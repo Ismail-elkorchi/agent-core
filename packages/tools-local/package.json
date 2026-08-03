@@ -1,0 +1,26 @@
+{
+  "name": "@agent-core/tools-local",
+  "version": "0.2.0",
+  "description": "Node and workspace-local coding tools for Agent Core.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./testing/filesystem": "./dist/core/filesystem.js",
+    "./testing/text-write": "./dist/core/text-write.js",
+    "./testing/apply-patch/*": "./dist/tools/apply-patch/*.js",
+    "./testing/shell-command/safety": "./dist/tools/shell-command/safety.js"
+  },
+  "files": ["dist", "README.md"],
+  "sideEffects": false,
+  "engines": { "node": ">=24" },
+  "dependencies": {
+    "@agent-core/evidence": "0.2.0",
+    "@agent-core/tools": "0.2.0",
+    "zod": "^4.4.3"
+  }
+}

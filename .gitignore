@@ -1,0 +1,15 @@
+node_modules/
+**/dist/
+*.tsbuildinfo
+
+.agent-core/
+**/.agent-core/
+
+.env
+.env.*
+!.env.example
+credentials.json
+secrets.json
+
+.DS_Store
+npm-debug.log*

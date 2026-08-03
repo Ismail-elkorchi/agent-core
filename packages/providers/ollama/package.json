@@ -1,0 +1,22 @@
+{
+  "name": "@agent-core/provider-ollama",
+  "version": "0.2.0",
+  "description": "Capability-discovered Ollama adapter for Agent Core's provider-neutral model contracts.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@agent-core/model": "0.2.0",
+    "ollama": "^0.6.3"
+  }
+}

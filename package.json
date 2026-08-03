@@ -1,0 +1,33 @@
+{
+  "name": "agent-core",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "workspaces": [
+    "packages/*",
+    "packages/providers/*"
+  ],
+  "scripts": {
+    "build": "tsc -b && chmod +x packages/cli/dist/index.js",
+    "lint": "eslint \"packages/**/*.ts\"",
+    "test": "npm run build && npm run test:unit",
+    "test:unit": "node scripts/run-test-suite.mjs",
+    "test:focused": "node --test tests/agent-core.test.js tests/ledger.test.js tests/session.test.js tests/provider-conformance.test.js tests/ollama-provider.test.js tests/openai-provider.test.js tests/openai-codex-provider.test.js tests/openrouter-provider.test.js tests/self-hosting-smoke.test.js",
+    "package": "node scripts/test-packed-consumer.mjs",
+    "verify": "npm run clean && npm run build && npm run lint && npm run test:unit && npm run test:focused",
+    "verify:release": "npm run verify && npm run package",
+    "clean": "rm -rf packages/*/dist packages/providers/*/dist packages/*/*.tsbuildinfo packages/providers/*/*.tsbuildinfo"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.13.2",
+    "@types/ws": "^8.18.1",
+    "@ismail-elkorchi/terminal-ui": "github:Ismail-elkorchi/terminal-ui#64bd8def427d8b81e9de3fa673d99b6893b77d81",
+    "eslint": "^10.5.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.61.1"
+  }
+}

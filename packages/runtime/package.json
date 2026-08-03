@@ -1,0 +1,25 @@
+{
+  "name": "@agent-core/runtime",
+  "version": "0.2.0",
+  "description": "Provider-neutral Agent Core orchestration, contracts, context, session projections, verification, and recovery.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "engines": { "node": ">=24" },
+  "dependencies": {
+    "@agent-core/evidence": "0.2.0",
+    "@agent-core/model": "0.2.0",
+    "@agent-core/tools": "0.2.0"
+  }
+}

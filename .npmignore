@@ -1,0 +1,9 @@
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+.agent-core
+**/.agent-core
+.env
+.env.*
+credentials.json
+secrets.json

@@ -1,0 +1,17 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/auth" },
+    { "path": "packages/model" },
+    { "path": "packages/evidence" },
+    { "path": "packages/runtime" },
+    { "path": "packages/tools" },
+    { "path": "packages/tools-local" },
+    { "path": "packages/providers/openai-responses" },
+    { "path": "packages/providers/ollama" },
+    { "path": "packages/providers/openrouter" },
+    { "path": "packages/providers/openai" },
+    { "path": "packages/providers/openai-codex" },
+    { "path": "packages/cli" }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "name": "@agent-core/auth",
+  "version": "0.2.0",
+  "description": "Provider-neutral authentication and credential storage capabilities for Agent Core.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": "./dist/index.js" },
+  "files": ["dist", "README.md"],
+  "engines": { "node": ">=24" }
+}

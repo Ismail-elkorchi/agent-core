@@ -1,0 +1,75 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  ModelContractError,
+  assertModelRequestSupported,
+  parseModelProfile,
+  parseModelRequest,
+  parseModelResponse,
+  parseModelStreamEvent
+} from '@agent-core/model';
+
+const profile = {
+  id: 'test',
+  provider: 'test-provider',
+  capabilities: {
+    streaming: true, toolCalling: false, supportedToolInputs: [{ kind: 'json' }], jsonMode: false, jsonSchema: false,
+    logprobs: false, temperature: false, topP: false,
+    reasoning: { strategies: ['effort'], canDisable: false, efforts: ['high'], modes: ['standard'], separateOutput: true }
+  },
+  modalities: { input: ['text'], output: ['text'] },
+  limits: { contextTokens: 1000, maxInputTokens: 900, outputTokens: 100 },
+  supportedParameters: ['reasoning']
+};
+
+test('model request validation rejects illegal message combinations and unsafe options', () => {
+  const cyclic = {};
+  cyclic.self = cyclic;
+  assert.throws(
+    () => parseModelRequest({ model: 'test', messages: [{ role: 'tool', content: 'result', toolName: 'read', toolCallType: 'invalid' }], providerOptions: { provider: 'test', values: cyclic } }),
+    error => error instanceof ModelContractError && /toolCallType/.test(error.message) && /JSON-safe/.test(error.message)
+  );
+});
+
+test('request/profile validation rejects unsupported controls and reasoning combinations', () => {
+  assert.throws(
+    () => assertModelRequestSupported(profile, { model: 'test', messages: [{ role: 'user', content: 'hello' }], temperature: 0.2, reasoning: { strategy: 'disabled' } }),
+    error => error instanceof ModelContractError && /temperature/.test(error.message) && /cannot be disabled/.test(error.message)
+  );
+  assert.throws(
+    () => assertModelRequestSupported(profile, { model: 'test', messages: [{ role: 'user', content: 'hello' }], reasoning: { strategy: 'effort', effort: 'low', mode: 'pro' } }),
+    error => error instanceof ModelContractError && /effort low/.test(error.message) && /mode pro/.test(error.message)
+  );
+});
+
+test('profile validation rejects contradictory token limits and incomplete reasoning capabilities', () => {
+  assert.throws(
+    () => parseModelProfile({
+      ...profile,
+      limits: { contextTokens: 100, maxInputTokens: 90, outputTokens: 20 },
+      capabilities: { ...profile.capabilities, reasoning: { strategies: ['effort'], canDisable: true, separateOutput: true } }
+    }),
+    error => error instanceof ModelContractError && /maxInputTokens \+ outputTokens/.test(error.message) && /reasoning/.test(error.message)
+  );
+});
+
+test('response and stream validation enforce coherent terminal and accumulation state', () => {
+  assert.throws(
+    () => parseModelResponse({
+      content: '',
+      model: 'test',
+      provider: 'test-provider',
+      terminationReason: 'stop',
+      toolCalls: [{ type: 'function', name: 'read', input: { kind: 'json', value: {} } }],
+      transport: { provider: 'different-provider', strategy: 'http' },
+      timings: { total: -1 }
+    }),
+    error => error instanceof ModelContractError
+      && /transport.provider/.test(error.message)
+      && /timings/.test(error.message)
+  );
+  assert.throws(
+    () => parseModelStreamEvent({ type: 'content', content: 'tail', accumulated: 'prefix' }),
+    error => error instanceof ModelContractError && /Malformed content/.test(error.message)
+  );
+});

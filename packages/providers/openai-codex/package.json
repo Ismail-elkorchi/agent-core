@@ -1,0 +1,24 @@
+{
+  "name": "@agent-core/provider-openai-codex",
+  "version": "0.2.0",
+  "description": "OpenAI Codex ChatGPT-subscription Responses adapter for Agent Core.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@agent-core/auth": "0.2.0",
+    "@agent-core/model": "0.2.0",
+    "@agent-core/provider-openai-responses": "0.2.0",
+    "ws": "^8.21.0"
+  }
+}

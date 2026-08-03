@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "provider": "openai",
+  "model": "gpt-5.6-sol",
+  "reasoning": { "strategy": "effort", "effort": "max", "mode": "standard" },
+  "instructions": [{ "path": "AGENTS.md" }],
+  "tools": {
+    "enabled": ["list_directory_tree", "read_text_files", "search_file_text", "apply_patch", "shell_command"]
+  },
+  "authorization": {
+    "allowedRisks": ["read", "write", "execute"],
+    "requireApprovalFor": ["write", "execute"]
+  },
+  "verification": {
+    "required": [
+      { "id": "build", "command": "npm run build", "timeoutMs": 120000, "maxOutputBytes": 64000 },
+      { "id": "lint", "command": "npm run lint", "timeoutMs": 120000, "maxOutputBytes": 64000 },
+      { "id": "test", "command": "npm run test:unit", "timeoutMs": 300000, "maxOutputBytes": 128000 }
+    ],
+    "advisory": [
+      { "id": "package", "command": "npm run package", "timeoutMs": 300000, "maxOutputBytes": 128000 }
+    ]
+  },
+  "limits": {
+    "modelTurns": 32,
+    "totalToolCalls": 128,
+    "repeatedIdenticalToolCalls": 3,
+    "elapsedMs": 1800000,
+    "promptTokens": 1000000,
+    "completionTokens": 250000,
+    "knownCost": { "amount": 25, "currency": "USD" },
+    "consecutiveProviderFailures": 3,
+    "consecutiveToolFailures": 5,
+    "providerRetries": 6
+  },
+  "session": { "mode": "latest" }
+}

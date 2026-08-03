@@ -1,0 +1,18 @@
+{
+  "name": "@agent-core/provider-openai-responses",
+  "version": "0.2.0",
+  "description": "Dependency-light OpenAI Responses protocol transport primitives for Agent Core adapters.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=24"
+  }
+}

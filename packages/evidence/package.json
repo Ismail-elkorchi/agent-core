@@ -1,0 +1,14 @@
+{
+  "name": "@agent-core/evidence",
+  "version": "0.2.0",
+  "description": "Event and artifact repositories plus bounded JSON normalization for Agent Core.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./node": "./dist/node.js"
+  },
+  "files": ["dist", "README.md"],
+  "engines": { "node": ">=24" }
+}
