@@ -31,7 +31,7 @@ test('workspace configuration validates first-party policy, checks, and exact li
     model: 'gpt-5.6-sol',
     reasoning: { strategy: 'effort', effort: 'max', mode: 'standard' },
     instructions: [{ path: 'AGENTS.md' }],
-    tools: { enabled: ['read_text_files'] },
+    tools: { enabled: ['read_files'] },
     authorization: { allowedRisks: ['read', 'write'], requireApprovalFor: ['write'] },
     verification: { required: [{ id: 'test', command: 'npm test', timeoutMs: 1_000 }], advisory: [] },
     limits: { modelTurns: 3, knownCost: { amount: 10, currency: 'USD' } },

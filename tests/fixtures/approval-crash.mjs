@@ -1,4 +1,5 @@
 import { appendFile } from 'node:fs/promises';
+import * as z from 'zod';
 import path from 'node:path';
 import { AgentRuntime, agentEventCodec } from '@agent-core/runtime';
 import { JsonlEventRepository, LocalArtifactRepository } from '@agent-core/evidence/node';
@@ -41,13 +42,13 @@ const provider = {
 };
 
 const tool = {
-  name: 'effect', implementationId: 'tests/crash-effect@1', description: 'writes one externally visible marker', jsonSchema: { type: 'object' }, risk: 'write',
-  declaredEffects: { kind: 'write', resourceScopes: ['fixture/effect'], idempotency: 'non_idempotent', reversible: false },
-  decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return this.declaredEffects; },
+  name: 'effect', implementationId: 'tests/crash-effect@1', description: 'writes one externally visible marker', jsonSchema: { type: 'object' }, outputSchema: z.strictObject({}),
+  effectEnvelope: { accesses: [{ mode: 'write', scope: 'fixture/effect' }], lockScopes: ['fixture/effect'] },
+  decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'fixture/effect' }], lockScopes: ['fixture/effect'], idempotency: 'non_idempotent' }; },
   async invoke() {
     await appendFile(path.join(root, 'effect.txt'), 'effect\n');
     if (mode === 'crash') process.exit(42);
-    return { kind: 'result', ok: true, output: {}, summary: 'effect happened again' };
+    return { kind: 'result', ok: true, output: {}, summary: 'effect happened again', scope: { resources: ['fixture/effect'], coverage: 'complete' } };
   }
 };
 

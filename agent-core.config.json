@@ -5,11 +5,11 @@
   "reasoning": { "strategy": "effort", "effort": "max", "mode": "standard" },
   "instructions": [{ "path": "AGENTS.md" }],
   "tools": {
-    "enabled": ["list_directory_tree", "read_text_files", "search_file_text", "apply_patch", "shell_command"]
+    "enabled": ["list_directory", "find_files", "read_files", "search_text", "apply_patch", "exec_command", "write_stdin", "stop_process", "view_image", "read_artifact"]
   },
   "authorization": {
-    "allowedRisks": ["read", "write", "execute"],
-    "requireApprovalFor": ["write", "execute"]
+    "allowedRisks": ["read", "write", "execute", "destructive"],
+    "requireApprovalFor": ["write", "execute", "destructive"]
   },
   "verification": {
     "required": [

@@ -1,44 +1,39 @@
-import type { ToolEffects } from '@agent-core/tools';
+import { scopesOverlap, type ToolEffects } from '@agent-core/tools';
 
 export interface SchedulableToolCall<T> { readonly callIndex: number; readonly effects: ToolEffects; readonly value: T }
 
-/** Builds deterministic waves. Calls inside a wave may run concurrently; waves and persisted results stay in source order. */
 export function scheduleToolCalls<T>(calls: readonly SchedulableToolCall<T>[], maxConcurrentToolCalls: number): readonly (readonly SchedulableToolCall<T>[])[] {
-  if (!Number.isInteger(maxConcurrentToolCalls) || maxConcurrentToolCalls < 1) {
-    throw new Error('maxConcurrentToolCalls must be a positive integer.');
-  }
+  if (!Number.isSafeInteger(maxConcurrentToolCalls) || maxConcurrentToolCalls < 1) throw new Error('maxConcurrentToolCalls must be a positive integer.');
+  const byIndex = new Map(calls.map((call) => [call.callIndex, call]));
+  if (byIndex.size !== calls.length) throw new Error('Tool call indices must be unique within a batch.');
+  const waveByIndex = new Map<number, number>();
   const waves: SchedulableToolCall<T>[][] = [];
-  const waveByCallIndex = new Map<number, number>();
   for (const call of [...calls].sort((left, right) => left.callIndex - right.callIndex)) {
     const dependencies = call.effects.dependsOnCallIndices ?? [];
-    if (dependencies.some((dependency) => dependency >= call.callIndex)) throw new Error(`Tool call ${String(call.callIndex)} has a forward or self dependency.`);
-    const earliestWave = dependencies.reduce((minimum, dependency) => {
-      const dependencyWave = waveByCallIndex.get(dependency);
-      if (dependencyWave === undefined) throw new Error(`Tool call ${String(call.callIndex)} depends on unavailable call ${String(dependency)}.`);
-      return Math.max(minimum, dependencyWave + 1);
-    }, 0);
-    let selected = -1;
-    for (let waveIndex = earliestWave; waveIndex < waves.length; waveIndex += 1) {
-      const wave = waves[waveIndex];
-      if (wave && wave.length < maxConcurrentToolCalls && wave.every((existing) => !effectsConflict(existing.effects, call.effects))) { selected = waveIndex; break; }
+    for (const dependency of dependencies) {
+      if (dependency >= call.callIndex || !byIndex.has(dependency)) throw new Error(`Tool call ${String(call.callIndex)} has invalid dependency ${String(dependency)}.`);
     }
-    if (selected < 0) { selected = waves.length; waves.push([]); }
+    const earliestWave = dependencies.reduce((wave, dependency) => Math.max(wave, (waveByIndex.get(dependency) ?? -1) + 1), 0);
+    let selected = earliestWave;
+    for (;;) {
+      const wave = waves[selected];
+      if (!wave || (wave.length < maxConcurrentToolCalls && wave.every((existing) => !toolEffectsConflict(existing.effects, call.effects)))) break;
+      selected += 1;
+    }
     const selectedWave = waves[selected];
-    if (!selectedWave) throw new Error(`Tool scheduler failed to allocate wave ${String(selected)}.`);
-    selectedWave.push(call);
-    waveByCallIndex.set(call.callIndex, selected);
+    if (selectedWave) selectedWave.push(call);
+    else waves[selected] = [call];
+    waveByIndex.set(call.callIndex, selected);
   }
   return Object.freeze(waves.map((wave) => Object.freeze(wave)));
 }
 
-export function effectsConflict(left: ToolEffects, right: ToolEffects): boolean {
-  if (left.idempotency === 'non_idempotent' || right.idempotency === 'non_idempotent') return true;
-  if (left.kind === 'read' && right.kind === 'read') return false;
-  if (left.kind === 'mixed' || right.kind === 'mixed') return true;
-  const scopesOverlap = left.resourceScopes.some((leftScope) => right.resourceScopes.some((rightScope) => scopeOverlaps(leftScope, rightScope)));
-  return scopesOverlap;
+export function lockScopesConflict(left: readonly string[], right: readonly string[]): boolean {
+  return left.some((leftScope) => right.some((rightScope) => scopesOverlap(leftScope, rightScope)));
 }
 
-function scopeOverlaps(left: string, right: string): boolean {
-  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+export function toolEffectsConflict(left: ToolEffects, right: ToolEffects): boolean {
+  if (lockScopesConflict(left.lockScopes, right.lockScopes)) return true;
+  return left.accesses.some((leftAccess) => right.accesses.some((rightAccess) => scopesOverlap(leftAccess.scope, rightAccess.scope)
+    && (leftAccess.mode !== 'read' || rightAccess.mode !== 'read')));
 }

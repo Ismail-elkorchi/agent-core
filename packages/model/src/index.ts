@@ -49,7 +49,7 @@ export interface ModelToolMessage extends ModelMessageBase {
   toolCallType: ModelToolKind;
   reasoning?: never;
   toolCalls?: never;
-  images?: never;
+  images?: ModelImage[];
 }
 
 export type ModelMessage =

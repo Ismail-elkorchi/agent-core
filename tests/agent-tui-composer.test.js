@@ -76,9 +76,9 @@ function approvalSuspension() {
   return {
     state: 'suspended', reason: 'approval_required', runId: 'run', finalizationId: 'final',
     pendingApprovals: [{
-      runId: 'run', approvalId: 'approval', status: 'pending', toolName: 'shell_command',
+      runId: 'run', approvalId: 'approval', status: 'pending', toolName: 'exec_command',
       fingerprint: 'fingerprint', input: { command: 'echo ok' },
-      effects: { kind: 'execute', resourceScopes: ['workspace://command'] },
+      effects: { accesses: [{ mode: 'execute', scope: 'workspace/command' }], lockScopes: ['workspace/command'], idempotency: 'non_idempotent' },
       binding: { toolImplementationId: 'shell@1', authorizationPolicyId: 'policy@1', executionTargetId: 'workspace@1' },
       policyHash: 'policy-hash', reason: 'Shell execution requires approval.',
       turnIndex: 1, turnId: 'turn-1', requestAttempt: 1, toolBatchId: 'batch-1', callIndex: 0, callId: 'call-1'

@@ -88,10 +88,17 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
     const callIdentityValue = callIdentity(input, call, callIndex);
     if (!input.resuming) await input.session?.repository.appendToolCall(input.session.sessionId, { runId: input.runId, identity: callIdentityValue, call });
     let machine: ToolCallMachineState = createToolCallMachine(callIdentityValue, call.name);
-    const preparation = await prepareToolCall(call, input.tools, authorizationContext);
     const recovery = input.recovery?.find((item) => item.callIndex === callIndex);
     const toolAttempt = recovery?.completed?.toolAttempt ?? (recovery?.lastAttempt ?? 0) + 1;
     const identity: AgentToolCallAttemptIdentity = { ...callIdentityValue, toolAttempt };
+    const preparation = await prepareToolCall(call, input.tools, {
+      ...authorizationContext,
+      emitProgress: async (progress) => {
+        const event = { type: 'tool.updated' as const, ...identity, toolName: call.name, progress };
+        await input.append(event);
+        await input.emit(event);
+      }
+    });
     if (!preparation.ok) {
       machine = transitionWithoutCommands(machine, { type: 'rejected', outcome: preparationOutcome(preparation.observation), observation: preparation.observation });
       entries.push({ identity, call, machine, observation: preparation.observation });
@@ -139,7 +146,7 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
     }
     if (authorization.decision === 'deny') {
       requireNoCommands(authorizationTransition.commands);
-      const observation = policyBlockedObservation(`Tool authorization denied: ${call.name}`, { tool: call.name, risk: prepared.tool.risk, policyReason: 'deny', ...(authorization.reason ? { recovery: authorization.reason } : {}) });
+      const observation = policyBlockedObservation(`Tool authorization denied: ${call.name}`, { tool: call.name, policyReason: 'deny', ...(authorization.reason ? { recovery: authorization.reason } : {}) });
       entries.push({ identity, call, prepared, machine, observation });
       continue;
     }
@@ -158,6 +165,11 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
       callIndex: item.callIndex,
       observation: await invokePreparedToolCall(item.value.prepared, {
         ...input.toolContext,
+        emitProgress: async (progress) => {
+          const event = { type: 'tool.updated' as const, ...item.value.identity, toolName: item.value.call.name, progress };
+          await input.append(event);
+          await input.emit(event);
+        },
         invocation: {
           runId: input.runId,
           turnId: item.value.identity.turnId,
@@ -199,24 +211,34 @@ async function persistToolStart(input: Parameters<typeof executeAssistantToolCal
   if (!entry.prepared) throw new Error('Cannot persist a tool start without a prepared call.');
   await input.append({ type: 'tool.started', ...entry.identity, toolName: entry.call.name, input: entry.call, fingerprint: entry.prepared.fingerprint, effects: entry.prepared.effects }, toolEventKey(input.runId, entry.identity, 'started'));
   await input.emit({ type: 'tool.started', ...entry.identity, toolName: entry.call.name, input: entry.call, fingerprint: entry.prepared.fingerprint, effects: entry.prepared.effects });
-  await input.append({ type: 'tool.updated', ...entry.identity, toolName: entry.call.name, message: 'executing' }, toolEventKey(input.runId, entry.identity, 'updated'));
-  await input.emit({ type: 'tool.updated', ...entry.identity, toolName: entry.call.name, message: 'executing' });
+  await input.append({ type: 'tool.updated', ...entry.identity, toolName: entry.call.name, progress: { stage: 'executing' } }, toolEventKey(input.runId, entry.identity, 'updated'));
+  await input.emit({ type: 'tool.updated', ...entry.identity, toolName: entry.call.name, progress: { stage: 'executing' } });
 }
 
 async function persistObservation(input: Parameters<typeof executeAssistantToolCalls>[0], entry: PreparedEntry, observation: ToolObservation): Promise<void> {
-  const persistedObservation = normalizeToolObservationForPersistence(observation);
+  const record = entry.observationProjected
+    ? undefined
+    : await input.observationStore.put({ turnIndex: input.turnIndex, call: entry.call, canonicalInput: entry.prepared?.canonicalInput, tool: entry.prepared?.tool, observation });
+  const persistedObservation = normalizeToolObservationForPersistence(record?.durableObservation ?? observation);
+  const artifacts = observationArtifacts(persistedObservation);
   await input.append({ type: 'tool.ended', ...entry.identity, toolName: entry.call.name, observation: persistedObservation }, toolEventKey(input.runId, entry.identity, 'ended'));
   await input.session?.repository.appendObservation(input.session.sessionId, {
     runId: input.runId,
     identity: entry.identity,
     toolName: entry.call.name,
-    observation: { ok: observation.ok, summary: observation.summary, output: observation.output, ...(observation.artifacts ? { artifacts: observation.artifacts } : {}), ...(observation.metadata ? { metadata: observation.metadata } : {}) }
+    observation: {
+      ok: persistedObservation.ok,
+      summary: persistedObservation.summary,
+      output: persistedObservation.output,
+      ...(artifacts.length > 0 ? { artifacts } : {}),
+      ...(persistedObservation.metadata ? { metadata: persistedObservation.metadata } : {})
+    }
   });
   if (entry.observationProjected) {
-    await input.emit({ type: 'tool.ended', ...entry.identity, toolName: entry.call.name, observation });
+    await input.emit({ type: 'tool.ended', ...entry.identity, toolName: entry.call.name, observation: persistedObservation });
     return;
   }
-  const record = input.observationStore.put({ turnIndex: input.turnIndex, call: entry.call, canonicalInput: entry.prepared?.canonicalInput, tool: entry.prepared?.tool, observation });
+  if (!record) throw new Error('Tool observation record was not created.');
   input.contextManager.recordToolResult({
     turnIndex: input.turnIndex,
     toolName: record.toolName,
@@ -224,15 +246,19 @@ async function persistObservation(input: Parameters<typeof executeAssistantToolC
     toolCallType: record.call.input.kind === 'text' ? 'custom' : 'function',
     immediateContent: serializeToolObservationPresentation(record.immediatePresentation),
     retainedContent: serializeToolObservationPresentation(record.retainedPresentation),
+    immediateImages: record.immediateImages,
     evidence: record.evidence
   });
   await input.append({
     type: 'observation.record.created', id: record.id, ...entry.identity, toolName: entry.call.name, call: record.call,
     toolCallType: record.call.input.kind === 'text' ? 'custom' : 'function', evidence: normalizeJsonSafe(record.evidence).value,
-    immediatePresentation: record.immediatePresentation, retainedPresentation: record.retainedPresentation,
-    immediateBytes: Buffer.byteLength(JSON.stringify(record.immediatePresentation), 'utf8'), retainedBytes: Buffer.byteLength(JSON.stringify(record.retainedPresentation), 'utf8')
+    immediatePresentation: record.immediatePresentation, retainedPresentation: record.retainedPresentation
   }, toolEventKey(input.runId, entry.identity, 'observation'));
-  await input.emit({ type: 'tool.ended', ...entry.identity, toolName: entry.call.name, observation });
+  await input.emit({ type: 'tool.ended', ...entry.identity, toolName: entry.call.name, observation: persistedObservation });
+}
+
+function observationArtifacts(observation: ToolObservation) {
+  return [...new Map((observation.content ?? []).flatMap((item) => item.type === 'text' ? [] : [[item.artifact.artifactId, item.artifact] as const])).values()];
 }
 
 function callIdentity(input: AgentToolBatchIdentity, call: ToolCall, callIndex: number): AgentToolCallIdentity {

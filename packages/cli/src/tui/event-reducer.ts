@@ -125,9 +125,10 @@ function reduceToolStarted(state: AgentTuiState, event: ProgressEvent<'tool.star
 
 function reduceToolUpdated(state: AgentTuiState, event: ProgressEvent<'tool.updated'>): AgentTuiState {
   const id = toolActivityId(event);
+  const label = event.progress.message ?? event.progress.stage;
   return upsertActivity(
     withWorking(state, 'Running tool'),
-    updatedToolActivity(activity(state, id), id, event.toolName, event.message)
+    updatedToolActivity(activity(state, id), id, event.toolName, label)
   );
 }
 

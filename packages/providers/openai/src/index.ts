@@ -698,6 +698,7 @@ function toOpenAIInput(messages: ModelMessage[], preferIncremental = false): { i
     }
     if (message.role === 'tool') {
       input.push(toolCallOutputForOpenAIMessage(message));
+      if (message.images && message.images.length > 0) input.push({ role: 'user', content: contentForOpenAIMessage({ role: 'user', content: '', images: message.images }) });
       continue;
     }
     if (message.role === 'assistant') {

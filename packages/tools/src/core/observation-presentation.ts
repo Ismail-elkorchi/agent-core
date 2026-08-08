@@ -21,7 +21,7 @@ export interface ToolObservationPresentation {
 }
 
 export interface ToolObservationPresentationLimit {
-  maxBytes: number;
+  maxTokens: number;
 }
 
 export interface ToolObservationPresentationRequest<TInput = unknown, TOutput = unknown> {
@@ -80,10 +80,6 @@ export function toolFailurePresentation(toolName: string, observation: ToolObser
 
 export function toJsonValue(value: unknown): JsonValue {
   return toJsonValueInner(value, new WeakSet());
-}
-
-export function estimateJsonBytes(value: JsonValue): number {
-  return Buffer.byteLength(JSON.stringify(value), 'utf8');
 }
 
 function requireType(
@@ -198,21 +194,29 @@ function toJsonValueInner(value: unknown, seen: WeakSet<object>): JsonValue {
       return '[circular]';
     }
     seen.add(value);
-    return value.map((item) => toJsonValueInner(item, seen));
+    try {
+      return value.map((item) => toJsonValueInner(item, seen));
+    } finally {
+      seen.delete(value);
+    }
   }
   if (isUnknownRecord(value)) {
     if (seen.has(value)) {
       return '[circular]';
     }
     seen.add(value);
-    const output: JsonObject = {};
-    for (const key of Object.keys(value)) {
-      const item = value[key];
-      if (item !== undefined) {
-        output[key] = toJsonValueInner(item, seen);
+    try {
+      const output: JsonObject = {};
+      for (const key of Object.keys(value)) {
+        const item = value[key];
+        if (item !== undefined) {
+          output[key] = toJsonValueInner(item, seen);
+        }
       }
+      return output;
+    } finally {
+      seen.delete(value);
     }
-    return output;
   }
   return Object.prototype.toString.call(value);
 }

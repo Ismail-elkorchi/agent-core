@@ -2,9 +2,9 @@ import * as z from 'zod';
 import type { ToolExecutionContext, ToolPreparationContext } from './context.js';
 import type { ToolDefinition, ToolInput, ToolObservation, ToolPromptGuide, ToolTextInputDefinition } from './definition.js';
 import type { ToolObservationPresentation, ToolObservationPresentationRequest } from './observation-presentation.js';
-import type { ToolPolicy, ToolRisk } from './policy.js';
+import type { ToolPolicy } from './policy.js';
 import { invalidArgumentsObservation, invalidToolInputObservation } from './observation.js';
-import { validateToolEffects, type ToolEffects } from './authorization.js';
+import { validateToolEffectEnvelope, type ToolEffectEnvelope, type ToolEffects } from './authorization.js';
 
 export interface DefineToolOptions<Schema extends z.ZodType, TCanonicalInput, TOutput> {
   name: string;
@@ -12,11 +12,11 @@ export interface DefineToolOptions<Schema extends z.ZodType, TCanonicalInput, TO
   description: string;
   promptGuide?: ToolPromptGuide;
   schema: Schema;
+  outputSchema: z.ZodType<TOutput>;
   textInput?: Omit<ToolTextInputDefinition<z.output<Schema>>, 'decode'> & {
     decode(text: string): z.input<Schema>;
   };
-  risk: ToolRisk;
-  declaredEffects: ToolEffects;
+  effectEnvelope: ToolEffectEnvelope;
   canonicalizeInput(input: z.output<Schema>, context: ToolPreparationContext): TCanonicalInput | Promise<TCanonicalInput>;
   deriveEffects(input: TCanonicalInput, context: ToolPreparationContext): ToolEffects | Promise<ToolEffects>;
   isAvailable?: (policy: ToolPolicy) => boolean;
@@ -43,9 +43,9 @@ export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
     description: definition.description,
     ...(definition.promptGuide ? { promptGuide: definition.promptGuide } : {}),
     jsonSchema: toToolJsonSchema(definition.schema),
+    outputSchema: definition.outputSchema,
     ...(textInput ? { textInput } : {}),
-    risk: definition.risk,
-    declaredEffects: validateToolEffects(definition.declaredEffects),
+    effectEnvelope: validateToolEffectEnvelope(definition.effectEnvelope),
     ...(definition.isAvailable ? { isAvailable: definition.isAvailable } : {}),
     ...(definition.presentObservation ? { presentObservation: definition.presentObservation } : {}),
     decodeInput(input: ToolInput) {

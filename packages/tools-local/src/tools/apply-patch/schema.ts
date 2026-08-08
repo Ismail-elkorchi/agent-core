@@ -3,7 +3,7 @@ import * as z from 'zod';
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 
 export const applyPatchInputSchema = z.strictObject({
-  patch: z.string().min(1).max(5_000_000).meta({
+  patch: z.string().min(1).meta({
     description: 'Single patch document. First call shape: {"patch":"*** Begin Patch\\n*** Update File: relative/path.txt\\n@@\\n-old\\n+new\\n*** End Patch"}. Supports Add File, Update File, Delete File, and Move to operations.'
   }),
   dryRun: z.boolean().default(false).meta({
@@ -11,15 +11,6 @@ export const applyPatchInputSchema = z.strictObject({
   }),
   expectedOldSha256: z.record(z.string().trim().min(1), sha256Schema).optional().meta({
     description: 'Optional preconditions keyed by patch source path. For update, delete, and move operations, the current source file SHA-256 must match when a key is provided.'
-  }),
-  maxPatchBytes: z.int().min(1).max(5_000_000).default(512_000).meta({
-    description: 'Maximum UTF-8 byte size of the patch document. Defaults to 512000.'
-  }),
-  maxBytesPerFile: z.int().min(1).max(50_000_000).default(1_000_000).meta({
-    description: 'Maximum bytes to read per existing file. Defaults to 1000000. Larger existing files make the whole patch invalid.'
-  }),
-  maxNewBytesPerFile: z.int().min(1).max(50_000_000).default(1_000_000).meta({
-    description: 'Maximum UTF-8 byte size for each resulting file. Defaults to 1000000.'
   })
 });
 
@@ -107,3 +98,39 @@ export interface ApplyPatchOutput {
   totalAdditions: number;
   totalDeletions: number;
 }
+
+const patchFileOutputSchema = z.strictObject({
+  path: z.string(),
+  operation: z.enum(['add', 'update', 'delete', 'move']),
+  destinationPath: z.string().optional(),
+  hunkCount: z.int().nonnegative(),
+  additions: z.int().nonnegative(),
+  deletions: z.int().nonnegative(),
+  oldSha256: sha256Schema.optional(),
+  newSha256: sha256Schema.optional(),
+  oldBytes: z.int().nonnegative(),
+  newBytes: z.int().nonnegative(),
+  changed: z.boolean(),
+  matchModes: z.array(z.enum(['exact', 'trim_trailing_whitespace', 'trim_surrounding_whitespace', 'normalize_common_unicode_punctuation'])).optional(),
+  exact: z.boolean().optional()
+});
+
+const pathPairSchema = z.strictObject({ sourcePath: z.string(), destinationPath: z.string() });
+
+export const applyPatchOutputSchema = z.strictObject({
+  dryRun: z.boolean(),
+  transactional: z.literal(true),
+  files: z.array(patchFileOutputSchema),
+  changedPaths: z.array(z.string()),
+  wouldChangePaths: z.array(z.string()),
+  createdPaths: z.array(z.string()),
+  wouldCreatePaths: z.array(z.string()),
+  deletedPaths: z.array(z.string()),
+  wouldDeletePaths: z.array(z.string()),
+  movedPaths: z.array(pathPairSchema),
+  wouldMovePaths: z.array(pathPairSchema),
+  totalOperationCount: z.int().nonnegative(),
+  totalHunkCount: z.int().nonnegative(),
+  totalAdditions: z.int().nonnegative(),
+  totalDeletions: z.int().nonnegative()
+});

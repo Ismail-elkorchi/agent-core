@@ -123,14 +123,14 @@ test('ContextManager preserves native tool call/result pairs in projected histor
       {
         id: 'call-1',
         type: 'function',
-        name: 'read_text_files',
+        name: 'read_files',
         input: { kind: 'json', value: { files: [{ path: 'a.txt' }] } }
       }
     ]
   });
   manager.recordToolResult({
     turnIndex: 1,
-    toolName: 'read_text_files',
+    toolName: 'read_files',
     toolCallType: 'function',
     callId: 'call-1',
     immediateContent: '{"ok":true,"summary":"read a.txt"}',
@@ -159,7 +159,7 @@ test('ContextManager projects compact evidence without inferring reads from list
   const manager = new ContextManager();
   manager.recordToolResult({
     turnIndex: 1,
-    toolName: 'list_directory_tree',
+    toolName: 'list_directory',
     toolCallType: 'function',
     immediateContent: '{"ok":true}',
     retainedContent: '{"ok":true}',
@@ -167,7 +167,7 @@ test('ContextManager projects compact evidence without inferring reads from list
       {
         id: 'obs-list:evidence:1',
         observationId: 'obs-list',
-        toolName: 'list_directory_tree',
+        toolName: 'list_directory',
         createdAt: '2026-06-23T00:00:00.000Z',
         action: 'list',
         outcome: 'success',
@@ -178,7 +178,7 @@ test('ContextManager projects compact evidence without inferring reads from list
       {
         id: 'obs-shell:evidence:1',
         observationId: 'obs-shell',
-        toolName: 'shell_command',
+        toolName: 'exec_command',
         createdAt: '2026-06-23T00:00:00.000Z',
         action: 'execute',
         outcome: 'success',
@@ -211,7 +211,7 @@ test('ContextManager summarizes omitted evidence within the evidence budget', ()
   const manager = new ContextManager();
   manager.recordToolResult({
     turnIndex: 1,
-    toolName: 'shell_command',
+    toolName: 'exec_command',
     toolCallType: 'function',
     immediateContent: '{"ok":true}',
     retainedContent: '{"ok":true}',
@@ -219,7 +219,7 @@ test('ContextManager summarizes omitted evidence within the evidence budget', ()
       {
         id: 'obs-1:evidence:1',
         observationId: 'obs-1',
-        toolName: 'shell_command',
+        toolName: 'exec_command',
         createdAt: '2026-06-23T00:00:00.000Z',
         action: 'execute',
         outcome: 'success',
@@ -229,7 +229,7 @@ test('ContextManager summarizes omitted evidence within the evidence budget', ()
       {
         id: 'obs-2:evidence:1',
         observationId: 'obs-2',
-        toolName: 'shell_command',
+        toolName: 'exec_command',
         createdAt: '2026-06-23T00:00:01.000Z',
         action: 'execute',
         outcome: 'success',
@@ -254,7 +254,7 @@ test('ContextManager summarizes omitted evidence within the evidence budget', ()
   assert.equal(evidence.records.length, 0);
   assert.equal(evidence.omittedRecords, 3);
   assert.deepEqual(evidence.omittedSummary, [
-    { toolName: 'shell_command', action: 'execute', outcome: 'success', count: 2 },
+    { toolName: 'exec_command', action: 'execute', outcome: 'success', count: 2 },
     { toolName: 'apply_patch', action: 'update', outcome: 'failure', count: 1 }
   ]);
   assert.equal(evidence.tokenEstimate <= 120, true);
@@ -270,14 +270,14 @@ test('ContextManager checkpoints old pairs instead of replaying executable place
       {
         id: 'call-1',
         type: 'function',
-        name: 'shell_command',
+        name: 'exec_command',
         input: { kind: 'json', value: { command: 'printf large' } }
       }
     ]
   });
   manager.recordToolResult({
     turnIndex: 1,
-    toolName: 'shell_command',
+    toolName: 'exec_command',
     toolCallType: 'function',
     callId: 'call-1',
     immediateContent: '{"ok":true,"summary":"large output immediate","results":{"stdout":"large output"}}',
@@ -285,7 +285,7 @@ test('ContextManager checkpoints old pairs instead of replaying executable place
     evidence: [{
       id: 'obs-shell:evidence:1',
       observationId: 'obs-shell',
-      toolName: 'shell_command',
+      toolName: 'exec_command',
       createdAt: '2026-06-24T00:00:00.000Z',
       action: 'execute',
       outcome: 'success',
@@ -311,9 +311,9 @@ test('ContextManager checkpoints old pairs instead of replaying executable place
   assert.equal(projection.prompt.continuity.length, 1);
   assert.match(projection.prompt.continuity[0], /reference-only continuity data/);
   assert.match(projection.prompt.continuity[0], /Compacted observations/);
-  assert.match(projection.prompt.continuity[0], /shell_command ok: large output retained/);
+  assert.match(projection.prompt.continuity[0], /exec_command ok: large output retained/);
   assert.match(projection.prompt.continuity[0], /Evidence summary/);
-  assert.match(projection.prompt.continuity[0], /shell_command execute success: 1/);
+  assert.match(projection.prompt.continuity[0], /exec_command execute success: 1/);
   assert.equal(projection.contextHistoryMessages.some((message) => message.role === 'assistant' && message.toolCalls), false);
   assert.doesNotMatch(projection.prompt.continuity[0], /\[omitted large tool call string/);
 });
@@ -328,14 +328,14 @@ test('ContextManager preserves recent exact pairs while reducing and checkpointi
         {
           id: `call-${index}`,
           type: 'function',
-          name: 'shell_command',
+          name: 'exec_command',
           input: { kind: 'json', value: { command: `printf turnIndex-${index}` } }
         }
       ]
     });
     manager.recordToolResult({
       turnIndex: index,
-      toolName: 'shell_command',
+      toolName: 'exec_command',
       toolCallType: 'function',
       callId: `call-${index}`,
       immediateContent: JSON.stringify({
@@ -355,7 +355,7 @@ test('ContextManager preserves recent exact pairs while reducing and checkpointi
       evidence: [{
         id: `obs-${index}:evidence:1`,
         observationId: `obs-${index}`,
-        toolName: 'shell_command',
+        toolName: 'exec_command',
         createdAt: `2026-06-24T00:00:${String(index).padStart(2, '0')}.000Z`,
         action: 'execute',
         outcome: 'success',
@@ -389,7 +389,7 @@ test('ContextManager preserves recent exact pairs while reducing and checkpointi
   assert.doesNotMatch(toolMessages.find((message) => message.toolCallId === 'call-1').content, /x{100}/);
   assert.match(toolMessages.find((message) => message.toolCallId === 'call-7').content, /immediate turnIndex 7/);
   assert.match(toolMessages.find((message) => message.toolCallId === 'call-8').content, /immediate turnIndex 8/);
-  assert.equal(projection.prompt.evidence.omittedSummary.some((item) => item.toolName === 'shell_command' && item.action === 'execute'), true);
+  assert.equal(projection.prompt.evidence.omittedSummary.some((item) => item.toolName === 'exec_command' && item.action === 'execute'), true);
 
   const checkpoint = manager.installCheckpoint();
   assert.ok(checkpoint);
@@ -408,7 +408,7 @@ test('ContextManager preserves recent exact pairs while reducing and checkpointi
   assert.equal(checkpointProjection.prompt.continuity.length, 1);
   assert.match(checkpointProjection.prompt.continuity[0], /reference-only continuity data/);
   assert.match(checkpointProjection.prompt.continuity[0], /turnIndex 8 assistant: visible assistant turnIndex 8/);
-  assert.match(checkpointProjection.prompt.continuity[0], /shell_command execute success: 8/);
+  assert.match(checkpointProjection.prompt.continuity[0], /exec_command execute success: 8/);
   assert.doesNotMatch(checkpointProjection.prompt.continuity[0], /"toolCalls"/);
   assert.doesNotMatch(checkpointProjection.prompt.continuity[0], /function_call_output/);
 });
@@ -422,14 +422,14 @@ test('ContextManager does not compact an existing checkpoint into a weaker check
       {
         id: 'call-1',
         type: 'function',
-        name: 'shell_command',
+        name: 'exec_command',
         input: { kind: 'json', value: { command: 'printf retained' } }
       }
     ]
   });
   manager.recordToolResult({
     turnIndex: 1,
-    toolName: 'shell_command',
+    toolName: 'exec_command',
     toolCallType: 'function',
     callId: 'call-1',
     immediateContent: '{"ok":true,"summary":"large output immediate"}',
@@ -464,6 +464,6 @@ test('ContextManager does not compact an existing checkpoint into a weaker check
 
   assert.equal(projection.prompt.continuity.length, 1);
   assert.equal(projection.prompt.continuity[0], checkpointText);
-  assert.match(projection.prompt.continuity[0], /shell_command ok: large output retained/);
+  assert.match(projection.prompt.continuity[0], /exec_command ok: large output retained/);
   assert.doesNotMatch(projection.prompt.continuity[0], /Removed active history items: 1/);
 });

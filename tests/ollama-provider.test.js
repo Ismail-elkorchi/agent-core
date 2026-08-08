@@ -49,7 +49,7 @@ test('OllamaProvider maps the full chat surface and normalizes streamed response
   const tool = {
     type: 'function',
     function: {
-      name: 'read_text_files',
+      name: 'read_files',
       description: 'Read a file',
       parameters: {
         type: 'object',
@@ -58,7 +58,7 @@ test('OllamaProvider maps the full chat surface and normalizes streamed response
       }
     }
   };
-  const toolCall = { function: { name: 'read_text_files', arguments: { files: [{ path: 'package.json' }] } } };
+  const toolCall = { function: { name: 'read_files', arguments: { files: [{ path: 'package.json' }] } } };
   const client = new FakeOllamaClient([
     { model: 'llama3.1', message: { role: 'assistant', content: '{"ok":' }, done: false },
     { model: 'llama3.1', message: { role: 'assistant', content: 'true', thinking: 'checking', tool_calls: [toolCall] }, done: false },
@@ -120,7 +120,7 @@ test('OllamaProvider maps the full chat surface and normalizes streamed response
   assert.deepEqual(response.toolCalls, [
     {
       type: 'function',
-      name: 'read_text_files',
+      name: 'read_files',
       input: { kind: 'json', value: { files: [{ path: 'package.json' }] } }
     }
   ]);
@@ -287,7 +287,7 @@ test('OllamaProvider treats unsupported tool models as invalid requests', async 
   const provider = new OllamaProvider({ clientFactory: () => new FakeOllamaClient(unsupported) });
 
   await assert.rejects(
-    () => provider.complete({ model: 'gemma3:270m', messages: [{ role: 'user', content: 'hi' }], tools: [{ type: 'function', function: { name: 'read_text_files' } }] }),
+    () => provider.complete({ model: 'gemma3:270m', messages: [{ role: 'user', content: 'hi' }], tools: [{ type: 'function', function: { name: 'read_files' } }] }),
     (error) => error.code === 'invalid_request' && error.retryable === false
   );
 });

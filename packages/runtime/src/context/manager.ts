@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
   type ModelMessage,
+  type ModelImage,
   type ModelProfile,
   type ModelTool,
   type ModelToolCall,
@@ -62,7 +63,7 @@ export interface PromptToolSummary {
   name: string;
   description: string;
   inputFormat: string;
-  risk: string;
+  accessModes: string[];
   promptGuide?: string;
 }
 
@@ -195,6 +196,7 @@ export interface RecordToolResultInput {
   callId?: string;
   immediateContent: string;
   retainedContent: string;
+  immediateImages?: readonly ModelImage[];
   useRetained?: boolean;
   evidence?: EvidenceRecord[];
 }
@@ -803,7 +805,8 @@ function toolResultMessage(input: RecordToolResultInput, _detail: 'immediate' | 
     role: 'tool',
     toolName: input.toolName,
     toolCallType: input.toolCallType,
-    content: _detail === 'immediate' ? input.immediateContent : input.retainedContent
+    content: _detail === 'immediate' ? input.immediateContent : input.retainedContent,
+    ...(_detail === 'immediate' && input.immediateImages && input.immediateImages.length > 0 ? { images: [...input.immediateImages] } : {})
   };
   if (input.callId) {
     message.toolCallId = input.callId;

@@ -1,5 +1,5 @@
 import type { ToolDefinition } from './definition.js';
-import { validateToolEffects } from './authorization.js';
+import { validateToolEffectEnvelope } from './authorization.js';
 import { isToolAvailable, type ToolPolicy } from './policy.js';
 
 export class ToolRegistry {
@@ -58,8 +58,8 @@ export function validateToolDefinition(tool: unknown): ToolDefinition {
   nonEmpty(definition.implementationId, 'implementationId');
   nonEmpty(definition.description, 'description');
   if (typeof definition.jsonSchema !== 'object' || definition.jsonSchema === null || Array.isArray(definition.jsonSchema)) throw new Error(`Tool ${definition.name} jsonSchema must be an object.`);
-  if (!isToolRisk(definition.risk)) throw new Error(`Tool ${definition.name} risk is invalid.`);
-  validateToolEffects(definition.declaredEffects);
+  validateToolEffectEnvelope(definition.effectEnvelope);
+  if (!isZodSchema(definition.outputSchema)) throw new Error(`Tool ${definition.name} outputSchema must be a Zod schema.`);
   if (typeof definition.decodeInput !== 'function') throw new Error(`Tool ${definition.name} decodeInput must be callable.`);
   if (typeof definition.invoke !== 'function') throw new Error(`Tool ${definition.name} invoke must be callable.`);
   if (typeof definition.canonicalizeInput !== 'function') throw new Error(`Tool ${definition.name} canonicalizeInput must be callable.`);
@@ -73,7 +73,7 @@ export function validateToolDefinition(tool: unknown): ToolDefinition {
 }
 
 const TOOL_DEFINITION_KEYS = new Set([
-  'name', 'implementationId', 'description', 'promptGuide', 'jsonSchema', 'textInput', 'risk', 'declaredEffects',
+  'name', 'implementationId', 'description', 'promptGuide', 'jsonSchema', 'outputSchema', 'textInput', 'effectEnvelope',
   'isAvailable', 'decodeInput', 'canonicalizeInput', 'deriveEffects', 'invoke', 'presentObservation'
 ]);
 
@@ -81,7 +81,7 @@ function nonEmpty(value: unknown, field: string): asserts value is string {
   if (typeof value !== 'string' || value.trim().length === 0) throw new Error(`Tool ${field} must be a non-empty string.`);
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
-function isToolRisk(value: unknown): value is import('./policy.js').ToolRisk { return value === 'read' || value === 'write' || value === 'execute' || value === 'network' || value === 'destructive'; }
+function isZodSchema(value: unknown): value is import('zod').ZodType { return isRecord(value) && typeof value.safeParse === 'function'; }
 function isTextInputDefinition(value: unknown): value is NonNullable<ToolDefinition['textInput']> {
   if (!isRecord(value) || !isRecord(value.format) || typeof value.decode !== 'function') return false;
   if (value.description !== undefined && typeof value.description !== 'string') return false;
@@ -90,7 +90,7 @@ function isTextInputDefinition(value: unknown): value is NonNullable<ToolDefinit
 }
 function isToolDefinition(value: Record<string, unknown>): value is Record<string, unknown> & ToolDefinition {
   return typeof value.name === 'string' && value.name.trim().length > 0 && typeof value.implementationId === 'string' && value.implementationId.trim().length > 0
-    && typeof value.description === 'string' && value.description.trim().length > 0 && isRecord(value.jsonSchema) && isToolRisk(value.risk) && hasValidEffects(value.declaredEffects)
+    && typeof value.description === 'string' && value.description.trim().length > 0 && isRecord(value.jsonSchema) && isZodSchema(value.outputSchema) && hasValidEnvelope(value.effectEnvelope)
     && typeof value.decodeInput === 'function' && typeof value.invoke === 'function'
     && typeof value.canonicalizeInput === 'function'
     && typeof value.deriveEffects === 'function'
@@ -99,4 +99,4 @@ function isToolDefinition(value: Record<string, unknown>): value is Record<strin
     && (value.isAvailable === undefined || typeof value.isAvailable === 'function')
     && (value.presentObservation === undefined || typeof value.presentObservation === 'function');
 }
-function hasValidEffects(value: unknown): boolean { try { validateToolEffects(value); return true; } catch { return false; } }
+function hasValidEnvelope(value: unknown): boolean { try { validateToolEffectEnvelope(value); return true; } catch { return false; } }

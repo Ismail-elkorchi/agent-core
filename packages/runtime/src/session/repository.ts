@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { isJsonObject, normalizeJsonSafe, validateArtifactRef, type JsonObject } from '@agent-core/evidence';
+import { isJsonObject, normalizeJsonSafe, validateArtifactRef, type JsonObject, type JsonValue } from '@agent-core/evidence';
 import { PersistenceConflictError } from '@agent-core/evidence';
 import { parseAgentTerminalSnapshot, terminalSnapshotFingerprint, type AgentEffectiveInstruction, type AgentTerminalSnapshot, type AgentToolCallAttemptIdentity, type AgentToolCallIdentity, type AgentTurnIdentity } from '../run/contracts.js';
 import type {
@@ -154,10 +154,13 @@ function normalizedObservationInput(input: { runId: string; identity: AgentTurnI
   const artifacts = input.observation.artifacts?.map((artifact) => { validateArtifactRef(artifact); return Object.freeze({ ...artifact }); });
   return {
     runId: input.runId, ...input.identity, toolName: input.toolName, ok: input.observation.ok, summary: input.observation.summary,
-    ...(input.observation.output === undefined ? {} : { output: normalizeJsonSafe(input.observation.output).value }),
+    ...(input.observation.output === undefined ? {} : { output: normalizeObservationOutput(input.observation.output) }),
     ...(artifacts && artifacts.length > 0 ? { artifacts: Object.freeze(artifacts) } : {}),
     ...(input.observation.metadata ? { metadata: normalizeMetadata(input.observation.metadata) } : {})
   };
+}
+function normalizeObservationOutput(value: unknown): JsonValue {
+  return normalizeJsonSafe(value, { maxDepth: 16, maxCollectionEntries: 20_000, maxStringBytes: 1024 * 1024, maxTotalBytes: 4 * 1024 * 1024 }).value;
 }
 function normalizeMetadata(value: unknown): JsonObject {
   const normalized = normalizeJsonSafe(value).value;

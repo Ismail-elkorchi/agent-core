@@ -2,7 +2,7 @@ import { hashRecord, normalizeJsonSafe } from '@agent-core/evidence';
 import { abortableToolBoundary, MissingToolServiceError, throwIfAborted, ToolInputError, type ToolPreparationContext } from './context.js';
 import type { ToolCall, ToolDefinition, ToolObservation } from './definition.js';
 import { invalidToolInputObservation, missingServiceObservation, runtimeErrorObservation, unknownToolObservation } from './observation.js';
-import { validateToolEffects, type ToolEffects } from './authorization.js';
+import { assertEffectsWithinEnvelope, validateToolEffects, type ToolEffects } from './authorization.js';
 
 export interface PreparedToolCall {
   readonly call: ToolCall;
@@ -26,13 +26,14 @@ export async function prepareToolCall(call: ToolCall, tools: readonly ToolDefini
     if (!decoded.ok) return { ok: false, observation: decoded.observation };
     const canonicalInput = await abortableToolBoundary(context.signal, () => tool.canonicalizeInput(decoded.input, context));
     const effects = validateToolEffects(await abortableToolBoundary(context.signal, () => tool.deriveEffects(canonicalInput, context)));
+    assertEffectsWithinEnvelope(effects, tool.effectEnvelope);
     const normalized = normalizeJsonSafe({
-      tool: { name: tool.name, implementationId: tool.implementationId, description: tool.description, jsonSchema: tool.jsonSchema, risk: tool.risk, declaredEffects: tool.declaredEffects },
+      tool: { name: tool.name, implementationId: tool.implementationId, description: tool.description, jsonSchema: tool.jsonSchema, effectEnvelope: tool.effectEnvelope },
       canonicalInput,
       effects,
       policy: context.policy,
       boundary: context.boundary
-    });
+    }, { maxDepth: 32, maxCollectionEntries: 20_000, maxStringBytes: 4_000_000, maxTotalBytes: 8_000_000 });
     if (normalized.diagnostics.length > 0) {
       return { ok: false, observation: invalidToolInputObservation(tool.name, 'Canonical tool input is not safely serializable.', { diagnostics: normalized.diagnostics }) };
     }

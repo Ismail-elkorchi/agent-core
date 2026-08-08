@@ -6,7 +6,7 @@ import { createCliDefaultTools, createCliToolPolicy, resultExitCode } from '@age
 import { parseAgentTerminalSnapshot } from '@agent-core/runtime';
 
 test('CLI exposes local coding tools and explicit risk policy', () => {
-  assert.deepEqual(createCliDefaultTools().map(tool => tool.name), ['list_directory_tree', 'read_text_files', 'search_file_text', 'apply_patch', 'shell_command']);
+  assert.deepEqual(createCliDefaultTools().map(tool => tool.name), ['list_directory', 'find_files', 'read_files', 'search_text', 'apply_patch', 'exec_command', 'write_stdin', 'stop_process', 'view_image', 'read_artifact']);
   assert.throws(() => createCliDefaultTools(['unknown_tool']), /Unknown configured local tools/u);
   assert.deepEqual(createCliToolPolicy({ apply: true, dryRun: false, allowShell: true, allowUnsafeShell: false }).allowedRisks, ['read', 'write', 'execute']);
 });

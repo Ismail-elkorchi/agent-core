@@ -40,7 +40,7 @@ export function summarizeRunConfiguration(input: {
       capabilities: input.model.capabilities,
       supportedParameters: [...input.model.supportedParameters]
     },
-    tools: input.tools.map((tool) => ({ name: tool.name, risk: tool.risk })),
+    tools: input.tools.map((tool) => ({ name: tool.name, accessModes: [...new Set(tool.effectEnvelope.accesses.map((access) => access.mode))].sort() })),
     toolPolicy: input.toolPolicy,
     requestWindow: {
       contextWindowTokens: input.requestWindow.contextWindowTokens,

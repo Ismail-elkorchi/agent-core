@@ -28,7 +28,7 @@ import {
   type AgentTurnIdentity,
   type AgentTurnSnapshotRecord
 } from './run/contracts.js';
-import { normalizeToolObservationForPersistence, type ToolCall, type ToolEffects, type ToolObservation, type ToolObservationPresentation, type ToolPolicy } from '@agent-core/tools';
+import { normalizeToolObservationForPersistence, type ToolCall, type ToolEffects, type ToolObservation, type ToolObservationPresentation, type ToolPolicy, type ToolProgress } from '@agent-core/tools';
 import type { BudgetAccountantSnapshot, RequestCostEstimate } from './orchestration/budget-accountant.js';
 import type { OverflowRecoveryResult } from './orchestration/overflow-recovery.js';
 
@@ -56,7 +56,7 @@ export interface AgentRunConfiguration {
     readonly capabilities: ModelCapabilities;
     readonly supportedParameters: readonly string[];
   };
-  readonly tools: readonly { readonly name: string; readonly risk: string }[];
+  readonly tools: readonly { readonly name: string; readonly accessModes: readonly string[] }[];
   readonly toolPolicy: ToolPolicy;
   readonly requestWindow: {
     readonly contextWindowTokens: number;
@@ -146,12 +146,12 @@ export type AgentEvent =
   | ({ readonly type: 'overflow.recovery.ended'; readonly attempt: number; readonly result: OverflowRecoveryResult } & AgentTurnIdentity)
   | ({ readonly type: 'context.history.reduced'; readonly reductions: readonly ContextHistoryReduction[] } & AgentTurnIdentity)
   | ({ readonly type: 'context.checkpoint.created'; readonly compactedToolResults: number; readonly removedItems?: number; readonly beforeBytes?: number; readonly afterBytes?: number } & AgentTurnIdentity)
-  | ({ readonly type: 'observation.record.created'; readonly id: string; readonly toolName: string; readonly call: ToolCall; readonly toolCallType: 'function' | 'custom'; readonly evidence: JsonValue; readonly immediatePresentation: ToolObservationPresentation; readonly retainedPresentation: ToolObservationPresentation; readonly immediateBytes: number; readonly retainedBytes: number } & AgentToolCallAttemptIdentity)
+  | ({ readonly type: 'observation.record.created'; readonly id: string; readonly toolName: string; readonly call: ToolCall; readonly toolCallType: 'function' | 'custom'; readonly evidence: JsonValue; readonly immediatePresentation: ToolObservationPresentation; readonly retainedPresentation: ToolObservationPresentation } & AgentToolCallAttemptIdentity)
   | ({ readonly type: 'tool.authorization.decided'; readonly toolName: string; readonly fingerprint: string; readonly binding: AgentApprovalBinding; readonly decision: 'allow' | 'deny' | 'require_approval'; readonly reason?: string } & AgentToolCallIdentity)
   | ({ readonly type: 'approval.requested'; readonly runId: string; readonly approvalId: string; readonly toolName: string; readonly fingerprint: string; readonly input: JsonValue; readonly effects: ToolEffects; readonly binding: AgentApprovalBinding; readonly policyHash: string; readonly reason: string } & AgentToolCallIdentity)
   | ({ readonly type: 'approval.resolved'; readonly runId: string; readonly approvalId: string; readonly fingerprint: string; readonly binding: AgentApprovalBinding; readonly decision: 'allow' | 'deny' } & AgentToolCallIdentity)
   | ({ readonly type: 'tool.started'; readonly toolName: string; readonly input: ToolCall; readonly fingerprint: string; readonly effects: ToolEffects } & AgentToolCallAttemptIdentity)
-  | ({ readonly type: 'tool.updated'; readonly toolName: string; readonly message: string } & AgentToolCallAttemptIdentity)
+  | ({ readonly type: 'tool.updated'; readonly toolName: string; readonly progress: ToolProgress } & AgentToolCallAttemptIdentity)
   | ({ readonly type: 'tool.ended'; readonly toolName: string; readonly observation: ToolObservation } & AgentToolCallAttemptIdentity)
   | ({ readonly type: 'check.started'; readonly check: string; readonly requirement: AgentCheckRequirement; readonly timeoutMs: number } & AgentTurnIdentity)
   | ({ readonly type: 'check.ended'; readonly check: string; readonly result: AgentCheckResult } & AgentTurnIdentity);
@@ -173,7 +173,7 @@ export type AgentProgressEvent =
   | ({ readonly type: 'assistant.interrupted'; readonly content: string; readonly candidate: AgentCandidate; readonly reasoningSummary?: string; readonly finalResponseReceived: boolean; readonly diagnostic?: ModelProviderErrorDiagnostic } & AgentTurnIdentity)
   | ({ readonly type: 'model.failed'; readonly diagnostic: ModelProviderErrorDiagnostic } & AgentTurnIdentity)
   | ({ readonly type: 'tool.started'; readonly toolName: string; readonly input: ToolCall; readonly fingerprint: string; readonly effects: ToolEffects } & AgentToolCallAttemptIdentity)
-  | ({ readonly type: 'tool.updated'; readonly toolName: string; readonly message: string } & AgentToolCallAttemptIdentity)
+  | ({ readonly type: 'tool.updated'; readonly toolName: string; readonly progress: ToolProgress } & AgentToolCallAttemptIdentity)
   | ({ readonly type: 'tool.ended'; readonly toolName: string; readonly observation: ToolObservation } & AgentToolCallAttemptIdentity)
   | ({ readonly type: 'check.ended'; readonly result: AgentCheckResult } & AgentTurnIdentity)
   | { readonly type: 'run.ended'; readonly terminal: AgentTerminalSnapshot; readonly deliveryDiagnostics: readonly AgentDeliveryDiagnostic[] };
@@ -182,6 +182,7 @@ export const agentEventCodec: RuntimeCodec<AgentEvent> = { name: 'AgentEvent', p
 
 const AGENT_EVENT_MAX_STRING_BYTES = 1024 * 1024;
 const AGENT_EVENT_MAX_TOTAL_BYTES = 4 * 1024 * 1024;
+const AGENT_EVENT_MAX_COLLECTION_ENTRIES = 20_000;
 
 export function parseAgentEvent(value: unknown): AgentEvent {
   if (!isRecord(value) || typeof value.type !== 'string') throw new Error('Agent event must have a type.');
@@ -207,7 +208,7 @@ export function parseAgentEvent(value: unknown): AgentEvent {
   if (!isAgentEvent(parsed)) throw new Error(`Malformed Agent event ${value.type}: validated fields did not form an event.`);
   const normalized = normalizeJsonSafe(parsed, {
     maxDepth: 16,
-    maxCollectionEntries: 256,
+    maxCollectionEntries: AGENT_EVENT_MAX_COLLECTION_ENTRIES,
     maxStringBytes: AGENT_EVENT_MAX_STRING_BYTES,
     maxTotalBytes: AGENT_EVENT_MAX_TOTAL_BYTES
   });
@@ -265,12 +266,12 @@ const EVENT_VALIDATORS = {
   'overflow.recovery.ended': (value, issues) => { if (!positiveInteger(value.attempt)) issues.push('attempt must be positive.'); requireRecord(value.result, 'result', issues); },
   'context.history.reduced': (value, issues) => { if (!Array.isArray(value.reductions)) issues.push('reductions must be an array.'); },
   'context.checkpoint.created': (value, issues) => { if (!nonnegativeInteger(value.compactedToolResults)) issues.push('compactedToolResults must be nonnegative.'); },
-  'observation.record.created': (value, issues) => { requireStrings(value, ['id', 'toolName'], issues); requireToolAttempt(value, issues); requireRecord(value.call, 'call', issues); requireRecord(value.immediatePresentation, 'immediatePresentation', issues); requireRecord(value.retainedPresentation, 'retainedPresentation', issues); if (value.toolCallType !== 'function' && value.toolCallType !== 'custom') issues.push('toolCallType is invalid.'); if (!nonnegativeFinite(value.immediateBytes) || !nonnegativeFinite(value.retainedBytes)) issues.push('presentation byte counts must be nonnegative.'); },
+  'observation.record.created': (value, issues) => { requireStrings(value, ['id', 'toolName'], issues); requireToolAttempt(value, issues); requireRecord(value.call, 'call', issues); requireRecord(value.immediatePresentation, 'immediatePresentation', issues); requireRecord(value.retainedPresentation, 'retainedPresentation', issues); if (value.toolCallType !== 'function' && value.toolCallType !== 'custom') issues.push('toolCallType is invalid.'); },
   'tool.authorization.decided': (value, issues) => { requireStrings(value, ['toolName', 'fingerprint'], issues); validateApprovalBinding(value.binding, issues); if (!nonnegativeInteger(value.callIndex)) issues.push('callIndex must be nonnegative.'); if (!['allow', 'deny', 'require_approval'].includes(String(value.decision))) issues.push('authorization decision is invalid.'); },
   'approval.requested': (value, issues) => { requireStrings(value, ['runId', 'approvalId', 'toolName', 'fingerprint', 'policyHash', 'reason'], issues); requireRecord(value.effects, 'effects', issues); validateApprovalBinding(value.binding, issues); },
   'approval.resolved': (value, issues) => { requireStrings(value, ['runId', 'approvalId', 'fingerprint'], issues); validateApprovalBinding(value.binding, issues); if (value.decision !== 'allow' && value.decision !== 'deny') issues.push('approval decision is invalid.'); },
   'tool.started': (value, issues) => { requireStrings(value, ['toolName', 'fingerprint'], issues); requireToolAttempt(value, issues); requireRecord(value.input, 'input', issues); requireRecord(value.effects, 'effects', issues); if (!nonnegativeInteger(value.callIndex)) issues.push('callIndex must be nonnegative.'); },
-  'tool.updated': (value, issues) => { requireStrings(value, ['toolName', 'message'], issues); requireToolAttempt(value, issues); if (!nonnegativeInteger(value.callIndex)) issues.push('callIndex must be nonnegative.'); },
+  'tool.updated': (value, issues) => { requireStrings(value, ['toolName'], issues); if (!isRecord(value.progress) || typeof value.progress.stage !== 'string') issues.push('progress.stage must be a string.'); requireToolAttempt(value, issues); if (!nonnegativeInteger(value.callIndex)) issues.push('callIndex must be nonnegative.'); },
   'tool.ended': (value, issues) => { requireStrings(value, ['toolName'], issues); requireToolAttempt(value, issues); requireRecord(value.observation, 'observation', issues); if (!nonnegativeInteger(value.callIndex)) issues.push('callIndex must be nonnegative.'); },
   'check.started': (value, issues) => { requireStrings(value, ['check', 'turnId'], issues); if (!positiveInteger(value.turnIndex) || !positiveInteger(value.requestAttempt)) issues.push('turn identity is invalid.'); if (value.requirement !== 'required' && value.requirement !== 'advisory') issues.push('requirement is invalid.'); if (!positiveInteger(value.timeoutMs)) issues.push('timeoutMs must be positive.'); },
   'check.ended': (value, issues) => { requireStrings(value, ['check', 'turnId'], issues); if (!positiveInteger(value.turnIndex) || !positiveInteger(value.requestAttempt)) issues.push('turn identity is invalid.'); requireRecord(value.result, 'result', issues); }

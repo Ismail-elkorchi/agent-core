@@ -19,13 +19,28 @@ import type { AgentSession } from '@agent-core/runtime';
 import type { AgentCheckDefinition } from '@agent-core/runtime';
 import {
   isToolAvailable,
+  accessRisk,
   type ToolCall,
   type ToolObservation,
   type ToolPolicy,
   type ToolRisk
 } from '@agent-core/tools';
 import type { ToolDefinition } from '@agent-core/tools';
-import { applyPatchTool, listDirectoryTreeTool, readTextFilesTool, searchFileTextTool, shellCommandTool, ShellRunner } from '@agent-core/tools-local';
+import {
+  DEFAULT_LOCAL_TOOL_CONFIGURATION,
+  ProcessManager,
+  WorkspaceFileSelector,
+  applyPatchTool,
+  execCommandTool,
+  findFilesTool,
+  listDirectoryTool,
+  readArtifactTool,
+  readFilesTool,
+  searchTextTool,
+  stopProcessTool,
+  viewImageTool,
+  writeStdinTool
+} from '@agent-core/tools-local';
 import { AgentTuiProgressRenderer, runAgentTuiApp, runAgentTuiTask } from './tui/index.js';
 import type { AgentTuiRuntimeDetails } from './tui/index.js';
 import { parseReasoningEffort } from './cli-values.js';
@@ -166,7 +181,13 @@ async function createRuntime(
   const artifactStore = new LocalArtifactRepository({ rootDir: workspace.artifactsDir });
   const events = new JsonlEventRepository<AgentEvent>({ rootDir: workspace.runsDir, codec: agentEventCodec });
   const estimator = new SimpleTokenEstimator();
-  const shellRunner = new ShellRunner({ artifactStore });
+  const localToolConfiguration = DEFAULT_LOCAL_TOOL_CONFIGURATION;
+  const processManager = new ProcessManager({
+    artifactRepository: artifactStore,
+    maxCapturedBytes: localToolConfiguration.process.maxCapturedBytes,
+    tailBytes: localToolConfiguration.process.tailBytes
+  });
+  const workspaceFileSelector = new WorkspaceFileSelector(workspace.workspaceRoot, localToolConfiguration.fileSelection);
   const toolPolicy = toolPolicyFromOptions(options);
   const configuredTools = createCliDefaultTools(options.configuration?.tools.enabled);
   const instructions = await loadWorkspaceInstructions(workspace.workspaceRoot, options.configuration);
@@ -187,22 +208,43 @@ async function createRuntime(
       services: {
         workspaceRoot: workspace.workspaceRoot,
         patchTransactionDirectory: path.join(workspace.runtimeDir, 'transactions', 'patch'),
-        shellRunner
+        localToolConfiguration,
+        processManager,
+        workspaceFileSelector
       }
     },
     toolPolicy,
     ...(options.configuration?.authorization.requireApprovalFor.length ? { toolAuthorizer: request => {
       if (!isToolAvailable(request.tool, toolPolicy)) return { decision: 'deny' as const, reason: 'Denied by workspace policy.' };
-      return options.configuration?.authorization.requireApprovalFor.includes(request.tool.risk)
-        ? { decision: 'require_approval' as const, reason: `Workspace configuration requires approval for ${request.tool.risk} tools.` }
+      const approvalAccesses = request.effects.accesses.map((access) => accessRisk(access.mode))
+        .filter((risk) => options.configuration?.authorization.requireApprovalFor.includes(risk));
+      return approvalAccesses.length > 0
+        ? { decision: 'require_approval' as const, reason: `Workspace configuration requires approval for ${[...new Set(approvalAccesses)].join(', ')} access.` }
         : { decision: 'allow' as const, reason: 'Allowed by workspace policy.' };
     } } : {}),
     ...(instructions.length > 0 ? { instructions } : {}),
     ...(checks.length > 0 ? { checks } : {}),
     ...(options.configuration?.limits ? { limits: options.configuration.limits } : {}),
     ...(checks.length > 0 ? { verification: { evidence: { read: () => Promise.resolve({ items: [], bytes: 0, truncated: false }), readArtifact: ref => artifactStore.readVerified(ref) }, runCommand: async (request, signal) => {
-      const result = await shellRunner.run({ command: request.command, cwd: workspace.workspaceRoot, shell: true, ...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }), ...(request.maxOutputBytes === undefined ? {} : { maxOutputBytes: request.maxOutputBytes }), signal });
-      return { exitCode: result.outcome === 'exited' ? result.process.exitCode : null, stdout: result.stdout, stderr: result.stderr, durationMs: result.durationMs };
+      const startedAt = Date.now();
+      const outputTokenBudget = Math.max(64, Math.ceil((request.maxOutputBytes ?? 64_000) / 4));
+      let result = await processManager.start({
+        command: request.command,
+        cwd: workspace.workspaceRoot,
+        pty: false,
+        timeoutMs: request.timeoutMs ?? 60_000,
+        yieldMs: localToolConfiguration.process.maxYieldMs,
+        outputTokenBudget,
+        signal
+      });
+      let stdout = result.stdout.text;
+      let stderr = result.stderr.text;
+      while (result.status === 'running') {
+        result = await processManager.poll(result.processId, outputTokenBudget, localToolConfiguration.process.maxYieldMs);
+        stdout += result.stdout.text;
+        stderr += result.stderr.text;
+      }
+      return { exitCode: result.status === 'exited' ? result.exitCode ?? null : null, stdout, stderr, durationMs: Date.now() - startedAt };
     } } } : {}),
     metadata: {
       workspaceRoot: workspace.workspaceRoot,
@@ -235,11 +277,16 @@ async function createRuntime(
 
 export function createCliDefaultTools(enabled?: readonly string[]): ToolDefinition[] {
   const tools = [
-    listDirectoryTreeTool,
-    readTextFilesTool,
-    searchFileTextTool,
+    listDirectoryTool,
+    findFilesTool,
+    readFilesTool,
+    searchTextTool,
     applyPatchTool,
-    shellCommandTool
+    execCommandTool,
+    writeStdinTool,
+    stopProcessTool,
+    viewImageTool,
+    readArtifactTool
   ];
   if (!enabled) return tools;
   const known = new Set(tools.map((tool) => tool.name));
@@ -534,15 +581,13 @@ export function createCliToolPolicy(options: CliToolPolicyOptions): ToolPolicy {
   }
   return {
     allowedRisks: [...new Set(allowedRisks)],
-    ...(options.dryRun ? { dryRunWrites: true } : {}),
-    ...(options.allowUnsafeShell ? { allowUnsafeShell: true } : {})
+    ...(options.dryRun ? { dryRunWrites: true } : {})
   };
 }
 
 function toolPolicyFromOptions(options: CliOptions): ToolPolicy {
   if (options.configuration) return {
-    allowedRisks: [...options.configuration.authorization.allowedRisks],
-    ...(options.configuration.authorization.allowedRisks.includes('destructive') ? { allowUnsafeShell: true } : {})
+    allowedRisks: [...options.configuration.authorization.allowedRisks]
   };
   return createCliToolPolicy(options);
 }
@@ -886,10 +931,11 @@ export class CliProgressRenderer {
       this.finishReasoningLine();
       this.stderr.write(`[tool ${String(event.turnIndex)}] running ${formatToolCall(event.input)}\n`);
     } else if (event.type === 'tool.updated') {
-      if (event.message !== 'executing') {
+      const message = event.progress.message ?? event.progress.stage;
+      if (event.progress.stage !== 'executing') {
         this.finishAnswerLine();
         this.finishReasoningLine();
-        this.stderr.write(`[tool ${String(event.turnIndex)}] ${event.toolName}: ${event.message}\n`);
+        this.stderr.write(`[tool ${String(event.turnIndex)}] ${event.toolName}: ${message}\n`);
       }
     } else if (event.type === 'tool.ended') {
       this.finishAnswerLine();
@@ -955,8 +1001,9 @@ function formatToolCall(toolCall: ToolCall): string {
 function formatToolResult(turnIndex: number, toolName: string, observation: ToolObservation): string {
   const status = observation.ok ? 'ok' : 'failed';
   const turnLabel = String(turnIndex);
-  const artifacts = observation.artifacts && observation.artifacts.length > 0
-    ? `\n[tool ${turnLabel}] artifacts: ${observation.artifacts.map((artifact) => artifact.label ?? artifact.artifactId).join(', ')}`
+  const artifactRefs = (observation.content ?? []).flatMap((item) => item.type === 'text' ? [] : [item.artifact]);
+  const artifacts = artifactRefs.length > 0
+    ? `\n[tool ${turnLabel}] artifacts: ${artifactRefs.map((artifact) => artifact.label ?? artifact.artifactId).join(', ')}`
     : '';
   return `[tool ${turnLabel}] ${status} ${toolName} - ${observation.summary}${artifacts}\n`;
 }

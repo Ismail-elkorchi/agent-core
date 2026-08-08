@@ -42,7 +42,6 @@ export async function invokeToolCall(call, tools, context) {
   if (authorization.decision !== 'allow') {
     return policyBlockedObservation(`Tool authorization denied: ${call.name}`, {
       tool: call.name,
-      risk: preparation.prepared.tool.risk,
       policyReason: authorization.decision,
       recovery: authorization.reason
     });
@@ -50,7 +49,7 @@ export async function invokeToolCall(call, tools, context) {
   return invokePreparedToolCall(preparation.prepared, preparationContext);
 }
 
-export async function presentToolObservation(tool, call, observation, context, maxBytes) {
+export async function presentToolObservation(tool, call, observation, context, maxTokens) {
   const controller = new AbortController();
   const preparationContext = {
     ...context,
@@ -63,12 +62,12 @@ export async function presentToolObservation(tool, call, observation, context, m
   const preparation = await prepareToolCall(call, [tool], preparationContext);
   if (!preparation.ok) {
     if (observation.kind !== 'failure') throw new Error(`Cannot present a result for an invalid tool call: ${preparation.observation.summary}`);
-    return tool.presentObservation({ call, input: undefined, observation, limit: { maxBytes } });
+    return tool.presentObservation({ call, input: undefined, observation, limit: { maxTokens } });
   }
   return tool.presentObservation({
     call,
     input: preparation.prepared.canonicalInput,
     observation,
-    limit: { maxBytes }
+    limit: { maxTokens }
   });
 }

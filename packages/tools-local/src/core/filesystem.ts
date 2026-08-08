@@ -3,13 +3,6 @@ import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { splitLogicalLines, ToolInputError } from '@agent-core/tools';
 
-export type HiddenMode = 'include' | 'exclude' | 'only';
-
-export interface PathMatcher {
-  pattern: string;
-  matches(workspaceRelativePath: string, scopedRelativePath: string, name: string): boolean;
-}
-
 export type TextFileFailureReason = 'not_found' | 'not_file' | 'binary' | 'too_large' | 'symlink' | 'path_outside_workspace';
 
 export interface TextFileFailure {
@@ -339,82 +332,4 @@ export function isProbablyBinary(buffer: Buffer): boolean {
   return sample.length > 0 && suspicious / sample.length > 0.2;
 }
 
-export function hasHiddenSegment(relativePathValue: string): boolean {
-  return relativePathValue.split('/').some((segment) => segment.startsWith('.') && segment.length > 1);
-}
-
-export function hiddenModeAllows(relativePathValue: string, mode: HiddenMode): boolean {
-  const hidden = hasHiddenSegment(relativePathValue);
-  return mode === 'include' || (mode === 'exclude' && !hidden) || (mode === 'only' && hidden);
-}
-
-export function validateRelativePatterns(patterns: readonly string[], fieldName: string): void {
-  for (const pattern of patterns) {
-    const normalized = normalizePattern(pattern);
-    if (path.isAbsolute(normalized) || path.win32.isAbsolute(normalized) || normalized.split('/').includes('..')) {
-      throw new ToolInputError(`${fieldName} patterns must be relative and cannot contain "..": ${pattern}`, {
-        field: fieldName,
-        pattern
-      });
-    }
-  }
-}
-
-export function createPathMatcher(pattern: string): PathMatcher {
-  const normalizedPattern = normalizePattern(pattern);
-  const hasWildcard = /[*?]/.test(normalizedPattern);
-  const hasPathSeparator = normalizedPattern.includes('/');
-  const regex = hasWildcard ? globToRegExp(normalizedPattern) : undefined;
-
-  return {
-    pattern,
-    matches(workspaceRelativePath, scopedRelativePath, name) {
-      if (regex) {
-        return regex.test(workspaceRelativePath) || regex.test(scopedRelativePath) || regex.test(name);
-      }
-      if (!hasPathSeparator) {
-        return name === normalizedPattern
-          || workspaceRelativePath.split('/').includes(normalizedPattern)
-          || scopedRelativePath.split('/').includes(normalizedPattern);
-      }
-      return pathMatchesOrDescends(workspaceRelativePath, normalizedPattern)
-        || pathMatchesOrDescends(scopedRelativePath, normalizedPattern);
-    }
-  };
-}
-
-export function normalizePattern(pattern: string): string {
-  return pattern.trim().replaceAll('\\', '/').replace(/^\.\/+/, '').replace(/\/+$/, '');
-}
-
-function globToRegExp(pattern: string): RegExp {
-  let source = '^';
-  for (let index = 0; index < pattern.length; index += 1) {
-    const char = pattern[index] ?? '';
-    const next = pattern[index + 1] ?? '';
-    if (char === '*' && next === '*') {
-      source += '.*';
-      index += 1;
-      continue;
-    }
-    if (char === '*') {
-      source += '[^/]*';
-      continue;
-    }
-    if (char === '?') {
-      source += '[^/]';
-      continue;
-    }
-    source += escapeRegExp(char);
-  }
-  return new RegExp(`${source}$`);
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function pathMatchesOrDescends(candidate: string, pattern: string): boolean {
-  return candidate === pattern || candidate.startsWith(`${pattern}/`);
-}
 function nodeCode(error: unknown): string | undefined { return typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string' ? error.code : undefined; }

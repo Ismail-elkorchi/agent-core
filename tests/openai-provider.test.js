@@ -103,7 +103,7 @@ test('OpenAIProvider sends Responses API requests with bearer auth, tools, text.
           {
             type: 'function_call',
             call_id: 'call-1',
-            name: 'read_text_files',
+            name: 'read_files',
             arguments: '{"files":[{"path":"package.json"}]}'
           }
         ],
@@ -133,7 +133,7 @@ test('OpenAIProvider sends Responses API requests with bearer auth, tools, text.
           {
             id: 'previous-call',
             type: 'function',
-            name: 'read_text_files',
+            name: 'read_files',
             input: { kind: 'json', value: { files: [{ path: 'README.md' }] } }
           }
         ]
@@ -141,7 +141,7 @@ test('OpenAIProvider sends Responses API requests with bearer auth, tools, text.
       {
         role: 'tool',
         toolCallId: 'previous-call',
-        toolName: 'read_text_files',
+        toolName: 'read_files',
         toolCallType: 'function',
         content: '{"ok":true}'
       }
@@ -150,7 +150,7 @@ test('OpenAIProvider sends Responses API requests with bearer auth, tools, text.
       {
         type: 'function',
         function: {
-          name: 'read_text_files',
+          name: 'read_files',
           description: 'Read text files',
           parameters: {
             type: 'object',
@@ -199,7 +199,7 @@ test('OpenAIProvider sends Responses API requests with bearer auth, tools, text.
   assert.deepEqual(body.input[2], {
     type: 'function_call',
     call_id: 'previous-call',
-    name: 'read_text_files',
+    name: 'read_files',
     arguments: '{"files":[{"path":"README.md"}]}'
   });
   assert.deepEqual(body.input[3], {
@@ -209,7 +209,7 @@ test('OpenAIProvider sends Responses API requests with bearer auth, tools, text.
   });
   assert.deepEqual(body.tools[0], {
     type: 'function',
-    name: 'read_text_files',
+    name: 'read_files',
     description: 'Read text files',
     parameters: {
       type: 'object',
@@ -232,7 +232,7 @@ test('OpenAIProvider sends Responses API requests with bearer auth, tools, text.
     {
       id: 'call-1',
       type: 'function',
-      name: 'read_text_files',
+      name: 'read_files',
       input: { kind: 'json', value: { files: [{ path: 'package.json' }] } }
     }
   ]);
@@ -445,7 +445,7 @@ test('OpenAIProvider streams typed content, reasoning, tool calls, and final res
         item: {
           type: 'function_call',
           call_id: 'call-2',
-          name: 'list_directory_tree',
+          name: 'list_directory',
           arguments: '{"path":"."}'
         }
       },
@@ -460,7 +460,7 @@ test('OpenAIProvider streams typed content, reasoning, tool calls, and final res
             {
               type: 'function_call',
               call_id: 'call-2',
-              name: 'list_directory_tree',
+              name: 'list_directory',
               arguments: '{"path":"."}'
             }
           ],
@@ -478,7 +478,7 @@ test('OpenAIProvider streams typed content, reasoning, tool calls, and final res
   assert.deepEqual(events.filter((event) => event.type === 'content').map((event) => event.content), ['hel', 'lo']);
   assert.deepEqual(events.filter((event) => event.type === 'reasoning').map((event) => event.reasoning), ['plan ']);
   assert.deepEqual(events.filter((event) => event.type === 'reasoning').map((event) => event.channel), ['summary']);
-  assert.deepEqual(events.filter((event) => event.type === 'tool_call').map((event) => event.toolCall.name), ['list_directory_tree']);
+  assert.deepEqual(events.filter((event) => event.type === 'tool_call').map((event) => event.toolCall.name), ['list_directory']);
   const done = events.at(-1);
   assert.equal(done.type, 'done');
   assert.equal(done.response.content, 'hello');
@@ -487,7 +487,7 @@ test('OpenAIProvider streams typed content, reasoning, tool calls, and final res
     {
       id: 'call-2',
       type: 'function',
-      name: 'list_directory_tree',
+      name: 'list_directory',
       input: { kind: 'json', value: { path: '.' } }
     }
   ]);
@@ -617,7 +617,7 @@ test('OpenAIProvider rejects malformed tool call arguments', async () => {
         {
           type: 'function_call',
           call_id: 'call-bad',
-          name: 'read_text_files',
+          name: 'read_files',
           arguments: '{bad json}'
         }
       ]
@@ -685,7 +685,7 @@ function toolTranscriptMessages() {
         {
           id: 'call-shell-1',
           type: 'function',
-          name: 'shell_command',
+          name: 'exec_command',
           input: { kind: 'json', value: { command: 'pwd' } }
         }
       ]
@@ -694,7 +694,7 @@ function toolTranscriptMessages() {
       role: 'tool',
       toolCallType: 'function',
       toolCallId: 'call-shell-1',
-      toolName: 'shell_command',
+      toolName: 'exec_command',
       content: '{"ok":true,"results":{"stdout":{"text":"/tmp/project\\n"}}}'
     },
     {
@@ -704,7 +704,7 @@ function toolTranscriptMessages() {
         {
           id: 'call-shell-2',
           type: 'function',
-          name: 'shell_command',
+          name: 'exec_command',
           input: { kind: 'json', value: { command: 'ls' } }
         }
       ]
@@ -713,7 +713,7 @@ function toolTranscriptMessages() {
       role: 'tool',
       toolCallType: 'function',
       toolCallId: 'call-shell-2',
-      toolName: 'shell_command',
+      toolName: 'exec_command',
       content: '{"ok":true,"results":{"stdout":{"text":"README.md\\n"}}}'
     }
   ];
@@ -732,7 +732,7 @@ function longMixedShellTranscriptMessages(turns) {
         {
           id: `call-shell-${String(index)}`,
           type: 'function',
-          name: 'shell_command',
+          name: 'exec_command',
           input: { kind: 'json', value: { command: `printf chunk-${String(index)}` } }
         }
       ]
@@ -741,7 +741,7 @@ function longMixedShellTranscriptMessages(turns) {
       role: 'tool',
       toolCallType: 'function',
       toolCallId: `call-shell-${String(index)}`,
-      toolName: 'shell_command',
+      toolName: 'exec_command',
       content: JSON.stringify({
         ok: true,
         results: {

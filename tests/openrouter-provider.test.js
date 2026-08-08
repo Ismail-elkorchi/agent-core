@@ -157,7 +157,7 @@ test('OpenRouterProvider sends chat requests through the real OpenRouter surface
                   id: 'call-1',
                   type: 'function',
                   function: {
-                    name: 'read_text_files',
+                    name: 'read_files',
                     arguments: '{"files":[{"path":"package.json"}]}'
                   }
                 }
@@ -191,7 +191,7 @@ test('OpenRouterProvider sends chat requests through the real OpenRouter surface
           {
             id: 'previous-call',
             type: 'function',
-            name: 'read_text_files',
+            name: 'read_files',
             input: { kind: 'json', value: { files: [{ path: 'README.md' }] } }
           }
         ]
@@ -199,7 +199,7 @@ test('OpenRouterProvider sends chat requests through the real OpenRouter surface
       {
         role: 'tool',
         toolCallId: 'previous-call',
-        toolName: 'read_text_files',
+        toolName: 'read_files',
         toolCallType: 'function',
         content: '{"ok":true}'
       }
@@ -208,7 +208,7 @@ test('OpenRouterProvider sends chat requests through the real OpenRouter surface
       {
         type: 'function',
         function: {
-          name: 'read_text_files',
+          name: 'read_files',
           description: 'Read a file',
           parameters: {
             type: 'object',
@@ -253,8 +253,8 @@ test('OpenRouterProvider sends chat requests through the real OpenRouter surface
   assert.equal(body.messages[2].content, null);
   assert.equal(body.messages[2].tool_calls[0].function.arguments, '{"files":[{"path":"README.md"}]}');
   assert.equal(body.messages[3].tool_call_id, 'previous-call');
-  assert.equal(body.messages[3].name, 'read_text_files');
-  assert.equal(body.tools[0].function.name, 'read_text_files');
+  assert.equal(body.messages[3].name, 'read_files');
+  assert.equal(body.tools[0].function.name, 'read_files');
   assert.deepEqual(body.reasoning, { max_tokens: 256, exclude: true });
   assert.deepEqual(body.metadata, { runId: 'run-1' });
   assert.deepEqual(body.provider, { order: ['openai'], require_parameters: true });
@@ -265,7 +265,7 @@ test('OpenRouterProvider sends chat requests through the real OpenRouter surface
     {
       id: 'call-1',
       type: 'function',
-      name: 'read_text_files',
+      name: 'read_files',
       input: { kind: 'json', value: { files: [{ path: 'package.json' }] } }
     }
   ]);
@@ -297,7 +297,7 @@ test('OpenRouterProvider streams content, reasoning, tool calls, and final usage
             delta: {
               content: 'lo',
               tool_calls: [
-                { index: 0, id: 'call-2', type: 'function', function: { name: 'list_directory_tree', arguments: '{"path":' } }
+                { index: 0, id: 'call-2', type: 'function', function: { name: 'list_directory', arguments: '{"path":' } }
               ]
             }
           }
@@ -333,7 +333,7 @@ test('OpenRouterProvider streams content, reasoning, tool calls, and final usage
   assert.deepEqual(events.filter((event) => event.type === 'content').map((event) => event.content), ['hel', 'lo']);
   assert.deepEqual(events.filter((event) => event.type === 'reasoning').map((event) => event.reasoning), ['plan ']);
   assert.equal(events.some((event) => event.type === 'status' && /OPENROUTER PROCESSING/.test(event.message)), true);
-  assert.deepEqual(events.filter((event) => event.type === 'tool_call').map((event) => event.toolCall.name), ['list_directory_tree']);
+  assert.deepEqual(events.filter((event) => event.type === 'tool_call').map((event) => event.toolCall.name), ['list_directory']);
   const done = events.at(-1);
   assert.equal(done.type, 'done');
   assert.equal(done.response.content, 'hello');
@@ -342,7 +342,7 @@ test('OpenRouterProvider streams content, reasoning, tool calls, and final usage
     {
       id: 'call-2',
       type: 'function',
-      name: 'list_directory_tree',
+      name: 'list_directory',
       input: { kind: 'json', value: { path: '.' } }
     }
   ]);
@@ -413,7 +413,7 @@ test('OpenRouterProvider rejects catalog capability contradictions before chat I
     () => provider.complete({
       model: 'openai/text-only',
       messages: [{ role: 'user', content: 'use a tool' }],
-      tools: [{ type: 'function', function: { name: 'read_text_files' } }]
+      tools: [{ type: 'function', function: { name: 'read_files' } }]
     }),
     error => error instanceof ModelProviderError && error.code === 'invalid_request' && /tools|tool calling/.test(error.message)
   );

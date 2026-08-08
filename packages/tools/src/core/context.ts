@@ -29,6 +29,14 @@ export interface ToolExecutionContext {
   services?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
   invocation?: ToolInvocationContext;
+  emitProgress?: (progress: ToolProgress) => void | Promise<void>;
+}
+
+export interface ToolProgress {
+  readonly stage: string;
+  readonly message?: string;
+  readonly completed?: number;
+  readonly total?: number;
 }
 
 export interface ToolAuthorizationBoundary {

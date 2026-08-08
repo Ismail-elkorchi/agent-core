@@ -12,12 +12,11 @@ import {
   sha256Text,
   validateParentDirectory
 } from '../../core/filesystem.js';
-import { invalidToolInputObservation, policyBlockedObservation, runtimeErrorObservation } from '@agent-core/tools';
-import { isRiskAllowed } from '@agent-core/tools';
+import { invalidToolInputObservation, runtimeErrorObservation } from '@agent-core/tools';
 import { commitTextFilePatchTransaction, recoverTextFilePatchTransactions, type PreparedTextPatchRemove, type PreparedTextPatchWrite, type TextTransactionResult } from '../../core/text-write.js';
 import { splitLogicalLines } from '@agent-core/tools';
 import { applyPatchUpdate, PatchApplyError } from './apply-diff.js';
-import { parseApplyPatch, PatchParseError, type ParsedPatchOperation } from './patch-parser.js';
+import { PatchParseError, type ParsedApplyPatch, type ParsedPatchOperation } from './patch-parser.js';
 import type {
   ApplyPatchFailure,
   ApplyPatchFileOutput,
@@ -26,7 +25,16 @@ import type {
   ApplyPatchOutput,
   ApplyPatchPathPair
 } from './schema.js';
-import { createPatchLifecycle, reducePatchLifecycle, type PatchLifecycleCommand, type PatchLifecycleEvent, type PatchLifecycleState } from './lifecycle-machine.js';
+
+export interface CanonicalApplyPatchInput extends ApplyPatchInput {
+  readonly tree: ParsedApplyPatch;
+  readonly limits: {
+    readonly maxPatchBytes: number;
+    readonly maxOperations: number;
+    readonly maxFileBytes: number;
+    readonly maxNewBytesPerFile: number;
+  };
+}
 
 interface PreparedPatchOperation {
   output: ApplyPatchFileOutput;
@@ -39,59 +47,27 @@ interface PreparedPatchOperation {
   changedPaths: string[];
 }
 
-export async function applyPatch(input: ApplyPatchInput, context: ToolExecutionContext): Promise<ToolObservation<ApplyPatchOutput>> {
-  let lifecycle: PatchLifecycleState = createPatchLifecycle();
-  if (!isRiskAllowed(context.policy, 'write') && context.policy.dryRunWrites !== true) {
-    return policyBlockedObservation('Patch blocked because write access is disabled.', {
-      tool: 'apply_patch',
-      risk: 'write',
-      policyReason: 'writes_disabled'
-    });
-  }
-
-  let parsed;
-  try {
-    parsed = parseApplyPatch(input.patch, { maxPatchBytes: input.maxPatchBytes });
-  } catch (error) {
-    const failures = [patchFailureFromError('', error)];
-    patchTransition(lifecycle, { type: 'parse.failed', message: summarizePatchFailures(failures) }, 'failure.persist');
-    return invalidToolInputObservation('apply_patch', summarizePatchFailures(failures), {
-      failures
-    });
-  }
-  lifecycle = patchTransition(lifecycle, { type: 'parse.succeeded' }, 'preflight.run');
-
+export async function applyPatch(input: CanonicalApplyPatchInput, context: ToolExecutionContext): Promise<ToolObservation<ApplyPatchOutput>> {
   throwIfAborted(context.signal);
   const rootDir = requireWorkspaceRoot(context);
-  const journalDirectory = requireToolService(context, 'patchTransactionDirectory', isNonEmptyString, 'non-empty patch transaction directory');
-  await recoverTextFilePatchTransactions(rootDir, journalDirectory);
-  const dryRun = input.dryRun || context.policy.dryRunWrites === true || !isRiskAllowed(context.policy, 'write');
-  const prepared: PreparedPatchOperation[] = [];
-  const failures: ApplyPatchFailure[] = [];
-  const reservedPaths = new Set<string>();
-
-  for (const operation of parsed.operations) {
-    const result = await prepareOperation(rootDir, operation, input, reservedPaths);
-    if (!result.ok) {
-      failures.push(result.failure);
-      continue;
-    }
-    prepared.push(result.operation);
-  }
+  const dryRun = input.dryRun;
+  const journalDirectory = dryRun ? undefined : requireToolService(context, 'patchTransactionDirectory', isNonEmptyString, 'non-empty patch transaction directory');
+  if (journalDirectory) await recoverTextFilePatchTransactions(rootDir, journalDirectory);
+  await context.emitProgress?.({ stage: 'prepare', message: 'Preparing patch transaction.', completed: 0, total: input.tree.operations.length });
+  const { prepared, failures } = await preparePatch(rootDir, input);
 
   if (failures.length > 0) {
-    patchTransition(lifecycle, { type: 'preflight.failed', message: summarizePatchFailures(failures) }, 'failure.persist');
     return invalidToolInputObservation('apply_patch', summarizePatchFailures(failures), {
       failures
     });
   }
-  lifecycle = patchTransition(lifecycle, { type: 'preflight.succeeded' }, 'changes.prepare');
+  await context.emitProgress?.({ stage: 'prepare', message: 'Patch transaction prepared.', completed: prepared.length, total: input.tree.operations.length });
 
   const changed = prepared.filter((operation) => operation.output.changed);
-  const requiresCommit = !dryRun && changed.length > 0;
-  lifecycle = patchTransition(lifecycle, { type: 'changes.prepared', requiresCommit }, requiresCommit ? 'transaction.commit' : 'result.complete');
   if (!dryRun && changed.length > 0) {
+    if (!journalDirectory) throw new Error('Patch journal directory is unavailable for a write transaction.');
     throwIfAborted(context.signal);
+    await context.emitProgress?.({ stage: 'commit', message: 'Committing patch transaction.', completed: 0, total: changed.length });
     const transactionId = patchTransactionId(context);
     const transaction = await commitTextFilePatchTransaction(rootDir, {
       writes: changed.flatMap((operation) => operation.write ? [operation.write] : []),
@@ -102,16 +78,13 @@ export async function applyPatch(input: ApplyPatchInput, context: ToolExecutionC
       journalDirectory,
       ...(transactionId ? { transactionId } : {})
     });
-    if (transaction.outcome === 'committed') {
-      lifecycle = patchTransition(lifecycle, { type: 'commit.succeeded' }, 'result.complete');
-    } else {
-      const recovery = transactionRecovery(transaction);
+    if (transaction.outcome !== 'committed') {
+      await context.emitProgress?.({ stage: 'rollback', message: `Patch rollback ${transactionRecovery(transaction)}.` });
       const message = transactionFailureMessage(transaction);
-      patchTransition(lifecycle, { type: 'commit.failed', message, recovery }, 'failure.persist');
       return runtimeErrorObservation('apply_patch', message, { transaction });
     }
+    await context.emitProgress?.({ stage: 'commit', message: 'Patch transaction committed.', completed: changed.length, total: changed.length });
   }
-  if (lifecycle.state !== 'completed') throw new Error(`Patch lifecycle did not reach completed: ${lifecycle.state}.`);
 
   const wouldChangePaths = uniquePaths(changed.flatMap((operation) => operation.changedPaths));
   const changedPaths = dryRun ? [] : [...wouldChangePaths];
@@ -139,10 +112,27 @@ export async function applyPatch(input: ApplyPatchInput, context: ToolExecutionC
     kind: 'result',
     ok: true,
     summary: summarizePatchOutput(output),
+    scope: { resources: uniquePaths(prepared.flatMap((operation) => operation.changedPaths)).map((item) => `workspace/files/${item}`), coverage: 'complete' },
     output,
     evidence: evidenceDelta(patchEvidenceItems(output)),
     ...(!dryRun ? { metadata: { changedPaths: output.changedPaths } } : {})
   };
+}
+
+/** Builds the one transaction plan used by both dry-run and commit execution. */
+export async function preparePatch(rootDir: string, input: CanonicalApplyPatchInput): Promise<{
+  readonly prepared: PreparedPatchOperation[];
+  readonly failures: ApplyPatchFailure[];
+}> {
+  const prepared: PreparedPatchOperation[] = [];
+  const failures: ApplyPatchFailure[] = [];
+  const reservedPaths = new Set<string>();
+  for (const operation of input.tree.operations) {
+    const result = await prepareOperation(rootDir, operation, input, reservedPaths);
+    if (result.ok) prepared.push(result.operation);
+    else failures.push(result.failure);
+  }
+  return { prepared, failures };
 }
 
 function patchTransactionId(context: ToolExecutionContext): string | undefined {
@@ -154,11 +144,6 @@ function patchTransactionId(context: ToolExecutionContext): string | undefined {
 
 function isNonEmptyString(value: unknown): value is string { return typeof value === 'string' && value.trim().length > 0; }
 
-function patchTransition(state: PatchLifecycleState, event: PatchLifecycleEvent, expected: PatchLifecycleCommand['type']): PatchLifecycleState {
-  const transition = reducePatchLifecycle(state, event);
-  if (transition.commands.length !== 1 || transition.commands[0]?.type !== expected) throw new Error(`Patch lifecycle expected ${expected}, received ${transition.commands.map((command) => command.type).join(', ') || 'none'}.`);
-  return transition.state;
-}
 function transactionRecovery(result: Exclude<TextTransactionResult, { outcome: 'committed' }>): 'succeeded' | 'failed' | 'uncertain' {
   return result.outcome === 'committed_with_residue' ? result.cleanup.status : result.rollback.status;
 }
@@ -210,7 +195,7 @@ function evidenceActionForPatch(operation: ApplyPatchFileOutput['operation']): E
 async function prepareOperation(
   rootDir: string,
   operation: ParsedPatchOperation,
-  input: ApplyPatchInput,
+  input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
 ): Promise<
   | { ok: true; operation: PreparedPatchOperation }
@@ -230,7 +215,7 @@ async function prepareAdd(
   requestedPath: string,
   content: string,
   additions: number,
-  input: ApplyPatchInput,
+  input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
 ): Promise<
   | { ok: true; operation: PreparedPatchOperation }
@@ -245,15 +230,15 @@ async function prepareAdd(
     return { ok: false, failure: withFailureContext(duplicate, 'add') };
   }
   const bytes = byteLengthUtf8(content);
-  if (bytes > input.maxNewBytesPerFile) {
+  if (bytes > input.limits.maxNewBytesPerFile) {
     return {
       ok: false,
       failure: {
         path: target.path,
         operation: 'add',
         reason: 'result_too_large',
-        message: `Created file would be too large (${String(bytes)} bytes, max ${String(input.maxNewBytesPerFile)}): ${target.path}`,
-        nextAction: 'Reduce the added file content or raise maxNewBytesPerFile when the caller intentionally allows a larger text file.'
+        message: `Created file would be too large (${String(bytes)} bytes, host max ${String(input.limits.maxNewBytesPerFile)}): ${target.path}`,
+        nextAction: 'Reduce the added file content.'
       }
     };
   }
@@ -299,13 +284,13 @@ async function prepareAdd(
 async function prepareDelete(
   rootDir: string,
   requestedPath: string,
-  input: ApplyPatchInput,
+  input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
 ): Promise<
   | { ok: true; operation: PreparedPatchOperation }
   | { ok: false; failure: ApplyPatchFailure }
 > {
-  const inspected = await inspectTextFile(rootDir, requestedPath, input.maxBytesPerFile, { rejectSymlink: true });
+  const inspected = await inspectTextFile(rootDir, requestedPath, input.limits.maxFileBytes, { rejectSymlink: true });
   if (!inspected.ok) {
     return { ok: false, failure: textFileFailure(inspected.failure.path, inspected.failure.reason, inspected.failure.message, 'delete') };
   }
@@ -347,13 +332,13 @@ async function prepareDelete(
 async function prepareUpdate(
   rootDir: string,
   operation: Extract<ParsedPatchOperation, { kind: 'update' }>,
-  input: ApplyPatchInput,
+  input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
 ): Promise<
   | { ok: true; operation: PreparedPatchOperation }
   | { ok: false; failure: ApplyPatchFailure }
 > {
-  const inspected = await inspectTextFile(rootDir, operation.path, input.maxBytesPerFile, { rejectSymlink: true });
+  const inspected = await inspectTextFile(rootDir, operation.path, input.limits.maxFileBytes, { rejectSymlink: true });
   if (!inspected.ok) {
     return { ok: false, failure: textFileFailure(inspected.failure.path, inspected.failure.reason, inspected.failure.message, 'update') };
   }
@@ -376,15 +361,15 @@ async function prepareUpdate(
   }
 
   const newBytes = byteLengthUtf8(patched.content);
-  if (newBytes > input.maxNewBytesPerFile) {
+  if (newBytes > input.limits.maxNewBytesPerFile) {
     return {
       ok: false,
       failure: {
         path: inspected.file.path,
         operation: operation.moveTo ? 'move' : 'update',
         reason: 'result_too_large',
-        message: `Patched file would be too large (${String(newBytes)} bytes, max ${String(input.maxNewBytesPerFile)}): ${inspected.file.path}`,
-        nextAction: 'Reduce the patch result size or raise maxNewBytesPerFile when the caller intentionally allows a larger text file.'
+        message: `Patched file would be too large (${String(newBytes)} bytes, host max ${String(input.limits.maxNewBytesPerFile)}): ${inspected.file.path}`,
+        nextAction: 'Reduce the patch result size.'
       }
     };
   }
@@ -531,7 +516,7 @@ function reservePath(paths: Set<string>, absolutePath: string, displayPath: stri
   return undefined;
 }
 
-function validateExpectedSha(input: ApplyPatchInput, requestedPath: string, displayPath: string, actualSha256: string, operation: ApplyPatchOperation): ApplyPatchFailure | undefined {
+function validateExpectedSha(input: CanonicalApplyPatchInput, requestedPath: string, displayPath: string, actualSha256: string, operation: ApplyPatchOperation): ApplyPatchFailure | undefined {
   const expected = input.expectedOldSha256?.[requestedPath] ?? input.expectedOldSha256?.[displayPath];
   if (expected && expected !== actualSha256) {
     return {
@@ -606,7 +591,7 @@ function nextActionForParseError(error: PatchParseError): string {
     return 'Use only supported operation headers: *** Add File, *** Update File, *** Delete File, and *** Move to inside Update File.';
   }
   if (error.reason === 'patch_too_large') {
-    return 'Split the edit into a smaller patch or raise maxPatchBytes when the caller intentionally allows it.';
+    return 'Split the edit into a smaller patch.';
   }
   return 'Rewrite the patch using the supported *** Begin Patch wrapper and valid operation/hunk lines.';
 }

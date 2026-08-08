@@ -39,16 +39,16 @@ function identity(callId) {
 
 function toolStarted(callId, command) {
   return {
-    type: 'tool.started', ...identity(callId), toolName: 'shell_command',
-    input: { id: callId, name: 'shell_command', input: { kind: 'json', value: { command } } },
+    type: 'tool.started', ...identity(callId), toolName: 'exec_command',
+    input: { id: callId, name: 'exec_command', input: { kind: 'json', value: { command } } },
     fingerprint: `fingerprint-${callId}`,
-    effects: { kind: 'execute', resourceScopes: ['workspace://command'], reversible: false, idempotency: 'non_idempotent' }
+    effects: { accesses: [{ mode: 'execute', scope: 'workspace/command' }], lockScopes: ['workspace/command'], idempotency: 'non_idempotent' }
   };
 }
 
 function toolEnded(callId, ok, summary) {
   return {
-    type: 'tool.ended', ...identity(callId), toolName: 'shell_command',
+    type: 'tool.ended', ...identity(callId), toolName: 'exec_command',
     observation: {
       kind: 'result', ok, summary, output: { outcome: ok ? 'exited' : 'runtime_error', command: callId },
       evidence: { items: [{ action: 'execute', resources: [{ uri: 'workspace://command' }], outcome: ok ? 'success' : 'failure' }] }

@@ -8,6 +8,7 @@ import {
   freezeArtifactRef,
   hashArtifactBytes,
   safeArtifactLabel,
+  mediaTypeFromArtifactId,
   validateArtifactRef,
   type ArtifactRef,
   type ArtifactRepository,
@@ -18,6 +19,7 @@ export interface LocalArtifactRepositoryOptions { readonly rootDir: string }
 
 export class LocalArtifactRepository implements ArtifactRepository {
   private readonly rootDir: string;
+  private readonly references = new Map<string, ArtifactRef>();
 
   constructor(options: LocalArtifactRepositoryOptions | string) {
     this.rootDir = path.resolve(typeof options === 'string' ? options : options.rootDir);
@@ -44,7 +46,7 @@ export class LocalArtifactRepository implements ArtifactRepository {
       await verifyFile(target, sha256, bytes.byteLength, artifactId);
     } finally { await fs.rm(temporary, { force: true }); }
     await verifyFile(target, sha256, bytes.byteLength, artifactId);
-    return freezeArtifactRef({
+    const ref = freezeArtifactRef({
       artifactId,
       sha256,
       size: bytes.byteLength,
@@ -52,6 +54,8 @@ export class LocalArtifactRepository implements ArtifactRepository {
       label: safeArtifactLabel(input.label),
       ...(input.description ? { description: input.description } : {})
     });
+    this.references.set(artifactId, ref);
+    return ref;
   }
 
   storeText(label: string, content: string, description?: string): Promise<ArtifactRef> {
@@ -79,6 +83,24 @@ export class LocalArtifactRepository implements ArtifactRepository {
     if (bytes.byteLength !== ref.size) throw new ArtifactIntegrityError(ref.artifactId, `Artifact size mismatch for ${ref.artifactId}.`);
     if (hashArtifactBytes(bytes) !== ref.sha256) throw new ArtifactIntegrityError(ref.artifactId, `Artifact SHA-256 mismatch for ${ref.artifactId}.`);
     return bytes;
+  }
+
+  async resolve(artifactId: string): Promise<ArtifactRef | undefined> {
+    const known = this.references.get(artifactId);
+    if (known) return known;
+    if (!/^[a-f0-9]{64}\.[a-z0-9]+$/u.test(artifactId)) return undefined;
+    let stat;
+    try { stat = await fs.stat(this.confinedPath(artifactId)); } catch { return undefined; }
+    if (!stat.isFile()) return undefined;
+    const ref = freezeArtifactRef({
+      artifactId,
+      sha256: artifactId.slice(0, 64),
+      size: stat.size,
+      mediaType: mediaTypeFromArtifactId(artifactId),
+      label: artifactId
+    });
+    this.references.set(artifactId, ref);
+    return ref;
   }
 
   private confinedPath(artifactId: string): string {

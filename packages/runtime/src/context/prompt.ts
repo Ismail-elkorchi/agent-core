@@ -119,7 +119,7 @@ function renderTools(tools: PromptProjection['tools']): string {
   if (tools.length === 0) {
     return '';
   }
-  const lines = tools.map((tool) => `- ${tool.name} [input=${tool.inputFormat}; risk=${tool.risk}]: ${tool.description}`);
+  const lines = tools.map((tool) => `- ${tool.name} [input=${tool.inputFormat}; accesses=${tool.accessModes.join(',') || 'none'}]: ${tool.description}`);
   const guides = tools
     .filter((tool) => tool.promptGuide && tool.promptGuide.trim().length > 0)
     .map((tool) => [

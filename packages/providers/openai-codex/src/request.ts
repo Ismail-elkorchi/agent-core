@@ -85,6 +85,7 @@ function toCodexInput(messages: ModelMessage[]): { instructions: string; input: 
     }
     if (message.role === 'tool') {
       input.push(toolCallOutputForCodexMessage(message));
+      if (message.images && message.images.length > 0) input.push({ role: 'user', content: contentForCodexMessage({ role: 'user', content: '', images: message.images }) });
       continue;
     }
     if (message.role === 'assistant') {

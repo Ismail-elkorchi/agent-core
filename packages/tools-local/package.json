@@ -10,17 +10,20 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./testing/filesystem": "./dist/core/filesystem.js",
-    "./testing/text-write": "./dist/core/text-write.js",
-    "./testing/apply-patch/*": "./dist/tools/apply-patch/*.js",
-    "./testing/shell-command/safety": "./dist/tools/shell-command/safety.js"
+    "./testing/text-write": "./dist/core/text-write.js"
   },
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "sideEffects": false,
-  "engines": { "node": ">=24" },
+  "engines": {
+    "node": ">=24"
+  },
   "dependencies": {
     "@agent-core/evidence": "0.2.0",
     "@agent-core/tools": "0.2.0",
+    "ignore": "^7.0.6",
     "zod": "^4.4.3"
   }
 }

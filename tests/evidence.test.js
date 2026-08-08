@@ -40,6 +40,13 @@ test('JSON normalization is total for hostile values and preserves unsafe proper
   assert.ok(result.diagnostics.some(diagnostic => diagnostic.code === 'access_error'));
 });
 
+test('JSON normalization duplicates shared values without misclassifying them as cycles', () => {
+  const shared = { value: 1 };
+  const result = normalizeJsonSafe({ left: shared, right: shared });
+  assert.equal(result.status, 'clean');
+  assert.deepEqual(JSON.parse(JSON.stringify(result.value)), { left: { value: 1 }, right: { value: 1 } });
+});
+
 test('evidence deltas normalize into observation-scoped records', () => {
   const records = normalizeToolEvidenceDelta(evidenceDelta([
     {
@@ -64,14 +71,14 @@ test('evidence deltas normalize into observation-scoped records', () => {
     }
   ]), {
     observationId: 'obs-1',
-    toolName: 'read_text_files',
+    toolName: 'read_files',
     createdAt: '2026-06-23T00:00:00.000Z'
   });
 
   assert.equal(records.length, 1);
   assert.equal(records[0].id, 'obs-1:evidence:1');
   assert.equal(records[0].observationId, 'obs-1');
-  assert.equal(records[0].toolName, 'read_text_files');
+  assert.equal(records[0].toolName, 'read_files');
   assert.equal(records[0].action, 'read');
   assert.deepEqual(records[0].resources[0], {
     uri: 'workspace://notes/a.txt',

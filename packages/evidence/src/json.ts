@@ -168,43 +168,47 @@ function normalizeValueUnsafe(
       return `[circular -> ${priorPath}]`;
     }
     seen.set(value, path);
-    if (Array.isArray(value)) {
-      const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
-      const length = typeof lengthDescriptor?.value === 'number' && Number.isSafeInteger(lengthDescriptor.value) && lengthDescriptor.value >= 0
-        ? lengthDescriptor.value
-        : 0;
-      const selectedLength = Math.min(length, limits.maxCollectionEntries);
-      const output: JsonValue[] = [];
-      for (let index = 0; index < selectedLength; index += 1) {
-        output.push(normalizeOwnProperty(value, String(index), `${path}[${String(index)}]`, depth + 1, limits, diagnostics, seen));
+    try {
+      if (Array.isArray(value)) {
+        const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+        const length = typeof lengthDescriptor?.value === 'number' && Number.isSafeInteger(lengthDescriptor.value) && lengthDescriptor.value >= 0
+          ? lengthDescriptor.value
+          : 0;
+        const selectedLength = Math.min(length, limits.maxCollectionEntries);
+        const output: JsonValue[] = [];
+        for (let index = 0; index < selectedLength; index += 1) {
+          output.push(normalizeOwnProperty(value, String(index), `${path}[${String(index)}]`, depth + 1, limits, diagnostics, seen));
+        }
+        if (selectedLength < length) {
+          diagnostics.push({ code: 'collection_truncated', path, message: `Array was truncated from ${String(length)} entries.` });
+          output.push(`[${String(length - selectedLength)} entries omitted]`);
+        }
+        return output;
       }
-      if (selectedLength < length) {
-        diagnostics.push({ code: 'collection_truncated', path, message: `Array was truncated from ${String(length)} entries.` });
-        output.push(`[${String(length - selectedLength)} entries omitted]`);
+      const keys = Reflect.ownKeys(value);
+      const enumerableKeys: string[] = [];
+      for (const key of keys) {
+        if (typeof key === 'symbol') {
+          diagnostics.push({ code: 'symbol', path, message: 'A symbol-keyed property was omitted.' });
+          continue;
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (descriptor?.enumerable === true) enumerableKeys.push(key);
+      }
+      enumerableKeys.sort((left, right) => left.localeCompare(right));
+      const selected = enumerableKeys.slice(0, limits.maxCollectionEntries);
+      const output = Object.create(null) as JsonObject;
+      for (const key of selected) {
+        defineJsonProperty(output, key, normalizeOwnProperty(value, key, `${path}.${key}`, depth + 1, limits, diagnostics, seen));
+      }
+      if (selected.length < enumerableKeys.length) {
+        diagnostics.push({ code: 'collection_truncated', path, message: `Object was truncated from ${String(enumerableKeys.length)} entries.` });
+        defineJsonProperty(output, '__omittedEntries', enumerableKeys.length - selected.length);
       }
       return output;
+    } finally {
+      seen.delete(value);
     }
-    const keys = Reflect.ownKeys(value);
-    const enumerableKeys: string[] = [];
-    for (const key of keys) {
-      if (typeof key === 'symbol') {
-        diagnostics.push({ code: 'symbol', path, message: 'A symbol-keyed property was omitted.' });
-        continue;
-      }
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (descriptor?.enumerable === true) enumerableKeys.push(key);
-    }
-    enumerableKeys.sort((left, right) => left.localeCompare(right));
-    const selected = enumerableKeys.slice(0, limits.maxCollectionEntries);
-    const output = Object.create(null) as JsonObject;
-    for (const key of selected) {
-      defineJsonProperty(output, key, normalizeOwnProperty(value, key, `${path}.${key}`, depth + 1, limits, diagnostics, seen));
-    }
-    if (selected.length < enumerableKeys.length) {
-      diagnostics.push({ code: 'collection_truncated', path, message: `Object was truncated from ${String(enumerableKeys.length)} entries.` });
-      defineJsonProperty(output, '__omittedEntries', enumerableKeys.length - selected.length);
-    }
-    return output;
   }
   diagnostics.push({ code: 'unsupported', path, message: 'Unsupported value was replaced with its object tag.' });
   return Object.prototype.toString.call(value);

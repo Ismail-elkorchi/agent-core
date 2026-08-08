@@ -405,7 +405,6 @@ function toOllamaMessage(message: ModelMessage): Message {
   if (message.reasoning) {
     ollamaMessage.thinking = message.reasoning;
   }
-  if (message.images?.some((image) => image.detail !== undefined && image.detail !== 'auto')) throw new ModelProviderError({ provider: 'ollama', code: 'invalid_request', message: 'Ollama does not expose per-image detail controls.' });
   const images = toOllamaImages(message.images);
   if (images) {
     ollamaMessage.images = images;

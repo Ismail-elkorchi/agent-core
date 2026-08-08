@@ -20,6 +20,7 @@ export interface ArtifactStoreInput {
 export interface ArtifactRepository {
   store(input: ArtifactStoreInput): Promise<ArtifactRef>;
   readVerified(ref: ArtifactRef): Promise<Uint8Array>;
+  resolve(artifactId: string): Promise<ArtifactRef | undefined>;
 }
 
 export class ArtifactIntegrityError extends Error {
@@ -33,6 +34,7 @@ export class ArtifactIntegrityError extends Error {
 
 export class InMemoryArtifactRepository implements ArtifactRepository {
   private readonly content = new Map<string, Uint8Array>();
+  private readonly references = new Map<string, ArtifactRef>();
 
   store(input: ArtifactStoreInput): Promise<ArtifactRef> {
     const bytes = new Uint8Array(input.content);
@@ -40,7 +42,9 @@ export class InMemoryArtifactRepository implements ArtifactRepository {
     const sha256 = hashArtifactBytes(bytes);
     const artifactId = `${sha256}${artifactExtension(mediaType)}`;
     this.content.set(artifactId, bytes);
-    return Promise.resolve(freezeArtifactRef({ artifactId, sha256, size: bytes.byteLength, mediaType, label: safeArtifactLabel(input.label), ...(input.description ? { description: input.description } : {}) }));
+    const ref = freezeArtifactRef({ artifactId, sha256, size: bytes.byteLength, mediaType, label: safeArtifactLabel(input.label), ...(input.description ? { description: input.description } : {}) });
+    this.references.set(artifactId, ref);
+    return Promise.resolve(ref);
   }
 
   readVerified(ref: ArtifactRef): Promise<Uint8Array> {
@@ -52,6 +56,8 @@ export class InMemoryArtifactRepository implements ArtifactRepository {
       return new Uint8Array(bytes);
     });
   }
+
+  resolve(artifactId: string): Promise<ArtifactRef | undefined> { return Promise.resolve(this.references.get(artifactId)); }
 }
 
 export async function storeJsonArtifact(repository: ArtifactRepository, label: string, value: unknown, description?: string): Promise<ArtifactRef> {
@@ -76,10 +82,31 @@ export function validateArtifactRef(value: unknown): asserts value is ArtifactRe
 export function hashArtifactBytes(content: Uint8Array): string { return createHash('sha256').update(content).digest('hex'); }
 export function freezeArtifactRef(ref: ArtifactRef): ArtifactRef { return Object.freeze(ref); }
 export function artifactExtension(mediaType: string): string {
+  if (mediaType.startsWith('image/png')) return '.png';
+  if (mediaType.startsWith('image/jpeg')) return '.jpg';
+  if (mediaType.startsWith('image/webp')) return '.webp';
+  if (mediaType.startsWith('image/gif')) return '.gif';
+  if (mediaType.startsWith('audio/mpeg')) return '.mp3';
+  if (mediaType.startsWith('audio/wav') || mediaType.startsWith('audio/x-wav')) return '.wav';
+  if (mediaType.startsWith('audio/ogg')) return '.ogg';
   if (mediaType.includes('json')) return '.json';
   if (mediaType.includes('markdown')) return '.md';
   if (mediaType.startsWith('text/')) return '.txt';
   return '.bin';
+}
+
+export function mediaTypeFromArtifactId(artifactId: string): string {
+  if (artifactId.endsWith('.png')) return 'image/png';
+  if (artifactId.endsWith('.jpg')) return 'image/jpeg';
+  if (artifactId.endsWith('.webp')) return 'image/webp';
+  if (artifactId.endsWith('.gif')) return 'image/gif';
+  if (artifactId.endsWith('.mp3')) return 'audio/mpeg';
+  if (artifactId.endsWith('.wav')) return 'audio/wav';
+  if (artifactId.endsWith('.ogg')) return 'audio/ogg';
+  if (artifactId.endsWith('.json')) return 'application/json; charset=utf-8';
+  if (artifactId.endsWith('.md')) return 'text/markdown; charset=utf-8';
+  if (artifactId.endsWith('.txt')) return 'text/plain; charset=utf-8';
+  return 'application/octet-stream';
 }
 export function safeArtifactLabel(name: string): string {
   const cleaned = name.trim().replace(/[^a-zA-Z0-9._:-]+/gu, '-').replace(/^-+|-+$/gu, '');

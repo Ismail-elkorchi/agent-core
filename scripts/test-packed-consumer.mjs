@@ -48,7 +48,7 @@ try {
     "import * as tools from '@agent-core/tools';",
     "import * as local from '@agent-core/tools-local';",
     "import * as nodeEvidence from '@agent-core/evidence/node';",
-    "if (!runtime.parseAgentTerminalSnapshot || !runtime.AgentRuntime || !runtime.InMemorySessionRepository || !nodeRuntime.JsonlSessionRepository || !model.parseModelResponse || !evidence.InMemoryEventRepository || !nodeEvidence.JsonlEventRepository || !tools.prepareToolCall || !tools.invokePreparedToolCall || !local.ShellRunner) throw new Error('public runtime exports missing');"
+    "if (!runtime.parseAgentTerminalSnapshot || !runtime.AgentRuntime || !runtime.InMemorySessionRepository || !nodeRuntime.JsonlSessionRepository || !model.parseModelResponse || !evidence.InMemoryEventRepository || !nodeEvidence.JsonlEventRepository || !tools.prepareToolCall || !tools.invokePreparedToolCall || !local.ProcessManager) throw new Error('public runtime exports missing');"
   ].join('\n'));
   await exec(process.execPath, ['runtime.mjs'], { cwd: consumer });
 
@@ -60,7 +60,7 @@ try {
     "const json: JsonObject = { nested: { ok: true }, values: [1, 'two'] };",
     "const providerState: ModelProviderStateObject = { responseId: 'resp', nested: { count: 1 } };",
     "const candidate: AgentCandidate = { status: 'complete', message: 'done', source: 'content', turnIndex: 1 };",
-    "const effects: ToolEffects = { kind: 'read', resourceScopes: ['workspace'], idempotency: 'pure', reversible: true };",
+    "const effects: ToolEffects = { accesses: [{ mode: 'read', scope: 'workspace' }], lockScopes: [], idempotency: 'pure' };",
     "declare const terminal: AgentTerminalSnapshot;",
     "void [json, providerState, candidate, effects, terminal];"
   ].join('\n'));

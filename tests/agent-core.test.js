@@ -14,6 +14,7 @@ import {
 } from '@agent-core/runtime';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/evidence';
 import { ModelProviderError } from '@agent-core/model';
+import * as z from 'zod';
 import {
   deriveAgentVerificationStatus,
   parseAgentTerminalSnapshot
@@ -32,6 +33,10 @@ const capabilities = {
   reasoning: undefined
 };
 const toolBoundary = { authorizationPolicyId: 'tests/agent-core-policy@1', executionTargetId: 'tests/agent-core-target' };
+const emptyOutputSchema = z.strictObject({});
+const readEnvelope = { accesses: [{ mode: 'read', scope: 'memory' }], lockScopes: [] };
+const readEffects = { ...readEnvelope, idempotency: 'pure' };
+const completeScope = { resources: ['memory'], coverage: 'complete' };
 
 function ended(result) {
   assert.equal(result.state, 'ended');
@@ -99,6 +104,96 @@ async function harness(options = {}) {
   });
   return { agent, provider, events, sessions, session, artifacts };
 }
+
+test('runtime exposes artifact and image tools only with the required repository and model modality', async () => {
+  const conditionalTool = (name) => ({
+    name,
+    implementationId: `tests/${name}@1`,
+    description: name,
+    jsonSchema: { type: 'object' },
+    outputSchema: emptyOutputSchema,
+    effectEnvelope: readEnvelope,
+    decodeInput() { return { ok: true, input: {} }; },
+    canonicalizeInput(input) { return input; },
+    deriveEffects() { return readEffects; },
+    async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; }
+  });
+  const tools = [conditionalTool('read_artifact'), conditionalTool('view_image')];
+
+  const textProvider = new ScriptedProvider([response()]);
+  const textAgent = new AgentRuntime({
+    provider: textProvider,
+    model: 'scripted',
+    toolBoundary,
+    repositories: { events: new InMemoryEventRepository(agentEventCodec) },
+    tools,
+    toolPolicy: { allowedRisks: ['read'] }
+  });
+  await textAgent.run({ task: 'text only' });
+  assert.deepEqual((textProvider.calls[0].tools ?? []).map(modelToolName), []);
+
+  const imageProvider = new ScriptedProvider([response()], { profile: { modalities: { input: ['text', 'image'], output: ['text'] } } });
+  const imageArtifacts = new InMemoryArtifactRepository();
+  const imageAgent = new AgentRuntime({
+    provider: imageProvider,
+    model: 'scripted',
+    toolBoundary,
+    repositories: { events: new InMemoryEventRepository(agentEventCodec), artifacts: imageArtifacts },
+    tools,
+    toolPolicy: { allowedRisks: ['read'] }
+  });
+  await imageAgent.run({ task: 'image capable' });
+  assert.deepEqual((imageProvider.calls[0].tools ?? []).map(modelToolName), ['read_artifact', 'view_image']);
+});
+
+function modelToolName(tool) {
+  return tool.type === 'function' ? tool.function.name : tool.name;
+}
+
+test('tool progress from preparation and invocation remains separate from the final observation', async () => {
+  const progress = [];
+  const tool = {
+    name: 'progress_tool', implementationId: 'tests/progress-tool@1', description: 'progress', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope,
+    decodeInput() { return { ok: true, input: {} }; },
+    async canonicalizeInput(input, context) { await context.emitProgress?.({ stage: 'canonicalize' }); return input; },
+    deriveEffects() { return readEffects; },
+    async invoke(_input, context) { await context.emitProgress?.({ stage: 'invoke' }); return { kind: 'result', ok: true, output: {}, summary: 'done', scope: completeScope }; }
+  };
+  const { agent, events } = await harness({
+    tools: [tool],
+    script: [response('tool_calls', '', { toolCalls: [{ id: 'progress', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }] }), response()],
+    onProgress(event) { if (event.type === 'tool.updated') progress.push(event.progress.stage); }
+  });
+  const result = ended(await agent.run({ task: 'report progress' }));
+  assert.deepEqual(progress.filter((stage) => stage === 'canonicalize' || stage === 'invoke'), ['canonicalize', 'invoke']);
+  const persisted = await eventsFor(events, result.runId);
+  assert.deepEqual(persisted.filter((event) => event.type === 'tool.updated').map((event) => event.progress.stage).filter((stage) => stage === 'canonicalize' || stage === 'invoke'), ['canonicalize', 'invoke']);
+  assert.equal(persisted.filter((event) => event.type === 'tool.ended').length, 1);
+});
+
+test('oversized tool observations keep domain output intact in an artifact', async () => {
+  const items = Array.from({ length: 2_000 }, (_unused, index) => ({ id: index, value: `item-${String(index)}-${'x'.repeat(20)}` }));
+  const tool = {
+    name: 'large_result', implementationId: 'tests/large-result@1', description: 'large result', jsonSchema: { type: 'object' },
+    outputSchema: z.strictObject({ items: z.array(z.strictObject({ id: z.int(), value: z.string() })) }), effectEnvelope: readEnvelope,
+    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return readEffects; },
+    async invoke() { return { kind: 'result', ok: true, output: { items }, summary: 'large result complete', scope: completeScope }; }
+  };
+  const { agent, events, artifacts } = await harness({
+    tools: [tool],
+    script: [response('tool_calls', '', { toolCalls: [{ id: 'large', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }] }), response()]
+  });
+  const result = ended(await agent.run({ task: 'preserve output' }));
+  const persistedEvents = await eventsFor(events, result.runId);
+  const observationEvent = persistedEvents.find((event) => event.type === 'observation.record.created');
+  assert.ok(observationEvent, JSON.stringify({ types: persistedEvents.map((event) => event.type), terminal: result }));
+  assert.equal(observationEvent.immediatePresentation.summary, 'large result complete');
+  assert.equal(observationEvent.immediatePresentation.truncated, true);
+  const artifactId = observationEvent.immediatePresentation.results.artifact.artifactId;
+  const artifact = await artifacts.resolve(artifactId);
+  const stored = JSON.parse(new TextDecoder().decode(await artifacts.readVerified(artifact)));
+  assert.equal(stored.results.output.items.length, items.length);
+});
 
 async function eventsFor(repository, runId) {
   const output = [];
@@ -241,8 +336,8 @@ test('cyclic and oversized check output is bounded without losing the candidate'
 test('application, run, and steering instructions reach checks with provenance', async () => {
   let received;
   let agent;
-  const noop = { name: 'noop', implementationId: 'tests/noop-instructions@1', description: 'noop', jsonSchema: { type: 'object' }, risk: 'read', declaredEffects: { kind: 'read', resourceScopes: ['memory'], idempotency: 'pure', reversible: true },
-    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return this.declaredEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok' }; } };
+  const noop = { name: 'noop', implementationId: 'tests/noop-instructions@1', description: 'noop', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope,
+    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return readEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; } };
   ({ agent } = await harness({
     script: [response('tool_calls', '', { toolCalls: [{ id: '1', type: 'function', name: 'noop', input: { kind: 'json', value: {} } }] }), response()],
     tools: [noop],
@@ -329,8 +424,8 @@ test('mid-run model changes apply only to the coherent next snapshot', async () 
     request => response('tool_calls', '', { toolCalls: [{ id: '1', type: 'function', name: 'noop', input: { kind: 'json', value: {} } }], model: request.model }),
     request => response('stop', `model:${request.model}`, { model: request.model })
   ]);
-  const noop = { name: 'noop', implementationId: 'tests/noop-snapshot@1', description: 'noop', jsonSchema: { type: 'object' }, risk: 'read', declaredEffects: { kind: 'read', resourceScopes: ['memory'], idempotency: 'pure', reversible: true },
-    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return this.declaredEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok' }; } };
+  const noop = { name: 'noop', implementationId: 'tests/noop-snapshot@1', description: 'noop', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope,
+    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return readEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; } };
   let agent;
   ({ agent } = await harness({ provider, tools: [noop], onProgress(event) { if (event.type === 'assistant.ended' && event.turnIndex === 1) agent.configureModel({ model: 'next-model' }); } }));
   const result = ended(await agent.run({ task: 'change model' }));  assert.equal(provider.calls[0].model, 'scripted');
@@ -341,7 +436,7 @@ test('mid-run model changes apply only to the coherent next snapshot', async () 
 test('run limits and retry policy terminate deterministically', async () => {
   const call = { id: '1', type: 'function', name: 'noop', input: { kind: 'json', value: {} } };
   const provider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] })]);
-  const noop = { name: 'noop', implementationId: 'tests/noop-model-change@1', description: 'noop', jsonSchema: { type: 'object' }, risk: 'read', declaredEffects: { kind: 'read', resourceScopes: ['memory'], idempotency: 'pure', reversible: true }, decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return this.declaredEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok' }; } };
+  const noop = { name: 'noop', implementationId: 'tests/noop-model-change@1', description: 'noop', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope, decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return readEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; } };
   const { agent } = await harness({ provider, tools: [noop], limits: { modelTurns: 1 } });
   const exhausted = ended(await agent.run({ task: 'limit' }));  assert.equal(exhausted.terminationReason, 'limit_exhausted');
   assert.equal(exhausted.exhaustedLimit, 'model_turns');
@@ -418,17 +513,17 @@ test('durable approval resumes after repository reopen and rejects changed polic
   let effects = 0;
   const call = { id: 'effect-1', type: 'function', name: 'effect', input: { kind: 'json', value: { path: 'src/../state' } } };
   const tool = {
-    name: 'effect', implementationId: 'tests/canonical-effect@1', description: 'write one canonical resource', jsonSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }, risk: 'write',
-    declaredEffects: { kind: 'write', resourceScopes: ['workspace'], idempotency: 'idempotent', idempotencyKey: 'effect:default', reversible: true },
+    name: 'effect', implementationId: 'tests/canonical-effect@1', description: 'write one canonical resource', jsonSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }, outputSchema: emptyOutputSchema,
+    effectEnvelope: { accesses: [{ mode: 'write', scope: 'workspace' }], lockScopes: ['workspace'] },
     decodeInput(input) { return { ok: true, input: input.value }; },
     canonicalizeInput(input) { return { ...input, path: 'state' }; },
-    deriveEffects(input) { return { kind: 'write', resourceScopes: [`workspace/${input.path}`], idempotency: 'idempotent', idempotencyKey: `effect:${input.path}`, reversible: true }; },
-    async invoke() { effects += 1; return { kind: 'result', ok: true, output: {}, summary: 'changed' }; }
+    deriveEffects(input) { return { accesses: [{ mode: 'write', scope: `workspace/${input.path}` }], lockScopes: [`workspace/${input.path}`], idempotency: 'idempotent', idempotencyKey: `effect:${input.path}` }; },
+    async invoke() { effects += 1; return { kind: 'result', ok: true, output: {}, summary: 'changed', scope: { resources: ['workspace/state'], coverage: 'complete' } }; }
   };
   const provider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] }), response('stop', 'approved')]);
   const repositories = await harness({ provider, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, toolAuthorizer: request => {
     assert.deepEqual(request.input, { path: 'state' });
-    assert.deepEqual(request.effects.resourceScopes, ['workspace/state']);
+    assert.deepEqual(request.effects.accesses, [{ mode: 'write', scope: 'workspace/state' }]);
     return { decision: 'require_approval', reason: 'confirm write' };
   }, checks: [{ id: 'required', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
   const suspended = await repositories.agent.run({ task: 'approval' });
@@ -462,10 +557,10 @@ test('durable approval resumes after repository reopen and rejects changed polic
 test('current authorization is re-evaluated and may veto a stored approval', async () => {
   let effects = 0;
   const tool = {
-    name: 'effect', implementationId: 'tests/current-veto-effect@1', description: 'effect', jsonSchema: { type: 'object' }, risk: 'write',
-    declaredEffects: { kind: 'write', resourceScopes: ['state'], idempotency: 'non_idempotent', reversible: false },
-    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return this.declaredEffects; },
-    async invoke() { effects += 1; return { kind: 'result', ok: true, output: {}, summary: 'changed' }; }
+    name: 'effect', implementationId: 'tests/current-veto-effect@1', description: 'effect', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema,
+    effectEnvelope: { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'] },
+    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'], idempotency: 'non_idempotent' }; },
+    async invoke() { effects += 1; return { kind: 'result', ok: true, output: {}, summary: 'changed', scope: { resources: ['state'], coverage: 'complete' } }; }
   };
   const provider = new ScriptedProvider([
     response('tool_calls', '', { toolCalls: [{ id: 'effect', type: 'function', name: 'effect', input: { kind: 'json', value: {} } }] }),
@@ -542,16 +637,16 @@ test('process death after tool completion projects the durable observation witho
 
 test('per-call recovery retries idempotent starts and only projects completed observations', async () => {
   const call = { id: 'idempotent-1', type: 'function', name: 'idempotent', input: { kind: 'json', value: {} } };
-  const effects = { kind: 'write', resourceScopes: ['state/idempotent'], idempotency: 'idempotent', idempotencyKey: 'fixture:idempotent-1', reversible: false };
+  const effects = { accesses: [{ mode: 'write', scope: 'state/idempotent' }], lockScopes: ['state/idempotent'], idempotency: 'idempotent', idempotencyKey: 'fixture:idempotent-1' };
   let invocations = 0;
   const tool = {
-    name: 'idempotent', implementationId: 'tests/idempotent-recovery@1', description: 'idempotent recovery fixture', jsonSchema: { type: 'object' }, risk: 'write', declaredEffects: effects,
+    name: 'idempotent', implementationId: 'tests/idempotent-recovery@1', description: 'idempotent recovery fixture', jsonSchema: { type: 'object' }, outputSchema: z.unknown(), effectEnvelope: { accesses: effects.accesses, lockScopes: effects.lockScopes },
     decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return effects; },
     async invoke(_input, context) {
       invocations += 1;
       assert.equal(context.invocation.toolAttempt, 2);
       assert.equal(context.invocation.idempotencyKey, effects.idempotencyKey);
-      return { kind: 'result', ok: true, output: { retried: true }, summary: 'retried safely' };
+      return { kind: 'result', ok: true, output: { retried: true }, summary: 'retried safely', scope: { resources: ['state/idempotent'], coverage: 'complete' } };
     }
   };
   const provider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] }), response('stop', 'after retry')]);
@@ -567,13 +662,13 @@ test('per-call recovery retries idempotent starts and only projects completed ob
   assert.deepEqual(records.filter((event) => event.type === 'tool.ended').map((event) => event.toolAttempt), [2]);
 
   let projectedInvocations = 0;
-  const completedTool = { ...tool, implementationId: 'tests/completed-recovery@1', async invoke() { projectedInvocations += 1; return { kind: 'result', ok: true, output: {}, summary: 'must not run' }; } };
+  const completedTool = { ...tool, implementationId: 'tests/completed-recovery@1', async invoke() { projectedInvocations += 1; return { kind: 'result', ok: true, output: {}, summary: 'must not run', scope: { resources: ['state/idempotent'], coverage: 'complete' } }; } };
   const completedProvider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] }), response('stop', 'after projection')]);
   const completedRun = await harness({ provider: completedProvider, tools: [completedTool], toolPolicy: { allowedRisks: ['read', 'write'] }, toolAuthorizer: () => ({ decision: 'require_approval', reason: 'confirm' }) });
   const completedSuspension = await completedRun.agent.run({ task: 'completed recovery' });
   const completedApproval = completedSuspension.pendingApprovals[0];
   const completedIdentity = { turnIndex: completedApproval.turnIndex, turnId: completedApproval.turnId, requestAttempt: completedApproval.requestAttempt, toolBatchId: completedApproval.toolBatchId, callIndex: completedApproval.callIndex, callId: completedApproval.callId, toolAttempt: 1 };
-  const completedObservation = { kind: 'result', ok: true, output: { already: true }, summary: 'already completed' };
+  const completedObservation = { kind: 'result', ok: true, output: { already: true }, summary: 'already completed', scope: { resources: ['state/idempotent'], coverage: 'complete' } };
   await completedRun.events.append(completedSuspension.runId, { type: 'tool.started', ...completedIdentity, toolName: completedTool.name, input: call, fingerprint: completedApproval.fingerprint, effects }, { idempotencyKey: toolStageKey(completedSuspension.runId, completedIdentity, 'started') });
   await completedRun.events.append(completedSuspension.runId, { type: 'tool.ended', ...completedIdentity, toolName: completedTool.name, observation: completedObservation }, { idempotencyKey: toolStageKey(completedSuspension.runId, completedIdentity, 'ended') });
   const completedResult = ended(await completedRun.agent.resolveApproval({ runId: completedSuspension.runId, approvalId: completedApproval.approvalId, fingerprint: completedApproval.fingerprint, decision: 'allow' }));  assert.equal(completedResult.executionStatus, 'completed');
@@ -598,7 +693,7 @@ test('elapsed limits use the injected monotonic clock', async () => {
   let now = 0;
   const call = { id: '1', type: 'function', name: 'noop', input: { kind: 'json', value: {} } };
   const provider = new ScriptedProvider([() => { now = 10; return response('tool_calls', '', { toolCalls: [call] }); }]);
-  const noop = { name: 'noop', implementationId: 'tests/noop-elapsed@1', description: 'noop', jsonSchema: { type: 'object' }, risk: 'read', declaredEffects: { kind: 'read', resourceScopes: ['memory'], idempotency: 'pure', reversible: true }, decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return this.declaredEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok' }; } };
+  const noop = { name: 'noop', implementationId: 'tests/noop-elapsed@1', description: 'noop', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope, decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return readEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; } };
   const run = await harness({ provider, tools: [noop], limits: { elapsedMs: 5 }, clock: { now: () => now }, withoutSession: true });
   const result = ended(await run.agent.run({ task: 'elapsed' }));  assert.equal(result.terminationReason, 'limit_exhausted');
   assert.equal(result.exhaustedLimit, 'elapsed_time');
@@ -618,12 +713,11 @@ test('elapsed limits actively abort a provider request that never settles', asyn
 test('tool preparation and authorization are abortable and elapsed-deadline bounded', async () => {
   const callResponse = () => response('tool_calls', '', { toolCalls: [{ id: 'stall', type: 'function', name: 'stall', input: { kind: 'json', value: {} } }] });
   const baseTool = {
-    name: 'stall', implementationId: 'tests/stalled-boundary@1', description: 'stalled boundary', jsonSchema: { type: 'object' }, risk: 'read',
-    declaredEffects: { kind: 'read', resourceScopes: ['memory'], idempotency: 'pure', reversible: true },
+    name: 'stall', implementationId: 'tests/stalled-boundary@1', description: 'stalled boundary', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope,
     decodeInput() { return { ok: true, input: {} }; },
     canonicalizeInput(input) { return input; },
-    deriveEffects() { return this.declaredEffects; },
-    async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'unexpected' }; }
+    deriveEffects() { return readEffects; },
+    async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'unexpected', scope: completeScope }; }
   };
   const cases = [
     { name: 'canonicalizer', tool: { ...baseTool, canonicalizeInput() { return new Promise(() => {}); } } },
@@ -655,7 +749,7 @@ test('tool preparation and authorization are abortable and elapsed-deadline boun
 test('non-idempotent failed tools cannot be agent-turn retried', async () => {
   const call = { id: '1', type: 'function', name: 'effect', input: { kind: 'json', value: {} } };
   const provider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] })]);
-  const effect = { name: 'effect', implementationId: 'tests/non-idempotent-effect@1', description: 'effect', jsonSchema: { type: 'object' }, risk: 'write', declaredEffects: { kind: 'write', resourceScopes: ['state'], idempotency: 'non_idempotent', reversible: false }, decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return this.declaredEffects; }, async invoke() { return { kind: 'failure', ok: false, output: { blocked: true, reason: 'runtime_error', error: 'uncertain', recovery: 'stop' }, summary: 'uncertain' }; } };
+  const effect = { name: 'effect', implementationId: 'tests/non-idempotent-effect@1', description: 'effect', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'] }, decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'], idempotency: 'non_idempotent' }; }, async invoke() { return { kind: 'failure', ok: false, output: { blocked: true, reason: 'runtime_error', error: 'uncertain', recovery: 'stop' }, summary: 'uncertain', scope: { resources: ['state'], coverage: 'partial', cause: 'uncertain' } }; } };
   let agent;
   ({ agent } = await harness({ provider, tools: [effect], toolPolicy: { allowedRisks: ['read', 'write'] }, onProgress(event) { if (event.type === 'tool.ended') agent.requestRetry(); } }));
   const result = ended(await agent.run({ task: 'effect' }));  assert.equal(result.terminationReason, 'uncertain_tool_effect');

@@ -643,12 +643,14 @@ function errorText(value: string): InlineContent {
 }
 
 function effectSummary(approval: AgentApprovalRequest): string {
-  const kind = typeof approval.effects.kind === 'string' ? approval.effects.kind : 'tool operation';
-  const rawScopes = approval.effects.resourceScopes;
-  const scopes = Array.isArray(rawScopes)
-    ? rawScopes.filter((scope): scope is string => typeof scope === 'string')
+  const accesses = Array.isArray(approval.effects.accesses)
+    ? approval.effects.accesses.filter((access): access is { readonly mode: string; readonly scope: string } => (
+      typeof access === 'object' && access !== null && !Array.isArray(access)
+      && typeof access.mode === 'string' && typeof access.scope === 'string'
+    ))
     : [];
-  return `${kind.replaceAll('_', ' ')}${scopes.length === 0 ? '' : ` · ${scopes.join(', ')}`}`;
+  if (accesses.length === 0) return 'tool operation';
+  return accesses.map((access) => `${access.mode.replaceAll('_', ' ')} · ${access.scope}`).join(', ');
 }
 
 function approvalSubject(approval: AgentApprovalRequest): string {

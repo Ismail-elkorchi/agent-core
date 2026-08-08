@@ -85,11 +85,16 @@ export function formatApprovalInput(call: ToolCall): string {
 function toolLabel(call: ToolCall): string {
   const value = call.input.kind === 'json' ? call.input.value : undefined;
   switch (call.name) {
-    case 'shell_command': return `Run ${quoted(firstString(value, ['command']) ?? (call.input.kind === 'text' ? call.input.value : 'command'))}`;
+    case 'exec_command': return `Run ${quoted(firstString(value, ['command']) ?? 'command')}`;
+    case 'write_stdin': return `Continue ${compactTarget(value, ['processId'])}`;
+    case 'stop_process': return `Stop ${compactTarget(value, ['processId'])}`;
     case 'apply_patch': return 'Apply workspace patch';
-    case 'read_text_files': return `Read ${compactTarget(value, ['paths', 'path'])}`;
-    case 'search_file_text': return `Search for ${quoted(firstString(value, ['query', 'pattern']) ?? 'text')}`;
-    case 'list_directory_tree': return `List ${compactTarget(value, ['path', 'root'])}`;
+    case 'read_files': return `Read ${compactTarget(value, ['files', 'path'])}`;
+    case 'search_text': return `Search for ${quoted(firstString(value, ['query']) ?? 'text')}`;
+    case 'list_directory': return `List ${compactTarget(value, ['path'])}`;
+    case 'find_files': return `Find ${compactTarget(value, ['patterns'])}`;
+    case 'view_image': return `View ${compactTarget(value, ['path'])}`;
+    case 'read_artifact': return `Read ${compactTarget(value, ['artifactId'])}`;
     default: return humanize(call.name);
   }
 }
@@ -120,7 +125,9 @@ function formatToolInput(call: ToolCall): string {
 }
 
 function formatEffects(effects: ToolEffects): string {
-  return `Effects\n${humanize(effects.kind)} · ${effects.resourceScopes.join(', ')} · ${humanize(effects.idempotency)}`;
+  const accesses = effects.accesses.map((access) => `${humanize(access.mode)} ${access.scope}`).join(', ');
+  const locks = effects.lockScopes.length > 0 ? ` · locks ${effects.lockScopes.join(', ')}` : '';
+  return `Effects\n${accesses || 'none'}${locks} · ${humanize(effects.idempotency)}`;
 }
 
 function formatOutput(output: unknown): string | undefined {

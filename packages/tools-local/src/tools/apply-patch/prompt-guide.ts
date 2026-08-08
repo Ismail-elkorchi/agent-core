@@ -1,5 +1,5 @@
 export const APPLY_PATCH_PROMPT_GUIDE = `Use apply_patch by sending the patch document as the freeform tool input. Do not wrap it in JSON.
-Use this for reviewable text edits that fit a patch document. A patch may span multiple files and hunks; reviewable means explicit changed regions, not necessarily tiny edits. For generated, bulk mechanical, or tool-produced transformations, shell_command may be more efficient.
+Use this for reviewable text edits that fit a patch document. A patch may span multiple files and hunks; reviewable means explicit changed regions, not necessarily tiny edits. For generated, bulk mechanical, or tool-produced transformations, exec_command may be more efficient.
 Patch hunks may contain larger changed regions; include enough unchanged context to locate each region.
 
 Patch envelope:

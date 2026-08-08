@@ -95,12 +95,12 @@ export function promptToolSpecs(
   tools: ToolDefinition[],
   modelProfile: ModelProfile,
   toolContext?: Omit<ToolExecutionContext, 'policy' | 'signal'>
-): { name: string; description: string; risk: string; inputFormat: string; promptGuide?: string }[] {
+): { name: string; description: string; accessModes: string[]; inputFormat: string; promptGuide?: string }[] {
   return tools.map((tool) => ({
     name: tool.name,
     description: promptDescriptionForTool(tool, modelProfile),
     inputFormat: promptInputFormatForTool(tool, modelProfile),
-    risk: tool.risk,
+    accessModes: [...new Set(tool.effectEnvelope.accesses.map((access) => access.mode))].sort(),
     ...promptGuideForTool(tool, modelProfile, toolContext)
   }));
 }
@@ -182,7 +182,7 @@ export function estimatePromptScaffoldTokens(estimator: TokenEstimator, input: {
       configuredInstructions: input.configuredInstructions
     }).map((instruction) => instruction.content),
     ...input.runNotes.slice(-8),
-    ...promptToolSpecs(input.tools, input.modelProfile, input.toolContext).map((tool) => `${tool.name} ${tool.inputFormat} ${tool.risk} ${tool.description} ${tool.promptGuide ?? ''}`)
+    ...promptToolSpecs(input.tools, input.modelProfile, input.toolContext).map((tool) => `${tool.name} ${tool.inputFormat} ${tool.accessModes.join(',')} ${tool.description} ${tool.promptGuide ?? ''}`)
   ].join('\n\n');
   return estimator.estimateText(text);
 }

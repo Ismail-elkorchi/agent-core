@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { normalizeToolEvidenceDelta, type EvidenceRecord } from '@agent-core/evidence';
+import { normalizeToolEvidenceDelta, validateArtifactRef, type ArtifactRef, type ArtifactRepository, type EvidenceRecord } from '@agent-core/evidence';
+import { SimpleTokenEstimator, type ModelImage, type TokenEstimator } from '@agent-core/model';
 import {
   type JsonObject,
   type JsonValue,
@@ -7,13 +8,14 @@ import {
   type ToolDefinition,
   type ToolObservationPresentation,
   type ToolObservation,
-  estimateJsonBytes,
   toJsonValue,
   validateToolObservationPresentation
 } from '@agent-core/tools';
 
-export const IMMEDIATE_TOOL_PRESENTATION_MAX_BYTES = 12_000;
-export const RETAINED_TOOL_PRESENTATION_MAX_BYTES = 2_400;
+export interface ToolObservationTokenBudgets {
+  readonly immediate: number;
+  readonly retained: number;
+}
 
 export interface ToolObservationRecord {
   id: string;
@@ -21,59 +23,139 @@ export interface ToolObservationRecord {
   call: ToolCall;
   toolName: string;
   fullObservation: ToolObservation;
+  durableObservation: ToolObservation;
   immediatePresentation: ToolObservationPresentation;
   retainedPresentation: ToolObservationPresentation;
+  immediateImages: readonly ModelImage[];
   evidence: EvidenceRecord[];
   createdAt: string;
 }
 
 export class ObservationStore {
   private readonly records = new Map<string, ToolObservationRecord>();
+  private readonly estimator: TokenEstimator;
+  private readonly artifacts: ArtifactRepository | undefined;
+  private budgets: ToolObservationTokenBudgets;
 
-  put(input: {
+  constructor(options: { estimator?: TokenEstimator; artifacts?: ArtifactRepository; budgets?: ToolObservationTokenBudgets } = {}) {
+    this.estimator = options.estimator ?? new SimpleTokenEstimator();
+    this.artifacts = options.artifacts;
+    this.budgets = options.budgets ?? { immediate: 3_000, retained: 600 };
+  }
+
+  setTokenBudgets(budgets: ToolObservationTokenBudgets): void {
+    if (!Number.isInteger(budgets.immediate) || budgets.immediate < 1 || !Number.isInteger(budgets.retained) || budgets.retained < 1) {
+      throw new Error('Tool observation token budgets must be positive integers.');
+    }
+    this.budgets = budgets;
+  }
+
+  async put(input: {
     turnIndex: number;
     call: ToolCall;
     canonicalInput?: unknown;
     tool: ToolDefinition | undefined;
     observation: ToolObservation;
-  }): ToolObservationRecord {
-    const immediatePresentation = presentToolObservation({
-      call: input.call,
-      canonicalInput: input.canonicalInput,
-      observation: input.observation,
-      tool: input.tool,
-      maxBytes: IMMEDIATE_TOOL_PRESENTATION_MAX_BYTES
-    });
-    const retainedPresentation = presentToolObservation({
-      call: input.call,
-      canonicalInput: input.canonicalInput,
-      observation: input.observation,
-      tool: input.tool,
-      maxBytes: RETAINED_TOOL_PRESENTATION_MAX_BYTES
-    });
+  }): Promise<ToolObservationRecord> {
+    const complete = redactToolObservationPresentation(buildToolObservationPresentation(input.call, input.canonicalInput, input.observation, input.tool, this.budgets.immediate));
+    const [immediatePresentation, retainedPresentation, immediateImages] = await Promise.all([
+      this.fitPresentation(input.call.name, complete, this.budgets.immediate),
+      this.fitPresentation(input.call.name, complete, this.budgets.retained),
+      this.loadObservationImages(input.observation)
+    ]);
     const id = `obs_${randomUUID()}`;
     const createdAt = new Date().toISOString();
+    const durableObservation = observationForDurableStorage(input.observation, immediatePresentation);
     const record: ToolObservationRecord = {
       id,
       turnIndex: input.turnIndex,
       call: input.call,
       toolName: input.call.name,
       fullObservation: input.observation,
+      durableObservation,
       immediatePresentation,
       retainedPresentation,
-      evidence: normalizeToolEvidenceDelta(input.observation.evidence, {
-        observationId: id,
-        toolName: input.call.name,
-        createdAt
-      }),
+      immediateImages,
+      evidence: normalizeToolEvidenceDelta(input.observation.evidence, { observationId: id, toolName: input.call.name, createdAt }),
       createdAt
     };
     this.records.set(record.id, record);
     return record;
   }
 
-  get(id: string): ToolObservationRecord | undefined {
-    return this.records.get(id);
+  get(id: string): ToolObservationRecord | undefined { return this.records.get(id); }
+
+  private async fitPresentation(toolName: string, presentation: ToolObservationPresentation, maxTokens: number): Promise<ToolObservationPresentation> {
+    const validated = validateToolObservationPresentation(presentation);
+    if (!validated.ok) return invalidPresenterPresentation(toolName, validated.issues);
+    const safePresentation = clonePresentation(validated.presentation);
+    const serialized = serializeToolObservationPresentation(safePresentation);
+    const tokens = this.estimator.estimateText(serialized);
+    if (tokens <= maxTokens) return safePresentation;
+    const artifact = this.artifacts
+      ? await this.artifacts.store({
+        label: `${toolName}-observation`,
+        content: new TextEncoder().encode(`${serialized}\n`),
+        mediaType: 'application/json; charset=utf-8',
+        description: 'Complete tool observation presentation.'
+      })
+      : undefined;
+    return {
+      ok: safePresentation.ok,
+      title: safePresentation.title,
+      summary: safePresentation.summary,
+      ...(safePresentation.scope ? { scope: safePresentation.scope } : {}),
+      results: artifact ? { artifact: toJsonValue(artifact) } : { artifact: null },
+      omitted: { presentationTokens: tokens, tokenBudget: maxTokens },
+      coverage: 'partial',
+      truncated: true,
+      warnings: ['The complete structured observation exceeded the runtime token budget and was stored as an artifact.'],
+      next: artifact ? `Use read_artifact with artifactId ${artifact.artifactId} to inspect the complete observation.` : 'Make a narrower tool call to retrieve less output.'
+    };
+  }
+
+  private async loadObservationImages(observation: ToolObservation): Promise<readonly ModelImage[]> {
+    if (!this.artifacts) return [];
+    return Promise.all((observation.content ?? []).flatMap((content) => content.type === 'image' ? [content] : []).map(async (content) => ({
+      type: 'bytes' as const,
+      data: await this.artifacts?.readVerified(content.artifact) ?? new Uint8Array(),
+      mediaType: content.artifact.mediaType as `image/${string}`,
+      detail: content.detail
+    })));
+  }
+}
+
+function observationForDurableStorage(observation: ToolObservation, presentation: ToolObservationPresentation): ToolObservation {
+  if (presentation.truncated !== true || observation.kind === 'failure') return observation;
+  const artifact = presentationArtifact(presentation);
+  return {
+    kind: 'result',
+    ok: observation.ok,
+    summary: observation.summary,
+    scope: {
+      resources: observation.scope.resources,
+      coverage: 'partial',
+      cause: artifact ? 'complete output stored as an artifact' : 'output exceeded the runtime token budget'
+    },
+    ...(artifact ? { content: [...(observation.content ?? []), { type: 'artifact', artifact }] } : {}),
+    output: {
+      truncated: true,
+      artifact: artifact ?? null,
+      omitted: presentation.omitted ?? {}
+    }
+  };
+}
+
+function presentationArtifact(presentation: ToolObservationPresentation): ArtifactRef | undefined {
+  const results = presentation.results;
+  if (results === undefined || !isJsonObject(results)) return undefined;
+  const candidate = results.artifact;
+  if (candidate === undefined || !isJsonObject(candidate)) return undefined;
+  try {
+    validateArtifactRef(candidate);
+    return Object.freeze({ ...candidate });
+  } catch {
+    return undefined;
   }
 }
 
@@ -81,59 +163,29 @@ export function serializeToolObservationPresentation(presentation: ToolObservati
   return JSON.stringify(presentation, null, 2);
 }
 
-function presentToolObservation(input: {
-  call: ToolCall;
-  canonicalInput?: unknown;
-  observation: ToolObservation;
-  tool: ToolDefinition | undefined;
-  maxBytes: number;
-}): ToolObservationPresentation {
-  const presented = buildToolObservationPresentation(input.call, input.canonicalInput, input.observation, input.tool, input.maxBytes);
-  const redacted = redactToolObservationPresentation(presented);
-  const reduced = reduceToolObservationPresentation(redacted, input.maxBytes, input.call.name);
-  const validated = validateToolObservationPresentation(reduced);
-  if (!validated.ok) {
-    return invalidPresenterPresentation(input.call.name, validated.issues);
-  }
-  const serialized = serializeToolObservationPresentation(validated.presentation);
-  if (Buffer.byteLength(serialized, 'utf8') <= input.maxBytes) {
-    return validated.presentation;
-  }
-  return emergencyToolObservationPresentation(input.call.name, validated.presentation, Buffer.byteLength(serialized, 'utf8'), input.maxBytes);
-}
-
 function buildToolObservationPresentation(
   toolCall: ToolCall,
   canonicalInput: unknown,
   observation: ToolObservation,
   tool: ToolDefinition | undefined,
-  maxBytes: number
+  maxTokens: number
 ): ToolObservationPresentation {
-  let rawPresentation: unknown;
+  let raw: unknown;
   try {
-    rawPresentation = tool?.presentObservation
-      ? tool.presentObservation({
-        call: toolCall,
-        input: canonicalInput,
-        observation,
-        limit: { maxBytes }
-      })
+    raw = tool?.presentObservation
+      ? tool.presentObservation({ call: toolCall, input: canonicalInput, observation, limit: { maxTokens } })
       : fallbackToolObservationPresentation(toolCall, observation);
   } catch (error) {
     return {
       ok: false,
       title: 'Invalid tool presenter output',
       summary: `Presenter for ${toolCall.name} threw before producing an observation presentation.`,
-      failures: {
-        reason: 'presenter_error',
-        error: error instanceof Error ? error.message : String(error)
-      },
-      truncated: false,
-      next: 'Use the recorded tool observation in the ledger for debugging; the invalid presentation was replaced by a safe failure.'
+      failures: { reason: 'presenter_error', error: error instanceof Error ? error.message : String(error) },
+      coverage: 'partial',
+      next: 'Inspect the persisted tool failure and fix the presenter.'
     };
   }
-
-  const validated = validateToolObservationPresentation(rawPresentation);
+  const validated = validateToolObservationPresentation(raw);
   return validated.ok ? validated.presentation : invalidPresenterPresentation(toolCall.name, validated.issues);
 }
 
@@ -142,37 +194,31 @@ function fallbackToolObservationPresentation(toolCall: ToolCall, observation: To
     ok: observation.ok,
     title: `${toolCall.name} observation`,
     summary: observation.summary,
-    truncated: false
+    scope: toJsonObject(observation.scope),
+    coverage: observation.scope.coverage
   };
-  if (observation.ok) {
+  if (observation.kind === 'result') {
     return {
       ...base,
       results: {
         output: toJsonValue(observation.output),
-        ...(observation.artifacts ? { artifacts: toJsonValue(observation.artifacts) } : {}),
+        ...(observation.content ? { content: toJsonValue(observation.content) } : {}),
         ...(observation.metadata ? { metadata: toJsonValue(observation.metadata) } : {})
       },
-      next: 'This external tool used the generic presentation; treat the result as scoped to the tool call.'
+      ...(observation.scope.coverage === 'partial' ? { next: 'Continue with the indicated range or artifact when more coverage is required.' } : {})
     };
   }
-  return {
-    ...base,
-    failures: toJsonValue(observation.output),
-    next: 'Use the failure details to adjust the next tool call.'
-  };
+  return { ...base, failures: toJsonValue(observation.output), next: observation.output.recovery };
 }
 
 function invalidPresenterPresentation(toolName: string, issues: { path: string; message: string }[]): ToolObservationPresentation {
   return {
     ok: false,
     title: 'Invalid tool presenter output',
-    summary: `Presenter for ${toolName} produced an invalid tool observation presentation. It was not sent to the model.`,
-    failures: {
-      reason: 'invalid_presenter_output',
-      issues: issues.map((issue) => ({ path: issue.path, message: issue.message }))
-    },
-    truncated: false,
-    next: 'Use the recorded tool observation in the ledger for debugging; the invalid presentation was replaced by a safe failure.'
+    summary: `Presenter for ${toolName} produced an invalid observation presentation.`,
+    failures: { reason: 'invalid_presenter_output', issues: issues.map((issue) => ({ path: issue.path, message: issue.message })) },
+    coverage: 'partial',
+    next: 'Fix the tool presenter before using this result.'
   };
 }
 
@@ -180,247 +226,42 @@ function redactToolObservationPresentation(presentation: ToolObservationPresenta
   const state = { redactions: 0 };
   const redacted = redactJsonValue(toJsonValue(presentation), [], state);
   const validated = validateToolObservationPresentation(redacted);
-  const next = validated.ok ? validated.presentation : invalidPresenterPresentation('redaction', validated.issues);
-  if (state.redactions === 0) {
-    return next;
-  }
-  return addWarning(next, `Global redaction replaced ${String(state.redactions)} sensitive value${state.redactions === 1 ? '' : 's'} with [REDACTED].`);
+  const result = validated.ok ? validated.presentation : invalidPresenterPresentation('redaction', validated.issues);
+  if (state.redactions === 0) return result;
+  return { ...result, warnings: [...(result.warnings ?? []), `Redacted ${String(state.redactions)} sensitive value${state.redactions === 1 ? '' : 's'}.`] };
 }
 
 function redactJsonValue(value: JsonValue, pathParts: string[], state: { redactions: number }): JsonValue {
-  if (typeof value === 'string') {
-    return redactString(value, pathParts, state);
-  }
-  if (Array.isArray(value)) {
-    return value.map((item, index) => redactJsonValue(item, [...pathParts, String(index)], state));
-  }
-  if (isJsonObject(value)) {
-    const output: JsonObject = {};
-    for (const [key, item] of Object.entries(value)) {
-      output[key] = redactJsonValue(item, [...pathParts, key], state);
-    }
-    return output;
-  }
-  return value;
+  if (typeof value === 'string') return redactString(value, pathParts, state);
+  if (Array.isArray(value)) return value.map((item, index) => redactJsonValue(item, [...pathParts, String(index)], state));
+  if (!isJsonObject(value)) return value;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactJsonValue(item, [...pathParts, key], state)]));
 }
 
 function redactString(value: string, pathParts: string[], state: { redactions: number }): string {
   const key = pathParts.at(-1) ?? '';
-  if (/(authorization|credential|password|secret|token|api[-_]?key)/i.test(key) && value.length > 0) {
+  if (/(authorization|credential|password|secret|token|api[-_]?key)/iu.test(key) && value.length > 0) {
     state.redactions += 1;
     return '[REDACTED]';
   }
-  const patterns = [
-    /(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi,
-    /(sk-(?:or-v1-)?[A-Za-z0-9_-]{16,})/g,
-    /([A-Za-z_][A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|KEY)[A-Za-z0-9_]*=)[^\s]+/gi
-  ];
-  let next = value;
-  for (const pattern of patterns) {
-    next = next.replace(pattern, (_match: string, prefix?: string) => {
-      state.redactions += 1;
-      return prefix ? `${prefix}[REDACTED]` : '[REDACTED]';
-    });
-  }
-  return next;
+  const patterns = [/(Bearer\s+)[A-Za-z0-9._~+/=-]+/giu, /(sk-(?:or-v1-)?[A-Za-z0-9_-]{16,})/gu, /([A-Za-z_][A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|KEY)[A-Za-z0-9_]*=)[^\s]+/giu];
+  let result = value;
+  for (const pattern of patterns) result = result.replace(pattern, (_match: string, prefix?: string) => { state.redactions += 1; return prefix ? `${prefix}[REDACTED]` : '[REDACTED]'; });
+  return result;
 }
 
-function reduceToolObservationPresentation(presentation: ToolObservationPresentation, maxBytes: number, toolName: string): ToolObservationPresentation {
-  let next = cloneToolObservationPresentation(presentation);
-  if (presentationBytes(next) <= maxBytes) {
-    return next;
-  }
-
-  const omitted = { items: 0, bytes: 0 };
-  let contentTruncated = false;
-  let partialCoverage = false;
-  const originalBytes = presentationBytes(next);
-  while (presentationBytes(next) > maxBytes && next.results !== undefined) {
-    const reduced = reduceJsonEvidence(next.results);
-    if (!reduced.changed) {
-      next.results = {
-        truncated: true,
-        message: 'Results omitted from the observation presentation because they exceeded the transcript budget.'
-      };
-      omitted.items += 1;
-      partialCoverage = true;
-      break;
-    }
-    next.results = reduced.value;
-    omitted.items += reduced.omittedItems;
-    omitted.bytes += reduced.omittedBytes;
-    contentTruncated ||= reduced.truncated;
-    partialCoverage ||= reduced.partial;
-  }
-
-  while (presentationBytes(next) > maxBytes && next.failures !== undefined) {
-    const reduced = reduceJsonEvidence(next.failures);
-    if (!reduced.changed) {
-      next.failures = {
-        truncated: true,
-        message: 'Failure details omitted from the observation presentation because they exceeded the transcript budget.'
-      };
-      omitted.items += 1;
-      partialCoverage = true;
-      break;
-    }
-    next.failures = reduced.value;
-    omitted.items += reduced.omittedItems;
-    omitted.bytes += reduced.omittedBytes;
-    contentTruncated ||= reduced.truncated;
-    partialCoverage ||= reduced.partial;
-  }
-
-  if (omitted.items > 0 || omitted.bytes > 0 || presentationBytes(next) < originalBytes) {
-    next = addWarning(next, 'The observation presentation was structurally reduced before serialization.');
-    next = addPresentationOmitted(next, omitted.items, Math.max(omitted.bytes, originalBytes - presentationBytes(next)));
-    if (contentTruncated) next.truncated = true;
-    if (partialCoverage) next.coverage = 'partial';
-  }
-
-  if (presentationBytes(next) <= maxBytes) {
-    return next;
-  }
-
-  return emergencyToolObservationPresentation(toolName, next, presentationBytes(next), maxBytes);
+function toJsonObject(value: unknown): JsonObject {
+  const json = toJsonValue(value);
+  return isJsonObject(json) ? json : { value: json };
 }
 
-function reduceJsonEvidence(value: JsonValue): { value: JsonValue; changed: boolean; omittedItems: number; omittedBytes: number; truncated: boolean; partial: boolean } {
-  const before = estimateJsonBytes(value);
-  const shortened = shortenLongestString(value);
-  if (shortened.changed) {
-    return {
-      value: shortened.value,
-      changed: true,
-      omittedItems: 0,
-      omittedBytes: Math.max(0, before - estimateJsonBytes(shortened.value)),
-      truncated: true,
-      partial: false
-    };
-  }
-  const dropped = dropOneArrayItem(value);
-  if (dropped.changed) {
-    return {
-      value: dropped.value,
-      changed: true,
-      omittedItems: 1,
-      omittedBytes: Math.max(0, before - estimateJsonBytes(dropped.value)),
-      truncated: false,
-      partial: true
-    };
-  }
-  return { value, changed: false, omittedItems: 0, omittedBytes: 0, truncated: false, partial: false };
+function clonePresentation(value: ToolObservationPresentation): ToolObservationPresentation {
+  const cloned = validateToolObservationPresentation(toJsonValue(value));
+  if (!cloned.ok) throw new Error('Validated tool observation presentation could not be cloned.');
+  return cloned.presentation;
 }
 
-function shortenLongestString(value: JsonValue): { value: JsonValue; changed: boolean } {
-  if (typeof value === 'string') {
-    if (Buffer.byteLength(value, 'utf8') <= 1_000) {
-      return { value, changed: false };
-    }
-    const next = `${value.slice(0, Math.max(0, Math.floor(value.length * 0.5)))}\n[field truncated for observation presentation]`;
-    return { value: next, changed: true };
-  }
-  if (Array.isArray(value)) {
-    for (let index = 0; index < value.length; index += 1) {
-      const result = shortenLongestString(value[index] ?? null);
-      if (result.changed) {
-        const copy = [...value];
-        copy[index] = result.value;
-        return { value: copy, changed: true };
-      }
-    }
-    return { value, changed: false };
-  }
-  if (isJsonObject(value)) {
-    for (const [key, item] of Object.entries(value)) {
-      const result = shortenLongestString(item);
-      if (result.changed) {
-        return { value: { ...value, [key]: result.value }, changed: true };
-      }
-    }
-  }
-  return { value, changed: false };
-}
-
-function dropOneArrayItem(value: JsonValue): { value: JsonValue; changed: boolean } {
-  if (Array.isArray(value)) {
-    if (value.length === 0) {
-      return { value, changed: false };
-    }
-    return { value: value.slice(0, -1), changed: true };
-  }
-  if (isJsonObject(value)) {
-    const entries = Object.entries(value);
-    for (let index = entries.length - 1; index >= 0; index -= 1) {
-      const entry = entries[index];
-      if (!entry) {
-        continue;
-      }
-      const [key, item] = entry;
-      const result = dropOneArrayItem(item);
-      if (result.changed) {
-        return { value: { ...value, [key]: result.value }, changed: true };
-      }
-    }
-  }
-  return { value, changed: false };
-}
-
-function emergencyToolObservationPresentation(toolName: string, presentation: ToolObservationPresentation, bytes: number, maxBytes: number): ToolObservationPresentation {
-  return {
-    ok: presentation.ok,
-    title: 'Tool observation emergency truncation',
-    summary: `Observation presentation for ${toolName} remained too large after structured reduction.`,
-    scope: {
-      tool: toolName,
-      originalTitle: presentation.title
-    },
-    omitted: {
-      presentationBytes: bytes,
-      maxBytes
-    },
-    truncated: true,
-    warnings: ['Emergency truncation replaced the oversized presentation with this compact marker. No partial JSON was sent.'],
-    next: 'Use a narrower tool call or inspect the full ledger observation outside the model transcript.'
-  };
-}
-
-function addWarning(presentation: ToolObservationPresentation, warning: string): ToolObservationPresentation {
-  const warnings = [...(presentation.warnings ?? [])];
-  if (!warnings.includes(warning)) {
-    warnings.push(warning);
-  }
-  return { ...presentation, warnings };
-}
-
-function addPresentationOmitted(presentation: ToolObservationPresentation, items: number, bytes: number): ToolObservationPresentation {
-  const omitted = { ...(presentation.omitted ?? {}) };
-  if (items > 0) {
-    omitted.presentationItems = numericJsonValue(omitted.presentationItems) + items;
-  }
-  if (bytes > 0) {
-    omitted.presentationBytes = numericJsonValue(omitted.presentationBytes) + bytes;
-  }
-  return { ...presentation, omitted };
-}
-
-function numericJsonValue(value: JsonValue | undefined): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
-}
-
-function cloneToolObservationPresentation(presentation: ToolObservationPresentation): ToolObservationPresentation {
-  const json = toJsonValue(presentation);
-  const validated = validateToolObservationPresentation(json);
-  return validated.ok ? validated.presentation : invalidPresenterPresentation('clone', validated.issues);
-}
-
-function presentationBytes(presentation: ToolObservationPresentation): number {
-  return Buffer.byteLength(JSON.stringify(toJsonValue(presentation), null, 2), 'utf8');
-}
-
-function isJsonObject(value: JsonValue): value is JsonObject {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
+function isJsonObject(value: JsonValue): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 
 export function sha256ToolObservationPresentation(presentation: ToolObservationPresentation): string {
   return createHash('sha256').update(serializeToolObservationPresentation(presentation)).digest('hex');
