@@ -55,6 +55,7 @@ export function spawnSupervisedProcess(input: {
     cwd: input.cwd,
     env: { ...process.env, AGENT_CORE_SUPERVISOR_TOKEN: input.supervision.authenticationToken },
     stdio: ['pipe', 'pipe', 'pipe'],
+    detached: true,
     windowsHide: true
   }) as ChildProcessByStdio<Writable, Readable, Readable>;
   return new SupervisorController(child, input.supervision);

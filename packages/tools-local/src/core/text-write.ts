@@ -288,14 +288,15 @@ async function syncDirectories(directories: readonly string[], io: TextWriteFile
 }
 
 async function syncDirectory(directory: string, io: TextWriteFileSystem): Promise<void> {
-  const handle = await io.open(directory, 'r');
+  let handle: Awaited<ReturnType<TextWriteFileSystem['open']>> | undefined;
   try {
+    handle = await io.open(directory, 'r');
     await handle.sync();
   } catch (error) {
     const code = nodeCode(error) ?? '';
     if (!['EINVAL', 'ENOTSUP', 'EBADF'].includes(code) && !(process.platform === 'win32' && code === 'EPERM')) throw error;
   } finally {
-    await handle.close();
+    await handle?.close();
   }
 }
 
