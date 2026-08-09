@@ -7,6 +7,9 @@ import { fileURLToPath } from 'node:url';
 
 const exec = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const npmCli = process.env.npm_execpath;
+if (!npmCli) throw new Error('npm_execpath is required to verify packed consumers.');
+const tscCli = path.join(root, 'node_modules', 'typescript', 'bin', 'tsc');
 const packageDirs = [
   'packages/auth', 'packages/cli', 'packages/json', 'packages/evidence', 'packages/model', 'packages/runtime', 'packages/tools', 'packages/tools-local',
   'packages/providers/ollama', 'packages/providers/openai-responses', 'packages/providers/openai', 'packages/providers/openai-codex', 'packages/providers/openrouter'
@@ -30,7 +33,7 @@ try {
   for (const relative of packageDirs) {
     const directory = path.join(root, relative);
     const manifest = JSON.parse(await readFile(path.join(directory, 'package.json'), 'utf8'));
-    const { stdout } = await exec('npm', ['pack', '--json', '--pack-destination', packs], { cwd: directory, maxBuffer: 10 * 1024 * 1024 });
+    const { stdout } = await exec(process.execPath, [npmCli, 'pack', '--json', '--pack-destination', packs], { cwd: directory, maxBuffer: 10 * 1024 * 1024 });
     const packed = JSON.parse(stdout)[0];
     const files = packed.files.map((file) => file.path);
     assertCleanArchivePaths(files);
@@ -39,7 +42,7 @@ try {
   }
   await mkdir(consumer, { recursive: true });
   await writeFile(path.join(consumer, 'package.json'), `${JSON.stringify({ name: 'agent-core-consumer', private: true, type: 'module', dependencies }, null, 2)}\n`);
-  await exec('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: consumer, maxBuffer: 20 * 1024 * 1024 });
+  await exec(process.execPath, [npmCli, 'install', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: consumer, maxBuffer: 20 * 1024 * 1024 });
   await writeFile(path.join(consumer, 'runtime.mjs'), [
     "import * as runtime from '@agent-core/runtime';",
     "import * as nodeRuntime from '@agent-core/runtime/node';",
@@ -68,7 +71,7 @@ try {
   for (const exactOptionalPropertyTypes of [true, false]) {
     const config = `tsconfig-${String(exactOptionalPropertyTypes)}.json`;
     await writeFile(path.join(consumer, config), `${JSON.stringify({ compilerOptions: { target: 'ES2022', module: 'NodeNext', moduleResolution: 'NodeNext', strict: true, skipLibCheck: false, exactOptionalPropertyTypes, noEmit: true }, files: ['consumer.ts'] }, null, 2)}\n`);
-    await exec(path.join(root, 'node_modules', '.bin', 'tsc'), ['-p', config, '--pretty', 'false'], { cwd: consumer, maxBuffer: 20 * 1024 * 1024 });
+    await exec(process.execPath, [tscCli, '-p', config, '--pretty', 'false'], { cwd: consumer, maxBuffer: 20 * 1024 * 1024 });
   }
   const testFiles = (await exec('rg', ['--files', 'tests'], { cwd: root })).stdout.trim().split('\n').filter(Boolean);
   for (const file of testFiles) assertNoDistImports(await readFile(path.join(root, file), 'utf8'), file);
