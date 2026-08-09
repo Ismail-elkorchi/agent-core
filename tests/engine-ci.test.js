@@ -16,6 +16,7 @@ test('package engines and release CI enforce the stable path.matchesGlob Node fl
     'packages/runtime/package.json',
     'packages/tools/package.json',
     'packages/tools-local/package.json',
+    'packages/tui/package.json',
     'packages/providers/ollama/package.json',
     'packages/providers/openai/package.json',
     'packages/providers/openai-codex/package.json',

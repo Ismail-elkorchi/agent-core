@@ -8,6 +8,7 @@
     { "path": "packages/runtime" },
     { "path": "packages/tools" },
     { "path": "packages/tools-local" },
+    { "path": "packages/tui" },
     { "path": "packages/providers/openai-responses" },
     { "path": "packages/providers/ollama" },
     { "path": "packages/providers/openrouter" },

@@ -38,7 +38,7 @@ import { createInitialAgentTuiState } from './state.js';
 import type { AgentTuiRuntimeDetails, AgentTuiState } from './state.js';
 import type { AgentTuiActivityEntry, AgentTuiConversationEntry } from './conversation-model.js';
 import { conversationText, scrollConversation, toggleActivity } from './conversation.js';
-import { INTERACTIVE_COMMANDS } from '../interactive-commands.js';
+import { INTERACTIVE_COMMANDS } from './interactive-commands.js';
 
 export interface AgentTuiAppOptions {
   readonly eventSource?: TuiEventSource<AgentTuiMessage>;

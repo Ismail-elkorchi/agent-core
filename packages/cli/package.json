@@ -1,7 +1,7 @@
 {
   "name": "@agent-core/cli",
   "version": "0.2.0",
-  "description": "CLI and TUI for Agent Core runtime operations and committed workspace configuration.",
+  "description": "Command-line entry point for Agent Core runtime operations and committed workspace configuration.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -9,8 +9,7 @@
     "agent-core": "./dist/index.js"
   },
   "exports": {
-    ".": "./dist/index.js",
-    "./tui": "./dist/tui/index.js"
+    ".": "./dist/index.js"
   },
   "files": [
     "dist",
@@ -31,6 +30,6 @@
     "@agent-core/provider-openrouter": "0.2.0",
     "@agent-core/tools": "0.2.0",
     "@agent-core/tools-local": "0.2.0",
-    "@ismail-elkorchi/terminal-ui": "github:Ismail-elkorchi/terminal-ui#64bd8def427d8b81e9de3fa673d99b6893b77d81"
+    "@agent-core/tui": "0.2.0"
   }
 }

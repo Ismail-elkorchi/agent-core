@@ -7,9 +7,9 @@ import {
 import type { SearchPickerIndex } from '@ismail-elkorchi/terminal-ui/behavior';
 import type { SearchEntry, TextAreaAction } from '@ismail-elkorchi/terminal-ui/components';
 import { textDocumentText } from '@ismail-elkorchi/terminal-ui/text';
-import { INTERACTIVE_COMMANDS } from '../interactive-commands.js';
-import type { InteractiveCommandResult } from '../interactive-commands.js';
-import { normalizeTaskInput } from '../task-input.js';
+import { INTERACTIVE_COMMANDS } from './interactive-commands.js';
+import type { InteractiveCommandResult } from './interactive-commands.js';
+import { normalizeTaskInput } from './task-input.js';
 import type { AgentTuiState } from './state.js';
 import { appendNotice, appendUser } from './conversation.js';
 

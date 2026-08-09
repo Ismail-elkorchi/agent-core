@@ -1,5 +1,5 @@
 import type { AgentRuntime, AgentRuntimeState } from '@agent-core/runtime';
-import { parseReasoningEffort } from './cli-values.js';
+import { parseReasoningEffort } from './reasoning-effort.js';
 
 export interface InteractiveCommandEntry {
   readonly name: InteractiveCommandName;

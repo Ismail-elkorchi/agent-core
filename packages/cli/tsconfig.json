@@ -17,6 +17,7 @@
     { "path": "../providers/openai-codex" },
     { "path": "../providers/openrouter" },
     { "path": "../tools" },
-    { "path": "../tools-local" }
+    { "path": "../tools-local" },
+    { "path": "../tui" }
   ]
 }

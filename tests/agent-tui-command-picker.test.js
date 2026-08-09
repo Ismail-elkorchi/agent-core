@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createMemoryTerminalHost } from '@ismail-elkorchi/terminal-ui/host';
 import { createTuiRuntime } from '@ismail-elkorchi/terminal-ui/tui';
-import { createAgentTuiApp, runAgentTuiApp } from '@agent-core/cli/tui';
+import { createAgentTuiApp, runAgentTuiApp } from '@agent-core/tui';
 import { plainOutput, waitFor } from './agent-tui-test-helpers.js';
 
 test('Ctrl+P opens the concise command picker and executes a selected command', async () => {

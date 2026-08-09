@@ -29,11 +29,15 @@ import {
   createLocalToolHost,
   type LocalToolHost
 } from '@agent-core/tools-local';
-import { AgentTuiProgressRenderer, runAgentTuiApp, runAgentTuiTask } from './tui/index.js';
-import type { AgentTuiRuntimeDetails } from './tui/index.js';
-import { parseReasoningEffort } from './cli-values.js';
-import { executeInteractiveCommand } from './interactive-commands.js';
-import { normalizeTaskInput } from './task-input.js';
+import {
+  AgentTuiProgressRenderer,
+  executeInteractiveCommand,
+  normalizeTaskInput,
+  parseReasoningEffort,
+  runAgentTuiApp,
+  runAgentTuiTask,
+  type AgentTuiRuntimeDetails
+} from '@agent-core/tui';
 import { parseJsonValue } from '@agent-core/json';
 
 export {

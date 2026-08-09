@@ -3,7 +3,7 @@ import test from 'node:test';
 import { createMemoryTerminalHost } from '@ismail-elkorchi/terminal-ui/host';
 import { textDocumentText } from '@ismail-elkorchi/terminal-ui/text';
 import { createTuiRuntime } from '@ismail-elkorchi/terminal-ui/tui';
-import { createAgentTuiApp } from '@agent-core/cli/tui';
+import { createAgentTuiApp } from '@agent-core/tui';
 
 test('composer sends with Enter and inserts newlines with Shift+Enter and Ctrl+O', async () => {
   const submitted = [];

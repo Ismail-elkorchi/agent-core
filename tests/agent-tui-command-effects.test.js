@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createMemoryTerminalHost } from '@ismail-elkorchi/terminal-ui/host';
 import { runTui } from '@ismail-elkorchi/terminal-ui/tui';
-import { AgentTuiEventSource, createAgentTuiApp } from '@agent-core/cli/tui';
+import { AgentTuiEventSource, createAgentTuiApp } from '@agent-core/tui';
 import { waitFor } from './agent-tui-test-helpers.js';
 
 test('delayed command effects preserve progress received while the effect is running', async () => {

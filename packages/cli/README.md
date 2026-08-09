@@ -1,6 +1,6 @@
 # `@agent-core/cli`
 
-Agent Core command-line and TUI entry point. It presents execution, candidate completeness, model termination, verification, advisory checks, and delivery diagnostics independently.
+Agent Core command-line entry point. The terminal UI implementation lives in `@agent-core/tui`; this package composes it with committed workspace configuration, providers, repositories, and the local tool host.
 
 Use `--config agent-core.config.json` for committed workspace settings. The default coding surface exposes structured list/read/search plus patch and shell tools. Interactive modes present Allow/Deny approval choices; noninteractive suspension exits `7`, and `agent-core approval` resolves the exact persisted fingerprint after restart.
 
