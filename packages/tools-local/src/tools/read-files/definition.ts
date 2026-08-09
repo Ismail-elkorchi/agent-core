@@ -1,6 +1,7 @@
-import { defineTool, requireWorkspaceRoot } from '@agent-core/tools';
+import { defineTool, requireWorkspaceRoot, workspaceFileScope } from '@agent-core/tools';
 import { canonicalWorkspacePath } from '../../core/filesystem.js';
 import { readFiles } from './run.js';
+import { presentReadFilesObservation } from '../../core/presenters.js';
 import { readFilesInputSchema, readFilesOutputSchema } from './schema.js';
 
 export const readFilesTool = defineTool({
@@ -9,13 +10,15 @@ export const readFilesTool = defineTool({
   description: 'Read line ranges from one or more workspace text files without loading complete files.',
   schema: readFilesInputSchema,
   outputSchema: readFilesOutputSchema,
+  presentObservation: presentReadFilesObservation,
+  requirements: { services: ['workspaceRoot', 'localToolConfiguration'] },
   effectEnvelope: { accesses: [{ mode: 'read', scope: 'workspace/files' }], lockScopes: [] },
   async canonicalizeInput(input, context) {
     const root = requireWorkspaceRoot(context);
     return { ...input, files: await Promise.all(input.files.map(async (file) => ({ ...file, path: await canonicalWorkspacePath(root, file.path) }))) };
   },
   deriveEffects(input) {
-    return { accesses: input.files.map((file) => ({ mode: 'read' as const, scope: `workspace/files/${file.path}` })), lockScopes: [], idempotency: 'pure' };
+    return { accesses: input.files.map((file) => ({ mode: 'read' as const, scope: workspaceFileScope(file.path) })), lockScopes: [], idempotency: 'pure' };
   },
   invoke: readFiles
 });

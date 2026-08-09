@@ -21,13 +21,15 @@ const streamOutputSchema = z.strictObject({
 
 export const processOutputSchema = z.strictObject({
   processId: z.string(),
+  owner: z.strictObject({ runId: z.string(), turnId: z.string(), toolBatchId: z.string(), callIndex: z.int().nonnegative() }),
   status: z.enum(['running', 'exited', 'stopped', 'timed_out', 'failed']),
   cursorStart: z.int().nonnegative(),
   cursorEnd: z.int().nonnegative(),
+  cursorExpired: z.boolean().optional(),
   stdout: streamOutputSchema,
   stderr: streamOutputSchema,
   combined: streamOutputSchema,
-  artifact: artifactRefSchema,
+  artifact: artifactRefSchema.optional(),
   exitCode: z.int().nullable().optional(),
   signal: z.string().nullable().optional(),
   diagnostic: z.string().optional()

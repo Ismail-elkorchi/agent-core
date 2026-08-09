@@ -1,5 +1,5 @@
 import type { ContextBundle, ContextHistoryReduction, PromptProjection } from './context/manager.js';
-import { normalizeJsonSafe, type ArtifactRef, type JsonValue, type RuntimeCodec } from '@agent-core/evidence';
+import { parseJsonObject, type ArtifactRef, type JsonValue, type RuntimeCodec } from '@agent-core/evidence';
 import type {
   ModelCapabilities,
   ModelLimits,
@@ -127,6 +127,7 @@ export type AgentEvent =
   | { readonly type: 'finalization.prepared'; readonly terminal: AgentTerminalSnapshot }
   | { readonly type: 'run.ended'; readonly terminal: AgentTerminalSnapshot; readonly diagnostic?: ModelProviderErrorDiagnostic & { readonly turnIndex?: number } }
   | { readonly type: 'delivery.failed'; readonly finalizationId: string; readonly diagnostic: AgentDeliveryDiagnostic }
+  | { readonly type: 'process.ended'; readonly runId: string; readonly processId: string; readonly status: string; readonly result: JsonValue }
   | ({ readonly type: 'turn.started'; readonly runId: string; readonly task: string; readonly sessionId?: string; readonly sessionEntryId?: string } & AgentTurnIdentity)
   | ({ readonly type: 'context.replay.created' } & AgentReplayPayload)
   | { readonly type: 'provider.state.restored'; readonly state: AgentProviderStateSummary; readonly stateRef?: ArtifactRef }
@@ -185,35 +186,46 @@ const AGENT_EVENT_MAX_TOTAL_BYTES = 4 * 1024 * 1024;
 const AGENT_EVENT_MAX_COLLECTION_ENTRIES = 20_000;
 
 export function parseAgentEvent(value: unknown): AgentEvent {
-  if (!isRecord(value) || typeof value.type !== 'string') throw new Error('Agent event must have a type.');
-  if (!isAgentEventType(value.type)) throw new Error(`Unsupported Agent event type: ${value.type}.`);
-  const issues = validateEventShape(value);
-  if (issues.length > 0) throw new Error(`Malformed Agent event ${value.type}: ${issues.join(' ')}`);
-  let parsed: unknown;
-  if (value.type === 'run.ended' || value.type === 'finalization.prepared') {
-    parsed = { ...value, terminal: parseAgentTerminalSnapshot(value.terminal) };
-  } else if (value.type === 'assistant.ended' || value.type === 'assistant.interrupted') {
-    const candidate = parseAgentCandidate(value.candidate);
-    if (candidate.status !== 'absent' && candidate.turnIndex !== value.turnIndex) throw new Error(`Malformed Agent event ${value.type}: candidate turnIndex does not match event turnIndex.`);
-    parsed = { ...value, candidate };
-  } else if (value.type === 'check.ended') {
-    const result = parseAgentCheckResult(value.result);
-    if (result.id !== value.check) throw new Error('Malformed Agent event check.ended: check id does not match result id.');
-    parsed = { ...value, result };
-  } else if (value.type === 'tool.ended') {
-    parsed = { ...value, observation: normalizeToolObservationForPersistence(value.observation) };
-  } else {
-    parsed = value;
+  let owned;
+  try {
+    owned = parseJsonObject(value, {
+      maxDepth: 16,
+      maxCollectionEntries: AGENT_EVENT_MAX_COLLECTION_ENTRIES,
+      maxStringBytes: AGENT_EVENT_MAX_STRING_BYTES,
+      maxTotalBytes: AGENT_EVENT_MAX_TOTAL_BYTES
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const code = message.includes('accessor') ? 'accessor' : message.includes('string byte limit') ? 'text_truncated' : 'invalid_json';
+    throw new Error(`Agent event is not safely serializable: ${code}. ${message}`, { cause: error });
   }
-  if (!isAgentEvent(parsed)) throw new Error(`Malformed Agent event ${value.type}: validated fields did not form an event.`);
-  const normalized = normalizeJsonSafe(parsed, {
+  if (typeof owned.type !== 'string') throw new Error('Agent event must have a type.');
+  if (!isAgentEventType(owned.type)) throw new Error(`Unsupported Agent event type: ${owned.type}.`);
+  const issues = validateEventShape(owned);
+  if (issues.length > 0) throw new Error(`Malformed Agent event ${owned.type}: ${issues.join(' ')}`);
+  let parsed: unknown;
+  if (owned.type === 'run.ended' || owned.type === 'finalization.prepared') {
+    parsed = { ...owned, terminal: parseAgentTerminalSnapshot(owned.terminal) };
+  } else if (owned.type === 'assistant.ended' || owned.type === 'assistant.interrupted') {
+    const candidate = parseAgentCandidate(owned.candidate);
+    if (candidate.status !== 'absent' && candidate.turnIndex !== owned.turnIndex) throw new Error(`Malformed Agent event ${owned.type}: candidate turnIndex does not match event turnIndex.`);
+    parsed = { ...owned, candidate };
+  } else if (owned.type === 'check.ended') {
+    const result = parseAgentCheckResult(owned.result);
+    if (result.id !== owned.check) throw new Error('Malformed Agent event check.ended: check id does not match result id.');
+    parsed = { ...owned, result };
+  } else if (owned.type === 'tool.ended') {
+    parsed = { ...owned, observation: normalizeToolObservationForPersistence(owned.observation) };
+  } else {
+    parsed = owned;
+  }
+  if (!isAgentEvent(parsed)) throw new Error(`Malformed Agent event ${owned.type}: validated fields did not form an event.`);
+  return parseJsonObject(parsed, {
     maxDepth: 16,
     maxCollectionEntries: AGENT_EVENT_MAX_COLLECTION_ENTRIES,
     maxStringBytes: AGENT_EVENT_MAX_STRING_BYTES,
     maxTotalBytes: AGENT_EVENT_MAX_TOTAL_BYTES
-  });
-  if (normalized.diagnostics.length > 0) throw new Error(`Agent event ${value.type} is not safely serializable: ${normalized.diagnostics.map((item) => item.code).join(', ')}.`);
-  return parsed;
+  }) as unknown as AgentEvent;
 }
 
 function validateEventShape(value: Record<string, unknown>): string[] {
@@ -247,6 +259,7 @@ const EVENT_VALIDATORS = {
   'finalization.prepared': (value, issues) => { requireRecord(value.terminal, 'terminal', issues); },
   'run.ended': (value, issues) => { requireRecord(value.terminal, 'terminal', issues); },
   'delivery.failed': (value, issues) => { requireStrings(value, ['finalizationId'], issues); requireRecord(value.diagnostic, 'diagnostic', issues); },
+  'process.ended': (value, issues) => { requireStrings(value, ['runId', 'processId', 'status'], issues); if (value.result === undefined) issues.push('result is required.'); },
   'turn.started': (value, issues) => { requireStrings(value, ['runId', 'task', 'turnId'], issues); if (!positiveInteger(value.turnIndex) || !positiveInteger(value.requestAttempt)) issues.push('turn identity is invalid.'); },
   'context.replay.created': (value, issues) => { requireStrings(value, ['sessionId'], issues); for (const name of ['replayedLedgers', 'replayedTurns', 'replayedSessionEntries', 'replayedCheckpoints', 'replayedToolResults', 'replayedEvidenceRecords']) if (!nonnegativeInteger(value[name])) issues.push(`${name} must be nonnegative.`); },
   'provider.state.restored': (value, issues) => { requireRecord(value.state, 'state', issues); },
@@ -271,7 +284,7 @@ const EVENT_VALIDATORS = {
   'approval.requested': (value, issues) => { requireStrings(value, ['runId', 'approvalId', 'toolName', 'fingerprint', 'policyHash', 'reason'], issues); requireRecord(value.effects, 'effects', issues); validateApprovalBinding(value.binding, issues); },
   'approval.resolved': (value, issues) => { requireStrings(value, ['runId', 'approvalId', 'fingerprint'], issues); validateApprovalBinding(value.binding, issues); if (value.decision !== 'allow' && value.decision !== 'deny') issues.push('approval decision is invalid.'); },
   'tool.started': (value, issues) => { requireStrings(value, ['toolName', 'fingerprint'], issues); requireToolAttempt(value, issues); requireRecord(value.input, 'input', issues); requireRecord(value.effects, 'effects', issues); if (!nonnegativeInteger(value.callIndex)) issues.push('callIndex must be nonnegative.'); },
-  'tool.updated': (value, issues) => { requireStrings(value, ['toolName'], issues); if (!isRecord(value.progress) || typeof value.progress.stage !== 'string') issues.push('progress.stage must be a string.'); requireToolAttempt(value, issues); if (!nonnegativeInteger(value.callIndex)) issues.push('callIndex must be nonnegative.'); },
+  'tool.updated': (value, issues) => { requireStrings(value, ['toolName'], issues); validateToolProgress(value.progress, issues); requireToolAttempt(value, issues); if (!nonnegativeInteger(value.callIndex)) issues.push('callIndex must be nonnegative.'); },
   'tool.ended': (value, issues) => { requireStrings(value, ['toolName'], issues); requireToolAttempt(value, issues); requireRecord(value.observation, 'observation', issues); if (!nonnegativeInteger(value.callIndex)) issues.push('callIndex must be nonnegative.'); },
   'check.started': (value, issues) => { requireStrings(value, ['check', 'turnId'], issues); if (!positiveInteger(value.turnIndex) || !positiveInteger(value.requestAttempt)) issues.push('turn identity is invalid.'); if (value.requirement !== 'required' && value.requirement !== 'advisory') issues.push('requirement is invalid.'); if (!positiveInteger(value.timeoutMs)) issues.push('timeoutMs must be positive.'); },
   'check.ended': (value, issues) => { requireStrings(value, ['check', 'turnId'], issues); if (!positiveInteger(value.turnIndex) || !positiveInteger(value.requestAttempt)) issues.push('turn identity is invalid.'); requireRecord(value.result, 'result', issues); }
@@ -286,6 +299,13 @@ function requireRecord(value: unknown, name: string, issues: string[]): void { i
 function validateApprovalBinding(value: unknown, issues: string[]): void {
   if (!isRecord(value)) { issues.push('binding must be an object.'); return; }
   requireStrings(value, ['toolImplementationId', 'authorizationPolicyId', 'executionTargetId'], issues);
+}
+function validateToolProgress(value: unknown, issues: string[]): void {
+  if (!isRecord(value) || !['status', 'output', 'patch', 'metric'].includes(String(value.type))) { issues.push('progress must be a supported typed progress value.'); return; }
+  if (value.type === 'status' && typeof value.stage !== 'string') issues.push('status progress.stage must be a string.');
+  if (value.type === 'output' && (!['stdout', 'stderr'].includes(String(value.stream)) || !nonnegativeInteger(value.sequence) || typeof value.text !== 'string' || !nonnegativeInteger(value.observedBytes))) issues.push('output progress is invalid.');
+  if (value.type === 'patch' && !Array.isArray(value.changes)) issues.push('patch progress.changes must be an array.');
+  if (value.type === 'metric' && (typeof value.name !== 'string' || typeof value.value !== 'number' || !Number.isFinite(value.value))) issues.push('metric progress is invalid.');
 }
 function requireToolAttempt(value: Record<string, unknown>, issues: string[]): void { if (!positiveInteger(value.toolAttempt)) issues.push('toolAttempt must be positive.'); }
 function nonnegativeInteger(value: unknown): value is number { return typeof value === 'number' && Number.isInteger(value) && value >= 0; }

@@ -22,7 +22,7 @@ export interface AgentTuiRuntimeDetails {
   readonly sessionLocation?: string;
   readonly permissions?: {
     readonly workspaceWrites: 'denied' | 'dry_run' | 'allowed';
-    readonly shell: 'denied' | 'safe' | 'unsafe';
+    readonly shell: 'denied' | 'allowed';
   };
 }
 

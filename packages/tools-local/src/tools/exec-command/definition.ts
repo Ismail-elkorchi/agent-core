@@ -1,57 +1,64 @@
-import { defineTool, requireToolService, requireWorkspaceRoot } from '@agent-core/tools';
+import { defineTool, requireToolService, requireWorkspaceRoot, workspaceFileScope, workspaceProcessScope } from '@agent-core/tools';
 import { canonicalWorkspacePath, requireDirectoryInsideRoot, resolveInsideRoot } from '../../core/filesystem.js';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
-import { isProcessManager, type ProcessManager } from '../../core/process-manager.js';
+import { isProcessManager, type ProcessManager, type ProcessOwner } from '../../core/process-manager.js';
+import { presentProcessObservation } from '../../core/presenters.js';
 import { isSuccessfulProcessResult } from '../process-output.js';
-import { execCommandInputSchema, execCommandOutputSchema } from './schema.js';
+import { execCommandOutputSchema, execCommandSchema } from './schema.js';
 
-export const execCommandTool = defineTool({
-  name: 'exec_command',
-  implementationId: 'agent-core.exec-command.v1',
-  description: 'Start a persistent workspace command and return output produced before the yield time.',
-  schema: execCommandInputSchema,
-  outputSchema: execCommandOutputSchema,
-  effectEnvelope: { accesses: [{ mode: 'execute', scope: 'workspace' }], lockScopes: ['workspace/process-start'] },
-  async canonicalizeInput(input, context) {
-    const root = requireWorkspaceRoot(context);
-    const workdir = await canonicalWorkspacePath(root, input.workdir);
-    await requireDirectoryInsideRoot(root, resolveInsideRoot(root, workdir), workdir);
-    const limits = requireLocalToolConfiguration(context).process;
-    return {
-      ...input,
-      workdir,
-      yieldMs: clampRequestedLimit(input.yieldMs, limits.maxYieldMs),
-      timeoutMs: clampRequestedLimit(input.timeoutMs, limits.maxTimeoutMs),
-      outputTokenBudget: clampRequestedLimit(input.outputTokenBudget, limits.maxOutputTokens)
-    };
-  },
-  deriveEffects(input) {
-    return {
-      accesses: [{ mode: 'execute', scope: `workspace/${input.workdir}` }],
-      lockScopes: ['workspace/process-start'],
-      idempotency: 'non_idempotent'
-    };
-  },
-  async invoke(input, context) {
-    const manager = requireToolService<ProcessManager>(context, 'processManager', isProcessManager, 'ProcessManager');
-    await context.emitProgress?.({ stage: 'start', message: 'Starting process.' });
-    const result = await manager.start({
-      command: input.command,
-      cwd: resolveInsideRoot(requireWorkspaceRoot(context), input.workdir),
-      pty: input.pty,
-      timeoutMs: input.timeoutMs,
-      yieldMs: input.yieldMs,
-      outputTokenBudget: input.outputTokenBudget,
-      ...(context.signal ? { signal: context.signal } : {})
-    });
-    await context.emitProgress?.({ stage: result.status === 'running' ? 'running' : 'completed', message: `Process ${result.status}.` });
-    return {
-      kind: 'result' as const,
-      ok: isSuccessfulProcessResult(result),
-      summary: result.status === 'running' ? `Process continues as ${result.processId}.` : `Process ${result.status}${result.exitCode === undefined ? '' : ` with exit code ${String(result.exitCode)}`}.`,
-      scope: { resources: [`processes/${result.processId}`, `workspace/files/${input.workdir}`], coverage: result.combined.omittedBytes > 0 ? 'partial' : 'complete', ...(result.combined.omittedBytes > 0 ? { cause: 'output token budget reached' } : {}) },
-      content: [{ type: 'artifact' as const, artifact: result.artifact }],
-      output: result
-    };
-  }
-});
+export function createExecCommandTool(options: { readonly ptySupported?: boolean } = {}) {
+  const ptySupported = options.ptySupported === true;
+  return defineTool({
+    name: 'exec_command',
+    implementationId: 'agent-core.exec-command.v1',
+    description: 'Start a persistent workspace command and return output produced before the yield time.',
+    schema: execCommandSchema(ptySupported),
+    outputSchema: execCommandOutputSchema,
+    presentObservation: presentProcessObservation,
+    requirements: { services: ['workspaceRoot', 'localToolConfiguration', 'processManager'] },
+    effectEnvelope: { accesses: [{ mode: 'execute', scope: workspaceProcessScope() }], lockScopes: [workspaceFileScope()] },
+    async canonicalizeInput(input, context) {
+      const root = requireWorkspaceRoot(context);
+      const workdir = await canonicalWorkspacePath(root, input.workdir);
+      await requireDirectoryInsideRoot(root, resolveInsideRoot(root, workdir), workdir);
+      const limits = requireLocalToolConfiguration(context).process;
+      return {
+        ...input, pty: 'pty' in input && input.pty === true, workdir,
+        yieldMs: clampRequestedLimit(input.yieldMs, limits.maxYieldMs),
+        timeoutMs: clampRequestedLimit(input.timeoutMs, limits.maxTimeoutMs),
+        outputTokenBudget: clampRequestedLimit(input.outputTokenBudget, limits.maxOutputTokens)
+      };
+    },
+    deriveEffects() {
+      return { accesses: [{ mode: 'execute', scope: workspaceProcessScope() }], lockScopes: [workspaceFileScope()], idempotency: 'non_idempotent' };
+    },
+    async invoke(input, context) {
+      const manager = requireToolService<ProcessManager>(context, 'processManager', isProcessManager, 'ProcessManager');
+      const owner = processOwner(context.invocation);
+      await context.emitProgress?.({ type: 'status', stage: 'process_started', message: 'Starting process.' });
+      const result = await manager.start({
+        command: input.command, cwd: resolveInsideRoot(requireWorkspaceRoot(context), input.workdir), pty: input.pty,
+        timeoutMs: input.timeoutMs, yieldMs: input.yieldMs, outputTokenBudget: input.outputTokenBudget, owner,
+        ...(context.signal ? { signal: context.signal } : {}), ...(context.resourceLease ? { lease: context.resourceLease } : {}),
+        onOutput: (stream, sequence, text, observedBytes) => context.emitProgress?.({ type: 'output', stream, sequence, text, observedBytes })
+      });
+      await context.emitProgress?.({ type: 'status', stage: result.status === 'running' ? 'process_started' : 'process_stopped', message: 'Process ' + result.status + '.' });
+      return {
+        kind: 'result' as const, ok: isSuccessfulProcessResult(result),
+        summary: result.status === 'running' ? 'Process continues as ' + result.processId + '.' : 'Process ' + result.status + (result.exitCode === undefined ? '' : ' with exit code ' + String(result.exitCode)) + '.',
+        scope: {
+          resources: [workspaceProcessScope(result.processId), workspaceFileScope(input.workdir)],
+          coverage: result.combined.omittedBytes > 0 ? 'partial' : 'complete',
+          ...(result.combined.omittedBytes > 0 ? { truncated: true, causes: ['output_budget'], omitted: { bytes: result.combined.omittedBytes } } : {})
+        },
+        ...(result.artifact ? { content: [{ type: 'artifact' as const, artifact: result.artifact }] } : {}),
+        output: result
+      };
+    }
+  });
+}
+export const execCommandTool = createExecCommandTool();
+function processOwner(invocation: import('@agent-core/tools').ToolInvocationContext | undefined): ProcessOwner {
+  if (!invocation) throw new Error('Process tools require a runtime invocation owner.');
+  return Object.freeze({ runId: invocation.runId, turnId: invocation.turnId, toolBatchId: invocation.toolBatchId, callIndex: invocation.callIndex });
+}

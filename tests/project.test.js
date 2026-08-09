@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, realpath, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { describeWorkspace, loadAgentCoreConfiguration, loadWorkspace, parseAgentCoreConfiguration } from '@agent-core/cli';
+import { createConfiguredCliToolPolicy, describeWorkspace, loadAgentCoreConfiguration, loadWorkspace, parseAgentCoreConfiguration } from '@agent-core/cli';
 
 test('loadWorkspace canonicalizes symlink roots', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'agent-core-workspace-'));
@@ -39,9 +39,22 @@ test('workspace configuration validates first-party policy, checks, and exact li
   };
   await writeFile(path.join(dir, 'agent-core.config.json'), JSON.stringify(configuration));
   assert.deepEqual(await loadAgentCoreConfiguration(dir), configuration);
+  const snapshot = parseAgentCoreConfiguration(configuration);
+  configuration.instructions[0].path = 'changed.md';
+  configuration.verification.required[0].command = 'changed';
+  configuration.authorization.allowedRisks[0] = 'execute';
+  assert.equal(snapshot.instructions[0].path, 'AGENTS.md');
+  assert.equal(snapshot.verification.required[0].command, 'npm test');
+  assert.deepEqual(snapshot.authorization.allowedRisks, ['read', 'write']);
+  assert.equal(Object.isFrozen(snapshot.verification.required[0]), true);
+  assert.deepEqual(createConfiguredCliToolPolicy(snapshot, true), { allowedRisks: ['read', 'write'], dryRunWrites: true });
+  configuration.instructions[0].path = 'AGENTS.md';
+  configuration.verification.required[0].command = 'npm test';
+  configuration.authorization.allowedRisks[0] = 'read';
   assert.throws(() => parseAgentCoreConfiguration({ ...configuration, limits: { mysteryLimit: 1 } }), /run limits/iu);
   assert.throws(() => parseAgentCoreConfiguration({ ...configuration, authorization: { allowedRisks: ['read'], requireApprovalFor: ['write'] } }), /Approval risks/u);
   assert.throws(() => parseAgentCoreConfiguration({ ...configuration, verification: { required: [{ id: 'same', command: 'true' }], advisory: [{ id: 'same', command: 'true' }] } }), /unique/u);
+  assert.throws(() => parseAgentCoreConfiguration({ ...configuration, tools: { enabled: [], unknown: true } }), /tool configuration/iu);
 });
 
 test('workspace configuration cannot escape through a symlink', async () => {

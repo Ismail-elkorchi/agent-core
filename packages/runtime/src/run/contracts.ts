@@ -1,5 +1,5 @@
 import type { ArtifactRef, JsonNormalizationDiagnostic, JsonObject, JsonValue } from '@agent-core/evidence';
-import { stableStringify } from '@agent-core/evidence';
+import { parseJsonValue, stableStringify } from '@agent-core/evidence';
 import type { ModelReasoningRequest, ModelResponseFormat, ModelTerminationReason } from '@agent-core/model';
 
 export type AgentExecutionStatus = 'completed' | 'failed' | 'aborted';
@@ -121,13 +121,19 @@ export interface AgentEvidenceReader {
   read(input?: { readonly cursor?: string; readonly limit?: number; readonly maxBytes?: number }): Promise<AgentEvidencePage>;
   readArtifact(ref: ArtifactRef, input?: { readonly maxBytes?: number }): Promise<Uint8Array>;
 }
-export interface AgentVerificationCommandRequest { readonly command: string; readonly timeoutMs?: number; readonly maxOutputBytes?: number }
+export interface AgentVerificationCommandRequest {
+  readonly command: string;
+  readonly owner: { readonly runId: string; readonly turnId: string; readonly toolBatchId: string; readonly callIndex: number };
+  readonly timeoutMs?: number;
+  readonly maxOutputBytes?: number;
+}
 export interface AgentVerificationCommandResult { readonly exitCode: number | null; readonly stdout: string; readonly stderr: string; readonly durationMs: number }
 export interface AgentVerificationExecutionContext {
   readonly evidence: AgentEvidenceReader;
   readonly runCommand?: (request: AgentVerificationCommandRequest, signal: AbortSignal) => Promise<AgentVerificationCommandResult>;
 }
 export interface AgentCheckContext {
+  readonly runId: string;
   readonly task: string;
   readonly instructions: readonly AgentEffectiveInstruction[];
   readonly candidate: AgentPresentCandidate;
@@ -455,7 +461,7 @@ function isBudgetState(value: unknown): value is AgentRunBudgetState {
   if (!isRecord(value)) return false;
   const names = ['modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'elapsedMs', 'promptTokens', 'completionTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'unknownPricedTokens', 'consecutiveProviderFailures', 'consecutiveToolFailures', 'providerRetries'];
   if (!names.every((name) => typeof value[name] === 'number' && Number.isFinite(value[name]) && Number.isInteger(value[name]) && (value[name]) >= 0)) return false;
-  return isRecord(value.knownCosts) && Object.values(value.knownCosts).every((amount) => typeof amount === 'number' && Number.isFinite(amount) && amount >= 0)
+  return finiteNonnegativeNumberRecord(value.knownCosts)
     && oneOf(value.pricingStatus, ['known', 'partial', 'unknown']);
 }
 function isCheckDiagnostic(value: unknown): value is AgentCheckDiagnostic {
@@ -493,10 +499,12 @@ function isArtifactRef(value: unknown): value is ArtifactRef {
     && typeof value.size === 'number' && Number.isInteger(value.size) && value.size >= 0 && typeof value.mediaType === 'string';
 }
 function isJson(value: unknown): value is JsonValue {
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
-  if (typeof value === 'number') return Number.isFinite(value);
-  if (Array.isArray(value)) return value.every(isJson);
-  return isRecord(value) && Object.values(value).every(isJson);
+  try { parseJsonValue(value); return true; } catch { return false; }
+}
+function finiteNonnegativeNumberRecord(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  return Object.values(descriptors).every((descriptor) => 'value' in descriptor && typeof descriptor.value === 'number' && Number.isFinite(descriptor.value) && descriptor.value >= 0);
 }
 function positiveInteger(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value > 0; }
 function validIdentity(value: unknown): value is string { return typeof value === 'string' && value.trim().length > 0 && Buffer.byteLength(value, 'utf8') <= 256; }

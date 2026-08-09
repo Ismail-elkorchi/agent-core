@@ -4,6 +4,7 @@ import path from 'node:path';
 import {
   isJsonObject,
   normalizeJsonSafe,
+  parseJsonValue,
   type ArtifactRef,
   type JsonObject,
   type JsonValue,
@@ -491,7 +492,7 @@ function isSessionModelSettingsEntry(value: Record<string, unknown> & BaseSessio
     && (value.temperature === undefined || (typeof value.temperature === 'number' && Number.isFinite(value.temperature)))
     && (value.reasoningEffort === undefined || typeof value.reasoningEffort === 'string');
 }
-function isJson(value: unknown): value is JsonValue { if (value === null || typeof value === 'string' || typeof value === 'boolean') return true; if (typeof value === 'number') return Number.isFinite(value); if (Array.isArray(value)) return value.every(isJson); return isRecord(value) && Object.values(value).every(isJson); }
+function isJson(value: unknown): value is JsonValue { try { parseJsonValue(value); return true; } catch { return false; } }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function nodeCode(error: unknown): string | undefined { return isRecord(error) && typeof error.code === 'string' ? error.code : undefined; }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }

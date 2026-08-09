@@ -15,5 +15,5 @@ export const readArtifactOutputSchema = z.strictObject({
   nextOffset: z.int().nonnegative().optional(),
   coverage: z.enum(['complete', 'partial']),
   text: z.string().optional(),
-  contentType: z.enum(['text', 'image', 'audio', 'artifact'])
+  contentType: z.enum(['text', 'image', 'artifact'])
 });

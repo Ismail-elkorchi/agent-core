@@ -1,8 +1,7 @@
 import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
-import { StringDecoder } from 'node:string_decoder';
-import { requireWorkspaceRoot, type ToolExecutionContext, type ToolObservation } from '@agent-core/tools';
+import { requireWorkspaceRoot, throwIfAborted, workspaceFileScope, type ToolExecutionContext, type ToolObservation } from '@agent-core/tools';
 import { assertRealPathInsideRoot, relativePath, resolveInsideRoot } from '../../core/filesystem.js';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
 import type { ReadFileFailure, ReadFileResult, ReadFilesInput, ReadFilesOutput } from './schema.js';
@@ -10,155 +9,118 @@ import type { ReadFileFailure, ReadFileResult, ReadFilesInput, ReadFilesOutput }
 export async function readFiles(input: ReadFilesInput, context: ToolExecutionContext): Promise<ToolObservation<ReadFilesOutput>> {
   const root = requireWorkspaceRoot(context);
   const limits = requireLocalToolConfiguration(context).readFiles;
-  const requested = input.files.slice(0, limits.maxFiles);
   const files: ReadFileResult[] = [];
   const failures: ReadFileFailure[] = [];
   let remainingBytes = limits.maxTotalBytes;
-
-  for (const request of requested) {
-    const lineCount = Math.min(request.lineCount ?? limits.maxLinesPerFile, limits.maxLinesPerFile);
-    const result = await readRange(root, request.path, request.startLine, lineCount, Math.min(limits.maxBytesPerFile, remainingBytes));
-    if (result.ok) {
-      files.push(result.value);
-      remainingBytes -= result.value.bytes;
-    } else {
-      failures.push(result.failure);
+  for (const [index, request] of input.files.entries()) {
+    throwIfAborted(context.signal);
+    if (index >= limits.maxFiles) {
+      failures.push({ path: request.path, reason: 'batch_file_limit', message: 'The host accepts at most ' + String(limits.maxFiles) + ' files in one batch.' });
+      continue;
     }
-  }
-  for (const request of input.files.slice(limits.maxFiles)) {
-    failures.push({ path: request.path, reason: 'range_too_large', message: `The host accepts at most ${String(limits.maxFiles)} files in one batch.` });
+    if (remainingBytes <= 0) {
+      failures.push({ path: request.path, reason: 'batch_byte_limit', message: 'The global read_files byte budget is exhausted.' });
+      continue;
+    }
+    const lineCount = Math.min(request.lineCount ?? limits.maxLinesPerFile, limits.maxLinesPerFile);
+    const result = await readRange(root, request.path, request.startLine, lineCount, Math.min(limits.maxBytesPerFile, remainingBytes), remainingBytes < limits.maxBytesPerFile, context.signal);
+    if (result.ok) { files.push(result.value); remainingBytes -= result.value.bytes; }
+    else failures.push(result.failure);
   }
   const returnedBytes = files.reduce((sum, file) => sum + file.bytes, 0);
-  const coverage = failures.length === 0 ? 'complete' : 'partial';
+  const coverage = failures.length === 0 ? 'complete' as const : 'partial' as const;
   const output: ReadFilesOutput = {
-    files,
-    failures,
-    coverage,
-    requestedFiles: input.files.length,
-    returnedFiles: files.length,
-    failedFiles: failures.length,
-    returnedBytes
+    files, failures, coverage, requestedFiles: input.files.length, returnedFiles: files.length, failedFiles: failures.length, returnedBytes
   };
   return {
-    kind: 'result',
-    ok: failures.length === 0,
-    summary: `Read ${String(files.length)} of ${String(input.files.length)} requested files${coverage === 'partial' ? ' with partial coverage' : ''}.`,
+    kind: 'result', ok: failures.length === 0,
+    summary: 'Read ' + String(files.length) + ' of ' + String(input.files.length) + ' requested files' + (coverage === 'partial' ? ' with partial coverage.' : '.'),
     scope: {
-      resources: input.files.map((file) => `workspace/files/${file.path}`),
-      coverage,
-      ...(coverage === 'partial' ? { cause: `${String(failures.length)} file ranges could not be returned` } : {})
+      resources: input.files.map((file) => workspaceFileScope(file.path)), coverage,
+      ...(coverage === 'partial' ? { causes: [...new Set(failures.map((failure) => failure.reason))], omitted: { files: failures.length } } : {})
     },
     output
   };
 }
 
 type RangeRead = { ok: true; value: ReadFileResult } | { ok: false; failure: ReadFileFailure };
-
-async function readRange(root: string, requestedPath: string, startLine: number, lineCount: number, maxBytes: number): Promise<RangeRead> {
+async function readRange(root: string, requestedPath: string, startLine: number, lineCount: number, maxBytes: number, batchLimited: boolean, signal?: AbortSignal): Promise<RangeRead> {
   let absolute: string;
   try { absolute = resolveInsideRoot(root, requestedPath); }
   catch (error) { return failure(requestedPath, 'path_outside_workspace', errorMessage(error)); }
   const displayPath = relativePath(root, absolute);
   let handle: FileHandle;
-  let stat;
+  try { handle = await fs.open(absolute, 'r'); }
+  catch (error) { return failure(displayPath || requestedPath, nodeCode(error) === 'ENOENT' ? 'not_found' : 'unreadable', errorMessage(error)); }
   try {
-    stat = await fs.stat(absolute);
-    if (!stat.isFile()) return failure(displayPath, 'not_file', `Path is not a regular file: ${requestedPath}`);
-    await assertRealPathInsideRoot(root, absolute, requestedPath);
-    handle = await fs.open(absolute, 'r');
-  } catch (error) {
-    const code = nodeCode(error);
-    return failure(displayPath || requestedPath, code === 'ENOENT' ? 'not_found' : 'unreadable', errorMessage(error));
-  }
-
-  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) return failure(displayPath, 'not_file', 'Path is not a regular file: ' + requestedPath);
+    try { await assertRealPathInsideRoot(root, absolute, requestedPath); }
+    catch (error) { return failure(displayPath, 'path_outside_workspace', errorMessage(error)); }
     const selected: Buffer[] = [];
     const chunk = Buffer.allocUnsafe(64 * 1024);
     let position = 0;
-    let line = 1;
+    let currentLine = 1;
     let selectedLines = 0;
     let selectedBytes = 0;
-    let selectionComplete = false;
-    let selectionEndPosition = 0;
-    let unterminatedLineHasBytes = false;
-
-    while (position < stat.size && !selectionComplete) {
+    let selectionEnd = 0;
+    let lastByte: number | undefined;
+    while (position < stat.size && selectedLines < lineCount) {
+      throwIfAborted(signal);
       const read = await handle.read(chunk, 0, Math.min(chunk.length, stat.size - position), position);
       if (read.bytesRead === 0) break;
-      const chunkStart = position;
-      position += read.bytesRead;
       let cursor = 0;
-      while (cursor < read.bytesRead) {
-        const newline = chunk.indexOf(0x0a, cursor);
-        const end = newline >= 0 && newline < read.bytesRead ? newline + 1 : read.bytesRead;
+      while (cursor < read.bytesRead && selectedLines < lineCount) {
+        throwIfAborted(signal);
+        const newlineIndex = chunk.indexOf(0x0a, cursor);
+        const hasNewline = newlineIndex >= 0 && newlineIndex < read.bytesRead;
+        const end = hasNewline ? newlineIndex + 1 : read.bytesRead;
         const segment = chunk.subarray(cursor, end);
-        if (line >= startLine && selectedLines < lineCount) {
-          if (selectedBytes + segment.byteLength > maxBytes) return failure(displayPath, 'range_too_large', 'Requested range exceeds the host byte limit for one result.');
+        if (currentLine >= startLine) {
+          if (selectedBytes + segment.byteLength > maxBytes) {
+            const reason = batchLimited ? 'batch_byte_limit' : 'range_too_large';
+            return failure(displayPath, reason, reason === 'batch_byte_limit' ? 'The global read_files byte budget is exhausted.' : 'Requested range exceeds the host byte limit for one result.');
+          }
           selected.push(Buffer.from(segment));
           selectedBytes += segment.byteLength;
         }
-        unterminatedLineHasBytes ||= segment.byteLength > 0;
+        lastByte = segment.at(-1);
         cursor = end;
-        if (newline < 0 || newline >= read.bytesRead) break;
-        if (line >= startLine && selectedLines < lineCount) selectedLines += 1;
-        line += 1;
-        unterminatedLineHasBytes = false;
-        if (selectedLines >= lineCount) {
-          selectionComplete = true;
-          selectionEndPosition = chunkStart + cursor;
-          break;
+        selectionEnd = position + cursor;
+        if (hasNewline) {
+          if (currentLine >= startLine) selectedLines += 1;
+          currentLine += 1;
         }
       }
+      position += read.bytesRead;
     }
-
-    if (!selectionComplete && position >= stat.size && unterminatedLineHasBytes && line >= startLine && selectedLines < lineCount) selectedLines += 1;
-    if (!selectionComplete) selectionEndPosition = position;
-
+    const fileHasUnterminatedLine = stat.size > 0 && lastByte !== 0x0a && position >= stat.size;
+    if (fileHasUnterminatedLine && currentLine >= startLine && selectedLines < lineCount) selectedLines += 1;
+    const totalLines = stat.size === 0 ? 0 : lastByte === 0x0a && position >= stat.size ? currentLine - 1 : currentLine;
+    if (startLine > totalLines) return failure(displayPath, 'start_after_eof', 'Requested start line ' + String(startLine) + ' is after EOF at line ' + String(totalLines) + '.');
     const raw = Buffer.concat(selected, selectedBytes);
-    if (raw.includes(0)) return failure(displayPath, 'binary', `Requested range contains binary data: ${requestedPath}`);
-    const decoder = new StringDecoder('utf8');
-    const content = decoder.write(raw) + decoder.end();
-    if (content.includes('\uFFFD')) return failure(displayPath, 'binary', `Requested range is not valid UTF-8 text: ${requestedPath}`);
-    const eof = selectionEndPosition >= stat.size;
+    if (raw.includes(0)) return failure(displayPath, 'binary', 'Requested range contains binary data: ' + requestedPath);
+    let content: string;
+    try { content = new TextDecoder('utf-8', { fatal: true }).decode(raw); }
+    catch { return failure(displayPath, 'invalid_utf8', 'Requested range is not valid UTF-8 text: ' + requestedPath); }
+    const eof = selectionEnd >= stat.size;
     const rangeSha256 = createHash('sha256').update(raw).digest('hex');
     const fullFile = startLine === 1 && eof && raw.byteLength === stat.size;
     return {
       ok: true,
       value: {
-        path: displayPath,
-        startLine,
-        lineCount: selectedLines,
-        content,
-        bytes: raw.byteLength,
-        eof,
-        ...(!eof ? { nextStartLine: startLine + selectedLines } : {}),
-        rangeSha256,
-        ...(fullFile ? { fullFileSha256: rangeSha256 } : {}),
-        lineEnding: detectLineEnding(raw)
+        path: displayPath, startLine, lineCount: selectedLines, content, bytes: raw.byteLength, fileBytes: stat.size, eof,
+        ...(!eof ? { nextStartLine: startLine + selectedLines } : {}), rangeSha256,
+        ...(fullFile ? { fullFileSha256: rangeSha256 } : {}), lineEnding: detectLineEnding(raw)
       }
     };
-  } finally {
-    await handle.close();
-  }
+  } finally { await handle.close(); }
 }
-
 function detectLineEnding(bytes: Buffer): ReadFileResult['lineEnding'] {
-  let lf = 0;
-  let crlf = 0;
-  for (let index = 0; index < bytes.length; index += 1) {
-    if (bytes[index] !== 0x0a) continue;
-    if (index > 0 && bytes[index - 1] === 0x0d) crlf += 1;
-    else lf += 1;
-  }
-  if (lf > 0 && crlf > 0) return 'mixed';
-  if (crlf > 0) return 'crlf';
-  if (lf > 0) return 'lf';
-  return 'none';
+  let lf = 0; let crlf = 0;
+  for (let index = 0; index < bytes.length; index += 1) if (bytes[index] === 0x0a) { if (index > 0 && bytes[index - 1] === 0x0d) crlf += 1; else lf += 1; }
+  return lf > 0 && crlf > 0 ? 'mixed' : crlf > 0 ? 'crlf' : lf > 0 ? 'lf' : 'none';
 }
-
-function failure(path: string, reason: ReadFileFailure['reason'], message: string): RangeRead {
-  return { ok: false, failure: { path, reason, message } };
-}
+function failure(path: string, reason: ReadFileFailure['reason'], message: string): RangeRead { return { ok: false, failure: { path, reason, message } }; }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
-function nodeCode(error: unknown): string | undefined { return isRecord(error) && typeof error.code === 'string' ? error.code : undefined; }
-function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
+function nodeCode(error: unknown): string | undefined { return typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string' ? error.code : undefined; }

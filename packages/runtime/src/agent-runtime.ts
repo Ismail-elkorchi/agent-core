@@ -43,7 +43,10 @@ import {
 import {
   isToolAvailable,
   prepareToolCall,
+  parseToolPolicy,
   READ_ONLY_TOOL_POLICY,
+  ResourceLeaseCoordinator,
+  toolRequirementsSatisfied,
   validateToolDefinitions,
   type ToolAuthorizer,
   type ToolCall,
@@ -249,6 +252,7 @@ export class AgentRuntime {
   private readonly maxOutputTokens: number | undefined;
   private readonly toolPolicy: ToolPolicy;
   private readonly tools: readonly ToolDefinition[];
+  private readonly resourceLeases: ResourceLeaseCoordinator;
   private readonly checks: readonly AgentCheckDefinition[];
   private readonly steerQueue: AgentQueuedSteer[] = [];
   private readonly followUpQueue: AgentQueuedFollowUp[] = [];
@@ -264,8 +268,9 @@ export class AgentRuntime {
   constructor(private readonly options: AgentRuntimeOptions) {
     this.estimator = options.estimator ?? new SimpleTokenEstimator();
     this.maxOutputTokens = validateOptionalPositiveInteger(options.maxOutputTokens, 'maxOutputTokens');
-    this.toolPolicy = deepFreeze(options.toolPolicy ?? READ_ONLY_TOOL_POLICY);
+    this.toolPolicy = parseToolPolicy(options.toolPolicy ?? READ_ONLY_TOOL_POLICY);
     this.tools = validateToolDefinitions(options.tools ?? []);
+    this.resourceLeases = processLeaseCoordinator(options.toolContext?.services?.processManager) ?? new ResourceLeaseCoordinator();
     validateToolBoundary(options.toolBoundary);
     this.checks = validateAgentCheckDefinitions(options.checks);
     this.runtimeModel = options.model;
@@ -402,14 +407,20 @@ export class AgentRuntime {
       decision = await this.decisionFromError({ error, signal, runId, controller, append, emit });
     }
     if (decision.executionStatus === 'waiting_for_approval') {
-      controller.waitForApproval(decision.approvals.map((approval) => approval.approvalId));
-      const budget = controller.snapshot();
-      await append({ type: 'run.phase.changed', runId, phase: 'waiting_for_approval', budget });
-      await emit({ type: 'run.phase.changed', phase: 'waiting_for_approval', budget });
-      return Object.freeze({ state: 'suspended', reason: 'approval_required', runId, finalizationId, pendingApprovals: decision.approvals, budget });
+      const cleanupError = await this.disposeOwnedProcesses(runId, append);
+      if (!cleanupError) {
+        controller.waitForApproval(decision.approvals.map((approval) => approval.approvalId));
+        const budget = controller.snapshot();
+        await append({ type: 'run.phase.changed', runId, phase: 'waiting_for_approval', budget });
+        await emit({ type: 'run.phase.changed', phase: 'waiting_for_approval', budget });
+        return Object.freeze({ state: 'suspended', reason: 'approval_required', runId, finalizationId, pendingApprovals: decision.approvals, budget });
+      }
+      decision = cleanupFailureDecision(cleanupError);
+    } else {
+      const cleanupError = await this.disposeOwnedProcesses(runId, append);
+      if (cleanupError) decision = cleanupFailureDecision(cleanupError);
     }
     await this.enterPhase(runId, controller, 'finalizing', append, emit);
-    await this.disposeOwnedProcesses();
     decision = decisionBeforeFinalization(decision, signal);
     const terminal = terminalSnapshot(runId, finalizationId, decision, controller, this.checks);
     const result = await finalizer.finalize(terminal, 'diagnostic' in decision ? decision.diagnostic : undefined);
@@ -547,7 +558,7 @@ export class AgentRuntime {
             return failedDecision('empty_response', activeCandidate, emptyMessage, turnIndex, checkResults, response);
           }
           await this.enterPhase(runtime.runId, runtime.controller, 'verifying', runtime.append, runtime.emit);
-          checkResults.push(...await runAgentChecks({ checks: this.checks, task: runtime.input.task, instructions: snapshot.instructions, candidate: activeCandidate, ...turnIdentity(snapshot.record), signal: runtime.signal,
+          checkResults.push(...await runAgentChecks({ runId: runtime.runId, checks: this.checks, task: runtime.input.task, instructions: snapshot.instructions, candidate: activeCandidate, ...turnIdentity(snapshot.record), signal: runtime.signal,
             ...(this.options.metadata ? { metadata: this.options.metadata } : {}), ...(this.options.verification ? { execution: this.options.verification } : {}),
             append: runtime.append, emit: runtime.emit }));
           return completedDecision(activeCandidate, turnIndex, checkResults, response);
@@ -559,7 +570,7 @@ export class AgentRuntime {
         const toolDeadline = runSignalDeadline(runtime.controller, runtime.signal);
         let toolResult;
         try {
-          toolResult = await executeAssistantToolCalls({ runId: runtime.runId, ...turnIdentity(snapshot.record), toolBatchId, toolCalls, tools: this.tools, toolContext: this.toolContext(toolDeadline.signal),
+          toolResult = await executeAssistantToolCalls({ runId: runtime.runId, ...turnIdentity(snapshot.record), toolBatchId, toolCalls, tools: this.tools, toolContext: this.toolContext(toolDeadline.signal), resourceLeases: this.resourceLeases,
             ...(this.options.toolAuthorizer ? { authorizer: this.options.toolAuthorizer } : {}), contextManager, observationStore,
             ...(this.options.repositories.session ? { session: this.options.repositories.session } : {}), controller: runtime.controller, append: runtime.append, emit: runtime.emit });
         } finally { toolDeadline.dispose(); }
@@ -591,7 +602,7 @@ export class AgentRuntime {
     const toolDeadline = runSignalDeadline(runtime.controller, runtime.signal);
     let resumedTools;
     try {
-      resumedTools = await executeAssistantToolCalls({ runId: runtime.runId, ...batchIdentity, toolCalls: runtime.resume.toolCalls, tools: this.tools, toolContext: this.toolContext(toolDeadline.signal), authorizationOverrides: runtime.resume.overrides, recovery: runtime.resume.recovery, resuming: true,
+      resumedTools = await executeAssistantToolCalls({ runId: runtime.runId, ...batchIdentity, toolCalls: runtime.resume.toolCalls, tools: this.tools, toolContext: this.toolContext(toolDeadline.signal), resourceLeases: this.resourceLeases, authorizationOverrides: runtime.resume.overrides, recovery: runtime.resume.recovery, resuming: true,
         ...(this.options.toolAuthorizer ? { authorizer: this.options.toolAuthorizer } : {}), contextManager, observationStore,
         ...(this.options.repositories.session ? { session: this.options.repositories.session } : {}), controller: runtime.controller, append: runtime.append, emit: runtime.emit });
     } finally { toolDeadline.dispose(); }
@@ -911,14 +922,25 @@ export class AgentRuntime {
   }
   private estimateAssistantOutput(response: ModelResponse): number { const toolText = response.toolCalls?.length ? `\n${JSON.stringify(response.toolCalls)}` : ''; return this.estimator.estimateText(`${response.content}${response.reasoningSummary ?? ''}${toolText}`); }
   private availableTools(profile?: ModelProfile): ToolDefinition[] {
-    return this.tools.filter((tool) => isToolAvailable(tool, this.toolPolicy)
-      && (tool.name !== 'read_artifact' || this.options.repositories.artifacts !== undefined)
-      && (tool.name !== 'view_image' || profile?.modalities.input.includes('image') === true));
+    const context = this.toolContext(new AbortController().signal);
+    return this.tools.filter((tool) => isToolAvailable(tool, this.toolPolicy) && toolRequirementsSatisfied(tool, {
+      ...(context.services ? { services: context.services } : {}),
+      ...(profile ? { modelInputModalities: profile.modalities.input } : {}),
+      hostCapabilities: processCapabilities(context.services?.processManager)
+    }));
   }
-  private async disposeOwnedProcesses(): Promise<void> {
+  private async disposeOwnedProcesses(runId: string, append: (event: AgentEvent) => Promise<unknown>): Promise<Error | undefined> {
     const service = this.options.toolContext?.services?.processManager;
-    if (!isProcessDisposer(service)) return;
-    await service.disposeAll();
+    if (!isProcessDisposer(service)) return undefined;
+    try {
+      const results = await service.disposeRun(runId);
+      for (const result of results) {
+        const durable = durableProcessTermination(result);
+        await safePersist(append, { type: 'process.ended', runId, processId: durable.processId, status: durable.status, result: durable.result });
+      }
+      return undefined;
+    }
+    catch (error) { return error instanceof Error ? error : new Error(String(error)); }
   }
   private controlRequest(runId: string, reason?: string): AgentQueuedControl { return { id: randomUUID(), runId, timestamp: new Date().toISOString(), ...(reason ? { reason } : {}) }; }
   private consumeSteeringInstructions(runId: string): string[] { const selected = this.steerQueue.filter((item) => item.runId === runId); removeRunItems(this.steerQueue, runId); return selected.map((item) => item.instruction); }
@@ -927,9 +949,41 @@ export class AgentRuntime {
   private countForActiveRun(items: readonly { runId: string }[]): number { return this.activeRunId ? items.filter((item) => item.runId === this.activeRunId).length : 0; }
 }
 
-function isProcessDisposer(value: unknown): value is { readonly disposeAll: () => Promise<void> } {
-  if (typeof value !== 'object' || value === null || !('disposeAll' in value)) return false;
-  return typeof (value as { readonly disposeAll?: unknown }).disposeAll === 'function';
+function isProcessDisposer(value: unknown): value is { readonly disposeRun: (runId: string) => Promise<readonly unknown[]> } {
+  if (typeof value !== 'object' || value === null || !('disposeRun' in value)) return false;
+  return typeof (value as { readonly disposeRun?: unknown }).disposeRun === 'function';
+}
+function durableProcessTermination(value: unknown): { readonly processId: string; readonly status: string; readonly result: import('@agent-core/evidence').JsonValue } {
+  const normalized = normalizeJsonSafe(value).value;
+  if (typeof normalized !== 'object' || normalized === null || Array.isArray(normalized) || typeof normalized.processId !== 'string' || typeof normalized.status !== 'string') throw new Error('Process cleanup returned an invalid terminal result.');
+  const stream = (candidate: unknown) => isRecord(candidate)
+    ? { observedBytes: typeof candidate.observedBytes === 'number' ? candidate.observedBytes : 0, capturedBytes: typeof candidate.capturedBytes === 'number' ? candidate.capturedBytes : 0, omittedBytes: typeof candidate.omittedBytes === 'number' ? candidate.omittedBytes : 0 }
+    : { observedBytes: 0, capturedBytes: 0, omittedBytes: 0 };
+  return {
+    processId: normalized.processId,
+    status: normalized.status,
+    result: normalizeJsonSafe({
+      owner: normalized.owner,
+      cursorEnd: normalized.cursorEnd,
+      stdout: stream(normalized.stdout), stderr: stream(normalized.stderr), combined: stream(normalized.combined),
+      ...(normalized.artifact === undefined ? {} : { artifact: normalized.artifact }),
+      ...(normalized.exitCode === undefined ? {} : { exitCode: normalized.exitCode }),
+      ...(normalized.signal === undefined ? {} : { signal: normalized.signal })
+    }).value
+  };
+}
+function processLeaseCoordinator(value: unknown): ResourceLeaseCoordinator | undefined {
+  if (typeof value !== 'object' || value === null || !('resourceLeases' in value)) return undefined;
+  const coordinator = (value as { readonly resourceLeases?: unknown }).resourceLeases;
+  return coordinator instanceof ResourceLeaseCoordinator ? coordinator : undefined;
+}
+function processCapabilities(value: unknown): readonly string[] {
+  if (typeof value !== 'object' || value === null || !('capabilities' in value)) return [];
+  const capabilities = (value as { readonly capabilities?: unknown }).capabilities;
+  return typeof capabilities === 'function' ? (capabilities as (this: unknown) => readonly string[]).call(value) : [];
+}
+function cleanupFailureDecision(error: Error): TerminalDecision {
+  return { executionStatus: 'failed', terminationReason: 'runtime_error', candidate: { status: 'absent' }, errorMessage: `Process cleanup failed: ${error.message}`, turnCount: 0, checkResults: [] };
 }
 
 function runDeadline(controller: AgentRunController, request: ModelRequest): { readonly request: ModelRequest; readonly error: AgentLimitExceededError | undefined; readonly dispose: () => void } {

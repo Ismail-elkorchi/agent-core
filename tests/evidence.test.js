@@ -4,9 +4,28 @@ import {
   evidenceDelta,
   normalizeJsonSafe,
   normalizeToolEvidenceDelta,
+  parseJsonObject,
   toEvidenceJsonObject,
   workspaceResource
 } from '@agent-core/evidence';
+
+test('safe JSON parsing rejects accessors, cycles, prototypes, and limits while returning an owned frozen copy', () => {
+  let getterCalls = 0;
+  const accessor = Object.defineProperty({}, 'secret', { enumerable: true, get() { getterCalls += 1; return 'value'; } });
+  assert.throws(() => parseJsonObject(accessor), /accessor/u);
+  assert.equal(getterCalls, 0);
+  const cyclic = {}; cyclic.self = cyclic;
+  assert.throws(() => parseJsonObject(cyclic), /cycle/u);
+  assert.throws(() => parseJsonObject(new (class Custom {})()), /prototype/u);
+  assert.throws(() => parseJsonObject({ value: 'too long' }, { maxStringBytes: 2 }), /string byte limit/u);
+  const source = { nested: { list: ['value'] } };
+  const parsed = parseJsonObject(source);
+  source.nested.list[0] = 'changed';
+  assert.deepEqual(parsed, { nested: { list: ['value'] } });
+  assert.equal(Object.isFrozen(parsed), true);
+  assert.equal(Object.isFrozen(parsed.nested), true);
+  assert.equal(Object.isFrozen(parsed.nested.list), true);
+});
 
 test('JSON normalization is total for hostile values and preserves unsafe property names as data', () => {
   const throwingGetter = Object.defineProperty({}, 'boom', {

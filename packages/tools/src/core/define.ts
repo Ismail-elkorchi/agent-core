@@ -1,10 +1,12 @@
 import * as z from 'zod';
 import type { ToolExecutionContext, ToolPreparationContext } from './context.js';
-import type { ToolDefinition, ToolInput, ToolObservation, ToolPromptGuide, ToolTextInputDefinition } from './definition.js';
+import type { ToolDefinition, ToolInput, ToolObservation, ToolPromptGuide, ToolRequirements, ToolTextInputDefinition } from './definition.js';
 import type { ToolObservationPresentation, ToolObservationPresentationRequest } from './observation-presentation.js';
 import type { ToolPolicy } from './policy.js';
 import { invalidArgumentsObservation, invalidToolInputObservation } from './observation.js';
 import { validateToolEffectEnvelope, type ToolEffectEnvelope, type ToolEffects } from './authorization.js';
+import { validateToolRequirements } from './resources.js';
+import { parseJsonObject } from '@agent-core/evidence';
 
 export interface DefineToolOptions<Schema extends z.ZodType, TCanonicalInput, TOutput> {
   name: string;
@@ -17,6 +19,7 @@ export interface DefineToolOptions<Schema extends z.ZodType, TCanonicalInput, TO
     decode(text: string): z.input<Schema>;
   };
   effectEnvelope: ToolEffectEnvelope;
+  requirements?: ToolRequirements;
   canonicalizeInput(input: z.output<Schema>, context: ToolPreparationContext): TCanonicalInput | Promise<TCanonicalInput>;
   deriveEffects(input: TCanonicalInput, context: ToolPreparationContext): ToolEffects | Promise<ToolEffects>;
   isAvailable?: (policy: ToolPolicy) => boolean;
@@ -37,7 +40,7 @@ export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
       }
     }
     : undefined;
-  return {
+  const tool: ToolDefinition<z.output<Schema>, TCanonicalInput, TOutput> = {
     name: definition.name,
     implementationId: nonEmpty(definition.implementationId, 'implementationId'),
     description: definition.description,
@@ -46,6 +49,11 @@ export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
     outputSchema: definition.outputSchema,
     ...(textInput ? { textInput } : {}),
     effectEnvelope: validateToolEffectEnvelope(definition.effectEnvelope),
+    ...(definition.requirements ? { requirements: (() => {
+      const requirements = validateToolRequirements(definition.requirements);
+      if (!requirements) throw new Error('Tool requirements snapshot was unexpectedly absent.');
+      return requirements;
+    })() } : {}),
     ...(definition.isAvailable ? { isAvailable: definition.isAvailable } : {}),
     ...(definition.presentObservation ? { presentObservation: definition.presentObservation } : {}),
     decodeInput(input: ToolInput) {
@@ -88,6 +96,7 @@ export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
       return definition.invoke(input, context);
     }
   };
+  return Object.freeze(tool);
 }
 
 function nonEmpty(value: string, name: string): string {
@@ -100,7 +109,7 @@ function toToolJsonSchema(schema: z.ZodType): Record<string, unknown> {
   if (!isJsonObject(normalized)) throw new Error('Tool schema conversion did not produce a JSON object.');
   const jsonSchema = normalized;
   delete jsonSchema.$schema;
-  return jsonSchema;
+  return parseJsonObject(jsonSchema, { maxDepth: 64, maxCollectionEntries: 50_000, maxStringBytes: 1_000_000, maxTotalBytes: 4_000_000 });
 }
 
 function normalizeJsonSchema(value: unknown): unknown {

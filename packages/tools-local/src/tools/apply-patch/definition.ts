@@ -1,6 +1,7 @@
-import { defineTool, isRiskAllowed, requireWorkspaceRoot, ToolInputError } from '@agent-core/tools';
+import { defineTool, isRiskAllowed, PATCH_JOURNAL_SCOPE, requireWorkspaceRoot, ToolInputError, workspaceFileScope } from '@agent-core/tools';
 import { canonicalWorkspacePath } from '../../core/filesystem.js';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
+import { presentApplyPatchObservation } from '../../core/presenters.js';
 import { APPLY_PATCH_LARK_GRAMMAR } from './grammar.js';
 import { parseApplyPatch, type ParsedApplyPatch } from './patch-parser.js';
 import { APPLY_PATCH_PROMPT_GUIDE } from './prompt-guide.js';
@@ -13,6 +14,8 @@ export const applyPatchTool = defineTool({
   description: 'Apply one Codex-style text patch transactionally, including add, update, delete, and move operations.',
   schema: applyPatchInputSchema,
   outputSchema: applyPatchOutputSchema,
+  presentObservation: presentApplyPatchObservation,
+  requirements: { services: ['workspaceRoot', 'localToolConfiguration', 'patchTransaction'] },
   textInput: {
     description: 'Pass the patch document directly, starting with *** Begin Patch and ending with *** End Patch.',
     promptGuide: APPLY_PATCH_PROMPT_GUIDE,
@@ -21,13 +24,13 @@ export const applyPatchTool = defineTool({
   },
   effectEnvelope: {
     accesses: [{ mode: 'read', scope: 'workspace/files' }, { mode: 'write', scope: 'workspace/files' }, { mode: 'delete', scope: 'workspace/files' }],
-    lockScopes: ['workspace/files']
+    lockScopes: ['workspace/files', PATCH_JOURNAL_SCOPE]
   },
   async canonicalizeInput(input, context): Promise<CanonicalApplyPatchInput> {
     const root = requireWorkspaceRoot(context);
     const limits = requireLocalToolConfiguration(context).applyPatch;
     let tree: ParsedApplyPatch;
-    await context.emitProgress?.({ stage: 'parse', message: 'Parsing patch.' });
+    await context.emitProgress?.({ type: 'status', stage: 'patch_parsing', message: 'Parsing patch.' });
     try { tree = parseApplyPatch(input.patch, { maxPatchBytes: limits.maxPatchBytes }); }
     catch (error) {
       const failure = patchFailureFromError('', error);
@@ -36,7 +39,7 @@ export const applyPatchTool = defineTool({
     if (tree.operations.length > limits.maxOperations) {
       throw new ToolInputError(`Patch contains ${String(tree.operations.length)} operations; the host limit is ${String(limits.maxOperations)}.`);
     }
-    await context.emitProgress?.({ stage: 'parse', message: 'Patch parsed.', completed: tree.operations.length, total: tree.operations.length });
+    await context.emitProgress?.({ type: 'status', stage: 'patch_parsed', message: 'Patch parsed.', completed: tree.operations.length, total: tree.operations.length });
     const requested = patchPaths(tree);
     for (const item of [...requested, ...Object.keys(input.expectedOldSha256 ?? {})]) {
       const canonical = await canonicalWorkspacePath(root, item);
@@ -46,7 +49,7 @@ export const applyPatchTool = defineTool({
   },
   deriveEffects(input) {
     const accesses = uniqueAccesses(input.tree.operations.flatMap((operation) => operationAccesses(operation, input.dryRun)));
-    const lockScopes = input.dryRun ? [] : [...new Set(accesses.filter((access) => access.mode !== 'read').map((access) => access.scope))].sort();
+    const lockScopes = input.dryRun ? [] : [...new Set([...accesses.filter((access) => access.mode !== 'read').map((access) => access.scope), PATCH_JOURNAL_SCOPE])].sort();
     return { accesses, lockScopes, idempotency: input.dryRun ? 'pure' : 'non_idempotent' };
   },
   isAvailable: (policy) => isRiskAllowed(policy, 'read') || isRiskAllowed(policy, 'write'),
@@ -62,16 +65,16 @@ function normalizePatchPath(value: string): string { return value.replaceAll('\\
 interface PatchAccess { readonly mode: 'read' | 'write' | 'delete'; readonly scope: string }
 
 function operationAccesses(operation: ParsedApplyPatch['operations'][number], dryRun: boolean): PatchAccess[] {
-  const source = `workspace/files/${normalizePatchPath(operation.path)}`;
+  const source = workspaceFileScope(normalizePatchPath(operation.path));
   if (dryRun) {
     return operation.kind === 'update' && operation.moveTo
-      ? [{ mode: 'read', scope: source }, { mode: 'read', scope: `workspace/files/${normalizePatchPath(operation.moveTo)}` }]
+      ? [{ mode: 'read', scope: source }, { mode: 'read', scope: workspaceFileScope(normalizePatchPath(operation.moveTo)) }]
       : [{ mode: 'read', scope: source }];
   }
   if (operation.kind === 'add') return [{ mode: 'read', scope: source }, { mode: 'write', scope: source }];
   if (operation.kind === 'delete') return [{ mode: 'read', scope: source }, { mode: 'delete', scope: source }];
   if (operation.moveTo) {
-    const destination = `workspace/files/${normalizePatchPath(operation.moveTo)}`;
+    const destination = workspaceFileScope(normalizePatchPath(operation.moveTo));
     return [{ mode: 'read', scope: source }, { mode: 'delete', scope: source }, { mode: 'read', scope: destination }, { mode: 'write', scope: destination }];
   }
   return [{ mode: 'read', scope: source }, { mode: 'write', scope: source }];

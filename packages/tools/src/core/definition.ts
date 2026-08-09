@@ -15,15 +15,25 @@ export type ToolInputParseResult<TInput> = { ok: true; input: TInput } | { ok: f
 
 export interface ToolScope {
   readonly resources: readonly string[];
+  readonly filters?: import('@agent-core/evidence').JsonObject;
+  readonly limits?: import('@agent-core/evidence').JsonObject;
+  readonly omitted?: import('@agent-core/evidence').JsonObject;
   readonly coverage: 'complete' | 'partial';
-  readonly cause?: string;
+  readonly truncated?: boolean;
+  readonly causes?: readonly string[];
 }
 
 export type ToolContent =
   | { readonly type: 'text'; readonly text: string; readonly mediaType?: string }
   | { readonly type: 'image'; readonly artifact: ArtifactRef; readonly detail: 'high' | 'original' }
-  | { readonly type: 'audio'; readonly artifact: ArtifactRef }
   | { readonly type: 'artifact'; readonly artifact: ArtifactRef };
+
+export type ModelInputModality = 'text' | 'image';
+export interface ToolRequirements {
+  readonly services?: readonly string[];
+  readonly modelInputModalities?: readonly ModelInputModality[];
+  readonly hostCapabilities?: readonly string[];
+}
 
 interface ToolObservationBase {
   readonly summary: string;
@@ -58,6 +68,7 @@ export interface ToolDefinition<TDecodedInput = unknown, TCanonicalInput = TDeco
   outputSchema: z.ZodType<TOutput>;
   textInput?: ToolTextInputDefinition<TDecodedInput>;
   effectEnvelope: ToolEffectEnvelope;
+  requirements?: ToolRequirements;
   isAvailable?: (policy: ToolPolicy) => boolean;
   decodeInput(input: ToolInput): ToolInputParseResult<TDecodedInput>;
   canonicalizeInput(input: TDecodedInput, context: ToolPreparationContext): TCanonicalInput | Promise<TCanonicalInput>;

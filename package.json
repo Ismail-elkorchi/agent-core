@@ -11,7 +11,7 @@
     "packages/providers/*"
   ],
   "scripts": {
-    "build": "tsc -b && chmod +x packages/cli/dist/index.js",
+    "build": "tsc -b && node scripts/post-build.mjs",
     "lint": "eslint \"packages/**/*.ts\"",
     "test": "npm run build && npm run test:unit",
     "test:unit": "node scripts/run-test-suite.mjs",
@@ -19,7 +19,7 @@
     "package": "node scripts/test-packed-consumer.mjs",
     "verify": "npm run clean && npm run build && npm run lint && npm run test:unit && npm run test:focused",
     "verify:release": "npm run verify && npm run package",
-    "clean": "rm -rf packages/*/dist packages/providers/*/dist packages/*/*.tsbuildinfo packages/providers/*/*.tsbuildinfo"
+    "clean": "node scripts/clean.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

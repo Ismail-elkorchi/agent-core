@@ -16,10 +16,18 @@ export interface ArtifactStoreInput {
   readonly mediaType?: string;
   readonly description?: string;
 }
+export interface ArtifactRange {
+  readonly offset: number;
+  readonly end: number;
+  readonly bytes: Uint8Array;
+  readonly fullSize: number;
+}
 
 export interface ArtifactRepository {
   store(input: ArtifactStoreInput): Promise<ArtifactRef>;
+  storeProtected(input: ArtifactStoreInput): Promise<ArtifactRef>;
   readVerified(ref: ArtifactRef): Promise<Uint8Array>;
+  readVerifiedRange(ref: ArtifactRef, input: { readonly offset: number; readonly length: number }): Promise<ArtifactRange>;
   resolve(artifactId: string): Promise<ArtifactRef | undefined>;
 }
 
@@ -37,10 +45,18 @@ export class InMemoryArtifactRepository implements ArtifactRepository {
   private readonly references = new Map<string, ArtifactRef>();
 
   store(input: ArtifactStoreInput): Promise<ArtifactRef> {
+    return this.storeWithPrefix(input, '');
+  }
+
+  storeProtected(input: ArtifactStoreInput): Promise<ArtifactRef> {
+    return this.storeWithPrefix(input, 'protected-');
+  }
+
+  private storeWithPrefix(input: ArtifactStoreInput, prefix: string): Promise<ArtifactRef> {
     const bytes = new Uint8Array(input.content);
     const mediaType = input.mediaType ?? 'application/octet-stream';
     const sha256 = hashArtifactBytes(bytes);
-    const artifactId = `${sha256}${artifactExtension(mediaType)}`;
+    const artifactId = `${prefix}${sha256}${artifactExtension(mediaType)}`;
     this.content.set(artifactId, bytes);
     const ref = freezeArtifactRef({ artifactId, sha256, size: bytes.byteLength, mediaType, label: safeArtifactLabel(input.label), ...(input.description ? { description: input.description } : {}) });
     this.references.set(artifactId, ref);
@@ -57,7 +73,14 @@ export class InMemoryArtifactRepository implements ArtifactRepository {
     });
   }
 
-  resolve(artifactId: string): Promise<ArtifactRef | undefined> { return Promise.resolve(this.references.get(artifactId)); }
+  async readVerifiedRange(ref: ArtifactRef, input: { readonly offset: number; readonly length: number }): Promise<ArtifactRange> {
+    validateRange(input, ref);
+    const bytes = await this.readVerified(ref);
+    const range = adjustedRange(ref, bytes, input.offset, input.length);
+    return Object.freeze({ offset: range.offset, end: range.end, bytes: new Uint8Array(bytes.subarray(range.offset, range.end)), fullSize: bytes.byteLength });
+  }
+
+  resolve(artifactId: string): Promise<ArtifactRef | undefined> { return Promise.resolve(artifactId.startsWith('protected-') ? undefined : this.references.get(artifactId)); }
 }
 
 export async function storeJsonArtifact(repository: ArtifactRepository, label: string, value: unknown, description?: string): Promise<ArtifactRef> {
@@ -113,3 +136,25 @@ export function safeArtifactLabel(name: string): string {
   return cleaned.length > 0 ? cleaned : 'artifact';
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
+
+export function adjustedArtifactByteRange(ref: ArtifactRef, bytes: Uint8Array, offset: number, length: number): { readonly offset: number; readonly end: number } {
+  return adjustedRange(ref, bytes, offset, length);
+}
+function adjustedRange(ref: ArtifactRef, bytes: Uint8Array, offset: number, length: number): { readonly offset: number; readonly end: number } {
+  let start = offset;
+  let end = Math.min(bytes.byteLength, offset + length);
+  if (isTextMediaType(ref.mediaType)) {
+    while (start > 0 && isContinuation(bytes[start])) start -= 1;
+    while (end < bytes.byteLength && isContinuation(bytes[end])) end += 1;
+  }
+  return { offset: start, end };
+}
+function isContinuation(value: number | undefined): boolean { return value !== undefined && (value & 0xc0) === 0x80; }
+function isTextMediaType(mediaType: string): boolean {
+  return mediaType.startsWith('text/') || mediaType.includes('json') || mediaType.includes('xml') || mediaType.includes('javascript');
+}
+function validateRange(input: { readonly offset: number; readonly length: number }, ref: ArtifactRef): void {
+  validateArtifactRef(ref);
+  if (!Number.isSafeInteger(input.offset) || input.offset < 0 || !Number.isSafeInteger(input.length) || input.length < 1) throw new Error('Artifact range must use a nonnegative offset and positive length.');
+  if (input.offset > ref.size) throw new Error('Artifact range offset exceeds the artifact size.');
+}

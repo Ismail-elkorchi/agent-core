@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { prepareToolCall } from '@agent-core/tools';
 import { invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
 import {
   DEFAULT_LOCAL_TOOL_CONFIGURATION,
@@ -164,4 +165,78 @@ test('search_text delegates regex validation to ripgrep and separates line and o
   await mkdir(path.join(root, 'empty'));
   const invalidWithoutFiles = await invokeToolCall(jsonToolCall('search_text', { query: '[', path: 'empty', mode: 'files' }), tools, context);
   assert.equal(invalidWithoutFiles.output.status, 'invalid_pattern');
+});
+
+test('nested gitignore negation, ignore limits, and visit limits are deterministic', async () => {
+  const { root, context } = await workspace();
+  await mkdir(path.join(root, 'nested'));
+  await writeFile(path.join(root, '.gitignore'), 'root-ignore.txt\n');
+  await writeFile(path.join(root, 'root-ignore.txt'), 'ignored\n');
+  await writeFile(path.join(root, 'nested', '.gitignore'), '*.log\n!important.log\n');
+  await writeFile(path.join(root, 'nested', 'a.log'), 'ignored\n');
+  await writeFile(path.join(root, 'nested', 'important.log'), 'kept\n');
+  await Promise.all(Array.from({ length: 10 }, (_unused, index) => writeFile(path.join(root, `file-${String(index).padStart(2, '0')}.txt`), 'x')));
+  const nested = await invokeToolCall(jsonToolCall('find_files', { patterns: ['**/*'], includeHidden: true }), tools, context);
+  assert.equal(nested.output.entries.some((entry) => entry.path === 'nested/a.log'), false);
+  assert.equal(nested.output.entries.some((entry) => entry.path === 'nested/important.log'), true);
+
+  const limitedConfiguration = {
+    ...DEFAULT_LOCAL_TOOL_CONFIGURATION,
+    fileSelection: { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.fileSelection, maxVisitedEntries: 3, maxIgnoreFiles: 1 }
+  };
+  const limitedContext = { ...context, services: { ...context.services, localToolConfiguration: limitedConfiguration, workspaceFileSelector: new WorkspaceFileSelector(root, limitedConfiguration.fileSelection) } };
+  const limited = await invokeToolCall(jsonToolCall('find_files', { patterns: ['**/*'], includeHidden: true }), tools, limitedContext);
+  assert.equal(limited.scope.coverage, 'partial');
+  assert.equal(limited.scope.causes.includes('visit_limit'), true);
+  assert.equal(limited.output.counts.visited, 3);
+});
+
+test('read_files reports precise EOF, UTF-8, and batch limit outcomes', async () => {
+  const { root, context } = await workspace();
+  await writeFile(path.join(root, 'short.txt'), 'one\ntwo');
+  await writeFile(path.join(root, 'invalid.txt'), Buffer.from([0x66, 0x6f, 0x80, 0x6f]));
+  await writeFile(path.join(root, 'second.txt'), 'second');
+  const edge = await invokeToolCall(jsonToolCall('read_files', { files: [{ path: 'short.txt', startLine: 9 }, { path: 'invalid.txt' }, { path: 'short.txt' }] }), tools, context);
+  assert.deepEqual(edge.output.failures.map((failure) => failure.reason), ['start_after_eof', 'invalid_utf8']);
+  assert.equal(edge.output.files[0].content, 'one\ntwo');
+  assert.equal(edge.output.files[0].fileBytes, 7);
+  assert.equal(edge.output.files[0].eof, true);
+
+  const limitedConfiguration = { ...DEFAULT_LOCAL_TOOL_CONFIGURATION, readFiles: { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.readFiles, maxFiles: 1, maxTotalBytes: 4 } };
+  const limitedContext = { ...context, services: { ...context.services, localToolConfiguration: limitedConfiguration } };
+  const limited = await invokeToolCall(jsonToolCall('read_files', { files: [{ path: 'short.txt' }, { path: 'second.txt' }] }), tools, limitedContext);
+  assert.equal(limited.output.failures.some((failure) => failure.reason === 'batch_byte_limit'), true);
+  assert.equal(limited.output.failures.some((failure) => failure.reason === 'batch_file_limit'), true);
+});
+
+test('search_text handles long repositories, context, per-file limits, abort, and missing ripgrep', async () => {
+  const { root, context } = await workspace();
+  const many = path.join(root, 'many'); await mkdir(many);
+  await Promise.all(Array.from({ length: 1_200 }, (_unused, index) => {
+    const name = `${String(index).padStart(4, '0')}-${'long-path-component-'.repeat(5)}.txt`;
+    return writeFile(path.join(many, name), index === 1_199 ? 'before\nneedle\nafter\nneedle\n' : 'nothing\n');
+  }));
+  const long = await invokeToolCall(jsonToolCall('search_text', { path: 'many', query: 'needle', contextLines: 1, perFileLimit: 1 }), tools, context);
+  assert.equal(long.output.status, 'completed');
+  assert.equal(long.output.results.length, 1);
+  assert.deepEqual(long.output.results[0].context, { before: ['before'], after: ['after'] });
+
+  const controller = new AbortController();
+  const call = jsonToolCall('search_text', { path: 'many', query: 'nothing' });
+  const preparationContext = { ...context, signal: controller.signal, boundary: { authorizationPolicyId: 'tests/search@1', executionTargetId: root } };
+  const prepared = await prepareToolCall(call, [searchTextTool], preparationContext);
+  assert.equal(prepared.ok, true);
+  const abortedPromise = prepared.prepared.tool.invoke(prepared.prepared.canonicalInput, preparationContext);
+  setTimeout(() => controller.abort('search cancelled'), 1);
+  const aborted = await abortedPromise;
+  assert.equal(aborted.output.status, 'aborted');
+
+  const oldPath = process.env.PATH;
+  try {
+    process.env.PATH = '';
+    const missing = await invokeToolCall(jsonToolCall('search_text', { path: 'many', query: 'needle' }), tools, context);
+    assert.equal(missing.output.status, 'missing_ripgrep');
+  } finally {
+    if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
+  }
 });

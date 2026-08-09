@@ -6,6 +6,7 @@ import type { AgentApprovalBinding, AgentApprovalRequest, AgentToolBatchIdentity
 import {
   POLICY_TOOL_AUTHORIZER,
   abortableToolBoundary,
+  enforceAllowedEffects,
   invokePreparedToolCall,
   normalizeToolObservationForPersistence,
   policyBlockedObservation,
@@ -18,6 +19,7 @@ import {
   type ToolPreparationContext,
   type ToolObservation
 } from '@agent-core/tools';
+import type { ResourceLeaseCoordinator, ToolProgress } from '@agent-core/tools';
 import type { AgentEvent, AgentProgressEvent } from '../events.js';
 import { ObservationStore, serializeToolObservationPresentation } from './observation-store.js';
 import type { AgentRunController } from './run-controller.js';
@@ -67,6 +69,7 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
   readonly tools: readonly ToolDefinition[];
   readonly toolContext: ToolPreparationContext;
   readonly authorizer?: ToolAuthorizer;
+  readonly resourceLeases?: ResourceLeaseCoordinator;
   readonly authorizationOverrides?: readonly ToolAuthorizationOverride[];
   readonly recovery?: readonly ToolCallRecoveryState[];
   readonly resuming?: boolean;
@@ -95,7 +98,7 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
       ...authorizationContext,
       emitProgress: async (progress) => {
         const event = { type: 'tool.updated' as const, ...identity, toolName: call.name, progress };
-        await input.append(event);
+        if (isDurableProgress(progress)) await input.append(event);
         await input.emit(event);
       }
     });
@@ -123,7 +126,9 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
     machine = transitionWithCommand(machine, { type: 'authorization.started' }, 'authorization.invoke');
     const override = input.authorizationOverrides?.find((item) => item.callIndex === callIndex);
     if (input.resuming && override?.fingerprint !== prepared.fingerprint) throw new Error(`Tool call fingerprint changed before approval resume at call ${String(callIndex)}.`);
-    const currentAuthorization = await abortableToolBoundary(input.toolContext.signal, () => authorizer({ call, tool: prepared.tool, input: prepared.canonicalInput, effects: prepared.effects, fingerprint: prepared.fingerprint, context: authorizationContext }));
+    const authorizationRequest = { call, tool: prepared.tool, input: prepared.canonicalInput, effects: prepared.effects, fingerprint: prepared.fingerprint, context: authorizationContext };
+    const policyDenial = enforceAllowedEffects(authorizationRequest);
+    const currentAuthorization = policyDenial ?? await abortableToolBoundary(input.toolContext.signal, () => authorizer(authorizationRequest));
     const authorization: ToolAuthorizationDecision = override
       ? currentAuthorization.decision === 'deny'
         ? currentAuthorization
@@ -161,27 +166,35 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
   const observed = new Map<number, ToolObservation>();
   for (const wave of scheduleToolCalls(executable, input.controller.limits.maxConcurrentToolCalls)) {
     for (const item of wave) await persistToolStart(input, item.value);
-    const results = await Promise.all(wave.map(async (item) => ({
-      callIndex: item.callIndex,
-      observation: await invokePreparedToolCall(item.value.prepared, {
-        ...input.toolContext,
-        emitProgress: async (progress) => {
-          const event = { type: 'tool.updated' as const, ...item.value.identity, toolName: item.value.call.name, progress };
-          await input.append(event);
-          await input.emit(event);
-        },
-        invocation: {
-          runId: input.runId,
-          turnId: item.value.identity.turnId,
-          requestAttempt: item.value.identity.requestAttempt,
-          toolBatchId: item.value.identity.toolBatchId,
-          callIndex: item.value.identity.callIndex,
-          ...(item.value.identity.callId ? { callId: item.value.identity.callId } : {}),
-          toolAttempt: item.value.identity.toolAttempt,
-          ...(item.value.prepared.effects.idempotency === 'idempotent' ? { idempotencyKey: item.value.prepared.effects.idempotencyKey } : {})
-        }
-      })
-    })));
+    const results = await Promise.all(wave.map(async (item) => {
+      const lease = await input.resourceLeases?.acquire(item.value.prepared.effects, `${input.runId}:${item.value.identity.toolBatchId}:${String(item.callIndex)}`, input.toolContext.signal);
+      try {
+        return {
+          callIndex: item.callIndex,
+          observation: await invokePreparedToolCall(item.value.prepared, {
+            ...input.toolContext,
+            ...(lease ? { resourceLease: lease } : {}),
+            emitProgress: async (progress) => {
+              const event = { type: 'tool.updated' as const, ...item.value.identity, toolName: item.value.call.name, progress };
+              if (isDurableProgress(progress)) await input.append(event);
+              await input.emit(event);
+            },
+            invocation: {
+              runId: input.runId,
+              turnId: item.value.identity.turnId,
+              requestAttempt: item.value.identity.requestAttempt,
+              toolBatchId: item.value.identity.toolBatchId,
+              callIndex: item.value.identity.callIndex,
+              ...(item.value.identity.callId ? { callId: item.value.identity.callId } : {}),
+              toolAttempt: item.value.identity.toolAttempt,
+              ...(item.value.prepared.effects.idempotency === 'idempotent' ? { idempotencyKey: item.value.prepared.effects.idempotencyKey } : {})
+            }
+          })
+        };
+      } finally {
+        if (lease && !lease.transferred) lease.release();
+      }
+    }));
     for (const result of results) observed.set(result.callIndex, result.observation);
   }
 
@@ -211,8 +224,14 @@ async function persistToolStart(input: Parameters<typeof executeAssistantToolCal
   if (!entry.prepared) throw new Error('Cannot persist a tool start without a prepared call.');
   await input.append({ type: 'tool.started', ...entry.identity, toolName: entry.call.name, input: entry.call, fingerprint: entry.prepared.fingerprint, effects: entry.prepared.effects }, toolEventKey(input.runId, entry.identity, 'started'));
   await input.emit({ type: 'tool.started', ...entry.identity, toolName: entry.call.name, input: entry.call, fingerprint: entry.prepared.fingerprint, effects: entry.prepared.effects });
-  await input.append({ type: 'tool.updated', ...entry.identity, toolName: entry.call.name, progress: { stage: 'executing' } }, toolEventKey(input.runId, entry.identity, 'updated'));
-  await input.emit({ type: 'tool.updated', ...entry.identity, toolName: entry.call.name, progress: { stage: 'executing' } });
+  const progress = { type: 'status' as const, stage: 'executing' };
+  await input.append({ type: 'tool.updated', ...entry.identity, toolName: entry.call.name, progress }, toolEventKey(input.runId, entry.identity, 'updated'));
+  await input.emit({ type: 'tool.updated', ...entry.identity, toolName: entry.call.name, progress });
+}
+
+const DURABLE_PROGRESS_STAGES = new Set(['patch_prepared', 'patch_committed', 'rollback_completed', 'process_started', 'process_stopped', 'executing']);
+function isDurableProgress(progress: ToolProgress): boolean {
+  return progress.type === 'status' && DURABLE_PROGRESS_STAGES.has(progress.stage);
 }
 
 async function persistObservation(input: Parameters<typeof executeAssistantToolCalls>[0], entry: PreparedEntry, observation: ToolObservation): Promise<void> {
@@ -247,7 +266,7 @@ async function persistObservation(input: Parameters<typeof executeAssistantToolC
     immediateContent: serializeToolObservationPresentation(record.immediatePresentation),
     retainedContent: serializeToolObservationPresentation(record.retainedPresentation),
     immediateImages: record.immediateImages,
-    evidence: record.evidence
+    evidence: [...record.evidence]
   });
   await input.append({
     type: 'observation.record.created', id: record.id, ...entry.identity, toolName: entry.call.name, call: record.call,

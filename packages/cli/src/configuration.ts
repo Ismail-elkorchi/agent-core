@@ -45,14 +45,14 @@ export function parseAgentCoreConfiguration(value: unknown): AgentCoreConfigurat
   if (Object.keys(value).some((key) => !['version', 'provider', 'model', 'reasoning', 'instructions', 'tools', 'authorization', 'verification', 'limits', 'session'].includes(key))) throw new Error('Agent Core configuration contains unknown fields.');
   if (!isProvider(value.provider) || typeof value.model !== 'string' || value.model.length === 0) throw new Error('Configuration provider/model is invalid.');
   if (!instructionArray(value.instructions)) throw new Error('Workspace instructions must contain confined relative paths.');
-  if (!isRecord(value.tools) || !stringArray(value.tools.enabled)) throw new Error('Project tool configuration is invalid.');
+  if (!isRecord(value.tools) || Object.keys(value.tools).some((key) => key !== 'enabled') || !stringArray(value.tools.enabled)) throw new Error('Project tool configuration is invalid.');
   const authorization = value.authorization;
-  if (!isRecord(authorization) || !riskArray(authorization.allowedRisks) || !riskArray(authorization.requireApprovalFor)) throw new Error('Project authorization configuration is invalid.');
+  if (!isRecord(authorization) || Object.keys(authorization).some((key) => key !== 'allowedRisks' && key !== 'requireApprovalFor') || !riskArray(authorization.allowedRisks) || !riskArray(authorization.requireApprovalFor)) throw new Error('Project authorization configuration is invalid.');
   const allowedRisks = authorization.allowedRisks;
   const approvalRisks = authorization.requireApprovalFor;
   if (!approvalRisks.every((risk) => allowedRisks.includes(risk))) throw new Error('Approval risks must also be present in authorization.allowedRisks.');
   const verification = value.verification;
-  if (!isRecord(verification) || !checkArray(verification.required) || !checkArray(verification.advisory)) throw new Error('Verification configuration is invalid.');
+  if (!isRecord(verification) || Object.keys(verification).some((key) => key !== 'required' && key !== 'advisory') || !checkArray(verification.required) || !checkArray(verification.advisory)) throw new Error('Verification configuration is invalid.');
   if (!sessionConfiguration(value.session)) throw new Error('Session configuration is invalid.');
   const reasoning = value.reasoning === undefined ? undefined : parseModelReasoningRequest(value.reasoning);
   if (value.limits !== undefined && !validLimits(value.limits)) throw new Error('Run limits are invalid.');
@@ -63,13 +63,17 @@ export function parseAgentCoreConfiguration(value: unknown): AgentCoreConfigurat
     provider: value.provider,
     model: value.model,
     ...(reasoning === undefined ? {} : { reasoning }),
-    instructions: Object.freeze([...value.instructions]),
+    instructions: Object.freeze(value.instructions.map((item) => Object.freeze({ path: item.path }))),
     tools: Object.freeze({ enabled: Object.freeze([...value.tools.enabled]) }),
     authorization: Object.freeze({ allowedRisks: Object.freeze([...allowedRisks]), requireApprovalFor: Object.freeze([...approvalRisks]) }),
-    verification: Object.freeze({ required: Object.freeze([...verification.required]), advisory: Object.freeze([...verification.advisory]) }),
+    verification: Object.freeze({ required: Object.freeze(verification.required.map(snapshotCheck)), advisory: Object.freeze(verification.advisory.map(snapshotCheck)) }),
     ...(value.limits === undefined ? {} : { limits: Object.freeze({ ...value.limits }) }),
     session: Object.freeze({ ...value.session })
   });
+}
+
+function snapshotCheck(check: AgentCoreCheckConfiguration): AgentCoreCheckConfiguration {
+  return Object.freeze({ id: check.id, command: check.command, ...(check.timeoutMs === undefined ? {} : { timeoutMs: check.timeoutMs }), ...(check.maxOutputBytes === undefined ? {} : { maxOutputBytes: check.maxOutputBytes }) });
 }
 
 function isProvider(value: unknown): value is AgentCoreConfiguration['provider'] { return value === 'ollama' || value === 'openrouter' || value === 'openai' || value === 'openai-codex'; }

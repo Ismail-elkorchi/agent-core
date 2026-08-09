@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { evidenceDelta, workspaceResource, type EvidenceAction, type ToolEvidenceItem } from '@agent-core/evidence';
-import { requireToolService, requireWorkspaceRoot, throwIfAborted, ToolInputError, type ToolExecutionContext } from '@agent-core/tools';
+import { requireToolService, requireWorkspaceRoot, throwIfAborted, ToolInputError, workspaceFileScope, type ToolExecutionContext } from '@agent-core/tools';
 import type { ToolObservation } from '@agent-core/tools';
 import {
   byteLengthUtf8,
@@ -13,7 +13,7 @@ import {
   validateParentDirectory
 } from '../../core/filesystem.js';
 import { invalidToolInputObservation, runtimeErrorObservation } from '@agent-core/tools';
-import { commitTextFilePatchTransaction, recoverTextFilePatchTransactions, type PreparedTextPatchRemove, type PreparedTextPatchWrite, type TextTransactionResult } from '../../core/text-write.js';
+import { withTextFilePatchJournal, type PreparedTextPatchRemove, type PreparedTextPatchWrite, type TextPatchJournalAuthority, type TextTransactionResult } from '../../core/text-write.js';
 import { splitLogicalLines } from '@agent-core/tools';
 import { applyPatchUpdate, PatchApplyError } from './apply-diff.js';
 import { PatchParseError, type ParsedApplyPatch, type ParsedPatchOperation } from './patch-parser.js';
@@ -52,8 +52,14 @@ export async function applyPatch(input: CanonicalApplyPatchInput, context: ToolE
   const rootDir = requireWorkspaceRoot(context);
   const dryRun = input.dryRun;
   const journalDirectory = dryRun ? undefined : requireToolService(context, 'patchTransactionDirectory', isNonEmptyString, 'non-empty patch transaction directory');
-  if (journalDirectory) await recoverTextFilePatchTransactions(rootDir, journalDirectory);
-  await context.emitProgress?.({ stage: 'prepare', message: 'Preparing patch transaction.', completed: 0, total: input.tree.operations.length });
+  if (journalDirectory) return withTextFilePatchJournal(rootDir, journalDirectory, (authority) => applyPatchWithAuthority(input, context, authority), context.signal);
+  return applyPatchWithAuthority(input, context);
+}
+
+async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, context: ToolExecutionContext, authority?: TextPatchJournalAuthority): Promise<ToolObservation<ApplyPatchOutput>> {
+  const rootDir = requireWorkspaceRoot(context);
+  const dryRun = input.dryRun;
+  await context.emitProgress?.({ type: 'status', stage: 'patch_preparing', message: 'Preparing patch transaction.', completed: 0, total: input.tree.operations.length });
   const { prepared, failures } = await preparePatch(rootDir, input);
 
   if (failures.length > 0) {
@@ -61,29 +67,28 @@ export async function applyPatch(input: CanonicalApplyPatchInput, context: ToolE
       failures
     });
   }
-  await context.emitProgress?.({ stage: 'prepare', message: 'Patch transaction prepared.', completed: prepared.length, total: input.tree.operations.length });
+  await context.emitProgress?.({ type: 'status', stage: 'patch_prepared', message: 'Patch transaction prepared.', completed: prepared.length, total: input.tree.operations.length });
 
   const changed = prepared.filter((operation) => operation.output.changed);
   if (!dryRun && changed.length > 0) {
-    if (!journalDirectory) throw new Error('Patch journal directory is unavailable for a write transaction.');
+    if (!authority) throw new Error('Patch journal authority is unavailable for a write transaction.');
     throwIfAborted(context.signal);
-    await context.emitProgress?.({ stage: 'commit', message: 'Committing patch transaction.', completed: 0, total: changed.length });
+    await context.emitProgress?.({ type: 'status', stage: 'patch_committing', message: 'Committing patch transaction.', completed: 0, total: changed.length });
     const transactionId = patchTransactionId(context);
-    const transaction = await commitTextFilePatchTransaction(rootDir, {
+    const transaction = await authority.commit({
       writes: changed.flatMap((operation) => operation.write ? [operation.write] : []),
       removes: changed.flatMap((operation) => operation.remove ? [operation.remove] : []),
       parentDirsToCreate: changed.flatMap((operation) => operation.parentDirsToCreate)
     }, {
       ...(context.signal ? { signal: context.signal } : {}),
-      journalDirectory,
       ...(transactionId ? { transactionId } : {})
     });
     if (transaction.outcome !== 'committed') {
-      await context.emitProgress?.({ stage: 'rollback', message: `Patch rollback ${transactionRecovery(transaction)}.` });
+      await context.emitProgress?.({ type: 'status', stage: 'rollback_completed', message: `Patch rollback ${transactionRecovery(transaction)}.` });
       const message = transactionFailureMessage(transaction);
       return runtimeErrorObservation('apply_patch', message, { transaction });
     }
-    await context.emitProgress?.({ stage: 'commit', message: 'Patch transaction committed.', completed: changed.length, total: changed.length });
+    await context.emitProgress?.({ type: 'status', stage: 'patch_committed', message: 'Patch transaction committed.', completed: changed.length, total: changed.length });
   }
 
   const wouldChangePaths = uniquePaths(changed.flatMap((operation) => operation.changedPaths));
@@ -112,7 +117,7 @@ export async function applyPatch(input: CanonicalApplyPatchInput, context: ToolE
     kind: 'result',
     ok: true,
     summary: summarizePatchOutput(output),
-    scope: { resources: uniquePaths(prepared.flatMap((operation) => operation.changedPaths)).map((item) => `workspace/files/${item}`), coverage: 'complete' },
+    scope: { resources: uniquePaths(prepared.flatMap((operation) => operation.changedPaths)).map((item) => workspaceFileScope(item)), coverage: 'complete' },
     output,
     evidence: evidenceDelta(patchEvidenceItems(output)),
     ...(!dryRun ? { metadata: { changedPaths: output.changedPaths } } : {})
@@ -272,7 +277,8 @@ async function prepareAdd(
         path: target.path,
         absolutePath: target.absolutePath,
         content,
-        overwrite: false
+        overwrite: false,
+        expectedAbsent: true
       },
       parentDirsToCreate: target.parentDirsToCreate,
       createdPath: target.path,
@@ -320,7 +326,8 @@ async function prepareDelete(
       },
       remove: {
         path: inspected.file.path,
-        absolutePath: inspected.file.absolutePath
+        absolutePath: inspected.file.absolutePath,
+        expectedCurrentSha256: oldSha256
       },
       parentDirsToCreate: [],
       deletedPath: inspected.file.path,
@@ -406,11 +413,13 @@ async function prepareUpdate(
           absolutePath: target.absolutePath,
           content: patched.content,
           mode: inspected.file.mode,
-          overwrite: false
+          overwrite: false,
+          expectedAbsent: true
         },
         remove: {
           path: inspected.file.path,
-          absolutePath: inspected.file.absolutePath
+          absolutePath: inspected.file.absolutePath,
+          expectedCurrentSha256: oldSha256
         },
         parentDirsToCreate: target.parentDirsToCreate,
         move: { sourcePath: inspected.file.path, destinationPath: target.path },
@@ -442,7 +451,8 @@ async function prepareUpdate(
           absolutePath: inspected.file.absolutePath,
           content: patched.content,
           mode: inspected.file.mode,
-          overwrite: true
+          overwrite: true,
+          expectedCurrentSha256: oldSha256
         }
       } : {}),
       parentDirsToCreate: [],

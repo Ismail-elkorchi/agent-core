@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
+import { hostname } from 'node:os';
 import { throwIfAborted } from '@agent-core/tools';
 import { assertPathIsNotSymlink, resolveInsideRoot } from './filesystem.js';
 
@@ -10,11 +11,14 @@ export interface PreparedTextPatchWrite {
   content: string;
   mode?: number;
   overwrite: boolean;
+  expectedCurrentSha256?: string;
+  expectedAbsent?: true;
 }
 
 export interface PreparedTextPatchRemove {
   path: string;
   absolutePath: string;
+  expectedCurrentSha256: string;
 }
 
 export interface PreparedTextPatchTransaction {
@@ -47,9 +51,31 @@ export type TextTransactionResult =
   | { readonly outcome: 'rollback_failed'; readonly failure: TextTransactionDiagnostic; readonly rollback: Exclude<TextTransactionRecovery, { status: 'succeeded' }> };
 
 export async function commitTextFilePatchTransaction(rootDir: string, transaction: PreparedTextPatchTransaction, options: TextTransactionOptions): Promise<TextTransactionResult> {
+  return withTextFilePatchJournal(rootDir, options.journalDirectory, async (authority) => authority.commit(transaction, options));
+}
+
+export interface TextPatchJournalAuthority {
+  commit(transaction: PreparedTextPatchTransaction, options: Omit<TextTransactionOptions, 'journalDirectory'> & { readonly journalDirectory?: string }): Promise<TextTransactionResult>;
+}
+
+export async function withTextFilePatchJournal<T>(
+  rootDir: string,
+  journalDirectory: string,
+  operation: (authority: TextPatchJournalAuthority) => Promise<T>,
+  signal?: AbortSignal
+): Promise<T> {
+  return withJournalLock(journalDirectory, signal, async () => {
+    await recoverTextFilePatchTransactionsUnlocked(rootDir, journalDirectory, fs);
+    const authority: TextPatchJournalAuthority = Object.freeze({
+      commit: (transaction: PreparedTextPatchTransaction, options: Omit<TextTransactionOptions, 'journalDirectory'> & { readonly journalDirectory?: string }) => commitTextFilePatchTransactionUnlocked(rootDir, transaction, { ...options, journalDirectory })
+    });
+    return operation(authority);
+  });
+}
+
+async function commitTextFilePatchTransactionUnlocked(rootDir: string, transaction: PreparedTextPatchTransaction, options: TextTransactionOptions): Promise<TextTransactionResult> {
   throwIfAborted(options.signal);
   const io = options.fileSystem ?? fs;
-  await recoverTextFilePatchTransactions(rootDir, options.journalDirectory, io);
   const parentDirs = [...new Set(transaction.parentDirsToCreate ?? [])];
   const transactionId = safeTransactionId(options.transactionId ?? randomUUID());
   const transactionDirectory = path.join(options.journalDirectory, transactionId);
@@ -60,14 +86,18 @@ export async function commitTextFilePatchTransaction(rootDir: string, transactio
     stagedPath: path.join(transactionDirectory, `write-${String(index)}.tmp`),
     ...(write.overwrite ? { backupPath: path.join(transactionDirectory, `backup-write-${String(index)}`) } : {}),
     newSha256: sha256(write.content),
-    overwrite: write.overwrite
+    overwrite: write.overwrite,
+    ...(write.expectedCurrentSha256 ? { expectedCurrentSha256: write.expectedCurrentSha256 } : {}),
+    ...(write.expectedAbsent ? { expectedAbsent: true as const } : {})
   }));
   const removes: PatchJournalRemove[] = transaction.removes.map((remove, index) => ({
     path: remove.path,
     absolutePath: remove.absolutePath,
-    backupPath: path.join(transactionDirectory, `backup-remove-${String(index)}`)
+    backupPath: path.join(transactionDirectory, `backup-remove-${String(index)}`),
+    expectedCurrentSha256: remove.expectedCurrentSha256
   }));
   const manifest: PatchJournalManifest = { version: 1, transactionId, phase: 'prepared', parentDirs, writes, removes };
+  let mutationStarted = false;
 
   try {
     for (const remove of transaction.removes) {
@@ -86,6 +116,8 @@ export async function commitTextFilePatchTransaction(rootDir: string, transactio
       await syncFile(journalWrite.stagedPath, io);
     }
     await writePatchJournalManifest(manifestPath, manifest, io);
+    await validateCommitPreconditions(transaction, parentDirs, io);
+    mutationStarted = true;
     for (const dir of parentDirs) {
       await ensureDurableDirectory(dir, io);
     }
@@ -109,7 +141,9 @@ export async function commitTextFilePatchTransaction(rootDir: string, transactio
     const cleanup = await recoveryResult([recoveryOperation('remove_patch_journal', transactionDirectory, () => removeJournal(transactionDirectory, io))], io);
     return cleanup.status === 'succeeded' ? { outcome: 'committed', cleanup } : { outcome: 'committed_with_residue', cleanup };
   } catch (error) {
-    const rollback = await recoverPreparedPatchTransaction(transactionDirectory, manifest, io);
+    const rollback = mutationStarted
+      ? await recoverPreparedPatchTransaction(transactionDirectory, manifest, io)
+      : await recoveryResult([recoveryOperation('remove_patch_journal', transactionDirectory, () => removeJournal(transactionDirectory, io))], io);
     return failedResult(error, 'commit_patch', rollback);
   }
 }
@@ -121,8 +155,10 @@ interface PatchJournalWrite {
   readonly backupPath?: string;
   readonly newSha256: string;
   readonly overwrite: boolean;
+  readonly expectedCurrentSha256?: string;
+  readonly expectedAbsent?: true;
 }
-interface PatchJournalRemove { readonly path: string; readonly absolutePath: string; readonly backupPath: string }
+interface PatchJournalRemove { readonly path: string; readonly absolutePath: string; readonly backupPath: string; readonly expectedCurrentSha256: string }
 interface PatchJournalManifest {
   readonly version: 1;
   readonly transactionId: string;
@@ -133,6 +169,14 @@ interface PatchJournalManifest {
 }
 
 export async function recoverTextFilePatchTransactions(rootDir: string, journalDirectory: string, io: TextWriteFileSystem = fs): Promise<void> {
+  if (io !== fs) {
+    await recoverTextFilePatchTransactionsUnlocked(rootDir, journalDirectory, io);
+    return;
+  }
+  await withJournalLock(journalDirectory, undefined, () => recoverTextFilePatchTransactionsUnlocked(rootDir, journalDirectory, io));
+}
+
+async function recoverTextFilePatchTransactionsUnlocked(rootDir: string, journalDirectory: string, io: TextWriteFileSystem): Promise<void> {
   await ensureDurableDirectory(journalDirectory, io);
   const entries = await io.readdir(journalDirectory, { withFileTypes: true });
   for (const entry of entries) {
@@ -278,13 +322,79 @@ async function readPatchJournalManifest(manifestPath: string, io: TextWriteFileS
 function isPatchJournalManifest(value: unknown): value is PatchJournalManifest {
   if (!isRecord(value) || value.version !== 1 || typeof value.transactionId !== 'string' || (value.phase !== 'prepared' && value.phase !== 'committed')) return false;
   return Array.isArray(value.parentDirs) && value.parentDirs.every((item) => typeof item === 'string')
-    && Array.isArray(value.writes) && value.writes.every((item) => isRecord(item) && typeof item.path === 'string' && typeof item.absolutePath === 'string' && typeof item.stagedPath === 'string' && (item.backupPath === undefined || typeof item.backupPath === 'string') && typeof item.newSha256 === 'string' && typeof item.overwrite === 'boolean')
-    && Array.isArray(value.removes) && value.removes.every((item) => isRecord(item) && typeof item.path === 'string' && typeof item.absolutePath === 'string' && typeof item.backupPath === 'string');
+    && Array.isArray(value.writes) && value.writes.every((item) => isRecord(item) && typeof item.path === 'string' && typeof item.absolutePath === 'string' && typeof item.stagedPath === 'string' && (item.backupPath === undefined || typeof item.backupPath === 'string') && typeof item.newSha256 === 'string' && typeof item.overwrite === 'boolean' && (item.expectedCurrentSha256 === undefined || typeof item.expectedCurrentSha256 === 'string') && (item.expectedAbsent === undefined || item.expectedAbsent === true))
+    && Array.isArray(value.removes) && value.removes.every((item) => isRecord(item) && typeof item.path === 'string' && typeof item.absolutePath === 'string' && typeof item.backupPath === 'string' && typeof item.expectedCurrentSha256 === 'string');
 }
 
 async function pathExists(pathValue: string, io: TextWriteFileSystem): Promise<boolean> {
   try { await io.lstat(pathValue); return true; }
   catch (error) { if (nodeCode(error) === 'ENOENT') return false; throw error; }
+}
+
+async function validateCommitPreconditions(transaction: PreparedTextPatchTransaction, parentDirs: readonly string[], io: TextWriteFileSystem): Promise<void> {
+  for (const remove of transaction.removes) await assertCurrentSha256(remove.path, remove.absolutePath, remove.expectedCurrentSha256, io);
+  for (const write of transaction.writes) {
+    if (write.expectedCurrentSha256) await assertCurrentSha256(write.path, write.absolutePath, write.expectedCurrentSha256, io);
+    if (write.expectedAbsent) await assertDestinationDoesNotExist(write.absolutePath, io);
+  }
+  for (const directory of parentDirs) {
+    if (await pathExists(directory, io)) throw new Error('Patch parent state changed before commit: ' + directory);
+    let ancestor = path.dirname(directory);
+    while (!await pathExists(ancestor, io)) {
+      const next = path.dirname(ancestor);
+      if (next === ancestor) throw new Error('Patch parent has no existing ancestor: ' + directory);
+      ancestor = next;
+    }
+    const stat = await io.lstat(ancestor);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Patch parent state is not a real directory: ' + ancestor);
+  }
+}
+async function assertCurrentSha256(filePath: string, absolutePath: string, expected: string, io: TextWriteFileSystem): Promise<void> {
+  const stat = await io.lstat(absolutePath);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Patch source type changed before commit: ' + filePath);
+  const actual = sha256(await io.readFile(absolutePath));
+  if (actual !== expected) throw new Error('Patch source changed before commit: ' + filePath);
+}
+
+async function withJournalLock<T>(journalDirectory: string, signal: AbortSignal | undefined, operation: () => Promise<T>): Promise<T> {
+  const lockPath = journalDirectory + '.lock';
+  await fs.mkdir(path.dirname(journalDirectory), { recursive: true });
+  const started = Date.now();
+  const owner = { pid: process.pid, hostname: hostname(), createdAt: new Date().toISOString(), nonce: randomUUID() };
+  for (;;) {
+    throwIfAborted(signal);
+    try {
+      await fs.mkdir(lockPath);
+      await fs.writeFile(path.join(lockPath, 'owner.json'), JSON.stringify(owner), { encoding: 'utf8', flag: 'wx' });
+      break;
+    } catch (error) {
+      if (nodeCode(error) !== 'EEXIST') throw error;
+      if (await staleJournalLock(lockPath)) { await fs.rm(lockPath, { recursive: true, force: true }); continue; }
+      if (Date.now() - started > 30_000) throw new Error('Timed out acquiring patch journal lock: ' + lockPath, { cause: error });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  try { return await operation(); }
+  finally {
+    try {
+      const current = JSON.parse(await fs.readFile(path.join(lockPath, 'owner.json'), 'utf8')) as { nonce?: unknown };
+      if (current.nonce === owner.nonce) await fs.rm(lockPath, { recursive: true, force: true });
+    } catch { /* A missing lock is already released. */ }
+  }
+}
+async function staleJournalLock(lockPath: string): Promise<boolean> {
+  let stat;
+  try { stat = await fs.stat(lockPath); } catch { return false; }
+  const age = Date.now() - stat.mtimeMs;
+  try {
+    const owner = JSON.parse(await fs.readFile(path.join(lockPath, 'owner.json'), 'utf8')) as { pid?: unknown; hostname?: unknown };
+    if (owner.hostname !== hostname()) return age > 60 * 60_000;
+    if (typeof owner.pid === 'number') {
+      try { process.kill(owner.pid, 0); return false; }
+      catch (error) { return nodeCode(error) === 'ESRCH'; }
+    }
+  } catch { return age > 10 * 60_000; }
+  return age > 10 * 60_000;
 }
 
 function sha256(value: string | Uint8Array): string { return createHash('sha256').update(value).digest('hex'); }

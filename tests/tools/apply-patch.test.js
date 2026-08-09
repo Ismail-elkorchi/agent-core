@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { promises as realFs } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { applyPatchTool, DEFAULT_LOCAL_TOOL_CONFIGURATION } from '@agent-core/tools-local';
@@ -41,13 +41,13 @@ test('apply_patch parses once into one canonical tree and applies add, update, m
   });
   assert.equal(observation.ok, true);
   assert.equal(observation.output.transactional, true);
-  assert.deepEqual(observation.output.changedPaths.sort(), ['added.txt', 'delete.txt', 'move.txt', 'moved.txt', 'update.txt']);
+  assert.deepEqual([...observation.output.changedPaths].sort(), ['added.txt', 'delete.txt', 'move.txt', 'moved.txt', 'update.txt']);
   assert.equal(await readFile(path.join(root, 'added.txt'), 'utf8'), 'added\n');
   assert.equal(await readFile(path.join(root, 'update.txt'), 'utf8'), 'new\n');
   assert.equal(await readFile(path.join(root, 'moved.txt'), 'utf8'), 'moved\n');
   await assert.rejects(readFile(path.join(root, 'move.txt')));
   await assert.rejects(readFile(path.join(root, 'delete.txt')));
-  assert.deepEqual([...new Set(progress.map((item) => item.stage))], ['parse', 'prepare', 'commit']);
+  assert.deepEqual([...new Set(progress.map((item) => item.stage))], ['patch_parsing', 'patch_parsed', 'patch_preparing', 'patch_prepared', 'patch_committing', 'patch_committed']);
 });
 
 test('apply_patch enforces raw SHA-256 preconditions and keeps dry runs non-mutating', async () => {
@@ -233,3 +233,73 @@ test('patch journals recover an interrupted process before another transaction r
   assert.equal(await readFile(path.join(root, 'note.txt'), 'utf8'), 'before\n');
   assert.deepEqual(await readdir(journalDirectory), []);
 });
+
+test('patch commit revalidates every hash and absent destination before mutation', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-precondition-'));
+  const journalDirectory = path.join(root, '.agent-core', 'transactions', 'patch');
+  const source = path.join(root, 'source.txt');
+  const destination = path.join(root, 'destination.txt');
+  await writeFile(source, 'initial\n');
+  const initialSha = createHash('sha256').update('initial\n').digest('hex');
+  await writeFile(source, 'external\n');
+  const changed = await commitTextFilePatchTransaction(root, {
+    writes: [{ path: 'source.txt', absolutePath: source, content: 'patched\n', overwrite: true, expectedCurrentSha256: initialSha }], removes: []
+  }, { journalDirectory });
+  assert.equal(changed.outcome, 'rolled_back');
+  assert.equal(await readFile(source, 'utf8'), 'external\n');
+
+  await writeFile(destination, 'external destination\n');
+  const appeared = await commitTextFilePatchTransaction(root, {
+    writes: [{ path: 'destination.txt', absolutePath: destination, content: 'patched\n', overwrite: false, expectedAbsent: true }], removes: []
+  }, { journalDirectory });
+  assert.equal(appeared.outcome, 'rolled_back');
+  assert.equal(await readFile(destination, 'utf8'), 'external destination\n');
+});
+
+test('one journal lock serializes same-process patches on different and identical files', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-concurrent-'));
+  const journalDirectory = path.join(root, '.agent-core', 'transactions', 'patch');
+  await writeFile(path.join(root, 'a.txt'), 'a0\n');
+  await writeFile(path.join(root, 'b.txt'), 'b0\n');
+  const shaA = createHash('sha256').update('a0\n').digest('hex');
+  const shaB = createHash('sha256').update('b0\n').digest('hex');
+  const transaction = (file, content, expectedCurrentSha256) => ({ writes: [{ path: file, absolutePath: path.join(root, file), content, overwrite: true, expectedCurrentSha256 }], removes: [] });
+  const distinct = await Promise.all([
+    commitTextFilePatchTransaction(root, transaction('a.txt', 'a1\n', shaA), { journalDirectory }),
+    commitTextFilePatchTransaction(root, transaction('b.txt', 'b1\n', shaB), { journalDirectory })
+  ]);
+  assert.deepEqual(distinct.map((item) => item.outcome), ['committed', 'committed']);
+
+  const currentSha = createHash('sha256').update('a1\n').digest('hex');
+  const same = await Promise.all([
+    commitTextFilePatchTransaction(root, transaction('a.txt', 'first\n', currentSha), { journalDirectory }),
+    commitTextFilePatchTransaction(root, transaction('a.txt', 'second\n', currentSha), { journalDirectory })
+  ]);
+  assert.equal(same.filter((item) => item.outcome === 'committed').length, 1);
+  assert.equal(same.filter((item) => item.outcome === 'rolled_back').length, 1);
+});
+
+test('the patch journal lock isolates separate Agent Core processes', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-interprocess-'));
+  const journalDirectory = path.join(root, '.agent-core', 'transactions', 'patch');
+  await writeFile(path.join(root, 'shared.txt'), 'base\n');
+  const expected = createHash('sha256').update('base\n').digest('hex');
+  const fixture = path.resolve('tests/fixtures/patch-concurrency.mjs');
+  const results = await Promise.all([
+    runPatchChild(fixture, [root, journalDirectory, 'shared.txt', expected, 'one\n']),
+    runPatchChild(fixture, [root, journalDirectory, 'shared.txt', expected, 'two\n'])
+  ]);
+  assert.equal(results.filter((item) => item.outcome === 'committed').length, 1);
+  assert.equal(results.filter((item) => item.outcome === 'rolled_back').length, 1);
+});
+
+function runPatchChild(fixture, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [fixture, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = ''; let stderr = '';
+    child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (value) => { stdout += value; }); child.stderr.on('data', (value) => { stderr += value; });
+    child.once('error', reject);
+    child.once('close', (code) => code === 0 ? resolve(JSON.parse(stdout)) : reject(new Error(stderr || `child exited ${String(code)}`)));
+  });
+}

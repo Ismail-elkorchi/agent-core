@@ -26,13 +26,21 @@ export class LocalArtifactRepository implements ArtifactRepository {
   }
 
   async store(input: ArtifactStoreInput): Promise<ArtifactRef> {
+    return this.storeAt(input, false);
+  }
+
+  async storeProtected(input: ArtifactStoreInput): Promise<ArtifactRef> {
+    return this.storeAt(input, true);
+  }
+
+  private async storeAt(input: ArtifactStoreInput, protectedPath: boolean): Promise<ArtifactRef> {
     const bytes = new Uint8Array(input.content);
     const mediaType = input.mediaType ?? 'application/octet-stream';
     const sha256 = hashArtifactBytes(bytes);
-    const artifactId = `${sha256}${artifactExtension(mediaType)}`;
+    const artifactId = `${protectedPath ? 'protected-' : ''}${sha256}${artifactExtension(mediaType)}`;
     const target = this.confinedPath(artifactId);
-    await fs.mkdir(this.rootDir, { recursive: true });
-    const temporary = this.confinedPath(`tmp-${artifactId}-${randomUUID()}.tmp`);
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    const temporary = path.join(path.dirname(target), `tmp-${artifactId}-${randomUUID()}.tmp`);
     const handle = await fs.open(temporary, 'wx');
     try {
       await handle.writeFile(bytes);
@@ -85,16 +93,53 @@ export class LocalArtifactRepository implements ArtifactRepository {
     return bytes;
   }
 
+  async readVerifiedRange(ref: ArtifactRef, input: { readonly offset: number; readonly length: number }): Promise<import('./artifact-repository.js').ArtifactRange> {
+    validateArtifactRef(ref);
+    if (!Number.isSafeInteger(input.offset) || input.offset < 0 || !Number.isSafeInteger(input.length) || input.length < 1 || input.offset > ref.size) throw new Error('Invalid artifact range.');
+    const filePath = this.confinedPath(ref.artifactId);
+    const handle = await fs.open(filePath, 'r');
+    try {
+      const stat = await handle.stat();
+      if (stat.size !== ref.size) throw new ArtifactIntegrityError(ref.artifactId, `Artifact size mismatch for ${ref.artifactId}.`);
+      const hash = (await import('node:crypto')).createHash('sha256');
+      const chunk = Buffer.allocUnsafe(256 * 1024);
+      let position = 0;
+      while (position < stat.size) {
+        const read = await handle.read(chunk, 0, Math.min(chunk.length, stat.size - position), position);
+        if (read.bytesRead === 0) break;
+        hash.update(chunk.subarray(0, read.bytesRead));
+        position += read.bytesRead;
+      }
+      if (hash.digest('hex') !== ref.sha256) throw new ArtifactIntegrityError(ref.artifactId, `Artifact SHA-256 mismatch for ${ref.artifactId}.`);
+      const windowStart = Math.max(0, input.offset - 3);
+      const windowEnd = Math.min(stat.size, input.offset + input.length + 3);
+      const window = Buffer.alloc(windowEnd - windowStart);
+      if (window.length > 0) await handle.read(window, 0, window.length, windowStart);
+      const relative = (await import('./artifact-repository.js')).adjustedArtifactByteRange(
+        { ...ref, size: window.length },
+        window,
+        input.offset - windowStart,
+        input.length
+      );
+      const offset = windowStart + relative.offset;
+      const end = windowStart + relative.end;
+      return Object.freeze({ offset, end, bytes: new Uint8Array(window.subarray(relative.offset, relative.end)), fullSize: stat.size });
+    } finally {
+      await handle.close();
+    }
+  }
+
   async resolve(artifactId: string): Promise<ArtifactRef | undefined> {
+    if (artifactId.startsWith('protected-')) return undefined;
     const known = this.references.get(artifactId);
     if (known) return known;
-    if (!/^[a-f0-9]{64}\.[a-z0-9]+$/u.test(artifactId)) return undefined;
+    if (!/^(?:protected-)?[a-f0-9]{64}\.[a-z0-9]+$/u.test(artifactId)) return undefined;
     let stat;
     try { stat = await fs.stat(this.confinedPath(artifactId)); } catch { return undefined; }
     if (!stat.isFile()) return undefined;
     const ref = freezeArtifactRef({
       artifactId,
-      sha256: artifactId.slice(0, 64),
+      sha256: artifactId.replace(/^protected-/u, '').slice(0, 64),
       size: stat.size,
       mediaType: mediaTypeFromArtifactId(artifactId),
       label: artifactId
@@ -105,7 +150,7 @@ export class LocalArtifactRepository implements ArtifactRepository {
 
   private confinedPath(artifactId: string): string {
     if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/u.test(artifactId)) throw new Error(`Invalid artifact identifier: ${artifactId}`);
-    const target = path.resolve(this.rootDir, artifactId);
+    const target = path.resolve(artifactId.startsWith('protected-') ? path.join(this.rootDir, 'protected') : this.rootDir, artifactId);
     const relative = path.relative(this.rootDir, target);
     if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error(`Artifact path escapes repository: ${artifactId}`);
     return target;

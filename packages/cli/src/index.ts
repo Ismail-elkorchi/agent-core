@@ -18,11 +18,11 @@ import { OpenRouterProvider } from '@agent-core/provider-openrouter';
 import type { AgentSession } from '@agent-core/runtime';
 import type { AgentCheckDefinition } from '@agent-core/runtime';
 import {
-  isToolAvailable,
   accessRisk,
   type ToolCall,
   type ToolObservation,
   type ToolPolicy,
+  type ToolProgress,
   type ToolRisk
 } from '@agent-core/tools';
 import type { ToolDefinition } from '@agent-core/tools';
@@ -31,7 +31,7 @@ import {
   ProcessManager,
   WorkspaceFileSelector,
   applyPatchTool,
-  execCommandTool,
+  createExecCommandTool,
   findFilesTool,
   listDirectoryTool,
   readArtifactTool,
@@ -67,7 +67,6 @@ interface CliOptions {
   apply: boolean;
   dryRun: boolean;
   allowShell: boolean;
-  allowUnsafeShell: boolean;
   showReasoning: boolean;
   tui: boolean;
   plain: boolean;
@@ -84,7 +83,6 @@ export interface CliToolPolicyOptions {
   apply: boolean;
   dryRun: boolean;
   allowShell: boolean;
-  allowUnsafeShell: boolean;
 }
 
 export interface CliProgressSink {
@@ -181,15 +179,10 @@ async function createRuntime(
   const artifactStore = new LocalArtifactRepository({ rootDir: workspace.artifactsDir });
   const events = new JsonlEventRepository<AgentEvent>({ rootDir: workspace.runsDir, codec: agentEventCodec });
   const estimator = new SimpleTokenEstimator();
-  const localToolConfiguration = DEFAULT_LOCAL_TOOL_CONFIGURATION;
-  const processManager = new ProcessManager({
-    artifactRepository: artifactStore,
-    maxCapturedBytes: localToolConfiguration.process.maxCapturedBytes,
-    tailBytes: localToolConfiguration.process.tailBytes
-  });
-  const workspaceFileSelector = new WorkspaceFileSelector(workspace.workspaceRoot, localToolConfiguration.fileSelection);
+  const localHost = createCliLocalToolHost(workspace, artifactStore, options.configuration?.tools.enabled);
+  const { localToolConfiguration, processManager } = localHost;
   const toolPolicy = toolPolicyFromOptions(options);
-  const configuredTools = createCliDefaultTools(options.configuration?.tools.enabled);
+  const configuredTools = localHost.tools;
   const instructions = await loadWorkspaceInstructions(workspace.workspaceRoot, options.configuration);
   const checks = configuredChecks(options.configuration);
   const agent = new AgentRuntime({
@@ -205,17 +198,10 @@ async function createRuntime(
     ...(options.maxOutputTokens !== undefined ? { maxOutputTokens: options.maxOutputTokens } : {}),
     tools: configuredTools,
     toolContext: {
-      services: {
-        workspaceRoot: workspace.workspaceRoot,
-        patchTransactionDirectory: path.join(workspace.runtimeDir, 'transactions', 'patch'),
-        localToolConfiguration,
-        processManager,
-        workspaceFileSelector
-      }
+      services: localHost.services
     },
     toolPolicy,
     ...(options.configuration?.authorization.requireApprovalFor.length ? { toolAuthorizer: request => {
-      if (!isToolAvailable(request.tool, toolPolicy)) return { decision: 'deny' as const, reason: 'Denied by workspace policy.' };
       const approvalAccesses = request.effects.accesses.map((access) => accessRisk(access.mode))
         .filter((risk) => options.configuration?.authorization.requireApprovalFor.includes(risk));
       return approvalAccesses.length > 0
@@ -229,6 +215,7 @@ async function createRuntime(
       const startedAt = Date.now();
       const outputTokenBudget = Math.max(64, Math.ceil((request.maxOutputBytes ?? 64_000) / 4));
       let result = await processManager.start({
+        owner: request.owner,
         command: request.command,
         cwd: workspace.workspaceRoot,
         pty: false,
@@ -239,10 +226,12 @@ async function createRuntime(
       });
       let stdout = result.stdout.text;
       let stderr = result.stderr.text;
+      let cursor = result.cursorEnd;
       while (result.status === 'running') {
-        result = await processManager.poll(result.processId, outputTokenBudget, localToolConfiguration.process.maxYieldMs);
+        result = await processManager.poll(result.processId, outputTokenBudget, localToolConfiguration.process.maxYieldMs, cursor, request.owner);
         stdout += result.stdout.text;
         stderr += result.stderr.text;
+        cursor = result.cursorEnd;
       }
       return { exitCode: result.status === 'exited' ? result.exitCode ?? null : null, stdout, stderr, durationMs: Date.now() - startedAt };
     } } } : {}),
@@ -269,20 +258,36 @@ async function createRuntime(
       sessionLocation: sessionBinding.repository.location(sessionBinding.session.id),
       permissions: {
         workspaceWrites: options.apply ? 'allowed' : options.dryRun ? 'dry_run' : 'denied',
-        shell: options.allowUnsafeShell ? 'unsafe' : options.allowShell ? 'safe' : 'denied'
+        shell: options.allowShell ? 'allowed' : 'denied'
       }
     }
   };
 }
 
-export function createCliDefaultTools(enabled?: readonly string[]): ToolDefinition[] {
+export function createCliLocalToolHost(workspace: WorkspaceLayout, artifactStore: LocalArtifactRepository, enabled?: readonly string[]) {
+  const localToolConfiguration = DEFAULT_LOCAL_TOOL_CONFIGURATION;
+  const processManager = new ProcessManager({ artifactRepository: artifactStore, ...localToolConfiguration.process });
+  const workspaceFileSelector = new WorkspaceFileSelector(workspace.workspaceRoot, localToolConfiguration.fileSelection);
+  const services = Object.freeze({
+    workspaceRoot: workspace.workspaceRoot,
+    artifactRepository: artifactStore,
+    patchTransaction: true,
+    patchTransactionDirectory: path.join(workspace.runtimeDir, 'transactions', 'patch'),
+    localToolConfiguration,
+    processManager,
+    workspaceFileSelector
+  });
+  return Object.freeze({ localToolConfiguration, processManager, workspaceFileSelector, services, tools: Object.freeze(createCliDefaultTools(enabled, { ptySupported: processManager.supportsPty() })) });
+}
+
+export function createCliDefaultTools(enabled?: readonly string[], host: { readonly ptySupported?: boolean } = {}): ToolDefinition[] {
   const tools = [
     listDirectoryTool,
     findFilesTool,
     readFilesTool,
     searchTextTool,
     applyPatchTool,
-    execCommandTool,
+    createExecCommandTool(host),
     writeStdinTool,
     stopProcessTool,
     viewImageTool,
@@ -333,7 +338,7 @@ function configuredCommandCheck(check: AgentCoreCheckConfiguration, requirement:
     ...(check.timeoutMs ? { timeoutMs: check.timeoutMs } : {}),
     async run(context) {
       if (!context.execution.runCommand) return { verdict: 'unknown', summary: `Verification command execution is unavailable: ${check.command}`, diagnostic: { kind: 'unavailable', message: 'Project command executor is unavailable.' } };
-      const result = await context.execution.runCommand({ command: check.command, ...(check.timeoutMs ? { timeoutMs: check.timeoutMs } : {}), ...(check.maxOutputBytes ? { maxOutputBytes: check.maxOutputBytes } : {}) }, context.signal);
+      const result = await context.execution.runCommand({ command: check.command, owner: { runId: context.runId, turnId: context.turnId, toolBatchId: `verification:${check.id}`, callIndex: 0 }, ...(check.timeoutMs ? { timeoutMs: check.timeoutMs } : {}), ...(check.maxOutputBytes ? { maxOutputBytes: check.maxOutputBytes } : {}) }, context.signal);
       return { verdict: result.exitCode === 0 ? 'passed' : 'failed', summary: `${check.command} ${result.exitCode === 0 ? 'passed' : `failed with exit ${String(result.exitCode)}`}.`, output: { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr, durationMs: result.durationMs } };
     }
   };
@@ -349,7 +354,6 @@ function parseOptions(args: string[]): { options: CliOptions; positionals: strin
     apply: false,
     dryRun: false,
     allowShell: false,
-    allowUnsafeShell: false,
     showReasoning: false,
     tui: false,
     plain: false,
@@ -385,7 +389,6 @@ const CLI_OPTION_SPECS = {
   '--apply': flagged(options => { options.apply = true; }),
   '--dry-run': flagged(options => { options.dryRun = true; }),
   '--allow-shell': flagged(options => { options.allowShell = true; }),
-  '--allow-unsafe-shell': flagged(options => { options.allowUnsafeShell = true; options.allowShell = true; }),
   '--show-reasoning': flagged(options => { options.showReasoning = true; }),
   '--tui': flagged(options => { options.tui = true; }),
   '--plain': flagged(options => { options.plain = true; }),
@@ -573,11 +576,8 @@ export function createCliToolPolicy(options: CliToolPolicyOptions): ToolPolicy {
   if (options.apply) {
     allowedRisks.push('write');
   }
-  if (options.allowShell || options.allowUnsafeShell) {
+  if (options.allowShell) {
     allowedRisks.push('execute');
-  }
-  if (options.allowUnsafeShell) {
-    allowedRisks.push('network', 'destructive');
   }
   return {
     allowedRisks: [...new Set(allowedRisks)],
@@ -586,10 +586,12 @@ export function createCliToolPolicy(options: CliToolPolicyOptions): ToolPolicy {
 }
 
 function toolPolicyFromOptions(options: CliOptions): ToolPolicy {
-  if (options.configuration) return {
-    allowedRisks: [...options.configuration.authorization.allowedRisks]
-  };
+  if (options.configuration) return createConfiguredCliToolPolicy(options.configuration, options.dryRun);
   return createCliToolPolicy(options);
+}
+
+export function createConfiguredCliToolPolicy(configuration: AgentCoreConfiguration, dryRun = false): ToolPolicy {
+  return Object.freeze({ allowedRisks: Object.freeze([...configuration.authorization.allowedRisks]), ...(dryRun ? { dryRunWrites: true } : {}) });
 }
 
 async function openSession(options: CliOptions, workspace: WorkspaceLayout, providerRuntime: CliProviderRuntime, persistedSessionId?: string): Promise<{ repository: JsonlSessionRepository; session: AgentSession }> {
@@ -931,8 +933,8 @@ export class CliProgressRenderer {
       this.finishReasoningLine();
       this.stderr.write(`[tool ${String(event.turnIndex)}] running ${formatToolCall(event.input)}\n`);
     } else if (event.type === 'tool.updated') {
-      const message = event.progress.message ?? event.progress.stage;
-      if (event.progress.stage !== 'executing') {
+      const message = cliProgressMessage(event.progress);
+      if (event.progress.type !== 'status' || event.progress.stage !== 'executing') {
         this.finishAnswerLine();
         this.finishReasoningLine();
         this.stderr.write(`[tool ${String(event.turnIndex)}] ${event.toolName}: ${message}\n`);
@@ -1070,6 +1072,15 @@ function reasoningFromEffort(effort: ModelReasoningEffort): ModelReasoningReques
   return effort === 'none' ? { strategy: 'disabled' } : { strategy: 'effort', effort };
 }
 
+function cliProgressMessage(progress: ToolProgress): string {
+  switch (progress.type) {
+    case 'status': return progress.message ?? progress.stage;
+    case 'output': return `${progress.stream}: ${progress.text}`;
+    case 'patch': return `patch ${String(progress.changes.length)} change${progress.changes.length === 1 ? '' : 's'}`;
+    case 'metric': return `${progress.name}: ${String(progress.value)}${progress.unit ? ` ${progress.unit}` : ''}`;
+  }
+}
+
 function printHelp(): void {
   console.log(`Agent Core CLI
 
@@ -1087,7 +1098,6 @@ Usage:
 Safety defaults:
   The agent does not write files unless --apply or --dry-run is supplied.
   The agent does not execute shell commands unless --allow-shell is supplied.
-  destructive shell patterns remain blocked unless --allow-unsafe-shell is supplied.
 
 Common options:
   --root <dir>           Workspace root. Default: current directory.
@@ -1106,8 +1116,7 @@ Common options:
   --plain                Use readline fallback for interactive mode.
   --apply                Allow file writes through confined edit/write tools.
   --dry-run              Validate writes without changing files.
-  --allow-shell          Allow non-destructive shell command execution.
-  --allow-unsafe-shell   Allow commands blocked by the shell safety filter. Does not imply --apply.
+  --allow-shell          Allow shell command execution. Does not imply --apply.
   --resume               Resume the latest session for this workspace.
   --session <path>       Open or create a specific session JSONL file.
   --branch <entry-id>    Branch the active session from a prior entry before running.

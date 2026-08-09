@@ -9,3 +9,5 @@ export * from './core/policy.js';
 export * from './core/prepare.js';
 export * from './core/registry.js';
 export * from './core/text.js';
+export * from './core/resources.js';
+export * from './core/resource-leases.js';

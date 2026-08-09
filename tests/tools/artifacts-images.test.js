@@ -4,6 +4,7 @@ import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { InMemoryArtifactRepository } from '@agent-core/evidence';
+import { LocalArtifactRepository } from '@agent-core/evidence/node';
 import { readArtifactTool, viewImageTool } from '@agent-core/tools-local';
 import { invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
 
@@ -44,4 +45,18 @@ test('view_image stores image bytes and returns an image content reference witho
   assert.equal(observation.content[0].detail, 'original');
   assert.equal(JSON.stringify(observation).includes('data:image'), false);
   assert.deepEqual(Buffer.from(await repository.readVerified(observation.output.artifact)), png);
+});
+
+test('artifact repositories verify small ranges without breaking UTF-8 boundaries', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-core-artifact-range-'));
+  for (const repository of [new InMemoryArtifactRepository(), new LocalArtifactRepository({ rootDir: root })]) {
+    const text = `prefix-${'x'.repeat(2_000_000)}-a🙂b-suffix`;
+    const artifact = await repository.store({ label: 'large-text', content: new TextEncoder().encode(text), mediaType: 'text/plain; charset=utf-8' });
+    const marker = new TextEncoder().encode(`prefix-${'x'.repeat(2_000_000)}-a`).byteLength;
+    const range = await repository.readVerifiedRange(artifact, { offset: marker + 1, length: 2 });
+    assert.equal(new TextDecoder('utf-8', { fatal: true }).decode(range.bytes), '🙂');
+    assert.equal(range.offset, marker);
+    assert.equal(range.end, marker + 4);
+    assert.equal(range.fullSize, artifact.size);
+  }
 });

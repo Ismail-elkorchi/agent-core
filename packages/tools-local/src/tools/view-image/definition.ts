@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { ArtifactRepository } from '@agent-core/evidence';
-import { defineTool, requireToolService, requireWorkspaceRoot, ToolInputError } from '@agent-core/tools';
+import { artifactScope, defineTool, requireToolService, requireWorkspaceRoot, ToolInputError, workspaceFileScope } from '@agent-core/tools';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
 import { assertRealPathInsideRoot, canonicalWorkspacePath, resolveInsideRoot } from '../../core/filesystem.js';
 import { viewImageInputSchema, viewImageOutputSchema } from './schema.js';
@@ -12,13 +12,14 @@ export const viewImageTool = defineTool({
   description: 'Load a workspace image as model image content without placing a data URL in the event log.',
   schema: viewImageInputSchema,
   outputSchema: viewImageOutputSchema,
+  requirements: { services: ['workspaceRoot', 'artifactRepository', 'localToolConfiguration'], modelInputModalities: ['image'] },
   effectEnvelope: { accesses: [{ mode: 'read', scope: 'workspace/files' }], lockScopes: [] },
   async canonicalizeInput(input, context) {
     return { ...input, path: await canonicalWorkspacePath(requireWorkspaceRoot(context), input.path) };
   },
   deriveEffects(input) {
     return {
-      accesses: [{ mode: 'read', scope: `workspace/files/${input.path}` }],
+      accesses: [{ mode: 'read', scope: workspaceFileScope(input.path) }],
       lockScopes: [],
       idempotency: 'pure'
     };
@@ -51,7 +52,7 @@ export const viewImageTool = defineTool({
       kind: 'result' as const,
       ok: true,
       summary: `Loaded image ${input.path} (${String(stat.size)} bytes).`,
-      scope: { resources: [`workspace/files/${input.path}`, `artifacts/${artifact.artifactId}`], coverage: 'complete' },
+      scope: { resources: [workspaceFileScope(input.path), artifactScope(artifact.artifactId)], coverage: 'complete' },
       content: [{ type: 'image' as const, artifact, detail: input.detail }],
       output
     };
@@ -79,5 +80,7 @@ function isArtifactRepository(value: unknown): value is ArtifactRepository {
   return typeof value === 'object' && value !== null
     && typeof (value as ArtifactRepository).store === 'function'
     && typeof (value as ArtifactRepository).readVerified === 'function'
+    && typeof (value as ArtifactRepository).readVerifiedRange === 'function'
+    && typeof (value as ArtifactRepository).storeProtected === 'function'
     && typeof (value as ArtifactRepository).resolve === 'function';
 }

@@ -14,6 +14,7 @@ const readFileResultSchema = z.strictObject({
   lineCount: z.int().nonnegative(),
   content: z.string(),
   bytes: z.int().nonnegative(),
+  fileBytes: z.int().nonnegative(),
   eof: z.boolean(),
   nextStartLine: z.int().min(1).optional(),
   rangeSha256: z.string().regex(/^[a-f0-9]{64}$/u),
@@ -23,7 +24,7 @@ const readFileResultSchema = z.strictObject({
 
 const readFileFailureSchema = z.strictObject({
   path: z.string(),
-  reason: z.enum(['not_found', 'not_file', 'binary', 'range_too_large', 'path_outside_workspace', 'unreadable']),
+  reason: z.enum(['not_found', 'not_file', 'binary', 'invalid_utf8', 'range_too_large', 'start_after_eof', 'batch_file_limit', 'batch_byte_limit', 'path_outside_workspace', 'unreadable']),
   message: z.string()
 });
 

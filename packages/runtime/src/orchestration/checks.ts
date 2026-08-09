@@ -37,6 +37,7 @@ export const EMPTY_EVIDENCE_READER: AgentEvidenceReader = Object.freeze({
 });
 
 export async function runAgentChecks(input: {
+  readonly runId: string;
   readonly checks: readonly AgentCheckDefinition[];
   readonly task: string;
   readonly instructions: readonly AgentEffectiveInstruction[];
@@ -67,6 +68,7 @@ export async function runAgentChecks(input: {
       timeoutMs,
       parentSignal: input.signal,
       context: {
+        runId: input.runId,
         task: input.task,
         instructions: input.instructions,
         candidate: input.candidate,

@@ -1,6 +1,6 @@
 import type { ToolCall, ToolDefinition } from './definition.js';
 import type { ToolPreparationContext } from './context.js';
-import { isToolAvailable, isRiskAllowed, type ToolRisk } from './policy.js';
+import { isRiskAllowed, type ToolRisk } from './policy.js';
 
 export type ToolResourceAccessMode = 'read' | 'write' | 'execute' | 'network' | 'delete';
 export type ToolIdempotency = 'pure' | 'idempotent' | 'non_idempotent';
@@ -43,10 +43,21 @@ export interface ToolAuthorizationRequest {
 
 export type ToolAuthorizer = (request: ToolAuthorizationRequest) => ToolAuthorizationDecision | Promise<ToolAuthorizationDecision>;
 
-export const POLICY_TOOL_AUTHORIZER: ToolAuthorizer = (request) => isToolAvailable(request.tool, request.context.policy)
-  && request.effects.accesses.every((access) => isRiskAllowed(request.context.policy, accessRisk(access.mode)))
+export const POLICY_TOOL_AUTHORIZER: ToolAuthorizer = (request) => request.effects.accesses.every((access) => isRiskAllowed(request.context.policy, accessRisk(access.mode)))
   ? { decision: 'allow', reason: 'Allowed by the configured tool policy.' }
   : { decision: 'deny', reason: `Tool ${request.tool.name} requires a resource access denied by the configured policy.` };
+
+export function deniedEffectRisks(effects: ToolEffects, policy: import('./policy.js').ToolPolicy): readonly ToolRisk[] {
+  return Object.freeze([...new Set(effects.accesses.map((access) => accessRisk(access.mode)).filter((risk) => !isRiskAllowed(policy, risk)))]);
+}
+
+export function enforceAllowedEffects(request: ToolAuthorizationRequest): ToolAuthorizationDecision | undefined {
+  const denied = deniedEffectRisks(request.effects, request.context.policy);
+  return denied.length === 0 ? undefined : {
+    decision: 'deny',
+    reason: 'Tool ' + request.tool.name + ' requires prohibited risk' + (denied.length === 1 ? '' : 's') + ': ' + denied.join(', ') + '.'
+  };
+}
 
 export function validateToolEffectEnvelope(value: unknown): ToolEffectEnvelope {
   if (!isRecord(value)) throw new Error('Tool effect envelope must be an object.');
@@ -93,7 +104,7 @@ export function accessRisk(mode: ToolResourceAccessMode): ToolRisk {
   return 'destructive';
 }
 
-function scopeContains(parent: string, child: string): boolean {
+export function scopeContains(parent: string, child: string): boolean {
   return parent === '*' || parent === child || child.startsWith(parent.endsWith('/') ? parent : `${parent}/`);
 }
 function validateResourceAccesses(value: unknown, label: string): readonly ToolResourceAccess[] {

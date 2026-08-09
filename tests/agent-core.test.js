@@ -112,6 +112,7 @@ test('runtime exposes artifact and image tools only with the required repository
     description: name,
     jsonSchema: { type: 'object' },
     outputSchema: emptyOutputSchema,
+    requirements: name === 'view_image' ? { services: ['artifactRepository'], modelInputModalities: ['image'] } : { services: ['artifactRepository'] },
     effectEnvelope: readEnvelope,
     decodeInput() { return { ok: true, input: {} }; },
     canonicalizeInput(input) { return input; },
@@ -155,19 +156,19 @@ test('tool progress from preparation and invocation remains separate from the fi
   const tool = {
     name: 'progress_tool', implementationId: 'tests/progress-tool@1', description: 'progress', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope,
     decodeInput() { return { ok: true, input: {} }; },
-    async canonicalizeInput(input, context) { await context.emitProgress?.({ stage: 'canonicalize' }); return input; },
+    async canonicalizeInput(input, context) { await context.emitProgress?.({ type: 'status', stage: 'canonicalize' }); return input; },
     deriveEffects() { return readEffects; },
-    async invoke(_input, context) { await context.emitProgress?.({ stage: 'invoke' }); return { kind: 'result', ok: true, output: {}, summary: 'done', scope: completeScope }; }
+    async invoke(_input, context) { await context.emitProgress?.({ type: 'status', stage: 'invoke' }); return { kind: 'result', ok: true, output: {}, summary: 'done', scope: completeScope }; }
   };
   const { agent, events } = await harness({
     tools: [tool],
     script: [response('tool_calls', '', { toolCalls: [{ id: 'progress', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }] }), response()],
-    onProgress(event) { if (event.type === 'tool.updated') progress.push(event.progress.stage); }
+    onProgress(event) { if (event.type === 'tool.updated' && event.progress.type === 'status') progress.push(event.progress.stage); }
   });
   const result = ended(await agent.run({ task: 'report progress' }));
   assert.deepEqual(progress.filter((stage) => stage === 'canonicalize' || stage === 'invoke'), ['canonicalize', 'invoke']);
   const persisted = await eventsFor(events, result.runId);
-  assert.deepEqual(persisted.filter((event) => event.type === 'tool.updated').map((event) => event.progress.stage).filter((stage) => stage === 'canonicalize' || stage === 'invoke'), ['canonicalize', 'invoke']);
+  assert.deepEqual(persisted.filter((event) => event.type === 'tool.updated' && event.progress.type === 'status').map((event) => event.progress.stage).filter((stage) => stage === 'canonicalize' || stage === 'invoke'), []);
   assert.equal(persisted.filter((event) => event.type === 'tool.ended').length, 1);
 });
 
@@ -192,7 +193,7 @@ test('oversized tool observations keep domain output intact in an artifact', asy
   const artifactId = observationEvent.immediatePresentation.results.artifact.artifactId;
   const artifact = await artifacts.resolve(artifactId);
   const stored = JSON.parse(new TextDecoder().decode(await artifacts.readVerified(artifact)));
-  assert.equal(stored.results.output.items.length, items.length);
+  assert.equal(stored.output.items.length, items.length);
 });
 
 async function eventsFor(repository, runId) {

@@ -125,11 +125,20 @@ function reduceToolStarted(state: AgentTuiState, event: ProgressEvent<'tool.star
 
 function reduceToolUpdated(state: AgentTuiState, event: ProgressEvent<'tool.updated'>): AgentTuiState {
   const id = toolActivityId(event);
-  const label = event.progress.message ?? event.progress.stage;
+  const label = progressLabel(event.progress);
   return upsertActivity(
     withWorking(state, 'Running tool'),
     updatedToolActivity(activity(state, id), id, event.toolName, label)
   );
+}
+
+function progressLabel(progress: import('@agent-core/tools').ToolProgress): string {
+  switch (progress.type) {
+    case 'status': return progress.message ?? progress.stage;
+    case 'output': return `${progress.stream}: ${progress.text}`;
+    case 'patch': return `Patch: ${String(progress.changes.length)} change${progress.changes.length === 1 ? '' : 's'}`;
+    case 'metric': return `${progress.name}: ${String(progress.value)}${progress.unit ? ` ${progress.unit}` : ''}`;
+  }
 }
 
 function reduceToolEnded(state: AgentTuiState, event: ProgressEvent<'tool.ended'>): AgentTuiState {

@@ -17,6 +17,7 @@ export const findFilesOutputSchema = z.strictObject({
   coverage: z.enum(['complete', 'partial']),
   causes: z.array(z.string()),
   counts: z.strictObject({ visited: z.int().nonnegative(), returned: z.int().nonnegative(), omitted: z.int().nonnegative() }),
+  omitted: z.strictObject({ ignoreFiles: z.int().nonnegative() }),
   omissionSamples: z.array(z.strictObject({
     path: z.string(),
     reason: z.enum(['hidden', 'gitignored', 'excluded', 'unreadable', 'limit']),
