@@ -294,20 +294,21 @@ test('read_files detects replacement, growth, and truncation of an opened file',
     await writeFile(target, 'line\n'.repeat(1_600_000));
     const configuration = { ...DEFAULT_LOCAL_TOOL_CONFIGURATION, readFiles: { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.readFiles, maxBytesPerFile: 16 * 1024 * 1024, maxTotalBytes: 16 * 1024 * 1024 } };
     const changingContext = { ...context, services: { ...context.services, localToolConfiguration: configuration } };
-    let iteration = 0;
-    const timer = setInterval(() => {
-      iteration += 1;
+    let mutated = false;
+    const emitProgress = async (progress) => {
+      if (mutated || progress.stage !== 'file_reading') return;
+      mutated = true;
       if (mutation === 'replace') {
-        const replacement = path.join(root, `replacement-${iteration}.txt`);
-        void writeFile(replacement, `replacement ${iteration}\n`).then(() => rename(replacement, target)).catch(() => undefined);
-      } else if (mutation === 'grow') void appendFile(target, `growth ${iteration}\n`).catch(() => undefined);
-      else void truncate(target, iteration % 2 === 0 ? 1024 : 2048).catch(() => undefined);
-    }, 1);
-    try {
-      const result = await invokeToolCall(jsonToolCall('read_files', { files: [{ path: 'changing.txt' }] }), tools, changingContext);
-      assert.equal(result.kind, 'result');
-      assert.equal(result.output.failures.some(failure => failure.reason === 'file_changed'), true, mutation);
-    } finally { clearInterval(timer); }
+        const replacement = path.join(root, 'replacement.txt');
+        await writeFile(replacement, 'replacement\n');
+        await rename(replacement, target);
+      } else if (mutation === 'grow') await appendFile(target, 'growth\n');
+      else await truncate(target, 1024);
+    };
+    const result = await invokeToolCall(jsonToolCall('read_files', { files: [{ path: 'changing.txt' }] }), tools, { ...changingContext, emitProgress });
+    assert.equal(mutated, true, mutation);
+    assert.equal(result.kind, 'result');
+    assert.equal(result.output.failures.some(failure => failure.reason === 'file_changed'), true, mutation);
   }
 });
 

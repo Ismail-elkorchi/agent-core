@@ -24,7 +24,7 @@ export async function readFiles(input: ReadFilesInput, context: ToolExecutionCon
       continue;
     }
     const lineCount = Math.min(request.lineCount ?? limits.maxLinesPerFile, limits.maxLinesPerFile);
-    const result = await readRange(root, request.path, request.startLine, lineCount, Math.min(limits.maxBytesPerFile, remainingBytes), remainingBytes < limits.maxBytesPerFile, context.signal);
+    const result = await readRange(root, request.path, request.startLine, lineCount, Math.min(limits.maxBytesPerFile, remainingBytes), remainingBytes < limits.maxBytesPerFile, context);
     if (result.ok) { files.push(result.value); remainingBytes -= result.value.bytes; }
     else failures.push(result.failure);
   }
@@ -79,7 +79,7 @@ function readFileEvidence(files: readonly ReadFileResult[], failures: readonly R
 }
 
 type RangeRead = { ok: true; value: ReadFileResult } | { ok: false; failure: ReadFileFailure };
-async function readRange(root: string, requestedPath: string, startLine: number, lineCount: number, maxBytes: number, batchLimited: boolean, signal?: AbortSignal): Promise<RangeRead> {
+async function readRange(root: string, requestedPath: string, startLine: number, lineCount: number, maxBytes: number, batchLimited: boolean, context: ToolExecutionContext): Promise<RangeRead> {
   let absolute: string;
   try { absolute = resolveInsideRoot(root, requestedPath); }
   catch (error) { return failure(requestedPath, 'path_outside_workspace', errorMessage(error)); }
@@ -93,6 +93,7 @@ async function readRange(root: string, requestedPath: string, startLine: number,
     const initialIdentity = fileIdentity(stat);
     try { await assertRealPathInsideRoot(root, absolute, requestedPath); }
     catch (error) { return failure(displayPath, 'path_outside_workspace', errorMessage(error)); }
+    await context.emitProgress?.({ type: 'status', stage: 'file_reading', message: `Reading stable file ${displayPath}.` });
     const selected: Buffer[] = [];
     const chunk = Buffer.allocUnsafe(64 * 1024);
     let position = 0;
@@ -102,12 +103,12 @@ async function readRange(root: string, requestedPath: string, startLine: number,
     let selectionEnd = 0;
     let lastByte: number | undefined;
     while (position < stat.size && selectedLines < lineCount) {
-      throwIfAborted(signal);
+      throwIfAborted(context.signal);
       const read = await handle.read(chunk, 0, Math.min(chunk.length, stat.size - position), position);
       if (read.bytesRead === 0) break;
       let cursor = 0;
       while (cursor < read.bytesRead && selectedLines < lineCount) {
-        throwIfAborted(signal);
+        throwIfAborted(context.signal);
         const newlineIndex = chunk.indexOf(0x0a, cursor);
         const hasNewline = newlineIndex >= 0 && newlineIndex < read.bytesRead;
         const end = hasNewline ? newlineIndex + 1 : read.bytesRead;
