@@ -325,9 +325,11 @@ test('read_files observes abort during a long streamed scan', async () => {
   const controller = new AbortController();
   const configuration = { ...DEFAULT_LOCAL_TOOL_CONFIGURATION, readFiles: { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.readFiles, maxBytesPerFile: 16 * 1024 * 1024, maxTotalBytes: 16 * 1024 * 1024 } };
   const promise = invokeToolCall(jsonToolCall('read_files', { files: [{ path: 'long.txt' }] }), tools, {
-    ...context, signal: controller.signal, services: { ...context.services, localToolConfiguration: configuration }
+    ...context,
+    signal: controller.signal,
+    services: { ...context.services, localToolConfiguration: configuration },
+    emitProgress(progress) { if (progress.stage === 'file_reading') controller.abort('cancel long read'); }
   });
-  setTimeout(() => controller.abort('cancel long read'), 1);
   await assert.rejects(promise, /cancel long read|aborted|abort/iu);
 });
 

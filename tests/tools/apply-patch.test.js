@@ -305,7 +305,7 @@ test('patch transactions preserve modes, roll back atomically, and recover inter
     removes: []
   }, { journalDirectory });
   assert.equal(committed.outcome, 'committed');
-  assert.equal((await stat(firstPath)).mode & 0o777, 0o744);
+  assert.equal((await stat(firstPath)).mode & 0o777, mode & 0o777);
 
   await writeFile(firstPath, 'old first\n');
   const fileSystem = {
