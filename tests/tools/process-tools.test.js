@@ -383,8 +383,8 @@ test('startup reconciliation stops an orphaned child process tree and resolves i
   const ledger = JSON.parse(await readFile(path.join(ledgerDirectory, ledgerName), 'utf8'));
   const manager = new ProcessManager({ artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts-recovered') }), ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
   const reconciliation = await manager.reconcileOrphanProcesses();
-  assert.equal(reconciliation.resolved.includes(processId), true);
-  assert.equal(reconciliation.unresolved.length, 0);
+  assert.equal(reconciliation.resolved.includes(processId), true, JSON.stringify(reconciliation));
+  assert.equal(reconciliation.unresolved.length, 0, JSON.stringify(reconciliation));
   assert.equal(typeof ledger.supervisorIdentity, 'string');
   assert.equal(typeof ledger.supervisorEndpoint, 'string');
   const reports = await manager.disposeRun('orphan-run');
@@ -462,8 +462,8 @@ test('supervisor handshake prevents user code before durable release and reconci
       ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process
     });
     const reconciliation = await manager.reconcileOrphanProcesses();
-    assert.equal(reconciliation.unresolved.length, 0);
-    assert.equal(reconciliation.resolved.includes(processId), true);
+    assert.equal(reconciliation.unresolved.length, 0, JSON.stringify(reconciliation));
+    assert.equal(reconciliation.resolved.includes(processId), true, JSON.stringify(reconciliation));
     const reports = await manager.disposeRun(`crash-${phase}`);
     assert.equal(reports.length, 1);
     assert.equal(phase === 'ledger_persisted' ? reports[0].result.status === 'failed' : reports[0].result.status === 'stopped', true);
@@ -486,7 +486,7 @@ test('local host durably hands recovered terminal reports to old runs during sta
     async deliverRecoveredTerminalReport(report) { delivered.push(report); return true; }
   });
   await host.ready();
-  assert.equal(delivered.length, 1);
+  assert.equal(delivered.length, 1, JSON.stringify(await host.reconciliation()));
   assert.equal(delivered[0].result.processId, processId);
   assert.equal(delivered[0].result.owner.runId, 'orphan-run');
   assert.deepEqual(await readdir(path.join(root, 'processes')), []);

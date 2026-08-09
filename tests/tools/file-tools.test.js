@@ -126,9 +126,12 @@ test('directory traversal continues with partial coverage after an unreadable br
   t.after(async () => chmod(path.join(root, 'unreadable'), 0o700));
   const result = await invokeToolCall(jsonToolCall('list_directory', { depth: 2 }), tools, context);
   assert.equal(result.output.entries.some((entry) => entry.path === 'readable/kept.txt'), true);
-  if (process.getuid?.() !== 0) {
+  if (process.getuid !== undefined && process.getuid() !== 0) {
     assert.equal(result.output.coverage, 'partial');
     assert.equal(result.output.omissionSamples.some((entry) => entry.reason === 'unreadable'), true);
+  } else {
+    assert.equal(result.output.coverage, 'complete');
+    assert.equal(result.output.entries.some((entry) => entry.path === 'unreadable/hidden.txt'), true);
   }
 });
 
@@ -301,7 +304,11 @@ test('read_files detects replacement, growth, and truncation of an opened file',
       if (mutation === 'replace') {
         const replacement = path.join(root, 'replacement.txt');
         await writeFile(replacement, 'replacement\n');
-        await rename(replacement, target);
+        try { await rename(replacement, target); }
+        catch (error) {
+          if (process.platform !== 'win32' || error?.code !== 'EPERM') throw error;
+          await writeFile(target, 'replacement\n');
+        }
       } else if (mutation === 'grow') await appendFile(target, 'growth\n');
       else await truncate(target, 1024);
     };

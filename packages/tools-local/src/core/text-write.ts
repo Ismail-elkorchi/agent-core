@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
+import process from 'node:process';
 import { hostname } from 'node:os';
 import { throwIfAborted } from '@agent-core/tools';
 import { assertPathIsNotSymlink, resolveInsideRoot } from './filesystem.js';
@@ -291,7 +292,8 @@ async function syncDirectory(directory: string, io: TextWriteFileSystem): Promis
   try {
     await handle.sync();
   } catch (error) {
-    if (!['EINVAL', 'ENOTSUP', 'EBADF'].includes(nodeCode(error) ?? '')) throw error;
+    const code = nodeCode(error) ?? '';
+    if (!['EINVAL', 'ENOTSUP', 'EBADF'].includes(code) && !(process.platform === 'win32' && code === 'EPERM')) throw error;
   } finally {
     await handle.close();
   }

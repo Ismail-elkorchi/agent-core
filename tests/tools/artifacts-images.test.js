@@ -56,7 +56,13 @@ test('view_image rejects replacement, growth, truncation, invalid headers, and e
       async emitProgress(progress) {
         if (progress.stage !== 'image_reading' || changed) return;
         changed = true;
-        if (mutation === 'replacement') await rename(path.join(root, 'replacement.png'), target);
+        if (mutation === 'replacement') {
+          try { await rename(path.join(root, 'replacement.png'), target); }
+          catch (error) {
+            if (process.platform !== 'win32' || error?.code !== 'EPERM') throw error;
+            await writeFile(target, pngBytes(4, 5));
+          }
+        }
         else if (mutation === 'growth') await appendFile(target, Buffer.from([0]));
         else await truncate(target, 10);
       }
