@@ -1,6 +1,8 @@
 import type { ToolCall, ToolDefinition } from './definition.js';
 import type { ToolPreparationContext } from './context.js';
 import { isRiskAllowed, type ToolRisk } from './policy.js';
+import { validateResourceScope } from './resources.js';
+import { parseJsonObject } from '@agent-core/evidence';
 
 export type ToolResourceAccessMode = 'read' | 'write' | 'execute' | 'network' | 'delete';
 export type ToolIdempotency = 'pure' | 'idempotent' | 'non_idempotent';
@@ -43,9 +45,12 @@ export interface ToolAuthorizationRequest {
 
 export type ToolAuthorizer = (request: ToolAuthorizationRequest) => ToolAuthorizationDecision | Promise<ToolAuthorizationDecision>;
 
-export const POLICY_TOOL_AUTHORIZER: ToolAuthorizer = (request) => request.effects.accesses.every((access) => isRiskAllowed(request.context.policy, accessRisk(access.mode)))
-  ? { decision: 'allow', reason: 'Allowed by the configured tool policy.' }
-  : { decision: 'deny', reason: `Tool ${request.tool.name} requires a resource access denied by the configured policy.` };
+export const POLICY_TOOL_AUTHORIZER: ToolAuthorizer = (request) => {
+  const denied = deniedEffectRisks(request.effects, request.context.policy);
+  return denied.length === 0
+    ? { decision: 'allow', reason: 'Allowed by the configured tool policy.' }
+    : { decision: 'deny', reason: `Tool ${request.tool.name} requires prohibited risk${denied.length === 1 ? '' : 's'}: ${denied.join(', ')}.` };
+};
 
 export function deniedEffectRisks(effects: ToolEffects, policy: import('./policy.js').ToolPolicy): readonly ToolRisk[] {
   return Object.freeze([...new Set(effects.accesses.map((access) => accessRisk(access.mode)).filter((risk) => !isRiskAllowed(policy, risk)))]);
@@ -60,23 +65,25 @@ export function enforceAllowedEffects(request: ToolAuthorizationRequest): ToolAu
 }
 
 export function validateToolEffectEnvelope(value: unknown): ToolEffectEnvelope {
-  if (!isRecord(value)) throw new Error('Tool effect envelope must be an object.');
-  const accesses = validateResourceAccesses(value.accesses, 'effect envelope');
-  const lockScopes = validateScopes(value.lockScopes, 'effect envelope lockScopes');
+  const record = parseJsonObject(value, { maxDepth: 8, maxCollectionEntries: 10_000, maxStringBytes: 16_000, maxTotalBytes: 1_000_000 });
+  const accesses = validateResourceAccesses(record.accesses, 'effect envelope');
+  const lockScopes = validateScopes(record.lockScopes, 'effect envelope lockScopes');
   return Object.freeze({ accesses, lockScopes });
 }
 
 export function validateToolEffects(value: unknown): ToolEffects {
-  if (!isRecord(value)) throw new Error('Tool effects must be an object.');
-  const accesses = validateResourceAccesses(value.accesses, 'effects');
-  const lockScopes = validateScopes(value.lockScopes, 'effect lockScopes');
-  if (!isToolIdempotency(value.idempotency)) throw new Error('Invalid tool idempotency.');
-  if (value.idempotency === 'idempotent' && (typeof value.idempotencyKey !== 'string' || value.idempotencyKey.trim().length === 0)) throw new Error('Idempotent tool effects require a non-empty idempotencyKey.');
-  if (value.idempotency !== 'idempotent' && value.idempotencyKey !== undefined) throw new Error('Only idempotent tool effects may declare idempotencyKey.');
-  const dependsOnCallIndices = value.dependsOnCallIndices === undefined ? undefined : validateDependencies(value.dependsOnCallIndices);
+  const record = parseJsonObject(value, { maxDepth: 8, maxCollectionEntries: 10_000, maxStringBytes: 16_000, maxTotalBytes: 1_000_000 });
+  const accesses = validateResourceAccesses(record.accesses, 'effects');
+  const lockScopes = validateScopes(record.lockScopes, 'effect lockScopes');
+  if (!isToolIdempotency(record.idempotency)) throw new Error('Invalid tool idempotency.');
+  const dependsOnCallIndices = record.dependsOnCallIndices === undefined ? undefined : validateDependencies(record.dependsOnCallIndices);
   const base = { accesses, lockScopes, ...(dependsOnCallIndices === undefined ? {} : { dependsOnCallIndices }) };
-  if (value.idempotency === 'idempotent') return Object.freeze({ ...base, idempotency: 'idempotent', idempotencyKey: String(value.idempotencyKey) });
-  return Object.freeze({ ...base, idempotency: value.idempotency });
+  if (record.idempotency === 'idempotent') {
+    if (typeof record.idempotencyKey !== 'string' || record.idempotencyKey.trim().length === 0) throw new Error('Idempotent tool effects require a non-empty idempotencyKey.');
+    return Object.freeze({ ...base, idempotency: 'idempotent', idempotencyKey: record.idempotencyKey });
+  }
+  if (record.idempotencyKey !== undefined) throw new Error('Only idempotent tool effects may declare idempotencyKey.');
+  return Object.freeze({ ...base, idempotency: record.idempotency });
 }
 
 export function assertEffectsWithinEnvelope(effects: ToolEffects, envelope: ToolEffectEnvelope): void {
@@ -111,15 +118,17 @@ function validateResourceAccesses(value: unknown, label: string): readonly ToolR
   if (!Array.isArray(value)) throw new Error(`Tool ${label} accesses must be an array.`);
   const accesses = value.map((item) => {
     if (!isRecord(item) || !isAccessMode(item.mode) || typeof item.scope !== 'string' || item.scope.trim().length === 0) throw new Error(`Tool ${label} contains an invalid resource access.`);
-    return Object.freeze({ mode: item.mode, scope: item.scope });
+    return Object.freeze({ mode: item.mode, scope: validateResourceScope(item.scope) });
   });
+  const identities = accesses.map((access) => `${access.mode}\0${access.scope}`);
+  if (new Set(identities).size !== identities.length) throw new Error(`Tool ${label} resource accesses must be unique.`);
   return Object.freeze(accesses);
 }
 function validateScopes(value: unknown, label: string): readonly string[] {
   if (!Array.isArray(value)) throw new Error(`Tool ${label} must be an array.`);
   const scopes = value.map((scope) => {
     if (typeof scope !== 'string' || scope.trim().length === 0) throw new Error(`Tool ${label} requires non-empty scopes.`);
-    return scope;
+    return validateResourceScope(scope);
   });
   if (new Set(scopes).size !== scopes.length) throw new Error(`Tool ${label} scopes must be unique.`);
   return Object.freeze(scopes);

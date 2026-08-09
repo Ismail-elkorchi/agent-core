@@ -7,7 +7,7 @@
   "types": "./dist/index.d.ts",
   "exports": { ".": "./dist/index.js" },
   "files": ["dist", "README.md"],
-  "engines": { "node": ">=24" },
+  "engines": { "node": ">=24.8.0" },
   "dependencies": {
     "@agent-core/evidence": "0.2.0",
     "zod": "^4.4.3"

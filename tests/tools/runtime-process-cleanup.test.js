@@ -86,7 +86,69 @@ test('cleanup failure becomes terminal runtime_error and still commits run.ended
   assert.equal(result.state, 'ended');
   assert.equal(result.terminal.executionStatus, 'failed');
   assert.match(result.terminal.errorMessage, /cleanup broke/u);
+  assert.equal(result.terminal.candidate.status, 'complete');
+  assert.equal(result.terminal.candidate.message, 'done');
+  assert.equal(result.terminal.turnCount, 1);
+  assert.equal(result.terminal.modelTerminationReason, 'stop');
+  assert.deepEqual(result.terminal.cleanupDiagnostic, { kind: 'process_cleanup', message: 'cleanup broke' });
   assert.equal((await records(state.events, 'cleanup-failure-run')).at(-1).type, 'run.ended');
+});
+
+test('natural process exit is persisted exactly once even when the model never polls it', async () => {
+  const state = await setup();
+  const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify('process.exit(0)')}`;
+  const agent = createRuntime({ ...state, provider: new Provider([toolResponse('exec_command', { command, yieldMs: 1_000 }), done]), tools: [execCommandTool] });
+  const result = await agent.run({ runId: 'natural-exit-run', task: 'let process exit' });
+  assert.equal(result.state, 'ended');
+  const persisted = await records(state.events, 'natural-exit-run');
+  const ended = persisted.filter(event => event.type === 'process.ended');
+  assert.equal(ended.length, 1);
+  assert.equal(ended[0].status, 'exited');
+  assert.equal(ended[0].result.artifact.visibility, 'public');
+  assert.equal(ended[0].result.protectedArtifact.visibility, 'protected');
+  assert.deepEqual(await state.manager.disposeRun('natural-exit-run'), []);
+});
+
+test('cleanup failure transforms prior partial, checked, and aborted decisions without erasing their truth', async () => {
+  const cases = [
+    {
+      runId: 'partial-cleanup', provider: new Provider([{ ...done, content: 'partial answer', terminationReason: 'output_limit' }]),
+      assertTerminal(terminal) { assert.equal(terminal.candidate.status, 'partial'); assert.equal(terminal.modelTerminationReason, 'output_limit'); }
+    },
+    {
+      runId: 'checked-cleanup', provider: new Provider([done]),
+      checks: [
+        { id: 'required-pass', requirement: 'required', async run() { return { verdict: 'passed', summary: 'passed' }; } },
+        { id: 'advisory-fail', requirement: 'advisory', async run() { return { verdict: 'failed', summary: 'failed advisory' }; } }
+      ],
+      assertTerminal(terminal) { assert.deepEqual(terminal.checkResults.map(item => [item.id, item.verdict]), [['required-pass', 'passed'], ['advisory-fail', 'failed']]); }
+    }
+  ];
+  for (const item of cases) {
+    const state = await setup();
+    const failingManager = { resourceLeases: state.manager.resourceLeases, capabilities: () => ['process'], async disposeRun() { throw new Error('cleanup failed'); } };
+    const agent = new AgentRuntime({
+      provider: item.provider, model: 'scripted', toolBoundary: boundary, repositories: { events: state.events, artifacts: state.artifacts },
+      toolContext: { services: { ...state.services, processManager: failingManager } }, ...(item.checks ? { checks: item.checks } : {})
+    });
+    const result = await agent.run({ runId: item.runId, task: 'preserve prior decision' });
+    assert.equal(result.state, 'ended');
+    assert.equal(result.terminal.executionStatus, 'failed');
+    assert.equal(result.terminal.terminationReason, 'runtime_error');
+    assert.equal(result.terminal.turnCount, 1);
+    assert.match(result.terminal.errorMessage, /cleanup failed/u);
+    item.assertTerminal(result.terminal);
+  }
+
+  const state = await setup();
+  const failingManager = { resourceLeases: state.manager.resourceLeases, capabilities: () => ['process'], async disposeRun() { throw new Error('cleanup failed'); } };
+  const agent = createRuntime({ ...state, provider: new Provider([done]), services: { ...state.services, processManager: failingManager } });
+  const controller = new AbortController(); controller.abort('already aborted');
+  const result = await agent.run({ runId: 'aborted-cleanup', task: 'abort', signal: controller.signal });
+  assert.equal(result.state, 'ended');
+  assert.equal(result.terminal.executionStatus, 'failed');
+  assert.equal(result.terminal.candidate.status, 'absent');
+  assert.match(result.terminal.errorMessage, /already aborted.*cleanup failed/iu);
 });
 
 test('two runtimes sharing one manager clean only their own processes', async () => {

@@ -51,6 +51,22 @@ test('an allowed write may require approval but approval never adds a denied ris
   assert.equal(denied.decision, 'deny');
 });
 
+test('delete may require approval only when destructive authority is already allowed', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-core-delete-approval-'));
+  const call = { name: 'apply_patch', input: { kind: 'text', value: '*** Begin Patch\n*** Delete File: delete.txt\n*** End Patch' } };
+  const services = { workspaceRoot: root, patchTransaction: true, localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION };
+  const allowedPolicy = { allowedRisks: ['read', 'write', 'destructive'] };
+  const allowed = await prepared(call, [applyPatchTool], allowedPolicy, services);
+  assert.equal(enforceAllowedEffects(request(call, allowed, allowedPolicy, services)), undefined);
+  const approval = enforceAllowedEffects(request(call, allowed, allowedPolicy, services)) ?? { decision: 'require_approval', reason: 'confirm delete' };
+  assert.equal(approval.decision, 'require_approval');
+
+  const writeOnlyPolicy = { allowedRisks: ['read', 'write'] };
+  const denial = enforceAllowedEffects(request(call, allowed, writeOnlyPolicy, services));
+  assert.equal(denial.decision, 'deny');
+  assert.match(denial.reason, /delete|destructive/iu);
+});
+
 test('a mixed-access call is denied when any one derived access is prohibited', async () => {
   const mixed = defineTool({
     name: 'mixed', implementationId: 'tests/mixed@1', description: 'mixed', schema: z.strictObject({}), outputSchema: z.strictObject({}),

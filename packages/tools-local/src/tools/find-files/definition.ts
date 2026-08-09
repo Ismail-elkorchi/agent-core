@@ -2,6 +2,7 @@ import { defineTool, requireWorkspaceRoot, workspaceFileScope } from '@agent-cor
 import { canonicalWorkspacePath } from '../../core/filesystem.js';
 import { workspaceFileSelector } from '../../core/workspace-file-selection.js';
 import { presentFindFilesObservation } from '../../core/presenters.js';
+import { builtInReadEvidence } from '../../core/read-evidence.js';
 import { findFilesInputSchema, findFilesOutputSchema, type FindFilesInput } from './schema.js';
 
 interface CanonicalFindFilesInput extends FindFilesInput { readonly path: string }
@@ -42,11 +43,13 @@ export const findFilesTool = defineTool({
       omitted: { ignoreFiles: selected.omittedIgnoreFiles },
       omissionSamples: [...selected.omissionSamples]
     };
+    const scope = { resources: [workspaceFileScope(output.path)], coverage: output.coverage, filters: { patterns: input.patterns, exclude: input.exclude, type: input.type }, ...(output.causes.length > 0 ? { causes: output.causes, omitted: { entries: output.counts.omitted } } : {}) } as const;
     return {
       kind: 'result' as const,
       ok: true,
       summary: `Found ${String(output.counts.returned)} paths under ${output.path}${output.coverage === 'partial' ? ' with partial coverage' : ''}.`,
-      scope: { resources: [workspaceFileScope(output.path)], coverage: output.coverage, ...(output.causes.length > 0 ? { causes: output.causes, omitted: { entries: output.counts.omitted } } : {}) },
+      scope,
+      evidence: builtInReadEvidence('search', scope, `Found ${String(output.counts.returned)} matching paths.`),
       output
     };
   }

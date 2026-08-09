@@ -1,4 +1,5 @@
 import type { ModelInputModality, ToolDefinition, ToolRequirements } from './definition.js';
+import { parseJsonObject } from '@agent-core/evidence';
 
 export const WORKSPACE_FILES_SCOPE = 'workspace/files';
 export const WORKSPACE_PROCESSES_SCOPE = 'workspace/processes';
@@ -9,14 +10,13 @@ export function workspaceFileScope(relativePath = ''): string { return scoped(WO
 export function workspaceProcessScope(processId = ''): string { return scoped(WORKSPACE_PROCESSES_SCOPE, processId); }
 export function artifactScope(artifactId = ''): string { return scoped(ARTIFACTS_SCOPE, artifactId); }
 export function validateResourceScope(value: string): string {
-  const normalized = value.replaceAll('\\', '/').replace(/^\.\/+/u, '').replace(/\/+$/u, '');
-  if (normalized.length === 0 || normalized.split('/').some((part) => part.length === 0 || part === '.' || part === '..')) throw new Error('Invalid resource scope: ' + value);
-  return normalized;
+  if (value.length === 0 || value.trim() !== value || value.includes('\\') || value.endsWith('/')
+    || value.split('/').some((part) => part.length === 0 || part === '.' || part === '..')) throw new Error('Invalid resource scope: ' + value);
+  return value;
 }
 export function validateToolRequirements(value: unknown): ToolRequirements | undefined {
   if (value === undefined) return undefined;
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('Tool requirements must be an object.');
-  const record = value as Record<string, unknown>;
+  const record = parseJsonObject(value, { maxDepth: 4, maxCollectionEntries: 1_000, maxStringBytes: 16_000, maxTotalBytes: 100_000 });
   const unknown = Object.keys(record).filter((key) => key !== 'services' && key !== 'modelInputModalities' && key !== 'hostCapabilities');
   if (unknown.length > 0) throw new Error('Tool requirements contain unsupported fields: ' + unknown.join(', ') + '.');
   const services = strings(record.services, 'services');

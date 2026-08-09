@@ -19,12 +19,16 @@ const matchSchema = z.strictObject({
   context: z.strictObject({ before: z.array(z.string()), after: z.array(z.string()) }).optional()
 });
 const countSchema = z.strictObject({ path: z.string(), matchingLineCount: z.int().nonnegative(), occurrenceCount: z.int().nonnegative() });
+const perFileOmissionSchema = z.strictObject({
+  path: z.string(), cause: z.literal('per_file_limit'), retainedMatches: z.int().nonnegative(), omittedAtLeast: z.int().positive()
+});
 const common = {
   query: z.string(),
   status: z.enum(['completed', 'partial', 'invalid_pattern', 'missing_ripgrep', 'io_error', 'aborted', 'output_limit', 'failed']),
   diagnostic: z.string().optional(), coverage: z.enum(['complete', 'partial']),
   examinedFileCount: z.int().nonnegative(), matchingFileCount: z.int().nonnegative(), matchingLineCount: z.int().nonnegative(),
-  occurrenceCount: z.int().nonnegative(), omittedResultCount: z.int().nonnegative()
+  occurrenceCount: z.int().nonnegative(), omittedResultCount: z.int().nonnegative(),
+  countsCapped: z.boolean(), omittedResultCountIsLowerBound: z.boolean(), outputTruncated: z.boolean(), perFileOmissions: z.array(perFileOmissionSchema)
 };
 export const searchTextOutputSchema = z.discriminatedUnion('mode', [
   z.strictObject({ ...common, mode: z.literal('files'), results: z.array(z.string()) }),

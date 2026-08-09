@@ -10,7 +10,8 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./testing/text-write": "./dist/core/text-write.js"
+    "./testing/text-write": "./dist/core/text-write.js",
+    "./testing/apply-patch": "./dist/testing/apply-patch.js"
   },
   "files": [
     "dist",
@@ -18,7 +19,7 @@
   ],
   "sideEffects": false,
   "engines": {
-    "node": ">=24"
+    "node": ">=24.8.0"
   },
   "dependencies": {
     "@agent-core/evidence": "0.2.0",

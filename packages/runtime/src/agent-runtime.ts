@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { type ContextHistoryReduction, type ContextItemInput, ContextManager } from './context/manager.js';
-import { hashRecord, normalizeJsonSafe } from '@agent-core/evidence';
+import { hashRecord, normalizeJsonSafe, parseJsonValue } from '@agent-core/evidence';
 import {
   ModelContractError,
   type ModelProfile,
@@ -60,6 +60,7 @@ import type { AgentEvent, AgentProgressEvent } from './events.js';
 import type { AgentRuntimeRepositories } from './ports.js';
 import { BudgetAccountant, type RequestCostEstimate, type RequestWindow } from './orchestration/budget-accountant.js';
 import { AgentVerificationAbortedError, runAgentChecks } from './orchestration/checks.js';
+import { contextEvidenceExecution } from './orchestration/context-evidence.js';
 import { summarizeModelRequest, summarizeModelResponse, summarizeProviderState, summarizeRunConfiguration } from './orchestration/event-summaries.js';
 import { AgentRunFinalizer } from './orchestration/finalization.js';
 import {
@@ -207,9 +208,9 @@ interface CompletedModelAttempt { readonly response: ModelResponse; readonly ide
 type RequestAssemblyResult = { readonly ok: true; readonly request: ModelRequest; readonly estimate: RequestCostEstimate; readonly snapshot: AgentRequestSnapshotRecord } | { readonly ok: false; readonly diagnostic: OverflowDiagnostic };
 
 type TerminalDecision =
-  | { readonly executionStatus: 'completed'; readonly terminationReason: 'model_completed' | 'model_output_limit' | 'content_filtered' | 'unknown_model_termination'; readonly candidate: AgentPresentCandidate; readonly turnCount: number; readonly checkResults: readonly AgentCheckResult[]; readonly modelTerminationReason: ModelResponse['terminationReason']; readonly providerTerminationReason?: string }
-  | { readonly executionStatus: 'failed'; readonly terminationReason: 'model_output_limit' | 'content_filtered' | 'unknown_model_termination' | 'empty_response' | 'malformed_response' | 'provider_error' | 'runtime_error' | 'stream_interrupted' | 'request_too_large' | 'limit_exhausted' | 'uncertain_tool_effect'; readonly candidate: AgentCandidate; readonly errorMessage: string; readonly turnCount: number; readonly checkResults: readonly AgentCheckResult[]; readonly modelTerminationReason?: ModelResponse['terminationReason']; readonly providerTerminationReason?: string; readonly exhaustedLimit?: AgentLimitExceededError['limit']; readonly diagnostic?: ModelProviderErrorDiagnostic & { readonly turnIndex?: number } }
-  | { readonly executionStatus: 'aborted'; readonly terminationReason: 'aborted'; readonly candidate: AgentCandidate; readonly errorMessage: string; readonly turnCount: number; readonly checkResults: readonly AgentCheckResult[]; readonly diagnostic?: ModelProviderErrorDiagnostic & { readonly turnIndex?: number } };
+  | { readonly executionStatus: 'completed'; readonly terminationReason: 'model_completed' | 'model_output_limit' | 'content_filtered' | 'unknown_model_termination'; readonly candidate: AgentPresentCandidate; readonly turnCount: number; readonly checkResults: readonly AgentCheckResult[]; readonly modelTerminationReason: ModelResponse['terminationReason']; readonly providerTerminationReason?: string; readonly cleanupDiagnostic?: { readonly kind: 'process_cleanup'; readonly message: string } }
+  | { readonly executionStatus: 'failed'; readonly terminationReason: 'model_output_limit' | 'content_filtered' | 'unknown_model_termination' | 'empty_response' | 'malformed_response' | 'provider_error' | 'runtime_error' | 'stream_interrupted' | 'request_too_large' | 'limit_exhausted' | 'uncertain_tool_effect'; readonly candidate: AgentCandidate; readonly errorMessage: string; readonly turnCount: number; readonly checkResults: readonly AgentCheckResult[]; readonly modelTerminationReason?: ModelResponse['terminationReason']; readonly providerTerminationReason?: string; readonly exhaustedLimit?: AgentLimitExceededError['limit']; readonly diagnostic?: ModelProviderErrorDiagnostic & { readonly turnIndex?: number }; readonly cleanupDiagnostic?: { readonly kind: 'process_cleanup'; readonly message: string } }
+  | { readonly executionStatus: 'aborted'; readonly terminationReason: 'aborted'; readonly candidate: AgentCandidate; readonly errorMessage: string; readonly turnCount: number; readonly checkResults: readonly AgentCheckResult[]; readonly diagnostic?: ModelProviderErrorDiagnostic & { readonly turnIndex?: number }; readonly cleanupDiagnostic?: { readonly kind: 'process_cleanup'; readonly message: string } };
 type ExecutionDecision = TerminalDecision | { readonly executionStatus: 'waiting_for_approval'; readonly approvals: readonly AgentApprovalRequest[] };
 
 interface ResumeExecutionState {
@@ -415,10 +416,10 @@ export class AgentRuntime {
         await emit({ type: 'run.phase.changed', phase: 'waiting_for_approval', budget });
         return Object.freeze({ state: 'suspended', reason: 'approval_required', runId, finalizationId, pendingApprovals: decision.approvals, budget });
       }
-      decision = cleanupFailureDecision(cleanupError);
+      decision = cleanupFailureDecision(undefined, cleanupError);
     } else {
       const cleanupError = await this.disposeOwnedProcesses(runId, append);
-      if (cleanupError) decision = cleanupFailureDecision(cleanupError);
+      if (cleanupError) decision = cleanupFailureDecision(decision, cleanupError);
     }
     await this.enterPhase(runId, controller, 'finalizing', append, emit);
     decision = decisionBeforeFinalization(decision, signal);
@@ -559,7 +560,7 @@ export class AgentRuntime {
           }
           await this.enterPhase(runtime.runId, runtime.controller, 'verifying', runtime.append, runtime.emit);
           checkResults.push(...await runAgentChecks({ runId: runtime.runId, checks: this.checks, task: runtime.input.task, instructions: snapshot.instructions, candidate: activeCandidate, ...turnIdentity(snapshot.record), signal: runtime.signal,
-            ...(this.options.metadata ? { metadata: this.options.metadata } : {}), ...(this.options.verification ? { execution: this.options.verification } : {}),
+            ...(this.options.metadata ? { metadata: this.options.metadata } : {}), execution: contextEvidenceExecution({ contextManager, ...(this.options.repositories.artifacts ? { artifacts: this.options.repositories.artifacts } : {}), ...(this.options.verification ? { configured: this.options.verification } : {}) }),
             append: runtime.append, emit: runtime.emit }));
           return completedDecision(activeCandidate, turnIndex, checkResults, response);
         }
@@ -570,7 +571,7 @@ export class AgentRuntime {
         const toolDeadline = runSignalDeadline(runtime.controller, runtime.signal);
         let toolResult;
         try {
-          toolResult = await executeAssistantToolCalls({ runId: runtime.runId, ...turnIdentity(snapshot.record), toolBatchId, toolCalls, tools: this.tools, toolContext: this.toolContext(toolDeadline.signal), resourceLeases: this.resourceLeases,
+          toolResult = await executeAssistantToolCalls({ runId: runtime.runId, ...turnIdentity(snapshot.record), toolBatchId, toolCalls, tools: this.tools, toolContext: this.toolContext(toolDeadline.signal), resourceLeases: this.resourceLeases, modelInputModalities: snapshot.profile.modalities.input,
             ...(this.options.toolAuthorizer ? { authorizer: this.options.toolAuthorizer } : {}), contextManager, observationStore,
             ...(this.options.repositories.session ? { session: this.options.repositories.session } : {}), controller: runtime.controller, append: runtime.append, emit: runtime.emit });
         } finally { toolDeadline.dispose(); }
@@ -591,6 +592,7 @@ export class AgentRuntime {
   }
 
   private async resumeToolBatch(runtime: RunExecutionRuntime & { readonly resume: ResumeExecutionState }, contextManager: ContextManager, observationStore: ObservationStore, checkResults: readonly AgentCheckResult[]): Promise<TerminalDecision | undefined> {
+    const profile = parseModelProfile(await this.options.provider.describeModel(this.runtimeModel));
     const batchIdentity = { ...runtime.resume.identity, toolBatchId: runtime.resume.toolBatchId };
     runtime.controller.transition('requesting_model', runtime.resume.identity);
     runtime.controller.transition('executing_tools', batchIdentity);
@@ -602,7 +604,7 @@ export class AgentRuntime {
     const toolDeadline = runSignalDeadline(runtime.controller, runtime.signal);
     let resumedTools;
     try {
-      resumedTools = await executeAssistantToolCalls({ runId: runtime.runId, ...batchIdentity, toolCalls: runtime.resume.toolCalls, tools: this.tools, toolContext: this.toolContext(toolDeadline.signal), resourceLeases: this.resourceLeases, authorizationOverrides: runtime.resume.overrides, recovery: runtime.resume.recovery, resuming: true,
+      resumedTools = await executeAssistantToolCalls({ runId: runtime.runId, ...batchIdentity, toolCalls: runtime.resume.toolCalls, tools: this.tools, toolContext: this.toolContext(toolDeadline.signal), resourceLeases: this.resourceLeases, modelInputModalities: profile.modalities.input, authorizationOverrides: runtime.resume.overrides, recovery: runtime.resume.recovery, resuming: true,
         ...(this.options.toolAuthorizer ? { authorizer: this.options.toolAuthorizer } : {}), contextManager, observationStore,
         ...(this.options.repositories.session ? { session: this.options.repositories.session } : {}), controller: runtime.controller, append: runtime.append, emit: runtime.emit });
     } finally { toolDeadline.dispose(); }
@@ -929,14 +931,18 @@ export class AgentRuntime {
       hostCapabilities: processCapabilities(context.services?.processManager)
     }));
   }
-  private async disposeOwnedProcesses(runId: string, append: (event: AgentEvent) => Promise<unknown>): Promise<Error | undefined> {
+  private async disposeOwnedProcesses(runId: string, append: (event: AgentEvent, idempotencyKey?: string) => Promise<unknown>): Promise<Error | undefined> {
     const service = this.options.toolContext?.services?.processManager;
     if (!isProcessDisposer(service)) return undefined;
     try {
       const results = await service.disposeRun(runId);
-      for (const result of results) {
-        const durable = durableProcessTermination(result);
-        await safePersist(append, { type: 'process.ended', runId, processId: durable.processId, status: durable.status, result: durable.result });
+      for (const report of results) {
+        const durable = durableProcessTermination(report);
+        await append(
+          { type: 'process.ended', runId, processId: durable.processId, status: durable.status, result: durable.result },
+          `${runId}:process:${durable.processId}:ended`
+        );
+        await service.markTerminalReported?.(durable.processId);
       }
       return undefined;
     }
@@ -949,12 +955,13 @@ export class AgentRuntime {
   private countForActiveRun(items: readonly { runId: string }[]): number { return this.activeRunId ? items.filter((item) => item.runId === this.activeRunId).length : 0; }
 }
 
-function isProcessDisposer(value: unknown): value is { readonly disposeRun: (runId: string) => Promise<readonly unknown[]> } {
+function isProcessDisposer(value: unknown): value is { readonly disposeRun: (runId: string) => Promise<readonly unknown[]>; readonly markTerminalReported?: (processId: string) => Promise<void> } {
   if (typeof value !== 'object' || value === null || !('disposeRun' in value)) return false;
   return typeof (value as { readonly disposeRun?: unknown }).disposeRun === 'function';
 }
 function durableProcessTermination(value: unknown): { readonly processId: string; readonly status: string; readonly result: import('@agent-core/evidence').JsonValue } {
-  const normalized = normalizeJsonSafe(value).value;
+  const outer = parseJsonValue(value, { maxDepth: 16, maxCollectionEntries: 20_000, maxStringBytes: 1_000_000, maxTotalBytes: 4_000_000 });
+  const normalized = isRecord(outer) && isRecord(outer.result) ? outer.result : outer;
   if (typeof normalized !== 'object' || normalized === null || Array.isArray(normalized) || typeof normalized.processId !== 'string' || typeof normalized.status !== 'string') throw new Error('Process cleanup returned an invalid terminal result.');
   const stream = (candidate: unknown) => isRecord(candidate)
     ? { observedBytes: typeof candidate.observedBytes === 'number' ? candidate.observedBytes : 0, capturedBytes: typeof candidate.capturedBytes === 'number' ? candidate.capturedBytes : 0, omittedBytes: typeof candidate.omittedBytes === 'number' ? candidate.omittedBytes : 0 }
@@ -968,7 +975,8 @@ function durableProcessTermination(value: unknown): { readonly processId: string
       stdout: stream(normalized.stdout), stderr: stream(normalized.stderr), combined: stream(normalized.combined),
       ...(normalized.artifact === undefined ? {} : { artifact: normalized.artifact }),
       ...(normalized.exitCode === undefined ? {} : { exitCode: normalized.exitCode }),
-      ...(normalized.signal === undefined ? {} : { signal: normalized.signal })
+      ...(normalized.signal === undefined ? {} : { signal: normalized.signal }),
+      ...(isRecord(outer) && outer.protectedArtifact !== undefined ? { protectedArtifact: outer.protectedArtifact } : {})
     }).value
   };
 }
@@ -982,8 +990,16 @@ function processCapabilities(value: unknown): readonly string[] {
   const capabilities = (value as { readonly capabilities?: unknown }).capabilities;
   return typeof capabilities === 'function' ? (capabilities as (this: unknown) => readonly string[]).call(value) : [];
 }
-function cleanupFailureDecision(error: Error): TerminalDecision {
-  return { executionStatus: 'failed', terminationReason: 'runtime_error', candidate: { status: 'absent' }, errorMessage: `Process cleanup failed: ${error.message}`, turnCount: 0, checkResults: [] };
+function cleanupFailureDecision(previous: TerminalDecision | undefined, error: Error): TerminalDecision {
+  const cleanupDiagnostic = { kind: 'process_cleanup' as const, message: error.message };
+  if (!previous) return { executionStatus: 'failed', terminationReason: 'runtime_error', candidate: { status: 'absent' }, errorMessage: `Process cleanup failed: ${error.message}`, turnCount: 0, checkResults: [], cleanupDiagnostic };
+  return {
+    ...previous,
+    executionStatus: 'failed',
+    terminationReason: 'runtime_error',
+    errorMessage: `${'errorMessage' in previous ? `${previous.errorMessage} ` : ''}Process cleanup failed: ${error.message}`,
+    cleanupDiagnostic
+  };
 }
 
 function runDeadline(controller: AgentRunController, request: ModelRequest): { readonly request: ModelRequest; readonly error: AgentLimitExceededError | undefined; readonly dispose: () => void } {
@@ -1011,7 +1027,8 @@ function terminalSnapshot(runId: string, finalizationId: string, decision: Termi
   const common = { runId, finalizationId, phase: 'ended' as const, turnCount: decision.turnCount, candidate: decision.candidate, checkResults: decision.checkResults, budget: controller.snapshot(),
     ...('modelTerminationReason' in decision ? { modelTerminationReason: decision.modelTerminationReason } : {}),
     ...('providerTerminationReason' in decision ? { providerTerminationReason: decision.providerTerminationReason } : {}),
-    ...('exhaustedLimit' in decision ? { exhaustedLimit: decision.exhaustedLimit } : {}) };
+    ...('exhaustedLimit' in decision ? { exhaustedLimit: decision.exhaustedLimit } : {}),
+    ...(decision.cleanupDiagnostic ? { cleanupDiagnostic: decision.cleanupDiagnostic } : {}) };
   if (decision.executionStatus === 'completed') return parseAgentTerminalSnapshot({ ...common, executionStatus: 'completed', terminationReason: decision.terminationReason, verificationStatus: deriveAgentVerificationStatus(checks, decision.checkResults) });
   if (decision.executionStatus === 'aborted') return parseAgentTerminalSnapshot({ ...common, executionStatus: 'aborted', terminationReason: 'aborted', verificationStatus: 'not_run', errorMessage: decision.errorMessage });
   return parseAgentTerminalSnapshot({ ...common, executionStatus: 'failed', terminationReason: decision.terminationReason, verificationStatus: 'not_run', errorMessage: decision.errorMessage });
@@ -1034,7 +1051,7 @@ function failedDecision(reason: Extract<TerminalDecision, { executionStatus: 'fa
 }
 function partialOrAbsent(candidate: AgentCandidate): AgentCandidate { return candidate.status === 'absent' ? candidate : { ...candidate, status: 'partial' }; }
 function decisionBeforeFinalization(decision: TerminalDecision, signal: AbortSignal): TerminalDecision {
-  if (!signal.aborted) return decision;
+  if (!signal.aborted || decision.executionStatus === 'aborted' || decision.cleanupDiagnostic) return decision;
   return {
     executionStatus: 'aborted',
     terminationReason: 'aborted',

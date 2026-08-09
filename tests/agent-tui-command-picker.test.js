@@ -52,6 +52,19 @@ test('the normal frame contains conversation, composer, and compact chrome only'
   await run;
 });
 
+test('TUI permission labels distinguish structured patch authority from ambient shell authority', async () => {
+  const host = createMemoryTerminalHost({ terminalSize: { columns: 150, rows: 18 } });
+  const run = runAgentTuiApp(fakeAgent(), { host, runtimeDetails: {
+    modelId: 'test-model', permissions: { workspaceWrites: 'ambient_shell', shell: 'ambient' }
+  } });
+  await waitFor(() => host.frames().length > 0);
+  const output = plainOutput(host);
+  assert.match(output, /patch: denied; workspace: ambient shell; shell: ambient/u);
+  assert.doesNotMatch(output, /workspaceWrites: denied/u);
+  host.input('/exit\r');
+  await run;
+});
+
 function fakeAgent() {
   return {
     runtimeState() {

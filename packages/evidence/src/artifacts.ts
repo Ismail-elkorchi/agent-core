@@ -12,36 +12,44 @@ import {
   validateArtifactRef,
   type ArtifactRef,
   type ArtifactRepository,
-  type ArtifactStoreInput
+  type ArtifactStoreInput,
+  type ProtectedArtifactRef,
+  type PublicArtifactRef
 } from './artifact-repository.js';
 
-export interface LocalArtifactRepositoryOptions { readonly rootDir: string }
+export interface LocalArtifactRepositoryOptions { readonly rootDir: string; readonly onVerificationScan?: (artifactId: string) => void }
 
 export class LocalArtifactRepository implements ArtifactRepository {
   private readonly rootDir: string;
+  private readonly onVerificationScan: ((artifactId: string) => void) | undefined;
   private readonly references = new Map<string, ArtifactRef>();
+  private readonly verifiedFiles = new Map<string, { readonly identity: string; readonly sha256: string }>();
 
   constructor(options: LocalArtifactRepositoryOptions | string) {
     this.rootDir = path.resolve(typeof options === 'string' ? options : options.rootDir);
+    this.onVerificationScan = typeof options === 'string' ? undefined : options.onVerificationScan;
   }
 
-  async store(input: ArtifactStoreInput): Promise<ArtifactRef> {
+  async store(input: ArtifactStoreInput): Promise<PublicArtifactRef> {
     return this.storeAt(input, false);
   }
 
-  async storeProtected(input: ArtifactStoreInput): Promise<ArtifactRef> {
+  async storeProtected(input: ArtifactStoreInput): Promise<ProtectedArtifactRef> {
     return this.storeAt(input, true);
   }
 
-  private async storeAt(input: ArtifactStoreInput, protectedPath: boolean): Promise<ArtifactRef> {
+  private async storeAt(input: ArtifactStoreInput, protectedPath: false): Promise<PublicArtifactRef>;
+  private async storeAt(input: ArtifactStoreInput, protectedPath: true): Promise<ProtectedArtifactRef>;
+  private async storeAt(input: ArtifactStoreInput, protectedPath: boolean): Promise<PublicArtifactRef | ProtectedArtifactRef> {
     const bytes = new Uint8Array(input.content);
     const mediaType = input.mediaType ?? 'application/octet-stream';
     const sha256 = hashArtifactBytes(bytes);
     const artifactId = `${protectedPath ? 'protected-' : ''}${sha256}${artifactExtension(mediaType)}`;
     const target = this.confinedPath(artifactId);
-    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.mkdir(path.dirname(target), { recursive: true, ...(protectedPath ? { mode: 0o700 } : {}) });
+    if (protectedPath) await fs.chmod(path.dirname(target), 0o700);
     const temporary = path.join(path.dirname(target), `tmp-${artifactId}-${randomUUID()}.tmp`);
-    const handle = await fs.open(temporary, 'wx');
+    const handle = await fs.open(temporary, 'wx', protectedPath ? 0o600 : 0o644);
     try {
       await handle.writeFile(bytes);
       await handle.sync();
@@ -59,18 +67,20 @@ export class LocalArtifactRepository implements ArtifactRepository {
       sha256,
       size: bytes.byteLength,
       mediaType,
+      visibility: protectedPath ? 'protected' as const : 'public' as const,
       label: safeArtifactLabel(input.label),
       ...(input.description ? { description: input.description } : {})
     });
+    if (protectedPath) await fs.chmod(target, 0o600);
     this.references.set(artifactId, ref);
     return ref;
   }
 
-  storeText(label: string, content: string, description?: string): Promise<ArtifactRef> {
+  storeText(label: string, content: string, description?: string): Promise<PublicArtifactRef> {
     return this.store({ label, content: new TextEncoder().encode(content), mediaType: 'text/plain; charset=utf-8', ...(description ? { description } : {}) });
   }
 
-  storeJson(label: string, value: unknown, description?: string): Promise<ArtifactRef> {
+  storeJson(label: string, value: unknown, description?: string): Promise<PublicArtifactRef> {
     const normalized = normalizeJsonSafe(value);
     return this.store({
       label,
@@ -80,7 +90,7 @@ export class LocalArtifactRepository implements ArtifactRepository {
     });
   }
 
-  storeBuffer(label: string, content: Uint8Array, mediaType = 'application/octet-stream', description?: string): Promise<ArtifactRef> {
+  storeBuffer(label: string, content: Uint8Array, mediaType = 'application/octet-stream', description?: string): Promise<PublicArtifactRef> {
     return this.store({ label, content, mediaType, ...(description ? { description } : {}) });
   }
 
@@ -90,6 +100,8 @@ export class LocalArtifactRepository implements ArtifactRepository {
     const bytes = new Uint8Array(await fs.readFile(filePath));
     if (bytes.byteLength !== ref.size) throw new ArtifactIntegrityError(ref.artifactId, `Artifact size mismatch for ${ref.artifactId}.`);
     if (hashArtifactBytes(bytes) !== ref.sha256) throw new ArtifactIntegrityError(ref.artifactId, `Artifact SHA-256 mismatch for ${ref.artifactId}.`);
+    const stat = await fs.stat(filePath);
+    this.verifiedFiles.set(filePath, { identity: fileIdentity(stat), sha256: ref.sha256 });
     return bytes;
   }
 
@@ -101,20 +113,33 @@ export class LocalArtifactRepository implements ArtifactRepository {
     try {
       const stat = await handle.stat();
       if (stat.size !== ref.size) throw new ArtifactIntegrityError(ref.artifactId, `Artifact size mismatch for ${ref.artifactId}.`);
-      const hash = (await import('node:crypto')).createHash('sha256');
-      const chunk = Buffer.allocUnsafe(256 * 1024);
-      let position = 0;
-      while (position < stat.size) {
-        const read = await handle.read(chunk, 0, Math.min(chunk.length, stat.size - position), position);
-        if (read.bytesRead === 0) break;
-        hash.update(chunk.subarray(0, read.bytesRead));
-        position += read.bytesRead;
+      const identity = fileIdentity(stat);
+      const cached = this.verifiedFiles.get(filePath);
+      if (cached?.identity !== identity || cached.sha256 !== ref.sha256) {
+        this.verifiedFiles.delete(filePath);
+        this.onVerificationScan?.(ref.artifactId);
+        const hash = (await import('node:crypto')).createHash('sha256');
+        const chunk = Buffer.allocUnsafe(256 * 1024);
+        let position = 0;
+        while (position < stat.size) {
+          const read = await handle.read(chunk, 0, Math.min(chunk.length, stat.size - position), position);
+          if (read.bytesRead === 0) break;
+          hash.update(chunk.subarray(0, read.bytesRead));
+          position += read.bytesRead;
+        }
+        if (hash.digest('hex') !== ref.sha256) throw new ArtifactIntegrityError(ref.artifactId, `Artifact SHA-256 mismatch for ${ref.artifactId}.`);
+        const verifiedStat = await handle.stat();
+        if (fileIdentity(verifiedStat) !== identity) throw new ArtifactIntegrityError(ref.artifactId, `Artifact changed while verifying ${ref.artifactId}.`);
+        this.verifiedFiles.set(filePath, { identity, sha256: ref.sha256 });
       }
-      if (hash.digest('hex') !== ref.sha256) throw new ArtifactIntegrityError(ref.artifactId, `Artifact SHA-256 mismatch for ${ref.artifactId}.`);
       const windowStart = Math.max(0, input.offset - 3);
       const windowEnd = Math.min(stat.size, input.offset + input.length + 3);
       const window = Buffer.alloc(windowEnd - windowStart);
       if (window.length > 0) await handle.read(window, 0, window.length, windowStart);
+      if (fileIdentity(await handle.stat()) !== identity) {
+        this.verifiedFiles.delete(filePath);
+        throw new ArtifactIntegrityError(ref.artifactId, `Artifact changed while reading ${ref.artifactId}.`);
+      }
       const relative = (await import('./artifact-repository.js')).adjustedArtifactByteRange(
         { ...ref, size: window.length },
         window,
@@ -129,10 +154,10 @@ export class LocalArtifactRepository implements ArtifactRepository {
     }
   }
 
-  async resolve(artifactId: string): Promise<ArtifactRef | undefined> {
+  async resolve(artifactId: string): Promise<PublicArtifactRef | undefined> {
     if (artifactId.startsWith('protected-')) return undefined;
     const known = this.references.get(artifactId);
-    if (known) return known;
+    if (known?.visibility === 'public') return known;
     if (!/^(?:protected-)?[a-f0-9]{64}\.[a-z0-9]+$/u.test(artifactId)) return undefined;
     let stat;
     try { stat = await fs.stat(this.confinedPath(artifactId)); } catch { return undefined; }
@@ -142,6 +167,7 @@ export class LocalArtifactRepository implements ArtifactRepository {
       sha256: artifactId.replace(/^protected-/u, '').slice(0, 64),
       size: stat.size,
       mediaType: mediaTypeFromArtifactId(artifactId),
+      visibility: 'public',
       label: artifactId
     });
     this.references.set(artifactId, ref);
@@ -163,3 +189,6 @@ async function verifyFile(filePath: string, sha256: string, size: number, artifa
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function nodeCode(error: unknown): string | undefined { return isRecord(error) && typeof error.code === 'string' ? error.code : undefined; }
+function fileIdentity(stat: { readonly dev: number | bigint; readonly ino: number | bigint; readonly size: number; readonly mtimeMs: number; readonly ctimeMs: number }): string {
+  return [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].map(String).join(':');
+}

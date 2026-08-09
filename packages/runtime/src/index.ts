@@ -8,3 +8,4 @@ export * from './session/repository.js';
 export * from './orchestration/finalization.js';
 export * from './orchestration/run-controller.js';
 export * from './orchestration/tool-scheduler.js';
+export * from './orchestration/observation-store.js';

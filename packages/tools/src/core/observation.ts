@@ -2,7 +2,7 @@ import * as z from 'zod';
 import {
   parseJsonObject,
   parseJsonValue,
-  validateArtifactRef,
+  validatePublicArtifactRef,
   type JsonObject,
   type JsonValue,
   type ToolEvidenceDelta
@@ -80,7 +80,10 @@ export function runtimeErrorObservation(toolName: string, error: unknown, detail
 
 /** The sole boundary from untrusted tool output into Agent Core. */
 export function parseToolObservation(tool: Pick<ToolDefinition, 'outputSchema'> | undefined, value: unknown): ToolObservation<JsonValue> {
-  const record = ownRecord(value, 'Tool observation');
+  return parseOwnedToolObservation(tool, parseJsonObject(value, JSON_LIMITS));
+}
+
+function parseOwnedToolObservation(tool: Pick<ToolDefinition, 'outputSchema'> | undefined, record: JsonObject): ToolObservation<JsonValue> {
   const unknown = Object.keys(record).filter((key) => !['kind', 'ok', 'summary', 'scope', 'content', 'metadata', 'evidence', 'output'].includes(key));
   if (unknown.length > 0) throw new Error('Tool observation contains unsupported fields: ' + unknown.join(', ') + '.');
   if (typeof record.summary !== 'string' || record.summary.trim().length === 0) throw new Error('Tool observation requires a non-empty summary.');
@@ -108,23 +111,25 @@ export function parseToolObservation(tool: Pick<ToolDefinition, 'outputSchema'> 
 }
 
 export function normalizeToolObservationForPersistence(value: unknown): ToolObservation<JsonValue> {
-  const record = ownRecord(value, 'Tool observation');
-  return parseToolObservation(record.kind === 'result' ? persistenceTool() : undefined, value);
+  const record = parseJsonObject(value, JSON_LIMITS);
+  return parseOwnedToolObservation(record.kind === 'result' ? persistenceTool() : undefined, record);
 }
 
 export function parseToolScope(value: unknown): ToolScope {
-  const record = ownRecord(value, 'Tool scope');
+  const record = parseJsonObject(value, JSON_LIMITS);
   const unknown = Object.keys(record).filter((key) => !['resources', 'filters', 'limits', 'omitted', 'coverage', 'truncated', 'causes'].includes(key));
   if (unknown.length > 0) throw new Error('Tool scope contains unsupported fields: ' + unknown.join(', ') + '.');
   if (!Array.isArray(record.resources) || !record.resources.every((item) => typeof item === 'string')) throw new Error('Tool scope resources must be strings.');
   if (record.coverage !== 'complete' && record.coverage !== 'partial') throw new Error('Tool scope coverage is invalid.');
   if (record.truncated !== undefined && typeof record.truncated !== 'boolean') throw new Error('Tool scope truncated must be boolean.');
-  if (record.causes !== undefined && (!Array.isArray(record.causes) || !record.causes.every((item) => typeof item === 'string' && item.length > 0))) throw new Error('Tool scope causes must be non-empty strings.');
+  const rawCauses = record.causes;
+  if (rawCauses !== undefined && (!Array.isArray(rawCauses) || !rawCauses.every((item) => typeof item === 'string' && item.length > 0))) throw new Error('Tool scope causes must be non-empty strings.');
   const resources = Object.freeze(record.resources.map(validateResourceScope));
+  if (new Set(resources).size !== resources.length) throw new Error('Tool scope resources must be unique.');
   const filters = record.filters === undefined ? undefined : parseJsonObject(record.filters);
   const limits = record.limits === undefined ? undefined : parseJsonObject(record.limits);
   const omitted = record.omitted === undefined ? undefined : parseJsonObject(record.omitted);
-  const causes = record.causes === undefined ? undefined : Object.freeze([...new Set(record.causes)]);
+  const causes = rawCauses === undefined ? undefined : Object.freeze([...new Set(rawCauses as string[])]);
   if (record.coverage === 'complete' && (record.truncated === true || (causes?.length ?? 0) > 0)) throw new Error('A complete tool scope cannot be truncated or have omission causes.');
   return Object.freeze({
     resources, coverage: record.coverage,
@@ -151,7 +156,7 @@ function parseContent(value: unknown): readonly ToolContent[] | undefined {
     if (record.type === 'text' && typeof record.text === 'string' && (record.mediaType === undefined || typeof record.mediaType === 'string')) return Object.freeze({ type: 'text', text: record.text, ...(record.mediaType ? { mediaType: record.mediaType } : {}) });
     if ((record.type === 'image' || record.type === 'artifact') && record.artifact !== undefined) {
       const artifact = parseJsonObject(record.artifact, JSON_LIMITS);
-      validateArtifactRef(artifact);
+      validatePublicArtifactRef(artifact);
       if (record.type === 'image' && (record.detail === 'high' || record.detail === 'original')) return Object.freeze({ type: 'image', artifact, detail: record.detail });
       if (record.type === 'artifact') return Object.freeze({ type: 'artifact', artifact });
     }

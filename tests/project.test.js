@@ -55,6 +55,14 @@ test('workspace configuration validates first-party policy, checks, and exact li
   assert.throws(() => parseAgentCoreConfiguration({ ...configuration, authorization: { allowedRisks: ['read'], requireApprovalFor: ['write'] } }), /Approval risks/u);
   assert.throws(() => parseAgentCoreConfiguration({ ...configuration, verification: { required: [{ id: 'same', command: 'true' }], advisory: [{ id: 'same', command: 'true' }] } }), /unique/u);
   assert.throws(() => parseAgentCoreConfiguration({ ...configuration, tools: { enabled: [], unknown: true } }), /tool configuration/iu);
+  let accessed = false;
+  const accessor = { ...configuration };
+  Object.defineProperty(accessor, 'model', { enumerable: true, get() { accessed = true; return 'stolen'; } });
+  assert.throws(() => parseAgentCoreConfiguration(accessor), /accessor/iu);
+  assert.equal(accessed, false);
+  const cyclic = { ...configuration };
+  cyclic.loop = cyclic;
+  assert.throws(() => parseAgentCoreConfiguration(cyclic), /cycle/iu);
 });
 
 test('workspace configuration cannot escape through a symlink', async () => {

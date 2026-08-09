@@ -13,7 +13,7 @@
     "README.md"
   ],
   "engines": {
-    "node": ">=24"
+    "node": ">=24.8.0"
   },
   "dependencies": {
     "@agent-core/auth": "0.2.0",

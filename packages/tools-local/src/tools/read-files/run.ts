@@ -4,6 +4,7 @@ import type { FileHandle } from 'node:fs/promises';
 import { requireWorkspaceRoot, throwIfAborted, workspaceFileScope, type ToolExecutionContext, type ToolObservation } from '@agent-core/tools';
 import { assertRealPathInsideRoot, relativePath, resolveInsideRoot } from '../../core/filesystem.js';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
+import { builtInReadEvidence } from '../../core/read-evidence.js';
 import type { ReadFileFailure, ReadFileResult, ReadFilesInput, ReadFilesOutput } from './schema.js';
 
 export async function readFiles(input: ReadFilesInput, context: ToolExecutionContext): Promise<ToolObservation<ReadFilesOutput>> {
@@ -32,13 +33,16 @@ export async function readFiles(input: ReadFilesInput, context: ToolExecutionCon
   const output: ReadFilesOutput = {
     files, failures, coverage, requestedFiles: input.files.length, returnedFiles: files.length, failedFiles: failures.length, returnedBytes
   };
+  const scope = {
+    resources: [...new Set(input.files.map((file) => workspaceFileScope(file.path)))], coverage,
+    limits: { maxFiles: limits.maxFiles, maxTotalBytes: limits.maxTotalBytes, maxBytesPerFile: limits.maxBytesPerFile },
+    ...(coverage === 'partial' ? { causes: [...new Set(failures.map((failure) => failure.reason))], omitted: { files: failures.length } } : {})
+  } as const;
   return {
     kind: 'result', ok: failures.length === 0,
     summary: 'Read ' + String(files.length) + ' of ' + String(input.files.length) + ' requested files' + (coverage === 'partial' ? ' with partial coverage.' : '.'),
-    scope: {
-      resources: input.files.map((file) => workspaceFileScope(file.path)), coverage,
-      ...(coverage === 'partial' ? { causes: [...new Set(failures.map((failure) => failure.reason))], omitted: { files: failures.length } } : {})
-    },
+    scope,
+    evidence: builtInReadEvidence('read', scope, `Read ${String(files.length)} file ranges totaling ${String(returnedBytes)} bytes.`),
     output
   };
 }
@@ -55,6 +59,7 @@ async function readRange(root: string, requestedPath: string, startLine: number,
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) return failure(displayPath, 'not_file', 'Path is not a regular file: ' + requestedPath);
+    const initialIdentity = fileIdentity(stat);
     try { await assertRealPathInsideRoot(root, absolute, requestedPath); }
     catch (error) { return failure(displayPath, 'path_outside_workspace', errorMessage(error)); }
     const selected: Buffer[] = [];
@@ -97,6 +102,20 @@ async function readRange(root: string, requestedPath: string, startLine: number,
     const fileHasUnterminatedLine = stat.size > 0 && lastByte !== 0x0a && position >= stat.size;
     if (fileHasUnterminatedLine && currentLine >= startLine && selectedLines < lineCount) selectedLines += 1;
     const totalLines = stat.size === 0 ? 0 : lastByte === 0x0a && position >= stat.size ? currentLine - 1 : currentLine;
+    const finalHandleStat = await handle.stat();
+    let finalPathStat;
+    try { finalPathStat = await fs.stat(absolute); }
+    catch { return failure(displayPath, 'file_changed', 'File changed or was replaced while it was being read: ' + requestedPath); }
+    if (fileIdentity(finalHandleStat) !== initialIdentity || fileIdentity(finalPathStat) !== initialIdentity) {
+      return failure(displayPath, 'file_changed', 'File changed or was replaced while it was being read: ' + requestedPath);
+    }
+    if (stat.size === 0 && startLine === 1) {
+      const emptySha256 = createHash('sha256').update(Buffer.alloc(0)).digest('hex');
+      return { ok: true, value: {
+        path: displayPath, startLine, lineCount: 0, content: '', bytes: 0, fileBytes: 0, eof: true,
+        rangeSha256: emptySha256, fullFileSha256: emptySha256, rangeLineEnding: 'none'
+      } };
+    }
     if (startLine > totalLines) return failure(displayPath, 'start_after_eof', 'Requested start line ' + String(startLine) + ' is after EOF at line ' + String(totalLines) + '.');
     const raw = Buffer.concat(selected, selectedBytes);
     if (raw.includes(0)) return failure(displayPath, 'binary', 'Requested range contains binary data: ' + requestedPath);
@@ -111,12 +130,12 @@ async function readRange(root: string, requestedPath: string, startLine: number,
       value: {
         path: displayPath, startLine, lineCount: selectedLines, content, bytes: raw.byteLength, fileBytes: stat.size, eof,
         ...(!eof ? { nextStartLine: startLine + selectedLines } : {}), rangeSha256,
-        ...(fullFile ? { fullFileSha256: rangeSha256 } : {}), lineEnding: detectLineEnding(raw)
+        ...(fullFile ? { fullFileSha256: rangeSha256 } : {}), rangeLineEnding: detectLineEnding(raw)
       }
     };
   } finally { await handle.close(); }
 }
-function detectLineEnding(bytes: Buffer): ReadFileResult['lineEnding'] {
+function detectLineEnding(bytes: Buffer): ReadFileResult['rangeLineEnding'] {
   let lf = 0; let crlf = 0;
   for (let index = 0; index < bytes.length; index += 1) if (bytes[index] === 0x0a) { if (index > 0 && bytes[index - 1] === 0x0d) crlf += 1; else lf += 1; }
   return lf > 0 && crlf > 0 ? 'mixed' : crlf > 0 ? 'crlf' : lf > 0 ? 'lf' : 'none';
@@ -124,3 +143,6 @@ function detectLineEnding(bytes: Buffer): ReadFileResult['lineEnding'] {
 function failure(path: string, reason: ReadFileFailure['reason'], message: string): RangeRead { return { ok: false, failure: { path, reason, message } }; }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function nodeCode(error: unknown): string | undefined { return typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string' ? error.code : undefined; }
+function fileIdentity(stat: { readonly dev: number | bigint; readonly ino: number | bigint; readonly size: number; readonly mtimeMs: number; readonly ctimeMs: number }): string {
+  return [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].map(String).join(':');
+}

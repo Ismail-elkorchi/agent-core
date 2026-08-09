@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { evidenceDelta, workspaceResource, type EvidenceAction, type ToolEvidenceItem } from '@agent-core/evidence';
-import { requireToolService, requireWorkspaceRoot, throwIfAborted, ToolInputError, workspaceFileScope, type ToolExecutionContext } from '@agent-core/tools';
+import { PATCH_JOURNAL_SCOPE, requireToolService, requireWorkspaceRoot, throwIfAborted, ToolInputError, workspaceFileScope, type ToolExecutionContext } from '@agent-core/tools';
 import type { ToolObservation } from '@agent-core/tools';
 import {
   byteLengthUtf8,
@@ -12,7 +12,7 @@ import {
   sha256Text,
   validateParentDirectory
 } from '../../core/filesystem.js';
-import { invalidToolInputObservation, runtimeErrorObservation } from '@agent-core/tools';
+import { invalidToolInputObservation } from '@agent-core/tools';
 import { withTextFilePatchJournal, type PreparedTextPatchRemove, type PreparedTextPatchWrite, type TextPatchJournalAuthority, type TextTransactionResult } from '../../core/text-write.js';
 import { splitLogicalLines } from '@agent-core/tools';
 import { applyPatchUpdate, PatchApplyError } from './apply-diff.js';
@@ -56,7 +56,7 @@ export async function applyPatch(input: CanonicalApplyPatchInput, context: ToolE
   return applyPatchWithAuthority(input, context);
 }
 
-async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, context: ToolExecutionContext, authority?: TextPatchJournalAuthority): Promise<ToolObservation<ApplyPatchOutput>> {
+export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, context: ToolExecutionContext, authority?: TextPatchJournalAuthority): Promise<ToolObservation<ApplyPatchOutput>> {
   const rootDir = requireWorkspaceRoot(context);
   const dryRun = input.dryRun;
   await context.emitProgress?.({ type: 'status', stage: 'patch_preparing', message: 'Preparing patch transaction.', completed: 0, total: input.tree.operations.length });
@@ -67,15 +67,17 @@ async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, context:
       failures
     });
   }
-  await context.emitProgress?.({ type: 'status', stage: 'patch_prepared', message: 'Patch transaction prepared.', completed: prepared.length, total: input.tree.operations.length });
+  await emitCheckpoint(context, { type: 'status', stage: 'patch_prepared', message: 'Patch transaction prepared.', completed: prepared.length, total: input.tree.operations.length });
 
   const changed = prepared.filter((operation) => operation.output.changed);
+  let status: ApplyPatchOutput['status'] = 'committed';
+  let transaction: TextTransactionResult | undefined;
   if (!dryRun && changed.length > 0) {
     if (!authority) throw new Error('Patch journal authority is unavailable for a write transaction.');
     throwIfAborted(context.signal);
     await context.emitProgress?.({ type: 'status', stage: 'patch_committing', message: 'Committing patch transaction.', completed: 0, total: changed.length });
     const transactionId = patchTransactionId(context);
-    const transaction = await authority.commit({
+    transaction = await authority.commit({
       writes: changed.flatMap((operation) => operation.write ? [operation.write] : []),
       removes: changed.flatMap((operation) => operation.remove ? [operation.remove] : []),
       parentDirsToCreate: changed.flatMap((operation) => operation.parentDirsToCreate)
@@ -83,31 +85,39 @@ async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, context:
       ...(context.signal ? { signal: context.signal } : {}),
       ...(transactionId ? { transactionId } : {})
     });
-    if (transaction.outcome !== 'committed') {
-      await context.emitProgress?.({ type: 'status', stage: 'rollback_completed', message: `Patch rollback ${transactionRecovery(transaction)}.` });
-      const message = transactionFailureMessage(transaction);
-      return runtimeErrorObservation('apply_patch', message, { transaction });
+    status = transaction.outcome;
+    if (transaction.outcome === 'rolled_back' || transaction.outcome === 'rollback_failed') {
+      await emitCheckpoint(context, { type: 'status', stage: 'rollback_completed', message: `Patch rollback ${transactionRecovery(transaction)}.` });
+    } else {
+      await emitCheckpoint(context, {
+        type: 'status', stage: 'patch_committed', completed: changed.length, total: changed.length,
+        message: transaction.outcome === 'committed' ? 'Patch transaction committed.' : transactionFailureMessage(transaction)
+      });
     }
-    await context.emitProgress?.({ type: 'status', stage: 'patch_committed', message: 'Patch transaction committed.', completed: changed.length, total: changed.length });
   }
 
   const wouldChangePaths = uniquePaths(changed.flatMap((operation) => operation.changedPaths));
-  const changedPaths = dryRun ? [] : [...wouldChangePaths];
+  const contentsCommitted = status === 'committed' || status === 'committed_with_residue';
+  const changedPaths = dryRun || !contentsCommitted ? [] : [...wouldChangePaths];
   const wouldCreatePaths = changed.flatMap((operation) => operation.createdPath ? [operation.createdPath] : []);
   const wouldDeletePaths = changed.flatMap((operation) => operation.deletedPath ? [operation.deletedPath] : []);
   const wouldMovePaths = changed.flatMap((operation) => operation.move ? [operation.move] : []);
   const output: ApplyPatchOutput = {
+    status,
+    workspaceState: status === 'rollback_failed' ? 'uncertain' : 'known',
     dryRun,
     transactional: true,
     files: prepared.map((operation) => operation.output),
     changedPaths,
     wouldChangePaths,
-    createdPaths: dryRun ? [] : [...wouldCreatePaths],
+    createdPaths: dryRun || !contentsCommitted ? [] : [...wouldCreatePaths],
     wouldCreatePaths,
-    deletedPaths: dryRun ? [] : [...wouldDeletePaths],
+    deletedPaths: dryRun || !contentsCommitted ? [] : [...wouldDeletePaths],
     wouldDeletePaths,
-    movedPaths: dryRun ? [] : wouldMovePaths.map((item) => ({ ...item })),
+    movedPaths: dryRun || !contentsCommitted ? [] : wouldMovePaths.map((item) => ({ ...item })),
     wouldMovePaths: wouldMovePaths.map((item) => ({ ...item })),
+    potentiallyAffectedPaths: status === 'rollback_failed' ? [...wouldChangePaths] : [],
+    ...(transaction ? { transaction } : {}),
     totalOperationCount: prepared.length,
     totalHunkCount: prepared.reduce((total, operation) => total + operation.output.hunkCount, 0),
     totalAdditions: prepared.reduce((total, operation) => total + operation.output.additions, 0),
@@ -115,9 +125,22 @@ async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, context:
   };
   return {
     kind: 'result',
-    ok: true,
-    summary: summarizePatchOutput(output),
-    scope: { resources: uniquePaths(prepared.flatMap((operation) => operation.changedPaths)).map((item) => workspaceFileScope(item)), coverage: 'complete' },
+    ok: status === 'committed' || status === 'committed_with_residue',
+    summary: status === 'committed'
+      ? summarizePatchOutput(output)
+      : status === 'committed_with_residue'
+        ? transactionFailureMessage(transaction as Extract<TextTransactionResult, { outcome: 'committed_with_residue' }>)
+        : status === 'rolled_back'
+          ? 'Patch transaction was rolled back; no requested file changes remain.'
+          : 'Patch rollback failed; workspace state is uncertain for: ' + (wouldChangePaths.join(', ') || 'unknown paths') + '.',
+    scope: {
+      resources: status === 'committed_with_residue'
+        ? [...uniquePaths(prepared.flatMap((operation) => operation.changedPaths)).map((item) => workspaceFileScope(item)), PATCH_JOURNAL_SCOPE]
+        : uniquePaths(prepared.flatMap((operation) => operation.changedPaths)).map((item) => workspaceFileScope(item)),
+      coverage: status === 'committed_with_residue' || status === 'rollback_failed' ? 'partial' : 'complete',
+      ...(status === 'committed_with_residue' ? { causes: ['journal_residue'], omitted: { cleanup: transaction?.outcome === 'committed_with_residue' ? transaction.cleanup.strandedPaths.length : 0 } } : {}),
+      ...(status === 'rollback_failed' ? { causes: ['workspace_state_uncertain'], omitted: { potentiallyAffectedPaths: wouldChangePaths.length } } : {})
+    },
     output,
     evidence: evidenceDelta(patchEvidenceItems(output)),
     ...(!dryRun ? { metadata: { changedPaths: output.changedPaths } } : {})
@@ -148,6 +171,9 @@ function patchTransactionId(context: ToolExecutionContext): string | undefined {
 }
 
 function isNonEmptyString(value: unknown): value is string { return typeof value === 'string' && value.trim().length > 0; }
+function emitCheckpoint(context: ToolExecutionContext, progress: import('@agent-core/tools').ToolProgress): Promise<void> {
+  return Promise.resolve(context.persistProgressCheckpoint ? context.persistProgressCheckpoint(progress) : context.emitProgress?.(progress));
+}
 
 function transactionRecovery(result: Exclude<TextTransactionResult, { outcome: 'committed' }>): 'succeeded' | 'failed' | 'uncertain' {
   return result.outcome === 'committed_with_residue' ? result.cleanup.status : result.rollback.status;
@@ -158,6 +184,7 @@ function transactionFailureMessage(result: Exclude<TextTransactionResult, { outc
 }
 
 function patchEvidenceItems(output: ApplyPatchOutput): ToolEvidenceItem[] {
+  if (output.status === 'rolled_back') return [];
   return output.files
     .filter((file) => file.changed)
     .map((file) => {
@@ -178,12 +205,13 @@ function patchEvidenceItems(output: ApplyPatchOutput): ToolEvidenceItem[] {
         scope: {
           limits: {
             dryRun: output.dryRun,
+            status: output.status,
             hunkCount: file.hunkCount,
             additions: file.additions,
             deletions: file.deletions
           },
           truncated: false,
-          confidence: output.dryRun ? 'unverified' : 'verified'
+          confidence: output.dryRun || output.status === 'rollback_failed' ? 'unverified' : 'verified'
         },
         summary: `${output.dryRun ? 'Would ' : ''}${action} ${file.destinationPath ?? file.path}.`
       };

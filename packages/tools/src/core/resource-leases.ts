@@ -18,6 +18,7 @@ export class ResourceLeaseCoordinator {
           const index = this.waiters.indexOf(waiter);
           if (index >= 0) this.waiters.splice(index, 1);
           reject(abortError(signal));
+          this.drain();
         };
         signal.addEventListener('abort', waiter.abort, { once: true });
       }
@@ -26,22 +27,29 @@ export class ResourceLeaseCoordinator {
     });
   }
 
+  /** FIFO for conflicting waiters, with compatible batching when no earlier waiter conflicts. */
+  wouldWait(effects: ToolEffects): boolean {
+    return [...this.active.values()].some((lease) => leasesConflict(lease, effects))
+      || this.waiters.some((waiter) => effectsConflict(waiter.effects, effects));
+  }
+
   releaseProcess(processId: string): void {
     for (const active of this.active.values()) if (active.processId === processId) this.releaseLease(active.id);
   }
   activeCount(): number { return this.active.size; }
 
   private drain(): void {
-    for (let index = 0; index < this.waiters.length;) {
-      const waiter = this.waiters[index];
-      if (!waiter) break;
-      if ([...this.active.values()].some((lease) => leasesConflict(lease, waiter.effects))) { index += 1; continue; }
-      this.waiters.splice(index, 1);
+    const retained: Waiter[] = [];
+    for (const waiter of this.waiters.splice(0)) {
+      const conflictsWithActive = [...this.active.values()].some((lease) => leasesConflict(lease, waiter.effects));
+      const bypassesEarlierConflict = retained.some((earlier) => effectsConflict(earlier.effects, waiter.effects));
+      if (conflictsWithActive || bypassesEarlierConflict) { retained.push(waiter); continue; }
       if (waiter.abort && waiter.signal) waiter.signal.removeEventListener('abort', waiter.abort);
       const active: ActiveLease = { id: this.nextId++, owner: waiter.owner, effects: waiter.effects };
       this.active.set(active.id, active);
       waiter.resolve(new Lease(this, active));
     }
+    this.waiters.push(...retained);
   }
   releaseLease(id: number): void { if (this.active.delete(id)) this.drain(); }
   transferLease(id: number, processId: string): void {
@@ -77,7 +85,7 @@ function processControlOnly(effects: ToolEffects, processId: string): boolean {
   return effects.accesses.length > 0 && effects.accesses.every((access) => access.mode === 'execute' && access.scope === scope)
     && effects.lockScopes.every((lock) => lock === scope);
 }
-function effectsConflict(left: ToolEffects, right: ToolEffects): boolean {
+export function effectsConflict(left: ToolEffects, right: ToolEffects): boolean {
   if (left.lockScopes.some((a) => right.lockScopes.some((b) => scopesOverlap(a, b)))) return true;
   if (left.lockScopes.some((lock) => right.accesses.some((access) => scopesOverlap(lock, access.scope)))) return true;
   if (right.lockScopes.some((lock) => left.accesses.some((access) => scopesOverlap(lock, access.scope)))) return true;

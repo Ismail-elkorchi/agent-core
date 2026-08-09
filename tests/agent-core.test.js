@@ -196,6 +196,31 @@ test('oversized tool observations keep domain output intact in an artifact', asy
   assert.equal(stored.output.items.length, items.length);
 });
 
+test('artifact-store failure after a completed tool effect still persists tool.ended and a degraded diagnostic', async () => {
+  class FailingArtifacts extends InMemoryArtifactRepository { async store() { throw new Error('artifact store failed'); } }
+  let effects = 0;
+  const tool = {
+    name: 'degraded_result', implementationId: 'tests/degraded-result@1', description: 'degraded result', jsonSchema: { type: 'object' },
+    outputSchema: z.strictObject({ payload: z.string() }), effectEnvelope: { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'] },
+    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; },
+    deriveEffects() { return { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'], idempotency: 'non_idempotent' }; },
+    async invoke() { effects += 1; return { kind: 'result', ok: true, output: { payload: 'x'.repeat(400_000) }, summary: 'effect completed', scope: completeScope }; }
+  };
+  const { agent, events } = await harness({
+    artifacts: new FailingArtifacts(), tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] },
+    script: [response('tool_calls', '', { toolCalls: [{ id: 'degraded', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }] }), response()]
+  });
+  const result = ended(await agent.run({ task: 'complete despite degraded artifact storage' }));
+  assert.equal(result.executionStatus, 'completed');
+  assert.equal(effects, 1);
+  const persisted = await eventsFor(events, result.runId);
+  assert.equal(persisted.filter(event => event.type === 'tool.started').length, 1);
+  assert.equal(persisted.filter(event => event.type === 'tool.ended').length, 1);
+  const diagnostic = persisted.find(event => event.type === 'observation.record.created').durableStorageDegraded;
+  assert.match(diagnostic.message, /artifact store failed/u);
+  assert.equal(persisted.find(event => event.type === 'tool.ended').observation.metadata.durableStorage.status, 'degraded');
+});
+
 async function eventsFor(repository, runId) {
   const output = [];
   for await (const record of repository.read(runId)) output.push(record.event);
@@ -489,6 +514,23 @@ test('final request snapshot separates every dynamic context provenance and hash
   for (const field of ['effectiveInstructionHash', 'selectedEvidenceHash', 'retainedHistoryHash', 'modelToolSchemasHash', 'compiledPromptHash']) assert.match(snapshot[field], /^[a-f0-9]{64}$/);
 });
 
+test('runtime configuration summaries describe ambient shell authority without claiming workspace isolation', async () => {
+  const ambient = {
+    name: 'ambient', implementationId: 'tests/ambient-authority@1', description: 'ambient authority fixture', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema,
+    effectEnvelope: { accesses: [{ mode: 'execute', scope: 'process/ambient' }], lockScopes: ['workspace/files'] },
+    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; },
+    deriveEffects() { return { accesses: [{ mode: 'execute', scope: 'process/ambient' }], lockScopes: ['workspace/files'], idempotency: 'non_idempotent' }; },
+    async invoke() { return { kind: 'result', ok: true, summary: 'not invoked', scope: { resources: ['process/ambient'], coverage: 'complete' }, output: {} }; }
+  };
+  const run = await harness({ withoutSession: true, tools: [ambient], toolPolicy: { allowedRisks: ['read', 'execute'] } });
+  const result = ended(await run.agent.run({ task: 'describe authority' }));
+  const configured = (await eventsFor(run.events, result.runId)).find((event) => event.type === 'run.configured');
+  assert.equal(configured.configuration.authority.ambientShell, true);
+  assert.match(configured.configuration.authority.summary, /read, write, or delete files, access the network, and start child processes/iu);
+  assert.match(configured.configuration.authority.summary, /leases until exit or stop/iu);
+  assert.doesNotMatch(configured.configuration.authority.summary, /isolated|workspace writes.*denied/iu);
+});
+
 test('terminal cleanup prevents steering, retry, and follow-up controls from leaking into a later run', async () => {
   const provider = new ScriptedProvider([response('stop', 'first'), response('stop', 'second')]);
   let agent;
@@ -610,6 +652,33 @@ test('process death after an approved non-idempotent effect recovers as uncertai
   assert.equal(records.filter((event) => event.type === 'tool.started').length, 1);
   assert.equal(records.filter((event) => event.type === 'tool.ended').length, 0);
   assert.equal(records.filter((event) => event.type === 'run.ended').length, 1);
+});
+
+test('crashes while waiting for a lease or after acquisition but before tool.started remain safe to replay', async () => {
+  const fixture = path.resolve('tests/fixtures/approval-crash.mjs');
+  for (const [mode, exitStatus] of [['crash_waiting_for_lease', 44], ['crash_before_started', 45]]) {
+    const root = await mkdtemp(path.join(tmpdir(), `agent-${mode}-`));
+    const initial = spawnSync(process.execPath, [fixture, 'suspend', root], { encoding: 'utf8' });
+    assert.equal(initial.status, 0, initial.stderr);
+    const approval = JSON.parse(initial.stdout);
+
+    const crash = spawnSync(process.execPath, [fixture, mode, root, approval.runId, approval.approvalId, approval.fingerprint], { encoding: 'utf8', timeout: 10_000 });
+    assert.equal(crash.status, exitStatus, crash.stderr);
+    await assert.rejects(() => readFile(path.join(root, 'effect.txt'), 'utf8'), /ENOENT/u);
+
+    const eventRepository = new (await import('@agent-core/evidence/node')).JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
+    let records = await eventsFor(eventRepository, approval.runId);
+    assert.equal(records.filter((event) => event.type === 'tool.started').length, 0, mode);
+    assert.equal(records.filter((event) => event.type === 'tool.ended').length, 0, mode);
+
+    const recovered = spawnSync(process.execPath, [fixture, 'recover', root, approval.runId, approval.approvalId, approval.fingerprint], { encoding: 'utf8', timeout: 10_000 });
+    assert.equal(recovered.status, 0, recovered.stderr);
+    assert.equal(JSON.parse(recovered.stdout).executionStatus, 'completed');
+    assert.equal(await readFile(path.join(root, 'effect.txt'), 'utf8'), 'effect\n');
+    records = await eventsFor(eventRepository, approval.runId);
+    assert.equal(records.filter((event) => event.type === 'tool.started').length, 1, mode);
+    assert.equal(records.filter((event) => event.type === 'tool.ended').length, 1, mode);
+  }
 });
 
 test('process death after tool completion projects the durable observation without replay', async () => {

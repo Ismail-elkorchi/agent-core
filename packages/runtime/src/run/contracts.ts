@@ -258,6 +258,7 @@ interface AgentTerminalBase extends AgentRunIdentity {
   readonly checkResults: readonly AgentCheckResult[];
   readonly budget: AgentRunBudgetState;
   readonly exhaustedLimit?: AgentLimitKind;
+  readonly cleanupDiagnostic?: { readonly kind: 'process_cleanup'; readonly message: string };
 }
 export interface AgentCompletedTerminalSnapshot extends AgentTerminalBase {
   readonly executionStatus: 'completed';
@@ -268,7 +269,7 @@ export interface AgentCompletedTerminalSnapshot extends AgentTerminalBase {
 }
 export interface AgentFailedTerminalSnapshot extends AgentTerminalBase {
   readonly executionStatus: 'failed';
-  readonly candidate: AgentAbsentCandidate | (AgentPresentCandidate & { readonly status: 'partial' });
+  readonly candidate: AgentCandidate;
   readonly verificationStatus: 'not_run';
   readonly terminationReason: AgentFailureTerminationReason;
   readonly errorMessage: string;
@@ -393,7 +394,6 @@ export function parseAgentTerminalSnapshot(value: unknown): AgentTerminalSnapsho
     if (candidate && candidate.status !== 'absent') issues.push(...completedCandidateIssues(value.terminationReason, candidate.status));
     if (value.errorMessage !== undefined) issues.push('Completed execution cannot have errorMessage.');
   } else if (value.executionStatus === 'failed') {
-    if (candidate && candidate.status !== 'absent' && candidate.status !== 'partial') issues.push('Failed execution can only preserve a partial candidate.');
     if (value.verificationStatus !== 'not_run') issues.push('Failed execution must use verificationStatus not_run.');
     if (!oneOf(value.terminationReason, FAILURE_REASONS)) issues.push('Failed execution has an invalid termination reason.');
     if (typeof value.errorMessage !== 'string' || value.errorMessage.trim().length === 0) issues.push('Failed execution requires errorMessage.');
@@ -404,6 +404,7 @@ export function parseAgentTerminalSnapshot(value: unknown): AgentTerminalSnapsho
   } else issues.push('executionStatus is invalid.');
   if (value.terminationReason === 'limit_exhausted' && !oneOf(value.exhaustedLimit, AGENT_LIMIT_KINDS)) issues.push('limit_exhausted requires exhaustedLimit.');
   if (value.terminationReason !== 'limit_exhausted' && value.exhaustedLimit !== undefined) issues.push('exhaustedLimit is only legal for limit_exhausted.');
+  if (value.cleanupDiagnostic !== undefined && (!isRecord(value.cleanupDiagnostic) || value.cleanupDiagnostic.kind !== 'process_cleanup' || typeof value.cleanupDiagnostic.message !== 'string' || value.cleanupDiagnostic.message.length === 0)) issues.push('cleanupDiagnostic is invalid.');
   issues.push(...modelTerminationIssues(value));
   if (issues.length > 0) throw contract('Invalid terminal snapshot.', issues);
   const parsed = { ...value, candidate, checkResults };

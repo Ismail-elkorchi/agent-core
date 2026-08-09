@@ -1,8 +1,8 @@
 import { defineTool, requireWorkspaceRoot, workspaceFileScope } from '@agent-core/tools';
 import { canonicalWorkspacePath } from '../../core/filesystem.js';
-import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
 import { workspaceFileSelector } from '../../core/workspace-file-selection.js';
 import { presentListDirectoryObservation } from '../../core/presenters.js';
+import { builtInReadEvidence } from '../../core/read-evidence.js';
 import { listDirectoryInputSchema, listDirectoryOutputSchema, type ListDirectoryInput } from './schema.js';
 
 interface CanonicalListDirectoryInput extends ListDirectoryInput { readonly path: string }
@@ -20,22 +20,22 @@ export const listDirectoryTool = defineTool({
     return {
       ...input,
       path: await canonicalWorkspacePath(requireWorkspaceRoot(context), input.path),
-      depth: clampRequestedLimit(input.depth, requireLocalToolConfiguration(context).fileSelection.maxDepth)
+      depth: input.depth
     };
   },
   deriveEffects(input) {
     return { accesses: [{ mode: 'read', scope: workspaceFileScope(input.path) }], lockScopes: [], idempotency: 'pure' };
   },
   async invoke(input, context) {
-    const patterns = Array.from({ length: input.depth }, (_unused, index) => `${'*/'.repeat(index)}*`);
     const selected = await workspaceFileSelector(context).select({
       startPath: input.path,
-      patterns,
+      patterns: ['**/*'],
       type: 'any',
       respectGitIgnore: input.respectGitIgnore,
       includeHidden: input.includeHidden,
       exclude: input.exclude,
       ...(input.resultLimit === undefined ? {} : { requestedLimit: input.resultLimit }),
+      traversalDepth: input.depth,
       includeMetadata: input.includeMetadata,
       ...(context.signal ? { signal: context.signal } : {})
     });
@@ -48,11 +48,13 @@ export const listDirectoryTool = defineTool({
       omitted: { ignoreFiles: selected.omittedIgnoreFiles },
       omissionSamples: [...selected.omissionSamples]
     };
+    const scope = { resources: [workspaceFileScope(output.path)], coverage: output.coverage, ...(output.causes.length > 0 ? { causes: output.causes, omitted: { entries: output.counts.omitted } } : {}) } as const;
     return {
       kind: 'result' as const,
       ok: true,
       summary: `Listed ${String(output.counts.returned)} entries under ${output.path}${output.coverage === 'partial' ? ' with partial coverage' : ''}.`,
-      scope: { resources: [workspaceFileScope(output.path)], coverage: output.coverage, ...(output.causes.length > 0 ? { causes: output.causes, omitted: { entries: output.counts.omitted } } : {}) },
+      scope,
+      evidence: builtInReadEvidence('list', scope, `Listed ${String(output.counts.returned)} directory entries.`),
       output
     };
   }

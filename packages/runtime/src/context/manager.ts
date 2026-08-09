@@ -405,6 +405,10 @@ export class ContextManager {
     return this.evidenceRecords.length;
   }
 
+  evidenceSnapshot(): readonly EvidenceRecord[] {
+    return Object.freeze([...this.evidenceRecords]);
+  }
+
   selectContext(input: { items: ContextItemInput[]; maxTokens: number; maxItems?: number; omitted?: ContextOmission[] }): ContextBundle {
     const candidates = input.items.map((item) => this.materializeContextItem(item));
     const omitted = [...(input.omitted ?? [])];

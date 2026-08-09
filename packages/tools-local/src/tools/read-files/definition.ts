@@ -18,7 +18,7 @@ export const readFilesTool = defineTool({
     return { ...input, files: await Promise.all(input.files.map(async (file) => ({ ...file, path: await canonicalWorkspacePath(root, file.path) }))) };
   },
   deriveEffects(input) {
-    return { accesses: input.files.map((file) => ({ mode: 'read' as const, scope: workspaceFileScope(file.path) })), lockScopes: [], idempotency: 'pure' };
+    return { accesses: [...new Set(input.files.map((file) => workspaceFileScope(file.path)))].map((scope) => ({ mode: 'read' as const, scope })), lockScopes: [], idempotency: 'pure' };
   },
   invoke: readFiles
 });

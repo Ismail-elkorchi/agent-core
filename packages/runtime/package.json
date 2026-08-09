@@ -16,7 +16,7 @@
     }
   },
   "files": ["dist", "README.md"],
-  "engines": { "node": ">=24" },
+  "engines": { "node": ">=24.8.0" },
   "dependencies": {
     "@agent-core/evidence": "0.2.0",
     "@agent-core/model": "0.2.0",

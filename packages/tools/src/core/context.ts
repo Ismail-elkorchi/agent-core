@@ -30,7 +30,10 @@ export interface ToolExecutionContext {
   metadata?: Record<string, unknown>;
   invocation?: ToolInvocationContext;
   resourceLease?: ToolResourceLease;
+  /** Ephemeral progress. Callers must not infer durability from stage strings. */
   emitProgress?: (progress: ToolProgress) => void | Promise<void>;
+  /** Explicit durable checkpoint for state transitions that matter during recovery. */
+  persistProgressCheckpoint?: (progress: ToolProgress) => void | Promise<void>;
 }
 
 export interface PatchProgressChange { readonly path: string; readonly operation: 'add' | 'update' | 'delete' | 'move'; readonly status: string }

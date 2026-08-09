@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdir, mkdtemp, rename, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { prepareToolCall } from '@agent-core/tools';
@@ -12,6 +12,7 @@ import {
   findFilesTool,
   listDirectoryTool,
   readFilesTool,
+  requireLocalToolConfiguration,
   searchTextTool
 } from '@agent-core/tools-local';
 
@@ -94,6 +95,26 @@ test('directory and path selection are sorted, Git-aware, hidden-safe, and match
   assert.equal(hiddenTypescript.output.entries.every((entry) => entry.path.endsWith('.ts')), true);
 });
 
+test('local tool hosts retain an owned configuration snapshot after caller mutation', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-core-config-snapshot-'));
+  await writeFile(path.join(root, 'one.txt'), 'one\n');
+  await writeFile(path.join(root, 'two.txt'), 'two\n');
+  const callerOwned = JSON.parse(JSON.stringify(DEFAULT_LOCAL_TOOL_CONFIGURATION));
+  const localToolConfiguration = requireLocalToolConfiguration({ services: { localToolConfiguration: callerOwned } });
+  const context = { policy, services: { workspaceRoot: root, localToolConfiguration } };
+
+  callerOwned.readFiles.maxFiles = 1;
+  callerOwned.readFiles.unexpected = 10;
+  const observation = await invokeToolCall(jsonToolCall('read_files', { files: [{ path: 'one.txt' }, { path: 'two.txt' }] }), [readFilesTool], context);
+  assert.equal(observation.output.returnedFiles, 2);
+  assert.equal(localToolConfiguration.readFiles.maxFiles, DEFAULT_LOCAL_TOOL_CONFIGURATION.readFiles.maxFiles);
+  assert.equal(Object.isFrozen(localToolConfiguration.readFiles), true);
+
+  const invalid = JSON.parse(JSON.stringify(DEFAULT_LOCAL_TOOL_CONFIGURATION));
+  invalid.readFiles.unexpected = 10;
+  assert.throws(() => requireLocalToolConfiguration({ services: { localToolConfiguration: invalid } }), /fields are invalid/iu);
+});
+
 test('directory traversal continues with partial coverage after an unreadable branch', async (t) => {
   const { root, context } = await workspace();
   await mkdir(path.join(root, 'readable'));
@@ -108,6 +129,37 @@ test('directory traversal continues with partial coverage after an unreadable br
     assert.equal(result.output.coverage, 'partial');
     assert.equal(result.output.omissionSamples.some((entry) => entry.reason === 'unreadable'), true);
   }
+});
+
+test('list_directory depth is structural and find_files still traverses to the host depth', async () => {
+  const { root, context } = await workspace();
+  await mkdir(path.join(root, 'a-deep'));
+  await mkdir(path.join(root, 'a-deep', 'branch'));
+  await mkdir(path.join(root, 'z-other'));
+  await writeFile(path.join(root, 'a-deep', 'branch', 'deep.txt'), 'deep\n');
+  await writeFile(path.join(root, 'a-deep', 'first.txt'), 'first\n');
+  await writeFile(path.join(root, 'z-other', 'second.txt'), 'second\n');
+  await writeFile(path.join(root, 'top.txt'), 'top\n');
+
+  const shallowLimits = { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.fileSelection, maxVisitedEntries: 3 };
+  const shallowConfiguration = { ...DEFAULT_LOCAL_TOOL_CONFIGURATION, fileSelection: shallowLimits };
+  const shallowContext = { ...context, services: { ...context.services, localToolConfiguration: shallowConfiguration, workspaceFileSelector: new WorkspaceFileSelector(root, shallowLimits) } };
+  const shallow = await invokeToolCall(jsonToolCall('list_directory', { depth: 1 }), tools, shallowContext);
+  assert.deepEqual(shallow.output.entries.map(entry => entry.path), ['a-deep', 'top.txt', 'z-other']);
+  assert.equal(shallow.output.counts.visited, 3);
+  assert.equal(shallow.output.coverage, 'complete');
+  assert.equal(shallow.output.causes.includes('visit_limit'), false);
+
+  const hostLimited = { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.fileSelection, maxDepth: 1 };
+  const hostConfiguration = { ...DEFAULT_LOCAL_TOOL_CONFIGURATION, fileSelection: hostLimited };
+  const hostContext = { ...context, services: { ...context.services, localToolConfiguration: hostConfiguration, workspaceFileSelector: new WorkspaceFileSelector(root, hostLimited) } };
+  const requestedDeeper = await invokeToolCall(jsonToolCall('list_directory', { depth: 3 }), tools, hostContext);
+  assert.equal(requestedDeeper.output.coverage, 'partial');
+  assert.equal(requestedDeeper.output.causes.includes('depth_limit'), true);
+  assert.equal(requestedDeeper.output.entries.some(entry => entry.path === 'a-deep/first.txt'), false);
+
+  const found = await invokeToolCall(jsonToolCall('find_files', { patterns: ['**/*.txt'] }), tools, context);
+  assert.deepEqual(found.output.entries.map(entry => entry.path), ['a-deep/branch/deep.txt', 'a-deep/first.txt', 'top.txt', 'z-other/second.txt']);
 });
 
 test('read_files streams large ranges, preserves batch failures, and hashes raw selected bytes', async () => {
@@ -127,7 +179,7 @@ test('read_files streams large ranges, preserves batch failures, and hashes raw 
   assert.equal(result.output.files[0].nextStartLine, startLine + 2);
   assert.equal(result.output.files[0].eof, false);
   assert.equal(result.output.files[1].rangeSha256, createHash('sha256').update(Buffer.from('one\r\n')).digest('hex'));
-  assert.equal(result.output.files[1].lineEnding, 'crlf');
+  assert.equal(result.output.files[1].rangeLineEnding, 'crlf');
   assert.equal(result.output.files[1].fullFileSha256, undefined);
   assert.deepEqual(result.output.failures.map((failure) => failure.reason), ['not_found']);
 
@@ -209,6 +261,61 @@ test('read_files reports precise EOF, UTF-8, and batch limit outcomes', async ()
   assert.equal(limited.output.failures.some((failure) => failure.reason === 'batch_file_limit'), true);
 });
 
+test('read_files handles empty files, unterminated final lines, and UTF-8 split across scan chunks', async () => {
+  const { root, context } = await workspace();
+  await writeFile(path.join(root, 'empty.txt'), '');
+  await writeFile(path.join(root, 'no-final-newline.txt'), 'one\ntwo');
+  await writeFile(path.join(root, 'utf8-boundary.txt'), `${'a'.repeat(65_535)}😀\n`);
+  const result = await invokeToolCall(jsonToolCall('read_files', { files: [
+    { path: 'empty.txt', startLine: 1 }, { path: 'no-final-newline.txt' }, { path: 'utf8-boundary.txt' }
+  ] }), tools, context);
+  assert.equal(result.output.files[0].content, '');
+  assert.equal(result.output.files[0].lineCount, 0);
+  assert.equal(result.output.files[0].fileBytes, 0);
+  assert.equal(result.output.files[0].eof, true);
+  assert.equal(result.output.files[0].fullFileSha256, createHash('sha256').update(Buffer.alloc(0)).digest('hex'));
+  assert.equal(result.output.files[1].content, 'one\ntwo');
+  assert.equal(result.output.files[1].lineCount, 2);
+  assert.equal(result.output.files[1].eof, true);
+  assert.match(result.output.files[2].content, /😀\n$/u);
+});
+
+test('read_files detects replacement, growth, and truncation of an opened file', async () => {
+  for (const mutation of ['replace', 'grow', 'truncate']) {
+    const { root, context } = await workspace();
+    const target = path.join(root, 'changing.txt');
+    await writeFile(target, 'line\n'.repeat(1_600_000));
+    const configuration = { ...DEFAULT_LOCAL_TOOL_CONFIGURATION, readFiles: { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.readFiles, maxBytesPerFile: 16 * 1024 * 1024, maxTotalBytes: 16 * 1024 * 1024 } };
+    const changingContext = { ...context, services: { ...context.services, localToolConfiguration: configuration } };
+    let iteration = 0;
+    const timer = setInterval(() => {
+      iteration += 1;
+      if (mutation === 'replace') {
+        const replacement = path.join(root, `replacement-${iteration}.txt`);
+        void writeFile(replacement, `replacement ${iteration}\n`).then(() => rename(replacement, target)).catch(() => undefined);
+      } else if (mutation === 'grow') void appendFile(target, `growth ${iteration}\n`).catch(() => undefined);
+      else void truncate(target, iteration % 2 === 0 ? 1024 : 2048).catch(() => undefined);
+    }, 1);
+    try {
+      const result = await invokeToolCall(jsonToolCall('read_files', { files: [{ path: 'changing.txt' }] }), tools, changingContext);
+      assert.equal(result.kind, 'result');
+      assert.equal(result.output.failures.some(failure => failure.reason === 'file_changed'), true, mutation);
+    } finally { clearInterval(timer); }
+  }
+});
+
+test('read_files observes abort during a long streamed scan', async () => {
+  const { root, context } = await workspace();
+  await writeFile(path.join(root, 'long.txt'), 'line\n'.repeat(1_600_000));
+  const controller = new AbortController();
+  const configuration = { ...DEFAULT_LOCAL_TOOL_CONFIGURATION, readFiles: { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.readFiles, maxBytesPerFile: 16 * 1024 * 1024, maxTotalBytes: 16 * 1024 * 1024 } };
+  const promise = invokeToolCall(jsonToolCall('read_files', { files: [{ path: 'long.txt' }] }), tools, {
+    ...context, signal: controller.signal, services: { ...context.services, localToolConfiguration: configuration }
+  });
+  setTimeout(() => controller.abort('cancel long read'), 1);
+  await assert.rejects(promise, /cancel long read|aborted|abort/iu);
+});
+
 test('search_text handles long repositories, context, per-file limits, abort, and missing ripgrep', async () => {
   const { root, context } = await workspace();
   const many = path.join(root, 'many'); await mkdir(many);
@@ -217,7 +324,8 @@ test('search_text handles long repositories, context, per-file limits, abort, an
     return writeFile(path.join(many, name), index === 1_199 ? 'before\nneedle\nafter\nneedle\n' : 'nothing\n');
   }));
   const long = await invokeToolCall(jsonToolCall('search_text', { path: 'many', query: 'needle', contextLines: 1, perFileLimit: 1 }), tools, context);
-  assert.equal(long.output.status, 'completed');
+  assert.equal(long.output.status, 'partial');
+  assert.deepEqual(long.output.perFileOmissions, [{ path: long.output.results[0].path, cause: 'per_file_limit', retainedMatches: 1, omittedAtLeast: 1 }]);
   assert.equal(long.output.results.length, 1);
   assert.deepEqual(long.output.results[0].context, { before: ['before'], after: ['after'] });
 
@@ -239,4 +347,60 @@ test('search_text handles long repositories, context, per-file limits, abort, an
   } finally {
     if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
   }
+});
+
+test('search_text reports independent per-file omissions in matches and files modes while count mode stays exact', async () => {
+  const { root, context } = await workspace();
+  await writeFile(path.join(root, 'below.txt'), 'needle\n');
+  await writeFile(path.join(root, 'at.txt'), 'needle\nneedle\n');
+  await writeFile(path.join(root, 'above.txt'), 'needle\nneedle\nneedle\n');
+  await writeFile(path.join(root, 'second-above.txt'), 'needle\nneedle\nneedle\nneedle\n');
+
+  const matches = await invokeToolCall(jsonToolCall('search_text', { query: 'needle', mode: 'matches', perFileLimit: 2 }), tools, context);
+  assert.equal(matches.output.status, 'partial');
+  assert.deepEqual(matches.output.perFileOmissions.map(item => [item.path, item.cause, item.retainedMatches, item.omittedAtLeast]), [
+    ['above.txt', 'per_file_limit', 2, 1], ['second-above.txt', 'per_file_limit', 2, 1]
+  ]);
+  assert.deepEqual(Object.fromEntries(matches.output.results.reduce((map, item) => map.set(item.path, (map.get(item.path) ?? 0) + 1), new Map())), {
+    'above.txt': 2, 'at.txt': 2, 'below.txt': 1, 'second-above.txt': 2
+  });
+
+  const counts = await invokeToolCall(jsonToolCall('search_text', { query: 'needle', mode: 'count', perFileLimit: 2 }), tools, context);
+  assert.equal(counts.output.status, 'completed');
+  assert.equal(counts.output.countsCapped, false);
+  assert.deepEqual(counts.output.results.map(item => [item.path, item.matchingLineCount, item.occurrenceCount]), [
+    ['above.txt', 3, 3], ['at.txt', 2, 2], ['below.txt', 1, 1], ['second-above.txt', 4, 4]
+  ]);
+
+  const files = await invokeToolCall(jsonToolCall('search_text', { query: 'needle', mode: 'files', perFileLimit: 1 }), tools, context);
+  assert.deepEqual(files.output.results, ['above.txt', 'at.txt', 'below.txt', 'second-above.txt']);
+  assert.equal(files.output.status, 'partial');
+  assert.deepEqual(files.output.perFileOmissions.map(item => item.path), ['above.txt', 'at.txt', 'second-above.txt']);
+});
+
+test('search_text bounds and parses multi-megabyte ripgrep output without quadratic truncation', async () => {
+  const { root, context } = await workspace();
+  const line = `needle ${'x'.repeat(1_500)}\n`;
+  await writeFile(path.join(root, 'large-search.txt'), line.repeat(2_500));
+  const largeConfiguration = {
+    ...DEFAULT_LOCAL_TOOL_CONFIGURATION,
+    searchText: { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.searchText, maxResults: 3_000, maxOutputBytes: 6 * 1024 * 1024, maxFileBytes: 8 * 1024 * 1024 }
+  };
+  const large = await invokeToolCall(jsonToolCall('search_text', { query: 'needle', mode: 'matches', resultLimit: 3_000, perFileLimit: 3_000 }), tools, {
+    ...context, services: { ...context.services, localToolConfiguration: largeConfiguration }
+  });
+  assert.equal(large.output.status, 'completed');
+  assert.equal(large.output.results.length, 2_500);
+
+  const boundedConfiguration = {
+    ...largeConfiguration,
+    searchText: { ...largeConfiguration.searchText, maxOutputBytes: 20_000 }
+  };
+  const bounded = await invokeToolCall(jsonToolCall('search_text', { query: 'needle', mode: 'matches', resultLimit: 3_000, perFileLimit: 3_000 }), tools, {
+    ...context, services: { ...context.services, localToolConfiguration: boundedConfiguration }
+  });
+  assert.equal(bounded.output.status, 'output_limit');
+  assert.equal(bounded.output.outputTruncated, true);
+  assert.equal(bounded.output.coverage, 'partial');
+  assert.match(bounded.output.diagnostic, /output.*limit|middle.*JSON/iu);
 });

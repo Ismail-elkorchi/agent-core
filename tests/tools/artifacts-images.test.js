@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { InMemoryArtifactRepository } from '@agent-core/evidence';
@@ -59,4 +59,52 @@ test('artifact repositories verify small ranges without breaking UTF-8 boundarie
     assert.equal(range.end, marker + 4);
     assert.equal(range.fullSize, artifact.size);
   }
+});
+
+test('public and protected artifacts have distinct lookup and filesystem visibility', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-core-artifact-visibility-'));
+  const repository = new LocalArtifactRepository({ rootDir: root });
+  const publicRef = await repository.store({ label: 'public', content: new TextEncoder().encode('public'), mediaType: 'text/plain' });
+  const protectedRef = await repository.storeProtected({ label: 'raw', content: new TextEncoder().encode('secret raw'), mediaType: 'text/plain' });
+  assert.equal(publicRef.visibility, 'public');
+  assert.equal(protectedRef.visibility, 'protected');
+  assert.equal((await repository.resolve(publicRef.artifactId)).artifactId, publicRef.artifactId);
+  assert.equal(await repository.resolve(protectedRef.artifactId), undefined);
+  assert.equal(new TextDecoder().decode(await repository.readVerified(protectedRef)), 'secret raw');
+  if (process.platform !== 'win32') {
+    assert.equal((await stat(path.join(root, 'protected'))).mode & 0o777, 0o700);
+    assert.equal((await stat(path.join(root, 'protected', protectedRef.artifactId))).mode & 0o777, 0o600);
+  }
+  const denied = await invokeToolCall(jsonToolCall('read_artifact', { artifactId: protectedRef.artifactId }), tools, {
+    policy: { allowedRisks: ['read'] }, services: { artifactRepository: repository }
+  });
+  assert.equal(denied.kind, 'failure');
+  assert.match(denied.summary, /unknown artifact/iu);
+});
+
+test('verified range cache reuses hashes only for unchanged file identity', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-core-artifact-cache-'));
+  const scans = [];
+  const repository = new LocalArtifactRepository({ rootDir: root, onVerificationScan: artifactId => scans.push(artifactId) });
+  const original = new TextEncoder().encode('a🙂b-' + 'x'.repeat(10_000));
+  const artifact = await repository.store({ label: 'cached', content: original, mediaType: 'text/plain; charset=utf-8' });
+  const target = path.join(root, artifact.artifactId);
+  const first = await repository.readVerifiedRange(artifact, { offset: 2, length: 2 });
+  assert.equal(new TextDecoder('utf8', { fatal: true }).decode(first.bytes), '🙂');
+  await repository.readVerifiedRange(artifact, { offset: 100, length: 10 });
+  assert.equal(scans.length, 1, 'the second unchanged small range reuses the verified hash');
+
+  await writeFile(target, Buffer.alloc(artifact.size, 0x79));
+  await assert.rejects(repository.readVerifiedRange(artifact, { offset: 0, length: 4 }), /SHA-256/u);
+  assert.equal(scans.length, 2);
+  await writeFile(target, original);
+  await repository.readVerifiedRange(artifact, { offset: 0, length: 4 });
+  assert.equal(scans.length, 3, 'restoring contents still invalidates the changed identity');
+
+  const replacement = path.join(root, 'same-size-replacement.tmp');
+  await writeFile(replacement, original);
+  await rename(replacement, target);
+  await repository.readVerifiedRange(artifact, { offset: 0, length: 4 });
+  assert.equal(scans.length, 4, 'same-size replacement invalidates inode-based identity');
+  assert.deepEqual(Buffer.from(await readFile(target)), Buffer.from(original));
 });

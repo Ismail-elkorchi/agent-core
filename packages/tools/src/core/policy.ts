@@ -1,6 +1,9 @@
 import type { ToolDefinition } from './definition.js';
+import { parseJsonObject } from '@agent-core/evidence';
 
 export type ToolRisk = 'read' | 'write' | 'execute' | 'network' | 'destructive';
+
+/** `execute` authorizes ambient process execution unless a host explicitly documents isolation. Ambient execution may indirectly exercise every other operating-system authority. */
 
 export interface ToolPolicy {
   allowedRisks: readonly ToolRisk[];
@@ -10,8 +13,7 @@ export interface ToolPolicy {
 export const READ_ONLY_TOOL_POLICY: ToolPolicy = parseToolPolicy({ allowedRisks: ['read'] });
 
 export function parseToolPolicy(value: unknown): ToolPolicy {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('Tool policy must be an object.');
-  const record = value as Record<string, unknown>;
+  const record = parseJsonObject(value, { maxDepth: 4, maxCollectionEntries: 20, maxStringBytes: 100, maxTotalBytes: 2_000 });
   const unknown = Object.keys(record).filter((key) => key !== 'allowedRisks' && key !== 'dryRunWrites');
   if (unknown.length > 0) throw new Error('Tool policy contains unsupported fields: ' + unknown.join(', ') + '.');
   if (!Array.isArray(record.allowedRisks)) throw new Error('Tool policy must declare allowedRisks.');

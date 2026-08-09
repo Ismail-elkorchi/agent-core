@@ -2,6 +2,7 @@ import type { ArtifactRepository } from '@agent-core/evidence';
 import { artifactScope, defineTool, requireToolService, ToolInputError } from '@agent-core/tools';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
 import { presentReadArtifactObservation } from '../../core/presenters.js';
+import { builtInReadEvidence } from '../../core/read-evidence.js';
 import { readArtifactInputSchema, readArtifactOutputSchema } from './schema.js';
 
 export const readArtifactTool = defineTool({
@@ -46,11 +47,13 @@ export const readArtifactTool = defineTool({
       : coverage === 'complete' && contentType === 'image'
         ? [{ type: 'image' as const, artifact, detail: 'original' as const }]
         : [{ type: 'artifact' as const, artifact }];
+    const scope = { resources: [artifactScope(artifact.artifactId)], coverage, ...(coverage === 'partial' ? { causes: ['requested_range'], limits: { offset: input.offset, byteCount: input.byteCount } } : {}) } as const;
     return {
       kind: 'result' as const,
       ok: true,
       summary: `Read bytes ${String(input.offset)}-${String(end)} of ${String(artifact.size)} from ${artifact.artifactId}.`,
-      scope: { resources: [artifactScope(artifact.artifactId)], coverage, ...(coverage === 'partial' ? { causes: ['requested_range'], limits: { offset: input.offset, byteCount: input.byteCount } } : {}) },
+      scope,
+      evidence: builtInReadEvidence('read', scope, `Read ${String(selected.byteLength)} bytes from artifact ${artifact.artifactId}.`),
       content,
       output
     };

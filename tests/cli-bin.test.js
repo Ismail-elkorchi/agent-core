@@ -8,7 +8,9 @@ import { parseAgentTerminalSnapshot } from '@agent-core/runtime';
 test('CLI exposes local coding tools and explicit risk policy', () => {
   assert.deepEqual(createCliDefaultTools().map(tool => tool.name), ['list_directory', 'find_files', 'read_files', 'search_text', 'apply_patch', 'exec_command', 'write_stdin', 'stop_process', 'view_image', 'read_artifact']);
   assert.throws(() => createCliDefaultTools(['unknown_tool']), /Unknown configured local tools/u);
-  assert.deepEqual(createCliToolPolicy({ apply: true, dryRun: false, allowShell: true, allowUnsafeShell: false }).allowedRisks, ['read', 'write', 'execute']);
+  assert.deepEqual(createCliToolPolicy({ apply: true, dryRun: false, allowShell: true, allowUnsafeShell: false }).allowedRisks, ['read', 'write', 'destructive', 'execute']);
+  assert.deepEqual(createCliToolPolicy({ apply: true, dryRun: false, allowShell: false, allowUnsafeShell: false }).allowedRisks, ['read', 'write', 'destructive'], 'patch writes do not grant shell execution');
+  assert.deepEqual(createCliToolPolicy({ apply: false, dryRun: false, allowShell: true, allowUnsafeShell: false }).allowedRisks, ['read', 'execute'], 'shell execution does not grant apply_patch writes');
 });
 
 test('CLI exit codes distinguish success, candidate completeness, verification, failure, and abort', () => {
@@ -25,6 +27,10 @@ test('CLI binary help works through the published executable', async () => {
   assert.equal(output.code, 0);
   assert.match(output.stdout + output.stderr, /agent-core/i);
   assert.match(output.stdout + output.stderr, /approval <allow\|deny> <run-id> <approval-id> <fingerprint>/u);
+  assert.match(output.stdout + output.stderr, /ambient shell authority runs with this Agent Core process's permissions/iu);
+  assert.match(output.stdout + output.stderr, /read, write, or delete files, access the network, and start child processes/iu);
+  assert.match(output.stdout + output.stderr, /Persistent ambient processes block conflicting workspace tools until they exit or stop/iu);
+  assert.match(output.stdout + output.stderr, /--apply\s+Allow apply_patch add, update, move, and delete operations/iu);
 });
 
 function result(overrides = {}) { return { state: 'ended', terminal: parseAgentTerminalSnapshot({ ...base(), ...overrides }), deliveryDiagnostics: [] }; }

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ModelContractError,
+  SimpleTokenEstimator,
   assertModelRequestSupported,
   parseModelProfile,
   parseModelRequest,
@@ -29,6 +30,31 @@ test('model request validation rejects illegal message combinations and unsafe o
     () => parseModelRequest({ model: 'test', messages: [{ role: 'tool', content: 'result', toolName: 'read', toolCallType: 'invalid' }], providerOptions: { provider: 'test', values: cyclic } }),
     error => error instanceof ModelContractError && /toolCallType/.test(error.message) && /JSON-safe/.test(error.message)
   );
+});
+
+test('tool-result images validate, require image input support, and consume estimated tokens', () => {
+  const request = parseModelRequest({
+    model: 'test',
+    messages: [{ role: 'tool', content: 'image result', toolName: 'view_image', toolCallType: 'function', toolCallId: 'call', images: [{ type: 'base64', data: 'aGVsbG8=', mediaType: 'image/png', detail: 'original' }] }]
+  });
+  assert.equal(request.messages[0].images.length, 1);
+  assert.throws(() => assertModelRequestSupported(profile, request), error => error instanceof ModelContractError && /image input/u.test(error.message));
+  const imageProfile = parseModelProfile({ ...profile, modalities: { input: ['text', 'image'], output: ['text'] } });
+  assert.doesNotThrow(() => assertModelRequestSupported(imageProfile, request));
+  const estimator = new SimpleTokenEstimator();
+  assert.ok(estimator.estimateMessages(request.messages) >= estimator.estimateImage(request.messages[0].images[0]));
+  assert.ok(estimator.estimateImage(request.messages[0].images[0]) > 0);
+});
+
+test('model JSON boundaries reject metadata accessors and own tool-call input', () => {
+  const metadata = {};
+  Object.defineProperty(metadata, 'secret', { enumerable: true, get() { throw new Error('must not execute'); } });
+  assert.throws(() => parseModelRequest({ model: 'test', messages: [{ role: 'user', content: 'hello' }], metadata }), /metadata/u);
+  const input = { path: 'before.txt' };
+  const request = parseModelRequest({ model: 'test', messages: [{ role: 'assistant', content: '', toolCalls: [{ id: 'call', type: 'function', name: 'read_files', input: { kind: 'json', value: input } }] }] });
+  input.path = 'after.txt';
+  assert.equal(request.messages[0].toolCalls[0].input.value.path, 'before.txt');
+  assert.equal(Object.isFrozen(request.messages[0].toolCalls[0].input.value), true);
 });
 
 test('request/profile validation rejects unsupported controls and reasoning combinations', () => {

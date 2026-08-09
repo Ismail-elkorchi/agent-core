@@ -1,4 +1,5 @@
-import { requireToolService, type ToolExecutionContext } from '@agent-core/tools';
+import { parseJsonObject } from '@agent-core/evidence';
+import { type ToolExecutionContext } from '@agent-core/tools';
 
 export interface LocalToolConfiguration {
   readonly fileSelection: { readonly maxDepth: number; readonly maxVisitedEntries: number; readonly maxReturnedEntries: number; readonly maxIgnoreFiles: number; readonly maxGlobExpansions: number };
@@ -34,23 +35,29 @@ const DEFAULTS: LocalToolConfiguration = {
   artifact: { maxReadBytes: 2_000_000, maxImageBytes: 20_000_000 }
 };
 export const DEFAULT_LOCAL_TOOL_CONFIGURATION = parseLocalToolConfiguration(DEFAULTS);
+const CONFIGURATION_SNAPSHOTS = new WeakMap<object, LocalToolConfiguration>();
 
 export function parseLocalToolConfiguration(value: unknown): LocalToolConfiguration {
-  if (!record(value)) throw new Error('Local tool configuration must be an object.');
-  exactKeys(value, ['fileSelection', 'readFiles', 'searchText', 'applyPatch', 'process', 'artifact'], 'Local tool configuration');
+  const owned = parseJsonObject(value, { maxDepth: 8, maxCollectionEntries: 100, maxStringBytes: 1_000, maxTotalBytes: 32_000 });
+  exactKeys(owned, ['fileSelection', 'readFiles', 'searchText', 'applyPatch', 'process', 'artifact'], 'Local tool configuration');
   return Object.freeze({
-    fileSelection: group(value.fileSelection, ['maxDepth', 'maxVisitedEntries', 'maxReturnedEntries', 'maxIgnoreFiles', 'maxGlobExpansions'], 'fileSelection'),
-    readFiles: group(value.readFiles, ['maxFiles', 'maxLinesPerFile', 'maxBytesPerFile', 'maxTotalBytes'], 'readFiles'),
-    searchText: group(value.searchText, ['maxResults', 'maxOutputBytes', 'maxFileBytes'], 'searchText'),
-    applyPatch: group(value.applyPatch, ['maxPatchBytes', 'maxOperations', 'maxFileBytes', 'maxNewBytesPerFile'], 'applyPatch'),
-    process: group(value.process, ['maxYieldMs', 'maxTimeoutMs', 'maxOutputTokens', 'maxCapturedBytes', 'tailBytes', 'maxActiveProcessesPerRun', 'maxActiveProcesses', 'maxTotalCapturedBytes', 'maxProcessLifetimeMs', 'completedRetentionMs', 'maxPendingOutputBytes'], 'process'),
-    artifact: group(value.artifact, ['maxReadBytes', 'maxImageBytes'], 'artifact')
+    fileSelection: group(owned.fileSelection, ['maxDepth', 'maxVisitedEntries', 'maxReturnedEntries', 'maxIgnoreFiles', 'maxGlobExpansions'], 'fileSelection'),
+    readFiles: group(owned.readFiles, ['maxFiles', 'maxLinesPerFile', 'maxBytesPerFile', 'maxTotalBytes'], 'readFiles'),
+    searchText: group(owned.searchText, ['maxResults', 'maxOutputBytes', 'maxFileBytes'], 'searchText'),
+    applyPatch: group(owned.applyPatch, ['maxPatchBytes', 'maxOperations', 'maxFileBytes', 'maxNewBytesPerFile'], 'applyPatch'),
+    process: group(owned.process, ['maxYieldMs', 'maxTimeoutMs', 'maxOutputTokens', 'maxCapturedBytes', 'tailBytes', 'maxActiveProcessesPerRun', 'maxActiveProcesses', 'maxTotalCapturedBytes', 'maxProcessLifetimeMs', 'completedRetentionMs', 'maxPendingOutputBytes'], 'process'),
+    artifact: group(owned.artifact, ['maxReadBytes', 'maxImageBytes'], 'artifact')
   }) as LocalToolConfiguration;
 }
 export function requireLocalToolConfiguration(context: ToolExecutionContext): LocalToolConfiguration {
   const configured = context.services?.localToolConfiguration;
   if (configured === undefined) return DEFAULT_LOCAL_TOOL_CONFIGURATION;
-  return requireToolService(context, 'localToolConfiguration', isLocalToolConfiguration, 'LocalToolConfiguration');
+  if (!record(configured)) throw new Error('Tool service localToolConfiguration is invalid; expected LocalToolConfiguration.');
+  const cached = CONFIGURATION_SNAPSHOTS.get(configured);
+  if (cached) return cached;
+  const parsed = parseLocalToolConfiguration(configured);
+  CONFIGURATION_SNAPSHOTS.set(configured, parsed);
+  return parsed;
 }
 export function clampRequestedLimit(requested: number | undefined, configured: number): number { return Math.min(requested ?? configured, configured); }
 function group(value: unknown, keys: readonly string[], label: string): Readonly<Record<string, number>> {
@@ -68,8 +75,5 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[], labe
   const unknown = Object.keys(value).filter((key) => !keys.includes(key));
   const missing = keys.filter((key) => !(key in value));
   if (unknown.length > 0 || missing.length > 0) throw new Error(label + ' fields are invalid. Unknown: ' + unknown.join(', ') + '; missing: ' + missing.join(', ') + '.');
-}
-function isLocalToolConfiguration(value: unknown): value is LocalToolConfiguration {
-  try { parseLocalToolConfiguration(value); return true; } catch { return false; }
 }
 function record(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }

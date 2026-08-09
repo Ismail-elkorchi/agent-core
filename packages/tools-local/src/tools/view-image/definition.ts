@@ -4,6 +4,7 @@ import type { ArtifactRepository } from '@agent-core/evidence';
 import { artifactScope, defineTool, requireToolService, requireWorkspaceRoot, ToolInputError, workspaceFileScope } from '@agent-core/tools';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
 import { assertRealPathInsideRoot, canonicalWorkspacePath, resolveInsideRoot } from '../../core/filesystem.js';
+import { builtInReadEvidence } from '../../core/read-evidence.js';
 import { viewImageInputSchema, viewImageOutputSchema } from './schema.js';
 
 export const viewImageTool = defineTool({
@@ -48,11 +49,13 @@ export const viewImageTool = defineTool({
       ...(image.height === undefined ? {} : { height: image.height }),
       artifact
     };
+    const scope = { resources: [workspaceFileScope(input.path), artifactScope(artifact.artifactId)], coverage: 'complete' as const };
     return {
       kind: 'result' as const,
       ok: true,
       summary: `Loaded image ${input.path} (${String(stat.size)} bytes).`,
-      scope: { resources: [workspaceFileScope(input.path), artifactScope(artifact.artifactId)], coverage: 'complete' },
+      scope,
+      evidence: builtInReadEvidence('read', scope, `Read workspace image ${input.path}.`),
       content: [{ type: 'image' as const, artifact, detail: input.detail }],
       output
     };

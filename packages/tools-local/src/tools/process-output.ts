@@ -6,6 +6,7 @@ export const artifactRefSchema = z.strictObject({
   sha256: z.string().regex(/^[a-f0-9]{64}$/u),
   size: z.int().nonnegative(),
   mediaType: z.string(),
+  visibility: z.literal('public'),
   label: z.string().optional(),
   description: z.string().optional()
 });
@@ -32,7 +33,9 @@ export const processOutputSchema = z.strictObject({
   artifact: artifactRefSchema.optional(),
   exitCode: z.int().nullable().optional(),
   signal: z.string().nullable().optional(),
-  diagnostic: z.string().optional()
+  diagnostic: z.string().optional(),
+  progressDroppedEvents: z.int().nonnegative().optional(),
+  progressDeliveryErrors: z.int().nonnegative().optional()
 });
 
 export function isSuccessfulProcessResult(result: ProcessPollResult): boolean {

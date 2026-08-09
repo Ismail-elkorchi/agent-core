@@ -19,7 +19,6 @@ export const stopProcessTool = defineTool({
     const manager = requireToolService<ProcessManager>(context, 'processManager', isProcessManager, 'ProcessManager');
     const owner = processOwner(context.invocation);
     await manager.stop(input.processId, owner);
-    await context.emitProgress?.({ type: 'status', stage: 'process_stopped', message: 'Process stopped.' });
     const result = await manager.poll(input.processId, input.outputTokenBudget, 0, input.afterCursor, owner);
     return {
       kind: 'result' as const, ok: true, summary: 'Process ' + result.processId + ' is ' + result.status + '.',

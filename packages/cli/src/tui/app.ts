@@ -650,7 +650,12 @@ function effectSummary(approval: AgentApprovalRequest): string {
     ))
     : [];
   if (accesses.length === 0) return 'tool operation';
-  return accesses.map((access) => `${access.mode.replaceAll('_', ' ')} · ${access.scope}`).join(', ');
+  const summary = accesses.map((access) => `${access.mode.replaceAll('_', ' ')} · ${access.scope}`).join(', ');
+  const ambient = accesses.some((access) => access.mode === 'execute')
+    && Array.isArray(approval.effects.lockScopes) && approval.effects.lockScopes.includes('workspace/files');
+  return ambient
+    ? `${summary}. Ambient shell authority can read, write, or delete files, access the network, and start child processes.`
+    : summary;
 }
 
 function approvalSubject(approval: AgentApprovalRequest): string {

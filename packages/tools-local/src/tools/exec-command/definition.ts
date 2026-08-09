@@ -11,7 +11,7 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
   return defineTool({
     name: 'exec_command',
     implementationId: 'agent-core.exec-command.v1',
-    description: 'Start a persistent workspace command and return output produced before the yield time.',
+    description: 'Start an ambient persistent shell command under the permissions of the Agent Core process. It can indirectly read, write, or delete files, access the network, and start child processes.',
     schema: execCommandSchema(ptySupported),
     outputSchema: execCommandOutputSchema,
     presentObservation: presentProcessObservation,
@@ -35,14 +35,19 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
     async invoke(input, context) {
       const manager = requireToolService<ProcessManager>(context, 'processManager', isProcessManager, 'ProcessManager');
       const owner = processOwner(context.invocation);
-      await context.emitProgress?.({ type: 'status', stage: 'process_started', message: 'Starting process.' });
-      const result = await manager.start({
-        command: input.command, cwd: resolveInsideRoot(requireWorkspaceRoot(context), input.workdir), pty: input.pty,
-        timeoutMs: input.timeoutMs, yieldMs: input.yieldMs, outputTokenBudget: input.outputTokenBudget, owner,
-        ...(context.signal ? { signal: context.signal } : {}), ...(context.resourceLease ? { lease: context.resourceLease } : {}),
-        onOutput: (stream, sequence, text, observedBytes) => context.emitProgress?.({ type: 'output', stream, sequence, text, observedBytes })
-      });
-      await context.emitProgress?.({ type: 'status', stage: result.status === 'running' ? 'process_started' : 'process_stopped', message: 'Process ' + result.status + '.' });
+      await context.emitProgress?.({ type: 'status', stage: 'process_starting', message: 'Starting ambient process.' });
+      let result;
+      try {
+        result = await manager.start({
+          command: input.command, cwd: resolveInsideRoot(requireWorkspaceRoot(context), input.workdir), pty: input.pty,
+          timeoutMs: input.timeoutMs, yieldMs: input.yieldMs, outputTokenBudget: input.outputTokenBudget, owner,
+          ...(context.signal ? { signal: context.signal } : {}), ...(context.resourceLease ? { lease: context.resourceLease } : {}),
+          onProgress: (progress) => context.emitProgress?.(progress)
+        });
+      } catch (error) {
+        await context.emitProgress?.({ type: 'status', stage: 'process_failed', message: error instanceof Error ? error.message : String(error) });
+        throw error;
+      }
       return {
         kind: 'result' as const, ok: isSuccessfulProcessResult(result),
         summary: result.status === 'running' ? 'Process continues as ' + result.processId + '.' : 'Process ' + result.status + (result.exitCode === undefined ? '' : ' with exit code ' + String(result.exitCode)) + '.',

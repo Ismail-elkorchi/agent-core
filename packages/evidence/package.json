@@ -10,5 +10,5 @@
     "./node": "./dist/node.js"
   },
   "files": ["dist", "README.md"],
-  "engines": { "node": ">=24" }
+  "engines": { "node": ">=24.8.0" }
 }

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { normalizeJsonSafe } from './json.js';
 
-export interface ArtifactRef {
+interface ArtifactRefBase {
   readonly artifactId: string;
   readonly sha256: string;
   readonly size: number;
@@ -9,6 +9,9 @@ export interface ArtifactRef {
   readonly label?: string;
   readonly description?: string;
 }
+export interface PublicArtifactRef extends ArtifactRefBase { readonly visibility: 'public' }
+export interface ProtectedArtifactRef extends ArtifactRefBase { readonly visibility: 'protected' }
+export type ArtifactRef = PublicArtifactRef | ProtectedArtifactRef;
 
 export interface ArtifactStoreInput {
   readonly label: string;
@@ -24,11 +27,11 @@ export interface ArtifactRange {
 }
 
 export interface ArtifactRepository {
-  store(input: ArtifactStoreInput): Promise<ArtifactRef>;
-  storeProtected(input: ArtifactStoreInput): Promise<ArtifactRef>;
+  store(input: ArtifactStoreInput): Promise<PublicArtifactRef>;
+  storeProtected(input: ArtifactStoreInput): Promise<ProtectedArtifactRef>;
   readVerified(ref: ArtifactRef): Promise<Uint8Array>;
   readVerifiedRange(ref: ArtifactRef, input: { readonly offset: number; readonly length: number }): Promise<ArtifactRange>;
-  resolve(artifactId: string): Promise<ArtifactRef | undefined>;
+  resolve(artifactId: string): Promise<PublicArtifactRef | undefined>;
 }
 
 export class ArtifactIntegrityError extends Error {
@@ -44,21 +47,23 @@ export class InMemoryArtifactRepository implements ArtifactRepository {
   private readonly content = new Map<string, Uint8Array>();
   private readonly references = new Map<string, ArtifactRef>();
 
-  store(input: ArtifactStoreInput): Promise<ArtifactRef> {
+  store(input: ArtifactStoreInput): Promise<PublicArtifactRef> {
     return this.storeWithPrefix(input, '');
   }
 
-  storeProtected(input: ArtifactStoreInput): Promise<ArtifactRef> {
+  storeProtected(input: ArtifactStoreInput): Promise<ProtectedArtifactRef> {
     return this.storeWithPrefix(input, 'protected-');
   }
 
-  private storeWithPrefix(input: ArtifactStoreInput, prefix: string): Promise<ArtifactRef> {
+  private storeWithPrefix(input: ArtifactStoreInput, prefix: ''): Promise<PublicArtifactRef>;
+  private storeWithPrefix(input: ArtifactStoreInput, prefix: 'protected-'): Promise<ProtectedArtifactRef>;
+  private storeWithPrefix(input: ArtifactStoreInput, prefix: '' | 'protected-'): Promise<PublicArtifactRef | ProtectedArtifactRef> {
     const bytes = new Uint8Array(input.content);
     const mediaType = input.mediaType ?? 'application/octet-stream';
     const sha256 = hashArtifactBytes(bytes);
     const artifactId = `${prefix}${sha256}${artifactExtension(mediaType)}`;
     this.content.set(artifactId, bytes);
-    const ref = freezeArtifactRef({ artifactId, sha256, size: bytes.byteLength, mediaType, label: safeArtifactLabel(input.label), ...(input.description ? { description: input.description } : {}) });
+    const ref = freezeArtifactRef({ artifactId, sha256, size: bytes.byteLength, mediaType, visibility: prefix === 'protected-' ? 'protected' : 'public', label: safeArtifactLabel(input.label), ...(input.description ? { description: input.description } : {}) });
     this.references.set(artifactId, ref);
     return Promise.resolve(ref);
   }
@@ -80,10 +85,13 @@ export class InMemoryArtifactRepository implements ArtifactRepository {
     return Object.freeze({ offset: range.offset, end: range.end, bytes: new Uint8Array(bytes.subarray(range.offset, range.end)), fullSize: bytes.byteLength });
   }
 
-  resolve(artifactId: string): Promise<ArtifactRef | undefined> { return Promise.resolve(artifactId.startsWith('protected-') ? undefined : this.references.get(artifactId)); }
+  resolve(artifactId: string): Promise<PublicArtifactRef | undefined> {
+    const value = artifactId.startsWith('protected-') ? undefined : this.references.get(artifactId);
+    return Promise.resolve(value?.visibility === 'public' ? value : undefined);
+  }
 }
 
-export async function storeJsonArtifact(repository: ArtifactRepository, label: string, value: unknown, description?: string): Promise<ArtifactRef> {
+export async function storeJsonArtifact(repository: ArtifactRepository, label: string, value: unknown, description?: string): Promise<PublicArtifactRef> {
   const normalized = normalizeJsonSafe(value);
   return repository.store({
     label,
@@ -97,13 +105,19 @@ export function validateArtifactRef(value: unknown): asserts value is ArtifactRe
   if (!isRecord(value) || typeof value.artifactId !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/u.test(value.artifactId)
     || typeof value.sha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(value.sha256)
     || typeof value.size !== 'number' || !Number.isInteger(value.size) || value.size < 0
-    || typeof value.mediaType !== 'string' || value.mediaType.trim().length === 0) {
+    || typeof value.mediaType !== 'string' || value.mediaType.trim().length === 0
+    || (value.visibility !== 'public' && value.visibility !== 'protected')
+    || (value.visibility === 'protected') !== value.artifactId.startsWith('protected-')) {
     throw new Error('Invalid artifact reference.');
   }
 }
+export function validatePublicArtifactRef(value: unknown): asserts value is PublicArtifactRef {
+  validateArtifactRef(value);
+  if (value.visibility !== 'public') throw new Error('Protected artifacts are not model-readable.');
+}
 
 export function hashArtifactBytes(content: Uint8Array): string { return createHash('sha256').update(content).digest('hex'); }
-export function freezeArtifactRef(ref: ArtifactRef): ArtifactRef { return Object.freeze(ref); }
+export function freezeArtifactRef<T extends ArtifactRef>(ref: T): T { return Object.freeze(ref); }
 export function artifactExtension(mediaType: string): string {
   if (mediaType.startsWith('image/png')) return '.png';
   if (mediaType.startsWith('image/jpeg')) return '.jpg';

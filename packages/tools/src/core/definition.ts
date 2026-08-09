@@ -1,4 +1,4 @@
-import type { ArtifactRef, ToolEvidenceDelta } from '@agent-core/evidence';
+import type { PublicArtifactRef, ToolEvidenceDelta } from '@agent-core/evidence';
 import type * as z from 'zod';
 import type { ToolExecutionContext, ToolPreparationContext } from './context.js';
 import type { ToolObservationPresentation, ToolObservationPresentationRequest } from './observation-presentation.js';
@@ -25,8 +25,8 @@ export interface ToolScope {
 
 export type ToolContent =
   | { readonly type: 'text'; readonly text: string; readonly mediaType?: string }
-  | { readonly type: 'image'; readonly artifact: ArtifactRef; readonly detail: 'high' | 'original' }
-  | { readonly type: 'artifact'; readonly artifact: ArtifactRef };
+  | { readonly type: 'image'; readonly artifact: PublicArtifactRef; readonly detail: 'high' | 'original' }
+  | { readonly type: 'artifact'; readonly artifact: PublicArtifactRef };
 
 export type ModelInputModality = 'text' | 'image';
 export interface ToolRequirements {

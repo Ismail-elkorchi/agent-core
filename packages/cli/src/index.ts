@@ -257,8 +257,8 @@ async function createRuntime(
       showReasoning: options.showReasoning,
       sessionLocation: sessionBinding.repository.location(sessionBinding.session.id),
       permissions: {
-        workspaceWrites: options.apply ? 'allowed' : options.dryRun ? 'dry_run' : 'denied',
-        shell: options.allowShell ? 'allowed' : 'denied'
+        workspaceWrites: options.apply ? 'allowed' : options.dryRun ? 'dry_run' : options.allowShell ? 'ambient_shell' : 'denied',
+        shell: options.allowShell ? 'ambient' : 'denied'
       }
     }
   };
@@ -266,7 +266,7 @@ async function createRuntime(
 
 export function createCliLocalToolHost(workspace: WorkspaceLayout, artifactStore: LocalArtifactRepository, enabled?: readonly string[]) {
   const localToolConfiguration = DEFAULT_LOCAL_TOOL_CONFIGURATION;
-  const processManager = new ProcessManager({ artifactRepository: artifactStore, ...localToolConfiguration.process });
+  const processManager = new ProcessManager({ artifactRepository: artifactStore, ledgerDirectory: path.join(workspace.runtimeDir, 'processes'), ...localToolConfiguration.process });
   const workspaceFileSelector = new WorkspaceFileSelector(workspace.workspaceRoot, localToolConfiguration.fileSelection);
   const services = Object.freeze({
     workspaceRoot: workspace.workspaceRoot,
@@ -574,7 +574,7 @@ async function loginAuth(provider: CliAuthProviderId): Promise<void> {
 export function createCliToolPolicy(options: CliToolPolicyOptions): ToolPolicy {
   const allowedRisks: ToolRisk[] = ['read'];
   if (options.apply) {
-    allowedRisks.push('write');
+    allowedRisks.push('write', 'destructive');
   }
   if (options.allowShell) {
     allowedRisks.push('execute');
@@ -1096,8 +1096,10 @@ Usage:
   agent-core
 
 Safety defaults:
-  The agent does not write files unless --apply or --dry-run is supplied.
-  The agent does not execute shell commands unless --allow-shell is supplied.
+  Structured patch mutation is disabled unless --apply or --dry-run is supplied.
+  Ambient shell execution is disabled unless --allow-shell is supplied.
+  Ambient shell authority runs with this Agent Core process's permissions and can indirectly read, write, or delete files, access the network, and start child processes.
+  Persistent ambient processes block conflicting workspace tools until they exit or stop.
 
 Common options:
   --root <dir>           Workspace root. Default: current directory.
@@ -1114,9 +1116,9 @@ Common options:
   --show-reasoning       Stream separate model reasoning or reasoning summaries to stderr.
   --tui                  Use the terminal-ui TUI surface for direct task output.
   --plain                Use readline fallback for interactive mode.
-  --apply                Allow file writes through confined edit/write tools.
+  --apply                Allow apply_patch add, update, move, and delete operations.
   --dry-run              Validate writes without changing files.
-  --allow-shell          Allow shell command execution. Does not imply --apply.
+  --allow-shell          Allow ambient shell execution with process-level file, network, and child-process authority. Does not authorize apply_patch.
   --resume               Resume the latest session for this workspace.
   --session <path>       Open or create a specific session JSONL file.
   --branch <entry-id>    Branch the active session from a prior entry before running.

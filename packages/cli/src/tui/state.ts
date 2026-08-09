@@ -21,8 +21,8 @@ export interface AgentTuiRuntimeDetails {
   readonly showReasoning?: boolean;
   readonly sessionLocation?: string;
   readonly permissions?: {
-    readonly workspaceWrites: 'denied' | 'dry_run' | 'allowed';
-    readonly shell: 'denied' | 'allowed';
+    readonly workspaceWrites: 'denied' | 'dry_run' | 'allowed' | 'ambient_shell';
+    readonly shell: 'denied' | 'ambient';
   };
 }
 

@@ -4,13 +4,15 @@ import path from 'node:path';
 import { AgentRuntime, agentEventCodec } from '@agent-core/runtime';
 import { JsonlEventRepository, LocalArtifactRepository } from '@agent-core/evidence/node';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
+import { ResourceLeaseCoordinator } from '@agent-core/tools';
 
 const [mode, root, runId, approvalId, fingerprint] = process.argv.slice(2);
 if (!mode || !root) throw new Error('mode and root are required');
 
 const storedEvents = new JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
-const events = mode === 'crash_after_ended' ? {
+const events = mode === 'crash_after_ended' || mode === 'crash_before_started' ? {
   async append(...args) {
+    if (mode === 'crash_before_started' && args[1]?.type === 'tool.started') process.exit(45);
     const record = await storedEvents.append(...args);
     if (args[1]?.type === 'tool.ended') process.exit(43);
     return record;
@@ -52,6 +54,11 @@ const tool = {
   }
 };
 
+const resourceLeases = new ResourceLeaseCoordinator();
+if (mode === 'crash_waiting_for_lease') {
+  await resourceLeases.acquire({ accesses: [{ mode: 'write', scope: 'fixture/effect' }], lockScopes: ['fixture/effect'], idempotency: 'non_idempotent' }, 'fixture-blocker');
+}
+
 const agent = new AgentRuntime({
   provider,
   model: 'fixture',
@@ -59,7 +66,11 @@ const agent = new AgentRuntime({
   repositories: { events, session: { repository: sessions, sessionId }, artifacts },
   tools: [tool],
   toolPolicy: { allowedRisks: ['read', 'write'] },
-  toolAuthorizer: () => ({ decision: 'require_approval', reason: 'confirm crash fixture' })
+  toolAuthorizer: () => ({ decision: 'require_approval', reason: 'confirm crash fixture' }),
+  toolContext: { services: { processManager: { resourceLeases } } },
+  onProgress(event) {
+    if (mode === 'crash_waiting_for_lease' && event.type === 'tool.updated' && event.progress.stage === 'resource_lease_waiting') process.exit(44);
+  }
 });
 
 if (mode === 'suspend') {

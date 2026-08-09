@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { type ModelReasoningRequest, parseModelReasoningRequest } from '@agent-core/model';
+import { parseJsonObject } from '@agent-core/evidence';
 
 export interface AgentCoreInstructionConfiguration { readonly path: string }
 export interface AgentCoreCheckConfiguration { readonly id: string; readonly command: string; readonly timeoutMs?: number; readonly maxOutputBytes?: number }
@@ -40,8 +41,9 @@ export async function loadAgentCoreConfiguration(rootDir: string, configPath = '
   return parseAgentCoreConfiguration(value);
 }
 
-export function parseAgentCoreConfiguration(value: unknown): AgentCoreConfiguration {
-  if (!isRecord(value) || value.version !== 1) throw new Error('Agent Core configuration must be a version 1 object.');
+export function parseAgentCoreConfiguration(input: unknown): AgentCoreConfiguration {
+  const value = parseJsonObject(input, { maxDepth: 16, maxCollectionEntries: 10_000, maxStringBytes: 1_000_000, maxTotalBytes: 4_000_000 });
+  if (value.version !== 1) throw new Error('Agent Core configuration must be a version 1 object.');
   if (Object.keys(value).some((key) => !['version', 'provider', 'model', 'reasoning', 'instructions', 'tools', 'authorization', 'verification', 'limits', 'session'].includes(key))) throw new Error('Agent Core configuration contains unknown fields.');
   if (!isProvider(value.provider) || typeof value.model !== 'string' || value.model.length === 0) throw new Error('Configuration provider/model is invalid.');
   if (!instructionArray(value.instructions)) throw new Error('Workspace instructions must contain confined relative paths.');
@@ -53,10 +55,16 @@ export function parseAgentCoreConfiguration(value: unknown): AgentCoreConfigurat
   if (!approvalRisks.every((risk) => allowedRisks.includes(risk))) throw new Error('Approval risks must also be present in authorization.allowedRisks.');
   const verification = value.verification;
   if (!isRecord(verification) || Object.keys(verification).some((key) => key !== 'required' && key !== 'advisory') || !checkArray(verification.required) || !checkArray(verification.advisory)) throw new Error('Verification configuration is invalid.');
-  if (!sessionConfiguration(value.session)) throw new Error('Session configuration is invalid.');
+  const session = value.session;
+  if (!sessionConfiguration(session)) throw new Error('Session configuration is invalid.');
   const reasoning = value.reasoning === undefined ? undefined : parseModelReasoningRequest(value.reasoning);
-  if (value.limits !== undefined && !validLimits(value.limits)) throw new Error('Run limits are invalid.');
-  const checkIds = [...verification.required, ...verification.advisory].map((item) => item.id);
+  const limits = value.limits;
+  let ownedLimits: AgentCoreLimitConfiguration | undefined;
+  if (limits !== undefined) {
+    if (!validLimits(limits)) throw new Error('Run limits are invalid.');
+    ownedLimits = limits;
+  }
+  const checkIds = verification.required.map((item) => item.id).concat(verification.advisory.map((item) => item.id));
   if (new Set(checkIds).size !== checkIds.length) throw new Error('Verification check IDs must be unique.');
   return Object.freeze({
     version: 1,
@@ -64,11 +72,11 @@ export function parseAgentCoreConfiguration(value: unknown): AgentCoreConfigurat
     model: value.model,
     ...(reasoning === undefined ? {} : { reasoning }),
     instructions: Object.freeze(value.instructions.map((item) => Object.freeze({ path: item.path }))),
-    tools: Object.freeze({ enabled: Object.freeze([...value.tools.enabled]) }),
-    authorization: Object.freeze({ allowedRisks: Object.freeze([...allowedRisks]), requireApprovalFor: Object.freeze([...approvalRisks]) }),
+    tools: Object.freeze({ enabled: Object.freeze(value.tools.enabled.map((tool) => tool)) }),
+    authorization: Object.freeze({ allowedRisks: Object.freeze(allowedRisks.map((risk) => risk)), requireApprovalFor: Object.freeze(approvalRisks.map((risk) => risk)) }),
     verification: Object.freeze({ required: Object.freeze(verification.required.map(snapshotCheck)), advisory: Object.freeze(verification.advisory.map(snapshotCheck)) }),
-    ...(value.limits === undefined ? {} : { limits: Object.freeze({ ...value.limits }) }),
-    session: Object.freeze({ ...value.session })
+    ...(ownedLimits === undefined ? {} : { limits: Object.freeze({ ...ownedLimits }) }),
+    session: Object.freeze({ ...session })
   });
 }
 

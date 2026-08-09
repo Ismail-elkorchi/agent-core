@@ -19,6 +19,9 @@ for (const adapter of [ollamaAdapter(), openAIAdapter(), openAICodexAdapter(), o
     assert.equal(complete.terminationReason, 'stop');
     assertUsage(complete.usage);
 
+    const imageResult = parseModelResponse(await provider.complete(toolImageRequest(adapter.model)));
+    assert.equal(imageResult.terminationReason, 'stop', 'a view_image tool result may carry its image into the next provider request');
+
     const events = [];
     for await (const raw of provider.stream({ ...request, model: adapter.model })) events.push(parseModelStreamEvent(raw));
     assert.equal(events.filter(event => event.type === 'done').length, 1, 'stream has exactly one terminal event');
@@ -70,7 +73,7 @@ function ollamaAdapter() {
             yield { model: input.model, message: { role: 'assistant', content: 'lo' }, done: true, done_reason: 'stop', prompt_eval_count: 2, eval_count: 1 };
           })();
         },
-        async show() { return { capabilities: ['completion'], model_info: { 'test.context_length': 16000 } }; },
+        async show() { return { capabilities: ['completion', 'tools', 'vision'], model_info: { 'test.context_length': 16000 } }; },
         abort() {}
       }) });
     },
@@ -155,7 +158,7 @@ function openRouterAdapter() {
     name: 'OpenRouterProvider', model: 'openai/test', sessionRetryDisposition: undefined,
     create() {
       return new OpenRouterProvider({ apiKey: 'test', fetch: async (_url, init) => {
-        if (!init?.body) return json({ data: [{ id: 'openai/test', name: 'Test', context_length: 16_000, architecture: { input_modalities: ['text'], output_modalities: ['text'] }, top_provider: { context_length: 16_000, max_completion_tokens: 2_000 }, supported_parameters: ['tools', 'max_tokens'] }] });
+        if (!init?.body) return json({ data: [{ id: 'openai/test', name: 'Test', context_length: 16_000, architecture: { input_modalities: ['text', 'image'], output_modalities: ['text'] }, top_provider: { context_length: 16_000, max_completion_tokens: 2_000 }, supported_parameters: ['tools', 'max_tokens'] }] });
         if (init.signal?.aborted) throw new Error('aborted');
         const body = JSON.parse(init.body);
         const final = { id: 'gen', model: 'openai/test', choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'hello' } }], usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 } };
@@ -194,10 +197,20 @@ function testModelProfile() {
       temperature: false,
       topP: false
     },
-    modalities: { input: ['text'], output: ['text'] },
+    modalities: { input: ['text', 'image'], output: ['text'] },
     limits: { contextTokens: 16_000, maxInputTokens: 14_000, outputTokens: 2_000 },
     supportedParameters: ['responseFormat', 'tools', 'metadata', 'providerOptions'],
     metadata: { source: 'provider-conformance-test' }
+  };
+}
+function toolImageRequest(model) {
+  return {
+    model,
+    messages: [
+      { role: 'user', content: 'Inspect the image.' },
+      { role: 'assistant', content: '', toolCalls: [{ id: 'image-call', name: 'view_image', type: 'function', input: { kind: 'json', value: { path: 'image.png' } } }] },
+      { role: 'tool', content: 'Loaded image image.png.', toolName: 'view_image', toolCallId: 'image-call', toolCallType: 'function', images: [{ type: 'base64', data: 'iVBORw0KGgo=', mediaType: 'image/png', detail: 'original' }] }
+    ]
   };
 }
 function assertUsage(usage) { assert.ok(usage); for (const value of Object.values(usage)) assert.ok(Number.isFinite(value) && value >= 0); }

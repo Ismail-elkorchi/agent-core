@@ -58,6 +58,10 @@ export interface AgentRunConfiguration {
   };
   readonly tools: readonly { readonly name: string; readonly accessModes: readonly string[] }[];
   readonly toolPolicy: ToolPolicy;
+  readonly authority: {
+    readonly ambientShell: boolean;
+    readonly summary: string;
+  };
   readonly requestWindow: {
     readonly contextWindowTokens: number;
     readonly maxOutputTokens: number;
@@ -147,7 +151,7 @@ export type AgentEvent =
   | ({ readonly type: 'overflow.recovery.ended'; readonly attempt: number; readonly result: OverflowRecoveryResult } & AgentTurnIdentity)
   | ({ readonly type: 'context.history.reduced'; readonly reductions: readonly ContextHistoryReduction[] } & AgentTurnIdentity)
   | ({ readonly type: 'context.checkpoint.created'; readonly compactedToolResults: number; readonly removedItems?: number; readonly beforeBytes?: number; readonly afterBytes?: number } & AgentTurnIdentity)
-  | ({ readonly type: 'observation.record.created'; readonly id: string; readonly toolName: string; readonly call: ToolCall; readonly toolCallType: 'function' | 'custom'; readonly evidence: JsonValue; readonly immediatePresentation: ToolObservationPresentation; readonly retainedPresentation: ToolObservationPresentation } & AgentToolCallAttemptIdentity)
+  | ({ readonly type: 'observation.record.created'; readonly id: string; readonly toolName: string; readonly call: ToolCall; readonly toolCallType: 'function' | 'custom'; readonly evidence: JsonValue; readonly immediatePresentation: ToolObservationPresentation; readonly retainedPresentation: ToolObservationPresentation; readonly durableStorageDegraded?: { readonly message: string } } & AgentToolCallAttemptIdentity)
   | ({ readonly type: 'tool.authorization.decided'; readonly toolName: string; readonly fingerprint: string; readonly binding: AgentApprovalBinding; readonly decision: 'allow' | 'deny' | 'require_approval'; readonly reason?: string } & AgentToolCallIdentity)
   | ({ readonly type: 'approval.requested'; readonly runId: string; readonly approvalId: string; readonly toolName: string; readonly fingerprint: string; readonly input: JsonValue; readonly effects: ToolEffects; readonly binding: AgentApprovalBinding; readonly policyHash: string; readonly reason: string } & AgentToolCallIdentity)
   | ({ readonly type: 'approval.resolved'; readonly runId: string; readonly approvalId: string; readonly fingerprint: string; readonly binding: AgentApprovalBinding; readonly decision: 'allow' | 'deny' } & AgentToolCallIdentity)
@@ -279,7 +283,7 @@ const EVENT_VALIDATORS = {
   'overflow.recovery.ended': (value, issues) => { if (!positiveInteger(value.attempt)) issues.push('attempt must be positive.'); requireRecord(value.result, 'result', issues); },
   'context.history.reduced': (value, issues) => { if (!Array.isArray(value.reductions)) issues.push('reductions must be an array.'); },
   'context.checkpoint.created': (value, issues) => { if (!nonnegativeInteger(value.compactedToolResults)) issues.push('compactedToolResults must be nonnegative.'); },
-  'observation.record.created': (value, issues) => { requireStrings(value, ['id', 'toolName'], issues); requireToolAttempt(value, issues); requireRecord(value.call, 'call', issues); requireRecord(value.immediatePresentation, 'immediatePresentation', issues); requireRecord(value.retainedPresentation, 'retainedPresentation', issues); if (value.toolCallType !== 'function' && value.toolCallType !== 'custom') issues.push('toolCallType is invalid.'); },
+  'observation.record.created': (value, issues) => { requireStrings(value, ['id', 'toolName'], issues); requireToolAttempt(value, issues); requireRecord(value.call, 'call', issues); requireRecord(value.immediatePresentation, 'immediatePresentation', issues); requireRecord(value.retainedPresentation, 'retainedPresentation', issues); if (value.toolCallType !== 'function' && value.toolCallType !== 'custom') issues.push('toolCallType is invalid.'); if (value.durableStorageDegraded !== undefined) { requireRecord(value.durableStorageDegraded, 'durableStorageDegraded', issues); if (isRecord(value.durableStorageDegraded)) requireStrings(value.durableStorageDegraded, ['message'], issues); } },
   'tool.authorization.decided': (value, issues) => { requireStrings(value, ['toolName', 'fingerprint'], issues); validateApprovalBinding(value.binding, issues); if (!nonnegativeInteger(value.callIndex)) issues.push('callIndex must be nonnegative.'); if (!['allow', 'deny', 'require_approval'].includes(String(value.decision))) issues.push('authorization decision is invalid.'); },
   'approval.requested': (value, issues) => { requireStrings(value, ['runId', 'approvalId', 'toolName', 'fingerprint', 'policyHash', 'reason'], issues); requireRecord(value.effects, 'effects', issues); validateApprovalBinding(value.binding, issues); },
   'approval.resolved': (value, issues) => { requireStrings(value, ['runId', 'approvalId', 'fingerprint'], issues); validateApprovalBinding(value.binding, issues); if (value.decision !== 'allow' && value.decision !== 'deny') issues.push('approval decision is invalid.'); },

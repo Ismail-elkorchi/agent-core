@@ -6,14 +6,24 @@ import { terminalPresentation } from './run-presentation.js';
 
 export function statusChrome(state: AgentTuiState): Element {
   const presentation = runPresentation(state);
+  const center = [state.runtimeDetails.modelId, permissionLabel(state)].filter((value): value is string => value !== undefined).join(' · ');
   return statusBar({
     id: 'status',
     leading: [{ id: 'app', kind: 'text', text: 'Agent Core' }],
-    center: state.runtimeDetails.modelId === undefined
-      ? []
-      : [{ id: 'model', kind: 'text', text: state.runtimeDetails.modelId }],
+    center: center.length === 0 ? [] : [{ id: 'model-and-authority', kind: 'text', text: center }],
     trailing: [{ id: 'run', kind: 'status', text: presentation.text, status: presentation.status }]
   });
+}
+
+function permissionLabel(state: AgentTuiState): string | undefined {
+  const permissions = state.runtimeDetails.permissions;
+  if (!permissions) return undefined;
+  const patch = permissions.workspaceWrites === 'allowed' ? 'patch: allowed'
+    : permissions.workspaceWrites === 'dry_run' ? 'patch: dry-run'
+      : permissions.workspaceWrites === 'ambient_shell' ? 'patch: denied; workspace: ambient shell'
+        : 'patch: denied';
+  const shell = permissions.shell === 'ambient' ? 'shell: ambient' : 'shell: denied';
+  return `${patch}; ${shell}`;
 }
 
 export function hintBar(state: AgentTuiState, columns: number): Element<AgentTuiMessage> {

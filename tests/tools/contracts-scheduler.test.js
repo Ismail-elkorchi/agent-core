@@ -89,6 +89,56 @@ test('runtime resource leases span batches until a running process exits', async
   assert.equal(coordinator.activeCount(), 0);
 });
 
+test('resource lease queue is fair, batches compatible readers, and removes aborted waiters', async () => {
+  const coordinator = new ResourceLeaseCoordinator();
+  const read = { accesses: [{ mode: 'read', scope: 'workspace/files/a' }], lockScopes: [], idempotency: 'pure' };
+  const write = { accesses: [{ mode: 'write', scope: 'workspace/files/a' }], lockScopes: ['workspace/files/a'], idempotency: 'non_idempotent' };
+  const first = await coordinator.acquire(read, 'reader-1');
+  const order = [];
+  const writerPromise = coordinator.acquire(write, 'writer').then(lease => { order.push('writer'); return lease; });
+  const laterReaderPromise = coordinator.acquire(read, 'reader-2').then(lease => { order.push('reader-2'); return lease; });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.deepEqual(order, []);
+  first.release();
+  const writer = await writerPromise;
+  assert.deepEqual(order, ['writer']);
+  writer.release();
+  const laterReader = await laterReaderPromise;
+  assert.deepEqual(order, ['writer', 'reader-2']);
+  laterReader.release();
+
+  const compatibleA = await coordinator.acquire(read, 'compatible-a');
+  const compatibleB = await coordinator.acquire(read, 'compatible-b');
+  assert.equal(coordinator.activeCount(), 2);
+  compatibleA.release(); compatibleB.release();
+
+  const blocker = await coordinator.acquire(read, 'blocker');
+  const controller = new AbortController();
+  const aborted = coordinator.acquire(write, 'aborted-writer', controller.signal);
+  const unblockedReader = coordinator.acquire(read, 'reader-after-abort');
+  controller.abort('cancel waiter');
+  await assert.rejects(aborted, /cancel waiter/u);
+  const reader = await unblockedReader;
+  blocker.release(); reader.release();
+  assert.equal(coordinator.activeCount(), 0);
+});
+
+test('a queued writer cannot starve behind a continuing stream of readers', async () => {
+  const coordinator = new ResourceLeaseCoordinator();
+  const read = { accesses: [{ mode: 'read', scope: 'workspace/files/a' }], lockScopes: [], idempotency: 'pure' };
+  const write = { accesses: [{ mode: 'write', scope: 'workspace/files/a' }], lockScopes: ['workspace/files/a'], idempotency: 'non_idempotent' };
+  const initial = await coordinator.acquire(read, 'initial');
+  let writerAcquired = false;
+  const writerPromise = coordinator.acquire(write, 'writer').then(lease => { writerAcquired = true; return lease; });
+  const laterReaders = Array.from({ length: 20 }, (_, index) => coordinator.acquire(read, `later-${index}`));
+  initial.release();
+  const writer = await writerPromise;
+  assert.equal(writerAcquired, true);
+  assert.equal(coordinator.activeCount(), 1);
+  writer.release();
+  for (const lease of await Promise.all(laterReaders)) lease.release();
+});
+
 test('one observation parser validates complete results, failures, artifacts, and returns an immutable snapshot', () => {
   const tool = defineTool({
     name: 'observation', implementationId: 'tests/observation@1', description: 'observation', schema: z.strictObject({}), outputSchema: z.strictObject({ value: z.string() }),
@@ -105,6 +155,10 @@ test('one observation parser validates complete results, failures, artifacts, an
   assert.throws(() => parseToolObservation(tool, { ...source, output: { value: 42 } }));
   assert.throws(() => parseToolObservation(undefined, { kind: 'failure', ok: false, summary: 'bad', scope: { resources: [], coverage: 'partial' }, output: { reason: 'runtime_error' } }));
   assert.throws(() => parseToolObservation(tool, { ...source, content: [{ type: 'artifact', artifact: { artifactId: 'bad', sha256: 'bad', size: -1, mediaType: 'text/plain' } }] }));
+  let outputGetterCalls = 0;
+  const hostileOutput = Object.defineProperty({}, 'value', { enumerable: true, get() { outputGetterCalls += 1; return 'stolen'; } });
+  assert.throws(() => parseToolObservation(tool, { ...source, output: hostileOutput }), /accessor/iu);
+  assert.equal(outputGetterCalls, 0);
 });
 
 test('tool registration snapshots mutable consumer definition contracts', () => {
@@ -120,4 +174,80 @@ test('tool registration snapshots mutable consumer definition contracts', () => 
   assert.equal(registered.effectEnvelope.accesses[0].mode, 'read');
   assert.deepEqual(registered.requirements.services, ['workspaceRoot']);
   assert.equal(Object.isFrozen(registered.effectEnvelope.accesses), true);
+});
+
+test('every effect and observation resource scope uses the strict canonical scope grammar', async () => {
+  const malformedScopes = ['workspace/files//a', 'workspace/files/./a', 'workspace/files/../a', 'workspace\\files\\a', 'workspace/files/a/'];
+  for (const scope of malformedScopes) {
+    assert.throws(() => validateToolDefinition({
+      name: 'bad_scope', implementationId: 'tests/bad-scope@1', description: 'bad', jsonSchema: { type: 'object' }, outputSchema: z.strictObject({}),
+      effectEnvelope: { accesses: [{ mode: 'read', scope }], lockScopes: [] }, decodeInput() { return { ok: true, input: {} }; },
+      canonicalizeInput(input) { return input; }, deriveEffects() { return { accesses: [], lockScopes: [], idempotency: 'pure' }; },
+      async invoke() { return { kind: 'result', ok: true, summary: 'bad', scope: { resources: [], coverage: 'complete' }, output: {} }; }
+    }), /scope/iu, scope);
+  }
+  const duplicate = defineTool({
+    name: 'duplicate_scope', implementationId: 'tests/duplicate-scope@1', description: 'duplicate', schema: z.strictObject({}), outputSchema: z.strictObject({}),
+    effectEnvelope: { accesses: [{ mode: 'read', scope: 'workspace/files/a' }], lockScopes: [] }, canonicalizeInput: input => input,
+    deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'workspace/files/a' }, { mode: 'read', scope: 'workspace/files/a' }], lockScopes: [], idempotency: 'pure' }),
+    invoke: async () => ({ kind: 'result', ok: true, summary: 'duplicate', scope: { resources: [], coverage: 'complete' }, output: {} })
+  });
+  const prepared = await prepareToolCall({ name: duplicate.name, input: { kind: 'json', value: {} } }, [duplicate], { policy: { allowedRisks: ['read'] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } });
+  assert.equal(prepared.ok, false);
+  assert.match(prepared.observation.summary, /unique/iu);
+  assert.throws(() => parseToolObservation(duplicate, { kind: 'result', ok: true, summary: 'bad scope', scope: { resources: ['workspace/files//a'], coverage: 'complete' }, output: {} }), /scope/iu);
+});
+
+test('canonical input, effects, fingerprint, and invocation share one frozen owned JSON snapshot', async () => {
+  const callerOwned = { path: 'before.txt', nested: { value: 1 } };
+  let invoked;
+  const tool = defineTool({
+    name: 'owned_input', implementationId: 'tests/owned-input@1', description: 'owned', schema: z.strictObject({}), outputSchema: z.strictObject({ path: z.string(), value: z.number() }),
+    effectEnvelope: { accesses: [{ mode: 'read', scope: 'workspace/files' }], lockScopes: [] },
+    canonicalizeInput() { return callerOwned; },
+    deriveEffects(input) { return { accesses: [{ mode: 'read', scope: `workspace/files/${input.path}` }], lockScopes: [], idempotency: 'pure' }; },
+    async invoke(input) { invoked = input; return { kind: 'result', ok: true, summary: 'owned', scope: { resources: [`workspace/files/${input.path}`], coverage: 'complete' }, output: { path: input.path, value: input.nested.value } }; }
+  });
+  const context = { policy: { allowedRisks: ['read'] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } };
+  const preparation = await prepareToolCall({ name: tool.name, input: { kind: 'json', value: {} } }, [tool], context);
+  assert.equal(preparation.ok, true);
+  const fingerprint = preparation.prepared.fingerprint;
+  callerOwned.path = 'after.txt'; callerOwned.nested.value = 2;
+  const observation = await invokePreparedToolCall(preparation.prepared, context);
+  assert.equal(observation.output.path, 'before.txt');
+  assert.equal(observation.output.value, 1);
+  assert.equal(preparation.prepared.fingerprint, fingerprint);
+  assert.equal(preparation.prepared.effects.accesses[0].scope, 'workspace/files/before.txt');
+  assert.equal(Object.isFrozen(invoked), true);
+  assert.equal(Object.isFrozen(invoked.nested), true);
+});
+
+test('canonicalization rejects accessors and cycles without invoking accessors', async () => {
+  let accesses = 0;
+  const hostile = {};
+  Object.defineProperty(hostile, 'secret', { enumerable: true, get() { accesses += 1; return 'value'; } });
+  const cyclic = {}; cyclic.self = cyclic;
+  const makeTool = (name, value) => defineTool({
+    name, implementationId: `tests/${name}@1`, description: name, schema: z.strictObject({}), outputSchema: z.strictObject({}), effectEnvelope: { accesses: [], lockScopes: [] },
+    canonicalizeInput() { return value; }, deriveEffects() { return { accesses: [], lockScopes: [], idempotency: 'pure' }; },
+    invoke: async () => ({ kind: 'result', ok: true, summary: 'never', scope: { resources: [], coverage: 'complete' }, output: {} })
+  });
+  for (const [name, value] of [['accessor_input', hostile], ['cyclic_input', cyclic]]) {
+    const prepared = await prepareToolCall({ name, input: { kind: 'json', value: {} } }, [makeTool(name, value)], { policy: { allowedRisks: [] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } });
+    assert.equal(prepared.ok, false);
+  }
+  assert.equal(accesses, 0);
+
+  let effectAccesses = 0;
+  const hostileEffects = {};
+  Object.defineProperty(hostileEffects, 'accesses', { enumerable: true, get() { effectAccesses += 1; return []; } });
+  Object.defineProperties(hostileEffects, { lockScopes: { enumerable: true, value: [] }, idempotency: { enumerable: true, value: 'pure' } });
+  const effectsTool = defineTool({
+    name: 'hostile_effects', implementationId: 'tests/hostile-effects@1', description: 'hostile effects', schema: z.strictObject({}), outputSchema: z.strictObject({}),
+    effectEnvelope: { accesses: [], lockScopes: [] }, canonicalizeInput: input => input, deriveEffects: () => hostileEffects,
+    invoke: async () => ({ kind: 'result', ok: true, summary: 'never', scope: { resources: [], coverage: 'complete' }, output: {} })
+  });
+  const effectsPreparation = await prepareToolCall({ name: effectsTool.name, input: { kind: 'json', value: {} } }, [effectsTool], { policy: { allowedRisks: [] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } });
+  assert.equal(effectsPreparation.ok, false);
+  assert.equal(effectAccesses, 0);
 });

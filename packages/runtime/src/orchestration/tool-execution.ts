@@ -19,7 +19,7 @@ import {
   type ToolPreparationContext,
   type ToolObservation
 } from '@agent-core/tools';
-import type { ResourceLeaseCoordinator, ToolProgress } from '@agent-core/tools';
+import type { ResourceLeaseCoordinator } from '@agent-core/tools';
 import type { AgentEvent, AgentProgressEvent } from '../events.js';
 import { ObservationStore, serializeToolObservationPresentation } from './observation-store.js';
 import type { AgentRunController } from './run-controller.js';
@@ -70,6 +70,7 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
   readonly toolContext: ToolPreparationContext;
   readonly authorizer?: ToolAuthorizer;
   readonly resourceLeases?: ResourceLeaseCoordinator;
+  readonly modelInputModalities?: readonly string[];
   readonly authorizationOverrides?: readonly ToolAuthorizationOverride[];
   readonly recovery?: readonly ToolCallRecoveryState[];
   readonly resuming?: boolean;
@@ -98,7 +99,11 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
       ...authorizationContext,
       emitProgress: async (progress) => {
         const event = { type: 'tool.updated' as const, ...identity, toolName: call.name, progress };
-        if (isDurableProgress(progress)) await input.append(event);
+        await input.emit(event);
+      },
+      persistProgressCheckpoint: async (progress) => {
+        const event = { type: 'tool.updated' as const, ...identity, toolName: call.name, progress };
+        await input.append(event);
         await input.emit(event);
       }
     });
@@ -108,25 +113,26 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
       continue;
     }
     const prepared = preparation.prepared;
+    const preparedCall = prepared.call;
     machine = transitionWithoutCommands(machine, { type: 'input.parsed', input: prepared.decodedInput });
     machine = transitionWithoutCommands(machine, { type: 'input.canonicalized', input: prepared.canonicalInput });
     machine = transitionWithoutCommands(machine, { type: 'effects.derived', effects: prepared.effects, fingerprint: prepared.fingerprint });
     if (recovery?.completed) {
-      entries.push({ identity, call, prepared, machine, observation: recovery.completed.observation, observationProjected: recovery.completed.observationProjected });
+      entries.push({ identity, call: preparedCall, prepared, machine, observation: recovery.completed.observation, observationProjected: recovery.completed.observationProjected });
       continue;
     }
     if (recovery?.incompleteStart) {
       if (recovery.incompleteStart.fingerprint !== prepared.fingerprint) throw new Error(`Tool call fingerprint changed after an incomplete execution at call ${String(callIndex)}.`);
       if (recovery.incompleteStart.effects.idempotency === 'non_idempotent') {
         uncertain = { callIndex, toolName: call.name, toolAttempt: recovery.incompleteStart.toolAttempt };
-        entries.push({ identity, call, prepared, machine });
+        entries.push({ identity, call: preparedCall, prepared, machine });
         continue;
       }
     }
     machine = transitionWithCommand(machine, { type: 'authorization.started' }, 'authorization.invoke');
     const override = input.authorizationOverrides?.find((item) => item.callIndex === callIndex);
     if (input.resuming && override?.fingerprint !== prepared.fingerprint) throw new Error(`Tool call fingerprint changed before approval resume at call ${String(callIndex)}.`);
-    const authorizationRequest = { call, tool: prepared.tool, input: prepared.canonicalInput, effects: prepared.effects, fingerprint: prepared.fingerprint, context: authorizationContext };
+    const authorizationRequest = { call: preparedCall, tool: prepared.tool, input: prepared.canonicalInput, effects: prepared.effects, fingerprint: prepared.fingerprint, context: authorizationContext };
     const policyDenial = enforceAllowedEffects(authorizationRequest);
     const currentAuthorization = policyDenial ?? await abortableToolBoundary(input.toolContext.signal, () => authorizer(authorizationRequest));
     const authorization: ToolAuthorizationDecision = override
@@ -146,17 +152,17 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
       const approval = approvalRequest(input.runId, identity, approvalId, authorization.reason, prepared, authorizationContext);
       approvals.push(approval);
       await input.append({ type: 'approval.requested', runId: input.runId, ...identity, approvalId, toolName: call.name, fingerprint: approval.fingerprint, input: approval.input, effects: prepared.effects, binding, policyHash: approval.policyHash, reason: approval.reason });
-      entries.push({ identity, call, prepared, machine });
+      entries.push({ identity, call: preparedCall, prepared, machine });
       continue;
     }
     if (authorization.decision === 'deny') {
       requireNoCommands(authorizationTransition.commands);
       const observation = policyBlockedObservation(`Tool authorization denied: ${call.name}`, { tool: call.name, policyReason: 'deny', ...(authorization.reason ? { recovery: authorization.reason } : {}) });
-      entries.push({ identity, call, prepared, machine, observation });
+      entries.push({ identity, call: preparedCall, prepared, machine, observation });
       continue;
     }
     requireSingleCommand(authorizationTransition.commands, 'tool.invoke');
-    entries.push({ identity, call, prepared, machine, invoke: true });
+    entries.push({ identity, call: preparedCall, prepared, machine, invoke: true });
   }
 
   if (approvals.length > 0) return { outcome: 'waiting_for_approval', approvals: Object.freeze(approvals) };
@@ -165,10 +171,16 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
   const executable = entries.filter(isExecutableEntry).map((entry) => ({ callIndex: entry.identity.callIndex, effects: entry.prepared.effects, value: entry }));
   const observed = new Map<number, ToolObservation>();
   for (const wave of scheduleToolCalls(executable, input.controller.limits.maxConcurrentToolCalls)) {
-    for (const item of wave) await persistToolStart(input, item.value);
     const results = await Promise.all(wave.map(async (item) => {
+      if (input.resourceLeases?.wouldWait(item.value.prepared.effects)) {
+        await input.emit({ type: 'tool.updated', ...item.value.identity, toolName: item.value.call.name, progress: {
+          type: 'status', stage: 'resource_lease_waiting',
+          message: 'Waiting for a conflicting resource lease. Persistent ambient processes block conflicting workspace tools until they exit or stop.'
+        } });
+      }
       const lease = await input.resourceLeases?.acquire(item.value.prepared.effects, `${input.runId}:${item.value.identity.toolBatchId}:${String(item.callIndex)}`, input.toolContext.signal);
       try {
+        await persistToolStart(input, item.value);
         return {
           callIndex: item.callIndex,
           observation: await invokePreparedToolCall(item.value.prepared, {
@@ -176,7 +188,11 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
             ...(lease ? { resourceLease: lease } : {}),
             emitProgress: async (progress) => {
               const event = { type: 'tool.updated' as const, ...item.value.identity, toolName: item.value.call.name, progress };
-              if (isDurableProgress(progress)) await input.append(event);
+              await input.emit(event);
+            },
+            persistProgressCheckpoint: async (progress) => {
+              const event = { type: 'tool.updated' as const, ...item.value.identity, toolName: item.value.call.name, progress };
+              await input.append(event);
               await input.emit(event);
             },
             invocation: {
@@ -229,15 +245,13 @@ async function persistToolStart(input: Parameters<typeof executeAssistantToolCal
   await input.emit({ type: 'tool.updated', ...entry.identity, toolName: entry.call.name, progress });
 }
 
-const DURABLE_PROGRESS_STAGES = new Set(['patch_prepared', 'patch_committed', 'rollback_completed', 'process_started', 'process_stopped', 'executing']);
-function isDurableProgress(progress: ToolProgress): boolean {
-  return progress.type === 'status' && DURABLE_PROGRESS_STAGES.has(progress.stage);
-}
-
 async function persistObservation(input: Parameters<typeof executeAssistantToolCalls>[0], entry: PreparedEntry, observation: ToolObservation): Promise<void> {
   const record = entry.observationProjected
     ? undefined
-    : await input.observationStore.put({ turnIndex: input.turnIndex, call: entry.call, canonicalInput: entry.prepared?.canonicalInput, tool: entry.prepared?.tool, observation });
+    : await input.observationStore.put({
+      turnIndex: input.turnIndex, call: entry.call, canonicalInput: entry.prepared?.canonicalInput, tool: entry.prepared?.tool, observation,
+      ...(input.modelInputModalities ? { modelInputModalities: input.modelInputModalities } : {})
+    });
   const persistedObservation = normalizeToolObservationForPersistence(record?.durableObservation ?? observation);
   const artifacts = observationArtifacts(persistedObservation);
   await input.append({ type: 'tool.ended', ...entry.identity, toolName: entry.call.name, observation: persistedObservation }, toolEventKey(input.runId, entry.identity, 'ended'));
@@ -271,7 +285,8 @@ async function persistObservation(input: Parameters<typeof executeAssistantToolC
   await input.append({
     type: 'observation.record.created', id: record.id, ...entry.identity, toolName: entry.call.name, call: record.call,
     toolCallType: record.call.input.kind === 'text' ? 'custom' : 'function', evidence: normalizeJsonSafe(record.evidence).value,
-    immediatePresentation: record.immediatePresentation, retainedPresentation: record.retainedPresentation
+    immediatePresentation: record.immediatePresentation, retainedPresentation: record.retainedPresentation,
+    ...(record.durableStorageDegraded ? { durableStorageDegraded: record.durableStorageDegraded } : {})
   }, toolEventKey(input.runId, entry.identity, 'observation'));
   await input.emit({ type: 'tool.ended', ...entry.identity, toolName: entry.call.name, observation: persistedObservation });
 }
@@ -311,7 +326,11 @@ function approvalRequest(runId: string, identity: AgentToolCallIdentity, approva
   const input = normalizeJsonSafe(prepared.canonicalInput).value;
   const effects = normalizeJsonSafe(prepared.effects).value;
   if (!isJsonObject(effects)) throw new Error('Prepared tool effects did not normalize to an object.');
-  return Object.freeze({ ...identity, approvalId, status: 'pending', toolName: prepared.tool.name, fingerprint: prepared.fingerprint, input, effects, binding: approvalBinding(prepared, context), policyHash: hashRecord(normalizeJsonSafe(context.policy).value), reason, runId });
+  const ambient = prepared.effects.accesses.some((access) => access.mode === 'execute') && prepared.effects.lockScopes.includes('workspace/files');
+  const authorityReason = ambient
+    ? `${reason} This grants ambient process authority that can indirectly read, write, or delete files, access the network, and start child processes.`
+    : reason;
+  return Object.freeze({ ...identity, approvalId, status: 'pending', toolName: prepared.tool.name, fingerprint: prepared.fingerprint, input, effects, binding: approvalBinding(prepared, context), policyHash: hashRecord(normalizeJsonSafe(context.policy).value), reason: authorityReason, runId });
 }
 function approvalBinding(prepared: PreparedToolCall, context: ToolPreparationContext): AgentApprovalBinding {
   return Object.freeze({ toolImplementationId: prepared.tool.implementationId, authorizationPolicyId: context.boundary.authorizationPolicyId, executionTargetId: context.boundary.executionTargetId });

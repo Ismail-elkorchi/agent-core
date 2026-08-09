@@ -53,6 +53,7 @@ export interface ApplyPatchFailure {
 }
 
 export type ApplyPatchOperation = 'add' | 'update' | 'delete' | 'move';
+export type ApplyPatchStatus = 'committed' | 'committed_with_residue' | 'rolled_back' | 'rollback_failed';
 
 export type PatchMatchMode =
   | 'exact'
@@ -82,6 +83,8 @@ export interface ApplyPatchFileOutput {
 }
 
 export interface ApplyPatchOutput {
+  status: ApplyPatchStatus;
+  workspaceState: 'known' | 'uncertain';
   dryRun: boolean;
   transactional: true;
   files: ApplyPatchFileOutput[];
@@ -93,6 +96,8 @@ export interface ApplyPatchOutput {
   wouldDeletePaths: string[];
   movedPaths: ApplyPatchPathPair[];
   wouldMovePaths: ApplyPatchPathPair[];
+  potentiallyAffectedPaths: string[];
+  transaction?: import('../../core/text-write.js').TextTransactionResult;
   totalOperationCount: number;
   totalHunkCount: number;
   totalAdditions: number;
@@ -118,6 +123,8 @@ const patchFileOutputSchema = z.strictObject({
 const pathPairSchema = z.strictObject({ sourcePath: z.string(), destinationPath: z.string() });
 
 export const applyPatchOutputSchema = z.strictObject({
+  status: z.enum(['committed', 'committed_with_residue', 'rolled_back', 'rollback_failed']),
+  workspaceState: z.enum(['known', 'uncertain']),
   dryRun: z.boolean(),
   transactional: z.literal(true),
   files: z.array(patchFileOutputSchema),
@@ -129,8 +136,22 @@ export const applyPatchOutputSchema = z.strictObject({
   wouldDeletePaths: z.array(z.string()),
   movedPaths: z.array(pathPairSchema),
   wouldMovePaths: z.array(pathPairSchema),
+  potentiallyAffectedPaths: z.array(z.string()),
+  transaction: z.union([
+    z.strictObject({ outcome: z.literal('committed'), cleanup: recoverySchema() }),
+    z.strictObject({ outcome: z.literal('committed_with_residue'), cleanup: recoverySchema() }),
+    z.strictObject({ outcome: z.literal('rolled_back'), failure: transactionDiagnosticSchema(), rollback: recoverySchema() }),
+    z.strictObject({ outcome: z.literal('rollback_failed'), failure: transactionDiagnosticSchema(), rollback: recoverySchema() })
+  ]).optional(),
   totalOperationCount: z.int().nonnegative(),
   totalHunkCount: z.int().nonnegative(),
   totalAdditions: z.int().nonnegative(),
   totalDeletions: z.int().nonnegative()
 });
+
+function transactionDiagnosticSchema() {
+  return z.strictObject({ operation: z.string(), path: z.string(), message: z.string(), code: z.string().optional() });
+}
+function recoverySchema() {
+  return z.strictObject({ status: z.enum(['succeeded', 'failed', 'uncertain']), diagnostics: z.array(transactionDiagnosticSchema()), strandedPaths: z.array(z.string()) });
+}

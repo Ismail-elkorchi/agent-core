@@ -389,10 +389,15 @@ export class ModelProviderError extends Error {
 
 export interface TokenEstimator {
   estimateText(text: string): number;
+  /** Estimate one encoded image. Implementations must never silently count an image as zero. */
+  estimateImage(image: ModelImage): number;
   estimateMessages(messages: ModelMessage[]): number;
 }
 
 export class SimpleTokenEstimator implements TokenEstimator {
+  /** Conservative fallback used when a provider-specific image estimator is unavailable. */
+  static readonly DEFAULT_IMAGE_TOKENS = 2_000;
+
   estimateText(text: string): number {
     if (text.length === 0) {
       return 0;
@@ -400,8 +405,14 @@ export class SimpleTokenEstimator implements TokenEstimator {
     return Math.ceil(text.length / 4);
   }
 
+  estimateImage(image: ModelImage): number {
+    void image;
+    return SimpleTokenEstimator.DEFAULT_IMAGE_TOKENS;
+  }
+
   estimateMessages(messages: ModelMessage[]): number {
-    return messages.reduce((total, message) => total + this.estimateText(message.content) + 4, 0);
+    return messages.reduce((total, message) => total + this.estimateText(message.content)
+      + (message.images ?? []).reduce((imageTotal, image) => imageTotal + this.estimateImage(image), 0) + 4, 0);
   }
 }
 

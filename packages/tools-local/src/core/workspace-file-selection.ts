@@ -16,6 +16,8 @@ export interface WorkspaceFileSelectionRequest {
   readonly includeHidden: boolean;
   readonly exclude: readonly string[];
   readonly requestedLimit?: number;
+  /** Requested traversal depth. Omitted means the host maximum. */
+  readonly traversalDepth?: number;
   readonly includeMetadata?: boolean;
   readonly signal?: AbortSignal;
 }
@@ -45,6 +47,9 @@ export class WorkspaceFileSelector {
     const exclusions = request.exclude.map(normalizePattern);
     if (patterns.length + exclusions.length > this.limits.maxGlobExpansions) throw new ToolInputError('Workspace glob patterns exceed the host limit.');
     const requestedLimit = Math.min(request.requestedLimit ?? this.limits.maxReturnedEntries, this.limits.maxReturnedEntries);
+    const requestedDepth = request.traversalDepth ?? this.limits.maxDepth;
+    if (!Number.isSafeInteger(requestedDepth) || requestedDepth < 1) throw new ToolInputError('Workspace traversal depth must be a positive integer.');
+    const traversalDepth = Math.min(requestedDepth, this.limits.maxDepth);
     const entries: WorkspaceSelectionEntry[] = [];
     const samples: WorkspaceFileSelectionResult['omissionSamples'][number][] = [];
     const causes = new Set<string>();
@@ -112,7 +117,12 @@ export class WorkspaceFileSelector {
           catch (error) { omittedEntries += 1; causes.add('unreadable_entry'); sample(samples, { path: workspacePath, reason: 'unreadable', message: message(error) }); }
         }
         if (isDirectory) {
-          if (depth >= this.limits.maxDepth) { causes.add('depth_limit'); omittedEntries += 1; sample(samples, { path: workspacePath, reason: 'limit' }); continue; }
+          if (depth >= traversalDepth) {
+            if (requestedDepth > this.limits.maxDepth && depth >= this.limits.maxDepth) {
+              causes.add('depth_limit'); omittedEntries += 1; sample(samples, { path: workspacePath, reason: 'limit' });
+            }
+            continue;
+          }
           await walk(absolute, depth + 1, rules);
         }
       }
