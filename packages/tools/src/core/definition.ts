@@ -15,9 +15,9 @@ export type ToolInputParseResult<TInput> = { ok: true; input: TInput } | { ok: f
 
 export interface ToolScope {
   readonly resources: readonly string[];
-  readonly filters?: import('@agent-core/evidence').JsonObject;
-  readonly limits?: import('@agent-core/evidence').JsonObject;
-  readonly omitted?: import('@agent-core/evidence').JsonObject;
+  readonly filters?: import('@agent-core/json').JsonObject;
+  readonly limits?: import('@agent-core/json').JsonObject;
+  readonly omitted?: import('@agent-core/json').JsonObject;
   readonly coverage: 'complete' | 'partial';
   readonly truncated?: boolean;
   readonly causes?: readonly string[];

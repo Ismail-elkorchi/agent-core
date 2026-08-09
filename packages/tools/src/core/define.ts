@@ -6,7 +6,7 @@ import type { ToolPolicy } from './policy.js';
 import { invalidArgumentsObservation, invalidToolInputObservation } from './observation.js';
 import { validateToolEffectEnvelope, type ToolEffectEnvelope, type ToolEffects } from './authorization.js';
 import { validateToolRequirements } from './resources.js';
-import { parseJsonObject } from '@agent-core/evidence';
+import { parseJsonObject } from '@agent-core/json';
 
 export interface DefineToolOptions<Schema extends z.ZodType, TCanonicalInput, TOutput> {
   name: string;

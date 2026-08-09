@@ -1,4 +1,4 @@
-import { parseJsonObject } from '@agent-core/evidence';
+import { parseJsonObject } from '@agent-core/json';
 import type { ToolDefinition } from './definition.js';
 import { validateToolEffectEnvelope } from './authorization.js';
 import { isToolAvailable, type ToolPolicy } from './policy.js';

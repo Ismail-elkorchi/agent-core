@@ -62,12 +62,12 @@ export async function presentToolObservation(tool, call, observation, context, m
   const preparation = await prepareToolCall(call, [tool], preparationContext);
   if (!preparation.ok) {
     if (observation.kind !== 'failure') throw new Error(`Cannot present a result for an invalid tool call: ${preparation.observation.summary}`);
-    return tool.presentObservation({ call, input: undefined, observation, limit: { maxTokens } });
+    return tool.presentObservation({ call, input: undefined, observation, mode: 'immediate', maxTokens });
   }
   return tool.presentObservation({
     call,
     input: preparation.prepared.canonicalInput,
     observation,
-    limit: { maxTokens }
+    mode: 'immediate', maxTokens
   });
 }

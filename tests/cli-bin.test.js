@@ -2,12 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
-import { createCliDefaultTools, createCliToolPolicy, resultExitCode } from '@agent-core/cli';
+import { createCliToolPolicy, resultExitCode } from '@agent-core/cli';
 import { parseAgentTerminalSnapshot } from '@agent-core/runtime';
 
-test('CLI exposes local coding tools and explicit risk policy', () => {
-  assert.deepEqual(createCliDefaultTools().map(tool => tool.name), ['list_directory', 'find_files', 'read_files', 'search_text', 'apply_patch', 'exec_command', 'write_stdin', 'stop_process', 'view_image', 'read_artifact']);
-  assert.throws(() => createCliDefaultTools(['unknown_tool']), /Unknown configured local tools/u);
+test('CLI exposes explicit risk policy', () => {
   assert.deepEqual(createCliToolPolicy({ apply: true, dryRun: false, allowShell: true, allowUnsafeShell: false }).allowedRisks, ['read', 'write', 'destructive', 'execute']);
   assert.deepEqual(createCliToolPolicy({ apply: true, dryRun: false, allowShell: false, allowUnsafeShell: false }).allowedRisks, ['read', 'write', 'destructive'], 'patch writes do not grant shell execution');
   assert.deepEqual(createCliToolPolicy({ apply: false, dryRun: false, allowShell: true, allowUnsafeShell: false }).allowedRisks, ['read', 'execute'], 'shell execution does not grant apply_patch writes');

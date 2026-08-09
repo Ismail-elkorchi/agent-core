@@ -55,10 +55,37 @@ test('every built-in read tool derives evidence from its persisted ToolScope', a
     assert.equal(evidence.action, action, tool.name);
     assert.equal(evidence.scope.coverage, observation.scope.coverage, tool.name);
     assert.deepEqual(evidence.scope.filters, observation.scope.filters, tool.name);
-    assert.deepEqual(evidence.scope.limits, observation.scope.limits, tool.name);
-    assert.deepEqual(evidence.scope.omitted, observation.scope.omitted, tool.name);
-    assert.equal(evidence.resources.length, observation.scope.resources.length, tool.name);
+    if (tool.name !== 'read_files') {
+      assert.deepEqual(evidence.scope.limits, observation.scope.limits, tool.name);
+      assert.deepEqual(evidence.scope.omitted, observation.scope.omitted, tool.name);
+      assert.equal(evidence.resources.length, observation.scope.resources.length, tool.name);
+    } else {
+      assert.equal(evidence.resources.length, 1);
+      assert.equal(evidence.scope.limits.maxFiles, observation.scope.limits.maxFiles);
+    }
   }
+});
+
+test('read_files emits per-file success and failure evidence and failed searches report failure', async () => {
+  const { root, context } = await readHost();
+  await writeFile(path.join(root, 'good.txt'), 'one\ntwo\n');
+  const read = await invokeToolCall(jsonToolCall('read_files', {
+    files: [{ path: 'good.txt', startLine: 1, lineCount: 2 }, { path: 'missing.txt' }]
+  }), [readFilesTool], context);
+  assert.equal(read.evidence.items.length, 2);
+  const success = read.evidence.items.find(item => item.outcome === 'success');
+  const failure = read.evidence.items.find(item => item.outcome === 'failure');
+  assert.equal(success.resources[0].range.kind, 'line');
+  assert.equal(success.resources[0].sha256, read.output.files[0].rangeSha256);
+  assert.equal(success.resources[0].fullSha256, read.output.files[0].fullFileSha256);
+  assert.equal(success.scope.coverage, 'complete');
+  assert.equal(failure.resources[0].uri, 'workspace://missing.txt');
+  assert.equal(failure.scope.coverage, 'absent');
+
+  const search = await invokeToolCall(jsonToolCall('search_text', { query: '[', mode: 'matches' }), [searchTextTool], context);
+  assert.equal(search.output.status, 'invalid_pattern');
+  assert.equal(search.evidence.items[0].outcome, 'failure');
+  assert.equal(search.evidence.items[0].scope.coverage, 'partial');
 });
 
 test('read-tool evidence reaches durable observations, session context, prompt selection, and check input', async () => {

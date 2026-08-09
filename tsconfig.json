@@ -2,6 +2,7 @@
   "files": [],
   "references": [
     { "path": "packages/auth" },
+    { "path": "packages/json" },
     { "path": "packages/model" },
     { "path": "packages/evidence" },
     { "path": "packages/runtime" },

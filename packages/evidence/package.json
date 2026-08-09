@@ -10,5 +10,6 @@
     "./node": "./dist/node.js"
   },
   "files": ["dist", "README.md"],
+  "dependencies": { "@agent-core/json": "0.2.0" },
   "engines": { "node": ">=24.8.0" }
 }

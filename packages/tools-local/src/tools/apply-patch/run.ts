@@ -69,8 +69,8 @@ export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, c
   }
   await emitCheckpoint(context, { type: 'status', stage: 'patch_prepared', message: 'Patch transaction prepared.', completed: prepared.length, total: input.tree.operations.length });
 
-  const changed = prepared.filter((operation) => operation.output.changed);
-  let status: ApplyPatchOutput['status'] = 'committed';
+  const changed = prepared.filter((operation) => operation.output.plannedChange);
+  let transactionOutcome: ApplyPatchOutput['transactionOutcome'];
   let transaction: TextTransactionResult | undefined;
   if (!dryRun && changed.length > 0) {
     if (!authority) throw new Error('Patch journal authority is unavailable for a write transaction.');
@@ -85,7 +85,7 @@ export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, c
       ...(context.signal ? { signal: context.signal } : {}),
       ...(transactionId ? { transactionId } : {})
     });
-    status = transaction.outcome;
+    transactionOutcome = transaction.outcome;
     if (transaction.outcome === 'rolled_back' || transaction.outcome === 'rollback_failed') {
       await emitCheckpoint(context, { type: 'status', stage: 'rollback_completed', message: `Patch rollback ${transactionRecovery(transaction)}.` });
     } else {
@@ -97,17 +97,33 @@ export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, c
   }
 
   const wouldChangePaths = uniquePaths(changed.flatMap((operation) => operation.changedPaths));
-  const contentsCommitted = status === 'committed' || status === 'committed_with_residue';
+  const operationStatus: ApplyPatchOutput['operationStatus'] = dryRun
+    ? 'dry_run'
+    : changed.length === 0
+      ? 'no_change'
+      : transactionOutcome === 'committed' || transactionOutcome === 'committed_with_residue'
+        ? 'applied'
+        : transactionOutcome === 'rolled_back'
+          ? 'not_applied'
+          : 'uncertain';
+  const contentsCommitted = operationStatus === 'applied';
   const changedPaths = dryRun || !contentsCommitted ? [] : [...wouldChangePaths];
   const wouldCreatePaths = changed.flatMap((operation) => operation.createdPath ? [operation.createdPath] : []);
   const wouldDeletePaths = changed.flatMap((operation) => operation.deletedPath ? [operation.deletedPath] : []);
   const wouldMovePaths = changed.flatMap((operation) => operation.move ? [operation.move] : []);
   const output: ApplyPatchOutput = {
-    status,
-    workspaceState: status === 'rollback_failed' ? 'uncertain' : 'known',
+    operationStatus,
+    ...(transactionOutcome ? { transactionOutcome } : {}),
+    workspaceState: operationStatus === 'uncertain' ? 'uncertain' : 'known',
     dryRun,
-    transactional: true,
-    files: prepared.map((operation) => operation.output),
+    files: prepared.map((operation) => ({
+      ...operation.output,
+      finalState: !operation.output.plannedChange || dryRun || operationStatus === 'no_change' || operationStatus === 'not_applied'
+        ? 'unchanged' as const
+        : operationStatus === 'uncertain'
+          ? 'uncertain' as const
+          : 'changed' as const
+    })),
     changedPaths,
     wouldChangePaths,
     createdPaths: dryRun || !contentsCommitted ? [] : [...wouldCreatePaths],
@@ -116,7 +132,7 @@ export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, c
     wouldDeletePaths,
     movedPaths: dryRun || !contentsCommitted ? [] : wouldMovePaths.map((item) => ({ ...item })),
     wouldMovePaths: wouldMovePaths.map((item) => ({ ...item })),
-    potentiallyAffectedPaths: status === 'rollback_failed' ? [...wouldChangePaths] : [],
+    potentiallyAffectedPaths: operationStatus === 'uncertain' ? [...wouldChangePaths] : [],
     ...(transaction ? { transaction } : {}),
     totalOperationCount: prepared.length,
     totalHunkCount: prepared.reduce((total, operation) => total + operation.output.hunkCount, 0),
@@ -125,21 +141,21 @@ export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, c
   };
   return {
     kind: 'result',
-    ok: status === 'committed' || status === 'committed_with_residue',
-    summary: status === 'committed'
+    ok: operationStatus === 'dry_run' || operationStatus === 'no_change' || operationStatus === 'applied',
+    summary: operationStatus === 'dry_run' || operationStatus === 'no_change' || transactionOutcome === 'committed'
       ? summarizePatchOutput(output)
-      : status === 'committed_with_residue'
+      : transactionOutcome === 'committed_with_residue'
         ? transactionFailureMessage(transaction as Extract<TextTransactionResult, { outcome: 'committed_with_residue' }>)
-        : status === 'rolled_back'
+        : transactionOutcome === 'rolled_back'
           ? 'Patch transaction was rolled back; no requested file changes remain.'
           : 'Patch rollback failed; workspace state is uncertain for: ' + (wouldChangePaths.join(', ') || 'unknown paths') + '.',
     scope: {
-      resources: status === 'committed_with_residue'
+      resources: transactionOutcome === 'committed_with_residue'
         ? [...uniquePaths(prepared.flatMap((operation) => operation.changedPaths)).map((item) => workspaceFileScope(item)), PATCH_JOURNAL_SCOPE]
         : uniquePaths(prepared.flatMap((operation) => operation.changedPaths)).map((item) => workspaceFileScope(item)),
-      coverage: status === 'committed_with_residue' || status === 'rollback_failed' ? 'partial' : 'complete',
-      ...(status === 'committed_with_residue' ? { causes: ['journal_residue'], omitted: { cleanup: transaction?.outcome === 'committed_with_residue' ? transaction.cleanup.strandedPaths.length : 0 } } : {}),
-      ...(status === 'rollback_failed' ? { causes: ['workspace_state_uncertain'], omitted: { potentiallyAffectedPaths: wouldChangePaths.length } } : {})
+      coverage: transactionOutcome === 'committed_with_residue' || operationStatus === 'uncertain' ? 'partial' : 'complete',
+      ...(transactionOutcome === 'committed_with_residue' ? { causes: ['journal_residue'], omitted: { cleanup: transaction?.outcome === 'committed_with_residue' ? transaction.cleanup.strandedPaths.length : 0 } } : {}),
+      ...(operationStatus === 'uncertain' ? { causes: ['workspace_state_uncertain'], omitted: { potentiallyAffectedPaths: wouldChangePaths.length } } : {})
     },
     output,
     evidence: evidenceDelta(patchEvidenceItems(output)),
@@ -184,9 +200,9 @@ function transactionFailureMessage(result: Exclude<TextTransactionResult, { outc
 }
 
 function patchEvidenceItems(output: ApplyPatchOutput): ToolEvidenceItem[] {
-  if (output.status === 'rolled_back') return [];
+  if (output.operationStatus === 'not_applied' || output.operationStatus === 'no_change') return [];
   return output.files
-    .filter((file) => file.changed)
+    .filter((file) => file.plannedChange)
     .map((file) => {
       const action = evidenceActionForPatch(file.operation);
       const resources = [workspaceResource(file.path, {
@@ -201,17 +217,19 @@ function patchEvidenceItems(output: ApplyPatchOutput): ToolEvidenceItem[] {
       }
       return {
         action,
+        outcome: output.operationStatus === 'uncertain' ? 'failure' as const : 'success' as const,
         resources,
         scope: {
           limits: {
             dryRun: output.dryRun,
-            status: output.status,
+            operationStatus: output.operationStatus,
+            ...(output.transactionOutcome ? { transactionOutcome: output.transactionOutcome } : {}),
             hunkCount: file.hunkCount,
             additions: file.additions,
             deletions: file.deletions
           },
           truncated: false,
-          confidence: output.dryRun || output.status === 'rollback_failed' ? 'unverified' : 'verified'
+          confidence: output.dryRun || output.operationStatus === 'uncertain' ? 'unverified' : 'verified'
         },
         summary: `${output.dryRun ? 'Would ' : ''}${action} ${file.destinationPath ?? file.path}.`
       };
@@ -299,7 +317,8 @@ async function prepareAdd(
         newSha256: sha256Text(content),
         oldBytes: 0,
         newBytes: bytes,
-        changed: true
+        plannedChange: true,
+        finalState: 'unchanged'
       },
       write: {
         path: target.path,
@@ -350,7 +369,8 @@ async function prepareDelete(
         oldSha256,
         oldBytes: inspected.file.bytes,
         newBytes: 0,
-        changed: true
+        plannedChange: true,
+        finalState: 'unchanged'
       },
       remove: {
         path: inspected.file.path,
@@ -432,7 +452,8 @@ async function prepareUpdate(
           newSha256: sha256Text(patched.content),
           oldBytes: inspected.file.bytes,
           newBytes,
-          changed: true,
+          plannedChange: true,
+          finalState: 'unchanged',
           matchModes: patched.matchModes,
           exact: patched.exact
         },
@@ -469,7 +490,8 @@ async function prepareUpdate(
         newSha256: sha256Text(patched.content),
         oldBytes: inspected.file.bytes,
         newBytes,
-        changed: patched.changed,
+        plannedChange: patched.changed,
+        finalState: 'unchanged',
         matchModes: patched.matchModes,
         exact: patched.exact
       },
@@ -690,9 +712,10 @@ function summarizePatchFailures(failures: ApplyPatchFailure[]): string {
 }
 
 function summarizePatchOutput(output: ApplyPatchOutput): string {
-  const verb = output.dryRun ? 'Validated' : 'Applied';
-  const changed = output.dryRun ? output.wouldChangePaths.length : output.changedPaths.length;
-  return `${verb} ${String(output.totalOperationCount)} patch operation${output.totalOperationCount === 1 ? '' : 's'}; ${String(changed)} path${changed === 1 ? '' : 's'} ${output.dryRun ? 'would change' : 'changed'}.`;
+  const verb = output.operationStatus === 'dry_run' ? 'Validated' : output.operationStatus === 'no_change' ? 'Completed' : 'Applied';
+  const changed = output.operationStatus === 'dry_run' ? output.wouldChangePaths.length : output.changedPaths.length;
+  const outcome = output.operationStatus === 'dry_run' ? 'would change' : output.operationStatus === 'no_change' ? 'changed' : 'changed';
+  return `${verb} ${String(output.totalOperationCount)} patch operation${output.totalOperationCount === 1 ? '' : 's'}; ${String(changed)} path${changed === 1 ? '' : 's'} ${outcome}.`;
 }
 
 function uniquePaths(paths: string[]): string[] {

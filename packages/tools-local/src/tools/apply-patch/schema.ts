@@ -53,7 +53,8 @@ export interface ApplyPatchFailure {
 }
 
 export type ApplyPatchOperation = 'add' | 'update' | 'delete' | 'move';
-export type ApplyPatchStatus = 'committed' | 'committed_with_residue' | 'rolled_back' | 'rollback_failed';
+export type ApplyPatchOperationStatus = 'dry_run' | 'no_change' | 'applied' | 'not_applied' | 'uncertain';
+export type ApplyPatchTransactionOutcome = 'committed' | 'committed_with_residue' | 'rolled_back' | 'rollback_failed';
 
 export type PatchMatchMode =
   | 'exact'
@@ -77,16 +78,17 @@ export interface ApplyPatchFileOutput {
   newSha256?: string;
   oldBytes: number;
   newBytes: number;
-  changed: boolean;
+  plannedChange: boolean;
+  finalState: 'unchanged' | 'changed' | 'uncertain';
   matchModes?: PatchMatchMode[];
   exact?: boolean;
 }
 
 export interface ApplyPatchOutput {
-  status: ApplyPatchStatus;
+  operationStatus: ApplyPatchOperationStatus;
+  transactionOutcome?: ApplyPatchTransactionOutcome;
   workspaceState: 'known' | 'uncertain';
   dryRun: boolean;
-  transactional: true;
   files: ApplyPatchFileOutput[];
   changedPaths: string[];
   wouldChangePaths: string[];
@@ -115,7 +117,8 @@ const patchFileOutputSchema = z.strictObject({
   newSha256: sha256Schema.optional(),
   oldBytes: z.int().nonnegative(),
   newBytes: z.int().nonnegative(),
-  changed: z.boolean(),
+  plannedChange: z.boolean(),
+  finalState: z.enum(['unchanged', 'changed', 'uncertain']),
   matchModes: z.array(z.enum(['exact', 'trim_trailing_whitespace', 'trim_surrounding_whitespace', 'normalize_common_unicode_punctuation'])).optional(),
   exact: z.boolean().optional()
 });
@@ -123,10 +126,10 @@ const patchFileOutputSchema = z.strictObject({
 const pathPairSchema = z.strictObject({ sourcePath: z.string(), destinationPath: z.string() });
 
 export const applyPatchOutputSchema = z.strictObject({
-  status: z.enum(['committed', 'committed_with_residue', 'rolled_back', 'rollback_failed']),
+  operationStatus: z.enum(['dry_run', 'no_change', 'applied', 'not_applied', 'uncertain']),
+  transactionOutcome: z.enum(['committed', 'committed_with_residue', 'rolled_back', 'rollback_failed']).optional(),
   workspaceState: z.enum(['known', 'uncertain']),
   dryRun: z.boolean(),
-  transactional: z.literal(true),
   files: z.array(patchFileOutputSchema),
   changedPaths: z.array(z.string()),
   wouldChangePaths: z.array(z.string()),

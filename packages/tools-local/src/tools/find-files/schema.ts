@@ -12,12 +12,14 @@ export const findFilesInputSchema = z.strictObject({
 
 export const findFilesOutputSchema = z.strictObject({
   path: z.string(),
+  hostMaximumDepth: z.int().positive(),
   patterns: z.array(z.string()),
   entries: z.array(z.strictObject({ path: z.string(), type: z.enum(['file', 'directory', 'symlink', 'other']) })),
   coverage: z.enum(['complete', 'partial']),
   causes: z.array(z.string()),
-  counts: z.strictObject({ visited: z.int().nonnegative(), returned: z.int().nonnegative(), omitted: z.int().nonnegative() }),
-  omitted: z.strictObject({ ignoreFiles: z.int().nonnegative() }),
+  counts: z.strictObject({ visited: z.int().nonnegative(), returned: z.int().nonnegative(), omitted: z.strictObject({ count: z.int().nonnegative(), relation: z.enum(['exact', 'at_least']) }) }),
+  omitted: z.strictObject({ ignoreFiles: z.strictObject({ count: z.int().nonnegative(), relation: z.enum(['exact', 'at_least']) }) }),
+  omissions: z.array(z.strictObject({ cause: z.string(), count: z.int().nonnegative(), relation: z.enum(['exact', 'at_least']) })),
   omissionSamples: z.array(z.strictObject({
     path: z.string(),
     reason: z.enum(['hidden', 'gitignored', 'excluded', 'unreadable', 'limit']),

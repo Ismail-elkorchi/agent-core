@@ -10,6 +10,7 @@
     { "path": "../auth" },
     { "path": "../runtime" },
     { "path": "../evidence" },
+    { "path": "../json" },
     { "path": "../model" },
     { "path": "../providers/ollama" },
     { "path": "../providers/openai" },

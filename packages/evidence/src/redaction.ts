@@ -1,4 +1,4 @@
-import { parseJsonValue, type JsonValue, type SafeJsonParseLimits } from './json.js';
+import { parseJsonValue, type JsonValue, type SafeJsonParseLimits } from '@agent-core/json';
 
 export interface RedactedJson {
   readonly value: JsonValue;
@@ -40,4 +40,28 @@ function redactString(value: string, pathParts: readonly string[], state: { reda
     });
   }
   return result;
+}
+
+/** Redact process-stream text while preserving UTF-16 length for deterministic chunk re-splitting. */
+export function redactTextPreservingLength(value: string): { readonly text: string; readonly redactions: number } {
+  let text = value;
+  let redactions = 0;
+  for (const pattern of secretPatterns()) {
+    text = text.replace(pattern, (match: string) => {
+      redactions += 1;
+      const marker = '[REDACTED]';
+      return marker.length >= match.length ? marker.slice(0, match.length) : marker + '*'.repeat(match.length - marker.length);
+    });
+  }
+  return Object.freeze({ text, redactions });
+}
+
+function secretPatterns(): RegExp[] {
+  return [
+    /Bearer\s+[A-Za-z0-9._~+/=-]+/giu,
+    /Basic\s+[A-Za-z0-9+/=]+/giu,
+    /sk-(?:or-v1-)?[A-Za-z0-9_-]{16,}/gu,
+    /\b[A-Za-z_][A-Za-z0-9_]{0,127}(?:TOKEN|SECRET|PASSWORD|KEY)[A-Za-z0-9_]{0,127}=[^\s]+/giu,
+    /(?:password|secret|token|api[-_]?key)\s*[:=]\s*[^\s,;]+/giu
+  ];
 }

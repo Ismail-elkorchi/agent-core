@@ -22,14 +22,17 @@ const omissionSchema = z.strictObject({
   reason: z.enum(['hidden', 'gitignored', 'excluded', 'unreadable', 'limit']),
   message: z.string().optional()
 });
+const omissionCountSchema = z.strictObject({ count: z.int().nonnegative(), relation: z.enum(['exact', 'at_least']) });
 
 export const listDirectoryOutputSchema = z.strictObject({
   path: z.string(),
+  depth: z.strictObject({ requested: z.int().positive(), effective: z.int().positive(), hostMaximum: z.int().positive() }),
   entries: z.array(entrySchema),
   coverage: z.enum(['complete', 'partial']),
   causes: z.array(z.string()),
-  counts: z.strictObject({ visited: z.int().nonnegative(), returned: z.int().nonnegative(), omitted: z.int().nonnegative() }),
-  omitted: z.strictObject({ ignoreFiles: z.int().nonnegative() }),
+  counts: z.strictObject({ visited: z.int().nonnegative(), returned: z.int().nonnegative(), omitted: omissionCountSchema }),
+  omitted: z.strictObject({ ignoreFiles: omissionCountSchema }),
+  omissions: z.array(z.strictObject({ cause: z.string(), count: z.int().nonnegative(), relation: z.enum(['exact', 'at_least']) })),
   omissionSamples: z.array(omissionSchema)
 });
 

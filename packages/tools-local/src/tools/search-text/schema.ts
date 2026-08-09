@@ -16,7 +16,10 @@ export const searchTextInputSchema = z.strictObject({
 const matchSchema = z.strictObject({
   path: z.string(), lineNumber: z.int().positive(), text: z.string(),
   occurrences: z.array(z.strictObject({ startByte: z.int().nonnegative(), endByte: z.int().nonnegative(), text: z.string() })),
-  context: z.strictObject({ before: z.array(z.string()), after: z.array(z.string()) }).optional()
+  context: z.strictObject({
+    before: z.array(z.strictObject({ lineNumber: z.int().positive(), text: z.string() })),
+    after: z.array(z.strictObject({ lineNumber: z.int().positive(), text: z.string() }))
+  }).optional()
 });
 const countSchema = z.strictObject({ path: z.string(), matchingLineCount: z.int().nonnegative(), occurrenceCount: z.int().nonnegative() });
 const perFileOmissionSchema = z.strictObject({
@@ -25,7 +28,7 @@ const perFileOmissionSchema = z.strictObject({
 const common = {
   query: z.string(),
   status: z.enum(['completed', 'partial', 'invalid_pattern', 'missing_ripgrep', 'io_error', 'aborted', 'output_limit', 'failed']),
-  diagnostic: z.string().optional(), coverage: z.enum(['complete', 'partial']),
+  diagnostic: z.string().optional(), resultCoverage: z.enum(['complete', 'partial']), countCoverage: z.enum(['complete', 'partial']),
   examinedFileCount: z.int().nonnegative(), matchingFileCount: z.int().nonnegative(), matchingLineCount: z.int().nonnegative(),
   occurrenceCount: z.int().nonnegative(), omittedResultCount: z.int().nonnegative(),
   countsCapped: z.boolean(), omittedResultCountIsLowerBound: z.boolean(), outputTruncated: z.boolean(), perFileOmissions: z.array(perFileOmissionSchema)

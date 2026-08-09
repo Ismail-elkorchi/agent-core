@@ -1,12 +1,10 @@
 import * as z from 'zod';
 import {
-  parseJsonObject,
-  parseJsonValue,
   validatePublicArtifactRef,
-  type JsonObject,
-  type JsonValue,
+  parseToolEvidenceDelta,
   type ToolEvidenceDelta
 } from '@agent-core/evidence';
+import { parseJsonObject, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import type {
   InvalidArgumentsToolFailureOutput,
   InvalidOutputToolFailureOutput,
@@ -164,9 +162,7 @@ function parseContent(value: unknown): readonly ToolContent[] | undefined {
   }));
 }
 function parseEvidence(value: unknown): ToolEvidenceDelta {
-  const copy = parseJsonObject(value, JSON_LIMITS);
-  if (!Array.isArray(copy.items)) throw new Error('Tool evidence must contain an items array.');
-  return copy as unknown as ToolEvidenceDelta;
+  return parseToolEvidenceDelta(value);
 }
 function persistenceTool(): Pick<ToolDefinition, 'outputSchema'> {
   return { outputSchema: z.unknown() };

@@ -1,6 +1,6 @@
-import { ContextManager } from '../context/manager.js';
+import { ContextManager, type ContextImageLimits } from '../context/manager.js';
 import type { ArtifactRef, ArtifactRepository, EventEnvelope, EventRepository, EvidenceRecord } from '@agent-core/evidence';
-import { isJsonObject } from '@agent-core/evidence';
+import { isJsonObject } from '@agent-core/json';
 import type { ModelProviderState, TokenEstimator } from '@agent-core/model';
 import type { SessionRepository } from '../session/repository.js';
 import { validateToolObservationPresentation } from '@agent-core/tools';
@@ -28,11 +28,12 @@ export async function rebuildContextFromRepositories(input: {
   readonly events: EventRepository<AgentEvent>;
   readonly artifacts?: ArtifactRepository;
   readonly estimator: TokenEstimator;
+  readonly contextImageLimits?: ContextImageLimits;
   readonly providerId: string;
   readonly model: string;
   readonly runIds?: readonly string[];
 }): Promise<ContextReplayResult> {
-  const contextManager = new ContextManager(input.estimator);
+  const contextManager = new ContextManager(input.estimator, input.contextImageLimits);
   const replayState = input.session ? await input.session.repository.loadReplayState(input.session.sessionId) : undefined;
   const runIds = [...new Set([...(replayState?.ledgerRunIds ?? []), ...(input.runIds ?? [])])];
   if (replayState?.contextProjection) {

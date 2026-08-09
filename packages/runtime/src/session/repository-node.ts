@@ -2,14 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import {
-  isJsonObject,
-  normalizeJsonSafe,
-  parseJsonValue,
   type ArtifactRef,
-  type JsonObject,
-  type JsonValue,
   validateArtifactRef
 } from '@agent-core/evidence';
+import { isJsonObject, normalizeJsonSafe, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import {
   PersistenceConflictError,
   PersistenceCorruptionError,

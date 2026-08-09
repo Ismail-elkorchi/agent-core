@@ -46,15 +46,17 @@ export async function searchText(input: SearchTextInput, context: ToolExecutionC
   const globallyOmitted = input.mode === 'matches'
     ? Math.max(0, aggregate.matchingLineCount - Math.min(aggregate.matches.length, resultLimit))
     : Math.max(0, aggregate.files.size - Math.min(aggregate.files.size, resultLimit));
-  const omittedResultCount = globallyOmitted + perFileOmitted;
-  const limited = globallyOmitted > 0 || perFileOmitted > 0;
+  const omittedResultCount = globallyOmitted + (input.mode === 'matches' ? perFileOmitted : 0);
+  const failed = aggregate.status !== 'completed';
+  const resultCoverage = failed || aggregate.outputTruncated || globallyOmitted > 0 || (input.mode === 'matches' && perFileOmitted > 0) ? 'partial' as const : 'complete' as const;
+  const countCoverage = failed || aggregate.outputTruncated || perFileOmitted > 0 ? 'partial' as const : 'complete' as const;
+  const limited = resultCoverage === 'partial' || countCoverage === 'partial';
   const status: SearchStatus = aggregate.status === 'completed' && limited ? 'partial' : aggregate.status;
-  const coverage = status === 'completed' ? 'complete' as const : 'partial' as const;
   const common = {
-    query: input.query, status, ...(aggregate.diagnostic ? { diagnostic: aggregate.diagnostic } : {}), coverage,
+    query: input.query, status, ...(aggregate.diagnostic ? { diagnostic: aggregate.diagnostic } : {}), resultCoverage, countCoverage,
     examinedFileCount: aggregate.examinedFileCount, matchingFileCount: aggregate.files.size,
     matchingLineCount: aggregate.matchingLineCount, occurrenceCount: aggregate.occurrenceCount, omittedResultCount,
-    countsCapped: perFileOmitted > 0 || aggregate.outputTruncated,
+    countsCapped: countCoverage === 'partial',
     omittedResultCountIsLowerBound: perFileOmitted > 0 || aggregate.outputTruncated,
     outputTruncated: aggregate.outputTruncated,
     perFileOmissions: [...aggregate.perFileOmissions.entries()].sort(([a], [b]) => compare(a, b)).map(([file, omittedAtLeast]) => ({
@@ -71,13 +73,18 @@ export async function searchText(input: SearchTextInput, context: ToolExecutionC
       return {
         ...match,
         context: {
-          before: range(match.lineNumber - input.contextLines, match.lineNumber - 1).flatMap((line) => lines?.get(line) ?? []),
-          after: range(match.lineNumber + 1, match.lineNumber + input.contextLines).flatMap((line) => lines?.get(line) ?? [])
+          before: range(match.lineNumber - input.contextLines, match.lineNumber - 1).flatMap((line) => {
+            const text = lines?.get(line); return text === undefined ? [] : [{ lineNumber: line, text }];
+          }),
+          after: range(match.lineNumber + 1, match.lineNumber + input.contextLines).flatMap((line) => {
+            const text = lines?.get(line); return text === undefined ? [] : [{ lineNumber: line, text }];
+          })
         }
       };
     });
     output = { ...common, mode: 'matches', results };
   }
+  const coverage = resultCoverage === 'complete' && countCoverage === 'complete' ? 'complete' as const : 'partial' as const;
   const scope = {
     resources: [workspaceFileScope(input.path)], coverage,
     filters: { patterns: input.patterns, exclude: input.exclude, respectGitIgnore: input.respectGitIgnore, query: input.query, mode: input.mode },
@@ -91,10 +98,19 @@ export async function searchText(input: SearchTextInput, context: ToolExecutionC
   return {
     kind: 'result', ok: status === 'completed' || status === 'partial',
     summary: status === 'completed' || status === 'partial'
-      ? 'Found ' + String(output.occurrenceCount) + ' occurrences on ' + String(output.matchingLineCount) + ' lines in ' + String(output.matchingFileCount) + ' files.'
+      ? (output.countCoverage === 'complete' ? 'Found ' : 'Reported at least ') + String(output.occurrenceCount) + ' occurrences on '
+        + (output.countCoverage === 'complete' ? '' : 'at least ') + String(output.matchingLineCount) + ' lines in ' + String(output.matchingFileCount) + ' files.'
       : 'Search failed: ' + status + '.',
     scope,
-    evidence: builtInReadEvidence('search', scope, `Searched ${String(output.examinedFileCount)} files and found ${String(output.occurrenceCount)} reported occurrences.`),
+    evidence: builtInReadEvidence(
+      'search',
+      scope,
+      `Searched ${String(output.examinedFileCount)} files and reported ${String(output.occurrenceCount)} occurrences.`,
+      {
+        outcome: status === 'completed' || status === 'partial' ? 'success' : 'failure',
+        confidence: output.countsCapped || output.outputTruncated ? 'unverified' : 'verified'
+      }
+    ),
     output
   };
 }

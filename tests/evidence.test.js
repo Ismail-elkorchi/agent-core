@@ -2,12 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   evidenceDelta,
-  normalizeJsonSafe,
   normalizeToolEvidenceDelta,
-  parseJsonObject,
+  parseToolEvidenceDelta,
   toEvidenceJsonObject,
   workspaceResource
 } from '@agent-core/evidence';
+import { normalizeJsonSafe, parseJsonObject } from '@agent-core/json';
 
 test('safe JSON parsing rejects accessors, cycles, prototypes, and limits while returning an owned frozen copy', () => {
   let getterCalls = 0;
@@ -82,11 +82,8 @@ test('evidence deltas normalize into observation-scoped records', () => {
         truncated: false,
         confidence: 'verified'
       },
-      summary: 'Read a window.'
-    },
-    {
-      action: 'not-real',
-      resources: [{ uri: '' }]
+      summary: 'Read a window.',
+      outcome: 'success'
     }
   ]), {
     observationId: 'obs-1',
@@ -107,4 +104,8 @@ test('evidence deltas normalize into observation-scoped records', () => {
   });
   assert.deepEqual(records[0].scope.filters, { hidden: 'exclude' });
   assert.equal(records[0].scope.confidence, 'verified');
+  assert.throws(() => parseToolEvidenceDelta({ items: [{ action: 'not-real', outcome: 'success', resources: [] }] }), /action/u);
+  assert.throws(() => parseToolEvidenceDelta({ items: [{ action: 'read', outcome: 'success', resources: [{ uri: '' }] }] }), /URI/u);
+  assert.throws(() => parseToolEvidenceDelta({ items: [{ action: 'read', outcome: 'success', resources: [], scope: { coverage: 'complete', truncated: true } }] }), /complete and truncated/u);
+  assert.throws(() => parseToolEvidenceDelta({ items: [{ action: 'read', outcome: 'failure', resources: [], unexpected: true }] }), /unsupported fields/u);
 });

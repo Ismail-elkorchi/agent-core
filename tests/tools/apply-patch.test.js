@@ -43,7 +43,8 @@ test('apply_patch parses once into one canonical tree and applies add, update, m
     emitProgress(item) { progress.push(item); }
   });
   assert.equal(observation.ok, true);
-  assert.equal(observation.output.transactional, true);
+  assert.equal(observation.output.operationStatus, 'applied');
+  assert.equal(observation.output.transactionOutcome, 'committed');
   assert.deepEqual([...observation.output.changedPaths].sort(), ['added.txt', 'delete.txt', 'move.txt', 'moved.txt', 'update.txt']);
   assert.equal(await readFile(path.join(root, 'added.txt'), 'utf8'), 'added\n');
   assert.equal(await readFile(path.join(root, 'update.txt'), 'utf8'), 'new\n');
@@ -82,6 +83,10 @@ test('apply_patch enforces raw SHA-256 preconditions and keeps dry runs non-muta
     policy, services: { workspaceRoot: root }
   });
   assert.equal(dryRun.ok, true);
+  assert.equal(dryRun.output.operationStatus, 'dry_run');
+  assert.equal(dryRun.output.transactionOutcome, undefined);
+  assert.equal(dryRun.output.files[0].plannedChange, true);
+  assert.equal(dryRun.output.files[0].finalState, 'unchanged');
   assert.deepEqual(dryRun.output.changedPaths, []);
   assert.deepEqual(dryRun.output.wouldChangePaths, ['note.txt']);
   assert.deepEqual(await readFile(path.join(root, 'note.txt')), original);
@@ -107,15 +112,19 @@ test('apply_patch preserves all four transaction outcome semantics', async () =>
     assert.equal(preparation.ok, true);
     const observation = await applyPatchWithAuthority(preparation.prepared.canonicalInput, context, { async commit() { return transaction; } });
     assert.equal(observation.kind, 'result');
-    assert.equal(observation.output.status, transaction.outcome);
+    assert.equal(observation.output.transactionOutcome, transaction.outcome);
+    assert.equal(observation.output.operationStatus, transaction.outcome === 'committed' || transaction.outcome === 'committed_with_residue'
+      ? 'applied' : transaction.outcome === 'rolled_back' ? 'not_applied' : 'uncertain');
     assert.deepEqual(observation.output.wouldChangePaths, ['note.txt']);
     if (transaction.outcome === 'committed' || transaction.outcome === 'committed_with_residue') {
       assert.equal(observation.ok, true);
       assert.deepEqual(observation.output.changedPaths, ['note.txt']);
+      assert.equal(observation.output.files[0].finalState, 'changed');
       assert.equal(observation.evidence.items[0].scope.confidence, 'verified');
     } else {
       assert.equal(observation.ok, false);
       assert.deepEqual(observation.output.changedPaths, []);
+      assert.equal(observation.output.files[0].finalState, transaction.outcome === 'rolled_back' ? 'unchanged' : 'uncertain');
     }
     if (transaction.outcome === 'committed_with_residue') {
       assert.equal(observation.scope.coverage, 'partial');
@@ -135,6 +144,45 @@ test('apply_patch preserves all four transaction outcome semantics', async () =>
       assert.equal(observation.evidence.items[0].scope.confidence, 'unverified');
     }
   }
+});
+
+test('apply_patch reports no-op without a transaction outcome', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-noop-'));
+  await writeFile(path.join(root, 'note.txt'), 'same\n');
+  const result = await invokeToolCall(textToolCall('apply_patch', patch(['*** Update File: note.txt', '@@', '-same', '+same'])), [applyPatchTool], {
+    policy, services: { workspaceRoot: root }
+  });
+  assert.equal(result.kind, 'result');
+  assert.equal(result.output.operationStatus, 'no_change');
+  assert.equal(result.output.transactionOutcome, undefined);
+  assert.equal(result.output.files[0].plannedChange, false);
+  assert.equal(result.output.files[0].finalState, 'unchanged');
+});
+
+test('apply_patch dynamically requires a transaction directory only for writes', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-services-'));
+  await writeFile(path.join(root, 'note.txt'), 'old\n');
+  const base = {
+    policy,
+    boundary: { authorizationPolicyId: 'tests/patch-services@1', executionTargetId: root },
+    signal: new AbortController().signal,
+    services: { workspaceRoot: root, localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION }
+  };
+  const document = patch(['*** Update File: note.txt', '@@', '-old', '+new']);
+  const dryPreparation = await prepareToolCall({ name: 'apply_patch', input: { kind: 'json', value: { patch: document, dryRun: true } } }, [applyPatchTool], base);
+  assert.equal(dryPreparation.ok, true);
+  const dry = await dryPreparation.prepared.tool.invoke(dryPreparation.prepared.canonicalInput, base);
+  assert.equal(dry.output.operationStatus, 'dry_run');
+
+  const writePreparation = await prepareToolCall(textToolCall('apply_patch', document), [applyPatchTool], base);
+  assert.equal(writePreparation.ok, true);
+  const missing = await writePreparation.prepared.tool.invoke(writePreparation.prepared.canonicalInput, base).catch(error => error);
+  assert.match(missing.message, /patchTransactionDirectory/u);
+
+  const withDirectory = { ...base, services: { ...base.services, patchTransactionDirectory: path.join(root, '.agent-core', 'transactions', 'patch') } };
+  const applied = await writePreparation.prepared.tool.invoke(writePreparation.prepared.canonicalInput, withDirectory);
+  assert.equal(applied.output.operationStatus, 'applied');
+  assert.deepEqual(applyPatchTool.requirements.services, ['workspaceRoot', 'localToolConfiguration']);
 });
 
 test('apply_patch dry runs require only read access and do not create transaction state', async () => {

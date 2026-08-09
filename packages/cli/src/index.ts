@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { FileCredentialStore } from '@agent-core/auth';
 import { AgentRuntime, agentEventCodec, type AgentApprovalSuspension, type AgentEvent, type AgentInstruction, type AgentProgressEvent, type AgentRunResult } from '@agent-core/runtime';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
-import { JsonlEventRepository, LocalArtifactRepository } from '@agent-core/evidence/node';
+import { JsonlEventRepository } from '@agent-core/evidence/node';
 import { type ModelProvider, type ModelReasoningEffort, type ModelReasoningRequest, SimpleTokenEstimator } from '@agent-core/model';
 import { loadAgentCoreConfiguration, type AgentCoreCheckConfiguration, type AgentCoreConfiguration } from './configuration.js';
 import { loadWorkspace, type WorkspaceLayout } from './workspace.js';
@@ -25,27 +25,16 @@ import {
   type ToolProgress,
   type ToolRisk
 } from '@agent-core/tools';
-import type { ToolDefinition } from '@agent-core/tools';
 import {
-  DEFAULT_LOCAL_TOOL_CONFIGURATION,
-  ProcessManager,
-  WorkspaceFileSelector,
-  applyPatchTool,
-  createExecCommandTool,
-  findFilesTool,
-  listDirectoryTool,
-  readArtifactTool,
-  readFilesTool,
-  searchTextTool,
-  stopProcessTool,
-  viewImageTool,
-  writeStdinTool
+  createLocalToolHost,
+  type LocalToolHost
 } from '@agent-core/tools-local';
 import { AgentTuiProgressRenderer, runAgentTuiApp, runAgentTuiTask } from './tui/index.js';
 import type { AgentTuiRuntimeDetails } from './tui/index.js';
 import { parseReasoningEffort } from './cli-values.js';
 import { executeInteractiveCommand } from './interactive-commands.js';
 import { normalizeTaskInput } from './task-input.js';
+import { parseJsonValue } from '@agent-core/json';
 
 export {
   loadAgentCoreConfiguration,
@@ -103,6 +92,7 @@ interface CliRuntime {
   session: AgentSession;
   progress: CliProgressSink;
   tuiDetails: AgentTuiRuntimeDetails;
+  localHost: LocalToolHost;
 }
 
 export async function main(argv: string[]): Promise<void> {
@@ -136,6 +126,7 @@ export async function main(argv: string[]): Promise<void> {
       });
       printPersistenceLocations(runtime, result);
       process.exitCode = resultExitCode(result);
+      await runtime.localHost.close();
       return;
     }
     const progress = new CliProgressRenderer({ showReasoning: options.showReasoning });
@@ -144,6 +135,7 @@ export async function main(argv: string[]): Promise<void> {
     printResult(result, progress);
     printPersistenceLocations(runtime, result);
     process.exitCode = resultExitCode(result);
+    await runtime.localHost.close();
     return;
   }
 
@@ -156,12 +148,14 @@ export async function main(argv: string[]): Promise<void> {
         runtimeDetails: runtime.tuiDetails
       });
       console.error(`\nSession: ${runtime.sessions.location(runtime.session.id)}`);
+      await runtime.localHost.close();
       return;
     }
     const progress = new CliProgressRenderer({ showReasoning: options.showReasoning });
     const runtime = await createRuntime(options, workspace, progress);
     await runInteractive(runtime.agent, progress);
     console.error(`\nSession: ${runtime.sessions.location(runtime.session.id)}`);
+    await runtime.localHost.close();
     return;
   }
 
@@ -176,11 +170,36 @@ async function createRuntime(
 ): Promise<CliRuntime> {
   const providerRuntime = createProviderRuntime(options);
   const sessionBinding = await openSession(options, workspace, providerRuntime, persistedSessionId);
-  const artifactStore = new LocalArtifactRepository({ rootDir: workspace.artifactsDir });
   const events = new JsonlEventRepository<AgentEvent>({ rootDir: workspace.runsDir, codec: agentEventCodec });
+  const existingRunIds = new Set(await events.listRunIds());
+  const localHost = createLocalToolHost({
+    workspaceRoot: workspace.workspaceRoot,
+    artifactDirectory: workspace.artifactsDir,
+    processLedgerDirectory: path.join(workspace.runtimeDir, 'processes'),
+    patchTransactionDirectory: path.join(workspace.runtimeDir, 'transactions', 'patch'),
+    ...(options.configuration?.tools.enabled ? { enabledTools: options.configuration.tools.enabled } : {}),
+    async deliverRecoveredTerminalReport(report) {
+      const runId = report.result.owner.runId;
+      if (!existingRunIds.has(runId)) return false;
+      await events.append(runId, {
+        type: 'process.ended',
+        runId,
+        processId: report.result.processId,
+        status: report.result.status,
+        result: parseJsonValue(report)
+      }, { idempotencyKey: `${runId}:process:${report.result.processId}:ended` });
+      return true;
+    }
+  });
+  await localHost.ready();
+  const reconciliation = await localHost.reconciliation();
+  if (reconciliation.unresolved.length > 0) {
+    throw new Error('Unresolved ambient process supervision blocks this workspace: ' + reconciliation.unresolved.map((item) => `${item.processId}: ${item.diagnostic}`).join('; '));
+  }
+  const artifactStore = localHost.artifactRepository;
   const estimator = new SimpleTokenEstimator();
-  const localHost = createCliLocalToolHost(workspace, artifactStore, options.configuration?.tools.enabled);
-  const { localToolConfiguration, processManager } = localHost;
+  const localToolConfiguration = localHost.services.localToolConfiguration;
+  const processManager = localHost.processManager;
   const toolPolicy = toolPolicyFromOptions(options);
   const configuredTools = localHost.tools;
   const instructions = await loadWorkspaceInstructions(workspace.workspaceRoot, options.configuration);
@@ -260,44 +279,9 @@ async function createRuntime(
         workspaceWrites: options.apply ? 'allowed' : options.dryRun ? 'dry_run' : options.allowShell ? 'ambient_shell' : 'denied',
         shell: options.allowShell ? 'ambient' : 'denied'
       }
-    }
+    },
+    localHost
   };
-}
-
-export function createCliLocalToolHost(workspace: WorkspaceLayout, artifactStore: LocalArtifactRepository, enabled?: readonly string[]) {
-  const localToolConfiguration = DEFAULT_LOCAL_TOOL_CONFIGURATION;
-  const processManager = new ProcessManager({ artifactRepository: artifactStore, ledgerDirectory: path.join(workspace.runtimeDir, 'processes'), ...localToolConfiguration.process });
-  const workspaceFileSelector = new WorkspaceFileSelector(workspace.workspaceRoot, localToolConfiguration.fileSelection);
-  const services = Object.freeze({
-    workspaceRoot: workspace.workspaceRoot,
-    artifactRepository: artifactStore,
-    patchTransaction: true,
-    patchTransactionDirectory: path.join(workspace.runtimeDir, 'transactions', 'patch'),
-    localToolConfiguration,
-    processManager,
-    workspaceFileSelector
-  });
-  return Object.freeze({ localToolConfiguration, processManager, workspaceFileSelector, services, tools: Object.freeze(createCliDefaultTools(enabled, { ptySupported: processManager.supportsPty() })) });
-}
-
-export function createCliDefaultTools(enabled?: readonly string[], host: { readonly ptySupported?: boolean } = {}): ToolDefinition[] {
-  const tools = [
-    listDirectoryTool,
-    findFilesTool,
-    readFilesTool,
-    searchTextTool,
-    applyPatchTool,
-    createExecCommandTool(host),
-    writeStdinTool,
-    stopProcessTool,
-    viewImageTool,
-    readArtifactTool
-  ];
-  if (!enabled) return tools;
-  const known = new Set(tools.map((tool) => tool.name));
-  const unknown = enabled.filter((name) => !known.has(name));
-  if (unknown.length > 0) throw new Error(`Unknown configured local tools: ${unknown.join(', ')}.`);
-  return tools.filter(tool => enabled.includes(tool.name));
 }
 
 function applyConfiguration(options: CliOptions, configuration: AgentCoreConfiguration): CliOptions {

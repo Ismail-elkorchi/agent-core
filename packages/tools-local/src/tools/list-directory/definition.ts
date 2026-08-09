@@ -41,14 +41,24 @@ export const listDirectoryTool = defineTool({
     });
     const output = {
       path: selected.startPath,
+      depth: { requested: input.depth, effective: selected.effectiveDepth, hostMaximum: selected.hostMaximumDepth },
       entries: [...selected.entries],
       coverage: selected.coverage,
       causes: [...selected.causes],
       counts: { visited: selected.visitedEntries, returned: selected.returnedEntries, omitted: selected.omittedEntries },
       omitted: { ignoreFiles: selected.omittedIgnoreFiles },
+      omissions: [...selected.omissions],
       omissionSamples: [...selected.omissionSamples]
     };
-    const scope = { resources: [workspaceFileScope(output.path)], coverage: output.coverage, ...(output.causes.length > 0 ? { causes: output.causes, omitted: { entries: output.counts.omitted } } : {}) } as const;
+    const scope = {
+      resources: [workspaceFileScope(output.path)], coverage: output.coverage,
+      filters: { requestedDepth: input.depth },
+      limits: { effectiveDepth: selected.effectiveDepth, hostMaximumDepth: selected.hostMaximumDepth },
+      ...(output.causes.length > 0 ? { causes: output.causes, omitted: {
+        entries: { count: output.counts.omitted.count, relation: output.counts.omitted.relation },
+        causes: output.omissions.map((item) => ({ cause: item.cause, count: item.count, relation: item.relation }))
+      } } : {})
+    } as const;
     return {
       kind: 'result' as const,
       ok: true,

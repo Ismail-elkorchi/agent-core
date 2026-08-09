@@ -7,6 +7,6 @@
   },
   "include": ["src"],
   "references": [
-    { "path": "../evidence" }
+    { "path": "../json" }
   ]
 }

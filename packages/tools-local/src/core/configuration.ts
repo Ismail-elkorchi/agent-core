@@ -1,4 +1,4 @@
-import { parseJsonObject } from '@agent-core/evidence';
+import { parseJsonObject } from '@agent-core/json';
 import { type ToolExecutionContext } from '@agent-core/tools';
 
 export interface LocalToolConfiguration {
@@ -19,7 +19,13 @@ export interface LocalToolConfiguration {
     readonly completedRetentionMs: number;
     readonly maxPendingOutputBytes: number;
   };
-  readonly artifact: { readonly maxReadBytes: number; readonly maxImageBytes: number };
+  readonly artifact: {
+    readonly maxReadBytes: number;
+    readonly maxImageEncodedBytes: number;
+    readonly maxImageWidth: number;
+    readonly maxImageHeight: number;
+    readonly maxImagePixels: number;
+  };
 }
 
 const DEFAULTS: LocalToolConfiguration = {
@@ -32,7 +38,7 @@ const DEFAULTS: LocalToolConfiguration = {
     maxActiveProcessesPerRun: 8, maxActiveProcesses: 32, maxTotalCapturedBytes: 64_000_000, maxProcessLifetimeMs: 3_600_000,
     completedRetentionMs: 60_000, maxPendingOutputBytes: 2_000_000
   },
-  artifact: { maxReadBytes: 2_000_000, maxImageBytes: 20_000_000 }
+  artifact: { maxReadBytes: 2_000_000, maxImageEncodedBytes: 20_000_000, maxImageWidth: 16_384, maxImageHeight: 16_384, maxImagePixels: 100_000_000 }
 };
 export const DEFAULT_LOCAL_TOOL_CONFIGURATION = parseLocalToolConfiguration(DEFAULTS);
 const CONFIGURATION_SNAPSHOTS = new WeakMap<object, LocalToolConfiguration>();
@@ -46,7 +52,7 @@ export function parseLocalToolConfiguration(value: unknown): LocalToolConfigurat
     searchText: group(owned.searchText, ['maxResults', 'maxOutputBytes', 'maxFileBytes'], 'searchText'),
     applyPatch: group(owned.applyPatch, ['maxPatchBytes', 'maxOperations', 'maxFileBytes', 'maxNewBytesPerFile'], 'applyPatch'),
     process: group(owned.process, ['maxYieldMs', 'maxTimeoutMs', 'maxOutputTokens', 'maxCapturedBytes', 'tailBytes', 'maxActiveProcessesPerRun', 'maxActiveProcesses', 'maxTotalCapturedBytes', 'maxProcessLifetimeMs', 'completedRetentionMs', 'maxPendingOutputBytes'], 'process'),
-    artifact: group(owned.artifact, ['maxReadBytes', 'maxImageBytes'], 'artifact')
+    artifact: group(owned.artifact, ['maxReadBytes', 'maxImageEncodedBytes', 'maxImageWidth', 'maxImageHeight', 'maxImagePixels'], 'artifact')
   }) as LocalToolConfiguration;
 }
 export function requireLocalToolConfiguration(context: ToolExecutionContext): LocalToolConfiguration {

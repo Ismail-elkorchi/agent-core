@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { ContextManager } from '@agent-core/runtime';
+import { SimpleTokenEstimator } from '@agent-core/model';
 
 const modelProfile = {
   id: 'scripted',
@@ -21,6 +22,77 @@ const modelProfile = {
   limits: { contextTokens: 20_000, outputTokens: 4_000 },
   supportedParameters: ['tools']
 };
+const imageProfile = { ...modelProfile, modalities: { input: ['text', 'image'], output: ['text'] } };
+
+function recordImageResult(manager, index, images) {
+  const callId = `image-call-${index}`;
+  manager.recordModelOutput({ turnIndex: index, content: '', toolCalls: [{ id: callId, type: 'function', name: 'view_image', input: { kind: 'json', value: { path: `${index}.png` } } }] });
+  manager.recordToolResult({
+    turnIndex: index, toolName: 'view_image', toolCallType: 'function', callId,
+    immediateContent: JSON.stringify({ ok: true, summary: `image ${index}`, results: { artifacts: images.map((_, imageIndex) => `artifact-${index}-${imageIndex}`) } }),
+    retainedContent: JSON.stringify({ ok: true, summary: `retained image ${index}`, results: { artifacts: images.map((_, imageIndex) => `artifact-${index}-${imageIndex}`) } }),
+    immediateImages: images,
+    imageArtifacts: images.map((image, imageIndex) => ({
+      visibility: 'public', artifactId: `artifact-${index}-${imageIndex}`, sha256: `${index}${imageIndex}`.padEnd(64, '0'),
+      size: image.data.byteLength, mediaType: image.mediaType
+    }))
+  });
+}
+
+test('history projection removes incompatible images without mutating stored tool protocol history', () => {
+  const manager = new ContextManager();
+  recordImageResult(manager, 1, [{ type: 'bytes', data: new Uint8Array([1, 2, 3]), mediaType: 'image/png', detail: 'original' }]);
+  const multimodal = manager.projectHistory(imageProfile);
+  assert.equal(multimodal.messages[1].images.length, 1);
+  assert.equal(multimodal.reductions.length, 0);
+  const textOnly = manager.projectHistory(modelProfile);
+  assert.equal(textOnly.messages.length, 2);
+  assert.equal(textOnly.messages[0].toolCalls[0].id, textOnly.messages[1].toolCallId);
+  assert.equal(textOnly.messages[1].images, undefined);
+  assert.match(textOnly.messages[1].content, /public artifact artifact-1-0/u);
+  assert.deepEqual(textOnly.reductions.map((item) => item.reason), ['unsupported_modality']);
+  assert.equal(manager.rawItems()[1].immediateMessage.images.length, 1);
+  assert.ok(textOnly.estimatedTokens < multimodal.estimatedTokens);
+});
+
+test('active image count, byte, and token budgets remove older images deterministically', () => {
+  const scenarios = [
+    { limits: { maxCount: 2, maxBytes: 100, maxEstimatedTokens: 10_000 }, reason: 'image_count_limit' },
+    { limits: { maxCount: 10, maxBytes: 5, maxEstimatedTokens: 10_000 }, reason: 'image_byte_limit' },
+    { limits: { maxCount: 10, maxBytes: 100, maxEstimatedTokens: 2_000 }, reason: 'image_token_limit' }
+  ];
+  for (const scenario of scenarios) {
+    const manager = new ContextManager(new SimpleTokenEstimator(), scenario.limits);
+    for (let index = 1; index <= 3; index += 1) recordImageResult(manager, index, [{ type: 'bytes', data: new Uint8Array([index, index, index]), mediaType: 'image/png' }]);
+    const projection = manager.projectHistory(imageProfile);
+    const toolMessages = projection.messages.filter((message) => message.role === 'tool');
+    const attached = toolMessages.flatMap((message) => message.images ?? []);
+    assert.equal(attached.every((image) => image.data[0] !== 1), true);
+    assert.equal(projection.reductions.some((item) => item.reason === scenario.reason), true);
+    assert.equal(projection.messages.filter((message) => message.role === 'assistant').length, 3);
+    assert.equal(toolMessages.length, 3);
+  }
+});
+
+test('several images in one result obey the same global newest-first budget', () => {
+  const manager = new ContextManager(new SimpleTokenEstimator(), { maxCount: 2, maxBytes: 100, maxEstimatedTokens: 10_000 });
+  recordImageResult(manager, 1, [1, 2, 3].map((value) => ({ type: 'bytes', data: new Uint8Array([value]), mediaType: 'image/png' })));
+  const projection = manager.projectHistory(imageProfile);
+  assert.deepEqual(projection.messages[1].images.map((image) => image.data[0]), [2, 3]);
+  assert.match(projection.messages[1].content, /artifact-1-0/u);
+});
+
+test('context compaction keeps image tool protocol and public references while dropping active bytes', () => {
+  const manager = new ContextManager();
+  recordImageResult(manager, 1, [{ type: 'bytes', data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }]);
+  const reductions = manager.reduceOlderLargeToolResults({ keepLatestToolResults: 0, includeLatest: true });
+  assert.equal(reductions.length, 1);
+  const projection = manager.projectHistory(imageProfile);
+  assert.equal(projection.messages.length, 2);
+  assert.equal(projection.messages[0].toolCalls[0].id, projection.messages[1].toolCallId);
+  assert.equal(projection.messages[1].images, undefined);
+  assert.match(projection.messages[1].content, /artifact-1-0/u);
+});
 
 test('ContextManager ranks and budgets already-materialized evidence only', () => {
   const manager = new ContextManager();

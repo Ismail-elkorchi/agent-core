@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { InMemoryArtifactRepository } from '@agent-core/evidence';
@@ -9,6 +9,7 @@ import { spawnSync } from 'node:child_process';
 import {
   DEFAULT_LOCAL_TOOL_CONFIGURATION,
   ProcessManager,
+  createLocalToolHost,
   execCommandTool,
   stopProcessTool,
   writeStdinTool
@@ -182,6 +183,94 @@ test('natural termination is reported once whether or not the process was polled
   }
 });
 
+test('terminal tombstones release capture budgets before late acknowledgment', async () => {
+  const { root, manager } = await processContext({
+    maxCapturedBytes: 1_024,
+    maxTotalCapturedBytes: 1_024,
+    completedRetentionMs: 20
+  });
+  const processIds = [];
+  for (let index = 0; index < 4; index += 1) {
+    const owner = { ...invocation, runId: `late-ack-${String(index)}` };
+    let result = await manager.start({
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('x'.repeat(800))")}`,
+      cwd: root, pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner
+    });
+    while (result.status === 'running') result = await manager.poll(result.processId, 100, 50, result.cursorEnd, owner);
+    processIds.push(result.processId);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal((await manager.unreportedTerminalProcesses(owner.runId)).length, 1);
+  }
+  for (const processId of processIds) {
+    const before = await manager.poll(processId, 100);
+    await manager.markTerminalReported(processId);
+    await manager.markTerminalReported(processId);
+    assert.equal(before.status, 'exited');
+    assert.equal(manager.has(processId), false);
+  }
+});
+
+test('ledger cleanup residue does not change a terminal result and is retried on startup', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-core-ledger-residue-'));
+  const ledgerDirectory = path.join(root, 'processes');
+  const artifacts = new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts') });
+  const owner = { ...invocation, runId: 'cleanup-residue-run' };
+  const manager = new ProcessManager({
+    artifactRepository: artifacts,
+    ledgerDirectory,
+    ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process,
+    async removeLedgerRecord() { throw new Error('simulated ledger deletion failure'); }
+  });
+  let result = await manager.start({
+    command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('done')")}`,
+    cwd: root, pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner
+  });
+  while (result.status === 'running') result = await manager.poll(result.processId, 100, 50, result.cursorEnd, owner);
+  while ((await manager.unreportedTerminalProcesses(owner.runId)).length === 0) await new Promise(resolve => setTimeout(resolve, 10));
+  await manager.markTerminalReported(result.processId);
+  assert.equal(result.status, 'exited');
+  assert.match(manager.cleanupDiagnostics().join(' '), /simulated ledger deletion failure/u);
+
+  const retry = new ProcessManager({ artifactRepository: artifacts, ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+  const reconciliation = await retry.reconcileOrphanProcesses();
+  assert.equal(reconciliation.unresolved.length, 0);
+  assert.equal(reconciliation.resolved.includes(result.processId), true);
+  assert.deepEqual(await readdir(ledgerDirectory), []);
+});
+
+test('public process redaction detects a secret split across output chunks', async () => {
+  const { root, artifacts, manager } = await processContext();
+  const owner = { ...invocation, runId: 'split-redaction-run' };
+  const secret = 'split-secret-value';
+  const script = `process.stdout.write('API_TO'); setTimeout(()=>process.stdout.write('KEN=${secret}'), 20)`;
+  let result = await manager.start({
+    command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+    cwd: root, pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner
+  });
+  while (result.status === 'running') result = await manager.poll(result.processId, 100, 50, result.cursorEnd, owner);
+  const publicPayload = JSON.parse(new TextDecoder().decode(await artifacts.readVerified(result.artifact)));
+  const publicOutput = publicPayload.chunks.map((chunk) => chunk.text).join('');
+  assert.doesNotMatch(publicOutput, new RegExp(secret, 'u'));
+  assert.match(publicOutput, /REDACTED/u);
+  await manager.markTerminalReported(result.processId);
+});
+
+test('public process artifacts preserve output larger than the strict JSON string boundary', async () => {
+  const { root, artifacts, manager } = await processContext({ maxCapturedBytes: 5_000_000, maxTotalCapturedBytes: 5_000_000 });
+  const owner = { ...invocation, runId: 'large-public-output-run' };
+  const outputBytes = 4_300_000;
+  let result = await manager.start({
+    command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`process.stdout.write('x'.repeat(${String(outputBytes)}))`)}`,
+    cwd: root, pty: false, timeoutMs: 10_000, yieldMs: 1_000, outputTokenBudget: 100, owner
+  });
+  while (result.status === 'running') result = await manager.poll(result.processId, 100, 100, result.cursorEnd, owner);
+  assert.equal(result.artifact.visibility, 'public');
+  assert.ok(result.artifact.size > 4_000_000);
+  const publicPayload = JSON.parse(new TextDecoder().decode(await artifacts.readVerified(result.artifact)));
+  assert.equal(publicPayload.chunks.reduce((total, chunk) => total + Buffer.byteLength(chunk.text, 'utf8'), 0), outputBytes);
+  await manager.markTerminalReported(result.processId);
+});
+
 test('process output keeps raw protected bytes internal and exposes only a redacted public artifact', async () => {
   const { root, artifacts, manager } = await processContext();
   const owner = { ...invocation, runId: 'artifact-visibility-run' };
@@ -236,8 +325,33 @@ test('asynchronous process progress is ordered, bounded, and catches callback fa
     const exitedIndex = delivered.findIndex(item => item.type === 'status' && item.stage === 'process_exited');
     assert.ok(startedIndex >= 0 && exitedIndex > startedIndex);
     assert.equal(delivered.slice(0, startedIndex).some(item => item.type === 'output'), false);
+    const deliveredAtTerminal = delivered.length;
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(delivered.length, deliveredAtTerminal, 'no progress is delivered after a terminal result');
     await manager.disposeRun('progress-run');
   } finally { process.off('unhandledRejection', listener); }
+});
+
+test('a terminal poll waits for accepted asynchronous progress delivery', async () => {
+  const { root, artifacts } = await processContext();
+  const manager = new ProcessManager({ artifactRepository: artifacts, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+  const delivered = [];
+  const owner = { ...invocation, runId: 'terminal-progress-drain-run' };
+  let result = await manager.start({
+    command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('done')")}`,
+    cwd: root, pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner,
+    async onProgress(progress) {
+      if (progress.type === 'status' && progress.stage === 'process_exited') await new Promise(resolve => setTimeout(resolve, 40));
+      delivered.push(progress);
+    }
+  });
+  while (result.status === 'running') result = await manager.poll(result.processId, 100, 100, result.cursorEnd, owner);
+  assert.equal(delivered.at(-1).type, 'status');
+  assert.equal(delivered.at(-1).stage, 'process_exited');
+  const deliveredAtTerminal = delivered.length;
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.equal(delivered.length, deliveredAtTerminal);
+  await manager.markTerminalReported(result.processId);
 });
 
 test('process ledger restores unreported terminal records across manager restart', async () => {
@@ -265,16 +379,116 @@ test('startup reconciliation stops an orphaned child process tree and resolves i
   assert.equal(crashed.status, 44, crashed.stderr);
   const { processId } = JSON.parse(crashed.stdout);
   const ledgerDirectory = path.join(root, 'processes');
-  const ledgerName = (await readdir(ledgerDirectory)).find(name => name.endsWith('.json'));
+  const ledgerName = (await readdir(ledgerDirectory)).find(name => /^proc_[a-f0-9-]+\.json$/u.test(name));
   const ledger = JSON.parse(await readFile(path.join(ledgerDirectory, ledgerName), 'utf8'));
   const manager = new ProcessManager({ artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts-recovered') }), ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
   const reconciliation = await manager.reconcileOrphanProcesses();
   assert.equal(reconciliation.resolved.includes(processId), true);
   assert.equal(reconciliation.unresolved.length, 0);
-  assert.throws(() => process.kill(process.platform === 'win32' ? ledger.processGroup : -ledger.processGroup, 0), error => error?.code === 'ESRCH');
+  assert.equal(typeof ledger.supervisorIdentity, 'string');
+  assert.equal(typeof ledger.supervisorEndpoint, 'string');
   const reports = await manager.disposeRun('orphan-run');
   assert.equal(reports.length, 1);
   assert.equal(reports[0].result.status, 'stopped');
   await manager.markTerminalReported(processId);
   assert.deepEqual(await readdir(ledgerDirectory), []);
+});
+
+test('reconciliation never signals a PID without authenticated supervisor identity and blocks the workspace', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-core-process-pid-reuse-'));
+  const ledgerDirectory = path.join(root, 'processes');
+  await mkdir(ledgerDirectory, { recursive: true });
+  const processId = 'proc_11111111-1111-4111-8111-111111111111';
+  await writeFile(path.join(ledgerDirectory, `${processId}.json`), JSON.stringify({
+    schemaVersion: 1,
+    processId,
+    supervisorPid: process.pid,
+    supervisorIdentity: 'supervisor_22222222-2222-4222-8222-222222222222',
+    supervisorEndpoint: process.platform === 'win32' ? '\\\\.\\pipe\\missing-agent-core-supervisor' : path.join(ledgerDirectory, 'missing.sock'),
+    owner: { runId: 'old-run', turnId: 'turn', toolBatchId: 'batch', callIndex: 0 },
+    startedAt: new Date().toISOString(),
+    workspace: root,
+    state: 'running',
+    terminalReported: false
+  }) + '\n');
+
+  const host = createLocalToolHost({
+    workspaceRoot: root,
+    artifactDirectory: path.join(root, 'artifacts'),
+    processLedgerDirectory: ledgerDirectory,
+    patchTransactionDirectory: path.join(root, 'patch-transactions')
+  });
+  await host.ready();
+  const reconciliation = await host.reconciliation();
+  assert.equal(reconciliation.unresolved.length, 1);
+  assert.equal(reconciliation.unresolved[0].workspace, root);
+  assert.equal(host.processManager.resourceLeases.activeCount(), 1);
+  assert.equal(host.processManager.resourceLeases.wouldWait({ accesses: [{ mode: 'write', scope: 'workspace/files/a.txt' }], lockScopes: ['workspace/files/a.txt'], idempotency: 'non_idempotent' }), true);
+  assert.doesNotThrow(() => process.kill(process.pid, 0), 'the reused PID remains untouched');
+  await assert.rejects(host.processManager.start({
+    command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify('process.exit(0)')}`,
+    cwd: root, pty: false, timeoutMs: 1_000, yieldMs: 1, outputTokenBudget: 100,
+    owner: { runId: 'new-run', turnId: 'turn', toolBatchId: 'batch', callIndex: 0 }
+  }), /unresolved supervised process/u);
+
+  const resolved = await host.resolveReconciliation({ acknowledgeProcessIds: [processId] });
+  assert.equal(resolved.unresolved.length, 0);
+  assert.equal(host.processManager.resourceLeases.activeCount(), 0);
+  await host.close();
+});
+
+test('supervisor handshake prevents user code before durable release and reconciles a post-release crash', async () => {
+  const fixture = path.resolve('tests/fixtures/process-supervisor-crash.mjs');
+  for (const phase of ['ledger_persisted', 'released']) {
+    const root = await mkdtemp(path.join(tmpdir(), `agent-core-supervisor-${phase}-`));
+    const crashed = spawnSync(process.execPath, [fixture, root, phase], { encoding: 'utf8', timeout: 10_000 });
+    assert.equal(crashed.status, 45, crashed.stderr);
+    const { processId, checkpoint } = JSON.parse(crashed.stdout);
+    assert.equal(checkpoint, phase);
+    const marker = path.join(root, 'user-command-started');
+    if (phase === 'ledger_persisted') {
+      await new Promise(resolve => setTimeout(resolve, 600));
+      await assert.rejects(access(marker), /ENOENT/u, 'the supervisor timed out without starting user code');
+    } else {
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        try { await access(marker); break; } catch { await new Promise(resolve => setTimeout(resolve, 10)); }
+      }
+      await access(marker);
+    }
+    const ledgerDirectory = path.join(root, 'processes');
+    const manager = new ProcessManager({
+      artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'recovered-artifacts') }),
+      ledgerDirectory,
+      ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process
+    });
+    const reconciliation = await manager.reconcileOrphanProcesses();
+    assert.equal(reconciliation.unresolved.length, 0);
+    assert.equal(reconciliation.resolved.includes(processId), true);
+    const reports = await manager.disposeRun(`crash-${phase}`);
+    assert.equal(reports.length, 1);
+    assert.equal(phase === 'ledger_persisted' ? reports[0].result.status === 'failed' : reports[0].result.status === 'stopped', true);
+    await manager.markTerminalReported(processId);
+  }
+});
+
+test('local host durably hands recovered terminal reports to old runs during startup', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-core-terminal-handoff-'));
+  const fixture = path.resolve('tests/fixtures/process-orphan.mjs');
+  const crashed = spawnSync(process.execPath, [fixture, root], { encoding: 'utf8', timeout: 10_000 });
+  assert.equal(crashed.status, 44, crashed.stderr);
+  const { processId } = JSON.parse(crashed.stdout);
+  const delivered = [];
+  const host = createLocalToolHost({
+    workspaceRoot: root,
+    artifactDirectory: path.join(root, 'host-artifacts'),
+    processLedgerDirectory: path.join(root, 'processes'),
+    patchTransactionDirectory: path.join(root, 'patch-transactions'),
+    async deliverRecoveredTerminalReport(report) { delivered.push(report); return true; }
+  });
+  await host.ready();
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].result.processId, processId);
+  assert.equal(delivered[0].result.owner.runId, 'orphan-run');
+  assert.deepEqual(await readdir(path.join(root, 'processes')), []);
+  await host.close();
 });

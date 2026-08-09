@@ -64,7 +64,7 @@ class ScriptedProvider {
   calls = [];
   constructor(script, options = {}) { this.script = [...script]; this.options = options; }
   describe() { return { id: this.id, displayName: 'Scripted', defaultModel: 'scripted' }; }
-  async describeModel(model) { return profile(model, this.options.profile ?? {}); }
+  async describeModel(model) { return profile(model, typeof this.options.profile === 'function' ? this.options.profile(model) : this.options.profile ?? {}); }
   async complete(request) {
     this.calls.push(request);
     const next = this.script.shift();
@@ -219,6 +219,96 @@ test('artifact-store failure after a completed tool effect still persists tool.e
   const diagnostic = persisted.find(event => event.type === 'observation.record.created').durableStorageDegraded;
   assert.match(diagnostic.message, /artifact store failed/u);
   assert.equal(persisted.find(event => event.type === 'tool.ended').observation.metadata.durableStorage.status, 'degraded');
+});
+
+test('image and presenter projection failures happen after durable tool truth and preserve protocol pairing', async () => {
+  const missingImage = {
+    visibility: 'public', artifactId: 'missing-image', sha256: '0'.repeat(64), size: 4, mediaType: 'image/png'
+  };
+  class IntegrityFailingArtifacts extends InMemoryArtifactRepository {
+    async readVerified(ref) { throw new Error(`Artifact SHA-256 integrity failure for ${ref.artifactId}`); }
+  }
+  const integrityArtifacts = new IntegrityFailingArtifacts();
+  const integrityImage = await integrityArtifacts.store({ label: 'integrity-image', content: new Uint8Array([1, 2, 3, 4]), mediaType: 'image/png' });
+  const cases = [
+    {
+      name: 'missing_image_projection', profile: { modalities: { input: ['text', 'image'], output: ['text'] } }, expected: /Unknown artifact/u,
+      observation: { kind: 'result', ok: true, summary: 'image effect completed', scope: completeScope, content: [{ type: 'image', artifact: missingImage, detail: 'original' }], output: { artifact: missingImage } }
+    },
+    {
+      name: 'image_integrity_projection', profile: { modalities: { input: ['text', 'image'], output: ['text'] } }, expected: /integrity failure/u,
+      artifacts: integrityArtifacts,
+      observation: { kind: 'result', ok: true, summary: 'image effect completed', scope: completeScope, content: [{ type: 'image', artifact: integrityImage, detail: 'original' }], output: { artifact: integrityImage } }
+    },
+    {
+      name: 'presenter_projection', expected: /presenter exploded/u,
+      presentObservation() { throw new Error('presenter exploded'); },
+      observation: { kind: 'result', ok: true, summary: 'presenter effect completed', scope: completeScope, output: { changed: true } }
+    }
+  ];
+  for (const scenario of cases) {
+    let effects = 0;
+    const tool = {
+      name: scenario.name, implementationId: `tests/${scenario.name}@1`, description: scenario.name, jsonSchema: { type: 'object' }, outputSchema: z.unknown(), effectEnvelope: { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'] },
+      ...(scenario.profile ? { requirements: { modelInputModalities: ['image'] } } : {}),
+      ...(scenario.presentObservation ? { presentObservation: scenario.presentObservation } : {}),
+      decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; },
+      deriveEffects() { return { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'], idempotency: 'non_idempotent' }; },
+      async invoke() { effects += 1; return scenario.observation; }
+    };
+    const provider = new ScriptedProvider([
+      response('tool_calls', '', { toolCalls: [{ id: `${scenario.name}-call`, type: 'function', name: scenario.name, input: { kind: 'json', value: {} } }] }),
+      request => {
+        const result = request.messages.find(message => message.role === 'tool' && message.toolName === scenario.name);
+        assert.ok(result);
+        assert.match(result.content, /durable tool result was committed/iu);
+        return response('stop', 'continued after projection failure');
+      }
+    ], { ...(scenario.profile ? { profile: scenario.profile } : {}) });
+    const { agent, events } = await harness({ provider, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, withoutSession: true, ...(scenario.artifacts ? { artifacts: scenario.artifacts } : {}) });
+    const result = ended(await agent.run({ task: scenario.name }));
+    assert.equal(result.executionStatus, 'completed', JSON.stringify({ scenario: scenario.name, result }));
+    assert.equal(effects, 1);
+    const persisted = await eventsFor(events, result.runId);
+    const endedIndex = persisted.findIndex(event => event.type === 'tool.ended');
+    const failedIndex = persisted.findIndex(event => event.type === 'observation.projection.failed');
+    assert.ok(endedIndex >= 0 && failedIndex > endedIndex);
+    assert.match(persisted[failedIndex].message, scenario.expected);
+    assert.equal(persisted.some(event => event.type === 'observation.record.created'), false);
+  }
+});
+
+test('session and observation-record projection failures do not reclassify a completed effect', async () => {
+  class FailingSessionRepository extends InMemorySessionRepository {
+    async appendObservation() { throw new Error('session projection failed'); }
+  }
+  class FailingObservationEventRepository extends InMemoryEventRepository {
+    failed = false;
+    async append(runId, event, options) {
+      if (event.type === 'observation.record.created' && !this.failed) { this.failed = true; throw new Error('observation event projection failed'); }
+      return super.append(runId, event, options);
+    }
+  }
+  const cases = [
+    { sessions: new FailingSessionRepository(), expected: /session projection failed/u },
+    { events: new FailingObservationEventRepository(agentEventCodec), expected: /observation event projection failed/u }
+  ];
+  for (const scenario of cases) {
+    let effects = 0;
+    const tool = {
+      name: 'projection_effect', implementationId: 'tests/projection-effect@1', description: 'projection effect', jsonSchema: { type: 'object' }, outputSchema: z.unknown(),
+      effectEnvelope: { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'] },
+      decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'], idempotency: 'non_idempotent' }; },
+      async invoke() { effects += 1; return { kind: 'result', ok: true, summary: 'effect committed', scope: completeScope, output: { done: true } }; }
+    };
+    const run = await harness({ ...scenario, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, script: [response('tool_calls', '', { toolCalls: [{ id: 'projection', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }] }), response()] });
+    const result = ended(await run.agent.run({ task: 'projection failure' }));
+    assert.equal(result.executionStatus, 'completed');
+    assert.equal(effects, 1);
+    const persisted = await eventsFor(run.events, result.runId);
+    assert.equal(persisted.filter(event => event.type === 'tool.ended').length, 1);
+    assert.match(persisted.find(event => event.type === 'observation.projection.failed').message, scenario.expected);
+  }
 });
 
 async function eventsFor(repository, runId) {
@@ -457,6 +547,39 @@ test('mid-run model changes apply only to the coherent next snapshot', async () 
   const result = ended(await agent.run({ task: 'change model' }));  assert.equal(provider.calls[0].model, 'scripted');
   assert.equal(provider.calls[1].model, 'next-model');
   assert.equal(result.candidate.message, 'model:next-model');
+});
+
+test('a multimodal image result remains valid after switching to a text-only model', async () => {
+  const artifacts = new InMemoryArtifactRepository();
+  const artifact = await artifacts.store({ label: 'pixel', mediaType: 'image/png', content: new Uint8Array([1, 2, 3, 4]) });
+  const imageCall = { id: 'image-1', type: 'function', name: 'view_image', input: { kind: 'json', value: { path: 'pixel.png' } } };
+  const viewImage = {
+    name: 'view_image', implementationId: 'tests/profile-switch-image@1', description: 'image fixture', jsonSchema: { type: 'object' }, outputSchema: z.unknown(),
+    requirements: { services: ['artifactRepository'], modelInputModalities: ['image'] }, effectEnvelope: readEnvelope,
+    decodeInput() { return { ok: true, input: { path: 'pixel.png' } }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return readEffects; },
+    async invoke() {
+      return { kind: 'result', ok: true, summary: 'Loaded pixel image.', scope: completeScope,
+        content: [{ type: 'image', artifact, detail: 'original' }], output: { artifact } };
+    }
+  };
+  const provider = new ScriptedProvider([
+    response('tool_calls', '', { toolCalls: [imageCall] }),
+    request => {
+      const toolResult = request.messages.find(message => message.role === 'tool' && message.toolName === 'view_image');
+      assert.ok(toolResult);
+      assert.equal(toolResult.images, undefined);
+      assert.match(toolResult.content, new RegExp(artifact.artifactId, 'u'));
+      return response('stop', 'text-only request accepted');
+    }
+  ], { profile: model => ({ modalities: { input: model === 'text-only' ? ['text'] : ['text', 'image'], output: ['text'] } }) });
+  let agent;
+  ({ agent } = await harness({ provider, artifacts, tools: [viewImage], onProgress(event) {
+    if (event.type === 'assistant.ended' && event.turnIndex === 1) agent.configureModel({ model: 'text-only' });
+  } }));
+  const result = ended(await agent.run({ task: 'inspect then switch model' }));
+  assert.equal(result.executionStatus, 'completed');
+  assert.equal(provider.calls[0].model, 'scripted');
+  assert.equal(provider.calls[1].model, 'text-only');
 });
 
 test('run limits and retry policy terminate deterministically', async () => {

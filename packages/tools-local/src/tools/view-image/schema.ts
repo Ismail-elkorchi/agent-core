@@ -11,5 +11,6 @@ export const viewImageOutputSchema = z.strictObject({
   detail: z.enum(['high', 'original']),
   width: z.int().positive().optional(),
   height: z.int().positive().optional(),
+  encodedBytes: z.int().nonnegative(),
   artifact: artifactRefSchema
 });

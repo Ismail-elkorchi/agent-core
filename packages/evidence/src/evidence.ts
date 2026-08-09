@@ -1,4 +1,4 @@
-import type { JsonObject, JsonPrimitive, JsonValue } from './json.js';
+import { parseJsonObject, type JsonObject, type JsonPrimitive, type JsonValue } from '@agent-core/json';
 
 export type JsonMember = JsonValue;
 
@@ -26,6 +26,7 @@ export interface EvidenceResource {
   uri: string;
   range?: EvidenceRange;
   sha256?: string;
+  fullSha256?: string;
   mediaType?: string;
 }
 
@@ -33,21 +34,21 @@ export interface EvidenceScope {
   filters?: JsonObject;
   limits?: JsonObject;
   omitted?: JsonObject;
-  coverage?: 'complete' | 'partial';
+  coverage?: 'complete' | 'partial' | 'absent';
   truncated?: boolean;
   confidence?: EvidenceConfidence;
 }
 
 export interface ToolEvidenceItem {
   action: EvidenceAction;
-  resources?: EvidenceResource[];
+  resources?: readonly EvidenceResource[];
   scope?: EvidenceScope;
   summary?: string;
-  outcome?: EvidenceOutcome;
+  outcome: EvidenceOutcome;
 }
 
 export interface ToolEvidenceDelta {
-  items: ToolEvidenceItem[];
+  items: readonly ToolEvidenceItem[];
 }
 
 export interface EvidenceRecord extends ToolEvidenceItem {
@@ -55,7 +56,7 @@ export interface EvidenceRecord extends ToolEvidenceItem {
   observationId: string;
   toolName: string;
   createdAt: string;
-  resources: EvidenceResource[];
+  resources: readonly EvidenceResource[];
   outcome: EvidenceOutcome;
 }
 
@@ -66,41 +67,32 @@ export interface EvidenceRecordContext {
 }
 
 export function normalizeToolEvidenceDelta(delta: unknown, context: EvidenceRecordContext): EvidenceRecord[] {
-  if (!isRecord(delta) || !Array.isArray(delta.items)) {
-    return [];
-  }
+  if (delta === undefined) return [];
+  const parsed = parseToolEvidenceDelta(delta);
   const createdAt = context.createdAt ?? new Date().toISOString();
-  const records: EvidenceRecord[] = [];
-  for (const [index, item] of delta.items.entries()) {
-    if (!isRecord(item) || !isEvidenceAction(item.action)) {
-      continue;
-    }
-    const resources = Array.isArray(item.resources)
-      ? item.resources.map(normalizeEvidenceResource).filter((resource): resource is EvidenceResource => resource !== undefined)
-      : [];
-    const record: EvidenceRecord = {
+  return parsed.items.map((item, index): EvidenceRecord => Object.freeze({
       id: `${context.observationId}:evidence:${String(index + 1)}`,
       observationId: context.observationId,
       toolName: context.toolName,
       createdAt,
       action: item.action,
-      resources,
-      outcome: item.outcome === 'failure' ? 'failure' : 'success'
-    };
-    const scope = normalizeEvidenceScope(item.scope);
-    if (scope) {
-      record.scope = scope;
-    }
-    if (typeof item.summary === 'string' && item.summary.trim().length > 0) {
-      record.summary = item.summary.trim().slice(0, 1_000);
-    }
-    records.push(record);
-  }
-  return records;
+      resources: item.resources ?? Object.freeze([]),
+      outcome: item.outcome,
+      ...(item.scope ? { scope: item.scope } : {}),
+      ...(item.summary ? { summary: item.summary } : {})
+    }));
 }
 
-export function evidenceDelta(items: ToolEvidenceItem[]): ToolEvidenceDelta {
-  return { items };
+export function evidenceDelta(items: readonly ToolEvidenceItem[]): ToolEvidenceDelta {
+  return parseToolEvidenceDelta({ items });
+}
+
+/** The single ownership and validation boundary for evidence emitted by tools. */
+export function parseToolEvidenceDelta(value: unknown): ToolEvidenceDelta {
+  const record = parseJsonObject(value);
+  rejectUnknown(record, ['items'], 'Tool evidence');
+  if (!Array.isArray(record.items)) throw new Error('Tool evidence must contain an items array.');
+  return Object.freeze({ items: Object.freeze(record.items.map((item, index) => parseEvidenceItem(item, index))) });
 }
 
 export function workspaceResource(path: string, options: Omit<EvidenceResource, 'uri'> = {}): EvidenceResource {
@@ -121,65 +113,87 @@ export function toEvidenceJsonObject(value: Record<string, unknown>): JsonObject
   return output;
 }
 
-function normalizeEvidenceResource(value: unknown): EvidenceResource | undefined {
-  if (!isRecord(value) || typeof value.uri !== 'string' || value.uri.trim().length === 0) {
-    return undefined;
+function parseEvidenceItem(value: JsonValue, index: number): ToolEvidenceItem {
+  const item = parseJsonObject(value);
+  rejectUnknown(item, ['action', 'resources', 'scope', 'summary', 'outcome'], `Tool evidence item ${String(index)}`);
+  if (!isEvidenceAction(item.action)) throw new Error(`Tool evidence item ${String(index)} has an invalid action.`);
+  if (item.outcome !== 'success' && item.outcome !== 'failure') throw new Error(`Tool evidence item ${String(index)} has an invalid outcome.`);
+  if (item.resources !== undefined && !Array.isArray(item.resources)) throw new Error(`Tool evidence item ${String(index)} resources must be an array.`);
+  if (item.summary !== undefined && (typeof item.summary !== 'string' || item.summary.trim().length === 0 || Buffer.byteLength(item.summary, 'utf8') > 1_000)) {
+    throw new Error(`Tool evidence item ${String(index)} has an invalid summary.`);
   }
-  const resource: EvidenceResource = { uri: value.uri.trim().slice(0, 1_000) };
-  const range = normalizeEvidenceRange(value.range);
-  if (range) {
-    resource.range = range;
-  }
-  if (typeof value.sha256 === 'string' && /^[a-f0-9]{64}$/i.test(value.sha256)) {
-    resource.sha256 = value.sha256.toLowerCase();
-  }
-  if (typeof value.mediaType === 'string' && value.mediaType.trim().length > 0) {
-    resource.mediaType = value.mediaType.trim().slice(0, 200);
-  }
-  return resource;
+  const resources = item.resources === undefined ? undefined : Object.freeze(item.resources.map((resource, resourceIndex) => parseEvidenceResource(resource, index, resourceIndex)));
+  const scope = item.scope === undefined ? undefined : parseEvidenceScope(item.scope, index);
+  return Object.freeze({
+    action: item.action,
+    outcome: item.outcome,
+    ...(resources ? { resources } : {}),
+    ...(scope ? { scope } : {}),
+    ...(typeof item.summary === 'string' ? { summary: item.summary.trim() } : {})
+  });
 }
 
-function normalizeEvidenceRange(value: unknown): EvidenceRange | undefined {
-  if (!isRecord(value) || (value.kind !== 'line' && value.kind !== 'byte')) {
-    return undefined;
+function parseEvidenceResource(value: JsonValue, itemIndex: number, resourceIndex: number): EvidenceResource {
+  const resource = parseJsonObject(value);
+  rejectUnknown(resource, ['uri', 'range', 'sha256', 'fullSha256', 'mediaType'], `Tool evidence resource ${String(itemIndex)}:${String(resourceIndex)}`);
+  if (typeof resource.uri !== 'string' || resource.uri.trim().length === 0 || Buffer.byteLength(resource.uri, 'utf8') > 1_000) {
+    throw new Error(`Tool evidence resource ${String(itemIndex)}:${String(resourceIndex)} has an invalid URI.`);
   }
-  const range: EvidenceRange = { kind: value.kind };
-  if (typeof value.start === 'number' && Number.isFinite(value.start)) {
-    range.start = Math.max(0, Math.floor(value.start));
+  const range = resource.range === undefined ? undefined : parseEvidenceRange(resource.range, itemIndex, resourceIndex);
+  const sha256 = parseOptionalSha256(resource.sha256, 'sha256', itemIndex, resourceIndex);
+  const fullSha256 = parseOptionalSha256(resource.fullSha256, 'fullSha256', itemIndex, resourceIndex);
+  if (resource.mediaType !== undefined && (typeof resource.mediaType !== 'string' || resource.mediaType.trim().length === 0
+    || Buffer.byteLength(resource.mediaType, 'utf8') > 200 || !/^[^\s/]+\/[^\s]+$/u.test(resource.mediaType.trim()))) {
+    throw new Error(`Tool evidence resource ${String(itemIndex)}:${String(resourceIndex)} has an invalid media type.`);
   }
-  if (typeof value.end === 'number' && Number.isFinite(value.end)) {
-    range.end = Math.max(0, Math.floor(value.end));
-  }
-  return range;
+  return Object.freeze({
+    uri: resource.uri.trim(),
+    ...(range ? { range } : {}),
+    ...(sha256 ? { sha256 } : {}),
+    ...(fullSha256 ? { fullSha256 } : {}),
+    ...(typeof resource.mediaType === 'string' ? { mediaType: resource.mediaType.trim() } : {})
+  });
 }
 
-function normalizeEvidenceScope(value: unknown): EvidenceScope | undefined {
-  if (!isRecord(value)) {
-    return undefined;
+function parseEvidenceRange(value: JsonValue, itemIndex: number, resourceIndex: number): EvidenceRange {
+  const range = parseJsonObject(value);
+  rejectUnknown(range, ['kind', 'start', 'end'], `Tool evidence range ${String(itemIndex)}:${String(resourceIndex)}`);
+  if (range.kind !== 'line' && range.kind !== 'byte') throw new Error(`Tool evidence range ${String(itemIndex)}:${String(resourceIndex)} has an invalid kind.`);
+  const minimum = range.kind === 'line' ? 1 : 0;
+  for (const key of ['start', 'end'] as const) {
+    const number = range[key];
+    if (number !== undefined && (typeof number !== 'number' || !Number.isSafeInteger(number) || number < minimum)) throw new Error(`Tool evidence range ${String(itemIndex)}:${String(resourceIndex)} has an invalid ${key}.`);
   }
-  const scope: EvidenceScope = {};
-  const filters = isRecord(value.filters) ? toEvidenceJsonObject(value.filters) : undefined;
-  const limits = isRecord(value.limits) ? toEvidenceJsonObject(value.limits) : undefined;
-  const omitted = isRecord(value.omitted) ? toEvidenceJsonObject(value.omitted) : undefined;
-  if (filters && Object.keys(filters).length > 0) {
-    scope.filters = filters;
-  }
-  if (limits && Object.keys(limits).length > 0) {
-    scope.limits = limits;
-  }
-  if (omitted && Object.keys(omitted).length > 0) {
-    scope.omitted = omitted;
-  }
-  if (typeof value.truncated === 'boolean') {
-    scope.truncated = value.truncated;
-  }
-  if (value.coverage === 'complete' || value.coverage === 'partial') {
-    scope.coverage = value.coverage;
-  }
-  if (value.confidence === 'verified' || value.confidence === 'unverified') {
-    scope.confidence = value.confidence;
-  }
-  return Object.keys(scope).length > 0 ? scope : undefined;
+  if (typeof range.start === 'number' && typeof range.end === 'number' && range.end < range.start) throw new Error(`Tool evidence range ${String(itemIndex)}:${String(resourceIndex)} ends before it starts.`);
+  return Object.freeze({ kind: range.kind, ...(typeof range.start === 'number' ? { start: range.start } : {}), ...(typeof range.end === 'number' ? { end: range.end } : {}) });
+}
+
+function parseEvidenceScope(value: JsonValue, itemIndex: number): EvidenceScope {
+  const scope = parseJsonObject(value);
+  rejectUnknown(scope, ['filters', 'limits', 'omitted', 'coverage', 'truncated', 'confidence'], `Tool evidence scope ${String(itemIndex)}`);
+  if (scope.coverage !== undefined && scope.coverage !== 'complete' && scope.coverage !== 'partial' && scope.coverage !== 'absent') throw new Error(`Tool evidence scope ${String(itemIndex)} has invalid coverage.`);
+  if (scope.truncated !== undefined && typeof scope.truncated !== 'boolean') throw new Error(`Tool evidence scope ${String(itemIndex)} has invalid truncation.`);
+  if (scope.confidence !== undefined && scope.confidence !== 'verified' && scope.confidence !== 'unverified') throw new Error(`Tool evidence scope ${String(itemIndex)} has invalid confidence.`);
+  if (scope.coverage === 'complete' && scope.truncated === true) throw new Error(`Tool evidence scope ${String(itemIndex)} cannot be complete and truncated.`);
+  return Object.freeze({
+    ...(scope.filters === undefined ? {} : { filters: parseJsonObject(scope.filters) }),
+    ...(scope.limits === undefined ? {} : { limits: parseJsonObject(scope.limits) }),
+    ...(scope.omitted === undefined ? {} : { omitted: parseJsonObject(scope.omitted) }),
+    ...(scope.coverage === undefined ? {} : { coverage: scope.coverage }),
+    ...(scope.truncated === undefined ? {} : { truncated: scope.truncated }),
+    ...(scope.confidence === undefined ? {} : { confidence: scope.confidence })
+  });
+}
+
+function parseOptionalSha256(value: JsonValue | undefined, field: string, itemIndex: number, resourceIndex: number): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/iu.test(value)) throw new Error(`Tool evidence resource ${String(itemIndex)}:${String(resourceIndex)} has an invalid ${field}.`);
+  return value.toLowerCase();
+}
+
+function rejectUnknown(record: JsonObject, allowed: readonly string[], label: string): void {
+  const unknown = Object.keys(record).filter((key) => !allowed.includes(key));
+  if (unknown.length > 0) throw new Error(`${label} contains unsupported fields: ${unknown.join(', ')}.`);
 }
 
 function toEvidenceJsonMember(value: unknown): JsonMember | undefined {

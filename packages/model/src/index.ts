@@ -35,7 +35,7 @@ export interface ModelUserMessage extends ModelMessageBase {
 export interface ModelAssistantMessage extends ModelMessageBase {
   role: 'assistant';
   reasoning?: string;
-  toolCalls?: ModelToolCall[];
+  toolCalls?: readonly ModelToolCall[];
   toolName?: never;
   toolCallId?: never;
   toolCallType?: never;
@@ -265,7 +265,7 @@ export interface ModelResponse {
   usage?: ModelUsage;
   reasoning?: string;
   reasoningSummary?: string;
-  toolCalls?: ModelToolCall[];
+  toolCalls?: readonly ModelToolCall[];
   terminationReason: ModelTerminationReason;
   providerTerminationReason?: string;
   timings?: Record<string, number>;

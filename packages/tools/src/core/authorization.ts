@@ -2,7 +2,7 @@ import type { ToolCall, ToolDefinition } from './definition.js';
 import type { ToolPreparationContext } from './context.js';
 import { isRiskAllowed, type ToolRisk } from './policy.js';
 import { validateResourceScope } from './resources.js';
-import { parseJsonObject } from '@agent-core/evidence';
+import { parseJsonObject } from '@agent-core/json';
 
 export type ToolResourceAccessMode = 'read' | 'write' | 'execute' | 'network' | 'delete';
 export type ToolIdempotency = 'pure' | 'idempotent' | 'non_idempotent';

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { isJsonObject, normalizeJsonSafe, validateArtifactRef, type JsonObject, type JsonValue } from '@agent-core/evidence';
+import { validateArtifactRef } from '@agent-core/evidence';
+import { isJsonObject, normalizeJsonSafe, type JsonObject, type JsonValue } from '@agent-core/json';
 import { PersistenceConflictError } from '@agent-core/evidence';
 import { parseAgentTerminalSnapshot, terminalSnapshotFingerprint, type AgentEffectiveInstruction, type AgentTerminalSnapshot, type AgentToolCallAttemptIdentity, type AgentToolCallIdentity, type AgentTurnIdentity } from '../run/contracts.js';
 import type {

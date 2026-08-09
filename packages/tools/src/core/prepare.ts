@@ -1,4 +1,5 @@
-import { hashRecord, parseJsonObject, parseJsonValue, type JsonObject } from '@agent-core/evidence';
+import { hashRecord } from '@agent-core/evidence';
+import { parseJsonObject, parseJsonValue, type JsonObject } from '@agent-core/json';
 import { abortableToolBoundary, MissingToolServiceError, throwIfAborted, ToolInputError, type ToolPreparationContext } from './context.js';
 import type { ToolCall, ToolDefinition, ToolObservation } from './definition.js';
 import { invalidToolInputObservation, missingServiceObservation, runtimeErrorObservation, unknownToolObservation } from './observation.js';

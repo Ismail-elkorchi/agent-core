@@ -8,6 +8,7 @@
   "include": ["src"],
   "references": [
     { "path": "../evidence" },
+    { "path": "../json" },
     { "path": "../model" },
     { "path": "../tools" }
   ]

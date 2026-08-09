@@ -99,3 +99,37 @@ test('response and stream validation enforce coherent terminal and accumulation 
     error => error instanceof ModelContractError && /Malformed content/.test(error.message)
   );
 });
+
+test('model responses and terminal stream events own every nested provider value', () => {
+  const source = {
+    content: 'done', model: 'test', provider: 'provider', terminationReason: 'tool_calls',
+    toolCalls: [{ id: 'call', type: 'function', name: 'read_files', input: { kind: 'json', value: { paths: ['a.txt'] } } }],
+    usage: { promptTokens: 4, completionTokens: 2, totalTokens: 6 },
+    providerState: { provider: 'provider', model: 'test', kind: 'continuation', data: { responseId: 'one' } },
+    transport: { provider: 'provider', strategy: 'http', responseId: 'response' },
+    timings: { total: 10 },
+    raw: { nested: ['provider-owned'] }
+  };
+  const response = parseModelResponse(source);
+  const terminal = parseModelStreamEvent({ type: 'done', response: source });
+  source.toolCalls[0].input.value.paths[0] = 'changed.txt';
+  source.usage.promptTokens = 100;
+  source.providerState.data.responseId = 'changed';
+  source.transport.responseId = 'changed';
+  source.timings.total = 999;
+  source.raw.nested[0] = 'changed';
+  for (const owned of [response, terminal.response]) {
+    assert.equal(owned.toolCalls[0].input.value.paths[0], 'a.txt');
+    assert.equal(owned.usage.promptTokens, 4);
+    assert.equal(owned.providerState.data.responseId, 'one');
+    assert.equal(owned.transport.responseId, 'response');
+    assert.equal(owned.timings.total, 10);
+    assert.equal(owned.raw.nested[0], 'provider-owned');
+    assert.equal(Object.isFrozen(owned.toolCalls[0].input.value.paths), true);
+    assert.equal(Object.isFrozen(owned.usage), true);
+    assert.equal(Object.isFrozen(owned.providerState.data), true);
+    assert.equal(Object.isFrozen(owned.transport), true);
+    assert.equal(Object.isFrozen(owned.timings), true);
+    assert.equal(Object.isFrozen(owned.raw.nested), true);
+  }
+});

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { normalizeJsonSafe } from './json.js';
+import { normalizeJsonSafe } from '@agent-core/json';
 
 interface ArtifactRefBase {
   readonly artifactId: string;

@@ -35,15 +35,24 @@ export const findFilesTool = defineTool({
     });
     const output = {
       path: selected.startPath,
+      hostMaximumDepth: selected.hostMaximumDepth,
       patterns: [...input.patterns],
       entries: selected.entries.map(({ path, type }) => ({ path, type })),
       coverage: selected.coverage,
       causes: [...selected.causes],
       counts: { visited: selected.visitedEntries, returned: selected.returnedEntries, omitted: selected.omittedEntries },
       omitted: { ignoreFiles: selected.omittedIgnoreFiles },
+      omissions: [...selected.omissions],
       omissionSamples: [...selected.omissionSamples]
     };
-    const scope = { resources: [workspaceFileScope(output.path)], coverage: output.coverage, filters: { patterns: input.patterns, exclude: input.exclude, type: input.type }, ...(output.causes.length > 0 ? { causes: output.causes, omitted: { entries: output.counts.omitted } } : {}) } as const;
+    const scope = {
+      resources: [workspaceFileScope(output.path)], coverage: output.coverage,
+      filters: { patterns: input.patterns, exclude: input.exclude, type: input.type }, limits: { hostMaximumDepth: selected.hostMaximumDepth },
+      ...(output.causes.length > 0 ? { causes: output.causes, omitted: {
+        entries: { count: output.counts.omitted.count, relation: output.counts.omitted.relation },
+        causes: output.omissions.map((item) => ({ cause: item.cause, count: item.count, relation: item.relation }))
+      } } : {})
+    } as const;
     return {
       kind: 'result' as const,
       ok: true,

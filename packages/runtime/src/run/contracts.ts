@@ -1,5 +1,6 @@
-import type { ArtifactRef, JsonNormalizationDiagnostic, JsonObject, JsonValue } from '@agent-core/evidence';
-import { parseJsonValue, stableStringify } from '@agent-core/evidence';
+import type { ArtifactRef } from '@agent-core/evidence';
+import { stableStringify } from '@agent-core/evidence';
+import { parseJsonValue, type JsonNormalizationDiagnostic, type JsonObject, type JsonValue } from '@agent-core/json';
 import type { ModelReasoningRequest, ModelResponseFormat, ModelTerminationReason } from '@agent-core/model';
 
 export type AgentExecutionStatus = 'completed' | 'failed' | 'aborted';
@@ -164,6 +165,9 @@ export interface AgentRunLimits {
   readonly elapsedMs: number;
   readonly promptTokens: number;
   readonly completionTokens: number;
+  readonly activeImageCount: number;
+  readonly activeImageBytes: number;
+  readonly activeImageTokens: number;
   readonly knownCost: { readonly amount: number; readonly currency: string };
   readonly consecutiveProviderFailures: number;
   readonly consecutiveToolFailures: number;
@@ -177,6 +181,9 @@ export const DEFAULT_AGENT_RUN_LIMITS: AgentRunLimits = Object.freeze({
   elapsedMs: 30 * 60 * 1_000,
   promptTokens: 1_000_000,
   completionTokens: 250_000,
+  activeImageCount: 16,
+  activeImageBytes: 64 * 1024 * 1024,
+  activeImageTokens: 32_000,
   knownCost: Object.freeze({ amount: 10, currency: 'USD' }),
   consecutiveProviderFailures: 3,
   consecutiveToolFailures: 5,
@@ -303,7 +310,8 @@ export function validateAgentRunLimits(input: Partial<AgentRunLimits> = {}): Age
   const limits: AgentRunLimits = { ...DEFAULT_AGENT_RUN_LIMITS, ...input, knownCost: { ...DEFAULT_AGENT_RUN_LIMITS.knownCost, ...(input.knownCost ?? {}) } };
   const fields: (keyof Omit<AgentRunLimits, 'knownCost'>)[] = [
     'maxConcurrentToolCalls', 'modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'elapsedMs', 'promptTokens',
-    'completionTokens', 'consecutiveProviderFailures', 'consecutiveToolFailures', 'providerRetries'
+    'completionTokens', 'activeImageCount', 'activeImageBytes', 'activeImageTokens',
+    'consecutiveProviderFailures', 'consecutiveToolFailures', 'providerRetries'
   ];
   const issues = fields.flatMap((field) => positiveInteger(limits[field]) ? [] : [`${field} must be a positive finite integer.`]);
   if (!Number.isFinite(limits.knownCost.amount) || limits.knownCost.amount <= 0) issues.push('knownCost.amount must be positive and finite.');

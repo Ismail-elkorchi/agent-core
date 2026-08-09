@@ -1,4 +1,5 @@
-import type { ArtifactRef, JsonObject, JsonValue } from '@agent-core/evidence';
+import type { ArtifactRef } from '@agent-core/evidence';
+import type { JsonObject, JsonValue } from '@agent-core/json';
 import type {
   AgentEffectiveInstruction,
   AgentTerminalSnapshot,

@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { type ModelReasoningRequest, parseModelReasoningRequest } from '@agent-core/model';
-import { parseJsonObject } from '@agent-core/evidence';
+import { parseJsonObject } from '@agent-core/json';
 
 export interface AgentCoreInstructionConfiguration { readonly path: string }
 export interface AgentCoreCheckConfiguration { readonly id: string; readonly command: string; readonly timeoutMs?: number; readonly maxOutputBytes?: number }
@@ -13,6 +13,9 @@ export interface AgentCoreLimitConfiguration {
   readonly elapsedMs?: number;
   readonly promptTokens?: number;
   readonly completionTokens?: number;
+  readonly activeImageCount?: number;
+  readonly activeImageBytes?: number;
+  readonly activeImageTokens?: number;
   readonly knownCost?: { readonly amount: number; readonly currency: string };
   readonly consecutiveProviderFailures?: number;
   readonly consecutiveToolFailures?: number;
@@ -91,7 +94,7 @@ function sessionConfiguration(value: unknown): value is AgentCoreConfiguration['
 function optionalPositive(value: unknown): boolean { return value === undefined || (typeof value === 'number' && Number.isInteger(value) && value > 0); }
 function validLimits(value: unknown): value is AgentCoreLimitConfiguration {
   if (!isRecord(value)) return false;
-  const numeric = ['maxConcurrentToolCalls', 'modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'elapsedMs', 'promptTokens', 'completionTokens', 'consecutiveProviderFailures', 'consecutiveToolFailures', 'providerRetries'];
+  const numeric = ['maxConcurrentToolCalls', 'modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'elapsedMs', 'promptTokens', 'completionTokens', 'activeImageCount', 'activeImageBytes', 'activeImageTokens', 'consecutiveProviderFailures', 'consecutiveToolFailures', 'providerRetries'];
   if (Object.keys(value).some((key) => ![...numeric, 'knownCost'].includes(key))) return false;
   if (numeric.some((key) => value[key] !== undefined && !optionalPositive(value[key]))) return false;
   return value.knownCost === undefined || (isRecord(value.knownCost) && typeof value.knownCost.amount === 'number' && Number.isFinite(value.knownCost.amount) && value.knownCost.amount > 0 && typeof value.knownCost.currency === 'string' && value.knownCost.currency.trim().length > 0);

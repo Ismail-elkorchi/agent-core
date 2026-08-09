@@ -1,9 +1,9 @@
-import { parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/evidence';
+import { parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import type { ToolDefinition, ToolObservationPresentation } from '@agent-core/tools';
 
 type Presenter = NonNullable<ToolDefinition['presentObservation']>;
 
-export const presentListDirectoryObservation: Presenter = ({ observation, limit }) => {
+export const presentListDirectoryObservation: Presenter = ({ observation, maxTokens }) => {
   const failure = failurePresentation('Directory listing', observation);
   if (failure) return failure;
   const output = object(observation.output);
@@ -27,7 +27,7 @@ export const presentListDirectoryObservation: Presenter = ({ observation, limit 
     for (const key of [...groups.keys()].sort(compare)) {
       const entry = groups.get(key)?.[index];
       if (!entry) { groups.delete(key); continue; }
-      if (fits({ ...base, results: { ...object(base.results), entries: [...selected, entry] } }, limit.maxTokens)) {
+      if (fits({ ...base, results: { ...object(base.results), entries: [...selected, entry] } }, maxTokens)) {
         selected.push(entry);
         added = true;
       }
@@ -35,12 +35,12 @@ export const presentListDirectoryObservation: Presenter = ({ observation, limit 
     if (!added) break;
     index += 1;
   }
-  const omissionSamples = boundedArray(array(output.omissionSamples), { ...base, results: { ...object(base.results), entries: selected } }, 'omissionSamples', limit.maxTokens);
+  const omissionSamples = boundedArray(array(output.omissionSamples), { ...base, results: { ...object(base.results), entries: selected } }, 'omissionSamples', maxTokens);
   return withResults(base, { ...object(base.results), entries: selected, omissionSamples }, observation.scope.coverage === 'partial'
     ? 'Use a narrower path or larger host limits to inspect omitted directory entries.' : undefined);
 };
 
-export const presentFindFilesObservation: Presenter = ({ observation, limit }) => {
+export const presentFindFilesObservation: Presenter = ({ observation, maxTokens }) => {
   const failure = failurePresentation('File search', observation);
   if (failure) return failure;
   const output = object(observation.output);
@@ -51,15 +51,15 @@ export const presentFindFilesObservation: Presenter = ({ observation, limit }) =
   const paths = array(output.entries).filter(isObject).sort((a, b) => compare(stringField(a.path), stringField(b.path)));
   const entries: JsonValue[] = [];
   for (const entry of paths) {
-    if (!fits({ ...base, results: { ...object(base.results), entries: [...entries, entry] } }, limit.maxTokens)) break;
+    if (!fits({ ...base, results: { ...object(base.results), entries: [...entries, entry] } }, maxTokens)) break;
     entries.push(entry);
   }
-  const omissionSamples = boundedArray(array(output.omissionSamples), { ...base, results: { ...object(base.results), entries } }, 'omissionSamples', limit.maxTokens);
+  const omissionSamples = boundedArray(array(output.omissionSamples), { ...base, results: { ...object(base.results), entries } }, 'omissionSamples', maxTokens);
   return withResults(base, { ...object(base.results), entries, omissionSamples }, observation.scope.coverage === 'partial'
     ? 'Narrow the patterns or continue with a more specific path.' : undefined);
 };
 
-export const presentReadFilesObservation: Presenter = ({ observation, limit }) => {
+export const presentReadFilesObservation: Presenter = ({ observation, maxTokens }) => {
   const failure = failurePresentation('File contents', observation);
   if (failure) return failure;
   const output = object(observation.output);
@@ -73,7 +73,7 @@ export const presentReadFilesObservation: Presenter = ({ observation, limit }) =
     requestedFiles: value(output.requestedFiles), returnedFiles: value(output.returnedFiles), failedFiles: value(output.failedFiles),
     returnedBytes: value(output.returnedBytes), coverage: value(output.coverage), failures: compactReadFailures(array(output.failures), 512), files
   });
-  if (!fits(base, limit.maxTokens)) {
+  if (!fits(base, maxTokens)) {
     files = files.map((file) => ({ ...file, content: '' }));
     const compactBase = resultBase('File contents', observation, {
       requestedFiles: value(output.requestedFiles), returnedFiles: value(output.returnedFiles), failedFiles: value(output.failedFiles),
@@ -81,7 +81,7 @@ export const presentReadFilesObservation: Presenter = ({ observation, limit }) =
     });
     Object.assign(base, compactBase);
   }
-  let remaining = Math.max(0, limit.maxTokens * 4 - jsonBytes(base) - 64);
+  let remaining = Math.max(0, maxTokens * 4 - jsonBytes(base) - 64);
   const sources = sourceFiles.map((file) => typeof file.content === 'string' ? file.content : '');
   for (let index = 0; index < files.length; index += 1) {
     const share = Math.max(0, Math.floor(remaining / Math.max(1, files.length - index)));
@@ -92,7 +92,7 @@ export const presentReadFilesObservation: Presenter = ({ observation, limit }) =
   const next = observation.scope.coverage === 'partial'
     ? 'Continue each file from its continuationLine, or correct the reported failures.' : undefined;
   let presentation = withResults(base, { ...object(base.results), files }, next);
-  while (!fits(presentation, limit.maxTokens) && files.some((file) => typeof file.content === 'string' && file.content.length > 1)) {
+  while (!fits(presentation, maxTokens) && files.some((file) => typeof file.content === 'string' && file.content.length > 1)) {
     files = files.map((file, index) => {
       const content = typeof file.content === 'string' ? file.content : '';
       const shortened = takeChars(content, Math.max(1, Math.floor(content.length * 0.75)));
@@ -103,12 +103,13 @@ export const presentReadFilesObservation: Presenter = ({ observation, limit }) =
   return presentation;
 };
 
-export const presentSearchTextObservation: Presenter = ({ observation, limit }) => {
+export const presentSearchTextObservation: Presenter = ({ observation, maxTokens }) => {
   const failure = failurePresentation('Text search', observation);
   if (failure) return failure;
   const output = object(observation.output);
   const fixed = {
-    query: value(output.query), mode: value(output.mode), status: value(output.status), coverage: value(output.coverage),
+    query: value(output.query), mode: value(output.mode), status: value(output.status),
+    resultCoverage: value(output.resultCoverage), countCoverage: value(output.countCoverage),
     examinedFileCount: value(output.examinedFileCount), matchingFileCount: value(output.matchingFileCount),
     matchingLineCount: value(output.matchingLineCount), occurrenceCount: value(output.occurrenceCount),
     omittedResultCount: value(output.omittedResultCount), countsCapped: value(output.countsCapped),
@@ -119,18 +120,21 @@ export const presentSearchTextObservation: Presenter = ({ observation, limit }) 
   const source = array(output.results);
   const selected: JsonValue[] = [];
   if (output.mode === 'matches') {
-    const matches = source.filter(isObject).map((match) => compactMatch(match, Math.max(96, Math.floor(limit.maxTokens * 3 / Math.max(1, source.length)))));
+    const matches = source.filter(isObject).map((match) => compactMatch(match, Math.max(96, Math.floor(maxTokens * 3 / Math.max(1, source.length)))));
     const firstByFile = new Map<string, JsonObject>();
     for (const match of matches) if (!firstByFile.has(stringField(match.path))) firstByFile.set(stringField(match.path), match);
-    for (const match of firstByFile.values()) selected.push(match);
+    for (const match of firstByFile.values()) {
+      if (!fits({ ...base, results: { ...fixed, results: [...selected, match] } }, maxTokens)) break;
+      selected.push(match);
+    }
     for (const match of matches) {
       if (selected.includes(match)) continue;
-      if (!fits({ ...base, results: { ...fixed, results: [...selected, match] } }, limit.maxTokens)) break;
+      if (!fits({ ...base, results: { ...fixed, results: [...selected, match] } }, maxTokens)) break;
       selected.push(match);
     }
   } else {
     for (const item of source) {
-      if (!fits({ ...base, results: { ...fixed, results: [...selected, item] } }, limit.maxTokens)) break;
+      if (!fits({ ...base, results: { ...fixed, results: [...selected, item] } }, maxTokens)) break;
       selected.push(item);
     }
   }
@@ -138,13 +142,13 @@ export const presentSearchTextObservation: Presenter = ({ observation, limit }) 
     ? 'Narrow the query or increase the relevant result and per-file limits.' : undefined);
 };
 
-export const presentApplyPatchObservation: Presenter = ({ observation, limit }) => {
+export const presentApplyPatchObservation: Presenter = ({ observation, maxTokens }) => {
   const failure = failurePresentation('Patch transaction', observation);
   if (failure) return failure;
   const output = object(observation.output);
   const files = array(output.files).filter(isObject).map((file) => ({
     path: value(file.path), operation: value(file.operation), destinationPath: value(file.destinationPath),
-    additions: value(file.additions), deletions: value(file.deletions), changed: value(file.changed)
+    additions: value(file.additions), deletions: value(file.deletions), plannedChange: value(file.plannedChange), finalState: value(file.finalState)
   }));
   const affectedPaths = uniqueStrings([
     ...array(output.changedPaths), ...array(output.wouldChangePaths), ...array(output.potentiallyAffectedPaths),
@@ -152,16 +156,16 @@ export const presentApplyPatchObservation: Presenter = ({ observation, limit }) 
   ]);
   const base = resultBase('Patch transaction', observation, {});
   let results: JsonObject = {
-    status: value(output.status), workspaceState: value(output.workspaceState), dryRun: value(output.dryRun), transactional: value(output.transactional),
+    operationStatus: value(output.operationStatus), transactionOutcome: value(output.transactionOutcome), workspaceState: value(output.workspaceState), dryRun: value(output.dryRun),
     files, affectedPaths, changedPaths: value(output.changedPaths), wouldChangePaths: value(output.wouldChangePaths),
     createdPaths: value(output.createdPaths), deletedPaths: value(output.deletedPaths), movedPaths: value(output.movedPaths),
     potentiallyAffectedPaths: value(output.potentiallyAffectedPaths), totalOperationCount: value(output.totalOperationCount),
     totalHunkCount: value(output.totalHunkCount), totalAdditions: value(output.totalAdditions), totalDeletions: value(output.totalDeletions),
     transaction: compactTransaction(output.transaction, 512)
   };
-  if (!fits({ ...base, results }, limit.maxTokens)) {
+  if (!fits({ ...base, results }, maxTokens)) {
     results = {
-      status: value(output.status), workspaceState: value(output.workspaceState), files, affectedPaths,
+      operationStatus: value(output.operationStatus), transactionOutcome: value(output.transactionOutcome), workspaceState: value(output.workspaceState), files, affectedPaths,
       totalOperationCount: value(output.totalOperationCount), totalAdditions: value(output.totalAdditions), totalDeletions: value(output.totalDeletions),
       transaction: compactTransaction(output.transaction, 96)
     };
@@ -169,7 +173,7 @@ export const presentApplyPatchObservation: Presenter = ({ observation, limit }) 
   return withResults(base, results);
 };
 
-export const presentProcessObservation: Presenter = ({ observation, limit }) => {
+export const presentProcessObservation: Presenter = ({ observation, maxTokens }) => {
   const failure = failurePresentation('Process', observation);
   if (failure) return failure;
   const output = object(observation.output);
@@ -182,12 +186,12 @@ export const presentProcessObservation: Presenter = ({ observation, limit }) => 
   };
   const base = resultBase('Process', observation, fixed);
   const text = typeof combined.text === 'string' ? combined.text : '';
-  const available = Math.max(0, limit.maxTokens * 4 - jsonBytes(base) - 96);
+  const available = Math.max(0, maxTokens * 4 - jsonBytes(base) - 96);
   const tail = takeTailChars(text, available);
   return withResults(base, { ...fixed, outputTail: tail, outputTailOmittedCharacters: Math.max(0, text.length - tail.length) });
 };
 
-export const presentReadArtifactObservation: Presenter = ({ observation, limit }) => {
+export const presentReadArtifactObservation: Presenter = ({ observation, maxTokens }) => {
   const failure = failurePresentation('Artifact range', observation);
   if (failure) return failure;
   const output = object(observation.output);
@@ -199,7 +203,7 @@ export const presentReadArtifactObservation: Presenter = ({ observation, limit }
   };
   const base = resultBase('Artifact range', observation, fixed);
   const text = typeof output.text === 'string' ? output.text : undefined;
-  const available = Math.max(0, limit.maxTokens * 4 - jsonBytes(base) - 64);
+  const available = Math.max(0, maxTokens * 4 - jsonBytes(base) - 64);
   const results = text === undefined ? fixed : { ...fixed, textExcerpt: takeChars(text, available), textOmittedCharacters: Math.max(0, text.length - available) };
   return withResults(base, results, typeof output.nextOffset === 'number' ? `Continue at byte offset ${String(output.nextOffset)}.` : undefined);
 };
@@ -236,8 +240,15 @@ function array(value: JsonValue | undefined): JsonValue[] { return Array.isArray
 function isObject(value: JsonValue | undefined): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function fits(value: unknown, maxTokens: number): boolean { return jsonBytes(value) <= Math.max(1, maxTokens) * 4; }
 function jsonBytes(value: unknown): number { return Buffer.byteLength(JSON.stringify(value), 'utf8'); }
-function takeChars(value: string, count: number): string { return value.length <= count ? value : value.slice(0, Math.max(0, count)); }
-function takeTailChars(value: string, count: number): string { return value.length <= count ? value : value.slice(Math.max(0, value.length - count)); }
+const GRAPHEME_SEGMENTER = new Intl.Segmenter('en', { granularity: 'grapheme' });
+function takeChars(value: string, count: number): string {
+  const characters = Array.from(GRAPHEME_SEGMENTER.segment(value), (item) => item.segment);
+  return characters.length <= count ? value : characters.slice(0, Math.max(0, count)).join('');
+}
+function takeTailChars(value: string, count: number): string {
+  const characters = Array.from(GRAPHEME_SEGMENTER.segment(value), (item) => item.segment);
+  return characters.length <= count ? value : characters.slice(Math.max(0, characters.length - count)).join('');
+}
 function compare(left: string, right: string): number { return left.localeCompare(right, 'en'); }
 function boundedArray(source: JsonValue[], base: unknown, key: string, maxTokens: number): JsonValue[] {
   const selected: JsonValue[] = [];

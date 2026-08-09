@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 const exec = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const packageDirs = [
-  'packages/auth', 'packages/cli', 'packages/evidence', 'packages/model', 'packages/runtime', 'packages/tools', 'packages/tools-local',
+  'packages/auth', 'packages/cli', 'packages/json', 'packages/evidence', 'packages/model', 'packages/runtime', 'packages/tools', 'packages/tools-local',
   'packages/providers/ollama', 'packages/providers/openai-responses', 'packages/providers/openai', 'packages/providers/openai-codex', 'packages/providers/openrouter'
 ];
 
@@ -44,16 +44,17 @@ try {
     "import * as runtime from '@agent-core/runtime';",
     "import * as nodeRuntime from '@agent-core/runtime/node';",
     "import * as model from '@agent-core/model';",
+    "import * as json from '@agent-core/json';",
     "import * as evidence from '@agent-core/evidence';",
     "import * as tools from '@agent-core/tools';",
     "import * as local from '@agent-core/tools-local';",
     "import * as nodeEvidence from '@agent-core/evidence/node';",
-    "if (!runtime.parseAgentTerminalSnapshot || !runtime.AgentRuntime || !runtime.InMemorySessionRepository || !nodeRuntime.JsonlSessionRepository || !model.parseModelResponse || !evidence.InMemoryEventRepository || !nodeEvidence.JsonlEventRepository || !tools.prepareToolCall || !tools.invokePreparedToolCall || !local.ProcessManager) throw new Error('public runtime exports missing');"
+    "if (!runtime.parseAgentTerminalSnapshot || !runtime.AgentRuntime || !runtime.InMemorySessionRepository || !nodeRuntime.JsonlSessionRepository || !model.parseModelResponse || !json.parseJsonObject || !evidence.InMemoryEventRepository || !nodeEvidence.JsonlEventRepository || !tools.prepareToolCall || !tools.invokePreparedToolCall || !local.ProcessManager) throw new Error('public runtime exports missing');"
   ].join('\n'));
   await exec(process.execPath, ['runtime.mjs'], { cwd: consumer });
 
   await writeFile(path.join(consumer, 'consumer.ts'), [
-    "import type { JsonObject } from '@agent-core/evidence';",
+    "import type { JsonObject } from '@agent-core/json';",
     "import type { ModelProviderStateObject } from '@agent-core/model';",
     "import type { AgentCandidate, AgentTerminalSnapshot } from '@agent-core/runtime';",
     "import type { ToolEffects } from '@agent-core/tools';",

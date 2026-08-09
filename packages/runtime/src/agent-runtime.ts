@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { type ContextHistoryReduction, type ContextItemInput, ContextManager } from './context/manager.js';
-import { hashRecord, normalizeJsonSafe, parseJsonValue } from '@agent-core/evidence';
+import { hashRecord } from '@agent-core/evidence';
+import { normalizeJsonSafe, parseJsonValue } from '@agent-core/json';
 import {
   ModelContractError,
   type ModelProfile,
@@ -439,6 +440,11 @@ export class AgentRuntime {
       events: this.options.repositories.events,
       ...(this.options.repositories.artifacts ? { artifacts: this.options.repositories.artifacts } : {}),
       estimator: this.estimator,
+      contextImageLimits: {
+        maxCount: runtime.controller.limits.activeImageCount,
+        maxBytes: runtime.controller.limits.activeImageBytes,
+        maxEstimatedTokens: runtime.controller.limits.activeImageTokens
+      },
       providerId: this.options.provider.id,
       model: this.runtimeModel,
       ...(runtime.resume ? { runIds: [runtime.runId] } : {})
@@ -769,6 +775,7 @@ export class AgentRuntime {
     let contextRemoved = false;
     let evidenceRemoved = false;
     const reductionRecords: { kind: string; reason: string; sequence: number }[] = [];
+    const recordedProjectionReductions = new Set<string>();
     const runInstructions = request.snapshot.instructions.filter((item) => item.provenance !== 'application').map((item) => item.content);
     for (;;) {
       const estimatedBaseTokens = estimatePromptScaffoldTokens(this.estimator, { task: request.input.task, runNotes: [...request.runNotes], runInstructions,
@@ -781,6 +788,18 @@ export class AgentRuntime {
         instructions: promptInstructionsForRequest({ runInstructions, configuredInstructions: [...(this.options.instructions ?? [])] }), notes: request.runNotes.slice(-8),
         contextItems: allContextInputs, tools: promptToolSpecs([...request.snapshot.tools], request.snapshot.profile, this.options.toolContext), modelTools,
         modelProfile: request.snapshot.profile, requestWindow: request.snapshot.requestWindow, contextTokenBudget: contextCapacity, evidenceTokenBudget });
+      const newProjectionReductions = projection.reductions.filter((reduction) => {
+        const key = JSON.stringify([reduction.itemId, reduction.kind, reduction.reason, reduction.removedItems, reduction.removedImageBytes]);
+        if (recordedProjectionReductions.has(key)) return false;
+        recordedProjectionReductions.add(key);
+        return true;
+      });
+      if (newProjectionReductions.length > 0) {
+        const firstSequence = reductionRecords.length + 1;
+        reductionRecords.push(...newProjectionReductions.map((reduction, index) => ({ kind: reduction.kind, reason: reduction.reason ?? 'projection', sequence: firstSequence + index })));
+        await append({ type: 'context.history.reduced', ...identity, reductions: newProjectionReductions });
+        await emit({ type: 'context.history.reduced', ...identity, reductions: newProjectionReductions });
+      }
       await append({ type: 'context.bundle.created', bundle: projection.context });
       await append({ type: 'prompt.projection.created', projection: projection.prompt });
       const compiled = compilePromptProjection(projection.prompt);
@@ -959,7 +978,7 @@ function isProcessDisposer(value: unknown): value is { readonly disposeRun: (run
   if (typeof value !== 'object' || value === null || !('disposeRun' in value)) return false;
   return typeof (value as { readonly disposeRun?: unknown }).disposeRun === 'function';
 }
-function durableProcessTermination(value: unknown): { readonly processId: string; readonly status: string; readonly result: import('@agent-core/evidence').JsonValue } {
+function durableProcessTermination(value: unknown): { readonly processId: string; readonly status: string; readonly result: import('@agent-core/json').JsonValue } {
   const outer = parseJsonValue(value, { maxDepth: 16, maxCollectionEntries: 20_000, maxStringBytes: 1_000_000, maxTotalBytes: 4_000_000 });
   const normalized = isRecord(outer) && isRecord(outer.result) ? outer.result : outer;
   if (typeof normalized !== 'object' || normalized === null || Array.isArray(normalized) || typeof normalized.processId !== 'string' || typeof normalized.status !== 'string') throw new Error('Process cleanup returned an invalid terminal result.');

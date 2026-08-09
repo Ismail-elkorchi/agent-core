@@ -1,6 +1,7 @@
 export * from './core/configuration.js';
 export * from './core/process-manager.js';
 export * from './core/workspace-file-selection.js';
+export * from './host.js';
 export * from './tools/list-directory/index.js';
 export * from './tools/find-files/index.js';
 export * from './tools/read-files/index.js';

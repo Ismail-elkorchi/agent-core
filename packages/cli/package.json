@@ -23,6 +23,7 @@
     "@agent-core/auth": "0.2.0",
     "@agent-core/runtime": "0.2.0",
     "@agent-core/evidence": "0.2.0",
+    "@agent-core/json": "0.2.0",
     "@agent-core/model": "0.2.0",
     "@agent-core/provider-ollama": "0.2.0",
     "@agent-core/provider-openai": "0.2.0",

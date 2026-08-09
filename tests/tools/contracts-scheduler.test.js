@@ -155,6 +155,14 @@ test('one observation parser validates complete results, failures, artifacts, an
   assert.throws(() => parseToolObservation(tool, { ...source, output: { value: 42 } }));
   assert.throws(() => parseToolObservation(undefined, { kind: 'failure', ok: false, summary: 'bad', scope: { resources: [], coverage: 'partial' }, output: { reason: 'runtime_error' } }));
   assert.throws(() => parseToolObservation(tool, { ...source, content: [{ type: 'artifact', artifact: { artifactId: 'bad', sha256: 'bad', size: -1, mediaType: 'text/plain' } }] }));
+  assert.throws(() => parseToolObservation(tool, {
+    ...source,
+    evidence: { items: [{ action: 'read', outcome: 'success', resources: [{ uri: '' }], scope: { coverage: 'complete' } }] }
+  }), /evidence.*URI|resource.*URI/iu);
+  assert.throws(() => parseToolObservation(tool, {
+    ...source,
+    evidence: { items: [{ action: 'search', outcome: 'success', resources: [], scope: { coverage: 'complete', truncated: true } }] }
+  }), /complete and truncated/iu);
   let outputGetterCalls = 0;
   const hostileOutput = Object.defineProperty({}, 'value', { enumerable: true, get() { outputGetterCalls += 1; return 'stolen'; } });
   assert.throws(() => parseToolObservation(tool, { ...source, output: hostileOutput }), /accessor/iu);

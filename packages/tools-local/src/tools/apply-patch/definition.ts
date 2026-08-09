@@ -15,7 +15,7 @@ export const applyPatchTool = defineTool({
   schema: applyPatchInputSchema,
   outputSchema: applyPatchOutputSchema,
   presentObservation: presentApplyPatchObservation,
-  requirements: { services: ['workspaceRoot', 'localToolConfiguration', 'patchTransaction'] },
+  requirements: { services: ['workspaceRoot', 'localToolConfiguration'] },
   textInput: {
     description: 'Pass the patch document directly, starting with *** Begin Patch and ending with *** End Patch.',
     promptGuide: APPLY_PATCH_PROMPT_GUIDE,

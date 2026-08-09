@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { ContextManager } from '../context/manager.js';
-import { hashRecord, normalizeJsonSafe, type JsonObject } from '@agent-core/evidence';
+import { hashRecord } from '@agent-core/evidence';
+import { normalizeJsonSafe, type JsonObject } from '@agent-core/json';
 import type { SessionRepository } from '../session/repository.js';
 import type { AgentApprovalBinding, AgentApprovalRequest, AgentToolBatchIdentity, AgentToolCallAttemptIdentity, AgentToolCallIdentity } from '../run/contracts.js';
 import {
@@ -246,49 +247,79 @@ async function persistToolStart(input: Parameters<typeof executeAssistantToolCal
 }
 
 async function persistObservation(input: Parameters<typeof executeAssistantToolCalls>[0], entry: PreparedEntry, observation: ToolObservation): Promise<void> {
-  const record = entry.observationProjected
+  const committed = entry.observationProjected
     ? undefined
-    : await input.observationStore.put({
-      turnIndex: input.turnIndex, call: entry.call, canonicalInput: entry.prepared?.canonicalInput, tool: entry.prepared?.tool, observation,
-      ...(input.modelInputModalities ? { modelInputModalities: input.modelInputModalities } : {})
+    : await input.observationStore.commitToolObservation({
+      turnIndex: input.turnIndex, call: entry.call, canonicalInput: entry.prepared?.canonicalInput, tool: entry.prepared?.tool, observation
     });
-  const persistedObservation = normalizeToolObservationForPersistence(record?.durableObservation ?? observation);
-  const artifacts = observationArtifacts(persistedObservation);
+  const persistedObservation = normalizeToolObservationForPersistence(committed?.durableObservation ?? observation);
   await input.append({ type: 'tool.ended', ...entry.identity, toolName: entry.call.name, observation: persistedObservation }, toolEventKey(input.runId, entry.identity, 'ended'));
-  await input.session?.repository.appendObservation(input.session.sessionId, {
-    runId: input.runId,
-    identity: entry.identity,
-    toolName: entry.call.name,
-    observation: {
-      ok: persistedObservation.ok,
-      summary: persistedObservation.summary,
-      output: persistedObservation.output,
-      ...(artifacts.length > 0 ? { artifacts } : {}),
-      ...(persistedObservation.metadata ? { metadata: persistedObservation.metadata } : {})
-    }
-  });
   if (entry.observationProjected) {
     await input.emit({ type: 'tool.ended', ...entry.identity, toolName: entry.call.name, observation: persistedObservation });
     return;
   }
-  if (!record) throw new Error('Tool observation record was not created.');
-  input.contextManager.recordToolResult({
-    turnIndex: input.turnIndex,
-    toolName: record.toolName,
-    ...(record.call.id ? { callId: record.call.id } : {}),
-    toolCallType: record.call.input.kind === 'text' ? 'custom' : 'function',
-    immediateContent: serializeToolObservationPresentation(record.immediatePresentation),
-    retainedContent: serializeToolObservationPresentation(record.retainedPresentation),
-    immediateImages: record.immediateImages,
-    evidence: [...record.evidence]
-  });
-  await input.append({
-    type: 'observation.record.created', id: record.id, ...entry.identity, toolName: entry.call.name, call: record.call,
-    toolCallType: record.call.input.kind === 'text' ? 'custom' : 'function', evidence: normalizeJsonSafe(record.evidence).value,
-    immediatePresentation: record.immediatePresentation, retainedPresentation: record.retainedPresentation,
-    ...(record.durableStorageDegraded ? { durableStorageDegraded: record.durableStorageDegraded } : {})
-  }, toolEventKey(input.runId, entry.identity, 'observation'));
+  if (!committed) throw new Error('Committed tool observation identity was not created.');
+  try {
+    const record = await input.observationStore.projectToolObservation(committed, input.modelInputModalities);
+    await input.session?.repository.appendObservation(input.session.sessionId, {
+      runId: input.runId,
+      identity: entry.identity,
+      toolName: entry.call.name,
+      observation: sessionObservation(persistedObservation)
+    });
+    await input.append({
+      type: 'observation.record.created', id: record.id, ...entry.identity, toolName: entry.call.name, call: record.call,
+      toolCallType: record.call.input.kind === 'text' ? 'custom' : 'function', evidence: normalizeJsonSafe(record.evidence).value,
+      immediatePresentation: record.immediatePresentation, retainedPresentation: record.retainedPresentation,
+      ...(record.durableStorageDegraded ? { durableStorageDegraded: record.durableStorageDegraded } : {})
+    }, toolEventKey(input.runId, entry.identity, 'observation'));
+    input.contextManager.recordToolResult({
+      turnIndex: input.turnIndex,
+      toolName: record.toolName,
+      ...(record.call.id ? { callId: record.call.id } : {}),
+      toolCallType: record.call.input.kind === 'text' ? 'custom' : 'function',
+      immediateContent: serializeToolObservationPresentation(record.immediatePresentation),
+      retainedContent: serializeToolObservationPresentation(record.retainedPresentation),
+      immediateImages: record.immediateImages,
+      imageArtifacts: record.imageArtifacts,
+      evidence: [...record.evidence]
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await input.append({ type: 'observation.projection.failed', id: committed.id, ...entry.identity, toolName: entry.call.name, message }, toolEventKey(input.runId, entry.identity, 'projection-failed'));
+    const fallback = minimalToolResultProjection(persistedObservation, entry.call.name, message);
+    input.contextManager.recordToolResult({
+      turnIndex: input.turnIndex,
+      toolName: entry.call.name,
+      ...(entry.call.id ? { callId: entry.call.id } : {}),
+      toolCallType: entry.call.input.kind === 'text' ? 'custom' : 'function',
+      immediateContent: fallback,
+      retainedContent: fallback
+    });
+  }
   await input.emit({ type: 'tool.ended', ...entry.identity, toolName: entry.call.name, observation: persistedObservation });
+}
+
+function sessionObservation(observation: ToolObservation) {
+  const artifacts = observationArtifacts(observation);
+  return {
+    ok: observation.ok,
+    summary: observation.summary,
+    output: observation.output,
+    ...(artifacts.length > 0 ? { artifacts } : {}),
+    ...(observation.metadata ? { metadata: observation.metadata } : {})
+  };
+}
+
+function minimalToolResultProjection(observation: ToolObservation, toolName: string, projectionError: string): string {
+  return JSON.stringify({
+    ok: observation.ok,
+    title: `${toolName} completed`,
+    summary: `${observation.summary} The durable tool result was committed, but its rich model projection failed.`,
+    scope: observation.scope,
+    coverage: observation.scope.coverage,
+    results: { artifacts: observationArtifacts(observation), projectionError: projectionError.slice(0, 1_000) }
+  });
 }
 
 function observationArtifacts(observation: ToolObservation) {

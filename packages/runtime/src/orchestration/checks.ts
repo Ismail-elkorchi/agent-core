@@ -1,4 +1,5 @@
-import { normalizeJsonSafe, validateArtifactRef, type ArtifactRef } from '@agent-core/evidence';
+import { validateArtifactRef, type ArtifactRef } from '@agent-core/evidence';
+import { normalizeJsonSafe } from '@agent-core/json';
 import {
   parseAgentCheckResult,
   validateAgentCheckDefinitions,

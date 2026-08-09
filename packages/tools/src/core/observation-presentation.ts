@@ -1,6 +1,6 @@
-import { isJsonObject, isJsonValue, normalizeJsonSafe, parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/evidence';
+import { isJsonObject, isJsonValue, normalizeJsonSafe, parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
 import type { ToolCall, ToolObservation } from './definition.js';
-export type { JsonObject, JsonValue } from '@agent-core/evidence';
+export type { JsonObject, JsonValue } from '@agent-core/json';
 
 export interface ToolObservationPresentation {
   ok: boolean;
@@ -17,12 +17,13 @@ export interface ToolObservationPresentation {
   warnings?: string[];
   next?: string;
 }
-export interface ToolObservationPresentationLimit { maxTokens: number }
+export type ToolObservationPresentationMode = 'immediate' | 'retained';
 export interface ToolObservationPresentationRequest<TInput = unknown, TOutput = unknown> {
   call: ToolCall;
   input: TInput;
   observation: ToolObservation<TOutput>;
-  limit: ToolObservationPresentationLimit;
+  mode: ToolObservationPresentationMode;
+  maxTokens: number;
 }
 export interface ToolObservationPresentationValidationIssue { path: string; message: string }
 export type ToolObservationPresentationValidationResult =

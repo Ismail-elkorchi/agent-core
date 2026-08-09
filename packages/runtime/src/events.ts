@@ -1,5 +1,6 @@
 import type { ContextBundle, ContextHistoryReduction, PromptProjection } from './context/manager.js';
-import { parseJsonObject, type ArtifactRef, type JsonValue, type RuntimeCodec } from '@agent-core/evidence';
+import type { ArtifactRef, RuntimeCodec } from '@agent-core/evidence';
+import { parseJsonObject, type JsonValue } from '@agent-core/json';
 import type {
   ModelCapabilities,
   ModelLimits,
@@ -152,6 +153,7 @@ export type AgentEvent =
   | ({ readonly type: 'context.history.reduced'; readonly reductions: readonly ContextHistoryReduction[] } & AgentTurnIdentity)
   | ({ readonly type: 'context.checkpoint.created'; readonly compactedToolResults: number; readonly removedItems?: number; readonly beforeBytes?: number; readonly afterBytes?: number } & AgentTurnIdentity)
   | ({ readonly type: 'observation.record.created'; readonly id: string; readonly toolName: string; readonly call: ToolCall; readonly toolCallType: 'function' | 'custom'; readonly evidence: JsonValue; readonly immediatePresentation: ToolObservationPresentation; readonly retainedPresentation: ToolObservationPresentation; readonly durableStorageDegraded?: { readonly message: string } } & AgentToolCallAttemptIdentity)
+  | ({ readonly type: 'observation.projection.failed'; readonly id: string; readonly toolName: string; readonly message: string } & AgentToolCallAttemptIdentity)
   | ({ readonly type: 'tool.authorization.decided'; readonly toolName: string; readonly fingerprint: string; readonly binding: AgentApprovalBinding; readonly decision: 'allow' | 'deny' | 'require_approval'; readonly reason?: string } & AgentToolCallIdentity)
   | ({ readonly type: 'approval.requested'; readonly runId: string; readonly approvalId: string; readonly toolName: string; readonly fingerprint: string; readonly input: JsonValue; readonly effects: ToolEffects; readonly binding: AgentApprovalBinding; readonly policyHash: string; readonly reason: string } & AgentToolCallIdentity)
   | ({ readonly type: 'approval.resolved'; readonly runId: string; readonly approvalId: string; readonly fingerprint: string; readonly binding: AgentApprovalBinding; readonly decision: 'allow' | 'deny' } & AgentToolCallIdentity)
@@ -238,14 +240,14 @@ function validateEventShape(value: Record<string, unknown>): string[] {
     'run.retry.scheduled', 'provider.state.updated', 'assistant.started', 'assistant.ended', 'assistant.interrupted',
     'model.failed', 'model.requested', 'model.responded', 'budget.estimate.created', 'budget.provider_usage.recorded',
     'overflow.recovery.started', 'overflow.recovery.ended', 'context.history.reduced', 'context.checkpoint.created',
-    'observation.record.created', 'tool.authorization.decided', 'approval.requested', 'approval.resolved', 'tool.started', 'tool.updated', 'tool.ended'
+    'observation.record.created', 'observation.projection.failed', 'tool.authorization.decided', 'approval.requested', 'approval.resolved', 'tool.started', 'tool.updated', 'tool.ended'
   ]);
   if (turnTypes.has(String(value.type))) {
     if (!positiveInteger(value.turnIndex)) issues.push('turnIndex must be a positive integer.');
     requireStrings(value, ['turnId'], issues);
     if (!positiveInteger(value.requestAttempt)) issues.push('requestAttempt must be positive.');
   }
-  const toolTypes = new Set(['observation.record.created', 'tool.authorization.decided', 'approval.requested', 'approval.resolved', 'tool.started', 'tool.updated', 'tool.ended']);
+  const toolTypes = new Set(['observation.record.created', 'observation.projection.failed', 'tool.authorization.decided', 'approval.requested', 'approval.resolved', 'tool.started', 'tool.updated', 'tool.ended']);
   if (toolTypes.has(String(value.type))) requireStrings(value, ['toolBatchId'], issues);
   if (!isAgentEventType(value.type)) return ['type is unsupported.'];
   EVENT_VALIDATORS[value.type](value, issues);
@@ -284,6 +286,7 @@ const EVENT_VALIDATORS = {
   'context.history.reduced': (value, issues) => { if (!Array.isArray(value.reductions)) issues.push('reductions must be an array.'); },
   'context.checkpoint.created': (value, issues) => { if (!nonnegativeInteger(value.compactedToolResults)) issues.push('compactedToolResults must be nonnegative.'); },
   'observation.record.created': (value, issues) => { requireStrings(value, ['id', 'toolName'], issues); requireToolAttempt(value, issues); requireRecord(value.call, 'call', issues); requireRecord(value.immediatePresentation, 'immediatePresentation', issues); requireRecord(value.retainedPresentation, 'retainedPresentation', issues); if (value.toolCallType !== 'function' && value.toolCallType !== 'custom') issues.push('toolCallType is invalid.'); if (value.durableStorageDegraded !== undefined) { requireRecord(value.durableStorageDegraded, 'durableStorageDegraded', issues); if (isRecord(value.durableStorageDegraded)) requireStrings(value.durableStorageDegraded, ['message'], issues); } },
+  'observation.projection.failed': (value, issues) => { requireStrings(value, ['id', 'toolName', 'message'], issues); requireToolAttempt(value, issues); },
   'tool.authorization.decided': (value, issues) => { requireStrings(value, ['toolName', 'fingerprint'], issues); validateApprovalBinding(value.binding, issues); if (!nonnegativeInteger(value.callIndex)) issues.push('callIndex must be nonnegative.'); if (!['allow', 'deny', 'require_approval'].includes(String(value.decision))) issues.push('authorization decision is invalid.'); },
   'approval.requested': (value, issues) => { requireStrings(value, ['runId', 'approvalId', 'toolName', 'fingerprint', 'policyHash', 'reason'], issues); requireRecord(value.effects, 'effects', issues); validateApprovalBinding(value.binding, issues); },
   'approval.resolved': (value, issues) => { requireStrings(value, ['runId', 'approvalId', 'fingerprint'], issues); validateApprovalBinding(value.binding, issues); if (value.decision !== 'allow' && value.decision !== 'deny') issues.push('approval decision is invalid.'); },

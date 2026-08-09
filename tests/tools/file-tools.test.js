@@ -53,7 +53,8 @@ test('directory and path selection are sorted, Git-aware, hidden-safe, and match
   assert.deepEqual(listed.output.entries.map((entry) => entry.path), [...listed.output.entries.map((entry) => entry.path)].sort((a, b) => a.localeCompare(b, 'en')));
   assert.equal(listed.output.entries.some((entry) => entry.path === 'ignored.txt'), false);
   assert.equal(listed.output.entries.some((entry) => entry.path === '.secret'), false);
-  assert.equal(listed.output.counts.omitted > 0, true);
+  assert.equal(listed.output.counts.omitted.count > 0, true);
+  assert.equal(listed.output.counts.omitted.relation, 'exact');
   assert.equal(listed.output.omissionSamples.some((entry) => entry.reason === 'hidden'), true);
   assert.equal(listed.output.omissionSamples.some((entry) => entry.reason === 'gitignored'), true);
   assert.deepEqual(listed.output.counts, {
@@ -155,11 +156,16 @@ test('list_directory depth is structural and find_files still traverses to the h
   const hostContext = { ...context, services: { ...context.services, localToolConfiguration: hostConfiguration, workspaceFileSelector: new WorkspaceFileSelector(root, hostLimited) } };
   const requestedDeeper = await invokeToolCall(jsonToolCall('list_directory', { depth: 3 }), tools, hostContext);
   assert.equal(requestedDeeper.output.coverage, 'partial');
-  assert.equal(requestedDeeper.output.causes.includes('depth_limit'), true);
+  assert.equal(requestedDeeper.output.causes.includes('host_depth_limit'), true);
+  assert.equal(requestedDeeper.output.counts.omitted.relation, 'at_least');
   assert.equal(requestedDeeper.output.entries.some(entry => entry.path === 'a-deep/first.txt'), false);
 
   const found = await invokeToolCall(jsonToolCall('find_files', { patterns: ['**/*.txt'] }), tools, context);
   assert.deepEqual(found.output.entries.map(entry => entry.path), ['a-deep/branch/deep.txt', 'a-deep/first.txt', 'top.txt', 'z-other/second.txt']);
+  const hostFound = await invokeToolCall(jsonToolCall('find_files', { patterns: ['**/*.txt'] }), tools, hostContext);
+  assert.equal(hostFound.output.coverage, 'partial');
+  assert.equal(hostFound.output.causes.includes('host_depth_limit'), true);
+  assert.equal(hostFound.output.counts.omitted.relation, 'at_least');
 });
 
 test('read_files streams large ranges, preserves batch failures, and hashes raw selected bytes', async () => {
@@ -206,7 +212,8 @@ test('search_text delegates regex validation to ripgrep and separates line and o
   const limitedFiles = await invokeToolCall(jsonToolCall('search_text', { query: 'foo', mode: 'files', resultLimit: 1 }), tools, context);
   assert.equal(limitedFiles.output.results.length, 1);
   assert.equal(limitedFiles.output.omittedResultCount, 1);
-  assert.equal(limitedFiles.output.coverage, 'partial');
+  assert.equal(limitedFiles.output.resultCoverage, 'partial');
+  assert.equal(limitedFiles.output.countCoverage, 'complete');
 
   const invalid = await invokeToolCall(jsonToolCall('search_text', { query: '[', mode: 'files' }), tools, context);
   assert.equal(invalid.kind, 'result');
@@ -327,7 +334,10 @@ test('search_text handles long repositories, context, per-file limits, abort, an
   assert.equal(long.output.status, 'partial');
   assert.deepEqual(long.output.perFileOmissions, [{ path: long.output.results[0].path, cause: 'per_file_limit', retainedMatches: 1, omittedAtLeast: 1 }]);
   assert.equal(long.output.results.length, 1);
-  assert.deepEqual(long.output.results[0].context, { before: ['before'], after: ['after'] });
+  assert.deepEqual(long.output.results[0].context, {
+    before: [{ lineNumber: 1, text: 'before' }],
+    after: [{ lineNumber: 3, text: 'after' }]
+  });
 
   const controller = new AbortController();
   const call = jsonToolCall('search_text', { path: 'many', query: 'nothing' });
@@ -358,6 +368,8 @@ test('search_text reports independent per-file omissions in matches and files mo
 
   const matches = await invokeToolCall(jsonToolCall('search_text', { query: 'needle', mode: 'matches', perFileLimit: 2 }), tools, context);
   assert.equal(matches.output.status, 'partial');
+  assert.equal(matches.output.resultCoverage, 'partial');
+  assert.equal(matches.output.countCoverage, 'partial');
   assert.deepEqual(matches.output.perFileOmissions.map(item => [item.path, item.cause, item.retainedMatches, item.omittedAtLeast]), [
     ['above.txt', 'per_file_limit', 2, 1], ['second-above.txt', 'per_file_limit', 2, 1]
   ]);
@@ -368,6 +380,8 @@ test('search_text reports independent per-file omissions in matches and files mo
   const counts = await invokeToolCall(jsonToolCall('search_text', { query: 'needle', mode: 'count', perFileLimit: 2 }), tools, context);
   assert.equal(counts.output.status, 'completed');
   assert.equal(counts.output.countsCapped, false);
+  assert.equal(counts.output.resultCoverage, 'complete');
+  assert.equal(counts.output.countCoverage, 'complete');
   assert.deepEqual(counts.output.results.map(item => [item.path, item.matchingLineCount, item.occurrenceCount]), [
     ['above.txt', 3, 3], ['at.txt', 2, 2], ['below.txt', 1, 1], ['second-above.txt', 4, 4]
   ]);
@@ -375,6 +389,8 @@ test('search_text reports independent per-file omissions in matches and files mo
   const files = await invokeToolCall(jsonToolCall('search_text', { query: 'needle', mode: 'files', perFileLimit: 1 }), tools, context);
   assert.deepEqual(files.output.results, ['above.txt', 'at.txt', 'below.txt', 'second-above.txt']);
   assert.equal(files.output.status, 'partial');
+  assert.equal(files.output.resultCoverage, 'complete');
+  assert.equal(files.output.countCoverage, 'partial');
   assert.deepEqual(files.output.perFileOmissions.map(item => item.path), ['above.txt', 'at.txt', 'second-above.txt']);
 });
 
@@ -401,6 +417,7 @@ test('search_text bounds and parses multi-megabyte ripgrep output without quadra
   });
   assert.equal(bounded.output.status, 'output_limit');
   assert.equal(bounded.output.outputTruncated, true);
-  assert.equal(bounded.output.coverage, 'partial');
+  assert.equal(bounded.output.resultCoverage, 'partial');
+  assert.equal(bounded.output.countCoverage, 'partial');
   assert.match(bounded.output.diagnostic, /output.*limit|middle.*JSON/iu);
 });

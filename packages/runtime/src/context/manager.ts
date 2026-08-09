@@ -8,7 +8,8 @@ import {
   SimpleTokenEstimator,
   type TokenEstimator
 } from '@agent-core/model';
-import type { EvidenceRecord, JsonObject } from '@agent-core/evidence';
+import type { EvidenceRecord, PublicArtifactRef } from '@agent-core/evidence';
+import type { JsonObject } from '@agent-core/json';
 
 export interface ContextRange {
   kind: 'line' | 'byte';
@@ -111,7 +112,20 @@ export interface ContextProjection {
 export interface ContextHistoryProjection {
   messages: ModelMessage[];
   estimatedTokens: number;
+  reductions: ContextHistoryReduction[];
 }
+
+export interface ContextImageLimits {
+  readonly maxCount: number;
+  readonly maxBytes: number;
+  readonly maxEstimatedTokens: number;
+}
+
+export const DEFAULT_CONTEXT_IMAGE_LIMITS: ContextImageLimits = Object.freeze({
+  maxCount: 16,
+  maxBytes: 64 * 1024 * 1024,
+  maxEstimatedTokens: 32_000
+});
 
 export interface ContextHistoryPressureReduction {
   reductions: ContextHistoryReduction[];
@@ -145,11 +159,14 @@ export interface ContextProjectionRequest {
 
 export interface ContextHistoryReduction {
   itemId: string;
-  kind: 'tool_result_reduced' | 'checkpoint_installed';
+  kind: 'tool_result_reduced' | 'checkpoint_installed' | 'image_content_removed';
   beforeBytes: number;
   afterBytes: number;
   toolName?: string;
   removedItems?: number;
+  removedImageBytes?: number;
+  removedImageTokens?: number;
+  reason?: 'unsupported_modality' | 'image_count_limit' | 'image_byte_limit' | 'image_token_limit';
 }
 
 export type ContextHistoryItem =
@@ -173,6 +190,7 @@ export interface ContextToolResultItem {
   callId?: string;
   immediateMessage: ModelMessage;
   retainedMessage: ModelMessage;
+  imageArtifacts: readonly PublicArtifactRef[];
   useRetained: boolean;
 }
 
@@ -197,6 +215,7 @@ export interface RecordToolResultInput {
   immediateContent: string;
   retainedContent: string;
   immediateImages?: readonly ModelImage[];
+  imageArtifacts?: readonly PublicArtifactRef[];
   useRetained?: boolean;
   evidence?: EvidenceRecord[];
 }
@@ -218,9 +237,12 @@ export class ContextManager {
   private readonly historyItems: ContextHistoryItem[] = [];
   private readonly evidenceRecords: EvidenceRecord[] = [];
   private readonly projectionReductions: ContextHistoryReduction[] = [];
+  private readonly imageLimits: ContextImageLimits;
 
-  constructor(estimator: TokenEstimator = new SimpleTokenEstimator()) {
+  constructor(estimator: TokenEstimator = new SimpleTokenEstimator(), imageLimits: ContextImageLimits = DEFAULT_CONTEXT_IMAGE_LIMITS) {
     this.estimator = estimator;
+    if (![imageLimits.maxCount, imageLimits.maxBytes, imageLimits.maxEstimatedTokens].every((value) => Number.isSafeInteger(value) && value > 0)) throw new Error('Context image limits must be positive safe integers.');
+    this.imageLimits = Object.freeze({ ...imageLimits });
   }
 
   recordModelOutput(input: RecordModelOutputInput): void {
@@ -252,6 +274,7 @@ export class ContextManager {
       toolCallType: input.toolCallType,
       immediateMessage: toolResultMessage(input, 'immediate'),
       retainedMessage: toolResultMessage(input, 'retained'),
+      imageArtifacts: Object.freeze([...(input.imageArtifacts ?? [])]),
       useRetained: input.useRetained ?? false
     };
     if (input.callId) {
@@ -282,11 +305,12 @@ export class ContextManager {
   }
 
   projectHistory(modelProfile: ModelProfile): ContextHistoryProjection {
-    void modelProfile;
-    const messages = this.contextHistoryMessages();
+    const projected = projectImagesForProfile(this.contextHistoryEntries(), modelProfile, this.imageLimits, this.estimator);
+    const messages = normalizeToolProtocolMessages(projected.messages);
     return {
       messages,
-      estimatedTokens: this.estimator.estimateMessages(messages)
+      estimatedTokens: this.estimator.estimateMessages(messages),
+      reductions: projected.reductions
     };
   }
 
@@ -343,7 +367,7 @@ export class ContextManager {
       prompt: projection,
       contextHistoryMessages: contextHistory.messages,
       context,
-      reductions: this.consumeProjectionReductions(),
+      reductions: [...this.consumeProjectionReductions(), ...contextHistory.reductions],
       estimate: {
         contextHistoryTokens: contextHistory.estimatedTokens,
         contextTokens: context.totalTokens,
@@ -516,16 +540,16 @@ export class ContextManager {
     };
   }
 
-  private contextHistoryMessages(): ModelMessage[] {
-    return normalizeToolProtocolMessages(this.historyItems.map((item) => {
+  private contextHistoryEntries(): ProjectableHistoryMessage[] {
+    return this.historyItems.map((item) => {
       if (item.kind === 'assistant_tool_call') {
-        return item.message;
+        return { itemId: item.id, message: item.message, imageArtifacts: [] };
       }
       if (item.kind === 'checkpoint') {
         return undefined;
       }
-      return item.useRetained ? item.retainedMessage : item.immediateMessage;
-    }).filter((message): message is ModelMessage => message !== undefined));
+      return { itemId: item.id, message: item.useRetained ? item.retainedMessage : item.immediateMessage, imageArtifacts: item.imageArtifacts };
+    }).filter((entry): entry is ProjectableHistoryMessage => entry !== undefined);
   }
 
   private materializeContextItem(input: ContextItemInput): ContextItem {
@@ -741,6 +765,110 @@ function selectContextItems(
   }
 
   return { items: selected, totalTokens, omitted };
+}
+
+interface ProjectableHistoryMessage {
+  readonly itemId: string;
+  readonly message: ModelMessage;
+  readonly imageArtifacts: readonly PublicArtifactRef[];
+}
+
+interface ProjectedHistoryImages {
+  readonly messages: ModelMessage[];
+  readonly reductions: ContextHistoryReduction[];
+}
+
+function projectImagesForProfile(
+  entries: readonly ProjectableHistoryMessage[],
+  profile: ModelProfile,
+  limits: ContextImageLimits,
+  estimator: TokenEstimator
+): ProjectedHistoryImages {
+  const supportsImages = profile.modalities.input.includes('image');
+  const images = entries.flatMap((entry, messageIndex) => (entry.message.images ?? []).map((image, imageIndex) => ({
+    entry, messageIndex, imageIndex, image, bytes: imageByteLength(image), tokens: estimator.estimateImage(image)
+  })));
+  const kept = new Set<string>();
+  const removalReasons = new Map<string, ContextHistoryReduction['reason']>();
+  let activeCount = 0;
+  let activeBytes = 0;
+  let activeTokens = 0;
+  for (let index = images.length - 1; index >= 0; index -= 1) {
+    const candidate = images[index];
+    if (!candidate) continue;
+    const key = `${String(candidate.messageIndex)}:${String(candidate.imageIndex)}`;
+    if (!supportsImages) {
+      removalReasons.set(key, 'unsupported_modality');
+      continue;
+    }
+    const reason = activeCount + 1 > limits.maxCount
+      ? 'image_count_limit'
+      : activeBytes + candidate.bytes > limits.maxBytes
+        ? 'image_byte_limit'
+        : activeTokens + candidate.tokens > limits.maxEstimatedTokens
+          ? 'image_token_limit'
+          : undefined;
+    if (reason) {
+      removalReasons.set(key, reason);
+      continue;
+    }
+    kept.add(key);
+    activeCount += 1;
+    activeBytes += candidate.bytes;
+    activeTokens += candidate.tokens;
+  }
+
+  const reductions: ContextHistoryReduction[] = [];
+  const messages = entries.map((entry, messageIndex) => {
+    const sourceImages = entry.message.images ?? [];
+    if (sourceImages.length === 0) return entry.message;
+    const retained: ModelImage[] = [];
+    const removed: { readonly image: ModelImage; readonly artifact?: PublicArtifactRef; readonly bytes: number; readonly tokens: number; readonly reason: NonNullable<ContextHistoryReduction['reason']> }[] = [];
+    for (let imageIndex = 0; imageIndex < sourceImages.length; imageIndex += 1) {
+      const image = sourceImages[imageIndex];
+      if (!image) continue;
+      const key = `${String(messageIndex)}:${String(imageIndex)}`;
+      if (kept.has(key)) retained.push(image);
+      else removed.push({
+        image,
+        ...(entry.imageArtifacts[imageIndex] ? { artifact: entry.imageArtifacts[imageIndex] } : {}),
+        bytes: imageByteLength(image),
+        tokens: estimator.estimateImage(image),
+        reason: removalReasons.get(key) ?? 'unsupported_modality'
+      });
+    }
+    if (removed.length === 0) return entry.message;
+    const firstRemoved = removed[0];
+    if (!firstRemoved) return entry.message;
+    const metadata = removed.map((item) => item.artifact
+      ? `- ${item.image.mediaType}, ${String(item.bytes)} bytes, public artifact ${item.artifact.artifactId} (${item.artifact.sha256}, ${String(item.artifact.size)} bytes).`
+      : `- ${item.image.mediaType}, ${String(item.bytes)} bytes; its public artifact metadata remains in the tool-result presentation.`).join('\n');
+    const projected = {
+      ...entry.message,
+      content: `${entry.message.content}\n[${String(removed.length)} image attachment${removed.length === 1 ? '' : 's'} omitted from active model context]\n${metadata}`,
+      ...(retained.length > 0 ? { images: retained } : { images: undefined })
+    } as ModelMessage;
+    if (retained.length === 0) delete (projected as { images?: ModelImage[] }).images;
+    reductions.push({
+      itemId: entry.itemId,
+      kind: 'image_content_removed',
+      beforeBytes: Buffer.byteLength(entry.message.content, 'utf8') + sourceImages.reduce((total, image) => total + imageByteLength(image), 0),
+      afterBytes: Buffer.byteLength(projected.content, 'utf8') + retained.reduce((total, image) => total + imageByteLength(image), 0),
+      ...(entry.message.role === 'tool' ? { toolName: entry.message.toolName } : {}),
+      removedItems: removed.length,
+      removedImageBytes: removed.reduce((total, item) => total + item.bytes, 0),
+      removedImageTokens: removed.reduce((total, item) => total + item.tokens, 0),
+      reason: firstRemoved.reason
+    });
+    return projected;
+  });
+  return { messages, reductions };
+}
+
+function imageByteLength(image: ModelImage): number {
+  if (image.type === 'bytes') return image.data.byteLength;
+  const padding = image.data.endsWith('==') ? 2 : image.data.endsWith('=') ? 1 : 0;
+  return Math.max(0, Math.floor(image.data.length * 3 / 4) - padding);
 }
 
 function normalizeToolProtocolMessages(messages: ModelMessage[]): ModelMessage[] {

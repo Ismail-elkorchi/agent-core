@@ -9,3 +9,4 @@ export * from './orchestration/finalization.js';
 export * from './orchestration/run-controller.js';
 export * from './orchestration/tool-scheduler.js';
 export * from './orchestration/observation-store.js';
+export * from './orchestration/context-evidence.js';

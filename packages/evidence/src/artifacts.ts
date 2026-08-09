@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { normalizeJsonSafe } from './json.js';
+import { normalizeJsonSafe } from '@agent-core/json';
 import {
   ArtifactIntegrityError,
   artifactExtension,

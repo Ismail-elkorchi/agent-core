@@ -22,15 +22,21 @@ export interface WorkspaceFileSelectionRequest {
   readonly signal?: AbortSignal;
 }
 export interface WorkspaceSelectionEntry { readonly path: string; readonly type: WorkspaceEntryType; readonly size?: number; readonly modifiedAt?: string }
+export interface WorkspaceOmissionCount { readonly count: number; readonly relation: 'exact' | 'at_least' }
+export interface WorkspaceSelectionOmission extends WorkspaceOmissionCount { readonly cause: string }
 export interface WorkspaceFileSelectionResult {
   readonly startPath: string;
+  readonly requestedDepth: number | null;
+  readonly effectiveDepth: number;
+  readonly hostMaximumDepth: number;
   readonly entries: readonly WorkspaceSelectionEntry[];
   readonly coverage: 'complete' | 'partial';
   readonly causes: readonly string[];
   readonly visitedEntries: number;
   readonly returnedEntries: number;
-  readonly omittedEntries: number;
-  readonly omittedIgnoreFiles: number;
+  readonly omittedEntries: WorkspaceOmissionCount;
+  readonly omittedIgnoreFiles: WorkspaceOmissionCount;
+  readonly omissions: readonly WorkspaceSelectionOmission[];
   readonly omissionSamples: readonly { path: string; reason: 'hidden' | 'gitignored' | 'excluded' | 'unreadable' | 'limit'; message?: string }[];
 }
 interface IgnoreRules { readonly base: string; readonly matcher: Ignore }
@@ -57,7 +63,13 @@ export class WorkspaceFileSelector {
     let omittedEntries = 0;
     let loadedIgnoreFiles = 0;
     let omittedIgnoreFiles = 0;
+    const omissionCounts = new Map<string, { count: number; relation: 'exact' | 'at_least' }>();
     let stopped = false;
+    const omit = (cause: string, count = 1, relation: 'exact' | 'at_least' = 'exact') => {
+      omittedEntries += count;
+      const prior = omissionCounts.get(cause) ?? { count: 0, relation: 'exact' as const };
+      omissionCounts.set(cause, { count: prior.count + count, relation: prior.relation === 'at_least' || relation === 'at_least' ? 'at_least' : 'exact' });
+    };
 
     const walk = async (directory: string, depth: number, inherited: readonly IgnoreRules[]): Promise<void> => {
       if (stopped) return;
@@ -66,6 +78,7 @@ export class WorkspaceFileSelector {
       try { directoryEntries = await fs.readdir(directory, { withFileTypes: true }); }
       catch (error) {
         causes.add('unreadable_branch');
+        omit('unreadable_branch', 1, 'at_least');
         sample(samples, { path: relativePath(this.rootDir, directory), reason: 'unreadable', message: message(error) });
         return;
       }
@@ -86,13 +99,14 @@ export class WorkspaceFileSelector {
         } else {
           omittedIgnoreFiles += 1;
           causes.add('ignore_file_limit');
+          omit('ignore_file_limit');
         }
       }
 
       for (const dirent of directoryEntries) {
         throwIfAborted(request.signal);
         if (visitedEntries >= this.limits.maxVisitedEntries) {
-          stopped = true; omittedEntries += 1; causes.add('visit_limit');
+          stopped = true; omit('visit_limit', 1, 'at_least'); causes.add('visit_limit');
           sample(samples, { path: relativePath(this.rootDir, path.join(directory, dirent.name)), reason: 'limit' });
           break;
         }
@@ -102,24 +116,28 @@ export class WorkspaceFileSelector {
         const scopedPath = relativePath(start, absolute);
         const type = entryType(dirent);
         const isDirectory = type === 'directory';
-        if (workspacePath === '.git' || workspacePath.startsWith('.git/')) { omittedEntries += 1; continue; }
-        if (!request.includeHidden && hidden(workspacePath)) { omittedEntries += 1; sample(samples, { path: workspacePath, reason: 'hidden' }); continue; }
-        if (matchesAny(scopedPath, exclusions, isDirectory)) { omittedEntries += 1; sample(samples, { path: workspacePath, reason: 'excluded' }); continue; }
-        if (request.respectGitIgnore && ignored(workspacePath, isDirectory, rules)) { omittedEntries += 1; sample(samples, { path: workspacePath, reason: 'gitignored' }); continue; }
+        if (workspacePath === '.git' || workspacePath.startsWith('.git/')) { omit('git_metadata'); continue; }
+        if (!request.includeHidden && hidden(workspacePath)) { omit('hidden'); sample(samples, { path: workspacePath, reason: 'hidden' }); continue; }
+        if (matchesAny(scopedPath, exclusions, isDirectory)) { omit('excluded'); sample(samples, { path: workspacePath, reason: 'excluded' }); continue; }
+        if (request.respectGitIgnore && ignored(workspacePath, isDirectory, rules)) { omit('gitignored'); sample(samples, { path: workspacePath, reason: 'gitignored' }); continue; }
         const matches = matchesAny(scopedPath, patterns, isDirectory) && matchesType(type, request.type);
         if (matches) {
           if (entries.length >= requestedLimit) {
-            stopped = true; omittedEntries += 1; causes.add('result_limit');
+            stopped = true; omit('result_limit', 1, 'at_least'); causes.add('result_limit');
             sample(samples, { path: workspacePath, reason: 'limit' });
             break;
           }
           try { entries.push(await makeEntry(workspacePath, absolute, type, request.includeMetadata === true)); }
-          catch (error) { omittedEntries += 1; causes.add('unreadable_entry'); sample(samples, { path: workspacePath, reason: 'unreadable', message: message(error) }); }
+          catch (error) { omit('unreadable_entry'); causes.add('unreadable_entry'); sample(samples, { path: workspacePath, reason: 'unreadable', message: message(error) }); }
         }
         if (isDirectory) {
           if (depth >= traversalDepth) {
-            if (requestedDepth > this.limits.maxDepth && depth >= this.limits.maxDepth) {
-              causes.add('depth_limit'); omittedEntries += 1; sample(samples, { path: workspacePath, reason: 'limit' });
+            const hostLimited = request.traversalDepth === undefined || requestedDepth > this.limits.maxDepth;
+            if (hostLimited && depth >= this.limits.maxDepth) {
+              const descendants = await immediateEntryCount(absolute);
+              if (descendants > 0) {
+                causes.add('host_depth_limit'); omit('host_depth_limit', descendants, 'at_least'); sample(samples, { path: workspacePath, reason: 'limit' });
+              }
             }
             continue;
           }
@@ -129,12 +147,21 @@ export class WorkspaceFileSelector {
     };
     await walk(start, 1, []);
     if (omittedIgnoreFiles > 0) causes.add('ignore_file_limit');
+    const lowerBound = [...omissionCounts.values()].some((item) => item.relation === 'at_least');
     return Object.freeze({
-      startPath, entries: Object.freeze(entries), coverage: causes.size === 0 ? 'complete' : 'partial',
-      causes: Object.freeze([...causes].sort()), visitedEntries, returnedEntries: entries.length, omittedEntries, omittedIgnoreFiles,
+      startPath, requestedDepth: request.traversalDepth ?? null, effectiveDepth: traversalDepth, hostMaximumDepth: this.limits.maxDepth,
+      entries: Object.freeze(entries), coverage: causes.size === 0 ? 'complete' : 'partial',
+      causes: Object.freeze([...causes].sort()), visitedEntries, returnedEntries: entries.length,
+      omittedEntries: Object.freeze({ count: omittedEntries, relation: lowerBound ? 'at_least' : 'exact' }),
+      omittedIgnoreFiles: Object.freeze({ count: omittedIgnoreFiles, relation: 'exact' }),
+      omissions: Object.freeze([...omissionCounts.entries()].map(([cause, value]) => Object.freeze({ cause, ...value })).sort((a, b) => a.cause.localeCompare(b.cause, 'en'))),
       omissionSamples: Object.freeze(samples)
     });
   }
+}
+async function immediateEntryCount(directory: string): Promise<number> {
+  try { return (await fs.readdir(directory)).length; }
+  catch { return 1; }
 }
 
 export function createWorkspaceFileSelector(rootDir: string, limits: WorkspaceFileSelectionLimits): WorkspaceFileSelector { return new WorkspaceFileSelector(rootDir, limits); }

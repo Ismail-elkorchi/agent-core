@@ -18,23 +18,27 @@ const completeScope = { resources: ['workspace/files'], coverage: 'complete' };
 function present(tool, output, options = {}) {
   const scope = options.scope ?? completeScope;
   return tool.presentObservation({
-    call: { name: tool.name, input: { kind: 'json', value: {} } }, input: {}, limit: { maxTokens: options.maxTokens ?? 500 },
+    call: { name: tool.name, input: { kind: 'json', value: {} } }, input: {}, mode: options.mode ?? 'immediate', maxTokens: options.maxTokens ?? 500,
     observation: { kind: 'result', ok: options.ok ?? true, summary: `${tool.name} result`, scope, output }
   });
 }
 
 test('domain presenters preserve their required shape while spending the supplied budget', () => {
   const listed = present(listDirectoryTool, {
-    path: '.', coverage: 'partial', causes: ['result_limit'], counts: { visited: 12, returned: 9, omitted: 3 }, omitted: { ignoreFiles: 0 }, omissionSamples: [],
+    path: '.', depth: { requested: 1, effective: 1, hostMaximum: 16 }, coverage: 'partial', causes: ['result_limit'],
+    counts: { visited: 12, returned: 9, omitted: { count: 3, relation: 'at_least' } },
+    omitted: { ignoreFiles: { count: 0, relation: 'exact' } }, omissions: [{ cause: 'result_limit', count: 3, relation: 'at_least' }], omissionSamples: [],
     entries: ['a/1', 'a/2', 'a/3', 'b/1', 'b/2', 'b/3', 'c/1', 'c/2', 'c/3'].map(path => ({ path, type: 'file' }))
   }, { scope: { resources: ['workspace/files'], coverage: 'partial', causes: ['result_limit'], omitted: { entries: 3 } }, maxTokens: 300 });
   assert.deepEqual([...new Set(listed.results.entries.map(entry => entry.path.split('/')[0]))], ['a', 'b', 'c']);
-  assert.deepEqual(listed.results.counts, { visited: 12, returned: 9, omitted: 3 });
+  assert.deepEqual(listed.results.counts, { visited: 12, returned: 9, omitted: { count: 3, relation: 'at_least' } });
   assert.match(listed.next, /narrower/u);
   assertWithinBudget(listed, 300);
 
   const foundComplete = present(findFilesTool, {
-    path: '.', patterns: ['**/*.ts'], coverage: 'complete', causes: [], counts: { visited: 5, returned: 3, omitted: 0 }, omitted: { ignoreFiles: 0 }, omissionSamples: [],
+    path: '.', hostMaximumDepth: 16, patterns: ['**/*.ts'], coverage: 'complete', causes: [],
+    counts: { visited: 5, returned: 3, omitted: { count: 0, relation: 'exact' } },
+    omitted: { ignoreFiles: { count: 0, relation: 'exact' } }, omissions: [], omissionSamples: [],
     entries: [{ path: 'z.ts', type: 'file' }, { path: 'a.ts', type: 'file' }, { path: 'm.ts', type: 'file' }]
   });
   assert.deepEqual(foundComplete.results.entries.map(entry => entry.path), ['a.ts', 'm.ts', 'z.ts']);
@@ -50,7 +54,7 @@ test('domain presenters preserve their required shape while spending the supplie
   assertWithinBudget(read, 700);
 
   const searched = present(searchTextTool, {
-    query: 'needle', mode: 'matches', status: 'partial', coverage: 'partial', examinedFileCount: 2, matchingFileCount: 2, matchingLineCount: 4,
+    query: 'needle', mode: 'matches', status: 'partial', resultCoverage: 'partial', countCoverage: 'partial', examinedFileCount: 2, matchingFileCount: 2, matchingLineCount: 4,
     occurrenceCount: 4, omittedResultCount: 2, countsCapped: false, omittedResultCountIsLowerBound: false, outputTruncated: false,
     perFileOmissions: [{ path: 'a.txt', cause: 'per_file_limit', retainedMatches: 1, omittedAtLeast: 1 }],
     results: [
@@ -64,17 +68,18 @@ test('domain presenters preserve their required shape while spending the supplie
   assertWithinBudget(searched, 700);
 
   const patched = present(applyPatchTool, {
-    status: 'rollback_failed', workspaceState: 'uncertain', dryRun: false, transactional: true,
+    operationStatus: 'uncertain', transactionOutcome: 'rollback_failed', workspaceState: 'uncertain', dryRun: false,
     files: [
-      { path: 'a.txt', operation: 'update', hunkCount: 1, additions: 1, deletions: 1, oldBytes: 1, newBytes: 1, changed: false },
-      { path: 'old.txt', destinationPath: 'new.txt', operation: 'move', hunkCount: 0, additions: 0, deletions: 0, oldBytes: 1, newBytes: 1, changed: false }
+      { path: 'a.txt', operation: 'update', hunkCount: 1, additions: 1, deletions: 1, oldBytes: 1, newBytes: 1, plannedChange: true, finalState: 'uncertain' },
+      { path: 'old.txt', destinationPath: 'new.txt', operation: 'move', hunkCount: 0, additions: 0, deletions: 0, oldBytes: 1, newBytes: 1, plannedChange: true, finalState: 'uncertain' }
     ],
     changedPaths: [], wouldChangePaths: ['a.txt', 'old.txt', 'new.txt'], createdPaths: [], wouldCreatePaths: [], deletedPaths: [], wouldDeletePaths: [],
     movedPaths: [], wouldMovePaths: [{ sourcePath: 'old.txt', destinationPath: 'new.txt' }], potentiallyAffectedPaths: ['a.txt', 'old.txt', 'new.txt'],
     totalOperationCount: 2, totalHunkCount: 1, totalAdditions: 1, totalDeletions: 1, failures: [],
     transaction: { outcome: 'rollback_failed', failure: { operation: 'commit_patch', path: 'a.txt', message: 'commit failed' }, rollback: { status: 'uncertain', diagnostics: [{ operation: 'restore', path: 'a.txt', message: 'state unknown' }], strandedPaths: ['a.txt'] } }
   }, { scope: { resources: ['workspace/files/a.txt', 'workspace/files/old.txt', 'workspace/files/new.txt'], coverage: 'partial', causes: ['workspace_state_uncertain'] }, ok: false });
-  assert.equal(patched.results.status, 'rollback_failed');
+  assert.equal(patched.results.operationStatus, 'uncertain');
+  assert.equal(patched.results.transactionOutcome, 'rollback_failed');
   assert.equal(patched.results.workspaceState, 'uncertain');
   assert.deepEqual(patched.results.files.map(file => [file.path, file.operation, file.additions, file.deletions]), [['a.txt', 'update', 1, 1], ['old.txt', 'move', 0, 0]]);
   assert.equal(patched.results.transaction.outcome, 'rollback_failed');

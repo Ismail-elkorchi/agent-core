@@ -1,5 +1,5 @@
 import type { ToolDefinition } from './definition.js';
-import { parseJsonObject } from '@agent-core/evidence';
+import { parseJsonObject } from '@agent-core/json';
 
 export type ToolRisk = 'read' | 'write' | 'execute' | 'network' | 'destructive';
 

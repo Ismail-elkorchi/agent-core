@@ -9,7 +9,7 @@ import type {
   ModelToolCall,
   ModelUsage
 } from './index.js';
-import { parseJsonObject, parseJsonValue } from '@agent-core/evidence';
+import { normalizeJsonSafe, parseJsonObject, parseJsonValue } from '@agent-core/json';
 
 export class ModelContractError extends Error {
   readonly issues: readonly string[];
@@ -201,7 +201,7 @@ function validModelTool(value: unknown): boolean {
 
 export function parseModelReasoningRequest(value: unknown): ModelReasoningRequest {
   if (!validReasoningRequest(value)) throw contract('Invalid model reasoning request.', ['Expected a legal disabled, enabled, effort, or budget strategy.']);
-  return Object.freeze(value);
+  return Object.freeze({ ...value });
 }
 
 export function parseModelUsage(value: unknown): ModelUsage {
@@ -211,7 +211,14 @@ export function parseModelUsage(value: unknown): ModelUsage {
   if (nonnegativeFinite(value.totalTokens) && nonnegativeFinite(value.promptTokens) && nonnegativeFinite(value.completionTokens) && value.totalTokens !== value.promptTokens + value.completionTokens) issues.push('totalTokens must equal promptTokens + completionTokens.');
   if (issues.length > 0) throw contract('Invalid model usage.', issues);
   if (!isModelUsage(value)) throw contract('Invalid model usage.', ['Validated fields did not form model usage.']);
-  return Object.freeze(value);
+  return Object.freeze({
+    promptTokens: value.promptTokens,
+    completionTokens: value.completionTokens,
+    totalTokens: value.totalTokens,
+    ...(typeof value.cacheReadTokens === 'number' ? { cacheReadTokens: value.cacheReadTokens } : {}),
+    ...(typeof value.cacheWriteTokens === 'number' ? { cacheWriteTokens: value.cacheWriteTokens } : {}),
+    ...(typeof value.reasoningTokens === 'number' ? { reasoningTokens: value.reasoningTokens } : {})
+  });
 }
 
 export function parseModelTerminationReason(value: unknown): ModelTerminationReason {
@@ -266,7 +273,24 @@ export function parseModelResponse(value: unknown): ModelResponse {
   if (value.timings !== undefined && !validFiniteNumberRecord(value.timings)) issues.push('timings must contain finite nonnegative numbers.');
   if (issues.length > 0) throw contract('Invalid model response.', issues);
   if (!isModelResponse(value)) throw contract('Invalid model response.', ['Validated fields did not form a model response.']);
-  return Object.freeze(value);
+  const response: ModelResponse = {
+    content: value.content,
+    model: value.model,
+    provider: value.provider,
+    terminationReason: parseModelTerminationReason(value.terminationReason),
+    ...(value.providerState === undefined ? {} : { providerState: parseModelProviderState(value.providerState) }),
+    ...(typeof value.requestId === 'string' ? { requestId: value.requestId } : {}),
+    ...(value.transport === undefined ? {} : { transport: ownedTransport(value.transport) }),
+    ...(value.usage === undefined ? {} : { usage: parseModelUsage(value.usage) }),
+    ...(typeof value.reasoning === 'string' ? { reasoning: value.reasoning } : {}),
+    ...(typeof value.reasoningSummary === 'string' ? { reasoningSummary: value.reasoningSummary } : {}),
+    ...(Array.isArray(value.toolCalls) ? { toolCalls: Object.freeze(value.toolCalls.map(parseModelToolCall)) } : {}),
+    ...(typeof value.providerTerminationReason === 'string' ? { providerTerminationReason: value.providerTerminationReason } : {}),
+    ...(value.timings === undefined ? {} : { timings: ownedFiniteNumberRecord(value.timings) }),
+    ...(Object.hasOwn(value, 'logprobs') ? { logprobs: ownedOpaque(value.logprobs) } : {}),
+    ...(Object.hasOwn(value, 'raw') ? { raw: ownedOpaque(value.raw) } : {})
+  };
+  return Object.freeze(response);
 }
 
 export function parseModelStreamEvent(value: unknown): ModelStreamEvent {
@@ -322,6 +346,23 @@ function validateTransport(value: unknown, provider: unknown, issues: string[]):
   if (value.responseId !== undefined) nonempty(value.responseId, 'transport.responseId', issues);
   if (value.reusedContinuation !== undefined && typeof value.reusedContinuation !== 'boolean') issues.push('transport.reusedContinuation must be boolean.');
   if (value.fallbackReason !== undefined) nonempty(value.fallbackReason, 'transport.fallbackReason', issues);
+}
+function ownedTransport(value: unknown): import('./index.js').ModelTransportMetadata {
+  if (!isRecord(value)) throw contract('Invalid transport metadata.', ['Expected an object.']);
+  return Object.freeze({
+    provider: value.provider as string,
+    strategy: value.strategy as string,
+    ...(typeof value.responseId === 'string' ? { responseId: value.responseId } : {}),
+    ...(typeof value.reusedContinuation === 'boolean' ? { reusedContinuation: value.reusedContinuation } : {}),
+    ...(typeof value.fallbackReason === 'string' ? { fallbackReason: value.fallbackReason } : {})
+  });
+}
+function ownedFiniteNumberRecord(value: unknown): Record<string, number> {
+  const parsed = parseJsonObject(value);
+  return Object.freeze(Object.fromEntries(Object.entries(parsed).map(([key, item]) => [key, item as number])));
+}
+function ownedOpaque(value: unknown): unknown {
+  return parseJsonValue(normalizeJsonSafe(value, { maxDepth: 32, maxCollectionEntries: 20_000, maxStringBytes: 1024 * 1024, maxTotalBytes: 4 * 1024 * 1024 }).value);
 }
 function validReasoningRequest(value: unknown): value is ModelReasoningRequest {
   if (!isRecord(value)) return false;
@@ -480,7 +521,7 @@ function isModelToolInputSupport(value: unknown): value is ModelProfile['capabil
   if (value.kind === 'json' || value.kind === 'text') return onlyKeys(value, ['kind']);
   return value.kind === 'grammar' && typeof value.syntax === 'string' && value.syntax.length > 0 && onlyKeys(value, ['kind', 'syntax']);
 }
-function optionalRaw(value: Record<string, unknown>): { raw?: unknown } { return Object.hasOwn(value, 'raw') ? { raw: value.raw } : {}; }
+function optionalRaw(value: Record<string, unknown>): { raw?: unknown } { return Object.hasOwn(value, 'raw') ? { raw: ownedOpaque(value.raw) } : {}; }
 function finiteInRange(value: unknown, minimum: number, maximum: number): boolean { return typeof value === 'number' && Number.isFinite(value) && value >= minimum && value <= maximum; }
 function nonnegativeInteger(value: unknown): value is number { return typeof value === 'number' && Number.isInteger(value) && value >= 0; }
 function positiveFinite(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value) && value > 0; }

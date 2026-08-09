@@ -1,5 +1,5 @@
 import type { ModelInputModality, ToolDefinition, ToolRequirements } from './definition.js';
-import { parseJsonObject } from '@agent-core/evidence';
+import { parseJsonObject } from '@agent-core/json';
 
 export const WORKSPACE_FILES_SCOPE = 'workspace/files';
 export const WORKSPACE_PROCESSES_SCOPE = 'workspace/processes';

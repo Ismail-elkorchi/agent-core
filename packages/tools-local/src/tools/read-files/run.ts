@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
+import { evidenceDelta, workspaceResource, type ToolEvidenceItem } from '@agent-core/evidence';
 import { requireWorkspaceRoot, throwIfAborted, workspaceFileScope, type ToolExecutionContext, type ToolObservation } from '@agent-core/tools';
 import { assertRealPathInsideRoot, relativePath, resolveInsideRoot } from '../../core/filesystem.js';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
-import { builtInReadEvidence } from '../../core/read-evidence.js';
 import type { ReadFileFailure, ReadFileResult, ReadFilesInput, ReadFilesOutput } from './schema.js';
 
 export async function readFiles(input: ReadFilesInput, context: ToolExecutionContext): Promise<ToolObservation<ReadFilesOutput>> {
@@ -42,9 +42,40 @@ export async function readFiles(input: ReadFilesInput, context: ToolExecutionCon
     kind: 'result', ok: failures.length === 0,
     summary: 'Read ' + String(files.length) + ' of ' + String(input.files.length) + ' requested files' + (coverage === 'partial' ? ' with partial coverage.' : '.'),
     scope,
-    evidence: builtInReadEvidence('read', scope, `Read ${String(files.length)} file ranges totaling ${String(returnedBytes)} bytes.`),
+    evidence: evidenceDelta(readFileEvidence(files, failures, scope)),
     output
   };
+}
+
+function readFileEvidence(files: readonly ReadFileResult[], failures: readonly ReadFileFailure[], scope: { readonly filters?: import('@agent-core/json').JsonObject; readonly limits?: import('@agent-core/json').JsonObject }): ToolEvidenceItem[] {
+  return [
+    ...files.map((file): ToolEvidenceItem => ({
+      action: 'read',
+      outcome: 'success',
+      resources: [workspaceResource(file.path, {
+        ...(file.lineCount > 0 ? { range: { kind: 'line', start: file.startLine, end: file.startLine + file.lineCount - 1 } } : {}),
+        sha256: file.rangeSha256,
+        ...(file.fullFileSha256 ? { fullSha256: file.fullFileSha256 } : {}),
+        mediaType: 'text/plain'
+      })],
+      scope: {
+        ...(scope.filters ? { filters: scope.filters } : {}),
+        coverage: 'complete', truncated: false, confidence: 'verified',
+        limits: { ...(scope.limits ?? {}), returnedBytes: file.bytes, fileBytes: file.fileBytes, eof: file.eof }
+      },
+      summary: `Read ${String(file.lineCount)} lines (${String(file.bytes)} bytes) from ${file.path}.`
+    })),
+    ...failures.map((failure): ToolEvidenceItem => ({
+      action: 'read',
+      outcome: 'failure',
+      resources: [workspaceResource(failure.path)],
+      scope: {
+        ...(scope.filters ? { filters: scope.filters } : {}), ...(scope.limits ? { limits: scope.limits } : {}),
+        coverage: 'absent', truncated: false, confidence: 'verified', omitted: { reason: failure.reason }
+      },
+      summary: `Failed to read ${failure.path}: ${failure.reason}.`
+    }))
+  ];
 }
 
 type RangeRead = { ok: true; value: ReadFileResult } | { ok: false; failure: ReadFileFailure };

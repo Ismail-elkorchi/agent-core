@@ -1115,8 +1115,8 @@ function tryCustomAccumulatorToToolCall(item: StreamingCustomToolCallAccumulator
 }
 
 function addUniqueToolCall(toolCalls: ModelToolCall[], toolCall: ModelToolCall): boolean {
-  const key = JSON.stringify(toolCall);
-  if (toolCalls.some((existing) => JSON.stringify(existing) === key)) {
+  const key = toolCallIdentity(toolCall);
+  if (toolCalls.some((existing) => toolCallIdentity(existing) === key)) {
     return false;
   }
   toolCalls.push(toolCall);
@@ -1127,13 +1127,17 @@ function dedupeToolCalls(toolCalls: ModelToolCall[]): ModelToolCall[] {
   const seen = new Set<string>();
   const result: ModelToolCall[] = [];
   for (const toolCall of toolCalls) {
-    const key = JSON.stringify(toolCall);
+    const key = toolCallIdentity(toolCall);
     if (!seen.has(key)) {
       seen.add(key);
       result.push(toolCall);
     }
   }
   return result;
+}
+
+function toolCallIdentity(toolCall: ModelToolCall): string {
+  return JSON.stringify([toolCall.id, toolCall.type, toolCall.name, toolCall.input]);
 }
 
 function normalizeUsage(usage: OpenAIUsage | undefined): ModelUsage | undefined {

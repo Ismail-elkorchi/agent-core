@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { appendFile, mkdtemp, readFile, rename, stat, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { InMemoryArtifactRepository } from '@agent-core/evidence';
 import { LocalArtifactRepository } from '@agent-core/evidence/node';
-import { readArtifactTool, viewImageTool } from '@agent-core/tools-local';
+import { DEFAULT_LOCAL_TOOL_CONFIGURATION, readArtifactTool, viewImageTool } from '@agent-core/tools-local';
 import { invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
 
 const tools = [readArtifactTool, viewImageTool];
@@ -28,12 +28,7 @@ test('read_artifact returns ranges, continuation offsets, and typed text content
 test('view_image stores image bytes and returns an image content reference without a data URL', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-image-'));
   const repository = new InMemoryArtifactRepository();
-  const png = Buffer.alloc(24);
-  Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(png, 0);
-  png.writeUInt32BE(13, 8);
-  png.write('IHDR', 12, 'ascii');
-  png.writeUInt32BE(2, 16);
-  png.writeUInt32BE(3, 20);
+  const png = pngBytes(2, 3);
   await writeFile(path.join(root, 'image.png'), png);
   const observation = await invokeToolCall(jsonToolCall('view_image', { path: 'image.png', detail: 'original' }), tools, {
     policy: { allowedRisks: ['read'] }, services: { workspaceRoot: root, artifactRepository: repository }
@@ -41,10 +36,53 @@ test('view_image stores image bytes and returns an image content reference witho
   assert.equal(observation.ok, true);
   assert.equal(observation.output.width, 2);
   assert.equal(observation.output.height, 3);
+  assert.equal(observation.output.encodedBytes, png.byteLength);
   assert.equal(observation.content[0].type, 'image');
   assert.equal(observation.content[0].detail, 'original');
   assert.equal(JSON.stringify(observation).includes('data:image'), false);
   assert.deepEqual(Buffer.from(await repository.readVerified(observation.output.artifact)), png);
+});
+
+test('view_image rejects replacement, growth, truncation, invalid headers, and excessive pixels', async () => {
+  for (const mutation of ['replacement', 'growth', 'truncation']) {
+    const root = await mkdtemp(path.join(tmpdir(), `agent-core-image-${mutation}-`));
+    const repository = new InMemoryArtifactRepository();
+    const target = path.join(root, 'image.png');
+    await writeFile(target, pngBytes(2, 3));
+    if (mutation === 'replacement') await writeFile(path.join(root, 'replacement.png'), pngBytes(4, 5));
+    let changed = false;
+    const result = await invokeToolCall(jsonToolCall('view_image', { path: 'image.png' }), tools, {
+      policy: { allowedRisks: ['read'] }, services: { workspaceRoot: root, artifactRepository: repository },
+      async emitProgress(progress) {
+        if (progress.stage !== 'image_reading' || changed) return;
+        changed = true;
+        if (mutation === 'replacement') await rename(path.join(root, 'replacement.png'), target);
+        else if (mutation === 'growth') await appendFile(target, Buffer.from([0]));
+        else await truncate(target, 10);
+      }
+    });
+    assert.equal(result.kind, 'failure', mutation);
+    assert.match(result.summary, /changed|replaced/u);
+  }
+
+  const invalidRoot = await mkdtemp(path.join(tmpdir(), 'agent-core-image-invalid-'));
+  await writeFile(path.join(invalidRoot, 'bad.png'), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+  const invalid = await invokeToolCall(jsonToolCall('view_image', { path: 'bad.png' }), tools, {
+    policy: { allowedRisks: ['read'] }, services: { workspaceRoot: invalidRoot, artifactRepository: new InMemoryArtifactRepository() }
+  });
+  assert.equal(invalid.kind, 'failure');
+  assert.match(invalid.summary, /truncated|invalid image/u);
+
+  await writeFile(path.join(invalidRoot, 'huge.png'), pngBytes(20_000, 20_000));
+  const limits = {
+    ...DEFAULT_LOCAL_TOOL_CONFIGURATION,
+    artifact: { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.artifact, maxImageWidth: 30_000, maxImageHeight: 30_000, maxImagePixels: 10_000 }
+  };
+  const huge = await invokeToolCall(jsonToolCall('view_image', { path: 'huge.png' }), tools, {
+    policy: { allowedRisks: ['read'] }, services: { workspaceRoot: invalidRoot, artifactRepository: new InMemoryArtifactRepository(), localToolConfiguration: limits }
+  });
+  assert.equal(huge.kind, 'failure');
+  assert.match(huge.summary, /dimensions exceed/u);
 });
 
 test('artifact repositories verify small ranges without breaking UTF-8 boundaries', async () => {
@@ -108,3 +146,10 @@ test('verified range cache reuses hashes only for unchanged file identity', asyn
   assert.equal(scans.length, 4, 'same-size replacement invalidates inode-based identity');
   assert.deepEqual(Buffer.from(await readFile(target)), Buffer.from(original));
 });
+
+function pngBytes(width, height) {
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
+  png.writeUInt32BE(width, 16);
+  png.writeUInt32BE(height, 20);
+  return png;
+}
