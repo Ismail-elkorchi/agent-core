@@ -77,7 +77,7 @@ test('a nonzero command exit is a negative tool result, not a tool failure', asy
   assert.equal(result.output.exitCode, 7);
 });
 
-test('stop_process force-kills descendants that ignore graceful termination', { skip: process.platform === 'win32' }, async () => {
+test('stop_process force-kills descendants that ignore graceful termination', async () => {
   const { context } = await processContext();
   const script = "console.log(process.pid); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)";
   const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`;

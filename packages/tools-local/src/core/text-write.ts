@@ -288,13 +288,16 @@ async function syncDirectories(directories: readonly string[], io: TextWriteFile
 }
 
 async function syncDirectory(directory: string, io: TextWriteFileSystem): Promise<void> {
+  // Node cannot open directory handles for fsync on Windows. File contents and
+  // manifests are still synced before their atomic rename boundaries.
+  if (process.platform === 'win32') return;
   let handle: Awaited<ReturnType<TextWriteFileSystem['open']>> | undefined;
   try {
     handle = await io.open(directory, 'r');
     await handle.sync();
   } catch (error) {
     const code = nodeCode(error) ?? '';
-    if (!['EINVAL', 'ENOTSUP', 'EBADF'].includes(code) && !(process.platform === 'win32' && code === 'EPERM')) throw error;
+    if (!['EINVAL', 'ENOTSUP', 'EBADF'].includes(code)) throw error;
   } finally {
     await handle?.close();
   }
