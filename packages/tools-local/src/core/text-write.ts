@@ -279,7 +279,9 @@ async function removeJournal(transactionDirectory: string, io: TextWriteFileSyst
 }
 
 async function syncFile(filePath: string, io: TextWriteFileSystem): Promise<void> {
-  const handle = await io.open(filePath, 'r');
+  // Windows requires a writable handle for FlushFileBuffers. This helper is
+  // used only for Agent Core-owned staged and manifest files.
+  const handle = await io.open(filePath, 'r+');
   try { await handle.sync(); } finally { await handle.close(); }
 }
 
