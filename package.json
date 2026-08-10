@@ -23,9 +23,9 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@ismail-elkorchi/terminal-ui": "github:Ismail-elkorchi/terminal-ui#13524a007c82d1fdc3951640ba2b09e9ab9d8981",
     "@types/node": "^24.13.2",
     "@types/ws": "^8.18.1",
-    "@ismail-elkorchi/terminal-ui": "github:Ismail-elkorchi/terminal-ui#64bd8def427d8b81e9de3fa673d99b6893b77d81",
     "eslint": "^10.5.0",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.61.1"

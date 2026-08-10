@@ -20,7 +20,12 @@ import type { Element, InlineContent, SearchEntry } from '@ismail-elkorchi/termi
 import { column, grid, overlay, row, viewport } from '@ismail-elkorchi/terminal-ui/layout';
 import { wrapTextCells } from '@ismail-elkorchi/terminal-ui/text';
 import { defineTui } from '@ismail-elkorchi/terminal-ui/tui';
-import type { TuiContext, TuiEventSource, TuiUpdateResult } from '@ismail-elkorchi/terminal-ui/tui';
+import type {
+  TuiContext,
+  TuiEventSource,
+  TuiInputBindingContext,
+  TuiUpdateResult
+} from '@ismail-elkorchi/terminal-ui/tui';
 import { statusChrome, hintBar } from './chrome.js';
 import { commandEffect } from './command-effects.js';
 import {
@@ -58,11 +63,20 @@ export function createAgentTuiApp(task: string, options: AgentTuiAppOptions = {}
     init: () => createInitialAgentTuiState(task, options.runtimeDetails),
     update: (state, message, context) => updateAgentTui(state, message, context, options),
     inputBindings: [
-      binding('commands', 'p', { ctrl: true }, { type: 'overlay.open', overlay: 'commands' }, state => canOpenOverlay(state)),
-      binding('search', 'f', { ctrl: true }, { type: 'overlay.open', overlay: 'search' }, state => canOpenOverlay(state)),
-      binding('help', 'f1', {}, { type: 'overlay.open', overlay: 'help' }, state => canOpenOverlay(state)),
-      binding('page-up', 'pageUp', {}, { type: 'conversation.scroll', action: { kind: 'scrollPages', rows: -1 } }, state => canScroll(state)),
-      binding('page-down', 'pageDown', {}, { type: 'conversation.scroll', action: { kind: 'scrollPages', rows: 1 } }, state => canScroll(state))
+      binding('commands', 'p', { ctrl: true }, { type: 'overlay.open', overlay: 'commands' }, ({ state }) => canOpenOverlay(state)),
+      binding('search', 'f', { ctrl: true }, { type: 'overlay.open', overlay: 'search' }, ({ state }) => canOpenOverlay(state)),
+      binding('help', 'f1', {}, { type: 'overlay.open', overlay: 'help' }, ({ state }) => canOpenOverlay(state)),
+      binding('page-up', 'pageUp', {}, { type: 'conversation.scroll', action: { kind: 'scrollPages', rows: -1 } }, ({ state }) => canScroll(state)),
+      binding('page-down', 'pageDown', {}, { type: 'conversation.scroll', action: { kind: 'scrollPages', rows: 1 } }, ({ state }) => canScroll(state)),
+      binding('composer-submit', 'enter', {}, { type: 'composer.submit' }, composerBindingEnabled),
+      binding(
+        'composer-newline-shift-enter',
+        'enter',
+        { shift: true },
+        composerNewlineMessage(),
+        composerBindingEnabled
+      ),
+      binding('composer-newline-control-o', 'o', { ctrl: true }, composerNewlineMessage(), composerBindingEnabled)
     ],
     ...(eventSource === undefined
       ? {}
@@ -264,27 +278,16 @@ function composerView(state: AgentTuiState): Element<AgentTuiMessage> {
     placeholder,
     wrap: true,
     scrollbar: { axis: 'vertical', visible: 'auto' },
-    onAction: (action): AgentTuiMessage => ({ type: 'composer.edit', action }),
-    keys: {
-      enter: (): AgentTuiMessage => ({ type: 'composer.submit' }),
-      triggers: [
-        {
-          trigger: { kind: 'key', key: 'enter', modifiers: { shift: true } },
-          onKey: (): AgentTuiMessage => ({ type: 'composer.edit', action: { kind: 'edit', operation: { kind: 'insert', text: '\n' } } })
-        },
-        {
-          trigger: { kind: 'key', key: 'o', modifiers: { ctrl: true } },
-          onKey: (): AgentTuiMessage => ({ type: 'composer.edit', action: { kind: 'edit', operation: { kind: 'insert', text: '\n' } } })
-        }
-      ]
-    }
+    onAction: (
+      action: Extract<AgentTuiMessage, { type: 'composer.edit' }>['action']
+    ): AgentTuiMessage => ({ type: 'composer.edit', action })
   });
 }
 
 function conversationView(state: AgentTuiState, context: TuiContext): Element<AgentTuiMessage> {
   const layout = conversationLayout(state, context);
   if (layout.items.length === 0) {
-    return viewport(text('Start with a message.', { id: 'conversation-empty', textRole: 'caption' }), {
+    return viewport(text({ content: 'Start with a message.', id: 'conversation-empty', textRole: 'caption' }), {
       id: 'conversation',
       offset: { row: 0 },
       onScroll: (event): AgentTuiMessage => ({ type: 'conversation.scroll', action: event.action })
@@ -299,7 +302,7 @@ function conversationView(state: AgentTuiState, context: TuiContext): Element<Ag
   const sizes: { readonly kind: 'fixed'; readonly cells: number }[] = [];
   const firstStart = window.entries[0]?.startRowIndex ?? 0;
   if (firstStart > 0) {
-    children.push(text('', { id: 'conversation-before' }));
+    children.push(text({ content: '', id: 'conversation-before' }));
     sizes.push({ kind: 'fixed', cells: firstStart });
   }
   for (const entry of window.entries) {
@@ -308,7 +311,7 @@ function conversationView(state: AgentTuiState, context: TuiContext): Element<Ag
   }
   const lastEnd = window.entries.at(-1)?.endRowIndexExclusive ?? 0;
   if (lastEnd < window.totalRows) {
-    children.push(text('', { id: 'conversation-after' }));
+    children.push(text({ content: '', id: 'conversation-after' }));
     sizes.push({ kind: 'fixed', cells: window.totalRows - lastEnd });
   }
   return viewport(column(children, { id: 'conversation-window', sizes }), {
@@ -321,16 +324,16 @@ function conversationView(state: AgentTuiState, context: TuiContext): Element<Ag
 
 function conversationEntryView(entry: AgentTuiConversationEntry, state: AgentTuiState): Element<AgentTuiMessage> {
   if (entry.kind === 'activity' && entry.details !== undefined) {
-    return disclosure(
-      richText({ id: `${entry.id}:details`, segments: body(entry.details), wrap: true }),
-      {
-        id: entry.id,
-        label: activityLabel(entry),
-        ...(entry.summary === undefined ? {} : { summary: body(entry.summary) }),
-        expanded: state.conversation.expandedIds.includes(entry.id),
-        onAction: (): AgentTuiMessage => ({ type: 'activity.toggle', id: entry.id })
-      }
-    );
+    return disclosure({
+      id: entry.id,
+      label: activityLabel(entry),
+      ...(entry.summary === undefined ? {} : { summary: body(entry.summary) }),
+      expanded: state.conversation.expandedIds.includes(entry.id),
+      slots: {
+        content: richText({ id: `${entry.id}:details`, segments: body(entry.details), wrap: true })
+      },
+      onAction: (): AgentTuiMessage => ({ type: 'activity.toggle', id: entry.id })
+    });
   }
   return richText({ id: entry.id, segments: conversationSegments(entry), wrap: true });
 }
@@ -340,71 +343,91 @@ function overlayView(state: AgentTuiState, context: TuiContext): Element<AgentTu
   const height = Math.max(8, Math.min(20, context.terminalSize.rows - 4));
   switch (state.overlay.kind) {
     case 'none': return undefined;
-    case 'commands': return dialog(searchPicker({
-      id: 'command-picker',
-      title: 'Commands',
-      query: state.overlay.picker.query,
-      searchPickerIndex: COMMAND_INDEX,
-      ...(state.overlay.picker.selectedId === undefined ? {} : { selectedId: state.overlay.picker.selectedId }),
-      maxVisible: Math.max(3, height - 5),
-      helpText: 'Enter choose · Esc close',
-      onAction: (action): AgentTuiMessage => ({ type: 'commands.action', action })
-    }), modalOptions('commands-dialog', 'Commands', 'command-picker', width, height));
-    case 'search': return dialog(searchPicker({
-      id: 'conversation-search',
-      title: 'Find in conversation',
-      query: state.overlay.picker.query,
-      searchPickerIndex: conversationSearchIndex(state),
-      ...(state.overlay.picker.selectedId === undefined ? {} : { selectedId: state.overlay.picker.selectedId }),
-      maxVisible: Math.max(3, height - 5),
-      emptyText: 'No matching messages',
-      helpText: 'Enter jump · Esc close',
-      onAction: (action): AgentTuiMessage => ({ type: 'search.action', action })
-    }), modalOptions('search-dialog', 'Find', 'conversation-search', width, height));
-    case 'help': return dialog(richText({
-      id: 'help-content',
-      segments: body([
-        'Enter             Send message',
-        'Shift+Enter       Insert newline (enhanced terminals)',
-        'Ctrl+O            Insert newline',
-        'Ctrl+P            Commands',
-        'Ctrl+F            Find in conversation',
-        'PageUp/PageDown   Scroll conversation',
-        'F1                Help',
-        'Escape            Close'
-      ].join('\n')),
-      wrap: true
-    }), modalOptions('help-dialog', 'Keyboard shortcuts', 'help-content', width, 13));
-    case 'debug': return dialog(modalViewport(
-      richText({ id: 'debug-details', segments: body(state.overlay.text), wrap: true }),
-      state,
-      'debug-content'
-    ), modalOptions('debug-dialog', 'Runtime details', 'debug-content', width, height));
+    case 'commands': return dialog({
+      ...modalOptions('commands-dialog', 'Commands', 'command-picker', width, height),
+      slots: {
+        content: searchPicker({
+          id: 'command-picker',
+          title: 'Commands',
+          query: state.overlay.picker.query,
+          searchPickerIndex: COMMAND_INDEX,
+          ...(state.overlay.picker.selectedId === undefined ? {} : { selectedId: state.overlay.picker.selectedId }),
+          maxVisible: Math.max(3, height - 5),
+          helpText: 'Enter choose · Esc close',
+          onAction: (action): AgentTuiMessage => ({ type: 'commands.action', action })
+        })
+      }
+    });
+    case 'search': return dialog({
+      ...modalOptions('search-dialog', 'Find', 'conversation-search', width, height),
+      slots: {
+        content: searchPicker({
+          id: 'conversation-search',
+          title: 'Find in conversation',
+          query: state.overlay.picker.query,
+          searchPickerIndex: conversationSearchIndex(state),
+          ...(state.overlay.picker.selectedId === undefined ? {} : { selectedId: state.overlay.picker.selectedId }),
+          maxVisible: Math.max(3, height - 5),
+          emptyText: 'No matching messages',
+          helpText: 'Enter jump · Esc close',
+          onAction: (action): AgentTuiMessage => ({ type: 'search.action', action })
+        })
+      }
+    });
+    case 'help': return dialog({
+      ...modalOptions('help-dialog', 'Keyboard shortcuts', 'help-content', width, 13),
+      slots: {
+        content: richText({
+          id: 'help-content',
+          segments: body([
+            'Enter             Send message',
+            'Shift+Enter       Insert newline (enhanced terminals)',
+            'Ctrl+O            Insert newline',
+            'Ctrl+P            Commands',
+            'Ctrl+F            Find in conversation',
+            'PageUp/PageDown   Scroll conversation',
+            'F1                Help',
+            'Escape            Close'
+          ].join('\n')),
+          wrap: true
+        })
+      }
+    });
+    case 'debug': return dialog({
+      ...modalOptions('debug-dialog', 'Runtime details', 'debug-content', width, height),
+      slots: {
+        content: modalViewport(
+          richText({ id: 'debug-details', segments: body(state.overlay.text), wrap: true }),
+          state,
+          'debug-content'
+        )
+      }
+    });
   }
 }
 
 function approvalDialog(state: AgentTuiState, context: TuiContext): Element<AgentTuiMessage> {
-  if (state.run.kind !== 'waiting_for_approval') return text('');
+  if (state.run.kind !== 'waiting_for_approval') return text({ content: '' });
   const suspension = state.run.suspension;
   const approval = suspension.pendingApprovals[0];
   const width = Math.max(36, Math.min(88, context.terminalSize.columns - 4));
   const bodyElement = approval === undefined
     ? richText({ id: 'approval-missing', segments: errorText('The runtime suspended without an approval request.'), wrap: true })
     : approvalContent(approval, suspension.pendingApprovals.length, state);
-  return dialog(modalViewport(bodyElement, state, 'approval-content-scroll'), {
+  return dialog({
     id: 'approval-dialog',
     title: 'Approval required',
     modal: true,
     focusPolicy: { initialFocus: { kind: 'element', elementId: 'approval-deny' }, returnFocus: 'restore' },
-    dismissal: {
-      escape: true,
-      outsidePress: false,
-      onDismiss: (): AgentTuiMessage => ({ type: 'approval.decide', decision: 'deny' })
+    dismissal: { escape: true, outsidePress: false },
+    onAction: (): AgentTuiMessage => ({ type: 'approval.decide', decision: 'deny' }),
+    slots: {
+      content: modalViewport(bodyElement, state, 'approval-content-scroll'),
+      actions: row([
+        button({ id: 'approval-deny', label: 'Deny', tone: 'destructive', onAction: (): AgentTuiMessage => ({ type: 'approval.decide', decision: 'deny' }) }),
+        button({ id: 'approval-allow', label: 'Allow once', tone: 'primary', onAction: (): AgentTuiMessage => ({ type: 'approval.decide', decision: 'allow' }) })
+      ], { id: 'approval-actions', gap: 2 })
     },
-    actions: row([
-      button({ id: 'approval-deny', label: 'Deny', tone: 'destructive', onPress: (): AgentTuiMessage => ({ type: 'approval.decide', decision: 'deny' }) }),
-      button({ id: 'approval-allow', label: 'Allow once', tone: 'primary', onPress: (): AgentTuiMessage => ({ type: 'approval.decide', decision: 'allow' }) })
-    ], { id: 'approval-actions', gap: 2 }),
     width,
     height: Math.max(12, Math.min(18, context.terminalSize.rows - 4)),
     padding: 1
@@ -438,15 +461,15 @@ function approvalContent(
   const details = JSON.stringify({ input: approval.input, effects: approval.effects }, null, 2);
   return column([
     richText({ id: 'approval-summary', segments: body(summary), wrap: true }),
-    disclosure(
-      richText({ id: 'approval-raw', segments: body(details), wrap: true }),
-      {
-        id: 'approval-details',
-        label: 'Exact input and effects',
-        expanded: state.conversation.expandedIds.includes('approval-details'),
-        onAction: (): AgentTuiMessage => ({ type: 'activity.toggle', id: 'approval-details' })
-      }
-    )
+    disclosure({
+      id: 'approval-details',
+      label: 'Exact input and effects',
+      expanded: state.conversation.expandedIds.includes('approval-details'),
+      slots: {
+        content: richText({ id: 'approval-raw', segments: body(details), wrap: true })
+      },
+      onAction: (): AgentTuiMessage => ({ type: 'activity.toggle', id: 'approval-details' })
+    })
   ], { id: 'approval-content', gap: 1 });
 }
 
@@ -600,10 +623,10 @@ function modalOptions(id: string, title: string, focusId: string, width: number,
     modal: true as const,
     focusPolicy: { initialFocus: { kind: 'element' as const, elementId: focusId }, returnFocus: 'restore' as const },
     dismissal: {
-      escape: true,
-      outsidePress: false,
-      onDismiss: (): AgentTuiMessage => ({ type: 'overlay.close' })
+      escape: true as const,
+      outsidePress: false as const
     },
+    onAction: (): AgentTuiMessage => ({ type: 'overlay.close' }),
     width,
     height,
     padding: 1
@@ -612,17 +635,30 @@ function modalOptions(id: string, title: string, focusId: string, width: number,
 
 function binding(
   id: string,
-  key: 'p' | 'f' | 'f1' | 'pageUp' | 'pageDown',
-  modifiers: { readonly ctrl?: boolean },
+  key: 'p' | 'f' | 'f1' | 'pageUp' | 'pageDown' | 'enter' | 'o',
+  modifiers: { readonly ctrl?: boolean; readonly shift?: boolean },
   message: AgentTuiMessage,
-  enabled: (state: AgentTuiState) => boolean
+  enabled: (context: TuiInputBindingContext<AgentTuiState>) => boolean
 ) {
   return {
     id,
     triggers: [{ kind: 'key' as const, key, modifiers }],
     phase: 'beforeFocus' as const,
     message,
-    enabled: ({ state }: { readonly state: AgentTuiState }) => enabled(state)
+    enabled
+  };
+}
+
+function composerBindingEnabled({ state, focusPath }: TuiInputBindingContext<AgentTuiState>): boolean {
+  return state.overlay.kind === 'none'
+    && state.run.kind !== 'waiting_for_approval'
+    && focusPath?.includes('composer') === true;
+}
+
+function composerNewlineMessage(): AgentTuiMessage {
+  return {
+    type: 'composer.edit',
+    action: { kind: 'edit', operation: { kind: 'insert', text: '\n' } }
   };
 }
 
