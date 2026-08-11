@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
-import type { EventActor, EventEnvelope, LedgerIntegrityReport, TypedEvent } from './ledger.js';
+import type { EventActor, EventAppendReceipt, EventEnvelope, LedgerIntegrityReport, TypedEvent } from './ledger.js';
 import { hashJson, canonicalJsonString } from './ledger.js';
 import {
   PersistenceConflictError,
@@ -62,10 +62,9 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     return Object.freeze({ fullScans: this.fullScans, incrementalRefreshes: this.incrementalRefreshes });
   }
 
-  append(runId: string, event: TEvent, options: EventAppendOptions = {}): Promise<EventEnvelope<TEvent>> {
+  append(runId: string, event: TEvent, options: EventAppendOptions = {}): Promise<EventAppendReceipt> {
     return this.enqueue(runId, async () => withPersistenceFileLock(this.filePath(runId), this.lockTimeoutMs, this.staleLockMs, async () => {
-      const encoding = this.codec.encode(event);
-      const encodedEvent = encoding.json;
+      const encodedEvent = this.codec.encode(event);
       await this.ensureHeader(runId);
       const index = await this.refreshIndex(runId, true);
       const records = index.records;
@@ -75,7 +74,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
           if (canonicalJsonString(existing.event) !== canonicalJsonString(encodedEvent)) {
             throw new PersistenceConflictError(`Idempotency key ${options.idempotencyKey} already identifies a different event.`);
           }
-          return domainEnvelope(existing, encoding.value);
+          return receiptFromEncoded(existing);
         }
       }
       const previous = records.at(-1);
@@ -98,7 +97,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       index.completeBytes += Buffer.byteLength(`${canonicalJsonString(encodedEnvelope)}\n`, 'utf8');
       index.boundaryMarker = await jsonlBoundaryMarker(this.filePath(runId), index.completeBytes);
       index.storageStamp = await jsonlStorageStamp(this.filePath(runId));
-      return domainEnvelope(encodedEnvelope, encoding.value);
+      return receiptFromEncoded(encodedEnvelope);
     }));
   }
 
@@ -302,6 +301,15 @@ function domainEnvelope<TEvent extends TypedEvent>(encoded: EncodedEnvelope, eve
     ...(encoded.causationId === undefined ? {} : { causationId: encoded.causationId }), ...(encoded.correlationId === undefined ? {} : { correlationId: encoded.correlationId }),
     ...(encoded.idempotencyKey === undefined ? {} : { idempotencyKey: encoded.idempotencyKey }), ...(encoded.previousHash === undefined ? {} : { previousHash: encoded.previousHash }),
     hash: encoded.hash, event
+  });
+}
+
+function receiptFromEncoded(encoded: EncodedEnvelope): EventAppendReceipt {
+  return Object.freeze({
+    eventId: encoded.eventId, runId: encoded.runId, sequence: encoded.sequence, timestamp: encoded.timestamp,
+    schemaVersion: encoded.schemaVersion, actor: encoded.actor, hash: encoded.hash,
+    ...(encoded.causationId ? { causationId: encoded.causationId } : {}), ...(encoded.correlationId ? { correlationId: encoded.correlationId } : {}),
+    ...(encoded.idempotencyKey ? { idempotencyKey: encoded.idempotencyKey } : {}), ...(encoded.previousHash ? { previousHash: encoded.previousHash } : {})
   });
 }
 

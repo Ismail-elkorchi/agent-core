@@ -11,7 +11,9 @@ import { parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/jso
 import { SimpleTokenEstimator, type ModelImage, type TokenEstimator } from '@agent-core/model';
 import {
   parseToolObservation,
-  normalizeToolObservationForPersistence,
+  decodeOwnedToolObservationForPersistence,
+  encodeToolObservation,
+  updateToolObservation,
   type ToolCall,
   type ToolDefinition,
   type ToolObservationPresentation,
@@ -103,7 +105,7 @@ export class ObservationStore {
       }
     }
     const durableBase = durableStorageDegraded
-      ? normalizeToolObservationForPersistence({ ...redactedDurable, metadata: {
+      ? updateToolObservation(redactedDurable, { metadata: {
         ...(redactedDurable.metadata ?? {}), durableStorage: { status: 'degraded', message: durableStorageDegraded.message }
       } })
       : redactedDurable;
@@ -176,9 +178,10 @@ export async function transformToolObservationForDurability(
   observation: ToolObservation,
   options: { readonly artifacts?: ArtifactRepository; readonly retainUnredacted?: boolean } = {}
 ): Promise<ToolObservation> {
-  const canonical = normalizeToolObservationForPersistence(observation);
-  const redacted = redactJson(parseJsonValue(canonical, CANONICAL_JSON_LIMITS), CANONICAL_JSON_LIMITS);
-  let durable = normalizeToolObservationForPersistence(redacted.value);
+  const canonical = observation;
+  const redacted = redactJson(encodeToolObservation(canonical));
+  if (!isJsonObject(redacted.value)) throw new Error('Redacted tool observation is invalid.');
+  let durable = decodeOwnedToolObservationForPersistence(redacted.value);
   if (redacted.redactions > 0 && options.retainUnredacted && options.artifacts) {
     const protectedArtifact = await options.artifacts.storeProtected({
       label: 'protected-tool-observation',
@@ -186,12 +189,9 @@ export async function transformToolObservationForDurability(
       mediaType: 'application/json; charset=utf-8',
       description: 'Protected unredacted tool observation.'
     });
-    durable = normalizeToolObservationForPersistence({
-      ...durable,
-      metadata: { ...(durable.metadata ?? {}), redactions: redacted.redactions, protectedArtifact }
-    });
+    durable = updateToolObservation(durable, { metadata: { ...(durable.metadata ?? {}), redactions: redacted.redactions, protectedArtifact } });
   } else if (redacted.redactions > 0) {
-    durable = normalizeToolObservationForPersistence({ ...durable, metadata: { ...(durable.metadata ?? {}), redactions: redacted.redactions } });
+    durable = updateToolObservation(durable, { metadata: { ...(durable.metadata ?? {}), redactions: redacted.redactions } });
   }
   return durable;
 }
@@ -200,19 +200,9 @@ function boundedDurableObservation(observation: ToolObservation, artifact: Publi
   const content = [...(observation.content ?? []), ...(artifact ? [{ type: 'artifact' as const, artifact }] : [])];
   const metadata = { ...(observation.metadata ?? {}), durableObservation: { originalBytes, storedAsArtifact: artifact !== undefined, ...(artifact ? { artifact } : {}) } };
   if (observation.kind === 'failure') {
-    return normalizeToolObservationForPersistence({
-      ...observation,
-      ...(content.length ? { content } : {}),
-      metadata,
-      output: boundedFailureOutput(observation.output, artifact, originalBytes)
-    });
+    return updateToolObservation(observation, { ...(content.length ? { content } : {}), metadata, output: boundedFailureOutput(observation.output, artifact, originalBytes) });
   }
-  return normalizeToolObservationForPersistence({
-    ...observation,
-    ...(content.length ? { content } : {}),
-    metadata,
-    output: preserveImportantResultFields(observation.output, artifact, originalBytes)
-  });
+  return updateToolObservation(observation, { ...(content.length ? { content } : {}), metadata, output: preserveImportantResultFields(observation.output, artifact, originalBytes) });
 }
 
 function boundedFailureOutput(output: import('@agent-core/tools').ToolFailureOutput, artifact: ArtifactRef | undefined, originalBytes: number): JsonValue {
@@ -220,13 +210,13 @@ function boundedFailureOutput(output: import('@agent-core/tools').ToolFailureOut
   const common = { blocked: true as const, reason: output.reason, recovery: output.recovery };
   if (output.reason === 'unknown_tool') return parseJsonValue({ ...common, toolCall: output.toolCall });
   if (output.reason === 'policy') return parseJsonValue({ ...common, ...(output.tool ? { tool: output.tool } : {}), ...(output.policyReason ? { policyReason: output.policyReason } : {}), details: storage });
-  if (output.reason === 'invalid_arguments') return parseJsonValue({ ...common, ...(boundedFailureField(output.issues) ? { issues: boundedFailureField(output.issues) } : {}), details: storage });
+  if (output.reason === 'invalid_arguments') { const issues = boundedFailureField(output.issues); return parseJsonValue({ ...common, ...(issues ? { issues } : {}), details: storage }); }
   if (output.reason === 'invalid_output') return parseJsonValue({
     ...common,
     issues: boundedFailureField(output.issues) ?? { issues: [{ path: [], code: 'details_stored_as_artifact', message: 'Full validation issues are in the canonical observation artifact.' }] },
     details: storage
   });
-  if (output.reason === 'missing_service') return parseJsonValue({ ...common, service: output.service, ...(boundedFailureField(output.details) ? { serviceDetails: boundedFailureField(output.details) } : {}), details: storage });
+  if (output.reason === 'missing_service') { const serviceDetails = boundedFailureField(output.details); return parseJsonValue({ ...common, service: output.service, details: { ...storage, ...(serviceDetails ? { serviceDetails } : {}) } }); }
   return parseJsonValue({ ...common, error: output.error, details: storage });
 }
 
@@ -243,10 +233,8 @@ export function filterToolResultContentForModel(observation: ToolObservation, mo
   const content = observation.content.map((item) => item.type === 'image'
     ? Object.freeze({ type: 'artifact' as const, artifact: item.artifact })
     : item);
-  return normalizeToolObservationForPersistence({
-    ...observation,
-    summary: `${observation.summary} ${String(hiddenImages.length)} image${hiddenImages.length === 1 ? '' : 's'} exist as public artifacts but were not attached because the active model does not support image input.`,
-    content,
+  return updateToolObservation(observation, {
+    summary: `${observation.summary} ${String(hiddenImages.length)} image${hiddenImages.length === 1 ? '' : 's'} exist as public artifacts but were not attached because the active model does not support image input.`, content,
     metadata: {
       ...(observation.metadata ?? {}),
       modelContentFilter: {
@@ -257,8 +245,7 @@ export function filterToolResultContentForModel(observation: ToolObservation, mo
   });
 }
 
-function preserveImportantResultFields(output: unknown, artifact: ArtifactRef | undefined, originalBytes: number): JsonValue {
-  const value = parseJsonValue(output, CANONICAL_JSON_LIMITS);
+function preserveImportantResultFields(value: JsonValue, artifact: ArtifactRef | undefined, originalBytes: number): JsonValue {
   const durable: Record<string, JsonValue> = { truncatedForPersistence: true, originalBytes, ...(artifact ? { artifact: { ...artifact } } : {}) };
   if (isJsonObject(value)) {
     const important = /^(status|reason|processId|exitCode|signal|count|total|path|file|files|matches|changed|created|deleted|renamed|cursor|nextCursor|fileBytes|observedBytes|retainedBytes|omittedBytes)$/u;
@@ -318,7 +305,7 @@ function invalidPresenterPresentation(toolName: string, issues: readonly { reado
 }
 
 function redactToolObservationPresentation(presentation: ToolObservationPresentation): ToolObservationPresentation {
-  const redacted = redactJson(presentation);
+  const redacted = redactJson(parseJsonValue(presentation));
   const validated = validateToolObservationPresentation(redacted.value);
   const result = validated.ok ? validated.presentation : invalidPresenterPresentation('redaction', validated.issues);
   if (redacted.redactions === 0) return result;

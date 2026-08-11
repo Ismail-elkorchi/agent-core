@@ -8,13 +8,13 @@ import {
   SimpleTokenEstimator,
   type TokenEstimator
 } from '@agent-core/model';
-import type { EvidenceRecord, PublicArtifactRef } from '@agent-core/evidence';
-import type { JsonObject } from '@agent-core/json';
+import { createEvidenceRecord, type EvidenceRecord, type PublicArtifactRef } from '@agent-core/evidence';
+import { parseJsonObject, type JsonObject } from '@agent-core/json';
 
 export interface ContextRange {
-  kind: 'line' | 'byte';
-  start?: number;
-  end?: number;
+  readonly kind: 'line' | 'byte';
+  readonly start?: number;
+  readonly end?: number;
 }
 
 export type ContextSourceKind = 'user' | 'external' | 'session' | 'tool-observation' | 'generated';
@@ -22,18 +22,18 @@ export type ContextConfidence = 'unverified' | 'verified';
 export type ContextRepresentation = 'full' | 'excerpt' | 'summary';
 
 export interface ContextItem {
-  id: string;
-  sourceUri: string;
-  sourceKind: ContextSourceKind;
-  confidence?: ContextConfidence;
-  representation: ContextRepresentation;
-  mediaType: string;
-  title: string;
-  content: string;
-  range?: ContextRange;
-  tokenEstimate: number;
-  selectionReason: string;
-  score: number;
+  readonly id: string;
+  readonly sourceUri: string;
+  readonly sourceKind: ContextSourceKind;
+  readonly confidence?: ContextConfidence;
+  readonly representation: ContextRepresentation;
+  readonly mediaType: string;
+  readonly title: string;
+  readonly content: string;
+  readonly range?: ContextRange;
+  readonly tokenEstimate: number;
+  readonly selectionReason: string;
+  readonly score: number;
 }
 
 export type ContextItemInput = Omit<ContextItem, 'id' | 'tokenEstimate'> & {
@@ -42,30 +42,30 @@ export type ContextItemInput = Omit<ContextItem, 'id' | 'tokenEstimate'> & {
 };
 
 export interface ContextOmission {
-  reason: string;
-  sourceUri?: string;
+  readonly reason: string;
+  readonly sourceUri?: string;
 }
 
 export interface ContextBundle {
-  items: ContextItem[];
-  totalTokens: number;
-  omitted: ContextOmission[];
+  readonly items: readonly ContextItem[];
+  readonly totalTokens: number;
+  readonly omitted: readonly ContextOmission[];
 }
 
 export interface PromptInstructionBlock {
-  id: string;
-  role: 'system' | 'developer' | 'workspace' | 'user';
-  content: string;
-  sourceUri?: string;
-  priority: number;
+  readonly id: string;
+  readonly role: 'system' | 'developer' | 'workspace' | 'user';
+  readonly content: string;
+  readonly sourceUri?: string;
+  readonly priority: number;
 }
 
 export interface PromptToolSummary {
-  name: string;
-  description: string;
-  inputFormat: string;
-  accessModes: string[];
-  promptGuide?: string;
+  readonly name: string;
+  readonly description: string;
+  readonly inputFormat: string;
+  readonly accessModes: readonly string[];
+  readonly promptGuide?: string;
 }
 
 export interface PromptOutputContract {
@@ -74,11 +74,11 @@ export interface PromptOutputContract {
 }
 
 export interface PromptEvidenceProjection {
-  records: EvidenceRecord[];
-  omittedRecords: number;
-  omittedSummary?: PromptEvidenceOmissionSummary[];
-  tokenEstimate: number;
-  coverage: 'complete' | 'partial';
+  readonly records: readonly EvidenceRecord[];
+  readonly omittedRecords: number;
+  readonly omittedSummary?: readonly PromptEvidenceOmissionSummary[];
+  readonly tokenEstimate: number;
+  readonly coverage: 'complete' | 'partial';
 }
 
 export interface PromptEvidenceOmissionSummary {
@@ -89,30 +89,30 @@ export interface PromptEvidenceOmissionSummary {
 }
 
 export interface PromptProjection {
-  id: string;
-  task: string;
-  instructions: PromptInstructionBlock[];
-  notes: string[];
-  context: ContextItem[];
-  tools: PromptToolSummary[];
-  continuity: string[];
-  evidence?: PromptEvidenceProjection;
-  outputContract?: PromptOutputContract;
-  metadata?: Record<string, string>;
+  readonly id: string;
+  readonly task: string;
+  readonly instructions: readonly PromptInstructionBlock[];
+  readonly notes: readonly string[];
+  context: readonly ContextItem[];
+  readonly tools: readonly PromptToolSummary[];
+  readonly continuity: readonly string[];
+  readonly evidence?: PromptEvidenceProjection;
+  readonly outputContract?: PromptOutputContract;
+  readonly metadata?: Readonly<Record<string, string>>;
 }
 
 export interface ContextProjection {
-  prompt: PromptProjection;
-  contextHistoryMessages: ModelMessage[];
-  context: ContextBundle;
-  reductions: ContextHistoryReduction[];
-  estimate: ContextProjectionEstimate;
+  readonly prompt: PromptProjection;
+  readonly contextHistoryMessages: readonly ModelMessage[];
+  readonly context: ContextBundle;
+  readonly reductions: readonly ContextHistoryReduction[];
+  readonly estimate: ContextProjectionEstimate;
 }
 
 export interface ContextHistoryProjection {
-  messages: ModelMessage[];
-  estimatedTokens: number;
-  reductions: ContextHistoryReduction[];
+  readonly messages: readonly ModelMessage[];
+  readonly estimatedTokens: number;
+  readonly reductions: readonly ContextHistoryReduction[];
 }
 
 export interface ContextImageLimits {
@@ -139,22 +139,22 @@ export interface ContextProjectionEstimate {
 }
 
 export interface ContextProjectionRequest {
-  task: string;
-  instructions: PromptInstructionBlock[];
-  notes?: string[];
-  contextItems?: ContextItemInput[];
-  tools: PromptToolSummary[];
-  modelProfile: ModelProfile;
-  modelTools: ModelTool[];
-  requestWindow: {
-    maxPromptTokens: number;
-    maxOutputTokens: number;
-    contextWindowTokens: number;
+  readonly task: string;
+  readonly instructions: readonly PromptInstructionBlock[];
+  readonly notes?: readonly string[];
+  readonly contextItems?: readonly ContextItemInput[];
+  readonly tools: readonly PromptToolSummary[];
+  readonly modelProfile: ModelProfile;
+  readonly modelTools: readonly ModelTool[];
+  readonly requestWindow: {
+    readonly maxPromptTokens: number;
+    readonly maxOutputTokens: number;
+    readonly contextWindowTokens: number;
   };
-  contextTokenBudget?: number;
-  evidenceTokenBudget?: number;
-  maxContextItems?: number;
-  metadata?: Record<string, string>;
+  readonly contextTokenBudget?: number;
+  readonly evidenceTokenBudget?: number;
+  readonly maxContextItems?: number;
+  readonly metadata?: Readonly<Record<string, string>>;
 }
 
 export interface ContextHistoryReduction {
@@ -256,7 +256,7 @@ export class ContextManager {
       message: {
         role: 'assistant',
         content: input.content,
-        toolCalls: input.toolCalls.map((call) => ({ ...call }))
+        toolCalls: Object.freeze(input.toolCalls.map(snapshotModelToolCall))
       }
     });
   }
@@ -274,7 +274,7 @@ export class ContextManager {
       toolCallType: input.toolCallType,
       immediateMessage: toolResultMessage(input, 'immediate'),
       retainedMessage: toolResultMessage(input, 'retained'),
-      imageArtifacts: Object.freeze([...(input.imageArtifacts ?? [])]),
+      imageArtifacts: Object.freeze((input.imageArtifacts ?? []).map((artifact) => Object.freeze({ ...artifact }))),
       useRetained: input.useRetained ?? false
     };
     if (input.callId) {
@@ -284,7 +284,7 @@ export class ContextManager {
     this.evidenceRecords.push(...compactEvidenceRecords(input.evidence ?? []));
   }
 
-  recordEvidence(records: EvidenceRecord[]): void {
+  recordEvidence(records: readonly EvidenceRecord[]): void {
     this.evidenceRecords.push(...compactEvidenceRecords(records));
   }
 
@@ -307,11 +307,11 @@ export class ContextManager {
   projectHistory(modelProfile: ModelProfile): ContextHistoryProjection {
     const projected = projectImagesForProfile(this.contextHistoryEntries(), modelProfile, this.imageLimits, this.estimator);
     const messages = normalizeToolProtocolMessages(projected.messages);
-    return {
-      messages,
+    return Object.freeze({
+      messages: Object.freeze(messages),
       estimatedTokens: this.estimator.estimateMessages(messages),
-      reductions: projected.reductions
-    };
+      reductions: Object.freeze(projected.reductions)
+    });
   }
 
   reduceHistoryForPromptPressure(input: {
@@ -343,7 +343,7 @@ export class ContextManager {
   project(request: ContextProjectionRequest): ContextProjection {
     const contextHistory = this.projectHistory(request.modelProfile);
     const contextBudget = Math.max(0, request.contextTokenBudget ?? request.requestWindow.maxPromptTokens);
-    const selectInput: { items: ContextItemInput[]; maxTokens: number; maxItems?: number } = {
+    const selectInput: { items: readonly ContextItemInput[]; maxTokens: number; maxItems?: number } = {
       items: request.contextItems ?? [],
       maxTokens: contextBudget
     };
@@ -352,38 +352,38 @@ export class ContextManager {
     }
     const context = this.selectContext(selectInput);
     const evidence = this.projectEvidence(request.evidenceTokenBudget ?? Math.min(1_600, Math.floor(request.requestWindow.maxPromptTokens * 0.08)));
-    const projection: PromptProjection = {
+    const projection: PromptProjection = Object.freeze({
       id: `prompt_${randomUUID()}`,
       task: request.task,
-      instructions: request.instructions,
-      notes: request.notes ?? [],
+      instructions: Object.freeze(request.instructions.map((instruction) => Object.freeze({ ...instruction }))),
+      notes: Object.freeze([...(request.notes ?? [])]),
       context: context.items,
-      tools: request.tools,
-      continuity: checkpointMessages(this.historyItems),
+      tools: Object.freeze(request.tools.map((tool) => Object.freeze({ ...tool, accessModes: Object.freeze([...tool.accessModes]) }))),
+      continuity: Object.freeze(checkpointMessages(this.historyItems)),
       ...(evidence.records.length > 0 || evidence.omittedSummary?.length ? { evidence } : {}),
-      ...(request.metadata ? { metadata: request.metadata } : {})
-    };
-    return {
+      ...(request.metadata ? { metadata: Object.freeze({ ...request.metadata }) } : {})
+    });
+    return Object.freeze({
       prompt: projection,
-      contextHistoryMessages: contextHistory.messages,
+      contextHistoryMessages: Object.freeze([...contextHistory.messages]),
       context,
-      reductions: [...this.consumeProjectionReductions(), ...contextHistory.reductions],
-      estimate: {
+      reductions: Object.freeze([...this.consumeProjectionReductions(), ...contextHistory.reductions]),
+      estimate: Object.freeze({
         contextHistoryTokens: contextHistory.estimatedTokens,
         contextTokens: context.totalTokens,
         evidenceTokens: evidence.tokenEstimate
-      }
-    };
+      })
+    });
   }
 
   projectEvidence(maxTokens: number): PromptEvidenceProjection {
     if (maxTokens <= 0 || this.evidenceRecords.length === 0) {
-      return {
-        records: [],
+      return Object.freeze({
+        records: Object.freeze([]),
         omittedRecords: this.evidenceRecords.length,
         tokenEstimate: 0,
         coverage: this.evidenceRecords.length > 0 ? 'partial' : 'complete'
-      };
+      });
     }
 
     const selected: { record: EvidenceRecord; tokens: number }[] = [];
@@ -416,13 +416,13 @@ export class ContextManager {
       omittedSummary = fitOmittedSummary(omitted, maxTokens - tokenEstimate, this.estimator);
     }
     tokenEstimate += omittedSummary.tokens;
-    return {
-      records: selected.map((item) => item.record),
+    return Object.freeze({
+      records: Object.freeze(selected.map((item) => item.record)),
       omittedRecords,
-      ...(omittedSummary.summary.length > 0 ? { omittedSummary: omittedSummary.summary } : {}),
+      ...(omittedSummary.summary.length > 0 ? { omittedSummary: Object.freeze(omittedSummary.summary) } : {}),
       tokenEstimate,
       coverage: omittedRecords > 0 ? 'partial' : 'complete'
-    };
+    });
   }
 
   evidenceRecordCount(): number {
@@ -433,7 +433,7 @@ export class ContextManager {
     return Object.freeze([...this.evidenceRecords]);
   }
 
-  selectContext(input: { items: ContextItemInput[]; maxTokens: number; maxItems?: number; omitted?: ContextOmission[] }): ContextBundle {
+  selectContext(input: { items: readonly ContextItemInput[]; maxTokens: number; maxItems?: number; omitted?: readonly ContextOmission[] }): ContextBundle {
     const candidates = input.items.map((item) => this.materializeContextItem(item));
     const omitted = [...(input.omitted ?? [])];
     return selectContextItems(candidates, input.maxTokens, input.maxItems ?? 24, omitted);
@@ -527,17 +527,13 @@ export class ContextManager {
     return this.historyItems.length;
   }
 
-  rawItems(): readonly ContextHistoryItem[] {
-    return this.historyItems;
-  }
-
   snapshot(): ContextManagerSnapshot {
-    return {
+    return Object.freeze({
       activeItems: this.historyItems.length,
       compactedToolResults: this.compactedToolResultCount(),
       checkpoints: this.historyItems.filter((item) => item.kind === 'checkpoint').length,
       evidenceRecords: this.evidenceRecords.length
-    };
+    });
   }
 
   private contextHistoryEntries(): ProjectableHistoryMessage[] {
@@ -554,11 +550,12 @@ export class ContextManager {
 
   private materializeContextItem(input: ContextItemInput): ContextItem {
     const { id, tokenEstimate, ...rest } = input;
-    return {
+    return Object.freeze({
       ...rest,
       id: id ?? contextId(input.sourceUri, input.title, input.content),
-      tokenEstimate: tokenEstimate ?? this.estimator.estimateText(input.content)
-    };
+      tokenEstimate: tokenEstimate ?? this.estimator.estimateText(input.content),
+      ...(input.range ? { range: Object.freeze({ ...input.range }) } : {})
+    });
   }
 
   private consumeProjectionReductions(): ContextHistoryReduction[] {
@@ -566,22 +563,18 @@ export class ContextManager {
   }
 }
 
-function compactEvidenceRecords(records: EvidenceRecord[]): EvidenceRecord[] {
+function compactEvidenceRecords(records: readonly EvidenceRecord[]): EvidenceRecord[] {
   return records.map((record) => {
-    const next: EvidenceRecord = {
+    const resources = record.resources.slice(0, 8).map((resource) => ({
+      ...resource,
+      uri: compactText(resource.uri, 300)
+    }));
+    return createEvidenceRecord({
       ...record,
-      resources: record.resources.slice(0, 8).map((resource) => ({
-        ...resource,
-        uri: compactText(resource.uri, 300)
-      }))
-    };
-    if (record.summary) {
-      next.summary = compactText(record.summary, 300);
-    }
-    if (record.scope) {
-      next.scope = compactEvidenceScope(record.scope);
-    }
-    return next;
+      resources,
+      ...(record.summary ? { summary: compactText(record.summary, 300) } : {}),
+      ...(record.scope ? { scope: compactEvidenceScope(record.scope) } : {})
+    });
   });
 }
 
@@ -764,7 +757,7 @@ function selectContextItems(
     totalTokens += item.tokenEstimate;
   }
 
-  return { items: selected, totalTokens, omitted };
+  return Object.freeze({ items: Object.freeze(selected), totalTokens, omitted: Object.freeze(omitted.map((item) => Object.freeze({ ...item }))) });
 }
 
 interface ProjectableHistoryMessage {
@@ -933,14 +926,23 @@ function sameToolCall(left: ModelToolCall, right: ModelToolCall): boolean {
 }
 
 function toolResultMessage(input: RecordToolResultInput, _detail: 'immediate' | 'retained'): ModelMessage {
-  return {
+  return Object.freeze({
     role: 'tool',
     toolName: input.toolName,
     toolCallType: input.toolCallType,
     content: _detail === 'immediate' ? input.immediateContent : input.retainedContent,
     ...(input.callId ? { toolCallId: input.callId } : {}),
-    ...(_detail === 'immediate' && input.immediateImages && input.immediateImages.length > 0 ? { images: [...input.immediateImages] } : {})
-  };
+    ...(_detail === 'immediate' && input.immediateImages && input.immediateImages.length > 0 ? { images: Object.freeze(input.immediateImages.map(snapshotModelImage)) } : {})
+  });
+}
+
+function snapshotModelToolCall(call: ModelToolCall): ModelToolCall {
+  if (call.type === 'function') return Object.freeze({ ...call, input: Object.freeze({ kind: 'json', value: parseJsonObject(call.input.value) }) });
+  return Object.freeze({ ...call, input: Object.freeze({ kind: 'text', value: call.input.value }) });
+}
+
+function snapshotModelImage(image: ModelImage): ModelImage {
+  return image.type === 'bytes' ? Object.freeze({ ...image, data: new Uint8Array(image.data) }) : Object.freeze({ ...image });
 }
 
 function checkpointMessages(items: ContextHistoryItem[]): string[] {

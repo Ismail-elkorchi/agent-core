@@ -1,4 +1,4 @@
-import { type JsonObject, type JsonPrimitive, type JsonValue } from '@agent-core/json';
+import { parseJsonObject, type JsonObject, type JsonPrimitive, type JsonValue } from '@agent-core/json';
 
 export type JsonMember = JsonValue;
 
@@ -17,69 +17,115 @@ export type EvidenceConfidence = 'unverified' | 'verified';
 export type EvidenceOutcome = 'success' | 'failure';
 
 export interface EvidenceRange {
-  kind: 'line' | 'byte';
-  start?: number;
-  end?: number;
+  readonly kind: 'line' | 'byte';
+  readonly start?: number;
+  readonly end?: number;
 }
 
 export interface EvidenceResource {
-  uri: string;
-  range?: EvidenceRange;
-  sha256?: string;
-  fullSha256?: string;
-  mediaType?: string;
+  readonly uri: string;
+  readonly range?: EvidenceRange;
+  readonly sha256?: string;
+  readonly fullSha256?: string;
+  readonly mediaType?: string;
 }
 
 export interface EvidenceScope {
-  filters?: JsonObject;
-  limits?: JsonObject;
-  omitted?: JsonObject;
-  coverage?: 'complete' | 'partial' | 'absent';
-  truncated?: boolean;
-  confidence?: EvidenceConfidence;
+  readonly filters?: JsonObject;
+  readonly limits?: JsonObject;
+  readonly omitted?: JsonObject;
+  readonly coverage?: 'complete' | 'partial' | 'absent';
+  readonly truncated?: boolean;
+  readonly confidence?: EvidenceConfidence;
 }
 
 export interface ToolEvidenceItem {
-  action: EvidenceAction;
-  resources?: readonly EvidenceResource[];
-  scope?: EvidenceScope;
-  summary?: string;
-  outcome: EvidenceOutcome;
+  readonly action: EvidenceAction;
+  readonly resources?: readonly EvidenceResource[];
+  readonly scope?: EvidenceScope;
+  readonly summary?: string;
+  readonly outcome: EvidenceOutcome;
 }
 
 export interface ToolEvidenceDelta {
-  items: readonly ToolEvidenceItem[];
+  readonly items: readonly ToolEvidenceItem[];
 }
 
 export interface EvidenceRecord extends ToolEvidenceItem {
-  id: string;
-  observationId: string;
-  toolName: string;
-  createdAt: string;
-  resources: readonly EvidenceResource[];
-  outcome: EvidenceOutcome;
+  readonly id: string;
+  readonly observationId: string;
+  readonly toolName: string;
+  readonly createdAt: string;
+  readonly resources: readonly EvidenceResource[];
+  readonly outcome: EvidenceOutcome;
 }
 
 export interface EvidenceRecordContext {
-  observationId: string;
-  toolName: string;
-  createdAt?: string;
+  readonly observationId: string;
+  readonly toolName: string;
+  readonly createdAt?: string;
 }
+
+const OWNED_EVIDENCE_RECORDS = new WeakSet();
 
 export function projectToolEvidence(delta: ToolEvidenceDelta | undefined, context: EvidenceRecordContext): EvidenceRecord[] {
   if (delta === undefined) return [];
   const createdAt = context.createdAt ?? new Date().toISOString();
-  return delta.items.map((item, index): EvidenceRecord => Object.freeze({
+  return delta.items.map((item, index): EvidenceRecord => createEvidenceRecord({
       id: `${context.observationId}:evidence:${String(index + 1)}`,
       observationId: context.observationId,
       toolName: context.toolName,
       createdAt,
       action: item.action,
-      resources: item.resources ?? Object.freeze([]),
+      resources: item.resources ?? [],
       outcome: item.outcome,
       ...(item.scope ? { scope: item.scope } : {}),
       ...(item.summary ? { summary: item.summary } : {})
     }));
+}
+
+export function createEvidenceRecord(value: EvidenceRecord): EvidenceRecord {
+  if (OWNED_EVIDENCE_RECORDS.has(value)) return value;
+  const record = Object.freeze({
+    ...value,
+    resources: Object.freeze(value.resources.map(ownEvidenceResource)),
+    ...(value.scope ? { scope: ownEvidenceScope(value.scope) } : {})
+  });
+  OWNED_EVIDENCE_RECORDS.add(record);
+  return record;
+}
+
+export function decodeOwnedEvidenceRecord(value: JsonObject): EvidenceRecord {
+  rejectUnknown(value, ['id', 'observationId', 'toolName', 'createdAt', 'action', 'resources', 'scope', 'summary', 'outcome'], 'Evidence record');
+  const id = value.id; const observationId = value.observationId; const toolName = value.toolName; const createdAt = value.createdAt;
+  if (typeof id !== 'string' || id.length === 0 || typeof observationId !== 'string' || observationId.length === 0 || typeof toolName !== 'string' || toolName.length === 0 || typeof createdAt !== 'string' || createdAt.length === 0) throw new Error('Evidence record identity is invalid.');
+  if (!isEvidenceAction(value.action) || (value.outcome !== 'success' && value.outcome !== 'failure') || !jsonArray(value.resources)) throw new Error('Evidence record is invalid.');
+  if (value.summary !== undefined && (typeof value.summary !== 'string' || value.summary.trim().length === 0 || Buffer.byteLength(value.summary, 'utf8') > 1_000)) throw new Error('Evidence record summary is invalid.');
+  const record = Object.freeze({
+    id, observationId, toolName, createdAt,
+    action: value.action, resources: Object.freeze(value.resources.map((resource, index) => parseEvidenceResource(resource, 0, index))), outcome: value.outcome,
+    ...(value.scope === undefined ? {} : { scope: parseEvidenceScope(value.scope, 0) }),
+    ...(typeof value.summary === 'string' ? { summary: value.summary.trim() } : {})
+  });
+  OWNED_EVIDENCE_RECORDS.add(record);
+  return record;
+}
+
+export function encodeEvidenceRecord(value: EvidenceRecord): JsonObject {
+  const record = createEvidenceRecord(value);
+  return Object.freeze({
+    id: record.id, observationId: record.observationId, toolName: record.toolName, createdAt: record.createdAt,
+    action: record.action, resources: Object.freeze(record.resources.map(encodeEvidenceResource)), outcome: record.outcome,
+    ...(record.scope ? { scope: encodeEvidenceScope(record.scope) } : {}), ...(record.summary ? { summary: record.summary } : {})
+  });
+}
+
+export function encodeToolEvidenceDelta(value: ToolEvidenceDelta): JsonObject {
+  return Object.freeze({ items: Object.freeze(value.items.map((item) => Object.freeze({
+    action: item.action, outcome: item.outcome,
+    ...(item.resources ? { resources: Object.freeze(item.resources.map(encodeEvidenceResource)) } : {}),
+    ...(item.scope ? { scope: encodeEvidenceScope(item.scope) } : {}), ...(item.summary ? { summary: item.summary } : {})
+  }))) });
 }
 
 /** Semantic validation for evidence in an already-decoded JSON observation. */
@@ -90,10 +136,10 @@ export function parseToolEvidenceDelta(value: JsonObject): ToolEvidenceDelta {
 }
 
 export function workspaceResource(path: string, options: Omit<EvidenceResource, 'uri'> = {}): EvidenceResource {
-  return {
+  return ownEvidenceResource({
     uri: `workspace://${path}`,
     ...options
-  };
+  });
 }
 
 export function toEvidenceJsonObject(value: Record<string, unknown>): JsonObject {
@@ -179,6 +225,26 @@ function parseEvidenceScope(value: JsonValue, itemIndex: number): EvidenceScope 
   });
 }
 
+function ownEvidenceResource(value: EvidenceResource): EvidenceResource {
+  return Object.freeze({ ...value, ...(value.range ? { range: Object.freeze({ ...value.range }) } : {}) });
+}
+
+function ownEvidenceScope(value: EvidenceScope): EvidenceScope {
+  return Object.freeze({ ...value,
+    ...(value.filters ? { filters: parseJsonObject(value.filters) } : {}),
+    ...(value.limits ? { limits: parseJsonObject(value.limits) } : {}),
+    ...(value.omitted ? { omitted: parseJsonObject(value.omitted) } : {})
+  });
+}
+
+function encodeEvidenceResource(value: EvidenceResource): JsonObject {
+  return Object.freeze({ uri: value.uri, ...(value.range ? { range: Object.freeze({ ...value.range }) } : {}), ...(value.sha256 ? { sha256: value.sha256 } : {}), ...(value.fullSha256 ? { fullSha256: value.fullSha256 } : {}), ...(value.mediaType ? { mediaType: value.mediaType } : {}) });
+}
+
+function encodeEvidenceScope(value: EvidenceScope): JsonObject {
+  return Object.freeze({ ...(value.filters ? { filters: value.filters } : {}), ...(value.limits ? { limits: value.limits } : {}), ...(value.omitted ? { omitted: value.omitted } : {}), ...(value.coverage ? { coverage: value.coverage } : {}), ...(value.truncated === undefined ? {} : { truncated: value.truncated }), ...(value.confidence ? { confidence: value.confidence } : {}) });
+}
+
 function parseOptionalSha256(value: JsonValue | undefined, field: string, itemIndex: number, resourceIndex: number): string | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== 'string' || !/^[a-f0-9]{64}$/iu.test(value)) throw new Error(`Tool evidence resource ${String(itemIndex)}:${String(resourceIndex)} has an invalid ${field}.`);
@@ -205,7 +271,7 @@ function toEvidenceJsonMember(value: unknown): JsonMember | undefined {
   }
   if (Array.isArray(value)) {
     const items = value.map(toEvidenceJsonPrimitive).filter((item): item is JsonPrimitive => item !== undefined);
-    return items.length === value.length ? items : undefined;
+    return items.length === value.length ? Object.freeze(items) : undefined;
   }
   if (isRecord(value)) {
     const output: Record<string, JsonPrimitive | JsonPrimitive[]> = {};
@@ -217,7 +283,7 @@ function toEvidenceJsonMember(value: unknown): JsonMember | undefined {
         output[key] = json;
       }
     }
-    return output;
+    return Object.freeze(output);
   }
   return undefined;
 }

@@ -42,24 +42,24 @@ interface ToolObservationBase {
   readonly summary: string;
   readonly scope: ToolScope;
   readonly content?: readonly ToolContent[];
-  readonly metadata?: Record<string, unknown>;
+  readonly metadata?: JsonObject;
   readonly evidence?: ToolEvidenceDelta;
 }
-export interface ToolResultObservation<TOutput = unknown> extends ToolObservationBase { kind: 'result'; /** A negative domain result is still a completed tool invocation. */ ok: boolean; output: TOutput }
+export interface ToolResultObservation<TOutput = JsonValue> extends ToolObservationBase { kind: 'result'; /** A negative domain result is still a completed tool invocation. */ ok: boolean; output: TOutput }
 export interface ToolFailureObservation<TOutput extends ToolFailureOutput = ToolFailureOutput> extends ToolObservationBase { kind: 'failure'; ok: false; output: TOutput }
-export type ToolObservation<TOutput = unknown> = ToolResultObservation<TOutput> | ToolFailureObservation;
+export type ToolObservation<TOutput = JsonValue> = ToolResultObservation<TOutput> | ToolFailureObservation;
 
 export type ToolFailureReason = 'unknown_tool' | 'policy' | 'invalid_arguments' | 'invalid_output' | 'missing_service' | 'runtime_error';
 export interface BaseToolFailureOutput { blocked: true; reason: ToolFailureReason; recovery: string }
 export interface UnknownToolFailureOutput extends BaseToolFailureOutput { reason: 'unknown_tool'; toolCall: ToolCall }
-export interface PolicyToolFailureOutput extends BaseToolFailureOutput { reason: 'policy'; tool?: string; policyReason?: string; details?: Record<string, unknown> }
+export interface PolicyToolFailureOutput extends BaseToolFailureOutput { reason: 'policy'; tool?: string; policyReason?: string; details?: JsonObject }
 export interface ToolValidationIssue { readonly path: readonly (string | number)[]; readonly code: string; readonly message: string }
 export interface ToolValidationIssues { readonly issues: readonly ToolValidationIssue[] }
-export interface InvalidArgumentsToolFailureOutput extends BaseToolFailureOutput { reason: 'invalid_arguments'; issues?: ToolValidationIssues; details?: Record<string, unknown> }
+export interface InvalidArgumentsToolFailureOutput extends BaseToolFailureOutput { reason: 'invalid_arguments'; issues?: ToolValidationIssues; details?: JsonObject }
 export interface InvalidOutputToolFailureOutput extends BaseToolFailureOutput { reason: 'invalid_output'; issues: ToolValidationIssues }
 export interface MissingServiceDetails { readonly expected?: string; readonly actualType?: string }
-export interface MissingServiceToolFailureOutput extends BaseToolFailureOutput { reason: 'missing_service'; service: string; details?: MissingServiceDetails }
-export interface RuntimeErrorToolFailureOutput extends BaseToolFailureOutput { reason: 'runtime_error'; error: string; details?: Record<string, unknown> }
+export interface MissingServiceToolFailureOutput extends BaseToolFailureOutput { reason: 'missing_service'; service: string; details?: JsonObject }
+export interface RuntimeErrorToolFailureOutput extends BaseToolFailureOutput { reason: 'runtime_error'; error: string; details?: JsonObject }
 export type ToolFailureOutput = UnknownToolFailureOutput | PolicyToolFailureOutput | InvalidArgumentsToolFailureOutput | InvalidOutputToolFailureOutput | MissingServiceToolFailureOutput | RuntimeErrorToolFailureOutput;
 
 export interface ToolDefinition<TDecodedInput = unknown, TCanonicalInput = TDecodedInput, TOutput = unknown> {

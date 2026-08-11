@@ -41,6 +41,7 @@ function recordImageResult(manager, index, images) {
 
 test('history projection removes incompatible images without mutating stored tool protocol history', () => {
   const manager = new ContextManager();
+  assert.equal(typeof manager.rawItems, 'undefined');
   recordImageResult(manager, 1, [{ type: 'bytes', data: new Uint8Array([1, 2, 3]), mediaType: 'image/png', detail: 'original' }]);
   const multimodal = manager.projectHistory(imageProfile);
   assert.equal(multimodal.messages[1].images.length, 1);
@@ -51,7 +52,7 @@ test('history projection removes incompatible images without mutating stored too
   assert.equal(textOnly.messages[1].images, undefined);
   assert.match(textOnly.messages[1].content, /public artifact artifact-1-0/u);
   assert.deepEqual(textOnly.reductions.map((item) => item.reason), ['unsupported_modality']);
-  assert.equal(manager.rawItems()[1].immediateMessage.images.length, 1);
+  assert.equal(manager.projectHistory(imageProfile).messages[1].images.length, 1);
   assert.ok(textOnly.estimatedTokens < multimodal.estimatedTokens);
 });
 

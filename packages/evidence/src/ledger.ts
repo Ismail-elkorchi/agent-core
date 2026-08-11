@@ -22,6 +22,20 @@ export interface EventEnvelope<TEvent extends TypedEvent = TypedEvent> {
   readonly event: TEvent;
 }
 
+export interface EventAppendReceipt {
+  readonly eventId: string;
+  readonly runId: string;
+  readonly sequence: number;
+  readonly timestamp: string;
+  readonly schemaVersion: string;
+  readonly actor: EventActor;
+  readonly causationId?: string;
+  readonly correlationId?: string;
+  readonly idempotencyKey?: string;
+  readonly previousHash?: string;
+  readonly hash: string;
+}
+
 export interface AppendEventOptions {
   actor?: EventActor;
   causationId?: string;

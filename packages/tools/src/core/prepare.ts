@@ -57,7 +57,7 @@ export async function prepareToolCall(call: ToolCall, tools: readonly ToolDefini
       invoke: async (executionContext: ToolExecutionContext) => {
         const observation = await tool.invoke(canonicalized, executionContext);
         try { return parseToolObservation(tool, observation); }
-        catch (error) { return parseToolObservation(undefined, invalidOutputObservation(tool.name, error instanceof Error ? error : new Error(String(error)))); }
+        catch (error) { return invalidOutputObservation(tool.name, error instanceof Error ? error : new Error(String(error))); }
       }
     }) };
   } catch (error) {

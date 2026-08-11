@@ -1,4 +1,4 @@
-import { parseJsonValue, type JsonValue, type SafeJsonParseLimits } from '@agent-core/json';
+import type { JsonValue } from '@agent-core/json';
 
 export interface RedactedJson {
   readonly value: JsonValue;
@@ -6,9 +6,9 @@ export interface RedactedJson {
 }
 
 /** Apply the shared durable/model-visible secret redaction policy to owned JSON. */
-export function redactJson(value: unknown, limits: Partial<SafeJsonParseLimits> = {}): RedactedJson {
+export function redactJson(value: JsonValue): RedactedJson {
   const state = { redactions: 0 };
-  const redacted = redactValue(parseJsonValue(value, limits), [], state);
+  const redacted = redactValue(value, [], state);
   return Object.freeze({ value: redacted, redactions: state.redactions });
 }
 

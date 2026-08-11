@@ -31,7 +31,7 @@ test('repositories encode on append and decode once on read', async () => {
     encode(value) {
       encodes += 1;
       const payload = Object.freeze({ ...value.payload });
-      return Object.freeze({ json: Object.freeze({ type: value.type, payload }), value: Object.freeze({ type: value.type, payload }) });
+      return Object.freeze({ type: value.type, payload });
     },
     decode(value) {
       decodes += 1;
@@ -44,23 +44,40 @@ test('repositories encode on append and decode once on read', async () => {
   const appended = await repository.append('run', original);
   original.payload.count = 2;
   assert.deepEqual({ encodes, decodes }, { encodes: 1, decodes: 0 });
-  const { hash, event: _domainEvent, ...envelope } = appended;
-  assert.equal(hash, hashJson({ ...envelope, event: { type: 'measured', payload: { count: 1 } } }));
+  assert.equal('event' in appended, false);
+  const { hash, ...receipt } = appended;
+  assert.equal(hash, hashJson({ ...receipt, event: { type: 'measured', payload: { count: 1 } } }));
   const records = await Array.fromAsync(repository.read('run'));
   assert.deepEqual({ encodes, decodes }, { encodes: 1, decodes: 1 });
   assert.equal(records[0].event.payload.count, 1);
+  await Array.fromAsync(repository.read('run'));
+  await repository.verifyIntegrity('run');
+  assert.deepEqual({ encodes, decodes }, { encodes: 1, decodes: 1 });
 
   const malformed = new InMemoryEventRepository({
-    encode(value) { return { json: { type: value.type, payload: { count: 'bad' } }, value }; },
+    encode(value) { return { type: value.type, payload: { count: 'bad' } }; },
     decode: codec.decode
   });
   await malformed.append('run', { type: 'measured', payload: { count: 1 } });
   await assert.rejects(Array.fromAsync(malformed.read('run')), /malformed measured event/u);
 
   const events = readFileSync(path.join(root, 'packages/runtime/src/events.ts'), 'utf8');
-  assert.doesNotMatch(events, /AgentEvent\s*&\s*JsonObject|as\s+AgentEvent\s*&\s*JsonObject/u);
+  assert.doesNotMatch(events, /AgentEvent\s*&\s*JsonObject|as\s+AgentEvent\s*&\s*JsonObject|Object\.freeze\(\{\s*\.\.\.value\s*\}\)/u);
+  const repositorySource = readFileSync(path.join(root, 'packages/evidence/src/event-repository.ts'), 'utf8');
+  assert.doesNotMatch(repositorySource, /readonly json:\s*JsonObject;\s*readonly value|encoding\.value/u);
   const prepare = readFileSync(path.join(root, 'packages/tools/src/core/prepare.ts'), 'utf8');
   assert.doesNotMatch(prepare, /parseJsonObject|decodeToolCall/u);
+  const execute = readFileSync(path.join(root, 'packages/tools/src/core/execute.ts'), 'utf8');
+  assert.doesNotMatch(`${prepare}\n${execute}`, /parseToolObservation\(undefined,\s*(?:invalid|missing|runtime|unknown)[A-Z][A-Za-z]+Observation/u);
+  const manager = readFileSync(path.join(root, 'packages/runtime/src/context/manager.ts'), 'utf8');
+  assert.doesNotMatch(manager, /\brawItems\s*\(/u);
+  const contextEvidence = readFileSync(path.join(root, 'packages/runtime/src/orchestration/context-evidence.ts'), 'utf8');
+  assert.doesNotMatch(contextEvidence, /parseJsonValue\(record\)/u);
+  const observationStore = readFileSync(path.join(root, 'packages/runtime/src/orchestration/observation-store.ts'), 'utf8');
+  assert.doesNotMatch(observationStore, /normalizeToolObservationForPersistence|parseJsonValue\(canonical/u);
+  const toolContracts = readFileSync(path.join(root, 'packages/tools/src/core/definition.ts'), 'utf8');
+  assert.doesNotMatch(toolContracts, /interface ToolObservationBase\s*\{[^}]*metadata\?:\s*Record<string, unknown>/u);
+  assert.doesNotMatch(toolContracts, /interface \w+ToolFailureOutput[^\{]*\{[^}]*details\?:\s*Record<string, unknown>/u);
   const registry = readFileSync(path.join(root, 'packages/tools/src/core/registry.ts'), 'utf8');
   const registerBody = registry.slice(registry.indexOf('register('), registry.indexOf('\n  get('));
   assert.doesNotMatch(registerBody, /markCompiledTool|parseJsonObject/u);

@@ -9,7 +9,6 @@ import {
   abortableToolBoundary,
   enforceAllowedEffects,
   invokePreparedToolCall,
-  normalizeToolObservationForPersistence,
   policyBlockedObservation,
   prepareToolCall,
   type PreparedToolCall,
@@ -254,7 +253,7 @@ async function persistObservation(input: Parameters<typeof executeAssistantToolC
       ...(entry.prepared ? { canonicalSnapshot: entry.prepared.canonicalSnapshot } : {}),
       tool: input.tools.find((tool) => tool.name === entry.call.name && tool.implementationId === entry.prepared?.toolImplementationId), observation
     });
-  const persistedObservation = normalizeToolObservationForPersistence(committed?.durableObservation ?? observation);
+  const persistedObservation = committed?.durableObservation ?? observation;
   await input.append({ type: 'tool.ended', ...entry.identity, toolName: entry.call.name, observation: persistedObservation }, toolEventKey(input.runId, entry.identity, 'ended'));
   if (entry.observationProjected) {
     await input.emit({ type: 'tool.ended', ...entry.identity, toolName: entry.call.name, observation: persistedObservation });

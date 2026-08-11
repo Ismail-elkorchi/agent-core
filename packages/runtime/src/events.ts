@@ -1,5 +1,5 @@
 import type { ContextBundle, ContextHistoryReduction, PromptProjection } from './context/manager.js';
-import { decodeOwnedArtifactRef, type ArtifactRef, type RuntimeCodec } from '@agent-core/evidence';
+import { decodeOwnedArtifactRef, decodeOwnedEvidenceRecord, type ArtifactRef, type RuntimeCodec } from '@agent-core/evidence';
 import { parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
 import type {
   ModelCapabilities,
@@ -189,7 +189,7 @@ export type AgentProgressEvent =
   | { readonly type: 'run.ended'; readonly terminal: AgentTerminalSnapshot; readonly deliveryDiagnostics: readonly AgentDeliveryDiagnostic[] };
 
 export const agentEventCodec: RuntimeCodec<AgentEvent> = {
-  encode(value) { return Object.freeze({ json: encodeAgentEvent(value), value: Object.freeze({ ...value }) }); },
+  encode: encodeAgentEvent,
   decode: decodeAgentEvent
 };
 
@@ -752,42 +752,10 @@ function decodePromptEvidence(value: JsonValue): NonNullable<PromptProjection['e
     return Object.freeze({ toolName: requiredString(summary.toolName, 'omittedSummary.toolName'), action: requiredEnum(summary.action, ['list', 'search', 'read', 'execute', 'create', 'update', 'delete', 'move', 'verify'] as const, 'omittedSummary.action'), outcome: requiredEnum(summary.outcome, ['success', 'failure'] as const, 'omittedSummary.outcome'), count: positiveInteger(summary.count, 'omittedSummary.count') });
   });
   return Object.freeze({
-    records: requiredArray(object.records, 'projection.evidence.records').map((item, index) => decodeEvidenceRecord(item, `projection.evidence.records[${String(index)}]`)),
+    records: requiredArray(object.records, 'projection.evidence.records').map((item, index) => decodeOwnedEvidenceRecord(requiredObject(item, `projection.evidence.records[${String(index)}]`))),
     omittedRecords: nonnegativeInteger(object.omittedRecords, 'projection.evidence.omittedRecords'), ...(omittedSummary ? { omittedSummary } : {}),
     tokenEstimate: nonnegativeInteger(object.tokenEstimate, 'projection.evidence.tokenEstimate'), coverage: requiredEnum(object.coverage, ['complete', 'partial'] as const, 'projection.evidence.coverage')
   });
-}
-function decodeEvidenceRecord(value: JsonValue, path: string): NonNullable<PromptProjection['evidence']>['records'][number] {
-  const object = requiredObject(value, path);
-  exact(object, ['id', 'observationId', 'toolName', 'createdAt', 'action', 'resources', 'scope', 'summary', 'outcome']);
-  const scope = object.scope === undefined ? undefined : decodeEvidenceScope(object.scope, `${path}.scope`);
-  const summary = optionalStringValue(object.summary, `${path}.summary`);
-  return Object.freeze({
-    id: requiredString(object.id, `${path}.id`), observationId: requiredString(object.observationId, `${path}.observationId`), toolName: requiredString(object.toolName, `${path}.toolName`),
-    createdAt: requiredString(object.createdAt, `${path}.createdAt`), action: requiredEnum(object.action, ['list', 'search', 'read', 'execute', 'create', 'update', 'delete', 'move', 'verify'] as const, `${path}.action`),
-    resources: requiredArray(object.resources, `${path}.resources`).map((item, index) => decodeEvidenceResource(item, `${path}.resources[${String(index)}]`)),
-    ...(scope ? { scope } : {}), ...(summary !== undefined ? { summary } : {}), outcome: requiredEnum(object.outcome, ['success', 'failure'] as const, `${path}.outcome`)
-  });
-}
-function decodeEvidenceResource(value: JsonValue, path: string): NonNullable<PromptProjection['evidence']>['records'][number]['resources'][number] {
-  const object = requiredObject(value, path);
-  exact(object, ['uri', 'range', 'sha256', 'fullSha256', 'mediaType']);
-  const range = object.range === undefined ? undefined : decodeRange(object.range, `${path}.range`);
-  const sha256 = optionalStringValue(object.sha256, `${path}.sha256`);
-  const fullSha256 = optionalStringValue(object.fullSha256, `${path}.fullSha256`);
-  const mediaType = optionalStringValue(object.mediaType, `${path}.mediaType`);
-  return Object.freeze({ uri: requiredString(object.uri, `${path}.uri`), ...(range ? { range } : {}), ...(sha256 !== undefined ? { sha256 } : {}), ...(fullSha256 !== undefined ? { fullSha256 } : {}), ...(mediaType !== undefined ? { mediaType } : {}) });
-}
-function decodeEvidenceScope(value: JsonValue, path: string): NonNullable<NonNullable<PromptProjection['evidence']>['records'][number]['scope']> {
-  const object = requiredObject(value, path);
-  exact(object, ['filters', 'limits', 'omitted', 'coverage', 'truncated', 'confidence']);
-  const filters = optionalObject(object.filters, `${path}.filters`);
-  const limits = optionalObject(object.limits, `${path}.limits`);
-  const omitted = optionalObject(object.omitted, `${path}.omitted`);
-  const coverage = object.coverage === undefined ? undefined : requiredEnum(object.coverage, ['complete', 'partial', 'absent'] as const, `${path}.coverage`);
-  const truncated = object.truncated === undefined ? undefined : requiredBoolean(object.truncated, `${path}.truncated`);
-  const confidence = object.confidence === undefined ? undefined : requiredEnum(object.confidence, ['unverified', 'verified'] as const, `${path}.confidence`);
-  return Object.freeze({ ...(filters ? { filters } : {}), ...(limits ? { limits } : {}), ...(omitted ? { omitted } : {}), ...(coverage ? { coverage } : {}), ...(truncated !== undefined ? { truncated } : {}), ...(confidence ? { confidence } : {}) });
 }
 function decodeOutputContract(value: JsonValue): NonNullable<PromptProjection['outputContract']> {
   const object = requiredObject(value, 'projection.outputContract');

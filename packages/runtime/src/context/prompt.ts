@@ -61,14 +61,14 @@ const DEFAULT_OUTPUT_CONTRACT = {
   description: 'Answer with text when the task is complete.'
 };
 
-function renderNotes(notes: string[]): string {
+function renderNotes(notes: readonly string[]): string {
   if (notes.length === 0) {
     return '';
   }
   return ['Run notes:', ...notes.map((note) => `- ${escapeText(note)}`)].join('\n');
 }
 
-function renderContinuity(continuity: string[]): string {
+function renderContinuity(continuity: readonly string[]): string {
   if (continuity.length === 0) {
     return '';
   }
@@ -137,7 +137,7 @@ function renderOutputContract(contract: NonNullable<PromptProjection['outputCont
   return `Final response contract: ${contract.description}`;
 }
 
-function renderContext(items: ContextItem[]): string {
+function renderContext(items: readonly ContextItem[]): string {
   if (items.length === 0) {
     return 'Context: none supplied.';
   }

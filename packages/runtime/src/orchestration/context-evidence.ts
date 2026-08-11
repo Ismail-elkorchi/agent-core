@@ -1,5 +1,5 @@
-import { validateArtifactRef, type ArtifactRef, type ArtifactRepository, type EvidenceRecord } from '@agent-core/evidence';
-import { parseJsonObject, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
+import { encodeEvidenceRecord, validateArtifactRef, type ArtifactRef, type ArtifactRepository, type EvidenceRecord } from '@agent-core/evidence';
+import { parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
 import type { ContextManager } from '../context/manager.js';
 import type { AgentEvidencePage, AgentEvidenceReader, AgentVerificationExecutionContext } from '../run/contracts.js';
 
@@ -47,7 +47,7 @@ function contextEvidenceReader(
       while (index < records.length && items.length < limit) {
         const record = records[index];
         if (!record) break;
-        const item = parseJsonValue(record);
+        const item = encodeEvidenceRecord(record);
         const itemBytes = jsonBytes(item);
         if (items.length > 0 && bytes + itemBytes > maxBytes) break;
         if (items.length === 0 && itemBytes > maxBytes) {
@@ -89,14 +89,14 @@ function contextEvidenceReader(
 function externalPage(page: AgentEvidencePage): AgentEvidencePage {
   const owned = parseJsonObject(page);
   const unknown = Object.keys(owned).filter((key) => !['items', 'bytes', 'truncated', 'nextCursor'].includes(key));
-  if (unknown.length > 0 || !Array.isArray(owned.items)
+  if (unknown.length > 0 || !jsonArray(owned.items)
     || !Number.isSafeInteger(owned.bytes) || typeof owned.bytes !== 'number' || owned.bytes < 0
     || typeof owned.truncated !== 'boolean'
     || (owned.nextCursor !== undefined && typeof owned.nextCursor !== 'string')
     || (owned.truncated && typeof owned.nextCursor !== 'string')) {
     throw new Error('External evidence reader returned an invalid page.');
   }
-  const items = Object.freeze(owned.items.map((item) => parseJsonValue(item)));
+  const items = Object.freeze([...owned.items]);
   return Object.freeze({
     items,
     bytes: owned.bytes,
@@ -104,6 +104,8 @@ function externalPage(page: AgentEvidencePage): AgentEvidencePage {
     ...(typeof owned.nextCursor === 'string' ? { nextCursor: `external:${encodeURIComponent(owned.nextCursor)}` } : {})
   });
 }
+
+function jsonArray(value: JsonValue | undefined): value is readonly JsonValue[] { return Array.isArray(value); }
 
 function oversizedEvidenceStub(record: EvidenceRecord, originalBytes: number, maxBytes: number): JsonObject {
   let id = record.id;
