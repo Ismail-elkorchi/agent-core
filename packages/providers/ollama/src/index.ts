@@ -191,7 +191,7 @@ export class OllamaProvider implements ModelProvider {
 
   async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
     try {
-      parseModelRequest(request);
+      request = parseModelRequest(request);
       assertModelRequestSupported(await this.describeModel(request.model), request);
     }
     catch (error) { throw this.normalizeError(error); }

@@ -7,9 +7,12 @@ import type {
   ModelStreamEvent,
   ModelTerminationReason,
   ModelToolCall,
+  ModelTransportMetadata,
   ModelUsage
 } from './index.js';
-import { normalizeJsonSafe, parseJsonObject, parseJsonValue } from '@agent-core/json';
+import { normalizeJsonSafe, parseJsonObject, parseJsonValue, type JsonObject } from '@agent-core/json';
+
+const MODEL_JSON_LIMITS = { maxDepth: 32, maxCollectionEntries: 10_000, maxStringBytes: 1024 * 1024, maxTotalBytes: 4 * 1024 * 1024 };
 
 export class ModelContractError extends Error {
   readonly issues: readonly string[];
@@ -47,7 +50,6 @@ export function parseModelProfile(value: unknown): ModelProfile {
   if (value.pricing !== undefined && !validPricing(value.pricing)) issues.push('pricing must contain finite nonnegative numeric rates.');
   if (value.metadata !== undefined && !isJsonObject(value.metadata)) issues.push('metadata must be a bounded JSON-safe object.');
   if (issues.length > 0) throw contract('Invalid model profile.', issues);
-  if (!isModelProfile(value)) throw contract('Invalid model profile.', ['Validated fields did not form a model profile.']);
   return ownedModelProfile(value);
 }
 
@@ -72,14 +74,11 @@ export function parseModelRequest(value: unknown): ModelRequest {
   if (value.metadata !== undefined && !validStringMetadata(value.metadata)) issues.push('metadata must contain string values.');
   if (value.signal !== undefined && !isAbortSignal(value.signal)) issues.push('signal must be an AbortSignal.');
   if (issues.length > 0) throw contract('Invalid model request.', issues);
-  if (!isModelRequest(value)) throw contract('Invalid model request.', ['Validated fields did not form a model request.']);
   return ownedModelRequest(value);
 }
 
 /** Enforces a discovered profile against an actual request at the provider boundary. */
-export function assertModelRequestSupported(profileValue: unknown, requestValue: unknown): void {
-  const profile = parseModelProfile(profileValue);
-  const request = parseModelRequest(requestValue);
+export function assertModelRequestSupported(profile: ModelProfile, request: ModelRequest): void {
   const issues: string[] = [];
   if (request.model !== profile.id) issues.push(`request model ${request.model} does not match profile ${profile.id}.`);
   const declared = new Set<string>(profile.supportedParameters);
@@ -120,9 +119,7 @@ function grammarInputSupported(inputs: ModelProfile['capabilities']['supportedTo
   return inputs.some((input) => input.kind === 'grammar' && input.syntax === syntax);
 }
 
-export function assertModelReasoningSupported(profileValue: unknown, reasoning: ModelReasoningRequest | undefined): void {
-  const profile = parseModelProfile(profileValue);
-  if (reasoning !== undefined) parseModelReasoningRequest(reasoning);
+export function assertModelReasoningSupported(profile: ModelProfile, reasoning: ModelReasoningRequest | undefined): void {
   const issues = modelReasoningSupportIssues(profile, reasoning);
   if (issues.length > 0) throw contract('Model reasoning request conflicts with its profile.', issues);
 }
@@ -206,11 +203,13 @@ export function parseModelReasoningRequest(value: unknown): ModelReasoningReques
 
 export function parseModelUsage(value: unknown): ModelUsage {
   if (!isRecord(value)) throw contract('Invalid model usage.', ['Expected an object.']);
-  const issues = ['promptTokens', 'completionTokens', 'totalTokens'].filter((name) => !nonnegativeFinite(value[name])).map((name) => `${name} must be finite and nonnegative.`);
-  for (const name of ['cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens']) if (value[name] !== undefined && !nonnegativeFinite(value[name])) issues.push(`${name} must be finite and nonnegative when provided.`);
-  if (nonnegativeFinite(value.totalTokens) && nonnegativeFinite(value.promptTokens) && nonnegativeFinite(value.completionTokens) && value.totalTokens !== value.promptTokens + value.completionTokens) issues.push('totalTokens must equal promptTokens + completionTokens.');
-  if (issues.length > 0) throw contract('Invalid model usage.', issues);
-  if (!isModelUsage(value)) throw contract('Invalid model usage.', ['Validated fields did not form model usage.']);
+  if (!nonnegativeFinite(value.promptTokens)) throw contract('Invalid model usage.', ['promptTokens must be finite and nonnegative.']);
+  if (!nonnegativeFinite(value.completionTokens)) throw contract('Invalid model usage.', ['completionTokens must be finite and nonnegative.']);
+  if (!nonnegativeFinite(value.totalTokens)) throw contract('Invalid model usage.', ['totalTokens must be finite and nonnegative.']);
+  for (const name of ['cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens']) {
+    if (value[name] !== undefined && !nonnegativeFinite(value[name])) throw contract('Invalid model usage.', [`${name} must be finite and nonnegative when provided.`]);
+  }
+  if (value.totalTokens !== value.promptTokens + value.completionTokens) throw contract('Invalid model usage.', ['totalTokens must equal promptTokens + completionTokens.']);
   return Object.freeze({
     promptTokens: value.promptTokens,
     completionTokens: value.completionTokens,
@@ -229,64 +228,84 @@ export function parseModelTerminationReason(value: unknown): ModelTerminationRea
 export function parseModelToolCall(value: unknown): ModelToolCall {
   if (!isRecord(value)) throw contract('Invalid model tool call.', ['Expected an object.']);
   const issues: string[] = [];
-  nonempty(value.name, 'name', issues);
+  let jsonInput: JsonObject | undefined;
+  const name = typeof value.name === 'string' ? value.name : '';
+  nonempty(name, 'name', issues);
   if (value.id !== undefined && typeof value.id !== 'string') issues.push('id must be a string.');
   if (value.type !== 'function' && value.type !== 'custom') issues.push('type must be function or custom.');
   if (!isRecord(value.input) || (value.input.kind !== 'json' && value.input.kind !== 'text')) issues.push('input is invalid.');
-  else if (value.input.kind === 'text' ? typeof value.input.value !== 'string' : !isJsonObject(value.input.value)) issues.push('input value is invalid.');
+  else if (value.input.kind === 'text') {
+    if (typeof value.input.value !== 'string') issues.push('input value is invalid.');
+  } else {
+    try { jsonInput = parseJsonObject(value.input.value, MODEL_JSON_LIMITS); }
+    catch { issues.push('input value is invalid.'); }
+  }
   if (value.type === 'function' && isRecord(value.input) && value.input.kind !== 'json') issues.push('function tool calls require JSON input.');
   if (value.type === 'custom' && isRecord(value.input) && value.input.kind !== 'text') issues.push('custom tool calls require text input.');
   if (issues.length > 0) throw contract('Invalid model tool call.', issues);
-  if (!isModelToolCall(value)) throw contract('Invalid model tool call.', ['Validated fields did not form a model tool call.']);
   const input = value.input as Record<string, unknown>;
-  const identity = { ...(typeof value.id === 'string' ? { id: value.id } : {}), name: value.name };
+  const identity = { ...(typeof value.id === 'string' ? { id: value.id } : {}), name };
   return value.type === 'function'
-    ? Object.freeze({ ...identity, type: 'function', input: Object.freeze({ kind: 'json', value: parseJsonObject(input.value) }) })
+    ? Object.freeze({ ...identity, type: 'function', input: Object.freeze({ kind: 'json', value: jsonInput ?? {} }) })
     : Object.freeze({ ...identity, type: 'custom', input: Object.freeze({ kind: 'text', value: input.value as string }) });
 }
 
 export function parseModelProviderState(value: unknown): ModelProviderState {
-  if (!isRecord(value) || typeof value.provider !== 'string' || value.provider.length === 0 || typeof value.model !== 'string' || value.model.length === 0 || typeof value.kind !== 'string' || value.kind.length === 0 || !isJsonObject(value.data)) {
+  if (!isRecord(value) || typeof value.provider !== 'string' || value.provider.length === 0 || typeof value.model !== 'string' || value.model.length === 0 || typeof value.kind !== 'string' || value.kind.length === 0) {
     throw contract('Invalid provider continuation state.', ['State identity and data must be JSON-safe.']);
   }
-  return Object.freeze({ provider: value.provider, model: value.model, kind: value.kind, data: parseJsonObject(value.data) });
+  let data: JsonObject;
+  try { data = parseJsonObject(value.data, MODEL_JSON_LIMITS); }
+  catch { throw contract('Invalid provider continuation state.', ['State identity and data must be JSON-safe.']); }
+  return Object.freeze({ provider: value.provider, model: value.model, kind: value.kind, data });
 }
 
 export function parseModelResponse(value: unknown): ModelResponse {
   if (!isRecord(value)) throw contract('Invalid model response.', ['Expected an object.']);
   const issues: string[] = [];
+  let terminationReason: ModelTerminationReason = 'unknown';
+  let usage: ModelUsage | undefined;
+  let toolCalls: ModelToolCall[] | undefined;
+  let providerState: ModelProviderState | undefined;
+  let transport: ModelTransportMetadata | undefined;
+  let timings: Record<string, number> | undefined;
+  const content = typeof value.content === 'string' ? value.content : '';
+  const model = typeof value.model === 'string' ? value.model : '';
+  const provider = typeof value.provider === 'string' ? value.provider : '';
   if (typeof value.content !== 'string') issues.push('content must be a string.');
-  nonempty(value.model, 'model', issues); nonempty(value.provider, 'provider', issues);
-  try { parseModelTerminationReason(value.terminationReason); } catch (error) { issues.push(errorMessage(error)); }
-  if (value.usage !== undefined) try { parseModelUsage(value.usage); } catch (error) { issues.push(errorMessage(error)); }
+  nonempty(model, 'model', issues); nonempty(provider, 'provider', issues);
+  try { terminationReason = parseModelTerminationReason(value.terminationReason); } catch (error) { issues.push(errorMessage(error)); }
+  if (value.usage !== undefined) try { usage = parseModelUsage(value.usage); } catch (error) { issues.push(errorMessage(error)); }
   if (value.toolCalls !== undefined) {
     if (!Array.isArray(value.toolCalls)) issues.push('toolCalls must be an array.');
-    else for (const call of value.toolCalls) try { parseModelToolCall(call); } catch (error) { issues.push(errorMessage(error)); }
+    else {
+      toolCalls = [];
+      for (const call of value.toolCalls) try { toolCalls.push(parseModelToolCall(call)); } catch (error) { issues.push(errorMessage(error)); }
+    }
   }
-  if (value.providerState !== undefined) try { parseModelProviderState(value.providerState); } catch (error) { issues.push(errorMessage(error)); }
+  if (value.providerState !== undefined) try { providerState = parseModelProviderState(value.providerState); } catch (error) { issues.push(errorMessage(error)); }
   if (isRecord(value.providerState) && typeof value.provider === 'string' && value.providerState.provider !== value.provider) issues.push('providerState.provider must match response.provider.');
   if (value.requestId !== undefined) nonempty(value.requestId, 'requestId', issues);
   if (value.providerTerminationReason !== undefined) nonempty(value.providerTerminationReason, 'providerTerminationReason', issues);
-  if (value.transport !== undefined) validateTransport(value.transport, value.provider, issues);
+  if (value.transport !== undefined) try { transport = parseTransport(value.transport, value.provider); } catch (error) { issues.push(errorMessage(error)); }
   if (value.reasoning !== undefined && typeof value.reasoning !== 'string') issues.push('reasoning must be a string.');
   if (value.reasoningSummary !== undefined && typeof value.reasoningSummary !== 'string') issues.push('reasoningSummary must be a string.');
-  if (value.timings !== undefined && !validFiniteNumberRecord(value.timings)) issues.push('timings must contain finite nonnegative numbers.');
+  if (value.timings !== undefined) try { timings = parseFiniteNumberRecord(value.timings); } catch { issues.push('timings must contain finite nonnegative numbers.'); }
   if (issues.length > 0) throw contract('Invalid model response.', issues);
-  if (!isModelResponse(value)) throw contract('Invalid model response.', ['Validated fields did not form a model response.']);
   const response: ModelResponse = {
-    content: value.content,
-    model: value.model,
-    provider: value.provider,
-    terminationReason: parseModelTerminationReason(value.terminationReason),
-    ...(value.providerState === undefined ? {} : { providerState: parseModelProviderState(value.providerState) }),
+    content,
+    model,
+    provider,
+    terminationReason,
+    ...(providerState ? { providerState } : {}),
     ...(typeof value.requestId === 'string' ? { requestId: value.requestId } : {}),
-    ...(value.transport === undefined ? {} : { transport: ownedTransport(value.transport) }),
-    ...(value.usage === undefined ? {} : { usage: parseModelUsage(value.usage) }),
+    ...(transport ? { transport } : {}),
+    ...(usage ? { usage } : {}),
     ...(typeof value.reasoning === 'string' ? { reasoning: value.reasoning } : {}),
     ...(typeof value.reasoningSummary === 'string' ? { reasoningSummary: value.reasoningSummary } : {}),
-    ...(Array.isArray(value.toolCalls) ? { toolCalls: Object.freeze(value.toolCalls.map(parseModelToolCall)) } : {}),
+    ...(toolCalls ? { toolCalls: Object.freeze(toolCalls) } : {}),
     ...(typeof value.providerTerminationReason === 'string' ? { providerTerminationReason: value.providerTerminationReason } : {}),
-    ...(value.timings === undefined ? {} : { timings: ownedFiniteNumberRecord(value.timings) }),
+    ...(timings ? { timings } : {}),
     ...(Object.hasOwn(value, 'logprobs') ? { logprobs: ownedOpaque(value.logprobs) } : {}),
     ...(Object.hasOwn(value, 'raw') ? { raw: ownedOpaque(value.raw) } : {})
   };
@@ -335,31 +354,30 @@ function validReasoningCapabilities(value: unknown): boolean {
   return value.summaries === undefined || (stringArray(value.summaries) && value.summaries.every((item) => item === 'auto' || item === 'concise' || item === 'detailed'));
 }
 
-function validateTransport(value: unknown, provider: unknown, issues: string[]): void {
-  if (!isRecord(value) || !onlyKeys(value, ['provider', 'strategy', 'responseId', 'reusedContinuation', 'fallbackReason'])) {
-    issues.push('transport must be a valid transport metadata object.');
-    return;
-  }
-  nonempty(value.provider, 'transport.provider', issues);
-  nonempty(value.strategy, 'transport.strategy', issues);
-  if (typeof provider === 'string' && value.provider !== provider) issues.push('transport.provider must match response.provider.');
-  if (value.responseId !== undefined) nonempty(value.responseId, 'transport.responseId', issues);
-  if (value.reusedContinuation !== undefined && typeof value.reusedContinuation !== 'boolean') issues.push('transport.reusedContinuation must be boolean.');
-  if (value.fallbackReason !== undefined) nonempty(value.fallbackReason, 'transport.fallbackReason', issues);
-}
-function ownedTransport(value: unknown): import('./index.js').ModelTransportMetadata {
-  if (!isRecord(value)) throw contract('Invalid transport metadata.', ['Expected an object.']);
+function parseTransport(value: unknown, provider: unknown): ModelTransportMetadata {
+  if (!isRecord(value) || !onlyKeys(value, ['provider', 'strategy', 'responseId', 'reusedContinuation', 'fallbackReason'])) throw new Error('transport must be a valid transport metadata object.');
+  if (typeof value.provider !== 'string' || value.provider.trim().length === 0) throw new Error('transport.provider must be a non-empty string.');
+  if (typeof value.strategy !== 'string' || value.strategy.trim().length === 0) throw new Error('transport.strategy must be a non-empty string.');
+  if (typeof provider === 'string' && value.provider !== provider) throw new Error('transport.provider must match response.provider.');
+  if (value.responseId !== undefined && (typeof value.responseId !== 'string' || value.responseId.trim().length === 0)) throw new Error('transport.responseId must be a non-empty string.');
+  if (value.reusedContinuation !== undefined && typeof value.reusedContinuation !== 'boolean') throw new Error('transport.reusedContinuation must be boolean.');
+  if (value.fallbackReason !== undefined && (typeof value.fallbackReason !== 'string' || value.fallbackReason.trim().length === 0)) throw new Error('transport.fallbackReason must be a non-empty string.');
   return Object.freeze({
-    provider: value.provider as string,
-    strategy: value.strategy as string,
+    provider: value.provider,
+    strategy: value.strategy,
     ...(typeof value.responseId === 'string' ? { responseId: value.responseId } : {}),
     ...(typeof value.reusedContinuation === 'boolean' ? { reusedContinuation: value.reusedContinuation } : {}),
     ...(typeof value.fallbackReason === 'string' ? { fallbackReason: value.fallbackReason } : {})
   });
 }
-function ownedFiniteNumberRecord(value: unknown): Record<string, number> {
-  const parsed = parseJsonObject(value);
-  return Object.freeze(Object.fromEntries(Object.entries(parsed).map(([key, item]) => [key, item as number])));
+function parseFiniteNumberRecord(value: unknown): Record<string, number> {
+  const parsed = parseJsonObject(value, MODEL_JSON_LIMITS);
+  const output: Record<string, number> = {};
+  for (const [key, item] of Object.entries(parsed)) {
+    if (!nonnegativeFinite(item)) throw new Error('Expected finite nonnegative numbers.');
+    output[key] = item;
+  }
+  return Object.freeze(output);
 }
 function ownedOpaque(value: unknown): unknown {
   return parseJsonValue(normalizeJsonSafe(value, { maxDepth: 32, maxCollectionEntries: 20_000, maxStringBytes: 1024 * 1024, maxTotalBytes: 4 * 1024 * 1024 }).value);
@@ -376,53 +394,6 @@ function validProviderOptions(value: unknown): boolean { return isRecord(value) 
 function validSummary(value: unknown): boolean { return value === undefined || value === 'auto' || value === 'concise' || value === 'detailed'; }
 function onlyKeys(value: Record<string, unknown>, keys: string[]): boolean { const allowed = new Set(keys); return Object.keys(value).every((key) => allowed.has(key)); }
 function isAbortSignal(value: unknown): value is AbortSignal { return isRecord(value) && typeof value.aborted === 'boolean' && typeof value.addEventListener === 'function'; }
-function isModelProfile(value: Record<string, unknown>): value is Record<string, unknown> & ModelProfile {
-  if (typeof value.id !== 'string' || value.id.trim().length === 0 || typeof value.provider !== 'string' || value.provider.trim().length === 0
-    || (value.displayName !== undefined && typeof value.displayName !== 'string')) return false;
-  const capabilities = value.capabilities;
-  if (!isRecord(capabilities)
-    || !['streaming', 'toolCalling', 'jsonMode', 'jsonSchema', 'logprobs', 'temperature', 'topP'].every((name) => typeof capabilities[name] === 'boolean')
-    || !Array.isArray(capabilities.supportedToolInputs) || !capabilities.supportedToolInputs.every(isModelToolInputSupport)
-    || (capabilities.reasoning !== undefined && !validReasoningCapabilities(capabilities.reasoning))) return false;
-  const modalities = value.modalities;
-  if (!isRecord(modalities) || !stringArray(modalities.input) || !stringArray(modalities.output)) return false;
-  const limits = value.limits;
-  return isRecord(limits)
-    && ['contextTokens', 'maxInputTokens', 'outputTokens'].every((name) => limits[name] === undefined || positiveInteger(limits[name]))
-    && Array.isArray(value.supportedParameters) && value.supportedParameters.every(isModelParameter)
-    && (value.pricing === undefined || validPricing(value.pricing))
-    && (value.metadata === undefined || isJsonObject(value.metadata));
-}
-function isModelRequest(value: Record<string, unknown>): value is Record<string, unknown> & ModelRequest {
-  return typeof value.model === 'string' && value.model.trim().length > 0
-    && Array.isArray(value.messages) && value.messages.length > 0 && value.messages.every(isModelMessage)
-    && (value.temperature === undefined || finiteInRange(value.temperature, 0, 2))
-    && (value.topP === undefined || finiteInRange(value.topP, 0, 1))
-    && (value.maxOutputTokens === undefined || positiveInteger(value.maxOutputTokens))
-    && (value.responseFormat === undefined || validResponseFormat(value.responseFormat))
-    && (value.tools === undefined || (Array.isArray(value.tools) && value.tools.every(validModelTool)))
-    && (value.keepAlive === undefined || typeof value.keepAlive === 'string' || nonnegativeFinite(value.keepAlive))
-    && (value.reasoning === undefined || validReasoningRequest(value.reasoning))
-    && (value.logprobs === undefined || typeof value.logprobs === 'boolean')
-    && (value.topLogprobs === undefined || nonnegativeInteger(value.topLogprobs))
-    && (value.providerOptions === undefined || validProviderOptions(value.providerOptions))
-    && (value.metadata === undefined || validStringMetadata(value.metadata))
-    && (value.signal === undefined || isAbortSignal(value.signal));
-}
-function isModelMessage(value: unknown): value is ModelRequest['messages'][number] {
-  if (!isRecord(value) || typeof value.content !== 'string' || (value.name !== undefined && typeof value.name !== 'string')) return false;
-  if (value.role === 'system') return onlyKeys(value, ['role', 'content', 'name']);
-  if (value.role === 'user') return onlyKeys(value, ['role', 'content', 'name', 'images']) && (value.images === undefined || (Array.isArray(value.images) && value.images.every(validImage)));
-  if (value.role === 'assistant') return onlyKeys(value, ['role', 'content', 'name', 'reasoning', 'toolCalls'])
-    && (value.reasoning === undefined || typeof value.reasoning === 'string')
-    && (value.toolCalls === undefined || (Array.isArray(value.toolCalls) && value.toolCalls.every(isModelToolCall)));
-  return value.role === 'tool' && onlyKeys(value, ['role', 'content', 'name', 'toolName', 'toolCallId', 'toolCallType', 'images'])
-    && typeof value.toolName === 'string' && value.toolName.trim().length > 0
-    && (value.toolCallId === undefined || typeof value.toolCallId === 'string')
-    && (value.toolCallType === 'function' || value.toolCallType === 'custom')
-    && (value.images === undefined || (Array.isArray(value.images) && value.images.every(validImage)));
-}
-
 function ownedModelRequest(value: Record<string, unknown>): ModelRequest {
   const messages = (value.messages as unknown[]).map((raw) => {
     const message = raw as Record<string, unknown>;
@@ -480,42 +451,9 @@ function validStringMetadata(value: unknown): boolean {
   try { return Object.entries(parseJsonObject(value)).every(([, item]) => typeof item === 'string'); }
   catch { return false; }
 }
-function validFiniteNumberRecord(value: unknown): boolean {
-  try { return Object.entries(parseJsonObject(value)).every(([, item]) => nonnegativeFinite(item)); }
-  catch { return false; }
-}
-function isModelUsage(value: Record<string, unknown>): value is Record<string, unknown> & ModelUsage {
-  return nonnegativeFinite(value.promptTokens) && nonnegativeFinite(value.completionTokens) && nonnegativeFinite(value.totalTokens)
-    && (value.cacheReadTokens === undefined || nonnegativeFinite(value.cacheReadTokens))
-    && (value.cacheWriteTokens === undefined || nonnegativeFinite(value.cacheWriteTokens))
-    && (value.reasoningTokens === undefined || nonnegativeFinite(value.reasoningTokens));
-}
-function isModelToolCall(value: unknown): value is ModelToolCall {
-  return isRecord(value) && typeof value.name === 'string' && value.name.trim().length > 0
-    && (value.id === undefined || typeof value.id === 'string') && isRecord(value.input)
-    && ((value.type === 'function' && value.input.kind === 'json' && isJsonObject(value.input.value))
-      || (value.type === 'custom' && value.input.kind === 'text' && typeof value.input.value === 'string'));
-}
-function isModelResponse(value: Record<string, unknown>): value is Record<string, unknown> & ModelResponse {
-  return typeof value.content === 'string' && typeof value.model === 'string' && value.model.trim().length > 0
-    && typeof value.provider === 'string' && value.provider.trim().length > 0 && isModelTerminationReason(value.terminationReason)
-    && (value.providerState === undefined || isModelProviderState(value.providerState))
-    && (value.requestId === undefined || (typeof value.requestId === 'string' && value.requestId.trim().length > 0))
-    && (value.usage === undefined || (isRecord(value.usage) && isModelUsage(value.usage)))
-    && (value.toolCalls === undefined || (Array.isArray(value.toolCalls) && value.toolCalls.every(isModelToolCall)))
-    && (value.reasoning === undefined || typeof value.reasoning === 'string')
-    && (value.reasoningSummary === undefined || typeof value.reasoningSummary === 'string')
-    && (value.providerTerminationReason === undefined || (typeof value.providerTerminationReason === 'string' && value.providerTerminationReason.trim().length > 0))
-    && (value.timings === undefined || validFiniteNumberRecord(value.timings));
-}
-function isModelProviderState(value: unknown): value is ModelProviderState {
-  return isRecord(value) && typeof value.provider === 'string' && value.provider.length > 0
-    && typeof value.model === 'string' && value.model.length > 0 && typeof value.kind === 'string' && value.kind.length > 0 && isJsonObject(value.data);
-}
 function isModelTerminationReason(value: unknown): value is ModelTerminationReason {
   return value === 'stop' || value === 'tool_calls' || value === 'output_limit' || value === 'content_filter' || value === 'unknown';
 }
-function isModelParameter(value: unknown): value is ModelProfile['supportedParameters'][number] { return typeof value === 'string' && MODEL_PARAMETERS.has(value); }
 function isModelToolInputSupport(value: unknown): value is ModelProfile['capabilities']['supportedToolInputs'][number] {
   if (!isRecord(value)) return false;
   if (value.kind === 'json' || value.kind === 'text') return onlyKeys(value, ['kind']);
@@ -529,7 +467,7 @@ const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', '
 const MODEL_PARAMETERS = new Set(['temperature', 'topP', 'maxOutputTokens', 'responseFormat', 'tools', 'keepAlive', 'reasoning', 'logprobs', 'topLogprobs', 'metadata', 'providerOptions']);
 function isJsonObject(value: unknown): value is import('./index.js').ModelProviderStateObject {
   try {
-    parseJsonObject(value, { maxDepth: 64, maxCollectionEntries: 10_000, maxStringBytes: 1024 * 1024, maxTotalBytes: 4 * 1024 * 1024 });
+    parseJsonObject(value, MODEL_JSON_LIMITS);
     return true;
   } catch { return false; }
 }

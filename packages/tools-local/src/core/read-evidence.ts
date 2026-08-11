@@ -1,4 +1,4 @@
-import { evidenceDelta, type EvidenceAction, type EvidenceResource, type ToolEvidenceDelta } from '@agent-core/evidence';
+import { type EvidenceAction, type EvidenceResource, type ToolEvidenceDelta } from '@agent-core/evidence';
 import type { ToolScope } from '@agent-core/tools';
 
 /** Build read-tool evidence from the same ToolScope persisted on the observation. */
@@ -8,7 +8,7 @@ export function builtInReadEvidence(
   summary: string,
   options: { readonly outcome?: 'success' | 'failure'; readonly confidence?: 'verified' | 'unverified' } = {}
 ): ToolEvidenceDelta {
-  return evidenceDelta([{
+  return { items: [{
     action,
     resources: scope.resources.map(resourceFromScope),
     scope: {
@@ -21,7 +21,7 @@ export function builtInReadEvidence(
     },
     summary,
     outcome: options.outcome ?? 'success'
-  }]);
+  }] };
 }
 
 function resourceFromScope(scope: string): EvidenceResource {

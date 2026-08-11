@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
-  normalizeToolEvidenceDelta,
+  projectToolEvidence,
   redactJson,
   type ArtifactRef,
   type ArtifactRepository,
@@ -145,7 +145,7 @@ export class ObservationStore {
       retainedPresentation,
       immediateImages,
       imageArtifacts,
-      evidence: Object.freeze(normalizeToolEvidenceDelta(committed.durableObservation.evidence, { observationId: committed.id, toolName: committed.toolName, createdAt: committed.createdAt })),
+      evidence: Object.freeze(projectToolEvidence(committed.durableObservation.evidence, { observationId: committed.id, toolName: committed.toolName, createdAt: committed.createdAt })),
       ...(committed.durableStorageDegraded ? { durableStorageDegraded: committed.durableStorageDegraded } : {}),
       createdAt: committed.createdAt
     });

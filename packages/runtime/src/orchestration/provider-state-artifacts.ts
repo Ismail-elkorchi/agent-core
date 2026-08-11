@@ -1,5 +1,4 @@
 import type { ArtifactRef, ArtifactRepository } from '@agent-core/evidence';
-import { isJsonObject } from '@agent-core/json';
 import type { ModelProviderState } from '@agent-core/model';
 import type { AgentProviderStateReference } from '../events.js';
 import { summarizeProviderState } from './event-summaries.js';
@@ -40,7 +39,7 @@ function isProviderState(value: unknown): value is ModelProviderState {
     && typeof value.provider === 'string'
     && typeof value.model === 'string'
     && typeof value.kind === 'string'
-    && isJsonObject(value.data);
+    && isRecord(value.data);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

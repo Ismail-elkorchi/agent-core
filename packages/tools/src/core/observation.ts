@@ -88,7 +88,7 @@ function parseOwnedToolObservation(tool: Pick<ToolDefinition, 'outputSchema'> | 
   if (Buffer.byteLength(record.summary, 'utf8') > 64_000) throw new Error('Tool observation summary exceeds the host limit.');
   const scope = parseToolScope(record.scope);
   const content = parseContent(record.content);
-  const metadata = record.metadata === undefined ? undefined : parseJsonObject(record.metadata, JSON_LIMITS);
+  const metadata = record.metadata === undefined ? undefined : requireJsonObject(record.metadata, 'Tool observation metadata');
   const evidence = record.evidence === undefined ? undefined : parseEvidence(record.evidence);
   if (record.kind === 'result' && typeof record.ok === 'boolean') {
     if (!tool) throw new Error('A result observation requires its tool definition.');
@@ -113,8 +113,9 @@ export function normalizeToolObservationForPersistence(value: unknown): ToolObse
   return parseOwnedToolObservation(record.kind === 'result' ? persistenceTool() : undefined, record);
 }
 
-export function parseToolScope(value: unknown): ToolScope {
-  const record = parseJsonObject(value, JSON_LIMITS);
+function parseToolScope(value: JsonValue | undefined): ToolScope {
+  if (value === undefined) throw new Error('Tool scope must be an object.');
+  const record = requireJsonObject(value, 'Tool scope');
   const unknown = Object.keys(record).filter((key) => !['resources', 'filters', 'limits', 'omitted', 'coverage', 'truncated', 'causes'].includes(key));
   if (unknown.length > 0) throw new Error('Tool scope contains unsupported fields: ' + unknown.join(', ') + '.');
   if (!Array.isArray(record.resources) || !record.resources.every((item) => typeof item === 'string')) throw new Error('Tool scope resources must be strings.');
@@ -124,9 +125,9 @@ export function parseToolScope(value: unknown): ToolScope {
   if (rawCauses !== undefined && (!Array.isArray(rawCauses) || !rawCauses.every((item) => typeof item === 'string' && item.length > 0))) throw new Error('Tool scope causes must be non-empty strings.');
   const resources = Object.freeze(record.resources.map(validateResourceScope));
   if (new Set(resources).size !== resources.length) throw new Error('Tool scope resources must be unique.');
-  const filters = record.filters === undefined ? undefined : parseJsonObject(record.filters);
-  const limits = record.limits === undefined ? undefined : parseJsonObject(record.limits);
-  const omitted = record.omitted === undefined ? undefined : parseJsonObject(record.omitted);
+  const filters = record.filters === undefined ? undefined : requireJsonObject(record.filters, 'Tool scope filters');
+  const limits = record.limits === undefined ? undefined : requireJsonObject(record.limits, 'Tool scope limits');
+  const omitted = record.omitted === undefined ? undefined : requireJsonObject(record.omitted, 'Tool scope omitted');
   const causes = rawCauses === undefined ? undefined : Object.freeze([...new Set(rawCauses as string[])]);
   if (record.coverage === 'complete' && (record.truncated === true || (causes?.length ?? 0) > 0)) throw new Error('A complete tool scope cannot be truncated or have omission causes.');
   return Object.freeze({
@@ -146,14 +147,14 @@ function parseFailureOutput(value: JsonObject): ToolFailureOutput {
   if (value.reason === 'runtime_error' && typeof value.error === 'string') return Object.freeze({ blocked: true, reason: 'runtime_error', recovery: value.recovery, error: value.error, ...(jsonObject(value.details) ? { details: value.details } : {}) });
   throw new Error('Tool failure output does not match a declared failure contract.');
 }
-function parseContent(value: unknown): readonly ToolContent[] | undefined {
+function parseContent(value: JsonValue | undefined): readonly ToolContent[] | undefined {
   if (value === undefined) return undefined;
   if (!Array.isArray(value)) throw new Error('Tool observation content must be an array.');
   return Object.freeze(value.map((item): ToolContent => {
-    const record = ownRecord(item, 'Tool content');
+    const record = requireJsonObject(item, 'Tool content');
     if (record.type === 'text' && typeof record.text === 'string' && (record.mediaType === undefined || typeof record.mediaType === 'string')) return Object.freeze({ type: 'text', text: record.text, ...(record.mediaType ? { mediaType: record.mediaType } : {}) });
     if ((record.type === 'image' || record.type === 'artifact') && record.artifact !== undefined) {
-      const artifact = parseJsonObject(record.artifact, JSON_LIMITS);
+      const artifact = requireJsonObject(record.artifact, 'Tool content artifact');
       validatePublicArtifactRef(artifact);
       if (record.type === 'image' && (record.detail === 'high' || record.detail === 'original')) return Object.freeze({ type: 'image', artifact, detail: record.detail });
       if (record.type === 'artifact') return Object.freeze({ type: 'artifact', artifact });
@@ -161,8 +162,8 @@ function parseContent(value: unknown): readonly ToolContent[] | undefined {
     throw new Error('Tool observation content item is invalid or uses an unsupported modality.');
   }));
 }
-function parseEvidence(value: unknown): ToolEvidenceDelta {
-  return parseToolEvidenceDelta(value);
+function parseEvidence(value: JsonValue): ToolEvidenceDelta {
+  return parseToolEvidenceDelta(requireJsonObject(value, 'Tool evidence'));
 }
 function persistenceTool(): Pick<ToolDefinition, 'outputSchema'> {
   return { outputSchema: z.unknown() };
@@ -171,21 +172,11 @@ function freezeFailure<T extends ToolFailureOutput>(summary: string, output: T):
   return Object.freeze({ kind: 'failure', ok: false, summary, scope: failureScope(), output });
 }
 function failureScope(): ToolScope { return Object.freeze({ resources: Object.freeze([]), coverage: 'partial', causes: Object.freeze(['tool_failure']) }); }
-function ownRecord(value: unknown, label: string): Record<string, unknown> {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error(label + ' must be an object.');
-  const prototype: unknown = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) throw new Error(label + ' has an unsupported prototype.');
-  const output: Record<string, unknown> = {};
-  for (const key of Reflect.ownKeys(value)) {
-    if (typeof key !== 'string') throw new Error(label + ' contains a symbol key.');
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor?.enumerable) continue;
-    if (!('value' in descriptor)) throw new Error(label + ' contains an accessor.');
-    output[key] = descriptor.value;
-  }
-  return output;
-}
 function jsonObject(value: JsonValue | undefined): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }
+function requireJsonObject(value: JsonValue, label: string): JsonObject {
+  if (!jsonObject(value)) throw new Error(label + ' must be an object.');
+  return value;
+}
 function isToolCall(value: JsonValue | undefined): boolean {
   return jsonObject(value) && typeof value.name === 'string' && (value.id === undefined || typeof value.id === 'string') && jsonObject(value.input)
     && ((value.input.kind === 'text' && typeof value.input.value === 'string') || (value.input.kind === 'json' && jsonObject(value.input.value)));

@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { evidenceDelta, workspaceResource, type EvidenceAction, type ToolEvidenceItem } from '@agent-core/evidence';
+import { workspaceResource, type EvidenceAction, type ToolEvidenceItem } from '@agent-core/evidence';
 import { PATCH_JOURNAL_SCOPE, requireToolService, requireWorkspaceRoot, throwIfAborted, ToolInputError, workspaceFileScope, type ToolExecutionContext } from '@agent-core/tools';
 import type { ToolObservation } from '@agent-core/tools';
 import {
@@ -158,7 +158,7 @@ export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, c
       ...(operationStatus === 'uncertain' ? { causes: ['workspace_state_uncertain'], omitted: { potentiallyAffectedPaths: wouldChangePaths.length } } : {})
     },
     output,
-    evidence: evidenceDelta(patchEvidenceItems(output)),
+    evidence: { items: patchEvidenceItems(output) },
     ...(!dryRun ? { metadata: { changedPaths: output.changedPaths } } : {})
   };
 }

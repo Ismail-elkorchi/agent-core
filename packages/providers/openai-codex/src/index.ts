@@ -14,7 +14,8 @@ import {
   type ModelRequest,
   type ModelResponse,
   type ModelStreamEvent,
-  type ModelToolCall
+  type ModelToolCall,
+  parseModelRequest
 } from '@agent-core/model';
 
 import {
@@ -162,17 +163,19 @@ export class OpenAICodexProvider implements ModelProvider {
   }
 
   async fetchResponse(request: ModelRequest, stream: boolean): Promise<Response> {
-    await this.validateRequest(request);
     return fetchCodexResponse(this.httpTransportConfig(), request, stream);
   }
 
   async *streamHttp(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
-    await this.validateRequest(request);
     yield* streamCodexHttp(this.httpTransportConfig(), request);
   }
 
-  async validateRequest(request: ModelRequest): Promise<void> {
-    try { assertModelRequestSupported(await this.describeModel(request.model), request); }
+  async validateRequest(request: ModelRequest): Promise<ModelRequest> {
+    try {
+      const owned = parseModelRequest(request);
+      assertModelRequestSupported(await this.describeModel(owned.model), owned);
+      return owned;
+    }
     catch (error) { throw normalizeError(this.id, error); }
   }
 
@@ -232,6 +235,7 @@ class OpenAICodexProviderSession implements ModelProviderSession {
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
     try {
+      request = await this.provider.validateRequest(request);
       const response = await this.provider.fetchResponse(request, false);
       const payload = await parseJsonResponse<OpenAICodexResponsesPayload>(this.provider.id, response);
       const modelResponse = toModelResponse(this.provider.id, request, payload, { strategy: 'http_full_replay' });
@@ -244,7 +248,7 @@ class OpenAICodexProviderSession implements ModelProviderSession {
   }
 
   async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
-    await this.provider.validateRequest(request);
+    request = await this.provider.validateRequest(request);
     if (!this.provider.shouldUseWebSocket()) {
       yield* this.streamHttp(request);
       return;

@@ -177,8 +177,8 @@ test('tool registration snapshots mutable consumer definition contracts', () => 
     effectEnvelope: { accesses, lockScopes: [] }, canonicalizeInput: (input) => input, deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'workspace/files' }], lockScopes: [], idempotency: 'pure' }),
     invoke: async () => ({ kind: 'result', ok: true, summary: 'ok', scope: { resources: [], coverage: 'complete' }, output: {} })
   });
-  accesses[0].mode = 'write'; requirements[0] = 'processManager';
   const registered = validateToolDefinition(definition);
+  accesses[0].mode = 'write'; requirements[0] = 'processManager';
   assert.equal(registered.effectEnvelope.accesses[0].mode, 'read');
   assert.deepEqual(registered.requirements.services, ['workspaceRoot']);
   assert.equal(Object.isFrozen(registered.effectEnvelope.accesses), true);

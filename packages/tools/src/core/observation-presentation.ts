@@ -1,4 +1,4 @@
-import { isJsonObject, isJsonValue, normalizeJsonSafe, parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
+import { normalizeJsonSafe, parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
 import type { ToolCall, ToolObservation } from './definition.js';
 export type { JsonObject, JsonValue } from '@agent-core/json';
 
@@ -39,7 +39,6 @@ export function validateToolObservationPresentation(value: unknown): ToolObserva
   requireType(owned, 'title', 'string', issues);
   requireType(owned, 'summary', 'string', issues);
   for (const key of ['scope', 'filters', 'limits', 'omitted']) optionalObject(owned, key, issues);
-  for (const key of ['results', 'failures']) optionalJson(owned, key, issues);
   if (owned.coverage !== undefined && owned.coverage !== 'complete' && owned.coverage !== 'partial') issues.push({ path: '$.coverage', message: 'Field coverage must be complete or partial.' });
   optionalType(owned, 'truncated', 'boolean', issues);
   optionalType(owned, 'next', 'string', issues);
@@ -76,15 +75,13 @@ function optionalType(value: JsonObject, key: string, expected: 'boolean' | 'str
   if (key in value && typeof value[key] !== expected) issues.push({ path: '$.' + key, message: 'Field ' + key + ' must be ' + expected + '.' });
 }
 function optionalObject(value: JsonObject, key: string, issues: ToolObservationPresentationValidationIssue[]): void {
-  if (key in value && !isJsonObject(value[key])) issues.push({ path: '$.' + key, message: 'Field ' + key + ' must be a JSON object.' });
-}
-function optionalJson(value: JsonObject, key: string, issues: ToolObservationPresentationValidationIssue[]): void {
-  if (key in value && !isJsonValue(value[key])) issues.push({ path: '$.' + key, message: 'Field ' + key + ' must be JSON.' });
+  if (key in value && !jsonObject(value[key])) issues.push({ path: '$.' + key, message: 'Field ' + key + ' must be a JSON object.' });
 }
 function recoveryFromJson(value: JsonValue): string | undefined {
-  return isJsonObject(value) && typeof value.recovery === 'string' ? value.recovery : undefined;
+  return jsonObject(value) && typeof value.recovery === 'string' ? value.recovery : undefined;
 }
 function toObject(value: unknown): JsonObject {
   const normalized = toJsonValue(value);
-  return isJsonObject(normalized) ? normalized : parseJsonObject({ value: normalized });
+  return jsonObject(normalized) ? normalized : { value: normalized };
 }
+function jsonObject(value: JsonValue | undefined): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }

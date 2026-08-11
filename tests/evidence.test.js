@@ -1,8 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  evidenceDelta,
-  normalizeToolEvidenceDelta,
+  projectToolEvidence,
   parseToolEvidenceDelta,
   toEvidenceJsonObject,
   workspaceResource
@@ -66,8 +65,8 @@ test('JSON normalization duplicates shared values without misclassifying them as
   assert.deepEqual(JSON.parse(JSON.stringify(result.value)), { left: { value: 1 }, right: { value: 1 } });
 });
 
-test('evidence deltas normalize into observation-scoped records', () => {
-  const records = normalizeToolEvidenceDelta(evidenceDelta([
+test('decoded evidence deltas project into observation-scoped records', () => {
+  const delta = parseToolEvidenceDelta(parseJsonObject({ items: [
     {
       action: 'read',
       resources: [workspaceResource('notes/a.txt', {
@@ -85,7 +84,8 @@ test('evidence deltas normalize into observation-scoped records', () => {
       summary: 'Read a window.',
       outcome: 'success'
     }
-  ]), {
+  ] }));
+  const records = projectToolEvidence(delta, {
     observationId: 'obs-1',
     toolName: 'read_files',
     createdAt: '2026-06-23T00:00:00.000Z'
@@ -104,8 +104,8 @@ test('evidence deltas normalize into observation-scoped records', () => {
   });
   assert.deepEqual(records[0].scope.filters, { hidden: 'exclude' });
   assert.equal(records[0].scope.confidence, 'verified');
-  assert.throws(() => parseToolEvidenceDelta({ items: [{ action: 'not-real', outcome: 'success', resources: [] }] }), /action/u);
-  assert.throws(() => parseToolEvidenceDelta({ items: [{ action: 'read', outcome: 'success', resources: [{ uri: '' }] }] }), /URI/u);
-  assert.throws(() => parseToolEvidenceDelta({ items: [{ action: 'read', outcome: 'success', resources: [], scope: { coverage: 'complete', truncated: true } }] }), /complete and truncated/u);
-  assert.throws(() => parseToolEvidenceDelta({ items: [{ action: 'read', outcome: 'failure', resources: [], unexpected: true }] }), /unsupported fields/u);
+  assert.throws(() => parseToolEvidenceDelta(parseJsonObject({ items: [{ action: 'not-real', outcome: 'success', resources: [] }] })), /action/u);
+  assert.throws(() => parseToolEvidenceDelta(parseJsonObject({ items: [{ action: 'read', outcome: 'success', resources: [{ uri: '' }] }] })), /URI/u);
+  assert.throws(() => parseToolEvidenceDelta(parseJsonObject({ items: [{ action: 'read', outcome: 'success', resources: [], scope: { coverage: 'complete', truncated: true } }] })), /complete and truncated/u);
+  assert.throws(() => parseToolEvidenceDelta(parseJsonObject({ items: [{ action: 'read', outcome: 'failure', resources: [], unexpected: true }] })), /unsupported fields/u);
 });

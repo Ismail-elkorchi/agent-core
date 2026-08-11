@@ -5,7 +5,7 @@ import {
   type ArtifactRef,
   validateArtifactRef
 } from '@agent-core/evidence';
-import { isJsonObject, normalizeJsonSafe, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
+import { normalizeJsonSafe, type JsonObject, type JsonValue } from '@agent-core/json';
 import {
   PersistenceConflictError,
   PersistenceCorruptionError,
@@ -415,8 +415,9 @@ function normalizeObservationOutput(value: unknown): JsonValue {
 }
 function normalizeMetadata(value: unknown): JsonObject {
   const normalized = normalizeJsonSafe(value).value;
-  return isJsonObject(normalized) ? normalized : Object.freeze({ value: normalized });
+  return isOwnedJsonObject(normalized) ? normalized : Object.freeze({ value: normalized });
 }
+function isOwnedJsonObject(value: JsonValue): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function validArtifactRefs(value: unknown): value is readonly ArtifactRef[] | undefined {
   if (value === undefined) return true;
   if (!Array.isArray(value)) return false;
@@ -469,12 +470,12 @@ function isSessionInputEntry(value: Record<string, unknown> & BaseSessionEntry):
 function isSessionToolCallEntry(value: Record<string, unknown> & BaseSessionEntry): value is Record<string, unknown> & SessionToolCallEntry {
   return value.type === 'tool_call' && validTurnIdentity(value) && typeof value.runId === 'string' && value.runId.length > 0
     && typeof value.toolBatchId === 'string' && value.toolBatchId.length > 0 && nonnegativeInteger(value.callIndex)
-    && (value.callId === undefined || typeof value.callId === 'string') && isJson(value.call);
+    && (value.callId === undefined || typeof value.callId === 'string') && value.call !== undefined;
 }
 function isSessionObservationEntry(value: Record<string, unknown> & BaseSessionEntry): value is Record<string, unknown> & SessionObservationEntry {
   return value.type === 'observation' && validTurnIdentity(value) && typeof value.runId === 'string' && value.runId.length > 0
     && typeof value.toolName === 'string' && value.toolName.length > 0 && typeof value.ok === 'boolean' && typeof value.summary === 'string'
-    && (value.output === undefined || isJson(value.output)) && (value.metadata === undefined || isJsonObject(value.metadata))
+    && (value.metadata === undefined || isRecord(value.metadata))
     && validArtifactRefs(value.artifacts) && (value.callId === undefined || typeof value.callId === 'string')
     && (value.toolBatchId === undefined
       ? value.callIndex === undefined && value.callId === undefined && value.toolAttempt === undefined
@@ -488,7 +489,6 @@ function isSessionModelSettingsEntry(value: Record<string, unknown> & BaseSessio
     && (value.temperature === undefined || (typeof value.temperature === 'number' && Number.isFinite(value.temperature)))
     && (value.reasoningEffort === undefined || typeof value.reasoningEffort === 'string');
 }
-function isJson(value: unknown): value is JsonValue { try { parseJsonValue(value); return true; } catch { return false; } }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function nodeCode(error: unknown): string | undefined { return isRecord(error) && typeof error.code === 'string' ? error.code : undefined; }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }

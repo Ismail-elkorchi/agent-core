@@ -1,4 +1,4 @@
-import { parseJsonObject, type JsonObject, type JsonPrimitive, type JsonValue } from '@agent-core/json';
+import { type JsonObject, type JsonPrimitive, type JsonValue } from '@agent-core/json';
 
 export type JsonMember = JsonValue;
 
@@ -66,11 +66,10 @@ export interface EvidenceRecordContext {
   createdAt?: string;
 }
 
-export function normalizeToolEvidenceDelta(delta: unknown, context: EvidenceRecordContext): EvidenceRecord[] {
+export function projectToolEvidence(delta: ToolEvidenceDelta | undefined, context: EvidenceRecordContext): EvidenceRecord[] {
   if (delta === undefined) return [];
-  const parsed = parseToolEvidenceDelta(delta);
   const createdAt = context.createdAt ?? new Date().toISOString();
-  return parsed.items.map((item, index): EvidenceRecord => Object.freeze({
+  return delta.items.map((item, index): EvidenceRecord => Object.freeze({
       id: `${context.observationId}:evidence:${String(index + 1)}`,
       observationId: context.observationId,
       toolName: context.toolName,
@@ -83,16 +82,11 @@ export function normalizeToolEvidenceDelta(delta: unknown, context: EvidenceReco
     }));
 }
 
-export function evidenceDelta(items: readonly ToolEvidenceItem[]): ToolEvidenceDelta {
-  return parseToolEvidenceDelta({ items });
-}
-
-/** The single ownership and validation boundary for evidence emitted by tools. */
-export function parseToolEvidenceDelta(value: unknown): ToolEvidenceDelta {
-  const record = parseJsonObject(value);
-  rejectUnknown(record, ['items'], 'Tool evidence');
-  if (!Array.isArray(record.items)) throw new Error('Tool evidence must contain an items array.');
-  return Object.freeze({ items: Object.freeze(record.items.map((item, index) => parseEvidenceItem(item, index))) });
+/** Semantic validation for evidence in an already-decoded JSON observation. */
+export function parseToolEvidenceDelta(value: JsonObject): ToolEvidenceDelta {
+  rejectUnknown(value, ['items'], 'Tool evidence');
+  if (!Array.isArray(value.items)) throw new Error('Tool evidence must contain an items array.');
+  return Object.freeze({ items: Object.freeze(value.items.map((item, index) => parseEvidenceItem(item, index))) });
 }
 
 export function workspaceResource(path: string, options: Omit<EvidenceResource, 'uri'> = {}): EvidenceResource {
@@ -114,7 +108,7 @@ export function toEvidenceJsonObject(value: Record<string, unknown>): JsonObject
 }
 
 function parseEvidenceItem(value: JsonValue, index: number): ToolEvidenceItem {
-  const item = parseJsonObject(value);
+  const item = requireJsonObject(value, `Tool evidence item ${String(index)}`);
   rejectUnknown(item, ['action', 'resources', 'scope', 'summary', 'outcome'], `Tool evidence item ${String(index)}`);
   if (!isEvidenceAction(item.action)) throw new Error(`Tool evidence item ${String(index)} has an invalid action.`);
   if (item.outcome !== 'success' && item.outcome !== 'failure') throw new Error(`Tool evidence item ${String(index)} has an invalid outcome.`);
@@ -134,7 +128,7 @@ function parseEvidenceItem(value: JsonValue, index: number): ToolEvidenceItem {
 }
 
 function parseEvidenceResource(value: JsonValue, itemIndex: number, resourceIndex: number): EvidenceResource {
-  const resource = parseJsonObject(value);
+  const resource = requireJsonObject(value, `Tool evidence resource ${String(itemIndex)}:${String(resourceIndex)}`);
   rejectUnknown(resource, ['uri', 'range', 'sha256', 'fullSha256', 'mediaType'], `Tool evidence resource ${String(itemIndex)}:${String(resourceIndex)}`);
   if (typeof resource.uri !== 'string' || resource.uri.trim().length === 0 || Buffer.byteLength(resource.uri, 'utf8') > 1_000) {
     throw new Error(`Tool evidence resource ${String(itemIndex)}:${String(resourceIndex)} has an invalid URI.`);
@@ -156,7 +150,7 @@ function parseEvidenceResource(value: JsonValue, itemIndex: number, resourceInde
 }
 
 function parseEvidenceRange(value: JsonValue, itemIndex: number, resourceIndex: number): EvidenceRange {
-  const range = parseJsonObject(value);
+  const range = requireJsonObject(value, `Tool evidence range ${String(itemIndex)}:${String(resourceIndex)}`);
   rejectUnknown(range, ['kind', 'start', 'end'], `Tool evidence range ${String(itemIndex)}:${String(resourceIndex)}`);
   if (range.kind !== 'line' && range.kind !== 'byte') throw new Error(`Tool evidence range ${String(itemIndex)}:${String(resourceIndex)} has an invalid kind.`);
   const minimum = range.kind === 'line' ? 1 : 0;
@@ -169,16 +163,16 @@ function parseEvidenceRange(value: JsonValue, itemIndex: number, resourceIndex: 
 }
 
 function parseEvidenceScope(value: JsonValue, itemIndex: number): EvidenceScope {
-  const scope = parseJsonObject(value);
+  const scope = requireJsonObject(value, `Tool evidence scope ${String(itemIndex)}`);
   rejectUnknown(scope, ['filters', 'limits', 'omitted', 'coverage', 'truncated', 'confidence'], `Tool evidence scope ${String(itemIndex)}`);
   if (scope.coverage !== undefined && scope.coverage !== 'complete' && scope.coverage !== 'partial' && scope.coverage !== 'absent') throw new Error(`Tool evidence scope ${String(itemIndex)} has invalid coverage.`);
   if (scope.truncated !== undefined && typeof scope.truncated !== 'boolean') throw new Error(`Tool evidence scope ${String(itemIndex)} has invalid truncation.`);
   if (scope.confidence !== undefined && scope.confidence !== 'verified' && scope.confidence !== 'unverified') throw new Error(`Tool evidence scope ${String(itemIndex)} has invalid confidence.`);
   if (scope.coverage === 'complete' && scope.truncated === true) throw new Error(`Tool evidence scope ${String(itemIndex)} cannot be complete and truncated.`);
   return Object.freeze({
-    ...(scope.filters === undefined ? {} : { filters: parseJsonObject(scope.filters) }),
-    ...(scope.limits === undefined ? {} : { limits: parseJsonObject(scope.limits) }),
-    ...(scope.omitted === undefined ? {} : { omitted: parseJsonObject(scope.omitted) }),
+    ...(scope.filters === undefined ? {} : { filters: requireJsonObject(scope.filters, `Tool evidence scope ${String(itemIndex)} filters`) }),
+    ...(scope.limits === undefined ? {} : { limits: requireJsonObject(scope.limits, `Tool evidence scope ${String(itemIndex)} limits`) }),
+    ...(scope.omitted === undefined ? {} : { omitted: requireJsonObject(scope.omitted, `Tool evidence scope ${String(itemIndex)} omitted`) }),
     ...(scope.coverage === undefined ? {} : { coverage: scope.coverage }),
     ...(scope.truncated === undefined ? {} : { truncated: scope.truncated }),
     ...(scope.confidence === undefined ? {} : { confidence: scope.confidence })
@@ -194,6 +188,11 @@ function parseOptionalSha256(value: JsonValue | undefined, field: string, itemIn
 function rejectUnknown(record: JsonObject, allowed: readonly string[], label: string): void {
   const unknown = Object.keys(record).filter((key) => !allowed.includes(key));
   if (unknown.length > 0) throw new Error(`${label} contains unsupported fields: ${unknown.join(', ')}.`);
+}
+
+function requireJsonObject(value: JsonValue, label: string): JsonObject {
+  if (value === null || Array.isArray(value) || typeof value !== 'object') throw new Error(`${label} must be an object.`);
+  return value;
 }
 
 function toEvidenceJsonMember(value: unknown): JsonMember | undefined {

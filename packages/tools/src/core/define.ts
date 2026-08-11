@@ -4,9 +4,7 @@ import type { ToolDefinition, ToolInput, ToolObservation, ToolPromptGuide, ToolR
 import type { ToolObservationPresentation, ToolObservationPresentationRequest } from './observation-presentation.js';
 import type { ToolPolicy } from './policy.js';
 import { invalidArgumentsObservation, invalidToolInputObservation } from './observation.js';
-import { validateToolEffectEnvelope, type ToolEffectEnvelope, type ToolEffects } from './authorization.js';
-import { validateToolRequirements } from './resources.js';
-import { parseJsonObject } from '@agent-core/json';
+import type { ToolEffectEnvelope, ToolEffects } from './authorization.js';
 
 export interface DefineToolOptions<Schema extends z.ZodType, TCanonicalInput, TOutput> {
   name: string;
@@ -20,10 +18,10 @@ export interface DefineToolOptions<Schema extends z.ZodType, TCanonicalInput, TO
   };
   effectEnvelope: ToolEffectEnvelope;
   requirements?: ToolRequirements;
-  canonicalizeInput(input: z.output<Schema>, context: ToolPreparationContext): TCanonicalInput | Promise<TCanonicalInput>;
-  deriveEffects(input: TCanonicalInput, context: ToolPreparationContext): ToolEffects | Promise<ToolEffects>;
+  canonicalizeInput: (input: z.output<Schema>, context: ToolPreparationContext) => TCanonicalInput | Promise<TCanonicalInput>;
+  deriveEffects: (input: TCanonicalInput, context: ToolPreparationContext) => ToolEffects | Promise<ToolEffects>;
   isAvailable?: (policy: ToolPolicy) => boolean;
-  invoke(input: TCanonicalInput, context: ToolExecutionContext): Promise<ToolObservation<TOutput>>;
+  invoke: (input: TCanonicalInput, context: ToolExecutionContext) => Promise<ToolObservation<TOutput>>;
   presentObservation?: (request: ToolObservationPresentationRequest<TCanonicalInput, TOutput>) => ToolObservationPresentation;
 }
 
@@ -42,18 +40,14 @@ export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
     : undefined;
   const tool: ToolDefinition<z.output<Schema>, TCanonicalInput, TOutput> = {
     name: definition.name,
-    implementationId: nonEmpty(definition.implementationId, 'implementationId'),
+    implementationId: definition.implementationId,
     description: definition.description,
     ...(definition.promptGuide ? { promptGuide: definition.promptGuide } : {}),
     jsonSchema: toToolJsonSchema(definition.schema),
     outputSchema: definition.outputSchema,
     ...(textInput ? { textInput } : {}),
-    effectEnvelope: validateToolEffectEnvelope(definition.effectEnvelope),
-    ...(definition.requirements ? { requirements: (() => {
-      const requirements = validateToolRequirements(definition.requirements);
-      if (!requirements) throw new Error('Tool requirements snapshot was unexpectedly absent.');
-      return requirements;
-    })() } : {}),
+    effectEnvelope: definition.effectEnvelope,
+    ...(definition.requirements ? { requirements: definition.requirements } : {}),
     ...(definition.isAvailable ? { isAvailable: definition.isAvailable } : {}),
     ...(definition.presentObservation ? { presentObservation: definition.presentObservation } : {}),
     decodeInput(input: ToolInput) {
@@ -86,22 +80,11 @@ export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
       }
       return { ok: true, input: parsed.data };
     },
-    canonicalizeInput(input, context) {
-      return definition.canonicalizeInput(input, context);
-    },
-    deriveEffects(input, context) {
-      return definition.deriveEffects(input, context);
-    },
-    async invoke(input, context) {
-      return definition.invoke(input, context);
-    }
+    canonicalizeInput: definition.canonicalizeInput,
+    deriveEffects: definition.deriveEffects,
+    invoke: definition.invoke
   };
   return Object.freeze(tool);
-}
-
-function nonEmpty(value: string, name: string): string {
-  if (value.trim().length === 0) throw new Error(`Tool ${name} must be non-empty.`);
-  return value;
 }
 
 function toToolJsonSchema(schema: z.ZodType): Record<string, unknown> {
@@ -109,7 +92,7 @@ function toToolJsonSchema(schema: z.ZodType): Record<string, unknown> {
   if (!isJsonObject(normalized)) throw new Error('Tool schema conversion did not produce a JSON object.');
   const jsonSchema = normalized;
   delete jsonSchema.$schema;
-  return parseJsonObject(jsonSchema, { maxDepth: 64, maxCollectionEntries: 50_000, maxStringBytes: 1_000_000, maxTotalBytes: 4_000_000 });
+  return jsonSchema;
 }
 
 function normalizeJsonSchema(value: unknown): unknown {

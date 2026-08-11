@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { validateArtifactRef } from '@agent-core/evidence';
-import { isJsonObject, normalizeJsonSafe, type JsonObject, type JsonValue } from '@agent-core/json';
+import { normalizeJsonSafe, type JsonObject, type JsonValue } from '@agent-core/json';
 import { PersistenceConflictError } from '@agent-core/evidence';
 import { parseAgentTerminalSnapshot, terminalSnapshotFingerprint, type AgentEffectiveInstruction, type AgentTerminalSnapshot, type AgentToolCallAttemptIdentity, type AgentToolCallIdentity, type AgentTurnIdentity } from '../run/contracts.js';
 import type {
@@ -165,8 +165,9 @@ function normalizeObservationOutput(value: unknown): JsonValue {
 }
 function normalizeMetadata(value: unknown): JsonObject {
   const normalized = normalizeJsonSafe(value).value;
-  return isJsonObject(normalized) ? normalized : Object.freeze({ value: normalized });
+  return isOwnedJsonObject(normalized) ? normalized : Object.freeze({ value: normalized });
 }
+function isOwnedJsonObject(value: JsonValue): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function sessionObservationKey(value: Pick<SessionObservationEntry, 'runId' | 'turnId'> & Partial<Pick<SessionObservationEntry, 'requestAttempt' | 'toolBatchId' | 'callIndex' | 'toolAttempt'>>): string | undefined {
   return value.toolBatchId !== undefined && value.callIndex !== undefined && value.toolAttempt !== undefined
     ? `${value.runId}:${value.turnId}:${String(value.requestAttempt)}:${value.toolBatchId}:${String(value.callIndex)}:${String(value.toolAttempt)}`

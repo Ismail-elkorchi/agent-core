@@ -433,6 +433,31 @@ test('OpenAIProvider continuation rejection reports reused stored response id', 
   );
 });
 
+test('OpenAIProvider streaming continuation state uses the owned request model', async () => {
+  const provider = new OpenAIProvider({
+    apiKey: 'test-key',
+    fetch: async () => sseResponse([
+      { type: 'response.output_text.delta', delta: 'hello' },
+      {
+        type: 'response.completed',
+        response: { id: 'resp-owned', model: 'gpt-5.5', status: 'completed', output_text: 'hello' }
+      }
+    ])
+  });
+  const request = {
+    model: 'gpt-5.5',
+    messages: [{ role: 'user', content: 'Stream safely.' }]
+  };
+  let response;
+
+  for await (const event of provider.createSession().stream(request)) {
+    request.model = 'gpt-5.6';
+    if (event.type === 'done') response = event.response;
+  }
+
+  assert.equal(response.providerState.model, 'gpt-5.5');
+});
+
 test('OpenAIProvider streams typed content, reasoning, tool calls, and final response metadata', async () => {
   const provider = new OpenAIProvider({
     apiKey: 'test-key',

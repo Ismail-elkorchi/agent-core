@@ -1,6 +1,5 @@
 import { ContextManager, type ContextImageLimits } from '../context/manager.js';
 import type { ArtifactRef, ArtifactRepository, EventEnvelope, EventRepository, EvidenceRecord } from '@agent-core/evidence';
-import { isJsonObject } from '@agent-core/json';
 import type { ModelProviderState, TokenEstimator } from '@agent-core/model';
 import type { SessionRepository } from '../session/repository.js';
 import { validateToolObservationPresentation } from '@agent-core/tools';
@@ -146,7 +145,7 @@ async function latestProviderState(
           : undefined;
       if (stateReference?.summary.provider === providerId && stateReference.summary.model === model) {
         const providerState = await readProviderStateArtifact({ artifacts, ref: stateReference.ref });
-        if (isMatchingProviderState(providerState, providerId, model)) return { providerState, providerStateSummary: stateReference.summary, providerStateRef: stateReference.ref };
+        if (providerState?.provider === providerId && providerState.model === model) return { providerState, providerStateSummary: stateReference.summary, providerStateRef: stateReference.ref };
       }
     }
   }
@@ -176,9 +175,6 @@ function isEvidenceRecord(value: unknown): value is EvidenceRecord {
   return isRecord(value) && typeof value.id === 'string' && typeof value.observationId === 'string' && typeof value.toolName === 'string'
     && typeof value.createdAt === 'string' && typeof value.action === 'string' && (value.outcome === 'success' || value.outcome === 'failure')
     && Array.isArray(value.resources) && value.resources.every((resource) => isRecord(resource) && typeof resource.uri === 'string');
-}
-function isMatchingProviderState(value: unknown, providerId: string, model: string): value is ModelProviderState {
-  return isRecord(value) && value.provider === providerId && value.model === model && typeof value.kind === 'string' && isJsonObject(value.data);
 }
 function compactLine(value: string, maxChars: number): string { const normalized = value.replace(/\s+/gu, ' ').trim(); return normalized.length <= maxChars ? normalized : `${normalized.slice(0, maxChars)}...`; }
 function emptyReplay(contextManager: ContextManager): ContextReplayResult {

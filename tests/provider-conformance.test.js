@@ -61,6 +61,24 @@ for (const adapter of [ollamaAdapter(), openAIAdapter(), openAICodexAdapter(), o
   });
 }
 
+test('provider request decoding owns input before asynchronous profile validation', async () => {
+  let sent;
+  const provider = new OpenAIProvider({
+    apiKey: 'test',
+    modelProfiles: { 'gpt-test': testModelProfile() },
+    fetch: async (_url, init) => {
+      sent = JSON.parse(init.body);
+      return json(openAIFinal('gpt-test'));
+    }
+  });
+  const request = { model: 'gpt-test', messages: [{ role: 'user', content: 'before' }] };
+  const completion = provider.complete(request);
+  request.messages[0].content = 'after';
+  await completion;
+  assert.match(JSON.stringify(sent.input), /before/u);
+  assert.doesNotMatch(JSON.stringify(sent.input), /after/u);
+});
+
 function ollamaAdapter() {
   return {
     name: 'OllamaProvider', model: 'llama-test', sessionRetryDisposition: undefined,

@@ -6,13 +6,11 @@ import {
   type ModelRequest,
   type ModelResponseFormat,
   type ModelTool,
-  type ModelToolCall,
-  parseModelRequest
+  type ModelToolCall
 } from '@agent-core/model';
 import { OPENAI_CODEX_PROVIDER_ID } from './constants.js';
 
 export function toCodexResponsesRequest(request: ModelRequest, stream: boolean): Record<string, unknown> {
-  parseModelRequest(request);
   assertCodexRequestCompatibility(request);
   const { instructions, input } = toCodexInput(request.messages);
   const body: Record<string, unknown> = {

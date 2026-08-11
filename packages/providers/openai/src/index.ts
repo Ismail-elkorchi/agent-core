@@ -280,8 +280,7 @@ export class OpenAIProvider implements ModelProvider {
 
   async *streamWithContinuation(request: ModelRequest, previousResponseId: string | undefined): AsyncIterable<ModelStreamEvent> {
     try {
-      parseModelRequest(request);
-      throwIfAborted(request.signal);
+      request = await this.validateRequest(request);
       const reusedContinuation = previousResponseId !== undefined;
       const responsePromise = this.fetchResponse(request, true, previousResponseId);
       const startedAt = Date.now();
@@ -406,8 +405,6 @@ export class OpenAIProvider implements ModelProvider {
 
   async fetchResponse(request: ModelRequest, stream: boolean, previousResponseId?: string): Promise<Response> {
     try {
-      parseModelRequest(request);
-      assertModelRequestSupported(await this.describeModel(request.model), request);
       const token = await this.tokenProvider.getBearerToken(request.signal);
       const init: RequestInit = {
         method: 'POST',
@@ -426,6 +423,13 @@ export class OpenAIProvider implements ModelProvider {
     } catch (error) {
       throw normalizeError(this.id, error);
     }
+  }
+
+  async validateRequest(request: ModelRequest): Promise<ModelRequest> {
+    const owned = parseModelRequest(request);
+    throwIfAborted(owned.signal);
+    assertModelRequestSupported(await this.describeModel(owned.model), owned);
+    return owned;
   }
 
   private async throwIfBadResponse(response: Response): Promise<void> {
@@ -506,6 +510,7 @@ class OpenAIProviderSession implements ModelProviderSession {
     const previousResponseId = this.previousResponseId;
     const reusedContinuation = previousResponseId !== undefined;
     try {
+      request = await this.provider.validateRequest(request);
       const response = await this.provider.fetchResponse(request, false, previousResponseId);
       const payload = await parseJsonResponse<OpenAIResponsesPayload>(this.provider.id, response);
       const modelResponse = toModelResponse(this.provider.id, request, payload, { reusedContinuation });
@@ -530,7 +535,7 @@ class OpenAIProviderSession implements ModelProviderSession {
       for await (const event of this.provider.streamWithContinuation(request, previousResponseId)) {
         if (event.type === 'done') {
           this.previousResponseId = event.response.transport?.responseId;
-          const state = this.providerState(request.model);
+          const state = this.providerState(event.response.model);
           yield state
             ? { ...event, response: parseOpenAIModelResponse({ ...event.response, providerState: state }) }
             : event;

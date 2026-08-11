@@ -180,7 +180,7 @@ export class OpenRouterProvider implements ModelProvider {
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
     try {
-      await this.validateRequest(request);
+      request = await this.validateRequest(request);
       const response = await this.fetchChatCompletion(request, false);
       const payload = await parseJsonResponse<OpenRouterChatResponse>(this.id, response);
       return toModelResponse(this.id, request, payload);
@@ -191,7 +191,7 @@ export class OpenRouterProvider implements ModelProvider {
 
   async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
     try {
-      await this.validateRequest(request);
+      request = await this.validateRequest(request);
       const responsePromise = this.fetchChatCompletion(request, true);
       const startedAt = Date.now();
       let response: Response | undefined;
@@ -308,9 +308,9 @@ export class OpenRouterProvider implements ModelProvider {
     return this.modelCatalog().then(() => undefined);
   }
 
-  private async validateRequest(request: ModelRequest): Promise<void> {
-    parseModelRequest(request);
-    throwIfAborted(request.signal);
+  private async validateRequest(request: ModelRequest): Promise<ModelRequest> {
+    const owned = parseModelRequest(request);
+    throwIfAborted(owned.signal);
     if (!this.apiKey?.trim()) {
       throw new ModelProviderError({
         provider: this.id,
@@ -318,7 +318,8 @@ export class OpenRouterProvider implements ModelProvider {
         message: 'OpenRouter API key is required. Set OPENROUTER_API_KEY or pass apiKey.'
       });
     }
-    assertModelRequestSupported(await this.describeModel(request.model), request);
+    assertModelRequestSupported(await this.describeModel(owned.model), owned);
+    return owned;
   }
 
   private async fetchModelCatalog(): Promise<OpenRouterModelRecord[]> {

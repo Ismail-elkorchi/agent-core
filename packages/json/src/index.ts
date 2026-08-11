@@ -111,14 +111,6 @@ export function normalizeJsonSafe(
   return Object.freeze({ status: 'normalized_with_diagnostics', value: output, bytes: utf8Bytes(text), truncated, diagnostics: nonemptyDiagnostics });
 }
 
-export function isJsonValue(value: unknown): value is JsonValue {
-  try { parseJsonValue(value); return true; } catch { return false; }
-}
-
-export function isJsonObject(value: unknown): value is JsonObject {
-  try { parseJsonObject(value); return true; } catch { return false; }
-}
-
 function copyJson(
   value: unknown,
   path: string,

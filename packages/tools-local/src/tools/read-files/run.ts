@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
-import { evidenceDelta, workspaceResource, type ToolEvidenceItem } from '@agent-core/evidence';
+import { workspaceResource, type ToolEvidenceItem } from '@agent-core/evidence';
 import { requireWorkspaceRoot, throwIfAborted, workspaceFileScope, type ToolExecutionContext, type ToolObservation } from '@agent-core/tools';
 import { assertRealPathInsideRoot, relativePath, resolveInsideRoot } from '../../core/filesystem.js';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
@@ -42,7 +42,7 @@ export async function readFiles(input: ReadFilesInput, context: ToolExecutionCon
     kind: 'result', ok: failures.length === 0,
     summary: 'Read ' + String(files.length) + ' of ' + String(input.files.length) + ' requested files' + (coverage === 'partial' ? ' with partial coverage.' : '.'),
     scope,
-    evidence: evidenceDelta(readFileEvidence(files, failures, scope)),
+    evidence: { items: readFileEvidence(files, failures, scope) },
     output
   };
 }
