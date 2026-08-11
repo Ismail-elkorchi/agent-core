@@ -1,15 +1,17 @@
 import { hashJson } from '@agent-core/evidence';
-import { parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
+import type { JsonObject, JsonValue } from '@agent-core/json';
 import { abortableToolBoundary, MissingToolServiceError, throwIfAborted, ToolInputError, type ToolExecutionContext, type ToolPreparationContext } from './context.js';
 import type { ToolCall, ToolDefinition, ToolObservation } from './definition.js';
 import { invalidOutputObservation, invalidToolInputObservation, missingServiceObservation, parseToolObservation, runtimeErrorObservation, unknownToolObservation } from './observation.js';
-import { assertEffectsWithinEnvelope, validateToolEffects, type ToolEffects } from './authorization.js';
+import { assertEffectsWithinEnvelope, encodeToolEffects, validateToolEffects, type ToolEffects } from './authorization.js';
+import { encodeToolPolicy } from './policy.js';
+import { isOwnedToolCall } from './call.js';
 
 export interface PreparedToolCall {
   readonly call: ToolCall;
   readonly toolImplementationId: string;
   readonly canonicalSnapshot: JsonValue;
-  readonly effects: ToolEffects & JsonObject;
+  readonly effects: ToolEffects;
   readonly fingerprint: string;
   invoke(context: ToolExecutionContext): Promise<ToolObservation>;
 }
@@ -20,11 +22,11 @@ export type ToolCallPreparation =
 
 /** Resolve, parse, canonicalize, and derive effects before any authorization decision. */
 export async function prepareToolCall(call: ToolCall, tools: readonly ToolDefinition[], context: ToolPreparationContext): Promise<ToolCallPreparation> {
-  const ownedCall = ownToolCall(call);
-  const tool = tools.find((candidate) => candidate.name === ownedCall.name);
-  if (!tool) return { ok: false, observation: unknownToolObservation(ownedCall) };
+  if (!isOwnedToolCall(call)) throw new Error('Tool calls must be created or decoded before preparation.');
+  const tool = tools.find((candidate) => candidate.name === call.name);
+  if (!tool) return { ok: false, observation: unknownToolObservation(call) };
   try {
-    const decoded = tool.decodeInput(ownedCall.input);
+    const decoded = tool.decodeInput(call.input);
     if (!decoded.ok) return { ok: false, observation: decoded.observation };
     const canonicalized = await abortableToolBoundary(context.signal, () => tool.canonicalizeInput(decoded.input, context));
     const canonicalSnapshot = tool.snapshotInput(canonicalized);
@@ -42,12 +44,12 @@ export async function prepareToolCall(call: ToolCall, tools: readonly ToolDefini
         })
       }),
       canonicalInput: canonicalSnapshot,
-      effects,
-      policy: context.policy,
+      effects: encodeToolEffects(effects),
+      policy: encodeToolPolicy(context.policy),
       boundary: Object.freeze({ authorizationPolicyId: context.boundary.authorizationPolicyId, executionTargetId: context.boundary.executionTargetId })
     });
     return { ok: true, prepared: Object.freeze({
-      call: ownedCall,
+      call,
       toolImplementationId: tool.implementationId,
       canonicalSnapshot,
       effects,
@@ -65,14 +67,3 @@ export async function prepareToolCall(call: ToolCall, tools: readonly ToolDefini
     return { ok: false, observation: runtimeErrorObservation(tool.name, error) };
   }
 }
-
-function ownToolCall(value: unknown): ToolCall {
-  const record = parseJsonObject(value, { maxDepth: 32, maxCollectionEntries: 20_000, maxStringBytes: 4_000_000, maxTotalBytes: 8_000_000 });
-  if (Object.keys(record).some((key) => key !== 'id' && key !== 'name' && key !== 'input') || typeof record.name !== 'string' || record.name.trim().length === 0
-    || (record.id !== undefined && typeof record.id !== 'string') || !jsonObject(record.input)) throw new Error('Tool call does not match the strict JSON tool-call contract.');
-  const input = record.input;
-  if (input.kind === 'json' && jsonObject(input.value)) return Object.freeze({ ...(typeof record.id === 'string' ? { id: record.id } : {}), name: record.name, input: Object.freeze({ kind: 'json', value: input.value }) });
-  if (input.kind === 'text' && typeof input.value === 'string') return Object.freeze({ ...(typeof record.id === 'string' ? { id: record.id } : {}), name: record.name, input: Object.freeze({ kind: 'text', value: input.value }) });
-  throw new Error('Tool call input is invalid.');
-}
-function jsonObject(value: unknown): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }

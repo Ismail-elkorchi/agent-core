@@ -4,14 +4,14 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import * as z from 'zod';
-import { defineTool, enforceAllowedEffects, prepareToolCall } from '@agent-core/tools';
+import { createToolCall, defineTool, enforceAllowedEffects, prepareToolCall } from '@agent-core/tools';
 import { applyPatchTool, DEFAULT_LOCAL_TOOL_CONFIGURATION } from '@agent-core/tools-local';
 
 const boundary = { authorizationPolicyId: 'tests/authorization@1', executionTargetId: 'workspace' };
 const signal = new AbortController().signal;
 
 async function prepared(call, tools, policy, services = {}) {
-  const result = await prepareToolCall(call, tools, { policy, services, signal, boundary });
+  const result = await prepareToolCall(createToolCall(call), tools, { policy, services, signal, boundary });
   assert.equal(result.ok, true, result.ok ? '' : result.observation.summary);
   return result.prepared;
 }

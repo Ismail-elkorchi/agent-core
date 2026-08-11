@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import type { JsonObject } from '@agent-core/json';
+import { parseJsonObject, type JsonObject } from '@agent-core/json';
 import type { EventActor, EventEnvelope, LedgerIntegrityReport, TypedEvent } from './ledger.js';
 import { hashJson, canonicalJsonString } from './ledger.js';
 import {
@@ -43,7 +43,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   private readonly lockTimeoutMs: number;
   private readonly staleLockMs: number;
   private readonly queues = new Map<string, Promise<void>>();
-  private readonly indexes = new Map<string, EventAppendIndex<TEvent>>();
+  private readonly indexes = new Map<string, EventAppendIndex>();
   private fullScans = 0;
   private incrementalRefreshes = 0;
 
@@ -64,41 +64,41 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
 
   append(runId: string, event: TEvent, options: EventAppendOptions = {}): Promise<EventEnvelope<TEvent>> {
     return this.enqueue(runId, async () => withPersistenceFileLock(this.filePath(runId), this.lockTimeoutMs, this.staleLockMs, async () => {
-      const parsedEvent = this.codec.decode(event);
+      const encoding = this.codec.encode(event);
+      const encodedEvent = encoding.json;
       await this.ensureHeader(runId);
       const index = await this.refreshIndex(runId, true);
       const records = index.records;
       if (options.idempotencyKey) {
         const existing = records.find((record) => record.idempotencyKey === options.idempotencyKey);
         if (existing) {
-          if (canonicalJsonString(existing.event) !== canonicalJsonString(parsedEvent)) {
+          if (canonicalJsonString(existing.event) !== canonicalJsonString(encodedEvent)) {
             throw new PersistenceConflictError(`Idempotency key ${options.idempotencyKey} already identifies a different event.`);
           }
-          return existing;
+          return domainEnvelope(existing, encoding.value);
         }
       }
       const previous = records.at(-1);
-      const base: Omit<EventEnvelope<TEvent>, 'hash'> & { idempotencyKey?: string } = Object.freeze({
+      const base = Object.freeze({
         eventId: randomUUID(),
         runId,
         sequence: records.length,
         timestamp: options.timestamp ?? new Date().toISOString(),
         schemaVersion: '1',
-        actor: options.actor ?? inferActor(parsedEvent.type),
-        event: parsedEvent,
+        actor: options.actor ?? inferActor(event.type),
+        event: encodedEvent,
         ...(options.causationId ? { causationId: options.causationId } : {}),
         ...(options.correlationId ? { correlationId: options.correlationId } : {}),
         ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
         ...(previous ? { previousHash: previous.hash } : {})
       });
-      const envelope: EventEnvelope<TEvent> = Object.freeze({ ...base, hash: hashJson(base) });
-      const encodedEnvelope = encodeEnvelope(envelope);
+      const encodedEnvelope: EncodedEnvelope = Object.freeze({ ...base, hash: hashJson(base) });
       await appendJsonlRecord(this.filePath(runId), encodedEnvelope);
-      records.push(envelope);
+      records.push(encodedEnvelope);
       index.completeBytes += Buffer.byteLength(`${canonicalJsonString(encodedEnvelope)}\n`, 'utf8');
       index.boundaryMarker = await jsonlBoundaryMarker(this.filePath(runId), index.completeBytes);
       index.storageStamp = await jsonlStorageStamp(this.filePath(runId));
-      return envelope;
+      return domainEnvelope(encodedEnvelope, encoding.value);
     }));
   }
 
@@ -107,7 +107,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       try { return [...(await this.refreshIndex(runId, false)).records]; }
       catch (error) { if (nodeCode(error) === 'ENOENT') return []; throw error; }
     });
-    yield* records;
+    for (const record of records) yield domainEnvelope(record, this.codec.decode(record.event));
   }
 
   async listRunIds(): Promise<readonly string[]> {
@@ -126,7 +126,8 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     let records = 0;
     let previousHash: string | undefined;
     try {
-      for await (const record of this.read(runId)) {
+      for (const record of (await this.refreshIndex(runId, false)).records) {
+        this.codec.decode(record.event);
         if (record.sequence !== records) errors.push(`sequence mismatch at index ${String(records)}: got ${String(record.sequence)}`);
         if (record.previousHash !== previousHash) errors.push(`previousHash mismatch at sequence ${String(record.sequence)}`);
         const { hash, ...base } = record;
@@ -155,11 +156,11 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     }
   }
 
-  private async refreshIndex(runId: string, repairTornTail: boolean): Promise<EventAppendIndex<TEvent>> {
+  private async refreshIndex(runId: string, repairTornTail: boolean): Promise<EventAppendIndex> {
     const filePath = this.filePath(runId);
     let index = this.indexes.get(runId);
     if (!index) {
-      const committed = await readEventFile(filePath, runId, this.codec);
+      const committed = await readEventFile(filePath, runId);
       const records = committed.records;
       this.fullScans += 1;
       validateEnvelopeChain(records, filePath);
@@ -175,7 +176,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     if (size < index.completeBytes) throw new PersistenceCorruptionError({ code: 'integrity', storage: filePath, line: index.records.length + 2, byteOffset: size, message: 'Event stream was truncated after it was indexed.' });
     if (size === index.completeBytes && sameJsonlStorageStamp(stamp, index.storageStamp)) return index;
     if (size === index.completeBytes || await jsonlBoundaryMarker(filePath, index.completeBytes) !== index.boundaryMarker) {
-      const committed = await readEventFile(filePath, runId, this.codec);
+      const committed = await readEventFile(filePath, runId);
       const records = committed.records;
       this.fullScans += 1;
       validateEnvelopeChain(records, filePath);
@@ -195,8 +196,8 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       const located = { ...line, line: index.records.length + 2 };
       let raw: unknown;
       try { raw = JSON.parse(line.text); } catch (error) { throw corruption('invalid_json', filePath, located, `Invalid JSON: ${errorMessage(error)}`); }
-      let envelope: PersistedEnvelope<TEvent>;
-      try { envelope = parseEnvelope(raw, runId, this.codec); } catch (error) { throw corruption('invalid_record', filePath, located, errorMessage(error)); }
+      let envelope: EncodedEnvelope;
+      try { envelope = parseEnvelope(raw, runId); } catch (error) { throw corruption('invalid_record', filePath, located, errorMessage(error)); }
       validateNextEnvelope(index.records.at(-1), envelope, index.records.length, filePath, located);
       index.records.push(envelope);
     }
@@ -218,33 +219,18 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   }
 }
 
-function encodeEnvelope<TEvent extends TypedEvent>(envelope: EventEnvelope<TEvent>): JsonObject {
-  return Object.freeze({
-    eventId: envelope.eventId,
-    runId: envelope.runId,
-    sequence: envelope.sequence,
-    timestamp: envelope.timestamp,
-    schemaVersion: envelope.schemaVersion,
-    actor: envelope.actor,
-    ...(envelope.causationId === undefined ? {} : { causationId: envelope.causationId }),
-    ...(envelope.correlationId === undefined ? {} : { correlationId: envelope.correlationId }),
-    ...(envelope.idempotencyKey === undefined ? {} : { idempotencyKey: envelope.idempotencyKey }),
-    ...(envelope.previousHash === undefined ? {} : { previousHash: envelope.previousHash }),
-    hash: envelope.hash,
-    event: envelope.event
-  });
+interface EventAppendIndex { readonly records: EncodedEnvelope[]; completeBytes: number; boundaryMarker: string; storageStamp: JsonlStorageStamp }
+
+interface EncodedEnvelope extends JsonObject {
+  readonly eventId: string; readonly runId: string; readonly sequence: number; readonly timestamp: string; readonly schemaVersion: '1'; readonly actor: EventActor;
+  readonly causationId?: string; readonly correlationId?: string; readonly idempotencyKey?: string; readonly previousHash?: string; readonly hash: string; readonly event: JsonObject;
 }
 
-interface EventAppendIndex<TEvent extends TypedEvent> { readonly records: PersistedEnvelope<TEvent>[]; completeBytes: number; boundaryMarker: string; storageStamp: JsonlStorageStamp }
-
-interface PersistedEnvelope<TEvent extends TypedEvent> extends EventEnvelope<TEvent> { readonly idempotencyKey?: string }
-
-async function readEventFile<TEvent extends TypedEvent>(
+async function readEventFile(
   filePath: string,
   runId: string,
-  codec: RuntimeCodec<TEvent>,
   missingIsEmpty = false
-): Promise<{ readonly records: PersistedEnvelope<TEvent>[]; readonly completeBytes: number }> {
+): Promise<{ readonly records: EncodedEnvelope[]; readonly completeBytes: number }> {
   let committed;
   try { committed = await readJsonlCommittedFile(filePath); }
   catch (error) { if (missingIsEmpty && nodeCode(error) === 'ENOENT') return { records: [], completeBytes: 0 }; throw error; }
@@ -254,39 +240,40 @@ async function readEventFile<TEvent extends TypedEvent>(
   if (headerLine === undefined) return { records: [], completeBytes: committed.completeBytes };
   const header = parseLine(headerLine, filePath);
   if (!isEventHeader(header, runId)) throw corruption('invalid_header', filePath, headerLine, 'Event stream header is invalid.');
-  const output: PersistedEnvelope<TEvent>[] = [];
+  const output: EncodedEnvelope[] = [];
   for (const line of lines.slice(1)) {
     if (line.text.trim().length === 0) continue;
     let raw: unknown;
     try { raw = JSON.parse(line.text); }
     catch (error) { throw corruption('invalid_json', filePath, line, `Invalid JSON: ${errorMessage(error)}`); }
-    try { output.push(parseEnvelope(raw, runId, codec)); }
+    try { output.push(parseEnvelope(raw, runId)); }
     catch (error) { throw corruption('invalid_record', filePath, line, errorMessage(error)); }
   }
   return { records: output, completeBytes: committed.completeBytes };
 }
 
-function parseEnvelope<TEvent extends TypedEvent>(value: unknown, runId: string, codec: RuntimeCodec<TEvent>): PersistedEnvelope<TEvent> {
-  if (!isRecord(value) || typeof value.eventId !== 'string' || value.runId !== runId || !nonnegativeInteger(value.sequence)
-    || typeof value.timestamp !== 'string' || value.schemaVersion !== '1' || !isEventActor(value.actor)
-    || typeof value.hash !== 'string') throw new Error('Event envelope fields are invalid.');
-  if (value.causationId !== undefined && typeof value.causationId !== 'string') throw new Error('causationId is invalid.');
-  if (value.correlationId !== undefined && typeof value.correlationId !== 'string') throw new Error('correlationId is invalid.');
-  if (value.previousHash !== undefined && typeof value.previousHash !== 'string') throw new Error('previousHash is invalid.');
-  if (value.idempotencyKey !== undefined && typeof value.idempotencyKey !== 'string') throw new Error('idempotencyKey is invalid.');
+function parseEnvelope(value: unknown, runId: string): EncodedEnvelope {
+  const record = parseJsonObject(value, { maxDepth: 66, maxCollectionEntries: 50_020, maxStringBytes: 1_000_000, maxTotalBytes: 8_000_000 });
+  if (typeof record.eventId !== 'string' || record.runId !== runId || !nonnegativeInteger(record.sequence)
+    || typeof record.timestamp !== 'string' || record.schemaVersion !== '1' || !isEventActor(record.actor)
+    || typeof record.hash !== 'string' || !jsonObject(record.event)) throw new Error('Event envelope fields are invalid.');
+  if (record.causationId !== undefined && typeof record.causationId !== 'string') throw new Error('causationId is invalid.');
+  if (record.correlationId !== undefined && typeof record.correlationId !== 'string') throw new Error('correlationId is invalid.');
+  if (record.previousHash !== undefined && typeof record.previousHash !== 'string') throw new Error('previousHash is invalid.');
+  if (record.idempotencyKey !== undefined && typeof record.idempotencyKey !== 'string') throw new Error('idempotencyKey is invalid.');
   return Object.freeze({
-    eventId: value.eventId,
+    eventId: record.eventId,
     runId,
-    sequence: value.sequence,
-    timestamp: value.timestamp,
+    sequence: record.sequence,
+    timestamp: record.timestamp,
     schemaVersion: '1',
-    actor: value.actor,
-    ...(value.causationId === undefined ? {} : { causationId: value.causationId }),
-    ...(value.correlationId === undefined ? {} : { correlationId: value.correlationId }),
-    ...(value.idempotencyKey === undefined ? {} : { idempotencyKey: value.idempotencyKey }),
-    ...(value.previousHash === undefined ? {} : { previousHash: value.previousHash }),
-    hash: value.hash,
-    event: codec.decode(value.event)
+    actor: record.actor,
+    ...(record.causationId === undefined ? {} : { causationId: record.causationId }),
+    ...(record.correlationId === undefined ? {} : { correlationId: record.correlationId }),
+    ...(record.idempotencyKey === undefined ? {} : { idempotencyKey: record.idempotencyKey }),
+    ...(record.previousHash === undefined ? {} : { previousHash: record.previousHash }),
+    hash: record.hash,
+    event: record.event
   });
 }
 
@@ -294,20 +281,31 @@ function isEventActor(value: unknown): value is EventActor {
   return value === 'user' || value === 'runtime' || value === 'model' || value === 'tool' || value === 'system' || value === 'check';
 }
 
-function validateEnvelopeChain<TEvent extends TypedEvent>(records: readonly PersistedEnvelope<TEvent>[], filePath: string): void {
-  let previous: PersistedEnvelope<TEvent> | undefined;
+function validateEnvelopeChain(records: readonly EncodedEnvelope[], filePath: string): void {
+  let previous: EncodedEnvelope | undefined;
   for (const [index, record] of records.entries()) {
     validateNextEnvelope(previous, record, index, filePath, { text: '', line: index + 2, byteOffset: 0, terminated: true });
     previous = record;
   }
 }
 
-function validateNextEnvelope<TEvent extends TypedEvent>(previous: PersistedEnvelope<TEvent> | undefined, record: PersistedEnvelope<TEvent>, expectedSequence: number, filePath: string, line: JsonlLine): void {
+function validateNextEnvelope(previous: EncodedEnvelope | undefined, record: EncodedEnvelope, expectedSequence: number, filePath: string, line: JsonlLine): void {
   if (record.sequence !== expectedSequence) throw corruption('integrity', filePath, line, `Event sequence mismatch: expected ${String(expectedSequence)}, got ${String(record.sequence)}.`);
   if (record.previousHash !== previous?.hash) throw corruption('integrity', filePath, line, 'Event previousHash does not match the indexed leaf.');
   const { hash, ...base } = record;
   if (hash !== hashJson(base)) throw corruption('integrity', filePath, line, 'Event hash does not match its record bytes.');
 }
+
+function domainEnvelope<TEvent extends TypedEvent>(encoded: EncodedEnvelope, event: TEvent): EventEnvelope<TEvent> {
+  return Object.freeze({
+    eventId: encoded.eventId, runId: encoded.runId, sequence: encoded.sequence, timestamp: encoded.timestamp, schemaVersion: encoded.schemaVersion, actor: encoded.actor,
+    ...(encoded.causationId === undefined ? {} : { causationId: encoded.causationId }), ...(encoded.correlationId === undefined ? {} : { correlationId: encoded.correlationId }),
+    ...(encoded.idempotencyKey === undefined ? {} : { idempotencyKey: encoded.idempotencyKey }), ...(encoded.previousHash === undefined ? {} : { previousHash: encoded.previousHash }),
+    hash: encoded.hash, event
+  });
+}
+
+function jsonObject(value: unknown): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 
 function parseLine(line: JsonlLine, storage: string): unknown {
   try { return JSON.parse(line.text); }

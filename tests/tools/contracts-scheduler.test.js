@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
-import { adoptToolDefinition, defineTool, invokePreparedToolCall, parseToolObservation, prepareToolCall, ResourceLeaseCoordinator } from '@agent-core/tools';
+import { adoptToolDefinition, createToolCall, defineTool, invokePreparedToolCall, parseToolObservation, prepareToolCall, ResourceLeaseCoordinator } from '@agent-core/tools';
 import { scheduleToolCalls } from '@agent-core/runtime';
 import {
   applyPatchTool,
@@ -37,7 +37,7 @@ test('derived effects cannot exceed their envelope and output is validated befor
   });
   const controller = new AbortController();
   const context = { policy: { allowedRisks: ['read', 'write'] }, signal: controller.signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } };
-  const prepared = await prepareToolCall({ name: 'escape', input: { kind: 'json', value: {} } }, [escape], context);
+  const prepared = await prepareToolCall(createToolCall({ name: 'escape', input: { kind: 'json', value: {} } }), [escape], context);
   assert.equal(prepared.ok, false);
   assert.match(prepared.observation.summary, /exceeds the tool effect envelope/u);
 
@@ -47,7 +47,7 @@ test('derived effects cannot exceed their envelope and output is validated befor
     deriveEffects: () => ({ accesses: [], lockScopes: [], idempotency: 'pure' }),
     invoke: async () => ({ kind: 'result', ok: true, summary: 'bad', scope: { resources: [], coverage: 'complete' }, output: { value: 42 } })
   });
-  const validPreparation = await prepareToolCall({ name: 'invalid_output', input: { kind: 'json', value: {} } }, [invalidOutput], context);
+  const validPreparation = await prepareToolCall(createToolCall({ name: 'invalid_output', input: { kind: 'json', value: {} } }), [invalidOutput], context);
   assert.equal(validPreparation.ok, true);
   const observation = await invokePreparedToolCall(validPreparation.prepared, context);
   assert.equal(observation.kind, 'failure');
@@ -200,7 +200,7 @@ test('every effect and observation resource scope uses the strict canonical scop
     deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'workspace/files/a' }, { mode: 'read', scope: 'workspace/files/a' }], lockScopes: [], idempotency: 'pure' }),
     invoke: async () => ({ kind: 'result', ok: true, summary: 'duplicate', scope: { resources: [], coverage: 'complete' }, output: {} })
   });
-  const prepared = await prepareToolCall({ name: duplicate.name, input: { kind: 'json', value: {} } }, [duplicate], { policy: { allowedRisks: ['read'] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } });
+  const prepared = await prepareToolCall(createToolCall({ name: duplicate.name, input: { kind: 'json', value: {} } }), [duplicate], { policy: { allowedRisks: ['read'] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } });
   assert.equal(prepared.ok, false);
   assert.match(prepared.observation.summary, /unique/iu);
   assert.throws(() => parseToolObservation(duplicate, { kind: 'result', ok: true, summary: 'bad scope', scope: { resources: ['workspace/files//a'], coverage: 'complete' }, output: {} }), /scope/iu);
@@ -217,7 +217,7 @@ test('authoritative canonicalization owns input before effects, fingerprinting, 
     async invoke(input) { invoked = input; return { kind: 'result', ok: true, summary: 'owned', scope: { resources: [`workspace/files/${input.path}`], coverage: 'complete' }, output: { path: input.path, value: input.nested.value } }; }
   });
   const context = { policy: { allowedRisks: ['read'] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } };
-  const preparation = await prepareToolCall({ name: tool.name, input: { kind: 'json', value: {} } }, [tool], context);
+  const preparation = await prepareToolCall(createToolCall({ name: tool.name, input: { kind: 'json', value: {} } }), [tool], context);
   assert.equal(preparation.ok, true);
   const fingerprint = preparation.prepared.fingerprint;
   callerOwned.path = 'after.txt'; callerOwned.nested.value = 2;
@@ -241,7 +241,7 @@ test('canonicalization rejects accessors and cycles without invoking accessors',
     invoke: async () => ({ kind: 'result', ok: true, summary: 'never', scope: { resources: [], coverage: 'complete' }, output: {} })
   });
   for (const [name, value] of [['accessor_input', hostile], ['cyclic_input', cyclic]]) {
-    const prepared = await prepareToolCall({ name, input: { kind: 'json', value: {} } }, [makeTool(name, value)], { policy: { allowedRisks: [] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } });
+    const prepared = await prepareToolCall(createToolCall({ name, input: { kind: 'json', value: {} } }), [makeTool(name, value)], { policy: { allowedRisks: [] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } });
     assert.equal(prepared.ok, false);
   }
   assert.equal(accesses, 0);
@@ -255,7 +255,7 @@ test('canonicalization rejects accessors and cycles without invoking accessors',
     effectEnvelope: { accesses: [], lockScopes: [] }, canonicalizeInput: input => input, deriveEffects: () => hostileEffects,
     invoke: async () => ({ kind: 'result', ok: true, summary: 'never', scope: { resources: [], coverage: 'complete' }, output: {} })
   });
-  const effectsPreparation = await prepareToolCall({ name: effectsTool.name, input: { kind: 'json', value: {} } }, [effectsTool], { policy: { allowedRisks: [] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } });
+  const effectsPreparation = await prepareToolCall(createToolCall({ name: effectsTool.name, input: { kind: 'json', value: {} } }), [effectsTool], { policy: { allowedRisks: [] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } });
   assert.equal(effectsPreparation.ok, false);
   assert.equal(effectAccesses, 0);
 });

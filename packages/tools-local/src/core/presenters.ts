@@ -211,20 +211,20 @@ export const presentReadArtifactObservation: Presenter = ({ observation, maxToke
 function failurePresentation(title: string, observation: Parameters<Presenter>[0]['observation']): ToolObservationPresentation | undefined {
   if (observation.kind !== 'failure') return undefined;
   return {
-    ok: false, title, summary: observation.summary, scope: parseJsonValue(observation.scope) as JsonObject,
+    ok: false, title, summary: observation.summary, scope: { ...observation.scope },
     failures: parseJsonValue(observation.output), coverage: observation.scope.coverage, next: observation.output.recovery
   };
 }
 function resultBase(title: string, observation: Parameters<Presenter>[0]['observation'], results: JsonObject): ToolObservationPresentation {
   return {
-    ok: observation.ok, title, summary: observation.summary, scope: parseJsonValue(observation.scope) as JsonObject,
-    results: parseJsonValue(results), coverage: observation.scope.coverage,
+    ok: observation.ok, title, summary: observation.summary, scope: { ...observation.scope },
+    results, coverage: observation.scope.coverage,
     ...(observation.scope.omitted ? { omitted: observation.scope.omitted } : {}),
     ...(observation.scope.causes?.length ? { warnings: [...observation.scope.causes] } : {})
   };
 }
 function withResults(base: ToolObservationPresentation, results: JsonObject, next?: string): ToolObservationPresentation {
-  return { ...base, results: parseJsonValue(results), ...(next ? { next } : {}) };
+  return { ...base, results, ...(next ? { next } : {}) };
 }
 function compactMatch(match: JsonObject, maxTextChars: number): JsonObject {
   return {

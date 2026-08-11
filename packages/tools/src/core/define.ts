@@ -6,6 +6,7 @@ import type { ToolObservationPresentation, ToolObservationPresentationRequest } 
 import type { ToolPolicy } from './policy.js';
 import { invalidArgumentsObservation, invalidToolInputObservation } from './observation.js';
 import { validateToolEffectEnvelope, type ToolEffectEnvelope, type ToolEffects } from './authorization.js';
+import { markCompiledTool, type CompiledToolDefinition } from './compiled.js';
 
 export interface DefineToolOptions<Schema extends z.ZodType, TCanonicalInput, TOutput> {
   name: string;
@@ -29,7 +30,7 @@ export interface DefineToolOptions<Schema extends z.ZodType, TCanonicalInput, TO
 
 export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
   definition: DefineToolOptions<Schema, TCanonicalInput, TOutput>
-): ToolDefinition<z.output<Schema>, TCanonicalInput, TOutput> {
+): CompiledToolDefinition<z.output<Schema>, TCanonicalInput, TOutput> {
   const snapshotInput = definition.snapshotInput ?? ((input: TCanonicalInput) => input);
   const requirements = definition.requirements ? Object.freeze({
     ...(definition.requirements.services ? { services: Object.freeze([...definition.requirements.services]) } : {}),
@@ -93,7 +94,7 @@ export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
     deriveEffects: definition.deriveEffects,
     invoke: definition.invoke
   };
-  return Object.freeze(tool);
+  return markCompiledTool(Object.freeze(tool));
 }
 
 function toToolJsonSchema(schema: z.ZodType): Record<string, unknown> {

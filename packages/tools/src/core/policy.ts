@@ -1,5 +1,5 @@
 import type { ToolDefinition } from './definition.js';
-import { parseJsonObject } from '@agent-core/json';
+import { parseJsonObject, type JsonObject } from '@agent-core/json';
 
 export type ToolRisk = 'read' | 'write' | 'execute' | 'network' | 'destructive';
 
@@ -11,6 +11,10 @@ export const READ_ONLY_TOOL_POLICY: ToolPolicy = parseToolPolicy({ allowedRisks:
 
 export function parseToolPolicy(value: unknown): ToolPolicy {
   const record = parseJsonObject(value, { maxDepth: 4, maxCollectionEntries: 20, maxStringBytes: 100, maxTotalBytes: 2_000 });
+  return decodeOwnedToolPolicy(record);
+}
+
+export function decodeOwnedToolPolicy(record: JsonObject): ToolPolicy {
   const unknown = Object.keys(record).filter((key) => key !== 'allowedRisks' && key !== 'dryRunWrites');
   if (unknown.length > 0) throw new Error('Tool policy contains unsupported fields: ' + unknown.join(', ') + '.');
   if (!Array.isArray(record.allowedRisks)) throw new Error('Tool policy must declare allowedRisks.');
@@ -21,6 +25,10 @@ export function parseToolPolicy(value: unknown): ToolPolicy {
   if (new Set(allowedRisks).size !== allowedRisks.length) throw new Error('Tool policy risks must be unique.');
   if (record.dryRunWrites !== undefined && typeof record.dryRunWrites !== 'boolean') throw new Error('Tool policy dryRunWrites must be boolean.');
   return Object.freeze({ allowedRisks: Object.freeze(allowedRisks), ...(record.dryRunWrites === true ? { dryRunWrites: true } : {}) });
+}
+
+export function encodeToolPolicy(policy: ToolPolicy): JsonObject {
+  return Object.freeze({ allowedRisks: Object.freeze([...policy.allowedRisks]), ...(policy.dryRunWrites === true ? { dryRunWrites: true } : {}) });
 }
 
 export function isToolAvailable(tool: ToolDefinition, policy: ToolPolicy): boolean {

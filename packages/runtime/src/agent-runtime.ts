@@ -51,7 +51,7 @@ import {
   ToolRegistry,
   type ToolAuthorizer,
   type ToolCall,
-  type ToolDefinition,
+  type CompiledToolDefinition,
   type ToolAuthorizationBoundary,
   type ToolExecutionContext,
   type ToolPreparationContext,
@@ -124,7 +124,7 @@ export interface AgentRuntimeOptions {
   readonly provider: ModelProvider;
   readonly model: string;
   readonly repositories: AgentRuntimeRepositories;
-  readonly tools?: readonly ToolDefinition[];
+  readonly tools?: readonly CompiledToolDefinition[];
   readonly toolBoundary: ToolAuthorizationBoundary;
   readonly toolContext?: Omit<ToolExecutionContext, 'policy' | 'signal'>;
   readonly toolPolicy?: ToolPolicy;
@@ -181,7 +181,7 @@ interface TurnSnapshot {
   readonly profile: ModelProfile;
   readonly requestWindow: RequestWindow;
   readonly budgetAccountant: BudgetAccountant;
-  readonly tools: readonly ToolDefinition[];
+  readonly tools: readonly CompiledToolDefinition[];
   readonly configuration: RuntimeModelConfiguration;
   readonly instructions: readonly AgentEffectiveInstruction[];
 }
@@ -253,7 +253,7 @@ export class AgentRuntime {
   private readonly estimator: TokenEstimator;
   private readonly maxOutputTokens: number | undefined;
   private readonly toolPolicy: ToolPolicy;
-  private readonly tools: readonly ToolDefinition[];
+  private readonly tools: readonly CompiledToolDefinition[];
   private readonly resourceLeases: ResourceLeaseCoordinator;
   private readonly checks: readonly AgentCheckDefinition[];
   private readonly steerQueue: AgentQueuedSteer[] = [];
@@ -680,7 +680,7 @@ export class AgentRuntime {
     readonly configuration: RuntimeModelConfiguration;
     readonly profile: ModelProfile;
     readonly requestWindow: RequestWindow;
-    readonly tools: readonly ToolDefinition[];
+    readonly tools: readonly CompiledToolDefinition[];
     readonly instructions: readonly AgentEffectiveInstruction[];
     readonly controller: AgentRunController;
     readonly continuationEligible: boolean;
@@ -942,7 +942,7 @@ export class AgentRuntime {
     });
   }
   private estimateAssistantOutput(response: ModelResponse): number { const toolText = response.toolCalls?.length ? `\n${JSON.stringify(response.toolCalls)}` : ''; return this.estimator.estimateText(`${response.content}${response.reasoningSummary ?? ''}${toolText}`); }
-  private availableTools(profile?: ModelProfile): ToolDefinition[] {
+  private availableTools(profile?: ModelProfile): CompiledToolDefinition[] {
     const context = this.toolContext(new AbortController().signal);
     return this.tools.filter((tool) => isToolAvailable(tool, this.toolPolicy) && toolRequirementsSatisfied(tool, {
       ...(context.services ? { services: context.services } : {}),
@@ -1121,9 +1121,7 @@ function validateToolBoundary(value: unknown): asserts value is ToolAuthorizatio
 function removeRunItems(items: { readonly runId: string }[], runId: string): void { for (let index = items.length - 1; index >= 0; index -= 1) if (items[index]?.runId === runId) items.splice(index, 1); }
 function assertQueueCapacity(items: readonly unknown[], maximum: number, label: string): void { if (items.length >= maximum) throw new Error(`${label} queue limit of ${String(maximum)} was reached.`); }
 function approvalFromEvent(event: Extract<AgentEvent, { type: 'approval.requested' }>): AgentApprovalRequest {
-  const effects = normalizeJsonSafe(event.effects).value;
-  if (!isRecord(effects)) throw new Error(`Approval ${event.approvalId} effects are malformed.`);
-  return Object.freeze({ runId: event.runId, turnIndex: event.turnIndex, turnId: event.turnId, requestAttempt: event.requestAttempt, toolBatchId: event.toolBatchId, callIndex: event.callIndex, ...(event.callId ? { callId: event.callId } : {}), approvalId: event.approvalId, status: 'pending', toolName: event.toolName, fingerprint: event.fingerprint, input: event.input, effects, binding: event.binding, policyHash: event.policyHash, reason: event.reason });
+  return Object.freeze({ runId: event.runId, turnIndex: event.turnIndex, turnId: event.turnId, requestAttempt: event.requestAttempt, toolBatchId: event.toolBatchId, callIndex: event.callIndex, ...(event.callId ? { callId: event.callId } : {}), approvalId: event.approvalId, status: 'pending', toolName: event.toolName, fingerprint: event.fingerprint, input: event.input, effects: event.effects, binding: event.binding, policyHash: event.policyHash, reason: event.reason });
 }
 function toolRecoveryState(records: readonly AgentEvent[], toolBatchId: string, callCount: number): readonly ToolCallRecoveryState[] {
   const recovery: ToolCallRecoveryState[] = [];

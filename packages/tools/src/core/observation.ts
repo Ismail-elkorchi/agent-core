@@ -1,4 +1,5 @@
 import * as z from 'zod';
+import { decodeOwnedToolCall } from './call.js';
 import {
   validatePublicArtifactRef,
   parseToolEvidenceDelta,
@@ -81,8 +82,12 @@ export function runtimeErrorObservation(toolName: string, error: unknown, detail
 
 /** The sole boundary from untrusted tool output into Agent Core. */
 export function parseToolObservation(tool: Pick<ToolDefinition, 'outputSchema'> | undefined, value: unknown): ToolObservation<JsonValue> {
-  if (typeof value === 'object' && value !== null && OWNED_TOOL_OBSERVATIONS.has(value)) return value as ToolObservation<JsonValue>;
+  if (isOwnedToolObservation(value)) return value;
   return parseOwnedToolObservation(tool, parseJsonObject(value, JSON_LIMITS));
+}
+
+function isOwnedToolObservation(value: unknown): value is ToolObservation<JsonValue> {
+  return typeof value === 'object' && value !== null && OWNED_TOOL_OBSERVATIONS.has(value);
 }
 
 function parseOwnedToolObservation(tool: Pick<ToolDefinition, 'outputSchema'> | undefined, record: JsonObject): ToolObservation<JsonValue> {
@@ -119,6 +124,7 @@ function ownObservation<T extends ToolObservation<JsonValue>>(observation: T): T
 }
 
 export function normalizeToolObservationForPersistence(value: unknown): ToolObservation<JsonValue> {
+  if (isOwnedToolObservation(value)) return value;
   return decodeOwnedToolObservationForPersistence(parseJsonObject(value, JSON_LIMITS));
 }
 
@@ -195,10 +201,8 @@ function requireJsonObject(value: JsonValue, label: string): JsonObject {
   return value;
 }
 function decodeToolCall(value: JsonValue | undefined): ToolCall | undefined {
-  if (!jsonObject(value) || typeof value.name !== 'string' || (value.id !== undefined && typeof value.id !== 'string') || !jsonObject(value.input)) return undefined;
-  if (value.input.kind === 'text' && typeof value.input.value === 'string') return Object.freeze({ ...(typeof value.id === 'string' ? { id: value.id } : {}), name: value.name, input: Object.freeze({ kind: 'text', value: value.input.value }) });
-  if (value.input.kind === 'json' && jsonObject(value.input.value)) return Object.freeze({ ...(typeof value.id === 'string' ? { id: value.id } : {}), name: value.name, input: Object.freeze({ kind: 'json', value: value.input.value }) });
-  return undefined;
+  if (!jsonObject(value)) return undefined;
+  try { return decodeOwnedToolCall(value); } catch { return undefined; }
 }
 function decodeValidationIssues(value: JsonValue | undefined): ToolValidationIssues | undefined {
   if (!jsonObject(value) || !jsonArray(value.issues)) return undefined;

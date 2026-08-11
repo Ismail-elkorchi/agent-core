@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { LocalArtifactRepository } from '@agent-core/evidence/node';
-import type { ToolDefinition, ToolResourceLease } from '@agent-core/tools';
+import type { CompiledToolDefinition, ToolResourceLease } from '@agent-core/tools';
 import { parseLocalToolConfiguration, DEFAULT_LOCAL_TOOL_CONFIGURATION, type LocalToolConfiguration } from './core/configuration.js';
 import { ProcessManager, type ProcessReconciliationResult, type ProcessTerminalReport, type PtyProcessFactory } from './core/process-manager.js';
 import { WorkspaceFileSelector } from './core/workspace-file-selection.js';
@@ -27,7 +27,7 @@ export interface LocalToolHostOptions {
 }
 
 export interface LocalToolHost {
-  readonly tools: readonly ToolDefinition[];
+  readonly tools: readonly CompiledToolDefinition[];
   readonly services: Readonly<Record<string, unknown>> & {
     readonly workspaceRoot: string;
     readonly artifactRepository: LocalArtifactRepository;
@@ -67,7 +67,7 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
     workspaceFileSelector,
     ...(options.patchTransactionDirectory ? { patchTransactionDirectory: path.resolve(options.patchTransactionDirectory) } : {})
   });
-  const allTools: readonly ToolDefinition[] = Object.freeze([
+  const allTools: readonly CompiledToolDefinition[] = Object.freeze([
     listDirectoryTool,
     findFilesTool,
     readFilesTool,
@@ -118,7 +118,7 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
   });
 }
 
-function selectTools(tools: readonly ToolDefinition[], enabled: readonly string[] | undefined): readonly ToolDefinition[] {
+function selectTools(tools: readonly CompiledToolDefinition[], enabled: readonly string[] | undefined): readonly CompiledToolDefinition[] {
   if (!enabled) return tools;
   const known = new Set(tools.map((tool) => tool.name));
   const unknown = enabled.filter((name) => !known.has(name));

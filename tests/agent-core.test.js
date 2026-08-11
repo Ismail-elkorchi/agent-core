@@ -20,6 +20,7 @@ import {
   decodeAgentTerminalSnapshot
 } from '@agent-core/runtime';
 import { InMemorySessionRepository } from '@agent-core/runtime';
+import { adoptToolDefinition } from '@agent-core/tools';
 
 const capabilities = {
   streaming: false,
@@ -91,7 +92,7 @@ async function harness(options = {}) {
     },
     ...(options.checks ? { checks: options.checks } : {}),
     ...(options.instructions ? { instructions: options.instructions } : {}),
-    ...(options.tools ? { tools: options.tools } : {}),
+    ...(options.tools ? { tools: options.tools.map(adoptToolDefinition) } : {}),
     ...(options.toolPolicy ? { toolPolicy: options.toolPolicy } : {}),
     ...(options.toolAuthorizer ? { toolAuthorizer: options.toolAuthorizer } : {}),
     ...(options.toolContext ? { toolContext: options.toolContext } : {}),
@@ -119,7 +120,7 @@ test('runtime exposes artifact and image tools only with the required repository
     deriveEffects() { return readEffects; },
     async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; }
   });
-  const tools = [conditionalTool('read_artifact'), conditionalTool('view_image')];
+  const tools = [conditionalTool('read_artifact'), conditionalTool('view_image')].map(adoptToolDefinition);
 
   const textProvider = new ScriptedProvider([response()]);
   const textAgent = new AgentRuntime({
@@ -153,13 +154,13 @@ function modelToolName(tool) {
 
 test('tool progress from preparation and invocation remains separate from the final observation', async () => {
   const progress = [];
-  const tool = {
+  const tool = adoptToolDefinition({
     name: 'progress_tool', implementationId: 'tests/progress-tool@1', description: 'progress', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope,
     decodeInput() { return { ok: true, input: {} }; },
     async canonicalizeInput(input, context) { await context.emitProgress?.({ type: 'status', stage: 'canonicalize' }); return input; }, snapshotInput(input) { return input; },
     deriveEffects() { return readEffects; },
     async invoke(_input, context) { await context.emitProgress?.({ type: 'status', stage: 'invoke' }); return { kind: 'result', ok: true, output: {}, summary: 'done', scope: completeScope }; }
-  };
+  });
   const { agent, events } = await harness({
     tools: [tool],
     script: [response('tool_calls', '', { toolCalls: [{ id: 'progress', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }] }), response()],
@@ -174,12 +175,12 @@ test('tool progress from preparation and invocation remains separate from the fi
 
 test('oversized tool observations keep domain output intact in an artifact', async () => {
   const items = Array.from({ length: 2_000 }, (_unused, index) => ({ id: index, value: `item-${String(index)}-${'x'.repeat(20)}` }));
-  const tool = {
+  const tool = adoptToolDefinition({
     name: 'large_result', implementationId: 'tests/large-result@1', description: 'large result', jsonSchema: { type: 'object' },
     outputSchema: z.strictObject({ items: z.array(z.strictObject({ id: z.int(), value: z.string() })) }), effectEnvelope: readEnvelope,
     decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return readEffects; },
     async invoke() { return { kind: 'result', ok: true, output: { items }, summary: 'large result complete', scope: completeScope }; }
-  };
+  });
   const { agent, events, artifacts } = await harness({
     tools: [tool],
     script: [response('tool_calls', '', { toolCalls: [{ id: 'large', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }] }), response()]
@@ -678,14 +679,14 @@ test('terminal cleanup prevents steering, retry, and follow-up controls from lea
 test('durable approval resumes after repository reopen and rejects changed policy fingerprints', async () => {
   let effects = 0;
   const call = { id: 'effect-1', type: 'function', name: 'effect', input: { kind: 'json', value: { path: 'src/../state' } } };
-  const tool = {
+  const tool = adoptToolDefinition({
     name: 'effect', implementationId: 'tests/canonical-effect@1', description: 'write one canonical resource', jsonSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }, outputSchema: emptyOutputSchema,
     effectEnvelope: { accesses: [{ mode: 'write', scope: 'workspace' }], lockScopes: ['workspace'] },
     decodeInput(input) { return { ok: true, input: input.value }; },
     canonicalizeInput(input) { return { ...input, path: 'state' }; }, snapshotInput(input) { return input; },
     deriveEffects(input) { return { accesses: [{ mode: 'write', scope: `workspace/${input.path}` }], lockScopes: [`workspace/${input.path}`], idempotency: 'idempotent', idempotencyKey: `effect:${input.path}` }; },
     async invoke() { effects += 1; return { kind: 'result', ok: true, output: {}, summary: 'changed', scope: { resources: ['workspace/state'], coverage: 'complete' } }; }
-  };
+  });
   const provider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] }), response('stop', 'approved')]);
   const repositories = await harness({ provider, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, toolAuthorizer: request => {
     assert.deepEqual(request.input, { path: 'state' });
@@ -704,7 +705,7 @@ test('durable approval resumes after repository reopen and rejects changed polic
   const changedTarget = new AgentRuntime({ provider, model: 'scripted', toolBoundary: { ...toolBoundary, executionTargetId: 'tests/other-target' }, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] } });
   await assert.rejects(changedTarget.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' }), /boundary changed/);
 
-  const replacement = { ...tool, implementationId: 'tests/canonical-effect@2' };
+  const replacement = adoptToolDefinition({ ...tool, implementationId: 'tests/canonical-effect@2' });
   const changedImplementation = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [replacement], toolPolicy: { allowedRisks: ['read', 'write'] } });
   await assert.rejects(changedImplementation.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' }), /implementation changed|fingerprint changed/);
   assert.deepEqual(approval.binding, { toolImplementationId: tool.implementationId, ...toolBoundary });
@@ -722,12 +723,12 @@ test('durable approval resumes after repository reopen and rejects changed polic
 
 test('current authorization is re-evaluated and may veto a stored approval', async () => {
   let effects = 0;
-  const tool = {
+  const tool = adoptToolDefinition({
     name: 'effect', implementationId: 'tests/current-veto-effect@1', description: 'effect', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema,
     effectEnvelope: { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'] },
     decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'], idempotency: 'non_idempotent' }; },
     async invoke() { effects += 1; return { kind: 'result', ok: true, output: {}, summary: 'changed', scope: { resources: ['state'], coverage: 'complete' } }; }
-  };
+  });
   const provider = new ScriptedProvider([
     response('tool_calls', '', { toolCalls: [{ id: 'effect', type: 'function', name: 'effect', input: { kind: 'json', value: {} } }] }),
     response('stop', 'continued safely')

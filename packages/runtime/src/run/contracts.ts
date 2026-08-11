@@ -2,6 +2,7 @@ import type { ArtifactRef } from '@agent-core/evidence';
 import { canonicalJsonString } from '@agent-core/evidence';
 import { parseJsonObject, type JsonNormalizationDiagnostic, type JsonObject, type JsonValue } from '@agent-core/json';
 import type { ModelReasoningRequest, ModelResponseFormat, ModelTerminationReason } from '@agent-core/model';
+import type { ToolEffects } from '@agent-core/tools';
 
 export type AgentExecutionStatus = 'completed' | 'failed' | 'aborted';
 export type AgentCandidateStatus = 'complete' | 'partial' | 'indeterminate' | 'absent';
@@ -58,7 +59,7 @@ export interface AgentApprovalRequest extends AgentToolCallIdentity {
   readonly toolName: string;
   readonly fingerprint: string;
   readonly input: JsonValue;
-  readonly effects: JsonObject;
+  readonly effects: ToolEffects;
   readonly binding: AgentApprovalBinding;
   readonly policyHash: string;
   readonly reason: string;

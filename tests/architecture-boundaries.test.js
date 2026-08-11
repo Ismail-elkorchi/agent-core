@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+import { hashJson, InMemoryEventRepository } from '@agent-core/evidence';
 
 const root = path.resolve(import.meta.dirname, '..');
 const production = readdirSync(path.join(root, 'packages'), { recursive: true, withFileTypes: true })
@@ -23,17 +24,44 @@ test('production boundaries do not rebuild established ownership proofs', () => 
   assert.deepEqual(violations, []);
 });
 
-test('event persistence and tool registration have one ownership transition', () => {
-  const events = readFileSync(path.join(root, 'packages/runtime/src/events.ts'), 'utf8');
-  const decodeBody = events.slice(events.indexOf('export function decodeAgentEvent'), events.indexOf('type AgentEventOf'));
-  assert.equal((decodeBody.match(/parseJsonObject\(/gu) ?? []).length, 1);
-  assert.doesNotMatch(decodeBody, /isAgentEvent\(/u);
-  const dispatch = events.slice(events.indexOf('const AGENT_EVENT_DECODERS'), events.indexOf('const AGENT_EVENT_TYPES'));
-  assert.match(dispatch, /satisfies AgentEventDecoderMap/u);
-  assert.doesNotMatch(dispatch, /parseJsonObject\(|parseAgentCandidate|as unknown as/u);
-  assert.equal((dispatch.match(/^  '[^']+': \(value\) => \{/gmu) ?? []).length, (dispatch.match(/\n    exact\(value,/gu) ?? []).length);
+test('repositories encode on append and decode once on read', async () => {
+  let encodes = 0;
+  let decodes = 0;
+  const codec = {
+    encode(value) {
+      encodes += 1;
+      const payload = Object.freeze({ ...value.payload });
+      return Object.freeze({ json: Object.freeze({ type: value.type, payload }), value: Object.freeze({ type: value.type, payload }) });
+    },
+    decode(value) {
+      decodes += 1;
+      if (!value || typeof value !== 'object' || value.type !== 'measured' || !value.payload || typeof value.payload !== 'object' || typeof value.payload.count !== 'number') throw new Error('malformed measured event');
+      return Object.freeze({ type: value.type, payload: Object.freeze({ count: value.payload.count }) });
+    }
+  };
+  const repository = new InMemoryEventRepository(codec);
+  const original = { type: 'measured', payload: { count: 1 } };
+  const appended = await repository.append('run', original);
+  original.payload.count = 2;
+  assert.deepEqual({ encodes, decodes }, { encodes: 1, decodes: 0 });
+  const { hash, event: _domainEvent, ...envelope } = appended;
+  assert.equal(hash, hashJson({ ...envelope, event: { type: 'measured', payload: { count: 1 } } }));
+  const records = await Array.fromAsync(repository.read('run'));
+  assert.deepEqual({ encodes, decodes }, { encodes: 1, decodes: 1 });
+  assert.equal(records[0].event.payload.count, 1);
 
+  const malformed = new InMemoryEventRepository({
+    encode(value) { return { json: { type: value.type, payload: { count: 'bad' } }, value }; },
+    decode: codec.decode
+  });
+  await malformed.append('run', { type: 'measured', payload: { count: 1 } });
+  await assert.rejects(Array.fromAsync(malformed.read('run')), /malformed measured event/u);
+
+  const events = readFileSync(path.join(root, 'packages/runtime/src/events.ts'), 'utf8');
+  assert.doesNotMatch(events, /AgentEvent\s*&\s*JsonObject|as\s+AgentEvent\s*&\s*JsonObject/u);
+  const prepare = readFileSync(path.join(root, 'packages/tools/src/core/prepare.ts'), 'utf8');
+  assert.doesNotMatch(prepare, /parseJsonObject|decodeToolCall/u);
   const registry = readFileSync(path.join(root, 'packages/tools/src/core/registry.ts'), 'utf8');
-  const registerBody = registry.slice(registry.indexOf('register<'), registry.indexOf('\n  get('));
-  assert.doesNotMatch(registerBody, /adoptToolDefinition|parseJsonObject/u);
+  const registerBody = registry.slice(registry.indexOf('register('), registry.indexOf('\n  get('));
+  assert.doesNotMatch(registerBody, /markCompiledTool|parseJsonObject/u);
 });

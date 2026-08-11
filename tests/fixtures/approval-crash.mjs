@@ -4,7 +4,7 @@ import path from 'node:path';
 import { AgentRuntime, agentEventCodec } from '@agent-core/runtime';
 import { JsonlEventRepository, LocalArtifactRepository } from '@agent-core/evidence/node';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
-import { ResourceLeaseCoordinator } from '@agent-core/tools';
+import { adoptToolDefinition, ResourceLeaseCoordinator } from '@agent-core/tools';
 
 const [mode, root, runId, approvalId, fingerprint] = process.argv.slice(2);
 if (!mode || !root) throw new Error('mode and root are required');
@@ -64,7 +64,7 @@ const agent = new AgentRuntime({
   model: 'fixture',
   toolBoundary: { authorizationPolicyId: 'tests/crash-policy@1', executionTargetId: root },
   repositories: { events, session: { repository: sessions, sessionId }, artifacts },
-  tools: [tool],
+  tools: [adoptToolDefinition(tool)],
   toolPolicy: { allowedRisks: ['read', 'write'] },
   toolAuthorizer: () => ({ decision: 'require_approval', reason: 'confirm crash fixture' }),
   toolContext: { services: { processManager: { resourceLeases } } },

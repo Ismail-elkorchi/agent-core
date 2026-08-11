@@ -5,7 +5,7 @@ import { canonicalJsonString, hashJson, InMemoryEventRepository, typedEventCodec
 import { normalizeJsonSafe } from '@agent-core/json';
 import { createModelRequest, parseModelRequest, parseModelResponse } from '@agent-core/model';
 import { decodeAgentEvent } from '@agent-core/runtime';
-import { adoptToolDefinition, defineTool, parseToolObservation, ToolRegistry } from '@agent-core/tools';
+import { adoptToolDefinition, createToolCall, defineTool, parseToolObservation, prepareToolCall, ToolRegistry } from '@agent-core/tools';
 
 test('normalized JSON is already recursively owned', () => {
   const nested = { values: [{ count: 1 }] };
@@ -60,8 +60,24 @@ test('authored tools retain identity and dynamic tools cross an explicit adopter
   effectEnvelope.accesses[0].scope = 'changed';
   assert.equal(tool.effectEnvelope.accesses[0].scope, 'memory');
   assert.equal(registry.require(tool.name), tool);
-  assert.notEqual(adoptToolDefinition(tool), tool);
+  assert.equal(adoptToolDefinition(tool), tool);
+  assert.throws(() => registry.register({ ...tool }), /created by/u);
   assert.throws(() => adoptToolDefinition({ ...tool, unsupported: true }), /unsupported fields/u);
+});
+
+test('tool preparation accepts owned calls without decoding structural lookalikes', async () => {
+  const tool = defineTool({
+    name: 'prepared_tool', implementationId: 'tests/prepared-tool@1', description: 'Checks call ownership.', schema: z.strictObject({ value: z.string() }), outputSchema: z.strictObject({}),
+    effectEnvelope: { accesses: [], lockScopes: [] }, canonicalizeInput: (input) => input, deriveEffects: () => ({ accesses: [], lockScopes: [], idempotency: 'pure' }),
+    invoke: async () => ({ kind: 'result', ok: true, summary: 'ok', scope: { resources: [], coverage: 'complete' }, output: {} })
+  });
+  const input = { name: tool.name, input: { kind: 'json', value: { value: 'owned' } } };
+  const context = { policy: { allowedRisks: [] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'tests', executionTargetId: 'tests' } };
+  await assert.rejects(prepareToolCall(input, [tool], context), /created or decoded/u);
+  const call = createToolCall(input);
+  const prepared = await prepareToolCall(call, [tool], context);
+  assert.equal(prepared.ok, true);
+  assert.equal(prepared.prepared.call, call);
 });
 
 test('owned provider values are not decoded again', () => {

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { normalizeJsonSafe } from '@agent-core/json';
+import type { JsonObject } from '@agent-core/json';
 
 type ArtifactRefBase = Readonly<{
   readonly artifactId: string;
@@ -114,6 +115,13 @@ export function validateArtifactRef(value: unknown): asserts value is ArtifactRe
 export function validatePublicArtifactRef(value: unknown): asserts value is PublicArtifactRef {
   validateArtifactRef(value);
   if (value.visibility !== 'public') throw new Error('Protected artifacts are not model-readable.');
+}
+
+export function decodeOwnedArtifactRef(value: JsonObject): ArtifactRef {
+  const allowed = new Set(['artifactId', 'sha256', 'size', 'mediaType', 'visibility', 'label', 'description']);
+  if (Object.keys(value).some((key) => !allowed.has(key)) || (value.label !== undefined && typeof value.label !== 'string') || (value.description !== undefined && typeof value.description !== 'string')) throw new Error('Invalid artifact reference.');
+  validateArtifactRef(value);
+  return value;
 }
 
 export function hashArtifactBytes(content: Uint8Array): string { return createHash('sha256').update(content).digest('hex'); }

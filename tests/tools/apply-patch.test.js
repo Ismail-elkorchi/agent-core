@@ -6,7 +6,7 @@ import { promises as realFs } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { prepareToolCall } from '@agent-core/tools';
+import { createToolCall, prepareToolCall } from '@agent-core/tools';
 import { createCliToolPolicy } from '@agent-core/cli';
 import { applyPatchTool, DEFAULT_LOCAL_TOOL_CONFIGURATION } from '@agent-core/tools-local';
 import { applyPatchWithAuthority } from '@agent-core/tools-local/testing/apply-patch';
@@ -169,7 +169,7 @@ test('apply_patch dynamically requires a transaction directory only for writes',
     services: { workspaceRoot: root, localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION }
   };
   const document = patch(['*** Update File: note.txt', '@@', '-old', '+new']);
-  const dryPreparation = await prepareToolCall({ name: 'apply_patch', input: { kind: 'json', value: { patch: document, dryRun: true } } }, [applyPatchTool], base);
+  const dryPreparation = await prepareToolCall(createToolCall({ name: 'apply_patch', input: { kind: 'json', value: { patch: document, dryRun: true } } }), [applyPatchTool], base);
   assert.equal(dryPreparation.ok, true);
   const dry = await dryPreparation.prepared.invoke(base);
   assert.equal(dry.output.operationStatus, 'dry_run');

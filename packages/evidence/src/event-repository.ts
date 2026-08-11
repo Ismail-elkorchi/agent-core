@@ -4,11 +4,17 @@ import type { AppendEventOptions, EventActor, EventEnvelope, LedgerIntegrityRepo
 import { hashJson, canonicalJsonString } from './ledger.js';
 
 export interface RuntimeCodec<T> {
-  readonly name: string;
-  decode(value: unknown): T & JsonObject;
+  encode(value: T): Readonly<{ readonly json: JsonObject; readonly value: T }>;
+  decode(value: unknown): T;
 }
 
 export interface EventAppendOptions extends AppendEventOptions { readonly idempotencyKey?: string }
+
+interface EncodedEnvelope extends JsonObject {
+  readonly eventId: string; readonly runId: string; readonly sequence: number; readonly timestamp: string;
+  readonly schemaVersion: string; readonly actor: EventActor; readonly event: JsonObject; readonly hash: string;
+  readonly causationId?: string; readonly correlationId?: string; readonly idempotencyKey?: string; readonly previousHash?: string;
+}
 
 export interface EventRepository<TEvent extends TypedEvent> {
   append(runId: string, event: TEvent, options?: EventAppendOptions): Promise<EventEnvelope<TEvent>>;
@@ -37,64 +43,94 @@ export class PersistenceConflictError extends Error {
 }
 
 export class InMemoryEventRepository<TEvent extends TypedEvent> implements EventRepository<TEvent> {
-  private readonly records = new Map<string, EventEnvelope<TEvent>[]>();
+  private readonly records = new Map<string, EncodedEnvelope[]>();
   private queue: Promise<void> = Promise.resolve();
   constructor(private readonly codec: RuntimeCodec<TEvent>) {}
 
   append(runId: string, event: TEvent, options: EventAppendOptions = {}): Promise<EventEnvelope<TEvent>> {
     const operation = this.queue.then(() => {
       assertIdentifier(runId, 'runId');
-      const parsed = this.codec.decode(event);
+      const encoding = this.codec.encode(event);
+      const encodedEvent = encoding.json;
       const records = this.records.get(runId) ?? [];
       const idempotencyKey = options.idempotencyKey;
       const existing = idempotencyKey ? records.find((record) => record.idempotencyKey === idempotencyKey) : undefined;
       if (existing && idempotencyKey) {
-        if (canonicalJsonString(existing.event) !== canonicalJsonString(parsed)) throw new PersistenceConflictError(`Conflicting event for ${idempotencyKey}.`);
-        return existing;
+        if (canonicalJsonString(existing.event) !== canonicalJsonString(encodedEvent)) throw new PersistenceConflictError(`Conflicting event for ${idempotencyKey}.`);
+        return envelopeFromEncoded(existing, encoding.value);
       }
       const previous = records.at(-1);
-      const base: Omit<EventEnvelope<TEvent>, 'hash'> & { idempotencyKey?: string } = Object.freeze({
+      const base = Object.freeze({
         eventId: randomUUID(), runId, sequence: records.length, timestamp: options.timestamp ?? new Date().toISOString(),
-        schemaVersion: '1', actor: options.actor ?? inferActor(parsed.type), event: parsed,
+        schemaVersion: '1', actor: options.actor ?? inferActor(event.type), event: encodedEvent,
         ...(options.causationId ? { causationId: options.causationId } : {}),
         ...(options.correlationId ? { correlationId: options.correlationId } : {}),
         ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
         ...(previous ? { previousHash: previous.hash } : {})
       });
-      const envelope: EventEnvelope<TEvent> = Object.freeze({ ...base, hash: hashJson(base) });
-      records.push(envelope);
+      const encodedEnvelope: EncodedEnvelope = Object.freeze({ ...base, hash: hashJson(base) });
+      records.push(encodedEnvelope);
       this.records.set(runId, records);
-      return envelope;
+      return envelopeFromEncoded(encodedEnvelope, encoding.value);
     });
     this.queue = operation.then(() => undefined, () => undefined);
     return operation;
   }
 
-  async *read(runId: string): AsyncIterable<EventEnvelope<TEvent>> { await Promise.resolve(); yield* [...(this.records.get(runId) ?? [])]; }
+  async *read(runId: string): AsyncIterable<EventEnvelope<TEvent>> {
+    await Promise.resolve();
+    for (const record of this.records.get(runId) ?? []) yield decodeEnvelope(record, runId, this.codec);
+  }
   listRunIds(): Promise<readonly string[]> { return Promise.resolve([...this.records.keys()].sort()); }
   verifyIntegrity(runId: string): Promise<LedgerIntegrityReport> {
     let previousHash: string | undefined;
     const errors: string[] = [];
     const records = this.records.get(runId) ?? [];
-    for (const [index, record] of records.entries()) {
-      if (record.sequence !== index) errors.push(`sequence mismatch at index ${String(index)}`);
-      if (record.previousHash !== previousHash) errors.push(`previousHash mismatch at sequence ${String(record.sequence)}`);
-      const { hash, ...base } = record;
-      if (hash !== hashJson(base)) errors.push(`hash mismatch at sequence ${String(record.sequence)}`);
-      previousHash = record.hash;
+    for (const [index, encoded] of records.entries()) {
+      try {
+        const record = decodeEnvelope(encoded, runId, this.codec);
+        if (record.sequence !== index) errors.push(`sequence mismatch at index ${String(index)}`);
+        if (record.previousHash !== previousHash) errors.push(`previousHash mismatch at sequence ${String(record.sequence)}`);
+        const { hash, ...base } = encoded;
+        if (hash !== hashJson(base)) errors.push(`hash mismatch at sequence ${String(record.sequence)}`);
+        previousHash = record.hash;
+      } catch (error) { errors.push(error instanceof Error ? error.message : String(error)); }
     }
     return Promise.resolve({ ok: errors.length === 0, records: records.length, errors });
   }
 }
 
 export const typedEventCodec: RuntimeCodec<TypedEvent> = {
-  name: 'TypedEvent',
-  decode(value: unknown): TypedEvent & JsonObject {
-    const object = parseJsonObject(value, { maxDepth: 64, maxCollectionEntries: 50_000, maxStringBytes: 1_000_000, maxTotalBytes: 8_000_000 });
+  encode(value: TypedEvent) {
+    const json = parseJsonObject(value, EVENT_LIMITS);
+    if (typeof json.type !== 'string' || json.type.length === 0) throw new Error('Event must have a non-empty type.');
+    return Object.freeze({ json, value: Object.freeze({ ...json, type: json.type }) });
+  },
+  decode(value: unknown): TypedEvent {
+    const object = parseJsonObject(value, EVENT_LIMITS);
     if (typeof object.type !== 'string' || object.type.length === 0) throw new Error('Event must have a non-empty type.');
     return Object.freeze({ ...object, type: object.type });
   }
 };
+
+const EVENT_LIMITS = { maxDepth: 64, maxCollectionEntries: 50_000, maxStringBytes: 1_000_000, maxTotalBytes: 8_000_000 } as const;
+
+function envelopeFromEncoded<TEvent extends TypedEvent>(encoded: EncodedEnvelope, event: TEvent): EventEnvelope<TEvent> {
+  return Object.freeze({
+    eventId: encoded.eventId, runId: encoded.runId, sequence: encoded.sequence,
+    timestamp: encoded.timestamp, schemaVersion: encoded.schemaVersion, actor: encoded.actor,
+    ...(encoded.causationId ? { causationId: encoded.causationId } : {}),
+    ...(encoded.correlationId ? { correlationId: encoded.correlationId } : {}),
+    ...(encoded.idempotencyKey ? { idempotencyKey: encoded.idempotencyKey } : {}),
+    ...(encoded.previousHash ? { previousHash: encoded.previousHash } : {}),
+    hash: encoded.hash, event
+  });
+}
+
+function decodeEnvelope<TEvent extends TypedEvent>(encoded: EncodedEnvelope, runId: string, codec: RuntimeCodec<TEvent>): EventEnvelope<TEvent> {
+  if (encoded.runId !== runId) throw new Error('Event envelope fields are invalid.');
+  return envelopeFromEncoded(encoded, codec.decode(encoded.event));
+}
 
 function assertIdentifier(value: string, name: string): void { if (!/^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/u.test(value)) throw new Error(`${name} is invalid.`); }
 function inferActor(type: string): EventActor {

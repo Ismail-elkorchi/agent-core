@@ -216,7 +216,7 @@ function boundedDurableObservation(observation: ToolObservation, artifact: Publi
 }
 
 function boundedFailureOutput(output: import('@agent-core/tools').ToolFailureOutput, artifact: ArtifactRef | undefined, originalBytes: number): JsonValue {
-  const storage = artifact ? { artifact: parseJsonValue(artifact), originalBytes } : { originalBytes };
+  const storage = artifact ? { artifact: { ...artifact }, originalBytes } : { originalBytes };
   const common = { blocked: true as const, reason: output.reason, recovery: output.recovery };
   if (output.reason === 'unknown_tool') return parseJsonValue({ ...common, toolCall: output.toolCall });
   if (output.reason === 'policy') return parseJsonValue({ ...common, ...(output.tool ? { tool: output.tool } : {}), ...(output.policyReason ? { policyReason: output.policyReason } : {}), details: storage });
@@ -259,12 +259,12 @@ export function filterToolResultContentForModel(observation: ToolObservation, mo
 
 function preserveImportantResultFields(output: unknown, artifact: ArtifactRef | undefined, originalBytes: number): JsonValue {
   const value = parseJsonValue(output, CANONICAL_JSON_LIMITS);
-  const durable: Record<string, JsonValue> = { truncatedForPersistence: true, originalBytes, ...(artifact ? { artifact: parseJsonValue(artifact) } : {}) };
+  const durable: Record<string, JsonValue> = { truncatedForPersistence: true, originalBytes, ...(artifact ? { artifact: { ...artifact } } : {}) };
   if (isJsonObject(value)) {
     const important = /^(status|reason|processId|exitCode|signal|count|total|path|file|files|matches|changed|created|deleted|renamed|cursor|nextCursor|fileBytes|observedBytes|retainedBytes|omittedBytes)$/u;
-    for (const [key, item] of Object.entries(value)) if (important.test(key) && byteLength(JSON.stringify(item)) <= 16_384) durable[key] = parseJsonValue(item);
+    for (const [key, item] of Object.entries(value)) if (important.test(key) && byteLength(JSON.stringify(item)) <= 16_384) durable[key] = item;
   }
-  return parseJsonValue(durable);
+  return Object.freeze(durable);
 }
 
 function truncatePresentation(presentation: ToolObservationPresentation, maxTokens: number, estimator: TokenEstimator, artifact?: ArtifactRef): ToolObservationPresentation {
@@ -272,7 +272,7 @@ function truncatePresentation(presentation: ToolObservationPresentation, maxToke
     ok: presentation.ok,
     title: unicodePrefix(presentation.title, 128),
     summary: unicodePrefix(presentation.summary, 512),
-    results: artifact ? { artifact: parseJsonValue(artifact) } : { presenterOverBudget: true },
+    results: artifact ? { artifact: { ...artifact } } : { presenterOverBudget: true },
     omitted: { tokenBudget: maxTokens },
     coverage: 'partial',
     truncated: true,

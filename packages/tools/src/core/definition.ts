@@ -6,7 +6,9 @@ import type { ToolObservationPresentation, ToolObservationPresentationRequest } 
 import type { ToolPolicy } from './policy.js';
 import type { ToolEffectEnvelope, ToolEffects } from './authorization.js';
 
-export interface ToolCall { readonly id?: string; readonly name: string; readonly input: ToolInput }
+declare const ownedToolCall: unique symbol;
+export interface ToolCallInput { readonly id?: string; readonly name: string; readonly input: ToolInput }
+export type ToolCall = Readonly<ToolCallInput & { readonly [ownedToolCall]: true }>;
 export type ToolInput = { readonly kind: 'json'; readonly value: JsonObject } | { readonly kind: 'text'; readonly value: string };
 export type ToolTextInputFormat = { type: 'text' } | { type: 'grammar'; syntax: string; definition: string };
 export interface ToolPromptGuideRequest { inputFormat: string; services?: Record<string, unknown>; metadata?: Record<string, unknown> }

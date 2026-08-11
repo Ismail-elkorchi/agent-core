@@ -72,8 +72,12 @@ export function validateToolEffectEnvelope(value: unknown): ToolEffectEnvelope {
   return Object.freeze({ accesses, lockScopes });
 }
 
-export function validateToolEffects(value: unknown): ToolEffects & JsonObject {
+export function validateToolEffects(value: unknown): ToolEffects {
   const record = parseJsonObject(value, { maxDepth: 8, maxCollectionEntries: 10_000, maxStringBytes: 16_000, maxTotalBytes: 1_000_000 });
+  return decodeOwnedToolEffects(record);
+}
+
+export function decodeOwnedToolEffects(record: JsonObject): ToolEffects {
   const accesses = validateResourceAccesses(record.accesses, 'effects');
   const lockScopes = validateScopes(record.lockScopes, 'effect lockScopes');
   if (!isToolIdempotency(record.idempotency)) throw new Error('Invalid tool idempotency.');
@@ -85,6 +89,16 @@ export function validateToolEffects(value: unknown): ToolEffects & JsonObject {
   }
   if (record.idempotencyKey !== undefined) throw new Error('Only idempotent tool effects may declare idempotencyKey.');
   return Object.freeze({ ...base, idempotency: record.idempotency });
+}
+
+export function encodeToolEffects(effects: ToolEffects): JsonObject {
+  return Object.freeze({
+    accesses: Object.freeze(effects.accesses.map((access) => Object.freeze({ mode: access.mode, scope: access.scope }))),
+    lockScopes: Object.freeze([...effects.lockScopes]),
+    ...(effects.dependsOnCallIndices === undefined ? {} : { dependsOnCallIndices: Object.freeze([...effects.dependsOnCallIndices]) }),
+    idempotency: effects.idempotency,
+    ...(effects.idempotency === 'idempotent' ? { idempotencyKey: effects.idempotencyKey } : {})
+  });
 }
 
 export function assertEffectsWithinEnvelope(effects: ToolEffects, envelope: ToolEffectEnvelope): void {
@@ -115,7 +129,7 @@ export function accessRisk(mode: ToolResourceAccessMode): ToolRisk {
 export function scopeContains(parent: string, child: string): boolean {
   return parent === '*' || parent === child || child.startsWith(parent.endsWith('/') ? parent : `${parent}/`);
 }
-function validateResourceAccesses(value: unknown, label: string): readonly (ToolResourceAccess & JsonObject)[] {
+function validateResourceAccesses(value: unknown, label: string): readonly ToolResourceAccess[] {
   if (!Array.isArray(value)) throw new Error(`Tool ${label} accesses must be an array.`);
   const accesses = value.map((item) => {
     if (!isRecord(item) || !isAccessMode(item.mode) || typeof item.scope !== 'string' || item.scope.trim().length === 0) throw new Error(`Tool ${label} contains an invalid resource access.`);

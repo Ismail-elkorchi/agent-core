@@ -2,6 +2,8 @@ export * from './core/context.js';
 export * from './core/authorization.js';
 export * from './core/define.js';
 export * from './core/definition.js';
+export { createToolCall, decodeToolCall, decodeOwnedToolCall } from './core/call.js';
+export type { CompiledToolDefinition } from './core/compiled.js';
 export * from './core/execute.js';
 export * from './core/observation-presentation.js';
 export * from './core/observation.js';

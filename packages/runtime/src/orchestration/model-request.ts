@@ -12,7 +12,7 @@ import {
   type TokenEstimator,
   assertModelReasoningSupported
 } from '@agent-core/model';
-import { type ToolCall, type ToolDefinition, type ToolExecutionContext } from '@agent-core/tools';
+import { createToolCall, type ToolCall, type ToolDefinition, type ToolExecutionContext } from '@agent-core/tools';
 import { type RequestWindow } from './budget-accountant.js';
 
 export interface AgentInstructionInput {
@@ -24,11 +24,7 @@ export interface AgentInstructionInput {
 }
 
 export function normalizeModelToolCall(toolCall: ModelToolCall): ToolCall {
-  return Object.freeze({
-    ...(toolCall.id ? { id: toolCall.id } : {}),
-    name: toolCall.name,
-    input: toolCall.input
-  });
+  return createToolCall({ ...(toolCall.id ? { id: toolCall.id } : {}), name: toolCall.name, input: toolCall.input });
 }
 
 export function modelToolCallFromToolCall(toolCall: ToolCall): ModelToolCall {

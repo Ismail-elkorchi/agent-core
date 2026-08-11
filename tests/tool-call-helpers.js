@@ -1,4 +1,5 @@
 import {
+  createToolCall,
   POLICY_TOOL_AUTHORIZER,
   invokePreparedToolCall,
   policyBlockedObservation,
@@ -7,14 +8,15 @@ import {
 import path from 'node:path';
 
 export function jsonToolCall(name, value = {}, id) {
-  return { ...(id ? { id } : {}), name, input: { kind: 'json', value } };
+  return createToolCall({ ...(id ? { id } : {}), name, input: { kind: 'json', value } });
 }
 
 export function textToolCall(name, value, id) {
-  return { ...(id ? { id } : {}), name, input: { kind: 'text', value } };
+  return createToolCall({ ...(id ? { id } : {}), name, input: { kind: 'text', value } });
 }
 
 export async function invokeToolCall(call, tools, context) {
+  const ownedCall = createToolCall(call);
   const controller = new AbortController();
   const workspaceRoot = context.services?.workspaceRoot;
   const services = typeof workspaceRoot === 'string'
@@ -29,10 +31,10 @@ export async function invokeToolCall(call, tools, context) {
       executionTargetId: String(context.services?.workspaceRoot ?? 'tests')
     }
   };
-  const preparation = await prepareToolCall(call, tools, preparationContext);
+  const preparation = await prepareToolCall(ownedCall, tools, preparationContext);
   if (!preparation.ok) return preparation.observation;
   const authorization = await POLICY_TOOL_AUTHORIZER({
-    call,
+    call: ownedCall,
     toolImplementationId: preparation.prepared.toolImplementationId,
     input: preparation.prepared.canonicalSnapshot,
     effects: preparation.prepared.effects,
@@ -50,6 +52,7 @@ export async function invokeToolCall(call, tools, context) {
 }
 
 export async function presentToolObservation(tool, call, observation, context, maxTokens) {
+  const ownedCall = createToolCall(call);
   const controller = new AbortController();
   const preparationContext = {
     ...context,
@@ -59,7 +62,7 @@ export async function presentToolObservation(tool, call, observation, context, m
       executionTargetId: String(context.services?.workspaceRoot ?? 'tests')
     }
   };
-  const preparation = await prepareToolCall(call, [tool], preparationContext);
+  const preparation = await prepareToolCall(ownedCall, [tool], preparationContext);
   if (!preparation.ok) {
     if (observation.kind !== 'failure') throw new Error(`Cannot present a result for an invalid tool call: ${preparation.observation.summary}`);
     return tool.presentObservation({ call, input: undefined, observation, mode: 'immediate', maxTokens });

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { JsonObject, JsonValue } from '@agent-core/json';
+import type { JsonValue } from '@agent-core/json';
 
 export type EventActor = 'user' | 'runtime' | 'model' | 'tool' | 'system' | 'check';
 
@@ -19,7 +19,7 @@ export interface EventEnvelope<TEvent extends TypedEvent = TypedEvent> {
   readonly idempotencyKey?: string;
   readonly previousHash?: string;
   readonly hash: string;
-  readonly event: TEvent & JsonObject;
+  readonly event: TEvent;
 }
 
 export interface AppendEventOptions {

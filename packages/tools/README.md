@@ -6,4 +6,6 @@ The runtime boundary is decode → canonicalize → derive call-specific effects
 
 `defineTool` is authoritative typed construction, including the owned JSON snapshot used for authorization and audit hashing. `ToolRegistry.register()` preserves authored definition identity. Independently implemented or dynamically loaded definitions cross the explicit `adoptToolDefinition()` boundary before registration.
 
+Tool calls cross `createToolCall()` for typed construction or `decodeToolCall()` for external data. Preparation accepts only that owned call and does not decode it again.
+
 `execute` is ambient process authority unless a host explicitly supplies a stronger isolation contract. Agent Core's built-in `exec_command` runs with the permissions of the Agent Core process. It may indirectly read, write, or delete files, access the network, and start child processes. Its conservative `workspace/files` lease remains held for the lifetime of a persistent process. Persistent ambient processes block conflicting workspace tools until they exit or stop.

@@ -3,25 +3,28 @@ import type { ToolDefinition } from './definition.js';
 import { validateToolEffectEnvelope } from './authorization.js';
 import { isToolAvailable, type ToolPolicy } from './policy.js';
 import { validateToolRequirements } from './resources.js';
+import { isCompiledTool, markCompiledTool, type CompiledToolDefinition } from './compiled.js';
 
 export class ToolRegistry {
-  private readonly tools = new Map<string, ToolDefinition>();
-  constructor(tools: readonly ToolDefinition[] = []) { for (const tool of tools) this.register(tool); }
-  register<TDecodedInput, TCanonicalInput, TOutput>(tool: ToolDefinition<TDecodedInput, TCanonicalInput, TOutput>): void {
+  private readonly tools = new Map<string, CompiledToolDefinition>();
+  constructor(tools: readonly CompiledToolDefinition[] = []) { for (const tool of tools) this.register(tool); }
+  register(tool: CompiledToolDefinition): void {
+    if (!isCompiledTool(tool)) throw new Error('Tool definitions must be created by defineTool() or adoptToolDefinition().');
     if (this.tools.has(tool.name)) throw new Error('Tool already registered: ' + tool.name);
     this.tools.set(tool.name, tool);
   }
-  get(name: string): ToolDefinition | undefined { return this.tools.get(name); }
-  require(name: string): ToolDefinition {
+  get(name: string): CompiledToolDefinition | undefined { return this.tools.get(name); }
+  require(name: string): CompiledToolDefinition {
     const tool = this.get(name);
     if (!tool) throw new Error('Unknown tool: ' + name);
     return tool;
   }
-  list(): ToolDefinition[] { return [...this.tools.values()].sort((a, b) => a.name.localeCompare(b.name, 'en')); }
-  available(policy: ToolPolicy): ToolDefinition[] { return this.list().filter((tool) => isToolAvailable(tool, policy)); }
+  list(): CompiledToolDefinition[] { return [...this.tools.values()].sort((a, b) => a.name.localeCompare(b.name, 'en')); }
+  available(policy: ToolPolicy): CompiledToolDefinition[] { return this.list().filter((tool) => isToolAvailable(tool, policy)); }
 }
 
-export function adoptToolDefinition(tool: unknown): ToolDefinition {
+export function adoptToolDefinition(tool: unknown): CompiledToolDefinition {
+  if (isCompiledTool(tool)) return tool;
   if (!record(tool)) throw new Error('Tool definition must be an object.');
   const unexpected = Object.keys(tool).filter((key) => !KEYS.has(key));
   if (unexpected.length > 0) throw new Error('Tool definition has unsupported fields: ' + unexpected.sort().join(', ') + '.');
@@ -37,7 +40,7 @@ export function adoptToolDefinition(tool: unknown): ToolDefinition {
   const textInput = tool.textInput === undefined ? undefined : snapshotTextInput(tool.textInput);
   const jsonSchema = parseJsonObject(tool.jsonSchema, { maxDepth: 64, maxCollectionEntries: 50_000, maxStringBytes: 1_000_000, maxTotalBytes: 4_000_000 });
   const requirements = validateToolRequirements(tool.requirements);
-  return Object.freeze({
+  return markCompiledTool(Object.freeze({
     name, implementationId, description,
     ...(tool.promptGuide !== undefined ? { promptGuide: tool.promptGuide as NonNullable<ToolDefinition['promptGuide']> } : {}),
     jsonSchema,
@@ -52,7 +55,7 @@ export function adoptToolDefinition(tool: unknown): ToolDefinition {
     deriveEffects: tool.deriveEffects as ToolDefinition['deriveEffects'],
     invoke: tool.invoke as ToolDefinition['invoke'],
     ...(tool.presentObservation ? { presentObservation: tool.presentObservation as NonNullable<ToolDefinition['presentObservation']> } : {})
-  });
+  }));
 }
 
 const KEYS = new Set(['name', 'implementationId', 'description', 'promptGuide', 'jsonSchema', 'outputSchema', 'textInput', 'effectEnvelope', 'requirements', 'isAvailable', 'decodeInput', 'canonicalizeInput', 'snapshotInput', 'deriveEffects', 'invoke', 'presentObservation']);
