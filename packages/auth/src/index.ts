@@ -1,4 +1,3 @@
-import { createHash, randomBytes } from 'node:crypto';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -45,12 +44,6 @@ export interface OAuthRefreshRequest {
 export interface OAuthTokenRefresher {
   describe(): AuthSourceInfo;
   refresh(request: OAuthRefreshRequest): Promise<CredentialRecord>;
-}
-
-export interface PkcePair {
-  verifier: string;
-  challenge: string;
-  method: 'S256';
 }
 
 export type DeviceCodePollResult<T> =
@@ -405,12 +398,6 @@ export function defaultCredentialStoreDir(): string {
   return path.join(process.env.AGENT_CORE_HOME ?? path.join(os.homedir(), '.agent-core'), 'auth');
 }
 
-export function generatePkcePair(): PkcePair {
-  const verifier = base64UrlEncode(randomBytes(32));
-  const challenge = base64UrlEncode(createHash('sha256').update(verifier).digest());
-  return { verifier, challenge, method: 'S256' };
-}
-
 export async function pollDeviceCode<T>(options: DeviceCodePollOptions<T>): Promise<T> {
   if (!Number.isFinite(options.intervalSeconds) || options.intervalSeconds < 0) {
     throw new AuthError({
@@ -566,14 +553,6 @@ function isNodeError(error: unknown): error is NodeJS.ErrnoException {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function base64UrlEncode(value: Buffer): string {
-  return value
-    .toString('base64')
-    .replaceAll('+', '-')
-    .replaceAll('/', '_')
-    .replace(/=+$/, '');
 }
 
 function delay(ms: number, signal: AbortSignal | undefined): Promise<void> {

@@ -101,7 +101,6 @@ export type SessionContextProjection = Readonly<{
 }>;
 
 export type SessionBranchEntry = SessionInputEntry | SessionToolCallEntry | SessionObservationEntry | SessionBranchMarkerEntry | SessionModelSettingsEntry;
-export type SessionRecord = SessionHeader | SessionBranchEntry | SessionFinalProjection | SessionContextProjection;
 
 export interface CreateSessionOptions {
   readonly id?: string;

@@ -37,4 +37,3 @@ export const listDirectoryOutputSchema = z.strictObject({
 });
 
 export type ListDirectoryInput = z.output<typeof listDirectoryInputSchema>;
-export type ListDirectoryOutput = z.output<typeof listDirectoryOutputSchema>;

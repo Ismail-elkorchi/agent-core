@@ -1,5 +1,5 @@
 import type { ContextBundle, ContextHistoryReduction, PromptProjection } from './context/manager.js';
-import { decodeOwnedArtifactRef, decodeOwnedEvidenceRecord, type ArtifactRef, type RuntimeCodec } from '@agent-core/evidence';
+import { decodeOwnedArtifactRef, decodeOwnedEvidenceRecord, encodeEvidenceRecord, type ArtifactRef, type EvidenceRecord, type RuntimeCodec } from '@agent-core/evidence';
 import { parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
 import type {
   ModelCapabilities,
@@ -155,7 +155,7 @@ export type AgentEvent =
   | ({ readonly type: 'overflow.recovery.ended'; readonly attempt: number; readonly result: OverflowRecoveryResult } & AgentTurnIdentity)
   | ({ readonly type: 'context.history.reduced'; readonly reductions: readonly ContextHistoryReduction[] } & AgentTurnIdentity)
   | ({ readonly type: 'context.checkpoint.created'; readonly compactedToolResults: number; readonly removedItems?: number; readonly beforeBytes?: number; readonly afterBytes?: number } & AgentTurnIdentity)
-  | ({ readonly type: 'observation.record.created'; readonly id: string; readonly toolName: string; readonly call: ToolCall; readonly toolCallType: 'function' | 'custom'; readonly evidence: JsonValue; readonly immediatePresentation: ToolObservationPresentation; readonly retainedPresentation: ToolObservationPresentation; readonly durableStorageDegraded?: { readonly message: string } } & AgentToolCallAttemptIdentity)
+  | ({ readonly type: 'observation.record.created'; readonly id: string; readonly toolName: string; readonly call: ToolCall; readonly toolCallType: 'function' | 'custom'; readonly evidence: readonly EvidenceRecord[]; readonly immediatePresentation: ToolObservationPresentation; readonly retainedPresentation: ToolObservationPresentation; readonly durableStorageDegraded?: { readonly message: string } } & AgentToolCallAttemptIdentity)
   | ({ readonly type: 'observation.projection.failed'; readonly id: string; readonly toolName: string; readonly message: string } & AgentToolCallAttemptIdentity)
   | ({ readonly type: 'tool.authorization.decided'; readonly toolName: string; readonly fingerprint: string; readonly binding: AgentApprovalBinding; readonly decision: 'allow' | 'deny' | 'require_approval'; readonly reason?: string } & AgentToolCallIdentity)
   | ({ readonly type: 'approval.requested'; readonly runId: string; readonly approvalId: string; readonly toolName: string; readonly fingerprint: string; readonly input: JsonValue; readonly effects: ToolEffects; readonly binding: AgentApprovalBinding; readonly policyHash: string; readonly reason: string } & AgentToolCallIdentity)
@@ -198,7 +198,11 @@ const AGENT_EVENT_MAX_TOTAL_BYTES = 4 * 1024 * 1024;
 const AGENT_EVENT_MAX_COLLECTION_ENTRIES = 20_000;
 
 
-export function encodeAgentEvent(value: AgentEvent): JsonObject { return ownEventJson(value); }
+export function encodeAgentEvent(value: AgentEvent): JsonObject {
+  return ownEventJson(value.type === 'observation.record.created'
+    ? { ...value, evidence: Object.freeze(value.evidence.map(encodeEvidenceRecord)) }
+    : value);
+}
 
 export function decodeAgentEvent(value: unknown): AgentEvent {
   const owned = ownEventJson(value);
@@ -371,9 +375,10 @@ const AGENT_EVENT_DECODERS = {
   'observation.record.created': (value) => {
     exact(value, ['type', ...TOOL_ATTEMPT_KEYS, 'id', 'toolName', 'call', 'toolCallType', 'evidence', 'immediatePresentation', 'retainedPresentation', 'durableStorageDegraded']);
     const degraded = value.durableStorageDegraded === undefined ? undefined : decodeMessageRecord(value.durableStorageDegraded, 'durableStorageDegraded');
+    const evidence = Object.freeze(requiredArray(value.evidence, 'evidence').map((item, index) => decodeOwnedEvidenceRecord(requiredObject(item, `evidence[${String(index)}]`))));
     return Object.freeze({
       type: 'observation.record.created', ...decodeToolAttemptIdentity(value), id: requiredString(value.id, 'id'), toolName: requiredString(value.toolName, 'toolName'),
-      call: decodeOwnedToolCall(requiredObject(value.call, 'call')), toolCallType: requiredEnum(value.toolCallType, TOOL_CALL_TYPES, 'toolCallType'), evidence: requiredJson(value.evidence, 'evidence'),
+      call: decodeOwnedToolCall(requiredObject(value.call, 'call')), toolCallType: requiredEnum(value.toolCallType, TOOL_CALL_TYPES, 'toolCallType'), evidence,
       immediatePresentation: decodePresentation(value.immediatePresentation, 'immediatePresentation'), retainedPresentation: decodePresentation(value.retainedPresentation, 'retainedPresentation'),
       ...(degraded ? { durableStorageDegraded: degraded } : {})
     });

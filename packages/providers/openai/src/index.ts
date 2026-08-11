@@ -58,14 +58,6 @@ interface OpenAIBuiltInProfile {
   metadata?: Record<string, unknown>;
 }
 
-export interface OpenAIRequestOptions {
-  serviceTier?: 'auto' | 'default' | 'flex' | 'priority';
-  safetyIdentifier?: string;
-  promptCacheKey?: string;
-  promptCacheOptions?: { mode?: 'implicit' | 'explicit'; ttl?: '30m' };
-  reasoningContext?: 'auto' | 'current_turn' | 'all_turns';
-}
-
 interface OpenAIResponsesPayload {
   id?: string;
   model?: string;

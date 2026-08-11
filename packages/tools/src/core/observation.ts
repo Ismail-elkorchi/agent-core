@@ -223,7 +223,7 @@ function exactFailure(value: JsonObject, fields: readonly string[]): void { if (
 export function encodeToolObservation(observation: ToolObservation): JsonObject {
   if (!isOwnedToolObservation(observation)) throw new Error('Tool observations must be decoded or constructed before encoding.');
   return Object.freeze({
-    kind: observation.kind, ok: observation.ok, summary: observation.summary, scope: encodeToolScope(observation.scope), output: observation.kind === 'result' ? observation.output : encodeFailureOutput(observation.output),
+    kind: observation.kind, ok: observation.ok, summary: observation.summary, scope: encodeToolScope(observation.scope), output: observation.kind === 'result' ? observation.output : encodeToolFailureOutput(observation.output),
     ...(observation.content ? { content: Object.freeze(observation.content.map(encodeToolContent)) } : {}),
     ...(observation.metadata ? { metadata: observation.metadata } : {}), ...(observation.evidence ? { evidence: encodeToolEvidenceDelta(observation.evidence) } : {})
   });
@@ -245,7 +245,7 @@ export function updateToolObservation(observation: ToolObservation, changes: { r
 
 function encodeToolScope(scope: ToolScope): JsonObject { return Object.freeze({ resources: Object.freeze([...scope.resources]), coverage: scope.coverage, ...(scope.filters ? { filters: scope.filters } : {}), ...(scope.limits ? { limits: scope.limits } : {}), ...(scope.omitted ? { omitted: scope.omitted } : {}), ...(scope.truncated === undefined ? {} : { truncated: scope.truncated }), ...(scope.causes ? { causes: Object.freeze([...scope.causes]) } : {}) }); }
 function encodeToolContent(content: ToolContent): JsonObject { return content.type === 'text' ? Object.freeze({ type: content.type, text: content.text, ...(content.mediaType ? { mediaType: content.mediaType } : {}) }) : Object.freeze({ type: content.type, artifact: Object.freeze({ ...content.artifact }), ...(content.type === 'image' ? { detail: content.detail } : {}) }); }
-function encodeFailureOutput(output: ToolFailureOutput): JsonObject {
+export function encodeToolFailureOutput(output: ToolFailureOutput): JsonObject {
   const common = { blocked: true, reason: output.reason, recovery: output.recovery } as const;
   if (output.reason === 'unknown_tool') return Object.freeze({ ...common, toolCall: Object.freeze({ ...(output.toolCall.id ? { id: output.toolCall.id } : {}), name: output.toolCall.name, input: output.toolCall.input.kind === 'json' ? Object.freeze({ kind: 'json', value: output.toolCall.input.value }) : Object.freeze({ kind: 'text', value: output.toolCall.input.value }) }) });
   if (output.reason === 'policy') return Object.freeze({ ...common, ...(output.tool ? { tool: output.tool } : {}), ...(output.policyReason ? { policyReason: output.policyReason } : {}), ...(output.details ? { details: output.details } : {}) });

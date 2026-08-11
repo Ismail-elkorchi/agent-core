@@ -219,11 +219,3 @@ export function malformedStreamEvent(provider: string, message: string, cause: u
     cause
   });
 }
-
-export function codexProviderError(message: string): ModelProviderError {
-  return new ModelProviderError({
-    provider: OPENAI_CODEX_PROVIDER_ID,
-    code: 'provider_unavailable',
-    message
-  });
-}

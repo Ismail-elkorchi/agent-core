@@ -1,7 +1,5 @@
 import type { JsonObject, JsonValue } from '@agent-core/json';
 
-export type ModelRole = 'system' | 'user' | 'assistant' | 'tool';
-
 export type ModelImage =
   | { readonly type: 'base64'; readonly data: string; readonly mediaType: ModelImageMediaType; readonly detail?: ModelImageDetail }
   | { readonly type: 'bytes'; readonly data: Uint8Array; readonly mediaType: ModelImageMediaType; readonly detail?: ModelImageDetail };
@@ -205,8 +203,6 @@ export interface ModelRequest {
 }
 
 export type ModelResponseFormat = 'text' | 'json' | { readonly type: 'json_schema'; readonly schema: JsonObject };
-
-export type ModelToolInputFormat = 'json' | 'text' | 'grammar';
 
 export type ModelToolInputSupport =
   | { readonly kind: 'json' }

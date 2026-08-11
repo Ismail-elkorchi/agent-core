@@ -384,8 +384,6 @@ export class AgentRuntime {
   private async runInternal(input: ResolvedAgentRunInput, signal: AbortSignal, resume?: ResumeExecutionState): Promise<AgentRunResult> {
     const { runId, finalizationId } = input;
     const controller = new AgentRunController({
-      runId,
-      finalizationId,
       ...(this.options.clock ? { clock: this.options.clock } : {}),
       ...(this.options.limits ? { limits: this.options.limits } : {}),
       ...(this.options.retryPolicy ? { retryPolicy: this.options.retryPolicy } : {}),
@@ -411,7 +409,7 @@ export class AgentRuntime {
     if (decision.executionStatus === 'waiting_for_approval') {
       const cleanupError = await this.disposeOwnedProcesses(runId, append);
       if (!cleanupError) {
-        controller.waitForApproval(decision.approvals.map((approval) => approval.approvalId));
+        controller.waitForApproval();
         const budget = controller.snapshot();
         await append({ type: 'run.phase.changed', runId, phase: 'waiting_for_approval', budget });
         await emit({ type: 'run.phase.changed', phase: 'waiting_for_approval', budget });
@@ -426,7 +424,7 @@ export class AgentRuntime {
     decision = decisionBeforeFinalization(decision, signal);
     const terminal = terminalSnapshot(runId, finalizationId, decision, controller, this.checks);
     const result = await finalizer.finalize(terminal, 'diagnostic' in decision ? decision.diagnostic : undefined);
-    controller.commitTerminal(result.terminal);
+    controller.commitTerminal();
     return result;
   }
 
@@ -542,7 +540,7 @@ export class AgentRuntime {
         }) };
         await runtime.append(configuredEvent);
         await runtime.emit(configuredEvent);
-        await this.enterPhase(runtime.runId, runtime.controller, 'requesting_model', runtime.append, runtime.emit, snapshot.record);
+        await this.enterPhase(runtime.runId, runtime.controller, 'requesting_model', runtime.append, runtime.emit);
         lastStartedTurnIndex = turnIndex;
         const currentModelSession = modelSession;
         if (!currentModelSession) throw new Error('Model session was not initialized for the turn snapshot.');
@@ -573,7 +571,7 @@ export class AgentRuntime {
 
         runtime.controller.recordToolCalls(toolCalls);
         contextManager.recordModelOutput({ turnIndex, content: response.content, toolCalls: toolCalls.map(modelToolCallFromToolCall) });
-        await this.enterPhase(runtime.runId, runtime.controller, 'executing_tools', runtime.append, runtime.emit, { ...snapshot.record, toolBatchId });
+        await this.enterPhase(runtime.runId, runtime.controller, 'executing_tools', runtime.append, runtime.emit);
         const toolDeadline = runSignalDeadline(runtime.controller, runtime.signal);
         let toolResult;
         try {
@@ -600,9 +598,9 @@ export class AgentRuntime {
   private async resumeToolBatch(runtime: RunExecutionRuntime & { readonly resume: ResumeExecutionState }, contextManager: ContextManager, observationStore: ObservationStore, checkResults: readonly AgentCheckResult[]): Promise<TerminalDecision | undefined> {
     const profile = parseModelProfile(await this.options.provider.describeModel(this.runtimeModel));
     const batchIdentity = { ...runtime.resume.identity, toolBatchId: runtime.resume.toolBatchId };
-    runtime.controller.transition('requesting_model', runtime.resume.identity);
-    runtime.controller.transition('executing_tools', batchIdentity);
-    runtime.controller.waitForApproval(runtime.resume.approvalIds);
+    runtime.controller.transition('requesting_model');
+    runtime.controller.transition('executing_tools');
+    runtime.controller.waitForApproval();
     runtime.controller.resumeApprovedTools();
     const resumedBudget = runtime.controller.snapshot();
     await runtime.append({ type: 'run.phase.changed', runId: runtime.runId, phase: 'executing_tools', budget: resumedBudget });
@@ -907,8 +905,8 @@ export class AgentRuntime {
     return response;
   }
 
-  private async enterPhase(runId: string, controller: AgentRunController, phase: Parameters<AgentRunController['transition']>[0], append: (event: AgentEvent) => Promise<unknown>, emit: (event: AgentProgressEvent) => Promise<void>, identity?: AgentTurnSnapshotRecord & { readonly toolBatchId?: string }): Promise<void> {
-    controller.transition(phase, identity); const budget = controller.snapshot(); await append({ type: 'run.phase.changed', runId, phase, budget }); await emit({ type: 'run.phase.changed', phase, budget });
+  private async enterPhase(runId: string, controller: AgentRunController, phase: Parameters<AgentRunController['transition']>[0], append: (event: AgentEvent) => Promise<unknown>, emit: (event: AgentProgressEvent) => Promise<void>): Promise<void> {
+    controller.transition(phase); const budget = controller.snapshot(); await append({ type: 'run.phase.changed', runId, phase, budget }); await emit({ type: 'run.phase.changed', phase, budget });
   }
   private async emitProgress(runId: string, finalizationId: string, event: AgentProgressEvent, diagnostics: { eventType: string; message: string; persisted: boolean }[]): Promise<void> {
     if (!this.options.onProgress) return;

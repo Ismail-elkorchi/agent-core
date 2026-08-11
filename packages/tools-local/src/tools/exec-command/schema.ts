@@ -11,6 +11,4 @@ export function execCommandSchema(ptySupported: boolean) {
     outputTokenBudget: z.int().min(64).default(4_000)
   });
 }
-export const execCommandInputSchema = execCommandSchema(false);
 export const execCommandOutputSchema = processOutputSchema;
-export type ExecCommandInput = z.output<ReturnType<typeof execCommandSchema>>;

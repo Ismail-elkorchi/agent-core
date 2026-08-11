@@ -14,7 +14,6 @@ export const applyPatchInputSchema = z.strictObject({
   })
 });
 
-export type ApplyPatchArguments = z.input<typeof applyPatchInputSchema>;
 export type ApplyPatchInput = z.output<typeof applyPatchInputSchema>;
 
 export type ApplyPatchFailureReason =

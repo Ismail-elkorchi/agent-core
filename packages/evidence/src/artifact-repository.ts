@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import { normalizeJsonSafe } from '@agent-core/json';
 import type { JsonObject } from '@agent-core/json';
 
 type ArtifactRefBase = Readonly<{
@@ -90,16 +89,6 @@ export class InMemoryArtifactRepository implements ArtifactRepository {
     const value = artifactId.startsWith('protected-') ? undefined : this.references.get(artifactId);
     return Promise.resolve(value?.visibility === 'public' ? value : undefined);
   }
-}
-
-export async function storeJsonArtifact(repository: ArtifactRepository, label: string, value: unknown, description?: string): Promise<PublicArtifactRef> {
-  const normalized = normalizeJsonSafe(value);
-  return repository.store({
-    label,
-    content: new TextEncoder().encode(`${JSON.stringify(normalized.value, null, 2)}\n`),
-    mediaType: 'application/json; charset=utf-8',
-    ...(description ? { description } : {})
-  });
 }
 
 export function validateArtifactRef(value: unknown): asserts value is ArtifactRef {

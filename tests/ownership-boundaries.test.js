@@ -122,6 +122,17 @@ test('owned extension observations are not decoded again', () => {
   assert.equal(outputChecks, 1);
 });
 
+test('event decoding validates nested persisted evidence', () => {
+  assert.throws(() => agentEventCodec.decode({
+    type: 'observation.record.created', turnIndex: 1, turnId: 'turn-1', requestAttempt: 1,
+    toolBatchId: 'batch-1', callIndex: 0, toolAttempt: 1, id: 'observation-1', toolName: 'read',
+    call: { name: 'read', input: { kind: 'json', value: {} } }, toolCallType: 'function',
+    evidence: [{ id: 'evidence-1', observationId: 'observation-1', toolName: 'read', createdAt: '2026-01-01T00:00:00.000Z', action: 'read', resources: [{ uri: 42 }], outcome: 'success' }],
+    immediatePresentation: { ok: true, title: 'Read', summary: 'Read a resource.' },
+    retainedPresentation: { ok: true, title: 'Read', summary: 'Read a resource.' }
+  }), /uri/iu);
+});
+
 test('canonical hashing uses the JSON persistence domain without invoking accessors', () => {
   assert.equal(canonicalJsonString({ z: 1, a: [true, null] }), '{"a":[true,null],"z":1}');
   assert.equal(hashJson({ z: 1, a: [true, null] }), hashJson({ a: [true, null], z: 1 }));

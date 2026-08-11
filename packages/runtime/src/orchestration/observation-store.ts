@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import {
   projectToolEvidence,
   redactJson,
@@ -12,6 +12,7 @@ import { SimpleTokenEstimator, type ModelImage, type TokenEstimator } from '@age
 import {
   parseToolObservation,
   decodeOwnedToolObservationForPersistence,
+  encodeToolFailureOutput,
   encodeToolObservation,
   updateToolObservation,
   type ToolCall,
@@ -295,9 +296,9 @@ function buildToolObservationPresentation(toolCall: ToolCall, canonicalSnapshot:
 function fallbackToolObservationPresentation(toolCall: ToolCall, observation: ToolObservation): ToolObservationPresentation {
   const base = { ok: observation.ok, title: `${toolCall.name} observation`, summary: observation.summary, scope: toJsonObject(observation.scope), coverage: observation.scope.coverage };
   if (observation.kind === 'result') {
-    return { ...base, results: { output: toJsonValue(observation.output), ...(observation.content ? { content: toJsonValue(observation.content) } : {}), ...(observation.metadata ? { metadata: toJsonValue(observation.metadata) } : {}) }, ...(observation.scope.coverage === 'partial' ? { next: 'Continue with the indicated range or artifact when more coverage is required.' } : {}) };
+    return { ...base, results: { output: observation.output, ...(observation.content ? { content: toJsonValue(observation.content) } : {}), ...(observation.metadata ? { metadata: observation.metadata } : {}) }, ...(observation.scope.coverage === 'partial' ? { next: 'Continue with the indicated range or artifact when more coverage is required.' } : {}) };
   }
-  return { ...base, failures: toJsonValue(observation.output), next: observation.output.recovery };
+  return { ...base, failures: encodeToolFailureOutput(observation.output), next: observation.output.recovery };
 }
 
 function invalidPresenterPresentation(toolName: string, issues: readonly { readonly path: string; readonly message: string }[]): ToolObservationPresentation {
@@ -314,4 +315,3 @@ function redactToolObservationPresentation(presentation: ToolObservationPresenta
 
 function toJsonObject(value: unknown): JsonObject { const json = parseJsonValue(value); return isJsonObject(json) ? json : { value: json }; }
 function isJsonObject(value: JsonValue | undefined): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }
-export function sha256ToolObservationPresentation(presentation: ToolObservationPresentation): string { return createHash('sha256').update(serializeToolObservationPresentation(presentation)).digest('hex'); }

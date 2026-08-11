@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { ContextManager } from '../context/manager.js';
 import { hashJson } from '@agent-core/evidence';
-import { normalizeJsonSafe, type JsonObject } from '@agent-core/json';
 import type { SessionRepository } from '../session/repository.js';
 import type { AgentApprovalBinding, AgentApprovalRequest, AgentToolBatchIdentity, AgentToolCallAttemptIdentity, AgentToolCallIdentity } from '../run/contracts.js';
 import {
@@ -23,7 +22,6 @@ import type { ResourceLeaseCoordinator } from '@agent-core/tools';
 import type { AgentEvent, AgentProgressEvent } from '../events.js';
 import { ObservationStore, serializeToolObservationPresentation } from './observation-store.js';
 import type { AgentRunController } from './run-controller.js';
-import { createToolCallMachine, reduceToolCall, type ToolCallMachineCommand, type ToolCallMachineEvent, type ToolCallMachineState } from './tool-call-machine.js';
 import { scheduleToolCalls } from './tool-scheduler.js';
 
 export type ToolBatchExecutionResult =
@@ -57,7 +55,6 @@ interface PreparedEntry {
   readonly identity: AgentToolCallAttemptIdentity;
   readonly call: ToolCall;
   readonly prepared?: PreparedToolCall;
-  machine: ToolCallMachineState;
   readonly observation?: ToolObservation;
   readonly observationProjected?: boolean;
   readonly invoke?: true;
@@ -91,7 +88,6 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
   for (const [callIndex, call] of input.toolCalls.entries()) {
     const callIdentityValue = callIdentity(input, call, callIndex);
     if (!input.resuming) await input.session?.repository.appendToolCall(input.session.sessionId, { runId: input.runId, identity: callIdentityValue, call });
-    let machine: ToolCallMachineState = createToolCallMachine(callIdentityValue, call.name);
     const recovery = input.recovery?.find((item) => item.callIndex === callIndex);
     const toolAttempt = recovery?.completed?.toolAttempt ?? (recovery?.lastAttempt ?? 0) + 1;
     const identity: AgentToolCallAttemptIdentity = { ...callIdentityValue, toolAttempt };
@@ -108,28 +104,23 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
       }
     });
     if (!preparation.ok) {
-      machine = transitionWithoutCommands(machine, { type: 'rejected', outcome: preparationOutcome(preparation.observation), observation: preparation.observation });
-      entries.push({ identity, call, machine, observation: preparation.observation });
+      entries.push({ identity, call, observation: preparation.observation });
       continue;
     }
     const prepared = preparation.prepared;
     const preparedCall = prepared.call;
-    machine = transitionWithoutCommands(machine, { type: 'input.parsed', input: prepared.canonicalSnapshot });
-    machine = transitionWithoutCommands(machine, { type: 'input.canonicalized', input: prepared.canonicalSnapshot });
-    machine = transitionWithoutCommands(machine, { type: 'effects.derived', effects: prepared.effects, fingerprint: prepared.fingerprint });
     if (recovery?.completed) {
-      entries.push({ identity, call: preparedCall, prepared, machine, observation: recovery.completed.observation, observationProjected: recovery.completed.observationProjected });
+      entries.push({ identity, call: preparedCall, prepared, observation: recovery.completed.observation, observationProjected: recovery.completed.observationProjected });
       continue;
     }
     if (recovery?.incompleteStart) {
       if (recovery.incompleteStart.fingerprint !== prepared.fingerprint) throw new Error(`Tool call fingerprint changed after an incomplete execution at call ${String(callIndex)}.`);
       if (recovery.incompleteStart.effects.idempotency === 'non_idempotent') {
         uncertain = { callIndex, toolName: call.name, toolAttempt: recovery.incompleteStart.toolAttempt };
-        entries.push({ identity, call: preparedCall, prepared, machine });
+        entries.push({ identity, call: preparedCall, prepared });
         continue;
       }
     }
-    machine = transitionWithCommand(machine, { type: 'authorization.started' }, 'authorization.invoke');
     const override = input.authorizationOverrides?.find((item) => item.callIndex === callIndex);
     if (input.resuming && override?.fingerprint !== prepared.fingerprint) throw new Error(`Tool call fingerprint changed before approval resume at call ${String(callIndex)}.`);
     const authorizationRequest = { call: preparedCall, toolImplementationId: prepared.toolImplementationId, input: prepared.canonicalSnapshot, effects: prepared.effects, fingerprint: prepared.fingerprint, context: authorizationContext };
@@ -142,27 +133,22 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
           ? { decision: 'allow', ...(override.reason ? { reason: override.reason } : {}) }
           : { decision: 'deny', reason: override.reason ?? 'Approval denied.' }
       : currentAuthorization;
-    const approvalId = authorization.decision === 'require_approval' ? randomUUID() : undefined;
     const binding = approvalBinding(prepared, authorizationContext);
-    const authorizationTransition = reduceToolCall(machine, { type: 'authorization.decided', decision: authorization, ...(approvalId ? { approvalId } : {}) });
-    machine = authorizationTransition.state;
     if (!input.resuming) await input.append({ type: 'tool.authorization.decided', ...callIdentityValue, toolName: call.name, fingerprint: prepared.fingerprint, binding, decision: authorization.decision, ...(authorization.reason ? { reason: authorization.reason } : {}) });
-    if (authorization.decision === 'require_approval' && approvalId) {
-      requireSingleCommand(authorizationTransition.commands, 'approval.persist');
+    if (authorization.decision === 'require_approval') {
+      const approvalId = randomUUID();
       const approval = approvalRequest(input.runId, identity, approvalId, authorization.reason, prepared, authorizationContext);
       approvals.push(approval);
       await input.append({ type: 'approval.requested', runId: input.runId, ...callIdentityValue, approvalId, toolName: call.name, fingerprint: approval.fingerprint, input: approval.input, effects: prepared.effects, binding, policyHash: approval.policyHash, reason: approval.reason });
-      entries.push({ identity, call: preparedCall, prepared, machine });
+      entries.push({ identity, call: preparedCall, prepared });
       continue;
     }
     if (authorization.decision === 'deny') {
-      requireNoCommands(authorizationTransition.commands);
       const observation = policyBlockedObservation(`Tool authorization denied: ${call.name}`, { tool: call.name, policyReason: 'deny', ...(authorization.reason ? { recovery: authorization.reason } : {}) });
-      entries.push({ identity, call: preparedCall, prepared, machine, observation });
+      entries.push({ identity, call: preparedCall, prepared, observation });
       continue;
     }
-    requireSingleCommand(authorizationTransition.commands, 'tool.invoke');
-    entries.push({ identity, call: preparedCall, prepared, machine, invoke: true });
+    entries.push({ identity, call: preparedCall, prepared, invoke: true });
   }
 
   if (approvals.length > 0) return { outcome: 'waiting_for_approval', approvals: Object.freeze(approvals) };
@@ -219,10 +205,7 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
   for (const entry of [...entries].sort((left, right) => left.identity.callIndex - right.identity.callIndex)) {
     const observation = entry.observation ?? observed.get(entry.identity.callIndex);
     if (!observation) throw new Error(`Tool call ${String(entry.identity.callIndex)} has no terminal observation.`);
-    const observationMustPersist = entry.invoke === true;
-    if (observationMustPersist) entry.machine = transitionWithCommand(entry.machine, { type: 'execution.observed', observation }, 'observation.persist');
     await persistObservation(input, entry, observation);
-    if (observationMustPersist) entry.machine = transitionWithoutCommands(entry.machine, { type: 'observation.persisted' });
     input.controller.recordToolResult(observation.ok);
     if (!observation.ok) {
       failedTool = true;
@@ -270,7 +253,7 @@ async function persistObservation(input: Parameters<typeof executeAssistantToolC
     });
     await input.append({
       type: 'observation.record.created', id: record.id, ...entry.identity, toolName: entry.call.name, call: record.call,
-      toolCallType: record.call.input.kind === 'text' ? 'custom' : 'function', evidence: normalizeJsonSafe(record.evidence).value,
+      toolCallType: record.call.input.kind === 'text' ? 'custom' : 'function', evidence: record.evidence,
       immediatePresentation: record.immediatePresentation, retainedPresentation: record.retainedPresentation,
       ...(record.durableStorageDegraded ? { durableStorageDegraded: record.durableStorageDegraded } : {})
     }, toolEventKey(input.runId, entry.identity, 'observation'));
@@ -333,27 +316,6 @@ function callIdentity(input: AgentToolBatchIdentity, call: ToolCall, callIndex: 
 function toolEventKey(runId: string, identity: AgentToolCallAttemptIdentity, stage: string): string {
   return `${runId}:tool:${identity.turnId}:${identity.toolBatchId}:${String(identity.callIndex)}:attempt:${String(identity.toolAttempt)}:${stage}`;
 }
-function transitionWithoutCommands(state: ToolCallMachineState, event: ToolCallMachineEvent): ToolCallMachineState {
-  const transition = reduceToolCall(state, event);
-  requireNoCommands(transition.commands);
-  return transition.state;
-}
-function transitionWithCommand(state: ToolCallMachineState, event: ToolCallMachineEvent, command: ToolCallMachineCommand['type']): ToolCallMachineState {
-  const transition = reduceToolCall(state, event);
-  requireSingleCommand(transition.commands, command);
-  return transition.state;
-}
-function requireNoCommands(commands: readonly ToolCallMachineCommand[]): void {
-  if (commands.length !== 0) throw new Error(`Tool transition produced unhandled commands: ${commands.map((command) => command.type).join(', ')}.`);
-}
-function requireSingleCommand(commands: readonly ToolCallMachineCommand[], type: ToolCallMachineCommand['type']): void {
-  if (commands.length !== 1 || commands[0]?.type !== type) throw new Error(`Tool transition must produce exactly ${type}; received ${commands.map((command) => command.type).join(', ') || 'none'}.`);
-}
-function preparationOutcome(observation: ToolObservation): 'invalid_input' | 'unknown_tool' | 'failed' {
-  if (!observation.ok && isJsonObject(observation.output) && observation.output.reason === 'unknown_tool') return 'unknown_tool';
-  if (!observation.ok && isJsonObject(observation.output) && observation.output.reason === 'invalid_arguments') return 'invalid_input';
-  return 'failed';
-}
 function approvalRequest(runId: string, identity: AgentToolCallIdentity, approvalId: string, reason: string, prepared: PreparedToolCall, context: ToolPreparationContext): AgentApprovalRequest {
   const input = prepared.canonicalSnapshot;
   const effects = prepared.effects;
@@ -366,4 +328,3 @@ function approvalRequest(runId: string, identity: AgentToolCallIdentity, approva
 function approvalBinding(prepared: PreparedToolCall, context: ToolPreparationContext): AgentApprovalBinding {
   return Object.freeze({ toolImplementationId: prepared.toolImplementationId, authorizationPolicyId: context.boundary.authorizationPolicyId, executionTargetId: context.boundary.executionTargetId });
 }
-function isJsonObject(value: unknown): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }

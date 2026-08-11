@@ -4,7 +4,6 @@ import { parseJsonObject, type JsonNormalizationDiagnostic, type JsonObject, typ
 import type { ModelReasoningRequest, ModelResponseFormat, ModelTerminationReason } from '@agent-core/model';
 import type { ToolEffects } from '@agent-core/tools';
 
-export type AgentExecutionStatus = 'completed' | 'failed' | 'aborted';
 export type AgentCandidateStatus = 'complete' | 'partial' | 'indeterminate' | 'absent';
 export type AgentCandidateSource = 'content' | 'reasoning_summary' | 'stream_recovery';
 export type AgentVerificationStatus = 'not_required' | 'not_run' | 'passed' | 'failed' | 'inconclusive';
@@ -255,8 +254,6 @@ export type AgentFailureTerminationReason =
   | Exclude<AgentCompletedTerminationReason, 'model_completed'>
   | 'empty_response' | 'malformed_response' | 'provider_error' | 'runtime_error'
   | 'stream_interrupted' | 'request_too_large' | 'limit_exhausted' | 'uncertain_tool_effect';
-export type AgentTerminationReason = AgentCompletedTerminationReason | AgentFailureTerminationReason | 'aborted';
-
 type AgentTerminalBase = AgentRunIdentity & Readonly<{
   readonly phase: 'ended';
   readonly turnCount: number;
@@ -348,10 +345,6 @@ export function deriveAgentVerificationStatus(
   if (required.some((definition) => byId.get(definition.id)?.verdict === 'failed')) return 'failed';
   if (required.some((definition) => byId.get(definition.id)?.verdict !== 'passed')) return 'inconclusive';
   return 'passed';
-}
-
-export function parseAgentCandidate(value: unknown): AgentCandidate {
-  return decodeOwnedAgentCandidate(parseJsonObject(value));
 }
 
 export function decodeOwnedAgentCandidate(value: JsonObject): AgentCandidate {
@@ -581,5 +574,3 @@ function isJsonObject(value: JsonValue): value is JsonObject { return typeof val
 function isJsonArray(value: JsonValue | undefined): value is readonly JsonValue[] { return Array.isArray(value); }
 function contract(message: string, issues: string[]): AgentContractError { return new AgentContractError(message, issues); }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
-
-export * from './machine.js';

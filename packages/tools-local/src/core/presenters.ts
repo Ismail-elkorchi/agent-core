@@ -1,5 +1,5 @@
 import { parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
-import type { ToolDefinition, ToolObservationPresentation } from '@agent-core/tools';
+import { encodeToolFailureOutput, type ToolDefinition, type ToolObservationPresentation } from '@agent-core/tools';
 
 type Presenter = NonNullable<ToolDefinition['presentObservation']>;
 
@@ -212,7 +212,7 @@ function failurePresentation(title: string, observation: Parameters<Presenter>[0
   if (observation.kind !== 'failure') return undefined;
   return {
     ok: false, title, summary: observation.summary, scope: { ...observation.scope },
-    failures: parseJsonValue(observation.output), coverage: observation.scope.coverage, next: observation.output.recovery
+    failures: encodeToolFailureOutput(observation.output), coverage: observation.scope.coverage, next: observation.output.recovery
   };
 }
 function resultBase(title: string, observation: Parameters<Presenter>[0]['observation'], results: JsonObject): ToolObservationPresentation {

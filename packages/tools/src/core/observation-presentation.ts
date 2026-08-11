@@ -64,19 +64,6 @@ export function validateToolObservationPresentation(value: unknown): ToolObserva
   }) };
 }
 
-export function toolFailurePresentation(toolName: string, observation: ToolObservation): ToolObservationPresentation {
-  const output = toJsonValue(observation.output);
-  return {
-    ok: false,
-    title: toolName + ' failed',
-    summary: observation.summary,
-    scope: toObject(observation.scope),
-    failures: output,
-    coverage: observation.scope.coverage,
-    next: recoveryFromJson(output) ?? 'Use the failure details to adjust the next tool call.'
-  };
-}
-
 export function toJsonValue(value: unknown): JsonValue {
   return normalizeJsonSafe(value, { maxDepth: 32, maxCollectionEntries: 20_000, maxStringBytes: 2_000_000, maxTotalBytes: 4_000_000 }).value;
 }
@@ -90,12 +77,5 @@ function optionalType(value: JsonObject, key: string, expected: 'boolean' | 'str
 }
 function optionalObject(value: JsonObject, key: string, issues: ToolObservationPresentationValidationIssue[]): void {
   if (key in value && !jsonObject(value[key])) issues.push({ path: '$.' + key, message: 'Field ' + key + ' must be a JSON object.' });
-}
-function recoveryFromJson(value: JsonValue): string | undefined {
-  return jsonObject(value) && typeof value.recovery === 'string' ? value.recovery : undefined;
-}
-function toObject(value: unknown): JsonObject {
-  const normalized = toJsonValue(value);
-  return jsonObject(normalized) ? normalized : { value: normalized };
 }
 function jsonObject(value: JsonValue | undefined): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }

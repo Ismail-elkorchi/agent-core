@@ -1,21 +1,15 @@
 import { canonicalJsonString } from '@agent-core/evidence';
 import type { ModelPricing, ModelUsage } from '@agent-core/model';
 import {
-  createAgentRunMachine,
   DEFAULT_AGENT_RUN_RETRY_POLICY,
-  reduceAgentRun,
   systemAgentClock,
   validateAgentRunLimits,
   type AgentClock,
   type AgentLimitKind,
   type AgentRunBudgetState,
   type AgentRunLimits,
-  type AgentRunMachineState,
   type AgentRunPhase,
-  type AgentRunRetryPolicy,
-  type AgentTerminalSnapshot,
-  type AgentToolBatchIdentity,
-  type AgentTurnIdentity
+  type AgentRunRetryPolicy
 } from '../run/contracts.js';
 import type { ToolCall } from '@agent-core/tools';
 
@@ -48,7 +42,7 @@ export class AgentRunController {
   private readonly startedAt: number;
   private readonly initialElapsedMs: number;
   private readonly callCounts = new Map<string, number>();
-  private machine: AgentRunMachineState;
+  private currentPhase: AgentRunPhase = 'preparing';
   private state: Omit<AgentRunBudgetState, 'elapsedMs'> = {
     modelTurns: 0,
     totalToolCalls: 0,
@@ -67,8 +61,6 @@ export class AgentRunController {
   };
 
   constructor(input: {
-    readonly runId?: string;
-    readonly finalizationId?: string;
     readonly clock?: AgentClock;
     readonly limits?: Partial<AgentRunLimits>;
     readonly retryPolicy?: Partial<AgentRunRetryPolicy>;
@@ -88,11 +80,6 @@ export class AgentRunController {
       this.initialElapsedMs = 0;
       if (input.initialToolCalls && input.initialToolCalls.length > 0) throw new Error('Initial tool-call history requires an initial budget snapshot.');
     }
-    this.machine = createAgentRunMachine({
-      runId: input.runId ?? 'unassigned-run',
-      finalizationId: input.finalizationId ?? 'unassigned-finalization',
-      budget: this.snapshot()
-    });
   }
 
   private restoreToolCallHistory(calls: readonly ToolCall[]): void {
@@ -105,37 +92,27 @@ export class AgentRunController {
     if (recoveredMaximum !== this.state.repeatedIdenticalToolCalls) throw new Error(`Recovered repeated-call maximum ${String(recoveredMaximum)} does not match budget value ${String(this.state.repeatedIdenticalToolCalls)}.`);
   }
 
-  get phase(): AgentRunPhase { return this.machine.phase; }
-  get machineState(): AgentRunMachineState { return this.machine; }
+  get phase(): AgentRunPhase { return this.currentPhase; }
 
-  transition(phase: Exclude<AgentRunPhase, 'preparing' | 'ended'>, identity?: AgentTurnIdentity | AgentToolBatchIdentity): void {
-    if (phase === this.machine.phase) return;
-    const budget = this.snapshot();
-    if (phase === 'requesting_model') {
-      const turn = requireTurnIdentity(identity, phase);
-      this.machine = reduceAgentRun(this.machine, { type: 'model.request', turnId: turn.turnId, requestAttempt: turn.requestAttempt, budget });
-    } else if (phase === 'executing_tools') {
-      const batch = requireToolBatchIdentity(identity);
-      this.machine = reduceAgentRun(this.machine, { type: 'tools.execute', turnId: batch.turnId, requestAttempt: batch.requestAttempt, toolBatchId: batch.toolBatchId, budget });
-    } else if (phase === 'waiting_for_approval') {
-      throw new Error('Use waitForApproval() so approval identities are persisted with the transition.');
-    } else if (phase === 'verifying') {
-      this.machine = reduceAgentRun(this.machine, { type: 'verification.start', budget });
-    } else {
-      this.machine = reduceAgentRun(this.machine, { type: 'finalization.start', budget });
-    }
-  }
+  transition(phase: Exclude<AgentRunPhase, 'preparing' | 'waiting_for_approval' | 'ended'>): void { this.setPhase(phase); }
 
-  waitForApproval(approvalIds: readonly string[]): void {
-    this.machine = reduceAgentRun(this.machine, { type: 'approval.wait', approvalIds, budget: this.snapshot() });
-  }
+  waitForApproval(): void { this.setPhase('waiting_for_approval'); }
 
-  resumeApprovedTools(): void {
-    this.machine = reduceAgentRun(this.machine, { type: 'approval.resolved', budget: this.snapshot() });
-  }
+  resumeApprovedTools(): void { this.setPhase('executing_tools'); }
 
-  commitTerminal(terminal: AgentTerminalSnapshot): void {
-    this.machine = reduceAgentRun(this.machine, { type: 'finalization.committed', terminal });
+  commitTerminal(): void { this.setPhase('ended'); }
+
+  private setPhase(next: AgentRunPhase): void {
+    const previous = this.currentPhase;
+    if (previous === next) return;
+    const allowed = (previous === 'preparing' && (next === 'requesting_model' || next === 'finalizing'))
+      || (previous === 'requesting_model' && (next === 'executing_tools' || next === 'verifying' || next === 'finalizing'))
+      || (previous === 'executing_tools' && (next === 'waiting_for_approval' || next === 'requesting_model' || next === 'finalizing'))
+      || (previous === 'waiting_for_approval' && (next === 'executing_tools' || next === 'finalizing'))
+      || (previous === 'verifying' && next === 'finalizing')
+      || (previous === 'finalizing' && next === 'ended');
+    if (!allowed) throw new Error(`Illegal run transition: ${previous} -> ${next}.`);
+    this.currentPhase = next;
   }
 
   beginModelTurn(): void {
@@ -268,14 +245,4 @@ function calculateCost(usage: ModelUsage, pricing: ModelPricing | undefined): { 
 
 function multiplyRate(rate: number | undefined, multiplier: number): number | undefined {
   return rate === undefined ? undefined : rate * multiplier;
-}
-
-function requireTurnIdentity(identity: AgentTurnIdentity | AgentToolBatchIdentity | undefined, phase: AgentRunPhase): AgentTurnIdentity {
-  if (!identity) throw new Error(`${phase} requires a turn identity.`);
-  return identity;
-}
-
-function requireToolBatchIdentity(identity: AgentTurnIdentity | AgentToolBatchIdentity | undefined): AgentToolBatchIdentity {
-  if (!identity || !('toolBatchId' in identity) || identity.toolBatchId.length === 0) throw new Error('executing_tools requires a tool-batch identity.');
-  return identity;
 }
