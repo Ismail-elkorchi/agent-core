@@ -1,17 +1,17 @@
-import { hashRecord } from '@agent-core/evidence';
-import { parseJsonObject, parseJsonValue, type JsonObject } from '@agent-core/json';
-import { abortableToolBoundary, MissingToolServiceError, throwIfAborted, ToolInputError, type ToolPreparationContext } from './context.js';
+import { hashJson } from '@agent-core/evidence';
+import { parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
+import { abortableToolBoundary, MissingToolServiceError, throwIfAborted, ToolInputError, type ToolExecutionContext, type ToolPreparationContext } from './context.js';
 import type { ToolCall, ToolDefinition, ToolObservation } from './definition.js';
-import { invalidToolInputObservation, missingServiceObservation, runtimeErrorObservation, unknownToolObservation } from './observation.js';
+import { invalidOutputObservation, invalidToolInputObservation, missingServiceObservation, parseToolObservation, runtimeErrorObservation, unknownToolObservation } from './observation.js';
 import { assertEffectsWithinEnvelope, validateToolEffects, type ToolEffects } from './authorization.js';
 
 export interface PreparedToolCall {
   readonly call: ToolCall;
-  readonly tool: ToolDefinition;
-  readonly decodedInput: unknown;
-  readonly canonicalInput: unknown;
-  readonly effects: ToolEffects;
+  readonly toolImplementationId: string;
+  readonly canonicalSnapshot: JsonValue;
+  readonly effects: ToolEffects & JsonObject;
   readonly fingerprint: string;
+  invoke(context: ToolExecutionContext): Promise<ToolObservation>;
 }
 
 export type ToolCallPreparation =
@@ -27,17 +27,37 @@ export async function prepareToolCall(call: ToolCall, tools: readonly ToolDefini
     const decoded = tool.decodeInput(ownedCall.input);
     if (!decoded.ok) return { ok: false, observation: decoded.observation };
     const canonicalized = await abortableToolBoundary(context.signal, () => tool.canonicalizeInput(decoded.input, context));
-    const canonicalInput = parseJsonValue(canonicalized, { maxDepth: 32, maxCollectionEntries: 20_000, maxStringBytes: 4_000_000, maxTotalBytes: 8_000_000 });
-    const effects = validateToolEffects(await abortableToolBoundary(context.signal, () => tool.deriveEffects(canonicalInput, context)));
+    const canonicalSnapshot = tool.snapshotInput(canonicalized);
+    const effects = validateToolEffects(await abortableToolBoundary(context.signal, () => tool.deriveEffects(canonicalized, context)));
     assertEffectsWithinEnvelope(effects, tool.effectEnvelope);
-    const fingerprintInput = parseJsonValue({
-      tool: { name: tool.name, implementationId: tool.implementationId, description: tool.description, jsonSchema: tool.jsonSchema, effectEnvelope: tool.effectEnvelope },
-      canonicalInput,
+    const fingerprintInput: JsonObject = Object.freeze({
+      tool: Object.freeze({
+        name: tool.name,
+        implementationId: tool.implementationId,
+        description: tool.description,
+        jsonSchema: tool.jsonSchema,
+        effectEnvelope: Object.freeze({
+          accesses: Object.freeze(tool.effectEnvelope.accesses.map((access) => Object.freeze({ mode: access.mode, scope: access.scope }))),
+          lockScopes: Object.freeze([...tool.effectEnvelope.lockScopes])
+        })
+      }),
+      canonicalInput: canonicalSnapshot,
       effects,
       policy: context.policy,
-      boundary: context.boundary
-    }, { maxDepth: 32, maxCollectionEntries: 20_000, maxStringBytes: 4_000_000, maxTotalBytes: 8_000_000 });
-    return { ok: true, prepared: Object.freeze({ call: ownedCall, tool, decodedInput: decoded.input, canonicalInput, effects, fingerprint: hashRecord(fingerprintInput) }) };
+      boundary: Object.freeze({ authorizationPolicyId: context.boundary.authorizationPolicyId, executionTargetId: context.boundary.executionTargetId })
+    });
+    return { ok: true, prepared: Object.freeze({
+      call: ownedCall,
+      toolImplementationId: tool.implementationId,
+      canonicalSnapshot,
+      effects,
+      fingerprint: hashJson(fingerprintInput),
+      invoke: async (executionContext: ToolExecutionContext) => {
+        const observation = await tool.invoke(canonicalized, executionContext);
+        try { return parseToolObservation(tool, observation); }
+        catch (error) { return parseToolObservation(undefined, invalidOutputObservation(tool.name, error instanceof Error ? error : new Error(String(error)))); }
+      }
+    }) };
   } catch (error) {
     if (context.signal.aborted) { throwIfAborted(context.signal); }
     if (error instanceof ToolInputError) return { ok: false, observation: invalidToolInputObservation(tool.name, error.message, error.details) };

@@ -110,7 +110,7 @@ test('apply_patch preserves all four transaction outcome semantics', async () =>
     };
     const preparation = await prepareToolCall(textToolCall('apply_patch', patch(['*** Update File: note.txt', '@@', '-old', '+new'])), [applyPatchTool], context);
     assert.equal(preparation.ok, true);
-    const observation = await applyPatchWithAuthority(preparation.prepared.canonicalInput, context, { async commit() { return transaction; } });
+    const observation = await applyPatchWithAuthority(preparation.prepared.canonicalSnapshot, context, { async commit() { return transaction; } });
     assert.equal(observation.kind, 'result');
     assert.equal(observation.output.transactionOutcome, transaction.outcome);
     assert.equal(observation.output.operationStatus, transaction.outcome === 'committed' || transaction.outcome === 'committed_with_residue'
@@ -171,16 +171,16 @@ test('apply_patch dynamically requires a transaction directory only for writes',
   const document = patch(['*** Update File: note.txt', '@@', '-old', '+new']);
   const dryPreparation = await prepareToolCall({ name: 'apply_patch', input: { kind: 'json', value: { patch: document, dryRun: true } } }, [applyPatchTool], base);
   assert.equal(dryPreparation.ok, true);
-  const dry = await dryPreparation.prepared.tool.invoke(dryPreparation.prepared.canonicalInput, base);
+  const dry = await dryPreparation.prepared.invoke(base);
   assert.equal(dry.output.operationStatus, 'dry_run');
 
   const writePreparation = await prepareToolCall(textToolCall('apply_patch', document), [applyPatchTool], base);
   assert.equal(writePreparation.ok, true);
-  const missing = await writePreparation.prepared.tool.invoke(writePreparation.prepared.canonicalInput, base).catch(error => error);
+  const missing = await writePreparation.prepared.invoke(base).catch(error => error);
   assert.match(missing.message, /patchTransactionDirectory/u);
 
   const withDirectory = { ...base, services: { ...base.services, patchTransactionDirectory: path.join(root, '.agent-core', 'transactions', 'patch') } };
-  const applied = await writePreparation.prepared.tool.invoke(writePreparation.prepared.canonicalInput, withDirectory);
+  const applied = await writePreparation.prepared.invoke(withDirectory);
   assert.equal(applied.output.operationStatus, 'applied');
   assert.deepEqual(applyPatchTool.requirements.services, ['workspaceRoot', 'localToolConfiguration']);
 });

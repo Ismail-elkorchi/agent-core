@@ -933,17 +933,14 @@ function sameToolCall(left: ModelToolCall, right: ModelToolCall): boolean {
 }
 
 function toolResultMessage(input: RecordToolResultInput, _detail: 'immediate' | 'retained'): ModelMessage {
-  const message: ModelMessage = {
+  return {
     role: 'tool',
     toolName: input.toolName,
     toolCallType: input.toolCallType,
     content: _detail === 'immediate' ? input.immediateContent : input.retainedContent,
+    ...(input.callId ? { toolCallId: input.callId } : {}),
     ...(_detail === 'immediate' && input.immediateImages && input.immediateImages.length > 0 ? { images: [...input.immediateImages] } : {})
   };
-  if (input.callId) {
-    message.toolCallId = input.callId;
-  }
-  return message;
 }
 
 function checkpointMessages(items: ContextHistoryItem[]): string[] {

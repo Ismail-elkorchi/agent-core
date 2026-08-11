@@ -9,7 +9,7 @@ import {
   AgentFinalizationError,
   AgentRunFinalizer,
   agentEventCodec,
-  parseAgentEvent,
+  decodeAgentEvent,
   readCommittedTerminal
 } from '@agent-core/runtime';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/evidence';
@@ -17,7 +17,7 @@ import { ModelProviderError } from '@agent-core/model';
 import * as z from 'zod';
 import {
   deriveAgentVerificationStatus,
-  parseAgentTerminalSnapshot
+  decodeAgentTerminalSnapshot
 } from '@agent-core/runtime';
 import { InMemorySessionRepository } from '@agent-core/runtime';
 
@@ -115,7 +115,7 @@ test('runtime exposes artifact and image tools only with the required repository
     requirements: name === 'view_image' ? { services: ['artifactRepository'], modelInputModalities: ['image'] } : { services: ['artifactRepository'] },
     effectEnvelope: readEnvelope,
     decodeInput() { return { ok: true, input: {} }; },
-    canonicalizeInput(input) { return input; },
+    canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; },
     deriveEffects() { return readEffects; },
     async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; }
   });
@@ -156,7 +156,7 @@ test('tool progress from preparation and invocation remains separate from the fi
   const tool = {
     name: 'progress_tool', implementationId: 'tests/progress-tool@1', description: 'progress', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope,
     decodeInput() { return { ok: true, input: {} }; },
-    async canonicalizeInput(input, context) { await context.emitProgress?.({ type: 'status', stage: 'canonicalize' }); return input; },
+    async canonicalizeInput(input, context) { await context.emitProgress?.({ type: 'status', stage: 'canonicalize' }); return input; }, snapshotInput(input) { return input; },
     deriveEffects() { return readEffects; },
     async invoke(_input, context) { await context.emitProgress?.({ type: 'status', stage: 'invoke' }); return { kind: 'result', ok: true, output: {}, summary: 'done', scope: completeScope }; }
   };
@@ -177,7 +177,7 @@ test('oversized tool observations keep domain output intact in an artifact', asy
   const tool = {
     name: 'large_result', implementationId: 'tests/large-result@1', description: 'large result', jsonSchema: { type: 'object' },
     outputSchema: z.strictObject({ items: z.array(z.strictObject({ id: z.int(), value: z.string() })) }), effectEnvelope: readEnvelope,
-    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return readEffects; },
+    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return readEffects; },
     async invoke() { return { kind: 'result', ok: true, output: { items }, summary: 'large result complete', scope: completeScope }; }
   };
   const { agent, events, artifacts } = await harness({
@@ -202,7 +202,7 @@ test('artifact-store failure after a completed tool effect still persists tool.e
   const tool = {
     name: 'degraded_result', implementationId: 'tests/degraded-result@1', description: 'degraded result', jsonSchema: { type: 'object' },
     outputSchema: z.strictObject({ payload: z.string() }), effectEnvelope: { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'] },
-    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; },
+    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; },
     deriveEffects() { return { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'], idempotency: 'non_idempotent' }; },
     async invoke() { effects += 1; return { kind: 'result', ok: true, output: { payload: 'x'.repeat(400_000) }, summary: 'effect completed', scope: completeScope }; }
   };
@@ -252,7 +252,7 @@ test('image and presenter projection failures happen after durable tool truth an
       name: scenario.name, implementationId: `tests/${scenario.name}@1`, description: scenario.name, jsonSchema: { type: 'object' }, outputSchema: z.unknown(), effectEnvelope: { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'] },
       ...(scenario.profile ? { requirements: { modelInputModalities: ['image'] } } : {}),
       ...(scenario.presentObservation ? { presentObservation: scenario.presentObservation } : {}),
-      decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; },
+      decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; },
       deriveEffects() { return { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'], idempotency: 'non_idempotent' }; },
       async invoke() { effects += 1; return scenario.observation; }
     };
@@ -298,7 +298,7 @@ test('session and observation-record projection failures do not reclassify a com
     const tool = {
       name: 'projection_effect', implementationId: 'tests/projection-effect@1', description: 'projection effect', jsonSchema: { type: 'object' }, outputSchema: z.unknown(),
       effectEnvelope: { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'] },
-      decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'], idempotency: 'non_idempotent' }; },
+      decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'], idempotency: 'non_idempotent' }; },
       async invoke() { effects += 1; return { kind: 'result', ok: true, summary: 'effect committed', scope: completeScope, output: { done: true } }; }
     };
     const run = await harness({ ...scenario, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, script: [response('tool_calls', '', { toolCalls: [{ id: 'projection', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }] }), response()] });
@@ -453,7 +453,7 @@ test('application, run, and steering instructions reach checks with provenance',
   let received;
   let agent;
   const noop = { name: 'noop', implementationId: 'tests/noop-instructions@1', description: 'noop', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope,
-    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return readEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; } };
+    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return readEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; } };
   ({ agent } = await harness({
     script: [response('tool_calls', '', { toolCalls: [{ id: '1', type: 'function', name: 'noop', input: { kind: 'json', value: {} } }] }), response()],
     tools: [noop],
@@ -478,14 +478,14 @@ test('check artifacts and diagnostics agree across ledger, session projection, a
 });
 
 test('persisted terminal validation rejects illegal cross-field combinations', () => {
-  assert.throws(() => parseAgentTerminalSnapshot({ ...terminal(), executionStatus: 'completed', verificationStatus: 'not_run' }), /invalid verification/i);
-  assert.throws(() => parseAgentTerminalSnapshot({ ...terminal(), candidate: { status: 'absent' } }), /present candidate/i);
-  assert.throws(() => parseAgentTerminalSnapshot({ ...terminal(), terminationReason: 'model_output_limit', modelTerminationReason: 'output_limit' }), /candidate status partial/i);
-  assert.throws(() => parseAgentTerminalSnapshot({ ...terminal(), terminationReason: 'content_filtered', modelTerminationReason: 'content_filter', candidate: { ...terminal().candidate, status: 'indeterminate' } }), /candidate status partial/i);
-  assert.throws(() => parseAgentTerminalSnapshot({ ...terminal(), terminationReason: 'unknown_model_termination', modelTerminationReason: 'unknown' }), /candidate status indeterminate/i);
-  assert.throws(() => parseAgentTerminalSnapshot({ ...terminal(), candidate: { ...terminal().candidate, status: 'partial' } }), /candidate status complete/i);
-  assert.throws(() => parseAgentEvent({ type: 'obsolete.event', value: true }), /unsupported/i);
-  assert.throws(() => parseAgentEvent({ type: 'assistant.ended', turnIndex: 2, turnId: 'turn-2', requestAttempt: 1, content: 'x', candidate: { status: 'complete', message: 'x', source: 'content', turnIndex: 1 } }), /candidate turnIndex/i);
+  assert.throws(() => decodeAgentTerminalSnapshot({ ...terminal(), executionStatus: 'completed', verificationStatus: 'not_run' }), /invalid verification/i);
+  assert.throws(() => decodeAgentTerminalSnapshot({ ...terminal(), candidate: { status: 'absent' } }), /present candidate/i);
+  assert.throws(() => decodeAgentTerminalSnapshot({ ...terminal(), terminationReason: 'model_output_limit', modelTerminationReason: 'output_limit' }), /candidate status partial/i);
+  assert.throws(() => decodeAgentTerminalSnapshot({ ...terminal(), terminationReason: 'content_filtered', modelTerminationReason: 'content_filter', candidate: { ...terminal().candidate, status: 'indeterminate' } }), /candidate status partial/i);
+  assert.throws(() => decodeAgentTerminalSnapshot({ ...terminal(), terminationReason: 'unknown_model_termination', modelTerminationReason: 'unknown' }), /candidate status indeterminate/i);
+  assert.throws(() => decodeAgentTerminalSnapshot({ ...terminal(), candidate: { ...terminal().candidate, status: 'partial' } }), /candidate status complete/i);
+  assert.throws(() => decodeAgentEvent({ type: 'obsolete.event', value: true }), /unsupported/i);
+  assert.throws(() => decodeAgentEvent({ type: 'assistant.ended', turnIndex: 2, turnId: 'turn-2', requestAttempt: 1, content: 'x', candidate: { status: 'complete', message: 'x', source: 'content', turnIndex: 1 } }), /candidate turnIndex/i);
 });
 
 test('agent event persistence rejects hostile caller data before hashing or writing', async () => {
@@ -507,7 +507,7 @@ test('agent event persistence rejects hostile caller data before hashing or writ
 
 test('agent event persistence accepts long model answers within the runtime output envelope', () => {
   const message = '🧠'.repeat(100_000);
-  const event = parseAgentEvent({
+  const event = decodeAgentEvent({
     type: 'assistant.ended',
     turnIndex: 1,
     turnId: 'turn-1',
@@ -516,7 +516,7 @@ test('agent event persistence accepts long model answers within the runtime outp
     candidate: { status: 'complete', message, source: 'content', turnIndex: 1 }
   });
   assert.equal(event.content, message);
-  assert.throws(() => parseAgentEvent({
+  assert.throws(() => decodeAgentEvent({
     ...event,
     content: 'x'.repeat(1024 * 1024 + 1),
     candidate: { status: 'complete', message: 'x'.repeat(1024 * 1024 + 1), source: 'content', turnIndex: 1 }
@@ -541,7 +541,7 @@ test('mid-run model changes apply only to the coherent next snapshot', async () 
     request => response('stop', `model:${request.model}`, { model: request.model })
   ]);
   const noop = { name: 'noop', implementationId: 'tests/noop-snapshot@1', description: 'noop', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope,
-    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return readEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; } };
+    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return readEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; } };
   let agent;
   ({ agent } = await harness({ provider, tools: [noop], onProgress(event) { if (event.type === 'assistant.ended' && event.turnIndex === 1) agent.configureModel({ model: 'next-model' }); } }));
   const result = ended(await agent.run({ task: 'change model' }));  assert.equal(provider.calls[0].model, 'scripted');
@@ -556,7 +556,7 @@ test('a multimodal image result remains valid after switching to a text-only mod
   const viewImage = {
     name: 'view_image', implementationId: 'tests/profile-switch-image@1', description: 'image fixture', jsonSchema: { type: 'object' }, outputSchema: z.unknown(),
     requirements: { services: ['artifactRepository'], modelInputModalities: ['image'] }, effectEnvelope: readEnvelope,
-    decodeInput() { return { ok: true, input: { path: 'pixel.png' } }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return readEffects; },
+    decodeInput() { return { ok: true, input: { path: 'pixel.png' } }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return readEffects; },
     async invoke() {
       return { kind: 'result', ok: true, summary: 'Loaded pixel image.', scope: completeScope,
         content: [{ type: 'image', artifact, detail: 'original' }], output: { artifact } };
@@ -585,7 +585,7 @@ test('a multimodal image result remains valid after switching to a text-only mod
 test('run limits and retry policy terminate deterministically', async () => {
   const call = { id: '1', type: 'function', name: 'noop', input: { kind: 'json', value: {} } };
   const provider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] })]);
-  const noop = { name: 'noop', implementationId: 'tests/noop-model-change@1', description: 'noop', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope, decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return readEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; } };
+  const noop = { name: 'noop', implementationId: 'tests/noop-model-change@1', description: 'noop', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope, decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return readEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; } };
   const { agent } = await harness({ provider, tools: [noop], limits: { modelTurns: 1 } });
   const exhausted = ended(await agent.run({ task: 'limit' }));  assert.equal(exhausted.terminationReason, 'limit_exhausted');
   assert.equal(exhausted.exhaustedLimit, 'model_turns');
@@ -641,7 +641,7 @@ test('runtime configuration summaries describe ambient shell authority without c
   const ambient = {
     name: 'ambient', implementationId: 'tests/ambient-authority@1', description: 'ambient authority fixture', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema,
     effectEnvelope: { accesses: [{ mode: 'execute', scope: 'process/ambient' }], lockScopes: ['workspace/files'] },
-    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; },
+    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; },
     deriveEffects() { return { accesses: [{ mode: 'execute', scope: 'process/ambient' }], lockScopes: ['workspace/files'], idempotency: 'non_idempotent' }; },
     async invoke() { return { kind: 'result', ok: true, summary: 'not invoked', scope: { resources: ['process/ambient'], coverage: 'complete' }, output: {} }; }
   };
@@ -682,7 +682,7 @@ test('durable approval resumes after repository reopen and rejects changed polic
     name: 'effect', implementationId: 'tests/canonical-effect@1', description: 'write one canonical resource', jsonSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }, outputSchema: emptyOutputSchema,
     effectEnvelope: { accesses: [{ mode: 'write', scope: 'workspace' }], lockScopes: ['workspace'] },
     decodeInput(input) { return { ok: true, input: input.value }; },
-    canonicalizeInput(input) { return { ...input, path: 'state' }; },
+    canonicalizeInput(input) { return { ...input, path: 'state' }; }, snapshotInput(input) { return input; },
     deriveEffects(input) { return { accesses: [{ mode: 'write', scope: `workspace/${input.path}` }], lockScopes: [`workspace/${input.path}`], idempotency: 'idempotent', idempotencyKey: `effect:${input.path}` }; },
     async invoke() { effects += 1; return { kind: 'result', ok: true, output: {}, summary: 'changed', scope: { resources: ['workspace/state'], coverage: 'complete' } }; }
   };
@@ -725,7 +725,7 @@ test('current authorization is re-evaluated and may veto a stored approval', asy
   const tool = {
     name: 'effect', implementationId: 'tests/current-veto-effect@1', description: 'effect', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema,
     effectEnvelope: { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'] },
-    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'], idempotency: 'non_idempotent' }; },
+    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'], idempotency: 'non_idempotent' }; },
     async invoke() { effects += 1; return { kind: 'result', ok: true, output: {}, summary: 'changed', scope: { resources: ['state'], coverage: 'complete' } }; }
   };
   const provider = new ScriptedProvider([
@@ -830,11 +830,12 @@ test('process death after tool completion projects the durable observation witho
 
 test('per-call recovery retries idempotent starts and only projects completed observations', async () => {
   const call = { id: 'idempotent-1', type: 'function', name: 'idempotent', input: { kind: 'json', value: {} } };
+  const persistedCall = { id: call.id, name: call.name, input: call.input };
   const effects = { accesses: [{ mode: 'write', scope: 'state/idempotent' }], lockScopes: ['state/idempotent'], idempotency: 'idempotent', idempotencyKey: 'fixture:idempotent-1' };
   let invocations = 0;
   const tool = {
     name: 'idempotent', implementationId: 'tests/idempotent-recovery@1', description: 'idempotent recovery fixture', jsonSchema: { type: 'object' }, outputSchema: z.unknown(), effectEnvelope: { accesses: effects.accesses, lockScopes: effects.lockScopes },
-    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return effects; },
+    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return effects; },
     async invoke(_input, context) {
       invocations += 1;
       assert.equal(context.invocation.toolAttempt, 2);
@@ -847,7 +848,7 @@ test('per-call recovery retries idempotent starts and only projects completed ob
   const suspended = await run.agent.run({ task: 'idempotent recovery' });
   const approval = suspended.pendingApprovals[0];
   const identity = { turnIndex: approval.turnIndex, turnId: approval.turnId, requestAttempt: approval.requestAttempt, toolBatchId: approval.toolBatchId, callIndex: approval.callIndex, callId: approval.callId, toolAttempt: 1 };
-  await run.events.append(suspended.runId, { type: 'tool.started', ...identity, toolName: tool.name, input: call, fingerprint: approval.fingerprint, effects }, { idempotencyKey: toolStageKey(suspended.runId, identity, 'started') });
+  await run.events.append(suspended.runId, { type: 'tool.started', ...identity, toolName: tool.name, input: persistedCall, fingerprint: approval.fingerprint, effects }, { idempotencyKey: toolStageKey(suspended.runId, identity, 'started') });
   const result = ended(await run.agent.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' }));  assert.equal(result.executionStatus, 'completed');
   assert.equal(invocations, 1);
   let records = await eventsFor(run.events, result.runId);
@@ -862,7 +863,7 @@ test('per-call recovery retries idempotent starts and only projects completed ob
   const completedApproval = completedSuspension.pendingApprovals[0];
   const completedIdentity = { turnIndex: completedApproval.turnIndex, turnId: completedApproval.turnId, requestAttempt: completedApproval.requestAttempt, toolBatchId: completedApproval.toolBatchId, callIndex: completedApproval.callIndex, callId: completedApproval.callId, toolAttempt: 1 };
   const completedObservation = { kind: 'result', ok: true, output: { already: true }, summary: 'already completed', scope: { resources: ['state/idempotent'], coverage: 'complete' } };
-  await completedRun.events.append(completedSuspension.runId, { type: 'tool.started', ...completedIdentity, toolName: completedTool.name, input: call, fingerprint: completedApproval.fingerprint, effects }, { idempotencyKey: toolStageKey(completedSuspension.runId, completedIdentity, 'started') });
+  await completedRun.events.append(completedSuspension.runId, { type: 'tool.started', ...completedIdentity, toolName: completedTool.name, input: persistedCall, fingerprint: completedApproval.fingerprint, effects }, { idempotencyKey: toolStageKey(completedSuspension.runId, completedIdentity, 'started') });
   await completedRun.events.append(completedSuspension.runId, { type: 'tool.ended', ...completedIdentity, toolName: completedTool.name, observation: completedObservation }, { idempotencyKey: toolStageKey(completedSuspension.runId, completedIdentity, 'ended') });
   const completedResult = ended(await completedRun.agent.resolveApproval({ runId: completedSuspension.runId, approvalId: completedApproval.approvalId, fingerprint: completedApproval.fingerprint, decision: 'allow' }));  assert.equal(completedResult.executionStatus, 'completed');
   assert.equal(projectedInvocations, 0);
@@ -886,7 +887,7 @@ test('elapsed limits use the injected monotonic clock', async () => {
   let now = 0;
   const call = { id: '1', type: 'function', name: 'noop', input: { kind: 'json', value: {} } };
   const provider = new ScriptedProvider([() => { now = 10; return response('tool_calls', '', { toolCalls: [call] }); }]);
-  const noop = { name: 'noop', implementationId: 'tests/noop-elapsed@1', description: 'noop', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope, decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return readEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; } };
+  const noop = { name: 'noop', implementationId: 'tests/noop-elapsed@1', description: 'noop', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope, decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return readEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; } };
   const run = await harness({ provider, tools: [noop], limits: { elapsedMs: 5 }, clock: { now: () => now }, withoutSession: true });
   const result = ended(await run.agent.run({ task: 'elapsed' }));  assert.equal(result.terminationReason, 'limit_exhausted');
   assert.equal(result.exhaustedLimit, 'elapsed_time');
@@ -908,7 +909,7 @@ test('tool preparation and authorization are abortable and elapsed-deadline boun
   const baseTool = {
     name: 'stall', implementationId: 'tests/stalled-boundary@1', description: 'stalled boundary', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope,
     decodeInput() { return { ok: true, input: {} }; },
-    canonicalizeInput(input) { return input; },
+    canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; },
     deriveEffects() { return readEffects; },
     async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'unexpected', scope: completeScope }; }
   };
@@ -942,7 +943,7 @@ test('tool preparation and authorization are abortable and elapsed-deadline boun
 test('non-idempotent failed tools cannot be agent-turn retried', async () => {
   const call = { id: '1', type: 'function', name: 'effect', input: { kind: 'json', value: {} } };
   const provider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] })]);
-  const effect = { name: 'effect', implementationId: 'tests/non-idempotent-effect@1', description: 'effect', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'] }, decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'], idempotency: 'non_idempotent' }; }, async invoke() { return { kind: 'failure', ok: false, output: { blocked: true, reason: 'runtime_error', error: 'uncertain', recovery: 'stop' }, summary: 'uncertain', scope: { resources: ['state'], coverage: 'partial', cause: 'uncertain' } }; } };
+  const effect = { name: 'effect', implementationId: 'tests/non-idempotent-effect@1', description: 'effect', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'] }, decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'], idempotency: 'non_idempotent' }; }, async invoke() { return { kind: 'failure', ok: false, output: { blocked: true, reason: 'runtime_error', error: 'uncertain', recovery: 'stop' }, summary: 'uncertain', scope: { resources: ['state'], coverage: 'partial', cause: 'uncertain' } }; } };
   let agent;
   ({ agent } = await harness({ provider, tools: [effect], toolPolicy: { allowedRisks: ['read', 'write'] }, onProgress(event) { if (event.type === 'tool.ended') agent.requestRetry(); } }));
   const result = ended(await agent.run({ task: 'effect' }));  assert.equal(result.terminationReason, 'uncertain_tool_effect');
@@ -1008,7 +1009,7 @@ test('finalization is idempotent, rejects conflicts, and recovers faults after e
 });
 
 function terminal() {
-  return parseAgentTerminalSnapshot({
+  return decodeAgentTerminalSnapshot({
     runId: 'run-final', finalizationId: 'final-1', phase: 'ended', executionStatus: 'completed', verificationStatus: 'not_required', terminationReason: 'model_completed',
     modelTerminationReason: 'stop', candidate: { status: 'complete', message: 'done', source: 'content', turnIndex: 1 }, turnCount: 1, checkResults: [],
     budget: { modelTurns: 1, totalToolCalls: 0, repeatedIdenticalToolCalls: 0, elapsedMs: 1, promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, knownCosts: {}, pricingStatus: 'unknown', unknownPricedTokens: 0, consecutiveProviderFailures: 0, consecutiveToolFailures: 0, providerRetries: 0 }

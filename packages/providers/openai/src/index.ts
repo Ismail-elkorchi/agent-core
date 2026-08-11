@@ -7,6 +7,7 @@ import {
   type ProviderAuth,
   StaticBearerTokenProvider
 } from '@agent-core/auth';
+import { normalizeJsonSafe, parseJsonObject, type JsonObject } from '@agent-core/json';
 import {
   type ModelCapabilities,
   ModelContractError,
@@ -345,7 +346,7 @@ export class OpenAIProvider implements ModelProvider {
         const contentDelta = stringValue(part.delta);
         if (eventType === 'response.output_text.delta' && contentDelta.length > 0) {
           content += contentDelta;
-          yield { type: 'content', content: contentDelta, accumulated: content, raw: part };
+          yield { type: 'content', content: contentDelta, accumulated: content, raw: normalizeJsonSafe(part).value };
           continue;
         }
 
@@ -353,10 +354,10 @@ export class OpenAIProvider implements ModelProvider {
         if (reasoningChannel && contentDelta.length > 0) {
           if (reasoningChannel === 'summary') {
             reasoningSummary += contentDelta;
-            yield { type: 'reasoning', reasoning: contentDelta, accumulatedReasoning: reasoningSummary, channel: 'summary', raw: part };
+            yield { type: 'reasoning', reasoning: contentDelta, accumulatedReasoning: reasoningSummary, channel: 'summary', raw: normalizeJsonSafe(part).value };
           } else {
             reasoning += contentDelta;
-            yield { type: 'reasoning', reasoning: contentDelta, accumulatedReasoning: reasoning, channel: 'reasoning', raw: part };
+            yield { type: 'reasoning', reasoning: contentDelta, accumulatedReasoning: reasoning, channel: 'reasoning', raw: normalizeJsonSafe(part).value };
           }
           continue;
         }
@@ -365,7 +366,7 @@ export class OpenAIProvider implements ModelProvider {
         if (eventType === 'response.output_item.done' && toolCall) {
           const deduped = addUniqueToolCall(toolCalls, toolCall);
           if (deduped) {
-            yield { type: 'tool_call', toolCall, raw: part };
+            yield { type: 'tool_call', toolCall, raw: normalizeJsonSafe(part).value };
           }
           continue;
         }
@@ -373,14 +374,14 @@ export class OpenAIProvider implements ModelProvider {
         for (const streamedToolCall of mergeStreamingFunctionCallParts(accumulators, part)) {
           const deduped = addUniqueToolCall(toolCalls, streamedToolCall);
           if (deduped) {
-            yield { type: 'tool_call', toolCall: streamedToolCall, raw: part };
+            yield { type: 'tool_call', toolCall: streamedToolCall, raw: normalizeJsonSafe(part).value };
           }
         }
 
         for (const streamedToolCall of mergeStreamingCustomToolCallParts(customAccumulators, part)) {
           const deduped = addUniqueToolCall(toolCalls, streamedToolCall);
           if (deduped) {
-            yield { type: 'tool_call', toolCall: streamedToolCall, raw: part };
+            yield { type: 'tool_call', toolCall: streamedToolCall, raw: normalizeJsonSafe(part).value };
           }
         }
       }
@@ -693,7 +694,7 @@ function rejectUnknownProviderOptions(options: Record<string, unknown>, allowed:
 
 function onlyOpenAIOptionKeys(value: Record<string, unknown>, allowed: string[]): boolean { const keys = new Set(allowed); return Object.keys(value).every((key) => keys.has(key)); }
 
-function toOpenAIInput(messages: ModelMessage[], preferIncremental = false): { instructions: string; input: unknown[]; usesPreviousResponse: boolean } {
+function toOpenAIInput(messages: readonly ModelMessage[], preferIncremental = false): { instructions: string; input: unknown[]; usesPreviousResponse: boolean } {
   const instructionMessages = instructionMessagesFrom(messages);
   const input: unknown[] = [];
   const projectedMessages = preferIncremental ? incrementalMessagesAfterPreviousResponse(messages) : undefined;
@@ -727,13 +728,13 @@ function toOpenAIInput(messages: ModelMessage[], preferIncremental = false): { i
   };
 }
 
-function instructionMessagesFrom(messages: ModelMessage[]): string[] {
+function instructionMessagesFrom(messages: readonly ModelMessage[]): string[] {
   return messages
     .filter((message) => message.role === 'system' && message.content.trim().length > 0)
     .map((message) => message.content);
 }
 
-function incrementalMessagesAfterPreviousResponse(messages: ModelMessage[]): ModelMessage[] | undefined {
+function incrementalMessagesAfterPreviousResponse(messages: readonly ModelMessage[]): ModelMessage[] | undefined {
   const lastAssistantIndex = findLastIndex(messages, (message) => message.role === 'assistant');
   const candidateMessages = lastAssistantIndex >= 0
     ? messages.slice(lastAssistantIndex + 1)
@@ -742,7 +743,7 @@ function incrementalMessagesAfterPreviousResponse(messages: ModelMessage[]): Mod
   return incrementalMessages.length > 0 ? incrementalMessages : undefined;
 }
 
-function findLastIndex<T>(items: T[], predicate: (item: T) => boolean): number {
+function findLastIndex<T>(items: readonly T[], predicate: (item: T) => boolean): number {
   for (let index = items.length - 1; index >= 0; index -= 1) {
     const item = items[index];
     if (item !== undefined && predicate(item)) {
@@ -884,21 +885,20 @@ function toModelResponse(
   const toolCalls = normalizeToolCalls(provider, payload.output ?? []);
   const reasoningSummary = reasoningSummaryFromOutput(payload.output ?? []);
   const providerTerminationReason = payload.incomplete_details?.reason ?? payload.status;
-  const response: ModelResponse = {
+  const usage = normalizeUsage(payload.usage);
+  return parseOpenAIModelResponse({
     content,
     model: payload.model ?? request.model,
     provider,
     terminationReason: normalizeOpenAITermination(payload, toolCalls.length > 0),
     ...(providerTerminationReason ? { providerTerminationReason } : {}),
-    raw: payload,
+    ...(payload.id ? { requestId: payload.id } : {}),
+    ...(usage ? { usage } : {}),
+    ...(reasoningSummary ? { reasoningSummary } : {}),
+    ...(toolCalls.length > 0 ? { toolCalls } : {}),
+    raw: normalizeJsonSafe(payload).value,
     transport: responseTransport(provider, 'stored_response', payload.id, transport)
-  };
-  if (payload.id) response.requestId = payload.id;
-  const usage = normalizeUsage(payload.usage);
-  if (usage) response.usage = usage;
-  if (reasoningSummary) response.reasoningSummary = reasoningSummary;
-  if (toolCalls.length > 0) response.toolCalls = toolCalls;
-  return parseOpenAIModelResponse(response);
+  });
 }
 
 function fallbackStreamResponse(
@@ -910,17 +910,16 @@ function fallbackStreamResponse(
   toolCalls: ModelToolCall[],
   transport: { reusedContinuation?: boolean } = {}
 ): ModelResponse {
-  const response: ModelResponse = {
+  return parseOpenAIModelResponse({
     content,
     model: request.model,
     provider,
     terminationReason: toolCalls.length > 0 ? 'tool_calls' : 'unknown',
+    ...(reasoning ? { reasoning } : {}),
+    ...(reasoningSummary ? { reasoningSummary } : {}),
+    ...(toolCalls.length > 0 ? { toolCalls: dedupeToolCalls(toolCalls) } : {}),
     transport: responseTransport(provider, 'stored_response', undefined, transport)
-  };
-  if (reasoning) response.reasoning = reasoning;
-  if (reasoningSummary) response.reasoningSummary = reasoningSummary;
-  if (toolCalls.length > 0) response.toolCalls = dedupeToolCalls(toolCalls);
-  return parseOpenAIModelResponse(response);
+  });
 }
 
 function normalizeOpenAITermination(
@@ -1013,15 +1012,12 @@ function toolCallFromOutputItem(provider: string, item: OpenAIOutputItem | undef
   };
 }
 
-function parseToolArguments(provider: string, value: string | undefined): Record<string, unknown> {
+function parseToolArguments(provider: string, value: string | undefined): JsonObject {
   if (value === undefined || value.length === 0) {
-    return {};
+    return Object.freeze({});
   }
   try {
-    const parsed: unknown = JSON.parse(value);
-    if (isJsonObject(parsed)) {
-      return parsed;
-    }
+    return parseJsonObject(JSON.parse(value));
   } catch (error) {
     throw new ModelProviderError({
       provider,
@@ -1070,7 +1066,7 @@ function tryAccumulatorToToolCall(item: StreamingFunctionCallAccumulator): Model
       ...(item.callId ? { id: item.callId } : item.id ? { id: item.id } : {}),
       type: 'function',
       name: item.name,
-      input: { kind: 'json', value: parsed }
+      input: { kind: 'json', value: parseJsonObject(parsed) }
     };
   } catch {
     return undefined;

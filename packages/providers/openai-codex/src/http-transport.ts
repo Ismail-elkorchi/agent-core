@@ -1,4 +1,5 @@
 import { type BearerTokenProvider } from '@agent-core/auth';
+import { normalizeJsonSafe } from '@agent-core/json';
 import { ModelProviderError, type ModelRequest, type ModelStreamEvent, type ModelToolCall } from '@agent-core/model';
 import { readBoundedResponseText, readJsonSseEvents, waitForResponseOrStatus } from '@agent-core/provider-openai-responses';
 
@@ -123,7 +124,7 @@ export async function* streamCodexHttp(config: CodexHttpTransportConfig, request
       const contentDelta = stringValue(part.delta);
       if (eventType === 'response.output_text.delta' && contentDelta.length > 0) {
         content += contentDelta;
-        yield { type: 'content', content: contentDelta, accumulated: content, raw: part };
+        yield { type: 'content', content: contentDelta, accumulated: content, raw: normalizeJsonSafe(part).value };
         continue;
       }
 
@@ -131,10 +132,10 @@ export async function* streamCodexHttp(config: CodexHttpTransportConfig, request
       if (reasoningChannel && contentDelta.length > 0) {
         if (reasoningChannel === 'summary') {
           reasoningSummary += contentDelta;
-          yield { type: 'reasoning', reasoning: contentDelta, accumulatedReasoning: reasoningSummary, channel: 'summary', raw: part };
+          yield { type: 'reasoning', reasoning: contentDelta, accumulatedReasoning: reasoningSummary, channel: 'summary', raw: normalizeJsonSafe(part).value };
         } else {
           reasoning += contentDelta;
-          yield { type: 'reasoning', reasoning: contentDelta, accumulatedReasoning: reasoning, channel: 'reasoning', raw: part };
+          yield { type: 'reasoning', reasoning: contentDelta, accumulatedReasoning: reasoning, channel: 'reasoning', raw: normalizeJsonSafe(part).value };
         }
         continue;
       }
@@ -143,7 +144,7 @@ export async function* streamCodexHttp(config: CodexHttpTransportConfig, request
       if (eventType === 'response.output_item.done' && toolCall) {
         const deduped = addUniqueToolCall(toolCalls, toolCall);
         if (deduped) {
-          yield { type: 'tool_call', toolCall, raw: part };
+          yield { type: 'tool_call', toolCall, raw: normalizeJsonSafe(part).value };
         }
         continue;
       }
@@ -151,14 +152,14 @@ export async function* streamCodexHttp(config: CodexHttpTransportConfig, request
       for (const streamedToolCall of mergeStreamingFunctionCallParts(accumulators, part)) {
         const deduped = addUniqueToolCall(toolCalls, streamedToolCall);
         if (deduped) {
-          yield { type: 'tool_call', toolCall: streamedToolCall, raw: part };
+          yield { type: 'tool_call', toolCall: streamedToolCall, raw: normalizeJsonSafe(part).value };
         }
       }
 
       for (const streamedToolCall of mergeStreamingCustomToolCallParts(customAccumulators, part)) {
         const deduped = addUniqueToolCall(toolCalls, streamedToolCall);
         if (deduped) {
-          yield { type: 'tool_call', toolCall: streamedToolCall, raw: part };
+          yield { type: 'tool_call', toolCall: streamedToolCall, raw: normalizeJsonSafe(part).value };
         }
       }
     }

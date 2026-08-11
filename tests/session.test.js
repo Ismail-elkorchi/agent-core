@@ -4,7 +4,7 @@ import { appendFile, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { PersistenceCorruptionError } from '@agent-core/evidence';
-import { InMemorySessionRepository, parseAgentTerminalSnapshot } from '@agent-core/runtime';
+import { InMemorySessionRepository, decodeAgentTerminalSnapshot } from '@agent-core/runtime';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 
 test('session repository initializes a missing nested root before acquiring its stream lock', async () => {
@@ -84,7 +84,7 @@ test('session final projections are idempotent and validate the complete termina
   const repository = new JsonlSessionRepository({ rootDir });
   const session = await repository.create({ id: 'final', workspaceRoot: process.cwd() });
   await repository.appendInput(session.id, { runId: 'run', task: 'finish the run' });
-  const terminal = parseAgentTerminalSnapshot({
+  const terminal = decodeAgentTerminalSnapshot({
     runId: 'run', finalizationId: 'fin', phase: 'ended', executionStatus: 'completed', verificationStatus: 'not_required', terminationReason: 'model_completed', modelTerminationReason: 'stop',
     candidate: { status: 'complete', message: 'done', source: 'content', turnIndex: 1 }, turnCount: 1, checkResults: [],
     budget: { modelTurns: 1, totalToolCalls: 0, repeatedIdenticalToolCalls: 0, elapsedMs: 1, promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, knownCosts: {}, pricingStatus: 'unknown', unknownPricedTokens: 0, consecutiveProviderFailures: 0, consecutiveToolFailures: 0, providerRetries: 0 }

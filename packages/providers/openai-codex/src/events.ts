@@ -5,6 +5,7 @@ import {
   type ModelToolCall,
   type ModelUsage
 } from '@agent-core/model';
+import { normalizeJsonSafe, parseJsonObject, type JsonObject } from '@agent-core/json';
 
 import { parseCodexModelResponse, summarizeCodexFailure } from './errors.js';
 import { errorMessage, isJsonObject, stringValue } from './utils.js';
@@ -130,23 +131,21 @@ export function toModelResponse(
   const content = typeof payload.output_text === 'string' ? payload.output_text : contentFromOutput(payload.output ?? []);
   const toolCalls = normalizeToolCalls(provider, payload.output ?? []);
   const reasoningSummary = reasoningSummaryFromOutput(payload.output ?? []);
-  const response: ModelResponse = {
+  const usage = normalizeUsage(payload.usage);
+  const providerTerminationReason = payload.incomplete_details?.reason ?? payload.status;
+  return parseCodexModelResponse({
     content,
     model: payload.model ?? request.model,
     provider,
-    terminationReason: toolCalls.length > 0 ? 'tool_calls' : 'unknown',
-    raw: payload,
+    terminationReason: normalizeOpenAITermination(payload, toolCalls.length > 0),
+    ...(providerTerminationReason ? { providerTerminationReason } : {}),
+    ...(payload.id ? { requestId: payload.id } : {}),
+    ...(usage ? { usage } : {}),
+    ...(reasoningSummary ? { reasoningSummary } : {}),
+    ...(toolCalls.length > 0 ? { toolCalls } : {}),
+    raw: normalizeJsonSafe(payload).value,
     transport: responseTransport(provider, transport.strategy, payload.id, transport)
-  };
-  if (payload.id) response.requestId = payload.id;
-  const usage = normalizeUsage(payload.usage);
-  if (usage) response.usage = usage;
-  if (reasoningSummary) response.reasoningSummary = reasoningSummary;
-  if (toolCalls.length > 0) response.toolCalls = toolCalls;
-  response.terminationReason = normalizeOpenAITermination(payload, toolCalls.length > 0);
-  const providerTerminationReason = payload.incomplete_details?.reason ?? payload.status;
-  if (providerTerminationReason) response.providerTerminationReason = providerTerminationReason;
-  return parseCodexModelResponse(response);
+  });
 }
 
 function normalizeOpenAITermination(
@@ -177,17 +176,16 @@ export function fallbackStreamResponse(
   toolCalls: ModelToolCall[],
   transport: { strategy: string; reusedContinuation?: boolean } = { strategy: 'http_full_replay' }
 ): ModelResponse {
-  const response: ModelResponse = {
+  return parseCodexModelResponse({
     content,
     model: request.model,
     provider,
     terminationReason: 'unknown',
+    ...(reasoning ? { reasoning } : {}),
+    ...(reasoningSummary ? { reasoningSummary } : {}),
+    ...(toolCalls.length > 0 ? { toolCalls: dedupeToolCalls(toolCalls) } : {}),
     transport: responseTransport(provider, transport.strategy, undefined, transport)
-  };
-  if (reasoning) response.reasoning = reasoning;
-  if (reasoningSummary) response.reasoningSummary = reasoningSummary;
-  if (toolCalls.length > 0) response.toolCalls = dedupeToolCalls(toolCalls);
-  return parseCodexModelResponse(response);
+  });
 }
 
 export function contentFromOutput(output: OpenAICodexOutputItem[]): string {
@@ -350,15 +348,12 @@ function normalizeToolCalls(provider: string, output: OpenAICodexOutputItem[]): 
     .filter((toolCall): toolCall is ModelToolCall => toolCall !== undefined);
 }
 
-function parseToolArguments(provider: string, value: string | undefined): Record<string, unknown> {
+function parseToolArguments(provider: string, value: string | undefined): JsonObject {
   if (value === undefined || value.length === 0) {
-    return {};
+    return Object.freeze({});
   }
   try {
-    const parsed: unknown = JSON.parse(value);
-    if (isJsonObject(parsed)) {
-      return parsed;
-    }
+    return parseJsonObject(JSON.parse(value));
   } catch (error) {
     throw new ModelProviderError({
       provider,
@@ -383,7 +378,7 @@ function tryAccumulatorToToolCall(item: StreamingFunctionCallAccumulator): Model
       ...(item.callId ? { id: item.callId } : item.id ? { id: item.id } : {}),
       type: 'function',
       name: item.name,
-      input: { kind: 'json', value: parsed }
+      input: { kind: 'json', value: parseJsonObject(parsed) }
     };
   } catch {
     return undefined;

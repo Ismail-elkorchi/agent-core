@@ -1,18 +1,33 @@
 import type {
   ModelProfile,
+  ModelCapabilities,
+  ModelLimits,
+  ModelMessage,
+  ModelImage,
+  ModelModalities,
+  ModelPricing,
+  ModelProviderOptions,
+  ModelReasoningEffort,
   ModelReasoningRequest,
   ModelRequest,
+  ModelResponseFormat,
   ModelProviderState,
   ModelResponse,
   ModelStreamEvent,
   ModelTerminationReason,
+  ModelTool,
   ModelToolCall,
   ModelTransportMetadata,
   ModelUsage
 } from './index.js';
-import { normalizeJsonSafe, parseJsonObject, parseJsonValue, type JsonObject } from '@agent-core/json';
+import { normalizeJsonSafe, parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
 
 const MODEL_JSON_LIMITS = { maxDepth: 32, maxCollectionEntries: 10_000, maxStringBytes: 1024 * 1024, maxTotalBytes: 4 * 1024 * 1024 };
+const OWNED_PROFILES = new WeakSet<ModelProfile>();
+const OWNED_REQUESTS = new WeakSet<ModelRequest>();
+const OWNED_RESPONSES = new WeakSet<ModelResponse>();
+const OWNED_PROVIDER_STATES = new WeakSet<ModelProviderState>();
+const OWNED_STREAM_EVENTS = new WeakSet<ModelStreamEvent>();
 
 export class ModelContractError extends Error {
   readonly issues: readonly string[];
@@ -24,57 +39,126 @@ export class ModelContractError extends Error {
 }
 
 export function parseModelProfile(value: unknown): ModelProfile {
+  if (ownedBy(OWNED_PROFILES, value)) return value;
   if (!isRecord(value)) throw contract('Invalid model profile.', ['Expected an object.']);
   const issues: string[] = [];
-  nonempty(value.id, 'id', issues); nonempty(value.provider, 'provider', issues);
+  const id = typeof value.id === 'string' ? value.id : '';
+  const provider = typeof value.provider === 'string' ? value.provider : '';
+  nonempty(id, 'id', issues); nonempty(provider, 'provider', issues);
   if (value.displayName !== undefined && typeof value.displayName !== 'string') issues.push('displayName must be a string.');
-  if (!isRecord(value.capabilities)) issues.push('capabilities must be an object.');
-  else {
-    for (const name of ['streaming', 'toolCalling', 'jsonMode', 'jsonSchema', 'logprobs', 'temperature', 'topP']) if (typeof value.capabilities[name] !== 'boolean') issues.push(`capabilities.${name} must be boolean.`);
-    if (!Array.isArray(value.capabilities.supportedToolInputs) || !value.capabilities.supportedToolInputs.every(isModelToolInputSupport)) issues.push('capabilities.supportedToolInputs is invalid.');
-    if (value.capabilities.reasoning !== undefined && !validReasoningCapabilities(value.capabilities.reasoning)) issues.push('capabilities.reasoning is invalid.');
-  }
-  if (!isRecord(value.modalities) || !stringArray(value.modalities.input) || !stringArray(value.modalities.output)) issues.push('modalities is invalid.');
-  if (!isRecord(value.limits)) issues.push('limits must be an object.');
-  else {
-    for (const name of ['contextTokens', 'maxInputTokens', 'outputTokens']) if (value.limits[name] !== undefined && !positiveInteger(value.limits[name])) issues.push(`limits.${name} must be a positive integer.`);
-    const context = positiveInteger(value.limits.contextTokens) ? value.limits.contextTokens : undefined;
-    const input = positiveInteger(value.limits.maxInputTokens) ? value.limits.maxInputTokens : undefined;
-    const output = positiveInteger(value.limits.outputTokens) ? value.limits.outputTokens : undefined;
-    if (context !== undefined && input !== undefined && input > context) issues.push('limits.maxInputTokens cannot exceed contextTokens.');
-    if (context !== undefined && output !== undefined && output > context) issues.push('limits.outputTokens cannot exceed contextTokens.');
-    if (context !== undefined && input !== undefined && output !== undefined && input + output > context) issues.push('limits.maxInputTokens + outputTokens cannot exceed contextTokens.');
-  }
+  let capabilities: ModelCapabilities | undefined;
+  let modalities: ModelModalities | undefined;
+  let limits: ModelLimits | undefined;
+  let pricing: ModelPricing | undefined;
+  let metadata: JsonObject | undefined;
+  try { capabilities = decodeCapabilities(value.capabilities); } catch (error) { issues.push(errorMessage(error)); }
+  try { modalities = decodeModalities(value.modalities); } catch (error) { issues.push(errorMessage(error)); }
+  try { limits = decodeLimits(value.limits); } catch (error) { issues.push(errorMessage(error)); }
   if (!stringArray(value.supportedParameters) || !value.supportedParameters.every((item) => MODEL_PARAMETERS.has(item))) issues.push('supportedParameters contains an unsupported canonical parameter.');
   else if (new Set(value.supportedParameters).size !== value.supportedParameters.length) issues.push('supportedParameters must not contain duplicates.');
-  if (value.pricing !== undefined && !validPricing(value.pricing)) issues.push('pricing must contain finite nonnegative numeric rates.');
-  if (value.metadata !== undefined && !isJsonObject(value.metadata)) issues.push('metadata must be a bounded JSON-safe object.');
+  if (value.pricing !== undefined) try { pricing = decodePricing(value.pricing); } catch (error) { issues.push(errorMessage(error)); }
+  if (value.metadata !== undefined) try { metadata = parseJsonObject(value.metadata, MODEL_JSON_LIMITS); } catch { issues.push('metadata must be a bounded JSON-safe object.'); }
   if (issues.length > 0) throw contract('Invalid model profile.', issues);
-  return ownedModelProfile(value);
+  if (!capabilities || !modalities || !limits) throw contract('Invalid model profile.', ['Required owned profile fields are missing.']);
+  return own(OWNED_PROFILES, Object.freeze({
+    id, provider,
+    ...(typeof value.displayName === 'string' ? { displayName: value.displayName } : {}),
+    capabilities, modalities, limits,
+    supportedParameters: Object.freeze([...(value.supportedParameters as ModelProfile['supportedParameters'])]),
+    ...(pricing ? { pricing } : {}), ...(metadata ? { metadata } : {})
+  }));
 }
 
 export function parseModelRequest(value: unknown): ModelRequest {
+  if (ownedBy(OWNED_REQUESTS, value)) return value;
   if (!isRecord(value)) throw contract('Invalid model request.', ['Expected an object.']);
   const issues: string[] = [];
+  const model = typeof value.model === 'string' ? value.model : '';
+  let messages: readonly ModelMessage[] | undefined;
+  let responseFormat: ModelResponseFormat | undefined;
+  let tools: readonly ModelTool[] | undefined;
+  let reasoning: ModelReasoningRequest | undefined;
+  let providerOptions: ModelProviderOptions | undefined;
+  let metadata: Readonly<Record<string, string>> | undefined;
   if (!onlyKeys(value, ['model', 'messages', 'temperature', 'topP', 'maxOutputTokens', 'responseFormat', 'tools', 'keepAlive', 'reasoning', 'logprobs', 'topLogprobs', 'providerOptions', 'metadata', 'signal'])) issues.push('request contains unsupported fields.');
-  nonempty(value.model, 'model', issues);
+  nonempty(model, 'model', issues);
   if (!Array.isArray(value.messages) || value.messages.length === 0) issues.push('messages must be a non-empty array.');
-  else value.messages.forEach((message, index) => { validateMessage(message, index, issues); });
+  else {
+    const owned: ModelMessage[] = [];
+    value.messages.forEach((message, index) => { try { owned.push(decodeMessage(message, index)); } catch (error) { issues.push(errorMessage(error)); } });
+    messages = Object.freeze(owned);
+  }
   if (value.temperature !== undefined && !finiteInRange(value.temperature, 0, 2)) issues.push('temperature must be finite and between 0 and 2.');
   if (value.topP !== undefined && !finiteInRange(value.topP, 0, 1)) issues.push('topP must be finite and between 0 and 1.');
   if (value.maxOutputTokens !== undefined && !positiveInteger(value.maxOutputTokens)) issues.push('maxOutputTokens must be a positive integer.');
-  if (value.responseFormat !== undefined && !validResponseFormat(value.responseFormat)) issues.push('responseFormat is invalid or not JSON-safe.');
-  if (value.tools !== undefined && (!Array.isArray(value.tools) || !value.tools.every(validModelTool))) issues.push('tools contains an invalid definition.');
+  if (value.responseFormat !== undefined) try { responseFormat = decodeResponseFormat(value.responseFormat); } catch { issues.push('responseFormat is invalid or not JSON-safe.'); }
+  if (value.tools !== undefined) {
+    if (!Array.isArray(value.tools)) issues.push('tools contains an invalid definition.');
+    else { const owned: ModelTool[] = []; for (const tool of value.tools) try { owned.push(decodeModelTool(tool)); } catch { issues.push('tools contains an invalid definition.'); } tools = Object.freeze(owned); }
+  }
   if (value.keepAlive !== undefined && !(typeof value.keepAlive === 'string' || nonnegativeFinite(value.keepAlive))) issues.push('keepAlive must be a string or finite nonnegative number.');
   if (value.logprobs !== undefined && typeof value.logprobs !== 'boolean') issues.push('logprobs must be a boolean.');
   if (value.topLogprobs !== undefined && !nonnegativeInteger(value.topLogprobs)) issues.push('topLogprobs must be a nonnegative integer.');
   if (value.topLogprobs !== undefined && value.logprobs !== true) issues.push('topLogprobs requires logprobs=true.');
-  if (value.reasoning !== undefined && !validReasoningRequest(value.reasoning)) issues.push('reasoning must be a valid discriminated strategy.');
-  if (value.providerOptions !== undefined && !validProviderOptions(value.providerOptions)) issues.push('providerOptions must be namespaced to a provider and contain JSON-safe values.');
-  if (value.metadata !== undefined && !validStringMetadata(value.metadata)) issues.push('metadata must contain string values.');
+  if (value.reasoning !== undefined) try { reasoning = parseModelReasoningRequest(value.reasoning); } catch { issues.push('reasoning must be a valid discriminated strategy.'); }
+  if (value.providerOptions !== undefined) try { providerOptions = decodeProviderOptions(value.providerOptions); } catch { issues.push('providerOptions must be namespaced to a provider and contain JSON-safe values.'); }
+  if (value.metadata !== undefined) try { metadata = decodeStringMetadata(value.metadata); } catch { issues.push('metadata must contain string values.'); }
   if (value.signal !== undefined && !isAbortSignal(value.signal)) issues.push('signal must be an AbortSignal.');
   if (issues.length > 0) throw contract('Invalid model request.', issues);
-  return ownedModelRequest(value);
+  if (!messages) throw contract('Invalid model request.', ['messages must be a non-empty array.']);
+  return own(OWNED_REQUESTS, Object.freeze({
+    model, messages,
+    ...(typeof value.temperature === 'number' ? { temperature: value.temperature } : {}),
+    ...(typeof value.topP === 'number' ? { topP: value.topP } : {}),
+    ...(typeof value.maxOutputTokens === 'number' ? { maxOutputTokens: value.maxOutputTokens } : {}),
+    ...(responseFormat !== undefined ? { responseFormat } : {}), ...(tools ? { tools } : {}),
+    ...((typeof value.keepAlive === 'string' || typeof value.keepAlive === 'number') ? { keepAlive: value.keepAlive } : {}),
+    ...(reasoning ? { reasoning } : {}), ...(typeof value.logprobs === 'boolean' ? { logprobs: value.logprobs } : {}),
+    ...(typeof value.topLogprobs === 'number' ? { topLogprobs: value.topLogprobs } : {}),
+    ...(providerOptions ? { providerOptions } : {}), ...(metadata ? { metadata } : {}),
+    ...(isAbortSignal(value.signal) ? { signal: value.signal } : {})
+  }));
+}
+
+export function createModelRequest(value: ModelRequest): ModelRequest {
+  if (OWNED_REQUESTS.has(value)) return value;
+  const issues: string[] = [];
+  nonempty(value.model, 'model', issues);
+  if (value.messages.length === 0) issues.push('messages must be a non-empty array.');
+  if (value.temperature !== undefined && !finiteInRange(value.temperature, 0, 2)) issues.push('temperature must be finite and between 0 and 2.');
+  if (value.topP !== undefined && !finiteInRange(value.topP, 0, 1)) issues.push('topP must be finite and between 0 and 1.');
+  if (value.maxOutputTokens !== undefined && !positiveInteger(value.maxOutputTokens)) issues.push('maxOutputTokens must be a positive integer.');
+  if (value.topLogprobs !== undefined && value.logprobs !== true) issues.push('topLogprobs requires logprobs=true.');
+  if (issues.length > 0) throw contract('Invalid model request.', issues);
+  return own(OWNED_REQUESTS, Object.freeze({
+    ...value,
+    messages: Object.freeze(value.messages.map(snapshotMessage)),
+    ...(value.responseFormat && typeof value.responseFormat === 'object' ? { responseFormat: Object.freeze({ type: 'json_schema' as const, schema: parseJsonObject(value.responseFormat.schema, MODEL_JSON_LIMITS) }) } : {}),
+    ...(value.tools ? { tools: Object.freeze(value.tools.map(snapshotModelTool)) } : {}),
+    ...(value.reasoning ? { reasoning: Object.freeze({ ...value.reasoning }) } : {}),
+    ...(value.providerOptions ? { providerOptions: Object.freeze({ provider: value.providerOptions.provider, values: parseJsonObject(value.providerOptions.values, MODEL_JSON_LIMITS) }) } : {}),
+    ...(value.metadata ? { metadata: Object.freeze({ ...value.metadata }) } : {})
+  }));
+}
+
+function snapshotMessage(message: ModelMessage): ModelMessage {
+  if (message.role === 'user') return Object.freeze({ ...message, ...(message.images ? { images: Object.freeze(message.images.map(snapshotImage)) } : {}) });
+  if (message.role === 'assistant') return Object.freeze({ ...message, ...(message.toolCalls ? { toolCalls: Object.freeze(message.toolCalls.map(snapshotToolCall)) } : {}) });
+  if (message.role === 'tool') return Object.freeze({ ...message, ...(message.images ? { images: Object.freeze(message.images.map(snapshotImage)) } : {}) });
+  return Object.freeze({ ...message });
+}
+function snapshotImage(image: ModelImage): ModelImage {
+  return image.type === 'bytes' ? Object.freeze({ ...image, data: new Uint8Array(image.data) }) : Object.freeze({ ...image });
+}
+function snapshotToolCall(call: ModelToolCall): ModelToolCall {
+  return call.type === 'function'
+    ? Object.freeze({ ...call, input: Object.freeze({ kind: 'json' as const, value: parseJsonObject(call.input.value, MODEL_JSON_LIMITS) }) })
+    : Object.freeze({ ...call, input: Object.freeze({ ...call.input }) });
+}
+function snapshotModelTool(tool: ModelTool): ModelTool {
+  return tool.type === 'function'
+    ? Object.freeze({ type: 'function', function: Object.freeze({ ...tool.function, ...(tool.function.parameters ? { parameters: parseJsonObject(tool.function.parameters, MODEL_JSON_LIMITS) } : {}) }) })
+    : Object.freeze({ ...tool, format: Object.freeze({ ...tool.format }) });
 }
 
 /** Enforces a discovered profile against an actual request at the provider boundary. */
@@ -138,62 +222,66 @@ function modelReasoningSupportIssues(profile: ModelProfile, reasoning: ModelReas
   return issues;
 }
 
-function validateMessage(value: unknown, index: number, issues: string[]): void {
+function decodeMessage(value: unknown, index: number): ModelMessage {
   const path = `messages[${String(index)}]`;
-  if (!isRecord(value)) { issues.push(`${path} must be an object.`); return; }
-  if (typeof value.content !== 'string') issues.push(`${path}.content must be a string.`);
-  if (value.name !== undefined && typeof value.name !== 'string') issues.push(`${path}.name must be a string.`);
+  if (!isRecord(value) || typeof value.content !== 'string' || (value.name !== undefined && typeof value.name !== 'string')) throw new Error(`${path} has invalid common fields.`);
+  const common = { content: value.content, ...(typeof value.name === 'string' ? { name: value.name } : {}) };
   if (value.role === 'system') {
-    if (!onlyKeys(value, ['role', 'content', 'name'])) issues.push(`${path} contains fields that are illegal for a system message.`);
-    return;
+    if (!onlyKeys(value, ['role', 'content', 'name'])) throw new Error(`${path} contains fields that are illegal for a system message.`);
+    return Object.freeze({ role: 'system', ...common });
   }
   if (value.role === 'user') {
-    if (!onlyKeys(value, ['role', 'content', 'name', 'images'])) issues.push(`${path} contains fields that are illegal for a user message.`);
-    if (value.images !== undefined && (!Array.isArray(value.images) || !value.images.every(validImage))) issues.push(`${path}.images is invalid.`);
-    return;
+    if (!onlyKeys(value, ['role', 'content', 'name', 'images'])) throw new Error(`${path} contains fields that are illegal for a user message.`);
+    return Object.freeze({ role: 'user', ...common, ...(value.images === undefined ? {} : { images: decodeImages(value.images, path) }) });
   }
   if (value.role === 'assistant') {
-    if (!onlyKeys(value, ['role', 'content', 'name', 'reasoning', 'toolCalls'])) issues.push(`${path} contains fields that are illegal for an assistant message.`);
-    if (value.reasoning !== undefined && typeof value.reasoning !== 'string') issues.push(`${path}.reasoning must be a string.`);
-    if (value.toolCalls !== undefined) {
-      if (!Array.isArray(value.toolCalls)) issues.push(`${path}.toolCalls must be an array.`);
-      else for (const call of value.toolCalls) try { parseModelToolCall(call); } catch (error) { issues.push(`${path}.${errorMessage(error)}`); }
-    }
-    return;
+    if (!onlyKeys(value, ['role', 'content', 'name', 'reasoning', 'toolCalls']) || (value.reasoning !== undefined && typeof value.reasoning !== 'string')) throw new Error(`${path} has invalid assistant fields.`);
+    if (value.toolCalls !== undefined && !Array.isArray(value.toolCalls)) throw new Error(`${path}.toolCalls must be an array.`);
+    const toolCalls = Array.isArray(value.toolCalls) ? Object.freeze(value.toolCalls.map(parseModelToolCall)) : undefined;
+    return Object.freeze({ role: 'assistant', ...common, ...(typeof value.reasoning === 'string' ? { reasoning: value.reasoning } : {}), ...(toolCalls ? { toolCalls } : {}) });
   }
   if (value.role === 'tool') {
-    if (!onlyKeys(value, ['role', 'content', 'name', 'toolName', 'toolCallId', 'toolCallType', 'images'])) issues.push(`${path} contains fields that are illegal for a tool message.`);
-    nonempty(value.toolName, `${path}.toolName`, issues);
-    if (value.toolCallId !== undefined && typeof value.toolCallId !== 'string') issues.push(`${path}.toolCallId must be a string.`);
-    if (value.toolCallType !== 'function' && value.toolCallType !== 'custom') issues.push(`${path}.toolCallType must be function or custom.`);
-    if (value.images !== undefined && (!Array.isArray(value.images) || !value.images.every(validImage))) issues.push(`${path}.images is invalid.`);
-    return;
+    if (value.toolCallType !== 'function' && value.toolCallType !== 'custom') throw new Error(`${path}.toolCallType is invalid.`);
+    if (!onlyKeys(value, ['role', 'content', 'name', 'toolName', 'toolCallId', 'toolCallType', 'images']) || typeof value.toolName !== 'string' || value.toolName.trim().length === 0 || (value.toolCallId !== undefined && typeof value.toolCallId !== 'string')) throw new Error(`${path} has invalid tool fields.`);
+    return Object.freeze({ role: 'tool', ...common, toolName: value.toolName, toolCallType: value.toolCallType, ...(typeof value.toolCallId === 'string' ? { toolCallId: value.toolCallId } : {}), ...(value.images === undefined ? {} : { images: decodeImages(value.images, path) }) });
   }
-  issues.push(`${path}.role is invalid.`);
+  throw new Error(`${path}.role is invalid.`);
 }
 
-function validImage(value: unknown): boolean {
-  if (!isRecord(value) || (value.type !== 'base64' && value.type !== 'bytes') || typeof value.mediaType !== 'string' || !value.mediaType.startsWith('image/') || (value.detail !== undefined && value.detail !== 'auto' && value.detail !== 'low' && value.detail !== 'high' && value.detail !== 'original')) return false;
-  if (!onlyKeys(value, ['type', 'data', 'mediaType', 'detail'])) return false;
-  return value.type === 'base64' ? typeof value.data === 'string' : value.data instanceof Uint8Array;
+function decodeImages(value: unknown, path: string): readonly import('./index.js').ModelImage[] {
+  if (!Array.isArray(value)) throw new Error(`${path}.images is invalid.`);
+  return Object.freeze(value.map((item) => {
+    if (!isRecord(item) || (item.type !== 'base64' && item.type !== 'bytes') || typeof item.mediaType !== 'string' || !item.mediaType.startsWith('image/') || (item.detail !== undefined && item.detail !== 'auto' && item.detail !== 'low' && item.detail !== 'high' && item.detail !== 'original') || !onlyKeys(item, ['type', 'data', 'mediaType', 'detail'])) throw new Error(`${path}.images is invalid.`);
+    if (item.type === 'base64') {
+      if (typeof item.data !== 'string') throw new Error(`${path}.images is invalid.`);
+      return Object.freeze({ type: 'base64' as const, data: item.data, mediaType: item.mediaType as `image/${string}`, ...(item.detail === undefined ? {} : { detail: item.detail }) });
+    }
+    if (!(item.data instanceof Uint8Array)) throw new Error(`${path}.images is invalid.`);
+    return Object.freeze({ type: 'bytes' as const, data: new Uint8Array(item.data), mediaType: item.mediaType as `image/${string}`, ...(item.detail === undefined ? {} : { detail: item.detail }) });
+  }));
 }
 
-function validResponseFormat(value: unknown): boolean {
-  if (value === 'text' || value === 'json') return true;
-  return isRecord(value) && value.type === 'json_schema' && isJsonObject(value.schema) && onlyKeys(value, ['type', 'schema']);
+function decodeResponseFormat(value: unknown): ModelResponseFormat {
+  if (value === 'text' || value === 'json') return value;
+  if (!isRecord(value) || value.type !== 'json_schema' || !onlyKeys(value, ['type', 'schema'])) throw new Error('responseFormat is invalid.');
+  return Object.freeze({ type: 'json_schema', schema: parseJsonObject(value.schema, MODEL_JSON_LIMITS) });
 }
 
-function validModelTool(value: unknown): boolean {
-  if (!isRecord(value)) return false;
+function decodeModelTool(value: unknown): ModelTool {
+  if (!isRecord(value)) throw new Error('Tool must be an object.');
   if (value.type === 'function') {
-    if (!onlyKeys(value, ['type', 'function']) || !isRecord(value.function) || !onlyKeys(value.function, ['name', 'description', 'parameters'])) return false;
-    return typeof value.function.name === 'string' && value.function.name.trim().length > 0
-      && (value.function.description === undefined || typeof value.function.description === 'string')
-      && (value.function.parameters === undefined || isJsonObject(value.function.parameters));
+    if (!onlyKeys(value, ['type', 'function']) || !isRecord(value.function) || !onlyKeys(value.function, ['name', 'description', 'parameters']) || typeof value.function.name !== 'string' || value.function.name.trim().length === 0 || (value.function.description !== undefined && typeof value.function.description !== 'string')) throw new Error('Function tool is invalid.');
+    const parameters = value.function.parameters === undefined ? undefined : parseJsonObject(value.function.parameters, MODEL_JSON_LIMITS);
+    return Object.freeze({ type: 'function', function: Object.freeze({ name: value.function.name, ...(typeof value.function.description === 'string' ? { description: value.function.description } : {}), ...(parameters ? { parameters } : {}) }) });
   }
-  if (value.type !== 'custom' || !onlyKeys(value, ['type', 'name', 'description', 'format']) || typeof value.name !== 'string' || value.name.trim().length === 0 || (value.description !== undefined && typeof value.description !== 'string') || !isRecord(value.format)) return false;
-  if (value.format.type === 'text') return onlyKeys(value.format, ['type']);
-  return value.format.type === 'grammar' && typeof value.format.syntax === 'string' && value.format.syntax.length > 0 && typeof value.format.definition === 'string' && value.format.definition.length > 0 && onlyKeys(value.format, ['type', 'syntax', 'definition']);
+  if (value.type !== 'custom' || !onlyKeys(value, ['type', 'name', 'description', 'format']) || typeof value.name !== 'string' || value.name.trim().length === 0 || (value.description !== undefined && typeof value.description !== 'string') || !isRecord(value.format)) throw new Error('Custom tool is invalid.');
+  const format = value.format.type === 'text' && onlyKeys(value.format, ['type'])
+    ? Object.freeze({ type: 'text' as const })
+    : value.format.type === 'grammar' && typeof value.format.syntax === 'string' && value.format.syntax.length > 0 && typeof value.format.definition === 'string' && value.format.definition.length > 0 && onlyKeys(value.format, ['type', 'syntax', 'definition'])
+      ? Object.freeze({ type: 'grammar' as const, syntax: value.format.syntax, definition: value.format.definition })
+      : undefined;
+  if (!format) throw new Error('Custom tool format is invalid.');
+  return Object.freeze({ type: 'custom', name: value.name, ...(typeof value.description === 'string' ? { description: value.description } : {}), format });
 }
 
 export function parseModelReasoningRequest(value: unknown): ModelReasoningRequest {
@@ -251,16 +339,18 @@ export function parseModelToolCall(value: unknown): ModelToolCall {
 }
 
 export function parseModelProviderState(value: unknown): ModelProviderState {
+  if (ownedBy(OWNED_PROVIDER_STATES, value)) return value;
   if (!isRecord(value) || typeof value.provider !== 'string' || value.provider.length === 0 || typeof value.model !== 'string' || value.model.length === 0 || typeof value.kind !== 'string' || value.kind.length === 0) {
     throw contract('Invalid provider continuation state.', ['State identity and data must be JSON-safe.']);
   }
   let data: JsonObject;
   try { data = parseJsonObject(value.data, MODEL_JSON_LIMITS); }
   catch { throw contract('Invalid provider continuation state.', ['State identity and data must be JSON-safe.']); }
-  return Object.freeze({ provider: value.provider, model: value.model, kind: value.kind, data });
+  return own(OWNED_PROVIDER_STATES, Object.freeze({ provider: value.provider, model: value.model, kind: value.kind, data }));
 }
 
 export function parseModelResponse(value: unknown): ModelResponse {
+  if (ownedBy(OWNED_RESPONSES, value)) return value;
   if (!isRecord(value)) throw contract('Invalid model response.', ['Expected an object.']);
   const issues: string[] = [];
   let terminationReason: ModelTerminationReason = 'unknown';
@@ -309,49 +399,90 @@ export function parseModelResponse(value: unknown): ModelResponse {
     ...(Object.hasOwn(value, 'logprobs') ? { logprobs: ownedOpaque(value.logprobs) } : {}),
     ...(Object.hasOwn(value, 'raw') ? { raw: ownedOpaque(value.raw) } : {})
   };
-  return Object.freeze(response);
+  return own(OWNED_RESPONSES, Object.freeze(response));
 }
 
 export function parseModelStreamEvent(value: unknown): ModelStreamEvent {
+  if (ownedBy(OWNED_STREAM_EVENTS, value)) return value;
   if (!isRecord(value) || typeof value.type !== 'string') throw contract('Invalid model stream event.', ['Expected a discriminated object.']);
   if (value.type === 'content' && typeof value.content === 'string' && value.content.length > 0 && typeof value.accumulated === 'string' && value.accumulated.endsWith(value.content) && onlyKeys(value, ['type', 'content', 'accumulated', 'raw'])) {
-    return Object.freeze({ type: 'content', content: value.content, accumulated: value.accumulated, ...optionalRaw(value) });
+    return own(OWNED_STREAM_EVENTS, Object.freeze({ type: 'content', content: value.content, accumulated: value.accumulated, ...optionalRaw(value) }));
   }
   if (value.type === 'reasoning' && typeof value.reasoning === 'string' && value.reasoning.length > 0 && typeof value.accumulatedReasoning === 'string' && value.accumulatedReasoning.endsWith(value.reasoning) && (value.channel === undefined || value.channel === 'reasoning' || value.channel === 'summary') && onlyKeys(value, ['type', 'reasoning', 'accumulatedReasoning', 'channel', 'raw'])) {
     if (value.channel === 'reasoning') {
       const event: ModelStreamEvent = { type: 'reasoning', reasoning: value.reasoning, accumulatedReasoning: value.accumulatedReasoning, channel: 'reasoning', ...optionalRaw(value) };
-      return Object.freeze(event);
+      return own(OWNED_STREAM_EVENTS, Object.freeze(event));
     }
     if (value.channel === 'summary') {
       const event: ModelStreamEvent = { type: 'reasoning', reasoning: value.reasoning, accumulatedReasoning: value.accumulatedReasoning, channel: 'summary', ...optionalRaw(value) };
-      return Object.freeze(event);
+      return own(OWNED_STREAM_EVENTS, Object.freeze(event));
     }
     const event: ModelStreamEvent = { type: 'reasoning', reasoning: value.reasoning, accumulatedReasoning: value.accumulatedReasoning, ...optionalRaw(value) };
-    return Object.freeze(event);
+    return own(OWNED_STREAM_EVENTS, Object.freeze(event));
   }
-  if (value.type === 'tool_call' && onlyKeys(value, ['type', 'toolCall', 'raw'])) return Object.freeze({ type: 'tool_call', toolCall: parseModelToolCall(value.toolCall), ...optionalRaw(value) });
-  if (value.type === 'status' && typeof value.message === 'string' && value.message.trim().length > 0 && onlyKeys(value, ['type', 'message', 'raw'])) return Object.freeze({ type: 'status', message: value.message, ...optionalRaw(value) });
-  if (value.type === 'done' && onlyKeys(value, ['type', 'response'])) return Object.freeze({ type: 'done', response: parseModelResponse(value.response) });
+  if (value.type === 'tool_call' && onlyKeys(value, ['type', 'toolCall', 'raw'])) return own(OWNED_STREAM_EVENTS, Object.freeze({ type: 'tool_call', toolCall: parseModelToolCall(value.toolCall), ...optionalRaw(value) }));
+  if (value.type === 'status' && typeof value.message === 'string' && value.message.trim().length > 0 && onlyKeys(value, ['type', 'message', 'raw'])) return own(OWNED_STREAM_EVENTS, Object.freeze({ type: 'status', message: value.message, ...optionalRaw(value) }));
+  if (value.type === 'done' && onlyKeys(value, ['type', 'response'])) return own(OWNED_STREAM_EVENTS, Object.freeze({ type: 'done', response: parseModelResponse(value.response) }));
   throw contract('Invalid model stream event.', [`Malformed ${value.type} event.`]);
 }
 
-function validPricing(value: unknown): boolean {
-  if (!isRecord(value)) return false;
-  if (typeof value.currency !== 'string' || value.currency.length === 0 || !isRecord(value.rates)) return false;
-  const rates = value.rates;
-  if (!['input', 'output', 'cacheRead', 'cacheWrite'].every((name) => rates[name] === undefined || nonnegativeFinite(rates[name]))) return false;
-  if (value.inputTiers !== undefined && (!Array.isArray(value.inputTiers) || !value.inputTiers.every((tier) => isRecord(tier) && nonnegativeInteger(tier.aboveInputTokens) && positiveFinite(tier.inputMultiplier) && positiveFinite(tier.outputMultiplier)))) return false;
-  if (value.metadata !== undefined && !isJsonObject(value.metadata)) return false;
-  return true;
+function own<T extends object>(owners: WeakSet<T>, value: T): T { owners.add(value); return value; }
+function ownedBy<T extends object>(owners: WeakSet<T>, value: unknown): value is T { return typeof value === 'object' && value !== null && owners.has(value as T); }
+
+function decodeCapabilities(value: unknown): ModelCapabilities {
+  if (!isRecord(value)) throw new Error('capabilities must be an object.');
+  for (const name of ['streaming', 'toolCalling', 'jsonMode', 'jsonSchema', 'logprobs', 'temperature', 'topP']) if (typeof value[name] !== 'boolean') throw new Error(`capabilities.${name} must be boolean.`);
+  if (!Array.isArray(value.supportedToolInputs) || !value.supportedToolInputs.every(isModelToolInputSupport)) throw new Error('capabilities.supportedToolInputs is invalid.');
+  const reasoning = value.reasoning === undefined ? undefined : decodeReasoningCapabilities(value.reasoning);
+  return Object.freeze({
+    streaming: value.streaming as boolean, toolCalling: value.toolCalling as boolean,
+    supportedToolInputs: Object.freeze(value.supportedToolInputs.map((input) => Object.freeze({ ...input }))),
+    jsonMode: value.jsonMode as boolean, jsonSchema: value.jsonSchema as boolean, logprobs: value.logprobs as boolean,
+    temperature: value.temperature as boolean, topP: value.topP as boolean, ...(reasoning ? { reasoning } : {})
+  });
 }
-function validReasoningCapabilities(value: unknown): boolean {
-  if (!isRecord(value) || !Array.isArray(value.strategies) || !value.strategies.every((item) => item === 'toggle' || item === 'effort' || item === 'budget') || typeof value.canDisable !== 'boolean' || typeof value.separateOutput !== 'boolean') return false;
-  if (new Set(value.strategies).size !== value.strategies.length) return false;
-  if (value.efforts !== undefined && (!stringArray(value.efforts) || !value.efforts.every((item) => REASONING_EFFORTS.has(item)))) return false;
-  if (value.strategies.includes('effort') !== (Array.isArray(value.efforts) && value.efforts.length > 0)) return false;
-  if (value.modes !== undefined && (!stringArray(value.modes) || !value.modes.every((item) => item === 'standard' || item === 'pro'))) return false;
-  if (value.modes !== undefined && !value.strategies.includes('effort')) return false;
-  return value.summaries === undefined || (stringArray(value.summaries) && value.summaries.every((item) => item === 'auto' || item === 'concise' || item === 'detailed'));
+function decodeReasoningCapabilities(value: unknown): NonNullable<ModelCapabilities['reasoning']> {
+  if (!isRecord(value) || !Array.isArray(value.strategies) || !value.strategies.every((item) => item === 'toggle' || item === 'effort' || item === 'budget') || new Set(value.strategies).size !== value.strategies.length || typeof value.canDisable !== 'boolean' || typeof value.separateOutput !== 'boolean') throw new Error('capabilities.reasoning is invalid.');
+  if (value.efforts !== undefined && (!Array.isArray(value.efforts) || !value.efforts.every(isReasoningEffort))) throw new Error('capabilities.reasoning is invalid.');
+  if (value.strategies.includes('effort') !== (Array.isArray(value.efforts) && value.efforts.length > 0)) throw new Error('capabilities.reasoning is invalid.');
+  if (value.modes !== undefined && (!stringArray(value.modes) || !value.modes.every((item) => item === 'standard' || item === 'pro') || !value.strategies.includes('effort'))) throw new Error('capabilities.reasoning is invalid.');
+  if (value.summaries !== undefined && (!stringArray(value.summaries) || !value.summaries.every((item) => item === 'auto' || item === 'concise' || item === 'detailed'))) throw new Error('capabilities.reasoning is invalid.');
+  const strategies = Object.freeze(value.strategies.filter(isReasoningStrategy));
+  const efforts = Array.isArray(value.efforts) ? Object.freeze(value.efforts.filter(isReasoningEffort)) : undefined;
+  const modes = Array.isArray(value.modes) ? Object.freeze(value.modes.filter(isReasoningMode)) : undefined;
+  const summaries = Array.isArray(value.summaries) ? Object.freeze(value.summaries.filter(isReasoningSummary)) : undefined;
+  return Object.freeze({ strategies, canDisable: value.canDisable, separateOutput: value.separateOutput, ...(efforts ? { efforts } : {}), ...(modes ? { modes } : {}), ...(summaries ? { summaries } : {}) });
+}
+function isReasoningStrategy(value: unknown): value is 'toggle' | 'effort' | 'budget' { return value === 'toggle' || value === 'effort' || value === 'budget'; }
+function isReasoningEffort(value: unknown): value is ModelReasoningEffort { return typeof value === 'string' && REASONING_EFFORTS.has(value); }
+function isReasoningMode(value: unknown): value is 'standard' | 'pro' { return value === 'standard' || value === 'pro'; }
+function isReasoningSummary(value: unknown): value is 'auto' | 'concise' | 'detailed' { return value === 'auto' || value === 'concise' || value === 'detailed'; }
+function decodeModalities(value: unknown): ModelModalities {
+  if (!isRecord(value) || !stringArray(value.input) || !stringArray(value.output)) throw new Error('modalities is invalid.');
+  return Object.freeze({ input: Object.freeze([...value.input]), output: Object.freeze([...value.output]) });
+}
+function decodeLimits(value: unknown): ModelLimits {
+  if (!isRecord(value)) throw new Error('limits must be an object.');
+  for (const name of ['contextTokens', 'maxInputTokens', 'outputTokens']) if (value[name] !== undefined && !positiveInteger(value[name])) throw new Error(`limits.${name} must be a positive integer.`);
+  const contextTokens = positiveInteger(value.contextTokens) ? value.contextTokens : undefined;
+  const maxInputTokens = positiveInteger(value.maxInputTokens) ? value.maxInputTokens : undefined;
+  const outputTokens = positiveInteger(value.outputTokens) ? value.outputTokens : undefined;
+  if (contextTokens !== undefined && maxInputTokens !== undefined && maxInputTokens > contextTokens) throw new Error('limits.maxInputTokens cannot exceed contextTokens.');
+  if (contextTokens !== undefined && outputTokens !== undefined && outputTokens > contextTokens) throw new Error('limits.outputTokens cannot exceed contextTokens.');
+  if (contextTokens !== undefined && maxInputTokens !== undefined && outputTokens !== undefined && maxInputTokens + outputTokens > contextTokens) throw new Error('limits.maxInputTokens + outputTokens cannot exceed contextTokens.');
+  return Object.freeze({ ...(contextTokens === undefined ? {} : { contextTokens }), ...(maxInputTokens === undefined ? {} : { maxInputTokens }), ...(outputTokens === undefined ? {} : { outputTokens }) });
+}
+function decodePricing(value: unknown): ModelPricing {
+  if (!isRecord(value) || typeof value.currency !== 'string' || value.currency.length === 0 || !isRecord(value.rates)) throw new Error('pricing must contain finite nonnegative numeric rates.');
+  const rates: Record<string, number> = {};
+  for (const name of ['input', 'output', 'cacheRead', 'cacheWrite']) { const rate = value.rates[name]; if (rate !== undefined) { if (!nonnegativeFinite(rate)) throw new Error('pricing must contain finite nonnegative numeric rates.'); rates[name] = rate; } }
+  let inputTiers: readonly import('./index.js').ModelPricingTier[] | undefined;
+  if (value.inputTiers !== undefined) {
+    if (!Array.isArray(value.inputTiers)) throw new Error('pricing input tiers are invalid.');
+    inputTiers = Object.freeze(value.inputTiers.map((tier) => { if (!isRecord(tier) || !nonnegativeInteger(tier.aboveInputTokens) || !positiveFinite(tier.inputMultiplier) || !positiveFinite(tier.outputMultiplier)) throw new Error('pricing input tiers are invalid.'); return Object.freeze({ aboveInputTokens: tier.aboveInputTokens, inputMultiplier: tier.inputMultiplier, outputMultiplier: tier.outputMultiplier }); }));
+  }
+  const metadata = value.metadata === undefined ? undefined : parseJsonObject(value.metadata, MODEL_JSON_LIMITS);
+  return Object.freeze({ currency: value.currency, rates: Object.freeze(rates), ...(inputTiers ? { inputTiers } : {}), ...(metadata ? { metadata } : {}) });
 }
 
 function parseTransport(value: unknown, provider: unknown): ModelTransportMetadata {
@@ -379,8 +510,8 @@ function parseFiniteNumberRecord(value: unknown): Record<string, number> {
   }
   return Object.freeze(output);
 }
-function ownedOpaque(value: unknown): unknown {
-  return parseJsonValue(normalizeJsonSafe(value, { maxDepth: 32, maxCollectionEntries: 20_000, maxStringBytes: 1024 * 1024, maxTotalBytes: 4 * 1024 * 1024 }).value);
+function ownedOpaque(value: unknown): JsonValue {
+  return normalizeJsonSafe(value, { maxDepth: 32, maxCollectionEntries: 20_000, maxStringBytes: 1024 * 1024, maxTotalBytes: 4 * 1024 * 1024 }).value;
 }
 function validReasoningRequest(value: unknown): value is ModelReasoningRequest {
   if (!isRecord(value)) return false;
@@ -390,66 +521,21 @@ function validReasoningRequest(value: unknown): value is ModelReasoningRequest {
   if (value.strategy === 'budget') return positiveInteger(value.maxTokens) && validSummary(value.summary) && onlyKeys(value, ['strategy', 'maxTokens', 'summary']);
   return false;
 }
-function validProviderOptions(value: unknown): boolean { return isRecord(value) && typeof value.provider === 'string' && value.provider.trim().length > 0 && isJsonObject(value.values) && onlyKeys(value, ['provider', 'values']); }
+function decodeProviderOptions(value: unknown): ModelProviderOptions {
+  if (!isRecord(value) || typeof value.provider !== 'string' || value.provider.trim().length === 0 || !onlyKeys(value, ['provider', 'values'])) throw new Error('providerOptions is invalid.');
+  return Object.freeze({ provider: value.provider, values: parseJsonObject(value.values, MODEL_JSON_LIMITS) });
+}
 function validSummary(value: unknown): boolean { return value === undefined || value === 'auto' || value === 'concise' || value === 'detailed'; }
 function onlyKeys(value: Record<string, unknown>, keys: string[]): boolean { const allowed = new Set(keys); return Object.keys(value).every((key) => allowed.has(key)); }
 function isAbortSignal(value: unknown): value is AbortSignal { return isRecord(value) && typeof value.aborted === 'boolean' && typeof value.addEventListener === 'function'; }
-function ownedModelRequest(value: Record<string, unknown>): ModelRequest {
-  const messages = (value.messages as unknown[]).map((raw) => {
-    const message = raw as Record<string, unknown>;
-    const common = { role: message.role, content: message.content, ...(typeof message.name === 'string' ? { name: message.name } : {}) };
-    if (message.role === 'system') return Object.freeze(common) as ModelRequest['messages'][number];
-    if (message.role === 'user') return Object.freeze({ ...common, ...(Array.isArray(message.images) ? { images: ownedImages(message.images) } : {}) }) as ModelRequest['messages'][number];
-    if (message.role === 'assistant') return Object.freeze({
-      ...common, ...(typeof message.reasoning === 'string' ? { reasoning: message.reasoning } : {}),
-      ...(Array.isArray(message.toolCalls) ? { toolCalls: Object.freeze(message.toolCalls.map(parseModelToolCall)) } : {})
-    }) as ModelRequest['messages'][number];
-    return Object.freeze({
-      ...common, toolName: message.toolName, toolCallType: message.toolCallType,
-      ...(typeof message.toolCallId === 'string' ? { toolCallId: message.toolCallId } : {}),
-      ...(Array.isArray(message.images) ? { images: ownedImages(message.images) } : {})
-    }) as ModelRequest['messages'][number];
-  });
-  const output: Record<string, unknown> = { ...value, messages: Object.freeze(messages) };
-  if (value.metadata !== undefined) output.metadata = parseJsonObject(value.metadata);
-  if (isRecord(value.providerOptions)) output.providerOptions = Object.freeze({ provider: value.providerOptions.provider, values: parseJsonObject(value.providerOptions.values) });
-  if (isRecord(value.responseFormat) && value.responseFormat.type === 'json_schema') output.responseFormat = Object.freeze({ type: 'json_schema', schema: parseJsonObject(value.responseFormat.schema) });
-  if (Array.isArray(value.tools)) output.tools = Object.freeze(value.tools.map((tool) => parseJsonValue(tool) as unknown));
-  if (value.reasoning !== undefined) output.reasoning = parseJsonObject(value.reasoning);
-  return Object.freeze(output) as unknown as ModelRequest;
-}
-function ownedModelProfile(value: Record<string, unknown>): ModelProfile {
-  const capabilities = value.capabilities as Record<string, unknown>;
-  const modalities = value.modalities as Record<string, unknown>;
-  const limits = value.limits as Record<string, unknown>;
-  return Object.freeze({
-    id: value.id as string, provider: value.provider as string,
-    ...(typeof value.displayName === 'string' ? { displayName: value.displayName } : {}),
-    capabilities: parseJsonObject({
-      streaming: capabilities.streaming, toolCalling: capabilities.toolCalling,
-      supportedToolInputs: capabilities.supportedToolInputs, jsonMode: capabilities.jsonMode, jsonSchema: capabilities.jsonSchema,
-      logprobs: capabilities.logprobs, temperature: capabilities.temperature, topP: capabilities.topP,
-      ...(capabilities.reasoning === undefined ? {} : { reasoning: capabilities.reasoning })
-    }) as unknown as ModelProfile['capabilities'],
-    modalities: Object.freeze({ input: Object.freeze([...(modalities.input as string[])]), output: Object.freeze([...(modalities.output as string[])]) }),
-    limits: parseJsonObject(Object.fromEntries(Object.entries(limits).filter(([, item]) => item !== undefined))),
-    supportedParameters: Object.freeze([...(value.supportedParameters as string[])]),
-    ...(value.pricing === undefined ? {} : { pricing: parseJsonObject(value.pricing) as unknown as NonNullable<ModelProfile['pricing']> }),
-    ...(value.metadata === undefined ? {} : { metadata: parseJsonObject(value.metadata) })
-  }) as unknown as ModelProfile;
-}
-function ownedImages(images: unknown[]): ModelRequest['messages'][number] extends { images?: infer T } ? T : never {
-  return Object.freeze(images.map((raw) => {
-    const image = raw as Record<string, unknown>;
-    return Object.freeze({
-      type: image.type, data: image.type === 'bytes' ? new Uint8Array(image.data as Uint8Array) : image.data,
-      mediaType: image.mediaType, ...(image.detail === undefined ? {} : { detail: image.detail })
-    });
-  })) as never;
-}
-function validStringMetadata(value: unknown): boolean {
-  try { return Object.entries(parseJsonObject(value)).every(([, item]) => typeof item === 'string'); }
-  catch { return false; }
+function decodeStringMetadata(value: unknown): Readonly<Record<string, string>> {
+  const parsed = parseJsonObject(value, MODEL_JSON_LIMITS);
+  const output: Record<string, string> = {};
+  for (const [key, item] of Object.entries(parsed)) {
+    if (typeof item !== 'string') throw new Error('metadata must contain string values.');
+    output[key] = item;
+  }
+  return Object.freeze(output);
 }
 function isModelTerminationReason(value: unknown): value is ModelTerminationReason {
   return value === 'stop' || value === 'tool_calls' || value === 'output_limit' || value === 'content_filter' || value === 'unknown';
@@ -459,18 +545,12 @@ function isModelToolInputSupport(value: unknown): value is ModelProfile['capabil
   if (value.kind === 'json' || value.kind === 'text') return onlyKeys(value, ['kind']);
   return value.kind === 'grammar' && typeof value.syntax === 'string' && value.syntax.length > 0 && onlyKeys(value, ['kind', 'syntax']);
 }
-function optionalRaw(value: Record<string, unknown>): { raw?: unknown } { return Object.hasOwn(value, 'raw') ? { raw: ownedOpaque(value.raw) } : {}; }
+function optionalRaw(value: Record<string, unknown>): { raw?: JsonValue } { return Object.hasOwn(value, 'raw') ? { raw: ownedOpaque(value.raw) } : {}; }
 function finiteInRange(value: unknown, minimum: number, maximum: number): boolean { return typeof value === 'number' && Number.isFinite(value) && value >= minimum && value <= maximum; }
 function nonnegativeInteger(value: unknown): value is number { return typeof value === 'number' && Number.isInteger(value) && value >= 0; }
 function positiveFinite(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value) && value > 0; }
 const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 const MODEL_PARAMETERS = new Set(['temperature', 'topP', 'maxOutputTokens', 'responseFormat', 'tools', 'keepAlive', 'reasoning', 'logprobs', 'topLogprobs', 'metadata', 'providerOptions']);
-function isJsonObject(value: unknown): value is import('./index.js').ModelProviderStateObject {
-  try {
-    parseJsonObject(value, MODEL_JSON_LIMITS);
-    return true;
-  } catch { return false; }
-}
 function stringArray(value: unknown): value is string[] { return Array.isArray(value) && value.every((item) => typeof item === 'string'); }
 function positiveInteger(value: unknown): value is number { return typeof value === 'number' && Number.isInteger(value) && value > 0; }
 function nonnegativeFinite(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value) && value >= 0; }

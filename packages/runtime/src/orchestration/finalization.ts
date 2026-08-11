@@ -1,7 +1,7 @@
 import type { EventRepository } from '@agent-core/evidence';
 import {
   AgentContractError,
-  parseAgentTerminalSnapshot,
+  createAgentTerminalSnapshot,
   terminalSnapshotFingerprint,
   type AgentDeliveryDiagnostic,
   type AgentEndedRunResult,
@@ -28,7 +28,7 @@ export class AgentRunFinalizer {
     terminalInput: AgentTerminalSnapshot,
     diagnostic?: Extract<AgentEvent, { type: 'run.ended' }>['diagnostic']
   ): Promise<AgentEndedRunResult> {
-    const terminal = parseAgentTerminalSnapshot(terminalInput);
+    const terminal = createAgentTerminalSnapshot(terminalInput);
     if (terminal.runId !== this.input.runId || terminal.finalizationId !== this.input.finalizationId) {
       throw new AgentContractError('Finalization identity mismatch.', ['The terminal decision does not belong to this finalizer.']);
     }

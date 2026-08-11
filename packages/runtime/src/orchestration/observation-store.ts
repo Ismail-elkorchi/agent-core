@@ -46,7 +46,7 @@ export interface CommittedToolObservation {
   readonly turnIndex: number;
   readonly call: ToolCall;
   readonly toolName: string;
-  readonly canonicalInput?: unknown;
+  readonly canonicalSnapshot?: JsonValue;
   readonly tool: ToolDefinition | undefined;
   readonly fullObservation: ToolObservation;
   readonly durableObservation: ToolObservation;
@@ -79,7 +79,7 @@ export class ObservationStore {
   async commitToolObservation(input: {
     readonly turnIndex: number;
     readonly call: ToolCall;
-    readonly canonicalInput?: unknown;
+    readonly canonicalSnapshot?: JsonValue;
     readonly tool: ToolDefinition | undefined;
     readonly observation: ToolObservation;
   }): Promise<CommittedToolObservation> {
@@ -115,7 +115,7 @@ export class ObservationStore {
       turnIndex: input.turnIndex,
       call: input.call,
       toolName: input.call.name,
-      ...(input.canonicalInput === undefined ? {} : { canonicalInput: input.canonicalInput }),
+      ...(input.canonicalSnapshot === undefined ? {} : { canonicalSnapshot: input.canonicalSnapshot }),
       tool: input.tool,
       fullObservation: canonical,
       durableObservation,
@@ -128,8 +128,8 @@ export class ObservationStore {
 
   async projectToolObservation(committed: CommittedToolObservation, modelInputModalities: readonly string[] = ['text']): Promise<ToolObservationRecord> {
     const modelObservation = filterToolResultContentForModel(committed.fullObservation, modelInputModalities);
-    const immediateRaw = buildToolObservationPresentation(committed.call, committed.canonicalInput, modelObservation, committed.tool, 'immediate', this.budgets.immediate);
-    const retainedRaw = buildToolObservationPresentation(committed.call, committed.canonicalInput, modelObservation, committed.tool, 'retained', this.budgets.retained);
+    const immediateRaw = buildToolObservationPresentation(committed.call, committed.canonicalSnapshot, modelObservation, committed.tool, 'immediate', this.budgets.immediate);
+    const retainedRaw = buildToolObservationPresentation(committed.call, committed.canonicalSnapshot, modelObservation, committed.tool, 'retained', this.budgets.retained);
     const immediatePresentation = this.fitPresentation(redactToolObservationPresentation(immediateRaw), this.budgets.immediate, committed.canonicalArtifact);
     const retainedPresentation = this.fitPresentation(redactToolObservationPresentation(retainedRaw), this.budgets.retained, committed.canonicalArtifact);
     const immediateImages = await this.loadObservationImages(modelObservation);
@@ -156,11 +156,8 @@ export class ObservationStore {
   get(id: string): ToolObservationRecord | undefined { return this.records.get(id); }
 
   private fitPresentation(presentation: ToolObservationPresentation, maxTokens: number, artifact?: ArtifactRef): ToolObservationPresentation {
-    const validated = validateToolObservationPresentation(presentation);
-    if (!validated.ok) return invalidPresenterPresentation('unknown', validated.issues);
-    const safe = clonePresentation(validated.presentation);
-    if (this.estimator.estimateText(serializeToolObservationPresentation(safe)) <= maxTokens) return safe;
-    return truncatePresentation(safe, maxTokens, this.estimator, artifact);
+    if (this.estimator.estimateText(serializeToolObservationPresentation(presentation)) <= maxTokens) return presentation;
+    return truncatePresentation(presentation, maxTokens, this.estimator, artifact);
   }
 
   private async loadObservationImages(observation: ToolObservation): Promise<readonly ModelImage[]> {
@@ -271,7 +268,7 @@ function preserveImportantResultFields(output: unknown, artifact: ArtifactRef | 
 }
 
 function truncatePresentation(presentation: ToolObservationPresentation, maxTokens: number, estimator: TokenEstimator, artifact?: ArtifactRef): ToolObservationPresentation {
-  const compacted: ToolObservationPresentation = {
+  const compacted: { -readonly [K in keyof ToolObservationPresentation]: ToolObservationPresentation[K] } = {
     ok: presentation.ok,
     title: unicodePrefix(presentation.title, 128),
     summary: unicodePrefix(presentation.summary, 512),
@@ -300,9 +297,9 @@ export function serializeToolObservationPresentation(presentation: ToolObservati
 function serializeObservation(observation: ToolObservation): string { return JSON.stringify(observation); }
 function byteLength(value: string): number { return new TextEncoder().encode(value).byteLength; }
 
-function buildToolObservationPresentation(toolCall: ToolCall, canonicalInput: unknown, observation: ToolObservation, tool: ToolDefinition | undefined, mode: 'immediate' | 'retained', maxTokens: number): ToolObservationPresentation {
+function buildToolObservationPresentation(toolCall: ToolCall, canonicalSnapshot: JsonValue | undefined, observation: ToolObservation, tool: ToolDefinition | undefined, mode: 'immediate' | 'retained', maxTokens: number): ToolObservationPresentation {
   const raw: unknown = tool?.presentObservation
-    ? tool.presentObservation({ call: toolCall, input: canonicalInput, observation, mode, maxTokens })
+    ? tool.presentObservation({ call: toolCall, input: canonicalSnapshot, observation, mode, maxTokens })
     : fallbackToolObservationPresentation(toolCall, observation);
   const validated = validateToolObservationPresentation(raw);
   return validated.ok ? validated.presentation : invalidPresenterPresentation(toolCall.name, validated.issues);
@@ -329,6 +326,5 @@ function redactToolObservationPresentation(presentation: ToolObservationPresenta
 }
 
 function toJsonObject(value: unknown): JsonObject { const json = parseJsonValue(value); return isJsonObject(json) ? json : { value: json }; }
-function clonePresentation(value: ToolObservationPresentation): ToolObservationPresentation { const cloned = validateToolObservationPresentation(parseJsonValue(value)); if (!cloned.ok) throw new Error('Validated tool observation presentation could not be cloned.'); return cloned.presentation; }
 function isJsonObject(value: JsonValue | undefined): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 export function sha256ToolObservationPresentation(presentation: ToolObservationPresentation): string { return createHash('sha256').update(serializeToolObservationPresentation(presentation)).digest('hex'); }

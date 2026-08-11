@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
-import { defineTool, invokePreparedToolCall, parseToolObservation, prepareToolCall, ResourceLeaseCoordinator, validateToolDefinition } from '@agent-core/tools';
+import { adoptToolDefinition, defineTool, invokePreparedToolCall, parseToolObservation, prepareToolCall, ResourceLeaseCoordinator } from '@agent-core/tools';
 import { scheduleToolCalls } from '@agent-core/runtime';
 import {
   applyPatchTool,
@@ -169,7 +169,7 @@ test('one observation parser validates complete results, failures, artifacts, an
   assert.equal(outputGetterCalls, 0);
 });
 
-test('tool registration snapshots mutable consumer definition contracts', () => {
+test('dynamic tool adoption snapshots mutable consumer definition contracts', () => {
   const accesses = [{ mode: 'read', scope: 'workspace/files' }];
   const requirements = ['workspaceRoot'];
   const definition = defineTool({
@@ -177,7 +177,7 @@ test('tool registration snapshots mutable consumer definition contracts', () => 
     effectEnvelope: { accesses, lockScopes: [] }, canonicalizeInput: (input) => input, deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'workspace/files' }], lockScopes: [], idempotency: 'pure' }),
     invoke: async () => ({ kind: 'result', ok: true, summary: 'ok', scope: { resources: [], coverage: 'complete' }, output: {} })
   });
-  const registered = validateToolDefinition(definition);
+  const registered = adoptToolDefinition(definition);
   accesses[0].mode = 'write'; requirements[0] = 'processManager';
   assert.equal(registered.effectEnvelope.accesses[0].mode, 'read');
   assert.deepEqual(registered.requirements.services, ['workspaceRoot']);
@@ -187,10 +187,10 @@ test('tool registration snapshots mutable consumer definition contracts', () => 
 test('every effect and observation resource scope uses the strict canonical scope grammar', async () => {
   const malformedScopes = ['workspace/files//a', 'workspace/files/./a', 'workspace/files/../a', 'workspace\\files\\a', 'workspace/files/a/'];
   for (const scope of malformedScopes) {
-    assert.throws(() => validateToolDefinition({
+    assert.throws(() => adoptToolDefinition({
       name: 'bad_scope', implementationId: 'tests/bad-scope@1', description: 'bad', jsonSchema: { type: 'object' }, outputSchema: z.strictObject({}),
       effectEnvelope: { accesses: [{ mode: 'read', scope }], lockScopes: [] }, decodeInput() { return { ok: true, input: {} }; },
-      canonicalizeInput(input) { return input; }, deriveEffects() { return { accesses: [], lockScopes: [], idempotency: 'pure' }; },
+      canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return { accesses: [], lockScopes: [], idempotency: 'pure' }; },
       async invoke() { return { kind: 'result', ok: true, summary: 'bad', scope: { resources: [], coverage: 'complete' }, output: {} }; }
     }), /scope/iu, scope);
   }
@@ -206,13 +206,13 @@ test('every effect and observation resource scope uses the strict canonical scop
   assert.throws(() => parseToolObservation(duplicate, { kind: 'result', ok: true, summary: 'bad scope', scope: { resources: ['workspace/files//a'], coverage: 'complete' }, output: {} }), /scope/iu);
 });
 
-test('canonical input, effects, fingerprint, and invocation share one frozen owned JSON snapshot', async () => {
+test('authoritative canonicalization owns input before effects, fingerprinting, and invocation', async () => {
   const callerOwned = { path: 'before.txt', nested: { value: 1 } };
   let invoked;
   const tool = defineTool({
     name: 'owned_input', implementationId: 'tests/owned-input@1', description: 'owned', schema: z.strictObject({}), outputSchema: z.strictObject({ path: z.string(), value: z.number() }),
     effectEnvelope: { accesses: [{ mode: 'read', scope: 'workspace/files' }], lockScopes: [] },
-    canonicalizeInput() { return callerOwned; },
+    canonicalizeInput() { return Object.freeze({ path: callerOwned.path, nested: Object.freeze({ value: callerOwned.nested.value }) }); },
     deriveEffects(input) { return { accesses: [{ mode: 'read', scope: `workspace/files/${input.path}` }], lockScopes: [], idempotency: 'pure' }; },
     async invoke(input) { invoked = input; return { kind: 'result', ok: true, summary: 'owned', scope: { resources: [`workspace/files/${input.path}`], coverage: 'complete' }, output: { path: input.path, value: input.nested.value } }; }
   });

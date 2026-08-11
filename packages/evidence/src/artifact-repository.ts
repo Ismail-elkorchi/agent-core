@@ -1,16 +1,16 @@
 import { createHash } from 'node:crypto';
 import { normalizeJsonSafe } from '@agent-core/json';
 
-interface ArtifactRefBase {
+type ArtifactRefBase = Readonly<{
   readonly artifactId: string;
   readonly sha256: string;
   readonly size: number;
   readonly mediaType: string;
   readonly label?: string;
   readonly description?: string;
-}
-export interface PublicArtifactRef extends ArtifactRefBase { readonly visibility: 'public' }
-export interface ProtectedArtifactRef extends ArtifactRefBase { readonly visibility: 'protected' }
+}>;
+export type PublicArtifactRef = ArtifactRefBase & Readonly<{ readonly visibility: 'public' }>;
+export type ProtectedArtifactRef = ArtifactRefBase & Readonly<{ readonly visibility: 'protected' }>;
 export type ArtifactRef = PublicArtifactRef | ProtectedArtifactRef;
 
 export interface ArtifactStoreInput {

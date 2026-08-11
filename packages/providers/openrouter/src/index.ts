@@ -23,6 +23,7 @@ import {
   parseModelRequest,
   parseModelResponse
 } from '@agent-core/model';
+import { normalizeJsonSafe, parseJsonObject, type JsonObject } from '@agent-core/json';
 
 export interface OpenRouterProviderOptions {
   apiKey?: string;
@@ -247,39 +248,38 @@ export class OpenRouterProvider implements ModelProvider {
         const contentDelta = contentFromWire(delta?.content);
         if (contentDelta.length > 0) {
           content += contentDelta;
-          yield { type: 'content', content: contentDelta, accumulated: content, raw: part };
+          yield { type: 'content', content: contentDelta, accumulated: content, raw: normalizeJsonSafe(part).value };
         }
 
         const reasoningDelta = reasoningFromWire(delta);
         if (reasoningDelta.length > 0) {
           reasoning += reasoningDelta;
-          yield { type: 'reasoning', reasoning: reasoningDelta, accumulatedReasoning: reasoning, raw: part };
+          yield { type: 'reasoning', reasoning: reasoningDelta, accumulatedReasoning: reasoning, raw: normalizeJsonSafe(part).value };
         }
 
         for (const toolCall of mergeStreamingToolCalls(toolCallParts, delta?.tool_calls ?? [])) {
           const key = JSON.stringify(toolCall);
           if (!toolCalls.some((existing) => JSON.stringify(existing) === key)) {
             toolCalls.push(toolCall);
-            yield { type: 'tool_call', toolCall, raw: part };
+            yield { type: 'tool_call', toolCall, raw: normalizeJsonSafe(part).value };
           }
         }
       }
 
       const finalToolCalls = Array.from(toolCallParts.values()).map((item) => accumulatorToToolCall(this.id, item));
       const responseToolCalls = dedupeToolCalls([...toolCalls, ...finalToolCalls]);
-      const responsePayload: ModelResponse = {
+      yield { type: 'done', response: parseOpenRouterModelResponse({
         content,
         model: actualModel,
         provider: this.id,
         terminationReason: normalizeOpenRouterTermination(this.id, providerTerminationReason, responseToolCalls.length > 0),
         ...(providerTerminationReason ? { providerTerminationReason: providerTerminationReason } : {}),
-        raw: lastRaw
-      };
-      if (responseId) responsePayload.requestId = responseId;
-      if (usage) responsePayload.usage = usage;
-      if (reasoning) responsePayload.reasoning = reasoning;
-      if (responseToolCalls.length > 0) responsePayload.toolCalls = responseToolCalls;
-      yield { type: 'done', response: parseOpenRouterModelResponse(responsePayload) };
+        ...(responseId ? { requestId: responseId } : {}),
+        ...(usage ? { usage } : {}),
+        ...(reasoning ? { reasoning } : {}),
+        ...(responseToolCalls.length > 0 ? { toolCalls: responseToolCalls } : {}),
+        ...(lastRaw === undefined ? {} : { raw: normalizeJsonSafe(lastRaw).value })
+      }) };
     } catch (error) {
       throw normalizeError(this.id, error);
     }
@@ -430,7 +430,7 @@ function contentForOpenRouterMessage(message: ModelMessage): unknown {
   return message.content;
 }
 
-function toOpenRouterContentParts(content: string, images: ModelImage[]): Record<string, unknown>[] {
+function toOpenRouterContentParts(content: string, images: readonly ModelImage[]): Record<string, unknown>[] {
   return [
     ...(content.length > 0 ? [{ type: 'text', text: content }] : []),
     ...images.map((image) => ({
@@ -529,7 +529,9 @@ function toModelResponse(provider: string, request: ModelRequest, payload: OpenR
   }
   const content = contentFromWire(message.content);
   const toolCalls = normalizeToolCalls(provider, message.tool_calls ?? []);
-  const response: ModelResponse = {
+  const usage = normalizeUsage(payload.usage);
+  const reasoning = reasoningFromWire(message);
+  return parseOpenRouterModelResponse({
     content,
     model: payload.model ?? request.model,
     provider,
@@ -539,15 +541,12 @@ function toModelResponse(provider: string, request: ModelRequest, payload: OpenR
       toolCalls.length > 0
     ),
     ...(choice.finish_reason ? { providerTerminationReason: choice.finish_reason } : {}),
-    raw: payload
-  };
-  if (payload.id) response.requestId = payload.id;
-  const usage = normalizeUsage(payload.usage);
-  if (usage) response.usage = usage;
-  const reasoning = reasoningFromWire(message);
-  if (reasoning) response.reasoning = reasoning;
-  if (toolCalls.length > 0) response.toolCalls = toolCalls;
-  return parseOpenRouterModelResponse(response);
+    ...(payload.id ? { requestId: payload.id } : {}),
+    ...(usage ? { usage } : {}),
+    ...(reasoning ? { reasoning } : {}),
+    ...(toolCalls.length > 0 ? { toolCalls } : {}),
+    raw: normalizeJsonSafe(payload).value
+  });
 }
 
 function normalizeOpenRouterTermination(
@@ -620,18 +619,15 @@ function wireToolCallToModelToolCall(provider: string, toolCall: OpenRouterWireT
   };
 }
 
-function parseToolArguments(provider: string, value: string | Record<string, unknown> | undefined): Record<string, unknown> {
+function parseToolArguments(provider: string, value: string | Record<string, unknown> | undefined): JsonObject {
   if (value === undefined || value === '') {
-    return {};
+    return Object.freeze({});
   }
   if (typeof value !== 'string') {
-    return value;
+    return parseJsonObject(value);
   }
   try {
-    const parsed: unknown = JSON.parse(value);
-    if (isJsonObject(parsed)) {
-      return parsed;
-    }
+    return parseJsonObject(JSON.parse(value));
   } catch (error) {
     throw new ModelProviderError({
       provider,
@@ -682,7 +678,7 @@ function tryAccumulatorToToolCall(item: StreamingToolCallAccumulator): ModelTool
       ...(item.id ? { id: item.id } : {}),
       type: 'function',
       name: item.name,
-      input: { kind: 'json', value: parsed }
+      input: { kind: 'json', value: parseJsonObject(parsed) }
     };
   } catch {
     return undefined;
@@ -807,7 +803,7 @@ function modelRecordToProfile(record: OpenRouterModelRecord): ModelProfile {
     },
     supportedParameters,
     ...(pricing ? { pricing } : {}),
-    metadata: modelMetadata(record)
+    metadata: parseJsonObject(modelMetadata(record))
   };
 }
 
@@ -837,7 +833,7 @@ function normalizePricing(pricing: OpenRouterModelRecord['pricing']): ModelPrici
   if (!pricing) {
     return undefined;
   }
-  const rates: ModelPricing['rates'] = {};
+  const rates: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number } = {};
   const input = pricePerMillion(pricing.prompt);
   const output = pricePerMillion(pricing.completion);
   const cacheRead = pricePerMillion(pricing.input_cache_read);
@@ -846,8 +842,8 @@ function normalizePricing(pricing: OpenRouterModelRecord['pricing']): ModelPrici
   if (output !== undefined) rates.output = output;
   if (cacheRead !== undefined) rates.cacheRead = cacheRead;
   if (cacheWrite !== undefined) rates.cacheWrite = cacheWrite;
-  const metadata = Object.fromEntries(Object.entries(pricing).filter(([key]) => !['prompt', 'completion', 'input_cache_read', 'input_cache_write'].includes(key)));
-  return Object.keys(rates).length > 0 || Object.keys(metadata).length > 0 ? { currency: 'USD', rates, ...(Object.keys(metadata).length > 0 ? { metadata } : {}) } : undefined;
+  const metadata = Object.fromEntries(Object.entries(pricing).filter(([key, value]) => value !== undefined && !['prompt', 'completion', 'input_cache_read', 'input_cache_write'].includes(key)));
+  return Object.keys(rates).length > 0 || Object.keys(metadata).length > 0 ? { currency: 'USD', rates, ...(Object.keys(metadata).length > 0 ? { metadata: parseJsonObject(metadata) } : {}) } : undefined;
 }
 
 function pricePerMillion(value: string | number | null | undefined): number | undefined {

@@ -8,7 +8,7 @@ import type {
   AgentTurnIdentity
 } from '../run/contracts.js';
 
-export interface SessionHeader {
+export type SessionHeader = Readonly<{
   readonly type: 'session';
   readonly version: 1;
   readonly id: string;
@@ -17,7 +17,7 @@ export interface SessionHeader {
   readonly parentSessionId?: string;
   readonly provider?: string;
   readonly model?: string;
-}
+}>;
 
 export interface AgentSession {
   readonly id: string;
@@ -25,26 +25,26 @@ export interface AgentSession {
   readonly leafId: string | null;
 }
 
-export interface BaseSessionEntry {
+export type BaseSessionEntry = Readonly<{
   readonly id: string;
   readonly parentId: string | null;
   readonly timestamp: string;
-}
+}>;
 
-export interface SessionInputEntry extends BaseSessionEntry {
+export type SessionInputEntry = BaseSessionEntry & Readonly<{
   readonly type: 'input';
   readonly runId: string;
   readonly task: string;
   readonly instructions: readonly AgentEffectiveInstruction[];
-}
+}>;
 
-export interface SessionToolCallEntry extends BaseSessionEntry, AgentToolCallIdentity {
+export type SessionToolCallEntry = BaseSessionEntry & AgentToolCallIdentity & Readonly<{
   readonly type: 'tool_call';
   readonly runId: string;
   readonly call: JsonValue;
-}
+}>;
 
-export interface SessionObservationEntry extends BaseSessionEntry, AgentTurnIdentity {
+export type SessionObservationEntry = BaseSessionEntry & AgentTurnIdentity & Readonly<{
   readonly type: 'observation';
   readonly runId: string;
   readonly toolBatchId?: string;
@@ -57,40 +57,40 @@ export interface SessionObservationEntry extends BaseSessionEntry, AgentTurnIden
   readonly output?: JsonValue;
   readonly artifacts?: readonly ArtifactRef[];
   readonly metadata?: JsonObject;
-}
+}>;
 
-export interface SessionBranchMarkerEntry extends BaseSessionEntry {
+export type SessionBranchMarkerEntry = BaseSessionEntry & Readonly<{
   readonly type: 'branch';
   readonly fromEntryId: string;
   readonly label?: string;
-}
+}>;
 
-export interface SessionModelSettingsEntry extends BaseSessionEntry {
+export type SessionModelSettingsEntry = BaseSessionEntry & Readonly<{
   readonly type: 'model_settings';
   readonly provider: string;
   readonly model: string;
   readonly temperature?: number;
   readonly reasoningEffort?: string;
-}
+}>;
 
-export interface SessionFinalProjection {
+export type SessionFinalProjection = Readonly<{
   readonly type: 'final';
   readonly id: string;
   readonly timestamp: string;
   readonly runId: string;
   readonly finalizationId: string;
   readonly terminal: AgentTerminalSnapshot;
-}
+}>;
 
-export interface SessionTurnDigest {
+export type SessionTurnDigest = Readonly<{
   readonly runId: string;
   readonly finalizationId: string;
   readonly task: string;
   readonly status: string;
   readonly result?: string;
-}
+}>;
 
-export interface SessionContextProjection {
+export type SessionContextProjection = Readonly<{
   readonly type: 'context';
   readonly id: string;
   readonly timestamp: string;
@@ -98,7 +98,7 @@ export interface SessionContextProjection {
   readonly throughFinalizationId: string;
   readonly historyDigest: string;
   readonly recentTurns: readonly SessionTurnDigest[];
-}
+}>;
 
 export type SessionBranchEntry = SessionInputEntry | SessionToolCallEntry | SessionObservationEntry | SessionBranchMarkerEntry | SessionModelSettingsEntry;
 export type SessionRecord = SessionHeader | SessionBranchEntry | SessionFinalProjection | SessionContextProjection;

@@ -5,6 +5,7 @@ import {
   type CredentialStore,
   type ProviderAuth
 } from '@agent-core/auth';
+import { normalizeJsonSafe } from '@agent-core/json';
 import {
   assertModelRequestSupported,
   type ModelProvider,
@@ -357,7 +358,7 @@ class OpenAICodexProviderSession implements ModelProviderSession {
       const contentDelta = stringValue(part.delta);
       if (eventType === 'response.output_text.delta' && contentDelta.length > 0) {
         content += contentDelta;
-        yield { type: 'content', content: contentDelta, accumulated: content, raw: part };
+        yield { type: 'content', content: contentDelta, accumulated: content, raw: normalizeJsonSafe(part).value };
         continue;
       }
 
@@ -365,10 +366,10 @@ class OpenAICodexProviderSession implements ModelProviderSession {
       if (reasoningChannel && contentDelta.length > 0) {
         if (reasoningChannel === 'summary') {
           reasoningSummary += contentDelta;
-          yield { type: 'reasoning', reasoning: contentDelta, accumulatedReasoning: reasoningSummary, channel: 'summary', raw: part };
+          yield { type: 'reasoning', reasoning: contentDelta, accumulatedReasoning: reasoningSummary, channel: 'summary', raw: normalizeJsonSafe(part).value };
         } else {
           reasoning += contentDelta;
-          yield { type: 'reasoning', reasoning: contentDelta, accumulatedReasoning: reasoning, channel: 'reasoning', raw: part };
+          yield { type: 'reasoning', reasoning: contentDelta, accumulatedReasoning: reasoning, channel: 'reasoning', raw: normalizeJsonSafe(part).value };
         }
         continue;
       }
@@ -377,7 +378,7 @@ class OpenAICodexProviderSession implements ModelProviderSession {
       if (eventType === 'response.output_item.done' && toolCall) {
         const deduped = addUniqueToolCall(toolCalls, toolCall);
         if (deduped) {
-          yield { type: 'tool_call', toolCall, raw: part };
+          yield { type: 'tool_call', toolCall, raw: normalizeJsonSafe(part).value };
         }
         continue;
       }
@@ -385,14 +386,14 @@ class OpenAICodexProviderSession implements ModelProviderSession {
       for (const streamedToolCall of mergeStreamingFunctionCallParts(accumulators, part)) {
         const deduped = addUniqueToolCall(toolCalls, streamedToolCall);
         if (deduped) {
-          yield { type: 'tool_call', toolCall: streamedToolCall, raw: part };
+          yield { type: 'tool_call', toolCall: streamedToolCall, raw: normalizeJsonSafe(part).value };
         }
       }
 
       for (const streamedToolCall of mergeStreamingCustomToolCallParts(customAccumulators, part)) {
         const deduped = addUniqueToolCall(toolCalls, streamedToolCall);
         if (deduped) {
-          yield { type: 'tool_call', toolCall: streamedToolCall, raw: part };
+          yield { type: 'tool_call', toolCall: streamedToolCall, raw: normalizeJsonSafe(part).value };
         }
       }
 

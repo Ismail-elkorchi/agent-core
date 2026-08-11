@@ -5,10 +5,7 @@ export type ToolRisk = 'read' | 'write' | 'execute' | 'network' | 'destructive';
 
 /** `execute` authorizes ambient process execution unless a host explicitly documents isolation. Ambient execution may indirectly exercise every other operating-system authority. */
 
-export interface ToolPolicy {
-  allowedRisks: readonly ToolRisk[];
-  dryRunWrites?: boolean;
-}
+export type ToolPolicy = Readonly<{ readonly allowedRisks: readonly ToolRisk[]; readonly dryRunWrites?: boolean }>;
 
 export const READ_ONLY_TOOL_POLICY: ToolPolicy = parseToolPolicy({ allowedRisks: ['read'] });
 

@@ -9,6 +9,7 @@ import {
   type ProtectedArtifactRef,
   type PublicArtifactRef
 } from '@agent-core/evidence';
+import { validateArtifactRef, validatePublicArtifactRef } from '@agent-core/evidence';
 import { parseJsonObject } from '@agent-core/json';
 import { ResourceLeaseCoordinator } from '@agent-core/tools';
 import type { ToolProgress, ToolResourceLease } from '@agent-core/tools';
@@ -903,12 +904,77 @@ function parseLedgerEntry(value: unknown): ProcessLedgerEntry {
     || typeof owned.supervisorEndpoint !== 'string' || owned.supervisorEndpoint.length === 0
     || typeof owned.startedAt !== 'string' || typeof owned.workspace !== 'string'
     || (owned.state !== 'running' && owned.state !== 'terminal') || typeof owned.terminalReported !== 'boolean') throw new Error('Invalid process ledger record.');
-  const owner = owned.owner;
-  if (typeof owner !== 'object' || owner === null || Array.isArray(owner)
-    || typeof owner.runId !== 'string' || typeof owner.turnId !== 'string' || typeof owner.toolBatchId !== 'string'
-    || typeof owner.callIndex !== 'number' || !Number.isSafeInteger(owner.callIndex) || owner.callIndex < 0) throw new Error('Invalid process ledger owner.');
-  return owned as unknown as ProcessLedgerEntry;
+  const owner = decodeProcessOwner(owned.owner);
+  const terminal = owned.terminal === undefined ? undefined : decodeProcessPollResult(owned.terminal);
+  let protectedArtifact: ProtectedArtifactRef | undefined;
+  if (owned.protectedArtifact !== undefined) {
+    validateArtifactRef(owned.protectedArtifact);
+    if (owned.protectedArtifact.visibility !== 'protected') throw new Error('Invalid protected process artifact.');
+    protectedArtifact = owned.protectedArtifact;
+  }
+  return Object.freeze({
+    schemaVersion: 1,
+    processId: owned.processId,
+    supervisorPid: owned.supervisorPid,
+    supervisorIdentity: owned.supervisorIdentity,
+    supervisorEndpoint: owned.supervisorEndpoint,
+    owner,
+    startedAt: owned.startedAt,
+    workspace: owned.workspace,
+    state: owned.state,
+    terminalReported: owned.terminalReported,
+    ...(terminal ? { terminal } : {}),
+    ...(protectedArtifact ? { protectedArtifact } : {})
+  });
 }
+function decodeProcessOwner(value: import('@agent-core/json').JsonValue | undefined): ProcessOwner {
+  const record = jsonRecord(value, 'process ledger owner');
+  if (typeof record.runId !== 'string' || typeof record.turnId !== 'string' || typeof record.toolBatchId !== 'string'
+    || typeof record.callIndex !== 'number' || !Number.isSafeInteger(record.callIndex) || record.callIndex < 0) throw new Error('Invalid process ledger owner.');
+  return Object.freeze({ runId: record.runId, turnId: record.turnId, toolBatchId: record.toolBatchId, callIndex: record.callIndex });
+}
+function decodeProcessOutputView(value: import('@agent-core/json').JsonValue | undefined): ProcessOutputView {
+  const record = jsonRecord(value, 'process output view');
+  if (typeof record.text !== 'string' || !nonnegativeInteger(record.observedBytes) || !nonnegativeInteger(record.capturedBytes)
+    || !nonnegativeInteger(record.omittedBytes) || typeof record.startsAtOutputStart !== 'boolean' || typeof record.endsAtOutputEnd !== 'boolean') throw new Error('Invalid process output view.');
+  return Object.freeze({ text: record.text, observedBytes: record.observedBytes, capturedBytes: record.capturedBytes, omittedBytes: record.omittedBytes,
+    startsAtOutputStart: record.startsAtOutputStart, endsAtOutputEnd: record.endsAtOutputEnd });
+}
+function decodeProcessPollResult(value: import('@agent-core/json').JsonValue): ProcessPollResult {
+  const record = jsonRecord(value, 'process terminal result');
+  if (typeof record.processId !== 'string' || !processStatus(record.status) || !nonnegativeInteger(record.cursorStart) || !nonnegativeInteger(record.cursorEnd)
+    || (record.cursorExpired !== undefined && typeof record.cursorExpired !== 'boolean')
+    || (record.exitCode !== undefined && record.exitCode !== null && (typeof record.exitCode !== 'number' || !Number.isInteger(record.exitCode)))
+    || (record.signal !== undefined && record.signal !== null && typeof record.signal !== 'string')
+    || (record.diagnostic !== undefined && typeof record.diagnostic !== 'string')
+    || (record.progressDroppedEvents !== undefined && !nonnegativeInteger(record.progressDroppedEvents))
+    || (record.progressDeliveryErrors !== undefined && !nonnegativeInteger(record.progressDeliveryErrors))) throw new Error('Invalid process terminal result.');
+  let artifact: PublicArtifactRef | undefined;
+  if (record.artifact !== undefined) { validatePublicArtifactRef(record.artifact); artifact = record.artifact; }
+  return Object.freeze({
+    processId: record.processId,
+    owner: decodeProcessOwner(record.owner),
+    status: record.status,
+    cursorStart: record.cursorStart,
+    cursorEnd: record.cursorEnd,
+    stdout: decodeProcessOutputView(record.stdout),
+    stderr: decodeProcessOutputView(record.stderr),
+    combined: decodeProcessOutputView(record.combined),
+    ...(record.cursorExpired !== undefined ? { cursorExpired: record.cursorExpired } : {}),
+    ...(artifact ? { artifact } : {}),
+    ...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}),
+    ...(record.signal !== undefined ? { signal: record.signal as NodeJS.Signals | null } : {}),
+    ...(typeof record.diagnostic === 'string' ? { diagnostic: record.diagnostic } : {}),
+    ...(typeof record.progressDroppedEvents === 'number' ? { progressDroppedEvents: record.progressDroppedEvents } : {}),
+    ...(typeof record.progressDeliveryErrors === 'number' ? { progressDeliveryErrors: record.progressDeliveryErrors } : {})
+  });
+}
+function jsonRecord(value: import('@agent-core/json').JsonValue | undefined, label: string): import('@agent-core/json').JsonObject {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error(`Invalid ${label}.`);
+  return value as import('@agent-core/json').JsonObject;
+}
+function nonnegativeInteger(value: unknown): value is number { return typeof value === 'number' && Number.isInteger(value) && value >= 0; }
+function processStatus(value: unknown): value is ManagedProcessStatus { return value === 'running' || value === 'exited' || value === 'stopped' || value === 'timed_out' || value === 'failed'; }
 function requirePid(tree: OwnedProcessTree): number { const pid = tree.child.pid; if (pid === undefined || pid <= 0) throw new Error('Process PID is unavailable.'); return pid; }
 function appendDiagnostic(existing: string | undefined, next: string): string { return existing ? `${existing} ${next}` : next; }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }

@@ -1,4 +1,6 @@
 import { promises as fs } from 'node:fs';
+import type { JsonValue } from '@agent-core/json';
+import { canonicalJsonString } from './ledger.js';
 
 const SCAN_CHUNK_BYTES = 64 * 1024;
 
@@ -44,8 +46,8 @@ export async function jsonlCommittedBytes(filePath: string, knownSize?: number):
   return 0;
 }
 
-export async function appendJsonlRecord(filePath: string, record: unknown): Promise<number> {
-  const serialized = `${JSON.stringify(record)}\n`;
+export async function appendJsonlRecord(filePath: string, record: JsonValue): Promise<number> {
+  const serialized = `${canonicalJsonString(record)}\n`;
   const handle = await fs.open(filePath, 'a');
   try {
     await handle.write(serialized, null, 'utf8');

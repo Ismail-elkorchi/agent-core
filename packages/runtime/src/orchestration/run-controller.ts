@@ -1,4 +1,4 @@
-import { stableStringify } from '@agent-core/evidence';
+import { canonicalJsonString } from '@agent-core/evidence';
 import type { ModelPricing, ModelUsage } from '@agent-core/model';
 import {
   createAgentRunMachine,
@@ -98,7 +98,7 @@ export class AgentRunController {
   private restoreToolCallHistory(calls: readonly ToolCall[]): void {
     if (calls.length !== this.state.totalToolCalls) throw new Error(`Recovered tool-call history count ${String(calls.length)} does not match budget total ${String(this.state.totalToolCalls)}.`);
     for (const call of calls) {
-      const fingerprint = `${call.name}:${stableStringify(call.input)}`;
+      const fingerprint = `${call.name}:${canonicalJsonString(call.input)}`;
       this.callCounts.set(fingerprint, (this.callCounts.get(fingerprint) ?? 0) + 1);
     }
     const recoveredMaximum = Math.max(0, ...this.callCounts.values());
@@ -155,7 +155,7 @@ export class AgentRunController {
     let maximum = this.state.repeatedIdenticalToolCalls;
     const nextCounts = new Map(this.callCounts);
     for (const call of calls) {
-      const fingerprint = `${call.name}:${stableStringify(call.input)}`;
+      const fingerprint = `${call.name}:${canonicalJsonString(call.input)}`;
       const count = (nextCounts.get(fingerprint) ?? 0) + 1;
       nextCounts.set(fingerprint, count);
       maximum = Math.max(maximum, count);

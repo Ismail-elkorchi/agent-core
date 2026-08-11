@@ -17,7 +17,7 @@ async function prepared(call, tools, policy, services = {}) {
 }
 
 function request(call, preparedCall, policy, services = {}) {
-  return { call, tool: preparedCall.tool, input: preparedCall.canonicalInput, effects: preparedCall.effects, fingerprint: preparedCall.fingerprint, context: { policy, services, signal, boundary } };
+  return { call, toolImplementationId: preparedCall.toolImplementationId, input: preparedCall.canonicalSnapshot, effects: preparedCall.effects, fingerprint: preparedCall.fingerprint, context: { policy, services, signal, boundary } };
 }
 
 test('a read-only policy denies a writing apply_patch call before approval', async () => {

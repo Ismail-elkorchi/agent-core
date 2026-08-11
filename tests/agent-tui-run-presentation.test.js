@@ -3,11 +3,11 @@ import assert from 'node:assert/strict';
 import { createMemoryTerminalHost } from '@ismail-elkorchi/terminal-ui/host';
 import { runTui } from '@ismail-elkorchi/terminal-ui/tui';
 import { AgentTuiEventSource, createAgentTuiApp } from '@agent-core/tui';
-import { parseAgentTerminalSnapshot } from '@agent-core/runtime';
+import { decodeAgentTerminalSnapshot } from '@agent-core/runtime';
 import { waitFor } from './agent-tui-test-helpers.js';
 
 test('TUI preserves terminal truth and does not duplicate the final answer', async () => {
-  const terminal = parseAgentTerminalSnapshot({
+  const terminal = decodeAgentTerminalSnapshot({
     ...base(),
     verificationStatus: 'failed',
     checkResults: [{ id: 'tests', requirement: 'required', verdict: 'failed', summary: 'Tests failed', durationMs: 4 }]

@@ -1,6 +1,6 @@
 export type JsonPrimitive = string | number | boolean | null;
-export type JsonValue = JsonPrimitive | JsonValue[] | JsonObject;
-export interface JsonObject { [key: string]: JsonValue }
+export type JsonValue = JsonPrimitive | readonly JsonValue[] | JsonObject;
+export interface JsonObject { readonly [key: string]: JsonValue }
 
 export type JsonNormalizationDiagnosticCode =
   | 'access_error'
@@ -18,7 +18,7 @@ export type JsonNormalizationDiagnosticCode =
   | 'total_bytes_truncated'
   | 'unsupported';
 
-export interface JsonNormalizationDiagnostic {
+export interface JsonNormalizationDiagnostic extends JsonObject {
   readonly code: JsonNormalizationDiagnosticCode;
   readonly path: string;
   readonly message: string;
@@ -74,7 +74,7 @@ export function parseJsonValue(input: unknown, requested: Partial<SafeJsonParseL
 export function parseJsonObject(input: unknown, requested: Partial<SafeJsonParseLimits> = {}): JsonObject {
   const value = parseJsonValue(input, requested);
   if (value === null || Array.isArray(value) || typeof value !== 'object') throw new Error('JSON value must be an object.');
-  return value;
+  return value as JsonObject;
 }
 
 export function normalizeJsonSafe(
@@ -93,11 +93,11 @@ export function normalizeJsonSafe(
       path: '$',
       message: `Normalized JSON exceeded ${String(limits.maxTotalBytes)} bytes.`
     });
-    output = {
+    output = Object.freeze({
       truncated: true,
       preview: truncateText(text, Math.max(0, limits.maxTotalBytes - 256)),
       originalBytes: utf8Bytes(text)
-    };
+    });
     text = JSON.stringify(output);
   }
   const truncated = diagnostics.some((diagnostic) => diagnostic.code.includes('truncated') || diagnostic.code === 'circular');
@@ -147,7 +147,7 @@ function copyJson(
         if (!descriptor || !('value' in descriptor)) throw new Error(path + '[' + String(index) + '] must be a data property.');
         output.push(copyJson(descriptor.value, path + '[' + String(index) + ']', depth + 1, limits, state, seen));
       }
-      return Object.freeze(output) as unknown as JsonValue;
+      return Object.freeze(output);
     }
     const prototype: unknown = Object.getPrototypeOf(value);
     if (prototype !== Object.prototype && prototype !== null) throw new Error(path + ' has an unsupported object prototype.');
@@ -268,7 +268,7 @@ function normalizeValueUnsafe(
           diagnostics.push({ code: 'collection_truncated', path, message: `Array was truncated from ${String(length)} entries.` });
           output.push(`[${String(length - selectedLength)} entries omitted]`);
         }
-        return output;
+        return Object.freeze(output);
       }
       const keys = Reflect.ownKeys(value);
       const enumerableKeys: string[] = [];
@@ -290,7 +290,7 @@ function normalizeValueUnsafe(
         diagnostics.push({ code: 'collection_truncated', path, message: `Object was truncated from ${String(enumerableKeys.length)} entries.` });
         defineJsonProperty(output, '__omittedEntries', enumerableKeys.length - selected.length);
       }
-      return output;
+      return Object.freeze(output);
     } finally {
       seen.delete(value);
     }
@@ -342,7 +342,7 @@ function normalizeError(
     if (descriptor?.enumerable !== true) continue;
     defineJsonProperty(output, key, normalizeOwnProperty(error, key, `${path}.${key}`, depth + 1, limits, diagnostics, seen));
   }
-  return output;
+  return Object.freeze(output);
 }
 
 function safeErrorField(error: Error, key: 'name' | 'message' | 'stack'): unknown {
@@ -365,7 +365,7 @@ function defineJsonProperty(object: JsonObject, key: string, value: JsonValue): 
 function nullPrototypeObject(entries: readonly (readonly [string, JsonValue])[]): JsonObject {
   const output = Object.create(null) as JsonObject;
   for (const [key, value] of entries) defineJsonProperty(output, key, value);
-  return output;
+  return Object.freeze(output);
 }
 
 function validateLimits(limits: JsonNormalizationLimits): JsonNormalizationLimits {

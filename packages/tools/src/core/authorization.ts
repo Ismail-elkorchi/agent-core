@@ -1,8 +1,9 @@
-import type { ToolCall, ToolDefinition } from './definition.js';
+import type { ToolCall } from './definition.js';
 import type { ToolPreparationContext } from './context.js';
 import { isRiskAllowed, type ToolRisk } from './policy.js';
 import { validateResourceScope } from './resources.js';
 import { parseJsonObject } from '@agent-core/json';
+import type { JsonObject } from '@agent-core/json';
 
 export type ToolResourceAccessMode = 'read' | 'write' | 'execute' | 'network' | 'delete';
 export type ToolIdempotency = 'pure' | 'idempotent' | 'non_idempotent';
@@ -36,7 +37,7 @@ export type ToolAuthorizationDecision =
 
 export interface ToolAuthorizationRequest {
   readonly call: ToolCall;
-  readonly tool: ToolDefinition;
+  readonly toolImplementationId: string;
   readonly input: unknown;
   readonly effects: ToolEffects;
   readonly fingerprint: string;
@@ -49,7 +50,7 @@ export const POLICY_TOOL_AUTHORIZER: ToolAuthorizer = (request) => {
   const denied = deniedEffectRisks(request.effects, request.context.policy);
   return denied.length === 0
     ? { decision: 'allow', reason: 'Allowed by the configured tool policy.' }
-    : { decision: 'deny', reason: `Tool ${request.tool.name} requires prohibited risk${denied.length === 1 ? '' : 's'}: ${denied.join(', ')}.` };
+    : { decision: 'deny', reason: `Tool ${request.call.name} requires prohibited risk${denied.length === 1 ? '' : 's'}: ${denied.join(', ')}.` };
 };
 
 export function deniedEffectRisks(effects: ToolEffects, policy: import('./policy.js').ToolPolicy): readonly ToolRisk[] {
@@ -60,7 +61,7 @@ export function enforceAllowedEffects(request: ToolAuthorizationRequest): ToolAu
   const denied = deniedEffectRisks(request.effects, request.context.policy);
   return denied.length === 0 ? undefined : {
     decision: 'deny',
-    reason: 'Tool ' + request.tool.name + ' requires prohibited risk' + (denied.length === 1 ? '' : 's') + ': ' + denied.join(', ') + '.'
+    reason: 'Tool ' + request.call.name + ' requires prohibited risk' + (denied.length === 1 ? '' : 's') + ': ' + denied.join(', ') + '.'
   };
 }
 
@@ -71,7 +72,7 @@ export function validateToolEffectEnvelope(value: unknown): ToolEffectEnvelope {
   return Object.freeze({ accesses, lockScopes });
 }
 
-export function validateToolEffects(value: unknown): ToolEffects {
+export function validateToolEffects(value: unknown): ToolEffects & JsonObject {
   const record = parseJsonObject(value, { maxDepth: 8, maxCollectionEntries: 10_000, maxStringBytes: 16_000, maxTotalBytes: 1_000_000 });
   const accesses = validateResourceAccesses(record.accesses, 'effects');
   const lockScopes = validateScopes(record.lockScopes, 'effect lockScopes');
@@ -114,7 +115,7 @@ export function accessRisk(mode: ToolResourceAccessMode): ToolRisk {
 export function scopeContains(parent: string, child: string): boolean {
   return parent === '*' || parent === child || child.startsWith(parent.endsWith('/') ? parent : `${parent}/`);
 }
-function validateResourceAccesses(value: unknown, label: string): readonly ToolResourceAccess[] {
+function validateResourceAccesses(value: unknown, label: string): readonly (ToolResourceAccess & JsonObject)[] {
   if (!Array.isArray(value)) throw new Error(`Tool ${label} accesses must be an array.`);
   const accesses = value.map((item) => {
     if (!isRecord(item) || !isAccessMode(item.mode) || typeof item.scope !== 'string' || item.scope.trim().length === 0) throw new Error(`Tool ${label} contains an invalid resource access.`);

@@ -33,8 +33,8 @@ export async function invokeToolCall(call, tools, context) {
   if (!preparation.ok) return preparation.observation;
   const authorization = await POLICY_TOOL_AUTHORIZER({
     call,
-    tool: preparation.prepared.tool,
-    input: preparation.prepared.canonicalInput,
+    toolImplementationId: preparation.prepared.toolImplementationId,
+    input: preparation.prepared.canonicalSnapshot,
     effects: preparation.prepared.effects,
     fingerprint: preparation.prepared.fingerprint,
     context: preparationContext
@@ -66,7 +66,7 @@ export async function presentToolObservation(tool, call, observation, context, m
   }
   return tool.presentObservation({
     call,
-    input: preparation.prepared.canonicalInput,
+    input: preparation.prepared.canonicalSnapshot,
     observation,
     mode: 'immediate', maxTokens
   });

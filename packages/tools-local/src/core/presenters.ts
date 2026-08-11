@@ -236,7 +236,8 @@ function compactMatch(match: JsonObject, maxTextChars: number): JsonObject {
 function value(value: JsonValue | undefined): JsonValue { return value === undefined ? null : value; }
 function stringField(value: JsonValue | undefined): string { return typeof value === 'string' ? value : ''; }
 function object(value: unknown): JsonObject { const parsed = parseJsonValue(value); return isObject(parsed) ? parsed : {}; }
-function array(value: JsonValue | undefined): JsonValue[] { return Array.isArray(value) ? value : []; }
+function array(value: JsonValue | undefined): readonly JsonValue[] { return isJsonArray(value) ? value : []; }
+function isJsonArray(value: JsonValue | undefined): value is readonly JsonValue[] { return Array.isArray(value); }
 function isObject(value: JsonValue | undefined): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function fits(value: unknown, maxTokens: number): boolean { return jsonBytes(value) <= Math.max(1, maxTokens) * 4; }
 function jsonBytes(value: unknown): number { return Buffer.byteLength(JSON.stringify(value), 'utf8'); }
@@ -250,7 +251,7 @@ function takeTailChars(value: string, count: number): string {
   return characters.length <= count ? value : characters.slice(Math.max(0, characters.length - count)).join('');
 }
 function compare(left: string, right: string): number { return left.localeCompare(right, 'en'); }
-function boundedArray(source: JsonValue[], base: unknown, key: string, maxTokens: number): JsonValue[] {
+function boundedArray(source: readonly JsonValue[], base: unknown, key: string, maxTokens: number): JsonValue[] {
   const selected: JsonValue[] = [];
   const parsedBase = parseJsonValue(base);
   const baseObject = isObject(parsedBase) ? parsedBase : {};
@@ -260,7 +261,7 @@ function boundedArray(source: JsonValue[], base: unknown, key: string, maxTokens
   }
   return selected;
 }
-function compactReadFailures(source: JsonValue[], messageChars: number): JsonValue[] {
+function compactReadFailures(source: readonly JsonValue[], messageChars: number): JsonValue[] {
   return source.filter(isObject).map((failure) => ({
     path: value(failure.path), reason: value(failure.reason),
     message: typeof failure.message === 'string' ? takeChars(failure.message, messageChars) : ''
@@ -268,7 +269,7 @@ function compactReadFailures(source: JsonValue[], messageChars: number): JsonVal
 }
 function compactTransaction(value: JsonValue | undefined, messageChars: number): JsonValue {
   if (!isObject(value)) return null;
-  const output: JsonObject = { outcome: value.outcome ?? null };
+  const output: Record<string, JsonValue> = { outcome: value.outcome ?? null };
   if (isObject(value.failure)) output.failure = compactTransactionDiagnostic(value.failure, messageChars);
   for (const key of ['cleanup', 'rollback']) {
     const recovery = value[key];
@@ -279,7 +280,7 @@ function compactTransaction(value: JsonValue | undefined, messageChars: number):
       diagnostics: array(recovery.diagnostics).filter(isObject).map((item) => compactTransactionDiagnostic(item, messageChars))
     };
   }
-  return output;
+  return Object.freeze(output);
 }
 function compactTransactionDiagnostic(value: JsonObject, messageChars: number): JsonObject {
   return {
@@ -287,6 +288,6 @@ function compactTransactionDiagnostic(value: JsonObject, messageChars: number): 
     message: typeof value.message === 'string' ? takeChars(value.message, messageChars) : ''
   };
 }
-function uniqueStrings(values: JsonValue[]): JsonValue[] {
+function uniqueStrings(values: readonly JsonValue[]): JsonValue[] {
   return [...new Set(values.filter((value): value is string => typeof value === 'string'))].sort(compare);
 }

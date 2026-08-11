@@ -1,12 +1,13 @@
 import type { PublicArtifactRef, ToolEvidenceDelta } from '@agent-core/evidence';
+import type { JsonObject, JsonValue } from '@agent-core/json';
 import type * as z from 'zod';
 import type { ToolExecutionContext, ToolPreparationContext } from './context.js';
 import type { ToolObservationPresentation, ToolObservationPresentationRequest } from './observation-presentation.js';
 import type { ToolPolicy } from './policy.js';
 import type { ToolEffectEnvelope, ToolEffects } from './authorization.js';
 
-export interface ToolCall { id?: string; name: string; input: ToolInput }
-export type ToolInput = { kind: 'json'; value: Record<string, unknown> } | { kind: 'text'; value: string };
+export interface ToolCall { readonly id?: string; readonly name: string; readonly input: ToolInput }
+export type ToolInput = { readonly kind: 'json'; readonly value: JsonObject } | { readonly kind: 'text'; readonly value: string };
 export type ToolTextInputFormat = { type: 'text' } | { type: 'grammar'; syntax: string; definition: string };
 export interface ToolPromptGuideRequest { inputFormat: string; services?: Record<string, unknown>; metadata?: Record<string, unknown> }
 export type ToolPromptGuide = string | ((request: ToolPromptGuideRequest) => string | undefined);
@@ -50,28 +51,29 @@ export type ToolFailureReason = 'unknown_tool' | 'policy' | 'invalid_arguments' 
 export interface BaseToolFailureOutput { blocked: true; reason: ToolFailureReason; recovery: string }
 export interface UnknownToolFailureOutput extends BaseToolFailureOutput { reason: 'unknown_tool'; toolCall: ToolCall }
 export interface PolicyToolFailureOutput extends BaseToolFailureOutput { reason: 'policy'; tool?: string; policyReason?: string; details?: Record<string, unknown> }
-export interface ToolValidationIssue { path: (string | number)[]; code: string; message: string }
-export interface ToolValidationIssues { issues: ToolValidationIssue[] }
+export interface ToolValidationIssue { readonly path: readonly (string | number)[]; readonly code: string; readonly message: string }
+export interface ToolValidationIssues { readonly issues: readonly ToolValidationIssue[] }
 export interface InvalidArgumentsToolFailureOutput extends BaseToolFailureOutput { reason: 'invalid_arguments'; issues?: ToolValidationIssues; details?: Record<string, unknown> }
 export interface InvalidOutputToolFailureOutput extends BaseToolFailureOutput { reason: 'invalid_output'; issues: ToolValidationIssues }
-export interface MissingServiceDetails { expected?: string; actualType?: string }
+export interface MissingServiceDetails { readonly expected?: string; readonly actualType?: string }
 export interface MissingServiceToolFailureOutput extends BaseToolFailureOutput { reason: 'missing_service'; service: string; details?: MissingServiceDetails }
 export interface RuntimeErrorToolFailureOutput extends BaseToolFailureOutput { reason: 'runtime_error'; error: string; details?: Record<string, unknown> }
 export type ToolFailureOutput = UnknownToolFailureOutput | PolicyToolFailureOutput | InvalidArgumentsToolFailureOutput | InvalidOutputToolFailureOutput | MissingServiceToolFailureOutput | RuntimeErrorToolFailureOutput;
 
 export interface ToolDefinition<TDecodedInput = unknown, TCanonicalInput = TDecodedInput, TOutput = unknown> {
-  name: string;
-  implementationId: string;
-  description: string;
-  promptGuide?: ToolPromptGuide;
-  jsonSchema: Record<string, unknown>;
-  outputSchema: z.ZodType<TOutput>;
-  textInput?: ToolTextInputDefinition<TDecodedInput>;
-  effectEnvelope: ToolEffectEnvelope;
-  requirements?: ToolRequirements;
-  isAvailable?: (policy: ToolPolicy) => boolean;
+  readonly name: string;
+  readonly implementationId: string;
+  readonly description: string;
+  readonly promptGuide?: ToolPromptGuide;
+  readonly jsonSchema: JsonObject;
+  readonly outputSchema: z.ZodType<TOutput>;
+  readonly textInput?: ToolTextInputDefinition<TDecodedInput>;
+  readonly effectEnvelope: ToolEffectEnvelope;
+  readonly requirements?: ToolRequirements;
+  readonly isAvailable?: (policy: ToolPolicy) => boolean;
   decodeInput(input: ToolInput): ToolInputParseResult<TDecodedInput>;
   canonicalizeInput(input: TDecodedInput, context: ToolPreparationContext): TCanonicalInput | Promise<TCanonicalInput>;
+  snapshotInput(input: TCanonicalInput): JsonValue;
   deriveEffects(input: TCanonicalInput, context: ToolPreparationContext): ToolEffects | Promise<ToolEffects>;
   invoke(input: TCanonicalInput, context: ToolExecutionContext): Promise<ToolObservation<TOutput>>;
   presentObservation?(request: ToolObservationPresentationRequest<TCanonicalInput, TOutput>): ToolObservationPresentation;

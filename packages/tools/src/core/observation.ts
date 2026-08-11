@@ -19,9 +19,12 @@ import type {
   ToolFailureOutput,
   ToolObservation,
   ToolScope,
+  ToolValidationIssue,
   ToolValidationIssues,
   UnknownToolFailureOutput
 } from './definition.js';
+
+const OWNED_TOOL_OBSERVATIONS = new WeakSet();
 import { validateResourceScope } from './resources.js';
 
 type PolicyFailureDetails = Omit<PolicyToolFailureOutput, 'blocked' | 'reason' | 'recovery'> & { recovery?: string };
@@ -78,6 +81,7 @@ export function runtimeErrorObservation(toolName: string, error: unknown, detail
 
 /** The sole boundary from untrusted tool output into Agent Core. */
 export function parseToolObservation(tool: Pick<ToolDefinition, 'outputSchema'> | undefined, value: unknown): ToolObservation<JsonValue> {
+  if (typeof value === 'object' && value !== null && OWNED_TOOL_OBSERVATIONS.has(value)) return value as ToolObservation<JsonValue>;
   return parseOwnedToolObservation(tool, parseJsonObject(value, JSON_LIMITS));
 }
 
@@ -95,21 +99,30 @@ function parseOwnedToolObservation(tool: Pick<ToolDefinition, 'outputSchema'> | 
     const parsed = tool.outputSchema.safeParse(record.output);
     if (!parsed.success) throw parsed.error;
     const output = parseJsonValue(parsed.data, JSON_LIMITS);
-    return Object.freeze({
+    return ownObservation(Object.freeze({
       kind: 'result', ok: record.ok, summary: record.summary, scope, output,
       ...(content ? { content } : {}), ...(metadata ? { metadata } : {}), ...(evidence ? { evidence } : {})
-    });
+    }));
   }
   if (record.kind !== 'failure' || record.ok !== false) throw new Error('Tool observation kind and ok fields are inconsistent.');
-  const output = parseFailureOutput(parseJsonObject(record.output, JSON_LIMITS));
-  return Object.freeze({
+  if (record.output === undefined) throw new Error('Tool failure output must be an object.');
+  const output = parseFailureOutput(requireJsonObject(record.output, 'Tool failure output'));
+  return ownObservation(Object.freeze({
     kind: 'failure', ok: false, summary: record.summary, scope, output,
     ...(content ? { content } : {}), ...(metadata ? { metadata } : {}), ...(evidence ? { evidence } : {})
-  });
+  }));
+}
+
+function ownObservation<T extends ToolObservation<JsonValue>>(observation: T): T {
+  OWNED_TOOL_OBSERVATIONS.add(observation);
+  return observation;
 }
 
 export function normalizeToolObservationForPersistence(value: unknown): ToolObservation<JsonValue> {
-  const record = parseJsonObject(value, JSON_LIMITS);
+  return decodeOwnedToolObservationForPersistence(parseJsonObject(value, JSON_LIMITS));
+}
+
+export function decodeOwnedToolObservationForPersistence(record: JsonObject): ToolObservation<JsonValue> {
   return parseOwnedToolObservation(record.kind === 'result' ? persistenceTool() : undefined, record);
 }
 
@@ -139,17 +152,20 @@ function parseToolScope(value: JsonValue | undefined): ToolScope {
 
 function parseFailureOutput(value: JsonObject): ToolFailureOutput {
   if (value.blocked !== true || typeof value.recovery !== 'string' || value.recovery.length === 0) throw new Error('Tool failure output must be blocked and provide recovery guidance.');
-  if (value.reason === 'unknown_tool' && isToolCall(value.toolCall)) return Object.freeze({ blocked: true, reason: 'unknown_tool', recovery: value.recovery, toolCall: value.toolCall as unknown as ToolCall });
+  const toolCall = decodeToolCall(value.toolCall);
+  const validationIssues = decodeValidationIssues(value.issues);
+  const serviceDetails = decodeMissingServiceDetails(value.details);
+  if (value.reason === 'unknown_tool' && toolCall) return Object.freeze({ blocked: true, reason: 'unknown_tool', recovery: value.recovery, toolCall });
   if (value.reason === 'policy') return Object.freeze({ blocked: true, reason: 'policy', recovery: value.recovery, ...(typeof value.tool === 'string' ? { tool: value.tool } : {}), ...(typeof value.policyReason === 'string' ? { policyReason: value.policyReason } : {}), ...(jsonObject(value.details) ? { details: value.details } : {}) });
-  if (value.reason === 'invalid_arguments') return Object.freeze({ blocked: true, reason: 'invalid_arguments', recovery: value.recovery, ...(isValidationIssues(value.issues) ? { issues: value.issues as unknown as ToolValidationIssues } : {}), ...(jsonObject(value.details) ? { details: value.details } : {}) });
-  if (value.reason === 'invalid_output' && isValidationIssues(value.issues)) return Object.freeze({ blocked: true, reason: 'invalid_output', recovery: value.recovery, issues: value.issues as unknown as ToolValidationIssues });
-  if (value.reason === 'missing_service' && typeof value.service === 'string') return Object.freeze({ blocked: true, reason: 'missing_service', recovery: value.recovery, service: value.service, ...(isMissingServiceDetails(value.details) ? { details: value.details as unknown as MissingServiceDetails } : {}) });
+  if (value.reason === 'invalid_arguments') return Object.freeze({ blocked: true, reason: 'invalid_arguments', recovery: value.recovery, ...(validationIssues ? { issues: validationIssues } : {}), ...(jsonObject(value.details) ? { details: value.details } : {}) });
+  if (value.reason === 'invalid_output' && validationIssues) return Object.freeze({ blocked: true, reason: 'invalid_output', recovery: value.recovery, issues: validationIssues });
+  if (value.reason === 'missing_service' && typeof value.service === 'string') return Object.freeze({ blocked: true, reason: 'missing_service', recovery: value.recovery, service: value.service, ...(serviceDetails ? { details: serviceDetails } : {}) });
   if (value.reason === 'runtime_error' && typeof value.error === 'string') return Object.freeze({ blocked: true, reason: 'runtime_error', recovery: value.recovery, error: value.error, ...(jsonObject(value.details) ? { details: value.details } : {}) });
   throw new Error('Tool failure output does not match a declared failure contract.');
 }
 function parseContent(value: JsonValue | undefined): readonly ToolContent[] | undefined {
   if (value === undefined) return undefined;
-  if (!Array.isArray(value)) throw new Error('Tool observation content must be an array.');
+  if (!jsonArray(value)) throw new Error('Tool observation content must be an array.');
   return Object.freeze(value.map((item): ToolContent => {
     const record = requireJsonObject(item, 'Tool content');
     if (record.type === 'text' && typeof record.text === 'string' && (record.mediaType === undefined || typeof record.mediaType === 'string')) return Object.freeze({ type: 'text', text: record.text, ...(record.mediaType ? { mediaType: record.mediaType } : {}) });
@@ -173,20 +189,29 @@ function freezeFailure<T extends ToolFailureOutput>(summary: string, output: T):
 }
 function failureScope(): ToolScope { return Object.freeze({ resources: Object.freeze([]), coverage: 'partial', causes: Object.freeze(['tool_failure']) }); }
 function jsonObject(value: JsonValue | undefined): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }
+function jsonArray(value: JsonValue | undefined): value is readonly JsonValue[] { return Array.isArray(value); }
 function requireJsonObject(value: JsonValue, label: string): JsonObject {
   if (!jsonObject(value)) throw new Error(label + ' must be an object.');
   return value;
 }
-function isToolCall(value: JsonValue | undefined): boolean {
-  return jsonObject(value) && typeof value.name === 'string' && (value.id === undefined || typeof value.id === 'string') && jsonObject(value.input)
-    && ((value.input.kind === 'text' && typeof value.input.value === 'string') || (value.input.kind === 'json' && jsonObject(value.input.value)));
+function decodeToolCall(value: JsonValue | undefined): ToolCall | undefined {
+  if (!jsonObject(value) || typeof value.name !== 'string' || (value.id !== undefined && typeof value.id !== 'string') || !jsonObject(value.input)) return undefined;
+  if (value.input.kind === 'text' && typeof value.input.value === 'string') return Object.freeze({ ...(typeof value.id === 'string' ? { id: value.id } : {}), name: value.name, input: Object.freeze({ kind: 'text', value: value.input.value }) });
+  if (value.input.kind === 'json' && jsonObject(value.input.value)) return Object.freeze({ ...(typeof value.id === 'string' ? { id: value.id } : {}), name: value.name, input: Object.freeze({ kind: 'json', value: value.input.value }) });
+  return undefined;
 }
-function isValidationIssues(value: JsonValue | undefined): boolean {
-  return jsonObject(value) && Array.isArray(value.issues) && value.issues.every((issue) => jsonObject(issue) && Array.isArray(issue.path)
-    && issue.path.every((part) => typeof part === 'string' || typeof part === 'number') && typeof issue.code === 'string' && typeof issue.message === 'string');
+function decodeValidationIssues(value: JsonValue | undefined): ToolValidationIssues | undefined {
+  if (!jsonObject(value) || !jsonArray(value.issues)) return undefined;
+  const issues: ToolValidationIssue[] = [];
+  for (const issue of value.issues) {
+    if (!jsonObject(issue) || !jsonArray(issue.path) || !issue.path.every((part) => typeof part === 'string' || typeof part === 'number') || typeof issue.code !== 'string' || typeof issue.message !== 'string') return undefined;
+    issues.push(Object.freeze({ path: Object.freeze([...issue.path]), code: issue.code, message: issue.message }));
+  }
+  return Object.freeze({ issues: Object.freeze(issues) });
 }
-function isMissingServiceDetails(value: JsonValue | undefined): boolean {
-  return jsonObject(value) && (value.expected === undefined || typeof value.expected === 'string') && (value.actualType === undefined || typeof value.actualType === 'string');
+function decodeMissingServiceDetails(value: JsonValue | undefined): MissingServiceDetails | undefined {
+  if (!jsonObject(value) || (value.expected !== undefined && typeof value.expected !== 'string') || (value.actualType !== undefined && typeof value.actualType !== 'string')) return undefined;
+  return Object.freeze({ ...(typeof value.expected === 'string' ? { expected: value.expected } : {}), ...(typeof value.actualType === 'string' ? { actualType: value.actualType } : {}) });
 }
 function validationIssues(error: z.ZodError): ToolValidationIssues {
   return { issues: error.issues.map((issue) => ({ path: issue.path.map((item) => typeof item === 'number' ? item : String(item)), code: issue.code, message: issue.message })) };

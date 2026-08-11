@@ -46,7 +46,7 @@ const provider = {
 const tool = {
   name: 'effect', implementationId: 'tests/crash-effect@1', description: 'writes one externally visible marker', jsonSchema: { type: 'object' }, outputSchema: z.strictObject({}),
   effectEnvelope: { accesses: [{ mode: 'write', scope: 'fixture/effect' }], lockScopes: ['fixture/effect'] },
-  decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'fixture/effect' }], lockScopes: ['fixture/effect'], idempotency: 'non_idempotent' }; },
+  decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'fixture/effect' }], lockScopes: ['fixture/effect'], idempotency: 'non_idempotent' }; },
   async invoke() {
     await appendFile(path.join(root, 'effect.txt'), 'effect\n');
     if (mode === 'crash') process.exit(42);

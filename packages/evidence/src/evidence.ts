@@ -85,7 +85,7 @@ export function projectToolEvidence(delta: ToolEvidenceDelta | undefined, contex
 /** Semantic validation for evidence in an already-decoded JSON observation. */
 export function parseToolEvidenceDelta(value: JsonObject): ToolEvidenceDelta {
   rejectUnknown(value, ['items'], 'Tool evidence');
-  if (!Array.isArray(value.items)) throw new Error('Tool evidence must contain an items array.');
+  if (!jsonArray(value.items)) throw new Error('Tool evidence must contain an items array.');
   return Object.freeze({ items: Object.freeze(value.items.map((item, index) => parseEvidenceItem(item, index))) });
 }
 
@@ -97,14 +97,14 @@ export function workspaceResource(path: string, options: Omit<EvidenceResource, 
 }
 
 export function toEvidenceJsonObject(value: Record<string, unknown>): JsonObject {
-  const output: JsonObject = {};
+  const output: Record<string, JsonValue> = {};
   for (const [key, item] of Object.entries(value)) {
     const json = toEvidenceJsonMember(item);
     if (json !== undefined) {
       output[key] = json;
     }
   }
-  return output;
+  return Object.freeze(output);
 }
 
 function parseEvidenceItem(value: JsonValue, index: number): ToolEvidenceItem {
@@ -112,7 +112,7 @@ function parseEvidenceItem(value: JsonValue, index: number): ToolEvidenceItem {
   rejectUnknown(item, ['action', 'resources', 'scope', 'summary', 'outcome'], `Tool evidence item ${String(index)}`);
   if (!isEvidenceAction(item.action)) throw new Error(`Tool evidence item ${String(index)} has an invalid action.`);
   if (item.outcome !== 'success' && item.outcome !== 'failure') throw new Error(`Tool evidence item ${String(index)} has an invalid outcome.`);
-  if (item.resources !== undefined && !Array.isArray(item.resources)) throw new Error(`Tool evidence item ${String(index)} resources must be an array.`);
+  if (item.resources !== undefined && !jsonArray(item.resources)) throw new Error(`Tool evidence item ${String(index)} resources must be an array.`);
   if (item.summary !== undefined && (typeof item.summary !== 'string' || item.summary.trim().length === 0 || Buffer.byteLength(item.summary, 'utf8') > 1_000)) {
     throw new Error(`Tool evidence item ${String(index)} has an invalid summary.`);
   }
@@ -192,8 +192,9 @@ function rejectUnknown(record: JsonObject, allowed: readonly string[], label: st
 
 function requireJsonObject(value: JsonValue, label: string): JsonObject {
   if (value === null || Array.isArray(value) || typeof value !== 'object') throw new Error(`${label} must be an object.`);
-  return value;
+  return value as JsonObject;
 }
+function jsonArray(value: JsonValue | undefined): value is readonly JsonValue[] { return Array.isArray(value); }
 
 function toEvidenceJsonMember(value: unknown): JsonMember | undefined {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') {

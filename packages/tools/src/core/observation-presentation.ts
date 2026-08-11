@@ -3,19 +3,19 @@ import type { ToolCall, ToolObservation } from './definition.js';
 export type { JsonObject, JsonValue } from '@agent-core/json';
 
 export interface ToolObservationPresentation {
-  ok: boolean;
-  title: string;
-  summary: string;
-  scope?: JsonObject;
-  filters?: JsonObject;
-  limits?: JsonObject;
-  results?: JsonValue;
-  failures?: JsonValue;
-  omitted?: JsonObject;
-  coverage?: 'complete' | 'partial';
-  truncated?: boolean;
-  warnings?: string[];
-  next?: string;
+  readonly ok: boolean;
+  readonly title: string;
+  readonly summary: string;
+  readonly scope?: JsonObject;
+  readonly filters?: JsonObject;
+  readonly limits?: JsonObject;
+  readonly results?: JsonValue;
+  readonly failures?: JsonValue;
+  readonly omitted?: JsonObject;
+  readonly coverage?: 'complete' | 'partial';
+  readonly truncated?: boolean;
+  readonly warnings?: readonly string[];
+  readonly next?: string;
 }
 export type ToolObservationPresentationMode = 'immediate' | 'retained';
 export interface ToolObservationPresentationRequest<TInput = unknown, TOutput = unknown> {
@@ -47,7 +47,21 @@ export function validateToolObservationPresentation(value: unknown): ToolObserva
   const unknown = Object.keys(owned).filter((key) => !keys.has(key));
   if (unknown.length > 0) issues.push({ path: '$', message: 'Unsupported presentation fields: ' + unknown.join(', ') + '.' });
   if (issues.length > 0) return { ok: false, issues };
-  return { ok: true, presentation: owned as unknown as ToolObservationPresentation };
+  return { ok: true, presentation: Object.freeze({
+    ok: owned.ok as boolean,
+    title: owned.title as string,
+    summary: owned.summary as string,
+    ...(jsonObject(owned.scope) ? { scope: owned.scope } : {}),
+    ...(jsonObject(owned.filters) ? { filters: owned.filters } : {}),
+    ...(jsonObject(owned.limits) ? { limits: owned.limits } : {}),
+    ...(owned.results !== undefined ? { results: owned.results } : {}),
+    ...(owned.failures !== undefined ? { failures: owned.failures } : {}),
+    ...(jsonObject(owned.omitted) ? { omitted: owned.omitted } : {}),
+    ...(owned.coverage === 'complete' || owned.coverage === 'partial' ? { coverage: owned.coverage } : {}),
+    ...(typeof owned.truncated === 'boolean' ? { truncated: owned.truncated } : {}),
+    ...(Array.isArray(owned.warnings) ? { warnings: Object.freeze(owned.warnings.filter((entry): entry is string => typeof entry === 'string')) } : {}),
+    ...(typeof owned.next === 'string' ? { next: owned.next } : {})
+  }) };
 }
 
 export function toolFailurePresentation(toolName: string, observation: ToolObservation): ToolObservationPresentation {

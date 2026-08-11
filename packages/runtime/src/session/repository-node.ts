@@ -5,7 +5,7 @@ import {
   type ArtifactRef,
   validateArtifactRef
 } from '@agent-core/evidence';
-import { normalizeJsonSafe, type JsonObject, type JsonValue } from '@agent-core/json';
+import { normalizeJsonSafe, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import {
   PersistenceConflictError,
   PersistenceCorruptionError,
@@ -21,7 +21,8 @@ import {
   type JsonlStorageStamp
 } from '@agent-core/evidence/node';
 import {
-  parseAgentTerminalSnapshot,
+  createAgentTerminalSnapshot,
+  decodeOwnedAgentTerminalSnapshot,
   terminalSnapshotFingerprint,
   type AgentEffectiveInstruction,
   type AgentToolCallAttemptIdentity,
@@ -190,7 +191,7 @@ export class JsonlSessionRepository implements SessionRepository {
 
   projectFinal(sessionId: string, terminalInput: AgentTerminalSnapshot): Promise<SessionFinalProjection> {
     return this.enqueue(sessionId, () => withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
-      const terminal = parseAgentTerminalSnapshot(terminalInput);
+      const terminal = createAgentTerminalSnapshot(terminalInput);
       const state = await this.refreshIndex(sessionId, true);
       const existing = state.projections.find((projection) => projection.finalizationId === terminal.finalizationId);
       if (existing) {
@@ -272,11 +273,10 @@ export class JsonlSessionRepository implements SessionRepository {
       consumed = line.byteOffset - index.completeBytes + Buffer.byteLength(line.text, 'utf8') + 1;
       if (line.text.trim().length === 0) continue;
       const actualLine = sessionRecordCount(index) + 2;
-      let value: unknown;
-      try { value = JSON.parse(line.text); } catch (error) { throw corruption(filePath, actualLine, line.byteOffset, `Invalid JSON: ${errorMessage(error)}`, 'invalid_json'); }
+      const value = parseJson({ ...line, line: actualLine }, filePath);
       try {
-        if (isRecord(value) && value.type === 'final') index.projections.push(parseFinalProjection(value));
-        else if (isRecord(value) && value.type === 'context') index.contextProjections.push(parseContextProjection(value));
+        if (isJsonObject(value) && value.type === 'final') index.projections.push(parseFinalProjection(value));
+        else if (isJsonObject(value) && value.type === 'context') index.contextProjections.push(parseContextProjection(value));
         else {
           const entry = parseBranchEntry(value);
           if (entry.parentId !== null && !index.branchEntries.some((candidate) => candidate.id === entry.parentId)) throw new Error(`Unknown parent ${entry.parentId}.`);
@@ -321,12 +321,10 @@ async function readSessionFile(filePath: string, sessionId: string): Promise<{ r
   const contextProjections: SessionContextProjection[] = [];
   for (const line of lines.slice(1)) {
     if (line.text.trim().length === 0) continue;
-    let value: unknown;
-    try { value = JSON.parse(line.text); }
-    catch (error) { throw corruption(filePath, line.line, line.byteOffset, `Invalid JSON: ${errorMessage(error)}`, 'invalid_json'); }
+    const value = parseJson(line, filePath);
     try {
-      if (isRecord(value) && value.type === 'final') projections.push(parseFinalProjection(value));
-      else if (isRecord(value) && value.type === 'context') contextProjections.push(parseContextProjection(value));
+      if (isJsonObject(value) && value.type === 'final') projections.push(parseFinalProjection(value));
+      else if (isJsonObject(value) && value.type === 'context') contextProjections.push(parseContextProjection(value));
       else branchEntries.push(parseBranchEntry(value));
     } catch (error) { throw corruption(filePath, line.line, line.byteOffset, errorMessage(error), 'invalid_record'); }
   }
@@ -334,45 +332,46 @@ async function readSessionFile(filePath: string, sessionId: string): Promise<{ r
   return { state: { header, branchEntries, projections, contextProjections }, completeBytes: committed.completeBytes };
 }
 
-function parseBranchEntry(value: unknown): SessionBranchEntry {
+function parseBranchEntry(value: JsonValue): SessionBranchEntry {
   if (!isRecord(value) || !validBaseEntry(value)) throw new Error('Session entry base is invalid.');
   if (isSessionInputEntry(value)) return value;
   if (isSessionToolCallEntry(value)) return value;
   if (isSessionObservationEntry(value)) return value;
   if (isSessionBranchMarkerEntry(value)) return value;
   if (isSessionModelSettingsEntry(value)) return value;
-  throw new Error(`Unsupported or malformed session entry: ${String(value.type)}`);
+  throw new Error(`Unsupported or malformed session entry: ${typeof value.type === 'string' ? value.type : 'unknown'}`);
 }
-function parseFinalProjection(value: Record<string, unknown>): SessionFinalProjection {
+function parseFinalProjection(value: JsonObject): SessionFinalProjection {
   if (typeof value.id !== 'string' || typeof value.timestamp !== 'string' || typeof value.runId !== 'string' || typeof value.finalizationId !== 'string') throw new Error('Final projection identity is invalid.');
-  const terminal = parseAgentTerminalSnapshot(value.terminal);
+  if (!isJsonObject(value.terminal)) throw new Error('Final projection terminal is invalid.');
+  const terminal = decodeOwnedAgentTerminalSnapshot(value.terminal);
   if (terminal.runId !== value.runId || terminal.finalizationId !== value.finalizationId) throw new Error('Final projection identity conflicts with terminal snapshot.');
-  return { type: 'final', id: value.id, timestamp: value.timestamp, runId: value.runId, finalizationId: value.finalizationId, terminal };
+  return Object.freeze({ type: 'final', id: value.id, timestamp: value.timestamp, runId: value.runId, finalizationId: value.finalizationId, terminal });
 }
-function parseContextProjection(value: Record<string, unknown>): SessionContextProjection {
+function parseContextProjection(value: JsonObject): SessionContextProjection {
   if (typeof value.id !== 'string' || typeof value.timestamp !== 'string' || typeof value.throughEntryId !== 'string' || typeof value.throughFinalizationId !== 'string' || typeof value.historyDigest !== 'string') throw new Error('Context projection identity is invalid.');
   if (!Array.isArray(value.recentTurns)) throw new Error('Context projection turn digests are invalid.');
-  return {
+  return Object.freeze({
     type: 'context',
     id: value.id,
     timestamp: value.timestamp,
     throughEntryId: value.throughEntryId,
     throughFinalizationId: value.throughFinalizationId,
     historyDigest: value.historyDigest,
-    recentTurns: value.recentTurns.map(parseSessionTurnDigest)
-  };
+    recentTurns: Object.freeze(value.recentTurns.map(parseSessionTurnDigest))
+  });
 }
 function parseSessionTurnDigest(value: unknown): SessionContextProjection['recentTurns'][number] {
   if (!isRecord(value) || typeof value.runId !== 'string' || typeof value.finalizationId !== 'string' || typeof value.task !== 'string' || typeof value.status !== 'string' || (value.result !== undefined && typeof value.result !== 'string')) {
     throw new Error('Context projection turn digest is invalid.');
   }
-  return {
+  return Object.freeze({
     runId: value.runId,
     finalizationId: value.finalizationId,
     task: value.task,
     status: value.status,
     ...(typeof value.result === 'string' ? { result: value.result } : {})
-  };
+  });
 }
 function activeBranch(entries: readonly SessionBranchEntry[], leafId: string | null): SessionBranchEntry[] {
   const byId = new Map(entries.map((entry) => [entry.id, entry])); const output: SessionBranchEntry[] = []; let cursor = leafId;
@@ -446,7 +445,10 @@ function observationPayload(value: SessionObservationEntry): Omit<SessionObserva
     ...(value.metadata === undefined ? {} : { metadata: value.metadata })
   };
 }
-function parseJson(line: JsonlLine, storage: string): unknown { try { return JSON.parse(line.text); } catch (error) { throw corruption(storage, line.line, line.byteOffset, errorMessage(error), 'invalid_json'); } }
+function parseJson(line: JsonlLine, storage: string): JsonValue {
+  try { return parseJsonValue(JSON.parse(line.text), { maxDepth: 32, maxCollectionEntries: 50_000, maxStringBytes: 4 * 1024 * 1024, maxTotalBytes: 8 * 1024 * 1024 }); }
+  catch (error) { throw corruption(storage, line.line, line.byteOffset, errorMessage(error), 'invalid_json'); }
+}
 function corruption(storage: string, line: number, byteOffset: number, message: string, code: PersistenceCorruptionError['code']): PersistenceCorruptionError { return new PersistenceCorruptionError({ code, storage, line, byteOffset, message }); }
 async function canonicalWorkspaceRoot(rootDir: string): Promise<string> { return fs.realpath(path.resolve(rootDir)); }
 function assertIdentifier(value: string): void { if (!/^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/u.test(value)) throw new Error('Invalid session id.'); }
@@ -490,5 +492,6 @@ function isSessionModelSettingsEntry(value: Record<string, unknown> & BaseSessio
     && (value.reasoningEffort === undefined || typeof value.reasoningEffort === 'string');
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
+function isJsonObject(value: JsonValue | undefined): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function nodeCode(error: unknown): string | undefined { return isRecord(error) && typeof error.code === 'string' ? error.code : undefined; }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }

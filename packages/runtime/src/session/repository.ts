@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { validateArtifactRef } from '@agent-core/evidence';
 import { normalizeJsonSafe, type JsonObject, type JsonValue } from '@agent-core/json';
 import { PersistenceConflictError } from '@agent-core/evidence';
-import { parseAgentTerminalSnapshot, terminalSnapshotFingerprint, type AgentEffectiveInstruction, type AgentTerminalSnapshot, type AgentToolCallAttemptIdentity, type AgentToolCallIdentity, type AgentTurnIdentity } from '../run/contracts.js';
+import { createAgentTerminalSnapshot, terminalSnapshotFingerprint, type AgentEffectiveInstruction, type AgentTerminalSnapshot, type AgentToolCallAttemptIdentity, type AgentToolCallIdentity, type AgentTurnIdentity } from '../run/contracts.js';
 import type {
   AgentSession,
   BaseSessionEntry,
@@ -104,7 +104,7 @@ export class InMemorySessionRepository implements SessionRepository {
   }
   projectFinal(sessionId: string, terminalInput: AgentTerminalSnapshot): Promise<SessionFinalProjection> {
     return this.serial(() => {
-      const state = this.require(sessionId); const terminal = parseAgentTerminalSnapshot(terminalInput);
+      const state = this.require(sessionId); const terminal = createAgentTerminalSnapshot(terminalInput);
       const existing = state.projections.find((projection) => projection.finalizationId === terminal.finalizationId);
       if (existing) {
         if (terminalSnapshotFingerprint(existing.terminal) !== terminalSnapshotFingerprint(terminal)) throw new PersistenceConflictError(`Conflicting finalization ${terminal.finalizationId}.`);

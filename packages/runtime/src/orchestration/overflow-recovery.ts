@@ -16,7 +16,7 @@ export interface OverflowDiagnostic {
   toolSchemaTokens: number;
   outputReserveTokens: number;
   totalRequestTokens: number;
-  reductionsAttempted: OverflowRecoveryAction[];
+  readonly reductionsAttempted: readonly OverflowRecoveryAction[];
 }
 
 export type OverflowRecoveryResult =

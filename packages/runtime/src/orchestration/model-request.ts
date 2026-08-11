@@ -24,14 +24,11 @@ export interface AgentInstructionInput {
 }
 
 export function normalizeModelToolCall(toolCall: ModelToolCall): ToolCall {
-  const call: ToolCall = {
+  return Object.freeze({
+    ...(toolCall.id ? { id: toolCall.id } : {}),
     name: toolCall.name,
     input: toolCall.input
-  };
-  if (toolCall.id) {
-    call.id = toolCall.id;
-  }
-  return call;
+  });
 }
 
 export function modelToolCallFromToolCall(toolCall: ToolCall): ModelToolCall {
@@ -198,14 +195,11 @@ export function validateOptionalPositiveInteger(value: number | undefined, name:
 }
 
 export function normalizeStreamedFinalResponse(response: ModelResponse, streamedContent: string, streamedReasoningSummary: string): ModelResponse {
-  const normalized: ModelResponse = { ...response };
-  if (normalized.content.length === 0 && streamedContent.length > 0) {
-    normalized.content = streamedContent;
-  }
-  if (!normalized.reasoningSummary && streamedReasoningSummary.length > 0) {
-    normalized.reasoningSummary = streamedReasoningSummary;
-  }
-  return normalized;
+  return Object.freeze({
+    ...response,
+    ...(response.content.length === 0 && streamedContent.length > 0 ? { content: streamedContent } : {}),
+    ...(!response.reasoningSummary && streamedReasoningSummary.length > 0 ? { reasoningSummary: streamedReasoningSummary } : {})
+  });
 }
 
 export function providerFailureDiagnostic(error: unknown): ModelProviderErrorDiagnostic | undefined {

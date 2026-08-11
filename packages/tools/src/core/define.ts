@@ -1,10 +1,11 @@
 import * as z from 'zod';
+import { parseJsonObject, parseJsonValue, type JsonValue } from '@agent-core/json';
 import type { ToolExecutionContext, ToolPreparationContext } from './context.js';
 import type { ToolDefinition, ToolInput, ToolObservation, ToolPromptGuide, ToolRequirements, ToolTextInputDefinition } from './definition.js';
 import type { ToolObservationPresentation, ToolObservationPresentationRequest } from './observation-presentation.js';
 import type { ToolPolicy } from './policy.js';
 import { invalidArgumentsObservation, invalidToolInputObservation } from './observation.js';
-import type { ToolEffectEnvelope, ToolEffects } from './authorization.js';
+import { validateToolEffectEnvelope, type ToolEffectEnvelope, type ToolEffects } from './authorization.js';
 
 export interface DefineToolOptions<Schema extends z.ZodType, TCanonicalInput, TOutput> {
   name: string;
@@ -19,6 +20,7 @@ export interface DefineToolOptions<Schema extends z.ZodType, TCanonicalInput, TO
   effectEnvelope: ToolEffectEnvelope;
   requirements?: ToolRequirements;
   canonicalizeInput: (input: z.output<Schema>, context: ToolPreparationContext) => TCanonicalInput | Promise<TCanonicalInput>;
+  snapshotInput?: (input: TCanonicalInput) => JsonValue;
   deriveEffects: (input: TCanonicalInput, context: ToolPreparationContext) => ToolEffects | Promise<ToolEffects>;
   isAvailable?: (policy: ToolPolicy) => boolean;
   invoke: (input: TCanonicalInput, context: ToolExecutionContext) => Promise<ToolObservation<TOutput>>;
@@ -28,6 +30,12 @@ export interface DefineToolOptions<Schema extends z.ZodType, TCanonicalInput, TO
 export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
   definition: DefineToolOptions<Schema, TCanonicalInput, TOutput>
 ): ToolDefinition<z.output<Schema>, TCanonicalInput, TOutput> {
+  const snapshotInput = definition.snapshotInput ?? ((input: TCanonicalInput) => input);
+  const requirements = definition.requirements ? Object.freeze({
+    ...(definition.requirements.services ? { services: Object.freeze([...definition.requirements.services]) } : {}),
+    ...(definition.requirements.modelInputModalities ? { modelInputModalities: Object.freeze([...definition.requirements.modelInputModalities]) } : {}),
+    ...(definition.requirements.hostCapabilities ? { hostCapabilities: Object.freeze([...definition.requirements.hostCapabilities]) } : {})
+  }) : undefined;
   const textInput: ToolTextInputDefinition<z.output<Schema>> | undefined = definition.textInput
     ? {
       format: definition.textInput.format,
@@ -43,11 +51,11 @@ export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
     implementationId: definition.implementationId,
     description: definition.description,
     ...(definition.promptGuide ? { promptGuide: definition.promptGuide } : {}),
-    jsonSchema: toToolJsonSchema(definition.schema),
+    jsonSchema: parseJsonObject(toToolJsonSchema(definition.schema), { maxDepth: 64, maxCollectionEntries: 50_000, maxStringBytes: 1_000_000, maxTotalBytes: 4_000_000 }),
     outputSchema: definition.outputSchema,
     ...(textInput ? { textInput } : {}),
-    effectEnvelope: definition.effectEnvelope,
-    ...(definition.requirements ? { requirements: definition.requirements } : {}),
+    effectEnvelope: validateToolEffectEnvelope(definition.effectEnvelope),
+    ...(requirements ? { requirements } : {}),
     ...(definition.isAvailable ? { isAvailable: definition.isAvailable } : {}),
     ...(definition.presentObservation ? { presentObservation: definition.presentObservation } : {}),
     decodeInput(input: ToolInput) {
@@ -81,6 +89,7 @@ export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
       return { ok: true, input: parsed.data };
     },
     canonicalizeInput: definition.canonicalizeInput,
+    snapshotInput: (input) => parseJsonValue(snapshotInput(input), { maxDepth: 32, maxCollectionEntries: 20_000, maxStringBytes: 4_000_000, maxTotalBytes: 8_000_000 }),
     deriveEffects: definition.deriveEffects,
     invoke: definition.invoke
   };

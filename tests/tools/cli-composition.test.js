@@ -66,11 +66,11 @@ test('local host exposes dry-run patching without a transaction directory and ga
   const dryContext = contextFor(withoutDirectory.services);
   const dryPrepared = await prepareToolCall({ name: 'apply_patch', input: { kind: 'json', value: { patch, dryRun: true } } }, withoutDirectory.tools, dryContext);
   assert.equal(dryPrepared.ok, true);
-  const dry = await dryPrepared.prepared.tool.invoke(dryPrepared.prepared.canonicalInput, dryContext);
+  const dry = await dryPrepared.prepared.invoke(dryContext);
   assert.equal(dry.output.operationStatus, 'dry_run');
   const writePrepared = await prepareToolCall({ name: 'apply_patch', input: { kind: 'text', value: patch } }, withoutDirectory.tools, dryContext);
   assert.equal(writePrepared.ok, true);
-  await assert.rejects(writePrepared.prepared.tool.invoke(writePrepared.prepared.canonicalInput, dryContext), /patchTransactionDirectory/u);
+  await assert.rejects(writePrepared.prepared.invoke(dryContext), /patchTransactionDirectory/u);
   await withoutDirectory.close();
 
   const withDirectory = createLocalToolHost({
@@ -84,7 +84,7 @@ test('local host exposes dry-run patching without a transaction directory and ga
   const writeContext = contextFor(withDirectory.services);
   const prepared = await prepareToolCall({ name: 'apply_patch', input: { kind: 'text', value: patch } }, withDirectory.tools, writeContext);
   assert.equal(prepared.ok, true);
-  const applied = await prepared.prepared.tool.invoke(prepared.prepared.canonicalInput, writeContext);
+  const applied = await prepared.prepared.invoke(writeContext);
   assert.equal(applied.output.operationStatus, 'applied');
   await withDirectory.close();
 });

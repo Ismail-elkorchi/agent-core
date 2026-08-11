@@ -354,7 +354,7 @@ test('search_text handles long repositories, context, per-file limits, abort, an
   const preparationContext = { ...context, signal: controller.signal, boundary: { authorizationPolicyId: 'tests/search@1', executionTargetId: root } };
   const prepared = await prepareToolCall(call, [searchTextTool], preparationContext);
   assert.equal(prepared.ok, true);
-  const abortedPromise = prepared.prepared.tool.invoke(prepared.prepared.canonicalInput, preparationContext);
+  const abortedPromise = prepared.prepared.invoke(preparationContext);
   setTimeout(() => controller.abort('search cancelled'), 1);
   const aborted = await abortedPromise;
   assert.equal(aborted.output.status, 'aborted');

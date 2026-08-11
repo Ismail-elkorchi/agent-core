@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { type ContextHistoryReduction, type ContextItemInput, ContextManager } from './context/manager.js';
-import { hashRecord } from '@agent-core/evidence';
+import { hashJson } from '@agent-core/evidence';
 import { normalizeJsonSafe, parseJsonValue } from '@agent-core/json';
 import {
+  createModelRequest,
   ModelContractError,
   type ModelProfile,
   type ModelProvider,
@@ -21,9 +22,8 @@ import {
 } from '@agent-core/model';
 import { compilePromptProjection, type PromptInstruction } from './context/prompt.js';
 import {
-  deepFreeze,
   deriveAgentVerificationStatus,
-  parseAgentTerminalSnapshot,
+  createAgentTerminalSnapshot,
   validateAgentCheckDefinitions,
   type AgentCandidate,
   type AgentApprovalRequest,
@@ -48,7 +48,7 @@ import {
   READ_ONLY_TOOL_POLICY,
   ResourceLeaseCoordinator,
   toolRequirementsSatisfied,
-  validateToolDefinitions,
+  ToolRegistry,
   type ToolAuthorizer,
   type ToolCall,
   type ToolDefinition,
@@ -271,7 +271,7 @@ export class AgentRuntime {
     this.estimator = options.estimator ?? new SimpleTokenEstimator();
     this.maxOutputTokens = validateOptionalPositiveInteger(options.maxOutputTokens, 'maxOutputTokens');
     this.toolPolicy = parseToolPolicy(options.toolPolicy ?? READ_ONLY_TOOL_POLICY);
-    this.tools = validateToolDefinitions(options.tools ?? []);
+    this.tools = Object.freeze(new ToolRegistry(options.tools ?? []).list());
     this.resourceLeases = processLeaseCoordinator(options.toolContext?.services?.processManager) ?? new ResourceLeaseCoordinator();
     validateToolBoundary(options.toolBoundary);
     this.checks = validateAgentCheckDefinitions(options.checks);
@@ -335,7 +335,7 @@ export class AgentRuntime {
     const authorizationContext = this.toolContext(input.signal ?? new AbortController().signal);
     const currentPreparation = await prepareToolCall(currentCall, this.tools, authorizationContext);
     if (!currentPreparation.ok) throw new Error(`Approved tool call is no longer valid: ${currentPreparation.observation.summary}`);
-    if (currentPreparation.prepared.tool.implementationId !== target.binding.toolImplementationId) throw new Error(`Approved tool implementation changed for ${input.approvalId}; a new approval is required.`);
+    if (currentPreparation.prepared.toolImplementationId !== target.binding.toolImplementationId) throw new Error(`Approved tool implementation changed for ${input.approvalId}; a new approval is required.`);
     if (currentPreparation.prepared.fingerprint !== target.fingerprint) throw new Error(`Approval fingerprint changed for ${input.approvalId}; a new approval is required.`);
     const priorResolutions = records.filter((event): event is Extract<AgentEvent, { type: 'approval.resolved' }> => event.type === 'approval.resolved');
     const existing = priorResolutions.find((resolution) => resolution.approvalId === input.approvalId);
@@ -685,14 +685,14 @@ export class AgentRuntime {
     readonly controller: AgentRunController;
     readonly continuationEligible: boolean;
   }): TurnSnapshot {
-    const record: AgentTurnSnapshotRecord = deepFreeze({
+    const record: AgentTurnSnapshotRecord = Object.freeze({
       turnIndex: input.turnIndex, turnId: input.turnId, requestAttempt: input.requestAttempt,
       provider: this.options.provider.id, model: input.configuration.model,
-      profileHash: hashRecord(normalizeJsonSafe(input.profile).value), continuationEligible: input.continuationEligible,
+      profileHash: hashJson(normalizeJsonSafe(input.profile).value), continuationEligible: input.continuationEligible,
       ...(input.configuration.temperature === undefined ? {} : { temperature: input.configuration.temperature }),
       ...(input.configuration.reasoning === undefined ? {} : { reasoning: input.configuration.reasoning }),
       ...(input.configuration.responseFormat === undefined ? {} : { responseFormat: input.configuration.responseFormat }),
-      toolNames: input.tools.map((tool) => tool.name), toolPolicyHash: hashRecord(this.toolPolicy), instructions: [...input.instructions],
+      toolNames: input.tools.map((tool) => tool.name), toolPolicyHash: hashJson(this.toolPolicy), instructions: [...input.instructions],
       configuredContextSourceIds: contextSourceIds(this.options.contextItems, 'configured'), checkIds: this.checks.map((check) => check.id), limits: input.controller.limits, budget: input.controller.snapshot()
     });
     return Object.freeze({ record, profile: input.profile, requestWindow: Object.freeze({ ...input.requestWindow }), budgetAccountant: new BudgetAccountant(input.requestWindow, this.estimator), tools: Object.freeze([...input.tools]), configuration: input.configuration, instructions: Object.freeze([...input.instructions]) });
@@ -823,17 +823,17 @@ export class AgentRuntime {
           ...(request.snapshot.configuration.temperature !== undefined ? { temperature: request.snapshot.configuration.temperature } : {}),
           ...(request.snapshot.configuration.reasoning !== undefined && supportsParameter(request.snapshot.profile, 'reasoning') ? { reasoning: request.snapshot.configuration.reasoning } : {}),
           ...(request.snapshot.configuration.responseFormat !== undefined ? { responseFormat: request.snapshot.configuration.responseFormat } : {}) };
-        const finalRequestSnapshot: AgentRequestSnapshotRecord = deepFreeze({
+        const finalRequestSnapshot: AgentRequestSnapshotRecord = Object.freeze({
           ...identity,
           requestId: randomUUID(),
           configuredContextIds: contextSourceIds(contextInputs.configured, 'configured'),
           providerContextIds: contextSourceIds(contextInputs.provider, 'provider'),
           runContextIds: contextSourceIds(contextInputs.run, 'run'),
-          effectiveInstructionHash: hashRecord(normalizeJsonSafe(request.snapshot.instructions).value),
-          selectedEvidenceHash: hashRecord(normalizeJsonSafe(projection.prompt.evidence ?? null).value),
-          retainedHistoryHash: hashRecord(normalizeJsonSafe(projection.contextHistoryMessages).value),
-          modelToolSchemasHash: hashRecord(normalizeJsonSafe(modelTools).value),
-          compiledPromptHash: hashRecord(normalizeJsonSafe(compiled.messages).value),
+          effectiveInstructionHash: hashJson(normalizeJsonSafe(request.snapshot.instructions).value),
+          selectedEvidenceHash: hashJson(normalizeJsonSafe(projection.prompt.evidence ?? null).value),
+          retainedHistoryHash: hashJson(normalizeJsonSafe(projection.contextHistoryMessages).value),
+          modelToolSchemasHash: hashJson(normalizeJsonSafe(modelTools).value),
+          compiledPromptHash: hashJson(normalizeJsonSafe(compiled.messages).value),
           reductions: reductionRecords
         });
         return { ok: true, request: modelRequest, estimate, snapshot: finalRequestSnapshot };
@@ -900,7 +900,7 @@ export class AgentRuntime {
         }
       } catch (error) { throw modelStreamInterrupted({ turnIndex: identity.turnIndex, cause: error, content: streamedContent, reasoningSummary: streamedReasoningSummary, finalResponseReceived: response !== undefined }); }
       if (!response) throw modelStreamInterrupted({ turnIndex: identity.turnIndex, cause: new Error('Model stream ended without a final response.'), content: streamedContent, reasoningSummary: streamedReasoningSummary, finalResponseReceived: false });
-      return parseModelResponse(normalizeStreamedFinalResponse(response, streamedContent, streamedReasoningSummary));
+      return normalizeStreamedFinalResponse(response, streamedContent, streamedReasoningSummary);
     }
     const response = parseModelResponse(await session.complete(request));
     if (response.content.length > 0) await emit({ type: 'assistant.delta', ...identity, delta: response.content, accumulated: response.content });
@@ -919,7 +919,7 @@ export class AgentRuntime {
       catch { diagnostics.push({ ...base, persisted: false }); }
     }
   }
-  private captureRuntimeConfiguration(): RuntimeModelConfiguration { return deepFreeze({ model: this.runtimeModel, ...(this.runtimeTemperature === undefined ? {} : { temperature: this.runtimeTemperature }), ...(this.runtimeReasoning === undefined ? {} : { reasoning: this.runtimeReasoning }), ...(this.runtimeResponseFormat === undefined ? {} : { responseFormat: this.runtimeResponseFormat }) }); }
+  private captureRuntimeConfiguration(): RuntimeModelConfiguration { return Object.freeze({ model: this.runtimeModel, ...(this.runtimeTemperature === undefined ? {} : { temperature: this.runtimeTemperature }), ...(this.runtimeReasoning === undefined ? {} : { reasoning: this.runtimeReasoning }), ...(this.runtimeResponseFormat === undefined ? {} : { responseFormat: this.runtimeResponseFormat }) }); }
   private toolContext(signal: AbortSignal): ToolPreparationContext {
     const services = {
       ...(this.options.toolContext?.services ?? {}),
@@ -981,20 +981,22 @@ function isProcessDisposer(value: unknown): value is { readonly disposeRun: (run
 function durableProcessTermination(value: unknown): { readonly processId: string; readonly status: string; readonly result: import('@agent-core/json').JsonValue } {
   const outer = parseJsonValue(value, { maxDepth: 16, maxCollectionEntries: 20_000, maxStringBytes: 1_000_000, maxTotalBytes: 4_000_000 });
   const normalized = isRecord(outer) && isRecord(outer.result) ? outer.result : outer;
-  if (typeof normalized !== 'object' || normalized === null || Array.isArray(normalized) || typeof normalized.processId !== 'string' || typeof normalized.status !== 'string') throw new Error('Process cleanup returned an invalid terminal result.');
+  if (typeof normalized !== 'object' || normalized === null || Array.isArray(normalized)) throw new Error('Process cleanup returned an invalid terminal result.');
+  const record = normalized as import('@agent-core/json').JsonObject;
+  if (typeof record.processId !== 'string' || typeof record.status !== 'string') throw new Error('Process cleanup returned an invalid terminal result.');
   const stream = (candidate: unknown) => isRecord(candidate)
     ? { observedBytes: typeof candidate.observedBytes === 'number' ? candidate.observedBytes : 0, capturedBytes: typeof candidate.capturedBytes === 'number' ? candidate.capturedBytes : 0, omittedBytes: typeof candidate.omittedBytes === 'number' ? candidate.omittedBytes : 0 }
     : { observedBytes: 0, capturedBytes: 0, omittedBytes: 0 };
   return {
-    processId: normalized.processId,
-    status: normalized.status,
+    processId: record.processId,
+    status: record.status,
     result: normalizeJsonSafe({
-      owner: normalized.owner,
-      cursorEnd: normalized.cursorEnd,
-      stdout: stream(normalized.stdout), stderr: stream(normalized.stderr), combined: stream(normalized.combined),
-      ...(normalized.artifact === undefined ? {} : { artifact: normalized.artifact }),
-      ...(normalized.exitCode === undefined ? {} : { exitCode: normalized.exitCode }),
-      ...(normalized.signal === undefined ? {} : { signal: normalized.signal }),
+      owner: record.owner,
+      cursorEnd: record.cursorEnd,
+      stdout: stream(record.stdout), stderr: stream(record.stderr), combined: stream(record.combined),
+      ...(record.artifact === undefined ? {} : { artifact: record.artifact }),
+      ...(record.exitCode === undefined ? {} : { exitCode: record.exitCode }),
+      ...(record.signal === undefined ? {} : { signal: record.signal }),
       ...(isRecord(outer) && outer.protectedArtifact !== undefined ? { protectedArtifact: outer.protectedArtifact } : {})
     }).value
   };
@@ -1030,7 +1032,7 @@ function runDeadline(controller: AgentRunController, request: ModelRequest): { r
   }, controller.remainingElapsedMs() + 1);
   const signal = request.signal ? AbortSignal.any([request.signal, timeout.signal]) : timeout.signal;
   return {
-    request: { ...request, signal },
+    request: createModelRequest({ ...request, signal }),
     get error() { return deadlineError; },
     dispose: () => { clearTimeout(timer); }
   };
@@ -1048,9 +1050,19 @@ function terminalSnapshot(runId: string, finalizationId: string, decision: Termi
     ...('providerTerminationReason' in decision ? { providerTerminationReason: decision.providerTerminationReason } : {}),
     ...('exhaustedLimit' in decision ? { exhaustedLimit: decision.exhaustedLimit } : {}),
     ...(decision.cleanupDiagnostic ? { cleanupDiagnostic: decision.cleanupDiagnostic } : {}) };
-  if (decision.executionStatus === 'completed') return parseAgentTerminalSnapshot({ ...common, executionStatus: 'completed', terminationReason: decision.terminationReason, verificationStatus: deriveAgentVerificationStatus(checks, decision.checkResults) });
-  if (decision.executionStatus === 'aborted') return parseAgentTerminalSnapshot({ ...common, executionStatus: 'aborted', terminationReason: 'aborted', verificationStatus: 'not_run', errorMessage: decision.errorMessage });
-  return parseAgentTerminalSnapshot({ ...common, executionStatus: 'failed', terminationReason: decision.terminationReason, verificationStatus: 'not_run', errorMessage: decision.errorMessage });
+  if (decision.executionStatus === 'completed') {
+    if (common.candidate.status === 'absent') throw new Error('Completed execution requires a present candidate.');
+    return createAgentTerminalSnapshot({ ...common, candidate: common.candidate, executionStatus: 'completed', terminationReason: decision.terminationReason, verificationStatus: deriveAgentVerificationStatus(checks, decision.checkResults) });
+  }
+  if (decision.executionStatus === 'aborted') {
+    const candidate = common.candidate;
+    if (candidate.status !== 'absent' && candidate.status !== 'partial') throw new Error('Aborted execution can only preserve a partial candidate.');
+    const abortedCandidate: import('./run/contracts.js').AgentAbortedTerminalSnapshot['candidate'] = candidate.status === 'absent'
+      ? candidate
+      : Object.freeze({ ...candidate, status: 'partial' });
+    return createAgentTerminalSnapshot({ ...common, candidate: abortedCandidate, executionStatus: 'aborted', terminationReason: 'aborted', verificationStatus: 'not_run', errorMessage: decision.errorMessage });
+  }
+  return createAgentTerminalSnapshot({ ...common, executionStatus: 'failed', terminationReason: decision.terminationReason, verificationStatus: 'not_run', errorMessage: decision.errorMessage });
 }
 
 function candidateFromResponse(response: ModelResponse, turnIndex: number, continuingWithTools: boolean): AgentCandidate {
@@ -1086,7 +1098,7 @@ function steeringInstructions(input: readonly string[], offset: number): AgentEf
 function contextSourceIds(items: readonly ContextItemInput[] | undefined, provenance: 'configured' | 'provider' | 'run'): string[] {
   return (items ?? []).map((item, index) => isRecord(item) && typeof item.id === 'string' && item.id.length > 0
     ? item.id
-    : `${provenance}-context-${String(index + 1)}-${hashRecord(normalizeJsonSafe(item).value).slice(0, 12)}`);
+    : `${provenance}-context-${String(index + 1)}-${hashJson(normalizeJsonSafe(item).value).slice(0, 12)}`);
 }
 function turnIdentity(snapshot: AgentTurnSnapshotRecord): AgentTurnIdentity { return { turnIndex: snapshot.turnIndex, turnId: snapshot.turnId, requestAttempt: snapshot.requestAttempt }; }
 function formatOverflowDiagnostic(diagnostic: OverflowDiagnostic): string { return ['Request assembly exceeded budget after overflow recovery.', `Reason: ${diagnostic.reason}.`, `Components: messages=${String(diagnostic.messageTokens)}, contextHistory=${String(diagnostic.contextHistoryTokens)}, context=${String(diagnostic.contextTokens)}, evidence=${String(diagnostic.evidenceTokens)}, toolSchemas=${String(diagnostic.toolSchemaTokens)}, outputReserve=${String(diagnostic.outputReserveTokens)}.`, `Total request tokens=${String(diagnostic.totalRequestTokens)}.`, `Recovery actions attempted=${diagnostic.reductionsAttempted.map(formatOverflowAction).join(', ') || 'none'}.`].join(' '); }

@@ -1,4 +1,5 @@
 import { type ChatRequest, type Message, Ollama, type Tool } from 'ollama';
+import { normalizeJsonSafe, parseJsonObject } from '@agent-core/json';
 import {
   type ModelCapabilities,
   ModelContractError,
@@ -213,18 +214,18 @@ export class OllamaProvider implements ModelProvider {
         const delta = typeof wirePart.message?.content === 'string' ? wirePart.message.content : '';
         if (delta.length > 0) {
           content += delta;
-          yield { type: 'content', content: delta, accumulated: content, raw: part };
+          yield { type: 'content', content: delta, accumulated: content, raw: normalizeJsonSafe(part).value };
         }
 
         const reasoningDelta = typeof wirePart.message?.thinking === 'string' ? wirePart.message.thinking : '';
         if (reasoningDelta.length > 0) {
           reasoning += reasoningDelta;
-          yield { type: 'reasoning', reasoning: reasoningDelta, accumulatedReasoning: reasoning, raw: part };
+          yield { type: 'reasoning', reasoning: reasoningDelta, accumulatedReasoning: reasoning, raw: normalizeJsonSafe(part).value };
         }
 
         for (const toolCall of normalizeToolCalls(wirePart.message?.tool_calls ?? [])) {
           toolCalls.push(toolCall);
-          yield { type: 'tool_call', toolCall, raw: part };
+          yield { type: 'tool_call', toolCall, raw: normalizeJsonSafe(part).value };
         }
 
         if (part.done) {
@@ -292,7 +293,8 @@ export class OllamaProvider implements ModelProvider {
     const toolCalls = dedupeToolCalls([...streamedToolCalls, ...responseToolCalls]);
     const usage = normalizeUsage(response);
     const timings = normalizeTimings(response);
-    const modelResponse: ModelResponse = {
+    const responseReasoning = reasoning || response.message?.thinking;
+    return parseOllamaModelResponse({
       content: content || fallbackContent,
       model: typeof response.model === 'string' && response.model.length > 0 ? response.model : request.model,
       provider: this.id,
@@ -304,25 +306,13 @@ export class OllamaProvider implements ModelProvider {
             ? 'stop'
             : 'unknown',
       ...(response.done_reason ? { providerTerminationReason: response.done_reason } : {}),
-      raw: response
-    };
-    if (usage) {
-      modelResponse.usage = usage;
-    }
-    const responseReasoning = reasoning || response.message?.thinking;
-    if (responseReasoning) {
-      modelResponse.reasoning = responseReasoning;
-    }
-    if (toolCalls.length > 0) {
-      modelResponse.toolCalls = toolCalls;
-    }
-    if (Object.keys(timings).length > 0) {
-      modelResponse.timings = timings;
-    }
-    if (response.logprobs) {
-      modelResponse.logprobs = response.logprobs;
-    }
-    return parseOllamaModelResponse(modelResponse);
+      ...(usage ? { usage } : {}),
+      ...(responseReasoning ? { reasoning: responseReasoning } : {}),
+      ...(toolCalls.length > 0 ? { toolCalls } : {}),
+      ...(Object.keys(timings).length > 0 ? { timings } : {}),
+      ...(response.logprobs ? { logprobs: normalizeJsonSafe(response.logprobs).value } : {}),
+      raw: normalizeJsonSafe(response).value
+    });
   }
 
   private toRuntimeOptions(request: ModelRequest): OllamaGenerationOptions {
@@ -489,13 +479,13 @@ function profileFromShow(model: string, response: OllamaShowResponse, generation
     modalities: { input: declared.has('vision') ? ['text', 'image'] : ['text'], output: ['text'] },
     limits: { contextTokens, ...(outputTokens ? { outputTokens } : {}) },
     supportedParameters,
-    metadata: {
+    metadata: parseJsonObject({
       discovery: 'ollama.show',
       deployment,
       declaredCapabilities: [...declared],
       ...(response.details ? { details: response.details } : {}),
       ...(response.modified_at ? { modifiedAt: response.modified_at } : {})
-    }
+    })
   };
 }
 
@@ -539,7 +529,7 @@ function positiveIntegerOrUndefined(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined;
 }
 
-function toOllamaImages(images: ModelImage[] | undefined): Message['images'] | undefined {
+function toOllamaImages(images: readonly ModelImage[] | undefined): Message['images'] | undefined {
   if (!images || images.length === 0) {
     return undefined;
   }
@@ -612,7 +602,7 @@ function normalizeToolCalls(toolCalls: OllamaWireToolCall[]): ModelToolCall[] {
     const name = toolCall.function?.name;
     const input = toolCall.function?.arguments;
     if (typeof name !== 'string' || name.trim().length === 0 || !isJsonObject(input)) throw new ModelProviderError({ provider: 'ollama', code: 'malformed_response', message: 'Ollama tool call must contain a non-empty function name and JSON-object arguments.' });
-    return { type: 'function', name, input: { kind: 'json', value: input } };
+    return { type: 'function', name, input: { kind: 'json', value: parseJsonObject(input) } };
   });
 }
 

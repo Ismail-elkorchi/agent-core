@@ -52,7 +52,7 @@ const approvalTool = defineTool({
 test('a run stops and persists its active process before durable approval suspension', async () => {
   const state = await setup();
   const provider = new Provider([toolResponse('exec_command', { command: longCommand, yieldMs: 100 }), toolResponse('approval_write', {})]);
-  const agent = createRuntime({ ...state, provider, tools: [execCommandTool, approvalTool], authorizer: (request) => request.tool.name === 'approval_write' ? { decision: 'require_approval', reason: 'confirm' } : { decision: 'allow' } });
+  const agent = createRuntime({ ...state, provider, tools: [execCommandTool, approvalTool], authorizer: (request) => request.call.name === 'approval_write' ? { decision: 'require_approval', reason: 'confirm' } : { decision: 'allow' } });
   const result = await agent.run({ runId: 'suspension-run', task: 'suspend' });
   assert.equal(result.state, 'suspended');
   assert.equal(state.manager.activeCount('suspension-run'), 0);

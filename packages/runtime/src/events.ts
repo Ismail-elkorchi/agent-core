@@ -1,6 +1,6 @@
 import type { ContextBundle, ContextHistoryReduction, PromptProjection } from './context/manager.js';
 import type { ArtifactRef, RuntimeCodec } from '@agent-core/evidence';
-import { parseJsonObject, type JsonValue } from '@agent-core/json';
+import { parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
 import type {
   ModelCapabilities,
   ModelLimits,
@@ -12,12 +12,14 @@ import type {
   ModelUsage
 } from '@agent-core/model';
 import {
-  parseAgentCandidate,
-  parseAgentCheckResult,
-  parseAgentTerminalSnapshot,
+  decodeOwnedAgentCandidate,
+  decodeOwnedAgentCheckResult,
+  decodeOwnedAgentTerminalSnapshot,
   type AgentCandidate,
   type AgentApprovalBinding,
   type AgentCheckRequirement,
+  type AgentEffectiveInstruction,
+  type AgentRunLimits,
   type AgentCheckResult,
   type AgentDeliveryDiagnostic,
   type AgentRunBudgetState,
@@ -29,7 +31,7 @@ import {
   type AgentTurnIdentity,
   type AgentTurnSnapshotRecord
 } from './run/contracts.js';
-import { normalizeToolObservationForPersistence, type ToolCall, type ToolEffects, type ToolObservation, type ToolObservationPresentation, type ToolPolicy, type ToolProgress } from '@agent-core/tools';
+import { decodeOwnedToolObservationForPersistence, type ToolCall, type ToolEffects, type ToolObservation, type ToolObservationPresentation, type ToolPolicy, type ToolProgress } from '@agent-core/tools';
 import type { BudgetAccountantSnapshot, RequestCostEstimate } from './orchestration/budget-accountant.js';
 import type { OverflowRecoveryResult } from './orchestration/overflow-recovery.js';
 
@@ -185,14 +187,15 @@ export type AgentProgressEvent =
   | ({ readonly type: 'check.ended'; readonly result: AgentCheckResult } & AgentTurnIdentity)
   | { readonly type: 'run.ended'; readonly terminal: AgentTerminalSnapshot; readonly deliveryDiagnostics: readonly AgentDeliveryDiagnostic[] };
 
-export const agentEventCodec: RuntimeCodec<AgentEvent> = { name: 'AgentEvent', parse: parseAgentEvent };
+export const agentEventCodec: RuntimeCodec<AgentEvent> = { name: 'AgentEvent', decode: decodeAgentEvent };
 
 const AGENT_EVENT_MAX_STRING_BYTES = 1024 * 1024;
 const AGENT_EVENT_MAX_TOTAL_BYTES = 4 * 1024 * 1024;
 const AGENT_EVENT_MAX_COLLECTION_ENTRIES = 20_000;
 
-export function parseAgentEvent(value: unknown): AgentEvent {
-  let owned;
+
+export function decodeAgentEvent(value: unknown): AgentEvent & JsonObject {
+  let owned: JsonObject;
   try {
     owned = parseJsonObject(value, {
       maxDepth: 16,
@@ -205,127 +208,842 @@ export function parseAgentEvent(value: unknown): AgentEvent {
     const code = message.includes('accessor') ? 'accessor' : message.includes('string byte limit') ? 'text_truncated' : 'invalid_json';
     throw new Error(`Agent event is not safely serializable: ${code}. ${message}`, { cause: error });
   }
-  if (typeof owned.type !== 'string') throw new Error('Agent event must have a type.');
-  if (!isAgentEventType(owned.type)) throw new Error(`Unsupported Agent event type: ${owned.type}.`);
-  const issues = validateEventShape(owned);
-  if (issues.length > 0) throw new Error(`Malformed Agent event ${owned.type}: ${issues.join(' ')}`);
-  let parsed: unknown;
-  if (owned.type === 'run.ended' || owned.type === 'finalization.prepared') {
-    parsed = { ...owned, terminal: parseAgentTerminalSnapshot(owned.terminal) };
-  } else if (owned.type === 'assistant.ended' || owned.type === 'assistant.interrupted') {
-    const candidate = parseAgentCandidate(owned.candidate);
-    if (candidate.status !== 'absent' && candidate.turnIndex !== owned.turnIndex) throw new Error(`Malformed Agent event ${owned.type}: candidate turnIndex does not match event turnIndex.`);
-    parsed = { ...owned, candidate };
-  } else if (owned.type === 'check.ended') {
-    const result = parseAgentCheckResult(owned.result);
-    if (result.id !== owned.check) throw new Error('Malformed Agent event check.ended: check id does not match result id.');
-    parsed = { ...owned, result };
-  } else if (owned.type === 'tool.ended') {
-    parsed = { ...owned, observation: normalizeToolObservationForPersistence(owned.observation) };
-  } else {
-    parsed = owned;
+  const type = decodeEventType(owned.type);
+  return AGENT_EVENT_DECODERS[type](owned) as AgentEvent & JsonObject;
+}
+
+function decodeEventType(value: JsonValue | undefined): AgentEvent['type'] {
+  if (typeof value !== 'string') throw malformed('type is invalid');
+  for (const type of AGENT_EVENT_TYPES) if (type === value) return type;
+  throw malformed(`unsupported type ${value}`);
+}
+
+type AgentEventOf<Type extends AgentEvent['type']> = Extract<AgentEvent, { readonly type: Type }>;
+type AgentEventDecoderMap = { readonly [Type in AgentEvent['type']]: (value: JsonObject) => AgentEventOf<Type> };
+
+const AGENT_EVENT_DECODERS = {
+  'run.started': (value) => {
+    exact(value, ['type', 'runId', 'finalizationId', 'task', 'model', 'toolPolicy', 'metadata']);
+    const metadata = optionalStringRecord(value.metadata, 'metadata');
+    return Object.freeze({
+      type: 'run.started', runId: requiredString(value.runId, 'runId'), finalizationId: requiredString(value.finalizationId, 'finalizationId'),
+      task: requiredString(value.task, 'task'), model: requiredString(value.model, 'model'), toolPolicy: decodeToolPolicy(value.toolPolicy),
+      ...(metadata ? { metadata } : {})
+    });
+  },
+  'run.phase.changed': (value) => {
+    exact(value, ['type', 'runId', 'phase', 'budget']);
+    return Object.freeze({ type: 'run.phase.changed', runId: requiredString(value.runId, 'runId'), phase: requiredEnum(value.phase, RUN_PHASES, 'phase'), budget: decodeRunBudget(value.budget) });
+  },
+  'run.configured': (value) => {
+    exact(value, ['type', 'configuration']);
+    return Object.freeze({ type: 'run.configured', configuration: decodeRunConfiguration(value.configuration) });
+  },
+  'turn.snapshot.created': (value) => {
+    exact(value, ['type', 'snapshot']);
+    return Object.freeze({ type: 'turn.snapshot.created', snapshot: decodeTurnSnapshot(value.snapshot) });
+  },
+  'request.snapshot.created': (value) => {
+    exact(value, ['type', 'snapshot']);
+    return Object.freeze({ type: 'request.snapshot.created', snapshot: decodeRequestSnapshot(value.snapshot) });
+  },
+  'run.retry.scheduled': (value) => {
+    exact(value, ['type', ...TURN_KEYS, 'kind', 'attempt', 'delayMs', 'diagnostic']);
+    const diagnostic = optionalDiagnostic(value.diagnostic);
+    return Object.freeze({ type: 'run.retry.scheduled', ...decodeTurnIdentity(value), kind: requiredEnum(value.kind, RETRY_KINDS, 'kind'), attempt: positiveInteger(value.attempt, 'attempt'), delayMs: nonnegativeNumber(value.delayMs, 'delayMs'), ...(diagnostic ? { diagnostic } : {}) });
+  },
+  'finalization.prepared': (value) => {
+    exact(value, ['type', 'terminal']);
+    return Object.freeze({ type: 'finalization.prepared', terminal: decodeOwnedAgentTerminalSnapshot(requiredObject(value.terminal, 'terminal')) });
+  },
+  'run.ended': (value) => {
+    exact(value, ['type', 'terminal', 'diagnostic']);
+    const diagnostic = optionalDiagnostic(value.diagnostic, true);
+    return Object.freeze({ type: 'run.ended', terminal: decodeOwnedAgentTerminalSnapshot(requiredObject(value.terminal, 'terminal')), ...(diagnostic ? { diagnostic } : {}) });
+  },
+  'delivery.failed': (value) => {
+    exact(value, ['type', 'finalizationId', 'diagnostic']);
+    return Object.freeze({ type: 'delivery.failed', finalizationId: requiredString(value.finalizationId, 'finalizationId'), diagnostic: decodeDeliveryDiagnostic(value.diagnostic) });
+  },
+  'process.ended': (value) => {
+    exact(value, ['type', 'runId', 'processId', 'status', 'result']);
+    return Object.freeze({ type: 'process.ended', runId: requiredString(value.runId, 'runId'), processId: requiredString(value.processId, 'processId'), status: requiredString(value.status, 'status'), result: requiredJson(value.result, 'result') });
+  },
+  'turn.started': (value) => {
+    exact(value, ['type', 'runId', 'task', 'sessionId', 'sessionEntryId', ...TURN_KEYS]);
+    const sessionId = optionalString(value.sessionId, 'sessionId');
+    const sessionEntryId = optionalString(value.sessionEntryId, 'sessionEntryId');
+    return Object.freeze({ type: 'turn.started', ...decodeTurnIdentity(value), runId: requiredString(value.runId, 'runId'), task: requiredString(value.task, 'task'), ...(sessionId ? { sessionId } : {}), ...(sessionEntryId ? { sessionEntryId } : {}) });
+  },
+  'context.replay.created': (value) => {
+    exact(value, ['type', ...REPLAY_KEYS]);
+    return Object.freeze({ type: 'context.replay.created', ...decodeReplayPayload(value) });
+  },
+  'provider.state.restored': (value) => {
+    exact(value, ['type', 'state', 'stateRef']);
+    const stateRef = optionalArtifactRef(value.stateRef);
+    return Object.freeze({ type: 'provider.state.restored', state: decodeProviderStateSummary(value.state), ...(stateRef ? { stateRef } : {}) });
+  },
+  'provider.state.updated': (value) => {
+    exact(value, ['type', ...TURN_KEYS, 'state', 'stateRef']);
+    return Object.freeze({ type: 'provider.state.updated', ...decodeTurnIdentity(value), state: decodeProviderStateSummary(value.state), stateRef: decodeArtifactRef(value.stateRef) });
+  },
+  'input.received': (value) => {
+    exact(value, ['type', 'task']);
+    return Object.freeze({ type: 'input.received', task: requiredString(value.task, 'task') });
+  },
+  'context.bundle.created': (value) => {
+    exact(value, ['type', 'bundle']);
+    return Object.freeze({ type: 'context.bundle.created', bundle: decodeContextBundle(value.bundle) });
+  },
+  'prompt.projection.created': (value) => {
+    exact(value, ['type', 'projection']);
+    return Object.freeze({ type: 'prompt.projection.created', projection: decodePromptProjection(value.projection) });
+  },
+  'assistant.started': (value) => {
+    exact(value, ['type', ...TURN_KEYS]);
+    return Object.freeze({ type: 'assistant.started', ...decodeTurnIdentity(value) });
+  },
+  'assistant.ended': (value) => {
+    exact(value, ['type', ...TURN_KEYS, 'content', 'candidate', 'toolCalls']);
+    const identity = decodeTurnIdentity(value);
+    const candidate = decodeOwnedAgentCandidate(requiredObject(value.candidate, 'candidate'));
+    if (candidate.status !== 'absent' && candidate.turnIndex !== identity.turnIndex) throw malformed('candidate turnIndex does not match event turnIndex');
+    const toolCalls = optionalArray(value.toolCalls, 'toolCalls')?.map((call, index) => decodeToolCall(call, `toolCalls[${String(index)}]`));
+    return Object.freeze({ type: 'assistant.ended', ...identity, content: requiredStringValue(value.content, 'content'), candidate, ...(toolCalls ? { toolCalls: Object.freeze(toolCalls) } : {}) });
+  },
+  'assistant.interrupted': (value) => {
+    exact(value, ['type', ...TURN_KEYS, 'content', 'candidate', 'reasoningSummary', 'finalResponseReceived', 'diagnostic']);
+    const identity = decodeTurnIdentity(value);
+    const candidate = decodeOwnedAgentCandidate(requiredObject(value.candidate, 'candidate'));
+    if (candidate.status !== 'absent' && candidate.turnIndex !== identity.turnIndex) throw malformed('candidate turnIndex does not match event turnIndex');
+    const reasoningSummary = optionalStringValue(value.reasoningSummary, 'reasoningSummary');
+    const diagnostic = optionalDiagnostic(value.diagnostic);
+    return Object.freeze({ type: 'assistant.interrupted', ...identity, content: requiredStringValue(value.content, 'content'), candidate, ...(reasoningSummary !== undefined ? { reasoningSummary } : {}), finalResponseReceived: requiredBoolean(value.finalResponseReceived, 'finalResponseReceived'), ...(diagnostic ? { diagnostic } : {}) });
+  },
+  'model.failed': (value) => {
+    exact(value, ['type', ...TURN_KEYS, 'diagnostic']);
+    return Object.freeze({ type: 'model.failed', ...decodeTurnIdentity(value), diagnostic: decodeDiagnostic(value.diagnostic) });
+  },
+  'model.requested': (value) => {
+    exact(value, ['type', ...TURN_KEYS, 'request']);
+    return Object.freeze({ type: 'model.requested', ...decodeTurnIdentity(value), request: decodeModelRequestSummary(value.request) });
+  },
+  'model.responded': (value) => {
+    exact(value, ['type', ...TURN_KEYS, 'response']);
+    return Object.freeze({ type: 'model.responded', ...decodeTurnIdentity(value), response: decodeModelResponseSummary(value.response) });
+  },
+  'budget.estimate.created': (value) => {
+    exact(value, ['type', ...TURN_KEYS, 'attempt', 'estimate', 'snapshot']);
+    return Object.freeze({ type: 'budget.estimate.created', ...decodeTurnIdentity(value), attempt: positiveInteger(value.attempt, 'attempt'), estimate: decodeRequestCostEstimate(value.estimate), snapshot: decodeBudgetSnapshot(value.snapshot) });
+  },
+  'budget.provider_usage.recorded': (value) => {
+    exact(value, ['type', ...TURN_KEYS, 'usage', 'snapshot']);
+    return Object.freeze({ type: 'budget.provider_usage.recorded', ...decodeTurnIdentity(value), usage: decodeModelUsage(value.usage), snapshot: decodeBudgetSnapshot(value.snapshot) });
+  },
+  'overflow.recovery.started': (value) => {
+    exact(value, ['type', ...TURN_KEYS, 'attempt', 'estimate', 'snapshot']);
+    return Object.freeze({ type: 'overflow.recovery.started', ...decodeTurnIdentity(value), attempt: positiveInteger(value.attempt, 'attempt'), estimate: decodeRequestCostEstimate(value.estimate), snapshot: decodeBudgetSnapshot(value.snapshot) });
+  },
+  'overflow.recovery.ended': (value) => {
+    exact(value, ['type', ...TURN_KEYS, 'attempt', 'result']);
+    return Object.freeze({ type: 'overflow.recovery.ended', ...decodeTurnIdentity(value), attempt: positiveInteger(value.attempt, 'attempt'), result: decodeOverflowResult(value.result) });
+  },
+  'context.history.reduced': (value) => {
+    exact(value, ['type', ...TURN_KEYS, 'reductions']);
+    return Object.freeze({ type: 'context.history.reduced', ...decodeTurnIdentity(value), reductions: Object.freeze(requiredArray(value.reductions, 'reductions').map((item, index) => decodeHistoryReduction(item, `reductions[${String(index)}]`))) });
+  },
+  'context.checkpoint.created': (value) => {
+    exact(value, ['type', ...TURN_KEYS, 'compactedToolResults', 'removedItems', 'beforeBytes', 'afterBytes']);
+    return Object.freeze({ type: 'context.checkpoint.created', ...decodeTurnIdentity(value), compactedToolResults: nonnegativeInteger(value.compactedToolResults, 'compactedToolResults'), ...optionalNonnegativeFields(value, ['removedItems', 'beforeBytes', 'afterBytes']) });
+  },
+  'observation.record.created': (value) => {
+    exact(value, ['type', ...TOOL_ATTEMPT_KEYS, 'id', 'toolName', 'call', 'toolCallType', 'evidence', 'immediatePresentation', 'retainedPresentation', 'durableStorageDegraded']);
+    const degraded = value.durableStorageDegraded === undefined ? undefined : decodeMessageRecord(value.durableStorageDegraded, 'durableStorageDegraded');
+    return Object.freeze({
+      type: 'observation.record.created', ...decodeToolAttemptIdentity(value), id: requiredString(value.id, 'id'), toolName: requiredString(value.toolName, 'toolName'),
+      call: decodeToolCall(value.call, 'call'), toolCallType: requiredEnum(value.toolCallType, TOOL_CALL_TYPES, 'toolCallType'), evidence: requiredJson(value.evidence, 'evidence'),
+      immediatePresentation: decodePresentation(value.immediatePresentation, 'immediatePresentation'), retainedPresentation: decodePresentation(value.retainedPresentation, 'retainedPresentation'),
+      ...(degraded ? { durableStorageDegraded: degraded } : {})
+    });
+  },
+  'observation.projection.failed': (value) => {
+    exact(value, ['type', ...TOOL_ATTEMPT_KEYS, 'id', 'toolName', 'message']);
+    return Object.freeze({ type: 'observation.projection.failed', ...decodeToolAttemptIdentity(value), id: requiredString(value.id, 'id'), toolName: requiredString(value.toolName, 'toolName'), message: requiredStringValue(value.message, 'message') });
+  },
+  'tool.authorization.decided': (value) => {
+    exact(value, ['type', ...TOOL_CALL_KEYS, 'toolName', 'fingerprint', 'binding', 'decision', 'reason']);
+    const reason = optionalStringValue(value.reason, 'reason');
+    return Object.freeze({ type: 'tool.authorization.decided', ...decodeToolCallIdentity(value), toolName: requiredString(value.toolName, 'toolName'), fingerprint: requiredString(value.fingerprint, 'fingerprint'), binding: decodeApprovalBinding(value.binding), decision: requiredEnum(value.decision, AUTHORIZATION_DECISIONS, 'decision'), ...(reason !== undefined ? { reason } : {}) });
+  },
+  'approval.requested': (value) => {
+    exact(value, ['type', ...TOOL_CALL_KEYS, 'runId', 'approvalId', 'toolName', 'fingerprint', 'input', 'effects', 'binding', 'policyHash', 'reason']);
+    return Object.freeze({
+      type: 'approval.requested', ...decodeToolCallIdentity(value), runId: requiredString(value.runId, 'runId'), approvalId: requiredString(value.approvalId, 'approvalId'),
+      toolName: requiredString(value.toolName, 'toolName'), fingerprint: requiredString(value.fingerprint, 'fingerprint'), input: requiredJson(value.input, 'input'),
+      effects: decodeToolEffects(value.effects), binding: decodeApprovalBinding(value.binding), policyHash: requiredString(value.policyHash, 'policyHash'), reason: requiredStringValue(value.reason, 'reason')
+    });
+  },
+  'approval.resolved': (value) => {
+    exact(value, ['type', ...TOOL_CALL_KEYS, 'runId', 'approvalId', 'fingerprint', 'binding', 'decision']);
+    return Object.freeze({ type: 'approval.resolved', ...decodeToolCallIdentity(value), runId: requiredString(value.runId, 'runId'), approvalId: requiredString(value.approvalId, 'approvalId'), fingerprint: requiredString(value.fingerprint, 'fingerprint'), binding: decodeApprovalBinding(value.binding), decision: requiredEnum(value.decision, APPROVAL_DECISIONS, 'decision') });
+  },
+  'tool.started': (value) => {
+    exact(value, ['type', ...TOOL_ATTEMPT_KEYS, 'toolName', 'input', 'fingerprint', 'effects']);
+    return Object.freeze({ type: 'tool.started', ...decodeToolAttemptIdentity(value), toolName: requiredString(value.toolName, 'toolName'), input: decodeToolCall(value.input, 'input'), fingerprint: requiredString(value.fingerprint, 'fingerprint'), effects: decodeToolEffects(value.effects) });
+  },
+  'tool.updated': (value) => {
+    exact(value, ['type', ...TOOL_ATTEMPT_KEYS, 'toolName', 'progress']);
+    return Object.freeze({ type: 'tool.updated', ...decodeToolAttemptIdentity(value), toolName: requiredString(value.toolName, 'toolName'), progress: decodeToolProgress(value.progress) });
+  },
+  'tool.ended': (value) => {
+    exact(value, ['type', ...TOOL_ATTEMPT_KEYS, 'toolName', 'observation']);
+    return Object.freeze({ type: 'tool.ended', ...decodeToolAttemptIdentity(value), toolName: requiredString(value.toolName, 'toolName'), observation: decodeOwnedToolObservationForPersistence(requiredObject(value.observation, 'observation')) });
+  },
+  'check.started': (value) => {
+    exact(value, ['type', ...TURN_KEYS, 'check', 'requirement', 'timeoutMs']);
+    return Object.freeze({ type: 'check.started', ...decodeTurnIdentity(value), check: requiredString(value.check, 'check'), requirement: requiredEnum(value.requirement, CHECK_REQUIREMENTS, 'requirement'), timeoutMs: positiveInteger(value.timeoutMs, 'timeoutMs') });
+  },
+  'check.ended': (value) => {
+    exact(value, ['type', ...TURN_KEYS, 'check', 'result']);
+    const check = requiredString(value.check, 'check');
+    const result = decodeOwnedAgentCheckResult(requiredObject(value.result, 'result'));
+    if (result.id !== check) throw malformed('check id does not match result id');
+    return Object.freeze({ type: 'check.ended', ...decodeTurnIdentity(value), check, result });
   }
-  if (!isAgentEvent(parsed)) throw new Error(`Malformed Agent event ${owned.type}: validated fields did not form an event.`);
-  return parseJsonObject(parsed, {
-    maxDepth: 16,
-    maxCollectionEntries: AGENT_EVENT_MAX_COLLECTION_ENTRIES,
-    maxStringBytes: AGENT_EVENT_MAX_STRING_BYTES,
-    maxTotalBytes: AGENT_EVENT_MAX_TOTAL_BYTES
-  }) as unknown as AgentEvent;
-}
+} satisfies AgentEventDecoderMap;
 
-function validateEventShape(value: Record<string, unknown>): string[] {
-  const issues: string[] = [];
-  const turnTypes = new Set([
-    'run.retry.scheduled', 'provider.state.updated', 'assistant.started', 'assistant.ended', 'assistant.interrupted',
-    'model.failed', 'model.requested', 'model.responded', 'budget.estimate.created', 'budget.provider_usage.recorded',
-    'overflow.recovery.started', 'overflow.recovery.ended', 'context.history.reduced', 'context.checkpoint.created',
-    'observation.record.created', 'observation.projection.failed', 'tool.authorization.decided', 'approval.requested', 'approval.resolved', 'tool.started', 'tool.updated', 'tool.ended'
-  ]);
-  if (turnTypes.has(String(value.type))) {
-    if (!positiveInteger(value.turnIndex)) issues.push('turnIndex must be a positive integer.');
-    requireStrings(value, ['turnId'], issues);
-    if (!positiveInteger(value.requestAttempt)) issues.push('requestAttempt must be positive.');
+const AGENT_EVENT_TYPES = Object.freeze(Object.keys(AGENT_EVENT_DECODERS)) as readonly AgentEvent['type'][];
+const TURN_KEYS = ['turnIndex', 'turnId', 'requestAttempt'] as const;
+const TOOL_CALL_KEYS = [...TURN_KEYS, 'toolBatchId', 'callIndex', 'callId'] as const;
+const TOOL_ATTEMPT_KEYS = [...TOOL_CALL_KEYS, 'toolAttempt'] as const;
+const REPLAY_KEYS = ['sessionId', 'replayedLedgers', 'replayedTurns', 'replayedSessionEntries', 'replayedCheckpoints', 'replayedToolResults', 'replayedEvidenceRecords', 'restoredProviderState', 'restoredProviderStateRef'] as const;
+const RUN_PHASES = ['preparing', 'requesting_model', 'executing_tools', 'waiting_for_approval', 'verifying', 'finalizing', 'ended'] as const;
+const RETRY_KINDS = ['transport', 'provider_request', 'agent_turn'] as const;
+const TOOL_CALL_TYPES = ['function', 'custom'] as const;
+const AUTHORIZATION_DECISIONS = ['allow', 'deny', 'require_approval'] as const;
+const APPROVAL_DECISIONS = ['allow', 'deny'] as const;
+const CHECK_REQUIREMENTS = ['required', 'advisory'] as const;
+const PRICING_STATUSES = ['known', 'partial', 'unknown'] as const;
+const BUDGET_PRESSURES = ['normal', 'constrained', 'critical', 'exhausted'] as const;
+const TERMINATION_REASONS = ['stop', 'tool_calls', 'output_limit', 'content_filter', 'unknown'] as const;
+const TOOL_RISKS = ['read', 'write', 'execute', 'network', 'destructive'] as const;
+const TOOL_ACCESS_MODES = ['read', 'write', 'execute', 'network', 'delete'] as const;
+const REASONING_STRATEGIES = ['disabled', 'enabled', 'effort', 'budget'] as const;
+const REASONING_SUMMARIES = ['auto', 'concise', 'detailed'] as const;
+const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+const REASONING_MODES = ['standard', 'pro'] as const;
+const HISTORY_REDUCTION_KINDS = ['tool_result_reduced', 'checkpoint_installed', 'image_content_removed'] as const;
+const HISTORY_REASONS = ['unsupported_modality', 'image_count_limit', 'image_byte_limit', 'image_token_limit'] as const;
+
+function decodeTurnIdentity(value: JsonObject): AgentTurnIdentity {
+  return Object.freeze({ turnIndex: positiveInteger(value.turnIndex, 'turnIndex'), turnId: requiredString(value.turnId, 'turnId'), requestAttempt: positiveInteger(value.requestAttempt, 'requestAttempt') });
+}
+function decodeToolCallIdentity(value: JsonObject): AgentToolCallIdentity {
+  const callId = optionalStringValue(value.callId, 'callId');
+  return Object.freeze({ ...decodeTurnIdentity(value), toolBatchId: requiredString(value.toolBatchId, 'toolBatchId'), callIndex: nonnegativeInteger(value.callIndex, 'callIndex'), ...(callId !== undefined ? { callId } : {}) });
+}
+function decodeToolAttemptIdentity(value: JsonObject): AgentToolCallAttemptIdentity {
+  return Object.freeze({ ...decodeToolCallIdentity(value), toolAttempt: positiveInteger(value.toolAttempt, 'toolAttempt') });
+}
+function decodeReplayPayload(value: JsonObject): AgentReplayPayload {
+  const restoredProviderState = value.restoredProviderState === undefined ? undefined : decodeProviderStateSummary(value.restoredProviderState);
+  const restoredProviderStateRef = optionalArtifactRef(value.restoredProviderStateRef);
+  return Object.freeze({
+    sessionId: requiredString(value.sessionId, 'sessionId'), replayedLedgers: nonnegativeInteger(value.replayedLedgers, 'replayedLedgers'),
+    replayedTurns: nonnegativeInteger(value.replayedTurns, 'replayedTurns'), replayedSessionEntries: nonnegativeInteger(value.replayedSessionEntries, 'replayedSessionEntries'),
+    replayedCheckpoints: nonnegativeInteger(value.replayedCheckpoints, 'replayedCheckpoints'), replayedToolResults: nonnegativeInteger(value.replayedToolResults, 'replayedToolResults'),
+    replayedEvidenceRecords: nonnegativeInteger(value.replayedEvidenceRecords, 'replayedEvidenceRecords'),
+    ...(restoredProviderState ? { restoredProviderState } : {}), ...(restoredProviderStateRef ? { restoredProviderStateRef } : {})
+  });
+}
+function decodeRunBudget(value: JsonValue | undefined): AgentRunBudgetState {
+  const object = requiredObject(value, 'budget');
+  exact(object, ['modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'elapsedMs', 'promptTokens', 'completionTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'knownCosts', 'pricingStatus', 'unknownPricedTokens', 'consecutiveProviderFailures', 'consecutiveToolFailures', 'providerRetries']);
+  return Object.freeze({
+    modelTurns: nonnegativeInteger(object.modelTurns, 'budget.modelTurns'), totalToolCalls: nonnegativeInteger(object.totalToolCalls, 'budget.totalToolCalls'),
+    repeatedIdenticalToolCalls: nonnegativeInteger(object.repeatedIdenticalToolCalls, 'budget.repeatedIdenticalToolCalls'), elapsedMs: nonnegativeInteger(object.elapsedMs, 'budget.elapsedMs'),
+    promptTokens: nonnegativeInteger(object.promptTokens, 'budget.promptTokens'), completionTokens: nonnegativeInteger(object.completionTokens, 'budget.completionTokens'),
+    cacheReadTokens: nonnegativeInteger(object.cacheReadTokens, 'budget.cacheReadTokens'), cacheWriteTokens: nonnegativeInteger(object.cacheWriteTokens, 'budget.cacheWriteTokens'),
+    reasoningTokens: nonnegativeInteger(object.reasoningTokens, 'budget.reasoningTokens'), knownCosts: nonnegativeNumberRecord(object.knownCosts, 'budget.knownCosts'),
+    pricingStatus: requiredEnum(object.pricingStatus, PRICING_STATUSES, 'budget.pricingStatus'), unknownPricedTokens: nonnegativeInteger(object.unknownPricedTokens, 'budget.unknownPricedTokens'),
+    consecutiveProviderFailures: nonnegativeInteger(object.consecutiveProviderFailures, 'budget.consecutiveProviderFailures'), consecutiveToolFailures: nonnegativeInteger(object.consecutiveToolFailures, 'budget.consecutiveToolFailures'),
+    providerRetries: nonnegativeInteger(object.providerRetries, 'budget.providerRetries')
+  });
+}
+function decodeRunConfiguration(value: JsonValue | undefined): AgentRunConfiguration {
+  const object = requiredObject(value, 'configuration');
+  exact(object, ['provider', 'model', 'tools', 'toolPolicy', 'authority', 'requestWindow', 'runtime']);
+  const provider = requiredObject(object.provider, 'configuration.provider');
+  exact(provider, ['id', 'displayName']);
+  const model = requiredObject(object.model, 'configuration.model');
+  exact(model, ['id', 'provider', 'displayName', 'limits', 'modalities', 'capabilities', 'supportedParameters']);
+  const authority = requiredObject(object.authority, 'configuration.authority');
+  exact(authority, ['ambientShell', 'summary']);
+  const requestWindow = requiredObject(object.requestWindow, 'configuration.requestWindow');
+  exact(requestWindow, ['contextWindowTokens', 'maxOutputTokens', 'maxPromptTokens', 'requestedMaxOutputTokens']);
+  const runtime = requiredObject(object.runtime, 'configuration.runtime');
+  exact(runtime, ['temperature', 'reasoning', 'metadataKeys']);
+  const displayName = optionalStringValue(model.displayName, 'configuration.model.displayName');
+  const temperature = optionalFiniteNumber(runtime.temperature, 'configuration.runtime.temperature');
+  const reasoning = runtime.reasoning === undefined ? undefined : decodeReasoning(runtime.reasoning);
+  const requestedMaxOutputTokens = optionalPositiveInteger(requestWindow.requestedMaxOutputTokens, 'configuration.requestWindow.requestedMaxOutputTokens');
+  return Object.freeze({
+    provider: Object.freeze({ id: requiredString(provider.id, 'configuration.provider.id'), displayName: requiredString(provider.displayName, 'configuration.provider.displayName') }),
+    model: Object.freeze({
+      id: requiredString(model.id, 'configuration.model.id'), provider: requiredString(model.provider, 'configuration.model.provider'), ...(displayName !== undefined ? { displayName } : {}),
+      limits: decodeModelLimits(model.limits), modalities: decodeModelModalities(model.modalities), capabilities: decodeModelCapabilities(model.capabilities),
+      supportedParameters: stringArray(model.supportedParameters, 'configuration.model.supportedParameters')
+    }),
+    tools: Object.freeze(requiredArray(object.tools, 'configuration.tools').map((item, index) => {
+      const tool = requiredObject(item, `configuration.tools[${String(index)}]`);
+      exact(tool, ['name', 'accessModes']);
+      return Object.freeze({ name: requiredString(tool.name, `configuration.tools[${String(index)}].name`), accessModes: stringArray(tool.accessModes, `configuration.tools[${String(index)}].accessModes`) });
+    })),
+    toolPolicy: decodeToolPolicy(object.toolPolicy),
+    authority: Object.freeze({ ambientShell: requiredBoolean(authority.ambientShell, 'configuration.authority.ambientShell'), summary: requiredStringValue(authority.summary, 'configuration.authority.summary') }),
+    requestWindow: Object.freeze({
+      contextWindowTokens: positiveInteger(requestWindow.contextWindowTokens, 'configuration.requestWindow.contextWindowTokens'),
+      maxOutputTokens: positiveInteger(requestWindow.maxOutputTokens, 'configuration.requestWindow.maxOutputTokens'),
+      maxPromptTokens: positiveInteger(requestWindow.maxPromptTokens, 'configuration.requestWindow.maxPromptTokens'),
+      ...(requestedMaxOutputTokens !== undefined ? { requestedMaxOutputTokens } : {})
+    }),
+    runtime: Object.freeze({ ...(temperature !== undefined ? { temperature } : {}), ...(reasoning ? { reasoning } : {}), metadataKeys: stringArray(runtime.metadataKeys, 'configuration.runtime.metadataKeys') })
+  });
+}
+function decodeModelLimits(value: JsonValue | undefined): ModelLimits {
+  const object = requiredObject(value, 'model.limits');
+  exact(object, ['contextTokens', 'maxInputTokens', 'outputTokens']);
+  const contextTokens = optionalPositiveInteger(object.contextTokens, 'model.limits.contextTokens');
+  const maxInputTokens = optionalPositiveInteger(object.maxInputTokens, 'model.limits.maxInputTokens');
+  const outputTokens = optionalPositiveInteger(object.outputTokens, 'model.limits.outputTokens');
+  return Object.freeze({ ...(contextTokens ? { contextTokens } : {}), ...(maxInputTokens ? { maxInputTokens } : {}), ...(outputTokens ? { outputTokens } : {}) });
+}
+function decodeModelModalities(value: JsonValue | undefined): ModelModalities {
+  const object = requiredObject(value, 'model.modalities');
+  exact(object, ['input', 'output']);
+  return Object.freeze({ input: stringArray(object.input, 'model.modalities.input'), output: stringArray(object.output, 'model.modalities.output') });
+}
+function decodeModelCapabilities(value: JsonValue | undefined): ModelCapabilities {
+  const object = requiredObject(value, 'model.capabilities');
+  exact(object, ['streaming', 'toolCalling', 'supportedToolInputs', 'jsonMode', 'jsonSchema', 'logprobs', 'temperature', 'topP', 'reasoning']);
+  const reasoning = object.reasoning === undefined ? undefined : decodeReasoningCapabilities(object.reasoning);
+  return Object.freeze({
+    streaming: requiredBoolean(object.streaming, 'model.capabilities.streaming'), toolCalling: requiredBoolean(object.toolCalling, 'model.capabilities.toolCalling'),
+    supportedToolInputs: Object.freeze(requiredArray(object.supportedToolInputs, 'model.capabilities.supportedToolInputs').map((item, index) => {
+      const support = requiredObject(item, `supportedToolInputs[${String(index)}]`);
+      if (support.kind === 'json' || support.kind === 'text') { exact(support, ['kind']); return Object.freeze({ kind: support.kind }); }
+      exact(support, ['kind', 'syntax']);
+      if (support.kind !== 'grammar') throw malformed(`supportedToolInputs[${String(index)}].kind is invalid`);
+      return Object.freeze({ kind: 'grammar' as const, syntax: requiredString(support.syntax, `supportedToolInputs[${String(index)}].syntax`) });
+    })),
+    jsonMode: requiredBoolean(object.jsonMode, 'model.capabilities.jsonMode'), jsonSchema: requiredBoolean(object.jsonSchema, 'model.capabilities.jsonSchema'),
+    logprobs: requiredBoolean(object.logprobs, 'model.capabilities.logprobs'), temperature: requiredBoolean(object.temperature, 'model.capabilities.temperature'),
+    topP: requiredBoolean(object.topP, 'model.capabilities.topP'), ...(reasoning ? { reasoning } : {})
+  });
+}
+function decodeReasoningCapabilities(value: JsonValue): NonNullable<ModelCapabilities['reasoning']> {
+  const object = requiredObject(value, 'model.capabilities.reasoning');
+  exact(object, ['strategies', 'canDisable', 'efforts', 'modes', 'summaries', 'separateOutput']);
+  const efforts = object.efforts === undefined ? undefined : enumArray(object.efforts, ['none', ...REASONING_EFFORTS] as const, 'reasoning.efforts');
+  const modes = object.modes === undefined ? undefined : enumArray(object.modes, REASONING_MODES, 'reasoning.modes');
+  const summaries = object.summaries === undefined ? undefined : enumArray(object.summaries, REASONING_SUMMARIES, 'reasoning.summaries');
+  return Object.freeze({
+    strategies: enumArray(object.strategies, ['toggle', 'effort', 'budget'] as const, 'reasoning.strategies'), canDisable: requiredBoolean(object.canDisable, 'reasoning.canDisable'),
+    ...(efforts ? { efforts } : {}), ...(modes ? { modes } : {}), ...(summaries ? { summaries } : {}), separateOutput: requiredBoolean(object.separateOutput, 'reasoning.separateOutput')
+  });
+}
+function decodeReasoning(value: JsonValue): ModelReasoningRequest {
+  const object = requiredObject(value, 'reasoning');
+  const strategy = requiredEnum(object.strategy, REASONING_STRATEGIES, 'reasoning.strategy');
+  if (strategy === 'disabled') { exact(object, ['strategy']); return Object.freeze({ strategy }); }
+  const summary = object.summary === undefined ? undefined : requiredEnum(object.summary, REASONING_SUMMARIES, 'reasoning.summary');
+  if (strategy === 'enabled') { exact(object, ['strategy', 'summary']); return Object.freeze({ strategy, ...(summary ? { summary } : {}) }); }
+  if (strategy === 'effort') {
+    exact(object, ['strategy', 'effort', 'mode', 'summary']);
+    const mode = object.mode === undefined ? undefined : requiredEnum(object.mode, REASONING_MODES, 'reasoning.mode');
+    return Object.freeze({ strategy, effort: requiredEnum(object.effort, REASONING_EFFORTS, 'reasoning.effort'), ...(mode ? { mode } : {}), ...(summary ? { summary } : {}) });
   }
-  const toolTypes = new Set(['observation.record.created', 'observation.projection.failed', 'tool.authorization.decided', 'approval.requested', 'approval.resolved', 'tool.started', 'tool.updated', 'tool.ended']);
-  if (toolTypes.has(String(value.type))) requireStrings(value, ['toolBatchId'], issues);
-  if (!isAgentEventType(value.type)) return ['type is unsupported.'];
-  EVENT_VALIDATORS[value.type](value, issues);
-  return issues;
+  exact(object, ['strategy', 'maxTokens', 'summary']);
+  return Object.freeze({ strategy, maxTokens: positiveInteger(object.maxTokens, 'reasoning.maxTokens'), ...(summary ? { summary } : {}) });
+}
+function decodeToolPolicy(value: JsonValue | undefined): ToolPolicy {
+  const object = requiredObject(value, 'toolPolicy');
+  exact(object, ['allowedRisks', 'dryRunWrites']);
+  const allowedRisks = enumArray(object.allowedRisks, TOOL_RISKS, 'toolPolicy.allowedRisks');
+  if (new Set(allowedRisks).size !== allowedRisks.length) throw malformed('toolPolicy.allowedRisks must be unique');
+  const dryRunWrites = object.dryRunWrites === undefined ? undefined : requiredBoolean(object.dryRunWrites, 'toolPolicy.dryRunWrites');
+  return Object.freeze({ allowedRisks, ...(dryRunWrites !== undefined ? { dryRunWrites } : {}) });
+}
+function decodeTurnSnapshot(value: JsonValue | undefined): AgentTurnSnapshotRecord {
+  const object = requiredObject(value, 'snapshot');
+  exact(object, ['turnIndex', 'turnId', 'requestAttempt', 'provider', 'model', 'profileHash', 'continuationEligible', 'temperature', 'reasoning', 'responseFormat', 'toolNames', 'toolPolicyHash', 'instructions', 'configuredContextSourceIds', 'checkIds', 'limits', 'budget']);
+  const temperature = optionalFiniteNumber(object.temperature, 'snapshot.temperature');
+  const reasoning = object.reasoning === undefined ? undefined : decodeReasoning(object.reasoning);
+  const responseFormat = object.responseFormat === undefined ? undefined : decodeResponseFormat(object.responseFormat);
+  return Object.freeze({
+    ...decodeTurnIdentity(object), provider: requiredString(object.provider, 'snapshot.provider'), model: requiredString(object.model, 'snapshot.model'),
+    profileHash: requiredString(object.profileHash, 'snapshot.profileHash'), continuationEligible: requiredBoolean(object.continuationEligible, 'snapshot.continuationEligible'),
+    ...(temperature !== undefined ? { temperature } : {}), ...(reasoning ? { reasoning } : {}), ...(responseFormat ? { responseFormat } : {}),
+    toolNames: stringArray(object.toolNames, 'snapshot.toolNames'), toolPolicyHash: requiredString(object.toolPolicyHash, 'snapshot.toolPolicyHash'),
+    instructions: Object.freeze(requiredArray(object.instructions, 'snapshot.instructions').map((item, index) => decodeInstruction(item, `snapshot.instructions[${String(index)}]`))),
+    configuredContextSourceIds: stringArray(object.configuredContextSourceIds, 'snapshot.configuredContextSourceIds'), checkIds: stringArray(object.checkIds, 'snapshot.checkIds'),
+    limits: decodeRunLimits(object.limits), budget: decodeRunBudget(object.budget)
+  });
+}
+function decodeInstruction(value: JsonValue, path: string): AgentEffectiveInstruction {
+  const object = requiredObject(value, path);
+  exact(object, ['id', 'content', 'provenance', 'role', 'sourceUri', 'priority']);
+  const role = optionalStringValue(object.role, `${path}.role`);
+  const sourceUri = optionalStringValue(object.sourceUri, `${path}.sourceUri`);
+  const priority = optionalFiniteNumber(object.priority, `${path}.priority`);
+  return Object.freeze({
+    id: requiredString(object.id, `${path}.id`), content: requiredStringValue(object.content, `${path}.content`),
+    provenance: requiredEnum(object.provenance, ['application', 'run', 'steering'] as const, `${path}.provenance`),
+    ...(role !== undefined ? { role } : {}), ...(sourceUri !== undefined ? { sourceUri } : {}), ...(priority !== undefined ? { priority } : {})
+  });
+}
+function decodeResponseFormat(value: JsonValue): AgentTurnSnapshotRecord['responseFormat'] {
+  if (value === 'text' || value === 'json') return value;
+  const object = requiredObject(value, 'responseFormat');
+  exact(object, ['type', 'schema']);
+  if (object.type !== 'json_schema') throw malformed('responseFormat.type is invalid');
+  return Object.freeze({ type: 'json_schema', schema: requiredObject(object.schema, 'responseFormat.schema') });
+}
+function decodeRunLimits(value: JsonValue | undefined): AgentRunLimits {
+  const object = requiredObject(value, 'limits');
+  exact(object, ['maxConcurrentToolCalls', 'modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'elapsedMs', 'promptTokens', 'completionTokens', 'activeImageCount', 'activeImageBytes', 'activeImageTokens', 'knownCost', 'consecutiveProviderFailures', 'consecutiveToolFailures', 'providerRetries']);
+  const knownCost = requiredObject(object.knownCost, 'limits.knownCost');
+  exact(knownCost, ['amount', 'currency']);
+  return Object.freeze({
+    maxConcurrentToolCalls: positiveInteger(object.maxConcurrentToolCalls, 'limits.maxConcurrentToolCalls'), modelTurns: positiveInteger(object.modelTurns, 'limits.modelTurns'),
+    totalToolCalls: positiveInteger(object.totalToolCalls, 'limits.totalToolCalls'), repeatedIdenticalToolCalls: positiveInteger(object.repeatedIdenticalToolCalls, 'limits.repeatedIdenticalToolCalls'),
+    elapsedMs: positiveInteger(object.elapsedMs, 'limits.elapsedMs'), promptTokens: positiveInteger(object.promptTokens, 'limits.promptTokens'),
+    completionTokens: positiveInteger(object.completionTokens, 'limits.completionTokens'), activeImageCount: positiveInteger(object.activeImageCount, 'limits.activeImageCount'),
+    activeImageBytes: positiveInteger(object.activeImageBytes, 'limits.activeImageBytes'), activeImageTokens: positiveInteger(object.activeImageTokens, 'limits.activeImageTokens'),
+    knownCost: Object.freeze({ amount: positiveNumber(knownCost.amount, 'limits.knownCost.amount'), currency: requiredString(knownCost.currency, 'limits.knownCost.currency') }),
+    consecutiveProviderFailures: positiveInteger(object.consecutiveProviderFailures, 'limits.consecutiveProviderFailures'), consecutiveToolFailures: positiveInteger(object.consecutiveToolFailures, 'limits.consecutiveToolFailures'),
+    providerRetries: positiveInteger(object.providerRetries, 'limits.providerRetries')
+  });
+}
+function decodeRequestSnapshot(value: JsonValue | undefined): AgentRequestSnapshotRecord {
+  const object = requiredObject(value, 'snapshot');
+  exact(object, [...TURN_KEYS, 'requestId', 'configuredContextIds', 'providerContextIds', 'runContextIds', 'effectiveInstructionHash', 'selectedEvidenceHash', 'retainedHistoryHash', 'modelToolSchemasHash', 'compiledPromptHash', 'reductions']);
+  return Object.freeze({
+    ...decodeTurnIdentity(object), requestId: requiredString(object.requestId, 'snapshot.requestId'), configuredContextIds: stringArray(object.configuredContextIds, 'snapshot.configuredContextIds'),
+    providerContextIds: stringArray(object.providerContextIds, 'snapshot.providerContextIds'), runContextIds: stringArray(object.runContextIds, 'snapshot.runContextIds'),
+    effectiveInstructionHash: requiredString(object.effectiveInstructionHash, 'snapshot.effectiveInstructionHash'), selectedEvidenceHash: requiredString(object.selectedEvidenceHash, 'snapshot.selectedEvidenceHash'),
+    retainedHistoryHash: requiredString(object.retainedHistoryHash, 'snapshot.retainedHistoryHash'), modelToolSchemasHash: requiredString(object.modelToolSchemasHash, 'snapshot.modelToolSchemasHash'),
+    compiledPromptHash: requiredString(object.compiledPromptHash, 'snapshot.compiledPromptHash'),
+    reductions: Object.freeze(requiredArray(object.reductions, 'snapshot.reductions').map((item, index) => {
+      const reduction = requiredObject(item, `snapshot.reductions[${String(index)}]`);
+      exact(reduction, ['kind', 'reason', 'sequence']);
+      return Object.freeze({ kind: requiredString(reduction.kind, 'reduction.kind'), reason: requiredStringValue(reduction.reason, 'reduction.reason'), sequence: nonnegativeInteger(reduction.sequence, 'reduction.sequence') });
+    }))
+  });
+}
+function decodeProviderStateSummary(value: JsonValue | undefined): AgentProviderStateSummary {
+  const object = requiredObject(value, 'providerState');
+  exact(object, ['provider', 'model', 'kind', 'dataKeys', 'bytes']);
+  return Object.freeze({ provider: requiredString(object.provider, 'providerState.provider'), model: requiredString(object.model, 'providerState.model'), kind: requiredString(object.kind, 'providerState.kind'), dataKeys: stringArray(object.dataKeys, 'providerState.dataKeys'), bytes: nonnegativeInteger(object.bytes, 'providerState.bytes') });
+}
+function decodeModelRequestSummary(value: JsonValue | undefined): AgentModelRequestSummary {
+  const object = requiredObject(value, 'request');
+  exact(object, ['model', 'messageCount', 'messageRoleCounts', 'messageBytes', 'toolCount', 'toolNames', 'toolSchemaBytes', 'maxOutputTokens', 'temperature', 'topP', 'reasoning', 'metadataKeys', 'providerOptionKeys']);
+  const maxOutputTokens = optionalPositiveInteger(object.maxOutputTokens, 'request.maxOutputTokens');
+  const temperature = optionalFiniteNumber(object.temperature, 'request.temperature');
+  const topP = optionalFiniteNumber(object.topP, 'request.topP');
+  const reasoning = object.reasoning === undefined ? undefined : decodeReasoning(object.reasoning);
+  return Object.freeze({
+    model: requiredString(object.model, 'request.model'), messageCount: nonnegativeInteger(object.messageCount, 'request.messageCount'), messageRoleCounts: nonnegativeNumberRecord(object.messageRoleCounts, 'request.messageRoleCounts'),
+    messageBytes: nonnegativeInteger(object.messageBytes, 'request.messageBytes'), toolCount: nonnegativeInteger(object.toolCount, 'request.toolCount'), toolNames: stringArray(object.toolNames, 'request.toolNames'),
+    toolSchemaBytes: nonnegativeInteger(object.toolSchemaBytes, 'request.toolSchemaBytes'), ...(maxOutputTokens ? { maxOutputTokens } : {}), ...(temperature !== undefined ? { temperature } : {}),
+    ...(topP !== undefined ? { topP } : {}), ...(reasoning ? { reasoning } : {}), metadataKeys: stringArray(object.metadataKeys, 'request.metadataKeys'), providerOptionKeys: stringArray(object.providerOptionKeys, 'request.providerOptionKeys')
+  });
+}
+function decodeModelResponseSummary(value: JsonValue | undefined): AgentModelResponseSummary {
+  const object = requiredObject(value, 'response');
+  exact(object, ['provider', 'model', 'contentChars', 'contentBytes', 'toolCallCount', 'toolCallNames', 'requestId', 'transport', 'usage', 'terminationReason', 'providerTerminationReason', 'reasoningSummaryChars', 'rawBytes', 'providerState', 'providerStateRef']);
+  const requestId = optionalStringValue(object.requestId, 'response.requestId');
+  const transport = object.transport === undefined ? undefined : decodeTransport(object.transport);
+  const usage = object.usage === undefined ? undefined : decodeModelUsage(object.usage);
+  const providerTerminationReason = optionalStringValue(object.providerTerminationReason, 'response.providerTerminationReason');
+  const providerState = object.providerState === undefined ? undefined : decodeProviderStateSummary(object.providerState);
+  const providerStateRef = optionalArtifactRef(object.providerStateRef);
+  return Object.freeze({
+    provider: requiredString(object.provider, 'response.provider'), model: requiredString(object.model, 'response.model'), contentChars: nonnegativeInteger(object.contentChars, 'response.contentChars'),
+    contentBytes: nonnegativeInteger(object.contentBytes, 'response.contentBytes'), toolCallCount: nonnegativeInteger(object.toolCallCount, 'response.toolCallCount'), toolCallNames: stringArray(object.toolCallNames, 'response.toolCallNames'),
+    ...(requestId !== undefined ? { requestId } : {}), ...(transport ? { transport } : {}), ...(usage ? { usage } : {}),
+    terminationReason: requiredEnum(object.terminationReason, TERMINATION_REASONS, 'response.terminationReason'), ...(providerTerminationReason !== undefined ? { providerTerminationReason } : {}),
+    ...optionalNonnegativeFields(object, ['reasoningSummaryChars', 'rawBytes']), ...(providerState ? { providerState } : {}), ...(providerStateRef ? { providerStateRef } : {})
+  });
+}
+function decodeTransport(value: JsonValue): ModelTransportMetadata {
+  const object = requiredObject(value, 'transport');
+  exact(object, ['provider', 'strategy', 'responseId', 'reusedContinuation', 'fallbackReason']);
+  const responseId = optionalStringValue(object.responseId, 'transport.responseId');
+  const reusedContinuation = object.reusedContinuation === undefined ? undefined : requiredBoolean(object.reusedContinuation, 'transport.reusedContinuation');
+  const fallbackReason = optionalStringValue(object.fallbackReason, 'transport.fallbackReason');
+  return Object.freeze({ provider: requiredString(object.provider, 'transport.provider'), strategy: requiredString(object.strategy, 'transport.strategy'), ...(responseId !== undefined ? { responseId } : {}), ...(reusedContinuation !== undefined ? { reusedContinuation } : {}), ...(fallbackReason !== undefined ? { fallbackReason } : {}) });
+}
+function decodeModelUsage(value: JsonValue | undefined): ModelUsage {
+  const object = requiredObject(value, 'usage');
+  exact(object, ['promptTokens', 'completionTokens', 'totalTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens']);
+  return Object.freeze({ promptTokens: nonnegativeInteger(object.promptTokens, 'usage.promptTokens'), completionTokens: nonnegativeInteger(object.completionTokens, 'usage.completionTokens'), totalTokens: nonnegativeInteger(object.totalTokens, 'usage.totalTokens'), ...optionalNonnegativeFields(object, ['cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens']) });
+}
+function decodeRequestCostEstimate(value: JsonValue | undefined): RequestCostEstimate {
+  const object = requiredObject(value, 'estimate');
+  exact(object, ['messageTokens', 'contextHistoryTokens', 'contextTokens', 'evidenceTokens', 'toolSchemaTokens', 'outputReserveTokens', 'totalPromptTokens', 'totalRequestTokens', 'warnings']);
+  return Object.freeze({
+    messageTokens: nonnegativeInteger(object.messageTokens, 'estimate.messageTokens'), contextHistoryTokens: nonnegativeInteger(object.contextHistoryTokens, 'estimate.contextHistoryTokens'),
+    contextTokens: nonnegativeInteger(object.contextTokens, 'estimate.contextTokens'), evidenceTokens: nonnegativeInteger(object.evidenceTokens, 'estimate.evidenceTokens'),
+    toolSchemaTokens: nonnegativeInteger(object.toolSchemaTokens, 'estimate.toolSchemaTokens'), outputReserveTokens: nonnegativeInteger(object.outputReserveTokens, 'estimate.outputReserveTokens'),
+    totalPromptTokens: nonnegativeInteger(object.totalPromptTokens, 'estimate.totalPromptTokens'), totalRequestTokens: nonnegativeInteger(object.totalRequestTokens, 'estimate.totalRequestTokens'), warnings: stringArray(object.warnings, 'estimate.warnings')
+  });
+}
+function decodeBudgetSnapshot(value: JsonValue | undefined): BudgetAccountantSnapshot {
+  const object = requiredObject(value, 'snapshot');
+  exact(object, ['estimatedPromptTokens', 'providerPromptTokens', 'completionTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'totalTokens', 'remainingPromptTokens', 'pressure', 'lastEstimate', 'lastProviderUsage', 'estimateToActualRatio']);
+  const lastEstimate = object.lastEstimate === undefined ? undefined : decodeRequestCostEstimate(object.lastEstimate);
+  const lastProviderUsage = object.lastProviderUsage === undefined ? undefined : decodeProviderUsage(object.lastProviderUsage);
+  const estimateToActualRatio = optionalNonnegativeNumber(object.estimateToActualRatio, 'snapshot.estimateToActualRatio');
+  return Object.freeze({
+    estimatedPromptTokens: nonnegativeInteger(object.estimatedPromptTokens, 'snapshot.estimatedPromptTokens'), providerPromptTokens: nonnegativeInteger(object.providerPromptTokens, 'snapshot.providerPromptTokens'),
+    completionTokens: nonnegativeInteger(object.completionTokens, 'snapshot.completionTokens'), cacheReadTokens: nonnegativeInteger(object.cacheReadTokens, 'snapshot.cacheReadTokens'),
+    cacheWriteTokens: nonnegativeInteger(object.cacheWriteTokens, 'snapshot.cacheWriteTokens'), reasoningTokens: nonnegativeInteger(object.reasoningTokens, 'snapshot.reasoningTokens'),
+    totalTokens: nonnegativeInteger(object.totalTokens, 'snapshot.totalTokens'), remainingPromptTokens: nonnegativeInteger(object.remainingPromptTokens, 'snapshot.remainingPromptTokens'),
+    pressure: requiredEnum(object.pressure, BUDGET_PRESSURES, 'snapshot.pressure'), ...(lastEstimate ? { lastEstimate } : {}), ...(lastProviderUsage ? { lastProviderUsage } : {}),
+    ...(estimateToActualRatio !== undefined ? { estimateToActualRatio } : {})
+  });
+}
+function decodeProviderUsage(value: JsonValue): NonNullable<BudgetAccountantSnapshot['lastProviderUsage']> {
+  const object = requiredObject(value, 'lastProviderUsage');
+  exact(object, ['promptTokens', 'completionTokens', 'totalTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'source']);
+  if (object.source !== 'provider') throw malformed('lastProviderUsage.source is invalid');
+  return Object.freeze({
+    promptTokens: nonnegativeInteger(object.promptTokens, 'lastProviderUsage.promptTokens'), completionTokens: nonnegativeInteger(object.completionTokens, 'lastProviderUsage.completionTokens'),
+    totalTokens: nonnegativeInteger(object.totalTokens, 'lastProviderUsage.totalTokens'), cacheReadTokens: nonnegativeInteger(object.cacheReadTokens, 'lastProviderUsage.cacheReadTokens'),
+    cacheWriteTokens: nonnegativeInteger(object.cacheWriteTokens, 'lastProviderUsage.cacheWriteTokens'), reasoningTokens: nonnegativeInteger(object.reasoningTokens, 'lastProviderUsage.reasoningTokens'), source: 'provider'
+  });
+}
+function decodeOverflowResult(value: JsonValue | undefined): OverflowRecoveryResult {
+  const object = requiredObject(value, 'result');
+  if (object.kind === 'retry') { exact(object, ['kind', 'action']); return Object.freeze({ kind: 'retry', action: decodeOverflowAction(object.action, 'result.action') }); }
+  if (object.kind === 'diagnostic') { exact(object, ['kind', 'diagnostic']); return Object.freeze({ kind: 'diagnostic', diagnostic: decodeOverflowDiagnostic(object.diagnostic) }); }
+  throw malformed('result.kind is invalid');
+}
+function decodeOverflowAction(value: JsonValue | undefined, path: string): Extract<OverflowRecoveryResult, { kind: 'retry' }>['action'] {
+  const object = requiredObject(value, path);
+  if (object.kind === 'reduce_context_history') { exact(object, ['kind', 'reductions']); return Object.freeze({ kind: object.kind, reductions: positiveInteger(object.reductions, `${path}.reductions`) }); }
+  if (object.kind === 'reduce_context') { exact(object, ['kind', 'removedItems']); return Object.freeze({ kind: object.kind, removedItems: positiveInteger(object.removedItems, `${path}.removedItems`) }); }
+  if (object.kind === 'reduce_evidence') { exact(object, ['kind', 'removedRecords']); return Object.freeze({ kind: object.kind, removedRecords: positiveInteger(object.removedRecords, `${path}.removedRecords`) }); }
+  if (object.kind === 'install_checkpoint') { exact(object, ['kind', 'compactedToolResults']); return Object.freeze({ kind: object.kind, compactedToolResults: positiveInteger(object.compactedToolResults, `${path}.compactedToolResults`) }); }
+  if (object.kind === 'diagnostic_failure') { exact(object, ['kind', 'diagnostic']); return Object.freeze({ kind: object.kind, diagnostic: decodeOverflowDiagnostic(object.diagnostic) }); }
+  throw malformed(`${path}.kind is invalid`);
+}
+function decodeOverflowDiagnostic(value: JsonValue | undefined): Extract<OverflowRecoveryResult, { kind: 'diagnostic' }>['diagnostic'] {
+  const object = requiredObject(value, 'overflow diagnostic');
+  exact(object, ['reason', 'messageTokens', 'contextHistoryTokens', 'contextTokens', 'evidenceTokens', 'toolSchemaTokens', 'outputReserveTokens', 'totalRequestTokens', 'reductionsAttempted']);
+  return Object.freeze({
+    reason: requiredEnum(object.reason, ['model_context_window', 'tool_schema_cost'] as const, 'diagnostic.reason'),
+    messageTokens: nonnegativeInteger(object.messageTokens, 'diagnostic.messageTokens'), contextHistoryTokens: nonnegativeInteger(object.contextHistoryTokens, 'diagnostic.contextHistoryTokens'),
+    contextTokens: nonnegativeInteger(object.contextTokens, 'diagnostic.contextTokens'), evidenceTokens: nonnegativeInteger(object.evidenceTokens, 'diagnostic.evidenceTokens'),
+    toolSchemaTokens: nonnegativeInteger(object.toolSchemaTokens, 'diagnostic.toolSchemaTokens'), outputReserveTokens: nonnegativeInteger(object.outputReserveTokens, 'diagnostic.outputReserveTokens'),
+    totalRequestTokens: nonnegativeInteger(object.totalRequestTokens, 'diagnostic.totalRequestTokens'),
+    reductionsAttempted: Object.freeze(requiredArray(object.reductionsAttempted, 'diagnostic.reductionsAttempted').map((item, index) => decodeOverflowAction(item, `diagnostic.reductionsAttempted[${String(index)}]`)))
+  });
+}
+function decodeHistoryReduction(value: JsonValue, path: string): ContextHistoryReduction {
+  const object = requiredObject(value, path);
+  exact(object, ['itemId', 'kind', 'beforeBytes', 'afterBytes', 'toolName', 'removedItems', 'removedImageBytes', 'removedImageTokens', 'reason']);
+  const toolName = optionalStringValue(object.toolName, `${path}.toolName`);
+  const reason = object.reason === undefined ? undefined : requiredEnum(object.reason, HISTORY_REASONS, `${path}.reason`);
+  return Object.freeze({
+    itemId: requiredString(object.itemId, `${path}.itemId`), kind: requiredEnum(object.kind, HISTORY_REDUCTION_KINDS, `${path}.kind`),
+    beforeBytes: nonnegativeInteger(object.beforeBytes, `${path}.beforeBytes`), afterBytes: nonnegativeInteger(object.afterBytes, `${path}.afterBytes`),
+    ...(toolName !== undefined ? { toolName } : {}), ...optionalNonnegativeFields(object, ['removedItems', 'removedImageBytes', 'removedImageTokens']), ...(reason ? { reason } : {})
+  });
+}
+function decodeContextBundle(value: JsonValue | undefined): ContextBundle {
+  const object = requiredObject(value, 'bundle');
+  exact(object, ['items', 'totalTokens', 'omitted']);
+  return Object.freeze({
+    items: requiredArray(object.items, 'bundle.items').map((item, index) => decodeContextItem(item, `bundle.items[${String(index)}]`)),
+    totalTokens: nonnegativeInteger(object.totalTokens, 'bundle.totalTokens'),
+    omitted: requiredArray(object.omitted, 'bundle.omitted').map((item, index) => {
+      const omission = requiredObject(item, `bundle.omitted[${String(index)}]`);
+      exact(omission, ['reason', 'sourceUri']);
+      const sourceUri = optionalStringValue(omission.sourceUri, 'omission.sourceUri');
+      return Object.freeze({ reason: requiredStringValue(omission.reason, 'omission.reason'), ...(sourceUri !== undefined ? { sourceUri } : {}) });
+    })
+  });
+}
+function decodeContextItem(value: JsonValue, path: string): ContextBundle['items'][number] {
+  const object = requiredObject(value, path);
+  exact(object, ['id', 'sourceUri', 'sourceKind', 'confidence', 'representation', 'mediaType', 'title', 'content', 'range', 'tokenEstimate', 'selectionReason', 'score']);
+  const confidence = object.confidence === undefined ? undefined : requiredEnum(object.confidence, ['unverified', 'verified'] as const, `${path}.confidence`);
+  const range = object.range === undefined ? undefined : decodeRange(object.range, `${path}.range`);
+  return Object.freeze({
+    id: requiredString(object.id, `${path}.id`), sourceUri: requiredString(object.sourceUri, `${path}.sourceUri`),
+    sourceKind: requiredEnum(object.sourceKind, ['user', 'external', 'session', 'tool-observation', 'generated'] as const, `${path}.sourceKind`),
+    ...(confidence ? { confidence } : {}), representation: requiredEnum(object.representation, ['full', 'excerpt', 'summary'] as const, `${path}.representation`),
+    mediaType: requiredString(object.mediaType, `${path}.mediaType`), title: requiredStringValue(object.title, `${path}.title`), content: requiredStringValue(object.content, `${path}.content`),
+    ...(range ? { range } : {}), tokenEstimate: nonnegativeInteger(object.tokenEstimate, `${path}.tokenEstimate`), selectionReason: requiredStringValue(object.selectionReason, `${path}.selectionReason`), score: finiteNumber(object.score, `${path}.score`)
+  });
+}
+function decodeRange(value: JsonValue, path: string): { kind: 'line' | 'byte'; start?: number; end?: number } {
+  const object = requiredObject(value, path);
+  exact(object, ['kind', 'start', 'end']);
+  const start = optionalNonnegativeNumber(object.start, `${path}.start`);
+  const end = optionalNonnegativeNumber(object.end, `${path}.end`);
+  return Object.freeze({ kind: requiredEnum(object.kind, ['line', 'byte'] as const, `${path}.kind`), ...(start !== undefined ? { start } : {}), ...(end !== undefined ? { end } : {}) });
+}
+function decodePromptProjection(value: JsonValue | undefined): PromptProjection {
+  const object = requiredObject(value, 'projection');
+  exact(object, ['id', 'task', 'instructions', 'notes', 'context', 'tools', 'continuity', 'evidence', 'outputContract', 'metadata']);
+  const evidence = object.evidence === undefined ? undefined : decodePromptEvidence(object.evidence);
+  const outputContract = object.outputContract === undefined ? undefined : decodeOutputContract(object.outputContract);
+  const metadata = optionalStringRecord(object.metadata, 'projection.metadata');
+  return Object.freeze({
+    id: requiredString(object.id, 'projection.id'), task: requiredStringValue(object.task, 'projection.task'),
+    instructions: requiredArray(object.instructions, 'projection.instructions').map((item, index) => decodePromptInstruction(item, `projection.instructions[${String(index)}]`)),
+    notes: [...stringArray(object.notes, 'projection.notes')], context: requiredArray(object.context, 'projection.context').map((item, index) => decodeContextItem(item, `projection.context[${String(index)}]`)),
+    tools: requiredArray(object.tools, 'projection.tools').map((item, index) => decodePromptTool(item, `projection.tools[${String(index)}]`)),
+    continuity: [...stringArray(object.continuity, 'projection.continuity')], ...(evidence ? { evidence } : {}), ...(outputContract ? { outputContract } : {}), ...(metadata ? { metadata: { ...metadata } } : {})
+  });
+}
+function decodePromptInstruction(value: JsonValue, path: string): PromptProjection['instructions'][number] {
+  const object = requiredObject(value, path);
+  exact(object, ['id', 'role', 'content', 'sourceUri', 'priority']);
+  const sourceUri = optionalStringValue(object.sourceUri, `${path}.sourceUri`);
+  return Object.freeze({ id: requiredString(object.id, `${path}.id`), role: requiredEnum(object.role, ['system', 'developer', 'workspace', 'user'] as const, `${path}.role`), content: requiredStringValue(object.content, `${path}.content`), ...(sourceUri !== undefined ? { sourceUri } : {}), priority: finiteNumber(object.priority, `${path}.priority`) });
+}
+function decodePromptTool(value: JsonValue, path: string): PromptProjection['tools'][number] {
+  const object = requiredObject(value, path);
+  exact(object, ['name', 'description', 'inputFormat', 'accessModes', 'promptGuide']);
+  const promptGuide = optionalStringValue(object.promptGuide, `${path}.promptGuide`);
+  return Object.freeze({ name: requiredString(object.name, `${path}.name`), description: requiredStringValue(object.description, `${path}.description`), inputFormat: requiredString(object.inputFormat, `${path}.inputFormat`), accessModes: [...stringArray(object.accessModes, `${path}.accessModes`)], ...(promptGuide !== undefined ? { promptGuide } : {}) });
+}
+function decodePromptEvidence(value: JsonValue): NonNullable<PromptProjection['evidence']> {
+  const object = requiredObject(value, 'projection.evidence');
+  exact(object, ['records', 'omittedRecords', 'omittedSummary', 'tokenEstimate', 'coverage']);
+  const omittedSummary = object.omittedSummary === undefined ? undefined : requiredArray(object.omittedSummary, 'projection.evidence.omittedSummary').map((item, index) => {
+    const summary = requiredObject(item, `omittedSummary[${String(index)}]`);
+    exact(summary, ['toolName', 'action', 'outcome', 'count']);
+    return Object.freeze({ toolName: requiredString(summary.toolName, 'omittedSummary.toolName'), action: requiredEnum(summary.action, ['list', 'search', 'read', 'execute', 'create', 'update', 'delete', 'move', 'verify'] as const, 'omittedSummary.action'), outcome: requiredEnum(summary.outcome, ['success', 'failure'] as const, 'omittedSummary.outcome'), count: positiveInteger(summary.count, 'omittedSummary.count') });
+  });
+  return Object.freeze({
+    records: requiredArray(object.records, 'projection.evidence.records').map((item, index) => decodeEvidenceRecord(item, `projection.evidence.records[${String(index)}]`)),
+    omittedRecords: nonnegativeInteger(object.omittedRecords, 'projection.evidence.omittedRecords'), ...(omittedSummary ? { omittedSummary } : {}),
+    tokenEstimate: nonnegativeInteger(object.tokenEstimate, 'projection.evidence.tokenEstimate'), coverage: requiredEnum(object.coverage, ['complete', 'partial'] as const, 'projection.evidence.coverage')
+  });
+}
+function decodeEvidenceRecord(value: JsonValue, path: string): NonNullable<PromptProjection['evidence']>['records'][number] {
+  const object = requiredObject(value, path);
+  exact(object, ['id', 'observationId', 'toolName', 'createdAt', 'action', 'resources', 'scope', 'summary', 'outcome']);
+  const scope = object.scope === undefined ? undefined : decodeEvidenceScope(object.scope, `${path}.scope`);
+  const summary = optionalStringValue(object.summary, `${path}.summary`);
+  return Object.freeze({
+    id: requiredString(object.id, `${path}.id`), observationId: requiredString(object.observationId, `${path}.observationId`), toolName: requiredString(object.toolName, `${path}.toolName`),
+    createdAt: requiredString(object.createdAt, `${path}.createdAt`), action: requiredEnum(object.action, ['list', 'search', 'read', 'execute', 'create', 'update', 'delete', 'move', 'verify'] as const, `${path}.action`),
+    resources: requiredArray(object.resources, `${path}.resources`).map((item, index) => decodeEvidenceResource(item, `${path}.resources[${String(index)}]`)),
+    ...(scope ? { scope } : {}), ...(summary !== undefined ? { summary } : {}), outcome: requiredEnum(object.outcome, ['success', 'failure'] as const, `${path}.outcome`)
+  });
+}
+function decodeEvidenceResource(value: JsonValue, path: string): NonNullable<PromptProjection['evidence']>['records'][number]['resources'][number] {
+  const object = requiredObject(value, path);
+  exact(object, ['uri', 'range', 'sha256', 'fullSha256', 'mediaType']);
+  const range = object.range === undefined ? undefined : decodeRange(object.range, `${path}.range`);
+  const sha256 = optionalStringValue(object.sha256, `${path}.sha256`);
+  const fullSha256 = optionalStringValue(object.fullSha256, `${path}.fullSha256`);
+  const mediaType = optionalStringValue(object.mediaType, `${path}.mediaType`);
+  return Object.freeze({ uri: requiredString(object.uri, `${path}.uri`), ...(range ? { range } : {}), ...(sha256 !== undefined ? { sha256 } : {}), ...(fullSha256 !== undefined ? { fullSha256 } : {}), ...(mediaType !== undefined ? { mediaType } : {}) });
+}
+function decodeEvidenceScope(value: JsonValue, path: string): NonNullable<NonNullable<PromptProjection['evidence']>['records'][number]['scope']> {
+  const object = requiredObject(value, path);
+  exact(object, ['filters', 'limits', 'omitted', 'coverage', 'truncated', 'confidence']);
+  const filters = optionalObject(object.filters, `${path}.filters`);
+  const limits = optionalObject(object.limits, `${path}.limits`);
+  const omitted = optionalObject(object.omitted, `${path}.omitted`);
+  const coverage = object.coverage === undefined ? undefined : requiredEnum(object.coverage, ['complete', 'partial', 'absent'] as const, `${path}.coverage`);
+  const truncated = object.truncated === undefined ? undefined : requiredBoolean(object.truncated, `${path}.truncated`);
+  const confidence = object.confidence === undefined ? undefined : requiredEnum(object.confidence, ['unverified', 'verified'] as const, `${path}.confidence`);
+  return Object.freeze({ ...(filters ? { filters } : {}), ...(limits ? { limits } : {}), ...(omitted ? { omitted } : {}), ...(coverage ? { coverage } : {}), ...(truncated !== undefined ? { truncated } : {}), ...(confidence ? { confidence } : {}) });
+}
+function decodeOutputContract(value: JsonValue): NonNullable<PromptProjection['outputContract']> {
+  const object = requiredObject(value, 'projection.outputContract');
+  exact(object, ['kind', 'description']);
+  if (object.kind !== 'text') throw malformed('projection.outputContract.kind is invalid');
+  return Object.freeze({ kind: 'text', description: requiredStringValue(object.description, 'projection.outputContract.description') });
+}
+function decodeArtifactRef(value: JsonValue | undefined): ArtifactRef {
+  const object = requiredObject(value, 'artifact');
+  exact(object, ['artifactId', 'sha256', 'size', 'mediaType', 'visibility', 'label', 'description']);
+  const label = optionalStringValue(object.label, 'artifact.label');
+  const description = optionalStringValue(object.description, 'artifact.description');
+  const base = { artifactId: requiredString(object.artifactId, 'artifact.artifactId'), sha256: requiredString(object.sha256, 'artifact.sha256'), size: nonnegativeInteger(object.size, 'artifact.size'), mediaType: requiredString(object.mediaType, 'artifact.mediaType'), ...(label !== undefined ? { label } : {}), ...(description !== undefined ? { description } : {}) };
+  if (object.visibility === 'public') return Object.freeze({ ...base, visibility: 'public' });
+  if (object.visibility === 'protected') return Object.freeze({ ...base, visibility: 'protected' });
+  throw malformed('artifact.visibility is invalid');
+}
+function optionalArtifactRef(value: JsonValue | undefined): ArtifactRef | undefined { return value === undefined ? undefined : decodeArtifactRef(value); }
+function decodeDiagnostic(value: JsonValue | undefined, allowTurnIndex = false): ModelProviderErrorDiagnostic & { readonly turnIndex?: number } {
+  const object = requiredObject(value, 'diagnostic');
+  exact(object, ['provider', 'code', 'retryable', 'transport', 'eventType', 'causeSummary', ...(allowTurnIndex ? ['turnIndex'] : [])]);
+  const transport = optionalStringValue(object.transport, 'diagnostic.transport');
+  const eventType = optionalStringValue(object.eventType, 'diagnostic.eventType');
+  const causeSummary = object.causeSummary === undefined ? undefined : primitiveRecord(object.causeSummary, 'diagnostic.causeSummary');
+  const turnIndex = allowTurnIndex ? optionalPositiveInteger(object.turnIndex, 'diagnostic.turnIndex') : undefined;
+  return Object.freeze({
+    provider: requiredString(object.provider, 'diagnostic.provider'), code: requiredEnum(object.code, ['provider_unavailable', 'model_unavailable', 'invalid_request', 'context_overflow', 'rate_limited', 'malformed_response', 'aborted', 'unknown'] as const, 'diagnostic.code'),
+    retryable: requiredBoolean(object.retryable, 'diagnostic.retryable'), ...(transport !== undefined ? { transport } : {}), ...(eventType !== undefined ? { eventType } : {}),
+    ...(causeSummary ? { causeSummary } : {}), ...(turnIndex !== undefined ? { turnIndex } : {})
+  });
+}
+function optionalDiagnostic(value: JsonValue | undefined, allowTurnIndex = false): (ModelProviderErrorDiagnostic & { readonly turnIndex?: number }) | undefined { return value === undefined ? undefined : decodeDiagnostic(value, allowTurnIndex); }
+function decodeDeliveryDiagnostic(value: JsonValue | undefined): AgentDeliveryDiagnostic {
+  const object = requiredObject(value, 'diagnostic');
+  exact(object, ['eventType', 'message', 'persisted']);
+  return Object.freeze({ eventType: requiredString(object.eventType, 'diagnostic.eventType'), message: requiredStringValue(object.message, 'diagnostic.message'), persisted: requiredBoolean(object.persisted, 'diagnostic.persisted') });
+}
+function decodeApprovalBinding(value: JsonValue | undefined): AgentApprovalBinding {
+  const object = requiredObject(value, 'binding');
+  exact(object, ['toolImplementationId', 'authorizationPolicyId', 'executionTargetId']);
+  return Object.freeze({ toolImplementationId: requiredString(object.toolImplementationId, 'binding.toolImplementationId'), authorizationPolicyId: requiredString(object.authorizationPolicyId, 'binding.authorizationPolicyId'), executionTargetId: requiredString(object.executionTargetId, 'binding.executionTargetId') });
+}
+function decodeToolCall(value: JsonValue | undefined, path: string): ToolCall {
+  const object = requiredObject(value, path);
+  exact(object, ['id', 'name', 'input']);
+  const id = optionalStringValue(object.id, `${path}.id`);
+  const input = requiredObject(object.input, `${path}.input`);
+  exact(input, ['kind', 'value']);
+  if (input.kind === 'json') return Object.freeze({ ...(id !== undefined ? { id } : {}), name: requiredString(object.name, `${path}.name`), input: Object.freeze({ kind: 'json', value: requiredObject(input.value, `${path}.input.value`) }) });
+  if (input.kind === 'text') return Object.freeze({ ...(id !== undefined ? { id } : {}), name: requiredString(object.name, `${path}.name`), input: Object.freeze({ kind: 'text', value: requiredStringValue(input.value, `${path}.input.value`) }) });
+  throw malformed(`${path}.input.kind is invalid`);
+}
+function decodeToolEffects(value: JsonValue | undefined): ToolEffects {
+  const object = requiredObject(value, 'effects');
+  exact(object, ['accesses', 'lockScopes', 'dependsOnCallIndices', 'idempotency', 'idempotencyKey']);
+  const accesses = Object.freeze(requiredArray(object.accesses, 'effects.accesses').map((item, index) => {
+    const access = requiredObject(item, `effects.accesses[${String(index)}]`);
+    exact(access, ['mode', 'scope']);
+    return Object.freeze({ mode: requiredEnum(access.mode, TOOL_ACCESS_MODES, 'effects.access.mode'), scope: requiredString(access.scope, 'effects.access.scope') });
+  }));
+  const lockScopes = stringArray(object.lockScopes, 'effects.lockScopes');
+  const dependencies = object.dependsOnCallIndices === undefined ? undefined : Object.freeze(requiredArray(object.dependsOnCallIndices, 'effects.dependsOnCallIndices').map((item) => nonnegativeInteger(item, 'effects dependency')));
+  if (object.idempotency === 'idempotent') return Object.freeze({ accesses, lockScopes, ...(dependencies ? { dependsOnCallIndices: dependencies } : {}), idempotency: 'idempotent', idempotencyKey: requiredString(object.idempotencyKey, 'effects.idempotencyKey') });
+  if (object.idempotency === 'pure' || object.idempotency === 'non_idempotent') {
+    if (object.idempotencyKey !== undefined) throw malformed('effects.idempotencyKey is only valid for idempotent effects');
+    return Object.freeze({ accesses, lockScopes, ...(dependencies ? { dependsOnCallIndices: dependencies } : {}), idempotency: object.idempotency });
+  }
+  throw malformed('effects.idempotency is invalid');
+}
+function decodeToolProgress(value: JsonValue | undefined): ToolProgress {
+  const object = requiredObject(value, 'progress');
+  if (object.type === 'status') {
+    exact(object, ['type', 'stage', 'message', 'completed', 'total']);
+    const message = optionalStringValue(object.message, 'progress.message');
+    return Object.freeze({ type: 'status', stage: requiredStringValue(object.stage, 'progress.stage'), ...(message !== undefined ? { message } : {}), ...optionalNonnegativeFields(object, ['completed', 'total']) });
+  }
+  if (object.type === 'output') { exact(object, ['type', 'stream', 'sequence', 'text', 'observedBytes']); return Object.freeze({ type: 'output', stream: requiredEnum(object.stream, ['stdout', 'stderr'] as const, 'progress.stream'), sequence: nonnegativeInteger(object.sequence, 'progress.sequence'), text: requiredStringValue(object.text, 'progress.text'), observedBytes: nonnegativeInteger(object.observedBytes, 'progress.observedBytes') }); }
+  if (object.type === 'patch') {
+    exact(object, ['type', 'changes']);
+    return Object.freeze({ type: 'patch', changes: Object.freeze(requiredArray(object.changes, 'progress.changes').map((item, index) => {
+      const change = requiredObject(item, `progress.changes[${String(index)}]`);
+      exact(change, ['path', 'operation', 'status']);
+      return Object.freeze({ path: requiredString(change.path, 'change.path'), operation: requiredEnum(change.operation, ['add', 'update', 'delete', 'move'] as const, 'change.operation'), status: requiredStringValue(change.status, 'change.status') });
+    })) });
+  }
+  if (object.type === 'metric') { exact(object, ['type', 'name', 'value', 'unit']); const unit = optionalStringValue(object.unit, 'progress.unit'); return Object.freeze({ type: 'metric', name: requiredString(object.name, 'progress.name'), value: finiteNumber(object.value, 'progress.value'), ...(unit !== undefined ? { unit } : {}) }); }
+  throw malformed('progress.type is invalid');
+}
+function decodePresentation(value: JsonValue | undefined, path: string): ToolObservationPresentation {
+  const object = requiredObject(value, path);
+  exact(object, ['ok', 'title', 'summary', 'scope', 'filters', 'limits', 'results', 'failures', 'omitted', 'coverage', 'truncated', 'warnings', 'next']);
+  const scope = optionalObject(object.scope, `${path}.scope`);
+  const filters = optionalObject(object.filters, `${path}.filters`);
+  const limits = optionalObject(object.limits, `${path}.limits`);
+  const omitted = optionalObject(object.omitted, `${path}.omitted`);
+  const coverage = object.coverage === undefined ? undefined : requiredEnum(object.coverage, ['complete', 'partial'] as const, `${path}.coverage`);
+  const truncated = object.truncated === undefined ? undefined : requiredBoolean(object.truncated, `${path}.truncated`);
+  const warnings = object.warnings === undefined ? undefined : stringArray(object.warnings, `${path}.warnings`);
+  const next = optionalStringValue(object.next, `${path}.next`);
+  return Object.freeze({
+    ok: requiredBoolean(object.ok, `${path}.ok`), title: requiredStringValue(object.title, `${path}.title`), summary: requiredStringValue(object.summary, `${path}.summary`),
+    ...(scope ? { scope } : {}), ...(filters ? { filters } : {}), ...(limits ? { limits } : {}), ...(object.results !== undefined ? { results: object.results } : {}),
+    ...(object.failures !== undefined ? { failures: object.failures } : {}), ...(omitted ? { omitted } : {}), ...(coverage ? { coverage } : {}),
+    ...(truncated !== undefined ? { truncated } : {}), ...(warnings ? { warnings } : {}), ...(next !== undefined ? { next } : {})
+  });
+}
+function decodeMessageRecord(value: JsonValue, path: string): { readonly message: string } {
+  const object = requiredObject(value, path);
+  exact(object, ['message']);
+  return Object.freeze({ message: requiredStringValue(object.message, `${path}.message`) });
 }
 
-type EventShapeValidator = (value: Record<string, unknown>, issues: string[]) => void;
-const EVENT_VALIDATORS = {
-  'run.started': (value, issues) => { requireStrings(value, ['runId', 'finalizationId', 'task', 'model'], issues); requireRecord(value.toolPolicy, 'toolPolicy', issues); },
-  'run.phase.changed': (value, issues) => { requireStrings(value, ['runId'], issues); if (!['preparing', 'requesting_model', 'executing_tools', 'waiting_for_approval', 'verifying', 'finalizing', 'ended'].includes(String(value.phase))) issues.push('phase is invalid.'); requireRecord(value.budget, 'budget', issues); },
-  'run.configured': (value, issues) => { requireRecord(value.configuration, 'configuration', issues); },
-  'turn.snapshot.created': (value, issues) => { requireRecord(value.snapshot, 'snapshot', issues); },
-  'request.snapshot.created': (value, issues) => { requireRecord(value.snapshot, 'snapshot', issues); },
-  'run.retry.scheduled': (value, issues) => { if (!['transport', 'provider_request', 'agent_turn'].includes(String(value.kind))) issues.push('retry kind is invalid.'); if (!positiveInteger(value.attempt)) issues.push('attempt must be positive.'); if (!nonnegativeFinite(value.delayMs)) issues.push('delayMs must be nonnegative.'); },
-  'finalization.prepared': (value, issues) => { requireRecord(value.terminal, 'terminal', issues); },
-  'run.ended': (value, issues) => { requireRecord(value.terminal, 'terminal', issues); },
-  'delivery.failed': (value, issues) => { requireStrings(value, ['finalizationId'], issues); requireRecord(value.diagnostic, 'diagnostic', issues); },
-  'process.ended': (value, issues) => { requireStrings(value, ['runId', 'processId', 'status'], issues); if (value.result === undefined) issues.push('result is required.'); },
-  'turn.started': (value, issues) => { requireStrings(value, ['runId', 'task', 'turnId'], issues); if (!positiveInteger(value.turnIndex) || !positiveInteger(value.requestAttempt)) issues.push('turn identity is invalid.'); },
-  'context.replay.created': (value, issues) => { requireStrings(value, ['sessionId'], issues); for (const name of ['replayedLedgers', 'replayedTurns', 'replayedSessionEntries', 'replayedCheckpoints', 'replayedToolResults', 'replayedEvidenceRecords']) if (!nonnegativeInteger(value[name])) issues.push(`${name} must be nonnegative.`); },
-  'provider.state.restored': (value, issues) => { requireRecord(value.state, 'state', issues); },
-  'provider.state.updated': (value, issues) => { requireRecord(value.state, 'state', issues); requireRecord(value.stateRef, 'stateRef', issues); },
-  'input.received': (value, issues) => { requireStrings(value, ['task'], issues); },
-  'context.bundle.created': (value, issues) => { requireRecord(value.bundle, 'bundle', issues); },
-  'prompt.projection.created': (value, issues) => { requireRecord(value.projection, 'projection', issues); },
-  'assistant.started': () => undefined,
-  'assistant.ended': (value, issues) => { if (typeof value.content !== 'string') issues.push('content must be a string.'); if (value.toolCalls !== undefined && !Array.isArray(value.toolCalls)) issues.push('toolCalls must be an array.'); },
-  'assistant.interrupted': (value, issues) => { if (typeof value.content !== 'string') issues.push('content must be a string.'); if (typeof value.finalResponseReceived !== 'boolean') issues.push('finalResponseReceived must be boolean.'); },
-  'model.failed': (value, issues) => { requireRecord(value.diagnostic, 'diagnostic', issues); },
-  'model.requested': (value, issues) => { requireRecord(value.request, 'request', issues); },
-  'model.responded': (value, issues) => { requireRecord(value.response, 'response', issues); },
-  'budget.estimate.created': estimateEvent,
-  'budget.provider_usage.recorded': (value, issues) => { requireRecord(value.usage, 'usage', issues); requireRecord(value.snapshot, 'snapshot', issues); },
-  'overflow.recovery.started': estimateEvent,
-  'overflow.recovery.ended': (value, issues) => { if (!positiveInteger(value.attempt)) issues.push('attempt must be positive.'); requireRecord(value.result, 'result', issues); },
-  'context.history.reduced': (value, issues) => { if (!Array.isArray(value.reductions)) issues.push('reductions must be an array.'); },
-  'context.checkpoint.created': (value, issues) => { if (!nonnegativeInteger(value.compactedToolResults)) issues.push('compactedToolResults must be nonnegative.'); },
-  'observation.record.created': (value, issues) => { requireStrings(value, ['id', 'toolName'], issues); requireToolAttempt(value, issues); requireRecord(value.call, 'call', issues); requireRecord(value.immediatePresentation, 'immediatePresentation', issues); requireRecord(value.retainedPresentation, 'retainedPresentation', issues); if (value.toolCallType !== 'function' && value.toolCallType !== 'custom') issues.push('toolCallType is invalid.'); if (value.durableStorageDegraded !== undefined) { requireRecord(value.durableStorageDegraded, 'durableStorageDegraded', issues); if (isRecord(value.durableStorageDegraded)) requireStrings(value.durableStorageDegraded, ['message'], issues); } },
-  'observation.projection.failed': (value, issues) => { requireStrings(value, ['id', 'toolName', 'message'], issues); requireToolAttempt(value, issues); },
-  'tool.authorization.decided': (value, issues) => { requireStrings(value, ['toolName', 'fingerprint'], issues); validateApprovalBinding(value.binding, issues); if (!nonnegativeInteger(value.callIndex)) issues.push('callIndex must be nonnegative.'); if (!['allow', 'deny', 'require_approval'].includes(String(value.decision))) issues.push('authorization decision is invalid.'); },
-  'approval.requested': (value, issues) => { requireStrings(value, ['runId', 'approvalId', 'toolName', 'fingerprint', 'policyHash', 'reason'], issues); requireRecord(value.effects, 'effects', issues); validateApprovalBinding(value.binding, issues); },
-  'approval.resolved': (value, issues) => { requireStrings(value, ['runId', 'approvalId', 'fingerprint'], issues); validateApprovalBinding(value.binding, issues); if (value.decision !== 'allow' && value.decision !== 'deny') issues.push('approval decision is invalid.'); },
-  'tool.started': (value, issues) => { requireStrings(value, ['toolName', 'fingerprint'], issues); requireToolAttempt(value, issues); requireRecord(value.input, 'input', issues); requireRecord(value.effects, 'effects', issues); if (!nonnegativeInteger(value.callIndex)) issues.push('callIndex must be nonnegative.'); },
-  'tool.updated': (value, issues) => { requireStrings(value, ['toolName'], issues); validateToolProgress(value.progress, issues); requireToolAttempt(value, issues); if (!nonnegativeInteger(value.callIndex)) issues.push('callIndex must be nonnegative.'); },
-  'tool.ended': (value, issues) => { requireStrings(value, ['toolName'], issues); requireToolAttempt(value, issues); requireRecord(value.observation, 'observation', issues); if (!nonnegativeInteger(value.callIndex)) issues.push('callIndex must be nonnegative.'); },
-  'check.started': (value, issues) => { requireStrings(value, ['check', 'turnId'], issues); if (!positiveInteger(value.turnIndex) || !positiveInteger(value.requestAttempt)) issues.push('turn identity is invalid.'); if (value.requirement !== 'required' && value.requirement !== 'advisory') issues.push('requirement is invalid.'); if (!positiveInteger(value.timeoutMs)) issues.push('timeoutMs must be positive.'); },
-  'check.ended': (value, issues) => { requireStrings(value, ['check', 'turnId'], issues); if (!positiveInteger(value.turnIndex) || !positiveInteger(value.requestAttempt)) issues.push('turn identity is invalid.'); requireRecord(value.result, 'result', issues); }
-} satisfies Record<AgentEvent['type'], EventShapeValidator>;
-
-function estimateEvent(value: Record<string, unknown>, issues: string[]): void { if (!positiveInteger(value.attempt)) issues.push('attempt must be positive.'); requireRecord(value.estimate, 'estimate', issues); requireRecord(value.snapshot, 'snapshot', issues); }
-
-function requireStrings(value: Record<string, unknown>, names: readonly string[], issues: string[]): void {
-  for (const name of names) if (typeof value[name] !== 'string' || value[name].trim().length === 0) issues.push(`${name} must be a non-empty string.`);
+function requiredObject(value: JsonValue | undefined, path: string): JsonObject {
+  if (!isJsonObject(value)) throw malformed(`${path} must be an object`);
+  return value;
 }
-function requireRecord(value: unknown, name: string, issues: string[]): void { if (!isRecord(value)) issues.push(`${name} must be an object.`); }
-function validateApprovalBinding(value: unknown, issues: string[]): void {
-  if (!isRecord(value)) { issues.push('binding must be an object.'); return; }
-  requireStrings(value, ['toolImplementationId', 'authorizationPolicyId', 'executionTargetId'], issues);
+function optionalObject(value: JsonValue | undefined, path: string): JsonObject | undefined { return value === undefined ? undefined : requiredObject(value, path); }
+function requiredArray(value: JsonValue | undefined, path: string): readonly JsonValue[] { if (!isJsonArray(value)) throw malformed(`${path} must be an array`); return value; }
+function optionalArray(value: JsonValue | undefined, path: string): readonly JsonValue[] | undefined { return value === undefined ? undefined : requiredArray(value, path); }
+function requiredJson(value: JsonValue | undefined, path: string): JsonValue { if (value === undefined) throw malformed(`${path} is required`); return value; }
+function requiredString(value: JsonValue | undefined, path: string): string { if (typeof value !== 'string' || value.trim().length === 0) throw malformed(`${path} must be a non-empty string`); return value; }
+function requiredStringValue(value: JsonValue | undefined, path: string): string { if (typeof value !== 'string') throw malformed(`${path} must be a string`); return value; }
+function optionalString(value: JsonValue | undefined, path: string): string | undefined { return value === undefined ? undefined : requiredString(value, path); }
+function optionalStringValue(value: JsonValue | undefined, path: string): string | undefined { return value === undefined ? undefined : requiredStringValue(value, path); }
+function requiredBoolean(value: JsonValue | undefined, path: string): boolean { if (typeof value !== 'boolean') throw malformed(`${path} must be boolean`); return value; }
+function finiteNumber(value: JsonValue | undefined, path: string): number { if (typeof value !== 'number' || !Number.isFinite(value)) throw malformed(`${path} must be finite`); return value; }
+function positiveNumber(value: JsonValue | undefined, path: string): number { const number = finiteNumber(value, path); if (number <= 0) throw malformed(`${path} must be positive`); return number; }
+function nonnegativeNumber(value: JsonValue | undefined, path: string): number { const number = finiteNumber(value, path); if (number < 0) throw malformed(`${path} must be nonnegative`); return number; }
+function optionalFiniteNumber(value: JsonValue | undefined, path: string): number | undefined { return value === undefined ? undefined : finiteNumber(value, path); }
+function optionalNonnegativeNumber(value: JsonValue | undefined, path: string): number | undefined { return value === undefined ? undefined : nonnegativeNumber(value, path); }
+function positiveInteger(value: JsonValue | undefined, path: string): number { const number = finiteNumber(value, path); if (!Number.isInteger(number) || number < 1) throw malformed(`${path} must be a positive integer`); return number; }
+function nonnegativeInteger(value: JsonValue | undefined, path: string): number { const number = finiteNumber(value, path); if (!Number.isInteger(number) || number < 0) throw malformed(`${path} must be a nonnegative integer`); return number; }
+function optionalPositiveInteger(value: JsonValue | undefined, path: string): number | undefined { return value === undefined ? undefined : positiveInteger(value, path); }
+function requiredEnum<const Values extends readonly string[]>(value: JsonValue | undefined, values: Values, path: string): Values[number] {
+  if (typeof value !== 'string' || !values.includes(value)) throw malformed(`${path} is invalid`);
+  return value;
 }
-function validateToolProgress(value: unknown, issues: string[]): void {
-  if (!isRecord(value) || !['status', 'output', 'patch', 'metric'].includes(String(value.type))) { issues.push('progress must be a supported typed progress value.'); return; }
-  if (value.type === 'status' && typeof value.stage !== 'string') issues.push('status progress.stage must be a string.');
-  if (value.type === 'output' && (!['stdout', 'stderr'].includes(String(value.stream)) || !nonnegativeInteger(value.sequence) || typeof value.text !== 'string' || !nonnegativeInteger(value.observedBytes))) issues.push('output progress is invalid.');
-  if (value.type === 'patch' && !Array.isArray(value.changes)) issues.push('patch progress.changes must be an array.');
-  if (value.type === 'metric' && (typeof value.name !== 'string' || typeof value.value !== 'number' || !Number.isFinite(value.value))) issues.push('metric progress is invalid.');
+function enumArray<const Values extends readonly string[]>(value: JsonValue | undefined, values: Values, path: string): readonly Values[number][] {
+  return Object.freeze(requiredArray(value, path).map((item, index) => requiredEnum(item, values, `${path}[${String(index)}]`)));
 }
-function requireToolAttempt(value: Record<string, unknown>, issues: string[]): void { if (!positiveInteger(value.toolAttempt)) issues.push('toolAttempt must be positive.'); }
-function nonnegativeInteger(value: unknown): value is number { return typeof value === 'number' && Number.isInteger(value) && value >= 0; }
-function positiveInteger(value: unknown): value is number { return typeof value === 'number' && Number.isInteger(value) && value > 0; }
-function nonnegativeFinite(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value) && value >= 0; }
-
-function isAgentEventType(value: unknown): value is AgentEvent['type'] {
-  return typeof value === 'string' && Object.hasOwn(EVENT_VALIDATORS, value);
+function stringArray(value: JsonValue | undefined, path: string): readonly string[] { return Object.freeze(requiredArray(value, path).map((item, index) => requiredStringValue(item, `${path}[${String(index)}]`))); }
+function optionalStringRecord(value: JsonValue | undefined, path: string): Readonly<Record<string, string>> | undefined {
+  if (value === undefined) return undefined;
+  const object = requiredObject(value, path);
+  const output: Record<string, string> = {};
+  for (const [key, item] of Object.entries(object)) output[key] = requiredStringValue(item, `${path}.${key}`);
+  return Object.freeze(output);
 }
-function isAgentEvent(value: unknown): value is AgentEvent {
-  return isRecord(value) && isAgentEventType(value.type) && validateEventShape(value).length === 0;
+function nonnegativeNumberRecord(value: JsonValue | undefined, path: string): Readonly<Record<string, number>> {
+  const object = requiredObject(value, path);
+  const output: Record<string, number> = {};
+  for (const [key, item] of Object.entries(object)) output[key] = nonnegativeNumber(item, `${path}.${key}`);
+  return Object.freeze(output);
 }
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+function primitiveRecord(value: JsonValue, path: string): Readonly<Record<string, string | number | boolean | null>> {
+  const object = requiredObject(value, path);
+  const output: Record<string, string | number | boolean | null> = {};
+  for (const [key, item] of Object.entries(object)) {
+    if (item !== null && typeof item !== 'string' && typeof item !== 'number' && typeof item !== 'boolean') throw malformed(`${path}.${key} must be primitive`);
+    output[key] = item;
+  }
+  return Object.freeze(output);
 }
+function optionalNonnegativeFields<const Keys extends readonly string[]>(object: JsonObject, keys: Keys): Readonly<Partial<Record<Keys[number], number>>> {
+  const output: Partial<Record<Keys[number], number>> = {};
+  for (const key of keys) {
+    if (object[key] !== undefined) Object.defineProperty(output, key, { value: nonnegativeInteger(object[key], key), enumerable: true });
+  }
+  return Object.freeze(output);
+}
+function isJsonObject(value: JsonValue | undefined): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }
+function isJsonArray(value: JsonValue | undefined): value is readonly JsonValue[] { return Array.isArray(value); }
+function exact(value: JsonObject, keys: readonly string[]): void {
+  const allowed = new Set(keys);
+  const unsupported = Object.keys(value).filter((key) => !allowed.has(key));
+  if (unsupported.length > 0) throw malformed(`unsupported fields: ${unsupported.join(', ')}`);
+}
+function malformed(message: string): Error { return new Error(`Malformed Agent event: ${message}.`); }

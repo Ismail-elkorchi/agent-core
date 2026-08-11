@@ -1,55 +1,57 @@
+import type { JsonObject, JsonValue } from '@agent-core/json';
+
 export type ModelRole = 'system' | 'user' | 'assistant' | 'tool';
 
 export type ModelImage =
-  | { type: 'base64'; data: string; mediaType: ModelImageMediaType; detail?: ModelImageDetail }
-  | { type: 'bytes'; data: Uint8Array; mediaType: ModelImageMediaType; detail?: ModelImageDetail };
+  | { readonly type: 'base64'; readonly data: string; readonly mediaType: ModelImageMediaType; readonly detail?: ModelImageDetail }
+  | { readonly type: 'bytes'; readonly data: Uint8Array; readonly mediaType: ModelImageMediaType; readonly detail?: ModelImageDetail };
 
 export type ModelImageDetail = 'auto' | 'low' | 'high' | 'original';
 export type ModelImageMediaType = `image/${string}`;
 
 interface ModelMessageBase {
-  content: string;
-  name?: string;
+  readonly content: string;
+  readonly name?: string;
 }
 
 export interface ModelSystemMessage extends ModelMessageBase {
-  role: 'system';
-  reasoning?: never;
-  toolCalls?: never;
-  toolName?: never;
-  toolCallId?: never;
-  toolCallType?: never;
-  images?: never;
+  readonly role: 'system';
+  readonly reasoning?: never;
+  readonly toolCalls?: never;
+  readonly toolName?: never;
+  readonly toolCallId?: never;
+  readonly toolCallType?: never;
+  readonly images?: never;
 }
 
 export interface ModelUserMessage extends ModelMessageBase {
-  role: 'user';
-  images?: ModelImage[];
-  reasoning?: never;
-  toolCalls?: never;
-  toolName?: never;
-  toolCallId?: never;
-  toolCallType?: never;
+  readonly role: 'user';
+  readonly images?: readonly ModelImage[];
+  readonly reasoning?: never;
+  readonly toolCalls?: never;
+  readonly toolName?: never;
+  readonly toolCallId?: never;
+  readonly toolCallType?: never;
 }
 
 export interface ModelAssistantMessage extends ModelMessageBase {
-  role: 'assistant';
-  reasoning?: string;
-  toolCalls?: readonly ModelToolCall[];
-  toolName?: never;
-  toolCallId?: never;
-  toolCallType?: never;
-  images?: never;
+  readonly role: 'assistant';
+  readonly reasoning?: string;
+  readonly toolCalls?: readonly ModelToolCall[];
+  readonly toolName?: never;
+  readonly toolCallId?: never;
+  readonly toolCallType?: never;
+  readonly images?: never;
 }
 
 export interface ModelToolMessage extends ModelMessageBase {
-  role: 'tool';
-  toolName: string;
-  toolCallId?: string;
-  toolCallType: ModelToolKind;
-  reasoning?: never;
-  toolCalls?: never;
-  images?: ModelImage[];
+  readonly role: 'tool';
+  readonly toolName: string;
+  readonly toolCallId?: string;
+  readonly toolCallType: ModelToolKind;
+  readonly reasoning?: never;
+  readonly toolCalls?: never;
+  readonly images?: readonly ModelImage[];
 }
 
 export type ModelMessage =
@@ -59,70 +61,70 @@ export type ModelMessage =
   | ModelToolMessage;
 
 export interface ModelUsage {
-  promptTokens: number;
-  completionTokens: number;
-  totalTokens: number;
-  cacheReadTokens?: number;
-  cacheWriteTokens?: number;
-  reasoningTokens?: number;
+  readonly promptTokens: number;
+  readonly completionTokens: number;
+  readonly totalTokens: number;
+  readonly cacheReadTokens?: number;
+  readonly cacheWriteTokens?: number;
+  readonly reasoningTokens?: number;
 }
 
 export interface ModelCapabilities {
-  streaming: boolean;
-  toolCalling: boolean;
-  supportedToolInputs: ModelToolInputSupport[];
-  jsonMode: boolean;
-  jsonSchema: boolean;
-  logprobs: boolean;
-  temperature: boolean;
-  topP: boolean;
-  reasoning?: ModelReasoningCapabilities;
+  readonly streaming: boolean;
+  readonly toolCalling: boolean;
+  readonly supportedToolInputs: readonly ModelToolInputSupport[];
+  readonly jsonMode: boolean;
+  readonly jsonSchema: boolean;
+  readonly logprobs: boolean;
+  readonly temperature: boolean;
+  readonly topP: boolean;
+  readonly reasoning?: ModelReasoningCapabilities;
 }
 
 export type ModelReasoningStrategy = 'toggle' | 'effort' | 'budget';
 export type ModelReasoningSummary = 'auto' | 'concise' | 'detailed';
 
 export interface ModelReasoningCapabilities {
-  strategies: ModelReasoningStrategy[];
-  canDisable: boolean;
-  efforts?: ModelReasoningEffort[];
-  modes?: ModelReasoningMode[];
-  summaries?: ModelReasoningSummary[];
-  separateOutput: boolean;
+  readonly strategies: readonly ModelReasoningStrategy[];
+  readonly canDisable: boolean;
+  readonly efforts?: readonly ModelReasoningEffort[];
+  readonly modes?: readonly ModelReasoningMode[];
+  readonly summaries?: readonly ModelReasoningSummary[];
+  readonly separateOutput: boolean;
 }
 
 export type ModelModality = 'text' | 'image' | 'audio' | 'video' | 'pdf' | (string & {});
 
 export interface ModelModalities {
-  input: ModelModality[];
-  output: ModelModality[];
+  readonly input: readonly ModelModality[];
+  readonly output: readonly ModelModality[];
 }
 
 export interface ModelLimits {
-  contextTokens?: number;
-  maxInputTokens?: number;
-  outputTokens?: number;
+  readonly contextTokens?: number;
+  readonly maxInputTokens?: number;
+  readonly outputTokens?: number;
 }
 
 export interface ModelTokenRates {
-  input?: number;
-  output?: number;
-  cacheRead?: number;
-  cacheWrite?: number;
+  readonly input?: number;
+  readonly output?: number;
+  readonly cacheRead?: number;
+  readonly cacheWrite?: number;
 }
 
 export interface ModelPricingTier {
   /** Applies to the whole request when prompt tokens exceed this threshold. */
-  aboveInputTokens: number;
-  inputMultiplier: number;
-  outputMultiplier: number;
+  readonly aboveInputTokens: number;
+  readonly inputMultiplier: number;
+  readonly outputMultiplier: number;
 }
 
 export interface ModelPricing {
-  currency: string;
-  rates: ModelTokenRates;
-  inputTiers?: ModelPricingTier[];
-  metadata?: Record<string, unknown>;
+  readonly currency: string;
+  readonly rates: ModelTokenRates;
+  readonly inputTiers?: readonly ModelPricingTier[];
+  readonly metadata?: JsonObject;
 }
 
 export type ModelParameter =
@@ -139,21 +141,21 @@ export type ModelParameter =
   | 'providerOptions';
 
 export interface ModelProfile {
-  id: string;
-  provider: string;
-  displayName?: string;
-  capabilities: ModelCapabilities;
-  modalities: ModelModalities;
-  limits: ModelLimits;
-  supportedParameters: ModelParameter[];
-  pricing?: ModelPricing;
-  metadata?: Record<string, unknown>;
+  readonly id: string;
+  readonly provider: string;
+  readonly displayName?: string;
+  readonly capabilities: ModelCapabilities;
+  readonly modalities: ModelModalities;
+  readonly limits: ModelLimits;
+  readonly supportedParameters: readonly ModelParameter[];
+  readonly pricing?: ModelPricing;
+  readonly metadata?: JsonObject;
 }
 
 export interface ModelProviderInfo {
-  id: string;
-  displayName: string;
-  defaultModel: string;
+  readonly id: string;
+  readonly displayName: string;
+  readonly defaultModel: string;
 }
 
 export type ModelReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
@@ -181,28 +183,28 @@ export type ModelReasoningRequest =
   };
 
 export interface ModelProviderOptions {
-  provider: string;
-  values: ModelProviderStateObject;
+  readonly provider: string;
+  readonly values: JsonObject;
 }
 
 export interface ModelRequest {
-  model: string;
-  messages: ModelMessage[];
-  temperature?: number;
-  topP?: number;
-  maxOutputTokens?: number;
-  responseFormat?: ModelResponseFormat;
-  tools?: ModelTool[];
-  keepAlive?: string | number;
-  reasoning?: ModelReasoningRequest;
-  logprobs?: boolean;
-  topLogprobs?: number;
-  providerOptions?: ModelProviderOptions;
-  metadata?: Record<string, string>;
-  signal?: AbortSignal;
+  readonly model: string;
+  readonly messages: readonly ModelMessage[];
+  readonly temperature?: number;
+  readonly topP?: number;
+  readonly maxOutputTokens?: number;
+  readonly responseFormat?: ModelResponseFormat;
+  readonly tools?: readonly ModelTool[];
+  readonly keepAlive?: string | number;
+  readonly reasoning?: ModelReasoningRequest;
+  readonly logprobs?: boolean;
+  readonly topLogprobs?: number;
+  readonly providerOptions?: ModelProviderOptions;
+  readonly metadata?: Readonly<Record<string, string>>;
+  readonly signal?: AbortSignal;
 }
 
-export type ModelResponseFormat = 'text' | 'json' | { type: 'json_schema'; schema: Record<string, unknown> };
+export type ModelResponseFormat = 'text' | 'json' | { readonly type: 'json_schema'; readonly schema: JsonObject };
 
 export type ModelToolInputFormat = 'json' | 'text' | 'grammar';
 
@@ -212,19 +214,19 @@ export type ModelToolInputSupport =
   | { readonly kind: 'grammar'; readonly syntax: string };
 
 export type ModelToolInput =
-  | { kind: 'json'; value: Record<string, unknown> }
-  | { kind: 'text'; value: string };
+  | { readonly kind: 'json'; readonly value: JsonObject }
+  | { readonly kind: 'text'; readonly value: string };
 
 export type ModelToolKind = 'function' | 'custom';
 
 export type ModelTool = ModelFunctionTool | ModelCustomTool;
 
 export interface ModelFunctionTool {
-  type: 'function';
-  function: {
-    name: string;
-    description?: string;
-    parameters?: Record<string, unknown>;
+  readonly type: 'function';
+  readonly function: {
+    readonly name: string;
+    readonly description?: string;
+    readonly parameters?: JsonObject;
   };
 }
 
@@ -233,44 +235,44 @@ export type ModelCustomToolFormat =
   | { type: 'grammar'; syntax: string; definition: string };
 
 export interface ModelCustomTool {
-  type: 'custom';
-  name: string;
-  description?: string;
-  format: ModelCustomToolFormat;
+  readonly type: 'custom';
+  readonly name: string;
+  readonly description?: string;
+  readonly format: ModelCustomToolFormat;
 }
 
 export interface ModelFunctionToolCall {
-  id?: string;
-  type: 'function';
-  name: string;
-  input: Extract<ModelToolInput, { kind: 'json' }>;
+  readonly id?: string;
+  readonly type: 'function';
+  readonly name: string;
+  readonly input: Extract<ModelToolInput, { kind: 'json' }>;
 }
 
 export interface ModelCustomToolCall {
-  id?: string;
-  type: 'custom';
-  name: string;
-  input: Extract<ModelToolInput, { kind: 'text' }>;
+  readonly id?: string;
+  readonly type: 'custom';
+  readonly name: string;
+  readonly input: Extract<ModelToolInput, { kind: 'text' }>;
 }
 
 export type ModelToolCall = ModelFunctionToolCall | ModelCustomToolCall;
 
 export interface ModelResponse {
-  content: string;
-  model: string;
-  provider: string;
-  providerState?: ModelProviderState;
-  requestId?: string;
-  transport?: ModelTransportMetadata;
-  usage?: ModelUsage;
-  reasoning?: string;
-  reasoningSummary?: string;
-  toolCalls?: readonly ModelToolCall[];
-  terminationReason: ModelTerminationReason;
-  providerTerminationReason?: string;
-  timings?: Record<string, number>;
-  logprobs?: unknown;
-  raw?: unknown;
+  readonly content: string;
+  readonly model: string;
+  readonly provider: string;
+  readonly providerState?: ModelProviderState;
+  readonly requestId?: string;
+  readonly transport?: ModelTransportMetadata;
+  readonly usage?: ModelUsage;
+  readonly reasoning?: string;
+  readonly reasoningSummary?: string;
+  readonly toolCalls?: readonly ModelToolCall[];
+  readonly terminationReason: ModelTerminationReason;
+  readonly providerTerminationReason?: string;
+  readonly timings?: Readonly<Record<string, number>>;
+  readonly logprobs?: JsonValue;
+  readonly raw?: JsonValue;
 }
 
 export type ModelTerminationReason =
@@ -280,34 +282,29 @@ export type ModelTerminationReason =
   | 'content_filter'
   | 'unknown';
 
-export type ModelProviderStatePrimitive = string | number | boolean | null;
-export type ModelProviderStateValue = ModelProviderStatePrimitive | ModelProviderStateValue[] | ModelProviderStateObject;
-
-export interface ModelProviderStateObject { [key: string]: ModelProviderStateValue }
-
 export interface ModelProviderState {
-  provider: string;
-  model: string;
-  kind: string;
-  data: ModelProviderStateObject;
+  readonly provider: string;
+  readonly model: string;
+  readonly kind: string;
+  readonly data: JsonObject;
 }
 
 export interface ModelTransportMetadata {
-  provider: string;
-  strategy: string;
-  responseId?: string;
-  reusedContinuation?: boolean;
-  fallbackReason?: string;
+  readonly provider: string;
+  readonly strategy: string;
+  readonly responseId?: string;
+  readonly reusedContinuation?: boolean;
+  readonly fallbackReason?: string;
 }
 
 export type ModelReasoningChannel = 'reasoning' | 'summary';
 
 export type ModelStreamEvent =
-  | { type: 'content'; content: string; accumulated: string; raw?: unknown }
-  | { type: 'reasoning'; reasoning: string; accumulatedReasoning: string; channel?: ModelReasoningChannel; raw?: unknown }
-  | { type: 'tool_call'; toolCall: ModelToolCall; raw?: unknown }
-  | { type: 'status'; message: string; raw?: unknown }
-  | { type: 'done'; response: ModelResponse };
+  | { readonly type: 'content'; readonly content: string; readonly accumulated: string; readonly raw?: JsonValue }
+  | { readonly type: 'reasoning'; readonly reasoning: string; readonly accumulatedReasoning: string; readonly channel?: ModelReasoningChannel; readonly raw?: JsonValue }
+  | { readonly type: 'tool_call'; readonly toolCall: ModelToolCall; readonly raw?: JsonValue }
+  | { readonly type: 'status'; readonly message: string; readonly raw?: JsonValue }
+  | { readonly type: 'done'; readonly response: ModelResponse };
 
 export interface ModelProvider {
   readonly id: string;
@@ -343,12 +340,12 @@ export type ModelProviderErrorCode =
 export type ModelProviderErrorDiagnosticValue = string | number | boolean | null;
 
 export interface ModelProviderErrorDiagnostic {
-  provider: string;
-  code: ModelProviderErrorCode;
-  retryable: boolean;
-  transport?: string;
-  eventType?: string;
-  causeSummary?: Record<string, ModelProviderErrorDiagnosticValue>;
+  readonly provider: string;
+  readonly code: ModelProviderErrorCode;
+  readonly retryable: boolean;
+  readonly transport?: string;
+  readonly eventType?: string;
+  readonly causeSummary?: Readonly<Record<string, ModelProviderErrorDiagnosticValue>>;
 }
 
 export class ModelProviderError extends Error {
@@ -391,7 +388,7 @@ export interface TokenEstimator {
   estimateText(text: string): number;
   /** Estimate one encoded image. Implementations must never silently count an image as zero. */
   estimateImage(image: ModelImage): number;
-  estimateMessages(messages: ModelMessage[]): number;
+  estimateMessages(messages: readonly ModelMessage[]): number;
 }
 
 export class SimpleTokenEstimator implements TokenEstimator {
@@ -410,7 +407,7 @@ export class SimpleTokenEstimator implements TokenEstimator {
     return SimpleTokenEstimator.DEFAULT_IMAGE_TOKENS;
   }
 
-  estimateMessages(messages: ModelMessage[]): number {
+  estimateMessages(messages: readonly ModelMessage[]): number {
     return messages.reduce((total, message) => total + this.estimateText(message.content)
       + (message.images ?? []).reduce((imageTotal, image) => imageTotal + this.estimateImage(image), 0) + 4, 0);
   }

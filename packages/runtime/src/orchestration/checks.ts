@@ -79,7 +79,7 @@ export async function runAgentChecks(input: {
         execution
       }
     });
-    const withDuration = parseAgentCheckResult({ ...result, durationMs: Math.max(0, performance.now() - startedAt) });
+    const withDuration = parseAgentCheckResult(result, Math.max(0, performance.now() - startedAt));
     results.push(withDuration);
     await input.append({ type: 'check.ended', ...identity, check: check.id, result: withDuration });
     await input.emit({ type: 'check.ended', ...identity, result: withDuration });

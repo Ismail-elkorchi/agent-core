@@ -74,7 +74,7 @@ export function toCodexFunctionCallInput(toolCall: ModelToolCall): Record<string
   };
 }
 
-function toCodexInput(messages: ModelMessage[]): { instructions: string; input: unknown[] } {
+function toCodexInput(messages: readonly ModelMessage[]): { instructions: string; input: unknown[] } {
   const instructionMessages = instructionMessagesFrom(messages);
   const input: unknown[] = [];
   for (const message of messages) {
@@ -103,7 +103,7 @@ function toCodexInput(messages: ModelMessage[]): { instructions: string; input: 
   return { instructions: instructionMessages.join('\n\n'), input };
 }
 
-function instructionMessagesFrom(messages: ModelMessage[]): string[] {
+function instructionMessagesFrom(messages: readonly ModelMessage[]): string[] {
   return messages
     .filter((message) => message.role === 'system' && message.content.trim().length > 0)
     .map((message) => message.content);

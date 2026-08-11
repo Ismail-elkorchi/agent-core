@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { ContextManager } from '../context/manager.js';
-import { hashRecord } from '@agent-core/evidence';
+import { hashJson } from '@agent-core/evidence';
 import { normalizeJsonSafe, type JsonObject } from '@agent-core/json';
 import type { SessionRepository } from '../session/repository.js';
 import type { AgentApprovalBinding, AgentApprovalRequest, AgentToolBatchIdentity, AgentToolCallAttemptIdentity, AgentToolCallIdentity } from '../run/contracts.js';
@@ -115,8 +115,8 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
     }
     const prepared = preparation.prepared;
     const preparedCall = prepared.call;
-    machine = transitionWithoutCommands(machine, { type: 'input.parsed', input: prepared.decodedInput });
-    machine = transitionWithoutCommands(machine, { type: 'input.canonicalized', input: prepared.canonicalInput });
+    machine = transitionWithoutCommands(machine, { type: 'input.parsed', input: prepared.canonicalSnapshot });
+    machine = transitionWithoutCommands(machine, { type: 'input.canonicalized', input: prepared.canonicalSnapshot });
     machine = transitionWithoutCommands(machine, { type: 'effects.derived', effects: prepared.effects, fingerprint: prepared.fingerprint });
     if (recovery?.completed) {
       entries.push({ identity, call: preparedCall, prepared, machine, observation: recovery.completed.observation, observationProjected: recovery.completed.observationProjected });
@@ -133,7 +133,7 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
     machine = transitionWithCommand(machine, { type: 'authorization.started' }, 'authorization.invoke');
     const override = input.authorizationOverrides?.find((item) => item.callIndex === callIndex);
     if (input.resuming && override?.fingerprint !== prepared.fingerprint) throw new Error(`Tool call fingerprint changed before approval resume at call ${String(callIndex)}.`);
-    const authorizationRequest = { call: preparedCall, tool: prepared.tool, input: prepared.canonicalInput, effects: prepared.effects, fingerprint: prepared.fingerprint, context: authorizationContext };
+    const authorizationRequest = { call: preparedCall, toolImplementationId: prepared.toolImplementationId, input: prepared.canonicalSnapshot, effects: prepared.effects, fingerprint: prepared.fingerprint, context: authorizationContext };
     const policyDenial = enforceAllowedEffects(authorizationRequest);
     const currentAuthorization = policyDenial ?? await abortableToolBoundary(input.toolContext.signal, () => authorizer(authorizationRequest));
     const authorization: ToolAuthorizationDecision = override
@@ -147,12 +147,12 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
     const binding = approvalBinding(prepared, authorizationContext);
     const authorizationTransition = reduceToolCall(machine, { type: 'authorization.decided', decision: authorization, ...(approvalId ? { approvalId } : {}) });
     machine = authorizationTransition.state;
-    if (!input.resuming) await input.append({ type: 'tool.authorization.decided', ...identity, toolName: call.name, fingerprint: prepared.fingerprint, binding, decision: authorization.decision, ...(authorization.reason ? { reason: authorization.reason } : {}) });
+    if (!input.resuming) await input.append({ type: 'tool.authorization.decided', ...callIdentityValue, toolName: call.name, fingerprint: prepared.fingerprint, binding, decision: authorization.decision, ...(authorization.reason ? { reason: authorization.reason } : {}) });
     if (authorization.decision === 'require_approval' && approvalId) {
       requireSingleCommand(authorizationTransition.commands, 'approval.persist');
       const approval = approvalRequest(input.runId, identity, approvalId, authorization.reason, prepared, authorizationContext);
       approvals.push(approval);
-      await input.append({ type: 'approval.requested', runId: input.runId, ...identity, approvalId, toolName: call.name, fingerprint: approval.fingerprint, input: approval.input, effects: prepared.effects, binding, policyHash: approval.policyHash, reason: approval.reason });
+      await input.append({ type: 'approval.requested', runId: input.runId, ...callIdentityValue, approvalId, toolName: call.name, fingerprint: approval.fingerprint, input: approval.input, effects: prepared.effects, binding, policyHash: approval.policyHash, reason: approval.reason });
       entries.push({ identity, call: preparedCall, prepared, machine });
       continue;
     }
@@ -250,7 +250,9 @@ async function persistObservation(input: Parameters<typeof executeAssistantToolC
   const committed = entry.observationProjected
     ? undefined
     : await input.observationStore.commitToolObservation({
-      turnIndex: input.turnIndex, call: entry.call, canonicalInput: entry.prepared?.canonicalInput, tool: entry.prepared?.tool, observation
+      turnIndex: input.turnIndex, call: entry.call,
+      ...(entry.prepared ? { canonicalSnapshot: entry.prepared.canonicalSnapshot } : {}),
+      tool: input.tools.find((tool) => tool.name === entry.call.name && tool.implementationId === entry.prepared?.toolImplementationId), observation
     });
   const persistedObservation = normalizeToolObservationForPersistence(committed?.durableObservation ?? observation);
   await input.append({ type: 'tool.ended', ...entry.identity, toolName: entry.call.name, observation: persistedObservation }, toolEventKey(input.runId, entry.identity, 'ended'));
@@ -354,16 +356,15 @@ function preparationOutcome(observation: ToolObservation): 'invalid_input' | 'un
   return 'failed';
 }
 function approvalRequest(runId: string, identity: AgentToolCallIdentity, approvalId: string, reason: string, prepared: PreparedToolCall, context: ToolPreparationContext): AgentApprovalRequest {
-  const input = normalizeJsonSafe(prepared.canonicalInput).value;
-  const effects = normalizeJsonSafe(prepared.effects).value;
-  if (!isJsonObject(effects)) throw new Error('Prepared tool effects did not normalize to an object.');
+  const input = prepared.canonicalSnapshot;
+  const effects = prepared.effects;
   const ambient = prepared.effects.accesses.some((access) => access.mode === 'execute') && prepared.effects.lockScopes.includes('workspace/files');
   const authorityReason = ambient
     ? `${reason} This grants ambient process authority that can indirectly read, write, or delete files, access the network, and start child processes.`
     : reason;
-  return Object.freeze({ ...identity, approvalId, status: 'pending', toolName: prepared.tool.name, fingerprint: prepared.fingerprint, input, effects, binding: approvalBinding(prepared, context), policyHash: hashRecord(normalizeJsonSafe(context.policy).value), reason: authorityReason, runId });
+  return Object.freeze({ ...identity, approvalId, status: 'pending', toolName: prepared.call.name, fingerprint: prepared.fingerprint, input, effects, binding: approvalBinding(prepared, context), policyHash: hashJson(context.policy), reason: authorityReason, runId });
 }
 function approvalBinding(prepared: PreparedToolCall, context: ToolPreparationContext): AgentApprovalBinding {
-  return Object.freeze({ toolImplementationId: prepared.tool.implementationId, authorizationPolicyId: context.boundary.authorizationPolicyId, executionTargetId: context.boundary.executionTargetId });
+  return Object.freeze({ toolImplementationId: prepared.toolImplementationId, authorizationPolicyId: context.boundary.authorizationPolicyId, executionTargetId: context.boundary.executionTargetId });
 }
 function isJsonObject(value: unknown): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }

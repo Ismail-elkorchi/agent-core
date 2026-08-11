@@ -16,7 +16,7 @@ export interface RequestCostEstimate {
   outputReserveTokens: number;
   totalPromptTokens: number;
   totalRequestTokens: number;
-  warnings: string[];
+  readonly warnings: readonly string[];
 }
 
 export interface RequestWindow {

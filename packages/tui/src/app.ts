@@ -679,11 +679,8 @@ function errorText(value: string): InlineContent {
 }
 
 function effectSummary(approval: AgentApprovalRequest): string {
-  const accesses = Array.isArray(approval.effects.accesses)
-    ? approval.effects.accesses.filter((access): access is { readonly mode: string; readonly scope: string } => (
-      typeof access === 'object' && access !== null && !Array.isArray(access)
-      && typeof access.mode === 'string' && typeof access.scope === 'string'
-    ))
+  const accesses = readonlyArray(approval.effects.accesses)
+    ? approval.effects.accesses.filter(effectAccess)
     : [];
   if (accesses.length === 0) return 'tool operation';
   const summary = accesses.map((access) => `${access.mode.replaceAll('_', ' ')} · ${access.scope}`).join(', ');
@@ -693,14 +690,21 @@ function effectSummary(approval: AgentApprovalRequest): string {
     ? `${summary}. Ambient shell authority can read, write, or delete files, access the network, and start child processes.`
     : summary;
 }
+function readonlyArray(value: unknown): value is readonly unknown[] { return Array.isArray(value); }
+function effectAccess(value: unknown): value is { readonly mode: string; readonly scope: string } {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.mode === 'string' && typeof record.scope === 'string';
+}
 
 function approvalSubject(approval: AgentApprovalRequest): string {
   if (typeof approval.input !== 'object' || approval.input === null || Array.isArray(approval.input)) return '';
+  const input = approval.input as import('@agent-core/json').JsonObject;
   const candidates = [
-    ['Command', approval.input.command],
-    ['Path', approval.input.path],
-    ['Query', approval.input.query],
-    ['Pattern', approval.input.pattern]
+    ['Command', input.command],
+    ['Path', input.path],
+    ['Query', input.query],
+    ['Pattern', input.pattern]
   ] as const;
   for (const [label, value] of candidates) {
     if (typeof value === 'string' && value.trim().length > 0) {

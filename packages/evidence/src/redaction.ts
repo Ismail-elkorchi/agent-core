@@ -9,15 +9,16 @@ export interface RedactedJson {
 export function redactJson(value: unknown, limits: Partial<SafeJsonParseLimits> = {}): RedactedJson {
   const state = { redactions: 0 };
   const redacted = redactValue(parseJsonValue(value, limits), [], state);
-  return Object.freeze({ value: parseJsonValue(redacted, limits), redactions: state.redactions });
+  return Object.freeze({ value: redacted, redactions: state.redactions });
 }
 
 function redactValue(value: JsonValue, pathParts: readonly string[], state: { redactions: number }): JsonValue {
   if (typeof value === 'string') return redactString(value, pathParts, state);
-  if (Array.isArray(value)) return value.map((item, index) => redactValue(item, [...pathParts, String(index)], state));
+  if (jsonArray(value)) return Object.freeze(value.map((item, index) => redactValue(item, [...pathParts, String(index)], state)));
   if (typeof value !== 'object' || value === null) return value;
-  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactValue(item, [...pathParts, key], state)]));
+  return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactValue(item, [...pathParts, key], state)])));
 }
+function jsonArray(value: JsonValue): value is readonly JsonValue[] { return Array.isArray(value); }
 
 function redactString(value: string, pathParts: readonly string[], state: { redactions: number }): string {
   const key = pathParts.at(-1) ?? '';
