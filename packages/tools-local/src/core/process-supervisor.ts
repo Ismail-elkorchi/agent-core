@@ -4,6 +4,7 @@ import { createServer, type Socket } from 'node:net';
 import { mkdir, open, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 
 const args = argumentsMap(process.argv.slice(2));
 const identity = required('identity');
@@ -86,10 +87,12 @@ async function release(): Promise<void> {
   if (released) return;
   released = true;
   clearTimeout(releaseTimer);
-  const child = spawn(command, [], {
+  const child = spawn(process.platform === 'win32' ? process.execPath : command, process.platform === 'win32'
+    ? [fileURLToPath(new URL('./process-command-host.js', import.meta.url)), cwd, command]
+    : [], {
     cwd,
     env: process.env,
-    shell: true,
+    shell: process.platform !== 'win32',
     stdio: ['pipe', 'pipe', 'pipe'],
     detached: process.platform !== 'win32',
     windowsHide: true
