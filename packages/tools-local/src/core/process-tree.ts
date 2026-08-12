@@ -19,6 +19,10 @@ export async function stopExistingProcessTree(processGroup: number): Promise<voi
       killer.once('error', reject);
       killer.once('close', (code) => { if (code === 0 || !processTreeExists(processGroup)) resolve(); else reject(new Error(`taskkill exited with code ${String(code)}.`)); });
     });
+    for (let settled = 0; settled < 10;) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      settled = processTreeExists(processGroup) ? 0 : settled + 1;
+    }
     return;
   }
   try { process.kill(-processGroup, 'SIGTERM'); }
