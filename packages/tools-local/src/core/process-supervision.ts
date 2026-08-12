@@ -1,6 +1,7 @@
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import { createConnection } from 'node:net';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import { tmpdir } from 'node:os';
@@ -120,10 +121,13 @@ class SupervisorController implements SupervisedProcessTree {
   release(): Promise<void> { return sendSupervisorCommand(this.supervision, 'release', 5_000); }
 
   stop(): void {
-    this.#operation = sendSupervisorCommand(this.supervision, 'stop', 5_000).catch((error: unknown) => {
+    this.#operation = sendSupervisorCommand(this.supervision, 'stop', 5_000).catch(async (error: unknown) => {
       // This is the exact child handle created by this controller, not a recovered PID.
       try { this.child.kill('SIGKILL'); } catch { /* The supervisor already exited. */ }
-      throw error;
+      await this.#settled;
+      try {
+        verifySupervisorTerminalState(JSON.parse(await readFile(this.supervision.stateFile, 'utf8')), this.supervision);
+      } catch { throw error; }
     });
   }
 
