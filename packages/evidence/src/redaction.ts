@@ -1,4 +1,4 @@
-import type { JsonValue } from '@agent-core/json';
+import type { JsonObject, JsonValue } from '@agent-core/json';
 
 export interface RedactedJson {
   readonly value: JsonValue;
@@ -6,6 +6,9 @@ export interface RedactedJson {
 }
 
 /** Apply the shared durable/model-visible secret redaction policy to owned JSON. */
+export function redactJson(value: string): RedactedJson & { readonly value: string };
+export function redactJson(value: JsonObject): RedactedJson & { readonly value: JsonObject };
+export function redactJson(value: JsonValue): RedactedJson;
 export function redactJson(value: JsonValue): RedactedJson {
   const state = { redactions: 0 };
   const redacted = redactValue(value, [], state);

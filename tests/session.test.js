@@ -79,6 +79,33 @@ test('session observations normalize hostile output and metadata before durable 
   assert.deepEqual(observation.metadata, { value: '[value inspection failed]' });
 });
 
+test('session repositories retain and expose only owned session state', async () => {
+  const rootDir = await mkdtemp(path.join(tmpdir(), 'agent-session-owned-'));
+  const repositories = [new InMemorySessionRepository(), new JsonlSessionRepository({ rootDir })];
+  for (const [index, repository] of repositories.entries()) {
+    const session = await repository.create({ id: `owned-${String(index)}`, workspaceRoot: process.cwd(), model: 'original' });
+    const instruction = { id: 'instruction', content: 'original', provenance: 'run' };
+    const input = await repository.appendInput(session.id, { runId: 'run', task: 'original', instructions: [instruction] });
+    instruction.content = 'mutated';
+
+    assert.equal(input.instructions[0].content, 'original');
+    assert.equal(Object.isFrozen(session), true);
+    assert.equal(Object.isFrozen(session.header), true);
+    assert.equal(Object.isFrozen(input), true);
+    assert.equal(Object.isFrozen(input.instructions), true);
+    assert.equal(Object.isFrozen(input.instructions[0]), true);
+    assert.throws(() => { input.instructions[0].content = 'changed'; }, TypeError);
+
+    const replay = await repository.loadReplayState(session.id);
+    assert.equal(Object.isFrozen(replay), true);
+    assert.equal(Object.isFrozen(replay.branch), true);
+    assert.equal(Object.isFrozen(replay.terminalProjections), true);
+    assert.equal(Object.isFrozen(replay.ledgerRunIds), true);
+    assert.throws(() => { replay.branch.pop(); }, TypeError);
+    assert.equal((await repository.loadReplayState(session.id)).branch[0].instructions[0].content, 'original');
+  }
+});
+
 test('session final projections are idempotent and validate the complete terminal union', async () => {
   const rootDir = await mkdtemp(path.join(tmpdir(), 'agent-session-final-'));
   const repository = new JsonlSessionRepository({ rootDir });

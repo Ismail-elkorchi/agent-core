@@ -77,19 +77,20 @@ export class JsonlSessionRepository implements SessionRepository {
   async create(options: CreateSessionOptions): Promise<AgentSession> {
     const id = options.id ?? randomUUID();
     return this.enqueue(id, () => withPersistenceFileLock(this.filePath(id), this.lockTimeoutMs, this.staleLockMs, async () => {
-      const header: SessionHeader = {
+      const header: SessionHeader = Object.freeze({
         type: 'session', version: 1, id, timestamp: new Date().toISOString(),
         workspaceRoot: await canonicalWorkspaceRoot(options.workspaceRoot),
         ...(options.parentSessionId ? { parentSessionId: options.parentSessionId } : {}),
         ...(options.provider ? { provider: options.provider } : {}),
         ...(options.model ? { model: options.model } : {})
-      };
+      });
       await fs.mkdir(this.rootDir, { recursive: true });
       const serialized = `${JSON.stringify(header)}\n`;
       await fs.writeFile(this.filePath(id), serialized, { encoding: 'utf8', flag: 'wx' });
       const completeBytes = Buffer.byteLength(serialized, 'utf8');
-      this.indexes.set(id, { header, branchEntries: [], projections: [], contextProjections: [], completeBytes, boundaryMarker: Buffer.from(serialized).subarray(-256).toString('base64'), storageStamp: await jsonlStorageStamp(this.filePath(id)) });
-      return { id, header, leafId: null };
+      const state: SessionAppendIndex = { header, branchEntries: [], projections: [], contextProjections: [], completeBytes, boundaryMarker: Buffer.from(serialized).subarray(-256).toString('base64'), storageStamp: await jsonlStorageStamp(this.filePath(id)) };
+      this.indexes.set(id, state);
+      return sessionFromState(state);
     }));
   }
 
@@ -109,40 +110,41 @@ export class JsonlSessionRepository implements SessionRepository {
       if (!id) continue;
       const session = await this.open(id);
       if (wanted && session.header.workspaceRoot !== wanted) continue;
-      summaries.push({
+      summaries.push(Object.freeze({
         id, workspaceRoot: session.header.workspaceRoot, timestamp: session.header.timestamp,
         ...(session.header.provider ? { provider: session.header.provider } : {}),
         ...(session.header.model ? { model: session.header.model } : {})
-      });
+      }));
     }
-    return summaries.sort((left, right) => right.timestamp.localeCompare(left.timestamp));
+    return Object.freeze(summaries.sort((left, right) => right.timestamp.localeCompare(left.timestamp)));
   }
 
   async loadReplayState(sessionId: string, leafId?: string | null): Promise<SessionReplayState> {
     const state = await this.enqueue(sessionId, () => this.refreshIndex(sessionId, false));
     const session = sessionFromState(state);
-    const branch = activeBranch(state.branchEntries, leafId === undefined ? session.leafId : leafId);
+    const branch = Object.freeze(activeBranch(state.branchEntries, leafId === undefined ? session.leafId : leafId));
     const branchIds = new Set(branch.map((entry) => entry.id));
     const contextProjection = [...state.contextProjections].reverse().find((projection) => branchIds.has(projection.throughEntryId));
     const latestEndedRunId = contextProjection?.recentTurns.at(-1)?.runId;
     const tailStart = contextProjection ? branch.findIndex((entry) => entry.id === contextProjection.throughEntryId) + 1 : 0;
     const tailRunIds = [...new Set(branch.slice(tailStart).flatMap((entry) => entry.type === 'input' ? [entry.runId] : []))];
     const relevantRunIds = new Set([...tailRunIds, ...(latestEndedRunId ? [latestEndedRunId] : [])]);
-    const terminalProjections = state.projections.filter((projection) => relevantRunIds.has(projection.runId));
+    const terminalProjections = Object.freeze(state.projections.filter((projection) => relevantRunIds.has(projection.runId)));
     const endedRunIds = new Set(terminalProjections.map((projection) => projection.runId));
     const openRunIds = tailRunIds.filter((runId) => !endedRunIds.has(runId));
-    const ledgerRunIds = [...new Set([...openRunIds, ...(latestEndedRunId ? [latestEndedRunId] : [])])];
-    return { session, branch, terminalProjections, ...(contextProjection ? { contextProjection } : {}), ledgerRunIds };
+    const ledgerRunIds = Object.freeze([...new Set([...openRunIds, ...(latestEndedRunId ? [latestEndedRunId] : [])])]);
+    return Object.freeze({ session, branch, terminalProjections, ...(contextProjection ? { contextProjection } : {}), ledgerRunIds });
   }
 
   appendInput(sessionId: string, input: { runId: string; task: string; instructions?: readonly AgentEffectiveInstruction[] }): Promise<SessionInputEntry> {
-    return this.appendBranchEntry(sessionId, (parentId) => ({
-      ...baseEntry(parentId), type: 'input', runId: input.runId, task: input.task, instructions: Object.freeze([...(input.instructions ?? [])])
+    return this.appendBranchEntry(sessionId, (parentId) => Object.freeze({
+      ...baseEntry(parentId), type: 'input', runId: input.runId, task: input.task,
+      instructions: Object.freeze((input.instructions ?? []).map((instruction) => Object.freeze({ ...instruction })))
     }));
   }
 
   appendToolCall(sessionId: string, input: { runId: string; identity: AgentToolCallIdentity; call: unknown }): Promise<SessionToolCallEntry> {
-    return this.appendBranchEntry(sessionId, (parentId) => ({
+    return this.appendBranchEntry(sessionId, (parentId) => Object.freeze({
       ...baseEntry(parentId), type: 'tool_call', runId: input.runId, ...input.identity, call: normalizeJsonSafe(input.call).value
     }));
   }
@@ -157,7 +159,7 @@ export class JsonlSessionRepository implements SessionRepository {
         if (!sameObservation(existing, normalized)) throw new PersistenceConflictError(`Conflicting session observation for ${String(key)}.`);
         return existing;
       }
-      const entry: SessionObservationEntry = { ...baseEntry(branchLeaf(state.branchEntries)), type: 'observation', ...normalized };
+      const entry: SessionObservationEntry = Object.freeze({ ...baseEntry(branchLeaf(state.branchEntries)), type: 'observation', ...normalized });
       await appendJsonlRecord(this.filePath(sessionId), entry);
       state.branchEntries.push(entry);
       state.completeBytes += recordBytes(entry);
@@ -168,7 +170,7 @@ export class JsonlSessionRepository implements SessionRepository {
   }
 
   appendModelSettings(sessionId: string, settings: { provider: string; model: string; temperature?: number; reasoningEffort?: string }): Promise<SessionModelSettingsEntry> {
-    return this.appendBranchEntry(sessionId, (parentId) => ({
+    return this.appendBranchEntry(sessionId, (parentId) => Object.freeze({
       ...baseEntry(parentId), type: 'model_settings', provider: settings.provider, model: settings.model,
       ...(settings.temperature === undefined ? {} : { temperature: settings.temperature }),
       ...(settings.reasoningEffort === undefined ? {} : { reasoningEffort: settings.reasoningEffort })
@@ -179,7 +181,7 @@ export class JsonlSessionRepository implements SessionRepository {
     return this.enqueue(sessionId, () => withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
       const state = await this.refreshIndex(sessionId, true);
       if (!state.branchEntries.some((entry) => entry.id === entryId)) throw new Error(`Cannot branch from unknown entry: ${entryId}`);
-      const entry: SessionBranchMarkerEntry = { ...baseEntry(entryId), type: 'branch', fromEntryId: entryId, ...(label ? { label } : {}) };
+      const entry: SessionBranchMarkerEntry = Object.freeze({ ...baseEntry(entryId), type: 'branch', fromEntryId: entryId, ...(label ? { label } : {}) });
       await appendJsonlRecord(this.filePath(sessionId), entry);
       state.branchEntries.push(entry);
       state.completeBytes += recordBytes(entry);
@@ -202,10 +204,10 @@ export class JsonlSessionRepository implements SessionRepository {
         return existing;
       }
       const contextProjection = contextProjectionForTerminal(state, terminal);
-      const projection: SessionFinalProjection = {
+      const projection: SessionFinalProjection = Object.freeze({
         type: 'final', id: randomUUID(), timestamp: new Date().toISOString(), runId: terminal.runId,
         finalizationId: terminal.finalizationId, terminal
-      };
+      });
       await appendJsonlRecord(this.filePath(sessionId), projection);
       state.projections.push(projection);
       state.completeBytes += recordBytes(projection);
@@ -314,8 +316,9 @@ async function readSessionFile(filePath: string, sessionId: string): Promise<{ r
   if (lines.length === 0) throw corruption(filePath, 1, 0, 'Session is empty.', 'invalid_header');
   const headerLine = lines[0];
   if (headerLine === undefined) throw corruption(filePath, 1, 0, 'Session is empty.', 'invalid_header');
-  const header = parseJson(headerLine, filePath);
-  if (!isSessionHeader(header, sessionId)) throw corruption(filePath, 1, 0, 'Session header is invalid.', 'invalid_header');
+  let header: SessionHeader;
+  try { header = parseSessionHeader(parseJson(headerLine, filePath), sessionId); }
+  catch (error) { throw corruption(filePath, 1, 0, errorMessage(error), 'invalid_header'); }
   const branchEntries: SessionBranchEntry[] = [];
   const projections: SessionFinalProjection[] = [];
   const contextProjections: SessionContextProjection[] = [];
@@ -390,14 +393,24 @@ function contextProjectionForTerminal(state: SessionFileState, terminal: AgentTe
   const previous = [...state.contextProjections].reverse().find((projection) => branchIds.has(projection.throughEntryId));
   return createSessionContextProjection({ branchEntries: branch, terminal, throughEntryId, ...(previous ? { previous } : {}) });
 }
-function sessionFromState(state: SessionFileState): AgentSession { return { id: state.header.id, header: state.header, leafId: branchLeaf(state.branchEntries) }; }
+function sessionFromState(state: SessionFileState): AgentSession { return Object.freeze({ id: state.header.id, header: state.header, leafId: branchLeaf(state.branchEntries) }); }
 function baseEntry(parentId: string | null): BaseSessionEntry { return { id: randomUUID(), parentId, timestamp: new Date().toISOString() }; }
 function validateParents(entries: readonly SessionBranchEntry[], filePath: string): void {
   const ids = new Set<string>();
   for (const entry of entries) { if (ids.has(entry.id)) throw new Error(`Duplicate session entry ${entry.id} in ${filePath}.`); if (entry.parentId !== null && !ids.has(entry.parentId)) throw new Error(`Unknown parent ${entry.parentId} in ${filePath}.`); ids.add(entry.id); }
 }
-function isSessionHeader(value: unknown, sessionId: string): value is SessionHeader {
-  return isRecord(value) && value.type === 'session' && value.version === 1 && value.id === sessionId && typeof value.timestamp === 'string' && typeof value.workspaceRoot === 'string';
+function parseSessionHeader(value: JsonValue, sessionId: string): SessionHeader {
+  if (!isJsonObject(value) || value.type !== 'session' || value.version !== 1 || value.id !== sessionId
+    || typeof value.timestamp !== 'string' || typeof value.workspaceRoot !== 'string'
+    || (value.parentSessionId !== undefined && typeof value.parentSessionId !== 'string')
+    || (value.provider !== undefined && typeof value.provider !== 'string')
+    || (value.model !== undefined && typeof value.model !== 'string')) throw new Error('Session header is invalid.');
+  return Object.freeze({
+    type: 'session', version: 1, id: value.id, timestamp: value.timestamp, workspaceRoot: value.workspaceRoot,
+    ...(value.parentSessionId === undefined ? {} : { parentSessionId: value.parentSessionId }),
+    ...(value.provider === undefined ? {} : { provider: value.provider }),
+    ...(value.model === undefined ? {} : { model: value.model })
+  });
 }
 function recordBytes(record: unknown): number { return Buffer.byteLength(`${JSON.stringify(record)}\n`, 'utf8'); }
 function normalizedObservationInput(input: { runId: string; identity: AgentTurnIdentity & Partial<Pick<AgentToolCallAttemptIdentity, 'toolBatchId' | 'callIndex' | 'callId' | 'toolAttempt'>>; toolName: string; observation: SessionObservationInput }): Omit<SessionObservationEntry, keyof BaseSessionEntry | 'type'> {

@@ -2,7 +2,6 @@ import { ContextManager, type ContextImageLimits } from '../context/manager.js';
 import type { ArtifactRef, ArtifactRepository, EventEnvelope, EventRepository, EvidenceRecord } from '@agent-core/evidence';
 import type { ModelProviderState, TokenEstimator } from '@agent-core/model';
 import type { SessionRepository } from '../session/repository.js';
-import { validateToolObservationPresentation } from '@agent-core/tools';
 import type { AgentEvent, AgentProviderStateSummary } from '../events.js';
 import { serializeToolObservationPresentation } from './observation-store.js';
 import { modelToolCallFromToolCall } from './model-request.js';
@@ -102,17 +101,14 @@ function replayOpenProtocolTail(contextManager: ContextManager, turn: ReplayTurn
     if (event.type === 'assistant.ended' && event.toolCalls && event.toolCalls.length > 0) {
       contextManager.recordModelOutput({ turnIndex: event.turnIndex, content: event.content, toolCalls: event.toolCalls.map(modelToolCallFromToolCall) });
     } else if (event.type === 'observation.record.created') {
-      const immediate = validateToolObservationPresentation(event.immediatePresentation);
-      const retained = validateToolObservationPresentation(event.retainedPresentation);
-      if (!immediate.ok || !retained.ok) continue;
-      const evidence = evidenceRecordsFromUnknown(event.evidence);
+      const evidence = event.evidence;
       contextManager.recordToolResult({
         turnIndex: event.turnIndex,
         toolName: event.toolName,
         toolCallType: event.toolCallType,
         ...(event.callId ? { callId: event.callId } : {}),
-        immediateContent: serializeToolObservationPresentation(immediate.presentation),
-        retainedContent: serializeToolObservationPresentation(retained.presentation),
+        immediateContent: serializeToolObservationPresentation(event.immediatePresentation),
+        retainedContent: serializeToolObservationPresentation(event.retainedPresentation),
         useRetained: true,
         evidence
       });
@@ -124,7 +120,7 @@ function replayOpenProtocolTail(contextManager: ContextManager, turn: ReplayTurn
 }
 
 function evidenceFromTurn(turn: ReplayTurn): EvidenceRecord[] {
-  return turn.records.flatMap((record) => record.event.type === 'observation.record.created' ? evidenceRecordsFromUnknown(record.event.evidence) : []);
+  return turn.records.flatMap((record) => record.event.type === 'observation.record.created' ? record.event.evidence : []);
 }
 
 async function latestProviderState(
@@ -170,14 +166,7 @@ function renderTurnCheckpoint(turn: ReplayTurn, evidenceRecords: number): string
 function protocolEventCount(turn: ReplayTurn): number {
   return turn.records.filter((record) => record.event.type === 'assistant.ended' || record.event.type === 'observation.record.created').length;
 }
-function evidenceRecordsFromUnknown(value: unknown): EvidenceRecord[] { return Array.isArray(value) ? value.filter(isEvidenceRecord) : []; }
-function isEvidenceRecord(value: unknown): value is EvidenceRecord {
-  return isRecord(value) && typeof value.id === 'string' && typeof value.observationId === 'string' && typeof value.toolName === 'string'
-    && typeof value.createdAt === 'string' && typeof value.action === 'string' && (value.outcome === 'success' || value.outcome === 'failure')
-    && Array.isArray(value.resources) && value.resources.every((resource) => isRecord(resource) && typeof resource.uri === 'string');
-}
 function compactLine(value: string, maxChars: number): string { const normalized = value.replace(/\s+/gu, ' ').trim(); return normalized.length <= maxChars ? normalized : `${normalized.slice(0, maxChars)}...`; }
 function emptyReplay(contextManager: ContextManager): ContextReplayResult {
   return { contextManager, replayedLedgers: 0, replayedTurns: 0, replayedSessionEntries: 0, replayedCheckpoints: 0, replayedToolResults: 0, replayedEvidenceRecords: 0 };
 }
-function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }

@@ -1,5 +1,8 @@
 import type { ToolCall, ToolEffects, ToolObservation } from '@agent-core/tools';
+import type { JsonObject } from '@agent-core/json';
 import type { AgentTuiActivityEntry } from './conversation-model.js';
+
+type ToolDisplayValue = ToolCall['input']['value'] | ToolObservation['output'];
 
 export function toolActivityId(identity: {
   readonly turnId: string;
@@ -99,7 +102,7 @@ function toolLabel(call: ToolCall): string {
   }
 }
 
-function compactTarget(value: Record<string, unknown> | undefined, keys: readonly string[]): string {
+function compactTarget(value: JsonObject | undefined, keys: readonly string[]): string {
   for (const key of keys) {
     const candidate = value?.[key];
     if (typeof candidate === 'string' && candidate.trim().length > 0) return candidate;
@@ -111,7 +114,7 @@ function compactTarget(value: Record<string, unknown> | undefined, keys: readonl
   return 'workspace';
 }
 
-function firstString(value: Record<string, unknown> | undefined, keys: readonly string[]): string | undefined {
+function firstString(value: JsonObject | undefined, keys: readonly string[]): string | undefined {
   for (const key of keys) {
     const candidate = value?.[key];
     if (typeof candidate === 'string' && candidate.trim().length > 0) return compact(candidate);
@@ -130,8 +133,7 @@ function formatEffects(effects: ToolEffects): string {
   return `Effects\n${accesses || 'none'}${locks} · ${humanize(effects.idempotency)}`;
 }
 
-function formatOutput(output: unknown): string | undefined {
-  if (output === undefined) return undefined;
+function formatOutput(output: ToolObservation['output']): string | undefined {
   const formatted = formatValue(output);
   return formatted.length === 0 ? undefined : `Output\n${formatted}`;
 }
@@ -146,14 +148,9 @@ function formatEvidence(observation: ToolObservation): string | undefined {
   return `Evidence\n${lines.join('\n')}${items.length > lines.length ? `\n… ${String(items.length - lines.length)} more` : ''}`;
 }
 
-function formatValue(value: unknown): string {
+function formatValue(value: ToolDisplayValue): string {
   if (typeof value === 'string') return bounded(value.trim(), 4_000);
-  if (value === undefined || typeof value === 'function' || typeof value === 'symbol') return bounded(String(value), 4_000);
-  try {
-    return bounded(JSON.stringify(value, null, 2), 4_000);
-  } catch {
-    return '[Unserializable value]';
-  }
+  return bounded(JSON.stringify(value, null, 2), 4_000);
 }
 
 function quoted(value: string): string {

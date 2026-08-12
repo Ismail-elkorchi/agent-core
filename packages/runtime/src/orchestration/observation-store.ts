@@ -254,25 +254,26 @@ function preserveImportantResultFields(value: JsonValue, artifact: ArtifactRef |
 }
 
 function truncatePresentation(presentation: ToolObservationPresentation, maxTokens: number, estimator: TokenEstimator, artifact?: ArtifactRef): ToolObservationPresentation {
-  const compacted: { -readonly [K in keyof ToolObservationPresentation]: ToolObservationPresentation[K] } = {
+  const compacted: ToolObservationPresentation = Object.freeze({
     ok: presentation.ok,
     title: unicodePrefix(presentation.title, 128),
     summary: unicodePrefix(presentation.summary, 512),
-    results: artifact ? { artifact: { ...artifact } } : { presenterOverBudget: true },
-    omitted: { tokenBudget: maxTokens },
+    results: artifact ? Object.freeze({ artifact }) : Object.freeze({ presenterOverBudget: true }),
+    omitted: Object.freeze({ tokenBudget: maxTokens }),
     coverage: 'partial',
     truncated: true,
-    warnings: ['The domain presenter exceeded its hard budget; durable tool truth is unchanged.'],
+    warnings: Object.freeze(['The domain presenter exceeded its hard budget; durable tool truth is unchanged.']),
     ...(artifact ? { next: `Use read_artifact with artifactId ${artifact.artifactId} to inspect the canonical observation.` } : { next: 'Make a narrower tool call to retrieve less output.' })
-  };
-  if (estimator.estimateText(JSON.stringify(compacted)) > maxTokens) {
-    compacted.title = 'Tool result';
-    compacted.summary = 'The model view exceeded its hard budget.';
-    delete compacted.warnings;
-    delete compacted.next;
-  }
-  const validated = validateToolObservationPresentation(compacted);
-  return validated.ok ? validated.presentation : invalidPresenterPresentation('truncation', validated.issues);
+  });
+  return estimator.estimateText(JSON.stringify(compacted)) <= maxTokens ? compacted : Object.freeze({
+    ok: presentation.ok,
+    title: 'Tool result',
+    summary: 'The model view exceeded its hard budget.',
+    results: artifact ? Object.freeze({ artifact }) : Object.freeze({ presenterOverBudget: true }),
+    omitted: Object.freeze({ tokenBudget: maxTokens }),
+    coverage: 'partial',
+    truncated: true
+  });
 }
 const GRAPHEME_SEGMENTER = new Intl.Segmenter('en', { granularity: 'grapheme' });
 function unicodePrefix(value: string, count: number): string {
@@ -284,9 +285,8 @@ function serializeObservation(observation: ToolObservation): string { return JSO
 function byteLength(value: string): number { return new TextEncoder().encode(value).byteLength; }
 
 function buildToolObservationPresentation(toolCall: ToolCall, canonicalSnapshot: JsonValue | undefined, observation: ToolObservation, tool: ToolDefinition | undefined, mode: 'immediate' | 'retained', maxTokens: number): ToolObservationPresentation {
-  const raw: unknown = tool?.presentObservation
-    ? tool.presentObservation({ call: toolCall, input: canonicalSnapshot, observation, mode, maxTokens })
-    : fallbackToolObservationPresentation(toolCall, observation);
+  if (!tool?.presentObservation) return fallbackToolObservationPresentation(toolCall, observation);
+  const raw: unknown = tool.presentObservation({ call: toolCall, input: canonicalSnapshot, observation, mode, maxTokens });
   const validated = validateToolObservationPresentation(raw);
   return validated.ok ? validated.presentation : invalidPresenterPresentation(toolCall.name, validated.issues);
 }
@@ -294,21 +294,54 @@ function buildToolObservationPresentation(toolCall: ToolCall, canonicalSnapshot:
 function fallbackToolObservationPresentation(toolCall: ToolCall, observation: ToolObservation): ToolObservationPresentation {
   const base = { ok: observation.ok, title: `${toolCall.name} observation`, summary: observation.summary, scope: toJsonObject(observation.scope), coverage: observation.scope.coverage };
   if (observation.kind === 'result') {
-    return { ...base, results: { output: observation.output, ...(observation.content ? { content: toJsonValue(observation.content) } : {}), ...(observation.metadata ? { metadata: observation.metadata } : {}) }, ...(observation.scope.coverage === 'partial' ? { next: 'Continue with the indicated range or artifact when more coverage is required.' } : {}) };
+    return Object.freeze({ ...base, results: Object.freeze({ output: observation.output, ...(observation.content ? { content: toJsonValue(observation.content) } : {}), ...(observation.metadata ? { metadata: observation.metadata } : {}) }), ...(observation.scope.coverage === 'partial' ? { next: 'Continue with the indicated range or artifact when more coverage is required.' } : {}) });
   }
-  return { ...base, failures: encodeToolFailureOutput(observation.output), next: observation.output.recovery };
+  return Object.freeze({ ...base, failures: encodeToolFailureOutput(observation.output), next: observation.output.recovery });
 }
 
 function invalidPresenterPresentation(toolName: string, issues: readonly { readonly path: string; readonly message: string }[]): ToolObservationPresentation {
-  return { ok: false, title: 'Invalid tool presenter output', summary: `Presenter for ${toolName} produced an invalid observation presentation.`, failures: { reason: 'invalid_presenter_output', issues: issues.map((issue) => ({ path: issue.path, message: issue.message })) }, coverage: 'partial', next: 'Fix the tool presenter before using this result.' };
+  return Object.freeze({
+    ok: false,
+    title: 'Invalid tool presenter output',
+    summary: `Presenter for ${toolName} produced an invalid observation presentation.`,
+    failures: Object.freeze({ reason: 'invalid_presenter_output', issues: Object.freeze(issues.map((issue) => Object.freeze({ path: issue.path, message: issue.message }))) }),
+    coverage: 'partial',
+    next: 'Fix the tool presenter before using this result.'
+  });
 }
 
 function redactToolObservationPresentation(presentation: ToolObservationPresentation): ToolObservationPresentation {
-  const redacted = redactJson(parseJsonValue(presentation));
-  const validated = validateToolObservationPresentation(redacted.value);
-  const result = validated.ok ? validated.presentation : invalidPresenterPresentation('redaction', validated.issues);
-  if (redacted.redactions === 0) return result;
-  return { ...result, warnings: [...(result.warnings ?? []), `Redacted ${String(redacted.redactions)} sensitive value${redacted.redactions === 1 ? '' : 's'}.`] };
+  const title = redactJson(presentation.title);
+  const summary = redactJson(presentation.summary);
+  const scope = presentation.scope === undefined ? undefined : redactJson(presentation.scope);
+  const filters = presentation.filters === undefined ? undefined : redactJson(presentation.filters);
+  const limits = presentation.limits === undefined ? undefined : redactJson(presentation.limits);
+  const results = presentation.results === undefined ? undefined : redactJson(presentation.results);
+  const failures = presentation.failures === undefined ? undefined : redactJson(presentation.failures);
+  const omitted = presentation.omitted === undefined ? undefined : redactJson(presentation.omitted);
+  const warningValues = (presentation.warnings ?? []).map((warning) => redactJson(warning));
+  const next = presentation.next === undefined ? undefined : redactJson(presentation.next);
+  const redactions = title.redactions + summary.redactions + (scope?.redactions ?? 0) + (filters?.redactions ?? 0) + (limits?.redactions ?? 0)
+    + (results?.redactions ?? 0) + (failures?.redactions ?? 0) + (omitted?.redactions ?? 0) + warningValues.reduce((total, warning) => total + warning.redactions, 0) + (next?.redactions ?? 0);
+  const warnings = Object.freeze([
+    ...warningValues.map((warning) => warning.value),
+    ...(redactions === 0 ? [] : [`Redacted ${String(redactions)} sensitive value${redactions === 1 ? '' : 's'}.`])
+  ]);
+  return Object.freeze({
+    ok: presentation.ok,
+    title: title.value,
+    summary: summary.value,
+    ...(scope ? { scope: scope.value } : {}),
+    ...(filters ? { filters: filters.value } : {}),
+    ...(limits ? { limits: limits.value } : {}),
+    ...(results ? { results: results.value } : {}),
+    ...(failures ? { failures: failures.value } : {}),
+    ...(omitted ? { omitted: omitted.value } : {}),
+    ...(presentation.coverage ? { coverage: presentation.coverage } : {}),
+    ...(presentation.truncated === undefined ? {} : { truncated: presentation.truncated }),
+    ...(warnings.length === 0 ? {} : { warnings }),
+    ...(next ? { next: next.value } : {})
+  });
 }
 
 function toJsonObject(value: unknown): JsonObject { const json = parseJsonValue(value); return isJsonObject(json) ? json : { value: json }; }

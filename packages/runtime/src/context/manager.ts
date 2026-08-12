@@ -217,7 +217,7 @@ export interface RecordToolResultInput {
   immediateImages?: readonly ModelImage[];
   imageArtifacts?: readonly PublicArtifactRef[];
   useRetained?: boolean;
-  evidence?: EvidenceRecord[];
+  evidence?: readonly EvidenceRecord[];
 }
 
 export interface RecordCheckpointInput {

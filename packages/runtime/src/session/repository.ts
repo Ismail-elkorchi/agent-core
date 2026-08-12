@@ -31,48 +31,52 @@ export class InMemorySessionRepository implements SessionRepository {
     const id = options.id ?? randomUUID();
     return this.serial(() => {
       if (this.states.has(id)) throw new Error(`Session already exists: ${id}`);
-      const header: SessionHeader = {
+      const header: SessionHeader = Object.freeze({
         type: 'session', version: 1, id, timestamp: new Date().toISOString(), workspaceRoot: options.workspaceRoot,
         ...(options.parentSessionId ? { parentSessionId: options.parentSessionId } : {}),
         ...(options.provider ? { provider: options.provider } : {}), ...(options.model ? { model: options.model } : {})
-      };
-      this.states.set(id, { header, branchEntries: [], projections: [], contextProjections: [] });
-      return { id, header, leafId: null };
+      });
+      const state = { header, branchEntries: [], projections: [], contextProjections: [] };
+      this.states.set(id, state);
+      return sessionFromState(state);
     });
   }
 
   open(sessionId: string): Promise<AgentSession> { return this.serial(() => sessionFromState(this.require(sessionId))); }
 
   list(workspaceRoot?: string): Promise<readonly SessionSummary[]> {
-    return this.serial(() => [...this.states.values()].filter((state) => workspaceRoot === undefined || state.header.workspaceRoot === workspaceRoot).map((state) => ({
+    return this.serial(() => Object.freeze([...this.states.values()].filter((state) => workspaceRoot === undefined || state.header.workspaceRoot === workspaceRoot).map((state) => Object.freeze({
       id: state.header.id, workspaceRoot: state.header.workspaceRoot, timestamp: state.header.timestamp,
       ...(state.header.provider ? { provider: state.header.provider } : {}), ...(state.header.model ? { model: state.header.model } : {})
-    })).sort((left, right) => right.timestamp.localeCompare(left.timestamp)));
+    })).sort((left, right) => right.timestamp.localeCompare(left.timestamp))));
   }
 
   loadReplayState(sessionId: string, leafId?: string | null): Promise<SessionReplayState> {
     return this.serial(() => {
       const state = this.require(sessionId); const session = sessionFromState(state);
-      const branch = activeBranch(state.branchEntries, leafId === undefined ? session.leafId : leafId);
+      const branch = Object.freeze(activeBranch(state.branchEntries, leafId === undefined ? session.leafId : leafId));
       const branchIds = new Set(branch.map((entry) => entry.id));
       const contextProjection = [...state.contextProjections].reverse().find((projection) => branchIds.has(projection.throughEntryId));
       const latestEndedRunId = contextProjection?.recentTurns.at(-1)?.runId;
       const tailStart = contextProjection ? branch.findIndex((entry) => entry.id === contextProjection.throughEntryId) + 1 : 0;
       const tailRunIds = [...new Set(branch.slice(tailStart).flatMap((entry) => entry.type === 'input' ? [entry.runId] : []))];
       const relevantRunIds = new Set([...tailRunIds, ...(latestEndedRunId ? [latestEndedRunId] : [])]);
-      const terminalProjections = state.projections.filter((projection) => relevantRunIds.has(projection.runId));
+      const terminalProjections = Object.freeze(state.projections.filter((projection) => relevantRunIds.has(projection.runId)));
       const endedRunIds = new Set(terminalProjections.map((projection) => projection.runId));
       const openRunIds = tailRunIds.filter((runId) => !endedRunIds.has(runId));
-      const ledgerRunIds = [...new Set([...openRunIds, ...(latestEndedRunId ? [latestEndedRunId] : [])])];
-      return { session, branch, terminalProjections, ...(contextProjection ? { contextProjection } : {}), ledgerRunIds };
+      const ledgerRunIds = Object.freeze([...new Set([...openRunIds, ...(latestEndedRunId ? [latestEndedRunId] : [])])]);
+      return Object.freeze({ session, branch, terminalProjections, ...(contextProjection ? { contextProjection } : {}), ledgerRunIds });
     });
   }
 
   appendInput(sessionId: string, input: { runId: string; task: string; instructions?: readonly AgentEffectiveInstruction[] }): Promise<SessionInputEntry> {
-    return this.append(sessionId, (parentId) => ({ ...baseEntry(parentId), type: 'input', runId: input.runId, task: input.task, instructions: [...(input.instructions ?? [])] }));
+    return this.append(sessionId, (parentId) => Object.freeze({
+      ...baseEntry(parentId), type: 'input', runId: input.runId, task: input.task,
+      instructions: Object.freeze((input.instructions ?? []).map((instruction) => Object.freeze({ ...instruction })))
+    }));
   }
   appendToolCall(sessionId: string, input: { runId: string; identity: AgentToolCallIdentity; call: unknown }): Promise<SessionToolCallEntry> {
-    return this.append(sessionId, (parentId) => ({ ...baseEntry(parentId), type: 'tool_call', runId: input.runId, ...input.identity, call: normalizeJsonSafe(input.call).value }));
+    return this.append(sessionId, (parentId) => Object.freeze({ ...baseEntry(parentId), type: 'tool_call', runId: input.runId, ...input.identity, call: normalizeJsonSafe(input.call).value }));
   }
   appendObservation(sessionId: string, input: { runId: string; identity: AgentTurnIdentity & Partial<Pick<AgentToolCallAttemptIdentity, 'toolBatchId' | 'callIndex' | 'callId' | 'toolAttempt'>>; toolName: string; observation: SessionObservationInput }): Promise<SessionObservationEntry> {
     return this.serial(() => {
@@ -84,20 +88,20 @@ export class InMemorySessionRepository implements SessionRepository {
         if (!sameObservation(existing, normalized)) throw new PersistenceConflictError(`Conflicting session observation for ${String(key)}.`);
         return existing;
       }
-      const entry: SessionObservationEntry = { ...baseEntry(branchLeaf(state.branchEntries)), type: 'observation', ...normalized };
+      const entry: SessionObservationEntry = Object.freeze({ ...baseEntry(branchLeaf(state.branchEntries)), type: 'observation', ...normalized });
       state.branchEntries.push(entry);
       return entry;
     });
   }
   appendModelSettings(sessionId: string, settings: { provider: string; model: string; temperature?: number; reasoningEffort?: string }): Promise<SessionModelSettingsEntry> {
-    return this.append(sessionId, (parentId) => ({ ...baseEntry(parentId), type: 'model_settings', provider: settings.provider, model: settings.model,
+    return this.append(sessionId, (parentId) => Object.freeze({ ...baseEntry(parentId), type: 'model_settings', provider: settings.provider, model: settings.model,
       ...(settings.temperature === undefined ? {} : { temperature: settings.temperature }), ...(settings.reasoningEffort === undefined ? {} : { reasoningEffort: settings.reasoningEffort }) }));
   }
   branchFrom(sessionId: string, entryId: string, label?: string): Promise<SessionBranchMarkerEntry> {
     return this.serial(() => {
       const state = this.require(sessionId);
       if (!state.branchEntries.some((entry) => entry.id === entryId)) throw new Error(`Unknown entry: ${entryId}`);
-      const entry: SessionBranchMarkerEntry = { ...baseEntry(entryId), type: 'branch', fromEntryId: entryId, ...(label ? { label } : {}) };
+      const entry: SessionBranchMarkerEntry = Object.freeze({ ...baseEntry(entryId), type: 'branch', fromEntryId: entryId, ...(label ? { label } : {}) });
       state.branchEntries.push(entry);
       return entry;
     });
@@ -114,7 +118,7 @@ export class InMemorySessionRepository implements SessionRepository {
         return existing;
       }
       const contextProjection = contextProjectionForTerminal(state, terminal);
-      const projection: SessionFinalProjection = { type: 'final', id: randomUUID(), timestamp: new Date().toISOString(), runId: terminal.runId, finalizationId: terminal.finalizationId, terminal };
+      const projection: SessionFinalProjection = Object.freeze({ type: 'final', id: randomUUID(), timestamp: new Date().toISOString(), runId: terminal.runId, finalizationId: terminal.finalizationId, terminal });
       state.projections.push(projection);
       state.contextProjections.push(contextProjection);
       return projection;
@@ -149,7 +153,7 @@ function contextProjectionForTerminal(state: SessionState, terminal: AgentTermin
   return createSessionContextProjection({ branchEntries: branch, terminal, throughEntryId, ...(previous ? { previous } : {}) });
 }
 function branchLeaf(entries: readonly SessionBranchEntry[]): string | null { return entries.at(-1)?.id ?? null; }
-function sessionFromState(state: SessionState): AgentSession { return { id: state.header.id, header: state.header, leafId: branchLeaf(state.branchEntries) }; }
+function sessionFromState(state: SessionState): AgentSession { return Object.freeze({ id: state.header.id, header: state.header, leafId: branchLeaf(state.branchEntries) }); }
 function baseEntry(parentId: string | null): BaseSessionEntry { return { id: randomUUID(), parentId, timestamp: new Date().toISOString() }; }
 function normalizedObservationInput(input: { runId: string; identity: AgentTurnIdentity & Partial<Pick<AgentToolCallAttemptIdentity, 'toolBatchId' | 'callIndex' | 'callId' | 'toolAttempt'>>; toolName: string; observation: SessionObservationInput }): Omit<SessionObservationEntry, keyof BaseSessionEntry | 'type'> {
   const artifacts = input.observation.artifacts?.map((artifact) => { validateArtifactRef(artifact); return Object.freeze({ ...artifact }); });

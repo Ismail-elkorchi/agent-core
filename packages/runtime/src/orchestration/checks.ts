@@ -2,7 +2,6 @@ import { validateArtifactRef, type ArtifactRef } from '@agent-core/evidence';
 import { normalizeJsonSafe } from '@agent-core/json';
 import {
   parseAgentCheckResult,
-  validateAgentCheckDefinitions,
   type AgentCheckContext,
   type AgentCheckDefinition,
   type AgentCheckDiagnostic,
@@ -53,12 +52,11 @@ export async function runAgentChecks(input: {
   readonly append: (event: AgentEvent) => Promise<unknown>;
   readonly emit: (event: AgentProgressEvent) => Promise<void>;
 }): Promise<readonly AgentCheckResult[]> {
-  const checks = validateAgentCheckDefinitions(input.checks);
   const metadataValue = normalizeJsonSafe(input.metadata ?? {}).value;
   const metadata = isRecord(metadataValue) ? metadataValue : {};
   const execution = input.execution ?? { evidence: EMPTY_EVIDENCE_READER };
   const results: AgentCheckResult[] = [];
-  for (const check of checks) {
+  for (const check of input.checks) {
     throwIfVerificationAborted(input.signal);
     const timeoutMs = check.timeoutMs ?? input.defaultTimeoutMs ?? 30_000;
     const identity: AgentTurnIdentity = { turnIndex: input.turnIndex, turnId: input.turnId, requestAttempt: input.requestAttempt };
