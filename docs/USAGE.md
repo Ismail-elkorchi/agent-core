@@ -89,3 +89,39 @@ Checks are read-only by default. Grant a bounded verification command executor o
 - Missing or unknown required check: inconclusive verification.
 
 Run `npm run verify:release` for the full repository gate.
+## Complete CLI option reference
+
+Run `agent-core [initial task] [options]` for the interactive TUI. Run `agent-core exec <task|-> [options]` for one noninteractive task; `-` reads the task from standard input.
+
+| Option | Parameter and behavior |
+| --- | --- |
+| `--root <dir>` | Workspace root. Defaults to the current directory. |
+| `--config <path>` | Load committed instructions, provider/model settings, tools, authorization, verification checks, and limits. |
+| `--provider <name>` | Select `ollama`, `openrouter`, `openai`, or `openai-codex`. |
+| `--model <name>` | Select the provider model, such as `gpt-5.6-luna`. |
+| `--provider-endpoint <url>` | Override the Ollama host or hosted-provider base URL. |
+| `--max-output-tokens <n>` | Set a positive per-request output-token limit. |
+| `--temperature <n>` | Set a finite temperature when the selected provider/model supports it. OpenAI Codex subscription requests do not support temperature. |
+| `--reasoning-effort <level>` | Select `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`, subject to provider/model support. |
+| `--show-reasoning` | Render reasoning text or summaries exposed by the provider. It does not expose private chain-of-thought. |
+| `--apply` | Authorize structured patch writes, subject to committed authorization policy and approvals. |
+| `--dry-run` | Validate structured patch writes without applying them. This does not sandbox shell commands. |
+| `--allow-shell` | Authorize ambient shell execution. Required for configured command checks and subject to committed authorization policy and approvals. |
+| `--resume` | Resume the most recently active session for this workspace. |
+| `--session <id>` | Open an existing session by exact ID. |
+| `--branch <entry-id>` | Branch the selected existing session from an entry. Requires `--resume` or `--session`. |
+
+Runtime-setting precedence is explicit CLI option, resumed-session setting, matching committed provider configuration, environment, then provider default. Provider-specific committed settings are meaningful only for their configured provider.
+
+Provider environment variables are `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `OPENROUTER_APP_URL`, and `OPENROUTER_APP_TITLE`. Runtime defaults can be supplied with `AGENT_CORE_PROVIDER`, `AGENT_CORE_MODEL`, `AGENT_CORE_PROVIDER_ENDPOINT`, and `AGENT_CORE_REASONING_EFFORT`.
+
+Credential commands are:
+
+```bash
+agent-core auth status openai
+agent-core auth status openai-codex
+agent-core auth login openai-codex
+agent-core auth logout openai-codex
+```
+
+OpenAI Platform authentication comes from `OPENAI_API_KEY`; ChatGPT subscription authentication is stored by `auth login openai-codex` outside the workspace.

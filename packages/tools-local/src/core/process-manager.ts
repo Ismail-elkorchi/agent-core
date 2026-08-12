@@ -91,7 +91,7 @@ export interface ProcessReconciliationResult {
 }
 
 interface CapturedChunk { readonly sequence: number; readonly stream: ProcessStream; readonly text: string; readonly start: number; readonly end: number; readonly bytes: number }
-interface QueuedProgress { readonly progress: ToolProgress; readonly bytes: number }
+interface QueuedProgress { readonly progress: ToolProgress; readonly bytes: number; readonly delivered: () => void }
 interface ManagedProcess {
   readonly id: string;
   readonly owner: ProcessOwner;
@@ -240,9 +240,9 @@ export class ProcessManager {
       await this.removeSupervisorFiles(id);
       throw error;
     }
-    this.enqueueProgress(record, { type: 'status', stage: 'process_started', message: `Process ${id} started.` });
+    void this.enqueueProgress(record, { type: 'status', stage: 'process_started', message: `Process ${id} started.` });
     record.progressStarted = true;
-    for (const chunk of record.history) this.enqueueProgress(record, { type: 'output', stream: chunk.stream, sequence: chunk.sequence, text: chunk.text, observedBytes: chunk.end });
+    for (const chunk of record.history) void this.enqueueProgress(record, { type: 'output', stream: chunk.stream, sequence: chunk.sequence, text: chunk.text, observedBytes: chunk.end });
     if (record.pendingClose) this.handleClose(record, record.pendingClose.exitCode, record.pendingClose.signal);
     if (record.status === 'running') {
       record.timeout = setTimeout(() => {
@@ -317,7 +317,7 @@ export class ProcessManager {
     const record = this.requireProcess(processId);
     this.assertOwner(record, requester);
     if (record.status === 'running') {
-      if (record.terminalStatus === undefined) this.enqueueProgress(record, { type: 'status', stage: 'process_stopping', message: `Stopping process ${processId}.` });
+      if (record.terminalStatus === undefined) void this.enqueueProgress(record, { type: 'status', stage: 'process_stopping', message: `Stopping process ${processId}.` });
       this.requestTermination(record, 'stopped');
     }
     await record.tree.settle();
@@ -441,27 +441,30 @@ export class ProcessManager {
       record.oldestCursor = removed.end;
       if (!record.progressStarted) record.progressDroppedEvents += 1;
     }
-    if (record.progressStarted) this.enqueueProgress(record, { type: 'output', stream, sequence: chunk.sequence, text, observedBytes: record.cursor });
+    if (record.progressStarted) void this.enqueueProgress(record, { type: 'output', stream, sequence: chunk.sequence, text, observedBytes: record.cursor });
     this.signalActivity(record);
   }
 
-  private enqueueProgress(record: ManagedProcess, progress: ToolProgress): void {
-    if (!record.onProgress) return;
-    if (record.progressClosed) { record.progressDroppedEvents += 1; return; }
+  private enqueueProgress(record: ManagedProcess, progress: ToolProgress): Promise<void> {
+    if (!record.onProgress) return Promise.resolve();
+    if (record.progressClosed) { record.progressDroppedEvents += 1; return Promise.resolve(); }
     const bytes = Buffer.byteLength(JSON.stringify(progress), 'utf8');
     if (progress.type === 'output' && record.progressBytes + bytes > this.limits.maxPendingOutputBytes) {
       record.progressDroppedEvents += 1;
-      return;
+      return Promise.resolve();
     }
     while (record.progressBytes + bytes > this.limits.maxPendingOutputBytes) {
       const index = record.progressQueue.findIndex((item) => item.progress.type === 'output');
       if (index < 0) break;
       const [removed] = record.progressQueue.splice(index, 1);
-      if (removed) { record.progressBytes -= removed.bytes; record.progressDroppedEvents += 1; }
+      if (removed) { record.progressBytes -= removed.bytes; record.progressDroppedEvents += 1; removed.delivered(); }
     }
-    record.progressQueue.push({ progress, bytes });
+    let delivered: () => void = () => undefined;
+    const delivery = new Promise<void>((resolve) => { delivered = resolve; });
+    record.progressQueue.push({ progress, bytes, delivered });
     record.progressBytes += bytes;
     if (!record.progressDelivering) record.progressDrainPromise = this.drainProgress(record);
+    return delivery;
   }
 
   private async drainProgress(record: ManagedProcess): Promise<void> {
@@ -476,6 +479,7 @@ export class ProcessManager {
           record.progressDeliveryErrors += 1;
           record.diagnostic = appendDiagnostic(record.diagnostic, `Progress delivery failed: ${errorMessage(error)}`);
         }
+        finally { item.delivered(); }
       }
     } finally {
       record.progressDelivering = false;
@@ -506,12 +510,14 @@ export class ProcessManager {
   }
 
   private async finishOnce(record: ManagedProcess): Promise<void> {
-    if (record.status === 'running') record.status = record.terminalStatus ?? 'failed';
+    const terminalStatus = record.terminalStatus ?? 'failed';
+    let terminalDelivery = Promise.resolve();
     if (!record.progressClosed) {
-      this.enqueueProgress(record, terminalProgress(record));
+      terminalDelivery = this.enqueueProgress(record, terminalProgress(record, terminalStatus));
       record.progressClosed = true;
     }
-    await record.progressDrainPromise;
+    await terminalDelivery;
+    if (record.status === 'running') record.status = terminalStatus;
     if (record.timeout) { clearTimeout(record.timeout); delete record.timeout; }
     if (record.abortSignal && record.abortListener) record.abortSignal.removeEventListener('abort', record.abortListener);
     delete record.abortSignal;
@@ -894,9 +900,9 @@ function dropUtf8Bytes(value: string, bytes: number): string {
   return '';
 }
 
-function terminalProgress(record: ManagedProcess): ToolProgress {
-  const stage = record.status === 'timed_out' ? 'process_timed_out' : record.status === 'failed' ? 'process_failed' : record.status === 'stopped' ? 'process_stopped' : 'process_exited';
-  return { type: 'status', stage, message: `Process ${record.id} ${record.status}.` };
+function terminalProgress(record: ManagedProcess, status: Exclude<ManagedProcessStatus, 'running'>): ToolProgress {
+  const stage = status === 'timed_out' ? 'process_timed_out' : status === 'failed' ? 'process_failed' : status === 'stopped' ? 'process_stopped' : 'process_exited';
+  return { type: 'status', stage, message: `Process ${record.id} ${status}.` };
 }
 function orphanTerminalResult(entry: ProcessLedgerEntry, terminal: SupervisorTerminalState, stopped: boolean): ProcessPollResult {
   const stream = Object.freeze({ text: '', observedBytes: 0, capturedBytes: 0, omittedBytes: 0, startsAtOutputStart: true, endsAtOutputEnd: true });
