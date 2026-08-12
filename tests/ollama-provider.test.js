@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { ModelProviderError } from '@agent-core/model';
 import { OllamaProvider } from '@agent-core/provider-ollama';
 
 class FakeOllamaClient {
@@ -279,6 +280,14 @@ test('OllamaProvider classifies response errors', async () => {
   await assert.rejects(
     () => provider.complete({ model: 'missing', messages: [{ role: 'user', content: 'hi' }] }),
     (error) => error.code === 'model_unavailable' && error.retryable === false
+  );
+});
+
+test('OllamaProvider decodes injected client output before trusting nested fields', async () => {
+  const provider = new OllamaProvider({ clientFactory: () => new FakeOllamaClient([{ model: 'llama3.1', message: { content: 42 }, done: true }]) });
+  await assert.rejects(
+    () => provider.complete({ model: 'llama3.1', messages: [{ role: 'user', content: 'hi' }] }),
+    error => error instanceof ModelProviderError && error.code === 'malformed_response' && /message\.content/u.test(error.message)
   );
 });
 

@@ -13,6 +13,7 @@ import {
   createBearerTokenProvider,
   pollDeviceCode
 } from '@agent-core/auth';
+import { readBoundedJsonResponse } from '@agent-core/provider-openai-responses';
 
 import {
   CHATGPT_ACCOUNT_CLAIM,
@@ -27,7 +28,6 @@ import {
   OPENAI_CODEX_PROVIDER_ID,
   OPENAI_CODEX_TOKEN_URL
 } from './constants.js';
-import { parseJsonResponse } from './errors.js';
 import { errorMessage, isJsonObject, numericValue, parseJsonText } from './utils.js';
 
 export interface OpenAICodexDeviceCodeInfo {
@@ -151,7 +151,7 @@ export function accountIdFromToken(token: BearerToken): string {
 }
 
 function isBearerTokenProvider(value: ProviderAuth | BearerTokenProvider): value is BearerTokenProvider {
-  return typeof (value as BearerTokenProvider).getBearerToken === 'function';
+  return 'getBearerToken' in value && typeof value.getBearerToken === 'function';
 }
 
 async function startDeviceAuth(fetchImpl: typeof fetch, signal: AbortSignal | undefined): Promise<{ deviceAuthId: string; userCode: string; intervalSeconds: number }> {
@@ -161,7 +161,7 @@ async function startDeviceAuth(fetchImpl: typeof fetch, signal: AbortSignal | un
     body: JSON.stringify({ client_id: OPENAI_CODEX_CLIENT_ID }),
     ...(signal ? { signal } : {})
   });
-  const json = await parseJsonResponse<DeviceAuthStartResponse>(OPENAI_CODEX_PROVIDER_ID, response);
+  const json = decodeDeviceAuthStart(await readAuthJsonResponse(response, 'OpenAI Codex device-code response'));
   const intervalSeconds = numericValue(json.interval, 5);
   if (!json.device_auth_id || !json.user_code || !Number.isFinite(intervalSeconds) || intervalSeconds < 0) {
     throw new AuthError({
@@ -192,7 +192,7 @@ async function pollDeviceAuth(
   });
   const body = await response.text();
   if (response.ok) {
-    const json = parseJsonText(body, 'OpenAI Codex device token response') as DeviceAuthTokenResponse;
+    const json = decodeDeviceAuthToken(parseJsonText(body, 'OpenAI Codex device token response'));
     if (!json.authorization_code || !json.code_verifier) {
       return { status: 'failed', message: 'OpenAI Codex device token response did not include authorization fields.' };
     }
@@ -239,7 +239,7 @@ async function requestCodexToken(
       message: `OpenAI Codex token ${operation} failed with HTTP ${String(response.status)}: ${text || response.statusText}`
     });
   }
-  const json = parseJsonText(text, `OpenAI Codex token ${operation} response`) as CodexTokenResponse;
+  const json = decodeCodexToken(parseJsonText(text, `OpenAI Codex token ${operation} response`), `OpenAI Codex token ${operation} response`);
   if (!json.access_token || !json.refresh_token || typeof json.expires_in !== 'number') {
     throw new AuthError({
       code: 'invalid_credentials',
@@ -319,4 +319,44 @@ function errorCodeFromDeviceBody(body: string): string | undefined {
     return undefined;
   }
   return undefined;
+}
+
+async function readAuthJsonResponse(response: Response, label: string): Promise<unknown> {
+  try {
+    return await readBoundedJsonResponse(response);
+  } catch (error) {
+    throw new AuthError({ code: 'invalid_credentials', message: `${label} was not valid bounded JSON: ${errorMessage(error)}`, cause: error });
+  }
+}
+
+function decodeDeviceAuthStart(value: unknown): DeviceAuthStartResponse {
+  if (!isJsonObject(value)) throw new AuthError({ code: 'invalid_credentials', message: 'OpenAI Codex device-code response must be an object.' });
+  if (typeof value.device_auth_id !== 'string' || typeof value.user_code !== 'string') throw new AuthError({ code: 'invalid_credentials', message: 'OpenAI Codex device-code response did not include the required fields.' });
+  if (value.interval !== undefined && typeof value.interval !== 'number' && typeof value.interval !== 'string') throw new AuthError({ code: 'invalid_credentials', message: 'OpenAI Codex device-code interval must be a number or numeric string.' });
+  if (value.expires_in !== undefined && typeof value.expires_in !== 'number' && typeof value.expires_in !== 'string') throw new AuthError({ code: 'invalid_credentials', message: 'OpenAI Codex device-code expiry must be a number or numeric string.' });
+  return Object.freeze({ device_auth_id: value.device_auth_id, user_code: value.user_code, ...(value.interval === undefined ? {} : { interval: value.interval }), ...(value.expires_in === undefined ? {} : { expires_in: value.expires_in }) });
+}
+
+function decodeDeviceAuthToken(value: Record<string, unknown>): DeviceAuthTokenResponse {
+  if (value.authorization_code !== undefined && typeof value.authorization_code !== 'string') throw new AuthError({ code: 'invalid_credentials', message: 'OpenAI Codex device authorization_code must be a string.' });
+  if (value.code_verifier !== undefined && typeof value.code_verifier !== 'string') throw new AuthError({ code: 'invalid_credentials', message: 'OpenAI Codex device code_verifier must be a string.' });
+  const error = value.error;
+  let decodedError: DeviceAuthTokenResponse['error'];
+  if (typeof error === 'string') decodedError = error;
+  else if (error !== undefined) {
+    if (!isJsonObject(error) || (error.code !== undefined && typeof error.code !== 'string')) throw new AuthError({ code: 'invalid_credentials', message: 'OpenAI Codex device error must be a string or coded object.' });
+    decodedError = Object.freeze({ ...(typeof error.code === 'string' ? { code: error.code } : {}) });
+  }
+  return Object.freeze({
+    ...(value.authorization_code === undefined ? {} : { authorization_code: value.authorization_code }),
+    ...(value.code_verifier === undefined ? {} : { code_verifier: value.code_verifier }),
+    ...(decodedError === undefined ? {} : { error: decodedError })
+  });
+}
+
+function decodeCodexToken(value: Record<string, unknown>, label: string): CodexTokenResponse {
+  if (typeof value.access_token !== 'string' || typeof value.refresh_token !== 'string' || typeof value.expires_in !== 'number' || !Number.isFinite(value.expires_in) || value.expires_in <= 0) throw new AuthError({ code: 'invalid_credentials', message: `${label} did not include valid access_token, refresh_token, and expires_in fields.` });
+  if (value.token_type !== undefined && typeof value.token_type !== 'string') throw new AuthError({ code: 'invalid_credentials', message: `${label}.token_type must be a string.` });
+  if (value.scope !== undefined && typeof value.scope !== 'string') throw new AuthError({ code: 'invalid_credentials', message: `${label}.scope must be a string.` });
+  return Object.freeze({ access_token: value.access_token, refresh_token: value.refresh_token, expires_in: value.expires_in, ...(value.token_type === undefined ? {} : { token_type: value.token_type }), ...(value.scope === undefined ? {} : { scope: value.scope }) });
 }

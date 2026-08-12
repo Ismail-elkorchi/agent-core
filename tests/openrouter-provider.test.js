@@ -452,6 +452,26 @@ test('OpenRouterProvider classifies malformed stream events', async () => {
   );
 });
 
+test('OpenRouterProvider rejects malformed nested wire fields and bounds stream idleness', async () => {
+  const malformed = new OpenRouterProvider({
+    apiKey: 'test-key',
+    fetch: withModelCatalog('openrouter/auto', async () => jsonResponse({ model: 'openrouter/auto', choices: [{ message: { content: 'ok', tool_calls: 'not-an-array' } }] }))
+  });
+  await assert.rejects(
+    () => malformed.complete({ model: 'openrouter/auto', messages: [{ role: 'user', content: 'hi' }] }),
+    error => error instanceof ModelProviderError && error.code === 'malformed_response' && /tool_calls/u.test(error.message)
+  );
+
+  const stalled = new OpenRouterProvider({
+    apiKey: 'test-key', statusIntervalMs: 2, streamIdleTimeoutMs: 12,
+    fetch: withModelCatalog('openrouter/auto', async () => stalledSseResponse())
+  });
+  await assert.rejects(
+    async () => { for await (const _event of stalled.stream({ model: 'openrouter/auto', messages: [{ role: 'user', content: 'hi' }] })) { /* consume */ } },
+    error => error instanceof ModelProviderError && error.code === 'provider_unavailable' && /idle/iu.test(error.message)
+  );
+});
+
 test('OpenRouterProvider does not retry a stream error after visible content', async () => {
   const provider = new OpenRouterProvider({
     apiKey: 'test-key',
@@ -525,4 +545,9 @@ function sseResponse(chunks) {
   return new Response(body, {
     headers: { 'content-type': 'text/event-stream' }
   });
+}
+
+function stalledSseResponse() {
+  const encoder = new TextEncoder();
+  return new Response(new ReadableStream({ start(controller) { controller.enqueue(encoder.encode(': CONNECTED\n\n')); } }), { headers: { 'content-type': 'text/event-stream' } });
 }

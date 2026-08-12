@@ -6,81 +6,28 @@ import {
   type ModelUsage
 } from '@agent-core/model';
 import { normalizeJsonSafe, parseJsonObject, type JsonObject } from '@agent-core/json';
+import type {
+  ResponsesContentPart,
+  ResponsesErrorBody,
+  ResponsesOutputItem,
+  ResponsesPayload,
+  ResponsesStreamData,
+  ResponsesUsage
+} from '@agent-core/provider-openai-responses';
 
 import { parseCodexModelResponse, summarizeCodexFailure } from './errors.js';
 import { errorMessage, isJsonObject, stringValue } from './utils.js';
 
-export interface OpenAICodexResponsesPayload {
-  id?: string;
-  model?: string;
-  status?: string;
-  output_text?: string;
-  output?: OpenAICodexOutputItem[];
-  usage?: OpenAICodexUsage;
-  error?: OpenAICodexErrorBody;
-  incomplete_details?: {
-    reason?: string;
-    [key: string]: unknown;
-  };
-  [key: string]: unknown;
-}
-
-export interface OpenAICodexOutputItem {
-  id?: string;
-  type?: string;
-  status?: string;
-  role?: string;
-  content?: OpenAICodexContentPart[];
-  call_id?: string;
-  name?: string;
-  arguments?: string;
-  input?: string;
-  summary?: OpenAICodexContentPart[] | string;
-  encrypted_content?: string;
-  [key: string]: unknown;
-}
-
-export interface OpenAICodexContentPart {
-  type?: string;
-  text?: string;
-  output_text?: string;
-  summary_text?: string;
-  [key: string]: unknown;
-}
-
-export interface OpenAICodexUsage {
-  input_tokens?: number;
-  output_tokens?: number;
-  total_tokens?: number;
-  input_tokens_details?: { cached_tokens?: number; cache_write_tokens?: number; [key: string]: unknown };
-  output_tokens_details?: { reasoning_tokens?: number; [key: string]: unknown };
-  [key: string]: unknown;
-}
-
-export interface OpenAICodexErrorBody {
-  message?: string;
-  type?: string;
-  code?: string;
-  [key: string]: unknown;
-}
-
-export interface OpenAICodexStreamData {
-  type?: string;
-  delta?: string;
-  response?: OpenAICodexResponsesPayload;
-  item?: OpenAICodexOutputItem;
-  output_index?: number;
-  item_id?: string;
-  call_id?: string;
-  name?: string;
-  arguments?: string;
-  input?: string;
-  error?: OpenAICodexErrorBody;
-  [key: string]: unknown;
-}
+export type OpenAICodexResponsesPayload = ResponsesPayload;
+export type OpenAICodexOutputItem = ResponsesOutputItem;
+export type OpenAICodexContentPart = ResponsesContentPart;
+export type OpenAICodexUsage = ResponsesUsage;
+export type OpenAICodexErrorBody = ResponsesErrorBody;
+export type OpenAICodexStreamData = ResponsesStreamData;
 
 export type OpenAICodexSseEvent =
   | { type: 'comment'; comment: string }
+  | { type: 'status'; idleMs: number }
   | { type: 'data'; data: OpenAICodexStreamData | '[DONE]' };
 
 export interface StreamingFunctionCallAccumulator {
@@ -188,7 +135,7 @@ export function fallbackStreamResponse(
   });
 }
 
-export function contentFromOutput(output: OpenAICodexOutputItem[]): string {
+export function contentFromOutput(output: readonly OpenAICodexOutputItem[]): string {
   return output
     .filter((item) => item.type === 'message' || item.role === 'assistant')
     .flatMap((item) => item.content ?? [])
@@ -223,7 +170,7 @@ export function toolCallFromOutputItem(provider: string, item: OpenAICodexOutput
 }
 
 export function mergeStreamingFunctionCallParts(accumulators: Map<string, StreamingFunctionCallAccumulator>, part: OpenAICodexStreamData): ModelToolCall[] {
-  const eventType = part.type ?? '';
+  const eventType = part.type;
   if (!eventType.includes('function_call')) {
     return [];
   }
@@ -247,7 +194,7 @@ export function mergeStreamingFunctionCallParts(accumulators: Map<string, Stream
 }
 
 export function mergeStreamingCustomToolCallParts(accumulators: Map<string, StreamingCustomToolCallAccumulator>, part: OpenAICodexStreamData): ModelToolCall[] {
-  const eventType = part.type ?? '';
+  const eventType = part.type;
   if (!eventType.includes('custom_tool_call')) {
     return [];
   }
@@ -326,23 +273,20 @@ function responseTransport(
   };
 }
 
-function reasoningSummaryFromOutput(output: OpenAICodexOutputItem[]): string {
+function reasoningSummaryFromOutput(output: readonly OpenAICodexOutputItem[]): string {
   return output
     .filter((item) => item.type === 'reasoning')
     .map((item) => {
       if (typeof item.summary === 'string') {
         return item.summary;
       }
-      if (Array.isArray(item.summary)) {
-        return item.summary.map((part) => part.text ?? part.summary_text ?? '').join('');
-      }
-      return '';
+      return item.summary?.map((part) => part.text ?? part.summary_text ?? '').join('') ?? '';
     })
     .filter((text) => text.length > 0)
     .join('\n');
 }
 
-function normalizeToolCalls(provider: string, output: OpenAICodexOutputItem[]): ModelToolCall[] {
+function normalizeToolCalls(provider: string, output: readonly OpenAICodexOutputItem[]): ModelToolCall[] {
   return output
     .map((item) => toolCallFromOutputItem(provider, item))
     .filter((toolCall): toolCall is ModelToolCall => toolCall !== undefined);

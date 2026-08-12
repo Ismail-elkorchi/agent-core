@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@agent-core/auth": "0.2.0",
+    "@agent-core/json": "0.2.0",
     "@agent-core/model": "0.2.0",
     "@agent-core/provider-openai-responses": "0.2.0"
   }

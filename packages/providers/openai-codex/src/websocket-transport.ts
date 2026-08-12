@@ -1,6 +1,7 @@
 import { createRequire } from 'node:module';
 
 import { ModelProviderError } from '@agent-core/model';
+import { decodeResponsesStreamData } from '@agent-core/provider-openai-responses';
 
 import {
   CONTENT_TYPE_JSON,
@@ -265,7 +266,7 @@ export function readCodexWebSocketEvents(socket: CodexWebSocket, signal: AbortSi
             throw item;
           }
           yield item;
-          if (item.type === 'response.completed' || item.type === 'response.incomplete' || item.type === 'response.failed') {
+          if (item.type === 'response.completed' || item.type === 'response.incomplete' || item.type === 'response.failed' || item.type === 'error') {
             return;
           }
         }
@@ -287,10 +288,7 @@ function parseCodexWebSocketText(text: string): OpenAICodexStreamData[] {
     .map((line) => {
       try {
         const parsed: unknown = JSON.parse(line);
-        if (!isJsonObject(parsed)) {
-          throw new Error('OpenAI Codex WebSocket event must be a JSON object.');
-        }
-        return parsed;
+        return decodeResponsesStreamData(parsed, 'OpenAI Codex WebSocket event');
       } catch (error) {
         throw malformedStreamEvent(OPENAI_CODEX_PROVIDER_ID, `OpenAI Codex WebSocket event was not valid JSON: ${errorMessage(error)}`, error);
       }

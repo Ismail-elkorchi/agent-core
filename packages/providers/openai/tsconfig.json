@@ -8,6 +8,7 @@
   "include": ["src"],
   "references": [
     { "path": "../../auth" },
+    { "path": "../../json" },
     { "path": "../../model" },
     { "path": "../openai-responses" }
   ]

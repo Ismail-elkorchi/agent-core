@@ -559,6 +559,19 @@ test('OpenAIProvider summarizes failed stream events without error bodies', asyn
   );
 });
 
+test('OpenAIProvider decodes generic error events and malformed nested payloads at the wire boundary', async () => {
+  const streamProvider = new OpenAIProvider({ apiKey: 'test-key', fetch: async () => sseResponse([{ type: 'error', error: { message: 'stream failed', code: 'backend_error' } }]) });
+  await assert.rejects(
+    async () => { for await (const _event of streamProvider.stream({ model: 'gpt-5.6-sol', messages: [{ role: 'user', content: 'hi' }] })) { /* consume */ } },
+    error => error instanceof ModelProviderError && error.code === 'provider_unavailable' && error.diagnostic.eventType === 'error'
+  );
+  const responseProvider = new OpenAIProvider({ apiKey: 'test-key', fetch: async () => jsonResponse({ id: 'bad', model: 'gpt-5.6-sol', status: 'completed', output: [{ type: 'message', content: 'not-an-array' }] }) });
+  await assert.rejects(
+    () => responseProvider.complete({ model: 'gpt-5.6-sol', messages: [{ role: 'user', content: 'hi' }] }),
+    error => error instanceof ModelProviderError && error.code === 'malformed_response' && /content/u.test(error.message)
+  );
+});
+
 test('OpenAIProvider preserves accumulated streamed content when completed payload has no visible text', async () => {
   const provider = new OpenAIProvider({
     apiKey: 'test-key',

@@ -11,7 +11,7 @@ import { type ModelProvider, type ModelReasoningEffort, type ModelReasoningReque
 import { isAgentCoreProviderId, loadAgentCoreConfiguration, type AgentCoreCheckConfiguration, type AgentCoreConfiguration, type AgentCoreProviderId } from './configuration.js';
 import { loadWorkspace, type WorkspaceLayout } from './workspace.js';
 import { OllamaProvider } from '@agent-core/provider-ollama';
-import { OpenAICodexProvider, loginOpenAICodexDeviceCode } from '@agent-core/provider-openai-codex';
+import { OpenAICodexProvider, loginOpenAICodexDeviceCode, type OpenAICodexTransport } from '@agent-core/provider-openai-codex';
 import { OpenAIProvider } from '@agent-core/provider-openai';
 import { OpenRouterProvider } from '@agent-core/provider-openrouter';
 import type { AgentSession } from '@agent-core/runtime';
@@ -59,6 +59,7 @@ interface CliOptions {
   provider?: CliProviderId;
   model?: string;
   providerEndpoint?: string;
+  codexTransport?: OpenAICodexTransport;
   maxOutputTokens?: number;
   apply: boolean;
   dryRun: boolean;
@@ -93,6 +94,7 @@ interface ResolvedRuntimeSettings {
   readonly provider: CliProviderId;
   readonly model: string;
   readonly providerEndpoint?: string;
+  readonly codexTransport?: OpenAICodexTransport;
   readonly temperature?: number;
   readonly reasoning?: ModelReasoningRequest;
 }
@@ -385,6 +387,7 @@ const CLI_OPTION_SPECS = {
   '--model': valued((options, value) => { options.model = value; }),
   '--provider': valued((options, value) => { options.provider = parseProviderId(value); }),
   '--provider-endpoint': valued((options, value) => { options.providerEndpoint = value; }),
+  '--codex-transport': valued((options, value) => { options.codexTransport = parseCodexTransport(value); }),
   '--max-output-tokens': valued((options, value, key) => { options.maxOutputTokens = parsePositiveIntegerOption(key, value); }),
   '--temperature': valued((options, value) => { const temperature = Number(value); if (!Number.isFinite(temperature)) throw new Error('--temperature must be a finite number.'); options.temperature = temperature; }),
   '--reasoning-effort': valued((options, value, key) => { options.reasoning = reasoningFromEffort(parseReasoningEffort(value, key)); }),
@@ -446,7 +449,8 @@ function createProviderRuntime(options: ResolvedRuntimeSettings): CliProviderRun
         model,
         provider: new OpenAICodexProvider({
           model,
-          ...(options.providerEndpoint ? { baseUrl: options.providerEndpoint } : {})
+          ...(options.providerEndpoint ? { baseUrl: options.providerEndpoint } : {}),
+          ...(options.codexTransport ? { transport: options.codexTransport } : {})
         })
       };
   }
@@ -468,6 +472,11 @@ function defaultModelForProvider(provider: CliProviderId): string {
 function parseProviderId(value: string): CliProviderId {
   if (isAgentCoreProviderId(value)) return value;
   throw new Error(`Unsupported provider: ${value}. Supported providers: ollama, openrouter, openai, openai-codex.`);
+}
+
+function parseCodexTransport(value: string): OpenAICodexTransport {
+  if (value === 'http_sse' || value === 'websocket') return value;
+  throw new Error('--codex-transport must be http_sse or websocket.');
 }
 
 async function runApprovalCommand(args: string[]): Promise<void> {
@@ -639,6 +648,7 @@ function resolveRuntimeSettings(options: CliOptions, persisted: PersistedModelSe
     ?? process.env.AGENT_CORE_MODEL
     ?? defaultModelForProvider(provider);
   const persistedSettingsMatch = persistedMatches && persisted?.model === model;
+  const configurationSettingsMatch = options.configuration?.provider === provider && options.configuration.model === model;
   const persistedReasoning = persistedSettingsMatch && persisted.reasoningEffort
     ? reasoningFromEffort(parseReasoningEffort(persisted.reasoningEffort, 'persisted session reasoning effort'))
     : undefined;
@@ -646,14 +656,16 @@ function resolveRuntimeSettings(options: CliOptions, persisted: PersistedModelSe
   const temperature = options.temperature ?? (persistedSettingsMatch ? persisted.temperature : undefined);
   const reasoning = options.reasoning
     ?? persistedReasoning
-    ?? options.configuration?.reasoning
+    ?? (configurationSettingsMatch ? options.configuration?.reasoning : undefined)
     ?? (process.env.AGENT_CORE_REASONING_EFFORT
       ? reasoningFromEffort(parseReasoningEffort(process.env.AGENT_CORE_REASONING_EFFORT, 'AGENT_CORE_REASONING_EFFORT'))
       : undefined);
+  if (options.codexTransport !== undefined && provider !== 'openai-codex') throw new Error('--codex-transport requires --provider openai-codex.');
   return Object.freeze({
     provider,
     model,
     ...(providerEndpoint === undefined ? {} : { providerEndpoint }),
+    ...(options.codexTransport === undefined ? {} : { codexTransport: options.codexTransport }),
     ...(temperature === undefined ? {} : { temperature }),
     ...(reasoning === undefined ? {} : { reasoning })
   });
@@ -1024,6 +1036,8 @@ Common options:
   --model <name>         Model name. Default: AGENT_CORE_MODEL or the provider default.
   --provider-endpoint <url>
                          Provider endpoint override. Ollama host or provider base URL.
+  --codex-transport <http_sse|websocket>
+                         OpenAI Codex streaming transport. Default: http_sse.
   --max-output-tokens <n>
                          Optional per-request output token override.
   --temperature <n>      Provider temperature.

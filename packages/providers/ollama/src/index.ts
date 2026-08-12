@@ -1,5 +1,5 @@
 import { type ChatRequest, type Message, Ollama, type Tool } from 'ollama';
-import { normalizeJsonSafe, parseJsonObject } from '@agent-core/json';
+import { parseJsonObject } from '@agent-core/json';
 import {
   type ModelCapabilities,
   ModelContractError,
@@ -23,10 +23,19 @@ import {
   parseModelRequest,
   parseModelResponse
 } from '@agent-core/model';
+import {
+  decodeOllamaShowResponse,
+  decodeOllamaWireResponse,
+  type OllamaShowResponse,
+  type OllamaWireResponse,
+  type OllamaWireToolCall
+} from './wire.js';
+
+export type { OllamaShowResponse } from './wire.js';
 
 export interface OllamaClient {
-  chat(request: OllamaChatRequest): Promise<AsyncIterable<OllamaWireResponse>>;
-  show?(request: { model: string; verbose?: boolean }): Promise<OllamaShowResponse>;
+  chat(request: ChatRequest & { stream: true }): Promise<AsyncIterable<unknown>>;
+  show?(request: { model: string; verbose?: boolean }): Promise<unknown>;
   abort?(): void;
 }
 
@@ -45,12 +54,6 @@ export interface OllamaGenerationOptions {
   num_thread?: number;
 }
 
-export interface OllamaChatRequest extends Record<string, unknown> {
-  model: string;
-  messages: unknown[];
-  stream: true;
-}
-
 export interface OllamaProviderOptions {
   host?: string;
   model?: string;
@@ -65,42 +68,6 @@ export interface OllamaProviderOptions {
 }
 
 export type OllamaModelProfileOverride = Omit<ModelProfile, 'id' | 'provider'>;
-
-interface OllamaWireToolCall {
-  function?: {
-    name?: string;
-    arguments?: unknown;
-  };
-}
-
-interface OllamaWireMessage {
-  content?: string;
-  thinking?: string;
-  tool_calls?: OllamaWireToolCall[];
-}
-
-interface OllamaWireResponse {
-  model?: string;
-  done?: boolean;
-  done_reason?: string;
-  message?: OllamaWireMessage;
-  prompt_eval_count?: number;
-  eval_count?: number;
-  total_duration?: number;
-  load_duration?: number;
-  prompt_eval_duration?: number;
-  eval_duration?: number;
-  logprobs?: unknown;
-  error?: string;
-}
-
-export interface OllamaShowResponse {
-  parameters?: string;
-  capabilities?: string[];
-  model_info?: Record<string, unknown>;
-  details?: Record<string, unknown>;
-  modified_at?: string;
-}
 
 export class OllamaProvider implements ModelProvider {
   readonly id = 'ollama';
@@ -120,7 +87,7 @@ export class OllamaProvider implements ModelProvider {
     this.clientFactory = options.clientFactory ?? (() => {
       const client = new Ollama(config);
       return {
-        chat: (request) => client.chat(request as ChatRequest & { stream: true }),
+        chat: (request) => client.chat(request),
         show: async (request) => {
           const response = await client.show(request);
           const modelInfo = toRecord(response.model_info);
@@ -208,28 +175,30 @@ export class OllamaProvider implements ModelProvider {
     try {
       const stream = await client.chat(chatRequest);
       for await (const part of stream) {
-        const wirePart: OllamaWireResponse = part;
+        let wirePart: OllamaWireResponse;
+        try { wirePart = decodeOllamaWireResponse(part); }
+        catch (error) { throw new ModelProviderError({ provider: this.id, code: 'malformed_response', message: `Ollama response was malformed: ${error instanceof Error ? error.message : String(error)}`, cause: error }); }
         if (wirePart.error) throw new ModelProviderError({ provider: this.id, code: 'provider_unavailable', message: `Ollama stream error: ${wirePart.error}`, retryable: content.length === 0, cause: wirePart });
         throwIfAborted(request.signal);
         const delta = typeof wirePart.message?.content === 'string' ? wirePart.message.content : '';
         if (delta.length > 0) {
           content += delta;
-          yield { type: 'content', content: delta, accumulated: content, raw: normalizeJsonSafe(part).value };
+          yield { type: 'content', content: delta, accumulated: content, raw: wirePart.raw };
         }
 
         const reasoningDelta = typeof wirePart.message?.thinking === 'string' ? wirePart.message.thinking : '';
         if (reasoningDelta.length > 0) {
           reasoning += reasoningDelta;
-          yield { type: 'reasoning', reasoning: reasoningDelta, accumulatedReasoning: reasoning, raw: normalizeJsonSafe(part).value };
+          yield { type: 'reasoning', reasoning: reasoningDelta, accumulatedReasoning: reasoning, raw: wirePart.raw };
         }
 
         for (const toolCall of normalizeToolCalls(wirePart.message?.tool_calls ?? [])) {
           toolCalls.push(toolCall);
-          yield { type: 'tool_call', toolCall, raw: normalizeJsonSafe(part).value };
+          yield { type: 'tool_call', toolCall, raw: wirePart.raw };
         }
 
-        if (part.done) {
-          const response = this.toModelResponse(part, request, content, reasoning, toolCalls);
+        if (wirePart.done) {
+          const response = this.toModelResponse(wirePart, request, content, reasoning, toolCalls);
           yield { type: 'done', response };
           return;
         }
@@ -242,9 +211,9 @@ export class OllamaProvider implements ModelProvider {
     }
   }
 
-  private toChatRequest(request: ModelRequest, stream: true): OllamaChatRequest {
+  private toChatRequest(request: ModelRequest, stream: true): ChatRequest & { stream: true } {
     const options = this.toRuntimeOptions(request);
-    const chatRequest: OllamaChatRequest = {
+    const chatRequest: ChatRequest & { stream: true } = {
       model: request.model || this.defaultModel,
       messages: request.messages.map(toOllamaMessage),
       stream
@@ -310,8 +279,8 @@ export class OllamaProvider implements ModelProvider {
       ...(responseReasoning ? { reasoning: responseReasoning } : {}),
       ...(toolCalls.length > 0 ? { toolCalls } : {}),
       ...(Object.keys(timings).length > 0 ? { timings } : {}),
-      ...(response.logprobs ? { logprobs: normalizeJsonSafe(response.logprobs).value } : {}),
-      raw: normalizeJsonSafe(response).value
+      ...(response.logprobs ? { logprobs: response.logprobs } : {}),
+      raw: response.raw
     });
   }
 
@@ -334,7 +303,7 @@ export class OllamaProvider implements ModelProvider {
     const client = this.clientFactory();
     if (!client.show) throw new ModelProviderError({ provider: this.id, code: 'model_unavailable', message: `Ollama model ${model} cannot be profiled because the client does not implement show(). Supply a complete modelProfiles override for offline or custom clients.` });
     try {
-      const details = await client.show({ model, verbose: false });
+      const details = decodeOllamaShowResponse(await client.show({ model, verbose: false }));
       return parseModelProfile(profileFromShow(model, details, this.generationOptions, this.deployment));
     } catch (error) {
       throw this.normalizeError(error);
@@ -492,8 +461,9 @@ function profileFromShow(model: string, response: OllamaShowResponse, generation
 function contextLengthFromModelInfo(modelInfo: Record<string, unknown> | undefined): number | undefined {
   if (!modelInfo) return undefined;
   const entries = Object.entries(modelInfo)
-    .filter(([key, value]) => key.endsWith('.context_length') && positiveIntegerOrUndefined(value) !== undefined)
-    .map(([, value]) => value as number);
+    .filter(([key]) => key.endsWith('.context_length'))
+    .map(([, value]) => positiveIntegerOrUndefined(value))
+    .filter((value): value is number => value !== undefined);
   return entries.length > 0 ? Math.max(...entries) : undefined;
 }
 
@@ -597,12 +567,9 @@ function toOllamaFormat(format: ModelResponseFormat): string | object | undefine
   return format.schema;
 }
 
-function normalizeToolCalls(toolCalls: OllamaWireToolCall[]): ModelToolCall[] {
+function normalizeToolCalls(toolCalls: readonly OllamaWireToolCall[]): ModelToolCall[] {
   return toolCalls.map((toolCall) => {
-    const name = toolCall.function?.name;
-    const input = toolCall.function?.arguments;
-    if (typeof name !== 'string' || name.trim().length === 0 || !isJsonObject(input)) throw new ModelProviderError({ provider: 'ollama', code: 'malformed_response', message: 'Ollama tool call must contain a non-empty function name and JSON-object arguments.' });
-    return { type: 'function', name, input: { kind: 'json', value: parseJsonObject(input) } };
+    return { type: 'function', name: toolCall.function.name, input: { kind: 'json', value: toolCall.function.arguments } };
   });
 }
 
@@ -675,10 +642,8 @@ function classifyError(message: string, statusCode: number | undefined): ModelPr
 }
 
 function statusCodeFromError(error: unknown): number | undefined {
-  if (typeof error !== 'object' || error === null) {
-    return undefined;
-  }
-  const statusCode = (error as { status_code?: unknown; status?: unknown }).status_code ?? (error as { status?: unknown }).status;
+  if (!isJsonObject(error)) return undefined;
+  const statusCode = error.status_code ?? error.status;
   return typeof statusCode === 'number' ? statusCode : undefined;
 }
 

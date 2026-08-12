@@ -34,7 +34,19 @@ import {
   parseModelRequest,
   parseModelResponse
 } from '@agent-core/model';
-import { readBoundedJsonResponse, readBoundedResponseText, readJsonSseEvents, waitForResponseOrStatus } from '@agent-core/provider-openai-responses';
+import {
+  decodeResponsesPayload,
+  decodeResponsesStreamData,
+  readBoundedJsonResponse,
+  readBoundedResponseText,
+  readJsonSseEvents,
+  waitForResponseOrStatus,
+  type JsonSseEvent,
+  type ResponsesOutputItem as OpenAIOutputItem,
+  type ResponsesPayload as OpenAIResponsesPayload,
+  type ResponsesStreamData as OpenAIStreamData,
+  type ResponsesUsage as OpenAIUsage
+} from '@agent-core/provider-openai-responses';
 
 export interface OpenAIProviderOptions {
   auth?: ProviderAuth | BearerTokenProvider;
@@ -43,6 +55,7 @@ export interface OpenAIProviderOptions {
   model?: string;
   fetch?: typeof fetch;
   statusIntervalMs?: number;
+  streamIdleTimeoutMs?: number;
   modelProfiles?: Record<string, OpenAIModelProfileDefinition>;
 }
 
@@ -58,77 +71,7 @@ interface OpenAIBuiltInProfile {
   metadata?: Record<string, unknown>;
 }
 
-interface OpenAIResponsesPayload {
-  id?: string;
-  model?: string;
-  status?: string;
-  output_text?: string;
-  output?: OpenAIOutputItem[];
-  usage?: OpenAIUsage;
-  error?: OpenAIErrorBody;
-  incomplete_details?: {
-    reason?: string;
-    [key: string]: unknown;
-  };
-  [key: string]: unknown;
-}
-
-interface OpenAIOutputItem {
-  id?: string;
-  type?: string;
-  status?: string;
-  role?: string;
-  content?: OpenAIContentPart[];
-  call_id?: string;
-  name?: string;
-  arguments?: string;
-  input?: string;
-  summary?: OpenAIContentPart[] | string;
-  [key: string]: unknown;
-}
-
-interface OpenAIContentPart {
-  type?: string;
-  text?: string;
-  output_text?: string;
-  summary_text?: string;
-  [key: string]: unknown;
-}
-
-interface OpenAIUsage {
-  input_tokens?: number;
-  output_tokens?: number;
-  total_tokens?: number;
-  input_tokens_details?: { cached_tokens?: number; cache_write_tokens?: number; [key: string]: unknown };
-  output_tokens_details?: { reasoning_tokens?: number; [key: string]: unknown };
-  [key: string]: unknown;
-}
-
-interface OpenAIErrorBody {
-  message?: string;
-  type?: string;
-  code?: string;
-  [key: string]: unknown;
-}
-
-interface OpenAIStreamData {
-  type?: string;
-  delta?: string;
-  response?: OpenAIResponsesPayload;
-  item?: OpenAIOutputItem;
-  output_index?: number;
-  item_id?: string;
-  call_id?: string;
-  name?: string;
-  arguments?: string;
-  input?: string;
-  error?: OpenAIErrorBody;
-  [key: string]: unknown;
-}
-
-type OpenAISseEvent =
-  | { type: 'comment'; comment: string }
-  | { type: 'data'; data: OpenAIStreamData | '[DONE]' };
+type OpenAISseEvent = JsonSseEvent<OpenAIStreamData>;
 
 interface StreamingFunctionCallAccumulator {
   id?: string;
@@ -195,6 +138,7 @@ export class OpenAIProvider implements ModelProvider {
   private readonly defaultModel: string;
   private readonly fetchImpl: typeof fetch;
   private readonly statusIntervalMs: number;
+  private readonly streamIdleTimeoutMs: number;
   private readonly modelProfiles: Record<string, OpenAIModelProfileDefinition>;
 
   constructor(options: OpenAIProviderOptions = {}) {
@@ -202,6 +146,7 @@ export class OpenAIProvider implements ModelProvider {
     this.defaultModel = options.model ?? OPENAI_DEFAULT_MODEL;
     this.fetchImpl = options.fetch ?? fetch;
     this.statusIntervalMs = Math.max(1, options.statusIntervalMs ?? 15_000);
+    this.streamIdleTimeoutMs = Math.max(1, options.streamIdleTimeoutMs ?? 120_000);
     this.modelProfiles = options.modelProfiles ?? {};
     this.tokenProvider = new CachedBearerTokenProvider(resolveTokenProvider(options));
   }
@@ -304,18 +249,22 @@ export class OpenAIProvider implements ModelProvider {
       const accumulators = new Map<string, StreamingFunctionCallAccumulator>();
       const customAccumulators = new Map<string, StreamingCustomToolCallAccumulator>();
 
-      for await (const event of readSseEvents(response.body)) {
+      for await (const event of readSseEvents(response.body, request.signal, this.statusIntervalMs, this.streamIdleTimeoutMs)) {
         if (event.type === 'comment') {
           yield { type: 'status', message: `OpenAI stream status: ${event.comment}`, raw: event };
+          continue;
+        }
+        if (event.type === 'status') {
+          yield { type: 'status', message: `Waiting for OpenAI stream data (${String(Math.max(1, Math.round(event.idleMs / 1_000)))}s).` };
           continue;
         }
         if (event.data === '[DONE]') {
           break;
         }
         const part = event.data;
-        const eventType = part.type ?? '';
+        const eventType = part.type;
 
-        if (eventType === 'response.failed') {
+        if (eventType === 'response.failed' || eventType === 'error') {
           const failure = summarizeOpenAIFailure(part);
           throw new ModelProviderError({
             provider: this.id,
@@ -505,7 +454,7 @@ class OpenAIProviderSession implements ModelProviderSession {
     try {
       request = await this.provider.validateRequest(request);
       const response = await this.provider.fetchResponse(request, false, previousResponseId);
-      const payload = await parseJsonResponse<OpenAIResponsesPayload>(this.provider.id, response);
+      const payload = await parseJsonResponse(this.provider.id, response);
       const modelResponse = toModelResponse(this.provider.id, request, payload, { reusedContinuation });
       this.previousResponseId = modelResponse.transport?.responseId;
       const state = this.providerState(request.model);
@@ -625,7 +574,7 @@ function resolveTokenProvider(options: OpenAIProviderOptions): BearerTokenProvid
 }
 
 function isBearerTokenProvider(value: ProviderAuth | BearerTokenProvider): value is BearerTokenProvider {
-  return typeof (value as BearerTokenProvider).getBearerToken === 'function';
+  return 'getBearerToken' in value && typeof value.getBearerToken === 'function';
 }
 
 function toOpenAIResponsesRequest(request: ModelRequest, stream: boolean, previousResponseId: string | undefined): Record<string, unknown> {
@@ -948,7 +897,7 @@ function responseTransport(
   };
 }
 
-function contentFromOutput(output: OpenAIOutputItem[]): string {
+function contentFromOutput(output: readonly OpenAIOutputItem[]): string {
   return output
     .filter((item) => item.type === 'message' || item.role === 'assistant')
     .flatMap((item) => item.content ?? [])
@@ -956,23 +905,20 @@ function contentFromOutput(output: OpenAIOutputItem[]): string {
     .join('');
 }
 
-function reasoningSummaryFromOutput(output: OpenAIOutputItem[]): string {
+function reasoningSummaryFromOutput(output: readonly OpenAIOutputItem[]): string {
   return output
     .filter((item) => item.type === 'reasoning')
     .map((item) => {
       if (typeof item.summary === 'string') {
         return item.summary;
       }
-      if (Array.isArray(item.summary)) {
-        return item.summary.map((part) => part.text ?? part.summary_text ?? '').join('');
-      }
-      return '';
+      return item.summary?.map((part) => part.text ?? part.summary_text ?? '').join('') ?? '';
     })
     .filter((text) => text.length > 0)
     .join('\n');
 }
 
-function normalizeToolCalls(provider: string, output: OpenAIOutputItem[]): ModelToolCall[] {
+function normalizeToolCalls(provider: string, output: readonly OpenAIOutputItem[]): ModelToolCall[] {
   return output
     .map((item) => toolCallFromOutputItem(provider, item))
     .filter((toolCall): toolCall is ModelToolCall => toolCall !== undefined);
@@ -1022,7 +968,7 @@ function parseToolArguments(provider: string, value: string | undefined): JsonOb
 }
 
 function mergeStreamingFunctionCallParts(accumulators: Map<string, StreamingFunctionCallAccumulator>, part: OpenAIStreamData): ModelToolCall[] {
-  const eventType = part.type ?? '';
+  const eventType = part.type;
   if (!eventType.includes('function_call')) {
     return [];
   }
@@ -1066,7 +1012,7 @@ function tryAccumulatorToToolCall(item: StreamingFunctionCallAccumulator): Model
 }
 
 function mergeStreamingCustomToolCallParts(accumulators: Map<string, StreamingCustomToolCallAccumulator>, part: OpenAIStreamData): ModelToolCall[] {
-  const eventType = part.type ?? '';
+  const eventType = part.type;
   if (!eventType.includes('custom_tool_call')) {
     return [];
   }
@@ -1149,15 +1095,20 @@ function normalizeUsage(usage: OpenAIUsage | undefined): ModelUsage | undefined 
   };
 }
 
-function readSseEvents(body: ReadableStream<Uint8Array>): AsyncIterable<OpenAISseEvent> {
-  return readJsonSseEvents<OpenAIStreamData>(body, {
-    createMalformedError: (message, cause) => new ModelProviderError({ provider: OPENAI_PROVIDER_ID, code: 'malformed_response', message: `OpenAI ${message}`, cause })
+function readSseEvents(body: ReadableStream<Uint8Array>, signal: AbortSignal | undefined, statusIntervalMs: number, idleTimeoutMs: number): AsyncIterable<OpenAISseEvent> {
+  return readJsonSseEvents(body, {
+    ...(signal ? { signal } : {}),
+    statusIntervalMs,
+    idleTimeoutMs,
+    decodeData: (value) => decodeResponsesStreamData(value, 'OpenAI stream event'),
+    createMalformedError: (message, cause) => new ModelProviderError({ provider: OPENAI_PROVIDER_ID, code: 'malformed_response', message: `OpenAI ${message}`, cause }),
+    createIdleError: (idleMs) => new ModelProviderError({ provider: OPENAI_PROVIDER_ID, code: 'provider_unavailable', message: `OpenAI stream was idle for ${String(idleMs)}ms.`, retryable: true, diagnostic: { transport: 'http_sse', causeSummary: { idleMs } } })
   });
 }
 
-async function parseJsonResponse<T>(provider: string, response: Response): Promise<T> {
+async function parseJsonResponse(provider: string, response: Response): Promise<OpenAIResponsesPayload> {
   try {
-    return await readBoundedJsonResponse<T>(response);
+    return decodeResponsesPayload(await readBoundedJsonResponse(response), 'OpenAI response');
   } catch (error) {
     throw new ModelProviderError({
       provider,
@@ -1259,9 +1210,9 @@ function summarizeOpenAIFailure(payload: OpenAIStreamData | OpenAIResponsesPaylo
   eventType?: string;
   causeSummary: Record<string, ModelProviderErrorDiagnosticValue>;
 } {
-  const response = isJsonObject(payload.response) ? payload.response as OpenAIResponsesPayload : undefined;
-  const payloadIncompleteDetails = isJsonObject(payload.incomplete_details) ? payload.incomplete_details : undefined;
-  const payloadOutput = Array.isArray(payload.output) ? payload.output as OpenAIOutputItem[] : undefined;
+  const response = isOpenAIStreamData(payload) ? payload.response : undefined;
+  const payloadIncompleteDetails = payload.incomplete_details;
+  const payloadOutput = payload.output;
   const error = payload.error ?? response?.error;
   const causeSummary: Record<string, ModelProviderErrorDiagnosticValue> = {};
   addDiagnosticField(causeSummary, 'eventType', payload.type);
@@ -1294,6 +1245,10 @@ function summarizeOpenAIFailure(payload: OpenAIStreamData | OpenAIResponsesPaylo
   };
 }
 
+function isOpenAIStreamData(value: OpenAIStreamData | OpenAIResponsesPayload): value is OpenAIStreamData {
+  return typeof value.type === 'string';
+}
+
 function summarizedFailureMessage(summary: Record<string, ModelProviderErrorDiagnosticValue>): string {
   const parts = [
     typeof summary.eventType === 'string' ? `event=${summary.eventType}` : '',
@@ -1304,7 +1259,7 @@ function summarizedFailureMessage(summary: Record<string, ModelProviderErrorDiag
   return parts.length > 0 ? parts.join('; ') : 'provider returned a failed response without error details';
 }
 
-function firstOutputError(items: OpenAIOutputItem[] | undefined): {
+function firstOutputError(items: readonly OpenAIOutputItem[] | undefined): {
   type?: string;
   status?: string;
   message?: string;
@@ -1312,7 +1267,7 @@ function firstOutputError(items: OpenAIOutputItem[] | undefined): {
 } | undefined {
   for (const item of items ?? []) {
     if (item.status === 'failed' || item.type === 'error' || isJsonObject(item.error)) {
-      const error = isJsonObject(item.error) ? item.error as OpenAIErrorBody : undefined;
+      const error = item.error;
       return {
         ...(item.type ? { type: item.type } : {}),
         ...(item.status ? { status: item.status } : {}),

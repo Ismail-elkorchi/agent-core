@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createCliToolPolicy, resultExitCode } from '@agent-core/cli';
 import { decodeAgentTerminalSnapshot } from '@agent-core/runtime';
@@ -38,10 +40,33 @@ test('CLI binary help works through the published executable', async () => {
   assert.match(output.stdout + output.stderr, /read, write, or delete files, access the network, and start child processes/iu);
   assert.match(output.stdout + output.stderr, /Persistent ambient processes block conflicting workspace tools until they exit or stop/iu);
   assert.match(output.stdout + output.stderr, /--apply\s+Allow apply_patch add, update, move, and delete operations/iu);
+  assert.match(output.stdout + output.stderr, /--codex-transport <http_sse\|websocket>/u);
+});
+
+test('CLI discards configured reasoning when provider or model identity changes', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-core-cli-provider-'));
+  const home = path.join(root, 'home');
+  await mkdir(home);
+  await writeFile(path.join(root, 'agent-core.config.json'), JSON.stringify({
+    version: 1,
+    provider: 'openai',
+    model: 'gpt-5.6-sol',
+    reasoning: { strategy: 'effort', effort: 'max', mode: 'standard' },
+    instructions: [],
+    tools: { enabled: [] },
+    authorization: { allowedRisks: ['read'], requireApprovalFor: [] },
+    verification: { required: [], advisory: [] }
+  }));
+  const output = await run(path.resolve('packages/cli/dist/index.js'), [
+    'exec', 'test', '--root', root, '--config', 'agent-core.config.json',
+    '--provider', 'openai-codex', '--model', 'gpt-5.6-luna'
+  ], { env: { ...process.env, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: home } });
+  assert.equal(output.code, 1);
+  assert.doesNotMatch(output.stderr, /reasoning\.mode|reasoning mode/iu);
 });
 
 function result(overrides = {}) { return { state: 'ended', terminal: decodeAgentTerminalSnapshot({ ...base(), ...overrides }), deliveryDiagnostics: [] }; }
 function failed() { const { modelTerminationReason: _reason, ...input } = base(); return { state: 'ended', terminal: decodeAgentTerminalSnapshot({ ...input, executionStatus: 'failed', verificationStatus: 'not_run', terminationReason: 'runtime_error', errorMessage: 'failed', candidate: { status: 'absent' } }), deliveryDiagnostics: [] }; }
 function aborted() { const { modelTerminationReason: _reason, ...input } = base(); return { state: 'ended', terminal: decodeAgentTerminalSnapshot({ ...input, executionStatus: 'aborted', verificationStatus: 'not_run', terminationReason: 'aborted', errorMessage: 'stopped', candidate: { status: 'absent' } }), deliveryDiagnostics: [] }; }
 function base() { return { runId: 'run', finalizationId: 'final', phase: 'ended', executionStatus: 'completed', verificationStatus: 'not_required', terminationReason: 'model_completed', modelTerminationReason: 'stop', candidate: { status: 'complete', message: 'done', source: 'content', turnIndex: 1 }, turnCount: 1, checkResults: [], budget: { modelTurns: 1, totalToolCalls: 0, repeatedIdenticalToolCalls: 0, elapsedMs: 1, promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, knownCosts: {}, pricingStatus: 'unknown', unknownPricedTokens: 0, consecutiveProviderFailures: 0, consecutiveToolFailures: 0, providerRetries: 0 } }; }
-function run(file, args) { return new Promise((resolve, reject) => { const child = spawn(process.execPath, [file, ...args], { stdio: ['ignore', 'pipe', 'pipe'] }); let stdout = ''; let stderr = ''; child.stdout.on('data', chunk => { stdout += chunk; }); child.stderr.on('data', chunk => { stderr += chunk; }); child.on('error', reject); child.on('close', code => resolve({ code, stdout, stderr })); }); }
+function run(file, args, options = {}) { return new Promise((resolve, reject) => { const child = spawn(process.execPath, [file, ...args], { stdio: ['ignore', 'pipe', 'pipe'], ...options }); let stdout = ''; let stderr = ''; child.stdout.on('data', chunk => { stdout += chunk; }); child.stderr.on('data', chunk => { stderr += chunk; }); child.on('error', reject); child.on('close', code => resolve({ code, stdout, stderr })); }); }

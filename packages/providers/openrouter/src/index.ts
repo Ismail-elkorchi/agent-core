@@ -24,6 +24,22 @@ import {
   parseModelResponse
 } from '@agent-core/model';
 import { normalizeJsonSafe, parseJsonObject, type JsonObject } from '@agent-core/json';
+import {
+  readBoundedJsonResponse,
+  readBoundedResponseText,
+  readJsonSseEvents,
+  waitForResponseOrStatus,
+  type JsonSseEvent
+} from '@agent-core/provider-openai-responses';
+import {
+  decodeOpenRouterChatResponse,
+  decodeOpenRouterModelCatalog,
+  type OpenRouterChatResponse,
+  type OpenRouterModelRecord,
+  type OpenRouterResponseMessage,
+  type OpenRouterUsage,
+  type OpenRouterWireToolCall
+} from './wire.js';
 
 export interface OpenRouterProviderOptions {
   apiKey?: string;
@@ -33,84 +49,8 @@ export interface OpenRouterProviderOptions {
   appTitle?: string;
   fetch?: typeof fetch;
   statusIntervalMs?: number;
+  streamIdleTimeoutMs?: number;
   catalogTtlMs?: number;
-}
-
-interface OpenRouterModelCatalog {
-  data?: OpenRouterModelRecord[];
-}
-
-interface OpenRouterModelRecord {
-  id?: string;
-  name?: string;
-  description?: string;
-  context_length?: number | null;
-  architecture?: {
-    input_modalities?: string[];
-    output_modalities?: string[];
-    [key: string]: unknown;
-  };
-  pricing?: Record<string, string | number | null | undefined>;
-  top_provider?: {
-    context_length?: number | null;
-    max_completion_tokens?: number | null;
-    [key: string]: unknown;
-  } | null;
-  supported_parameters?: string[];
-  reasoning?: {
-    supported_efforts?: string[] | null;
-    supports_max_tokens?: boolean;
-    mandatory?: boolean;
-    [key: string]: unknown;
-  };
-  [key: string]: unknown;
-}
-
-interface OpenRouterChatResponse {
-  id?: string;
-  model?: string;
-  choices?: OpenRouterChoice[];
-  usage?: OpenRouterUsage;
-  provider?: string;
-  error?: { code?: number | string; message?: string; metadata?: unknown; [key: string]: unknown };
-  [key: string]: unknown;
-}
-
-interface OpenRouterChoice {
-  message?: OpenRouterResponseMessage;
-  delta?: OpenRouterResponseMessage;
-  finish_reason?: string | null;
-  [key: string]: unknown;
-}
-
-interface OpenRouterResponseMessage {
-  role?: string;
-  content?: string | null | Record<string, unknown>[];
-  reasoning?: string | null;
-  reasoning_details?: unknown;
-  tool_calls?: OpenRouterWireToolCall[];
-  [key: string]: unknown;
-}
-
-interface OpenRouterWireToolCall {
-  id?: string;
-  index?: number;
-  type?: string;
-  function?: {
-    name?: string;
-    arguments?: string | Record<string, unknown>;
-    [key: string]: unknown;
-  };
-  [key: string]: unknown;
-}
-
-interface OpenRouterUsage {
-  prompt_tokens?: number;
-  completion_tokens?: number;
-  total_tokens?: number;
-  prompt_tokens_details?: { cached_tokens?: number; cache_write_tokens?: number; [key: string]: unknown };
-  completion_tokens_details?: { reasoning_tokens?: number; [key: string]: unknown };
-  [key: string]: unknown;
 }
 
 interface StreamingToolCallAccumulator {
@@ -121,16 +61,11 @@ interface StreamingToolCallAccumulator {
   emittedKey?: string;
 }
 
-type OpenRouterSseEvent =
-  | { type: 'comment'; comment: string }
-  | { type: 'data'; data: OpenRouterChatResponse | '[DONE]' };
+type OpenRouterSseEvent = JsonSseEvent<OpenRouterChatResponse>;
 
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 const OPENROUTER_DEFAULT_MODEL = 'openrouter/auto';
 const OPENROUTER_PROVIDER_ID = 'openrouter';
-const MAX_SSE_BUFFER_BYTES = 1_048_576;
-const MAX_DIAGNOSTIC_BODY_BYTES = 65_536;
-const MAX_JSON_BODY_BYTES = 33_554_432;
 const CONTENT_TYPE_JSON = 'application/json';
 
 export class OpenRouterProvider implements ModelProvider {
@@ -142,8 +77,9 @@ export class OpenRouterProvider implements ModelProvider {
   private readonly appTitle: string | undefined;
   private readonly fetchImpl: typeof fetch;
   private readonly statusIntervalMs: number;
+  private readonly streamIdleTimeoutMs: number;
   private readonly catalogTtlMs: number;
-  private modelCatalogPromise: Promise<OpenRouterModelRecord[]> | undefined;
+  private modelCatalogPromise: Promise<readonly OpenRouterModelRecord[]> | undefined;
   private modelCatalogExpiresAt = 0;
 
   constructor(options: OpenRouterProviderOptions = {}) {
@@ -154,6 +90,7 @@ export class OpenRouterProvider implements ModelProvider {
     this.appTitle = options.appTitle ?? process.env.OPENROUTER_APP_TITLE;
     this.fetchImpl = options.fetch ?? fetch;
     this.statusIntervalMs = Math.max(1, options.statusIntervalMs ?? 15_000);
+    this.streamIdleTimeoutMs = Math.max(1, options.streamIdleTimeoutMs ?? 120_000);
     this.catalogTtlMs = Math.max(1, options.catalogTtlMs ?? 5 * 60_000);
   }
 
@@ -183,7 +120,7 @@ export class OpenRouterProvider implements ModelProvider {
     try {
       request = await this.validateRequest(request);
       const response = await this.fetchChatCompletion(request, false);
-      const payload = await parseJsonResponse<OpenRouterChatResponse>(this.id, response);
+      const payload = await decodeJsonResponse(this.id, response, decodeOpenRouterChatResponse, 'OpenRouter chat response');
       return toModelResponse(this.id, request, payload);
     } catch (error) {
       throw normalizeError(this.id, error);
@@ -197,7 +134,7 @@ export class OpenRouterProvider implements ModelProvider {
       const startedAt = Date.now();
       let response: Response | undefined;
       while (!response) {
-        const result = await waitForOpenRouterResponse(responsePromise, this.statusIntervalMs, request.signal);
+        const result = await waitForResponseOrStatus(responsePromise, this.statusIntervalMs, request.signal);
         if (result.type === 'response') {
           response = result.response;
         } else {
@@ -224,9 +161,13 @@ export class OpenRouterProvider implements ModelProvider {
       const toolCallParts = new Map<number, StreamingToolCallAccumulator>();
       const toolCalls: ModelToolCall[] = [];
 
-      for await (const event of readSseEvents(response.body)) {
+      for await (const event of readSseEvents(response.body, request.signal, this.statusIntervalMs, this.streamIdleTimeoutMs)) {
         if (event.type === 'comment') {
           yield { type: 'status', message: `OpenRouter stream status: ${event.comment}`, raw: event };
+          continue;
+        }
+        if (event.type === 'status') {
+          yield { type: 'status', message: `Waiting for OpenRouter stream data (${String(Math.max(1, Math.round(event.idleMs / 1_000)))}s).` };
           continue;
         }
         if (event.data === '[DONE]') {
@@ -285,7 +226,7 @@ export class OpenRouterProvider implements ModelProvider {
     }
   }
 
-  private async modelCatalog(): Promise<OpenRouterModelRecord[]> {
+  private async modelCatalog(): Promise<readonly OpenRouterModelRecord[]> {
     if (Date.now() >= this.modelCatalogExpiresAt) {
       this.modelCatalogPromise = undefined;
     }
@@ -322,15 +263,15 @@ export class OpenRouterProvider implements ModelProvider {
     return owned;
   }
 
-  private async fetchModelCatalog(): Promise<OpenRouterModelRecord[]> {
+  private async fetchModelCatalog(): Promise<readonly OpenRouterModelRecord[]> {
     try {
       const response = await this.fetchImpl(`${this.baseUrl}/models`, {
         method: 'GET',
         headers: this.headers(false)
       });
       await throwIfBadResponse(this.id, response);
-      const payload = await parseJsonResponse<OpenRouterModelCatalog>(this.id, response);
-      if (!Array.isArray(payload.data)) {
+      const payload = await decodeJsonResponse(this.id, response, decodeOpenRouterModelCatalog, 'OpenRouter model catalog');
+      if (payload.data === undefined) {
         throw new ModelProviderError({
           provider: this.id,
           code: 'malformed_response',
@@ -602,7 +543,7 @@ function reasoningFromWire(message: OpenRouterResponseMessage | undefined): stri
   return '';
 }
 
-function normalizeToolCalls(provider: string, toolCalls: OpenRouterWireToolCall[]): ModelToolCall[] {
+function normalizeToolCalls(provider: string, toolCalls: readonly OpenRouterWireToolCall[]): ModelToolCall[] {
   return toolCalls.map((toolCall) => wireToolCallToModelToolCall(provider, toolCall));
 }
 
@@ -615,11 +556,11 @@ function wireToolCallToModelToolCall(provider: string, toolCall: OpenRouterWireT
     ...(toolCall.id ? { id: toolCall.id } : {}),
     type: 'function',
     name,
-    input: { kind: 'json', value: parseToolArguments(provider, toolCall.function?.arguments) }
+    input: { kind: 'json', value: parseToolArguments(provider, toolCall.function.arguments) }
   };
 }
 
-function parseToolArguments(provider: string, value: string | Record<string, unknown> | undefined): JsonObject {
+function parseToolArguments(provider: string, value: string | Readonly<Record<string, unknown>> | undefined): JsonObject {
   if (value === undefined || value === '') {
     return Object.freeze({});
   }
@@ -639,7 +580,7 @@ function parseToolArguments(provider: string, value: string | Record<string, unk
   throw new ModelProviderError({ provider, code: 'malformed_response', message: 'OpenRouter tool call arguments must decode to a JSON object.' });
 }
 
-function mergeStreamingToolCalls(accumulators: Map<number, StreamingToolCallAccumulator>, deltas: OpenRouterWireToolCall[]): ModelToolCall[] {
+function mergeStreamingToolCalls(accumulators: Map<number, StreamingToolCallAccumulator>, deltas: readonly OpenRouterWireToolCall[]): ModelToolCall[] {
   const toolCalls: ModelToolCall[] = [];
   for (const delta of deltas) {
     const index = delta.index ?? 0;
@@ -714,7 +655,7 @@ function dedupeToolCalls(toolCalls: ModelToolCall[]): ModelToolCall[] {
   return result;
 }
 
-function canonicalOpenRouterParameters(parameters: string[]): ModelProfile['supportedParameters'] {
+function canonicalOpenRouterParameters(parameters: readonly string[]): ModelProfile['supportedParameters'] {
   const supported = new Set<ModelProfile['supportedParameters'][number]>(['providerOptions']);
   const mappings: Record<string, ModelProfile['supportedParameters'][number]> = {
     temperature: 'temperature',
@@ -825,8 +766,8 @@ function modelMetadata(record: OpenRouterModelRecord): Record<string, unknown> {
   };
 }
 
-function normalizeModalities(value: string[] | undefined, fallback: ModelModality[]): ModelModality[] {
-  return value && value.length > 0 ? value : fallback;
+function normalizeModalities(value: readonly string[] | undefined, fallback: ModelModality[]): ModelModality[] {
+  return value && value.length > 0 ? [...value] : fallback;
 }
 
 function normalizePricing(pricing: OpenRouterModelRecord['pricing']): ModelPricing | undefined {
@@ -842,7 +783,7 @@ function normalizePricing(pricing: OpenRouterModelRecord['pricing']): ModelPrici
   if (output !== undefined) rates.output = output;
   if (cacheRead !== undefined) rates.cacheRead = cacheRead;
   if (cacheWrite !== undefined) rates.cacheWrite = cacheWrite;
-  const metadata = Object.fromEntries(Object.entries(pricing).filter(([key, value]) => value !== undefined && !['prompt', 'completion', 'input_cache_read', 'input_cache_write'].includes(key)));
+  const metadata = Object.fromEntries(Object.entries(pricing).filter(([key]) => !['prompt', 'completion', 'input_cache_read', 'input_cache_write'].includes(key)));
   return Object.keys(rates).length > 0 || Object.keys(metadata).length > 0 ? { currency: 'USD', rates, ...(Object.keys(metadata).length > 0 ? { metadata: parseJsonObject(metadata) } : {}) } : undefined;
 }
 
@@ -870,103 +811,25 @@ function normalizeUsage(usage: OpenRouterUsage | undefined): ModelUsage | undefi
   };
 }
 
-function waitForOpenRouterResponse<T>(response: Promise<T>, intervalMs: number, signal: AbortSignal | undefined): Promise<{ type: 'response'; response: T } | { type: 'status' }> {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const finish = (result: { type: 'response'; response: T } | { type: 'status' }) => { if (settled) return; settled = true; clearTimeout(timer); signal?.removeEventListener('abort', onAbort); resolve(result); };
-    const fail = (error: unknown) => { if (settled) return; settled = true; clearTimeout(timer); signal?.removeEventListener('abort', onAbort); reject(error instanceof Error ? error : new Error(String(error))); };
-    const onAbort = () => { fail(abortError()); };
-    const timer = setTimeout(() => { finish({ type: 'status' }); }, intervalMs);
-    response.then((value) => { finish({ type: 'response', response: value }); }, fail);
-    if (signal?.aborted) onAbort(); else signal?.addEventListener('abort', onAbort, { once: true });
+function readSseEvents(body: ReadableStream<Uint8Array>, signal: AbortSignal | undefined, statusIntervalMs: number, idleTimeoutMs: number): AsyncIterable<OpenRouterSseEvent> {
+  return readJsonSseEvents(body, {
+    ...(signal ? { signal } : {}),
+    statusIntervalMs,
+    idleTimeoutMs,
+    decodeData: decodeOpenRouterChatResponse,
+    createMalformedError: (message, cause) => new ModelProviderError({ provider: OPENROUTER_PROVIDER_ID, code: 'malformed_response', message: `OpenRouter ${message}`, cause }),
+    createIdleError: (idleMs) => new ModelProviderError({ provider: OPENROUTER_PROVIDER_ID, code: 'provider_unavailable', message: `OpenRouter stream was idle for ${String(idleMs)}ms.`, retryable: true, diagnostic: { transport: 'http_sse', causeSummary: { idleMs } } })
   });
 }
 
-function abortError(): Error {
-  const error = new Error('OpenRouter request aborted.');
-  error.name = 'AbortError';
-  return error;
-}
-
-async function* readSseEvents(body: ReadableStream<Uint8Array>): AsyncIterable<OpenRouterSseEvent> {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
+async function decodeJsonResponse<T>(provider: string, response: Response, decode: (value: unknown) => T, label: string): Promise<T> {
   try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) {
-        break;
-      }
-      buffer += decoder.decode(value, { stream: true });
-      assertOpenRouterSseBuffer(buffer);
-      yield* drainSseBuffer(buffer, (next) => {
-        buffer = next;
-      });
-    }
-    buffer += decoder.decode();
-    assertOpenRouterSseBuffer(buffer);
-    yield* drainSseBuffer(`${buffer}\n\n`, (next) => {
-      buffer = next;
-    });
-  } finally {
-    reader.releaseLock();
-  }
-}
-
-function assertOpenRouterSseBuffer(buffer: string): void {
-  if (new TextEncoder().encode(buffer).byteLength > MAX_SSE_BUFFER_BYTES) throw new ModelProviderError({ provider: OPENROUTER_PROVIDER_ID, code: 'malformed_response', message: `OpenRouter SSE event exceeded the ${String(MAX_SSE_BUFFER_BYTES)} byte buffer limit.` });
-}
-
-function* drainSseBuffer(buffer: string, setBuffer: (value: string) => void): Iterable<OpenRouterSseEvent> {
-  for (;;) {
-    const boundary = /\r?\n\r?\n/.exec(buffer);
-    if (!boundary) {
-      setBuffer(buffer);
-      return;
-    }
-    const rawEvent = buffer.slice(0, boundary.index);
-    buffer = buffer.slice(boundary.index + boundary[0].length);
-    const lines = rawEvent
-      .split(/\r?\n/)
-      .map((line) => line.trim());
-    for (const comment of lines.filter((line) => line.startsWith(':')).map((line) => line.slice(1).trim()).filter((line) => line.length > 0)) {
-      yield { type: 'comment', comment };
-    }
-    const data = lines
-      .filter((line) => line.startsWith('data:'))
-      .map((line) => line.slice(5).trim())
-      .join('\n');
-    if (data.length === 0) {
-      continue;
-    }
-    if (data === '[DONE]') {
-      yield { type: 'data', data: '[DONE]' };
-      continue;
-    }
-    try {
-      yield { type: 'data', data: JSON.parse(data) as OpenRouterChatResponse };
-    } catch (error) {
-      throw new ModelProviderError({
-        provider: OPENROUTER_PROVIDER_ID,
-        code: 'malformed_response',
-        message: `OpenRouter stream event was not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
-        cause: error
-      });
-    }
-  }
-}
-
-async function parseJsonResponse<T>(provider: string, response: Response): Promise<T> {
-  try {
-    const result = await readBoundedText(response, MAX_JSON_BODY_BYTES);
-    if (result.truncated) throw new Error(`JSON response exceeded the ${String(MAX_JSON_BODY_BYTES)} byte limit.`);
-    return JSON.parse(result.text) as T;
+    return decode(await readBoundedJsonResponse(response));
   } catch (error) {
     throw new ModelProviderError({
       provider,
       code: 'malformed_response',
-      message: `OpenRouter response was not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+      message: `${label} was malformed: ${error instanceof Error ? error.message : String(error)}`,
       cause: error
     });
   }
@@ -976,7 +839,7 @@ async function throwIfBadResponse(provider: string, response: Response): Promise
   if (response.ok) {
     return;
   }
-  const { text: body, truncated } = await readBoundedText(response, MAX_DIAGNOSTIC_BODY_BYTES);
+  const { text: body, truncated } = await readBoundedResponseText(response);
   const retryAfterMs = retryAfterMilliseconds(response.headers.get('retry-after'));
   const extractedMessage = extractErrorMessage(body);
   throw new ModelProviderError({
@@ -994,34 +857,6 @@ async function throwIfBadResponse(provider: string, response: Response): Promise
       }
     }
   });
-}
-
-async function readBoundedText(response: Response, maximumBytes: number): Promise<{ readonly text: string; readonly truncated: boolean }> {
-  if (!response.body) return { text: '', truncated: false };
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let bytes = 0;
-  let truncated = false;
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      const remaining = maximumBytes - bytes;
-      if (value.byteLength > remaining) {
-        if (remaining > 0) chunks.push(value.slice(0, remaining));
-        bytes = maximumBytes;
-        truncated = true;
-        await reader.cancel('response body exceeded configured bound');
-        break;
-      }
-      chunks.push(value);
-      bytes += value.byteLength;
-    }
-  } finally { reader.releaseLock(); }
-  const joined = new Uint8Array(bytes);
-  let offset = 0;
-  for (const chunk of chunks) { joined.set(chunk, offset); offset += chunk.byteLength; }
-  return { text: new TextDecoder().decode(joined), truncated };
 }
 
 function retryAfterMilliseconds(value: string | null): number | undefined {
@@ -1077,8 +912,10 @@ function extractErrorMessage(body: string): string {
     return 'empty response body';
   }
   try {
-    const parsed = JSON.parse(body) as { error?: { message?: string }; message?: string };
-    return parsed.error?.message ?? parsed.message ?? body;
+    const parsed: unknown = JSON.parse(body);
+    if (!isJsonObject(parsed)) return body;
+    const error = isJsonObject(parsed.error) ? parsed.error : undefined;
+    return typeof error?.message === 'string' ? error.message : typeof parsed.message === 'string' ? parsed.message : body;
   } catch {
     return body;
   }

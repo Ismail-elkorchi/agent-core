@@ -7,7 +7,7 @@ import {
   type ModelProviderErrorCode,
   type ModelProviderErrorDiagnosticValue
 } from '@agent-core/model';
-import { readBoundedJsonResponse } from '@agent-core/provider-openai-responses';
+import { decodeResponsesPayload, readBoundedJsonResponse } from '@agent-core/provider-openai-responses';
 
 import { OPENAI_CODEX_PROVIDER_ID } from './constants.js';
 import type {
@@ -17,9 +17,9 @@ import type {
 } from './events.js';
 import { errorMessage, isAbortError, isJsonObject } from './utils.js';
 
-export async function parseJsonResponse<T>(provider: string, response: Response): Promise<T> {
+export async function parseCodexJsonResponse(provider: string, response: Response): Promise<OpenAICodexResponsesPayload> {
   try {
-    return await readBoundedJsonResponse<T>(response);
+    return decodeResponsesPayload(await readBoundedJsonResponse(response), 'OpenAI Codex response');
   } catch (error) {
     throw new ModelProviderError({
       provider,
@@ -105,9 +105,9 @@ export function summarizeCodexFailure(payload: OpenAICodexStreamData | OpenAICod
   eventType?: string;
   causeSummary: Record<string, ModelProviderErrorDiagnosticValue>;
 } {
-  const response = isJsonObject(payload.response) ? payload.response as OpenAICodexResponsesPayload : undefined;
-  const payloadIncompleteDetails = isJsonObject(payload.incomplete_details) ? payload.incomplete_details : undefined;
-  const payloadOutput = Array.isArray(payload.output) ? payload.output as OpenAICodexOutputItem[] : undefined;
+  const response = isCodexStreamData(payload) ? payload.response : undefined;
+  const payloadIncompleteDetails = payload.incomplete_details;
+  const payloadOutput = payload.output;
   const error = payload.error ?? response?.error;
   const causeSummary: Record<string, ModelProviderErrorDiagnosticValue> = {};
   addDiagnosticField(causeSummary, 'eventType', payload.type);
@@ -140,6 +140,10 @@ export function summarizeCodexFailure(payload: OpenAICodexStreamData | OpenAICod
   };
 }
 
+function isCodexStreamData(value: OpenAICodexStreamData | OpenAICodexResponsesPayload): value is OpenAICodexStreamData {
+  return typeof value.type === 'string';
+}
+
 function authErrorCodeToModelCode(error: AuthError): ModelProviderErrorCode {
   if (error.code === 'aborted') {
     return 'aborted';
@@ -160,7 +164,7 @@ function summarizedFailureMessage(summary: Record<string, ModelProviderErrorDiag
   return parts.length > 0 ? parts.join('; ') : 'provider returned a failed response without error details';
 }
 
-function firstOutputError(items: OpenAICodexOutputItem[] | undefined): {
+function firstOutputError(items: readonly OpenAICodexOutputItem[] | undefined): {
   type?: string;
   status?: string;
   message?: string;

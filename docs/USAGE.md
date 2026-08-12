@@ -100,6 +100,7 @@ Run `agent-core [initial task] [options]` for the interactive TUI. Run `agent-co
 | `--provider <name>` | Select `ollama`, `openrouter`, `openai`, or `openai-codex`. |
 | `--model <name>` | Select the provider model, such as `gpt-5.6-luna`. |
 | `--provider-endpoint <url>` | Override the Ollama host or hosted-provider base URL. |
+| `--codex-transport <http_sse\|websocket>` | Select OpenAI Codex HTTP full-replay streaming or live WebSocket continuation. Defaults to `http_sse`. |
 | `--max-output-tokens <n>` | Set a positive per-request output-token limit. |
 | `--temperature <n>` | Set a finite temperature when the selected provider/model supports it. OpenAI Codex subscription requests do not support temperature. |
 | `--reasoning-effort <level>` | Select `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`, subject to provider/model support. |

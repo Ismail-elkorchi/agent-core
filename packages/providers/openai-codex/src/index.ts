@@ -30,7 +30,7 @@ import {
   prepareCodexWebSocketRequest
 } from './continuation.js';
 import {
-  parseJsonResponse,
+  parseCodexJsonResponse,
   normalizeError,
   parseCodexModelResponse,
   summarizeCodexFailure
@@ -107,6 +107,7 @@ export interface OpenAICodexProviderOptions {
   transport?: OpenAICodexTransport;
   webSocketFactory?: CodexWebSocketFactory;
   statusIntervalMs?: number;
+  streamIdleTimeoutMs?: number;
   originator?: string;
   modelProfiles?: Record<string, OpenAICodexModelProfileDefinition>;
 }
@@ -120,6 +121,7 @@ export class OpenAICodexProvider implements ModelProvider {
   private readonly transport: OpenAICodexTransport;
   private readonly webSocketFactory: CodexWebSocketFactory;
   private readonly statusIntervalMs: number;
+  private readonly streamIdleTimeoutMs: number;
   private readonly originator: string;
   private readonly modelProfiles: Record<string, OpenAICodexModelProfileDefinition>;
 
@@ -130,6 +132,7 @@ export class OpenAICodexProvider implements ModelProvider {
     this.transport = options.transport ?? 'http_sse';
     this.webSocketFactory = options.webSocketFactory ?? defaultCodexWebSocketFactory;
     this.statusIntervalMs = Math.max(1, options.statusIntervalMs ?? 15_000);
+    this.streamIdleTimeoutMs = Math.max(1, options.streamIdleTimeoutMs ?? 120_000);
     this.originator = options.originator ?? 'agent-core';
     this.modelProfiles = options.modelProfiles ?? {};
     this.tokenProvider = new CachedBearerTokenProvider(resolveTokenProvider(options, this.fetchImpl));
@@ -167,8 +170,8 @@ export class OpenAICodexProvider implements ModelProvider {
     return fetchCodexResponse(this.httpTransportConfig(), request, stream);
   }
 
-  async *streamHttp(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
-    yield* streamCodexHttp(this.httpTransportConfig(), request);
+  async *streamHttp(request: ModelRequest, onResponsePayload?: (payload: OpenAICodexResponsesPayload) => void): AsyncIterable<ModelStreamEvent> {
+    yield* streamCodexHttp({ ...this.httpTransportConfig(), ...(onResponsePayload ? { onResponsePayload } : {}) }, request);
   }
 
   async validateRequest(request: ModelRequest): Promise<ModelRequest> {
@@ -219,7 +222,8 @@ export class OpenAICodexProvider implements ModelProvider {
       fetchImpl: this.fetchImpl,
       tokenProvider: this.tokenProvider,
       originator: this.originator,
-      statusIntervalMs: this.statusIntervalMs
+      statusIntervalMs: this.statusIntervalMs,
+      streamIdleTimeoutMs: this.streamIdleTimeoutMs
     };
   }
 }
@@ -238,7 +242,7 @@ class OpenAICodexProviderSession implements ModelProviderSession {
     try {
       request = await this.provider.validateRequest(request);
       const response = await this.provider.fetchResponse(request, false);
-      const payload = await parseJsonResponse<OpenAICodexResponsesPayload>(this.provider.id, response);
+      const payload = await parseCodexJsonResponse(this.provider.id, response);
       const modelResponse = toModelResponse(this.provider.id, request, payload, { strategy: 'http_full_replay' });
       this.rememberFullHttpRequest(request, false, payload);
       return modelResponse;
@@ -293,9 +297,10 @@ class OpenAICodexProviderSession implements ModelProviderSession {
   }
 
   private async *streamHttp(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
-    for await (const event of this.provider.streamHttp(request)) {
+    let payload: OpenAICodexResponsesPayload | undefined;
+    for await (const event of this.provider.streamHttp(request, (value) => { payload = value; })) {
       if (event.type === 'done') {
-        this.rememberFullHttpRequest(request, true, event.response.raw as OpenAICodexResponsesPayload | undefined);
+        this.rememberFullHttpRequest(request, true, payload);
         yield event;
         continue;
       }
@@ -326,7 +331,7 @@ class OpenAICodexProviderSession implements ModelProviderSession {
     const customAccumulators = new Map<string, StreamingCustomToolCallAccumulator>();
 
     for await (const part of streamEvents) {
-      const eventType = part.type ?? '';
+      const eventType = part.type;
       if (eventType === 'response.failed' || eventType === 'error') {
         const failure = summarizeCodexFailure(part);
         const causeSummary = {
@@ -420,7 +425,7 @@ class OpenAICodexProviderSession implements ModelProviderSession {
       ...(reasoningSummary && !responsePayload.reasoningSummary ? { reasoningSummary } : {}),
       ...(responseToolCalls.length > 0 ? { toolCalls: responseToolCalls } : {})
     });
-    this.rememberPreparedRequest(fullRequest, recoveredResponse.raw as OpenAICodexResponsesPayload | undefined);
+    this.rememberPreparedRequest(fullRequest, completedResponse);
     yield {
       type: 'done',
       response: recoveredResponse

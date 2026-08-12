@@ -162,6 +162,40 @@ test('OpenAICodexProvider summarizes failed stream events without error bodies',
   );
 });
 
+test('OpenAICodexProvider treats generic HTTP error events as terminal provider failures', async () => {
+  const provider = new OpenAICodexProvider({
+    auth: bearerProvider(codexJwt()),
+    fetch: async () => sseResponse([{ type: 'error', error: { message: 'backend rejected the stream', code: 'backend_error' } }])
+  });
+  await assert.rejects(
+    async () => { for await (const _event of provider.stream({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hi' }] })) { /* consume */ } },
+    error => error instanceof ModelProviderError && error.code === 'provider_unavailable' && error.diagnostic.eventType === 'error'
+  );
+});
+
+test('OpenAICodexProvider bounds post-header stream idleness', async () => {
+  const provider = new OpenAICodexProvider({
+    auth: bearerProvider(codexJwt()),
+    statusIntervalMs: 2,
+    streamIdleTimeoutMs: 12,
+    fetch: async () => stalledSseResponse()
+  });
+  const statuses = [];
+  await assert.rejects(
+    async () => { for await (const event of provider.stream({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hi' }] })) if (event.type === 'status') statuses.push(event); },
+    error => error instanceof ModelProviderError && error.code === 'provider_unavailable' && /idle/iu.test(error.message)
+  );
+  assert.equal(statuses.some((event) => /stream data/iu.test(event.message)), true);
+});
+
+test('OpenAICodexProvider rejects malformed nested Responses fields', async () => {
+  const provider = new OpenAICodexProvider({ auth: bearerProvider(codexJwt()), fetch: async () => jsonResponse({ id: 'bad', model: 'gpt-5.6', status: 'completed', output_text: 'x', usage: { input_tokens: 'one' } }) });
+  await assert.rejects(
+    () => provider.complete({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hi' }] }),
+    error => error instanceof ModelProviderError && error.code === 'malformed_response' && /input_tokens/u.test(error.message)
+  );
+});
+
 test('OpenAICodexProvider labels HTTP request failures as http_sse transport', async () => {
   const provider = new OpenAICodexProvider({
     auth: bearerProvider(codexJwt()),
@@ -1376,4 +1410,9 @@ function sseResponse(chunks) {
   return new Response(body, {
     headers: { 'content-type': 'text/event-stream' }
   });
+}
+
+function stalledSseResponse() {
+  const encoder = new TextEncoder();
+  return new Response(new ReadableStream({ start(controller) { controller.enqueue(encoder.encode(': CONNECTED\n\n')); } }), { headers: { 'content-type': 'text/event-stream' } });
 }

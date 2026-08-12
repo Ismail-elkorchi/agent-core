@@ -1,7 +1,7 @@
 import { type BearerTokenProvider } from '@agent-core/auth';
 import { normalizeJsonSafe } from '@agent-core/json';
 import { ModelProviderError, type ModelRequest, type ModelStreamEvent, type ModelToolCall } from '@agent-core/model';
-import { readBoundedResponseText, readJsonSseEvents, waitForResponseOrStatus } from '@agent-core/provider-openai-responses';
+import { decodeResponsesStreamData, readBoundedResponseText, readJsonSseEvents, waitForResponseOrStatus } from '@agent-core/provider-openai-responses';
 
 import { CONTENT_TYPE_JSON } from './constants.js';
 import {
@@ -36,6 +36,8 @@ export interface CodexHttpTransportConfig {
   tokenProvider: BearerTokenProvider;
   originator: string;
   statusIntervalMs: number;
+  streamIdleTimeoutMs: number;
+  onResponsePayload?: (payload: OpenAICodexResponsesPayload) => void;
 }
 
 export async function fetchCodexResponse(config: CodexHttpTransportConfig, request: ModelRequest, stream: boolean): Promise<Response> {
@@ -90,18 +92,22 @@ export async function* streamCodexHttp(config: CodexHttpTransportConfig, request
     const accumulators = new Map<string, StreamingFunctionCallAccumulator>();
     const customAccumulators = new Map<string, StreamingCustomToolCallAccumulator>();
 
-    for await (const event of readSseEvents(response.body, config.providerId)) {
+    for await (const event of readSseEvents(response.body, config, request.signal)) {
       if (event.type === 'comment') {
         yield { type: 'status', message: `OpenAI Codex stream status: ${event.comment}`, raw: event };
+        continue;
+      }
+      if (event.type === 'status') {
+        yield { type: 'status', message: `Waiting for OpenAI Codex stream data (${String(Math.max(1, Math.round(event.idleMs / 1_000)))}s).` };
         continue;
       }
       if (event.data === '[DONE]') {
         break;
       }
       const part = event.data;
-      const eventType = part.type ?? '';
+      const eventType = part.type;
 
-      if (eventType === 'response.failed') {
+      if (eventType === 'response.failed' || eventType === 'error') {
         const failure = summarizeCodexFailure(part);
         throw new ModelProviderError({
           provider: config.providerId,
@@ -164,6 +170,7 @@ export async function* streamCodexHttp(config: CodexHttpTransportConfig, request
       }
     }
 
+    if (completedResponse) config.onResponsePayload?.(completedResponse);
     const responsePayload = completedResponse
       ? toModelResponse(config.providerId, request, completedResponse, { strategy: 'http_full_replay' })
       : fallbackStreamResponse(config.providerId, request, content, reasoning, reasoningSummary, toolCalls, { strategy: 'http_full_replay' });
@@ -218,8 +225,13 @@ async function throwIfBadResponse(config: CodexHttpTransportConfig, response: Re
   });
 }
 
-function readSseEvents(body: ReadableStream<Uint8Array>, provider: string): AsyncIterable<OpenAICodexSseEvent> {
+function readSseEvents(body: ReadableStream<Uint8Array>, config: CodexHttpTransportConfig, signal: AbortSignal | undefined): AsyncIterable<OpenAICodexSseEvent> {
   return readJsonSseEvents(body, {
-    createMalformedError: (message, cause) => new ModelProviderError({ provider, code: 'malformed_response', message: `OpenAI Codex ${message}`, cause })
+    ...(signal ? { signal } : {}),
+    statusIntervalMs: config.statusIntervalMs,
+    idleTimeoutMs: config.streamIdleTimeoutMs,
+    decodeData: (value) => decodeResponsesStreamData(value, 'OpenAI Codex stream event'),
+    createMalformedError: (message, cause) => new ModelProviderError({ provider: config.providerId, code: 'malformed_response', message: `OpenAI Codex ${message}`, cause }),
+    createIdleError: (idleMs) => new ModelProviderError({ provider: config.providerId, code: 'provider_unavailable', message: `OpenAI Codex stream was idle for ${String(idleMs)}ms.`, retryable: true, diagnostic: { transport: 'http_sse', causeSummary: { idleMs } } })
   });
 }
