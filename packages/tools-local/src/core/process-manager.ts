@@ -118,6 +118,7 @@ interface ManagedProcess {
   progressDroppedEvents: number;
   progressDeliveryErrors: number;
   terminalReported: boolean;
+  terminalStatus?: Exclude<ManagedProcessStatus, 'running' | 'exited'>;
   readonly observed: { stdout: number; stderr: number };
   exitCode?: number | null;
   signal?: NodeJS.Signals | null;
@@ -216,7 +217,7 @@ export class ProcessManager {
     tree.child.stdout.on('data', (value: Buffer | string) => { this.decodeAndAppend(record, 'stdout', value); });
     tree.child.stderr.on('data', (value: Buffer | string) => { this.decodeAndAppend(record, 'stderr', value); });
     tree.child.once('error', (error) => {
-      record.status = 'failed';
+      record.terminalStatus = 'failed';
       record.diagnostic = error.message;
       this.signalActivity(record);
     });
@@ -249,7 +250,7 @@ export class ProcessManager {
     if (record.status === 'running') {
       record.timeout = setTimeout(() => {
         if (record.status !== 'running') return;
-        record.status = 'timed_out';
+        record.terminalStatus = 'timed_out';
         record.tree.stop();
         this.signalActivity(record);
       }, Math.min(request.timeoutMs, this.limits.maxProcessLifetimeMs));
@@ -322,7 +323,7 @@ export class ProcessManager {
     this.assertOwner(record, requester);
     if (record.status === 'running') {
       this.enqueueProgress(record, { type: 'status', stage: 'process_stopping', message: `Stopping process ${processId}.` });
-      record.status = 'stopped';
+      record.terminalStatus = 'stopped';
       record.tree.stop();
     }
     await record.tree.settle();
@@ -411,7 +412,7 @@ export class ProcessManager {
   private handleClose(record: ManagedProcess, exitCode: number | null, signal: NodeJS.Signals | null): void {
     delete record.pendingClose;
     this.flushDecoders(record);
-    if (record.status === 'running') record.status = exitCode === null ? 'failed' : 'exited';
+    if (record.status === 'running') record.status = record.terminalStatus ?? (exitCode === null ? 'failed' : 'exited');
     record.exitCode = exitCode;
     record.signal = signal;
     this.enqueueProgress(record, terminalProgress(record));
@@ -496,6 +497,7 @@ export class ProcessManager {
   }
 
   private async finishOnce(record: ManagedProcess): Promise<void> {
+    if (record.status === 'running') record.status = record.terminalStatus ?? 'failed';
     if (!record.progressClosed) {
       this.enqueueProgress(record, terminalProgress(record));
       record.progressClosed = true;
