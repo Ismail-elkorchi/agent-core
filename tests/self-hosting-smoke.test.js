@@ -79,11 +79,14 @@ test('scripted self-hosting run survives approvals, structured tools, verificati
     result = await new AgentRuntime(options).resolveApproval({ runId: result.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' });
     if (result.state === 'ended') break;
   }
-  assert.equal(result.terminal.executionStatus, 'completed');
-  assert.equal(result.terminal.verificationStatus, 'passed');
-  assert.equal(await readFile(path.join(root, 'note.txt'), 'utf8'), 'beta\n');
   const ledger = [];
   for await (const envelope of events.read(result.terminal.runId)) ledger.push(envelope.event);
+  const failedObservations = ledger.filter((event) =>
+    (event.type === 'tool.ended' && !event.observation.ok)
+    || (event.type === 'check.ended' && event.result.verdict !== 'passed'));
+  assert.equal(result.terminal.executionStatus, 'completed', failureDiagnostic(result.terminal, failedObservations));
+  assert.equal(result.terminal.verificationStatus, 'passed');
+  assert.equal(await readFile(path.join(root, 'note.txt'), 'utf8'), 'beta\n');
   assert.equal(ledger.filter((event) => event.type === 'run.ended').length, 1);
   assert.deepEqual(ledger.filter((event) => event.type === 'tool.ended').map((event) => event.toolName), tools.map((tool) => tool.name));
 });
@@ -106,3 +109,6 @@ class ScriptedProvider {
 
 function call(id, name, value) { return { id, type: 'function', name, input: { kind: 'json', value } }; }
 function response(terminationReason, content, extra = {}) { return { content, model: 'scripted', provider: 'scripted', terminationReason, ...extra }; }
+function failureDiagnostic(terminal, failedObservations) {
+  return `Self-hosting run failed.\nTerminal:\n${JSON.stringify(terminal, null, 2)}\nFailed observations:\n${JSON.stringify(failedObservations, null, 2)}`;
+}
