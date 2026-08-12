@@ -110,10 +110,10 @@ function jsonArray(value: JsonValue | undefined): value is readonly JsonValue[] 
 function oversizedEvidenceStub(record: EvidenceRecord, originalBytes: number, maxBytes: number): JsonObject {
   let id = record.id;
   let toolName = record.toolName;
-  const build = (): JsonObject => parseJsonObject({ id, action: record.action, outcome: record.outcome, toolName, originalBytes, truncated: true });
+  const build = (): JsonObject => Object.freeze({ id, action: record.action, outcome: record.outcome, toolName, originalBytes, truncated: true });
   let stub = build();
   if (jsonBytes(stub) <= maxBytes) return stub;
-  const fixed = jsonBytes(parseJsonObject({ id: '', action: record.action, outcome: record.outcome, toolName: '', originalBytes, truncated: true }));
+  const fixed = jsonBytes(Object.freeze({ id: '', action: record.action, outcome: record.outcome, toolName: '', originalBytes, truncated: true }));
   if (fixed > maxBytes) throw new Error(`Evidence maxBytes ${String(maxBytes)} is too small for an oversized-item identity stub.`);
   const available = maxBytes - fixed;
   id = takeUtf8(id, Math.floor(available / 2));

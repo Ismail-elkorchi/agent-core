@@ -7,7 +7,7 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { ObservationStore } from '@agent-core/runtime';
-import { defineTool } from '@agent-core/tools';
+import { defineTool, parseToolObservation } from '@agent-core/tools';
 
 const tool = defineTool({
   name: 'large_observation', implementationId: 'tests/large-observation@1', description: 'large observation',
@@ -104,7 +104,10 @@ test('observation projection invokes domain presenters independently for immedia
 
 async function commitAndProject(store, input) {
   const { modelInputModalities, ...commitInput } = input;
-  const committed = await store.commitToolObservation(commitInput);
+  const committed = await store.commitToolObservation({
+    ...commitInput,
+    observation: parseToolObservation(commitInput.tool, commitInput.observation)
+  });
   return store.projectToolObservation(committed, modelInputModalities);
 }
 

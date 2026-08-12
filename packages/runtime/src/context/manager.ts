@@ -69,8 +69,8 @@ export interface PromptToolSummary {
 }
 
 export interface PromptOutputContract {
-  kind: 'text';
-  description: string;
+  readonly kind: 'text';
+  readonly description: string;
 }
 
 export interface PromptEvidenceProjection {
@@ -82,10 +82,10 @@ export interface PromptEvidenceProjection {
 }
 
 export interface PromptEvidenceOmissionSummary {
-  toolName: string;
-  action: EvidenceRecord['action'];
-  outcome: EvidenceRecord['outcome'];
-  count: number;
+  readonly toolName: string;
+  readonly action: EvidenceRecord['action'];
+  readonly outcome: EvidenceRecord['outcome'];
+  readonly count: number;
 }
 
 export interface PromptProjection {
@@ -93,7 +93,7 @@ export interface PromptProjection {
   readonly task: string;
   readonly instructions: readonly PromptInstructionBlock[];
   readonly notes: readonly string[];
-  context: readonly ContextItem[];
+  readonly context: readonly ContextItem[];
   readonly tools: readonly PromptToolSummary[];
   readonly continuity: readonly string[];
   readonly evidence?: PromptEvidenceProjection;
@@ -128,14 +128,14 @@ export const DEFAULT_CONTEXT_IMAGE_LIMITS: ContextImageLimits = Object.freeze({
 });
 
 export interface ContextHistoryPressureReduction {
-  reductions: ContextHistoryReduction[];
-  projectedTokens: number;
+  readonly reductions: readonly ContextHistoryReduction[];
+  readonly projectedTokens: number;
 }
 
 export interface ContextProjectionEstimate {
-  contextHistoryTokens: number;
-  contextTokens: number;
-  evidenceTokens: number;
+  readonly contextHistoryTokens: number;
+  readonly contextTokens: number;
+  readonly evidenceTokens: number;
 }
 
 export interface ContextProjectionRequest {
@@ -158,30 +158,30 @@ export interface ContextProjectionRequest {
 }
 
 export interface ContextHistoryReduction {
-  itemId: string;
-  kind: 'tool_result_reduced' | 'checkpoint_installed' | 'image_content_removed';
-  beforeBytes: number;
-  afterBytes: number;
-  toolName?: string;
-  removedItems?: number;
-  removedImageBytes?: number;
-  removedImageTokens?: number;
-  reason?: 'unsupported_modality' | 'image_count_limit' | 'image_byte_limit' | 'image_token_limit';
+  readonly itemId: string;
+  readonly kind: 'tool_result_reduced' | 'checkpoint_installed' | 'image_content_removed';
+  readonly beforeBytes: number;
+  readonly afterBytes: number;
+  readonly toolName?: string;
+  readonly removedItems?: number;
+  readonly removedImageBytes?: number;
+  readonly removedImageTokens?: number;
+  readonly reason?: 'unsupported_modality' | 'image_count_limit' | 'image_byte_limit' | 'image_token_limit';
 }
 
-export type ContextHistoryItem =
+type ContextHistoryItem =
   | ContextAssistantToolCallItem
   | ContextToolResultItem
   | ContextCheckpointItem;
 
-export interface ContextAssistantToolCallItem {
+interface ContextAssistantToolCallItem {
   kind: 'assistant_tool_call';
   id: string;
   turnIndex: number;
   message: ModelMessage;
 }
 
-export interface ContextToolResultItem {
+interface ContextToolResultItem {
   kind: 'tool_result';
   id: string;
   turnIndex: number;
@@ -194,7 +194,7 @@ export interface ContextToolResultItem {
   useRetained: boolean;
 }
 
-export interface ContextCheckpointItem {
+interface ContextCheckpointItem {
   kind: 'checkpoint';
   id: string;
   message: ModelMessage;
@@ -226,10 +226,10 @@ export interface RecordCheckpointInput {
 }
 
 export interface ContextManagerSnapshot {
-  activeItems: number;
-  compactedToolResults: number;
-  checkpoints: number;
-  evidenceRecords: number;
+  readonly activeItems: number;
+  readonly compactedToolResults: number;
+  readonly checkpoints: number;
+  readonly evidenceRecords: number;
 }
 
 export class ContextManager {
@@ -253,11 +253,11 @@ export class ContextManager {
       kind: 'assistant_tool_call',
       id: `hist_${randomUUID()}`,
       turnIndex: input.turnIndex,
-      message: {
+      message: Object.freeze({
         role: 'assistant',
         content: input.content,
         toolCalls: Object.freeze(input.toolCalls.map(snapshotModelToolCall))
-      }
+      })
     });
   }
 
@@ -321,15 +321,15 @@ export class ContextManager {
   }): ContextHistoryPressureReduction {
     let projection = this.projectHistory(input.modelProfile);
     if (projection.estimatedTokens <= input.maxHistoryTokens) {
-      return { reductions: [], projectedTokens: projection.estimatedTokens };
+      return Object.freeze({ reductions: Object.freeze([]), projectedTokens: projection.estimatedTokens });
     }
 
-    const reductions = this.reduceOlderLargeToolResults({
+    const reductions = [...this.reduceOlderLargeToolResults({
       keepLatestToolResults: input.keepLatestToolResults ?? 2
-    });
+    })];
     projection = this.projectHistory(input.modelProfile);
     if (projection.estimatedTokens <= input.maxHistoryTokens) {
-      return { reductions, projectedTokens: projection.estimatedTokens };
+      return Object.freeze({ reductions: Object.freeze(reductions), projectedTokens: projection.estimatedTokens });
     }
 
     reductions.push(...this.reduceOlderLargeToolResults({
@@ -337,7 +337,7 @@ export class ContextManager {
       includeLatest: true
     }));
     projection = this.projectHistory(input.modelProfile);
-    return { reductions, projectedTokens: projection.estimatedTokens };
+    return Object.freeze({ reductions: Object.freeze(reductions), projectedTokens: projection.estimatedTokens });
   }
 
   project(request: ContextProjectionRequest): ContextProjection {
@@ -439,7 +439,7 @@ export class ContextManager {
     return selectContextItems(candidates, input.maxTokens, input.maxItems ?? 24, omitted);
   }
 
-  reduceOlderLargeToolResults(options: { keepLatestToolResults: number; includeLatest?: boolean }): ContextHistoryReduction[] {
+  reduceOlderLargeToolResults(options: { keepLatestToolResults: number; includeLatest?: boolean }): readonly ContextHistoryReduction[] {
     const toolItems = this.historyItems.filter((item): item is ContextToolResultItem => item.kind === 'tool_result');
     const keepLatest = Math.max(0, options.keepLatestToolResults);
     const latestKeepStart = Math.max(0, toolItems.length - keepLatest);
@@ -459,16 +459,16 @@ export class ContextManager {
         continue;
       }
       item.useRetained = true;
-      reductions.push({
+      reductions.push(createContextHistoryReduction({
         itemId: item.id,
         kind: 'tool_result_reduced',
         beforeBytes,
         afterBytes,
         toolName: item.toolName
-      });
+      }));
     }
     this.projectionReductions.push(...reductions);
-    return reductions;
+    return Object.freeze(reductions);
   }
 
   installCheckpoint(): ContextHistoryReduction | undefined {
@@ -508,13 +508,13 @@ export class ContextManager {
       removedItems
     };
     this.historyItems.splice(0, this.historyItems.length, item);
-    const reduction: ContextHistoryReduction = {
+    const reduction = createContextHistoryReduction({
       itemId: item.id,
       kind: 'checkpoint_installed',
       beforeBytes,
       afterBytes: messageBytes(message),
       removedItems
-    };
+    });
     this.projectionReductions.push(reduction);
     return reduction;
   }
@@ -558,7 +558,7 @@ export class ContextManager {
     });
   }
 
-  private consumeProjectionReductions(): ContextHistoryReduction[] {
+  private consumeProjectionReductions(): readonly ContextHistoryReduction[] {
     return this.projectionReductions.splice(0);
   }
 }
@@ -593,12 +593,12 @@ function compactEvidenceScope(scope: NonNullable<EvidenceRecord['scope']>): NonN
 }
 
 function fitOmittedSummary(
-  records: EvidenceRecord[],
+  records: readonly EvidenceRecord[],
   maxTokens: number,
   estimator: TokenEstimator
-): { summary: PromptEvidenceOmissionSummary[]; tokens: number } {
+): { readonly summary: readonly PromptEvidenceOmissionSummary[]; readonly tokens: number } {
   if (records.length === 0 || maxTokens <= 0) {
-    return { summary: [], tokens: 0 };
+    return Object.freeze({ summary: Object.freeze([]), tokens: 0 });
   }
   const selected: PromptEvidenceOmissionSummary[] = [];
   let tokens = 0;
@@ -611,11 +611,11 @@ function fitOmittedSummary(
     selected.push(item);
     tokens = estimate;
   }
-  return { summary: selected, tokens };
+  return Object.freeze({ summary: Object.freeze(selected), tokens });
 }
 
-function summarizeOmittedEvidence(records: EvidenceRecord[]): PromptEvidenceOmissionSummary[] {
-  const groups = new Map<string, PromptEvidenceOmissionSummary>();
+function summarizeOmittedEvidence(records: readonly EvidenceRecord[]): readonly PromptEvidenceOmissionSummary[] {
+  const groups = new Map<string, { toolName: string; action: EvidenceRecord['action']; outcome: EvidenceRecord['outcome']; count: number }>();
   for (const record of records) {
     const key = [record.toolName, record.action, record.outcome].join('\0');
     const existing = groups.get(key);
@@ -630,7 +630,7 @@ function summarizeOmittedEvidence(records: EvidenceRecord[]): PromptEvidenceOmis
       count: 1
     });
   }
-  return [...groups.values()].sort((left, right) => {
+  return Object.freeze([...groups.values()].sort((left, right) => {
     if (right.count !== left.count) {
       return right.count - left.count;
     }
@@ -641,7 +641,7 @@ function summarizeOmittedEvidence(records: EvidenceRecord[]): PromptEvidenceOmis
       return left.action.localeCompare(right.action);
     }
     return left.outcome.localeCompare(right.outcome);
-  });
+  }).map((item) => Object.freeze({ ...item })));
 }
 
 function checkpointHistorySummary(items: readonly ContextHistoryItem[], maxItems: number): string[] {
@@ -813,7 +813,8 @@ function projectImagesForProfile(
 
   const reductions: ContextHistoryReduction[] = [];
   const messages = entries.map((entry, messageIndex) => {
-    const sourceImages = entry.message.images ?? [];
+    if (entry.message.role !== 'user' && entry.message.role !== 'tool') return entry.message;
+    const { images: sourceImages = [], ...messageWithoutImages } = entry.message;
     if (sourceImages.length === 0) return entry.message;
     const retained: ModelImage[] = [];
     const removed: { readonly image: ModelImage; readonly artifact?: PublicArtifactRef; readonly bytes: number; readonly tokens: number; readonly reason: NonNullable<ContextHistoryReduction['reason']> }[] = [];
@@ -836,13 +837,12 @@ function projectImagesForProfile(
     const metadata = removed.map((item) => item.artifact
       ? `- ${item.image.mediaType}, ${String(item.bytes)} bytes, public artifact ${item.artifact.artifactId} (${item.artifact.sha256}, ${String(item.artifact.size)} bytes).`
       : `- ${item.image.mediaType}, ${String(item.bytes)} bytes; its public artifact metadata remains in the tool-result presentation.`).join('\n');
-    const projected = {
-      ...entry.message,
+    const projected: ModelMessage = Object.freeze({
+      ...messageWithoutImages,
       content: `${entry.message.content}\n[${String(removed.length)} image attachment${removed.length === 1 ? '' : 's'} omitted from active model context]\n${metadata}`,
-      ...(retained.length > 0 ? { images: retained } : { images: undefined })
-    } as ModelMessage;
-    if (retained.length === 0) delete (projected as { images?: ModelImage[] }).images;
-    reductions.push({
+      ...(retained.length > 0 ? { images: Object.freeze(retained) } : {})
+    });
+    reductions.push(createContextHistoryReduction({
       itemId: entry.itemId,
       kind: 'image_content_removed',
       beforeBytes: Buffer.byteLength(entry.message.content, 'utf8') + sourceImages.reduce((total, image) => total + imageByteLength(image), 0),
@@ -852,7 +852,7 @@ function projectImagesForProfile(
       removedImageBytes: removed.reduce((total, item) => total + item.bytes, 0),
       removedImageTokens: removed.reduce((total, item) => total + item.tokens, 0),
       reason: firstRemoved.reason
-    });
+    }));
     return projected;
   });
   return { messages, reductions };
@@ -908,13 +908,13 @@ function normalizeToolProtocolMessages(messages: ModelMessage[]): ModelMessage[]
     if (retainedCalls.length === message.toolCalls.length) {
       return message;
     }
-    return {
+    return Object.freeze({
       ...message,
-      toolCalls: retainedCalls,
+      toolCalls: Object.freeze(retainedCalls),
       content: retainedCalls.length > 0
         ? message.content
         : `${message.content}\n[tool calls removed from active history because their paired outputs were not retained]`.trim()
-    };
+    });
   });
 }
 
@@ -923,6 +923,10 @@ function sameToolCall(left: ModelToolCall, right: ModelToolCall): boolean {
     return left.id === right.id;
   }
   return left.name === right.name && left.type === right.type;
+}
+
+function createContextHistoryReduction(value: ContextHistoryReduction): ContextHistoryReduction {
+  return Object.freeze(value);
 }
 
 function toolResultMessage(input: RecordToolResultInput, _detail: 'immediate' | 'retained'): ModelMessage {

@@ -74,7 +74,7 @@ test('repositories encode on append and decode once on read', async () => {
   const contextEvidence = readFileSync(path.join(root, 'packages/runtime/src/orchestration/context-evidence.ts'), 'utf8');
   assert.doesNotMatch(contextEvidence, /parseJsonValue\(record\)/u);
   const observationStore = readFileSync(path.join(root, 'packages/runtime/src/orchestration/observation-store.ts'), 'utf8');
-  assert.doesNotMatch(observationStore, /normalizeToolObservationForPersistence|parseJsonValue\(canonical/u);
+  assert.doesNotMatch(observationStore, /normalizeToolObservationForPersistence|parseJsonValue\(canonical|parseToolObservation/u);
   const toolContracts = readFileSync(path.join(root, 'packages/tools/src/core/definition.ts'), 'utf8');
   assert.doesNotMatch(toolContracts, /interface ToolObservationBase\s*\{[^}]*metadata\?:\s*Record<string, unknown>/u);
   assert.doesNotMatch(toolContracts, /interface \w+ToolFailureOutput[^\{]*\{[^}]*details\?:\s*Record<string, unknown>/u);

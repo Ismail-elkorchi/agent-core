@@ -88,11 +88,37 @@ test('context compaction keeps image tool protocol and public references while d
   recordImageResult(manager, 1, [{ type: 'bytes', data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }]);
   const reductions = manager.reduceOlderLargeToolResults({ keepLatestToolResults: 0, includeLatest: true });
   assert.equal(reductions.length, 1);
+  assert.ok(Object.isFrozen(reductions));
+  assert.ok(Object.isFrozen(reductions[0]));
   const projection = manager.projectHistory(imageProfile);
   assert.equal(projection.messages.length, 2);
   assert.equal(projection.messages[0].toolCalls[0].id, projection.messages[1].toolCallId);
   assert.equal(projection.messages[1].images, undefined);
   assert.match(projection.messages[1].content, /artifact-1-0/u);
+});
+
+test('returned context reductions cannot mutate pending manager state', () => {
+  const manager = new ContextManager();
+  manager.recordToolResult({
+    turnIndex: 1, toolName: 'exec_command', toolCallType: 'function',
+    immediateContent: JSON.stringify({ output: 'x'.repeat(2_000) }), retainedContent: JSON.stringify({ output: 'retained' })
+  });
+  const reductions = manager.reduceOlderLargeToolResults({ keepLatestToolResults: 0, includeLatest: true });
+  const reduction = reductions[0];
+  assert.ok(reduction);
+  const expected = { ...reduction };
+  assert.throws(() => { reduction.afterBytes = 0; }, TypeError);
+  assert.throws(() => reductions.push(reduction), TypeError);
+  const projection = manager.project({
+    task: 'continue', instructions: [], notes: [], contextItems: [], tools: [], modelTools: [], modelProfile,
+    requestWindow: { contextWindowTokens: 20_000, maxPromptTokens: 16_000, maxOutputTokens: 4_000 }
+  });
+  assert.deepEqual(projection.reductions[0], expected);
+  assert.ok(Object.isFrozen(projection.reductions[0]));
+  const checkpoint = manager.installCheckpoint();
+  assert.ok(checkpoint);
+  assert.ok(Object.isFrozen(checkpoint));
+  assert.throws(() => { checkpoint.removedItems = 0; }, TypeError);
 });
 
 test('ContextManager ranks and budgets already-materialized evidence only', () => {

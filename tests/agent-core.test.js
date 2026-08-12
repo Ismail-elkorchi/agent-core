@@ -20,7 +20,7 @@ import {
   decodeAgentTerminalSnapshot
 } from '@agent-core/runtime';
 import { InMemorySessionRepository } from '@agent-core/runtime';
-import { adoptToolDefinition } from '@agent-core/tools';
+import { adoptToolDefinition, parseToolObservation } from '@agent-core/tools';
 
 const capabilities = {
   streaming: false,
@@ -863,7 +863,7 @@ test('per-call recovery retries idempotent starts and only projects completed ob
   const completedSuspension = await completedRun.agent.run({ task: 'completed recovery' });
   const completedApproval = completedSuspension.pendingApprovals[0];
   const completedIdentity = { turnIndex: completedApproval.turnIndex, turnId: completedApproval.turnId, requestAttempt: completedApproval.requestAttempt, toolBatchId: completedApproval.toolBatchId, callIndex: completedApproval.callIndex, callId: completedApproval.callId, toolAttempt: 1 };
-  const completedObservation = { kind: 'result', ok: true, output: { already: true }, summary: 'already completed', scope: { resources: ['state/idempotent'], coverage: 'complete' } };
+  const completedObservation = parseToolObservation(completedTool, { kind: 'result', ok: true, output: { already: true }, summary: 'already completed', scope: { resources: ['state/idempotent'], coverage: 'complete' } });
   await completedRun.events.append(completedSuspension.runId, { type: 'tool.started', ...completedIdentity, toolName: completedTool.name, input: persistedCall, fingerprint: completedApproval.fingerprint, effects }, { idempotencyKey: toolStageKey(completedSuspension.runId, completedIdentity, 'started') });
   await completedRun.events.append(completedSuspension.runId, { type: 'tool.ended', ...completedIdentity, toolName: completedTool.name, observation: completedObservation }, { idempotencyKey: toolStageKey(completedSuspension.runId, completedIdentity, 'ended') });
   const completedResult = ended(await completedRun.agent.resolveApproval({ runId: completedSuspension.runId, approvalId: completedApproval.approvalId, fingerprint: completedApproval.fingerprint, decision: 'allow' }));  assert.equal(completedResult.executionStatus, 'completed');

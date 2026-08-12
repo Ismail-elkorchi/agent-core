@@ -84,16 +84,22 @@ try {
     "import type { JsonObject } from '@agent-core/json';",
     "import type { ModelProviderState } from '@agent-core/model';",
     "import type { AgentCandidate, AgentTerminalSnapshot } from '@agent-core/runtime';",
-    "import type { ToolEffects } from '@agent-core/tools';",
+    "import type { ToolEffects, ToolObservation, ToolObservationInput } from '@agent-core/tools';",
     "import type { AgentTuiAppRunOptions, AgentTuiRuntimeDetails } from '@agent-core/tui';",
     "const json: JsonObject = { nested: { ok: true }, values: [1, 'two'] };",
     "const providerState: ModelProviderState = { provider: 'test', model: 'test-model', kind: 'response', data: { responseId: 'resp', nested: { count: 1 } } };",
     "const candidate: AgentCandidate = { status: 'complete', message: 'done', source: 'content', turnIndex: 1 };",
     "const effects: ToolEffects = { accesses: [{ mode: 'read', scope: 'workspace' }], lockScopes: [], idempotency: 'pure' };",
+    "const rawObservation: ToolObservationInput<{ value: string }> = { kind: 'result', ok: true, summary: 'raw', scope: { resources: [], coverage: 'complete' }, output: { value: 'raw' } };",
+    "// @ts-expect-error raw extension output is not an owned observation",
+    "const ownedObservation: ToolObservation = rawObservation;",
+    "declare const immutableObservation: ToolObservation;",
+    "// @ts-expect-error owned observation fields are readonly",
+    "immutableObservation.output = {};",
     "const tuiDetails: AgentTuiRuntimeDetails = { modelId: 'test-model', permissions: { workspaceWrites: 'denied', shell: 'denied' } };",
     "const tuiOptions: AgentTuiAppRunOptions = { runtimeDetails: tuiDetails, exitOnCompletion: true };",
     "declare const terminal: AgentTerminalSnapshot;",
-    "void [json, providerState, candidate, effects, terminal, tuiOptions];"
+    "void [json, providerState, candidate, effects, rawObservation, ownedObservation, immutableObservation, terminal, tuiOptions];"
   ].join('\n'));
   for (const exactOptionalPropertyTypes of [true, false]) {
     const config = `tsconfig-${String(exactOptionalPropertyTypes)}.json`;

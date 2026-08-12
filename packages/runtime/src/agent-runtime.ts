@@ -837,7 +837,7 @@ export class AgentRuntime {
         return { ok: true, request: modelRequest, estimate, snapshot: finalRequestSnapshot };
       }
       await append({ type: 'overflow.recovery.started', ...identity, attempt, estimate, snapshot: request.snapshot.budgetAccountant.snapshot() });
-      let latestReductions: ContextHistoryReduction[] = [];
+      let latestReductions: readonly ContextHistoryReduction[] = [];
       let recoveryResult: OverflowRecoveryResult | undefined;
       while (recoveryResult === undefined && nextRecoveryStage < OVERFLOW_RECOVERY_STAGES.length) {
         const recoveryStage: OverflowRecoveryStage | undefined = OVERFLOW_RECOVERY_STAGES[nextRecoveryStage];

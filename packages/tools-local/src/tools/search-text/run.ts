@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { requireWorkspaceRoot, workspaceFileScope, type ToolExecutionContext, type ToolObservation } from '@agent-core/tools';
+import { requireWorkspaceRoot, workspaceFileScope, type ToolExecutionContext, type ToolObservationInput } from '@agent-core/tools';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
 import { builtInReadEvidence } from '../../core/read-evidence.js';
 import type { SearchTextInput, SearchTextOutput } from './schema.js';
@@ -26,7 +26,7 @@ interface SearchAggregate {
   outputTruncated: boolean;
 }
 
-export async function searchText(input: SearchTextInput, context: ToolExecutionContext): Promise<ToolObservation<SearchTextOutput>> {
+export async function searchText(input: SearchTextInput, context: ToolExecutionContext): Promise<ToolObservationInput<SearchTextOutput>> {
   const root = requireWorkspaceRoot(context);
   const limits = requireLocalToolConfiguration(context).searchText;
   const resultLimit = clampRequestedLimit(input.resultLimit, limits.maxResults);

@@ -2,12 +2,12 @@ import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
 import { workspaceResource, type ToolEvidenceItem } from '@agent-core/evidence';
-import { requireWorkspaceRoot, throwIfAborted, workspaceFileScope, type ToolExecutionContext, type ToolObservation } from '@agent-core/tools';
+import { requireWorkspaceRoot, throwIfAborted, workspaceFileScope, type ToolExecutionContext, type ToolObservationInput } from '@agent-core/tools';
 import { assertRealPathInsideRoot, relativePath, resolveInsideRoot } from '../../core/filesystem.js';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
 import type { ReadFileFailure, ReadFileResult, ReadFilesInput, ReadFilesOutput } from './schema.js';
 
-export async function readFiles(input: ReadFilesInput, context: ToolExecutionContext): Promise<ToolObservation<ReadFilesOutput>> {
+export async function readFiles(input: ReadFilesInput, context: ToolExecutionContext): Promise<ToolObservationInput<ReadFilesOutput>> {
   const root = requireWorkspaceRoot(context);
   const limits = requireLocalToolConfiguration(context).readFiles;
   const files: ReadFileResult[] = [];

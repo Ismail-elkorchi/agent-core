@@ -32,7 +32,7 @@ import {
   type AgentTurnIdentity,
   type AgentTurnSnapshotRecord
 } from './run/contracts.js';
-import { decodeOwnedToolCall, decodeOwnedToolEffects, decodeOwnedToolObservationForPersistence, decodeOwnedToolPolicy, type ToolCall, type ToolEffects, type ToolObservation, type ToolObservationPresentation, type ToolPolicy, type ToolProgress } from '@agent-core/tools';
+import { decodeOwnedToolCall, decodeOwnedToolEffects, decodeOwnedToolObservationForPersistence, decodeOwnedToolPolicy, encodeToolObservation, type ToolCall, type ToolEffects, type ToolObservation, type ToolObservationPresentation, type ToolPolicy, type ToolProgress } from '@agent-core/tools';
 import type { BudgetAccountantSnapshot, RequestCostEstimate } from './orchestration/budget-accountant.js';
 import type { OverflowRecoveryResult } from './orchestration/overflow-recovery.js';
 
@@ -199,9 +199,12 @@ const AGENT_EVENT_MAX_COLLECTION_ENTRIES = 20_000;
 
 
 export function encodeAgentEvent(value: AgentEvent): JsonObject {
-  return ownEventJson(value.type === 'observation.record.created'
+  const encoded = value.type === 'observation.record.created'
     ? { ...value, evidence: Object.freeze(value.evidence.map(encodeEvidenceRecord)) }
-    : value);
+    : value.type === 'tool.ended'
+      ? { ...value, observation: encodeToolObservation(value.observation) }
+      : value;
+  return ownEventJson(encoded);
 }
 
 export function decodeAgentEvent(value: unknown): AgentEvent {

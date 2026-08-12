@@ -2,7 +2,7 @@ import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { workspaceResource, type EvidenceAction, type ToolEvidenceItem } from '@agent-core/evidence';
 import { PATCH_JOURNAL_SCOPE, requireToolService, requireWorkspaceRoot, throwIfAborted, ToolInputError, workspaceFileScope, type ToolExecutionContext } from '@agent-core/tools';
-import type { ToolObservation } from '@agent-core/tools';
+import type { ToolObservationInput } from '@agent-core/tools';
 import {
   byteLengthUtf8,
   inspectTextFile,
@@ -47,7 +47,7 @@ interface PreparedPatchOperation {
   changedPaths: string[];
 }
 
-export async function applyPatch(input: CanonicalApplyPatchInput, context: ToolExecutionContext): Promise<ToolObservation<ApplyPatchOutput>> {
+export async function applyPatch(input: CanonicalApplyPatchInput, context: ToolExecutionContext): Promise<ToolObservationInput<ApplyPatchOutput>> {
   throwIfAborted(context.signal);
   const rootDir = requireWorkspaceRoot(context);
   const dryRun = input.dryRun;
@@ -56,7 +56,7 @@ export async function applyPatch(input: CanonicalApplyPatchInput, context: ToolE
   return applyPatchWithAuthority(input, context);
 }
 
-export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, context: ToolExecutionContext, authority?: TextPatchJournalAuthority): Promise<ToolObservation<ApplyPatchOutput>> {
+export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, context: ToolExecutionContext, authority?: TextPatchJournalAuthority): Promise<ToolObservationInput<ApplyPatchOutput>> {
   const rootDir = requireWorkspaceRoot(context);
   const dryRun = input.dryRun;
   await context.emitProgress?.({ type: 'status', stage: 'patch_preparing', message: 'Preparing patch transaction.', completed: 0, total: input.tree.operations.length });

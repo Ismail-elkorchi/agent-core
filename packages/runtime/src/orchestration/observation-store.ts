@@ -10,7 +10,6 @@ import {
 import { parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import { SimpleTokenEstimator, type ModelImage, type TokenEstimator } from '@agent-core/model';
 import {
-  parseToolObservation,
   decodeOwnedToolObservationForPersistence,
   encodeToolFailureOutput,
   encodeToolObservation,
@@ -59,8 +58,6 @@ export interface CommittedToolObservation {
 }
 
 const MAX_DURABLE_OBSERVATION_BYTES = 256 * 1024;
-const MAX_CANONICAL_OBSERVATION_BYTES = 8 * 1024 * 1024;
-const CANONICAL_JSON_LIMITS = { maxDepth: 32, maxCollectionEntries: 50_000, maxStringBytes: 4_000_000, maxTotalBytes: MAX_CANONICAL_OBSERVATION_BYTES };
 
 export class ObservationStore {
   private readonly records = new Map<string, ToolObservationRecord>();
@@ -86,7 +83,7 @@ export class ObservationStore {
     readonly tool: ToolDefinition | undefined;
     readonly observation: ToolObservation;
   }): Promise<CommittedToolObservation> {
-    const canonical = parseToolObservation(input.tool, input.observation);
+    const canonical = input.observation;
     const redactedDurable = await transformToolObservationForDurability(canonical);
     const durableJson = serializeObservation(redactedDurable);
     const needsCanonicalArtifact = byteLength(durableJson) > MAX_DURABLE_OBSERVATION_BYTES
@@ -207,24 +204,25 @@ function boundedDurableObservation(observation: ToolObservation, artifact: Publi
 }
 
 function boundedFailureOutput(output: import('@agent-core/tools').ToolFailureOutput, artifact: ArtifactRef | undefined, originalBytes: number): JsonValue {
-  const storage = artifact ? { artifact: { ...artifact }, originalBytes } : { originalBytes };
+  const encoded = encodeToolFailureOutput(output);
+  const storage: JsonObject = Object.freeze(artifact ? { artifact: Object.freeze({ ...artifact }), originalBytes } : { originalBytes });
   const common = { blocked: true as const, reason: output.reason, recovery: output.recovery };
-  if (output.reason === 'unknown_tool') return parseJsonValue({ ...common, toolCall: output.toolCall });
-  if (output.reason === 'policy') return parseJsonValue({ ...common, ...(output.tool ? { tool: output.tool } : {}), ...(output.policyReason ? { policyReason: output.policyReason } : {}), details: storage });
-  if (output.reason === 'invalid_arguments') { const issues = boundedFailureField(output.issues); return parseJsonValue({ ...common, ...(issues ? { issues } : {}), details: storage }); }
-  if (output.reason === 'invalid_output') return parseJsonValue({
+  if (output.reason === 'unknown_tool') return encoded;
+  if (output.reason === 'policy') return Object.freeze({ ...common, ...(output.tool ? { tool: output.tool } : {}), ...(output.policyReason ? { policyReason: output.policyReason } : {}), details: storage });
+  if (output.reason === 'invalid_arguments') { const issues = boundedFailureField(encoded.issues); return Object.freeze({ ...common, ...(issues ? { issues } : {}), details: storage }); }
+  if (output.reason === 'invalid_output') return Object.freeze({
     ...common,
-    issues: boundedFailureField(output.issues) ?? { issues: [{ path: [], code: 'details_stored_as_artifact', message: 'Full validation issues are in the canonical observation artifact.' }] },
+    issues: boundedFailureField(encoded.issues) ?? Object.freeze({ issues: Object.freeze([Object.freeze({ path: Object.freeze([]), code: 'details_stored_as_artifact', message: 'Full validation issues are in the canonical observation artifact.' })]) }),
     details: storage
   });
-  if (output.reason === 'missing_service') { const serviceDetails = boundedFailureField(output.details); return parseJsonValue({ ...common, service: output.service, details: { ...storage, ...(serviceDetails ? { serviceDetails } : {}) } }); }
-  return parseJsonValue({ ...common, error: output.error, details: storage });
+  if (output.reason === 'missing_service') { const serviceDetails = boundedFailureField(encoded.details); return Object.freeze({ ...common, service: output.service, details: Object.freeze({ ...storage, ...(serviceDetails ? { serviceDetails } : {}) }) }); }
+  return Object.freeze({ ...common, error: output.error, details: storage });
 }
 
-function boundedFailureField(value: unknown): JsonValue | undefined {
+function boundedFailureField(value: JsonValue | undefined): JsonValue | undefined {
   if (value === undefined) return undefined;
   const serialized = JSON.stringify(value);
-  return byteLength(serialized) <= 16_384 ? parseJsonValue(value, CANONICAL_JSON_LIMITS) : undefined;
+  return byteLength(serialized) <= 16_384 ? value : undefined;
 }
 
 /** Generic result-content projection. It is intentionally independent of tool names. */

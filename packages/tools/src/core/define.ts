@@ -1,7 +1,7 @@
 import * as z from 'zod';
 import { parseJsonObject, parseJsonValue, type JsonValue } from '@agent-core/json';
 import type { ToolExecutionContext, ToolPreparationContext } from './context.js';
-import type { ToolDefinition, ToolInput, ToolObservation, ToolPromptGuide, ToolRequirements, ToolTextInputDefinition } from './definition.js';
+import type { ToolDefinition, ToolInput, ToolObservationInput, ToolPromptGuide, ToolRequirements, ToolTextInputDefinition } from './definition.js';
 import type { ToolObservationPresentation, ToolObservationPresentationRequest } from './observation-presentation.js';
 import type { ToolPolicy } from './policy.js';
 import { invalidArgumentsObservation, invalidToolInputObservation } from './observation.js';
@@ -24,7 +24,7 @@ export interface DefineToolOptions<Schema extends z.ZodType, TCanonicalInput, TO
   snapshotInput?: (input: TCanonicalInput) => JsonValue;
   deriveEffects: (input: TCanonicalInput, context: ToolPreparationContext) => ToolEffects | Promise<ToolEffects>;
   isAvailable?: (policy: ToolPolicy) => boolean;
-  invoke: (input: TCanonicalInput, context: ToolExecutionContext) => Promise<ToolObservation<TOutput>>;
+  invoke: (input: TCanonicalInput, context: ToolExecutionContext) => Promise<ToolObservationInput<TOutput>>;
   presentObservation?: (request: ToolObservationPresentationRequest<TCanonicalInput, TOutput>) => ToolObservationPresentation;
 }
 

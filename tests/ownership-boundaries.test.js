@@ -5,7 +5,7 @@ import { canonicalJsonString, hashJson, InMemoryEventRepository, typedEventCodec
 import { normalizeJsonSafe } from '@agent-core/json';
 import { createModelRequest, parseModelRequest, parseModelResponse } from '@agent-core/model';
 import { agentEventCodec, decodeAgentEvent, encodeAgentEvent } from '@agent-core/runtime';
-import { adoptToolDefinition, createToolCall, defineTool, invalidToolInputObservation, parseToolObservation, prepareToolCall, ToolRegistry } from '@agent-core/tools';
+import { adoptToolDefinition, createToolCall, defineTool, invalidOutputObservation, invalidToolInputObservation, parseToolObservation, prepareToolCall, ToolRegistry } from '@agent-core/tools';
 
 test('normalized JSON is already recursively owned', () => {
   const nested = { values: [{ count: 1 }] };
@@ -28,16 +28,17 @@ test('event decoding rejects accessors without invoking them', () => {
 
 test('agent event append, idempotency, hashing, and read share one owned value', async () => {
   const repository = new InMemoryEventRepository(agentEventCodec);
-  const observation = { kind: 'result', ok: true, summary: 'done', scope: { resources: [], coverage: 'complete' }, output: { nested: { count: 1 } } };
+  const observationInput = { kind: 'result', ok: true, summary: 'done', scope: { resources: [], coverage: 'complete' }, output: { nested: { count: 1 } } };
+  const observation = parseToolObservation({ outputSchema: z.strictObject({ nested: z.strictObject({ count: z.number() }) }) }, observationInput);
   const original = { type: 'tool.ended', turnIndex: 1, turnId: 'turn', requestAttempt: 1, toolBatchId: 'batch', callIndex: 0, callId: 'call', toolAttempt: 1, toolName: 'tool', observation };
   const encoded = encodeAgentEvent(original);
   const appended = await repository.append('run-1', original, { timestamp: '2026-01-01T00:00:00.000Z', idempotencyKey: 'same' });
-  observation.output.nested.count = 2;
+  observationInput.output.nested.count = 2;
   assert.ok(Object.isFrozen(appended));
   assert.equal('event' in appended, false);
   const { hash, ...receipt } = appended;
   assert.equal(hash, hashJson({ ...receipt, event: encoded }));
-  const duplicate = await repository.append('run-1', { ...original, observation: { ...observation, output: { nested: { count: 1 } } } }, { timestamp: '2026-01-01T00:00:00.000Z', idempotencyKey: 'same' });
+  const duplicate = await repository.append('run-1', original, { timestamp: '2026-01-01T00:00:00.000Z', idempotencyKey: 'same' });
   assert.deepEqual(duplicate, appended);
   const [read] = await Array.fromAsync(repository.read('run-1'));
   assert.equal(read.event.observation.output.nested.count, 1);
@@ -57,6 +58,19 @@ test('built-in failure constructors own unknown details without a second parse',
     kind: 'failure', ok: false, summary: 'blocked', scope: { resources: [], coverage: 'partial' },
     output: { blocked: true, reason: 'policy', recovery: 'retry', toolCall: { malformed: true } }
   }), /unsupported fields/u);
+});
+
+test('plain errors produce deeply immutable invalid-output observations', () => {
+  const observation = invalidOutputObservation('example', new Error('invalid output'));
+  assert.ok(Object.isFrozen(observation));
+  assert.ok(Object.isFrozen(observation.output));
+  assert.ok(Object.isFrozen(observation.output.issues));
+  assert.ok(Object.isFrozen(observation.output.issues.issues));
+  assert.ok(Object.isFrozen(observation.output.issues.issues[0]));
+  assert.ok(Object.isFrozen(observation.output.issues.issues[0].path));
+  assert.throws(() => observation.output.issues.issues.push({ path: [], code: 'changed', message: 'changed' }), TypeError);
+  assert.throws(() => { observation.output.issues.issues[0].message = 'changed'; }, TypeError);
+  assert.throws(() => observation.output.issues.issues[0].path.push('changed'), TypeError);
 });
 
 test('authored tools retain identity and dynamic tools cross an explicit adopter', () => {
