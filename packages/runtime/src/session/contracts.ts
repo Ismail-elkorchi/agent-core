@@ -122,6 +122,7 @@ export interface SessionSummary {
   readonly id: string;
   readonly workspaceRoot: string;
   readonly timestamp: string;
+  readonly updatedAt: string;
   readonly provider?: string;
   readonly model?: string;
 }

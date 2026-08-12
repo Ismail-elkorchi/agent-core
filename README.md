@@ -33,21 +33,31 @@ npm run verify:release
 ## CLI
 
 ```bash
-# Read-only local task
+# Start an interactive TUI session
+npx agent-core --provider ollama --model llama3.1
+
+# Start the TUI and immediately run a task
 npx agent-core "summarize this workspace" --provider ollama --model llama3.1
+
+# Run once without a TUI
+npx agent-core exec "summarize this workspace" --provider ollama --model llama3.1
 
 # Use committed workspace configuration
 OPENAI_API_KEY=... npx agent-core \
   "fix the failing test and run the required checks" \
-  --root . --config agent-core.config.json
+  --root . --config agent-core.config.json --apply --allow-shell
 
 # Resolve a persisted approval after restart
 npx agent-core approval allow RUN_ID APPROVAL_ID FINGERPRINT \
-  --root . --config agent-core.config.json
+  --root . --config agent-core.config.json --allow-shell
 ```
 
-Interactive plain and TUI modes present approval details and explicit Allow/Deny choices. Noninteractive suspension exits with code `7` and prints the persisted identity.
+`agent-core` is the interactive TUI entry point. `agent-core exec <task|->` is the noninteractive entry point and accepts a task argument or stdin. The TUI resolves approvals directly; `agent-core approval` resolves an exact persisted fingerprint after the original process exits.
 
-Terminal output preserves the independent result axes. Exit codes are `0` success, `1` execution failure, `2` partial/indeterminate candidate, `3` failed required verification, `4` inconclusive verification, `7` suspension, and `130` abort.
+New sessions are the default. `--resume` selects the most recently active session in the workspace, while `--session <id>` opens an existing session. A resumed session retains its latest provider and model unless an explicit CLI option overrides them.
+
+Explicit CLI options override resumed-session settings, committed configuration, environment values, and built-in defaults in that order. Project authorization can restrict invocation authority but cannot grant it: `--apply` or `--dry-run` is required for structured writes, and `--allow-shell` is required for ambient execution and configured command checks.
+
+Noninteractive output preserves the independent result axes. Exit codes are `0` success, `1` execution failure, `2` partial/indeterminate candidate, `3` failed required verification, `4` inconclusive verification, `7` suspension, and `130` abort.
 
 `.agent-core` contains runtime state and is never source configuration. See [Architecture](docs/ARCHITECTURE.md), [Usage](docs/USAGE.md), and [Provider contracts](docs/PROVIDERS.md).

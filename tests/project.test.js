@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, realpath, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { createConfiguredCliToolPolicy, describeWorkspace, loadAgentCoreConfiguration, loadWorkspace, parseAgentCoreConfiguration } from '@agent-core/cli';
+import { describeWorkspace, loadAgentCoreConfiguration, loadWorkspace, parseAgentCoreConfiguration } from '@agent-core/cli';
 
 test('loadWorkspace canonicalizes symlink roots', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'agent-core-workspace-'));
@@ -34,8 +34,7 @@ test('workspace configuration validates first-party policy, checks, and exact li
     tools: { enabled: ['read_files'] },
     authorization: { allowedRisks: ['read', 'write'], requireApprovalFor: ['write'] },
     verification: { required: [{ id: 'test', command: 'npm test', timeoutMs: 1_000 }], advisory: [] },
-    limits: { modelTurns: 3, knownCost: { amount: 10, currency: 'USD' } },
-    session: { mode: 'latest' }
+    limits: { modelTurns: 3, knownCost: { amount: 10, currency: 'USD' } }
   };
   await writeFile(path.join(dir, 'agent-core.config.json'), JSON.stringify(configuration));
   assert.deepEqual(await loadAgentCoreConfiguration(dir), configuration);
@@ -47,7 +46,6 @@ test('workspace configuration validates first-party policy, checks, and exact li
   assert.equal(snapshot.verification.required[0].command, 'npm test');
   assert.deepEqual(snapshot.authorization.allowedRisks, ['read', 'write']);
   assert.equal(Object.isFrozen(snapshot.verification.required[0]), true);
-  assert.deepEqual(createConfiguredCliToolPolicy(snapshot, true), { allowedRisks: ['read', 'write'], dryRunWrites: true });
   configuration.instructions[0].path = 'AGENTS.md';
   configuration.verification.required[0].command = 'npm test';
   configuration.authorization.allowedRisks[0] = 'read';

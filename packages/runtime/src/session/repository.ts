@@ -46,9 +46,9 @@ export class InMemorySessionRepository implements SessionRepository {
 
   list(workspaceRoot?: string): Promise<readonly SessionSummary[]> {
     return this.serial(() => Object.freeze([...this.states.values()].filter((state) => workspaceRoot === undefined || state.header.workspaceRoot === workspaceRoot).map((state) => Object.freeze({
-      id: state.header.id, workspaceRoot: state.header.workspaceRoot, timestamp: state.header.timestamp,
+      id: state.header.id, workspaceRoot: state.header.workspaceRoot, timestamp: state.header.timestamp, updatedAt: sessionUpdatedAt(state),
       ...(state.header.provider ? { provider: state.header.provider } : {}), ...(state.header.model ? { model: state.header.model } : {})
-    })).sort((left, right) => right.timestamp.localeCompare(left.timestamp))));
+    })).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))));
   }
 
   loadReplayState(sessionId: string, leafId?: string | null): Promise<SessionReplayState> {
@@ -130,6 +130,11 @@ export class InMemorySessionRepository implements SessionRepository {
   }
   private require(sessionId: string): SessionState { const state = this.states.get(sessionId); if (!state) throw new Error(`Unknown session: ${sessionId}`); return state; }
   private serial<T>(operation: () => T | PromiseLike<T>): Promise<T> { const result = this.queue.then(operation); this.queue = result.then(() => undefined, () => undefined); return result; }
+}
+
+function sessionUpdatedAt(state: SessionState): string {
+  return [...state.branchEntries, ...state.projections, ...state.contextProjections]
+    .reduce((latest, entry) => entry.timestamp > latest ? entry.timestamp : latest, state.header.timestamp);
 }
 
 interface SessionState { readonly header: SessionHeader; readonly branchEntries: SessionBranchEntry[]; readonly projections: SessionFinalProjection[]; readonly contextProjections: SessionContextProjection[] }

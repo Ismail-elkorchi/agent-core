@@ -9,6 +9,15 @@ test('CLI exposes explicit risk policy', () => {
   assert.deepEqual(createCliToolPolicy({ apply: true, dryRun: false, allowShell: true, allowUnsafeShell: false }).allowedRisks, ['read', 'write', 'destructive', 'execute']);
   assert.deepEqual(createCliToolPolicy({ apply: true, dryRun: false, allowShell: false, allowUnsafeShell: false }).allowedRisks, ['read', 'write', 'destructive'], 'patch writes do not grant shell execution');
   assert.deepEqual(createCliToolPolicy({ apply: false, dryRun: false, allowShell: true, allowUnsafeShell: false }).allowedRisks, ['read', 'execute'], 'shell execution does not grant apply_patch writes');
+  assert.deepEqual(createCliToolPolicy({ apply: false, dryRun: true, allowShell: false }).allowedRisks, ['read', 'write', 'destructive'], 'dry-run authorizes write validation without mutation');
+});
+
+test('CLI rejects retired presentation flags', async () => {
+  for (const flag of ['--tui', '--plain']) {
+    const output = await run(path.resolve('packages/cli/dist/index.js'), [flag]);
+    assert.equal(output.code, 1);
+    assert.match(output.stderr, /Unknown option/u);
+  }
 });
 
 test('CLI exit codes distinguish success, candidate completeness, verification, failure, and abort', () => {

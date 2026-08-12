@@ -17,6 +17,26 @@ const artifacts = new LocalArtifactRepository({ rootDir: '.agent-core/artifacts'
 
 Repository interfaces do not expose filesystem paths. Applications can substitute the in-memory implementations.
 
+## CLI
+
+```bash
+# Interactive TUI, optionally with an initial task
+agent-core
+agent-core "inspect the failing checks"
+
+# Noninteractive task or piped input
+agent-core exec "summarize the workspace"
+printf '%s\n' 'summarize the workspace' | agent-core exec -
+
+# Resume the most recently active session or open an existing ID
+agent-core --resume
+agent-core --session SESSION_ID
+```
+
+Session selection is not part of committed configuration. A resumed session restores its latest provider and model unless explicitly overridden. Resolution order is explicit CLI options, resumed-session settings, committed configuration, environment values, then built-in defaults.
+
+Configured authorization restricts rather than grants invocation authority. Use `--apply` for structured mutation, `--dry-run` to validate structured writes without mutation, and `--allow-shell` for ambient execution. Configured command checks require `--allow-shell` and project `execute` authorization.
+
 ## Approvals
 
 Input is parsed and canonicalized before authorization. When a call requires approval, `run()` returns a durable suspension:
@@ -39,7 +59,7 @@ Changed input, effects, implementation, policy, or execution boundary invalidate
 The CLI supports the same persisted operation after process restart:
 
 ```bash
-agent-core approval allow RUN_ID APPROVAL_ID FINGERPRINT --root . --config agent-core.config.json
+agent-core approval allow RUN_ID APPROVAL_ID FINGERPRINT --root . --config agent-core.config.json --allow-shell
 ```
 
 ## Checks

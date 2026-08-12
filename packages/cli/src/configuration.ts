@@ -5,6 +5,7 @@ import { parseJsonObject } from '@agent-core/json';
 
 export interface AgentCoreInstructionConfiguration { readonly path: string }
 export interface AgentCoreCheckConfiguration { readonly id: string; readonly command: string; readonly timeoutMs?: number; readonly maxOutputBytes?: number }
+export type AgentCoreProviderId = 'ollama' | 'openrouter' | 'openai' | 'openai-codex';
 export interface AgentCoreLimitConfiguration {
   readonly maxConcurrentToolCalls?: number;
   readonly modelTurns?: number;
@@ -23,7 +24,7 @@ export interface AgentCoreLimitConfiguration {
 }
 export interface AgentCoreConfiguration {
   readonly version: 1;
-  readonly provider: 'ollama' | 'openrouter' | 'openai' | 'openai-codex';
+  readonly provider: AgentCoreProviderId;
   readonly model: string;
   readonly reasoning?: ModelReasoningRequest;
   readonly instructions: readonly AgentCoreInstructionConfiguration[];
@@ -31,7 +32,6 @@ export interface AgentCoreConfiguration {
   readonly authorization: { readonly allowedRisks: readonly ('read' | 'write' | 'execute' | 'network' | 'destructive')[]; readonly requireApprovalFor: readonly ('read' | 'write' | 'execute' | 'network' | 'destructive')[] };
   readonly verification: { readonly required: readonly AgentCoreCheckConfiguration[]; readonly advisory: readonly AgentCoreCheckConfiguration[] };
   readonly limits?: AgentCoreLimitConfiguration;
-  readonly session: { readonly mode: 'new' | 'latest'; readonly id?: string };
 }
 
 export async function loadAgentCoreConfiguration(rootDir: string, configPath = 'agent-core.config.json'): Promise<AgentCoreConfiguration> {
@@ -47,8 +47,8 @@ export async function loadAgentCoreConfiguration(rootDir: string, configPath = '
 export function parseAgentCoreConfiguration(input: unknown): AgentCoreConfiguration {
   const value = parseJsonObject(input, { maxDepth: 16, maxCollectionEntries: 10_000, maxStringBytes: 1_000_000, maxTotalBytes: 4_000_000 });
   if (value.version !== 1) throw new Error('Agent Core configuration must be a version 1 object.');
-  if (Object.keys(value).some((key) => !['version', 'provider', 'model', 'reasoning', 'instructions', 'tools', 'authorization', 'verification', 'limits', 'session'].includes(key))) throw new Error('Agent Core configuration contains unknown fields.');
-  if (!isProvider(value.provider) || typeof value.model !== 'string' || value.model.length === 0) throw new Error('Configuration provider/model is invalid.');
+  if (Object.keys(value).some((key) => !['version', 'provider', 'model', 'reasoning', 'instructions', 'tools', 'authorization', 'verification', 'limits'].includes(key))) throw new Error('Agent Core configuration contains unknown fields.');
+  if (!isAgentCoreProviderId(value.provider) || typeof value.model !== 'string' || value.model.length === 0) throw new Error('Configuration provider/model is invalid.');
   if (!instructionArray(value.instructions)) throw new Error('Workspace instructions must contain confined relative paths.');
   if (!isRecord(value.tools) || Object.keys(value.tools).some((key) => key !== 'enabled') || !stringArray(value.tools.enabled)) throw new Error('Project tool configuration is invalid.');
   const authorization = value.authorization;
@@ -58,8 +58,6 @@ export function parseAgentCoreConfiguration(input: unknown): AgentCoreConfigurat
   if (!approvalRisks.every((risk) => allowedRisks.includes(risk))) throw new Error('Approval risks must also be present in authorization.allowedRisks.');
   const verification = value.verification;
   if (!isRecord(verification) || Object.keys(verification).some((key) => key !== 'required' && key !== 'advisory') || !checkArray(verification.required) || !checkArray(verification.advisory)) throw new Error('Verification configuration is invalid.');
-  const session = value.session;
-  if (!sessionConfiguration(session)) throw new Error('Session configuration is invalid.');
   const reasoning = value.reasoning === undefined ? undefined : parseModelReasoningRequest(value.reasoning);
   const limits = value.limits;
   let ownedLimits: AgentCoreLimitConfiguration | undefined;
@@ -78,8 +76,7 @@ export function parseAgentCoreConfiguration(input: unknown): AgentCoreConfigurat
     tools: Object.freeze({ enabled: Object.freeze(value.tools.enabled.map((tool) => tool)) }),
     authorization: Object.freeze({ allowedRisks: Object.freeze(allowedRisks.map((risk) => risk)), requireApprovalFor: Object.freeze(approvalRisks.map((risk) => risk)) }),
     verification: Object.freeze({ required: Object.freeze(verification.required.map(snapshotCheck)), advisory: Object.freeze(verification.advisory.map(snapshotCheck)) }),
-    ...(ownedLimits === undefined ? {} : { limits: Object.freeze({ ...ownedLimits }) }),
-    session: Object.freeze({ ...session })
+    ...(ownedLimits === undefined ? {} : { limits: Object.freeze({ ...ownedLimits }) })
   });
 }
 
@@ -87,10 +84,9 @@ function snapshotCheck(check: AgentCoreCheckConfiguration): AgentCoreCheckConfig
   return Object.freeze({ id: check.id, command: check.command, ...(check.timeoutMs === undefined ? {} : { timeoutMs: check.timeoutMs }), ...(check.maxOutputBytes === undefined ? {} : { maxOutputBytes: check.maxOutputBytes }) });
 }
 
-function isProvider(value: unknown): value is AgentCoreConfiguration['provider'] { return value === 'ollama' || value === 'openrouter' || value === 'openai' || value === 'openai-codex'; }
+export function isAgentCoreProviderId(value: unknown): value is AgentCoreProviderId { return value === 'ollama' || value === 'openrouter' || value === 'openai' || value === 'openai-codex'; }
 function instructionArray(value: unknown): value is readonly AgentCoreInstructionConfiguration[] { return Array.isArray(value) && value.every(item => isRecord(item) && Object.keys(item).every((key) => key === 'path') && relativePath(item.path)); }
 function checkArray(value: unknown): value is readonly AgentCoreCheckConfiguration[] { return Array.isArray(value) && value.every(item => isRecord(item) && Object.keys(item).every((key) => ['id', 'command', 'timeoutMs', 'maxOutputBytes'].includes(key)) && typeof item.id === 'string' && item.id.length > 0 && typeof item.command === 'string' && item.command.length > 0 && optionalPositive(item.timeoutMs) && optionalPositive(item.maxOutputBytes)); }
-function sessionConfiguration(value: unknown): value is AgentCoreConfiguration['session'] { return isRecord(value) && Object.keys(value).every((key) => key === 'mode' || key === 'id') && (value.mode === 'new' || value.mode === 'latest') && (value.id === undefined || (typeof value.id === 'string' && value.id.trim().length > 0)); }
 function optionalPositive(value: unknown): boolean { return value === undefined || (typeof value === 'number' && Number.isInteger(value) && value > 0); }
 function validLimits(value: unknown): value is AgentCoreLimitConfiguration {
   if (!isRecord(value)) return false;

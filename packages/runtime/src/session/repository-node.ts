@@ -108,15 +108,16 @@ export class JsonlSessionRepository implements SessionRepository {
     for (const name of names.sort()) {
       const id = /^session-(.+)\.jsonl$/u.exec(name)?.[1];
       if (!id) continue;
-      const session = await this.open(id);
+      const state = await this.enqueue(id, () => this.refreshIndex(id, false));
+      const session = sessionFromState(state);
       if (wanted && session.header.workspaceRoot !== wanted) continue;
       summaries.push(Object.freeze({
-        id, workspaceRoot: session.header.workspaceRoot, timestamp: session.header.timestamp,
+        id, workspaceRoot: session.header.workspaceRoot, timestamp: session.header.timestamp, updatedAt: sessionUpdatedAt(state),
         ...(session.header.provider ? { provider: session.header.provider } : {}),
         ...(session.header.model ? { model: session.header.model } : {})
       }));
     }
-    return Object.freeze(summaries.sort((left, right) => right.timestamp.localeCompare(left.timestamp)));
+    return Object.freeze(summaries.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)));
   }
 
   async loadReplayState(sessionId: string, leafId?: string | null): Promise<SessionReplayState> {
@@ -308,6 +309,10 @@ export class JsonlSessionRepository implements SessionRepository {
 
 interface SessionFileState { readonly header: SessionHeader; readonly branchEntries: SessionBranchEntry[]; readonly projections: SessionFinalProjection[]; readonly contextProjections: SessionContextProjection[] }
 interface SessionAppendIndex extends SessionFileState { completeBytes: number; boundaryMarker: string; storageStamp: JsonlStorageStamp }
+function sessionUpdatedAt(state: SessionFileState): string {
+  return [...state.branchEntries, ...state.projections, ...state.contextProjections]
+    .reduce((latest, entry) => entry.timestamp > latest ? entry.timestamp : latest, state.header.timestamp);
+}
 function sessionRecordCount(state: SessionFileState): number { return state.branchEntries.length + state.projections.length + state.contextProjections.length; }
 
 async function readSessionFile(filePath: string, sessionId: string): Promise<{ readonly state: SessionFileState; readonly completeBytes: number }> {

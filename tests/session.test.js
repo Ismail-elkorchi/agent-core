@@ -218,3 +218,14 @@ function completedTerminal(runId, finalizationId, message) {
     }
   };
 }
+test('session listing orders sessions by latest committed activity', async () => {
+  const repository = new InMemorySessionRepository();
+  const first = await repository.create({ id: 'first', workspaceRoot: '/workspace' });
+  await new Promise(resolve => setTimeout(resolve, 2));
+  await repository.create({ id: 'second', workspaceRoot: '/workspace' });
+  await new Promise(resolve => setTimeout(resolve, 2));
+  await repository.appendInput(first.id, { runId: 'run', task: 'recent activity' });
+  const sessions = await repository.list('/workspace');
+  assert.equal(sessions[0].id, first.id);
+  assert.ok(sessions[0].updatedAt >= sessions[0].timestamp);
+});

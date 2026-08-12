@@ -1,15 +1,14 @@
 #!/usr/bin/env node
 import { realpathSync, promises as fs } from 'node:fs';
 import path from 'node:path';
-import { createInterface } from 'node:readline/promises';
-import type { Readable, Writable } from 'node:stream';
+import type { Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { FileCredentialStore } from '@agent-core/auth';
-import { AgentRuntime, agentEventCodec, type AgentApprovalSuspension, type AgentEvent, type AgentInstruction, type AgentProgressEvent, type AgentRunResult } from '@agent-core/runtime';
+import { AgentRuntime, agentEventCodec, type AgentEvent, type AgentInstruction, type AgentProgressEvent, type AgentRunResult } from '@agent-core/runtime';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 import { JsonlEventRepository } from '@agent-core/evidence/node';
 import { type ModelProvider, type ModelReasoningEffort, type ModelReasoningRequest, SimpleTokenEstimator } from '@agent-core/model';
-import { loadAgentCoreConfiguration, type AgentCoreCheckConfiguration, type AgentCoreConfiguration } from './configuration.js';
+import { isAgentCoreProviderId, loadAgentCoreConfiguration, type AgentCoreCheckConfiguration, type AgentCoreConfiguration, type AgentCoreProviderId } from './configuration.js';
 import { loadWorkspace, type WorkspaceLayout } from './workspace.js';
 import { OllamaProvider } from '@agent-core/provider-ollama';
 import { OpenAICodexProvider, loginOpenAICodexDeviceCode } from '@agent-core/provider-openai-codex';
@@ -31,11 +30,9 @@ import {
 } from '@agent-core/tools-local';
 import {
   AgentTuiProgressRenderer,
-  executeInteractiveCommand,
   normalizeTaskInput,
   parseReasoningEffort,
   runAgentTuiApp,
-  runAgentTuiTask,
   type AgentTuiRuntimeDetails
 } from '@agent-core/tui';
 import { parseJsonValue } from '@agent-core/json';
@@ -44,16 +41,22 @@ export {
   loadAgentCoreConfiguration,
   parseAgentCoreConfiguration,
   type AgentCoreCheckConfiguration,
-  type AgentCoreConfiguration
+  type AgentCoreConfiguration,
+  type AgentCoreProviderId
 } from './configuration.js';
 export { describeWorkspace, loadWorkspace, type WorkspaceLayout } from './workspace.js';
 
-type CliProviderId = 'ollama' | 'openrouter' | 'openai' | 'openai-codex';
+type CliProviderId = AgentCoreProviderId;
 type CliAuthProviderId = 'openai' | 'openai-codex';
+
+type SessionSelection =
+  | { readonly kind: 'new' }
+  | { readonly kind: 'latest' }
+  | { readonly kind: 'existing'; readonly id: string };
 
 interface CliOptions {
   root: string;
-  provider: CliProviderId;
+  provider?: CliProviderId;
   model?: string;
   providerEndpoint?: string;
   maxOutputTokens?: number;
@@ -61,10 +64,7 @@ interface CliOptions {
   dryRun: boolean;
   allowShell: boolean;
   showReasoning: boolean;
-  tui: boolean;
-  plain: boolean;
-  resume: boolean;
-  session?: string;
+  sessionSelection: SessionSelection;
   branch?: string;
   temperature?: number;
   reasoning?: ModelReasoningRequest;
@@ -89,12 +89,32 @@ interface CliProviderRuntime {
   model: string;
 }
 
+interface ResolvedRuntimeSettings {
+  readonly provider: CliProviderId;
+  readonly model: string;
+  readonly providerEndpoint?: string;
+  readonly temperature?: number;
+  readonly reasoning?: ModelReasoningRequest;
+}
+
+interface PersistedModelSettings {
+  readonly provider?: string;
+  readonly model?: string;
+  readonly temperature?: number;
+  readonly reasoningEffort?: string;
+}
+
+interface EffectiveCliAuthority {
+  readonly toolPolicy: ToolPolicy;
+  readonly verificationCommands: 'disabled' | 'ambient';
+  readonly permissions: NonNullable<AgentTuiRuntimeDetails['permissions']>;
+}
+
 interface CliRuntime {
   agent: AgentRuntime;
   events: JsonlEventRepository<AgentEvent>;
   sessions: JsonlSessionRepository;
   session: AgentSession;
-  progress: CliProgressSink;
   tuiDetails: AgentTuiRuntimeDetails;
   localHost: LocalToolHost;
 }
@@ -113,70 +133,81 @@ export async function main(argv: string[]): Promise<void> {
     return;
   }
 
-  const parsed = parseOptions(argv);
-  const task = normalizeTaskInput(parsed.positionals.join(' '));
+  const exec = argv[0] === 'exec';
+  if (exec && argv.length === 2 && (argv[1] === 'help' || argv[1] === '--help' || argv[1] === '-h')) {
+    printHelp();
+    return;
+  }
+  const parsed = parseOptions(exec ? argv.slice(1) : argv);
+  let task = normalizeTaskInput(parsed.positionals.join(' '));
   const root = path.resolve(parsed.options.root);
   const workspace = await loadWorkspace(root);
-  const options = parsed.options.config
-    ? applyConfiguration(parsed.options, await loadAgentCoreConfiguration(workspace.workspaceRoot, parsed.options.config))
-    : parsed.options;
+  const configuration = parsed.options.config
+    ? await loadAgentCoreConfiguration(workspace.workspaceRoot, parsed.options.config)
+    : undefined;
+  const options: CliOptions = { ...parsed.options, ...(configuration ? { configuration } : {}) };
 
-  if (task) {
-    if (options.tui) {
-      const progress = new AgentTuiProgressRenderer();
-      const runtime = await createRuntime(options, workspace, progress);
-      const result = await runAgentTuiTask(runtime.agent, task, progress, {
-        runtimeDetails: runtime.tuiDetails
-      });
+  if (exec) {
+    if (task === '-' || (task.length === 0 && !process.stdin.isTTY)) task = normalizeTaskInput(await readStandardInput());
+    if (task.length === 0) throw new Error('agent-core exec requires a task string or piped stdin.');
+    const progress = new CliProgressRenderer({ showReasoning: options.showReasoning });
+    await withCliRuntime(options, workspace, progress, async (runtime) => {
+      const result = await runtime.agent.run({ task });
+      printResult(result, progress);
       printPersistenceLocations(runtime, result);
       process.exitCode = resultExitCode(result);
-      await runtime.localHost.close();
-      return;
-    }
-    const progress = new CliProgressRenderer({ showReasoning: options.showReasoning });
-    const runtime = await createRuntime(options, workspace, progress);
-    const result = await runtime.agent.run({ task });
-    printResult(result, progress);
-    printPersistenceLocations(runtime, result);
-    process.exitCode = resultExitCode(result);
-    await runtime.localHost.close();
+    });
     return;
   }
 
-  if (process.stdin.isTTY) {
-    if (!options.plain) {
-      const progress = new AgentTuiProgressRenderer();
-      const runtime = await createRuntime(options, workspace, progress);
-      await runAgentTuiApp(runtime.agent, {
+  if (!process.stdin.isTTY) throw new Error('Interactive mode requires a terminal. Use agent-core exec with piped input.');
+  const progress = new AgentTuiProgressRenderer();
+  await withCliRuntime(options, workspace, progress, async (runtime) => {
+    await runAgentTuiApp(runtime.agent, {
+        ...(task.length > 0 ? { initialTask: task } : {}),
         progress,
         runtimeDetails: runtime.tuiDetails
       });
-      console.error(`\nSession: ${runtime.sessions.location(runtime.session.id)}`);
-      await runtime.localHost.close();
-      return;
-    }
-    const progress = new CliProgressRenderer({ showReasoning: options.showReasoning });
-    const runtime = await createRuntime(options, workspace, progress);
-    await runInteractive(runtime.agent, progress);
     console.error(`\nSession: ${runtime.sessions.location(runtime.session.id)}`);
-    await runtime.localHost.close();
-    return;
-  }
+  });
+}
 
-  throw new Error('agent-core requires a task string when stdin is not interactive.');
+async function withCliRuntime<T>(options: CliOptions, workspace: WorkspaceLayout, progress: CliProgressSink, run: (runtime: CliRuntime) => Promise<T>, persistedSessionId?: string): Promise<T> {
+  const runtime = await createRuntime(options, workspace, progress, persistedSessionId);
+  try { return await run(runtime); }
+  finally { await runtime.localHost.close(); }
 }
 
 async function createRuntime(
   options: CliOptions,
   workspace: WorkspaceLayout,
-  progress: CliProgressSink = new CliProgressRenderer({ showReasoning: options.showReasoning }),
+  progress: CliProgressSink,
   persistedSessionId?: string
 ): Promise<CliRuntime> {
-  const providerRuntime = createProviderRuntime(options);
-  const sessionBinding = await openSession(options, workspace, providerRuntime, persistedSessionId);
+  const sessions = new JsonlSessionRepository({ rootDir: workspace.sessionsDir });
+  let session = await selectSession(options, workspace, sessions, persistedSessionId);
+  const replay = session ? await sessions.loadReplayState(session.id) : undefined;
+  const latestSettings = replay ? [...replay.branch].reverse().find((entry) => entry.type === 'model_settings') : undefined;
+  const persistedSettings: PersistedModelSettings | undefined = latestSettings ?? (session ? {
+    ...(session.header.provider ? { provider: session.header.provider } : {}),
+    ...(session.header.model ? { model: session.header.model } : {})
+  } : undefined);
+  const settings = resolveRuntimeSettings(options, persistedSettings);
+  const providerRuntime = createProviderRuntime(settings);
+  session ??= await sessions.create({ workspaceRoot: workspace.workspaceRoot, provider: providerRuntime.providerId, model: providerRuntime.model });
+  if (options.branch) {
+    await sessions.branchFrom(session.id, options.branch, 'cli branch');
+    session = await sessions.open(session.id);
+  }
+  const sessionBinding = { repository: sessions, session };
   const events = new JsonlEventRepository<AgentEvent>({ rootDir: workspace.runsDir, codec: agentEventCodec });
   const existingRunIds = new Set(await events.listRunIds());
-  const localHost = createLocalToolHost({
+  const authority = resolveCliAuthority(options);
+  const checks = configuredChecks(options.configuration);
+  const instructions = await loadWorkspaceInstructions(workspace.workspaceRoot, options.configuration);
+  let localHost: LocalToolHost | undefined;
+  try {
+    localHost = createLocalToolHost({
     workspaceRoot: workspace.workspaceRoot,
     artifactDirectory: workspace.artifactsDir,
     processLedgerDirectory: path.join(workspace.runtimeDir, 'processes'),
@@ -194,21 +225,18 @@ async function createRuntime(
       }, { idempotencyKey: `${runId}:process:${report.result.processId}:ended` });
       return true;
     }
-  });
-  await localHost.ready();
-  const reconciliation = await localHost.reconciliation();
-  if (reconciliation.unresolved.length > 0) {
-    throw new Error('Unresolved ambient process supervision blocks this workspace: ' + reconciliation.unresolved.map((item) => `${item.processId}: ${item.diagnostic}`).join('; '));
-  }
-  const artifactStore = localHost.artifactRepository;
-  const estimator = new SimpleTokenEstimator();
-  const localToolConfiguration = localHost.services.localToolConfiguration;
-  const processManager = localHost.processManager;
-  const toolPolicy = toolPolicyFromOptions(options);
-  const configuredTools = localHost.tools;
-  const instructions = await loadWorkspaceInstructions(workspace.workspaceRoot, options.configuration);
-  const checks = configuredChecks(options.configuration);
-  const agent = new AgentRuntime({
+    });
+    await localHost.ready();
+    const reconciliation = await localHost.reconciliation();
+    if (reconciliation.unresolved.length > 0) {
+      throw new Error('Unresolved ambient process supervision blocks this workspace: ' + reconciliation.unresolved.map((item) => `${item.processId}: ${item.diagnostic}`).join('; '));
+    }
+    const artifactStore = localHost.artifactRepository;
+    const estimator = new SimpleTokenEstimator();
+    const localToolConfiguration = localHost.services.localToolConfiguration;
+    const processManager = localHost.processManager;
+    const configuredTools = localHost.tools;
+    const agent = new AgentRuntime({
     provider: providerRuntime.provider,
     model: providerRuntime.model,
     toolBoundary: { authorizationPolicyId: 'agent-core-cli/workspace-policy@1', executionTargetId: workspace.workspaceRoot },
@@ -223,7 +251,7 @@ async function createRuntime(
     toolContext: {
       services: localHost.services
     },
-    toolPolicy,
+    toolPolicy: authority.toolPolicy,
     ...(options.configuration?.authorization.requireApprovalFor.length ? { toolAuthorizer: request => {
       const approvalAccesses = request.effects.accesses.map((access) => accessRisk(access.mode))
         .filter((risk) => options.configuration?.authorization.requireApprovalFor.includes(risk));
@@ -234,7 +262,7 @@ async function createRuntime(
     ...(instructions.length > 0 ? { instructions } : {}),
     ...(checks.length > 0 ? { checks } : {}),
     ...(options.configuration?.limits ? { limits: options.configuration.limits } : {}),
-    ...(checks.length > 0 ? { verification: { evidence: { read: () => Promise.resolve({ items: [], bytes: 0, truncated: false }), readArtifact: ref => artifactStore.readVerified(ref) }, runCommand: async (request, signal) => {
+    ...(authority.verificationCommands === 'ambient' ? { verification: { evidence: { read: () => Promise.resolve({ items: [], bytes: 0, truncated: false }), readArtifact: ref => artifactStore.readVerified(ref) }, runCommand: async (request, signal) => {
       const startedAt = Date.now();
       const outputTokenBudget = Math.max(64, Math.ceil((request.maxOutputBytes ?? 64_000) / 4));
       let result = await processManager.start({
@@ -262,42 +290,33 @@ async function createRuntime(
       workspaceRoot: workspace.workspaceRoot,
       workspaceName: workspace.workspaceName
     },
-    ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
-    ...(options.reasoning !== undefined ? { reasoning: options.reasoning } : {}),
+    ...(settings.temperature !== undefined ? { temperature: settings.temperature } : {}),
+    ...(settings.reasoning !== undefined ? { reasoning: settings.reasoning } : {}),
     onProgress: (event) => progress.handle(event)
-  });
-  return {
-    agent,
-    events,
-    sessions: sessionBinding.repository,
-    session: sessionBinding.session,
-    progress,
-    tuiDetails: {
+    });
+    return {
+      agent,
+      events,
+      sessions: sessionBinding.repository,
+      session: sessionBinding.session,
+      tuiDetails: {
       providerId: providerRuntime.providerId,
       modelId: providerRuntime.model,
-      ...(options.temperature === undefined ? {} : { temperature: options.temperature }),
-      ...(options.reasoning?.strategy === 'effort' ? { reasoningEffort: options.reasoning.effort } : {}),
+      ...(settings.temperature === undefined ? {} : { temperature: settings.temperature }),
+      ...(settings.reasoning?.strategy === 'effort' ? { reasoningEffort: settings.reasoning.effort } : {}),
       showReasoning: options.showReasoning,
       sessionLocation: sessionBinding.repository.location(sessionBinding.session.id),
-      permissions: {
-        workspaceWrites: options.apply ? 'allowed' : options.dryRun ? 'dry_run' : options.allowShell ? 'ambient_shell' : 'denied',
-        shell: options.allowShell ? 'ambient' : 'denied'
-      }
-    },
-    localHost
-  };
-}
-
-function applyConfiguration(options: CliOptions, configuration: AgentCoreConfiguration): CliOptions {
-  return {
-    ...options,
-    provider: configuration.provider,
-    model: configuration.model,
-    ...(configuration.reasoning ? { reasoning: configuration.reasoning } : {}),
-    resume: configuration.session.mode === 'latest',
-    ...(configuration.session.id ? { session: configuration.session.id } : {}),
-    configuration: configuration
-  };
+      permissions: authority.permissions
+      },
+      localHost
+    };
+  } catch (error) {
+    if (localHost) {
+      try { await localHost.close(); }
+      catch (closeError) { throw new AggregateError([error, closeError], 'CLI runtime initialization and cleanup both failed.', { cause: closeError }); }
+    }
+    throw error;
+  }
 }
 
 async function loadWorkspaceInstructions(rootDir: string, configuration: AgentCoreConfiguration | undefined): Promise<AgentInstruction[]> {
@@ -335,17 +354,11 @@ function configuredCommandCheck(check: AgentCoreCheckConfiguration, requirement:
 function parseOptions(args: string[]): { options: CliOptions; positionals: string[] } {
   const options: CliOptions = {
     root: process.cwd(),
-    provider: parseProviderId(process.env.AGENT_CORE_PROVIDER ?? 'ollama'),
-    ...(process.env.AGENT_CORE_MODEL ? { model: process.env.AGENT_CORE_MODEL } : {}),
-    ...(process.env.AGENT_CORE_PROVIDER_ENDPOINT ? { providerEndpoint: process.env.AGENT_CORE_PROVIDER_ENDPOINT } : {}),
-    ...(process.env.AGENT_CORE_REASONING_EFFORT ? { reasoning: reasoningFromEffort(parseReasoningEffort(process.env.AGENT_CORE_REASONING_EFFORT, 'AGENT_CORE_REASONING_EFFORT')) } : {}),
     apply: false,
     dryRun: false,
     allowShell: false,
     showReasoning: false,
-    tui: false,
-    plain: false,
-    resume: false
+    sessionSelection: { kind: 'new' }
   };
   const positionals: string[] = [];
 
@@ -362,6 +375,7 @@ function parseOptions(args: string[]): { options: CliOptions; positionals: strin
     spec.apply(options, value, key);
     if (spec.takesValue && inlineValue === undefined) index += 1;
   }
+  if (options.branch && options.sessionSelection.kind === 'new') throw new Error('--branch requires --resume or --session.');
   return { options, positionals };
 }
 
@@ -378,10 +392,8 @@ const CLI_OPTION_SPECS = {
   '--dry-run': flagged(options => { options.dryRun = true; }),
   '--allow-shell': flagged(options => { options.allowShell = true; }),
   '--show-reasoning': flagged(options => { options.showReasoning = true; }),
-  '--tui': flagged(options => { options.tui = true; }),
-  '--plain': flagged(options => { options.plain = true; }),
-  '--resume': flagged(options => { options.resume = true; }),
-  '--session': valued((options, value) => { options.session = value; }),
+  '--resume': flagged(options => { setSessionSelection(options, { kind: 'latest' }, '--resume'); }),
+  '--session': valued((options, value) => { setSessionSelection(options, { kind: 'existing', id: value }, '--session'); }),
   '--branch': valued((options, value) => { options.branch = value; }),
   '--config': valued((options, value) => { options.config = value; })
 } satisfies Record<string, CliOptionSpec>;
@@ -393,8 +405,13 @@ function cliOptionSpec(key: string): CliOptionSpec | undefined {
 }
 function isCliOptionKey(key: string): key is keyof typeof CLI_OPTION_SPECS { return Object.hasOwn(CLI_OPTION_SPECS, key); }
 
-function createProviderRuntime(options: CliOptions): CliProviderRuntime {
-  const model = options.model ?? defaultModelForProvider(options.provider);
+function setSessionSelection(options: CliOptions, selection: SessionSelection, option: string): void {
+  if (options.sessionSelection.kind !== 'new') throw new Error(`${option} conflicts with another session selector.`);
+  options.sessionSelection = selection;
+}
+
+function createProviderRuntime(options: ResolvedRuntimeSettings): CliProviderRuntime {
+  const model = options.model;
   switch (options.provider) {
     case 'ollama':
       return {
@@ -449,9 +466,7 @@ function defaultModelForProvider(provider: CliProviderId): string {
 }
 
 function parseProviderId(value: string): CliProviderId {
-  if (value === 'ollama' || value === 'openrouter' || value === 'openai' || value === 'openai-codex') {
-    return value;
-  }
+  if (isAgentCoreProviderId(value)) return value;
   throw new Error(`Unsupported provider: ${value}. Supported providers: ollama, openrouter, openai, openai-codex.`);
 }
 
@@ -463,8 +478,9 @@ async function runApprovalCommand(args: string[]): Promise<void> {
   const parsed = parseOptions(optionArgs);
   if (parsed.positionals.length > 0) throw new Error(`Unexpected approval arguments: ${parsed.positionals.join(' ')}`);
   const workspace = await loadWorkspace(path.resolve(parsed.options.root));
-  let options = parsed.options.config
-    ? applyConfiguration(parsed.options, await loadAgentCoreConfiguration(workspace.workspaceRoot, parsed.options.config))
+  if (parsed.options.sessionSelection.kind !== 'new' || parsed.options.branch) throw new Error('Approval resolution uses the session persisted with the run; session selectors are not allowed.');
+  let options: CliOptions = parsed.options.config
+    ? { ...parsed.options, configuration: await loadAgentCoreConfiguration(workspace.workspaceRoot, parsed.options.config) }
     : parsed.options;
   const events = new JsonlEventRepository<AgentEvent>({ rootDir: workspace.runsDir, codec: agentEventCodec });
   const records: AgentEvent[] = [];
@@ -474,11 +490,12 @@ async function runApprovalCommand(args: string[]): Promise<void> {
   if (!configured || !startedTurn?.sessionId) throw new Error(`Run ${runId} does not contain enough persisted runtime/session identity to resolve an approval.`);
   options = { ...options, provider: parseProviderId(configured.configuration.provider.id), model: configured.configuration.model.id };
   const progress = new CliProgressRenderer({ showReasoning: options.showReasoning });
-  const runtime = await createRuntime(options, workspace, progress, startedTurn.sessionId);
-  const result = await runtime.agent.resolveApproval({ runId, approvalId, fingerprint, decision: decisionValue });
-  printResult(result, progress);
-  printPersistenceLocations(runtime, result);
-  process.exitCode = resultExitCode(result);
+  await withCliRuntime(options, workspace, progress, async (runtime) => {
+    const result = await runtime.agent.resolveApproval({ runId, approvalId, fingerprint, decision: decisionValue });
+    printResult(result, progress);
+    printPersistenceLocations(runtime, result);
+    process.exitCode = resultExitCode(result);
+  }, startedTurn.sessionId);
 }
 
 async function runAuthCommand(args: string[]): Promise<void> {
@@ -561,7 +578,7 @@ async function loginAuth(provider: CliAuthProviderId): Promise<void> {
 
 export function createCliToolPolicy(options: CliToolPolicyOptions): ToolPolicy {
   const allowedRisks: ToolRisk[] = ['read'];
-  if (options.apply) {
+  if (options.apply || options.dryRun) {
     allowedRisks.push('write', 'destructive');
   }
   if (options.allowShell) {
@@ -573,51 +590,73 @@ export function createCliToolPolicy(options: CliToolPolicyOptions): ToolPolicy {
   };
 }
 
-function toolPolicyFromOptions(options: CliOptions): ToolPolicy {
-  if (options.configuration) return createConfiguredCliToolPolicy(options.configuration, options.dryRun);
-  return createCliToolPolicy(options);
+function resolveCliAuthority(options: CliOptions): EffectiveCliAuthority {
+  const invocation = createCliToolPolicy(options);
+  const configured = options.configuration?.authorization.allowedRisks;
+  const allowedRisks = configured ? invocation.allowedRisks.filter((risk) => configured.includes(risk)) : invocation.allowedRisks;
+  const toolPolicy = Object.freeze({ allowedRisks: Object.freeze([...allowedRisks]), ...(invocation.dryRunWrites ? { dryRunWrites: true } : {}) });
+  const hasChecks = (options.configuration?.verification.required.length ?? 0) + (options.configuration?.verification.advisory.length ?? 0) > 0;
+  const verificationCommands = hasChecks && options.allowShell && allowedRisks.includes('execute') ? 'ambient' : 'disabled';
+  if (hasChecks && verificationCommands === 'disabled') throw new Error('Configured verification commands require --allow-shell and execute authorization.');
+  const ambientShell = allowedRisks.includes('execute');
+  const writes = allowedRisks.includes('write') || allowedRisks.includes('destructive');
+  return Object.freeze({
+    toolPolicy,
+    verificationCommands,
+    permissions: Object.freeze({
+      workspaceWrites: ambientShell ? 'ambient_shell' : writes ? options.dryRun ? 'dry_run' : 'allowed' : 'denied',
+      shell: ambientShell ? 'ambient' : 'denied'
+    })
+  });
 }
 
-export function createConfiguredCliToolPolicy(configuration: AgentCoreConfiguration, dryRun = false): ToolPolicy {
-  return Object.freeze({ allowedRisks: Object.freeze([...configuration.authorization.allowedRisks]), ...(dryRun ? { dryRunWrites: true } : {}) });
-}
-
-async function openSession(options: CliOptions, workspace: WorkspaceLayout, providerRuntime: CliProviderRuntime, persistedSessionId?: string): Promise<{ repository: JsonlSessionRepository; session: AgentSession }> {
-  const repository = new JsonlSessionRepository({ rootDir: workspace.sessionsDir });
+async function selectSession(options: CliOptions, workspace: WorkspaceLayout, repository: JsonlSessionRepository, persistedSessionId?: string): Promise<AgentSession | undefined> {
   let session: AgentSession | undefined;
   if (persistedSessionId !== undefined) {
     session = await repository.open(persistedSessionId);
-  } else if (options.session) {
-    try {
-      session = await repository.open(options.session);
-    } catch (error) {
-      if (nodeErrorCode(error) !== 'ENOENT') {
-        throw error;
-      }
-      session = await repository.create({
-        id: options.session,
-        workspaceRoot: workspace.workspaceRoot,
-        provider: providerRuntime.providerId,
-        model: providerRuntime.model
-      });
-    }
-  } else if (options.resume) {
+  } else if (options.sessionSelection.kind === 'existing') {
+    session = await repository.open(options.sessionSelection.id);
+  } else if (options.sessionSelection.kind === 'latest') {
     const latest = (await repository.list(workspace.workspaceRoot))[0];
     if (latest) session = await repository.open(latest.id);
   }
+  if (session) validateSessionWorkspace(session, workspace);
+  if (!session && options.branch) throw new Error('--branch requires an existing session.');
+  return session;
+}
 
-  session ??= await repository.create({
-    workspaceRoot: workspace.workspaceRoot,
-    provider: providerRuntime.providerId,
-    model: providerRuntime.model
+function resolveRuntimeSettings(options: CliOptions, persisted: PersistedModelSettings | undefined): ResolvedRuntimeSettings {
+  const persistedProvider = persisted?.provider;
+  const provider = options.provider
+    ?? (persistedProvider ? parseProviderId(persistedProvider) : undefined)
+    ?? options.configuration?.provider
+    ?? (process.env.AGENT_CORE_PROVIDER ? parseProviderId(process.env.AGENT_CORE_PROVIDER) : undefined)
+    ?? 'ollama';
+  const persistedMatches = persistedProvider === provider;
+  const model = options.model
+    ?? (persistedMatches ? persisted?.model : undefined)
+    ?? (options.configuration?.provider === provider ? options.configuration.model : undefined)
+    ?? process.env.AGENT_CORE_MODEL
+    ?? defaultModelForProvider(provider);
+  const persistedSettingsMatch = persistedMatches && persisted?.model === model;
+  const persistedReasoning = persistedSettingsMatch && persisted.reasoningEffort
+    ? reasoningFromEffort(parseReasoningEffort(persisted.reasoningEffort, 'persisted session reasoning effort'))
+    : undefined;
+  const providerEndpoint = options.providerEndpoint ?? process.env.AGENT_CORE_PROVIDER_ENDPOINT;
+  const temperature = options.temperature ?? (persistedSettingsMatch ? persisted.temperature : undefined);
+  const reasoning = options.reasoning
+    ?? persistedReasoning
+    ?? options.configuration?.reasoning
+    ?? (process.env.AGENT_CORE_REASONING_EFFORT
+      ? reasoningFromEffort(parseReasoningEffort(process.env.AGENT_CORE_REASONING_EFFORT, 'AGENT_CORE_REASONING_EFFORT'))
+      : undefined);
+  return Object.freeze({
+    provider,
+    model,
+    ...(providerEndpoint === undefined ? {} : { providerEndpoint }),
+    ...(temperature === undefined ? {} : { temperature }),
+    ...(reasoning === undefined ? {} : { reasoning })
   });
-
-  validateSessionWorkspace(session, workspace);
-  if (options.branch) {
-    await repository.branchFrom(session.id, options.branch, 'cli branch');
-    session = await repository.open(session.id);
-  }
-  return { repository, session };
 }
 
 function validateSessionWorkspace(session: AgentSession, workspace: WorkspaceLayout): void {
@@ -627,117 +666,6 @@ function validateSessionWorkspace(session: AgentSession, workspace: WorkspaceLay
       `Current workspace root: ${workspace.workspaceRoot}`
     ].join('\n'));
   }
-}
-
-export async function runInteractive(
-  agent: AgentRuntime,
-  progress: CliProgressRenderer = new CliProgressRenderer(),
-  streams: { input: Readable; output: Writable } = { input: process.stdin, output: process.stdout }
-): Promise<void> {
-  const input = createInterface({ input: streams.input, output: streams.output, prompt: 'agent-core> ' });
-  let activeRun: Promise<void> | undefined;
-  let pendingApproval: AgentApprovalSuspension | undefined;
-  let closing = false;
-  writeLine(streams.output, 'Agent Core interactive. Type exit or quit to leave.');
-  input.prompt();
-  for await (const line of input) {
-    const task = normalizeTaskInput(line);
-    let deferPromptUntilRunFinishes = false;
-    if (task === 'exit' || task === 'quit') {
-      closing = true;
-      if (activeRun) {
-        agent.abort('Interactive session closed.');
-        await activeRun;
-      }
-      break;
-    }
-    if (task.length > 0) {
-      try {
-        if (pendingApproval !== undefined && (task === 'allow' || task === 'deny')) {
-          const suspension = pendingApproval;
-          const approval = suspension.pendingApprovals[0];
-          if (approval === undefined) throw new Error('Approval suspension contains no pending approval.');
-          pendingApproval = undefined;
-          activeRun = agent.resolveApproval({
-            runId: suspension.runId,
-            approvalId: approval.approvalId,
-            fingerprint: approval.fingerprint,
-            decision: task
-          }).then((result) => {
-            printResult(result, progress, streams.output);
-            if (result.state === 'suspended') {
-              pendingApproval = result;
-              printApprovalPrompt(result, streams.output);
-            }
-          }).catch((error: unknown) => {
-            console.error(error instanceof Error ? error.message : String(error));
-            process.exitCode = 1;
-          }).finally(() => {
-            activeRun = undefined;
-            if (!closing) input.prompt();
-          });
-          deferPromptUntilRunFinishes = true;
-        } else if (pendingApproval !== undefined) {
-          writeLine(streams.output, 'Approval required. Enter allow or deny.');
-        } else if (task.startsWith('/')) {
-          writeLine(streams.output, executeInteractiveCommand(agent, task).message);
-        } else if (activeRun) {
-          writeLine(streams.output, 'A run is active. Use /follow to queue work or /abort to stop it.');
-        } else {
-          writeLine(streams.output, 'Run started. Slash commands remain available; use /abort to stop the active run.');
-          activeRun = runTaskAndFollowUps(agent, task, progress, streams.output)
-            .then((result) => {
-              if (result.state === 'suspended') {
-                pendingApproval = result;
-                printApprovalPrompt(result, streams.output);
-              }
-            })
-            .catch((error: unknown) => {
-              console.error(error instanceof Error ? error.message : String(error));
-              process.exitCode = 1;
-            })
-            .finally(() => {
-              activeRun = undefined;
-              if (!closing) {
-                input.prompt();
-              }
-            });
-          deferPromptUntilRunFinishes = true;
-        }
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-      }
-    }
-    if (!deferPromptUntilRunFinishes) {
-      input.prompt();
-    }
-  }
-  input.close();
-}
-
-async function runTaskAndFollowUps(agent: AgentRuntime, task: string, progress: CliProgressRenderer, output: Writable = process.stdout): Promise<AgentRunResult> {
-  let result = await agent.run({ task });
-  printResult(result, progress, output);
-  if (result.state === 'suspended') return result;
-  for (const followUp of agent.takeFollowUps(runIdOf(result))) {
-    result = await agent.run({
-      task: followUp.task,
-      ...(followUp.instructions ? { instructions: followUp.instructions } : {})
-    });
-    printResult(result, progress, output);
-    if (result.state === 'suspended') break;
-  }
-  return result;
-}
-
-function printApprovalPrompt(result: AgentApprovalSuspension, output: Writable): void {
-  const approval = result.pendingApprovals[0];
-  if (approval === undefined) return;
-  writeLine(output, `Approval required for ${approval.toolName}.`);
-  writeLine(output, `Reason: ${approval.reason}`);
-  writeLine(output, `Input: ${JSON.stringify(approval.input)}`);
-  writeLine(output, `Effects: ${JSON.stringify(approval.effects)}`);
-  writeLine(output, 'Enter allow or deny.');
 }
 
 function writeLine(output: Writable, text: string): void {
@@ -1037,8 +965,11 @@ function compactForDisplay(value: unknown, maxLength: number): string {
   return text.length > maxLength ? `${text.slice(0, maxLength - 14)}... [truncated]` : text;
 }
 
-function nodeErrorCode(error: unknown): string | undefined {
-  return typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string' ? error.code : undefined;
+async function readStandardInput(): Promise<string> {
+  let input = '';
+  process.stdin.setEncoding('utf8');
+  for await (const chunk of process.stdin) input += String(chunk);
+  return input;
 }
 
 function requireValue(key: string, value: string | undefined): string {
@@ -1073,11 +1004,8 @@ function printHelp(): void {
   console.log(`Agent Core CLI
 
 Usage:
-  agent-core "summarize how tests are organized" [--provider ollama] [--model llama3.1] [--root .]
-  agent-core "add tests for the parser" --apply --allow-shell [--provider ollama] [--model llama3.1]
-  agent-core "summarize this workspace" --provider openrouter [--model openrouter/auto]
-  agent-core "summarize this workspace" --provider openai [--model gpt-5.6-sol]
-  agent-core "summarize this workspace" --provider openai-codex [--model gpt-5.6]
+  agent-core ["initial task"] [options]
+  agent-core exec <task|-> [options]
   agent-core auth status openai
   agent-core auth login openai-codex
   agent-core approval <allow|deny> <run-id> <approval-id> <fingerprint> [--root .] [--config agent-core.config.json]
@@ -1091,7 +1019,7 @@ Safety defaults:
 
 Common options:
   --root <dir>           Workspace root. Default: current directory.
-  --config <path>        Load committed workspace instructions, provider/model, tools, approvals, checks, limits, and session policy.
+  --config <path>        Load committed workspace instructions, provider/model, tools, approvals, checks, and limits.
   --provider <name>      Model provider. Supported: ollama, openrouter, openai, openai-codex. Default: AGENT_CORE_PROVIDER or ollama.
   --model <name>         Model name. Default: AGENT_CORE_MODEL or the provider default.
   --provider-endpoint <url>
@@ -1102,13 +1030,11 @@ Common options:
   --reasoning-effort <level>
                          Optional reasoning effort: none, minimal, low, medium, high, xhigh, max.
   --show-reasoning       Stream separate model reasoning or reasoning summaries to stderr.
-  --tui                  Use the terminal-ui TUI surface for direct task output.
-  --plain                Use readline fallback for interactive mode.
   --apply                Allow apply_patch add, update, move, and delete operations.
   --dry-run              Validate writes without changing files.
   --allow-shell          Allow ambient shell execution with process-level file, network, and child-process authority. Does not authorize apply_patch.
   --resume               Resume the latest session for this workspace.
-  --session <path>       Open or create a specific session JSONL file.
+  --session <id>         Open an existing session by ID.
   --branch <entry-id>    Branch the active session from a prior entry before running.
 
 OpenRouter:
