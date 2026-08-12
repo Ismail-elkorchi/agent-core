@@ -94,7 +94,7 @@ async function release(): Promise<void> {
     env: process.env,
     shell: process.platform !== 'win32',
     stdio: ['pipe', 'pipe', 'pipe'],
-    detached: process.platform !== 'win32',
+    detached: true,
     windowsHide: true
   });
   userProcess = child;
