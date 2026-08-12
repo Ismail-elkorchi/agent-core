@@ -37,6 +37,7 @@ export interface SupervisorTerminalState {
 
 export interface SupervisedProcessTree extends OwnedProcessTree {
   readonly supervision: ProcessSupervisorIdentity;
+  readonly terminalState: Promise<SupervisorTerminalState | undefined>;
   release(): Promise<void>;
 }
 
@@ -123,7 +124,7 @@ export function terminalStateProof(supervision: ProcessSupervisorIdentity, state
 class SupervisorController implements SupervisedProcessTree {
   readonly started: Promise<void>;
   readonly supervision: ProcessSupervisorIdentity;
-  readonly #settled: Promise<void>;
+  readonly terminalState: Promise<SupervisorTerminalState | undefined>;
   #operation: Promise<void> = Promise.resolve();
   #processGroup: number | undefined;
   #releaseAttempted = false;
@@ -136,7 +137,7 @@ class SupervisorController implements SupervisedProcessTree {
       child.once('error', reject);
     });
     this.started = spawned.then(() => waitForSupervisor(supervision, child));
-    this.#settled = new Promise((resolve, reject) => {
+    this.terminalState = new Promise((resolve, reject) => {
       let settled = false;
       const finish = () => {
         if (settled) return;
@@ -161,23 +162,23 @@ class SupervisorController implements SupervisedProcessTree {
     this.#operation = sendSupervisorCommand(this.supervision, 'stop', 5_000).then(() => undefined).catch(async (error: unknown) => {
       // This is the exact child handle created by this controller, not a recovered PID.
       try { this.child.kill('SIGKILL'); } catch { /* The supervisor already exited. */ }
-      try { await this.#settled; } catch { throw error; }
+      try { await this.terminalState; } catch { throw error; }
     });
   }
 
   async settle(): Promise<void> {
     await this.#operation;
-    await this.#settled;
+    await this.terminalState;
   }
 
-  private async settleProcessTree(): Promise<void> {
+  private async settleProcessTree(): Promise<SupervisorTerminalState | undefined> {
     try {
-      verifySupervisorTerminalState(JSON.parse(await readFile(this.supervision.stateFile, 'utf8')), this.supervision);
-      return;
+      return verifySupervisorTerminalState(JSON.parse(await readFile(this.supervision.stateFile, 'utf8')), this.supervision);
     } catch (error) {
-      if (!this.#releaseAttempted) return;
+      if (!this.#releaseAttempted) return undefined;
       if (this.#processGroup === undefined) throw error;
       await stopExistingProcessTree(this.#processGroup);
+      return undefined;
     }
   }
 }

@@ -93,10 +93,11 @@ async function release(): Promise<void> {
     cwd,
     env: process.env,
     shell: process.platform !== 'win32',
-    stdio: ['pipe', 'pipe', 'pipe'],
+    stdio: process.platform === 'win32' ? ['pipe', 'pipe', 'pipe', 'ipc'] : ['pipe', 'pipe', 'pipe'],
     detached: true,
     windowsHide: true
   });
+  if (!child.stdin || !child.stdout || !child.stderr) throw new Error('Process supervisor requires piped command streams.');
   userProcess = child;
   process.stdin.pipe(child.stdin);
   child.stdout.pipe(process.stdout, { end: false });
@@ -104,7 +105,8 @@ async function release(): Promise<void> {
   child.once('error', (error) => { void finish('failed', null, null, 71, error.message); });
   child.once('close', (exitCode, signal) => { void finish(stopRequested ? 'stopped' : exitCode === null ? 'failed' : 'exited', exitCode, signal, exitCode ?? 1); });
   await new Promise<void>((resolve, reject) => {
-    child.once('spawn', resolve);
+    if (process.platform === 'win32') child.once('message', (message) => { if (message === 'ready') resolve(); else reject(new Error('Invalid process command host readiness response.')); });
+    else child.once('spawn', resolve);
     child.once('error', reject);
   });
 }

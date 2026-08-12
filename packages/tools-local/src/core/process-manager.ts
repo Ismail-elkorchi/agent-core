@@ -484,7 +484,13 @@ export class ProcessManager {
   }
 
   private async settleAndFinish(record: ManagedProcess): Promise<void> {
-    try { await record.tree.settle(); }
+    try {
+      await record.tree.settle();
+      const terminalState = await record.tree.terminalState;
+      if (record.terminalStatus !== 'timed_out' && record.terminalStatus !== 'stopped') {
+        record.terminalStatus = terminalState?.state ?? 'failed';
+      }
+    }
     catch (error) {
       record.diagnostic = appendDiagnostic(record.diagnostic, `Process settlement failed: ${errorMessage(error)}`);
       this.signalActivity(record);

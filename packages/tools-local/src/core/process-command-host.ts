@@ -26,6 +26,7 @@ process.exitCode = await new Promise<number>((resolve) => {
     settled = true;
     resolve(exitCode);
   };
+  child.once('spawn', () => { process.send?.('ready'); process.disconnect(); });
   child.once('error', () => { finish(71); });
   child.once('close', (exitCode) => { finish(exitCode ?? 1); });
 });
