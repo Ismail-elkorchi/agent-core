@@ -7,17 +7,28 @@ import process from 'node:process';
 import { tmpdir } from 'node:os';
 import type { Readable, Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
-import type { OwnedProcessTree } from './process-tree.js';
+import { stopExistingProcessTree, type OwnedProcessTree } from './process-tree.js';
+
+export interface ProcessSupervisorOwner {
+  readonly runId: string;
+  readonly turnId: string;
+  readonly toolBatchId: string;
+  readonly callIndex: number;
+}
 
 export interface ProcessSupervisorIdentity {
   readonly identity: string;
   readonly authenticationToken: string;
+  readonly processId: string;
+  readonly owner: ProcessSupervisorOwner;
   readonly endpoint: string;
   readonly stateFile: string;
 }
 
 export interface SupervisorTerminalState {
   readonly identity: string;
+  readonly processId: string;
+  readonly owner: ProcessSupervisorOwner;
   readonly state: 'exited' | 'stopped' | 'failed';
   readonly exitCode: number | null;
   readonly signal: string | null;
@@ -29,13 +40,15 @@ export interface SupervisedProcessTree extends OwnedProcessTree {
   release(): Promise<void>;
 }
 
-export function createProcessSupervisorIdentity(processId: string, directory: string): ProcessSupervisorIdentity {
+interface SupervisorResponse { readonly processPid?: number; readonly processProof?: string }
+
+export function createProcessSupervisorIdentity(processId: string, directory: string, owner: ProcessSupervisorOwner): ProcessSupervisorIdentity {
   const identity = `supervisor_${randomUUID()}`;
   const authenticationToken = randomBytes(32).toString('hex');
   const endpoint = process.platform === 'win32'
     ? `\\\\.\\pipe\\agent-core-${processId}-${randomUUID()}`
     : path.join(tmpdir(), `agent-core-${randomUUID()}.sock`);
-  return Object.freeze({ identity, authenticationToken, endpoint, stateFile: path.join(directory, `${processId}.state.json`) });
+  return Object.freeze({ identity, authenticationToken, processId, owner: Object.freeze({ ...owner }), endpoint, stateFile: path.join(directory, `${processId}.state.json`) });
 }
 
 export function spawnSupervisedProcess(input: {
@@ -47,6 +60,8 @@ export function spawnSupervisedProcess(input: {
   const child = spawn(process.execPath, [
     fileURLToPath(new URL('./process-supervisor.js', import.meta.url)),
     '--identity', input.supervision.identity,
+    '--process-id', input.supervision.processId,
+    '--owner', JSON.stringify(input.supervision.owner),
     '--endpoint', input.supervision.endpoint,
     '--state-file', input.supervision.stateFile,
     '--cwd', input.cwd,
@@ -66,7 +81,7 @@ export async function sendSupervisorCommand(
   supervision: ProcessSupervisorIdentity,
   operation: 'challenge' | 'release' | 'stop',
   timeoutMs = 2_000
-): Promise<void> {
+): Promise<SupervisorResponse> {
   const nonce = randomBytes(24).toString('hex');
   const clientProof = hmac(supervision.authenticationToken, `client\n${supervision.identity}\n${nonce}\n${operation}`);
   const response = await exchange(supervision.endpoint, JSON.stringify({
@@ -79,24 +94,30 @@ export async function sendSupervisorCommand(
   if (!isRecord(parsed) || parsed.ok !== true || parsed.identity !== supervision.identity || parsed.nonce !== nonce || typeof parsed.serverProof !== 'string') {
     throw new Error('Process supervisor returned an invalid authentication response.');
   }
-  const expected = hmac(supervision.authenticationToken, `server\n${supervision.identity}\n${nonce}\n${operation}`);
+  const processPid = parsed.processPid === undefined ? undefined : typeof parsed.processPid === 'number' && Number.isSafeInteger(parsed.processPid) && parsed.processPid > 0 ? parsed.processPid : invalidResponse();
+  const processProof = parsed.processProof === undefined ? undefined : typeof parsed.processProof === 'string' ? parsed.processProof : invalidResponse();
+  if ((processPid === undefined) !== (processProof === undefined)) throw new Error('Process supervisor returned incomplete process ownership.');
+  const expected = hmac(supervision.authenticationToken, `server\n${supervision.identity}\n${nonce}\n${operation}\n${String(processPid ?? '')}\n${processProof ?? ''}`);
   if (!safeEqual(parsed.serverProof, expected)) throw new Error('Process supervisor failed authenticated challenge.');
+  if (processPid !== undefined && processProof !== processOwnershipProof(supervision, processPid)) throw new Error('Process supervisor returned invalid process ownership.');
+  if (processPid === undefined || processProof === undefined) return Object.freeze({});
+  return Object.freeze({ processPid, processProof });
 }
 
 export function verifySupervisorTerminalState(value: unknown, supervision: ProcessSupervisorIdentity): SupervisorTerminalState {
-  if (!isRecord(value) || value.identity !== supervision.identity
+  if (!isRecord(value) || value.identity !== supervision.identity || value.processId !== supervision.processId || !sameOwner(value.owner, supervision.owner)
     || (value.state !== 'exited' && value.state !== 'stopped' && value.state !== 'failed')
     || (value.exitCode !== null && (!Number.isSafeInteger(value.exitCode) || typeof value.exitCode !== 'number'))
     || (value.signal !== null && typeof value.signal !== 'string') || typeof value.proof !== 'string') {
     throw new Error('Invalid process supervisor terminal state.');
   }
-  const expected = terminalStateProof(supervision.authenticationToken, value.identity, value.state, value.exitCode, value.signal);
+  const expected = terminalStateProof(supervision, value.state, value.exitCode, value.signal);
   if (!safeEqual(value.proof, expected)) throw new Error('Process supervisor terminal state failed authentication.');
-  return Object.freeze({ identity: value.identity, state: value.state, exitCode: value.exitCode, signal: value.signal, proof: value.proof });
+  return Object.freeze({ identity: value.identity, processId: value.processId, owner: supervision.owner, state: value.state, exitCode: value.exitCode, signal: value.signal, proof: value.proof });
 }
 
-export function terminalStateProof(token: string, identity: string, state: string, exitCode: number | null, signal: string | null): string {
-  return hmac(token, `terminal\n${identity}\n${state}\n${String(exitCode)}\n${String(signal)}`);
+export function terminalStateProof(supervision: ProcessSupervisorIdentity, state: string, exitCode: number | null, signal: string | null): string {
+  return hmac(supervision.authenticationToken, `terminal\n${supervision.identity}\n${supervision.processId}\n${ownerText(supervision.owner)}\n${state}\n${String(exitCode)}\n${String(signal)}`);
 }
 
 class SupervisorController implements SupervisedProcessTree {
@@ -104,6 +125,9 @@ class SupervisorController implements SupervisedProcessTree {
   readonly supervision: ProcessSupervisorIdentity;
   readonly #settled: Promise<void>;
   #operation: Promise<void> = Promise.resolve();
+  #processGroup: number | undefined;
+  #releaseAttempted = false;
+  #stopRequested = false;
 
   constructor(readonly child: ChildProcessByStdio<Writable, Readable, Readable>, supervision: ProcessSupervisorIdentity) {
     this.supervision = supervision;
@@ -112,28 +136,49 @@ class SupervisorController implements SupervisedProcessTree {
       child.once('error', reject);
     });
     this.started = spawned.then(() => waitForSupervisor(supervision, child));
-    this.#settled = new Promise((resolve) => {
-      child.once('close', () => { resolve(); });
-      child.once('error', () => { resolve(); });
+    this.#settled = new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        void this.settleProcessTree().then(resolve, reject);
+      };
+      child.once('close', finish);
+      child.once('error', finish);
     });
   }
 
-  release(): Promise<void> { return sendSupervisorCommand(this.supervision, 'release', 5_000); }
+  async release(): Promise<void> {
+    this.#releaseAttempted = true;
+    const response = await sendSupervisorCommand(this.supervision, 'release', 5_000);
+    if (response.processPid === undefined) throw new Error('Process supervisor did not return authenticated process ownership.');
+    this.#processGroup = response.processPid;
+  }
 
   stop(): void {
-    this.#operation = sendSupervisorCommand(this.supervision, 'stop', 5_000).catch(async (error: unknown) => {
+    if (this.#stopRequested) return;
+    this.#stopRequested = true;
+    this.#operation = sendSupervisorCommand(this.supervision, 'stop', 5_000).then(() => undefined).catch(async (error: unknown) => {
       // This is the exact child handle created by this controller, not a recovered PID.
       try { this.child.kill('SIGKILL'); } catch { /* The supervisor already exited. */ }
-      await this.#settled;
-      try {
-        verifySupervisorTerminalState(JSON.parse(await readFile(this.supervision.stateFile, 'utf8')), this.supervision);
-      } catch { throw error; }
+      try { await this.#settled; } catch { throw error; }
     });
   }
 
   async settle(): Promise<void> {
     await this.#operation;
     await this.#settled;
+  }
+
+  private async settleProcessTree(): Promise<void> {
+    try {
+      verifySupervisorTerminalState(JSON.parse(await readFile(this.supervision.stateFile, 'utf8')), this.supervision);
+      return;
+    } catch (error) {
+      if (!this.#releaseAttempted) return;
+      if (this.#processGroup === undefined) throw error;
+      await stopExistingProcessTree(this.#processGroup);
+    }
   }
 }
 
@@ -177,5 +222,13 @@ function safeEqual(actual: string, expected: string): boolean {
   const left = Buffer.from(actual, 'utf8'); const right = Buffer.from(expected, 'utf8');
   return left.byteLength === right.byteLength && timingSafeEqual(left, right);
 }
+function processOwnershipProof(supervision: ProcessSupervisorIdentity, processPid: number): string {
+  return hmac(supervision.authenticationToken, `process\n${supervision.identity}\n${supervision.processId}\n${ownerText(supervision.owner)}\n${String(processPid)}`);
+}
+function ownerText(owner: ProcessSupervisorOwner): string { return `${owner.runId}\n${owner.turnId}\n${owner.toolBatchId}\n${String(owner.callIndex)}`; }
+function sameOwner(value: unknown, expected: ProcessSupervisorOwner): boolean {
+  return isRecord(value) && value.runId === expected.runId && value.turnId === expected.turnId && value.toolBatchId === expected.toolBatchId && value.callIndex === expected.callIndex;
+}
+function invalidResponse(): never { throw new Error('Process supervisor returned invalid process ownership.'); }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }

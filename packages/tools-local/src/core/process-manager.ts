@@ -118,7 +118,7 @@ interface ManagedProcess {
   progressDroppedEvents: number;
   progressDeliveryErrors: number;
   terminalReported: boolean;
-  terminalStatus?: Exclude<ManagedProcessStatus, 'running' | 'exited'>;
+  terminalStatus?: Exclude<ManagedProcessStatus, 'running'>;
   readonly observed: { stdout: number; stderr: number };
   exitCode?: number | null;
   signal?: NodeJS.Signals | null;
@@ -189,7 +189,7 @@ export class ProcessManager {
     if (request.pty) throw new Error('PTY mode is unavailable because the configured PTY backend does not use the supervised process lifecycle.');
     const id = 'proc_' + randomUUID();
     const supervisorDirectory = this.options.ledgerDirectory ?? path.join(tmpdir(), 'agent-core-process-supervisors');
-    const supervision = createProcessSupervisorIdentity(id, supervisorDirectory);
+    const supervision = createProcessSupervisorIdentity(id, supervisorDirectory, request.owner);
     await this.persistSupervisorAuthentication(id, supervision);
     const tree = spawnSupervisedProcess({
       command: request.command,
@@ -197,11 +197,6 @@ export class ProcessManager {
       supervision,
       ...(this.options.supervisorReleaseTimeoutMs ? { releaseTimeoutMs: positive(this.options.supervisorReleaseTimeoutMs, 'supervisorReleaseTimeoutMs') } : {})
     });
-    const osPid = tree.child.pid;
-    if (osPid === undefined || osPid <= 0) {
-      tree.stop('SIGKILL');
-      throw new Error('The process host did not provide an operating-system process ID.');
-    }
     const record: ManagedProcess = {
       id, owner: Object.freeze({ ...request.owner }), workspace: request.cwd, tree, startedAt: Date.now(),
       capture: new BoundedCapture(this.options.maxCapturedBytes, this.options.tailBytes),
@@ -217,7 +212,7 @@ export class ProcessManager {
     tree.child.stdout.on('data', (value: Buffer | string) => { this.decodeAndAppend(record, 'stdout', value); });
     tree.child.stderr.on('data', (value: Buffer | string) => { this.decodeAndAppend(record, 'stderr', value); });
     tree.child.once('error', (error) => {
-      record.terminalStatus = 'failed';
+      record.terminalStatus ??= 'failed';
       record.diagnostic = error.message;
       this.signalActivity(record);
     });
@@ -227,6 +222,8 @@ export class ProcessManager {
     });
     try {
       await tree.started;
+      const osPid = tree.child.pid;
+      if (osPid === undefined || osPid <= 0) throw new Error('The process host did not provide an operating-system process ID.');
       await this.options.onSupervisorCheckpoint?.('supervisor_ready', id);
       await this.persistLedger(this.runningLedgerEntry(record, osPid));
       await this.options.onSupervisorCheckpoint?.('ledger_persisted', id);
@@ -250,9 +247,7 @@ export class ProcessManager {
     if (record.status === 'running') {
       record.timeout = setTimeout(() => {
         if (record.status !== 'running') return;
-        record.terminalStatus = 'timed_out';
-        record.tree.stop();
-        this.signalActivity(record);
+        this.requestTermination(record, 'timed_out');
       }, Math.min(request.timeoutMs, this.limits.maxProcessLifetimeMs));
       record.timeout.unref();
     }
@@ -322,9 +317,8 @@ export class ProcessManager {
     const record = this.requireProcess(processId);
     this.assertOwner(record, requester);
     if (record.status === 'running') {
-      this.enqueueProgress(record, { type: 'status', stage: 'process_stopping', message: `Stopping process ${processId}.` });
-      record.terminalStatus = 'stopped';
-      record.tree.stop();
+      if (record.terminalStatus === undefined) this.enqueueProgress(record, { type: 'status', stage: 'process_stopping', message: `Stopping process ${processId}.` });
+      this.requestTermination(record, 'stopped');
     }
     await record.tree.settle();
     await this.finish(record);
@@ -409,14 +403,19 @@ export class ProcessManager {
     if (text.length > 0) this.append(record, stream, text);
   }
 
+  private requestTermination(record: ManagedProcess, status: Exclude<ManagedProcessStatus, 'running' | 'exited'>): void {
+    if (record.status !== 'running' || record.terminalStatus !== undefined) return;
+    record.terminalStatus = status;
+    record.tree.stop();
+    this.signalActivity(record);
+  }
+
   private handleClose(record: ManagedProcess, exitCode: number | null, signal: NodeJS.Signals | null): void {
     delete record.pendingClose;
     this.flushDecoders(record);
-    if (record.status === 'running') record.status = record.terminalStatus ?? (exitCode === null ? 'failed' : 'exited');
+    record.terminalStatus ??= exitCode === null ? 'failed' : 'exited';
     record.exitCode = exitCode;
     record.signal = signal;
-    this.enqueueProgress(record, terminalProgress(record));
-    record.progressClosed = true;
     void this.settleAndFinish(record);
   }
 
@@ -686,6 +685,8 @@ export class ProcessManager {
     return Object.freeze({
       identity: entry.supervisorIdentity,
       authenticationToken: owned.token,
+      processId: entry.processId,
+      owner: entry.owner,
       endpoint: entry.supervisorEndpoint,
       stateFile: this.supervisorStatePath(entry.processId)
     });

@@ -7,6 +7,8 @@ import process from 'node:process';
 
 const args = argumentsMap(process.argv.slice(2));
 const identity = required('identity');
+const processId = required('process-id');
+const owner = parseOwner(required('owner'));
 const endpoint = required('endpoint');
 const stateFile = required('state-file');
 const cwd = required('cwd');
@@ -66,11 +68,14 @@ async function respond(socket: Socket, text: string): Promise<void> {
     if (!safeEqual(request.clientProof, expected)) throw new Error('Supervisor authentication failed.');
     if (request.operation === 'release') await release();
     if (request.operation === 'stop') stop();
+    const processPid = userProcess?.pid;
+    const processProof = processPid === undefined ? undefined : hmac(`process\n${identity}\n${processId}\n${ownerText(owner)}\n${String(processPid)}`);
     socket.end(JSON.stringify({
       ok: true,
       identity,
       nonce: request.nonce,
-      serverProof: hmac(`server\n${identity}\n${request.nonce}\n${request.operation}`)
+      ...(processPid === undefined ? {} : { processPid, processProof }),
+      serverProof: hmac(`server\n${identity}\n${request.nonce}\n${request.operation}\n${String(processPid ?? '')}\n${processProof ?? ''}`)
     }) + '\n');
   } catch (error) {
     socket.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }) + '\n');
@@ -123,11 +128,13 @@ async function finish(state: 'exited' | 'stopped' | 'failed', exitCode: number |
   if (forceTimer) clearTimeout(forceTimer);
   const value = {
     identity,
+    processId,
+    owner,
     state,
     exitCode,
     signal,
     ...(diagnostic ? { diagnostic } : {}),
-    proof: hmac(`terminal\n${identity}\n${state}\n${String(exitCode)}\n${String(signal)}`)
+    proof: hmac(`terminal\n${identity}\n${processId}\n${ownerText(owner)}\n${state}\n${String(exitCode)}\n${String(signal)}`)
   };
   await mkdir(path.dirname(stateFile), { recursive: true, mode: 0o700 });
   const temporary = `${stateFile}.${String(process.pid)}.tmp`;
@@ -157,6 +164,15 @@ function argumentsMap(values: readonly string[]): Map<string, string> {
 }
 function required(name: string): string { const value = args.get(name); if (!value) throw new Error(`Missing process supervisor argument: ${name}`); return value; }
 function positive(value: string): number { const number = Number(value); if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid release timeout.'); return number; }
+function parseOwner(value: string): { readonly runId: string; readonly turnId: string; readonly toolBatchId: string; readonly callIndex: number } {
+  const parsed: unknown = JSON.parse(value);
+  if (!isRecord(parsed) || typeof parsed.runId !== 'string' || typeof parsed.turnId !== 'string' || typeof parsed.toolBatchId !== 'string'
+    || typeof parsed.callIndex !== 'number' || !Number.isSafeInteger(parsed.callIndex) || parsed.callIndex < 0) throw new Error('Invalid process execution owner.');
+  return Object.freeze({ runId: parsed.runId, turnId: parsed.turnId, toolBatchId: parsed.toolBatchId, callIndex: parsed.callIndex });
+}
+function ownerText(value: { readonly runId: string; readonly turnId: string; readonly toolBatchId: string; readonly callIndex: number }): string {
+  return `${value.runId}\n${value.turnId}\n${value.toolBatchId}\n${String(value.callIndex)}`;
+}
 function hmac(value: string): string { return createHmac('sha256', authenticationToken).update(value).digest('hex'); }
 function safeEqual(actual: string, expected: string): boolean { const left = Buffer.from(actual); const right = Buffer.from(expected); return left.length === right.length && timingSafeEqual(left, right); }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
