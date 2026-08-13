@@ -19,6 +19,6 @@
     "@agent-core/model": "0.2.0",
     "@agent-core/runtime": "0.2.0",
     "@agent-core/tools": "0.2.0",
-    "@ismail-elkorchi/terminal-ui": "github:Ismail-elkorchi/terminal-ui#f33c68e526c2bf24f584c8e168ded32da1bdec0e"
+    "@ismail-elkorchi/terminal-ui": "github:Ismail-elkorchi/terminal-ui#cc5e59b64edb18fb6c56b5818509bc4d7bde0398"
   }
 }
