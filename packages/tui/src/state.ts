@@ -1,5 +1,5 @@
 import { createScrollState, createTextAreaState } from '@ismail-elkorchi/terminal-ui/behavior';
-import type { ScrollState, SearchPickerState, TextAreaState } from '@ismail-elkorchi/terminal-ui/behavior';
+import type { ScrollState, SearchPickerPresentation, TextAreaState } from '@ismail-elkorchi/terminal-ui/behavior';
 import type {
   AgentApprovalSuspension,
   AgentDeliveryDiagnostic,
@@ -50,10 +50,14 @@ export type AgentTuiRunState =
 
 export type AgentTuiOverlay =
   | { readonly kind: 'none' }
-  | { readonly kind: 'commands'; readonly picker: SearchPickerState }
-  | { readonly kind: 'search'; readonly picker: SearchPickerState }
+  | { readonly kind: 'commands'; readonly picker: AgentTuiPickerState }
+  | { readonly kind: 'search'; readonly picker: AgentTuiPickerState }
   | { readonly kind: 'help' }
   | { readonly kind: 'debug'; readonly text: string };
+
+export type AgentTuiPickerState = Omit<SearchPickerPresentation, 'scroll'> & {
+  readonly scroll?: never;
+};
 
 export interface AgentTuiConversationState {
   readonly items: readonly AgentTuiConversationEntry[];
@@ -94,7 +98,7 @@ export function createInitialAgentTuiState(
       items,
       omittedEntries: 0,
       omittedBytes: 0,
-      scroll: createScrollState({ contentRows: items.length, followTail: true }),
+      scroll: createScrollState({ followTail: true }),
       expandedIds: []
     },
     composer: {

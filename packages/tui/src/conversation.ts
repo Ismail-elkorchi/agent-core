@@ -1,5 +1,3 @@
-import { scrollReducer } from '@ismail-elkorchi/terminal-ui/behavior';
-import type { ScrollAction } from '@ismail-elkorchi/terminal-ui/behavior';
 import type { AgentTuiState } from './state.js';
 import type {
   AgentTuiActivityEntry,
@@ -66,16 +64,6 @@ export function toggleActivity(state: AgentTuiState, id: string): AgentTuiState 
       expandedIds: expanded
         ? state.conversation.expandedIds.filter((candidate) => candidate !== id)
         : [...state.conversation.expandedIds, id]
-    }
-  };
-}
-
-export function scrollConversation(state: AgentTuiState, action: ScrollAction): AgentTuiState {
-  return {
-    ...state,
-    conversation: {
-      ...state.conversation,
-      scroll: scrollReducer(state.conversation.scroll, action)
     }
   };
 }

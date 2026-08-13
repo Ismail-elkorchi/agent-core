@@ -1,11 +1,12 @@
 import type { AgentApprovalRequest, AgentApprovalSuspension } from '@agent-core/runtime';
 import {
   measuredWindow,
+  normalizeScrollState,
   prepareSearchPickerIndex,
   searchPickerReducer,
   scrollReducer
 } from '@ismail-elkorchi/terminal-ui/behavior';
-import type { SearchPickerState } from '@ismail-elkorchi/terminal-ui/behavior';
+import type { ScrollGeometry } from '@ismail-elkorchi/terminal-ui/interaction';
 import {
   button,
   dialog,
@@ -40,9 +41,9 @@ import type { AgentTuiCommandHandler } from './command-surface.js';
 import { applyFailure, applyProgress, applyResult } from './event-reducer.js';
 import type { AgentTuiMessage } from './messages.js';
 import { createInitialAgentTuiState } from './state.js';
-import type { AgentTuiRuntimeDetails, AgentTuiState } from './state.js';
+import type { AgentTuiPickerState, AgentTuiRuntimeDetails, AgentTuiState } from './state.js';
 import type { AgentTuiActivityEntry, AgentTuiConversationEntry } from './conversation-model.js';
-import { conversationText, scrollConversation, toggleActivity } from './conversation.js';
+import { conversationText, toggleActivity } from './conversation.js';
 import { INTERACTIVE_COMMANDS } from './interactive-commands.js';
 
 export interface AgentTuiAppOptions {
@@ -123,15 +124,30 @@ function updateAgentTui(
         : updated(next, context);
     }
     case 'command.failed': return updated(applyCommandFailure(state, message.message), context);
-    case 'conversation.scroll': return updated(scrollConversation(state, message.action), context);
+    case 'conversation.scroll': {
+      const layout = conversationLayout(state, context);
+      return updated({
+        ...state,
+        conversation: {
+          ...state.conversation,
+          scroll: scrollReducer(layout.scroll, message.action, layout.geometry)
+        }
+      }, context);
+    }
+    case 'conversation.scrolled': return updated({
+      ...state,
+      conversation: { ...state.conversation, scroll: message.event.state }
+    }, context);
     case 'activity.toggle': return updated(toggleActivity(state, message.id), context);
     case 'overlay.open': return openOverlay(state, message.overlay, context);
     case 'overlay.close': return updated({ ...state, overlay: { kind: 'none' } }, context, {
       kind: 'element', elementId: 'composer'
     });
     case 'modal.scrolled': return { state: { ...state, modalOffsetRow: message.offsetRow } };
-    case 'commands.action': return updateCommands(state, message.action, context, options.commandHandler);
-    case 'search.action': return updateSearch(state, message.action, context);
+    case 'commands.transition': return transitionCommands(state, message.transition);
+    case 'commands.accept': return acceptCommand(state, message.event.id, context, options.commandHandler);
+    case 'search.transition': return transitionSearch(state, message.transition);
+    case 'search.accept': return acceptSearchResult(state, message.event.id, context);
     case 'app.exit': return {
       state,
       exit: message.reason === undefined ? {} : { reason: message.reason }
@@ -154,39 +170,83 @@ function submit(
       };
 }
 
-function updateCommands(
+function transitionCommands(
   state: AgentTuiState,
-  action: Extract<AgentTuiMessage, { type: 'commands.action' }>['action'],
+  transition: Extract<AgentTuiMessage, { type: 'commands.transition' }>['transition']
+): TuiUpdateResult<AgentTuiState, AgentTuiMessage> {
+  if (state.overlay.kind !== 'commands') return { state };
+  return {
+    state: {
+      ...state,
+      overlay: {
+        kind: 'commands',
+        picker: searchPickerReducer(
+          state.overlay.picker,
+          transition,
+          { searchPickerIndex: COMMAND_INDEX }
+        )
+      }
+    }
+  };
+}
+
+function acceptCommand(
+  state: AgentTuiState,
+  id: string,
   context: TuiContext,
   handler: AgentTuiCommandHandler | undefined
 ): TuiUpdateResult<AgentTuiState, AgentTuiMessage> {
   if (state.overlay.kind !== 'commands') return { state };
-  if (action.kind !== 'activate') {
-    return { state: { ...state, overlay: { kind: 'commands', picker: searchPickerReducer(state.overlay.picker, action, { searchPickerIndex: COMMAND_INDEX }) } } };
-  }
-  const command = INTERACTIVE_COMMANDS.find((candidate) => candidate.name === action.entry.value);
-  if (command?.requiresValue === true) {
+  const command = INTERACTIVE_COMMANDS.find((candidate) => candidate.name === id);
+  if (command === undefined) return { state };
+  if (command.requiresValue) {
     return updated(setComposerText({ ...state, overlay: { kind: 'none' } }, `${command.name} `), context, {
       kind: 'element', elementId: 'composer'
     });
   }
-  return submit(setComposerText({ ...state, overlay: { kind: 'none' } }, action.entry.value), context, handler);
+  return submit(setComposerText({ ...state, overlay: { kind: 'none' } }, command.name), context, handler);
 }
 
-function updateSearch(
+function transitionSearch(
   state: AgentTuiState,
-  action: Extract<AgentTuiMessage, { type: 'search.action' }>['action'],
-  context: TuiContext
+  transition: Extract<AgentTuiMessage, { type: 'search.transition' }>['transition']
 ): TuiUpdateResult<AgentTuiState, AgentTuiMessage> {
   if (state.overlay.kind !== 'search') return { state };
   const index = conversationSearchIndex(state);
-  if (action.kind !== 'activate') {
-    return { state: { ...state, overlay: { kind: 'search', picker: searchPickerReducer(state.overlay.picker, action, { searchPickerIndex: index }) } } };
-  }
+  return {
+    state: {
+      ...state,
+      overlay: {
+        kind: 'search',
+        picker: searchPickerReducer(
+          state.overlay.picker,
+          transition,
+          { searchPickerIndex: index }
+        )
+      }
+    }
+  };
+}
+
+function acceptSearchResult(
+  state: AgentTuiState,
+  id: string,
+  context: TuiContext
+): TuiUpdateResult<AgentTuiState, AgentTuiMessage> {
+  if (state.overlay.kind !== 'search') return { state };
   const layout = conversationLayout(state, context);
-  const selected = layout.items.find((item) => item.id === action.entry.value);
-  let scroll = scrollReducer(layout.scroll, { kind: 'setFollowTail', followTail: false });
-  if (selected !== undefined) scroll = scrollReducer(scroll, { kind: 'setOffset', rows: layout.starts.get(selected.id) ?? 0 });
+  const selected = layout.items.find((item) => item.id === id);
+  if (selected === undefined) return { state };
+  let scroll = scrollReducer(
+    layout.scroll,
+    { kind: 'setFollowTail', followTail: false },
+    layout.geometry
+  );
+  scroll = scrollReducer(
+    scroll,
+    { kind: 'setOffset', rows: layout.starts.get(selected.id) ?? 0 },
+    layout.geometry
+  );
   return {
     state: {
       ...state,
@@ -205,7 +265,7 @@ function openOverlay(
   if (!canOpenOverlay(state)) return { state };
   if (kind === 'help') return { state: { ...state, overlay: { kind: 'help' }, modalOffsetRow: 0 } };
   if (kind === 'debug') return { state: { ...state, overlay: { kind: 'debug', text: debugText(state) }, modalOffsetRow: 0 } };
-  const picker: SearchPickerState = { query: '' };
+  const picker: AgentTuiPickerState = { query: { text: '' } };
   const overlayState: AgentTuiState = kind === 'commands'
     ? { ...state, overlay: { kind: 'commands', picker }, modalOffsetRow: 0 }
     : { ...state, overlay: { kind: 'search', picker }, modalOffsetRow: 0 };
@@ -278,12 +338,12 @@ function conversationView(state: AgentTuiState, context: TuiContext): Element<Ag
     return viewport(text({ content: 'Start with a message.', id: 'conversation-empty', textRole: 'caption' }), {
       id: 'conversation',
       offset: { row: 0 },
-      onScroll: (event): AgentTuiMessage => ({ type: 'conversation.scroll', action: event.action })
+      onScroll: (event): AgentTuiMessage => ({ type: 'conversation.scrolled', event })
     });
   }
   const window = measuredWindow({
     items: layout.items,
-    viewportRows: layout.scroll.viewportRows,
+    viewportRows: layout.geometry.viewportRows,
     offsetRow: layout.scroll.offsetRow
   });
   const children: Element<AgentTuiMessage>[] = [];
@@ -306,7 +366,7 @@ function conversationView(state: AgentTuiState, context: TuiContext): Element<Ag
     id: 'conversation',
     offset: { row: layout.scroll.offsetRow },
     scrollbar: { axis: 'vertical', visible: 'auto' },
-    onScroll: (event): AgentTuiMessage => ({ type: 'conversation.scroll', action: event.action })
+    onScroll: (event): AgentTuiMessage => ({ type: 'conversation.scrolled', event })
   });
 }
 
@@ -337,12 +397,15 @@ function overlayView(state: AgentTuiState, context: TuiContext): Element<AgentTu
         content: searchPicker({
           id: 'command-picker',
           title: 'Commands',
-          query: state.overlay.picker.query,
+          presentation: state.overlay.picker,
           searchPickerIndex: COMMAND_INDEX,
-          ...(state.overlay.picker.selectedId === undefined ? {} : { selectedId: state.overlay.picker.selectedId }),
           maxVisible: Math.max(3, height - 5),
           helpText: 'Enter choose · Esc close',
-          onAction: (action): AgentTuiMessage => ({ type: 'commands.action', action })
+          onTransition: (transition): AgentTuiMessage => ({
+            type: 'commands.transition',
+            transition
+          }),
+          onAccept: (event): AgentTuiMessage => ({ type: 'commands.accept', event })
         })
       }
     });
@@ -352,13 +415,16 @@ function overlayView(state: AgentTuiState, context: TuiContext): Element<AgentTu
         content: searchPicker({
           id: 'conversation-search',
           title: 'Find in conversation',
-          query: state.overlay.picker.query,
+          presentation: state.overlay.picker,
           searchPickerIndex: conversationSearchIndex(state),
-          ...(state.overlay.picker.selectedId === undefined ? {} : { selectedId: state.overlay.picker.selectedId }),
           maxVisible: Math.max(3, height - 5),
           emptyText: 'No matching messages',
           helpText: 'Enter jump · Esc close',
-          onAction: (action): AgentTuiMessage => ({ type: 'search.action', action })
+          onTransition: (transition): AgentTuiMessage => ({
+            type: 'search.transition',
+            transition
+          }),
+          onAccept: (event): AgentTuiMessage => ({ type: 'search.accept', event })
         })
       }
     });
@@ -431,7 +497,7 @@ function modalViewport(
     id,
     offset: { row: state.modalOffsetRow },
     scrollbar: { axis: 'vertical', visible: 'auto' },
-    onScroll: (event): AgentTuiMessage => ({ type: 'modal.scrolled', offsetRow: event.scroll.offsetRow })
+    onScroll: (event): AgentTuiMessage => ({ type: 'modal.scrolled', offsetRow: event.state.offsetRow })
   });
 }
 
@@ -485,6 +551,7 @@ interface ConversationLayout {
   readonly items: readonly { readonly id: string; readonly value: AgentTuiConversationEntry; readonly rows: number }[];
   readonly starts: ReadonlyMap<string, number>;
   readonly scroll: AgentTuiState['conversation']['scroll'];
+  readonly geometry: ScrollGeometry;
 }
 
 function conversationLayout(state: AgentTuiState, context: TuiContext): ConversationLayout {
@@ -501,9 +568,14 @@ function conversationLayout(state: AgentTuiState, context: TuiContext): Conversa
     starts.set(item.id, totalRows);
     totalRows += item.rows;
   }
-  let scroll = scrollReducer(state.conversation.scroll, { kind: 'setViewport', rows: viewportRows, columns: width });
-  scroll = scrollReducer(scroll, { kind: 'setContent', rows: totalRows, columns: width });
-  return { items, starts, scroll };
+  const geometry: ScrollGeometry = {
+    contentRows: totalRows,
+    contentColumns: width,
+    viewportRows,
+    viewportColumns: width
+  };
+  const scroll = normalizeScrollState(state.conversation.scroll, geometry);
+  return { items, starts, scroll, geometry };
 }
 
 function conversationEntryRows(
