@@ -1,11 +1,14 @@
 import type { AgentApprovalRequest, AgentApprovalSuspension } from '@agent-core/runtime';
 import {
+  applyScrollEvent,
   measuredWindow,
   normalizeScrollState,
   prepareSearchPickerIndex,
   searchPickerReducer,
+  searchPickerEntryById,
   scrollReducer
 } from '@ismail-elkorchi/terminal-ui/behavior';
+import type { SearchPickerIndex } from '@ismail-elkorchi/terminal-ui/behavior';
 import type { ScrollGeometry } from '@ismail-elkorchi/terminal-ui/interaction';
 import {
   button,
@@ -17,7 +20,7 @@ import {
   text,
   textArea
 } from '@ismail-elkorchi/terminal-ui/components';
-import type { Element, InlineContent, SearchEntry } from '@ismail-elkorchi/terminal-ui/components';
+import type { Element, InlineContent } from '@ismail-elkorchi/terminal-ui/components';
 import { column, grid, overlay, row, viewport } from '@ismail-elkorchi/terminal-ui/layout';
 import { wrapTextCells } from '@ismail-elkorchi/terminal-ui/text';
 import { defineTui } from '@ismail-elkorchi/terminal-ui/tui';
@@ -41,7 +44,12 @@ import type { AgentTuiCommandHandler } from './command-surface.js';
 import { applyFailure, applyProgress, applyResult } from './event-reducer.js';
 import type { AgentTuiMessage } from './messages.js';
 import { createInitialAgentTuiState } from './state.js';
-import type { AgentTuiPickerState, AgentTuiRuntimeDetails, AgentTuiState } from './state.js';
+import type {
+  AgentTuiConversationState,
+  AgentTuiPickerState,
+  AgentTuiRuntimeDetails,
+  AgentTuiState,
+} from './state.js';
 import type { AgentTuiActivityEntry, AgentTuiConversationEntry } from './conversation-model.js';
 import { conversationText, toggleActivity } from './conversation.js';
 import { INTERACTIVE_COMMANDS } from './interactive-commands.js';
@@ -136,7 +144,10 @@ function updateAgentTui(
     }
     case 'conversation.scrolled': return updated({
       ...state,
-      conversation: { ...state.conversation, scroll: message.event.state }
+      conversation: {
+        ...state.conversation,
+        scroll: applyScrollEvent(state.conversation.scroll, message.event),
+      }
     }, context);
     case 'activity.toggle': return updated(toggleActivity(state, message.id), context);
     case 'overlay.open': return openOverlay(state, message.overlay, context);
@@ -235,7 +246,7 @@ function acceptSearchResult(
 ): TuiUpdateResult<AgentTuiState, AgentTuiMessage> {
   if (state.overlay.kind !== 'search') return { state };
   const layout = conversationLayout(state, context);
-  const selected = layout.items.find((item) => item.id === id);
+  const selected = searchPickerEntryById(conversationSearchIndex(state), id)?.value;
   if (selected === undefined) return { state };
   let scroll = scrollReducer(
     layout.scroll,
@@ -497,7 +508,10 @@ function modalViewport(
     id,
     offset: { row: state.modalOffsetRow },
     scrollbar: { axis: 'vertical', visible: 'auto' },
-    onScroll: (event): AgentTuiMessage => ({ type: 'modal.scrolled', offsetRow: event.state.offsetRow })
+    onScroll: (event): AgentTuiMessage => ({
+      type: 'modal.scrolled',
+      offsetRow: event.nextState.offsetRow,
+    })
   });
 }
 
@@ -653,13 +667,33 @@ function activitySymbol(status: AgentTuiActivityEntry['status']): InlineContent[
   };
 }
 
-function conversationSearchIndex(state: AgentTuiState) {
-  const entries: SearchEntry[] = visibleConversationItems(state).map((entry) => {
-    const content = conversationText(entry).trim().replaceAll(/\s+/g, ' ');
-    const label = content.length <= 90 ? content : `${content.slice(0, 89)}…`;
-    return { id: entry.id, label: label.length === 0 ? entry.kind : label, value: entry.id, group: entry.kind };
-  });
-  return prepareSearchPickerIndex(entries);
+const conversationSearchIndexes = new WeakMap<
+  AgentTuiConversationState,
+  SearchPickerIndex<AgentTuiConversationEntry>
+>();
+
+function conversationSearchIndex(
+  state: AgentTuiState,
+): SearchPickerIndex<AgentTuiConversationEntry> {
+  const cached = conversationSearchIndexes.get(state.conversation);
+  if (cached !== undefined) return cached;
+  const index = prepareSearchPickerIndex(
+    visibleConversationItems(state),
+    conversationSearchEntry,
+  );
+  conversationSearchIndexes.set(state.conversation, index);
+  return index;
+}
+
+function conversationSearchEntry(entry: AgentTuiConversationEntry) {
+  const content = conversationText(entry).trim().replaceAll(/\s+/g, ' ');
+  const label = content.length <= 90 ? content : `${content.slice(0, 89)}…`;
+  return {
+    id: entry.id,
+    label: label.length === 0 ? entry.kind : label,
+    value: entry,
+    group: entry.kind,
+  };
 }
 
 function visibleConversationItems(state: AgentTuiState): readonly AgentTuiConversationEntry[] {
