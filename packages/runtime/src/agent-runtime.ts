@@ -189,6 +189,7 @@ interface ResolvedContextInputs {
 }
 
 interface AssistantTurnRequest {
+  readonly runId: string;
   readonly input: AgentRunInput;
   readonly runNotes: readonly string[];
   readonly turnIndex: number;
@@ -516,7 +517,7 @@ export class AgentRuntime {
         lastStartedTurnIndex = turnIndex;
         const currentModelSession = modelSession;
         if (!currentModelSession) throw new Error('Model session was not initialized for the turn snapshot.');
-        const assistant = await this.requestAssistantTurn({ input: runtime.input, runNotes, turnIndex, toolBatchId, snapshot, modelSession: currentModelSession, signal: runtime.signal, contextManager, controller: runtime.controller }, runtime.append, runtime.emit);
+        const assistant = await this.requestAssistantTurn({ runId: runtime.runId, input: runtime.input, runNotes, turnIndex, toolBatchId, snapshot, modelSession: currentModelSession, signal: runtime.signal, contextManager, controller: runtime.controller }, runtime.append, runtime.emit);
         activeCandidate = assistant.candidate;
         const { response, toolCalls } = assistant;
 
@@ -693,6 +694,13 @@ export class AgentRuntime {
     const assistantEnded = { type: 'assistant.ended' as const, ...responseIdentity, content: response.content, candidate, ...(toolCalls.length > 0 ? { toolCalls } : {}) };
     await append(assistantEnded);
     await emit(assistantEnded);
+    if (this.options.repositories.session) {
+      await this.options.repositories.session.repository.appendAssistant(this.options.repositories.session.sessionId, {
+        runId: request.runId,
+        identity: responseIdentity,
+        content: response.content
+      });
+    }
     return { response, toolCalls, candidate };
   }
 

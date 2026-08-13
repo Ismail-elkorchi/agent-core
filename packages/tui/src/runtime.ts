@@ -204,6 +204,7 @@ export async function runAgentTuiApp(
   });
   const initialTask = options.initialTask;
   try {
+    await session.restore();
     if (initialTask !== undefined) await session.submit({ task: initialTask });
     const exitResult = await exit;
     await session.waitForIdle();

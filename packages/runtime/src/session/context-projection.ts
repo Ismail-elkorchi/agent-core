@@ -12,6 +12,7 @@ export function createSessionContextProjection(input: {
   terminal: AgentTerminalSnapshot;
   throughEntryId: string;
   previous?: SessionContextProjection;
+  baseSummary?: string;
 }): SessionContextProjection {
   const task = [...input.branchEntries].reverse().find((entry): entry is Extract<SessionBranchEntry, { type: 'input' }> => entry.type === 'input' && entry.runId === input.terminal.runId)?.task ?? '';
   const digest: SessionTurnDigest = {
@@ -25,7 +26,7 @@ export function createSessionContextProjection(input: {
   const evicted = allRecent.slice(0, Math.max(0, allRecent.length - RECENT_TURN_LIMIT));
   const recentTurns = allRecent.slice(-RECENT_TURN_LIMIT);
   const historyDigest = keepUtf8Tail([
-    input.previous?.historyDigest ?? '',
+    input.baseSummary ?? input.previous?.historyDigest ?? '',
     ...evicted.map(renderTurnDigest)
   ].filter(Boolean).join('\n'), HISTORY_DIGEST_MAX_BYTES);
   return Object.freeze({

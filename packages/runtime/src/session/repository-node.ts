@@ -34,8 +34,12 @@ import type {
   SessionDescriptor,
   BaseSessionEntry,
   CreateSessionOptions,
+  SessionAssistantEntry,
   SessionBranchEntry,
   SessionBranchMarkerEntry,
+  SessionBranchPoint,
+  SessionCompactionEntry,
+  SessionConversationItem,
   SessionContextProjection,
   SessionFinalProjection,
   SessionHeader,
@@ -43,12 +47,18 @@ import type {
   SessionModelSettingsEntry,
   SessionObservationEntry,
   SessionObservationInput,
+  SessionPendingSubmission,
   SessionReplayState,
   SessionRepository,
+  SessionSubmissionInput,
+  SessionSubmissionConfiguration,
+  SessionSubmissionRecord,
+  SessionSubmissionState,
   SessionSummary,
   SessionToolCallEntry
 } from './contracts.js';
 import { createSessionContextProjection } from './context-projection.js';
+import { createSessionSubmissionTransition, ownSessionSubmissionConfiguration, ownSessionSubmissionInput, pendingSessionSubmissions } from './submission-lifecycle.js';
 
 export interface JsonlSessionRepositoryOptions {
   readonly rootDir: string;
@@ -88,7 +98,7 @@ export class JsonlSessionRepository implements SessionRepository {
       const serialized = `${JSON.stringify(header)}\n`;
       await fs.writeFile(this.filePath(id), serialized, { encoding: 'utf8', flag: 'wx' });
       const completeBytes = Buffer.byteLength(serialized, 'utf8');
-      const state: SessionAppendIndex = { header, branchEntries: [], projections: [], contextProjections: [], completeBytes, boundaryMarker: Buffer.from(serialized).subarray(-256).toString('base64'), storageStamp: await jsonlStorageStamp(this.filePath(id)) };
+      const state: SessionAppendIndex = { header, branchEntries: [], projections: [], contextProjections: [], submissionRecords: [], completeBytes, boundaryMarker: Buffer.from(serialized).subarray(-256).toString('base64'), storageStamp: await jsonlStorageStamp(this.filePath(id)) };
       this.indexes.set(id, state);
       return sessionFromState(state);
     }));
@@ -126,21 +136,56 @@ export class JsonlSessionRepository implements SessionRepository {
     const branch = Object.freeze(activeBranch(state.branchEntries, leafId === undefined ? session.leafId : leafId));
     const branchIds = new Set(branch.map((entry) => entry.id));
     const contextProjection = [...state.contextProjections].reverse().find((projection) => branchIds.has(projection.throughEntryId));
-    const latestEndedRunId = contextProjection?.recentTurns.at(-1)?.runId;
-    const tailStart = contextProjection ? branch.findIndex((entry) => entry.id === contextProjection.throughEntryId) + 1 : 0;
+    const compaction = [...branch].reverse().find((entry): entry is SessionCompactionEntry => entry.type === 'compaction');
+    const contextIndex = contextProjection ? branch.findIndex((entry) => entry.id === contextProjection.throughEntryId) : -1;
+    const compactionIndex = compaction ? branch.findIndex((entry) => entry.id === compaction.id) : -1;
+    const latestEndedRunId = contextIndex > compactionIndex ? contextProjection?.recentTurns.at(-1)?.runId : undefined;
+    const tailStart = Math.max(contextIndex, compactionIndex) + 1;
     const tailRunIds = [...new Set(branch.slice(tailStart).flatMap((entry) => entry.type === 'input' ? [entry.runId] : []))];
     const relevantRunIds = new Set([...tailRunIds, ...(latestEndedRunId ? [latestEndedRunId] : [])]);
     const terminalProjections = Object.freeze(state.projections.filter((projection) => relevantRunIds.has(projection.runId)));
     const endedRunIds = new Set(terminalProjections.map((projection) => projection.runId));
     const openRunIds = tailRunIds.filter((runId) => !endedRunIds.has(runId));
     const ledgerRunIds = Object.freeze([...new Set([...openRunIds, ...(latestEndedRunId ? [latestEndedRunId] : [])])]);
-    return Object.freeze({ session, branch, terminalProjections, ...(contextProjection ? { contextProjection } : {}), ledgerRunIds });
+    return Object.freeze({ session, branch, terminalProjections, ...(contextProjection ? { contextProjection } : {}), ...(compaction ? { compaction } : {}), ledgerRunIds });
+  }
+
+  async readConversation(sessionId: string): Promise<readonly SessionConversationItem[]> {
+    const replay = await this.loadReplayState(sessionId);
+    return Object.freeze(replay.branch.filter((entry): entry is SessionConversationItem => entry.type !== 'branch' && entry.type !== 'model_settings'));
+  }
+
+  async listBranchPoints(sessionId: string): Promise<readonly SessionBranchPoint[]> {
+    const state = await this.enqueue(sessionId, () => this.refreshIndex(sessionId, false));
+    const points: SessionBranchPoint[] = state.contextProjections.map((projection) => {
+      const runId = state.projections.find((item) => item.finalizationId === projection.throughFinalizationId)?.runId;
+      return Object.freeze({ entryId: projection.throughEntryId, timestamp: projection.timestamp, kind: 'final' as const,
+        finalizationId: projection.throughFinalizationId, ...(runId === undefined ? {} : { runId }) });
+    });
+    for (const entry of state.branchEntries) if (entry.type === 'compaction') points.push(Object.freeze({ entryId: entry.id, timestamp: entry.timestamp, kind: 'compaction' }));
+    return Object.freeze(points);
   }
 
   appendInput(sessionId: string, input: { runId: string; task: string; instructions?: readonly AgentEffectiveInstruction[] }): Promise<SessionInputEntry> {
     return this.appendBranchEntry(sessionId, (parentId) => Object.freeze({
       ...baseEntry(parentId), type: 'input', runId: input.runId, task: input.task,
       instructions: Object.freeze((input.instructions ?? []).map((instruction) => Object.freeze({ ...instruction })))
+    }));
+  }
+
+  appendAssistant(sessionId: string, input: { runId: string; identity: AgentTurnIdentity; content: string }): Promise<SessionAssistantEntry> {
+    return this.enqueue(sessionId, () => withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
+      const state = await this.refreshIndex(sessionId, true);
+      const existing = state.branchEntries.find((entry): entry is SessionAssistantEntry => entry.type === 'assistant'
+        && entry.runId === input.runId && entry.turnId === input.identity.turnId && entry.requestAttempt === input.identity.requestAttempt);
+      if (existing) {
+        if (existing.turnIndex !== input.identity.turnIndex || existing.content !== input.content) throw new PersistenceConflictError(`Conflicting assistant projection for ${input.runId}/${input.identity.turnId}/${String(input.identity.requestAttempt)}.`);
+        return existing;
+      }
+      const entry: SessionAssistantEntry = Object.freeze({ ...baseEntry(branchLeaf(state.branchEntries)), type: 'assistant', runId: input.runId, ...input.identity, content: input.content });
+      await this.appendRecord(sessionId, state, entry);
+      state.branchEntries.push(entry);
+      return entry;
     }));
   }
 
@@ -178,10 +223,28 @@ export class JsonlSessionRepository implements SessionRepository {
     }));
   }
 
+  appendCompaction(sessionId: string, input: { summary: string; provider: string; model: string }): Promise<SessionCompactionEntry> {
+    return this.enqueue(sessionId, () => withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
+      const state = await this.refreshIndex(sessionId, true);
+      assertStableBranch(state);
+      const summary = input.summary.trim();
+      if (summary.length === 0) throw new Error('Session compaction summary must not be empty.');
+      if (Buffer.byteLength(summary, 'utf8') > 64 * 1024) throw new Error('Session compaction summary exceeds 64 KiB.');
+      const entry: SessionCompactionEntry = Object.freeze({ ...baseEntry(branchLeaf(state.branchEntries)), type: 'compaction', summary, provider: input.provider, model: input.model });
+      await this.appendRecord(sessionId, state, entry);
+      state.branchEntries.push(entry);
+      return entry;
+    }));
+  }
+
   branchFrom(sessionId: string, entryId: string, label?: string): Promise<SessionBranchMarkerEntry> {
     return this.enqueue(sessionId, () => withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
       const state = await this.refreshIndex(sessionId, true);
-      if (!state.branchEntries.some((entry) => entry.id === entryId)) throw new Error(`Cannot branch from unknown entry: ${entryId}`);
+      const source = state.branchEntries.find((entry) => entry.id === entryId);
+      if (!source) throw new Error(`Cannot branch from unknown entry: ${entryId}`);
+      if (source.type !== 'compaction' && !state.contextProjections.some((projection) => projection.throughEntryId === entryId)) {
+        throw new Error(`Session branches require a completed final or compaction entry: ${entryId}`);
+      }
       const entry: SessionBranchMarkerEntry = Object.freeze({ ...baseEntry(entryId), type: 'branch', fromEntryId: entryId, ...(label ? { label } : {}) });
       await appendJsonlRecord(this.filePath(sessionId), entry);
       state.branchEntries.push(entry);
@@ -219,10 +282,43 @@ export class JsonlSessionRepository implements SessionRepository {
     }));
   }
 
+  enqueueSubmission(sessionId: string, input: { submissionId: string; runId: string; input: SessionSubmissionInput; configuration: SessionSubmissionConfiguration }): Promise<void> {
+    return this.enqueue(sessionId, () => withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
+      const state = await this.refreshIndex(sessionId, true);
+      if (state.submissionRecords.some((record) => record.submissionId === input.submissionId)) throw new Error(`Duplicate session submission: ${input.submissionId}`);
+      const record: SessionSubmissionRecord = Object.freeze({ type: 'submission.queued', submissionId: input.submissionId, runId: input.runId,
+        timestamp: new Date().toISOString(), input: ownSessionSubmissionInput(input.input), configuration: ownSessionSubmissionConfiguration(input.configuration) });
+      await this.appendRecord(sessionId, state, record);
+      state.submissionRecords.push(record);
+    }));
+  }
+
+  transitionSubmission(sessionId: string, submissionId: string, outcome: { state: SessionSubmissionState; errorMessage?: string }): Promise<void> {
+    return this.enqueue(sessionId, () => withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
+      const state = await this.refreshIndex(sessionId, true);
+      const record = createSessionSubmissionTransition(state.submissionRecords, submissionId, outcome.state, outcome.errorMessage);
+      if (!record) return;
+      await this.appendRecord(sessionId, state, record);
+      state.submissionRecords.push(record);
+    }));
+  }
+
+  async loadPendingSubmissions(sessionId: string): Promise<readonly SessionPendingSubmission[]> {
+    const state = await this.enqueue(sessionId, () => this.refreshIndex(sessionId, false));
+    return pendingSessionSubmissions(state.submissionRecords);
+  }
+
   private async appendContextProjection(sessionId: string, state: SessionAppendIndex, projection: SessionContextProjection): Promise<void> {
     await appendJsonlRecord(this.filePath(sessionId), projection);
     state.contextProjections.push(projection);
     state.completeBytes += recordBytes(projection);
+  }
+
+  private async appendRecord(sessionId: string, state: SessionAppendIndex, record: SessionBranchEntry | SessionSubmissionRecord): Promise<void> {
+    await appendJsonlRecord(this.filePath(sessionId), 'submissionId' in record ? encodeSubmissionRecord(record) : record);
+    state.completeBytes += recordBytes(record);
+    state.boundaryMarker = await jsonlBoundaryMarker(this.filePath(sessionId), state.completeBytes);
+    state.storageStamp = await jsonlStorageStamp(this.filePath(sessionId));
   }
 
   private appendBranchEntry<T extends SessionBranchEntry>(sessionId: string, create: (parentId: string | null) => T): Promise<T> {
@@ -263,6 +359,7 @@ export class JsonlSessionRepository implements SessionRepository {
       index.branchEntries.splice(0, index.branchEntries.length, ...state.branchEntries);
       index.projections.splice(0, index.projections.length, ...state.projections);
       index.contextProjections.splice(0, index.contextProjections.length, ...state.contextProjections);
+      index.submissionRecords.splice(0, index.submissionRecords.length, ...state.submissionRecords);
       index.completeBytes = committed.completeBytes;
       index.boundaryMarker = await jsonlBoundaryMarker(filePath, index.completeBytes);
       if (repairTornTail && size > index.completeBytes) await fs.truncate(filePath, index.completeBytes);
@@ -280,6 +377,7 @@ export class JsonlSessionRepository implements SessionRepository {
       try {
         if (isJsonObject(value) && value.type === 'final') index.projections.push(parseFinalProjection(value));
         else if (isJsonObject(value) && value.type === 'context') index.contextProjections.push(parseContextProjection(value));
+        else if (isJsonObject(value) && typeof value.type === 'string' && value.type.startsWith('submission.')) index.submissionRecords.push(parseSubmissionRecord(value));
         else {
           const entry = parseBranchEntry(value);
           if (entry.parentId !== null && !index.branchEntries.some((candidate) => candidate.id === entry.parentId)) throw new Error(`Unknown parent ${entry.parentId}.`);
@@ -287,6 +385,11 @@ export class JsonlSessionRepository implements SessionRepository {
           index.branchEntries.push(entry);
         }
       } catch (error) { throw corruption(filePath, actualLine, line.byteOffset, errorMessage(error), 'invalid_record'); }
+    }
+    try { pendingSessionSubmissions(index.submissionRecords); }
+    catch (error) {
+      const last = lines.at(-1);
+      throw corruption(filePath, last?.line ?? sessionRecordCount(index) + 1, last?.byteOffset ?? index.completeBytes, errorMessage(error), 'invalid_record');
     }
     index.completeBytes += consumed;
     index.boundaryMarker = await jsonlBoundaryMarker(filePath, index.completeBytes);
@@ -307,13 +410,13 @@ export class JsonlSessionRepository implements SessionRepository {
   }
 }
 
-interface SessionFileState { readonly header: SessionHeader; readonly branchEntries: SessionBranchEntry[]; readonly projections: SessionFinalProjection[]; readonly contextProjections: SessionContextProjection[] }
+interface SessionFileState { readonly header: SessionHeader; readonly branchEntries: SessionBranchEntry[]; readonly projections: SessionFinalProjection[]; readonly contextProjections: SessionContextProjection[]; readonly submissionRecords: SessionSubmissionRecord[] }
 interface SessionAppendIndex extends SessionFileState { completeBytes: number; boundaryMarker: string; storageStamp: JsonlStorageStamp }
 function sessionUpdatedAt(state: SessionFileState): string {
-  return [...state.branchEntries, ...state.projections, ...state.contextProjections]
+  return [...state.branchEntries, ...state.projections, ...state.contextProjections, ...state.submissionRecords]
     .reduce((latest, entry) => entry.timestamp > latest ? entry.timestamp : latest, state.header.timestamp);
 }
-function sessionRecordCount(state: SessionFileState): number { return state.branchEntries.length + state.projections.length + state.contextProjections.length; }
+function sessionRecordCount(state: SessionFileState): number { return state.branchEntries.length + state.projections.length + state.contextProjections.length + state.submissionRecords.length; }
 
 async function readSessionFile(filePath: string, sessionId: string): Promise<{ readonly state: SessionFileState; readonly completeBytes: number }> {
   const committed = await readJsonlCommittedFile(filePath);
@@ -327,26 +430,35 @@ async function readSessionFile(filePath: string, sessionId: string): Promise<{ r
   const branchEntries: SessionBranchEntry[] = [];
   const projections: SessionFinalProjection[] = [];
   const contextProjections: SessionContextProjection[] = [];
+  const submissionRecords: SessionSubmissionRecord[] = [];
   for (const line of lines.slice(1)) {
     if (line.text.trim().length === 0) continue;
     const value = parseJson(line, filePath);
     try {
       if (isJsonObject(value) && value.type === 'final') projections.push(parseFinalProjection(value));
       else if (isJsonObject(value) && value.type === 'context') contextProjections.push(parseContextProjection(value));
+      else if (isJsonObject(value) && typeof value.type === 'string' && value.type.startsWith('submission.')) submissionRecords.push(parseSubmissionRecord(value));
       else branchEntries.push(parseBranchEntry(value));
     } catch (error) { throw corruption(filePath, line.line, line.byteOffset, errorMessage(error), 'invalid_record'); }
   }
   validateParents(branchEntries, filePath);
-  return { state: { header, branchEntries, projections, contextProjections }, completeBytes: committed.completeBytes };
+  try { pendingSessionSubmissions(submissionRecords); }
+  catch (error) {
+    const last = lines.at(-1);
+    throw corruption(filePath, last?.line ?? 1, last?.byteOffset ?? 0, errorMessage(error), 'invalid_record');
+  }
+  return { state: { header, branchEntries, projections, contextProjections, submissionRecords }, completeBytes: committed.completeBytes };
 }
 
 function parseBranchEntry(value: JsonValue): SessionBranchEntry {
   if (!isRecord(value) || !validBaseEntry(value)) throw new Error('Session entry base is invalid.');
   if (isSessionInputEntry(value)) return value;
+  if (isSessionAssistantEntry(value)) return value;
   if (isSessionToolCallEntry(value)) return value;
   if (isSessionObservationEntry(value)) return value;
   if (isSessionBranchMarkerEntry(value)) return value;
   if (isSessionModelSettingsEntry(value)) return value;
+  if (isSessionCompactionEntry(value)) return value;
   throw new Error(`Unsupported or malformed session entry: ${typeof value.type === 'string' ? value.type : 'unknown'}`);
 }
 function parseFinalProjection(value: JsonObject): SessionFinalProjection {
@@ -396,7 +508,15 @@ function contextProjectionForTerminal(state: SessionFileState, terminal: AgentTe
   }
   const branchIds = new Set(branch.map((entry) => entry.id));
   const previous = [...state.contextProjections].reverse().find((projection) => branchIds.has(projection.throughEntryId));
-  return createSessionContextProjection({ branchEntries: branch, terminal, throughEntryId, ...(previous ? { previous } : {}) });
+  let compactionIndex = -1;
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    if (branch[index]?.type === 'compaction') { compactionIndex = index; break; }
+  }
+  const previousIndex = previous ? branch.findIndex((entry) => entry.id === previous.throughEntryId) : -1;
+  const candidate = compactionIndex > previousIndex ? branch[compactionIndex] : undefined;
+  const compaction = candidate?.type === 'compaction' ? candidate : undefined;
+  return createSessionContextProjection({ branchEntries: branch, terminal, throughEntryId,
+    ...(compaction ? { baseSummary: compaction.summary } : previous ? { previous } : {}) });
 }
 function sessionFromState(state: SessionFileState): SessionDescriptor { return Object.freeze({ id: state.header.id, header: state.header, leafId: branchLeaf(state.branchEntries) }); }
 function baseEntry(parentId: string | null): BaseSessionEntry { return { id: randomUUID(), parentId, timestamp: new Date().toISOString() }; }
@@ -487,6 +607,9 @@ function isSessionInputEntry(value: Record<string, unknown> & BaseSessionEntry):
   return value.type === 'input' && typeof value.runId === 'string' && value.runId.length > 0 && typeof value.task === 'string'
     && Array.isArray(value.instructions) && value.instructions.every(isEffectiveInstruction);
 }
+function isSessionAssistantEntry(value: Record<string, unknown> & BaseSessionEntry): value is Record<string, unknown> & SessionAssistantEntry {
+  return value.type === 'assistant' && validTurnIdentity(value) && typeof value.runId === 'string' && value.runId.length > 0 && typeof value.content === 'string';
+}
 function isSessionToolCallEntry(value: Record<string, unknown> & BaseSessionEntry): value is Record<string, unknown> & SessionToolCallEntry {
   return value.type === 'tool_call' && validTurnIdentity(value) && typeof value.runId === 'string' && value.runId.length > 0
     && typeof value.toolBatchId === 'string' && value.toolBatchId.length > 0 && nonnegativeInteger(value.callIndex)
@@ -509,6 +632,147 @@ function isSessionModelSettingsEntry(value: Record<string, unknown> & BaseSessio
     && (value.temperature === undefined || (typeof value.temperature === 'number' && Number.isFinite(value.temperature)))
     && (value.reasoningEffort === undefined || typeof value.reasoningEffort === 'string');
 }
+function isSessionCompactionEntry(value: Record<string, unknown> & BaseSessionEntry): value is Record<string, unknown> & SessionCompactionEntry {
+  return value.type === 'compaction' && typeof value.summary === 'string' && value.summary.length > 0
+    && typeof value.provider === 'string' && value.provider.length > 0 && typeof value.model === 'string' && value.model.length > 0;
+}
+
+function parseSubmissionRecord(value: JsonObject): SessionSubmissionRecord {
+  if (typeof value.submissionId !== 'string' || value.submissionId.length === 0 || typeof value.runId !== 'string' || value.runId.length === 0 || typeof value.timestamp !== 'string') {
+    throw new Error('Session submission identity is invalid.');
+  }
+  if (value.type === 'submission.queued') {
+    if (!isJsonObject(value.input) || !isJsonObject(value.configuration)) throw new Error('Queued session submission input is invalid.');
+    return Object.freeze({ type: 'submission.queued', submissionId: value.submissionId, runId: value.runId, timestamp: value.timestamp,
+      input: parseSubmissionInput(value.input), configuration: parseSubmissionConfiguration(value.configuration) });
+  }
+  if (value.type !== 'submission.claimed' && value.type !== 'submission.suspended' && value.type !== 'submission.completed' && value.type !== 'submission.failed') throw new Error('Session submission state is invalid.');
+  if (value.errorMessage !== undefined && typeof value.errorMessage !== 'string') throw new Error('Session submission error is invalid.');
+  return Object.freeze({ type: value.type, submissionId: value.submissionId, runId: value.runId, timestamp: value.timestamp,
+    ...(value.errorMessage === undefined ? {} : { errorMessage: value.errorMessage }) });
+}
+
+function parseSubmissionInput(value: JsonObject): SessionSubmissionInput {
+  if (typeof value.task !== 'string' || !isOptionalStringArray(value.instructions)
+    || (value.contextItems !== undefined && !Array.isArray(value.contextItems))) throw new Error('Session submission input is invalid.');
+  return Object.freeze({ task: value.task,
+    ...(value.instructions === undefined ? {} : { instructions: Object.freeze([...value.instructions]) }),
+    ...(value.contextItems === undefined ? {} : { contextItems: Object.freeze(value.contextItems.map(parseContextItem)) }) });
+}
+
+function parseSubmissionConfiguration(value: JsonObject): SessionSubmissionConfiguration {
+  if (typeof value.provider !== 'string' || value.provider.length === 0 || typeof value.model !== 'string' || value.model.length === 0
+    || (value.temperature !== undefined && (typeof value.temperature !== 'number' || !Number.isFinite(value.temperature)))) throw new Error('Session submission configuration is invalid.');
+  return Object.freeze({ provider: value.provider, model: value.model,
+    ...(value.temperature === undefined ? {} : { temperature: value.temperature }),
+    ...(value.reasoning === undefined ? {} : { reasoning: parseSubmissionReasoning(value.reasoning) }),
+    ...(value.responseFormat === undefined ? {} : { responseFormat: parseSubmissionResponseFormat(value.responseFormat) }) });
+}
+
+function parseSubmissionReasoning(value: JsonValue): NonNullable<SessionSubmissionConfiguration['reasoning']> {
+  if (!isJsonObject(value)) throw new Error('Session submission reasoning is invalid.');
+  if (value.strategy === 'disabled') return Object.freeze({ strategy: 'disabled' });
+  const summary = value.summary;
+  if (summary !== undefined && summary !== 'auto' && summary !== 'concise' && summary !== 'detailed') throw new Error('Session submission reasoning summary is invalid.');
+  if (value.strategy === 'enabled') return Object.freeze({ strategy: 'enabled', ...(summary === undefined ? {} : { summary }) });
+  if (value.strategy === 'effort') {
+    if (value.effort !== 'minimal' && value.effort !== 'low' && value.effort !== 'medium' && value.effort !== 'high' && value.effort !== 'xhigh' && value.effort !== 'max') throw new Error('Session submission reasoning effort is invalid.');
+    if (value.mode !== undefined && value.mode !== 'standard' && value.mode !== 'pro') throw new Error('Session submission reasoning mode is invalid.');
+    return Object.freeze({ strategy: 'effort', effort: value.effort, ...(value.mode === undefined ? {} : { mode: value.mode }), ...(summary === undefined ? {} : { summary }) });
+  }
+  if (value.strategy === 'budget' && typeof value.maxTokens === 'number' && Number.isSafeInteger(value.maxTokens) && value.maxTokens > 0) {
+    return Object.freeze({ strategy: 'budget', maxTokens: value.maxTokens, ...(summary === undefined ? {} : { summary }) });
+  }
+  throw new Error('Session submission reasoning strategy is invalid.');
+}
+
+function parseSubmissionResponseFormat(value: JsonValue): NonNullable<SessionSubmissionConfiguration['responseFormat']> {
+  if (value === 'text' || value === 'json') return value;
+  if (!isJsonObject(value) || value.type !== 'json_schema' || !isJsonObject(value.schema)) throw new Error('Session submission response format is invalid.');
+  return Object.freeze({ type: 'json_schema', schema: value.schema });
+}
+
+function isOptionalStringArray(value: JsonValue | undefined): value is readonly string[] | undefined {
+  return value === undefined || (Array.isArray(value) && value.every((item) => typeof item === 'string'));
+}
+
+function parseContextItem(value: unknown): NonNullable<SessionSubmissionInput['contextItems']>[number] {
+  if (!isRecord(value) || typeof value.sourceUri !== 'string'
+    || (value.sourceKind !== 'user' && value.sourceKind !== 'external' && value.sourceKind !== 'session' && value.sourceKind !== 'tool-observation' && value.sourceKind !== 'generated')
+    || (value.confidence !== undefined && value.confidence !== 'unverified' && value.confidence !== 'verified')
+    || (value.representation !== 'full' && value.representation !== 'excerpt' && value.representation !== 'summary')
+    || typeof value.mediaType !== 'string' || typeof value.title !== 'string' || typeof value.content !== 'string'
+    || typeof value.selectionReason !== 'string' || typeof value.score !== 'number' || !Number.isFinite(value.score)
+    || (value.id !== undefined && typeof value.id !== 'string')
+    || (value.tokenEstimate !== undefined && !nonnegativeInteger(value.tokenEstimate))) throw new Error('Session context item is invalid.');
+  const range = value.range === undefined ? undefined : parseContextRange(value.range);
+  return Object.freeze({
+    sourceUri: value.sourceUri, sourceKind: value.sourceKind,
+    ...(value.confidence === undefined ? {} : { confidence: value.confidence }),
+    representation: value.representation, mediaType: value.mediaType, title: value.title, content: value.content,
+    ...(range === undefined ? {} : { range }), selectionReason: value.selectionReason, score: value.score,
+    ...(value.id === undefined ? {} : { id: value.id }), ...(value.tokenEstimate === undefined ? {} : { tokenEstimate: value.tokenEstimate })
+  });
+}
+
+function parseContextRange(value: unknown): NonNullable<NonNullable<SessionSubmissionInput['contextItems']>[number]['range']> {
+  if (!isRecord(value) || (value.kind !== 'line' && value.kind !== 'byte')
+    || (value.start !== undefined && !nonnegativeInteger(value.start)) || (value.end !== undefined && !nonnegativeInteger(value.end))
+    || (typeof value.start === 'number' && typeof value.end === 'number' && value.end < value.start)) throw new Error('Session context range is invalid.');
+  return Object.freeze({ kind: value.kind, ...(value.start === undefined ? {} : { start: value.start }), ...(value.end === undefined ? {} : { end: value.end }) });
+}
+
+function encodeSubmissionRecord(record: SessionSubmissionRecord): JsonObject {
+  if (record.type === 'submission.queued') return Object.freeze({
+    type: record.type, submissionId: record.submissionId, runId: record.runId, timestamp: record.timestamp,
+    input: encodeSubmissionInput(record.input), configuration: encodeSubmissionConfiguration(record.configuration)
+  });
+  return Object.freeze({ type: record.type, submissionId: record.submissionId, runId: record.runId, timestamp: record.timestamp,
+    ...(record.errorMessage === undefined ? {} : { errorMessage: record.errorMessage }) });
+}
+
+function encodeSubmissionConfiguration(configuration: SessionSubmissionConfiguration): JsonObject {
+  return Object.freeze({ provider: configuration.provider, model: configuration.model,
+    ...(configuration.temperature === undefined ? {} : { temperature: configuration.temperature }),
+    ...(configuration.reasoning === undefined ? {} : { reasoning: encodeSubmissionReasoning(configuration.reasoning) }),
+    ...(configuration.responseFormat === undefined ? {} : { responseFormat: typeof configuration.responseFormat === 'string'
+      ? configuration.responseFormat
+      : Object.freeze({ type: 'json_schema', schema: configuration.responseFormat.schema }) }) });
+}
+
+function encodeSubmissionReasoning(reasoning: NonNullable<SessionSubmissionConfiguration['reasoning']>): JsonObject {
+  switch (reasoning.strategy) {
+    case 'disabled': return Object.freeze({ strategy: 'disabled' });
+    case 'enabled': return Object.freeze({ strategy: 'enabled', ...(reasoning.summary === undefined ? {} : { summary: reasoning.summary }) });
+    case 'effort': return Object.freeze({ strategy: 'effort', effort: reasoning.effort,
+      ...(reasoning.mode === undefined ? {} : { mode: reasoning.mode }), ...(reasoning.summary === undefined ? {} : { summary: reasoning.summary }) });
+    case 'budget': return Object.freeze({ strategy: 'budget', maxTokens: reasoning.maxTokens,
+      ...(reasoning.summary === undefined ? {} : { summary: reasoning.summary }) });
+  }
+}
+
+function encodeSubmissionInput(input: SessionSubmissionInput): JsonObject {
+  return Object.freeze({ task: input.task,
+    ...(input.instructions === undefined ? {} : { instructions: Object.freeze([...input.instructions]) }),
+    ...(input.contextItems === undefined ? {} : { contextItems: Object.freeze(input.contextItems.map(encodeContextItem)) }) });
+}
+
+function encodeContextItem(item: NonNullable<SessionSubmissionInput['contextItems']>[number]): JsonObject {
+  return Object.freeze({ sourceUri: item.sourceUri, sourceKind: item.sourceKind,
+    ...(item.confidence === undefined ? {} : { confidence: item.confidence }), representation: item.representation,
+    mediaType: item.mediaType, title: item.title, content: item.content,
+    ...(item.range === undefined ? {} : { range: Object.freeze({ kind: item.range.kind,
+      ...(item.range.start === undefined ? {} : { start: item.range.start }), ...(item.range.end === undefined ? {} : { end: item.range.end }) }) }),
+    selectionReason: item.selectionReason, score: item.score,
+    ...(item.id === undefined ? {} : { id: item.id }), ...(item.tokenEstimate === undefined ? {} : { tokenEstimate: item.tokenEstimate }) });
+}
+
+function assertStableBranch(state: SessionFileState): void {
+  const branch = activeBranch(state.branchEntries, branchLeaf(state.branchEntries));
+  const completed = new Set(state.projections.map((projection) => projection.runId));
+  if (branch.some((entry) => entry.type === 'input' && !completed.has(entry.runId))) throw new Error('Session compaction requires every run on the active branch to be finalized.');
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function isJsonObject(value: JsonValue | undefined): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function nodeCode(error: unknown): string | undefined { return isRecord(error) && typeof error.code === 'string' ? error.code : undefined; }

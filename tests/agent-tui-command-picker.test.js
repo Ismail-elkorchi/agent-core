@@ -76,6 +76,7 @@ function fakeAgent() {
       };
     },
     subscribe() { return () => {}; },
+    async restore() {},
     async waitForIdle() {},
     async configure() { return this.state(); },
     async submit() { throw new Error('fake session does not execute runs'); },

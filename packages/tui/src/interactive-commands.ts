@@ -19,6 +19,7 @@ export type InteractiveCommandName =
   | '/reasoning-effort'
   | '/steer'
   | '/follow'
+  | '/compact'
   | '/abort'
   | '/status'
   | '/debug';
@@ -36,15 +37,19 @@ export type InteractiveCommandEffect =
 export const INTERACTIVE_COMMAND_REGISTRY = {
   '/exit': command('/exit', 'Exit the interactive surface.', false, () => ({ message: 'Exit requested.' })),
   '/quit': command('/quit', 'Exit the interactive surface.', false, () => ({ message: 'Exit requested.' })),
-  '/model': command('/model', 'Set the model for the next run.', true, async (session, value) => { const state = await session.configure({ model: value }); return { message: `Model: ${state.configuration.model}` }; }),
-  '/temperature': command('/temperature', 'Set provider temperature for the next run.', true, async (session, value) => { const temperature = Number(value); if (!Number.isFinite(temperature)) throw new Error('/temperature requires a number.'); await session.configure({ temperature }); return { message: `Temperature: ${String(temperature)}` }; }),
-  '/reasoning-effort': command('/reasoning-effort', 'Set provider reasoning effort for the next run.', true, async (session, value) => { const effort = parseReasoningEffort(value, '/reasoning-effort'); await session.configure({ reasoning: effort === 'none' ? { strategy: 'disabled' } : { strategy: 'effort', effort } }); return { message: `Reasoning effort: ${effort}` }; }),
+  '/model': command('/model', 'Set the model for new submissions.', true, async (session, value) => { const state = await session.configure({ model: value }); return { message: `Model: ${state.configuration.model}` }; }),
+  '/temperature': command('/temperature', 'Set provider temperature for new submissions.', true, async (session, value) => { const temperature = Number(value); if (!Number.isFinite(temperature)) throw new Error('/temperature requires a number.'); await session.configure({ temperature }); return { message: `Temperature: ${String(temperature)}` }; }),
+  '/reasoning-effort': command('/reasoning-effort', 'Set provider reasoning effort for new submissions.', true, async (session, value) => { const effort = parseReasoningEffort(value, '/reasoning-effort'); await session.configure({ reasoning: effort === 'none' ? { strategy: 'disabled' } : { strategy: 'effort', effort } }); return { message: `Reasoning effort: ${effort}` }; }),
   '/steer': command('/steer', 'Steer the active run.', true, async (session, value) => { const activeRunId = session.state().activeRunId; const result = await session.submit({ task: value }, { delivery: 'steer', ...(activeRunId === undefined ? {} : { expectedRunId: activeRunId }) }); if (result.kind === 'rejected') throw new Error('No matching active run can accept steering.'); return { message: 'Steering accepted.' }; }),
   '/follow': command('/follow', 'Queue a follow-up after current work.', true, async (session, value) => {
     const result = await session.submit({ task: value }, { delivery: 'follow_up' });
     return result.kind === 'queued'
       ? { message: 'Follow-up queued.', effect: { type: 'follow-up-queued', task: value } }
       : { message: 'Run started.' };
+  }),
+  '/compact': command('/compact', 'Summarize stable session history for future turns.', false, async (session) => {
+    const compaction = await session.compact();
+    return { message: `Session compacted with ${compaction.provider}/${compaction.model}.` };
   }),
   '/abort': command('/abort', 'Abort the active run.', false, (session, value) => { if (!session.abort(value || undefined, session.state().activeRunId)) throw new Error('No active run to abort.'); return { message: 'Abort requested.', effect: { type: 'abort-requested', reason: value || 'requested' } }; }),
   '/status': command('/status', 'Show the current session status.', false, session => ({ message: runtimeStatus(session.state()) })),
@@ -84,6 +89,6 @@ function requireCommandValue(command: string, value: string): string {
 }
 
 function runtimeStatus(state: AgentSessionState): string {
-  const status = state.phase === 'running' ? 'Running' : state.phase === 'waiting_for_approval' ? 'Waiting for approval' : 'Idle';
+  const status = state.phase === 'running' ? 'Running' : state.phase === 'waiting_for_approval' ? 'Waiting for approval' : state.phase === 'compacting' ? 'Compacting' : 'Idle';
   return `${status} · ${state.configuration.model}${state.queuedInputs === 0 ? '' : ` · ${String(state.queuedInputs)} queued`}`;
 }

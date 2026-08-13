@@ -187,6 +187,27 @@ test('session JSONL indexes only newline-committed records and repairs arbitrari
   assert.equal(replay.branch[1].parentId, replay.branch[0].id);
 });
 
+test('session JSONL owns queued configuration and validates submission lifecycle recovery', async () => {
+  const rootDir = await mkdtemp(path.join(tmpdir(), 'agent-session-submissions-'));
+  let repository = new JsonlSessionRepository({ rootDir });
+  const session = await repository.create({ id: 'submissions', workspaceRoot: process.cwd() });
+  await repository.enqueueSubmission(session.id, {
+    submissionId: 'submission', runId: 'run', input: { task: 'persisted task' },
+    configuration: { provider: 'test', model: 'captured-model', reasoning: { strategy: 'effort', effort: 'high' }, responseFormat: { type: 'json_schema', schema: { type: 'object' } } }
+  });
+  repository = new JsonlSessionRepository({ rootDir });
+  let pending = await repository.loadPendingSubmissions(session.id);
+  assert.equal(pending[0].configuration.model, 'captured-model');
+  assert.equal(Object.isFrozen(pending[0].configuration.responseFormat.schema), true);
+  await repository.transitionSubmission(session.id, 'submission', { state: 'claimed' });
+  await repository.transitionSubmission(session.id, 'submission', { state: 'suspended' });
+  pending = await new JsonlSessionRepository({ rootDir }).loadPendingSubmissions(session.id);
+  assert.equal(pending[0].state, 'suspended');
+
+  await appendFile(repository.location(session.id), `${JSON.stringify({ type: 'submission.completed', submissionId: 'submission', runId: 'run', timestamp: new Date().toISOString() })}\n`);
+  await assert.rejects(new JsonlSessionRepository({ rootDir }).open(session.id), error => error instanceof PersistenceCorruptionError && error.code === 'invalid_record');
+});
+
 function completedTerminal(runId, finalizationId, message) {
   return {
     runId,
@@ -219,11 +240,14 @@ function completedTerminal(runId, finalizationId, message) {
   };
 }
 
-test('AgentSession serializes admission, preserves steering identity, and applies configuration to the next run', async () => {
+test('AgentSession serializes admission, preserves steering identity, and snapshots configuration at submission', async () => {
   const configurations = [];
   const controls = [];
+  const repository = new InMemorySessionRepository();
+  const descriptor = await repository.create({ id: 'session-authority', workspaceRoot: process.cwd() });
   const session = new AgentSession({
-    descriptor: { id: 'session-authority', header: { type: 'session', version: 1, id: 'session-authority', timestamp: new Date().toISOString(), workspaceRoot: process.cwd() }, leafId: null },
+    descriptor,
+    repository,
     configuration: { provider: 'test', model: 'first' },
     createRuntime(configuration) {
       configurations.push(configuration);
@@ -247,9 +271,9 @@ test('AgentSession serializes admission, preserves steering identity, and applie
   const steered = await session.submit({ task: 'focus' }, { delivery: 'steer', expectedRunId: first.runId });
   assert.equal(steered.kind, 'steered');
   assert.deepEqual(controls[0].steering, ['focus']);
+  await session.configure({ model: 'second' });
   const second = await session.submit({ task: 'second' });
   assert.equal(second.kind, 'queued');
-  await session.configure({ model: 'second' });
   controls[0].resolve({ state: 'ended', terminal: { runId: first.runId }, deliveryDiagnostics: [] });
   await first.completion;
   await new Promise((resolve) => setImmediate(resolve));
@@ -260,12 +284,131 @@ test('AgentSession serializes admission, preserves steering identity, and applie
   assert.equal(session.state().phase, 'idle');
 
   const third = await session.submit({ task: 'third' });
-  const fourth = await session.submit({ task: 'fourth' });
   await session.configure({ model: 'broken' });
+  const fourth = await session.submit({ task: 'fourth' });
   controls[2].resolve({ state: 'ended', terminal: { runId: controls[2].runId }, deliveryDiagnostics: [] });
   await third.completion;
   await assert.rejects(fourth.completion, /unsupported model/u);
   assert.equal(session.state().phase, 'idle');
+});
+
+test('session branches require stable boundaries and conversation projects assistant turns once', async () => {
+  const repository = new InMemorySessionRepository();
+  const session = await repository.create({ id: 'stable-branch', workspaceRoot: process.cwd() });
+  const input = await repository.appendInput(session.id, { runId: 'run', task: 'work' });
+  await assert.rejects(repository.branchFrom(session.id, input.id), /completed final or compaction/u);
+  await repository.appendAssistant(session.id, {
+    runId: 'run', identity: { turnIndex: 1, turnId: 'turn', requestAttempt: 1 }, content: 'answer'
+  });
+  await assert.rejects(repository.appendAssistant(session.id, {
+    runId: 'run', identity: { turnIndex: 1, turnId: 'turn', requestAttempt: 1 }, content: 'conflicting answer'
+  }), /Conflicting assistant projection/u);
+  await repository.appendAssistant(session.id, {
+    runId: 'run', identity: { turnIndex: 1, turnId: 'turn', requestAttempt: 1 }, content: 'answer'
+  });
+  await repository.projectFinal(session.id, completedTerminal('run', 'final', 'answer'));
+  const points = await repository.listBranchPoints(session.id);
+  assert.equal(points.length, 1);
+  await repository.branchFrom(session.id, points[0].entryId);
+  const conversation = await repository.readConversation(session.id);
+  assert.equal(conversation.filter((entry) => entry.type === 'assistant').length, 1);
+});
+
+test('AgentSession recovers queued work but records claimed work as uncertain instead of retrying it', async () => {
+  const repository = new InMemorySessionRepository();
+  const descriptor = await repository.create({ id: 'durable-admission', workspaceRoot: process.cwd() });
+  const blocked = new AgentSession({
+    descriptor, repository, configuration: { provider: 'test', model: 'model' },
+    createRuntime() {
+      return { run(input) { return { runId: input.runId, result: new Promise(() => {}), injectSteering() { throw new Error('unused'); }, abort() {} }; } };
+    }
+  });
+  await blocked.submit({ task: 'claimed' });
+  const queued = await blocked.submit({ task: 'recover me' });
+  assert.equal(queued.kind, 'queued');
+
+  const executed = [];
+  const failures = [];
+  const recovered = new AgentSession({
+    descriptor, repository, configuration: { provider: 'test', model: 'different-model' },
+    createRuntime(configuration) {
+      return { run(input) {
+        executed.push({ task: input.task, model: configuration.model });
+        return { runId: input.runId, result: Promise.resolve({ state: 'ended', terminal: { runId: input.runId }, deliveryDiagnostics: [] }), injectSteering() { throw new Error('unused'); }, abort() {} };
+      } };
+    }
+  });
+  recovered.subscribe((event) => { if (event.type === 'run.failed') failures.push(event.error.message); });
+  await recovered.restore();
+  await recovered.waitForIdle();
+  assert.deepEqual(executed, [{ task: 'recover me', model: 'model' }]);
+  assert.equal(failures.length, 1);
+  assert.match(failures[0], /not retried/u);
+  assert.deepEqual(await repository.loadPendingSubmissions(descriptor.id), []);
+});
+
+test('semantic compaction is persisted once and becomes the replay base', async () => {
+  const repository = new InMemorySessionRepository();
+  const descriptor = await repository.create({ id: 'semantic-compaction', workspaceRoot: process.cwd() });
+  await repository.appendInput(descriptor.id, { runId: 'run', task: 'retain this decision' });
+  await repository.appendAssistant(descriptor.id, { runId: 'run', identity: { turnIndex: 1, turnId: 'turn', requestAttempt: 1 }, content: 'decision retained' });
+  await repository.projectFinal(descriptor.id, completedTerminal('run', 'final', 'decision retained'));
+  let calls = 0;
+  const agent = new AgentSession({
+    descriptor, repository, configuration: { provider: 'test', model: 'summary-model' },
+    createRuntime() { throw new Error('runtime is not needed for compaction'); },
+    async summarizeConversation(request) {
+      calls += 1;
+      assert.equal(request.conversation.some((entry) => entry.type === 'assistant'), true);
+      return 'Persisted semantic decision.';
+    }
+  });
+  const compacted = await agent.compact();
+  assert.equal(Object.isFrozen(compacted), true);
+  const replay = await repository.loadReplayState(descriptor.id);
+  assert.equal(replay.compaction?.summary, 'Persisted semantic decision.');
+  assert.deepEqual(replay.ledgerRunIds, []);
+  assert.equal(calls, 1);
+  await assert.rejects(agent.compact(), /requires new completed conversation history/u);
+  assert.equal(calls, 1);
+});
+
+test('approval suspension remains durable and blocks queued follow-ups until resolution', async () => {
+  const repository = new InMemorySessionRepository();
+  const descriptor = await repository.create({ id: 'durable-suspension', workspaceRoot: process.cwd() });
+  let resolveFirst;
+  const firstProcess = new AgentSession({
+    descriptor, repository, configuration: { provider: 'test', model: 'model' },
+    createRuntime() { return { run(input) {
+      return { runId: input.runId, result: new Promise((resolve) => { resolveFirst = resolve; }), injectSteering() { throw new Error('unused'); }, abort() {} };
+    } }; }
+  });
+  const first = await firstProcess.submit({ task: 'needs approval' });
+  const followUp = await firstProcess.submit({ task: 'after approval' });
+  assert.equal(followUp.kind, 'queued');
+  resolveFirst({ state: 'suspended', runId: first.runId, pendingApprovals: [], deliveryDiagnostics: [] });
+  await first.completion;
+  assert.equal(firstProcess.state().phase, 'waiting_for_approval');
+
+  const executed = [];
+  const restarted = new AgentSession({
+    descriptor, repository, configuration: { provider: 'test', model: 'model' },
+    createRuntime() { return {
+      run(input) {
+        executed.push(input.task);
+        return { runId: input.runId, result: Promise.resolve({ state: 'ended', terminal: { runId: input.runId }, deliveryDiagnostics: [] }), injectSteering() { throw new Error('unused'); }, abort() {} };
+      },
+      resumeApproval(input) {
+        return Promise.resolve({ runId: input.runId, result: Promise.resolve({ state: 'ended', terminal: { runId: input.runId }, deliveryDiagnostics: [] }), injectSteering() { throw new Error('unused'); }, abort() {} });
+      }
+    }; }
+  });
+  await restarted.restore();
+  assert.equal(restarted.state().phase, 'waiting_for_approval');
+  assert.deepEqual(executed, []);
+  await restarted.resolveApproval({ runId: first.runId, approvalId: 'approval', fingerprint: 'fingerprint', decision: 'allow' });
+  await restarted.waitForIdle();
+  assert.deepEqual(executed, ['after approval']);
 });
 test('session listing orders sessions by latest committed activity', async () => {
   const repository = new InMemorySessionRepository();
