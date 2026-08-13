@@ -39,6 +39,21 @@ jobs:
         run: brew install ripgrep
       - name: Install ripgrep on Windows
         if: runner.os == 'Windows'
-        run: choco install ripgrep --yes --no-progress
+        shell: pwsh
+        run: |
+          $version = '15.2.0'
+          $archive = Join-Path $env:RUNNER_TEMP "ripgrep-$version.zip"
+          $destination = Join-Path $env:RUNNER_TEMP 'ripgrep'
+          Invoke-WebRequest "https://github.com/BurntSushi/ripgrep/releases/download/$version/ripgrep-$version-x86_64-pc-windows-msvc.zip" -OutFile $archive
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne '71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5') {
+            throw "Unexpected ripgrep archive hash: $hash"
+          }
+          Expand-Archive $archive -DestinationPath $destination
+          $binary = Get-ChildItem $destination -Recurse -Filter rg.exe | Select-Object -First 1
+          if ($null -eq $binary) { throw 'The ripgrep archive did not contain rg.exe' }
+          $binary.Directory.FullName | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Verify ripgrep
+        run: rg --version
       - run: npm ci
       - run: npm run verify:release
