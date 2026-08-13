@@ -127,7 +127,7 @@ test('read-tool evidence reaches durable observations, session context, prompt s
     tools: [listDirectoryTool], checks: [check], toolBoundary: { authorizationPolicyId: 'tests/read-evidence@1', executionTargetId: root },
     toolPolicy: { allowedRisks: ['read'] }, toolContext: { services }
   });
-  const result = await runtime.run({ task: 'inspect the workspace' });
+  const result = await runtime.run({ task: 'inspect the workspace' }).result;
   assert.equal(result.state, 'ended');
   assert.equal(result.terminal.verificationStatus, 'passed');
 

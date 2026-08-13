@@ -4,7 +4,7 @@ import path from 'node:path';
 import type { Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { FileCredentialStore } from '@agent-core/auth';
-import { AgentRuntime, agentEventCodec, type AgentEvent, type AgentInstruction, type AgentProgressEvent, type AgentRunResult } from '@agent-core/runtime';
+import { AgentRuntime, AgentSession, agentEventCodec, type AgentEvent, type AgentInstruction, type AgentProgressEvent, type AgentRunResult, type SessionDescriptor } from '@agent-core/runtime';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 import { JsonlEventRepository } from '@agent-core/evidence/node';
 import { type ModelProvider, type ModelReasoningEffort, type ModelReasoningRequest, SimpleTokenEstimator } from '@agent-core/model';
@@ -14,7 +14,6 @@ import { OllamaProvider } from '@agent-core/provider-ollama';
 import { OpenAICodexProvider, loginOpenAICodexDeviceCode, type OpenAICodexTransport } from '@agent-core/provider-openai-codex';
 import { OpenAIProvider } from '@agent-core/provider-openai';
 import { OpenRouterProvider } from '@agent-core/provider-openrouter';
-import type { AgentSession } from '@agent-core/runtime';
 import type { AgentCheckDefinition } from '@agent-core/runtime';
 import {
   accessRisk,
@@ -79,11 +78,6 @@ export interface CliToolPolicyOptions {
   allowShell: boolean;
 }
 
-export interface CliProgressSink {
-  handle(event: AgentProgressEvent): void | Promise<void>;
-  consumeFinalAlreadyPrinted?(): boolean;
-}
-
 interface CliProviderRuntime {
   provider: ModelProvider;
   providerId: CliProviderId;
@@ -113,10 +107,10 @@ interface EffectiveCliAuthority {
 }
 
 interface CliRuntime {
-  agent: AgentRuntime;
+  agent: AgentSession;
   events: JsonlEventRepository<AgentEvent>;
   sessions: JsonlSessionRepository;
-  session: AgentSession;
+  session: SessionDescriptor;
   tuiDetails: AgentTuiRuntimeDetails;
   localHost: LocalToolHost;
 }
@@ -153,18 +147,25 @@ export async function main(argv: string[]): Promise<void> {
     if (task === '-' || (task.length === 0 && !process.stdin.isTTY)) task = normalizeTaskInput(await readStandardInput());
     if (task.length === 0) throw new Error('agent-core exec requires a task string or piped stdin.');
     const progress = new CliProgressRenderer({ showReasoning: options.showReasoning });
-    await withCliRuntime(options, workspace, progress, async (runtime) => {
-      const result = await runtime.agent.run({ task });
-      printResult(result, progress);
-      printPersistenceLocations(runtime, result);
-      process.exitCode = resultExitCode(result);
+    await withCliRuntime(options, workspace, async (runtime) => {
+      const unsubscribe = runtime.agent.subscribe((event) => { if (event.type === 'run.progress') { progress.handle(event.event); } });
+      try {
+        const submission = await runtime.agent.submit({ task });
+        if (submission.kind === 'rejected') throw new Error(`Task was rejected: ${submission.reason}.`);
+        const result = await submission.completion;
+        printResult(result, progress);
+        printPersistenceLocations(runtime, result);
+        process.exitCode = resultExitCode(result);
+      } finally {
+        unsubscribe();
+      }
     });
     return;
   }
 
   if (!process.stdin.isTTY) throw new Error('Interactive mode requires a terminal. Use agent-core exec with piped input.');
   const progress = new AgentTuiProgressRenderer();
-  await withCliRuntime(options, workspace, progress, async (runtime) => {
+  await withCliRuntime(options, workspace, async (runtime) => {
     await runAgentTuiApp(runtime.agent, {
         ...(task.length > 0 ? { initialTask: task } : {}),
         progress,
@@ -174,8 +175,8 @@ export async function main(argv: string[]): Promise<void> {
   });
 }
 
-async function withCliRuntime<T>(options: CliOptions, workspace: WorkspaceLayout, progress: CliProgressSink, run: (runtime: CliRuntime) => Promise<T>, persistedSessionId?: string): Promise<T> {
-  const runtime = await createRuntime(options, workspace, progress, persistedSessionId);
+async function withCliRuntime<T>(options: CliOptions, workspace: WorkspaceLayout, run: (runtime: CliRuntime) => Promise<T>, persistedSessionId?: string): Promise<T> {
+  const runtime = await createRuntime(options, workspace, persistedSessionId);
   try { return await run(runtime); }
   finally { await runtime.localHost.close(); }
 }
@@ -183,7 +184,6 @@ async function withCliRuntime<T>(options: CliOptions, workspace: WorkspaceLayout
 async function createRuntime(
   options: CliOptions,
   workspace: WorkspaceLayout,
-  progress: CliProgressSink,
   persistedSessionId?: string
 ): Promise<CliRuntime> {
   const sessions = new JsonlSessionRepository({ rootDir: workspace.sessionsDir });
@@ -237,64 +237,78 @@ async function createRuntime(
     const estimator = new SimpleTokenEstimator();
     const localToolConfiguration = localHost.services.localToolConfiguration;
     const processManager = localHost.processManager;
+    const services = localHost.services;
     const configuredTools = localHost.tools;
-    const agent = new AgentRuntime({
-    provider: providerRuntime.provider,
-    model: providerRuntime.model,
-    toolBoundary: { authorizationPolicyId: 'agent-core-cli/workspace-policy@1', executionTargetId: workspace.workspaceRoot },
-    repositories: {
-      events,
-      session: { repository: sessionBinding.repository, sessionId: sessionBinding.session.id },
-      artifacts: artifactStore
-    },
-    estimator,
-    ...(options.maxOutputTokens !== undefined ? { maxOutputTokens: options.maxOutputTokens } : {}),
-    tools: configuredTools,
-    toolContext: {
-      services: localHost.services
-    },
-    toolPolicy: authority.toolPolicy,
-    ...(options.configuration?.authorization.requireApprovalFor.length ? { toolAuthorizer: request => {
-      const approvalAccesses = request.effects.accesses.map((access) => accessRisk(access.mode))
-        .filter((risk) => options.configuration?.authorization.requireApprovalFor.includes(risk));
-      return approvalAccesses.length > 0
-        ? { decision: 'require_approval' as const, reason: `Workspace configuration requires approval for ${[...new Set(approvalAccesses)].join(', ')} access.` }
-        : { decision: 'allow' as const, reason: 'Allowed by workspace policy.' };
-    } } : {}),
-    ...(instructions.length > 0 ? { instructions } : {}),
-    ...(checks.length > 0 ? { checks } : {}),
-    ...(options.configuration?.limits ? { limits: options.configuration.limits } : {}),
-    ...(authority.verificationCommands === 'ambient' ? { verification: { evidence: { read: () => Promise.resolve({ items: [], bytes: 0, truncated: false }), readArtifact: ref => artifactStore.readVerified(ref) }, runCommand: async (request, signal) => {
-      const startedAt = Date.now();
-      const outputTokenBudget = Math.max(64, Math.ceil((request.maxOutputBytes ?? 64_000) / 4));
-      let result = await processManager.start({
-        owner: request.owner,
-        command: request.command,
-        cwd: workspace.workspaceRoot,
-        pty: false,
-        timeoutMs: request.timeoutMs ?? 60_000,
-        yieldMs: localToolConfiguration.process.maxYieldMs,
-        outputTokenBudget,
-        signal
-      });
-      let stdout = result.stdout.text;
-      let stderr = result.stderr.text;
-      let cursor = result.cursorEnd;
-      while (result.status === 'running') {
-        result = await processManager.poll(result.processId, outputTokenBudget, localToolConfiguration.process.maxYieldMs, cursor, request.owner);
-        stdout += result.stdout.text;
-        stderr += result.stderr.text;
-        cursor = result.cursorEnd;
+    const agent = new AgentSession({
+      descriptor: sessionBinding.session,
+      configuration: {
+        provider: providerRuntime.providerId,
+        model: providerRuntime.model,
+        ...(settings.temperature !== undefined ? { temperature: settings.temperature } : {}),
+        ...(settings.reasoning !== undefined ? { reasoning: settings.reasoning } : {})
+      },
+      createRuntime(configuration, onProgress) {
+        if (configuration.provider !== providerRuntime.providerId) throw new Error(`Provider ${configuration.provider} is not available in this session runtime.`);
+        return new AgentRuntime({
+          provider: providerRuntime.provider,
+          model: configuration.model,
+          toolBoundary: { authorizationPolicyId: 'agent-core-cli/workspace-policy@1', executionTargetId: workspace.workspaceRoot },
+          repositories: {
+            events,
+            session: { repository: sessionBinding.repository, sessionId: sessionBinding.session.id },
+            artifacts: artifactStore
+          },
+          estimator,
+          ...(options.maxOutputTokens !== undefined ? { maxOutputTokens: options.maxOutputTokens } : {}),
+          tools: configuredTools,
+          toolContext: {
+          services
+          },
+          toolPolicy: authority.toolPolicy,
+          ...(options.configuration?.authorization.requireApprovalFor.length ? { toolAuthorizer: request => {
+            const approvalAccesses = request.effects.accesses.map((access) => accessRisk(access.mode))
+              .filter((risk) => options.configuration?.authorization.requireApprovalFor.includes(risk));
+            return approvalAccesses.length > 0
+              ? { decision: 'require_approval' as const, reason: `Workspace configuration requires approval for ${[...new Set(approvalAccesses)].join(', ')} access.` }
+              : { decision: 'allow' as const, reason: 'Allowed by workspace policy.' };
+          } } : {}),
+          ...(instructions.length > 0 ? { instructions } : {}),
+          ...(checks.length > 0 ? { checks } : {}),
+          ...(options.configuration?.limits ? { limits: options.configuration.limits } : {}),
+          ...(authority.verificationCommands === 'ambient' ? { verification: { evidence: { read: () => Promise.resolve({ items: [], bytes: 0, truncated: false }), readArtifact: ref => artifactStore.readVerified(ref) }, runCommand: async (request, signal) => {
+            const startedAt = Date.now();
+            const outputTokenBudget = Math.max(64, Math.ceil((request.maxOutputBytes ?? 64_000) / 4));
+            let result = await processManager.start({
+              owner: request.owner,
+              command: request.command,
+              cwd: workspace.workspaceRoot,
+              pty: false,
+              timeoutMs: request.timeoutMs ?? 60_000,
+              yieldMs: localToolConfiguration.process.maxYieldMs,
+              outputTokenBudget,
+              signal
+            });
+            let stdout = result.stdout.text;
+            let stderr = result.stderr.text;
+            let cursor = result.cursorEnd;
+            while (result.status === 'running') {
+              result = await processManager.poll(result.processId, outputTokenBudget, localToolConfiguration.process.maxYieldMs, cursor, request.owner);
+              stdout += result.stdout.text;
+              stderr += result.stderr.text;
+              cursor = result.cursorEnd;
+            }
+            return { exitCode: result.status === 'exited' ? result.exitCode ?? null : null, stdout, stderr, durationMs: Date.now() - startedAt };
+          } } } : {}),
+          metadata: {
+            workspaceRoot: workspace.workspaceRoot,
+            workspaceName: workspace.workspaceName
+          },
+          ...(configuration.temperature !== undefined ? { temperature: configuration.temperature } : {}),
+          ...(configuration.reasoning !== undefined ? { reasoning: configuration.reasoning } : {}),
+          ...(configuration.responseFormat !== undefined ? { responseFormat: configuration.responseFormat } : {}),
+          onProgress
+        });
       }
-      return { exitCode: result.status === 'exited' ? result.exitCode ?? null : null, stdout, stderr, durationMs: Date.now() - startedAt };
-    } } } : {}),
-    metadata: {
-      workspaceRoot: workspace.workspaceRoot,
-      workspaceName: workspace.workspaceName
-    },
-    ...(settings.temperature !== undefined ? { temperature: settings.temperature } : {}),
-    ...(settings.reasoning !== undefined ? { reasoning: settings.reasoning } : {}),
-    onProgress: (event) => progress.handle(event)
     });
     return {
       agent,
@@ -499,11 +513,16 @@ async function runApprovalCommand(args: string[]): Promise<void> {
   if (!configured || !startedTurn?.sessionId) throw new Error(`Run ${runId} does not contain enough persisted runtime/session identity to resolve an approval.`);
   options = { ...options, provider: parseProviderId(configured.configuration.provider.id), model: configured.configuration.model.id };
   const progress = new CliProgressRenderer({ showReasoning: options.showReasoning });
-  await withCliRuntime(options, workspace, progress, async (runtime) => {
-    const result = await runtime.agent.resolveApproval({ runId, approvalId, fingerprint, decision: decisionValue });
-    printResult(result, progress);
-    printPersistenceLocations(runtime, result);
-    process.exitCode = resultExitCode(result);
+  await withCliRuntime(options, workspace, async (runtime) => {
+    const unsubscribe = runtime.agent.subscribe((event) => { if (event.type === 'run.progress') { progress.handle(event.event); } });
+    try {
+      const result = await runtime.agent.resolveApproval({ runId, approvalId, fingerprint, decision: decisionValue });
+      printResult(result, progress);
+      printPersistenceLocations(runtime, result);
+      process.exitCode = resultExitCode(result);
+    } finally {
+      unsubscribe();
+    }
   }, startedTurn.sessionId);
 }
 
@@ -619,8 +638,8 @@ function resolveCliAuthority(options: CliOptions): EffectiveCliAuthority {
   });
 }
 
-async function selectSession(options: CliOptions, workspace: WorkspaceLayout, repository: JsonlSessionRepository, persistedSessionId?: string): Promise<AgentSession | undefined> {
-  let session: AgentSession | undefined;
+async function selectSession(options: CliOptions, workspace: WorkspaceLayout, repository: JsonlSessionRepository, persistedSessionId?: string): Promise<SessionDescriptor | undefined> {
+  let session: SessionDescriptor | undefined;
   if (persistedSessionId !== undefined) {
     session = await repository.open(persistedSessionId);
   } else if (options.sessionSelection.kind === 'existing') {
@@ -671,7 +690,7 @@ function resolveRuntimeSettings(options: CliOptions, persisted: PersistedModelSe
   });
 }
 
-function validateSessionWorkspace(session: AgentSession, workspace: WorkspaceLayout): void {
+function validateSessionWorkspace(session: SessionDescriptor, workspace: WorkspaceLayout): void {
   if (path.resolve(session.header.workspaceRoot) !== workspace.workspaceRoot) {
     throw new Error([
       `Session belongs to a different workspace root: ${session.header.workspaceRoot}`,

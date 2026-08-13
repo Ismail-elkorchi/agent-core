@@ -62,7 +62,7 @@ test('durable event and session JSONL redact tool, metadata, failure, and proces
     repositories: { events, session: { repository: sessions, sessionId: session.id }, artifacts }, tools: [secretResult, secretFailure, execCommandTool],
     toolPolicy: { allowedRisks: ['read', 'execute'] }, toolContext: { services: { workspaceRoot: root, artifactRepository: artifacts, localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION, processManager: manager } }
   });
-  const result = await agent.run({ runId: 'redaction-run', task: 'redact' });
+  const result = await agent.run({ runId: 'redaction-run', task: 'redact' }).result;
   assert.equal(result.state, 'ended');
   const durableText = `${await readFile(events.location('redaction-run'), 'utf8')}\n${await readFile(sessions.location(session.id), 'utf8')}`;
   for (const secret of secrets) assert.equal(durableText.includes(secret), false, secret);

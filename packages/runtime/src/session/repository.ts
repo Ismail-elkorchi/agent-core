@@ -4,7 +4,7 @@ import { normalizeJsonSafe, type JsonObject, type JsonValue } from '@agent-core/
 import { PersistenceConflictError } from '@agent-core/evidence';
 import { createAgentTerminalSnapshot, terminalSnapshotFingerprint, type AgentEffectiveInstruction, type AgentTerminalSnapshot, type AgentToolCallAttemptIdentity, type AgentToolCallIdentity, type AgentTurnIdentity } from '../run/contracts.js';
 import type {
-  AgentSession,
+  SessionDescriptor,
   BaseSessionEntry,
   CreateSessionOptions,
   SessionBranchEntry,
@@ -27,7 +27,7 @@ export class InMemorySessionRepository implements SessionRepository {
   private readonly states = new Map<string, SessionState>();
   private queue: Promise<void> = Promise.resolve();
 
-  create(options: CreateSessionOptions): Promise<AgentSession> {
+  create(options: CreateSessionOptions): Promise<SessionDescriptor> {
     const id = options.id ?? randomUUID();
     return this.serial(() => {
       if (this.states.has(id)) throw new Error(`Session already exists: ${id}`);
@@ -42,7 +42,7 @@ export class InMemorySessionRepository implements SessionRepository {
     });
   }
 
-  open(sessionId: string): Promise<AgentSession> { return this.serial(() => sessionFromState(this.require(sessionId))); }
+  open(sessionId: string): Promise<SessionDescriptor> { return this.serial(() => sessionFromState(this.require(sessionId))); }
 
   list(workspaceRoot?: string): Promise<readonly SessionSummary[]> {
     return this.serial(() => Object.freeze([...this.states.values()].filter((state) => workspaceRoot === undefined || state.header.workspaceRoot === workspaceRoot).map((state) => Object.freeze({
@@ -158,7 +158,7 @@ function contextProjectionForTerminal(state: SessionState, terminal: AgentTermin
   return createSessionContextProjection({ branchEntries: branch, terminal, throughEntryId, ...(previous ? { previous } : {}) });
 }
 function branchLeaf(entries: readonly SessionBranchEntry[]): string | null { return entries.at(-1)?.id ?? null; }
-function sessionFromState(state: SessionState): AgentSession { return Object.freeze({ id: state.header.id, header: state.header, leafId: branchLeaf(state.branchEntries) }); }
+function sessionFromState(state: SessionState): SessionDescriptor { return Object.freeze({ id: state.header.id, header: state.header, leafId: branchLeaf(state.branchEntries) }); }
 function baseEntry(parentId: string | null): BaseSessionEntry { return { id: randomUUID(), parentId, timestamp: new Date().toISOString() }; }
 function normalizedObservationInput(input: { runId: string; identity: AgentTurnIdentity & Partial<Pick<AgentToolCallAttemptIdentity, 'toolBatchId' | 'callIndex' | 'callId' | 'toolAttempt'>>; toolName: string; observation: SessionObservationInput }): Omit<SessionObservationEntry, keyof BaseSessionEntry | 'type'> {
   const artifacts = input.observation.artifacts?.map((artifact) => { validateArtifactRef(artifact); return Object.freeze({ ...artifact }); });

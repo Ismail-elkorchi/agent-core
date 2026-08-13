@@ -74,11 +74,11 @@ const agent = new AgentRuntime({
 });
 
 if (mode === 'suspend') {
-  const result = await agent.run({ task: 'crash after approved non-idempotent effect' });
+  const result = await agent.run({ task: 'crash after approved non-idempotent effect' }).result;
   const approval = result.pendingApprovals[0];
   process.stdout.write(JSON.stringify({ runId: result.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint }));
 } else {
   if (!runId || !approvalId || !fingerprint) throw new Error('resume identity is required');
-  const result = await agent.resolveApproval({ runId, approvalId, fingerprint, decision: 'allow' });
+  const result = await (await agent.resumeApproval({ runId, approvalId, fingerprint, decision: 'allow' })).result;
   process.stdout.write(JSON.stringify(result.state === 'ended' ? result.terminal : result));
 }

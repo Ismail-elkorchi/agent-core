@@ -31,7 +31,7 @@ import {
   type AgentTerminalSnapshot
 } from '../run/contracts.js';
 import type {
-  AgentSession,
+  SessionDescriptor,
   BaseSessionEntry,
   CreateSessionOptions,
   SessionBranchEntry,
@@ -74,7 +74,7 @@ export class JsonlSessionRepository implements SessionRepository {
   location(sessionId: string): string { return this.filePath(sessionId); }
   indexMetrics(): Readonly<{ fullScans: number; incrementalRefreshes: number }> { return Object.freeze({ fullScans: this.fullScans, incrementalRefreshes: this.incrementalRefreshes }); }
 
-  async create(options: CreateSessionOptions): Promise<AgentSession> {
+  async create(options: CreateSessionOptions): Promise<SessionDescriptor> {
     const id = options.id ?? randomUUID();
     return this.enqueue(id, () => withPersistenceFileLock(this.filePath(id), this.lockTimeoutMs, this.staleLockMs, async () => {
       const header: SessionHeader = Object.freeze({
@@ -94,7 +94,7 @@ export class JsonlSessionRepository implements SessionRepository {
     }));
   }
 
-  async open(sessionId: string): Promise<AgentSession> {
+  async open(sessionId: string): Promise<SessionDescriptor> {
     const state = await this.enqueue(sessionId, () => this.refreshIndex(sessionId, false));
     return sessionFromState(state);
   }
@@ -398,7 +398,7 @@ function contextProjectionForTerminal(state: SessionFileState, terminal: AgentTe
   const previous = [...state.contextProjections].reverse().find((projection) => branchIds.has(projection.throughEntryId));
   return createSessionContextProjection({ branchEntries: branch, terminal, throughEntryId, ...(previous ? { previous } : {}) });
 }
-function sessionFromState(state: SessionFileState): AgentSession { return Object.freeze({ id: state.header.id, header: state.header, leafId: branchLeaf(state.branchEntries) }); }
+function sessionFromState(state: SessionFileState): SessionDescriptor { return Object.freeze({ id: state.header.id, header: state.header, leafId: branchLeaf(state.branchEntries) }); }
 function baseEntry(parentId: string | null): BaseSessionEntry { return { id: randomUUID(), parentId, timestamp: new Date().toISOString() }; }
 function validateParents(entries: readonly SessionBranchEntry[], filePath: string): void {
   const ids = new Set<string>();

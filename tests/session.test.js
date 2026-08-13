@@ -4,7 +4,7 @@ import { appendFile, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { PersistenceCorruptionError } from '@agent-core/evidence';
-import { InMemorySessionRepository, decodeAgentTerminalSnapshot } from '@agent-core/runtime';
+import { AgentSession, InMemorySessionRepository, decodeAgentTerminalSnapshot } from '@agent-core/runtime';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 
 test('session repository initializes a missing nested root before acquiring its stream lock', async () => {
@@ -218,6 +218,55 @@ function completedTerminal(runId, finalizationId, message) {
     }
   };
 }
+
+test('AgentSession serializes admission, preserves steering identity, and applies configuration to the next run', async () => {
+  const configurations = [];
+  const controls = [];
+  const session = new AgentSession({
+    descriptor: { id: 'session-authority', header: { type: 'session', version: 1, id: 'session-authority', timestamp: new Date().toISOString(), workspaceRoot: process.cwd() }, leafId: null },
+    configuration: { provider: 'test', model: 'first' },
+    createRuntime(configuration) {
+      configurations.push(configuration);
+      if (configuration.model === 'broken') throw new Error('unsupported model');
+      return {
+        run(input) {
+          let resolve;
+          const steering = [];
+          const result = new Promise((done) => { resolve = done; });
+          const control = { runId: input.runId, steering, resolve, result, injectSteering(value) { steering.push(value.instruction); return { id: 'steer', runId: input.runId, timestamp: new Date().toISOString() }; }, abort() {} };
+          controls.push(control);
+          return control;
+        }
+      };
+    }
+  });
+  const first = await session.submit({ task: 'first' });
+  assert.equal(first.kind, 'started');
+  const stale = await session.submit({ task: 'stale' }, { delivery: 'steer', expectedRunId: 'wrong' });
+  assert.deepEqual(stale, { kind: 'rejected', reason: 'run_mismatch' });
+  const steered = await session.submit({ task: 'focus' }, { delivery: 'steer', expectedRunId: first.runId });
+  assert.equal(steered.kind, 'steered');
+  assert.deepEqual(controls[0].steering, ['focus']);
+  const second = await session.submit({ task: 'second' });
+  assert.equal(second.kind, 'queued');
+  await session.configure({ model: 'second' });
+  controls[0].resolve({ state: 'ended', terminal: { runId: first.runId }, deliveryDiagnostics: [] });
+  await first.completion;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(configurations[0].model, 'first');
+  assert.equal(configurations[1].model, 'second');
+  controls[1].resolve({ state: 'ended', terminal: { runId: controls[1].runId }, deliveryDiagnostics: [] });
+  await second.completion;
+  assert.equal(session.state().phase, 'idle');
+
+  const third = await session.submit({ task: 'third' });
+  const fourth = await session.submit({ task: 'fourth' });
+  await session.configure({ model: 'broken' });
+  controls[2].resolve({ state: 'ended', terminal: { runId: controls[2].runId }, deliveryDiagnostics: [] });
+  await third.completion;
+  await assert.rejects(fourth.completion, /unsupported model/u);
+  assert.equal(session.state().phase, 'idle');
+});
 test('session listing orders sessions by latest committed activity', async () => {
   const repository = new InMemorySessionRepository();
   const first = await repository.create({ id: 'first', workspaceRoot: '/workspace' });

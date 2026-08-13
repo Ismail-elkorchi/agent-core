@@ -76,14 +76,14 @@ try {
     "import * as local from '@agent-core/tools-local';",
     "import * as tui from '@agent-core/tui';",
     "import * as nodeEvidence from '@agent-core/evidence/node';",
-    "if (!runtime.decodeAgentTerminalSnapshot || !runtime.AgentRuntime || !runtime.InMemorySessionRepository || !nodeRuntime.JsonlSessionRepository || !model.parseModelResponse || !json.parseJsonObject || !evidence.InMemoryEventRepository || !nodeEvidence.JsonlEventRepository || !tools.prepareToolCall || !tools.invokePreparedToolCall || !local.ProcessManager || !tui.createAgentTuiApp) throw new Error('public runtime exports missing');"
+    "if (!runtime.decodeAgentTerminalSnapshot || !runtime.AgentRuntime || !runtime.AgentSession || !runtime.InMemorySessionRepository || !nodeRuntime.JsonlSessionRepository || !model.parseModelResponse || !json.parseJsonObject || !evidence.InMemoryEventRepository || !nodeEvidence.JsonlEventRepository || !tools.prepareToolCall || !tools.invokePreparedToolCall || !local.ProcessManager || !tui.createAgentTuiApp) throw new Error('public runtime exports missing');"
   ].join('\n'));
   await exec(process.execPath, ['runtime.mjs'], { cwd: consumer });
 
   await writeFile(path.join(consumer, 'consumer.ts'), [
     "import type { JsonObject } from '@agent-core/json';",
     "import type { ModelProviderState } from '@agent-core/model';",
-    "import type { AgentCandidate, AgentTerminalSnapshot } from '@agent-core/runtime';",
+    "import type { AgentCandidate, AgentRunControl, AgentSessionState, AgentTerminalSnapshot } from '@agent-core/runtime';",
     "import type { ToolEffects, ToolObservation, ToolObservationInput } from '@agent-core/tools';",
     "import type { AgentTuiAppRunOptions, AgentTuiRuntimeDetails } from '@agent-core/tui';",
     "const json: JsonObject = { nested: { ok: true }, values: [1, 'two'] };",
@@ -99,7 +99,9 @@ try {
     "const tuiDetails: AgentTuiRuntimeDetails = { modelId: 'test-model', permissions: { workspaceWrites: 'denied', shell: 'denied' } };",
     "const tuiOptions: AgentTuiAppRunOptions = { runtimeDetails: tuiDetails, exitOnCompletion: true };",
     "declare const terminal: AgentTerminalSnapshot;",
-    "void [json, providerState, candidate, effects, rawObservation, ownedObservation, immutableObservation, terminal, tuiOptions];"
+    "declare const run: AgentRunControl;",
+    "declare const sessionState: AgentSessionState;",
+    "void [json, providerState, candidate, effects, rawObservation, ownedObservation, immutableObservation, terminal, tuiOptions, run, sessionState];"
   ].join('\n'));
   for (const exactOptionalPropertyTypes of [true, false]) {
     const config = `tsconfig-${String(exactOptionalPropertyTypes)}.json`;

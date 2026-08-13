@@ -156,17 +156,13 @@ export interface AgentRunInput {
 }
 type ResolvedAgentRunInput = AgentRunInput & { readonly runId: string; readonly finalizationId: string };
 
-export interface AgentQueuedSteer { readonly id: string; readonly runId: string; readonly timestamp: string; readonly instruction: string }
-export interface AgentQueuedFollowUp { readonly id: string; readonly runId: string; readonly timestamp: string; readonly task: string; readonly instructions?: readonly string[] }
-export interface AgentQueuedControl { readonly id: string; readonly runId: string; readonly timestamp: string; readonly reason?: string }
-export interface AgentRuntimeState {
-  readonly active: boolean;
-  readonly model: string;
-  readonly temperature?: number;
-  readonly reasoning?: ModelReasoningRequest;
-  readonly queuedSteers: number;
-  readonly queuedFollowUps: number;
-  readonly queuedRetries: number;
+export interface AgentSteeringInput { readonly instruction: string }
+export interface AgentSteeringReceipt { readonly id: string; readonly runId: string; readonly timestamp: string }
+export interface AgentRunControl {
+  readonly runId: string;
+  injectSteering(input: AgentSteeringInput): AgentSteeringReceipt;
+  abort(reason?: string): void;
+  readonly result: Promise<AgentRunResult>;
 }
 
 interface RuntimeModelConfiguration {
@@ -256,16 +252,10 @@ export class AgentRuntime {
   private readonly tools: readonly CompiledToolDefinition[];
   private readonly resourceLeases: ResourceLeaseCoordinator;
   private readonly checks: readonly AgentCheckDefinition[];
-  private readonly steerQueue: AgentQueuedSteer[] = [];
-  private readonly followUpQueue: AgentQueuedFollowUp[] = [];
-  private readonly retryQueue: AgentQueuedControl[] = [];
-  private runtimeModel: string;
-  private runtimeTemperature: number | undefined;
-  private runtimeReasoning: ModelReasoningRequest | undefined;
-  private runtimeResponseFormat: ModelResponseFormat | undefined;
+  private readonly steerQueue: (AgentSteeringReceipt & { readonly instruction: string })[] = [];
   private activeAbortController: AbortController | undefined;
   private activeRunId: string | undefined;
-  private static readonly MAX_CONTROL_QUEUE_ITEMS = 1024;
+  private static readonly MAX_STEERING_ITEMS = 1024;
 
   constructor(private readonly options: AgentRuntimeOptions) {
     this.estimator = options.estimator ?? new SimpleTokenEstimator();
@@ -275,50 +265,21 @@ export class AgentRuntime {
     this.resourceLeases = processLeaseCoordinator(options.toolContext?.services?.processManager) ?? new ResourceLeaseCoordinator();
     validateToolBoundary(options.toolBoundary);
     this.checks = validateAgentCheckDefinitions(options.checks);
-    this.runtimeModel = options.model;
-    this.runtimeTemperature = options.temperature;
-    this.runtimeReasoning = options.reasoning;
-    this.runtimeResponseFormat = options.responseFormat;
   }
 
-  configureModel(settings: { readonly model?: string; readonly temperature?: number; readonly reasoning?: ModelReasoningRequest; readonly responseFormat?: ModelResponseFormat }): AgentRuntimeState {
-    if (settings.model !== undefined) this.runtimeModel = settings.model;
-    if (settings.temperature !== undefined) this.runtimeTemperature = settings.temperature;
-    if (settings.reasoning !== undefined) this.runtimeReasoning = settings.reasoning;
-    if (settings.responseFormat !== undefined) this.runtimeResponseFormat = settings.responseFormat;
-    return this.runtimeState();
-  }
-
-  steer(instruction: string): AgentQueuedSteer { const runId = this.requireActiveRunId('steer'); assertQueueCapacity(this.steerQueue, AgentRuntime.MAX_CONTROL_QUEUE_ITEMS, 'steering'); const item = { id: randomUUID(), runId, timestamp: new Date().toISOString(), instruction }; this.steerQueue.push(item); return item; }
-  enqueueFollowUp(task: string, instructions?: readonly string[]): AgentQueuedFollowUp {
-    const runId = this.requireActiveRunId('enqueue a follow-up');
-    assertQueueCapacity(this.followUpQueue, AgentRuntime.MAX_CONTROL_QUEUE_ITEMS, 'follow-up');
-    const item = { id: randomUUID(), runId, timestamp: new Date().toISOString(), task, ...(instructions?.length ? { instructions: Object.freeze([...instructions]) } : {}) };
-    this.followUpQueue.push(item); return item;
-  }
-  takeFollowUps(runId: string): AgentQueuedFollowUp[] { const selected = this.followUpQueue.filter((item) => item.runId === runId); removeRunItems(this.followUpQueue, runId); return selected; }
-  requestRetry(reason?: string): AgentQueuedControl { assertQueueCapacity(this.retryQueue, AgentRuntime.MAX_CONTROL_QUEUE_ITEMS, 'retry'); const item = this.controlRequest(this.requireActiveRunId('request a retry'), reason); this.retryQueue.push(item); return item; }
-  abort(reason = 'Agent run aborted.'): void { this.activeAbortController?.abort(reason); }
-  runtimeState(): AgentRuntimeState {
-    return { active: this.activeAbortController !== undefined, model: this.runtimeModel,
-      ...(this.runtimeTemperature !== undefined ? { temperature: this.runtimeTemperature } : {}),
-      ...(this.runtimeReasoning !== undefined ? { reasoning: this.runtimeReasoning } : {}),
-      queuedSteers: this.countForActiveRun(this.steerQueue), queuedFollowUps: this.countForActiveRun(this.followUpQueue), queuedRetries: this.countForActiveRun(this.retryQueue) };
-  }
-
-  async run(input: AgentRunInput): Promise<AgentRunResult> {
+  run(input: AgentRunInput): AgentRunControl {
     const runId = input.runId ?? randomUUID();
     const finalizationId = input.finalizationId ?? randomUUID();
-    return this.runActive({ ...input, runId, finalizationId });
+    return this.startRun({ ...input, runId, finalizationId });
   }
 
-  async resolveApproval(input: { readonly runId: string; readonly approvalId: string; readonly fingerprint: string; readonly decision: 'allow' | 'deny'; readonly signal?: AbortSignal }): Promise<AgentRunResult> {
+  async resumeApproval(input: { readonly runId: string; readonly approvalId: string; readonly fingerprint: string; readonly decision: 'allow' | 'deny'; readonly signal?: AbortSignal }): Promise<AgentRunControl> {
     const records: AgentEvent[] = [];
     for await (const envelope of this.options.repositories.events.read(input.runId)) records.push(envelope.event);
     const committed = [...records].reverse().find((event): event is Extract<AgentEvent, { type: 'run.ended' }> => event.type === 'run.ended');
     if (committed) {
       const deliveryDiagnostics = records.flatMap((event) => event.type === 'delivery.failed' ? [event.diagnostic] : []);
-      return Object.freeze({ state: 'ended', terminal: committed.terminal, deliveryDiagnostics: Object.freeze(deliveryDiagnostics) });
+      return completedRunControl(input.runId, Object.freeze({ state: 'ended', terminal: committed.terminal, deliveryDiagnostics: Object.freeze(deliveryDiagnostics) }));
     }
     const started = records.find((event): event is Extract<AgentEvent, { type: 'run.started' }> => event.type === 'run.started');
     if (!started) throw new Error(`Cannot resume unknown run: ${input.runId}.`);
@@ -348,7 +309,7 @@ export class AgentRuntime {
     const pending = batchRequests.filter((request) => !resolutions.has(request.approvalId));
     const phase = [...records].reverse().find((event): event is Extract<AgentEvent, { type: 'run.phase.changed' }> => event.type === 'run.phase.changed');
     if (!phase) throw new Error(`Run ${input.runId} has no persisted phase budget.`);
-    if (pending.length > 0) return Object.freeze({ state: 'suspended', reason: 'approval_required', runId: input.runId, finalizationId: started.finalizationId, pendingApprovals: Object.freeze(pending.map(approvalFromEvent)), budget: phase.budget });
+    if (pending.length > 0) return completedRunControl(input.runId, Object.freeze({ state: 'suspended', reason: 'approval_required', runId: input.runId, finalizationId: started.finalizationId, pendingApprovals: Object.freeze(pending.map(approvalFromEvent)), budget: phase.budget }));
     const authorizations = records.filter((event): event is Extract<AgentEvent, { type: 'tool.authorization.decided' }> => event.type === 'tool.authorization.decided' && event.toolBatchId === target.toolBatchId);
     const overrides: ToolAuthorizationOverride[] = authorizations.map((authorization) => {
       const decision = authorization.decision === 'require_approval'
@@ -361,7 +322,17 @@ export class AgentRuntime {
     if (!snapshot) throw new Error(`Approval ${input.approvalId} has no immutable turn snapshot.`);
     const callHistory = records.flatMap((event) => event.type === 'assistant.ended' ? [...(event.toolCalls ?? [])] : []);
     const resume: ResumeExecutionState = { identity: { turnIndex: target.turnIndex, turnId: target.turnId, requestAttempt: target.requestAttempt }, toolBatchId: target.toolBatchId, toolCalls: assistant.toolCalls, overrides, instructions: snapshot.snapshot.instructions, budget: phase.budget, approvalIds: batchRequests.map((request) => request.approvalId), callHistory, recovery: toolRecoveryState(records, target.toolBatchId, assistant.toolCalls.length) };
-    return this.runActive({ task: started.task, runId: input.runId, finalizationId: started.finalizationId, ...(input.signal ? { signal: input.signal } : {}) }, resume);
+    return this.startRun({ task: started.task, runId: input.runId, finalizationId: started.finalizationId, ...(input.signal ? { signal: input.signal } : {}) }, resume);
+  }
+
+  private startRun(input: ResolvedAgentRunInput, resume?: ResumeExecutionState): AgentRunControl {
+    const result = this.runActive(input, resume);
+    return Object.freeze({
+      runId: input.runId,
+      injectSteering: (steering: AgentSteeringInput) => this.injectSteering(input.runId, steering),
+      abort: (reason?: string) => { this.abortRun(input.runId, reason); },
+      result
+    });
   }
 
   private async runActive(input: ResolvedAgentRunInput, resume?: ResumeExecutionState): Promise<AgentRunResult> {
@@ -375,7 +346,6 @@ export class AgentRuntime {
     finally {
       cleanupExternalAbort();
       removeRunItems(this.steerQueue, runId);
-      removeRunItems(this.retryQueue, runId);
       if (this.activeAbortController === abortController) this.activeAbortController = undefined;
       if (this.activeRunId === runId) this.activeRunId = undefined;
     }
@@ -444,13 +414,13 @@ export class AgentRuntime {
         maxEstimatedTokens: runtime.controller.limits.activeImageTokens
       },
       providerId: this.options.provider.id,
-      model: this.runtimeModel,
+      model: this.options.model,
       ...(runtime.resume ? { runIds: [runtime.runId] } : {})
     });
     const contextManager = replay.contextManager;
     const observationStore = new ObservationStore({ estimator: this.estimator, ...(this.options.repositories.artifacts ? { artifacts: this.options.repositories.artifacts } : {}) });
     if (!runtime.resume) {
-      await runtime.append({ type: 'run.started', runId: runtime.runId, finalizationId: runtime.input.finalizationId, task: runtime.input.task, model: this.runtimeModel, toolPolicy: this.toolPolicy, ...(this.options.metadata ? { metadata: this.options.metadata } : {}) }, `${runtime.runId}:started`);
+      await runtime.append({ type: 'run.started', runId: runtime.runId, finalizationId: runtime.input.finalizationId, task: runtime.input.task, model: this.options.model, toolPolicy: this.toolPolicy, ...(this.options.metadata ? { metadata: this.options.metadata } : {}) }, `${runtime.runId}:started`);
       await runtime.append({ type: 'run.phase.changed', runId: runtime.runId, phase: 'preparing', budget: runtime.controller.snapshot() });
     }
     if (this.options.repositories.session && !runtime.resume) {
@@ -524,22 +494,24 @@ export class AgentRuntime {
           ...(this.options.repositories.session ? { sessionId: this.options.repositories.session.sessionId } : {}), ...(sessionEntryId ? { sessionEntryId } : {}) };
         await runtime.append(turnStarted);
         await runtime.emit(turnStarted);
-        if (this.options.repositories.session) {
+        if (this.options.repositories.session && turnIndex === 1) {
           await this.options.repositories.session.repository.appendModelSettings(this.options.repositories.session.sessionId, {
             provider: providerInfo.id, model: configuration.model,
             ...(configuration.temperature === undefined ? {} : { temperature: configuration.temperature }),
             ...(configuration.reasoning?.strategy === 'effort' ? { reasoningEffort: configuration.reasoning.effort } : {})
           });
         }
-        const configuredEvent = { type: 'run.configured' as const, configuration: summarizeRunConfiguration({
-          provider: providerInfo, model: profile, tools: [...tools], toolPolicy: this.toolPolicy, requestWindow,
-          ...(this.maxOutputTokens === undefined ? {} : { requestedMaxOutputTokens: this.maxOutputTokens }),
-          ...(configuration.temperature === undefined ? {} : { temperature: configuration.temperature }),
-          ...(configuration.reasoning === undefined ? {} : { reasoning: configuration.reasoning }),
-          ...(this.options.metadata === undefined ? {} : { metadata: this.options.metadata })
-        }) };
-        await runtime.append(configuredEvent);
-        await runtime.emit(configuredEvent);
+        if (turnIndex === 1) {
+          const configuredEvent = { type: 'run.configured' as const, configuration: summarizeRunConfiguration({
+            provider: providerInfo, model: profile, tools: [...tools], toolPolicy: this.toolPolicy, requestWindow,
+            ...(this.maxOutputTokens === undefined ? {} : { requestedMaxOutputTokens: this.maxOutputTokens }),
+            ...(configuration.temperature === undefined ? {} : { temperature: configuration.temperature }),
+            ...(configuration.reasoning === undefined ? {} : { reasoning: configuration.reasoning }),
+            ...(this.options.metadata === undefined ? {} : { metadata: this.options.metadata })
+          }) };
+          await runtime.append(configuredEvent);
+          await runtime.emit(configuredEvent);
+        }
         await this.enterPhase(runtime.runId, runtime.controller, 'requesting_model', runtime.append, runtime.emit);
         lastStartedTurnIndex = turnIndex;
         const currentModelSession = modelSession;
@@ -581,11 +553,7 @@ export class AgentRuntime {
         } finally { toolDeadline.dispose(); }
         if (toolResult.outcome === 'waiting_for_approval') return { executionStatus: 'waiting_for_approval', approvals: toolResult.approvals };
         if (toolResult.outcome === 'uncertain_effect') return { executionStatus: 'failed', terminationReason: 'uncertain_tool_effect', candidate: { status: 'absent' }, errorMessage: `Tool ${toolResult.toolName} attempt ${String(toolResult.toolAttempt)} has an uncertain non-idempotent side effect.`, turnCount: turnIndex, checkResults };
-        if (toolResult.failedTool && this.consumeRetryRequest(runtime.runId)) {
-          if (!toolResult.retrySafe) return { executionStatus: 'failed', terminationReason: 'uncertain_tool_effect', candidate: { status: 'absent' }, errorMessage: 'Agent-turn retry was refused because a failed tool may have produced a non-idempotent side effect.', turnCount: turnIndex, checkResults };
-          await runtime.append({ type: 'run.retry.scheduled', ...turnIdentity(snapshot.record), kind: 'agent_turn', attempt: 1, delayMs: 0 });
-          runNotes.push(`Agent-turn retry requested after a failed idempotent tool call at turnIndex ${String(turnIndex)}.`);
-        } else turnIndex += 1;
+        turnIndex += 1;
       }
       throw new Error('Model-turn execution exhausted its available entries without a terminal or limit decision.');
     } catch (error) {
@@ -596,7 +564,7 @@ export class AgentRuntime {
   }
 
   private async resumeToolBatch(runtime: RunExecutionRuntime & { readonly resume: ResumeExecutionState }, contextManager: ContextManager, observationStore: ObservationStore, checkResults: readonly AgentCheckResult[]): Promise<TerminalDecision | undefined> {
-    const profile = parseModelProfile(await this.options.provider.describeModel(this.runtimeModel));
+    const profile = parseModelProfile(await this.options.provider.describeModel(this.options.model));
     const batchIdentity = { ...runtime.resume.identity, toolBatchId: runtime.resume.toolBatchId };
     runtime.controller.transition('requesting_model');
     runtime.controller.transition('executing_tools');
@@ -917,7 +885,7 @@ export class AgentRuntime {
       catch { diagnostics.push({ ...base, persisted: false }); }
     }
   }
-  private captureRuntimeConfiguration(): RuntimeModelConfiguration { return Object.freeze({ model: this.runtimeModel, ...(this.runtimeTemperature === undefined ? {} : { temperature: this.runtimeTemperature }), ...(this.runtimeReasoning === undefined ? {} : { reasoning: this.runtimeReasoning }), ...(this.runtimeResponseFormat === undefined ? {} : { responseFormat: this.runtimeResponseFormat }) }); }
+  private captureRuntimeConfiguration(): RuntimeModelConfiguration { return Object.freeze({ model: this.options.model, ...(this.options.temperature === undefined ? {} : { temperature: this.options.temperature }), ...(this.options.reasoning === undefined ? {} : { reasoning: this.options.reasoning }), ...(this.options.responseFormat === undefined ? {} : { responseFormat: this.options.responseFormat }) }); }
   private toolContext(signal: AbortSignal): ToolPreparationContext {
     const services = {
       ...(this.options.toolContext?.services ?? {}),
@@ -965,11 +933,18 @@ export class AgentRuntime {
     }
     catch (error) { return error instanceof Error ? error : new Error(String(error)); }
   }
-  private controlRequest(runId: string, reason?: string): AgentQueuedControl { return { id: randomUUID(), runId, timestamp: new Date().toISOString(), ...(reason ? { reason } : {}) }; }
   private consumeSteeringInstructions(runId: string): string[] { const selected = this.steerQueue.filter((item) => item.runId === runId); removeRunItems(this.steerQueue, runId); return selected.map((item) => item.instruction); }
-  private consumeRetryRequest(runId: string): AgentQueuedControl | undefined { const index = this.retryQueue.findIndex((item) => item.runId === runId); return index < 0 ? undefined : this.retryQueue.splice(index, 1)[0]; }
-  private requireActiveRunId(action: string): string { if (!this.activeRunId) throw new Error(`Cannot ${action} without an active run.`); return this.activeRunId; }
-  private countForActiveRun(items: readonly { runId: string }[]): number { return this.activeRunId ? items.filter((item) => item.runId === this.activeRunId).length : 0; }
+  private injectSteering(runId: string, input: AgentSteeringInput): AgentSteeringReceipt {
+    if (this.activeRunId !== runId) throw new Error(`Run ${runId} is not active.`);
+    if (input.instruction.trim().length === 0) throw new Error('Steering instruction must not be empty.');
+    assertQueueCapacity(this.steerQueue, AgentRuntime.MAX_STEERING_ITEMS, 'steering');
+    const receipt = Object.freeze({ id: randomUUID(), runId, timestamp: new Date().toISOString() });
+    this.steerQueue.push({ ...receipt, instruction: input.instruction });
+    return receipt;
+  }
+  private abortRun(runId: string, reason = 'Agent run aborted.'): void {
+    if (this.activeRunId === runId) this.activeAbortController?.abort(reason);
+  }
 }
 
 function isProcessDisposer(value: unknown): value is { readonly disposeRun: (runId: string) => Promise<readonly unknown[]>; readonly markTerminalReported?: (processId: string) => Promise<void> } {
@@ -1118,6 +1093,9 @@ function validateToolBoundary(value: unknown): asserts value is ToolAuthorizatio
 }
 function removeRunItems(items: { readonly runId: string }[], runId: string): void { for (let index = items.length - 1; index >= 0; index -= 1) if (items[index]?.runId === runId) items.splice(index, 1); }
 function assertQueueCapacity(items: readonly unknown[], maximum: number, label: string): void { if (items.length >= maximum) throw new Error(`${label} queue limit of ${String(maximum)} was reached.`); }
+function completedRunControl(runId: string, result: AgentRunResult): AgentRunControl {
+  return Object.freeze({ runId, injectSteering() { throw new Error(`Run ${runId} is not active.`); }, abort: () => undefined, result: Promise.resolve(result) });
+}
 function approvalFromEvent(event: Extract<AgentEvent, { type: 'approval.requested' }>): AgentApprovalRequest {
   return Object.freeze({ runId: event.runId, turnIndex: event.turnIndex, turnId: event.turnId, requestAttempt: event.requestAttempt, toolBatchId: event.toolBatchId, callIndex: event.callIndex, ...(event.callId ? { callId: event.callId } : {}), approvalId: event.approvalId, status: 'pending', toolName: event.toolName, fingerprint: event.fingerprint, input: event.input, effects: event.effects, binding: event.binding, policyHash: event.policyHash, reason: event.reason });
 }

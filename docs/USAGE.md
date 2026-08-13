@@ -42,15 +42,16 @@ Configured authorization restricts rather than grants invocation authority. Use 
 Input is parsed and canonicalized before authorization. When a call requires approval, `run()` returns a durable suspension:
 
 ```ts
-const result = await runtime.run({ task: 'update the workspace' });
+const result = await runtime.run({ task: 'update the workspace' }).result;
 if (result.state === 'suspended') {
   const approval = result.pendingApprovals[0];
-  const resumed = await reopenedRuntime.resolveApproval({
+  const resumedControl = await reopenedRuntime.resumeApproval({
     runId: result.runId,
     approvalId: approval.approvalId,
     fingerprint: approval.fingerprint,
     decision: 'allow'
   });
+  const resumed = await resumedControl.result;
 }
 ```
 

@@ -1,4 +1,4 @@
-import type { AgentRuntime, AgentRuntimeState } from '@agent-core/runtime';
+import type { AgentSession, AgentSessionState } from '@agent-core/runtime';
 import { parseReasoningEffort } from './reasoning-effort.js';
 
 export interface InteractiveCommandEntry {
@@ -8,7 +8,7 @@ export interface InteractiveCommandEntry {
 }
 
 interface InteractiveCommandSpec extends InteractiveCommandEntry {
-  execute(agent: AgentRuntime, value: string): InteractiveCommandResult;
+  execute(session: AgentSession, value: string): InteractiveCommandResult | Promise<InteractiveCommandResult>;
 }
 
 export type InteractiveCommandName =
@@ -19,7 +19,6 @@ export type InteractiveCommandName =
   | '/reasoning-effort'
   | '/steer'
   | '/follow'
-  | '/retry'
   | '/abort'
   | '/status'
   | '/debug';
@@ -37,23 +36,27 @@ export type InteractiveCommandEffect =
 export const INTERACTIVE_COMMAND_REGISTRY = {
   '/exit': command('/exit', 'Exit the interactive surface.', false, () => ({ message: 'Exit requested.' })),
   '/quit': command('/quit', 'Exit the interactive surface.', false, () => ({ message: 'Exit requested.' })),
-  '/model': command('/model', 'Set the model for the next request.', true, (agent, value) => { agent.configureModel({ model: value }); return { message: `Model: ${agent.runtimeState().model}` }; }),
-  '/temperature': command('/temperature', 'Set provider temperature for the next request.', true, (agent, value) => { const temperature = Number(value); if (!Number.isFinite(temperature)) throw new Error('/temperature requires a number.'); agent.configureModel({ temperature }); return { message: `Temperature: ${String(temperature)}` }; }),
-  '/reasoning-effort': command('/reasoning-effort', 'Set provider reasoning effort for the next request.', true, (agent, value) => { const effort = parseReasoningEffort(value, '/reasoning-effort'); agent.configureModel({ reasoning: effort === 'none' ? { strategy: 'disabled' } : { strategy: 'effort', effort } }); return { message: `Reasoning effort: ${effort}` }; }),
-  '/steer': command('/steer', 'Queue a steering instruction for the next request.', true, (agent, value) => { agent.steer(value); return { message: 'Steering queued.' }; }),
-  '/follow': command('/follow', 'Queue a follow-up task after the active run.', true, (agent, value) => { agent.enqueueFollowUp(value); return { message: 'Follow-up queued.', effect: { type: 'follow-up-queued', task: value } }; }),
-  '/retry': command('/retry', 'Ask the loop to retry the failed tool call.', false, (agent, value) => { agent.requestRetry(value || undefined); return { message: 'Retry requested.' }; }),
-  '/abort': command('/abort', 'Abort the active run.', false, (agent, value) => { agent.abort(value || undefined); return { message: 'Abort requested.', effect: { type: 'abort-requested', reason: value || 'requested' } }; }),
-  '/status': command('/status', 'Show the current run status.', false, agent => ({ message: runtimeStatus(agent.runtimeState()) })),
-  '/debug': command('/debug', 'Inspect detailed runtime state.', false, agent => ({ message: JSON.stringify(agent.runtimeState(), null, 2), view: 'debug' }))
+  '/model': command('/model', 'Set the model for the next run.', true, async (session, value) => { const state = await session.configure({ model: value }); return { message: `Model: ${state.configuration.model}` }; }),
+  '/temperature': command('/temperature', 'Set provider temperature for the next run.', true, async (session, value) => { const temperature = Number(value); if (!Number.isFinite(temperature)) throw new Error('/temperature requires a number.'); await session.configure({ temperature }); return { message: `Temperature: ${String(temperature)}` }; }),
+  '/reasoning-effort': command('/reasoning-effort', 'Set provider reasoning effort for the next run.', true, async (session, value) => { const effort = parseReasoningEffort(value, '/reasoning-effort'); await session.configure({ reasoning: effort === 'none' ? { strategy: 'disabled' } : { strategy: 'effort', effort } }); return { message: `Reasoning effort: ${effort}` }; }),
+  '/steer': command('/steer', 'Steer the active run.', true, async (session, value) => { const activeRunId = session.state().activeRunId; const result = await session.submit({ task: value }, { delivery: 'steer', ...(activeRunId === undefined ? {} : { expectedRunId: activeRunId }) }); if (result.kind === 'rejected') throw new Error('No matching active run can accept steering.'); return { message: 'Steering accepted.' }; }),
+  '/follow': command('/follow', 'Queue a follow-up after current work.', true, async (session, value) => {
+    const result = await session.submit({ task: value }, { delivery: 'follow_up' });
+    return result.kind === 'queued'
+      ? { message: 'Follow-up queued.', effect: { type: 'follow-up-queued', task: value } }
+      : { message: 'Run started.' };
+  }),
+  '/abort': command('/abort', 'Abort the active run.', false, (session, value) => { if (!session.abort(value || undefined, session.state().activeRunId)) throw new Error('No active run to abort.'); return { message: 'Abort requested.', effect: { type: 'abort-requested', reason: value || 'requested' } }; }),
+  '/status': command('/status', 'Show the current session status.', false, session => ({ message: runtimeStatus(session.state()) })),
+  '/debug': command('/debug', 'Inspect detailed session state.', false, session => ({ message: JSON.stringify(session.state(), null, 2), view: 'debug' }))
 } satisfies Record<InteractiveCommandName, InteractiveCommandSpec>;
 
 export const INTERACTIVE_COMMANDS: readonly InteractiveCommandEntry[] = Object.freeze(Object.values(INTERACTIVE_COMMAND_REGISTRY));
 
-export function executeInteractiveCommand(agent: AgentRuntime, commandLine: string): InteractiveCommandResult {
+export function executeInteractiveCommand(session: AgentSession, commandLine: string): InteractiveCommandResult | Promise<InteractiveCommandResult> {
   const parsed = parseInteractiveCommandLine(commandLine);
   const spec = INTERACTIVE_COMMAND_REGISTRY[parsed.command];
-  return spec.execute(agent, spec.requiresValue ? requireCommandValue(parsed.command, parsed.value) : parsed.value);
+  return spec.execute(session, spec.requiresValue ? requireCommandValue(parsed.command, parsed.value) : parsed.value);
 }
 
 function command(name: InteractiveCommandName, description: string, requiresValue: boolean, execute: InteractiveCommandSpec['execute']): InteractiveCommandSpec {
@@ -80,7 +83,7 @@ function requireCommandValue(command: string, value: string): string {
   return value;
 }
 
-function runtimeStatus(state: AgentRuntimeState): string {
-  const queues = state.queuedSteers + state.queuedFollowUps + state.queuedRetries;
-  return `${state.active ? 'Running' : 'Idle'} · ${state.model}${queues === 0 ? '' : ` · ${String(queues)} queued`}`;
+function runtimeStatus(state: AgentSessionState): string {
+  const status = state.phase === 'running' ? 'Running' : state.phase === 'waiting_for_approval' ? 'Waiting for approval' : 'Idle';
+  return `${status} · ${state.configuration.model}${state.queuedInputs === 0 ? '' : ` · ${String(state.queuedInputs)} queued`}`;
 }

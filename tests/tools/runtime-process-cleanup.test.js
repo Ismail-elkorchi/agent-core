@@ -53,7 +53,7 @@ test('a run stops and persists its active process before durable approval suspen
   const state = await setup();
   const provider = new Provider([toolResponse('exec_command', { command: longCommand, yieldMs: 100 }), toolResponse('approval_write', {})]);
   const agent = createRuntime({ ...state, provider, tools: [execCommandTool, approvalTool], authorizer: (request) => request.call.name === 'approval_write' ? { decision: 'require_approval', reason: 'confirm' } : { decision: 'allow' } });
-  const result = await agent.run({ runId: 'suspension-run', task: 'suspend' });
+  const result = await agent.run({ runId: 'suspension-run', task: 'suspend' }).result;
   assert.equal(result.state, 'suspended');
   assert.equal(state.manager.activeCount('suspension-run'), 0);
   const ended = (await records(state.events, 'suspension-run')).filter((event) => event.type === 'process.ended');
@@ -65,10 +65,11 @@ test('abort and runtime failure both clean active run processes before run.ended
   for (const mode of ['abort', 'failure']) {
     const state = await setup();
     const provider = new Provider([toolResponse('exec_command', { command: longCommand, yieldMs: 100 }), ...(mode === 'failure' ? [new Error('provider failed')] : [done])]);
-    let agent;
-    agent = createRuntime({ ...state, provider, tools: [execCommandTool], onProgress(event) { if (mode === 'abort' && event.type === 'tool.ended') agent.abort('stop'); } });
+    let control;
+    const agent = createRuntime({ ...state, provider, tools: [execCommandTool], onProgress(event) { if (mode === 'abort' && event.type === 'tool.ended') control.abort('stop'); } });
     const runId = `${mode}-run`;
-    const result = await agent.run({ runId, task: mode });
+    control = agent.run({ runId, task: mode });
+    const result = await control.result;
     assert.equal(result.state, 'ended');
     assert.equal(result.terminal.executionStatus, mode === 'abort' ? 'aborted' : 'failed');
     assert.equal(state.manager.activeCount(runId), 0);
@@ -82,7 +83,7 @@ test('cleanup failure becomes terminal runtime_error and still commits run.ended
   const state = await setup();
   const failingManager = { resourceLeases: state.manager.resourceLeases, capabilities: () => ['process'], async disposeRun() { throw new Error('cleanup broke'); } };
   const agent = createRuntime({ ...state, provider: new Provider([done]), services: { ...state.services, processManager: failingManager } });
-  const result = await agent.run({ runId: 'cleanup-failure-run', task: 'finish' });
+  const result = await agent.run({ runId: 'cleanup-failure-run', task: 'finish' }).result;
   assert.equal(result.state, 'ended');
   assert.equal(result.terminal.executionStatus, 'failed');
   assert.match(result.terminal.errorMessage, /cleanup broke/u);
@@ -98,7 +99,7 @@ test('natural process exit is persisted exactly once even when the model never p
   const state = await setup();
   const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify('process.exit(0)')}`;
   const agent = createRuntime({ ...state, provider: new Provider([toolResponse('exec_command', { command, yieldMs: 1_000 }), done]), tools: [execCommandTool] });
-  const result = await agent.run({ runId: 'natural-exit-run', task: 'let process exit' });
+  const result = await agent.run({ runId: 'natural-exit-run', task: 'let process exit' }).result;
   assert.equal(result.state, 'ended');
   const persisted = await records(state.events, 'natural-exit-run');
   const ended = persisted.filter(event => event.type === 'process.ended');
@@ -131,7 +132,7 @@ test('cleanup failure transforms prior partial, checked, and aborted decisions w
       provider: item.provider, model: 'scripted', toolBoundary: boundary, repositories: { events: state.events, artifacts: state.artifacts },
       toolContext: { services: { ...state.services, processManager: failingManager } }, ...(item.checks ? { checks: item.checks } : {})
     });
-    const result = await agent.run({ runId: item.runId, task: 'preserve prior decision' });
+    const result = await agent.run({ runId: item.runId, task: 'preserve prior decision' }).result;
     assert.equal(result.state, 'ended');
     assert.equal(result.terminal.executionStatus, 'failed');
     assert.equal(result.terminal.terminationReason, 'runtime_error');
@@ -144,7 +145,7 @@ test('cleanup failure transforms prior partial, checked, and aborted decisions w
   const failingManager = { resourceLeases: state.manager.resourceLeases, capabilities: () => ['process'], async disposeRun() { throw new Error('cleanup failed'); } };
   const agent = createRuntime({ ...state, provider: new Provider([done]), services: { ...state.services, processManager: failingManager } });
   const controller = new AbortController(); controller.abort('already aborted');
-  const result = await agent.run({ runId: 'aborted-cleanup', task: 'abort', signal: controller.signal });
+  const result = await agent.run({ runId: 'aborted-cleanup', task: 'abort', signal: controller.signal }).result;
   assert.equal(result.state, 'ended');
   assert.equal(result.terminal.executionStatus, 'failed');
   assert.equal(result.terminal.candidate.status, 'absent');
@@ -157,7 +158,7 @@ test('two runtimes sharing one manager clean only their own processes', async ()
   const running = await state.manager.start({ command: longCommand, cwd: state.root, pty: false, timeoutMs: 60_000, yieldMs: 100, outputTokenBudget: 1_000, owner: ownerB });
   assert.equal(running.status, 'running');
   const agentA = createRuntime({ ...state, provider: new Provider([done]) });
-  const result = await agentA.run({ runId: 'run-a', task: 'finish a' });
+  const result = await agentA.run({ runId: 'run-a', task: 'finish a' }).result;
   assert.equal(result.state, 'ended');
   assert.equal(state.manager.activeCount('run-b'), 1);
   await state.manager.disposeRun('run-b');

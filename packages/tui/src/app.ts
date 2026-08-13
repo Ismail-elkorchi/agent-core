@@ -1,4 +1,4 @@
-import type { AgentApprovalRequest, AgentApprovalSuspension, AgentRunResult } from '@agent-core/runtime';
+import type { AgentApprovalRequest, AgentApprovalSuspension } from '@agent-core/runtime';
 import {
   measuredWindow,
   prepareSearchPickerIndex,
@@ -52,8 +52,7 @@ export interface AgentTuiAppOptions {
   readonly approvalHandler?: (
     suspension: AgentApprovalSuspension,
     decision: 'allow' | 'deny'
-  ) => Promise<AgentRunResult>;
-  readonly exitWhenApprovalEnds?: boolean;
+  ) => Promise<void>;
 }
 
 export function createAgentTuiApp(task: string, options: AgentTuiAppOptions = {}) {
@@ -107,17 +106,6 @@ function updateAgentTui(
         state,
         effects: [approvalEffect(state.run.suspension, message.decision, options.approvalHandler)]
       };
-    }
-    case 'approval.result': {
-      if (message.result.state === 'suspended') {
-        return updated({ ...state, run: { kind: 'waiting_for_approval', suspension: message.result } }, context, {
-          kind: 'element', elementId: 'approval-deny'
-        });
-      }
-      const ended = reconcileConversationLayout(applyResult(state, message.result), context);
-      return options.exitWhenApprovalEnds === true
-        ? { state: ended, exit: { reason: terminalReason(message.result) } }
-        : { state: ended, focus: { kind: 'element', elementId: 'composer' } };
     }
     case 'composer.edit': return updated(editComposer(state, message.action), context);
     case 'composer.submit': return submit(state, context, options.commandHandler);
@@ -483,10 +471,8 @@ function approvalEffect(
     concurrency: 'keep-first' as const,
     async run() {
       if (handler === undefined) throw new Error('No approval handler is attached.');
-      return {
-        kind: 'message' as const,
-        message: { type: 'approval.result' as const, result: await handler(suspension, decision) }
-      };
+      await handler(suspension, decision);
+      return { kind: 'none' as const };
     },
     onError: ({ diagnostic }: { readonly diagnostic: { readonly message: string } }) => ({
       kind: 'message' as const,
@@ -722,8 +708,4 @@ function parseDebugRuntimeState(value: string): unknown {
   } catch {
     return value;
   }
-}
-
-function terminalReason(result: Extract<AgentRunResult, { state: 'ended' }>): string {
-  return `${result.terminal.executionStatus}:${result.terminal.verificationStatus}:${result.terminal.terminationReason}`;
 }

@@ -161,23 +161,23 @@ export type ModelReasoningMode = 'standard' | 'pro';
 
 export type ModelReasoningRequest =
   | {
-    strategy: 'disabled';
+    readonly strategy: 'disabled';
   }
   | {
-    strategy: 'enabled';
-    summary?: ModelReasoningSummary;
+    readonly strategy: 'enabled';
+    readonly summary?: ModelReasoningSummary;
   }
   | {
-    strategy: 'effort';
-    effort: Exclude<ModelReasoningEffort, 'none'>;
+    readonly strategy: 'effort';
+    readonly effort: Exclude<ModelReasoningEffort, 'none'>;
     /** A provider-declared execution mode, serialized only by adapters that support it. */
-    mode?: ModelReasoningMode;
-    summary?: ModelReasoningSummary;
+    readonly mode?: ModelReasoningMode;
+    readonly summary?: ModelReasoningSummary;
   }
   | {
-    strategy: 'budget';
-    maxTokens: number;
-    summary?: ModelReasoningSummary;
+    readonly strategy: 'budget';
+    readonly maxTokens: number;
+    readonly summary?: ModelReasoningSummary;
   };
 
 export interface ModelProviderOptions {

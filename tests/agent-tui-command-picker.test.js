@@ -67,15 +67,19 @@ test('TUI permission labels distinguish structured patch authority from ambient 
 
 function fakeAgent() {
   return {
-    runtimeState() {
+    state() {
       return {
-        active: false,
-        model: 'test-model',
-        queuedSteers: 0,
-        queuedFollowUps: 0,
-        queuedRetries: 0
+        sessionId: 'test-session',
+        phase: 'idle',
+        configuration: { provider: 'test', model: 'test-model' },
+        queuedInputs: 0
       };
-    }
+    },
+    subscribe() { return () => {}; },
+    async waitForIdle() {},
+    async configure() { return this.state(); },
+    async submit() { throw new Error('fake session does not execute runs'); },
+    abort() { return false; }
   };
 }
 

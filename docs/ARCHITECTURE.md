@@ -45,7 +45,7 @@ Replay ignores an uncommitted session projection. Repeated identical finalizatio
 
 ## Tools, approvals, and verification
 
-Tool execution is parse → canonicalize → derive effects → authorize → execute → normalize → persist. Authorization is per call. An approval binds canonical input, resources, tool implementation, effects, policy, execution boundary, and fingerprint; `resolveApproval` reconstructs the exact persisted batch and never repeats an uncertain non-idempotent effect.
+Tool execution is parse → canonicalize → derive effects → authorize → execute → normalize → persist. Authorization is per call. An approval binds canonical input, resources, tool implementation, effects, policy, execution boundary, and fingerprint; `AgentSession.resolveApproval()` reconstructs the exact persisted batch and never repeats an uncertain non-idempotent effect.
 
 Checks receive a present candidate, provenance-bearing instructions, read-only evidence, metadata, and an abort signal. Required failed checks produce `failed`; missing or unknown required checks produce `inconclusive`; advisory checks remain visible without blocking.
 

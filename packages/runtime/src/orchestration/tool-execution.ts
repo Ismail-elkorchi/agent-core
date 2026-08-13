@@ -25,7 +25,7 @@ import type { AgentRunController } from './run-controller.js';
 import { scheduleToolCalls } from './tool-scheduler.js';
 
 export type ToolBatchExecutionResult =
-  | { readonly outcome: 'completed'; readonly failedTool: boolean; readonly retrySafe: boolean }
+  | { readonly outcome: 'completed' }
   | { readonly outcome: 'waiting_for_approval'; readonly approvals: readonly AgentApprovalRequest[] }
   | { readonly outcome: 'uncertain_effect'; readonly callIndex: number; readonly toolName: string; readonly toolAttempt: number };
 
@@ -200,19 +200,13 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
     for (const result of results) observed.set(result.callIndex, result.observation);
   }
 
-  let failedTool = false;
-  let retrySafe = true;
   for (const entry of [...entries].sort((left, right) => left.identity.callIndex - right.identity.callIndex)) {
     const observation = entry.observation ?? observed.get(entry.identity.callIndex);
     if (!observation) throw new Error(`Tool call ${String(entry.identity.callIndex)} has no terminal observation.`);
     await persistObservation(input, entry, observation);
     input.controller.recordToolResult(observation.ok);
-    if (!observation.ok) {
-      failedTool = true;
-      if (entry.prepared?.effects.idempotency === 'non_idempotent') retrySafe = false;
-    }
   }
-  return { outcome: 'completed', failedTool, retrySafe };
+  return { outcome: 'completed' };
 }
 
 function isExecutableEntry(entry: PreparedEntry): entry is PreparedEntry & { readonly prepared: PreparedToolCall; readonly invoke: true } {

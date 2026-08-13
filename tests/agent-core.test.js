@@ -131,7 +131,7 @@ test('runtime exposes artifact and image tools only with the required repository
     tools,
     toolPolicy: { allowedRisks: ['read'] }
   });
-  await textAgent.run({ task: 'text only' });
+  await textAgent.run({ task: 'text only' }).result;
   assert.deepEqual((textProvider.calls[0].tools ?? []).map(modelToolName), []);
 
   const imageProvider = new ScriptedProvider([response()], { profile: { modalities: { input: ['text', 'image'], output: ['text'] } } });
@@ -144,7 +144,7 @@ test('runtime exposes artifact and image tools only with the required repository
     tools,
     toolPolicy: { allowedRisks: ['read'] }
   });
-  await imageAgent.run({ task: 'image capable' });
+  await imageAgent.run({ task: 'image capable' }).result;
   assert.deepEqual((imageProvider.calls[0].tools ?? []).map(modelToolName), ['read_artifact', 'view_image']);
 });
 
@@ -166,7 +166,7 @@ test('tool progress from preparation and invocation remains separate from the fi
     script: [response('tool_calls', '', { toolCalls: [{ id: 'progress', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }] }), response()],
     onProgress(event) { if (event.type === 'tool.updated' && event.progress.type === 'status') progress.push(event.progress.stage); }
   });
-  const result = ended(await agent.run({ task: 'report progress' }));
+  const result = ended(await agent.run({ task: 'report progress' }).result);
   assert.deepEqual(progress.filter((stage) => stage === 'canonicalize' || stage === 'invoke'), ['canonicalize', 'invoke']);
   const persisted = await eventsFor(events, result.runId);
   assert.deepEqual(persisted.filter((event) => event.type === 'tool.updated' && event.progress.type === 'status').map((event) => event.progress.stage).filter((stage) => stage === 'canonicalize' || stage === 'invoke'), []);
@@ -185,7 +185,7 @@ test('oversized tool observations keep domain output intact in an artifact', asy
     tools: [tool],
     script: [response('tool_calls', '', { toolCalls: [{ id: 'large', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }] }), response()]
   });
-  const result = ended(await agent.run({ task: 'preserve output' }));
+  const result = ended(await agent.run({ task: 'preserve output' }).result);
   const persistedEvents = await eventsFor(events, result.runId);
   const observationEvent = persistedEvents.find((event) => event.type === 'observation.record.created');
   assert.ok(observationEvent, JSON.stringify({ types: persistedEvents.map((event) => event.type), terminal: result }));
@@ -211,7 +211,7 @@ test('artifact-store failure after a completed tool effect still persists tool.e
     artifacts: new FailingArtifacts(), tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] },
     script: [response('tool_calls', '', { toolCalls: [{ id: 'degraded', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }] }), response()]
   });
-  const result = ended(await agent.run({ task: 'complete despite degraded artifact storage' }));
+  const result = ended(await agent.run({ task: 'complete despite degraded artifact storage' }).result);
   assert.equal(result.executionStatus, 'completed');
   assert.equal(effects, 1);
   const persisted = await eventsFor(events, result.runId);
@@ -267,7 +267,7 @@ test('image and presenter projection failures happen after durable tool truth an
       }
     ], { ...(scenario.profile ? { profile: scenario.profile } : {}) });
     const { agent, events } = await harness({ provider, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, withoutSession: true, ...(scenario.artifacts ? { artifacts: scenario.artifacts } : {}) });
-    const result = ended(await agent.run({ task: scenario.name }));
+    const result = ended(await agent.run({ task: scenario.name }).result);
     assert.equal(result.executionStatus, 'completed', JSON.stringify({ scenario: scenario.name, result }));
     assert.equal(effects, 1);
     const persisted = await eventsFor(events, result.runId);
@@ -303,7 +303,7 @@ test('session and observation-record projection failures do not reclassify a com
       async invoke() { effects += 1; return { kind: 'result', ok: true, summary: 'effect committed', scope: completeScope, output: { done: true } }; }
     };
     const run = await harness({ ...scenario, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, script: [response('tool_calls', '', { toolCalls: [{ id: 'projection', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }] }), response()] });
-    const result = ended(await run.agent.run({ task: 'projection failure' }));
+    const result = ended(await run.agent.run({ task: 'projection failure' }).result);
     assert.equal(result.executionStatus, 'completed');
     assert.equal(effects, 1);
     const persisted = await eventsFor(run.events, result.runId);
@@ -334,7 +334,7 @@ test('candidate mappings preserve execution, completeness, source, and verificat
   ];
   for (const [modelResponse, execution, status, source, termination] of cases) {
     const { agent, events } = await harness({ script: [modelResponse], withoutSession: true });
-    const result = ended(await agent.run({ task: 'map candidate' }));    assert.equal(result.executionStatus, execution);
+    const result = ended(await agent.run({ task: 'map candidate' }).result);    assert.equal(result.executionStatus, execution);
     assert.equal(result.candidate.status, status);
     if (source) assert.equal(result.candidate.source, source);
     assert.equal(result.terminationReason, termination);
@@ -351,7 +351,7 @@ test('stream interruption preserves a partial stream-recovery candidate and neve
     async *stream() { yield { type: 'content', content: 'part', accumulated: 'part' }; throw new Error('socket closed'); }
   });
   const { agent, events } = await harness({ provider, withoutSession: true });
-  const result = ended(await agent.run({ task: 'stream' }));  assert.equal(result.executionStatus, 'failed');
+  const result = ended(await agent.run({ task: 'stream' }).result);  assert.equal(result.executionStatus, 'failed');
   assert.deepEqual(result.candidate, { status: 'partial', message: 'part', source: 'stream_recovery', turnIndex: 1 });
   assert.equal(result.verificationStatus, 'not_run');
   const interrupted = (await eventsFor(events, result.runId)).find((event) => event.type === 'assistant.interrupted');
@@ -366,7 +366,7 @@ test('abort during verification produces aborted/not_run and preserves a partial
     return { verdict: 'passed', summary: 'impossible' };
   } };
   const { agent } = await harness({ checks: [check] });
-  const result = ended(await agent.run({ task: 'abort verification', signal: controller.signal }));  assert.equal(result.executionStatus, 'aborted');
+  const result = ended(await agent.run({ task: 'abort verification', signal: controller.signal }).result);  assert.equal(result.executionStatus, 'aborted');
   assert.equal(result.verificationStatus, 'not_run');
   assert.equal(result.candidate.status, 'partial');
   assert.equal(result.candidate.message, 'done');
@@ -378,7 +378,7 @@ test('abort requested while delivering the final check cannot commit completed v
     checks: [{ id: 'last', requirement: 'required', async run() { return { verdict: 'passed', summary: 'valid before cancellation' }; } }],
     onProgress(event) { if (event.type === 'check.ended') controller.abort('cancel at final check delivery'); }
   });
-  const result = ended(await agent.run({ task: 'cancel at verification boundary', signal: controller.signal }));  assert.equal(result.executionStatus, 'aborted');
+  const result = ended(await agent.run({ task: 'cancel at verification boundary', signal: controller.signal }).result);  assert.equal(result.executionStatus, 'aborted');
   assert.equal(result.verificationStatus, 'not_run');
   assert.equal(result.candidate.status, 'partial');
   const records = await eventsFor(events, result.runId);
@@ -393,7 +393,7 @@ test('abort at the finalization boundary wins before terminal preparation', asyn
       if (event.type === 'run.phase.changed' && event.phase === 'finalizing') controller.abort('cancel before terminal preparation');
     }
   });
-  const result = ended(await agent.run({ task: 'cancel at finalization boundary', signal: controller.signal }));  assert.equal(result.executionStatus, 'aborted');
+  const result = ended(await agent.run({ task: 'cancel at finalization boundary', signal: controller.signal }).result);  assert.equal(result.executionStatus, 'aborted');
   assert.equal(result.verificationStatus, 'not_run');
   assert.equal(result.candidate.status, 'partial');
   const records = await eventsFor(events, result.runId);
@@ -408,7 +408,7 @@ test('throwing check progress observer is a delivery diagnostic and cannot alter
     checks: [{ id: 'sound', requirement: 'required', async run() { return { verdict: 'passed', summary: 'sound' }; } }],
     onProgress(event) { if (event.type === 'check.ended') throw new Error('check renderer broke'); }
   });
-  const result = ended(await agent.run({ task: 'observer-independent verification' }));  assert.equal(result.executionStatus, 'completed');
+  const result = ended(await agent.run({ task: 'observer-independent verification' }).result);  assert.equal(result.executionStatus, 'completed');
   assert.equal(result.verificationStatus, 'passed');
   assert.equal(result.candidate.status, 'complete');
   assert.equal(result.deliveryDiagnostics.some((item) => item.eventType === 'check.ended'), true);
@@ -423,7 +423,7 @@ test('check timeouts and malformed verdicts become unknown instead of passing', 
     { id: 'bad', requirement: 'advisory', async run() { return { verdict: 'excellent', summary: 'not legal' }; } }
   ];
   const { agent } = await harness({ checks });
-  const result = ended(await agent.run({ task: 'verify' }));  assert.equal(result.verificationStatus, 'inconclusive');
+  const result = ended(await agent.run({ task: 'verify' }).result);  assert.equal(result.verificationStatus, 'inconclusive');
   assert.equal(result.checkResults[0].verdict, 'unknown');
   assert.equal(result.checkResults[0].diagnostic.kind, 'timeout');
   assert.equal(result.checkResults[1].verdict, 'unknown');
@@ -444,7 +444,7 @@ test('cyclic and oversized check output is bounded without losing the candidate'
   const cyclic = { huge: 'x'.repeat(100_000), values: Array.from({ length: 500 }, (_, index) => index) };
   cyclic.self = cyclic;
   const { agent } = await harness({ checks: [{ id: 'safe', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok', output: cyclic }; } }] });
-  const result = ended(await agent.run({ task: 'normalize' }));  assert.equal(result.candidate.message, 'done');
+  const result = ended(await agent.run({ task: 'normalize' }).result);  assert.equal(result.candidate.message, 'done');
   assert.equal(result.verificationStatus, 'passed');
   assert.ok(result.checkResults[0].outputNormalization.length > 0);
   assert.ok(JSON.stringify(result.checkResults[0].output).length < 40_000);
@@ -453,6 +453,7 @@ test('cyclic and oversized check output is bounded without losing the candidate'
 test('application, run, and steering instructions reach checks with provenance', async () => {
   let received;
   let agent;
+  let runControl;
   const noop = { name: 'noop', implementationId: 'tests/noop-instructions@1', description: 'noop', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope,
     decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return readEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; } };
   ({ agent } = await harness({
@@ -460,9 +461,10 @@ test('application, run, and steering instructions reach checks with provenance',
     tools: [noop],
     instructions: [{ id: 'standing', content: 'application rule' }],
     checks: [{ id: 'context', requirement: 'required', async run(context) { received = context.instructions; return { verdict: 'passed', summary: 'ok' }; } }],
-    onProgress(event) { if (event.type === 'assistant.started') agent.steer('steering rule'); }
+    onProgress(event) { if (event.type === 'assistant.started') runControl.injectSteering({ instruction: 'steering rule' }); }
   }));
-  const result = ended(await agent.run({ task: 'instructions', instructions: ['run rule'] }));  assert.equal(result.executionStatus, 'completed');
+  runControl = agent.run({ task: 'instructions', instructions: ['run rule'] });
+  const result = ended(await runControl.result);  assert.equal(result.executionStatus, 'completed');
   assert.deepEqual(received.map((item) => item.provenance), ['application', 'run', 'steering']);
 });
 
@@ -470,7 +472,7 @@ test('check artifacts and diagnostics agree across ledger, session projection, a
   const artifacts = new InMemoryArtifactRepository();
   const ref = await artifacts.store({ label: 'proof', content: new TextEncoder().encode('proof'), mediaType: 'text/plain' });
   const { agent, events, sessions, session } = await harness({ artifacts, checks: [{ id: 'advice', requirement: 'advisory', async run() { return { verdict: 'unknown', summary: 'unavailable', diagnostic: { kind: 'unavailable', message: 'offline' }, artifacts: [ref] }; } }] });
-  const result = ended(await agent.run({ task: 'persist checks' }));  const ledgerFinal = (await eventsFor(events, result.runId)).find((event) => event.type === 'run.ended').terminal;
+  const result = ended(await agent.run({ task: 'persist checks' }).result);  const ledgerFinal = (await eventsFor(events, result.runId)).find((event) => event.type === 'run.ended').terminal;
   const replay = await sessions.loadReplayState(session.id);
   const projection = replay.terminalProjections[0].terminal;
   assert.deepEqual(ledgerFinal.checkResults, result.checkResults);
@@ -525,62 +527,15 @@ test('agent event persistence accepts long model answers within the runtime outp
 });
 
 test('in-memory repositories run, reopen, and replay without filesystem paths', async () => {
-  const first = await harness({ script: [response('stop', 'first')] });  const firstResult = ended(await first.agent.run({ task: 'first' }));  const started = (await eventsFor(first.events, firstResult.runId)).find((event) => event.type === 'run.started');
+  const first = await harness({ script: [response('stop', 'first')] });  const firstResult = ended(await first.agent.run({ task: 'first' }).result);  const started = (await eventsFor(first.events, firstResult.runId)).find((event) => event.type === 'run.started');
   assert.equal(started.runId, firstResult.runId);
   assert.equal(started.finalizationId, firstResult.finalizationId);
   const reopened = await first.sessions.open(first.session.id);
   assert.equal(reopened.id, first.session.id);
   const secondProvider = new ScriptedProvider([request => response('stop', request.messages.some(message => message.content.includes('Prior session context')) ? 'replayed' : 'missing')]);
   const second = new AgentRuntime({ provider: secondProvider, model: 'scripted', toolBoundary, repositories: { events: first.events, session: { repository: first.sessions, sessionId: first.session.id }, artifacts: first.artifacts } });
-  const secondResult = ended(await second.run({ task: 'second' }));  assert.equal(firstResult.executionStatus, 'completed');
+  const secondResult = ended(await second.run({ task: 'second' }).result);  assert.equal(firstResult.executionStatus, 'completed');
   assert.equal(secondResult.candidate.message, 'replayed');
-});
-
-test('mid-run model changes apply only to the coherent next snapshot', async () => {
-  const provider = new ScriptedProvider([
-    request => response('tool_calls', '', { toolCalls: [{ id: '1', type: 'function', name: 'noop', input: { kind: 'json', value: {} } }], model: request.model }),
-    request => response('stop', `model:${request.model}`, { model: request.model })
-  ]);
-  const noop = { name: 'noop', implementationId: 'tests/noop-snapshot@1', description: 'noop', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope,
-    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return readEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; } };
-  let agent;
-  ({ agent } = await harness({ provider, tools: [noop], onProgress(event) { if (event.type === 'assistant.ended' && event.turnIndex === 1) agent.configureModel({ model: 'next-model' }); } }));
-  const result = ended(await agent.run({ task: 'change model' }));  assert.equal(provider.calls[0].model, 'scripted');
-  assert.equal(provider.calls[1].model, 'next-model');
-  assert.equal(result.candidate.message, 'model:next-model');
-});
-
-test('a multimodal image result remains valid after switching to a text-only model', async () => {
-  const artifacts = new InMemoryArtifactRepository();
-  const artifact = await artifacts.store({ label: 'pixel', mediaType: 'image/png', content: new Uint8Array([1, 2, 3, 4]) });
-  const imageCall = { id: 'image-1', type: 'function', name: 'view_image', input: { kind: 'json', value: { path: 'pixel.png' } } };
-  const viewImage = {
-    name: 'view_image', implementationId: 'tests/profile-switch-image@1', description: 'image fixture', jsonSchema: { type: 'object' }, outputSchema: z.unknown(),
-    requirements: { services: ['artifactRepository'], modelInputModalities: ['image'] }, effectEnvelope: readEnvelope,
-    decodeInput() { return { ok: true, input: { path: 'pixel.png' } }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return readEffects; },
-    async invoke() {
-      return { kind: 'result', ok: true, summary: 'Loaded pixel image.', scope: completeScope,
-        content: [{ type: 'image', artifact, detail: 'original' }], output: { artifact } };
-    }
-  };
-  const provider = new ScriptedProvider([
-    response('tool_calls', '', { toolCalls: [imageCall] }),
-    request => {
-      const toolResult = request.messages.find(message => message.role === 'tool' && message.toolName === 'view_image');
-      assert.ok(toolResult);
-      assert.equal(toolResult.images, undefined);
-      assert.match(toolResult.content, new RegExp(artifact.artifactId, 'u'));
-      return response('stop', 'text-only request accepted');
-    }
-  ], { profile: model => ({ modalities: { input: model === 'text-only' ? ['text'] : ['text', 'image'], output: ['text'] } }) });
-  let agent;
-  ({ agent } = await harness({ provider, artifacts, tools: [viewImage], onProgress(event) {
-    if (event.type === 'assistant.ended' && event.turnIndex === 1) agent.configureModel({ model: 'text-only' });
-  } }));
-  const result = ended(await agent.run({ task: 'inspect then switch model' }));
-  assert.equal(result.executionStatus, 'completed');
-  assert.equal(provider.calls[0].model, 'scripted');
-  assert.equal(provider.calls[1].model, 'text-only');
 });
 
 test('run limits and retry policy terminate deterministically', async () => {
@@ -588,12 +543,12 @@ test('run limits and retry policy terminate deterministically', async () => {
   const provider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] })]);
   const noop = { name: 'noop', implementationId: 'tests/noop-model-change@1', description: 'noop', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope, decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return readEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; } };
   const { agent } = await harness({ provider, tools: [noop], limits: { modelTurns: 1 } });
-  const exhausted = ended(await agent.run({ task: 'limit' }));  assert.equal(exhausted.terminationReason, 'limit_exhausted');
+  const exhausted = ended(await agent.run({ task: 'limit' }).result);  assert.equal(exhausted.terminationReason, 'limit_exhausted');
   assert.equal(exhausted.exhaustedLimit, 'model_turns');
 
   const retrying = new ScriptedProvider([new ModelProviderError({ provider: 'scripted', code: 'provider_unavailable', message: 'retry', retryable: true }), response()]);
   const retryHarness = await harness({ provider: retrying, retryPolicy: { retriesPerRequest: 1, initialDelayMs: 0 } });
-  const retried = ended(await retryHarness.agent.run({ task: 'retry' }));  assert.equal(retried.executionStatus, 'completed');
+  const retried = ended(await retryHarness.agent.run({ task: 'retry' }).result);  assert.equal(retried.executionStatus, 'completed');
   assert.equal(retrying.calls.length, 2);
   assert.equal((await eventsFor(retryHarness.events, retried.runId)).filter((event) => event.type === 'run.retry.scheduled').length, 1);
 });
@@ -614,7 +569,7 @@ test('provider retries persist distinct attempt identities and honor session ret
       resetContinuation() { resets += 1; }
     });
     const run = await harness({ provider, retryPolicy: { retriesPerRequest: 1, initialDelayMs: 0 }, withoutSession: true });
-    const result = ended(await run.agent.run({ task: `retry ${disposition}` }));    const records = await eventsFor(run.events, result.runId);
+    const result = ended(await run.agent.run({ task: `retry ${disposition}` }).result);    const records = await eventsFor(run.events, result.runId);
     const requested = records.filter(event => event.type === 'model.requested');
     assert.deepEqual(requested.map(event => event.requestAttempt), [1, 2]);
     assert.equal(new Set(requested.map(event => event.turnId)).size, 1);
@@ -631,7 +586,7 @@ test('final request snapshot separates every dynamic context provenance and hash
     contextItems: [item('configured', 'configured context')],
     contextProvider: () => [item('provider', 'provider context')]
   });
-  const result = ended(await run.agent.run({ task: 'snapshot', contextItems: [item('run', 'run context')] }));  const snapshot = (await eventsFor(run.events, result.runId)).find(event => event.type === 'request.snapshot.created').snapshot;
+  const result = ended(await run.agent.run({ task: 'snapshot', contextItems: [item('run', 'run context')] }).result);  const snapshot = (await eventsFor(run.events, result.runId)).find(event => event.type === 'request.snapshot.created').snapshot;
   assert.deepEqual(snapshot.configuredContextIds, ['configured']);
   assert.deepEqual(snapshot.providerContextIds, ['provider']);
   assert.deepEqual(snapshot.runContextIds, ['run']);
@@ -647,33 +602,12 @@ test('runtime configuration summaries describe ambient shell authority without c
     async invoke() { return { kind: 'result', ok: true, summary: 'not invoked', scope: { resources: ['process/ambient'], coverage: 'complete' }, output: {} }; }
   };
   const run = await harness({ withoutSession: true, tools: [ambient], toolPolicy: { allowedRisks: ['read', 'execute'] } });
-  const result = ended(await run.agent.run({ task: 'describe authority' }));
+  const result = ended(await run.agent.run({ task: 'describe authority' }).result);
   const configured = (await eventsFor(run.events, result.runId)).find((event) => event.type === 'run.configured');
   assert.equal(configured.configuration.authority.ambientShell, true);
   assert.match(configured.configuration.authority.summary, /read, write, or delete files, access the network, and start child processes/iu);
   assert.match(configured.configuration.authority.summary, /leases until exit or stop/iu);
   assert.doesNotMatch(configured.configuration.authority.summary, /isolated|workspace writes.*denied/iu);
-});
-
-test('terminal cleanup prevents steering, retry, and follow-up controls from leaking into a later run', async () => {
-  const provider = new ScriptedProvider([response('stop', 'first'), response('stop', 'second')]);
-  let agent;
-  let firstRunId;
-  let queued = false;
-  ({ agent } = await harness({ provider, withoutSession: true, onProgress(event) {
-    if (!queued && event.type === 'run.ended') {
-      queued = true;
-      agent.steer('must not leak');
-      agent.requestRetry('must not leak');
-      agent.enqueueFollowUp('follow-up owned by first run');
-    }
-  } }));
-  const first = ended(await agent.run({ task: 'first' }));  firstRunId = first.runId;
-  assert.equal(agent.runtimeState().queuedSteers, 0);
-  assert.equal(agent.runtimeState().queuedRetries, 0);
-  const second = ended(await agent.run({ task: 'second' }));  assert.equal(second.candidate.message, 'second');
-  assert.doesNotMatch(JSON.stringify(provider.calls[1].messages), /must not leak/);
-  assert.deepEqual(agent.takeFollowUps(firstRunId).map(item => item.task), ['follow-up owned by first run']);
 });
 
 test('durable approval resumes after repository reopen and rejects changed policy fingerprints', async () => {
@@ -693,25 +627,25 @@ test('durable approval resumes after repository reopen and rejects changed polic
     assert.deepEqual(request.effects.accesses, [{ mode: 'write', scope: 'workspace/state' }]);
     return { decision: 'require_approval', reason: 'confirm write' };
   }, checks: [{ id: 'required', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
-  const suspended = await repositories.agent.run({ task: 'approval' });
+  const suspended = await repositories.agent.run({ task: 'approval' }).result;
   assert.equal(suspended.state, 'suspended');
   assert.equal(effects, 0);
   const approval = suspended.pendingApprovals[0];
 
   const changedPolicy = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read'] } });
-  await assert.rejects(changedPolicy.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' }), /fingerprint changed/);
+  await assert.rejects(async () => (await changedPolicy.resumeApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result, /fingerprint changed/);
   assert.equal((await eventsFor(repositories.events, suspended.runId)).filter(event => event.type === 'approval.resolved').length, 0);
 
   const changedTarget = new AgentRuntime({ provider, model: 'scripted', toolBoundary: { ...toolBoundary, executionTargetId: 'tests/other-target' }, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] } });
-  await assert.rejects(changedTarget.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' }), /boundary changed/);
+  await assert.rejects(async () => (await changedTarget.resumeApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result, /boundary changed/);
 
   const replacement = adoptToolDefinition({ ...tool, implementationId: 'tests/canonical-effect@2' });
   const changedImplementation = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [replacement], toolPolicy: { allowedRisks: ['read', 'write'] } });
-  await assert.rejects(changedImplementation.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' }), /implementation changed|fingerprint changed/);
+  await assert.rejects(async () => (await changedImplementation.resumeApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result, /implementation changed|fingerprint changed/);
   assert.deepEqual(approval.binding, { toolImplementationId: tool.implementationId, ...toolBoundary });
 
   const reopened = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, checks: [{ id: 'required', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
-  const result = ended(await reopened.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' }));  assert.equal(result.executionStatus, 'completed');
+  const result = ended(await (await reopened.resumeApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result);  assert.equal(result.executionStatus, 'completed');
   assert.equal(result.verificationStatus, 'passed');
   assert.equal(effects, 1);
   const records = await eventsFor(repositories.events, result.runId);
@@ -733,7 +667,7 @@ test('current authorization is re-evaluated and may veto a stored approval', asy
     response('tool_calls', '', { toolCalls: [{ id: 'effect', type: 'function', name: 'effect', input: { kind: 'json', value: {} } }] }),
     response('stop', 'continued safely')
   ]);
-  const first = await harness({ provider, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, toolAuthorizer: () => ({ decision: 'require_approval', reason: 'confirm' }) });  const suspended = await first.agent.run({ task: 'current veto' });
+  const first = await harness({ provider, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, toolAuthorizer: () => ({ decision: 'require_approval', reason: 'confirm' }) });  const suspended = await first.agent.run({ task: 'current veto' }).result;
   const approval = suspended.pendingApprovals[0];
   let currentChecks = 0;
   const reopened = new AgentRuntime({
@@ -745,7 +679,7 @@ test('current authorization is re-evaluated and may veto a stored approval', asy
     toolPolicy: { allowedRisks: ['read', 'write'] },
     toolAuthorizer() { currentChecks += 1; return { decision: 'deny', reason: 'policy changed' }; }
   });
-  const result = ended(await reopened.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' }));  assert.equal(result.executionStatus, 'completed');
+  const result = ended(await (await reopened.resumeApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result);  assert.equal(result.executionStatus, 'completed');
   assert.equal(effects, 0);
   assert.equal(currentChecks, 1);
   const toolEnded = (await eventsFor(first.events, result.runId)).find((event) => event.type === 'tool.ended');
@@ -846,11 +780,11 @@ test('per-call recovery retries idempotent starts and only projects completed ob
   };
   const provider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] }), response('stop', 'after retry')]);
   const run = await harness({ provider, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, toolAuthorizer: () => ({ decision: 'require_approval', reason: 'confirm' }) });
-  const suspended = await run.agent.run({ task: 'idempotent recovery' });
+  const suspended = await run.agent.run({ task: 'idempotent recovery' }).result;
   const approval = suspended.pendingApprovals[0];
   const identity = { turnIndex: approval.turnIndex, turnId: approval.turnId, requestAttempt: approval.requestAttempt, toolBatchId: approval.toolBatchId, callIndex: approval.callIndex, callId: approval.callId, toolAttempt: 1 };
   await run.events.append(suspended.runId, { type: 'tool.started', ...identity, toolName: tool.name, input: persistedCall, fingerprint: approval.fingerprint, effects }, { idempotencyKey: toolStageKey(suspended.runId, identity, 'started') });
-  const result = ended(await run.agent.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' }));  assert.equal(result.executionStatus, 'completed');
+  const result = ended(await (await run.agent.resumeApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result);  assert.equal(result.executionStatus, 'completed');
   assert.equal(invocations, 1);
   let records = await eventsFor(run.events, result.runId);
   assert.deepEqual(records.filter((event) => event.type === 'tool.started').map((event) => event.toolAttempt), [1, 2]);
@@ -860,13 +794,13 @@ test('per-call recovery retries idempotent starts and only projects completed ob
   const completedTool = { ...tool, implementationId: 'tests/completed-recovery@1', async invoke() { projectedInvocations += 1; return { kind: 'result', ok: true, output: {}, summary: 'must not run', scope: { resources: ['state/idempotent'], coverage: 'complete' } }; } };
   const completedProvider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] }), response('stop', 'after projection')]);
   const completedRun = await harness({ provider: completedProvider, tools: [completedTool], toolPolicy: { allowedRisks: ['read', 'write'] }, toolAuthorizer: () => ({ decision: 'require_approval', reason: 'confirm' }) });
-  const completedSuspension = await completedRun.agent.run({ task: 'completed recovery' });
+  const completedSuspension = await completedRun.agent.run({ task: 'completed recovery' }).result;
   const completedApproval = completedSuspension.pendingApprovals[0];
   const completedIdentity = { turnIndex: completedApproval.turnIndex, turnId: completedApproval.turnId, requestAttempt: completedApproval.requestAttempt, toolBatchId: completedApproval.toolBatchId, callIndex: completedApproval.callIndex, callId: completedApproval.callId, toolAttempt: 1 };
   const completedObservation = parseToolObservation(completedTool, { kind: 'result', ok: true, output: { already: true }, summary: 'already completed', scope: { resources: ['state/idempotent'], coverage: 'complete' } });
   await completedRun.events.append(completedSuspension.runId, { type: 'tool.started', ...completedIdentity, toolName: completedTool.name, input: persistedCall, fingerprint: completedApproval.fingerprint, effects }, { idempotencyKey: toolStageKey(completedSuspension.runId, completedIdentity, 'started') });
   await completedRun.events.append(completedSuspension.runId, { type: 'tool.ended', ...completedIdentity, toolName: completedTool.name, observation: completedObservation }, { idempotencyKey: toolStageKey(completedSuspension.runId, completedIdentity, 'ended') });
-  const completedResult = ended(await completedRun.agent.resolveApproval({ runId: completedSuspension.runId, approvalId: completedApproval.approvalId, fingerprint: completedApproval.fingerprint, decision: 'allow' }));  assert.equal(completedResult.executionStatus, 'completed');
+  const completedResult = ended(await (await completedRun.agent.resumeApproval({ runId: completedSuspension.runId, approvalId: completedApproval.approvalId, fingerprint: completedApproval.fingerprint, decision: 'allow' })).result);  assert.equal(completedResult.executionStatus, 'completed');
   assert.equal(projectedInvocations, 0);
   records = await eventsFor(completedRun.events, completedResult.runId);
   assert.equal(records.filter((event) => event.type === 'tool.ended').length, 1);
@@ -877,7 +811,7 @@ test('per-call recovery retries idempotent starts and only projects completed ob
 
 test('consumed provider usage remains in the terminal snapshot when it crosses a limit', async () => {
   const run = await harness({ script: [response('stop', 'over', { usage: { promptTokens: 4, completionTokens: 11, totalTokens: 15 } })], limits: { completionTokens: 10 }, withoutSession: true });
-  const result = ended(await run.agent.run({ task: 'usage limit' }));  assert.equal(result.terminationReason, 'limit_exhausted');
+  const result = ended(await run.agent.run({ task: 'usage limit' }).result);  assert.equal(result.terminationReason, 'limit_exhausted');
   assert.equal(result.exhaustedLimit, 'completion_tokens');
   assert.equal(result.budget.completionTokens, 11);
   const usage = (await eventsFor(run.events, result.runId)).find(event => event.type === 'budget.provider_usage.recorded');
@@ -890,7 +824,7 @@ test('elapsed limits use the injected monotonic clock', async () => {
   const provider = new ScriptedProvider([() => { now = 10; return response('tool_calls', '', { toolCalls: [call] }); }]);
   const noop = { name: 'noop', implementationId: 'tests/noop-elapsed@1', description: 'noop', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope, decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return readEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; } };
   const run = await harness({ provider, tools: [noop], limits: { elapsedMs: 5 }, clock: { now: () => now }, withoutSession: true });
-  const result = ended(await run.agent.run({ task: 'elapsed' }));  assert.equal(result.terminationReason, 'limit_exhausted');
+  const result = ended(await run.agent.run({ task: 'elapsed' }).result);  assert.equal(result.terminationReason, 'limit_exhausted');
   assert.equal(result.exhaustedLimit, 'elapsed_time');
   assert.equal(result.budget.elapsedMs, 10);
 });
@@ -900,7 +834,7 @@ test('elapsed limits actively abort a provider request that never settles', asyn
     request => new Promise((_resolve, reject) => request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true }))
   ]);
   const run = await harness({ provider, limits: { elapsedMs: 20 }, retryPolicy: { retriesPerRequest: 0 }, withoutSession: true });
-  const result = ended(await run.agent.run({ task: 'stalled provider' }));  assert.equal(result.terminationReason, 'limit_exhausted');
+  const result = ended(await run.agent.run({ task: 'stalled provider' }).result);  assert.equal(result.terminationReason, 'limit_exhausted');
   assert.equal(result.exhaustedLimit, 'elapsed_time');
   assert.equal(result.executionStatus, 'failed');
 });
@@ -924,7 +858,7 @@ test('tool preparation and authorization are abortable and elapsed-deadline boun
     const run = await harness({ script: [callResponse()], tools: [item.tool], withoutSession: true, ...(item.toolAuthorizer ? { toolAuthorizer: item.toolAuthorizer } : {}) });
     setTimeout(() => controller.abort(`abort ${item.name}`), 10);
     const result = ended(await Promise.race([
-      run.agent.run({ task: item.name, signal: controller.signal }),
+      run.agent.run({ task: item.name, signal: controller.signal }).result,
       new Promise((_resolve, reject) => setTimeout(() => reject(new Error(`${item.name} ignored abort`)), 1_000))
     ]));
     assert.equal(result.executionStatus, 'aborted', item.name);
@@ -933,7 +867,7 @@ test('tool preparation and authorization are abortable and elapsed-deadline boun
 
   const deadlineRun = await harness({ script: [callResponse()], tools: [baseTool], toolAuthorizer: () => new Promise(() => {}), limits: { elapsedMs: 20 }, withoutSession: true });
   const deadlineResult = ended(await Promise.race([
-    deadlineRun.agent.run({ task: 'authorization deadline' }),
+    deadlineRun.agent.run({ task: 'authorization deadline' }).result,
     new Promise((_resolve, reject) => setTimeout(() => reject(new Error('authorizer ignored elapsed deadline')), 1_000))
   ]));
   assert.equal(deadlineResult.executionStatus, 'failed');
@@ -941,18 +875,20 @@ test('tool preparation and authorization are abortable and elapsed-deadline boun
   assert.equal(deadlineResult.exhaustedLimit, 'elapsed_time');
 });
 
-test('non-idempotent failed tools cannot be agent-turn retried', async () => {
+test('completed non-idempotent tool failures are not replayed automatically', async () => {
   const call = { id: '1', type: 'function', name: 'effect', input: { kind: 'json', value: {} } };
-  const provider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] })]);
-  const effect = { name: 'effect', implementationId: 'tests/non-idempotent-effect@1', description: 'effect', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'] }, decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'], idempotency: 'non_idempotent' }; }, async invoke() { return { kind: 'failure', ok: false, output: { blocked: true, reason: 'runtime_error', error: 'uncertain', recovery: 'stop' }, summary: 'uncertain', scope: { resources: ['state'], coverage: 'partial', cause: 'uncertain' } }; } };
-  let agent;
-  ({ agent } = await harness({ provider, tools: [effect], toolPolicy: { allowedRisks: ['read', 'write'] }, onProgress(event) { if (event.type === 'tool.ended') agent.requestRetry(); } }));
-  const result = ended(await agent.run({ task: 'effect' }));  assert.equal(result.terminationReason, 'uncertain_tool_effect');
+  const provider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] }), response('stop', 'handled')]);
+  let invocations = 0;
+  const effect = { name: 'effect', implementationId: 'tests/non-idempotent-effect@1', description: 'effect', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'] }, decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'], idempotency: 'non_idempotent' }; }, async invoke() { invocations += 1; return { kind: 'failure', ok: false, output: { blocked: true, reason: 'runtime_error', error: 'failed', recovery: 'stop' }, summary: 'failed', scope: { resources: ['state'], coverage: 'partial', cause: 'failed' } }; } };
+  const { agent } = await harness({ provider, tools: [effect], toolPolicy: { allowedRisks: ['read', 'write'] } });
+  const result = ended(await agent.run({ task: 'effect' }).result);
+  assert.equal(result.executionStatus, 'completed');
+  assert.equal(invocations, 1);
 });
 
 test('throwing terminal observer leaves one commit and records one delivery diagnostic', async () => {
   const { agent, events } = await harness({ withoutSession: true, onProgress(event) { if (event.type === 'run.ended') throw new Error('renderer broke'); } });
-  const result = ended(await agent.run({ task: 'observer' }));  const records = await eventsFor(events, result.runId);
+  const result = ended(await agent.run({ task: 'observer' }).result);  const records = await eventsFor(events, result.runId);
   assert.equal(records.filter((event) => event.type === 'run.ended').length, 1);
   assert.equal(records.filter((event) => event.type === 'delivery.failed').length, 1);
   assert.equal(result.executionStatus, 'completed');

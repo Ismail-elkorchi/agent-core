@@ -71,12 +71,12 @@ test('scripted self-hosting run survives approvals, structured tools, verificati
     } }]
   };
 
-  let result = await new AgentRuntime(options).run({ task: 'Change alpha to beta.' });
+  let result = await new AgentRuntime(options).run({ task: 'Change alpha to beta.' }).result;
   assert.equal(result.state, 'suspended');
   assert.deepEqual(result.pendingApprovals.map((approval) => approval.toolName), ['apply_patch', 'exec_command']);
   for (;;) {
     const approval = result.pendingApprovals[0];
-    result = await new AgentRuntime(options).resolveApproval({ runId: result.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' });
+    result = await (await new AgentRuntime(options).resumeApproval({ runId: result.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result;
     if (result.state === 'ended') break;
   }
   const ledger = [];

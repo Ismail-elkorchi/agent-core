@@ -131,7 +131,7 @@ export type AgentEvent =
   | { readonly type: 'run.configured'; readonly configuration: AgentRunConfiguration }
   | { readonly type: 'turn.snapshot.created'; readonly snapshot: AgentTurnSnapshotRecord }
   | { readonly type: 'request.snapshot.created'; readonly snapshot: AgentRequestSnapshotRecord }
-  | ({ readonly type: 'run.retry.scheduled'; readonly kind: 'transport' | 'provider_request' | 'agent_turn'; readonly attempt: number; readonly delayMs: number; readonly diagnostic?: ModelProviderErrorDiagnostic } & AgentTurnIdentity)
+  | ({ readonly type: 'run.retry.scheduled'; readonly kind: 'transport' | 'provider_request'; readonly attempt: number; readonly delayMs: number; readonly diagnostic?: ModelProviderErrorDiagnostic } & AgentTurnIdentity)
   | { readonly type: 'finalization.prepared'; readonly terminal: AgentTerminalSnapshot }
   | { readonly type: 'run.ended'; readonly terminal: AgentTerminalSnapshot; readonly diagnostic?: ModelProviderErrorDiagnostic & { readonly turnIndex?: number } }
   | { readonly type: 'delivery.failed'; readonly finalizationId: string; readonly diagnostic: AgentDeliveryDiagnostic }
@@ -438,7 +438,7 @@ const TOOL_CALL_KEYS = [...TURN_KEYS, 'toolBatchId', 'callIndex', 'callId'] as c
 const TOOL_ATTEMPT_KEYS = [...TOOL_CALL_KEYS, 'toolAttempt'] as const;
 const REPLAY_KEYS = ['sessionId', 'replayedLedgers', 'replayedTurns', 'replayedSessionEntries', 'replayedCheckpoints', 'replayedToolResults', 'replayedEvidenceRecords', 'restoredProviderState', 'restoredProviderStateRef'] as const;
 const RUN_PHASES = ['preparing', 'requesting_model', 'executing_tools', 'waiting_for_approval', 'verifying', 'finalizing', 'ended'] as const;
-const RETRY_KINDS = ['transport', 'provider_request', 'agent_turn'] as const;
+const RETRY_KINDS = ['transport', 'provider_request'] as const;
 const TOOL_CALL_TYPES = ['function', 'custom'] as const;
 const AUTHORIZATION_DECISIONS = ['allow', 'deny', 'require_approval'] as const;
 const APPROVAL_DECISIONS = ['allow', 'deny'] as const;

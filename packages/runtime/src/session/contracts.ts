@@ -19,7 +19,7 @@ export type SessionHeader = Readonly<{
   readonly model?: string;
 }>;
 
-export interface AgentSession {
+export interface SessionDescriptor {
   readonly id: string;
   readonly header: SessionHeader;
   readonly leafId: string | null;
@@ -128,7 +128,7 @@ export interface SessionSummary {
 }
 
 export interface SessionReplayState {
-  readonly session: AgentSession;
+  readonly session: SessionDescriptor;
   readonly branch: readonly SessionBranchEntry[];
   readonly terminalProjections: readonly SessionFinalProjection[];
   readonly contextProjection?: SessionContextProjection;
@@ -136,8 +136,8 @@ export interface SessionReplayState {
 }
 
 export interface SessionRepository {
-  create(options: CreateSessionOptions): Promise<AgentSession>;
-  open(sessionId: string): Promise<AgentSession>;
+  create(options: CreateSessionOptions): Promise<SessionDescriptor>;
+  open(sessionId: string): Promise<SessionDescriptor>;
   list(workspaceRoot?: string): Promise<readonly SessionSummary[]>;
   loadReplayState(sessionId: string, leafId?: string | null): Promise<SessionReplayState>;
   appendInput(sessionId: string, input: { runId: string; task: string; instructions?: readonly AgentEffectiveInstruction[] }): Promise<SessionInputEntry>;

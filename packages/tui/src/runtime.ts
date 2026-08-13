@@ -1,4 +1,4 @@
-import type { AgentRuntime, AgentEndedRunResult, AgentProgressEvent, AgentRunInput, AgentRunResult } from '@agent-core/runtime';
+import type { AgentSession, AgentEndedRunResult, AgentProgressEvent, AgentRunResult, AgentSessionSubmissionResult } from '@agent-core/runtime';
 import { createTerminalHost } from '@ismail-elkorchi/terminal-ui/host';
 import type { TerminalHost } from '@ismail-elkorchi/terminal-ui/host';
 import { runTui } from '@ismail-elkorchi/terminal-ui/tui';
@@ -146,72 +146,53 @@ export interface AgentTuiAppRunResult {
 }
 
 export async function runAgentTuiApp(
-  agent: AgentRuntime,
+  session: AgentSession,
   options: AgentTuiAppRunOptions = {}
 ): Promise<AgentTuiAppRunResult> {
   const host = options.host ?? createTerminalHost({ runtime: 'node' });
   const ownsHost = options.host === undefined;
   const progress = options.progress ?? new AgentTuiProgressRenderer();
   const events = new AgentTuiEventSource();
-  const taskQueue: AgentRunInput[] = [];
-  const maxQueuedTasks = 1024;
-  let activeRun: Promise<void> | undefined;
   let result: AgentRunResult | undefined;
-  let failure: unknown;
+  let failure: Error | undefined;
   const exitOnCompletion = options.exitOnCompletion === true;
-  const launchTaskQueue = (input: AgentRunInput): void => {
-    activeRun = runTaskQueue(input)
-      .catch((error: unknown) => {
-        failure = error;
-      })
-      .finally(() => {
-        activeRun = undefined;
-      });
-  };
-  const startTask = (input: AgentRunInput): string => {
-    const normalizedTask = normalizeTaskInput(input.task);
-    if (normalizedTask.length === 0) {
-      return 'Task is empty.';
+  const unsubscribe = session.subscribe(async (event) => {
+    if (event.type === 'run.progress') {
+      progress.handle(event.event);
+      return;
     }
-    const normalizedInput = { ...input, task: normalizedTask };
-    if (activeRun !== undefined) {
-      agent.enqueueFollowUp(normalizedTask, normalizedInput.instructions);
-      return 'Follow-up queued.';
+    if (event.type === 'run.failed') {
+      await progress.showFailure(event.error.message);
+      if (exitOnCompletion) {
+        failure = event.error;
+        events.enqueue({ type: 'app.exit', reason: 'failed' });
+      }
+      return;
     }
-    launchTaskQueue(normalizedInput);
-    return 'Run started.';
-  };
+    if (event.type !== 'run.completed') return;
+    result = event.result;
+    if (event.result.state === 'suspended') await progress.showSuspension(event.result);
+    else await progress.showResult(event.result);
+    if (exitOnCompletion && session.state().queuedInputs === 0) {
+      const terminal = event.result.state === 'ended' ? event.result.terminal : undefined;
+      events.enqueue({ type: 'app.exit', reason: terminal ? `${terminal.executionStatus}:${terminal.verificationStatus}:${terminal.terminationReason}` : 'approval_required' });
+    }
+  });
   const app = createAgentTuiApp(normalizeTaskInput(options.initialTask ?? ''), {
     eventSource: events,
     ...(options.runtimeDetails === undefined ? {} : { runtimeDetails: options.runtimeDetails }),
-    exitWhenApprovalEnds: exitOnCompletion,
     approvalHandler: async (suspension, decision) => {
       const approval = suspension.pendingApprovals[0];
       if (approval === undefined) throw new Error('Approval suspension contains no pending request.');
-      result = await agent.resolveApproval({ runId: suspension.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision });
-      if (result.state === 'ended') {
-        if (exitOnCompletion) {
-          result = await runFollowUps(result);
-        } else {
-          const followUps = takeFollowUpInputs(result.terminal.runId);
-          const previousRun = activeRun;
-          if (previousRun !== undefined) await previousRun;
-          const first = followUps.shift();
-          appendQueuedTasks(followUps);
-          if (first !== undefined) launchTaskQueue(first);
-        }
-      }
-      return result;
+      await session.resolveApproval({ runId: suspension.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision });
     },
     commandHandler: {
       execute(line) {
         if (line === '/exit' || line === '/quit') {
           return { message: 'Exiting.', exit: true };
         }
-        if (!line.startsWith('/')) {
-          return { message: startTask({ task: line }) };
-        }
-        return executeInteractiveCommand(agent, line);
+        if (!line.startsWith('/')) return session.submit({ task: line }).then(submissionMessage);
+        return executeInteractiveCommand(session, line);
       }
     }
   });
@@ -223,71 +204,21 @@ export async function runAgentTuiApp(
   });
   const initialTask = options.initialTask;
   try {
-    if (initialTask !== undefined) startTask({ task: initialTask });
-    if (activeRun !== undefined && exitOnCompletion) await activeRun;
+    if (initialTask !== undefined) await session.submit({ task: initialTask });
     const exitResult = await exit;
-    if (activeRun !== undefined && !exitOnCompletion) await activeRun;
-    if (failure !== undefined) throw errorFromUnknown(failure);
+    await session.waitForIdle();
+    if (failure !== undefined) throw failure;
     return result === undefined ? { exit: exitResult } : { exit: exitResult, result };
   } finally {
     await progress.flush();
+    unsubscribe();
     events.close();
     if (ownsHost) await host.dispose();
   }
-
-  async function runTaskQueue(firstInput: AgentRunInput): Promise<void> {
-    let nextInput: AgentRunInput | undefined = firstInput;
-    while (nextInput !== undefined) {
-      try {
-        result = await runTask(agent, nextInput, progress);
-        if (result.state === 'suspended') return;
-        appendQueuedTasks(takeFollowUpInputs(result.terminal.runId));
-        if (exitOnCompletion && taskQueue.length === 0) {
-          events.enqueue({
-            type: 'app.exit',
-            reason: `${result.terminal.executionStatus}:${result.terminal.verificationStatus}:${result.terminal.terminationReason}`
-          });
-        }
-      } catch (error) {
-        if (exitOnCompletion) events.enqueue({ type: 'app.exit', reason: 'failed' });
-        throw error;
-      }
-      nextInput = taskQueue.shift();
-    }
-  }
-
-  async function runFollowUps(initialResult: AgentRunResult): Promise<AgentRunResult> {
-    let latest = initialResult;
-    while (latest.state === 'ended') {
-      const followUps = takeFollowUpInputs(latest.terminal.runId);
-      if (followUps.length === 0) return latest;
-      for (const followUp of followUps) {
-        latest = await runTask(agent, followUp, progress);
-        if (latest.state === 'suspended') return latest;
-      }
-    }
-    return latest;
-  }
-
-  function takeFollowUpInputs(runId: string): AgentRunInput[] {
-    return agent.takeFollowUps(runId).map((followUp) => ({
-      task: followUp.task,
-      ...(followUp.instructions ? { instructions: followUp.instructions } : {})
-    }));
-  }
-
-  function appendQueuedTasks(inputs: readonly AgentRunInput[]): void {
-    if (taskQueue.length + inputs.length > maxQueuedTasks) throw new Error(`Follow-up queue limit of ${String(maxQueuedTasks)} was exceeded.`);
-    taskQueue.push(...inputs);
-  }
-}
-
-function errorFromUnknown(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
 }
 
 export async function runAgentTuiTask(
-  agent: AgentRuntime,
+  session: AgentSession,
   task: string,
   progress: AgentTuiProgressRenderer,
   options: {
@@ -295,7 +226,7 @@ export async function runAgentTuiTask(
     readonly runtimeDetails?: AgentTuiRuntimeDetails;
   } = {}
 ): Promise<AgentRunResult> {
-  const appResult = await runAgentTuiApp(agent, {
+  const appResult = await runAgentTuiApp(session, {
     initialTask: task,
     progress,
     exitOnCompletion: true,
@@ -308,19 +239,11 @@ export async function runAgentTuiTask(
   return appResult.result;
 }
 
-async function runTask(
-  agent: AgentRuntime,
-  input: AgentRunInput,
-  progress: AgentTuiProgressRenderer
-): Promise<AgentRunResult> {
-  try {
-    const result = await agent.run(input);
-    if (result.state === 'suspended') await progress.showSuspension(result);
-    else await progress.showResult(result);
-    return result;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await progress.showFailure(message);
-    throw error;
+function submissionMessage(result: AgentSessionSubmissionResult): { readonly message: string } {
+  switch (result.kind) {
+    case 'started': return { message: 'Run started.' };
+    case 'steered': return { message: 'Steering accepted.' };
+    case 'queued': return { message: 'Follow-up queued.' };
+    case 'rejected': return { message: `Input rejected: ${result.reason}.` };
   }
 }
