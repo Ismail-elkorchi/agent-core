@@ -1,4 +1,5 @@
-import { defineTool, isRiskAllowed, PATCH_JOURNAL_SCOPE, ToolInputError, workspaceFileScope } from '@agent-core/tools';
+import { defineTool, isRiskAllowed, ToolInputError } from '@agent-core/tools';
+import { PATCH_JOURNAL_SCOPE, WORKSPACE_FILES_SCOPE, workspaceFileScope } from '../../core/resources.js';
 import { canonicalWorkspacePath } from '../../core/filesystem.js';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
 import { requireWorkspaceRoot } from '../../core/workspace.js';
@@ -25,7 +26,7 @@ export const applyPatchTool = defineTool({
   },
   effectEnvelope: {
     accesses: [{ mode: 'read', scope: 'workspace/files' }, { mode: 'write', scope: 'workspace/files' }, { mode: 'delete', scope: 'workspace/files' }],
-    lockScopes: ['workspace/files', PATCH_JOURNAL_SCOPE]
+    lockScopes: [WORKSPACE_FILES_SCOPE, PATCH_JOURNAL_SCOPE]
   },
   async canonicalizeInput(input, context): Promise<CanonicalApplyPatchInput> {
     const root = requireWorkspaceRoot(context);

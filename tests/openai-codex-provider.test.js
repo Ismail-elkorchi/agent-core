@@ -128,6 +128,47 @@ test('OpenAICodexProvider defaults to HTTP full replay transport', async () => {
   assert.equal(requests[0].headers.originator, 'agent-core');
 });
 
+test('OpenAICodexProvider accepts nullable response fields in HTTP stream events', async () => {
+  const provider = new OpenAICodexProvider({
+    auth: bearerProvider(codexJwt()),
+    fetch: async () => sseResponse([
+      {
+        type: 'response.created',
+        response: {
+          id: 'resp-nullable',
+          model: 'gpt-5.6',
+          status: 'in_progress',
+          output: [],
+          usage: null,
+          error: null,
+          incomplete_details: null
+        }
+      },
+      {
+        type: 'response.completed',
+        response: {
+          id: 'resp-nullable',
+          model: 'gpt-5.6',
+          status: 'completed',
+          output_text: 'stream ok',
+          output: [],
+          usage: { input_tokens: 4, output_tokens: 2, total_tokens: 6 },
+          error: null,
+          incomplete_details: null
+        }
+      }
+    ])
+  });
+
+  const events = [];
+  for await (const event of provider.stream({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hi' }] })) events.push(event);
+  const done = events.find((event) => event.type === 'done');
+  assert.equal(done.response.content, 'stream ok');
+  assert.deepEqual(done.response.usage, { promptTokens: 4, completionTokens: 2, totalTokens: 6 });
+  assert.equal(done.response.raw.error, undefined);
+  assert.equal(done.response.raw.incomplete_details, undefined);
+});
+
 test('OpenAICodexProvider summarizes failed stream events without error bodies', async () => {
   const provider = new OpenAICodexProvider({
     auth: bearerProvider(codexJwt()),

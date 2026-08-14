@@ -211,14 +211,19 @@ export async function readBoundedJsonResponse(response: Response, maximumBytes =
 
 export function decodeResponsesPayload(value: unknown, label = 'Responses response'): ResponsesPayload {
   const record = requiredRecord(value, label);
+  const properties = { ...record };
+  delete properties.output;
+  delete properties.usage;
+  delete properties.error;
+  delete properties.incomplete_details;
   const output = optionalArray(record.output, `${label}.output`, decodeResponsesOutputItem);
-  const usage = record.usage === undefined ? undefined : decodeResponsesUsage(record.usage, `${label}.usage`);
-  const error = record.error === undefined ? undefined : decodeResponsesError(record.error, `${label}.error`);
-  const incompleteDetails = record.incomplete_details === undefined
+  const usage = record.usage == null ? undefined : decodeResponsesUsage(record.usage, `${label}.usage`);
+  const error = record.error == null ? undefined : decodeResponsesError(record.error, `${label}.error`);
+  const incompleteDetails = record.incomplete_details == null
     ? undefined
     : decodeIncompleteDetails(record.incomplete_details, `${label}.incomplete_details`);
   return Object.freeze({
-    ...record,
+    ...properties,
     ...optionalStringProperty(record, 'id', label),
     ...optionalStringProperty(record, 'model', label),
     ...optionalStringProperty(record, 'status', label),
@@ -253,13 +258,15 @@ export function decodeResponsesStreamData(value: unknown, label = 'Responses str
 
 function decodeResponsesOutputItem(value: unknown, label: string): ResponsesOutputItem {
   const record = requiredRecord(value, label);
+  const properties = { ...record };
+  delete properties.error;
   const content = optionalArray(record.content, `${label}.content`, decodeResponsesContentPart);
   const summary = typeof record.summary === 'string'
     ? record.summary
     : optionalArray(record.summary, `${label}.summary`, decodeResponsesContentPart);
-  const error = record.error === undefined ? undefined : decodeResponsesError(record.error, `${label}.error`);
+  const error = record.error == null ? undefined : decodeResponsesError(record.error, `${label}.error`);
   return Object.freeze({
-    ...record,
+    ...properties,
     ...optionalStringProperty(record, 'id', label),
     ...optionalStringProperty(record, 'type', label),
     ...optionalStringProperty(record, 'status', label),

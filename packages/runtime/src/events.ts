@@ -62,10 +62,6 @@ export interface AgentRunConfiguration {
   };
   readonly tools: readonly { readonly name: string; readonly accessModes: readonly string[] }[];
   readonly toolPolicy: ToolPolicy;
-  readonly authority: {
-    readonly ambientShell: boolean;
-    readonly summary: string;
-  };
   readonly requestWindow: {
     readonly contextWindowTokens: number;
     readonly maxOutputTokens: number;
@@ -486,13 +482,11 @@ function decodeRunBudget(value: JsonValue | undefined): AgentRunBudgetState {
 }
 function decodeRunConfiguration(value: JsonValue | undefined): AgentRunConfiguration {
   const object = requiredObject(value, 'configuration');
-  exact(object, ['provider', 'model', 'tools', 'toolPolicy', 'authority', 'requestWindow', 'runtime']);
+  exact(object, ['provider', 'model', 'tools', 'toolPolicy', 'requestWindow', 'runtime']);
   const provider = requiredObject(object.provider, 'configuration.provider');
   exact(provider, ['id', 'displayName']);
   const model = requiredObject(object.model, 'configuration.model');
   exact(model, ['id', 'provider', 'displayName', 'limits', 'modalities', 'capabilities', 'supportedParameters']);
-  const authority = requiredObject(object.authority, 'configuration.authority');
-  exact(authority, ['ambientShell', 'summary']);
   const requestWindow = requiredObject(object.requestWindow, 'configuration.requestWindow');
   exact(requestWindow, ['contextWindowTokens', 'maxOutputTokens', 'maxPromptTokens', 'requestedMaxOutputTokens']);
   const runtime = requiredObject(object.runtime, 'configuration.runtime');
@@ -514,7 +508,6 @@ function decodeRunConfiguration(value: JsonValue | undefined): AgentRunConfigura
       return Object.freeze({ name: requiredString(tool.name, `configuration.tools[${String(index)}].name`), accessModes: stringArray(tool.accessModes, `configuration.tools[${String(index)}].accessModes`) });
     })),
     toolPolicy: decodeOwnedToolPolicy(requiredObject(object.toolPolicy, 'configuration.toolPolicy')),
-    authority: Object.freeze({ ambientShell: requiredBoolean(authority.ambientShell, 'configuration.authority.ambientShell'), summary: requiredStringValue(authority.summary, 'configuration.authority.summary') }),
     requestWindow: Object.freeze({
       contextWindowTokens: positiveInteger(requestWindow.contextWindowTokens, 'configuration.requestWindow.contextWindowTokens'),
       maxOutputTokens: positiveInteger(requestWindow.maxOutputTokens, 'configuration.requestWindow.maxOutputTokens'),
@@ -743,7 +736,7 @@ function decodePromptInstruction(value: JsonValue, path: string): PromptProjecti
   const object = requiredObject(value, path);
   exact(object, ['id', 'role', 'content', 'sourceUri', 'priority']);
   const sourceUri = optionalStringValue(object.sourceUri, `${path}.sourceUri`);
-  return Object.freeze({ id: requiredString(object.id, `${path}.id`), role: requiredEnum(object.role, ['system', 'developer', 'workspace', 'user'] as const, `${path}.role`), content: requiredStringValue(object.content, `${path}.content`), ...(sourceUri !== undefined ? { sourceUri } : {}), priority: finiteNumber(object.priority, `${path}.priority`) });
+  return Object.freeze({ id: requiredString(object.id, `${path}.id`), role: requiredEnum(object.role, ['system', 'developer', 'environment', 'user'] as const, `${path}.role`), content: requiredStringValue(object.content, `${path}.content`), ...(sourceUri !== undefined ? { sourceUri } : {}), priority: finiteNumber(object.priority, `${path}.priority`) });
 }
 function decodePromptTool(value: JsonValue, path: string): PromptProjection['tools'][number] {
   const object = requiredObject(value, path);
@@ -804,14 +797,6 @@ function decodeToolProgress(value: JsonValue | undefined): ToolProgress {
     return Object.freeze({ type: 'status', stage: requiredStringValue(object.stage, 'progress.stage'), ...(message !== undefined ? { message } : {}), ...optionalNonnegativeFields(object, ['completed', 'total']) });
   }
   if (object.type === 'output') { exact(object, ['type', 'stream', 'sequence', 'text', 'observedBytes']); return Object.freeze({ type: 'output', stream: requiredEnum(object.stream, ['stdout', 'stderr'] as const, 'progress.stream'), sequence: nonnegativeInteger(object.sequence, 'progress.sequence'), text: requiredStringValue(object.text, 'progress.text'), observedBytes: nonnegativeInteger(object.observedBytes, 'progress.observedBytes') }); }
-  if (object.type === 'patch') {
-    exact(object, ['type', 'changes']);
-    return Object.freeze({ type: 'patch', changes: Object.freeze(requiredArray(object.changes, 'progress.changes').map((item, index) => {
-      const change = requiredObject(item, `progress.changes[${String(index)}]`);
-      exact(change, ['path', 'operation', 'status']);
-      return Object.freeze({ path: requiredString(change.path, 'change.path'), operation: requiredEnum(change.operation, ['add', 'update', 'delete', 'move'] as const, 'change.operation'), status: requiredStringValue(change.status, 'change.status') });
-    })) });
-  }
   if (object.type === 'metric') { exact(object, ['type', 'name', 'value', 'unit']); const unit = optionalStringValue(object.unit, 'progress.unit'); return Object.freeze({ type: 'metric', name: requiredString(object.name, 'progress.name'), value: finiteNumber(object.value, 'progress.value'), ...(unit !== undefined ? { unit } : {}) }); }
   throw malformed('progress.type is invalid');
 }

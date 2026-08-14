@@ -1,7 +1,7 @@
 import { scopesOverlap, type ToolEffects, type ToolResourceAccess } from './authorization.js';
 import type { ToolResourceLease } from './context.js';
 
-interface ActiveLease { readonly id: number; readonly owner: string; readonly effects: ToolEffects; processId?: string }
+interface ActiveLease { readonly id: number; readonly owner: string; readonly effects: ToolEffects; processId?: string; controlScope?: string }
 interface Waiter { readonly effects: ToolEffects; readonly owner: string; readonly resolve: (lease: ToolResourceLease) => void; readonly reject: (error: Error) => void; readonly signal?: AbortSignal; abort?: () => void }
 
 export class ResourceLeaseCoordinator {
@@ -52,11 +52,15 @@ export class ResourceLeaseCoordinator {
     this.waiters.push(...retained);
   }
   releaseLease(id: number): void { if (this.active.delete(id)) this.drain(); }
-  transferLease(id: number, processId: string): void {
+  transferLease(id: number, processId: string, controlScope: string): void {
     const active = this.active.get(id);
     if (!active) throw new Error('Cannot transfer a released resource lease.');
-    if (active.processId !== undefined && active.processId !== processId) throw new Error('Resource lease is already owned by another process.');
+    if (active.processId !== undefined) {
+      if (active.processId === processId && active.controlScope === controlScope) return;
+      throw new Error('Resource lease has already been transferred.');
+    }
     active.processId = processId;
+    active.controlScope = controlScope;
   }
 }
 
@@ -65,9 +69,9 @@ class Lease implements ToolResourceLease {
   private processId: string | undefined;
   constructor(private readonly coordinator: ResourceLeaseCoordinator, private readonly active: ActiveLease) {}
   get transferred(): boolean { return this.processId !== undefined; }
-  transferToProcess(processId: string): void {
-    if (this.released || processId.trim().length === 0) throw new Error('Cannot transfer this resource lease.');
-    this.coordinator.transferLease(this.active.id, processId);
+  transferToProcess(processId: string, controlScope: string): void {
+    if (this.released || processId.trim().length === 0 || controlScope.trim().length === 0) throw new Error('Cannot transfer this resource lease.');
+    this.coordinator.transferLease(this.active.id, processId, controlScope);
     this.processId = processId;
   }
   release(): void {
@@ -77,13 +81,12 @@ class Lease implements ToolResourceLease {
   }
 }
 function leasesConflict(active: ActiveLease, waiting: ToolEffects): boolean {
-  if (active.processId !== undefined && processControlOnly(waiting, active.processId)) return false;
+  if (active.processId !== undefined && active.controlScope !== undefined && processControlOnly(waiting, active.controlScope)) return false;
   return effectsConflict(active.effects, waiting);
 }
-function processControlOnly(effects: ToolEffects, processId: string): boolean {
-  const scope = 'workspace/processes/' + processId;
-  return effects.accesses.length > 0 && effects.accesses.every((access) => access.mode === 'execute' && access.scope === scope)
-    && effects.lockScopes.every((lock) => lock === scope);
+function processControlOnly(effects: ToolEffects, controlScope: string): boolean {
+  return effects.accesses.length > 0 && effects.accesses.every((access) => access.mode === 'execute' && access.scope === controlScope)
+    && effects.lockScopes.every((lock) => lock === controlScope);
 }
 export function effectsConflict(left: ToolEffects, right: ToolEffects): boolean {
   if (left.lockScopes.some((a) => right.lockScopes.some((b) => scopesOverlap(a, b)))) return true;

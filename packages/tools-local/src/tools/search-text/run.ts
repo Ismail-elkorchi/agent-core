@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { workspaceFileScope, type ToolExecutionContext, type ToolObservationInput } from '@agent-core/tools';
+import { type ToolExecutionContext, type ToolObservationInput } from '@agent-core/tools';
+import { workspaceFileScope } from '../../core/resources.js';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
 import { builtInReadEvidence } from '../../core/read-evidence.js';
 import { requireWorkspaceRoot } from '../../core/workspace.js';

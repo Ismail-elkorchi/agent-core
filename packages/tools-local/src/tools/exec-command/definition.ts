@@ -1,4 +1,5 @@
-import { defineTool, requireToolService, workspaceFileScope, workspaceProcessScope } from '@agent-core/tools';
+import { defineTool, requireToolService } from '@agent-core/tools';
+import { workspaceFileScope, workspaceProcessScope } from '../../core/resources.js';
 import { canonicalWorkspacePath, requireDirectoryInsideRoot, resolveInsideRoot } from '../../core/filesystem.js';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
 import { isProcessManager, type ProcessManager, type ProcessOwner } from '../../core/process-manager.js';

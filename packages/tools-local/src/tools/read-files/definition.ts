@@ -1,4 +1,5 @@
-import { defineTool, workspaceFileScope } from '@agent-core/tools';
+import { defineTool } from '@agent-core/tools';
+import { workspaceFileScope } from '../../core/resources.js';
 import { canonicalWorkspacePath } from '../../core/filesystem.js';
 import { readFiles } from './run.js';
 import { presentReadFilesObservation } from '../../core/presenters.js';

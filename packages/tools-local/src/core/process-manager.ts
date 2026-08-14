@@ -12,6 +12,7 @@ import {
 import { validateArtifactRef, validatePublicArtifactRef } from '@agent-core/evidence';
 import { parseJsonObject } from '@agent-core/json';
 import { ResourceLeaseCoordinator } from '@agent-core/tools';
+import { workspaceProcessScope } from './resources.js';
 import type { ToolProgress, ToolResourceLease } from '@agent-core/tools';
 import type { OwnedProcessTree } from './process-tree.js';
 import {
@@ -258,7 +259,7 @@ export class ProcessManager {
       if (request.signal.aborted) record.abortListener();
     }
     await this.waitForActivity(record, request.yieldMs, 0);
-    if (record.status === 'running' && request.lease) request.lease.transferToProcess(id);
+    if (record.status === 'running' && request.lease) request.lease.transferToProcess(id, workspaceProcessScope(id));
     return this.poll(id, request.outputTokenBudget, 0, 0, request.owner);
   }
 

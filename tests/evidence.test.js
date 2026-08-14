@@ -3,8 +3,7 @@ import assert from 'node:assert/strict';
 import {
   projectToolEvidence,
   parseToolEvidenceDelta,
-  toEvidenceJsonObject,
-  workspaceResource
+  toEvidenceJsonObject
 } from '@agent-core/evidence';
 import { normalizeJsonSafe, parseJsonObject } from '@agent-core/json';
 
@@ -69,11 +68,12 @@ test('decoded evidence deltas project into observation-scoped records', () => {
   const delta = parseToolEvidenceDelta(parseJsonObject({ items: [
     {
       action: 'read',
-      resources: [workspaceResource('notes/a.txt', {
+      resources: [{
+        uri: 'workspace://notes/a.txt',
         range: { kind: 'line', start: 1, end: 3 },
         sha256: 'a'.repeat(64),
         mediaType: 'text/plain'
-      })],
+      }],
       scope: {
         filters: toEvidenceJsonObject({ hidden: 'exclude', ignored: undefined }),
         limits: toEvidenceJsonObject({ maxBytes: 1200 }),

@@ -135,13 +135,6 @@ export function parseToolEvidenceDelta(value: JsonObject): ToolEvidenceDelta {
   return Object.freeze({ items: Object.freeze(value.items.map((item, index) => parseEvidenceItem(item, index))) });
 }
 
-export function workspaceResource(path: string, options: Omit<EvidenceResource, 'uri'> = {}): EvidenceResource {
-  return ownEvidenceResource({
-    uri: `workspace://${path}`,
-    ...options
-  });
-}
-
 export function toEvidenceJsonObject(value: Record<string, unknown>): JsonObject {
   const output: Record<string, JsonValue> = {};
   for (const [key, item] of Object.entries(value)) {

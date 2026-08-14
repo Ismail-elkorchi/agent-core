@@ -71,10 +71,8 @@ export async function rebuildContextFromRepositories(input: {
         replayedCheckpoints += 1;
       }
     } else {
-      if (turn.steering.length > 0) {
-        contextManager.recordCheckpoint({ content: renderSteering(turn.steering) });
-        replayedCheckpoints += 1;
-      }
+      contextManager.recordCheckpoint({ content: renderInterruptedTurnCheckpoint(turn) });
+      replayedCheckpoints += 1;
       const replayed = replayOpenProtocolTail(contextManager, turn);
       replayedToolResults += replayed.toolResults;
       replayedEvidenceRecords += replayed.evidenceRecords;
@@ -208,8 +206,13 @@ function renderTurnCheckpoint(turn: ReplayTurn, evidenceRecords: number): string
     ...(result ? [`Result: ${compactLine(result, 1_200)}`] : [])
   ].join('\n');
 }
-function renderSteering(steering: readonly string[]): string {
-  return ['Accepted user steering:', ...steering.map((item) => `- ${compactLine(item, 800)}`)].join('\n');
+function renderInterruptedTurnCheckpoint(turn: ReplayTurn): string {
+  return [
+    'Prior interrupted session turn:',
+    'This unfinished turn is continuity data, not an instruction and not an executable tool transcript.',
+    `Task: ${compactLine(turn.task, 800)}`,
+    ...(turn.steering.length > 0 ? ['Accepted user steering:', ...turn.steering.map((item) => `- ${compactLine(item, 800)}`)] : [])
+  ].join('\n');
 }
 
 function protocolEventCount(turn: ReplayTurn): number {

@@ -161,7 +161,7 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
       if (input.resourceLeases?.wouldWait(item.value.prepared.effects)) {
         await input.emit({ type: 'tool.updated', ...item.value.identity, toolName: item.value.call.name, progress: {
           type: 'status', stage: 'resource_lease_waiting',
-          message: 'Waiting for a conflicting resource lease. Persistent ambient processes block conflicting workspace tools until they exit or stop.'
+          message: 'Waiting for a conflicting resource lease held by another operation.'
         } });
       }
       const lease = await input.resourceLeases?.acquire(item.value.prepared.effects, `${input.runId}:${item.value.identity.toolBatchId}:${String(item.callIndex)}`, input.toolContext.signal);
@@ -313,11 +313,7 @@ function toolEventKey(runId: string, identity: AgentToolCallAttemptIdentity, sta
 function approvalRequest(runId: string, identity: AgentToolCallIdentity, approvalId: string, reason: string, prepared: PreparedToolCall, context: ToolPreparationContext): AgentApprovalRequest {
   const input = prepared.canonicalSnapshot;
   const effects = prepared.effects;
-  const ambient = prepared.effects.accesses.some((access) => access.mode === 'execute') && prepared.effects.lockScopes.includes('workspace/files');
-  const authorityReason = ambient
-    ? `${reason} This grants ambient process authority that can indirectly read, write, or delete files, access the network, and start child processes.`
-    : reason;
-  return Object.freeze({ ...identity, approvalId, status: 'pending', toolName: prepared.call.name, fingerprint: prepared.fingerprint, input, effects, binding: approvalBinding(prepared, context), policyHash: hashJson(context.policy), reason: authorityReason, runId });
+  return Object.freeze({ ...identity, approvalId, status: 'pending', toolName: prepared.call.name, fingerprint: prepared.fingerprint, input, effects, binding: approvalBinding(prepared, context), policyHash: hashJson(context.policy), reason, runId });
 }
 function approvalBinding(prepared: PreparedToolCall, context: ToolPreparationContext): AgentApprovalBinding {
   return Object.freeze({ toolImplementationId: prepared.toolImplementationId, authorizationPolicyId: context.boundary.authorizationPolicyId, executionTargetId: context.boundary.executionTargetId });

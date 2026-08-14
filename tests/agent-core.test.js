@@ -538,6 +538,36 @@ test('in-memory repositories run, reopen, and replay without filesystem paths', 
   assert.equal(secondResult.candidate.message, 'replayed');
 });
 
+test('session replay preserves an accepted task from an interrupted run', async () => {
+  const events = new InMemoryEventRepository(agentEventCodec);
+  const sessions = new InMemorySessionRepository();
+  const session = await sessions.create({ provider: 'scripted', model: 'scripted' });
+  const artifacts = new InMemoryArtifactRepository();
+  const interruptedTask = 'Investigate the unfinished continuity problem.';
+  await sessions.appendInput(session.id, { runId: 'interrupted-run', task: interruptedTask });
+  await events.append('interrupted-run', {
+    type: 'run.started',
+    runId: 'interrupted-run',
+    finalizationId: 'interrupted-finalization',
+    task: interruptedTask,
+    model: 'scripted',
+    toolPolicy: { allowedRisks: [] }
+  });
+  const provider = new ScriptedProvider([request => response(
+    'stop',
+    request.messages.some((message) => message.content.includes(interruptedTask)) ? 'recovered interrupted task' : 'missing interrupted task'
+  )]);
+  const reopened = new AgentRuntime({
+    provider,
+    model: 'scripted',
+    toolBoundary,
+    repositories: { events, session: { repository: sessions, sessionId: session.id }, artifacts }
+  });
+
+  const result = ended(await reopened.run({ task: 'Continue after recovery.' }).result);
+  assert.equal(result.candidate.message, 'recovered interrupted task');
+});
+
 test('run limits and retry policy terminate deterministically', async () => {
   const call = { id: '1', type: 'function', name: 'noop', input: { kind: 'json', value: {} } };
   const provider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] })]);
@@ -591,23 +621,6 @@ test('final request snapshot separates every dynamic context provenance and hash
   assert.deepEqual(snapshot.providerContextIds, ['provider']);
   assert.deepEqual(snapshot.runContextIds, ['run']);
   for (const field of ['effectiveInstructionHash', 'selectedEvidenceHash', 'retainedHistoryHash', 'modelToolSchemasHash', 'compiledPromptHash']) assert.match(snapshot[field], /^[a-f0-9]{64}$/);
-});
-
-test('runtime configuration summaries describe ambient shell authority without claiming workspace isolation', async () => {
-  const ambient = {
-    name: 'ambient', implementationId: 'tests/ambient-authority@1', description: 'ambient authority fixture', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema,
-    effectEnvelope: { accesses: [{ mode: 'execute', scope: 'process/ambient' }], lockScopes: ['workspace/files'] },
-    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; },
-    deriveEffects() { return { accesses: [{ mode: 'execute', scope: 'process/ambient' }], lockScopes: ['workspace/files'], idempotency: 'non_idempotent' }; },
-    async invoke() { return { kind: 'result', ok: true, summary: 'not invoked', scope: { resources: ['process/ambient'], coverage: 'complete' }, output: {} }; }
-  };
-  const run = await harness({ withoutSession: true, tools: [ambient], toolPolicy: { allowedRisks: ['read', 'execute'] } });
-  const result = ended(await run.agent.run({ task: 'describe authority' }).result);
-  const configured = (await eventsFor(run.events, result.runId)).find((event) => event.type === 'run.configured');
-  assert.equal(configured.configuration.authority.ambientShell, true);
-  assert.match(configured.configuration.authority.summary, /read, write, or delete files, access the network, and start child processes/iu);
-  assert.match(configured.configuration.authority.summary, /leases until exit or stop/iu);
-  assert.doesNotMatch(configured.configuration.authority.summary, /isolated|workspace writes.*denied/iu);
 });
 
 test('durable approval resumes after repository reopen and rejects changed policy fingerprints', async () => {

@@ -26,8 +26,6 @@ export function summarizeRunConfiguration(input: {
   reasoning?: AgentRunConfiguration['runtime']['reasoning'];
   metadata?: Record<string, string>;
 }): AgentRunConfiguration {
-  const ambientShell = input.tools.some((tool) => tool.effectEnvelope.accesses.some((access) => access.mode === 'execute')
-    && tool.effectEnvelope.lockScopes.includes('workspace/files'));
   return {
     provider: {
       id: input.provider.id,
@@ -65,12 +63,6 @@ export function summarizeRunConfiguration(input: {
     },
     tools: input.tools.map((tool) => ({ name: tool.name, accessModes: [...new Set(tool.effectEnvelope.accesses.map((access) => access.mode))].sort() })),
     toolPolicy: input.toolPolicy,
-    authority: {
-      ambientShell,
-      summary: ambientShell
-        ? 'Ambient shell execution is enabled under the Agent Core process permissions and may indirectly read, write, or delete files, access the network, and start child processes. Persistent processes hold conflicting workspace leases until exit or stop.'
-        : 'No built-in ambient shell tool is exposed in this model request.'
-    },
     requestWindow: {
       contextWindowTokens: input.requestWindow.contextWindowTokens,
       maxOutputTokens: input.requestWindow.maxOutputTokens,

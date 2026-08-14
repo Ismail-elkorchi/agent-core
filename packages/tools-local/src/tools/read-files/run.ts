@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
-import { workspaceResource, type ToolEvidenceItem } from '@agent-core/evidence';
-import { throwIfAborted, workspaceFileScope, type ToolExecutionContext, type ToolObservationInput } from '@agent-core/tools';
+import type { ToolEvidenceItem } from '@agent-core/evidence';
+import { throwIfAborted, type ToolExecutionContext, type ToolObservationInput } from '@agent-core/tools';
+import { workspaceFileScope, workspaceResource } from '../../core/resources.js';
 import { assertRealPathInsideRoot, relativePath, resolveInsideRoot } from '../../core/filesystem.js';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
 import { requireWorkspaceRoot } from '../../core/workspace.js';

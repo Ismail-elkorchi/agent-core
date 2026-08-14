@@ -1,13 +1,8 @@
 import type { ModelInputModality, ToolDefinition, ToolRequirements } from './definition.js';
 import { parseJsonObject } from '@agent-core/json';
 
-export const WORKSPACE_FILES_SCOPE = 'workspace/files';
-export const WORKSPACE_PROCESSES_SCOPE = 'workspace/processes';
-export const PATCH_JOURNAL_SCOPE = 'workspace/internal/patch-journal';
 export const ARTIFACTS_SCOPE = 'artifacts';
 
-export function workspaceFileScope(relativePath = ''): string { return scoped(WORKSPACE_FILES_SCOPE, relativePath); }
-export function workspaceProcessScope(processId = ''): string { return scoped(WORKSPACE_PROCESSES_SCOPE, processId); }
 export function artifactScope(artifactId = ''): string { return scoped(ARTIFACTS_SCOPE, artifactId); }
 export function validateResourceScope(value: string): string {
   if (value.length === 0 || value.trim() !== value || value.includes('\\') || value.endsWith('/')

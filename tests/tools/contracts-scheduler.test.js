@@ -74,7 +74,9 @@ test('scheduler uses resource accesses and locks, never idempotency, for conflic
 test('runtime resource leases span batches until a running process exits', async () => {
   const coordinator = new ResourceLeaseCoordinator();
   const command = await coordinator.acquire({ accesses: [{ mode: 'execute', scope: 'workspace/processes/p1' }], lockScopes: ['workspace/files'], idempotency: 'non_idempotent' }, 'batch-1');
-  command.transferToProcess('p1');
+  command.transferToProcess('p1', 'workspace/processes/p1');
+  assert.doesNotThrow(() => command.transferToProcess('p1', 'workspace/processes/p1'));
+  assert.throws(() => command.transferToProcess('p1', 'workspace/processes/p2'), /already been transferred/u);
   let acquired = false;
   const blocked = coordinator.acquire({ accesses: [{ mode: 'read', scope: 'workspace/files/a' }], lockScopes: [], idempotency: 'pure' }, 'batch-2').then((lease) => { acquired = true; return lease; });
   await new Promise((resolve) => setTimeout(resolve, 20));

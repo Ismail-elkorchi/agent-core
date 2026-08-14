@@ -54,7 +54,7 @@ export interface ContextBundle {
 
 export interface PromptInstructionBlock {
   readonly id: string;
-  readonly role: 'system' | 'developer' | 'workspace' | 'user';
+  readonly role: 'system' | 'developer' | 'environment' | 'user';
   readonly content: string;
   readonly sourceUri?: string;
   readonly priority: number;

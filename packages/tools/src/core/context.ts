@@ -36,16 +36,14 @@ export interface ToolExecutionContext {
   persistProgressCheckpoint?: (progress: ToolProgress) => void | Promise<void>;
 }
 
-export interface PatchProgressChange { readonly path: string; readonly operation: 'add' | 'update' | 'delete' | 'move'; readonly status: string }
 export type ToolProgress =
   | { readonly type: 'status'; readonly stage: string; readonly message?: string; readonly completed?: number; readonly total?: number }
   | { readonly type: 'output'; readonly stream: 'stdout' | 'stderr'; readonly sequence: number; readonly text: string; readonly observedBytes: number }
-  | { readonly type: 'patch'; readonly changes: readonly PatchProgressChange[] }
   | { readonly type: 'metric'; readonly name: string; readonly value: number; readonly unit?: string };
 
 export interface ToolResourceLease {
   readonly transferred: boolean;
-  transferToProcess(processId: string): void;
+  transferToProcess(processId: string, controlScope: string): void;
   release(): void;
 }
 
