@@ -11,7 +11,7 @@
     "packages/providers/*"
   ],
   "scripts": {
-    "build": "tsc -b && node scripts/post-build.mjs",
+    "build": "tsc -b",
     "lint": "eslint \"packages/**/*.ts\"",
     "test": "npm run build && npm run test:unit",
     "test:unit": "node scripts/run-test-suite.mjs",
@@ -23,7 +23,6 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@ismail-elkorchi/terminal-ui": "github:Ismail-elkorchi/terminal-ui#cc5e59b64edb18fb6c56b5818509bc4d7bde0398",
     "@types/node": "^24.13.2",
     "@types/ws": "^8.18.1",
     "eslint": "^10.5.0",

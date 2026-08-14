@@ -7,13 +7,12 @@ import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createToolCall, prepareToolCall } from '@agent-core/tools';
-import { createCliToolPolicy } from '@agent-core/cli';
 import { applyPatchTool, DEFAULT_LOCAL_TOOL_CONFIGURATION } from '@agent-core/tools-local';
 import { applyPatchWithAuthority } from '@agent-core/tools-local/testing/apply-patch';
 import { commitTextFilePatchTransaction, recoverTextFilePatchTransactions } from '@agent-core/tools-local/testing/text-write';
 import { invokeToolCall, textToolCall } from '../tool-call-helpers.js';
 
-const policy = createCliToolPolicy({ apply: true, dryRun: false, allowShell: false, allowUnsafeShell: false });
+const policy = { allowedRisks: ['read', 'write', 'destructive'] };
 
 function patch(lines) { return ['*** Begin Patch', ...lines, '*** End Patch'].join('\n'); }
 
@@ -54,11 +53,11 @@ test('apply_patch parses once into one canonical tree and applies add, update, m
   assert.deepEqual([...new Set(progress.map((item) => item.stage))], ['patch_parsing', 'patch_parsed', 'patch_preparing', 'patch_prepared', 'patch_committing', 'patch_committed']);
 });
 
-test('CLI policy denies delete without --apply', async () => {
+test('tool policy denies destructive patches without destructive authority', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-no-apply-'));
   await writeFile(path.join(root, 'delete.txt'), 'delete\n');
   const observation = await invokeToolCall(textToolCall('apply_patch', patch(['*** Delete File: delete.txt'])), [applyPatchTool], {
-    policy: createCliToolPolicy({ apply: false, dryRun: false, allowShell: false, allowUnsafeShell: false }), services: { workspaceRoot: root }
+    policy: { allowedRisks: ['read'] }, services: { workspaceRoot: root }
   });
   assert.equal(observation.kind, 'failure');
   assert.equal(observation.output.reason, 'policy');

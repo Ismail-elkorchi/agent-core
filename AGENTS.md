@@ -6,7 +6,7 @@
 - Runtime code depends on repository capabilities. Root exports contain contracts and in-memory repositories; filesystem persistence is isolated in `@agent-core/evidence/node` and `@agent-core/runtime/node`.
 - `@agent-core/tools` contains domain-neutral tool contracts and policy. Node/workspace implementations belong in `@agent-core/tools-local`.
 - Provider packages depend on `@agent-core/model` and pass the shared conformance suite. OpenAI adapters may share only dependency-light Responses framing, never credentials or product policy.
-- `@agent-core/cli` owns committed configuration and workspace runtime-directory layout. `.agent-core` is runtime state, never configuration.
+- Runnable applications own committed configuration, environment layout, and presentation. Core packages receive capabilities and explicit persistence locations.
 
 ## Runtime truth
 
