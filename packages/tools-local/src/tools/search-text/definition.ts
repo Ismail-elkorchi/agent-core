@@ -1,7 +1,8 @@
-import { defineTool, requireWorkspaceRoot, workspaceFileScope } from '@agent-core/tools';
+import { defineTool, workspaceFileScope } from '@agent-core/tools';
 import { canonicalWorkspacePath } from '../../core/filesystem.js';
 import { searchText } from './run.js';
 import { presentSearchTextObservation } from '../../core/presenters.js';
+import { requireWorkspaceRoot } from '../../core/workspace.js';
 import { searchTextInputSchema, searchTextOutputSchema } from './schema.js';
 
 export const searchTextTool = defineTool({

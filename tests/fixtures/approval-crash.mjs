@@ -24,7 +24,7 @@ const events = mode === 'crash_after_ended' || mode === 'crash_before_started' ?
 const sessions = new JsonlSessionRepository({ rootDir: path.join(root, 'sessions') });
 const artifacts = new LocalArtifactRepository(path.join(root, 'artifacts'));
 const sessionId = 'crash-recovery';
-if (mode === 'suspend') await sessions.create({ id: sessionId, workspaceRoot: root, provider: 'fixture', model: 'fixture' });
+if (mode === 'suspend') await sessions.create({ id: sessionId, provider: 'fixture', model: 'fixture' });
 else await sessions.open(sessionId);
 
 const provider = {

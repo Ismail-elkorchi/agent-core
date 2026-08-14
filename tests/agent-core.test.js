@@ -78,7 +78,7 @@ class ScriptedProvider {
 async function harness(options = {}) {
   const events = options.events ?? new InMemoryEventRepository(agentEventCodec);
   const sessions = options.sessions ?? new InMemorySessionRepository();
-  const session = options.withoutSession ? undefined : await sessions.create({ workspaceRoot: process.cwd(), provider: 'scripted', model: 'scripted' });
+  const session = options.withoutSession ? undefined : await sessions.create({ provider: 'scripted', model: 'scripted' });
   const artifacts = options.artifacts ?? new InMemoryArtifactRepository();
   const provider = options.provider ?? new ScriptedProvider(options.script ?? [response()]);
   const agent = new AgentRuntime({
@@ -899,7 +899,7 @@ test('finalization is idempotent, rejects conflicts, and recovers faults after e
   const base = terminal();
   const events = new InMemoryEventRepository(agentEventCodec);
   const sessions = new InMemorySessionRepository();
-  const session = await sessions.create({ workspaceRoot: process.cwd() });
+  const session = await sessions.create({});
   await sessions.appendInput(session.id, { runId: base.runId, task: 'finalize' });
   const finalizer = new AgentRunFinalizer({ runId: base.runId, finalizationId: base.finalizationId, events, session: { repository: sessions, sessionId: session.id } });
   const first = finalizer.finalize(base);
@@ -911,7 +911,7 @@ test('finalization is idempotent, rejects conflicts, and recovers faults after e
   for (const point of ['prepared', 'session', 'committed']) {
     const durableEvents = new InMemoryEventRepository(agentEventCodec);
     const durableSessions = new InMemorySessionRepository();
-    const durableSession = await durableSessions.create({ workspaceRoot: process.cwd() });
+    const durableSession = await durableSessions.create({});
     await durableSessions.appendInput(durableSession.id, { runId: base.runId, task: 'recover' });
     let thrown = false;
     const faultEvents = {

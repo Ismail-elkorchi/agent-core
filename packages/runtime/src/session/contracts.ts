@@ -15,7 +15,6 @@ export type SessionHeader = Readonly<{
   readonly version: 1;
   readonly id: string;
   readonly timestamp: string;
-  readonly workspaceRoot: string;
   readonly parentSessionId?: string;
   readonly provider?: string;
   readonly model?: string;
@@ -38,6 +37,12 @@ export type SessionInputEntry = BaseSessionEntry & Readonly<{
   readonly runId: string;
   readonly task: string;
   readonly instructions: readonly AgentEffectiveInstruction[];
+}>;
+
+export type SessionSteeringEntry = BaseSessionEntry & Readonly<{
+  readonly type: 'steering';
+  readonly runId: string;
+  readonly content: string;
 }>;
 
 export type SessionAssistantEntry = BaseSessionEntry & AgentTurnIdentity & Readonly<{
@@ -92,31 +97,15 @@ export type SessionFinalProjection = Readonly<{
   readonly type: 'final';
   readonly id: string;
   readonly timestamp: string;
+  readonly throughEntryId: string;
   readonly runId: string;
   readonly finalizationId: string;
   readonly terminal: AgentTerminalSnapshot;
 }>;
 
-export type SessionTurnDigest = Readonly<{
-  readonly runId: string;
-  readonly finalizationId: string;
-  readonly task: string;
-  readonly status: string;
-  readonly result?: string;
-}>;
-
-export type SessionContextProjection = Readonly<{
-  readonly type: 'context';
-  readonly id: string;
-  readonly timestamp: string;
-  readonly throughEntryId: string;
-  readonly throughFinalizationId: string;
-  readonly historyDigest: string;
-  readonly recentTurns: readonly SessionTurnDigest[];
-}>;
-
 export type SessionBranchEntry =
   | SessionInputEntry
+  | SessionSteeringEntry
   | SessionAssistantEntry
   | SessionToolCallEntry
   | SessionObservationEntry
@@ -126,6 +115,7 @@ export type SessionBranchEntry =
 
 export type SessionConversationItem =
   | SessionInputEntry
+  | SessionSteeringEntry
   | SessionAssistantEntry
   | SessionToolCallEntry
   | SessionObservationEntry
@@ -184,7 +174,6 @@ export interface SessionPendingSubmission {
 
 export interface CreateSessionOptions {
   readonly id?: string;
-  readonly workspaceRoot: string;
   readonly parentSessionId?: string;
   readonly provider?: string;
   readonly model?: string;
@@ -200,7 +189,6 @@ export interface SessionObservationInput {
 
 export interface SessionSummary {
   readonly id: string;
-  readonly workspaceRoot: string;
   readonly timestamp: string;
   readonly updatedAt: string;
   readonly provider?: string;
@@ -211,7 +199,6 @@ export interface SessionReplayState {
   readonly session: SessionDescriptor;
   readonly branch: readonly SessionBranchEntry[];
   readonly terminalProjections: readonly SessionFinalProjection[];
-  readonly contextProjection?: SessionContextProjection;
   readonly compaction?: SessionCompactionEntry;
   readonly ledgerRunIds: readonly string[];
 }
@@ -219,11 +206,12 @@ export interface SessionReplayState {
 export interface SessionRepository {
   create(options: CreateSessionOptions): Promise<SessionDescriptor>;
   open(sessionId: string): Promise<SessionDescriptor>;
-  list(workspaceRoot?: string): Promise<readonly SessionSummary[]>;
+  list(): Promise<readonly SessionSummary[]>;
   loadReplayState(sessionId: string, leafId?: string | null): Promise<SessionReplayState>;
   readConversation(sessionId: string): Promise<readonly SessionConversationItem[]>;
   listBranchPoints(sessionId: string): Promise<readonly SessionBranchPoint[]>;
   appendInput(sessionId: string, input: { runId: string; task: string; instructions?: readonly AgentEffectiveInstruction[] }): Promise<SessionInputEntry>;
+  appendSteering(sessionId: string, input: { runId: string; content: string }): Promise<SessionSteeringEntry>;
   appendAssistant(sessionId: string, input: { runId: string; identity: AgentTurnIdentity; content: string }): Promise<SessionAssistantEntry>;
   appendToolCall(sessionId: string, input: { runId: string; identity: AgentToolCallIdentity; call: unknown }): Promise<SessionToolCallEntry>;
   appendObservation(sessionId: string, input: { runId: string; identity: AgentTurnIdentity & Partial<Pick<AgentToolCallAttemptIdentity, 'toolBatchId' | 'callIndex' | 'callId' | 'toolAttempt'>>; toolName: string; observation: SessionObservationInput }): Promise<SessionObservationEntry>;

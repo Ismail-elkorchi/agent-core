@@ -13,7 +13,6 @@ import type {
   SessionBranchPoint,
   SessionCompactionEntry,
   SessionConversationItem,
-  SessionContextProjection,
   SessionFinalProjection,
   SessionHeader,
   SessionInputEntry,
@@ -28,9 +27,9 @@ import type {
   SessionSubmissionRecord,
   SessionSubmissionState,
   SessionSummary,
+  SessionSteeringEntry,
   SessionToolCallEntry
 } from './contracts.js';
-import { createSessionContextProjection } from './context-projection.js';
 import { createSessionSubmissionTransition, ownSessionSubmissionConfiguration, ownSessionSubmissionInput, pendingSessionSubmissions } from './submission-lifecycle.js';
 
 export class InMemorySessionRepository implements SessionRepository {
@@ -42,11 +41,11 @@ export class InMemorySessionRepository implements SessionRepository {
     return this.serial(() => {
       if (this.states.has(id)) throw new Error(`Session already exists: ${id}`);
       const header: SessionHeader = Object.freeze({
-        type: 'session', version: 1, id, timestamp: new Date().toISOString(), workspaceRoot: options.workspaceRoot,
+        type: 'session', version: 1, id, timestamp: new Date().toISOString(),
         ...(options.parentSessionId ? { parentSessionId: options.parentSessionId } : {}),
         ...(options.provider ? { provider: options.provider } : {}), ...(options.model ? { model: options.model } : {})
       });
-      const state = { header, branchEntries: [], projections: [], contextProjections: [], submissionRecords: [] };
+      const state = { header, branchEntries: [], projections: [], submissionRecords: [] };
       this.states.set(id, state);
       return sessionFromState(state);
     });
@@ -54,9 +53,9 @@ export class InMemorySessionRepository implements SessionRepository {
 
   open(sessionId: string): Promise<SessionDescriptor> { return this.serial(() => sessionFromState(this.require(sessionId))); }
 
-  list(workspaceRoot?: string): Promise<readonly SessionSummary[]> {
-    return this.serial(() => Object.freeze([...this.states.values()].filter((state) => workspaceRoot === undefined || state.header.workspaceRoot === workspaceRoot).map((state) => Object.freeze({
-      id: state.header.id, workspaceRoot: state.header.workspaceRoot, timestamp: state.header.timestamp, updatedAt: sessionUpdatedAt(state),
+  list(): Promise<readonly SessionSummary[]> {
+    return this.serial(() => Object.freeze([...this.states.values()].map((state) => Object.freeze({
+      id: state.header.id, timestamp: state.header.timestamp, updatedAt: sessionUpdatedAt(state),
       ...(state.header.provider ? { provider: state.header.provider } : {}), ...(state.header.model ? { model: state.header.model } : {})
     })).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))));
   }
@@ -65,20 +64,17 @@ export class InMemorySessionRepository implements SessionRepository {
     return this.serial(() => {
       const state = this.require(sessionId); const session = sessionFromState(state);
       const branch = Object.freeze(activeBranch(state.branchEntries, leafId === undefined ? session.leafId : leafId));
-      const branchIds = new Set(branch.map((entry) => entry.id));
-      const contextProjection = [...state.contextProjections].reverse().find((projection) => branchIds.has(projection.throughEntryId));
       const compaction = [...branch].reverse().find((entry): entry is SessionCompactionEntry => entry.type === 'compaction');
-      const contextIndex = contextProjection ? branch.findIndex((entry) => entry.id === contextProjection.throughEntryId) : -1;
       const compactionIndex = compaction ? branch.findIndex((entry) => entry.id === compaction.id) : -1;
-      const latestEndedRunId = contextIndex > compactionIndex ? contextProjection?.recentTurns.at(-1)?.runId : undefined;
-      const tailStart = Math.max(contextIndex, compactionIndex) + 1;
+      const tailStart = compactionIndex + 1;
       const tailRunIds = [...new Set(branch.slice(tailStart).flatMap((entry) => entry.type === 'input' ? [entry.runId] : []))];
-      const relevantRunIds = new Set([...tailRunIds, ...(latestEndedRunId ? [latestEndedRunId] : [])]);
-      const terminalProjections = Object.freeze(state.projections.filter((projection) => relevantRunIds.has(projection.runId)));
+      const branchIds = new Set(branch.slice(tailStart).map((entry) => entry.id));
+      const terminalProjections = Object.freeze(state.projections.filter((projection) => branchIds.has(projection.throughEntryId)));
       const endedRunIds = new Set(terminalProjections.map((projection) => projection.runId));
       const openRunIds = tailRunIds.filter((runId) => !endedRunIds.has(runId));
-      const ledgerRunIds = Object.freeze([...new Set([...openRunIds, ...(latestEndedRunId ? [latestEndedRunId] : [])])]);
-      return Object.freeze({ session, branch, terminalProjections, ...(contextProjection ? { contextProjection } : {}), ...(compaction ? { compaction } : {}), ledgerRunIds });
+      const latestEndedRunId = terminalProjections.at(-1)?.runId;
+      const ledgerRunIds = Object.freeze([...openRunIds, ...(latestEndedRunId ? [latestEndedRunId] : [])]);
+      return Object.freeze({ session, branch, terminalProjections, ...(compaction ? { compaction } : {}), ledgerRunIds });
     });
   }
 
@@ -90,11 +86,10 @@ export class InMemorySessionRepository implements SessionRepository {
   listBranchPoints(sessionId: string): Promise<readonly SessionBranchPoint[]> {
     return this.serial(() => {
       const state = this.require(sessionId);
-      const points: SessionBranchPoint[] = state.contextProjections.map((projection) => {
-        const final = state.projections.find((item) => item.finalizationId === projection.throughFinalizationId);
-        return Object.freeze({ entryId: projection.throughEntryId, timestamp: projection.timestamp, kind: 'final' as const,
-          finalizationId: projection.throughFinalizationId, ...(final === undefined ? {} : { runId: final.runId }) });
-      });
+      const points: SessionBranchPoint[] = state.projections.map((projection) => Object.freeze({
+        entryId: projection.throughEntryId, timestamp: projection.timestamp, kind: 'final' as const,
+        finalizationId: projection.finalizationId, runId: projection.runId
+      }));
       for (const entry of state.branchEntries) {
         if (entry.type === 'compaction') points.push(Object.freeze({ entryId: entry.id, timestamp: entry.timestamp, kind: 'compaction' }));
       }
@@ -107,6 +102,9 @@ export class InMemorySessionRepository implements SessionRepository {
       ...baseEntry(parentId), type: 'input', runId: input.runId, task: input.task,
       instructions: Object.freeze((input.instructions ?? []).map((instruction) => Object.freeze({ ...instruction })))
     }));
+  }
+  appendSteering(sessionId: string, input: { runId: string; content: string }): Promise<SessionSteeringEntry> {
+    return this.append(sessionId, (parentId) => Object.freeze({ ...baseEntry(parentId), type: 'steering', runId: input.runId, content: input.content }));
   }
   appendAssistant(sessionId: string, input: { runId: string; identity: AgentTurnIdentity; content: string }): Promise<SessionAssistantEntry> {
     return this.serial(() => {
@@ -165,7 +163,7 @@ export class InMemorySessionRepository implements SessionRepository {
       const state = this.require(sessionId);
       const source = state.branchEntries.find((entry) => entry.id === entryId);
       if (!source) throw new Error(`Unknown entry: ${entryId}`);
-      if (source.type !== 'compaction' && !state.contextProjections.some((projection) => projection.throughEntryId === entryId)) {
+      if (source.type !== 'compaction' && !state.projections.some((projection) => projection.throughEntryId === entryId)) {
         throw new Error(`Session branches require a completed final or compaction entry: ${entryId}`);
       }
       const entry: SessionBranchMarkerEntry = Object.freeze({ ...baseEntry(entryId), type: 'branch', fromEntryId: entryId, ...(label ? { label } : {}) });
@@ -179,15 +177,14 @@ export class InMemorySessionRepository implements SessionRepository {
       const existing = state.projections.find((projection) => projection.finalizationId === terminal.finalizationId);
       if (existing) {
         if (terminalSnapshotFingerprint(existing.terminal) !== terminalSnapshotFingerprint(terminal)) throw new PersistenceConflictError(`Conflicting finalization ${terminal.finalizationId}.`);
-        if (!state.contextProjections.some((projection) => projection.throughFinalizationId === terminal.finalizationId)) {
-          state.contextProjections.push(contextProjectionForTerminal(state, terminal));
-        }
         return existing;
       }
-      const contextProjection = contextProjectionForTerminal(state, terminal);
-      const projection: SessionFinalProjection = Object.freeze({ type: 'final', id: randomUUID(), timestamp: new Date().toISOString(), runId: terminal.runId, finalizationId: terminal.finalizationId, terminal });
+      const throughEntryId = branchLeaf(state.branchEntries);
+      if (!throughEntryId || !activeBranch(state.branchEntries, throughEntryId).some((entry) => entry.type === 'input' && entry.runId === terminal.runId)) {
+        throw new Error(`Cannot project finalization ${terminal.finalizationId}: run ${terminal.runId} is not on the active session branch.`);
+      }
+      const projection: SessionFinalProjection = Object.freeze({ type: 'final', id: randomUUID(), timestamp: new Date().toISOString(), throughEntryId, runId: terminal.runId, finalizationId: terminal.finalizationId, terminal });
       state.projections.push(projection);
-      state.contextProjections.push(contextProjection);
       return projection;
     });
   }
@@ -221,39 +218,15 @@ export class InMemorySessionRepository implements SessionRepository {
 }
 
 function sessionUpdatedAt(state: SessionState): string {
-  return [...state.branchEntries, ...state.projections, ...state.contextProjections, ...state.submissionRecords]
+  return [...state.branchEntries, ...state.projections, ...state.submissionRecords]
     .reduce((latest, entry) => entry.timestamp > latest ? entry.timestamp : latest, state.header.timestamp);
 }
 
-interface SessionState { readonly header: SessionHeader; readonly branchEntries: SessionBranchEntry[]; readonly projections: SessionFinalProjection[]; readonly contextProjections: SessionContextProjection[]; readonly submissionRecords: SessionSubmissionRecord[] }
+interface SessionState { readonly header: SessionHeader; readonly branchEntries: SessionBranchEntry[]; readonly projections: SessionFinalProjection[]; readonly submissionRecords: SessionSubmissionRecord[] }
 function activeBranch(entries: readonly SessionBranchEntry[], leafId: string | null): SessionBranchEntry[] {
   const byId = new Map(entries.map((entry) => [entry.id, entry])); const output: SessionBranchEntry[] = []; let cursor = leafId;
   while (cursor) { const entry = byId.get(cursor); if (!entry) throw new Error(`Session branch points to missing entry: ${cursor}`); output.push(entry); cursor = entry.parentId; }
   return output.reverse();
-}
-function contextProjectionForBranch(projections: readonly SessionContextProjection[], branch: readonly SessionBranchEntry[]): SessionContextProjection | undefined {
-  const ids = new Set(branch.map((entry) => entry.id));
-  return [...projections].reverse().find((projection) => ids.has(projection.throughEntryId));
-}
-function contextProjectionForTerminal(state: SessionState, terminal: AgentTerminalSnapshot): SessionContextProjection {
-  const throughEntryId = branchLeaf(state.branchEntries);
-  if (!throughEntryId) throw new Error('Cannot project a final without a session branch entry.');
-  const branch = activeBranch(state.branchEntries, throughEntryId);
-  if (!branch.some((entry) => entry.type === 'input' && entry.runId === terminal.runId)) {
-    throw new Error(`Cannot project finalization ${terminal.finalizationId}: run ${terminal.runId} is not on the active session branch.`);
-  }
-  const previous = contextProjectionForBranch(state.contextProjections, branch);
-  let compactionIndex = -1;
-  for (let index = branch.length - 1; index >= 0; index -= 1) {
-    if (branch[index]?.type === 'compaction') { compactionIndex = index; break; }
-  }
-  const previousIndex = previous ? branch.findIndex((entry) => entry.id === previous.throughEntryId) : -1;
-  const candidate = compactionIndex > previousIndex ? branch[compactionIndex] : undefined;
-  const compaction = candidate?.type === 'compaction' ? candidate : undefined;
-  return createSessionContextProjection({
-    branchEntries: branch, terminal, throughEntryId,
-    ...(compaction ? { baseSummary: compaction.summary } : previous ? { previous } : {})
-  });
 }
 function branchLeaf(entries: readonly SessionBranchEntry[]): string | null { return entries.at(-1)?.id ?? null; }
 function sessionFromState(state: SessionState): SessionDescriptor { return Object.freeze({ id: state.header.id, header: state.header, leafId: branchLeaf(state.branchEntries) }); }

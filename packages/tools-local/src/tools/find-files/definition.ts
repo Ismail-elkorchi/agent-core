@@ -1,8 +1,9 @@
-import { defineTool, requireWorkspaceRoot, workspaceFileScope } from '@agent-core/tools';
+import { defineTool, workspaceFileScope } from '@agent-core/tools';
 import { canonicalWorkspacePath } from '../../core/filesystem.js';
 import { workspaceFileSelector } from '../../core/workspace-file-selection.js';
 import { presentFindFilesObservation } from '../../core/presenters.js';
 import { builtInReadEvidence } from '../../core/read-evidence.js';
+import { requireWorkspaceRoot } from '../../core/workspace.js';
 import { findFilesInputSchema, findFilesOutputSchema, type FindFilesInput } from './schema.js';
 
 interface CanonicalFindFilesInput extends FindFilesInput { readonly path: string }

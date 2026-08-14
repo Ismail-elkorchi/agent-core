@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process';
-import { requireWorkspaceRoot, workspaceFileScope, type ToolExecutionContext, type ToolObservationInput } from '@agent-core/tools';
+import { workspaceFileScope, type ToolExecutionContext, type ToolObservationInput } from '@agent-core/tools';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
 import { builtInReadEvidence } from '../../core/read-evidence.js';
+import { requireWorkspaceRoot } from '../../core/workspace.js';
 import type { SearchTextInput, SearchTextOutput } from './schema.js';
 
 interface RipgrepData {

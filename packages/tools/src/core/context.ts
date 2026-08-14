@@ -91,10 +91,6 @@ export function requireToolService<T>(
   return value;
 }
 
-export function requireWorkspaceRoot(context: ToolExecutionContext): string {
-  return requireToolService(context, 'workspaceRoot', isNonEmptyString, 'non-empty string workspace root');
-}
-
 export function throwIfAborted(signal: AbortSignal | undefined): void {
   if (!signal?.aborted) {
     return;
@@ -124,9 +120,6 @@ export async function abortableToolBoundary<T>(signal: AbortSignal, operation: (
   }
 }
 
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === 'string' && value.trim().length > 0;
-}
 
 function valueType(value: unknown): string {
   if (value === null) {

@@ -1,10 +1,11 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { ArtifactRepository } from '@agent-core/evidence';
-import { artifactScope, defineTool, requireToolService, requireWorkspaceRoot, ToolInputError, workspaceFileScope } from '@agent-core/tools';
+import { artifactScope, defineTool, requireToolService, ToolInputError, workspaceFileScope } from '@agent-core/tools';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
 import { assertRealPathInsideRoot, canonicalWorkspacePath, resolveInsideRoot } from '../../core/filesystem.js';
 import { builtInReadEvidence } from '../../core/read-evidence.js';
+import { requireWorkspaceRoot } from '../../core/workspace.js';
 import { viewImageInputSchema, viewImageOutputSchema } from './schema.js';
 
 export const viewImageTool = defineTool({

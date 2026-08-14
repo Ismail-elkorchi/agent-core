@@ -37,7 +37,7 @@ test('scripted self-hosting run survives approvals, structured tools, verificati
   const events = new InMemoryEventRepository(agentEventCodec);
   const sessions = new InMemorySessionRepository();
   const artifacts = new InMemoryArtifactRepository();
-  const session = await sessions.create({ id: 'self-host', workspaceRoot: root, provider: 'scripted', model: 'scripted' });
+  const session = await sessions.create({ id: 'self-host', provider: 'scripted', model: 'scripted' });
   const processManager = new ProcessManager({
     artifactRepository: artifacts,
     maxCapturedBytes: DEFAULT_LOCAL_TOOL_CONFIGURATION.process.maxCapturedBytes,

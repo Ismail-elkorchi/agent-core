@@ -1,7 +1,8 @@
-import { defineTool, requireWorkspaceRoot, workspaceFileScope } from '@agent-core/tools';
+import { defineTool, workspaceFileScope } from '@agent-core/tools';
 import { canonicalWorkspacePath } from '../../core/filesystem.js';
 import { readFiles } from './run.js';
 import { presentReadFilesObservation } from '../../core/presenters.js';
+import { requireWorkspaceRoot } from '../../core/workspace.js';
 import { readFilesInputSchema, readFilesOutputSchema } from './schema.js';
 
 export const readFilesTool = defineTool({

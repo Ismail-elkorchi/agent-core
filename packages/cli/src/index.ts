@@ -187,7 +187,7 @@ async function createRuntime(
   persistedSessionId?: string
 ): Promise<CliRuntime> {
   const sessions = new JsonlSessionRepository({ rootDir: workspace.sessionsDir });
-  let session = await selectSession(options, workspace, sessions, persistedSessionId);
+  let session = await selectSession(options, sessions, persistedSessionId);
   const replay = session ? await sessions.loadReplayState(session.id) : undefined;
   const latestSettings = replay ? [...replay.branch].reverse().find((entry) => entry.type === 'model_settings') : undefined;
   const persistedSettings: PersistedModelSettings | undefined = latestSettings ?? (session ? {
@@ -196,11 +196,7 @@ async function createRuntime(
   } : undefined);
   const settings = resolveRuntimeSettings(options, persistedSettings);
   const providerRuntime = createProviderRuntime(settings);
-  session ??= await sessions.create({ workspaceRoot: workspace.workspaceRoot, provider: providerRuntime.providerId, model: providerRuntime.model });
-  if (options.branch) {
-    await sessions.branchFrom(session.id, options.branch, 'cli branch');
-    session = await sessions.open(session.id);
-  }
+  session ??= await sessions.create({ provider: providerRuntime.providerId, model: providerRuntime.model });
   const sessionBinding = { repository: sessions, session };
   const events = new JsonlEventRepository<AgentEvent>({ rootDir: workspace.runsDir, codec: agentEventCodec });
   const existingRunIds = new Set(await events.listRunIds());
@@ -310,8 +306,9 @@ async function createRuntime(
           onProgress
         });
       },
-      summarizeConversation: request => summarizeConversation(providerRuntime.provider, request.configuration.model, request.conversation, request.contextProjection)
+      summarizeConversation: request => summarizeConversation(providerRuntime.provider, request.configuration.model, request.conversation)
     });
+    if (options.branch) await agent.branchFrom(options.branch, 'cli branch');
     return {
       agent,
       events,
@@ -340,15 +337,12 @@ async function createRuntime(
 async function summarizeConversation(
   provider: ModelProvider,
   model: string,
-  conversation: readonly SessionConversationItem[],
-  projection: { readonly historyDigest: string; readonly recentTurns: readonly unknown[] } | undefined
+  conversation: readonly SessionConversationItem[]
 ): Promise<string> {
   const profile = await provider.describeModel(model);
   const inputTokens = profile.limits.maxInputTokens ?? profile.limits.contextTokens ?? 32_000;
   const maxChars = Math.min(1_000_000, Math.max(16_000, Math.floor(inputTokens * 3)));
   const transcript = [
-    ...(projection?.historyDigest ? [`Prior deterministic digest:\n${projection.historyDigest}`] : []),
-    ...(projection?.recentTurns.length ? [`Recent deterministic turns:\n${JSON.stringify(projection.recentTurns)}`] : []),
     ...conversation.map(renderConversationItem)
   ].join('\n\n');
   const bounded = transcript.length <= maxChars ? transcript : `[Earlier projection omitted for input bounds]\n${transcript.slice(-maxChars)}`;
@@ -367,6 +361,7 @@ async function summarizeConversation(
 function renderConversationItem(item: SessionConversationItem): string {
   switch (item.type) {
     case 'input': return `User (${item.runId}): ${item.task}`;
+    case 'steering': return `User steering (${item.runId}): ${item.content}`;
     case 'assistant': return `Assistant (${item.runId}/${item.turnId}): ${item.content}`;
     case 'tool_call': return `Tool call (${item.runId}/${item.toolBatchId}/${String(item.callIndex)}): ${JSON.stringify(item.call)}`;
     case 'observation': return `Tool observation (${item.runId}/${item.toolName}, ${item.ok ? 'ok' : 'failed'}): ${item.summary}${item.output === undefined ? '' : `\n${JSON.stringify(item.output)}`}`;
@@ -677,17 +672,16 @@ function resolveCliAuthority(options: CliOptions): EffectiveCliAuthority {
   });
 }
 
-async function selectSession(options: CliOptions, workspace: WorkspaceLayout, repository: JsonlSessionRepository, persistedSessionId?: string): Promise<SessionDescriptor | undefined> {
+async function selectSession(options: CliOptions, repository: JsonlSessionRepository, persistedSessionId?: string): Promise<SessionDescriptor | undefined> {
   let session: SessionDescriptor | undefined;
   if (persistedSessionId !== undefined) {
     session = await repository.open(persistedSessionId);
   } else if (options.sessionSelection.kind === 'existing') {
     session = await repository.open(options.sessionSelection.id);
   } else if (options.sessionSelection.kind === 'latest') {
-    const latest = (await repository.list(workspace.workspaceRoot))[0];
+    const latest = (await repository.list())[0];
     if (latest) session = await repository.open(latest.id);
   }
-  if (session) validateSessionWorkspace(session, workspace);
   if (!session && options.branch) throw new Error('--branch requires an existing session.');
   return session;
 }
@@ -727,15 +721,6 @@ function resolveRuntimeSettings(options: CliOptions, persisted: PersistedModelSe
     ...(temperature === undefined ? {} : { temperature }),
     ...(reasoning === undefined ? {} : { reasoning })
   });
-}
-
-function validateSessionWorkspace(session: SessionDescriptor, workspace: WorkspaceLayout): void {
-  if (path.resolve(session.header.workspaceRoot) !== workspace.workspaceRoot) {
-    throw new Error([
-      `Session belongs to a different workspace root: ${session.header.workspaceRoot}`,
-      `Current workspace root: ${workspace.workspaceRoot}`
-    ].join('\n'));
-  }
 }
 
 function writeLine(output: Writable, text: string): void {

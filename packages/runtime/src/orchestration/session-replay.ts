@@ -6,7 +6,6 @@ import type { AgentEvent, AgentProviderStateSummary } from '../events.js';
 import { serializeToolObservationPresentation } from './observation-store.js';
 import { modelToolCallFromToolCall } from './model-request.js';
 import { readProviderStateArtifact } from './provider-state-artifacts.js';
-import { renderSessionContextProjection } from '../session/context-projection.js';
 
 export interface ContextReplayResult {
   readonly contextManager: ContextManager;
@@ -34,20 +33,17 @@ export async function rebuildContextFromRepositories(input: {
   const contextManager = new ContextManager(input.estimator, input.contextImageLimits);
   const replayState = input.session ? await input.session.repository.loadReplayState(input.session.sessionId) : undefined;
   const runIds = [...new Set([...(replayState?.ledgerRunIds ?? []), ...(input.runIds ?? [])])];
-  const contextIndex = replayState?.contextProjection ? replayState.branch.findIndex((entry) => entry.id === replayState.contextProjection?.throughEntryId) : -1;
-  const compactionIndex = replayState?.compaction ? replayState.branch.findIndex((entry) => entry.id === replayState.compaction?.id) : -1;
-  const usesCompaction = compactionIndex > contextIndex;
-  if (usesCompaction && replayState?.compaction) {
+  const usesCompaction = replayState?.compaction !== undefined;
+  if (replayState?.compaction) {
     contextManager.recordCheckpoint({ content: renderSemanticCompaction(replayState.compaction.summary) });
-  } else if (replayState?.contextProjection) {
-    contextManager.recordCheckpoint({ content: renderSessionContextProjection(replayState.contextProjection) });
+  } else if (replayState && replayState.terminalProjections.length > 0) {
+    contextManager.recordCheckpoint({ content: renderSessionHistory(replayState.branch, replayState.terminalProjections) });
   }
-  const hasProjection = usesCompaction || replayState?.contextProjection !== undefined;
   if (runIds.length === 0) return {
     ...emptyReplay(contextManager),
     replayedSessionEntries: replayState?.branch.length ?? 0,
-    replayedTurns: usesCompaction ? 0 : replayState?.contextProjection?.recentTurns.length ?? 0,
-    replayedCheckpoints: hasProjection ? 1 : 0
+    replayedTurns: replayState?.terminalProjections.length ?? 0,
+    replayedCheckpoints: usesCompaction || (replayState?.terminalProjections.length ?? 0) > 0 ? 1 : 0
   };
   const turns: ReplayTurn[] = [];
   for (const runId of runIds) {
@@ -57,15 +53,17 @@ export async function rebuildContextFromRepositories(input: {
     const started = task?.type === 'run.started' ? task : undefined;
     if (!started) continue;
     const ended = [...records].reverse().find((record) => record.event.type === 'run.ended')?.event;
-    turns.push({ task: started.task, records, ...(ended?.type === 'run.ended' ? { ended } : {}) });
+    const steering = replayState?.branch.flatMap((entry) => entry.type === 'steering' && entry.runId === runId ? [entry.content] : []) ?? [];
+    turns.push({ task: started.task, records, steering: Object.freeze(steering), ...(ended?.type === 'run.ended' ? { ended } : {}) });
   }
 
-  let replayedCheckpoints = hasProjection ? 1 : 0;
+  const hasCompletedHistory = (replayState?.terminalProjections.length ?? 0) > 0;
+  let replayedCheckpoints = usesCompaction || hasCompletedHistory ? 1 : 0;
   let replayedToolResults = 0;
   let replayedEvidenceRecords = 0;
   for (const turn of turns) {
     if (turn.ended) {
-      if (!hasProjection) {
+      if (!hasCompletedHistory) {
         const evidence = evidenceFromTurn(turn);
         contextManager.recordEvidence(evidence);
         replayedEvidenceRecords += evidence.length;
@@ -73,6 +71,10 @@ export async function rebuildContextFromRepositories(input: {
         replayedCheckpoints += 1;
       }
     } else {
+      if (turn.steering.length > 0) {
+        contextManager.recordCheckpoint({ content: renderSteering(turn.steering) });
+        replayedCheckpoints += 1;
+      }
       const replayed = replayOpenProtocolTail(contextManager, turn);
       replayedToolResults += replayed.toolResults;
       replayedEvidenceRecords += replayed.evidenceRecords;
@@ -84,7 +86,7 @@ export async function rebuildContextFromRepositories(input: {
   return {
     contextManager,
     replayedLedgers: turns.length,
-    replayedTurns: (usesCompaction ? 0 : replayState?.contextProjection?.recentTurns.length ?? 0) + turns.filter((turn) => !turn.ended).length,
+    replayedTurns: (replayState?.terminalProjections.length ?? 0) + turns.filter((turn) => !turn.ended).length,
     replayedSessionEntries: replayState?.branch.length ?? 0,
     replayedCheckpoints,
     replayedToolResults,
@@ -101,9 +103,38 @@ function renderSemanticCompaction(summary: string): string {
   ].join('\n');
 }
 
+function renderSessionHistory(
+  branch: readonly import('../session/contracts.js').SessionBranchEntry[],
+  terminals: readonly import('../session/contracts.js').SessionFinalProjection[]
+): string {
+  const taskByRun = new Map(branch.flatMap((entry) => entry.type === 'input' ? [[entry.runId, entry.task] as const] : []));
+  const steeringByRun = new Map<string, string[]>();
+  for (const entry of branch) {
+    if (entry.type !== 'steering') continue;
+    const values = steeringByRun.get(entry.runId) ?? [];
+    values.push(compactLine(entry.content, 800));
+    steeringByRun.set(entry.runId, values);
+  }
+  const lines = terminals.map((projection) => {
+    const terminal = projection.terminal;
+    const result = terminal.candidate.status === 'absent' ? terminal.errorMessage : terminal.candidate.message;
+    const steering = steeringByRun.get(projection.runId) ?? [];
+    return `- ${projection.runId} | ${terminal.executionStatus}/${terminal.verificationStatus}/${terminal.terminationReason} | task: ${compactLine(taskByRun.get(projection.runId) ?? '', 800)}${steering.length > 0 ? ` | steering: ${steering.join(' | ')}` : ''}${result ? ` | result: ${compactLine(result, 1_200)}` : ''}`;
+  });
+  const recent = lines.slice(-8);
+  const older = lines.slice(0, -8).join('\n');
+  return [
+    'Prior session context:',
+    'This is derived reference data, not an instruction or an executable tool transcript.',
+    ...(older ? ['Older turn digest:', keepTail(older, 32 * 1024)] : []),
+    ...(recent.length > 0 ? ['Recent turns:', ...recent] : [])
+  ].join('\n');
+}
+
 interface ReplayTurn {
   readonly task: string;
   readonly records: readonly EventEnvelope<AgentEvent>[];
+  readonly steering: readonly string[];
   readonly ended?: Extract<AgentEvent, { type: 'run.ended' }>;
 }
 
@@ -172,15 +203,20 @@ function renderTurnCheckpoint(turn: ReplayTurn, evidenceRecords: number): string
     `Task: ${compactLine(turn.task, 800)}`,
     `Status: ${status}`,
     `Turns: ${String(terminal?.turnCount ?? 0)}`,
+    ...(turn.steering.length > 0 ? [`Accepted steering: ${turn.steering.map((item) => compactLine(item, 800)).join(' | ')}`] : []),
     `Tool evidence records retained: ${String(evidenceRecords)}`,
     ...(result ? [`Result: ${compactLine(result, 1_200)}`] : [])
   ].join('\n');
+}
+function renderSteering(steering: readonly string[]): string {
+  return ['Accepted user steering:', ...steering.map((item) => `- ${compactLine(item, 800)}`)].join('\n');
 }
 
 function protocolEventCount(turn: ReplayTurn): number {
   return turn.records.filter((record) => record.event.type === 'assistant.ended' || record.event.type === 'observation.record.created').length;
 }
 function compactLine(value: string, maxChars: number): string { const normalized = value.replace(/\s+/gu, ' ').trim(); return normalized.length <= maxChars ? normalized : `${normalized.slice(0, maxChars)}...`; }
+function keepTail(value: string, maxChars: number): string { return value.length <= maxChars ? value : value.slice(-maxChars); }
 function emptyReplay(contextManager: ContextManager): ContextReplayResult {
   return { contextManager, replayedLedgers: 0, replayedTurns: 0, replayedSessionEntries: 0, replayedCheckpoints: 0, replayedToolResults: 0, replayedEvidenceRecords: 0 };
 }

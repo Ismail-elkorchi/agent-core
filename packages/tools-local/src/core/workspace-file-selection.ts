@@ -2,9 +2,10 @@ import { promises as fs } from 'node:fs';
 import type { Dirent } from 'node:fs';
 import path from 'node:path';
 import createIgnore, { type Ignore } from 'ignore';
-import { ToolInputError, requireWorkspaceRoot, throwIfAborted, type ToolExecutionContext } from '@agent-core/tools';
+import { ToolInputError, throwIfAborted, type ToolExecutionContext } from '@agent-core/tools';
 import { requireLocalToolConfiguration } from './configuration.js';
 import { relativePath, requireDirectoryInsideRoot, resolveInsideRoot } from './filesystem.js';
+import { requireWorkspaceRoot } from './workspace.js';
 
 export type WorkspaceEntryType = 'file' | 'directory' | 'symlink' | 'other';
 export interface WorkspaceFileSelectionLimits { readonly maxDepth: number; readonly maxVisitedEntries: number; readonly maxReturnedEntries: number; readonly maxIgnoreFiles: number; readonly maxGlobExpansions: number }

@@ -93,7 +93,7 @@ test('read-tool evidence reaches durable observations, session context, prompt s
   await writeFile(path.join(root, 'visible.txt'), 'visible\n');
   const events = new InMemoryEventRepository(agentEventCodec);
   const sessions = new InMemorySessionRepository();
-  const session = await sessions.create({ workspaceRoot: root, provider: 'evidence-provider', model: 'evidence-model' });
+  const session = await sessions.create({ provider: 'evidence-provider', model: 'evidence-model' });
   const requests = [];
   const provider = {
     id: 'evidence-provider',

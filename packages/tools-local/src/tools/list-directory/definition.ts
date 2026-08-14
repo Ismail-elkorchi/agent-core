@@ -1,8 +1,9 @@
-import { defineTool, requireWorkspaceRoot, workspaceFileScope } from '@agent-core/tools';
+import { defineTool, workspaceFileScope } from '@agent-core/tools';
 import { canonicalWorkspacePath } from '../../core/filesystem.js';
 import { workspaceFileSelector } from '../../core/workspace-file-selection.js';
 import { presentListDirectoryObservation } from '../../core/presenters.js';
 import { builtInReadEvidence } from '../../core/read-evidence.js';
+import { requireWorkspaceRoot } from '../../core/workspace.js';
 import { listDirectoryInputSchema, listDirectoryOutputSchema, type ListDirectoryInput } from './schema.js';
 
 interface CanonicalListDirectoryInput extends ListDirectoryInput { readonly path: string }

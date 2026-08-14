@@ -1,7 +1,7 @@
 import type { ArtifactRef } from '@agent-core/evidence';
 import { canonicalJsonString } from '@agent-core/evidence';
 import { parseJsonObject, type JsonNormalizationDiagnostic, type JsonObject, type JsonValue } from '@agent-core/json';
-import type { ModelReasoningRequest, ModelResponseFormat, ModelTerminationReason } from '@agent-core/model';
+import type { ModelReasoningRequest, ModelRequest, ModelResponseFormat, ModelTerminationReason } from '@agent-core/model';
 import type { ToolEffects } from '@agent-core/tools';
 
 export type AgentCandidateStatus = 'complete' | 'partial' | 'indeterminate' | 'absent';
@@ -247,6 +247,11 @@ export interface AgentRequestSnapshotRecord extends AgentTurnIdentity {
   readonly modelToolSchemasHash: string;
   readonly compiledPromptHash: string;
   readonly reductions: readonly AgentRequestReductionRecord[];
+}
+
+export interface AgentExactRequestRecord extends AgentTurnIdentity {
+  readonly requestId: string;
+  readonly request: Omit<ModelRequest, 'signal'>;
 }
 
 export type AgentCompletedTerminationReason = 'model_completed' | 'model_output_limit' | 'content_filtered' | 'unknown_model_termination';

@@ -40,7 +40,6 @@ import type {
   SessionBranchPoint,
   SessionCompactionEntry,
   SessionConversationItem,
-  SessionContextProjection,
   SessionFinalProjection,
   SessionHeader,
   SessionInputEntry,
@@ -55,9 +54,9 @@ import type {
   SessionSubmissionRecord,
   SessionSubmissionState,
   SessionSummary,
+  SessionSteeringEntry,
   SessionToolCallEntry
 } from './contracts.js';
-import { createSessionContextProjection } from './context-projection.js';
 import { createSessionSubmissionTransition, ownSessionSubmissionConfiguration, ownSessionSubmissionInput, pendingSessionSubmissions } from './submission-lifecycle.js';
 
 export interface JsonlSessionRepositoryOptions {
@@ -89,7 +88,6 @@ export class JsonlSessionRepository implements SessionRepository {
     return this.enqueue(id, () => withPersistenceFileLock(this.filePath(id), this.lockTimeoutMs, this.staleLockMs, async () => {
       const header: SessionHeader = Object.freeze({
         type: 'session', version: 1, id, timestamp: new Date().toISOString(),
-        workspaceRoot: await canonicalWorkspaceRoot(options.workspaceRoot),
         ...(options.parentSessionId ? { parentSessionId: options.parentSessionId } : {}),
         ...(options.provider ? { provider: options.provider } : {}),
         ...(options.model ? { model: options.model } : {})
@@ -98,7 +96,7 @@ export class JsonlSessionRepository implements SessionRepository {
       const serialized = `${JSON.stringify(header)}\n`;
       await fs.writeFile(this.filePath(id), serialized, { encoding: 'utf8', flag: 'wx' });
       const completeBytes = Buffer.byteLength(serialized, 'utf8');
-      const state: SessionAppendIndex = { header, branchEntries: [], projections: [], contextProjections: [], submissionRecords: [], completeBytes, boundaryMarker: Buffer.from(serialized).subarray(-256).toString('base64'), storageStamp: await jsonlStorageStamp(this.filePath(id)) };
+      const state: SessionAppendIndex = { header, branchEntries: [], projections: [], submissionRecords: [], completeBytes, boundaryMarker: Buffer.from(serialized).subarray(-256).toString('base64'), storageStamp: await jsonlStorageStamp(this.filePath(id)) };
       this.indexes.set(id, state);
       return sessionFromState(state);
     }));
@@ -109,8 +107,7 @@ export class JsonlSessionRepository implements SessionRepository {
     return sessionFromState(state);
   }
 
-  async list(workspaceRoot?: string): Promise<readonly SessionSummary[]> {
-    const wanted = workspaceRoot ? await canonicalWorkspaceRoot(workspaceRoot) : undefined;
+  async list(): Promise<readonly SessionSummary[]> {
     let names: string[];
     try { names = await fs.readdir(this.rootDir); }
     catch (error) { if (nodeCode(error) === 'ENOENT') return []; throw error; }
@@ -120,9 +117,8 @@ export class JsonlSessionRepository implements SessionRepository {
       if (!id) continue;
       const state = await this.enqueue(id, () => this.refreshIndex(id, false));
       const session = sessionFromState(state);
-      if (wanted && session.header.workspaceRoot !== wanted) continue;
       summaries.push(Object.freeze({
-        id, workspaceRoot: session.header.workspaceRoot, timestamp: session.header.timestamp, updatedAt: sessionUpdatedAt(state),
+        id, timestamp: session.header.timestamp, updatedAt: sessionUpdatedAt(state),
         ...(session.header.provider ? { provider: session.header.provider } : {}),
         ...(session.header.model ? { model: session.header.model } : {})
       }));
@@ -134,20 +130,17 @@ export class JsonlSessionRepository implements SessionRepository {
     const state = await this.enqueue(sessionId, () => this.refreshIndex(sessionId, false));
     const session = sessionFromState(state);
     const branch = Object.freeze(activeBranch(state.branchEntries, leafId === undefined ? session.leafId : leafId));
-    const branchIds = new Set(branch.map((entry) => entry.id));
-    const contextProjection = [...state.contextProjections].reverse().find((projection) => branchIds.has(projection.throughEntryId));
     const compaction = [...branch].reverse().find((entry): entry is SessionCompactionEntry => entry.type === 'compaction');
-    const contextIndex = contextProjection ? branch.findIndex((entry) => entry.id === contextProjection.throughEntryId) : -1;
     const compactionIndex = compaction ? branch.findIndex((entry) => entry.id === compaction.id) : -1;
-    const latestEndedRunId = contextIndex > compactionIndex ? contextProjection?.recentTurns.at(-1)?.runId : undefined;
-    const tailStart = Math.max(contextIndex, compactionIndex) + 1;
+    const tailStart = compactionIndex + 1;
     const tailRunIds = [...new Set(branch.slice(tailStart).flatMap((entry) => entry.type === 'input' ? [entry.runId] : []))];
-    const relevantRunIds = new Set([...tailRunIds, ...(latestEndedRunId ? [latestEndedRunId] : [])]);
-    const terminalProjections = Object.freeze(state.projections.filter((projection) => relevantRunIds.has(projection.runId)));
+    const branchIds = new Set(branch.slice(tailStart).map((entry) => entry.id));
+    const terminalProjections = Object.freeze(state.projections.filter((projection) => branchIds.has(projection.throughEntryId)));
     const endedRunIds = new Set(terminalProjections.map((projection) => projection.runId));
     const openRunIds = tailRunIds.filter((runId) => !endedRunIds.has(runId));
-    const ledgerRunIds = Object.freeze([...new Set([...openRunIds, ...(latestEndedRunId ? [latestEndedRunId] : [])])]);
-    return Object.freeze({ session, branch, terminalProjections, ...(contextProjection ? { contextProjection } : {}), ...(compaction ? { compaction } : {}), ledgerRunIds });
+    const latestEndedRunId = terminalProjections.at(-1)?.runId;
+    const ledgerRunIds = Object.freeze([...openRunIds, ...(latestEndedRunId ? [latestEndedRunId] : [])]);
+    return Object.freeze({ session, branch, terminalProjections, ...(compaction ? { compaction } : {}), ledgerRunIds });
   }
 
   async readConversation(sessionId: string): Promise<readonly SessionConversationItem[]> {
@@ -157,11 +150,10 @@ export class JsonlSessionRepository implements SessionRepository {
 
   async listBranchPoints(sessionId: string): Promise<readonly SessionBranchPoint[]> {
     const state = await this.enqueue(sessionId, () => this.refreshIndex(sessionId, false));
-    const points: SessionBranchPoint[] = state.contextProjections.map((projection) => {
-      const runId = state.projections.find((item) => item.finalizationId === projection.throughFinalizationId)?.runId;
-      return Object.freeze({ entryId: projection.throughEntryId, timestamp: projection.timestamp, kind: 'final' as const,
-        finalizationId: projection.throughFinalizationId, ...(runId === undefined ? {} : { runId }) });
-    });
+    const points: SessionBranchPoint[] = state.projections.map((projection) => Object.freeze({
+      entryId: projection.throughEntryId, timestamp: projection.timestamp, kind: 'final' as const,
+      finalizationId: projection.finalizationId, runId: projection.runId
+    }));
     for (const entry of state.branchEntries) if (entry.type === 'compaction') points.push(Object.freeze({ entryId: entry.id, timestamp: entry.timestamp, kind: 'compaction' }));
     return Object.freeze(points);
   }
@@ -171,6 +163,10 @@ export class JsonlSessionRepository implements SessionRepository {
       ...baseEntry(parentId), type: 'input', runId: input.runId, task: input.task,
       instructions: Object.freeze((input.instructions ?? []).map((instruction) => Object.freeze({ ...instruction })))
     }));
+  }
+
+  appendSteering(sessionId: string, input: { runId: string; content: string }): Promise<SessionSteeringEntry> {
+    return this.appendBranchEntry(sessionId, (parentId) => Object.freeze({ ...baseEntry(parentId), type: 'steering', runId: input.runId, content: input.content }));
   }
 
   appendAssistant(sessionId: string, input: { runId: string; identity: AgentTurnIdentity; content: string }): Promise<SessionAssistantEntry> {
@@ -242,7 +238,7 @@ export class JsonlSessionRepository implements SessionRepository {
       const state = await this.refreshIndex(sessionId, true);
       const source = state.branchEntries.find((entry) => entry.id === entryId);
       if (!source) throw new Error(`Cannot branch from unknown entry: ${entryId}`);
-      if (source.type !== 'compaction' && !state.contextProjections.some((projection) => projection.throughEntryId === entryId)) {
+      if (source.type !== 'compaction' && !state.projections.some((projection) => projection.throughEntryId === entryId)) {
         throw new Error(`Session branches require a completed final or compaction entry: ${entryId}`);
       }
       const entry: SessionBranchMarkerEntry = Object.freeze({ ...baseEntry(entryId), type: 'branch', fromEntryId: entryId, ...(label ? { label } : {}) });
@@ -262,20 +258,19 @@ export class JsonlSessionRepository implements SessionRepository {
       const existing = state.projections.find((projection) => projection.finalizationId === terminal.finalizationId);
       if (existing) {
         if (terminalSnapshotFingerprint(existing.terminal) !== terminalSnapshotFingerprint(terminal)) throw new PersistenceConflictError(`Conflicting session projection for finalization ${terminal.finalizationId}.`);
-        if (!state.contextProjections.some((projection) => projection.throughFinalizationId === terminal.finalizationId)) {
-          await this.appendContextProjection(sessionId, state, contextProjectionForTerminal(state, terminal));
-        }
         return existing;
       }
-      const contextProjection = contextProjectionForTerminal(state, terminal);
+      const throughEntryId = branchLeaf(state.branchEntries);
+      if (!throughEntryId || !activeBranch(state.branchEntries, throughEntryId).some((entry) => entry.type === 'input' && entry.runId === terminal.runId)) {
+        throw new Error(`Cannot project finalization ${terminal.finalizationId}: run ${terminal.runId} is not on the active session branch.`);
+      }
       const projection: SessionFinalProjection = Object.freeze({
-        type: 'final', id: randomUUID(), timestamp: new Date().toISOString(), runId: terminal.runId,
+        type: 'final', id: randomUUID(), timestamp: new Date().toISOString(), throughEntryId, runId: terminal.runId,
         finalizationId: terminal.finalizationId, terminal
       });
       await appendJsonlRecord(this.filePath(sessionId), projection);
       state.projections.push(projection);
       state.completeBytes += recordBytes(projection);
-      await this.appendContextProjection(sessionId, state, contextProjection);
       state.boundaryMarker = await jsonlBoundaryMarker(this.filePath(sessionId), state.completeBytes);
       state.storageStamp = await jsonlStorageStamp(this.filePath(sessionId));
       return projection;
@@ -306,12 +301,6 @@ export class JsonlSessionRepository implements SessionRepository {
   async loadPendingSubmissions(sessionId: string): Promise<readonly SessionPendingSubmission[]> {
     const state = await this.enqueue(sessionId, () => this.refreshIndex(sessionId, false));
     return pendingSessionSubmissions(state.submissionRecords);
-  }
-
-  private async appendContextProjection(sessionId: string, state: SessionAppendIndex, projection: SessionContextProjection): Promise<void> {
-    await appendJsonlRecord(this.filePath(sessionId), projection);
-    state.contextProjections.push(projection);
-    state.completeBytes += recordBytes(projection);
   }
 
   private async appendRecord(sessionId: string, state: SessionAppendIndex, record: SessionBranchEntry | SessionSubmissionRecord): Promise<void> {
@@ -358,7 +347,6 @@ export class JsonlSessionRepository implements SessionRepository {
       this.fullScans += 1;
       index.branchEntries.splice(0, index.branchEntries.length, ...state.branchEntries);
       index.projections.splice(0, index.projections.length, ...state.projections);
-      index.contextProjections.splice(0, index.contextProjections.length, ...state.contextProjections);
       index.submissionRecords.splice(0, index.submissionRecords.length, ...state.submissionRecords);
       index.completeBytes = committed.completeBytes;
       index.boundaryMarker = await jsonlBoundaryMarker(filePath, index.completeBytes);
@@ -376,7 +364,6 @@ export class JsonlSessionRepository implements SessionRepository {
       const value = parseJson({ ...line, line: actualLine }, filePath);
       try {
         if (isJsonObject(value) && value.type === 'final') index.projections.push(parseFinalProjection(value));
-        else if (isJsonObject(value) && value.type === 'context') index.contextProjections.push(parseContextProjection(value));
         else if (isJsonObject(value) && typeof value.type === 'string' && value.type.startsWith('submission.')) index.submissionRecords.push(parseSubmissionRecord(value));
         else {
           const entry = parseBranchEntry(value);
@@ -410,13 +397,13 @@ export class JsonlSessionRepository implements SessionRepository {
   }
 }
 
-interface SessionFileState { readonly header: SessionHeader; readonly branchEntries: SessionBranchEntry[]; readonly projections: SessionFinalProjection[]; readonly contextProjections: SessionContextProjection[]; readonly submissionRecords: SessionSubmissionRecord[] }
+interface SessionFileState { readonly header: SessionHeader; readonly branchEntries: SessionBranchEntry[]; readonly projections: SessionFinalProjection[]; readonly submissionRecords: SessionSubmissionRecord[] }
 interface SessionAppendIndex extends SessionFileState { completeBytes: number; boundaryMarker: string; storageStamp: JsonlStorageStamp }
 function sessionUpdatedAt(state: SessionFileState): string {
-  return [...state.branchEntries, ...state.projections, ...state.contextProjections, ...state.submissionRecords]
+  return [...state.branchEntries, ...state.projections, ...state.submissionRecords]
     .reduce((latest, entry) => entry.timestamp > latest ? entry.timestamp : latest, state.header.timestamp);
 }
-function sessionRecordCount(state: SessionFileState): number { return state.branchEntries.length + state.projections.length + state.contextProjections.length + state.submissionRecords.length; }
+function sessionRecordCount(state: SessionFileState): number { return state.branchEntries.length + state.projections.length + state.submissionRecords.length; }
 
 async function readSessionFile(filePath: string, sessionId: string): Promise<{ readonly state: SessionFileState; readonly completeBytes: number }> {
   const committed = await readJsonlCommittedFile(filePath);
@@ -429,14 +416,12 @@ async function readSessionFile(filePath: string, sessionId: string): Promise<{ r
   catch (error) { throw corruption(filePath, 1, 0, errorMessage(error), 'invalid_header'); }
   const branchEntries: SessionBranchEntry[] = [];
   const projections: SessionFinalProjection[] = [];
-  const contextProjections: SessionContextProjection[] = [];
   const submissionRecords: SessionSubmissionRecord[] = [];
   for (const line of lines.slice(1)) {
     if (line.text.trim().length === 0) continue;
     const value = parseJson(line, filePath);
     try {
       if (isJsonObject(value) && value.type === 'final') projections.push(parseFinalProjection(value));
-      else if (isJsonObject(value) && value.type === 'context') contextProjections.push(parseContextProjection(value));
       else if (isJsonObject(value) && typeof value.type === 'string' && value.type.startsWith('submission.')) submissionRecords.push(parseSubmissionRecord(value));
       else branchEntries.push(parseBranchEntry(value));
     } catch (error) { throw corruption(filePath, line.line, line.byteOffset, errorMessage(error), 'invalid_record'); }
@@ -447,12 +432,13 @@ async function readSessionFile(filePath: string, sessionId: string): Promise<{ r
     const last = lines.at(-1);
     throw corruption(filePath, last?.line ?? 1, last?.byteOffset ?? 0, errorMessage(error), 'invalid_record');
   }
-  return { state: { header, branchEntries, projections, contextProjections, submissionRecords }, completeBytes: committed.completeBytes };
+  return { state: { header, branchEntries, projections, submissionRecords }, completeBytes: committed.completeBytes };
 }
 
 function parseBranchEntry(value: JsonValue): SessionBranchEntry {
   if (!isRecord(value) || !validBaseEntry(value)) throw new Error('Session entry base is invalid.');
   if (isSessionInputEntry(value)) return value;
+  if (isSessionSteeringEntry(value)) return value;
   if (isSessionAssistantEntry(value)) return value;
   if (isSessionToolCallEntry(value)) return value;
   if (isSessionObservationEntry(value)) return value;
@@ -462,36 +448,11 @@ function parseBranchEntry(value: JsonValue): SessionBranchEntry {
   throw new Error(`Unsupported or malformed session entry: ${typeof value.type === 'string' ? value.type : 'unknown'}`);
 }
 function parseFinalProjection(value: JsonObject): SessionFinalProjection {
-  if (typeof value.id !== 'string' || typeof value.timestamp !== 'string' || typeof value.runId !== 'string' || typeof value.finalizationId !== 'string') throw new Error('Final projection identity is invalid.');
+  if (typeof value.id !== 'string' || typeof value.timestamp !== 'string' || typeof value.throughEntryId !== 'string' || typeof value.runId !== 'string' || typeof value.finalizationId !== 'string') throw new Error('Final projection identity is invalid.');
   if (!isJsonObject(value.terminal)) throw new Error('Final projection terminal is invalid.');
   const terminal = decodeOwnedAgentTerminalSnapshot(value.terminal);
   if (terminal.runId !== value.runId || terminal.finalizationId !== value.finalizationId) throw new Error('Final projection identity conflicts with terminal snapshot.');
-  return Object.freeze({ type: 'final', id: value.id, timestamp: value.timestamp, runId: value.runId, finalizationId: value.finalizationId, terminal });
-}
-function parseContextProjection(value: JsonObject): SessionContextProjection {
-  if (typeof value.id !== 'string' || typeof value.timestamp !== 'string' || typeof value.throughEntryId !== 'string' || typeof value.throughFinalizationId !== 'string' || typeof value.historyDigest !== 'string') throw new Error('Context projection identity is invalid.');
-  if (!Array.isArray(value.recentTurns)) throw new Error('Context projection turn digests are invalid.');
-  return Object.freeze({
-    type: 'context',
-    id: value.id,
-    timestamp: value.timestamp,
-    throughEntryId: value.throughEntryId,
-    throughFinalizationId: value.throughFinalizationId,
-    historyDigest: value.historyDigest,
-    recentTurns: Object.freeze(value.recentTurns.map(parseSessionTurnDigest))
-  });
-}
-function parseSessionTurnDigest(value: unknown): SessionContextProjection['recentTurns'][number] {
-  if (!isRecord(value) || typeof value.runId !== 'string' || typeof value.finalizationId !== 'string' || typeof value.task !== 'string' || typeof value.status !== 'string' || (value.result !== undefined && typeof value.result !== 'string')) {
-    throw new Error('Context projection turn digest is invalid.');
-  }
-  return Object.freeze({
-    runId: value.runId,
-    finalizationId: value.finalizationId,
-    task: value.task,
-    status: value.status,
-    ...(typeof value.result === 'string' ? { result: value.result } : {})
-  });
+  return Object.freeze({ type: 'final', id: value.id, timestamp: value.timestamp, throughEntryId: value.throughEntryId, runId: value.runId, finalizationId: value.finalizationId, terminal });
 }
 function activeBranch(entries: readonly SessionBranchEntry[], leafId: string | null): SessionBranchEntry[] {
   const byId = new Map(entries.map((entry) => [entry.id, entry])); const output: SessionBranchEntry[] = []; let cursor = leafId;
@@ -499,39 +460,23 @@ function activeBranch(entries: readonly SessionBranchEntry[], leafId: string | n
   return output.reverse();
 }
 function branchLeaf(entries: readonly SessionBranchEntry[]): string | null { return entries.at(-1)?.id ?? null; }
-function contextProjectionForTerminal(state: SessionFileState, terminal: AgentTerminalSnapshot): SessionContextProjection {
-  const throughEntryId = branchLeaf(state.branchEntries);
-  if (!throughEntryId) throw new Error('Cannot project a final without a session branch entry.');
-  const branch = activeBranch(state.branchEntries, throughEntryId);
-  if (!branch.some((entry) => entry.type === 'input' && entry.runId === terminal.runId)) {
-    throw new Error(`Cannot project finalization ${terminal.finalizationId}: run ${terminal.runId} is not on the active session branch.`);
-  }
-  const branchIds = new Set(branch.map((entry) => entry.id));
-  const previous = [...state.contextProjections].reverse().find((projection) => branchIds.has(projection.throughEntryId));
-  let compactionIndex = -1;
-  for (let index = branch.length - 1; index >= 0; index -= 1) {
-    if (branch[index]?.type === 'compaction') { compactionIndex = index; break; }
-  }
-  const previousIndex = previous ? branch.findIndex((entry) => entry.id === previous.throughEntryId) : -1;
-  const candidate = compactionIndex > previousIndex ? branch[compactionIndex] : undefined;
-  const compaction = candidate?.type === 'compaction' ? candidate : undefined;
-  return createSessionContextProjection({ branchEntries: branch, terminal, throughEntryId,
-    ...(compaction ? { baseSummary: compaction.summary } : previous ? { previous } : {}) });
-}
 function sessionFromState(state: SessionFileState): SessionDescriptor { return Object.freeze({ id: state.header.id, header: state.header, leafId: branchLeaf(state.branchEntries) }); }
 function baseEntry(parentId: string | null): BaseSessionEntry { return { id: randomUUID(), parentId, timestamp: new Date().toISOString() }; }
 function validateParents(entries: readonly SessionBranchEntry[], filePath: string): void {
   const ids = new Set<string>();
   for (const entry of entries) { if (ids.has(entry.id)) throw new Error(`Duplicate session entry ${entry.id} in ${filePath}.`); if (entry.parentId !== null && !ids.has(entry.parentId)) throw new Error(`Unknown parent ${entry.parentId} in ${filePath}.`); ids.add(entry.id); }
 }
+const SESSION_HEADER_FIELDS = new Set(['type', 'version', 'id', 'timestamp', 'parentSessionId', 'provider', 'model']);
+
 function parseSessionHeader(value: JsonValue, sessionId: string): SessionHeader {
   if (!isJsonObject(value) || value.type !== 'session' || value.version !== 1 || value.id !== sessionId
-    || typeof value.timestamp !== 'string' || typeof value.workspaceRoot !== 'string'
+    || Object.keys(value).some((key) => !SESSION_HEADER_FIELDS.has(key))
+    || typeof value.timestamp !== 'string'
     || (value.parentSessionId !== undefined && typeof value.parentSessionId !== 'string')
     || (value.provider !== undefined && typeof value.provider !== 'string')
     || (value.model !== undefined && typeof value.model !== 'string')) throw new Error('Session header is invalid.');
   return Object.freeze({
-    type: 'session', version: 1, id: value.id, timestamp: value.timestamp, workspaceRoot: value.workspaceRoot,
+    type: 'session', version: 1, id: value.id, timestamp: value.timestamp,
     ...(value.parentSessionId === undefined ? {} : { parentSessionId: value.parentSessionId }),
     ...(value.provider === undefined ? {} : { provider: value.provider }),
     ...(value.model === undefined ? {} : { model: value.model })
@@ -588,7 +533,6 @@ function parseJson(line: JsonlLine, storage: string): JsonValue {
   catch (error) { throw corruption(storage, line.line, line.byteOffset, errorMessage(error), 'invalid_json'); }
 }
 function corruption(storage: string, line: number, byteOffset: number, message: string, code: PersistenceCorruptionError['code']): PersistenceCorruptionError { return new PersistenceCorruptionError({ code, storage, line, byteOffset, message }); }
-async function canonicalWorkspaceRoot(rootDir: string): Promise<string> { return fs.realpath(path.resolve(rootDir)); }
 function assertIdentifier(value: string): void { if (!/^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/u.test(value)) throw new Error('Invalid session id.'); }
 function positiveInteger(value: number, name: string): number { if (!Number.isInteger(value) || value < 1) throw new Error(`${name} must be positive.`); return value; }
 function nonnegativeInteger(value: unknown): value is number { return typeof value === 'number' && Number.isInteger(value) && value >= 0; }
@@ -606,6 +550,9 @@ function isEffectiveInstruction(value: unknown): value is AgentEffectiveInstruct
 function isSessionInputEntry(value: Record<string, unknown> & BaseSessionEntry): value is Record<string, unknown> & SessionInputEntry {
   return value.type === 'input' && typeof value.runId === 'string' && value.runId.length > 0 && typeof value.task === 'string'
     && Array.isArray(value.instructions) && value.instructions.every(isEffectiveInstruction);
+}
+function isSessionSteeringEntry(value: Record<string, unknown> & BaseSessionEntry): value is Record<string, unknown> & SessionSteeringEntry {
+  return value.type === 'steering' && typeof value.runId === 'string' && value.runId.length > 0 && typeof value.content === 'string' && value.content.length > 0;
 }
 function isSessionAssistantEntry(value: Record<string, unknown> & BaseSessionEntry): value is Record<string, unknown> & SessionAssistantEntry {
   return value.type === 'assistant' && validTurnIdentity(value) && typeof value.runId === 'string' && value.runId.length > 0 && typeof value.content === 'string';

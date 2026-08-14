@@ -54,7 +54,7 @@ test('durable event and session JSONL redact tool, metadata, failure, and proces
   await Promise.all([mkdir(runsDir), mkdir(sessionsDir), mkdir(artifactsDir)]);
   const events = new JsonlEventRepository({ rootDir: runsDir, codec: agentEventCodec });
   const sessions = new JsonlSessionRepository({ rootDir: sessionsDir });
-  const session = await sessions.create({ workspaceRoot: root, provider: 'scripted', model: 'scripted' });
+  const session = await sessions.create({ provider: 'scripted', model: 'scripted' });
   const artifacts = new LocalArtifactRepository({ rootDir: artifactsDir });
   const manager = new ProcessManager({ artifactRepository: artifacts, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
   const agent = new AgentRuntime({

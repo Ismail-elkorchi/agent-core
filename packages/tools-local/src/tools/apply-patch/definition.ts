@@ -1,6 +1,7 @@
-import { defineTool, isRiskAllowed, PATCH_JOURNAL_SCOPE, requireWorkspaceRoot, ToolInputError, workspaceFileScope } from '@agent-core/tools';
+import { defineTool, isRiskAllowed, PATCH_JOURNAL_SCOPE, ToolInputError, workspaceFileScope } from '@agent-core/tools';
 import { canonicalWorkspacePath } from '../../core/filesystem.js';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
+import { requireWorkspaceRoot } from '../../core/workspace.js';
 import { presentApplyPatchObservation } from '../../core/presenters.js';
 import { APPLY_PATCH_LARK_GRAMMAR } from './grammar.js';
 import { parseApplyPatch, type ParsedApplyPatch } from './patch-parser.js';

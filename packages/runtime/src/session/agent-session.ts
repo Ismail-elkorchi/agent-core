@@ -4,7 +4,7 @@ import type { AgentProgressEvent } from '../events.js';
 import type { AgentRunResult } from '../run/contracts.js';
 import type {
   SessionCompactionEntry,
-  SessionContextProjection,
+  SessionBranchMarkerEntry,
   SessionConversationItem,
   SessionDescriptor,
   SessionPendingSubmission,
@@ -27,7 +27,6 @@ export interface AgentSessionState {
 export interface AgentSessionCompactionRequest {
   readonly configuration: AgentSessionConfiguration;
   readonly conversation: readonly SessionConversationItem[];
-  readonly contextProjection?: SessionContextProjection;
 }
 
 export type AgentSessionEvent =
@@ -108,6 +107,7 @@ export class AgentSession {
       if (delivery === 'steer') {
         if (!this.active) return { kind: 'rejected', reason: 'no_active_run' };
         if (options.expectedRunId !== undefined && options.expectedRunId !== this.active.control.runId) return { kind: 'rejected', reason: 'run_mismatch' };
+        await this.options.repository.appendSteering(this.options.descriptor.id, { runId: this.active.control.runId, content: task });
         this.active.control.injectSteering({ instruction: task });
         return { kind: 'steered', submissionId, runId: this.active.control.runId, completion: this.active.pending.completion };
       }
@@ -134,7 +134,6 @@ export class AgentSession {
       if (this.active || this.suspended || this.queued.length > 0) throw new Error('Session compaction requires an idle session with no queued work.');
       this.compacting = true;
       try {
-        const replay = await this.options.repository.loadReplayState(this.options.descriptor.id);
         const entireConversation = await this.options.repository.readConversation(this.options.descriptor.id);
         let previousCompaction = -1;
         for (let index = entireConversation.length - 1; index >= 0; index -= 1) {
@@ -142,8 +141,7 @@ export class AgentSession {
         }
         if (entireConversation.length === 0 || previousCompaction === entireConversation.length - 1) throw new Error('Session compaction requires new completed conversation history.');
         const conversation = Object.freeze(entireConversation.slice(Math.max(0, previousCompaction)));
-        const summary = await this.options.summarizeConversation({ configuration: this.configuration, conversation,
-          ...(replay.contextProjection === undefined ? {} : { contextProjection: replay.contextProjection }) });
+        const summary = await this.options.summarizeConversation({ configuration: this.configuration, conversation });
         const compaction = await this.options.repository.appendCompaction(this.options.descriptor.id, {
           summary, provider: this.configuration.provider, model: this.configuration.model
         });
@@ -152,6 +150,14 @@ export class AgentSession {
       } finally {
         this.compacting = false;
       }
+    });
+  }
+
+  branchFrom(entryId: string, label?: string): Promise<SessionBranchMarkerEntry> {
+    return this.serial(async () => {
+      await this.restorePending();
+      if (this.active || this.suspended || this.compacting || this.queued.length > 0) throw new Error('Session branching requires an idle session with no queued work.');
+      return this.options.repository.branchFrom(this.options.descriptor.id, entryId, label);
     });
   }
 

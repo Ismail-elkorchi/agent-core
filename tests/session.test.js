@@ -11,14 +11,14 @@ test('session repository initializes a missing nested root before acquiring its 
   const parent = await mkdtemp(path.join(tmpdir(), 'agent-session-missing-root-'));
   const rootDir = path.join(parent, 'missing', 'nested');
   const repository = new JsonlSessionRepository({ rootDir });
-  const session = await repository.create({ id: 'created', workspaceRoot: process.cwd() });
+  const session = await repository.create({ id: 'created' });
   assert.equal((await repository.open(session.id)).id, 'created');
 });
 
 test('concurrent session appends preserve one parent chain and leaf', async () => {
   const rootDir = await mkdtemp(path.join(tmpdir(), 'agent-session-concurrent-'));
   const repository = new JsonlSessionRepository({ rootDir });
-  const session = await repository.create({ id: 'concurrent', workspaceRoot: process.cwd() });
+  const session = await repository.create({ id: 'concurrent' });
   await Promise.all(Array.from({ length: 30 }, (_, index) => repository.appendInput(session.id, { runId: `run-${index}`, task: `task ${index}` })));
   const replay = await repository.loadReplayState(session.id);
   assert.equal(replay.branch.length, 30);
@@ -31,7 +31,7 @@ test('session repositories scan once and incrementally preserve a cross-instance
   const rootDir = await mkdtemp(path.join(tmpdir(), 'agent-session-index-'));
   const first = new JsonlSessionRepository({ rootDir });
   const second = new JsonlSessionRepository({ rootDir });
-  const session = await first.create({ id: 'indexed', workspaceRoot: process.cwd() });
+  const session = await first.create({ id: 'indexed' });
   await second.open(session.id);
   // Force each warm index to ingest one record from the other writer before the
   // concurrent burst. Lock scheduling may otherwise let one repository finish
@@ -55,7 +55,7 @@ test('session repositories scan once and incrementally preserve a cross-instance
 test('session observations normalize hostile output and metadata before durable replay', async () => {
   const rootDir = await mkdtemp(path.join(tmpdir(), 'agent-session-hostile-json-'));
   const repository = new JsonlSessionRepository({ rootDir });
-  const session = await repository.create({ id: 'hostile-json', workspaceRoot: process.cwd() });
+  const session = await repository.create({ id: 'hostile-json' });
   await repository.appendInput(session.id, { runId: 'run-hostile', task: 'persist hostile observation' });
   let getterCalls = 0;
   const output = Object.create(null);
@@ -83,7 +83,7 @@ test('session repositories retain and expose only owned session state', async ()
   const rootDir = await mkdtemp(path.join(tmpdir(), 'agent-session-owned-'));
   const repositories = [new InMemorySessionRepository(), new JsonlSessionRepository({ rootDir })];
   for (const [index, repository] of repositories.entries()) {
-    const session = await repository.create({ id: `owned-${String(index)}`, workspaceRoot: process.cwd(), model: 'original' });
+    const session = await repository.create({ id: `owned-${String(index)}`, model: 'original' });
     const instruction = { id: 'instruction', content: 'original', provenance: 'run' };
     const input = await repository.appendInput(session.id, { runId: 'run', task: 'original', instructions: [instruction] });
     instruction.content = 'mutated';
@@ -109,7 +109,7 @@ test('session repositories retain and expose only owned session state', async ()
 test('session final projections are idempotent and validate the complete terminal union', async () => {
   const rootDir = await mkdtemp(path.join(tmpdir(), 'agent-session-final-'));
   const repository = new JsonlSessionRepository({ rootDir });
-  const session = await repository.create({ id: 'final', workspaceRoot: process.cwd() });
+  const session = await repository.create({ id: 'final' });
   await repository.appendInput(session.id, { runId: 'run', task: 'finish the run' });
   const terminal = decodeAgentTerminalSnapshot({
     runId: 'run', finalizationId: 'fin', phase: 'ended', executionStatus: 'completed', verificationStatus: 'not_required', terminationReason: 'model_completed', modelTerminationReason: 'stop',
@@ -121,16 +121,16 @@ test('session final projections are idempotent and validate the complete termina
   assert.equal(first.id, second.id);
   const replay = await repository.loadReplayState(session.id);
   assert.equal(replay.terminalProjections.length, 1);
-  assert.equal(replay.contextProjection?.recentTurns.at(-1)?.task, 'finish the run');
+  assert.equal(first.throughEntryId, replay.branch[0].id);
 
   const file = repository.location(session.id);
   await writeFile(file, `${await readFile(file, 'utf8')}${JSON.stringify({ type: 'final', id: 'bad', timestamp: new Date().toISOString(), runId: 'bad', finalizationId: 'bad', terminal: { ...terminal, runId: 'bad', finalizationId: 'bad', candidate: { status: 'absent' } } })}\n`, 'utf8');
   await assert.rejects(repository.open(session.id), error => error instanceof PersistenceCorruptionError && error.code === 'invalid_record');
 });
 
-test('session replay remains compact after hundreds of completed turns', async () => {
+test('session replay derives bounded continuity without persisted context records', async () => {
   const repository = new InMemorySessionRepository();
-  const session = await repository.create({ id: 'long-session', workspaceRoot: process.cwd() });
+  const session = await repository.create({ id: 'long-session' });
   for (let index = 0; index < 300; index += 1) {
     const runId = `run-${String(index)}`;
     await repository.appendInput(session.id, { runId, task: `${'任務'.repeat(600)} ${String(index)}` });
@@ -139,18 +139,14 @@ test('session replay remains compact after hundreds of completed turns', async (
 
   const replay = await repository.loadReplayState(session.id);
   assert.equal(replay.branch.length, 300, 'the durable branch retains every input');
-  assert.equal(replay.terminalProjections.length, 1, 'replay exposes only terminal state relevant after the checkpoint');
+  assert.equal(replay.terminalProjections.length, 300, 'final projections remain authoritative inputs to derived continuity');
   assert.deepEqual(replay.ledgerRunIds, ['run-299']);
-  assert.equal(replay.contextProjection?.recentTurns.length, 8);
-  assert.equal(Buffer.byteLength(JSON.stringify(replay.contextProjection), 'utf8') < 64 * 1024, true);
-  assert.equal(Buffer.byteLength(replay.contextProjection?.recentTurns.at(-1)?.task ?? '', 'utf8') <= 800, true);
-  assert.equal(Buffer.byteLength(replay.contextProjection?.recentTurns.at(-1)?.result ?? '', 'utf8') <= 1_200, true);
 });
 
 test('session JSONL tolerates a torn tail and identifies middle corruption', async () => {
   const rootDir = await mkdtemp(path.join(tmpdir(), 'agent-session-torn-'));
   const repository = new JsonlSessionRepository({ rootDir });
-  const session = await repository.create({ id: 'torn', workspaceRoot: process.cwd() });
+  const session = await repository.create({ id: 'torn' });
   await repository.appendInput(session.id, { runId: 'run', task: 'task' });
   const file = repository.location(session.id);
   await writeFile(file, `${await readFile(file, 'utf8')}{"type":`, 'utf8');
@@ -164,7 +160,7 @@ test('session JSONL tolerates a torn tail and identifies middle corruption', asy
 test('session JSONL indexes only newline-committed records and repairs arbitrarily large torn tails', async () => {
   const rootDir = await mkdtemp(path.join(tmpdir(), 'agent-session-committed-prefix-'));
   let repository = new JsonlSessionRepository({ rootDir });
-  let session = await repository.create({ id: 'valid-tail', workspaceRoot: process.cwd() });
+  let session = await repository.create({ id: 'valid-tail' });
   await repository.appendInput(session.id, { runId: 'one', task: 'one' });
   await repository.appendInput(session.id, { runId: 'uncommitted', task: 'uncommitted' });
   const validFile = repository.location(session.id);
@@ -178,7 +174,7 @@ test('session JSONL indexes only newline-committed records and repairs arbitrari
   assert.equal(replay.branch[1].parentId, replay.branch[0].id);
 
   repository = new JsonlSessionRepository({ rootDir });
-  session = await repository.create({ id: 'large-tail', workspaceRoot: process.cwd() });
+  session = await repository.create({ id: 'large-tail' });
   await repository.appendInput(session.id, { runId: 'one', task: 'one' });
   await appendFile(repository.location(session.id), 'x'.repeat(70 * 1024));
   await new JsonlSessionRepository({ rootDir }).appendInput(session.id, { runId: 'two', task: 'two' });
@@ -190,7 +186,7 @@ test('session JSONL indexes only newline-committed records and repairs arbitrari
 test('session JSONL owns queued configuration and validates submission lifecycle recovery', async () => {
   const rootDir = await mkdtemp(path.join(tmpdir(), 'agent-session-submissions-'));
   let repository = new JsonlSessionRepository({ rootDir });
-  const session = await repository.create({ id: 'submissions', workspaceRoot: process.cwd() });
+  const session = await repository.create({ id: 'submissions' });
   await repository.enqueueSubmission(session.id, {
     submissionId: 'submission', runId: 'run', input: { task: 'persisted task' },
     configuration: { provider: 'test', model: 'captured-model', reasoning: { strategy: 'effort', effort: 'high' }, responseFormat: { type: 'json_schema', schema: { type: 'object' } } }
@@ -244,7 +240,7 @@ test('AgentSession serializes admission, preserves steering identity, and snapsh
   const configurations = [];
   const controls = [];
   const repository = new InMemorySessionRepository();
-  const descriptor = await repository.create({ id: 'session-authority', workspaceRoot: process.cwd() });
+  const descriptor = await repository.create({ id: 'session-authority' });
   const session = new AgentSession({
     descriptor,
     repository,
@@ -294,12 +290,13 @@ test('AgentSession serializes admission, preserves steering identity, and snapsh
 
 test('session branches require stable boundaries and conversation projects assistant turns once', async () => {
   const repository = new InMemorySessionRepository();
-  const session = await repository.create({ id: 'stable-branch', workspaceRoot: process.cwd() });
+  const session = await repository.create({ id: 'stable-branch' });
   const input = await repository.appendInput(session.id, { runId: 'run', task: 'work' });
   await assert.rejects(repository.branchFrom(session.id, input.id), /completed final or compaction/u);
   await repository.appendAssistant(session.id, {
     runId: 'run', identity: { turnIndex: 1, turnId: 'turn', requestAttempt: 1 }, content: 'answer'
   });
+  await repository.appendSteering(session.id, { runId: 'run', content: 'preserve this accepted correction' });
   await assert.rejects(repository.appendAssistant(session.id, {
     runId: 'run', identity: { turnIndex: 1, turnId: 'turn', requestAttempt: 1 }, content: 'conflicting answer'
   }), /Conflicting assistant projection/u);
@@ -312,11 +309,12 @@ test('session branches require stable boundaries and conversation projects assis
   await repository.branchFrom(session.id, points[0].entryId);
   const conversation = await repository.readConversation(session.id);
   assert.equal(conversation.filter((entry) => entry.type === 'assistant').length, 1);
+  assert.equal(conversation.filter((entry) => entry.type === 'steering').length, 1);
 });
 
 test('AgentSession recovers queued work but records claimed work as uncertain instead of retrying it', async () => {
   const repository = new InMemorySessionRepository();
-  const descriptor = await repository.create({ id: 'durable-admission', workspaceRoot: process.cwd() });
+  const descriptor = await repository.create({ id: 'durable-admission' });
   const blocked = new AgentSession({
     descriptor, repository, configuration: { provider: 'test', model: 'model' },
     createRuntime() {
@@ -349,7 +347,7 @@ test('AgentSession recovers queued work but records claimed work as uncertain in
 
 test('semantic compaction is persisted once and becomes the replay base', async () => {
   const repository = new InMemorySessionRepository();
-  const descriptor = await repository.create({ id: 'semantic-compaction', workspaceRoot: process.cwd() });
+  const descriptor = await repository.create({ id: 'semantic-compaction' });
   await repository.appendInput(descriptor.id, { runId: 'run', task: 'retain this decision' });
   await repository.appendAssistant(descriptor.id, { runId: 'run', identity: { turnIndex: 1, turnId: 'turn', requestAttempt: 1 }, content: 'decision retained' });
   await repository.projectFinal(descriptor.id, completedTerminal('run', 'final', 'decision retained'));
@@ -375,7 +373,7 @@ test('semantic compaction is persisted once and becomes the replay base', async 
 
 test('approval suspension remains durable and blocks queued follow-ups until resolution', async () => {
   const repository = new InMemorySessionRepository();
-  const descriptor = await repository.create({ id: 'durable-suspension', workspaceRoot: process.cwd() });
+  const descriptor = await repository.create({ id: 'durable-suspension' });
   let resolveFirst;
   const firstProcess = new AgentSession({
     descriptor, repository, configuration: { provider: 'test', model: 'model' },
@@ -412,12 +410,12 @@ test('approval suspension remains durable and blocks queued follow-ups until res
 });
 test('session listing orders sessions by latest committed activity', async () => {
   const repository = new InMemorySessionRepository();
-  const first = await repository.create({ id: 'first', workspaceRoot: '/workspace' });
+  const first = await repository.create({ id: 'first' });
   await new Promise(resolve => setTimeout(resolve, 2));
-  await repository.create({ id: 'second', workspaceRoot: '/workspace' });
+  await repository.create({ id: 'second' });
   await new Promise(resolve => setTimeout(resolve, 2));
   await repository.appendInput(first.id, { runId: 'run', task: 'recent activity' });
-  const sessions = await repository.list('/workspace');
+  const sessions = await repository.list();
   assert.equal(sessions[0].id, first.id);
   assert.ok(sessions[0].updatedAt >= sessions[0].timestamp);
 });

@@ -31,6 +31,7 @@ import {
   type AgentCheckDefinition,
   type AgentCheckResult,
   type AgentEffectiveInstruction,
+  type AgentExactRequestRecord,
   type AgentPresentCandidate,
   type AgentRequestSnapshotRecord,
   type AgentRunLimits,
@@ -144,6 +145,7 @@ export interface AgentRuntimeOptions {
   readonly retryPolicy?: Partial<AgentRunRetryPolicy>;
   readonly clock?: AgentClock;
   readonly onProgress?: (event: AgentProgressEvent) => void | Promise<void>;
+  readonly recordRequest?: (record: AgentExactRequestRecord) => void | Promise<void>;
 }
 
 export interface AgentRunInput {
@@ -708,6 +710,10 @@ export class AgentRuntime {
     for (let attempt = 0; attempt <= turnRequest.controller.retryPolicy.retriesPerRequest; attempt += 1) {
       const identity = { ...turnIdentity(turnRequest.snapshot.record), requestAttempt: attempt + 1 };
       await append({ type: 'turn.snapshot.created', snapshot: { ...turnRequest.snapshot.record, requestAttempt: identity.requestAttempt } });
+      if (this.options.recordRequest) {
+        const ownedRequest = recordableModelRequest(request);
+        await this.options.recordRequest(Object.freeze({ ...identity, requestId: requestSnapshot.requestId, request: ownedRequest }));
+      }
       await append({ type: 'request.snapshot.created', snapshot: { ...requestSnapshot, requestAttempt: identity.requestAttempt } });
       await append({ type: 'model.requested', ...identity, request: requestSummary });
       const deadline = runDeadline(turnRequest.controller, request);
@@ -1017,6 +1023,24 @@ function runDeadline(controller: AgentRunController, request: ModelRequest): { r
     get error() { return deadlineError; },
     dispose: () => { clearTimeout(timer); }
   };
+}
+
+function recordableModelRequest(request: ModelRequest): Omit<ModelRequest, 'signal'> {
+  return createModelRequest({
+    model: request.model,
+    messages: request.messages,
+    ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
+    ...(request.topP === undefined ? {} : { topP: request.topP }),
+    ...(request.maxOutputTokens === undefined ? {} : { maxOutputTokens: request.maxOutputTokens }),
+    ...(request.responseFormat === undefined ? {} : { responseFormat: request.responseFormat }),
+    ...(request.tools === undefined ? {} : { tools: request.tools }),
+    ...(request.keepAlive === undefined ? {} : { keepAlive: request.keepAlive }),
+    ...(request.reasoning === undefined ? {} : { reasoning: request.reasoning }),
+    ...(request.logprobs === undefined ? {} : { logprobs: request.logprobs }),
+    ...(request.topLogprobs === undefined ? {} : { topLogprobs: request.topLogprobs }),
+    ...(request.providerOptions === undefined ? {} : { providerOptions: request.providerOptions }),
+    ...(request.metadata === undefined ? {} : { metadata: request.metadata })
+  });
 }
 
 function runSignalDeadline(controller: AgentRunController, parentSignal: AbortSignal): { readonly signal: AbortSignal; readonly dispose: () => void } {

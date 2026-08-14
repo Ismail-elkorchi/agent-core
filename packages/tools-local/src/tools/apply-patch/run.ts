@@ -1,8 +1,9 @@
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { workspaceResource, type EvidenceAction, type ToolEvidenceItem } from '@agent-core/evidence';
-import { PATCH_JOURNAL_SCOPE, requireToolService, requireWorkspaceRoot, throwIfAborted, ToolInputError, workspaceFileScope, type ToolExecutionContext } from '@agent-core/tools';
+import { PATCH_JOURNAL_SCOPE, requireToolService, throwIfAborted, ToolInputError, workspaceFileScope, type ToolExecutionContext } from '@agent-core/tools';
 import type { ToolObservationInput } from '@agent-core/tools';
+import { requireWorkspaceRoot } from '../../core/workspace.js';
 import {
   byteLengthUtf8,
   inspectTextFile,
