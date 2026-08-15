@@ -416,7 +416,8 @@ test('reconciliation never signals a PID without authenticated supervisor identi
     workspaceRoot: root,
     artifactDirectory: path.join(root, 'artifacts'),
     processLedgerDirectory: ledgerDirectory,
-    patchTransactionDirectory: path.join(root, 'patch-transactions')
+    patchTransactionDirectory: path.join(root, 'patch-transactions'),
+    enabledTools: ['exec_command', 'write_stdin', 'stop_process']
   });
   await host.ready();
   const reconciliation = await host.reconciliation();
@@ -483,6 +484,7 @@ test('local host durably hands recovered terminal reports to old runs during sta
     artifactDirectory: path.join(root, 'host-artifacts'),
     processLedgerDirectory: path.join(root, 'processes'),
     patchTransactionDirectory: path.join(root, 'patch-transactions'),
+    enabledTools: ['exec_command', 'write_stdin', 'stop_process'],
     async deliverRecoveredTerminalReport(report) { delivered.push(report); return true; }
   });
   await host.ready();

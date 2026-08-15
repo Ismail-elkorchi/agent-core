@@ -18,10 +18,10 @@ import { writeStdinTool } from './tools/write-stdin/index.js';
 export interface LocalToolHostOptions {
   readonly workspaceRoot: string;
   readonly artifactDirectory: string;
-  readonly processLedgerDirectory: string;
+  readonly processLedgerDirectory?: string;
   readonly patchTransactionDirectory?: string;
   readonly configuration?: LocalToolConfiguration;
-  readonly enabledTools?: readonly string[];
+  readonly enabledTools: readonly string[];
   readonly ptyFactory?: PtyProcessFactory;
   readonly deliverRecoveredTerminalReport?: (report: ProcessTerminalReport) => Promise<boolean>;
 }
@@ -32,13 +32,13 @@ export interface LocalToolHost {
     readonly workspaceRoot: string;
     readonly artifactRepository: LocalArtifactRepository;
     readonly localToolConfiguration: LocalToolConfiguration;
-    readonly processManager: ProcessManager;
+    readonly processManager?: ProcessManager;
     readonly workspaceFileSelector: WorkspaceFileSelector;
     readonly patchTransactionDirectory?: string;
   };
   readonly capabilities: readonly string[];
   readonly artifactRepository: LocalArtifactRepository;
-  readonly processManager: ProcessManager;
+  readonly processManager?: ProcessManager;
   ready(): Promise<void>;
   reconciliation(): Promise<ProcessReconciliationResult>;
   resolveReconciliation(input?: { readonly acknowledgeProcessIds?: readonly string[] }): Promise<ProcessReconciliationResult>;
@@ -48,22 +48,25 @@ export interface LocalToolHost {
 /** Compose and own the Node-local built-in tool host without application policy. */
 export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHost {
   const workspaceRoot = path.resolve(options.workspaceRoot);
+  const enabledTools = ownEnabledTools(options.enabledTools);
+  const processToolsEnabled = enabledTools.some((name) => name === 'exec_command' || name === 'write_stdin' || name === 'stop_process');
+  if (processToolsEnabled && options.processLedgerDirectory === undefined) throw new Error('Local process tools require processLedgerDirectory.');
   const configuration = options.configuration === undefined
     ? DEFAULT_LOCAL_TOOL_CONFIGURATION
     : parseLocalToolConfiguration(options.configuration);
   const artifactRepository = new LocalArtifactRepository({ rootDir: path.resolve(options.artifactDirectory) });
-  const processManager = new ProcessManager({
-    artifactRepository,
-    ledgerDirectory: path.resolve(options.processLedgerDirectory),
-    ...configuration.process,
-    ...(options.ptyFactory ? { ptyFactory: options.ptyFactory } : {})
-  });
+  const processManager = options.processLedgerDirectory === undefined ? undefined : new ProcessManager({
+      artifactRepository,
+      ledgerDirectory: path.resolve(options.processLedgerDirectory),
+      ...configuration.process,
+      ...(options.ptyFactory ? { ptyFactory: options.ptyFactory } : {})
+    });
   const workspaceFileSelector = new WorkspaceFileSelector(workspaceRoot, configuration.fileSelection);
   const services = Object.freeze({
     workspaceRoot,
     artifactRepository,
     localToolConfiguration: configuration,
-    processManager,
+    ...(processManager ? { processManager } : {}),
     workspaceFileSelector,
     ...(options.patchTransactionDirectory ? { patchTransactionDirectory: path.resolve(options.patchTransactionDirectory) } : {})
   });
@@ -73,16 +76,18 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
     readFilesTool,
     searchTextTool,
     applyPatchTool,
-    createExecCommandTool({ ptySupported: processManager.supportsPty() }),
+    createExecCommandTool({ ptySupported: processManager?.supportsPty() ?? false }),
     writeStdinTool,
     stopProcessTool,
     viewImageTool,
     readArtifactTool
   ]);
-  const tools = selectTools(allTools, options.enabledTools);
-  let reconciliation = processManager.reconcileOrphanProcesses();
+  const tools = selectTools(allTools, enabledTools);
+  const noProcesses: ProcessReconciliationResult = Object.freeze({ resolved: Object.freeze([]), unresolved: Object.freeze([]) });
+  let reconciliation = processManager?.reconcileOrphanProcesses() ?? Promise.resolve(noProcesses);
   let blocker: ToolResourceLease | undefined;
   const ensureBlocker = async (result: ProcessReconciliationResult): Promise<void> => {
+    if (!processManager) return;
     if (result.unresolved.length > 0 && !blocker) {
       blocker = await processManager.resourceLeases.acquire({
         accesses: [{ mode: 'execute', scope: 'workspace/processes' }],
@@ -93,7 +98,7 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
     if (result.unresolved.length === 0 && blocker) { blocker.release(); blocker = undefined; }
   };
   const deliverRecovered = async (): Promise<void> => {
-    if (!options.deliverRecoveredTerminalReport) return;
+    if (!processManager || !options.deliverRecoveredTerminalReport) return;
     for (const report of processManager.recoveredTerminalReports()) {
       if (await options.deliverRecoveredTerminalReport(report)) await processManager.markTerminalReported(report.result.processId);
     }
@@ -101,12 +106,13 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
   return Object.freeze({
     tools,
     services,
-    capabilities: Object.freeze([...processManager.capabilities()]),
+    capabilities: Object.freeze([...(processManager?.capabilities() ?? [])]),
     artifactRepository,
-    processManager,
+    ...(processManager ? { processManager } : {}),
     async ready() { await ensureBlocker(await reconciliation); await deliverRecovered(); },
     reconciliation: () => reconciliation,
     async resolveReconciliation(input: { readonly acknowledgeProcessIds?: readonly string[] } = {}) {
+      if (!processManager) return noProcesses;
       if (input.acknowledgeProcessIds?.length) await processManager.acknowledgeUnresolvedProcesses(input.acknowledgeProcessIds);
       reconciliation = processManager.retryOrphanReconciliation();
       const result = await reconciliation;
@@ -114,12 +120,16 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
       await deliverRecovered();
       return result;
     },
-    async close() { blocker?.release(); blocker = undefined; await processManager.close(); }
+    async close() { blocker?.release(); blocker = undefined; await processManager?.close(); }
   });
 }
 
-function selectTools(tools: readonly CompiledToolDefinition[], enabled: readonly string[] | undefined): readonly CompiledToolDefinition[] {
-  if (!enabled) return tools;
+function ownEnabledTools(enabled: readonly string[]): readonly string[] {
+  if (new Set(enabled).size !== enabled.length) throw new Error('Configured local tools must be unique.');
+  return Object.freeze([...enabled]);
+}
+
+function selectTools(tools: readonly CompiledToolDefinition[], enabled: readonly string[]): readonly CompiledToolDefinition[] {
   const known = new Set(tools.map((tool) => tool.name));
   const unknown = enabled.filter((name) => !known.has(name));
   if (unknown.length > 0) throw new Error(`Unknown configured local tools: ${unknown.join(', ')}.`);

@@ -1,7 +1,7 @@
 {
   "name": "@agent-core/tools-local",
   "version": "0.2.0",
-  "description": "Node and workspace-local coding tools for Agent Core.",
+  "description": "Optional Node-local tool implementations for Agent Core applications.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
