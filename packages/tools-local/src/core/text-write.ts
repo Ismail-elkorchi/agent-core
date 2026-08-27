@@ -1,47 +1,46 @@
-import { promises as fs } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
+import { closeSync, fchmodSync, fstatSync, readFileSync } from 'node:fs';
+import { chmod, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { hostname } from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
-import { hostname } from 'node:os';
 import { throwIfAborted } from '@agent-core/tools';
-import { assertPathIsNotSymlink, resolveInsideRoot } from './filesystem.js';
+import { openHostDirectoryWithoutAliases, openWorkspaceMutationDirectory, workspaceFileIdentitiesEqual, type WorkspaceFileIdentity, type WorkspaceFileRoot, type WorkspaceMutationDirectory } from './workspace-file-root.js';
 
-export interface PreparedTextPatchWrite {
-  path: string;
-  absolutePath: string;
-  content: string;
-  mode?: number;
-  overwrite: boolean;
-  expectedCurrentSha256?: string;
-  expectedAbsent?: true;
+const ownedJournals = new WeakSet<TextPatchJournal>();
+const MAX_JOURNAL_MANIFEST_BYTES = 16 * 1024 * 1024;
+
+interface PreparedTextPatchWriteBase {
+  readonly path: string;
+  readonly content: string;
+  readonly mode?: number;
 }
 
+export type PreparedTextPatchWrite =
+  | PreparedTextPatchWriteBase & {
+    readonly overwrite: true;
+    readonly expectedCurrentSha256: string;
+    readonly expectedCurrentIdentity: WorkspaceFileIdentity;
+  }
+  | PreparedTextPatchWriteBase & {
+    readonly overwrite: false;
+    readonly expectedAbsent: true;
+  };
+
 export interface PreparedTextPatchRemove {
-  path: string;
-  absolutePath: string;
-  expectedCurrentSha256: string;
+  readonly path: string;
+  readonly expectedCurrentSha256: string;
+  readonly expectedCurrentIdentity: WorkspaceFileIdentity;
 }
 
 export interface PreparedTextPatchTransaction {
-  writes: PreparedTextPatchWrite[];
-  removes: PreparedTextPatchRemove[];
-  parentDirsToCreate?: string[];
+  readonly writes: readonly PreparedTextPatchWrite[];
+  readonly removes: readonly PreparedTextPatchRemove[];
+  readonly parentDirsToCreate?: readonly string[];
 }
 
-export interface TextTransactionOptions {
-  readonly signal?: AbortSignal;
-  readonly fileSystem?: TextWriteFileSystem;
-  readonly journalDirectory: string;
-  readonly transactionId?: string;
-}
-
-export type TextWriteFileSystem = Pick<typeof fs, 'chmod' | 'lstat' | 'mkdir' | 'open' | 'readFile' | 'readdir' | 'rename' | 'rm' | 'rmdir' | 'writeFile'>;
-export interface TextTransactionDiagnostic {
-  readonly operation: string;
-  readonly path: string;
-  readonly message: string;
-  readonly code?: string;
-}
+export interface TextTransactionOptions { readonly signal?: AbortSignal; readonly transactionId?: string }
+export interface TextTransactionDiagnostic { readonly operation: string; readonly path: string; readonly message: string; readonly code?: string }
 export type TextTransactionRecovery =
   | { readonly status: 'succeeded'; readonly diagnostics: readonly []; readonly strandedPaths: readonly [] }
   | { readonly status: 'failed' | 'uncertain'; readonly diagnostics: readonly TextTransactionDiagnostic[]; readonly strandedPaths: readonly string[] };
@@ -51,411 +50,477 @@ export type TextTransactionResult =
   | { readonly outcome: 'rolled_back'; readonly failure: TextTransactionDiagnostic; readonly rollback: Extract<TextTransactionRecovery, { status: 'succeeded' }> }
   | { readonly outcome: 'rollback_failed'; readonly failure: TextTransactionDiagnostic; readonly rollback: Exclude<TextTransactionRecovery, { status: 'succeeded' }> };
 
-export async function commitTextFilePatchTransaction(rootDir: string, transaction: PreparedTextPatchTransaction, options: TextTransactionOptions): Promise<TextTransactionResult> {
-  return withTextFilePatchJournal(rootDir, options.journalDirectory, async (authority) => authority.commit(transaction, options));
-}
-
 export interface TextPatchJournalAuthority {
-  commit(transaction: PreparedTextPatchTransaction, options: Omit<TextTransactionOptions, 'journalDirectory'> & { readonly journalDirectory?: string }): Promise<TextTransactionResult>;
+  commit(transaction: PreparedTextPatchTransaction, options?: TextTransactionOptions): Promise<TextTransactionResult>;
 }
 
-export async function withTextFilePatchJournal<T>(
-  rootDir: string,
-  journalDirectory: string,
-  operation: (authority: TextPatchJournalAuthority) => Promise<T>,
-  signal?: AbortSignal
-): Promise<T> {
-  return withJournalLock(journalDirectory, signal, async () => {
-    await recoverTextFilePatchTransactionsUnlocked(rootDir, journalDirectory, fs);
-    const authority: TextPatchJournalAuthority = Object.freeze({
-      commit: (transaction: PreparedTextPatchTransaction, options: Omit<TextTransactionOptions, 'journalDirectory'> & { readonly journalDirectory?: string }) => commitTextFilePatchTransactionUnlocked(rootDir, transaction, { ...options, journalDirectory })
-    });
-    return operation(authority);
-  });
-}
+export class TextPatchJournal {
+  readonly #directory: string;
+  readonly #descriptor: number;
+  readonly #device: bigint;
+  readonly #inode: bigint;
+  #closed = false;
+  #activeOperations = 0;
 
-async function commitTextFilePatchTransactionUnlocked(rootDir: string, transaction: PreparedTextPatchTransaction, options: TextTransactionOptions): Promise<TextTransactionResult> {
-  throwIfAborted(options.signal);
-  const io = options.fileSystem ?? fs;
-  const parentDirs = [...new Set(transaction.parentDirsToCreate ?? [])];
-  const transactionId = safeTransactionId(options.transactionId ?? randomUUID());
-  const transactionDirectory = path.join(options.journalDirectory, transactionId);
-  const manifestPath = path.join(transactionDirectory, 'transaction.json');
-  const writes: PatchJournalWrite[] = transaction.writes.map((write, index) => ({
-    path: write.path,
-    absolutePath: write.absolutePath,
-    stagedPath: path.join(transactionDirectory, `write-${String(index)}.tmp`),
-    ...(write.overwrite ? { backupPath: path.join(transactionDirectory, `backup-write-${String(index)}`) } : {}),
-    newSha256: sha256(write.content),
-    overwrite: write.overwrite,
-    ...(write.expectedCurrentSha256 ? { expectedCurrentSha256: write.expectedCurrentSha256 } : {}),
-    ...(write.expectedAbsent ? { expectedAbsent: true as const } : {})
-  }));
-  const removes: PatchJournalRemove[] = transaction.removes.map((remove, index) => ({
-    path: remove.path,
-    absolutePath: remove.absolutePath,
-    backupPath: path.join(transactionDirectory, `backup-remove-${String(index)}`),
-    expectedCurrentSha256: remove.expectedCurrentSha256
-  }));
-  const manifest: PatchJournalManifest = { version: 1, transactionId, phase: 'prepared', parentDirs, writes, removes };
-  let mutationStarted = false;
+  private constructor(directory: string, descriptor: number, device: bigint, inode: bigint) {
+    this.#directory = directory; this.#descriptor = descriptor; this.#device = device; this.#inode = inode; ownedJournals.add(this);
+  }
 
-  try {
-    for (const remove of transaction.removes) {
-      await assertPathIsNotSymlink(rootDir, remove.path);
+  static adopt(directoryPath: string): TextPatchJournal {
+    if (typeof directoryPath !== 'string' || directoryPath.trim().length === 0) throw new TypeError('Patch journal path must be non-empty.');
+    const directory = path.resolve(directoryPath);
+    const fd = openHostDirectoryWithoutAliases(directory);
+    try {
+      const opened = fstatSync(fd, { bigint: true });
+      if (!opened.isDirectory()) throw new Error(`Patch journal must be a real directory: ${directory}`);
+      fchmodSync(fd, 0o700);
+      return new TextPatchJournal(directory, fd, opened.dev, opened.ino);
+    } catch (error) { closeSync(fd); throw error; }
+  }
+
+  async withAuthority<T>(root: WorkspaceFileRoot, operation: (authority: TextPatchJournalAuthority) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    this.#assertOpen();
+    this.#activeOperations += 1;
+    try {
+      const authorityPath = `/proc/self/fd/${String(this.#descriptor)}`;
+      return await withJournalLock(authorityPath, signal, async (assertOwned) => {
+        this.#assertIdentity();
+        await assertOwned();
+        await recoverTransactions(root, authorityPath);
+        let active = true;
+        const authority: TextPatchJournalAuthority = Object.freeze({
+          commit: async (transaction: PreparedTextPatchTransaction, options: TextTransactionOptions = {}) => {
+            this.#assertOpen();
+            if (!active) throw new Error('Patch journal operation authority has expired.');
+            await assertOwned();
+            return commitTransaction(root, authorityPath, transaction, options);
+          }
+        });
+        try { return await operation(authority); }
+        finally { active = false; }
+      });
+    } finally {
+      this.#activeOperations -= 1;
+      if (this.#closed && this.#activeOperations === 0) closeSync(this.#descriptor);
     }
-    for (const write of transaction.writes) {
-      await assertPathIsNotSymlink(rootDir, write.path);
-    }
-    await io.mkdir(transactionDirectory);
-    await syncDirectory(options.journalDirectory, io);
-    for (const [index, write] of transaction.writes.entries()) {
-      const journalWrite = writes[index];
-      if (!journalWrite) throw new Error(`Missing journal write ${String(index)}.`);
-      await io.writeFile(journalWrite.stagedPath, write.content, { encoding: 'utf8', ...(write.mode !== undefined ? { mode: write.mode } : {}) });
-      if (write.mode !== undefined) await io.chmod(journalWrite.stagedPath, write.mode);
-      await syncFile(journalWrite.stagedPath, io);
-    }
-    await writePatchJournalManifest(manifestPath, manifest, io);
-    await validateCommitPreconditions(transaction, parentDirs, io);
-    mutationStarted = true;
-    for (const dir of parentDirs) {
-      await ensureDurableDirectory(dir, io);
-    }
-    for (const remove of removes) {
-      await assertStagedPathIsFile(remove.path, remove.absolutePath, io);
-      await io.rename(remove.absolutePath, remove.backupPath);
-      await syncDirectories([path.dirname(remove.absolutePath), transactionDirectory], io);
-    }
-    for (const write of writes) {
-      if (write.backupPath) {
-        await assertStagedPathIsFile(write.path, write.absolutePath, io);
-        await io.rename(write.absolutePath, write.backupPath);
-        await syncDirectories([path.dirname(write.absolutePath), transactionDirectory], io);
-      } else {
-        await assertDestinationDoesNotExist(write.absolutePath, io);
-      }
-      await io.rename(write.stagedPath, write.absolutePath);
-      await syncDirectories([transactionDirectory, path.dirname(write.absolutePath)], io);
-    }
-    await writePatchJournalManifest(manifestPath, { ...manifest, phase: 'committed' }, io);
-    const cleanup = await recoveryResult([recoveryOperation('remove_patch_journal', transactionDirectory, () => removeJournal(transactionDirectory, io))], io);
-    return cleanup.status === 'succeeded' ? { outcome: 'committed', cleanup } : { outcome: 'committed_with_residue', cleanup };
-  } catch (error) {
-    const rollback = mutationStarted
-      ? await recoverPreparedPatchTransaction(transactionDirectory, manifest, io)
-      : await recoveryResult([recoveryOperation('remove_patch_journal', transactionDirectory, () => removeJournal(transactionDirectory, io))], io);
-    return failedResult(error, 'commit_patch', rollback);
+  }
+
+  async recover(root: WorkspaceFileRoot): Promise<void> {
+    await this.withAuthority(root, () => Promise.resolve(undefined));
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    if (this.#activeOperations === 0) closeSync(this.#descriptor);
+  }
+  #assertOpen(): void { if (this.#closed) throw new Error('Patch journal has been released.'); }
+  #assertIdentity(): void {
+    const current = fstatSync(this.#descriptor, { bigint: true });
+    if (!current.isDirectory() || current.dev !== this.#device || current.ino !== this.#inode) throw new Error(`Patch journal authority no longer names its adopted directory: ${this.#directory}`);
   }
 }
 
-interface PatchJournalWrite {
-  readonly path: string;
-  readonly absolutePath: string;
-  readonly stagedPath: string;
-  readonly backupPath?: string;
-  readonly newSha256: string;
-  readonly overwrite: boolean;
-  readonly expectedCurrentSha256?: string;
-  readonly expectedAbsent?: true;
+export function isTextPatchJournal(value: unknown): value is TextPatchJournal {
+  return typeof value === 'object' && value !== null && ownedJournals.has(value as TextPatchJournal);
 }
-interface PatchJournalRemove { readonly path: string; readonly absolutePath: string; readonly backupPath: string; readonly expectedCurrentSha256: string }
-interface PatchJournalManifest {
+
+export function withTextFilePatchJournal<T>(root: WorkspaceFileRoot, journal: TextPatchJournal, operation: (authority: TextPatchJournalAuthority) => Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!isTextPatchJournal(journal)) throw new TypeError('Patch writes require an adopted TextPatchJournal.');
+  return journal.withAuthority(root, operation, signal);
+}
+
+export function commitTextFilePatchTransaction(root: WorkspaceFileRoot, journal: TextPatchJournal, transaction: PreparedTextPatchTransaction, options: TextTransactionOptions = {}): Promise<TextTransactionResult> {
+  return journal.withAuthority(root, (authority) => authority.commit(transaction, options), options.signal);
+}
+
+export function recoverTextFilePatchTransactions(root: WorkspaceFileRoot, journal: TextPatchJournal): Promise<void> { return journal.recover(root); }
+
+interface JournalWriteBase {
+  readonly path: string;
+  readonly stageName: string;
+  readonly newSha256: string;
+  readonly mode: number;
+}
+type JournalWrite =
+  | JournalWriteBase & {
+    readonly overwrite: true;
+    readonly backupName: string;
+    readonly expectedCurrentSha256: string;
+    readonly expectedCurrentIdentity: WorkspaceFileIdentity;
+  }
+  | JournalWriteBase & {
+    readonly overwrite: false;
+    readonly expectedAbsent: true;
+  };
+interface JournalRemove {
+  readonly path: string;
+  readonly backupName: string;
+  readonly expectedCurrentSha256: string;
+  readonly expectedCurrentIdentity: WorkspaceFileIdentity;
+}
+interface JournalCreatedDirectory { readonly path: string; readonly identity?: WorkspaceFileIdentity }
+interface JournalManifest {
   readonly version: 1;
   readonly transactionId: string;
   readonly phase: 'prepared' | 'committed';
-  readonly parentDirs: readonly string[];
-  readonly writes: readonly PatchJournalWrite[];
-  readonly removes: readonly PatchJournalRemove[];
+  readonly createdDirectories: readonly JournalCreatedDirectory[];
+  readonly writes: readonly JournalWrite[];
+  readonly removes: readonly JournalRemove[];
 }
 
-export async function recoverTextFilePatchTransactions(rootDir: string, journalDirectory: string, io: TextWriteFileSystem = fs): Promise<void> {
-  if (io !== fs) {
-    await recoverTextFilePatchTransactionsUnlocked(rootDir, journalDirectory, io);
-    return;
-  }
-  await withJournalLock(journalDirectory, undefined, () => recoverTextFilePatchTransactionsUnlocked(rootDir, journalDirectory, io));
-}
-
-async function recoverTextFilePatchTransactionsUnlocked(rootDir: string, journalDirectory: string, io: TextWriteFileSystem): Promise<void> {
-  await ensureDurableDirectory(journalDirectory, io);
-  const entries = await io.readdir(journalDirectory, { withFileTypes: true });
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const transactionDirectory = path.join(journalDirectory, entry.name);
-    const manifest = await readPatchJournalManifest(path.join(transactionDirectory, 'transaction.json'), io);
-    validatePatchJournalPaths(rootDir, transactionDirectory, manifest);
-    const recovery = manifest.phase === 'committed'
-      ? await recoveryResult([recoveryOperation('remove_committed_patch_journal', transactionDirectory, () => removeJournal(transactionDirectory, io))], io)
-      : await recoverPreparedPatchTransaction(transactionDirectory, manifest, io);
-    if (recovery.status !== 'succeeded') {
-      throw new Error(`Patch transaction recovery ${recovery.status}: ${recovery.diagnostics.map((item) => item.message).join('; ')}`);
+async function commitTransaction(root: WorkspaceFileRoot, journalDirectory: string, transaction: PreparedTextPatchTransaction, options: TextTransactionOptions): Promise<TextTransactionResult> {
+  throwIfAborted(options.signal);
+  const transactionId = safeTransactionId(options.transactionId ?? randomUUID());
+  const token = createHash('sha256').update(transactionId).digest('hex').slice(0, 20);
+  const transactionDirectory = path.join(journalDirectory, transactionId);
+  const manifestPath = path.join(transactionDirectory, 'transaction.json');
+  const writes = transaction.writes.map((write, index): JournalWrite => {
+    const common = {
+      path: root.canonicalPath(write.path),
+      stageName: temporaryName(token, index, 'stage'),
+      newSha256: sha256(write.content),
+      mode: write.mode ?? 0o600
+    };
+    return write.overwrite
+      ? {
+        ...common,
+        overwrite: true,
+        backupName: temporaryName(token, index, 'backup-write'),
+        expectedCurrentSha256: write.expectedCurrentSha256,
+        expectedCurrentIdentity: write.expectedCurrentIdentity
+      }
+      : { ...common, overwrite: false, expectedAbsent: true };
+  });
+  const removes = transaction.removes.map((remove, index): JournalRemove => ({
+    path: root.canonicalPath(remove.path), backupName: temporaryName(token, index, 'backup-remove'),
+    expectedCurrentSha256: remove.expectedCurrentSha256, expectedCurrentIdentity: remove.expectedCurrentIdentity
+  }));
+  const createdDirectories = [...new Set(transaction.parentDirsToCreate ?? [])].map((item): JournalCreatedDirectory => ({ path: root.canonicalPath(item) }));
+  let manifest: JournalManifest = { version: 1, transactionId, phase: 'prepared', createdDirectories, writes, removes };
+  validateManifest(root, manifest);
+  let journalCreated = false;
+  try {
+    await mkdir(transactionDirectory, { mode: 0o700 });
+    journalCreated = true;
+    await syncDirectory(journalDirectory);
+    await writeManifest(manifestPath, manifest);
+    manifest = await createParents(root, manifestPath, manifest);
+    for (const [index, write] of writes.entries()) {
+      const source = transaction.writes[index];
+      if (!source) throw new Error(`Missing prepared patch write ${String(index)}.`);
+      await withParent(root, write.path, async (directory) => { await directory.writeExclusive(write.stageName, source.content, write.mode); await directory.sync(); });
     }
-  }
-}
-
-function validatePatchJournalPaths(rootDir: string, transactionDirectory: string, manifest: PatchJournalManifest): void {
-  if (manifest.transactionId !== path.basename(transactionDirectory)) throw new Error(`Patch journal transaction identity does not match its directory: ${transactionDirectory}`);
-  for (const [index, write] of manifest.writes.entries()) {
-    const expectedAbsolutePath = resolveInsideRoot(rootDir, write.path);
-    const expectedStagedPath = path.join(transactionDirectory, `write-${String(index)}.tmp`);
-    const expectedBackupPath = write.overwrite ? path.join(transactionDirectory, `backup-write-${String(index)}`) : undefined;
-    if (path.resolve(write.absolutePath) !== expectedAbsolutePath || path.resolve(write.stagedPath) !== path.resolve(expectedStagedPath) || resolveOptionalPath(write.backupPath) !== resolveOptionalPath(expectedBackupPath)) {
-      throw new Error(`Patch journal write paths are invalid for: ${write.path}`);
+    await validatePreconditions(root, writes, removes);
+    for (const remove of removes) await moveCurrentToBackup(root, remove.path, remove.backupName, remove.expectedCurrentSha256, remove.expectedCurrentIdentity);
+    for (const write of writes) {
+      if (write.overwrite) await moveCurrentToBackup(root, write.path, write.backupName, write.expectedCurrentSha256, write.expectedCurrentIdentity);
+      else if ((await root.inspectPath(write.path)).kind !== 'absent') throw new Error(`Patch destination appeared before commit: ${write.path}`);
+      await withParent(root, write.path, async (directory, leaf) => {
+        await directory.link(write.stageName, leaf);
+        await directory.sync();
+      });
     }
-  }
-  for (const [index, remove] of manifest.removes.entries()) {
-    if (path.resolve(remove.absolutePath) !== resolveInsideRoot(rootDir, remove.path) || path.resolve(remove.backupPath) !== path.resolve(transactionDirectory, `backup-remove-${String(index)}`)) {
-      throw new Error(`Patch journal removal paths are invalid for: ${remove.path}`);
+    manifest = { ...manifest, phase: 'committed' };
+    await writeManifest(manifestPath, manifest);
+    const cleanup = await cleanupCommitted(root, transactionDirectory, manifest);
+    return cleanup.status === 'succeeded' ? { outcome: 'committed', cleanup } : { outcome: 'committed_with_residue', cleanup };
+  } catch (error) {
+    if (!journalCreated) {
+      return { outcome: 'rolled_back', failure: diagnostic('create_patch_journal', transactionId, error), rollback: { status: 'succeeded', diagnostics: [], strandedPaths: [] } };
     }
+    const rollback = await rollbackPrepared(root, transactionDirectory, manifest);
+    const failure = diagnostic('commit_patch', transactionId, error);
+    return rollback.status === 'succeeded' ? { outcome: 'rolled_back', failure, rollback } : { outcome: 'rollback_failed', failure, rollback };
   }
-  for (const directory of manifest.parentDirs) assertAbsolutePathInsideRoot(rootDir, directory);
 }
 
-function resolveOptionalPath(value: string | undefined): string | undefined { return value === undefined ? undefined : path.resolve(value); }
-
-function assertAbsolutePathInsideRoot(rootDir: string, candidate: string): void {
-  const root = path.resolve(rootDir);
-  const absolute = path.resolve(candidate);
-  if (absolute !== root && !absolute.startsWith(`${root}${path.sep}`)) throw new Error(`Patch journal directory escapes the workspace: ${candidate}`);
+async function validatePreconditions(root: WorkspaceFileRoot, writes: readonly JournalWrite[], removes: readonly JournalRemove[]): Promise<void> {
+  for (const remove of removes) await assertCurrentFile(root, remove.path, remove.expectedCurrentSha256, remove.expectedCurrentIdentity);
+  for (const write of writes) {
+    if (write.overwrite) await assertCurrentFile(root, write.path, write.expectedCurrentSha256, write.expectedCurrentIdentity);
+    else if ((await root.inspectPath(write.path)).kind !== 'absent') throw new Error(`Patch destination appeared before commit: ${write.path}`);
+  }
 }
 
-async function recoverPreparedPatchTransaction(transactionDirectory: string, manifest: PatchJournalManifest, io: TextWriteFileSystem): Promise<TextTransactionRecovery> {
+async function createParents(root: WorkspaceFileRoot, manifestPath: string, initial: JournalManifest): Promise<JournalManifest> {
+  let manifest = initial;
+  for (const [index, item] of manifest.createdDirectories.entries()) {
+    const { parent, leaf } = splitParent(item.path);
+    const directory = await openWorkspaceMutationDirectory(root, parent);
+    try {
+      await directory.createDirectory(leaf, 0o700);
+      await directory.sync();
+      const status = await directory.status(leaf);
+      if (status.kind !== 'directory') throw new Error(`Created patch parent is not a directory: ${item.path}`);
+      const createdDirectories = manifest.createdDirectories.map((entry, entryIndex) => entryIndex === index ? { ...entry, identity: status.identity } : entry);
+      manifest = { ...manifest, createdDirectories };
+      await writeManifest(manifestPath, manifest);
+    }
+    finally { await directory.close(); }
+  }
+  return manifest;
+}
+
+async function moveCurrentToBackup(root: WorkspaceFileRoot, filePath: string, backupName: string, expectedSha256: string, expectedIdentity: WorkspaceFileIdentity): Promise<void> {
+  await withParent(root, filePath, async (directory, leaf) => {
+    const backup = await directory.status(backupName);
+    if (backup.kind !== 'absent') throw new Error(`Patch backup already exists: ${backup.path}`);
+    await directory.rename(leaf, backupName);
+    await directory.sync();
+    const moved = await directory.status(backupName);
+    if (moved.kind !== 'file' || !sameFileObject(moved.identity, expectedIdentity)) throw new Error(`Patch source identity changed before publication: ${filePath}`);
+    const actual = sha256(await directory.readFile(backupName, Number.MAX_SAFE_INTEGER));
+    if (actual !== expectedSha256) throw new Error(`Patch source changed before publication: ${filePath}`);
+  });
+}
+
+async function cleanupCommitted(root: WorkspaceFileRoot, transactionDirectory: string, manifest: JournalManifest): Promise<TextTransactionRecovery> {
+  return recoverThenRemoveJournal(transactionDirectory, [
+    ...manifest.writes.flatMap((write) => [write.stageName, ...(write.overwrite ? [write.backupName] : [])].map((name) => operation('remove_patch_temporary', joinParent(write.path, name), () => removeSibling(root, write.path, name)))),
+    ...manifest.removes.map((remove) => operation('remove_patch_backup', joinParent(remove.path, remove.backupName), () => removeSibling(root, remove.path, remove.backupName)))
+  ]);
+}
+
+async function rollbackPrepared(root: WorkspaceFileRoot, transactionDirectory: string, manifest: JournalManifest): Promise<TextTransactionRecovery> {
   const operations: RecoveryOperation[] = [];
   for (const write of [...manifest.writes].reverse()) {
-    const backupPath = write.backupPath;
-    if (backupPath) {
-      operations.push(recoveryOperation('restore_write_backup', write.absolutePath, async () => {
-        if (!await pathExists(backupPath, io)) return;
-        if (await pathExists(write.absolutePath, io)) {
-          const actual = sha256(await io.readFile(write.absolutePath));
-          if (actual !== write.newSha256) throw new Error(`Refusing to overwrite changed path during recovery: ${write.path}`);
-          await io.rm(write.absolutePath, { force: true });
-          await syncDirectory(path.dirname(write.absolutePath), io);
-        }
-        await io.rename(backupPath, write.absolutePath);
-        await syncDirectories([path.dirname(backupPath), path.dirname(write.absolutePath)], io);
-      }, backupPath));
-    } else {
-      operations.push(recoveryOperation('remove_incomplete_write', write.absolutePath, async () => {
-        if (!await pathExists(write.absolutePath, io)) return;
-        const actual = sha256(await io.readFile(write.absolutePath));
-        if (actual !== write.newSha256) throw new Error(`Refusing to remove changed path during recovery: ${write.path}`);
-        await io.rm(write.absolutePath, { force: true });
-        await syncDirectory(path.dirname(write.absolutePath), io);
-      }));
-    }
+    operations.push(operation('rollback_patch_write', write.path, async () => {
+      const backupPresent = write.overwrite ? await siblingExists(root, write.path, write.backupName) : false;
+      const stageStatus = await siblingStatus(root, write.path, write.stageName);
+      const status = await siblingStatus(root, write.path, splitParent(write.path).leaf);
+      if (status.kind === 'file') {
+        const publishedByTransaction = stageStatus.kind === 'file' && stageStatus.identity.device === status.identity.device && stageStatus.identity.inode === status.identity.inode;
+        if (publishedByTransaction) await removeTarget(root, write.path);
+        else if (backupPresent) throw new Error(`Refusing to remove a changed patch result: ${write.path}`);
+      } else if (status.kind !== 'absent') throw new Error(`Patch result has an unsafe type: ${write.path}`);
+      if (write.overwrite) await restoreSibling(root, write.path, write.backupName, write.expectedCurrentIdentity);
+      await removeSibling(root, write.path, write.stageName);
+    }));
   }
-  for (const remove of [...manifest.removes].reverse()) {
-    operations.push(recoveryOperation('restore_remove_backup', remove.absolutePath, async () => {
-      if (!await pathExists(remove.backupPath, io)) return;
-      if (await pathExists(remove.absolutePath, io)) throw new Error(`Refusing to overwrite changed path during recovery: ${remove.path}`);
-      await io.rename(remove.backupPath, remove.absolutePath);
-      await syncDirectories([path.dirname(remove.backupPath), path.dirname(remove.absolutePath)], io);
-    }, remove.backupPath));
+  for (const remove of [...manifest.removes].reverse()) operations.push(operation('restore_patch_remove', remove.path, () => restoreSibling(root, remove.path, remove.backupName, remove.expectedCurrentIdentity)));
+  for (const directory of [...manifest.createdDirectories].reverse()) {
+    operations.push(operation('remove_patch_directory', directory.path, () => removeCreatedDirectory(root, directory)));
   }
-  operations.push(...[...manifest.parentDirs].sort((left, right) => right.length - left.length).map((dir) => recoveryOperation('remove_created_directory', dir, async () => {
-    await io.rmdir(dir);
-    await syncDirectory(path.dirname(dir), io);
-  })));
-  const recovery = await recoveryResult(operations, io);
-  if (recovery.status === 'succeeded') {
-    await removeJournal(transactionDirectory, io);
+  return recoverThenRemoveJournal(transactionDirectory, operations);
+}
+
+async function recoverTransactions(root: WorkspaceFileRoot, journalDirectory: string): Promise<void> {
+  for (const entry of await readdir(journalDirectory, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name === '.lock') continue;
+    const transactionDirectory = path.join(journalDirectory, entry.name);
+    const manifest = await readManifest(path.join(transactionDirectory, 'transaction.json'));
+    if (manifest.transactionId !== entry.name) throw new Error(`Patch journal identity mismatch: ${transactionDirectory}`);
+    validateManifest(root, manifest);
+    const recovery = manifest.phase === 'committed' ? await cleanupCommitted(root, transactionDirectory, manifest) : await rollbackPrepared(root, transactionDirectory, manifest);
+    if (recovery.status !== 'succeeded') throw new Error(`Patch recovery ${recovery.status}: ${recovery.diagnostics.map((item) => item.message).join('; ')}`);
   }
-  return recovery;
 }
 
-async function writePatchJournalManifest(manifestPath: string, manifest: PatchJournalManifest, io: TextWriteFileSystem): Promise<void> {
-  const temporaryPath = `${manifestPath}.tmp`;
-  await io.writeFile(temporaryPath, JSON.stringify(manifest), 'utf8');
-  await syncFile(temporaryPath, io);
-  await io.rename(temporaryPath, manifestPath);
-  await syncDirectory(path.dirname(manifestPath), io);
+async function restoreSibling(root: WorkspaceFileRoot, targetPath: string, backupName: string, expectedIdentity: WorkspaceFileIdentity): Promise<void> {
+  await withParent(root, targetPath, async (directory, leaf) => {
+    const backup = await directory.status(backupName);
+    if (backup.kind === 'absent') return;
+    if (backup.kind !== 'file' || !sameFileObject(backup.identity, expectedIdentity)) throw new Error(`Patch backup identity changed: ${joinParent(targetPath, backupName)}`);
+    if ((await directory.status(leaf)).kind !== 'absent') throw new Error(`Refusing to overwrite a changed path during recovery: ${targetPath}`);
+    await directory.rename(backupName, leaf); await directory.sync();
+  });
 }
-
-async function removeJournal(transactionDirectory: string, io: TextWriteFileSystem): Promise<void> {
-  await io.rm(transactionDirectory, { recursive: true, force: true });
-  await syncDirectory(path.dirname(transactionDirectory), io);
-}
-
-async function syncFile(filePath: string, io: TextWriteFileSystem): Promise<void> {
-  // Windows requires a writable handle for FlushFileBuffers. This helper is
-  // used only for Agent Core-owned staged and manifest files.
-  const handle = await io.open(filePath, 'r+');
-  try { await handle.sync(); } finally { await handle.close(); }
-}
-
-async function syncDirectories(directories: readonly string[], io: TextWriteFileSystem): Promise<void> {
-  for (const directory of new Set(directories)) await syncDirectory(directory, io);
-}
-
-async function syncDirectory(directory: string, io: TextWriteFileSystem): Promise<void> {
-  // Node cannot open directory handles for fsync on Windows. File contents and
-  // manifests are still synced before their atomic rename boundaries.
-  if (process.platform === 'win32') return;
-  let handle: Awaited<ReturnType<TextWriteFileSystem['open']>> | undefined;
+async function removeTarget(root: WorkspaceFileRoot, targetPath: string): Promise<void> { await withParent(root, targetPath, async (directory, leaf) => { await directory.removeFile(leaf); await directory.sync(); }); }
+async function removeSibling(root: WorkspaceFileRoot, targetPath: string, name: string): Promise<void> { await withParent(root, targetPath, async (directory) => { await directory.removeFile(name); await directory.sync(); }); }
+async function siblingExists(root: WorkspaceFileRoot, targetPath: string, name: string): Promise<boolean> { return withParent(root, targetPath, async (directory) => (await directory.status(name)).kind !== 'absent'); }
+async function siblingStatus(root: WorkspaceFileRoot, targetPath: string, name: string) { return withParent(root, targetPath, async (directory) => directory.status(name)); }
+async function removeCreatedDirectory(root: WorkspaceFileRoot, item: JournalCreatedDirectory): Promise<void> {
+  const { parent, leaf } = splitParent(item.path); const directory = await openWorkspaceMutationDirectory(root, parent);
   try {
-    handle = await io.open(directory, 'r');
-    await handle.sync();
-  } catch (error) {
-    const code = nodeCode(error) ?? '';
-    if (!['EINVAL', 'ENOTSUP', 'EBADF'].includes(code)) throw error;
-  } finally {
-    await handle?.close();
+    const status = await directory.status(leaf);
+    if (status.kind === 'absent') return;
+    if (item.identity === undefined) throw new Error(`Cannot prove ownership of a patch parent created before its receipt was durable: ${item.path}`);
+    if (status.kind !== 'directory' || !sameFileObject(status.identity, item.identity)) throw new Error(`Patch-created directory identity changed: ${item.path}`);
+    await directory.removeDirectory(leaf); await directory.sync();
+  } finally { await directory.close(); }
+}
+async function withParent<T>(root: WorkspaceFileRoot, targetPath: string, operationValue: (directory: WorkspaceMutationDirectory, leaf: string) => Promise<T>): Promise<T> {
+  const { parent, leaf } = splitParent(targetPath); const directory = await openWorkspaceMutationDirectory(root, parent);
+  try { return await operationValue(directory, leaf); } finally { await directory.close(); }
+}
+
+function splitParent(filePath: string): { readonly parent: string; readonly leaf: string } {
+  const index = filePath.lastIndexOf('/');
+  return index < 0 ? { parent: '.', leaf: filePath } : { parent: filePath.slice(0, index), leaf: filePath.slice(index + 1) };
+}
+function joinParent(filePath: string, sibling: string): string { const { parent } = splitParent(filePath); return parent === '.' ? sibling : `${parent}/${sibling}`; }
+async function assertCurrentFile(root: WorkspaceFileRoot, filePath: string, expectedSha256: string, expectedIdentity: WorkspaceFileIdentity): Promise<void> {
+  const file = await root.openFile(filePath);
+  try {
+    if (!workspaceFileIdentitiesEqual(file.identity, expectedIdentity)) throw new Error(`Patch source identity changed before commit: ${filePath}`);
+    if (sha256(await file.readAll(Number.MAX_SAFE_INTEGER)) !== expectedSha256) throw new Error(`Patch source changed before commit: ${filePath}`);
+    if (!workspaceFileIdentitiesEqual(await file.identityNow(), expectedIdentity)) throw new Error(`Patch source changed while validating the commit: ${filePath}`);
+  } finally { await file.close(); }
+}
+function sha256(value: string | Uint8Array): string { return createHash('sha256').update(value).digest('hex'); }
+function temporaryName(token: string, index: number, role: string): string { return `.agent-core-patch-${token}-${String(index)}-${role}`; }
+
+async function writeManifest(manifestPath: string, manifest: JournalManifest): Promise<void> {
+  const temporary = `${manifestPath}.tmp`;
+  const payload = JSON.stringify(manifest);
+  const envelope = JSON.stringify({ version: 1, payload: manifest, sha256: sha256(payload) });
+  if (Buffer.byteLength(envelope, 'utf8') > MAX_JOURNAL_MANIFEST_BYTES) throw new Error('Patch journal manifest exceeds its retained byte limit.');
+  await writeFile(temporary, envelope, { encoding: 'utf8', mode: 0o600 });
+  await chmod(temporary, 0o600);
+  const handle = await open(temporary, 'r+'); try { await handle.sync(); } finally { await handle.close(); }
+  await rename(temporary, manifestPath); await syncDirectory(path.dirname(manifestPath));
+}
+async function readManifest(manifestPath: string): Promise<JournalManifest> {
+  const metadata = await stat(manifestPath);
+  if (!metadata.isFile() || metadata.size > MAX_JOURNAL_MANIFEST_BYTES) throw new Error(`Patch journal manifest exceeds its admitted form: ${manifestPath}`);
+  const value: unknown = JSON.parse(await readFile(manifestPath, 'utf8'));
+  if (!record(value) || value.version !== 1 || !isManifest(value.payload) || !sha256Value(value.sha256)) {
+    throw new Error(`Invalid patch journal manifest: ${manifestPath}`);
+  }
+  if (sha256(JSON.stringify(value.payload)) !== value.sha256) throw new Error(`Patch journal checksum failed: ${manifestPath}`);
+  return value.payload;
+}
+function isManifest(value: unknown): value is JournalManifest {
+  return record(value) && value.version === 1 && typeof value.transactionId === 'string' && (value.phase === 'prepared' || value.phase === 'committed')
+    && Array.isArray(value.createdDirectories) && value.createdDirectories.every((item) => record(item) && typeof item.path === 'string' && (item.identity === undefined || isFileIdentity(item.identity)))
+    && Array.isArray(value.writes) && value.writes.every((item) => {
+      if (!record(item) || typeof item.path !== 'string' || typeof item.stageName !== 'string' || !sha256Value(item.newSha256)
+        || !Number.isInteger(item.mode) || Number(item.mode) < 0 || Number(item.mode) > 0o7777) return false;
+      return item.overwrite === true
+        ? typeof item.backupName === 'string' && sha256Value(item.expectedCurrentSha256) && isFileIdentity(item.expectedCurrentIdentity)
+          && item.expectedAbsent === undefined
+        : item.overwrite === false && item.expectedAbsent === true && item.backupName === undefined
+          && item.expectedCurrentSha256 === undefined && item.expectedCurrentIdentity === undefined;
+    })
+    && Array.isArray(value.removes) && value.removes.every((item) => record(item) && typeof item.path === 'string'
+      && typeof item.backupName === 'string' && sha256Value(item.expectedCurrentSha256) && isFileIdentity(item.expectedCurrentIdentity));
+}
+
+function validateManifest(root: WorkspaceFileRoot, manifest: JournalManifest): void {
+  const transactionId = safeTransactionId(manifest.transactionId);
+  const token = createHash('sha256').update(transactionId).digest('hex').slice(0, 20);
+  const paths = new Set<string>();
+  for (const item of manifest.createdDirectories) {
+    const canonical = root.canonicalPath(item.path);
+    if (canonical !== item.path || canonical === '.' || paths.has(canonical)) throw new Error(`Invalid patch-created directory in journal: ${item.path}`);
+    paths.add(canonical);
+  }
+  for (const [index, write] of manifest.writes.entries()) {
+    const canonical = root.canonicalPath(write.path);
+    if (canonical !== write.path || paths.has(canonical)) throw new Error(`Duplicate or non-canonical patch path in journal: ${write.path}`);
+    paths.add(canonical);
+    if (write.stageName !== temporaryName(token, index, 'stage')) throw new Error(`Invalid patch stage name in journal: ${write.stageName}`);
+    if (write.overwrite && write.backupName !== temporaryName(token, index, 'backup-write')) throw new Error(`Invalid patch backup name in journal: ${write.backupName}`);
+  }
+  for (const [index, remove] of manifest.removes.entries()) {
+    const canonical = root.canonicalPath(remove.path);
+    if (canonical !== remove.path || paths.has(canonical)) throw new Error(`Duplicate or non-canonical patch path in journal: ${remove.path}`);
+    paths.add(canonical);
+    if (remove.backupName !== temporaryName(token, index, 'backup-remove')) throw new Error(`Invalid patch backup name in journal: ${remove.backupName}`);
   }
 }
 
-async function ensureDurableDirectory(directory: string, io: TextWriteFileSystem): Promise<void> {
-  const missing: string[] = [];
-  let cursor = path.resolve(directory);
-  while (!await pathExists(cursor, io)) {
-    missing.push(cursor);
-    const parent = path.dirname(cursor);
-    if (parent === cursor) throw new Error(`Cannot find an existing ancestor for directory: ${directory}`);
-    cursor = parent;
-  }
-  for (const item of missing.reverse()) {
-    try { await io.mkdir(item); }
-    catch (error) { if (nodeCode(error) !== 'EEXIST') throw error; }
-    await syncDirectory(path.dirname(item), io);
-  }
+interface RecoveryOperation { readonly operation: string; readonly path: string; run(): Promise<void> }
+function operation(name: string, pathValue: string, run: () => Promise<void>): RecoveryOperation { return { operation: name, path: pathValue, run }; }
+async function recoverOperations(operations: readonly RecoveryOperation[]): Promise<TextTransactionRecovery> {
+  const diagnostics: TextTransactionDiagnostic[] = [];
+  for (const item of operations) try { await item.run(); } catch (error) { diagnostics.push(diagnostic(item.operation, item.path, error)); }
+  return diagnostics.length === 0
+    ? { status: 'succeeded', diagnostics: [], strandedPaths: [] }
+    : { status: 'uncertain', diagnostics, strandedPaths: [...new Set(diagnostics.map((item) => item.path))] };
+}
+async function recoverThenRemoveJournal(transactionDirectory: string, operations: readonly RecoveryOperation[]): Promise<TextTransactionRecovery> {
+  const result = await recoverOperations(operations);
+  if (result.status !== 'succeeded') return result;
+  return recoverOperations([operation('remove_patch_journal', transactionDirectory, () => removeJournal(transactionDirectory))]);
+}
+function diagnostic(operationValue: string, pathValue: string, error: unknown): TextTransactionDiagnostic {
+  const code = nodeCode(error);
+  return { operation: operationValue, path: pathValue, message: error instanceof Error ? error.message : String(error), ...(code === undefined ? {} : { code }) };
+}
+async function removeJournal(directory: string): Promise<void> { await rm(directory, { recursive: true, force: true }); await syncDirectory(path.dirname(directory)); }
+async function syncDirectory(directory: string): Promise<void> {
+  if (process.platform === 'win32') return;
+  const handle = await open(directory, 'r'); try { await handle.sync(); } finally { await handle.close(); }
 }
 
-async function readPatchJournalManifest(manifestPath: string, io: TextWriteFileSystem): Promise<PatchJournalManifest> {
-  const value: unknown = JSON.parse(await io.readFile(manifestPath, 'utf8'));
-  if (!isPatchJournalManifest(value)) throw new Error(`Invalid patch transaction journal: ${manifestPath}`);
-  return value;
-}
-
-function isPatchJournalManifest(value: unknown): value is PatchJournalManifest {
-  if (!isRecord(value) || value.version !== 1 || typeof value.transactionId !== 'string' || (value.phase !== 'prepared' && value.phase !== 'committed')) return false;
-  return Array.isArray(value.parentDirs) && value.parentDirs.every((item) => typeof item === 'string')
-    && Array.isArray(value.writes) && value.writes.every((item) => isRecord(item) && typeof item.path === 'string' && typeof item.absolutePath === 'string' && typeof item.stagedPath === 'string' && (item.backupPath === undefined || typeof item.backupPath === 'string') && typeof item.newSha256 === 'string' && typeof item.overwrite === 'boolean' && (item.expectedCurrentSha256 === undefined || typeof item.expectedCurrentSha256 === 'string') && (item.expectedAbsent === undefined || item.expectedAbsent === true))
-    && Array.isArray(value.removes) && value.removes.every((item) => isRecord(item) && typeof item.path === 'string' && typeof item.absolutePath === 'string' && typeof item.backupPath === 'string' && typeof item.expectedCurrentSha256 === 'string');
-}
-
-async function pathExists(pathValue: string, io: TextWriteFileSystem): Promise<boolean> {
-  try { await io.lstat(pathValue); return true; }
-  catch (error) { if (nodeCode(error) === 'ENOENT') return false; throw error; }
-}
-
-async function validateCommitPreconditions(transaction: PreparedTextPatchTransaction, parentDirs: readonly string[], io: TextWriteFileSystem): Promise<void> {
-  for (const remove of transaction.removes) await assertCurrentSha256(remove.path, remove.absolutePath, remove.expectedCurrentSha256, io);
-  for (const write of transaction.writes) {
-    if (write.expectedCurrentSha256) await assertCurrentSha256(write.path, write.absolutePath, write.expectedCurrentSha256, io);
-    if (write.expectedAbsent) await assertDestinationDoesNotExist(write.absolutePath, io);
-  }
-  for (const directory of parentDirs) {
-    if (await pathExists(directory, io)) throw new Error('Patch parent state changed before commit: ' + directory);
-    let ancestor = path.dirname(directory);
-    while (!await pathExists(ancestor, io)) {
-      const next = path.dirname(ancestor);
-      if (next === ancestor) throw new Error('Patch parent has no existing ancestor: ' + directory);
-      ancestor = next;
-    }
-    const stat = await io.lstat(ancestor);
-    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Patch parent state is not a real directory: ' + ancestor);
-  }
-}
-async function assertCurrentSha256(filePath: string, absolutePath: string, expected: string, io: TextWriteFileSystem): Promise<void> {
-  const stat = await io.lstat(absolutePath);
-  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Patch source type changed before commit: ' + filePath);
-  const actual = sha256(await io.readFile(absolutePath));
-  if (actual !== expected) throw new Error('Patch source changed before commit: ' + filePath);
-}
-
-async function withJournalLock<T>(journalDirectory: string, signal: AbortSignal | undefined, operation: () => Promise<T>): Promise<T> {
-  const lockPath = journalDirectory + '.lock';
-  await fs.mkdir(path.dirname(journalDirectory), { recursive: true });
-  const started = Date.now();
-  const owner = { pid: process.pid, hostname: hostname(), createdAt: new Date().toISOString(), nonce: randomUUID() };
+async function withJournalLock<T>(journalDirectory: string, signal: AbortSignal | undefined, operationValue: (assertOwned: () => Promise<void>) => Promise<T>): Promise<T> {
+  const lockPath = path.join(journalDirectory, '.lock');
+  const nonce = randomUUID();
+  const processIdentity = linuxProcessIdentity(process.pid);
+  if (processIdentity === undefined) throw new Error('Cannot establish the patch-journal owner process identity.');
   for (;;) {
     throwIfAborted(signal);
     try {
-      await fs.mkdir(lockPath);
-      await fs.writeFile(path.join(lockPath, 'owner.json'), JSON.stringify(owner), { encoding: 'utf8', flag: 'wx' });
+      await mkdir(lockPath, { mode: 0o700 });
+      await writeFile(path.join(lockPath, 'owner.json'), JSON.stringify({ nonce, pid: process.pid, hostname: hostname(), processIdentity }), { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+      const ownerHandle = await open(path.join(lockPath, 'owner.json'), 'r+'); try { await ownerHandle.sync(); } finally { await ownerHandle.close(); }
+      await syncDirectory(lockPath); await syncDirectory(journalDirectory);
       break;
     } catch (error) {
       if (nodeCode(error) !== 'EEXIST') throw error;
-      if (await staleJournalLock(lockPath)) { await fs.rm(lockPath, { recursive: true, force: true }); continue; }
-      if (Date.now() - started > 30_000) throw new Error('Timed out acquiring patch journal lock: ' + lockPath, { cause: error });
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      const owner = await readLockOwner(lockPath);
+      if (!owner) {
+        const lockStat = await stat(lockPath);
+        if (Date.now() - lockStat.mtimeMs < 30_000) { await wait(signal); continue; }
+        throw new Error(`Patch journal lock has no valid owner: ${lockPath}`, { cause: error });
+      }
+      if (owner.hostname !== hostname()) throw new Error(`Patch journal lock belongs to another host and cannot be proven stale: ${lockPath}`, { cause: error });
+      if (linuxProcessIdentity(owner.pid) === owner.processIdentity) { await wait(signal); continue; }
+      await rm(lockPath, { recursive: true, force: true }); await syncDirectory(journalDirectory);
     }
   }
-  try { return await operation(); }
+  const assertOwned = async () => {
+    const owner = await readLockOwner(lockPath);
+    if (owner?.nonce !== nonce || owner.pid !== process.pid || owner.hostname !== hostname() || owner.processIdentity !== processIdentity) throw new Error('Patch journal lock ownership was lost.');
+  };
+  try { return await operationValue(assertOwned); }
   finally {
-    try {
-      const current = JSON.parse(await fs.readFile(path.join(lockPath, 'owner.json'), 'utf8')) as { nonce?: unknown };
-      if (current.nonce === owner.nonce) await fs.rm(lockPath, { recursive: true, force: true });
-    } catch { /* A missing lock is already released. */ }
+    const owner = await readLockOwner(lockPath);
+    if (owner?.nonce === nonce) { await rm(lockPath, { recursive: true, force: true }); await syncDirectory(journalDirectory); }
   }
 }
-async function staleJournalLock(lockPath: string): Promise<boolean> {
-  let stat;
-  try { stat = await fs.stat(lockPath); } catch { return false; }
-  const age = Date.now() - stat.mtimeMs;
+async function readLockOwner(lockPath: string): Promise<{ nonce?: string; pid: number; hostname: string; processIdentity: string } | undefined> {
   try {
-    const owner = JSON.parse(await fs.readFile(path.join(lockPath, 'owner.json'), 'utf8')) as { pid?: unknown; hostname?: unknown };
-    if (owner.hostname !== hostname()) return age > 60 * 60_000;
-    if (typeof owner.pid === 'number') {
-      try { process.kill(owner.pid, 0); return false; }
-      catch (error) { return nodeCode(error) === 'ESRCH'; }
-    }
-  } catch { return age > 10 * 60_000; }
-  return age > 10 * 60_000;
+    const value: unknown = JSON.parse(await readFile(path.join(lockPath, 'owner.json'), 'utf8'));
+    if (!record(value) || !Number.isSafeInteger(value.pid) || typeof value.hostname !== 'string' || typeof value.processIdentity !== 'string') return undefined;
+    return { ...(typeof value.nonce === 'string' ? { nonce: value.nonce } : {}), pid: Number(value.pid), hostname: value.hostname, processIdentity: value.processIdentity };
+  } catch { return undefined; }
 }
-
-function sha256(value: string | Uint8Array): string { return createHash('sha256').update(value).digest('hex'); }
-function safeTransactionId(value: string): string { return value.replace(/[^A-Za-z0-9._-]/gu, '_'); }
-function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
-
-async function assertDestinationDoesNotExist(absolutePath: string, io: TextWriteFileSystem): Promise<void> {
+function linuxProcessIdentity(pid: number): string | undefined {
   try {
-    await io.lstat(absolutePath);
-  } catch (error) {
-    if (nodeCode(error) === 'ENOENT') return;
-    throw error;
-  }
-  throw new Error('Refusing to overwrite existing destination during commit.');
+    const statValue = readFileSync(`/proc/${String(pid)}/stat`, 'utf8');
+    const closingParenthesis = statValue.lastIndexOf(')');
+    if (closingParenthesis < 0) return undefined;
+    const fields = statValue.slice(closingParenthesis + 2).trim().split(/\s+/u);
+    const startTicks = fields[19];
+    if (!startTicks) return undefined;
+    const bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+    return `${bootId}:${startTicks}`;
+  } catch { return undefined; }
 }
-
-async function assertStagedPathIsFile(filePath: string, absolutePath: string, io: TextWriteFileSystem): Promise<void> {
-  const stat = await io.lstat(absolutePath);
-  if (!stat.isFile()) {
-    throw new Error(`Path is not a regular file: ${filePath}`);
-  }
+function wait(signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, 20);
+    signal?.addEventListener('abort', () => {
+      clearTimeout(timer);
+      reject(signal.reason instanceof Error ? signal.reason : new Error('Patch journal wait was aborted.', { cause: signal.reason }));
+    }, { once: true });
+  });
 }
-
-interface RecoveryOperation { readonly operation: string; readonly path: string; readonly strandedPath: string; readonly run: () => Promise<unknown> }
-function recoveryOperation(operation: string, pathValue: string, run: () => Promise<unknown>, strandedPath = pathValue): RecoveryOperation { return { operation, path: pathValue, strandedPath, run }; }
-async function recoveryResult(operations: readonly RecoveryOperation[], io: TextWriteFileSystem): Promise<TextTransactionRecovery> {
-  const diagnostics: TextTransactionDiagnostic[] = [];
-  const strandedPaths: string[] = [];
-  let uncertain = false;
-  for (const operation of operations) {
-    try { await operation.run(); }
-    catch (error) {
-      const stranded = await probePath(operation.strandedPath, io);
-      if (stranded === false) continue;
-      diagnostics.push(diagnostic(error, operation.operation, operation.path));
-      strandedPaths.push(operation.strandedPath);
-      if (stranded === 'unknown') uncertain = true;
-    }
-  }
-  return diagnostics.length === 0
-    ? { status: 'succeeded', diagnostics: [], strandedPaths: [] }
-    : { status: uncertain ? 'uncertain' : 'failed', diagnostics: Object.freeze(diagnostics), strandedPaths: Object.freeze([...new Set(strandedPaths)]) };
+function safeTransactionId(value: string): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/u.test(value) || value === '.lock') throw new Error('Patch transaction identity is invalid.');
+  return value;
 }
-async function probePath(pathValue: string, io: TextWriteFileSystem): Promise<boolean | 'unknown'> {
-  try { await io.lstat(pathValue); return true; }
-  catch (error) { return nodeCode(error) === 'ENOENT' ? false : 'unknown'; }
+function sha256Value(value: unknown): value is string { return typeof value === 'string' && /^[a-f0-9]{64}$/u.test(value); }
+function isFileIdentity(value: unknown): value is WorkspaceFileIdentity {
+  return record(value) && typeof value.device === 'string' && typeof value.inode === 'string' && typeof value.mode === 'string'
+    && typeof value.links === 'string' && typeof value.size === 'string' && typeof value.modifiedNanoseconds === 'string'
+    && typeof value.changedNanoseconds === 'string';
 }
-function failedResult(error: unknown, operation: string, rollback: TextTransactionRecovery): TextTransactionResult {
-  const failure = diagnostic(error, operation, '');
-  return rollback.status === 'succeeded' ? { outcome: 'rolled_back', failure, rollback } : { outcome: 'rollback_failed', failure, rollback };
+function sameFileObject(left: WorkspaceFileIdentity, right: WorkspaceFileIdentity): boolean {
+  return left.device === right.device && left.inode === right.inode;
 }
-function diagnostic(error: unknown, operation: string, pathValue: string): TextTransactionDiagnostic {
-  const code = nodeCode(error);
-  return { operation, path: pathValue, message: error instanceof Error ? error.message : String(error), ...(code ? { code } : {}) };
-}
-function nodeCode(error: unknown): string | undefined { return typeof error === 'object' && error !== null && typeof Reflect.get(error, 'code') === 'string' ? String(Reflect.get(error, 'code')) : undefined; }
+function record(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
+function nodeCode(error: unknown): string | undefined { return record(error) && typeof error.code === 'string' ? error.code : undefined; }

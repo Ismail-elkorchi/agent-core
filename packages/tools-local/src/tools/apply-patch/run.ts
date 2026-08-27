@@ -1,21 +1,17 @@
-import path from 'node:path';
-import { promises as fs } from 'node:fs';
 import type { EvidenceAction, ToolEvidenceItem } from '@agent-core/evidence';
 import { requireToolService, throwIfAborted, ToolInputError, type ToolExecutionContext } from '@agent-core/tools';
 import { PATCH_JOURNAL_SCOPE, workspaceFileScope, workspaceResource } from '../../core/resources.js';
 import type { ToolObservationInput } from '@agent-core/tools';
-import { requireWorkspaceRoot } from '../../core/workspace.js';
+import { requireWorkspaceFileRoot } from '../../core/workspace.js';
+import type { WorkspaceFileRoot } from '../../core/workspace-file-root.js';
 import {
   byteLengthUtf8,
   inspectTextFile,
   isProbablyBinary,
-  relativePath,
-  resolveInsideRoot,
-  sha256Text,
-  validateParentDirectory
+  sha256Text
 } from '../../core/filesystem.js';
 import { invalidToolInputObservation } from '@agent-core/tools';
-import { withTextFilePatchJournal, type PreparedTextPatchRemove, type PreparedTextPatchWrite, type TextPatchJournalAuthority, type TextTransactionResult } from '../../core/text-write.js';
+import { isTextPatchJournal, withTextFilePatchJournal, type PreparedTextPatchRemove, type PreparedTextPatchWrite, type TextPatchJournal, type TextPatchJournalAuthority, type TextTransactionResult } from '../../core/text-write.js';
 import { splitLogicalLines } from '@agent-core/tools';
 import { applyPatchUpdate, PatchApplyError } from './apply-diff.js';
 import { PatchParseError, type ParsedApplyPatch, type ParsedPatchOperation } from './patch-parser.js';
@@ -42,7 +38,7 @@ interface PreparedPatchOperation {
   output: ApplyPatchFileOutput;
   write?: PreparedTextPatchWrite;
   remove?: PreparedTextPatchRemove;
-  parentDirsToCreate: string[];
+  parentDirsToCreate: readonly string[];
   createdPath?: string;
   deletedPath?: string;
   move?: ApplyPatchPathPair;
@@ -51,18 +47,18 @@ interface PreparedPatchOperation {
 
 export async function applyPatch(input: CanonicalApplyPatchInput, context: ToolExecutionContext): Promise<ToolObservationInput<ApplyPatchOutput>> {
   throwIfAborted(context.signal);
-  const rootDir = requireWorkspaceRoot(context);
+  const root = requireWorkspaceFileRoot(context);
   const dryRun = input.dryRun;
-  const journalDirectory = dryRun ? undefined : requireToolService(context, 'patchTransactionDirectory', isNonEmptyString, 'non-empty patch transaction directory');
-  if (journalDirectory) return withTextFilePatchJournal(rootDir, journalDirectory, (authority) => applyPatchWithAuthority(input, context, authority), context.signal);
+  const journal = dryRun ? undefined : requireToolService<TextPatchJournal>(context, 'patchJournal', isTextPatchJournal, 'adopted TextPatchJournal');
+  if (journal) return withTextFilePatchJournal(root, journal, (authority) => applyPatchWithAuthority(input, context, authority), context.signal);
   return applyPatchWithAuthority(input, context);
 }
 
 export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, context: ToolExecutionContext, authority?: TextPatchJournalAuthority): Promise<ToolObservationInput<ApplyPatchOutput>> {
-  const rootDir = requireWorkspaceRoot(context);
+  const root = requireWorkspaceFileRoot(context);
   const dryRun = input.dryRun;
   await context.emitProgress?.({ type: 'status', stage: 'patch_preparing', message: 'Preparing patch transaction.', completed: 0, total: input.tree.operations.length });
-  const { prepared, failures } = await preparePatch(rootDir, input);
+  const { prepared, failures } = await preparePatch(root, input);
 
   if (failures.length > 0) {
     return invalidToolInputObservation('apply_patch', summarizePatchFailures(failures), {
@@ -166,7 +162,7 @@ export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, c
 }
 
 /** Builds the one transaction plan used by both dry-run and commit execution. */
-export async function preparePatch(rootDir: string, input: CanonicalApplyPatchInput): Promise<{
+export async function preparePatch(root: WorkspaceFileRoot, input: CanonicalApplyPatchInput): Promise<{
   readonly prepared: PreparedPatchOperation[];
   readonly failures: ApplyPatchFailure[];
 }> {
@@ -174,7 +170,7 @@ export async function preparePatch(rootDir: string, input: CanonicalApplyPatchIn
   const failures: ApplyPatchFailure[] = [];
   const reservedPaths = new Set<string>();
   for (const operation of input.tree.operations) {
-    const result = await prepareOperation(rootDir, operation, input, reservedPaths);
+    const result = await prepareOperation(root, operation, input, reservedPaths);
     if (result.ok) prepared.push(result.operation);
     else failures.push(result.failure);
   }
@@ -188,7 +184,6 @@ function patchTransactionId(context: ToolExecutionContext): string | undefined {
     : undefined;
 }
 
-function isNonEmptyString(value: unknown): value is string { return typeof value === 'string' && value.trim().length > 0; }
 function emitCheckpoint(context: ToolExecutionContext, progress: import('@agent-core/tools').ToolProgress): Promise<void> {
   return Promise.resolve(context.persistProgressCheckpoint ? context.persistProgressCheckpoint(progress) : context.emitProgress?.(progress));
 }
@@ -246,7 +241,7 @@ function evidenceActionForPatch(operation: ApplyPatchFileOutput['operation']): E
 }
 
 async function prepareOperation(
-  rootDir: string,
+  root: WorkspaceFileRoot,
   operation: ParsedPatchOperation,
   input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
@@ -255,16 +250,16 @@ async function prepareOperation(
   | { ok: false; failure: ApplyPatchFailure }
 > {
   if (operation.kind === 'add') {
-    return prepareAdd(rootDir, operation.path, operation.content, operation.additions, input, reservedPaths);
+    return prepareAdd(root, operation.path, operation.content, operation.additions, input, reservedPaths);
   }
   if (operation.kind === 'delete') {
-    return prepareDelete(rootDir, operation.path, input, reservedPaths);
+    return prepareDelete(root, operation.path, input, reservedPaths);
   }
-  return prepareUpdate(rootDir, operation, input, reservedPaths);
+  return prepareUpdate(root, operation, input, reservedPaths);
 }
 
 async function prepareAdd(
-  rootDir: string,
+  root: WorkspaceFileRoot,
   requestedPath: string,
   content: string,
   additions: number,
@@ -274,11 +269,11 @@ async function prepareAdd(
   | { ok: true; operation: PreparedPatchOperation }
   | { ok: false; failure: ApplyPatchFailure }
 > {
-  const target = await inspectNewTarget(rootDir, requestedPath, 'already_exists');
+  const target = await inspectNewTarget(root, requestedPath, 'already_exists');
   if (!target.ok) {
     return { ok: false, failure: withFailureContext(target.failure, 'add') };
   }
-  const duplicate = reservePath(reservedPaths, target.absolutePath, target.path);
+  const duplicate = reservePath(reservedPaths, target.path);
   if (duplicate) {
     return { ok: false, failure: withFailureContext(duplicate, 'add') };
   }
@@ -324,7 +319,6 @@ async function prepareAdd(
       },
       write: {
         path: target.path,
-        absolutePath: target.absolutePath,
         content,
         overwrite: false,
         expectedAbsent: true
@@ -337,7 +331,7 @@ async function prepareAdd(
 }
 
 async function prepareDelete(
-  rootDir: string,
+  root: WorkspaceFileRoot,
   requestedPath: string,
   input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
@@ -345,11 +339,11 @@ async function prepareDelete(
   | { ok: true; operation: PreparedPatchOperation }
   | { ok: false; failure: ApplyPatchFailure }
 > {
-  const inspected = await inspectTextFile(rootDir, requestedPath, input.limits.maxFileBytes, { rejectSymlink: true });
+  const inspected = await inspectTextFile(root, requestedPath, input.limits.maxFileBytes);
   if (!inspected.ok) {
     return { ok: false, failure: textFileFailure(inspected.failure.path, inspected.failure.reason, inspected.failure.message, 'delete') };
   }
-  const duplicate = reservePath(reservedPaths, inspected.file.absolutePath, inspected.file.path);
+  const duplicate = reservePath(reservedPaths, inspected.file.path);
   if (duplicate) {
     return { ok: false, failure: withFailureContext(duplicate, 'delete') };
   }
@@ -376,8 +370,8 @@ async function prepareDelete(
       },
       remove: {
         path: inspected.file.path,
-        absolutePath: inspected.file.absolutePath,
-        expectedCurrentSha256: oldSha256
+        expectedCurrentSha256: oldSha256,
+        expectedCurrentIdentity: inspected.file.identity
       },
       parentDirsToCreate: [],
       deletedPath: inspected.file.path,
@@ -387,7 +381,7 @@ async function prepareDelete(
 }
 
 async function prepareUpdate(
-  rootDir: string,
+  root: WorkspaceFileRoot,
   operation: Extract<ParsedPatchOperation, { kind: 'update' }>,
   input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
@@ -395,11 +389,11 @@ async function prepareUpdate(
   | { ok: true; operation: PreparedPatchOperation }
   | { ok: false; failure: ApplyPatchFailure }
 > {
-  const inspected = await inspectTextFile(rootDir, operation.path, input.limits.maxFileBytes, { rejectSymlink: true });
+  const inspected = await inspectTextFile(root, operation.path, input.limits.maxFileBytes);
   if (!inspected.ok) {
     return { ok: false, failure: textFileFailure(inspected.failure.path, inspected.failure.reason, inspected.failure.message, 'update') };
   }
-  const sourceDuplicate = reservePath(reservedPaths, inspected.file.absolutePath, inspected.file.path);
+  const sourceDuplicate = reservePath(reservedPaths, inspected.file.path);
   if (sourceDuplicate) {
     return { ok: false, failure: withFailureContext(sourceDuplicate, operation.moveTo ? 'move' : 'update') };
   }
@@ -432,11 +426,11 @@ async function prepareUpdate(
   }
 
   if (operation.moveTo) {
-    const target = await inspectNewTarget(rootDir, operation.moveTo, 'destination_exists');
+    const target = await inspectNewTarget(root, operation.moveTo, 'destination_exists');
     if (!target.ok) {
       return { ok: false, failure: withFailureContext(target.failure, 'move') };
     }
-    const targetDuplicate = reservePath(reservedPaths, target.absolutePath, target.path);
+    const targetDuplicate = reservePath(reservedPaths, target.path);
     if (targetDuplicate) {
       return { ok: false, failure: withFailureContext(targetDuplicate, 'move') };
     }
@@ -461,7 +455,6 @@ async function prepareUpdate(
         },
         write: {
           path: target.path,
-          absolutePath: target.absolutePath,
           content: patched.content,
           mode: inspected.file.mode,
           overwrite: false,
@@ -469,8 +462,8 @@ async function prepareUpdate(
         },
         remove: {
           path: inspected.file.path,
-          absolutePath: inspected.file.absolutePath,
-          expectedCurrentSha256: oldSha256
+          expectedCurrentSha256: oldSha256,
+          expectedCurrentIdentity: inspected.file.identity
         },
         parentDirsToCreate: target.parentDirsToCreate,
         move: { sourcePath: inspected.file.path, destinationPath: target.path },
@@ -500,11 +493,11 @@ async function prepareUpdate(
       ...(patched.changed ? {
         write: {
           path: inspected.file.path,
-          absolutePath: inspected.file.absolutePath,
           content: patched.content,
           mode: inspected.file.mode,
           overwrite: true,
-          expectedCurrentSha256: oldSha256
+          expectedCurrentSha256: oldSha256,
+          expectedCurrentIdentity: inspected.file.identity
         }
       } : {}),
       parentDirsToCreate: [],
@@ -514,29 +507,28 @@ async function prepareUpdate(
 }
 
 async function inspectNewTarget(
-  rootDir: string,
+  root: WorkspaceFileRoot,
   requestedPath: string,
   existsReason: 'already_exists' | 'destination_exists'
 ): Promise<
-  | { ok: true; path: string; absolutePath: string; parentDirsToCreate: string[] }
+  | { ok: true; path: string; parentDirsToCreate: readonly string[] }
   | { ok: false; failure: ApplyPatchFailure }
 > {
-  let absolutePath;
+  let normalizedPath: string;
   try {
-    absolutePath = resolveInsideRoot(rootDir, requestedPath, { emptyPathMessage: 'Path cannot be empty.' });
+    normalizedPath = root.canonicalPath(requestedPath);
   } catch (error) {
     if (error instanceof ToolInputError) {
       return { ok: false, failure: { path: requestedPath, reason: 'path_outside_workspace', message: error.message } };
     }
     throw error;
   }
-  const normalizedPath = relativePath(rootDir, absolutePath);
   try {
-    const stat = await fs.lstat(absolutePath);
-    if (stat.isSymbolicLink()) {
+    const status = await root.inspectPath(normalizedPath);
+    if (status.kind === 'symlink') {
       return { ok: false, failure: { path: normalizedPath, reason: 'symlink', message: `Refusing to write through symlink path: ${requestedPath}` } };
     }
-    return {
+    if (status.kind !== 'absent') return {
       ok: false,
       failure: {
         path: normalizedPath,
@@ -544,37 +536,26 @@ async function inspectNewTarget(
         message: existsReason === 'already_exists' ? `File already exists: ${requestedPath}` : `Destination already exists: ${requestedPath}`
       }
     };
-  } catch {
-    const parent = await validateParentDirectory(rootDir, absolutePath, requestedPath, true);
-    if (!parent.ok) {
-      return {
-        ok: false,
-        failure: {
-          path: parent.failure.path,
-          reason: parent.failure.reason,
-          message: parent.failure.message
-        }
-      };
-    }
+    const parentDirsToCreate = await root.missingParentDirectories(normalizedPath);
     return {
       ok: true,
       path: normalizedPath,
-      absolutePath: path.resolve(absolutePath),
-      parentDirsToCreate: parent.parentDirsToCreate
+      parentDirsToCreate
     };
+  } catch (error) {
+    return { ok: false, failure: { path: normalizedPath, reason: 'parent_not_directory', message: error instanceof Error ? error.message : String(error) } };
   }
 }
 
-function reservePath(paths: Set<string>, absolutePath: string, displayPath: string): ApplyPatchFailure | undefined {
-  const resolved = path.resolve(absolutePath);
-  if (paths.has(resolved)) {
+function reservePath(paths: Set<string>, displayPath: string): ApplyPatchFailure | undefined {
+  if (paths.has(displayPath)) {
     return {
       path: displayPath,
       reason: 'duplicate_path',
       message: `Duplicate patch target after path normalization: ${displayPath}`
     };
   }
-  paths.add(resolved);
+  paths.add(displayPath);
   return undefined;
 }
 

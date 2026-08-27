@@ -1,16 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from 'node:fs/promises';
-import { promises as realFs } from 'node:fs';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
 import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createToolCall, prepareToolCall } from '@agent-core/tools';
-import { applyPatchTool, DEFAULT_LOCAL_TOOL_CONFIGURATION } from '@agent-core/tools-local';
+import { applyPatchTool, DEFAULT_LOCAL_TOOL_CONFIGURATION, TextPatchJournal } from '@agent-core/tools-local';
 import { applyPatchWithAuthority } from '@agent-core/tools-local/testing/apply-patch';
 import { commitTextFilePatchTransaction, recoverTextFilePatchTransactions } from '@agent-core/tools-local/testing/text-write';
 import { invokeToolCall, textToolCall } from '../tool-call-helpers.js';
+import { testPatchJournal, testWorkspaceFileRoot } from '../workspace-file-root-helper.js';
 
 const policy = { allowedRisks: ['read', 'write', 'destructive'] };
 
@@ -38,7 +38,7 @@ test('apply_patch parses once into one canonical tree and applies add, update, m
   ]);
   const observation = await invokeToolCall(textToolCall('apply_patch', document), [applyPatchTool], {
     policy,
-    services: { workspaceRoot: root },
+    services: { workspaceFileRoot: testWorkspaceFileRoot(root) },
     emitProgress(item) { progress.push(item); }
   });
   assert.equal(observation.ok, true);
@@ -57,7 +57,7 @@ test('tool policy denies destructive patches without destructive authority', asy
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-no-apply-'));
   await writeFile(path.join(root, 'delete.txt'), 'delete\n');
   const observation = await invokeToolCall(textToolCall('apply_patch', patch(['*** Delete File: delete.txt'])), [applyPatchTool], {
-    policy: { allowedRisks: ['read'] }, services: { workspaceRoot: root }
+    policy: { allowedRisks: ['read'] }, services: { workspaceFileRoot: testWorkspaceFileRoot(root) }
   });
   assert.equal(observation.kind, 'failure');
   assert.equal(observation.output.reason, 'policy');
@@ -71,7 +71,7 @@ test('apply_patch enforces raw SHA-256 preconditions and keeps dry runs non-muta
   await writeFile(path.join(root, 'note.txt'), original);
   const document = patch(['*** Update File: note.txt', '@@', '-old', '+new']);
   const wrong = await invokeToolCall({ name: 'apply_patch', input: { kind: 'json', value: { patch: document, expectedOldSha256: { 'note.txt': '0'.repeat(64) } } } }, [applyPatchTool], {
-    policy, services: { workspaceRoot: root }
+    policy, services: { workspaceFileRoot: testWorkspaceFileRoot(root) }
   });
   assert.equal(wrong.kind, 'failure');
   assert.match(wrong.summary, /SHA-256|sha256/iu);
@@ -79,7 +79,7 @@ test('apply_patch enforces raw SHA-256 preconditions and keeps dry runs non-muta
 
   const expected = createHash('sha256').update(original).digest('hex');
   const dryRun = await invokeToolCall({ name: 'apply_patch', input: { kind: 'json', value: { patch: document, dryRun: true, expectedOldSha256: { 'note.txt': expected } } } }, [applyPatchTool], {
-    policy, services: { workspaceRoot: root }
+    policy, services: { workspaceFileRoot: testWorkspaceFileRoot(root) }
   });
   assert.equal(dryRun.ok, true);
   assert.equal(dryRun.output.operationStatus, 'dry_run');
@@ -105,7 +105,7 @@ test('apply_patch preserves all four transaction outcome semantics', async () =>
       policy,
       boundary: { authorizationPolicyId: 'tests/patch-status@1', executionTargetId: root },
       signal: new AbortController().signal,
-      services: { workspaceRoot: root, localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION }
+      services: { workspaceFileRoot: testWorkspaceFileRoot(root), localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION }
     };
     const preparation = await prepareToolCall(textToolCall('apply_patch', patch(['*** Update File: note.txt', '@@', '-old', '+new'])), [applyPatchTool], context);
     assert.equal(preparation.ok, true);
@@ -149,7 +149,7 @@ test('apply_patch reports no-op without a transaction outcome', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-noop-'));
   await writeFile(path.join(root, 'note.txt'), 'same\n');
   const result = await invokeToolCall(textToolCall('apply_patch', patch(['*** Update File: note.txt', '@@', '-same', '+same'])), [applyPatchTool], {
-    policy, services: { workspaceRoot: root }
+    policy, services: { workspaceFileRoot: testWorkspaceFileRoot(root) }
   });
   assert.equal(result.kind, 'result');
   assert.equal(result.output.operationStatus, 'no_change');
@@ -165,7 +165,7 @@ test('apply_patch dynamically requires a transaction directory only for writes',
     policy,
     boundary: { authorizationPolicyId: 'tests/patch-services@1', executionTargetId: root },
     signal: new AbortController().signal,
-    services: { workspaceRoot: root, localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION }
+    services: { workspaceFileRoot: testWorkspaceFileRoot(root), localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION }
   };
   const document = patch(['*** Update File: note.txt', '@@', '-old', '+new']);
   const dryPreparation = await prepareToolCall(createToolCall({ name: 'apply_patch', input: { kind: 'json', value: { patch: document, dryRun: true } } }), [applyPatchTool], base);
@@ -176,12 +176,12 @@ test('apply_patch dynamically requires a transaction directory only for writes',
   const writePreparation = await prepareToolCall(textToolCall('apply_patch', document), [applyPatchTool], base);
   assert.equal(writePreparation.ok, true);
   const missing = await writePreparation.prepared.invoke(base).catch(error => error);
-  assert.match(missing.message, /patchTransactionDirectory/u);
+  assert.match(missing.message, /patchJournal/u);
 
-  const withDirectory = { ...base, services: { ...base.services, patchTransactionDirectory: path.join(root, '.agent-core', 'transactions', 'patch') } };
+  const withDirectory = { ...base, services: { ...base.services, patchJournal: testPatchJournal(base.services.workspaceFileRoot) } };
   const applied = await writePreparation.prepared.invoke(withDirectory);
   assert.equal(applied.output.operationStatus, 'applied');
-  assert.deepEqual(applyPatchTool.requirements.services, ['workspaceRoot', 'localToolConfiguration']);
+  assert.deepEqual(applyPatchTool.requirements.services, ['workspaceFileRoot', 'localToolConfiguration']);
 });
 
 test('apply_patch dry runs require only read access and do not create transaction state', async () => {
@@ -189,7 +189,7 @@ test('apply_patch dry runs require only read access and do not create transactio
   await writeFile(path.join(root, 'note.txt'), 'old\n');
   const document = patch(['*** Update File: note.txt', '@@', '-old', '+new']);
   const observation = await invokeToolCall({ name: 'apply_patch', input: { kind: 'json', value: { patch: document, dryRun: true } } }, [applyPatchTool], {
-    policy: { allowedRisks: ['read'] }, services: { workspaceRoot: root }
+    policy: { allowedRisks: ['read'] }, services: { workspaceFileRoot: testWorkspaceFileRoot(root) }
   });
   assert.equal(observation.ok, true);
   assert.equal(observation.output.dryRun, true);
@@ -202,7 +202,7 @@ test('apply_patch reports parser and matching diagnostics without mutating files
   await writeFile(path.join(root, 'note.txt'), 'section one\r\nvalue   \r\nsection two\r\nvalue\t\r\n');
 
   const malformed = await invokeToolCall(textToolCall('apply_patch', 'not a patch'), [applyPatchTool], {
-    policy, services: { workspaceRoot: root }
+    policy, services: { workspaceFileRoot: testWorkspaceFileRoot(root) }
   });
   assert.equal(malformed.kind, 'failure');
   assert.equal(malformed.output.reason, 'invalid_arguments');
@@ -213,7 +213,7 @@ test('apply_patch reports parser and matching diagnostics without mutating files
     '*** Update File: note.txt',
     '@@',
     ' section one'
-  ])), [applyPatchTool], { policy, services: { workspaceRoot: root } });
+  ])), [applyPatchTool], { policy, services: { workspaceFileRoot: testWorkspaceFileRoot(root) } });
   assert.equal(contextOnly.kind, 'failure');
   assert.equal(contextOnly.output.details.failures[0].hunkIndex, 0);
   assert.match(contextOnly.output.details.failures[0].nextAction, /at least one \+ or - line/u);
@@ -223,7 +223,7 @@ test('apply_patch reports parser and matching diagnostics without mutating files
     '@@',
     '-value',
     '+VALUE'
-  ])), [applyPatchTool], { policy, services: { workspaceRoot: root } });
+  ])), [applyPatchTool], { policy, services: { workspaceFileRoot: testWorkspaceFileRoot(root) } });
   assert.equal(ambiguous.kind, 'failure');
   assert.equal(ambiguous.output.details.failures[0].reason, 'ambiguous_context');
   assert.deepEqual(ambiguous.output.details.failures[0].candidateLines, [2, 4]);
@@ -237,7 +237,7 @@ test('apply_patch reports parser and matching diagnostics without mutating files
       '+VALUE',
       '*** End of File'
     ]) } }
-  }, [applyPatchTool], { policy, services: { workspaceRoot: root } });
+  }, [applyPatchTool], { policy, services: { workspaceFileRoot: testWorkspaceFileRoot(root) } });
   assert.equal(narrowed.ok, true);
   assert.deepEqual(narrowed.output.files[0].matchModes, ['trim_trailing_whitespace']);
   assert.equal(narrowed.output.files[0].exact, false);
@@ -279,7 +279,7 @@ test('apply_patch rejects invalid targets atomically under host limits', async (
     '+duplicate'
   ]);
   const observation = await invokeToolCall(textToolCall('apply_patch', document), [applyPatchTool], {
-    policy, services: { workspaceRoot: root, localToolConfiguration }
+    policy, services: { workspaceFileRoot: testWorkspaceFileRoot(root), localToolConfiguration }
   });
   assert.equal(observation.kind, 'failure');
   assert.deepEqual(
@@ -289,7 +289,7 @@ test('apply_patch rejects invalid targets atomically under host limits', async (
   assert.equal(await readFile(path.join(root, 'good.txt'), 'utf8'), 'hello\nworld\n');
 });
 
-test('patch transactions preserve modes, roll back atomically, and recover interrupted rollback', async () => {
+test('patch transactions preserve requested modes', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-transaction-'));
   const journalDirectory = path.join(root, '.journal');
   const firstPath = path.join(root, 'first.txt');
@@ -298,40 +298,16 @@ test('patch transactions preserve modes, roll back atomically, and recover inter
   await writeFile(secondPath, 'old second\n');
   await chmod(firstPath, 0o744);
   const mode = (await stat(firstPath)).mode;
+  const workspaceFileRoot = testWorkspaceFileRoot(root);
+  const journal = testPatchJournal(workspaceFileRoot);
+  const firstIdentity = await workspaceFileRoot.fileIdentity('first.txt');
 
-  const committed = await commitTextFilePatchTransaction(root, {
-    writes: [{ path: 'first.txt', absolutePath: firstPath, content: 'mode preserved\n', mode, overwrite: true }],
+  const committed = await commitTextFilePatchTransaction(workspaceFileRoot, journal, {
+    writes: [{ path: 'first.txt', content: 'mode preserved\n', mode, overwrite: true, expectedCurrentSha256: createHash('sha256').update('old first\n').digest('hex'), expectedCurrentIdentity: firstIdentity }],
     removes: []
-  }, { journalDirectory });
+  });
   assert.equal(committed.outcome, 'committed');
   assert.equal((await stat(firstPath)).mode & 0o777, mode & 0o777);
-
-  await writeFile(firstPath, 'old first\n');
-  const fileSystem = {
-    ...realFs,
-    async rename(source, destination) {
-      const sourceName = path.basename(String(source));
-      if (sourceName === 'write-1.tmp') throw new Error('injected second write failure');
-      if (sourceName === 'backup-write-0' && String(destination) === firstPath) throw new Error('injected rollback interruption');
-      return realFs.rename(source, destination);
-    }
-  };
-  const interrupted = await commitTextFilePatchTransaction(root, {
-    writes: [
-      { path: 'first.txt', absolutePath: firstPath, content: 'new first\n', overwrite: true },
-      { path: 'second.txt', absolutePath: secondPath, content: 'new second\n', overwrite: true }
-    ],
-    removes: []
-  }, { fileSystem, journalDirectory, transactionId: 'interrupted' });
-  assert.equal(interrupted.outcome, 'rollback_failed');
-  assert.equal(interrupted.rollback.status, 'failed');
-  await assert.rejects(readFile(firstPath), /ENOENT/u);
-  assert.equal(await readFile(secondPath, 'utf8'), 'old second\n');
-
-  await recoverTextFilePatchTransactions(root, journalDirectory);
-  assert.equal(await readFile(firstPath, 'utf8'), 'old first\n');
-  assert.equal(await readFile(secondPath, 'utf8'), 'old second\n');
-  assert.deepEqual(await readdir(journalDirectory), []);
 });
 
 test('patch journals recover an interrupted process before another transaction runs', async () => {
@@ -341,9 +317,124 @@ test('patch journals recover an interrupted process before another transaction r
   const child = spawnSync(process.execPath, [fixture, root], { encoding: 'utf8' });
   assert.equal(child.status, 42, child.stderr);
   const journalDirectory = path.join(root, '.agent-core', 'transactions', 'patch');
-  await recoverTextFilePatchTransactions(root, journalDirectory);
+  const workspaceFileRoot = testWorkspaceFileRoot(root);
+  const journal = TextPatchJournal.adopt(journalDirectory);
+  await recoverTextFilePatchTransactions(workspaceFileRoot, journal);
+  journal.close();
   assert.equal(await readFile(path.join(root, 'note.txt'), 'utf8'), 'before\n');
   assert.deepEqual(await readdir(journalDirectory), []);
+});
+
+test('patch recovery preserves directories and files that its journal cannot prove it owns', async () => {
+  const rootPath = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-unproven-root-'));
+  const journalPath = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-unproven-journal-'));
+  await mkdir(path.join(rootPath, 'external-empty'));
+  const root = testWorkspaceFileRoot(rootPath);
+
+  const unprovenId = 'unproven-directory';
+  const unprovenDirectory = path.join(journalPath, unprovenId);
+  await mkdir(unprovenDirectory);
+  await writeJournalEnvelope(path.join(unprovenDirectory, 'transaction.json'), {
+    version: 1, transactionId: unprovenId, phase: 'prepared',
+    createdDirectories: [{ path: 'external-empty' }], writes: [], removes: []
+  });
+  const journal = TextPatchJournal.adopt(journalPath);
+  await assert.rejects(recoverTextFilePatchTransactions(root, journal), /cannot prove ownership|uncertain/iu);
+  assert.equal((await stat(path.join(rootPath, 'external-empty'))).isDirectory(), true);
+  assert.equal((await stat(unprovenDirectory)).isDirectory(), true);
+  journal.close();
+
+  const corruptJournalPath = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-corrupt-journal-'));
+  const corruptId = 'corrupt-cleanup';
+  const corruptDirectory = path.join(corruptJournalPath, corruptId);
+  await mkdir(corruptDirectory);
+  await writeFile(path.join(rootPath, 'victim.txt'), 'keep\n');
+  await writeJournalEnvelope(path.join(corruptDirectory, 'transaction.json'), {
+    version: 1, transactionId: corruptId, phase: 'committed', createdDirectories: [],
+    writes: [{ path: 'target.txt', stageName: 'victim.txt', newSha256: createHash('sha256').update('x').digest('hex'), mode: 0o600, overwrite: false, expectedAbsent: true }],
+    removes: []
+  });
+  const corruptJournal = TextPatchJournal.adopt(corruptJournalPath);
+  await assert.rejects(recoverTextFilePatchTransactions(root, corruptJournal), /invalid patch stage/iu);
+  assert.equal(await readFile(path.join(rootPath, 'victim.txt'), 'utf8'), 'keep\n');
+  corruptJournal.close();
+
+  const checksumJournalPath = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-checksum-journal-'));
+  const checksumId = 'checksum-failure';
+  const checksumDirectory = path.join(checksumJournalPath, checksumId);
+  await mkdir(checksumDirectory);
+  const checksumManifest = { version: 1, transactionId: checksumId, phase: 'prepared', createdDirectories: [], writes: [], removes: [] };
+  await writeFile(path.join(checksumDirectory, 'transaction.json'), JSON.stringify({ version: 1, payload: checksumManifest, sha256: '0'.repeat(64) }), { mode: 0o600 });
+  const checksumJournal = TextPatchJournal.adopt(checksumJournalPath);
+  await assert.rejects(recoverTextFilePatchTransactions(root, checksumJournal), /checksum failed/iu);
+  assert.equal((await stat(checksumDirectory)).isDirectory(), true);
+  checksumJournal.close();
+});
+
+test('an adopted patch journal keeps its physical directory after its display path is replaced', async () => {
+  const rootPath = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-journal-root-'));
+  const parent = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-journal-parent-'));
+  const journalPath = path.join(parent, 'journal');
+  const movedJournalPath = path.join(parent, 'journal-original');
+  await mkdir(journalPath);
+  await writeFile(path.join(rootPath, 'value.txt'), 'before\n');
+  const root = testWorkspaceFileRoot(rootPath);
+  const identity = await root.fileIdentity('value.txt');
+  const journal = TextPatchJournal.adopt(journalPath);
+  await rename(journalPath, movedJournalPath);
+  await mkdir(journalPath);
+  const result = await commitTextFilePatchTransaction(root, journal, {
+    writes: [{ path: 'value.txt', content: 'after\n', overwrite: true, expectedCurrentSha256: createHash('sha256').update('before\n').digest('hex'), expectedCurrentIdentity: identity }],
+    removes: []
+  });
+  assert.equal(result.outcome, 'committed');
+  assert.deepEqual(await readdir(journalPath), []);
+  assert.deepEqual(await readdir(movedJournalPath), []);
+  journal.close();
+});
+
+test('patch journal operation authority expires when its callback returns', async () => {
+  const rootPath = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-authority-root-'));
+  const journalPath = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-authority-journal-'));
+  const root = testWorkspaceFileRoot(rootPath);
+  const journal = TextPatchJournal.adopt(journalPath);
+  if (process.platform !== 'win32') assert.equal((await stat(journalPath)).mode & 0o777, 0o700);
+  let retained;
+  await journal.withAuthority(root, async (authority) => { retained = authority; });
+  await assert.rejects(retained.commit({ writes: [], removes: [] }), /expired/iu);
+  journal.close();
+});
+
+test('a hostile parent swap cannot redirect a structured mutation outside the adopted root', { skip: process.platform !== 'linux' }, async () => {
+  const rootPath = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-race-root-'));
+  const outside = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-race-outside-'));
+  await mkdir(path.join(rootPath, 'branch'));
+  await writeFile(path.join(rootPath, 'branch', 'value.txt'), 'inside\n');
+  await writeFile(path.join(outside, 'value.txt'), 'outside-secret\n');
+  const fixture = path.resolve('tests/fixtures/hostile-path-swap.mjs');
+  const child = spawn(process.execPath, [fixture, rootPath, outside], { stdio: ['ignore', 'pipe', 'inherit'] });
+  await new Promise((resolve, reject) => {
+    child.stdout.once('data', resolve); child.once('error', reject);
+    child.once('exit', (code) => reject(new Error(`Hostile fixture exited early: ${String(code)}`)));
+  });
+  const workspaceFileRoot = testWorkspaceFileRoot(rootPath);
+  try {
+    for (let attempt = 0; attempt < 25; attempt += 1) {
+      try {
+        await invokeToolCall(textToolCall('apply_patch', patch([
+          `*** Add File: branch/new-${String(attempt)}.txt`,
+          '+inside'
+        ])), [applyPatchTool], {
+          policy,
+          services: { workspaceFileRoot, localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION }
+        });
+      } catch { /* A concurrent alias or missing parent is an admitted conflict. */ }
+    }
+    assert.deepEqual((await readdir(outside)).sort(), ['value.txt']);
+    assert.equal(await readFile(path.join(outside, 'value.txt'), 'utf8'), 'outside-secret\n');
+  } finally {
+    child.kill('SIGKILL'); await new Promise((resolve) => child.once('close', resolve));
+  }
 });
 
 test('patch commit revalidates every hash and absent destination before mutation', async () => {
@@ -353,17 +444,19 @@ test('patch commit revalidates every hash and absent destination before mutation
   const destination = path.join(root, 'destination.txt');
   await writeFile(source, 'initial\n');
   const initialSha = createHash('sha256').update('initial\n').digest('hex');
+  const workspaceFileRoot = testWorkspaceFileRoot(root); const journal = testPatchJournal(workspaceFileRoot);
+  const initialIdentity = await workspaceFileRoot.fileIdentity('source.txt');
   await writeFile(source, 'external\n');
-  const changed = await commitTextFilePatchTransaction(root, {
-    writes: [{ path: 'source.txt', absolutePath: source, content: 'patched\n', overwrite: true, expectedCurrentSha256: initialSha }], removes: []
-  }, { journalDirectory });
+  const changed = await commitTextFilePatchTransaction(workspaceFileRoot, journal, {
+    writes: [{ path: 'source.txt', content: 'patched\n', overwrite: true, expectedCurrentSha256: initialSha, expectedCurrentIdentity: initialIdentity }], removes: []
+  });
   assert.equal(changed.outcome, 'rolled_back');
   assert.equal(await readFile(source, 'utf8'), 'external\n');
 
   await writeFile(destination, 'external destination\n');
-  const appeared = await commitTextFilePatchTransaction(root, {
-    writes: [{ path: 'destination.txt', absolutePath: destination, content: 'patched\n', overwrite: false, expectedAbsent: true }], removes: []
-  }, { journalDirectory });
+  const appeared = await commitTextFilePatchTransaction(workspaceFileRoot, journal, {
+    writes: [{ path: 'destination.txt', content: 'patched\n', overwrite: false, expectedAbsent: true }], removes: []
+  });
   assert.equal(appeared.outcome, 'rolled_back');
   assert.equal(await readFile(destination, 'utf8'), 'external destination\n');
 });
@@ -375,17 +468,22 @@ test('one journal lock serializes same-process patches on different and identica
   await writeFile(path.join(root, 'b.txt'), 'b0\n');
   const shaA = createHash('sha256').update('a0\n').digest('hex');
   const shaB = createHash('sha256').update('b0\n').digest('hex');
-  const transaction = (file, content, expectedCurrentSha256) => ({ writes: [{ path: file, absolutePath: path.join(root, file), content, overwrite: true, expectedCurrentSha256 }], removes: [] });
+  const workspaceFileRoot = testWorkspaceFileRoot(root); const journal = testPatchJournal(workspaceFileRoot);
+  const transaction = async (file, content, expectedCurrentSha256) => ({
+    writes: [{ path: file, content, overwrite: true, expectedCurrentSha256, expectedCurrentIdentity: await workspaceFileRoot.fileIdentity(file) }], removes: []
+  });
   const distinct = await Promise.all([
-    commitTextFilePatchTransaction(root, transaction('a.txt', 'a1\n', shaA), { journalDirectory }),
-    commitTextFilePatchTransaction(root, transaction('b.txt', 'b1\n', shaB), { journalDirectory })
+    transaction('a.txt', 'a1\n', shaA).then((value) => commitTextFilePatchTransaction(workspaceFileRoot, journal, value)),
+    transaction('b.txt', 'b1\n', shaB).then((value) => commitTextFilePatchTransaction(workspaceFileRoot, journal, value))
   ]);
   assert.deepEqual(distinct.map((item) => item.outcome), ['committed', 'committed']);
 
   const currentSha = createHash('sha256').update('a1\n').digest('hex');
+  const firstSame = await transaction('a.txt', 'first\n', currentSha);
+  const secondSame = await transaction('a.txt', 'second\n', currentSha);
   const same = await Promise.all([
-    commitTextFilePatchTransaction(root, transaction('a.txt', 'first\n', currentSha), { journalDirectory }),
-    commitTextFilePatchTransaction(root, transaction('a.txt', 'second\n', currentSha), { journalDirectory })
+    commitTextFilePatchTransaction(workspaceFileRoot, journal, firstSame),
+    commitTextFilePatchTransaction(workspaceFileRoot, journal, secondSame)
   ]);
   assert.equal(same.filter((item) => item.outcome === 'committed').length, 1);
   assert.equal(same.filter((item) => item.outcome === 'rolled_back').length, 1);
@@ -394,6 +492,7 @@ test('one journal lock serializes same-process patches on different and identica
 test('the patch journal lock isolates separate Agent Core processes', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-interprocess-'));
   const journalDirectory = path.join(root, '.agent-core', 'transactions', 'patch');
+  await mkdir(journalDirectory, { recursive: true, mode: 0o700 });
   await writeFile(path.join(root, 'shared.txt'), 'base\n');
   const expected = createHash('sha256').update('base\n').digest('hex');
   const fixture = path.resolve('tests/fixtures/patch-concurrency.mjs');
@@ -414,4 +513,9 @@ function runPatchChild(fixture, args) {
     child.once('error', reject);
     child.once('close', (code) => code === 0 ? resolve(JSON.parse(stdout)) : reject(new Error(stderr || `child exited ${String(code)}`)));
   });
+}
+
+async function writeJournalEnvelope(filePath, manifest) {
+  const payload = JSON.stringify(manifest);
+  await writeFile(filePath, JSON.stringify({ version: 1, payload: manifest, sha256: createHash('sha256').update(payload).digest('hex') }), { mode: 0o600 });
 }

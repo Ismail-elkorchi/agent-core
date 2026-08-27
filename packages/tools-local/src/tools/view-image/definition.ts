@@ -1,12 +1,11 @@
-import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { ArtifactRepository } from '@agent-core/evidence';
 import { artifactScope, defineTool, requireToolService, ToolInputError } from '@agent-core/tools';
 import { workspaceFileScope } from '../../core/resources.js';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
-import { assertRealPathInsideRoot, canonicalWorkspacePath, resolveInsideRoot } from '../../core/filesystem.js';
 import { builtInReadEvidence } from '../../core/read-evidence.js';
-import { requireWorkspaceRoot } from '../../core/workspace.js';
+import { requireWorkspaceFileRoot } from '../../core/workspace.js';
+import { workspaceFileIdentitiesEqual } from '../../core/workspace-file-root.js';
 import { viewImageInputSchema, viewImageOutputSchema } from './schema.js';
 
 export const viewImageTool = defineTool({
@@ -15,10 +14,10 @@ export const viewImageTool = defineTool({
   description: 'Load a workspace image as model image content without placing a data URL in the event log.',
   schema: viewImageInputSchema,
   outputSchema: viewImageOutputSchema,
-  requirements: { services: ['workspaceRoot', 'artifactRepository', 'localToolConfiguration'], modelInputModalities: ['image'] },
+  requirements: { services: ['workspaceFileRoot', 'artifactRepository', 'localToolConfiguration'], modelInputModalities: ['image'] },
   effectEnvelope: { accesses: [{ mode: 'read', scope: 'workspace/files' }], lockScopes: [] },
-  async canonicalizeInput(input, context) {
-    return { ...input, path: await canonicalWorkspacePath(requireWorkspaceRoot(context), input.path) };
+  canonicalizeInput(input, context) {
+    return { ...input, path: requireWorkspaceFileRoot(context).canonicalPath(input.path) };
   },
   deriveEffects(input) {
     return {
@@ -28,31 +27,26 @@ export const viewImageTool = defineTool({
     };
   },
   async invoke(input, context) {
-    const root = requireWorkspaceRoot(context);
-    const absolute = resolveInsideRoot(root, input.path);
+    const root = requireWorkspaceFileRoot(context);
     const limits = requireLocalToolConfiguration(context).artifact;
-    const handle = await fs.open(absolute, 'r');
+    const handle = await root.openFile(input.path);
     let bytes: Uint8Array;
     let image: ReturnType<typeof inspectImage>;
     try {
-      const stat = await handle.stat();
-      if (!stat.isFile()) throw new ToolInputError(`Path is not a regular file: ${input.path}`);
-      const identity = fileIdentity(stat);
-      await assertRealPathInsideRoot(root, absolute, input.path);
-      if (stat.size > limits.maxImageEncodedBytes) throw new ToolInputError(`Image exceeds the encoded-byte host limit (${String(stat.size)} bytes, max ${String(limits.maxImageEncodedBytes)}).`);
+      const identity = handle.identity;
+      if (handle.size > limits.maxImageEncodedBytes) throw new ToolInputError(`Image exceeds the encoded-byte host limit (${String(handle.size)} bytes, max ${String(limits.maxImageEncodedBytes)}).`);
       await context.emitProgress?.({ type: 'status', stage: 'image_reading', message: `Reading stable image ${input.path}.` });
-      const buffer = Buffer.alloc(stat.size);
+      const buffer = Buffer.alloc(handle.size);
       let offset = 0;
       while (offset < buffer.byteLength) {
-        const read = await handle.read(buffer, offset, buffer.byteLength - offset, offset);
-        if (read.bytesRead === 0) break;
-        offset += read.bytesRead;
+        const bytesRead = await handle.read(buffer, offset, buffer.byteLength - offset, offset);
+        if (bytesRead === 0) break;
+        offset += bytesRead;
       }
-      const finalHandleStat = await handle.stat();
-      let finalPathStat;
-      try { finalPathStat = await fs.stat(absolute); }
+      let currentPathIdentity;
+      try { currentPathIdentity = await root.fileIdentity(input.path); }
       catch { throw new ToolInputError(`Image file changed or was replaced while it was being read: ${input.path}`); }
-      if (offset !== stat.size || fileIdentity(finalHandleStat) !== identity || fileIdentity(finalPathStat) !== identity) {
+      if (offset !== handle.size || !workspaceFileIdentitiesEqual(await handle.identityNow(), identity) || !workspaceFileIdentitiesEqual(currentPathIdentity, identity)) {
         throw new ToolInputError(`Image file changed or was replaced while it was being read: ${input.path}`);
       }
       bytes = new Uint8Array(buffer);
@@ -153,9 +147,6 @@ function validateDimensions(image: { width?: number; height?: number }, limits: 
 }
 function readUInt24LE(buffer: Buffer, offset: number): number { return buffer.readUIntLE(offset, 3); }
 function invalidImage(filePath: string, reason: string): ToolInputError { return new ToolInputError(`Unsupported or invalid image file (${reason}): ${filePath}`); }
-function fileIdentity(stat: { readonly dev: number | bigint; readonly ino: number | bigint; readonly size: number; readonly mtimeMs: number; readonly ctimeMs: number }): string {
-  return [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].map(String).join(':');
-}
 
 function isArtifactRepository(value: unknown): value is ArtifactRepository {
   return typeof value === 'object' && value !== null

@@ -22,6 +22,7 @@ export type ApplyPatchFailureReason =
   | 'binary'
   | 'too_large'
   | 'symlink'
+  | 'unsafe_link'
   | 'path_outside_workspace'
   | 'duplicate_path'
   | 'sha256_mismatch'

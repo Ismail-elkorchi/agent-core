@@ -15,6 +15,7 @@ import {
   requireLocalToolConfiguration,
   searchTextTool
 } from '@agent-core/tools-local';
+import { testWorkspaceFileRoot } from '../workspace-file-root-helper.js';
 
 const tools = [listDirectoryTool, findFilesTool, readFilesTool, searchTextTool];
 const policy = { allowedRisks: ['read'] };
@@ -22,14 +23,15 @@ const policy = { allowedRisks: ['read'] };
 async function workspace() {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-file-tools-'));
   const configuration = DEFAULT_LOCAL_TOOL_CONFIGURATION;
+  const workspaceFileRoot = testWorkspaceFileRoot(root);
   return {
     root,
     context: {
       policy,
       services: {
-        workspaceRoot: root,
+        workspaceFileRoot,
         localToolConfiguration: configuration,
-        workspaceFileSelector: new WorkspaceFileSelector(root, configuration.fileSelection)
+        workspaceFileSelector: new WorkspaceFileSelector(workspaceFileRoot, configuration.fileSelection)
       }
     }
   };
@@ -80,7 +82,7 @@ test('directory and path selection are sorted, Git-aware, hidden-safe, and match
     services: {
       ...context.services,
       localToolConfiguration: shallowConfiguration,
-      workspaceFileSelector: new WorkspaceFileSelector(root, shallowConfiguration.fileSelection)
+      workspaceFileSelector: new WorkspaceFileSelector(context.services.workspaceFileRoot, shallowConfiguration.fileSelection)
     }
   };
   const clampedDepth = await invokeToolCall(jsonToolCall('list_directory', { depth: 99 }), tools, shallowContext);
@@ -102,7 +104,7 @@ test('local tool hosts retain an owned configuration snapshot after caller mutat
   await writeFile(path.join(root, 'two.txt'), 'two\n');
   const callerOwned = JSON.parse(JSON.stringify(DEFAULT_LOCAL_TOOL_CONFIGURATION));
   const localToolConfiguration = requireLocalToolConfiguration({ services: { localToolConfiguration: callerOwned } });
-  const context = { policy, services: { workspaceRoot: root, localToolConfiguration } };
+  const context = { policy, services: { workspaceFileRoot: testWorkspaceFileRoot(root), localToolConfiguration } };
 
   callerOwned.readFiles.maxFiles = 1;
   callerOwned.readFiles.unexpected = 10;
@@ -147,7 +149,7 @@ test('list_directory depth is structural and find_files still traverses to the h
 
   const shallowLimits = { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.fileSelection, maxVisitedEntries: 3 };
   const shallowConfiguration = { ...DEFAULT_LOCAL_TOOL_CONFIGURATION, fileSelection: shallowLimits };
-  const shallowContext = { ...context, services: { ...context.services, localToolConfiguration: shallowConfiguration, workspaceFileSelector: new WorkspaceFileSelector(root, shallowLimits) } };
+  const shallowContext = { ...context, services: { ...context.services, localToolConfiguration: shallowConfiguration, workspaceFileSelector: new WorkspaceFileSelector(context.services.workspaceFileRoot, shallowLimits) } };
   const shallow = await invokeToolCall(jsonToolCall('list_directory', { depth: 1 }), tools, shallowContext);
   assert.deepEqual(shallow.output.entries.map(entry => entry.path), ['a-deep', 'top.txt', 'z-other']);
   assert.equal(shallow.output.counts.visited, 3);
@@ -156,7 +158,7 @@ test('list_directory depth is structural and find_files still traverses to the h
 
   const hostLimited = { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.fileSelection, maxDepth: 1 };
   const hostConfiguration = { ...DEFAULT_LOCAL_TOOL_CONFIGURATION, fileSelection: hostLimited };
-  const hostContext = { ...context, services: { ...context.services, localToolConfiguration: hostConfiguration, workspaceFileSelector: new WorkspaceFileSelector(root, hostLimited) } };
+  const hostContext = { ...context, services: { ...context.services, localToolConfiguration: hostConfiguration, workspaceFileSelector: new WorkspaceFileSelector(context.services.workspaceFileRoot, hostLimited) } };
   const requestedDeeper = await invokeToolCall(jsonToolCall('list_directory', { depth: 3 }), tools, hostContext);
   assert.equal(requestedDeeper.output.coverage, 'partial');
   assert.equal(requestedDeeper.output.causes.includes('host_depth_limit'), true);
@@ -246,7 +248,7 @@ test('nested gitignore negation, ignore limits, and visit limits are determinist
     ...DEFAULT_LOCAL_TOOL_CONFIGURATION,
     fileSelection: { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.fileSelection, maxVisitedEntries: 3, maxIgnoreFiles: 1 }
   };
-  const limitedContext = { ...context, services: { ...context.services, localToolConfiguration: limitedConfiguration, workspaceFileSelector: new WorkspaceFileSelector(root, limitedConfiguration.fileSelection) } };
+  const limitedContext = { ...context, services: { ...context.services, localToolConfiguration: limitedConfiguration, workspaceFileSelector: new WorkspaceFileSelector(context.services.workspaceFileRoot, limitedConfiguration.fileSelection) } };
   const limited = await invokeToolCall(jsonToolCall('find_files', { patterns: ['**/*'], includeHidden: true }), tools, limitedContext);
   assert.equal(limited.scope.coverage, 'partial');
   assert.equal(limited.scope.causes.includes('visit_limit'), true);

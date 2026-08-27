@@ -15,6 +15,7 @@ import {
   writeStdinTool
 } from '@agent-core/tools-local';
 import { invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
+import { testWorkspaceFileRoot } from '../workspace-file-root-helper.js';
 
 const tools = [execCommandTool, writeStdinTool, stopProcessTool];
 const policy = { allowedRisks: ['read', 'execute'] };
@@ -31,7 +32,7 @@ async function processContext(options = {}, owner = invocation) {
     artifactRepository: artifacts,
     ...configuration.process
   });
-  return { root, artifacts, manager, context: { policy, invocation: owner, services: { workspaceRoot: root, artifactRepository: artifacts, localToolConfiguration: configuration, processManager: manager } } };
+  return { root, artifacts, manager, context: { policy, invocation: owner, services: { workspaceFileRoot: testWorkspaceFileRoot(root), artifactRepository: artifacts, localToolConfiguration: configuration, processManager: manager } } };
 }
 
 async function pollUntilSettled(processId, context, afterCursor = 0) {
@@ -413,10 +414,9 @@ test('reconciliation never signals a PID without authenticated supervisor identi
   }) + '\n');
 
   const host = createLocalToolHost({
-    workspaceRoot: root,
-    artifactDirectory: path.join(root, 'artifacts'),
+    workspacePath: root,
+    artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts') }),
     processLedgerDirectory: ledgerDirectory,
-    patchTransactionDirectory: path.join(root, 'patch-transactions'),
     enabledTools: ['exec_command', 'write_stdin', 'stop_process']
   });
   await host.ready();
@@ -480,10 +480,9 @@ test('local host durably hands recovered terminal reports to old runs during sta
   const { processId } = JSON.parse(crashed.stdout);
   const delivered = [];
   const host = createLocalToolHost({
-    workspaceRoot: root,
-    artifactDirectory: path.join(root, 'host-artifacts'),
+    workspacePath: root,
+    artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'host-artifacts') }),
     processLedgerDirectory: path.join(root, 'processes'),
-    patchTransactionDirectory: path.join(root, 'patch-transactions'),
     enabledTools: ['exec_command', 'write_stdin', 'stop_process'],
     async deliverRecoveredTerminalReport(report) { delivered.push(report); return true; }
   });

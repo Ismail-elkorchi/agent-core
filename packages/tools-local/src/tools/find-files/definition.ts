@@ -1,10 +1,9 @@
 import { defineTool } from '@agent-core/tools';
 import { workspaceFileScope } from '../../core/resources.js';
-import { canonicalWorkspacePath } from '../../core/filesystem.js';
 import { workspaceFileSelector } from '../../core/workspace-file-selection.js';
 import { presentFindFilesObservation } from '../../core/presenters.js';
 import { builtInReadEvidence } from '../../core/read-evidence.js';
-import { requireWorkspaceRoot } from '../../core/workspace.js';
+import { requireWorkspaceFileRoot } from '../../core/workspace.js';
 import { findFilesInputSchema, findFilesOutputSchema, type FindFilesInput } from './schema.js';
 
 interface CanonicalFindFilesInput extends FindFilesInput { readonly path: string }
@@ -16,10 +15,10 @@ export const findFilesTool = defineTool({
   schema: findFilesInputSchema,
   outputSchema: findFilesOutputSchema,
   presentObservation: presentFindFilesObservation,
-  requirements: { services: ['workspaceRoot', 'workspaceFileSelector'] },
+  requirements: { services: ['workspaceFileRoot', 'workspaceFileSelector'] },
   effectEnvelope: { accesses: [{ mode: 'read', scope: 'workspace/files' }], lockScopes: [] },
-  async canonicalizeInput(input, context): Promise<CanonicalFindFilesInput> {
-    return { ...input, path: await canonicalWorkspacePath(requireWorkspaceRoot(context), input.path) };
+  canonicalizeInput(input, context): CanonicalFindFilesInput {
+    return { ...input, path: requireWorkspaceFileRoot(context).canonicalPath(input.path) };
   },
   deriveEffects(input) {
     return { accesses: [{ mode: 'read', scope: workspaceFileScope(input.path) }], lockScopes: [], idempotency: 'pure' };

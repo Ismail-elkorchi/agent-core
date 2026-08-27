@@ -1,10 +1,9 @@
 import { defineTool } from '@agent-core/tools';
 import { workspaceFileScope } from '../../core/resources.js';
-import { canonicalWorkspacePath } from '../../core/filesystem.js';
 import { workspaceFileSelector } from '../../core/workspace-file-selection.js';
 import { presentListDirectoryObservation } from '../../core/presenters.js';
 import { builtInReadEvidence } from '../../core/read-evidence.js';
-import { requireWorkspaceRoot } from '../../core/workspace.js';
+import { requireWorkspaceFileRoot } from '../../core/workspace.js';
 import { listDirectoryInputSchema, listDirectoryOutputSchema, type ListDirectoryInput } from './schema.js';
 
 interface CanonicalListDirectoryInput extends ListDirectoryInput { readonly path: string }
@@ -16,12 +15,12 @@ export const listDirectoryTool = defineTool({
   schema: listDirectoryInputSchema,
   outputSchema: listDirectoryOutputSchema,
   presentObservation: presentListDirectoryObservation,
-  requirements: { services: ['workspaceRoot', 'localToolConfiguration', 'workspaceFileSelector'] },
+  requirements: { services: ['workspaceFileRoot', 'localToolConfiguration', 'workspaceFileSelector'] },
   effectEnvelope: { accesses: [{ mode: 'read', scope: 'workspace/files' }], lockScopes: [] },
-  async canonicalizeInput(input, context): Promise<CanonicalListDirectoryInput> {
+  canonicalizeInput(input, context): CanonicalListDirectoryInput {
     return {
       ...input,
-      path: await canonicalWorkspacePath(requireWorkspaceRoot(context), input.path),
+      path: requireWorkspaceFileRoot(context).canonicalPath(input.path),
       depth: input.depth
     };
   },

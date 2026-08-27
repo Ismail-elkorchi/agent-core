@@ -8,6 +8,7 @@ import { AgentRuntime, agentEventCodec } from '@agent-core/runtime';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/evidence';
 import { defineTool } from '@agent-core/tools';
 import { DEFAULT_LOCAL_TOOL_CONFIGURATION, ProcessManager, execCommandTool } from '@agent-core/tools-local';
+import { testWorkspaceFileRoot } from '../workspace-file-root-helper.js';
 
 const boundary = { authorizationPolicyId: 'tests/process-cleanup@1', executionTargetId: 'workspace' };
 const profile = {
@@ -29,7 +30,7 @@ async function setup() {
   const artifacts = new InMemoryArtifactRepository();
   const manager = new ProcessManager({ artifactRepository: artifacts, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
   const events = new InMemoryEventRepository(agentEventCodec);
-  const services = { workspaceRoot: root, artifactRepository: artifacts, localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION, processManager: manager };
+  const services = { workspaceFileRoot: testWorkspaceFileRoot(root), artifactRepository: artifacts, localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION, processManager: manager };
   return { root, artifacts, manager, events, services };
 }
 function createRuntime(input) {

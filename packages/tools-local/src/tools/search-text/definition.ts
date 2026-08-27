@@ -1,9 +1,8 @@
 import { defineTool } from '@agent-core/tools';
 import { workspaceFileScope } from '../../core/resources.js';
-import { canonicalWorkspacePath } from '../../core/filesystem.js';
 import { searchText } from './run.js';
 import { presentSearchTextObservation } from '../../core/presenters.js';
-import { requireWorkspaceRoot } from '../../core/workspace.js';
+import { requireWorkspaceFileRoot } from '../../core/workspace.js';
 import { searchTextInputSchema, searchTextOutputSchema } from './schema.js';
 
 export const searchTextTool = defineTool({
@@ -13,10 +12,10 @@ export const searchTextTool = defineTool({
   schema: searchTextInputSchema,
   outputSchema: searchTextOutputSchema,
   presentObservation: presentSearchTextObservation,
-  requirements: { services: ['workspaceRoot', 'localToolConfiguration'] },
+  requirements: { services: ['workspaceFileRoot', 'localToolConfiguration', 'workspaceFileSelector'] },
   effectEnvelope: { accesses: [{ mode: 'read', scope: 'workspace/files' }], lockScopes: [] },
-  async canonicalizeInput(input, context) {
-    return { ...input, path: await canonicalWorkspacePath(requireWorkspaceRoot(context), input.path) };
+  canonicalizeInput(input, context) {
+    return { ...input, path: requireWorkspaceFileRoot(context).canonicalPath(input.path) };
   },
   deriveEffects(input) {
     return { accesses: [{ mode: 'read', scope: workspaceFileScope(input.path) }], lockScopes: [], idempotency: 'pure' };

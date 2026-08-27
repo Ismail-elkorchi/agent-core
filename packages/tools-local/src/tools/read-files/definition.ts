@@ -1,9 +1,8 @@
 import { defineTool } from '@agent-core/tools';
 import { workspaceFileScope } from '../../core/resources.js';
-import { canonicalWorkspacePath } from '../../core/filesystem.js';
 import { readFiles } from './run.js';
 import { presentReadFilesObservation } from '../../core/presenters.js';
-import { requireWorkspaceRoot } from '../../core/workspace.js';
+import { requireWorkspaceFileRoot } from '../../core/workspace.js';
 import { readFilesInputSchema, readFilesOutputSchema } from './schema.js';
 
 export const readFilesTool = defineTool({
@@ -13,11 +12,11 @@ export const readFilesTool = defineTool({
   schema: readFilesInputSchema,
   outputSchema: readFilesOutputSchema,
   presentObservation: presentReadFilesObservation,
-  requirements: { services: ['workspaceRoot', 'localToolConfiguration'] },
+  requirements: { services: ['workspaceFileRoot', 'localToolConfiguration'] },
   effectEnvelope: { accesses: [{ mode: 'read', scope: 'workspace/files' }], lockScopes: [] },
-  async canonicalizeInput(input, context) {
-    const root = requireWorkspaceRoot(context);
-    return { ...input, files: await Promise.all(input.files.map(async (file) => ({ ...file, path: await canonicalWorkspacePath(root, file.path) }))) };
+  canonicalizeInput(input, context) {
+    const root = requireWorkspaceFileRoot(context);
+    return { ...input, files: input.files.map((file) => ({ ...file, path: root.canonicalPath(file.path) })) };
   },
   deriveEffects(input) {
     return { accesses: [...new Set(input.files.map((file) => workspaceFileScope(file.path)))].map((scope) => ({ mode: 'read' as const, scope })), lockScopes: [], idempotency: 'pure' };

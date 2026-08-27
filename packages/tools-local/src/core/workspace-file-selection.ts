@@ -1,11 +1,9 @@
-import { promises as fs } from 'node:fs';
-import type { Dirent } from 'node:fs';
 import path from 'node:path';
 import createIgnore, { type Ignore } from 'ignore';
 import { ToolInputError, throwIfAborted, type ToolExecutionContext } from '@agent-core/tools';
 import { requireLocalToolConfiguration } from './configuration.js';
-import { relativePath, requireDirectoryInsideRoot, resolveInsideRoot } from './filesystem.js';
-import { requireWorkspaceRoot } from './workspace.js';
+import { requireWorkspaceFileRoot } from './workspace.js';
+import { isWorkspaceFileRoot, type WorkspaceFileRoot, type WorkspaceDirectoryEntry } from './workspace-file-root.js';
 
 export type WorkspaceEntryType = 'file' | 'directory' | 'symlink' | 'other';
 export interface WorkspaceFileSelectionLimits { readonly maxDepth: number; readonly maxVisitedEntries: number; readonly maxReturnedEntries: number; readonly maxIgnoreFiles: number; readonly maxGlobExpansions: number }
@@ -43,13 +41,14 @@ export interface WorkspaceFileSelectionResult {
 interface IgnoreRules { readonly base: string; readonly matcher: Ignore }
 
 export class WorkspaceFileSelector {
-  private readonly rootDir: string;
-  constructor(rootDir: string, private readonly limits: WorkspaceFileSelectionLimits) { this.rootDir = path.resolve(rootDir); }
+  constructor(private readonly root: WorkspaceFileRoot, private readonly limits: WorkspaceFileSelectionLimits) {
+    if (!isWorkspaceFileRoot(root)) throw new TypeError('WorkspaceFileSelector requires an adopted WorkspaceFileRoot.');
+  }
 
   async select(request: WorkspaceFileSelectionRequest): Promise<WorkspaceFileSelectionResult> {
-    const start = resolveInsideRoot(this.rootDir, request.startPath);
-    await requireDirectoryInsideRoot(this.rootDir, start, request.startPath);
-    const startPath = relativePath(this.rootDir, start) || '.';
+    const startPath = this.root.canonicalPath(request.startPath);
+    const startHandle = await this.root.openDirectory(startPath);
+    await startHandle.close();
     const patterns = request.patterns.length > 0 ? request.patterns.map(normalizePattern) : ['**/*'];
     const exclusions = request.exclude.map(normalizePattern);
     if (patterns.length + exclusions.length > this.limits.maxGlobExpansions) throw new ToolInputError('Workspace glob patterns exceed the host limit.');
@@ -75,27 +74,35 @@ export class WorkspaceFileSelector {
     const walk = async (directory: string, depth: number, inherited: readonly IgnoreRules[]): Promise<void> => {
       if (stopped) return;
       throwIfAborted(request.signal);
-      let directoryEntries: Dirent[];
-      try { directoryEntries = await fs.readdir(directory, { withFileTypes: true }); }
+      let directoryEntries: readonly WorkspaceDirectoryEntry[];
+      try {
+        const handle = await this.root.openDirectory(directory);
+        try { directoryEntries = await handle.entries(); }
+        finally { await handle.close(); }
+      }
       catch (error) {
         causes.add('unreadable_branch');
         omit('unreadable_branch', 1, 'at_least');
-        sample(samples, { path: relativePath(this.rootDir, directory), reason: 'unreadable', message: message(error) });
+        sample(samples, { path: directory, reason: 'unreadable', message: message(error) });
         return;
       }
-      directoryEntries.sort((a, b) => a.name.localeCompare(b.name, 'en'));
+      directoryEntries = [...directoryEntries].sort((a, b) => a.name.localeCompare(b.name, 'en'));
       let rules = inherited;
-      const ignoreEntry = request.respectGitIgnore ? directoryEntries.find((entry) => entry.name === '.gitignore' && entry.isFile()) : undefined;
+      const ignoreEntry = request.respectGitIgnore ? directoryEntries.find((entry) => entry.name === '.gitignore' && entry.type === 'file') : undefined;
       if (ignoreEntry) {
         if (loadedIgnoreFiles < this.limits.maxIgnoreFiles) {
           try {
-            const base = relativePath(this.rootDir, directory);
-            const content = await fs.readFile(path.join(directory, ignoreEntry.name), 'utf8');
+            const base = directory;
+            const ignorePath = joinWorkspacePath(directory, ignoreEntry.name);
+            const file = await this.root.openFile(ignorePath);
+            let content: string;
+            try { content = (await file.readAll(1_000_000)).toString('utf8'); }
+            finally { await file.close(); }
             rules = Object.freeze([...inherited, { base: base === '.' ? '' : base, matcher: createIgnore().add(content) }]);
             loadedIgnoreFiles += 1;
           } catch (error) {
             causes.add('unreadable_ignore_file');
-            sample(samples, { path: relativePath(this.rootDir, path.join(directory, ignoreEntry.name)), reason: 'unreadable', message: message(error) });
+            sample(samples, { path: joinWorkspacePath(directory, ignoreEntry.name), reason: 'unreadable', message: message(error) });
           }
         } else {
           omittedIgnoreFiles += 1;
@@ -108,16 +115,15 @@ export class WorkspaceFileSelector {
         throwIfAborted(request.signal);
         if (visitedEntries >= this.limits.maxVisitedEntries) {
           stopped = true; omit('visit_limit', 1, 'at_least'); causes.add('visit_limit');
-          sample(samples, { path: relativePath(this.rootDir, path.join(directory, dirent.name)), reason: 'limit' });
+          sample(samples, { path: joinWorkspacePath(directory, dirent.name), reason: 'limit' });
           break;
         }
         visitedEntries += 1;
-        const absolute = path.join(directory, dirent.name);
-        const workspacePath = relativePath(this.rootDir, absolute);
-        const scopedPath = relativePath(start, absolute);
-        const type = entryType(dirent);
+        const workspacePath = joinWorkspacePath(directory, dirent.name);
+        const scopedPath = startPath === '.' ? workspacePath : workspacePath.slice(startPath.length + 1);
+        const type = dirent.type;
         const isDirectory = type === 'directory';
-        if (workspacePath === '.git' || workspacePath.startsWith('.git/')) { omit('git_metadata'); continue; }
+        if (this.root.isReservedPath(workspacePath)) { omit('reserved_metadata'); continue; }
         if (!request.includeHidden && hidden(workspacePath)) { omit('hidden'); sample(samples, { path: workspacePath, reason: 'hidden' }); continue; }
         if (matchesAny(scopedPath, exclusions, isDirectory)) { omit('excluded'); sample(samples, { path: workspacePath, reason: 'excluded' }); continue; }
         if (request.respectGitIgnore && ignored(workspacePath, isDirectory, rules)) { omit('gitignored'); sample(samples, { path: workspacePath, reason: 'gitignored' }); continue; }
@@ -128,25 +134,25 @@ export class WorkspaceFileSelector {
             sample(samples, { path: workspacePath, reason: 'limit' });
             break;
           }
-          try { entries.push(await makeEntry(workspacePath, absolute, type, request.includeMetadata === true)); }
+          try { entries.push(await makeEntry(this.root, workspacePath, type, request.includeMetadata === true)); }
           catch (error) { omit('unreadable_entry'); causes.add('unreadable_entry'); sample(samples, { path: workspacePath, reason: 'unreadable', message: message(error) }); }
         }
         if (isDirectory) {
           if (depth >= traversalDepth) {
             const hostLimited = request.traversalDepth === undefined || requestedDepth > this.limits.maxDepth;
             if (hostLimited && depth >= this.limits.maxDepth) {
-              const descendants = await immediateEntryCount(absolute);
+              const descendants = await immediateEntryCount(this.root, workspacePath);
               if (descendants > 0) {
                 causes.add('host_depth_limit'); omit('host_depth_limit', descendants, 'at_least'); sample(samples, { path: workspacePath, reason: 'limit' });
               }
             }
             continue;
           }
-          await walk(absolute, depth + 1, rules);
+          await walk(workspacePath, depth + 1, rules);
         }
       }
     };
-    await walk(start, 1, []);
+    await walk(startPath, 1, []);
     if (omittedIgnoreFiles > 0) causes.add('ignore_file_limit');
     const lowerBound = [...omissionCounts.values()].some((item) => item.relation === 'at_least');
     return Object.freeze({
@@ -160,12 +166,16 @@ export class WorkspaceFileSelector {
     });
   }
 }
-async function immediateEntryCount(directory: string): Promise<number> {
-  try { return (await fs.readdir(directory)).length; }
+async function immediateEntryCount(root: WorkspaceFileRoot, directory: string): Promise<number> {
+  try {
+    const handle = await root.openDirectory(directory);
+    try { return (await handle.entries()).length; }
+    finally { await handle.close(); }
+  }
   catch { return 1; }
 }
 
-export function createWorkspaceFileSelector(rootDir: string, limits: WorkspaceFileSelectionLimits): WorkspaceFileSelector { return new WorkspaceFileSelector(rootDir, limits); }
+export function createWorkspaceFileSelector(root: WorkspaceFileRoot, limits: WorkspaceFileSelectionLimits): WorkspaceFileSelector { return new WorkspaceFileSelector(root, limits); }
 export function isWorkspaceFileSelector(value: unknown): value is WorkspaceFileSelector { return value instanceof WorkspaceFileSelector; }
 export function workspaceFileSelector(context: ToolExecutionContext): WorkspaceFileSelector {
   const service = context.services?.workspaceFileSelector;
@@ -173,7 +183,7 @@ export function workspaceFileSelector(context: ToolExecutionContext): WorkspaceF
     if (!isWorkspaceFileSelector(service)) throw new ToolInputError('The workspaceFileSelector service is invalid.');
     return service;
   }
-  return createWorkspaceFileSelector(requireWorkspaceRoot(context), requireLocalToolConfiguration(context).fileSelection);
+  return createWorkspaceFileSelector(requireWorkspaceFileRoot(context), requireLocalToolConfiguration(context).fileSelection);
 }
 function ignored(workspacePath: string, directory: boolean, rules: readonly IgnoreRules[]): boolean {
   let result = false;
@@ -199,13 +209,23 @@ function normalizePattern(pattern: string): string {
   if (normalized.length === 0 || path.posix.isAbsolute(normalized) || normalized.split('/').includes('..')) throw new ToolInputError('Invalid workspace glob pattern: ' + pattern, { pattern });
   return normalized;
 }
-function entryType(dirent: Dirent): WorkspaceEntryType { return dirent.isFile() ? 'file' : dirent.isDirectory() ? 'directory' : dirent.isSymbolicLink() ? 'symlink' : 'other'; }
 function matchesType(actual: WorkspaceEntryType, requested: WorkspaceFileSelectionRequest['type']): boolean { return requested === 'any' || actual === requested; }
-async function makeEntry(workspacePath: string, absolutePath: string, type: WorkspaceEntryType, metadata: boolean): Promise<WorkspaceSelectionEntry> {
+async function makeEntry(root: WorkspaceFileRoot, workspacePath: string, type: WorkspaceEntryType, metadata: boolean): Promise<WorkspaceSelectionEntry> {
   if (!metadata) return Object.freeze({ path: workspacePath, type });
-  const stat = await fs.lstat(absolutePath);
-  return Object.freeze({ path: workspacePath, type, size: stat.size, modifiedAt: stat.mtime.toISOString() });
+  if (type === 'file') {
+    const handle = await root.openFile(workspacePath);
+    try { return Object.freeze({ path: workspacePath, type, size: handle.size, modifiedAt: nanosecondsToIso(handle.identity.modifiedNanoseconds) }); }
+    finally { await handle.close(); }
+  }
+  if (type === 'directory') {
+    const handle = await root.openDirectory(workspacePath);
+    try { return Object.freeze({ path: workspacePath, type, size: handle.size, modifiedAt: nanosecondsToIso(handle.identity.modifiedNanoseconds) }); }
+    finally { await handle.close(); }
+  }
+  return Object.freeze({ path: workspacePath, type });
 }
 function hidden(value: string): boolean { return value.split('/').some((segment) => segment.startsWith('.') && segment !== '.' && segment !== '..'); }
 function sample(samples: WorkspaceFileSelectionResult['omissionSamples'][number][], entry: WorkspaceFileSelectionResult['omissionSamples'][number]): void { if (samples.length < 10) samples.push(Object.freeze(entry)); }
 function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+function joinWorkspacePath(parent: string, name: string): string { return parent === '.' ? name : `${parent}/${name}`; }
+function nanosecondsToIso(value: string): string { return new Date(Number(BigInt(value) / 1_000_000n)).toISOString(); }

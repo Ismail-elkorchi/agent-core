@@ -16,6 +16,7 @@ import {
   viewImageTool
 } from '@agent-core/tools-local';
 import { invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
+import { testWorkspaceFileRoot } from '../workspace-file-root-helper.js';
 
 const onePixelPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
 
@@ -23,11 +24,12 @@ async function readHost() {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-read-evidence-'));
   const artifacts = new InMemoryArtifactRepository();
   const configuration = DEFAULT_LOCAL_TOOL_CONFIGURATION;
+  const workspaceFileRoot = testWorkspaceFileRoot(root);
   const services = {
-    workspaceRoot: root,
+    workspaceFileRoot,
     artifactRepository: artifacts,
     localToolConfiguration: configuration,
-    workspaceFileSelector: new WorkspaceFileSelector(root, configuration.fileSelection)
+    workspaceFileSelector: new WorkspaceFileSelector(workspaceFileRoot, configuration.fileSelection)
   };
   return { root, artifacts, services, context: { policy: { allowedRisks: ['read'] }, services } };
 }

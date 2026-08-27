@@ -6,6 +6,7 @@ import path from 'node:path';
 import * as z from 'zod';
 import { createToolCall, defineTool, enforceAllowedEffects, prepareToolCall } from '@agent-core/tools';
 import { applyPatchTool, DEFAULT_LOCAL_TOOL_CONFIGURATION } from '@agent-core/tools-local';
+import { testWorkspaceFileRoot } from '../workspace-file-root-helper.js';
 
 const boundary = { authorizationPolicyId: 'tests/authorization@1', executionTargetId: 'workspace' };
 const signal = new AbortController().signal;
@@ -24,7 +25,7 @@ test('a read-only policy denies a writing apply_patch call before approval', asy
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-authorization-'));
   const call = { name: 'apply_patch', input: { kind: 'text', value: '*** Begin Patch\n*** Add File: created.txt\n+created\n*** End Patch' } };
   const policy = { allowedRisks: ['read'] };
-  const services = { workspaceRoot: root, localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION };
+  const services = { workspaceFileRoot: testWorkspaceFileRoot(root), localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION };
   const preparedCall = await prepared(call, [applyPatchTool], policy, services);
   const denial = enforceAllowedEffects(request(call, preparedCall, policy, services));
   assert.deepEqual(denial.decision, 'deny');
@@ -54,7 +55,7 @@ test('an allowed write may require approval but approval never adds a denied ris
 test('delete may require approval only when destructive authority is already allowed', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-delete-approval-'));
   const call = { name: 'apply_patch', input: { kind: 'text', value: '*** Begin Patch\n*** Delete File: delete.txt\n*** End Patch' } };
-  const services = { workspaceRoot: root, localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION };
+  const services = { workspaceFileRoot: testWorkspaceFileRoot(root), localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION };
   const allowedPolicy = { allowedRisks: ['read', 'write', 'destructive'] };
   const allowed = await prepared(call, [applyPatchTool], allowedPolicy, services);
   assert.equal(enforceAllowedEffects(request(call, allowed, allowedPolicy, services)), undefined);

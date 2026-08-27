@@ -4,6 +4,17 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const linuxRootCapabilityTests = new Set([
+  'tests/self-hosting-smoke.test.js',
+  'tests/tools/apply-patch.test.js',
+  'tests/tools/artifacts-images.test.js',
+  'tests/tools/authorization-invariants.test.js',
+  'tests/tools/durable-redaction.test.js',
+  'tests/tools/file-tools.test.js',
+  'tests/tools/process-tools.test.js',
+  'tests/tools/read-evidence.test.js',
+  'tests/tools/runtime-process-cleanup.test.js'
+].map((value) => path.join(root, value)));
 
 export async function ordinaryTestFiles() {
   return (await filesUnder(path.join(root, 'tests')))
@@ -12,7 +23,8 @@ export async function ordinaryTestFiles() {
 }
 
 async function run() {
-  const files = await ordinaryTestFiles();
+  const discovered = await ordinaryTestFiles();
+  const files = process.platform === 'linux' ? discovered : discovered.filter((file) => !linuxRootCapabilityTests.has(file));
   if (files.length === 0) throw new Error('No ordinary test files were discovered under tests/.');
   const child = spawn(process.execPath, ['--test', ...files], { cwd: root, stdio: 'inherit' });
   const code = await new Promise((resolve, reject) => {

@@ -1,10 +1,11 @@
 import { requireToolService, type ToolExecutionContext } from '@agent-core/tools';
+import { isWorkspaceFileRoot, type WorkspaceFileRoot } from './workspace-file-root.js';
 
-export function requireWorkspaceRoot(context: ToolExecutionContext): string {
+export function requireWorkspaceFileRoot(context: ToolExecutionContext): WorkspaceFileRoot {
   return requireToolService(
     context,
-    'workspaceRoot',
-    (value): value is string => typeof value === 'string' && value.trim().length > 0,
-    'non-empty string workspace root'
+    'workspaceFileRoot',
+    isWorkspaceFileRoot,
+    'adopted WorkspaceFileRoot'
   );
 }

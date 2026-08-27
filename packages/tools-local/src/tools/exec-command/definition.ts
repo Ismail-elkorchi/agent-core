@@ -1,10 +1,9 @@
 import { defineTool, requireToolService } from '@agent-core/tools';
 import { workspaceFileScope, workspaceProcessScope } from '../../core/resources.js';
-import { canonicalWorkspacePath, requireDirectoryInsideRoot, resolveInsideRoot } from '../../core/filesystem.js';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
 import { isProcessManager, type ProcessManager, type ProcessOwner } from '../../core/process-manager.js';
 import { presentProcessObservation } from '../../core/presenters.js';
-import { requireWorkspaceRoot } from '../../core/workspace.js';
+import { requireWorkspaceFileRoot } from '../../core/workspace.js';
 import { isSuccessfulProcessResult } from '../process-output.js';
 import { execCommandOutputSchema, execCommandSchema } from './schema.js';
 
@@ -17,12 +16,13 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
     schema: execCommandSchema(ptySupported),
     outputSchema: execCommandOutputSchema,
     presentObservation: presentProcessObservation,
-    requirements: { services: ['workspaceRoot', 'localToolConfiguration', 'processManager'] },
+    requirements: { services: ['workspaceFileRoot', 'localToolConfiguration', 'processManager'] },
     effectEnvelope: { accesses: [{ mode: 'execute', scope: workspaceProcessScope() }], lockScopes: [workspaceFileScope()] },
     async canonicalizeInput(input, context) {
-      const root = requireWorkspaceRoot(context);
-      const workdir = await canonicalWorkspacePath(root, input.workdir);
-      await requireDirectoryInsideRoot(root, resolveInsideRoot(root, workdir), workdir);
+      const root = requireWorkspaceFileRoot(context);
+      const workdir = root.canonicalPath(input.workdir);
+      const directory = await root.openDirectory(workdir);
+      await directory.close();
       const limits = requireLocalToolConfiguration(context).process;
       return {
         ...input, pty: 'pty' in input && input.pty === true, workdir,
@@ -37,11 +37,12 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
     async invoke(input, context) {
       const manager = requireToolService<ProcessManager>(context, 'processManager', isProcessManager, 'ProcessManager');
       const owner = processOwner(context.invocation);
+      const commandDirectory = await requireWorkspaceFileRoot(context).commandDirectory(input.workdir);
       await context.emitProgress?.({ type: 'status', stage: 'process_starting', message: 'Starting ambient process.' });
       let result;
       try {
         result = await manager.start({
-          command: input.command, cwd: resolveInsideRoot(requireWorkspaceRoot(context), input.workdir), pty: input.pty,
+          command: input.command, cwd: commandDirectory.path, pty: input.pty,
           timeoutMs: input.timeoutMs, yieldMs: input.yieldMs, outputTokenBudget: input.outputTokenBudget, owner,
           ...(context.signal ? { signal: context.signal } : {}), ...(context.resourceLease ? { lease: context.resourceLease } : {}),
           onProgress: (progress) => context.emitProgress?.(progress)
@@ -49,7 +50,7 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
       } catch (error) {
         await context.emitProgress?.({ type: 'status', stage: 'process_failed', message: error instanceof Error ? error.message : String(error) });
         throw error;
-      }
+      } finally { await commandDirectory.close(); }
       return {
         kind: 'result' as const, ok: isSuccessfulProcessResult(result),
         summary: result.status === 'running' ? 'Process continues as ' + result.processId + '.' : 'Process ' + result.status + (result.exitCode === undefined ? '' : ' with exit code ' + String(result.exitCode)) + '.',

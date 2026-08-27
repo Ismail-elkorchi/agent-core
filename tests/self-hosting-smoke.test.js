@@ -16,10 +16,11 @@ import {
   readFilesTool,
   searchTextTool
 } from '@agent-core/tools-local';
+import { testPatchJournal, testWorkspaceFileRoot } from './workspace-file-root-helper.js';
 
 const tools = [listDirectoryTool, findFilesTool, readFilesTool, searchTextTool, applyPatchTool, execCommandTool];
 
-test('scripted self-hosting run survives approvals, structured tools, verification, and one terminal commit', async () => {
+test('scripted self-hosting run survives approvals, structured tools, verification, and one terminal commit', { skip: process.platform !== 'linux' }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-self-host-'));
   await writeFile(path.join(root, 'note.txt'), 'alpha\n');
   const calls = [
@@ -43,13 +44,14 @@ test('scripted self-hosting run survives approvals, structured tools, verificati
     maxCapturedBytes: DEFAULT_LOCAL_TOOL_CONFIGURATION.process.maxCapturedBytes,
     tailBytes: DEFAULT_LOCAL_TOOL_CONFIGURATION.process.tailBytes
   });
+  const workspaceFileRoot = testWorkspaceFileRoot(root);
   const services = {
-    workspaceRoot: root,
+    workspaceFileRoot,
     artifactRepository: artifacts,
     localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION,
-    patchTransactionDirectory: path.join(root, '.agent-core', 'transactions', 'patch'),
+    patchJournal: testPatchJournal(workspaceFileRoot),
     processManager,
-    workspaceFileSelector: new WorkspaceFileSelector(root, DEFAULT_LOCAL_TOOL_CONFIGURATION.fileSelection)
+    workspaceFileSelector: new WorkspaceFileSelector(workspaceFileRoot, DEFAULT_LOCAL_TOOL_CONFIGURATION.fileSelection)
   };
   const options = {
     provider,

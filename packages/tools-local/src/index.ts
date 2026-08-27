@@ -1,6 +1,18 @@
 export * from './core/configuration.js';
 export * from './core/process-manager.js';
 export * from './core/workspace-file-selection.js';
+export {
+  WorkspaceFileRoot,
+  isWorkspaceFileRoot,
+  workspaceFileIdentitiesEqual,
+  type WorkspaceFileRootOptions,
+  type WorkspaceFileIdentity,
+  type WorkspaceFileHandle,
+  type WorkspaceDirectoryEntry,
+  type WorkspaceDirectoryHandle,
+  type WorkspacePathStatus
+} from './core/workspace-file-root.js';
+export { TextPatchJournal, isTextPatchJournal, type TextTransactionResult } from './core/text-write.js';
 export * from './host.js';
 export * from './tools/list-directory/index.js';
 export * from './tools/find-files/index.js';
