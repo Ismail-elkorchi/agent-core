@@ -19,6 +19,7 @@ import { writeStdinTool } from './tools/write-stdin/index.js';
 
 export interface LocalToolHostOptions {
   readonly workspacePath: string;
+  readonly additionalDeniedWorkspaceEntries?: readonly string[];
   readonly artifactRepository: ArtifactRepository;
   readonly processLedgerDirectory?: string;
   readonly patchJournal?: TextPatchJournal;
@@ -61,7 +62,9 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
   let patchJournal: TextPatchJournal | undefined;
   try {
     patchJournal = options.patchJournal;
-    workspaceFileRoot = WorkspaceFileRoot.adopt(options.workspacePath);
+    workspaceFileRoot = WorkspaceFileRoot.adopt(options.workspacePath, options.additionalDeniedWorkspaceEntries === undefined
+      ? {}
+      : { additionalDeniedEntries: options.additionalDeniedWorkspaceEntries });
   } catch (error) {
     patchJournal?.close(); workspaceFileRoot?.close(); throw error;
   }
