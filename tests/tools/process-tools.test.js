@@ -9,6 +9,7 @@ import { spawnSync } from 'node:child_process';
 import {
   DEFAULT_LOCAL_TOOL_CONFIGURATION,
   ProcessManager,
+  WorkspaceFileRoot,
   createLocalToolHost,
   execCommandTool,
   stopProcessTool,
@@ -414,7 +415,7 @@ test('reconciliation never signals a PID without authenticated supervisor identi
   }) + '\n');
 
   const host = createLocalToolHost({
-    workspacePath: root,
+    workspaceFileRoot: WorkspaceFileRoot.adopt(root),
     artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts') }),
     processLedgerDirectory: ledgerDirectory,
     enabledTools: ['exec_command', 'write_stdin', 'stop_process']
@@ -480,7 +481,7 @@ test('local host durably hands recovered terminal reports to old runs during sta
   const { processId } = JSON.parse(crashed.stdout);
   const delivered = [];
   const host = createLocalToolHost({
-    workspacePath: root,
+    workspaceFileRoot: WorkspaceFileRoot.adopt(root),
     artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'host-artifacts') }),
     processLedgerDirectory: path.join(root, 'processes'),
     enabledTools: ['exec_command', 'write_stdin', 'stop_process'],

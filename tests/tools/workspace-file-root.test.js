@@ -55,10 +55,17 @@ test('an adopted root keeps its original physical authority after its path is re
   await mkdir(rootPath);
   await writeFile(path.join(rootPath, 'value.txt'), 'original\n');
   const root = WorkspaceFileRoot.adopt(rootPath);
+  const identity = root.identity;
+  assert.equal(Object.isFrozen(identity), true);
+  assert.equal(identity.canonicalPath, rootPath);
   await rename(rootPath, movedPath);
   await mkdir(rootPath);
   await writeFile(path.join(rootPath, 'value.txt'), 'replacement-secret\n');
   try {
+    assert.equal(root.identity, identity);
+    const replacement = WorkspaceFileRoot.adopt(rootPath);
+    try { assert.notEqual(replacement.identity.inode, identity.inode); }
+    finally { replacement.close(); }
     const file = await root.openFile('value.txt');
     try { assert.equal((await file.readAll(100)).toString('utf8'), 'original\n'); }
     finally { await file.close(); }
@@ -97,6 +104,7 @@ test('released workspace file roots reject later authority use', { skip: process
   const file = await root.openFile('value.txt');
   const directory = await root.openDirectory('.');
   root.close();
+  assert.throws(() => root.identity, /released/iu);
   assert.throws(() => root.canonicalPath('.'), /released/iu);
   await assert.rejects(root.openDirectory('.'), /released/iu);
   await assert.rejects(file.readAll(100), /released/iu);

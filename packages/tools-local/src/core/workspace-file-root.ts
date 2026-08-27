@@ -64,6 +64,13 @@ export interface WorkspaceFileRootOptions {
   readonly additionalDeniedEntries?: readonly string[];
 }
 
+export interface WorkspaceRootIdentity {
+  readonly canonicalPath: string;
+  readonly device: string;
+  readonly inode: string;
+  readonly mountId: string;
+}
+
 export type WorkspacePathStatus =
   | { readonly kind: 'absent'; readonly path: string }
   | { readonly kind: 'file'; readonly path: string; readonly identity: WorkspaceFileIdentity; readonly size: number; readonly mode: number }
@@ -83,13 +90,15 @@ export class WorkspaceFileRoot {
   readonly #displayPath: string;
   readonly #rootFd: number;
   readonly #rootMountId: string;
+  readonly #identity: WorkspaceRootIdentity;
   readonly #deniedRootEntries: ReadonlySet<string>;
   #closed = false;
 
-  private constructor(displayPath: string, rootFd: number, rootMountId: string, deniedRootEntries: ReadonlySet<string>) {
+  private constructor(displayPath: string, rootFd: number, rootMountId: string, rootIdentity: WorkspaceRootIdentity, deniedRootEntries: ReadonlySet<string>) {
     this.#displayPath = displayPath;
     this.#rootFd = rootFd;
     this.#rootMountId = rootMountId;
+    this.#identity = rootIdentity;
     this.#deniedRootEntries = deniedRootEntries;
     ownedRoots.add(this);
   }
@@ -108,7 +117,9 @@ export class WorkspaceFileRoot {
       const openedPath = readlinkSync(`/proc/self/fd/${String(rootFd)}`);
       if (openedPath.endsWith(' (deleted)')) throw new Error(`Workspace root was removed during adoption: ${displayPath}`);
       const denied = ownDeniedEntries([...DEFAULT_DENIED_ROOT_ENTRIES, ...(options.additionalDeniedEntries ?? [])]);
-      return new WorkspaceFileRoot(displayPath, rootFd, readMountId(rootFd), denied);
+      const mountId = readMountId(rootFd);
+      const rootIdentity = Object.freeze({ canonicalPath: displayPath, device: String(stat.dev), inode: String(stat.ino), mountId });
+      return new WorkspaceFileRoot(displayPath, rootFd, mountId, rootIdentity, denied);
     } catch (error) {
       if (rootFd !== undefined) closeSync(rootFd);
       throw error;
@@ -116,6 +127,7 @@ export class WorkspaceFileRoot {
   }
 
   get displayPath(): string { return this.#displayPath; }
+  get identity(): WorkspaceRootIdentity { this.#assertOpen(); return this.#identity; }
 
   canonicalPath(requestedPath: string): string {
     this.#assertOpen();

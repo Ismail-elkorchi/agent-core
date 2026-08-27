@@ -4,7 +4,7 @@ import type { CompiledToolDefinition, ToolResourceLease } from '@agent-core/tool
 import { parseLocalToolConfiguration, DEFAULT_LOCAL_TOOL_CONFIGURATION, type LocalToolConfiguration } from './core/configuration.js';
 import { ProcessManager, type ProcessReconciliationResult, type ProcessTerminalReport, type PtyProcessFactory } from './core/process-manager.js';
 import { WorkspaceFileSelector } from './core/workspace-file-selection.js';
-import { WorkspaceFileRoot } from './core/workspace-file-root.js';
+import { isWorkspaceFileRoot, type WorkspaceFileRoot } from './core/workspace-file-root.js';
 import { TextPatchJournal } from './core/text-write.js';
 import { applyPatchTool } from './tools/apply-patch/index.js';
 import { createExecCommandTool } from './tools/exec-command/index.js';
@@ -18,8 +18,7 @@ import { viewImageTool } from './tools/view-image/index.js';
 import { writeStdinTool } from './tools/write-stdin/index.js';
 
 export interface LocalToolHostOptions {
-  readonly workspacePath: string;
-  readonly additionalDeniedWorkspaceEntries?: readonly string[];
+  readonly workspaceFileRoot: WorkspaceFileRoot;
   readonly artifactRepository: ArtifactRepository;
   readonly processLedgerDirectory?: string;
   readonly patchJournal?: TextPatchJournal;
@@ -62,9 +61,8 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
   let patchJournal: TextPatchJournal | undefined;
   try {
     patchJournal = options.patchJournal;
-    workspaceFileRoot = WorkspaceFileRoot.adopt(options.workspacePath, options.additionalDeniedWorkspaceEntries === undefined
-      ? {}
-      : { additionalDeniedEntries: options.additionalDeniedWorkspaceEntries });
+    if (!isWorkspaceFileRoot(options.workspaceFileRoot)) throw new TypeError('Local tool host requires an adopted WorkspaceFileRoot.');
+    workspaceFileRoot = options.workspaceFileRoot;
   } catch (error) {
     patchJournal?.close(); workspaceFileRoot?.close(); throw error;
   }

@@ -6,6 +6,7 @@ export {
   isWorkspaceFileRoot,
   workspaceFileIdentitiesEqual,
   type WorkspaceFileRootOptions,
+  type WorkspaceRootIdentity,
   type WorkspaceFileIdentity,
   type WorkspaceFileHandle,
   type WorkspaceDirectoryEntry,
