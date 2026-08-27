@@ -10,14 +10,43 @@ export interface RuntimeCodec<T> {
 
 export interface EventAppendOptions extends AppendEventOptions { readonly idempotencyKey?: string }
 
+export interface EventLedgerTail {
+  readonly sequence: number;
+  readonly hash?: string;
+  readonly driverGeneration: number;
+}
+
+export interface ConditionalEventAppendOptions extends AppendEventOptions {
+  readonly idempotencyKey: string;
+  readonly expectedTail: EventLedgerTail;
+  readonly driverGeneration: number;
+}
+
+export interface PersistenceFailure {
+  readonly code?: string;
+  readonly message: string;
+}
+
+export type ConditionalEventAppendResult =
+  | Readonly<{ kind: 'committed'; receipt: EventAppendReceipt; tail: EventLedgerTail }>
+  | Readonly<{ kind: 'already_committed'; receipt: EventAppendReceipt; tail: EventLedgerTail }>
+  | Readonly<{ kind: 'rejected'; reason: 'stale_tail' | 'stale_driver' | 'idempotency_conflict'; tail: EventLedgerTail }>
+  | Readonly<{ kind: 'not_committed'; failure: PersistenceFailure }>
+  | Readonly<{ kind: 'committed_index_unknown'; receipt: EventAppendReceipt; tail: EventLedgerTail; failure: PersistenceFailure }>
+  | Readonly<{ kind: 'outcome_unknown'; failure: PersistenceFailure }>;
+
 interface EncodedEnvelope extends JsonObject {
   readonly eventId: string; readonly runId: string; readonly sequence: number; readonly timestamp: string;
   readonly schemaVersion: string; readonly actor: EventActor; readonly event: JsonObject; readonly hash: string;
   readonly causationId?: string; readonly correlationId?: string; readonly idempotencyKey?: string; readonly previousHash?: string;
+  readonly driverGeneration: number;
 }
 
 export interface EventRepository<TEvent extends TypedEvent> {
   append(runId: string, event: TEvent, options?: EventAppendOptions): Promise<EventAppendReceipt>;
+  appendConditional(runId: string, event: TEvent, options: ConditionalEventAppendOptions): Promise<ConditionalEventAppendResult>;
+  tail(runId: string): Promise<EventLedgerTail>;
+  latest(runId: string): Promise<EventEnvelope<TEvent> | undefined>;
   read(runId: string): AsyncIterable<EventEnvelope<TEvent>>;
   listRunIds(): Promise<readonly string[]>;
   verifyIntegrity(runId: string): Promise<LedgerIntegrityReport>;
@@ -66,12 +95,73 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
         ...(options.causationId ? { causationId: options.causationId } : {}),
         ...(options.correlationId ? { correlationId: options.correlationId } : {}),
         ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-        ...(previous ? { previousHash: previous.hash } : {})
+        ...(previous ? { previousHash: previous.hash } : {}),
+        driverGeneration: previous?.driverGeneration ?? 0
       });
       const encodedEnvelope: EncodedEnvelope = Object.freeze({ ...base, hash: hashJson(base) });
       records.push(encodedEnvelope);
       this.records.set(runId, records);
       return receiptFromEncoded(encodedEnvelope);
+    });
+    this.queue = operation.then(() => undefined, () => undefined);
+    return operation;
+  }
+
+  appendConditional(runId: string, event: TEvent, options: ConditionalEventAppendOptions): Promise<ConditionalEventAppendResult> {
+    const operation = this.queue.then(() => {
+      assertIdentifier(runId, 'runId');
+      assertConditionalOptions(options);
+      assertIdentifier(options.idempotencyKey, 'idempotencyKey');
+      const encodedEvent = this.codec.encode(event);
+      const records = this.records.get(runId) ?? [];
+      const currentTail = tailFromEncoded(records.at(-1));
+      const existing = records.find((record) => record.idempotencyKey === options.idempotencyKey);
+      if (existing !== undefined) {
+        if (canonicalJsonString(existing.event) !== canonicalJsonString(encodedEvent)) {
+          return Object.freeze({ kind: 'rejected' as const, reason: 'idempotency_conflict' as const, tail: currentTail });
+        }
+        return Object.freeze({ kind: 'already_committed' as const, receipt: receiptFromEncoded(existing), tail: currentTail });
+      }
+      if (!sameTail(options.expectedTail, currentTail)) {
+        return Object.freeze({ kind: 'rejected' as const, reason: 'stale_tail' as const, tail: currentTail });
+      }
+      if (options.driverGeneration !== currentTail.driverGeneration && options.driverGeneration !== currentTail.driverGeneration + 1) {
+        return Object.freeze({ kind: 'rejected' as const, reason: 'stale_driver' as const, tail: currentTail });
+      }
+      const previous = records.at(-1);
+      const base = Object.freeze({
+        eventId: randomUUID(), runId, sequence: records.length, timestamp: options.timestamp ?? new Date().toISOString(),
+        schemaVersion: '1', actor: options.actor ?? inferActor(event.type), event: encodedEvent,
+        ...(options.causationId ? { causationId: options.causationId } : {}),
+        ...(options.correlationId ? { correlationId: options.correlationId } : {}),
+        idempotencyKey: options.idempotencyKey,
+        ...(previous ? { previousHash: previous.hash } : {}),
+        driverGeneration: options.driverGeneration
+      });
+      const encodedEnvelope: EncodedEnvelope = Object.freeze({ ...base, hash: hashJson(base) });
+      records.push(encodedEnvelope);
+      this.records.set(runId, records);
+      const tail = tailFromEncoded(encodedEnvelope);
+      return Object.freeze({ kind: 'committed' as const, receipt: receiptFromEncoded(encodedEnvelope), tail });
+    });
+    this.queue = operation.then(() => undefined, () => undefined);
+    return operation;
+  }
+
+  tail(runId: string): Promise<EventLedgerTail> {
+    const operation = this.queue.then(() => {
+      assertIdentifier(runId, 'runId');
+      return tailFromEncoded(this.records.get(runId)?.at(-1));
+    });
+    this.queue = operation.then(() => undefined, () => undefined);
+    return operation;
+  }
+
+  latest(runId: string): Promise<EventEnvelope<TEvent> | undefined> {
+    const operation = this.queue.then(() => {
+      assertIdentifier(runId, 'runId');
+      const encoded = this.records.get(runId)?.at(-1);
+      return encoded === undefined ? undefined : envelopeFromEncoded(encoded, this.domainEvent(encoded));
     });
     this.queue = operation.then(() => undefined, () => undefined);
     return operation;
@@ -132,17 +222,50 @@ function envelopeFromEncoded<TEvent extends TypedEvent>(encoded: EncodedEnvelope
     ...(encoded.correlationId ? { correlationId: encoded.correlationId } : {}),
     ...(encoded.idempotencyKey ? { idempotencyKey: encoded.idempotencyKey } : {}),
     ...(encoded.previousHash ? { previousHash: encoded.previousHash } : {}),
-    hash: encoded.hash, event
+    hash: encoded.hash, driverGeneration: encoded.driverGeneration, event
   });
 }
 
 function receiptFromEncoded(encoded: EncodedEnvelope): EventAppendReceipt {
   return Object.freeze({
     eventId: encoded.eventId, runId: encoded.runId, sequence: encoded.sequence, timestamp: encoded.timestamp,
-    schemaVersion: encoded.schemaVersion, actor: encoded.actor, hash: encoded.hash,
+    schemaVersion: encoded.schemaVersion, actor: encoded.actor, hash: encoded.hash, driverGeneration: encoded.driverGeneration,
     ...(encoded.causationId ? { causationId: encoded.causationId } : {}), ...(encoded.correlationId ? { correlationId: encoded.correlationId } : {}),
     ...(encoded.idempotencyKey ? { idempotencyKey: encoded.idempotencyKey } : {}), ...(encoded.previousHash ? { previousHash: encoded.previousHash } : {})
   });
+}
+
+function tailFromEncoded(encoded: EncodedEnvelope | undefined): EventLedgerTail {
+  return Object.freeze(encoded === undefined
+    ? { sequence: -1, driverGeneration: 0 }
+    : { sequence: encoded.sequence, hash: encoded.hash, driverGeneration: encoded.driverGeneration });
+}
+
+function sameTail(left: EventLedgerTail, right: EventLedgerTail): boolean {
+  return left.sequence === right.sequence && left.hash === right.hash && left.driverGeneration === right.driverGeneration;
+}
+
+function assertConditionalOptions(options: unknown): void {
+  if (!isRecord(options) || typeof options.idempotencyKey !== 'string' || !isRecord(options.expectedTail)) {
+    throw new TypeError('Conditional event append options are invalid.');
+  }
+  const expected = options.expectedTail;
+  if (!Number.isSafeInteger(expected.sequence) || typeof expected.sequence !== 'number' || expected.sequence < -1
+    || !Number.isSafeInteger(expected.driverGeneration) || typeof expected.driverGeneration !== 'number' || expected.driverGeneration < 0
+    || (expected.sequence === -1 ? expected.hash !== undefined : typeof expected.hash !== 'string')
+    || !Number.isSafeInteger(options.driverGeneration) || typeof options.driverGeneration !== 'number' || options.driverGeneration < 0
+    || (options.actor !== undefined && !isEventActor(options.actor))
+    || !optionalStringFields(options, ['causationId', 'correlationId', 'timestamp'])) {
+    throw new TypeError('Conditional event append options are invalid.');
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
+function optionalStringFields(record: Record<string, unknown>, fields: readonly string[]): boolean {
+  return fields.every((field) => record[field] === undefined || typeof record[field] === 'string');
+}
+function isEventActor(value: unknown): value is EventActor {
+  return value === 'user' || value === 'runtime' || value === 'model' || value === 'tool' || value === 'system' || value === 'check';
 }
 
 function assertIdentifier(value: string, name: string): void { if (!/^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/u.test(value)) throw new Error(`${name} is invalid.`); }

@@ -19,6 +19,7 @@ export interface EventEnvelope<TEvent extends TypedEvent = TypedEvent> {
   readonly idempotencyKey?: string;
   readonly previousHash?: string;
   readonly hash: string;
+  readonly driverGeneration: number;
   readonly event: TEvent;
 }
 
@@ -34,6 +35,7 @@ export interface EventAppendReceipt {
   readonly idempotencyKey?: string;
   readonly previousHash?: string;
   readonly hash: string;
+  readonly driverGeneration: number;
 }
 
 export interface AppendEventOptions {
