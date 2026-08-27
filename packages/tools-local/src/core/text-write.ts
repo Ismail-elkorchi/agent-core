@@ -462,7 +462,8 @@ async function withJournalLock<T>(journalDirectory: string, signal: AbortSignal 
       if (nodeCode(error) !== 'EEXIST') throw error;
       const owner = await readLockOwner(lockPath);
       if (!owner) {
-        const lockStat = await stat(lockPath);
+        const lockStat = await statIfPresent(lockPath);
+        if (lockStat === undefined) continue;
         if (Date.now() - lockStat.mtimeMs < 30_000) { await wait(signal); continue; }
         throw new Error(`Patch journal lock has no valid owner: ${lockPath}`, { cause: error });
       }
@@ -480,6 +481,10 @@ async function withJournalLock<T>(journalDirectory: string, signal: AbortSignal 
     const owner = await readLockOwner(lockPath);
     if (owner?.nonce === nonce) { await rm(lockPath, { recursive: true, force: true }); await syncDirectory(journalDirectory); }
   }
+}
+async function statIfPresent(targetPath: string) {
+  try { return await stat(targetPath); }
+  catch (error) { if (nodeCode(error) === 'ENOENT') return undefined; throw error; }
 }
 async function readLockOwner(lockPath: string): Promise<{ nonce?: string; pid: number; hostname: string; processIdentity: string } | undefined> {
   try {
