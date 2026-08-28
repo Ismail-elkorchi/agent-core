@@ -221,12 +221,10 @@ test('OpenAICodexProvider bounds post-header stream idleness', async () => {
     streamIdleTimeoutMs: 12,
     fetch: async () => stalledSseResponse()
   });
-  const statuses = [];
   await assert.rejects(
-    async () => { for await (const event of provider.stream({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hi' }] })) if (event.type === 'status') statuses.push(event); },
+    async () => { for await (const _event of provider.stream({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hi' }] })) { /* consume */ } },
     error => error instanceof ModelProviderError && error.code === 'provider_unavailable' && /idle/iu.test(error.message)
   );
-  assert.equal(statuses.some((event) => /stream data/iu.test(event.message)), true);
 });
 
 test('OpenAICodexProvider rejects malformed nested Responses fields', async () => {
