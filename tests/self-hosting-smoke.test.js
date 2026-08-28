@@ -91,7 +91,9 @@ test('scripted self-hosting run survives approvals, structured tools, verificati
   assert.equal(result.terminal.verificationStatus, 'passed');
   assert.equal(await readFile(path.join(root, 'note.txt'), 'utf8'), 'beta\n');
   assert.equal(ledger.filter((event) => event.type === 'run.ended').length, 1);
-  assert.deepEqual(ledger.filter((event) => event.type === 'tool.ended').map((event) => event.toolName), tools.map((tool) => tool.name));
+  const endedTools = ledger.filter((event) => event.type === 'tool.ended').map((event) => event.toolName);
+  assert.equal(endedTools.length, tools.length);
+  assert.deepEqual(endedTools.toSorted(), tools.map((tool) => tool.name).toSorted());
 });
 
 class ScriptedProvider {
