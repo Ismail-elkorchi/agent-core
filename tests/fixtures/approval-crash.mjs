@@ -37,6 +37,7 @@ else await sessions.open(sessionId);
 
 const provider = {
   id: 'fixture',
+  implementationId: 'agent-core.tests.approval-crash-provider@1',
   describe() { return { id: 'fixture', displayName: 'Fixture', defaultModel: 'fixture' }; },
   async describeModel() {
     return {

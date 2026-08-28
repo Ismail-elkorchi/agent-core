@@ -19,6 +19,7 @@ const profile = {
 const done = { content: 'done', model: 'scripted', provider: 'scripted', terminationReason: 'stop' };
 class Provider {
   id = 'scripted';
+  implementationId = 'agent-core.tests.runtime-process-provider@1';
   constructor(script) { this.script = [...script]; }
   describe() { return { id: this.id, displayName: 'Scripted', defaultModel: 'scripted' }; }
   async describeModel() { return profile; }

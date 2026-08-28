@@ -163,7 +163,7 @@ export interface AgentCheckDefinition {
 export type AgentLimitKind =
   | 'model_turns' | 'total_tool_calls' | 'repeated_tool_calls' | 'elapsed_time'
   | 'prompt_tokens' | 'completion_tokens' | 'known_cost' | 'consecutive_provider_failures'
-  | 'consecutive_tool_failures' | 'provider_retries';
+  | 'consecutive_tool_failures';
 export interface AgentRunLimits {
   readonly maxConcurrentToolCalls: number;
   readonly modelTurns: number;
@@ -178,7 +178,6 @@ export interface AgentRunLimits {
   readonly knownCost: { readonly amount: number; readonly currency: string };
   readonly consecutiveProviderFailures: number;
   readonly consecutiveToolFailures: number;
-  readonly providerRetries: number;
 }
 export const DEFAULT_AGENT_RUN_LIMITS: AgentRunLimits = Object.freeze({
   maxConcurrentToolCalls: 4,
@@ -193,8 +192,7 @@ export const DEFAULT_AGENT_RUN_LIMITS: AgentRunLimits = Object.freeze({
   activeImageTokens: 32_000,
   knownCost: Object.freeze({ amount: 10, currency: 'USD' }),
   consecutiveProviderFailures: 3,
-  consecutiveToolFailures: 5,
-  providerRetries: 6
+  consecutiveToolFailures: 5
 });
 export type AgentRunBudgetState = Readonly<{
   readonly modelTurns: number;
@@ -211,10 +209,7 @@ export type AgentRunBudgetState = Readonly<{
   readonly unknownPricedTokens: number;
   readonly consecutiveProviderFailures: number;
   readonly consecutiveToolFailures: number;
-  readonly providerRetries: number;
 }>;
-export interface AgentRunRetryPolicy { readonly retriesPerRequest: number; readonly initialDelayMs: number; readonly multiplier: number; readonly maximumDelayMs: number }
-export const DEFAULT_AGENT_RUN_RETRY_POLICY: AgentRunRetryPolicy = Object.freeze({ retriesPerRequest: 2, initialDelayMs: 250, multiplier: 2, maximumDelayMs: 4_000 });
 
 export interface AgentTurnSnapshotRecord {
   readonly turnIndex: number;
@@ -321,7 +316,7 @@ export function validateAgentRunLimits(input: Partial<AgentRunLimits> = {}): Age
   const fields: (keyof Omit<AgentRunLimits, 'knownCost'>)[] = [
     'maxConcurrentToolCalls', 'modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'elapsedMs', 'promptTokens',
     'completionTokens', 'activeImageCount', 'activeImageBytes', 'activeImageTokens',
-    'consecutiveProviderFailures', 'consecutiveToolFailures', 'providerRetries'
+    'consecutiveProviderFailures', 'consecutiveToolFailures'
   ];
   const issues = fields.flatMap((field) => positiveInteger(limits[field]) ? [] : [`${field} must be a positive finite integer.`]);
   if (!Number.isFinite(limits.knownCost.amount) || limits.knownCost.amount <= 0) issues.push('knownCost.amount must be positive and finite.');
@@ -512,7 +507,7 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
 export function terminalSnapshotFingerprint(snapshot: AgentTerminalSnapshot): string { return canonicalJsonString(snapshot); }
 const AGENT_LIMIT_KINDS: readonly AgentLimitKind[] = [
   'model_turns', 'total_tool_calls', 'repeated_tool_calls', 'elapsed_time', 'prompt_tokens',
-  'completion_tokens', 'known_cost', 'consecutive_provider_failures', 'consecutive_tool_failures', 'provider_retries'
+  'completion_tokens', 'known_cost', 'consecutive_provider_failures', 'consecutive_tool_failures'
 ];
 const FAILURE_REASONS: readonly AgentFailureTerminationReason[] = [
   'model_output_limit', 'content_filtered', 'unknown_model_termination', 'empty_response', 'malformed_response',
@@ -549,7 +544,7 @@ function completedCandidateIssues(terminationReason: unknown, candidateStatus: A
 }
 function isBudgetState(value: unknown): value is AgentRunBudgetState {
   if (!isRecord(value)) return false;
-  const names = ['modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'elapsedMs', 'promptTokens', 'completionTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'unknownPricedTokens', 'consecutiveProviderFailures', 'consecutiveToolFailures', 'providerRetries'];
+  const names = ['modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'elapsedMs', 'promptTokens', 'completionTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'unknownPricedTokens', 'consecutiveProviderFailures', 'consecutiveToolFailures'];
   if (!names.every((name) => typeof value[name] === 'number' && Number.isFinite(value[name]) && Number.isInteger(value[name]) && (value[name]) >= 0)) return false;
   return finiteNonnegativeNumberRecord(value.knownCosts)
     && oneOf(value.pricingStatus, ['known', 'partial', 'unknown']);

@@ -70,6 +70,7 @@ const CONTENT_TYPE_JSON = 'application/json';
 
 export class OpenRouterProvider implements ModelProvider {
   readonly id = OPENROUTER_PROVIDER_ID;
+  readonly implementationId = 'agent-core.provider.openrouter@1';
   private readonly apiKey: string | undefined;
   private readonly baseUrl: string;
   private readonly defaultModel: string;

@@ -99,6 +99,7 @@ test('read-tool evidence reaches durable observations, session context, prompt s
   const requests = [];
   const provider = {
     id: 'evidence-provider',
+    implementationId: 'agent-core.tests.evidence-provider@1',
     describe() { return { id: this.id, displayName: 'Evidence provider', defaultModel: 'evidence-model' }; },
     async describeModel() {
       return {

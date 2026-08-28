@@ -63,6 +63,7 @@ function response(terminationReason = 'stop', content = 'done', extra = {}) {
 
 class ScriptedProvider {
   id = 'scripted';
+  implementationId = 'agent-core.tests.scripted-provider@1';
   calls = [];
   constructor(script, options = {}) { this.script = [...script]; this.options = options; }
   describe() { return { id: this.id, displayName: 'Scripted', defaultModel: 'scripted' }; }
@@ -101,7 +102,6 @@ async function harness(options = {}) {
     ...(options.contextProvider ? { contextProvider: options.contextProvider } : {}),
     ...(options.onProgress ? { onProgress: options.onProgress } : {}),
     ...(options.limits ? { limits: options.limits } : {}),
-    ...(options.retryPolicy ? { retryPolicy: options.retryPolicy } : {}),
     ...(options.clock ? { clock: options.clock } : {})
   });
   return { agent, provider, events, sessions, session, artifacts };
@@ -345,18 +345,19 @@ test('candidate mappings preserve execution, completeness, source, and verificat
   }
 });
 
-test('stream interruption preserves a partial stream-recovery candidate and never verifies it', async () => {
+test('stream interruption preserves an unknown provider outcome without treating partial output as settlement', async () => {
   const provider = new ScriptedProvider([], { profile: { capabilities: { ...capabilities, streaming: true } } });
   provider.createSession = () => ({
     async complete() { throw new Error('not used'); },
     async *stream() { yield { type: 'content', content: 'part', accumulated: 'part' }; throw new Error('socket closed'); }
   });
   const { agent, events } = await harness({ provider, withoutSession: true });
-  const result = ended(await agent.run({ task: 'stream' }).result);  assert.equal(result.executionStatus, 'failed');
-  assert.deepEqual(result.candidate, { status: 'partial', message: 'part', source: 'stream_recovery', turnIndex: 1 });
-  assert.equal(result.verificationStatus, 'not_run');
-  const interrupted = (await eventsFor(events, result.runId)).find((event) => event.type === 'assistant.interrupted');
-  assert.equal(interrupted.candidate.source, 'stream_recovery');
+  const result = await agent.run({ task: 'stream' }).result;
+  assert.equal(result.state, 'suspended');
+  assert.equal(result.reason, 'provider_outcome_unknown');
+  const records = await eventsFor(events, result.runId);
+  assert.equal(records.some((event) => event.type === 'assistant.interrupted'), false);
+  assert.equal(records.some((event) => event.type === 'provider.attempt.settled'), false);
 });
 
 test('abort during verification produces aborted/not_run and preserves a partial candidate', async () => {
@@ -569,7 +570,7 @@ test('session replay preserves an accepted task from an interrupted run', async 
   assert.equal(result.candidate.message, 'recovered interrupted task');
 });
 
-test('run limits and retry policy terminate deterministically', async () => {
+test('model-turn limits terminate deterministically', async () => {
   const call = { id: '1', type: 'function', name: 'noop', input: { kind: 'json', value: {} } };
   const provider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] })]);
   const noop = { name: 'noop', implementationId: 'tests/noop-model-change@1', description: 'noop', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope, decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return readEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; } };
@@ -577,37 +578,77 @@ test('run limits and retry policy terminate deterministically', async () => {
   const exhausted = ended(await agent.run({ task: 'limit' }).result);  assert.equal(exhausted.terminationReason, 'limit_exhausted');
   assert.equal(exhausted.exhaustedLimit, 'model_turns');
 
-  const retrying = new ScriptedProvider([new ModelProviderError({ provider: 'scripted', code: 'provider_unavailable', message: 'retry', retryable: true }), response()]);
-  const retryHarness = await harness({ provider: retrying, retryPolicy: { retriesPerRequest: 1, initialDelayMs: 0 } });
-  const retried = ended(await retryHarness.agent.run({ task: 'retry' }).result);  assert.equal(retried.executionStatus, 'completed');
-  assert.equal(retrying.calls.length, 2);
-  assert.equal((await eventsFor(retryHarness.events, retried.runId)).filter((event) => event.type === 'run.retry.scheduled').length, 1);
 });
 
-test('provider retries persist distinct attempt identities and honor session retry disposition', async () => {
-  for (const [disposition, expectedResets] of [['reusable', 0], ['unknown', 1]]) {
-    const provider = new ScriptedProvider([]);
-    const script = [new ModelProviderError({ provider: 'scripted', code: 'provider_unavailable', message: 'retry', retryable: true }), response()];
-    let resets = 0;
-    provider.createSession = () => ({
-      async complete(request) {
-        provider.calls.push(request);
-        const next = script.shift();
-        if (next instanceof Error) throw next;
-        return { ...next, model: request.model };
-      },
-      retryDisposition() { return disposition; },
-      resetContinuation() { resets += 1; }
-    });
-    const run = await harness({ provider, retryPolicy: { retriesPerRequest: 1, initialDelayMs: 0 }, withoutSession: true });
-    const result = ended(await run.agent.run({ task: `retry ${disposition}` }).result);    const records = await eventsFor(run.events, result.runId);
-    const requested = records.filter(event => event.type === 'model.requested');
-    assert.deepEqual(requested.map(event => event.requestAttempt), [1, 2]);
-    assert.equal(new Set(requested.map(event => event.turnId)).size, 1);
-    assert.equal(records.find(event => event.type === 'model.responded').requestAttempt, 2);
-    assert.equal(records.find(event => event.type === 'assistant.ended').requestAttempt, 2);
-    assert.equal(resets, expectedResets);
+test('provider failure preserves one durable unknown outcome without a second request', async () => {
+  const provider = new ScriptedProvider([new ModelProviderError({ provider: 'scripted', code: 'provider_unavailable', message: 'unknown outcome', retryable: true }), response()]);
+  const run = await harness({ provider, withoutSession: true });
+  const result = await run.agent.run({ task: 'one provider attempt' }).result;
+  assert.equal(result.state, 'suspended');
+  assert.equal(result.reason, 'provider_outcome_unknown');
+  assert.equal(provider.calls.length, 1);
+  const records = await eventsFor(run.events, result.runId);
+  assert.equal(records.filter(event => event.type === 'model.requested').length, 1);
+  assert.equal(records.filter(event => event.type === 'provider.attempt.settled').length, 0);
+  const operation = await new AgentOperationCoordinator(run.events).inspect(result.runId);
+  assert.equal(operation.state.phase.kind, 'provider');
+  assert.equal(operation.state.phase.stage, 'outcome_unknown');
+  assert.equal(operation.state.phase.effect.intent.implementationId, provider.implementationId);
+  assert.deepEqual(operation.state.phase.effect.intent.recovery, { kind: 'unknown' });
+  assert.deepEqual(operation.state.phase.effect.intent.exposure.quantities.map(quantity => quantity.unit), ['prompt_tokens', 'completion_tokens']);
+  assert.ok(operation.state.phase.effect.intent.exposure.quantities.every(quantity => quantity.amount > 0));
+});
+
+test('a persisted provider settlement resumes without issuing a duplicate request', async () => {
+  class InterruptedSettlementRepository extends InMemoryEventRepository {
+    interrupt = true;
+    async appendConditional(runId, event, options) {
+      if (this.interrupt && event.type === 'operation.transition' && event.state.phase.kind === 'provider' && event.state.phase.stage === 'settled') {
+        this.interrupt = false;
+        throw new Error('simulated process stop after provider settlement');
+      }
+      return super.appendConditional(runId, event, options);
+    }
   }
+  const events = new InterruptedSettlementRepository(agentEventCodec);
+  const provider = new ScriptedProvider([response('stop', 'persisted answer'), response('stop', 'duplicate')]);
+  const first = await harness({ events, provider, withoutSession: true });
+  const control = first.agent.run({ task: 'resume settled provider response' });
+  await assert.rejects(control.result, /simulated process stop|unresolved started provider effect/);
+  assert.equal(provider.calls.length, 1);
+  const operation = await new AgentOperationCoordinator(events).inspect(control.runId);
+  assert.equal(operation.state.phase.kind, 'provider');
+  assert.equal(operation.state.phase.stage, 'effect_pending');
+  const resumed = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events } });
+  const result = ended(await resumed.resume(control.runId).result);
+  assert.equal(result.executionStatus, 'completed');
+  assert.equal(result.candidate.message, 'persisted answer');
+  assert.equal(provider.calls.length, 1);
+  const records = await eventsFor(events, control.runId);
+  assert.equal(records.filter(event => event.type === 'provider.attempt.settled').length, 1);
+  assert.equal(records.filter(event => event.type === 'assistant.ended').length, 1);
+});
+
+test('provider takeover never starts a second request while the previous owner may still be live', async () => {
+  let releaseRequest;
+  let reportStarted;
+  const started = new Promise(resolve => { reportStarted = resolve; });
+  const blocked = new Promise(resolve => { releaseRequest = resolve; });
+  const provider = new ScriptedProvider([
+    async () => { reportStarted(); await blocked; return response('stop', 'late response'); },
+    response('stop', 'duplicate response')
+  ]);
+  const first = await harness({ provider, withoutSession: true });
+  const original = first.agent.run({ task: 'fence provider execution' });
+  await started;
+  const replacement = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: first.events } });
+  const recovered = await replacement.resume(original.runId).result;
+  assert.equal(recovered.state, 'suspended');
+  assert.equal(recovered.reason, 'provider_outcome_unknown');
+  assert.equal(provider.calls.length, 1);
+  releaseRequest();
+  await assert.rejects(original.result);
+  assert.equal(provider.calls.length, 1);
 });
 
 test('final request snapshot separates every dynamic context provenance and hashes the prompt', async () => {
@@ -881,14 +922,14 @@ test('elapsed limits use the injected monotonic clock', async () => {
   assert.equal(result.budget.elapsedMs, 10);
 });
 
-test('elapsed limits actively abort a provider request that never settles', async () => {
+test('elapsed limits abort a live provider request without inventing a known outcome', async () => {
   const provider = new ScriptedProvider([
     request => new Promise((_resolve, reject) => request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true }))
   ]);
-  const run = await harness({ provider, limits: { elapsedMs: 20 }, retryPolicy: { retriesPerRequest: 0 }, withoutSession: true });
-  const result = ended(await run.agent.run({ task: 'stalled provider' }).result);  assert.equal(result.terminationReason, 'limit_exhausted');
-  assert.equal(result.exhaustedLimit, 'elapsed_time');
-  assert.equal(result.executionStatus, 'failed');
+  const run = await harness({ provider, limits: { elapsedMs: 20 }, withoutSession: true });
+  const result = await run.agent.run({ task: 'stalled provider' }).result;
+  assert.equal(result.state, 'suspended');
+  assert.equal(result.reason, 'provider_outcome_unknown');
 });
 
 test('an immediate abort is durably accepted before local execution is cancelled', async () => {
@@ -1015,6 +1056,6 @@ function terminal() {
   return decodeAgentTerminalSnapshot({
     runId: 'run-final', finalizationId: 'final-1', phase: 'ended', executionStatus: 'completed', verificationStatus: 'not_required', terminationReason: 'model_completed',
     modelTerminationReason: 'stop', candidate: { status: 'complete', message: 'done', source: 'content', turnIndex: 1 }, turnCount: 1, checkResults: [],
-    budget: { modelTurns: 1, totalToolCalls: 0, repeatedIdenticalToolCalls: 0, elapsedMs: 1, promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, knownCosts: {}, pricingStatus: 'unknown', unknownPricedTokens: 0, consecutiveProviderFailures: 0, consecutiveToolFailures: 0, providerRetries: 0 }
+    budget: { modelTurns: 1, totalToolCalls: 0, repeatedIdenticalToolCalls: 0, elapsedMs: 1, promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, knownCosts: {}, pricingStatus: 'unknown', unknownPricedTokens: 0, consecutiveProviderFailures: 0, consecutiveToolFailures: 0 }
   });
 }

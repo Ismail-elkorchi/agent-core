@@ -71,6 +71,7 @@ export type OllamaModelProfileOverride = Omit<ModelProfile, 'id' | 'provider'>;
 
 export class OllamaProvider implements ModelProvider {
   readonly id = 'ollama';
+  readonly implementationId = 'agent-core.provider.ollama@1';
   private readonly clientFactory: () => OllamaClient;
   private readonly defaultModel: string;
   private readonly keepAlive: string | number | undefined;

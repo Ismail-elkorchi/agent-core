@@ -133,6 +133,7 @@ const DEFAULT_SUPPORTED_PARAMETERS: ModelProfile['supportedParameters'] = [
 
 export class OpenAIProvider implements ModelProvider {
   readonly id = OPENAI_PROVIDER_ID;
+  readonly implementationId = 'agent-core.provider.openai-responses@1';
   private readonly tokenProvider: BearerTokenProvider;
   private readonly baseUrl: string;
   private readonly defaultModel: string;
@@ -446,7 +447,6 @@ class OpenAIProviderSession implements ModelProviderSession {
 
   constructor(private readonly provider: OpenAIProvider) {}
 
-  retryDisposition(): 'reset_required' { return 'reset_required'; }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
     const previousResponseId = this.previousResponseId;

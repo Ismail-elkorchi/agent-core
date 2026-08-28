@@ -236,19 +236,17 @@ export class AgentSession {
         const operation = await this.options.operations.inspect(submission.runId);
         if (operation.state.phase.kind === 'approval') {
           this.suspended = { runId: submission.runId, submissionId: submission.submissionId, input: submission.input, configuration: submission.configuration, reason: 'approval_required' };
-        } else if (operation.state.phase.kind === 'suspended') {
-          this.suspended = { runId: submission.runId, submissionId: submission.submissionId, input: submission.input, configuration: submission.configuration, reason: operation.state.phase.reason };
         } else {
-          this.queued.push(pendingFromRecord(submission, true));
+          const reason = operationSuspensionReason(operation.state.phase);
+          if (reason) this.suspended = { runId: submission.runId, submissionId: submission.submissionId, input: submission.input, configuration: submission.configuration, reason };
+          else this.queued.push(pendingFromRecord(submission, true));
         }
       } else if (submission.state === 'suspended') {
         if (this.suspended) throw new Error(`Session has multiple suspended submissions: ${this.suspended.submissionId} and ${submission.submissionId}.`);
         const operation = await this.options.operations.inspect(submission.runId);
         const reason = operation.state.phase.kind === 'approval'
           ? 'approval_required'
-          : operation.state.phase.kind === 'suspended'
-            ? operation.state.phase.reason
-            : undefined;
+          : operationSuspensionReason(operation.state.phase);
         if (!reason) throw new Error(`Suspended submission ${submission.submissionId} has no matching operation suspension.`);
         this.suspended = { runId: submission.runId, submissionId: submission.submissionId, input: submission.input, configuration: submission.configuration, reason };
       } else {
@@ -389,3 +387,8 @@ function ownConfiguration(configuration: AgentSessionConfiguration): AgentSessio
 }
 
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+function operationSuspensionReason(phase: import('../operation/contracts.js').AgentOperationPhase): 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'missing_implementation' | 'user_decision' | undefined {
+  if (phase.kind === 'suspended' && phase.reason !== 'approval_required') return phase.reason;
+  if (phase.kind === 'provider' && phase.stage === 'outcome_unknown') return 'provider_outcome_unknown';
+  return undefined;
+}

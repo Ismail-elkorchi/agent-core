@@ -114,6 +114,7 @@ export interface OpenAICodexProviderOptions {
 
 export class OpenAICodexProvider implements ModelProvider {
   readonly id = OPENAI_CODEX_PROVIDER_ID;
+  readonly implementationId = 'agent-core.provider.openai-codex@1';
   private readonly tokenProvider: BearerTokenProvider;
   private readonly baseUrl: string;
   private readonly defaultModel: string;
@@ -236,7 +237,6 @@ class OpenAICodexProviderSession implements ModelProviderSession {
 
   constructor(private readonly provider: OpenAICodexProvider) {}
 
-  retryDisposition(): 'reset_required' { return 'reset_required'; }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
     try {

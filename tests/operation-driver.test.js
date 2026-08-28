@@ -15,6 +15,7 @@ const acceptance = (runId = 'run-operation') => ({
   input: { task: 'Perform a bounded task.', instructions: [], contextItems: [] },
   configuration: {
     providerId: 'scripted',
+    providerImplementationId: 'agent-core.tests.operation-provider@1',
     model: 'scripted-model',
     runtimeImplementationId: 'runtime-test-v1',
     toolImplementationIds: ['read-v1'],

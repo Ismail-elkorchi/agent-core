@@ -1,15 +1,13 @@
 import { canonicalJsonString } from '@agent-core/evidence';
 import type { ModelPricing, ModelUsage } from '@agent-core/model';
 import {
-  DEFAULT_AGENT_RUN_RETRY_POLICY,
   systemAgentClock,
   validateAgentRunLimits,
   type AgentClock,
   type AgentLimitKind,
   type AgentRunBudgetState,
   type AgentRunLimits,
-  type AgentRunPhase,
-  type AgentRunRetryPolicy
+  type AgentRunPhase
 } from '../run/contracts.js';
 import type { ToolCall } from '@agent-core/tools';
 
@@ -37,7 +35,6 @@ export class AgentLimitExceededError extends Error {
 
 export class AgentRunController {
   readonly limits: AgentRunLimits;
-  readonly retryPolicy: AgentRunRetryPolicy;
   private readonly clock: AgentClock;
   private readonly startedAt: number;
   private readonly initialElapsedMs: number;
@@ -56,19 +53,16 @@ export class AgentRunController {
     pricingStatus: 'unknown',
     unknownPricedTokens: 0,
     consecutiveProviderFailures: 0,
-    consecutiveToolFailures: 0,
-    providerRetries: 0
+    consecutiveToolFailures: 0
   };
 
   constructor(input: {
     readonly clock?: AgentClock;
     readonly limits?: Partial<AgentRunLimits>;
-    readonly retryPolicy?: Partial<AgentRunRetryPolicy>;
     readonly initialBudget?: AgentRunBudgetState;
     readonly initialToolCalls?: readonly ToolCall[];
   } = {}) {
     this.limits = validateAgentRunLimits(input.limits);
-    this.retryPolicy = validateRetryPolicy(input.retryPolicy);
     this.clock = input.clock ?? systemAgentClock();
     this.startedAt = this.clock.now();
     if (input.initialBudget) {
@@ -172,12 +166,6 @@ export class AgentRunController {
     this.state = { ...this.state, consecutiveProviderFailures: failures };
     if (failures > this.limits.consecutiveProviderFailures) throw this.limitError('consecutive_provider_failures', failures, this.limits.consecutiveProviderFailures, 1, previous, this.snapshot(), true);
   }
-  recordProviderRetry(): void {
-    const previous = this.snapshot();
-    const retries = this.state.providerRetries + 1;
-    this.state = { ...this.state, providerRetries: retries };
-    if (retries > this.limits.providerRetries) throw this.limitError('provider_retries', retries, this.limits.providerRetries, 1, previous, this.snapshot(), true);
-  }
   recordToolResult(ok: boolean): void {
     const previous = this.snapshot();
     const failures = ok ? 0 : this.state.consecutiveToolFailures + 1;
@@ -210,16 +198,6 @@ export class AgentRunController {
   private limitError(limit: AgentLimitKind, attempted: number, maximum: number, attemptedDelta: number, previousSnapshot: AgentRunBudgetState, resultingSnapshot: AgentRunBudgetState, consumed: boolean): AgentLimitExceededError {
     return new AgentLimitExceededError(limit, { attempted, maximum, attemptedDelta, previousSnapshot, resultingSnapshot, consumed });
   }
-}
-
-function validateRetryPolicy(input: Partial<AgentRunRetryPolicy> | undefined): AgentRunRetryPolicy {
-  const policy = { ...DEFAULT_AGENT_RUN_RETRY_POLICY, ...(input ?? {}) };
-  if (!Number.isInteger(policy.retriesPerRequest) || policy.retriesPerRequest < 0) throw new Error('retriesPerRequest must be a nonnegative integer.');
-  for (const name of ['initialDelayMs', 'maximumDelayMs'] as const) {
-    if (!Number.isInteger(policy[name]) || policy[name] < 0) throw new Error(`${name} must be a nonnegative integer.`);
-  }
-  if (!Number.isFinite(policy.multiplier) || policy.multiplier < 1) throw new Error('retry multiplier must be finite and at least 1.');
-  return Object.freeze(policy);
 }
 
 function calculateCost(usage: ModelUsage, pricing: ModelPricing | undefined): { readonly amount?: number; readonly currency?: string; readonly unknownTokens: number } {

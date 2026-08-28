@@ -95,6 +95,7 @@ test('scripted self-hosting run survives approvals, structured tools, verificati
 
 class ScriptedProvider {
   id = 'scripted';
+  implementationId = 'agent-core.tests.self-hosting-provider@1';
   constructor(script) { this.script = [...script]; }
   describe() { return { id: this.id, displayName: 'Scripted', defaultModel: 'scripted' }; }
   async describeModel() {

@@ -305,6 +305,8 @@ export type ModelStreamEvent =
 
 export interface ModelProvider {
   readonly id: string;
+  /** Stable identity of the adapter implementation whose request and recovery semantics are in force. */
+  readonly implementationId: string;
   describe(): ModelProviderInfo;
   describeModel(model: string): Promise<ModelProfile>;
   createSession?(): ModelProviderSession;
@@ -317,14 +319,10 @@ export interface ModelProvider {
 export interface ModelProviderSession {
   complete(request: ModelRequest): Promise<ModelResponse>;
   stream?(request: ModelRequest): AsyncIterable<ModelStreamEvent>;
-  /** Declares whether continuation state is safe after a failed request. */
-  retryDisposition(error: unknown): ModelProviderSessionRetryDisposition;
   restoreProviderState?(state: ModelProviderState): void;
   resetContinuation?(reason: string): void;
   close?(): Promise<void>;
 }
-
-export type ModelProviderSessionRetryDisposition = 'reusable' | 'reset_required' | 'unknown';
 
 export type ModelProviderErrorCode =
   | 'provider_unavailable'

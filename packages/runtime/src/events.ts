@@ -7,11 +7,12 @@ import type {
   ModelModalities,
   ModelProviderErrorDiagnostic,
   ModelReasoningRequest,
+  ModelResponse,
   ModelTerminationReason,
   ModelTransportMetadata,
   ModelUsage
 } from '@agent-core/model';
-import { decodeOwnedModelCapabilities, decodeOwnedModelLimits, decodeOwnedModelModalities, decodeOwnedModelResponseFormat, decodeOwnedModelTransport, parseModelReasoningRequest, parseModelUsage } from '@agent-core/model';
+import { decodeOwnedModelCapabilities, decodeOwnedModelLimits, decodeOwnedModelModalities, decodeOwnedModelResponseFormat, decodeOwnedModelTransport, parseModelReasoningRequest, parseModelResponse, parseModelUsage } from '@agent-core/model';
 import {
   decodeOwnedAgentCandidate,
   decodeOwnedAgentCheckResult,
@@ -129,7 +130,6 @@ export type AgentEvent =
   | { readonly type: 'run.configured'; readonly configuration: AgentRunConfiguration }
   | { readonly type: 'turn.snapshot.created'; readonly snapshot: AgentTurnSnapshotRecord }
   | { readonly type: 'request.snapshot.created'; readonly snapshot: AgentRequestSnapshotRecord }
-  | ({ readonly type: 'run.retry.scheduled'; readonly kind: 'transport' | 'provider_request'; readonly attempt: number; readonly delayMs: number; readonly diagnostic?: ModelProviderErrorDiagnostic } & AgentTurnIdentity)
   | { readonly type: 'finalization.prepared'; readonly terminal: AgentTerminalSnapshot }
   | { readonly type: 'run.ended'; readonly terminal: AgentTerminalSnapshot; readonly diagnostic?: ModelProviderErrorDiagnostic & { readonly turnIndex?: number } }
   | { readonly type: 'delivery.failed'; readonly finalizationId: string; readonly diagnostic: AgentDeliveryDiagnostic }
@@ -146,6 +146,7 @@ export type AgentEvent =
   | ({ readonly type: 'assistant.interrupted'; readonly content: string; readonly candidate: AgentCandidate; readonly reasoningSummary?: string; readonly finalResponseReceived: boolean; readonly diagnostic?: ModelProviderErrorDiagnostic } & AgentTurnIdentity)
   | ({ readonly type: 'model.failed'; readonly diagnostic: ModelProviderErrorDiagnostic } & AgentTurnIdentity)
   | ({ readonly type: 'model.requested'; readonly request: AgentModelRequestSummary } & AgentTurnIdentity)
+  | ({ readonly type: 'provider.attempt.settled'; readonly effectId: string; readonly responseId: string; readonly response: ModelResponse; readonly providerState?: AgentProviderStateReference } & AgentTurnIdentity)
   | ({ readonly type: 'model.responded'; readonly response: AgentModelResponseSummary } & AgentTurnIdentity)
   | ({ readonly type: 'budget.estimate.created'; readonly attempt: number; readonly estimate: RequestCostEstimate; readonly snapshot: BudgetAccountantSnapshot } & AgentTurnIdentity)
   | ({ readonly type: 'budget.provider_usage.recorded'; readonly usage: ModelUsage; readonly snapshot: BudgetAccountantSnapshot } & AgentTurnIdentity)
@@ -269,11 +270,6 @@ const AGENT_EVENT_DECODERS = {
     exact(value, ['type', 'snapshot']);
     return Object.freeze({ type: 'request.snapshot.created', snapshot: decodeRequestSnapshot(value.snapshot) });
   },
-  'run.retry.scheduled': (value) => {
-    exact(value, ['type', ...TURN_KEYS, 'kind', 'attempt', 'delayMs', 'diagnostic']);
-    const diagnostic = optionalDiagnostic(value.diagnostic);
-    return Object.freeze({ type: 'run.retry.scheduled', ...decodeTurnIdentity(value), kind: requiredEnum(value.kind, RETRY_KINDS, 'kind'), attempt: positiveInteger(value.attempt, 'attempt'), delayMs: nonnegativeNumber(value.delayMs, 'delayMs'), ...(diagnostic ? { diagnostic } : {}) });
-  },
   'finalization.prepared': (value) => {
     exact(value, ['type', 'terminal']);
     return Object.freeze({ type: 'finalization.prepared', terminal: decodeOwnedAgentTerminalSnapshot(requiredObject(value.terminal, 'terminal')) });
@@ -350,6 +346,16 @@ const AGENT_EVENT_DECODERS = {
   'model.requested': (value) => {
     exact(value, ['type', ...TURN_KEYS, 'request']);
     return Object.freeze({ type: 'model.requested', ...decodeTurnIdentity(value), request: decodeModelRequestSummary(value.request) });
+  },
+  'provider.attempt.settled': (value) => {
+    exact(value, ['type', ...TURN_KEYS, 'effectId', 'responseId', 'response', 'providerState']);
+    const providerState = value.providerState === undefined ? undefined : decodeProviderStateReference(value.providerState);
+    const response = parseModelResponse(value.response);
+    if (response.providerState !== undefined || response.reasoning !== undefined || response.raw !== undefined) throw malformed('provider settlement contains non-durable provider or private reasoning data');
+    return Object.freeze({
+      type: 'provider.attempt.settled', ...decodeTurnIdentity(value), effectId: requiredString(value.effectId, 'effectId'), responseId: requiredString(value.responseId, 'responseId'), response,
+      ...(providerState ? { providerState } : {})
+    });
   },
   'model.responded': (value) => {
     exact(value, ['type', ...TURN_KEYS, 'response']);
@@ -442,7 +448,6 @@ const TOOL_CALL_KEYS = [...TURN_KEYS, 'toolBatchId', 'callIndex', 'callId'] as c
 const TOOL_ATTEMPT_KEYS = [...TOOL_CALL_KEYS, 'toolAttempt'] as const;
 const REPLAY_KEYS = ['sessionId', 'replayedLedgers', 'replayedTurns', 'replayedSessionEntries', 'replayedCheckpoints', 'replayedToolResults', 'replayedEvidenceRecords', 'restoredProviderState', 'restoredProviderStateRef'] as const;
 const RUN_PHASES = ['preparing', 'requesting_model', 'executing_tools', 'waiting_for_approval', 'verifying', 'finalizing', 'ended'] as const;
-const RETRY_KINDS = ['transport', 'provider_request'] as const;
 const TOOL_CALL_TYPES = ['function', 'custom'] as const;
 const AUTHORIZATION_DECISIONS = ['allow', 'deny', 'require_approval'] as const;
 const APPROVAL_DECISIONS = ['allow', 'deny'] as const;
@@ -476,7 +481,7 @@ function decodeReplayPayload(value: JsonObject): AgentReplayPayload {
 }
 function decodeRunBudget(value: JsonValue | undefined): AgentRunBudgetState {
   const object = requiredObject(value, 'budget');
-  exact(object, ['modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'elapsedMs', 'promptTokens', 'completionTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'knownCosts', 'pricingStatus', 'unknownPricedTokens', 'consecutiveProviderFailures', 'consecutiveToolFailures', 'providerRetries']);
+  exact(object, ['modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'elapsedMs', 'promptTokens', 'completionTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'knownCosts', 'pricingStatus', 'unknownPricedTokens', 'consecutiveProviderFailures', 'consecutiveToolFailures']);
   return Object.freeze({
     modelTurns: nonnegativeInteger(object.modelTurns, 'budget.modelTurns'), totalToolCalls: nonnegativeInteger(object.totalToolCalls, 'budget.totalToolCalls'),
     repeatedIdenticalToolCalls: nonnegativeInteger(object.repeatedIdenticalToolCalls, 'budget.repeatedIdenticalToolCalls'), elapsedMs: nonnegativeInteger(object.elapsedMs, 'budget.elapsedMs'),
@@ -484,8 +489,7 @@ function decodeRunBudget(value: JsonValue | undefined): AgentRunBudgetState {
     cacheReadTokens: nonnegativeInteger(object.cacheReadTokens, 'budget.cacheReadTokens'), cacheWriteTokens: nonnegativeInteger(object.cacheWriteTokens, 'budget.cacheWriteTokens'),
     reasoningTokens: nonnegativeInteger(object.reasoningTokens, 'budget.reasoningTokens'), knownCosts: nonnegativeNumberRecord(object.knownCosts, 'budget.knownCosts'),
     pricingStatus: requiredEnum(object.pricingStatus, PRICING_STATUSES, 'budget.pricingStatus'), unknownPricedTokens: nonnegativeInteger(object.unknownPricedTokens, 'budget.unknownPricedTokens'),
-    consecutiveProviderFailures: nonnegativeInteger(object.consecutiveProviderFailures, 'budget.consecutiveProviderFailures'), consecutiveToolFailures: nonnegativeInteger(object.consecutiveToolFailures, 'budget.consecutiveToolFailures'),
-    providerRetries: nonnegativeInteger(object.providerRetries, 'budget.providerRetries')
+    consecutiveProviderFailures: nonnegativeInteger(object.consecutiveProviderFailures, 'budget.consecutiveProviderFailures'), consecutiveToolFailures: nonnegativeInteger(object.consecutiveToolFailures, 'budget.consecutiveToolFailures')
   });
 }
 function decodeRunConfiguration(value: JsonValue | undefined): AgentRunConfiguration {
@@ -555,7 +559,7 @@ function decodeInstruction(value: JsonValue, path: string): AgentEffectiveInstru
 }
  function decodeRunLimits(value: JsonValue | undefined): AgentRunLimits {
   const object = requiredObject(value, 'limits');
-  exact(object, ['maxConcurrentToolCalls', 'modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'elapsedMs', 'promptTokens', 'completionTokens', 'activeImageCount', 'activeImageBytes', 'activeImageTokens', 'knownCost', 'consecutiveProviderFailures', 'consecutiveToolFailures', 'providerRetries']);
+  exact(object, ['maxConcurrentToolCalls', 'modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'elapsedMs', 'promptTokens', 'completionTokens', 'activeImageCount', 'activeImageBytes', 'activeImageTokens', 'knownCost', 'consecutiveProviderFailures', 'consecutiveToolFailures']);
   const knownCost = requiredObject(object.knownCost, 'limits.knownCost');
   exact(knownCost, ['amount', 'currency']);
   return Object.freeze({
@@ -565,8 +569,7 @@ function decodeInstruction(value: JsonValue, path: string): AgentEffectiveInstru
     completionTokens: positiveInteger(object.completionTokens, 'limits.completionTokens'), activeImageCount: positiveInteger(object.activeImageCount, 'limits.activeImageCount'),
     activeImageBytes: positiveInteger(object.activeImageBytes, 'limits.activeImageBytes'), activeImageTokens: positiveInteger(object.activeImageTokens, 'limits.activeImageTokens'),
     knownCost: Object.freeze({ amount: positiveNumber(knownCost.amount, 'limits.knownCost.amount'), currency: requiredString(knownCost.currency, 'limits.knownCost.currency') }),
-    consecutiveProviderFailures: positiveInteger(object.consecutiveProviderFailures, 'limits.consecutiveProviderFailures'), consecutiveToolFailures: positiveInteger(object.consecutiveToolFailures, 'limits.consecutiveToolFailures'),
-    providerRetries: positiveInteger(object.providerRetries, 'limits.providerRetries')
+    consecutiveProviderFailures: positiveInteger(object.consecutiveProviderFailures, 'limits.consecutiveProviderFailures'), consecutiveToolFailures: positiveInteger(object.consecutiveToolFailures, 'limits.consecutiveToolFailures')
   });
 }
 function decodeRequestSnapshot(value: JsonValue | undefined): AgentRequestSnapshotRecord {
@@ -589,6 +592,11 @@ function decodeProviderStateSummary(value: JsonValue | undefined): AgentProvider
   const object = requiredObject(value, 'providerState');
   exact(object, ['provider', 'model', 'kind', 'dataKeys', 'bytes']);
   return Object.freeze({ provider: requiredString(object.provider, 'providerState.provider'), model: requiredString(object.model, 'providerState.model'), kind: requiredString(object.kind, 'providerState.kind'), dataKeys: stringArray(object.dataKeys, 'providerState.dataKeys'), bytes: nonnegativeInteger(object.bytes, 'providerState.bytes') });
+}
+function decodeProviderStateReference(value: JsonValue | undefined): AgentProviderStateReference {
+  const object = requiredObject(value, 'providerState');
+  exact(object, ['summary', 'artifact']);
+  return Object.freeze({ summary: decodeProviderStateSummary(object.summary), artifact: decodeOwnedArtifactRef(requiredObject(object.artifact, 'artifact')) });
 }
 function decodeModelRequestSummary(value: JsonValue | undefined): AgentModelRequestSummary {
   const object = requiredObject(value, 'request');

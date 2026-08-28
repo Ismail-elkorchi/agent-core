@@ -3,17 +3,29 @@ import { type ContextHistoryReduction, decodeContextItemInput, type ContextItemI
 import { hashJson, type EventAppendReceipt } from '@agent-core/evidence';
 import { normalizeJsonSafe, parseJsonValue } from '@agent-core/json';
 import {
+  UNKNOWN_EFFECT_RECOVERY,
+  closeExternalEffect,
+  decodeEffectRecoveryCapability,
+  issueEffectStartTicket,
+  knownEffectExposure,
+  settleExternalEffect,
+  startExternalEffect,
+  unknownEffectExposure,
+  type EffectExposureQuantity,
+  type EffectExposureReservation
+} from '@agent-core/effects';
+import {
   createModelRequest,
   ModelContractError,
   type ModelProfile,
   type ModelProvider,
   type ModelProviderErrorDiagnostic,
   type ModelProviderSession,
-  type ModelProviderSessionRetryDisposition,
   type ModelReasoningRequest,
   type ModelRequest,
   type ModelResponse,
   type ModelResponseFormat,
+  type ModelUsage,
   SimpleTokenEstimator,
   parseModelProfile,
   parseModelResponse,
@@ -36,7 +48,6 @@ import {
   type AgentRequestSnapshotRecord,
   type AgentRunLimits,
   type AgentRunResult,
-  type AgentRunRetryPolicy,
   type AgentTerminalSnapshot,
   type AgentTurnIdentity,
   type AgentTurnSnapshotRecord,
@@ -91,7 +102,7 @@ import {
   type OverflowRecoveryResult,
   type OverflowRecoveryStage
 } from './orchestration/overflow-recovery.js';
-import { storeProviderStateArtifact } from './orchestration/provider-state-artifacts.js';
+import { readProviderStateArtifact, storeProviderStateArtifact } from './orchestration/provider-state-artifacts.js';
 import { AgentLimitExceededError, AgentRunController } from './orchestration/run-controller.js';
 import { rebuildContextFromRepositories } from './orchestration/session-replay.js';
 import { executeAssistantToolCalls, type ToolAuthorizationOverride, type ToolCallRecoveryState } from './orchestration/tool-execution.js';
@@ -145,7 +156,6 @@ export interface AgentRuntimeOptions {
   readonly responseFormat?: ModelResponseFormat;
   readonly metadata?: Readonly<Record<string, string>>;
   readonly limits?: Partial<AgentRunLimits>;
-  readonly retryPolicy?: Partial<AgentRunRetryPolicy>;
   readonly clock?: AgentClock;
   readonly onProgress?: (event: AgentProgressEvent) => void | Promise<void>;
   readonly recordRequest?: (record: AgentExactRequestRecord) => void | Promise<void>;
@@ -207,17 +217,24 @@ interface AssistantTurnRequest {
   readonly operation: AgentOperationDriver;
 }
 
-interface AssistantTurnResult { readonly response: ModelResponse; readonly toolCalls: readonly ToolCall[]; readonly candidate: AgentCandidate }
-interface CompletedModelAttempt { readonly response: ModelResponse; readonly identity: AgentTurnIdentity }
+type AssistantTurnResult =
+  | { readonly kind: 'settled'; readonly response: ModelResponse; readonly toolCalls: readonly ToolCall[]; readonly candidate: AgentCandidate }
+  | { readonly kind: 'outcome_unknown'; readonly effectId: string };
+type CompletedModelAttempt =
+  | { readonly kind: 'settled'; readonly response: ModelResponse; readonly identity: AgentTurnIdentity }
+  | { readonly kind: 'outcome_unknown'; readonly effectId: string };
 type RequestAssemblyResult = { readonly ok: true; readonly request: ModelRequest; readonly estimate: RequestCostEstimate; readonly snapshot: AgentRequestSnapshotRecord } | { readonly ok: false; readonly diagnostic: OverflowDiagnostic };
 
 type TerminalDecision =
   | { readonly executionStatus: 'completed'; readonly terminationReason: 'model_completed' | 'model_output_limit' | 'content_filtered' | 'unknown_model_termination'; readonly candidate: AgentPresentCandidate; readonly turnCount: number; readonly checkResults: readonly AgentCheckResult[]; readonly modelTerminationReason: ModelResponse['terminationReason']; readonly providerTerminationReason?: string; readonly cleanupDiagnostic?: { readonly kind: 'process_cleanup'; readonly message: string } }
   | { readonly executionStatus: 'failed'; readonly terminationReason: 'model_output_limit' | 'content_filtered' | 'unknown_model_termination' | 'empty_response' | 'malformed_response' | 'provider_error' | 'runtime_error' | 'stream_interrupted' | 'request_too_large' | 'limit_exhausted' | 'uncertain_tool_effect'; readonly candidate: AgentCandidate; readonly errorMessage: string; readonly turnCount: number; readonly checkResults: readonly AgentCheckResult[]; readonly modelTerminationReason?: ModelResponse['terminationReason']; readonly providerTerminationReason?: string; readonly exhaustedLimit?: AgentLimitExceededError['limit']; readonly diagnostic?: ModelProviderErrorDiagnostic & { readonly turnIndex?: number }; readonly cleanupDiagnostic?: { readonly kind: 'process_cleanup'; readonly message: string } }
   | { readonly executionStatus: 'aborted'; readonly terminationReason: 'aborted'; readonly candidate: AgentCandidate; readonly errorMessage: string; readonly turnCount: number; readonly checkResults: readonly AgentCheckResult[]; readonly diagnostic?: ModelProviderErrorDiagnostic & { readonly turnIndex?: number }; readonly cleanupDiagnostic?: { readonly kind: 'process_cleanup'; readonly message: string } };
-type ExecutionDecision = TerminalDecision | { readonly executionStatus: 'waiting_for_approval'; readonly approvals: readonly AgentApprovalRequest[] };
+type ExecutionDecision = TerminalDecision
+  | { readonly executionStatus: 'waiting_for_approval'; readonly approvals: readonly AgentApprovalRequest[] }
+  | { readonly executionStatus: 'waiting_for_recovery'; readonly reason: 'provider_outcome_unknown'; readonly effectId: string };
 
-interface ResumeExecutionState {
+interface ToolResumeExecutionState {
+  readonly kind: 'tool';
   readonly identity: AgentTurnIdentity;
   readonly toolBatchId: string;
   readonly toolCalls: readonly ToolCall[];
@@ -228,6 +245,19 @@ interface ResumeExecutionState {
   readonly callHistory: readonly ToolCall[];
   readonly recovery: readonly ToolCallRecoveryState[];
 }
+interface ProviderResumeExecutionState {
+  readonly kind: 'provider';
+  readonly identity: AgentTurnIdentity;
+  readonly toolBatchId: string;
+  readonly response: ModelResponse;
+  readonly providerState?: import('./events.js').AgentProviderStateReference;
+  readonly turnSnapshot: AgentTurnSnapshotRecord;
+  readonly requestEstimate: RequestCostEstimate;
+  readonly instructions: readonly AgentEffectiveInstruction[];
+  readonly budget: import('./run/contracts.js').AgentRunBudgetState;
+  readonly callHistory: readonly ToolCall[];
+}
+type ResumeExecutionState = ToolResumeExecutionState | ProviderResumeExecutionState;
 interface RunExecutionRuntime {
   readonly runId: string;
   readonly input: ResolvedAgentRunInput;
@@ -384,7 +414,7 @@ export class AgentRuntime {
     const snapshot = [...records].reverse().find((event): event is Extract<AgentEvent, { type: 'turn.snapshot.created' }> => event.type === 'turn.snapshot.created' && event.snapshot.turnId === target.turnId);
     if (!snapshot) throw new Error(`Approval ${input.approvalId} has no immutable turn snapshot.`);
     const callHistory = records.flatMap((event) => event.type === 'assistant.ended' ? [...(event.toolCalls ?? [])] : []);
-    const resume: ResumeExecutionState = { identity: { turnIndex: target.turnIndex, turnId: target.turnId, requestAttempt: target.requestAttempt }, toolBatchId: target.toolBatchId, toolCalls: assistant.toolCalls, overrides, instructions: snapshot.snapshot.instructions, budget: phase.budget, approvalIds: batchRequests.map((request) => request.approvalId), callHistory, recovery: toolRecoveryState(records, target.toolBatchId, assistant.toolCalls.length) };
+    const resume: ToolResumeExecutionState = { kind: 'tool', identity: { turnIndex: target.turnIndex, turnId: target.turnId, requestAttempt: target.requestAttempt }, toolBatchId: target.toolBatchId, toolCalls: assistant.toolCalls, overrides, instructions: snapshot.snapshot.instructions, budget: phase.budget, approvalIds: batchRequests.map((request) => request.approvalId), callHistory, recovery: toolRecoveryState(records, target.toolBatchId, assistant.toolCalls.length) };
     return this.startRun({ task: started.task, runId: input.runId, finalizationId: started.finalizationId, ...(input.signal ? { signal: input.signal } : {}) }, resume, operation);
   }
 
@@ -456,9 +486,39 @@ export class AgentRuntime {
       const phase = operationState.phase;
       if (phase.kind === 'approval') return await this.approvalSuspension(operationState);
       if (phase.kind === 'suspended') return operationSuspension(operationState);
-      if (phase.kind === 'provider' && phase.stage === 'effect_pending') {
-        await this.advanceOperation(operation, 'reconcile_provider_request', { phase: { kind: 'suspended', reason: 'provider_outcome_unknown', ...(phase.effectId ? { effectId: phase.effectId } : {}) }, ...(operation.state().budget ? { budget: operation.state().budget } : {}) });
+      if (phase.kind === 'provider' && phase.stage === 'effect_ready') {
+        const closed = closeExternalEffect(phase.effect, 'cancelled_before_start');
+        await this.advanceOperation(operation, 'start_provider_request', {
+          phase: { kind: 'suspended', reason: 'user_decision', effectId: closed.intent.effectId },
+          ...(operation.state().budget ? { budget: operation.state().budget } : {})
+        });
         return operationSuspension(operation.state());
+      }
+      if (phase.kind === 'provider' && phase.stage === 'effect_pending') {
+        const settlement = await this.findProviderSettlement(runId, phase.effect.intent.effectId, phase.responseId);
+        if (settlement) {
+          const settled = settleExternalEffect(phase.effect, phase.effect.settlementPermit, {
+            outcome: 'succeeded',
+            resultDigest: hashJson(normalizeJsonSafe(settlement.event).value),
+            exposure: settlement.event.response.usage
+              ? knownEffectExposure(providerUsageQuantities(settlement.event.response.usage))
+              : unknownEffectExposure(phase.effect.intent.exposure)
+          });
+          if (settled.status !== 'settled' && settled.status !== 'already_settled') throw new Error(`Persisted provider settlement ${settlement.event.responseId} cannot settle effect ${phase.effect.intent.effectId}.`);
+          await this.advanceOperation(operation, 'reconcile_provider_request', {
+            phase: { ...phase, stage: 'settled', effect: settled.state, settlementEventId: settlement.eventId },
+            ...(operation.state().budget ? { budget: operation.state().budget } : {})
+          });
+        } else {
+          const closed = closeExternalEffect(phase.effect, 'unknown_outcome');
+          await this.advanceOperation(operation, 'reconcile_provider_request', { phase: { ...phase, stage: 'outcome_unknown', effect: closed }, ...(operation.state().budget ? { budget: operation.state().budget } : {}) });
+          return operationSuspension(operation.state());
+        }
+      }
+      const reconciledState = operation.state();
+      if (reconciledState.phase.kind === 'provider' && reconciledState.phase.stage === 'settled') {
+        const resume = await this.providerResumeExecutionState(reconciledState);
+        return await this.runInternal(operationInput(reconciledState), abortController.signal, operation, resume, true);
       }
       if (phase.kind === 'tools' && phase.stage === 'effect_pending') {
         await this.advanceOperation(operation, 'reconcile_tool_call', { phase: { kind: 'suspended', reason: 'tool_outcome_unknown', ...(phase.effectId ? { effectId: phase.effectId } : {}) }, ...(operation.state().budget ? { budget: operation.state().budget } : {}) });
@@ -493,7 +553,6 @@ export class AgentRuntime {
     const controller = new AgentRunController({
       ...(this.options.clock ? { clock: this.options.clock } : {}),
       ...(this.options.limits ? { limits: this.options.limits } : {}),
-      ...(this.options.retryPolicy ? { retryPolicy: this.options.retryPolicy } : {}),
       ...(resume ? { initialBudget: resume.budget, initialToolCalls: resume.callHistory } : {})
     });
     const deliveryDiagnostics: { eventType: string; message: string; persisted: boolean }[] = [];
@@ -527,6 +586,10 @@ export class AgentRuntime {
         return Object.freeze({ state: 'suspended', reason: 'approval_required', runId, finalizationId, pendingApprovals: decision.approvals, budget });
       }
       decision = cleanupFailureDecision(undefined, cleanupError);
+    } else if (decision.executionStatus === 'waiting_for_recovery') {
+      const state = operation.state();
+      if (state.phase.kind !== 'provider' || state.phase.stage !== 'outcome_unknown') throw new Error(`Run ${runId} lost its provider recovery state.`);
+      return Object.freeze({ state: 'suspended', reason: decision.reason, runId, finalizationId, effectId: decision.effectId, budget: controller.snapshot() });
     } else {
       const cleanupError = await this.disposeOwnedProcesses(runId, append);
       if (cleanupError) decision = cleanupFailureDecision(decision, cleanupError);
@@ -598,11 +661,12 @@ export class AgentRuntime {
     let sessionModel: string | undefined;
     let replayRestored = false;
     try {
-      if (runtime.resume) {
+      if (runtime.resume?.kind === 'tool') {
         const resumeDecision = await this.resumeToolBatch({ ...runtime, resume: runtime.resume }, contextManager, observationStore, checkResults);
         if (resumeDecision) return resumeDecision;
         turnIndex += 1;
       }
+      let providerResume = runtime.resume?.kind === 'provider' ? runtime.resume : undefined;
       const availableTurnEntries = runtime.controller.limits.modelTurns - runtime.controller.snapshot().modelTurns + 1;
       for (let turnEntry = 0; turnEntry < availableTurnEntries; turnEntry += 1) {
         runtime.controller.assertElapsed();
@@ -612,63 +676,93 @@ export class AgentRuntime {
           effectiveInstructions.push(...steeringInstructions(steering, effectiveInstructions.length));
           runNotes.push(`User steering added before turnIndex ${String(turnIndex)}:\n${steering.map((instruction) => `- ${instruction}`).join('\n')}`);
         }
-        runtime.controller.beginModelTurn();
-        const configuration = this.captureRuntimeConfiguration();
-        const profile = parseModelProfile(await this.options.provider.describeModel(configuration.model));
-        const providerInfo = this.options.provider.describe();
-        const tools = Object.freeze(this.availableTools(profile));
-        validateModelRun(providerInfo.id, profile, [...tools], configuration.temperature, configuration.reasoning);
-        const requestWindow = requestWindowForModel(profile, this.maxOutputTokens);
-        observationStore.setTokenBudgets({
-          immediate: Math.max(256, Math.min(4_000, Math.floor(requestWindow.maxPromptTokens * 0.12))),
-          retained: Math.max(128, Math.min(1_000, Math.floor(requestWindow.maxPromptTokens * 0.03)))
-        });
-        const continuationEligible = modelSession !== undefined && sessionModel === configuration.model;
-        if (!continuationEligible) {
-          if (modelSession) { modelSession.resetContinuation?.('Model changed between immutable turn snapshots.'); await modelSession.close?.(); }
+        let snapshot: TurnSnapshot;
+        let toolBatchId: string;
+        let assistant: AssistantTurnResult;
+        if (providerResume) {
+          snapshot = await this.restoreTurnSnapshot(providerResume.turnSnapshot, providerResume.requestEstimate);
+          toolBatchId = providerResume.toolBatchId;
+          activeTurnIdentity = providerResume.identity;
+          lastStartedTurnIndex = turnIndex;
+          runtime.controller.transition('requesting_model');
+          runtime.controller.recordProviderSuccess();
           modelSession = this.options.provider.createSession?.() ?? directProviderSession(this.options.provider);
-          sessionModel = configuration.model;
-          const restoreProviderState = modelSession.restoreProviderState?.bind(modelSession);
-          if (!replayRestored && replay.providerState?.model === configuration.model && restoreProviderState) {
-            restoreProviderState(replay.providerState);
+          sessionModel = snapshot.configuration.model;
+          if (providerResume.providerState && this.options.repositories.artifacts && modelSession.restoreProviderState) {
+            const storedState = await readProviderStateArtifact({ artifacts: this.options.repositories.artifacts, ref: providerResume.providerState.artifact });
+            if (!storedState) throw new Error(`Provider continuation state for settled response ${providerResume.providerState.artifact.artifactId} is unavailable.`);
+            modelSession.restoreProviderState(storedState);
             replayRestored = true;
-            const restoredSummary = replay.providerStateSummary ?? summarizeProviderState(replay.providerState);
-            await runtime.append({ type: 'provider.state.restored', state: restoredSummary, ...(replay.providerStateRef ? { stateRef: replay.providerStateRef } : {}) });
-            await runtime.emit({ type: 'provider.state.restored', state: restoredSummary, ...(replay.providerStateRef ? { stateRef: replay.providerStateRef } : {}) });
           }
-        }
-        const turnId = randomUUID();
-        const toolBatchId = randomUUID();
-        const snapshot = this.createTurnSnapshot({ turnIndex, turnId, requestAttempt: 1, configuration, profile, requestWindow, tools, instructions: effectiveInstructions, controller: runtime.controller, continuationEligible });
-        activeTurnIdentity = turnIdentity(snapshot.record);
-        const turnStarted = { type: 'turn.started' as const, runId: runtime.runId, task: runtime.input.task, ...activeTurnIdentity,
-          ...(this.options.repositories.session ? { sessionId: this.options.repositories.session.sessionId } : {}), ...(sessionEntryId ? { sessionEntryId } : {}) };
-        await runtime.append(turnStarted);
-        await runtime.emit(turnStarted);
-        if (this.options.repositories.session && turnIndex === 1) {
-          await this.options.repositories.session.repository.appendModelSettings(this.options.repositories.session.sessionId, {
-            provider: providerInfo.id, model: configuration.model,
-            ...(configuration.temperature === undefined ? {} : { temperature: configuration.temperature }),
-            ...(configuration.reasoning?.strategy === 'effort' ? { reasoningEffort: configuration.reasoning.effort } : {})
+          assistant = await this.consumeProviderSettlement({
+            request: { runId: runtime.runId, turnIndex, snapshot, controller: runtime.controller, operation: runtime.operation },
+            requestEstimate: providerResume.requestEstimate,
+            response: providerResume.response,
+            identity: providerResume.identity,
+            append: runtime.append,
+            emit: runtime.emit
           });
+          providerResume = undefined;
+        } else {
+          runtime.controller.beginModelTurn();
+          const configuration = this.captureRuntimeConfiguration();
+          const profile = parseModelProfile(await this.options.provider.describeModel(configuration.model));
+          const providerInfo = this.options.provider.describe();
+          const tools = Object.freeze(this.availableTools(profile));
+          validateModelRun(providerInfo.id, profile, [...tools], configuration.temperature, configuration.reasoning);
+          const requestWindow = requestWindowForModel(profile, this.maxOutputTokens);
+          observationStore.setTokenBudgets({
+            immediate: Math.max(256, Math.min(4_000, Math.floor(requestWindow.maxPromptTokens * 0.12))),
+            retained: Math.max(128, Math.min(1_000, Math.floor(requestWindow.maxPromptTokens * 0.03)))
+          });
+          const continuationEligible = modelSession !== undefined && sessionModel === configuration.model;
+          if (!continuationEligible) {
+            if (modelSession) { modelSession.resetContinuation?.('Model changed between immutable turn snapshots.'); await modelSession.close?.(); }
+            modelSession = this.options.provider.createSession?.() ?? directProviderSession(this.options.provider);
+            sessionModel = configuration.model;
+            const restoreProviderState = modelSession.restoreProviderState?.bind(modelSession);
+            if (!replayRestored && replay.providerState?.model === configuration.model && restoreProviderState) {
+              restoreProviderState(replay.providerState);
+              replayRestored = true;
+              const restoredSummary = replay.providerStateSummary ?? summarizeProviderState(replay.providerState);
+              await runtime.append({ type: 'provider.state.restored', state: restoredSummary, ...(replay.providerStateRef ? { stateRef: replay.providerStateRef } : {}) });
+              await runtime.emit({ type: 'provider.state.restored', state: restoredSummary, ...(replay.providerStateRef ? { stateRef: replay.providerStateRef } : {}) });
+            }
+          }
+          const turnId = randomUUID();
+          toolBatchId = randomUUID();
+          snapshot = this.createTurnSnapshot({ turnIndex, turnId, requestAttempt: 1, configuration, profile, requestWindow, tools, instructions: effectiveInstructions, controller: runtime.controller, continuationEligible });
+          activeTurnIdentity = turnIdentity(snapshot.record);
+          const turnStarted = { type: 'turn.started' as const, runId: runtime.runId, task: runtime.input.task, ...activeTurnIdentity,
+            ...(this.options.repositories.session ? { sessionId: this.options.repositories.session.sessionId } : {}), ...(sessionEntryId ? { sessionEntryId } : {}) };
+          await runtime.append(turnStarted);
+          await runtime.emit(turnStarted);
+          if (this.options.repositories.session && turnIndex === 1) {
+            await this.options.repositories.session.repository.appendModelSettings(this.options.repositories.session.sessionId, {
+              provider: providerInfo.id, model: configuration.model,
+              ...(configuration.temperature === undefined ? {} : { temperature: configuration.temperature }),
+              ...(configuration.reasoning?.strategy === 'effort' ? { reasoningEffort: configuration.reasoning.effort } : {})
+            });
+          }
+          if (turnIndex === 1) {
+            const configuredEvent = { type: 'run.configured' as const, configuration: summarizeRunConfiguration({
+              provider: providerInfo, model: profile, tools: [...tools], toolPolicy: this.toolPolicy, requestWindow,
+              ...(this.maxOutputTokens === undefined ? {} : { requestedMaxOutputTokens: this.maxOutputTokens }),
+              ...(configuration.temperature === undefined ? {} : { temperature: configuration.temperature }),
+              ...(configuration.reasoning === undefined ? {} : { reasoning: configuration.reasoning }),
+              ...(this.options.metadata === undefined ? {} : { metadata: this.options.metadata })
+            }) };
+            await runtime.append(configuredEvent);
+            await runtime.emit(configuredEvent);
+          }
+          await this.advanceOperation(runtime.operation, 'assemble_turn', { phase: { kind: 'provider', stage: 'ready', identity: activeTurnIdentity, toolBatchId }, budget: runtime.controller.snapshot() });
+          await this.enterPhase(runtime.runId, runtime.controller, 'requesting_model', runtime.append, runtime.emit);
+          lastStartedTurnIndex = turnIndex;
+          const currentModelSession = modelSession;
+          if (!currentModelSession) throw new Error('Model session was not initialized for the turn snapshot.');
+          assistant = await this.requestAssistantTurn({ runId: runtime.runId, input: runtime.input, runNotes, turnIndex, toolBatchId, snapshot, modelSession: currentModelSession, signal: runtime.signal, contextManager, controller: runtime.controller, operation: runtime.operation }, runtime.append, runtime.emit);
         }
-        if (turnIndex === 1) {
-          const configuredEvent = { type: 'run.configured' as const, configuration: summarizeRunConfiguration({
-            provider: providerInfo, model: profile, tools: [...tools], toolPolicy: this.toolPolicy, requestWindow,
-            ...(this.maxOutputTokens === undefined ? {} : { requestedMaxOutputTokens: this.maxOutputTokens }),
-            ...(configuration.temperature === undefined ? {} : { temperature: configuration.temperature }),
-            ...(configuration.reasoning === undefined ? {} : { reasoning: configuration.reasoning }),
-            ...(this.options.metadata === undefined ? {} : { metadata: this.options.metadata })
-          }) };
-          await runtime.append(configuredEvent);
-          await runtime.emit(configuredEvent);
-        }
-        await this.advanceOperation(runtime.operation, 'assemble_turn', { phase: { kind: 'provider', stage: 'ready', identity: activeTurnIdentity }, budget: runtime.controller.snapshot() });
-        await this.enterPhase(runtime.runId, runtime.controller, 'requesting_model', runtime.append, runtime.emit);
-        lastStartedTurnIndex = turnIndex;
-        const currentModelSession = modelSession;
-        if (!currentModelSession) throw new Error('Model session was not initialized for the turn snapshot.');
-        const assistant = await this.requestAssistantTurn({ runId: runtime.runId, input: runtime.input, runNotes, turnIndex, toolBatchId, snapshot, modelSession: currentModelSession, signal: runtime.signal, contextManager, controller: runtime.controller, operation: runtime.operation }, runtime.append, runtime.emit);
+        if (assistant.kind === 'outcome_unknown') return { executionStatus: 'waiting_for_recovery', reason: 'provider_outcome_unknown', effectId: assistant.effectId };
         activeCandidate = assistant.candidate;
         const { response, toolCalls } = assistant;
 
@@ -738,7 +832,7 @@ export class AgentRuntime {
     }
   }
 
-  private async resumeToolBatch(runtime: RunExecutionRuntime & { readonly resume: ResumeExecutionState }, contextManager: ContextManager, observationStore: ObservationStore, checkResults: readonly AgentCheckResult[]): Promise<TerminalDecision | undefined> {
+  private async resumeToolBatch(runtime: RunExecutionRuntime & { readonly resume: ToolResumeExecutionState }, contextManager: ContextManager, observationStore: ObservationStore, checkResults: readonly AgentCheckResult[]): Promise<TerminalDecision | undefined> {
     const profile = parseModelProfile(await this.options.provider.describeModel(this.options.model));
     const batchIdentity = { ...runtime.resume.identity, toolBatchId: runtime.resume.toolBatchId };
     runtime.controller.transition('requesting_model');
@@ -855,6 +949,28 @@ export class AgentRuntime {
     return Object.freeze({ record, profile: input.profile, requestWindow: Object.freeze({ ...input.requestWindow }), budgetAccountant: new BudgetAccountant(input.requestWindow, this.estimator), tools: Object.freeze([...input.tools]), configuration: input.configuration, instructions: Object.freeze([...input.instructions]) });
   }
 
+  private async restoreTurnSnapshot(record: AgentTurnSnapshotRecord, requestEstimate: RequestCostEstimate): Promise<TurnSnapshot> {
+    if (record.provider !== this.options.provider.id || record.model !== this.options.model) throw new Error(`Persisted turn ${record.turnId} does not match the configured provider and model.`);
+    const profile = parseModelProfile(await this.options.provider.describeModel(record.model));
+    if (hashJson(normalizeJsonSafe(profile).value) !== record.profileHash) throw new Error(`Provider model profile changed for persisted turn ${record.turnId}.`);
+    const available = new Map(this.availableTools(profile).map((tool) => [tool.name, tool]));
+    const tools = record.toolNames.map((name) => {
+      const tool = available.get(name);
+      if (!tool) throw new Error(`Tool ${name} required by persisted turn ${record.turnId} is unavailable.`);
+      return tool;
+    });
+    const requestWindow = requestWindowForModel(profile, this.maxOutputTokens);
+    const budgetAccountant = new BudgetAccountant(requestWindow, this.estimator);
+    budgetAccountant.recordSent(requestEstimate);
+    const configuration: RuntimeModelConfiguration = Object.freeze({
+      model: record.model,
+      ...(record.temperature === undefined ? {} : { temperature: record.temperature }),
+      ...(record.reasoning === undefined ? {} : { reasoning: record.reasoning }),
+      ...(record.responseFormat === undefined ? {} : { responseFormat: record.responseFormat })
+    });
+    return Object.freeze({ record, profile, requestWindow, budgetAccountant, tools: Object.freeze(tools), configuration, instructions: record.instructions });
+  }
+
   private async requestAssistantTurn(request: AssistantTurnRequest, append: (event: AgentAuditEvent) => Promise<EventAppendReceipt>, emit: (event: AgentProgressEvent) => Promise<void>): Promise<AssistantTurnResult> {
     const identity = turnIdentity(request.snapshot.record);
     const assembly = await this.assembleModelRequest(request, append, emit);
@@ -863,11 +979,18 @@ export class AgentRuntime {
     const ledgerModelRequest = { ...assembly.request }; delete ledgerModelRequest.signal;
     await append({ type: 'assistant.started', ...identity });
     await emit({ type: 'assistant.started', ...identity });
-    const completedAttempt = await this.completeWithRetries(assembly.request, assembly.snapshot, summarizeModelRequest(ledgerModelRequest), request, append, emit);
-    const { response, identity: responseIdentity } = completedAttempt;
-    const providerState = response.providerState && this.options.repositories.artifacts
-      ? await storeProviderStateArtifact({ artifacts: this.options.repositories.artifacts, turnIndex: request.turnIndex, state: response.providerState })
-      : undefined;
+    const completedAttempt = await this.completeProviderAttempt(assembly.request, assembly.estimate, assembly.snapshot, summarizeModelRequest(ledgerModelRequest), request, append, emit);
+    if (completedAttempt.kind === 'outcome_unknown') return completedAttempt;
+    return this.consumeProviderSettlement({ request, requestEstimate: assembly.estimate, response: completedAttempt.response, identity: completedAttempt.identity, append, emit });
+  }
+
+  private async consumeProviderSettlement(input: { readonly request: Pick<AssistantTurnRequest, 'runId' | 'turnIndex' | 'snapshot' | 'controller' | 'operation'>; readonly requestEstimate: RequestCostEstimate; readonly response: ModelResponse; readonly identity: AgentTurnIdentity; readonly append: (event: AgentAuditEvent) => Promise<EventAppendReceipt>; readonly emit: (event: AgentProgressEvent) => Promise<void> }): Promise<Extract<AssistantTurnResult, { readonly kind: 'settled' }>> {
+    const { request, response, identity: responseIdentity, append, emit } = input;
+    const providerPhase = request.operation.state().phase;
+    if (providerPhase.kind !== 'provider' || providerPhase.stage !== 'settled') throw new Error('Provider response is not durably settled.');
+    const settlementRecord = await this.findProviderSettlement(request.runId, providerPhase.effect.intent.effectId, providerPhase.responseId);
+    if (settlementRecord?.eventId !== providerPhase.settlementEventId) throw new Error('Provider response settlement is missing or contradictory.');
+    const providerState = settlementRecord.event.providerState;
     await append({ type: 'model.responded', ...responseIdentity, response: summarizeModelResponse(response, providerState) });
     if (providerState) await append({ type: 'provider.state.updated', ...responseIdentity, state: providerState.summary, stateRef: providerState.artifact });
     if (response.usage) {
@@ -877,12 +1000,12 @@ export class AgentRuntime {
     } else {
       const completionTokens = this.estimateAssistantOutput(response);
       request.snapshot.budgetAccountant.recordEstimatedResponse(completionTokens);
-      request.controller.recordUsage({ promptTokens: assembly.estimate.totalPromptTokens, completionTokens, totalTokens: assembly.estimate.totalPromptTokens + completionTokens }, request.snapshot.profile.pricing);
+      request.controller.recordUsage({ promptTokens: input.requestEstimate.totalPromptTokens, completionTokens, totalTokens: input.requestEstimate.totalPromptTokens + completionTokens }, request.snapshot.profile.pricing);
     }
     const toolCalls = Object.freeze((response.toolCalls ?? []).map(normalizeModelToolCall));
     const candidate = candidateFromResponse(response, request.turnIndex, toolCalls.length > 0);
     const assistantEnded = { type: 'assistant.ended' as const, ...responseIdentity, content: response.content, candidate, ...(toolCalls.length > 0 ? { toolCalls } : {}) };
-    const assistantReceipt = await append(assistantEnded);
+    await append(assistantEnded);
     await emit(assistantEnded);
     if (this.options.repositories.session) {
       await this.options.repositories.session.repository.appendAssistant(this.options.repositories.session.sessionId, {
@@ -891,25 +1014,11 @@ export class AgentRuntime {
         content: response.content
       });
     }
-    const pendingProvider = request.operation.state().phase;
-    if (pendingProvider.kind !== 'provider' || pendingProvider.stage !== 'effect_pending') throw new Error('Provider response settled outside its durable effect state.');
-    await this.advanceOperation(request.operation, 'reconcile_provider_request', {
-      phase: {
-        kind: 'provider',
-        stage: 'settled',
-        identity: responseIdentity,
-        ...(pendingProvider.requestEventId ? { requestEventId: pendingProvider.requestEventId } : {}),
-        ...(pendingProvider.effectId ? { effectId: pendingProvider.effectId } : {}),
-        responseEventId: assistantReceipt.eventId
-      },
-      budget: request.controller.snapshot()
-    });
-    return { response, toolCalls, candidate };
+    return { kind: 'settled', response, toolCalls, candidate };
   }
 
-  private async completeWithRetries(request: ModelRequest, requestSnapshot: AgentRequestSnapshotRecord, requestSummary: ReturnType<typeof summarizeModelRequest>, turnRequest: AssistantTurnRequest, append: (event: AgentAuditEvent) => Promise<EventAppendReceipt>, emit: (event: AgentProgressEvent) => Promise<void>): Promise<CompletedModelAttempt> {
-    for (let attempt = 0; attempt <= turnRequest.controller.retryPolicy.retriesPerRequest; attempt += 1) {
-      const identity = { ...turnIdentity(turnRequest.snapshot.record), requestAttempt: attempt + 1 };
+  private async completeProviderAttempt(request: ModelRequest, requestEstimate: RequestCostEstimate, requestSnapshot: AgentRequestSnapshotRecord, requestSummary: ReturnType<typeof summarizeModelRequest>, turnRequest: AssistantTurnRequest, append: (event: AgentAuditEvent) => Promise<EventAppendReceipt>, emit: (event: AgentProgressEvent) => Promise<void>): Promise<CompletedModelAttempt> {
+      const identity = turnIdentity(turnRequest.snapshot.record);
       await append({ type: 'turn.snapshot.created', snapshot: { ...turnRequest.snapshot.record, requestAttempt: identity.requestAttempt } });
       if (this.options.recordRequest) {
         const ownedRequest = recordableModelRequest(request);
@@ -917,49 +1026,83 @@ export class AgentRuntime {
       }
       await append({ type: 'request.snapshot.created', snapshot: { ...requestSnapshot, requestAttempt: identity.requestAttempt } });
       const requestReceipt = await append({ type: 'model.requested', ...identity, request: requestSummary });
+      const exactRequest = recordableModelRequest(request);
+      const parametersDigest = hashJson(normalizeJsonSafe(exactRequest).value);
+      const recovery = this.options.provider.requestRecovery
+        ? decodeEffectRecoveryCapability(this.options.provider.requestRecovery(exactRequest))
+        : UNKNOWN_EFFECT_RECOVERY;
+      const exposure = providerExposureReservation(requestEstimate);
+      const effectId = `${requestSnapshot.requestId}:${String(identity.requestAttempt)}`;
+      const responseId = randomUUID();
+      const issued = issueEffectStartTicket({
+        intent: Object.freeze({ effectId, operationId: turnRequest.runId, implementationId: this.options.provider.implementationId, parametersDigest, recovery, exposure }),
+        ticketId: randomUUID(),
+        settlementPermitId: randomUUID(),
+        driverGeneration: turnRequest.operation.state().driverGeneration,
+        currentDriverGeneration: turnRequest.operation.state().driverGeneration
+      });
+      if (issued.status !== 'issued') throw new Error(`Provider effect ${effectId} was rejected before intent commit.`);
       await this.advanceOperation(turnRequest.operation, 'prepare_provider_request', {
         phase: {
           kind: 'provider',
-          stage: 'effect_pending',
+          stage: 'effect_ready',
           identity,
+          toolBatchId: turnRequest.toolBatchId,
           requestEventId: requestReceipt.eventId,
-          effectId: `${requestSnapshot.requestId}:${String(identity.requestAttempt)}`
+          responseId,
+          effect: issued.state
         },
         budget: turnRequest.controller.snapshot()
       });
+      const current = turnRequest.operation.state().phase;
+      if (current.kind !== 'provider' || current.stage !== 'effect_ready') throw new Error(`Provider effect ${effectId} lost its issued ticket.`);
+      const started = startExternalEffect(current.effect, current.effect.ticket, turnRequest.operation.state().driverGeneration);
+      if (started.status !== 'started') throw new Error(`Provider effect ${effectId} could not consume its start authority: ${started.reason}.`);
+      await this.advanceOperation(turnRequest.operation, 'start_provider_request', {
+        phase: { ...current, stage: 'effect_pending', effect: started.state },
+        budget: turnRequest.controller.snapshot()
+      });
       const deadline = runDeadline(turnRequest.controller, request);
+      let response: ModelResponse;
+      let settlementReceipt: EventAppendReceipt;
+      let settlementEvent: Extract<AgentEvent, { readonly type: 'provider.attempt.settled' }>;
       try {
-        const response = await this.completeModelOnce(deadline.request, identity, turnRequest.toolBatchId, turnRequest.snapshot.profile, turnRequest.modelSession, emit);
-        turnRequest.controller.recordProviderSuccess();
-        return Object.freeze({ response, identity: Object.freeze(identity) });
+        const responseWithPrivateState = await this.completeModelOnce(deadline.request, identity, turnRequest.toolBatchId, turnRequest.snapshot.profile, turnRequest.modelSession, emit);
+        const providerState = responseWithPrivateState.providerState && this.options.repositories.artifacts
+          ? await storeProviderStateArtifact({ artifacts: this.options.repositories.artifacts, turnIndex: turnRequest.turnIndex, state: responseWithPrivateState.providerState })
+          : undefined;
+        response = durableProviderResponse(responseWithPrivateState);
+        settlementEvent = { type: 'provider.attempt.settled', ...identity, effectId, responseId, response, ...(providerState ? { providerState } : {}) };
+        settlementReceipt = await append(settlementEvent);
       } catch (error) {
-        if (deadline.error) throw deadline.error;
-        if (turnRequest.signal.aborted) throw error;
-        const interruptedVisible = error instanceof ModelStreamInterruptedError && (error.content.trim().length > 0 || (error.reasoningSummary?.trim().length ?? 0) > 0);
-        const failedValue = error instanceof ModelStreamInterruptedError ? error.cause : error;
-        const diagnostic = providerFailureDiagnostic(failedValue) ?? { provider: this.options.provider.id, code: 'unknown', retryable: false };
-        const disposition = providerRetryDisposition(turnRequest.modelSession, failedValue);
         turnRequest.controller.recordProviderFailure();
-        const retry = !interruptedVisible && diagnostic.retryable && attempt < turnRequest.controller.retryPolicy.retriesPerRequest;
-        const delayMs = retry ? Math.min(turnRequest.controller.retryPolicy.maximumDelayMs, Math.round(turnRequest.controller.retryPolicy.initialDelayMs * turnRequest.controller.retryPolicy.multiplier ** attempt)) : 0;
-        if (!retry) throw error;
-        turnRequest.controller.recordProviderRetry();
-        if (disposition !== 'reusable') turnRequest.modelSession.resetContinuation?.(`Retry disposition: ${disposition}.`);
-        const retryReceipt = await append({ type: 'run.retry.scheduled', ...identity, kind: error instanceof ModelStreamInterruptedError ? 'transport' : 'provider_request', attempt: attempt + 1, delayMs, diagnostic });
+        const pending = turnRequest.operation.state().phase;
+        if (pending.kind !== 'provider' || pending.stage !== 'effect_pending' || pending.effect.intent.effectId !== effectId) throw error;
+        const closed = closeExternalEffect(pending.effect, 'unknown_outcome');
         await this.advanceOperation(turnRequest.operation, 'reconcile_provider_request', {
-          phase: { kind: 'provider', stage: 'settled', identity, requestEventId: requestReceipt.eventId, effectId: `${requestSnapshot.requestId}:${String(identity.requestAttempt)}`, responseEventId: retryReceipt.eventId },
+          phase: { ...pending, stage: 'outcome_unknown', effect: closed },
           budget: turnRequest.controller.snapshot()
         });
-        await this.advanceOperation(turnRequest.operation, 'consume_provider_settlement', {
-          phase: { kind: 'provider', stage: 'ready', identity: { ...identity, requestAttempt: identity.requestAttempt + 1 } },
-          budget: turnRequest.controller.snapshot()
-        });
-        await abortableDelay(delayMs, turnRequest.signal);
+        return Object.freeze({ kind: 'outcome_unknown', effectId });
       } finally {
         deadline.dispose();
       }
-    }
-    throw new Error('Provider retry execution exhausted its attempts without a response or terminal failure.');
+      const pending = turnRequest.operation.state().phase;
+      if (pending.kind !== 'provider' || pending.stage !== 'effect_pending' || pending.effect.intent.effectId !== effectId) throw new Error(`Provider effect ${effectId} completed outside its durable start state.`);
+      const effectSettlement = settleExternalEffect(pending.effect, pending.effect.settlementPermit, {
+        outcome: 'succeeded',
+        resultDigest: hashJson(normalizeJsonSafe(settlementEvent).value),
+        exposure: response.usage ? knownEffectExposure(providerUsageQuantities(response.usage)) : unknownEffectExposure(pending.effect.intent.exposure)
+      });
+      if (effectSettlement.status !== 'settled' && effectSettlement.status !== 'already_settled') {
+        throw new Error(`Provider effect ${effectId} could not settle: ${effectSettlement.status === 'rejected' ? effectSettlement.reason : 'effect was already closed'}.`);
+      }
+      await this.advanceOperation(turnRequest.operation, 'reconcile_provider_request', {
+        phase: { ...pending, stage: 'settled', effect: effectSettlement.state, settlementEventId: settlementReceipt.eventId },
+        budget: turnRequest.controller.snapshot()
+      });
+      turnRequest.controller.recordProviderSuccess();
+      return Object.freeze({ kind: 'settled', response, identity: Object.freeze(identity) });
   }
 
   private async assembleModelRequest(request: AssistantTurnRequest, append: (event: AgentAuditEvent) => Promise<EventAppendReceipt>, emit: (event: AgentProgressEvent) => Promise<void>): Promise<RequestAssemblyResult> {
@@ -1156,6 +1299,45 @@ export class AgentRuntime {
       budget: state.budget
     });
   }
+  private async findProviderSettlement(runId: string, effectId: string, responseId: string): Promise<{ readonly eventId: string; readonly event: Extract<AgentEvent, { readonly type: 'provider.attempt.settled' }> } | undefined> {
+    let match: { readonly eventId: string; readonly event: Extract<AgentEvent, { readonly type: 'provider.attempt.settled' }> } | undefined;
+    for await (const record of this.options.repositories.events.read(runId)) {
+      if (record.event.type !== 'provider.attempt.settled' || record.event.effectId !== effectId || record.event.responseId !== responseId) continue;
+      if (match) throw new Error(`Run ${runId} contains duplicate provider settlements for ${responseId}.`);
+      match = Object.freeze({ eventId: record.eventId, event: record.event });
+    }
+    return match;
+  }
+  private async providerResumeExecutionState(state: import('./operation/contracts.js').AgentOperationState): Promise<ProviderResumeExecutionState> {
+    const phase = state.phase;
+    if (phase.kind !== 'provider' || phase.stage !== 'settled') throw new Error(`Run ${state.runId} has no settled provider response to resume.`);
+    if (!state.budget) throw new Error(`Run ${state.runId} has no durable budget at its provider settlement.`);
+    const settlement = await this.findProviderSettlement(state.runId, phase.effect.intent.effectId, phase.responseId);
+    if (settlement?.eventId !== phase.settlementEventId) throw new Error(`Run ${state.runId} is missing its exact provider settlement ${phase.settlementEventId}.`);
+    let turnSnapshot: AgentTurnSnapshotRecord | undefined;
+    let requestEstimate: RequestCostEstimate | undefined;
+    const callHistory: ToolCall[] = [];
+    for await (const record of this.options.repositories.events.read(state.runId)) {
+      const event = record.event;
+      if (event.type === 'turn.snapshot.created' && sameTurnIdentity(turnIdentity(event.snapshot), phase.identity)) turnSnapshot = event.snapshot;
+      else if (event.type === 'budget.estimate.created' && sameTurnIdentity(event, phase.identity)) requestEstimate = event.estimate;
+      else if (event.type === 'assistant.ended') callHistory.push(...(event.toolCalls ?? []));
+    }
+    if (!turnSnapshot) throw new Error(`Run ${state.runId} is missing the immutable snapshot for provider response ${phase.responseId}.`);
+    if (!requestEstimate) throw new Error(`Run ${state.runId} is missing the request estimate for provider response ${phase.responseId}.`);
+    return Object.freeze({
+      kind: 'provider',
+      identity: phase.identity,
+      toolBatchId: phase.toolBatchId,
+      response: settlement.event.response,
+      ...(settlement.event.providerState ? { providerState: settlement.event.providerState } : {}),
+      turnSnapshot,
+      requestEstimate,
+      instructions: turnSnapshot.instructions,
+      budget: state.budget,
+      callHistory: Object.freeze(callHistory)
+    });
+  }
   private async prepareOperationForFinalization(operation: AgentOperationDriver, budget: import('./run/contracts.js').AgentRunBudgetState): Promise<void> {
     for (let transitions = 0; transitions < 4; transitions += 1) {
       const state = operation.state();
@@ -1178,17 +1360,13 @@ export class AgentRuntime {
         case 'finalize_abort':
           await this.advanceOperation(operation, instruction, { phase: { kind: 'finalization', stage: 'ready' }, budget });
           continue;
-        case 'reconcile_provider_request': {
-          const failure = await this.options.repositories.events.latestOfType(state.runId, 'model.failed')
-            ?? await this.options.repositories.events.latestOfType(state.runId, 'assistant.interrupted');
-          await this.advanceOperation(operation, instruction, {
-            phase: state.phase.kind === 'provider'
-              ? { ...state.phase, stage: 'settled', ...(failure ? { responseEventId: failure.eventId } : {}) }
-              : { kind: 'finalization', stage: 'ready' },
-            budget
-          });
+        case 'start_provider_request': {
+          if (state.phase.kind !== 'provider' || state.phase.stage !== 'effect_ready') throw new Error(`Run ${state.runId} has contradictory provider start state.`);
+          closeExternalEffect(state.phase.effect, 'cancelled_before_start');
+          await this.advanceOperation(operation, instruction, { phase: { kind: 'finalization', stage: 'ready' }, budget });
           continue;
         }
+        case 'reconcile_provider_request': throw new Error(`Run ${state.runId} has an unresolved started provider effect and cannot finalize it as a local failure.`);
         case 'prepare_verification':
           await this.advanceOperation(operation, instruction, { phase: { kind: 'verification', stage: 'complete', checkIds: this.checks.map((check) => check.id), nextCheckIndex: this.checks.length }, budget });
           continue;
@@ -1229,6 +1407,7 @@ export class AgentRuntime {
   private currentOperationConfiguration() {
     return Object.freeze({
       providerId: this.options.provider.id,
+      providerImplementationId: this.options.provider.implementationId,
       model: this.options.model,
       runtimeImplementationId: 'agent-core.runtime.operation-v1',
       toolImplementationIds: Object.freeze(this.tools.map((tool) => tool.implementationId)),
@@ -1403,6 +1582,37 @@ function recordableModelRequest(request: ModelRequest): Omit<ModelRequest, 'sign
   });
 }
 
+function providerExposureReservation(estimate: RequestCostEstimate): EffectExposureReservation {
+  return Object.freeze({
+    quantities: Object.freeze([
+      Object.freeze({ unit: 'prompt_tokens', amount: Math.ceil(estimate.totalPromptTokens) }),
+      Object.freeze({ unit: 'completion_tokens', amount: Math.ceil(estimate.outputReserveTokens) })
+    ])
+  });
+}
+
+function providerUsageQuantities(usage: ModelUsage): readonly EffectExposureQuantity[] {
+  return Object.freeze([
+    Object.freeze({ unit: 'prompt_tokens', amount: Math.ceil(usage.promptTokens) }),
+    Object.freeze({ unit: 'completion_tokens', amount: Math.ceil(usage.completionTokens) })
+  ]);
+}
+
+function durableProviderResponse(response: ModelResponse): ModelResponse {
+  return parseModelResponse({
+    content: response.content,
+    model: response.model,
+    provider: response.provider,
+    ...(response.requestId === undefined ? {} : { requestId: response.requestId }),
+    ...(response.transport === undefined ? {} : { transport: response.transport }),
+    ...(response.usage === undefined ? {} : { usage: response.usage }),
+    ...(response.reasoningSummary === undefined ? {} : { reasoningSummary: response.reasoningSummary }),
+    ...(response.toolCalls === undefined ? {} : { toolCalls: response.toolCalls }),
+    terminationReason: response.terminationReason,
+    ...(response.providerTerminationReason === undefined ? {} : { providerTerminationReason: response.providerTerminationReason })
+  });
+}
+
 function runSignalDeadline(controller: AgentRunController, parentSignal: AbortSignal): { readonly signal: AbortSignal; readonly dispose: () => void } {
   const timeout = new AbortController();
   const timer = setTimeout(() => { timeout.abort(controller.elapsedDeadlineError()); }, controller.remainingElapsedMs() + 1);
@@ -1466,6 +1676,7 @@ function contextSourceIds(items: readonly ContextItemInput[] | undefined, proven
     : `${provenance}-context-${String(index + 1)}-${hashJson(normalizeJsonSafe(item).value).slice(0, 12)}`);
 }
 function turnIdentity(snapshot: AgentTurnSnapshotRecord): AgentTurnIdentity { return { turnIndex: snapshot.turnIndex, turnId: snapshot.turnId, requestAttempt: snapshot.requestAttempt }; }
+function sameTurnIdentity(left: AgentTurnIdentity, right: AgentTurnIdentity): boolean { return left.turnIndex === right.turnIndex && left.turnId === right.turnId && left.requestAttempt === right.requestAttempt; }
 function formatOverflowDiagnostic(diagnostic: OverflowDiagnostic): string { return ['Request assembly exceeded budget after overflow recovery.', `Reason: ${diagnostic.reason}.`, `Components: messages=${String(diagnostic.messageTokens)}, contextHistory=${String(diagnostic.contextHistoryTokens)}, context=${String(diagnostic.contextTokens)}, evidence=${String(diagnostic.evidenceTokens)}, toolSchemas=${String(diagnostic.toolSchemaTokens)}, outputReserve=${String(diagnostic.outputReserveTokens)}.`, `Total request tokens=${String(diagnostic.totalRequestTokens)}.`, `Recovery actions attempted=${diagnostic.reductionsAttempted.map(formatOverflowAction).join(', ') || 'none'}.`].join(' '); }
 function formatOverflowAction(action: OverflowRecoveryAction): string { if (action.kind === 'reduce_context_history') return `reduce_context_history(${String(action.reductions)})`; if (action.kind === 'reduce_context') return `reduce_context(${String(action.removedItems)})`; if (action.kind === 'install_checkpoint') return `install_checkpoint(${String(action.compactedToolResults)})`; return action.kind; }
 class RequestAssemblyError extends Error {}
@@ -1487,7 +1698,6 @@ function bindExternalAbort(external: AbortSignal | undefined, requestAbort: () =
 }
 function abortReason(reason: unknown): string { return reason instanceof Error ? reason.message : typeof reason === 'string' && reason.length > 0 ? reason : 'Agent run aborted.'; }
 function throwIfAborted(signal: AbortSignal): void { if (!signal.aborted) return; throw signal.reason instanceof Error ? signal.reason : new Error(typeof signal.reason === 'string' ? signal.reason : 'Agent run aborted.'); }
-async function abortableDelay(delayMs: number, signal: AbortSignal): Promise<void> { if (delayMs === 0) return; await new Promise<void>((resolve, reject) => { const timeout = setTimeout(resolve, delayMs); const abort = () => { clearTimeout(timeout); reject(signal.reason instanceof Error ? signal.reason : new Error('Retry aborted.')); }; if (signal.aborted) abort(); else signal.addEventListener('abort', abort, { once: true }); }); }
 async function safePersist(append: (event: AgentAuditEvent) => Promise<unknown>, event: AgentAuditEvent): Promise<void> { try { await append(event); } catch { /* Terminal finalization will report its own persistence state. */ } }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function validateToolBoundary(value: unknown): asserts value is ToolAuthorizationBoundary {
@@ -1500,15 +1710,17 @@ function validateToolBoundary(value: unknown): asserts value is ToolAuthorizatio
 function removeRunItems(items: { readonly runId: string }[], runId: string): void { for (let index = items.length - 1; index >= 0; index -= 1) if (items[index]?.runId === runId) items.splice(index, 1); }
 function assertQueueCapacity(items: readonly unknown[], maximum: number, label: string): void { if (items.length >= maximum) throw new Error(`${label} queue limit of ${String(maximum)} was reached.`); }
 function operationSuspension(state: import('./operation/contracts.js').AgentOperationState): AgentRunResult {
-  if (state.phase.kind !== 'suspended') throw new Error(`Run ${state.runId} is not suspended.`);
   if (!state.budget) throw new Error(`Run ${state.runId} has no durable budget at its suspension boundary.`);
-  if (state.phase.reason === 'approval_required') throw new Error(`Run ${state.runId} requires approval request reconstruction.`);
+  const phase = state.phase;
+  if (phase.kind === 'provider' && phase.stage === 'outcome_unknown') return Object.freeze({ state: 'suspended', reason: 'provider_outcome_unknown', runId: state.runId, finalizationId: state.finalizationId, effectId: phase.effect.intent.effectId, budget: state.budget });
+  if (phase.kind !== 'suspended') throw new Error(`Run ${state.runId} is not suspended.`);
+  if (phase.reason === 'approval_required') throw new Error(`Run ${state.runId} requires approval request reconstruction.`);
   return Object.freeze({
     state: 'suspended',
-    reason: state.phase.reason,
+    reason: phase.reason,
     runId: state.runId,
     finalizationId: state.finalizationId,
-    ...(state.phase.effectId ? { effectId: state.phase.effectId } : {}),
+    ...(phase.effectId ? { effectId: phase.effectId } : {}),
     budget: state.budget
   });
 }
@@ -1536,17 +1748,11 @@ function toolRecoveryState(records: readonly AgentEvent[], toolBatchId: string, 
   }
   return Object.freeze(recovery);
 }
-function providerRetryDisposition(session: ModelProviderSession, error: unknown): ModelProviderSessionRetryDisposition {
-  if (typeof session.retryDisposition !== 'function') return 'unknown';
-  const disposition = session.retryDisposition(error);
-  return disposition === 'reusable' || disposition === 'reset_required' ? disposition : 'unknown';
-}
 function directProviderSession(provider: ModelProvider): ModelProviderSession {
   const stream = provider.stream?.bind(provider);
   return {
     complete: (request) => provider.complete(request),
     ...(stream ? { stream: (request: ModelRequest) => stream(request) } : {}),
-    retryDisposition: () => 'unknown'
   };
 }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }

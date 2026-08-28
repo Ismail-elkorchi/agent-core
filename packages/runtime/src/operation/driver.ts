@@ -355,7 +355,8 @@ function advanceMatchesProcedure(procedure: Extract<AgentOperationInstruction, {
   switch (procedure) {
     case 'prepare': return phase.kind === 'preparing' || phase.kind === 'finalization';
     case 'assemble_turn': return phase.kind === 'provider' || phase.kind === 'finalization' || phase.kind === 'cancelling';
-    case 'prepare_provider_request': return (phase.kind === 'provider' && phase.stage === 'effect_pending') || phase.kind === 'finalization';
+    case 'prepare_provider_request': return (phase.kind === 'provider' && phase.stage === 'effect_ready') || phase.kind === 'finalization';
+    case 'start_provider_request': return (phase.kind === 'provider' && phase.stage === 'effect_pending') || phase.kind === 'finalization';
     case 'reconcile_provider_request': return (phase.kind === 'provider' && (phase.stage === 'settled' || phase.stage === 'outcome_unknown')) || phase.kind === 'suspended';
     case 'consume_provider_settlement': return phase.kind === 'provider' || phase.kind === 'tools' || phase.kind === 'preparing' || phase.kind === 'verification' || phase.kind === 'disposition' || phase.kind === 'finalization';
     case 'prepare_tool_call': return (phase.kind === 'tools' && (phase.stage === 'effect_pending' || phase.stage === 'complete')) || phase.kind === 'finalization';

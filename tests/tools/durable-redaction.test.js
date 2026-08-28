@@ -18,6 +18,7 @@ const profile = {
 };
 class Provider {
   id = 'scripted'; calls = 0;
+  implementationId = 'agent-core.tests.durable-redaction-provider@1';
   describe() { return { id: this.id, displayName: 'Scripted', defaultModel: 'scripted' }; }
   async describeModel() { return profile; }
   async complete(request) {

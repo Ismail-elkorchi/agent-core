@@ -4,6 +4,7 @@ import { appendFile, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { InMemoryEventRepository, PersistenceCorruptionError } from '@agent-core/evidence';
+import { issueEffectStartTicket, settleExternalEffect, startExternalEffect } from '@agent-core/effects';
 import { AgentOperationCoordinator, AgentSession, InMemorySessionRepository, agentEventCodec, decodeAgentTerminalSnapshot } from '@agent-core/runtime';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 
@@ -114,7 +115,7 @@ test('session final projections are idempotent and validate the complete termina
   const terminal = decodeAgentTerminalSnapshot({
     runId: 'run', finalizationId: 'fin', phase: 'ended', executionStatus: 'completed', verificationStatus: 'not_required', terminationReason: 'model_completed', modelTerminationReason: 'stop',
     candidate: { status: 'complete', message: 'done', source: 'content', turnIndex: 1 }, turnCount: 1, checkResults: [],
-    budget: { modelTurns: 1, totalToolCalls: 0, repeatedIdenticalToolCalls: 0, elapsedMs: 1, promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, knownCosts: {}, pricingStatus: 'unknown', unknownPricedTokens: 0, consecutiveProviderFailures: 0, consecutiveToolFailures: 0, providerRetries: 0 }
+    budget: { modelTurns: 1, totalToolCalls: 0, repeatedIdenticalToolCalls: 0, elapsedMs: 1, promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, knownCosts: {}, pricingStatus: 'unknown', unknownPricedTokens: 0, consecutiveProviderFailures: 0, consecutiveToolFailures: 0 }
   });
   const first = await repository.projectFinal(session.id, terminal);
   const second = await repository.projectFinal(session.id, terminal);
@@ -230,8 +231,7 @@ function completedTerminal(runId, finalizationId, message) {
       pricingStatus: 'unknown',
       unknownPricedTokens: 0,
       consecutiveProviderFailures: 0,
-      consecutiveToolFailures: 0,
-      providerRetries: 0
+      consecutiveToolFailures: 0
     }
   };
 }
@@ -247,7 +247,7 @@ async function acceptTestOperation(operations, runId) {
     runId,
     finalizationId: `${runId}:final`,
     input: { task: 'claimed', instructions: [], contextItems: [] },
-    configuration: { providerId: 'test', model: 'model', runtimeImplementationId: 'test/runtime@1', toolImplementationIds: [], checkIds: [], policyHash: 'policy' }
+    configuration: { providerId: 'test', providerImplementationId: 'agent-core.tests.session-provider@1', model: 'model', runtimeImplementationId: 'test/runtime@1', toolImplementationIds: [], checkIds: [], policyHash: 'policy' }
   });
 }
 
@@ -263,9 +263,16 @@ async function acceptApprovalOperation(operations, runId) {
     assert.equal(result.kind, 'advanced');
   };
   await advance('prepare', { kind: 'preparing', step: 'assemble_turn', turnIndex: 1 });
-  await advance('assemble_turn', { kind: 'provider', stage: 'ready', identity });
-  await advance('prepare_provider_request', { kind: 'provider', stage: 'effect_pending', identity, effectId: 'provider-effect' });
-  await advance('reconcile_provider_request', { kind: 'provider', stage: 'settled', identity, effectId: 'provider-effect', responseEventId: 'response' });
+  await advance('assemble_turn', { kind: 'provider', stage: 'ready', identity, toolBatchId: 'batch' });
+  const issued = issueEffectStartTicket({ intent: { effectId: 'provider-effect', operationId: runId, implementationId: 'agent-core.tests.session-provider@1', parametersDigest: '0'.repeat(64), recovery: { kind: 'unknown' }, exposure: { quantities: [] } }, ticketId: 'provider-ticket', settlementPermitId: 'provider-permit', driverGeneration: driver.state().driverGeneration, currentDriverGeneration: driver.state().driverGeneration });
+  assert.equal(issued.status, 'issued');
+  await advance('prepare_provider_request', { kind: 'provider', stage: 'effect_ready', identity, toolBatchId: 'batch', requestEventId: 'request', responseId: 'response', effect: issued.state });
+  const started = startExternalEffect(issued.state, issued.state.ticket, driver.state().driverGeneration);
+  assert.equal(started.status, 'started');
+  await advance('start_provider_request', { kind: 'provider', stage: 'effect_pending', identity, toolBatchId: 'batch', requestEventId: 'request', responseId: 'response', effect: started.state });
+  const settled = settleExternalEffect(started.state, started.state.settlementPermit, { outcome: 'succeeded', resultDigest: '1'.repeat(64), exposure: { status: 'known', quantities: [] } });
+  assert.equal(settled.status, 'settled');
+  await advance('reconcile_provider_request', { kind: 'provider', stage: 'settled', identity, toolBatchId: 'batch', requestEventId: 'request', responseId: 'response', settlementEventId: 'response-event', effect: settled.state });
   await advance('consume_provider_settlement', { kind: 'tools', stage: 'ready', identity, toolBatchId: 'batch', callCount: 1, nextCallIndex: 0 });
   await advance('prepare_tool_call', { kind: 'tools', stage: 'effect_pending', identity, toolBatchId: 'batch', callCount: 1, nextCallIndex: 0, effectId: 'tool-effect' });
   await advance('reconcile_tool_call', { kind: 'approval', identity, toolBatchId: 'batch', callCount: 1, nextCallIndex: 0, pendingApprovalIds: ['approval'] });

@@ -1,4 +1,5 @@
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
+import { decodeEffectExecutionState, type EffectExecutionState } from '@agent-core/effects';
 import type { AgentRunBudgetState, AgentTurnIdentity } from '../run/contracts.js';
 import { decodeContextItemInput, type ContextItemInput } from '../context/manager.js';
 
@@ -10,6 +11,7 @@ export interface AgentOperationInput {
 
 export interface AgentOperationConfiguration {
   readonly providerId: string;
+  readonly providerImplementationId: string;
   readonly model: string;
   readonly runtimeImplementationId: string;
   readonly toolImplementationIds: readonly string[];
@@ -22,17 +24,23 @@ export type AgentOperationControl =
   | Readonly<{ readonly status: 'owned'; readonly driverId: string }>
   | Readonly<{ readonly status: 'abort_requested'; readonly driverId?: string; readonly reason: string }>;
 
+interface AgentProviderPhaseBase {
+  readonly kind: 'provider';
+  readonly identity: AgentTurnIdentity;
+  readonly toolBatchId: string;
+}
+
+export type AgentProviderOperationPhase =
+  | Readonly<AgentProviderPhaseBase & { readonly stage: 'ready' }>
+  | Readonly<AgentProviderPhaseBase & { readonly stage: 'effect_ready'; readonly requestEventId: string; readonly responseId: string; readonly effect: Extract<EffectExecutionState, { readonly phase: 'ticket_issued' }> }>
+  | Readonly<AgentProviderPhaseBase & { readonly stage: 'effect_pending'; readonly requestEventId: string; readonly responseId: string; readonly effect: Extract<EffectExecutionState, { readonly phase: 'started' }> }>
+  | Readonly<AgentProviderPhaseBase & { readonly stage: 'settled'; readonly requestEventId: string; readonly responseId: string; readonly effect: Extract<EffectExecutionState, { readonly phase: 'settled' }>; readonly settlementEventId: string }>
+  | Readonly<AgentProviderPhaseBase & { readonly stage: 'outcome_unknown'; readonly requestEventId: string; readonly responseId: string; readonly effect: Extract<EffectExecutionState, { readonly phase: 'closed' }> }>;
+
 export type AgentOperationPhase =
   | Readonly<{ readonly kind: 'accepted' }>
   | Readonly<{ readonly kind: 'preparing'; readonly step: 'initialize' | 'assemble_turn'; readonly turnIndex: number }>
-  | Readonly<{
-      readonly kind: 'provider';
-      readonly stage: 'ready' | 'effect_pending' | 'settled' | 'outcome_unknown';
-      readonly identity: AgentTurnIdentity;
-      readonly requestEventId?: string;
-      readonly effectId?: string;
-      readonly responseEventId?: string;
-    }>
+  | AgentProviderOperationPhase
   | Readonly<{
       readonly kind: 'tools';
       readonly stage: 'ready' | 'effect_pending' | 'settled' | 'projecting' | 'complete';
@@ -96,6 +104,7 @@ export type AgentOperationProcedure =
   | 'prepare'
   | 'assemble_turn'
   | 'prepare_provider_request'
+  | 'start_provider_request'
   | 'reconcile_provider_request'
   | 'consume_provider_settlement'
   | 'prepare_tool_call'
@@ -125,6 +134,7 @@ export function nextAgentOperationInstruction(state: AgentOperationState): Agent
     case 'preparing': return Object.freeze({ kind: 'execute', procedure: state.phase.step === 'initialize' ? 'prepare' : 'assemble_turn' });
     case 'provider':
       if (state.phase.stage === 'ready') return Object.freeze({ kind: 'execute', procedure: 'prepare_provider_request' });
+      if (state.phase.stage === 'effect_ready') return Object.freeze({ kind: 'execute', procedure: 'start_provider_request' });
       if (state.phase.stage === 'effect_pending') return Object.freeze({ kind: 'execute', procedure: 'reconcile_provider_request' });
       if (state.phase.stage === 'settled') return Object.freeze({ kind: 'execute', procedure: 'consume_provider_settlement' });
       return Object.freeze({ kind: 'wait', reason: 'external_outcome' });
@@ -182,9 +192,10 @@ function decodeInput(value: unknown): AgentOperationInput {
 
 function decodeConfiguration(value: unknown): AgentOperationConfiguration {
   const configuration = object(value, 'operation configuration');
-  exact(configuration, ['providerId', 'model', 'runtimeImplementationId', 'toolImplementationIds', 'checkIds', 'policyHash']);
+  exact(configuration, ['providerId', 'providerImplementationId', 'model', 'runtimeImplementationId', 'toolImplementationIds', 'checkIds', 'policyHash']);
   return Object.freeze({
     providerId: identifier(configuration.providerId, 'providerId'),
+    providerImplementationId: identifier(configuration.providerImplementationId, 'providerImplementationId'),
     model: nonempty(configuration.model, 'model'),
     runtimeImplementationId: identifier(configuration.runtimeImplementationId, 'runtimeImplementationId'),
     toolImplementationIds: uniqueIdentifiers(configuration.toolImplementationIds, 'toolImplementationIds'),
@@ -220,11 +231,31 @@ function decodePhase(value: unknown): AgentOperationPhase {
       exact(phase, ['kind', 'step', 'turnIndex']);
       return Object.freeze({ kind, step: enumeration(phase.step, ['initialize', 'assemble_turn'] as const, 'phase.step'), turnIndex: positiveInteger(phase.turnIndex, 'phase.turnIndex') });
     case 'provider': {
-      exact(phase, ['kind', 'stage', 'identity', 'requestEventId', 'effectId', 'responseEventId']);
+      exact(phase, ['kind', 'stage', 'identity', 'toolBatchId', 'requestEventId', 'responseId', 'effect', 'settlementEventId']);
+      const stage = enumeration(phase.stage, ['ready', 'effect_ready', 'effect_pending', 'settled', 'outcome_unknown'] as const, 'phase.stage');
       const requestEventId = optionalIdentifier(phase.requestEventId, 'phase.requestEventId');
-      const effectId = optionalIdentifier(phase.effectId, 'phase.effectId');
-      const responseEventId = optionalIdentifier(phase.responseEventId, 'phase.responseEventId');
-      return Object.freeze({ kind, stage: enumeration(phase.stage, ['ready', 'effect_pending', 'settled', 'outcome_unknown'] as const, 'phase.stage'), identity: decodeTurnIdentity(phase.identity), ...(requestEventId ? { requestEventId } : {}), ...(effectId ? { effectId } : {}), ...(responseEventId ? { responseEventId } : {}) });
+      const responseId = optionalIdentifier(phase.responseId, 'phase.responseId');
+      const settlementEventId = optionalIdentifier(phase.settlementEventId, 'phase.settlementEventId');
+      const effect = phase.effect === undefined ? undefined : decodeEffectExecutionState(phase.effect);
+      if (stage === 'ready' && (requestEventId || responseId || effect || settlementEventId)) throw new TypeError('A ready provider phase cannot retain effect state.');
+      if (stage !== 'ready' && (!requestEventId || !responseId || !effect)) throw new TypeError(`Provider stage ${stage} requires request, response, and effect identity.`);
+      const base = { kind, identity: decodeTurnIdentity(phase.identity), toolBatchId: identifier(phase.toolBatchId, 'phase.toolBatchId') } as const;
+      if (stage === 'ready') return Object.freeze({ ...base, stage });
+      if (!requestEventId || !responseId || !effect) throw new TypeError(`Provider stage ${stage} is incomplete.`);
+      if (stage === 'effect_ready') {
+        if (effect.phase !== 'ticket_issued') throw new TypeError('An effect-ready provider phase requires an issued ticket.');
+        return Object.freeze({ ...base, stage, requestEventId, responseId, effect });
+      }
+      if (stage === 'effect_pending') {
+        if (effect.phase !== 'started') throw new TypeError('An effect-pending provider phase requires a started effect.');
+        return Object.freeze({ ...base, stage, requestEventId, responseId, effect });
+      }
+      if (stage === 'settled') {
+        if (effect.phase !== 'settled' || !settlementEventId) throw new TypeError('A settled provider phase requires effect and response settlement.');
+        return Object.freeze({ ...base, stage, requestEventId, responseId, effect, settlementEventId });
+      }
+      if (effect.phase !== 'closed') throw new TypeError('An unknown provider outcome requires a closed effect.');
+      return Object.freeze({ ...base, stage, requestEventId, responseId, effect });
     }
     case 'tools': {
       exact(phase, ['kind', 'stage', 'identity', 'toolBatchId', 'callCount', 'nextCallIndex', 'effectId', 'settlementEventId']);
@@ -285,9 +316,9 @@ function decodeTurnIdentity(value: unknown): AgentTurnIdentity {
 
 function decodeBudget(value: unknown): AgentRunBudgetState {
   const budget = object(value, 'operation budget');
-  exact(budget, ['modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'elapsedMs', 'promptTokens', 'completionTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'knownCosts', 'pricingStatus', 'unknownPricedTokens', 'consecutiveProviderFailures', 'consecutiveToolFailures', 'providerRetries']);
+  exact(budget, ['modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'elapsedMs', 'promptTokens', 'completionTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'knownCosts', 'pricingStatus', 'unknownPricedTokens', 'consecutiveProviderFailures', 'consecutiveToolFailures']);
   return Object.freeze({
-    modelTurns: nonnegativeInteger(budget.modelTurns, 'budget.modelTurns'), totalToolCalls: nonnegativeInteger(budget.totalToolCalls, 'budget.totalToolCalls'), repeatedIdenticalToolCalls: nonnegativeInteger(budget.repeatedIdenticalToolCalls, 'budget.repeatedIdenticalToolCalls'), elapsedMs: nonnegativeInteger(budget.elapsedMs, 'budget.elapsedMs'), promptTokens: nonnegativeInteger(budget.promptTokens, 'budget.promptTokens'), completionTokens: nonnegativeInteger(budget.completionTokens, 'budget.completionTokens'), cacheReadTokens: nonnegativeInteger(budget.cacheReadTokens, 'budget.cacheReadTokens'), cacheWriteTokens: nonnegativeInteger(budget.cacheWriteTokens, 'budget.cacheWriteTokens'), reasoningTokens: nonnegativeInteger(budget.reasoningTokens, 'budget.reasoningTokens'), knownCosts: numberRecord(budget.knownCosts, 'budget.knownCosts'), pricingStatus: enumeration(budget.pricingStatus, ['known', 'partial', 'unknown'] as const, 'budget.pricingStatus'), unknownPricedTokens: nonnegativeInteger(budget.unknownPricedTokens, 'budget.unknownPricedTokens'), consecutiveProviderFailures: nonnegativeInteger(budget.consecutiveProviderFailures, 'budget.consecutiveProviderFailures'), consecutiveToolFailures: nonnegativeInteger(budget.consecutiveToolFailures, 'budget.consecutiveToolFailures'), providerRetries: nonnegativeInteger(budget.providerRetries, 'budget.providerRetries')
+    modelTurns: nonnegativeInteger(budget.modelTurns, 'budget.modelTurns'), totalToolCalls: nonnegativeInteger(budget.totalToolCalls, 'budget.totalToolCalls'), repeatedIdenticalToolCalls: nonnegativeInteger(budget.repeatedIdenticalToolCalls, 'budget.repeatedIdenticalToolCalls'), elapsedMs: nonnegativeInteger(budget.elapsedMs, 'budget.elapsedMs'), promptTokens: nonnegativeInteger(budget.promptTokens, 'budget.promptTokens'), completionTokens: nonnegativeInteger(budget.completionTokens, 'budget.completionTokens'), cacheReadTokens: nonnegativeInteger(budget.cacheReadTokens, 'budget.cacheReadTokens'), cacheWriteTokens: nonnegativeInteger(budget.cacheWriteTokens, 'budget.cacheWriteTokens'), reasoningTokens: nonnegativeInteger(budget.reasoningTokens, 'budget.reasoningTokens'), knownCosts: numberRecord(budget.knownCosts, 'budget.knownCosts'), pricingStatus: enumeration(budget.pricingStatus, ['known', 'partial', 'unknown'] as const, 'budget.pricingStatus'), unknownPricedTokens: nonnegativeInteger(budget.unknownPricedTokens, 'budget.unknownPricedTokens'), consecutiveProviderFailures: nonnegativeInteger(budget.consecutiveProviderFailures, 'budget.consecutiveProviderFailures'), consecutiveToolFailures: nonnegativeInteger(budget.consecutiveToolFailures, 'budget.consecutiveToolFailures')
   });
 }
 

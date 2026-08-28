@@ -32,13 +32,8 @@ for (const adapter of [ollamaAdapter(), openAIAdapter(), openAICodexAdapter(), o
 
     const session = provider.createSession?.();
     if (session) {
-      const disposition = session.retryDisposition(new Error('conformance failure'));
-      assert.ok(['reusable', 'reset_required', 'unknown'].includes(disposition), 'session declares a valid retry disposition');
-      assert.equal(disposition, adapter.sessionRetryDisposition, 'adapter exposes its conservative continuation policy');
       session.resetContinuation?.('conformance reset');
       await session.close?.();
-    } else {
-      assert.equal(adapter.sessionRetryDisposition, undefined, 'stateless adapter does not claim continuation reuse');
     }
 
     const controller = new AbortController();
@@ -81,7 +76,7 @@ test('provider request decoding owns input before asynchronous profile validatio
 
 function ollamaAdapter() {
   return {
-    name: 'OllamaProvider', model: 'llama-test', sessionRetryDisposition: undefined,
+    name: 'OllamaProvider', model: 'llama-test',
     create() {
       return new OllamaProvider({ clientFactory: () => ({
         async chat(input) {
@@ -114,7 +109,7 @@ function ollamaAdapter() {
 
 function openAIAdapter() {
   return {
-    name: 'OpenAIProvider', model: 'gpt-test', sessionRetryDisposition: 'reset_required',
+    name: 'OpenAIProvider', model: 'gpt-test',
     create() {
       return new OpenAIProvider({ apiKey: 'test', modelProfiles: { 'gpt-test': testModelProfile() }, fetch: async (_url, init) => {
         if (init.signal?.aborted) throw new Error('aborted');
@@ -138,7 +133,7 @@ function openAIAdapter() {
 
 function openAICodexAdapter() {
   return {
-    name: 'OpenAICodexProvider', model: 'gpt-test', sessionRetryDisposition: 'reset_required',
+    name: 'OpenAICodexProvider', model: 'gpt-test',
     create() {
       return new OpenAICodexProvider({
         modelProfiles: { 'gpt-test': testModelProfile() },
@@ -173,7 +168,7 @@ function openAICodexAdapter() {
 
 function openRouterAdapter() {
   return {
-    name: 'OpenRouterProvider', model: 'openai/test', sessionRetryDisposition: undefined,
+    name: 'OpenRouterProvider', model: 'openai/test',
     create() {
       return new OpenRouterProvider({ apiKey: 'test', fetch: async (_url, init) => {
         if (!init?.body) return json({ data: [{ id: 'openai/test', name: 'Test', context_length: 16_000, architecture: { input_modalities: ['text', 'image'], output_modalities: ['text'] }, top_provider: { context_length: 16_000, max_completion_tokens: 2_000 }, supported_parameters: ['tools', 'max_tokens'] }] });
