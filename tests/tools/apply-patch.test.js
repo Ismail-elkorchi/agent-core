@@ -9,7 +9,7 @@ import { createToolCall, prepareToolCall } from '@agent-core/tools';
 import { applyPatchTool, DEFAULT_LOCAL_TOOL_CONFIGURATION, TextPatchJournal } from '@agent-core/tools-local';
 import { applyPatchWithAuthority } from '@agent-core/tools-local/testing/apply-patch';
 import { commitTextFilePatchTransaction, recoverTextFilePatchTransactions } from '@agent-core/tools-local/testing/text-write';
-import { invokeToolCall, textToolCall } from '../tool-call-helpers.js';
+import { invokePreparedForTest, invokeToolCall, textToolCall } from '../tool-call-helpers.js';
 import { testPatchJournal, testWorkspaceFileRoot } from '../workspace-file-root-helper.js';
 
 const policy = { allowedRisks: ['read', 'write', 'destructive'] };
@@ -170,16 +170,19 @@ test('apply_patch dynamically requires a transaction directory only for writes',
   const document = patch(['*** Update File: note.txt', '@@', '-old', '+new']);
   const dryPreparation = await prepareToolCall(createToolCall({ name: 'apply_patch', input: { kind: 'json', value: { patch: document, dryRun: true } } }), [applyPatchTool], base);
   assert.equal(dryPreparation.ok, true);
-  const dry = await dryPreparation.prepared.invoke(base);
+  const dry = await invokePreparedForTest(dryPreparation.prepared, base);
   assert.equal(dry.output.operationStatus, 'dry_run');
 
   const writePreparation = await prepareToolCall(textToolCall('apply_patch', document), [applyPatchTool], base);
   assert.equal(writePreparation.ok, true);
-  const missing = await writePreparation.prepared.invoke(base).catch(error => error);
-  assert.match(missing.message, /patchJournal/u);
+  const missing = await invokePreparedForTest(writePreparation.prepared, base);
+  assert.equal(missing.kind, 'failure');
+  assert.match(missing.summary, /patchJournal/u);
 
   const withDirectory = { ...base, services: { ...base.services, patchJournal: testPatchJournal(base.services.workspaceFileRoot) } };
-  const applied = await writePreparation.prepared.invoke(withDirectory);
+  const appliedPreparation = await prepareToolCall(textToolCall('apply_patch', document), [applyPatchTool], base);
+  assert.equal(appliedPreparation.ok, true);
+  const applied = await invokePreparedForTest(appliedPreparation.prepared, withDirectory);
   assert.equal(applied.output.operationStatus, 'applied');
   assert.deepEqual(applyPatchTool.requirements.services, ['workspaceFileRoot', 'localToolConfiguration']);
 });

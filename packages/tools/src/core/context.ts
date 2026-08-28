@@ -57,6 +57,19 @@ export interface ToolPreparationContext extends Omit<ToolExecutionContext, 'sign
   readonly boundary: ToolAuthorizationBoundary;
 }
 
+export interface ToolPreparationResource {
+  release(): void | Promise<void>;
+}
+
+export interface ToolPreparationLifetime {
+  /** Transfer cleanup responsibility to this preparation, or release immediately if preparation already ended. */
+  own(resource: ToolPreparationResource): Promise<void>;
+}
+
+export interface ToolCanonicalizationContext extends ToolPreparationContext {
+  readonly preparation: ToolPreparationLifetime;
+}
+
 export interface ToolInvocationContext {
   readonly runId: string;
   readonly turnId: string;

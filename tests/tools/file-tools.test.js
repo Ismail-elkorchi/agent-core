@@ -5,7 +5,7 @@ import { appendFile, chmod, mkdir, mkdtemp, rename, truncate, writeFile } from '
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { prepareToolCall } from '@agent-core/tools';
-import { invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
+import { invokePreparedForTest, invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
 import {
   DEFAULT_LOCAL_TOOL_CONFIGURATION,
   WorkspaceFileSelector,
@@ -356,7 +356,7 @@ test('search_text handles long repositories, context, per-file limits, abort, an
   const preparationContext = { ...context, signal: controller.signal, boundary: { authorizationPolicyId: 'tests/search@1', executionTargetId: root } };
   const prepared = await prepareToolCall(call, [searchTextTool], preparationContext);
   assert.equal(prepared.ok, true);
-  const abortedPromise = prepared.prepared.invoke(preparationContext);
+  const abortedPromise = invokePreparedForTest(prepared.prepared, preparationContext);
   setTimeout(() => controller.abort('search cancelled'), 1);
   const aborted = await abortedPromise;
   assert.equal(aborted.output.status, 'aborted');

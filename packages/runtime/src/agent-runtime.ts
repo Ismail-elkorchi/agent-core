@@ -45,6 +45,7 @@ import {
 import {
   isToolAvailable,
   prepareToolCall,
+  releasePreparedToolCall,
   parseToolPolicy,
   READ_ONLY_TOOL_POLICY,
   ResourceLeaseCoordinator,
@@ -330,8 +331,24 @@ export class AgentRuntime {
     const authorizationContext = this.toolContext(input.signal ?? new AbortController().signal);
     const currentPreparation = await prepareToolCall(currentCall, this.tools, authorizationContext);
     if (!currentPreparation.ok) throw new Error(`Approved tool call is no longer valid: ${currentPreparation.observation.summary}`);
-    if (currentPreparation.prepared.toolImplementationId !== target.binding.toolImplementationId) throw new Error(`Approved tool implementation changed for ${input.approvalId}; a new approval is required.`);
-    if (currentPreparation.prepared.fingerprint !== target.fingerprint) throw new Error(`Approval fingerprint changed for ${input.approvalId}; a new approval is required.`);
+    const preparation = currentPreparation.prepared;
+    let validationFailure: unknown;
+    try {
+      if (preparation.toolImplementationId !== target.binding.toolImplementationId) throw new Error(`Approved tool implementation changed for ${input.approvalId}; a new approval is required.`);
+      if (preparation.fingerprint !== target.fingerprint) throw new Error(`Approval fingerprint changed for ${input.approvalId}; a new approval is required.`);
+    } catch (error) {
+      validationFailure = error;
+    }
+    try {
+      await releasePreparedToolCall(preparation);
+    } catch (releaseFailure) {
+      if (validationFailure !== undefined) throw new AggregateError([validationFailure, releaseFailure], 'Approval revalidation and preparation release both failed.', { cause: releaseFailure });
+      throw releaseFailure;
+    }
+    if (validationFailure !== undefined) {
+      if (validationFailure instanceof Error) throw validationFailure;
+      throw new Error('Approval revalidation failed.', { cause: validationFailure });
+    }
     const priorResolutions = records.filter((event): event is Extract<AgentEvent, { type: 'approval.resolved' }> => event.type === 'approval.resolved');
     const existing = priorResolutions.find((resolution) => resolution.approvalId === input.approvalId);
     if (existing && (existing.decision !== input.decision || existing.fingerprint !== input.fingerprint)) throw new Error(`Conflicting approval resolution for ${input.approvalId}.`);
@@ -694,7 +711,7 @@ export class AgentRuntime {
         const toolDeadline = runSignalDeadline(runtime.controller, runtime.signal);
         let toolResult;
         try {
-          toolResult = await executeAssistantToolCalls({ runId: runtime.runId, ...turnIdentity(snapshot.record), toolBatchId, toolCalls, tools: this.tools, toolContext: this.toolContext(toolDeadline.signal), resourceLeases: this.resourceLeases, modelInputModalities: snapshot.profile.modalities.input,
+          toolResult = await executeAssistantToolCalls({ runId: runtime.runId, driverGeneration: runtime.operation.state().driverGeneration, ...turnIdentity(snapshot.record), toolBatchId, toolCalls, tools: this.tools, toolContext: this.toolContext(toolDeadline.signal), resourceLeases: this.resourceLeases, modelInputModalities: snapshot.profile.modalities.input,
             ...(this.options.toolAuthorizer ? { authorizer: this.options.toolAuthorizer } : {}), contextManager, observationStore,
             ...(this.options.repositories.session ? { session: this.options.repositories.session } : {}), controller: runtime.controller, append: runtime.append, emit: runtime.emit });
         } finally { toolDeadline.dispose(); }
@@ -742,7 +759,7 @@ export class AgentRuntime {
     const toolDeadline = runSignalDeadline(runtime.controller, runtime.signal);
     let resumedTools;
     try {
-      resumedTools = await executeAssistantToolCalls({ runId: runtime.runId, ...batchIdentity, toolCalls: runtime.resume.toolCalls, tools: this.tools, toolContext: this.toolContext(toolDeadline.signal), resourceLeases: this.resourceLeases, modelInputModalities: profile.modalities.input, authorizationOverrides: runtime.resume.overrides, recovery: runtime.resume.recovery, resuming: true,
+      resumedTools = await executeAssistantToolCalls({ runId: runtime.runId, driverGeneration: runtime.operation.state().driverGeneration, ...batchIdentity, toolCalls: runtime.resume.toolCalls, tools: this.tools, toolContext: this.toolContext(toolDeadline.signal), resourceLeases: this.resourceLeases, modelInputModalities: profile.modalities.input, authorizationOverrides: runtime.resume.overrides, recovery: runtime.resume.recovery, resuming: true,
         ...(this.options.toolAuthorizer ? { authorizer: this.options.toolAuthorizer } : {}), contextManager, observationStore,
         ...(this.options.repositories.session ? { session: this.options.repositories.session } : {}), controller: runtime.controller, append: runtime.append, emit: runtime.emit });
     } finally { toolDeadline.dispose(); }

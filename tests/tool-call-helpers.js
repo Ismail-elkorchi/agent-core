@@ -3,8 +3,12 @@ import {
   POLICY_TOOL_AUTHORIZER,
   invokePreparedToolCall,
   policyBlockedObservation,
-  prepareToolCall
+  prepareToolCall,
+  releasePreparedToolCall,
+  releaseToolInvocation,
+  startPreparedToolCall
 } from '@agent-core/tools';
+import { issueEffectStartTicket, NO_EFFECT_EXPOSURE } from '@agent-core/effects';
 import { testPatchJournal } from './workspace-file-root-helper.js';
 
 export function jsonToolCall(name, value = {}, id) {
@@ -42,13 +46,38 @@ export async function invokeToolCall(call, tools, context) {
     context: preparationContext
   });
   if (authorization.decision !== 'allow') {
+    await releasePreparedToolCall(preparation.prepared);
     return policyBlockedObservation(`Tool authorization denied: ${call.name}`, {
       tool: call.name,
       policyReason: authorization.decision,
       recovery: authorization.reason
     });
   }
-  return invokePreparedToolCall(preparation.prepared, preparationContext);
+  return invokePreparedForTest(preparation.prepared, preparationContext);
+}
+
+let nextInvocation = 1;
+
+export async function invokePreparedForTest(prepared, context) {
+  const identity = String(nextInvocation++);
+  const issued = issueEffectStartTicket({
+    intent: {
+      effectId: `test-effect-${identity}`,
+      operationId: 'test-operation',
+      implementationId: prepared.toolImplementationId,
+      parametersDigest: prepared.fingerprint,
+      recovery: prepared.effects.recovery,
+      exposure: NO_EFFECT_EXPOSURE
+    },
+    ticketId: `test-ticket-${identity}`,
+    settlementPermitId: `test-permit-${identity}`,
+    driverGeneration: 1,
+    currentDriverGeneration: 1
+  });
+  if (issued.status !== 'issued') throw new Error('Test effect ticket was rejected.');
+  const invocation = await startPreparedToolCall(prepared, issued.state, 1);
+  try { return await invokePreparedToolCall(invocation, context); }
+  finally { await releaseToolInvocation(invocation); }
 }
 
 export async function presentToolObservation(tool, call, observation, context, maxTokens) {
@@ -67,10 +96,14 @@ export async function presentToolObservation(tool, call, observation, context, m
     if (observation.kind !== 'failure') throw new Error(`Cannot present a result for an invalid tool call: ${preparation.observation.summary}`);
     return tool.presentObservation({ call, input: undefined, observation, mode: 'immediate', maxTokens });
   }
-  return tool.presentObservation({
-    call,
-    input: preparation.prepared.canonicalSnapshot,
-    observation,
-    mode: 'immediate', maxTokens
-  });
+  try {
+    return tool.presentObservation({
+      call,
+      input: preparation.prepared.canonicalSnapshot,
+      observation,
+      mode: 'immediate', maxTokens
+    });
+  } finally {
+    await releasePreparedToolCall(preparation.prepared);
+  }
 }

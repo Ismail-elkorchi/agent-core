@@ -624,14 +624,47 @@ test('final request snapshot separates every dynamic context provenance and hash
   for (const field of ['effectiveInstructionHash', 'selectedEvidenceHash', 'retainedHistoryHash', 'modelToolSchemasHash', 'compiledPromptHash']) assert.match(snapshot[field], /^[a-f0-9]{64}$/);
 });
 
+test('tool preparation resources release after denial, approval suspension, authorization failure, and success', async () => {
+  for (const outcome of ['denied', 'approval', 'authorization_failure', 'success']) {
+    let releases = 0;
+    const call = { id: outcome, type: 'function', name: 'lifetime', input: { kind: 'json', value: {} } };
+    const tool = {
+      name: 'lifetime', implementationId: `tests/lifetime-${outcome}@1`, description: 'lifetime', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema,
+      effectEnvelope: readEnvelope,
+      decodeInput() { return { ok: true, input: {} }; },
+      async canonicalizeInput(input, context) { await context.preparation.own({ release() { releases += 1; } }); return input; },
+      snapshotInput(input) { return input; }, deriveEffects() { return readEffects; },
+      async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'done', scope: completeScope }; }
+    };
+    const run = await harness({
+      script: [response('tool_calls', '', { toolCalls: [call] }), response()],
+      tools: [tool],
+      toolAuthorizer: outcome === 'denied'
+        ? () => ({ decision: 'deny', reason: 'denied for test' })
+        : outcome === 'approval'
+          ? () => ({ decision: 'require_approval', reason: 'approve for test' })
+          : outcome === 'authorization_failure'
+            ? () => { throw new Error('authorizer unavailable'); }
+          : () => ({ decision: 'allow' })
+    });
+    const result = await run.agent.run({ task: outcome }).result;
+    assert.equal(result.state, outcome === 'approval' ? 'suspended' : 'ended');
+    assert.equal(releases, 1, outcome);
+  }
+});
+
 test('durable approval resumes after repository reopen and rejects changed policy fingerprints', async () => {
   let effects = 0;
+  let preparationReleases = 0;
   const call = { id: 'effect-1', type: 'function', name: 'effect', input: { kind: 'json', value: { path: 'src/../state' } } };
   const tool = adoptToolDefinition({
     name: 'effect', implementationId: 'tests/canonical-effect@1', description: 'write one canonical resource', jsonSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }, outputSchema: emptyOutputSchema,
     effectEnvelope: { accesses: [{ mode: 'write', scope: 'workspace' }], lockScopes: ['workspace'] },
     decodeInput(input) { return { ok: true, input: input.value }; },
-    canonicalizeInput(input) { return { ...input, path: 'state' }; }, snapshotInput(input) { return input; },
+    async canonicalizeInput(input, context) {
+      await context.preparation.own({ release() { preparationReleases += 1; } });
+      return { ...input, path: 'state' };
+    }, snapshotInput(input) { return input; },
     deriveEffects(input) { return { accesses: [{ mode: 'write', scope: `workspace/${input.path}` }], lockScopes: [`workspace/${input.path}`], recovery: { kind: 'unknown' } }; },
     async invoke() { effects += 1; return { kind: 'result', ok: true, output: {}, summary: 'changed', scope: { resources: ['workspace/state'], coverage: 'complete' } }; }
   });
@@ -644,24 +677,29 @@ test('durable approval resumes after repository reopen and rejects changed polic
   const suspended = await repositories.agent.run({ task: 'approval' }).result;
   assert.equal(suspended.state, 'suspended');
   assert.equal(effects, 0);
+  assert.equal(preparationReleases, 1);
   const approval = suspended.pendingApprovals[0];
 
   const changedPolicy = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read'] } });
   await assert.rejects(async () => (await changedPolicy.resumeApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result, /fingerprint changed/);
+  assert.equal(preparationReleases, 2);
   assert.equal((await eventsFor(repositories.events, suspended.runId)).filter(event => event.type === 'approval.resolved').length, 0);
 
   const changedTarget = new AgentRuntime({ provider, model: 'scripted', toolBoundary: { ...toolBoundary, executionTargetId: 'tests/other-target' }, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] } });
   await assert.rejects(async () => (await changedTarget.resumeApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result, /boundary changed/);
+  assert.equal(preparationReleases, 2);
 
   const replacement = adoptToolDefinition({ ...tool, implementationId: 'tests/canonical-effect@2' });
   const changedImplementation = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [replacement], toolPolicy: { allowedRisks: ['read', 'write'] } });
   await assert.rejects(async () => (await changedImplementation.resumeApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result, /implementation changed|fingerprint changed/);
+  assert.equal(preparationReleases, 3);
   assert.deepEqual(approval.binding, { toolImplementationId: tool.implementationId, ...toolBoundary });
 
   const reopened = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, checks: [{ id: 'required', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
   const result = ended(await (await reopened.resumeApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result);  assert.equal(result.executionStatus, 'completed');
   assert.equal(result.verificationStatus, 'passed');
   assert.equal(effects, 1);
+  assert.equal(preparationReleases, 5);
   const records = await eventsFor(repositories.events, result.runId);
   assert.equal(records.filter(event => event.type === 'approval.requested').length, 1);
   assert.equal(records.filter(event => event.type === 'approval.resolved').length, 1);

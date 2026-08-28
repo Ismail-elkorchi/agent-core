@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { issueEffectStartTicket, NO_EFFECT_EXPOSURE } from '@agent-core/effects';
 import { ContextManager } from '../context/manager.js';
 import { hashJson } from '@agent-core/evidence';
 import type { SessionRepository } from '../session/repository.js';
@@ -8,9 +9,13 @@ import {
   abortableToolBoundary,
   enforceAllowedEffects,
   invokePreparedToolCall,
+  releasePreparedToolCall,
+  releaseToolInvocation,
+  startPreparedToolCall,
   policyBlockedObservation,
   prepareToolCall,
   type PreparedToolCall,
+  type ToolInvocation,
   type ToolAuthorizer,
   type ToolAuthorizationDecision,
   type ToolCall,
@@ -55,13 +60,14 @@ interface PreparedEntry {
   readonly identity: AgentToolCallAttemptIdentity;
   readonly call: ToolCall;
   readonly prepared?: PreparedToolCall;
-  readonly observation?: ToolObservation;
-  readonly observationProjected?: boolean;
-  readonly invoke?: true;
+  observation?: ToolObservation;
+  observationProjected?: boolean;
+  invoke?: true;
 }
 
 export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & {
   readonly runId: string;
+  readonly driverGeneration: number;
   readonly toolCalls: readonly ToolCall[];
   readonly tools: readonly ToolDefinition[];
   readonly toolContext: ToolPreparationContext;
@@ -81,9 +87,11 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
   const authorizationContext = input.toolContext;
   const authorizer = input.authorizer ?? POLICY_TOOL_AUTHORIZER;
   const entries: PreparedEntry[] = [];
+  const invocations = new Map<number, ToolInvocation>();
   const approvals: AgentApprovalRequest[] = [];
   let uncertain: { callIndex: number; toolName: string; toolAttempt: number } | undefined;
 
+  const execute = async (): Promise<ToolBatchExecutionResult> => {
   // The whole batch crosses the untrusted parse/canonicalize/effects/authorization boundary before any effect runs.
   for (const [callIndex, call] of input.toolCalls.entries()) {
     const callIdentityValue = callIdentity(input, call, callIndex);
@@ -109,14 +117,17 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
     }
     const prepared = preparation.prepared;
     const preparedCall = prepared.call;
+    const entry: PreparedEntry = { identity, call: preparedCall, prepared };
+    // Register ownership immediately. Every later failure is then covered by the batch release boundary.
+    entries.push(entry);
     if (recovery?.completed) {
-      entries.push({ identity, call: preparedCall, prepared, observation: recovery.completed.observation, observationProjected: recovery.completed.observationProjected });
+      entry.observation = recovery.completed.observation;
+      entry.observationProjected = recovery.completed.observationProjected;
       continue;
     }
     if (recovery?.incompleteStart) {
       if (recovery.incompleteStart.fingerprint !== prepared.fingerprint) throw new Error(`Tool call fingerprint changed after an incomplete execution at call ${String(callIndex)}.`);
       uncertain = { callIndex, toolName: call.name, toolAttempt: recovery.incompleteStart.toolAttempt };
-      entries.push({ identity, call: preparedCall, prepared });
       continue;
     }
     const override = input.authorizationOverrides?.find((item) => item.callIndex === callIndex);
@@ -138,15 +149,14 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
       const approval = approvalRequest(input.runId, identity, approvalId, authorization.reason, prepared, authorizationContext);
       approvals.push(approval);
       await input.append({ type: 'approval.requested', runId: input.runId, ...callIdentityValue, approvalId, toolName: call.name, fingerprint: approval.fingerprint, input: approval.input, effects: prepared.effects, binding, policyHash: approval.policyHash, reason: approval.reason });
-      entries.push({ identity, call: preparedCall, prepared });
       continue;
     }
     if (authorization.decision === 'deny') {
       const observation = policyBlockedObservation(`Tool authorization denied: ${call.name}`, { tool: call.name, policyReason: 'deny', ...(authorization.reason ? { recovery: authorization.reason } : {}) });
-      entries.push({ identity, call: preparedCall, prepared, observation });
+      entry.observation = observation;
       continue;
     }
-    entries.push({ identity, call: preparedCall, prepared, invoke: true });
+    entry.invoke = true;
   }
 
   if (approvals.length > 0) return { outcome: 'waiting_for_approval', approvals: Object.freeze(approvals) };
@@ -165,9 +175,12 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
       const lease = await input.resourceLeases?.acquire(item.value.prepared.effects, `${input.runId}:${item.value.identity.toolBatchId}:${String(item.callIndex)}`, input.toolContext.signal);
       try {
         await persistToolStart(input, item.value);
+        const effect = issueToolEffect(input, item.value);
+        const invocation = await startPreparedToolCall(item.value.prepared, effect, input.driverGeneration);
+        invocations.set(item.callIndex, invocation);
         return {
           callIndex: item.callIndex,
-          observation: await invokePreparedToolCall(item.value.prepared, {
+          observation: await invokePreparedToolCall(invocation, {
             ...input.toolContext,
             ...(lease ? { resourceLease: lease } : {}),
             emitProgress: async (progress) => {
@@ -204,6 +217,34 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
     input.controller.recordToolResult(observation.ok);
   }
   return { outcome: 'completed' };
+  };
+
+  const result = await execute().catch((failure: unknown) => releaseToolAuthoritiesAfterFailure(entries, invocations, failure));
+  await releaseToolAuthorities(entries, invocations);
+  return result;
+}
+
+async function releaseToolAuthoritiesAfterFailure(entries: readonly PreparedEntry[], invocations: ReadonlyMap<number, ToolInvocation>, failure: unknown): Promise<never> {
+  try {
+    await releaseToolAuthorities(entries, invocations);
+  } catch (releaseFailure) {
+    throw new AggregateError([failure, releaseFailure], 'Tool execution and authority release both failed.', { cause: releaseFailure });
+  }
+  if (failure instanceof Error) throw failure;
+  throw new Error('Tool execution failed.', { cause: failure });
+}
+
+async function releaseToolAuthorities(entries: readonly PreparedEntry[], invocations: ReadonlyMap<number, ToolInvocation>): Promise<void> {
+  const releases: Promise<void>[] = [];
+  for (const entry of entries) {
+    if (!entry.prepared) continue;
+    const invocation = invocations.get(entry.identity.callIndex);
+    releases.push(invocation ? releaseToolInvocation(invocation) : releasePreparedToolCall(entry.prepared));
+  }
+  const settled = await Promise.allSettled(releases);
+  const failures: unknown[] = [];
+  for (const result of settled) if (result.status === 'rejected') failures.push(result.reason);
+  if (failures.length > 0) throw new AggregateError(failures, 'Tool call authority release failed.');
 }
 
 function isExecutableEntry(entry: PreparedEntry): entry is PreparedEntry & { readonly prepared: PreparedToolCall; readonly invoke: true } {
@@ -306,6 +347,25 @@ function callIdentity(input: AgentToolBatchIdentity, call: ToolCall, callIndex: 
 }
 function toolEventKey(runId: string, identity: AgentToolCallAttemptIdentity, stage: string): string {
   return `${runId}:tool:${identity.turnId}:${identity.toolBatchId}:${String(identity.callIndex)}:attempt:${String(identity.toolAttempt)}:${stage}`;
+}
+function issueToolEffect(input: Parameters<typeof executeAssistantToolCalls>[0], entry: PreparedEntry & { readonly prepared: PreparedToolCall }) {
+  const effectId = `${input.runId}:${entry.identity.turnId}:${entry.identity.toolBatchId}:${String(entry.identity.callIndex)}:${String(entry.identity.toolAttempt)}`;
+  const issued = issueEffectStartTicket({
+    intent: {
+      effectId,
+      operationId: input.runId,
+      implementationId: entry.prepared.toolImplementationId,
+      parametersDigest: entry.prepared.fingerprint,
+      recovery: entry.prepared.effects.recovery,
+      exposure: NO_EFFECT_EXPOSURE
+    },
+    ticketId: randomUUID(),
+    settlementPermitId: randomUUID(),
+    driverGeneration: input.driverGeneration,
+    currentDriverGeneration: input.driverGeneration
+  });
+  if (issued.status !== 'issued') throw new Error(`Tool effect ticket was rejected: ${issued.reason}.`);
+  return issued.state;
 }
 function approvalRequest(runId: string, identity: AgentToolCallIdentity, approvalId: string, reason: string, prepared: PreparedToolCall, context: ToolPreparationContext): AgentApprovalRequest {
   const input = prepared.canonicalSnapshot;

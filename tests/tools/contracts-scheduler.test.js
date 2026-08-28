@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
-import { adoptToolDefinition, createToolCall, defineTool, invokePreparedToolCall, parseToolObservation, prepareToolCall, ResourceLeaseCoordinator } from '@agent-core/tools';
+import { adoptToolDefinition, beginToolInvocation, createToolCall, defineTool, parseToolObservation, prepareToolCall, releasePreparedToolCall, releaseToolInvocation, ResourceLeaseCoordinator, startPreparedToolCall } from '@agent-core/tools';
+import { issueEffectStartTicket, NO_EFFECT_EXPOSURE } from '@agent-core/effects';
 import { scheduleToolCalls } from '@agent-core/runtime';
 import {
   applyPatchTool,
@@ -15,6 +16,7 @@ import {
   viewImageTool,
   writeStdinTool
 } from '@agent-core/tools-local';
+import { invokePreparedForTest } from '../tool-call-helpers.js';
 
 const builtins = [listDirectoryTool, findFilesTool, readFilesTool, searchTextTool, applyPatchTool, execCommandTool, writeStdinTool, stopProcessTool, viewImageTool, readArtifactTool];
 
@@ -49,10 +51,89 @@ test('derived effects cannot exceed their envelope and output is validated befor
   });
   const validPreparation = await prepareToolCall(createToolCall({ name: 'invalid_output', input: { kind: 'json', value: {} } }), [invalidOutput], context);
   assert.equal(validPreparation.ok, true);
-  const observation = await invokePreparedToolCall(validPreparation.prepared, context);
+  const observation = await invokePreparedForTest(validPreparation.prepared, context);
   assert.equal(observation.kind, 'failure');
   assert.equal(observation.output.reason, 'invalid_output');
 });
+
+test('tool preparation authority transfers once and releases every owned resource', async () => {
+  let releases = 0;
+  const tool = defineTool({
+    name: 'lifetime', implementationId: 'tests.lifetime.v1', description: 'lifetime', schema: z.strictObject({}), outputSchema: z.strictObject({}),
+    effectEnvelope: { accesses: [], lockScopes: [] },
+    async canonicalizeInput(input, context) {
+      await context.preparation.own({ release() { releases += 1; } });
+      return input;
+    },
+    deriveEffects: () => ({ accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }),
+    invoke: async () => ({ kind: 'result', ok: true, summary: 'done', scope: { resources: [], coverage: 'complete' }, output: {} })
+  });
+  const context = { policy: { allowedRisks: [] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } };
+  const prepare = () => prepareToolCall(createToolCall({ name: tool.name, input: { kind: 'json', value: {} } }), [tool], context);
+  const rejected = await prepare();
+  assert.equal(rejected.ok, true);
+  const staleEffect = effectFor(rejected.prepared, 1);
+  await assert.rejects(startPreparedToolCall(rejected.prepared, staleEffect, 2), /stale_driver/u);
+  assert.equal(releases, 1);
+  await releasePreparedToolCall(rejected.prepared);
+  assert.equal(releases, 1);
+
+  const accepted = await prepare();
+  assert.equal(accepted.ok, true);
+  const invocation = await startPreparedToolCall(accepted.prepared, effectFor(accepted.prepared, 3), 3);
+  const observation = await beginToolInvocation(invocation, context);
+  assert.equal(observation.ok, true);
+  assert.throws(() => beginToolInvocation(invocation, context), /single-use/u);
+  await releaseToolInvocation(invocation);
+  await releaseToolInvocation(invocation);
+  assert.equal(releases, 2);
+  await releasePreparedToolCall(accepted.prepared);
+  await assert.rejects(startPreparedToolCall(accepted.prepared, effectFor(accepted.prepared, 3), 3), /already transferred or been released/u);
+});
+
+test('aborted and failed preparation release resources before returning control', async () => {
+  for (const mode of ['abort', 'invalid']) {
+    let releases = 0;
+    const controller = new AbortController();
+    const tool = defineTool({
+      name: `preparation_${mode}`, implementationId: `tests.preparation-${mode}.v1`, description: mode, schema: z.strictObject({}), outputSchema: z.strictObject({}),
+      effectEnvelope: { accesses: [], lockScopes: [] },
+      async canonicalizeInput(input, context) {
+        await context.preparation.own({ release() { releases += 1; } });
+        if (mode === 'abort') controller.abort('preparation cancelled');
+        else throw new Error('canonicalization failed');
+        return input;
+      },
+      deriveEffects: () => ({ accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }),
+      invoke: async () => ({ kind: 'result', ok: true, summary: 'unused', scope: { resources: [], coverage: 'complete' }, output: {} })
+    });
+    const preparation = prepareToolCall(createToolCall({ name: tool.name, input: { kind: 'json', value: {} } }), [tool], {
+      policy: { allowedRisks: [] }, signal: controller.signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' }
+    });
+    if (mode === 'abort') await assert.rejects(preparation, /preparation cancelled/u);
+    else assert.equal((await preparation).ok, false);
+    assert.equal(releases, 1, mode);
+  }
+});
+
+function effectFor(prepared, generation) {
+  const issued = issueEffectStartTicket({
+    intent: {
+      effectId: `effect-${String(generation)}`,
+      operationId: 'operation',
+      implementationId: prepared.toolImplementationId,
+      parametersDigest: prepared.fingerprint,
+      recovery: prepared.effects.recovery,
+      exposure: NO_EFFECT_EXPOSURE
+    },
+    ticketId: `ticket-${String(generation)}`,
+    settlementPermitId: `permit-${String(generation)}`,
+    driverGeneration: generation,
+    currentDriverGeneration: generation
+  });
+  assert.equal(issued.status, 'issued');
+  return issued.state;
+}
 
 test('scheduler uses resource accesses and locks, never recovery capability, for conflicts', () => {
   const call = (callIndex, accesses, lockScopes = [], recovery = { kind: 'unknown' }, dependsOnCallIndices) => ({
@@ -223,7 +304,7 @@ test('authoritative canonicalization owns input before effects, fingerprinting, 
   assert.equal(preparation.ok, true);
   const fingerprint = preparation.prepared.fingerprint;
   callerOwned.path = 'after.txt'; callerOwned.nested.value = 2;
-  const observation = await invokePreparedToolCall(preparation.prepared, context);
+  const observation = await invokePreparedForTest(preparation.prepared, context);
   assert.equal(observation.output.path, 'before.txt');
   assert.equal(observation.output.value, 1);
   assert.equal(preparation.prepared.fingerprint, fingerprint);
