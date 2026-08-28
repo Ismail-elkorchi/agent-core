@@ -261,7 +261,7 @@ test('dynamic tool adoption snapshots mutable consumer definition contracts', ()
     invoke: async () => ({ kind: 'result', ok: true, summary: 'ok', scope: { resources: [], coverage: 'complete' }, output: {} })
   });
   const registered = adoptToolDefinition(definition);
-  accesses[0].mode = 'write'; requirements[0] = 'processManager';
+  accesses[0].mode = 'write'; requirements[0] = 'commandExecution';
   assert.equal(registered.effectEnvelope.accesses[0].mode, 'read');
   assert.deepEqual(registered.requirements.services, ['workspaceRoot']);
   assert.equal(Object.isFrozen(registered.effectEnvelope.accesses), true);

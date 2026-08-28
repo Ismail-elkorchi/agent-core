@@ -5,14 +5,15 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { LocalArtifactRepository } from '@agent-core/evidence/node';
-import { DEFAULT_LOCAL_TOOL_CONFIGURATION, ProcessManager } from '@agent-core/tools-local';
+import { DEFAULT_LOCAL_TOOL_CONFIGURATION, LocalCommandExecution } from '@agent-core/tools-local';
+import { testWorkspaceFileRoot } from '../workspace-file-root-helper.js';
 
 const owner = Object.freeze({ runId: 'fault-matrix-run', turnId: 'turn', toolBatchId: 'batch', callIndex: 0 });
 
 test('process lifecycle fault matrix preserves one settled terminal truth', async (t) => {
   await t.test('exit before supervisor reachability leaves no owned process', async () => {
     const { manager, root } = await context();
-    const missing = path.join(root, 'missing-working-directory');
+    const missing = 'missing-working-directory';
     await assert.rejects(manager.start(request(missing, 'process.exit(0)')));
     assert.equal(manager.activeCount(owner.runId), 0);
     assert.deepEqual(await manager.disposeRun(owner.runId), []);
@@ -23,25 +24,25 @@ test('process lifecycle fault matrix preserves one settled terminal truth', asyn
     const { manager, root, ledgerDirectory } = await context();
     const heartbeat = path.join(root, 'heartbeat');
     const script = `const fs=require('node:fs');let n=0;fs.writeFileSync(${JSON.stringify(heartbeat)},String(++n));setInterval(()=>fs.writeFileSync(${JSON.stringify(heartbeat)},String(++n)),10)`;
-    let result = await manager.start(request(root, script, { onProgress(progress) { delivered.push(progress); } }));
+    let result = await manager.start(request('.', script, { onProgress(progress) { delivered.push(progress); } }));
     assert.equal(result.status, 'running');
     await waitFor(() => access(heartbeat));
     const ledger = await readLedger(ledgerDirectory, result.processId);
     process.kill(ledger.supervisorPid, 'SIGKILL');
-    while (result.status === 'running') result = await manager.poll(result.processId, 1_000, 50, result.cursorEnd, owner);
+    while (result.status === 'running') result = await manager.query(result.processId, 1_000, 50, result.cursorEnd, owner);
     const heartbeatAtTerminal = await readFile(heartbeat, 'utf8');
     await new Promise((resolve) => setTimeout(resolve, 100));
     assert.equal(await readFile(heartbeat, 'utf8'), heartbeatAtTerminal, 'descendant work stopped before terminal publication');
     assert.equal(result.status, 'failed');
     assert.equal(delivered.at(-1).type, 'status');
     assert.equal(delivered.at(-1).stage, 'process_failed');
-    assert.deepEqual((await manager.disposeProcess(result.processId, owner)).status, result.status);
+    assert.deepEqual((await manager.terminate(result.processId, owner)).status, result.status);
     const firstCleanup = await manager.disposeRun(owner.runId);
     const secondCleanup = await manager.disposeRun(owner.runId);
     assert.equal(firstCleanup.length, 1);
     assert.deepEqual(secondCleanup, firstCleanup);
-    await manager.markTerminalReported(result.processId);
-    await manager.markTerminalReported(result.processId);
+    await manager.acknowledgeTerminalReport(result.processId);
+    await manager.acknowledgeTerminalReport(result.processId);
     assert.deepEqual(await manager.disposeRun(owner.runId), []);
   });
 
@@ -51,19 +52,19 @@ test('process lifecycle fault matrix preserves one settled terminal truth', asyn
   ]) {
     await t.test(race.name + ' produce one stable outcome', async () => {
       const { manager, root } = await context();
-      let result = await manager.start(request(root, 'setTimeout(() => process.exit(0), 35)', { timeoutMs: race.timeoutMs }));
+      let result = await manager.start(request('.', 'setTimeout(() => process.exit(0), 35)', { timeoutMs: race.timeoutMs }));
       if (race.stop) {
-        const outcomes = await Promise.all([manager.disposeProcess(result.processId, owner), manager.disposeProcess(result.processId, owner)]);
+        const outcomes = await Promise.all([manager.terminate(result.processId, owner), manager.terminate(result.processId, owner)]);
         assert.deepEqual(outcomes[1], outcomes[0]);
         result = outcomes[0];
       } else {
-        while (result.status === 'running') result = await manager.poll(result.processId, 100, 20, result.cursorEnd, owner);
+        while (result.status === 'running') result = await manager.query(result.processId, 100, 20, result.cursorEnd, owner);
       }
-      const repeated = await manager.poll(result.processId, 100, 0, result.cursorEnd, owner);
+      const repeated = await manager.query(result.processId, 100, 0, result.cursorEnd, owner);
       assert.equal(repeated.status, result.status);
       assert.equal(repeated.cursorEnd, result.cursorEnd);
       assert.equal(['exited', race.stop ? 'stopped' : 'timed_out'].includes(result.status), true, result.status);
-      await manager.markTerminalReported(result.processId);
+      await manager.acknowledgeTerminalReport(result.processId);
     });
   }
 
@@ -71,12 +72,12 @@ test('process lifecycle fault matrix preserves one settled terminal truth', asyn
     const delivered = [];
     const { manager, root } = await context();
     const script = "let n=0;const timer=setInterval(()=>{process.stdout.write(String(n++)+'\\n');if(n===8){clearInterval(timer);process.exit(0)}},5)";
-    let result = await manager.start(request(root, script, { async onProgress(progress) { delivered.push(progress); await new Promise((resolve) => setTimeout(resolve, 2)); throw new Error('observer failed'); } }));
-    while (result.status === 'running') result = await manager.poll(result.processId, 1_000, 20, result.cursorEnd, owner);
+    let result = await manager.start(request('.', script, { async onProgress(progress) { delivered.push(progress); await new Promise((resolve) => setTimeout(resolve, 2)); throw new Error('observer failed'); } }));
+    while (result.status === 'running') result = await manager.query(result.processId, 1_000, 20, result.cursorEnd, owner);
     const terminalCursor = result.cursorEnd;
     const deliveredAtTerminal = delivered.length;
     await new Promise((resolve) => setTimeout(resolve, 50));
-    const repeated = await manager.poll(result.processId, 1_000, 0, terminalCursor, owner);
+    const repeated = await manager.query(result.processId, 1_000, 0, terminalCursor, owner);
     assert.equal(result.status, 'exited');
     assert.equal(result.exitCode, 0);
     assert.equal(result.progressDeliveryErrors > 0, true);
@@ -84,23 +85,23 @@ test('process lifecycle fault matrix preserves one settled terminal truth', asyn
     assert.equal(delivered.length, deliveredAtTerminal);
     assert.equal(delivered.at(-1).type, 'status');
     assert.equal(delivered.at(-1).stage, 'process_exited');
-    await manager.markTerminalReported(result.processId);
+    await manager.acknowledgeTerminalReport(result.processId);
   });
 });
 
 test('terminal-state recovery rejects missing, malformed, stale, unauthenticated, misowned, and invalid states', async (t) => {
   const valid = await terminalFixture();
   const validManager = recoveredManager(valid);
-  const validReconciliation = await validManager.reconcileOrphanProcesses();
+  const validReconciliation = await validManager.reconcile();
   assert.deepEqual(validReconciliation.unresolved, []);
   const [validReport] = await validManager.disposeRun('recovered-run');
   assert.equal(validReport.result.processId, valid.processId);
   assert.deepEqual(validReport.result.owner, { runId: 'recovered-run', turnId: 'turn', toolBatchId: 'batch', callIndex: 0 });
-  await validManager.markTerminalReported(valid.processId);
+  await validManager.acknowledgeTerminalReport(valid.processId);
 
   const staleSource = await terminalFixture();
   const staleState = await readFile(staleSource.stateFile, 'utf8');
-  await recoveredManager(staleSource).markTerminalReported(staleSource.processId);
+  await recoveredManager(staleSource).acknowledgeTerminalReport(staleSource.processId);
   const cases = [
     ['missing', async (fixture) => { await rm(fixture.stateFile); }],
     ['malformed', async (fixture) => { await writeFile(fixture.stateFile, '{'); }],
@@ -114,22 +115,22 @@ test('terminal-state recovery rejects missing, malformed, stale, unauthenticated
       const fixture = await terminalFixture();
       await mutate(fixture);
       const manager = recoveredManager(fixture);
-      const reconciliation = await manager.reconcileOrphanProcesses();
+      const reconciliation = await manager.reconcile();
       assert.equal(reconciliation.resolved.includes(fixture.processId), false);
       assert.equal(reconciliation.unresolved.some((item) => item.processId === fixture.processId), true);
       assert.deepEqual(await manager.disposeRun('recovered-run'), []);
-      await manager.acknowledgeUnresolvedProcesses([fixture.processId]);
+      await manager.acknowledgeUnresolved([fixture.processId]);
     });
   }
 });
 
-function request(cwd, source, overrides = {}) {
-  return { command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(source)}`, cwd, pty: false, timeoutMs: 5_000, yieldMs: 1, outputTokenBudget: 1_000, owner, ...overrides };
+function request(workspacePath, source, overrides = {}) {
+  return { command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(source)}`, workspacePath, pty: false, timeoutMs: 5_000, yieldMs: 1, outputTokenBudget: 1_000, owner, ...overrides };
 }
 async function context() {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-process-faults-'));
   const ledgerDirectory = path.join(root, 'processes');
-  const manager = new ProcessManager({ artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts') }), ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+  const manager = new LocalCommandExecution({ artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts') }), workspaceFileRoot: testWorkspaceFileRoot(root), ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
   return { manager, root, ledgerDirectory };
 }
 async function readLedger(directory, processId) { return JSON.parse(await readFile(path.join(directory, `${processId}.json`), 'utf8')); }
@@ -152,7 +153,7 @@ async function terminalFixture() {
   return { root, ledgerDirectory, stateFile, processId };
 }
 function recoveredManager(fixture) {
-  return new ProcessManager({ artifactRepository: new LocalArtifactRepository({ rootDir: path.join(fixture.root, 'recovered-artifacts') }), ledgerDirectory: fixture.ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+  return new LocalCommandExecution({ artifactRepository: new LocalArtifactRepository({ rootDir: path.join(fixture.root, 'recovered-artifacts') }), workspaceFileRoot: testWorkspaceFileRoot(fixture.root), ledgerDirectory: fixture.ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
 }
 function mutateState(change) {
   return async (fixture) => {

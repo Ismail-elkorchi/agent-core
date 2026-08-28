@@ -1,18 +1,19 @@
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { LocalArtifactRepository } from '@agent-core/evidence/node';
-import { DEFAULT_LOCAL_TOOL_CONFIGURATION, ProcessManager } from '@agent-core/tools-local';
+import { DEFAULT_LOCAL_TOOL_CONFIGURATION, LocalCommandExecution, WorkspaceFileRoot } from '@agent-core/tools-local';
 
 const root = path.resolve(process.argv[2]);
 await mkdir(root, { recursive: true });
-const manager = new ProcessManager({
+const manager = new LocalCommandExecution({
   artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts') }),
+  workspaceFileRoot: WorkspaceFileRoot.adopt(root),
   ledgerDirectory: path.join(root, 'processes'),
   ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process
 });
 const result = await manager.start({
   command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify('setInterval(()=>{},1000)')}`,
-  cwd: root, pty: false, timeoutMs: 60_000, yieldMs: 20, outputTokenBudget: 1_000,
+  workspacePath: '.', pty: false, timeoutMs: 60_000, yieldMs: 20, outputTokenBudget: 1_000,
   owner: { runId: 'orphan-run', turnId: 'turn', toolBatchId: 'batch', callIndex: 0 }
 });
 process.stdout.write(JSON.stringify({ processId: result.processId }) + '\n');

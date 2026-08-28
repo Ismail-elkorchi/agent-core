@@ -55,6 +55,7 @@ import {
 } from './run/contracts.js';
 import {
   isToolAvailable,
+  isCommandExecution,
   prepareToolCall,
   releasePreparedToolCall,
   parseToolPolicy,
@@ -68,7 +69,8 @@ import {
   type ToolAuthorizationBoundary,
   type ToolExecutionContext,
   type ToolPreparationContext,
-  type ToolPolicy
+  type ToolPolicy,
+  type CommandExecution
 } from '@agent-core/tools';
 import { encodeAgentEvent, type AgentAuditEvent, type AgentEvent, type AgentProgressEvent } from './events.js';
 import type { AgentRuntimeRepositories } from './ports.js';
@@ -142,6 +144,7 @@ export interface AgentRuntimeOptions {
   readonly tools?: readonly CompiledToolDefinition[];
   readonly toolBoundary: ToolAuthorizationBoundary;
   readonly toolContext?: Omit<ToolExecutionContext, 'policy' | 'signal'>;
+  readonly toolResourceLeases?: ResourceLeaseCoordinator;
   readonly toolPolicy?: ToolPolicy;
   readonly toolAuthorizer?: ToolAuthorizer;
   readonly instructions?: readonly AgentInstruction[];
@@ -291,6 +294,7 @@ export class AgentRuntime {
   private readonly tools: readonly CompiledToolDefinition[];
   private readonly resourceLeases: ResourceLeaseCoordinator;
   private readonly checks: readonly AgentCheckDefinition[];
+  private readonly commandExecution: CommandExecution | undefined;
   private readonly steerQueue: (AgentSteeringReceipt & { readonly instruction: string })[] = [];
   private activeAbortController: AbortController | undefined;
   private activeRunId: string | undefined;
@@ -305,7 +309,14 @@ export class AgentRuntime {
     this.maxOutputTokens = validateOptionalPositiveInteger(options.maxOutputTokens, 'maxOutputTokens');
     this.toolPolicy = parseToolPolicy(options.toolPolicy ?? READ_ONLY_TOOL_POLICY);
     this.tools = Object.freeze(new ToolRegistry(options.tools ?? []).list());
-    this.resourceLeases = processLeaseCoordinator(options.toolContext?.services?.processManager) ?? new ResourceLeaseCoordinator();
+    const configuredCommandExecution = options.toolContext?.services?.commandExecution;
+    if (configuredCommandExecution !== undefined && !isCommandExecution(configuredCommandExecution)) {
+      throw new TypeError('AgentRuntime requires an adopted CommandExecution service.');
+    }
+    this.commandExecution = configuredCommandExecution;
+    this.resourceLeases = options.toolResourceLeases
+      ?? this.commandExecution?.resourceLeases
+      ?? new ResourceLeaseCoordinator();
     validateToolBoundary(options.toolBoundary);
     this.checks = validateAgentCheckDefinitions(options.checks);
   }
@@ -587,9 +598,14 @@ export class AgentRuntime {
       }
       decision = cleanupFailureDecision(undefined, cleanupError);
     } else if (decision.executionStatus === 'waiting_for_recovery') {
+      const cleanupError = await this.disposeOwnedProcesses(runId, append);
       const state = operation.state();
       if (state.phase.kind !== 'provider' || state.phase.stage !== 'outcome_unknown') throw new Error(`Run ${runId} lost its provider recovery state.`);
-      return Object.freeze({ state: 'suspended', reason: decision.reason, runId, finalizationId, effectId: decision.effectId, budget: controller.snapshot() });
+      return Object.freeze({
+        state: 'suspended', reason: decision.reason, runId, finalizationId, effectId: decision.effectId,
+        ...(cleanupError ? { cleanupDiagnostic: { kind: 'process_cleanup' as const, message: cleanupError.message } } : {}),
+        budget: controller.snapshot()
+      });
     } else {
       const cleanupError = await this.disposeOwnedProcesses(runId, append);
       if (cleanupError) decision = cleanupFailureDecision(decision, cleanupError);
@@ -1443,12 +1459,12 @@ export class AgentRuntime {
     return this.tools.filter((tool) => isToolAvailable(tool, this.toolPolicy) && toolRequirementsSatisfied(tool, {
       ...(context.services ? { services: context.services } : {}),
       ...(profile ? { modelInputModalities: profile.modalities.input } : {}),
-      hostCapabilities: processCapabilities(context.services?.processManager)
+      hostCapabilities: this.commandExecution?.descriptor.capabilities ?? []
     }));
   }
   private async disposeOwnedProcesses(runId: string, append: (event: AgentAuditEvent, idempotencyKey?: string) => Promise<unknown>): Promise<Error | undefined> {
-    const service = this.options.toolContext?.services?.processManager;
-    if (!isProcessDisposer(service)) return undefined;
+    const service = this.commandExecution;
+    if (!service) return undefined;
     try {
       const results = await service.disposeRun(runId);
       for (const report of results) {
@@ -1457,7 +1473,7 @@ export class AgentRuntime {
           { type: 'process.ended', runId, processId: durable.processId, status: durable.status, result: durable.result },
           `${runId}:process:${durable.processId}:ended`
         );
-        await service.markTerminalReported?.(durable.processId);
+        await service.acknowledgeTerminalReport(durable.processId);
       }
       return undefined;
     }
@@ -1500,10 +1516,6 @@ export class AgentRuntime {
   }
 }
 
-function isProcessDisposer(value: unknown): value is { readonly disposeRun: (runId: string) => Promise<readonly unknown[]>; readonly markTerminalReported?: (processId: string) => Promise<void> } {
-  if (typeof value !== 'object' || value === null || !('disposeRun' in value)) return false;
-  return typeof (value as { readonly disposeRun?: unknown }).disposeRun === 'function';
-}
 function durableProcessTermination(value: unknown): { readonly processId: string; readonly status: string; readonly result: import('@agent-core/json').JsonValue } {
   const outer = parseJsonValue(value, { maxDepth: 16, maxCollectionEntries: 20_000, maxStringBytes: 1_000_000, maxTotalBytes: 4_000_000 });
   const normalized = isRecord(outer) && isRecord(outer.result) ? outer.result : outer;
@@ -1526,16 +1538,6 @@ function durableProcessTermination(value: unknown): { readonly processId: string
       ...(isRecord(outer) && outer.protectedArtifact !== undefined ? { protectedArtifact: outer.protectedArtifact } : {})
     }).value
   };
-}
-function processLeaseCoordinator(value: unknown): ResourceLeaseCoordinator | undefined {
-  if (typeof value !== 'object' || value === null || !('resourceLeases' in value)) return undefined;
-  const coordinator = (value as { readonly resourceLeases?: unknown }).resourceLeases;
-  return coordinator instanceof ResourceLeaseCoordinator ? coordinator : undefined;
-}
-function processCapabilities(value: unknown): readonly string[] {
-  if (typeof value !== 'object' || value === null || !('capabilities' in value)) return [];
-  const capabilities = (value as { readonly capabilities?: unknown }).capabilities;
-  return typeof capabilities === 'function' ? (capabilities as (this: unknown) => readonly string[]).call(value) : [];
 }
 function cleanupFailureDecision(previous: TerminalDecision | undefined, error: Error): TerminalDecision {
   const cleanupDiagnostic = { kind: 'process_cleanup' as const, message: error.message };

@@ -1,8 +1,14 @@
 import path from 'node:path';
 import type { ArtifactRepository } from '@agent-core/evidence';
-import type { CompiledToolDefinition, ToolResourceLease } from '@agent-core/tools';
+import type {
+  CommandExecution,
+  CommandExecutionReport,
+  CommandReconciliationResult,
+  CompiledToolDefinition,
+  ToolResourceLease
+} from '@agent-core/tools';
 import { parseLocalToolConfiguration, DEFAULT_LOCAL_TOOL_CONFIGURATION, type LocalToolConfiguration } from './core/configuration.js';
-import { ProcessManager, type ProcessReconciliationResult, type ProcessTerminalReport, type PtyProcessFactory } from './core/process-manager.js';
+import { LocalCommandExecution, type PtyProcessFactory } from './core/command-execution.js';
 import { WorkspaceFileSelector } from './core/workspace-file-selection.js';
 import { isWorkspaceFileRoot, type WorkspaceFileRoot } from './core/workspace-file-root.js';
 import { TextPatchJournal } from './core/text-write.js';
@@ -25,7 +31,7 @@ export interface LocalToolHostOptions {
   readonly configuration?: LocalToolConfiguration;
   readonly enabledTools: readonly string[];
   readonly ptyFactory?: PtyProcessFactory;
-  readonly deliverRecoveredTerminalReport?: (report: ProcessTerminalReport) => Promise<boolean>;
+  readonly deliverRecoveredTerminalReport?: (report: CommandExecutionReport) => Promise<boolean>;
 }
 
 export interface LocalToolHost {
@@ -34,16 +40,16 @@ export interface LocalToolHost {
     readonly workspaceFileRoot: WorkspaceFileRoot;
     readonly artifactRepository: ArtifactRepository;
     readonly localToolConfiguration: LocalToolConfiguration;
-    readonly processManager?: ProcessManager;
+    readonly commandExecution?: CommandExecution;
     readonly workspaceFileSelector: WorkspaceFileSelector;
     readonly patchJournal?: TextPatchJournal;
   };
   readonly capabilities: readonly string[];
   readonly artifactRepository: ArtifactRepository;
-  readonly processManager?: ProcessManager;
+  readonly commandExecution?: CommandExecution;
   ready(): Promise<void>;
-  reconciliation(): Promise<ProcessReconciliationResult>;
-  resolveReconciliation(input?: { readonly acknowledgeProcessIds?: readonly string[] }): Promise<ProcessReconciliationResult>;
+  reconciliation(): Promise<CommandReconciliationResult>;
+  resolveReconciliation(input?: { readonly acknowledgeProcessIds?: readonly string[] }): Promise<CommandReconciliationResult>;
   close(): Promise<void>;
 }
 
@@ -68,10 +74,11 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
   }
   const adoptedRoot = workspaceFileRoot;
   const workspaceFileSelector = new WorkspaceFileSelector(adoptedRoot, configuration.fileSelection);
-  let processManager: ProcessManager | undefined;
+  let commandExecution: LocalCommandExecution | undefined;
   try {
-    processManager = options.processLedgerDirectory === undefined ? undefined : new ProcessManager({
+    commandExecution = options.processLedgerDirectory === undefined ? undefined : new LocalCommandExecution({
         artifactRepository,
+        workspaceFileRoot: adoptedRoot,
         ledgerDirectory: path.resolve(options.processLedgerDirectory),
         ...configuration.process,
         ...(options.ptyFactory ? { ptyFactory: options.ptyFactory } : {})
@@ -83,7 +90,7 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
     workspaceFileRoot: adoptedRoot,
     artifactRepository,
     localToolConfiguration: configuration,
-    ...(processManager ? { processManager } : {}),
+    ...(commandExecution ? { commandExecution } : {}),
     workspaceFileSelector,
     ...(patchJournal ? { patchJournal } : {})
   });
@@ -93,20 +100,20 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
     readFilesTool,
     searchTextTool,
     applyPatchTool,
-    createExecCommandTool({ ptySupported: processManager?.supportsPty() ?? false }),
+    createExecCommandTool({ ptySupported: commandExecution?.descriptor.supportsPty ?? false }),
     writeStdinTool,
     stopProcessTool,
     viewImageTool,
     readArtifactTool
   ]);
   const tools = selectTools(allTools, enabledTools);
-  const noProcesses: ProcessReconciliationResult = Object.freeze({ resolved: Object.freeze([]), unresolved: Object.freeze([]) });
-  let reconciliation = processManager?.reconcileOrphanProcesses() ?? Promise.resolve(noProcesses);
+  const noProcesses: CommandReconciliationResult = Object.freeze({ resolved: Object.freeze([]), unresolved: Object.freeze([]) });
+  let reconciliation = commandExecution?.reconcile() ?? Promise.resolve(noProcesses);
   let blocker: ToolResourceLease | undefined;
-  const ensureBlocker = async (result: ProcessReconciliationResult): Promise<void> => {
-    if (!processManager) return;
+  const ensureBlocker = async (result: CommandReconciliationResult): Promise<void> => {
+    if (!commandExecution) return;
     if (result.unresolved.length > 0 && !blocker) {
-      blocker = await processManager.resourceLeases.acquire({
+      blocker = await commandExecution.resourceLeases.acquire({
         accesses: [{ mode: 'execute', scope: 'workspace/processes' }],
         lockScopes: ['workspace/files'],
         recovery: { kind: 'unknown' }
@@ -115,29 +122,29 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
     if (result.unresolved.length === 0 && blocker) { blocker.release(); blocker = undefined; }
   };
   const deliverRecovered = async (): Promise<void> => {
-    if (!processManager || !options.deliverRecoveredTerminalReport) return;
-    for (const report of processManager.recoveredTerminalReports()) {
-      if (await options.deliverRecoveredTerminalReport(report)) await processManager.markTerminalReported(report.result.processId);
+    if (!commandExecution || !options.deliverRecoveredTerminalReport) return;
+    for (const report of commandExecution.recoveredTerminalReports()) {
+      if (await options.deliverRecoveredTerminalReport(report)) await commandExecution.acknowledgeTerminalReport(report.result.processId);
     }
   };
   return Object.freeze({
     tools,
     services,
-    capabilities: Object.freeze([...(processManager?.capabilities() ?? [])]),
+    capabilities: Object.freeze([...(commandExecution?.descriptor.capabilities ?? [])]),
     artifactRepository,
-    ...(processManager ? { processManager } : {}),
+    ...(commandExecution ? { commandExecution } : {}),
     async ready() { await ensureBlocker(await reconciliation); await deliverRecovered(); },
     reconciliation: () => reconciliation,
     async resolveReconciliation(input: { readonly acknowledgeProcessIds?: readonly string[] } = {}) {
-      if (!processManager) return noProcesses;
-      if (input.acknowledgeProcessIds?.length) await processManager.acknowledgeUnresolvedProcesses(input.acknowledgeProcessIds);
-      reconciliation = processManager.retryOrphanReconciliation();
+      if (!commandExecution) return noProcesses;
+      if (input.acknowledgeProcessIds?.length) await commandExecution.acknowledgeUnresolved(input.acknowledgeProcessIds);
+      reconciliation = commandExecution.retryReconciliation();
       const result = await reconciliation;
       await ensureBlocker(result);
       await deliverRecovered();
       return result;
     },
-    async close() { blocker?.release(); blocker = undefined; await processManager?.close(); patchJournal?.close(); adoptedRoot.close(); }
+    async close() { blocker?.release(); blocker = undefined; await commandExecution?.close(); patchJournal?.close(); adoptedRoot.close(); }
   });
 }
 

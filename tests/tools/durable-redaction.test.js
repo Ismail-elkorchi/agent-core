@@ -8,7 +8,7 @@ import { AgentRuntime, agentEventCodec } from '@agent-core/runtime';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 import { JsonlEventRepository, LocalArtifactRepository } from '@agent-core/evidence/node';
 import { defineTool } from '@agent-core/tools';
-import { DEFAULT_LOCAL_TOOL_CONFIGURATION, ProcessManager, execCommandTool } from '@agent-core/tools-local';
+import { DEFAULT_LOCAL_TOOL_CONFIGURATION, LocalCommandExecution, execCommandTool } from '@agent-core/tools-local';
 import { testWorkspaceFileRoot } from '../workspace-file-root-helper.js';
 
 const secrets = ['tok_live_1234567890', 'bearer-secret-123456', 'password-value-789', 'environment-value-456', 'process-value-123'];
@@ -58,11 +58,11 @@ test('durable event and session JSONL redact tool, metadata, failure, and proces
   const sessions = new JsonlSessionRepository({ rootDir: sessionsDir });
   const session = await sessions.create({ provider: 'scripted', model: 'scripted' });
   const artifacts = new LocalArtifactRepository({ rootDir: artifactsDir });
-  const manager = new ProcessManager({ artifactRepository: artifacts, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+  const manager = new LocalCommandExecution({ artifactRepository: artifacts, workspaceFileRoot: testWorkspaceFileRoot(root), ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
   const agent = new AgentRuntime({
     provider: new Provider(), model: 'scripted', toolBoundary: { authorizationPolicyId: 'tests/redaction@1', executionTargetId: root },
     repositories: { events, session: { repository: sessions, sessionId: session.id }, artifacts }, tools: [secretResult, secretFailure, execCommandTool],
-    toolPolicy: { allowedRisks: ['read', 'execute'] }, toolContext: { services: { workspaceFileRoot: testWorkspaceFileRoot(root), artifactRepository: artifacts, localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION, processManager: manager } }
+    toolPolicy: { allowedRisks: ['read', 'execute'] }, toolContext: { services: { workspaceFileRoot: testWorkspaceFileRoot(root), artifactRepository: artifacts, localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION, commandExecution: manager } }
   });
   const result = await agent.run({ runId: 'redaction-run', task: 'redact' }).result;
   assert.equal(result.state, 'ended');

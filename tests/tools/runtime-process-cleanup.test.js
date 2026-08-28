@@ -6,8 +6,8 @@ import path from 'node:path';
 import * as z from 'zod';
 import { AgentRuntime, agentEventCodec } from '@agent-core/runtime';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/evidence';
-import { defineTool } from '@agent-core/tools';
-import { DEFAULT_LOCAL_TOOL_CONFIGURATION, ProcessManager, execCommandTool } from '@agent-core/tools-local';
+import { adoptCommandExecution, defineTool } from '@agent-core/tools';
+import { DEFAULT_LOCAL_TOOL_CONFIGURATION, LocalCommandExecution, execCommandTool } from '@agent-core/tools-local';
 import { testWorkspaceFileRoot } from '../workspace-file-root-helper.js';
 
 const boundary = { authorizationPolicyId: 'tests/process-cleanup@1', executionTargetId: 'workspace' };
@@ -29,9 +29,9 @@ function toolResponse(name, value) { return { content: '', model: 'scripted', pr
 async function setup() {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-runtime-process-'));
   const artifacts = new InMemoryArtifactRepository();
-  const manager = new ProcessManager({ artifactRepository: artifacts, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+  const manager = new LocalCommandExecution({ artifactRepository: artifacts, workspaceFileRoot: testWorkspaceFileRoot(root), ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
   const events = new InMemoryEventRepository(agentEventCodec);
-  const services = { workspaceFileRoot: testWorkspaceFileRoot(root), artifactRepository: artifacts, localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION, processManager: manager };
+  const services = { workspaceFileRoot: testWorkspaceFileRoot(root), artifactRepository: artifacts, localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION, commandExecution: manager };
   return { root, artifacts, manager, events, services };
 }
 function createRuntime(input) {
@@ -63,7 +63,7 @@ test('a run stops and persists its active process before durable approval suspen
   assert.equal(ended[0].status, 'stopped');
 });
 
-test('abort and runtime failure both clean active run processes before run.ended', async () => {
+test('abort and unknown provider outcome both clean active run processes before terminal or suspension publication', async () => {
   for (const mode of ['abort', 'failure']) {
     const state = await setup();
     const provider = new Provider([toolResponse('exec_command', { command: longCommand, yieldMs: 100 }), ...(mode === 'failure' ? [new Error('provider failed')] : [done])]);
@@ -72,21 +72,23 @@ test('abort and runtime failure both clean active run processes before run.ended
     const runId = `${mode}-run`;
     control = agent.run({ runId, task: mode });
     const result = await control.result;
-    assert.equal(result.state, 'ended');
-    assert.equal(result.terminal.executionStatus, mode === 'abort' ? 'aborted' : 'failed');
+    assert.equal(result.state, mode === 'abort' ? 'ended' : 'suspended');
+    if (result.state === 'ended') assert.equal(result.terminal.executionStatus, 'aborted');
+    else assert.equal(result.reason, 'provider_outcome_unknown');
     assert.equal(state.manager.activeCount(runId), 0);
     const persisted = await records(state.events, runId);
     assert.equal(persisted.some((event) => event.type === 'process.ended'), true);
-    assert.equal(persisted.at(-2).type, 'run.ended');
-    assert.equal(persisted.at(-1).type, 'operation.transition');
-    assert.equal(persisted.at(-1).state.phase.kind, 'terminal');
+    const finalOperation = persisted.filter((event) => event.type === 'operation.transition').at(-1);
+    assert.equal(finalOperation.state.phase.kind, mode === 'abort' ? 'terminal' : 'provider');
+    if (mode === 'failure') assert.equal(finalOperation.state.phase.stage, 'outcome_unknown');
+    assert.equal(persisted.some((event) => event.type === 'run.ended'), mode === 'abort');
   }
 });
 
 test('cleanup failure becomes terminal runtime_error and still commits run.ended', async () => {
   const state = await setup();
-  const failingManager = { resourceLeases: state.manager.resourceLeases, capabilities: () => ['process'], async disposeRun() { throw new Error('cleanup broke'); } };
-  const agent = createRuntime({ ...state, provider: new Provider([done]), services: { ...state.services, processManager: failingManager } });
+  const failingManager = commandExecutionWithCleanupFailure(state.manager, 'cleanup broke');
+  const agent = createRuntime({ ...state, provider: new Provider([done]), services: { ...state.services, commandExecution: failingManager } });
   const result = await agent.run({ runId: 'cleanup-failure-run', task: 'finish' }).result;
   assert.equal(result.state, 'ended');
   assert.equal(result.terminal.executionStatus, 'failed');
@@ -133,10 +135,10 @@ test('cleanup failure transforms prior partial, checked, and aborted decisions w
   ];
   for (const item of cases) {
     const state = await setup();
-    const failingManager = { resourceLeases: state.manager.resourceLeases, capabilities: () => ['process'], async disposeRun() { throw new Error('cleanup failed'); } };
+    const failingManager = commandExecutionWithCleanupFailure(state.manager, 'cleanup failed');
     const agent = new AgentRuntime({
       provider: item.provider, model: 'scripted', toolBoundary: boundary, repositories: { events: state.events, artifacts: state.artifacts },
-      toolContext: { services: { ...state.services, processManager: failingManager } }, ...(item.checks ? { checks: item.checks } : {})
+      toolContext: { services: { ...state.services, commandExecution: failingManager } }, ...(item.checks ? { checks: item.checks } : {})
     });
     const result = await agent.run({ runId: item.runId, task: 'preserve prior decision' }).result;
     assert.equal(result.state, 'ended');
@@ -148,8 +150,8 @@ test('cleanup failure transforms prior partial, checked, and aborted decisions w
   }
 
   const state = await setup();
-  const failingManager = { resourceLeases: state.manager.resourceLeases, capabilities: () => ['process'], async disposeRun() { throw new Error('cleanup failed'); } };
-  const agent = createRuntime({ ...state, provider: new Provider([done]), services: { ...state.services, processManager: failingManager } });
+  const failingManager = commandExecutionWithCleanupFailure(state.manager, 'cleanup failed');
+  const agent = createRuntime({ ...state, provider: new Provider([done]), services: { ...state.services, commandExecution: failingManager } });
   const controller = new AbortController(); controller.abort('already aborted');
   const result = await agent.run({ runId: 'aborted-cleanup', task: 'abort', signal: controller.signal }).result;
   assert.equal(result.state, 'ended');
@@ -158,10 +160,20 @@ test('cleanup failure transforms prior partial, checked, and aborted decisions w
   assert.match(result.terminal.errorMessage, /already aborted.*cleanup failed/iu);
 });
 
+function commandExecutionWithCleanupFailure(commandExecution, message) {
+  return adoptCommandExecution(new Proxy(commandExecution, {
+    get(target, property) {
+      if (property === 'disposeRun') return async () => { throw new Error(message); };
+      const value = Reflect.get(target, property, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  }));
+}
+
 test('two runtimes sharing one manager clean only their own processes', async () => {
   const state = await setup();
   const ownerB = { runId: 'run-b', turnId: 'turn-b', toolBatchId: 'batch-b', callIndex: 0 };
-  const running = await state.manager.start({ command: longCommand, cwd: state.root, pty: false, timeoutMs: 60_000, yieldMs: 100, outputTokenBudget: 1_000, owner: ownerB });
+  const running = await state.manager.start({ command: longCommand, workspacePath: '.', pty: false, timeoutMs: 60_000, yieldMs: 100, outputTokenBudget: 1_000, owner: ownerB });
   assert.equal(running.status, 'running');
   const agentA = createRuntime({ ...state, provider: new Provider([done]) });
   const result = await agentA.run({ runId: 'run-a', task: 'finish a' }).result;

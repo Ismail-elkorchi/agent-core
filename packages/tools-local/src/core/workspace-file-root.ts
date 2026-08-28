@@ -265,7 +265,7 @@ export class WorkspaceFileRoot {
   async commandDirectory(requestedPath: string): Promise<{ readonly path: string; close(): Promise<void> }> {
     const workspacePath = this.canonicalPath(requestedPath);
     const directory = await this.#openDirectorySegments(workspacePath === '.' ? [] : workspacePath.split('/'), requestedPath);
-    const commandPath = workspacePath === '.' ? this.#displayPath : path.join(this.#displayPath, ...workspacePath.split('/'));
+    const commandPath = `/proc/${String(process.pid)}/fd/${String(directory.handle.fd)}`;
     let closed = false;
     const assertOpen = () => {
       this.#assertOpen();

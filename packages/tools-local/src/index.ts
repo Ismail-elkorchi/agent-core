@@ -1,5 +1,5 @@
 export * from './core/configuration.js';
-export * from './core/process-manager.js';
+export * from './core/command-execution.js';
 export * from './core/workspace-file-selection.js';
 export {
   WorkspaceFileRoot,

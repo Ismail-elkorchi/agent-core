@@ -3,11 +3,14 @@ import type { ToolResourceLease } from './context.js';
 
 interface ActiveLease { readonly id: number; readonly owner: string; readonly effects: ToolEffects; processId?: string; controlScope?: string }
 interface Waiter { readonly effects: ToolEffects; readonly owner: string; readonly resolve: (lease: ToolResourceLease) => void; readonly reject: (error: Error) => void; readonly signal?: AbortSignal; abort?: () => void }
+const coordinators = new WeakSet<ResourceLeaseCoordinator>();
 
 export class ResourceLeaseCoordinator {
   private readonly active = new Map<number, ActiveLease>();
   private readonly waiters: Waiter[] = [];
   private nextId = 1;
+
+  constructor() { coordinators.add(this); }
 
   acquire(effects: ToolEffects, owner: string, signal?: AbortSignal): Promise<ToolResourceLease> {
     if (signal?.aborted) return Promise.reject(abortError(signal));
@@ -62,6 +65,10 @@ export class ResourceLeaseCoordinator {
     active.processId = processId;
     active.controlScope = controlScope;
   }
+}
+
+export function isResourceLeaseCoordinator(value: unknown): value is ResourceLeaseCoordinator {
+  return typeof value === 'object' && value !== null && coordinators.has(value as ResourceLeaseCoordinator);
 }
 
 class Lease implements ToolResourceLease {

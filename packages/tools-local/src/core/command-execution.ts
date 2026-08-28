@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, open, readFile, readdir, rename, rm, rmdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -11,10 +11,25 @@ import {
 } from '@agent-core/evidence';
 import { validateArtifactRef, validatePublicArtifactRef } from '@agent-core/evidence';
 import { parseJsonObject } from '@agent-core/json';
-import { ResourceLeaseCoordinator } from '@agent-core/tools';
+import {
+  ResourceLeaseCoordinator,
+  adoptCommandExecution,
+  type CommandExecution,
+  type CommandExecutionDescriptor,
+  type CommandExecutionOwner,
+  type CommandExecutionReport,
+  type CommandExecutionResult,
+  type CommandExecutionStatus,
+  type CommandOutputStream,
+  type CommandOutputView,
+  type CommandReconciliationResult,
+  type StartCommandRequest,
+  type ToolProgress,
+  type ToolResourceLease
+} from '@agent-core/tools';
 import { workspaceProcessScope } from './resources.js';
-import type { ToolProgress, ToolResourceLease } from '@agent-core/tools';
 import type { OwnedProcessTree } from './process-tree.js';
+import { isWorkspaceFileRoot, type WorkspaceFileRoot } from './workspace-file-root.js';
 import {
   createProcessSupervisorIdentity,
   sendSupervisorCommand,
@@ -25,11 +40,9 @@ import {
   type SupervisorTerminalState
 } from './process-supervision.js';
 
-export type ProcessStream = 'stdout' | 'stderr';
-export type ManagedProcessStatus = 'running' | 'exited' | 'stopped' | 'timed_out' | 'failed';
-export interface ProcessOwner { readonly runId: string; readonly turnId: string; readonly toolBatchId: string; readonly callIndex: number }
-export interface ProcessManagerOptions {
+export interface LocalCommandExecutionOptions {
   readonly artifactRepository: ArtifactRepository;
+  readonly workspaceFileRoot: WorkspaceFileRoot;
   readonly maxCapturedBytes: number;
   readonly tailBytes: number;
   readonly ledgerDirectory?: string;
@@ -44,58 +57,12 @@ export interface ProcessManagerOptions {
   readonly onSupervisorCheckpoint?: (checkpoint: 'supervisor_ready' | 'ledger_persisted' | 'released', processId: string) => void | Promise<void>;
   readonly removeLedgerRecord?: (filePath: string) => Promise<void>;
 }
-export interface PtyProcessFactory { start(command: string, cwd: string, env: NodeJS.ProcessEnv): OwnedProcessTree }
-export interface StartProcessRequest {
-  readonly command: string;
-  readonly cwd: string;
-  readonly pty: boolean;
-  readonly timeoutMs: number;
-  readonly yieldMs: number;
-  readonly outputTokenBudget: number;
-  readonly owner: ProcessOwner;
-  readonly signal?: AbortSignal;
-  readonly lease?: ToolResourceLease;
-  readonly onProgress?: (progress: ToolProgress) => void | Promise<void>;
-}
-export interface ProcessOutputView {
-  readonly text: string;
-  readonly observedBytes: number;
-  readonly capturedBytes: number;
-  readonly omittedBytes: number;
-  readonly startsAtOutputStart: boolean;
-  readonly endsAtOutputEnd: boolean;
-}
-export interface ProcessPollResult {
-  readonly processId: string;
-  readonly owner: ProcessOwner;
-  readonly status: ManagedProcessStatus;
-  readonly cursorStart: number;
-  readonly cursorEnd: number;
-  readonly cursorExpired?: boolean;
-  readonly stdout: ProcessOutputView;
-  readonly stderr: ProcessOutputView;
-  readonly combined: ProcessOutputView;
-  readonly artifact?: PublicArtifactRef;
-  readonly exitCode?: number | null;
-  readonly signal?: NodeJS.Signals | null;
-  readonly diagnostic?: string;
-  readonly progressDroppedEvents?: number;
-  readonly progressDeliveryErrors?: number;
-}
-export interface ProcessTerminalReport {
-  readonly result: ProcessPollResult;
-  readonly protectedArtifact?: ProtectedArtifactRef;
-}
-export interface ProcessReconciliationResult {
-  readonly resolved: readonly string[];
-  readonly unresolved: readonly { readonly processId: string; readonly workspace: string; readonly diagnostic: string }[];
-}
-
-interface CapturedChunk { readonly sequence: number; readonly stream: ProcessStream; readonly text: string; readonly start: number; readonly end: number; readonly bytes: number }
+export interface PtyProcessFactory { start(command: string, workingDirectory: string, env: NodeJS.ProcessEnv): OwnedProcessTree }
+interface CapturedChunk { readonly sequence: number; readonly stream: CommandOutputStream; readonly text: string; readonly start: number; readonly end: number; readonly bytes: number }
 interface QueuedProgress { readonly progress: ToolProgress; readonly bytes: number; readonly delivered: () => void }
 interface ManagedProcess {
   readonly id: string;
-  readonly owner: ProcessOwner;
+  readonly owner: CommandExecutionOwner;
   readonly workspace: string;
   readonly tree: SupervisedProcessTree;
   readonly startedAt: number;
@@ -103,10 +70,10 @@ interface ManagedProcess {
   readonly history: CapturedChunk[];
   readonly decoder: { readonly stdout: StringDecoder; readonly stderr: StringDecoder };
   readonly activityWaiters: Set<() => void>;
-  readonly onProgress?: StartProcessRequest['onProgress'];
+  readonly onProgress?: StartCommandRequest['onProgress'];
   readonly lease?: ToolResourceLease;
   readonly progressQueue: QueuedProgress[];
-  status: ManagedProcessStatus;
+  status: CommandExecutionStatus;
   cursor: number;
   oldestCursor: number;
   sequence: number;
@@ -119,7 +86,7 @@ interface ManagedProcess {
   progressDroppedEvents: number;
   progressDeliveryErrors: number;
   terminalReported: boolean;
-  terminalStatus?: Exclude<ManagedProcessStatus, 'running'>;
+  terminalStatus?: Exclude<CommandExecutionStatus, 'running'>;
   readonly observed: { stdout: number; stderr: number };
   exitCode?: number | null;
   signal?: NodeJS.Signals | null;
@@ -135,35 +102,43 @@ interface ManagedProcess {
   pendingClose?: { readonly exitCode: number | null; readonly signal: NodeJS.Signals | null };
 }
 interface ProcessArtifacts { readonly publicArtifact?: PublicArtifactRef; readonly protectedArtifact?: ProtectedArtifactRef }
-interface ProcessTerminalTombstone { readonly report: ProcessTerminalReport; readonly owner: ProcessOwner; terminalReported: boolean }
+interface ProcessTerminalTombstone { readonly report: CommandExecutionReport; readonly owner: CommandExecutionOwner; terminalReported: boolean }
 interface ProcessLedgerEntry {
   readonly schemaVersion: 1;
   readonly processId: string;
   readonly supervisorPid: number;
   readonly supervisorIdentity: string;
   readonly supervisorEndpoint: string;
-  readonly owner: ProcessOwner;
+  readonly owner: CommandExecutionOwner;
   readonly startedAt: string;
   readonly workspace: string;
   readonly state: 'running' | 'terminal';
   readonly terminalReported: boolean;
-  readonly terminal?: ProcessPollResult;
+  readonly terminal?: CommandExecutionResult;
   readonly protectedArtifact?: ProtectedArtifactRef;
 }
 
-export class ProcessManager {
+export class LocalCommandExecution implements CommandExecution {
+  readonly descriptor: CommandExecutionDescriptor;
   readonly resourceLeases = new ResourceLeaseCoordinator();
   private readonly active = new Map<string, ManagedProcess>();
   private readonly completed = new Map<string, ManagedProcess>();
   private readonly tombstones = new Map<string, ProcessTerminalTombstone>();
-  private readonly recovered = new Map<string, ProcessTerminalReport>();
+  private readonly recovered = new Map<string, CommandExecutionReport>();
   private readonly cleanupResidues = new Map<string, string>();
-  private readonly limits: Required<Pick<ProcessManagerOptions, 'maxActiveProcessesPerRun' | 'maxActiveProcesses' | 'maxTotalCapturedBytes' | 'maxProcessLifetimeMs' | 'completedRetentionMs' | 'maxPendingOutputBytes'>>;
-  private readonly ready: Promise<ProcessReconciliationResult>;
-  private reconciliationState: ProcessReconciliationResult | undefined;
+  private readonly limits: Required<Pick<LocalCommandExecutionOptions, 'maxActiveProcessesPerRun' | 'maxActiveProcesses' | 'maxTotalCapturedBytes' | 'maxProcessLifetimeMs' | 'completedRetentionMs' | 'maxPendingOutputBytes'>>;
+  private readonly ready: Promise<CommandReconciliationResult>;
+  private reconciliationState: CommandReconciliationResult | undefined;
   private reservedCapturedBytes = 0;
 
-  constructor(private readonly options: ProcessManagerOptions) {
+  constructor(private readonly options: LocalCommandExecutionOptions) {
+    if (!isWorkspaceFileRoot(options.workspaceFileRoot)) throw new TypeError('Local command execution requires an adopted WorkspaceFileRoot.');
+    this.descriptor = Object.freeze({
+      implementationId: 'agent-core.local-command-execution@1',
+      recoveryIdentity: recoveryIdentity(options.ledgerDirectory, options.workspaceFileRoot),
+      capabilities: Object.freeze(['process']),
+      supportsPty: false
+    });
     this.limits = {
       maxActiveProcessesPerRun: positive(options.maxActiveProcessesPerRun ?? 8, 'maxActiveProcessesPerRun'),
       maxActiveProcesses: positive(options.maxActiveProcesses ?? 32, 'maxActiveProcesses'),
@@ -173,14 +148,21 @@ export class ProcessManager {
       maxPendingOutputBytes: positive(options.maxPendingOutputBytes ?? Math.min(options.maxCapturedBytes, 2_000_000), 'maxPendingOutputBytes')
     };
     this.ready = this.reconcileLedger().then((result) => { this.reconciliationState = result; return result; });
+    adoptCommandExecution(this);
   }
 
-  capabilities(): readonly string[] { return Object.freeze(['process']); }
-  supportsPty(): boolean { return false; }
+  async start(request: StartCommandRequest): Promise<CommandExecutionResult> {
+    const commandDirectory = await this.options.workspaceFileRoot.commandDirectory(request.workspacePath);
+    try {
+      return await this.startInDirectory(request, commandDirectory.path);
+    } finally {
+      await commandDirectory.close();
+    }
+  }
 
-  async start(request: StartProcessRequest): Promise<ProcessPollResult> {
+  private async startInDirectory(request: StartCommandRequest, workingDirectory: string): Promise<CommandExecutionResult> {
     const reconciliation = await this.ready;
-    if (reconciliation.unresolved.some((item) => item.workspace === '*' || path.resolve(item.workspace) === path.resolve(request.cwd))) {
+    if (reconciliation.unresolved.length > 0) {
       throw new Error('An unresolved supervised process blocks new ambient process starts for this workspace.');
     }
     this.pruneExpired();
@@ -194,12 +176,12 @@ export class ProcessManager {
     await this.persistSupervisorAuthentication(id, supervision);
     const tree = spawnSupervisedProcess({
       command: request.command,
-      cwd: request.cwd,
+      cwd: workingDirectory,
       supervision,
       ...(this.options.supervisorReleaseTimeoutMs ? { releaseTimeoutMs: positive(this.options.supervisorReleaseTimeoutMs, 'supervisorReleaseTimeoutMs') } : {})
     });
     const record: ManagedProcess = {
-      id, owner: Object.freeze({ ...request.owner }), workspace: request.cwd, tree, startedAt: Date.now(),
+      id, owner: Object.freeze({ ...request.owner }), workspace: this.options.workspaceFileRoot.identity.canonicalPath, tree, startedAt: Date.now(),
       capture: new BoundedCapture(this.options.maxCapturedBytes, this.options.tailBytes),
       history: [], decoder: { stdout: new StringDecoder('utf8'), stderr: new StringDecoder('utf8') },
       activityWaiters: new Set(), progressQueue: [], status: 'running', cursor: 0, oldestCursor: 0, sequence: 0,
@@ -254,16 +236,16 @@ export class ProcessManager {
     }
     if (request.signal) {
       record.abortSignal = request.signal;
-      record.abortListener = () => { if (record.status === 'running') void this.disposeProcess(id).catch((error: unknown) => { record.diagnostic = errorMessage(error); }); };
+      record.abortListener = () => { if (record.status === 'running') void this.terminate(id).catch((error: unknown) => { record.diagnostic = errorMessage(error); }); };
       request.signal.addEventListener('abort', record.abortListener, { once: true });
       if (request.signal.aborted) record.abortListener();
     }
     await this.waitForActivity(record, request.yieldMs, 0);
     if (record.status === 'running' && request.lease) request.lease.transferToProcess(id, workspaceProcessScope(id));
-    return this.poll(id, request.outputTokenBudget, 0, 0, request.owner);
+    return this.query(id, request.outputTokenBudget, 0, 0, request.owner);
   }
 
-  async poll(processId: string, outputTokenBudget: number, yieldMs = 0, afterCursor = 0, requester?: ProcessOwner): Promise<ProcessPollResult> {
+  async query(processId: string, outputTokenBudget: number, yieldMs = 0, afterCursor = 0, requester?: CommandExecutionOwner): Promise<CommandExecutionResult> {
     await this.ready;
     this.pruneExpired();
     const tombstone = this.tombstones.get(processId);
@@ -297,14 +279,14 @@ export class ProcessManager {
     });
   }
 
-  async write(processId: string, text: string, requester?: ProcessOwner): Promise<void> {
+  async writeInput(processId: string, text: string, requester?: CommandExecutionOwner): Promise<void> {
     await this.ready;
     const record = this.requireRunningProcess(processId);
     this.assertOwner(record, requester);
     await new Promise<void>((resolve, reject) => record.tree.child.stdin.write(text, (error) => { if (error) reject(error); else resolve(); }));
   }
 
-  async closeStdin(processId: string, requester?: ProcessOwner): Promise<void> {
+  async closeInput(processId: string, requester?: CommandExecutionOwner): Promise<void> {
     await this.ready;
     const record = this.requireProcess(processId);
     this.assertOwner(record, requester);
@@ -312,9 +294,9 @@ export class ProcessManager {
     await new Promise<void>((resolve, reject) => record.tree.child.stdin.end((error?: Error | null) => { if (error) reject(error); else resolve(); }));
   }
 
-  async disposeProcess(processId: string, requester?: ProcessOwner): Promise<ProcessPollResult> {
+  async terminate(processId: string, requester?: CommandExecutionOwner): Promise<CommandExecutionResult> {
     await this.ready;
-    if (this.tombstones.has(processId)) return this.poll(processId, 4_000, 0, 0, requester);
+    if (this.tombstones.has(processId)) return this.query(processId, 4_000, 0, 0, requester);
     const record = this.requireProcess(processId);
     this.assertOwner(record, requester);
     if (record.status === 'running') {
@@ -323,27 +305,25 @@ export class ProcessManager {
     }
     await record.tree.settle();
     await this.finish(record);
-    return this.poll(processId, 4_000, 0, 0, requester);
+    return this.query(processId, 4_000, 0, 0, requester);
   }
 
-  async stop(processId: string, requester?: ProcessOwner): Promise<void> { await this.disposeProcess(processId, requester); }
-
   /** Stop active owned processes and return every terminal process not yet durably reported. */
-  async disposeRun(runId: string): Promise<readonly ProcessTerminalReport[]> {
+  async disposeRun(runId: string): Promise<readonly CommandExecutionReport[]> {
     await this.ready;
     const active = [...this.active.values()].filter((record) => record.owner.runId === runId);
-    for (const record of active) await this.disposeProcess(record.id);
+    for (const record of active) await this.terminate(record.id);
     return this.unreportedTerminalProcesses(runId);
   }
 
-  async unreportedTerminalProcesses(runId: string): Promise<readonly ProcessTerminalReport[]> {
+  async unreportedTerminalProcesses(runId: string): Promise<readonly CommandExecutionReport[]> {
     await this.ready;
-    const reports: ProcessTerminalReport[] = [];
+    const reports: CommandExecutionReport[] = [];
     for (const record of this.completed.values()) {
       if (record.owner.runId !== runId || record.terminalReported) continue;
       await record.finishPromise;
       const artifacts = await this.finalArtifacts(record);
-      reports.push(Object.freeze({ result: await this.poll(record.id, 4_000), ...(artifacts.protectedArtifact ? { protectedArtifact: artifacts.protectedArtifact } : {}) }));
+      reports.push(Object.freeze({ result: await this.query(record.id, 4_000), ...(artifacts.protectedArtifact ? { protectedArtifact: artifacts.protectedArtifact } : {}) }));
     }
     for (const tombstone of this.tombstones.values()) {
       if (tombstone.owner.runId !== runId || tombstone.terminalReported) continue;
@@ -353,12 +333,12 @@ export class ProcessManager {
     return Object.freeze(reports.sort((left, right) => left.result.processId.localeCompare(right.result.processId)));
   }
 
-  recoveredTerminalReports(): readonly ProcessTerminalReport[] {
+  recoveredTerminalReports(): readonly CommandExecutionReport[] {
     return Object.freeze([...this.recovered.values()].sort((left, right) => left.result.processId.localeCompare(right.result.processId)));
   }
 
   /** Call only after process.ended persistence succeeds or another durable handoff exists. */
-  async markTerminalReported(processId: string): Promise<void> {
+  async acknowledgeTerminalReport(processId: string): Promise<void> {
     await this.ready;
     const record = this.completed.get(processId);
     if (record) record.terminalReported = true;
@@ -375,14 +355,14 @@ export class ProcessManager {
     }
   }
 
-  async reconcileOrphanProcesses(): Promise<ProcessReconciliationResult> { return this.ready; }
-  async retryOrphanReconciliation(): Promise<ProcessReconciliationResult> {
+  async reconcile(): Promise<CommandReconciliationResult> { return this.ready; }
+  async retryReconciliation(): Promise<CommandReconciliationResult> {
     await this.ready;
     const result = await this.reconcileLedger();
     this.reconciliationState = result;
     return result;
   }
-  async acknowledgeUnresolvedProcesses(processIds: readonly string[]): Promise<void> {
+  async acknowledgeUnresolved(processIds: readonly string[]): Promise<void> {
     await this.ready;
     const unresolved = new Set(this.reconciliationState?.unresolved.map((item) => item.processId) ?? []);
     for (const processId of processIds) {
@@ -392,19 +372,19 @@ export class ProcessManager {
   }
   async close(): Promise<void> {
     await this.ready;
-    for (const record of [...this.active.values()]) await this.disposeProcess(record.id);
+    for (const record of [...this.active.values()]) await this.terminate(record.id);
   }
   has(processId: string): boolean { this.pruneExpired(); return this.active.has(processId) || this.completed.has(processId) || this.tombstones.has(processId); }
   activeCount(runId?: string): number { return runId === undefined ? this.active.size : [...this.active.values()].filter((record) => record.owner.runId === runId).length; }
   cleanupDiagnostics(): readonly string[] { return Object.freeze([...this.cleanupResidues.values()]); }
 
-  private decodeAndAppend(record: ManagedProcess, stream: ProcessStream, value: Buffer | string): void {
+  private decodeAndAppend(record: ManagedProcess, stream: CommandOutputStream, value: Buffer | string): void {
     const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value);
     const text = record.decoder[stream].write(bytes);
     if (text.length > 0) this.append(record, stream, text);
   }
 
-  private requestTermination(record: ManagedProcess, status: Exclude<ManagedProcessStatus, 'running' | 'exited'>): void {
+  private requestTermination(record: ManagedProcess, status: Exclude<CommandExecutionStatus, 'running' | 'exited'>): void {
     if (record.status !== 'running' || record.terminalStatus !== undefined) return;
     record.terminalStatus = status;
     record.tree.stop();
@@ -427,7 +407,7 @@ export class ProcessManager {
     }
   }
 
-  private append(record: ManagedProcess, stream: ProcessStream, text: string): void {
+  private append(record: ManagedProcess, stream: CommandOutputStream, text: string): void {
     const bytes = Buffer.byteLength(text, 'utf8');
     record.observed[stream] += bytes;
     const chunk: CapturedChunk = { sequence: record.sequence++, stream, text, start: record.cursor, end: record.cursor + bytes, bytes };
@@ -528,7 +508,7 @@ export class ProcessManager {
     record.lease?.release();
     this.signalActivity(record);
     const artifacts = await this.finalArtifacts(record);
-    const result = await this.poll(record.id, 4_000);
+    const result = await this.query(record.id, 4_000);
     await this.persistLedger({
       ...this.runningLedgerEntry(record, requirePid(record.tree)), state: 'terminal', terminalReported: false,
       terminal: result, ...(artifacts.protectedArtifact ? { protectedArtifact: artifacts.protectedArtifact } : {})
@@ -571,7 +551,7 @@ export class ProcessManager {
     if (!record.terminalReported) {
       const artifacts = await this.finalArtifacts(record);
       const report = Object.freeze({
-        result: await this.poll(record.id, 4_000),
+        result: await this.query(record.id, 4_000),
         ...(artifacts.protectedArtifact ? { protectedArtifact: artifacts.protectedArtifact } : {})
       });
       this.tombstones.set(processId, { report, owner: record.owner, terminalReported: false });
@@ -584,7 +564,7 @@ export class ProcessManager {
   private pruneExpired(): void { /* retention timers own expiry */ }
   private requireProcess(id: string): ManagedProcess { const record = this.active.get(id) ?? this.completed.get(id); if (!record) throw new Error('Unknown process: ' + id); return record; }
   private requireRunningProcess(id: string): ManagedProcess { const record = this.requireProcess(id); if (record.status !== 'running') throw new Error('Process is not running: ' + id); return record; }
-  private assertOwner(record: ManagedProcess, requester?: ProcessOwner): void { if (requester && requester.runId !== record.owner.runId) throw new Error('Process belongs to another run: ' + record.id); }
+  private assertOwner(record: ManagedProcess, requester?: CommandExecutionOwner): void { if (requester && requester.runId !== record.owner.runId) throw new Error('Process belongs to another run: ' + record.id); }
 
   private waitForActivity(record: ManagedProcess, yieldMs: number, afterCursor: number): Promise<void> {
     if (yieldMs <= 0 || record.status !== 'running' || record.cursor > afterCursor) return Promise.resolve();
@@ -606,7 +586,7 @@ export class ProcessManager {
     };
   }
 
-  private async reconcileLedger(): Promise<ProcessReconciliationResult> {
+  private async reconcileLedger(): Promise<CommandReconciliationResult> {
     if (!this.options.ledgerDirectory) return Object.freeze({ resolved: [], unresolved: [] });
     await mkdir(this.options.ledgerDirectory, { recursive: true, mode: 0o700 });
     const resolved: string[] = [];
@@ -807,8 +787,6 @@ function publicProcessOutput(record: ManagedProcess): Uint8Array {
   return new Uint8Array(Buffer.concat(parts));
 }
 
-export function isProcessManager(value: unknown): value is ProcessManager { return value instanceof ProcessManager; }
-
 class BoundedCapture {
   private readonly head: CapturedChunk[] = [];
   private readonly tail: CapturedChunk[] = [];
@@ -849,7 +827,7 @@ class BoundedCapture {
   chunks(): readonly CapturedChunk[] { return [...this.head, ...this.tail]; }
 }
 
-function view(chunks: readonly CapturedChunk[], maxBytes: number, afterCursor: number, cursorEnd: number, oldestCursor: number, observedOverride?: number): ProcessOutputView {
+function view(chunks: readonly CapturedChunk[], maxBytes: number, afterCursor: number, cursorEnd: number, oldestCursor: number, observedOverride?: number): CommandOutputView {
   const sliced = chunks.flatMap((chunk) => {
     if (chunk.start >= afterCursor) return [chunk];
     const skip = Math.max(0, afterCursor - chunk.start);
@@ -901,11 +879,11 @@ function dropUtf8Bytes(value: string, bytes: number): string {
   return '';
 }
 
-function terminalProgress(record: ManagedProcess, status: Exclude<ManagedProcessStatus, 'running'>): ToolProgress {
+function terminalProgress(record: ManagedProcess, status: Exclude<CommandExecutionStatus, 'running'>): ToolProgress {
   const stage = status === 'timed_out' ? 'process_timed_out' : status === 'failed' ? 'process_failed' : status === 'stopped' ? 'process_stopped' : 'process_exited';
   return { type: 'status', stage, message: `Process ${record.id} ${status}.` };
 }
-function orphanTerminalResult(entry: ProcessLedgerEntry, terminal: SupervisorTerminalState, stopped: boolean): ProcessPollResult {
+function orphanTerminalResult(entry: ProcessLedgerEntry, terminal: SupervisorTerminalState, stopped: boolean): CommandExecutionResult {
   const stream = Object.freeze({ text: '', observedBytes: 0, capturedBytes: 0, omittedBytes: 0, startsAtOutputStart: true, endsAtOutputEnd: true });
   return Object.freeze({
     processId: entry.processId, owner: entry.owner,
@@ -947,20 +925,20 @@ function parseLedgerEntry(value: unknown): ProcessLedgerEntry {
     ...(protectedArtifact ? { protectedArtifact } : {})
   });
 }
-function decodeProcessOwner(value: import('@agent-core/json').JsonValue | undefined): ProcessOwner {
+function decodeProcessOwner(value: import('@agent-core/json').JsonValue | undefined): CommandExecutionOwner {
   const record = jsonRecord(value, 'process ledger owner');
   if (typeof record.runId !== 'string' || typeof record.turnId !== 'string' || typeof record.toolBatchId !== 'string'
     || typeof record.callIndex !== 'number' || !Number.isSafeInteger(record.callIndex) || record.callIndex < 0) throw new Error('Invalid process ledger owner.');
   return Object.freeze({ runId: record.runId, turnId: record.turnId, toolBatchId: record.toolBatchId, callIndex: record.callIndex });
 }
-function decodeProcessOutputView(value: import('@agent-core/json').JsonValue | undefined): ProcessOutputView {
+function decodeProcessOutputView(value: import('@agent-core/json').JsonValue | undefined): CommandOutputView {
   const record = jsonRecord(value, 'process output view');
   if (typeof record.text !== 'string' || !nonnegativeInteger(record.observedBytes) || !nonnegativeInteger(record.capturedBytes)
     || !nonnegativeInteger(record.omittedBytes) || typeof record.startsAtOutputStart !== 'boolean' || typeof record.endsAtOutputEnd !== 'boolean') throw new Error('Invalid process output view.');
   return Object.freeze({ text: record.text, observedBytes: record.observedBytes, capturedBytes: record.capturedBytes, omittedBytes: record.omittedBytes,
     startsAtOutputStart: record.startsAtOutputStart, endsAtOutputEnd: record.endsAtOutputEnd });
 }
-function decodeProcessPollResult(value: import('@agent-core/json').JsonValue): ProcessPollResult {
+function decodeProcessPollResult(value: import('@agent-core/json').JsonValue): CommandExecutionResult {
   const record = jsonRecord(value, 'process terminal result');
   if (typeof record.processId !== 'string' || !processStatus(record.status) || !nonnegativeInteger(record.cursorStart) || !nonnegativeInteger(record.cursorEnd)
     || (record.cursorExpired !== undefined && typeof record.cursorExpired !== 'boolean')
@@ -994,7 +972,14 @@ function jsonRecord(value: import('@agent-core/json').JsonValue | undefined, lab
   return value as import('@agent-core/json').JsonObject;
 }
 function nonnegativeInteger(value: unknown): value is number { return typeof value === 'number' && Number.isInteger(value) && value >= 0; }
-function processStatus(value: unknown): value is ManagedProcessStatus { return value === 'running' || value === 'exited' || value === 'stopped' || value === 'timed_out' || value === 'failed'; }
+function processStatus(value: unknown): value is CommandExecutionStatus { return value === 'running' || value === 'exited' || value === 'stopped' || value === 'timed_out' || value === 'failed'; }
+
+function recoveryIdentity(ledgerDirectory: string | undefined, workspaceFileRoot: WorkspaceFileRoot): string {
+  if (ledgerDirectory === undefined) return `local-command:ephemeral:${randomUUID()}`;
+  return `local-command:sha256:${createHash('sha256')
+    .update(JSON.stringify({ ledgerDirectory: path.resolve(ledgerDirectory), workspace: workspaceFileRoot.identity }))
+    .digest('hex')}`;
+}
 function requirePid(tree: OwnedProcessTree): number { const pid = tree.child.pid; if (pid === undefined || pid <= 0) throw new Error('Process PID is unavailable.'); return pid; }
 function appendDiagnostic(existing: string | undefined, next: string): string { return existing ? `${existing} ${next}` : next; }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }

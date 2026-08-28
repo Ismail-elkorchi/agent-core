@@ -76,7 +76,7 @@ const agent = new AgentRuntime({
   tools: [adoptToolDefinition(tool)],
   toolPolicy: { allowedRisks: ['read', 'write'] },
   toolAuthorizer: () => ({ decision: 'require_approval', reason: 'confirm crash fixture' }),
-  toolContext: { services: { processManager: { resourceLeases } } },
+  toolResourceLeases: resourceLeases,
   onProgress(event) {
     if (mode === 'crash_waiting_for_lease' && event.type === 'tool.updated' && event.progress.stage === 'resource_lease_waiting') process.exit(44);
   }

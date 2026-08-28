@@ -7,7 +7,7 @@ import { AgentRuntime, agentEventCodec, InMemorySessionRepository } from '@agent
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/evidence';
 import {
   DEFAULT_LOCAL_TOOL_CONFIGURATION,
-  ProcessManager,
+  LocalCommandExecution,
   WorkspaceFileSelector,
   applyPatchTool,
   execCommandTool,
@@ -39,18 +39,19 @@ test('scripted self-hosting run survives approvals, structured tools, verificati
   const sessions = new InMemorySessionRepository();
   const artifacts = new InMemoryArtifactRepository();
   const session = await sessions.create({ id: 'self-host', provider: 'scripted', model: 'scripted' });
-  const processManager = new ProcessManager({
+  const workspaceFileRoot = testWorkspaceFileRoot(root);
+  const commandExecution = new LocalCommandExecution({
     artifactRepository: artifacts,
+    workspaceFileRoot,
     maxCapturedBytes: DEFAULT_LOCAL_TOOL_CONFIGURATION.process.maxCapturedBytes,
     tailBytes: DEFAULT_LOCAL_TOOL_CONFIGURATION.process.tailBytes
   });
-  const workspaceFileRoot = testWorkspaceFileRoot(root);
   const services = {
     workspaceFileRoot,
     artifactRepository: artifacts,
     localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION,
     patchJournal: testPatchJournal(workspaceFileRoot),
-    processManager,
+    commandExecution,
     workspaceFileSelector: new WorkspaceFileSelector(workspaceFileRoot, DEFAULT_LOCAL_TOOL_CONFIGURATION.fileSelection)
   };
   const options = {

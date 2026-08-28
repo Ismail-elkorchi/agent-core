@@ -1,7 +1,12 @@
-import { defineTool, requireToolService } from '@agent-core/tools';
+import {
+  defineTool,
+  isCommandExecution,
+  requireToolService,
+  type CommandExecution,
+  type CommandExecutionOwner
+} from '@agent-core/tools';
 import { workspaceProcessScope } from '../../core/resources.js';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
-import { isProcessManager, type ProcessManager, type ProcessOwner } from '../../core/process-manager.js';
 import { presentProcessObservation } from '../../core/presenters.js';
 import { isSuccessfulProcessResult } from '../process-output.js';
 import { writeStdinInputSchema, writeStdinOutputSchema } from './schema.js';
@@ -11,7 +16,7 @@ export const writeStdinTool = defineTool({
   description: 'Write to, close, or poll a process started by exec_command using a stable output cursor.',
   schema: writeStdinInputSchema, outputSchema: writeStdinOutputSchema,
   presentObservation: presentProcessObservation,
-  requirements: { services: ['localToolConfiguration', 'processManager'] },
+  requirements: { services: ['localToolConfiguration', 'commandExecution'] },
   effectEnvelope: { accesses: [{ mode: 'execute', scope: workspaceProcessScope() }], lockScopes: [workspaceProcessScope()] },
   canonicalizeInput(input, context) {
     const limits = requireLocalToolConfiguration(context).process;
@@ -25,11 +30,11 @@ export const writeStdinTool = defineTool({
     };
   },
   async invoke(input, context) {
-    const manager = requireToolService<ProcessManager>(context, 'processManager', isProcessManager, 'ProcessManager');
+    const executor = requireToolService<CommandExecution>(context, 'commandExecution', isCommandExecution, 'CommandExecution');
     const owner = processOwner(context.invocation);
-    if (input.text !== undefined && input.text.length > 0) await manager.write(input.processId, input.text, owner);
-    if (input.closeStdin) await manager.closeStdin(input.processId, owner);
-    const result = await manager.poll(input.processId, input.outputTokenBudget, input.yieldMs, input.afterCursor, owner);
+    if (input.text !== undefined && input.text.length > 0) await executor.writeInput(input.processId, input.text, owner);
+    if (input.closeStdin) await executor.closeInput(input.processId, owner);
+    const result = await executor.query(input.processId, input.outputTokenBudget, input.yieldMs, input.afterCursor, owner);
     return {
       kind: 'result' as const, ok: isSuccessfulProcessResult(result),
       summary: result.status === 'running' ? 'Process ' + result.processId + ' is still running.' : 'Process ' + result.processId + ' is ' + result.status + '.',
@@ -41,7 +46,7 @@ export const writeStdinTool = defineTool({
     };
   }
 });
-function processOwner(invocation: import('@agent-core/tools').ToolInvocationContext | undefined): ProcessOwner {
+function processOwner(invocation: import('@agent-core/tools').ToolInvocationContext | undefined): CommandExecutionOwner {
   if (!invocation) throw new Error('Process tools require a runtime invocation owner.');
   return Object.freeze({ runId: invocation.runId, turnId: invocation.turnId, toolBatchId: invocation.toolBatchId, callIndex: invocation.callIndex });
 }

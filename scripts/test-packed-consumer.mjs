@@ -58,7 +58,7 @@ try {
     "import * as tools from '@agent-core/tools';",
     "import * as local from '@agent-core/tools-local';",
     "import * as nodeEvidence from '@agent-core/evidence/node';",
-    "if (!runtime.decodeAgentTerminalSnapshot || !runtime.AgentRuntime || !runtime.AgentSession || !runtime.InMemorySessionRepository || !nodeRuntime.JsonlSessionRepository || !model.parseModelResponse || !json.parseJsonObject || !effects.decodeExternalEffectIntent || !evidence.InMemoryEventRepository || !nodeEvidence.JsonlEventRepository || !tools.prepareToolCall || !tools.invokePreparedToolCall || !local.ProcessManager) throw new Error('public runtime exports missing');"
+    "if (!runtime.decodeAgentTerminalSnapshot || !runtime.AgentRuntime || !runtime.AgentSession || !runtime.InMemorySessionRepository || !nodeRuntime.JsonlSessionRepository || !model.parseModelResponse || !json.parseJsonObject || !effects.decodeExternalEffectIntent || !evidence.InMemoryEventRepository || !nodeEvidence.JsonlEventRepository || !tools.prepareToolCall || !tools.invokePreparedToolCall || !tools.isCommandExecution || !local.LocalCommandExecution) throw new Error('public runtime exports missing');"
   ].join('\n'));
   await exec(process.execPath, ['runtime.mjs'], { cwd: consumer });
 

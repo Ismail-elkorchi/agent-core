@@ -1,5 +1,5 @@
 import * as z from 'zod';
-import type { ProcessPollResult } from '../core/process-manager.js';
+import type { CommandExecutionResult } from '@agent-core/tools';
 
 export const artifactRefSchema = z.strictObject({
   artifactId: z.string(),
@@ -38,6 +38,6 @@ export const processOutputSchema = z.strictObject({
   progressDeliveryErrors: z.int().nonnegative().optional()
 });
 
-export function isSuccessfulProcessResult(result: ProcessPollResult): boolean {
+export function isSuccessfulProcessResult(result: CommandExecutionResult): boolean {
   return result.status === 'running' || result.status === 'exited' && result.exitCode === 0;
 }
