@@ -41,6 +41,39 @@ export type ContextItemInput = Omit<ContextItem, 'id' | 'tokenEstimate'> & {
   tokenEstimate?: number;
 };
 
+export function decodeContextItemInput(value: unknown): ContextItemInput {
+  if (!isRecord(value)) throw new TypeError('Context item must be an object.');
+  const allowed = new Set(['id', 'sourceUri', 'sourceKind', 'confidence', 'representation', 'mediaType', 'title', 'content', 'range', 'tokenEstimate', 'selectionReason', 'score']);
+  const unsupported = Object.keys(value).filter((key) => !allowed.has(key));
+  if (unsupported.length > 0) throw new TypeError(`Unsupported context item fields: ${unsupported.join(', ')}.`);
+  if (typeof value.sourceUri !== 'string' || value.sourceUri.length === 0
+    || !oneOf(value.sourceKind, ['user', 'external', 'session', 'tool-observation', 'generated'] as const)
+    || (value.confidence !== undefined && !oneOf(value.confidence, ['unverified', 'verified'] as const))
+    || !oneOf(value.representation, ['full', 'excerpt', 'summary'] as const)
+    || typeof value.mediaType !== 'string' || value.mediaType.length === 0
+    || typeof value.title !== 'string' || typeof value.content !== 'string'
+    || typeof value.selectionReason !== 'string' || !finiteNumber(value.score)
+    || (value.id !== undefined && (typeof value.id !== 'string' || value.id.length === 0))
+    || (value.tokenEstimate !== undefined && !nonnegativeInteger(value.tokenEstimate))) {
+    throw new TypeError('Context item fields are invalid.');
+  }
+  const range = value.range === undefined ? undefined : decodeContextRange(value.range);
+  return Object.freeze({
+    sourceUri: value.sourceUri,
+    sourceKind: value.sourceKind,
+    ...(value.confidence === undefined ? {} : { confidence: value.confidence }),
+    representation: value.representation,
+    mediaType: value.mediaType,
+    title: value.title,
+    content: value.content,
+    ...(range === undefined ? {} : { range }),
+    selectionReason: value.selectionReason,
+    score: value.score,
+    ...(value.id === undefined ? {} : { id: value.id }),
+    ...(value.tokenEstimate === undefined ? {} : { tokenEstimate: value.tokenEstimate })
+  });
+}
+
 export interface ContextOmission {
   readonly reason: string;
   readonly sourceUri?: string;
@@ -698,6 +731,26 @@ function parseToolObservationPresentationSummary(content: string): { ok?: boolea
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
+
+function decodeContextRange(value: unknown): ContextRange {
+  if (!isRecord(value)) throw new TypeError('Context range must be an object.');
+  const unsupported = Object.keys(value).filter((key) => key !== 'kind' && key !== 'start' && key !== 'end');
+  if (unsupported.length > 0
+    || !oneOf(value.kind, ['line', 'byte'] as const)
+    || (value.start !== undefined && !nonnegativeInteger(value.start))
+    || (value.end !== undefined && !nonnegativeInteger(value.end))
+    || (typeof value.start === 'number' && typeof value.end === 'number' && value.end < value.start)) {
+    throw new TypeError('Context range is invalid.');
+  }
+  return Object.freeze({ kind: value.kind, ...(value.start === undefined ? {} : { start: value.start }), ...(value.end === undefined ? {} : { end: value.end }) });
+}
+
+function oneOf<const TValue extends readonly string[]>(value: unknown, choices: TValue): value is TValue[number] {
+  return typeof value === 'string' && choices.some((choice) => choice === value);
+}
+
+function finiteNumber(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value); }
+function nonnegativeInteger(value: unknown): value is number { return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0; }
 
 function compactJsonObject(value: JsonObject, maxBytes: number): JsonObject {
   const jsonBytes = Buffer.byteLength(JSON.stringify(value), 'utf8');

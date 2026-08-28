@@ -71,6 +71,13 @@ export interface AgentApprovalSuspension extends AgentRunIdentity {
   readonly budget: AgentRunBudgetState;
 }
 
+export interface AgentOperationSuspension extends AgentRunIdentity {
+  readonly state: 'suspended';
+  readonly reason: 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'missing_implementation' | 'user_decision';
+  readonly effectId?: string;
+  readonly budget: AgentRunBudgetState;
+}
+
 export type AgentCandidate = AgentAbsentCandidate | AgentPresentCandidate;
 export type AgentAbsentCandidate = Readonly<{ readonly status: 'absent' }>;
 export type AgentPresentCandidate = Readonly<{
@@ -298,7 +305,7 @@ export interface AgentEndedRunResult {
   readonly terminal: AgentTerminalSnapshot;
   readonly deliveryDiagnostics: readonly AgentDeliveryDiagnostic[];
 }
-export type AgentRunResult = AgentApprovalSuspension | AgentEndedRunResult;
+export type AgentRunResult = AgentApprovalSuspension | AgentOperationSuspension | AgentEndedRunResult;
 
 export class AgentContractError extends Error {
   readonly issues: readonly string[];

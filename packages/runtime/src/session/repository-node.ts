@@ -159,9 +159,20 @@ export class JsonlSessionRepository implements SessionRepository {
   }
 
   appendInput(sessionId: string, input: { runId: string; task: string; instructions?: readonly AgentEffectiveInstruction[] }): Promise<SessionInputEntry> {
-    return this.appendBranchEntry(sessionId, (parentId) => Object.freeze({
-      ...baseEntry(parentId), type: 'input', runId: input.runId, task: input.task,
-      instructions: Object.freeze((input.instructions ?? []).map((instruction) => Object.freeze({ ...instruction })))
+    return this.enqueue(sessionId, () => withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
+      const state = await this.refreshIndex(sessionId, true);
+      const existing = state.branchEntries.find((entry): entry is SessionInputEntry => entry.type === 'input' && entry.runId === input.runId);
+      if (existing) {
+        if (!sameSessionInput(existing, input)) throw new PersistenceConflictError(`Conflicting session input for run ${input.runId}.`);
+        return existing;
+      }
+      const entry: SessionInputEntry = Object.freeze({
+        ...baseEntry(branchLeaf(state.branchEntries)), type: 'input', runId: input.runId, task: input.task,
+        instructions: Object.freeze((input.instructions ?? []).map((instruction) => Object.freeze({ ...instruction })))
+      });
+      await this.appendRecord(sessionId, state, entry);
+      state.branchEntries.push(entry);
+      return entry;
     }));
   }
 
@@ -514,6 +525,10 @@ function sessionObservationKey(value: Pick<SessionObservationEntry, 'runId' | 't
 function sameObservation(existing: SessionObservationEntry, input: Omit<SessionObservationEntry, keyof BaseSessionEntry | 'type'>): boolean {
   const persisted = observationPayload(existing);
   return JSON.stringify(persisted) === JSON.stringify(input);
+}
+
+function sameSessionInput(existing: SessionInputEntry, input: { readonly runId: string; readonly task: string; readonly instructions?: readonly AgentEffectiveInstruction[] }): boolean {
+  return existing.task === input.task && JSON.stringify(existing.instructions) === JSON.stringify(input.instructions ?? []);
 }
 function observationPayload(value: SessionObservationEntry): Omit<SessionObservationEntry, keyof BaseSessionEntry | 'type'> {
   return {

@@ -164,6 +164,8 @@ export type AgentEvent =
   | ({ readonly type: 'check.started'; readonly check: string; readonly requirement: AgentCheckRequirement; readonly timeoutMs: number } & AgentTurnIdentity)
   | ({ readonly type: 'check.ended'; readonly check: string; readonly result: AgentCheckResult } & AgentTurnIdentity);
 
+export type AgentAuditEvent = Exclude<AgentEvent, { readonly type: 'operation.transition' }>;
+
 export type AgentProgressEvent =
   | ({ readonly type: 'turn.started'; readonly runId: string; readonly task: string; readonly sessionId?: string; readonly sessionEntryId?: string } & AgentTurnIdentity)
   | ({ readonly type: 'context.replay.restored' } & AgentReplayPayload)

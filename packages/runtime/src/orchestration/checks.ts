@@ -12,7 +12,7 @@ import {
   type AgentTurnIdentity,
   type AgentVerificationExecutionContext
 } from '../run/contracts.js';
-import type { AgentEvent, AgentProgressEvent } from '../events.js';
+import type { AgentAuditEvent, AgentProgressEvent } from '../events.js';
 
 export type {
   AgentCheckContext,
@@ -49,7 +49,7 @@ export async function runAgentChecks(input: {
   readonly metadata?: Readonly<Record<string, unknown>>;
   readonly execution?: AgentVerificationExecutionContext;
   readonly defaultTimeoutMs?: number;
-  readonly append: (event: AgentEvent) => Promise<unknown>;
+  readonly append: (event: AgentAuditEvent) => Promise<unknown>;
   readonly emit: (event: AgentProgressEvent) => Promise<void>;
 }): Promise<readonly AgentCheckResult[]> {
   const metadataValue = normalizeJsonSafe(input.metadata ?? {}).value;

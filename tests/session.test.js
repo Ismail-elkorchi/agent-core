@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { appendFile, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { PersistenceCorruptionError } from '@agent-core/evidence';
-import { AgentSession, InMemorySessionRepository, decodeAgentTerminalSnapshot } from '@agent-core/runtime';
+import { InMemoryEventRepository, PersistenceCorruptionError } from '@agent-core/evidence';
+import { AgentOperationCoordinator, AgentSession, InMemorySessionRepository, agentEventCodec, decodeAgentTerminalSnapshot } from '@agent-core/runtime';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 
 test('session repository initializes a missing nested root before acquiring its stream lock', async () => {
@@ -236,6 +236,41 @@ function completedTerminal(runId, finalizationId, message) {
   };
 }
 
+function testBudget() { return completedTerminal('run', 'final', 'result').budget; }
+
+function operationCoordinator() {
+  return new AgentOperationCoordinator(new InMemoryEventRepository(agentEventCodec));
+}
+
+async function acceptTestOperation(operations, runId) {
+  return operations.accept({
+    runId,
+    finalizationId: `${runId}:final`,
+    input: { task: 'claimed', instructions: [], contextItems: [] },
+    configuration: { providerId: 'test', model: 'model', runtimeImplementationId: 'test/runtime@1', toolImplementationIds: [], checkIds: [], policyHash: 'policy' }
+  });
+}
+
+async function acceptApprovalOperation(operations, runId) {
+  await acceptTestOperation(operations, runId);
+  const driver = await operations.attach(runId, 'session-test-driver');
+  const identity = { turnIndex: 1, turnId: 'turn', requestAttempt: 1 };
+  const advance = async (procedure, phase) => {
+    const result = await driver.drive(({ instruction }) => {
+      assert.equal(instruction.procedure, procedure);
+      return { phase, budget: testBudget() };
+    });
+    assert.equal(result.kind, 'advanced');
+  };
+  await advance('prepare', { kind: 'preparing', step: 'assemble_turn', turnIndex: 1 });
+  await advance('assemble_turn', { kind: 'provider', stage: 'ready', identity });
+  await advance('prepare_provider_request', { kind: 'provider', stage: 'effect_pending', identity, effectId: 'provider-effect' });
+  await advance('reconcile_provider_request', { kind: 'provider', stage: 'settled', identity, effectId: 'provider-effect', responseEventId: 'response' });
+  await advance('consume_provider_settlement', { kind: 'tools', stage: 'ready', identity, toolBatchId: 'batch', callCount: 1, nextCallIndex: 0 });
+  await advance('prepare_tool_call', { kind: 'tools', stage: 'effect_pending', identity, toolBatchId: 'batch', callCount: 1, nextCallIndex: 0, effectId: 'tool-effect' });
+  await advance('reconcile_tool_call', { kind: 'approval', identity, toolBatchId: 'batch', callCount: 1, nextCallIndex: 0, pendingApprovalIds: ['approval'] });
+}
+
 test('AgentSession serializes admission, preserves steering identity, and snapshots configuration at submission', async () => {
   const configurations = [];
   const controls = [];
@@ -244,6 +279,7 @@ test('AgentSession serializes admission, preserves steering identity, and snapsh
   const session = new AgentSession({
     descriptor,
     repository,
+    operations: operationCoordinator(),
     configuration: { provider: 'test', model: 'first' },
     createRuntime(configuration) {
       configurations.push(configuration);
@@ -312,36 +348,41 @@ test('session branches require stable boundaries and conversation projects assis
   assert.equal(conversation.filter((entry) => entry.type === 'steering').length, 1);
 });
 
-test('AgentSession recovers queued work but records claimed work as uncertain instead of retrying it', async () => {
+test('AgentSession restores claimed and queued work without starting execution during restore', async () => {
   const repository = new InMemorySessionRepository();
   const descriptor = await repository.create({ id: 'durable-admission' });
   const blocked = new AgentSession({
-    descriptor, repository, configuration: { provider: 'test', model: 'model' },
+    descriptor, repository, operations: operationCoordinator(), configuration: { provider: 'test', model: 'model' },
     createRuntime() {
       return { run(input) { return { runId: input.runId, result: new Promise(() => {}), injectSteering() { throw new Error('unused'); }, abort() {} }; } };
     }
   });
-  await blocked.submit({ task: 'claimed' });
+  const claimed = await blocked.submit({ task: 'claimed' });
   const queued = await blocked.submit({ task: 'recover me' });
   assert.equal(queued.kind, 'queued');
+
+  const events = new InMemoryEventRepository(agentEventCodec);
+  const operations = new AgentOperationCoordinator(events);
+  await acceptTestOperation(operations, claimed.runId);
 
   const executed = [];
   const failures = [];
   const recovered = new AgentSession({
-    descriptor, repository, configuration: { provider: 'test', model: 'different-model' },
+    descriptor, repository, operations, configuration: { provider: 'test', model: 'different-model' },
     createRuntime(configuration) {
-      return { run(input) {
+      const execute = (input) => {
         executed.push({ task: input.task, model: configuration.model });
         return { runId: input.runId, result: Promise.resolve({ state: 'ended', terminal: { runId: input.runId }, deliveryDiagnostics: [] }), injectSteering() { throw new Error('unused'); }, abort() {} };
-      } };
+      };
+      return { run: execute, resume(runId) { return execute({ runId, task: 'claimed' }); } };
     }
   });
   recovered.subscribe((event) => { if (event.type === 'run.failed') failures.push(event.error.message); });
   await recovered.restore();
+  assert.deepEqual(executed, []);
   await recovered.waitForIdle();
-  assert.deepEqual(executed, [{ task: 'recover me', model: 'model' }]);
-  assert.equal(failures.length, 1);
-  assert.match(failures[0], /not retried/u);
+  assert.deepEqual(executed, [{ task: 'claimed', model: 'model' }, { task: 'recover me', model: 'model' }]);
+  assert.equal(failures.length, 0);
   assert.deepEqual(await repository.loadPendingSubmissions(descriptor.id), []);
 });
 
@@ -353,7 +394,7 @@ test('semantic compaction is persisted once and becomes the replay base', async 
   await repository.projectFinal(descriptor.id, completedTerminal('run', 'final', 'decision retained'));
   let calls = 0;
   const agent = new AgentSession({
-    descriptor, repository, configuration: { provider: 'test', model: 'summary-model' },
+    descriptor, repository, operations: operationCoordinator(), configuration: { provider: 'test', model: 'summary-model' },
     createRuntime() { throw new Error('runtime is not needed for compaction'); },
     async summarizeConversation(request) {
       calls += 1;
@@ -376,7 +417,7 @@ test('approval suspension remains durable and blocks queued follow-ups until res
   const descriptor = await repository.create({ id: 'durable-suspension' });
   let resolveFirst;
   const firstProcess = new AgentSession({
-    descriptor, repository, configuration: { provider: 'test', model: 'model' },
+    descriptor, repository, operations: operationCoordinator(), configuration: { provider: 'test', model: 'model' },
     createRuntime() { return { run(input) {
       return { runId: input.runId, result: new Promise((resolve) => { resolveFirst = resolve; }), injectSteering() { throw new Error('unused'); }, abort() {} };
     } }; }
@@ -384,13 +425,17 @@ test('approval suspension remains durable and blocks queued follow-ups until res
   const first = await firstProcess.submit({ task: 'needs approval' });
   const followUp = await firstProcess.submit({ task: 'after approval' });
   assert.equal(followUp.kind, 'queued');
-  resolveFirst({ state: 'suspended', runId: first.runId, pendingApprovals: [], deliveryDiagnostics: [] });
+  resolveFirst({ state: 'suspended', reason: 'approval_required', runId: first.runId, finalizationId: 'final', pendingApprovals: [], budget: testBudget() });
   await first.completion;
-  assert.equal(firstProcess.state().phase, 'waiting_for_approval');
+  assert.equal(firstProcess.state().phase, 'waiting_for_user');
+
+  const approvalEvents = new InMemoryEventRepository(agentEventCodec);
+  const approvalOperations = new AgentOperationCoordinator(approvalEvents);
+  await acceptApprovalOperation(approvalOperations, first.runId);
 
   const executed = [];
   const restarted = new AgentSession({
-    descriptor, repository, configuration: { provider: 'test', model: 'model' },
+    descriptor, repository, operations: approvalOperations, configuration: { provider: 'test', model: 'model' },
     createRuntime() { return {
       run(input) {
         executed.push(input.task);
@@ -402,7 +447,7 @@ test('approval suspension remains durable and blocks queued follow-ups until res
     }; }
   });
   await restarted.restore();
-  assert.equal(restarted.state().phase, 'waiting_for_approval');
+  assert.equal(restarted.state().phase, 'waiting_for_user');
   assert.deepEqual(executed, []);
   await restarted.resolveApproval({ runId: first.runId, approvalId: 'approval', fingerprint: 'fingerprint', decision: 'allow' });
   await restarted.waitForIdle();

@@ -285,9 +285,9 @@ test('session and observation-record projection failures do not reclassify a com
   }
   class FailingObservationEventRepository extends InMemoryEventRepository {
     failed = false;
-    async append(runId, event, options) {
+    async appendConditional(runId, event, options) {
       if (event.type === 'observation.record.created' && !this.failed) { this.failed = true; throw new Error('observation event projection failed'); }
-      return super.append(runId, event, options);
+      return super.appendConditional(runId, event, options);
     }
   }
   const cases = [

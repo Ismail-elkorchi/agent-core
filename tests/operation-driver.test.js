@@ -68,7 +68,7 @@ test('driver attachment fences a live stale owner and all writes retain one tail
   assert.equal(advanced.inspection.state.phase.kind, 'preparing');
 });
 
-test('abort and advancement race through one conditional transition winner', async () => {
+test('abort retries a lost tail race and becomes the durable control state', async () => {
   const events = new InMemoryEventRepository(agentEventCodec);
   const operations = new AgentOperationCoordinator(events);
   await operations.accept(acceptance('abort-race'));
@@ -77,10 +77,10 @@ test('abort and advancement race through one conditional transition winner', asy
     driver.drive(() => ({ phase: { kind: 'preparing', step: 'assemble_turn', turnIndex: 1 } })),
     operations.requestAbort('abort-race', 'User requested cancellation.')
   ]);
-  assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
-  assert.equal(results.filter(result => result.status === 'rejected').length, 1);
+  assert.equal(results[1].status, 'fulfilled');
+  assert.ok(results[0].status === 'fulfilled' || results[0].status === 'rejected');
   const current = await operations.inspect('abort-race');
-  assert.ok(current.state.phase.kind === 'preparing' || current.state.control.status === 'abort_requested');
+  assert.equal(current.state.control.status, 'abort_requested');
 });
 
 test('total operation states select one explicit procedure, wait, or completion', () => {

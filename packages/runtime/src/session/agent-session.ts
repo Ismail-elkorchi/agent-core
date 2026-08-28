@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { AgentRuntime, type AgentRunControl, type AgentRunInput } from '../agent-runtime.js';
+import { AgentOperationCoordinator } from '../operation/driver.js';
 import type { AgentProgressEvent } from '../events.js';
 import type { AgentRunResult } from '../run/contracts.js';
 import type {
@@ -18,10 +19,11 @@ export type AgentSessionConfiguration = SessionSubmissionConfiguration;
 
 export interface AgentSessionState {
   readonly sessionId: string;
-  readonly phase: 'idle' | 'running' | 'waiting_for_approval' | 'compacting';
+  readonly phase: 'idle' | 'running' | 'waiting_for_user' | 'compacting';
   readonly configuration: AgentSessionConfiguration;
   readonly activeRunId?: string;
   readonly queuedInputs: number;
+  readonly suspensionReason?: Exclude<AgentRunResult, { readonly state: 'ended' }>['reason'];
 }
 
 export interface AgentSessionCompactionRequest {
@@ -46,6 +48,7 @@ export type AgentSessionSubmissionResult =
 export interface AgentSessionOptions {
   readonly descriptor: SessionDescriptor;
   readonly repository: SessionRepository;
+  readonly operations: AgentOperationCoordinator;
   readonly configuration: AgentSessionConfiguration;
   readonly createRuntime: (configuration: AgentSessionConfiguration, onProgress: (event: AgentProgressEvent) => void | Promise<void>) => AgentRuntime;
   readonly summarizeConversation?: (request: AgentSessionCompactionRequest) => Promise<string>;
@@ -58,7 +61,7 @@ export class AgentSession {
   private readonly queued: PendingSubmission[] = [];
   private readonly listeners = new Set<(event: AgentSessionEvent) => void | Promise<void>>();
   private active: ActiveSubmission | undefined;
-  private suspended: { readonly runId: string; readonly submissionId: string; readonly configuration: AgentSessionConfiguration } | undefined;
+  private suspended: { readonly runId: string; readonly submissionId: string; readonly configuration: AgentSessionConfiguration; readonly reason: Exclude<AgentRunResult, { readonly state: 'ended' }>['reason'] } | undefined;
   private operations: Promise<void> = Promise.resolve();
   private restored = false;
   private compacting = false;
@@ -73,10 +76,11 @@ export class AgentSession {
   state(): AgentSessionState {
     return Object.freeze({
       sessionId: this.options.descriptor.id,
-      phase: this.active ? 'running' : this.suspended ? 'waiting_for_approval' : this.compacting ? 'compacting' : 'idle',
+      phase: this.active ? 'running' : this.suspended ? 'waiting_for_user' : this.compacting ? 'compacting' : 'idle',
       configuration: this.configuration,
       ...(this.active ? { activeRunId: this.active.control.runId } : this.suspended ? { activeRunId: this.suspended.runId } : {}),
-      queuedInputs: this.queued.length
+      queuedInputs: this.queued.length,
+      ...(this.suspended ? { suspensionReason: this.suspended.reason } : {})
     });
   }
 
@@ -87,6 +91,13 @@ export class AgentSession {
 
   restore(): Promise<void> {
     return this.serial(() => this.restorePending());
+  }
+
+  resumePending(): Promise<void> {
+    return this.serial(async () => {
+      await this.restorePending();
+      if (!this.active && !this.suspended && !this.compacting) await this.launchNext();
+    });
   }
 
   configure(settings: Partial<AgentSessionConfiguration>): Promise<AgentSessionState> {
@@ -119,8 +130,9 @@ export class AgentSession {
       await this.options.repository.enqueueSubmission(this.options.descriptor.id, {
         submissionId, runId: pending.runId, input: submissionInput(pending.input), configuration: pending.configuration
       });
-      if (this.active || this.suspended || this.compacting) {
+      if (this.active || this.suspended || this.compacting || this.queued.length > 0) {
         this.enqueue(pending);
+        if (!this.active && !this.suspended && !this.compacting) await this.launchNext();
         return { kind: 'queued', submissionId, completion: pending.completion };
       }
       return this.launch(pending);
@@ -165,7 +177,7 @@ export class AgentSession {
     const started = await this.serial(async () => {
       await this.restorePending();
       if (this.active) throw new Error(`Session ${this.options.descriptor.id} already has an active run.`);
-      if (!this.suspended) throw new Error(`Session ${this.options.descriptor.id} is not waiting for approval.`);
+      if (this.suspended?.reason !== 'approval_required') throw new Error(`Session ${this.options.descriptor.id} is not waiting for approval.`);
       if (this.suspended.runId !== input.runId) throw new Error(`Session is suspended on run ${this.suspended.runId}, not ${input.runId}.`);
       const suspended = this.suspended;
       const configuration = suspended.configuration;
@@ -187,14 +199,14 @@ export class AgentSession {
     return started.completion;
   }
 
-  abort(reason = 'Agent run aborted.', expectedRunId?: string): boolean {
+  async abort(reason = 'Agent run aborted.', expectedRunId?: string): Promise<boolean> {
     if (!this.active || (expectedRunId !== undefined && this.active.control.runId !== expectedRunId)) return false;
-    this.active.control.abort(reason);
+    await this.active.control.abort(reason);
     return true;
   }
 
   async waitForIdle(): Promise<void> {
-    await this.restore();
+    await this.resumePending();
     while (this.active || (!this.suspended && this.queued.length > 0)) {
       if (this.active) await this.active.pending.completion.catch(() => undefined);
       await this.operations;
@@ -206,28 +218,37 @@ export class AgentSession {
     const pending = await this.options.repository.loadPendingSubmissions(this.options.descriptor.id);
     for (const submission of pending) {
       if (submission.state === 'claimed') {
-        const failure = new Error(`Submission ${submission.submissionId} was claimed before the process exited and was not retried because side effects may be uncertain.`);
-        await this.options.repository.transitionSubmission(this.options.descriptor.id, submission.submissionId, {
-          state: 'failed', errorMessage: failure.message
-        });
-        await this.emit({ type: 'run.failed', runId: submission.runId, error: failure });
+        const operation = await this.options.operations.inspect(submission.runId);
+        if (operation.state.phase.kind === 'approval') {
+          this.suspended = { runId: submission.runId, submissionId: submission.submissionId, configuration: submission.configuration, reason: 'approval_required' };
+        } else if (operation.state.phase.kind === 'suspended') {
+          this.suspended = { runId: submission.runId, submissionId: submission.submissionId, configuration: submission.configuration, reason: operation.state.phase.reason };
+        } else {
+          this.queued.push(pendingFromRecord(submission, true));
+        }
       } else if (submission.state === 'suspended') {
         if (this.suspended) throw new Error(`Session has multiple suspended submissions: ${this.suspended.submissionId} and ${submission.submissionId}.`);
-        this.suspended = { runId: submission.runId, submissionId: submission.submissionId, configuration: submission.configuration };
+        const operation = await this.options.operations.inspect(submission.runId);
+        const reason = operation.state.phase.kind === 'approval'
+          ? 'approval_required'
+          : operation.state.phase.kind === 'suspended'
+            ? operation.state.phase.reason
+            : undefined;
+        if (!reason) throw new Error(`Suspended submission ${submission.submissionId} has no matching operation suspension.`);
+        this.suspended = { runId: submission.runId, submissionId: submission.submissionId, configuration: submission.configuration, reason };
       } else {
-        this.queued.push(pendingFromRecord(submission));
+        this.queued.push(pendingFromRecord(submission, false));
       }
     }
     this.restored = true;
-    if (!this.active && !this.suspended) await this.launchNext();
   }
 
   private async launch(pending: PendingSubmission): Promise<Extract<AgentSessionSubmissionResult, { kind: 'started' }>> {
-    await this.options.repository.transitionSubmission(this.options.descriptor.id, pending.id, { state: 'claimed' });
+    if (!pending.resumeExisting) await this.options.repository.transitionSubmission(this.options.descriptor.id, pending.id, { state: 'claimed' });
     try {
       const configuration = pending.configuration;
       const runtime = this.options.createRuntime(configuration, (event) => this.emit({ type: 'run.progress', runId: pending.runId, event }));
-      const control = runtime.run({ ...pending.input, runId: pending.runId });
+      const control = pending.resumeExisting ? runtime.resume(pending.runId) : runtime.run({ ...pending.input, runId: pending.runId });
       this.observe({ control, pending, configuration });
       return { kind: 'started', submissionId: pending.id, runId: control.runId, completion: pending.completion };
     } catch (error) {
@@ -250,7 +271,7 @@ export class AgentSession {
     if (this.active !== active) return;
     await this.options.repository.transitionSubmission(this.options.descriptor.id, active.pending.id, { state: result.state === 'suspended' ? 'suspended' : 'completed' });
     this.active = undefined;
-    this.suspended = result.state === 'suspended' ? { runId: result.runId, submissionId: active.pending.id, configuration: active.configuration } : undefined;
+    this.suspended = result.state === 'suspended' ? { runId: result.runId, submissionId: active.pending.id, configuration: active.configuration, reason: result.reason } : undefined;
     active.pending.resolve(result);
     await this.emit({ type: 'run.completed', runId: active.control.runId, result });
     if (!this.suspended) await this.launchNext();
@@ -311,6 +332,7 @@ interface PendingSubmission {
   readonly runId: string;
   readonly input: AgentRunInput;
   readonly configuration: AgentSessionConfiguration;
+  readonly resumeExisting: boolean;
   readonly completion: Promise<AgentRunResult>;
   readonly resolve: (result: AgentRunResult) => void;
   readonly reject: (error: unknown) => void;
@@ -322,11 +344,11 @@ interface ActiveSubmission {
   readonly configuration: AgentSessionConfiguration;
 }
 
-function pendingFromRecord(record: SessionPendingSubmission): PendingSubmission {
-  return pendingSubmission(record.submissionId, record.runId, record.input, record.configuration);
+function pendingFromRecord(record: SessionPendingSubmission, resumeExisting: boolean): PendingSubmission {
+  return pendingSubmission(record.submissionId, record.runId, record.input, record.configuration, resumeExisting);
 }
 
-function pendingSubmission(id: string, runId: string, input: SessionSubmissionInput | AgentRunInput, configuration: AgentSessionConfiguration): PendingSubmission {
+function pendingSubmission(id: string, runId: string, input: SessionSubmissionInput | AgentRunInput, configuration: AgentSessionConfiguration, resumeExisting = false): PendingSubmission {
   let resolve!: (result: AgentRunResult) => void;
   let reject!: (error: unknown) => void;
   const completion = new Promise<AgentRunResult>((resolveResult, rejectResult) => { resolve = resolveResult; reject = rejectResult; });
@@ -338,7 +360,7 @@ function pendingSubmission(id: string, runId: string, input: SessionSubmissionIn
       ...item, ...(item.range === undefined ? {} : { range: Object.freeze({ ...item.range }) })
     }))) })
   });
-  return { id, runId, input: ownedInput, configuration: ownSessionSubmissionConfiguration(configuration), completion, resolve, reject };
+  return { id, runId, input: ownedInput, configuration: ownSessionSubmissionConfiguration(configuration), resumeExisting, completion, resolve, reject };
 }
 
 function submissionInput(input: AgentRunInput): SessionSubmissionInput {

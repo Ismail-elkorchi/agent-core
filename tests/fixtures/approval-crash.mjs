@@ -17,6 +17,14 @@ const events = mode === 'crash_after_ended' || mode === 'crash_before_started' ?
     if (args[1]?.type === 'tool.ended') process.exit(43);
     return record;
   },
+  async appendConditional(...args) {
+    if (mode === 'crash_before_started' && args[1]?.type === 'tool.started') process.exit(45);
+    const result = await storedEvents.appendConditional(...args);
+    if (args[1]?.type === 'tool.ended') process.exit(43);
+    return result;
+  },
+  tail: (...args) => storedEvents.tail(...args),
+  latestOfType: (...args) => storedEvents.latestOfType(...args),
   read: (...args) => storedEvents.read(...args),
   listRunIds: (...args) => storedEvents.listRunIds(...args),
   verifyIntegrity: (...args) => storedEvents.verifyIntegrity(...args)

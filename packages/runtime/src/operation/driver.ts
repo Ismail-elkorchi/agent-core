@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import {
   canonicalJsonString,
+  hashJson,
   type ConditionalEventAppendResult,
   type EventAppendReceipt,
   type EventLedgerTail,
   type EventRepository
 } from '@agent-core/evidence';
-import { encodeAgentEvent, type AgentEvent } from '../events.js';
+import { encodeAgentEvent, type AgentAuditEvent, type AgentEvent } from '../events.js';
 import {
   decodeAgentOperationState,
   nextAgentOperationInstruction,
@@ -40,7 +41,7 @@ export interface AgentOperationAdvance {
 export interface AgentOperationProcedureContext {
   readonly state: AgentOperationState;
   readonly instruction: Extract<AgentOperationInstruction, { readonly kind: 'execute' }>;
-  append(event: Exclude<AgentEvent, { readonly type: 'operation.transition' }>, idempotencyKey: string): Promise<EventAppendReceipt>;
+  append(event: AgentAuditEvent, idempotencyKey: string): Promise<EventAppendReceipt>;
 }
 
 export type AgentOperationProcedureExecutor = (context: AgentOperationProcedureContext) => AgentOperationAdvance | Promise<AgentOperationAdvance>;
@@ -144,24 +145,27 @@ export class AgentOperationCoordinator {
   }
 
   async requestAbort(runId: string, reason: string): Promise<AgentOperationInspection> {
-    const current = await this.inspect(runId);
-    if (current.state.phase.kind === 'terminal' || current.state.control.status === 'abort_requested') return current;
-    const state = decodeAgentOperationState({
-      ...current.state,
-      revision: current.state.revision + 1,
-      control: {
-        status: 'abort_requested',
-        ...(current.state.control.status === 'owned' ? { driverId: current.state.control.driverId } : {}),
-        reason
-      }
-    });
-    const result = await this.events.appendConditional(runId, { type: 'operation.transition', state }, {
-      idempotencyKey: transitionKey(state),
-      expectedTail: current.tail,
-      driverGeneration: current.tail.driverGeneration
-    });
-    acceptConditionalResult(runId, result);
-    return this.inspect(runId);
+    for (;;) {
+      const current = await this.inspect(runId);
+      if (current.state.phase.kind === 'terminal' || current.state.control.status === 'abort_requested') return current;
+      const state = decodeAgentOperationState({
+        ...current.state,
+        revision: current.state.revision + 1,
+        control: {
+          status: 'abort_requested',
+          ...(current.state.control.status === 'owned' ? { driverId: current.state.control.driverId } : {}),
+          reason
+        }
+      });
+      const result = await this.events.appendConditional(runId, { type: 'operation.transition', state }, {
+        idempotencyKey: transitionKey(state),
+        expectedTail: current.tail,
+        driverGeneration: current.tail.driverGeneration
+      });
+      if (result.kind === 'rejected' && (result.reason === 'stale_tail' || result.reason === 'stale_driver')) continue;
+      acceptConditionalResult(runId, result);
+      return this.inspect(runId);
+    }
   }
 }
 
@@ -186,24 +190,45 @@ export class AgentOperationDriver {
       const advance = await execute(Object.freeze({
         state: this.stateValue,
         instruction: inspection.instruction,
-        append: (event: Exclude<AgentEvent, { readonly type: 'operation.transition' }>, idempotencyKey: string) => this.appendNow(event, idempotencyKey)
+        append: (event: AgentAuditEvent, idempotencyKey: string) => this.appendNow(event, idempotencyKey)
       }));
       const next = await this.transitionNow(inspection.instruction.procedure, advance);
       return Object.freeze({ kind: 'advanced', inspection: next });
     });
   }
 
-  append(event: Exclude<AgentEvent, { readonly type: 'operation.transition' }>, idempotencyKey: string): Promise<EventAppendReceipt> {
+  append(event: AgentAuditEvent, idempotencyKey: string): Promise<EventAppendReceipt> {
     return this.serial(() => this.appendNow(event, idempotencyKey));
   }
 
-  private async appendNow(event: Exclude<AgentEvent, { readonly type: 'operation.transition' }>, idempotencyKey: string): Promise<EventAppendReceipt> {
+  resolveApproval(approvalId: string): Promise<AgentOperationInspection> {
+    return this.serial(async () => {
+      this.assertTransitionAuthority(this.stateValue.phase);
+      if (this.stateValue.phase.kind !== 'approval') throw new TypeError(`Run ${this.stateValue.runId} is not waiting for approval.`);
+      if (!this.stateValue.phase.pendingApprovalIds.includes(approvalId)) throw new TypeError(`Run ${this.stateValue.runId} is not waiting for approval ${approvalId}.`);
+      const pendingApprovalIds = this.stateValue.phase.pendingApprovalIds.filter((id) => id !== approvalId);
+      const phase: AgentOperationPhase = pendingApprovalIds.length > 0
+        ? Object.freeze({ ...this.stateValue.phase, pendingApprovalIds: Object.freeze(pendingApprovalIds) })
+        : Object.freeze({
+            kind: 'tools',
+            stage: 'ready',
+            identity: this.stateValue.phase.identity,
+            toolBatchId: this.stateValue.phase.toolBatchId,
+            callCount: this.stateValue.phase.callCount,
+            nextCallIndex: 0
+          });
+      return this.commitState({ phase });
+    });
+  }
+
+  private async appendNow(event: AgentAuditEvent, idempotencyKey: string): Promise<EventAppendReceipt> {
     this.assertEventAuthority(event);
     const result = await this.events.appendConditional(this.stateValue.runId, event, {
       idempotencyKey,
       expectedTail: this.tailValue,
       driverGeneration: this.stateValue.driverGeneration
     });
+    if (result.kind === 'rejected' && (result.reason === 'stale_tail' || result.reason === 'stale_driver')) await this.refresh();
     const committed = acceptConditionalResult(this.stateValue.runId, result);
     this.tailValue = committed.tail;
     return committed.receipt;
@@ -214,6 +239,10 @@ export class AgentOperationDriver {
     if (!advanceMatchesProcedure(procedure, advance.phase)) {
       throw new TypeError(`Procedure ${procedure} cannot advance to ${advance.phase.kind}.`);
     }
+    return this.commitState(advance);
+  }
+
+  private async commitState(advance: AgentOperationAdvance): Promise<AgentOperationInspection> {
     const state = decodeAgentOperationState({
       ...this.stateValue,
       revision: this.stateValue.revision + 1,
@@ -225,6 +254,7 @@ export class AgentOperationDriver {
       expectedTail: this.tailValue,
       driverGeneration: state.driverGeneration
     });
+    if (result.kind === 'rejected' && (result.reason === 'stale_tail' || result.reason === 'stale_driver')) await this.refresh();
     const committed = acceptConditionalResult(state.runId, result);
     this.stateValue = state;
     this.tailValue = committed.tail;
@@ -241,7 +271,15 @@ export class AgentOperationDriver {
     });
   }
 
-  private assertEventAuthority(event: Exclude<AgentEvent, { readonly type: 'operation.transition' }>): void {
+  private async refresh(): Promise<void> {
+    const transition = await this.events.latestOfType(this.stateValue.runId, 'operation.transition');
+    if (transition?.event.type !== 'operation.transition') throw new Error(`Run ${this.stateValue.runId} lost its durable operation transition.`);
+    this.stateValue = transition.event.state;
+    this.tailValue = await this.events.tail(this.stateValue.runId);
+    this.transitionValue = Object.freeze({ eventId: transition.eventId, sequence: transition.sequence, hash: transition.hash });
+  }
+
+  private assertEventAuthority(event: AgentAuditEvent): void {
     const control = this.stateValue.control;
     if (control.status === 'detached' || control.driverId !== this.driverId || (control.status === 'abort_requested' && !abortAdministrativeEvent(event))) {
       throw new AgentOperationConflictError(this.stateValue.runId, 'stale_driver', `Driver ${this.driverId} cannot append work for run ${this.stateValue.runId}.`);
@@ -276,10 +314,10 @@ function acceptConditionalResult(runId: string, result: ConditionalEventAppendRe
 }
 
 function transitionKey(state: AgentOperationState): string {
-  return `${state.runId}:operation:revision:${String(state.revision)}`;
+  return `${state.runId}:operation:revision:${String(state.revision)}:${hashJson(encodeAgentEvent({ type: 'operation.transition', state }))}`;
 }
 
-function abortAdministrativeEvent(event: Exclude<AgentEvent, { readonly type: 'operation.transition' }>): boolean {
+function abortAdministrativeEvent(event: AgentAuditEvent): boolean {
   return event.type === 'finalization.prepared'
     || event.type === 'run.ended'
     || event.type === 'delivery.failed'
@@ -289,14 +327,14 @@ function abortAdministrativeEvent(event: Exclude<AgentEvent, { readonly type: 'o
 
 function advanceMatchesProcedure(procedure: Extract<AgentOperationInstruction, { readonly kind: 'execute' }>['procedure'], phase: AgentOperationPhase): boolean {
   switch (procedure) {
-    case 'prepare': return phase.kind === 'preparing';
+    case 'prepare': return phase.kind === 'preparing' || phase.kind === 'finalization';
     case 'assemble_turn': return phase.kind === 'provider' || phase.kind === 'finalization' || phase.kind === 'cancelling';
-    case 'prepare_provider_request': return phase.kind === 'provider' && phase.stage === 'effect_pending';
+    case 'prepare_provider_request': return (phase.kind === 'provider' && phase.stage === 'effect_pending') || phase.kind === 'finalization';
     case 'reconcile_provider_request': return (phase.kind === 'provider' && (phase.stage === 'settled' || phase.stage === 'outcome_unknown')) || phase.kind === 'suspended';
-    case 'consume_provider_settlement': return phase.kind === 'tools' || phase.kind === 'preparing' || phase.kind === 'verification' || phase.kind === 'disposition' || phase.kind === 'finalization';
-    case 'prepare_tool_call': return phase.kind === 'tools' && (phase.stage === 'effect_pending' || phase.stage === 'complete');
-    case 'reconcile_tool_call': return (phase.kind === 'tools' && phase.stage === 'settled') || phase.kind === 'suspended';
-    case 'consume_tool_settlement': return phase.kind === 'tools' && phase.stage === 'projecting';
+    case 'consume_provider_settlement': return phase.kind === 'provider' || phase.kind === 'tools' || phase.kind === 'preparing' || phase.kind === 'verification' || phase.kind === 'disposition' || phase.kind === 'finalization';
+    case 'prepare_tool_call': return (phase.kind === 'tools' && (phase.stage === 'effect_pending' || phase.stage === 'complete')) || phase.kind === 'finalization';
+    case 'reconcile_tool_call': return (phase.kind === 'tools' && phase.stage === 'settled') || phase.kind === 'approval' || phase.kind === 'suspended' || phase.kind === 'finalization';
+    case 'consume_tool_settlement': return (phase.kind === 'tools' && phase.stage === 'projecting') || phase.kind === 'finalization';
     case 'project_tool_settlement': return phase.kind === 'tools' && (phase.stage === 'ready' || phase.stage === 'complete');
     case 'advance_after_tools': return phase.kind === 'preparing' || phase.kind === 'verification' || phase.kind === 'disposition' || phase.kind === 'finalization';
     case 'prepare_verification': return phase.kind === 'verification' && (phase.stage === 'effect_pending' || phase.stage === 'complete');

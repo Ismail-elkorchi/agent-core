@@ -8,7 +8,7 @@ import {
   type AgentTerminalSnapshot
 } from '../run/contracts.js';
 import type { SessionRepository } from '../session/repository.js';
-import type { AgentEvent, AgentProgressEvent } from '../events.js';
+import type { AgentAuditEvent, AgentEvent, AgentProgressEvent } from '../events.js';
 import { AgentFinalizationError, type AgentFinalizationProgress } from '../ports.js';
 
 export class AgentRunFinalizer {
@@ -19,7 +19,7 @@ export class AgentRunFinalizer {
     readonly runId: string;
     readonly finalizationId: string;
     readonly events: EventRepository<AgentEvent>;
-    readonly append: (event: AgentEvent, idempotencyKey: string) => Promise<EventAppendReceipt>;
+    readonly append: (event: AgentAuditEvent, idempotencyKey: string) => Promise<EventAppendReceipt>;
     readonly session?: { readonly repository: SessionRepository; readonly sessionId: string };
     readonly deliver?: (event: AgentProgressEvent) => void | Promise<void>;
     readonly deliveryDiagnostics?: AgentDeliveryDiagnostic[];

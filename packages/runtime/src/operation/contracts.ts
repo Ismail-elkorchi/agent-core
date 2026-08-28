@@ -1,10 +1,11 @@
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
 import type { AgentRunBudgetState, AgentTurnIdentity } from '../run/contracts.js';
+import { decodeContextItemInput, type ContextItemInput } from '../context/manager.js';
 
 export interface AgentOperationInput {
   readonly task: string;
   readonly instructions: readonly string[];
-  readonly contextItems: readonly JsonObject[];
+  readonly contextItems: readonly ContextItemInput[];
 }
 
 export interface AgentOperationConfiguration {
@@ -42,7 +43,14 @@ export type AgentOperationPhase =
       readonly effectId?: string;
       readonly settlementEventId?: string;
     }>
-  | Readonly<{ readonly kind: 'approval'; readonly pendingApprovalIds: readonly string[] }>
+  | Readonly<{
+      readonly kind: 'approval';
+      readonly identity: AgentTurnIdentity;
+      readonly toolBatchId: string;
+      readonly callCount: number;
+      readonly nextCallIndex: number;
+      readonly pendingApprovalIds: readonly string[];
+    }>
   | Readonly<{
       readonly kind: 'verification';
       readonly stage: 'ready' | 'effect_pending' | 'settled' | 'complete';
@@ -168,7 +176,7 @@ function decodeInput(value: unknown): AgentOperationInput {
   return Object.freeze({
     task: nonempty(input.task, 'task'),
     instructions: stringArray(input.instructions, 'instructions'),
-    contextItems: Object.freeze(array(input.contextItems, 'contextItems').map((item, index) => object(item, `contextItems[${String(index)}]`)))
+    contextItems: Object.freeze(array(input.contextItems, 'contextItems').map((item) => decodeContextItemInput(item)))
   });
 }
 
@@ -228,8 +236,13 @@ function decodePhase(value: unknown): AgentOperationPhase {
       return Object.freeze({ kind, stage: enumeration(phase.stage, ['ready', 'effect_pending', 'settled', 'projecting', 'complete'] as const, 'phase.stage'), identity: decodeTurnIdentity(phase.identity), toolBatchId: identifier(phase.toolBatchId, 'phase.toolBatchId'), callCount, nextCallIndex, ...(effectId ? { effectId } : {}), ...(settlementEventId ? { settlementEventId } : {}) });
     }
     case 'approval':
-      exact(phase, ['kind', 'pendingApprovalIds']);
-      return Object.freeze({ kind, pendingApprovalIds: nonemptyUniqueIdentifiers(phase.pendingApprovalIds, 'phase.pendingApprovalIds') });
+      exact(phase, ['kind', 'identity', 'toolBatchId', 'callCount', 'nextCallIndex', 'pendingApprovalIds']);
+      {
+        const callCount = positiveInteger(phase.callCount, 'phase.callCount');
+        const nextCallIndex = nonnegativeInteger(phase.nextCallIndex, 'phase.nextCallIndex');
+        if (nextCallIndex >= callCount) throw new TypeError('phase.nextCallIndex must identify a call in phase.callCount.');
+        return Object.freeze({ kind, identity: decodeTurnIdentity(phase.identity), toolBatchId: identifier(phase.toolBatchId, 'phase.toolBatchId'), callCount, nextCallIndex, pendingApprovalIds: nonemptyUniqueIdentifiers(phase.pendingApprovalIds, 'phase.pendingApprovalIds') });
+      }
     case 'verification': {
       exact(phase, ['kind', 'stage', 'checkIds', 'nextCheckIndex', 'effectId', 'resultEventId']);
       const checkIds = uniqueIdentifiers(phase.checkIds, 'phase.checkIds');
@@ -286,7 +299,8 @@ function exact(value: JsonObject, fields: readonly string[]): void {
 }
 function array(value: unknown, name: string): readonly unknown[] { if (!Array.isArray(value)) throw new TypeError(`${name} must be an array.`); return value; }
 function nonempty(value: unknown, name: string): string { if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`${name} must be a non-empty string.`); return value; }
-function identifier(value: unknown, name: string): string { const result = nonempty(value, name); if (!/^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$/u.test(result) || Buffer.byteLength(result, 'utf8') > 512) throw new TypeError(`${name} is invalid.`); return result; }
+function identifier(value: unknown, name: string): string { const result = nonempty(value, name); if (hasControlCharacter(result) || Buffer.byteLength(result, 'utf8') > 512) throw new TypeError(`${name} is invalid.`); return result; }
+function hasControlCharacter(value: string): boolean { for (let index = 0; index < value.length; index += 1) { const unit = value.charCodeAt(index); if (unit <= 31 || unit === 127) return true; } return false; }
 function optionalIdentifier(value: unknown, name: string): string | undefined { return value === undefined ? undefined : identifier(value, name); }
 function nonnegativeInteger(value: unknown, name: string): number { if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new TypeError(`${name} must be a non-negative safe integer.`); return value; }
 function positiveInteger(value: unknown, name: string): number { if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) throw new TypeError(`${name} must be a positive safe integer.`); return value; }

@@ -19,7 +19,7 @@ import {
   type ToolObservation
 } from '@agent-core/tools';
 import type { ResourceLeaseCoordinator } from '@agent-core/tools';
-import type { AgentEvent, AgentProgressEvent } from '../events.js';
+import type { AgentAuditEvent, AgentProgressEvent } from '../events.js';
 import { ObservationStore, serializeToolObservationPresentation } from './observation-store.js';
 import type { AgentRunController } from './run-controller.js';
 import { scheduleToolCalls } from './tool-scheduler.js';
@@ -75,7 +75,7 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
   readonly observationStore: ObservationStore;
   readonly session?: { readonly repository: SessionRepository; readonly sessionId: string };
   readonly controller: AgentRunController;
-  readonly append: (event: AgentEvent, idempotencyKey?: string) => Promise<unknown>;
+  readonly append: (event: AgentAuditEvent, idempotencyKey?: string) => Promise<unknown>;
   readonly emit: (event: AgentProgressEvent) => Promise<void>;
 }): Promise<ToolBatchExecutionResult> {
   const authorizationContext = input.toolContext;

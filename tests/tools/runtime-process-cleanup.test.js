@@ -76,7 +76,9 @@ test('abort and runtime failure both clean active run processes before run.ended
     assert.equal(state.manager.activeCount(runId), 0);
     const persisted = await records(state.events, runId);
     assert.equal(persisted.some((event) => event.type === 'process.ended'), true);
-    assert.equal(persisted.at(-1).type, 'run.ended');
+    assert.equal(persisted.at(-2).type, 'run.ended');
+    assert.equal(persisted.at(-1).type, 'operation.transition');
+    assert.equal(persisted.at(-1).state.phase.kind, 'terminal');
   }
 });
 
@@ -93,7 +95,9 @@ test('cleanup failure becomes terminal runtime_error and still commits run.ended
   assert.equal(result.terminal.turnCount, 1);
   assert.equal(result.terminal.modelTerminationReason, 'stop');
   assert.deepEqual(result.terminal.cleanupDiagnostic, { kind: 'process_cleanup', message: 'cleanup broke' });
-  assert.equal((await records(state.events, 'cleanup-failure-run')).at(-1).type, 'run.ended');
+  const persisted = await records(state.events, 'cleanup-failure-run');
+  assert.equal(persisted.at(-2).type, 'run.ended');
+  assert.equal(persisted.at(-1).state.phase.kind, 'terminal');
 });
 
 test('natural process exit is persisted exactly once even when the model never polls it', async () => {

@@ -98,10 +98,20 @@ export class InMemorySessionRepository implements SessionRepository {
   }
 
   appendInput(sessionId: string, input: { runId: string; task: string; instructions?: readonly AgentEffectiveInstruction[] }): Promise<SessionInputEntry> {
-    return this.append(sessionId, (parentId) => Object.freeze({
-      ...baseEntry(parentId), type: 'input', runId: input.runId, task: input.task,
-      instructions: Object.freeze((input.instructions ?? []).map((instruction) => Object.freeze({ ...instruction })))
-    }));
+    return this.serial(() => {
+      const state = this.require(sessionId);
+      const existing = state.branchEntries.find((entry): entry is SessionInputEntry => entry.type === 'input' && entry.runId === input.runId);
+      if (existing) {
+        if (!sameSessionInput(existing, input)) throw new PersistenceConflictError(`Conflicting session input for run ${input.runId}.`);
+        return existing;
+      }
+      const entry = Object.freeze({
+        ...baseEntry(branchLeaf(state.branchEntries)), type: 'input' as const, runId: input.runId, task: input.task,
+        instructions: Object.freeze((input.instructions ?? []).map((instruction) => Object.freeze({ ...instruction })))
+      });
+      state.branchEntries.push(entry);
+      return entry;
+    });
   }
   appendSteering(sessionId: string, input: { runId: string; content: string }): Promise<SessionSteeringEntry> {
     return this.append(sessionId, (parentId) => Object.freeze({ ...baseEntry(parentId), type: 'steering', runId: input.runId, content: input.content }));
@@ -254,6 +264,9 @@ function sessionObservationKey(value: Pick<SessionObservationEntry, 'runId' | 't
     : undefined;
 }
 function sameObservation(existing: SessionObservationEntry, input: Omit<SessionObservationEntry, keyof BaseSessionEntry | 'type'>): boolean { return JSON.stringify(observationPayload(existing)) === JSON.stringify(input); }
+function sameSessionInput(existing: SessionInputEntry, input: { readonly runId: string; readonly task: string; readonly instructions?: readonly AgentEffectiveInstruction[] }): boolean {
+  return existing.task === input.task && JSON.stringify(existing.instructions) === JSON.stringify(input.instructions ?? []);
+}
 function observationPayload(value: SessionObservationEntry): Omit<SessionObservationEntry, keyof BaseSessionEntry | 'type'> {
   return {
     runId: value.runId, turnIndex: value.turnIndex, turnId: value.turnId, requestAttempt: value.requestAttempt,
