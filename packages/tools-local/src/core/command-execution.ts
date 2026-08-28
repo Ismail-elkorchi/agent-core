@@ -14,6 +14,7 @@ import { parseJsonObject } from '@agent-core/json';
 import {
   ResourceLeaseCoordinator,
   adoptCommandExecution,
+  createCommandExecutionPreparation,
   type CommandExecution,
   type CommandExecutionDescriptor,
   type CommandExecutionOwner,
@@ -120,7 +121,7 @@ interface ProcessLedgerEntry {
   readonly protectedArtifact?: ProtectedArtifactRef;
 }
 
-class LocalCommandPreparation implements CommandExecutionPreparation {
+class LocalCommandPreparation {
   readonly authorization;
   #state: 'prepared' | 'started' | 'released' = 'prepared';
 
@@ -163,6 +164,7 @@ export class LocalCommandExecution implements CommandExecution {
   private readonly ready: Promise<CommandReconciliationResult>;
   private reconciliationState: CommandReconciliationResult | undefined;
   private reservedCapturedBytes = 0;
+  private readonly preparations = new WeakMap<CommandExecutionPreparation, LocalCommandPreparation>();
 
   constructor(private readonly options: LocalCommandExecutionOptions) {
     if (!isWorkspaceFileRoot(options.workspaceFileRoot)) throw new TypeError('Local command execution requires an adopted WorkspaceFileRoot.');
@@ -186,17 +188,20 @@ export class LocalCommandExecution implements CommandExecution {
 
   async prepare(request: PrepareCommandRequest): Promise<CommandExecutionPreparation> {
     const commandDirectory = await this.options.workspaceFileRoot.commandDirectory(request.workspacePath);
-    const preparation = new LocalCommandPreparation(this, request, commandDirectory);
+    const owned = new LocalCommandPreparation(this, request, commandDirectory);
+    const preparation = createCommandExecutionPreparation(owned.authorization, () => owned.release());
+    this.preparations.set(preparation, owned);
     return preparation;
   }
 
   async start(preparation: CommandExecutionPreparation, options: StartPreparedCommandOptions = {}): Promise<CommandExecutionResult> {
-    if (!(preparation instanceof LocalCommandPreparation) || preparation.authority !== this) throw new TypeError('Command preparation does not belong to the local command authority.');
-    const adopted = preparation.start();
+    const owned = this.preparations.get(preparation);
+    if (!owned || owned.authority !== this) throw new TypeError('Command preparation does not belong to the local command authority.');
+    const adopted = owned.start();
     try {
       return await this.startInDirectory(adopted.request, options, adopted.path);
     } finally {
-      await preparation.release();
+      await owned.release();
     }
   }
 

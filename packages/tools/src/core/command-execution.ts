@@ -42,9 +42,33 @@ export interface StartPreparedCommandOptions {
 
 /** Authority-owned command preparation. It may reserve resources but must not execute the target. */
 export interface CommandExecutionPreparation {
+  readonly [COMMAND_EXECUTION_PREPARATION]: true;
   /** Exact, immutable evidence included in the tool authorization fingerprint. */
   readonly authorization: JsonObject;
   release(): void | Promise<void>;
+}
+
+const COMMAND_EXECUTION_PREPARATION = Symbol('agent-core.command-execution-preparation');
+const commandExecutionPreparations = new WeakSet<CommandExecutionPreparation>();
+
+export function createCommandExecutionPreparation(
+  authorizationValue: unknown,
+  release: () => void | Promise<void>
+): CommandExecutionPreparation {
+  if (typeof release !== 'function') throw new TypeError('Command execution preparation release must be callable.');
+  const authorization = parseJsonObject(authorizationValue, {
+    maxDepth: 24,
+    maxCollectionEntries: 2_000,
+    maxStringBytes: 256_000,
+    maxTotalBytes: 512_000
+  });
+  const preparation = Object.freeze({
+    [COMMAND_EXECUTION_PREPARATION]: true as const,
+    authorization,
+    release
+  });
+  commandExecutionPreparations.add(preparation);
+  return preparation;
 }
 
 const PREPARED_COMMAND_EXECUTION = Symbol('agent-core.prepared-command-execution');
@@ -133,28 +157,20 @@ export async function prepareCommandExecution(
   if (!isCommandExecution(authority)) throw new TypeError('Command execution authority was not adopted.');
   validatePrepareRequest(request);
   const source = await authority.prepare(request);
-  if (typeof source !== 'object' || source === null || typeof source.release !== 'function') {
+  if (!isCommandExecutionPreparation(source)) {
     throw new TypeError('Command execution preparation is invalid.');
-  }
-  let authorization: JsonObject;
-  try {
-    authorization = parseJsonObject(source.authorization, {
-      maxDepth: 24,
-      maxCollectionEntries: 2_000,
-      maxStringBytes: 256_000,
-      maxTotalBytes: 512_000
-    });
-  } catch (error) {
-    await Promise.resolve(source.release()).catch(() => undefined);
-    throw error;
   }
   const prepared = Object.freeze({
     [PREPARED_COMMAND_EXECUTION]: true as const,
     request: Object.freeze({ ...request, owner: Object.freeze({ ...request.owner }) }),
-    authorization
+    authorization: source.authorization
   });
   preparedCommands.set(prepared, { state: 'prepared', authority, source });
   return prepared;
+}
+
+export function isCommandExecutionPreparation(value: unknown): value is CommandExecutionPreparation {
+  return typeof value === 'object' && value !== null && commandExecutionPreparations.has(value as CommandExecutionPreparation);
 }
 
 export async function startPreparedCommandExecution(
