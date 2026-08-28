@@ -16,7 +16,7 @@ const manager = new LocalCommandExecution({
     process.exit(46);
   }
 });
-await manager.start({
+const prepared = await manager.prepare({
   command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify('setTimeout(() => process.exit(0), 30)')}`,
   workspacePath: '.',
   pty: false,
@@ -25,3 +25,4 @@ await manager.start({
   outputTokenBudget: 100,
   owner: { runId: 'recovered-run', turnId: 'turn', toolBatchId: 'batch', callIndex: 0 }
 });
+await manager.start(prepared);

@@ -1,4 +1,5 @@
 import type { ProtectedArtifactRef, PublicArtifactRef } from '@agent-core/evidence';
+import { parseJsonObject, type JsonObject } from '@agent-core/json';
 import type { ToolProgress, ToolResourceLease } from './context.js';
 import type { ResourceLeaseCoordinator } from './resource-leases.js';
 import { isResourceLeaseCoordinator } from './resource-leases.js';
@@ -22,7 +23,7 @@ export interface CommandExecutionDescriptor {
   readonly supportsPty: boolean;
 }
 
-export interface StartCommandRequest {
+export interface PrepareCommandRequest {
   readonly command: string;
   /** Canonical path relative to the command authority's adopted workspace. */
   readonly workspacePath: string;
@@ -31,9 +32,27 @@ export interface StartCommandRequest {
   readonly yieldMs: number;
   readonly outputTokenBudget: number;
   readonly owner: CommandExecutionOwner;
+}
+
+export interface StartPreparedCommandOptions {
   readonly signal?: AbortSignal;
   readonly lease?: ToolResourceLease;
   readonly onProgress?: (progress: ToolProgress) => void | Promise<void>;
+}
+
+/** Authority-owned command preparation. It may reserve resources but must not execute the target. */
+export interface CommandExecutionPreparation {
+  /** Exact, immutable evidence included in the tool authorization fingerprint. */
+  readonly authorization: JsonObject;
+  release(): void | Promise<void>;
+}
+
+const PREPARED_COMMAND_EXECUTION = Symbol('agent-core.prepared-command-execution');
+/** Opaque, single-authority preparation admitted by this package. */
+export interface PreparedCommandExecution {
+  readonly [PREPARED_COMMAND_EXECUTION]: true;
+  readonly request: PrepareCommandRequest;
+  readonly authorization: JsonObject;
 }
 
 export interface CommandOutputView {
@@ -85,7 +104,8 @@ export interface CommandReconciliationResult {
 export interface CommandExecution {
   readonly descriptor: CommandExecutionDescriptor;
   readonly resourceLeases: ResourceLeaseCoordinator;
-  start(request: StartCommandRequest): Promise<CommandExecutionResult>;
+  prepare(request: PrepareCommandRequest): Promise<CommandExecutionPreparation>;
+  start(prepared: CommandExecutionPreparation, options?: StartPreparedCommandOptions): Promise<CommandExecutionResult>;
   query(processId: string, outputTokenBudget: number, yieldMs?: number, afterCursor?: number, requester?: CommandExecutionOwner): Promise<CommandExecutionResult>;
   writeInput(processId: string, text: string, requester?: CommandExecutionOwner): Promise<void>;
   closeInput(processId: string, requester?: CommandExecutionOwner): Promise<void>;
@@ -100,6 +120,63 @@ export interface CommandExecution {
 }
 
 const adoptedCommandExecutions = new WeakSet();
+const preparedCommands = new WeakMap<PreparedCommandExecution, {
+  state: 'prepared' | 'started' | 'released';
+  readonly authority: CommandExecution;
+  readonly source: CommandExecutionPreparation;
+}>();
+
+export async function prepareCommandExecution(
+  authority: CommandExecution,
+  request: PrepareCommandRequest
+): Promise<PreparedCommandExecution> {
+  if (!isCommandExecution(authority)) throw new TypeError('Command execution authority was not adopted.');
+  validatePrepareRequest(request);
+  const source = await authority.prepare(request);
+  if (typeof source !== 'object' || source === null || typeof source.release !== 'function') {
+    throw new TypeError('Command execution preparation is invalid.');
+  }
+  let authorization: JsonObject;
+  try {
+    authorization = parseJsonObject(source.authorization, {
+      maxDepth: 24,
+      maxCollectionEntries: 2_000,
+      maxStringBytes: 256_000,
+      maxTotalBytes: 512_000
+    });
+  } catch (error) {
+    await Promise.resolve(source.release()).catch(() => undefined);
+    throw error;
+  }
+  const prepared = Object.freeze({
+    [PREPARED_COMMAND_EXECUTION]: true as const,
+    request: Object.freeze({ ...request, owner: Object.freeze({ ...request.owner }) }),
+    authorization
+  });
+  preparedCommands.set(prepared, { state: 'prepared', authority, source });
+  return prepared;
+}
+
+export async function startPreparedCommandExecution(
+  authority: CommandExecution,
+  prepared: PreparedCommandExecution,
+  options: StartPreparedCommandOptions = {}
+): Promise<CommandExecutionResult> {
+  const record = requirePreparedCommand(prepared, authority);
+  if (record.state !== 'prepared') throw new Error('Command execution preparation is single-use.');
+  record.state = 'started';
+  return authority.start(record.source, options);
+}
+
+export async function releasePreparedCommandExecution(
+  authority: CommandExecution,
+  prepared: PreparedCommandExecution
+): Promise<void> {
+  const record = requirePreparedCommand(prepared, authority);
+  if (record.state === 'released') return;
+  record.state = 'released';
+  await record.source.release();
+}
 
 export function adoptCommandExecution(value: unknown): CommandExecution {
   if (isCommandExecution(value)) return value;
@@ -116,12 +193,33 @@ export function adoptCommandExecution(value: unknown): CommandExecution {
     throw new TypeError('Command execution descriptor and capabilities must be immutable.');
   }
   if (!isResourceLeaseCoordinator(candidate.resourceLeases)) throw new TypeError('Command execution resource lease coordinator is invalid.');
-  const complete = ['start', 'query', 'writeInput', 'closeInput', 'terminate', 'disposeRun', 'recoveredTerminalReports',
+  const complete = ['prepare', 'start', 'query', 'writeInput', 'closeInput', 'terminate', 'disposeRun', 'recoveredTerminalReports',
     'acknowledgeTerminalReport', 'reconcile', 'retryReconciliation', 'acknowledgeUnresolved', 'close']
     .every((key) => typeof candidate[key as keyof CommandExecution] === 'function');
   if (!complete) throw new TypeError('Command execution behavior is incomplete.');
   adoptedCommandExecutions.add(value);
   return value as CommandExecution;
+}
+
+function requirePreparedCommand(prepared: PreparedCommandExecution, authority: CommandExecution) {
+  const record = preparedCommands.get(prepared);
+  if (!record || record.authority !== authority) throw new TypeError('Command preparation does not belong to this execution authority.');
+  return record;
+}
+
+function validatePrepareRequest(request: PrepareCommandRequest): void {
+  if (typeof request !== 'object' || request === null) throw new TypeError('Command preparation request must be an object.');
+  if (typeof request.command !== 'string' || request.command.length === 0) throw new TypeError('Command must be non-empty.');
+  if (typeof request.workspacePath !== 'string') throw new TypeError('Command workspace path must be a string.');
+  if (typeof request.pty !== 'boolean') throw new TypeError('Command PTY selection must be boolean.');
+  for (const [name, value] of [['timeoutMs', request.timeoutMs], ['yieldMs', request.yieldMs], ['outputTokenBudget', request.outputTokenBudget]] as const) {
+    if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${name} must be a non-negative safe integer.`);
+  }
+  if (typeof request.owner !== 'object' || request.owner === null
+    || !validIdentity(request.owner.runId) || !validIdentity(request.owner.turnId)
+    || !validIdentity(request.owner.toolBatchId) || !Number.isSafeInteger(request.owner.callIndex) || request.owner.callIndex < 0) {
+    throw new TypeError('Command execution owner is invalid.');
+  }
 }
 
 export function isCommandExecution(value: unknown): value is CommandExecution {

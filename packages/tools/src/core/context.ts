@@ -53,7 +53,7 @@ export interface ToolAuthorizationBoundary {
   readonly executionTargetId: string;
 }
 
-export interface ToolPreparationContext extends Omit<ToolExecutionContext, 'signal' | 'invocation'> {
+export interface ToolPreparationContext extends Omit<ToolExecutionContext, 'signal'> {
   readonly signal: AbortSignal;
   readonly boundary: ToolAuthorizationBoundary;
 }

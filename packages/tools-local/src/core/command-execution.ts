@@ -17,13 +17,15 @@ import {
   type CommandExecution,
   type CommandExecutionDescriptor,
   type CommandExecutionOwner,
+  type CommandExecutionPreparation,
   type CommandExecutionReport,
   type CommandExecutionResult,
   type CommandExecutionStatus,
   type CommandOutputStream,
   type CommandOutputView,
   type CommandReconciliationResult,
-  type StartCommandRequest,
+  type PrepareCommandRequest,
+  type StartPreparedCommandOptions,
   type ToolProgress,
   type ToolResourceLease
 } from '@agent-core/tools';
@@ -70,7 +72,7 @@ interface ManagedProcess {
   readonly history: CapturedChunk[];
   readonly decoder: { readonly stdout: StringDecoder; readonly stderr: StringDecoder };
   readonly activityWaiters: Set<() => void>;
-  readonly onProgress?: StartCommandRequest['onProgress'];
+  readonly onProgress?: StartPreparedCommandOptions['onProgress'];
   readonly lease?: ToolResourceLease;
   readonly progressQueue: QueuedProgress[];
   status: CommandExecutionStatus;
@@ -118,6 +120,37 @@ interface ProcessLedgerEntry {
   readonly protectedArtifact?: ProtectedArtifactRef;
 }
 
+class LocalCommandPreparation implements CommandExecutionPreparation {
+  readonly authorization;
+  #state: 'prepared' | 'started' | 'released' = 'prepared';
+
+  constructor(
+    readonly authority: LocalCommandExecution,
+    readonly request: PrepareCommandRequest,
+    private readonly directory: { readonly path: string; close(): Promise<void> }
+  ) {
+    this.authorization = Object.freeze({
+      authority: authority.descriptor.implementationId,
+      recoveryIdentity: authority.descriptor.recoveryIdentity,
+      executionTarget: 'host',
+      isolation: 'none',
+      workingDirectory: directory.path
+    });
+  }
+
+  start(): { readonly request: PrepareCommandRequest; readonly path: string } {
+    if (this.#state !== 'prepared') throw new Error('Local command preparation is single-use.');
+    this.#state = 'started';
+    return { request: this.request, path: this.directory.path };
+  }
+
+  async release(): Promise<void> {
+    if (this.#state === 'released') return;
+    this.#state = 'released';
+    await this.directory.close();
+  }
+}
+
 export class LocalCommandExecution implements CommandExecution {
   readonly descriptor: CommandExecutionDescriptor;
   readonly resourceLeases = new ResourceLeaseCoordinator();
@@ -151,19 +184,26 @@ export class LocalCommandExecution implements CommandExecution {
     adoptCommandExecution(this);
   }
 
-  async start(request: StartCommandRequest): Promise<CommandExecutionResult> {
+  async prepare(request: PrepareCommandRequest): Promise<CommandExecutionPreparation> {
     const commandDirectory = await this.options.workspaceFileRoot.commandDirectory(request.workspacePath);
+    const preparation = new LocalCommandPreparation(this, request, commandDirectory);
+    return preparation;
+  }
+
+  async start(preparation: CommandExecutionPreparation, options: StartPreparedCommandOptions = {}): Promise<CommandExecutionResult> {
+    if (!(preparation instanceof LocalCommandPreparation) || preparation.authority !== this) throw new TypeError('Command preparation does not belong to the local command authority.');
+    const adopted = preparation.start();
     try {
-      return await this.startInDirectory(request, commandDirectory.path);
+      return await this.startInDirectory(adopted.request, options, adopted.path);
     } finally {
-      await commandDirectory.close();
+      await preparation.release();
     }
   }
 
-  private async startInDirectory(request: StartCommandRequest, workingDirectory: string): Promise<CommandExecutionResult> {
+  private async startInDirectory(request: PrepareCommandRequest, options: StartPreparedCommandOptions, workingDirectory: string): Promise<CommandExecutionResult> {
     const reconciliation = await this.ready;
     if (reconciliation.unresolved.length > 0) {
-      throw new Error('An unresolved supervised process blocks new ambient process starts for this workspace.');
+      throw new Error('An unresolved supervised process blocks new local command starts for this workspace.');
     }
     this.pruneExpired();
     if (this.active.size >= this.limits.maxActiveProcesses) throw new Error('Maximum active process count reached.');
@@ -188,7 +228,7 @@ export class LocalCommandExecution implements CommandExecution {
       historyBytes: 0, progressBytes: 0, progressDelivering: false, progressClosed: false, progressStarted: false, progressDroppedEvents: 0,
       progressDeliveryErrors: 0, terminalReported: false, observed: { stdout: 0, stderr: 0 },
       startupComplete: false, startupFailed: false,
-      ...(request.onProgress ? { onProgress: request.onProgress } : {}), ...(request.lease ? { lease: request.lease } : {})
+      ...(options.onProgress ? { onProgress: options.onProgress } : {}), ...(options.lease ? { lease: options.lease } : {})
     };
     this.active.set(id, record);
     this.reservedCapturedBytes += this.options.maxCapturedBytes;
@@ -234,14 +274,14 @@ export class LocalCommandExecution implements CommandExecution {
       }, Math.min(request.timeoutMs, this.limits.maxProcessLifetimeMs));
       record.timeout.unref();
     }
-    if (request.signal) {
-      record.abortSignal = request.signal;
+    if (options.signal) {
+      record.abortSignal = options.signal;
       record.abortListener = () => { if (record.status === 'running') void this.terminate(id).catch((error: unknown) => { record.diagnostic = errorMessage(error); }); };
-      request.signal.addEventListener('abort', record.abortListener, { once: true });
-      if (request.signal.aborted) record.abortListener();
+      options.signal.addEventListener('abort', record.abortListener, { once: true });
+      if (options.signal.aborted) record.abortListener();
     }
     await this.waitForActivity(record, request.yieldMs, 0);
-    if (record.status === 'running' && request.lease) request.lease.transferToProcess(id, workspaceProcessScope(id));
+    if (record.status === 'running' && options.lease) options.lease.transferToProcess(id, workspaceProcessScope(id));
     return this.query(id, request.outputTokenBudget, 0, 0, request.owner);
   }
 

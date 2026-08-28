@@ -11,10 +11,11 @@ const manager = new LocalCommandExecution({
   ledgerDirectory: path.join(root, 'processes'),
   ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process
 });
-const result = await manager.start({
+const prepared = await manager.prepare({
   command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify('setInterval(()=>{},1000)')}`,
   workspacePath: '.', pty: false, timeoutMs: 60_000, yieldMs: 20, outputTokenBudget: 1_000,
   owner: { runId: 'orphan-run', turnId: 'turn', toolBatchId: 'batch', callIndex: 0 }
 });
+const result = await manager.start(prepared);
 process.stdout.write(JSON.stringify({ processId: result.processId }) + '\n');
 process.exit(44);

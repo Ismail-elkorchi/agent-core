@@ -14,7 +14,7 @@ test('process lifecycle fault matrix preserves one settled terminal truth', asyn
   await t.test('exit before supervisor reachability leaves no owned process', async () => {
     const { manager, root } = await context();
     const missing = 'missing-working-directory';
-    await assert.rejects(manager.start(request(missing, 'process.exit(0)')));
+    await assert.rejects(startCommand(manager, request(missing, 'process.exit(0)')));
     assert.equal(manager.activeCount(owner.runId), 0);
     assert.deepEqual(await manager.disposeRun(owner.runId), []);
   });
@@ -24,7 +24,7 @@ test('process lifecycle fault matrix preserves one settled terminal truth', asyn
     const { manager, root, ledgerDirectory } = await context();
     const heartbeat = path.join(root, 'heartbeat');
     const script = `const fs=require('node:fs');let n=0;fs.writeFileSync(${JSON.stringify(heartbeat)},String(++n));setInterval(()=>fs.writeFileSync(${JSON.stringify(heartbeat)},String(++n)),10)`;
-    let result = await manager.start(request('.', script, { onProgress(progress) { delivered.push(progress); } }));
+    let result = await startCommand(manager, request('.', script, { onProgress(progress) { delivered.push(progress); } }));
     assert.equal(result.status, 'running');
     await waitFor(() => access(heartbeat));
     const ledger = await readLedger(ledgerDirectory, result.processId);
@@ -52,7 +52,7 @@ test('process lifecycle fault matrix preserves one settled terminal truth', asyn
   ]) {
     await t.test(race.name + ' produce one stable outcome', async () => {
       const { manager, root } = await context();
-      let result = await manager.start(request('.', 'setTimeout(() => process.exit(0), 35)', { timeoutMs: race.timeoutMs }));
+      let result = await startCommand(manager, request('.', 'setTimeout(() => process.exit(0), 35)', { timeoutMs: race.timeoutMs }));
       if (race.stop) {
         const outcomes = await Promise.all([manager.terminate(result.processId, owner), manager.terminate(result.processId, owner)]);
         assert.deepEqual(outcomes[1], outcomes[0]);
@@ -72,7 +72,7 @@ test('process lifecycle fault matrix preserves one settled terminal truth', asyn
     const delivered = [];
     const { manager, root } = await context();
     const script = "let n=0;const timer=setInterval(()=>{process.stdout.write(String(n++)+'\\n');if(n===8){clearInterval(timer);process.exit(0)}},5)";
-    let result = await manager.start(request('.', script, { async onProgress(progress) { delivered.push(progress); await new Promise((resolve) => setTimeout(resolve, 2)); throw new Error('observer failed'); } }));
+    let result = await startCommand(manager, request('.', script, { async onProgress(progress) { delivered.push(progress); await new Promise((resolve) => setTimeout(resolve, 2)); throw new Error('observer failed'); } }));
     while (result.status === 'running') result = await manager.query(result.processId, 1_000, 20, result.cursorEnd, owner);
     const terminalCursor = result.cursorEnd;
     const deliveredAtTerminal = delivered.length;
@@ -126,6 +126,11 @@ test('terminal-state recovery rejects missing, malformed, stale, unauthenticated
 
 function request(workspacePath, source, overrides = {}) {
   return { command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(source)}`, workspacePath, pty: false, timeoutMs: 5_000, yieldMs: 1, outputTokenBudget: 1_000, owner, ...overrides };
+}
+async function startCommand(manager, input) {
+  const { onProgress, ...request } = input;
+  const prepared = await manager.prepare(request);
+  return manager.start(prepared, onProgress ? { onProgress } : {});
 }
 async function context() {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-process-faults-'));

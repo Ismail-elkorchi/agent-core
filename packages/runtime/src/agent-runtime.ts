@@ -353,7 +353,18 @@ export class AgentRuntime {
     }
     const call = phase.calls[phase.nextCallIndex];
     if (!call) throw new Error(`Approval ${input.approvalId} has no durable tool call.`);
-    const authorizationContext = this.toolContext(input.signal ?? new AbortController().signal);
+    const authorizationContext = Object.freeze({
+      ...this.toolContext(input.signal ?? new AbortController().signal),
+      invocation: Object.freeze({
+        runId: input.runId,
+        turnId: approval.turnId,
+        requestAttempt: approval.requestAttempt,
+        toolBatchId: approval.toolBatchId,
+        callIndex: approval.callIndex,
+        ...(approval.callId ? { callId: approval.callId } : {}),
+        toolAttempt: 1
+      })
+    });
     const current = await prepareToolCall(call, this.tools, authorizationContext);
     if (!current.ok) throw new Error(`Approved tool call is no longer valid: ${current.observation.summary}`);
     const validationFailure = current.prepared.toolImplementationId !== approval.binding.toolImplementationId
@@ -1318,7 +1329,17 @@ export class AgentRuntime {
     if (phase.effect.intent.recovery.kind === 'unknown') return false;
     const call = phase.calls[phase.nextCallIndex];
     if (!call) throw new Error(`Run ${operation.state().runId} has no tool call for effect ${phase.effect.intent.effectId}.`);
-    const context = this.toolContext(signal);
+    const context = Object.freeze({
+      ...this.toolContext(signal),
+      invocation: Object.freeze({
+        runId: operation.state().runId,
+        ...phase.identity,
+        toolBatchId: phase.toolBatchId,
+        callIndex: phase.nextCallIndex,
+        ...(call.id ? { callId: call.id } : {}),
+        toolAttempt: phase.toolAttempt
+      })
+    });
     const preparedResult = await prepareToolCall(call, this.tools, context);
     if (!preparedResult.ok) return false;
     const prepared = preparedResult.prepared;
@@ -1326,14 +1347,7 @@ export class AgentRuntime {
       if (prepared.toolImplementationId !== phase.preparation.toolImplementationId || prepared.fingerprint !== phase.preparation.fingerprint) return false;
       const recovery = await recoverPreparedToolCall(prepared, phase.effect, {
         ...context,
-        invocation: {
-          runId: operation.state().runId,
-          ...phase.identity,
-          toolBatchId: phase.toolBatchId,
-          callIndex: phase.nextCallIndex,
-          ...(call.id ? { callId: call.id } : {}),
-          toolAttempt: phase.toolAttempt
-        }
+        invocation: context.invocation
       });
       if (recovery.status === 'settled') {
         if (phase.effect.intent.recovery.kind === 'preconditioned_reexecution') {

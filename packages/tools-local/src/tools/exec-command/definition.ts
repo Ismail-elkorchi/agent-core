@@ -1,7 +1,10 @@
 import {
   defineTool,
   isCommandExecution,
+  prepareCommandExecution,
   requireToolService,
+  releasePreparedCommandExecution,
+  startPreparedCommandExecution,
   type CommandExecution,
   type CommandExecutionOwner
 } from '@agent-core/tools';
@@ -17,7 +20,7 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
   return defineTool({
     name: 'exec_command',
     implementationId: 'agent-core.exec-command.v1',
-    description: 'Start an ambient persistent shell command under the permissions of the Agent Core process. It can indirectly read, write, or delete files, access the network, and start child processes.',
+    description: 'Start a persistent command through the application-supplied command execution authority.',
     schema: execCommandSchema(ptySupported),
     outputSchema: execCommandOutputSchema,
     presentObservation: presentProcessObservation,
@@ -29,25 +32,46 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
       const directory = await root.openDirectory(workdir);
       await directory.close();
       const limits = requireLocalToolConfiguration(context).process;
-      return {
+      const executor = requireToolService<CommandExecution>(context, 'commandExecution', isCommandExecution, 'CommandExecution');
+      const owner = processOwner(context.invocation);
+      const request = Object.freeze({
         ...input, pty: 'pty' in input && input.pty === true, workdir,
         yieldMs: clampRequestedLimit(input.yieldMs, limits.maxYieldMs),
         timeoutMs: clampRequestedLimit(input.timeoutMs, limits.maxTimeoutMs),
-        outputTokenBudget: clampRequestedLimit(input.outputTokenBudget, limits.maxOutputTokens)
-      };
+        outputTokenBudget: clampRequestedLimit(input.outputTokenBudget, limits.maxOutputTokens),
+        owner
+      });
+      const preparation = await prepareCommandExecution(executor, {
+        command: request.command,
+        workspacePath: request.workdir,
+        pty: request.pty,
+        timeoutMs: request.timeoutMs,
+        yieldMs: request.yieldMs,
+        outputTokenBudget: request.outputTokenBudget,
+        owner
+      });
+      await context.preparation.own({ release: () => releasePreparedCommandExecution(executor, preparation) });
+      return Object.freeze({ ...request, executor, preparation });
+    },
+    snapshotInput(input) {
+      return Object.freeze({
+        command: input.command,
+        workdir: input.workdir,
+        pty: input.pty,
+        timeoutMs: input.timeoutMs,
+        yieldMs: input.yieldMs,
+        outputTokenBudget: input.outputTokenBudget,
+        execution: input.preparation.authorization
+      });
     },
     deriveEffects() {
       return { accesses: [{ mode: 'execute', scope: workspaceProcessScope() }], lockScopes: [workspaceFileScope()], recovery: { kind: 'unknown' } };
     },
     async invoke(input, context) {
-      const executor = requireToolService<CommandExecution>(context, 'commandExecution', isCommandExecution, 'CommandExecution');
-      const owner = processOwner(context.invocation);
-      await context.emitProgress?.({ type: 'status', stage: 'process_starting', message: 'Starting ambient process.' });
+      await context.emitProgress?.({ type: 'status', stage: 'process_starting', message: 'Starting command.' });
       let result;
       try {
-        result = await executor.start({
-          command: input.command, workspacePath: input.workdir, pty: input.pty,
-          timeoutMs: input.timeoutMs, yieldMs: input.yieldMs, outputTokenBudget: input.outputTokenBudget, owner,
+        result = await startPreparedCommandExecution(input.executor, input.preparation, {
           ...(context.signal ? { signal: context.signal } : {}), ...(context.resourceLease ? { lease: context.resourceLease } : {}),
           onProgress: (progress) => context.emitProgress?.(progress)
         });

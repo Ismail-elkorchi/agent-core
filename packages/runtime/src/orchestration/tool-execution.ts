@@ -200,10 +200,11 @@ async function prepareCurrent(input: Parameters<typeof executeAssistantToolCalls
   return undefined;
 }
 
-function preparationContext(input: Parameters<typeof executeAssistantToolCalls>[0], phase: AgentToolOperationPhase, call: ToolCall): ToolPreparationContext {
-  const identity = attemptIdentity(phase, call, 1);
+function preparationContext(input: Parameters<typeof executeAssistantToolCalls>[0], phase: AgentToolOperationPhase, call: ToolCall, toolAttempt = 1): ToolPreparationContext {
+  const identity = attemptIdentity(phase, call, toolAttempt);
   return Object.freeze({
     ...input.toolContext,
+    invocation: invocationIdentity(input.runId, phase, call, toolAttempt),
     emitProgress: (progress: ToolProgress) => input.emit({ type: 'tool.updated', ...identity, toolName: call.name, progress }),
     persistProgressCheckpoint: async (progress: ToolProgress) => {
       const event = { type: 'tool.updated' as const, ...identity, toolName: call.name, progress };
@@ -220,7 +221,7 @@ async function requireMatchingPreparation(
   retained: PreparedToolCall | undefined
 ): Promise<PreparedToolCall> {
   if (retained) return retained;
-  const result = await prepareToolCall(call, input.tools, input.toolContext);
+  const result = await prepareToolCall(call, input.tools, preparationContext(input, phase, call, phase.toolAttempt));
   if (!result.ok) throw new Error(`Prepared tool ${call.name} is no longer available: ${result.observation.summary}`);
   const prepared = result.prepared;
   if (prepared.toolImplementationId !== phase.preparation.toolImplementationId || prepared.fingerprint !== phase.preparation.fingerprint) {

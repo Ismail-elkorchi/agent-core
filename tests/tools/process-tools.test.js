@@ -23,6 +23,11 @@ const tools = [execCommandTool, writeStdinTool, stopProcessTool];
 const policy = { allowedRisks: ['read', 'execute'] };
 const invocation = { runId: 'process-test-run', turnId: 'turn-1', requestAttempt: 1, toolBatchId: 'batch-1', callIndex: 0, toolAttempt: 1 };
 
+async function startCommand(execution, request, options = {}) {
+  const prepared = await execution.prepare(request);
+  return execution.start(prepared, options);
+}
+
 async function processContext(options = {}, owner = invocation) {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-process-tools-'));
   const artifacts = new InMemoryArtifactRepository();
@@ -86,7 +91,7 @@ test('command execution keeps the admitted physical working directory across a p
       await symlink(outside, original, 'dir');
     }
   });
-  let result = await execution.start({
+  let result = await startCommand(execution, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("require('node:fs').writeFileSync('marker.txt', 'inside')")}`,
     workspacePath: 'work', pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner
   });
@@ -220,7 +225,7 @@ test('natural termination is reported once whether or not the process was polled
     const command = mode === 'stopped'
       ? `${JSON.stringify(process.execPath)} -e ${JSON.stringify('setInterval(()=>{},1000)')}`
       : `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('done')")}`;
-    let result = await manager.start({ command, workspacePath: '.', pty: false, timeoutMs: 60_000, yieldMs: mode === 'stopped' ? 20 : 1_000, outputTokenBudget: 1_000, owner });
+    let result = await startCommand(manager, { command, workspacePath: '.', pty: false, timeoutMs: 60_000, yieldMs: mode === 'stopped' ? 20 : 1_000, outputTokenBudget: 1_000, owner });
     if (mode === 'polled') {
       while (result.status === 'running') result = await manager.query(result.processId, 1_000, 100, result.cursorEnd, owner);
     } else if (mode === 'stopped') {
@@ -246,7 +251,7 @@ test('terminal tombstones release capture budgets before late acknowledgment', a
   const processIds = [];
   for (let index = 0; index < 4; index += 1) {
     const owner = { ...invocation, runId: `late-ack-${String(index)}` };
-    let result = await manager.start({
+    let result = await startCommand(manager, {
       command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('x'.repeat(800))")}`,
       workspacePath: '.', pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner
     });
@@ -276,7 +281,7 @@ test('ledger cleanup residue does not change a terminal result and is retried on
     ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process,
     async removeLedgerRecord() { throw new Error('simulated ledger deletion failure'); }
   });
-  let result = await manager.start({
+  let result = await startCommand(manager, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('done')")}`,
     workspacePath: '.', pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner
   });
@@ -298,7 +303,7 @@ test('public process redaction detects a secret split across output chunks', asy
   const owner = { ...invocation, runId: 'split-redaction-run' };
   const secret = 'split-secret-value';
   const script = `process.stdout.write('API_TO'); setTimeout(()=>process.stdout.write('KEN=${secret}'), 20)`;
-  let result = await manager.start({
+  let result = await startCommand(manager, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
     workspacePath: '.', pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner
   });
@@ -314,7 +319,7 @@ test('public process artifacts preserve output larger than the strict JSON strin
   const { root, artifacts, manager } = await processContext({ maxCapturedBytes: 5_000_000, maxTotalCapturedBytes: 5_000_000 });
   const owner = { ...invocation, runId: 'large-public-output-run' };
   const outputBytes = 4_300_000;
-  let result = await manager.start({
+  let result = await startCommand(manager, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`process.stdout.write('x'.repeat(${String(outputBytes)}))`)}`,
     workspacePath: '.', pty: false, timeoutMs: 10_000, yieldMs: 1_000, outputTokenBudget: 100, owner
   });
@@ -330,7 +335,7 @@ test('process output keeps raw protected bytes internal and exposes only a redac
   const { root, artifacts, manager } = await processContext();
   const owner = { ...invocation, runId: 'artifact-visibility-run' };
   const secret = 'super-secret-value';
-  let result = await manager.start({
+  let result = await startCommand(manager, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`process.stdout.write('API_TOKEN=${secret}')`)}`,
     workspacePath: '.', pty: false, timeoutMs: 60_000, yieldMs: 1_000, outputTokenBudget: 1_000, owner
   });
@@ -357,9 +362,10 @@ test('asynchronous process progress is ordered, bounded, and catches callback fa
   process.on('unhandledRejection', listener);
   try {
     const script = "let i=0; const t=setInterval(()=>{process.stdout.write('o'+i+'\\n'); process.stderr.write('e'+i+'\\n'); if(++i===50){clearInterval(t);}},1)";
-    let result = await manager.start({
+    let result = await startCommand(manager, {
       command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`, workspacePath: '.', pty: false, timeoutMs: 60_000, yieldMs: 20, outputTokenBudget: 1_000,
-      owner: { ...invocation, runId: 'progress-run' },
+      owner: { ...invocation, runId: 'progress-run' }
+    }, {
       async onProgress(progress) {
         await new Promise(resolve => setTimeout(resolve, 2));
         delivered.push(progress);
@@ -392,9 +398,10 @@ test('a terminal poll waits for accepted asynchronous progress delivery', async 
   const manager = new LocalCommandExecution({ artifactRepository: artifacts, workspaceFileRoot: testWorkspaceFileRoot(root), ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
   const delivered = [];
   const owner = { ...invocation, runId: 'terminal-progress-drain-run' };
-  let result = await manager.start({
+  let result = await startCommand(manager, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('done')")}`,
-    workspacePath: '.', pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner,
+    workspacePath: '.', pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner
+  }, {
     async onProgress(progress) {
       if (progress.type === 'status' && progress.stage === 'process_exited') await new Promise(resolve => setTimeout(resolve, 40));
       delivered.push(progress);
@@ -415,7 +422,7 @@ test('process ledger restores unreported terminal records across manager restart
   const artifacts = new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts') });
   const owner = { ...invocation, runId: 'restart-run' };
   const first = new LocalCommandExecution({ artifactRepository: artifacts, workspaceFileRoot: testWorkspaceFileRoot(root), ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
-  const started = await first.start({ command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('done')")}`, workspacePath: '.', pty: false, timeoutMs: 60_000, yieldMs: 1_000, outputTokenBudget: 1_000, owner });
+  const started = await startCommand(first, { command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('done')")}`, workspacePath: '.', pty: false, timeoutMs: 60_000, yieldMs: 1_000, outputTokenBudget: 1_000, owner });
   while ((await first.unreportedTerminalProcesses(owner.runId)).length === 0) await new Promise(resolve => setTimeout(resolve, 10));
   const second = new LocalCommandExecution({ artifactRepository: artifacts, workspaceFileRoot: testWorkspaceFileRoot(root), ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
   const reconciliation = await second.reconcile();
@@ -480,7 +487,7 @@ test('reconciliation never signals a PID without authenticated supervisor identi
   assert.equal(host.commandExecution.resourceLeases.activeCount(), 1);
   assert.equal(host.commandExecution.resourceLeases.wouldWait({ accesses: [{ mode: 'write', scope: 'workspace/files/a.txt' }], lockScopes: ['workspace/files/a.txt'], recovery: { kind: 'unknown' } }), true);
   assert.doesNotThrow(() => process.kill(process.pid, 0), 'the reused PID remains untouched');
-  await assert.rejects(host.commandExecution.start({
+  await assert.rejects(startCommand(host.commandExecution, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify('process.exit(0)')}`,
     workspacePath: '.', pty: false, timeoutMs: 1_000, yieldMs: 1, outputTokenBudget: 100,
     owner: { runId: 'new-run', turnId: 'turn', toolBatchId: 'batch', callIndex: 0 }

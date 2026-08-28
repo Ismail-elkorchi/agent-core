@@ -7,6 +7,7 @@ import type {
   CompiledToolDefinition,
   ToolResourceLease
 } from '@agent-core/tools';
+import { adoptCommandExecution } from '@agent-core/tools';
 import { parseLocalToolConfiguration, DEFAULT_LOCAL_TOOL_CONFIGURATION, type LocalToolConfiguration } from './core/configuration.js';
 import { LocalCommandExecution, type PtyProcessFactory } from './core/command-execution.js';
 import { WorkspaceFileSelector } from './core/workspace-file-selection.js';
@@ -27,6 +28,8 @@ export interface LocalToolHostOptions {
   readonly workspaceFileRoot: WorkspaceFileRoot;
   readonly artifactRepository: ArtifactRepository;
   readonly processLedgerDirectory?: string;
+  /** Application-supplied command authority. The host owns and closes it. */
+  readonly commandExecution?: CommandExecution;
   readonly patchJournal?: TextPatchJournal;
   readonly configuration?: LocalToolConfiguration;
   readonly enabledTools: readonly string[];
@@ -58,7 +61,12 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
   const enabledTools = ownEnabledTools(options.enabledTools);
   assertKnownTools(enabledTools);
   const processToolsEnabled = enabledTools.some((name) => name === 'exec_command' || name === 'write_stdin' || name === 'stop_process');
-  if (processToolsEnabled && options.processLedgerDirectory === undefined) throw new Error('Local process tools require processLedgerDirectory.');
+  if (options.processLedgerDirectory !== undefined && options.commandExecution !== undefined) {
+    throw new Error('Local tool host accepts either a process ledger or an application command authority, not both.');
+  }
+  if (processToolsEnabled && options.processLedgerDirectory === undefined && options.commandExecution === undefined) {
+    throw new Error('Local process tools require an application command authority or a local process ledger.');
+  }
   const configuration = options.configuration === undefined
     ? DEFAULT_LOCAL_TOOL_CONFIGURATION
     : parseLocalToolConfiguration(options.configuration);
@@ -74,15 +82,17 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
   }
   const adoptedRoot = workspaceFileRoot;
   const workspaceFileSelector = new WorkspaceFileSelector(adoptedRoot, configuration.fileSelection);
-  let commandExecution: LocalCommandExecution | undefined;
+  let commandExecution: CommandExecution | undefined;
   try {
-    commandExecution = options.processLedgerDirectory === undefined ? undefined : new LocalCommandExecution({
+    commandExecution = options.commandExecution === undefined
+      ? options.processLedgerDirectory === undefined ? undefined : new LocalCommandExecution({
         artifactRepository,
         workspaceFileRoot: adoptedRoot,
         ledgerDirectory: path.resolve(options.processLedgerDirectory),
         ...configuration.process,
         ...(options.ptyFactory ? { ptyFactory: options.ptyFactory } : {})
-      });
+      })
+      : adoptCommandExecution(options.commandExecution);
   } catch (error) {
     patchJournal?.close(); adoptedRoot.close(); throw error;
   }

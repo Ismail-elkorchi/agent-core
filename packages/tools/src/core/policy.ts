@@ -3,7 +3,7 @@ import { parseJsonObject, type JsonObject } from '@agent-core/json';
 
 export type ToolRisk = 'read' | 'write' | 'execute' | 'network' | 'destructive';
 
-/** `execute` authorizes ambient process execution unless a host explicitly documents isolation. Ambient execution may indirectly exercise every other operating-system authority. */
+/** `execute` admits application-supplied command authority. Its exact isolation and egress policy must be bound by the execution target. */
 
 export type ToolPolicy = Readonly<{ readonly allowedRisks: readonly ToolRisk[]; readonly dryRunWrites?: boolean }>;
 

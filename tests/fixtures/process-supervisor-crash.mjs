@@ -19,7 +19,7 @@ const manager = new LocalCommandExecution({
     process.exit(45);
   }
 });
-await manager.start({
+const prepared = await manager.prepare({
   command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'started'); setInterval(()=>{},1000)`)}`,
   workspacePath: '.',
   pty: false,
@@ -28,3 +28,4 @@ await manager.start({
   outputTokenBudget: 100,
   owner: { runId: `crash-${phase}`, turnId: 'turn', toolBatchId: 'batch', callIndex: 0 }
 });
+await manager.start(prepared);

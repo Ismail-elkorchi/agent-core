@@ -173,7 +173,8 @@ function commandExecutionWithCleanupFailure(commandExecution, message) {
 test('two runtimes sharing one manager clean only their own processes', async () => {
   const state = await setup();
   const ownerB = { runId: 'run-b', turnId: 'turn-b', toolBatchId: 'batch-b', callIndex: 0 };
-  const running = await state.manager.start({ command: longCommand, workspacePath: '.', pty: false, timeoutMs: 60_000, yieldMs: 100, outputTokenBudget: 1_000, owner: ownerB });
+  const prepared = await state.manager.prepare({ command: longCommand, workspacePath: '.', pty: false, timeoutMs: 60_000, yieldMs: 100, outputTokenBudget: 1_000, owner: ownerB });
+  const running = await state.manager.start(prepared);
   assert.equal(running.status, 'running');
   const agentA = createRuntime({ ...state, provider: new Provider([done]) });
   const result = await agentA.run({ runId: 'run-a', task: 'finish a' }).result;
