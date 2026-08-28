@@ -17,6 +17,13 @@ import { ownSessionSubmissionConfiguration } from './submission-lifecycle.js';
 
 export type AgentSessionConfiguration = SessionSubmissionConfiguration;
 
+export interface AgentSessionRuntimeContext {
+  readonly submissionId: string;
+  readonly runId: string;
+  readonly input: AgentRunInput;
+  readonly resuming: boolean;
+}
+
 export interface AgentSessionState {
   readonly sessionId: string;
   readonly phase: 'idle' | 'running' | 'waiting_for_user' | 'compacting';
@@ -50,7 +57,11 @@ export interface AgentSessionOptions {
   readonly repository: SessionRepository;
   readonly operations: AgentOperationCoordinator;
   readonly configuration: AgentSessionConfiguration;
-  readonly createRuntime: (configuration: AgentSessionConfiguration, onProgress: (event: AgentProgressEvent) => void | Promise<void>) => AgentRuntime;
+  readonly createRuntime: (
+    configuration: AgentSessionConfiguration,
+    onProgress: (event: AgentProgressEvent) => void | Promise<void>,
+    context: AgentSessionRuntimeContext
+  ) => AgentRuntime | Promise<AgentRuntime>;
   readonly summarizeConversation?: (request: AgentSessionCompactionRequest) => Promise<string>;
   readonly maximumQueuedInputs?: number;
 }
@@ -183,7 +194,7 @@ export class AgentSession {
       const configuration = suspended.configuration;
       await this.options.repository.transitionSubmission(this.options.descriptor.id, suspended.submissionId, { state: 'claimed' });
       try {
-        const runtime = this.options.createRuntime(configuration, (event) => this.emit({ type: 'run.progress', runId: input.runId, event }));
+        const runtime = await this.createRuntime(suspended.submissionId, input.runId, suspended.input, configuration, true);
         const control = await runtime.resolveApproval(input);
         const pending = pendingSubmission(suspended.submissionId, input.runId, suspended.input, configuration);
         this.suspended = undefined;
@@ -211,7 +222,7 @@ export class AgentSession {
       if (!suspended || (expectedRunId !== undefined && suspended.runId !== expectedRunId)) return false;
       await this.options.operations.requestAbort(suspended.runId, reason);
       await this.options.repository.transitionSubmission(this.options.descriptor.id, suspended.submissionId, { state: 'claimed' });
-      const runtime = this.options.createRuntime(suspended.configuration, (event) => this.emit({ type: 'run.progress', runId: suspended.runId, event }));
+      const runtime = await this.createRuntime(suspended.submissionId, suspended.runId, suspended.input, suspended.configuration, true);
       const control = runtime.resume(suspended.runId);
       const pending = pendingSubmission(suspended.submissionId, suspended.runId, suspended.input, suspended.configuration);
       this.suspended = undefined;
@@ -260,7 +271,7 @@ export class AgentSession {
     if (!pending.resumeExisting) await this.options.repository.transitionSubmission(this.options.descriptor.id, pending.id, { state: 'claimed' });
     try {
       const configuration = pending.configuration;
-      const runtime = this.options.createRuntime(configuration, (event) => this.emit({ type: 'run.progress', runId: pending.runId, event }));
+      const runtime = await this.createRuntime(pending.id, pending.runId, pending.input, configuration, pending.resumeExisting);
       const control = pending.resumeExisting ? runtime.resume(pending.runId) : runtime.run({ ...pending.input, runId: pending.runId });
       this.observe({ control, pending, configuration });
       return { kind: 'started', submissionId: pending.id, runId: control.runId, completion: pending.completion };
@@ -278,6 +289,20 @@ export class AgentSession {
         (error: unknown) => this.serial(() => this.fail(active, error))
       )
       .catch(() => undefined);
+  }
+
+  private createRuntime(
+    submissionId: string,
+    runId: string,
+    input: AgentRunInput,
+    configuration: AgentSessionConfiguration,
+    resuming: boolean
+  ): Promise<AgentRuntime> {
+    return Promise.resolve(this.options.createRuntime(
+      configuration,
+      (event) => this.emit({ type: 'run.progress', runId, event }),
+      Object.freeze({ submissionId, runId, input, resuming })
+    ));
   }
 
   private async settle(active: ActiveSubmission, result: AgentRunResult): Promise<void> {

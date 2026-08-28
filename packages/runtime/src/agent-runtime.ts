@@ -2176,10 +2176,16 @@ function sameCheckBindings(
   left: readonly { readonly id: string; readonly implementationId: string }[],
   right: readonly { readonly id: string; readonly implementationId: string }[]
 ): boolean {
-  return left.length === right.length && left.every((value, index) => {
-    const candidate = right[index];
-    return value.id === candidate?.id && value.implementationId === candidate?.implementationId;
-  });
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    const value = left.at(index);
+    const candidate = right.at(index);
+    if (value === undefined) return false;
+    if (candidate === undefined) return false;
+    if (value.id !== candidate.id
+      || value.implementationId !== candidate.implementationId) return false;
+  }
+  return true;
 }
 function sameResourcePreconditions(
   left: readonly import('@agent-core/effects').EffectResourcePrecondition[],

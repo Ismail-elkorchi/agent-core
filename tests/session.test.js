@@ -286,6 +286,7 @@ async function acceptApprovalOperation(operations, runId) {
 
 test('AgentSession serializes admission, preserves steering identity, and snapshots configuration at submission', async () => {
   const configurations = [];
+  const runtimeContexts = [];
   const controls = [];
   const repository = new InMemorySessionRepository();
   const descriptor = await repository.create({ id: 'session-authority' });
@@ -294,8 +295,9 @@ test('AgentSession serializes admission, preserves steering identity, and snapsh
     repository,
     operations: operationCoordinator(),
     configuration: { provider: 'test', model: 'first' },
-    createRuntime(configuration) {
+    createRuntime(configuration, _onProgress, context) {
       configurations.push(configuration);
+      runtimeContexts.push(context);
       if (configuration.model === 'broken') throw new Error('unsupported model');
       return {
         run(input) {
@@ -324,6 +326,10 @@ test('AgentSession serializes admission, preserves steering identity, and snapsh
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(configurations[0].model, 'first');
   assert.equal(configurations[1].model, 'second');
+  assert.equal(runtimeContexts[0].runId, first.runId);
+  assert.equal(runtimeContexts[0].submissionId, first.submissionId);
+  assert.equal(runtimeContexts[0].input.task, 'first');
+  assert.equal(runtimeContexts[0].resuming, false);
   controls[1].resolve({ state: 'ended', terminal: { runId: controls[1].runId }, deliveryDiagnostics: [] });
   await second.completion;
   assert.equal(session.state().phase, 'idle');
@@ -382,9 +388,9 @@ test('AgentSession restores claimed and queued work without starting execution d
   const failures = [];
   const recovered = new AgentSession({
     descriptor, repository, operations, configuration: { provider: 'test', model: 'different-model' },
-    createRuntime(configuration) {
+    createRuntime(configuration, _onProgress, context) {
       const execute = (input) => {
-        executed.push({ task: input.task, model: configuration.model });
+        executed.push({ task: input.task, model: configuration.model, resuming: context.resuming });
         return { runId: input.runId, result: Promise.resolve({ state: 'ended', terminal: { runId: input.runId }, deliveryDiagnostics: [] }), injectSteering() { throw new Error('unused'); }, abort() {} };
       };
       return { run: execute, resume(runId) { return execute({ runId, task: 'claimed' }); } };
@@ -394,7 +400,7 @@ test('AgentSession restores claimed and queued work without starting execution d
   await recovered.restore();
   assert.deepEqual(executed, []);
   await recovered.waitForIdle();
-  assert.deepEqual(executed, [{ task: 'claimed', model: 'model' }, { task: 'recover me', model: 'model' }]);
+  assert.deepEqual(executed, [{ task: 'claimed', model: 'model', resuming: true }, { task: 'recover me', model: 'model', resuming: false }]);
   assert.equal(failures.length, 0);
   assert.deepEqual(await repository.loadPendingSubmissions(descriptor.id), []);
 });

@@ -382,16 +382,15 @@ export function validateAgentCheckDefinitions(definitions: readonly AgentCheckDe
     else if (ids.has(id)) issues.push(`Duplicate check id: ${id}.`);
     else ids.add(id);
     if (!validIdentity(definition.implementationId)) issues.push(`Check ${label} implementationId must be a non-empty bounded identity.`);
-    decodeAgentCheckKind(definition.kind);
+    if (!isAgentCheckKind(definition.kind)) issues.push(`Check ${label} kind must be deterministic or effect.`);
     if (definition.timeoutMs !== undefined && !positiveInteger(definition.timeoutMs)) issues.push(`Check ${label} timeoutMs must be a positive finite integer.`);
   }
   if (issues.length > 0) throw new AgentContractError('Invalid check definitions.', issues);
   return Object.freeze([...output]);
 }
 
-function decodeAgentCheckKind(value: unknown): AgentCheckDefinition['kind'] {
-  if (value !== 'deterministic' && value !== 'effect') throw new AgentContractError('Invalid check definitions.', ['Check kind must be deterministic or effect.']);
-  return value;
+function isAgentCheckKind(value: unknown): value is AgentCheckDefinition['kind'] {
+  return value === 'deterministic' || value === 'effect';
 }
 
 export function deriveAgentVerificationStatus(
