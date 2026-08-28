@@ -1,4 +1,4 @@
-import type { EventRepository } from '@agent-core/evidence';
+import type { EventAppendReceipt, EventRepository } from '@agent-core/evidence';
 import {
   AgentContractError,
   createAgentTerminalSnapshot,
@@ -19,6 +19,7 @@ export class AgentRunFinalizer {
     readonly runId: string;
     readonly finalizationId: string;
     readonly events: EventRepository<AgentEvent>;
+    readonly append: (event: AgentEvent, idempotencyKey: string) => Promise<EventAppendReceipt>;
     readonly session?: { readonly repository: SessionRepository; readonly sessionId: string };
     readonly deliver?: (event: AgentProgressEvent) => void | Promise<void>;
     readonly deliveryDiagnostics?: AgentDeliveryDiagnostic[];
@@ -47,20 +48,18 @@ export class AgentRunFinalizer {
   ): Promise<AgentEndedRunResult> {
     const progress: MutableFinalizationProgress = { prepared: false, sessionProjected: false, committed: false };
     try {
-      await this.input.events.append(
-        this.input.runId,
+      await this.input.append(
         { type: 'finalization.prepared', terminal },
-        { idempotencyKey: `${this.input.finalizationId}:prepared` }
+        `${this.input.finalizationId}:prepared`
       );
       progress.prepared = true;
       if (this.input.session) {
         await this.input.session.repository.projectFinal(this.input.session.sessionId, terminal);
       }
       progress.sessionProjected = true;
-      await this.input.events.append(
-        this.input.runId,
+      await this.input.append(
         { type: 'run.ended', terminal, ...(diagnostic ? { diagnostic } : {}) },
-        { idempotencyKey: `${this.input.finalizationId}:committed` }
+        `${this.input.finalizationId}:committed`
       );
       progress.committed = true;
     } catch (error) {
@@ -83,10 +82,9 @@ export class AgentRunFinalizer {
         const base = { eventType: 'run.ended', message: errorMessage(error) };
         try {
           const diagnosticEvent: AgentDeliveryDiagnostic = { ...base, persisted: true };
-          await this.input.events.append(
-            this.input.runId,
+          await this.input.append(
             { type: 'delivery.failed', finalizationId: this.input.finalizationId, diagnostic: diagnosticEvent },
-            { idempotencyKey: `${this.input.finalizationId}:delivery:turn.ended` }
+            `${this.input.finalizationId}:delivery:turn.ended`
           );
           deliveryDiagnostics.push(diagnosticEvent);
         } catch {

@@ -35,6 +35,7 @@ import {
 import { decodeOwnedToolCall, decodeOwnedToolEffects, decodeOwnedToolObservationForPersistence, decodeOwnedToolPolicy, encodeToolObservation, type ToolCall, type ToolEffects, type ToolObservation, type ToolObservationPresentation, type ToolPolicy, type ToolProgress } from '@agent-core/tools';
 import type { BudgetAccountantSnapshot, RequestCostEstimate } from './orchestration/budget-accountant.js';
 import type { OverflowRecoveryResult } from './orchestration/overflow-recovery.js';
+import { decodeAgentOperationState, type AgentOperationState } from './operation/contracts.js';
 
 export interface AgentProviderStateSummary {
   readonly provider: string;
@@ -122,6 +123,7 @@ export interface AgentReplayPayload {
 }
 
 export type AgentEvent =
+  | { readonly type: 'operation.transition'; readonly state: AgentOperationState }
   | { readonly type: 'run.started'; readonly runId: string; readonly finalizationId: string; readonly task: string; readonly model: string; readonly toolPolicy: ToolPolicy; readonly metadata?: Readonly<Record<string, string>> }
   | { readonly type: 'run.phase.changed'; readonly runId: string; readonly phase: AgentRunPhase; readonly budget: AgentRunBudgetState }
   | { readonly type: 'run.configured'; readonly configuration: AgentRunConfiguration }
@@ -236,6 +238,10 @@ type AgentEventOf<Type extends AgentEvent['type']> = Extract<AgentEvent, { reado
 type AgentEventDecoderMap = { readonly [Type in AgentEvent['type']]: (value: JsonObject) => AgentEventOf<Type> };
 
 const AGENT_EVENT_DECODERS = {
+  'operation.transition': (value) => {
+    exact(value, ['type', 'state']);
+    return Object.freeze({ type: 'operation.transition', state: decodeAgentOperationState(requiredObject(value.state, 'state')) });
+  },
   'run.started': (value) => {
     exact(value, ['type', 'runId', 'finalizationId', 'task', 'model', 'toolPolicy', 'metadata']);
     const metadata = optionalStringRecord(value.metadata, 'metadata');

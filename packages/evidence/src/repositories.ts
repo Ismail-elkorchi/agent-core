@@ -192,6 +192,23 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     });
   }
 
+  latestOfType(runId: string, type: TEvent['type']): Promise<EventEnvelope<TEvent> | undefined> {
+    return this.enqueue(runId, async () => {
+      assertIdentifier(type, 'type');
+      let index: EventAppendIndex;
+      try { index = await this.refreshIndex(runId, false); }
+      catch (error) { if (nodeCode(error) === 'ENOENT') return undefined; throw error; }
+      const pointer = index.latestByType.get(type);
+      if (pointer === undefined) return undefined;
+      const encoded = await this.readIndexedEnvelope(runId, index, pointer);
+      if (encoded.event.type !== type) {
+        const actualType = typeof encoded.event.type === 'string' ? encoded.event.type : 'a non-string event type';
+        throw new PersistenceCorruptionError({ code: 'integrity', storage: this.filePath(runId), line: pointer.sequence + 2, byteOffset: pointer.byteOffset, message: `Event-type index for ${type} resolves to ${actualType}.` });
+      }
+      return domainEnvelope(encoded, this.codec.decode(encoded.event));
+    });
+  }
+
   async *read(runId: string): AsyncIterable<EventEnvelope<TEvent>> {
     let completeBytes: number;
     try { completeBytes = (await this.enqueue(runId, () => this.refreshIndex(runId, false))).completeBytes; }
@@ -300,6 +317,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       recordCount: 0,
       completeBytes: 0,
       boundaryMarker: '',
+      latestByType: new Map(),
       storageStamp
     };
     for await (const line of readJsonlLines(filePath, { endOffset: completeBytes })) {
@@ -314,6 +332,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       validateNextEnvelope(index.tail, envelope, index.recordCount, filePath, line);
       await this.writeIdempotencyEntry(runId, envelope);
       index.tail = tailRecord(envelope, line.byteOffset);
+      index.latestByType.set(eventType(envelope), index.tail);
       index.recordCount += 1;
       index.completeBytes = line.byteOffset + Buffer.byteLength(line.text, 'utf8') + 1;
     }
@@ -332,6 +351,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       validateNextEnvelope(index.tail, envelope, index.recordCount, filePath, line);
       await this.writeIdempotencyEntry(runId, envelope);
       index.tail = tailRecord(envelope, line.byteOffset);
+      index.latestByType.set(eventType(envelope), index.tail);
       index.recordCount += 1;
     }
   }
@@ -340,6 +360,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     const serializedBytes = Buffer.byteLength(`${canonicalJsonString(envelope)}\n`, 'utf8');
     await this.writeIdempotencyEntry(runId, envelope);
     index.tail = tailRecord(envelope, index.completeBytes);
+    index.latestByType.set(eventType(envelope), index.tail);
     index.recordCount += 1;
     index.completeBytes += serializedBytes;
     index.boundaryMarker = await jsonlBoundaryMarker(this.filePath(runId), index.completeBytes);
@@ -395,14 +416,32 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   }
 
   private async writeTailIndex(runId: string, index: EventAppendIndex): Promise<void> {
-    await atomicWritePrivateJson(this.tailIndexPath(runId), {
+    const content = {
       version: 1,
       runId,
       recordCount: index.recordCount,
       completeBytes: index.completeBytes,
       boundaryMarker: index.boundaryMarker,
+      latestByType: Object.fromEntries([...index.latestByType.entries()].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)),
       ...(index.tail === undefined ? {} : { tail: index.tail })
-    });
+    } as const;
+    await atomicWritePrivateJson(this.tailIndexPath(runId), { ...content, contentHash: hashJson(content) });
+  }
+
+  private async readIndexedEnvelope(runId: string, index: EventAppendIndex, pointer: EventTailRecord): Promise<EncodedEnvelope> {
+    let found: EncodedEnvelope | undefined;
+    for await (const line of readJsonlLines(this.filePath(runId), {
+      startOffset: pointer.byteOffset,
+      endOffset: index.completeBytes,
+      firstLine: pointer.sequence + 2
+    })) {
+      found = parseEnvelopeLine(line, this.filePath(runId), runId);
+      break;
+    }
+    if (found?.sequence !== pointer.sequence || found.hash !== pointer.hash) {
+      throw new PersistenceCorruptionError({ code: 'integrity', storage: this.filePath(runId), line: pointer.sequence + 2, byteOffset: pointer.byteOffset, message: 'Event index does not resolve to its ledger record.' });
+    }
+    return found;
   }
 
   private async idempotencyEntry(runId: string, key: string): Promise<IdempotencyIndexEntry | undefined> {
@@ -496,6 +535,7 @@ interface EventAppendIndex {
   recordCount: number;
   completeBytes: number;
   boundaryMarker: string;
+  latestByType: Map<string, EventTailRecord>;
   storageStamp: JsonlStorageStamp;
 }
 
@@ -577,39 +617,26 @@ function tailRecord(envelope: EncodedEnvelope, byteOffset: number): EventTailRec
 }
 
 function parseTailIndex(value: unknown, runId: string): EventAppendIndex {
-  const record = parseJsonObject(value, { maxDepth: 4, maxCollectionEntries: 32, maxStringBytes: 16_384, maxTotalBytes: 65_536 });
-  if (record.version !== 1 || record.runId !== runId || !nonnegativeInteger(record.recordCount)
+  const record = parseJsonObject(value, { maxDepth: 5, maxCollectionEntries: 1_024, maxStringBytes: 65_536, maxTotalBytes: 262_144 });
+  const allowed = new Set(['version', 'runId', 'recordCount', 'completeBytes', 'boundaryMarker', 'latestByType', 'tail', 'contentHash']);
+  const unsupported = Object.keys(record).filter((field) => !allowed.has(field));
+  const { contentHash, ...content } = record;
+  if (unsupported.length > 0 || typeof contentHash !== 'string' || contentHash !== hashJson(content)
+    || record.version !== 1 || record.runId !== runId || !nonnegativeInteger(record.recordCount)
     || !nonnegativeInteger(record.completeBytes) || typeof record.boundaryMarker !== 'string') {
     throw new TypeError('Event tail index fields are invalid.');
   }
   let tail: EventTailRecord | undefined;
   if (record.tail !== undefined) {
-    const candidate = parseJsonObject(record.tail, { maxDepth: 2, maxCollectionEntries: 20, maxStringBytes: 16_384, maxTotalBytes: 32_768 });
-    if (typeof candidate.eventId !== 'string' || !nonnegativeInteger(candidate.sequence)
-      || typeof candidate.timestamp !== 'string' || !isEventActor(candidate.actor)
-      || typeof candidate.hash !== 'string' || !nonnegativeInteger(candidate.driverGeneration) || !nonnegativeInteger(candidate.byteOffset)) {
-      throw new TypeError('Event tail index record is invalid.');
-    }
-    for (const field of ['causationId', 'correlationId', 'idempotencyKey', 'previousHash'] as const) {
-      if (candidate[field] !== undefined && typeof candidate[field] !== 'string') throw new TypeError(`Event tail ${field} is invalid.`);
-    }
-    const causationId = optionalString(candidate, 'causationId');
-    const correlationId = optionalString(candidate, 'correlationId');
-    const idempotencyKey = optionalString(candidate, 'idempotencyKey');
-    const previousHash = optionalString(candidate, 'previousHash');
-    tail = Object.freeze({
-      eventId: candidate.eventId,
-      sequence: candidate.sequence,
-      timestamp: candidate.timestamp,
-      actor: candidate.actor,
-      hash: candidate.hash,
-      driverGeneration: candidate.driverGeneration,
-      byteOffset: candidate.byteOffset,
-      ...(causationId === undefined ? {} : { causationId }),
-      ...(correlationId === undefined ? {} : { correlationId }),
-      ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
-      ...(previousHash === undefined ? {} : { previousHash })
-    });
+    tail = parseEventTailRecord(record.tail, 'Event tail index');
+  }
+  const latestByType = new Map<string, EventTailRecord>();
+  const encodedTypes = parseJsonObject(record.latestByType, { maxDepth: 3, maxCollectionEntries: 1_000, maxStringBytes: 65_536, maxTotalBytes: 196_608 });
+  for (const [type, encodedPointer] of Object.entries(encodedTypes)) {
+    assertIdentifier(type, 'event type');
+    const pointer = parseEventTailRecord(encodedPointer, `Event-type index ${type}`);
+    if (pointer.sequence >= record.recordCount) throw new TypeError(`Event-type index ${type} points beyond the ledger tail.`);
+    latestByType.set(type, pointer);
   }
   if (record.recordCount === 0) {
     if (tail !== undefined) throw new TypeError('Empty event tail index contains a tail.');
@@ -620,10 +647,46 @@ function parseTailIndex(value: unknown, runId: string): EventAppendIndex {
     recordCount: record.recordCount,
     completeBytes: record.completeBytes,
     boundaryMarker: record.boundaryMarker,
+    latestByType,
     storageStamp: Object.freeze({ size: 0, mtimeMs: 0, ctimeMs: 0 })
   };
   if (tail !== undefined) index.tail = tail;
   return index;
+}
+
+function parseEventTailRecord(value: unknown, label: string): EventTailRecord {
+  const candidate = parseJsonObject(value, { maxDepth: 2, maxCollectionEntries: 20, maxStringBytes: 16_384, maxTotalBytes: 32_768 });
+  if (typeof candidate.eventId !== 'string' || !nonnegativeInteger(candidate.sequence)
+    || typeof candidate.timestamp !== 'string' || !isEventActor(candidate.actor)
+    || typeof candidate.hash !== 'string' || !nonnegativeInteger(candidate.driverGeneration) || !nonnegativeInteger(candidate.byteOffset)) {
+    throw new TypeError(`${label} record is invalid.`);
+  }
+  for (const field of ['causationId', 'correlationId', 'idempotencyKey', 'previousHash'] as const) {
+    if (candidate[field] !== undefined && typeof candidate[field] !== 'string') throw new TypeError(`${label} ${field} is invalid.`);
+  }
+  const causationId = optionalString(candidate, 'causationId');
+  const correlationId = optionalString(candidate, 'correlationId');
+  const idempotencyKey = optionalString(candidate, 'idempotencyKey');
+  const previousHash = optionalString(candidate, 'previousHash');
+  return Object.freeze({
+    eventId: candidate.eventId,
+    sequence: candidate.sequence,
+    timestamp: candidate.timestamp,
+    actor: candidate.actor,
+    hash: candidate.hash,
+    driverGeneration: candidate.driverGeneration,
+    byteOffset: candidate.byteOffset,
+    ...(causationId === undefined ? {} : { causationId }),
+    ...(correlationId === undefined ? {} : { correlationId }),
+    ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+    ...(previousHash === undefined ? {} : { previousHash })
+  });
+}
+
+function eventType(envelope: EncodedEnvelope): string {
+  const type = envelope.event.type;
+  if (typeof type !== 'string') throw new TypeError('Encoded event type is invalid.');
+  return type;
 }
 
 function parseIdempotencyEntry(value: unknown, runId: string, key: string): IdempotencyIndexEntry {

@@ -47,6 +47,7 @@ export interface EventRepository<TEvent extends TypedEvent> {
   appendConditional(runId: string, event: TEvent, options: ConditionalEventAppendOptions): Promise<ConditionalEventAppendResult>;
   tail(runId: string): Promise<EventLedgerTail>;
   latest(runId: string): Promise<EventEnvelope<TEvent> | undefined>;
+  latestOfType(runId: string, type: TEvent['type']): Promise<EventEnvelope<TEvent> | undefined>;
   read(runId: string): AsyncIterable<EventEnvelope<TEvent>>;
   listRunIds(): Promise<readonly string[]>;
   verifyIntegrity(runId: string): Promise<LedgerIntegrityReport>;
@@ -73,6 +74,7 @@ export class PersistenceConflictError extends Error {
 
 export class InMemoryEventRepository<TEvent extends TypedEvent> implements EventRepository<TEvent> {
   private readonly records = new Map<string, EncodedEnvelope[]>();
+  private readonly latestByType = new Map<string, Map<string, EncodedEnvelope>>();
   private readonly decoded = new WeakMap<EncodedEnvelope, TEvent>();
   private queue: Promise<void> = Promise.resolve();
   constructor(private readonly codec: RuntimeCodec<TEvent>) {}
@@ -101,6 +103,7 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
       const encodedEnvelope: EncodedEnvelope = Object.freeze({ ...base, hash: hashJson(base) });
       records.push(encodedEnvelope);
       this.records.set(runId, records);
+      this.rememberType(runId, encodedEnvelope);
       return receiptFromEncoded(encodedEnvelope);
     });
     this.queue = operation.then(() => undefined, () => undefined);
@@ -141,6 +144,7 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
       const encodedEnvelope: EncodedEnvelope = Object.freeze({ ...base, hash: hashJson(base) });
       records.push(encodedEnvelope);
       this.records.set(runId, records);
+      this.rememberType(runId, encodedEnvelope);
       const tail = tailFromEncoded(encodedEnvelope);
       return Object.freeze({ kind: 'committed' as const, receipt: receiptFromEncoded(encodedEnvelope), tail });
     });
@@ -161,6 +165,17 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
     const operation = this.queue.then(() => {
       assertIdentifier(runId, 'runId');
       const encoded = this.records.get(runId)?.at(-1);
+      return encoded === undefined ? undefined : envelopeFromEncoded(encoded, this.domainEvent(encoded));
+    });
+    this.queue = operation.then(() => undefined, () => undefined);
+    return operation;
+  }
+
+  latestOfType(runId: string, type: TEvent['type']): Promise<EventEnvelope<TEvent> | undefined> {
+    const operation = this.queue.then(() => {
+      assertIdentifier(runId, 'runId');
+      assertIdentifier(type, 'type');
+      const encoded = this.latestByType.get(runId)?.get(type);
       return encoded === undefined ? undefined : envelopeFromEncoded(encoded, this.domainEvent(encoded));
     });
     this.queue = operation.then(() => undefined, () => undefined);
@@ -196,6 +211,14 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
     const event = this.codec.decode(record.event);
     this.decoded.set(record, event);
     return event;
+  }
+
+  private rememberType(runId: string, encoded: EncodedEnvelope): void {
+    const type = encoded.event.type;
+    if (typeof type !== 'string') throw new TypeError('Encoded event type is invalid.');
+    const index = this.latestByType.get(runId) ?? new Map<string, EncodedEnvelope>();
+    index.set(type, encoded);
+    this.latestByType.set(runId, index);
   }
 }
 

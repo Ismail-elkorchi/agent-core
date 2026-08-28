@@ -112,6 +112,8 @@ for (const [name, create] of [
     assert.equal(claimed.kind, 'committed');
     assert.equal(claimed.tail.driverGeneration, 1);
     assert.equal((await repository.latest('conditional')).event.type, 'operation.claimed');
+    assert.equal((await repository.latestOfType('conditional', 'operation.claimed')).event.type, 'operation.claimed');
+    assert.equal(await repository.latestOfType('conditional', 'missing'), undefined);
 
     const duplicate = await repository.appendConditional('conditional', { type: 'operation.claimed' }, {
       idempotencyKey: 'claim:1',
@@ -141,8 +143,31 @@ for (const [name, create] of [
       driverGeneration: 0
     });
     assert.deepEqual({ kind: staleDriver.kind, reason: staleDriver.reason }, { kind: 'rejected', reason: 'stale_driver' });
+
+    const transitioned = await repository.appendConditional('conditional', { type: 'operation.transition', revision: 1 }, {
+      idempotencyKey: 'transition:1',
+      expectedTail: claimed.tail,
+      driverGeneration: 1
+    });
+    assert.equal(transitioned.kind, 'committed');
+    assert.equal((await repository.latestOfType('conditional', 'operation.claimed')).sequence, claimed.receipt.sequence);
+    assert.equal((await repository.latestOfType('conditional', 'operation.transition')).event.revision, 1);
   });
 }
+
+test('JSONL latest event-type index survives reopening without a history scan', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'agent-events-type-index-'));
+  let repository = new JsonlEventRepository({ rootDir: dir, codec: typedEventCodec });
+  await repository.append('typed', { type: 'operation.transition', revision: 1 });
+  await repository.append('typed', { type: 'audit.sample', value: 1 });
+  await repository.append('typed', { type: 'operation.transition', revision: 2 });
+  await repository.append('typed', { type: 'audit.sample', value: 2 });
+
+  repository = new JsonlEventRepository({ rootDir: dir, codec: typedEventCodec });
+  const transition = await repository.latestOfType('typed', 'operation.transition');
+  assert.equal(transition.event.revision, 2);
+  assert.equal(repository.indexMetrics().fullScans, 0);
+});
 
 test('JSONL derived indexes rebuild without retaining the event history', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'agent-events-rebuild-index-'));

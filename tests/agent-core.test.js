@@ -914,7 +914,7 @@ test('finalization is idempotent, rejects conflicts, and recovers faults after e
   const sessions = new InMemorySessionRepository();
   const session = await sessions.create({});
   await sessions.appendInput(session.id, { runId: base.runId, task: 'finalize' });
-  const finalizer = new AgentRunFinalizer({ runId: base.runId, finalizationId: base.finalizationId, events, session: { repository: sessions, sessionId: session.id } });
+  const finalizer = new AgentRunFinalizer({ runId: base.runId, finalizationId: base.finalizationId, events, append: (event, idempotencyKey) => events.append(base.runId, event, { idempotencyKey }), session: { repository: sessions, sessionId: session.id } });
   const first = finalizer.finalize(base);
   assert.equal(first, finalizer.finalize(base));
   const result = ended(await first);  assert.equal(result.executionStatus, 'completed');
@@ -941,7 +941,7 @@ test('finalization is idempotent, rejects conflicts, and recovers faults after e
       projectFinal: async (sessionId, value) => { const projection = await durableSessions.projectFinal(sessionId, value); if (!thrown) { thrown = true; throw new Error('fault session'); } return projection; },
       loadReplayState: (sessionId, leafId) => durableSessions.loadReplayState(sessionId, leafId)
     } : durableSessions;
-    const broken = new AgentRunFinalizer({ runId: base.runId, finalizationId: base.finalizationId, events: faultEvents, session: { repository: faultSessions, sessionId: durableSession.id } });
+    const broken = new AgentRunFinalizer({ runId: base.runId, finalizationId: base.finalizationId, events: faultEvents, append: (event, idempotencyKey) => faultEvents.append(base.runId, event, { idempotencyKey }), session: { repository: faultSessions, sessionId: durableSession.id } });
     await assert.rejects(broken.finalize(base), error => {
       assert.equal(error instanceof AgentFinalizationError, true);
       assert.equal(error.progress.reconciliation, 'verified');
@@ -950,7 +950,7 @@ test('finalization is idempotent, rejects conflicts, and recovers faults after e
       assert.equal(error.progress.committed, point === 'committed');
       return true;
     });
-    const recovered = new AgentRunFinalizer({ runId: base.runId, finalizationId: base.finalizationId, events: durableEvents, session: { repository: durableSessions, sessionId: durableSession.id } });
+    const recovered = new AgentRunFinalizer({ runId: base.runId, finalizationId: base.finalizationId, events: durableEvents, append: (event, idempotencyKey) => durableEvents.append(base.runId, event, { idempotencyKey }), session: { repository: durableSessions, sessionId: durableSession.id } });
     await recovered.finalize(base);
     assert.deepEqual(await readCommittedTerminal(durableEvents, base.runId), base);
     assert.equal((await eventsFor(durableEvents, base.runId)).filter(event => event.type === 'run.ended').length, 1);

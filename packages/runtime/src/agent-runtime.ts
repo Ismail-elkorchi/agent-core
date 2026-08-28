@@ -369,6 +369,7 @@ export class AgentRuntime {
       runId,
       finalizationId,
       events: this.options.repositories.events,
+      append: (event, idempotencyKey) => this.options.repositories.events.append(runId, event, { idempotencyKey }),
       ...(this.options.repositories.session ? { session: this.options.repositories.session } : {}),
       ...(this.options.onProgress ? { deliver: this.options.onProgress } : {}),
       deliveryDiagnostics

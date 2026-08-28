@@ -2,6 +2,8 @@ export * from './agent-runtime.js';
 export * from './events.js';
 export * from './ports.js';
 export * from './run/contracts.js';
+export * from './operation/contracts.js';
+export * from './operation/driver.js';
 export * from './context/manager.js';
 export * from './context/prompt.js';
 export * from './session/repository.js';
