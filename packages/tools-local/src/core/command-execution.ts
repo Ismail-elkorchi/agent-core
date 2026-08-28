@@ -196,7 +196,7 @@ export class LocalCommandExecution implements CommandExecution {
 
   async start(preparation: CommandExecutionPreparation, options: StartPreparedCommandOptions = {}): Promise<CommandExecutionResult> {
     const owned = this.preparations.get(preparation);
-    if (!owned || owned.authority !== this) throw new TypeError('Command preparation does not belong to the local command authority.');
+    if (owned?.authority !== this) throw new TypeError('Command preparation does not belong to the local command authority.');
     const adopted = owned.start();
     try {
       return await this.startInDirectory(adopted.request, options, adopted.path);

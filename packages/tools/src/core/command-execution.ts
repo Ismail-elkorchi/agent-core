@@ -219,20 +219,18 @@ export function adoptCommandExecution(value: unknown): CommandExecution {
 
 function requirePreparedCommand(prepared: PreparedCommandExecution, authority: CommandExecution) {
   const record = preparedCommands.get(prepared);
-  if (!record || record.authority !== authority) throw new TypeError('Command preparation does not belong to this execution authority.');
+  if (record?.authority !== authority) throw new TypeError('Command preparation does not belong to this execution authority.');
   return record;
 }
 
 function validatePrepareRequest(request: PrepareCommandRequest): void {
-  if (typeof request !== 'object' || request === null) throw new TypeError('Command preparation request must be an object.');
   if (typeof request.command !== 'string' || request.command.length === 0) throw new TypeError('Command must be non-empty.');
   if (typeof request.workspacePath !== 'string') throw new TypeError('Command workspace path must be a string.');
   if (typeof request.pty !== 'boolean') throw new TypeError('Command PTY selection must be boolean.');
   for (const [name, value] of [['timeoutMs', request.timeoutMs], ['yieldMs', request.yieldMs], ['outputTokenBudget', request.outputTokenBudget]] as const) {
     if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${name} must be a non-negative safe integer.`);
   }
-  if (typeof request.owner !== 'object' || request.owner === null
-    || !validIdentity(request.owner.runId) || !validIdentity(request.owner.turnId)
+  if (!validIdentity(request.owner.runId) || !validIdentity(request.owner.turnId)
     || !validIdentity(request.owner.toolBatchId) || !Number.isSafeInteger(request.owner.callIndex) || request.owner.callIndex < 0) {
     throw new TypeError('Command execution owner is invalid.');
   }

@@ -67,7 +67,7 @@ test('scripted self-hosting run survives approvals, structured tools, verificati
         ? { decision: 'require_approval', reason: 'Confirm side effect.' }
         : { decision: 'allow' };
     },
-    checks: [{ id: 'workspace', implementationId: 'agent-core.test.check.v1', requirement: 'required', async run() {
+    checks: [{ id: 'workspace', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run() {
       return await readFile(path.join(root, 'note.txt'), 'utf8') === 'beta\n'
         ? { verdict: 'passed', summary: 'Workspace updated.' }
         : { verdict: 'failed', summary: 'Workspace mismatch.' };

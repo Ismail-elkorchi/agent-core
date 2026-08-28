@@ -10,6 +10,7 @@ import {
   AgentFinalizationError,
   AgentRunFinalizer,
   agentEventCodec,
+  createAgentPreparedCheckEffect,
   decodeAgentEvent,
   readCommittedTerminal
 } from '@agent-core/runtime';
@@ -362,7 +363,7 @@ test('stream interruption preserves an unknown provider outcome without treating
 
 test('abort during verification produces aborted/not_run and preserves a partial candidate', async () => {
   const controller = new AbortController();
-  const check = { id: 'wait', implementationId: 'agent-core.test.check.v1', requirement: 'required', async run({ signal }) {
+  const check = { id: 'wait', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run({ signal }) {
     setTimeout(() => controller.abort('stop verification'), 5);
     await new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
     return { verdict: 'passed', summary: 'impossible' };
@@ -377,7 +378,7 @@ test('abort during verification produces aborted/not_run and preserves a partial
 test('abort requested while delivering the final check cannot commit completed verification', async () => {
   const controller = new AbortController();
   const { agent, events } = await harness({
-    checks: [{ id: 'last', implementationId: 'agent-core.test.check.v1', requirement: 'required', async run() { return { verdict: 'passed', summary: 'valid before cancellation' }; } }],
+    checks: [{ id: 'last', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run() { return { verdict: 'passed', summary: 'valid before cancellation' }; } }],
     onProgress(event) { if (event.type === 'check.ended') controller.abort('cancel at final check delivery'); }
   });
   const result = ended(await agent.run({ task: 'cancel at verification boundary', signal: controller.signal }).result);  assert.equal(result.executionStatus, 'aborted');
@@ -407,7 +408,7 @@ test('abort at the finalization boundary wins before terminal preparation', asyn
 
 test('throwing check progress observer is a delivery diagnostic and cannot alter verification truth', async () => {
   const { agent, events } = await harness({
-    checks: [{ id: 'sound', implementationId: 'agent-core.test.check.v1', requirement: 'required', async run() { return { verdict: 'passed', summary: 'sound' }; } }],
+    checks: [{ id: 'sound', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run() { return { verdict: 'passed', summary: 'sound' }; } }],
     onProgress(event) { if (event.type === 'check.ended') throw new Error('check renderer broke'); }
   });
   const result = ended(await agent.run({ task: 'observer-independent verification' }).result);  assert.equal(result.executionStatus, 'completed');
@@ -421,8 +422,8 @@ test('throwing check progress observer is a delivery diagnostic and cannot alter
 
 test('check timeouts and malformed verdicts become unknown instead of passing', async () => {
   const checks = [
-    { id: 'timeout', implementationId: 'agent-core.test.check.v1', requirement: 'required', timeoutMs: 10, async run() { return new Promise(() => {}); } },
-    { id: 'bad', implementationId: 'agent-core.test.check.v1', requirement: 'advisory', async run() { return { verdict: 'excellent', summary: 'not legal' }; } }
+    { id: 'timeout', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', timeoutMs: 10, async run() { return new Promise(() => {}); } },
+    { id: 'bad', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'advisory', async run() { return { verdict: 'excellent', summary: 'not legal' }; } }
   ];
   const { agent } = await harness({ checks });
   const result = ended(await agent.run({ task: 'verify' }).result);  assert.equal(result.verificationStatus, 'inconclusive');
@@ -436,20 +437,20 @@ test('check timeouts and malformed verdicts become unknown instead of passing', 
 test('duplicate check IDs are rejected before model execution and missing required results are inconclusive', async () => {
   const provider = new ScriptedProvider([response()]);
   assert.throws(() => new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: new InMemoryEventRepository(agentEventCodec) }, checks: [
-    { id: 'same', implementationId: 'agent-core.test.check.v1', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } },
-    { id: 'same', implementationId: 'agent-core.test.check.v1', requirement: 'advisory', async run() { return { verdict: 'passed', summary: 'ok' }; } }
+    { id: 'same', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } },
+    { id: 'same', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'advisory', async run() { return { verdict: 'passed', summary: 'ok' }; } }
   ] }), /Duplicate check id/);
   assert.equal(provider.calls.length, 0);
   assert.throws(() => new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: new InMemoryEventRepository(agentEventCodec) }, checks: [
     { id: 'missing-identity', implementationId: '', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }
   ] }), /implementationId/);
-  assert.equal(deriveAgentVerificationStatus([{ id: 'missing', implementationId: 'agent-core.test.check.v1', requirement: 'required' }], []), 'inconclusive');
+  assert.equal(deriveAgentVerificationStatus([{ id: 'missing', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required' }], []), 'inconclusive');
 });
 
 test('cyclic and oversized check output is bounded without losing the candidate', async () => {
   const cyclic = { huge: 'x'.repeat(100_000), values: Array.from({ length: 500 }, (_, index) => index) };
   cyclic.self = cyclic;
-  const { agent } = await harness({ checks: [{ id: 'safe', implementationId: 'agent-core.test.check.v1', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok', output: cyclic }; } }] });
+  const { agent } = await harness({ checks: [{ id: 'safe', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok', output: cyclic }; } }] });
   const result = ended(await agent.run({ task: 'normalize' }).result);  assert.equal(result.candidate.message, 'done');
   assert.equal(result.verificationStatus, 'passed');
   assert.ok(result.checkResults[0].outputNormalization.length > 0);
@@ -466,7 +467,7 @@ test('application, run, and steering instructions reach checks with provenance',
     script: [response('tool_calls', '', { toolCalls: [{ id: '1', type: 'function', name: 'noop', input: { kind: 'json', value: {} } }] }), response()],
     tools: [noop],
     instructions: [{ id: 'standing', content: 'application rule' }],
-    checks: [{ id: 'context', implementationId: 'agent-core.test.check.v1', requirement: 'required', async run(context) { received = context.instructions; return { verdict: 'passed', summary: 'ok' }; } }],
+    checks: [{ id: 'context', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run(context) { received = context.instructions; return { verdict: 'passed', summary: 'ok' }; } }],
     onProgress(event) { if (event.type === 'assistant.started') runControl.injectSteering({ instruction: 'steering rule' }); }
   }));
   runControl = agent.run({ task: 'instructions', instructions: ['run rule'] });
@@ -477,7 +478,7 @@ test('application, run, and steering instructions reach checks with provenance',
 test('check artifacts and diagnostics agree across ledger, session projection, and replay state', async () => {
   const artifacts = new InMemoryArtifactRepository();
   const ref = await artifacts.store({ label: 'proof', content: new TextEncoder().encode('proof'), mediaType: 'text/plain' });
-  const { agent, events, sessions, session } = await harness({ artifacts, checks: [{ id: 'advice', implementationId: 'agent-core.test.check.v1', requirement: 'advisory', async run() { return { verdict: 'unknown', summary: 'unavailable', diagnostic: { kind: 'unavailable', message: 'offline' }, artifacts: [ref] }; } }] });
+  const { agent, events, sessions, session } = await harness({ artifacts, checks: [{ id: 'advice', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'advisory', async run() { return { verdict: 'unknown', summary: 'unavailable', diagnostic: { kind: 'unavailable', message: 'offline' }, artifacts: [ref] }; } }] });
   const result = ended(await agent.run({ task: 'persist checks' }).result);  const ledgerFinal = (await eventsFor(events, result.runId)).find((event) => event.type === 'run.ended').terminal;
   const replay = await sessions.loadReplayState(session.id);
   const projection = replay.terminalProjections[0].terminal;
@@ -633,6 +634,55 @@ test('a persisted provider settlement resumes without issuing a duplicate reques
   assert.equal(records.filter(event => event.type === 'assistant.ended').length, 1);
 });
 
+test('a durably started verifier effect is reconciled after process loss without replay', async () => {
+  class InterruptedVerificationRepository extends InMemoryEventRepository {
+    interrupt = true;
+    async appendConditional(runId, event, options) {
+      if (this.interrupt && event.type === 'operation.transition'
+        && event.state.phase.kind === 'verification' && event.state.phase.stage === 'settled') {
+        this.interrupt = false;
+        throw new Error('simulated process stop after verifier completion');
+      }
+      return super.appendConditional(runId, event, options);
+    }
+  }
+  const events = new InterruptedVerificationRepository(agentEventCodec);
+  const provider = new ScriptedProvider([response('stop', 'candidate')]);
+  let starts = 0;
+  const check = {
+    id: 'effect-check',
+    implementationId: 'agent-core.tests.effect-check@1',
+    kind: 'effect',
+    requirement: 'required',
+    async prepare() {
+      return createAgentPreparedCheckEffect({
+        authorization: { command: 'verify' },
+        recovery: { kind: 'queryable', service: 'test-verifier', reconcilerId: 'test-verifier@1', externalExecutionId: 'verification-1', expiresAt: '2099-01-01T00:00:00.000Z' },
+        async start() { starts += 1; return { verdict: 'passed', summary: 'verified' }; },
+        async reconcile() { return starts === 1 ? { status: 'settled', observation: { verdict: 'passed', summary: 'verified' } } : { status: 'unknown' }; },
+        async release() {}
+      });
+    }
+  };
+  const first = await harness({ events, provider, checks: [check], withoutSession: true });
+  const control = first.agent.run({ task: 'resume verifier effect' });
+  await assert.rejects(control.result, /simulated process stop|unresolved verifier effect/);
+  assert.equal(starts, 1);
+  const interrupted = await new AgentOperationCoordinator(events).inspect(control.runId);
+  assert.equal(interrupted.state.phase.kind, 'verification');
+  assert.equal(interrupted.state.phase.stage, 'effect_pending');
+
+  const resumed = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events }, checks: [check] });
+  const result = ended(await resumed.resume(control.runId).result);
+  assert.equal(result.executionStatus, 'completed');
+  assert.equal(result.verificationStatus, 'passed');
+  assert.equal(starts, 1);
+  assert.equal(provider.calls.length, 1);
+  const records = await eventsFor(events, control.runId);
+  assert.equal(records.filter(event => event.type === 'check.started').length, 1);
+  assert.equal(records.filter(event => event.type === 'check.ended').length, 1);
+});
+
 test('provider takeover never starts a second request while the previous owner may still be live', async () => {
   let releaseRequest;
   let reportStarted;
@@ -718,7 +768,7 @@ test('durable approval resumes after repository reopen and rejects changed polic
     assert.deepEqual(request.input, { path: 'state' });
     assert.deepEqual(request.effects.accesses, [{ mode: 'write', scope: 'workspace/state' }]);
     return { decision: 'require_approval', reason: 'confirm write' };
-  }, checks: [{ id: 'required', implementationId: 'agent-core.test.check.v1', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
+  }, checks: [{ id: 'required', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
   const suspended = await repositories.agent.run({ task: 'approval' }).result;
   assert.equal(suspended.state, 'suspended');
   assert.equal(effects, 0);
@@ -730,12 +780,12 @@ test('durable approval resumes after repository reopen and rejects changed polic
   assert.equal(preparationReleases, 1);
   assert.equal((await eventsFor(repositories.events, suspended.runId)).filter(event => event.type === 'approval.resolved').length, 0);
 
-  const changedTarget = new AgentRuntime({ provider, model: 'scripted', toolBoundary: { ...toolBoundary, executionTargetId: 'tests/other-target' }, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, checks: [{ id: 'required', implementationId: 'agent-core.test.check.v1', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
+  const changedTarget = new AgentRuntime({ provider, model: 'scripted', toolBoundary: { ...toolBoundary, executionTargetId: 'tests/other-target' }, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, checks: [{ id: 'required', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
   await assert.rejects(async () => (await changedTarget.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result, /boundary changed/);
   assert.equal(preparationReleases, 1);
 
   const replacement = adoptToolDefinition({ ...tool, implementationId: 'tests/canonical-effect@2' });
-  const changedImplementation = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [replacement], toolPolicy: { allowedRisks: ['read', 'write'] }, checks: [{ id: 'required', implementationId: 'agent-core.test.check.v1', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
+  const changedImplementation = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [replacement], toolPolicy: { allowedRisks: ['read', 'write'] }, checks: [{ id: 'required', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
   const unavailable = await (await changedImplementation.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result;
   assert.equal(unavailable.state, 'suspended');
   assert.equal(unavailable.reason, 'missing_implementation');
@@ -743,7 +793,7 @@ test('durable approval resumes after repository reopen and rejects changed polic
   assert.equal((await repositories.agent.inspectOperation(suspended.runId)).state.phase.kind, 'approval');
   assert.deepEqual(approval.binding, { toolImplementationId: tool.implementationId, ...toolBoundary });
 
-  const reopened = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, checks: [{ id: 'required', implementationId: 'agent-core.test.check.v1', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
+  const reopened = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, checks: [{ id: 'required', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
   const result = ended(await (await reopened.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result);  assert.equal(result.executionStatus, 'completed');
   assert.equal(result.verificationStatus, 'passed');
   assert.equal(effects, 1);

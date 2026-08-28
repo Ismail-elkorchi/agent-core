@@ -5,6 +5,7 @@ import {
   type AgentCheckContext,
   type AgentCheckDefinition,
   type AgentCheckDiagnostic,
+  type AgentCheckObservation,
   type AgentCheckResult,
   type AgentEffectiveInstruction,
   type AgentEvidenceReader,
@@ -57,12 +58,12 @@ export async function runAgentChecks(input: {
   const execution = input.execution ?? { evidence: EMPTY_EVIDENCE_READER };
   const results: AgentCheckResult[] = [];
   for (const check of input.checks) {
+    if (check.kind !== 'deterministic') throw new TypeError(`Effectful check ${check.id} requires the durable verification driver.`);
     throwIfVerificationAborted(input.signal);
     const timeoutMs = check.timeoutMs ?? input.defaultTimeoutMs ?? 30_000;
     const identity: AgentTurnIdentity = { turnIndex: input.turnIndex, turnId: input.turnId, requestAttempt: input.requestAttempt };
     await input.append({ type: 'check.started', ...identity, check: check.id, implementationId: check.implementationId, requirement: check.requirement, timeoutMs });
-    const startedAt = performance.now();
-    const result = await executeOneCheck({
+    const result = await executeAgentCheckAction({
       check,
       timeoutMs,
       parentSignal: input.signal,
@@ -75,12 +76,12 @@ export async function runAgentChecks(input: {
         metadata,
         signal: input.signal,
         execution
-      }
+      },
+      action: (context) => check.run(context)
     });
-    const withDuration = parseAgentCheckResult(result, Math.max(0, performance.now() - startedAt));
-    results.push(withDuration);
-    await input.append({ type: 'check.ended', ...identity, check: check.id, result: withDuration });
-    await input.emit({ type: 'check.ended', ...identity, result: withDuration });
+    results.push(result);
+    await input.append({ type: 'check.ended', ...identity, check: check.id, result });
+    await input.emit({ type: 'check.ended', ...identity, result });
     // Observers are delivery-only, but they may request cancellation. Do not let a
     // cancellation delivered with the last check race past the verification commit.
     throwIfVerificationAborted(input.signal);
@@ -89,12 +90,13 @@ export async function runAgentChecks(input: {
   return Object.freeze(results);
 }
 
-async function executeOneCheck(input: {
+export async function executeAgentCheckAction(input: {
   readonly check: AgentCheckDefinition;
   readonly timeoutMs: number;
   readonly parentSignal: AbortSignal;
   readonly context: AgentCheckContext;
-}): Promise<Omit<AgentCheckResult, 'durationMs'>> {
+  readonly action: (context: AgentCheckContext) => Promise<AgentCheckObservation>;
+}): Promise<AgentCheckResult> {
   const controller = new AbortController();
   const forwardAbort = () => { controller.abort(input.parentSignal.reason); };
   if (input.parentSignal.aborted) forwardAbort();
@@ -106,27 +108,28 @@ async function executeOneCheck(input: {
       reject(new CheckTimeoutError(input.timeoutMs));
     }, input.timeoutMs);
   });
+  const startedAt = performance.now();
   try {
     const observation = await Promise.race([
-      Promise.resolve().then(() => input.check.run({ ...input.context, signal: controller.signal })),
+      Promise.resolve().then(() => input.action({ ...input.context, signal: controller.signal })),
       timeoutPromise
     ]);
     throwIfVerificationAborted(input.parentSignal);
-    return normalizeObservation(input.check, observation);
+    return parseAgentCheckResult(normalizeObservation(input.check, observation), Math.max(0, performance.now() - startedAt));
   } catch (error) {
     throwIfVerificationAborted(input.parentSignal);
     const details = safeDetails(error);
     const diagnostic: AgentCheckDiagnostic = error instanceof CheckTimeoutError
       ? { kind: 'timeout', message: error.message }
       : { kind: diagnosticKind(error), message: errorMessage(error), ...(details === undefined ? {} : { details }) };
-    return {
+    return parseAgentCheckResult({
       id: input.check.id,
       implementationId: input.check.implementationId,
       requirement: input.check.requirement,
       verdict: 'unknown',
       summary: diagnostic.message,
       diagnostic
-    };
+    }, Math.max(0, performance.now() - startedAt));
   } finally {
     if (timeout !== undefined) clearTimeout(timeout);
     input.parentSignal.removeEventListener('abort', forwardAbort);

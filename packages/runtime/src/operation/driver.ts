@@ -435,8 +435,9 @@ function advanceMatchesProcedure(procedure: Extract<AgentOperationInstruction, {
     case 'consume_tool_settlement': return (phase.kind === 'tools' && phase.stage === 'projecting') || phase.kind === 'finalization';
     case 'project_tool_settlement': return phase.kind === 'tools' && (phase.stage === 'ready' || phase.stage === 'complete');
     case 'advance_after_tools': return phase.kind === 'preparing' || phase.kind === 'verification' || phase.kind === 'disposition' || phase.kind === 'finalization';
-    case 'prepare_verification': return phase.kind === 'verification' && (phase.stage === 'effect_pending' || phase.stage === 'complete');
-    case 'reconcile_verification': return (phase.kind === 'verification' && phase.stage === 'settled') || phase.kind === 'suspended';
+    case 'prepare_verification': return phase.kind === 'verification' && (phase.stage === 'deterministic_pending' || phase.stage === 'effect_ready' || phase.stage === 'settled' || phase.stage === 'complete');
+    case 'start_verification': return (phase.kind === 'verification' && phase.stage === 'effect_pending') || phase.kind === 'finalization';
+    case 'reconcile_verification': return (phase.kind === 'verification' && phase.stage === 'settled') || phase.kind === 'suspended' || phase.kind === 'finalization';
     case 'consume_verification_settlement': return phase.kind === 'verification' || phase.kind === 'disposition' || phase.kind === 'finalization';
     case 'decide_candidate': return phase.kind === 'disposition' || phase.kind === 'finalization';
     case 'finalize':

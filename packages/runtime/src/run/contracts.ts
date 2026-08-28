@@ -1,8 +1,9 @@
 import type { ArtifactRef } from '@agent-core/evidence';
 import { canonicalJsonString } from '@agent-core/evidence';
-import { parseJsonObject, type JsonNormalizationDiagnostic, type JsonObject, type JsonValue } from '@agent-core/json';
+import { parseJsonObject, parseJsonValue, type JsonNormalizationDiagnostic, type JsonObject, type JsonValue } from '@agent-core/json';
 import type { ModelReasoningRequest, ModelRequest, ModelResponseFormat, ModelTerminationReason } from '@agent-core/model';
 import type { ToolEffects } from '@agent-core/tools';
+import { decodeEffectRecoveryCapability, type EffectRecoveryCapability } from '@agent-core/effects';
 
 export type AgentCandidateStatus = 'complete' | 'partial' | 'indeterminate' | 'absent';
 export type AgentCandidateSource = 'content' | 'reasoning_summary' | 'stream_recovery';
@@ -131,16 +132,8 @@ export interface AgentEvidenceReader {
   read(input?: { readonly cursor?: string; readonly limit?: number; readonly maxBytes?: number }): Promise<AgentEvidencePage>;
   readArtifact(ref: ArtifactRef, input?: { readonly maxBytes?: number }): Promise<Uint8Array>;
 }
-export interface AgentVerificationCommandRequest {
-  readonly command: string;
-  readonly owner: { readonly runId: string; readonly turnId: string; readonly toolBatchId: string; readonly callIndex: number };
-  readonly timeoutMs?: number;
-  readonly maxOutputBytes?: number;
-}
-export interface AgentVerificationCommandResult { readonly exitCode: number | null; readonly stdout: string; readonly stderr: string; readonly durationMs: number }
 export interface AgentVerificationExecutionContext {
   readonly evidence: AgentEvidenceReader;
-  readonly runCommand?: (request: AgentVerificationCommandRequest, signal: AbortSignal) => Promise<AgentVerificationCommandResult>;
 }
 export interface AgentCheckContext {
   readonly runId: string;
@@ -154,14 +147,63 @@ export interface AgentCheckContext {
   readonly signal: AbortSignal;
   readonly execution: AgentVerificationExecutionContext;
 }
-export interface AgentCheckDefinition {
+interface AgentCheckDefinitionBase {
   readonly id: string;
   /** Stable identity for the admitted verifier implementation and semantics. */
   readonly implementationId: string;
   readonly requirement: AgentCheckRequirement;
   readonly description?: string;
   readonly timeoutMs?: number;
+}
+export interface AgentDeterministicCheckDefinition extends AgentCheckDefinitionBase {
+  readonly kind: 'deterministic';
   run(context: AgentCheckContext): Promise<AgentCheckObservation>;
+}
+export interface AgentEffectCheckDefinition extends AgentCheckDefinitionBase {
+  readonly kind: 'effect';
+  prepare(context: AgentCheckContext): Promise<AgentCheckObservation | AgentPreparedCheckEffect>;
+}
+export type AgentCheckDefinition = AgentDeterministicCheckDefinition | AgentEffectCheckDefinition;
+
+export type AgentCheckEffectReconciliation =
+  | Readonly<{ readonly status: 'settled'; readonly observation: AgentCheckObservation }>
+  | Readonly<{ readonly status: 'running' | 'unknown' | 'expired' }>;
+
+export interface AgentPreparedCheckEffect {
+  readonly authorization: JsonValue;
+  readonly recovery: EffectRecoveryCapability;
+  start(signal: AbortSignal): Promise<AgentCheckObservation>;
+  reconcile(signal: AbortSignal): Promise<AgentCheckEffectReconciliation>;
+  release(): Promise<void>;
+}
+
+export interface AgentPreparedCheckEffectInput {
+  readonly authorization: JsonValue;
+  readonly recovery: EffectRecoveryCapability;
+  readonly start: (signal: AbortSignal) => Promise<AgentCheckObservation>;
+  readonly reconcile: (signal: AbortSignal) => Promise<AgentCheckEffectReconciliation>;
+  readonly release: () => Promise<void>;
+}
+
+const PREPARED_CHECK_EFFECTS = new WeakSet();
+
+export function createAgentPreparedCheckEffect(input: AgentPreparedCheckEffectInput): AgentPreparedCheckEffect {
+  if (typeof input.start !== 'function' || typeof input.reconcile !== 'function' || typeof input.release !== 'function') {
+    throw new TypeError('Prepared check effect requires start, reconcile, and release operations.');
+  }
+  const prepared = Object.freeze({
+    authorization: parseJsonValue(input.authorization),
+    recovery: decodeEffectRecoveryCapability(input.recovery),
+    start: input.start,
+    reconcile: input.reconcile,
+    release: input.release
+  });
+  PREPARED_CHECK_EFFECTS.add(prepared);
+  return prepared;
+}
+
+export function isAgentPreparedCheckEffect(value: unknown): value is AgentPreparedCheckEffect {
+  return typeof value === 'object' && value !== null && PREPARED_CHECK_EFFECTS.has(value);
 }
 
 export type AgentLimitKind =
@@ -340,10 +382,16 @@ export function validateAgentCheckDefinitions(definitions: readonly AgentCheckDe
     else if (ids.has(id)) issues.push(`Duplicate check id: ${id}.`);
     else ids.add(id);
     if (!validIdentity(definition.implementationId)) issues.push(`Check ${label} implementationId must be a non-empty bounded identity.`);
+    decodeAgentCheckKind(definition.kind);
     if (definition.timeoutMs !== undefined && !positiveInteger(definition.timeoutMs)) issues.push(`Check ${label} timeoutMs must be a positive finite integer.`);
   }
   if (issues.length > 0) throw new AgentContractError('Invalid check definitions.', issues);
   return Object.freeze([...output]);
+}
+
+function decodeAgentCheckKind(value: unknown): AgentCheckDefinition['kind'] {
+  if (value !== 'deterministic' && value !== 'effect') throw new AgentContractError('Invalid check definitions.', ['Check kind must be deterministic or effect.']);
+  return value;
 }
 
 export function deriveAgentVerificationStatus(

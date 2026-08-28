@@ -1,6 +1,6 @@
-import { parseJsonObject, type JsonObject } from '@agent-core/json';
-import { decodeEffectExecutionState, type EffectExecutionState } from '@agent-core/effects';
-import type { AgentRunBudgetState, AgentTurnIdentity } from '../run/contracts.js';
+import { parseJsonObject, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
+import { decodeEffectExecutionState, decodeEffectRecoveryCapability, type EffectExecutionState } from '@agent-core/effects';
+import { decodeOwnedAgentCheckResult, type AgentCheckResult, type AgentRunBudgetState, type AgentTurnIdentity } from '../run/contracts.js';
 import { decodeContextItemInput, type ContextItemInput } from '../context/manager.js';
 import { decodeToolCall, type ToolCall } from '@agent-core/tools';
 import { decodeToolOperationPhase, type AgentApprovalOperationPhase, type AgentToolOperationPhase } from './tool-state.js';
@@ -21,6 +21,21 @@ export interface AgentOperationConfiguration {
   readonly toolImplementationIds: readonly string[];
   readonly checks: readonly { readonly id: string; readonly implementationId: string }[];
   readonly policyHash: string;
+}
+
+export interface AgentCheckPreparationRecord {
+  readonly checkImplementationId: string;
+  readonly fingerprint: string;
+  readonly authorization: JsonValue;
+  readonly recovery: import('@agent-core/effects').EffectRecoveryCapability;
+}
+
+interface AgentVerificationPhaseBase {
+  readonly kind: 'verification';
+  readonly identity: AgentTurnIdentity;
+  readonly providerSettlementEventId: string;
+  readonly checkIds: readonly string[];
+  readonly nextCheckIndex: number;
 }
 
 export type AgentOperationControl =
@@ -47,14 +62,12 @@ export type AgentOperationPhase =
   | AgentProviderOperationPhase
   | AgentToolOperationPhase
   | AgentApprovalOperationPhase
-  | Readonly<{
-      readonly kind: 'verification';
-      readonly stage: 'ready' | 'effect_pending' | 'settled' | 'complete';
-      readonly checkIds: readonly string[];
-      readonly nextCheckIndex: number;
-      readonly effectId?: string;
-      readonly resultEventId?: string;
-    }>
+  | Readonly<AgentVerificationPhaseBase & { readonly stage: 'ready' }>
+  | Readonly<AgentVerificationPhaseBase & { readonly stage: 'deterministic_pending' }>
+  | Readonly<AgentVerificationPhaseBase & { readonly stage: 'effect_ready'; readonly preparation: AgentCheckPreparationRecord; readonly effect: Extract<EffectExecutionState, { readonly phase: 'ticket_issued' }> }>
+  | Readonly<AgentVerificationPhaseBase & { readonly stage: 'effect_pending'; readonly preparation: AgentCheckPreparationRecord; readonly effect: Extract<EffectExecutionState, { readonly phase: 'started' }> }>
+  | Readonly<AgentVerificationPhaseBase & { readonly stage: 'settled'; readonly result: AgentCheckResult; readonly effect?: Extract<EffectExecutionState, { readonly phase: 'settled' | 'closed' }> }>
+  | Readonly<AgentVerificationPhaseBase & { readonly stage: 'complete' }>
   | Readonly<{
       readonly kind: 'disposition';
       readonly stage: 'ready' | 'decided';
@@ -102,6 +115,7 @@ export type AgentOperationProcedure =
   | 'project_tool_settlement'
   | 'advance_after_tools'
   | 'prepare_verification'
+  | 'start_verification'
   | 'reconcile_verification'
   | 'consume_verification_settlement'
   | 'decide_candidate'
@@ -137,7 +151,9 @@ export function nextAgentOperationInstruction(state: AgentOperationState): Agent
     case 'approval': return Object.freeze({ kind: 'wait', reason: 'approval' });
     case 'verification':
       if (state.phase.stage === 'ready') return Object.freeze({ kind: 'execute', procedure: 'prepare_verification' });
+      if (state.phase.stage === 'effect_ready') return Object.freeze({ kind: 'execute', procedure: 'start_verification' });
       if (state.phase.stage === 'effect_pending') return Object.freeze({ kind: 'execute', procedure: 'reconcile_verification' });
+      if (state.phase.stage === 'deterministic_pending') return Object.freeze({ kind: 'execute', procedure: 'reconcile_verification' });
       return Object.freeze({ kind: 'execute', procedure: 'consume_verification_settlement' });
     case 'disposition': return Object.freeze({ kind: 'execute', procedure: 'decide_candidate' });
     case 'finalization': return Object.freeze({ kind: 'execute', procedure: state.phase.stage === 'ready' ? 'finalize' : 'reconcile_finalization' });
@@ -209,6 +225,17 @@ function checkBindings(value: unknown): readonly { readonly id: string; readonly
   }));
 }
 
+function decodeCheckPreparation(value: unknown): AgentCheckPreparationRecord {
+  const preparation = object(value, 'verification preparation');
+  exact(preparation, ['checkImplementationId', 'fingerprint', 'authorization', 'recovery']);
+  return Object.freeze({
+    checkImplementationId: identifier(preparation.checkImplementationId, 'verification preparation checkImplementationId'),
+    fingerprint: digest(preparation.fingerprint, 'verification preparation fingerprint'),
+    authorization: parseJsonValue(preparation.authorization),
+    recovery: decodeEffectRecoveryCapability(preparation.recovery)
+  });
+}
+
 function decodeControl(value: unknown): AgentOperationControl {
   const control = object(value, 'operation control');
   const status = enumeration(control.status, ['detached', 'owned', 'abort_requested'] as const, 'control.status');
@@ -265,13 +292,39 @@ function decodePhase(value: unknown): AgentOperationPhase {
     case 'tools':
     case 'approval': return decodeToolOperationPhase(phase);
     case 'verification': {
-      exact(phase, ['kind', 'stage', 'checkIds', 'nextCheckIndex', 'effectId', 'resultEventId']);
+      exact(phase, ['kind', 'stage', 'identity', 'providerSettlementEventId', 'checkIds', 'nextCheckIndex', 'preparation', 'effect', 'result']);
+      const identity = decodeTurnIdentity(phase.identity);
+      const providerSettlementEventId = identifier(phase.providerSettlementEventId, 'phase.providerSettlementEventId');
       const checkIds = uniqueIdentifiers(phase.checkIds, 'phase.checkIds');
       const nextCheckIndex = nonnegativeInteger(phase.nextCheckIndex, 'phase.nextCheckIndex');
       if (nextCheckIndex > checkIds.length) throw new TypeError('phase.nextCheckIndex exceeds phase.checkIds length.');
-      const effectId = optionalIdentifier(phase.effectId, 'phase.effectId');
-      const resultEventId = optionalIdentifier(phase.resultEventId, 'phase.resultEventId');
-      return Object.freeze({ kind, stage: enumeration(phase.stage, ['ready', 'effect_pending', 'settled', 'complete'] as const, 'phase.stage'), checkIds, nextCheckIndex, ...(effectId ? { effectId } : {}), ...(resultEventId ? { resultEventId } : {}) });
+      const stage = enumeration(phase.stage, ['ready', 'deterministic_pending', 'effect_ready', 'effect_pending', 'settled', 'complete'] as const, 'phase.stage');
+      const base = { kind, identity, providerSettlementEventId, checkIds, nextCheckIndex } as const;
+      if (stage === 'complete') {
+        if (nextCheckIndex !== checkIds.length) throw new TypeError('Complete verification must consume every check.');
+        return Object.freeze({ ...base, stage });
+      }
+      if (nextCheckIndex >= checkIds.length) throw new TypeError(`Verification ${stage} requires a current check.`);
+      if (stage === 'ready' || stage === 'deterministic_pending') return Object.freeze({ ...base, stage });
+      if (stage === 'effect_ready') {
+        const preparation = decodeCheckPreparation(phase.preparation);
+        const effect = decodeEffectExecutionState(phase.effect);
+        if (effect.phase !== 'ticket_issued') throw new TypeError('Verification effect_ready has an invalid effect state.');
+        if (effect.intent.implementationId !== preparation.checkImplementationId || effect.intent.parametersDigest !== preparation.fingerprint) throw new TypeError('Verification effect does not match its preparation.');
+        return Object.freeze({ ...base, stage, preparation, effect });
+      }
+      if (stage === 'effect_pending') {
+        const preparation = decodeCheckPreparation(phase.preparation);
+        const effect = decodeEffectExecutionState(phase.effect);
+        if (effect.phase !== 'started') throw new TypeError('Verification effect_pending has an invalid effect state.');
+        if (effect.intent.implementationId !== preparation.checkImplementationId || effect.intent.parametersDigest !== preparation.fingerprint) throw new TypeError('Verification effect does not match its preparation.');
+        return Object.freeze({ ...base, stage, preparation, effect });
+      }
+      const result = decodeOwnedAgentCheckResult(object(phase.result, 'phase.result'));
+      if (result.id !== checkIds[nextCheckIndex]) throw new TypeError('Settled verification result does not match the current check.');
+      const effect = phase.effect === undefined ? undefined : decodeEffectExecutionState(phase.effect);
+      if (effect !== undefined && effect.phase !== 'settled' && effect.phase !== 'closed') throw new TypeError('Settled verification retains an invalid effect state.');
+      return Object.freeze({ ...base, stage, result, ...(effect ? { effect } : {}) });
     }
     case 'disposition': {
       exact(phase, ['kind', 'stage', 'candidateEventId', 'verificationEventIds', 'decisionEventId']);
@@ -320,6 +373,7 @@ function exact(value: JsonObject, fields: readonly string[]): void {
 function array(value: unknown, name: string): readonly unknown[] { if (!Array.isArray(value)) throw new TypeError(`${name} must be an array.`); return value; }
 function nonempty(value: unknown, name: string): string { if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`${name} must be a non-empty string.`); return value; }
 function identifier(value: unknown, name: string): string { const result = nonempty(value, name); if (hasControlCharacter(result) || Buffer.byteLength(result, 'utf8') > 512) throw new TypeError(`${name} is invalid.`); return result; }
+function digest(value: unknown, name: string): string { if (typeof value !== 'string' || !/^[a-f0-9]{64}$/u.test(value)) throw new TypeError(`${name} must be a SHA-256 digest.`); return value; }
 function hasControlCharacter(value: string): boolean { for (let index = 0; index < value.length; index += 1) { const unit = value.charCodeAt(index); if (unit <= 31 || unit === 127) return true; } return false; }
 function optionalIdentifier(value: unknown, name: string): string | undefined { return value === undefined ? undefined : identifier(value, name); }
 function nonnegativeInteger(value: unknown, name: string): number { if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new TypeError(`${name} must be a non-negative safe integer.`); return value; }

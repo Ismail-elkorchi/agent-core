@@ -3,6 +3,7 @@ import { type ContextHistoryReduction, decodeContextItemInput, type ContextItemI
 import { hashJson, type EventAppendReceipt } from '@agent-core/evidence';
 import { normalizeJsonSafe, parseJsonValue } from '@agent-core/json';
 import {
+  NO_EFFECT_EXPOSURE,
   UNKNOWN_EFFECT_RECOVERY,
   closeExternalEffect,
   decodeEffectRecoveryCapability,
@@ -37,14 +38,18 @@ import {
   deriveAgentVerificationStatus,
   createAgentTerminalSnapshot,
   validateAgentCheckDefinitions,
+  isAgentPreparedCheckEffect,
   type AgentCandidate,
   type AgentApprovalRequest,
   type AgentClock,
+  type AgentCheckContext,
   type AgentCheckDefinition,
+  type AgentCheckObservation,
   type AgentCheckResult,
   type AgentEffectiveInstruction,
   type AgentExactRequestRecord,
   type AgentPresentCandidate,
+  type AgentPreparedCheckEffect,
   type AgentRequestSnapshotRecord,
   type AgentRunLimits,
   type AgentRunResult,
@@ -77,7 +82,7 @@ import {
 import { encodeAgentEvent, type AgentAuditEvent, type AgentEvent, type AgentProgressEvent } from './events.js';
 import type { AgentRuntimeRepositories } from './ports.js';
 import { BudgetAccountant, type RequestCostEstimate, type RequestWindow } from './orchestration/budget-accountant.js';
-import { AgentVerificationAbortedError, runAgentChecks } from './orchestration/checks.js';
+import { AgentVerificationAbortedError, executeAgentCheckAction } from './orchestration/checks.js';
 import { contextEvidenceExecution } from './orchestration/context-evidence.js';
 import { summarizeModelRequest, summarizeModelResponse, summarizeProviderState, summarizeRunConfiguration } from './orchestration/event-summaries.js';
 import { AgentRunFinalizer } from './orchestration/finalization.js';
@@ -111,7 +116,7 @@ import { AgentLimitExceededError, AgentRunController } from './orchestration/run
 import { rebuildContextFromRepositories } from './orchestration/session-replay.js';
 import { executeAssistantToolCalls } from './orchestration/tool-execution.js';
 import { AgentOperationCoordinator, type AgentOperationAdvance, type AgentOperationDriver } from './operation/driver.js';
-import { nextAgentOperationInstruction, type AgentOperationProcedure, type AgentToolOperationPhase } from './operation/contracts.js';
+import { nextAgentOperationInstruction, type AgentCheckPreparationRecord, type AgentOperationPhase, type AgentOperationProcedure, type AgentToolOperationPhase } from './operation/contracts.js';
 
 export type {
   AgentCheckContext,
@@ -510,7 +515,7 @@ export class AgentRuntime {
         if (!await this.reconcileStartedToolEffect(operation, phase, abortController.signal)) return operationSuspension(operation.state());
       }
       const recoverablePhase = operation.state().phase;
-      if (recoverablePhase.kind !== 'accepted' && recoverablePhase.kind !== 'preparing' && recoverablePhase.kind !== 'tools') {
+      if (recoverablePhase.kind !== 'accepted' && recoverablePhase.kind !== 'preparing' && recoverablePhase.kind !== 'tools' && recoverablePhase.kind !== 'verification') {
         throw new Error(`Run ${runId} requires ${nextAgentOperationInstruction(operation.state()).kind === 'wait' ? 'an explicit recovery decision' : 'a phase-specific recovery implementation'} before it can resume.`);
       }
       const input: ResolvedAgentRunInput = {
@@ -652,6 +657,22 @@ export class AgentRuntime {
     }
     throwIfAborted(runtime.signal);
 
+    if (initialPhase.kind === 'verification') {
+      const continuation = await this.verificationExecutionContinuation(runtime.runId, initialPhase);
+      runtime.controller.transition('requesting_model');
+      await this.enterPhase(runtime.runId, runtime.controller, 'verifying', runtime.append, runtime.emit);
+      const resumedResults = await this.executeVerificationChecks({
+        runtime,
+        instructions: continuation.instructions,
+        candidate: continuation.candidate,
+        contextManager
+      });
+      await this.advanceOperation(runtime.operation, 'consume_verification_settlement', {
+        phase: { kind: 'finalization', stage: 'ready' }, budget: runtime.controller.snapshot()
+      });
+      return completedDecision(continuation.candidate, initialPhase.identity.turnIndex, resumedResults, continuation.response);
+    }
+
     let turnIndex = initialToolPhase
       ? initialToolPhase.identity.turnIndex
       : runtime.providerContinuation?.identity.turnIndex ?? (initialPhase.kind === 'preparing' ? initialPhase.turnIndex : 1);
@@ -784,16 +805,18 @@ export class AgentRuntime {
             await this.advanceOperation(runtime.operation, 'consume_provider_settlement', { phase: { kind: 'finalization', stage: 'ready' }, budget: runtime.controller.snapshot() });
             return failedDecision('empty_response', activeCandidate, emptyMessage, turnIndex, checkResults, response);
           }
-          await this.advanceOperation(runtime.operation, 'consume_provider_settlement', { phase: { kind: 'verification', stage: 'ready', checkIds: this.checks.map((check) => check.id), nextCheckIndex: 0 }, budget: runtime.controller.snapshot() });
+          const providerSettlement = runtime.operation.state().phase;
+          if (providerSettlement.kind !== 'provider' || providerSettlement.stage !== 'settled') throw new Error('Verification requires an exact settled provider response.');
+          await this.advanceOperation(runtime.operation, 'consume_provider_settlement', {
+            phase: {
+              kind: 'verification', stage: this.checks.length === 0 ? 'complete' : 'ready', identity: providerSettlement.identity,
+              providerSettlementEventId: providerSettlement.settlementEventId,
+              checkIds: this.checks.map((check) => check.id), nextCheckIndex: 0
+            },
+            budget: runtime.controller.snapshot()
+          });
           await this.enterPhase(runtime.runId, runtime.controller, 'verifying', runtime.append, runtime.emit);
-          await this.advanceOperation(runtime.operation, 'prepare_verification', { phase: { kind: 'verification', stage: this.checks.length === 0 ? 'complete' : 'effect_pending', checkIds: this.checks.map((check) => check.id), nextCheckIndex: 0 }, budget: runtime.controller.snapshot() });
-          checkResults.push(...await runAgentChecks({ runId: runtime.runId, checks: this.checks, task: runtime.input.task, instructions: snapshot.instructions, candidate: activeCandidate, ...turnIdentity(snapshot.record), signal: runtime.signal,
-            ...(this.options.metadata ? { metadata: this.options.metadata } : {}), execution: contextEvidenceExecution({ contextManager, ...(this.options.repositories.artifacts ? { artifacts: this.options.repositories.artifacts } : {}), ...(this.options.verification ? { configured: this.options.verification } : {}) }),
-            append: runtime.append, emit: runtime.emit }));
-          if (this.checks.length > 0) {
-            const checkRecord = await this.options.repositories.events.latestOfType(runtime.runId, 'check.ended');
-            await this.advanceOperation(runtime.operation, 'reconcile_verification', { phase: { kind: 'verification', stage: 'settled', checkIds: this.checks.map((check) => check.id), nextCheckIndex: this.checks.length, ...(checkRecord ? { resultEventId: checkRecord.eventId } : {}) }, budget: runtime.controller.snapshot() });
-          }
+          checkResults.push(...await this.executeVerificationChecks({ runtime, instructions: snapshot.instructions, candidate: activeCandidate, contextManager }));
           await this.advanceOperation(runtime.operation, 'consume_verification_settlement', { phase: { kind: 'finalization', stage: 'ready' }, budget: runtime.controller.snapshot() });
           return completedDecision(activeCandidate, turnIndex, checkResults, response);
         }
@@ -847,6 +870,223 @@ export class AgentRuntime {
     } finally {
       await modelSession?.close?.();
     }
+  }
+
+  private async executeVerificationChecks(input: {
+    readonly runtime: RunExecutionRuntime;
+    readonly instructions: readonly AgentEffectiveInstruction[];
+    readonly candidate: AgentPresentCandidate;
+    readonly contextManager: ContextManager;
+  }): Promise<readonly AgentCheckResult[]> {
+    const metadataValue = normalizeJsonSafe(this.options.metadata ?? {}).value;
+    const metadata = isRecord(metadataValue) ? metadataValue : Object.freeze({});
+    const execution = contextEvidenceExecution({
+      contextManager: input.contextManager,
+      ...(this.options.repositories.artifacts ? { artifacts: this.options.repositories.artifacts } : {}),
+      ...(this.options.verification ? { configured: this.options.verification } : {})
+    });
+    const initial = input.runtime.operation.state().phase;
+    if (initial.kind !== 'verification') throw new Error(`Run ${input.runtime.runId} is not at its verification boundary.`);
+    const results = [...await this.completedVerificationResults(input.runtime.runId, initial)];
+    let retained: AgentPreparedCheckEffect | undefined;
+
+    try {
+      for (;;) {
+        throwIfAborted(input.runtime.signal);
+        const phase = input.runtime.operation.state().phase;
+        if (phase.kind !== 'verification') throw new Error(`Run ${input.runtime.runId} left verification before its checks completed.`);
+        if (phase.stage === 'complete') return Object.freeze(results);
+        const check = this.checks[phase.nextCheckIndex];
+        if (!check || check.id !== phase.checkIds[phase.nextCheckIndex]) throw new Error(`Run ${input.runtime.runId} is missing its captured verifier at index ${String(phase.nextCheckIndex)}.`);
+        const context = verificationContext({
+          runId: input.runtime.runId,
+          task: input.runtime.input.task,
+          instructions: input.instructions,
+          candidate: input.candidate,
+          identity: phase.identity,
+          metadata,
+          signal: input.runtime.signal,
+          execution
+        });
+        const base = verificationPhaseBase(phase);
+        const timeoutMs = check.timeoutMs ?? 30_000;
+        const eventKey = `${input.runtime.runId}:verification:${String(phase.nextCheckIndex)}:${check.id}`;
+
+        if (phase.stage === 'ready') {
+          await input.runtime.append({
+            type: 'check.started', ...phase.identity, check: check.id,
+            implementationId: check.implementationId, requirement: check.requirement, timeoutMs
+          }, `${eventKey}:started`);
+          if (check.kind === 'deterministic') {
+            await this.advanceOperation(input.runtime.operation, 'prepare_verification', {
+              phase: { ...base, stage: 'deterministic_pending' }, budget: input.runtime.controller.snapshot()
+            });
+            continue;
+          }
+          let preparedOutcome: AgentCheckObservation | AgentPreparedCheckEffect;
+          try { preparedOutcome = await check.prepare(context); }
+          catch (error) {
+            const result = await executeAgentCheckAction({
+              check, timeoutMs, parentSignal: input.runtime.signal, context,
+              action: () => Promise.reject(error instanceof Error ? error : new Error(String(error)))
+            });
+            await this.advanceOperation(input.runtime.operation, 'prepare_verification', {
+              phase: { ...base, stage: 'settled', result }, budget: input.runtime.controller.snapshot()
+            });
+            continue;
+          }
+          if (!isAgentPreparedCheckEffect(preparedOutcome)) {
+            const result = await executeAgentCheckAction({
+              check, timeoutMs, parentSignal: input.runtime.signal, context,
+              action: () => Promise.resolve(preparedOutcome)
+            });
+            await this.advanceOperation(input.runtime.operation, 'prepare_verification', {
+              phase: { ...base, stage: 'settled', result }, budget: input.runtime.controller.snapshot()
+            });
+            continue;
+          }
+          retained = preparedOutcome;
+          const preparation = checkPreparation(check, retained);
+          const effectId = `${input.runtime.runId}:verification:${String(phase.nextCheckIndex)}:${check.implementationId}`;
+          const generation = input.runtime.operation.state().driverGeneration;
+          const issued = issueEffectStartTicket({
+            intent: Object.freeze({
+              effectId,
+              operationId: input.runtime.runId,
+              implementationId: check.implementationId,
+              parametersDigest: preparation.fingerprint,
+              recovery: preparation.recovery,
+              exposure: NO_EFFECT_EXPOSURE
+            }),
+            ticketId: `${effectId}:start:${String(generation)}`,
+            settlementPermitId: `${effectId}:settle:${String(generation)}`,
+            driverGeneration: generation,
+            currentDriverGeneration: generation
+          });
+          if (issued.status !== 'issued') throw new AgentOperationOwnershipLostError(input.runtime.runId);
+          await this.advanceOperation(input.runtime.operation, 'prepare_verification', {
+            phase: { ...base, stage: 'effect_ready', preparation, effect: issued.state },
+            budget: input.runtime.controller.snapshot()
+          });
+          continue;
+        }
+
+        if (phase.stage === 'deterministic_pending') {
+          if (check.kind !== 'deterministic') throw new Error(`Verifier ${check.id} changed kind after its durable preparation.`);
+          const result = await executeAgentCheckAction({
+            check, timeoutMs, parentSignal: input.runtime.signal, context,
+            action: (activeContext) => check.run(activeContext)
+          });
+          await this.advanceOperation(input.runtime.operation, 'reconcile_verification', {
+            phase: { ...base, stage: 'settled', result }, budget: input.runtime.controller.snapshot()
+          });
+          continue;
+        }
+
+        if (phase.stage === 'effect_ready') {
+          if (check.kind !== 'effect') throw new Error(`Verifier ${check.id} changed kind after its durable preparation.`);
+          retained = await requireMatchingCheckPreparation(check, context, phase.preparation, retained);
+          const started = startExternalEffect(phase.effect, phase.effect.ticket, input.runtime.operation.state().driverGeneration);
+          if (started.status !== 'started') throw new AgentOperationOwnershipLostError(input.runtime.runId);
+          await this.advanceOperation(input.runtime.operation, 'start_verification', {
+            phase: { ...base, stage: 'effect_pending', preparation: phase.preparation, effect: started.state },
+            budget: input.runtime.controller.snapshot()
+          });
+          const activePreparation = retained;
+          const result = await executeAgentCheckAction({
+            check, timeoutMs, parentSignal: input.runtime.signal, context,
+            action: (activeContext) => activePreparation.start(activeContext.signal)
+          });
+          const settled = settleExternalEffect(started.state, started.state.settlementPermit, {
+            outcome: result.diagnostic ? 'failed' : 'succeeded',
+            resultDigest: hashJson(normalizeJsonSafe(result).value),
+            exposure: knownEffectExposure([])
+          });
+          if (settled.status !== 'settled' && settled.status !== 'already_settled') throw new Error(`Verifier ${check.id} effect settlement was rejected.`);
+          await this.advanceOperation(input.runtime.operation, 'reconcile_verification', {
+            phase: { ...base, stage: 'settled', result, effect: settled.state },
+            budget: input.runtime.controller.snapshot()
+          });
+          await activePreparation.release();
+          retained = undefined;
+          continue;
+        }
+
+        if (phase.stage === 'effect_pending') {
+          if (check.kind !== 'effect') throw new Error(`Verifier ${check.id} changed kind during recovery.`);
+          retained = await requireMatchingCheckPreparation(check, context, phase.preparation, retained);
+          const activePreparation = retained;
+          const reconciliation = await activePreparation.reconcile(input.runtime.signal);
+          let result: AgentCheckResult;
+          let effect: Extract<ReturnType<typeof closeExternalEffect>, { readonly phase: 'closed' }> | Extract<ReturnType<typeof settleExternalEffect>, { readonly status: 'settled' | 'already_settled' }>['state'];
+          if (reconciliation.status === 'settled') {
+            result = await executeAgentCheckAction({
+              check, timeoutMs, parentSignal: input.runtime.signal, context,
+              action: () => Promise.resolve(reconciliation.observation)
+            });
+            const settlement = settleExternalEffect(phase.effect, phase.effect.settlementPermit, {
+              outcome: result.diagnostic ? 'failed' : 'succeeded',
+              resultDigest: hashJson(normalizeJsonSafe(result).value),
+              exposure: knownEffectExposure([])
+            });
+            if (settlement.status !== 'settled' && settlement.status !== 'already_settled') throw new Error(`Verifier ${check.id} reconciliation settlement was rejected.`);
+            effect = settlement.state;
+          } else {
+            const summary = reconciliation.status === 'running'
+              ? 'Verifier execution remained active after driver recovery.'
+              : reconciliation.status === 'expired'
+                ? 'Verifier reconciliation expired before an outcome was recovered.'
+                : 'Verifier outcome could not be reconciled.';
+            const observation: AgentCheckObservation = {
+              verdict: 'unknown', summary,
+              diagnostic: { kind: 'unavailable', message: summary }
+            };
+            result = await executeAgentCheckAction({ check, timeoutMs, parentSignal: input.runtime.signal, context, action: () => Promise.resolve(observation) });
+            effect = closeExternalEffect(phase.effect, reconciliation.status === 'expired' ? 'expired' : reconciliation.status === 'unknown' ? 'reconciliation_unavailable' : 'unknown_outcome');
+          }
+          await this.advanceOperation(input.runtime.operation, 'reconcile_verification', {
+            phase: { ...base, stage: 'settled', result, effect }, budget: input.runtime.controller.snapshot()
+          });
+          await activePreparation.release();
+          retained = undefined;
+          continue;
+        }
+
+        results.push(phase.result);
+        await input.runtime.append({ type: 'check.ended', ...phase.identity, check: check.id, result: phase.result }, `${eventKey}:ended`);
+        await input.runtime.emit({ type: 'check.ended', ...phase.identity, result: phase.result });
+        const nextCheckIndex = phase.nextCheckIndex + 1;
+        await this.advanceOperation(input.runtime.operation, 'consume_verification_settlement', {
+          phase: {
+            ...base,
+            stage: nextCheckIndex === phase.checkIds.length ? 'complete' : 'ready',
+            nextCheckIndex
+          },
+          budget: input.runtime.controller.snapshot()
+        });
+      }
+    } finally {
+      if (retained) await retained.release();
+    }
+  }
+
+  private async completedVerificationResults(
+    runId: string,
+    phase: Extract<import('./operation/contracts.js').AgentOperationPhase, { readonly kind: 'verification' }>
+  ): Promise<readonly AgentCheckResult[]> {
+    const results = new Map<string, AgentCheckResult>();
+    for await (const record of this.options.repositories.events.read(runId)) {
+      const event = record.event;
+      if (event.type !== 'check.ended' || !sameTurnIdentity(event, phase.identity)) continue;
+      if (results.has(event.check)) throw new Error(`Run ${runId} contains duplicate verification settlement for ${event.check}.`);
+      results.set(event.check, event.result);
+    }
+    const completed = phase.checkIds.slice(0, phase.nextCheckIndex).map((checkId) => {
+      const result = results.get(checkId);
+      if (!result) throw new Error(`Run ${runId} is missing the durable result for completed verifier ${checkId}.`);
+      return result;
+    });
+    return Object.freeze(completed);
   }
 
   private async resumeDurableToolBatch(runtime: RunExecutionRuntime, contextManager: ContextManager, observationStore: ObservationStore): Promise<ExecutionDecision | undefined> {
@@ -1321,6 +1561,35 @@ export class AgentRuntime {
     }
     return match;
   }
+  private async verificationExecutionContinuation(
+    runId: string,
+    phase: Extract<AgentOperationPhase, { readonly kind: 'verification' }>
+  ): Promise<Readonly<{
+    readonly response: ModelResponse;
+    readonly candidate: AgentPresentCandidate;
+    readonly instructions: readonly AgentEffectiveInstruction[];
+  }>> {
+    let response: ModelResponse | undefined;
+    let instructions: readonly AgentEffectiveInstruction[] | undefined;
+    for await (const record of this.options.repositories.events.read(runId)) {
+      if (record.eventId === phase.providerSettlementEventId) {
+        if (record.event.type !== 'provider.attempt.settled' || !sameTurnIdentity(record.event, phase.identity)) {
+          throw new Error(`Run ${runId} verification source ${phase.providerSettlementEventId} is not its exact provider settlement.`);
+        }
+        response = record.event.response;
+      }
+      if (record.event.type === 'turn.snapshot.created' && sameTurnIdentity(turnIdentity(record.event.snapshot), phase.identity)) {
+        if (instructions) throw new Error(`Run ${runId} contains duplicate immutable snapshots for verification turn ${phase.identity.turnId}.`);
+        instructions = record.event.snapshot.instructions;
+      }
+    }
+    if (!response) throw new Error(`Run ${runId} is missing provider settlement ${phase.providerSettlementEventId} required by verification.`);
+    if (!instructions) throw new Error(`Run ${runId} is missing the immutable turn snapshot required by verification.`);
+    if ((response.toolCalls?.length ?? 0) !== 0) throw new Error(`Run ${runId} cannot verify a provider response that requested tools.`);
+    const candidate = candidateFromResponse(response, phase.identity.turnIndex, false);
+    if (candidate.status === 'absent') throw new Error(`Run ${runId} cannot verify an absent candidate.`);
+    return Object.freeze({ response, candidate, instructions: Object.freeze([...instructions]) });
+  }
   private async reconcileStartedToolEffect(
     operation: AgentOperationDriver,
     phase: Extract<AgentToolOperationPhase, { readonly stage: 'effect_pending' }>,
@@ -1466,13 +1735,21 @@ export class AgentRuntime {
         }
         case 'reconcile_provider_request': throw new Error(`Run ${state.runId} has an unresolved started provider effect and cannot finalize it as a local failure.`);
         case 'prepare_verification':
-          await this.advanceOperation(operation, instruction, { phase: { kind: 'verification', stage: 'complete', checkIds: this.checks.map((check) => check.id), nextCheckIndex: this.checks.length }, budget });
+          if (state.phase.kind !== 'verification') throw new Error(`Run ${state.runId} has contradictory verification preparation state.`);
+          await this.advanceOperation(operation, instruction, {
+            phase: { ...verificationPhaseBase(state.phase), stage: 'complete', nextCheckIndex: state.phase.checkIds.length }, budget
+          });
           continue;
-        case 'reconcile_verification': {
-          const result = await this.options.repositories.events.latestOfType(state.runId, 'check.ended');
-          await this.advanceOperation(operation, instruction, { phase: { kind: 'verification', stage: 'settled', checkIds: this.checks.map((check) => check.id), nextCheckIndex: this.checks.length, ...(result ? { resultEventId: result.eventId } : {}) }, budget });
+        case 'start_verification': {
+          if (state.phase.kind !== 'verification' || state.phase.stage !== 'effect_ready') throw new Error(`Run ${state.runId} has contradictory verification start state.`);
+          closeExternalEffect(state.phase.effect, 'cancelled_before_start');
+          await this.advanceOperation(operation, instruction, { phase: { kind: 'finalization', stage: 'ready' }, budget });
           continue;
         }
+        case 'reconcile_verification':
+          if (state.phase.kind === 'verification' && state.phase.stage === 'effect_pending') throw new Error(`Run ${state.runId} has an unresolved verifier effect and cannot finalize it as a local failure.`);
+          await this.advanceOperation(operation, instruction, { phase: { kind: 'finalization', stage: 'ready' }, budget });
+          continue;
         case 'project_tool_settlement':
           if (state.phase.kind !== 'tools') throw new Error(`Run ${state.runId} has a contradictory tool projection instruction.`);
           await this.advanceOperation(operation, instruction, { phase: { kind: 'tools', stage: 'complete', identity: state.phase.identity, toolBatchId: state.phase.toolBatchId, calls: state.phase.calls, nextCallIndex: state.phase.calls.length, instructions: state.phase.instructions, modelInputModalities: state.phase.modelInputModalities }, budget });
@@ -1774,6 +2051,63 @@ function contextSourceIds(items: readonly ContextItemInput[] | undefined, proven
 }
 function turnIdentity(snapshot: AgentTurnSnapshotRecord): AgentTurnIdentity { return { turnIndex: snapshot.turnIndex, turnId: snapshot.turnId, requestAttempt: snapshot.requestAttempt }; }
 function sameTurnIdentity(left: AgentTurnIdentity, right: AgentTurnIdentity): boolean { return left.turnIndex === right.turnIndex && left.turnId === right.turnId && left.requestAttempt === right.requestAttempt; }
+function verificationPhaseBase(phase: Extract<AgentOperationPhase, { readonly kind: 'verification' }>) {
+  return Object.freeze({
+    kind: 'verification' as const,
+    identity: phase.identity,
+    providerSettlementEventId: phase.providerSettlementEventId,
+    checkIds: phase.checkIds,
+    nextCheckIndex: phase.nextCheckIndex
+  });
+}
+function verificationContext(input: {
+  readonly runId: string;
+  readonly task: string;
+  readonly instructions: readonly AgentEffectiveInstruction[];
+  readonly candidate: AgentPresentCandidate;
+  readonly identity: AgentTurnIdentity;
+  readonly metadata: Readonly<Record<string, import('@agent-core/json').JsonValue>>;
+  readonly signal: AbortSignal;
+  readonly execution: AgentVerificationExecutionContext;
+}): AgentCheckContext {
+  return Object.freeze({
+    runId: input.runId,
+    task: input.task,
+    instructions: Object.freeze([...input.instructions]),
+    candidate: input.candidate,
+    ...input.identity,
+    metadata: input.metadata,
+    signal: input.signal,
+    execution: input.execution
+  });
+}
+function checkPreparation(check: AgentCheckDefinition, prepared: AgentPreparedCheckEffect): AgentCheckPreparationRecord {
+  const preparation = Object.freeze({
+    checkImplementationId: check.implementationId,
+    authorization: prepared.authorization,
+    recovery: prepared.recovery
+  });
+  return Object.freeze({ ...preparation, fingerprint: hashJson(normalizeJsonSafe(preparation).value) });
+}
+async function requireMatchingCheckPreparation(
+  check: Extract<AgentCheckDefinition, { readonly kind: 'effect' }>,
+  context: AgentCheckContext,
+  expected: AgentCheckPreparationRecord,
+  retained: AgentPreparedCheckEffect | undefined
+): Promise<AgentPreparedCheckEffect> {
+  const outcome = retained ?? await check.prepare(context);
+  if (!isAgentPreparedCheckEffect(outcome)) throw new Error(`Verifier ${check.id} no longer requires the external effect captured by its durable intent.`);
+  const prepared = outcome;
+  const actual = checkPreparation(check, prepared);
+  if (actual.fingerprint !== expected.fingerprint
+    || actual.checkImplementationId !== expected.checkImplementationId
+    || hashJson(actual.authorization) !== hashJson(expected.authorization)
+    || hashJson(normalizeJsonSafe(actual.recovery).value) !== hashJson(normalizeJsonSafe(expected.recovery).value)) {
+    await prepared.release();
+    throw new Error(`Verifier ${check.id} preparation changed after its durable intent was recorded.`);
+  }
+  return prepared;
+}
 function formatOverflowDiagnostic(diagnostic: OverflowDiagnostic): string { return ['Request assembly exceeded budget after overflow recovery.', `Reason: ${diagnostic.reason}.`, `Components: messages=${String(diagnostic.messageTokens)}, contextHistory=${String(diagnostic.contextHistoryTokens)}, context=${String(diagnostic.contextTokens)}, evidence=${String(diagnostic.evidenceTokens)}, toolSchemas=${String(diagnostic.toolSchemaTokens)}, outputReserve=${String(diagnostic.outputReserveTokens)}.`, `Total request tokens=${String(diagnostic.totalRequestTokens)}.`, `Recovery actions attempted=${diagnostic.reductionsAttempted.map(formatOverflowAction).join(', ') || 'none'}.`].join(' '); }
 function formatOverflowAction(action: OverflowRecoveryAction): string { if (action.kind === 'reduce_context_history') return `reduce_context_history(${String(action.reductions)})`; if (action.kind === 'reduce_context') return `reduce_context(${String(action.removedItems)})`; if (action.kind === 'install_checkpoint') return `install_checkpoint(${String(action.compactedToolResults)})`; return action.kind; }
 class RequestAssemblyError extends Error {}
@@ -1844,7 +2178,7 @@ function sameCheckBindings(
 ): boolean {
   return left.length === right.length && left.every((value, index) => {
     const candidate = right[index];
-    return candidate !== undefined && value.id === candidate.id && value.implementationId === candidate.implementationId;
+    return value.id === candidate?.id && value.implementationId === candidate?.implementationId;
   });
 }
 function sameResourcePreconditions(

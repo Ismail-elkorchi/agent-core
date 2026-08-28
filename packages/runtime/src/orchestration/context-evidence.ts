@@ -6,7 +6,7 @@ import type { AgentEvidencePage, AgentEvidenceReader, AgentVerificationExecution
 const DEFAULT_LIMIT = 50;
 const DEFAULT_MAX_BYTES = 256 * 1024;
 
-/** Expose owned tool evidence to verification without granting new command authority. */
+/** Expose owned tool evidence to verification without granting effect authority. */
 export function contextEvidenceExecution(input: {
   readonly contextManager: ContextManager;
   readonly artifacts?: ArtifactRepository;
@@ -14,7 +14,7 @@ export function contextEvidenceExecution(input: {
 }): AgentVerificationExecutionContext {
   const records = input.contextManager.evidenceSnapshot();
   const evidence = contextEvidenceReader(records, input.artifacts, input.configured?.evidence);
-  return Object.freeze({ evidence, ...(input.configured?.runCommand ? { runCommand: input.configured.runCommand } : {}) });
+  return Object.freeze({ evidence });
 }
 
 function contextEvidenceReader(
