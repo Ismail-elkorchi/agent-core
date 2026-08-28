@@ -1,7 +1,6 @@
 import { hashJson } from '@agent-core/evidence';
 import {
   issueEffectStartTicket,
-  NO_EFFECT_EXPOSURE,
   startExternalEffect
 } from '@agent-core/effects';
 import {
@@ -339,13 +338,17 @@ function batchBase(phase: AgentToolOperationPhase): ToolBatchFields {
 function issueToolEffect(input: Parameters<typeof executeAssistantToolCalls>[0], phase: AgentToolOperationPhase, prepared: PreparedToolCall, toolAttempt: number) {
   const effectId = `${input.runId}:${phase.identity.turnId}:${phase.toolBatchId}:${String(phase.nextCallIndex)}:${String(toolAttempt)}`;
   const issued = issueEffectStartTicket({
-    intent: { effectId, operationId: input.runId, implementationId: prepared.toolImplementationId, parametersDigest: prepared.fingerprint, recovery: prepared.effects.recovery, exposure: NO_EFFECT_EXPOSURE },
+    intent: { effectId, operationId: input.runId, implementationId: prepared.toolImplementationId, parametersDigest: prepared.fingerprint, recovery: prepared.effects.recovery, exposure: TOOL_INVOCATION_EXPOSURE },
     ticketId: `${effectId}:start`, settlementPermitId: `${effectId}:settle`,
     driverGeneration: input.driverGeneration, currentDriverGeneration: input.driverGeneration
   });
   if (issued.status !== 'issued') throw new Error(`Tool effect ticket was rejected: ${issued.reason}.`);
   return issued.state;
 }
+
+const TOOL_INVOCATION_EXPOSURE = Object.freeze({
+  quantities: Object.freeze([Object.freeze({ unit: 'tool_invocations', amount: 1 })])
+});
 
 function approvalRequest(runId: string, phase: AgentToolOperationPhase, call: ToolCall, prepared: PreparedToolCall, reason: string, context: ToolPreparationContext): AgentApprovalRequest {
   const identity = callIdentity(phase, call);

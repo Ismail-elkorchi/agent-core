@@ -1351,7 +1351,7 @@ export class AgentRuntime {
         const settled = settleExternalEffect(phase.effect, phase.effect.settlementPermit, {
           outcome: recovery.observation.ok ? 'succeeded' : 'failed',
           resultDigest: hashJson(encodeToolObservation(committed.durableObservation)),
-          exposure: knownEffectExposure([])
+          exposure: knownEffectExposure(phase.effect.intent.exposure.quantities)
         });
         if (settled.status !== 'settled' && settled.status !== 'already_settled') throw new Error(`Recovered tool effect ${phase.effect.intent.effectId} could not be settled.`);
         await this.advanceOperation(operation, 'reconcile_tool_call', {

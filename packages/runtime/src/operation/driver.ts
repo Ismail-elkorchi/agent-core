@@ -199,7 +199,7 @@ export class AgentOperationCoordinator {
       const settled = settleExternalEffect(phase.effect, permit, {
         outcome: settlement.observation.ok ? 'succeeded' : 'failed',
         resultDigest,
-        exposure: knownEffectExposure([])
+        exposure: knownEffectExposure(phase.effect.intent.exposure.quantities)
       });
       if (settled.status !== 'settled' && settled.status !== 'already_settled') {
         throw new AgentOperationConflictError(runId, 'idempotency_conflict', `Tool effect ${input.effectId} settlement authority was rejected: ${settled.status}.`);

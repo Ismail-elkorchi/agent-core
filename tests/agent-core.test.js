@@ -977,6 +977,10 @@ test('a live stale runtime can settle its exact tool permit but cannot continue 
   const first = await harness({ provider, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, toolAuthorizer: () => ({ decision: 'allow' }), withoutSession: true });
   const firstControl = first.agent.run({ task: 'live takeover' });
   await invocationStarted;
+  const pending = await first.agent.inspectOperation(firstControl.runId);
+  assert.equal(pending.state.phase.kind, 'tools');
+  assert.equal(pending.state.phase.stage, 'effect_pending');
+  assert.deepEqual(pending.state.phase.effect.intent.exposure, { quantities: [{ unit: 'tool_invocations', amount: 1 }] });
 
   const replacement = new AgentRuntime({
     provider, model: 'scripted', toolBoundary,
@@ -988,6 +992,10 @@ test('a live stale runtime can settle its exact tool permit but cannot continue 
   assert.equal(waiting.reason, 'tool_outcome_unknown');
   releaseInvocation();
   await assert.rejects(firstControl.result, /replacement driver/u);
+  const settled = await replacement.inspectOperation(firstControl.runId);
+  assert.equal(settled.state.phase.kind, 'tools');
+  assert.equal(settled.state.phase.stage, 'settled');
+  assert.deepEqual(settled.state.phase.effect.settlement.exposure, { status: 'known', quantities: [{ unit: 'tool_invocations', amount: 1 }] });
 
   const completed = ended(await replacement.resume(firstControl.runId).result);
   assert.equal(completed.executionStatus, 'completed');
