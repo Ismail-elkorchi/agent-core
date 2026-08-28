@@ -21,7 +21,7 @@ const acceptance = (runId = 'run-operation') => ({
     model: 'scripted-model',
     runtimeImplementationId: 'runtime-test-v1',
     toolImplementationIds: ['read-v1'],
-    checkIds: ['required-check'],
+    checks: [{ id: 'required-check', implementationId: 'agent-core.test.check.v1' }],
     policyHash: 'policy-hash'
   }
 });

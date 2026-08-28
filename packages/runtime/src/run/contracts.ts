@@ -110,6 +110,7 @@ export interface AgentCheckObservation {
 }
 export type AgentCheckResult = Readonly<{
   readonly id: string;
+  readonly implementationId: string;
   readonly requirement: AgentCheckRequirement;
   readonly verdict: AgentCheckVerdict;
   readonly summary: string;
@@ -155,6 +156,8 @@ export interface AgentCheckContext {
 }
 export interface AgentCheckDefinition {
   readonly id: string;
+  /** Stable identity for the admitted verifier implementation and semantics. */
+  readonly implementationId: string;
   readonly requirement: AgentCheckRequirement;
   readonly description?: string;
   readonly timeoutMs?: number;
@@ -227,7 +230,7 @@ export interface AgentTurnSnapshotRecord {
   readonly toolPolicyHash: string;
   readonly instructions: readonly AgentEffectiveInstruction[];
   readonly configuredContextSourceIds: readonly string[];
-  readonly checkIds: readonly string[];
+  readonly checks: readonly { readonly id: string; readonly implementationId: string }[];
   readonly limits: AgentRunLimits;
   readonly budget: AgentRunBudgetState;
 }
@@ -336,6 +339,7 @@ export function validateAgentCheckDefinitions(definitions: readonly AgentCheckDe
     if (id.trim().length === 0) issues.push(`Check at index ${String(index)} has an empty id.`);
     else if (ids.has(id)) issues.push(`Duplicate check id: ${id}.`);
     else ids.add(id);
+    if (!validIdentity(definition.implementationId)) issues.push(`Check ${label} implementationId must be a non-empty bounded identity.`);
     if (definition.timeoutMs !== undefined && !positiveInteger(definition.timeoutMs)) issues.push(`Check ${label} timeoutMs must be a positive finite integer.`);
   }
   if (issues.length > 0) throw new AgentContractError('Invalid check definitions.', issues);
@@ -376,12 +380,14 @@ export function parseAgentCheckResult(value: unknown, measuredDurationMs?: numbe
 export function decodeOwnedAgentCheckResult(object: JsonObject, measuredDurationMs?: number): AgentCheckResult {
   const issues: string[] = [];
   const id = typeof object.id === 'string' && object.id.trim().length > 0 ? object.id : undefined;
+  const implementationId = typeof object.implementationId === 'string' && validIdentity(object.implementationId) ? object.implementationId : undefined;
   const requirement = oneOf(object.requirement, ['required', 'advisory']) ? object.requirement : undefined;
   const verdict = oneOf(object.verdict, ['passed', 'failed', 'unknown']) ? object.verdict : undefined;
   const summary = typeof object.summary === 'string' && object.summary.trim().length > 0 ? object.summary : undefined;
   const rawDurationMs = measuredDurationMs ?? object.durationMs;
   const durationMs = typeof rawDurationMs === 'number' && Number.isFinite(rawDurationMs) && rawDurationMs >= 0 ? rawDurationMs : undefined;
   if (!id) issues.push('id must be non-empty.');
+  if (!implementationId) issues.push('implementationId must be a non-empty bounded identity.');
   if (!requirement) issues.push('requirement is invalid.');
   if (!verdict) issues.push('verdict is invalid.');
   if (!summary) issues.push('summary must be non-empty.');
@@ -393,8 +399,8 @@ export function decodeOwnedAgentCheckResult(object: JsonObject, measuredDuration
   const outputNormalization = object.outputNormalization === undefined ? undefined : decodeNormalizationDiagnostics(object.outputNormalization);
   if (object.outputNormalization !== undefined && !outputNormalization) issues.push('outputNormalization is invalid.');
   if (issues.length > 0) throw contract('Invalid check result.', issues);
-  if (!id || !requirement || !verdict || !summary || durationMs === undefined) throw contract('Invalid check result.', issues);
-  return Object.freeze({ id, requirement, verdict, summary, durationMs,
+  if (!id || !implementationId || !requirement || !verdict || !summary || durationMs === undefined) throw contract('Invalid check result.', issues);
+  return Object.freeze({ id, implementationId, requirement, verdict, summary, durationMs,
     ...(object.output !== undefined ? { output: object.output } : {}),
     ...(outputNormalization ? { outputNormalization } : {}),
     ...(artifacts ? { artifacts } : {}),

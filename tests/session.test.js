@@ -248,7 +248,7 @@ async function acceptTestOperation(operations, runId) {
     runId,
     finalizationId: `${runId}:final`,
     input: { task: 'claimed', instructions: [], contextItems: [] },
-    configuration: { providerId: 'test', providerImplementationId: 'agent-core.tests.session-provider@1', model: 'model', runtimeImplementationId: 'test/runtime@1', toolImplementationIds: [], checkIds: [], policyHash: 'policy' }
+    configuration: { providerId: 'test', providerImplementationId: 'agent-core.tests.session-provider@1', model: 'model', runtimeImplementationId: 'test/runtime@1', toolImplementationIds: [], checks: [], policyHash: 'policy' }
   });
 }
 

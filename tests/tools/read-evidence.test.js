@@ -119,7 +119,7 @@ test('read-tool evidence reaches durable observations, session context, prompt s
   };
   let checkedEvidence;
   const check = {
-    id: 'evidence-visible', requirement: 'required',
+    id: 'evidence-visible', implementationId: 'agent-core.test.check.v1', requirement: 'required',
     async run(context) {
       checkedEvidence = await context.execution.evidence.read({ limit: 100, maxBytes: 256 * 1024 });
       return { verdict: checkedEvidence.items.some((item) => item.toolName === 'list_directory') ? 'passed' : 'failed', summary: 'read evidence was supplied to verification' };

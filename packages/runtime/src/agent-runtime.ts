@@ -951,7 +951,7 @@ export class AgentRuntime {
       ...(input.configuration.reasoning === undefined ? {} : { reasoning: input.configuration.reasoning }),
       ...(input.configuration.responseFormat === undefined ? {} : { responseFormat: input.configuration.responseFormat }),
       toolNames: input.tools.map((tool) => tool.name), toolPolicyHash: hashJson(this.toolPolicy), instructions: [...input.instructions],
-      configuredContextSourceIds: contextSourceIds(this.options.contextItems, 'configured'), checkIds: this.checks.map((check) => check.id), limits: input.controller.limits, budget: input.controller.snapshot()
+      configuredContextSourceIds: contextSourceIds(this.options.contextItems, 'configured'), checks: this.checks.map(checkBinding), limits: input.controller.limits, budget: input.controller.snapshot()
     });
     return Object.freeze({ record, profile: input.profile, requestWindow: Object.freeze({ ...input.requestWindow }), budgetAccountant: new BudgetAccountant(input.requestWindow, this.estimator), tools: Object.freeze([...input.tools]), configuration: input.configuration, instructions: Object.freeze([...input.instructions]) });
   }
@@ -1512,7 +1512,7 @@ export class AgentRuntime {
       && captured.model === current.model
       && captured.runtimeImplementationId === current.runtimeImplementationId
       && captured.policyHash === current.policyHash
-      && sameStrings(captured.checkIds, current.checkIds);
+      && sameCheckBindings(captured.checks, current.checks);
     return nonToolConfigurationMatches && !sameStrings(captured.toolImplementationIds, current.toolImplementationIds);
   }
   private currentOperationConfiguration() {
@@ -1522,7 +1522,7 @@ export class AgentRuntime {
       model: this.options.model,
       runtimeImplementationId: 'agent-core.runtime.operation-v1',
       toolImplementationIds: Object.freeze(this.tools.map((tool) => tool.implementationId)),
-      checkIds: Object.freeze(this.checks.map((check) => check.id)),
+      checks: Object.freeze(this.checks.map(checkBinding)),
       policyHash: hashJson(this.toolPolicy)
     });
   }
@@ -1834,6 +1834,18 @@ function missingImplementationSuspension(state: import('./operation/contracts.js
 }
 function sameStrings(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+function checkBinding(check: AgentCheckDefinition): { readonly id: string; readonly implementationId: string } {
+  return Object.freeze({ id: check.id, implementationId: check.implementationId });
+}
+function sameCheckBindings(
+  left: readonly { readonly id: string; readonly implementationId: string }[],
+  right: readonly { readonly id: string; readonly implementationId: string }[]
+): boolean {
+  return left.length === right.length && left.every((value, index) => {
+    const candidate = right[index];
+    return candidate !== undefined && value.id === candidate.id && value.implementationId === candidate.implementationId;
+  });
 }
 function sameResourcePreconditions(
   left: readonly import('@agent-core/effects').EffectResourcePrecondition[],

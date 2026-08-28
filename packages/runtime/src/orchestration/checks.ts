@@ -60,7 +60,7 @@ export async function runAgentChecks(input: {
     throwIfVerificationAborted(input.signal);
     const timeoutMs = check.timeoutMs ?? input.defaultTimeoutMs ?? 30_000;
     const identity: AgentTurnIdentity = { turnIndex: input.turnIndex, turnId: input.turnId, requestAttempt: input.requestAttempt };
-    await input.append({ type: 'check.started', ...identity, check: check.id, requirement: check.requirement, timeoutMs });
+    await input.append({ type: 'check.started', ...identity, check: check.id, implementationId: check.implementationId, requirement: check.requirement, timeoutMs });
     const startedAt = performance.now();
     const result = await executeOneCheck({
       check,
@@ -121,6 +121,7 @@ async function executeOneCheck(input: {
       : { kind: diagnosticKind(error), message: errorMessage(error), ...(details === undefined ? {} : { details }) };
     return {
       id: input.check.id,
+      implementationId: input.check.implementationId,
       requirement: input.check.requirement,
       verdict: 'unknown',
       summary: diagnostic.message,
@@ -142,6 +143,7 @@ function normalizeObservation(check: AgentCheckDefinition, value: unknown): Omit
   const normalized = value.output === undefined ? undefined : normalizeJsonSafe(value.output);
   return {
     id: check.id,
+    implementationId: check.implementationId,
     requirement: check.requirement,
     verdict: value.verdict,
     summary: value.summary.trim(),
@@ -152,7 +154,7 @@ function normalizeObservation(check: AgentCheckDefinition, value: unknown): Omit
 }
 
 function invalidResult(check: AgentCheckDefinition, message: string): Omit<AgentCheckResult, 'durationMs'> {
-  return { id: check.id, requirement: check.requirement, verdict: 'unknown', summary: message, diagnostic: { kind: 'invalid_result', message } };
+  return { id: check.id, implementationId: check.implementationId, requirement: check.requirement, verdict: 'unknown', summary: message, diagnostic: { kind: 'invalid_result', message } };
 }
 
 function normalizeDiagnostic(value: unknown): AgentCheckDiagnostic | undefined {

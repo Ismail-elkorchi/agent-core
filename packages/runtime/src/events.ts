@@ -162,7 +162,7 @@ export type AgentEvent =
   | ({ readonly type: 'tool.started'; readonly toolName: string; readonly input: ToolCall; readonly fingerprint: string; readonly effects: ToolEffects } & AgentToolCallAttemptIdentity)
   | ({ readonly type: 'tool.updated'; readonly toolName: string; readonly progress: ToolProgress } & AgentToolCallAttemptIdentity)
   | ({ readonly type: 'tool.ended'; readonly toolName: string; readonly observation: ToolObservation } & AgentToolCallAttemptIdentity)
-  | ({ readonly type: 'check.started'; readonly check: string; readonly requirement: AgentCheckRequirement; readonly timeoutMs: number } & AgentTurnIdentity)
+  | ({ readonly type: 'check.started'; readonly check: string; readonly implementationId: string; readonly requirement: AgentCheckRequirement; readonly timeoutMs: number } & AgentTurnIdentity)
   | ({ readonly type: 'check.ended'; readonly check: string; readonly result: AgentCheckResult } & AgentTurnIdentity);
 
 export type AgentAuditEvent = Exclude<AgentEvent, { readonly type: 'operation.transition' }>;
@@ -430,8 +430,8 @@ const AGENT_EVENT_DECODERS = {
     return Object.freeze({ type: 'tool.ended', ...decodeToolAttemptIdentity(value), toolName: requiredString(value.toolName, 'toolName'), observation: decodeOwnedToolObservationForPersistence(requiredObject(value.observation, 'observation')) });
   },
   'check.started': (value) => {
-    exact(value, ['type', ...TURN_KEYS, 'check', 'requirement', 'timeoutMs']);
-    return Object.freeze({ type: 'check.started', ...decodeTurnIdentity(value), check: requiredString(value.check, 'check'), requirement: requiredEnum(value.requirement, CHECK_REQUIREMENTS, 'requirement'), timeoutMs: positiveInteger(value.timeoutMs, 'timeoutMs') });
+    exact(value, ['type', ...TURN_KEYS, 'check', 'implementationId', 'requirement', 'timeoutMs']);
+    return Object.freeze({ type: 'check.started', ...decodeTurnIdentity(value), check: requiredString(value.check, 'check'), implementationId: requiredString(value.implementationId, 'implementationId'), requirement: requiredEnum(value.requirement, CHECK_REQUIREMENTS, 'requirement'), timeoutMs: positiveInteger(value.timeoutMs, 'timeoutMs') });
   },
   'check.ended': (value) => {
     exact(value, ['type', ...TURN_KEYS, 'check', 'result']);
@@ -531,7 +531,7 @@ function decodeRunConfiguration(value: JsonValue | undefined): AgentRunConfigura
 }
  function decodeTurnSnapshot(value: JsonValue | undefined): AgentTurnSnapshotRecord {
   const object = requiredObject(value, 'snapshot');
-  exact(object, ['turnIndex', 'turnId', 'requestAttempt', 'provider', 'model', 'profileHash', 'continuationEligible', 'temperature', 'reasoning', 'responseFormat', 'toolNames', 'toolPolicyHash', 'instructions', 'configuredContextSourceIds', 'checkIds', 'limits', 'budget']);
+  exact(object, ['turnIndex', 'turnId', 'requestAttempt', 'provider', 'model', 'profileHash', 'continuationEligible', 'temperature', 'reasoning', 'responseFormat', 'toolNames', 'toolPolicyHash', 'instructions', 'configuredContextSourceIds', 'checks', 'limits', 'budget']);
   const temperature = optionalFiniteNumber(object.temperature, 'snapshot.temperature');
   const reasoning = object.reasoning === undefined ? undefined : parseModelReasoningRequest(object.reasoning);
   const responseFormat = object.responseFormat === undefined ? undefined : decodeOwnedModelResponseFormat(object.responseFormat);
@@ -541,7 +541,7 @@ function decodeRunConfiguration(value: JsonValue | undefined): AgentRunConfigura
     ...(temperature !== undefined ? { temperature } : {}), ...(reasoning ? { reasoning } : {}), ...(responseFormat ? { responseFormat } : {}),
     toolNames: stringArray(object.toolNames, 'snapshot.toolNames'), toolPolicyHash: requiredString(object.toolPolicyHash, 'snapshot.toolPolicyHash'),
     instructions: Object.freeze(requiredArray(object.instructions, 'snapshot.instructions').map((item, index) => decodeInstruction(item, `snapshot.instructions[${String(index)}]`))),
-    configuredContextSourceIds: stringArray(object.configuredContextSourceIds, 'snapshot.configuredContextSourceIds'), checkIds: stringArray(object.checkIds, 'snapshot.checkIds'),
+    configuredContextSourceIds: stringArray(object.configuredContextSourceIds, 'snapshot.configuredContextSourceIds'), checks: decodeCheckBindings(object.checks),
     limits: decodeRunLimits(object.limits), budget: decodeRunBudget(object.budget)
   });
 }
@@ -556,6 +556,17 @@ function decodeInstruction(value: JsonValue, path: string): AgentEffectiveInstru
     provenance: requiredEnum(object.provenance, ['application', 'run', 'steering'] as const, `${path}.provenance`),
     ...(role !== undefined ? { role } : {}), ...(sourceUri !== undefined ? { sourceUri } : {}), ...(priority !== undefined ? { priority } : {})
   });
+}
+function decodeCheckBindings(value: JsonValue | undefined): readonly { readonly id: string; readonly implementationId: string }[] {
+  const ids = new Set<string>();
+  return Object.freeze(requiredArray(value, 'snapshot.checks').map((item, index) => {
+    const check = requiredObject(item, `snapshot.checks[${String(index)}]`);
+    exact(check, ['id', 'implementationId']);
+    const id = requiredString(check.id, `snapshot.checks[${String(index)}].id`);
+    if (ids.has(id)) throw malformed(`snapshot.checks contains duplicate id: ${id}`);
+    ids.add(id);
+    return Object.freeze({ id, implementationId: requiredString(check.implementationId, `snapshot.checks[${String(index)}].implementationId`) });
+  }));
 }
  function decodeRunLimits(value: JsonValue | undefined): AgentRunLimits {
   const object = requiredObject(value, 'limits');

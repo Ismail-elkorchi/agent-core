@@ -19,7 +19,7 @@ export interface AgentOperationConfiguration {
   readonly model: string;
   readonly runtimeImplementationId: string;
   readonly toolImplementationIds: readonly string[];
-  readonly checkIds: readonly string[];
+  readonly checks: readonly { readonly id: string; readonly implementationId: string }[];
   readonly policyHash: string;
 }
 
@@ -184,16 +184,29 @@ function decodeInput(value: unknown): AgentOperationInput {
 
 function decodeConfiguration(value: unknown): AgentOperationConfiguration {
   const configuration = object(value, 'operation configuration');
-  exact(configuration, ['providerId', 'providerImplementationId', 'model', 'runtimeImplementationId', 'toolImplementationIds', 'checkIds', 'policyHash']);
+  exact(configuration, ['providerId', 'providerImplementationId', 'model', 'runtimeImplementationId', 'toolImplementationIds', 'checks', 'policyHash']);
   return Object.freeze({
     providerId: identifier(configuration.providerId, 'providerId'),
     providerImplementationId: identifier(configuration.providerImplementationId, 'providerImplementationId'),
     model: nonempty(configuration.model, 'model'),
     runtimeImplementationId: identifier(configuration.runtimeImplementationId, 'runtimeImplementationId'),
     toolImplementationIds: uniqueIdentifiers(configuration.toolImplementationIds, 'toolImplementationIds'),
-    checkIds: uniqueIdentifiers(configuration.checkIds, 'checkIds'),
+    checks: checkBindings(configuration.checks),
     policyHash: nonempty(configuration.policyHash, 'policyHash')
   });
+}
+
+function checkBindings(value: unknown): readonly { readonly id: string; readonly implementationId: string }[] {
+  if (!Array.isArray(value)) throw new TypeError('checks must be an array.');
+  const ids = new Set<string>();
+  return Object.freeze(value.map((entry, index) => {
+    const object = parseJsonObject(entry);
+    exact(object, ['id', 'implementationId']);
+    const id = identifier(object.id, `checks[${String(index)}].id`);
+    if (ids.has(id)) throw new TypeError(`checks contains duplicate id: ${id}`);
+    ids.add(id);
+    return Object.freeze({ id, implementationId: identifier(object.implementationId, `checks[${String(index)}].implementationId`) });
+  }));
 }
 
 function decodeControl(value: unknown): AgentOperationControl {
