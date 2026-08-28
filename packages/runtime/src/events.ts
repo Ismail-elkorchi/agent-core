@@ -14,6 +14,7 @@ import type {
 } from '@agent-core/model';
 import { decodeOwnedModelCapabilities, decodeOwnedModelLimits, decodeOwnedModelModalities, decodeOwnedModelResponseFormat, decodeOwnedModelTransport, parseModelReasoningRequest, parseModelResponse, parseModelUsage } from '@agent-core/model';
 import {
+  decodeAgentRunBudgetState,
   decodeOwnedAgentCandidate,
   decodeOwnedAgentCheckResult,
   decodeOwnedAgentTerminalSnapshot,
@@ -37,6 +38,7 @@ import { decodeOwnedToolCall, decodeOwnedToolEffects, decodeOwnedToolObservation
 import type { BudgetAccountantSnapshot, RequestCostEstimate } from './orchestration/budget-accountant.js';
 import type { OverflowRecoveryResult } from './orchestration/overflow-recovery.js';
 import { decodeAgentOperationState, type AgentOperationState } from './operation/contracts.js';
+import { parseAgentDispositionDecision, type AgentDispositionDecision } from './operation/disposition/contracts.js';
 
 export interface AgentProviderStateSummary {
   readonly provider: string;
@@ -163,7 +165,8 @@ export type AgentEvent =
   | ({ readonly type: 'tool.updated'; readonly toolName: string; readonly progress: ToolProgress } & AgentToolCallAttemptIdentity)
   | ({ readonly type: 'tool.ended'; readonly toolName: string; readonly observation: ToolObservation } & AgentToolCallAttemptIdentity)
   | ({ readonly type: 'check.started'; readonly check: string; readonly implementationId: string; readonly requirement: AgentCheckRequirement; readonly timeoutMs: number } & AgentTurnIdentity)
-  | ({ readonly type: 'check.ended'; readonly check: string; readonly result: AgentCheckResult } & AgentTurnIdentity);
+  | ({ readonly type: 'check.ended'; readonly check: string; readonly result: AgentCheckResult } & AgentTurnIdentity)
+  | ({ readonly type: 'candidate.disposition.decided'; readonly revisionCount: number; readonly implementationId: string; readonly policyHash: string; readonly inputDigest: string; readonly outputDigest: string; readonly decision: AgentDispositionDecision } & AgentTurnIdentity);
 
 export type AgentAuditEvent = Exclude<AgentEvent, { readonly type: 'operation.transition' }>;
 
@@ -256,7 +259,7 @@ const AGENT_EVENT_DECODERS = {
   },
   'run.phase.changed': (value) => {
     exact(value, ['type', 'runId', 'phase', 'budget']);
-    return Object.freeze({ type: 'run.phase.changed', runId: requiredString(value.runId, 'runId'), phase: requiredEnum(value.phase, RUN_PHASES, 'phase'), budget: decodeRunBudget(value.budget) });
+    return Object.freeze({ type: 'run.phase.changed', runId: requiredString(value.runId, 'runId'), phase: requiredEnum(value.phase, RUN_PHASES, 'phase'), budget: decodeAgentRunBudgetState(value.budget) });
   },
   'run.configured': (value) => {
     exact(value, ['type', 'configuration']);
@@ -439,6 +442,18 @@ const AGENT_EVENT_DECODERS = {
     const result = decodeOwnedAgentCheckResult(requiredObject(value.result, 'result'));
     if (result.id !== check) throw malformed('check id does not match result id');
     return Object.freeze({ type: 'check.ended', ...decodeTurnIdentity(value), check, result });
+  },
+  'candidate.disposition.decided': (value) => {
+    exact(value, ['type', ...TURN_KEYS, 'revisionCount', 'implementationId', 'policyHash', 'inputDigest', 'outputDigest', 'decision']);
+    return Object.freeze({
+      type: 'candidate.disposition.decided', ...decodeTurnIdentity(value),
+      revisionCount: nonnegativeInteger(value.revisionCount, 'revisionCount'),
+      implementationId: requiredString(value.implementationId, 'implementationId'),
+      policyHash: requiredDigest(value.policyHash, 'policyHash'),
+      inputDigest: requiredDigest(value.inputDigest, 'inputDigest'),
+      outputDigest: requiredDigest(value.outputDigest, 'outputDigest'),
+      decision: parseAgentDispositionDecision(value.decision)
+    });
   }
 } satisfies AgentEventDecoderMap;
 
@@ -447,12 +462,11 @@ const TURN_KEYS = ['turnIndex', 'turnId', 'requestAttempt'] as const;
 const TOOL_CALL_KEYS = [...TURN_KEYS, 'toolBatchId', 'callIndex', 'callId'] as const;
 const TOOL_ATTEMPT_KEYS = [...TOOL_CALL_KEYS, 'toolAttempt'] as const;
 const REPLAY_KEYS = ['sessionId', 'replayedLedgers', 'replayedTurns', 'replayedSessionEntries', 'replayedCheckpoints', 'replayedToolResults', 'replayedEvidenceRecords', 'restoredProviderState', 'restoredProviderStateRef'] as const;
-const RUN_PHASES = ['preparing', 'requesting_model', 'executing_tools', 'waiting_for_approval', 'verifying', 'finalizing', 'ended'] as const;
+const RUN_PHASES = ['preparing', 'requesting_model', 'executing_tools', 'waiting_for_approval', 'verifying', 'deciding', 'finalizing', 'ended'] as const;
 const TOOL_CALL_TYPES = ['function', 'custom'] as const;
 const AUTHORIZATION_DECISIONS = ['allow', 'deny', 'require_approval'] as const;
 const APPROVAL_DECISIONS = ['allow', 'deny'] as const;
 const CHECK_REQUIREMENTS = ['required', 'advisory'] as const;
-const PRICING_STATUSES = ['known', 'partial', 'unknown'] as const;
 const BUDGET_PRESSURES = ['normal', 'constrained', 'critical', 'exhausted'] as const;
 const TERMINATION_REASONS = ['stop', 'tool_calls', 'output_limit', 'content_filter', 'unknown'] as const;
 const HISTORY_REDUCTION_KINDS = ['tool_result_reduced', 'checkpoint_installed', 'image_content_removed'] as const;
@@ -477,19 +491,6 @@ function decodeReplayPayload(value: JsonObject): AgentReplayPayload {
     replayedCheckpoints: nonnegativeInteger(value.replayedCheckpoints, 'replayedCheckpoints'), replayedToolResults: nonnegativeInteger(value.replayedToolResults, 'replayedToolResults'),
     replayedEvidenceRecords: nonnegativeInteger(value.replayedEvidenceRecords, 'replayedEvidenceRecords'),
     ...(restoredProviderState ? { restoredProviderState } : {}), ...(restoredProviderStateRef ? { restoredProviderStateRef } : {})
-  });
-}
-function decodeRunBudget(value: JsonValue | undefined): AgentRunBudgetState {
-  const object = requiredObject(value, 'budget');
-  exact(object, ['modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'elapsedMs', 'promptTokens', 'completionTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'knownCosts', 'pricingStatus', 'unknownPricedTokens', 'consecutiveProviderFailures', 'consecutiveToolFailures']);
-  return Object.freeze({
-    modelTurns: nonnegativeInteger(object.modelTurns, 'budget.modelTurns'), totalToolCalls: nonnegativeInteger(object.totalToolCalls, 'budget.totalToolCalls'),
-    repeatedIdenticalToolCalls: nonnegativeInteger(object.repeatedIdenticalToolCalls, 'budget.repeatedIdenticalToolCalls'), elapsedMs: nonnegativeInteger(object.elapsedMs, 'budget.elapsedMs'),
-    promptTokens: nonnegativeInteger(object.promptTokens, 'budget.promptTokens'), completionTokens: nonnegativeInteger(object.completionTokens, 'budget.completionTokens'),
-    cacheReadTokens: nonnegativeInteger(object.cacheReadTokens, 'budget.cacheReadTokens'), cacheWriteTokens: nonnegativeInteger(object.cacheWriteTokens, 'budget.cacheWriteTokens'),
-    reasoningTokens: nonnegativeInteger(object.reasoningTokens, 'budget.reasoningTokens'), knownCosts: nonnegativeNumberRecord(object.knownCosts, 'budget.knownCosts'),
-    pricingStatus: requiredEnum(object.pricingStatus, PRICING_STATUSES, 'budget.pricingStatus'), unknownPricedTokens: nonnegativeInteger(object.unknownPricedTokens, 'budget.unknownPricedTokens'),
-    consecutiveProviderFailures: nonnegativeInteger(object.consecutiveProviderFailures, 'budget.consecutiveProviderFailures'), consecutiveToolFailures: nonnegativeInteger(object.consecutiveToolFailures, 'budget.consecutiveToolFailures')
   });
 }
 function decodeRunConfiguration(value: JsonValue | undefined): AgentRunConfiguration {
@@ -542,7 +543,7 @@ function decodeRunConfiguration(value: JsonValue | undefined): AgentRunConfigura
     toolNames: stringArray(object.toolNames, 'snapshot.toolNames'), toolPolicyHash: requiredString(object.toolPolicyHash, 'snapshot.toolPolicyHash'),
     instructions: Object.freeze(requiredArray(object.instructions, 'snapshot.instructions').map((item, index) => decodeInstruction(item, `snapshot.instructions[${String(index)}]`))),
     configuredContextSourceIds: stringArray(object.configuredContextSourceIds, 'snapshot.configuredContextSourceIds'), checks: decodeCheckBindings(object.checks),
-    limits: decodeRunLimits(object.limits), budget: decodeRunBudget(object.budget)
+    limits: decodeRunLimits(object.limits), budget: decodeAgentRunBudgetState(object.budget)
   });
 }
 function decodeInstruction(value: JsonValue, path: string): AgentEffectiveInstruction {
@@ -553,7 +554,7 @@ function decodeInstruction(value: JsonValue, path: string): AgentEffectiveInstru
   const priority = optionalFiniteNumber(object.priority, `${path}.priority`);
   return Object.freeze({
     id: requiredString(object.id, `${path}.id`), content: requiredStringValue(object.content, `${path}.content`),
-    provenance: requiredEnum(object.provenance, ['application', 'run', 'steering'] as const, `${path}.provenance`),
+    provenance: requiredEnum(object.provenance, ['application', 'run', 'steering', 'disposition'] as const, `${path}.provenance`),
     ...(role !== undefined ? { role } : {}), ...(sourceUri !== undefined ? { sourceUri } : {}), ...(priority !== undefined ? { priority } : {})
   });
 }
@@ -570,12 +571,12 @@ function decodeCheckBindings(value: JsonValue | undefined): readonly { readonly 
 }
  function decodeRunLimits(value: JsonValue | undefined): AgentRunLimits {
   const object = requiredObject(value, 'limits');
-  exact(object, ['maxConcurrentToolCalls', 'modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'elapsedMs', 'promptTokens', 'completionTokens', 'activeImageCount', 'activeImageBytes', 'activeImageTokens', 'knownCost', 'consecutiveProviderFailures', 'consecutiveToolFailures']);
+  exact(object, ['maxConcurrentToolCalls', 'modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'candidateRevisions', 'elapsedMs', 'promptTokens', 'completionTokens', 'activeImageCount', 'activeImageBytes', 'activeImageTokens', 'knownCost', 'consecutiveProviderFailures', 'consecutiveToolFailures']);
   const knownCost = requiredObject(object.knownCost, 'limits.knownCost');
   exact(knownCost, ['amount', 'currency']);
   return Object.freeze({
     maxConcurrentToolCalls: positiveInteger(object.maxConcurrentToolCalls, 'limits.maxConcurrentToolCalls'), modelTurns: positiveInteger(object.modelTurns, 'limits.modelTurns'),
-    totalToolCalls: positiveInteger(object.totalToolCalls, 'limits.totalToolCalls'), repeatedIdenticalToolCalls: positiveInteger(object.repeatedIdenticalToolCalls, 'limits.repeatedIdenticalToolCalls'),
+    totalToolCalls: positiveInteger(object.totalToolCalls, 'limits.totalToolCalls'), repeatedIdenticalToolCalls: positiveInteger(object.repeatedIdenticalToolCalls, 'limits.repeatedIdenticalToolCalls'), candidateRevisions: nonnegativeInteger(object.candidateRevisions, 'limits.candidateRevisions'),
     elapsedMs: positiveInteger(object.elapsedMs, 'limits.elapsedMs'), promptTokens: positiveInteger(object.promptTokens, 'limits.promptTokens'),
     completionTokens: positiveInteger(object.completionTokens, 'limits.completionTokens'), activeImageCount: positiveInteger(object.activeImageCount, 'limits.activeImageCount'),
     activeImageBytes: positiveInteger(object.activeImageBytes, 'limits.activeImageBytes'), activeImageTokens: positiveInteger(object.activeImageTokens, 'limits.activeImageTokens'),
@@ -860,6 +861,7 @@ function requiredArray(value: JsonValue | undefined, path: string): readonly Jso
 function optionalArray(value: JsonValue | undefined, path: string): readonly JsonValue[] | undefined { return value === undefined ? undefined : requiredArray(value, path); }
 function requiredJson(value: JsonValue | undefined, path: string): JsonValue { if (value === undefined) throw malformed(`${path} is required`); return value; }
 function requiredString(value: JsonValue | undefined, path: string): string { if (typeof value !== 'string' || value.trim().length === 0) throw malformed(`${path} must be a non-empty string`); return value; }
+function requiredDigest(value: JsonValue | undefined, path: string): string { if (typeof value !== 'string' || !/^[0-9a-f]{64}$/u.test(value)) throw malformed(`${path} must be a SHA-256 digest`); return value; }
 function requiredStringValue(value: JsonValue | undefined, path: string): string { if (typeof value !== 'string') throw malformed(`${path} must be a string`); return value; }
 function optionalString(value: JsonValue | undefined, path: string): string | undefined { return value === undefined ? undefined : requiredString(value, path); }
 function optionalStringValue(value: JsonValue | undefined, path: string): string | undefined { return value === undefined ? undefined : requiredStringValue(value, path); }

@@ -10,6 +10,7 @@ import {
   AgentFinalizationError,
   AgentRunFinalizer,
   agentEventCodec,
+  createAgentPreparedDispositionEffect,
   createAgentPreparedCheckEffect,
   decodeAgentEvent,
   readCommittedTerminal
@@ -101,6 +102,7 @@ async function harness(options = {}) {
       artifacts
     },
     ...(options.checks ? { checks: options.checks } : {}),
+    ...(options.disposition ? { disposition: options.disposition } : {}),
     ...(options.instructions ? { instructions: options.instructions } : {}),
     ...(options.tools ? { tools: options.tools.map(adoptToolDefinition) } : {}),
     ...(options.toolPolicy ? { toolPolicy: options.toolPolicy } : {}),
@@ -480,6 +482,214 @@ test('candidate mappings preserve execution, completeness, source, and verificat
     assert.equal(assistant.candidate.status, status);
     if (source) assert.equal(assistant.candidate.source, source);
   }
+});
+
+test('disposition decisions accept, revise, fail, or remain inconclusive from exact persisted inputs', async () => {
+  const inputs = [];
+  const revisionPolicy = {
+    kind: 'deterministic',
+    implementationId: 'agent-core.tests.revision-disposition@1',
+    policyIdentity: { strategy: 'revise-once' },
+    evaluate(input) {
+      inputs.push(input);
+      assert.deepEqual(Object.keys(input).sort(), ['budget', 'candidate', 'checkResults', 'control', 'policyIdentity', 'receipts']);
+      return input.budget.candidateRevisions === 0
+        ? { kind: 'revise', instruction: 'Return a shorter, directly actionable answer.' }
+        : { kind: 'accept' };
+    }
+  };
+  const revised = await harness({
+    disposition: revisionPolicy,
+    script: [response('stop', 'first candidate'), response('stop', 'revised candidate')],
+    withoutSession: true
+  });
+  const revisedResult = ended(await revised.agent.run({ task: 'revise once' }).result);
+  assert.equal(revisedResult.executionStatus, 'completed');
+  assert.equal(revisedResult.candidate.message, 'revised candidate');
+  assert.equal(revisedResult.budget.candidateRevisions, 1);
+  assert.equal(inputs.length, 2);
+  assert.equal(Object.isFrozen(inputs[0]), true);
+  const records = [];
+  for await (const record of revised.events.read(revisedResult.runId)) records.push(record);
+  const eventIds = new Set(records.map(record => record.eventId));
+  for (const input of inputs) {
+    assert.equal(eventIds.has(input.receipts.providerSettlementEventId), true);
+    assert.equal(eventIds.has(input.receipts.candidateEventId), true);
+    assert.equal(input.receipts.verificationEventIds.every(eventId => eventIds.has(eventId)), true);
+  }
+  const decisions = records.filter(record => record.event.type === 'candidate.disposition.decided').map(record => record.event);
+  assert.deepEqual(decisions.map(event => event.decision.kind), ['revise', 'accept']);
+  assert.deepEqual(decisions.map(event => event.revisionCount), [0, 1]);
+  assert.equal(decisions.every(event => /^[0-9a-f]{64}$/u.test(event.inputDigest) && /^[0-9a-f]{64}$/u.test(event.outputDigest)), true);
+  const secondSnapshot = records.map(record => record.event).find(event => event.type === 'turn.snapshot.created' && event.snapshot.turnIndex === 2);
+  assert.deepEqual(secondSnapshot.snapshot.instructions.filter(instruction => instruction.provenance === 'disposition').map(instruction => instruction.content), ['Return a shorter, directly actionable answer.']);
+
+  const terminalCases = [
+    [{ kind: 'fail', reason: 'Candidate violates the admitted policy.' }, 'candidate_rejected'],
+    [{ kind: 'inconclusive', reason: 'The admitted policy lacks enough evidence.' }, 'disposition_inconclusive']
+  ];
+  for (const [decision, terminationReason] of terminalCases) {
+    const run = await harness({
+      disposition: {
+        kind: 'deterministic', implementationId: `agent-core.tests.${decision.kind}-disposition@1`,
+        policyIdentity: { strategy: decision.kind }, evaluate: () => decision
+      },
+      script: [response('stop', `${decision.kind} candidate`)],
+      withoutSession: true
+    });
+    const result = ended(await run.agent.run({ task: decision.kind }).result);
+    assert.equal(result.executionStatus, 'failed');
+    assert.equal(result.terminationReason, terminationReason);
+    assert.equal(result.errorMessage, decision.reason);
+    assert.equal(result.candidate.status, 'complete');
+    assert.equal(result.verificationStatus, 'not_required');
+  }
+});
+
+test('disposition decision commits recover before, after, and across their authoritative state transition', async () => {
+  class InterruptedDispositionRepository extends InMemoryEventRepository {
+    constructor(mode) { super(agentEventCodec); this.mode = mode; this.interrupted = false; }
+    async appendConditional(runId, event, options) {
+      const decision = event.type === 'candidate.disposition.decided';
+      const decidedTransition = event.type === 'operation.transition' && event.state.phase.kind === 'disposition' && event.state.phase.stage === 'decided';
+      if (!this.interrupted && this.mode === 'before_event' && decision) { this.interrupted = true; throw new Error('interrupted before disposition event'); }
+      const result = await super.appendConditional(runId, event, options);
+      if (!this.interrupted && ((this.mode === 'after_event' && decision) || (this.mode === 'after_transition' && decidedTransition))) {
+        this.interrupted = true;
+        throw new Error(`interrupted ${this.mode}`);
+      }
+      return result;
+    }
+  }
+  for (const [mode, expectedEvaluations] of [['before_event', 2], ['after_event', 1], ['after_transition', 1]]) {
+    const events = new InterruptedDispositionRepository(mode);
+    const provider = new ScriptedProvider([response('stop', `candidate ${mode}`)]);
+    let evaluations = 0;
+    const disposition = {
+      kind: 'deterministic', implementationId: 'agent-core.tests.crash-disposition@1', policyIdentity: { strategy: 'accept' },
+      evaluate() { evaluations += 1; return { kind: 'accept' }; }
+    };
+    const initial = await harness({ events, provider, disposition, withoutSession: true });
+    const control = initial.agent.run({ task: mode });
+    await assert.rejects(control.result, /interrupted/u);
+    const resumed = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events }, disposition });
+    const result = ended(await resumed.resume(control.runId).result);
+    assert.equal(result.executionStatus, 'completed');
+    assert.equal(result.candidate.message, `candidate ${mode}`);
+    assert.equal(evaluations, expectedEvaluations);
+    assert.equal(provider.calls.length, 1);
+    const ledger = await eventsFor(events, control.runId);
+    assert.equal(ledger.filter(event => event.type === 'candidate.disposition.decided').length, 1);
+    assert.equal(ledger.filter(event => event.type === 'run.ended').length, 1);
+  }
+});
+
+test('disposition implementation mismatch suspends and revision exhaustion preserves checked candidate truth', async () => {
+  class BeforeDecisionRepository extends InMemoryEventRepository {
+    interrupted = false;
+    async appendConditional(runId, event, options) {
+      if (!this.interrupted && event.type === 'candidate.disposition.decided') { this.interrupted = true; throw new Error('stop before decision'); }
+      return super.appendConditional(runId, event, options);
+    }
+  }
+  const events = new BeforeDecisionRepository(agentEventCodec);
+  const provider = new ScriptedProvider([response('stop', 'captured candidate')]);
+  const original = {
+    kind: 'deterministic', implementationId: 'agent-core.tests.original-disposition@1',
+    policyIdentity: { strategy: 'accept' }, evaluate: () => ({ kind: 'accept' })
+  };
+  const initial = await harness({ events, provider, disposition: original, withoutSession: true });
+  const control = initial.agent.run({ task: 'capture binding' });
+  await assert.rejects(control.result, /stop before decision/u);
+  const replacement = new AgentRuntime({
+    provider, model: 'scripted', toolBoundary, repositories: { events },
+    disposition: { ...original, implementationId: 'agent-core.tests.replacement-disposition@1' }
+  });
+  const mismatch = await replacement.resume(control.runId).result;
+  assert.equal(mismatch.state, 'suspended');
+  assert.equal(mismatch.reason, 'missing_implementation');
+
+  const checked = {
+    id: 'required', implementationId: 'agent-core.tests.required-check@1', kind: 'deterministic', requirement: 'required',
+    async run() { return { verdict: 'passed', summary: 'Candidate checked.' }; }
+  };
+  const exhausted = await harness({
+    checks: [checked],
+    disposition: {
+      kind: 'deterministic', implementationId: 'agent-core.tests.always-revise@1', policyIdentity: { strategy: 'always-revise' },
+      evaluate: () => ({ kind: 'revise', instruction: 'Revise again.' })
+    },
+    limits: { candidateRevisions: 0 },
+    script: [response('stop', 'checked candidate')],
+    withoutSession: true
+  });
+  const exhaustedResult = ended(await exhausted.agent.run({ task: 'exhaust revisions' }).result);
+  assert.equal(exhaustedResult.executionStatus, 'failed');
+  assert.equal(exhaustedResult.terminationReason, 'limit_exhausted');
+  assert.equal(exhaustedResult.exhaustedLimit, 'candidate_revisions');
+  assert.equal(exhaustedResult.candidate.status, 'complete');
+  assert.equal(exhaustedResult.candidate.message, 'checked candidate');
+  assert.equal(exhaustedResult.verificationStatus, 'passed');
+  assert.deepEqual(exhaustedResult.checkResults.map(result => result.verdict), ['passed']);
+  assert.equal(exhaustedResult.budget.candidateRevisions, 0);
+});
+
+test('queryable disposition effects reconcile a started decision without replay', async () => {
+  class InterruptedEffectDecisionRepository extends InMemoryEventRepository {
+    interrupted = false;
+    async appendConditional(runId, event, options) {
+      if (!this.interrupted && event.type === 'candidate.disposition.decided') { this.interrupted = true; throw new Error('process stopped after evaluator effect'); }
+      return super.appendConditional(runId, event, options);
+    }
+  }
+  const events = new InterruptedEffectDecisionRepository(agentEventCodec);
+  const provider = new ScriptedProvider([response('stop', 'effect candidate')]);
+  let starts = 0;
+  let reconciliations = 0;
+  let externalDecision;
+  const disposition = {
+    kind: 'effect', implementationId: 'agent-core.tests.effect-disposition@1', policyIdentity: { strategy: 'queryable' },
+    async prepare() {
+      return createAgentPreparedDispositionEffect({
+        authorization: { evaluator: 'remote-policy' },
+        recovery: { kind: 'queryable', service: 'test-disposition', reconcilerId: 'test-disposition@1', externalExecutionId: 'decision-1', expiresAt: '2099-01-01T00:00:00.000Z' },
+        async start() { starts += 1; externalDecision = { kind: 'accept' }; return externalDecision; },
+        async reconcile() { reconciliations += 1; return externalDecision ? { status: 'settled', decision: externalDecision } : { status: 'unknown' }; },
+        async release() {}
+      });
+    }
+  };
+  const initial = await harness({ events, provider, disposition, withoutSession: true });
+  const control = initial.agent.run({ task: 'recover effect decision' });
+  await assert.rejects(control.result, /process stopped after evaluator effect/u);
+  const pending = await new AgentOperationCoordinator(events).inspect(control.runId);
+  assert.equal(pending.state.phase.kind, 'disposition');
+  assert.equal(pending.state.phase.stage, 'effect_pending');
+  const resumed = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events }, disposition });
+  const result = ended(await resumed.resume(control.runId).result);
+  assert.equal(result.executionStatus, 'completed');
+  assert.equal(starts, 1);
+  assert.equal(reconciliations, 1);
+  assert.equal(provider.calls.length, 1);
+  const ledger = await eventsFor(events, control.runId);
+  assert.equal(ledger.filter(event => event.type === 'candidate.disposition.decided').length, 1);
+});
+
+test('effect disposition policies cannot bypass their durable effect boundary', async () => {
+  const { agent, events } = await harness({
+    disposition: {
+      kind: 'effect', implementationId: 'agent-core.tests.invalid-effect-disposition@1', policyIdentity: { strategy: 'invalid-direct-decision' },
+      async prepare() { return { kind: 'accept' }; }
+    },
+    script: [response('stop', 'candidate without an effect')],
+    withoutSession: true
+  });
+  const result = ended(await agent.run({ task: 'reject direct effect decision' }).result);
+  assert.equal(result.executionStatus, 'failed');
+  assert.equal(result.terminationReason, 'runtime_error');
+  assert.match(result.errorMessage, /must return a prepared external effect/u);
+  const ledger = await eventsFor(events, result.runId);
+  assert.equal(ledger.some(event => event.type === 'candidate.disposition.decided'), false);
 });
 
 test('stream interruption preserves an unknown provider outcome without treating partial output as settlement', async () => {
@@ -1360,6 +1570,6 @@ function terminal() {
   return decodeAgentTerminalSnapshot({
     runId: 'run-final', finalizationId: 'final-1', phase: 'ended', executionStatus: 'completed', verificationStatus: 'not_required', terminationReason: 'model_completed',
     modelTerminationReason: 'stop', candidate: { status: 'complete', message: 'done', source: 'content', turnIndex: 1 }, turnCount: 1, checkResults: [],
-    budget: { modelTurns: 1, totalToolCalls: 0, repeatedIdenticalToolCalls: 0, elapsedMs: 1, promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, knownCosts: {}, pricingStatus: 'unknown', unknownPricedTokens: 0, consecutiveProviderFailures: 0, consecutiveToolFailures: 0 }
+    budget: { modelTurns: 1, totalToolCalls: 0, repeatedIdenticalToolCalls: 0, candidateRevisions: 0, elapsedMs: 1, promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, knownCosts: {}, pricingStatus: 'unknown', unknownPricedTokens: 0, consecutiveProviderFailures: 0, consecutiveToolFailures: 0 }
   });
 }

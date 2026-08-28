@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { appendFile, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { InMemoryEventRepository, PersistenceCorruptionError } from '@agent-core/evidence';
+import { hashJson, InMemoryEventRepository, PersistenceCorruptionError } from '@agent-core/evidence';
 import { issueEffectStartTicket, settleExternalEffect, startExternalEffect } from '@agent-core/effects';
 import { AgentOperationCoordinator, AgentSession, InMemorySessionRepository, agentEventCodec, decodeAgentTerminalSnapshot } from '@agent-core/runtime';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
@@ -116,7 +116,7 @@ test('session final projections are idempotent and validate the complete termina
   const terminal = decodeAgentTerminalSnapshot({
     runId: 'run', finalizationId: 'fin', phase: 'ended', executionStatus: 'completed', verificationStatus: 'not_required', terminationReason: 'model_completed', modelTerminationReason: 'stop',
     candidate: { status: 'complete', message: 'done', source: 'content', turnIndex: 1 }, turnCount: 1, checkResults: [],
-    budget: { modelTurns: 1, totalToolCalls: 0, repeatedIdenticalToolCalls: 0, elapsedMs: 1, promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, knownCosts: {}, pricingStatus: 'unknown', unknownPricedTokens: 0, consecutiveProviderFailures: 0, consecutiveToolFailures: 0 }
+    budget: { modelTurns: 1, totalToolCalls: 0, repeatedIdenticalToolCalls: 0, candidateRevisions: 0, elapsedMs: 1, promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, knownCosts: {}, pricingStatus: 'unknown', unknownPricedTokens: 0, consecutiveProviderFailures: 0, consecutiveToolFailures: 0 }
   });
   const first = await repository.projectFinal(session.id, terminal);
   const second = await repository.projectFinal(session.id, terminal);
@@ -222,6 +222,7 @@ function completedTerminal(runId, finalizationId, message) {
       modelTurns: 1,
       totalToolCalls: 0,
       repeatedIdenticalToolCalls: 0,
+      candidateRevisions: 0,
       elapsedMs: 1,
       promptTokens: 0,
       completionTokens: 0,
@@ -248,7 +249,7 @@ async function acceptTestOperation(operations, runId) {
     runId,
     finalizationId: `${runId}:final`,
     input: { task: 'claimed', instructions: [], contextItems: [] },
-    configuration: { providerId: 'test', providerImplementationId: 'agent-core.tests.session-provider@1', model: 'model', runtimeImplementationId: 'test/runtime@1', toolImplementationIds: [], checks: [], policyHash: 'policy' }
+    configuration: { providerId: 'test', providerImplementationId: 'agent-core.tests.session-provider@1', model: 'model', runtimeImplementationId: 'test/runtime@1', toolImplementationIds: [], checks: [], disposition: { implementationId: 'agent-core.tests.accept-disposition@1', policyIdentity: { strategy: 'accept' }, policyHash: hashJson({ strategy: 'accept' }) }, policyHash: 'policy' }
   });
 }
 

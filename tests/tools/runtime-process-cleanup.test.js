@@ -130,7 +130,7 @@ test('cleanup failure transforms prior partial, checked, and aborted decisions w
         { id: 'required-pass', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run() { return { verdict: 'passed', summary: 'passed' }; } },
         { id: 'advisory-fail', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'advisory', async run() { return { verdict: 'failed', summary: 'failed advisory' }; } }
       ],
-      assertTerminal(terminal) { assert.deepEqual(terminal.checkResults.map(item => [item.id, item.verdict]), [['required-pass', 'passed'], ['advisory-fail', 'failed']]); }
+      assertTerminal(terminal) { assert.equal(terminal.verificationStatus, 'passed'); assert.deepEqual(terminal.checkResults.map(item => [item.id, item.verdict]), [['required-pass', 'passed'], ['advisory-fail', 'failed']]); }
     }
   ];
   for (const item of cases) {

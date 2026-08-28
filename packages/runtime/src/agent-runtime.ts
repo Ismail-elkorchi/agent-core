@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { type ContextHistoryReduction, decodeContextItemInput, type ContextItemInput, ContextManager } from './context/manager.js';
 import { hashJson, type EventAppendReceipt } from '@agent-core/evidence';
-import { normalizeJsonSafe, parseJsonValue } from '@agent-core/json';
+import { normalizeJsonSafe, parseJsonValue, type JsonValue } from '@agent-core/json';
 import {
   NO_EFFECT_EXPOSURE,
   UNKNOWN_EFFECT_RECOVERY,
@@ -117,6 +117,17 @@ import { executeAssistantToolCalls } from './orchestration/tool-execution.js';
 import { AgentOperationConflictError, AgentOperationCoordinator, type AgentOperationAdvance, type AgentOperationDriver } from './operation/driver.js';
 import { nextAgentOperationInstruction, type AgentCheckPreparationRecord, type AgentOperationPhase, type AgentOperationProcedure, type AgentToolOperationPhase } from './operation/contracts.js';
 import type { AgentToolCallOperationState, AgentToolPreparationRecord } from './operation/tool-state.js';
+import {
+  isAgentPreparedDispositionEffect,
+  parseAgentDispositionDecision,
+  parseAgentDispositionEffectReconciliation,
+  validateAgentDispositionPolicy,
+  type AgentDispositionDecision,
+  type AgentDispositionInput,
+  type AgentDispositionPolicy,
+  type AgentPreparedDispositionEffect
+} from './operation/disposition/contracts.js';
+import type { AgentDispositionOperationPhase, AgentDispositionPreparationRecord } from './operation/disposition/state.js';
 
 export type {
   AgentCheckContext,
@@ -127,6 +138,14 @@ export type {
   AgentCheckVerdict,
   AgentVerificationStatus
 } from './run/contracts.js';
+export type {
+  AgentDispositionDecision,
+  AgentDispositionEffectReconciliation,
+  AgentDispositionInput,
+  AgentDispositionPolicy,
+  AgentPreparedDispositionEffect,
+  AgentPreparedDispositionEffectInput
+} from './operation/disposition/contracts.js';
 
 export interface AgentInstruction {
   readonly id: string;
@@ -158,6 +177,7 @@ export interface AgentRuntimeOptions {
   readonly contextItems?: readonly ContextItemInput[];
   readonly contextProvider?: AgentContextProvider;
   readonly checks?: readonly AgentCheckDefinition[];
+  readonly disposition?: AgentDispositionPolicy;
   readonly verification?: AgentVerificationExecutionContext;
   readonly estimator?: TokenEstimator;
   readonly maxOutputTokens?: number;
@@ -237,11 +257,24 @@ type RequestAssemblyResult = { readonly ok: true; readonly request: ModelRequest
 
 type TerminalDecision =
   | { readonly executionStatus: 'completed'; readonly terminationReason: 'model_completed' | 'model_output_limit' | 'content_filtered' | 'unknown_model_termination'; readonly candidate: AgentPresentCandidate; readonly turnCount: number; readonly checkResults: readonly AgentCheckResult[]; readonly modelTerminationReason: ModelResponse['terminationReason']; readonly providerTerminationReason?: string; readonly cleanupDiagnostic?: { readonly kind: 'process_cleanup'; readonly message: string } }
-  | { readonly executionStatus: 'failed'; readonly terminationReason: 'model_output_limit' | 'content_filtered' | 'unknown_model_termination' | 'empty_response' | 'malformed_response' | 'provider_error' | 'runtime_error' | 'stream_interrupted' | 'request_too_large' | 'limit_exhausted'; readonly candidate: AgentCandidate; readonly errorMessage: string; readonly turnCount: number; readonly checkResults: readonly AgentCheckResult[]; readonly modelTerminationReason?: ModelResponse['terminationReason']; readonly providerTerminationReason?: string; readonly exhaustedLimit?: AgentLimitExceededError['limit']; readonly diagnostic?: ModelProviderErrorDiagnostic & { readonly turnIndex?: number }; readonly cleanupDiagnostic?: { readonly kind: 'process_cleanup'; readonly message: string } }
+  | { readonly executionStatus: 'failed'; readonly terminationReason: 'model_output_limit' | 'content_filtered' | 'unknown_model_termination' | 'empty_response' | 'malformed_response' | 'provider_error' | 'runtime_error' | 'stream_interrupted' | 'request_too_large' | 'limit_exhausted' | 'candidate_rejected' | 'disposition_inconclusive'; readonly candidate: AgentCandidate; readonly errorMessage: string; readonly turnCount: number; readonly checkResults: readonly AgentCheckResult[]; readonly verificationCompleted?: boolean; readonly modelTerminationReason?: ModelResponse['terminationReason']; readonly providerTerminationReason?: string; readonly exhaustedLimit?: AgentLimitExceededError['limit']; readonly diagnostic?: ModelProviderErrorDiagnostic & { readonly turnIndex?: number }; readonly cleanupDiagnostic?: { readonly kind: 'process_cleanup'; readonly message: string } }
   | { readonly executionStatus: 'aborted'; readonly terminationReason: 'aborted'; readonly candidate: AgentCandidate; readonly errorMessage: string; readonly turnCount: number; readonly checkResults: readonly AgentCheckResult[]; readonly diagnostic?: ModelProviderErrorDiagnostic & { readonly turnIndex?: number }; readonly cleanupDiagnostic?: { readonly kind: 'process_cleanup'; readonly message: string } };
 type ExecutionDecision = TerminalDecision
   | { readonly executionStatus: 'waiting_for_approval'; readonly approvals: readonly AgentApprovalRequest[] }
-  | { readonly executionStatus: 'waiting_for_recovery'; readonly reason: 'provider_outcome_unknown' | 'tool_outcome_unknown'; readonly effectId: string };
+  | { readonly executionStatus: 'waiting_for_recovery'; readonly reason: 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'disposition_outcome_unknown'; readonly effectId: string };
+
+type DispositionExecutionResult =
+  | Readonly<{ readonly kind: 'terminal'; readonly decision: TerminalDecision }>
+  | Readonly<{ readonly kind: 'revise'; readonly instruction: string; readonly turnIndex: number }>
+  | Readonly<{ readonly kind: 'waiting'; readonly decision: Extract<ExecutionDecision, { readonly executionStatus: 'waiting_for_recovery' }> }>;
+
+interface DispositionExecutionContinuation {
+  readonly phase: AgentDispositionOperationPhase;
+  readonly input: AgentDispositionInput;
+  readonly candidate: AgentPresentCandidate;
+  readonly checkResults: readonly AgentCheckResult[];
+  readonly response: ModelResponse;
+}
 
 interface ProviderExecutionContinuation {
   readonly identity: AgentTurnIdentity;
@@ -270,6 +303,7 @@ interface RunFailureContext {
   readonly activeCandidate: AgentCandidate;
   readonly checkResults: readonly AgentCheckResult[];
   readonly activeTurnIdentity?: AgentTurnIdentity;
+  readonly verificationCompleted?: boolean;
 }
 
 class AgentExecutionError extends Error {
@@ -286,6 +320,7 @@ export class AgentRuntime {
   private readonly tools: readonly CompiledToolDefinition[];
   private readonly resourceLeases: ResourceLeaseCoordinator;
   private readonly checks: readonly AgentCheckDefinition[];
+  private readonly disposition: AgentDispositionPolicy;
   private readonly commandExecution: CommandExecution | undefined;
   private readonly steerQueue: (AgentSteeringReceipt & { readonly instruction: string })[] = [];
   private activeAbortController: AbortController | undefined;
@@ -311,6 +346,7 @@ export class AgentRuntime {
       ?? new ResourceLeaseCoordinator();
     validateToolBoundary(options.toolBoundary);
     this.checks = validateAgentCheckDefinitions(options.checks);
+    this.disposition = validateAgentDispositionPolicy(options.disposition);
   }
 
   run(input: AgentRunInput): AgentRunControl {
@@ -345,7 +381,7 @@ export class AgentRuntime {
     const terminal = await this.options.repositories.events.latestOfType(input.runId, 'run.ended');
     if (terminal?.event.type === 'run.ended') return completedRunControl(input.runId, Object.freeze({ state: 'ended', terminal: terminal.event.terminal, deliveryDiagnostics: Object.freeze([]) }));
     const operation = await new AgentOperationCoordinator(this.options.repositories.events).attach(input.runId);
-    if (this.hasToolImplementationMismatch(operation)) {
+    if (this.hasToolImplementationMismatch(operation) || this.hasDispositionImplementationMismatch(operation)) {
       return completedRunControl(input.runId, missingImplementationSuspension(operation.state()));
     }
     this.assertRuntimeMatchesOperation(operation);
@@ -454,7 +490,7 @@ export class AgentRuntime {
       }
       const operation = await operations.attach(runId);
       this.activeOperationDriver = operation;
-      if (this.hasToolImplementationMismatch(operation)) return missingImplementationSuspension(operation.state());
+      if (this.hasToolImplementationMismatch(operation) || this.hasDispositionImplementationMismatch(operation)) return missingImplementationSuspension(operation.state());
       this.assertRuntimeMatchesOperation(operation);
       if (signal?.aborted) await this.scheduleAbortRun(runId, abortReason(signal.reason));
       else cleanupExternalAbort = bindExternalAbort(signal, () => this.scheduleAbortRun(runId, abortReason(signal?.reason)), abortController);
@@ -504,7 +540,7 @@ export class AgentRuntime {
         return operationSuspension(operation.state());
       }
       const recoverablePhase = operation.state().phase;
-      if (recoverablePhase.kind !== 'accepted' && recoverablePhase.kind !== 'preparing' && recoverablePhase.kind !== 'tools' && recoverablePhase.kind !== 'verification') {
+      if (recoverablePhase.kind !== 'accepted' && recoverablePhase.kind !== 'preparing' && recoverablePhase.kind !== 'tools' && recoverablePhase.kind !== 'verification' && recoverablePhase.kind !== 'disposition') {
         throw new Error(`Run ${runId} requires ${nextAgentOperationInstruction(operation.state()).kind === 'wait' ? 'an explicit recovery decision' : 'a phase-specific recovery implementation'} before it can resume.`);
       }
       const input: ResolvedAgentRunInput = {
@@ -555,7 +591,7 @@ export class AgentRuntime {
     try {
       decision = await this.executeRun({ runId, input, signal, controller, operation, append, emit, ...(providerContinuation ? { providerContinuation } : {}), ...(restoring ? { restoring: true } : {}) });
     } catch (error) {
-      if (error instanceof AgentOperationOwnershipLostError) throw error;
+      if (error instanceof AgentOperationOwnershipLostError || error instanceof AgentDispositionCommitInterruptedError) throw error;
       decision = await this.decisionFromError({ error, signal, runId, controller, append, emit });
     }
     if (decision.executionStatus === 'waiting_for_approval') {
@@ -599,7 +635,7 @@ export class AgentRuntime {
   private async executeRun(runtime: RunExecutionRuntime): Promise<ExecutionDecision> {
     throwIfAborted(runtime.signal);
     const runNotes: string[] = [];
-    const checkResults: AgentCheckResult[] = [];
+    let checkResults: AgentCheckResult[] = [];
     const initialPhase = runtime.operation.state().phase;
     const initialToolPhase = initialPhase.kind === 'tools' || initialPhase.kind === 'approval' ? initialPhase : undefined;
     const durableInstructions = initialToolPhase?.instructions;
@@ -607,7 +643,7 @@ export class AgentRuntime {
       ? [...durableInstructions]
       : runtime.providerContinuation
         ? [...runtime.providerContinuation.instructions]
-        : [...applicationInstructions(this.options.instructions), ...runInstructions(runtime.input.instructions)];
+        : [...applicationInstructions(this.options.instructions), ...runInstructions(runtime.input.instructions), ...dispositionInstructions(runtime.operation.state().revisionInstructions)];
     const replay = await rebuildContextFromRepositories({
       ...(this.options.repositories.session ? { session: this.options.repositories.session } : {}),
       events: this.options.repositories.events,
@@ -644,25 +680,34 @@ export class AgentRuntime {
     }
     throwIfAborted(runtime.signal);
 
-    if (initialPhase.kind === 'verification') {
-      const continuation = await this.verificationExecutionContinuation(runtime.runId, initialPhase);
+    let revisedTurnIndex: number | undefined;
+    if (initialPhase.kind === 'verification' || initialPhase.kind === 'disposition') {
       runtime.controller.transition('requesting_model');
-      await this.enterPhase(runtime.runId, runtime.controller, 'verifying', runtime.append, runtime.emit);
-      const resumedResults = await this.executeVerificationChecks({
-        runtime,
-        instructions: continuation.instructions,
-        candidate: continuation.candidate,
-        contextManager
-      });
-      await this.advanceOperation(runtime.operation, 'consume_verification_settlement', {
-        phase: { kind: 'finalization', stage: 'ready' }, budget: runtime.controller.snapshot()
-      });
-      return completedDecision(continuation.candidate, initialPhase.identity.turnIndex, resumedResults, continuation.response);
+      if (initialPhase.kind === 'verification') {
+        const continuation = await this.verificationExecutionContinuation(runtime.runId, initialPhase);
+        await this.enterPhase(runtime.runId, runtime.controller, 'verifying', runtime.append, runtime.emit);
+        checkResults = [...await this.executeVerificationChecks({
+          runtime,
+          instructions: continuation.instructions,
+          candidate: continuation.candidate,
+          contextManager
+        })];
+        await this.enterDisposition(runtime, continuation.candidate, checkResults, continuation.response);
+      } else {
+        runtime.controller.transition('verifying');
+      }
+      await this.enterPhase(runtime.runId, runtime.controller, 'deciding', runtime.append, runtime.emit);
+      const disposition = await this.executeDisposition(runtime);
+      if (disposition.kind === 'terminal') return disposition.decision;
+      if (disposition.kind === 'waiting') return disposition.decision;
+      effectiveInstructions.push(dispositionInstruction(disposition.instruction, runtime.operation.state().revisionInstructions.length));
+      checkResults = [];
+      revisedTurnIndex = disposition.turnIndex;
     }
 
-    let turnIndex = initialToolPhase
+    let turnIndex = revisedTurnIndex ?? (initialToolPhase
       ? initialToolPhase.identity.turnIndex
-      : runtime.providerContinuation?.identity.turnIndex ?? (initialPhase.kind === 'preparing' ? initialPhase.turnIndex : 1);
+      : runtime.providerContinuation?.identity.turnIndex ?? (initialPhase.kind === 'preparing' ? initialPhase.turnIndex : 1));
     let lastStartedTurnIndex = 0;
     let activeCandidate: AgentCandidate = { status: 'absent' };
     let activeTurnIdentity: AgentTurnIdentity | undefined;
@@ -803,9 +848,17 @@ export class AgentRuntime {
             budget: runtime.controller.snapshot()
           });
           await this.enterPhase(runtime.runId, runtime.controller, 'verifying', runtime.append, runtime.emit);
-          checkResults.push(...await this.executeVerificationChecks({ runtime, instructions: snapshot.instructions, candidate: activeCandidate, contextManager }));
-          await this.advanceOperation(runtime.operation, 'consume_verification_settlement', { phase: { kind: 'finalization', stage: 'ready' }, budget: runtime.controller.snapshot() });
-          return completedDecision(activeCandidate, turnIndex, checkResults, response);
+          checkResults = [...await this.executeVerificationChecks({ runtime, instructions: snapshot.instructions, candidate: activeCandidate, contextManager })];
+          await this.enterDisposition(runtime, activeCandidate, checkResults, response);
+          await this.enterPhase(runtime.runId, runtime.controller, 'deciding', runtime.append, runtime.emit);
+          const disposition = await this.executeDisposition(runtime);
+          if (disposition.kind === 'terminal') return disposition.decision;
+          if (disposition.kind === 'waiting') return disposition.decision;
+          effectiveInstructions.push(dispositionInstruction(disposition.instruction, runtime.operation.state().revisionInstructions.length));
+          checkResults = [];
+          activeCandidate = { status: 'absent' };
+          turnIndex = disposition.turnIndex;
+          continue;
         }
 
         runtime.controller.recordToolCalls(toolCalls);
@@ -855,7 +908,7 @@ export class AgentRuntime {
       }
       throw new Error('Model-turn execution exhausted its available entries without a terminal or limit decision.');
     } catch (error) {
-      if (error instanceof AgentOperationOwnershipLostError) throw error;
+      if (error instanceof AgentOperationOwnershipLostError || error instanceof AgentDispositionCommitInterruptedError || error instanceof AgentExecutionError) throw error;
       throw new AgentExecutionError(error, { lastStartedTurnIndex, activeCandidate, checkResults: [...checkResults], ...(activeTurnIdentity ? { activeTurnIdentity } : {}) });
     } finally {
       await modelSession?.close?.();
@@ -900,7 +953,7 @@ export class AgentRuntime {
         });
         const base = verificationPhaseBase(phase);
         const timeoutMs = check.timeoutMs ?? 30_000;
-        const eventKey = `${input.runtime.runId}:verification:${String(phase.nextCheckIndex)}:${check.id}`;
+        const eventKey = `${input.runtime.runId}:verification:${phase.identity.turnId}:${String(phase.identity.requestAttempt)}:${String(phase.nextCheckIndex)}:${check.id}`;
 
         if (phase.stage === 'ready') {
           await input.runtime.append({
@@ -1079,6 +1132,363 @@ export class AgentRuntime {
     return Object.freeze(completed);
   }
 
+  private async enterDisposition(
+    runtime: RunExecutionRuntime,
+    candidate: AgentPresentCandidate,
+    checkResults: readonly AgentCheckResult[],
+    response: ModelResponse
+  ): Promise<void> {
+    const phase = runtime.operation.state().phase;
+    if (phase.kind !== 'verification' || phase.stage !== 'complete') throw new Error(`Run ${runtime.runId} is not ready to enter candidate disposition.`);
+    const evidence = await this.readDispositionEvidence(runtime.runId, phase.identity, phase.providerSettlementEventId, phase.checkIds);
+    if (hashJson(normalizeJsonSafe(evidence.candidate).value) !== hashJson(normalizeJsonSafe(candidate).value)) {
+      throw new Error(`Run ${runtime.runId} candidate does not match its exact assistant settlement.`);
+    }
+    if (hashJson(normalizeJsonSafe(evidence.checkResults).value) !== hashJson(normalizeJsonSafe(checkResults).value)) {
+      throw new Error(`Run ${runtime.runId} verification results do not match their exact settlements.`);
+    }
+    if (hashJson(normalizeJsonSafe(evidence.response).value) !== hashJson(normalizeJsonSafe(response).value)) {
+      throw new Error(`Run ${runtime.runId} provider response does not match its exact settlement.`);
+    }
+    const state = runtime.operation.state();
+    if (state.control.status !== 'owned') throw new Error(`Run ${runtime.runId} has no owned control snapshot for candidate disposition.`);
+    const budget = runtime.controller.snapshot();
+    const controlSnapshot = Object.freeze({ status: 'owned' as const, driverGeneration: state.driverGeneration });
+    const input = dispositionInput(state, evidence, budget, controlSnapshot);
+    const inputDigest = hashJson(normalizeJsonSafe(input).value);
+    await this.advanceOperation(runtime.operation, 'consume_verification_settlement', {
+      phase: Object.freeze({
+        kind: 'disposition' as const,
+        stage: 'ready' as const,
+        identity: phase.identity,
+        providerSettlementEventId: phase.providerSettlementEventId,
+        candidateEventId: evidence.candidateEventId,
+        verificationEventIds: evidence.verificationEventIds,
+        inputDigest,
+        revisionCount: budget.candidateRevisions,
+        controlSnapshot,
+        budgetSnapshot: budget
+      }),
+      budget
+    });
+  }
+
+  private async executeDisposition(runtime: RunExecutionRuntime): Promise<DispositionExecutionResult> {
+    let retained: AgentPreparedDispositionEffect | undefined;
+    let continuation: DispositionExecutionContinuation | undefined;
+    try {
+      for (let transitions = 0; transitions < 12; transitions += 1) {
+        runtime.controller.assertElapsed();
+        const state = runtime.operation.state();
+        const phase = state.phase;
+        if (phase.kind !== 'disposition') throw new Error(`Run ${runtime.runId} left candidate disposition before it completed.`);
+        continuation = await this.dispositionExecutionContinuation(runtime.runId, state, phase);
+        const persisted = await this.findDispositionDecision(runtime.runId, continuation);
+
+        if (phase.stage !== 'decided' && persisted) {
+          let effect: Extract<ReturnType<typeof settleExternalEffect>, { readonly status: 'settled' | 'already_settled' }>['state'] | undefined;
+          if (phase.stage === 'effect_pending') effect = settleDispositionEffect(phase.effect, persisted.event.outputDigest, runtime.runId);
+          else if (phase.stage === 'effect_ready' || phase.stage === 'outcome_unknown') {
+            throw new Error(`Run ${runtime.runId} has a disposition decision that contradicts its external-effect state.`);
+          }
+          const instruction = nextAgentOperationInstruction(state);
+          if (instruction.kind !== 'execute') throw new Error(`Run ${runtime.runId} cannot consume its persisted disposition decision.`);
+          await this.advanceOperation(runtime.operation, instruction.procedure, {
+            phase: Object.freeze({
+              ...dispositionPhaseBase(phase),
+              stage: 'decided' as const,
+              decision: persisted.event.decision,
+              decisionEventId: persisted.eventId,
+              outputDigest: persisted.event.outputDigest,
+              ...(effect ? { effect } : {})
+            }),
+            budget: runtime.controller.snapshot()
+          });
+          continue;
+        }
+
+        if (phase.stage === 'decided') {
+          if (persisted?.eventId !== phase.decisionEventId) throw new Error(`Run ${runtime.runId} is missing its exact disposition decision ${phase.decisionEventId}.`);
+          if (phase.decision.kind === 'accept') {
+            await this.advanceOperation(runtime.operation, 'consume_disposition', { phase: { kind: 'finalization', stage: 'ready' }, budget: runtime.controller.snapshot() });
+            return Object.freeze({ kind: 'terminal', decision: completedDecision(continuation.candidate, phase.identity.turnIndex, continuation.checkResults, continuation.response) });
+          }
+          if (phase.decision.kind === 'fail' || phase.decision.kind === 'inconclusive') {
+            await this.advanceOperation(runtime.operation, 'consume_disposition', { phase: { kind: 'finalization', stage: 'ready' }, budget: runtime.controller.snapshot() });
+            return Object.freeze({
+              kind: 'terminal',
+              decision: dispositionFailedDecision(phase.decision, continuation.candidate, phase.identity.turnIndex, continuation.checkResults, continuation.response)
+            });
+          }
+          runtime.controller.recordCandidateRevision();
+          const revisionInstructions = Object.freeze([...state.revisionInstructions, phase.decision.instruction]);
+          await this.advanceOperation(runtime.operation, 'consume_disposition', {
+            phase: { kind: 'preparing', step: 'assemble_turn', turnIndex: phase.identity.turnIndex + 1 },
+            budget: runtime.controller.snapshot(),
+            revisionInstructions
+          });
+          return Object.freeze({ kind: 'revise', instruction: phase.decision.instruction, turnIndex: phase.identity.turnIndex + 1 });
+        }
+
+        if (phase.stage === 'outcome_unknown') {
+          return Object.freeze({ kind: 'waiting', decision: dispositionRecoveryDecision(phase) });
+        }
+
+        if (phase.stage === 'ready') {
+          if (this.disposition.kind === 'deterministic') {
+            const evaluated = this.disposition.evaluate(continuation.input);
+            if (isPromiseLike(evaluated)) throw new TypeError(`Deterministic disposition ${this.disposition.implementationId} returned a promise.`);
+            const decision = parseAgentDispositionDecision(evaluated);
+            await this.commitDispositionDecision(runtime, phase, decision, 'prepare_disposition');
+            continue;
+          }
+          const prepared = await this.disposition.prepare(continuation.input);
+          if (!isAgentPreparedDispositionEffect(prepared)) throw new TypeError(`Effect disposition ${this.disposition.implementationId} must return a prepared external effect.`);
+          retained = prepared;
+          const preparation = dispositionPreparation(this.disposition, continuation.input, retained);
+          const generation = state.driverGeneration;
+          const effectId = dispositionEffectId(runtime.runId, phase.identity, phase.revisionCount);
+          const issued = issueEffectStartTicket({
+            intent: Object.freeze({
+              effectId,
+              operationId: runtime.runId,
+              implementationId: this.disposition.implementationId,
+              parametersDigest: preparation.fingerprint,
+              recovery: preparation.recovery,
+              exposure: NO_EFFECT_EXPOSURE
+            }),
+            ticketId: `${effectId}:start:${String(generation)}`,
+            settlementPermitId: `${effectId}:settle:${String(generation)}`,
+            driverGeneration: generation,
+            currentDriverGeneration: generation
+          });
+          if (issued.status !== 'issued') throw new AgentOperationOwnershipLostError(runtime.runId);
+          await this.advanceOperation(runtime.operation, 'prepare_disposition', {
+            phase: Object.freeze({ ...dispositionPhaseBase(phase), stage: 'effect_ready' as const, preparation, effect: issued.state }),
+            budget: runtime.controller.snapshot()
+          });
+          continue;
+        }
+
+        if (this.disposition.kind !== 'effect') throw new Error(`Disposition ${this.disposition.implementationId} changed kind after its durable preparation.`);
+        if (!retained) {
+          const outcome = await this.disposition.prepare(continuation.input);
+          if (!isAgentPreparedDispositionEffect(outcome)) throw new Error(`Disposition ${this.disposition.implementationId} no longer requires the external effect captured by its durable intent.`);
+          retained = outcome;
+        }
+        requireMatchingDispositionPreparation(this.disposition, continuation.input, phase.preparation, retained);
+
+        if (phase.stage === 'effect_ready') {
+          if (phase.effect.ticket.driverGeneration !== state.driverGeneration) {
+            closeExternalEffect(phase.effect, 'cancelled_before_start');
+            const issued = issueEffectStartTicket({
+              intent: phase.effect.intent,
+              ticketId: `${phase.effect.intent.effectId}:start:${String(state.driverGeneration)}`,
+              settlementPermitId: `${phase.effect.intent.effectId}:settle:${String(state.driverGeneration)}`,
+              driverGeneration: state.driverGeneration,
+              currentDriverGeneration: state.driverGeneration
+            });
+            if (issued.status !== 'issued') throw new AgentOperationOwnershipLostError(runtime.runId);
+            await this.advanceOperation(runtime.operation, 'start_disposition', {
+              phase: Object.freeze({ ...dispositionPhaseBase(phase), stage: 'effect_ready' as const, preparation: phase.preparation, effect: issued.state }),
+              budget: runtime.controller.snapshot()
+            });
+            continue;
+          }
+          const started = startExternalEffect(phase.effect, phase.effect.ticket, state.driverGeneration);
+          if (started.status !== 'started') throw new AgentOperationOwnershipLostError(runtime.runId);
+          await this.advanceOperation(runtime.operation, 'start_disposition', {
+            phase: Object.freeze({ ...dispositionPhaseBase(phase), stage: 'effect_pending' as const, preparation: phase.preparation, effect: started.state }),
+            budget: runtime.controller.snapshot()
+          });
+          const active = retained;
+          const deadline = runSignalDeadline(runtime.controller, runtime.signal);
+          let decision: AgentDispositionDecision;
+          try { decision = parseAgentDispositionDecision(await active.start(deadline.signal)); }
+          catch {
+            return Object.freeze({ kind: 'waiting', decision: dispositionRecoveryDecision(runtime.operation.state().phase) });
+          } finally { deadline.dispose(); }
+          const settled = settleDispositionEffect(started.state, hashJson(normalizeJsonSafe(decision).value), runtime.runId);
+          await this.commitDispositionDecision(runtime, runtime.operation.state().phase, decision, 'reconcile_disposition', settled);
+          retained = undefined;
+          await active.release();
+          continue;
+        }
+
+        const active = retained;
+        const deadline = runSignalDeadline(runtime.controller, runtime.signal);
+        let reconciliation;
+        try { reconciliation = parseAgentDispositionEffectReconciliation(await active.reconcile(deadline.signal)); }
+        finally { deadline.dispose(); }
+        if (reconciliation.status === 'settled') {
+          const outputDigest = hashJson(normalizeJsonSafe(reconciliation.decision).value);
+          const settled = settleDispositionEffect(phase.effect, outputDigest, runtime.runId);
+          await this.commitDispositionDecision(runtime, phase, reconciliation.decision, 'reconcile_disposition', settled);
+          retained = undefined;
+          await active.release();
+          continue;
+        }
+        if (reconciliation.status === 'expired') {
+          const closed = closeExternalEffect(phase.effect, 'expired');
+          await this.advanceOperation(runtime.operation, 'reconcile_disposition', {
+            phase: Object.freeze({ ...dispositionPhaseBase(phase), stage: 'outcome_unknown' as const, preparation: phase.preparation, effect: closed }),
+            budget: runtime.controller.snapshot()
+          });
+        }
+        return Object.freeze({ kind: 'waiting', decision: dispositionRecoveryDecision(runtime.operation.state().phase) });
+      }
+      throw new Error(`Run ${runtime.runId} exceeded its bounded disposition transition path.`);
+    } catch (error) {
+      if (error instanceof AgentOperationOwnershipLostError || error instanceof AgentDispositionCommitInterruptedError || error instanceof AgentExecutionError) throw error;
+      throw new AgentExecutionError(error, {
+        lastStartedTurnIndex: continuation?.phase.identity.turnIndex ?? 0,
+        activeCandidate: continuation?.candidate ?? { status: 'absent' },
+        checkResults: continuation?.checkResults ?? [],
+        ...(continuation ? { activeTurnIdentity: continuation.phase.identity, verificationCompleted: true } : {})
+      });
+    } finally {
+      if (retained) await retained.release();
+    }
+  }
+
+  private async commitDispositionDecision(
+    runtime: RunExecutionRuntime,
+    phase: Extract<AgentDispositionOperationPhase, { readonly stage: 'ready' | 'effect_pending' }> | AgentOperationPhase,
+    decision: AgentDispositionDecision,
+    procedure: 'prepare_disposition' | 'reconcile_disposition',
+    effect?: Extract<ReturnType<typeof settleExternalEffect>, { readonly status: 'settled' | 'already_settled' }>['state']
+  ): Promise<void> {
+    if (phase.kind !== 'disposition' || (phase.stage !== 'ready' && phase.stage !== 'effect_pending')) throw new Error(`Run ${runtime.runId} cannot commit a decision outside an active disposition boundary.`);
+    const outputDigest = hashJson(normalizeJsonSafe(decision).value);
+    const configuration = runtime.operation.state().configuration.disposition;
+    try {
+      const receipt = await runtime.append({
+        type: 'candidate.disposition.decided',
+        ...phase.identity,
+        revisionCount: phase.revisionCount,
+        implementationId: configuration.implementationId,
+        policyHash: configuration.policyHash,
+        inputDigest: phase.inputDigest,
+        outputDigest,
+        decision
+      }, `${runtime.runId}:disposition:${phase.inputDigest}:decision`);
+      await this.advanceOperation(runtime.operation, procedure, {
+        phase: Object.freeze({
+          ...dispositionPhaseBase(phase),
+          stage: 'decided' as const,
+          decision,
+          decisionEventId: receipt.eventId,
+          outputDigest,
+          ...(effect ? { effect } : {})
+        }),
+        budget: runtime.controller.snapshot()
+      });
+    } catch (error) {
+      throw new AgentDispositionCommitInterruptedError(runtime.runId, error);
+    }
+  }
+
+  private async dispositionExecutionContinuation(
+    runId: string,
+    state: import('./operation/contracts.js').AgentOperationState,
+    phase: AgentDispositionOperationPhase
+  ): Promise<DispositionExecutionContinuation> {
+    if (!state.budget) throw new Error(`Run ${runId} has no durable budget at its disposition boundary.`);
+    if (state.budget.candidateRevisions !== phase.revisionCount) throw new Error(`Run ${runId} disposition revision count contradicts its durable budget.`);
+    const evidence = await this.readDispositionEvidence(
+      runId,
+      phase.identity,
+      phase.providerSettlementEventId,
+      this.checks.map((check) => check.id),
+      Object.freeze({ candidateEventId: phase.candidateEventId, verificationEventIds: phase.verificationEventIds })
+    );
+    const input = dispositionInput(state, evidence, phase.budgetSnapshot, phase.controlSnapshot);
+    const restoredInputDigest = hashJson(normalizeJsonSafe(input).value);
+    if (restoredInputDigest !== phase.inputDigest) throw new Error(`Run ${runId} disposition input no longer matches its captured digest.`);
+    return Object.freeze({ phase, input, candidate: evidence.candidate, checkResults: evidence.checkResults, response: evidence.response });
+  }
+
+  private async readDispositionEvidence(
+    runId: string,
+    identity: AgentTurnIdentity,
+    providerSettlementEventId: string,
+    checkIds: readonly string[],
+    expected?: Readonly<{ readonly candidateEventId: string; readonly verificationEventIds: readonly string[] }>
+  ): Promise<Readonly<{
+    candidate: AgentPresentCandidate;
+    checkResults: readonly AgentCheckResult[];
+    response: ModelResponse;
+    candidateEventId: string;
+    verificationEventIds: readonly string[];
+    providerSettlementEventId: string;
+  }>> {
+    let provider: Extract<AgentEvent, { readonly type: 'provider.attempt.settled' }> | undefined;
+    const candidates: { readonly eventId: string; readonly event: Extract<AgentEvent, { readonly type: 'assistant.ended' }> }[] = [];
+    const checks: { readonly eventId: string; readonly event: Extract<AgentEvent, { readonly type: 'check.ended' }> }[] = [];
+    for await (const record of this.options.repositories.events.read(runId)) {
+      const event = record.event;
+      if (record.eventId === providerSettlementEventId) {
+        if (event.type !== 'provider.attempt.settled' || !sameTurnIdentity(event, identity)) throw new Error(`Run ${runId} disposition provider receipt is contradictory.`);
+        provider = event;
+      }
+      if (event.type === 'assistant.ended' && sameTurnIdentity(event, identity)) candidates.push(Object.freeze({ eventId: record.eventId, event }));
+      if (event.type === 'check.ended' && sameTurnIdentity(event, identity)) checks.push(Object.freeze({ eventId: record.eventId, event }));
+    }
+    if (!provider) throw new Error(`Run ${runId} is missing disposition provider settlement ${providerSettlementEventId}.`);
+    if (candidates.length !== 1) throw new Error(`Run ${runId} requires one exact candidate settlement for disposition, found ${String(candidates.length)}.`);
+    const candidateRecord = candidates[0];
+    if (!candidateRecord || candidateRecord.event.candidate.status === 'absent') throw new Error(`Run ${runId} disposition requires a present candidate.`);
+    if (expected && candidateRecord.eventId !== expected.candidateEventId) throw new Error(`Run ${runId} disposition candidate receipt changed.`);
+    if (checks.length !== checkIds.length) throw new Error(`Run ${runId} disposition verification receipt count is contradictory.`);
+    const byCheck = new Map(checks.map((record) => [record.event.check, record]));
+    if (byCheck.size !== checks.length) throw new Error(`Run ${runId} contains duplicate disposition verification receipts.`);
+    const ordered = checkIds.map((checkId) => {
+      const record = byCheck.get(checkId);
+      if (!record) throw new Error(`Run ${runId} is missing disposition verification receipt ${checkId}.`);
+      return record;
+    });
+    const verificationEventIds = Object.freeze(ordered.map((record) => record.eventId));
+    if (expected && !sameStrings(expected.verificationEventIds, verificationEventIds)) throw new Error(`Run ${runId} disposition verification receipts changed.`);
+    return Object.freeze({
+      candidate: candidateRecord.event.candidate,
+      checkResults: Object.freeze(ordered.map((record) => record.event.result)),
+      response: provider.response,
+      candidateEventId: candidateRecord.eventId,
+      verificationEventIds,
+      providerSettlementEventId
+    });
+  }
+
+  private async findDispositionDecision(
+    runId: string,
+    continuation: DispositionExecutionContinuation
+  ): Promise<{ readonly eventId: string; readonly event: Extract<AgentEvent, { readonly type: 'candidate.disposition.decided' }> } | undefined> {
+    const matches: { readonly eventId: string; readonly event: Extract<AgentEvent, { readonly type: 'candidate.disposition.decided' }> }[] = [];
+    for await (const record of this.options.repositories.events.read(runId)) {
+      const event = record.event;
+      if (event.type === 'candidate.disposition.decided'
+        && sameTurnIdentity(event, continuation.phase.identity)
+        && event.revisionCount === continuation.phase.revisionCount) matches.push(Object.freeze({ eventId: record.eventId, event }));
+    }
+    if (matches.length > 1) throw new Error(`Run ${runId} contains multiple disposition decisions for one candidate revision.`);
+    const match = matches[0];
+    if (!match) return undefined;
+    const configuration = this.currentOperationConfiguration().disposition;
+    if (match.event.implementationId !== configuration.implementationId
+      || match.event.policyHash !== configuration.policyHash
+      || match.event.inputDigest !== continuation.phase.inputDigest
+      || match.event.outputDigest !== hashJson(normalizeJsonSafe(match.event.decision).value)) {
+      throw new Error(`Run ${runId} contains a disposition decision with contradictory evaluator binding or digests.`);
+    }
+    if (continuation.phase.stage === 'decided'
+      && (continuation.phase.decisionEventId !== match.eventId
+        || continuation.phase.outputDigest !== match.event.outputDigest
+        || hashJson(normalizeJsonSafe(continuation.phase.decision).value) !== match.event.outputDigest)) {
+      throw new Error(`Run ${runId} durable disposition state contradicts its decision event.`);
+    }
+    return match;
+  }
+
   private async resumeDurableToolBatch(runtime: RunExecutionRuntime, contextManager: ContextManager, observationStore: ObservationStore): Promise<ExecutionDecision | undefined> {
     const initial = runtime.operation.state().phase;
     if (initial.kind !== 'tools') throw new Error('Run does not have a durable tool batch to resume.');
@@ -1146,8 +1556,9 @@ export class AgentRuntime {
     if (runtime.signal.aborted || cause instanceof AgentVerificationAbortedError) {
       return { executionStatus: 'aborted', terminationReason: 'aborted', candidate: partialOrAbsent(recoveredCandidate), errorMessage: message, turnCount, checkResults, ...(terminalDiagnostic ? { diagnostic: terminalDiagnostic } : {}) };
     }
+    const failureCandidate = attached?.verificationCompleted ? recoveredCandidate : partialOrAbsent(recoveredCandidate);
     if (cause instanceof AgentLimitExceededError) {
-      return { executionStatus: 'failed', terminationReason: 'limit_exhausted', candidate: partialOrAbsent(recoveredCandidate), errorMessage: message, turnCount, checkResults, exhaustedLimit: cause.limit };
+      return { executionStatus: 'failed', terminationReason: 'limit_exhausted', candidate: failureCandidate, errorMessage: message, turnCount, checkResults, exhaustedLimit: cause.limit, ...(attached?.verificationCompleted ? { verificationCompleted: true } : {}) };
     }
     const boundaryError = cause instanceof ModelStreamInterruptedError ? cause.cause : cause;
     const terminationReason = boundaryError instanceof ModelContractError
@@ -1159,7 +1570,7 @@ export class AgentRuntime {
           : diagnostic
             ? 'provider_error'
             : 'runtime_error';
-    return { executionStatus: 'failed', terminationReason, candidate: partialOrAbsent(recoveredCandidate), errorMessage: message, turnCount, checkResults, ...(terminalDiagnostic ? { diagnostic: terminalDiagnostic } : {}) };
+    return { executionStatus: 'failed', terminationReason, candidate: failureCandidate, errorMessage: message, turnCount, checkResults, ...(attached?.verificationCompleted ? { verificationCompleted: true } : {}), ...(terminalDiagnostic ? { diagnostic: terminalDiagnostic } : {}) };
   }
 
   private createTurnSnapshot(input: {
@@ -1786,7 +2197,8 @@ export class AgentRuntime {
         case 'project_tool_settlement':
         case 'advance_after_tools':
         case 'consume_verification_settlement':
-        case 'decide_candidate':
+        case 'prepare_disposition':
+        case 'consume_disposition':
         case 'finalize_abort':
           await this.advanceOperation(operation, instruction, { phase: { kind: 'finalization', stage: 'ready' }, budget });
           continue;
@@ -1812,6 +2224,16 @@ export class AgentRuntime {
         }
         case 'reconcile_verification':
           if (state.phase.kind === 'verification' && state.phase.stage === 'effect_pending') throw new Error(`Run ${state.runId} has an unresolved verifier effect and cannot finalize it as a local failure.`);
+          await this.advanceOperation(operation, instruction, { phase: { kind: 'finalization', stage: 'ready' }, budget });
+          continue;
+        case 'start_disposition': {
+          if (state.phase.kind !== 'disposition' || state.phase.stage !== 'effect_ready') throw new Error(`Run ${state.runId} has contradictory disposition start state.`);
+          closeExternalEffect(state.phase.effect, 'cancelled_before_start');
+          await this.advanceOperation(operation, instruction, { phase: { kind: 'finalization', stage: 'ready' }, budget });
+          continue;
+        }
+        case 'reconcile_disposition':
+          if (state.phase.kind === 'disposition' && state.phase.stage === 'effect_pending') throw new Error(`Run ${state.runId} has an unresolved disposition effect and cannot finalize it as a local failure.`);
           await this.advanceOperation(operation, instruction, { phase: { kind: 'finalization', stage: 'ready' }, budget });
           continue;
         case 'finalize': return;
@@ -1849,10 +2271,28 @@ export class AgentRuntime {
       && captured.model === current.model
       && captured.runtimeImplementationId === current.runtimeImplementationId
       && captured.policyHash === current.policyHash
+      && sameDispositionBinding(captured.disposition, current.disposition)
       && sameCheckBindings(captured.checks, current.checks);
     return nonToolConfigurationMatches && !sameStrings(captured.toolImplementationIds, current.toolImplementationIds);
   }
+  private hasDispositionImplementationMismatch(operation: AgentOperationDriver): boolean {
+    const captured = operation.state().configuration;
+    const current = this.currentOperationConfiguration();
+    const nonDispositionConfigurationMatches = captured.providerId === current.providerId
+      && captured.providerImplementationId === current.providerImplementationId
+      && captured.model === current.model
+      && captured.runtimeImplementationId === current.runtimeImplementationId
+      && captured.policyHash === current.policyHash
+      && sameStrings(captured.toolImplementationIds, current.toolImplementationIds)
+      && sameCheckBindings(captured.checks, current.checks);
+    return nonDispositionConfigurationMatches && !sameDispositionBinding(captured.disposition, current.disposition);
+  }
   private currentOperationConfiguration() {
+    const disposition = Object.freeze({
+      implementationId: this.disposition.implementationId,
+      policyIdentity: this.disposition.policyIdentity,
+      policyHash: hashJson(this.disposition.policyIdentity)
+    });
     return Object.freeze({
       providerId: this.options.provider.id,
       providerImplementationId: this.options.provider.implementationId,
@@ -1860,6 +2300,7 @@ export class AgentRuntime {
       runtimeImplementationId: 'agent-core.runtime.operation-v1',
       toolImplementationIds: Object.freeze(this.tools.map((tool) => tool.implementationId)),
       checks: Object.freeze(this.checks.map(checkBinding)),
+      disposition,
       policyHash: hashJson(this.toolPolicy)
     });
   }
@@ -1979,6 +2420,7 @@ function cleanupFailureDecision(previous: TerminalDecision | undefined, error: E
     executionStatus: 'failed',
     terminationReason: 'runtime_error',
     errorMessage: `${'errorMessage' in previous ? `${previous.errorMessage} ` : ''}Process cleanup failed: ${error.message}`,
+    ...(previous.executionStatus === 'completed' || (previous.executionStatus === 'failed' && previous.verificationCompleted) ? { verificationCompleted: true } : {}),
     cleanupDiagnostic
   };
 }
@@ -2071,7 +2513,13 @@ function terminalSnapshot(runId: string, finalizationId: string, decision: Termi
       : Object.freeze({ ...candidate, status: 'partial' });
     return createAgentTerminalSnapshot({ ...common, candidate: abortedCandidate, executionStatus: 'aborted', terminationReason: 'aborted', verificationStatus: 'not_run', errorMessage: decision.errorMessage });
   }
-  return createAgentTerminalSnapshot({ ...common, executionStatus: 'failed', terminationReason: decision.terminationReason, verificationStatus: 'not_run', errorMessage: decision.errorMessage });
+  return createAgentTerminalSnapshot({
+    ...common,
+    executionStatus: 'failed',
+    terminationReason: decision.terminationReason,
+    verificationStatus: decision.verificationCompleted ? deriveAgentVerificationStatus(checks, decision.checkResults) : 'not_run',
+    errorMessage: decision.errorMessage
+  });
 }
 
 function candidateFromResponse(response: ModelResponse, turnIndex: number, continuingWithTools: boolean): AgentCandidate {
@@ -2104,6 +2552,8 @@ function decisionBeforeFinalization(decision: TerminalDecision, signal: AbortSig
 function applicationInstructions(input: readonly AgentInstruction[] | undefined): AgentEffectiveInstruction[] { return (input ?? []).map((item, index) => ({ id: item.id.length > 0 ? item.id : `application-${String(index + 1)}`, content: item.content, provenance: 'application', ...(item.role ? { role: item.role } : {}), ...(item.sourceUri ? { sourceUri: item.sourceUri } : {}), ...(item.priority === undefined ? {} : { priority: item.priority }) })); }
 function runInstructions(input: readonly string[] | undefined): AgentEffectiveInstruction[] { return (input ?? []).map((content, index) => ({ id: `run-${String(index + 1)}`, content, provenance: 'run' })); }
 function steeringInstructions(input: readonly string[], offset: number): AgentEffectiveInstruction[] { return input.map((content, index) => ({ id: `steering-${String(offset + index + 1)}`, content, provenance: 'steering' })); }
+function dispositionInstructions(input: readonly string[]): AgentEffectiveInstruction[] { return input.map((content, index) => dispositionInstruction(content, index + 1)); }
+function dispositionInstruction(content: string, revisionCount: number): AgentEffectiveInstruction { return Object.freeze({ id: `disposition-${String(revisionCount)}`, content, provenance: 'disposition' }); }
 function contextSourceIds(items: readonly ContextItemInput[] | undefined, provenance: 'configured' | 'provider' | 'run'): string[] {
   return (items ?? []).map((item, index) => isRecord(item) && typeof item.id === 'string' && item.id.length > 0
     ? item.id
@@ -2168,6 +2618,118 @@ async function requireMatchingCheckPreparation(
   }
   return prepared;
 }
+function dispositionInput(
+  state: import('./operation/contracts.js').AgentOperationState,
+  evidence: Readonly<{
+    readonly candidate: AgentPresentCandidate;
+    readonly checkResults: readonly AgentCheckResult[];
+    readonly candidateEventId: string;
+    readonly verificationEventIds: readonly string[];
+    readonly providerSettlementEventId: string;
+  }>,
+  budget: import('./run/contracts.js').AgentRunBudgetState,
+  control: Readonly<{ readonly status: 'owned'; readonly driverGeneration: number }>
+): AgentDispositionInput {
+  return Object.freeze({
+    candidate: evidence.candidate,
+    checkResults: Object.freeze([...evidence.checkResults]),
+    budget,
+    control,
+    policyIdentity: state.configuration.disposition.policyIdentity,
+    receipts: Object.freeze({
+      providerSettlementEventId: evidence.providerSettlementEventId,
+      candidateEventId: evidence.candidateEventId,
+      verificationEventIds: Object.freeze([...evidence.verificationEventIds])
+    })
+  });
+}
+function dispositionPhaseBase(phase: AgentDispositionOperationPhase) {
+  return Object.freeze({
+    kind: 'disposition' as const,
+    identity: phase.identity,
+    providerSettlementEventId: phase.providerSettlementEventId,
+    candidateEventId: phase.candidateEventId,
+    verificationEventIds: phase.verificationEventIds,
+    inputDigest: phase.inputDigest,
+    revisionCount: phase.revisionCount,
+    controlSnapshot: phase.controlSnapshot,
+    budgetSnapshot: phase.budgetSnapshot
+  });
+}
+function dispositionPreparation(
+  policy: Extract<AgentDispositionPolicy, { readonly kind: 'effect' }>,
+  input: AgentDispositionInput,
+  prepared: AgentPreparedDispositionEffect
+): AgentDispositionPreparationRecord {
+  const record = Object.freeze({
+    implementationId: policy.implementationId,
+    inputDigest: hashJson(normalizeJsonSafe(input).value),
+    authorization: prepared.authorization,
+    recovery: prepared.recovery
+  });
+  return Object.freeze({
+    implementationId: record.implementationId,
+    authorization: record.authorization,
+    recovery: record.recovery,
+    fingerprint: hashJson(normalizeJsonSafe(record).value)
+  });
+}
+function requireMatchingDispositionPreparation(
+  policy: Extract<AgentDispositionPolicy, { readonly kind: 'effect' }>,
+  input: AgentDispositionInput,
+  expected: AgentDispositionPreparationRecord,
+  retained: AgentPreparedDispositionEffect
+): void {
+  const actual = dispositionPreparation(policy, input, retained);
+  if (actual.implementationId !== expected.implementationId
+    || actual.fingerprint !== expected.fingerprint
+    || hashJson(actual.authorization) !== hashJson(expected.authorization)
+    || hashJson(normalizeJsonSafe(actual.recovery).value) !== hashJson(normalizeJsonSafe(expected.recovery).value)) {
+    throw new Error(`Disposition ${policy.implementationId} preparation changed after its durable intent was recorded.`);
+  }
+}
+function dispositionEffectId(runId: string, identity: AgentTurnIdentity, revisionCount: number): string {
+  return `disposition:${hashJson(normalizeJsonSafe({ runId, identity, revisionCount }).value)}`;
+}
+function settleDispositionEffect(
+  effect: Extract<AgentDispositionOperationPhase, { readonly stage: 'effect_pending' }>['effect'],
+  outputDigest: string,
+  runId: string
+): Extract<ReturnType<typeof settleExternalEffect>, { readonly status: 'settled' | 'already_settled' }>['state'] {
+  const settlement = settleExternalEffect(effect, effect.settlementPermit, {
+    outcome: 'succeeded',
+    resultDigest: outputDigest,
+    exposure: knownEffectExposure([])
+  });
+  if (settlement.status !== 'settled' && settlement.status !== 'already_settled') throw new Error(`Run ${runId} disposition effect settlement was rejected: ${settlement.status}.`);
+  return settlement.state;
+}
+function dispositionRecoveryDecision(phase: AgentOperationPhase): Extract<ExecutionDecision, { readonly executionStatus: 'waiting_for_recovery' }> {
+  if (phase.kind !== 'disposition' || (phase.stage !== 'effect_pending' && phase.stage !== 'outcome_unknown')) {
+    throw new Error('Disposition recovery requires a pending or unknown external effect.');
+  }
+  return Object.freeze({ executionStatus: 'waiting_for_recovery', reason: 'disposition_outcome_unknown', effectId: phase.effect.intent.effectId });
+}
+function dispositionFailedDecision(
+  decision: Extract<AgentDispositionDecision, { readonly kind: 'fail' | 'inconclusive' }>,
+  candidate: AgentPresentCandidate,
+  turnCount: number,
+  checkResults: readonly AgentCheckResult[],
+  response: ModelResponse
+): TerminalDecision {
+  return Object.freeze({
+    executionStatus: 'failed',
+    terminationReason: decision.kind === 'fail' ? 'candidate_rejected' : 'disposition_inconclusive',
+    candidate,
+    errorMessage: decision.reason,
+    turnCount,
+    checkResults,
+    verificationCompleted: true,
+    modelTerminationReason: response.terminationReason,
+    ...(response.providerTerminationReason ? { providerTerminationReason: response.providerTerminationReason } : {})
+  });
+}
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> { return typeof value === 'object' && value !== null && 'then' in value && typeof value.then === 'function'; }
 function formatOverflowDiagnostic(diagnostic: OverflowDiagnostic): string { return ['Request assembly exceeded budget after overflow recovery.', `Reason: ${diagnostic.reason}.`, `Components: messages=${String(diagnostic.messageTokens)}, contextHistory=${String(diagnostic.contextHistoryTokens)}, context=${String(diagnostic.contextTokens)}, evidence=${String(diagnostic.evidenceTokens)}, toolSchemas=${String(diagnostic.toolSchemaTokens)}, outputReserve=${String(diagnostic.outputReserveTokens)}.`, `Total request tokens=${String(diagnostic.totalRequestTokens)}.`, `Recovery actions attempted=${diagnostic.reductionsAttempted.map(formatOverflowAction).join(', ') || 'none'}.`].join(' '); }
 function formatOverflowAction(action: OverflowRecoveryAction): string { if (action.kind === 'reduce_context_history') return `reduce_context_history(${String(action.reductions)})`; if (action.kind === 'reduce_context') return `reduce_context(${String(action.removedItems)})`; if (action.kind === 'install_checkpoint') return `install_checkpoint(${String(action.compactedToolResults)})`; return action.kind; }
 class RequestAssemblyError extends Error {}
@@ -2209,6 +2771,7 @@ function operationSuspension(state: import('./operation/contracts.js').AgentOper
     const unknown = phase.callStates.find((call) => call.stage === 'outcome_unknown');
     if (unknown?.stage === 'outcome_unknown') return Object.freeze({ state: 'suspended', reason: 'tool_outcome_unknown', runId: state.runId, finalizationId: state.finalizationId, effectId: unknown.effect.intent.effectId, budget: state.budget });
   }
+  if (phase.kind === 'disposition' && phase.stage === 'outcome_unknown') return Object.freeze({ state: 'suspended', reason: 'disposition_outcome_unknown', runId: state.runId, finalizationId: state.finalizationId, effectId: phase.effect.intent.effectId, budget: state.budget });
   if (phase.kind !== 'suspended') throw new Error(`Run ${state.runId} is not suspended.`);
   return Object.freeze({
     state: 'suspended',
@@ -2269,6 +2832,14 @@ function missingImplementationSuspension(state: import('./operation/contracts.js
 function sameStrings(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
+function sameDispositionBinding(
+  left: Readonly<{ readonly implementationId: string; readonly policyIdentity: JsonValue; readonly policyHash: string }>,
+  right: Readonly<{ readonly implementationId: string; readonly policyIdentity: JsonValue; readonly policyHash: string }>
+): boolean {
+  return left.implementationId === right.implementationId
+    && left.policyHash === right.policyHash
+    && hashJson(left.policyIdentity) === hashJson(right.policyIdentity);
+}
 function checkBinding(check: AgentCheckDefinition): { readonly id: string; readonly implementationId: string } {
   return Object.freeze({ id: check.id, implementationId: check.implementationId });
 }
@@ -2297,6 +2868,12 @@ class AgentOperationOwnershipLostError extends Error {
   constructor(runId: string) {
     super(`Run ${runId} continued under a replacement driver after this process settled its exact external effect.`);
     this.name = 'AgentOperationOwnershipLostError';
+  }
+}
+class AgentDispositionCommitInterruptedError extends Error {
+  constructor(runId: string, override readonly cause: unknown) {
+    super(`Run ${runId} was interrupted while durably committing its disposition decision: ${errorMessage(cause)}`);
+    this.name = 'AgentDispositionCommitInterruptedError';
   }
 }
 function completedRunControl(runId: string, result: AgentRunResult): AgentRunControl {

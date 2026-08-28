@@ -44,6 +44,7 @@ export class AgentRunController {
     modelTurns: 0,
     totalToolCalls: 0,
     repeatedIdenticalToolCalls: 0,
+    candidateRevisions: 0,
     promptTokens: 0,
     completionTokens: 0,
     cacheReadTokens: 0,
@@ -103,7 +104,8 @@ export class AgentRunController {
       || (previous === 'requesting_model' && (next === 'executing_tools' || next === 'verifying' || next === 'finalizing'))
       || (previous === 'executing_tools' && (next === 'waiting_for_approval' || next === 'requesting_model' || next === 'finalizing'))
       || (previous === 'waiting_for_approval' && (next === 'executing_tools' || next === 'finalizing'))
-      || (previous === 'verifying' && next === 'finalizing')
+      || (previous === 'verifying' && (next === 'deciding' || next === 'finalizing'))
+      || (previous === 'deciding' && (next === 'requesting_model' || next === 'finalizing'))
       || (previous === 'finalizing' && next === 'ended');
     if (!allowed) throw new Error(`Illegal run transition: ${previous} -> ${next}.`);
     this.currentPhase = next;
@@ -116,6 +118,16 @@ export class AgentRunController {
       throw this.limitError('model_turns', this.state.modelTurns + 1, this.limits.modelTurns, 1, previous, { ...previous, modelTurns: this.state.modelTurns + 1 }, false);
     }
     this.state = { ...this.state, modelTurns: this.state.modelTurns + 1 };
+  }
+
+  recordCandidateRevision(): void {
+    this.assertElapsed();
+    const previous = this.snapshot();
+    const revisions = this.state.candidateRevisions + 1;
+    if (revisions > this.limits.candidateRevisions) {
+      throw this.limitError('candidate_revisions', revisions, this.limits.candidateRevisions, 1, previous, { ...previous, candidateRevisions: revisions }, false);
+    }
+    this.state = { ...this.state, candidateRevisions: revisions };
   }
 
   recordToolCalls(calls: readonly ToolCall[]): void {

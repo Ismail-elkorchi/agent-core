@@ -17,6 +17,7 @@ export type AgentRunPhase =
   | 'executing_tools'
   | 'waiting_for_approval'
   | 'verifying'
+  | 'deciding'
   | 'finalizing'
   | 'ended';
 
@@ -74,7 +75,7 @@ export interface AgentApprovalSuspension extends AgentRunIdentity {
 
 export interface AgentOperationSuspension extends AgentRunIdentity {
   readonly state: 'suspended';
-  readonly reason: 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'missing_implementation' | 'user_decision';
+  readonly reason: 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'disposition_outcome_unknown' | 'missing_implementation' | 'user_decision';
   readonly effectId?: string;
   readonly cleanupDiagnostic?: { readonly kind: 'process_cleanup'; readonly message: string };
   readonly budget: AgentRunBudgetState;
@@ -94,7 +95,7 @@ export type AgentRunIdentity = Readonly<{ readonly runId: string; readonly final
 export type AgentEffectiveInstruction = Readonly<{
   readonly id: string;
   readonly content: string;
-  readonly provenance: 'application' | 'run' | 'steering';
+  readonly provenance: 'application' | 'run' | 'steering' | 'disposition';
   readonly role?: string;
   readonly sourceUri?: string;
   readonly priority?: number;
@@ -209,12 +210,13 @@ export function isAgentPreparedCheckEffect(value: unknown): value is AgentPrepar
 export type AgentLimitKind =
   | 'model_turns' | 'total_tool_calls' | 'repeated_tool_calls' | 'elapsed_time'
   | 'prompt_tokens' | 'completion_tokens' | 'known_cost' | 'consecutive_provider_failures'
-  | 'consecutive_tool_failures';
+  | 'consecutive_tool_failures' | 'candidate_revisions';
 export interface AgentRunLimits {
   readonly maxConcurrentToolCalls: number;
   readonly modelTurns: number;
   readonly totalToolCalls: number;
   readonly repeatedIdenticalToolCalls: number;
+  readonly candidateRevisions: number;
   readonly elapsedMs: number;
   readonly promptTokens: number;
   readonly completionTokens: number;
@@ -230,6 +232,7 @@ export const DEFAULT_AGENT_RUN_LIMITS: AgentRunLimits = Object.freeze({
   modelTurns: 32,
   totalToolCalls: 128,
   repeatedIdenticalToolCalls: 3,
+  candidateRevisions: 3,
   elapsedMs: 30 * 60 * 1_000,
   promptTokens: 1_000_000,
   completionTokens: 250_000,
@@ -244,6 +247,7 @@ export type AgentRunBudgetState = Readonly<{
   readonly modelTurns: number;
   readonly totalToolCalls: number;
   readonly repeatedIdenticalToolCalls: number;
+  readonly candidateRevisions: number;
   readonly elapsedMs: number;
   readonly promptTokens: number;
   readonly completionTokens: number;
@@ -256,6 +260,22 @@ export type AgentRunBudgetState = Readonly<{
   readonly consecutiveProviderFailures: number;
   readonly consecutiveToolFailures: number;
 }>;
+
+const AGENT_RUN_BUDGET_FIELDS = [
+  'modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'candidateRevisions', 'elapsedMs',
+  'promptTokens', 'completionTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens',
+  'knownCosts', 'pricingStatus', 'unknownPricedTokens', 'consecutiveProviderFailures', 'consecutiveToolFailures'
+] as const;
+
+export function decodeAgentRunBudgetState(value: unknown): AgentRunBudgetState {
+  const object = parseJsonObject(value);
+  const fields = Object.keys(object);
+  if (fields.length !== AGENT_RUN_BUDGET_FIELDS.length || fields.some((field) => !AGENT_RUN_BUDGET_FIELDS.includes(field as typeof AGENT_RUN_BUDGET_FIELDS[number]))) {
+    throw contract('Invalid run budget.', ['budget fields are invalid.']);
+  }
+  if (!isBudgetState(object)) throw contract('Invalid run budget.', ['budget values are invalid.']);
+  return Object.freeze({ ...object, knownCosts: Object.freeze({ ...object.knownCosts }) });
+}
 
 export interface AgentTurnSnapshotRecord {
   readonly turnIndex: number;
@@ -306,7 +326,8 @@ export type AgentCompletedTerminationReason = 'model_completed' | 'model_output_
 export type AgentFailureTerminationReason =
   | Exclude<AgentCompletedTerminationReason, 'model_completed'>
   | 'empty_response' | 'malformed_response' | 'provider_error' | 'runtime_error'
-  | 'stream_interrupted' | 'request_too_large' | 'limit_exhausted';
+  | 'stream_interrupted' | 'request_too_large' | 'limit_exhausted'
+  | 'candidate_rejected' | 'disposition_inconclusive';
 type AgentTerminalBase = AgentRunIdentity & Readonly<{
   readonly phase: 'ended';
   readonly turnCount: number;
@@ -328,7 +349,7 @@ export type AgentCompletedTerminalSnapshot = AgentTerminalBase & Readonly<{
 export type AgentFailedTerminalSnapshot = AgentTerminalBase & Readonly<{
   readonly executionStatus: 'failed';
   readonly candidate: AgentCandidate;
-  readonly verificationStatus: 'not_run';
+  readonly verificationStatus: AgentVerificationStatus;
   readonly terminationReason: AgentFailureTerminationReason;
   readonly errorMessage: string;
 }>;
@@ -365,6 +386,7 @@ export function validateAgentRunLimits(input: Partial<AgentRunLimits> = {}): Age
     'consecutiveProviderFailures', 'consecutiveToolFailures'
   ];
   const issues = fields.flatMap((field) => positiveInteger(limits[field]) ? [] : [`${field} must be a positive finite integer.`]);
+  if (!Number.isSafeInteger(limits.candidateRevisions) || limits.candidateRevisions < 0) issues.push('candidateRevisions must be a nonnegative safe integer.');
   if (!Number.isFinite(limits.knownCost.amount) || limits.knownCost.amount <= 0) issues.push('knownCost.amount must be positive and finite.');
   if (limits.knownCost.currency.trim().length === 0) issues.push('knownCost.currency must be non-empty.');
   if (issues.length > 0) throw new AgentContractError('Invalid run limits.', issues);
@@ -506,7 +528,7 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
     if (candidate && candidate.status !== 'absent') issues.push(...completedCandidateIssues(value.terminationReason, candidate.status));
     if (value.errorMessage !== undefined) issues.push('Completed execution cannot have errorMessage.');
   } else if (value.executionStatus === 'failed') {
-    if (value.verificationStatus !== 'not_run') issues.push('Failed execution must use verificationStatus not_run.');
+    if (!oneOf(value.verificationStatus, ['not_required', 'not_run', 'passed', 'failed', 'inconclusive'])) issues.push('Failed execution has an invalid verification status.');
     if (!oneOf(value.terminationReason, FAILURE_REASONS)) issues.push('Failed execution has an invalid termination reason.');
     if (typeof value.errorMessage !== 'string' || value.errorMessage.trim().length === 0) issues.push('Failed execution requires errorMessage.');
   } else if (value.executionStatus === 'aborted') {
@@ -544,7 +566,7 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
   if (value.executionStatus === 'failed') return Object.freeze({
     ...base,
     executionStatus: 'failed',
-    verificationStatus: 'not_run',
+    verificationStatus: value.verificationStatus as AgentVerificationStatus,
     terminationReason: value.terminationReason as AgentFailureTerminationReason,
     errorMessage: value.errorMessage as string
   });
@@ -561,11 +583,11 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
 export function terminalSnapshotFingerprint(snapshot: AgentTerminalSnapshot): string { return canonicalJsonString(snapshot); }
 const AGENT_LIMIT_KINDS: readonly AgentLimitKind[] = [
   'model_turns', 'total_tool_calls', 'repeated_tool_calls', 'elapsed_time', 'prompt_tokens',
-  'completion_tokens', 'known_cost', 'consecutive_provider_failures', 'consecutive_tool_failures'
+  'completion_tokens', 'known_cost', 'consecutive_provider_failures', 'consecutive_tool_failures', 'candidate_revisions'
 ];
 const FAILURE_REASONS: readonly AgentFailureTerminationReason[] = [
   'model_output_limit', 'content_filtered', 'unknown_model_termination', 'empty_response', 'malformed_response',
-  'provider_error', 'runtime_error', 'stream_interrupted', 'request_too_large', 'limit_exhausted'
+  'provider_error', 'runtime_error', 'stream_interrupted', 'request_too_large', 'limit_exhausted', 'candidate_rejected', 'disposition_inconclusive'
 ];
 function terminalBaseIssues(value: Record<string, unknown>): string[] {
   const issues: string[] = [];
@@ -598,7 +620,7 @@ function completedCandidateIssues(terminationReason: unknown, candidateStatus: A
 }
 function isBudgetState(value: unknown): value is AgentRunBudgetState {
   if (!isRecord(value)) return false;
-  const names = ['modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'elapsedMs', 'promptTokens', 'completionTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'unknownPricedTokens', 'consecutiveProviderFailures', 'consecutiveToolFailures'];
+  const names = ['modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'candidateRevisions', 'elapsedMs', 'promptTokens', 'completionTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'unknownPricedTokens', 'consecutiveProviderFailures', 'consecutiveToolFailures'];
   if (!names.every((name) => typeof value[name] === 'number' && Number.isFinite(value[name]) && Number.isInteger(value[name]) && (value[name]) >= 0)) return false;
   return finiteNonnegativeNumberRecord(value.knownCosts)
     && oneOf(value.pricingStatus, ['known', 'partial', 'unknown']);

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
-import { InMemoryEventRepository } from '@agent-core/evidence';
+import { hashJson, InMemoryEventRepository } from '@agent-core/evidence';
 import {
   AgentOperationConflictError,
   AgentOperationCoordinator,
@@ -22,6 +22,7 @@ const acceptance = (runId = 'run-operation') => ({
     runtimeImplementationId: 'runtime-test-v1',
     toolImplementationIds: ['read-v1'],
     checks: [{ id: 'required-check', implementationId: 'agent-core.test.check.v1' }],
+    disposition: { implementationId: 'agent-core.tests.accept-disposition@1', policyIdentity: { strategy: 'accept' }, policyHash: hashJson({ strategy: 'accept' }) },
     policyHash: 'policy-hash'
   }
 });
@@ -106,7 +107,7 @@ test('a stale live owner may settle only its exact started tool effect permit', 
       }]
     },
     budget: {
-      modelTurns: 1, totalToolCalls: 1, repeatedIdenticalToolCalls: 0, elapsedMs: 1,
+      modelTurns: 1, totalToolCalls: 1, repeatedIdenticalToolCalls: 0, candidateRevisions: 0, elapsedMs: 1,
       promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0,
       knownCosts: {}, pricingStatus: 'known', unknownPricedTokens: 0, consecutiveProviderFailures: 0, consecutiveToolFailures: 0
     },
@@ -174,7 +175,7 @@ test('every parallel completion permutation survives driver replacement and proj
         callStates, maxConcurrency: 3, nextProjectionIndex: 0, instructions: [], modelInputModalities: ['text']
       },
       budget: {
-        modelTurns: 1, totalToolCalls: 3, repeatedIdenticalToolCalls: 1, elapsedMs: 1,
+        modelTurns: 1, totalToolCalls: 3, repeatedIdenticalToolCalls: 1, candidateRevisions: 0, elapsedMs: 1,
         promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0,
         knownCosts: {}, pricingStatus: 'known', unknownPricedTokens: 0, consecutiveProviderFailures: 0, consecutiveToolFailures: 0
       },
@@ -252,7 +253,8 @@ test('total operation states select one explicit procedure, wait, or completion'
     driverGeneration: 0,
     control: { status: 'detached' },
     phase: { kind: 'accepted' },
-    toolCalls: []
+    toolCalls: [],
+    revisionInstructions: []
   });
   assert.deepEqual(nextAgentOperationInstruction(accepted), { kind: 'wait', reason: 'driver' });
   const owned = decodeAgentOperationState({ ...accepted, revision: 1, driverGeneration: 1, control: { status: 'owned', driverId: 'driver' } });

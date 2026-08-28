@@ -573,7 +573,7 @@ function validBaseEntry(value: Record<string, unknown>): value is Record<string,
 }
 function isEffectiveInstruction(value: unknown): value is AgentEffectiveInstruction {
   return isRecord(value) && typeof value.id === 'string' && value.id.length > 0 && typeof value.content === 'string'
-    && (value.provenance === 'application' || value.provenance === 'run' || value.provenance === 'steering')
+    && (value.provenance === 'application' || value.provenance === 'run' || value.provenance === 'steering' || value.provenance === 'disposition')
     && (value.role === undefined || typeof value.role === 'string') && (value.sourceUri === undefined || typeof value.sourceUri === 'string')
     && (value.priority === undefined || (typeof value.priority === 'number' && Number.isFinite(value.priority)));
 }

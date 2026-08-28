@@ -412,9 +412,10 @@ function ownConfiguration(configuration: AgentSessionConfiguration): AgentSessio
 }
 
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
-function operationSuspensionReason(phase: import('../operation/contracts.js').AgentOperationPhase): 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'missing_implementation' | 'user_decision' | undefined {
+function operationSuspensionReason(phase: import('../operation/contracts.js').AgentOperationPhase): 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'disposition_outcome_unknown' | 'missing_implementation' | 'user_decision' | undefined {
   if (phase.kind === 'suspended') return phase.reason;
   if (phase.kind === 'provider' && phase.stage === 'outcome_unknown') return 'provider_outcome_unknown';
   if (phase.kind === 'tools' && phase.callStates.some((call) => call.stage === 'outcome_unknown')) return 'tool_outcome_unknown';
+  if (phase.kind === 'disposition' && phase.stage === 'outcome_unknown') return 'disposition_outcome_unknown';
   return undefined;
 }

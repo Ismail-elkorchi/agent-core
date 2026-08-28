@@ -41,6 +41,7 @@ export interface AgentOperationAdvance {
   readonly phase: AgentOperationPhase;
   readonly budget?: AgentRunBudgetState;
   readonly toolCalls?: readonly ToolCall[];
+  readonly revisionInstructions?: readonly string[];
 }
 
 export interface AgentOperationProcedureContext {
@@ -80,7 +81,8 @@ export class AgentOperationCoordinator {
       configuration: value.configuration,
       control: { status: 'detached' },
       phase: { kind: 'accepted' },
-      toolCalls: []
+      toolCalls: [],
+      revisionInstructions: []
     });
     const expectedTail = await this.events.tail(state.runId);
     if (expectedTail.sequence !== -1) {
@@ -361,6 +363,7 @@ export class AgentOperationDriver {
       revision: this.stateValue.revision + 1,
       phase: advance.phase,
       toolCalls: advance.toolCalls ?? this.stateValue.toolCalls,
+      revisionInstructions: advance.revisionInstructions ?? this.stateValue.revisionInstructions,
       ...(advance.budget === undefined ? (this.stateValue.budget === undefined ? {} : { budget: this.stateValue.budget }) : { budget: advance.budget })
     });
     const result = await this.events.appendConditional(state.runId, { type: 'operation.transition', state }, {
@@ -465,7 +468,10 @@ function advanceMatchesProcedure(procedure: Extract<AgentOperationInstruction, {
     case 'start_verification': return (phase.kind === 'verification' && phase.stage === 'effect_pending') || phase.kind === 'finalization';
     case 'reconcile_verification': return (phase.kind === 'verification' && phase.stage === 'settled') || phase.kind === 'suspended' || phase.kind === 'finalization';
     case 'consume_verification_settlement': return phase.kind === 'verification' || phase.kind === 'disposition' || phase.kind === 'finalization';
-    case 'decide_candidate': return phase.kind === 'disposition' || phase.kind === 'finalization';
+    case 'prepare_disposition': return phase.kind === 'disposition' || phase.kind === 'finalization';
+    case 'start_disposition': return phase.kind === 'disposition' || phase.kind === 'finalization';
+    case 'reconcile_disposition': return phase.kind === 'disposition' || phase.kind === 'suspended' || phase.kind === 'finalization';
+    case 'consume_disposition': return phase.kind === 'preparing' || phase.kind === 'finalization';
     case 'finalize':
     case 'reconcile_finalization': return phase.kind === 'finalization' || phase.kind === 'terminal';
     case 'finalize_abort': return phase.kind === 'cancelling' || phase.kind === 'finalization' || phase.kind === 'terminal';

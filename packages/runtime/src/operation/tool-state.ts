@@ -284,7 +284,7 @@ function decodeInstruction(value: unknown, path: string): AgentEffectiveInstruct
   return Object.freeze({
     id: identifier(record.id, `${path}.id`),
     content: nonempty(record.content, `${path}.content`),
-    provenance: enumeration(record.provenance, ['application', 'run', 'steering'] as const, `${path}.provenance`),
+    provenance: enumeration(record.provenance, ['application', 'run', 'steering', 'disposition'] as const, `${path}.provenance`),
     ...(role ? { role } : {}),
     ...(sourceUri ? { sourceUri } : {}),
     ...(priority === undefined ? {} : { priority })
