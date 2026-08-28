@@ -146,7 +146,7 @@ export function decodeExternalEffectSettlement(value: unknown): ExternalEffectSe
 export function decodeEffectExecutionState(value: unknown): EffectExecutionState {
   const record = object(value, 'effect execution state');
   const intent = decodeExternalEffectIntent(record.intent);
-  const settlementPermit = decodeSettlementPermit(record.settlementPermit);
+  const settlementPermit = decodeEffectSettlementPermit(record.settlementPermit);
   assertEffectBinding(intent, settlementPermit, 'settlement permit');
   if (record.phase === 'ticket_issued' || record.phase === 'started') {
     const ticket = decodeStartTicket(record.ticket);
@@ -268,7 +268,7 @@ function decodeStartTicket(value: unknown): EffectStartTicket {
   });
 }
 
-function decodeSettlementPermit(value: unknown): EffectSettlementPermit {
+export function decodeEffectSettlementPermit(value: unknown): EffectSettlementPermit {
   const record = object(value, 'effect settlement permit');
   return Object.freeze({
     permitId: identifier(record.permitId, 'permitId'), effectId: identifier(record.effectId, 'effectId'),

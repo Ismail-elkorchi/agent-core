@@ -8,7 +8,7 @@ import {
   releaseToolInvocation,
   startPreparedToolCall
 } from '@agent-core/tools';
-import { issueEffectStartTicket, NO_EFFECT_EXPOSURE } from '@agent-core/effects';
+import { issueEffectStartTicket, NO_EFFECT_EXPOSURE, startExternalEffect } from '@agent-core/effects';
 import { testPatchJournal } from './workspace-file-root-helper.js';
 
 export function jsonToolCall(name, value = {}, id) {
@@ -75,7 +75,9 @@ export async function invokePreparedForTest(prepared, context) {
     currentDriverGeneration: 1
   });
   if (issued.status !== 'issued') throw new Error('Test effect ticket was rejected.');
-  const invocation = await startPreparedToolCall(prepared, issued.state, 1);
+  const started = startExternalEffect(issued.state, issued.state.ticket, 1);
+  if (started.status !== 'started') throw new Error('Test effect start was rejected.');
+  const invocation = await startPreparedToolCall(prepared, started.state);
   try { return await invokePreparedToolCall(invocation, context); }
   finally { await releaseToolInvocation(invocation); }
 }

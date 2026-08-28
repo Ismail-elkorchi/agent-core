@@ -1,377 +1,398 @@
-import { randomUUID } from 'node:crypto';
-import { issueEffectStartTicket, NO_EFFECT_EXPOSURE } from '@agent-core/effects';
-import { ContextManager } from '../context/manager.js';
 import { hashJson } from '@agent-core/evidence';
-import type { SessionRepository } from '../session/repository.js';
-import type { AgentApprovalBinding, AgentApprovalRequest, AgentToolBatchIdentity, AgentToolCallAttemptIdentity, AgentToolCallIdentity } from '../run/contracts.js';
+import {
+  issueEffectStartTicket,
+  NO_EFFECT_EXPOSURE,
+  startExternalEffect
+} from '@agent-core/effects';
 import {
   POLICY_TOOL_AUTHORIZER,
   abortableToolBoundary,
   enforceAllowedEffects,
   invokePreparedToolCall,
+  policyBlockedObservation,
+  prepareToolCall,
   releasePreparedToolCall,
   releaseToolInvocation,
   startPreparedToolCall,
-  policyBlockedObservation,
-  prepareToolCall,
   type PreparedToolCall,
-  type ToolInvocation,
+  type ResourceLeaseCoordinator,
   type ToolAuthorizer,
-  type ToolAuthorizationDecision,
   type ToolCall,
   type ToolDefinition,
+  type ToolInvocation,
+  type ToolObservation,
   type ToolPreparationContext,
-  type ToolObservation
+  type ToolProgress
 } from '@agent-core/tools';
-import type { ResourceLeaseCoordinator } from '@agent-core/tools';
 import type { AgentAuditEvent, AgentProgressEvent } from '../events.js';
-import { ObservationStore, serializeToolObservationPresentation } from './observation-store.js';
+import type { AgentOperationPhase, AgentOperationProcedure } from '../operation/contracts.js';
+import type { AgentToolOperationPhase, AgentToolPreparationRecord, AgentToolSettlementRecord } from '../operation/tool-state.js';
+import type { AgentApprovalBinding, AgentApprovalRequest, AgentToolCallAttemptIdentity, AgentToolCallIdentity } from '../run/contracts.js';
+import type { SessionRepository } from '../session/repository.js';
+import { ContextManager } from '../context/manager.js';
+import { ObservationStore, serializeToolObservationPresentation, type CommittedToolObservation } from './observation-store.js';
 import type { AgentRunController } from './run-controller.js';
-import { scheduleToolCalls } from './tool-scheduler.js';
 
 export type ToolBatchExecutionResult =
   | { readonly outcome: 'completed' }
   | { readonly outcome: 'waiting_for_approval'; readonly approvals: readonly AgentApprovalRequest[] }
-  | { readonly outcome: 'uncertain_effect'; readonly callIndex: number; readonly toolName: string; readonly toolAttempt: number };
+  | { readonly outcome: 'ownership_lost' };
 
-export interface ToolCallRecoveryState {
-  readonly callIndex: number;
-  readonly lastAttempt: number;
-  readonly incompleteStart?: {
-    readonly toolAttempt: number;
-    readonly fingerprint: string;
-    readonly effects: import('@agent-core/tools').ToolEffects;
-  };
-  readonly completed?: {
-    readonly toolAttempt: number;
-    readonly observation: ToolObservation;
-    readonly observationProjected: boolean;
-  };
-}
-
-export interface ToolAuthorizationOverride {
-  readonly callIndex: number;
-  readonly fingerprint: string;
-  readonly decision: 'allow' | 'deny';
-  readonly reason?: string;
-}
-
-interface PreparedEntry {
-  readonly identity: AgentToolCallAttemptIdentity;
-  readonly call: ToolCall;
-  readonly prepared?: PreparedToolCall;
-  observation?: ToolObservation;
-  observationProjected?: boolean;
-  invoke?: true;
-}
-
-export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & {
+export async function executeAssistantToolCalls(input: {
   readonly runId: string;
   readonly driverGeneration: number;
-  readonly toolCalls: readonly ToolCall[];
   readonly tools: readonly ToolDefinition[];
   readonly toolContext: ToolPreparationContext;
   readonly authorizer?: ToolAuthorizer;
   readonly resourceLeases?: ResourceLeaseCoordinator;
-  readonly modelInputModalities?: readonly string[];
-  readonly authorizationOverrides?: readonly ToolAuthorizationOverride[];
-  readonly recovery?: readonly ToolCallRecoveryState[];
-  readonly resuming?: boolean;
   readonly contextManager: ContextManager;
   readonly observationStore: ObservationStore;
   readonly session?: { readonly repository: SessionRepository; readonly sessionId: string };
   readonly controller: AgentRunController;
+  readonly phase: () => AgentOperationPhase;
+  readonly transition: (procedure: AgentOperationProcedure, phase: AgentOperationPhase) => Promise<void>;
+  readonly settle: (input: { readonly effectId: string; readonly permit: import('@agent-core/effects').EffectSettlementPermit; readonly settlement: AgentToolSettlementRecord }) => Promise<'owned' | 'ownership_lost'>;
   readonly append: (event: AgentAuditEvent, idempotencyKey?: string) => Promise<unknown>;
   readonly emit: (event: AgentProgressEvent) => Promise<void>;
 }): Promise<ToolBatchExecutionResult> {
-  const authorizationContext = input.toolContext;
-  const authorizer = input.authorizer ?? POLICY_TOOL_AUTHORIZER;
-  const entries: PreparedEntry[] = [];
-  const invocations = new Map<number, ToolInvocation>();
-  const approvals: AgentApprovalRequest[] = [];
-  let uncertain: { callIndex: number; toolName: string; toolAttempt: number } | undefined;
-
-  const execute = async (): Promise<ToolBatchExecutionResult> => {
-  // The whole batch crosses the untrusted parse/canonicalize/effects/authorization boundary before any effect runs.
-  for (const [callIndex, call] of input.toolCalls.entries()) {
-    const callIdentityValue = callIdentity(input, call, callIndex);
-    if (!input.resuming) await input.session?.repository.appendToolCall(input.session.sessionId, { runId: input.runId, identity: callIdentityValue, call });
-    const recovery = input.recovery?.find((item) => item.callIndex === callIndex);
-    const toolAttempt = recovery?.completed?.toolAttempt ?? (recovery?.lastAttempt ?? 0) + 1;
-    const identity: AgentToolCallAttemptIdentity = { ...callIdentityValue, toolAttempt };
-    const preparation = await prepareToolCall(call, input.tools, {
-      ...authorizationContext,
-      emitProgress: async (progress) => {
-        const event = { type: 'tool.updated' as const, ...identity, toolName: call.name, progress };
-        await input.emit(event);
-      },
-      persistProgressCheckpoint: async (progress) => {
-        const event = { type: 'tool.updated' as const, ...identity, toolName: call.name, progress };
-        await input.append(event);
-        await input.emit(event);
+  let prepared: PreparedToolCall | undefined;
+  let invocation: ToolInvocation | undefined;
+  let committed: CommittedToolObservation | undefined;
+  let lease: Awaited<ReturnType<ResourceLeaseCoordinator['acquire']>> | undefined;
+  try {
+    for (;;) {
+      const phase = input.phase();
+      if (phase.kind === 'approval') return { outcome: 'waiting_for_approval', approvals: Object.freeze([phase.approval]) };
+      if (phase.kind !== 'tools') throw new Error('Durable tool execution lost its tool-batch state.');
+      if (phase.stage === 'complete') return { outcome: 'completed' };
+      const call = phase.calls[phase.nextCallIndex];
+      if (!call) {
+        if (phase.stage !== 'ready' || phase.nextCallIndex !== phase.calls.length) throw new Error('Durable tool-batch position is invalid.');
+        await input.transition('prepare_tool_call', Object.freeze({ ...phase, stage: 'complete' }));
+        continue;
       }
-    });
-    if (!preparation.ok) {
-      entries.push({ identity, call, observation: preparation.observation });
-      continue;
-    }
-    const prepared = preparation.prepared;
-    const preparedCall = prepared.call;
-    const entry: PreparedEntry = { identity, call: preparedCall, prepared };
-    // Register ownership immediately. Every later failure is then covered by the batch release boundary.
-    entries.push(entry);
-    if (recovery?.completed) {
-      entry.observation = recovery.completed.observation;
-      entry.observationProjected = recovery.completed.observationProjected;
-      continue;
-    }
-    if (recovery?.incompleteStart) {
-      if (recovery.incompleteStart.fingerprint !== prepared.fingerprint) throw new Error(`Tool call fingerprint changed after an incomplete execution at call ${String(callIndex)}.`);
-      uncertain = { callIndex, toolName: call.name, toolAttempt: recovery.incompleteStart.toolAttempt };
-      continue;
-    }
-    const override = input.authorizationOverrides?.find((item) => item.callIndex === callIndex);
-    if (input.resuming && override?.fingerprint !== prepared.fingerprint) throw new Error(`Tool call fingerprint changed before approval resume at call ${String(callIndex)}.`);
-    const authorizationRequest = { call: preparedCall, toolImplementationId: prepared.toolImplementationId, input: prepared.canonicalSnapshot, effects: prepared.effects, fingerprint: prepared.fingerprint, context: authorizationContext };
-    const policyDenial = enforceAllowedEffects(authorizationRequest);
-    const currentAuthorization = policyDenial ?? await abortableToolBoundary(input.toolContext.signal, () => authorizer(authorizationRequest));
-    const authorization: ToolAuthorizationDecision = override
-      ? currentAuthorization.decision === 'deny'
-        ? currentAuthorization
-        : override.decision === 'allow'
-          ? { decision: 'allow', ...(override.reason ? { reason: override.reason } : {}) }
-          : { decision: 'deny', reason: override.reason ?? 'Approval denied.' }
-      : currentAuthorization;
-    const binding = approvalBinding(prepared, authorizationContext);
-    if (!input.resuming) await input.append({ type: 'tool.authorization.decided', ...callIdentityValue, toolName: call.name, fingerprint: prepared.fingerprint, binding, decision: authorization.decision, ...(authorization.reason ? { reason: authorization.reason } : {}) });
-    if (authorization.decision === 'require_approval') {
-      const approvalId = randomUUID();
-      const approval = approvalRequest(input.runId, identity, approvalId, authorization.reason, prepared, authorizationContext);
-      approvals.push(approval);
-      await input.append({ type: 'approval.requested', runId: input.runId, ...callIdentityValue, approvalId, toolName: call.name, fingerprint: approval.fingerprint, input: approval.input, effects: prepared.effects, binding, policyHash: approval.policyHash, reason: approval.reason });
-      continue;
-    }
-    if (authorization.decision === 'deny') {
-      const observation = policyBlockedObservation(`Tool authorization denied: ${call.name}`, { tool: call.name, policyReason: 'deny', ...(authorization.reason ? { recovery: authorization.reason } : {}) });
-      entry.observation = observation;
-      continue;
-    }
-    entry.invoke = true;
-  }
 
-  if (approvals.length > 0) return { outcome: 'waiting_for_approval', approvals: Object.freeze(approvals) };
-  if (uncertain) return { outcome: 'uncertain_effect', ...uncertain };
-
-  const executable = entries.filter(isExecutableEntry).map((entry) => ({ callIndex: entry.identity.callIndex, effects: entry.prepared.effects, value: entry }));
-  const observed = new Map<number, ToolObservation>();
-  for (const wave of scheduleToolCalls(executable, input.controller.limits.maxConcurrentToolCalls)) {
-    const results = await Promise.all(wave.map(async (item) => {
-      if (input.resourceLeases?.wouldWait(item.value.prepared.effects)) {
-        await input.emit({ type: 'tool.updated', ...item.value.identity, toolName: item.value.call.name, progress: {
-          type: 'status', stage: 'resource_lease_waiting',
-          message: 'Waiting for a conflicting resource lease held by another operation.'
-        } });
+      if (phase.stage === 'ready') {
+        prepared = await prepareCurrent(input, phase, call);
+        if (!prepared) continue;
+        const storedApproval = phase.approved;
+        const current = await authorize(input, prepared);
+        const authorization = storedApproval
+          ? current.decision === 'deny'
+            ? current
+            : storedApproval.decision === 'allow'
+              ? { decision: 'allow' as const, ...(current.reason ? { reason: current.reason } : {}) }
+              : { decision: 'deny' as const, reason: current.reason ?? storedApproval.approval.reason }
+          : current;
+        const preparation = preparationRecord(prepared, input.toolContext, authorization.decision, authorization.reason);
+        if (!storedApproval) {
+          await input.append(authorizationEvent(phase, call, prepared, authorization, input.toolContext), authorizationKey(input.runId, phase, prepared));
+        }
+        if (authorization.decision === 'require_approval') {
+          const approval = approvalRequest(input.runId, phase, call, prepared, authorization.reason, input.toolContext);
+          await input.append(approvalEvent(approval), approvalKey(input.runId, approval));
+          await input.transition('prepare_tool_call', Object.freeze({
+            kind: 'approval', identity: phase.identity, toolBatchId: phase.toolBatchId, calls: phase.calls,
+            nextCallIndex: phase.nextCallIndex, instructions: phase.instructions,
+            modelInputModalities: phase.modelInputModalities, preparation, approval
+          }));
+          await releasePreparedToolCall(prepared);
+          prepared = undefined;
+          continue;
+        }
+        if (authorization.decision === 'deny') {
+          const observation = policyBlockedObservation(`Tool authorization denied: ${call.name}`, {
+            tool: call.name, policyReason: 'deny', ...(authorization.reason ? { recovery: authorization.reason } : {})
+          });
+          committed = await commitObservation(input, phase, call, prepared, observation);
+          const settlement = settlementRecord(committed);
+          await input.transition('prepare_tool_call', Object.freeze({
+            ...batchBase(phase), stage: 'settled', preparation, toolAttempt: 1, settlement
+          }));
+          await releasePreparedToolCall(prepared);
+          prepared = undefined;
+          continue;
+        }
+        const toolAttempt = 1;
+        const effect = issueToolEffect(input, phase, prepared, toolAttempt);
+        await input.transition('prepare_tool_call', Object.freeze({
+          ...batchBase(phase), stage: 'effect_ready', preparation, toolAttempt, effect
+        }));
+        continue;
       }
-      const lease = await input.resourceLeases?.acquire(item.value.prepared.effects, `${input.runId}:${item.value.identity.toolBatchId}:${String(item.callIndex)}`, input.toolContext.signal);
-      try {
-        await persistToolStart(input, item.value);
-        const effect = issueToolEffect(input, item.value);
-        const invocation = await startPreparedToolCall(item.value.prepared, effect, input.driverGeneration);
-        invocations.set(item.callIndex, invocation);
-        return {
-          callIndex: item.callIndex,
-          observation: await invokePreparedToolCall(invocation, {
+
+      if (phase.stage === 'effect_ready') {
+        prepared = await requireMatchingPreparation(input, phase, call, prepared);
+        lease = await acquireLease(input, phase, call);
+        const started = startExternalEffect(phase.effect, phase.effect.ticket, input.driverGeneration);
+        if (started.status !== 'started') throw new Error(`Tool effect start was rejected: ${started.reason}.`);
+        await input.transition('start_tool_call', Object.freeze({ ...phase, stage: 'effect_pending', effect: started.state }));
+        invocation = await startPreparedToolCall(prepared, started.state);
+        const identity = attemptIdentity(phase, call, phase.toolAttempt);
+        await input.append({ type: 'tool.started', ...identity, toolName: call.name, input: call, fingerprint: prepared.fingerprint, effects: prepared.effects }, toolEventKey(input.runId, identity, 'started'));
+        await input.emit({ type: 'tool.started', ...identity, toolName: call.name, input: call, fingerprint: prepared.fingerprint, effects: prepared.effects });
+        continue;
+      }
+
+      if (phase.stage === 'effect_pending') {
+        if (!invocation || !prepared) {
+          throw new Error(`Tool effect ${phase.effect.intent.effectId} has no process-local invocation authority.`);
+        }
+        let observation: ToolObservation;
+        try {
+          observation = await invokePreparedToolCall(invocation, {
             ...input.toolContext,
             ...(lease ? { resourceLease: lease } : {}),
-            emitProgress: async (progress) => {
-              const event = { type: 'tool.updated' as const, ...item.value.identity, toolName: item.value.call.name, progress };
-              await input.emit(event);
-            },
+            emitProgress: (progress) => input.emit({ type: 'tool.updated', ...attemptIdentity(phase, call, phase.toolAttempt), toolName: call.name, progress }),
             persistProgressCheckpoint: async (progress) => {
-              const event = { type: 'tool.updated' as const, ...item.value.identity, toolName: item.value.call.name, progress };
-              await input.append(event);
+              const identity = attemptIdentity(phase, call, phase.toolAttempt);
+              const event = { type: 'tool.updated' as const, ...identity, toolName: call.name, progress };
+              await input.append(event, toolEventKey(input.runId, identity, `updated:${hashJson(progress)}`));
               await input.emit(event);
             },
-            invocation: {
-              runId: input.runId,
-              turnId: item.value.identity.turnId,
-              requestAttempt: item.value.identity.requestAttempt,
-              toolBatchId: item.value.identity.toolBatchId,
-              callIndex: item.value.identity.callIndex,
-              ...(item.value.identity.callId ? { callId: item.value.identity.callId } : {}),
-              toolAttempt: item.value.identity.toolAttempt
-            }
-          })
-        };
-      } finally {
-        if (lease && !lease.transferred) lease.release();
+            invocation: invocationIdentity(input.runId, phase, call, phase.toolAttempt)
+          });
+        } finally {
+          if (lease && !lease.transferred) lease.release();
+          lease = undefined;
+        }
+        committed = await commitObservation(input, phase, call, prepared, observation);
+        const ownership = await input.settle({
+          effectId: phase.effect.intent.effectId,
+          permit: phase.effect.settlementPermit,
+          settlement: settlementRecord(committed)
+        });
+        await releaseToolInvocation(invocation);
+        invocation = undefined;
+        prepared = undefined;
+        if (ownership === 'ownership_lost') return { outcome: 'ownership_lost' };
+        continue;
       }
-    }));
-    for (const result of results) observed.set(result.callIndex, result.observation);
+
+      if (phase.stage === 'settled') {
+        const identity = attemptIdentity(phase, call, phase.toolAttempt);
+        await input.append({ type: 'tool.ended', ...identity, toolName: call.name, observation: phase.settlement.observation }, toolEventKey(input.runId, identity, 'ended'));
+        await input.transition('consume_tool_settlement', Object.freeze({ ...phase, stage: 'projecting' }));
+        continue;
+      }
+
+      const owned = committed ?? committedFromState(input, phase, call);
+      await projectObservation(input, phase, call, owned);
+      input.controller.recordToolResult(phase.settlement.observation.ok);
+      const nextCallIndex = phase.nextCallIndex + 1;
+      const next: AgentToolOperationPhase = nextCallIndex === phase.calls.length
+        ? Object.freeze({ ...batchBase(phase), stage: 'complete', nextCallIndex })
+        : Object.freeze({ ...batchBase(phase), stage: 'ready', nextCallIndex });
+      await input.transition('project_tool_settlement', next);
+      committed = undefined;
+    }
+  } finally {
+    if (lease && !lease.transferred) lease.release();
+    if (invocation) await releaseToolInvocation(invocation);
+    else if (prepared) await releasePreparedToolCall(prepared);
   }
-
-  for (const entry of [...entries].sort((left, right) => left.identity.callIndex - right.identity.callIndex)) {
-    const observation = entry.observation ?? observed.get(entry.identity.callIndex);
-    if (!observation) throw new Error(`Tool call ${String(entry.identity.callIndex)} has no terminal observation.`);
-    await persistObservation(input, entry, observation);
-    input.controller.recordToolResult(observation.ok);
-  }
-  return { outcome: 'completed' };
-  };
-
-  const result = await execute().catch((failure: unknown) => releaseToolAuthoritiesAfterFailure(entries, invocations, failure));
-  await releaseToolAuthorities(entries, invocations);
-  return result;
 }
 
-async function releaseToolAuthoritiesAfterFailure(entries: readonly PreparedEntry[], invocations: ReadonlyMap<number, ToolInvocation>, failure: unknown): Promise<never> {
-  try {
-    await releaseToolAuthorities(entries, invocations);
-  } catch (releaseFailure) {
-    throw new AggregateError([failure, releaseFailure], 'Tool execution and authority release both failed.', { cause: releaseFailure });
-  }
-  if (failure instanceof Error) throw failure;
-  throw new Error('Tool execution failed.', { cause: failure });
+async function prepareCurrent(input: Parameters<typeof executeAssistantToolCalls>[0], phase: Extract<AgentOperationPhase, { readonly kind: 'tools'; readonly stage: 'ready' }>, call: ToolCall): Promise<PreparedToolCall | undefined> {
+  const result = await prepareToolCall(call, input.tools, preparationContext(input, phase, call));
+  if (result.ok) return result.prepared;
+  const committed = await commitObservation(input, phase, call, undefined, result.observation);
+  await input.transition('prepare_tool_call', Object.freeze({ ...batchBase(phase), stage: 'settled', toolAttempt: 1, settlement: settlementRecord(committed) }));
+  return undefined;
 }
 
-async function releaseToolAuthorities(entries: readonly PreparedEntry[], invocations: ReadonlyMap<number, ToolInvocation>): Promise<void> {
-  const releases: Promise<void>[] = [];
-  for (const entry of entries) {
-    if (!entry.prepared) continue;
-    const invocation = invocations.get(entry.identity.callIndex);
-    releases.push(invocation ? releaseToolInvocation(invocation) : releasePreparedToolCall(entry.prepared));
-  }
-  const settled = await Promise.allSettled(releases);
-  const failures: unknown[] = [];
-  for (const result of settled) if (result.status === 'rejected') failures.push(result.reason);
-  if (failures.length > 0) throw new AggregateError(failures, 'Tool call authority release failed.');
-}
-
-function isExecutableEntry(entry: PreparedEntry): entry is PreparedEntry & { readonly prepared: PreparedToolCall; readonly invoke: true } {
-  return entry.prepared !== undefined && entry.invoke === true;
-}
-
-async function persistToolStart(input: Parameters<typeof executeAssistantToolCalls>[0], entry: PreparedEntry): Promise<void> {
-  if (!entry.prepared) throw new Error('Cannot persist a tool start without a prepared call.');
-  await input.append({ type: 'tool.started', ...entry.identity, toolName: entry.call.name, input: entry.call, fingerprint: entry.prepared.fingerprint, effects: entry.prepared.effects }, toolEventKey(input.runId, entry.identity, 'started'));
-  await input.emit({ type: 'tool.started', ...entry.identity, toolName: entry.call.name, input: entry.call, fingerprint: entry.prepared.fingerprint, effects: entry.prepared.effects });
-  const progress = { type: 'status' as const, stage: 'executing' };
-  await input.append({ type: 'tool.updated', ...entry.identity, toolName: entry.call.name, progress }, toolEventKey(input.runId, entry.identity, 'updated'));
-  await input.emit({ type: 'tool.updated', ...entry.identity, toolName: entry.call.name, progress });
-}
-
-async function persistObservation(input: Parameters<typeof executeAssistantToolCalls>[0], entry: PreparedEntry, observation: ToolObservation): Promise<void> {
-  const committed = entry.observationProjected
-    ? undefined
-    : await input.observationStore.commitToolObservation({
-      turnIndex: input.turnIndex, call: entry.call,
-      ...(entry.prepared ? { canonicalSnapshot: entry.prepared.canonicalSnapshot } : {}),
-      tool: input.tools.find((tool) => tool.name === entry.call.name && tool.implementationId === entry.prepared?.toolImplementationId), observation
-    });
-  const persistedObservation = committed?.durableObservation ?? observation;
-  await input.append({ type: 'tool.ended', ...entry.identity, toolName: entry.call.name, observation: persistedObservation }, toolEventKey(input.runId, entry.identity, 'ended'));
-  if (entry.observationProjected) {
-    await input.emit({ type: 'tool.ended', ...entry.identity, toolName: entry.call.name, observation: persistedObservation });
-    return;
-  }
-  if (!committed) throw new Error('Committed tool observation identity was not created.');
-  try {
-    const record = await input.observationStore.projectToolObservation(committed, input.modelInputModalities);
-    await input.session?.repository.appendObservation(input.session.sessionId, {
-      runId: input.runId,
-      identity: entry.identity,
-      toolName: entry.call.name,
-      observation: sessionObservation(persistedObservation)
-    });
-    await input.append({
-      type: 'observation.record.created', id: record.id, ...entry.identity, toolName: entry.call.name, call: record.call,
-      toolCallType: record.call.input.kind === 'text' ? 'custom' : 'function', evidence: record.evidence,
-      immediatePresentation: record.immediatePresentation, retainedPresentation: record.retainedPresentation,
-      ...(record.durableStorageDegraded ? { durableStorageDegraded: record.durableStorageDegraded } : {})
-    }, toolEventKey(input.runId, entry.identity, 'observation'));
-    input.contextManager.recordToolResult({
-      turnIndex: input.turnIndex,
-      toolName: record.toolName,
-      ...(record.call.id ? { callId: record.call.id } : {}),
-      toolCallType: record.call.input.kind === 'text' ? 'custom' : 'function',
-      immediateContent: serializeToolObservationPresentation(record.immediatePresentation),
-      retainedContent: serializeToolObservationPresentation(record.retainedPresentation),
-      immediateImages: record.immediateImages,
-      imageArtifacts: record.imageArtifacts,
-      evidence: [...record.evidence]
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await input.append({ type: 'observation.projection.failed', id: committed.id, ...entry.identity, toolName: entry.call.name, message }, toolEventKey(input.runId, entry.identity, 'projection-failed'));
-    const fallback = minimalToolResultProjection(persistedObservation, entry.call.name, message);
-    input.contextManager.recordToolResult({
-      turnIndex: input.turnIndex,
-      toolName: entry.call.name,
-      ...(entry.call.id ? { callId: entry.call.id } : {}),
-      toolCallType: entry.call.input.kind === 'text' ? 'custom' : 'function',
-      immediateContent: fallback,
-      retainedContent: fallback
-    });
-  }
-  await input.emit({ type: 'tool.ended', ...entry.identity, toolName: entry.call.name, observation: persistedObservation });
-}
-
-function sessionObservation(observation: ToolObservation) {
-  const artifacts = observationArtifacts(observation);
-  return {
-    ok: observation.ok,
-    summary: observation.summary,
-    output: observation.output,
-    ...(artifacts.length > 0 ? { artifacts } : {}),
-    ...(observation.metadata ? { metadata: observation.metadata } : {})
-  };
-}
-
-function minimalToolResultProjection(observation: ToolObservation, toolName: string, projectionError: string): string {
-  return JSON.stringify({
-    ok: observation.ok,
-    title: `${toolName} completed`,
-    summary: `${observation.summary} The durable tool result was committed, but its rich model projection failed.`,
-    scope: observation.scope,
-    coverage: observation.scope.coverage,
-    results: { artifacts: observationArtifacts(observation), projectionError: projectionError.slice(0, 1_000) }
+function preparationContext(input: Parameters<typeof executeAssistantToolCalls>[0], phase: AgentToolOperationPhase, call: ToolCall): ToolPreparationContext {
+  const identity = attemptIdentity(phase, call, 1);
+  return Object.freeze({
+    ...input.toolContext,
+    emitProgress: (progress: ToolProgress) => input.emit({ type: 'tool.updated', ...identity, toolName: call.name, progress }),
+    persistProgressCheckpoint: async (progress: ToolProgress) => {
+      const event = { type: 'tool.updated' as const, ...identity, toolName: call.name, progress };
+      await input.append(event, toolEventKey(input.runId, identity, `preparation:${hashJson(progress)}`));
+      await input.emit(event);
+    }
   });
 }
 
-function observationArtifacts(observation: ToolObservation) {
-  return [...new Map((observation.content ?? []).flatMap((item) => item.type === 'text' ? [] : [[item.artifact.artifactId, item.artifact] as const])).values()];
+async function requireMatchingPreparation(
+  input: Parameters<typeof executeAssistantToolCalls>[0],
+  phase: Extract<AgentOperationPhase, { readonly kind: 'tools'; readonly stage: 'effect_ready' }>,
+  call: ToolCall,
+  retained: PreparedToolCall | undefined
+): Promise<PreparedToolCall> {
+  if (retained) return retained;
+  const result = await prepareToolCall(call, input.tools, input.toolContext);
+  if (!result.ok) throw new Error(`Prepared tool ${call.name} is no longer available: ${result.observation.summary}`);
+  const prepared = result.prepared;
+  if (prepared.toolImplementationId !== phase.preparation.toolImplementationId || prepared.fingerprint !== phase.preparation.fingerprint) {
+    await releasePreparedToolCall(prepared);
+    throw new Error(`Prepared tool ${call.name} no longer matches its durable intent.`);
+  }
+  return prepared;
 }
 
-function callIdentity(input: AgentToolBatchIdentity, call: ToolCall, callIndex: number): AgentToolCallIdentity {
-  return { turnIndex: input.turnIndex, turnId: input.turnId, requestAttempt: input.requestAttempt, toolBatchId: input.toolBatchId, callIndex, ...(call.id ? { callId: call.id } : {}) };
+async function authorize(input: Parameters<typeof executeAssistantToolCalls>[0], prepared: PreparedToolCall) {
+  const request = { call: prepared.call, toolImplementationId: prepared.toolImplementationId, input: prepared.canonicalSnapshot, effects: prepared.effects, fingerprint: prepared.fingerprint, context: input.toolContext };
+  return enforceAllowedEffects(request)
+    ?? await abortableToolBoundary(input.toolContext.signal, () => (input.authorizer ?? POLICY_TOOL_AUTHORIZER)(request));
 }
-function toolEventKey(runId: string, identity: AgentToolCallAttemptIdentity, stage: string): string {
-  return `${runId}:tool:${identity.turnId}:${identity.toolBatchId}:${String(identity.callIndex)}:attempt:${String(identity.toolAttempt)}:${stage}`;
+
+async function acquireLease(input: Parameters<typeof executeAssistantToolCalls>[0], phase: AgentToolOperationPhase, call: ToolCall) {
+  if (phase.stage !== 'effect_ready') throw new Error('Resource leases require an issued tool effect.');
+  if (input.resourceLeases?.wouldWait(phase.preparation.effects)) {
+    await input.emit({ type: 'tool.updated', ...attemptIdentity(phase, call, phase.toolAttempt), toolName: call.name, progress: {
+      type: 'status', stage: 'resource_lease_waiting', message: 'Waiting for a conflicting resource lease held by another operation.'
+    } });
+  }
+  return input.resourceLeases?.acquire(phase.preparation.effects, `${input.runId}:${phase.toolBatchId}:${String(phase.nextCallIndex)}`, input.toolContext.signal);
 }
-function issueToolEffect(input: Parameters<typeof executeAssistantToolCalls>[0], entry: PreparedEntry & { readonly prepared: PreparedToolCall }) {
-  const effectId = `${input.runId}:${entry.identity.turnId}:${entry.identity.toolBatchId}:${String(entry.identity.callIndex)}:${String(entry.identity.toolAttempt)}`;
+
+async function commitObservation(input: Parameters<typeof executeAssistantToolCalls>[0], phase: AgentToolOperationPhase, call: ToolCall, prepared: PreparedToolCall | undefined, observation: ToolObservation): Promise<CommittedToolObservation> {
+  return input.observationStore.commitToolObservation({
+    turnIndex: phase.identity.turnIndex,
+    call,
+    ...(prepared ? { canonicalSnapshot: prepared.canonicalSnapshot } : {}),
+    tool: input.tools.find((tool) => tool.name === call.name && tool.implementationId === prepared?.toolImplementationId),
+    observation
+  });
+}
+
+async function projectObservation(input: Parameters<typeof executeAssistantToolCalls>[0], phase: Extract<AgentToolOperationPhase, { readonly stage: 'projecting' }>, call: ToolCall, committed: CommittedToolObservation): Promise<void> {
+  const identity = attemptIdentity(phase, call, phase.toolAttempt);
+  try {
+    const record = await input.observationStore.projectToolObservation(committed, phase.modelInputModalities);
+    await input.session?.repository.appendObservation(input.session.sessionId, {
+      runId: input.runId, identity, toolName: call.name, observation: sessionObservation(phase.settlement.observation)
+    });
+    await input.append({
+      type: 'observation.record.created', id: record.id, ...identity, toolName: call.name, call: record.call,
+      toolCallType: record.call.input.kind === 'text' ? 'custom' : 'function', evidence: record.evidence,
+      immediatePresentation: record.immediatePresentation, retainedPresentation: record.retainedPresentation,
+      ...(record.durableStorageDegraded ? { durableStorageDegraded: record.durableStorageDegraded } : {})
+    }, toolEventKey(input.runId, identity, 'observation'));
+    input.contextManager.recordToolResult({
+      turnIndex: phase.identity.turnIndex, toolName: record.toolName, ...(call.id ? { callId: call.id } : {}),
+      toolCallType: call.input.kind === 'text' ? 'custom' : 'function',
+      immediateContent: serializeToolObservationPresentation(record.immediatePresentation),
+      retainedContent: serializeToolObservationPresentation(record.retainedPresentation),
+      immediateImages: record.immediateImages, imageArtifacts: record.imageArtifacts, evidence: [...record.evidence]
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await input.append({ type: 'observation.projection.failed', id: committed.id, ...identity, toolName: call.name, message }, toolEventKey(input.runId, identity, 'projection-failed'));
+    const fallback = minimalToolResultProjection(phase.settlement.observation, call.name, message);
+    input.contextManager.recordToolResult({
+      turnIndex: phase.identity.turnIndex, toolName: call.name, ...(call.id ? { callId: call.id } : {}),
+      toolCallType: call.input.kind === 'text' ? 'custom' : 'function', immediateContent: fallback, retainedContent: fallback
+    });
+  }
+  await input.emit({ type: 'tool.ended', ...identity, toolName: call.name, observation: phase.settlement.observation });
+}
+
+function committedFromState(input: Parameters<typeof executeAssistantToolCalls>[0], phase: Extract<AgentToolOperationPhase, { readonly stage: 'projecting' }>, call: ToolCall): CommittedToolObservation {
+  const tool = phase.preparation ? input.tools.find((candidate) => candidate.name === call.name && candidate.implementationId === phase.preparation?.toolImplementationId) : undefined;
+  return Object.freeze({
+    id: phase.settlement.observationId,
+    turnIndex: phase.identity.turnIndex,
+    call,
+    toolName: call.name,
+    ...(phase.preparation ? { canonicalSnapshot: phase.preparation.canonicalInput } : {}),
+    tool,
+    fullObservation: phase.settlement.observation,
+    durableObservation: phase.settlement.observation,
+    createdAt: phase.settlement.createdAt
+  });
+}
+
+function preparationRecord(prepared: PreparedToolCall, context: ToolPreparationContext, authorization: AgentToolPreparationRecord['authorization'], reason: string | undefined): AgentToolPreparationRecord {
+  return Object.freeze({
+    toolImplementationId: prepared.toolImplementationId,
+    canonicalInput: prepared.canonicalSnapshot,
+    fingerprint: prepared.fingerprint,
+    effects: prepared.effects,
+    binding: approvalBinding(prepared, context),
+    authorization,
+    ...(reason ? { authorizationReason: reason } : {})
+  });
+}
+
+function settlementRecord(committed: CommittedToolObservation): AgentToolSettlementRecord {
+  return Object.freeze({ observationId: committed.id, observation: committed.durableObservation, createdAt: committed.createdAt });
+}
+
+interface ToolBatchFields {
+  readonly kind: 'tools';
+  readonly identity: AgentToolOperationPhase['identity'];
+  readonly toolBatchId: string;
+  readonly calls: readonly ToolCall[];
+  readonly nextCallIndex: number;
+  readonly instructions: AgentToolOperationPhase['instructions'];
+  readonly modelInputModalities: readonly string[];
+}
+function batchBase(phase: AgentToolOperationPhase): ToolBatchFields {
+  return Object.freeze({
+    kind: 'tools', identity: phase.identity, toolBatchId: phase.toolBatchId, calls: phase.calls,
+    nextCallIndex: phase.nextCallIndex, instructions: phase.instructions, modelInputModalities: phase.modelInputModalities
+  });
+}
+
+function issueToolEffect(input: Parameters<typeof executeAssistantToolCalls>[0], phase: AgentToolOperationPhase, prepared: PreparedToolCall, toolAttempt: number) {
+  const effectId = `${input.runId}:${phase.identity.turnId}:${phase.toolBatchId}:${String(phase.nextCallIndex)}:${String(toolAttempt)}`;
   const issued = issueEffectStartTicket({
-    intent: {
-      effectId,
-      operationId: input.runId,
-      implementationId: entry.prepared.toolImplementationId,
-      parametersDigest: entry.prepared.fingerprint,
-      recovery: entry.prepared.effects.recovery,
-      exposure: NO_EFFECT_EXPOSURE
-    },
-    ticketId: randomUUID(),
-    settlementPermitId: randomUUID(),
-    driverGeneration: input.driverGeneration,
-    currentDriverGeneration: input.driverGeneration
+    intent: { effectId, operationId: input.runId, implementationId: prepared.toolImplementationId, parametersDigest: prepared.fingerprint, recovery: prepared.effects.recovery, exposure: NO_EFFECT_EXPOSURE },
+    ticketId: `${effectId}:start`, settlementPermitId: `${effectId}:settle`,
+    driverGeneration: input.driverGeneration, currentDriverGeneration: input.driverGeneration
   });
   if (issued.status !== 'issued') throw new Error(`Tool effect ticket was rejected: ${issued.reason}.`);
   return issued.state;
 }
-function approvalRequest(runId: string, identity: AgentToolCallIdentity, approvalId: string, reason: string, prepared: PreparedToolCall, context: ToolPreparationContext): AgentApprovalRequest {
-  const input = prepared.canonicalSnapshot;
-  const effects = prepared.effects;
-  return Object.freeze({ ...identity, approvalId, status: 'pending', toolName: prepared.call.name, fingerprint: prepared.fingerprint, input, effects, binding: approvalBinding(prepared, context), policyHash: hashJson(context.policy), reason, runId });
+
+function approvalRequest(runId: string, phase: AgentToolOperationPhase, call: ToolCall, prepared: PreparedToolCall, reason: string, context: ToolPreparationContext): AgentApprovalRequest {
+  const identity = callIdentity(phase, call);
+  const approvalId = `approval-${hashJson({ runId, ...identity, fingerprint: prepared.fingerprint }).slice(0, 32)}`;
+  return Object.freeze({ ...identity, approvalId, status: 'pending', toolName: call.name, fingerprint: prepared.fingerprint, input: prepared.canonicalSnapshot, effects: prepared.effects, binding: approvalBinding(prepared, context), policyHash: hashJson(context.policy), reason, runId });
 }
+
+function authorizationEvent(phase: AgentToolOperationPhase, call: ToolCall, prepared: PreparedToolCall, authorization: Awaited<ReturnType<typeof authorize>>, context: ToolPreparationContext): AgentAuditEvent {
+  return { type: 'tool.authorization.decided', ...callIdentity(phase, call), toolName: call.name, fingerprint: prepared.fingerprint, binding: approvalBinding(prepared, context), decision: authorization.decision, ...(authorization.reason ? { reason: authorization.reason } : {}) };
+}
+
+function approvalEvent(approval: AgentApprovalRequest): AgentAuditEvent {
+  return { type: 'approval.requested', runId: approval.runId, turnIndex: approval.turnIndex, turnId: approval.turnId, requestAttempt: approval.requestAttempt, toolBatchId: approval.toolBatchId, callIndex: approval.callIndex, ...(approval.callId ? { callId: approval.callId } : {}), approvalId: approval.approvalId, toolName: approval.toolName, fingerprint: approval.fingerprint, input: approval.input, effects: approval.effects, binding: approval.binding, policyHash: approval.policyHash, reason: approval.reason };
+}
+
 function approvalBinding(prepared: PreparedToolCall, context: ToolPreparationContext): AgentApprovalBinding {
   return Object.freeze({ toolImplementationId: prepared.toolImplementationId, authorizationPolicyId: context.boundary.authorizationPolicyId, executionTargetId: context.boundary.executionTargetId });
 }
+
+function callIdentity(phase: AgentToolOperationPhase, call: ToolCall): AgentToolCallIdentity {
+  return { ...phase.identity, toolBatchId: phase.toolBatchId, callIndex: phase.nextCallIndex, ...(call.id ? { callId: call.id } : {}) };
+}
+
+function attemptIdentity(phase: AgentToolOperationPhase, call: ToolCall, toolAttempt: number): AgentToolCallAttemptIdentity {
+  return { ...callIdentity(phase, call), toolAttempt };
+}
+
+function invocationIdentity(runId: string, phase: AgentToolOperationPhase, call: ToolCall, toolAttempt: number) {
+  const recovery = (phase.stage === 'effect_ready' || phase.stage === 'effect_pending')
+    && toolAttempt > 1
+    && phase.effect.intent.recovery.kind === 'preconditioned_reexecution'
+    ? Object.freeze({ kind: phase.effect.intent.recovery.kind, preconditions: phase.effect.intent.recovery.preconditions })
+    : undefined;
+  return { runId, ...attemptIdentity(phase, call, toolAttempt), ...(recovery ? { recovery } : {}) };
+}
+
+function authorizationKey(runId: string, phase: AgentToolOperationPhase, prepared: PreparedToolCall): string {
+  return `${runId}:tool:${phase.identity.turnId}:${phase.toolBatchId}:${String(phase.nextCallIndex)}:authorization:${prepared.fingerprint}`;
+}
+function approvalKey(runId: string, approval: AgentApprovalRequest): string { return `${runId}:approval:${approval.approvalId}:requested`; }
+function toolEventKey(runId: string, identity: AgentToolCallAttemptIdentity, stage: string): string { return `${runId}:tool:${identity.turnId}:${identity.toolBatchId}:${String(identity.callIndex)}:attempt:${String(identity.toolAttempt)}:${stage}`; }
+
+function sessionObservation(observation: ToolObservation) {
+  const artifacts = observationArtifacts(observation);
+  return { ok: observation.ok, summary: observation.summary, output: observation.output, ...(artifacts.length ? { artifacts } : {}), ...(observation.metadata ? { metadata: observation.metadata } : {}) };
+}
+function minimalToolResultProjection(observation: ToolObservation, toolName: string, projectionError: string): string {
+  return JSON.stringify({ ok: observation.ok, title: `${toolName} completed`, summary: `${observation.summary} The durable tool result was committed, but its rich model projection failed.`, scope: observation.scope, coverage: observation.scope.coverage, results: { artifacts: observationArtifacts(observation), projectionError: projectionError.slice(0, 1_000) } });
+}
+function observationArtifacts(observation: ToolObservation) { return [...new Map((observation.content ?? []).flatMap((item) => item.type === 'text' ? [] : [[item.artifact.artifactId, item.artifact] as const])).values()]; }

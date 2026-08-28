@@ -261,7 +261,7 @@ export type AgentCompletedTerminationReason = 'model_completed' | 'model_output_
 export type AgentFailureTerminationReason =
   | Exclude<AgentCompletedTerminationReason, 'model_completed'>
   | 'empty_response' | 'malformed_response' | 'provider_error' | 'runtime_error'
-  | 'stream_interrupted' | 'request_too_large' | 'limit_exhausted' | 'uncertain_tool_effect';
+  | 'stream_interrupted' | 'request_too_large' | 'limit_exhausted';
 type AgentTerminalBase = AgentRunIdentity & Readonly<{
   readonly phase: 'ended';
   readonly turnCount: number;
@@ -512,7 +512,7 @@ const AGENT_LIMIT_KINDS: readonly AgentLimitKind[] = [
 ];
 const FAILURE_REASONS: readonly AgentFailureTerminationReason[] = [
   'model_output_limit', 'content_filtered', 'unknown_model_termination', 'empty_response', 'malformed_response',
-  'provider_error', 'runtime_error', 'stream_interrupted', 'request_too_large', 'limit_exhausted', 'uncertain_tool_effect'
+  'provider_error', 'runtime_error', 'stream_interrupted', 'request_too_large', 'limit_exhausted'
 ];
 function terminalBaseIssues(value: Record<string, unknown>): string[] {
   const issues: string[] = [];

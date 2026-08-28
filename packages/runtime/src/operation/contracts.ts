@@ -2,6 +2,10 @@ import { parseJsonObject, type JsonObject } from '@agent-core/json';
 import { decodeEffectExecutionState, type EffectExecutionState } from '@agent-core/effects';
 import type { AgentRunBudgetState, AgentTurnIdentity } from '../run/contracts.js';
 import { decodeContextItemInput, type ContextItemInput } from '../context/manager.js';
+import { decodeToolCall, type ToolCall } from '@agent-core/tools';
+import { decodeToolOperationPhase, type AgentApprovalOperationPhase, type AgentToolOperationPhase } from './tool-state.js';
+
+export type { AgentApprovalOperationPhase, AgentToolOperationPhase, AgentToolPreparationRecord, AgentToolSettlementRecord } from './tool-state.js';
 
 export interface AgentOperationInput {
   readonly task: string;
@@ -41,24 +45,8 @@ export type AgentOperationPhase =
   | Readonly<{ readonly kind: 'accepted' }>
   | Readonly<{ readonly kind: 'preparing'; readonly step: 'initialize' | 'assemble_turn'; readonly turnIndex: number }>
   | AgentProviderOperationPhase
-  | Readonly<{
-      readonly kind: 'tools';
-      readonly stage: 'ready' | 'effect_pending' | 'settled' | 'projecting' | 'complete';
-      readonly identity: AgentTurnIdentity;
-      readonly toolBatchId: string;
-      readonly callCount: number;
-      readonly nextCallIndex: number;
-      readonly effectId?: string;
-      readonly settlementEventId?: string;
-    }>
-  | Readonly<{
-      readonly kind: 'approval';
-      readonly identity: AgentTurnIdentity;
-      readonly toolBatchId: string;
-      readonly callCount: number;
-      readonly nextCallIndex: number;
-      readonly pendingApprovalIds: readonly string[];
-    }>
+  | AgentToolOperationPhase
+  | AgentApprovalOperationPhase
   | Readonly<{
       readonly kind: 'verification';
       readonly stage: 'ready' | 'effect_pending' | 'settled' | 'complete';
@@ -81,9 +69,8 @@ export type AgentOperationPhase =
     }>
   | Readonly<{
       readonly kind: 'suspended';
-      readonly reason: 'approval_required' | 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'missing_implementation' | 'user_decision';
+      readonly reason: 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'missing_implementation' | 'user_decision';
       readonly effectId?: string;
-      readonly pendingApprovalIds?: readonly string[];
     }>
   | Readonly<{ readonly kind: 'cancelling'; readonly stage: 'requested' | 'finalizing' }>
   | Readonly<{ readonly kind: 'terminal'; readonly resultEventId: string }>;
@@ -97,6 +84,7 @@ export interface AgentOperationState {
   readonly configuration: AgentOperationConfiguration;
   readonly control: AgentOperationControl;
   readonly phase: AgentOperationPhase;
+  readonly toolCalls: readonly ToolCall[];
   readonly budget?: AgentRunBudgetState;
 }
 
@@ -108,6 +96,7 @@ export type AgentOperationProcedure =
   | 'reconcile_provider_request'
   | 'consume_provider_settlement'
   | 'prepare_tool_call'
+  | 'start_tool_call'
   | 'reconcile_tool_call'
   | 'consume_tool_settlement'
   | 'project_tool_settlement'
@@ -140,6 +129,7 @@ export function nextAgentOperationInstruction(state: AgentOperationState): Agent
       return Object.freeze({ kind: 'wait', reason: 'external_outcome' });
     case 'tools':
       if (state.phase.stage === 'ready') return Object.freeze({ kind: 'execute', procedure: 'prepare_tool_call' });
+      if (state.phase.stage === 'effect_ready') return Object.freeze({ kind: 'execute', procedure: 'start_tool_call' });
       if (state.phase.stage === 'effect_pending') return Object.freeze({ kind: 'execute', procedure: 'reconcile_tool_call' });
       if (state.phase.stage === 'settled') return Object.freeze({ kind: 'execute', procedure: 'consume_tool_settlement' });
       if (state.phase.stage === 'projecting') return Object.freeze({ kind: 'execute', procedure: 'project_tool_settlement' });
@@ -152,7 +142,7 @@ export function nextAgentOperationInstruction(state: AgentOperationState): Agent
     case 'disposition': return Object.freeze({ kind: 'execute', procedure: 'decide_candidate' });
     case 'finalization': return Object.freeze({ kind: 'execute', procedure: state.phase.stage === 'ready' ? 'finalize' : 'reconcile_finalization' });
     case 'suspended':
-      return Object.freeze({ kind: 'wait', reason: state.phase.reason === 'approval_required' ? 'approval' : state.phase.reason === 'user_decision' || state.phase.reason === 'missing_implementation' ? 'user_decision' : 'external_outcome' });
+      return Object.freeze({ kind: 'wait', reason: state.phase.reason === 'user_decision' || state.phase.reason === 'missing_implementation' ? 'user_decision' : 'external_outcome' });
     case 'cancelling': return Object.freeze({ kind: 'execute', procedure: 'finalize_abort' });
   }
 }
@@ -161,11 +151,12 @@ export function decodeAgentOperationState(value: unknown): AgentOperationState {
   let state: JsonObject;
   try { state = parseJsonObject(value, { maxDepth: 18, maxCollectionEntries: 20_000, maxStringBytes: 1024 * 1024, maxTotalBytes: 4 * 1024 * 1024 }); }
   catch (error) { throw new TypeError('operation state is invalid.', { cause: error }); }
-  exact(state, ['runId', 'finalizationId', 'revision', 'driverGeneration', 'input', 'configuration', 'control', 'phase', 'budget']);
+  exact(state, ['runId', 'finalizationId', 'revision', 'driverGeneration', 'input', 'configuration', 'control', 'phase', 'toolCalls', 'budget']);
   const input = decodeInput(state.input);
   const configuration = decodeConfiguration(state.configuration);
   const control = decodeControl(state.control);
   const phase = decodePhase(state.phase);
+  const toolCalls = Object.freeze(array(state.toolCalls, 'toolCalls').map((call) => decodeToolCall(call)));
   const budget = state.budget === undefined ? undefined : decodeBudget(state.budget);
   return Object.freeze({
     runId: identifier(state.runId, 'runId'),
@@ -176,6 +167,7 @@ export function decodeAgentOperationState(value: unknown): AgentOperationState {
     configuration,
     control,
     phase,
+    toolCalls,
     ...(budget === undefined ? {} : { budget })
   });
 }
@@ -257,23 +249,8 @@ function decodePhase(value: unknown): AgentOperationPhase {
       if (effect.phase !== 'closed') throw new TypeError('An unknown provider outcome requires a closed effect.');
       return Object.freeze({ ...base, stage, requestEventId, responseId, effect });
     }
-    case 'tools': {
-      exact(phase, ['kind', 'stage', 'identity', 'toolBatchId', 'callCount', 'nextCallIndex', 'effectId', 'settlementEventId']);
-      const callCount = nonnegativeInteger(phase.callCount, 'phase.callCount');
-      const nextCallIndex = nonnegativeInteger(phase.nextCallIndex, 'phase.nextCallIndex');
-      if (nextCallIndex > callCount) throw new TypeError('phase.nextCallIndex exceeds phase.callCount.');
-      const effectId = optionalIdentifier(phase.effectId, 'phase.effectId');
-      const settlementEventId = optionalIdentifier(phase.settlementEventId, 'phase.settlementEventId');
-      return Object.freeze({ kind, stage: enumeration(phase.stage, ['ready', 'effect_pending', 'settled', 'projecting', 'complete'] as const, 'phase.stage'), identity: decodeTurnIdentity(phase.identity), toolBatchId: identifier(phase.toolBatchId, 'phase.toolBatchId'), callCount, nextCallIndex, ...(effectId ? { effectId } : {}), ...(settlementEventId ? { settlementEventId } : {}) });
-    }
-    case 'approval':
-      exact(phase, ['kind', 'identity', 'toolBatchId', 'callCount', 'nextCallIndex', 'pendingApprovalIds']);
-      {
-        const callCount = positiveInteger(phase.callCount, 'phase.callCount');
-        const nextCallIndex = nonnegativeInteger(phase.nextCallIndex, 'phase.nextCallIndex');
-        if (nextCallIndex >= callCount) throw new TypeError('phase.nextCallIndex must identify a call in phase.callCount.');
-        return Object.freeze({ kind, identity: decodeTurnIdentity(phase.identity), toolBatchId: identifier(phase.toolBatchId, 'phase.toolBatchId'), callCount, nextCallIndex, pendingApprovalIds: nonemptyUniqueIdentifiers(phase.pendingApprovalIds, 'phase.pendingApprovalIds') });
-      }
+    case 'tools':
+    case 'approval': return decodeToolOperationPhase(phase);
     case 'verification': {
       exact(phase, ['kind', 'stage', 'checkIds', 'nextCheckIndex', 'effectId', 'resultEventId']);
       const checkIds = uniqueIdentifiers(phase.checkIds, 'phase.checkIds');
@@ -294,10 +271,9 @@ function decodePhase(value: unknown): AgentOperationPhase {
       return Object.freeze({ kind, stage: enumeration(phase.stage, ['ready', 'prepared', 'session_projected', 'committed'] as const, 'phase.stage'), ...(terminalEventId ? { terminalEventId } : {}) });
     }
     case 'suspended': {
-      exact(phase, ['kind', 'reason', 'effectId', 'pendingApprovalIds']);
+      exact(phase, ['kind', 'reason', 'effectId']);
       const effectId = optionalIdentifier(phase.effectId, 'phase.effectId');
-      const pendingApprovalIds = phase.pendingApprovalIds === undefined ? undefined : nonemptyUniqueIdentifiers(phase.pendingApprovalIds, 'phase.pendingApprovalIds');
-      return Object.freeze({ kind, reason: enumeration(phase.reason, ['approval_required', 'provider_outcome_unknown', 'tool_outcome_unknown', 'missing_implementation', 'user_decision'] as const, 'phase.reason'), ...(effectId ? { effectId } : {}), ...(pendingApprovalIds ? { pendingApprovalIds } : {}) });
+      return Object.freeze({ kind, reason: enumeration(phase.reason, ['provider_outcome_unknown', 'tool_outcome_unknown', 'missing_implementation', 'user_decision'] as const, 'phase.reason'), ...(effectId ? { effectId } : {}) });
     }
     case 'cancelling':
       exact(phase, ['kind', 'stage']);
@@ -337,7 +313,6 @@ function nonnegativeInteger(value: unknown, name: string): number { if (typeof v
 function positiveInteger(value: unknown, name: string): number { if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) throw new TypeError(`${name} must be a positive safe integer.`); return value; }
 function stringArray(value: unknown, name: string): readonly string[] { return Object.freeze(array(value, name).map((item, index) => nonempty(item, `${name}[${String(index)}]`))); }
 function uniqueIdentifiers(value: unknown, name: string): readonly string[] { const items = Object.freeze(array(value, name).map((item, index) => identifier(item, `${name}[${String(index)}]`))); if (new Set(items).size !== items.length) throw new TypeError(`${name} contains duplicate identities.`); return items; }
-function nonemptyUniqueIdentifiers(value: unknown, name: string): readonly string[] { const items = uniqueIdentifiers(value, name); if (items.length === 0) throw new TypeError(`${name} must not be empty.`); return items; }
 function numberRecord(value: unknown, name: string): Readonly<Record<string, number>> { const record = object(value, name); const owned: Record<string, number> = {}; for (const [key, item] of Object.entries(record)) { if (typeof item !== 'number' || !Number.isFinite(item) || item < 0) throw new TypeError(`${name}.${key} must be a non-negative finite number.`); owned[key] = item; } return Object.freeze(owned); }
 function enumeration<const T extends readonly string[]>(value: unknown, values: T, name: string): T[number] { if (!oneOf(value, values)) throw new TypeError(`${name} is invalid.`); return value; }
 function oneOf<const T extends readonly string[]>(value: unknown, values: T): value is T[number] { return typeof value === 'string' && values.some((candidate) => candidate === value); }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -21,7 +21,7 @@ import {
   decodeAgentTerminalSnapshot
 } from '@agent-core/runtime';
 import { InMemorySessionRepository } from '@agent-core/runtime';
-import { adoptToolDefinition, parseToolObservation } from '@agent-core/tools';
+import { adoptToolDefinition } from '@agent-core/tools';
 
 const capabilities = {
   streaming: false,
@@ -722,25 +722,28 @@ test('durable approval resumes after repository reopen and rejects changed polic
   const approval = suspended.pendingApprovals[0];
 
   const changedPolicy = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read'] } });
-  await assert.rejects(async () => (await changedPolicy.resumeApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result, /fingerprint changed/);
-  assert.equal(preparationReleases, 2);
+  await assert.rejects(async () => (await changedPolicy.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result, /different runtime implementation or configuration/);
+  assert.equal(preparationReleases, 1);
   assert.equal((await eventsFor(repositories.events, suspended.runId)).filter(event => event.type === 'approval.resolved').length, 0);
 
-  const changedTarget = new AgentRuntime({ provider, model: 'scripted', toolBoundary: { ...toolBoundary, executionTargetId: 'tests/other-target' }, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] } });
-  await assert.rejects(async () => (await changedTarget.resumeApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result, /boundary changed/);
-  assert.equal(preparationReleases, 2);
+  const changedTarget = new AgentRuntime({ provider, model: 'scripted', toolBoundary: { ...toolBoundary, executionTargetId: 'tests/other-target' }, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, checks: [{ id: 'required', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
+  await assert.rejects(async () => (await changedTarget.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result, /boundary changed/);
+  assert.equal(preparationReleases, 1);
 
   const replacement = adoptToolDefinition({ ...tool, implementationId: 'tests/canonical-effect@2' });
-  const changedImplementation = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [replacement], toolPolicy: { allowedRisks: ['read', 'write'] } });
-  await assert.rejects(async () => (await changedImplementation.resumeApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result, /implementation changed|fingerprint changed/);
-  assert.equal(preparationReleases, 3);
+  const changedImplementation = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [replacement], toolPolicy: { allowedRisks: ['read', 'write'] }, checks: [{ id: 'required', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
+  const unavailable = await (await changedImplementation.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result;
+  assert.equal(unavailable.state, 'suspended');
+  assert.equal(unavailable.reason, 'missing_implementation');
+  assert.equal(preparationReleases, 1);
+  assert.equal((await repositories.agent.inspectOperation(suspended.runId)).state.phase.kind, 'approval');
   assert.deepEqual(approval.binding, { toolImplementationId: tool.implementationId, ...toolBoundary });
 
   const reopened = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, checks: [{ id: 'required', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
-  const result = ended(await (await reopened.resumeApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result);  assert.equal(result.executionStatus, 'completed');
+  const result = ended(await (await reopened.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result);  assert.equal(result.executionStatus, 'completed');
   assert.equal(result.verificationStatus, 'passed');
   assert.equal(effects, 1);
-  assert.equal(preparationReleases, 5);
+  assert.equal(preparationReleases, 3);
   const records = await eventsFor(repositories.events, result.runId);
   assert.equal(records.filter(event => event.type === 'approval.requested').length, 1);
   assert.equal(records.filter(event => event.type === 'approval.resolved').length, 1);
@@ -772,7 +775,7 @@ test('current authorization is re-evaluated and may veto a stored approval', asy
     toolPolicy: { allowedRisks: ['read', 'write'] },
     toolAuthorizer() { currentChecks += 1; return { decision: 'deny', reason: 'policy changed' }; }
   });
-  const result = ended(await (await reopened.resumeApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result);  assert.equal(result.executionStatus, 'completed');
+  const result = ended(await (await reopened.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result);  assert.equal(result.executionStatus, 'completed');
   assert.equal(effects, 0);
   assert.equal(currentChecks, 1);
   const toolEnded = (await eventsFor(first.events, result.runId)).find((event) => event.type === 'tool.ended');
@@ -793,16 +796,15 @@ test('process death after an approved effect without recovery proof remains unce
   const recovered = spawnSync(process.execPath, [fixture, 'recover', root, approval.runId, approval.approvalId, approval.fingerprint], { encoding: 'utf8' });
   assert.equal(recovered.status, 0, recovered.stderr);
   const result = JSON.parse(recovered.stdout);
-  assert.equal(result.executionStatus, 'failed');
-  assert.equal(result.terminationReason, 'uncertain_tool_effect');
-  assert.equal(result.verificationStatus, 'not_run');
+  assert.equal(result.state, 'suspended');
+  assert.equal(result.reason, 'tool_outcome_unknown');
   assert.equal(await readFile(path.join(root, 'effect.txt'), 'utf8'), 'effect\n');
 
   const eventRepository = new (await import('@agent-core/evidence/node')).JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
   const records = await eventsFor(eventRepository, approval.runId);
   assert.equal(records.filter((event) => event.type === 'tool.started').length, 1);
   assert.equal(records.filter((event) => event.type === 'tool.ended').length, 0);
-  assert.equal(records.filter((event) => event.type === 'run.ended').length, 1);
+  assert.equal(records.filter((event) => event.type === 'run.ended').length, 0);
 });
 
 test('crashes while waiting for a lease or after acquisition but before tool.started remain safe to replay', async () => {
@@ -856,7 +858,73 @@ test('process death after tool completion projects the durable observation witho
   assert.equal(replay.branch.filter((entry) => entry.type === 'observation' && entry.toolName === 'effect').length, 1);
 });
 
-test('per-call recovery refuses incomplete effects without proof and only projects completed observations', async () => {
+test('process death after the tool audit event resumes the separate conversation projection', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-projection-crash-'));
+  const fixture = path.resolve('tests/fixtures/approval-crash.mjs');
+  const initial = spawnSync(process.execPath, [fixture, 'suspend', root], { encoding: 'utf8' });
+  assert.equal(initial.status, 0, initial.stderr);
+  const approval = JSON.parse(initial.stdout);
+  const crash = spawnSync(process.execPath, [fixture, 'crash_before_projection', root, approval.runId, approval.approvalId, approval.fingerprint], { encoding: 'utf8' });
+  assert.equal(crash.status, 47, crash.stderr);
+  const recovered = spawnSync(process.execPath, [fixture, 'recover', root, approval.runId, approval.approvalId, approval.fingerprint], { encoding: 'utf8' });
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.equal(JSON.parse(recovered.stdout).executionStatus, 'completed');
+  assert.equal(await readFile(path.join(root, 'effect.txt'), 'utf8'), 'effect\n');
+  const eventRepository = new (await import('@agent-core/evidence/node')).JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
+  const records = await eventsFor(eventRepository, approval.runId);
+  assert.equal(records.filter((event) => event.type === 'tool.started').length, 1);
+  assert.equal(records.filter((event) => event.type === 'tool.ended').length, 1);
+  assert.equal(records.filter((event) => event.type === 'observation.record.created').length, 1);
+});
+
+test('interrupted preconditioned reads reexecute only while every captured version remains stable', async () => {
+  const fixture = path.resolve('tests/fixtures/approval-crash.mjs');
+  for (const sourceChanged of [false, true]) {
+    const root = await mkdtemp(path.join(tmpdir(), `agent-preconditioned-${sourceChanged ? 'changed' : 'stable'}-`));
+    await writeFile(path.join(root, 'recovery-kind.txt'), 'preconditioned');
+    await writeFile(path.join(root, 'source.txt'), 'original\n');
+    const initial = spawnSync(process.execPath, [fixture, 'suspend', root], { encoding: 'utf8' });
+    assert.equal(initial.status, 0, initial.stderr);
+    const approval = JSON.parse(initial.stdout);
+    const crash = spawnSync(process.execPath, [fixture, 'crash', root, approval.runId, approval.approvalId, approval.fingerprint], { encoding: 'utf8' });
+    assert.equal(crash.status, 42, crash.stderr);
+    if (sourceChanged) await writeFile(path.join(root, 'source.txt'), 'changed\n');
+
+    const recovered = spawnSync(process.execPath, [fixture, 'recover', root, approval.runId, approval.approvalId, approval.fingerprint], { encoding: 'utf8' });
+    assert.equal(recovered.status, 0, recovered.stderr);
+    const result = JSON.parse(recovered.stdout);
+    assert.equal(result.state ?? 'ended', sourceChanged ? 'suspended' : 'ended');
+    if (sourceChanged) assert.equal(result.reason, 'tool_outcome_unknown');
+    const eventRepository = new (await import('@agent-core/evidence/node')).JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
+    const records = await eventsFor(eventRepository, approval.runId);
+    assert.deepEqual(records.filter((event) => event.type === 'tool.started').map((event) => event.toolAttempt), sourceChanged ? [1] : [1, 2]);
+    assert.deepEqual(records.filter((event) => event.type === 'tool.ended').map((event) => event.toolAttempt), sourceChanged ? [] : [2]);
+  }
+});
+
+test('an interrupted buffered mutation settles from its durable receipt without invoking again', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-buffered-recovery-'));
+  await writeFile(path.join(root, 'recovery-kind.txt'), 'buffered');
+  const fixture = path.resolve('tests/fixtures/approval-crash.mjs');
+  const initial = spawnSync(process.execPath, [fixture, 'suspend', root], { encoding: 'utf8' });
+  assert.equal(initial.status, 0, initial.stderr);
+  const approval = JSON.parse(initial.stdout);
+  const crash = spawnSync(process.execPath, [fixture, 'crash', root, approval.runId, approval.approvalId, approval.fingerprint], { encoding: 'utf8' });
+  assert.equal(crash.status, 42, crash.stderr);
+  assert.equal(await readFile(path.join(root, 'effect.txt'), 'utf8'), 'effect\n');
+
+  const recovered = spawnSync(process.execPath, [fixture, 'recover', root, approval.runId, approval.approvalId, approval.fingerprint], { encoding: 'utf8' });
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.equal(JSON.parse(recovered.stdout).executionStatus, 'completed');
+  assert.equal(await readFile(path.join(root, 'effect.txt'), 'utf8'), 'effect\n');
+  const eventRepository = new (await import('@agent-core/evidence/node')).JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
+  const records = await eventsFor(eventRepository, approval.runId);
+  assert.deepEqual(records.filter((event) => event.type === 'tool.started').map((event) => event.toolAttempt), [1]);
+  assert.deepEqual(records.filter((event) => event.type === 'tool.ended').map((event) => event.toolAttempt), [1]);
+  assert.equal(records.filter((event) => event.type === 'observation.record.created').length, 1);
+});
+
+test('semantic tool audit events cannot advance authoritative per-call recovery state', async () => {
   const call = { id: 'effect-1', type: 'function', name: 'effect', input: { kind: 'json', value: {} } };
   const persistedCall = { id: call.id, name: call.name, input: call.input };
   const effects = { accesses: [{ mode: 'write', scope: 'state/effect' }], lockScopes: ['state/effect'], recovery: { kind: 'unknown' } };
@@ -876,30 +944,57 @@ test('per-call recovery refuses incomplete effects without proof and only projec
   const approval = suspended.pendingApprovals[0];
   const identity = { turnIndex: approval.turnIndex, turnId: approval.turnId, requestAttempt: approval.requestAttempt, toolBatchId: approval.toolBatchId, callIndex: approval.callIndex, callId: approval.callId, toolAttempt: 1 };
   await run.events.append(suspended.runId, { type: 'tool.started', ...identity, toolName: tool.name, input: persistedCall, fingerprint: approval.fingerprint, effects }, { idempotencyKey: toolStageKey(suspended.runId, identity, 'started') });
-  const result = ended(await (await run.agent.resumeApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result);  assert.equal(result.executionStatus, 'failed');
-  assert.equal(result.terminationReason, 'uncertain_tool_effect');
-  assert.equal(invocations, 0);
+  const operationBeforeResolution = await run.agent.inspectOperation(suspended.runId);
+  assert.equal(operationBeforeResolution.state.phase.kind, 'approval');
+  const result = ended(await (await run.agent.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result);  assert.equal(result.executionStatus, 'completed');
+  assert.equal(invocations, 1);
   let records = await eventsFor(run.events, result.runId);
   assert.deepEqual(records.filter((event) => event.type === 'tool.started').map((event) => event.toolAttempt), [1]);
-  assert.deepEqual(records.filter((event) => event.type === 'tool.ended').map((event) => event.toolAttempt), []);
+  assert.deepEqual(records.filter((event) => event.type === 'tool.ended').map((event) => event.toolAttempt), [1]);
+  assert.equal(records.filter((event) => event.type === 'observation.record.created').length, 1);
+});
 
-  let projectedInvocations = 0;
-  const completedTool = { ...tool, implementationId: 'tests/completed-recovery@1', async invoke() { projectedInvocations += 1; return { kind: 'result', ok: true, output: {}, summary: 'must not run', scope: { resources: ['state/effect'], coverage: 'complete' } }; } };
-  const completedProvider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] }), response('stop', 'after projection')]);
-  const completedRun = await harness({ provider: completedProvider, tools: [completedTool], toolPolicy: { allowedRisks: ['read', 'write'] }, toolAuthorizer: () => ({ decision: 'require_approval', reason: 'confirm' }) });
-  const completedSuspension = await completedRun.agent.run({ task: 'completed recovery' }).result;
-  const completedApproval = completedSuspension.pendingApprovals[0];
-  const completedIdentity = { turnIndex: completedApproval.turnIndex, turnId: completedApproval.turnId, requestAttempt: completedApproval.requestAttempt, toolBatchId: completedApproval.toolBatchId, callIndex: completedApproval.callIndex, callId: completedApproval.callId, toolAttempt: 1 };
-  const completedObservation = parseToolObservation(completedTool, { kind: 'result', ok: true, output: { already: true }, summary: 'already completed', scope: { resources: ['state/effect'], coverage: 'complete' } });
-  await completedRun.events.append(completedSuspension.runId, { type: 'tool.started', ...completedIdentity, toolName: completedTool.name, input: persistedCall, fingerprint: completedApproval.fingerprint, effects }, { idempotencyKey: toolStageKey(completedSuspension.runId, completedIdentity, 'started') });
-  await completedRun.events.append(completedSuspension.runId, { type: 'tool.ended', ...completedIdentity, toolName: completedTool.name, observation: completedObservation }, { idempotencyKey: toolStageKey(completedSuspension.runId, completedIdentity, 'ended') });
-  const completedResult = ended(await (await completedRun.agent.resumeApproval({ runId: completedSuspension.runId, approvalId: completedApproval.approvalId, fingerprint: completedApproval.fingerprint, decision: 'allow' })).result);  assert.equal(completedResult.executionStatus, 'completed');
-  assert.equal(projectedInvocations, 0);
-  records = await eventsFor(completedRun.events, completedResult.runId);
+test('a live stale runtime can settle its exact tool permit but cannot continue the run after takeover', async () => {
+  let releaseInvocation;
+  let markInvocationStarted;
+  const invocationStarted = new Promise((resolve) => { markInvocationStarted = resolve; });
+  const invocationRelease = new Promise((resolve) => { releaseInvocation = resolve; });
+  let invocations = 0;
+  const call = { id: 'effect-1', type: 'function', name: 'effect', input: { kind: 'json', value: {} } };
+  const tool = adoptToolDefinition({
+    name: 'effect', implementationId: 'tests/live-takeover-effect@1', description: 'controlled effect', jsonSchema: { type: 'object' }, outputSchema: z.strictObject({}),
+    effectEnvelope: { accesses: [{ mode: 'write', scope: 'state/effect' }], lockScopes: ['state/effect'] },
+    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; },
+    deriveEffects() { return { accesses: [{ mode: 'write', scope: 'state/effect' }], lockScopes: ['state/effect'], recovery: { kind: 'unknown' } }; },
+    async invoke() {
+      invocations += 1;
+      markInvocationStarted();
+      await invocationRelease;
+      return { kind: 'result', ok: true, output: {}, summary: 'settled by stale owner', scope: { resources: ['state/effect'], coverage: 'complete' } };
+    }
+  });
+  const provider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] }), response('stop', 'continued by replacement')]);
+  const first = await harness({ provider, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, toolAuthorizer: () => ({ decision: 'allow' }), withoutSession: true });
+  const firstControl = first.agent.run({ task: 'live takeover' });
+  await invocationStarted;
+
+  const replacement = new AgentRuntime({
+    provider, model: 'scripted', toolBoundary,
+    repositories: { events: first.events, artifacts: first.artifacts },
+    tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, toolAuthorizer: () => ({ decision: 'allow' })
+  });
+  const waiting = await replacement.resume(firstControl.runId).result;
+  assert.equal(waiting.state, 'suspended');
+  assert.equal(waiting.reason, 'tool_outcome_unknown');
+  releaseInvocation();
+  await assert.rejects(firstControl.result, /replacement driver/u);
+
+  const completed = ended(await replacement.resume(firstControl.runId).result);
+  assert.equal(completed.executionStatus, 'completed');
+  assert.equal(invocations, 1);
+  const records = await eventsFor(first.events, firstControl.runId);
   assert.equal(records.filter((event) => event.type === 'tool.ended').length, 1);
   assert.equal(records.filter((event) => event.type === 'observation.record.created').length, 1);
-  const replay = await completedRun.sessions.loadReplayState(completedRun.session.id);
-  assert.equal(replay.branch.filter((entry) => entry.type === 'observation' && entry.toolName === completedTool.name).length, 1);
 });
 
 test('consumed provider usage remains in the terminal snapshot when it crosses a limit', async () => {

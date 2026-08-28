@@ -184,7 +184,7 @@ export class AgentSession {
       await this.options.repository.transitionSubmission(this.options.descriptor.id, suspended.submissionId, { state: 'claimed' });
       try {
         const runtime = this.options.createRuntime(configuration, (event) => this.emit({ type: 'run.progress', runId: input.runId, event }));
-        const control = await runtime.resumeApproval(input);
+        const control = await runtime.resolveApproval(input);
         const pending = pendingSubmission(suspended.submissionId, input.runId, suspended.input, configuration);
         this.suspended = undefined;
         this.observe({ control, pending, configuration });
@@ -388,7 +388,8 @@ function ownConfiguration(configuration: AgentSessionConfiguration): AgentSessio
 
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function operationSuspensionReason(phase: import('../operation/contracts.js').AgentOperationPhase): 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'missing_implementation' | 'user_decision' | undefined {
-  if (phase.kind === 'suspended' && phase.reason !== 'approval_required') return phase.reason;
+  if (phase.kind === 'suspended') return phase.reason;
   if (phase.kind === 'provider' && phase.stage === 'outcome_unknown') return 'provider_outcome_unknown';
+  if (phase.kind === 'tools' && phase.stage === 'effect_pending') return 'tool_outcome_unknown';
   return undefined;
 }

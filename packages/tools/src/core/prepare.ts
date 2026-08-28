@@ -1,8 +1,8 @@
 import { hashJson } from '@agent-core/evidence';
-import { startExternalEffect, type EffectExecutionState } from '@agent-core/effects';
+import { decodeEffectRecoveryCapability, type EffectExecutionState } from '@agent-core/effects';
 import type { JsonObject, JsonValue } from '@agent-core/json';
 import { abortableToolBoundary, MissingToolServiceError, throwIfAborted, ToolInputError, type ToolCanonicalizationContext, type ToolExecutionContext, type ToolPreparationContext, type ToolPreparationLifetime, type ToolPreparationResource } from './context.js';
-import type { ToolCall, ToolDefinition, ToolObservation } from './definition.js';
+import type { ToolCall, ToolDefinition, ToolEffectRecoveryResult, ToolObservation } from './definition.js';
 import { invalidOutputObservation, invalidToolInputObservation, missingServiceObservation, parseToolObservation, runtimeErrorObservation, unknownToolObservation } from './observation.js';
 import { assertEffectsWithinEnvelope, encodeToolEffects, validateToolEffects, type ToolEffects } from './authorization.js';
 import { encodeToolPolicy } from './policy.js';
@@ -76,9 +76,22 @@ export async function prepareToolCall(call: ToolCall, tools: readonly ToolDefini
       effects,
       fingerprint: hashJson(fingerprintInput)
     });
+    const recover = tool.recover?.bind(tool);
     preparedToolCalls.set(prepared, {
       state: 'prepared',
       lifetime,
+      ...(recover ? {
+        recover: async (effect: Extract<EffectExecutionState, { readonly phase: 'started' }>, executionContext: ToolExecutionContext) => {
+          let result: unknown;
+          try {
+            result = await recover(canonicalized, effect, executionContext);
+          } catch (error) {
+            if (executionContext.signal?.aborted) throwIfAborted(executionContext.signal);
+            return Object.freeze({ status: 'unavailable', reason: error instanceof Error ? error.message : String(error) });
+          }
+          return decodeToolEffectRecoveryResult(tool, result);
+        }
+      } : {}),
       invoke: async (executionContext: ToolExecutionContext) => {
         const observation = await tool.invoke(canonicalized, executionContext);
         try { return parseToolObservation(tool, observation); }
@@ -98,6 +111,7 @@ export async function prepareToolCall(call: ToolCall, tools: readonly ToolDefini
 interface PreparedToolCallRecord {
   state: 'prepared' | 'transferred' | 'released';
   readonly lifetime: PreparationLifetime;
+  readonly recover?: (effect: Extract<EffectExecutionState, { readonly phase: 'started' }>, context: ToolExecutionContext) => Promise<PreparedToolEffectRecovery>;
   readonly invoke: (context: ToolExecutionContext) => Promise<ToolObservation>;
 }
 
@@ -112,21 +126,33 @@ interface ToolInvocationRecord {
 const preparedToolCalls = new WeakMap<PreparedToolCall, PreparedToolCallRecord>();
 const toolInvocations = new WeakMap<ToolInvocation, ToolInvocationRecord>();
 
+export type PreparedToolEffectRecovery =
+  | Exclude<ToolEffectRecoveryResult, { readonly status: 'settled' }>
+  | { readonly status: 'settled'; readonly observation: ToolObservation };
+
+export async function recoverPreparedToolCall(
+  prepared: PreparedToolCall,
+  effect: Extract<EffectExecutionState, { readonly phase: 'started' }>,
+  context: ToolExecutionContext
+): Promise<PreparedToolEffectRecovery> {
+  const record = requirePreparedRecord(prepared);
+  if (record.state !== 'prepared') throw new ToolInvocationAuthorityError('Tool call preparation is not available for recovery.');
+  if (effect.intent.implementationId !== prepared.toolImplementationId || effect.intent.parametersDigest !== prepared.fingerprint) {
+    throw new ToolInvocationAuthorityError('Effect recovery authority does not match the prepared tool call.');
+  }
+  if (!record.recover) return Object.freeze({ status: 'unavailable', reason: 'The tool implementation does not expose effect recovery.' });
+  return record.recover(effect, context);
+}
+
 export async function startPreparedToolCall(
   prepared: PreparedToolCall,
-  effect: Extract<EffectExecutionState, { readonly phase: 'ticket_issued' }>,
-  currentDriverGeneration: number
+  effect: Extract<EffectExecutionState, { readonly phase: 'started' }>
 ): Promise<ToolInvocation> {
   const record = requirePreparedRecord(prepared);
   if (record.state !== 'prepared') throw new ToolInvocationAuthorityError('Tool call preparation has already transferred or been released.');
   if (effect.intent.implementationId !== prepared.toolImplementationId || effect.intent.parametersDigest !== prepared.fingerprint) {
     await releasePreparedToolCall(prepared);
     throw new ToolInvocationAuthorityError('Effect authority does not match the prepared tool call.');
-  }
-  const started = startExternalEffect(effect, effect.ticket, currentDriverGeneration);
-  if (started.status !== 'started') {
-    await releasePreparedToolCall(prepared);
-    throw new ToolInvocationAuthorityError(`Tool effect start was rejected: ${started.reason}.`);
   }
   record.state = 'transferred';
   const invocation = Object.freeze({
@@ -207,4 +233,35 @@ function isPreparationResource(value: unknown): value is ToolPreparationResource
   return (typeof value === 'object' && value !== null || typeof value === 'function')
     && 'release' in value
     && typeof value.release === 'function';
+}
+
+function decodeToolEffectRecoveryResult(tool: ToolDefinition, value: unknown): PreparedToolEffectRecovery {
+  if (!record(value) || typeof value.status !== 'string') throw new TypeError('Tool recovery must return a recovery result.');
+  if (value.status === 'reexecute') {
+    exact(value, ['status', 'preconditions']);
+    const capability = decodeEffectRecoveryCapability({ kind: 'preconditioned_reexecution', preconditions: value.preconditions });
+    if (capability.kind !== 'preconditioned_reexecution') throw new TypeError('Tool recovery preconditions are invalid.');
+    return Object.freeze({ status: value.status, preconditions: capability.preconditions });
+  }
+  if (value.status === 'settled') {
+    exact(value, ['status', 'observation']);
+    return Object.freeze({ status: value.status, observation: parseToolObservation(tool, value.observation) });
+  }
+  if (value.status === 'running') {
+    exact(value, ['status']);
+    return Object.freeze({ status: value.status });
+  }
+  if (value.status === 'not_found' || value.status === 'expired' || value.status === 'unavailable' || value.status === 'parameter_mismatch') {
+    exact(value, ['status', 'reason']);
+    if (value.reason !== undefined && (typeof value.reason !== 'string' || value.reason.trim().length === 0)) throw new TypeError('Tool recovery reason must be non-empty.');
+    return Object.freeze({ status: value.status, ...(typeof value.reason === 'string' ? { reason: value.reason } : {}) });
+  }
+  throw new TypeError('Tool recovery status is invalid.');
+}
+
+function record(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
+function exact(value: Record<string, unknown>, fields: readonly string[]): void {
+  const allowed = new Set(fields);
+  const unsupported = Object.keys(value).filter((field) => !allowed.has(field));
+  if (unsupported.length > 0) throw new TypeError(`Tool recovery returned unsupported fields: ${unsupported.join(', ')}.`);
 }

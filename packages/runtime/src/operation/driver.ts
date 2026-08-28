@@ -18,6 +18,10 @@ import {
   type AgentOperationState
 } from './contracts.js';
 import type { AgentRunBudgetState } from '../run/contracts.js';
+import type { ToolCall } from '@agent-core/tools';
+import { encodeToolObservation } from '@agent-core/tools';
+import { decodeEffectSettlementPermit, knownEffectExposure, settleExternalEffect, type EffectSettlementPermit } from '@agent-core/effects';
+import { decodeAgentToolSettlementRecord, type AgentToolSettlementRecord } from './tool-state.js';
 
 export interface AgentOperationAcceptance {
   readonly runId: string;
@@ -36,6 +40,7 @@ export interface AgentOperationInspection {
 export interface AgentOperationAdvance {
   readonly phase: AgentOperationPhase;
   readonly budget?: AgentRunBudgetState;
+  readonly toolCalls?: readonly ToolCall[];
 }
 
 export interface AgentOperationProcedureContext {
@@ -74,7 +79,8 @@ export class AgentOperationCoordinator {
       input: value.input,
       configuration: value.configuration,
       control: { status: 'detached' },
-      phase: { kind: 'accepted' }
+      phase: { kind: 'accepted' },
+      toolCalls: []
     });
     const expectedTail = await this.events.tail(state.runId);
     if (expectedTail.sequence !== -1) {
@@ -167,6 +173,52 @@ export class AgentOperationCoordinator {
       return this.inspect(runId);
     }
   }
+
+  async settleToolEffect(runId: string, input: {
+    readonly effectId: string;
+    readonly permit: EffectSettlementPermit;
+    readonly settlement: AgentToolSettlementRecord;
+  }): Promise<AgentOperationInspection> {
+    if (typeof input.effectId !== 'string' || input.effectId.trim().length === 0) throw new TypeError('Tool effect identity must be non-empty.');
+    const permit = decodeEffectSettlementPermit(input.permit);
+    const settlement = decodeAgentToolSettlementRecord(input.settlement);
+    for (;;) {
+      const current = await this.inspect(runId);
+      const phase = current.state.phase;
+      if (phase.kind === 'tools' && (phase.stage === 'settled' || phase.stage === 'projecting')
+        && phase.effect?.intent.effectId === input.effectId) {
+        if (toolSettlementDigest(phase.settlement) !== toolSettlementDigest(settlement)) {
+          throw new AgentOperationConflictError(runId, 'idempotency_conflict', `Tool effect ${input.effectId} already has a different settlement.`);
+        }
+        return current;
+      }
+      if (phase.kind !== 'tools' || phase.stage !== 'effect_pending' || phase.effect.intent.effectId !== input.effectId) {
+        throw new AgentOperationConflictError(runId, 'stale_tail', `Tool effect ${input.effectId} is no longer awaiting settlement.`);
+      }
+      const resultDigest = hashJson(encodeToolObservation(settlement.observation));
+      const settled = settleExternalEffect(phase.effect, permit, {
+        outcome: settlement.observation.ok ? 'succeeded' : 'failed',
+        resultDigest,
+        exposure: knownEffectExposure([])
+      });
+      if (settled.status !== 'settled' && settled.status !== 'already_settled') {
+        throw new AgentOperationConflictError(runId, 'idempotency_conflict', `Tool effect ${input.effectId} settlement authority was rejected: ${settled.status}.`);
+      }
+      const state = decodeAgentOperationState({
+        ...current.state,
+        revision: current.state.revision + 1,
+        phase: { ...phase, stage: 'settled', effect: settled.state, settlement }
+      });
+      const result = await this.events.appendConditional(runId, { type: 'operation.transition', state }, {
+        idempotencyKey: `${runId}:tool-effect:${input.effectId}:settled:${resultDigest}`,
+        expectedTail: current.tail,
+        driverGeneration: current.state.driverGeneration
+      });
+      if (result.kind === 'rejected' && (result.reason === 'stale_tail' || result.reason === 'stale_driver')) continue;
+      acceptConditionalResult(runId, result);
+      return this.inspect(runId);
+    }
+  }
 }
 
 export class AgentOperationDriver {
@@ -201,22 +253,31 @@ export class AgentOperationDriver {
     return this.serial(() => this.appendNow(event, idempotencyKey));
   }
 
-  resolveApproval(approvalId: string): Promise<AgentOperationInspection> {
+  synchronize(): Promise<AgentOperationInspection> {
+    return this.serial(async () => {
+      await this.refresh();
+      return this.inspection();
+    });
+  }
+
+  decideApproval(input: { readonly approvalId: string; readonly fingerprint: string; readonly decision: 'allow' | 'deny' }): Promise<AgentOperationInspection> {
     return this.serial(async () => {
       this.assertTransitionAuthority(this.stateValue.phase);
       if (this.stateValue.phase.kind !== 'approval') throw new TypeError(`Run ${this.stateValue.runId} is not waiting for approval.`);
-      if (!this.stateValue.phase.pendingApprovalIds.includes(approvalId)) throw new TypeError(`Run ${this.stateValue.runId} is not waiting for approval ${approvalId}.`);
-      const pendingApprovalIds = this.stateValue.phase.pendingApprovalIds.filter((id) => id !== approvalId);
-      const phase: AgentOperationPhase = pendingApprovalIds.length > 0
-        ? Object.freeze({ ...this.stateValue.phase, pendingApprovalIds: Object.freeze(pendingApprovalIds) })
-        : Object.freeze({
-            kind: 'tools',
-            stage: 'ready',
-            identity: this.stateValue.phase.identity,
-            toolBatchId: this.stateValue.phase.toolBatchId,
-            callCount: this.stateValue.phase.callCount,
-            nextCallIndex: 0
-          });
+      const approval = this.stateValue.phase.approval;
+      if (approval.approvalId !== input.approvalId) throw new TypeError(`Run ${this.stateValue.runId} is not waiting for approval ${input.approvalId}.`);
+      if (approval.fingerprint !== input.fingerprint) throw new TypeError(`Approval fingerprint mismatch for ${input.approvalId}.`);
+      const phase: AgentOperationPhase = Object.freeze({
+        kind: 'tools',
+        stage: 'ready',
+        identity: this.stateValue.phase.identity,
+        toolBatchId: this.stateValue.phase.toolBatchId,
+        calls: this.stateValue.phase.calls,
+        nextCallIndex: this.stateValue.phase.nextCallIndex,
+        instructions: this.stateValue.phase.instructions,
+        modelInputModalities: this.stateValue.phase.modelInputModalities,
+        approved: Object.freeze({ approval, decision: input.decision })
+      });
       return this.commitState({ phase });
     });
   }
@@ -273,6 +334,7 @@ export class AgentOperationDriver {
       ...this.stateValue,
       revision: this.stateValue.revision + 1,
       phase: advance.phase,
+      toolCalls: advance.toolCalls ?? this.stateValue.toolCalls,
       ...(advance.budget === undefined ? (this.stateValue.budget === undefined ? {} : { budget: this.stateValue.budget }) : { budget: advance.budget })
     });
     const result = await this.events.appendConditional(state.runId, { type: 'operation.transition', state }, {
@@ -343,6 +405,14 @@ function transitionKey(state: AgentOperationState): string {
   return `${state.runId}:operation:revision:${String(state.revision)}:${hashJson(encodeAgentEvent({ type: 'operation.transition', state }))}`;
 }
 
+function toolSettlementDigest(settlement: AgentToolSettlementRecord): string {
+  return hashJson(Object.freeze({
+    observationId: settlement.observationId,
+    observation: encodeToolObservation(settlement.observation),
+    createdAt: settlement.createdAt
+  }));
+}
+
 function abortAdministrativeEvent(event: AgentAuditEvent): boolean {
   return event.type === 'finalization.prepared'
     || event.type === 'run.ended'
@@ -359,8 +429,9 @@ function advanceMatchesProcedure(procedure: Extract<AgentOperationInstruction, {
     case 'start_provider_request': return (phase.kind === 'provider' && phase.stage === 'effect_pending') || phase.kind === 'finalization';
     case 'reconcile_provider_request': return (phase.kind === 'provider' && (phase.stage === 'settled' || phase.stage === 'outcome_unknown')) || phase.kind === 'suspended';
     case 'consume_provider_settlement': return phase.kind === 'provider' || phase.kind === 'tools' || phase.kind === 'preparing' || phase.kind === 'verification' || phase.kind === 'disposition' || phase.kind === 'finalization';
-    case 'prepare_tool_call': return (phase.kind === 'tools' && (phase.stage === 'effect_pending' || phase.stage === 'complete')) || phase.kind === 'finalization';
-    case 'reconcile_tool_call': return (phase.kind === 'tools' && phase.stage === 'settled') || phase.kind === 'approval' || phase.kind === 'suspended' || phase.kind === 'finalization';
+    case 'prepare_tool_call': return (phase.kind === 'tools' && (phase.stage === 'effect_ready' || phase.stage === 'settled' || phase.stage === 'complete')) || phase.kind === 'approval' || phase.kind === 'finalization';
+    case 'start_tool_call': return (phase.kind === 'tools' && (phase.stage === 'effect_ready' || phase.stage === 'effect_pending')) || phase.kind === 'suspended' || phase.kind === 'finalization';
+    case 'reconcile_tool_call': return (phase.kind === 'tools' && (phase.stage === 'effect_ready' || phase.stage === 'settled')) || phase.kind === 'approval' || phase.kind === 'suspended' || phase.kind === 'finalization';
     case 'consume_tool_settlement': return (phase.kind === 'tools' && phase.stage === 'projecting') || phase.kind === 'finalization';
     case 'project_tool_settlement': return phase.kind === 'tools' && (phase.stage === 'ready' || phase.stage === 'complete');
     case 'advance_after_tools': return phase.kind === 'preparing' || phase.kind === 'verification' || phase.kind === 'disposition' || phase.kind === 'finalization';

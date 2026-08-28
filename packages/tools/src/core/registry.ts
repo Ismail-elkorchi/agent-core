@@ -36,6 +36,7 @@ export function adoptToolDefinition(tool: unknown): CompiledToolDefinition {
   const snapshotInput = tool.snapshotInput as ToolDefinition['snapshotInput'];
   if (tool.promptGuide !== undefined && typeof tool.promptGuide !== 'string' && typeof tool.promptGuide !== 'function') throw new Error('Tool promptGuide is invalid.');
   if (tool.isAvailable !== undefined && typeof tool.isAvailable !== 'function') throw new Error('Tool isAvailable is invalid.');
+  if (tool.recover !== undefined && typeof tool.recover !== 'function') throw new Error('Tool recover is invalid.');
   if (tool.presentObservation !== undefined && typeof tool.presentObservation !== 'function') throw new Error('Tool presentObservation is invalid.');
   const textInput = tool.textInput === undefined ? undefined : snapshotTextInput(tool.textInput);
   const jsonSchema = parseJsonObject(tool.jsonSchema, { maxDepth: 64, maxCollectionEntries: 50_000, maxStringBytes: 1_000_000, maxTotalBytes: 4_000_000 });
@@ -53,12 +54,13 @@ export function adoptToolDefinition(tool: unknown): CompiledToolDefinition {
     canonicalizeInput: tool.canonicalizeInput as ToolDefinition['canonicalizeInput'],
     snapshotInput: (input: unknown) => parseJsonValue(snapshotInput(input)),
     deriveEffects: tool.deriveEffects as ToolDefinition['deriveEffects'],
+    ...(tool.recover ? { recover: tool.recover as NonNullable<ToolDefinition['recover']> } : {}),
     invoke: tool.invoke as ToolDefinition['invoke'],
     ...(tool.presentObservation ? { presentObservation: tool.presentObservation as NonNullable<ToolDefinition['presentObservation']> } : {})
   }));
 }
 
-const KEYS = new Set(['name', 'implementationId', 'description', 'promptGuide', 'jsonSchema', 'outputSchema', 'textInput', 'effectEnvelope', 'requirements', 'isAvailable', 'decodeInput', 'canonicalizeInput', 'snapshotInput', 'deriveEffects', 'invoke', 'presentObservation']);
+const KEYS = new Set(['name', 'implementationId', 'description', 'promptGuide', 'jsonSchema', 'outputSchema', 'textInput', 'effectEnvelope', 'requirements', 'isAvailable', 'decodeInput', 'canonicalizeInput', 'snapshotInput', 'deriveEffects', 'recover', 'invoke', 'presentObservation']);
 function snapshotTextInput(value: unknown): NonNullable<ToolDefinition['textInput']> {
   if (!record(value) || !record(value.format) || typeof value.decode !== 'function') throw new Error('Tool textInput is invalid.');
   if (value.description !== undefined && typeof value.description !== 'string') throw new Error('Tool textInput description is invalid.');

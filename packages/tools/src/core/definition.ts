@@ -5,6 +5,7 @@ import type { ToolCanonicalizationContext, ToolExecutionContext } from './contex
 import type { ToolObservationPresentation, ToolObservationPresentationRequest } from './observation-presentation.js';
 import type { ToolPolicy } from './policy.js';
 import type { ToolEffectEnvelope, ToolEffects } from './authorization.js';
+import type { EffectExecutionState, EffectResourcePrecondition } from '@agent-core/effects';
 
 declare const ownedToolCall: unique symbol;
 declare const ownedToolObservation: unique symbol;
@@ -62,6 +63,12 @@ export interface ToolResultObservation<TOutput = JsonValue> extends ToolObservat
 export interface ToolFailureObservation<TOutput extends ToolFailureOutput = ToolFailureOutput> extends ToolObservationBase { readonly kind: 'failure'; readonly ok: false; readonly output: TOutput }
 export type ToolObservation<TOutput = JsonValue> = ToolResultObservation<TOutput> | ToolFailureObservation;
 
+export type ToolEffectRecoveryResult<TOutput = unknown> =
+  | { readonly status: 'reexecute'; readonly preconditions: readonly EffectResourcePrecondition[] }
+  | { readonly status: 'settled'; readonly observation: ToolObservationInput<TOutput> }
+  | { readonly status: 'running' }
+  | { readonly status: 'not_found' | 'expired' | 'unavailable' | 'parameter_mismatch'; readonly reason?: string };
+
 export type ToolFailureReason = 'unknown_tool' | 'policy' | 'invalid_arguments' | 'invalid_output' | 'missing_service' | 'runtime_error';
 export interface BaseToolFailureOutput { readonly blocked: true; readonly reason: ToolFailureReason; readonly recovery: string }
 export interface UnknownToolFailureOutput extends BaseToolFailureOutput { readonly reason: 'unknown_tool'; readonly toolCall: ToolCall }
@@ -90,6 +97,7 @@ export interface ToolDefinition<TDecodedInput = unknown, TCanonicalInput = TDeco
   canonicalizeInput(input: TDecodedInput, context: ToolCanonicalizationContext): TCanonicalInput | Promise<TCanonicalInput>;
   snapshotInput(input: TCanonicalInput): JsonValue;
   deriveEffects(input: TCanonicalInput, context: ToolCanonicalizationContext): ToolEffects | Promise<ToolEffects>;
+  recover?(input: TCanonicalInput, effect: Extract<EffectExecutionState, { readonly phase: 'started' }>, context: ToolExecutionContext): ToolEffectRecoveryResult<TOutput> | Promise<ToolEffectRecoveryResult<TOutput>>;
   invoke(input: TCanonicalInput, context: ToolExecutionContext): Promise<ToolObservationInput<TOutput>>;
   presentObservation?(request: ToolObservationPresentationRequest<TCanonicalInput, TOutput>): ToolObservationPresentation;
 }

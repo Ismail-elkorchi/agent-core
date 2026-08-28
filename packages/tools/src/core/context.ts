@@ -1,5 +1,6 @@
 import type { ToolPolicy } from './policy.js';
 import type { MissingServiceDetails } from './definition.js';
+import type { EffectResourcePrecondition } from '@agent-core/effects';
 
 export class MissingToolServiceError extends Error {
   readonly serviceName: string;
@@ -78,6 +79,7 @@ export interface ToolInvocationContext {
   readonly callIndex: number;
   readonly callId?: string;
   readonly toolAttempt: number;
+  readonly recovery?: Readonly<{ readonly kind: 'preconditioned_reexecution'; readonly preconditions: readonly EffectResourcePrecondition[] }>;
 }
 
 export type ToolServiceValidator<T> = (value: unknown) => value is T;

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
 import { adoptToolDefinition, beginToolInvocation, createToolCall, defineTool, parseToolObservation, prepareToolCall, releasePreparedToolCall, releaseToolInvocation, ResourceLeaseCoordinator, startPreparedToolCall } from '@agent-core/tools';
-import { issueEffectStartTicket, NO_EFFECT_EXPOSURE } from '@agent-core/effects';
+import { issueEffectStartTicket, NO_EFFECT_EXPOSURE, startExternalEffect } from '@agent-core/effects';
 import { scheduleToolCalls } from '@agent-core/runtime';
 import {
   applyPatchTool,
@@ -73,14 +73,17 @@ test('tool preparation authority transfers once and releases every owned resourc
   const rejected = await prepare();
   assert.equal(rejected.ok, true);
   const staleEffect = effectFor(rejected.prepared, 1);
-  await assert.rejects(startPreparedToolCall(rejected.prepared, staleEffect, 2), /stale_driver/u);
-  assert.equal(releases, 1);
+  assert.equal(startExternalEffect(staleEffect, staleEffect.ticket, 2).status, 'rejected');
+  assert.equal(releases, 0);
   await releasePreparedToolCall(rejected.prepared);
   assert.equal(releases, 1);
 
   const accepted = await prepare();
   assert.equal(accepted.ok, true);
-  const invocation = await startPreparedToolCall(accepted.prepared, effectFor(accepted.prepared, 3), 3);
+  const issued = effectFor(accepted.prepared, 3);
+  const started = startExternalEffect(issued, issued.ticket, 3);
+  assert.equal(started.status, 'started');
+  const invocation = await startPreparedToolCall(accepted.prepared, started.state);
   const observation = await beginToolInvocation(invocation, context);
   assert.equal(observation.ok, true);
   assert.throws(() => beginToolInvocation(invocation, context), /single-use/u);
@@ -88,7 +91,10 @@ test('tool preparation authority transfers once and releases every owned resourc
   await releaseToolInvocation(invocation);
   assert.equal(releases, 2);
   await releasePreparedToolCall(accepted.prepared);
-  await assert.rejects(startPreparedToolCall(accepted.prepared, effectFor(accepted.prepared, 3), 3), /already transferred or been released/u);
+  const repeated = effectFor(accepted.prepared, 3);
+  const repeatedStart = startExternalEffect(repeated, repeated.ticket, 3);
+  assert.equal(repeatedStart.status, 'started');
+  await assert.rejects(startPreparedToolCall(accepted.prepared, repeatedStart.state), /already transferred or been released/u);
 });
 
 test('aborted and failed preparation release resources before returning control', async () => {

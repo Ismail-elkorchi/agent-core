@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { validateArtifactRef } from '@agent-core/evidence';
+import { hashJson, PersistenceConflictError, validateArtifactRef } from '@agent-core/evidence';
 import { normalizeJsonSafe, type JsonObject, type JsonValue } from '@agent-core/json';
-import { PersistenceConflictError } from '@agent-core/evidence';
 import { createAgentTerminalSnapshot, terminalSnapshotFingerprint, type AgentEffectiveInstruction, type AgentTerminalSnapshot, type AgentToolCallAttemptIdentity, type AgentToolCallIdentity, type AgentTurnIdentity } from '../run/contracts.js';
 import type {
   SessionDescriptor,
@@ -133,7 +132,21 @@ export class InMemorySessionRepository implements SessionRepository {
     });
   }
   appendToolCall(sessionId: string, input: { runId: string; identity: AgentToolCallIdentity; call: unknown }): Promise<SessionToolCallEntry> {
-    return this.append(sessionId, (parentId) => Object.freeze({ ...baseEntry(parentId), type: 'tool_call', runId: input.runId, ...input.identity, call: normalizeJsonSafe(input.call).value }));
+    return this.serial(() => {
+      const state = this.require(sessionId);
+      const call = normalizeJsonSafe(input.call).value;
+      const existing = state.branchEntries.find((entry): entry is SessionToolCallEntry => entry.type === 'tool_call'
+        && entry.runId === input.runId && entry.toolBatchId === input.identity.toolBatchId && entry.callIndex === input.identity.callIndex);
+      if (existing) {
+        if (existing.turnId !== input.identity.turnId || existing.requestAttempt !== input.identity.requestAttempt || hashJson(existing.call) !== hashJson(call)) {
+          throw new PersistenceConflictError(`Conflicting tool call for ${input.runId}/${input.identity.toolBatchId}/${String(input.identity.callIndex)}.`);
+        }
+        return existing;
+      }
+      const entry: SessionToolCallEntry = Object.freeze({ ...baseEntry(branchLeaf(state.branchEntries)), type: 'tool_call', runId: input.runId, ...input.identity, call });
+      state.branchEntries.push(entry);
+      return entry;
+    });
   }
   appendObservation(sessionId: string, input: { runId: string; identity: AgentTurnIdentity & Partial<Pick<AgentToolCallAttemptIdentity, 'toolBatchId' | 'callIndex' | 'callId' | 'toolAttempt'>>; toolName: string; observation: SessionObservationInput }): Promise<SessionObservationEntry> {
     return this.serial(() => {

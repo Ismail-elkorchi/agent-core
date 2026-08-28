@@ -7,6 +7,7 @@ import { InMemoryEventRepository, PersistenceCorruptionError } from '@agent-core
 import { issueEffectStartTicket, settleExternalEffect, startExternalEffect } from '@agent-core/effects';
 import { AgentOperationCoordinator, AgentSession, InMemorySessionRepository, agentEventCodec, decodeAgentTerminalSnapshot } from '@agent-core/runtime';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
+import { createToolCall } from '@agent-core/tools';
 
 test('session repository initializes a missing nested root before acquiring its stream lock', async () => {
   const parent = await mkdtemp(path.join(tmpdir(), 'agent-session-missing-root-'));
@@ -273,9 +274,14 @@ async function acceptApprovalOperation(operations, runId) {
   const settled = settleExternalEffect(started.state, started.state.settlementPermit, { outcome: 'succeeded', resultDigest: '1'.repeat(64), exposure: { status: 'known', quantities: [] } });
   assert.equal(settled.status, 'settled');
   await advance('reconcile_provider_request', { kind: 'provider', stage: 'settled', identity, toolBatchId: 'batch', requestEventId: 'request', responseId: 'response', settlementEventId: 'response-event', effect: settled.state });
-  await advance('consume_provider_settlement', { kind: 'tools', stage: 'ready', identity, toolBatchId: 'batch', callCount: 1, nextCallIndex: 0 });
-  await advance('prepare_tool_call', { kind: 'tools', stage: 'effect_pending', identity, toolBatchId: 'batch', callCount: 1, nextCallIndex: 0, effectId: 'tool-effect' });
-  await advance('reconcile_tool_call', { kind: 'approval', identity, toolBatchId: 'batch', callCount: 1, nextCallIndex: 0, pendingApprovalIds: ['approval'] });
+  const call = createToolCall({ id: 'call', name: 'write', input: { kind: 'json', value: {} } });
+  const effects = { accesses: [{ mode: 'write', scope: 'workspace/file' }], lockScopes: ['workspace/file'], recovery: { kind: 'unknown' } };
+  const binding = { toolImplementationId: 'test/write@1', authorizationPolicyId: 'test-policy', executionTargetId: 'test-target' };
+  const preparation = { toolImplementationId: binding.toolImplementationId, canonicalInput: {}, fingerprint: '2'.repeat(64), effects, binding, authorization: 'require_approval', authorizationReason: 'confirm' };
+  const approval = { runId, ...identity, toolBatchId: 'batch', callIndex: 0, callId: 'call', approvalId: 'approval', status: 'pending', toolName: 'write', fingerprint: preparation.fingerprint, input: {}, effects, binding, policyHash: '3'.repeat(64), reason: 'confirm' };
+  const batch = { identity, toolBatchId: 'batch', calls: [call], nextCallIndex: 0, instructions: [], modelInputModalities: ['text'] };
+  await advance('consume_provider_settlement', { kind: 'tools', stage: 'ready', ...batch });
+  await advance('prepare_tool_call', { kind: 'approval', ...batch, preparation, approval });
 }
 
 test('AgentSession serializes admission, preserves steering identity, and snapshots configuration at submission', async () => {
@@ -448,7 +454,7 @@ test('approval suspension remains durable and blocks queued follow-ups until res
         executed.push(input.task);
         return { runId: input.runId, result: Promise.resolve({ state: 'ended', terminal: { runId: input.runId }, deliveryDiagnostics: [] }), injectSteering() { throw new Error('unused'); }, abort() {} };
       },
-      resumeApproval(input) {
+      resolveApproval(input) {
         return Promise.resolve({ runId: input.runId, result: Promise.resolve({ state: 'ended', terminal: { runId: input.runId }, deliveryDiagnostics: [] }), injectSteering() { throw new Error('unused'); }, abort() {} });
       }
     }; }

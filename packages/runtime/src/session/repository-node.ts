@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import {
+  hashJson,
   type ArtifactRef,
   validateArtifactRef
 } from '@agent-core/evidence';
@@ -198,8 +199,21 @@ export class JsonlSessionRepository implements SessionRepository {
   }
 
   appendToolCall(sessionId: string, input: { runId: string; identity: AgentToolCallIdentity; call: unknown }): Promise<SessionToolCallEntry> {
-    return this.appendBranchEntry(sessionId, (parentId) => Object.freeze({
-      ...baseEntry(parentId), type: 'tool_call', runId: input.runId, ...input.identity, call: normalizeJsonSafe(input.call).value
+    return this.enqueue(sessionId, () => withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
+      const state = await this.refreshIndex(sessionId, true);
+      const call = normalizeJsonSafe(input.call).value;
+      const existing = state.branchEntries.find((entry): entry is SessionToolCallEntry => entry.type === 'tool_call'
+        && entry.runId === input.runId && entry.toolBatchId === input.identity.toolBatchId && entry.callIndex === input.identity.callIndex);
+      if (existing) {
+        if (existing.turnId !== input.identity.turnId || existing.requestAttempt !== input.identity.requestAttempt || hashJson(existing.call) !== hashJson(call)) {
+          throw new PersistenceConflictError(`Conflicting tool call for ${input.runId}/${input.identity.toolBatchId}/${String(input.identity.callIndex)}.`);
+        }
+        return existing;
+      }
+      const entry: SessionToolCallEntry = Object.freeze({ ...baseEntry(branchLeaf(state.branchEntries)), type: 'tool_call', runId: input.runId, ...input.identity, call });
+      await this.appendRecord(sessionId, state, entry);
+      state.branchEntries.push(entry);
+      return entry;
     }));
   }
 
