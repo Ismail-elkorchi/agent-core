@@ -11,6 +11,7 @@ const linuxRootCapabilityTests = new Set([
   'tests/tools/authorization-invariants.test.js',
   'tests/tools/durable-redaction.test.js',
   'tests/tools/file-tools.test.js',
+  'tests/tools/process-lifecycle-fault-matrix.test.js',
   'tests/tools/process-tools.test.js',
   'tests/tools/read-evidence.test.js',
   'tests/tools/runtime-process-cleanup.test.js'

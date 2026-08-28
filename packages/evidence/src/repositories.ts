@@ -265,8 +265,14 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     await ensurePrivateDirectory(this.rootDir);
     const filePath = this.filePath(runId);
     try {
-      await fs.writeFile(filePath, `${JSON.stringify({ type: 'event_stream', version: 1, runId, createdAt: new Date().toISOString() } satisfies EventStreamHeader)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-      await syncDirectory(this.rootDir);
+      const handle = await fs.open(filePath, 'wx', 0o600);
+      try {
+        await handle.writeFile(`${JSON.stringify({ type: 'event_stream', version: 1, runId, createdAt: new Date().toISOString() } satisfies EventStreamHeader)}\n`, 'utf8');
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await syncDirectoryEntry(this.rootDir);
     } catch (error) {
       if (nodeCode(error) !== 'EEXIST') throw error;
     }
@@ -817,14 +823,19 @@ async function atomicWritePrivateJson(filePath: string, value: JsonObject): Prom
   await handle.close();
   try {
     await fs.rename(temporary, filePath);
-    await syncDirectory(directory);
+    await syncDirectoryEntry(directory);
   } catch (error) {
     await fs.rm(temporary, { force: true });
     throw error;
   }
 }
 
-async function syncDirectory(directory: string): Promise<void> {
+async function syncDirectoryEntry(directory: string): Promise<void> {
+  // Node does not expose a Windows directory handle that FileHandle.sync() can
+  // flush. Regular files are still synchronized before publication, but the
+  // Windows implementation therefore makes no OS-restart or power-loss claim
+  // for creation and rename directory entries.
+  if (process.platform === 'win32') return;
   const handle = await fs.open(directory, 'r');
   try { await handle.sync(); } finally { await handle.close(); }
 }
