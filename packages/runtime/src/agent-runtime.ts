@@ -264,6 +264,7 @@ export class AgentRuntime {
   private activeAbortController: AbortController | undefined;
   private activeRunId: string | undefined;
   private activeOperations: AgentOperationCoordinator | undefined;
+  private activeOperationReady: Promise<void> | undefined;
   private static readonly MAX_STEERING_ITEMS = 1024;
 
   constructor(private readonly options: AgentRuntimeOptions) {
@@ -287,7 +288,15 @@ export class AgentRuntime {
   }
 
   resume(runId: string, signal?: AbortSignal): AgentRunControl {
-    const result = this.resumeActive(runId, signal);
+    if (this.activeAbortController) throw new Error('AgentRuntime already has an active run.');
+    const operations = new AgentOperationCoordinator(this.options.repositories.events);
+    const abortController = new AbortController();
+    const operationReady = Promise.resolve();
+    this.activeAbortController = abortController;
+    this.activeRunId = runId;
+    this.activeOperations = operations;
+    this.activeOperationReady = operationReady;
+    const result = this.resumeActive(runId, signal, operations, abortController, operationReady);
     return Object.freeze({
       runId,
       injectSteering: (steering: AgentSteeringInput) => this.injectSteering(runId, steering),
@@ -374,15 +383,21 @@ export class AgentRuntime {
     if (this.activeAbortController) throw new Error('AgentRuntime already has an active run.');
     const { runId } = input;
     const abortController = new AbortController();
-    const cleanupExternalAbort = bindExternalAbort(input.signal, abortController);
     const operations = new AgentOperationCoordinator(this.options.repositories.events);
+    const operationReady = resume
+      ? Promise.resolve()
+      : operations.accept(this.operationAcceptance(input)).then(() => undefined);
     this.activeAbortController = abortController;
     this.activeRunId = runId;
     this.activeOperations = operations;
+    this.activeOperationReady = operationReady;
+    let cleanupExternalAbort: () => void = () => undefined;
     try {
-      if (!resume) await operations.accept(this.operationAcceptance(input));
+      await operationReady;
       const operation = attachedOperation ?? await operations.attach(runId);
       this.assertRuntimeMatchesOperation(operation);
+      if (input.signal?.aborted) await this.abortRun(runId, abortReason(input.signal.reason));
+      else cleanupExternalAbort = bindExternalAbort(input.signal, () => this.abortRun(runId, abortReason(input.signal?.reason)), abortController);
       return await this.runInternal(input, abortController.signal, operation, resume);
     }
     finally {
@@ -391,43 +406,39 @@ export class AgentRuntime {
       if (this.activeAbortController === abortController) this.activeAbortController = undefined;
       if (this.activeRunId === runId) this.activeRunId = undefined;
       if (this.activeOperations === operations) this.activeOperations = undefined;
+      if (this.activeOperationReady === operationReady) this.activeOperationReady = undefined;
     }
   }
 
-  private async resumeActive(runId: string, signal?: AbortSignal): Promise<AgentRunResult> {
-    if (this.activeAbortController) throw new Error('AgentRuntime already has an active run.');
-    const operations = new AgentOperationCoordinator(this.options.repositories.events);
-    const inspection = await operations.inspect(runId);
-    const terminal = inspection.state.phase.kind === 'terminal'
-      ? await this.options.repositories.events.latestOfType(runId, 'run.ended')
-      : undefined;
-    if (terminal?.event.type === 'run.ended') {
-      return Object.freeze({ state: 'ended', terminal: terminal.event.terminal, deliveryDiagnostics: Object.freeze([]) });
-    }
-    if (inspection.state.phase.kind === 'approval') return this.approvalSuspension(inspection.state);
-    if (inspection.state.phase.kind === 'suspended') return operationSuspension(inspection.state);
-
-    const operation = await operations.attach(runId);
-    this.assertRuntimeMatchesOperation(operation);
-    const phase = operation.state().phase;
-    if (phase.kind === 'provider' && phase.stage === 'effect_pending') {
-      await this.advanceOperation(operation, 'reconcile_provider_request', { phase: { kind: 'suspended', reason: 'provider_outcome_unknown', ...(phase.effectId ? { effectId: phase.effectId } : {}) }, ...(operation.state().budget ? { budget: operation.state().budget } : {}) });
-      return operationSuspension(operation.state());
-    }
-    if (phase.kind === 'tools' && phase.stage === 'effect_pending') {
-      await this.advanceOperation(operation, 'reconcile_tool_call', { phase: { kind: 'suspended', reason: 'tool_outcome_unknown', ...(phase.effectId ? { effectId: phase.effectId } : {}) }, ...(operation.state().budget ? { budget: operation.state().budget } : {}) });
-      return operationSuspension(operation.state());
-    }
-    if (phase.kind !== 'accepted' && phase.kind !== 'preparing') {
-      throw new Error(`Run ${runId} requires ${nextAgentOperationInstruction(operation.state()).kind === 'wait' ? 'an explicit recovery decision' : 'a phase-specific recovery implementation'} before it can resume.`);
-    }
-
-    const abortController = new AbortController();
-    const cleanupExternalAbort = bindExternalAbort(signal, abortController);
-    this.activeAbortController = abortController;
-    this.activeRunId = runId;
-    this.activeOperations = operations;
+  private async resumeActive(runId: string, signal: AbortSignal | undefined, operations: AgentOperationCoordinator, abortController: AbortController, operationReady: Promise<void>): Promise<AgentRunResult> {
+    let cleanupExternalAbort: () => void = () => undefined;
     try {
+      const inspection = await operations.inspect(runId);
+      const terminal = inspection.state.phase.kind === 'terminal'
+        ? await this.options.repositories.events.latestOfType(runId, 'run.ended')
+        : undefined;
+      if (terminal?.event.type === 'run.ended') {
+        return Object.freeze({ state: 'ended', terminal: terminal.event.terminal, deliveryDiagnostics: Object.freeze([]) });
+      }
+      if (inspection.state.phase.kind === 'approval') return await this.approvalSuspension(inspection.state);
+      if (inspection.state.phase.kind === 'suspended') return operationSuspension(inspection.state);
+
+      const operation = await operations.attach(runId);
+      this.assertRuntimeMatchesOperation(operation);
+      if (signal?.aborted) await this.abortRun(runId, abortReason(signal.reason));
+      else cleanupExternalAbort = bindExternalAbort(signal, () => this.abortRun(runId, abortReason(signal?.reason)), abortController);
+      const phase = operation.state().phase;
+      if (phase.kind === 'provider' && phase.stage === 'effect_pending') {
+        await this.advanceOperation(operation, 'reconcile_provider_request', { phase: { kind: 'suspended', reason: 'provider_outcome_unknown', ...(phase.effectId ? { effectId: phase.effectId } : {}) }, ...(operation.state().budget ? { budget: operation.state().budget } : {}) });
+        return operationSuspension(operation.state());
+      }
+      if (phase.kind === 'tools' && phase.stage === 'effect_pending') {
+        await this.advanceOperation(operation, 'reconcile_tool_call', { phase: { kind: 'suspended', reason: 'tool_outcome_unknown', ...(phase.effectId ? { effectId: phase.effectId } : {}) }, ...(operation.state().budget ? { budget: operation.state().budget } : {}) });
+        return operationSuspension(operation.state());
+      }
+      if (phase.kind !== 'accepted' && phase.kind !== 'preparing') {
+        throw new Error(`Run ${runId} requires ${nextAgentOperationInstruction(operation.state()).kind === 'wait' ? 'an explicit recovery decision' : 'a phase-specific recovery implementation'} before it can resume.`);
+      }
       const input: ResolvedAgentRunInput = {
         task: operation.state().input.task,
         runId,
@@ -442,6 +453,7 @@ export class AgentRuntime {
       if (this.activeAbortController === abortController) this.activeAbortController = undefined;
       if (this.activeRunId === runId) this.activeRunId = undefined;
       if (this.activeOperations === operations) this.activeOperations = undefined;
+      if (this.activeOperationReady === operationReady) this.activeOperationReady = undefined;
     }
   }
 
@@ -1249,8 +1261,12 @@ export class AgentRuntime {
     return receipt;
   }
   private async abortRun(runId: string, reason = 'Agent run aborted.'): Promise<void> {
-    if (this.activeRunId !== runId || !this.activeOperations) return;
-    await this.activeOperations.requestAbort(runId, reason);
+    const operations = this.activeOperations;
+    const operationReady = this.activeOperationReady;
+    if (this.activeRunId !== runId || !operations || !operationReady) return;
+    await operationReady;
+    if (this.activeRunId !== runId || this.activeOperations !== operations) return;
+    await operations.requestAbort(runId, reason);
     if (this.activeRunId === runId) this.activeAbortController?.abort(reason);
   }
 }
@@ -1404,7 +1420,12 @@ function formatOverflowDiagnostic(diagnostic: OverflowDiagnostic): string { retu
 function formatOverflowAction(action: OverflowRecoveryAction): string { if (action.kind === 'reduce_context_history') return `reduce_context_history(${String(action.reductions)})`; if (action.kind === 'reduce_context') return `reduce_context(${String(action.removedItems)})`; if (action.kind === 'install_checkpoint') return `install_checkpoint(${String(action.compactedToolResults)})`; return action.kind; }
 class RequestAssemblyError extends Error {}
 function modelStreamInterrupted(input: { turnIndex: number; cause: unknown; content: string; reasoningSummary: string; finalResponseReceived: boolean }): ModelStreamInterruptedError { return new ModelStreamInterruptedError({ turnIndex: input.turnIndex, cause: input.cause, content: input.content, finalResponseReceived: input.finalResponseReceived, ...(input.reasoningSummary.length > 0 ? { reasoningSummary: input.reasoningSummary } : {}) }); }
-function bindExternalAbort(external: AbortSignal | undefined, controller: AbortController): () => void { if (!external) return () => undefined; if (external.aborted) { controller.abort(external.reason); return () => undefined; } const abort = () => { controller.abort(external.reason); }; external.addEventListener('abort', abort, { once: true }); return () => { external.removeEventListener('abort', abort); }; }
+function bindExternalAbort(external: AbortSignal | undefined, requestAbort: () => Promise<void>, controller: AbortController): () => void {
+  if (!external) return () => undefined;
+  const abort = () => { void requestAbort().catch((error: unknown) => { controller.abort(error); }); };
+  external.addEventListener('abort', abort, { once: true });
+  return () => { external.removeEventListener('abort', abort); };
+}
 function abortReason(reason: unknown): string { return reason instanceof Error ? reason.message : typeof reason === 'string' && reason.length > 0 ? reason : 'Agent run aborted.'; }
 function throwIfAborted(signal: AbortSignal): void { if (!signal.aborted) return; throw signal.reason instanceof Error ? signal.reason : new Error(typeof signal.reason === 'string' ? signal.reason : 'Agent run aborted.'); }
 async function abortableDelay(delayMs: number, signal: AbortSignal): Promise<void> { if (delayMs === 0) return; await new Promise<void>((resolve, reject) => { const timeout = setTimeout(resolve, delayMs); const abort = () => { clearTimeout(timeout); reject(signal.reason instanceof Error ? signal.reason : new Error('Retry aborted.')); }; if (signal.aborted) abort(); else signal.addEventListener('abort', abort, { once: true }); }); }

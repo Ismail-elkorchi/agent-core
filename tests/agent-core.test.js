@@ -6,6 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
   AgentRuntime,
+  AgentOperationCoordinator,
   AgentFinalizationError,
   AgentRunFinalizer,
   agentEventCodec,
@@ -850,6 +851,20 @@ test('elapsed limits actively abort a provider request that never settles', asyn
   const result = ended(await run.agent.run({ task: 'stalled provider' }).result);  assert.equal(result.terminationReason, 'limit_exhausted');
   assert.equal(result.exhaustedLimit, 'elapsed_time');
   assert.equal(result.executionStatus, 'failed');
+});
+
+test('an immediate abort is durably accepted before local execution is cancelled', async () => {
+  const run = await harness({
+    script: [request => new Promise((_resolve, reject) => request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true }))],
+    withoutSession: true
+  });
+  const control = run.agent.run({ task: 'abort immediately' });
+  await control.abort('stop before provider execution');
+  const result = ended(await control.result);
+  assert.equal(result.executionStatus, 'aborted');
+  const operation = await new AgentOperationCoordinator(run.events).inspect(control.runId);
+  assert.equal(operation.state.phase.kind, 'terminal');
+  assert.equal(operation.state.control.status, 'abort_requested');
 });
 
 test('tool preparation and authorization are abortable and elapsed-deadline bounded', async () => {

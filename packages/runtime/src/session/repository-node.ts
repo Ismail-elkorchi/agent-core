@@ -30,6 +30,7 @@ import {
   type AgentTurnIdentity,
   type AgentTerminalSnapshot
 } from '../run/contracts.js';
+import { decodeContextItemInput } from '../context/manager.js';
 import type {
   SessionDescriptor,
   BaseSessionEntry,
@@ -619,7 +620,7 @@ function parseSubmissionInput(value: JsonObject): SessionSubmissionInput {
     || (value.contextItems !== undefined && !Array.isArray(value.contextItems))) throw new Error('Session submission input is invalid.');
   return Object.freeze({ task: value.task,
     ...(value.instructions === undefined ? {} : { instructions: Object.freeze([...value.instructions]) }),
-    ...(value.contextItems === undefined ? {} : { contextItems: Object.freeze(value.contextItems.map(parseContextItem)) }) });
+    ...(value.contextItems === undefined ? {} : { contextItems: Object.freeze(value.contextItems.map((item) => decodeContextItemInput(item))) }) });
 }
 
 function parseSubmissionConfiguration(value: JsonObject): SessionSubmissionConfiguration {
@@ -658,31 +659,6 @@ function isOptionalStringArray(value: JsonValue | undefined): value is readonly 
   return value === undefined || (Array.isArray(value) && value.every((item) => typeof item === 'string'));
 }
 
-function parseContextItem(value: unknown): NonNullable<SessionSubmissionInput['contextItems']>[number] {
-  if (!isRecord(value) || typeof value.sourceUri !== 'string'
-    || (value.sourceKind !== 'user' && value.sourceKind !== 'external' && value.sourceKind !== 'session' && value.sourceKind !== 'tool-observation' && value.sourceKind !== 'generated')
-    || (value.confidence !== undefined && value.confidence !== 'unverified' && value.confidence !== 'verified')
-    || (value.representation !== 'full' && value.representation !== 'excerpt' && value.representation !== 'summary')
-    || typeof value.mediaType !== 'string' || typeof value.title !== 'string' || typeof value.content !== 'string'
-    || typeof value.selectionReason !== 'string' || typeof value.score !== 'number' || !Number.isFinite(value.score)
-    || (value.id !== undefined && typeof value.id !== 'string')
-    || (value.tokenEstimate !== undefined && !nonnegativeInteger(value.tokenEstimate))) throw new Error('Session context item is invalid.');
-  const range = value.range === undefined ? undefined : parseContextRange(value.range);
-  return Object.freeze({
-    sourceUri: value.sourceUri, sourceKind: value.sourceKind,
-    ...(value.confidence === undefined ? {} : { confidence: value.confidence }),
-    representation: value.representation, mediaType: value.mediaType, title: value.title, content: value.content,
-    ...(range === undefined ? {} : { range }), selectionReason: value.selectionReason, score: value.score,
-    ...(value.id === undefined ? {} : { id: value.id }), ...(value.tokenEstimate === undefined ? {} : { tokenEstimate: value.tokenEstimate })
-  });
-}
-
-function parseContextRange(value: unknown): NonNullable<NonNullable<SessionSubmissionInput['contextItems']>[number]['range']> {
-  if (!isRecord(value) || (value.kind !== 'line' && value.kind !== 'byte')
-    || (value.start !== undefined && !nonnegativeInteger(value.start)) || (value.end !== undefined && !nonnegativeInteger(value.end))
-    || (typeof value.start === 'number' && typeof value.end === 'number' && value.end < value.start)) throw new Error('Session context range is invalid.');
-  return Object.freeze({ kind: value.kind, ...(value.start === undefined ? {} : { start: value.start }), ...(value.end === undefined ? {} : { end: value.end }) });
-}
 
 function encodeSubmissionRecord(record: SessionSubmissionRecord): JsonObject {
   if (record.type === 'submission.queued') return Object.freeze({
