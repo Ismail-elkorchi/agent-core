@@ -425,7 +425,7 @@ test('reconciliation never signals a PID without authenticated supervisor identi
   assert.equal(reconciliation.unresolved.length, 1);
   assert.equal(reconciliation.unresolved[0].workspace, root);
   assert.equal(host.processManager.resourceLeases.activeCount(), 1);
-  assert.equal(host.processManager.resourceLeases.wouldWait({ accesses: [{ mode: 'write', scope: 'workspace/files/a.txt' }], lockScopes: ['workspace/files/a.txt'], idempotency: 'non_idempotent' }), true);
+  assert.equal(host.processManager.resourceLeases.wouldWait({ accesses: [{ mode: 'write', scope: 'workspace/files/a.txt' }], lockScopes: ['workspace/files/a.txt'], recovery: { kind: 'unknown' } }), true);
   assert.doesNotThrow(() => process.kill(process.pid, 0), 'the reused PID remains untouched');
   await assert.rejects(host.processManager.start({
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify('process.exit(0)')}`,

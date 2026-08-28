@@ -18,12 +18,11 @@ export const writeStdinTool = defineTool({
     return { ...input, yieldMs: clampRequestedLimit(input.yieldMs, limits.maxYieldMs), outputTokenBudget: clampRequestedLimit(input.outputTokenBudget, limits.maxOutputTokens) };
   },
   deriveEffects(input) {
-    const idempotency = input.text !== undefined && input.text.length > 0
-      ? { idempotency: 'non_idempotent' as const }
-      : input.closeStdin
-        ? { idempotency: 'idempotent' as const, idempotencyKey: 'close:' + input.processId }
-        : { idempotency: 'pure' as const };
-    return { accesses: [{ mode: 'execute' as const, scope: workspaceProcessScope(input.processId) }], lockScopes: [workspaceProcessScope(input.processId)], ...idempotency };
+    return {
+      accesses: [{ mode: 'execute' as const, scope: workspaceProcessScope(input.processId) }],
+      lockScopes: [workspaceProcessScope(input.processId)],
+      recovery: { kind: 'unknown' as const }
+    };
   },
   async invoke(input, context) {
     const manager = requireToolService<ProcessManager>(context, 'processManager', isProcessManager, 'ProcessManager');

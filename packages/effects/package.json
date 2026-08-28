@@ -1,0 +1,12 @@
+{
+  "name": "@agent-core/effects",
+  "version": "0.2.0",
+  "description": "Domain-neutral external-effect recovery and ownership contracts for Agent Core.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": "./dist/index.js" },
+  "files": ["dist", "README.md"],
+  "engines": { "node": ">=24.8.0" },
+  "dependencies": { "@agent-core/json": "0.2.0" }
+}

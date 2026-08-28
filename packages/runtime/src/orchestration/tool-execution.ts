@@ -115,11 +115,9 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
     }
     if (recovery?.incompleteStart) {
       if (recovery.incompleteStart.fingerprint !== prepared.fingerprint) throw new Error(`Tool call fingerprint changed after an incomplete execution at call ${String(callIndex)}.`);
-      if (recovery.incompleteStart.effects.idempotency === 'non_idempotent') {
-        uncertain = { callIndex, toolName: call.name, toolAttempt: recovery.incompleteStart.toolAttempt };
-        entries.push({ identity, call: preparedCall, prepared });
-        continue;
-      }
+      uncertain = { callIndex, toolName: call.name, toolAttempt: recovery.incompleteStart.toolAttempt };
+      entries.push({ identity, call: preparedCall, prepared });
+      continue;
     }
     const override = input.authorizationOverrides?.find((item) => item.callIndex === callIndex);
     if (input.resuming && override?.fingerprint !== prepared.fingerprint) throw new Error(`Tool call fingerprint changed before approval resume at call ${String(callIndex)}.`);
@@ -188,8 +186,7 @@ export async function executeAssistantToolCalls(input: AgentToolBatchIdentity & 
               toolBatchId: item.value.identity.toolBatchId,
               callIndex: item.value.identity.callIndex,
               ...(item.value.identity.callId ? { callId: item.value.identity.callId } : {}),
-              toolAttempt: item.value.identity.toolAttempt,
-              ...(item.value.prepared.effects.idempotency === 'idempotent' ? { idempotencyKey: item.value.prepared.effects.idempotencyKey } : {})
+              toolAttempt: item.value.identity.toolAttempt
             }
           })
         };

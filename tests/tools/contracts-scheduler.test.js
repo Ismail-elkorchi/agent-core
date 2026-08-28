@@ -32,7 +32,7 @@ test('derived effects cannot exceed their envelope and output is validated befor
     name: 'escape', implementationId: 'tests.escape.v1', description: 'escape', schema: z.strictObject({}), outputSchema: z.strictObject({ value: z.string() }),
     effectEnvelope: { accesses: [{ mode: 'read', scope: 'workspace/files' }], lockScopes: [] },
     canonicalizeInput: (input) => input,
-    deriveEffects: () => ({ accesses: [{ mode: 'write', scope: 'workspace/files/a' }], lockScopes: [], idempotency: 'pure' }),
+    deriveEffects: () => ({ accesses: [{ mode: 'write', scope: 'workspace/files/a' }], lockScopes: [], recovery: { kind: 'unknown' } }),
     invoke: async () => ({ kind: 'result', ok: true, summary: 'bad', scope: { resources: [], coverage: 'complete' }, output: { value: 'x' } })
   });
   const controller = new AbortController();
@@ -44,7 +44,7 @@ test('derived effects cannot exceed their envelope and output is validated befor
   const invalidOutput = defineTool({
     name: 'invalid_output', implementationId: 'tests.invalid-output.v1', description: 'invalid', schema: z.strictObject({}), outputSchema: z.strictObject({ value: z.string() }),
     effectEnvelope: { accesses: [], lockScopes: [] }, canonicalizeInput: (input) => input,
-    deriveEffects: () => ({ accesses: [], lockScopes: [], idempotency: 'pure' }),
+    deriveEffects: () => ({ accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }),
     invoke: async () => ({ kind: 'result', ok: true, summary: 'bad', scope: { resources: [], coverage: 'complete' }, output: { value: 42 } })
   });
   const validPreparation = await prepareToolCall(createToolCall({ name: 'invalid_output', input: { kind: 'json', value: {} } }), [invalidOutput], context);
@@ -54,35 +54,35 @@ test('derived effects cannot exceed their envelope and output is validated befor
   assert.equal(observation.output.reason, 'invalid_output');
 });
 
-test('scheduler uses resource accesses and locks, never idempotency, for conflicts', () => {
-  const call = (callIndex, accesses, lockScopes = [], idempotency = 'pure', dependsOnCallIndices) => ({
+test('scheduler uses resource accesses and locks, never recovery capability, for conflicts', () => {
+  const call = (callIndex, accesses, lockScopes = [], recovery = { kind: 'unknown' }, dependsOnCallIndices) => ({
     callIndex,
-    effects: { accesses, lockScopes, idempotency, ...(dependsOnCallIndices ? { dependsOnCallIndices } : {}) },
+    effects: { accesses, lockScopes, recovery, ...(dependsOnCallIndices ? { dependsOnCallIndices } : {}) },
     value: callIndex
   });
   const waves = scheduleToolCalls([
-    call(0, [{ mode: 'read', scope: 'workspace/files/a' }], [], 'non_idempotent'),
-    call(1, [{ mode: 'read', scope: 'workspace/files/a' }], [], 'non_idempotent'),
+    call(0, [{ mode: 'read', scope: 'workspace/files/a' }]),
+    call(1, [{ mode: 'read', scope: 'workspace/files/a' }]),
     call(2, [{ mode: 'write', scope: 'workspace/files/a' }]),
     call(3, [{ mode: 'read', scope: 'workspace/files/b' }], ['database/index']),
     call(4, [{ mode: 'read', scope: 'workspace/files/c' }], ['database/index']),
-    call(5, [{ mode: 'read', scope: 'workspace/files/d' }], [], 'pure', [2])
+    call(5, [{ mode: 'read', scope: 'workspace/files/d' }], [], { kind: 'unknown' }, [2])
   ], 8);
   assert.deepEqual(waves.map((wave) => wave.map((item) => item.callIndex)), [[0, 1, 3], [2, 4], [5]]);
 });
 
 test('runtime resource leases span batches until a running process exits', async () => {
   const coordinator = new ResourceLeaseCoordinator();
-  const command = await coordinator.acquire({ accesses: [{ mode: 'execute', scope: 'workspace/processes/p1' }], lockScopes: ['workspace/files'], idempotency: 'non_idempotent' }, 'batch-1');
+  const command = await coordinator.acquire({ accesses: [{ mode: 'execute', scope: 'workspace/processes/p1' }], lockScopes: ['workspace/files'], recovery: { kind: 'unknown' } }, 'batch-1');
   command.transferToProcess('p1', 'workspace/processes/p1');
   assert.doesNotThrow(() => command.transferToProcess('p1', 'workspace/processes/p1'));
   assert.throws(() => command.transferToProcess('p1', 'workspace/processes/p2'), /already been transferred/u);
   let acquired = false;
-  const blocked = coordinator.acquire({ accesses: [{ mode: 'read', scope: 'workspace/files/a' }], lockScopes: [], idempotency: 'pure' }, 'batch-2').then((lease) => { acquired = true; return lease; });
+  const blocked = coordinator.acquire({ accesses: [{ mode: 'read', scope: 'workspace/files/a' }], lockScopes: [], recovery: { kind: 'unknown' } }, 'batch-2').then((lease) => { acquired = true; return lease; });
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(acquired, false);
 
-  const control = await coordinator.acquire({ accesses: [{ mode: 'execute', scope: 'workspace/processes/p1' }], lockScopes: ['workspace/processes/p1'], idempotency: 'idempotent', idempotencyKey: 'stop:p1' }, 'batch-3');
+  const control = await coordinator.acquire({ accesses: [{ mode: 'execute', scope: 'workspace/processes/p1' }], lockScopes: ['workspace/processes/p1'], recovery: { kind: 'unknown' } }, 'batch-3');
   control.release();
   command.release();
   const released = await blocked;
@@ -93,8 +93,8 @@ test('runtime resource leases span batches until a running process exits', async
 
 test('resource lease queue is fair, batches compatible readers, and removes aborted waiters', async () => {
   const coordinator = new ResourceLeaseCoordinator();
-  const read = { accesses: [{ mode: 'read', scope: 'workspace/files/a' }], lockScopes: [], idempotency: 'pure' };
-  const write = { accesses: [{ mode: 'write', scope: 'workspace/files/a' }], lockScopes: ['workspace/files/a'], idempotency: 'non_idempotent' };
+  const read = { accesses: [{ mode: 'read', scope: 'workspace/files/a' }], lockScopes: [], recovery: { kind: 'unknown' } };
+  const write = { accesses: [{ mode: 'write', scope: 'workspace/files/a' }], lockScopes: ['workspace/files/a'], recovery: { kind: 'unknown' } };
   const first = await coordinator.acquire(read, 'reader-1');
   const order = [];
   const writerPromise = coordinator.acquire(write, 'writer').then(lease => { order.push('writer'); return lease; });
@@ -127,8 +127,8 @@ test('resource lease queue is fair, batches compatible readers, and removes abor
 
 test('a queued writer cannot starve behind a continuing stream of readers', async () => {
   const coordinator = new ResourceLeaseCoordinator();
-  const read = { accesses: [{ mode: 'read', scope: 'workspace/files/a' }], lockScopes: [], idempotency: 'pure' };
-  const write = { accesses: [{ mode: 'write', scope: 'workspace/files/a' }], lockScopes: ['workspace/files/a'], idempotency: 'non_idempotent' };
+  const read = { accesses: [{ mode: 'read', scope: 'workspace/files/a' }], lockScopes: [], recovery: { kind: 'unknown' } };
+  const write = { accesses: [{ mode: 'write', scope: 'workspace/files/a' }], lockScopes: ['workspace/files/a'], recovery: { kind: 'unknown' } };
   const initial = await coordinator.acquire(read, 'initial');
   let writerAcquired = false;
   const writerPromise = coordinator.acquire(write, 'writer').then(lease => { writerAcquired = true; return lease; });
@@ -144,7 +144,7 @@ test('a queued writer cannot starve behind a continuing stream of readers', asyn
 test('one observation parser validates complete results, failures, artifacts, and returns an immutable snapshot', () => {
   const tool = defineTool({
     name: 'observation', implementationId: 'tests/observation@1', description: 'observation', schema: z.strictObject({}), outputSchema: z.strictObject({ value: z.string() }),
-    effectEnvelope: { accesses: [], lockScopes: [] }, canonicalizeInput: (input) => input, deriveEffects: () => ({ accesses: [], lockScopes: [], idempotency: 'pure' }),
+    effectEnvelope: { accesses: [], lockScopes: [] }, canonicalizeInput: (input) => input, deriveEffects: () => ({ accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }),
     invoke: async () => ({ kind: 'result', ok: true, summary: 'ok', scope: { resources: [], coverage: 'complete' }, output: { value: 'ok' } })
   });
   const source = { kind: 'result', ok: true, summary: 'ok', scope: { resources: ['workspace/files/a'], coverage: 'complete' }, output: { value: 'owned' }, metadata: { nested: ['value'] } };
@@ -176,7 +176,7 @@ test('dynamic tool adoption snapshots mutable consumer definition contracts', ()
   const requirements = ['workspaceRoot'];
   const definition = defineTool({
     name: 'snapshot', implementationId: 'tests/snapshot@1', description: 'snapshot', schema: z.strictObject({}), outputSchema: z.strictObject({}), requirements: { services: requirements },
-    effectEnvelope: { accesses, lockScopes: [] }, canonicalizeInput: (input) => input, deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'workspace/files' }], lockScopes: [], idempotency: 'pure' }),
+    effectEnvelope: { accesses, lockScopes: [] }, canonicalizeInput: (input) => input, deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'workspace/files' }], lockScopes: [], recovery: { kind: 'unknown' } }),
     invoke: async () => ({ kind: 'result', ok: true, summary: 'ok', scope: { resources: [], coverage: 'complete' }, output: {} })
   });
   const registered = adoptToolDefinition(definition);
@@ -192,14 +192,14 @@ test('every effect and observation resource scope uses the strict canonical scop
     assert.throws(() => adoptToolDefinition({
       name: 'bad_scope', implementationId: 'tests/bad-scope@1', description: 'bad', jsonSchema: { type: 'object' }, outputSchema: z.strictObject({}),
       effectEnvelope: { accesses: [{ mode: 'read', scope }], lockScopes: [] }, decodeInput() { return { ok: true, input: {} }; },
-      canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return { accesses: [], lockScopes: [], idempotency: 'pure' }; },
+      canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return { accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }; },
       async invoke() { return { kind: 'result', ok: true, summary: 'bad', scope: { resources: [], coverage: 'complete' }, output: {} }; }
     }), /scope/iu, scope);
   }
   const duplicate = defineTool({
     name: 'duplicate_scope', implementationId: 'tests/duplicate-scope@1', description: 'duplicate', schema: z.strictObject({}), outputSchema: z.strictObject({}),
     effectEnvelope: { accesses: [{ mode: 'read', scope: 'workspace/files/a' }], lockScopes: [] }, canonicalizeInput: input => input,
-    deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'workspace/files/a' }, { mode: 'read', scope: 'workspace/files/a' }], lockScopes: [], idempotency: 'pure' }),
+    deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'workspace/files/a' }, { mode: 'read', scope: 'workspace/files/a' }], lockScopes: [], recovery: { kind: 'unknown' } }),
     invoke: async () => ({ kind: 'result', ok: true, summary: 'duplicate', scope: { resources: [], coverage: 'complete' }, output: {} })
   });
   const prepared = await prepareToolCall(createToolCall({ name: duplicate.name, input: { kind: 'json', value: {} } }), [duplicate], { policy: { allowedRisks: ['read'] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } });
@@ -215,7 +215,7 @@ test('authoritative canonicalization owns input before effects, fingerprinting, 
     name: 'owned_input', implementationId: 'tests/owned-input@1', description: 'owned', schema: z.strictObject({}), outputSchema: z.strictObject({ path: z.string(), value: z.number() }),
     effectEnvelope: { accesses: [{ mode: 'read', scope: 'workspace/files' }], lockScopes: [] },
     canonicalizeInput() { return Object.freeze({ path: callerOwned.path, nested: Object.freeze({ value: callerOwned.nested.value }) }); },
-    deriveEffects(input) { return { accesses: [{ mode: 'read', scope: `workspace/files/${input.path}` }], lockScopes: [], idempotency: 'pure' }; },
+    deriveEffects(input) { return { accesses: [{ mode: 'read', scope: `workspace/files/${input.path}` }], lockScopes: [], recovery: { kind: 'unknown' } }; },
     async invoke(input) { invoked = input; return { kind: 'result', ok: true, summary: 'owned', scope: { resources: [`workspace/files/${input.path}`], coverage: 'complete' }, output: { path: input.path, value: input.nested.value } }; }
   });
   const context = { policy: { allowedRisks: ['read'] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } };
@@ -239,7 +239,7 @@ test('canonicalization rejects accessors and cycles without invoking accessors',
   const cyclic = {}; cyclic.self = cyclic;
   const makeTool = (name, value) => defineTool({
     name, implementationId: `tests/${name}@1`, description: name, schema: z.strictObject({}), outputSchema: z.strictObject({}), effectEnvelope: { accesses: [], lockScopes: [] },
-    canonicalizeInput() { return value; }, deriveEffects() { return { accesses: [], lockScopes: [], idempotency: 'pure' }; },
+    canonicalizeInput() { return value; }, deriveEffects() { return { accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }; },
     invoke: async () => ({ kind: 'result', ok: true, summary: 'never', scope: { resources: [], coverage: 'complete' }, output: {} })
   });
   for (const [name, value] of [['accessor_input', hostile], ['cyclic_input', cyclic]]) {
@@ -251,7 +251,7 @@ test('canonicalization rejects accessors and cycles without invoking accessors',
   let effectAccesses = 0;
   const hostileEffects = {};
   Object.defineProperty(hostileEffects, 'accesses', { enumerable: true, get() { effectAccesses += 1; return []; } });
-  Object.defineProperties(hostileEffects, { lockScopes: { enumerable: true, value: [] }, idempotency: { enumerable: true, value: 'pure' } });
+  Object.defineProperties(hostileEffects, { lockScopes: { enumerable: true, value: [] }, recovery: { enumerable: true, value: { kind: 'unknown' } } });
   const effectsTool = defineTool({
     name: 'hostile_effects', implementationId: 'tests/hostile-effects@1', description: 'hostile effects', schema: z.strictObject({}), outputSchema: z.strictObject({}),
     effectEnvelope: { accesses: [], lockScopes: [] }, canonicalizeInput: input => input, deriveEffects: () => hostileEffects,

@@ -51,7 +51,7 @@ export const applyPatchTool = defineTool({
   deriveEffects(input) {
     const accesses = uniqueAccesses(input.tree.operations.flatMap((operation) => operationAccesses(operation, input.dryRun)));
     const lockScopes = input.dryRun ? [] : [...new Set([...accesses.filter((access) => access.mode !== 'read').map((access) => access.scope), PATCH_JOURNAL_SCOPE])].sort();
-    return { accesses, lockScopes, idempotency: input.dryRun ? 'pure' : 'non_idempotent' };
+    return { accesses, lockScopes, recovery: { kind: 'unknown' } };
   },
   isAvailable: (policy) => isRiskAllowed(policy, 'read') || isRiskAllowed(policy, 'write'),
   invoke: applyPatch

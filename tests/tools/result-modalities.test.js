@@ -11,7 +11,7 @@ const mixedContentTool = defineTool({
   name: 'mixed_content', implementationId: 'tests/mixed-content@1', description: 'Mixed content fixture.',
   schema: z.strictObject({}), outputSchema: z.strictObject({ status: z.literal('complete') }),
   effectEnvelope: { accesses: [], lockScopes: [] }, canonicalizeInput: input => input,
-  deriveEffects: () => ({ accesses: [], lockScopes: [], idempotency: 'pure' }),
+  deriveEffects: () => ({ accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }),
   invoke: async () => ({ kind: 'result', ok: true, summary: 'unused', scope: { resources: [], coverage: 'complete' }, output: { status: 'complete' } })
 });
 

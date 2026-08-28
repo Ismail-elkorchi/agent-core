@@ -1,4 +1,5 @@
 import type { JsonObject, JsonValue } from '@agent-core/json';
+import type { EffectRecoveryCapability } from '@agent-core/effects';
 
 export type ModelImage =
   | { readonly type: 'base64'; readonly data: string; readonly mediaType: ModelImageMediaType; readonly detail?: ModelImageDetail }
@@ -309,6 +310,8 @@ export interface ModelProvider {
   createSession?(): ModelProviderSession;
   complete(request: ModelRequest): Promise<ModelResponse>;
   stream?(request: ModelRequest): AsyncIterable<ModelStreamEvent>;
+  /** Recovery facts the provider can prove for this exact request. Absence means unknown. */
+  requestRecovery?(request: ModelRequest): EffectRecoveryCapability;
 }
 
 export interface ModelProviderSession {

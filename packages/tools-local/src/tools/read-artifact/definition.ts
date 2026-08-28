@@ -19,7 +19,7 @@ export const readArtifactTool = defineTool({
     return { ...input, byteCount: clampRequestedLimit(input.byteCount, limit) };
   },
   deriveEffects(input) {
-    return { accesses: [{ mode: 'read', scope: artifactScope(input.artifactId) }], lockScopes: [], idempotency: 'pure' };
+    return { accesses: [{ mode: 'read', scope: artifactScope(input.artifactId) }], lockScopes: [], recovery: { kind: 'unknown' } };
   },
   async invoke(input, context) {
     const repository = requireToolService<ArtifactRepository>(context, 'artifactRepository', isArtifactRepository, 'ArtifactRepository');

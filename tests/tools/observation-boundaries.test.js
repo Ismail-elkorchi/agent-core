@@ -13,7 +13,7 @@ const tool = defineTool({
   name: 'large_observation', implementationId: 'tests/large-observation@1', description: 'large observation',
   schema: z.strictObject({}), outputSchema: z.strictObject({ chunks: z.array(z.string()) }),
   effectEnvelope: { accesses: [{ mode: 'read', scope: 'memory' }], lockScopes: [] }, canonicalizeInput: input => input,
-  deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'memory' }], lockScopes: [], idempotency: 'pure' }),
+  deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'memory' }], lockScopes: [], recovery: { kind: 'unknown' } }),
   invoke: async () => ({ kind: 'result', ok: true, summary: 'unused', scope: { resources: ['memory'], coverage: 'complete' }, output: { chunks: [] } })
 });
 const call = { name: tool.name, input: { kind: 'json', value: {} } };
@@ -84,7 +84,7 @@ test('observation projection invokes domain presenters independently for immedia
     schema: z.strictObject({}), outputSchema: z.strictObject({ value: z.string() }),
     effectEnvelope: { accesses: [], lockScopes: [] },
     canonicalizeInput: input => input,
-    deriveEffects: () => ({ accesses: [], lockScopes: [], idempotency: 'pure' }),
+    deriveEffects: () => ({ accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }),
     invoke: async () => ({ kind: 'result', ok: true, summary: 'unused', scope: { resources: [], coverage: 'complete' }, output: { value: 'unused' } }),
     presentObservation(request) {
       calls.push({ mode: request.mode, maxTokens: request.maxTokens });

@@ -18,7 +18,7 @@ export const searchTextTool = defineTool({
     return { ...input, path: requireWorkspaceFileRoot(context).canonicalPath(input.path) };
   },
   deriveEffects(input) {
-    return { accesses: [{ mode: 'read', scope: workspaceFileScope(input.path) }], lockScopes: [], idempotency: 'pure' };
+    return { accesses: [{ mode: 'read', scope: workspaceFileScope(input.path) }], lockScopes: [], recovery: { kind: 'unknown' } };
   },
   invoke: searchText
 });

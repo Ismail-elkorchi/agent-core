@@ -32,7 +32,7 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
       };
     },
     deriveEffects() {
-      return { accesses: [{ mode: 'execute', scope: workspaceProcessScope() }], lockScopes: [workspaceFileScope()], idempotency: 'non_idempotent' };
+      return { accesses: [{ mode: 'execute', scope: workspaceProcessScope() }], lockScopes: [workspaceFileScope()], recovery: { kind: 'unknown' } };
     },
     async invoke(input, context) {
       const manager = requireToolService<ProcessManager>(context, 'processManager', isProcessManager, 'ProcessManager');

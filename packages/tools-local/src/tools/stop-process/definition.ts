@@ -14,7 +14,7 @@ export const stopProcessTool = defineTool({
   effectEnvelope: { accesses: [{ mode: 'execute', scope: workspaceProcessScope() }], lockScopes: [workspaceProcessScope()] },
   canonicalizeInput(input, context) { return { ...input, outputTokenBudget: clampRequestedLimit(input.outputTokenBudget, requireLocalToolConfiguration(context).process.maxOutputTokens) }; },
   deriveEffects(input) {
-    return { accesses: [{ mode: 'execute' as const, scope: workspaceProcessScope(input.processId) }], lockScopes: [workspaceProcessScope(input.processId)], idempotency: 'idempotent' as const, idempotencyKey: 'stop:' + input.processId };
+    return { accesses: [{ mode: 'execute' as const, scope: workspaceProcessScope(input.processId) }], lockScopes: [workspaceProcessScope(input.processId)], recovery: { kind: 'unknown' as const } };
   },
   async invoke(input, context) {
     const manager = requireToolService<ProcessManager>(context, 'processManager', isProcessManager, 'ProcessManager');

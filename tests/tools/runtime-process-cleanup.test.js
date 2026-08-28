@@ -46,7 +46,7 @@ const longCommand = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("co
 const approvalTool = defineTool({
   name: 'approval_write', implementationId: 'tests/approval-write@1', description: 'write', schema: z.strictObject({}), outputSchema: z.strictObject({}),
   effectEnvelope: { accesses: [{ mode: 'write', scope: 'workspace/files/approval' }], lockScopes: ['workspace/files/approval'] }, canonicalizeInput: (input) => input,
-  deriveEffects: () => ({ accesses: [{ mode: 'write', scope: 'workspace/files/approval' }], lockScopes: ['workspace/files/approval'], idempotency: 'idempotent', idempotencyKey: 'approval-write' }),
+  deriveEffects: () => ({ accesses: [{ mode: 'write', scope: 'workspace/files/approval' }], lockScopes: ['workspace/files/approval'], recovery: { kind: 'unknown' } }),
   invoke: async () => ({ kind: 'result', ok: true, summary: 'written', scope: { resources: ['workspace/files/approval'], coverage: 'complete' }, output: {} })
 });
 

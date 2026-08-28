@@ -4,9 +4,9 @@ import { isRiskAllowed, type ToolRisk } from './policy.js';
 import { validateResourceScope } from './resources.js';
 import { parseJsonObject } from '@agent-core/json';
 import type { JsonObject } from '@agent-core/json';
+import { decodeEffectRecoveryCapability, encodeEffectRecoveryCapability, type EffectRecoveryCapability } from '@agent-core/effects';
 
 export type ToolResourceAccessMode = 'read' | 'write' | 'execute' | 'network' | 'delete';
-export type ToolIdempotency = 'pure' | 'idempotent' | 'non_idempotent';
 
 export interface ToolResourceAccess {
   readonly mode: ToolResourceAccessMode;
@@ -25,10 +25,10 @@ interface ToolEffectsBase {
   readonly dependsOnCallIndices?: readonly number[];
 }
 
-export type ToolEffects = ToolEffectsBase & (
-  | { readonly idempotency: 'pure' | 'non_idempotent'; readonly idempotencyKey?: never }
-  | { readonly idempotency: 'idempotent'; readonly idempotencyKey: string }
-);
+export interface ToolEffects extends ToolEffectsBase {
+  /** Recovery proof captured with this exact effect. Missing proof is `unknown`. */
+  readonly recovery: EffectRecoveryCapability;
+}
 
 export type ToolAuthorizationDecision =
   | { readonly decision: 'allow'; readonly reason?: string }
@@ -80,15 +80,9 @@ export function validateToolEffects(value: unknown): ToolEffects {
 export function decodeOwnedToolEffects(record: JsonObject): ToolEffects {
   const accesses = validateResourceAccesses(record.accesses, 'effects');
   const lockScopes = validateScopes(record.lockScopes, 'effect lockScopes');
-  if (!isToolIdempotency(record.idempotency)) throw new Error('Invalid tool idempotency.');
   const dependsOnCallIndices = record.dependsOnCallIndices === undefined ? undefined : validateDependencies(record.dependsOnCallIndices);
   const base = { accesses, lockScopes, ...(dependsOnCallIndices === undefined ? {} : { dependsOnCallIndices }) };
-  if (record.idempotency === 'idempotent') {
-    if (typeof record.idempotencyKey !== 'string' || record.idempotencyKey.trim().length === 0) throw new Error('Idempotent tool effects require a non-empty idempotencyKey.');
-    return Object.freeze({ ...base, idempotency: 'idempotent', idempotencyKey: record.idempotencyKey });
-  }
-  if (record.idempotencyKey !== undefined) throw new Error('Only idempotent tool effects may declare idempotencyKey.');
-  return Object.freeze({ ...base, idempotency: record.idempotency });
+  return Object.freeze({ ...base, recovery: decodeEffectRecoveryCapability(record.recovery) });
 }
 
 export function encodeToolEffects(effects: ToolEffects): JsonObject {
@@ -96,8 +90,7 @@ export function encodeToolEffects(effects: ToolEffects): JsonObject {
     accesses: Object.freeze(effects.accesses.map((access) => Object.freeze({ mode: access.mode, scope: access.scope }))),
     lockScopes: Object.freeze([...effects.lockScopes]),
     ...(effects.dependsOnCallIndices === undefined ? {} : { dependsOnCallIndices: Object.freeze([...effects.dependsOnCallIndices]) }),
-    idempotency: effects.idempotency,
-    ...(effects.idempotency === 'idempotent' ? { idempotencyKey: effects.idempotencyKey } : {})
+    recovery: encodeEffectRecoveryCapability(effects.recovery)
   });
 }
 
@@ -159,4 +152,3 @@ function validateDependencies(value: unknown): readonly number[] {
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function isAccessMode(value: unknown): value is ToolResourceAccessMode { return value === 'read' || value === 'write' || value === 'execute' || value === 'network' || value === 'delete'; }
-function isToolIdempotency(value: unknown): value is ToolIdempotency { return value === 'pure' || value === 'idempotent' || value === 'non_idempotent'; }

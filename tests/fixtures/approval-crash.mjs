@@ -46,7 +46,7 @@ const provider = {
 const tool = {
   name: 'effect', implementationId: 'tests/crash-effect@1', description: 'writes one externally visible marker', jsonSchema: { type: 'object' }, outputSchema: z.strictObject({}),
   effectEnvelope: { accesses: [{ mode: 'write', scope: 'fixture/effect' }], lockScopes: ['fixture/effect'] },
-  decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'fixture/effect' }], lockScopes: ['fixture/effect'], idempotency: 'non_idempotent' }; },
+  decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'fixture/effect' }], lockScopes: ['fixture/effect'], recovery: { kind: 'unknown' } }; },
   async invoke() {
     await appendFile(path.join(root, 'effect.txt'), 'effect\n');
     if (mode === 'crash') process.exit(42);
@@ -56,7 +56,7 @@ const tool = {
 
 const resourceLeases = new ResourceLeaseCoordinator();
 if (mode === 'crash_waiting_for_lease') {
-  await resourceLeases.acquire({ accesses: [{ mode: 'write', scope: 'fixture/effect' }], lockScopes: ['fixture/effect'], idempotency: 'non_idempotent' }, 'fixture-blocker');
+  await resourceLeases.acquire({ accesses: [{ mode: 'write', scope: 'fixture/effect' }], lockScopes: ['fixture/effect'], recovery: { kind: 'unknown' } }, 'fixture-blocker');
 }
 
 const agent = new AgentRuntime({
@@ -74,7 +74,7 @@ const agent = new AgentRuntime({
 });
 
 if (mode === 'suspend') {
-  const result = await agent.run({ task: 'crash after approved non-idempotent effect' }).result;
+  const result = await agent.run({ task: 'crash after approved effect with unknown recovery' }).result;
   const approval = result.pendingApprovals[0];
   process.stdout.write(JSON.stringify({ runId: result.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint }));
 } else {

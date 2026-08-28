@@ -37,7 +37,7 @@ test('an allowed write may require approval but approval never adds a denied ris
     name: 'write', implementationId: 'tests/write@1', description: 'write', schema: z.strictObject({}), outputSchema: z.strictObject({}),
     effectEnvelope: { accesses: [{ mode: 'write', scope: 'workspace/files/a' }], lockScopes: [] },
     canonicalizeInput: (input) => input,
-    deriveEffects: () => ({ accesses: [{ mode: 'write', scope: 'workspace/files/a' }], lockScopes: [], idempotency: 'idempotent', idempotencyKey: 'write-a' }),
+    deriveEffects: () => ({ accesses: [{ mode: 'write', scope: 'workspace/files/a' }], lockScopes: [], recovery: { kind: 'unknown' } }),
     invoke: async () => ({ kind: 'result', ok: true, summary: 'written', scope: { resources: ['workspace/files/a'], coverage: 'complete' }, output: {} })
   });
   const call = { name: 'write', input: { kind: 'json', value: {} } };
@@ -73,7 +73,7 @@ test('a mixed-access call is denied when any one derived access is prohibited', 
     name: 'mixed', implementationId: 'tests/mixed@1', description: 'mixed', schema: z.strictObject({}), outputSchema: z.strictObject({}),
     effectEnvelope: { accesses: [{ mode: 'read', scope: 'workspace/files/a' }, { mode: 'network', scope: 'network/example.com' }], lockScopes: [] },
     canonicalizeInput: (input) => input,
-    deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'workspace/files/a' }, { mode: 'network', scope: 'network/example.com' }], lockScopes: [], idempotency: 'non_idempotent' }),
+    deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'workspace/files/a' }, { mode: 'network', scope: 'network/example.com' }], lockScopes: [], recovery: { kind: 'unknown' } }),
     invoke: async () => ({ kind: 'result', ok: true, summary: 'done', scope: { resources: ['workspace/files/a'], coverage: 'complete' }, output: {} })
   });
   const call = { name: 'mixed', input: { kind: 'json', value: {} } };

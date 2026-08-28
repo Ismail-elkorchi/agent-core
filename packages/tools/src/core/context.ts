@@ -65,7 +65,6 @@ export interface ToolInvocationContext {
   readonly callIndex: number;
   readonly callId?: string;
   readonly toolAttempt: number;
-  readonly idempotencyKey?: string;
 }
 
 export type ToolServiceValidator<T> = (value: unknown) => value is T;

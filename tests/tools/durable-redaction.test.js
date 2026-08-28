@@ -38,12 +38,12 @@ class Provider {
 const base = { accesses: [{ mode: 'read', scope: 'memory/secrets' }], lockScopes: [] };
 const secretResult = defineTool({
   name: 'secret_result', implementationId: 'tests/secret-result@1', description: 'secret', schema: z.strictObject({}), outputSchema: z.record(z.string(), z.string()), effectEnvelope: base,
-  canonicalizeInput: (input) => input, deriveEffects: () => ({ ...base, idempotency: 'pure' }),
+  canonicalizeInput: (input) => input, deriveEffects: () => ({ ...base, recovery: { kind: 'unknown' } }),
   invoke: async () => ({ kind: 'result', ok: true, summary: 'secret output', scope: { resources: ['memory/secrets'], coverage: 'complete' }, output: { token: secrets[0], authorization: `Bearer ${secrets[1]}`, password: secrets[2], environment: `APP_SECRET=${secrets[3]}` }, metadata: { apiKey: secrets[0], nested: { password: secrets[2] } } })
 });
 const secretFailure = defineTool({
   name: 'secret_failure', implementationId: 'tests/secret-failure@1', description: 'secret failure', schema: z.strictObject({}), outputSchema: z.strictObject({}), effectEnvelope: base,
-  canonicalizeInput: (input) => input, deriveEffects: () => ({ ...base, idempotency: 'pure' }),
+  canonicalizeInput: (input) => input, deriveEffects: () => ({ ...base, recovery: { kind: 'unknown' } }),
   invoke: async () => ({ kind: 'failure', ok: false, summary: 'failed safely', scope: { resources: ['memory/secrets'], coverage: 'partial', causes: ['runtime_error'] }, output: { blocked: true, reason: 'runtime_error', recovery: 'retry without secrets', error: `Authorization: Bearer ${secrets[1]}`, details: { password: secrets[2], token: secrets[0] } } })
 });
 

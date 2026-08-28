@@ -555,7 +555,7 @@ export class AgentRuntime {
             ...(this.options.repositories.session ? { session: this.options.repositories.session } : {}), controller: runtime.controller, append: runtime.append, emit: runtime.emit });
         } finally { toolDeadline.dispose(); }
         if (toolResult.outcome === 'waiting_for_approval') return { executionStatus: 'waiting_for_approval', approvals: toolResult.approvals };
-        if (toolResult.outcome === 'uncertain_effect') return { executionStatus: 'failed', terminationReason: 'uncertain_tool_effect', candidate: { status: 'absent' }, errorMessage: `Tool ${toolResult.toolName} attempt ${String(toolResult.toolAttempt)} has an uncertain non-idempotent side effect.`, turnCount: turnIndex, checkResults };
+        if (toolResult.outcome === 'uncertain_effect') return { executionStatus: 'failed', terminationReason: 'uncertain_tool_effect', candidate: { status: 'absent' }, errorMessage: `Tool ${toolResult.toolName} attempt ${String(toolResult.toolAttempt)} has an uncertain external outcome without sufficient recovery proof.`, turnCount: turnIndex, checkResults };
         turnIndex += 1;
       }
       throw new Error('Model-turn execution exhausted its available entries without a terminal or limit decision.');
@@ -583,7 +583,7 @@ export class AgentRuntime {
         ...(this.options.toolAuthorizer ? { authorizer: this.options.toolAuthorizer } : {}), contextManager, observationStore,
         ...(this.options.repositories.session ? { session: this.options.repositories.session } : {}), controller: runtime.controller, append: runtime.append, emit: runtime.emit });
     } finally { toolDeadline.dispose(); }
-    if (resumedTools.outcome === 'uncertain_effect') return { executionStatus: 'failed', terminationReason: 'uncertain_tool_effect', candidate: { status: 'absent' }, errorMessage: `Tool ${resumedTools.toolName} attempt ${String(resumedTools.toolAttempt)} may have produced a non-idempotent side effect before the process stopped; automatic replay is forbidden.`, turnCount: batchIdentity.turnIndex, checkResults };
+    if (resumedTools.outcome === 'uncertain_effect') return { executionStatus: 'failed', terminationReason: 'uncertain_tool_effect', candidate: { status: 'absent' }, errorMessage: `Tool ${resumedTools.toolName} attempt ${String(resumedTools.toolAttempt)} may have produced an external outcome before the process stopped; its captured recovery capability does not prove that replay is safe.`, turnCount: batchIdentity.turnIndex, checkResults };
     if (resumedTools.outcome !== 'completed') throw new Error('Resolved approval batch requested another approval.');
     return undefined;
   }

@@ -11,7 +11,7 @@ const npmCli = process.env.npm_execpath;
 if (!npmCli) throw new Error('npm_execpath is required to verify packed consumers.');
 const tscCli = path.join(root, 'node_modules', 'typescript', 'bin', 'tsc');
 const packageDirs = [
-  'packages/auth', 'packages/json', 'packages/evidence', 'packages/model', 'packages/runtime', 'packages/tools', 'packages/tools-local',
+  'packages/auth', 'packages/json', 'packages/effects', 'packages/evidence', 'packages/model', 'packages/runtime', 'packages/tools', 'packages/tools-local',
   'packages/providers/ollama', 'packages/providers/openai-responses', 'packages/providers/openai', 'packages/providers/openai-codex', 'packages/providers/openrouter'
 ];
 
@@ -54,22 +54,25 @@ try {
     "import * as model from '@agent-core/model';",
     "import * as json from '@agent-core/json';",
     "import * as evidence from '@agent-core/evidence';",
+    "import * as effects from '@agent-core/effects';",
     "import * as tools from '@agent-core/tools';",
     "import * as local from '@agent-core/tools-local';",
     "import * as nodeEvidence from '@agent-core/evidence/node';",
-    "if (!runtime.decodeAgentTerminalSnapshot || !runtime.AgentRuntime || !runtime.AgentSession || !runtime.InMemorySessionRepository || !nodeRuntime.JsonlSessionRepository || !model.parseModelResponse || !json.parseJsonObject || !evidence.InMemoryEventRepository || !nodeEvidence.JsonlEventRepository || !tools.prepareToolCall || !tools.invokePreparedToolCall || !local.ProcessManager) throw new Error('public runtime exports missing');"
+    "if (!runtime.decodeAgentTerminalSnapshot || !runtime.AgentRuntime || !runtime.AgentSession || !runtime.InMemorySessionRepository || !nodeRuntime.JsonlSessionRepository || !model.parseModelResponse || !json.parseJsonObject || !effects.decodeExternalEffectIntent || !evidence.InMemoryEventRepository || !nodeEvidence.JsonlEventRepository || !tools.prepareToolCall || !tools.invokePreparedToolCall || !local.ProcessManager) throw new Error('public runtime exports missing');"
   ].join('\n'));
   await exec(process.execPath, ['runtime.mjs'], { cwd: consumer });
 
   await writeFile(path.join(consumer, 'consumer.ts'), [
     "import type { JsonObject } from '@agent-core/json';",
     "import type { ModelProviderState } from '@agent-core/model';",
+    "import type { EffectRecoveryCapability } from '@agent-core/effects';",
     "import type { AgentCandidate, AgentRunControl, AgentSessionState, AgentTerminalSnapshot } from '@agent-core/runtime';",
     "import type { ToolEffects, ToolObservation, ToolObservationInput } from '@agent-core/tools';",
     "const json: JsonObject = { nested: { ok: true }, values: [1, 'two'] };",
     "const providerState: ModelProviderState = { provider: 'test', model: 'test-model', kind: 'response', data: { responseId: 'resp', nested: { count: 1 } } };",
     "const candidate: AgentCandidate = { status: 'complete', message: 'done', source: 'content', turnIndex: 1 };",
-    "const effects: ToolEffects = { accesses: [{ mode: 'read', scope: 'workspace' }], lockScopes: [], idempotency: 'pure' };",
+    "const recovery: EffectRecoveryCapability = { kind: 'unknown' };",
+    "const effects: ToolEffects = { accesses: [{ mode: 'read', scope: 'workspace' }], lockScopes: [], recovery };",
     "const rawObservation: ToolObservationInput<{ value: string }> = { kind: 'result', ok: true, summary: 'raw', scope: { resources: [], coverage: 'complete' }, output: { value: 'raw' } };",
     "// @ts-expect-error raw extension output is not an owned observation",
     "const ownedObservation: ToolObservation = rawObservation;",
@@ -79,7 +82,7 @@ try {
     "declare const terminal: AgentTerminalSnapshot;",
     "declare const run: AgentRunControl;",
     "declare const sessionState: AgentSessionState;",
-    "void [json, providerState, candidate, effects, rawObservation, ownedObservation, immutableObservation, terminal, run, sessionState];"
+    "void [json, providerState, candidate, recovery, effects, rawObservation, ownedObservation, immutableObservation, terminal, run, sessionState];"
   ].join('\n'));
   for (const exactOptionalPropertyTypes of [true, false]) {
     const config = `tsconfig-${String(exactOptionalPropertyTypes)}.json`;

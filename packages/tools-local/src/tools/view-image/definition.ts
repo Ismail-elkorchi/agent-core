@@ -23,7 +23,7 @@ export const viewImageTool = defineTool({
     return {
       accesses: [{ mode: 'read', scope: workspaceFileScope(input.path) }],
       lockScopes: [],
-      idempotency: 'pure'
+      recovery: { kind: 'unknown' }
     };
   },
   async invoke(input, context) {

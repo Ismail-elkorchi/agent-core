@@ -19,7 +19,7 @@ export const readFilesTool = defineTool({
     return { ...input, files: input.files.map((file) => ({ ...file, path: root.canonicalPath(file.path) })) };
   },
   deriveEffects(input) {
-    return { accesses: [...new Set(input.files.map((file) => workspaceFileScope(file.path)))].map((scope) => ({ mode: 'read' as const, scope })), lockScopes: [], idempotency: 'pure' };
+    return { accesses: [...new Set(input.files.map((file) => workspaceFileScope(file.path)))].map((scope) => ({ mode: 'read' as const, scope })), lockScopes: [], recovery: { kind: 'unknown' } };
   },
   invoke: readFiles
 });

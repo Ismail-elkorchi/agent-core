@@ -36,7 +36,7 @@ const capabilities = {
 const toolBoundary = { authorizationPolicyId: 'tests/agent-core-policy@1', executionTargetId: 'tests/agent-core-target' };
 const emptyOutputSchema = z.strictObject({});
 const readEnvelope = { accesses: [{ mode: 'read', scope: 'memory' }], lockScopes: [] };
-const readEffects = { ...readEnvelope, idempotency: 'pure' };
+const readEffects = { ...readEnvelope, recovery: { kind: 'unknown' } };
 const completeScope = { resources: ['memory'], coverage: 'complete' };
 
 function ended(result) {
@@ -204,7 +204,7 @@ test('artifact-store failure after a completed tool effect still persists tool.e
     name: 'degraded_result', implementationId: 'tests/degraded-result@1', description: 'degraded result', jsonSchema: { type: 'object' },
     outputSchema: z.strictObject({ payload: z.string() }), effectEnvelope: { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'] },
     decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; },
-    deriveEffects() { return { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'], idempotency: 'non_idempotent' }; },
+    deriveEffects() { return { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'], recovery: { kind: 'unknown' } }; },
     async invoke() { effects += 1; return { kind: 'result', ok: true, output: { payload: 'x'.repeat(400_000) }, summary: 'effect completed', scope: completeScope }; }
   };
   const { agent, events } = await harness({
@@ -254,7 +254,7 @@ test('image and presenter projection failures happen after durable tool truth an
       ...(scenario.profile ? { requirements: { modelInputModalities: ['image'] } } : {}),
       ...(scenario.presentObservation ? { presentObservation: scenario.presentObservation } : {}),
       decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; },
-      deriveEffects() { return { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'], idempotency: 'non_idempotent' }; },
+      deriveEffects() { return { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'], recovery: { kind: 'unknown' } }; },
       async invoke() { effects += 1; return scenario.observation; }
     };
     const provider = new ScriptedProvider([
@@ -299,7 +299,7 @@ test('session and observation-record projection failures do not reclassify a com
     const tool = {
       name: 'projection_effect', implementationId: 'tests/projection-effect@1', description: 'projection effect', jsonSchema: { type: 'object' }, outputSchema: z.unknown(),
       effectEnvelope: { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'] },
-      decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'], idempotency: 'non_idempotent' }; },
+      decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'], recovery: { kind: 'unknown' } }; },
       async invoke() { effects += 1; return { kind: 'result', ok: true, summary: 'effect committed', scope: completeScope, output: { done: true } }; }
     };
     const run = await harness({ ...scenario, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, script: [response('tool_calls', '', { toolCalls: [{ id: 'projection', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }] }), response()] });
@@ -631,7 +631,7 @@ test('durable approval resumes after repository reopen and rejects changed polic
     effectEnvelope: { accesses: [{ mode: 'write', scope: 'workspace' }], lockScopes: ['workspace'] },
     decodeInput(input) { return { ok: true, input: input.value }; },
     canonicalizeInput(input) { return { ...input, path: 'state' }; }, snapshotInput(input) { return input; },
-    deriveEffects(input) { return { accesses: [{ mode: 'write', scope: `workspace/${input.path}` }], lockScopes: [`workspace/${input.path}`], idempotency: 'idempotent', idempotencyKey: `effect:${input.path}` }; },
+    deriveEffects(input) { return { accesses: [{ mode: 'write', scope: `workspace/${input.path}` }], lockScopes: [`workspace/${input.path}`], recovery: { kind: 'unknown' } }; },
     async invoke() { effects += 1; return { kind: 'result', ok: true, output: {}, summary: 'changed', scope: { resources: ['workspace/state'], coverage: 'complete' } }; }
   });
   const provider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] }), response('stop', 'approved')]);
@@ -673,7 +673,7 @@ test('current authorization is re-evaluated and may veto a stored approval', asy
   const tool = adoptToolDefinition({
     name: 'effect', implementationId: 'tests/current-veto-effect@1', description: 'effect', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema,
     effectEnvelope: { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'] },
-    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'], idempotency: 'non_idempotent' }; },
+    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'], recovery: { kind: 'unknown' } }; },
     async invoke() { effects += 1; return { kind: 'result', ok: true, output: {}, summary: 'changed', scope: { resources: ['state'], coverage: 'complete' } }; }
   });
   const provider = new ScriptedProvider([
@@ -700,7 +700,7 @@ test('current authorization is re-evaluated and may veto a stored approval', asy
   assert.match(toolEnded.observation.summary, /authorization denied/i);
 });
 
-test('process death after an approved non-idempotent effect recovers as uncertain without replay', async () => {
+test('process death after an approved effect without recovery proof remains uncertain without replay', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-approved-crash-'));
   const fixture = path.resolve('tests/fixtures/approval-crash.mjs');
   const initial = spawnSync(process.execPath, [fixture, 'suspend', root], { encoding: 'utf8' });
@@ -776,41 +776,41 @@ test('process death after tool completion projects the durable observation witho
   assert.equal(replay.branch.filter((entry) => entry.type === 'observation' && entry.toolName === 'effect').length, 1);
 });
 
-test('per-call recovery retries idempotent starts and only projects completed observations', async () => {
-  const call = { id: 'idempotent-1', type: 'function', name: 'idempotent', input: { kind: 'json', value: {} } };
+test('per-call recovery refuses incomplete effects without proof and only projects completed observations', async () => {
+  const call = { id: 'effect-1', type: 'function', name: 'effect', input: { kind: 'json', value: {} } };
   const persistedCall = { id: call.id, name: call.name, input: call.input };
-  const effects = { accesses: [{ mode: 'write', scope: 'state/idempotent' }], lockScopes: ['state/idempotent'], idempotency: 'idempotent', idempotencyKey: 'fixture:idempotent-1' };
+  const effects = { accesses: [{ mode: 'write', scope: 'state/effect' }], lockScopes: ['state/effect'], recovery: { kind: 'unknown' } };
   let invocations = 0;
   const tool = {
-    name: 'idempotent', implementationId: 'tests/idempotent-recovery@1', description: 'idempotent recovery fixture', jsonSchema: { type: 'object' }, outputSchema: z.unknown(), effectEnvelope: { accesses: effects.accesses, lockScopes: effects.lockScopes },
+    name: 'effect', implementationId: 'tests/unknown-recovery@1', description: 'unknown recovery fixture', jsonSchema: { type: 'object' }, outputSchema: z.unknown(), effectEnvelope: { accesses: effects.accesses, lockScopes: effects.lockScopes },
     decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return effects; },
     async invoke(_input, context) {
       invocations += 1;
       assert.equal(context.invocation.toolAttempt, 2);
-      assert.equal(context.invocation.idempotencyKey, effects.idempotencyKey);
-      return { kind: 'result', ok: true, output: { retried: true }, summary: 'retried safely', scope: { resources: ['state/idempotent'], coverage: 'complete' } };
+      return { kind: 'result', ok: true, output: { retried: true }, summary: 'must not retry', scope: { resources: ['state/effect'], coverage: 'complete' } };
     }
   };
   const provider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] }), response('stop', 'after retry')]);
   const run = await harness({ provider, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, toolAuthorizer: () => ({ decision: 'require_approval', reason: 'confirm' }) });
-  const suspended = await run.agent.run({ task: 'idempotent recovery' }).result;
+  const suspended = await run.agent.run({ task: 'unknown recovery' }).result;
   const approval = suspended.pendingApprovals[0];
   const identity = { turnIndex: approval.turnIndex, turnId: approval.turnId, requestAttempt: approval.requestAttempt, toolBatchId: approval.toolBatchId, callIndex: approval.callIndex, callId: approval.callId, toolAttempt: 1 };
   await run.events.append(suspended.runId, { type: 'tool.started', ...identity, toolName: tool.name, input: persistedCall, fingerprint: approval.fingerprint, effects }, { idempotencyKey: toolStageKey(suspended.runId, identity, 'started') });
-  const result = ended(await (await run.agent.resumeApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result);  assert.equal(result.executionStatus, 'completed');
-  assert.equal(invocations, 1);
+  const result = ended(await (await run.agent.resumeApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result);  assert.equal(result.executionStatus, 'failed');
+  assert.equal(result.terminationReason, 'uncertain_tool_effect');
+  assert.equal(invocations, 0);
   let records = await eventsFor(run.events, result.runId);
-  assert.deepEqual(records.filter((event) => event.type === 'tool.started').map((event) => event.toolAttempt), [1, 2]);
-  assert.deepEqual(records.filter((event) => event.type === 'tool.ended').map((event) => event.toolAttempt), [2]);
+  assert.deepEqual(records.filter((event) => event.type === 'tool.started').map((event) => event.toolAttempt), [1]);
+  assert.deepEqual(records.filter((event) => event.type === 'tool.ended').map((event) => event.toolAttempt), []);
 
   let projectedInvocations = 0;
-  const completedTool = { ...tool, implementationId: 'tests/completed-recovery@1', async invoke() { projectedInvocations += 1; return { kind: 'result', ok: true, output: {}, summary: 'must not run', scope: { resources: ['state/idempotent'], coverage: 'complete' } }; } };
+  const completedTool = { ...tool, implementationId: 'tests/completed-recovery@1', async invoke() { projectedInvocations += 1; return { kind: 'result', ok: true, output: {}, summary: 'must not run', scope: { resources: ['state/effect'], coverage: 'complete' } }; } };
   const completedProvider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] }), response('stop', 'after projection')]);
   const completedRun = await harness({ provider: completedProvider, tools: [completedTool], toolPolicy: { allowedRisks: ['read', 'write'] }, toolAuthorizer: () => ({ decision: 'require_approval', reason: 'confirm' }) });
   const completedSuspension = await completedRun.agent.run({ task: 'completed recovery' }).result;
   const completedApproval = completedSuspension.pendingApprovals[0];
   const completedIdentity = { turnIndex: completedApproval.turnIndex, turnId: completedApproval.turnId, requestAttempt: completedApproval.requestAttempt, toolBatchId: completedApproval.toolBatchId, callIndex: completedApproval.callIndex, callId: completedApproval.callId, toolAttempt: 1 };
-  const completedObservation = parseToolObservation(completedTool, { kind: 'result', ok: true, output: { already: true }, summary: 'already completed', scope: { resources: ['state/idempotent'], coverage: 'complete' } });
+  const completedObservation = parseToolObservation(completedTool, { kind: 'result', ok: true, output: { already: true }, summary: 'already completed', scope: { resources: ['state/effect'], coverage: 'complete' } });
   await completedRun.events.append(completedSuspension.runId, { type: 'tool.started', ...completedIdentity, toolName: completedTool.name, input: persistedCall, fingerprint: completedApproval.fingerprint, effects }, { idempotencyKey: toolStageKey(completedSuspension.runId, completedIdentity, 'started') });
   await completedRun.events.append(completedSuspension.runId, { type: 'tool.ended', ...completedIdentity, toolName: completedTool.name, observation: completedObservation }, { idempotencyKey: toolStageKey(completedSuspension.runId, completedIdentity, 'ended') });
   const completedResult = ended(await (await completedRun.agent.resumeApproval({ runId: completedSuspension.runId, approvalId: completedApproval.approvalId, fingerprint: completedApproval.fingerprint, decision: 'allow' })).result);  assert.equal(completedResult.executionStatus, 'completed');
@@ -888,11 +888,11 @@ test('tool preparation and authorization are abortable and elapsed-deadline boun
   assert.equal(deadlineResult.exhaustedLimit, 'elapsed_time');
 });
 
-test('completed non-idempotent tool failures are not replayed automatically', async () => {
+test('completed tool failures with unknown recovery are not replayed automatically', async () => {
   const call = { id: '1', type: 'function', name: 'effect', input: { kind: 'json', value: {} } };
   const provider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] }), response('stop', 'handled')]);
   let invocations = 0;
-  const effect = { name: 'effect', implementationId: 'tests/non-idempotent-effect@1', description: 'effect', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'] }, decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'], idempotency: 'non_idempotent' }; }, async invoke() { invocations += 1; return { kind: 'failure', ok: false, output: { blocked: true, reason: 'runtime_error', error: 'failed', recovery: 'stop' }, summary: 'failed', scope: { resources: ['state'], coverage: 'partial', cause: 'failed' } }; } };
+  const effect = { name: 'effect', implementationId: 'tests/unknown-recovery-effect@1', description: 'effect', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'] }, decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'state' }], lockScopes: ['state'], recovery: { kind: 'unknown' } }; }, async invoke() { invocations += 1; return { kind: 'failure', ok: false, output: { blocked: true, reason: 'runtime_error', error: 'failed', recovery: 'stop' }, summary: 'failed', scope: { resources: ['state'], coverage: 'partial', cause: 'failed' } }; } };
   const { agent } = await harness({ provider, tools: [effect], toolPolicy: { allowedRisks: ['read', 'write'] } });
   const result = ended(await agent.run({ task: 'effect' }).result);
   assert.equal(result.executionStatus, 'completed');

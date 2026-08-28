@@ -25,7 +25,7 @@ export const listDirectoryTool = defineTool({
     };
   },
   deriveEffects(input) {
-    return { accesses: [{ mode: 'read', scope: workspaceFileScope(input.path) }], lockScopes: [], idempotency: 'pure' };
+    return { accesses: [{ mode: 'read', scope: workspaceFileScope(input.path) }], lockScopes: [], recovery: { kind: 'unknown' } };
   },
   async invoke(input, context) {
     const selected = await workspaceFileSelector(context).select({

@@ -21,7 +21,7 @@ export const findFilesTool = defineTool({
     return { ...input, path: requireWorkspaceFileRoot(context).canonicalPath(input.path) };
   },
   deriveEffects(input) {
-    return { accesses: [{ mode: 'read', scope: workspaceFileScope(input.path) }], lockScopes: [], idempotency: 'pure' };
+    return { accesses: [{ mode: 'read', scope: workspaceFileScope(input.path) }], lockScopes: [], recovery: { kind: 'unknown' } };
   },
   async invoke(input, context) {
     const selected = await workspaceFileSelector(context).select({

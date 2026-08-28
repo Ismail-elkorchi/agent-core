@@ -83,7 +83,7 @@ test('authored tools retain identity and dynamic tools cross an explicit adopter
     outputSchema: z.strictObject({ value: z.string() }),
     effectEnvelope,
     canonicalizeInput: (input) => input,
-    deriveEffects: () => ({ accesses: [], lockScopes: [], idempotency: 'idempotent' }),
+    deriveEffects: () => ({ accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }),
     invoke: async (input) => ({ kind: 'result', ok: true, summary: 'ok', scope: { resources: [], coverage: 'complete' }, output: input })
   });
   const registry = new ToolRegistry();
@@ -99,7 +99,7 @@ test('authored tools retain identity and dynamic tools cross an explicit adopter
 test('tool preparation accepts owned calls without decoding structural lookalikes', async () => {
   const tool = defineTool({
     name: 'prepared_tool', implementationId: 'tests/prepared-tool@1', description: 'Checks call ownership.', schema: z.strictObject({ value: z.string() }), outputSchema: z.strictObject({}),
-    effectEnvelope: { accesses: [], lockScopes: [] }, canonicalizeInput: (input) => input, deriveEffects: () => ({ accesses: [], lockScopes: [], idempotency: 'pure' }),
+    effectEnvelope: { accesses: [], lockScopes: [] }, canonicalizeInput: (input) => input, deriveEffects: () => ({ accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }),
     invoke: async () => ({ kind: 'result', ok: true, summary: 'ok', scope: { resources: [], coverage: 'complete' }, output: {} })
   });
   const input = { name: tool.name, input: { kind: 'json', value: { value: 'owned' } } };

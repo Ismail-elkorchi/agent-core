@@ -8,6 +8,9 @@
       "path": "packages/json"
     },
     {
+      "path": "packages/effects"
+    },
+    {
       "path": "packages/model"
     },
     {

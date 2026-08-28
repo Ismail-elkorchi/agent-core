@@ -109,7 +109,7 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
       blocker = await processManager.resourceLeases.acquire({
         accesses: [{ mode: 'execute', scope: 'workspace/processes' }],
         lockScopes: ['workspace/files'],
-        idempotency: 'non_idempotent'
+        recovery: { kind: 'unknown' }
       }, 'unresolved-process-reconciliation');
     }
     if (result.unresolved.length === 0 && blocker) { blocker.release(); blocker = undefined; }
