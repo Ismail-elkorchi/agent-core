@@ -110,7 +110,7 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
     readFilesTool,
     searchTextTool,
     applyPatchTool,
-    createExecCommandTool({ ptySupported: commandExecution?.descriptor.supportsPty ?? false }),
+    ...(enabledTools.includes('exec_command') ? [createExecCommandTool({ ptySupported: commandExecution?.descriptor.supportsPty ?? false })] : []),
     writeStdinTool,
     stopProcessTool,
     viewImageTool,
