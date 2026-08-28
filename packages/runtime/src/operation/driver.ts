@@ -221,6 +221,32 @@ export class AgentOperationDriver {
     });
   }
 
+  requestAbort(reason: string): Promise<AgentOperationInspection> {
+    return this.serial(async () => {
+      if (reason.trim().length === 0) throw new TypeError('Abort reason must not be empty.');
+      if (this.stateValue.phase.kind === 'terminal' || this.stateValue.control.status === 'abort_requested') return this.inspection();
+      if (this.stateValue.control.status !== 'owned' || this.stateValue.control.driverId !== this.driverId) {
+        throw new AgentOperationConflictError(this.stateValue.runId, 'stale_driver', `Driver ${this.driverId} cannot abort run ${this.stateValue.runId}.`);
+      }
+      const state = decodeAgentOperationState({
+        ...this.stateValue,
+        revision: this.stateValue.revision + 1,
+        control: { status: 'abort_requested', driverId: this.driverId, reason }
+      });
+      const result = await this.events.appendConditional(state.runId, { type: 'operation.transition', state }, {
+        idempotencyKey: transitionKey(state),
+        expectedTail: this.tailValue,
+        driverGeneration: state.driverGeneration
+      });
+      if (result.kind === 'rejected' && (result.reason === 'stale_tail' || result.reason === 'stale_driver')) await this.refresh();
+      const committed = acceptConditionalResult(state.runId, result);
+      this.stateValue = state;
+      this.tailValue = committed.tail;
+      this.transitionValue = committed.receipt;
+      return this.inspection();
+    });
+  }
+
   private async appendNow(event: AgentAuditEvent, idempotencyKey: string): Promise<EventAppendReceipt> {
     this.assertEventAuthority(event);
     const result = await this.events.appendConditional(this.stateValue.runId, event, {

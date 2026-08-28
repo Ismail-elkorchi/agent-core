@@ -264,7 +264,9 @@ export class AgentRuntime {
   private activeAbortController: AbortController | undefined;
   private activeRunId: string | undefined;
   private activeOperations: AgentOperationCoordinator | undefined;
+  private activeOperationDriver: AgentOperationDriver | undefined;
   private activeOperationReady: Promise<void> | undefined;
+  private activeAbortRequest: Promise<void> | undefined;
   private static readonly MAX_STEERING_ITEMS = 1024;
 
   constructor(private readonly options: AgentRuntimeOptions) {
@@ -300,7 +302,7 @@ export class AgentRuntime {
     return Object.freeze({
       runId,
       injectSteering: (steering: AgentSteeringInput) => this.injectSteering(runId, steering),
-      abort: (reason?: string) => this.abortRun(runId, reason),
+      abort: (reason?: string) => this.scheduleAbortRun(runId, reason),
       result
     });
   }
@@ -374,7 +376,7 @@ export class AgentRuntime {
     return Object.freeze({
       runId: input.runId,
       injectSteering: (steering: AgentSteeringInput) => this.injectSteering(input.runId, steering),
-      abort: (reason?: string) => this.abortRun(input.runId, reason),
+      abort: (reason?: string) => this.scheduleAbortRun(input.runId, reason),
       result
     });
   }
@@ -395,9 +397,10 @@ export class AgentRuntime {
     try {
       await operationReady;
       const operation = attachedOperation ?? await operations.attach(runId);
+      this.activeOperationDriver = operation;
       this.assertRuntimeMatchesOperation(operation);
-      if (input.signal?.aborted) await this.abortRun(runId, abortReason(input.signal.reason));
-      else cleanupExternalAbort = bindExternalAbort(input.signal, () => this.abortRun(runId, abortReason(input.signal?.reason)), abortController);
+      if (input.signal?.aborted) await this.scheduleAbortRun(runId, abortReason(input.signal.reason));
+      else cleanupExternalAbort = bindExternalAbort(input.signal, () => this.scheduleAbortRun(runId, abortReason(input.signal?.reason)), abortController);
       return await this.runInternal(input, abortController.signal, operation, resume);
     }
     finally {
@@ -405,7 +408,10 @@ export class AgentRuntime {
       removeRunItems(this.steerQueue, runId);
       if (this.activeAbortController === abortController) this.activeAbortController = undefined;
       if (this.activeRunId === runId) this.activeRunId = undefined;
-      if (this.activeOperations === operations) this.activeOperations = undefined;
+      if (this.activeOperations === operations) {
+        this.activeOperations = undefined;
+        this.activeOperationDriver = undefined;
+      }
       if (this.activeOperationReady === operationReady) this.activeOperationReady = undefined;
     }
   }
@@ -421,9 +427,10 @@ export class AgentRuntime {
         return Object.freeze({ state: 'ended', terminal: terminal.event.terminal, deliveryDiagnostics: Object.freeze([]) });
       }
       const operation = await operations.attach(runId);
+      this.activeOperationDriver = operation;
       this.assertRuntimeMatchesOperation(operation);
-      if (signal?.aborted) await this.abortRun(runId, abortReason(signal.reason));
-      else cleanupExternalAbort = bindExternalAbort(signal, () => this.abortRun(runId, abortReason(signal?.reason)), abortController);
+      if (signal?.aborted) await this.scheduleAbortRun(runId, abortReason(signal.reason));
+      else cleanupExternalAbort = bindExternalAbort(signal, () => this.scheduleAbortRun(runId, abortReason(signal?.reason)), abortController);
       const operationState = operation.state();
       if (operationState.control.status === 'abort_requested') {
         abortController.abort(operationState.control.reason);
@@ -456,7 +463,10 @@ export class AgentRuntime {
       removeRunItems(this.steerQueue, runId);
       if (this.activeAbortController === abortController) this.activeAbortController = undefined;
       if (this.activeRunId === runId) this.activeRunId = undefined;
-      if (this.activeOperations === operations) this.activeOperations = undefined;
+      if (this.activeOperations === operations) {
+        this.activeOperations = undefined;
+        this.activeOperationDriver = undefined;
+      }
       if (this.activeOperationReady === operationReady) this.activeOperationReady = undefined;
     }
   }
@@ -481,7 +491,7 @@ export class AgentRuntime {
       ...(this.options.onProgress ? { deliver: this.options.onProgress } : {}),
       deliveryDiagnostics
     });
-    if (operation.state().phase.kind === 'accepted') {
+    if (operation.state().phase.kind === 'accepted' && operation.state().control.status === 'owned') {
       await this.advanceOperation(operation, 'prepare', { phase: { kind: 'preparing', step: 'assemble_turn', turnIndex: resume?.identity.turnIndex ?? 1 }, budget: controller.snapshot() });
     }
     let decision: ExecutionDecision;
@@ -506,6 +516,7 @@ export class AgentRuntime {
     }
     await this.prepareOperationForFinalization(operation, controller.snapshot());
     await this.enterPhase(runId, controller, 'finalizing', append, emit);
+    await this.waitForAbortRequest(runId);
     decision = decisionBeforeFinalization(decision, signal);
     const terminal = terminalSnapshot(runId, finalizationId, decision, controller, this.checks);
     const result = await finalizer.finalize(terminal, 'diagnostic' in decision ? decision.diagnostic : undefined);
@@ -521,6 +532,7 @@ export class AgentRuntime {
   }
 
   private async executeRun(runtime: RunExecutionRuntime): Promise<ExecutionDecision> {
+    throwIfAborted(runtime.signal);
     const runNotes: string[] = [];
     const checkResults: AgentCheckResult[] = [];
     const effectiveInstructions = runtime.resume ? [...runtime.resume.instructions] : applicationInstructions(this.options.instructions);
@@ -1268,10 +1280,27 @@ export class AgentRuntime {
     const operations = this.activeOperations;
     const operationReady = this.activeOperationReady;
     if (this.activeRunId !== runId || !operations || !operationReady) return;
-    await operationReady;
-    if (this.activeRunId !== runId || this.activeOperations !== operations) return;
-    await operations.requestAbort(runId, reason);
+    const driver = this.activeOperationDriver;
+    if (driver?.state().runId === runId) {
+      await driver.requestAbort(reason);
+    } else {
+      await operationReady;
+      if (this.activeRunId !== runId || this.activeOperations !== operations) return;
+      const attachedDriver = this.activeOperationDriver;
+      if (attachedDriver?.state().runId === runId) await attachedDriver.requestAbort(reason);
+      else await operations.requestAbort(runId, reason);
+    }
     if (this.activeRunId === runId) this.activeAbortController?.abort(reason);
+  }
+  private scheduleAbortRun(runId: string, reason = 'Agent run aborted.'): Promise<void> {
+    const request = this.abortRun(runId, reason);
+    this.activeAbortRequest = request;
+    void request.finally(() => { if (this.activeAbortRequest === request) this.activeAbortRequest = undefined; }).catch(() => undefined);
+    return request;
+  }
+  private async waitForAbortRequest(runId: string): Promise<void> {
+    const request = this.activeRunId === runId ? this.activeAbortRequest : undefined;
+    if (request) await request;
   }
 }
 
