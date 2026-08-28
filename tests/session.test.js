@@ -453,6 +453,48 @@ test('approval suspension remains durable and blocks queued follow-ups until res
   await restarted.waitForIdle();
   assert.deepEqual(executed, ['after approval']);
 });
+
+test('aborting a suspended submission commits cancellation before starting finalization', async () => {
+  const repository = new InMemorySessionRepository();
+  const descriptor = await repository.create({ id: 'abort-suspension' });
+  const runId = 'suspended-run';
+  await repository.enqueueSubmission(descriptor.id, {
+    submissionId: 'submission',
+    runId,
+    input: { task: 'suspended task' },
+    configuration: { provider: 'test', model: 'model' }
+  });
+  await repository.transitionSubmission(descriptor.id, 'submission', { state: 'claimed' });
+  await repository.transitionSubmission(descriptor.id, 'submission', { state: 'suspended' });
+  const events = new InMemoryEventRepository(agentEventCodec);
+  const operations = new AgentOperationCoordinator(events);
+  await acceptApprovalOperation(operations, runId);
+  let resumed = false;
+  const session = new AgentSession({
+    descriptor,
+    repository,
+    operations,
+    configuration: { provider: 'test', model: 'model' },
+    createRuntime() {
+      return {
+        resume(resumedRunId) {
+          resumed = true;
+          const result = operations.inspect(resumedRunId).then((inspection) => {
+            assert.equal(inspection.state.control.status, 'abort_requested');
+            return { state: 'ended', terminal: { runId: resumedRunId }, deliveryDiagnostics: [] };
+          });
+          return { runId: resumedRunId, result, injectSteering() { throw new Error('unused'); }, abort() { return Promise.resolve(); } };
+        }
+      };
+    }
+  });
+  await session.restore();
+  assert.equal(session.state().phase, 'waiting_for_user');
+  assert.equal(await session.abort('cancel suspended work', runId), true);
+  await session.waitForIdle();
+  assert.equal(resumed, true);
+  assert.equal(session.state().phase, 'idle');
+});
 test('session listing orders sessions by latest committed activity', async () => {
   const repository = new InMemorySessionRepository();
   const first = await repository.create({ id: 'first' });

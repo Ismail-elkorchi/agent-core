@@ -420,14 +420,18 @@ export class AgentRuntime {
       if (terminal?.event.type === 'run.ended') {
         return Object.freeze({ state: 'ended', terminal: terminal.event.terminal, deliveryDiagnostics: Object.freeze([]) });
       }
-      if (inspection.state.phase.kind === 'approval') return await this.approvalSuspension(inspection.state);
-      if (inspection.state.phase.kind === 'suspended') return operationSuspension(inspection.state);
-
       const operation = await operations.attach(runId);
       this.assertRuntimeMatchesOperation(operation);
       if (signal?.aborted) await this.abortRun(runId, abortReason(signal.reason));
       else cleanupExternalAbort = bindExternalAbort(signal, () => this.abortRun(runId, abortReason(signal?.reason)), abortController);
-      const phase = operation.state().phase;
+      const operationState = operation.state();
+      if (operationState.control.status === 'abort_requested') {
+        abortController.abort(operationState.control.reason);
+        return await this.runInternal(operationInput(operationState), abortController.signal, operation, undefined, true);
+      }
+      const phase = operationState.phase;
+      if (phase.kind === 'approval') return await this.approvalSuspension(operationState);
+      if (phase.kind === 'suspended') return operationSuspension(operationState);
       if (phase.kind === 'provider' && phase.stage === 'effect_pending') {
         await this.advanceOperation(operation, 'reconcile_provider_request', { phase: { kind: 'suspended', reason: 'provider_outcome_unknown', ...(phase.effectId ? { effectId: phase.effectId } : {}) }, ...(operation.state().budget ? { budget: operation.state().budget } : {}) });
         return operationSuspension(operation.state());
@@ -1420,6 +1424,15 @@ function formatOverflowDiagnostic(diagnostic: OverflowDiagnostic): string { retu
 function formatOverflowAction(action: OverflowRecoveryAction): string { if (action.kind === 'reduce_context_history') return `reduce_context_history(${String(action.reductions)})`; if (action.kind === 'reduce_context') return `reduce_context(${String(action.removedItems)})`; if (action.kind === 'install_checkpoint') return `install_checkpoint(${String(action.compactedToolResults)})`; return action.kind; }
 class RequestAssemblyError extends Error {}
 function modelStreamInterrupted(input: { turnIndex: number; cause: unknown; content: string; reasoningSummary: string; finalResponseReceived: boolean }): ModelStreamInterruptedError { return new ModelStreamInterruptedError({ turnIndex: input.turnIndex, cause: input.cause, content: input.content, finalResponseReceived: input.finalResponseReceived, ...(input.reasoningSummary.length > 0 ? { reasoningSummary: input.reasoningSummary } : {}) }); }
+function operationInput(state: import('./operation/contracts.js').AgentOperationState): ResolvedAgentRunInput {
+  return {
+    task: state.input.task,
+    runId: state.runId,
+    finalizationId: state.finalizationId,
+    instructions: state.input.instructions,
+    contextItems: state.input.contextItems
+  };
+}
 function bindExternalAbort(external: AbortSignal | undefined, requestAbort: () => Promise<void>, controller: AbortController): () => void {
   if (!external) return () => undefined;
   const abort = () => { void requestAbort().catch((error: unknown) => { controller.abort(error); }); };
