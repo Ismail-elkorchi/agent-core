@@ -78,6 +78,13 @@ class ScriptedProvider {
   }
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => { resolve = resolvePromise; reject = rejectPromise; });
+  return { promise, resolve, reject };
+}
+
 async function harness(options = {}) {
   const events = options.events ?? new InMemoryEventRepository(agentEventCodec);
   const sessions = options.sessions ?? new InMemorySessionRepository();
@@ -312,6 +319,135 @@ test('session and observation-record projection failures do not reclassify a com
     assert.equal(persisted.filter(event => event.type === 'tool.ended').length, 1);
     assert.match(persisted.find(event => event.type === 'observation.projection.failed').message, scenario.expected);
   }
+});
+
+test('parallel tool settlements commit immediately while conversation projection remains a contiguous source-order prefix', async () => {
+  const gates = [deferred(), deferred(), deferred()];
+  const started = [deferred(), deferred(), deferred()];
+  let active = 0;
+  let maximumActive = 0;
+  const tool = {
+    name: 'parallel', implementationId: 'tests/parallel-settlement@1', description: 'controlled parallel tool',
+    jsonSchema: { type: 'object', properties: { index: { type: 'integer' } }, required: ['index'], additionalProperties: false },
+    outputSchema: z.strictObject({ index: z.int() }), effectEnvelope: { accesses: [{ mode: 'read', scope: 'parallel' }], lockScopes: [] },
+    decodeInput(input) { return Number.isInteger(input.value?.index) ? { ok: true, input: { index: input.value.index } } : { ok: false, issues: [] }; },
+    canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; },
+    deriveEffects(input) { return { accesses: [{ mode: 'read', scope: `parallel/${String(input.index)}` }], lockScopes: [], recovery: { kind: 'unknown' } }; },
+    async invoke(input) {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      started[input.index].resolve();
+      try {
+        await gates[input.index].promise;
+        return { kind: 'result', ok: true, output: { index: input.index }, summary: `parallel ${String(input.index)}`, scope: completeScope };
+      } finally { active -= 1; }
+    }
+  };
+  const calls = [0, 1, 2].map((index) => ({ id: `parallel-${String(index)}`, type: 'function', name: tool.name, input: { kind: 'json', value: { index } } }));
+  const run = await harness({
+    tools: [tool], limits: { maxConcurrentToolCalls: 2 },
+    script: [response('tool_calls', '', { toolCalls: calls }), response('stop', 'parallel complete')]
+  });
+  const control = run.agent.run({ task: 'run independent calls' });
+  await Promise.all([started[0].promise, started[1].promise]);
+  let operation = await run.agent.inspectOperation(control.runId);
+  assert.equal(operation.state.phase.kind, 'tools');
+  assert.equal(operation.state.phase.maxConcurrency, 2);
+  assert.deepEqual(operation.state.phase.callStates.map((state) => state.stage), ['effect_pending', 'effect_pending', 'effect_ready']);
+
+  gates[1].resolve();
+  await started[2].promise;
+  gates[2].resolve();
+  for (;;) {
+    operation = await run.agent.inspectOperation(control.runId);
+    if (operation.state.phase.kind === 'tools' && operation.state.phase.callStates[1]?.stage === 'settled'
+      && operation.state.phase.callStates[2]?.stage === 'settled') break;
+    await Promise.resolve();
+  }
+  assert.deepEqual(operation.state.phase.callStates.map((state) => state.stage), ['effect_pending', 'settled', 'settled']);
+  assert.equal(operation.state.phase.nextProjectionIndex, 0);
+  assert.equal((await eventsFor(run.events, control.runId)).some((event) => event.type === 'observation.record.created'), false);
+
+  gates[0].resolve();
+  const result = ended(await control.result);
+  assert.equal(result.executionStatus, 'completed');
+  assert.equal(maximumActive, 2);
+  const events = await eventsFor(run.events, control.runId);
+  assert.deepEqual(events.filter((event) => event.type === 'tool.ended').map((event) => event.callIndex), [1, 2, 0]);
+  assert.deepEqual(events.filter((event) => event.type === 'observation.record.created').map((event) => event.callIndex), [0, 1, 2]);
+});
+
+test('parallel scheduler enforces explicit dependencies and resource conflicts without serializing unrelated calls', async () => {
+  const gates = [deferred(), deferred(), deferred(), deferred()];
+  const started = [deferred(), deferred(), deferred(), deferred()];
+  const startOrder = [];
+  const tool = {
+    name: 'scheduled', implementationId: 'tests/parallel-scheduler@1', description: 'dependency scheduler fixture',
+    jsonSchema: { type: 'object', properties: { index: { type: 'integer' } }, required: ['index'], additionalProperties: false },
+    outputSchema: z.strictObject({ index: z.int() }), effectEnvelope: { accesses: [{ mode: 'read', scope: 'scheduled' }, { mode: 'write', scope: 'scheduled' }], lockScopes: [] },
+    decodeInput(input) { return Number.isInteger(input.value?.index) ? { ok: true, input: { index: input.value.index } } : { ok: false, issues: [] }; },
+    canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; },
+    deriveEffects(input) {
+      if (input.index === 0) return { accesses: [{ mode: 'write', scope: 'scheduled/a' }], lockScopes: [], recovery: { kind: 'unknown' } };
+      if (input.index === 1 || input.index === 3) return { accesses: [{ mode: 'write', scope: 'scheduled/b' }], lockScopes: [], recovery: { kind: 'unknown' } };
+      return { accesses: [{ mode: 'read', scope: 'scheduled/c' }], lockScopes: [], dependsOnCallIndices: [0], recovery: { kind: 'unknown' } };
+    },
+    async invoke(input) {
+      startOrder.push(input.index);
+      started[input.index].resolve();
+      await gates[input.index].promise;
+      return { kind: 'result', ok: true, output: { index: input.index }, summary: `scheduled ${String(input.index)}`, scope: completeScope };
+    }
+  };
+  const calls = [0, 1, 2, 3].map((index) => ({ id: `scheduled-${String(index)}`, type: 'function', name: tool.name, input: { kind: 'json', value: { index } } }));
+  const run = await harness({ tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, limits: { maxConcurrentToolCalls: 4 }, script: [response('tool_calls', '', { toolCalls: calls }), response()] });
+  const control = run.agent.run({ task: 'respect dependencies' });
+  await Promise.all([started[0].promise, started[1].promise]);
+  let operation = await run.agent.inspectOperation(control.runId);
+  assert.equal(operation.state.phase.kind, 'tools');
+  assert.deepEqual(operation.state.phase.callStates.map((state) => state.stage), ['effect_pending', 'effect_pending', 'effect_ready', 'effect_ready']);
+
+  gates[1].resolve();
+  await started[3].promise;
+  operation = await run.agent.inspectOperation(control.runId);
+  assert.equal(operation.state.phase.kind, 'tools');
+  assert.equal(operation.state.phase.callStates[2].stage, 'effect_ready');
+  gates[3].resolve();
+  gates[0].resolve();
+  await started[2].promise;
+  gates[2].resolve();
+  const result = ended(await control.result);
+  assert.equal(result.executionStatus, 'completed', JSON.stringify(result));
+  assert.deepEqual(startOrder, [0, 1, 3, 2]);
+});
+
+test('cancellation durably closes or marks every call in a parallel batch', async () => {
+  const started = [deferred(), deferred()];
+  const tool = {
+    name: 'abort_parallel', implementationId: 'tests/parallel-abort@1', description: 'abort fixture',
+    jsonSchema: { type: 'object', properties: { index: { type: 'integer' } }, required: ['index'], additionalProperties: false },
+    outputSchema: emptyOutputSchema, effectEnvelope: { accesses: [{ mode: 'read', scope: 'abort' }], lockScopes: [] },
+    decodeInput(input) { return Number.isInteger(input.value?.index) ? { ok: true, input: { index: input.value.index } } : { ok: false, issues: [] }; },
+    canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; },
+    deriveEffects(input) { return { accesses: [{ mode: 'read', scope: `abort/${String(input.index)}` }], lockScopes: [], recovery: { kind: 'unknown' } }; },
+    async invoke(input, context) {
+      if (input.index < 2) started[input.index].resolve();
+      await new Promise((_resolve, reject) => context.signal.addEventListener('abort', () => reject(context.signal.reason), { once: true }));
+      throw new Error('unreachable');
+    }
+  };
+  const calls = [0, 1, 2].map((index) => ({ id: `abort-${String(index)}`, type: 'function', name: tool.name, input: { kind: 'json', value: { index } } }));
+  const run = await harness({ tools: [tool], limits: { maxConcurrentToolCalls: 2 }, script: [response('tool_calls', '', { toolCalls: calls })] });
+  const control = run.agent.run({ task: 'abort all calls' });
+  await Promise.all(started.map((entry) => entry.promise));
+  await control.abort('cancel parallel batch');
+  const result = ended(await control.result);
+  assert.equal(result.executionStatus, 'aborted');
+  const transitions = (await eventsFor(run.events, control.runId)).filter((event) => event.type === 'operation.transition');
+  const cancelling = transitions.find((event) => event.state.phase.kind === 'cancelling' && event.state.phase.toolBatch);
+  assert.ok(cancelling);
+  assert.deepEqual(cancelling.state.phase.toolBatch.callStates.map((state) => state.stage), ['outcome_unknown', 'outcome_unknown', 'cancelled']);
+  assert.equal(cancelling.state.phase.toolBatch.callStates.every((state) => state.stage !== 'ready' && state.stage !== 'effect_ready' && state.stage !== 'effect_pending'), true);
 });
 
 async function eventsFor(repository, runId) {
@@ -1008,55 +1144,66 @@ test('semantic tool audit events cannot advance authoritative per-call recovery 
   assert.equal(records.filter((event) => event.type === 'observation.record.created').length, 1);
 });
 
-test('a live stale runtime can settle its exact tool permit but cannot continue the run after takeover', async () => {
+test('a live stale runtime settles its exact permit while its unknown call continues to consume the durable concurrency cap', async () => {
   let releaseInvocation;
   let markInvocationStarted;
   const invocationStarted = new Promise((resolve) => { markInvocationStarted = resolve; });
   const invocationRelease = new Promise((resolve) => { releaseInvocation = resolve; });
-  let invocations = 0;
-  const call = { id: 'effect-1', type: 'function', name: 'effect', input: { kind: 'json', value: {} } };
+  const invocations = [];
+  const calls = [0, 1].map((index) => ({ id: `effect-${String(index)}`, type: 'function', name: 'effect', input: { kind: 'json', value: { index } } }));
   const tool = adoptToolDefinition({
-    name: 'effect', implementationId: 'tests/live-takeover-effect@1', description: 'controlled effect', jsonSchema: { type: 'object' }, outputSchema: z.strictObject({}),
-    effectEnvelope: { accesses: [{ mode: 'write', scope: 'state/effect' }], lockScopes: ['state/effect'] },
-    decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; },
-    deriveEffects() { return { accesses: [{ mode: 'write', scope: 'state/effect' }], lockScopes: ['state/effect'], recovery: { kind: 'unknown' } }; },
-    async invoke() {
-      invocations += 1;
-      markInvocationStarted();
-      await invocationRelease;
-      return { kind: 'result', ok: true, output: {}, summary: 'settled by stale owner', scope: { resources: ['state/effect'], coverage: 'complete' } };
+    name: 'effect', implementationId: 'tests/live-takeover-effect@1', description: 'controlled effect',
+    jsonSchema: { type: 'object', properties: { index: { type: 'integer' } }, required: ['index'], additionalProperties: false },
+    outputSchema: z.strictObject({ index: z.int() }), effectEnvelope: { accesses: [{ mode: 'read', scope: 'state' }], lockScopes: [] },
+    decodeInput(input) { return Number.isInteger(input.value?.index) ? { ok: true, input: { index: input.value.index } } : { ok: false, issues: [] }; },
+    canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; },
+    deriveEffects(input) { return { accesses: [{ mode: 'read', scope: `state/effect-${String(input.index)}` }], lockScopes: [], recovery: { kind: 'unknown' } }; },
+    async invoke(input) {
+      invocations.push(input.index);
+      if (input.index === 0) {
+        markInvocationStarted();
+        await invocationRelease;
+      }
+      return { kind: 'result', ok: true, output: { index: input.index }, summary: `settled effect ${String(input.index)}`, scope: { resources: [`state/effect-${String(input.index)}`], coverage: 'complete' } };
     }
   });
-  const provider = new ScriptedProvider([response('tool_calls', '', { toolCalls: [call] }), response('stop', 'continued by replacement')]);
-  const first = await harness({ provider, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, toolAuthorizer: () => ({ decision: 'allow' }), withoutSession: true });
+  const provider = new ScriptedProvider([response('tool_calls', '', { toolCalls: calls }), response('stop', 'continued by replacement')]);
+  const first = await harness({ provider, tools: [tool], limits: { maxConcurrentToolCalls: 1 }, toolPolicy: { allowedRisks: ['read'] }, toolAuthorizer: () => ({ decision: 'allow' }), withoutSession: true });
   const firstControl = first.agent.run({ task: 'live takeover' });
   await invocationStarted;
   const pending = await first.agent.inspectOperation(firstControl.runId);
   assert.equal(pending.state.phase.kind, 'tools');
-  assert.equal(pending.state.phase.stage, 'effect_pending');
-  assert.deepEqual(pending.state.phase.effect.intent.exposure, { quantities: [{ unit: 'tool_invocations', amount: 1 }] });
+  assert.equal(pending.state.phase.callStates[0].stage, 'effect_pending');
+  assert.equal(pending.state.phase.callStates[1].stage, 'effect_ready');
+  assert.equal(pending.state.phase.maxConcurrency, 1);
+  assert.deepEqual(pending.state.phase.callStates[0].effect.intent.exposure, { quantities: [{ unit: 'tool_invocations', amount: 1 }] });
 
   const replacement = new AgentRuntime({
     provider, model: 'scripted', toolBoundary,
     repositories: { events: first.events, artifacts: first.artifacts },
-    tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, toolAuthorizer: () => ({ decision: 'allow' })
+    tools: [tool], limits: { maxConcurrentToolCalls: 1 }, toolPolicy: { allowedRisks: ['read'] }, toolAuthorizer: () => ({ decision: 'allow' })
   });
   const waiting = await replacement.resume(firstControl.runId).result;
   assert.equal(waiting.state, 'suspended');
   assert.equal(waiting.reason, 'tool_outcome_unknown');
+  assert.deepEqual(invocations, [0]);
+  const unresolved = await replacement.inspectOperation(firstControl.runId);
+  assert.equal(unresolved.state.phase.kind, 'tools');
+  assert.deepEqual(unresolved.state.phase.callStates.map((state) => state.stage), ['outcome_unknown', 'effect_ready']);
   releaseInvocation();
   await assert.rejects(firstControl.result, /replacement driver/u);
   const settled = await replacement.inspectOperation(firstControl.runId);
   assert.equal(settled.state.phase.kind, 'tools');
-  assert.equal(settled.state.phase.stage, 'settled');
-  assert.deepEqual(settled.state.phase.effect.settlement.exposure, { status: 'known', quantities: [{ unit: 'tool_invocations', amount: 1 }] });
+  assert.equal(settled.state.phase.callStates[0].stage, 'settled');
+  assert.equal(settled.state.phase.callStates[1].stage, 'effect_ready');
+  assert.deepEqual(settled.state.phase.callStates[0].effect.settlement.exposure, { status: 'known', quantities: [{ unit: 'tool_invocations', amount: 1 }] });
 
   const completed = ended(await replacement.resume(firstControl.runId).result);
   assert.equal(completed.executionStatus, 'completed');
-  assert.equal(invocations, 1);
+  assert.deepEqual(invocations, [0, 1]);
   const records = await eventsFor(first.events, firstControl.runId);
-  assert.equal(records.filter((event) => event.type === 'tool.ended').length, 1);
-  assert.equal(records.filter((event) => event.type === 'observation.record.created').length, 1);
+  assert.equal(records.filter((event) => event.type === 'tool.ended').length, 2);
+  assert.equal(records.filter((event) => event.type === 'observation.record.created').length, 2);
 });
 
 test('consumed provider usage remains in the terminal snapshot when it crosses a limit', async () => {

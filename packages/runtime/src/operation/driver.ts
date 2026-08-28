@@ -185,21 +185,26 @@ export class AgentOperationCoordinator {
     for (;;) {
       const current = await this.inspect(runId);
       const phase = current.state.phase;
-      if (phase.kind === 'tools' && (phase.stage === 'settled' || phase.stage === 'projecting')
-        && phase.effect?.intent.effectId === input.effectId) {
-        if (toolSettlementDigest(phase.settlement) !== toolSettlementDigest(settlement)) {
+      const callIndex = phase.kind === 'tools'
+        ? phase.callStates.findIndex((call) => call.stage !== 'ready' && call.effect?.intent.effectId === input.effectId)
+        : -1;
+      const callState = phase.kind === 'tools' && callIndex >= 0 ? phase.callStates[callIndex] : undefined;
+      if (callState?.stage === 'settled' || callState?.stage === 'projecting' || callState?.stage === 'projected') {
+        if (toolSettlementDigest(callState.settlement) !== toolSettlementDigest(settlement)) {
           throw new AgentOperationConflictError(runId, 'idempotency_conflict', `Tool effect ${input.effectId} already has a different settlement.`);
         }
         return current;
       }
-      if (phase.kind !== 'tools' || phase.stage !== 'effect_pending' || phase.effect.intent.effectId !== input.effectId) {
+      if (phase.kind !== 'tools' || callIndex < 0
+        || (callState?.stage !== 'effect_pending' && callState?.stage !== 'outcome_unknown')
+        || callState.effect.phase !== 'started') {
         throw new AgentOperationConflictError(runId, 'stale_tail', `Tool effect ${input.effectId} is no longer awaiting settlement.`);
       }
       const resultDigest = hashJson(encodeToolObservation(settlement.observation));
-      const settled = settleExternalEffect(phase.effect, permit, {
+      const settled = settleExternalEffect(callState.effect, permit, {
         outcome: settlement.observation.ok ? 'succeeded' : 'failed',
         resultDigest,
-        exposure: knownEffectExposure(phase.effect.intent.exposure.quantities)
+        exposure: knownEffectExposure(callState.effect.intent.exposure.quantities)
       });
       if (settled.status !== 'settled' && settled.status !== 'already_settled') {
         throw new AgentOperationConflictError(runId, 'idempotency_conflict', `Tool effect ${input.effectId} settlement authority was rejected: ${settled.status}.`);
@@ -207,7 +212,13 @@ export class AgentOperationCoordinator {
       const state = decodeAgentOperationState({
         ...current.state,
         revision: current.state.revision + 1,
-        phase: { ...phase, stage: 'settled', effect: settled.state, settlement }
+        phase: {
+          ...phase,
+          callStates: replaceAt(phase.callStates, callIndex, {
+            stage: 'settled', preparation: callState.preparation, toolAttempt: callState.toolAttempt,
+            effect: settled.state, settlement
+          })
+        }
       });
       const result = await this.events.appendConditional(runId, { type: 'operation.transition', state }, {
         idempotencyKey: `${runId}:tool-effect:${input.effectId}:settled:${resultDigest}`,
@@ -260,6 +271,18 @@ export class AgentOperationDriver {
     });
   }
 
+  settleToolEffect(input: {
+    readonly effectId: string;
+    readonly permit: EffectSettlementPermit;
+    readonly settlement: AgentToolSettlementRecord;
+  }): Promise<AgentOperationInspection> {
+    return this.serial(async () => {
+      await new AgentOperationCoordinator(this.events).settleToolEffect(this.stateValue.runId, input);
+      await this.refresh();
+      return this.inspection();
+    });
+  }
+
   decideApproval(input: { readonly approvalId: string; readonly fingerprint: string; readonly decision: 'allow' | 'deny' }): Promise<AgentOperationInspection> {
     return this.serial(async () => {
       this.assertTransitionAuthority(this.stateValue.phase);
@@ -269,14 +292,17 @@ export class AgentOperationDriver {
       if (approval.fingerprint !== input.fingerprint) throw new TypeError(`Approval fingerprint mismatch for ${input.approvalId}.`);
       const phase: AgentOperationPhase = Object.freeze({
         kind: 'tools',
-        stage: 'ready',
         identity: this.stateValue.phase.identity,
         toolBatchId: this.stateValue.phase.toolBatchId,
         calls: this.stateValue.phase.calls,
-        nextCallIndex: this.stateValue.phase.nextCallIndex,
+        callStates: replaceAt(this.stateValue.phase.callStates, this.stateValue.phase.approvalCallIndex, Object.freeze({
+          stage: 'ready' as const,
+          approved: Object.freeze({ approval, decision: input.decision })
+        })),
+        maxConcurrency: this.stateValue.phase.maxConcurrency,
+        nextProjectionIndex: this.stateValue.phase.nextProjectionIndex,
         instructions: this.stateValue.phase.instructions,
-        modelInputModalities: this.stateValue.phase.modelInputModalities,
-        approved: Object.freeze({ approval, decision: input.decision })
+        modelInputModalities: this.stateValue.phase.modelInputModalities
       });
       return this.commitState({ phase });
     });
@@ -429,12 +455,12 @@ function advanceMatchesProcedure(procedure: Extract<AgentOperationInstruction, {
     case 'start_provider_request': return (phase.kind === 'provider' && phase.stage === 'effect_pending') || phase.kind === 'finalization';
     case 'reconcile_provider_request': return (phase.kind === 'provider' && (phase.stage === 'settled' || phase.stage === 'outcome_unknown')) || phase.kind === 'suspended';
     case 'consume_provider_settlement': return phase.kind === 'provider' || phase.kind === 'tools' || phase.kind === 'preparing' || phase.kind === 'verification' || phase.kind === 'disposition' || phase.kind === 'finalization';
-    case 'prepare_tool_call': return (phase.kind === 'tools' && (phase.stage === 'effect_ready' || phase.stage === 'settled' || phase.stage === 'complete')) || phase.kind === 'approval' || phase.kind === 'finalization';
-    case 'start_tool_call': return (phase.kind === 'tools' && (phase.stage === 'effect_ready' || phase.stage === 'effect_pending')) || phase.kind === 'suspended' || phase.kind === 'finalization';
-    case 'reconcile_tool_call': return (phase.kind === 'tools' && (phase.stage === 'effect_ready' || phase.stage === 'settled')) || phase.kind === 'approval' || phase.kind === 'suspended' || phase.kind === 'finalization';
-    case 'consume_tool_settlement': return (phase.kind === 'tools' && phase.stage === 'projecting') || phase.kind === 'finalization';
-    case 'project_tool_settlement': return phase.kind === 'tools' && (phase.stage === 'ready' || phase.stage === 'complete');
-    case 'advance_after_tools': return phase.kind === 'preparing' || phase.kind === 'verification' || phase.kind === 'disposition' || phase.kind === 'finalization';
+    case 'prepare_tool_call': return phase.kind === 'tools' || phase.kind === 'approval' || phase.kind === 'cancelling' || phase.kind === 'finalization';
+    case 'start_tool_call': return phase.kind === 'tools' || phase.kind === 'suspended' || phase.kind === 'cancelling' || phase.kind === 'finalization';
+    case 'reconcile_tool_call': return phase.kind === 'tools' || phase.kind === 'approval' || phase.kind === 'suspended' || phase.kind === 'cancelling' || phase.kind === 'finalization';
+    case 'prepare_tool_projection': return phase.kind === 'tools' || phase.kind === 'cancelling' || phase.kind === 'finalization';
+    case 'project_tool_settlement': return phase.kind === 'tools' || phase.kind === 'cancelling';
+    case 'advance_after_tools': return phase.kind === 'preparing' || phase.kind === 'verification' || phase.kind === 'disposition' || phase.kind === 'cancelling' || phase.kind === 'finalization';
     case 'prepare_verification': return phase.kind === 'verification' && (phase.stage === 'deterministic_pending' || phase.stage === 'effect_ready' || phase.stage === 'settled' || phase.stage === 'complete');
     case 'start_verification': return (phase.kind === 'verification' && phase.stage === 'effect_pending') || phase.kind === 'finalization';
     case 'reconcile_verification': return (phase.kind === 'verification' && phase.stage === 'settled') || phase.kind === 'suspended' || phase.kind === 'finalization';
@@ -444,4 +470,11 @@ function advanceMatchesProcedure(procedure: Extract<AgentOperationInstruction, {
     case 'reconcile_finalization': return phase.kind === 'finalization' || phase.kind === 'terminal';
     case 'finalize_abort': return phase.kind === 'cancelling' || phase.kind === 'finalization' || phase.kind === 'terminal';
   }
+}
+
+function replaceAt<T>(values: readonly T[], index: number, value: T): readonly T[] {
+  if (index < 0 || index >= values.length) throw new TypeError(`Cannot replace missing item ${String(index)}.`);
+  const next = [...values];
+  next[index] = value;
+  return Object.freeze(next);
 }

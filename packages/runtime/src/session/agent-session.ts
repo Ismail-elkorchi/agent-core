@@ -415,6 +415,6 @@ function errorMessage(error: unknown): string { return error instanceof Error ? 
 function operationSuspensionReason(phase: import('../operation/contracts.js').AgentOperationPhase): 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'missing_implementation' | 'user_decision' | undefined {
   if (phase.kind === 'suspended') return phase.reason;
   if (phase.kind === 'provider' && phase.stage === 'outcome_unknown') return 'provider_outcome_unknown';
-  if (phase.kind === 'tools' && phase.stage === 'effect_pending') return 'tool_outcome_unknown';
+  if (phase.kind === 'tools' && phase.callStates.some((call) => call.stage === 'outcome_unknown')) return 'tool_outcome_unknown';
   return undefined;
 }

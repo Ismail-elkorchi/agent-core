@@ -61,7 +61,6 @@ import {
 import {
   isToolAvailable,
   isCommandExecution,
-  encodeToolObservation,
   prepareToolCall,
   recoverPreparedToolCall,
   releasePreparedToolCall,
@@ -115,8 +114,9 @@ import { readProviderStateArtifact, storeProviderStateArtifact } from './orchest
 import { AgentLimitExceededError, AgentRunController } from './orchestration/run-controller.js';
 import { rebuildContextFromRepositories } from './orchestration/session-replay.js';
 import { executeAssistantToolCalls } from './orchestration/tool-execution.js';
-import { AgentOperationCoordinator, type AgentOperationAdvance, type AgentOperationDriver } from './operation/driver.js';
+import { AgentOperationConflictError, AgentOperationCoordinator, type AgentOperationAdvance, type AgentOperationDriver } from './operation/driver.js';
 import { nextAgentOperationInstruction, type AgentCheckPreparationRecord, type AgentOperationPhase, type AgentOperationProcedure, type AgentToolOperationPhase } from './operation/contracts.js';
+import type { AgentToolCallOperationState, AgentToolPreparationRecord } from './operation/tool-state.js';
 
 export type {
   AgentCheckContext,
@@ -241,7 +241,7 @@ type TerminalDecision =
   | { readonly executionStatus: 'aborted'; readonly terminationReason: 'aborted'; readonly candidate: AgentCandidate; readonly errorMessage: string; readonly turnCount: number; readonly checkResults: readonly AgentCheckResult[]; readonly diagnostic?: ModelProviderErrorDiagnostic & { readonly turnIndex?: number }; readonly cleanupDiagnostic?: { readonly kind: 'process_cleanup'; readonly message: string } };
 type ExecutionDecision = TerminalDecision
   | { readonly executionStatus: 'waiting_for_approval'; readonly approvals: readonly AgentApprovalRequest[] }
-  | { readonly executionStatus: 'waiting_for_recovery'; readonly reason: 'provider_outcome_unknown'; readonly effectId: string };
+  | { readonly executionStatus: 'waiting_for_recovery'; readonly reason: 'provider_outcome_unknown' | 'tool_outcome_unknown'; readonly effectId: string };
 
 interface ProviderExecutionContinuation {
   readonly identity: AgentTurnIdentity;
@@ -356,7 +356,7 @@ export class AgentRuntime {
     if (approval.binding.authorizationPolicyId !== this.options.toolBoundary.authorizationPolicyId || approval.binding.executionTargetId !== this.options.toolBoundary.executionTargetId) {
       throw new Error(`Approval boundary changed for ${input.approvalId}; a new approval is required.`);
     }
-    const call = phase.calls[phase.nextCallIndex];
+    const call = phase.calls[phase.approvalCallIndex];
     if (!call) throw new Error(`Approval ${input.approvalId} has no durable tool call.`);
     const authorizationContext = Object.freeze({
       ...this.toolContext(input.signal ?? new AbortController().signal),
@@ -390,6 +390,10 @@ export class AgentRuntime {
       fingerprint: approval.fingerprint, binding: approval.binding, decision: input.decision
     }, `${input.runId}:approval:${input.approvalId}:resolved`);
     await operation.decideApproval(input);
+    const recoverySignal = input.signal ?? new AbortController().signal;
+    if (!await this.reconcileDurableToolBatch(operation, recoverySignal)) {
+      return completedRunControl(input.runId, operationSuspension(operation.state()));
+    }
     return this.startRun(operationInput(operation.state(), input.signal), undefined, operation);
   }
 
@@ -496,23 +500,8 @@ export class AgentRuntime {
         const continuation = await this.providerExecutionContinuation(reconciledState);
         return await this.runInternal(operationInput(reconciledState), abortController.signal, operation, continuation, true);
       }
-      if (phase.kind === 'tools' && phase.stage === 'effect_ready') {
-        closeExternalEffect(phase.effect, 'cancelled_before_start');
-        const generation = operation.state().driverGeneration;
-        const reissued = issueEffectStartTicket({
-          intent: phase.effect.intent,
-          ticketId: `${phase.effect.intent.effectId}:start:${String(generation)}`,
-          settlementPermitId: `${phase.effect.intent.effectId}:settle:${String(generation)}`,
-          driverGeneration: generation,
-          currentDriverGeneration: generation
-        });
-        if (reissued.status !== 'issued') throw new Error(`Run ${runId} could not reissue its unstarted tool effect.`);
-        await this.advanceOperation(operation, 'start_tool_call', {
-          phase: { ...phase, effect: reissued.state },
-          ...(operation.state().budget ? { budget: operation.state().budget } : {})
-        });
-      } else if (phase.kind === 'tools' && phase.stage === 'effect_pending') {
-        if (!await this.reconcileStartedToolEffect(operation, phase, abortController.signal)) return operationSuspension(operation.state());
+      if (phase.kind === 'tools' && !await this.reconcileDurableToolBatch(operation, abortController.signal)) {
+        return operationSuspension(operation.state());
       }
       const recoverablePhase = operation.state().phase;
       if (recoverablePhase.kind !== 'accepted' && recoverablePhase.kind !== 'preparing' && recoverablePhase.kind !== 'tools' && recoverablePhase.kind !== 'verification') {
@@ -581,8 +570,6 @@ export class AgentRuntime {
       decision = cleanupFailureDecision(undefined, cleanupError);
     } else if (decision.executionStatus === 'waiting_for_recovery') {
       const cleanupError = await this.disposeOwnedProcesses(runId, append);
-      const state = operation.state();
-      if (state.phase.kind !== 'provider' || state.phase.stage !== 'outcome_unknown') throw new Error(`Run ${runId} lost its provider recovery state.`);
       return Object.freeze({
         state: 'suspended', reason: decision.reason, runId, finalizationId, effectId: decision.effectId,
         ...(cleanupError ? { cleanupDiagnostic: { kind: 'process_cleanup' as const, message: cleanupError.message } } : {}),
@@ -834,8 +821,10 @@ export class AgentRuntime {
         }
         await this.advanceOperation(runtime.operation, 'consume_provider_settlement', {
           phase: {
-            kind: 'tools', stage: 'ready', identity: activeTurnIdentity, toolBatchId, calls: toolCalls,
-            nextCallIndex: 0, instructions: Object.freeze([...effectiveInstructions]),
+            kind: 'tools', identity: activeTurnIdentity, toolBatchId, calls: toolCalls,
+            callStates: Object.freeze(toolCalls.map(() => Object.freeze({ stage: 'ready' as const }))),
+            maxConcurrency: runtime.controller.limits.maxConcurrentToolCalls, nextProjectionIndex: 0,
+            instructions: Object.freeze([...effectiveInstructions]),
             modelInputModalities: snapshot.profile.modalities.input
           },
           budget: runtime.controller.snapshot(),
@@ -851,7 +840,7 @@ export class AgentRuntime {
             ...(this.options.toolAuthorizer ? { authorizer: this.options.toolAuthorizer } : {}), contextManager, observationStore,
             ...(this.options.repositories.session ? { session: this.options.repositories.session } : {}), controller: runtime.controller,
             phase: () => runtime.operation.state().phase,
-            transition: (procedure, phase) => this.advanceOperation(runtime.operation, procedure, { phase, budget: runtime.controller.snapshot() }),
+            transition: (procedure, update) => this.advanceOperation(runtime.operation, procedure, (state) => ({ phase: update(state.phase), budget: runtime.controller.snapshot() })),
             settle: (settlement) => this.settleToolEffect(runtime.operation, settlement),
             append: runtime.append, emit: runtime.emit
           });
@@ -860,6 +849,7 @@ export class AgentRuntime {
           return { executionStatus: 'waiting_for_approval', approvals: toolResult.approvals };
         }
         if (toolResult.outcome === 'ownership_lost') throw new AgentOperationOwnershipLostError(runtime.runId);
+        if (toolResult.outcome === 'waiting_for_recovery') return toolRecoveryDecision(runtime.operation.state());
         await this.advanceOperation(runtime.operation, 'advance_after_tools', { phase: { kind: 'preparing', step: 'assemble_turn', turnIndex: turnIndex + 1 }, budget: runtime.controller.snapshot() });
         turnIndex += 1;
       }
@@ -1106,13 +1096,14 @@ export class AgentRuntime {
         ...(this.options.toolAuthorizer ? { authorizer: this.options.toolAuthorizer } : {}), contextManager, observationStore,
         ...(this.options.repositories.session ? { session: this.options.repositories.session } : {}), controller: runtime.controller,
         phase: () => runtime.operation.state().phase,
-        transition: (procedure, phase) => this.advanceOperation(runtime.operation, procedure, { phase, budget: runtime.controller.snapshot() }),
+        transition: (procedure, update) => this.advanceOperation(runtime.operation, procedure, (state) => ({ phase: update(state.phase), budget: runtime.controller.snapshot() })),
         settle: (settlement) => this.settleToolEffect(runtime.operation, settlement),
         append: runtime.append, emit: runtime.emit
       });
     } finally { toolDeadline.dispose(); }
     if (resumedTools.outcome === 'ownership_lost') throw new AgentOperationOwnershipLostError(runtime.runId);
     if (resumedTools.outcome === 'waiting_for_approval') return { executionStatus: 'waiting_for_approval', approvals: resumedTools.approvals };
+    if (resumedTools.outcome === 'waiting_for_recovery') return toolRecoveryDecision(runtime.operation.state());
     await this.advanceOperation(runtime.operation, 'advance_after_tools', { phase: { kind: 'preparing', step: 'assemble_turn', turnIndex: initial.identity.turnIndex + 1 }, budget: runtime.controller.snapshot() });
     return undefined;
   }
@@ -1516,13 +1507,13 @@ export class AgentRuntime {
   private async advanceOperation(
     operation: AgentOperationDriver,
     procedure: AgentOperationProcedure,
-    advance: AgentOperationAdvance
+    advance: AgentOperationAdvance | ((state: import('./operation/contracts.js').AgentOperationState) => AgentOperationAdvance)
   ): Promise<void> {
-    const result = await operation.drive(({ instruction }) => {
+    const result = await operation.drive(({ instruction, state }) => {
       if (instruction.procedure !== procedure) {
         throw new Error(`Durable operation expected ${instruction.procedure}, not ${procedure}, while in ${JSON.stringify(operation.state().phase)}.`);
       }
-      return advance;
+      return typeof advance === 'function' ? advance(state) : advance;
     });
     if (result.kind !== 'advanced') {
       throw new Error(`Durable operation cannot execute ${procedure} while it is ${result.kind}.`);
@@ -1532,9 +1523,7 @@ export class AgentRuntime {
     operation: AgentOperationDriver,
     input: Parameters<AgentOperationCoordinator['settleToolEffect']>[1]
   ): Promise<'owned' | 'ownership_lost'> {
-    const coordinator = new AgentOperationCoordinator(this.options.repositories.events);
-    await coordinator.settleToolEffect(operation.state().runId, input);
-    const synchronized = await operation.synchronize();
+    const synchronized = await operation.settleToolEffect(input);
     const control = synchronized.state.control;
     return (control.status === 'owned' || control.status === 'abort_requested') && control.driverId === operation.driverId
       ? 'owned'
@@ -1590,36 +1579,110 @@ export class AgentRuntime {
     if (candidate.status === 'absent') throw new Error(`Run ${runId} cannot verify an absent candidate.`);
     return Object.freeze({ response, candidate, instructions: Object.freeze([...instructions]) });
   }
+  private async reconcileDurableToolBatch(operation: AgentOperationDriver, signal: AbortSignal): Promise<boolean> {
+    const attempted = new Set<number>();
+    for (;;) {
+      const phase = operation.state().phase;
+      if (phase.kind !== 'tools') throw new Error(`Run ${operation.state().runId} lost its durable tool batch during recovery.`);
+      const callIndex = phase.callStates.findIndex((state, index) => !attempted.has(index) && (
+        ((state.stage === 'effect_ready' || state.stage === 'effect_pending') && state.effect.ticket.driverGeneration !== operation.state().driverGeneration)
+        || (state.stage === 'outcome_unknown' && state.effect.phase === 'started' && state.effect.intent.recovery.kind !== 'unknown')
+      ));
+      if (callIndex < 0) return !phase.callStates.some((state) => state.stage === 'outcome_unknown');
+      const callState = phase.callStates[callIndex];
+      if (callState?.stage === 'effect_ready') {
+        closeExternalEffect(callState.effect, 'cancelled_before_start');
+        const generation = operation.state().driverGeneration;
+        const reissued = issueEffectStartTicket({
+          intent: callState.effect.intent,
+          ticketId: `${callState.effect.intent.effectId}:start:${String(generation)}`,
+          settlementPermitId: `${callState.effect.intent.effectId}:settle:${String(generation)}`,
+          driverGeneration: generation,
+          currentDriverGeneration: generation
+        });
+        if (reissued.status !== 'issued') throw new Error(`Run ${operation.state().runId} could not reissue tool effect ${callState.effect.intent.effectId}.`);
+        try {
+          await this.advanceOperation(operation, 'reconcile_tool_call', (state) => ({
+            phase: replaceToolCallState(requireToolBatch(state.phase), callIndex, {
+              stage: 'effect_ready', preparation: callState.preparation, toolAttempt: callState.toolAttempt, effect: reissued.state
+            }),
+            ...(state.budget ? { budget: state.budget } : {})
+          }));
+        } catch (error) {
+          if (!(error instanceof AgentOperationConflictError) || error.reason !== 'stale_tail') throw error;
+        }
+        continue;
+      }
+      if (callState?.stage !== 'effect_pending' && callState?.stage !== 'outcome_unknown') throw new Error(`Run ${operation.state().runId} has contradictory tool recovery state.`);
+      const startedEffect = callState.effect;
+      if (startedEffect.phase !== 'started') throw new Error(`Run ${operation.state().runId} selected a closed tool outcome for recovery.`);
+      const startedCallState = Object.freeze({
+        stage: callState.stage,
+        preparation: callState.preparation,
+        toolAttempt: callState.toolAttempt,
+        effect: startedEffect
+      });
+      try {
+        if (await this.reconcileStartedToolEffect(operation, phase, callIndex, startedCallState, signal)) continue;
+      } catch (error) {
+        if (!(error instanceof AgentOperationConflictError) || error.reason !== 'stale_tail') throw error;
+        continue;
+      }
+      attempted.add(callIndex);
+      if (callState.stage === 'effect_pending') {
+        try {
+          await this.advanceOperation(operation, 'reconcile_tool_call', (state) => ({
+            phase: replaceToolCallState(requireToolBatch(state.phase), callIndex, {
+              stage: 'outcome_unknown', preparation: callState.preparation, toolAttempt: callState.toolAttempt, effect: callState.effect
+            }),
+            ...(state.budget ? { budget: state.budget } : {})
+          }));
+        } catch (error) {
+          if (!(error instanceof AgentOperationConflictError) || error.reason !== 'stale_tail') throw error;
+          const current = requireToolBatch(operation.state().phase).callStates[callIndex];
+          if (current?.stage === 'effect_pending') attempted.delete(callIndex);
+        }
+      }
+    }
+  }
+
   private async reconcileStartedToolEffect(
     operation: AgentOperationDriver,
-    phase: Extract<AgentToolOperationPhase, { readonly stage: 'effect_pending' }>,
+    phase: AgentToolOperationPhase,
+    callIndex: number,
+    callState: Readonly<{
+      readonly stage: 'effect_pending' | 'outcome_unknown';
+      readonly preparation: AgentToolPreparationRecord;
+      readonly toolAttempt: number;
+      readonly effect: Extract<import('@agent-core/effects').EffectExecutionState, { readonly phase: 'started' }>;
+    }>,
     signal: AbortSignal
   ): Promise<boolean> {
-    if (phase.effect.intent.recovery.kind === 'unknown') return false;
-    const call = phase.calls[phase.nextCallIndex];
-    if (!call) throw new Error(`Run ${operation.state().runId} has no tool call for effect ${phase.effect.intent.effectId}.`);
+    if (callState.effect.intent.recovery.kind === 'unknown') return false;
+    const call = phase.calls[callIndex];
+    if (!call) throw new Error(`Run ${operation.state().runId} has no tool call for effect ${callState.effect.intent.effectId}.`);
     const context = Object.freeze({
       ...this.toolContext(signal),
       invocation: Object.freeze({
         runId: operation.state().runId,
         ...phase.identity,
         toolBatchId: phase.toolBatchId,
-        callIndex: phase.nextCallIndex,
+        callIndex,
         ...(call.id ? { callId: call.id } : {}),
-        toolAttempt: phase.toolAttempt
+        toolAttempt: callState.toolAttempt
       })
     });
     const preparedResult = await prepareToolCall(call, this.tools, context);
     if (!preparedResult.ok) return false;
     const prepared = preparedResult.prepared;
     try {
-      if (prepared.toolImplementationId !== phase.preparation.toolImplementationId || prepared.fingerprint !== phase.preparation.fingerprint) return false;
-      const recovery = await recoverPreparedToolCall(prepared, phase.effect, {
+      if (prepared.toolImplementationId !== callState.preparation.toolImplementationId || prepared.fingerprint !== callState.preparation.fingerprint) return false;
+      const recovery = await recoverPreparedToolCall(prepared, callState.effect, {
         ...context,
         invocation: context.invocation
       });
       if (recovery.status === 'settled') {
-        if (phase.effect.intent.recovery.kind === 'preconditioned_reexecution') {
+        if (callState.effect.intent.recovery.kind === 'preconditioned_reexecution') {
           throw new Error('A preconditioned re-execution capability cannot claim a previous external settlement.');
         }
         const observationStore = new ObservationStore({ estimator: this.estimator, ...(this.options.repositories.artifacts ? { artifacts: this.options.repositories.artifacts } : {}) });
@@ -1631,42 +1694,40 @@ export class AgentRuntime {
           tool,
           observation: recovery.observation
         });
-        const settled = settleExternalEffect(phase.effect, phase.effect.settlementPermit, {
-          outcome: recovery.observation.ok ? 'succeeded' : 'failed',
-          resultDigest: hashJson(encodeToolObservation(committed.durableObservation)),
-          exposure: knownEffectExposure(phase.effect.intent.exposure.quantities)
-        });
-        if (settled.status !== 'settled' && settled.status !== 'already_settled') throw new Error(`Recovered tool effect ${phase.effect.intent.effectId} could not be settled.`);
-        await this.advanceOperation(operation, 'reconcile_tool_call', {
-          phase: {
-            ...phase,
-            stage: 'settled',
-            effect: settled.state,
-            settlement: { observationId: committed.id, observation: committed.durableObservation, createdAt: committed.createdAt }
-          },
-          ...(operation.state().budget ? { budget: operation.state().budget } : {})
-        });
+        const settlement = { observationId: committed.id, observation: committed.durableObservation, createdAt: committed.createdAt };
+        try {
+          await operation.settleToolEffect({ effectId: callState.effect.intent.effectId, permit: callState.effect.settlementPermit, settlement });
+        } catch (error) {
+          if (!(error instanceof AgentOperationConflictError)
+            || (error.reason !== 'stale_tail' && error.reason !== 'idempotency_conflict')) throw error;
+          const synchronized = await operation.synchronize();
+          const current = synchronized.state.phase.kind === 'tools' ? synchronized.state.phase.callStates[callIndex] : undefined;
+          if ((current?.stage !== 'settled' && current?.stage !== 'projecting' && current?.stage !== 'projected')
+            || current.effect?.intent.effectId !== callState.effect.intent.effectId) throw error;
+        }
         return true;
       }
       if (recovery.status !== 'reexecute') return false;
-      const capability = phase.effect.intent.recovery;
+      const capability = callState.effect.intent.recovery;
       if (capability.kind !== 'preconditioned_reexecution' || !sameResourcePreconditions(recovery.preconditions, capability.preconditions)) return false;
-      closeExternalEffect(phase.effect, 'unknown_outcome');
-      const toolAttempt = phase.toolAttempt + 1;
-      const effectId = `${operation.state().runId}:${phase.identity.turnId}:${phase.toolBatchId}:${String(phase.nextCallIndex)}:${String(toolAttempt)}`;
+      closeExternalEffect(callState.effect, 'unknown_outcome');
+      const toolAttempt = callState.toolAttempt + 1;
+      const effectId = `${operation.state().runId}:${phase.identity.turnId}:${phase.toolBatchId}:${String(callIndex)}:${String(toolAttempt)}`;
       const generation = operation.state().driverGeneration;
       const issued = issueEffectStartTicket({
-        intent: { ...phase.effect.intent, effectId },
+        intent: { ...callState.effect.intent, effectId },
         ticketId: `${effectId}:start:${String(generation)}`,
         settlementPermitId: `${effectId}:settle:${String(generation)}`,
         driverGeneration: generation,
         currentDriverGeneration: generation
       });
       if (issued.status !== 'issued') throw new Error(`Run ${operation.state().runId} could not issue a recovered tool effect.`);
-      await this.advanceOperation(operation, 'reconcile_tool_call', {
-        phase: { ...phase, stage: 'effect_ready', toolAttempt, effect: issued.state },
-        ...(operation.state().budget ? { budget: operation.state().budget } : {})
-      });
+      await this.advanceOperation(operation, 'reconcile_tool_call', (state) => ({
+        phase: replaceToolCallState(requireToolBatch(state.phase), callIndex, {
+          stage: 'effect_ready', preparation: callState.preparation, toolAttempt, effect: issued.state
+        }),
+        ...(state.budget ? { budget: state.budget } : {})
+      }));
       return true;
     } finally {
       await releasePreparedToolCall(prepared);
@@ -1707,6 +1768,13 @@ export class AgentRuntime {
       const next = nextAgentOperationInstruction(state);
       if (next.kind !== 'execute') throw new Error(`Run ${state.runId} requires ${next.kind === 'wait' ? next.reason : 'completion'} instead of finalization.`);
       const instruction = next.procedure;
+      if (state.phase.kind === 'tools') {
+        await this.advanceOperation(operation, instruction, {
+          phase: { kind: 'cancelling', stage: 'requested', toolBatch: closeOpenToolCalls(state.phase) },
+          budget
+        });
+        continue;
+      }
       switch (instruction) {
         case 'prepare':
         case 'assemble_turn':
@@ -1714,7 +1782,8 @@ export class AgentRuntime {
         case 'consume_provider_settlement':
         case 'prepare_tool_call':
         case 'reconcile_tool_call':
-        case 'consume_tool_settlement':
+        case 'prepare_tool_projection':
+        case 'project_tool_settlement':
         case 'advance_after_tools':
         case 'consume_verification_settlement':
         case 'decide_candidate':
@@ -1727,12 +1796,7 @@ export class AgentRuntime {
           await this.advanceOperation(operation, instruction, { phase: { kind: 'finalization', stage: 'ready' }, budget });
           continue;
         }
-        case 'start_tool_call': {
-          if (state.phase.kind !== 'tools' || state.phase.stage !== 'effect_ready') throw new Error(`Run ${state.runId} has contradictory tool start state.`);
-          closeExternalEffect(state.phase.effect, 'cancelled_before_start');
-          await this.advanceOperation(operation, instruction, { phase: { kind: 'finalization', stage: 'ready' }, budget });
-          continue;
-        }
+        case 'start_tool_call': throw new Error(`Run ${state.runId} has a tool start instruction outside a tool batch.`);
         case 'reconcile_provider_request': throw new Error(`Run ${state.runId} has an unresolved started provider effect and cannot finalize it as a local failure.`);
         case 'prepare_verification':
           if (state.phase.kind !== 'verification') throw new Error(`Run ${state.runId} has contradictory verification preparation state.`);
@@ -1749,10 +1813,6 @@ export class AgentRuntime {
         case 'reconcile_verification':
           if (state.phase.kind === 'verification' && state.phase.stage === 'effect_pending') throw new Error(`Run ${state.runId} has an unresolved verifier effect and cannot finalize it as a local failure.`);
           await this.advanceOperation(operation, instruction, { phase: { kind: 'finalization', stage: 'ready' }, budget });
-          continue;
-        case 'project_tool_settlement':
-          if (state.phase.kind !== 'tools') throw new Error(`Run ${state.runId} has a contradictory tool projection instruction.`);
-          await this.advanceOperation(operation, instruction, { phase: { kind: 'tools', stage: 'complete', identity: state.phase.identity, toolBatchId: state.phase.toolBatchId, calls: state.phase.calls, nextCallIndex: state.phase.calls.length, instructions: state.phase.instructions, modelInputModalities: state.phase.modelInputModalities }, budget });
           continue;
         case 'finalize': return;
         case 'reconcile_finalization': return;
@@ -2145,7 +2205,10 @@ function operationSuspension(state: import('./operation/contracts.js').AgentOper
   if (!state.budget) throw new Error(`Run ${state.runId} has no durable budget at its suspension boundary.`);
   const phase = state.phase;
   if (phase.kind === 'provider' && phase.stage === 'outcome_unknown') return Object.freeze({ state: 'suspended', reason: 'provider_outcome_unknown', runId: state.runId, finalizationId: state.finalizationId, effectId: phase.effect.intent.effectId, budget: state.budget });
-  if (phase.kind === 'tools' && phase.stage === 'effect_pending') return Object.freeze({ state: 'suspended', reason: 'tool_outcome_unknown', runId: state.runId, finalizationId: state.finalizationId, effectId: phase.effect.intent.effectId, budget: state.budget });
+  if (phase.kind === 'tools') {
+    const unknown = phase.callStates.find((call) => call.stage === 'outcome_unknown');
+    if (unknown?.stage === 'outcome_unknown') return Object.freeze({ state: 'suspended', reason: 'tool_outcome_unknown', runId: state.runId, finalizationId: state.finalizationId, effectId: unknown.effect.intent.effectId, budget: state.budget });
+  }
   if (phase.kind !== 'suspended') throw new Error(`Run ${state.runId} is not suspended.`);
   return Object.freeze({
     state: 'suspended',
@@ -2154,6 +2217,43 @@ function operationSuspension(state: import('./operation/contracts.js').AgentOper
     finalizationId: state.finalizationId,
     ...(phase.effectId ? { effectId: phase.effectId } : {}),
     budget: state.budget
+  });
+}
+function toolRecoveryDecision(state: import('./operation/contracts.js').AgentOperationState): Extract<ExecutionDecision, { readonly executionStatus: 'waiting_for_recovery' }> {
+  const phase = requireToolBatch(state.phase);
+  const unknown = phase.callStates.find((call) => call.stage === 'outcome_unknown');
+  if (unknown?.stage !== 'outcome_unknown') throw new Error(`Run ${state.runId} has no unknown tool outcome.`);
+  return Object.freeze({ executionStatus: 'waiting_for_recovery', reason: 'tool_outcome_unknown', effectId: unknown.effect.intent.effectId });
+}
+function requireToolBatch(phase: AgentOperationPhase): AgentToolOperationPhase {
+  if (phase.kind !== 'tools') throw new Error('Operation does not retain a tool batch.');
+  return phase;
+}
+function replaceToolCallState(phase: AgentToolOperationPhase, callIndex: number, callState: AgentToolCallOperationState): AgentToolOperationPhase {
+  if (callIndex < 0 || callIndex >= phase.callStates.length) throw new Error(`Tool call state ${String(callIndex)} is missing.`);
+  const callStates = [...phase.callStates];
+  callStates[callIndex] = callState;
+  return Object.freeze({ ...phase, callStates: Object.freeze(callStates) });
+}
+function closeOpenToolCalls(phase: AgentToolOperationPhase): AgentToolOperationPhase {
+  return Object.freeze({
+    ...phase,
+    callStates: Object.freeze(phase.callStates.map((call): AgentToolCallOperationState => {
+      if (call.stage === 'ready') return Object.freeze({ stage: 'cancelled', toolAttempt: 1 });
+      if (call.stage === 'effect_ready') return Object.freeze({
+        stage: 'cancelled', preparation: call.preparation, toolAttempt: call.toolAttempt,
+        effect: closeExternalEffect(call.effect, 'cancelled_before_start')
+      });
+      if (call.stage === 'effect_pending') return Object.freeze({
+        stage: 'outcome_unknown', preparation: call.preparation, toolAttempt: call.toolAttempt,
+        effect: closeExternalEffect(call.effect, 'unknown_outcome')
+      });
+      if (call.stage === 'outcome_unknown' && call.effect.phase === 'started') return Object.freeze({
+        stage: 'outcome_unknown', preparation: call.preparation, toolAttempt: call.toolAttempt,
+        effect: closeExternalEffect(call.effect, 'unknown_outcome')
+      });
+      return call;
+    }))
   });
 }
 function missingImplementationSuspension(state: import('./operation/contracts.js').AgentOperationState): AgentRunResult {

@@ -4,6 +4,7 @@ import {
   decodeOwnedToolEffects,
   decodeOwnedToolObservationForPersistence,
   decodeToolCall,
+  effectsConflict,
   encodeToolObservation,
   type ToolCall,
   type ToolEffects,
@@ -33,21 +34,28 @@ interface AgentToolBatchBase {
   readonly identity: AgentTurnIdentity;
   readonly toolBatchId: string;
   readonly calls: readonly ToolCall[];
-  readonly nextCallIndex: number;
+  readonly callStates: readonly AgentToolCallOperationState[];
+  readonly maxConcurrency: number;
+  readonly nextProjectionIndex: number;
   readonly instructions: readonly AgentEffectiveInstruction[];
   readonly modelInputModalities: readonly string[];
 }
 
-export type AgentToolOperationPhase =
-  | Readonly<AgentToolBatchBase & { readonly stage: 'ready'; readonly approved?: Readonly<{ readonly approval: AgentApprovalRequest; readonly decision: 'allow' | 'deny' }> }>
-  | Readonly<AgentToolBatchBase & { readonly stage: 'effect_ready'; readonly preparation: AgentToolPreparationRecord; readonly toolAttempt: number; readonly effect: Extract<EffectExecutionState, { readonly phase: 'ticket_issued' }> }>
-  | Readonly<AgentToolBatchBase & { readonly stage: 'effect_pending'; readonly preparation: AgentToolPreparationRecord; readonly toolAttempt: number; readonly effect: Extract<EffectExecutionState, { readonly phase: 'started' }> }>
-  | Readonly<AgentToolBatchBase & { readonly stage: 'settled'; readonly preparation?: AgentToolPreparationRecord; readonly toolAttempt: number; readonly effect?: Extract<EffectExecutionState, { readonly phase: 'settled' }>; readonly settlement: AgentToolSettlementRecord }>
-  | Readonly<AgentToolBatchBase & { readonly stage: 'projecting'; readonly preparation?: AgentToolPreparationRecord; readonly toolAttempt: number; readonly effect?: Extract<EffectExecutionState, { readonly phase: 'settled' }>; readonly settlement: AgentToolSettlementRecord }>
-  | Readonly<AgentToolBatchBase & { readonly stage: 'complete' }>;
+export type AgentToolCallOperationState =
+  | Readonly<{ readonly stage: 'ready'; readonly approved?: Readonly<{ readonly approval: AgentApprovalRequest; readonly decision: 'allow' | 'deny' }> }>
+  | Readonly<{ readonly stage: 'effect_ready'; readonly preparation: AgentToolPreparationRecord; readonly toolAttempt: number; readonly effect: Extract<EffectExecutionState, { readonly phase: 'ticket_issued' }> }>
+  | Readonly<{ readonly stage: 'effect_pending'; readonly preparation: AgentToolPreparationRecord; readonly toolAttempt: number; readonly effect: Extract<EffectExecutionState, { readonly phase: 'started' }> }>
+  | Readonly<{ readonly stage: 'settled'; readonly preparation?: AgentToolPreparationRecord; readonly toolAttempt: number; readonly effect?: Extract<EffectExecutionState, { readonly phase: 'settled' }>; readonly settlement: AgentToolSettlementRecord }>
+  | Readonly<{ readonly stage: 'projecting'; readonly preparation?: AgentToolPreparationRecord; readonly toolAttempt: number; readonly effect?: Extract<EffectExecutionState, { readonly phase: 'settled' }>; readonly settlement: AgentToolSettlementRecord }>
+  | Readonly<{ readonly stage: 'projected'; readonly preparation?: AgentToolPreparationRecord; readonly toolAttempt: number; readonly effect?: Extract<EffectExecutionState, { readonly phase: 'settled' }>; readonly settlement: AgentToolSettlementRecord }>
+  | Readonly<{ readonly stage: 'outcome_unknown'; readonly preparation: AgentToolPreparationRecord; readonly toolAttempt: number; readonly effect: Extract<EffectExecutionState, { readonly phase: 'started' | 'closed' }> }>
+  | Readonly<{ readonly stage: 'cancelled'; readonly preparation?: AgentToolPreparationRecord; readonly toolAttempt: number; readonly effect?: Extract<EffectExecutionState, { readonly phase: 'closed' }> }>;
+
+export type AgentToolOperationPhase = Readonly<AgentToolBatchBase>;
 
 export type AgentApprovalOperationPhase = Readonly<Omit<AgentToolBatchBase, 'kind'> & {
   readonly kind: 'approval';
+  readonly approvalCallIndex: number;
   readonly preparation: AgentToolPreparationRecord;
   readonly approval: AgentApprovalRequest;
 }>;
@@ -57,39 +65,65 @@ export function decodeToolOperationPhase(value: unknown): AgentToolOperationPhas
   const kind = enumeration(phase.kind, ['tools', 'approval'] as const, 'phase.kind');
   const common = decodeCommon(phase);
   if (kind === 'approval') {
-    exact(phase, [...COMMON_FIELDS, 'kind', 'preparation', 'approval']);
+    exact(phase, [...COMMON_FIELDS, 'kind', 'approvalCallIndex', 'preparation', 'approval']);
+    const approvalCallIndex = nonnegativeInteger(phase.approvalCallIndex, 'phase.approvalCallIndex');
     const preparation = decodePreparation(phase.preparation);
     const approval = decodeApproval(phase.approval);
-    assertCurrentCall(common, approval.callIndex, approval.callId, approval.toolBatchId, approval.turnIndex, approval.turnId, approval.requestAttempt);
+    assertApprovalCall(common, approvalCallIndex, approval.callIndex, approval.callId, approval.toolBatchId, approval.turnIndex, approval.turnId, approval.requestAttempt);
+    assertToolDependencies(preparation.effects, approvalCallIndex, common.calls.length);
     if (approval.fingerprint !== preparation.fingerprint || approval.binding.toolImplementationId !== preparation.toolImplementationId) {
       throw new TypeError('Approval identity does not match its prepared tool call.');
     }
-    return Object.freeze({ kind, ...common, preparation, approval });
+    return Object.freeze({ kind, ...common, approvalCallIndex, preparation, approval });
   }
-  const stage = enumeration(phase.stage, ['ready', 'effect_ready', 'effect_pending', 'settled', 'projecting', 'complete'] as const, 'phase.stage');
-  exact(phase, [...COMMON_FIELDS, 'kind', 'stage', 'approved', 'preparation', 'toolAttempt', 'effect', 'settlement']);
+  exact(phase, [...COMMON_FIELDS, 'kind']);
+  return Object.freeze({ kind, ...common });
+}
+
+function decodeCallState(value: unknown, callIndex: number, callCount: number): AgentToolCallOperationState {
+  const state = object(value, `tool call state ${String(callIndex)}`);
+  const stage = enumeration(state.stage, ['ready', 'effect_ready', 'effect_pending', 'settled', 'projecting', 'projected', 'outcome_unknown', 'cancelled'] as const, `callStates[${String(callIndex)}].stage`);
+  exact(state, ['stage', 'approved', 'preparation', 'toolAttempt', 'effect', 'settlement']);
   if (stage === 'ready') {
-    const approved = phase.approved === undefined ? undefined : decodeApproved(phase.approved);
-    return Object.freeze({ kind, stage, ...common, ...(approved ? { approved } : {}) });
+    const approved = state.approved === undefined ? undefined : decodeApproved(state.approved);
+    if (approved && approved.approval.callIndex !== callIndex) throw new TypeError('Stored approval decision does not match its tool-call index.');
+    return Object.freeze({ stage, ...(approved ? { approved } : {}) });
   }
-  if (stage === 'complete') {
-    if (common.nextCallIndex !== common.calls.length) throw new TypeError('A complete tool batch must have projected every call.');
-    return Object.freeze({ kind, stage, ...common });
-  }
-  const toolAttempt = positiveInteger(phase.toolAttempt, 'phase.toolAttempt');
-  const preparation = phase.preparation === undefined ? undefined : decodePreparation(phase.preparation);
-  const effect = phase.effect === undefined ? undefined : decodeEffectExecutionState(phase.effect);
+  const toolAttempt = positiveInteger(state.toolAttempt, `callStates[${String(callIndex)}].toolAttempt`);
+  const preparation = state.preparation === undefined ? undefined : decodePreparation(state.preparation);
+  const effect = state.effect === undefined ? undefined : decodeEffectExecutionState(state.effect);
   if (stage === 'effect_ready') {
     if (!preparation || effect?.phase !== 'ticket_issued') throw new TypeError('An effect-ready tool call requires preparation and an issued ticket.');
+    assertToolDependencies(preparation.effects, callIndex, callCount);
     assertEffectMatchesPreparation(effect, preparation);
-    return Object.freeze({ kind, stage, ...common, preparation, toolAttempt, effect });
+    return Object.freeze({ stage, preparation, toolAttempt, effect });
   }
   if (stage === 'effect_pending') {
     if (!preparation || effect?.phase !== 'started') throw new TypeError('An effect-pending tool call requires preparation and a started effect.');
+    assertToolDependencies(preparation.effects, callIndex, callCount);
     assertEffectMatchesPreparation(effect, preparation);
-    return Object.freeze({ kind, stage, ...common, preparation, toolAttempt, effect });
+    return Object.freeze({ stage, preparation, toolAttempt, effect });
   }
-  const settlement = decodeAgentToolSettlementRecord(phase.settlement);
+  if (stage === 'outcome_unknown') {
+    if (!preparation || (effect?.phase !== 'started' && effect?.phase !== 'closed')
+      || (effect.phase === 'closed' && effect.closure.reason === 'cancelled_before_start')) {
+      throw new TypeError('An unknown tool outcome requires preparation and an outstanding or explicitly closed started effect.');
+    }
+    assertToolDependencies(preparation.effects, callIndex, callCount);
+    assertEffectMatchesPreparation(effect, preparation);
+    return Object.freeze({ stage, preparation, toolAttempt, effect });
+  }
+  if (stage === 'cancelled') {
+    if (effect !== undefined && (effect.phase !== 'closed' || effect.closure.reason !== 'cancelled_before_start')) {
+      throw new TypeError('A cancelled tool call may retain only an effect closed before start.');
+    }
+    if (effect && !preparation) throw new TypeError('A cancelled external tool effect requires its preparation record.');
+    if (preparation) assertToolDependencies(preparation.effects, callIndex, callCount);
+    if (effect && preparation) assertEffectMatchesPreparation(effect, preparation);
+    return Object.freeze({ stage, ...(preparation ? { preparation } : {}), toolAttempt, ...(effect ? { effect } : {}) });
+  }
+  const settlement = decodeAgentToolSettlementRecord(state.settlement);
+  if (preparation) assertToolDependencies(preparation.effects, callIndex, callCount);
   if (effect !== undefined && effect.phase !== 'settled') throw new TypeError('A settled tool call may retain only a settled external effect.');
   if (effect && !preparation) throw new TypeError('A settled external tool effect requires its preparation record.');
   if (effect && preparation) assertEffectMatchesPreparation(effect, preparation);
@@ -97,28 +131,65 @@ export function decodeToolOperationPhase(value: unknown): AgentToolOperationPhas
   if (effect && effect.settlement.resultDigest !== hashJson(encodeToolObservation(settlement.observation))) {
     throw new TypeError('External effect settlement does not match the durable tool observation.');
   }
-  if (stage === 'settled') return Object.freeze({ kind, stage, ...common, ...(preparation ? { preparation } : {}), toolAttempt, ...(effect ? { effect } : {}), settlement });
-  return Object.freeze({ kind, stage, ...common, ...(preparation ? { preparation } : {}), toolAttempt, ...(effect ? { effect } : {}), settlement });
+  return Object.freeze({ stage, ...(preparation ? { preparation } : {}), toolAttempt, ...(effect ? { effect } : {}), settlement });
 }
 
-const COMMON_FIELDS = ['identity', 'toolBatchId', 'calls', 'nextCallIndex', 'instructions', 'modelInputModalities'] as const;
+const COMMON_FIELDS = ['identity', 'toolBatchId', 'calls', 'callStates', 'maxConcurrency', 'nextProjectionIndex', 'instructions', 'modelInputModalities'] as const;
 
 function decodeCommon(value: JsonObject): Omit<AgentToolBatchBase, 'kind'> {
   const calls = array(value.calls, 'phase.calls').map((call) => decodeToolCall(call));
-  const nextCallIndex = nonnegativeInteger(value.nextCallIndex, 'phase.nextCallIndex');
-  if (nextCallIndex > calls.length) throw new TypeError('phase.nextCallIndex exceeds the tool-call count.');
+  const callStates = array(value.callStates, 'phase.callStates').map((state, index) => decodeCallState(state, index, calls.length));
+  if (callStates.length !== calls.length) throw new TypeError('phase.callStates must contain exactly one state per tool call.');
+  const maxConcurrency = positiveInteger(value.maxConcurrency, 'phase.maxConcurrency');
+  const nextProjectionIndex = nonnegativeInteger(value.nextProjectionIndex, 'phase.nextProjectionIndex');
+  if (nextProjectionIndex > calls.length) throw new TypeError('phase.nextProjectionIndex exceeds the tool-call count.');
+  for (const [index, state] of callStates.entries()) {
+    if (index < nextProjectionIndex && state.stage !== 'projected') throw new TypeError('Every tool call before nextProjectionIndex must be projected.');
+    if (index >= nextProjectionIndex && state.stage === 'projected') throw new TypeError('A tool call cannot be projected beyond the contiguous projection prefix.');
+  }
   return Object.freeze({
     identity: decodeTurnIdentity(value.identity),
     toolBatchId: identifier(value.toolBatchId, 'phase.toolBatchId'),
     calls: Object.freeze(calls),
-    nextCallIndex,
+    callStates: Object.freeze(callStates),
+    maxConcurrency,
+    nextProjectionIndex,
     instructions: Object.freeze(array(value.instructions, 'phase.instructions').map((item, index) => decodeInstruction(item, `phase.instructions[${String(index)}]`))),
     modelInputModalities: uniqueStrings(value.modelInputModalities, 'phase.modelInputModalities')
   });
 }
 
-function assertCurrentCall(
+export function nextStartableToolCallIndex(phase: AgentToolOperationPhase, driverGeneration: number): number | undefined {
+  const active = phase.callStates.flatMap((state, index) => state.stage === 'effect_pending'
+    || (state.stage === 'outcome_unknown' && state.effect.phase === 'started')
+    ? [{ index, preparation: state.preparation }]
+    : []);
+  if (active.length >= phase.maxConcurrency) return undefined;
+  for (const [index, state] of phase.callStates.entries()) {
+    if (state.stage !== 'effect_ready') continue;
+    if (state.effect.ticket.driverGeneration !== driverGeneration) continue;
+    const dependencies = state.preparation.effects.dependsOnCallIndices ?? [];
+    if (dependencies.some((dependency) => {
+      const dependencyState = phase.callStates[dependency];
+      return dependencyState?.stage !== 'settled' && dependencyState?.stage !== 'projected';
+    })) continue;
+    if (active.some((running) => effectsConflict(running.preparation.effects, state.preparation.effects))) continue;
+    return index;
+  }
+  return undefined;
+}
+
+function assertToolDependencies(effects: ToolEffects, callIndex: number, callCount: number): void {
+  for (const dependency of effects.dependsOnCallIndices ?? []) {
+    if (dependency >= callIndex || dependency >= callCount) {
+      throw new TypeError(`Tool call ${String(callIndex)} has invalid dependency ${String(dependency)}.`);
+    }
+  }
+}
+
+function assertApprovalCall(
   common: Omit<AgentToolBatchBase, 'kind'>,
+  approvalCallIndex: number,
   callIndex: number,
   callId: string | undefined,
   toolBatchId: string,
@@ -126,10 +197,11 @@ function assertCurrentCall(
   turnId: string,
   requestAttempt: number
 ): void {
-  const call = common.calls[common.nextCallIndex];
-  if (!call || callIndex !== common.nextCallIndex || call.id !== callId || toolBatchId !== common.toolBatchId
+  const call = common.calls[approvalCallIndex];
+  const state = common.callStates[approvalCallIndex];
+  if (!call || state?.stage !== 'ready' || callIndex !== approvalCallIndex || call.id !== callId || toolBatchId !== common.toolBatchId
     || turnIndex !== common.identity.turnIndex || turnId !== common.identity.turnId || requestAttempt !== common.identity.requestAttempt) {
-    throw new TypeError('Approval identity does not match the current durable tool call.');
+    throw new TypeError('Approval identity does not match its durable tool call.');
   }
 }
 

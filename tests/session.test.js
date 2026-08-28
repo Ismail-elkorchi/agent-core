@@ -279,9 +279,9 @@ async function acceptApprovalOperation(operations, runId) {
   const binding = { toolImplementationId: 'test/write@1', authorizationPolicyId: 'test-policy', executionTargetId: 'test-target' };
   const preparation = { toolImplementationId: binding.toolImplementationId, canonicalInput: {}, fingerprint: '2'.repeat(64), effects, binding, authorization: 'require_approval', authorizationReason: 'confirm' };
   const approval = { runId, ...identity, toolBatchId: 'batch', callIndex: 0, callId: 'call', approvalId: 'approval', status: 'pending', toolName: 'write', fingerprint: preparation.fingerprint, input: {}, effects, binding, policyHash: '3'.repeat(64), reason: 'confirm' };
-  const batch = { identity, toolBatchId: 'batch', calls: [call], nextCallIndex: 0, instructions: [], modelInputModalities: ['text'] };
-  await advance('consume_provider_settlement', { kind: 'tools', stage: 'ready', ...batch });
-  await advance('prepare_tool_call', { kind: 'approval', ...batch, preparation, approval });
+  const batch = { identity, toolBatchId: 'batch', calls: [call], callStates: [{ stage: 'ready' }], maxConcurrency: 1, nextProjectionIndex: 0, instructions: [], modelInputModalities: ['text'] };
+  await advance('consume_provider_settlement', { kind: 'tools', ...batch });
+  await advance('prepare_tool_call', { kind: 'approval', ...batch, approvalCallIndex: 0, preparation, approval });
 }
 
 test('AgentSession serializes admission, preserves steering identity, and snapshots configuration at submission', async () => {

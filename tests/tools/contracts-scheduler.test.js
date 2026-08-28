@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import * as z from 'zod';
 import { adoptToolDefinition, beginToolInvocation, createToolCall, defineTool, parseToolObservation, prepareToolCall, releasePreparedToolCall, releaseToolInvocation, ResourceLeaseCoordinator, startPreparedToolCall } from '@agent-core/tools';
 import { issueEffectStartTicket, NO_EFFECT_EXPOSURE, startExternalEffect } from '@agent-core/effects';
-import { scheduleToolCalls } from '@agent-core/runtime';
 import {
   applyPatchTool,
   execCommandTool,
@@ -140,23 +139,6 @@ function effectFor(prepared, generation) {
   assert.equal(issued.status, 'issued');
   return issued.state;
 }
-
-test('scheduler uses resource accesses and locks, never recovery capability, for conflicts', () => {
-  const call = (callIndex, accesses, lockScopes = [], recovery = { kind: 'unknown' }, dependsOnCallIndices) => ({
-    callIndex,
-    effects: { accesses, lockScopes, recovery, ...(dependsOnCallIndices ? { dependsOnCallIndices } : {}) },
-    value: callIndex
-  });
-  const waves = scheduleToolCalls([
-    call(0, [{ mode: 'read', scope: 'workspace/files/a' }]),
-    call(1, [{ mode: 'read', scope: 'workspace/files/a' }]),
-    call(2, [{ mode: 'write', scope: 'workspace/files/a' }]),
-    call(3, [{ mode: 'read', scope: 'workspace/files/b' }], ['database/index']),
-    call(4, [{ mode: 'read', scope: 'workspace/files/c' }], ['database/index']),
-    call(5, [{ mode: 'read', scope: 'workspace/files/d' }], [], { kind: 'unknown' }, [2])
-  ], 8);
-  assert.deepEqual(waves.map((wave) => wave.map((item) => item.callIndex)), [[0, 1, 3], [2, 4], [5]]);
-});
 
 test('runtime resource leases span batches until a running process exits', async () => {
   const coordinator = new ResourceLeaseCoordinator();

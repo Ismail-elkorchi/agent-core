@@ -3,7 +3,7 @@ import { decodeEffectExecutionState, decodeEffectRecoveryCapability, type Effect
 import { decodeOwnedAgentCheckResult, type AgentCheckResult, type AgentRunBudgetState, type AgentTurnIdentity } from '../run/contracts.js';
 import { decodeContextItemInput, type ContextItemInput } from '../context/manager.js';
 import { decodeToolCall, type ToolCall } from '@agent-core/tools';
-import { decodeToolOperationPhase, type AgentApprovalOperationPhase, type AgentToolOperationPhase } from './tool-state.js';
+import { decodeToolOperationPhase, nextStartableToolCallIndex, type AgentApprovalOperationPhase, type AgentToolOperationPhase } from './tool-state.js';
 
 export type { AgentApprovalOperationPhase, AgentToolOperationPhase, AgentToolPreparationRecord, AgentToolSettlementRecord } from './tool-state.js';
 
@@ -85,7 +85,7 @@ export type AgentOperationPhase =
       readonly reason: 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'missing_implementation' | 'user_decision';
       readonly effectId?: string;
     }>
-  | Readonly<{ readonly kind: 'cancelling'; readonly stage: 'requested' | 'finalizing' }>
+  | Readonly<{ readonly kind: 'cancelling'; readonly stage: 'requested' | 'finalizing'; readonly toolBatch?: AgentToolOperationPhase }>
   | Readonly<{ readonly kind: 'terminal'; readonly resultEventId: string }>;
 
 export interface AgentOperationState {
@@ -111,7 +111,7 @@ export type AgentOperationProcedure =
   | 'prepare_tool_call'
   | 'start_tool_call'
   | 'reconcile_tool_call'
-  | 'consume_tool_settlement'
+  | 'prepare_tool_projection'
   | 'project_tool_settlement'
   | 'advance_after_tools'
   | 'prepare_verification'
@@ -142,12 +142,20 @@ export function nextAgentOperationInstruction(state: AgentOperationState): Agent
       if (state.phase.stage === 'settled') return Object.freeze({ kind: 'execute', procedure: 'consume_provider_settlement' });
       return Object.freeze({ kind: 'wait', reason: 'external_outcome' });
     case 'tools':
-      if (state.phase.stage === 'ready') return Object.freeze({ kind: 'execute', procedure: 'prepare_tool_call' });
-      if (state.phase.stage === 'effect_ready') return Object.freeze({ kind: 'execute', procedure: 'start_tool_call' });
-      if (state.phase.stage === 'effect_pending') return Object.freeze({ kind: 'execute', procedure: 'reconcile_tool_call' });
-      if (state.phase.stage === 'settled') return Object.freeze({ kind: 'execute', procedure: 'consume_tool_settlement' });
-      if (state.phase.stage === 'projecting') return Object.freeze({ kind: 'execute', procedure: 'project_tool_settlement' });
-      return Object.freeze({ kind: 'execute', procedure: 'advance_after_tools' });
+      if (state.phase.nextProjectionIndex === state.phase.calls.length) return Object.freeze({ kind: 'execute', procedure: 'advance_after_tools' });
+      if (state.phase.callStates[state.phase.nextProjectionIndex]?.stage === 'projecting') return Object.freeze({ kind: 'execute', procedure: 'project_tool_settlement' });
+      if (state.phase.callStates.some((call) => (call.stage === 'effect_ready' || call.stage === 'effect_pending')
+        && call.effect.ticket.driverGeneration !== state.driverGeneration)
+        || state.phase.callStates.some((call) => call.stage === 'outcome_unknown' && call.effect.phase === 'started'
+          && call.effect.intent.recovery.kind !== 'unknown' && call.effect.ticket.driverGeneration !== state.driverGeneration)) {
+        return Object.freeze({ kind: 'execute', procedure: 'reconcile_tool_call' });
+      }
+      if (state.phase.callStates.some((call) => call.stage === 'ready')) return Object.freeze({ kind: 'execute', procedure: 'prepare_tool_call' });
+      if (nextStartableToolCallIndex(state.phase, state.driverGeneration) !== undefined) return Object.freeze({ kind: 'execute', procedure: 'start_tool_call' });
+      if (state.phase.callStates[state.phase.nextProjectionIndex]?.stage === 'settled') return Object.freeze({ kind: 'execute', procedure: 'prepare_tool_projection' });
+      if (state.phase.callStates.some((call) => call.stage === 'effect_pending')) return Object.freeze({ kind: 'execute', procedure: 'reconcile_tool_call' });
+      if (state.phase.callStates.some((call) => call.stage === 'outcome_unknown')) return Object.freeze({ kind: 'wait', reason: 'external_outcome' });
+      throw new TypeError('Tool batch has no executable operation instruction.');
     case 'approval': return Object.freeze({ kind: 'wait', reason: 'approval' });
     case 'verification':
       if (state.phase.stage === 'ready') return Object.freeze({ kind: 'execute', procedure: 'prepare_verification' });
@@ -342,12 +350,25 @@ function decodePhase(value: unknown): AgentOperationPhase {
       return Object.freeze({ kind, reason: enumeration(phase.reason, ['provider_outcome_unknown', 'tool_outcome_unknown', 'missing_implementation', 'user_decision'] as const, 'phase.reason'), ...(effectId ? { effectId } : {}) });
     }
     case 'cancelling':
-      exact(phase, ['kind', 'stage']);
-      return Object.freeze({ kind, stage: enumeration(phase.stage, ['requested', 'finalizing'] as const, 'phase.stage') });
+      exact(phase, ['kind', 'stage', 'toolBatch']);
+      return Object.freeze({
+        kind,
+        stage: enumeration(phase.stage, ['requested', 'finalizing'] as const, 'phase.stage'),
+        ...(phase.toolBatch === undefined ? {} : { toolBatch: decodeCancellingToolBatch(phase.toolBatch) })
+      });
     case 'terminal':
       exact(phase, ['kind', 'resultEventId']);
       return Object.freeze({ kind, resultEventId: identifier(phase.resultEventId, 'phase.resultEventId') });
   }
+}
+
+function decodeCancellingToolBatch(value: unknown): AgentToolOperationPhase {
+  const batch = decodeToolOperationPhase(value);
+  if (batch.kind !== 'tools') throw new TypeError('A cancelling tool batch must retain tool state.');
+  if (batch.callStates.some((call) => call.stage === 'ready' || call.stage === 'effect_ready' || call.stage === 'effect_pending')) {
+    throw new TypeError('A cancelling tool batch cannot retain open tool calls.');
+  }
+  return batch;
 }
 
 function decodeTurnIdentity(value: unknown): AgentTurnIdentity {
