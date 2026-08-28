@@ -45,6 +45,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   private readonly staleLockMs: number;
   private readonly queues = new Map<string, Promise<void>>();
   private readonly indexes = new Map<string, EventAppendIndex>();
+  private readonly quarantined = new Map<string, PersistenceCorruptionError>();
   private fullScans = 0;
   private incrementalRefreshes = 0;
 
@@ -213,11 +214,16 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     let completeBytes: number;
     try { completeBytes = (await this.enqueue(runId, () => this.refreshIndex(runId, false))).completeBytes; }
     catch (error) { if (nodeCode(error) === 'ENOENT') return; throw error; }
-    let first = true;
-    for await (const line of readJsonlLines(this.filePath(runId), { endOffset: completeBytes })) {
-      if (first) { first = false; continue; }
-      const record = parseEnvelopeLine(line, this.filePath(runId), runId);
-      yield domainEnvelope(record, this.codec.decode(record.event));
+    try {
+      let first = true;
+      for await (const line of readJsonlLines(this.filePath(runId), { endOffset: completeBytes })) {
+        if (first) { first = false; continue; }
+        const record = parseEnvelopeLine(line, this.filePath(runId), runId);
+        yield domainEnvelope(record, this.codec.decode(record.event));
+      }
+    } catch (error) {
+      if (error instanceof PersistenceCorruptionError) await this.quarantine(runId, error);
+      throw error;
     }
   }
 
@@ -236,6 +242,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     const errors: string[] = [];
     let records = 0;
     let previousHash: string | undefined;
+    let corruption: PersistenceCorruptionError | undefined;
     try {
       const index = await this.refreshIndex(runId, false);
       let first = true;
@@ -252,6 +259,16 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       }
     } catch (error) {
       errors.push(error instanceof Error ? error.message : String(error));
+      if (error instanceof PersistenceCorruptionError) corruption = error;
+    }
+    if (errors.length > 0) {
+      await this.quarantine(runId, corruption ?? new PersistenceCorruptionError({
+        code: 'integrity',
+        storage: this.filePath(runId),
+        line: 1,
+        byteOffset: 0,
+        message: `Event stream failed integrity verification: ${errors.join('; ')}`
+      }));
     }
     return { ok: errors.length === 0, records, errors };
   }
@@ -378,6 +395,10 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     return path.join(this.rootDir, `run-${runId}.index`);
   }
 
+  private quarantinePath(runId: string): string {
+    return path.join(this.rootDir, `run-${runId}.quarantine.json`);
+  }
+
   private keyDirectory(runId: string): string {
     return path.join(this.indexDirectory(runId), 'keys');
   }
@@ -491,11 +512,53 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
 
   private enqueue<T>(runId: string, operation: () => Promise<T>): Promise<T> {
     const prior = this.queues.get(runId) ?? Promise.resolve();
-    const result = prior.catch(() => undefined).then(operation);
+    const result = prior.catch(() => undefined).then(async () => {
+      await this.assertNotQuarantined(runId);
+      try {
+        return await operation();
+      } catch (error) {
+        if (error instanceof PersistenceCorruptionError) await this.quarantine(runId, error);
+        throw error;
+      }
+    });
     const tail = result.then(() => undefined, () => undefined);
     this.queues.set(runId, tail);
     void tail.finally(() => { if (this.queues.get(runId) === tail) this.queues.delete(runId); });
     return result;
+  }
+
+  private async assertNotQuarantined(runId: string): Promise<void> {
+    const known = this.quarantined.get(runId);
+    if (known !== undefined) throw known;
+    try {
+      await fs.access(this.quarantinePath(runId));
+    } catch (error) {
+      if (nodeCode(error) === 'ENOENT') return;
+      throw error;
+    }
+    const persisted = new PersistenceCorruptionError({
+      code: 'integrity',
+      storage: this.filePath(runId),
+      line: 1,
+      byteOffset: 0,
+      message: `Event stream ${runId} is quarantined after a failed integrity verification.`
+    });
+    this.quarantined.set(runId, persisted);
+    throw persisted;
+  }
+
+  private async quarantine(runId: string, error: PersistenceCorruptionError): Promise<void> {
+    this.quarantined.set(runId, error);
+    this.indexes.delete(runId);
+    await atomicWritePrivateJson(this.quarantinePath(runId), {
+      version: 1,
+      runId,
+      detectedAt: new Date().toISOString(),
+      code: error.code,
+      line: error.line,
+      byteOffset: error.byteOffset,
+      message: error.message
+    });
   }
 
   private async classifyFailedConditionalAppend(runId: string, attempted: EncodedEnvelope, cause: unknown): Promise<ConditionalEventAppendResult> {

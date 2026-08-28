@@ -18,7 +18,11 @@ const linuxRootCapabilityTests = new Set([
 ].map((value) => path.join(root, value)));
 
 export async function ordinaryTestFiles() {
-  return (await filesUnder(path.join(root, 'tests')))
+  const packageTests = await filesUnder(path.join(root, 'packages'));
+  return [
+    ...await filesUnder(path.join(root, 'tests')),
+    ...packageTests.filter((file) => file.split(path.sep).includes('test'))
+  ]
     .filter((file) => file.endsWith('.test.js'))
     .sort();
 }
