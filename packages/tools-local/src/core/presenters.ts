@@ -67,7 +67,8 @@ export const presentReadFilesObservation: Presenter = ({ observation, maxTokens 
   let files: JsonObject[] = sourceFiles.map((file) => ({
     path: value(file.path), startLine: value(file.startLine), lineCount: value(file.lineCount), eof: value(file.eof),
     fileBytes: value(file.fileBytes), rangeSha256: value(file.rangeSha256), fullFileSha256: value(file.fullFileSha256),
-    rangeLineEnding: value(file.rangeLineEnding), ...(file.nextStartLine === undefined ? {} : { continuationLine: value(file.nextStartLine) }), content: ''
+    truncated: value(file.truncated), newlineConvention: value(file.newlineConvention), utf8Validation: value(file.utf8Validation),
+    ...(file.nextStartLine === undefined ? {} : { continuationLine: value(file.nextStartLine) }), content: ''
   }));
   const base = resultBase('File contents', observation, {
     requestedFiles: value(output.requestedFiles), returnedFiles: value(output.returnedFiles), failedFiles: value(output.failedFiles),
@@ -156,7 +157,7 @@ export const presentApplyPatchObservation: Presenter = ({ observation, maxTokens
   ]);
   const base = resultBase('Patch transaction', observation, {});
   let results: JsonObject = {
-    operationStatus: value(output.operationStatus), transactionOutcome: value(output.transactionOutcome), workspaceState: value(output.workspaceState), dryRun: value(output.dryRun),
+    operationStatus: value(output.operationStatus), transactionOutcome: value(output.transactionOutcome), rootState: value(output.rootState), dryRun: value(output.dryRun),
     files, affectedPaths, changedPaths: value(output.changedPaths), wouldChangePaths: value(output.wouldChangePaths),
     createdPaths: value(output.createdPaths), deletedPaths: value(output.deletedPaths), movedPaths: value(output.movedPaths),
     potentiallyAffectedPaths: value(output.potentiallyAffectedPaths), totalOperationCount: value(output.totalOperationCount),
@@ -165,8 +166,36 @@ export const presentApplyPatchObservation: Presenter = ({ observation, maxTokens
   };
   if (!fits({ ...base, results }, maxTokens)) {
     results = {
-      operationStatus: value(output.operationStatus), transactionOutcome: value(output.transactionOutcome), workspaceState: value(output.workspaceState), files, affectedPaths,
+      operationStatus: value(output.operationStatus), transactionOutcome: value(output.transactionOutcome), rootState: value(output.rootState), files, affectedPaths,
       totalOperationCount: value(output.totalOperationCount), totalAdditions: value(output.totalAdditions), totalDeletions: value(output.totalDeletions),
+      transaction: compactTransaction(output.transaction, 96)
+    };
+  }
+  return withResults(base, results);
+};
+
+export const presentEditTextObservation: Presenter = ({ observation, maxTokens }) => {
+  const failure = failurePresentation('Text edit transaction', observation);
+  if (failure) return failure;
+  const output = object(observation.output);
+  const files = array(output.files).filter(isObject).map((file) => ({
+    path: value(file.path), changed: value(file.changed), finalState: value(file.finalState),
+    oldSha256: value(file.oldSha256), newSha256: value(file.newSha256),
+    oldBytes: value(file.oldBytes), newBytes: value(file.newBytes),
+    newlineConvention: value(file.newlineConvention), changedRanges: value(file.changedRanges)
+  }));
+  const base = resultBase('Text edit transaction', observation, {});
+  let results: JsonObject = {
+    operationStatus: value(output.operationStatus), transactionOutcome: value(output.transactionOutcome), rootState: value(output.rootState), dryRun: value(output.dryRun),
+    files, changedPaths: value(output.changedPaths), wouldChangePaths: value(output.wouldChangePaths),
+    potentiallyAffectedPaths: value(output.potentiallyAffectedPaths), diffSummary: value(output.diffSummary),
+    transaction: compactTransaction(output.transaction, 512)
+  };
+  if (!fits({ ...base, results }, maxTokens)) {
+    results = {
+      operationStatus: value(output.operationStatus), transactionOutcome: value(output.transactionOutcome), rootState: value(output.rootState),
+      files: files.map((file) => ({ path: file.path, changed: file.changed, finalState: file.finalState, newSha256: file.newSha256 })),
+      changedPaths: value(output.changedPaths), wouldChangePaths: value(output.wouldChangePaths),
       transaction: compactTransaction(output.transaction, 96)
     };
   }

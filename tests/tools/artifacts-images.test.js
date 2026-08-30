@@ -7,7 +7,7 @@ import { InMemoryArtifactRepository } from '@agent-core/evidence';
 import { LocalArtifactRepository } from '@agent-core/evidence/node';
 import { DEFAULT_LOCAL_TOOL_CONFIGURATION, readArtifactTool, viewImageTool } from '@agent-core/tools-local';
 import { invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
-import { testWorkspaceFileRoot } from '../workspace-file-root-helper.js';
+import { testRootedFileAuthority } from '../rooted-file-authority-helper.js';
 
 const tools = [readArtifactTool, viewImageTool];
 
@@ -32,7 +32,7 @@ test('view_image stores image bytes and returns an image content reference witho
   const png = pngBytes(2, 3);
   await writeFile(path.join(root, 'image.png'), png);
   const observation = await invokeToolCall(jsonToolCall('view_image', { path: 'image.png', detail: 'original' }), tools, {
-    policy: { allowedRisks: ['read'] }, services: { workspaceFileRoot: testWorkspaceFileRoot(root), artifactRepository: repository }
+    policy: { allowedRisks: ['read'] }, services: { rootedFileAuthority: testRootedFileAuthority(root), artifactRepository: repository }
   });
   assert.equal(observation.ok, true);
   assert.equal(observation.output.width, 2);
@@ -53,7 +53,7 @@ test('view_image rejects replacement, growth, truncation, invalid headers, and e
     if (mutation === 'replacement') await writeFile(path.join(root, 'replacement.png'), pngBytes(4, 5));
     let changed = false;
     const result = await invokeToolCall(jsonToolCall('view_image', { path: 'image.png' }), tools, {
-      policy: { allowedRisks: ['read'] }, services: { workspaceFileRoot: testWorkspaceFileRoot(root), artifactRepository: repository },
+      policy: { allowedRisks: ['read'] }, services: { rootedFileAuthority: testRootedFileAuthority(root), artifactRepository: repository },
       async emitProgress(progress) {
         if (progress.stage !== 'image_reading' || changed) return;
         changed = true;
@@ -75,7 +75,7 @@ test('view_image rejects replacement, growth, truncation, invalid headers, and e
   const invalidRoot = await mkdtemp(path.join(tmpdir(), 'agent-core-image-invalid-'));
   await writeFile(path.join(invalidRoot, 'bad.png'), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
   const invalid = await invokeToolCall(jsonToolCall('view_image', { path: 'bad.png' }), tools, {
-    policy: { allowedRisks: ['read'] }, services: { workspaceFileRoot: testWorkspaceFileRoot(invalidRoot), artifactRepository: new InMemoryArtifactRepository() }
+    policy: { allowedRisks: ['read'] }, services: { rootedFileAuthority: testRootedFileAuthority(invalidRoot), artifactRepository: new InMemoryArtifactRepository() }
   });
   assert.equal(invalid.kind, 'failure');
   assert.match(invalid.summary, /truncated|invalid image/u);
@@ -86,7 +86,7 @@ test('view_image rejects replacement, growth, truncation, invalid headers, and e
     artifact: { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.artifact, maxImageWidth: 30_000, maxImageHeight: 30_000, maxImagePixels: 10_000 }
   };
   const huge = await invokeToolCall(jsonToolCall('view_image', { path: 'huge.png' }), tools, {
-    policy: { allowedRisks: ['read'] }, services: { workspaceFileRoot: testWorkspaceFileRoot(invalidRoot), artifactRepository: new InMemoryArtifactRepository(), localToolConfiguration: limits }
+    policy: { allowedRisks: ['read'] }, services: { rootedFileAuthority: testRootedFileAuthority(invalidRoot), artifactRepository: new InMemoryArtifactRepository(), localToolConfiguration: limits }
   });
   assert.equal(huge.kind, 'failure');
   assert.match(huge.summary, /dimensions exceed/u);

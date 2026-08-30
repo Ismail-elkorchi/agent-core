@@ -9,14 +9,14 @@ import { spawnSync } from 'node:child_process';
 import {
   DEFAULT_LOCAL_TOOL_CONFIGURATION,
   LocalCommandExecution,
-  WorkspaceFileRoot,
+  RootedFileAuthority,
   createLocalToolHost,
   execCommandTool,
   stopProcessTool,
   writeStdinTool
 } from '@agent-core/tools-local';
 import { invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
-import { testWorkspaceFileRoot } from '../workspace-file-root-helper.js';
+import { testRootedFileAuthority } from '../rooted-file-authority-helper.js';
 import { isCommandExecution } from '@agent-core/tools';
 
 const tools = [execCommandTool, writeStdinTool, stopProcessTool];
@@ -35,13 +35,13 @@ async function processContext(options = {}, owner = invocation) {
     ...DEFAULT_LOCAL_TOOL_CONFIGURATION,
     process: { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process, ...options }
   };
-  const workspaceFileRoot = testWorkspaceFileRoot(root);
+  const rootedFileAuthority = testRootedFileAuthority(root);
   const manager = new LocalCommandExecution({
     artifactRepository: artifacts,
-    workspaceFileRoot,
+    rootedFileAuthority,
     ...configuration.process
   });
-  return { root, artifacts, manager, context: { policy, invocation: owner, services: { workspaceFileRoot, artifactRepository: artifacts, localToolConfiguration: configuration, commandExecution: manager } } };
+  return { root, artifacts, manager, context: { policy, invocation: owner, services: { rootedFileAuthority, artifactRepository: artifacts, localToolConfiguration: configuration, commandExecution: manager } } };
 }
 
 async function pollUntilSettled(processId, context, afterCursor = 0) {
@@ -58,7 +58,7 @@ test('command execution is admitted by behavior and has a stable recovery identi
   const ledgerDirectory = path.join(root, 'processes');
   const options = {
     artifactRepository: new InMemoryArtifactRepository(),
-    workspaceFileRoot: testWorkspaceFileRoot(root),
+    rootedFileAuthority: testRootedFileAuthority(root),
     ledgerDirectory,
     ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process
   };
@@ -82,7 +82,7 @@ test('command execution keeps the admitted physical working directory across a p
   const owner = { ...invocation, runId: 'working-directory-swap-run' };
   const execution = new LocalCommandExecution({
     artifactRepository: new InMemoryArtifactRepository(),
-    workspaceFileRoot: testWorkspaceFileRoot(root),
+    rootedFileAuthority: testRootedFileAuthority(root),
     ledgerDirectory: path.join(root, 'processes'),
     ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process,
     async onSupervisorCheckpoint(checkpoint) {
@@ -93,7 +93,7 @@ test('command execution keeps the admitted physical working directory across a p
   });
   let result = await startCommand(execution, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("require('node:fs').writeFileSync('marker.txt', 'inside')")}`,
-    workspacePath: 'work', pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner
+    rootedDirectory: 'work', pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner
   });
   while (result.status === 'running') result = await execution.query(result.processId, 100, 50, result.cursorEnd, owner);
   await access(path.join(retained, 'marker.txt'));
@@ -225,7 +225,7 @@ test('natural termination is reported once whether or not the process was polled
     const command = mode === 'stopped'
       ? `${JSON.stringify(process.execPath)} -e ${JSON.stringify('setInterval(()=>{},1000)')}`
       : `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('done')")}`;
-    let result = await startCommand(manager, { command, workspacePath: '.', pty: false, timeoutMs: 60_000, yieldMs: mode === 'stopped' ? 20 : 1_000, outputTokenBudget: 1_000, owner });
+    let result = await startCommand(manager, { command, rootedDirectory: '.', pty: false, timeoutMs: 60_000, yieldMs: mode === 'stopped' ? 20 : 1_000, outputTokenBudget: 1_000, owner });
     if (mode === 'polled') {
       while (result.status === 'running') result = await manager.query(result.processId, 1_000, 100, result.cursorEnd, owner);
     } else if (mode === 'stopped') {
@@ -253,7 +253,7 @@ test('terminal tombstones release capture budgets before late acknowledgment', a
     const owner = { ...invocation, runId: `late-ack-${String(index)}` };
     let result = await startCommand(manager, {
       command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('x'.repeat(800))")}`,
-      workspacePath: '.', pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner
+      rootedDirectory: '.', pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner
     });
     while (result.status === 'running') result = await manager.query(result.processId, 100, 50, result.cursorEnd, owner);
     processIds.push(result.processId);
@@ -276,14 +276,14 @@ test('ledger cleanup residue does not change a terminal result and is retried on
   const owner = { ...invocation, runId: 'cleanup-residue-run' };
   const manager = new LocalCommandExecution({
     artifactRepository: artifacts,
-    workspaceFileRoot: testWorkspaceFileRoot(root),
+    rootedFileAuthority: testRootedFileAuthority(root),
     ledgerDirectory,
     ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process,
     async removeLedgerRecord() { throw new Error('simulated ledger deletion failure'); }
   });
   let result = await startCommand(manager, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('done')")}`,
-    workspacePath: '.', pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner
+    rootedDirectory: '.', pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner
   });
   while (result.status === 'running') result = await manager.query(result.processId, 100, 50, result.cursorEnd, owner);
   while ((await manager.unreportedTerminalProcesses(owner.runId)).length === 0) await new Promise(resolve => setTimeout(resolve, 10));
@@ -291,7 +291,7 @@ test('ledger cleanup residue does not change a terminal result and is retried on
   assert.equal(result.status, 'exited');
   assert.match(manager.cleanupDiagnostics().join(' '), /simulated ledger deletion failure/u);
 
-  const retry = new LocalCommandExecution({ artifactRepository: artifacts, workspaceFileRoot: testWorkspaceFileRoot(root), ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+  const retry = new LocalCommandExecution({ artifactRepository: artifacts, rootedFileAuthority: testRootedFileAuthority(root), ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
   const reconciliation = await retry.reconcile();
   assert.equal(reconciliation.unresolved.length, 0);
   assert.equal(reconciliation.resolved.includes(result.processId), true);
@@ -305,7 +305,7 @@ test('public process redaction detects a secret split across output chunks', asy
   const script = `process.stdout.write('API_TO'); setTimeout(()=>process.stdout.write('KEN=${secret}'), 20)`;
   let result = await startCommand(manager, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
-    workspacePath: '.', pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner
+    rootedDirectory: '.', pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner
   });
   while (result.status === 'running') result = await manager.query(result.processId, 100, 50, result.cursorEnd, owner);
   const publicPayload = JSON.parse(new TextDecoder().decode(await artifacts.readVerified(result.artifact)));
@@ -321,7 +321,7 @@ test('public process artifacts preserve output larger than the strict JSON strin
   const outputBytes = 4_300_000;
   let result = await startCommand(manager, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`process.stdout.write('x'.repeat(${String(outputBytes)}))`)}`,
-    workspacePath: '.', pty: false, timeoutMs: 10_000, yieldMs: 1_000, outputTokenBudget: 100, owner
+    rootedDirectory: '.', pty: false, timeoutMs: 10_000, yieldMs: 1_000, outputTokenBudget: 100, owner
   });
   while (result.status === 'running') result = await manager.query(result.processId, 100, 100, result.cursorEnd, owner);
   assert.equal(result.artifact.visibility, 'public');
@@ -337,7 +337,7 @@ test('process output keeps raw protected bytes internal and exposes only a redac
   const secret = 'super-secret-value';
   let result = await startCommand(manager, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`process.stdout.write('API_TOKEN=${secret}')`)}`,
-    workspacePath: '.', pty: false, timeoutMs: 60_000, yieldMs: 1_000, outputTokenBudget: 1_000, owner
+    rootedDirectory: '.', pty: false, timeoutMs: 60_000, yieldMs: 1_000, outputTokenBudget: 1_000, owner
   });
   while (result.status === 'running') result = await manager.query(result.processId, 1_000, 100, result.cursorEnd, owner);
   assert.equal(result.artifact.visibility, 'public');
@@ -355,7 +355,7 @@ test('process output keeps raw protected bytes internal and exposes only a redac
 
 test('asynchronous process progress is ordered, bounded, and catches callback failures', async () => {
   const { root, artifacts } = await processContext();
-  const manager = new LocalCommandExecution({ artifactRepository: artifacts, workspaceFileRoot: testWorkspaceFileRoot(root), ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process, maxPendingOutputBytes: 512 });
+  const manager = new LocalCommandExecution({ artifactRepository: artifacts, rootedFileAuthority: testRootedFileAuthority(root), ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process, maxPendingOutputBytes: 512 });
   const delivered = [];
   const unhandled = [];
   const listener = reason => { unhandled.push(reason); };
@@ -363,7 +363,7 @@ test('asynchronous process progress is ordered, bounded, and catches callback fa
   try {
     const script = "let i=0; const t=setInterval(()=>{process.stdout.write('o'+i+'\\n'); process.stderr.write('e'+i+'\\n'); if(++i===50){clearInterval(t);}},1)";
     let result = await startCommand(manager, {
-      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`, workspacePath: '.', pty: false, timeoutMs: 60_000, yieldMs: 20, outputTokenBudget: 1_000,
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`, rootedDirectory: '.', pty: false, timeoutMs: 60_000, yieldMs: 20, outputTokenBudget: 1_000,
       owner: { ...invocation, runId: 'progress-run' }
     }, {
       async onProgress(progress) {
@@ -395,12 +395,12 @@ test('asynchronous process progress is ordered, bounded, and catches callback fa
 
 test('a terminal poll waits for accepted asynchronous progress delivery', async () => {
   const { root, artifacts } = await processContext();
-  const manager = new LocalCommandExecution({ artifactRepository: artifacts, workspaceFileRoot: testWorkspaceFileRoot(root), ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+  const manager = new LocalCommandExecution({ artifactRepository: artifacts, rootedFileAuthority: testRootedFileAuthority(root), ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
   const delivered = [];
   const owner = { ...invocation, runId: 'terminal-progress-drain-run' };
   let result = await startCommand(manager, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('done')")}`,
-    workspacePath: '.', pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner
+    rootedDirectory: '.', pty: false, timeoutMs: 5_000, yieldMs: 1_000, outputTokenBudget: 100, owner
   }, {
     async onProgress(progress) {
       if (progress.type === 'status' && progress.stage === 'process_exited') await new Promise(resolve => setTimeout(resolve, 40));
@@ -421,10 +421,10 @@ test('process ledger restores unreported terminal records across manager restart
   const ledgerDirectory = path.join(root, 'processes');
   const artifacts = new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts') });
   const owner = { ...invocation, runId: 'restart-run' };
-  const first = new LocalCommandExecution({ artifactRepository: artifacts, workspaceFileRoot: testWorkspaceFileRoot(root), ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
-  const started = await startCommand(first, { command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('done')")}`, workspacePath: '.', pty: false, timeoutMs: 60_000, yieldMs: 1_000, outputTokenBudget: 1_000, owner });
+  const first = new LocalCommandExecution({ artifactRepository: artifacts, rootedFileAuthority: testRootedFileAuthority(root), ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+  const started = await startCommand(first, { command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('done')")}`, rootedDirectory: '.', pty: false, timeoutMs: 60_000, yieldMs: 1_000, outputTokenBudget: 1_000, owner });
   while ((await first.unreportedTerminalProcesses(owner.runId)).length === 0) await new Promise(resolve => setTimeout(resolve, 10));
-  const second = new LocalCommandExecution({ artifactRepository: artifacts, workspaceFileRoot: testWorkspaceFileRoot(root), ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+  const second = new LocalCommandExecution({ artifactRepository: artifacts, rootedFileAuthority: testRootedFileAuthority(root), ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
   const reconciliation = await second.reconcile();
   assert.equal(reconciliation.unresolved.length, 0);
   const reports = await second.disposeRun(owner.runId);
@@ -443,7 +443,7 @@ test('startup reconciliation stops an orphaned child process tree and resolves i
   const ledgerDirectory = path.join(root, 'processes');
   const ledgerName = (await readdir(ledgerDirectory)).find(name => /^proc_[a-f0-9-]+\.json$/u.test(name));
   const ledger = JSON.parse(await readFile(path.join(ledgerDirectory, ledgerName), 'utf8'));
-  const manager = new LocalCommandExecution({ artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts-recovered') }), workspaceFileRoot: testWorkspaceFileRoot(root), ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+  const manager = new LocalCommandExecution({ artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts-recovered') }), rootedFileAuthority: testRootedFileAuthority(root), ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
   const reconciliation = await manager.reconcile();
   assert.equal(reconciliation.resolved.includes(processId), true, JSON.stringify(reconciliation));
   assert.equal(reconciliation.unresolved.length, 0, JSON.stringify(reconciliation));
@@ -456,7 +456,7 @@ test('startup reconciliation stops an orphaned child process tree and resolves i
   assert.deepEqual(await readdir(ledgerDirectory), []);
 });
 
-test('reconciliation never signals a PID without authenticated supervisor identity and blocks the workspace', async () => {
+test('reconciliation never signals a PID without authenticated supervisor identity and blocks the rooted authority', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-process-pid-reuse-'));
   const ledgerDirectory = path.join(root, 'processes');
   await mkdir(ledgerDirectory, { recursive: true });
@@ -469,13 +469,13 @@ test('reconciliation never signals a PID without authenticated supervisor identi
     supervisorEndpoint: process.platform === 'win32' ? '\\\\.\\pipe\\missing-agent-core-supervisor' : path.join(ledgerDirectory, 'missing.sock'),
     owner: { runId: 'old-run', turnId: 'turn', toolBatchId: 'batch', callIndex: 0 },
     startedAt: new Date().toISOString(),
-    workspace: root,
+    rootPath: root,
     state: 'running',
     terminalReported: false
   }) + '\n');
 
   const host = createLocalToolHost({
-    workspaceFileRoot: WorkspaceFileRoot.adopt(root),
+    rootedFileAuthority: RootedFileAuthority.adopt(root),
     artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts') }),
     processLedgerDirectory: ledgerDirectory,
     enabledTools: ['exec_command', 'write_stdin', 'stop_process']
@@ -483,13 +483,13 @@ test('reconciliation never signals a PID without authenticated supervisor identi
   await host.ready();
   const reconciliation = await host.reconciliation();
   assert.equal(reconciliation.unresolved.length, 1);
-  assert.equal(reconciliation.unresolved[0].workspace, root);
+  assert.equal(reconciliation.unresolved[0].rootPath, root);
   assert.equal(host.commandExecution.resourceLeases.activeCount(), 1);
-  assert.equal(host.commandExecution.resourceLeases.wouldWait({ accesses: [{ mode: 'write', scope: 'workspace/files/a.txt' }], lockScopes: ['workspace/files/a.txt'], recovery: { kind: 'unknown' } }), true);
+  assert.equal(host.commandExecution.resourceLeases.wouldWait({ accesses: [{ mode: 'write', scope: 'files/a.txt' }], lockScopes: ['files/a.txt'], recovery: { kind: 'unknown' } }), true);
   assert.doesNotThrow(() => process.kill(process.pid, 0), 'the reused PID remains untouched');
   await assert.rejects(startCommand(host.commandExecution, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify('process.exit(0)')}`,
-    workspacePath: '.', pty: false, timeoutMs: 1_000, yieldMs: 1, outputTokenBudget: 100,
+    rootedDirectory: '.', pty: false, timeoutMs: 1_000, yieldMs: 1, outputTokenBudget: 100,
     owner: { runId: 'new-run', turnId: 'turn', toolBatchId: 'batch', callIndex: 0 }
   }), /unresolved supervised process/u);
 
@@ -520,7 +520,7 @@ test('supervisor handshake prevents user code before durable release and reconci
     const ledgerDirectory = path.join(root, 'processes');
     const manager = new LocalCommandExecution({
       artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'recovered-artifacts') }),
-      workspaceFileRoot: testWorkspaceFileRoot(root),
+      rootedFileAuthority: testRootedFileAuthority(root),
       ledgerDirectory,
       ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process
     });
@@ -542,7 +542,7 @@ test('local host durably hands recovered terminal reports to old runs during sta
   const { processId } = JSON.parse(crashed.stdout);
   const delivered = [];
   const host = createLocalToolHost({
-    workspaceFileRoot: WorkspaceFileRoot.adopt(root),
+    rootedFileAuthority: RootedFileAuthority.adopt(root),
     artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'host-artifacts') }),
     processLedgerDirectory: path.join(root, 'processes'),
     enabledTools: ['exec_command', 'write_stdin', 'stop_process'],

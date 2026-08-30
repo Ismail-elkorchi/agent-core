@@ -270,7 +270,7 @@ test('ContextManager projects compact evidence without inferring reads from list
         createdAt: '2026-06-23T00:00:00.000Z',
         action: 'list',
         outcome: 'success',
-        resources: [{ uri: 'workspace://src/index.ts' }],
+        resources: [{ uri: 'rooted-file:///src/index.ts' }],
         scope: { truncated: false, confidence: 'verified' },
         summary: 'Listed src/index.ts.'
       },

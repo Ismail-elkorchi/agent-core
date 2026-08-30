@@ -2,15 +2,15 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { TextPatchJournal, WorkspaceFileRoot } from '@agent-core/tools-local';
+import { TextPatchJournal, RootedFileAuthority } from '@agent-core/tools-local';
 
 const roots = new Map();
 const journals = new Map();
 
-export function testWorkspaceFileRoot(rootPath) {
+export function testRootedFileAuthority(rootPath) {
   const absolute = path.resolve(rootPath);
   let root = roots.get(absolute);
-  if (!root) { root = WorkspaceFileRoot.adopt(absolute); roots.set(absolute, root); }
+  if (!root) { root = RootedFileAuthority.adopt(absolute); roots.set(absolute, root); }
   return root;
 }
 

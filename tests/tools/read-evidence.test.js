@@ -7,7 +7,7 @@ import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core
 import { AgentRuntime, InMemorySessionRepository, agentEventCodec } from '@agent-core/runtime';
 import {
   DEFAULT_LOCAL_TOOL_CONFIGURATION,
-  WorkspaceFileSelector,
+  RootedFileSelector,
   findFilesTool,
   listDirectoryTool,
   readArtifactTool,
@@ -16,7 +16,7 @@ import {
   viewImageTool
 } from '@agent-core/tools-local';
 import { invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
-import { testWorkspaceFileRoot } from '../workspace-file-root-helper.js';
+import { testRootedFileAuthority } from '../rooted-file-authority-helper.js';
 
 const onePixelPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
 const sessionBinding = Object.freeze({ schemaId: 'agent-core.tests/read-evidence', schemaVersion: 1, subject: Object.freeze({ application: 'read-evidence' }) });
@@ -25,12 +25,12 @@ async function readHost() {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-read-evidence-'));
   const artifacts = new InMemoryArtifactRepository();
   const configuration = DEFAULT_LOCAL_TOOL_CONFIGURATION;
-  const workspaceFileRoot = testWorkspaceFileRoot(root);
+  const rootedFileAuthority = testRootedFileAuthority(root);
   const services = {
-    workspaceFileRoot,
+    rootedFileAuthority,
     artifactRepository: artifacts,
     localToolConfiguration: configuration,
-    workspaceFileSelector: new WorkspaceFileSelector(workspaceFileRoot, configuration.fileSelection)
+    rootedFileSelector: new RootedFileSelector(rootedFileAuthority, configuration.fileSelection)
   };
   return { root, artifacts, services, context: { policy: { allowedRisks: ['read'] }, services } };
 }
@@ -82,7 +82,7 @@ test('read_files emits per-file success and failure evidence and failed searches
   assert.equal(success.resources[0].sha256, read.output.files[0].rangeSha256);
   assert.equal(success.resources[0].fullSha256, read.output.files[0].fullFileSha256);
   assert.equal(success.scope.coverage, 'complete');
-  assert.equal(failure.resources[0].uri, 'workspace://missing.txt');
+  assert.equal(failure.resources[0].uri, 'rooted-file:///missing.txt');
   assert.equal(failure.scope.coverage, 'absent');
 
   const search = await invokeToolCall(jsonToolCall('search_text', { query: '[', mode: 'matches' }), [searchTextTool], context);
@@ -145,7 +145,7 @@ test('read-tool evidence reaches durable observations, session context, prompt s
   const secondRequest = JSON.stringify(requests[1].messages);
   assert.match(secondRequest, /list_directory/u);
   assert.match(secondRequest, /evidence_state/u);
-  assert.match(secondRequest, /workspace:\/\/\./u);
+  assert.match(secondRequest, /rooted-file:\/\/\//u);
   assert.equal(checkedEvidence.items.some((item) => item.toolName === 'list_directory' && item.action === 'list'), true);
 
   const replay = await sessions.loadReplayState(session);

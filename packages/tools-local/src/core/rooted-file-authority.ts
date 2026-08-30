@@ -4,12 +4,12 @@ import path from 'node:path';
 import process from 'node:process';
 import { ToolInputError } from '@agent-core/tools';
 
-const ownedRoots = new WeakSet<WorkspaceFileRoot>();
-const DEFAULT_DENIED_ROOT_ENTRIES = Object.freeze(['.git', '.agent-core']);
+const ownedRoots = new WeakSet<RootedFileAuthority>();
+const DEFAULT_DENIED_ROOT_ENTRIES = Object.freeze(['.agent-core']);
 const RESERVED_ENTRY_PREFIX = '.agent-core-';
-const openMutationDirectory = Symbol('agent-core.workspace-file-root.open-mutation-directory');
+const openMutationDirectory = Symbol('agent-core.rooted-file-authority.open-mutation-directory');
 
-export interface WorkspaceFileIdentity {
+export interface RootedFileIdentity {
   readonly device: string;
   readonly inode: string;
   readonly mode: string;
@@ -19,36 +19,36 @@ export interface WorkspaceFileIdentity {
   readonly changedNanoseconds: string;
 }
 
-export interface WorkspaceFileHandle {
+export interface RootedFileHandle {
   readonly path: string;
-  readonly identity: WorkspaceFileIdentity;
+  readonly identity: RootedFileIdentity;
   readonly size: number;
   readonly mode: number;
   /** Descriptor may be inherited by a child only while this handle is open. */
   readonly descriptor: number;
   read(buffer: Buffer, offset: number, length: number, position: number): Promise<number>;
   readAll(maxBytes: number): Promise<Buffer>;
-  identityNow(): Promise<WorkspaceFileIdentity>;
+  identityNow(): Promise<RootedFileIdentity>;
   close(): Promise<void>;
 }
 
-export interface WorkspaceDirectoryEntry {
+export interface RootedDirectoryEntry {
   readonly name: string;
   readonly type: 'file' | 'directory' | 'symlink' | 'other';
 }
 
-export interface WorkspaceDirectoryHandle {
+export interface RootedDirectoryHandle {
   readonly path: string;
-  readonly identity: WorkspaceFileIdentity;
+  readonly identity: RootedFileIdentity;
   readonly size: number;
   readonly mode: number;
-  entries(): Promise<readonly WorkspaceDirectoryEntry[]>;
+  entries(): Promise<readonly RootedDirectoryEntry[]>;
   close(): Promise<void>;
 }
 
-export interface WorkspaceMutationDirectory {
+export interface RootedMutationDirectory {
   readonly path: string;
-  status(name: string): Promise<WorkspacePathStatus>;
+  status(name: string): Promise<RootedPathStatus>;
   writeExclusive(name: string, content: string, mode: number): Promise<void>;
   readFile(name: string, maxBytes: number): Promise<Buffer>;
   createDirectory(name: string, mode: number): Promise<void>;
@@ -60,25 +60,25 @@ export interface WorkspaceMutationDirectory {
   close(): Promise<void>;
 }
 
-export interface WorkspaceFileRootOptions {
+export interface RootedFileAuthorityOptions {
   readonly additionalDeniedEntries?: readonly string[];
 }
 
-export interface WorkspaceRootIdentity {
+export interface RootIdentity {
   readonly canonicalPath: string;
   readonly device: string;
   readonly inode: string;
   readonly mountId: string;
 }
 
-export type WorkspacePathStatus =
+export type RootedPathStatus =
   | { readonly kind: 'absent'; readonly path: string }
-  | { readonly kind: 'file'; readonly path: string; readonly identity: WorkspaceFileIdentity; readonly size: number; readonly mode: number }
-  | { readonly kind: 'directory'; readonly path: string; readonly identity: WorkspaceFileIdentity; readonly mode: number }
+  | { readonly kind: 'file'; readonly path: string; readonly identity: RootedFileIdentity; readonly size: number; readonly mode: number }
+  | { readonly kind: 'directory'; readonly path: string; readonly identity: RootedFileIdentity; readonly mode: number }
   | { readonly kind: 'symlink' | 'other'; readonly path: string };
 
 /**
- * Adopted host-file authority for one physical workspace root.
+ * Adopted host-file authority for one physical root directory.
  *
  * Node does not expose directory-relative open primitives on every supported
  * platform. The current implementation therefore admits file access only on
@@ -86,15 +86,15 @@ export type WorkspacePathStatus =
  * component be opened without following aliases. Unsupported platforms fail
  * at adoption instead of silently weakening confinement.
  */
-export class WorkspaceFileRoot {
+export class RootedFileAuthority {
   readonly #displayPath: string;
   readonly #rootFd: number;
   readonly #rootMountId: string;
-  readonly #identity: WorkspaceRootIdentity;
+  readonly #identity: RootIdentity;
   readonly #deniedRootEntries: ReadonlySet<string>;
   #closed = false;
 
-  private constructor(displayPath: string, rootFd: number, rootMountId: string, rootIdentity: WorkspaceRootIdentity, deniedRootEntries: ReadonlySet<string>) {
+  private constructor(displayPath: string, rootFd: number, rootMountId: string, rootIdentity: RootIdentity, deniedRootEntries: ReadonlySet<string>) {
     this.#displayPath = displayPath;
     this.#rootFd = rootFd;
     this.#rootMountId = rootMountId;
@@ -103,23 +103,23 @@ export class WorkspaceFileRoot {
     ownedRoots.add(this);
   }
 
-  static adopt(rootPath: string, options: WorkspaceFileRootOptions = {}): WorkspaceFileRoot {
+  static adopt(rootPath: string, options: RootedFileAuthorityOptions = {}): RootedFileAuthority {
     if (process.platform !== 'linux') {
       throw new Error(`Root-bound host file access is unavailable on ${process.platform}; this platform lacks the required package-owned handle-relative resolver.`);
     }
-    if (typeof rootPath !== 'string' || rootPath.trim().length === 0) throw new TypeError('Workspace root must be a non-empty path.');
+    if (typeof rootPath !== 'string' || rootPath.trim().length === 0) throw new TypeError('Root directory must be a non-empty path.');
     const displayPath = path.resolve(rootPath);
     let rootFd: number | undefined;
     try {
       rootFd = openHostDirectoryWithoutAliases(displayPath);
       const stat = fstatSync(rootFd, { bigint: true });
-      if (!stat.isDirectory()) throw new Error(`Workspace root is not a directory: ${displayPath}`);
+      if (!stat.isDirectory()) throw new Error(`Root path is not a directory: ${displayPath}`);
       const openedPath = readlinkSync(`/proc/self/fd/${String(rootFd)}`);
-      if (openedPath.endsWith(' (deleted)')) throw new Error(`Workspace root was removed during adoption: ${displayPath}`);
+      if (openedPath.endsWith(' (deleted)')) throw new Error(`Root directory was removed during adoption: ${displayPath}`);
       const denied = ownDeniedEntries([...DEFAULT_DENIED_ROOT_ENTRIES, ...(options.additionalDeniedEntries ?? [])]);
       const mountId = readMountId(rootFd);
       const rootIdentity = Object.freeze({ canonicalPath: displayPath, device: String(stat.dev), inode: String(stat.ino), mountId });
-      return new WorkspaceFileRoot(displayPath, rootFd, mountId, rootIdentity, denied);
+      return new RootedFileAuthority(displayPath, rootFd, mountId, rootIdentity, denied);
     } catch (error) {
       if (rootFd !== undefined) closeSync(rootFd);
       throw error;
@@ -127,11 +127,11 @@ export class WorkspaceFileRoot {
   }
 
   get displayPath(): string { return this.#displayPath; }
-  get identity(): WorkspaceRootIdentity { this.#assertOpen(); return this.#identity; }
+  get identity(): RootIdentity { this.#assertOpen(); return this.#identity; }
 
   canonicalPath(requestedPath: string): string {
     this.#assertOpen();
-    return normalizeWorkspacePath(requestedPath, this.#deniedRootEntries);
+    return normalizeRootedPath(requestedPath, this.#deniedRootEntries);
   }
 
   isReservedPath(requestedPath: string): boolean {
@@ -140,10 +140,10 @@ export class WorkspaceFileRoot {
     return segments.some((segment) => this.#deniedRootEntries.has(segment) || segment.startsWith(RESERVED_ENTRY_PREFIX));
   }
 
-  async openFile(requestedPath: string): Promise<WorkspaceFileHandle> {
-    const workspacePath = this.canonicalPath(requestedPath);
-    if (workspacePath === '.') throw new ToolInputError('Workspace root is not a regular file.', { path: requestedPath });
-    const segments = workspacePath.split('/');
+  async openFile(requestedPath: string): Promise<RootedFileHandle> {
+    const rootedDirectory = this.canonicalPath(requestedPath);
+    if (rootedDirectory === '.') throw new ToolInputError('Root directory is not a regular file.', { path: requestedPath });
+    const segments = rootedDirectory.split('/');
     const leaf = segments.pop();
     if (!leaf) throw new ToolInputError('Path does not identify a file.', { path: requestedPath });
     const parent = await this.#openDirectorySegments(segments, requestedPath);
@@ -154,7 +154,7 @@ export class WorkspaceFileRoot {
         const stat: BigIntStats = await handle.stat({ bigint: true });
         if (!stat.isFile()) throw new ToolInputError(`Path is not a regular file: ${requestedPath}`, { path: requestedPath });
         if (stat.nlink !== 1n) throw new ToolInputError(`Refusing a multiply linked file: ${requestedPath}`, { path: requestedPath, links: String(stat.nlink) });
-        return makeWorkspaceFileHandle(workspacePath, handle, stat, () => { this.#assertOpen(); });
+        return makeRootedFileHandle(rootedDirectory, handle, stat, () => { this.#assertOpen(); });
       } catch (error) {
         await handle.close();
         throw error;
@@ -167,53 +167,53 @@ export class WorkspaceFileRoot {
     }
   }
 
-  async fileIdentity(requestedPath: string): Promise<WorkspaceFileIdentity> {
+  async fileIdentity(requestedPath: string): Promise<RootedFileIdentity> {
     const file = await this.openFile(requestedPath);
     try { return file.identity; }
     finally { await file.close(); }
   }
 
-  async inspectPath(requestedPath: string): Promise<WorkspacePathStatus> {
-    const workspacePath = this.canonicalPath(requestedPath);
-    if (workspacePath === '.') {
+  async inspectPath(requestedPath: string): Promise<RootedPathStatus> {
+    const rootedDirectory = this.canonicalPath(requestedPath);
+    if (rootedDirectory === '.') {
       const directory = await this.openDirectory('.');
       try { return Object.freeze({ kind: 'directory', path: '.', identity: directory.identity, mode: directory.mode }); }
       finally { await directory.close(); }
     }
-    const segments = workspacePath.split('/');
+    const segments = rootedDirectory.split('/');
     const leaf = segments.pop();
-    if (!leaf) throw new Error(`Invalid canonical workspace path: ${workspacePath}`);
+    if (!leaf) throw new Error(`Invalid canonical rooted path: ${rootedDirectory}`);
     let parent;
     try { parent = await this.#openDirectorySegments(segments, requestedPath); }
     catch (error) {
-      if (nodeCode(error) === 'ENOENT') return Object.freeze({ kind: 'absent', path: workspacePath });
+      if (nodeCode(error) === 'ENOENT') return Object.freeze({ kind: 'absent', path: rootedDirectory });
       throw error;
     }
     try {
       let stat: BigIntStats;
       try { stat = await lstat(`${fdPath(parent.handle.fd)}/${leaf}`, { bigint: true }); }
       catch (error) {
-        if (nodeCode(error) === 'ENOENT') return Object.freeze({ kind: 'absent', path: workspacePath });
+        if (nodeCode(error) === 'ENOENT') return Object.freeze({ kind: 'absent', path: rootedDirectory });
         throw error;
       }
-      if (stat.isSymbolicLink()) return Object.freeze({ kind: 'symlink', path: workspacePath });
+      if (stat.isSymbolicLink()) return Object.freeze({ kind: 'symlink', path: rootedDirectory });
       if (stat.isFile()) {
-        const file = await this.openFile(workspacePath);
-        try { return Object.freeze({ kind: 'file', path: workspacePath, identity: file.identity, size: file.size, mode: file.mode }); }
+        const file = await this.openFile(rootedDirectory);
+        try { return Object.freeze({ kind: 'file', path: rootedDirectory, identity: file.identity, size: file.size, mode: file.mode }); }
         finally { await file.close(); }
       }
       if (stat.isDirectory()) {
-        const directory = await this.openDirectory(workspacePath);
-        try { return Object.freeze({ kind: 'directory', path: workspacePath, identity: directory.identity, mode: directory.mode }); }
+        const directory = await this.openDirectory(rootedDirectory);
+        try { return Object.freeze({ kind: 'directory', path: rootedDirectory, identity: directory.identity, mode: directory.mode }); }
         finally { await directory.close(); }
       }
-      return Object.freeze({ kind: 'other', path: workspacePath });
+      return Object.freeze({ kind: 'other', path: rootedDirectory });
     } finally { await parent.close(); }
   }
 
   async missingParentDirectories(requestedFilePath: string): Promise<readonly string[]> {
-    const workspacePath = this.canonicalPath(requestedFilePath);
-    const segments = workspacePath.split('/');
+    const rootedDirectory = this.canonicalPath(requestedFilePath);
+    const segments = rootedDirectory.split('/');
     segments.pop();
     const missing: string[] = [];
     for (let index = 0; index < segments.length; index += 1) {
@@ -230,17 +230,17 @@ export class WorkspaceFileRoot {
     return Object.freeze(missing);
   }
 
-  async openDirectory(requestedPath: string): Promise<WorkspaceDirectoryHandle> {
-    const workspacePath = this.canonicalPath(requestedPath);
-    const opened = await this.#openDirectorySegments(workspacePath === '.' ? [] : workspacePath.split('/'), requestedPath);
+  async openDirectory(requestedPath: string): Promise<RootedDirectoryHandle> {
+    const rootedDirectory = this.canonicalPath(requestedPath);
+    const opened = await this.#openDirectorySegments(rootedDirectory === '.' ? [] : rootedDirectory.split('/'), requestedPath);
     const stat: BigIntStats = await opened.handle.stat({ bigint: true });
     let closed = false;
     const assertOpen = () => {
       this.#assertOpen();
-      if (closed) throw new Error(`Workspace directory handle is closed: ${workspacePath}`);
+      if (closed) throw new Error(`Rooted directory handle is closed: ${rootedDirectory}`);
     };
-    const authority: WorkspaceDirectoryHandle = Object.freeze({
-      path: workspacePath,
+    const authority: RootedDirectoryHandle = Object.freeze({
+      path: rootedDirectory,
       identity: identity(stat),
       size: numberFromBigInt(stat.size, 'directory size'),
       mode: Number(stat.mode),
@@ -263,13 +263,13 @@ export class WorkspaceFileRoot {
 
   /** Stable procfs path used only to hand a held directory to a child process. */
   async commandDirectory(requestedPath: string): Promise<{ readonly path: string; close(): Promise<void> }> {
-    const workspacePath = this.canonicalPath(requestedPath);
-    const directory = await this.#openDirectorySegments(workspacePath === '.' ? [] : workspacePath.split('/'), requestedPath);
+    const rootedDirectory = this.canonicalPath(requestedPath);
+    const directory = await this.#openDirectorySegments(rootedDirectory === '.' ? [] : rootedDirectory.split('/'), requestedPath);
     const commandPath = `/proc/${String(process.pid)}/fd/${String(directory.handle.fd)}`;
     let closed = false;
     const assertOpen = () => {
       this.#assertOpen();
-      if (closed) throw new Error(`Workspace command directory is closed: ${workspacePath}`);
+      if (closed) throw new Error(`Rooted command directory is closed: ${rootedDirectory}`);
     };
     const authority: { readonly path: string; close(): Promise<void> } = Object.freeze({
       get path() {
@@ -285,25 +285,25 @@ export class WorkspaceFileRoot {
     return authority;
   }
 
-  async [openMutationDirectory](requestedPath: string): Promise<WorkspaceMutationDirectory> {
-    const workspacePath = normalizeWorkspacePath(requestedPath, this.#deniedRootEntries, true);
-    const directory = await this.#openDirectorySegments(workspacePath === '.' ? [] : workspacePath.split('/'), requestedPath);
+  async [openMutationDirectory](requestedPath: string): Promise<RootedMutationDirectory> {
+    const rootedDirectory = normalizeRootedPath(requestedPath, this.#deniedRootEntries, true);
+    const directory = await this.#openDirectorySegments(rootedDirectory === '.' ? [] : rootedDirectory.split('/'), requestedPath);
     const base = fdPath(directory.handle.fd);
     let closed = false;
     const assertOpen = () => {
       this.#assertOpen();
-      if (closed) throw new Error(`Workspace mutation directory is closed: ${workspacePath}`);
+      if (closed) throw new Error(`Rooted mutation directory is closed: ${rootedDirectory}`);
     };
     const entryPath = (name: string) => `${base}/${normalizeLeafName(name)}`;
-    const authority: WorkspaceMutationDirectory = Object.freeze({
-      path: workspacePath,
+    const authority: RootedMutationDirectory = Object.freeze({
+      path: rootedDirectory,
       async status(name: string) {
         assertOpen();
         const leaf = normalizeLeafName(name);
         let stat: BigIntStats;
         try { stat = await lstat(entryPath(leaf), { bigint: true }); }
-        catch (error) { if (nodeCode(error) === 'ENOENT') return Object.freeze({ kind: 'absent', path: joinPath(workspacePath, leaf) }); throw error; }
-        const resultPath = joinPath(workspacePath, leaf);
+        catch (error) { if (nodeCode(error) === 'ENOENT') return Object.freeze({ kind: 'absent', path: joinPath(rootedDirectory, leaf) }); throw error; }
+        const resultPath = joinPath(rootedDirectory, leaf);
         if (stat.isSymbolicLink()) return Object.freeze({ kind: 'symlink', path: resultPath });
         if (stat.isFile()) return Object.freeze({ kind: 'file', path: resultPath, identity: identity(stat), size: numberFromBigInt(stat.size, 'file size'), mode: Number(stat.mode) });
         if (stat.isDirectory()) return Object.freeze({ kind: 'directory', path: resultPath, identity: identity(stat), mode: Number(stat.mode) });
@@ -320,8 +320,8 @@ export class WorkspaceFileRoot {
         const handle = await open(entryPath(name), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
         try {
           const stat: BigIntStats = await handle.stat({ bigint: true });
-          if (!stat.isFile()) throw new Error(`Workspace transaction entry is not a regular file: ${name}`);
-          if (stat.size > BigInt(maxBytes)) throw new Error(`Workspace transaction entry exceeds the read limit: ${name}`);
+          if (!stat.isFile()) throw new Error(`Rooted transaction entry is not a regular file: ${name}`);
+          if (stat.size > BigInt(maxBytes)) throw new Error(`Rooted transaction entry exceeds the read limit: ${name}`);
           return await handle.readFile();
         } finally { await handle.close(); }
       },
@@ -383,36 +383,36 @@ export class WorkspaceFileRoot {
   #assertMount(fd: number, requestedPath: string): void {
     const mountId = readMountId(fd);
     if (mountId !== this.#rootMountId) {
-      throw new ToolInputError(`Path crosses the adopted workspace mount: ${requestedPath}`, { path: requestedPath });
+      throw new ToolInputError(`Path crosses the adopted root mount: ${requestedPath}`, { path: requestedPath });
     }
   }
 
   #assertOpen(): void {
-    if (this.#closed) throw new Error('Workspace file root has been released.');
+    if (this.#closed) throw new Error('Rooted file authority has been released.');
   }
 }
 
 /** Package-internal mutation authority. It is deliberately absent from the package entrypoint. */
-export function openWorkspaceMutationDirectory(root: WorkspaceFileRoot, requestedPath: string): Promise<WorkspaceMutationDirectory> {
-  if (!isWorkspaceFileRoot(root)) throw new TypeError('Workspace mutations require an adopted WorkspaceFileRoot.');
+export function openRootedMutationDirectory(root: RootedFileAuthority, requestedPath: string): Promise<RootedMutationDirectory> {
+  if (!isRootedFileAuthority(root)) throw new TypeError('Rooted mutations require an adopted RootedFileAuthority.');
   return root[openMutationDirectory](requestedPath);
 }
 
-export function isWorkspaceFileRoot(value: unknown): value is WorkspaceFileRoot {
-  return typeof value === 'object' && value !== null && ownedRoots.has(value as WorkspaceFileRoot);
+export function isRootedFileAuthority(value: unknown): value is RootedFileAuthority {
+  return typeof value === 'object' && value !== null && ownedRoots.has(value as RootedFileAuthority);
 }
 
-export function workspaceFileIdentitiesEqual(left: WorkspaceFileIdentity, right: WorkspaceFileIdentity): boolean {
+export function rootedFileIdentitiesEqual(left: RootedFileIdentity, right: RootedFileIdentity): boolean {
   return left.device === right.device && left.inode === right.inode && left.mode === right.mode && left.links === right.links
     && left.size === right.size && left.modifiedNanoseconds === right.modifiedNanoseconds && left.changedNanoseconds === right.changedNanoseconds;
 }
 
-function makeWorkspaceFileHandle(pathValue: string, handle: FileHandle, stat: BigIntStats, assertRootOpen: () => void): WorkspaceFileHandle {
+function makeRootedFileHandle(pathValue: string, handle: FileHandle, stat: BigIntStats, assertRootOpen: () => void): RootedFileHandle {
   let closed = false;
   const initial = identity(stat);
   const assertOpen = () => {
     assertRootOpen();
-    if (closed) throw new Error(`Workspace file handle is closed: ${pathValue}`);
+    if (closed) throw new Error(`Rooted file handle is closed: ${pathValue}`);
   };
   return Object.freeze({
     path: pathValue,
@@ -444,14 +444,14 @@ function makeWorkspaceFileHandle(pathValue: string, handle: FileHandle, stat: Bi
   });
 }
 
-function identity(stat: BigIntStats): WorkspaceFileIdentity {
+function identity(stat: BigIntStats): RootedFileIdentity {
   return Object.freeze({
     device: String(stat.dev), inode: String(stat.ino), mode: String(stat.mode), links: String(stat.nlink), size: String(stat.size),
     modifiedNanoseconds: String(stat.mtimeNs), changedNanoseconds: String(stat.ctimeNs)
   });
 }
 
-function normalizeWorkspacePath(requestedPath: string, deniedRootEntries: ReadonlySet<string>, allowReservedInternal = false): string {
+function normalizeRootedPath(requestedPath: string, deniedRootEntries: ReadonlySet<string>, allowReservedInternal = false): string {
   if (typeof requestedPath !== 'string' || requestedPath.trim().length === 0) throw new ToolInputError('Path cannot be empty.', { path: requestedPath });
   if (requestedPath.includes('\0')) throw new ToolInputError('Path contains a null byte.', { path: requestedPath });
   if (requestedPath.includes('\\')) throw new ToolInputError('Backslash path separators are not accepted.', { path: requestedPath });
@@ -468,7 +468,7 @@ function normalizeWorkspacePath(requestedPath: string, deniedRootEntries: Readon
 
 function normalizeLeafName(name: string): string {
   if (typeof name !== 'string' || name.length === 0 || name === '.' || name === '..' || name.includes('/') || name.includes('\\') || name.includes('\0')) {
-    throw new TypeError(`Invalid workspace mutation entry name: ${name}`);
+    throw new TypeError(`Invalid rooted mutation entry name: ${name}`);
   }
   return name;
 }
@@ -479,7 +479,7 @@ function ownDeniedEntries(values: readonly string[]): ReadonlySet<string> {
   const entries = new Set<string>();
   for (const value of values) {
     if (typeof value !== 'string' || value.length === 0 || value.includes('/') || value.includes('\\') || value === '.' || value === '..') {
-      throw new TypeError(`Invalid denied workspace root entry: ${value}`);
+      throw new TypeError(`Invalid denied root entry: ${value}`);
     }
     entries.add(value);
   }
@@ -498,7 +498,7 @@ export function openHostDirectoryWithoutAliases(absolutePath: string): number {
       try {
         next = openSync(`${fdPath(current)}/${segment}`, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
       } catch (error) {
-        if (nodeCode(error) === 'ELOOP' || nodeCode(error) === 'ENOTDIR') throw new Error(`Workspace root contains an aliased or non-directory component: ${absolutePath}`, { cause: error });
+        if (nodeCode(error) === 'ELOOP' || nodeCode(error) === 'ENOTDIR') throw new Error(`Root path contains an aliased or non-directory component: ${absolutePath}`, { cause: error });
         throw error;
       }
       closeSync(current);

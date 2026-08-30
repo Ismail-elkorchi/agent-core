@@ -1,14 +1,15 @@
 import type { EvidenceResource } from '@agent-core/evidence';
 import { validateResourceScope } from '@agent-core/tools';
 
-export const WORKSPACE_FILES_SCOPE = 'workspace/files';
-export const WORKSPACE_PROCESSES_SCOPE = 'workspace/processes';
-export const PATCH_JOURNAL_SCOPE = 'workspace/internal/patch-journal';
+export const FILES_SCOPE = 'files';
+export const PROCESSES_SCOPE = 'processes';
+export const PATCH_JOURNAL_SCOPE = 'files/internal/patch-journal';
 
-export function workspaceFileScope(relativePath = ''): string { return scoped(WORKSPACE_FILES_SCOPE, relativePath); }
-export function workspaceProcessScope(processId = ''): string { return scoped(WORKSPACE_PROCESSES_SCOPE, processId); }
-export function workspaceResource(path: string, options: Omit<EvidenceResource, 'uri'> = {}): EvidenceResource {
-  return { uri: `workspace://${path}`, ...options };
+export function fileScope(relativePath = ''): string { return scoped(FILES_SCOPE, relativePath); }
+export function processScope(processId = ''): string { return scoped(PROCESSES_SCOPE, processId); }
+export function rootedFileResource(path: string, options: Omit<EvidenceResource, 'uri'> = {}): EvidenceResource {
+  const clean = path.replaceAll('\\', '/').replace(/^\.?\/+/u, '').replace(/\/+$/u, '');
+  return { uri: clean.length === 0 || clean === '.' ? 'rooted-file:///' : `rooted-file:///${clean}`, ...options };
 }
 
 function scoped(parent: string, child: string): string {

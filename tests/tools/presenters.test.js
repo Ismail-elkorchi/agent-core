@@ -13,7 +13,7 @@ import {
 } from '@agent-core/tools-local';
 
 const hash = 'a'.repeat(64);
-const completeScope = { resources: ['workspace/files'], coverage: 'complete' };
+const completeScope = { resources: ['files'], coverage: 'complete' };
 
 function present(tool, output, options = {}) {
   const scope = options.scope ?? completeScope;
@@ -29,7 +29,7 @@ test('domain presenters preserve their required shape while spending the supplie
     counts: { visited: 12, returned: 9, omitted: { count: 3, relation: 'at_least' } },
     omitted: { ignoreFiles: { count: 0, relation: 'exact' } }, omissions: [{ cause: 'result_limit', count: 3, relation: 'at_least' }], omissionSamples: [],
     entries: ['a/1', 'a/2', 'a/3', 'b/1', 'b/2', 'b/3', 'c/1', 'c/2', 'c/3'].map(path => ({ path, type: 'file' }))
-  }, { scope: { resources: ['workspace/files'], coverage: 'partial', causes: ['result_limit'], omitted: { entries: 3 } }, maxTokens: 300 });
+  }, { scope: { resources: ['files'], coverage: 'partial', causes: ['result_limit'], omitted: { entries: 3 } }, maxTokens: 300 });
   assert.deepEqual([...new Set(listed.results.entries.map(entry => entry.path.split('/')[0]))], ['a', 'b', 'c']);
   assert.deepEqual(listed.results.counts, { visited: 12, returned: 9, omitted: { count: 3, relation: 'at_least' } });
   assert.match(listed.next, /narrower/u);
@@ -47,8 +47,8 @@ test('domain presenters preserve their required shape while spending the supplie
 
   const read = present(readFilesTool, {
     requestedFiles: 3, returnedFiles: 3, failedFiles: 0, returnedBytes: 18_000, coverage: 'partial', failures: [],
-    files: ['a.txt', 'b.txt', 'c.txt'].map((path, index) => ({ path, startLine: 1, lineCount: 100, content: String(index).repeat(6_000), bytes: 6_000, fileBytes: 6_000, eof: false, nextStartLine: 101, rangeSha256: hash, rangeLineEnding: 'lf' }))
-  }, { scope: { resources: ['workspace/files/a.txt', 'workspace/files/b.txt', 'workspace/files/c.txt'], coverage: 'partial', causes: ['range_limit'] }, maxTokens: 700 });
+    files: ['a.txt', 'b.txt', 'c.txt'].map((path, index) => ({ path, startLine: 1, lineCount: 100, content: String(index).repeat(6_000), bytes: 6_000, fileBytes: 6_000, eof: false, truncated: true, nextStartLine: 101, rangeSha256: hash, fullFileSha256: hash, newlineConvention: 'lf', utf8Validation: 'valid' }))
+  }, { scope: { resources: ['files/a.txt', 'files/b.txt', 'files/c.txt'], coverage: 'partial', causes: ['range_limit'] }, maxTokens: 700 });
   assert.deepEqual(read.results.files.map(file => file.path), ['a.txt', 'b.txt', 'c.txt']);
   assert.equal(read.results.files.every(file => file.content.length > 0 && file.continuationLine === 101), true);
   assertWithinBudget(read, 700);
@@ -62,13 +62,13 @@ test('domain presenters preserve their required shape while spending the supplie
       { path: 'a.txt', lineNumber: 2, text: 'needle again', occurrences: [{ startByte: 0, endByte: 6, text: 'needle' }] },
       { path: 'b.txt', lineNumber: 3, text: 'needle ' + 'b'.repeat(2_000), occurrences: [{ startByte: 0, endByte: 6, text: 'needle' }] }
     ]
-  }, { scope: { resources: ['workspace/files'], coverage: 'partial', causes: ['per_file_limit'] }, maxTokens: 700 });
+  }, { scope: { resources: ['files'], coverage: 'partial', causes: ['per_file_limit'] }, maxTokens: 700 });
   assert.deepEqual([...new Set(searched.results.results.map(match => match.path))], ['a.txt', 'b.txt']);
   assert.equal(searched.results.perFileOmissions[0].cause, 'per_file_limit');
   assertWithinBudget(searched, 700);
 
   const patched = present(applyPatchTool, {
-    operationStatus: 'uncertain', transactionOutcome: 'rollback_failed', workspaceState: 'uncertain', dryRun: false,
+    operationStatus: 'uncertain', transactionOutcome: 'rollback_failed', rootState: 'uncertain', dryRun: false,
     files: [
       { path: 'a.txt', operation: 'update', hunkCount: 1, additions: 1, deletions: 1, oldBytes: 1, newBytes: 1, plannedChange: true, finalState: 'uncertain' },
       { path: 'old.txt', destinationPath: 'new.txt', operation: 'move', hunkCount: 0, additions: 0, deletions: 0, oldBytes: 1, newBytes: 1, plannedChange: true, finalState: 'uncertain' }
@@ -77,10 +77,10 @@ test('domain presenters preserve their required shape while spending the supplie
     movedPaths: [], wouldMovePaths: [{ sourcePath: 'old.txt', destinationPath: 'new.txt' }], potentiallyAffectedPaths: ['a.txt', 'old.txt', 'new.txt'],
     totalOperationCount: 2, totalHunkCount: 1, totalAdditions: 1, totalDeletions: 1, failures: [],
     transaction: { outcome: 'rollback_failed', failure: { operation: 'commit_patch', path: 'a.txt', message: 'commit failed' }, rollback: { status: 'uncertain', diagnostics: [{ operation: 'restore', path: 'a.txt', message: 'state unknown' }], strandedPaths: ['a.txt'] } }
-  }, { scope: { resources: ['workspace/files/a.txt', 'workspace/files/old.txt', 'workspace/files/new.txt'], coverage: 'partial', causes: ['workspace_state_uncertain'] }, ok: false });
+  }, { scope: { resources: ['files/a.txt', 'files/old.txt', 'files/new.txt'], coverage: 'partial', causes: ['rooted_file_state_uncertain'] }, ok: false });
   assert.equal(patched.results.operationStatus, 'uncertain');
   assert.equal(patched.results.transactionOutcome, 'rollback_failed');
-  assert.equal(patched.results.workspaceState, 'uncertain');
+  assert.equal(patched.results.rootState, 'uncertain');
   assert.deepEqual(patched.results.files.map(file => [file.path, file.operation, file.additions, file.deletions]), [['a.txt', 'update', 1, 1], ['old.txt', 'move', 0, 0]]);
   assert.equal(patched.results.transaction.outcome, 'rollback_failed');
   assertWithinBudget(patched, 500);

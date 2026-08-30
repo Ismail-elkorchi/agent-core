@@ -25,8 +25,8 @@ export function builtInReadEvidence(
 }
 
 function resourceFromScope(scope: string): EvidenceResource {
-  if (scope === 'workspace/files') return { uri: 'workspace://.' };
-  if (scope.startsWith('workspace/files/')) return { uri: `workspace://${scope.slice('workspace/files/'.length)}` };
+  if (scope === 'files') return { uri: 'rooted-file:///' };
+  if (scope.startsWith('files/')) return { uri: `rooted-file:///${scope.slice('files/'.length)}` };
   if (scope === 'artifacts') return { uri: 'artifact://*' };
   if (scope.startsWith('artifacts/')) return { uri: `artifact://${scope.slice('artifacts/'.length)}` };
   return { uri: `scope://${scope}` };

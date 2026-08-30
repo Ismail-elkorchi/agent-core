@@ -8,9 +8,9 @@ import { AgentRuntime, agentEventCodec } from '@agent-core/runtime';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/evidence';
 import { adoptCommandExecution, defineTool } from '@agent-core/tools';
 import { DEFAULT_LOCAL_TOOL_CONFIGURATION, LocalCommandExecution, execCommandTool } from '@agent-core/tools-local';
-import { testWorkspaceFileRoot } from '../workspace-file-root-helper.js';
+import { testRootedFileAuthority } from '../rooted-file-authority-helper.js';
 
-const boundary = { authorizationPolicyId: 'tests/process-cleanup@1', executionTargetId: 'workspace' };
+const boundary = { authorizationPolicyId: 'tests/process-cleanup@1', executionTargetId: 'rooted-authority' };
 const profile = {
   id: 'scripted', provider: 'scripted',
   capabilities: { streaming: false, toolCalling: true, supportedToolInputs: [{ kind: 'json' }], jsonMode: false, jsonSchema: false, logprobs: false, temperature: true, topP: true },
@@ -29,9 +29,9 @@ function toolResponse(name, value) { return { content: '', model: 'scripted', pr
 async function setup() {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-runtime-process-'));
   const artifacts = new InMemoryArtifactRepository();
-  const manager = new LocalCommandExecution({ artifactRepository: artifacts, workspaceFileRoot: testWorkspaceFileRoot(root), ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+  const manager = new LocalCommandExecution({ artifactRepository: artifacts, rootedFileAuthority: testRootedFileAuthority(root), ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
   const events = new InMemoryEventRepository(agentEventCodec);
-  const services = { workspaceFileRoot: testWorkspaceFileRoot(root), artifactRepository: artifacts, localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION, commandExecution: manager };
+  const services = { rootedFileAuthority: testRootedFileAuthority(root), artifactRepository: artifacts, localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION, commandExecution: manager };
   return { root, artifacts, manager, events, services };
 }
 function createRuntime(input) {
@@ -46,9 +46,9 @@ const longCommand = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("co
 
 const approvalTool = defineTool({
   name: 'approval_write', implementationId: 'tests/approval-write@1', description: 'write', schema: z.strictObject({}), outputSchema: z.strictObject({}),
-  effectEnvelope: { accesses: [{ mode: 'write', scope: 'workspace/files/approval' }], lockScopes: ['workspace/files/approval'] }, canonicalizeInput: (input) => input,
-  deriveEffects: () => ({ accesses: [{ mode: 'write', scope: 'workspace/files/approval' }], lockScopes: ['workspace/files/approval'], recovery: { kind: 'unknown' } }),
-  invoke: async () => ({ kind: 'result', ok: true, summary: 'written', scope: { resources: ['workspace/files/approval'], coverage: 'complete' }, output: {} })
+  effectEnvelope: { accesses: [{ mode: 'write', scope: 'files/approval' }], lockScopes: ['files/approval'] }, canonicalizeInput: (input) => input,
+  deriveEffects: () => ({ accesses: [{ mode: 'write', scope: 'files/approval' }], lockScopes: ['files/approval'], recovery: { kind: 'unknown' } }),
+  invoke: async () => ({ kind: 'result', ok: true, summary: 'written', scope: { resources: ['files/approval'], coverage: 'complete' }, output: {} })
 });
 
 test('a run stops and persists its active process before durable approval suspension', async () => {
@@ -173,7 +173,7 @@ function commandExecutionWithCleanupFailure(commandExecution, message) {
 test('two runtimes sharing one manager clean only their own processes', async () => {
   const state = await setup();
   const ownerB = { runId: 'run-b', turnId: 'turn-b', toolBatchId: 'batch-b', callIndex: 0 };
-  const prepared = await state.manager.prepare({ command: longCommand, workspacePath: '.', pty: false, timeoutMs: 60_000, yieldMs: 100, outputTokenBudget: 1_000, owner: ownerB });
+  const prepared = await state.manager.prepare({ command: longCommand, rootedDirectory: '.', pty: false, timeoutMs: 60_000, yieldMs: 100, outputTokenBudget: 1_000, owner: ownerB });
   const running = await state.manager.start(prepared);
   assert.equal(running.status, 'running');
   const agentA = createRuntime({ ...state, provider: new Provider([done]) });

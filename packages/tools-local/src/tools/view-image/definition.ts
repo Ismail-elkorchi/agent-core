@@ -1,33 +1,33 @@
 import path from 'node:path';
 import type { ArtifactRepository } from '@agent-core/evidence';
 import { artifactScope, defineTool, requireToolService, ToolInputError } from '@agent-core/tools';
-import { workspaceFileScope } from '../../core/resources.js';
+import { fileScope } from '../../core/resources.js';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
 import { builtInReadEvidence } from '../../core/read-evidence.js';
-import { requireWorkspaceFileRoot } from '../../core/workspace.js';
-import { workspaceFileIdentitiesEqual } from '../../core/workspace-file-root.js';
+import { requireRootedFileAuthority } from '../../core/rooted-files.js';
+import { rootedFileIdentitiesEqual } from '../../core/rooted-file-authority.js';
 import { viewImageInputSchema, viewImageOutputSchema } from './schema.js';
 
 export const viewImageTool = defineTool({
   name: 'view_image',
   implementationId: 'agent-core.view-image.v1',
-  description: 'Load a workspace image as model image content without placing a data URL in the event log.',
+  description: 'Load a rooted image as model image content without placing a data URL in the event log.',
   schema: viewImageInputSchema,
   outputSchema: viewImageOutputSchema,
-  requirements: { services: ['workspaceFileRoot', 'artifactRepository', 'localToolConfiguration'], modelInputModalities: ['image'] },
-  effectEnvelope: { accesses: [{ mode: 'read', scope: 'workspace/files' }], lockScopes: [] },
+  requirements: { services: ['rootedFileAuthority', 'artifactRepository', 'localToolConfiguration'], modelInputModalities: ['image'] },
+  effectEnvelope: { accesses: [{ mode: 'read', scope: 'files' }], lockScopes: [] },
   canonicalizeInput(input, context) {
-    return { ...input, path: requireWorkspaceFileRoot(context).canonicalPath(input.path) };
+    return { ...input, path: requireRootedFileAuthority(context).canonicalPath(input.path) };
   },
   deriveEffects(input) {
     return {
-      accesses: [{ mode: 'read', scope: workspaceFileScope(input.path) }],
+      accesses: [{ mode: 'read', scope: fileScope(input.path) }],
       lockScopes: [],
       recovery: { kind: 'unknown' }
     };
   },
   async invoke(input, context) {
-    const root = requireWorkspaceFileRoot(context);
+    const root = requireRootedFileAuthority(context);
     const limits = requireLocalToolConfiguration(context).artifact;
     const handle = await root.openFile(input.path);
     let bytes: Uint8Array;
@@ -46,7 +46,7 @@ export const viewImageTool = defineTool({
       let currentPathIdentity;
       try { currentPathIdentity = await root.fileIdentity(input.path); }
       catch { throw new ToolInputError(`Image file changed or was replaced while it was being read: ${input.path}`); }
-      if (offset !== handle.size || !workspaceFileIdentitiesEqual(await handle.identityNow(), identity) || !workspaceFileIdentitiesEqual(currentPathIdentity, identity)) {
+      if (offset !== handle.size || !rootedFileIdentitiesEqual(await handle.identityNow(), identity) || !rootedFileIdentitiesEqual(currentPathIdentity, identity)) {
         throw new ToolInputError(`Image file changed or was replaced while it was being read: ${input.path}`);
       }
       bytes = new Uint8Array(buffer);
@@ -58,7 +58,7 @@ export const viewImageTool = defineTool({
       label: path.basename(input.path),
       content: bytes,
       mediaType: image.mediaType,
-      description: `Workspace image ${input.path}`
+      description: `Rooted image ${input.path}`
     });
     const output = {
       path: input.path,
@@ -68,13 +68,13 @@ export const viewImageTool = defineTool({
       encodedBytes: bytes.byteLength,
       artifact
     };
-    const scope = { resources: [workspaceFileScope(input.path), artifactScope(artifact.artifactId)], coverage: 'complete' as const };
+    const scope = { resources: [fileScope(input.path), artifactScope(artifact.artifactId)], coverage: 'complete' as const };
     return {
       kind: 'result' as const,
       ok: true,
       summary: `Loaded image ${input.path} (${String(bytes.byteLength)} encoded bytes).`,
       scope,
-      evidence: builtInReadEvidence('read', scope, `Read workspace image ${input.path}.`),
+      evidence: builtInReadEvidence('read', scope, `Read rooted image ${input.path}.`),
       content: [{ type: 'image' as const, artifact, detail: input.detail }],
       output
     };

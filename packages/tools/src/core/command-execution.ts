@@ -25,8 +25,8 @@ export interface CommandExecutionDescriptor {
 
 export interface PrepareCommandRequest {
   readonly command: string;
-  /** Canonical path relative to the command authority's adopted workspace. */
-  readonly workspacePath: string;
+  /** Canonical path relative to the command authority's adopted root. */
+  readonly rootedDirectory: string;
   readonly pty: boolean;
   readonly timeoutMs: number;
   readonly yieldMs: number;
@@ -115,7 +115,7 @@ export interface CommandReconciliationResult {
   readonly resolved: readonly string[];
   readonly unresolved: readonly {
     readonly processId: string;
-    readonly workspace: string;
+    readonly rootPath: string;
     readonly diagnostic: string;
   }[];
 }
@@ -225,7 +225,7 @@ function requirePreparedCommand(prepared: PreparedCommandExecution, authority: C
 
 function validatePrepareRequest(request: PrepareCommandRequest): void {
   if (typeof request.command !== 'string' || request.command.length === 0) throw new TypeError('Command must be non-empty.');
-  if (typeof request.workspacePath !== 'string') throw new TypeError('Command workspace path must be a string.');
+  if (typeof request.rootedDirectory !== 'string') throw new TypeError('Command rooted directory must be a string.');
   if (typeof request.pty !== 'boolean') throw new TypeError('Command PTY selection must be boolean.');
   for (const [name, value] of [['timeoutMs', request.timeoutMs], ['yieldMs', request.yieldMs], ['outputTokenBudget', request.outputTokenBudget]] as const) {
     if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${name} must be a non-negative safe integer.`);

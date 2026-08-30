@@ -1,11 +1,11 @@
 import { spawn } from 'node:child_process';
 import { type ToolExecutionContext, type ToolObservationInput } from '@agent-core/tools';
-import { workspaceFileScope } from '../../core/resources.js';
+import { fileScope } from '../../core/resources.js';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
 import { builtInReadEvidence } from '../../core/read-evidence.js';
-import { requireWorkspaceFileRoot } from '../../core/workspace.js';
-import { workspaceFileSelector } from '../../core/workspace-file-selection.js';
-import { workspaceFileIdentitiesEqual, type WorkspaceFileHandle, type WorkspaceFileRoot } from '../../core/workspace-file-root.js';
+import { requireRootedFileAuthority } from '../../core/rooted-files.js';
+import { rootedFileSelector } from '../../core/rooted-file-selection.js';
+import { rootedFileIdentitiesEqual, type RootedFileHandle, type RootedFileAuthority } from '../../core/rooted-file-authority.js';
 import type { SearchTextInput, SearchTextOutput } from './schema.js';
 
 interface RipgrepData {
@@ -31,7 +31,7 @@ interface SearchAggregate {
 }
 
 export async function searchText(input: SearchTextInput, context: ToolExecutionContext): Promise<ToolObservationInput<SearchTextOutput>> {
-  const root = requireWorkspaceFileRoot(context);
+  const root = requireRootedFileAuthority(context);
   const limits = requireLocalToolConfiguration(context).searchText;
   const resultLimit = clampRequestedLimit(input.resultLimit, limits.maxResults);
   const perFileLimit = clampRequestedLimit(input.perFileLimit, limits.maxResults);
@@ -45,7 +45,7 @@ export async function searchText(input: SearchTextInput, context: ToolExecutionC
   args.push('--', input.query);
   let aggregate: SearchAggregate;
   try {
-    const selection = await workspaceFileSelector(context).select({
+    const selection = await rootedFileSelector(context).select({
       startPath: input.path, patterns: input.patterns, type: 'file', respectGitIgnore: input.respectGitIgnore,
       includeHidden: input.includeHidden, exclude: input.exclude, ...(context.signal ? { signal: context.signal } : {})
     });
@@ -102,7 +102,7 @@ export async function searchText(input: SearchTextInput, context: ToolExecutionC
   }
   const coverage = resultCoverage === 'complete' && countCoverage === 'complete' ? 'complete' as const : 'partial' as const;
   const scope = {
-    resources: [workspaceFileScope(input.path)], coverage,
+    resources: [fileScope(input.path)], coverage,
     filters: { patterns: input.patterns, exclude: input.exclude, respectGitIgnore: input.respectGitIgnore, query: input.query, mode: input.mode },
     limits: { resultLimit, perFileLimit, contextLines: input.contextLines },
     ...(coverage === 'partial' ? { causes: [
@@ -131,13 +131,13 @@ export async function searchText(input: SearchTextInput, context: ToolExecutionC
   };
 }
 
-async function runRipgrep(root: WorkspaceFileRoot, files: readonly string[], args: readonly string[], maxOutputBytes: number, maxFileBytes: number, mode: SearchTextInput['mode'], perFileLimit?: number, signal?: AbortSignal): Promise<SearchAggregate> {
+async function runRipgrep(root: RootedFileAuthority, files: readonly string[], args: readonly string[], maxOutputBytes: number, maxFileBytes: number, mode: SearchTextInput['mode'], perFileLimit?: number, signal?: AbortSignal): Promise<SearchAggregate> {
   const aggregate: SearchAggregate = { files: new Set(), counts: new Map(), matches: [], contexts: new Map(), matchingLineCount: 0, occurrenceCount: 0, examinedFileCount: 0, status: 'completed', perFileOmissions: new Map(), outputTruncated: false };
   let observedBytes = 0;
   const batches = files.length === 0 ? [Object.freeze([] as string[])] : batchesOf(files, 64);
   for (const batch of batches) {
     if (aggregate.status !== 'completed') break;
-    const opened: { readonly path: string; readonly handle: WorkspaceFileHandle }[] = [];
+    const opened: { readonly path: string; readonly handle: RootedFileHandle }[] = [];
     for (const filePath of batch) {
       try {
         const handle = await root.openFile(filePath);
@@ -151,12 +151,12 @@ async function runRipgrep(root: WorkspaceFileRoot, files: readonly string[], arg
       observedBytes = await runRipgrepBatch(opened, args, maxOutputBytes, observedBytes, aggregate, mode, perFileLimit, signal);
       aggregate.examinedFileCount += opened.length;
       if (!signal?.aborted) {
-        for (const { path: workspacePath, handle } of opened) {
+        for (const { path: rootedDirectory, handle } of opened) {
           let currentPathIdentity;
-          try { currentPathIdentity = await root.fileIdentity(workspacePath); }
-          catch { aggregate.status = 'io_error'; aggregate.diagnostic = `Search source was replaced while it was being read: ${workspacePath}`; break; }
-          if (!workspaceFileIdentitiesEqual(await handle.identityNow(), handle.identity) || !workspaceFileIdentitiesEqual(currentPathIdentity, handle.identity)) {
-            aggregate.status = 'io_error'; aggregate.diagnostic = `Search source changed while it was being read: ${workspacePath}`; break;
+          try { currentPathIdentity = await root.fileIdentity(rootedDirectory); }
+          catch { aggregate.status = 'io_error'; aggregate.diagnostic = `Search source was replaced while it was being read: ${rootedDirectory}`; break; }
+          if (!rootedFileIdentitiesEqual(await handle.identityNow(), handle.identity) || !rootedFileIdentitiesEqual(currentPathIdentity, handle.identity)) {
+            aggregate.status = 'io_error'; aggregate.diagnostic = `Search source changed while it was being read: ${rootedDirectory}`; break;
           }
         }
       }
@@ -165,12 +165,12 @@ async function runRipgrep(root: WorkspaceFileRoot, files: readonly string[], arg
   return aggregate;
 }
 
-async function runRipgrepBatch(opened: readonly { readonly path: string; readonly handle: WorkspaceFileHandle }[], args: readonly string[], maxOutputBytes: number, initialObservedBytes: number, aggregate: SearchAggregate, mode: SearchTextInput['mode'], perFileLimit?: number, signal?: AbortSignal): Promise<number> {
+async function runRipgrepBatch(opened: readonly { readonly path: string; readonly handle: RootedFileHandle }[], args: readonly string[], maxOutputBytes: number, initialObservedBytes: number, aggregate: SearchAggregate, mode: SearchTextInput['mode'], perFileLimit?: number, signal?: AbortSignal): Promise<number> {
   let child;
   const pathMap = new Map<string, string>();
-  const inheritedPaths = opened.map(({ path: workspacePath }, index) => {
+  const inheritedPaths = opened.map(({ path: rootedDirectory }, index) => {
     const inheritedPath = `/proc/self/fd/${String(index + 3)}`;
-    pathMap.set(inheritedPath, workspacePath);
+    pathMap.set(inheritedPath, rootedDirectory);
     return inheritedPath;
   });
   try {

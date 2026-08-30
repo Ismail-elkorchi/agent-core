@@ -4,6 +4,7 @@ import { type ToolExecutionContext } from '@agent-core/tools';
 export interface LocalToolConfiguration {
   readonly fileSelection: { readonly maxDepth: number; readonly maxVisitedEntries: number; readonly maxReturnedEntries: number; readonly maxIgnoreFiles: number; readonly maxGlobExpansions: number };
   readonly readFiles: { readonly maxFiles: number; readonly maxLinesPerFile: number; readonly maxBytesPerFile: number; readonly maxTotalBytes: number };
+  readonly editText: { readonly maxFiles: number; readonly maxEditsPerFile: number; readonly maxFileBytes: number; readonly maxNewBytesPerFile: number; readonly maxTotalReplacementBytes: number; readonly maxDiffSummaryBytes: number };
   readonly searchText: { readonly maxResults: number; readonly maxOutputBytes: number; readonly maxFileBytes: number };
   readonly applyPatch: { readonly maxPatchBytes: number; readonly maxOperations: number; readonly maxFileBytes: number; readonly maxNewBytesPerFile: number };
   readonly process: {
@@ -31,6 +32,7 @@ export interface LocalToolConfiguration {
 const DEFAULTS: LocalToolConfiguration = {
   fileSelection: { maxDepth: 20, maxVisitedEntries: 20_000, maxReturnedEntries: 2_000, maxIgnoreFiles: 100, maxGlobExpansions: 256 },
   readFiles: { maxFiles: 50, maxLinesPerFile: 2_000, maxBytesPerFile: 2_000_000, maxTotalBytes: 4_000_000 },
+  editText: { maxFiles: 50, maxEditsPerFile: 500, maxFileBytes: 10_000_000, maxNewBytesPerFile: 10_000_000, maxTotalReplacementBytes: 2_000_000, maxDiffSummaryBytes: 16_000 },
   searchText: { maxResults: 2_000, maxOutputBytes: 4_000_000, maxFileBytes: 20_000_000 },
   applyPatch: { maxPatchBytes: 2_000_000, maxOperations: 500, maxFileBytes: 10_000_000, maxNewBytesPerFile: 10_000_000 },
   process: {
@@ -45,10 +47,11 @@ const CONFIGURATION_SNAPSHOTS = new WeakMap<object, LocalToolConfiguration>();
 
 export function parseLocalToolConfiguration(value: unknown): LocalToolConfiguration {
   const owned = parseJsonObject(value, { maxDepth: 8, maxCollectionEntries: 100, maxStringBytes: 1_000, maxTotalBytes: 32_000 });
-  exactKeys(owned, ['fileSelection', 'readFiles', 'searchText', 'applyPatch', 'process', 'artifact'], 'Local tool configuration');
+  exactKeys(owned, ['fileSelection', 'readFiles', 'editText', 'searchText', 'applyPatch', 'process', 'artifact'], 'Local tool configuration');
   return Object.freeze({
     fileSelection: group(owned.fileSelection, ['maxDepth', 'maxVisitedEntries', 'maxReturnedEntries', 'maxIgnoreFiles', 'maxGlobExpansions'], 'fileSelection'),
     readFiles: group(owned.readFiles, ['maxFiles', 'maxLinesPerFile', 'maxBytesPerFile', 'maxTotalBytes'], 'readFiles'),
+    editText: group(owned.editText, ['maxFiles', 'maxEditsPerFile', 'maxFileBytes', 'maxNewBytesPerFile', 'maxTotalReplacementBytes', 'maxDiffSummaryBytes'], 'editText'),
     searchText: group(owned.searchText, ['maxResults', 'maxOutputBytes', 'maxFileBytes'], 'searchText'),
     applyPatch: group(owned.applyPatch, ['maxPatchBytes', 'maxOperations', 'maxFileBytes', 'maxNewBytesPerFile'], 'applyPatch'),
     process: group(owned.process, ['maxYieldMs', 'maxTimeoutMs', 'maxOutputTokens', 'maxCapturedBytes', 'tailBytes', 'maxActiveProcessesPerRun', 'maxActiveProcesses', 'maxTotalCapturedBytes', 'maxProcessLifetimeMs', 'completedRetentionMs', 'maxPendingOutputBytes'], 'process'),

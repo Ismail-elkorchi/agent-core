@@ -69,7 +69,7 @@ test('decoded evidence deltas project into observation-scoped records', () => {
     {
       action: 'read',
       resources: [{
-        uri: 'workspace://notes/a.txt',
+        uri: 'rooted-file:///notes/a.txt',
         range: { kind: 'line', start: 1, end: 3 },
         sha256: 'a'.repeat(64),
         mediaType: 'text/plain'
@@ -97,7 +97,7 @@ test('decoded evidence deltas project into observation-scoped records', () => {
   assert.equal(records[0].toolName, 'read_files');
   assert.equal(records[0].action, 'read');
   assert.deepEqual(records[0].resources[0], {
-    uri: 'workspace://notes/a.txt',
+    uri: 'rooted-file:///notes/a.txt',
     range: { kind: 'line', start: 1, end: 3 },
     sha256: 'a'.repeat(64),
     mediaType: 'text/plain'

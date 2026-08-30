@@ -8,10 +8,10 @@ import {
   type CommandExecution,
   type CommandExecutionOwner
 } from '@agent-core/tools';
-import { workspaceFileScope, workspaceProcessScope } from '../../core/resources.js';
+import { fileScope, processScope } from '../../core/resources.js';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
 import { presentProcessObservation } from '../../core/presenters.js';
-import { requireWorkspaceFileRoot } from '../../core/workspace.js';
+import { requireRootedFileAuthority } from '../../core/rooted-files.js';
 import { isSuccessfulProcessResult } from '../process-output.js';
 import { execCommandOutputSchema, execCommandSchema } from './schema.js';
 
@@ -24,10 +24,10 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
     schema: execCommandSchema(ptySupported),
     outputSchema: execCommandOutputSchema,
     presentObservation: presentProcessObservation,
-    requirements: { services: ['workspaceFileRoot', 'localToolConfiguration', 'commandExecution'] },
-    effectEnvelope: { accesses: [{ mode: 'execute', scope: workspaceProcessScope() }], lockScopes: [workspaceFileScope()] },
+    requirements: { services: ['rootedFileAuthority', 'localToolConfiguration', 'commandExecution'] },
+    effectEnvelope: { accesses: [{ mode: 'execute', scope: processScope() }], lockScopes: [fileScope()] },
     async canonicalizeInput(input, context) {
-      const root = requireWorkspaceFileRoot(context);
+      const root = requireRootedFileAuthority(context);
       const workdir = root.canonicalPath(input.workdir);
       const directory = await root.openDirectory(workdir);
       await directory.close();
@@ -43,7 +43,7 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
       });
       const preparation = await prepareCommandExecution(executor, {
         command: request.command,
-        workspacePath: request.workdir,
+        rootedDirectory: request.workdir,
         pty: request.pty,
         timeoutMs: request.timeoutMs,
         yieldMs: request.yieldMs,
@@ -65,7 +65,7 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
       });
     },
     deriveEffects() {
-      return { accesses: [{ mode: 'execute', scope: workspaceProcessScope() }], lockScopes: [workspaceFileScope()], recovery: { kind: 'unknown' } };
+      return { accesses: [{ mode: 'execute', scope: processScope() }], lockScopes: [fileScope()], recovery: { kind: 'unknown' } };
     },
     async invoke(input, context) {
       await context.emitProgress?.({ type: 'status', stage: 'process_starting', message: 'Starting command.' });
@@ -83,7 +83,7 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
         kind: 'result' as const, ok: isSuccessfulProcessResult(result),
         summary: result.status === 'running' ? 'Process continues as ' + result.processId + '.' : 'Process ' + result.status + (result.exitCode === undefined ? '' : ' with exit code ' + String(result.exitCode)) + '.',
         scope: {
-          resources: [workspaceProcessScope(result.processId), workspaceFileScope(input.workdir)],
+          resources: [processScope(result.processId), fileScope(input.workdir)],
           coverage: result.combined.omittedBytes > 0 ? 'partial' : 'complete',
           ...(result.combined.omittedBytes > 0 ? { truncated: true, causes: ['output_budget'], omitted: { bytes: result.combined.omittedBytes } } : {})
         },

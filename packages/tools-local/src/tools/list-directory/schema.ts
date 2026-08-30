@@ -1,7 +1,7 @@
 import * as z from 'zod';
 
 export const listDirectoryInputSchema = z.strictObject({
-  path: z.string().trim().min(1).default('.').meta({ description: 'Workspace-relative directory path. Defaults to the workspace root.' }),
+  path: z.string().trim().min(1).default('.').meta({ description: 'Root-relative directory path. Defaults to the adopted root.' }),
   depth: z.int().min(1).default(1).meta({ description: 'Requested number of directory levels. The host clamps this to its traversal limit.' }),
   includeHidden: z.boolean().default(false).meta({ description: 'Include paths with hidden segments. Defaults to false.' }),
   respectGitIgnore: z.boolean().default(true).meta({ description: 'Apply Git ignore rules. Defaults to true.' }),

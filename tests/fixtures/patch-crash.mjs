@@ -19,6 +19,7 @@ await writeFile(path.join(root, stageName), 'after\n', { mode: 0o600 });
 const manifest = {
   version: 1,
   transactionId,
+  transactionDigest: '1'.repeat(64),
   phase: 'prepared',
   createdDirectories: [],
   writes: [{

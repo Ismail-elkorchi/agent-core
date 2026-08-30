@@ -1,9 +1,9 @@
 import { defineTool } from '@agent-core/tools';
-import { workspaceFileScope } from '../../core/resources.js';
-import { workspaceFileSelector } from '../../core/workspace-file-selection.js';
+import { fileScope } from '../../core/resources.js';
+import { rootedFileSelector } from '../../core/rooted-file-selection.js';
 import { presentListDirectoryObservation } from '../../core/presenters.js';
 import { builtInReadEvidence } from '../../core/read-evidence.js';
-import { requireWorkspaceFileRoot } from '../../core/workspace.js';
+import { requireRootedFileAuthority } from '../../core/rooted-files.js';
 import { listDirectoryInputSchema, listDirectoryOutputSchema, type ListDirectoryInput } from './schema.js';
 
 interface CanonicalListDirectoryInput extends ListDirectoryInput { readonly path: string }
@@ -11,24 +11,24 @@ interface CanonicalListDirectoryInput extends ListDirectoryInput { readonly path
 export const listDirectoryTool = defineTool({
   name: 'list_directory',
   implementationId: 'agent-core.list-directory.v1',
-  description: 'List a workspace directory as a sorted flat collection with explicit coverage.',
+  description: 'List a rooted directory as a sorted flat collection with explicit coverage.',
   schema: listDirectoryInputSchema,
   outputSchema: listDirectoryOutputSchema,
   presentObservation: presentListDirectoryObservation,
-  requirements: { services: ['workspaceFileRoot', 'localToolConfiguration', 'workspaceFileSelector'] },
-  effectEnvelope: { accesses: [{ mode: 'read', scope: 'workspace/files' }], lockScopes: [] },
+  requirements: { services: ['rootedFileAuthority', 'localToolConfiguration', 'rootedFileSelector'] },
+  effectEnvelope: { accesses: [{ mode: 'read', scope: 'files' }], lockScopes: [] },
   canonicalizeInput(input, context): CanonicalListDirectoryInput {
     return {
       ...input,
-      path: requireWorkspaceFileRoot(context).canonicalPath(input.path),
+      path: requireRootedFileAuthority(context).canonicalPath(input.path),
       depth: input.depth
     };
   },
   deriveEffects(input) {
-    return { accesses: [{ mode: 'read', scope: workspaceFileScope(input.path) }], lockScopes: [], recovery: { kind: 'unknown' } };
+    return { accesses: [{ mode: 'read', scope: fileScope(input.path) }], lockScopes: [], recovery: { kind: 'unknown' } };
   },
   async invoke(input, context) {
-    const selected = await workspaceFileSelector(context).select({
+    const selected = await rootedFileSelector(context).select({
       startPath: input.path,
       patterns: ['**/*'],
       type: 'any',
@@ -52,7 +52,7 @@ export const listDirectoryTool = defineTool({
       omissionSamples: [...selected.omissionSamples]
     };
     const scope = {
-      resources: [workspaceFileScope(output.path)], coverage: output.coverage,
+      resources: [fileScope(output.path)], coverage: output.coverage,
       filters: { requestedDepth: input.depth },
       limits: { effectiveDepth: selected.effectiveDepth, hostMaximumDepth: selected.hostMaximumDepth },
       ...(output.causes.length > 0 ? { causes: output.causes, omitted: {

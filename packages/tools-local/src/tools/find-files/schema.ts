@@ -1,8 +1,8 @@
 import * as z from 'zod';
 
 export const findFilesInputSchema = z.strictObject({
-  patterns: z.array(z.string().trim().min(1)).min(1).meta({ description: 'One or more workspace glob patterns.' }),
-  path: z.string().trim().min(1).default('.').meta({ description: 'Workspace-relative start directory.' }),
+  patterns: z.array(z.string().trim().min(1)).min(1).meta({ description: 'One or more rooted file glob patterns.' }),
+  path: z.string().trim().min(1).default('.').meta({ description: 'Root-relative start directory.' }),
   type: z.enum(['file', 'directory', 'any']).default('file'),
   respectGitIgnore: z.boolean().default(true),
   includeHidden: z.boolean().default(false),

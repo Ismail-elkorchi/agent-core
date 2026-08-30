@@ -1,7 +1,7 @@
 import { defineTool, isRiskAllowed, ToolInputError } from '@agent-core/tools';
-import { PATCH_JOURNAL_SCOPE, WORKSPACE_FILES_SCOPE, workspaceFileScope } from '../../core/resources.js';
+import { PATCH_JOURNAL_SCOPE, FILES_SCOPE, fileScope } from '../../core/resources.js';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
-import { requireWorkspaceFileRoot } from '../../core/workspace.js';
+import { requireRootedFileAuthority } from '../../core/rooted-files.js';
 import { presentApplyPatchObservation } from '../../core/presenters.js';
 import { APPLY_PATCH_LARK_GRAMMAR } from './grammar.js';
 import { parseApplyPatch, type ParsedApplyPatch } from './patch-parser.js';
@@ -16,7 +16,7 @@ export const applyPatchTool = defineTool({
   schema: applyPatchInputSchema,
   outputSchema: applyPatchOutputSchema,
   presentObservation: presentApplyPatchObservation,
-  requirements: { services: ['workspaceFileRoot', 'localToolConfiguration'] },
+  requirements: { services: ['rootedFileAuthority', 'localToolConfiguration'] },
   textInput: {
     description: 'Pass the patch document directly, starting with *** Begin Patch and ending with *** End Patch.',
     promptGuide: APPLY_PATCH_PROMPT_GUIDE,
@@ -24,11 +24,11 @@ export const applyPatchTool = defineTool({
     decode: (text) => ({ patch: text })
   },
   effectEnvelope: {
-    accesses: [{ mode: 'read', scope: 'workspace/files' }, { mode: 'write', scope: 'workspace/files' }, { mode: 'delete', scope: 'workspace/files' }],
-    lockScopes: [WORKSPACE_FILES_SCOPE, PATCH_JOURNAL_SCOPE]
+    accesses: [{ mode: 'read', scope: 'files' }, { mode: 'write', scope: 'files' }, { mode: 'delete', scope: 'files' }],
+    lockScopes: [FILES_SCOPE, PATCH_JOURNAL_SCOPE]
   },
   async canonicalizeInput(input, context): Promise<CanonicalApplyPatchInput> {
-    const root = requireWorkspaceFileRoot(context);
+    const root = requireRootedFileAuthority(context);
     const limits = requireLocalToolConfiguration(context).applyPatch;
     let tree: ParsedApplyPatch;
     await context.emitProgress?.({ type: 'status', stage: 'patch_parsing', message: 'Parsing patch.' });
@@ -44,7 +44,7 @@ export const applyPatchTool = defineTool({
     const requested = patchPaths(tree);
     for (const item of [...requested, ...Object.keys(input.expectedOldSha256 ?? {})]) {
       const canonical = root.canonicalPath(item);
-      if (canonical !== normalizePatchPath(item)) throw new ToolInputError(`Patch path is not canonical inside the workspace: ${item}`, { path: item, canonical });
+      if (canonical !== normalizePatchPath(item)) throw new ToolInputError(`Patch path is not canonical inside the rootPath: ${item}`, { path: item, canonical });
     }
     return { ...input, dryRun: input.dryRun || context.policy.dryRunWrites === true, tree, limits };
   },
@@ -66,16 +66,16 @@ function normalizePatchPath(value: string): string { return value.replaceAll('\\
 interface PatchAccess { readonly mode: 'read' | 'write' | 'delete'; readonly scope: string }
 
 function operationAccesses(operation: ParsedApplyPatch['operations'][number], dryRun: boolean): PatchAccess[] {
-  const source = workspaceFileScope(normalizePatchPath(operation.path));
+  const source = fileScope(normalizePatchPath(operation.path));
   if (dryRun) {
     return operation.kind === 'update' && operation.moveTo
-      ? [{ mode: 'read', scope: source }, { mode: 'read', scope: workspaceFileScope(normalizePatchPath(operation.moveTo)) }]
+      ? [{ mode: 'read', scope: source }, { mode: 'read', scope: fileScope(normalizePatchPath(operation.moveTo)) }]
       : [{ mode: 'read', scope: source }];
   }
   if (operation.kind === 'add') return [{ mode: 'read', scope: source }, { mode: 'write', scope: source }];
   if (operation.kind === 'delete') return [{ mode: 'read', scope: source }, { mode: 'delete', scope: source }];
   if (operation.moveTo) {
-    const destination = workspaceFileScope(normalizePatchPath(operation.moveTo));
+    const destination = fileScope(normalizePatchPath(operation.moveTo));
     return [{ mode: 'read', scope: source }, { mode: 'delete', scope: source }, { mode: 'read', scope: destination }, { mode: 'write', scope: destination }];
   }
   return [{ mode: 'read', scope: source }, { mode: 'write', scope: source }];

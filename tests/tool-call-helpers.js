@@ -9,7 +9,7 @@ import {
   startPreparedToolCall
 } from '@agent-core/tools';
 import { issueEffectStartTicket, NO_EFFECT_EXPOSURE, startExternalEffect } from '@agent-core/effects';
-import { testPatchJournal } from './workspace-file-root-helper.js';
+import { testPatchJournal } from './rooted-file-authority-helper.js';
 
 export function jsonToolCall(name, value = {}, id) {
   return createToolCall({ ...(id ? { id } : {}), name, input: { kind: 'json', value } });
@@ -22,9 +22,9 @@ export function textToolCall(name, value, id) {
 export async function invokeToolCall(call, tools, context) {
   const ownedCall = createToolCall(call);
   const controller = new AbortController();
-  const workspaceFileRoot = context.services?.workspaceFileRoot;
-  const services = workspaceFileRoot
-    ? { ...context.services, patchJournal: context.services.patchJournal ?? testPatchJournal(workspaceFileRoot) }
+  const rootedFileAuthority = context.services?.rootedFileAuthority;
+  const services = rootedFileAuthority
+    ? { ...context.services, patchJournal: context.services.patchJournal ?? testPatchJournal(rootedFileAuthority) }
     : context.services;
   const preparationContext = {
     ...context,
@@ -32,7 +32,7 @@ export async function invokeToolCall(call, tools, context) {
     signal: context.signal ?? controller.signal,
     boundary: context.boundary ?? {
       authorizationPolicyId: 'tests/tool-policy@1',
-      executionTargetId: String(context.services?.workspaceFileRoot?.displayPath ?? 'tests')
+      executionTargetId: String(context.services?.rootedFileAuthority?.displayPath ?? 'tests')
     }
   };
   const preparation = await prepareToolCall(ownedCall, tools, preparationContext);
@@ -90,7 +90,7 @@ export async function presentToolObservation(tool, call, observation, context, m
     signal: context.signal ?? controller.signal,
     boundary: context.boundary ?? {
       authorizationPolicyId: 'tests/tool-policy@1',
-      executionTargetId: String(context.services?.workspaceFileRoot?.displayPath ?? 'tests')
+      executionTargetId: String(context.services?.rootedFileAuthority?.displayPath ?? 'tests')
     }
   };
   const preparation = await prepareToolCall(ownedCall, [tool], preparationContext);

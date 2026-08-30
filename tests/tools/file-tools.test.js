@@ -8,37 +8,37 @@ import { prepareToolCall } from '@agent-core/tools';
 import { invokePreparedForTest, invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
 import {
   DEFAULT_LOCAL_TOOL_CONFIGURATION,
-  WorkspaceFileSelector,
+  RootedFileSelector,
   findFilesTool,
   listDirectoryTool,
   readFilesTool,
   requireLocalToolConfiguration,
   searchTextTool
 } from '@agent-core/tools-local';
-import { testWorkspaceFileRoot } from '../workspace-file-root-helper.js';
+import { testRootedFileAuthority } from '../rooted-file-authority-helper.js';
 
 const tools = [listDirectoryTool, findFilesTool, readFilesTool, searchTextTool];
 const policy = { allowedRisks: ['read'] };
 
-async function workspace() {
+async function rootedFiles() {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-file-tools-'));
   const configuration = DEFAULT_LOCAL_TOOL_CONFIGURATION;
-  const workspaceFileRoot = testWorkspaceFileRoot(root);
+  const rootedFileAuthority = testRootedFileAuthority(root);
   return {
     root,
     context: {
       policy,
       services: {
-        workspaceFileRoot,
+        rootedFileAuthority,
         localToolConfiguration: configuration,
-        workspaceFileSelector: new WorkspaceFileSelector(workspaceFileRoot, configuration.fileSelection)
+        rootedFileSelector: new RootedFileSelector(rootedFileAuthority, configuration.fileSelection)
       }
     }
   };
 }
 
 test('directory and path selection are sorted, Git-aware, hidden-safe, and match root globs', async () => {
-  const { root, context } = await workspace();
+  const { root, context } = await rootedFiles();
   await mkdir(path.join(root, 'src'));
   await mkdir(path.join(root, '.hidden'));
   await writeFile(path.join(root, '.gitignore'), 'ignored.txt\nignored-dir/\n');
@@ -82,7 +82,7 @@ test('directory and path selection are sorted, Git-aware, hidden-safe, and match
     services: {
       ...context.services,
       localToolConfiguration: shallowConfiguration,
-      workspaceFileSelector: new WorkspaceFileSelector(context.services.workspaceFileRoot, shallowConfiguration.fileSelection)
+      rootedFileSelector: new RootedFileSelector(context.services.rootedFileAuthority, shallowConfiguration.fileSelection)
     }
   };
   const clampedDepth = await invokeToolCall(jsonToolCall('list_directory', { depth: 99 }), tools, shallowContext);
@@ -104,7 +104,7 @@ test('local tool hosts retain an owned configuration snapshot after caller mutat
   await writeFile(path.join(root, 'two.txt'), 'two\n');
   const callerOwned = JSON.parse(JSON.stringify(DEFAULT_LOCAL_TOOL_CONFIGURATION));
   const localToolConfiguration = requireLocalToolConfiguration({ services: { localToolConfiguration: callerOwned } });
-  const context = { policy, services: { workspaceFileRoot: testWorkspaceFileRoot(root), localToolConfiguration } };
+  const context = { policy, services: { rootedFileAuthority: testRootedFileAuthority(root), localToolConfiguration } };
 
   callerOwned.readFiles.maxFiles = 1;
   callerOwned.readFiles.unexpected = 10;
@@ -119,7 +119,7 @@ test('local tool hosts retain an owned configuration snapshot after caller mutat
 });
 
 test('directory traversal continues with partial coverage after an unreadable branch', async (t) => {
-  const { root, context } = await workspace();
+  const { root, context } = await rootedFiles();
   await mkdir(path.join(root, 'readable'));
   await mkdir(path.join(root, 'unreadable'));
   await writeFile(path.join(root, 'readable', 'kept.txt'), 'kept\n');
@@ -138,7 +138,7 @@ test('directory traversal continues with partial coverage after an unreadable br
 });
 
 test('list_directory depth is structural and find_files still traverses to the host depth', async () => {
-  const { root, context } = await workspace();
+  const { root, context } = await rootedFiles();
   await mkdir(path.join(root, 'a-deep'));
   await mkdir(path.join(root, 'a-deep', 'branch'));
   await mkdir(path.join(root, 'z-other'));
@@ -149,7 +149,7 @@ test('list_directory depth is structural and find_files still traverses to the h
 
   const shallowLimits = { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.fileSelection, maxVisitedEntries: 3 };
   const shallowConfiguration = { ...DEFAULT_LOCAL_TOOL_CONFIGURATION, fileSelection: shallowLimits };
-  const shallowContext = { ...context, services: { ...context.services, localToolConfiguration: shallowConfiguration, workspaceFileSelector: new WorkspaceFileSelector(context.services.workspaceFileRoot, shallowLimits) } };
+  const shallowContext = { ...context, services: { ...context.services, localToolConfiguration: shallowConfiguration, rootedFileSelector: new RootedFileSelector(context.services.rootedFileAuthority, shallowLimits) } };
   const shallow = await invokeToolCall(jsonToolCall('list_directory', { depth: 1 }), tools, shallowContext);
   assert.deepEqual(shallow.output.entries.map(entry => entry.path), ['a-deep', 'top.txt', 'z-other']);
   assert.equal(shallow.output.counts.visited, 3);
@@ -158,7 +158,7 @@ test('list_directory depth is structural and find_files still traverses to the h
 
   const hostLimited = { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.fileSelection, maxDepth: 1 };
   const hostConfiguration = { ...DEFAULT_LOCAL_TOOL_CONFIGURATION, fileSelection: hostLimited };
-  const hostContext = { ...context, services: { ...context.services, localToolConfiguration: hostConfiguration, workspaceFileSelector: new WorkspaceFileSelector(context.services.workspaceFileRoot, hostLimited) } };
+  const hostContext = { ...context, services: { ...context.services, localToolConfiguration: hostConfiguration, rootedFileSelector: new RootedFileSelector(context.services.rootedFileAuthority, hostLimited) } };
   const requestedDeeper = await invokeToolCall(jsonToolCall('list_directory', { depth: 3 }), tools, hostContext);
   assert.equal(requestedDeeper.output.coverage, 'partial');
   assert.equal(requestedDeeper.output.causes.includes('host_depth_limit'), true);
@@ -174,7 +174,7 @@ test('list_directory depth is structural and find_files still traverses to the h
 });
 
 test('read_files streams large ranges, preserves batch failures, and hashes raw selected bytes', async () => {
-  const { root, context } = await workspace();
+  const { root, context } = await rootedFiles();
   const prefix = 'ignored-before-range\n'.repeat(150_000);
   await writeFile(path.join(root, 'large.txt'), `${prefix}target-one\r\ntarget-two\r\ntail\r\n`);
   await writeFile(path.join(root, 'raw.txt'), Buffer.from('one\r\ntwo\r\n'));
@@ -190,17 +190,20 @@ test('read_files streams large ranges, preserves batch failures, and hashes raw 
   assert.equal(result.output.files[0].nextStartLine, startLine + 2);
   assert.equal(result.output.files[0].eof, false);
   assert.equal(result.output.files[1].rangeSha256, createHash('sha256').update(Buffer.from('one\r\n')).digest('hex'));
-  assert.equal(result.output.files[1].rangeLineEnding, 'crlf');
-  assert.equal(result.output.files[1].fullFileSha256, undefined);
+  assert.equal(result.output.files[1].newlineConvention, 'crlf');
+  assert.equal(result.output.files[1].fullFileSha256, createHash('sha256').update(Buffer.from('one\r\ntwo\r\n')).digest('hex'));
+  assert.equal(result.output.files[1].truncated, true);
+  assert.equal(result.output.files[1].utf8Validation, 'valid');
   assert.deepEqual(result.output.failures.map((failure) => failure.reason), ['not_found']);
 
   const full = await invokeToolCall(jsonToolCall('read_files', { files: [{ path: 'raw.txt', lineCount: 10 }] }), tools, context);
   assert.equal(full.output.files[0].eof, true);
+  assert.equal(full.output.files[0].truncated, false);
   assert.equal(full.output.files[0].fullFileSha256, createHash('sha256').update(Buffer.from('one\r\ntwo\r\n')).digest('hex'));
 });
 
 test('search_text delegates regex validation to ripgrep and separates line and occurrence counts', async () => {
-  const { root, context } = await workspace();
+  const { root, context } = await rootedFiles();
   await writeFile(path.join(root, 'matches.txt'), 'foo foo\nfoo\nnone\n');
   const result = await invokeToolCall(jsonToolCall('search_text', { query: 'foo', mode: 'matches' }), tools, context);
   assert.equal(result.ok, true);
@@ -232,7 +235,7 @@ test('search_text delegates regex validation to ripgrep and separates line and o
 });
 
 test('nested gitignore negation, ignore limits, and visit limits are deterministic', async () => {
-  const { root, context } = await workspace();
+  const { root, context } = await rootedFiles();
   await mkdir(path.join(root, 'nested'));
   await writeFile(path.join(root, '.gitignore'), 'root-ignore.txt\n');
   await writeFile(path.join(root, 'root-ignore.txt'), 'ignored\n');
@@ -248,7 +251,7 @@ test('nested gitignore negation, ignore limits, and visit limits are determinist
     ...DEFAULT_LOCAL_TOOL_CONFIGURATION,
     fileSelection: { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.fileSelection, maxVisitedEntries: 3, maxIgnoreFiles: 1 }
   };
-  const limitedContext = { ...context, services: { ...context.services, localToolConfiguration: limitedConfiguration, workspaceFileSelector: new WorkspaceFileSelector(context.services.workspaceFileRoot, limitedConfiguration.fileSelection) } };
+  const limitedContext = { ...context, services: { ...context.services, localToolConfiguration: limitedConfiguration, rootedFileSelector: new RootedFileSelector(context.services.rootedFileAuthority, limitedConfiguration.fileSelection) } };
   const limited = await invokeToolCall(jsonToolCall('find_files', { patterns: ['**/*'], includeHidden: true }), tools, limitedContext);
   assert.equal(limited.scope.coverage, 'partial');
   assert.equal(limited.scope.causes.includes('visit_limit'), true);
@@ -256,7 +259,7 @@ test('nested gitignore negation, ignore limits, and visit limits are determinist
 });
 
 test('read_files reports precise EOF, UTF-8, and batch limit outcomes', async () => {
-  const { root, context } = await workspace();
+  const { root, context } = await rootedFiles();
   await writeFile(path.join(root, 'short.txt'), 'one\ntwo');
   await writeFile(path.join(root, 'invalid.txt'), Buffer.from([0x66, 0x6f, 0x80, 0x6f]));
   await writeFile(path.join(root, 'second.txt'), 'second');
@@ -274,7 +277,7 @@ test('read_files reports precise EOF, UTF-8, and batch limit outcomes', async ()
 });
 
 test('read_files handles empty files, unterminated final lines, and UTF-8 split across scan chunks', async () => {
-  const { root, context } = await workspace();
+  const { root, context } = await rootedFiles();
   await writeFile(path.join(root, 'empty.txt'), '');
   await writeFile(path.join(root, 'no-final-newline.txt'), 'one\ntwo');
   await writeFile(path.join(root, 'utf8-boundary.txt'), `${'a'.repeat(65_535)}😀\n`);
@@ -294,7 +297,7 @@ test('read_files handles empty files, unterminated final lines, and UTF-8 split 
 
 test('read_files detects replacement, growth, and truncation of an opened file', async () => {
   for (const mutation of ['replace', 'grow', 'truncate']) {
-    const { root, context } = await workspace();
+    const { root, context } = await rootedFiles();
     const target = path.join(root, 'changing.txt');
     await writeFile(target, 'line\n'.repeat(1_600_000));
     const configuration = { ...DEFAULT_LOCAL_TOOL_CONFIGURATION, readFiles: { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.readFiles, maxBytesPerFile: 16 * 1024 * 1024, maxTotalBytes: 16 * 1024 * 1024 } };
@@ -322,7 +325,7 @@ test('read_files detects replacement, growth, and truncation of an opened file',
 });
 
 test('read_files observes abort during a long streamed scan', async () => {
-  const { root, context } = await workspace();
+  const { root, context } = await rootedFiles();
   await writeFile(path.join(root, 'long.txt'), 'line\n'.repeat(1_600_000));
   const controller = new AbortController();
   const configuration = { ...DEFAULT_LOCAL_TOOL_CONFIGURATION, readFiles: { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.readFiles, maxBytesPerFile: 16 * 1024 * 1024, maxTotalBytes: 16 * 1024 * 1024 } };
@@ -336,7 +339,7 @@ test('read_files observes abort during a long streamed scan', async () => {
 });
 
 test('search_text handles long repositories, context, per-file limits, abort, and missing ripgrep', async () => {
-  const { root, context } = await workspace();
+  const { root, context } = await rootedFiles();
   const many = path.join(root, 'many'); await mkdir(many);
   await Promise.all(Array.from({ length: 1_200 }, (_unused, index) => {
     const name = `${String(index).padStart(4, '0')}-${'long-path-component-'.repeat(5)}.txt`;
@@ -372,7 +375,7 @@ test('search_text handles long repositories, context, per-file limits, abort, an
 });
 
 test('search_text reports independent per-file omissions in matches and files modes while count mode stays exact', async () => {
-  const { root, context } = await workspace();
+  const { root, context } = await rootedFiles();
   await writeFile(path.join(root, 'below.txt'), 'needle\n');
   await writeFile(path.join(root, 'at.txt'), 'needle\nneedle\n');
   await writeFile(path.join(root, 'above.txt'), 'needle\nneedle\nneedle\n');
@@ -407,7 +410,7 @@ test('search_text reports independent per-file omissions in matches and files mo
 });
 
 test('search_text bounds and parses multi-megabyte ripgrep output without quadratic truncation', async () => {
-  const { root, context } = await workspace();
+  const { root, context } = await rootedFiles();
   const line = `needle ${'x'.repeat(1_500)}\n`;
   await writeFile(path.join(root, 'large-search.txt'), line.repeat(2_500));
   const largeConfiguration = {

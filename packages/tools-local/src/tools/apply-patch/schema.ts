@@ -20,10 +20,11 @@ export type ApplyPatchFailureReason =
   | 'not_found'
   | 'not_file'
   | 'binary'
+  | 'invalid_utf8'
   | 'too_large'
   | 'symlink'
   | 'unsafe_link'
-  | 'path_outside_workspace'
+  | 'path_outside_root'
   | 'duplicate_path'
   | 'sha256_mismatch'
   | 'patch_parse_error'
@@ -87,7 +88,7 @@ export interface ApplyPatchFileOutput {
 export interface ApplyPatchOutput {
   operationStatus: ApplyPatchOperationStatus;
   transactionOutcome?: ApplyPatchTransactionOutcome;
-  workspaceState: 'known' | 'uncertain';
+  rootState: 'known' | 'uncertain';
   dryRun: boolean;
   files: ApplyPatchFileOutput[];
   changedPaths: string[];
@@ -128,7 +129,7 @@ const pathPairSchema = z.strictObject({ sourcePath: z.string(), destinationPath:
 export const applyPatchOutputSchema = z.strictObject({
   operationStatus: z.enum(['dry_run', 'no_change', 'applied', 'not_applied', 'uncertain']),
   transactionOutcome: z.enum(['committed', 'committed_with_residue', 'rolled_back', 'rollback_failed']).optional(),
-  workspaceState: z.enum(['known', 'uncertain']),
+  rootState: z.enum(['known', 'uncertain']),
   dryRun: z.boolean(),
   files: z.array(patchFileOutputSchema),
   changedPaths: z.array(z.string()),

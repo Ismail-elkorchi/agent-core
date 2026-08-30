@@ -10,7 +10,7 @@ function evidence(id, summary = 'small') {
     toolName: 'read_files',
     createdAt: '2026-08-09T00:00:00.000Z',
     action: 'read',
-    resources: [{ uri: `workspace://${id}.txt` }],
+    resources: [{ uri: `rooted-file:///${id}.txt` }],
     outcome: 'success',
     summary
   };
@@ -19,9 +19,9 @@ function evidence(id, summary = 'small') {
 test('verification evidence advances over oversized first and final items with bounded stubs', async () => {
   const context = new ContextManager();
   const mutable = evidence('small');
-  mutable.resources[0].uri = 'workspace://small.txt';
+  mutable.resources[0].uri = 'rooted-file:///small.txt';
   context.recordEvidence([evidence('large-first', 'x'.repeat(300)), mutable, evidence('large-final', 'y'.repeat(300))]);
-  mutable.resources[0].uri = 'workspace://mutated.txt';
+  mutable.resources[0].uri = 'rooted-file:///mutated.txt';
   const reader = contextEvidenceExecution({ contextManager: context }).evidence;
   const first = await reader.read({ maxBytes: 220, limit: 1 });
   assert.equal(first.items.length, 1);
@@ -32,7 +32,7 @@ test('verification evidence advances over oversized first and final items with b
 
   const middle = await reader.read({ cursor: first.nextCursor, maxBytes: 500, limit: 1 });
   assert.equal(middle.items[0].id, 'small');
-  assert.equal(middle.items[0].resources[0].uri, 'workspace://small.txt');
+  assert.equal(middle.items[0].resources[0].uri, 'rooted-file:///small.txt');
   assert.ok(Object.isFrozen(context.evidenceSnapshot()[1].resources[0]));
   assert.equal(middle.nextCursor, 'tool:2');
   const final = await reader.read({ cursor: middle.nextCursor, maxBytes: 220, limit: 1 });

@@ -10,10 +10,11 @@ import type {
 import { adoptCommandExecution } from '@agent-core/tools';
 import { parseLocalToolConfiguration, DEFAULT_LOCAL_TOOL_CONFIGURATION, type LocalToolConfiguration } from './core/configuration.js';
 import { LocalCommandExecution, type PtyProcessFactory } from './core/command-execution.js';
-import { WorkspaceFileSelector } from './core/workspace-file-selection.js';
-import { isWorkspaceFileRoot, type WorkspaceFileRoot } from './core/workspace-file-root.js';
+import { RootedFileSelector } from './core/rooted-file-selection.js';
+import { isRootedFileAuthority, type RootedFileAuthority } from './core/rooted-file-authority.js';
 import { TextPatchJournal } from './core/text-write.js';
 import { applyPatchTool } from './tools/apply-patch/index.js';
+import { editTextTool } from './tools/edit-text/index.js';
 import { createExecCommandTool } from './tools/exec-command/index.js';
 import { findFilesTool } from './tools/find-files/index.js';
 import { listDirectoryTool } from './tools/list-directory/index.js';
@@ -25,7 +26,7 @@ import { viewImageTool } from './tools/view-image/index.js';
 import { writeStdinTool } from './tools/write-stdin/index.js';
 
 export interface LocalToolHostOptions {
-  readonly workspaceFileRoot: WorkspaceFileRoot;
+  readonly rootedFileAuthority: RootedFileAuthority;
   readonly artifactRepository: ArtifactRepository;
   readonly processLedgerDirectory?: string;
   /** Application-supplied command authority. The host owns and closes it. */
@@ -40,11 +41,11 @@ export interface LocalToolHostOptions {
 export interface LocalToolHost {
   readonly tools: readonly CompiledToolDefinition[];
   readonly services: Readonly<Record<string, unknown>> & {
-    readonly workspaceFileRoot: WorkspaceFileRoot;
+    readonly rootedFileAuthority: RootedFileAuthority;
     readonly artifactRepository: ArtifactRepository;
     readonly localToolConfiguration: LocalToolConfiguration;
     readonly commandExecution?: CommandExecution;
-    readonly workspaceFileSelector: WorkspaceFileSelector;
+    readonly rootedFileSelector: RootedFileSelector;
     readonly patchJournal?: TextPatchJournal;
   };
   readonly capabilities: readonly string[];
@@ -71,23 +72,23 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
     ? DEFAULT_LOCAL_TOOL_CONFIGURATION
     : parseLocalToolConfiguration(options.configuration);
   const artifactRepository = options.artifactRepository;
-  let workspaceFileRoot: WorkspaceFileRoot | undefined;
+  let rootedFileAuthority: RootedFileAuthority | undefined;
   let patchJournal: TextPatchJournal | undefined;
   try {
     patchJournal = options.patchJournal;
-    if (!isWorkspaceFileRoot(options.workspaceFileRoot)) throw new TypeError('Local tool host requires an adopted WorkspaceFileRoot.');
-    workspaceFileRoot = options.workspaceFileRoot;
+    if (!isRootedFileAuthority(options.rootedFileAuthority)) throw new TypeError('Local tool host requires an adopted RootedFileAuthority.');
+    rootedFileAuthority = options.rootedFileAuthority;
   } catch (error) {
-    patchJournal?.close(); workspaceFileRoot?.close(); throw error;
+    patchJournal?.close(); rootedFileAuthority?.close(); throw error;
   }
-  const adoptedRoot = workspaceFileRoot;
-  const workspaceFileSelector = new WorkspaceFileSelector(adoptedRoot, configuration.fileSelection);
+  const adoptedRoot = rootedFileAuthority;
+  const rootedFileSelector = new RootedFileSelector(adoptedRoot, configuration.fileSelection);
   let commandExecution: CommandExecution | undefined;
   try {
     commandExecution = options.commandExecution === undefined
       ? options.processLedgerDirectory === undefined ? undefined : new LocalCommandExecution({
         artifactRepository,
-        workspaceFileRoot: adoptedRoot,
+        rootedFileAuthority: adoptedRoot,
         ledgerDirectory: path.resolve(options.processLedgerDirectory),
         ...configuration.process,
         ...(options.ptyFactory ? { ptyFactory: options.ptyFactory } : {})
@@ -97,11 +98,11 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
     patchJournal?.close(); adoptedRoot.close(); throw error;
   }
   const services = Object.freeze({
-    workspaceFileRoot: adoptedRoot,
+    rootedFileAuthority: adoptedRoot,
     artifactRepository,
     localToolConfiguration: configuration,
     ...(commandExecution ? { commandExecution } : {}),
-    workspaceFileSelector,
+    rootedFileSelector,
     ...(patchJournal ? { patchJournal } : {})
   });
   const allTools: readonly CompiledToolDefinition[] = Object.freeze([
@@ -109,6 +110,7 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
     findFilesTool,
     readFilesTool,
     searchTextTool,
+    editTextTool,
     applyPatchTool,
     ...(enabledTools.includes('exec_command') ? [createExecCommandTool({ ptySupported: commandExecution?.descriptor.supportsPty ?? false })] : []),
     writeStdinTool,
@@ -124,8 +126,8 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
     if (!commandExecution) return;
     if (result.unresolved.length > 0 && !blocker) {
       blocker = await commandExecution.resourceLeases.acquire({
-        accesses: [{ mode: 'execute', scope: 'workspace/processes' }],
-        lockScopes: ['workspace/files'],
+        accesses: [{ mode: 'execute', scope: 'processes' }],
+        lockScopes: ['files'],
         recovery: { kind: 'unknown' }
       }, 'unresolved-process-reconciliation');
     }
@@ -168,7 +170,7 @@ function selectTools(tools: readonly CompiledToolDefinition[], enabled: readonly
 }
 
 function assertKnownTools(enabled: readonly string[]): void {
-  const known = new Set(['list_directory', 'find_files', 'read_files', 'search_text', 'apply_patch', 'exec_command', 'write_stdin', 'stop_process', 'view_image', 'read_artifact']);
+  const known = new Set(['list_directory', 'find_files', 'read_files', 'search_text', 'edit_text', 'apply_patch', 'exec_command', 'write_stdin', 'stop_process', 'view_image', 'read_artifact']);
   const unknown = enabled.filter((name) => !known.has(name));
   if (unknown.length > 0) throw new Error(`Unknown configured local tools: ${unknown.join(', ')}.`);
 }

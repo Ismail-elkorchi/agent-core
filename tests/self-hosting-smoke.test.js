@@ -8,7 +8,7 @@ import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core
 import {
   DEFAULT_LOCAL_TOOL_CONFIGURATION,
   LocalCommandExecution,
-  WorkspaceFileSelector,
+  RootedFileSelector,
   applyPatchTool,
   execCommandTool,
   findFilesTool,
@@ -16,7 +16,7 @@ import {
   readFilesTool,
   searchTextTool
 } from '@agent-core/tools-local';
-import { testPatchJournal, testWorkspaceFileRoot } from './workspace-file-root-helper.js';
+import { testPatchJournal, testRootedFileAuthority } from './rooted-file-authority-helper.js';
 
 const tools = [listDirectoryTool, findFilesTool, readFilesTool, searchTextTool, applyPatchTool, execCommandTool];
 const binding = Object.freeze({ schemaId: 'agent-core.tests/self-hosting', schemaVersion: 1, subject: Object.freeze({ application: 'self-hosting-smoke' }) });
@@ -40,20 +40,20 @@ test('scripted self-hosting run survives approvals, structured tools, verificati
   const sessions = new InMemorySessionRepository();
   const artifacts = new InMemoryArtifactRepository();
   const session = await sessions.create({ id: 'self-host', provider: 'scripted', model: 'scripted', binding });
-  const workspaceFileRoot = testWorkspaceFileRoot(root);
+  const rootedFileAuthority = testRootedFileAuthority(root);
   const commandExecution = new LocalCommandExecution({
     artifactRepository: artifacts,
-    workspaceFileRoot,
+    rootedFileAuthority,
     maxCapturedBytes: DEFAULT_LOCAL_TOOL_CONFIGURATION.process.maxCapturedBytes,
     tailBytes: DEFAULT_LOCAL_TOOL_CONFIGURATION.process.tailBytes
   });
   const services = {
-    workspaceFileRoot,
+    rootedFileAuthority,
     artifactRepository: artifacts,
     localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION,
-    patchJournal: testPatchJournal(workspaceFileRoot),
+    patchJournal: testPatchJournal(rootedFileAuthority),
     commandExecution,
-    workspaceFileSelector: new WorkspaceFileSelector(workspaceFileRoot, DEFAULT_LOCAL_TOOL_CONFIGURATION.fileSelection)
+    rootedFileSelector: new RootedFileSelector(rootedFileAuthority, DEFAULT_LOCAL_TOOL_CONFIGURATION.fileSelection)
   };
   const options = {
     provider,

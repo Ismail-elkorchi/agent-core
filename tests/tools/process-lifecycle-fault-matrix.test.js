@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { LocalArtifactRepository } from '@agent-core/evidence/node';
 import { DEFAULT_LOCAL_TOOL_CONFIGURATION, LocalCommandExecution } from '@agent-core/tools-local';
-import { testWorkspaceFileRoot } from '../workspace-file-root-helper.js';
+import { testRootedFileAuthority } from '../rooted-file-authority-helper.js';
 
 const owner = Object.freeze({ runId: 'fault-matrix-run', turnId: 'turn', toolBatchId: 'batch', callIndex: 0 });
 
@@ -124,8 +124,8 @@ test('terminal-state recovery rejects missing, malformed, stale, unauthenticated
   }
 });
 
-function request(workspacePath, source, overrides = {}) {
-  return { command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(source)}`, workspacePath, pty: false, timeoutMs: 5_000, yieldMs: 1, outputTokenBudget: 1_000, owner, ...overrides };
+function request(rootedDirectory, source, overrides = {}) {
+  return { command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(source)}`, rootedDirectory, pty: false, timeoutMs: 5_000, yieldMs: 1, outputTokenBudget: 1_000, owner, ...overrides };
 }
 async function startCommand(manager, input) {
   const { onProgress, ...request } = input;
@@ -135,7 +135,7 @@ async function startCommand(manager, input) {
 async function context() {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-process-faults-'));
   const ledgerDirectory = path.join(root, 'processes');
-  const manager = new LocalCommandExecution({ artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts') }), workspaceFileRoot: testWorkspaceFileRoot(root), ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+  const manager = new LocalCommandExecution({ artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts') }), rootedFileAuthority: testRootedFileAuthority(root), ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
   return { manager, root, ledgerDirectory };
 }
 async function readLedger(directory, processId) { return JSON.parse(await readFile(path.join(directory, `${processId}.json`), 'utf8')); }
@@ -158,7 +158,7 @@ async function terminalFixture() {
   return { root, ledgerDirectory, stateFile, processId };
 }
 function recoveredManager(fixture) {
-  return new LocalCommandExecution({ artifactRepository: new LocalArtifactRepository({ rootDir: path.join(fixture.root, 'recovered-artifacts') }), workspaceFileRoot: testWorkspaceFileRoot(fixture.root), ledgerDirectory: fixture.ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+  return new LocalCommandExecution({ artifactRepository: new LocalArtifactRepository({ rootDir: path.join(fixture.root, 'recovered-artifacts') }), rootedFileAuthority: testRootedFileAuthority(fixture.root), ledgerDirectory: fixture.ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
 }
 function mutateState(change) {
   return async (fixture) => {

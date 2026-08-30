@@ -50,8 +50,8 @@ test('effect recovery admission owns exact capability facts and rejects incomple
   assert.throws(() => decodeEffectRecoveryCapability({
     kind: 'preconditioned_reexecution',
     preconditions: [
-      { resource: 'workspace/a', validatorId: 'sha256', expectedVersion: digest('b') },
-      { resource: 'workspace/a', validatorId: 'sha256', expectedVersion: digest('c') }
+      { resource: 'files/a', validatorId: 'sha256', expectedVersion: digest('b') },
+      { resource: 'files/a', validatorId: 'sha256', expectedVersion: digest('c') }
     ]
   }), /unique/iu);
   assert.throws(() => decodeEffectRecoveryCapability({ kind: 'idempotency_key', service: 'provider', key: 'key' }), /timestamp/iu);

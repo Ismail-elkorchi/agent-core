@@ -1,9 +1,9 @@
 import { defineTool } from '@agent-core/tools';
-import { workspaceFileScope } from '../../core/resources.js';
-import { workspaceFileSelector } from '../../core/workspace-file-selection.js';
+import { fileScope } from '../../core/resources.js';
+import { rootedFileSelector } from '../../core/rooted-file-selection.js';
 import { presentFindFilesObservation } from '../../core/presenters.js';
 import { builtInReadEvidence } from '../../core/read-evidence.js';
-import { requireWorkspaceFileRoot } from '../../core/workspace.js';
+import { requireRootedFileAuthority } from '../../core/rooted-files.js';
 import { findFilesInputSchema, findFilesOutputSchema, type FindFilesInput } from './schema.js';
 
 interface CanonicalFindFilesInput extends FindFilesInput { readonly path: string }
@@ -11,20 +11,20 @@ interface CanonicalFindFilesInput extends FindFilesInput { readonly path: string
 export const findFilesTool = defineTool({
   name: 'find_files',
   implementationId: 'agent-core.find-files.v1',
-  description: 'Find workspace files or directories using the common glob and ignore semantics.',
+  description: 'Find rooted files or directories using the common glob and ignore semantics.',
   schema: findFilesInputSchema,
   outputSchema: findFilesOutputSchema,
   presentObservation: presentFindFilesObservation,
-  requirements: { services: ['workspaceFileRoot', 'workspaceFileSelector'] },
-  effectEnvelope: { accesses: [{ mode: 'read', scope: 'workspace/files' }], lockScopes: [] },
+  requirements: { services: ['rootedFileAuthority', 'rootedFileSelector'] },
+  effectEnvelope: { accesses: [{ mode: 'read', scope: 'files' }], lockScopes: [] },
   canonicalizeInput(input, context): CanonicalFindFilesInput {
-    return { ...input, path: requireWorkspaceFileRoot(context).canonicalPath(input.path) };
+    return { ...input, path: requireRootedFileAuthority(context).canonicalPath(input.path) };
   },
   deriveEffects(input) {
-    return { accesses: [{ mode: 'read', scope: workspaceFileScope(input.path) }], lockScopes: [], recovery: { kind: 'unknown' } };
+    return { accesses: [{ mode: 'read', scope: fileScope(input.path) }], lockScopes: [], recovery: { kind: 'unknown' } };
   },
   async invoke(input, context) {
-    const selected = await workspaceFileSelector(context).select({
+    const selected = await rootedFileSelector(context).select({
       startPath: input.path,
       patterns: input.patterns,
       type: input.type,
@@ -47,7 +47,7 @@ export const findFilesTool = defineTool({
       omissionSamples: [...selected.omissionSamples]
     };
     const scope = {
-      resources: [workspaceFileScope(output.path)], coverage: output.coverage,
+      resources: [fileScope(output.path)], coverage: output.coverage,
       filters: { patterns: input.patterns, exclude: input.exclude, type: input.type }, limits: { hostMaximumDepth: selected.hostMaximumDepth },
       ...(output.causes.length > 0 ? { causes: output.causes, omitted: {
         entries: { count: output.counts.omitted.count, relation: output.counts.omitted.relation },

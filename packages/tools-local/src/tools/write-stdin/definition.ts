@@ -5,7 +5,7 @@ import {
   type CommandExecution,
   type CommandExecutionOwner
 } from '@agent-core/tools';
-import { workspaceProcessScope } from '../../core/resources.js';
+import { processScope } from '../../core/resources.js';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
 import { presentProcessObservation } from '../../core/presenters.js';
 import { isSuccessfulProcessResult } from '../process-output.js';
@@ -17,15 +17,15 @@ export const writeStdinTool = defineTool({
   schema: writeStdinInputSchema, outputSchema: writeStdinOutputSchema,
   presentObservation: presentProcessObservation,
   requirements: { services: ['localToolConfiguration', 'commandExecution'] },
-  effectEnvelope: { accesses: [{ mode: 'execute', scope: workspaceProcessScope() }], lockScopes: [workspaceProcessScope()] },
+  effectEnvelope: { accesses: [{ mode: 'execute', scope: processScope() }], lockScopes: [processScope()] },
   canonicalizeInput(input, context) {
     const limits = requireLocalToolConfiguration(context).process;
     return { ...input, yieldMs: clampRequestedLimit(input.yieldMs, limits.maxYieldMs), outputTokenBudget: clampRequestedLimit(input.outputTokenBudget, limits.maxOutputTokens) };
   },
   deriveEffects(input) {
     return {
-      accesses: [{ mode: 'execute' as const, scope: workspaceProcessScope(input.processId) }],
-      lockScopes: [workspaceProcessScope(input.processId)],
+      accesses: [{ mode: 'execute' as const, scope: processScope(input.processId) }],
+      lockScopes: [processScope(input.processId)],
       recovery: { kind: 'unknown' as const }
     };
   },
@@ -39,7 +39,7 @@ export const writeStdinTool = defineTool({
       kind: 'result' as const, ok: isSuccessfulProcessResult(result),
       summary: result.status === 'running' ? 'Process ' + result.processId + ' is still running.' : 'Process ' + result.processId + ' is ' + result.status + '.',
       scope: {
-        resources: [workspaceProcessScope(result.processId)], coverage: result.combined.omittedBytes > 0 || result.cursorExpired ? 'partial' : 'complete',
+        resources: [processScope(result.processId)], coverage: result.combined.omittedBytes > 0 || result.cursorExpired ? 'partial' : 'complete',
         ...(result.combined.omittedBytes > 0 || result.cursorExpired ? { truncated: true, causes: [result.cursorExpired ? 'cursor_expired' : 'output_budget'], omitted: { bytes: result.combined.omittedBytes } } : {})
       },
       ...(result.artifact ? { content: [{ type: 'artifact' as const, artifact: result.artifact }] } : {}), output: result

@@ -1,6 +1,6 @@
 # `@agent-core/tools`
 
-Domain-neutral tool definitions, effects, per-call authorization, policy, validation, registries, observations, and observation presentations. Node and workspace implementations live in `@agent-core/tools-local`.
+Domain-neutral tool definitions, effects, per-call authorization, policy, validation, registries, observations, and observation presentations. Node-local implementations live in `@agent-core/tools-local`.
 
 The runtime boundary is decode → canonicalize → derive call-specific effects → authorize → invoke → validate output → persist. Effects contain resource accesses, scheduling locks, dependencies, and capability-specific recovery proof. Missing proof is `unknown`; it never grants replay authority. Authorization applies to the exact persisted fingerprint.
 

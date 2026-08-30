@@ -30,9 +30,9 @@ import {
   type ToolProgress,
   type ToolResourceLease
 } from '@agent-core/tools';
-import { workspaceProcessScope } from './resources.js';
+import { processScope } from './resources.js';
 import type { OwnedProcessTree } from './process-tree.js';
-import { isWorkspaceFileRoot, type WorkspaceFileRoot } from './workspace-file-root.js';
+import { isRootedFileAuthority, type RootedFileAuthority } from './rooted-file-authority.js';
 import {
   createProcessSupervisorIdentity,
   sendSupervisorCommand,
@@ -45,7 +45,7 @@ import {
 
 export interface LocalCommandExecutionOptions {
   readonly artifactRepository: ArtifactRepository;
-  readonly workspaceFileRoot: WorkspaceFileRoot;
+  readonly rootedFileAuthority: RootedFileAuthority;
   readonly maxCapturedBytes: number;
   readonly tailBytes: number;
   readonly ledgerDirectory?: string;
@@ -66,7 +66,7 @@ interface QueuedProgress { readonly progress: ToolProgress; readonly bytes: numb
 interface ManagedProcess {
   readonly id: string;
   readonly owner: CommandExecutionOwner;
-  readonly workspace: string;
+  readonly rootPath: string;
   readonly tree: SupervisedProcessTree;
   readonly startedAt: number;
   readonly capture: BoundedCapture;
@@ -114,7 +114,7 @@ interface ProcessLedgerEntry {
   readonly supervisorEndpoint: string;
   readonly owner: CommandExecutionOwner;
   readonly startedAt: string;
-  readonly workspace: string;
+  readonly rootPath: string;
   readonly state: 'running' | 'terminal';
   readonly terminalReported: boolean;
   readonly terminal?: CommandExecutionResult;
@@ -167,10 +167,10 @@ export class LocalCommandExecution implements CommandExecution {
   private readonly preparations = new WeakMap<CommandExecutionPreparation, LocalCommandPreparation>();
 
   constructor(private readonly options: LocalCommandExecutionOptions) {
-    if (!isWorkspaceFileRoot(options.workspaceFileRoot)) throw new TypeError('Local command execution requires an adopted WorkspaceFileRoot.');
+    if (!isRootedFileAuthority(options.rootedFileAuthority)) throw new TypeError('Local command execution requires an adopted RootedFileAuthority.');
     this.descriptor = Object.freeze({
       implementationId: 'agent-core.local-command-execution@1',
-      recoveryIdentity: recoveryIdentity(options.ledgerDirectory, options.workspaceFileRoot),
+      recoveryIdentity: recoveryIdentity(options.ledgerDirectory, options.rootedFileAuthority),
       capabilities: Object.freeze(['process']),
       supportsPty: false
     });
@@ -187,7 +187,7 @@ export class LocalCommandExecution implements CommandExecution {
   }
 
   async prepare(request: PrepareCommandRequest): Promise<CommandExecutionPreparation> {
-    const commandDirectory = await this.options.workspaceFileRoot.commandDirectory(request.workspacePath);
+    const commandDirectory = await this.options.rootedFileAuthority.commandDirectory(request.rootedDirectory);
     const owned = new LocalCommandPreparation(this, request, commandDirectory);
     const preparation = createCommandExecutionPreparation(owned.authorization, () => owned.release());
     this.preparations.set(preparation, owned);
@@ -208,7 +208,7 @@ export class LocalCommandExecution implements CommandExecution {
   private async startInDirectory(request: PrepareCommandRequest, options: StartPreparedCommandOptions, workingDirectory: string): Promise<CommandExecutionResult> {
     const reconciliation = await this.ready;
     if (reconciliation.unresolved.length > 0) {
-      throw new Error('An unresolved supervised process blocks new local command starts for this workspace.');
+      throw new Error('An unresolved supervised process blocks new local command starts for this rooted authority.');
     }
     this.pruneExpired();
     if (this.active.size >= this.limits.maxActiveProcesses) throw new Error('Maximum active process count reached.');
@@ -226,7 +226,7 @@ export class LocalCommandExecution implements CommandExecution {
       ...(this.options.supervisorReleaseTimeoutMs ? { releaseTimeoutMs: positive(this.options.supervisorReleaseTimeoutMs, 'supervisorReleaseTimeoutMs') } : {})
     });
     const record: ManagedProcess = {
-      id, owner: Object.freeze({ ...request.owner }), workspace: this.options.workspaceFileRoot.identity.canonicalPath, tree, startedAt: Date.now(),
+      id, owner: Object.freeze({ ...request.owner }), rootPath: this.options.rootedFileAuthority.identity.canonicalPath, tree, startedAt: Date.now(),
       capture: new BoundedCapture(this.options.maxCapturedBytes, this.options.tailBytes),
       history: [], decoder: { stdout: new StringDecoder('utf8'), stderr: new StringDecoder('utf8') },
       activityWaiters: new Set(), progressQueue: [], status: 'running', cursor: 0, oldestCursor: 0, sequence: 0,
@@ -286,7 +286,7 @@ export class LocalCommandExecution implements CommandExecution {
       if (options.signal.aborted) record.abortListener();
     }
     await this.waitForActivity(record, request.yieldMs, 0);
-    if (record.status === 'running' && options.lease) options.lease.transferToProcess(id, workspaceProcessScope(id));
+    if (record.status === 'running' && options.lease) options.lease.transferToProcess(id, processScope(id));
     return this.query(id, request.outputTokenBudget, 0, 0, request.owner);
   }
 
@@ -626,7 +626,7 @@ export class LocalCommandExecution implements CommandExecution {
     return {
       schemaVersion: 1, processId: record.id, supervisorPid: osPid,
       supervisorIdentity: record.tree.supervision.identity, supervisorEndpoint: record.tree.supervision.endpoint, owner: record.owner,
-      startedAt: new Date(record.startedAt).toISOString(), workspace: record.workspace,
+      startedAt: new Date(record.startedAt).toISOString(), rootPath: record.rootPath,
       state: 'running', terminalReported: false
     };
   }
@@ -635,13 +635,13 @@ export class LocalCommandExecution implements CommandExecution {
     if (!this.options.ledgerDirectory) return Object.freeze({ resolved: [], unresolved: [] });
     await mkdir(this.options.ledgerDirectory, { recursive: true, mode: 0o700 });
     const resolved: string[] = [];
-    const unresolved: { processId: string; workspace: string; diagnostic: string }[] = [];
+    const unresolved: { processId: string; rootPath: string; diagnostic: string }[] = [];
     for (const name of await readdir(this.options.ledgerDirectory)) {
       if (!/^proc_[a-f0-9-]+\.json$/u.test(name)) continue;
-      let workspace = '*';
+      let rootPath = '*';
       try {
         const entry = parseLedgerEntry(JSON.parse(await readFile(path.join(this.options.ledgerDirectory, name), 'utf8')));
-        workspace = entry.workspace;
+        rootPath = entry.rootPath;
         if (entry.state === 'terminal' && entry.terminalReported) {
           await this.removeLedger(entry.processId);
           resolved.push(entry.processId);
@@ -665,7 +665,7 @@ export class LocalCommandExecution implements CommandExecution {
         this.recovered.set(entry.processId, Object.freeze({ result }));
         resolved.push(entry.processId);
       } catch (error) {
-        unresolved.push({ processId: name.slice(0, -5), workspace, diagnostic: errorMessage(error) });
+        unresolved.push({ processId: name.slice(0, -5), rootPath, diagnostic: errorMessage(error) });
       }
     }
     return Object.freeze({ resolved: Object.freeze(resolved), unresolved: Object.freeze(unresolved) });
@@ -945,7 +945,7 @@ function parseLedgerEntry(value: unknown): ProcessLedgerEntry {
     || typeof owned.supervisorPid !== 'number' || !Number.isSafeInteger(owned.supervisorPid) || owned.supervisorPid <= 0
     || typeof owned.supervisorIdentity !== 'string' || !/^supervisor_[a-f0-9-]+$/u.test(owned.supervisorIdentity)
     || typeof owned.supervisorEndpoint !== 'string' || owned.supervisorEndpoint.length === 0
-    || typeof owned.startedAt !== 'string' || typeof owned.workspace !== 'string'
+    || typeof owned.startedAt !== 'string' || typeof owned.rootPath !== 'string'
     || (owned.state !== 'running' && owned.state !== 'terminal') || typeof owned.terminalReported !== 'boolean') throw new Error('Invalid process ledger record.');
   const owner = decodeProcessOwner(owned.owner);
   const terminal = owned.terminal === undefined ? undefined : decodeProcessPollResult(owned.terminal);
@@ -963,7 +963,7 @@ function parseLedgerEntry(value: unknown): ProcessLedgerEntry {
     supervisorEndpoint: owned.supervisorEndpoint,
     owner,
     startedAt: owned.startedAt,
-    workspace: owned.workspace,
+    rootPath: owned.rootPath,
     state: owned.state,
     terminalReported: owned.terminalReported,
     ...(terminal ? { terminal } : {}),
@@ -1019,10 +1019,10 @@ function jsonRecord(value: import('@agent-core/json').JsonValue | undefined, lab
 function nonnegativeInteger(value: unknown): value is number { return typeof value === 'number' && Number.isInteger(value) && value >= 0; }
 function processStatus(value: unknown): value is CommandExecutionStatus { return value === 'running' || value === 'exited' || value === 'stopped' || value === 'timed_out' || value === 'failed'; }
 
-function recoveryIdentity(ledgerDirectory: string | undefined, workspaceFileRoot: WorkspaceFileRoot): string {
+function recoveryIdentity(ledgerDirectory: string | undefined, rootedFileAuthority: RootedFileAuthority): string {
   if (ledgerDirectory === undefined) return `local-command:ephemeral:${randomUUID()}`;
   return `local-command:sha256:${createHash('sha256')
-    .update(JSON.stringify({ ledgerDirectory: path.resolve(ledgerDirectory), workspace: workspaceFileRoot.identity }))
+    .update(JSON.stringify({ ledgerDirectory: path.resolve(ledgerDirectory), rootPath: rootedFileAuthority.identity }))
     .digest('hex')}`;
 }
 function requirePid(tree: OwnedProcessTree): number { const pid = tree.child.pid; if (pid === undefined || pid <= 0) throw new Error('Process PID is unavailable.'); return pid; }

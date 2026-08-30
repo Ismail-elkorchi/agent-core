@@ -1,9 +1,9 @@
 import type { EvidenceAction, ToolEvidenceItem } from '@agent-core/evidence';
 import { requireToolService, throwIfAborted, ToolInputError, type ToolExecutionContext } from '@agent-core/tools';
-import { PATCH_JOURNAL_SCOPE, workspaceFileScope, workspaceResource } from '../../core/resources.js';
+import { PATCH_JOURNAL_SCOPE, fileScope, rootedFileResource } from '../../core/resources.js';
 import type { ToolObservationInput } from '@agent-core/tools';
-import { requireWorkspaceFileRoot } from '../../core/workspace.js';
-import type { WorkspaceFileRoot } from '../../core/workspace-file-root.js';
+import { requireRootedFileAuthority } from '../../core/rooted-files.js';
+import type { RootedFileAuthority } from '../../core/rooted-file-authority.js';
 import {
   byteLengthUtf8,
   inspectTextFile,
@@ -47,7 +47,7 @@ interface PreparedPatchOperation {
 
 export async function applyPatch(input: CanonicalApplyPatchInput, context: ToolExecutionContext): Promise<ToolObservationInput<ApplyPatchOutput>> {
   throwIfAborted(context.signal);
-  const root = requireWorkspaceFileRoot(context);
+  const root = requireRootedFileAuthority(context);
   const dryRun = input.dryRun;
   const journal = dryRun ? undefined : requireToolService<TextPatchJournal>(context, 'patchJournal', isTextPatchJournal, 'adopted TextPatchJournal');
   if (journal) return withTextFilePatchJournal(root, journal, (authority) => applyPatchWithAuthority(input, context, authority), context.signal);
@@ -55,7 +55,7 @@ export async function applyPatch(input: CanonicalApplyPatchInput, context: ToolE
 }
 
 export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, context: ToolExecutionContext, authority?: TextPatchJournalAuthority): Promise<ToolObservationInput<ApplyPatchOutput>> {
-  const root = requireWorkspaceFileRoot(context);
+  const root = requireRootedFileAuthority(context);
   const dryRun = input.dryRun;
   await context.emitProgress?.({ type: 'status', stage: 'patch_preparing', message: 'Preparing patch transaction.', completed: 0, total: input.tree.operations.length });
   const { prepared, failures } = await preparePatch(root, input);
@@ -112,7 +112,7 @@ export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, c
   const output: ApplyPatchOutput = {
     operationStatus,
     ...(transactionOutcome ? { transactionOutcome } : {}),
-    workspaceState: operationStatus === 'uncertain' ? 'uncertain' : 'known',
+    rootState: operationStatus === 'uncertain' ? 'uncertain' : 'known',
     dryRun,
     files: prepared.map((operation) => ({
       ...operation.output,
@@ -146,14 +146,14 @@ export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, c
         ? transactionFailureMessage(transaction as Extract<TextTransactionResult, { outcome: 'committed_with_residue' }>)
         : transactionOutcome === 'rolled_back'
           ? 'Patch transaction was rolled back; no requested file changes remain.'
-          : 'Patch rollback failed; workspace state is uncertain for: ' + (wouldChangePaths.join(', ') || 'unknown paths') + '.',
+          : 'Patch rollback failed; rooted file state is uncertain for: ' + (wouldChangePaths.join(', ') || 'unknown paths') + '.',
     scope: {
       resources: transactionOutcome === 'committed_with_residue'
-        ? [...uniquePaths(prepared.flatMap((operation) => operation.changedPaths)).map((item) => workspaceFileScope(item)), PATCH_JOURNAL_SCOPE]
-        : uniquePaths(prepared.flatMap((operation) => operation.changedPaths)).map((item) => workspaceFileScope(item)),
+        ? [...uniquePaths(prepared.flatMap((operation) => operation.changedPaths)).map((item) => fileScope(item)), PATCH_JOURNAL_SCOPE]
+        : uniquePaths(prepared.flatMap((operation) => operation.changedPaths)).map((item) => fileScope(item)),
       coverage: transactionOutcome === 'committed_with_residue' || operationStatus === 'uncertain' ? 'partial' : 'complete',
       ...(transactionOutcome === 'committed_with_residue' ? { causes: ['journal_residue'], omitted: { cleanup: transaction?.outcome === 'committed_with_residue' ? transaction.cleanup.strandedPaths.length : 0 } } : {}),
-      ...(operationStatus === 'uncertain' ? { causes: ['workspace_state_uncertain'], omitted: { potentiallyAffectedPaths: wouldChangePaths.length } } : {})
+      ...(operationStatus === 'uncertain' ? { causes: ['rooted_file_state_uncertain'], omitted: { potentiallyAffectedPaths: wouldChangePaths.length } } : {})
     },
     output,
     evidence: { items: patchEvidenceItems(output) },
@@ -162,7 +162,7 @@ export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, c
 }
 
 /** Builds the one transaction plan used by both dry-run and commit execution. */
-export async function preparePatch(root: WorkspaceFileRoot, input: CanonicalApplyPatchInput): Promise<{
+export async function preparePatch(root: RootedFileAuthority, input: CanonicalApplyPatchInput): Promise<{
   readonly prepared: PreparedPatchOperation[];
   readonly failures: ApplyPatchFailure[];
 }> {
@@ -202,12 +202,12 @@ function patchEvidenceItems(output: ApplyPatchOutput): ToolEvidenceItem[] {
     .filter((file) => file.plannedChange)
     .map((file) => {
       const action = evidenceActionForPatch(file.operation);
-      const resources = [workspaceResource(file.path, {
+      const resources = [rootedFileResource(file.path, {
         ...(file.newSha256 ? { sha256: file.newSha256 } : {}),
         mediaType: 'text/plain'
       })];
       if (file.destinationPath && file.destinationPath !== file.path) {
-        resources.push(workspaceResource(file.destinationPath, {
+        resources.push(rootedFileResource(file.destinationPath, {
           ...(file.newSha256 ? { sha256: file.newSha256 } : {}),
           mediaType: 'text/plain'
         }));
@@ -241,7 +241,7 @@ function evidenceActionForPatch(operation: ApplyPatchFileOutput['operation']): E
 }
 
 async function prepareOperation(
-  root: WorkspaceFileRoot,
+  root: RootedFileAuthority,
   operation: ParsedPatchOperation,
   input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
@@ -259,7 +259,7 @@ async function prepareOperation(
 }
 
 async function prepareAdd(
-  root: WorkspaceFileRoot,
+  root: RootedFileAuthority,
   requestedPath: string,
   content: string,
   additions: number,
@@ -331,7 +331,7 @@ async function prepareAdd(
 }
 
 async function prepareDelete(
-  root: WorkspaceFileRoot,
+  root: RootedFileAuthority,
   requestedPath: string,
   input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
@@ -347,7 +347,7 @@ async function prepareDelete(
   if (duplicate) {
     return { ok: false, failure: withFailureContext(duplicate, 'delete') };
   }
-  const oldSha256 = sha256Text(inspected.file.content);
+  const oldSha256 = inspected.file.sha256;
   const shaFailure = validateExpectedSha(input, requestedPath, inspected.file.path, oldSha256, 'delete');
   if (shaFailure) {
     return { ok: false, failure: shaFailure };
@@ -381,7 +381,7 @@ async function prepareDelete(
 }
 
 async function prepareUpdate(
-  root: WorkspaceFileRoot,
+  root: RootedFileAuthority,
   operation: Extract<ParsedPatchOperation, { kind: 'update' }>,
   input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
@@ -398,7 +398,7 @@ async function prepareUpdate(
     return { ok: false, failure: withFailureContext(sourceDuplicate, operation.moveTo ? 'move' : 'update') };
   }
 
-  const oldSha256 = sha256Text(inspected.file.content);
+  const oldSha256 = inspected.file.sha256;
   const shaFailure = validateExpectedSha(input, operation.path, inspected.file.path, oldSha256, operation.moveTo ? 'move' : 'update');
   if (shaFailure) {
     return { ok: false, failure: shaFailure };
@@ -507,7 +507,7 @@ async function prepareUpdate(
 }
 
 async function inspectNewTarget(
-  root: WorkspaceFileRoot,
+  root: RootedFileAuthority,
   requestedPath: string,
   existsReason: 'already_exists' | 'destination_exists'
 ): Promise<
@@ -519,7 +519,7 @@ async function inspectNewTarget(
     normalizedPath = root.canonicalPath(requestedPath);
   } catch (error) {
     if (error instanceof ToolInputError) {
-      return { ok: false, failure: { path: requestedPath, reason: 'path_outside_workspace', message: error.message } };
+      return { ok: false, failure: { path: requestedPath, reason: 'path_outside_root', message: error.message } };
     }
     throw error;
   }
@@ -668,8 +668,8 @@ function nextActionForFailure(failure: ApplyPatchFailure): string {
   if (failure.reason === 'not_found') {
     return 'Check the path and use an existing text file for update, delete, or move operations.';
   }
-  if (failure.reason === 'path_outside_workspace') {
-    return 'Use a workspace-relative path that stays inside the configured workspace root.';
+  if (failure.reason === 'path_outside_root') {
+    return 'Use a relative path that stays inside the adopted root.';
   }
   if (failure.reason === 'binary') {
     return 'Use apply_patch only for text files.';

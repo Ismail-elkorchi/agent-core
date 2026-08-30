@@ -47,7 +47,7 @@ Preflight before updating existing files:
 - Use unnumbered source text as hunk content; do not copy line numbers from numbered listings.
 
 Rules:
-- Paths are workspace-relative, never absolute.
+- Paths are relative to the adopted root, never absolute.
 - Add File lines must start with +.
 - Update hunks start with @@. Use unchanged context lines with a leading space when possible.
 - Every Update File section has at least one @@ hunk unless it is move-only.
