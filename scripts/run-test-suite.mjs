@@ -10,6 +10,7 @@ const linuxRootCapabilityTests = new Set([
   'tests/tools/artifacts-images.test.js',
   'tests/tools/authorization-invariants.test.js',
   'tests/tools/durable-redaction.test.js',
+  'tests/tools/edit-text.test.js',
   'tests/tools/file-tools.test.js',
   'tests/tools/process-lifecycle-fault-matrix.test.js',
   'tests/tools/process-tools.test.js',
