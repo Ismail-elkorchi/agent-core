@@ -3,13 +3,15 @@ import { hashJson, JsonlEventRepository } from '@agent-core/evidence/node';
 import { AgentOperationCoordinator, AgentSession, agentEventCodec } from '@agent-core/runtime';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 
+const binding = Object.freeze({ schemaId: 'agent-core.tests/session-settlement', schemaVersion: 1, subject: Object.freeze({ fixture: 'fault-session' }) });
+
 class CrashOnCompletionRepository {
   constructor(repository, crashTiming) {
     this.repository = repository;
     this.crashTiming = crashTiming;
   }
   create(input) { return this.repository.create(input); }
-  open(id) { return this.repository.open(id); }
+  open(id, expectedBinding) { return this.repository.open(id, expectedBinding); }
   list() { return this.repository.list(); }
   loadReplayState(id, leaf) { return this.repository.loadReplayState(id, leaf); }
   appendInput(id, input) { return this.repository.appendInput(id, input); }
@@ -37,12 +39,13 @@ const [root, timing] = process.argv.slice(2);
 if (root === undefined || (timing !== 'before' && timing !== 'after')) throw new Error('A root and settlement timing are required.');
 
 const storedSessions = new JsonlSessionRepository({ rootDir: path.join(root, 'sessions') });
-const descriptor = await storedSessions.create({ id: 'fault-session', provider: 'fixture', model: 'fixture' });
+const descriptor = await storedSessions.create({ id: 'fault-session', provider: 'fixture', model: 'fixture', binding });
 const repository = new CrashOnCompletionRepository(storedSessions, timing);
 const events = new JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
 const operations = new AgentOperationCoordinator(events);
 const session = new AgentSession({
   descriptor,
+  expectedBinding: binding,
   repository,
   operations,
   configuration: { provider: 'fixture', model: 'fixture' },

@@ -24,12 +24,12 @@ import type {
   SessionSubmissionInput,
   SessionSubmissionConfiguration,
   SessionSubmissionRecord,
-  SessionSubmissionState,
   SessionSummary,
   SessionSteeringEntry,
   SessionToolCallEntry
 } from './contracts.js';
 import { createSessionSubmissionTransition, ownSessionSubmissionConfiguration, ownSessionSubmissionInput, pendingSessionSubmissions } from './submission-lifecycle.js';
+import { assertSessionBinding, createSessionBinding, decodeSessionBinding, type SessionBindingInput } from './binding.js';
 
 export class InMemorySessionRepository implements SessionRepository {
   private readonly states = new Map<string, SessionState>();
@@ -39,9 +39,14 @@ export class InMemorySessionRepository implements SessionRepository {
     const id = options.id ?? randomUUID();
     return this.serial(() => {
       if (this.states.has(id)) throw new Error(`Session already exists: ${id}`);
+      const binding = createSessionBinding(options.binding);
+      if (options.parent) {
+        const parent = this.requireDescriptor(options.parent);
+        assertSessionBinding(binding, parent.header.binding);
+      }
       const header: SessionHeader = Object.freeze({
-        type: 'session', version: 1, id, timestamp: new Date().toISOString(),
-        ...(options.parentSessionId ? { parentSessionId: options.parentSessionId } : {}),
+        type: 'session', version: 1, id, timestamp: new Date().toISOString(), binding,
+        ...(options.parent ? { parentSessionId: options.parent.id } : {}),
         ...(options.provider ? { provider: options.provider } : {}), ...(options.model ? { model: options.model } : {})
       });
       const state = { header, branchEntries: [], projections: [], submissionRecords: [] };
@@ -50,19 +55,26 @@ export class InMemorySessionRepository implements SessionRepository {
     });
   }
 
-  open(sessionId: string): Promise<SessionDescriptor> { return this.serial(() => sessionFromState(this.require(sessionId))); }
+  open(sessionId: string, expectedBinding: SessionBindingInput): Promise<SessionDescriptor> {
+    return this.serial(() => {
+      const state = this.require(sessionId);
+      assertSessionBinding(expectedBinding, state.header.binding);
+      return sessionFromState(state);
+    });
+  }
 
   list(): Promise<readonly SessionSummary[]> {
     return this.serial(() => Object.freeze([...this.states.values()].map((state) => Object.freeze({
       id: state.header.id, timestamp: state.header.timestamp, updatedAt: sessionUpdatedAt(state),
-      ...(state.header.provider ? { provider: state.header.provider } : {}), ...(state.header.model ? { model: state.header.model } : {})
+      ...(state.header.provider ? { provider: state.header.provider } : {}), ...(state.header.model ? { model: state.header.model } : {}),
+      bindingSchemaId: state.header.binding.schemaId, bindingSchemaVersion: state.header.binding.schemaVersion, bindingSha256: state.header.binding.bindingSha256
     })).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))));
   }
 
-  loadReplayState(sessionId: string, leafId?: string | null): Promise<SessionReplayState> {
+  loadReplayState(session: SessionDescriptor, leafId?: string | null): Promise<SessionReplayState> {
     return this.serial(() => {
-      const state = this.require(sessionId); const session = sessionFromState(state);
-      const branch = Object.freeze(activeBranch(state.branchEntries, leafId === undefined ? session.leafId : leafId));
+      const state = this.requireDescriptor(session); const current = sessionFromState(state);
+      const branch = Object.freeze(activeBranch(state.branchEntries, leafId === undefined ? current.leafId : leafId));
       const compaction = [...branch].reverse().find((entry): entry is SessionCompactionEntry => entry.type === 'compaction');
       const compactionIndex = compaction ? branch.findIndex((entry) => entry.id === compaction.id) : -1;
       const tailStart = compactionIndex + 1;
@@ -73,18 +85,18 @@ export class InMemorySessionRepository implements SessionRepository {
       const openRunIds = tailRunIds.filter((runId) => !endedRunIds.has(runId));
       const latestEndedRunId = terminalProjections.at(-1)?.runId;
       const ledgerRunIds = Object.freeze([...openRunIds, ...(latestEndedRunId ? [latestEndedRunId] : [])]);
-      return Object.freeze({ session, branch, terminalProjections, ...(compaction ? { compaction } : {}), ledgerRunIds });
+      return Object.freeze({ session: current, branch, terminalProjections, ...(compaction ? { compaction } : {}), ledgerRunIds });
     });
   }
 
-  async readConversation(sessionId: string): Promise<readonly SessionConversationItem[]> {
-    const replay = await this.loadReplayState(sessionId);
+  async readConversation(session: SessionDescriptor): Promise<readonly SessionConversationItem[]> {
+    const replay = await this.loadReplayState(session);
     return Object.freeze(replay.branch.filter((entry): entry is SessionConversationItem => entry.type !== 'branch' && entry.type !== 'model_settings'));
   }
 
-  listBranchPoints(sessionId: string): Promise<readonly SessionBranchPoint[]> {
+  listBranchPoints(session: SessionDescriptor): Promise<readonly SessionBranchPoint[]> {
     return this.serial(() => {
-      const state = this.require(sessionId);
+      const state = this.requireDescriptor(session);
       const points: SessionBranchPoint[] = state.projections.map((projection) => Object.freeze({
         entryId: projection.throughEntryId, timestamp: projection.timestamp, kind: 'final' as const,
         finalizationId: projection.finalizationId, runId: projection.runId
@@ -96,9 +108,9 @@ export class InMemorySessionRepository implements SessionRepository {
     });
   }
 
-  appendInput(sessionId: string, input: { runId: string; task: string; instructions?: readonly AgentEffectiveInstruction[] }): Promise<SessionInputEntry> {
+  appendInput(session: SessionDescriptor, input: { runId: string; task: string; instructions?: readonly AgentEffectiveInstruction[] }): Promise<SessionInputEntry> {
     return this.serial(() => {
-      const state = this.require(sessionId);
+      const state = this.requireDescriptor(session);
       const existing = state.branchEntries.find((entry): entry is SessionInputEntry => entry.type === 'input' && entry.runId === input.runId);
       if (existing) {
         if (!sameSessionInput(existing, input)) throw new PersistenceConflictError(`Conflicting session input for run ${input.runId}.`);
@@ -112,12 +124,12 @@ export class InMemorySessionRepository implements SessionRepository {
       return entry;
     });
   }
-  appendSteering(sessionId: string, input: { runId: string; content: string }): Promise<SessionSteeringEntry> {
-    return this.append(sessionId, (parentId) => Object.freeze({ ...baseEntry(parentId), type: 'steering', runId: input.runId, content: input.content }));
+  appendSteering(session: SessionDescriptor, input: { runId: string; content: string }): Promise<SessionSteeringEntry> {
+    return this.append(session, (parentId) => Object.freeze({ ...baseEntry(parentId), type: 'steering', runId: input.runId, content: input.content }));
   }
-  appendAssistant(sessionId: string, input: { runId: string; identity: AgentTurnIdentity; content: string }): Promise<SessionAssistantEntry> {
+  appendAssistant(session: SessionDescriptor, input: { runId: string; identity: AgentTurnIdentity; content: string }): Promise<SessionAssistantEntry> {
     return this.serial(() => {
-      const state = this.require(sessionId);
+      const state = this.requireDescriptor(session);
       const existing = state.branchEntries.find((entry): entry is SessionAssistantEntry => entry.type === 'assistant'
         && entry.runId === input.runId && entry.turnId === input.identity.turnId && entry.requestAttempt === input.identity.requestAttempt);
       if (existing) {
@@ -131,9 +143,9 @@ export class InMemorySessionRepository implements SessionRepository {
       return entry;
     });
   }
-  appendToolCall(sessionId: string, input: { runId: string; identity: AgentToolCallIdentity; call: unknown }): Promise<SessionToolCallEntry> {
+  appendToolCall(session: SessionDescriptor, input: { runId: string; identity: AgentToolCallIdentity; call: unknown }): Promise<SessionToolCallEntry> {
     return this.serial(() => {
-      const state = this.require(sessionId);
+      const state = this.requireDescriptor(session);
       const call = normalizeJsonSafe(input.call).value;
       const existing = state.branchEntries.find((entry): entry is SessionToolCallEntry => entry.type === 'tool_call'
         && entry.runId === input.runId && entry.toolBatchId === input.identity.toolBatchId && entry.callIndex === input.identity.callIndex);
@@ -148,9 +160,9 @@ export class InMemorySessionRepository implements SessionRepository {
       return entry;
     });
   }
-  appendObservation(sessionId: string, input: { runId: string; identity: AgentTurnIdentity & Partial<Pick<AgentToolCallAttemptIdentity, 'toolBatchId' | 'callIndex' | 'callId' | 'toolAttempt'>>; toolName: string; observation: SessionObservationInput }): Promise<SessionObservationEntry> {
+  appendObservation(session: SessionDescriptor, input: { runId: string; identity: AgentTurnIdentity & Partial<Pick<AgentToolCallAttemptIdentity, 'toolBatchId' | 'callIndex' | 'callId' | 'toolAttempt'>>; toolName: string; observation: SessionObservationInput }): Promise<SessionObservationEntry> {
     return this.serial(() => {
-      const state = this.require(sessionId);
+      const state = this.requireDescriptor(session);
       const normalized = normalizedObservationInput(input);
       const key = sessionObservationKey(normalized);
       const existing = key ? state.branchEntries.find((entry): entry is SessionObservationEntry => entry.type === 'observation' && sessionObservationKey(entry) === key) : undefined;
@@ -163,13 +175,13 @@ export class InMemorySessionRepository implements SessionRepository {
       return entry;
     });
   }
-  appendModelSettings(sessionId: string, settings: { provider: string; model: string; temperature?: number; reasoningEffort?: string }): Promise<SessionModelSettingsEntry> {
-    return this.append(sessionId, (parentId) => Object.freeze({ ...baseEntry(parentId), type: 'model_settings', provider: settings.provider, model: settings.model,
+  appendModelSettings(session: SessionDescriptor, settings: { provider: string; model: string; temperature?: number; reasoningEffort?: string }): Promise<SessionModelSettingsEntry> {
+    return this.append(session, (parentId) => Object.freeze({ ...baseEntry(parentId), type: 'model_settings', provider: settings.provider, model: settings.model,
       ...(settings.temperature === undefined ? {} : { temperature: settings.temperature }), ...(settings.reasoningEffort === undefined ? {} : { reasoningEffort: settings.reasoningEffort }) }));
   }
-  appendCompaction(sessionId: string, input: { summary: string; provider: string; model: string }): Promise<SessionCompactionEntry> {
+  appendCompaction(session: SessionDescriptor, input: { summary: string; provider: string; model: string }): Promise<SessionCompactionEntry> {
     return this.serial(() => {
-    const state = this.require(sessionId);
+    const state = this.requireDescriptor(session);
     assertStableBranch(state);
     const summary = input.summary.trim();
     if (summary.length === 0) throw new Error('Session compaction summary must not be empty.');
@@ -181,9 +193,9 @@ export class InMemorySessionRepository implements SessionRepository {
       return entry;
     });
   }
-  branchFrom(sessionId: string, entryId: string, label?: string): Promise<SessionBranchMarkerEntry> {
+  branchFrom(session: SessionDescriptor, entryId: string, label?: string): Promise<SessionBranchMarkerEntry> {
     return this.serial(() => {
-      const state = this.require(sessionId);
+      const state = this.requireDescriptor(session);
       const source = state.branchEntries.find((entry) => entry.id === entryId);
       if (!source) throw new Error(`Unknown entry: ${entryId}`);
       if (source.type !== 'compaction' && !state.projections.some((projection) => projection.throughEntryId === entryId)) {
@@ -194,9 +206,9 @@ export class InMemorySessionRepository implements SessionRepository {
       return entry;
     });
   }
-  projectFinal(sessionId: string, terminalInput: AgentTerminalSnapshot): Promise<SessionFinalProjection> {
+  projectFinal(session: SessionDescriptor, terminalInput: AgentTerminalSnapshot): Promise<SessionFinalProjection> {
     return this.serial(() => {
-      const state = this.require(sessionId); const terminal = createAgentTerminalSnapshot(terminalInput);
+      const state = this.requireDescriptor(session); const terminal = createAgentTerminalSnapshot(terminalInput);
       const existing = state.projections.find((projection) => projection.finalizationId === terminal.finalizationId);
       if (existing) {
         if (terminalSnapshotFingerprint(existing.terminal) !== terminalSnapshotFingerprint(terminal)) throw new PersistenceConflictError(`Conflicting finalization ${terminal.finalizationId}.`);
@@ -212,9 +224,9 @@ export class InMemorySessionRepository implements SessionRepository {
     });
   }
 
-  enqueueSubmission(sessionId: string, input: { submissionId: string; runId: string; input: SessionSubmissionInput; configuration: SessionSubmissionConfiguration }): Promise<void> {
+  enqueueSubmission(session: SessionDescriptor, input: { submissionId: string; runId: string; input: SessionSubmissionInput; configuration: SessionSubmissionConfiguration }): Promise<void> {
     return this.serial(() => {
-      const state = this.require(sessionId);
+      const state = this.requireDescriptor(session);
       if (state.submissionRecords.some((record) => record.submissionId === input.submissionId)) throw new Error(`Duplicate session submission: ${input.submissionId}`);
       state.submissionRecords.push(Object.freeze({
         type: 'submission.queued', submissionId: input.submissionId, runId: input.runId,
@@ -222,21 +234,29 @@ export class InMemorySessionRepository implements SessionRepository {
       }));
     });
   }
-  transitionSubmission(sessionId: string, submissionId: string, outcome: { state: SessionSubmissionState; errorMessage?: string }): Promise<void> {
+  transitionSubmission(session: SessionDescriptor, submissionId: string, outcome:
+    | { readonly state: 'claimed' | 'completed' }
+    | { readonly state: 'suspended'; readonly suspension: import('./contracts.js').SessionSuspensionDescriptor }
+    | { readonly state: 'failed'; readonly errorMessage: string }): Promise<void> {
     return this.serial(() => {
-      const state = this.require(sessionId);
-      const record = createSessionSubmissionTransition(state.submissionRecords, submissionId, outcome.state, outcome.errorMessage);
+      const state = this.requireDescriptor(session);
+      const record = createSessionSubmissionTransition(state.submissionRecords, submissionId, outcome);
       if (record) state.submissionRecords.push(record);
     });
   }
-  loadPendingSubmissions(sessionId: string): Promise<readonly SessionPendingSubmission[]> {
-    return this.serial(() => pendingSessionSubmissions(this.require(sessionId).submissionRecords));
+  loadPendingSubmissions(session: SessionDescriptor): Promise<readonly SessionPendingSubmission[]> {
+    return this.serial(() => pendingSessionSubmissions(this.requireDescriptor(session).submissionRecords));
   }
 
-  private append<T extends SessionBranchEntry>(sessionId: string, create: (parentId: string | null) => T): Promise<T> {
-    return this.serial(() => { const state = this.require(sessionId); const entry = create(branchLeaf(state.branchEntries)); state.branchEntries.push(entry); return entry; });
+  private append<T extends SessionBranchEntry>(session: SessionDescriptor, create: (parentId: string | null) => T): Promise<T> {
+    return this.serial(() => { const state = this.requireDescriptor(session); const entry = create(branchLeaf(state.branchEntries)); state.branchEntries.push(entry); return entry; });
   }
   private require(sessionId: string): SessionState { const state = this.states.get(sessionId); if (!state) throw new Error(`Unknown session: ${sessionId}`); return state; }
+  private requireDescriptor(session: SessionDescriptor): SessionState {
+    const state = this.require(session.id);
+    assertSessionBinding(decodeSessionBinding(session.header.binding), state.header.binding);
+    return state;
+  }
   private serial<T>(operation: () => T | PromiseLike<T>): Promise<T> { const result = this.queue.then(operation); this.queue = result.then(() => undefined, () => undefined); return result; }
 }
 

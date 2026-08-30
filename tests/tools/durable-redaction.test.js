@@ -12,6 +12,7 @@ import { DEFAULT_LOCAL_TOOL_CONFIGURATION, LocalCommandExecution, execCommandToo
 import { testWorkspaceFileRoot } from '../workspace-file-root-helper.js';
 
 const secrets = ['tok_live_1234567890', 'bearer-secret-123456', 'password-value-789', 'environment-value-456', 'process-value-123'];
+const sessionBinding = Object.freeze({ schemaId: 'agent-core.tests/durable-redaction', schemaVersion: 1, subject: Object.freeze({ application: 'durable-redaction' }) });
 const profile = {
   id: 'scripted', provider: 'scripted', capabilities: { streaming: false, toolCalling: true, supportedToolInputs: [{ kind: 'json' }], jsonMode: false, jsonSchema: false, logprobs: false, temperature: true, topP: true },
   modalities: { input: ['text'], output: ['text'] }, limits: { contextTokens: 16_000, outputTokens: 2_000 }, supportedParameters: ['tools', 'maxOutputTokens']
@@ -56,12 +57,12 @@ test('durable event and session JSONL redact tool, metadata, failure, and proces
   await Promise.all([mkdir(runsDir), mkdir(sessionsDir), mkdir(artifactsDir)]);
   const events = new JsonlEventRepository({ rootDir: runsDir, codec: agentEventCodec });
   const sessions = new JsonlSessionRepository({ rootDir: sessionsDir });
-  const session = await sessions.create({ provider: 'scripted', model: 'scripted' });
+  const session = await sessions.create({ provider: 'scripted', model: 'scripted', binding: sessionBinding });
   const artifacts = new LocalArtifactRepository({ rootDir: artifactsDir });
   const manager = new LocalCommandExecution({ artifactRepository: artifacts, workspaceFileRoot: testWorkspaceFileRoot(root), ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
   const agent = new AgentRuntime({
     provider: new Provider(), model: 'scripted', toolBoundary: { authorizationPolicyId: 'tests/redaction@1', executionTargetId: root },
-    repositories: { events, session: { repository: sessions, sessionId: session.id }, artifacts }, tools: [secretResult, secretFailure, execCommandTool],
+    repositories: { events, session: { repository: sessions, descriptor: session }, artifacts }, tools: [secretResult, secretFailure, execCommandTool],
     toolPolicy: { allowedRisks: ['read', 'execute'] }, toolContext: { services: { workspaceFileRoot: testWorkspaceFileRoot(root), artifactRepository: artifacts, localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION, commandExecution: manager } }
   });
   const result = await agent.run({ runId: 'redaction-run', task: 'redact' }).result;

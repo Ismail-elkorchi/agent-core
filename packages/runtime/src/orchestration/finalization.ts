@@ -7,7 +7,7 @@ import {
   type AgentEndedRunResult,
   type AgentTerminalSnapshot
 } from '../run/contracts.js';
-import type { SessionRepository } from '../session/repository.js';
+import type { SessionDescriptor, SessionRepository } from '../session/contracts.js';
 import type { AgentAuditEvent, AgentEvent, AgentProgressEvent } from '../events.js';
 import { AgentFinalizationError, type AgentFinalizationProgress } from '../ports.js';
 
@@ -20,7 +20,7 @@ export class AgentRunFinalizer {
     readonly finalizationId: string;
     readonly events: EventRepository<AgentEvent>;
     readonly append: (event: AgentAuditEvent, idempotencyKey: string) => Promise<EventAppendReceipt>;
-    readonly session?: { readonly repository: SessionRepository; readonly sessionId: string };
+    readonly session?: { readonly repository: SessionRepository; readonly descriptor: SessionDescriptor };
     readonly deliver?: (event: AgentProgressEvent) => void | Promise<void>;
     readonly deliveryDiagnostics?: AgentDeliveryDiagnostic[];
   }) {}
@@ -54,7 +54,7 @@ export class AgentRunFinalizer {
       );
       progress.prepared = true;
       if (this.input.session) {
-        await this.input.session.repository.projectFinal(this.input.session.sessionId, terminal);
+        await this.input.session.repository.projectFinal(this.input.session.descriptor, terminal);
       }
       progress.sessionProjected = true;
       await this.input.append(
@@ -108,7 +108,7 @@ export class AgentRunFinalizer {
     }
     let sessionProjected = this.input.session === undefined || fallback.sessionProjected;
     if (this.input.session) {
-      const replay = await this.input.session.repository.loadReplayState(this.input.session.sessionId);
+      const replay = await this.input.session.repository.loadReplayState(this.input.session.descriptor);
       for (const projection of replay.terminalProjections) {
         if (projection.finalizationId !== this.input.finalizationId) continue;
         if (terminalSnapshotFingerprint(projection.terminal) !== expected) throw new AgentContractError('Conflicting durable session projection.', [`Finalization ${this.input.finalizationId} changed while persistence was being reconciled.`]);

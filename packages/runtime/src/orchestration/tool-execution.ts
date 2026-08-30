@@ -31,7 +31,7 @@ import {
   type AgentToolSettlementRecord
 } from '../operation/tool-state.js';
 import type { AgentApprovalBinding, AgentApprovalRequest, AgentToolCallAttemptIdentity, AgentToolCallIdentity } from '../run/contracts.js';
-import type { SessionRepository } from '../session/repository.js';
+import type { SessionDescriptor, SessionRepository } from '../session/contracts.js';
 import { ContextManager } from '../context/manager.js';
 import { ObservationStore, serializeToolObservationPresentation, type CommittedToolObservation } from './observation-store.js';
 import type { AgentRunController } from './run-controller.js';
@@ -51,7 +51,7 @@ interface ToolExecutionInput {
   readonly resourceLeases?: ResourceLeaseCoordinator;
   readonly contextManager: ContextManager;
   readonly observationStore: ObservationStore;
-  readonly session?: { readonly repository: SessionRepository; readonly sessionId: string };
+  readonly session?: { readonly repository: SessionRepository; readonly descriptor: SessionDescriptor };
   readonly controller: AgentRunController;
   readonly phase: () => AgentOperationPhase;
   readonly transition: (procedure: AgentOperationProcedure, update: (phase: AgentOperationPhase) => AgentOperationPhase) => Promise<void>;
@@ -410,7 +410,7 @@ async function projectObservation(
   const identity = attemptIdentity(phase, callIndex, call, state.toolAttempt);
   try {
     const record = await input.observationStore.projectToolObservation(committed, phase.modelInputModalities);
-    await input.session?.repository.appendObservation(input.session.sessionId, {
+    await input.session?.repository.appendObservation(input.session.descriptor, {
       runId: input.runId, identity, toolName: call.name, observation: sessionObservation(state.settlement.observation)
     });
     await input.append({

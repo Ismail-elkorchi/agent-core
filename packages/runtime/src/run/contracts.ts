@@ -77,6 +77,7 @@ export interface AgentOperationSuspension extends AgentRunIdentity {
   readonly state: 'suspended';
   readonly reason: 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'disposition_outcome_unknown' | 'missing_implementation' | 'user_decision';
   readonly effectId?: string;
+  readonly decisionRequest?: import('../operation/contracts.js').AgentDecisionRequest;
   readonly cleanupDiagnostic?: { readonly kind: 'process_cleanup'; readonly message: string };
   readonly budget: AgentRunBudgetState;
 }

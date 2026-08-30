@@ -2,6 +2,7 @@ import type { ArtifactRef } from '@agent-core/evidence';
 import type { JsonObject, JsonValue } from '@agent-core/json';
 import type { ModelReasoningRequest, ModelResponseFormat } from '@agent-core/model';
 import type { ContextItemInput } from '../context/manager.js';
+import type { SessionBinding, SessionBindingInput } from './binding.js';
 import type {
   AgentEffectiveInstruction,
   AgentTerminalSnapshot,
@@ -9,12 +10,14 @@ import type {
   AgentToolCallIdentity,
   AgentTurnIdentity
 } from '../run/contracts.js';
+import type { AgentDecisionRequest } from '../operation/contracts.js';
 
 export type SessionHeader = Readonly<{
   readonly type: 'session';
   readonly version: 1;
   readonly id: string;
   readonly timestamp: string;
+  readonly binding: SessionBinding;
   readonly parentSessionId?: string;
   readonly provider?: string;
   readonly model?: string;
@@ -154,13 +157,28 @@ export type SessionQueuedSubmission = Readonly<{
 
 export type SessionSubmissionState = 'claimed' | 'suspended' | 'completed' | 'failed';
 
-export type SessionSubmissionTransition = Readonly<{
-  readonly type: `submission.${SessionSubmissionState}`;
+export type SessionSuspensionCategory = 'approval' | 'external_recovery' | 'implementation' | 'user_decision';
+export type SessionSuspensionAction = 'approval' | 'reconcile' | 'resume' | 'decide' | 'abort';
+export interface SessionSuspensionDescriptor {
+  readonly runId: string;
+  readonly submissionId: string;
+  readonly category: SessionSuspensionCategory;
+  readonly reason: 'approval_required' | 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'disposition_outcome_unknown' | 'missing_implementation' | 'user_decision';
+  readonly effectId?: string;
+  readonly actions: readonly SessionSuspensionAction[];
+  readonly decisionRequest?: AgentDecisionRequest;
+}
+
+type SessionSubmissionTransitionBase = Readonly<{
   readonly submissionId: string;
   readonly runId: string;
   readonly timestamp: string;
-  readonly errorMessage?: string;
 }>;
+
+export type SessionSubmissionTransition =
+  | (SessionSubmissionTransitionBase & Readonly<{ readonly type: 'submission.claimed' | 'submission.completed' }>)
+  | (SessionSubmissionTransitionBase & Readonly<{ readonly type: 'submission.suspended'; readonly suspension: SessionSuspensionDescriptor }>)
+  | (SessionSubmissionTransitionBase & Readonly<{ readonly type: 'submission.failed'; readonly errorMessage: string }>);
 
 export type SessionSubmissionRecord = SessionQueuedSubmission | SessionSubmissionTransition;
 
@@ -170,11 +188,13 @@ export interface SessionPendingSubmission {
   readonly state: 'queued' | Extract<SessionSubmissionState, 'claimed' | 'suspended'>;
   readonly input: SessionSubmissionInput;
   readonly configuration: SessionSubmissionConfiguration;
+  readonly suspension?: SessionSuspensionDescriptor;
 }
 
 export interface CreateSessionOptions {
   readonly id?: string;
-  readonly parentSessionId?: string;
+  readonly binding: SessionBindingInput;
+  readonly parent?: SessionDescriptor;
   readonly provider?: string;
   readonly model?: string;
 }
@@ -193,6 +213,9 @@ export interface SessionSummary {
   readonly updatedAt: string;
   readonly provider?: string;
   readonly model?: string;
+  readonly bindingSchemaId: string;
+  readonly bindingSchemaVersion: number;
+  readonly bindingSha256: string;
 }
 
 export interface SessionReplayState {
@@ -205,21 +228,24 @@ export interface SessionReplayState {
 
 export interface SessionRepository {
   create(options: CreateSessionOptions): Promise<SessionDescriptor>;
-  open(sessionId: string): Promise<SessionDescriptor>;
+  open(sessionId: string, expectedBinding: SessionBindingInput): Promise<SessionDescriptor>;
   list(): Promise<readonly SessionSummary[]>;
-  loadReplayState(sessionId: string, leafId?: string | null): Promise<SessionReplayState>;
-  readConversation(sessionId: string): Promise<readonly SessionConversationItem[]>;
-  listBranchPoints(sessionId: string): Promise<readonly SessionBranchPoint[]>;
-  appendInput(sessionId: string, input: { runId: string; task: string; instructions?: readonly AgentEffectiveInstruction[] }): Promise<SessionInputEntry>;
-  appendSteering(sessionId: string, input: { runId: string; content: string }): Promise<SessionSteeringEntry>;
-  appendAssistant(sessionId: string, input: { runId: string; identity: AgentTurnIdentity; content: string }): Promise<SessionAssistantEntry>;
-  appendToolCall(sessionId: string, input: { runId: string; identity: AgentToolCallIdentity; call: unknown }): Promise<SessionToolCallEntry>;
-  appendObservation(sessionId: string, input: { runId: string; identity: AgentTurnIdentity & Partial<Pick<AgentToolCallAttemptIdentity, 'toolBatchId' | 'callIndex' | 'callId' | 'toolAttempt'>>; toolName: string; observation: SessionObservationInput }): Promise<SessionObservationEntry>;
-  appendModelSettings(sessionId: string, settings: { provider: string; model: string; temperature?: number; reasoningEffort?: string }): Promise<SessionModelSettingsEntry>;
-  appendCompaction(sessionId: string, input: { summary: string; provider: string; model: string }): Promise<SessionCompactionEntry>;
-  branchFrom(sessionId: string, entryId: string, label?: string): Promise<SessionBranchMarkerEntry>;
-  projectFinal(sessionId: string, terminal: AgentTerminalSnapshot): Promise<SessionFinalProjection>;
-  enqueueSubmission(sessionId: string, input: { submissionId: string; runId: string; input: SessionSubmissionInput; configuration: SessionSubmissionConfiguration }): Promise<void>;
-  transitionSubmission(sessionId: string, submissionId: string, outcome: { state: SessionSubmissionState; errorMessage?: string }): Promise<void>;
-  loadPendingSubmissions(sessionId: string): Promise<readonly SessionPendingSubmission[]>;
+  loadReplayState(session: SessionDescriptor, leafId?: string | null): Promise<SessionReplayState>;
+  readConversation(session: SessionDescriptor): Promise<readonly SessionConversationItem[]>;
+  listBranchPoints(session: SessionDescriptor): Promise<readonly SessionBranchPoint[]>;
+  appendInput(session: SessionDescriptor, input: { runId: string; task: string; instructions?: readonly AgentEffectiveInstruction[] }): Promise<SessionInputEntry>;
+  appendSteering(session: SessionDescriptor, input: { runId: string; content: string }): Promise<SessionSteeringEntry>;
+  appendAssistant(session: SessionDescriptor, input: { runId: string; identity: AgentTurnIdentity; content: string }): Promise<SessionAssistantEntry>;
+  appendToolCall(session: SessionDescriptor, input: { runId: string; identity: AgentToolCallIdentity; call: unknown }): Promise<SessionToolCallEntry>;
+  appendObservation(session: SessionDescriptor, input: { runId: string; identity: AgentTurnIdentity & Partial<Pick<AgentToolCallAttemptIdentity, 'toolBatchId' | 'callIndex' | 'callId' | 'toolAttempt'>>; toolName: string; observation: SessionObservationInput }): Promise<SessionObservationEntry>;
+  appendModelSettings(session: SessionDescriptor, settings: { provider: string; model: string; temperature?: number; reasoningEffort?: string }): Promise<SessionModelSettingsEntry>;
+  appendCompaction(session: SessionDescriptor, input: { summary: string; provider: string; model: string }): Promise<SessionCompactionEntry>;
+  branchFrom(session: SessionDescriptor, entryId: string, label?: string): Promise<SessionBranchMarkerEntry>;
+  projectFinal(session: SessionDescriptor, terminal: AgentTerminalSnapshot): Promise<SessionFinalProjection>;
+  enqueueSubmission(session: SessionDescriptor, input: { submissionId: string; runId: string; input: SessionSubmissionInput; configuration: SessionSubmissionConfiguration }): Promise<void>;
+  transitionSubmission(session: SessionDescriptor, submissionId: string, outcome:
+    | { readonly state: 'claimed' | 'completed' }
+    | { readonly state: 'suspended'; readonly suspension: SessionSuspensionDescriptor }
+    | { readonly state: 'failed'; readonly errorMessage: string }): Promise<void>;
+  loadPendingSubmissions(session: SessionDescriptor): Promise<readonly SessionPendingSubmission[]>;
 }

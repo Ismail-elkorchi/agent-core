@@ -8,6 +8,8 @@ import { JsonlEventRepository } from '@agent-core/evidence/node';
 import { AgentOperationCoordinator, AgentSession, agentEventCodec } from '@agent-core/runtime';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 
+const binding = Object.freeze({ schemaId: 'agent-core.tests/session-settlement', schemaVersion: 1, subject: Object.freeze({ fixture: 'fault-session' }) });
+
 for (const [timing, exitStatus, expectedResumes] of [['before', 64, 1], ['after', 65, 0]]) {
   test(`session submission settlement recovers exactly once after process death ${timing} commit`, async () => {
     const root = await mkdtemp(path.join(tmpdir(), `agent-session-settlement-${timing}-`));
@@ -17,11 +19,12 @@ for (const [timing, exitStatus, expectedResumes] of [['before', 64, 1], ['after'
       assert.equal(crashed.status, exitStatus, crashed.stderr);
 
       const repository = new JsonlSessionRepository({ rootDir: path.join(root, 'sessions') });
-      const descriptor = await repository.open('fault-session');
+      const descriptor = await repository.open('fault-session', binding);
       const events = new JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
       let resumes = 0;
       const restored = new AgentSession({
         descriptor,
+        expectedBinding: binding,
         repository,
         operations: new AgentOperationCoordinator(events),
         configuration: { provider: 'fixture', model: 'fixture' },
@@ -39,7 +42,7 @@ for (const [timing, exitStatus, expectedResumes] of [['before', 64, 1], ['after'
       assert.equal(resumes, 0, 'restore is read-only');
       await restored.waitForIdle();
       assert.equal(resumes, expectedResumes);
-      assert.deepEqual(await repository.loadPendingSubmissions(descriptor.id), []);
+      assert.deepEqual(await repository.loadPendingSubmissions(descriptor), []);
 
       const ledger = await readFile(repository.location(descriptor.id), 'utf8');
       assert.equal((ledger.match(/"type":"submission\.completed"/gu) ?? []).length, 1);

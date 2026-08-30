@@ -1,7 +1,7 @@
 import { ContextManager, type ContextImageLimits } from '../context/manager.js';
 import type { ArtifactRef, ArtifactRepository, EventEnvelope, EventRepository, EvidenceRecord } from '@agent-core/evidence';
 import type { ModelProviderState, TokenEstimator } from '@agent-core/model';
-import type { SessionRepository } from '../session/repository.js';
+import type { SessionDescriptor, SessionRepository } from '../session/contracts.js';
 import type { AgentEvent, AgentProviderStateSummary } from '../events.js';
 import { serializeToolObservationPresentation } from './observation-store.js';
 import { modelToolCallFromToolCall } from './model-request.js';
@@ -21,7 +21,7 @@ export interface ContextReplayResult {
 }
 
 export async function rebuildContextFromRepositories(input: {
-  readonly session?: { readonly repository: SessionRepository; readonly sessionId: string };
+  readonly session?: { readonly repository: SessionRepository; readonly descriptor: SessionDescriptor };
   readonly events: EventRepository<AgentEvent>;
   readonly artifacts?: ArtifactRepository;
   readonly estimator: TokenEstimator;
@@ -31,7 +31,7 @@ export async function rebuildContextFromRepositories(input: {
   readonly runIds?: readonly string[];
 }): Promise<ContextReplayResult> {
   const contextManager = new ContextManager(input.estimator, input.contextImageLimits);
-  const replayState = input.session ? await input.session.repository.loadReplayState(input.session.sessionId) : undefined;
+  const replayState = input.session ? await input.session.repository.loadReplayState(input.session.descriptor) : undefined;
   const runIds = [...new Set([...(replayState?.ledgerRunIds ?? []), ...(input.runIds ?? [])])];
   const usesCompaction = replayState?.compaction !== undefined;
   if (replayState?.compaction) {

@@ -32,9 +32,11 @@ const events = mode === 'crash_after_ended' || mode === 'crash_before_started' |
 const sessions = new JsonlSessionRepository({ rootDir: path.join(root, 'sessions') });
 const artifacts = new LocalArtifactRepository(path.join(root, 'artifacts'));
 const sessionId = 'crash-recovery';
+const sessionBinding = Object.freeze({ schemaId: 'agent-core.tests/runtime', schemaVersion: 1, subject: Object.freeze({ application: 'agent-core-tests' }) });
 const recoveryKind = await readFile(path.join(root, 'recovery-kind.txt'), 'utf8').then((value) => value.trim(), () => 'unknown');
-if (mode === 'suspend') await sessions.create({ id: sessionId, provider: 'fixture', model: 'fixture' });
-else await sessions.open(sessionId);
+const session = mode === 'suspend'
+  ? await sessions.create({ id: sessionId, provider: 'fixture', model: 'fixture', binding: sessionBinding })
+  : await sessions.open(sessionId, sessionBinding);
 
 const provider = {
   id: 'fixture',
@@ -112,7 +114,7 @@ const agent = new AgentRuntime({
   provider,
   model: 'fixture',
   toolBoundary: { authorizationPolicyId: 'tests/crash-policy@1', executionTargetId: root },
-  repositories: { events, session: { repository: sessions, sessionId }, artifacts },
+  repositories: { events, session: { repository: sessions, descriptor: session }, artifacts },
   tools: [adoptToolDefinition(tool)],
   toolPolicy: { allowedRisks: ['read', 'write'] },
   toolAuthorizer: () => ({ decision: 'require_approval', reason: 'confirm crash fixture' }),

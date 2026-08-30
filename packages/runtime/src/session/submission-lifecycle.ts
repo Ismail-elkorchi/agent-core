@@ -4,9 +4,13 @@ import type {
   SessionSubmissionInput,
   SessionSubmissionRecord,
   SessionSubmissionState,
-  SessionSubmissionTransition
+  SessionSubmissionTransition,
+  SessionSuspensionAction,
+  SessionSuspensionCategory,
+  SessionSuspensionDescriptor
 } from './contracts.js';
 import { parseJsonObject } from '@agent-core/json';
+import { hashJson } from '@agent-core/evidence';
 import type { ModelReasoningRequest } from '@agent-core/model';
 
 type SubmissionState = SessionPendingSubmission['state'] | 'completed' | 'failed';
@@ -79,7 +83,8 @@ export function pendingSessionSubmissions(records: readonly SessionSubmissionRec
   return Object.freeze([...foldSubmissions(records).values()].flatMap((submission) =>
     submission.state === 'completed' || submission.state === 'failed' ? [] : [Object.freeze({
       submissionId: submission.submissionId, runId: submission.runId, state: submission.state,
-      input: submission.input, configuration: submission.configuration
+      input: submission.input, configuration: submission.configuration,
+      ...(submission.suspension === undefined ? {} : { suspension: submission.suspension })
     })]
   ));
 }
@@ -87,25 +92,46 @@ export function pendingSessionSubmissions(records: readonly SessionSubmissionRec
 export function createSessionSubmissionTransition(
   records: readonly SessionSubmissionRecord[],
   submissionId: string,
-  state: SessionSubmissionState,
-  errorMessage?: string
+  outcome:
+    | { readonly state: 'claimed' | 'completed' }
+    | { readonly state: 'suspended'; readonly suspension: SessionSuspensionDescriptor }
+    | { readonly state: 'failed'; readonly errorMessage: string }
 ): SessionSubmissionTransition | undefined {
   const current = foldSubmissions(records).get(submissionId);
   if (current === undefined) throw new Error(`Unknown session submission: ${submissionId}`);
-  if (state !== 'failed' && errorMessage !== undefined) throw new Error(`Only failed session submissions may contain an error: ${submissionId}`);
-  if (current.state === state) {
-    if (state === 'claimed') throw new Error(`Session submission is already claimed: ${submissionId}`);
-    if (state === 'failed' && current.errorMessage !== errorMessage) throw new Error(`Conflicting failure for session submission: ${submissionId}`);
-    return undefined;
-  }
-  assertTransition(current.state, state, submissionId);
-  return Object.freeze({
+  const state = outcome.state;
+  const base = {
     type: `submission.${state}`,
     submissionId,
     runId: current.runId,
-    timestamp: new Date().toISOString(),
-    ...(errorMessage === undefined ? {} : { errorMessage })
-  });
+    timestamp: new Date().toISOString()
+  } as const;
+  if (outcome.state === 'suspended') {
+    const suspension = ownSessionSuspensionDescriptor(outcome.suspension);
+    if (suspension.submissionId !== submissionId || suspension.runId !== current.runId) throw new Error(`Session suspension identity changed: ${submissionId}`);
+    if (current.state === state) {
+      if (current.suspension === undefined || hashJson(parseJsonObject(current.suspension)) !== hashJson(parseJsonObject(suspension))) throw new Error(`Conflicting suspension for session submission: ${submissionId}`);
+      return undefined;
+    }
+    assertTransition(current.state, state, submissionId);
+    return Object.freeze({ ...base, type: 'submission.suspended', suspension });
+  }
+  if (outcome.state === 'failed') {
+    const errorMessage = outcome.errorMessage;
+    if (errorMessage.trim().length === 0) throw new Error(`Failed session submission requires an error: ${submissionId}`);
+    if (current.state === state) {
+      if (current.errorMessage !== errorMessage) throw new Error(`Conflicting failure for session submission: ${submissionId}`);
+      return undefined;
+    }
+    assertTransition(current.state, state, submissionId);
+    return Object.freeze({ ...base, type: 'submission.failed', errorMessage });
+  }
+  if (current.state === state) {
+    if (state === 'claimed') throw new Error(`Session submission is already claimed: ${submissionId}`);
+    return undefined;
+  }
+  assertTransition(current.state, state, submissionId);
+  return Object.freeze({ ...base, type: state === 'claimed' ? 'submission.claimed' : 'submission.completed' });
 }
 
 function foldSubmissions(records: readonly SessionSubmissionRecord[]): Map<string, FoldedSubmission> {
@@ -124,11 +150,78 @@ function foldSubmissions(records: readonly SessionSubmissionRecord[]): Map<strin
     if (current.runId !== record.runId) throw new Error(`Session submission run identity changed: ${record.submissionId}`);
     const state = submissionTransitionState(record);
     assertTransition(current.state, state, record.submissionId);
-    if (state !== 'failed' && record.errorMessage !== undefined) throw new Error(`Only failed session submissions may contain an error: ${record.submissionId}`);
+    const suspension = record.type === 'submission.suspended' ? ownSessionSuspensionDescriptor(record.suspension) : undefined;
     submissions.set(record.submissionId, Object.freeze({ ...current, state,
-      ...(record.errorMessage === undefined ? {} : { errorMessage: record.errorMessage }) }));
+      ...(record.type === 'submission.failed' ? { errorMessage: record.errorMessage } : {}),
+      ...(suspension === undefined ? {} : { suspension }) }));
   }
   return submissions;
+}
+
+export function ownSessionSuspensionDescriptor(value: unknown): SessionSuspensionDescriptor {
+  const object = parseJsonObject(value);
+  const allowed = new Set(['runId', 'submissionId', 'category', 'reason', 'effectId', 'actions', 'decisionRequest']);
+  if (Object.keys(object).some((field) => !allowed.has(field))) throw new TypeError('Session suspension has unsupported fields.');
+  const runId = suspensionString(object.runId, 'runId');
+  const submissionId = suspensionString(object.submissionId, 'submissionId');
+  const category = suspensionCategory(object.category);
+  const reason = suspensionReason(object.reason);
+  const effectId = object.effectId === undefined ? undefined : suspensionString(object.effectId, 'effectId');
+  if (!Array.isArray(object.actions) || object.actions.length === 0) throw new TypeError('Session suspension actions are invalid.');
+  const actions = object.actions.map(suspensionAction);
+  if (new Set(actions).size !== actions.length) throw new TypeError('Session suspension actions are invalid.');
+  const expected: readonly SessionSuspensionAction[] = category === 'approval' ? ['approval', 'abort']
+    : category === 'external_recovery' ? ['reconcile', 'abort']
+      : category === 'implementation' ? ['resume', 'abort']
+        : ['decide', 'abort'];
+  if (actions.length !== expected.length || !actions.every((action, index) => action === expected[index])) throw new TypeError('Session suspension actions do not match its category.');
+  if ((category === 'approval') !== (reason === 'approval_required')
+    || (category === 'implementation') !== (reason === 'missing_implementation')
+    || (category === 'user_decision') !== (reason === 'user_decision')) throw new TypeError('Session suspension category does not match its reason.');
+  const request = object.decisionRequest === undefined ? undefined : ownDecisionRequest(object.decisionRequest);
+  if (category === 'user_decision' && request === undefined) throw new TypeError('Session user-decision suspension requires a decision request.');
+  if (category !== 'user_decision' && request !== undefined) throw new TypeError('Only user-decision suspensions may contain a decision request.');
+  return Object.freeze({
+    runId, submissionId, category, reason,
+    ...(effectId === undefined ? {} : { effectId }),
+    actions: Object.freeze(actions),
+    ...(request === undefined ? {} : { decisionRequest: Object.freeze({ ...request, choices: Object.freeze([...request.choices]) }) })
+  });
+}
+
+function suspensionString(value: unknown, field: string): string {
+  if (typeof value !== 'string' || value.length === 0) throw new TypeError(`Session suspension ${field} is invalid.`);
+  return value;
+}
+
+function suspensionCategory(value: unknown): SessionSuspensionCategory {
+  if (value !== 'approval' && value !== 'external_recovery' && value !== 'implementation' && value !== 'user_decision') throw new TypeError('Session suspension category is invalid.');
+  return value;
+}
+
+function suspensionReason(value: unknown): SessionSuspensionDescriptor['reason'] {
+  if (value !== 'approval_required' && value !== 'provider_outcome_unknown' && value !== 'tool_outcome_unknown'
+    && value !== 'disposition_outcome_unknown' && value !== 'missing_implementation' && value !== 'user_decision') throw new TypeError('Session suspension reason is invalid.');
+  return value;
+}
+
+function suspensionAction(value: unknown): SessionSuspensionAction {
+  if (value !== 'approval' && value !== 'reconcile' && value !== 'resume' && value !== 'decide' && value !== 'abort') throw new TypeError('Session suspension action is invalid.');
+  return value;
+}
+
+function ownDecisionRequest(value: unknown): NonNullable<SessionSuspensionDescriptor['decisionRequest']> {
+  const object = parseJsonObject(value);
+  if (Object.keys(object).length !== 5 || !Object.keys(object).every((field) => field === 'id' || field === 'reason' || field === 'choices' || field === 'fingerprint' || field === 'operationRevision')) {
+    throw new TypeError('Session decision request has unsupported or missing fields.');
+  }
+  const id = suspensionString(object.id, 'decision request id');
+  const reason = suspensionString(object.reason, 'decision request reason');
+  if (!Array.isArray(object.choices) || object.choices.length === 0 || !object.choices.every((choice) => typeof choice === 'string' && choice.length > 0)) throw new TypeError('Session decision request choices are invalid.');
+  const choices = Object.freeze(object.choices.map((choice) => String(choice)));
+  if (typeof object.fingerprint !== 'string' || !/^[a-f0-9]{64}$/u.test(object.fingerprint)) throw new TypeError('Session decision request fingerprint is invalid.');
+  if (typeof object.operationRevision !== 'number' || !Number.isSafeInteger(object.operationRevision) || object.operationRevision < 0) throw new TypeError('Session decision request revision is invalid.');
+  return Object.freeze({ id, reason, choices, fingerprint: object.fingerprint, operationRevision: object.operationRevision });
 }
 
 function submissionTransitionState(record: SessionSubmissionTransition): SessionSubmissionState {

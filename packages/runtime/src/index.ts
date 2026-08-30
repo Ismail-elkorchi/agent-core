@@ -10,6 +10,7 @@ export * from './context/prompt.js';
 export * from './session/repository.js';
 export * from './session/contracts.js';
 export * from './session/agent-session.js';
+export * from './session/binding.js';
 export * from './orchestration/finalization.js';
 export * from './orchestration/run-controller.js';
 export * from './orchestration/observation-store.js';

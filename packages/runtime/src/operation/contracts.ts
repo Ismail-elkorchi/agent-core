@@ -60,6 +60,23 @@ export type AgentProviderOperationPhase =
   | Readonly<AgentProviderPhaseBase & { readonly stage: 'settled'; readonly requestEventId: string; readonly responseId: string; readonly effect: Extract<EffectExecutionState, { readonly phase: 'settled' }>; readonly settlementEventId: string }>
   | Readonly<AgentProviderPhaseBase & { readonly stage: 'outcome_unknown'; readonly requestEventId: string; readonly responseId: string; readonly effect: Extract<EffectExecutionState, { readonly phase: 'closed' }> }>;
 
+export interface AgentDecisionRequest {
+  readonly id: string;
+  readonly reason: string;
+  readonly choices: readonly string[];
+  readonly fingerprint: string;
+  readonly operationRevision: number;
+}
+
+export interface AgentDecisionContinuation {
+  readonly kind: 'cancelled_provider_start';
+  readonly blockedProvider: Readonly<AgentProviderPhaseBase & {
+    readonly requestEventId: string;
+    readonly responseId: string;
+    readonly effect: Extract<EffectExecutionState, { readonly phase: 'closed' }>;
+  }>;
+}
+
 export type AgentOperationPhase =
   | Readonly<{ readonly kind: 'accepted' }>
   | Readonly<{ readonly kind: 'preparing'; readonly step: 'initialize' | 'assemble_turn'; readonly turnIndex: number }>
@@ -78,10 +95,13 @@ export type AgentOperationPhase =
       readonly stage: 'ready' | 'prepared' | 'session_projected' | 'committed';
       readonly terminalEventId?: string;
     }>
+  | Readonly<{ readonly kind: 'suspended'; readonly reason: 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'disposition_outcome_unknown' | 'missing_implementation'; readonly effectId?: string }>
   | Readonly<{
       readonly kind: 'suspended';
-      readonly reason: 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'disposition_outcome_unknown' | 'missing_implementation' | 'user_decision';
-      readonly effectId?: string;
+      readonly reason: 'user_decision';
+      readonly effectId: string;
+      readonly decisionRequest: AgentDecisionRequest;
+      readonly continuation: AgentDecisionContinuation;
     }>
   | Readonly<{ readonly kind: 'cancelling'; readonly stage: 'requested' | 'finalizing'; readonly toolBatch?: AgentToolOperationPhase }>
   | Readonly<{ readonly kind: 'terminal'; readonly resultEventId: string }>;
@@ -190,10 +210,19 @@ export function decodeAgentOperationState(value: unknown): AgentOperationState {
   const toolCalls = Object.freeze(array(state.toolCalls, 'toolCalls').map((call) => decodeToolCall(call)));
   const revisionInstructions = stringArray(state.revisionInstructions, 'revisionInstructions');
   const budget = state.budget === undefined ? undefined : decodeBudget(state.budget);
+  const runId = identifier(state.runId, 'runId');
+  const revision = nonnegativeInteger(state.revision, 'revision');
+  if (phase.kind === 'suspended' && phase.reason === 'user_decision') {
+    if (phase.decisionRequest.operationRevision > revision
+      || (control.status !== 'abort_requested' && phase.decisionRequest.operationRevision !== revision)) {
+      throw new TypeError('Decision request revision does not match the operation revision.');
+    }
+    if (phase.continuation.blockedProvider.effect.intent.operationId !== runId) throw new TypeError('Decision continuation does not belong to this operation.');
+  }
   return Object.freeze({
-    runId: identifier(state.runId, 'runId'),
+    runId,
     finalizationId: identifier(state.finalizationId, 'finalizationId'),
-    revision: nonnegativeInteger(state.revision, 'revision'),
+    revision,
     driverGeneration: nonnegativeInteger(state.driverGeneration, 'driverGeneration'),
     input,
     configuration,
@@ -360,9 +389,26 @@ function decodePhase(value: unknown): AgentOperationPhase {
       return Object.freeze({ kind, stage: enumeration(phase.stage, ['ready', 'prepared', 'session_projected', 'committed'] as const, 'phase.stage'), ...(terminalEventId ? { terminalEventId } : {}) });
     }
     case 'suspended': {
-      exact(phase, ['kind', 'reason', 'effectId']);
+      const reason = enumeration(phase.reason, ['provider_outcome_unknown', 'tool_outcome_unknown', 'disposition_outcome_unknown', 'missing_implementation', 'user_decision'] as const, 'phase.reason');
+      exact(phase, reason === 'user_decision' ? ['kind', 'reason', 'effectId', 'decisionRequest', 'continuation'] : ['kind', 'reason', 'effectId']);
       const effectId = optionalIdentifier(phase.effectId, 'phase.effectId');
-      return Object.freeze({ kind, reason: enumeration(phase.reason, ['provider_outcome_unknown', 'tool_outcome_unknown', 'disposition_outcome_unknown', 'missing_implementation', 'user_decision'] as const, 'phase.reason'), ...(effectId ? { effectId } : {}) });
+      if (reason === 'user_decision') {
+        if (!effectId) throw new TypeError('A user decision requires its blocked effect identity.');
+        const decisionRequest = decodeDecisionRequest(phase.decisionRequest);
+        const continuation = decodeDecisionContinuation(phase.continuation);
+        if (continuation.blockedProvider.effect.intent.effectId !== effectId) throw new TypeError('Decision continuation effect identity does not match its suspension.');
+        const expectedFingerprint = hashJson({
+          id: decisionRequest.id,
+          reason: decisionRequest.reason,
+          choices: decisionRequest.choices,
+          operationRevision: decisionRequest.operationRevision,
+          effectId
+        });
+        if (decisionRequest.fingerprint !== expectedFingerprint) throw new TypeError('Decision request fingerprint is inconsistent.');
+        if (decisionRequest.choices.length !== 1 || decisionRequest.choices[0] !== 'abort') throw new TypeError('A cancelled provider start permits only abort.');
+        return Object.freeze({ kind, reason, effectId, decisionRequest, continuation });
+      }
+      return Object.freeze({ kind, reason, ...(effectId ? { effectId } : {}) });
     }
     case 'cancelling':
       exact(phase, ['kind', 'stage', 'toolBatch']);
@@ -375,6 +421,42 @@ function decodePhase(value: unknown): AgentOperationPhase {
       exact(phase, ['kind', 'resultEventId']);
       return Object.freeze({ kind, resultEventId: identifier(phase.resultEventId, 'phase.resultEventId') });
   }
+}
+
+function decodeDecisionRequest(value: unknown): AgentDecisionRequest {
+  const request = object(value, 'decision request');
+  exact(request, ['id', 'reason', 'choices', 'fingerprint', 'operationRevision']);
+  const choices = uniqueIdentifiers(request.choices, 'decisionRequest.choices');
+  if (choices.length === 0) throw new TypeError('decisionRequest.choices must not be empty.');
+  return Object.freeze({
+    id: identifier(request.id, 'decisionRequest.id'),
+    reason: nonempty(request.reason, 'decisionRequest.reason'),
+    choices,
+    fingerprint: digest(request.fingerprint, 'decisionRequest.fingerprint'),
+    operationRevision: nonnegativeInteger(request.operationRevision, 'decisionRequest.operationRevision')
+  });
+}
+
+function decodeDecisionContinuation(value: unknown): AgentDecisionContinuation {
+  const continuation = object(value, 'decision continuation');
+  exact(continuation, ['kind', 'blockedProvider']);
+  if (continuation.kind !== 'cancelled_provider_start') throw new TypeError('Unknown decision continuation.');
+  const blockedProvider = object(continuation.blockedProvider, 'blocked provider continuation');
+  exact(blockedProvider, ['kind', 'identity', 'toolBatchId', 'requestEventId', 'responseId', 'effect']);
+  if (blockedProvider.kind !== 'provider') throw new TypeError('Decision continuation must retain a blocked provider phase.');
+  const effect = decodeEffectExecutionState(blockedProvider.effect);
+  if (effect.phase !== 'closed' || effect.closure.reason !== 'cancelled_before_start') throw new TypeError('Decision continuation must retain a provider effect closed before start.');
+  return Object.freeze({
+    kind: continuation.kind,
+    blockedProvider: Object.freeze({
+      kind: blockedProvider.kind,
+      identity: decodeTurnIdentity(blockedProvider.identity),
+      toolBatchId: identifier(blockedProvider.toolBatchId, 'decision continuation toolBatchId'),
+      requestEventId: identifier(blockedProvider.requestEventId, 'decision continuation requestEventId'),
+      responseId: identifier(blockedProvider.responseId, 'decision continuation responseId'),
+      effect
+    })
+  });
 }
 
 function decodeCancellingToolBatch(value: unknown): AgentToolOperationPhase {

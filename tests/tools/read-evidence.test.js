@@ -19,6 +19,7 @@ import { invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
 import { testWorkspaceFileRoot } from '../workspace-file-root-helper.js';
 
 const onePixelPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
+const sessionBinding = Object.freeze({ schemaId: 'agent-core.tests/read-evidence', schemaVersion: 1, subject: Object.freeze({ application: 'read-evidence' }) });
 
 async function readHost() {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-read-evidence-'));
@@ -95,7 +96,7 @@ test('read-tool evidence reaches durable observations, session context, prompt s
   await writeFile(path.join(root, 'visible.txt'), 'visible\n');
   const events = new InMemoryEventRepository(agentEventCodec);
   const sessions = new InMemorySessionRepository();
-  const session = await sessions.create({ provider: 'evidence-provider', model: 'evidence-model' });
+  const session = await sessions.create({ provider: 'evidence-provider', model: 'evidence-model', binding: sessionBinding });
   const requests = [];
   const provider = {
     id: 'evidence-provider',
@@ -126,7 +127,7 @@ test('read-tool evidence reaches durable observations, session context, prompt s
     }
   };
   const runtime = new AgentRuntime({
-    provider, model: 'evidence-model', repositories: { events, session: { repository: sessions, sessionId: session.id }, artifacts },
+    provider, model: 'evidence-model', repositories: { events, session: { repository: sessions, descriptor: session }, artifacts },
     tools: [listDirectoryTool], checks: [check], toolBoundary: { authorizationPolicyId: 'tests/read-evidence@1', executionTargetId: root },
     toolPolicy: { allowedRisks: ['read'] }, toolContext: { services }
   });
@@ -147,6 +148,6 @@ test('read-tool evidence reaches durable observations, session context, prompt s
   assert.match(secondRequest, /workspace:\/\/\./u);
   assert.equal(checkedEvidence.items.some((item) => item.toolName === 'list_directory' && item.action === 'list'), true);
 
-  const replay = await sessions.loadReplayState(session.id);
+  const replay = await sessions.loadReplayState(session);
   assert.equal(replay.branch.some((entry) => entry.type === 'observation' && entry.toolName === 'list_directory'), true);
 });

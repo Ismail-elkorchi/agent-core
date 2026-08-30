@@ -1,10 +1,10 @@
 import type { ArtifactRepository, EventRepository } from '@agent-core/evidence';
-import type { SessionRepository } from './session/repository.js';
+import type { SessionDescriptor, SessionRepository } from './session/contracts.js';
 import type { AgentEvent } from './events.js';
 
 export interface AgentSessionBinding {
   readonly repository: SessionRepository;
-  readonly sessionId: string;
+  readonly descriptor: SessionDescriptor;
 }
 
 export interface AgentRuntimeRepositories {

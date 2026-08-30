@@ -19,6 +19,7 @@ import {
 import { testPatchJournal, testWorkspaceFileRoot } from './workspace-file-root-helper.js';
 
 const tools = [listDirectoryTool, findFilesTool, readFilesTool, searchTextTool, applyPatchTool, execCommandTool];
+const binding = Object.freeze({ schemaId: 'agent-core.tests/self-hosting', schemaVersion: 1, subject: Object.freeze({ application: 'self-hosting-smoke' }) });
 
 test('scripted self-hosting run survives approvals, structured tools, verification, and one terminal commit', { skip: process.platform !== 'linux' }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-self-host-'));
@@ -38,7 +39,7 @@ test('scripted self-hosting run survives approvals, structured tools, verificati
   const events = new InMemoryEventRepository(agentEventCodec);
   const sessions = new InMemorySessionRepository();
   const artifacts = new InMemoryArtifactRepository();
-  const session = await sessions.create({ id: 'self-host', provider: 'scripted', model: 'scripted' });
+  const session = await sessions.create({ id: 'self-host', provider: 'scripted', model: 'scripted', binding });
   const workspaceFileRoot = testWorkspaceFileRoot(root);
   const commandExecution = new LocalCommandExecution({
     artifactRepository: artifacts,
@@ -58,7 +59,7 @@ test('scripted self-hosting run survives approvals, structured tools, verificati
     provider,
     model: 'scripted',
     toolBoundary: { authorizationPolicyId: 'tests/self-host-policy@1', executionTargetId: root },
-    repositories: { events, session: { repository: sessions, sessionId: session.id }, artifacts },
+    repositories: { events, session: { repository: sessions, descriptor: session }, artifacts },
     tools,
     toolPolicy: { allowedRisks: ['read', 'write', 'execute'] },
     toolContext: { services },

@@ -54,12 +54,12 @@ import type {
   SessionSubmissionInput,
   SessionSubmissionConfiguration,
   SessionSubmissionRecord,
-  SessionSubmissionState,
   SessionSummary,
   SessionSteeringEntry,
   SessionToolCallEntry
 } from './contracts.js';
-import { createSessionSubmissionTransition, ownSessionSubmissionConfiguration, ownSessionSubmissionInput, pendingSessionSubmissions } from './submission-lifecycle.js';
+import { createSessionSubmissionTransition, ownSessionSubmissionConfiguration, ownSessionSubmissionInput, ownSessionSuspensionDescriptor, pendingSessionSubmissions } from './submission-lifecycle.js';
+import { assertSessionBinding, createSessionBinding, decodeSessionBinding, type SessionBindingInput } from './binding.js';
 
 export interface JsonlSessionRepositoryOptions {
   readonly rootDir: string;
@@ -87,10 +87,15 @@ export class JsonlSessionRepository implements SessionRepository {
 
   async create(options: CreateSessionOptions): Promise<SessionDescriptor> {
     const id = options.id ?? randomUUID();
+    const binding = createSessionBinding(options.binding);
+    if (options.parent) {
+      const parent = await this.open(options.parent.id, options.parent.header.binding);
+      assertSessionBinding(binding, parent.header.binding);
+    }
     return this.enqueue(id, () => withPersistenceFileLock(this.filePath(id), this.lockTimeoutMs, this.staleLockMs, async () => {
       const header: SessionHeader = Object.freeze({
-        type: 'session', version: 1, id, timestamp: new Date().toISOString(),
-        ...(options.parentSessionId ? { parentSessionId: options.parentSessionId } : {}),
+        type: 'session', version: 1, id, timestamp: new Date().toISOString(), binding,
+        ...(options.parent ? { parentSessionId: options.parent.id } : {}),
         ...(options.provider ? { provider: options.provider } : {}),
         ...(options.model ? { model: options.model } : {})
       });
@@ -104,8 +109,9 @@ export class JsonlSessionRepository implements SessionRepository {
     }));
   }
 
-  async open(sessionId: string): Promise<SessionDescriptor> {
+  async open(sessionId: string, expectedBinding: SessionBindingInput): Promise<SessionDescriptor> {
     const state = await this.enqueue(sessionId, () => this.refreshIndex(sessionId, false));
+    assertSessionBinding(expectedBinding, state.header.binding);
     return sessionFromState(state);
   }
 
@@ -122,16 +128,21 @@ export class JsonlSessionRepository implements SessionRepository {
       summaries.push(Object.freeze({
         id, timestamp: session.header.timestamp, updatedAt: sessionUpdatedAt(state),
         ...(session.header.provider ? { provider: session.header.provider } : {}),
-        ...(session.header.model ? { model: session.header.model } : {})
+        ...(session.header.model ? { model: session.header.model } : {}),
+        bindingSchemaId: session.header.binding.schemaId,
+        bindingSchemaVersion: session.header.binding.schemaVersion,
+        bindingSha256: session.header.binding.bindingSha256
       }));
     }
     return Object.freeze(summaries.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)));
   }
 
-  async loadReplayState(sessionId: string, leafId?: string | null): Promise<SessionReplayState> {
+  async loadReplayState(session: SessionDescriptor, leafId?: string | null): Promise<SessionReplayState> {
+    const sessionId = session.id;
     const state = await this.enqueue(sessionId, () => this.refreshIndex(sessionId, false));
-    const session = sessionFromState(state);
-    const branch = Object.freeze(activeBranch(state.branchEntries, leafId === undefined ? session.leafId : leafId));
+    assertDescriptor(session, state);
+    const current = sessionFromState(state);
+    const branch = Object.freeze(activeBranch(state.branchEntries, leafId === undefined ? current.leafId : leafId));
     const compaction = [...branch].reverse().find((entry): entry is SessionCompactionEntry => entry.type === 'compaction');
     const compactionIndex = compaction ? branch.findIndex((entry) => entry.id === compaction.id) : -1;
     const tailStart = compactionIndex + 1;
@@ -142,16 +153,18 @@ export class JsonlSessionRepository implements SessionRepository {
     const openRunIds = tailRunIds.filter((runId) => !endedRunIds.has(runId));
     const latestEndedRunId = terminalProjections.at(-1)?.runId;
     const ledgerRunIds = Object.freeze([...openRunIds, ...(latestEndedRunId ? [latestEndedRunId] : [])]);
-    return Object.freeze({ session, branch, terminalProjections, ...(compaction ? { compaction } : {}), ledgerRunIds });
+    return Object.freeze({ session: current, branch, terminalProjections, ...(compaction ? { compaction } : {}), ledgerRunIds });
   }
 
-  async readConversation(sessionId: string): Promise<readonly SessionConversationItem[]> {
-    const replay = await this.loadReplayState(sessionId);
+  async readConversation(session: SessionDescriptor): Promise<readonly SessionConversationItem[]> {
+    const replay = await this.loadReplayState(session);
     return Object.freeze(replay.branch.filter((entry): entry is SessionConversationItem => entry.type !== 'branch' && entry.type !== 'model_settings'));
   }
 
-  async listBranchPoints(sessionId: string): Promise<readonly SessionBranchPoint[]> {
+  async listBranchPoints(session: SessionDescriptor): Promise<readonly SessionBranchPoint[]> {
+    const sessionId = session.id;
     const state = await this.enqueue(sessionId, () => this.refreshIndex(sessionId, false));
+    assertDescriptor(session, state);
     const points: SessionBranchPoint[] = state.projections.map((projection) => Object.freeze({
       entryId: projection.throughEntryId, timestamp: projection.timestamp, kind: 'final' as const,
       finalizationId: projection.finalizationId, runId: projection.runId
@@ -160,9 +173,11 @@ export class JsonlSessionRepository implements SessionRepository {
     return Object.freeze(points);
   }
 
-  appendInput(sessionId: string, input: { runId: string; task: string; instructions?: readonly AgentEffectiveInstruction[] }): Promise<SessionInputEntry> {
+  appendInput(session: SessionDescriptor, input: { runId: string; task: string; instructions?: readonly AgentEffectiveInstruction[] }): Promise<SessionInputEntry> {
+    const sessionId = session.id;
     return this.enqueue(sessionId, () => withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
       const state = await this.refreshIndex(sessionId, true);
+      assertDescriptor(session, state);
       const existing = state.branchEntries.find((entry): entry is SessionInputEntry => entry.type === 'input' && entry.runId === input.runId);
       if (existing) {
         if (!sameSessionInput(existing, input)) throw new PersistenceConflictError(`Conflicting session input for run ${input.runId}.`);
@@ -178,13 +193,15 @@ export class JsonlSessionRepository implements SessionRepository {
     }));
   }
 
-  appendSteering(sessionId: string, input: { runId: string; content: string }): Promise<SessionSteeringEntry> {
-    return this.appendBranchEntry(sessionId, (parentId) => Object.freeze({ ...baseEntry(parentId), type: 'steering', runId: input.runId, content: input.content }));
+  appendSteering(session: SessionDescriptor, input: { runId: string; content: string }): Promise<SessionSteeringEntry> {
+    return this.appendBranchEntry(session, (parentId) => Object.freeze({ ...baseEntry(parentId), type: 'steering', runId: input.runId, content: input.content }));
   }
 
-  appendAssistant(sessionId: string, input: { runId: string; identity: AgentTurnIdentity; content: string }): Promise<SessionAssistantEntry> {
+  appendAssistant(session: SessionDescriptor, input: { runId: string; identity: AgentTurnIdentity; content: string }): Promise<SessionAssistantEntry> {
+    const sessionId = session.id;
     return this.enqueue(sessionId, () => withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
       const state = await this.refreshIndex(sessionId, true);
+      assertDescriptor(session, state);
       const existing = state.branchEntries.find((entry): entry is SessionAssistantEntry => entry.type === 'assistant'
         && entry.runId === input.runId && entry.turnId === input.identity.turnId && entry.requestAttempt === input.identity.requestAttempt);
       if (existing) {
@@ -198,9 +215,11 @@ export class JsonlSessionRepository implements SessionRepository {
     }));
   }
 
-  appendToolCall(sessionId: string, input: { runId: string; identity: AgentToolCallIdentity; call: unknown }): Promise<SessionToolCallEntry> {
+  appendToolCall(session: SessionDescriptor, input: { runId: string; identity: AgentToolCallIdentity; call: unknown }): Promise<SessionToolCallEntry> {
+    const sessionId = session.id;
     return this.enqueue(sessionId, () => withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
       const state = await this.refreshIndex(sessionId, true);
+      assertDescriptor(session, state);
       const call = normalizeJsonSafe(input.call).value;
       const existing = state.branchEntries.find((entry): entry is SessionToolCallEntry => entry.type === 'tool_call'
         && entry.runId === input.runId && entry.toolBatchId === input.identity.toolBatchId && entry.callIndex === input.identity.callIndex);
@@ -217,9 +236,11 @@ export class JsonlSessionRepository implements SessionRepository {
     }));
   }
 
-  appendObservation(sessionId: string, input: { runId: string; identity: AgentTurnIdentity & Partial<Pick<AgentToolCallAttemptIdentity, 'toolBatchId' | 'callIndex' | 'callId' | 'toolAttempt'>>; toolName: string; observation: SessionObservationInput }): Promise<SessionObservationEntry> {
+  appendObservation(session: SessionDescriptor, input: { runId: string; identity: AgentTurnIdentity & Partial<Pick<AgentToolCallAttemptIdentity, 'toolBatchId' | 'callIndex' | 'callId' | 'toolAttempt'>>; toolName: string; observation: SessionObservationInput }): Promise<SessionObservationEntry> {
+    const sessionId = session.id;
     return this.enqueue(sessionId, () => withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
       const state = await this.refreshIndex(sessionId, true);
+      assertDescriptor(session, state);
       const normalized = normalizedObservationInput(input);
       const key = sessionObservationKey(normalized);
       const existing = key ? state.branchEntries.find((entry): entry is SessionObservationEntry => entry.type === 'observation' && sessionObservationKey(entry) === key) : undefined;
@@ -237,17 +258,19 @@ export class JsonlSessionRepository implements SessionRepository {
     }));
   }
 
-  appendModelSettings(sessionId: string, settings: { provider: string; model: string; temperature?: number; reasoningEffort?: string }): Promise<SessionModelSettingsEntry> {
-    return this.appendBranchEntry(sessionId, (parentId) => Object.freeze({
+  appendModelSettings(session: SessionDescriptor, settings: { provider: string; model: string; temperature?: number; reasoningEffort?: string }): Promise<SessionModelSettingsEntry> {
+    return this.appendBranchEntry(session, (parentId) => Object.freeze({
       ...baseEntry(parentId), type: 'model_settings', provider: settings.provider, model: settings.model,
       ...(settings.temperature === undefined ? {} : { temperature: settings.temperature }),
       ...(settings.reasoningEffort === undefined ? {} : { reasoningEffort: settings.reasoningEffort })
     }));
   }
 
-  appendCompaction(sessionId: string, input: { summary: string; provider: string; model: string }): Promise<SessionCompactionEntry> {
+  appendCompaction(session: SessionDescriptor, input: { summary: string; provider: string; model: string }): Promise<SessionCompactionEntry> {
+    const sessionId = session.id;
     return this.enqueue(sessionId, () => withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
       const state = await this.refreshIndex(sessionId, true);
+      assertDescriptor(session, state);
       assertStableBranch(state);
       const summary = input.summary.trim();
       if (summary.length === 0) throw new Error('Session compaction summary must not be empty.');
@@ -259,9 +282,11 @@ export class JsonlSessionRepository implements SessionRepository {
     }));
   }
 
-  branchFrom(sessionId: string, entryId: string, label?: string): Promise<SessionBranchMarkerEntry> {
+  branchFrom(session: SessionDescriptor, entryId: string, label?: string): Promise<SessionBranchMarkerEntry> {
+    const sessionId = session.id;
     return this.enqueue(sessionId, () => withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
       const state = await this.refreshIndex(sessionId, true);
+      assertDescriptor(session, state);
       const source = state.branchEntries.find((entry) => entry.id === entryId);
       if (!source) throw new Error(`Cannot branch from unknown entry: ${entryId}`);
       if (source.type !== 'compaction' && !state.projections.some((projection) => projection.throughEntryId === entryId)) {
@@ -277,10 +302,12 @@ export class JsonlSessionRepository implements SessionRepository {
     }));
   }
 
-  projectFinal(sessionId: string, terminalInput: AgentTerminalSnapshot): Promise<SessionFinalProjection> {
+  projectFinal(session: SessionDescriptor, terminalInput: AgentTerminalSnapshot): Promise<SessionFinalProjection> {
+    const sessionId = session.id;
     return this.enqueue(sessionId, () => withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
       const terminal = createAgentTerminalSnapshot(terminalInput);
       const state = await this.refreshIndex(sessionId, true);
+      assertDescriptor(session, state);
       const existing = state.projections.find((projection) => projection.finalizationId === terminal.finalizationId);
       if (existing) {
         if (terminalSnapshotFingerprint(existing.terminal) !== terminalSnapshotFingerprint(terminal)) throw new PersistenceConflictError(`Conflicting session projection for finalization ${terminal.finalizationId}.`);
@@ -303,9 +330,11 @@ export class JsonlSessionRepository implements SessionRepository {
     }));
   }
 
-  enqueueSubmission(sessionId: string, input: { submissionId: string; runId: string; input: SessionSubmissionInput; configuration: SessionSubmissionConfiguration }): Promise<void> {
+  enqueueSubmission(session: SessionDescriptor, input: { submissionId: string; runId: string; input: SessionSubmissionInput; configuration: SessionSubmissionConfiguration }): Promise<void> {
+    const sessionId = session.id;
     return this.enqueue(sessionId, () => withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
       const state = await this.refreshIndex(sessionId, true);
+      assertDescriptor(session, state);
       if (state.submissionRecords.some((record) => record.submissionId === input.submissionId)) throw new Error(`Duplicate session submission: ${input.submissionId}`);
       const record: SessionSubmissionRecord = Object.freeze({ type: 'submission.queued', submissionId: input.submissionId, runId: input.runId,
         timestamp: new Date().toISOString(), input: ownSessionSubmissionInput(input.input), configuration: ownSessionSubmissionConfiguration(input.configuration) });
@@ -314,18 +343,25 @@ export class JsonlSessionRepository implements SessionRepository {
     }));
   }
 
-  transitionSubmission(sessionId: string, submissionId: string, outcome: { state: SessionSubmissionState; errorMessage?: string }): Promise<void> {
+  transitionSubmission(session: SessionDescriptor, submissionId: string, outcome:
+    | { readonly state: 'claimed' | 'completed' }
+    | { readonly state: 'suspended'; readonly suspension: import('./contracts.js').SessionSuspensionDescriptor }
+    | { readonly state: 'failed'; readonly errorMessage: string }): Promise<void> {
+    const sessionId = session.id;
     return this.enqueue(sessionId, () => withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
       const state = await this.refreshIndex(sessionId, true);
-      const record = createSessionSubmissionTransition(state.submissionRecords, submissionId, outcome.state, outcome.errorMessage);
+      assertDescriptor(session, state);
+      const record = createSessionSubmissionTransition(state.submissionRecords, submissionId, outcome);
       if (!record) return;
       await this.appendRecord(sessionId, state, record);
       state.submissionRecords.push(record);
     }));
   }
 
-  async loadPendingSubmissions(sessionId: string): Promise<readonly SessionPendingSubmission[]> {
+  async loadPendingSubmissions(session: SessionDescriptor): Promise<readonly SessionPendingSubmission[]> {
+    const sessionId = session.id;
     const state = await this.enqueue(sessionId, () => this.refreshIndex(sessionId, false));
+    assertDescriptor(session, state);
     return pendingSessionSubmissions(state.submissionRecords);
   }
 
@@ -336,9 +372,11 @@ export class JsonlSessionRepository implements SessionRepository {
     state.storageStamp = await jsonlStorageStamp(this.filePath(sessionId));
   }
 
-  private appendBranchEntry<T extends SessionBranchEntry>(sessionId: string, create: (parentId: string | null) => T): Promise<T> {
+  private appendBranchEntry<T extends SessionBranchEntry>(session: SessionDescriptor, create: (parentId: string | null) => T): Promise<T> {
+    const sessionId = session.id;
     return this.enqueue(sessionId, () => withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
       const state = await this.refreshIndex(sessionId, true);
+      assertDescriptor(session, state);
       const entry = create(branchLeaf(state.branchEntries));
       await appendJsonlRecord(this.filePath(sessionId), entry);
       state.branchEntries.push(entry);
@@ -492,7 +530,7 @@ function validateParents(entries: readonly SessionBranchEntry[], filePath: strin
   const ids = new Set<string>();
   for (const entry of entries) { if (ids.has(entry.id)) throw new Error(`Duplicate session entry ${entry.id} in ${filePath}.`); if (entry.parentId !== null && !ids.has(entry.parentId)) throw new Error(`Unknown parent ${entry.parentId} in ${filePath}.`); ids.add(entry.id); }
 }
-const SESSION_HEADER_FIELDS = new Set(['type', 'version', 'id', 'timestamp', 'parentSessionId', 'provider', 'model']);
+const SESSION_HEADER_FIELDS = new Set(['type', 'version', 'id', 'timestamp', 'binding', 'parentSessionId', 'provider', 'model']);
 
 function parseSessionHeader(value: JsonValue, sessionId: string): SessionHeader {
   if (!isJsonObject(value) || value.type !== 'session' || value.version !== 1 || value.id !== sessionId
@@ -501,12 +539,17 @@ function parseSessionHeader(value: JsonValue, sessionId: string): SessionHeader 
     || (value.parentSessionId !== undefined && typeof value.parentSessionId !== 'string')
     || (value.provider !== undefined && typeof value.provider !== 'string')
     || (value.model !== undefined && typeof value.model !== 'string')) throw new Error('Session header is invalid.');
+  const binding = decodeSessionBinding(value.binding);
   return Object.freeze({
-    type: 'session', version: 1, id: value.id, timestamp: value.timestamp,
+    type: 'session', version: 1, id: value.id, timestamp: value.timestamp, binding,
     ...(value.parentSessionId === undefined ? {} : { parentSessionId: value.parentSessionId }),
     ...(value.provider === undefined ? {} : { provider: value.provider }),
     ...(value.model === undefined ? {} : { model: value.model })
   });
+}
+function assertDescriptor(session: SessionDescriptor, state: SessionFileState): void {
+  if (session.id !== state.header.id) throw new Error(`Session descriptor identity mismatch for ${session.id}.`);
+  assertSessionBinding(decodeSessionBinding(session.header.binding), state.header.binding);
 }
 function recordBytes(record: unknown): number { return Buffer.byteLength(`${JSON.stringify(record)}\n`, 'utf8'); }
 function normalizedObservationInput(input: { runId: string; identity: AgentTurnIdentity & Partial<Pick<AgentToolCallAttemptIdentity, 'toolBatchId' | 'callIndex' | 'callId' | 'toolAttempt'>>; toolName: string; observation: SessionObservationInput }): Omit<SessionObservationEntry, keyof BaseSessionEntry | 'type'> {
@@ -624,9 +667,54 @@ function parseSubmissionRecord(value: JsonObject): SessionSubmissionRecord {
       input: parseSubmissionInput(value.input), configuration: parseSubmissionConfiguration(value.configuration) });
   }
   if (value.type !== 'submission.claimed' && value.type !== 'submission.suspended' && value.type !== 'submission.completed' && value.type !== 'submission.failed') throw new Error('Session submission state is invalid.');
-  if (value.errorMessage !== undefined && typeof value.errorMessage !== 'string') throw new Error('Session submission error is invalid.');
-  return Object.freeze({ type: value.type, submissionId: value.submissionId, runId: value.runId, timestamp: value.timestamp,
-    ...(value.errorMessage === undefined ? {} : { errorMessage: value.errorMessage }) });
+  const base = { submissionId: value.submissionId, runId: value.runId, timestamp: value.timestamp };
+  if (value.type === 'submission.suspended') return Object.freeze({ ...base, type: value.type, suspension: parseSuspension(value.suspension, value.submissionId, value.runId) });
+  if (value.type === 'submission.failed') {
+    if (typeof value.errorMessage !== 'string' || value.errorMessage.length === 0) throw new Error('Session submission error is invalid.');
+    return Object.freeze({ ...base, type: value.type, errorMessage: value.errorMessage });
+  }
+  if (value.errorMessage !== undefined || value.suspension !== undefined) throw new Error('Session submission transition has unsupported state data.');
+  return Object.freeze({ ...base, type: value.type });
+}
+
+function parseSuspension(value: JsonValue | undefined, submissionId: string, runId: string): import('./contracts.js').SessionSuspensionDescriptor {
+  if (!isJsonObject(value) || value.submissionId !== submissionId || value.runId !== runId || !Array.isArray(value.actions)) throw new Error('Session suspension is invalid.');
+  const requestValue = value.decisionRequest;
+  let decisionRequest: import('../operation/contracts.js').AgentDecisionRequest | undefined;
+  if (requestValue !== undefined) {
+    if (!isJsonObject(requestValue) || typeof requestValue.id !== 'string' || typeof requestValue.reason !== 'string'
+      || !Array.isArray(requestValue.choices) || !requestValue.choices.every((choice): choice is string => typeof choice === 'string')
+      || typeof requestValue.fingerprint !== 'string' || typeof requestValue.operationRevision !== 'number') throw new Error('Session decision request is invalid.');
+    decisionRequest = Object.freeze({
+      id: requestValue.id, reason: requestValue.reason, choices: Object.freeze([...requestValue.choices]),
+      fingerprint: requestValue.fingerprint, operationRevision: requestValue.operationRevision
+    });
+  }
+  return ownSessionSuspensionDescriptor({
+    runId, submissionId,
+    category: parseSuspensionCategory(value.category),
+    reason: parseSuspensionReason(value.reason),
+    ...(value.effectId === undefined ? {} : { effectId: requiredString(value.effectId, 'Session suspension effect identity') }),
+    actions: Object.freeze(value.actions.map(parseSuspensionAction)),
+    ...(decisionRequest === undefined ? {} : { decisionRequest })
+  });
+}
+function parseSuspensionCategory(value: JsonValue | undefined): import('./contracts.js').SessionSuspensionCategory {
+  if (value === 'approval' || value === 'external_recovery' || value === 'implementation' || value === 'user_decision') return value;
+  throw new Error('Session suspension category is invalid.');
+}
+function parseSuspensionReason(value: JsonValue | undefined): import('./contracts.js').SessionSuspensionDescriptor['reason'] {
+  if (value === 'approval_required' || value === 'provider_outcome_unknown' || value === 'tool_outcome_unknown'
+    || value === 'disposition_outcome_unknown' || value === 'missing_implementation' || value === 'user_decision') return value;
+  throw new Error('Session suspension reason is invalid.');
+}
+function parseSuspensionAction(value: JsonValue): import('./contracts.js').SessionSuspensionAction {
+  if (value === 'approval' || value === 'reconcile' || value === 'resume' || value === 'decide' || value === 'abort') return value;
+  throw new Error('Session suspension action is invalid.');
+}
+function requiredString(value: JsonValue | undefined, name: string): string {
+  if (typeof value !== 'string' || value.length === 0) throw new Error(`${name} is invalid.`);
+  return value;
 }
 
 function parseSubmissionInput(value: JsonObject): SessionSubmissionInput {
@@ -679,8 +767,25 @@ function encodeSubmissionRecord(record: SessionSubmissionRecord): JsonObject {
     type: record.type, submissionId: record.submissionId, runId: record.runId, timestamp: record.timestamp,
     input: encodeSubmissionInput(record.input), configuration: encodeSubmissionConfiguration(record.configuration)
   });
+  if (record.type === 'submission.suspended') return Object.freeze({
+    type: record.type, submissionId: record.submissionId, runId: record.runId, timestamp: record.timestamp,
+    suspension: encodeSuspension(record.suspension)
+  });
   return Object.freeze({ type: record.type, submissionId: record.submissionId, runId: record.runId, timestamp: record.timestamp,
-    ...(record.errorMessage === undefined ? {} : { errorMessage: record.errorMessage }) });
+    ...(record.type === 'submission.failed' ? { errorMessage: record.errorMessage } : {}) });
+}
+
+function encodeSuspension(suspension: import('./contracts.js').SessionSuspensionDescriptor): JsonObject {
+  return Object.freeze({
+    runId: suspension.runId, submissionId: suspension.submissionId, category: suspension.category, reason: suspension.reason,
+    ...(suspension.effectId === undefined ? {} : { effectId: suspension.effectId }),
+    actions: Object.freeze([...suspension.actions]),
+    ...(suspension.decisionRequest === undefined ? {} : { decisionRequest: Object.freeze({
+      id: suspension.decisionRequest.id, reason: suspension.decisionRequest.reason,
+      choices: Object.freeze([...suspension.decisionRequest.choices]), fingerprint: suspension.decisionRequest.fingerprint,
+      operationRevision: suspension.decisionRequest.operationRevision
+    }) })
+  });
 }
 
 function encodeSubmissionConfiguration(configuration: SessionSubmissionConfiguration): JsonObject {

@@ -41,6 +41,7 @@ const emptyOutputSchema = z.strictObject({});
 const readEnvelope = { accesses: [{ mode: 'read', scope: 'memory' }], lockScopes: [] };
 const readEffects = { ...readEnvelope, recovery: { kind: 'unknown' } };
 const completeScope = { resources: ['memory'], coverage: 'complete' };
+const SESSION_BINDING = Object.freeze({ schemaId: 'agent-core.tests/runtime', schemaVersion: 1, subject: Object.freeze({ application: 'agent-core-tests' }) });
 
 function ended(result) {
   assert.equal(result.state, 'ended');
@@ -89,7 +90,7 @@ function deferred() {
 async function harness(options = {}) {
   const events = options.events ?? new InMemoryEventRepository(agentEventCodec);
   const sessions = options.sessions ?? new InMemorySessionRepository();
-  const session = options.withoutSession ? undefined : await sessions.create({ provider: 'scripted', model: 'scripted' });
+  const session = options.withoutSession ? undefined : await sessions.create({ provider: 'scripted', model: 'scripted', binding: SESSION_BINDING });
   const artifacts = options.artifacts ?? new InMemoryArtifactRepository();
   const provider = options.provider ?? new ScriptedProvider(options.script ?? [response()]);
   const agent = new AgentRuntime({
@@ -98,7 +99,7 @@ async function harness(options = {}) {
     toolBoundary: options.toolBoundary ?? toolBoundary,
     repositories: {
       events,
-      ...(session ? { session: { repository: sessions, sessionId: session.id } } : {}),
+      ...(session ? { session: { repository: sessions, descriptor: session } } : {}),
       artifacts
     },
     ...(options.checks ? { checks: options.checks } : {}),
@@ -826,7 +827,7 @@ test('check artifacts and diagnostics agree across ledger, session projection, a
   const ref = await artifacts.store({ label: 'proof', content: new TextEncoder().encode('proof'), mediaType: 'text/plain' });
   const { agent, events, sessions, session } = await harness({ artifacts, checks: [{ id: 'advice', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'advisory', async run() { return { verdict: 'unknown', summary: 'unavailable', diagnostic: { kind: 'unavailable', message: 'offline' }, artifacts: [ref] }; } }] });
   const result = ended(await agent.run({ task: 'persist checks' }).result);  const ledgerFinal = (await eventsFor(events, result.runId)).find((event) => event.type === 'run.ended').terminal;
-  const replay = await sessions.loadReplayState(session.id);
+  const replay = await sessions.loadReplayState(session);
   const projection = replay.terminalProjections[0].terminal;
   assert.deepEqual(ledgerFinal.checkResults, result.checkResults);
   assert.deepEqual(projection.checkResults, result.checkResults);
@@ -883,10 +884,10 @@ test('in-memory repositories run, reopen, and replay without filesystem paths', 
   const first = await harness({ script: [response('stop', 'first')] });  const firstResult = ended(await first.agent.run({ task: 'first' }).result);  const started = (await eventsFor(first.events, firstResult.runId)).find((event) => event.type === 'run.started');
   assert.equal(started.runId, firstResult.runId);
   assert.equal(started.finalizationId, firstResult.finalizationId);
-  const reopened = await first.sessions.open(first.session.id);
+  const reopened = await first.sessions.open(first.session.id, SESSION_BINDING);
   assert.equal(reopened.id, first.session.id);
   const secondProvider = new ScriptedProvider([request => response('stop', request.messages.some(message => message.content.includes('Prior session context')) ? 'replayed' : 'missing')]);
-  const second = new AgentRuntime({ provider: secondProvider, model: 'scripted', toolBoundary, repositories: { events: first.events, session: { repository: first.sessions, sessionId: first.session.id }, artifacts: first.artifacts } });
+  const second = new AgentRuntime({ provider: secondProvider, model: 'scripted', toolBoundary, repositories: { events: first.events, session: { repository: first.sessions, descriptor: reopened }, artifacts: first.artifacts } });
   const secondResult = ended(await second.run({ task: 'second' }).result);  assert.equal(firstResult.executionStatus, 'completed');
   assert.equal(secondResult.candidate.message, 'replayed');
 });
@@ -894,10 +895,10 @@ test('in-memory repositories run, reopen, and replay without filesystem paths', 
 test('session replay preserves an accepted task from an interrupted run', async () => {
   const events = new InMemoryEventRepository(agentEventCodec);
   const sessions = new InMemorySessionRepository();
-  const session = await sessions.create({ provider: 'scripted', model: 'scripted' });
+  const session = await sessions.create({ provider: 'scripted', model: 'scripted', binding: SESSION_BINDING });
   const artifacts = new InMemoryArtifactRepository();
   const interruptedTask = 'Investigate the unfinished continuity problem.';
-  await sessions.appendInput(session.id, { runId: 'interrupted-run', task: interruptedTask });
+  await sessions.appendInput(session, { runId: 'interrupted-run', task: interruptedTask });
   await events.append('interrupted-run', {
     type: 'run.started',
     runId: 'interrupted-run',
@@ -914,7 +915,7 @@ test('session replay preserves an accepted task from an interrupted run', async 
     provider,
     model: 'scripted',
     toolBoundary,
-    repositories: { events, session: { repository: sessions, sessionId: session.id }, artifacts }
+    repositories: { events, session: { repository: sessions, descriptor: session }, artifacts }
   });
 
   const result = ended(await reopened.run({ task: 'Continue after recovery.' }).result);
@@ -948,6 +949,41 @@ test('provider failure preserves one durable unknown outcome without a second re
   assert.deepEqual(operation.state.phase.effect.intent.recovery, { kind: 'unknown' });
   assert.deepEqual(operation.state.phase.effect.intent.exposure.quantities.map(quantity => quantity.unit), ['prompt_tokens', 'completion_tokens']);
   assert.ok(operation.state.phase.effect.intent.exposure.quantities.every(quantity => quantity.amount > 0));
+});
+
+test('a provider start ticket stranded by process loss becomes an exact durable abort decision', async () => {
+  class InterruptedProviderStartRepository extends InMemoryEventRepository {
+    interrupt = true;
+    async appendConditional(runId, event, options) {
+      const receipt = await super.appendConditional(runId, event, options);
+      if (this.interrupt && event.type === 'operation.transition'
+        && event.state.phase.kind === 'provider' && event.state.phase.stage === 'effect_ready') {
+        this.interrupt = false;
+        throw new Error('simulated process stop before provider start');
+      }
+      return receipt;
+    }
+  }
+  const events = new InterruptedProviderStartRepository(agentEventCodec);
+  const provider = new ScriptedProvider([response('stop', 'must not be requested')]);
+  const first = await harness({ events, provider, withoutSession: true });
+  const control = first.agent.run({ task: 'strand the issued provider ticket' });
+  await assert.rejects(control.result, /simulated process stop before provider start|outcome is unknown|stale_tail/u);
+  assert.equal(provider.calls.length, 0);
+
+  const resumed = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events } });
+  const result = await resumed.resume(control.runId).result;
+  assert.equal(result.state, 'suspended');
+  assert.equal(result.reason, 'user_decision');
+  assert.deepEqual(result.decisionRequest.choices, ['abort']);
+  assert.equal(result.decisionRequest.operationRevision, (await resumed.inspectOperation(control.runId)).state.revision);
+  assert.match(result.decisionRequest.fingerprint, /^[a-f0-9]{64}$/u);
+  assert.equal(provider.calls.length, 0);
+
+  const restored = await new AgentOperationCoordinator(events).inspect(control.runId);
+  assert.equal(restored.state.phase.kind, 'suspended');
+  assert.equal(restored.state.phase.reason, 'user_decision');
+  assert.deepEqual(restored.state.phase.decisionRequest, result.decisionRequest);
 });
 
 test('a persisted provider settlement resumes without issuing a duplicate request', async () => {
@@ -1121,17 +1157,17 @@ test('durable approval resumes after repository reopen and rejects changed polic
   assert.equal(preparationReleases, 1);
   const approval = suspended.pendingApprovals[0];
 
-  const changedPolicy = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read'] } });
+  const changedPolicy = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, descriptor: repositories.session }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read'] } });
   await assert.rejects(async () => (await changedPolicy.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result, /different runtime implementation or configuration/);
   assert.equal(preparationReleases, 1);
   assert.equal((await eventsFor(repositories.events, suspended.runId)).filter(event => event.type === 'approval.resolved').length, 0);
 
-  const changedTarget = new AgentRuntime({ provider, model: 'scripted', toolBoundary: { ...toolBoundary, executionTargetId: 'tests/other-target' }, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, checks: [{ id: 'required', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
+  const changedTarget = new AgentRuntime({ provider, model: 'scripted', toolBoundary: { ...toolBoundary, executionTargetId: 'tests/other-target' }, repositories: { events: repositories.events, session: { repository: repositories.sessions, descriptor: repositories.session }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, checks: [{ id: 'required', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
   await assert.rejects(async () => (await changedTarget.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result, /boundary changed/);
   assert.equal(preparationReleases, 1);
 
   const replacement = adoptToolDefinition({ ...tool, implementationId: 'tests/canonical-effect@2' });
-  const changedImplementation = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [replacement], toolPolicy: { allowedRisks: ['read', 'write'] }, checks: [{ id: 'required', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
+  const changedImplementation = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, descriptor: repositories.session }, artifacts: repositories.artifacts }, tools: [replacement], toolPolicy: { allowedRisks: ['read', 'write'] }, checks: [{ id: 'required', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
   const unavailable = await (await changedImplementation.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result;
   assert.equal(unavailable.state, 'suspended');
   assert.equal(unavailable.reason, 'missing_implementation');
@@ -1139,7 +1175,7 @@ test('durable approval resumes after repository reopen and rejects changed polic
   assert.equal((await repositories.agent.inspectOperation(suspended.runId)).state.phase.kind, 'approval');
   assert.deepEqual(approval.binding, { toolImplementationId: tool.implementationId, ...toolBoundary });
 
-  const reopened = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, sessionId: repositories.session.id }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, checks: [{ id: 'required', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
+  const reopened = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, descriptor: repositories.session }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, checks: [{ id: 'required', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
   const result = ended(await (await reopened.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result);  assert.equal(result.executionStatus, 'completed');
   assert.equal(result.verificationStatus, 'passed');
   assert.equal(effects, 1);
@@ -1148,7 +1184,7 @@ test('durable approval resumes after repository reopen and rejects changed polic
   assert.equal(records.filter(event => event.type === 'approval.requested').length, 1);
   assert.equal(records.filter(event => event.type === 'approval.resolved').length, 1);
   assert.equal(records.filter(event => event.type === 'run.ended').length, 1);
-  assert.equal((await repositories.sessions.open(repositories.session.id)).id, repositories.session.id);
+  assert.equal((await repositories.sessions.open(repositories.session.id, SESSION_BINDING)).id, repositories.session.id);
 });
 
 test('current authorization is re-evaluated and may veto a stored approval', async () => {
@@ -1170,7 +1206,7 @@ test('current authorization is re-evaluated and may veto a stored approval', asy
     provider,
     model: 'scripted',
     toolBoundary,
-    repositories: { events: first.events, session: { repository: first.sessions, sessionId: first.session.id }, artifacts: first.artifacts },
+    repositories: { events: first.events, session: { repository: first.sessions, descriptor: first.session }, artifacts: first.artifacts },
     tools: [tool],
     toolPolicy: { allowedRisks: ['read', 'write'] },
     toolAuthorizer() { currentChecks += 1; return { decision: 'deny', reason: 'policy changed' }; }
@@ -1254,7 +1290,8 @@ test('process death after tool completion projects the durable observation witho
   assert.equal(records.filter((event) => event.type === 'tool.ended').length, 1);
   assert.equal(records.filter((event) => event.type === 'observation.record.created').length, 1);
   const sessionRepository = new (await import('@agent-core/runtime/node')).JsonlSessionRepository({ rootDir: path.join(root, 'sessions') });
-  const replay = await sessionRepository.loadReplayState('crash-recovery');
+  const crashSession = await sessionRepository.open('crash-recovery', SESSION_BINDING);
+  const replay = await sessionRepository.loadReplayState(crashSession);
   assert.equal(replay.branch.filter((entry) => entry.type === 'observation' && entry.toolName === 'effect').length, 1);
 });
 
@@ -1520,9 +1557,9 @@ test('finalization is idempotent, rejects conflicts, and recovers faults after e
   const base = terminal();
   const events = new InMemoryEventRepository(agentEventCodec);
   const sessions = new InMemorySessionRepository();
-  const session = await sessions.create({});
-  await sessions.appendInput(session.id, { runId: base.runId, task: 'finalize' });
-  const finalizer = new AgentRunFinalizer({ runId: base.runId, finalizationId: base.finalizationId, events, append: (event, idempotencyKey) => events.append(base.runId, event, { idempotencyKey }), session: { repository: sessions, sessionId: session.id } });
+  const session = await sessions.create({ binding: SESSION_BINDING });
+  await sessions.appendInput(session, { runId: base.runId, task: 'finalize' });
+  const finalizer = new AgentRunFinalizer({ runId: base.runId, finalizationId: base.finalizationId, events, append: (event, idempotencyKey) => events.append(base.runId, event, { idempotencyKey }), session: { repository: sessions, descriptor: session } });
   const first = finalizer.finalize(base);
   assert.equal(first, finalizer.finalize(base));
   const result = ended(await first);  assert.equal(result.executionStatus, 'completed');
@@ -1532,8 +1569,8 @@ test('finalization is idempotent, rejects conflicts, and recovers faults after e
   for (const point of ['prepared', 'session', 'committed']) {
     const durableEvents = new InMemoryEventRepository(agentEventCodec);
     const durableSessions = new InMemorySessionRepository();
-    const durableSession = await durableSessions.create({});
-    await durableSessions.appendInput(durableSession.id, { runId: base.runId, task: 'recover' });
+    const durableSession = await durableSessions.create({ binding: SESSION_BINDING });
+    await durableSessions.appendInput(durableSession, { runId: base.runId, task: 'recover' });
     let thrown = false;
     const faultEvents = {
       ...durableEvents,
@@ -1549,7 +1586,7 @@ test('finalization is idempotent, rejects conflicts, and recovers faults after e
       projectFinal: async (sessionId, value) => { const projection = await durableSessions.projectFinal(sessionId, value); if (!thrown) { thrown = true; throw new Error('fault session'); } return projection; },
       loadReplayState: (sessionId, leafId) => durableSessions.loadReplayState(sessionId, leafId)
     } : durableSessions;
-    const broken = new AgentRunFinalizer({ runId: base.runId, finalizationId: base.finalizationId, events: faultEvents, append: (event, idempotencyKey) => faultEvents.append(base.runId, event, { idempotencyKey }), session: { repository: faultSessions, sessionId: durableSession.id } });
+    const broken = new AgentRunFinalizer({ runId: base.runId, finalizationId: base.finalizationId, events: faultEvents, append: (event, idempotencyKey) => faultEvents.append(base.runId, event, { idempotencyKey }), session: { repository: faultSessions, descriptor: durableSession } });
     await assert.rejects(broken.finalize(base), error => {
       assert.equal(error instanceof AgentFinalizationError, true);
       assert.equal(error.progress.reconciliation, 'verified');
@@ -1558,11 +1595,11 @@ test('finalization is idempotent, rejects conflicts, and recovers faults after e
       assert.equal(error.progress.committed, point === 'committed');
       return true;
     });
-    const recovered = new AgentRunFinalizer({ runId: base.runId, finalizationId: base.finalizationId, events: durableEvents, append: (event, idempotencyKey) => durableEvents.append(base.runId, event, { idempotencyKey }), session: { repository: durableSessions, sessionId: durableSession.id } });
+    const recovered = new AgentRunFinalizer({ runId: base.runId, finalizationId: base.finalizationId, events: durableEvents, append: (event, idempotencyKey) => durableEvents.append(base.runId, event, { idempotencyKey }), session: { repository: durableSessions, descriptor: durableSession } });
     await recovered.finalize(base);
     assert.deepEqual(await readCommittedTerminal(durableEvents, base.runId), base);
     assert.equal((await eventsFor(durableEvents, base.runId)).filter(event => event.type === 'run.ended').length, 1);
-    assert.equal((await durableSessions.loadReplayState(durableSession.id)).terminalProjections.length, 1);
+    assert.equal((await durableSessions.loadReplayState(durableSession)).terminalProjections.length, 1);
   }
 });
 

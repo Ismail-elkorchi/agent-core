@@ -504,8 +504,18 @@ export class AgentRuntime {
       if (phase.kind === 'suspended') return operationSuspension(operationState);
       if (phase.kind === 'provider' && phase.stage === 'effect_ready') {
         const closed = closeExternalEffect(phase.effect, 'cancelled_before_start');
+        const decisionRequest = cancelledProviderStartDecisionRequest(operation.state(), closed.intent.effectId);
         await this.advanceOperation(operation, 'start_provider_request', {
-          phase: { kind: 'suspended', reason: 'user_decision', effectId: closed.intent.effectId },
+          phase: {
+            kind: 'suspended', reason: 'user_decision', effectId: closed.intent.effectId, decisionRequest,
+            continuation: {
+              kind: 'cancelled_provider_start',
+              blockedProvider: {
+                kind: 'provider', identity: phase.identity, toolBatchId: phase.toolBatchId,
+                requestEventId: phase.requestEventId, responseId: phase.responseId, effect: closed
+              }
+            }
+          },
           ...(operation.state().budget ? { budget: operation.state().budget } : {})
         });
         return operationSuspension(operation.state());
@@ -665,7 +675,7 @@ export class AgentRuntime {
       await runtime.append({ type: 'run.phase.changed', runId: runtime.runId, phase: 'preparing', budget: runtime.controller.snapshot() });
     }
     if (this.options.repositories.session && !runtime.restoring) {
-      const replayEvent = { type: 'context.replay.created' as const, sessionId: this.options.repositories.session.sessionId,
+      const replayEvent = { type: 'context.replay.created' as const, sessionId: this.options.repositories.session.descriptor.id,
         replayedLedgers: replay.replayedLedgers, replayedTurns: replay.replayedTurns, replayedSessionEntries: replay.replayedSessionEntries,
         replayedCheckpoints: replay.replayedCheckpoints, replayedToolResults: replay.replayedToolResults, replayedEvidenceRecords: replay.replayedEvidenceRecords,
         ...(replay.providerStateSummary ? { restoredProviderState: replay.providerStateSummary } : {}), ...(replay.providerStateRef ? { restoredProviderStateRef: replay.providerStateRef } : {}) };
@@ -675,7 +685,7 @@ export class AgentRuntime {
     if (!runtime.restoring) await runtime.append({ type: 'input.received', task: runtime.input.task });
     let sessionEntryId: string | undefined;
     if (this.options.repositories.session && !runtime.restoring) {
-      const inputEntry = await this.options.repositories.session.repository.appendInput(this.options.repositories.session.sessionId, { runId: runtime.runId, task: runtime.input.task, instructions: effectiveInstructions });
+      const inputEntry = await this.options.repositories.session.repository.appendInput(this.options.repositories.session.descriptor, { runId: runtime.runId, task: runtime.input.task, instructions: effectiveInstructions });
       sessionEntryId = inputEntry.id;
     }
     throwIfAborted(runtime.signal);
@@ -788,11 +798,11 @@ export class AgentRuntime {
           snapshot = this.createTurnSnapshot({ turnIndex, turnId, requestAttempt: 1, configuration, profile, requestWindow, tools, instructions: effectiveInstructions, controller: runtime.controller, continuationEligible });
           activeTurnIdentity = turnIdentity(snapshot.record);
           const turnStarted = { type: 'turn.started' as const, runId: runtime.runId, task: runtime.input.task, ...activeTurnIdentity,
-            ...(this.options.repositories.session ? { sessionId: this.options.repositories.session.sessionId } : {}), ...(sessionEntryId ? { sessionEntryId } : {}) };
+            ...(this.options.repositories.session ? { sessionId: this.options.repositories.session.descriptor.id } : {}), ...(sessionEntryId ? { sessionEntryId } : {}) };
           await runtime.append(turnStarted);
           await runtime.emit(turnStarted);
           if (this.options.repositories.session && turnIndex === 1) {
-            await this.options.repositories.session.repository.appendModelSettings(this.options.repositories.session.sessionId, {
+            await this.options.repositories.session.repository.appendModelSettings(this.options.repositories.session.descriptor, {
               provider: providerInfo.id, model: configuration.model,
               ...(configuration.temperature === undefined ? {} : { temperature: configuration.temperature }),
               ...(configuration.reasoning?.strategy === 'effort' ? { reasoningEffort: configuration.reasoning.effort } : {})
@@ -833,7 +843,7 @@ export class AgentRuntime {
         if (toolCalls.length === 0) {
           if (activeCandidate.status === 'absent') {
             const emptyMessage = [`Model returned no native tool calls and no visible candidate at turnIndex ${String(turnIndex)}.`, response.reasoning ? 'Raw private reasoning is not a candidate.' : ''].filter(Boolean).join(' ');
-            await this.options.repositories.session?.repository.appendObservation(this.options.repositories.session.sessionId, { runId: runtime.runId, identity: turnIdentity(snapshot.record), toolName: 'assistant_response', observation: { ok: false, summary: emptyMessage, output: { content: response.content } } });
+            await this.options.repositories.session?.repository.appendObservation(this.options.repositories.session.descriptor, { runId: runtime.runId, identity: turnIdentity(snapshot.record), toolName: 'assistant_response', observation: { ok: false, summary: emptyMessage, output: { content: response.content } } });
             await this.advanceOperation(runtime.operation, 'consume_provider_settlement', { phase: { kind: 'finalization', stage: 'ready' }, budget: runtime.controller.snapshot() });
             return failedDecision('empty_response', activeCandidate, emptyMessage, turnIndex, checkResults, response);
           }
@@ -865,7 +875,7 @@ export class AgentRuntime {
         contextManager.recordModelOutput({ turnIndex, content: response.content, toolCalls: toolCalls.map(modelToolCallFromToolCall) });
         if (this.options.repositories.session) {
           for (const [callIndex, call] of toolCalls.entries()) {
-            await this.options.repositories.session.repository.appendToolCall(this.options.repositories.session.sessionId, {
+            await this.options.repositories.session.repository.appendToolCall(this.options.repositories.session.descriptor, {
               runId: runtime.runId,
               identity: { ...activeTurnIdentity, toolBatchId, callIndex, ...(call.id ? { callId: call.id } : {}) },
               call
@@ -1657,7 +1667,7 @@ export class AgentRuntime {
     await append(assistantEnded);
     await emit(assistantEnded);
     if (this.options.repositories.session) {
-      await this.options.repositories.session.repository.appendAssistant(this.options.repositories.session.sessionId, {
+      await this.options.repositories.session.repository.appendAssistant(this.options.repositories.session.descriptor, {
         runId: request.runId,
         identity: responseIdentity,
         content: response.content
@@ -2779,8 +2789,20 @@ function operationSuspension(state: import('./operation/contracts.js').AgentOper
     runId: state.runId,
     finalizationId: state.finalizationId,
     ...(phase.effectId ? { effectId: phase.effectId } : {}),
+    ...(phase.reason === 'user_decision' ? { decisionRequest: phase.decisionRequest } : {}),
     budget: state.budget
   });
+}
+function cancelledProviderStartDecisionRequest(
+  state: import('./operation/contracts.js').AgentOperationState,
+  effectId: string
+): import('./operation/contracts.js').AgentDecisionRequest {
+  const operationRevision = state.revision + 1;
+  const id = `${state.runId}:decision:${effectId}`;
+  const reason = 'The provider effect was durably prepared but cannot be started after restoration. Aborting is the only safe continuation.';
+  const choices = Object.freeze(['abort']);
+  const fingerprint = hashJson({ id, reason, choices, operationRevision, effectId });
+  return Object.freeze({ id, reason, choices, fingerprint, operationRevision });
 }
 function toolRecoveryDecision(state: import('./operation/contracts.js').AgentOperationState): Extract<ExecutionDecision, { readonly executionStatus: 'waiting_for_recovery' }> {
   const phase = requireToolBatch(state.phase);
