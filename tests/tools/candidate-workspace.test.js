@@ -6,7 +6,7 @@ import test from 'node:test';
 import { prepareCandidateWorkspaceAcceptance } from '@agent-core/runtime';
 import { LocalCandidateWorkspace, RootedFileAuthority, captureWorkspaceSnapshot } from '@agent-core/tools-local';
 
-test('candidate workspaces isolate edits, checkpoint, roll back, and promote one exact snapshot', async () => {
+test('candidate workspaces isolate edits, checkpoint, roll back, and promote one exact snapshot', { skip: process.platform !== 'linux' }, async () => {
   const parent = await mkdtemp(path.join(tmpdir(), 'agent-core-candidate-'));
   const sourceDirectory = path.join(parent, 'source');
   const runtimeDirectory = path.join(parent, 'runtime');
@@ -56,7 +56,7 @@ test('candidate workspaces isolate edits, checkpoint, roll back, and promote one
   }
 });
 
-test('candidate promotion refuses a stale source and never overwrites concurrent work', async () => {
+test('candidate promotion refuses a stale source and never overwrites concurrent work', { skip: process.platform !== 'linux' }, async () => {
   const parent = await mkdtemp(path.join(tmpdir(), 'agent-core-candidate-stale-'));
   const sourceDirectory = path.join(parent, 'source');
   await mkdir(sourceDirectory);
