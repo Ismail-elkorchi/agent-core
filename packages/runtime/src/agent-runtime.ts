@@ -189,6 +189,8 @@ export interface AgentRuntimeOptions {
   readonly clock?: AgentClock;
   readonly onProgress?: (event: AgentProgressEvent) => void | Promise<void>;
   readonly recordRequest?: (record: AgentExactRequestRecord) => void | Promise<void>;
+  /** Releases application-owned execution resources after this runtime settles or suspends. */
+  readonly release?: () => void | Promise<void>;
 }
 
 export interface AgentRunInput {
@@ -329,6 +331,7 @@ export class AgentRuntime {
   private activeOperationDriver: AgentOperationDriver | undefined;
   private activeOperationReady: Promise<void> | undefined;
   private activeAbortRequest: Promise<void> | undefined;
+  private releasePromise: Promise<void> | undefined;
   private static readonly MAX_STEERING_ITEMS = 1024;
 
   constructor(private readonly options: AgentRuntimeOptions) {
@@ -378,10 +381,24 @@ export class AgentRuntime {
   }
 
   async resolveApproval(input: { readonly runId: string; readonly approvalId: string; readonly fingerprint: string; readonly decision: 'allow' | 'deny'; readonly signal?: AbortSignal }): Promise<AgentRunControl> {
+    try { return await this.resolveApprovalActive(input); }
+    catch (error) {
+      if (this.releasePromise !== undefined) throw error;
+      try { await this.releaseResources(); }
+      catch (releaseError) { throw new AggregateError([error, releaseError], 'Approval resolution and runtime resource release both failed.', { cause: releaseError }); }
+      throw error;
+    }
+  }
+
+  private async resolveApprovalActive(input: { readonly runId: string; readonly approvalId: string; readonly fingerprint: string; readonly decision: 'allow' | 'deny'; readonly signal?: AbortSignal }): Promise<AgentRunControl> {
     const terminal = await this.options.repositories.events.latestOfType(input.runId, 'run.ended');
-    if (terminal?.event.type === 'run.ended') return completedRunControl(input.runId, Object.freeze({ state: 'ended', terminal: terminal.event.terminal, deliveryDiagnostics: Object.freeze([]) }));
+    if (terminal?.event.type === 'run.ended') {
+      await this.releaseResources();
+      return completedRunControl(input.runId, Object.freeze({ state: 'ended', terminal: terminal.event.terminal, deliveryDiagnostics: Object.freeze([]) }));
+    }
     const operation = await new AgentOperationCoordinator(this.options.repositories.events).attach(input.runId);
     if (this.hasToolImplementationMismatch(operation) || this.hasDispositionImplementationMismatch(operation)) {
+      await this.releaseResources();
       return completedRunControl(input.runId, missingImplementationSuspension(operation.state()));
     }
     this.assertRuntimeMatchesOperation(operation);
@@ -428,6 +445,7 @@ export class AgentRuntime {
     await operation.decideApproval(input);
     const recoverySignal = input.signal ?? new AbortController().signal;
     if (!await this.reconcileDurableToolBatch(operation, recoverySignal)) {
+      await this.releaseResources();
       return completedRunControl(input.runId, operationSuspension(operation.state()));
     }
     return this.startRun(operationInput(operation.state(), input.signal), undefined, operation);
@@ -475,6 +493,7 @@ export class AgentRuntime {
         this.activeOperationDriver = undefined;
       }
       if (this.activeOperationReady === operationReady) this.activeOperationReady = undefined;
+      await this.releaseResources();
     }
   }
 
@@ -571,7 +590,13 @@ export class AgentRuntime {
         this.activeOperationDriver = undefined;
       }
       if (this.activeOperationReady === operationReady) this.activeOperationReady = undefined;
+      await this.releaseResources();
     }
+  }
+
+  private releaseResources(): Promise<void> {
+    this.releasePromise ??= Promise.resolve(this.options.release?.()).then(() => undefined);
+    return this.releasePromise;
   }
 
   private async runInternal(input: ResolvedAgentRunInput, signal: AbortSignal, operation: AgentOperationDriver, providerContinuation?: ProviderExecutionContinuation, restoring = false): Promise<AgentRunResult> {
@@ -1252,9 +1277,14 @@ export class AgentRuntime {
             await this.commitDispositionDecision(runtime, phase, decision, 'prepare_disposition');
             continue;
           }
-          const prepared = await this.disposition.prepare(continuation.input);
-          if (!isAgentPreparedDispositionEffect(prepared)) throw new TypeError(`Effect disposition ${this.disposition.implementationId} must return a prepared external effect.`);
-          retained = prepared;
+          const outcome = await this.disposition.prepare(continuation.input);
+          if (!isAgentPreparedDispositionEffect(outcome)) {
+            const decision = parseAgentDispositionDecision(outcome);
+            if (decision.kind === 'accept') throw new Error(`Effect disposition ${this.disposition.implementationId} must return a prepared external effect before accepting a candidate.`);
+            await this.commitDispositionDecision(runtime, phase, decision, 'prepare_disposition');
+            continue;
+          }
+          retained = outcome;
           const preparation = dispositionPreparation(this.disposition, continuation.input, retained);
           const generation = state.driverGeneration;
           const effectId = dispositionEffectId(runtime.runId, phase.identity, phase.revisionCount);

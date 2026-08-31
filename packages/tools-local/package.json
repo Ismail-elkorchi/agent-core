@@ -24,6 +24,7 @@
   "dependencies": {
     "@agent-core/evidence": "0.2.0",
     "@agent-core/json": "0.2.0",
+    "@agent-core/runtime": "0.2.0",
     "@agent-core/tools": "0.2.0",
     "ignore": "^7.0.6",
     "zod": "^4.4.3"

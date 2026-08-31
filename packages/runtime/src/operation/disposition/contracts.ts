@@ -38,7 +38,12 @@ export interface AgentDeterministicDispositionPolicy extends AgentDispositionPol
 
 export interface AgentEffectDispositionPolicy extends AgentDispositionPolicyBase {
   readonly kind: 'effect';
-  readonly prepare: (input: AgentDispositionInput) => AgentPreparedDispositionEffect | Promise<AgentPreparedDispositionEffect>;
+  /**
+   * Returns a non-accepting decision when disposition needs no external side
+   * effect, or a prepared effect. Acceptance must cross the prepared effect
+   * boundary because an effect policy owns candidate publication.
+   */
+  readonly prepare: (input: AgentDispositionInput) => AgentDispositionDecision | AgentPreparedDispositionEffect | Promise<AgentDispositionDecision | AgentPreparedDispositionEffect>;
 }
 
 export type AgentDispositionPolicy = AgentDeterministicDispositionPolicy | AgentEffectDispositionPolicy;

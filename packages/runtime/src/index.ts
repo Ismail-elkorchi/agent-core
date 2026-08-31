@@ -1,6 +1,7 @@
 export * from './agent-runtime.js';
 export * from './events.js';
 export * from './ports.js';
+export * from './candidate-workspace.js';
 export * from './run/contracts.js';
 export * from './operation/contracts.js';
 export * from './operation/driver.js';
