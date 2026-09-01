@@ -20,7 +20,6 @@ import {
   type ModelProviderErrorDiagnosticValue,
   type ModelProviderInfo,
   type ModelProviderSession,
-  type ModelProviderState,
   type ModelReasoningRequest,
   type ModelRequest,
   type ModelResponse,
@@ -217,11 +216,10 @@ export class OpenAIProvider implements ModelProvider {
     yield* session.stream(request);
   }
 
-  async *streamWithContinuation(request: ModelRequest, previousResponseId: string | undefined): AsyncIterable<ModelStreamEvent> {
+  async *streamResponse(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
     try {
       request = await this.validateRequest(request);
-      const reusedContinuation = previousResponseId !== undefined;
-      const responsePromise = this.fetchResponse(request, true, previousResponseId);
+      const responsePromise = this.fetchResponse(request, true);
       const startedAt = Date.now();
       let response: Response | undefined;
       while (!response) {
@@ -329,8 +327,8 @@ export class OpenAIProvider implements ModelProvider {
       }
 
       const responsePayload = completedResponse
-        ? toModelResponse(this.id, request, completedResponse, { reusedContinuation })
-        : fallbackStreamResponse(this.id, request, content, reasoning, reasoningSummary, toolCalls, { reusedContinuation });
+        ? toModelResponse(this.id, request, completedResponse)
+        : fallbackStreamResponse(this.id, request, content, reasoning, reasoningSummary, toolCalls);
       const responseToolCalls = dedupeToolCalls([...(responsePayload.toolCalls ?? []), ...toolCalls]);
       const recoveredResponse = parseOpenAIModelResponse({
         ...responsePayload,
@@ -346,7 +344,7 @@ export class OpenAIProvider implements ModelProvider {
     }
   }
 
-  async fetchResponse(request: ModelRequest, stream: boolean, previousResponseId?: string): Promise<Response> {
+  async fetchResponse(request: ModelRequest, stream: boolean): Promise<Response> {
     try {
       const token = await this.tokenProvider.getBearerToken(request.signal);
       const init: RequestInit = {
@@ -355,7 +353,7 @@ export class OpenAIProvider implements ModelProvider {
           Authorization: `Bearer ${token.token}`,
           'Content-Type': CONTENT_TYPE_JSON
         },
-        body: JSON.stringify(toOpenAIResponsesRequest(request, stream, previousResponseId))
+        body: JSON.stringify(toOpenAIResponsesRequest(request, stream))
       };
       if (request.signal) {
         init.signal = request.signal;
@@ -443,117 +441,26 @@ function tieredOpenAIPricing(inputRate: number, outputRate: number): NonNullable
 }
 
 class OpenAIProviderSession implements ModelProviderSession {
-  private previousResponseId: string | undefined;
-
   constructor(private readonly provider: OpenAIProvider) {}
 
-
   async complete(request: ModelRequest): Promise<ModelResponse> {
-    const previousResponseId = this.previousResponseId;
-    const reusedContinuation = previousResponseId !== undefined;
     try {
       request = await this.provider.validateRequest(request);
-      const response = await this.provider.fetchResponse(request, false, previousResponseId);
+      const response = await this.provider.fetchResponse(request, false);
       const payload = await parseJsonResponse(this.provider.id, response);
-      const modelResponse = toModelResponse(this.provider.id, request, payload, { reusedContinuation });
-      this.previousResponseId = modelResponse.transport?.responseId;
-      const state = this.providerState(request.model);
-      return state ? parseOpenAIModelResponse({ ...modelResponse, providerState: state }) : modelResponse;
+      return toModelResponse(this.provider.id, request, payload);
     } catch (error) {
-      this.resetContinuation('error');
-      throw withContinuationDiagnostic(this.provider.id, error, {
-        previousResponseId,
-        reusedContinuation,
-        transport: 'http',
-        strategy: 'stored_response'
-      });
+      throw normalizeError(this.provider.id, error);
     }
   }
 
   async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
-    const previousResponseId = this.previousResponseId;
-    const reusedContinuation = previousResponseId !== undefined;
     try {
-      for await (const event of this.provider.streamWithContinuation(request, previousResponseId)) {
-        if (event.type === 'done') {
-          this.previousResponseId = event.response.transport?.responseId;
-          const state = this.providerState(event.response.model);
-          yield state
-            ? { ...event, response: parseOpenAIModelResponse({ ...event.response, providerState: state }) }
-            : event;
-          continue;
-        }
-        yield event;
-      }
+      yield* this.provider.streamResponse(request);
     } catch (error) {
-      this.resetContinuation('error');
-      throw withContinuationDiagnostic(this.provider.id, error, {
-        previousResponseId,
-        reusedContinuation,
-        transport: 'http_sse',
-        strategy: 'stored_response'
-      });
+      throw normalizeError(this.provider.id, error);
     }
   }
-
-  restoreProviderState(state: ModelProviderState): void {
-    if (state.provider !== OPENAI_PROVIDER_ID || state.kind !== 'openai.responses.stored_response') {
-      return;
-    }
-    const responseId = state.data.responseId;
-    this.previousResponseId = typeof responseId === 'string' && responseId.length > 0 ? responseId : undefined;
-  }
-
-  resetContinuation(reason: string): void {
-    void reason;
-    this.previousResponseId = undefined;
-  }
-
-  private providerState(model: string): ModelProviderState | undefined {
-    return this.previousResponseId
-      ? {
-        provider: OPENAI_PROVIDER_ID,
-        model,
-        kind: 'openai.responses.stored_response',
-        data: {
-          responseId: this.previousResponseId
-        }
-      }
-      : undefined;
-  }
-}
-
-function withContinuationDiagnostic(
-  provider: string,
-  error: unknown,
-  continuation: {
-    previousResponseId: string | undefined;
-    reusedContinuation: boolean;
-    transport: string;
-    strategy: string;
-  }
-): ModelProviderError {
-  const normalized = normalizeError(provider, error);
-  if (!continuation.reusedContinuation || !continuation.previousResponseId) {
-    return normalized;
-  }
-  return new ModelProviderError({
-    provider: normalized.provider,
-    code: normalized.code,
-    message: normalized.message,
-    retryable: normalized.retryable,
-    cause: normalized.causeValue,
-    diagnostic: {
-      transport: normalized.diagnostic.transport ?? continuation.transport,
-      ...(normalized.diagnostic.eventType ? { eventType: normalized.diagnostic.eventType } : {}),
-      causeSummary: {
-        ...(normalized.diagnostic.causeSummary ?? {}),
-        previousResponseId: continuation.previousResponseId,
-        reusedContinuation: true,
-        continuationStrategy: continuation.strategy
-      }
-    }
-  });
 }
 
 function resolveTokenProvider(options: OpenAIProviderOptions): BearerTokenProvider {
@@ -577,12 +484,12 @@ function isBearerTokenProvider(value: ProviderAuth | BearerTokenProvider): value
   return 'getBearerToken' in value && typeof value.getBearerToken === 'function';
 }
 
-function toOpenAIResponsesRequest(request: ModelRequest, stream: boolean, previousResponseId: string | undefined): Record<string, unknown> {
-  const { instructions, input, usesPreviousResponse } = toOpenAIInput(request.messages, previousResponseId !== undefined);
+function toOpenAIResponsesRequest(request: ModelRequest, stream: boolean): Record<string, unknown> {
+  const { instructions, input } = toOpenAIInput(request.messages);
   const body: Record<string, unknown> = {
     model: request.model,
     input,
-    store: true,
+    store: false,
     stream
   };
   if (instructions.length > 0) body.instructions = instructions;
@@ -599,7 +506,6 @@ function toOpenAIResponsesRequest(request: ModelRequest, stream: boolean, previo
     if (request.topLogprobs !== undefined) body.top_logprobs = request.topLogprobs;
   }
   if (request.metadata && Object.keys(request.metadata).length > 0) body.metadata = request.metadata;
-  if (previousResponseId && usesPreviousResponse) body.previous_response_id = previousResponseId;
   applyOpenAIProviderOptions(body, request);
   return body;
 }
@@ -635,11 +541,10 @@ function rejectUnknownProviderOptions(options: Record<string, unknown>, allowed:
 
 function onlyOpenAIOptionKeys(value: Record<string, unknown>, allowed: string[]): boolean { const keys = new Set(allowed); return Object.keys(value).every((key) => keys.has(key)); }
 
-function toOpenAIInput(messages: readonly ModelMessage[], preferIncremental = false): { instructions: string; input: unknown[]; usesPreviousResponse: boolean } {
+function toOpenAIInput(messages: readonly ModelMessage[]): { instructions: string; input: unknown[] } {
   const instructionMessages = instructionMessagesFrom(messages);
   const input: unknown[] = [];
-  const projectedMessages = preferIncremental ? incrementalMessagesAfterPreviousResponse(messages) : undefined;
-  for (const message of projectedMessages ?? messages) {
+  for (const message of messages) {
     if (message.role === 'system') {
       continue;
     }
@@ -664,8 +569,7 @@ function toOpenAIInput(messages: readonly ModelMessage[], preferIncremental = fa
   }
   return {
     instructions: instructionMessages.join('\n\n'),
-    input,
-    usesPreviousResponse: projectedMessages !== undefined
+    input
   };
 }
 
@@ -673,25 +577,6 @@ function instructionMessagesFrom(messages: readonly ModelMessage[]): string[] {
   return messages
     .filter((message) => message.role === 'system' && message.content.trim().length > 0)
     .map((message) => message.content);
-}
-
-function incrementalMessagesAfterPreviousResponse(messages: readonly ModelMessage[]): ModelMessage[] | undefined {
-  const lastAssistantIndex = findLastIndex(messages, (message) => message.role === 'assistant');
-  const candidateMessages = lastAssistantIndex >= 0
-    ? messages.slice(lastAssistantIndex + 1)
-    : messages.filter((message) => message.role !== 'system');
-  const incrementalMessages = candidateMessages.filter((message) => message.role !== 'system');
-  return incrementalMessages.length > 0 ? incrementalMessages : undefined;
-}
-
-function findLastIndex<T>(items: readonly T[], predicate: (item: T) => boolean): number {
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    const item = items[index];
-    if (item !== undefined && predicate(item)) {
-      return index;
-    }
-  }
-  return -1;
 }
 
 function contentForOpenAIMessage(message: ModelMessage): string | Record<string, unknown>[] {
@@ -796,8 +681,7 @@ function toOpenAIReasoning(reasoning: ModelReasoningRequest | undefined): Record
 function toModelResponse(
   provider: string,
   request: ModelRequest,
-  payload: OpenAIResponsesPayload,
-  transport: { reusedContinuation?: boolean } = {}
+  payload: OpenAIResponsesPayload
 ): ModelResponse {
   if (payload.error) {
     const failure = summarizeOpenAIFailure(payload);
@@ -838,7 +722,7 @@ function toModelResponse(
     ...(reasoningSummary ? { reasoningSummary } : {}),
     ...(toolCalls.length > 0 ? { toolCalls } : {}),
     raw: normalizeJsonSafe(payload).value,
-    transport: responseTransport(provider, 'stored_response', payload.id, transport)
+    transport: responseTransport(provider, payload.id)
   });
 }
 
@@ -848,8 +732,7 @@ function fallbackStreamResponse(
   content: string,
   reasoning: string,
   reasoningSummary: string,
-  toolCalls: ModelToolCall[],
-  transport: { reusedContinuation?: boolean } = {}
+  toolCalls: ModelToolCall[]
 ): ModelResponse {
   return parseOpenAIModelResponse({
     content,
@@ -859,7 +742,7 @@ function fallbackStreamResponse(
     ...(reasoning ? { reasoning } : {}),
     ...(reasoningSummary ? { reasoningSummary } : {}),
     ...(toolCalls.length > 0 ? { toolCalls: dedupeToolCalls(toolCalls) } : {}),
-    transport: responseTransport(provider, 'stored_response', undefined, transport)
+    transport: responseTransport(provider, undefined)
   });
 }
 
@@ -885,15 +768,13 @@ function normalizeOpenAITermination(
 
 function responseTransport(
   provider: string,
-  strategy: string,
-  responseId: string | undefined,
-  options: { reusedContinuation?: boolean }
+  responseId: string | undefined
 ): NonNullable<ModelResponse['transport']> {
   return {
     provider,
-    strategy,
+    strategy: 'http_full_replay',
     ...(responseId ? { responseId } : {}),
-    ...(options.reusedContinuation !== undefined ? { reusedContinuation: options.reusedContinuation } : {})
+    reusedContinuation: false
   };
 }
 

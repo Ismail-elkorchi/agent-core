@@ -178,7 +178,7 @@ test('OpenAIProvider sends Responses API requests with bearer auth, tools, text.
   const body = JSON.parse(calls[0].init.body);
   assert.equal(body.model, 'gpt-5.6-sol');
   assert.equal(body.stream, false);
-  assert.equal(body.store, true);
+  assert.equal(body.store, false);
   assert.equal(body.instructions, 'Return JSON.');
   assert.equal(body.temperature, 0.2);
   assert.equal(body.top_p, 0.9);
@@ -239,13 +239,13 @@ test('OpenAIProvider sends Responses API requests with bearer auth, tools, text.
   assert.deepEqual(response.usage, { promptTokens: 11, completionTokens: 7, totalTokens: 18 });
   assert.deepEqual(response.transport, {
     provider: 'openai',
-    strategy: 'stored_response',
+    strategy: 'http_full_replay',
     responseId: 'resp-1',
     reusedContinuation: false
   });
 });
 
-test('OpenAIProvider sessions send only incremental tool output when continuing stored Responses state', async () => {
+test('OpenAIProvider sessions submit the complete logical request without remote continuation', async () => {
   const calls = [];
   const responses = [
     { id: 'resp-prev', model: 'gpt-5.5', status: 'completed', output_text: 'ready' },
@@ -273,17 +273,22 @@ test('OpenAIProvider sessions send only incremental tool output when continuing 
   assert.equal(first.transport.responseId, 'resp-prev');
   assert.equal(first.transport.reusedContinuation, false);
   assert.equal(second.transport.responseId, 'resp-2');
-  assert.equal(second.transport.reusedContinuation, true);
+  assert.equal(second.transport.reusedContinuation, false);
   const body = JSON.parse(calls[1].init.body);
-  assert.equal(body.previous_response_id, 'resp-prev');
-  assert.equal(body.store, true);
+  assert.equal('previous_response_id' in body, false);
+  assert.equal(body.store, false);
   assert.deepEqual(body.input.map((item) => item.type ?? item.role), [
+    'user',
+    'function_call',
+    'function_call_output',
+    'function_call',
     'function_call_output'
   ]);
-  assert.equal(body.input[0].call_id, 'call-shell-2');
+  assert.equal(body.input[4].call_id, 'call-shell-2');
+  assert.equal(second.providerState, undefined);
 });
 
-test('OpenAIProvider sessions continue after output_text-only assistant turns without replaying assistant text', async () => {
+test('OpenAIProvider stateless replay preserves new feedback before an older native tool tail', async () => {
   const calls = [];
   const responses = [
     { id: 'resp-text', model: 'gpt-5.5', status: 'completed', output_text: 'ready' },
@@ -305,9 +310,14 @@ test('OpenAIProvider sessions continue after output_text-only assistant turns wi
   const second = await session.complete({
     model: 'gpt-5.5',
     messages: [
-      { role: 'user', content: 'Summarize status.' },
-      { role: 'assistant', content: 'ready' },
-      { role: 'user', content: 'What next?' }
+      { role: 'system', content: 'Follow the current operation contract.' },
+      { role: 'user', content: 'Original operation.\nNew disposition feedback: repair the rejected proposal.' },
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [{ id: 'proposal-call', type: 'function', name: 'propose_revision', input: { kind: 'json', value: { revision: 1 } } }]
+      },
+      { role: 'tool', content: '{"accepted":false}', toolCallId: 'proposal-call', toolName: 'propose_revision', toolCallType: 'function' }
     ]
   });
 
@@ -315,20 +325,17 @@ test('OpenAIProvider sessions continue after output_text-only assistant turns wi
   assert.equal(first.transport.responseId, 'resp-text');
   assert.equal(first.transport.reusedContinuation, false);
   assert.equal(second.transport.responseId, 'resp-followup');
-  assert.equal(second.transport.reusedContinuation, true);
+  assert.equal(second.transport.reusedContinuation, false);
   const body = JSON.parse(calls[1].init.body);
-  assert.equal(body.previous_response_id, 'resp-text');
-  assert.deepEqual(body.input, [{ role: 'user', content: 'What next?' }]);
-  assert.equal(JSON.stringify(body.input).includes('ready'), false);
-  assert.deepEqual(second.providerState, {
-    provider: 'openai',
-    model: 'gpt-5.5',
-    kind: 'openai.responses.stored_response',
-    data: { responseId: 'resp-followup' }
-  });
+  assert.equal('previous_response_id' in body, false);
+  assert.equal(body.store, false);
+  assert.equal(body.instructions, 'Follow the current operation contract.');
+  assert.equal(body.input[0].content.includes('New disposition feedback'), true);
+  assert.deepEqual(body.input.slice(1).map((item) => item.type ?? item.role), ['function_call', 'function_call_output']);
+  assert.equal(second.providerState, undefined);
 });
 
-test('OpenAIProvider sessions restore stored response continuation state', async () => {
+test('OpenAIProvider sessions ignore obsolete stored-response state and fully replay local context', async () => {
   const calls = [];
   const provider = new OpenAIProvider({
     apiKey: 'test-key',
@@ -338,12 +345,7 @@ test('OpenAIProvider sessions restore stored response continuation state', async
     }
   });
   const session = provider.createSession();
-  session.restoreProviderState({
-    provider: 'openai',
-    model: 'gpt-5.5',
-    kind: 'openai.responses.stored_response',
-    data: { responseId: 'resp-restored' }
-  });
+  assert.equal(session.restoreProviderState, undefined);
 
   const response = await session.complete({
     model: 'gpt-5.5',
@@ -351,18 +353,13 @@ test('OpenAIProvider sessions restore stored response continuation state', async
   });
 
   const body = JSON.parse(calls[0].init.body);
-  assert.equal(body.previous_response_id, 'resp-restored');
-  assert.deepEqual(body.input.map((item) => item.type ?? item.role), ['function_call_output']);
-  assert.equal(response.transport.reusedContinuation, true);
-  assert.deepEqual(response.providerState, {
-    provider: 'openai',
-    model: 'gpt-5.5',
-    kind: 'openai.responses.stored_response',
-    data: { responseId: 'resp-after-restore' }
-  });
+  assert.equal('previous_response_id' in body, false);
+  assert.deepEqual(body.input.map((item) => item.type ?? item.role), ['user', 'function_call', 'function_call_output', 'function_call', 'function_call_output']);
+  assert.equal(response.transport.reusedContinuation, false);
+  assert.equal(response.providerState, undefined);
 });
 
-test('OpenAIProvider stored continuation omits older long mixed shell transcript', async () => {
+test('OpenAIProvider stateless sessions retain older local transcript after multiple calls', async () => {
   const calls = [];
   const responses = [
     { id: 'resp-long-1', model: 'gpt-5.5', status: 'completed', output_text: 'ready' },
@@ -387,19 +384,14 @@ test('OpenAIProvider stored continuation omits older long mixed shell transcript
   });
 
   const body = JSON.parse(calls[1].init.body);
-  assert.equal(body.previous_response_id, 'resp-long-1');
-  assert.deepEqual(body.input, [{ role: 'user', content: 'Continue after many shell observations.' }]);
-  assert.equal(JSON.stringify(body.input).includes('chunk-30'), false);
-  assert.equal(response.transport.reusedContinuation, true);
-  assert.deepEqual(response.providerState, {
-    provider: 'openai',
-    model: 'gpt-5.5',
-    kind: 'openai.responses.stored_response',
-    data: { responseId: 'resp-long-2' }
-  });
+  assert.equal('previous_response_id' in body, false);
+  assert.equal(JSON.stringify(body.input).includes('chunk-30'), true);
+  assert.equal(body.input.at(-1).content, 'Continue after many shell observations.');
+  assert.equal(response.transport.reusedContinuation, false);
+  assert.equal(response.providerState, undefined);
 });
 
-test('OpenAIProvider continuation rejection reports reused stored response id', async () => {
+test('OpenAIProvider errors do not report nonexistent continuation state', async () => {
   const calls = [];
   const provider = new OpenAIProvider({
     apiKey: 'test-key',
@@ -425,15 +417,14 @@ test('OpenAIProvider continuation rejection reports reused stored response id', 
       assert.equal(error.diagnostic.transport, 'http');
       assert.equal(error.diagnostic.causeSummary.status, 400);
       assert.equal(error.diagnostic.causeSummary.errorMessage, 'previous response was rejected');
-      assert.equal(error.diagnostic.causeSummary.previousResponseId, 'resp-stale');
-      assert.equal(error.diagnostic.causeSummary.reusedContinuation, true);
-      assert.equal(error.diagnostic.causeSummary.continuationStrategy, 'stored_response');
+      assert.equal('previousResponseId' in error.diagnostic.causeSummary, false);
+      assert.equal('reusedContinuation' in error.diagnostic.causeSummary, false);
       return true;
     }
   );
 });
 
-test('OpenAIProvider streaming continuation state uses the owned request model', async () => {
+test('OpenAIProvider streaming remains stateless', async () => {
   const provider = new OpenAIProvider({
     apiKey: 'test-key',
     fetch: async () => sseResponse([
@@ -444,18 +435,16 @@ test('OpenAIProvider streaming continuation state uses the owned request model',
       }
     ])
   });
-  const request = {
-    model: 'gpt-5.5',
-    messages: [{ role: 'user', content: 'Stream safely.' }]
-  };
+  const request = { model: 'gpt-5.5', messages: [{ role: 'user', content: 'Stream safely.' }] };
   let response;
 
   for await (const event of provider.createSession().stream(request)) {
-    request.model = 'gpt-5.6';
     if (event.type === 'done') response = event.response;
   }
 
-  assert.equal(response.providerState.model, 'gpt-5.5');
+  assert.equal(response.providerState, undefined);
+  assert.equal(response.transport.strategy, 'http_full_replay');
+  assert.equal(response.transport.reusedContinuation, false);
 });
 
 test('OpenAIProvider streams typed content, reasoning, tool calls, and final response metadata', async () => {
@@ -519,7 +508,7 @@ test('OpenAIProvider streams typed content, reasoning, tool calls, and final res
   assert.deepEqual(done.response.usage, { promptTokens: 3, completionTokens: 2, totalTokens: 5 });
   assert.deepEqual(done.response.transport, {
     provider: 'openai',
-    strategy: 'stored_response',
+    strategy: 'http_full_replay',
     responseId: 'resp-2',
     reusedContinuation: false
   });
