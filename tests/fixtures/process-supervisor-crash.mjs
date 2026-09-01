@@ -1,6 +1,6 @@
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
-import { LocalArtifactRepository } from '@agent-core/evidence/node';
+import { LocalArtifactRepository } from '@agent-core/persistence/node';
 import { DEFAULT_LOCAL_TOOL_CONFIGURATION, LocalCommandExecution, RootedFileAuthority } from '@agent-core/tools-local';
 
 const root = path.resolve(process.argv[2]);
@@ -19,7 +19,7 @@ const manager = new LocalCommandExecution({
     process.exit(45);
   }
 });
-const prepared = await manager.prepare({
+const plan = await manager.plan({
   command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'started'); setInterval(()=>{},1000)`)}`,
   rootedDirectory: '.',
   pty: false,
@@ -28,4 +28,4 @@ const prepared = await manager.prepare({
   outputTokenBudget: 100,
   owner: { runId: `crash-${phase}`, turnId: 'turn', toolBatchId: 'batch', callIndex: 0 }
 });
-await manager.start(prepared);
+await manager.start(plan);

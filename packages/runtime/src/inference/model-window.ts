@@ -3,194 +3,39 @@ import {
   type ModelMessage,
   type ModelImage,
   type ModelProfile,
-  type ModelTool,
   type ModelToolCall,
   SimpleTokenEstimator,
   type TokenEstimator
 } from '@agent-core/model';
-import { createEvidenceRecord, type EvidenceRecord, type PublicArtifactRef } from '@agent-core/evidence';
+import type { PublicArtifactRef } from '@agent-core/persistence';
+import { ownObservedFactRecord, type ObservedFactRecord } from '@agent-core/tools';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
+import type { PromptObservedFactsMaterial, PromptObservedFactsOmissionSummary } from './prompt-material.js';
 
-export interface ContextRange {
-  readonly kind: 'line' | 'byte';
-  readonly start?: number;
-  readonly end?: number;
-}
-
-export type ContextSourceKind = 'user' | 'external' | 'session' | 'tool-observation' | 'generated';
-export type ContextConfidence = 'unverified' | 'verified';
-export type ContextRepresentation = 'full' | 'excerpt' | 'summary';
-
-export interface ContextItem {
-  readonly id: string;
-  readonly sourceUri: string;
-  readonly sourceKind: ContextSourceKind;
-  readonly confidence?: ContextConfidence;
-  readonly representation: ContextRepresentation;
-  readonly mediaType: string;
-  readonly title: string;
-  readonly content: string;
-  readonly range?: ContextRange;
-  readonly tokenEstimate: number;
-  readonly selectionReason: string;
-  readonly score: number;
-}
-
-export type ContextItemInput = Omit<ContextItem, 'id' | 'tokenEstimate'> & {
-  id?: string;
-  tokenEstimate?: number;
-};
-
-export function decodeContextItemInput(value: unknown): ContextItemInput {
-  if (!isRecord(value)) throw new TypeError('Context item must be an object.');
-  const allowed = new Set(['id', 'sourceUri', 'sourceKind', 'confidence', 'representation', 'mediaType', 'title', 'content', 'range', 'tokenEstimate', 'selectionReason', 'score']);
-  const unsupported = Object.keys(value).filter((key) => !allowed.has(key));
-  if (unsupported.length > 0) throw new TypeError(`Unsupported context item fields: ${unsupported.join(', ')}.`);
-  if (typeof value.sourceUri !== 'string' || value.sourceUri.length === 0
-    || !oneOf(value.sourceKind, ['user', 'external', 'session', 'tool-observation', 'generated'] as const)
-    || (value.confidence !== undefined && !oneOf(value.confidence, ['unverified', 'verified'] as const))
-    || !oneOf(value.representation, ['full', 'excerpt', 'summary'] as const)
-    || typeof value.mediaType !== 'string' || value.mediaType.length === 0
-    || typeof value.title !== 'string' || typeof value.content !== 'string'
-    || typeof value.selectionReason !== 'string' || !finiteNumber(value.score)
-    || (value.id !== undefined && (typeof value.id !== 'string' || value.id.length === 0))
-    || (value.tokenEstimate !== undefined && !nonnegativeInteger(value.tokenEstimate))) {
-    throw new TypeError('Context item fields are invalid.');
-  }
-  const range = value.range === undefined ? undefined : decodeContextRange(value.range);
-  return Object.freeze({
-    sourceUri: value.sourceUri,
-    sourceKind: value.sourceKind,
-    ...(value.confidence === undefined ? {} : { confidence: value.confidence }),
-    representation: value.representation,
-    mediaType: value.mediaType,
-    title: value.title,
-    content: value.content,
-    ...(range === undefined ? {} : { range }),
-    selectionReason: value.selectionReason,
-    score: value.score,
-    ...(value.id === undefined ? {} : { id: value.id }),
-    ...(value.tokenEstimate === undefined ? {} : { tokenEstimate: value.tokenEstimate })
-  });
-}
-
-export interface ContextOmission {
-  readonly reason: string;
-  readonly sourceUri?: string;
-}
-
-export interface ContextBundle {
-  readonly items: readonly ContextItem[];
-  readonly totalTokens: number;
-  readonly omitted: readonly ContextOmission[];
-}
-
-export interface PromptInstructionBlock {
-  readonly id: string;
-  readonly role: 'system' | 'developer' | 'environment' | 'user';
-  readonly content: string;
-  readonly sourceUri?: string;
-  readonly priority: number;
-}
-
-export interface PromptToolSummary {
-  readonly name: string;
-  readonly description: string;
-  readonly inputFormat: string;
-  readonly accessModes: readonly string[];
-  readonly promptGuide?: string;
-}
-
-export interface PromptOutputContract {
-  readonly kind: 'text';
-  readonly description: string;
-}
-
-export interface PromptEvidenceProjection {
-  readonly records: readonly EvidenceRecord[];
-  readonly omittedRecords: number;
-  readonly omittedSummary?: readonly PromptEvidenceOmissionSummary[];
-  readonly tokenEstimate: number;
-  readonly coverage: 'complete' | 'partial';
-}
-
-export interface PromptEvidenceOmissionSummary {
-  readonly toolName: string;
-  readonly action: EvidenceRecord['action'];
-  readonly outcome: EvidenceRecord['outcome'];
-  readonly count: number;
-}
-
-export interface PromptProjection {
-  readonly id: string;
-  readonly task: string;
-  readonly instructions: readonly PromptInstructionBlock[];
-  readonly notes: readonly string[];
-  readonly context: readonly ContextItem[];
-  readonly tools: readonly PromptToolSummary[];
-  readonly continuity: readonly string[];
-  readonly evidence?: PromptEvidenceProjection;
-  readonly outputContract?: PromptOutputContract;
-  readonly metadata?: Readonly<Record<string, string>>;
-}
-
-export interface ContextProjection {
-  readonly prompt: PromptProjection;
-  readonly contextHistoryMessages: readonly ModelMessage[];
-  readonly context: ContextBundle;
-  readonly reductions: readonly ContextHistoryReduction[];
-  readonly estimate: ContextProjectionEstimate;
-}
-
-export interface ContextHistoryProjection {
+export interface ModelWindowMessages {
   readonly messages: readonly ModelMessage[];
   readonly estimatedTokens: number;
-  readonly reductions: readonly ContextHistoryReduction[];
+  readonly reductions: readonly ModelWindowReduction[];
 }
 
-export interface ContextImageLimits {
+export interface ModelWindowImageLimits {
   readonly maxCount: number;
   readonly maxBytes: number;
   readonly maxEstimatedTokens: number;
 }
 
-export const DEFAULT_CONTEXT_IMAGE_LIMITS: ContextImageLimits = Object.freeze({
+export const DEFAULT_MODEL_WINDOW_IMAGE_LIMITS: ModelWindowImageLimits = Object.freeze({
   maxCount: 16,
   maxBytes: 64 * 1024 * 1024,
   maxEstimatedTokens: 32_000
 });
 
-export interface ContextHistoryPressureReduction {
-  readonly reductions: readonly ContextHistoryReduction[];
-  readonly projectedTokens: number;
+export interface ModelWindowPressureReduction {
+  readonly reductions: readonly ModelWindowReduction[];
+  readonly retainedTokens: number;
 }
 
-export interface ContextProjectionEstimate {
-  readonly contextHistoryTokens: number;
-  readonly contextTokens: number;
-  readonly evidenceTokens: number;
-}
-
-export interface ContextProjectionRequest {
-  readonly task: string;
-  readonly instructions: readonly PromptInstructionBlock[];
-  readonly notes?: readonly string[];
-  readonly contextItems?: readonly ContextItemInput[];
-  readonly tools: readonly PromptToolSummary[];
-  readonly modelProfile: ModelProfile;
-  readonly modelTools: readonly ModelTool[];
-  readonly requestWindow: {
-    readonly maxPromptTokens: number;
-    readonly maxOutputTokens: number;
-    readonly contextWindowTokens: number;
-  };
-  readonly contextTokenBudget?: number;
-  readonly evidenceTokenBudget?: number;
-  readonly maxContextItems?: number;
-  readonly metadata?: Readonly<Record<string, string>>;
-}
-
-export interface ContextHistoryReduction {
+export interface ModelWindowReduction {
   readonly itemId: string;
   readonly kind: 'tool_result_reduced' | 'checkpoint_installed' | 'image_content_removed';
   readonly beforeBytes: number;
@@ -250,7 +95,7 @@ export interface RecordToolResultInput {
   immediateImages?: readonly ModelImage[];
   imageArtifacts?: readonly PublicArtifactRef[];
   useRetained?: boolean;
-  evidence?: readonly EvidenceRecord[];
+  observedFacts?: readonly ObservedFactRecord[];
 }
 
 export interface RecordCheckpointInput {
@@ -258,21 +103,21 @@ export interface RecordCheckpointInput {
   removedItems?: number;
 }
 
-export interface ContextManagerSnapshot {
+export interface ModelWindowSnapshot {
   readonly activeItems: number;
   readonly compactedToolResults: number;
   readonly checkpoints: number;
-  readonly evidenceRecords: number;
+  readonly observedFactRecords: number;
 }
 
-export class ContextManager {
+export class ModelWindow {
   private readonly estimator: TokenEstimator;
   private readonly historyItems: ContextHistoryItem[] = [];
-  private readonly evidenceRecords: EvidenceRecord[] = [];
-  private readonly projectionReductions: ContextHistoryReduction[] = [];
-  private readonly imageLimits: ContextImageLimits;
+  private readonly observedFactRecords: ObservedFactRecord[] = [];
+  private readonly pendingReductions: ModelWindowReduction[] = [];
+  private readonly imageLimits: ModelWindowImageLimits;
 
-  constructor(estimator: TokenEstimator = new SimpleTokenEstimator(), imageLimits: ContextImageLimits = DEFAULT_CONTEXT_IMAGE_LIMITS) {
+  constructor(estimator: TokenEstimator = new SimpleTokenEstimator(), imageLimits: ModelWindowImageLimits = DEFAULT_MODEL_WINDOW_IMAGE_LIMITS) {
     this.estimator = estimator;
     if (![imageLimits.maxCount, imageLimits.maxBytes, imageLimits.maxEstimatedTokens].every((value) => Number.isSafeInteger(value) && value > 0)) throw new Error('Context image limits must be positive safe integers.');
     this.imageLimits = Object.freeze({ ...imageLimits });
@@ -314,11 +159,11 @@ export class ContextManager {
       item.callId = input.callId;
     }
     this.historyItems.push(item);
-    this.evidenceRecords.push(...compactEvidenceRecords(input.evidence ?? []));
+    this.observedFactRecords.push(...compactObservedFactRecords(input.observedFacts ?? []));
   }
 
-  recordEvidence(records: readonly EvidenceRecord[]): void {
-    this.evidenceRecords.push(...compactEvidenceRecords(records));
+  recordObservedFacts(records: readonly ObservedFactRecord[]): void {
+    this.observedFactRecords.push(...compactObservedFactRecords(records));
   }
 
   recordCheckpoint(input: RecordCheckpointInput): void {
@@ -337,13 +182,13 @@ export class ContextManager {
     });
   }
 
-  projectHistory(modelProfile: ModelProfile): ContextHistoryProjection {
-    const projected = projectImagesForProfile(this.contextHistoryEntries(), modelProfile, this.imageLimits, this.estimator);
-    const messages = normalizeToolProtocolMessages(projected.messages);
+  messagesFor(modelProfile: ModelProfile): ModelWindowMessages {
+    const selectedImages = selectImagesForProfile(this.contextHistoryEntries(), modelProfile, this.imageLimits, this.estimator);
+    const messages = normalizeToolProtocolMessages(selectedImages.messages);
     return Object.freeze({
       messages: Object.freeze(messages),
       estimatedTokens: this.estimator.estimateMessages(messages),
-      reductions: Object.freeze(projected.reductions)
+      reductions: Object.freeze(selectedImages.reductions)
     });
   }
 
@@ -351,80 +196,44 @@ export class ContextManager {
     modelProfile: ModelProfile;
     maxHistoryTokens: number;
     keepLatestToolResults?: number;
-  }): ContextHistoryPressureReduction {
-    let projection = this.projectHistory(input.modelProfile);
-    if (projection.estimatedTokens <= input.maxHistoryTokens) {
-      return Object.freeze({ reductions: Object.freeze([]), projectedTokens: projection.estimatedTokens });
+  }): ModelWindowPressureReduction {
+    let assembly = this.messagesFor(input.modelProfile);
+    if (assembly.estimatedTokens <= input.maxHistoryTokens) {
+      return Object.freeze({ reductions: Object.freeze([]), retainedTokens: assembly.estimatedTokens });
     }
 
     const reductions = [...this.reduceOlderLargeToolResults({
       keepLatestToolResults: input.keepLatestToolResults ?? 2
     })];
-    projection = this.projectHistory(input.modelProfile);
-    if (projection.estimatedTokens <= input.maxHistoryTokens) {
-      return Object.freeze({ reductions: Object.freeze(reductions), projectedTokens: projection.estimatedTokens });
+    assembly = this.messagesFor(input.modelProfile);
+    if (assembly.estimatedTokens <= input.maxHistoryTokens) {
+      return Object.freeze({ reductions: Object.freeze(reductions), retainedTokens: assembly.estimatedTokens });
     }
 
     reductions.push(...this.reduceOlderLargeToolResults({
       keepLatestToolResults: 0,
       includeLatest: true
     }));
-    projection = this.projectHistory(input.modelProfile);
-    return Object.freeze({ reductions: Object.freeze(reductions), projectedTokens: projection.estimatedTokens });
+    assembly = this.messagesFor(input.modelProfile);
+    return Object.freeze({ reductions: Object.freeze(reductions), retainedTokens: assembly.estimatedTokens });
   }
 
-  project(request: ContextProjectionRequest): ContextProjection {
-    const contextHistory = this.projectHistory(request.modelProfile);
-    const contextBudget = Math.max(0, request.contextTokenBudget ?? request.requestWindow.maxPromptTokens);
-    const selectInput: { items: readonly ContextItemInput[]; maxTokens: number; maxItems?: number } = {
-      items: request.contextItems ?? [],
-      maxTokens: contextBudget
-    };
-    if (request.maxContextItems !== undefined) {
-      selectInput.maxItems = request.maxContextItems;
-    }
-    const context = this.selectContext(selectInput);
-    const evidence = this.projectEvidence(request.evidenceTokenBudget ?? Math.min(1_600, Math.floor(request.requestWindow.maxPromptTokens * 0.08)));
-    const projection: PromptProjection = Object.freeze({
-      id: `prompt_${randomUUID()}`,
-      task: request.task,
-      instructions: Object.freeze(request.instructions.map((instruction) => Object.freeze({ ...instruction }))),
-      notes: Object.freeze([...(request.notes ?? [])]),
-      context: context.items,
-      tools: Object.freeze(request.tools.map((tool) => Object.freeze({ ...tool, accessModes: Object.freeze([...tool.accessModes]) }))),
-      continuity: Object.freeze(checkpointMessages(this.historyItems)),
-      ...(evidence.records.length > 0 || evidence.omittedSummary?.length ? { evidence } : {}),
-      ...(request.metadata ? { metadata: Object.freeze({ ...request.metadata }) } : {})
-    });
-    return Object.freeze({
-      prompt: projection,
-      contextHistoryMessages: Object.freeze([...contextHistory.messages]),
-      context,
-      reductions: Object.freeze([...this.consumeProjectionReductions(), ...contextHistory.reductions]),
-      estimate: Object.freeze({
-        contextHistoryTokens: contextHistory.estimatedTokens,
-        contextTokens: context.totalTokens,
-        evidenceTokens: evidence.tokenEstimate
-      })
-    });
-  }
-
-  projectEvidence(maxTokens: number): PromptEvidenceProjection {
-    if (maxTokens <= 0 || this.evidenceRecords.length === 0) {
+  selectObservedFacts(maxTokens: number): PromptObservedFactsMaterial {
+    if (maxTokens <= 0 || this.observedFactRecords.length === 0) {
       return Object.freeze({
         records: Object.freeze([]),
-        omittedRecords: this.evidenceRecords.length,
+        omittedRecords: this.observedFactRecords.length,
         tokenEstimate: 0,
-        coverage: this.evidenceRecords.length > 0 ? 'partial' : 'complete'
+        coverage: this.observedFactRecords.length > 0 ? 'partial' : 'complete'
       });
     }
 
-    const selected: { record: EvidenceRecord; tokens: number }[] = [];
-    const omitted: EvidenceRecord[] = [];
+    const selected: { record: ObservedFactRecord; tokens: number }[] = [];
+    const omitted: ObservedFactRecord[] = [];
     let tokenEstimate = 0;
     let omittedRecords = 0;
-    for (let index = this.evidenceRecords.length - 1; index >= 0; index -= 1) {
-      const record = this.evidenceRecords[index];
+    for (let index = this.observedFactRecords.length - 1; index >= 0; index -= 1) {
+      const record = this.observedFactRecords[index];
       if (!record) {
         continue;
       }
@@ -458,25 +267,19 @@ export class ContextManager {
     });
   }
 
-  evidenceRecordCount(): number {
-    return this.evidenceRecords.length;
+  observedFactRecordCount(): number {
+    return this.observedFactRecords.length;
   }
 
-  evidenceSnapshot(): readonly EvidenceRecord[] {
-    return Object.freeze([...this.evidenceRecords]);
+  observedFactsSnapshot(): readonly ObservedFactRecord[] {
+    return Object.freeze([...this.observedFactRecords]);
   }
 
-  selectContext(input: { items: readonly ContextItemInput[]; maxTokens: number; maxItems?: number; omitted?: readonly ContextOmission[] }): ContextBundle {
-    const candidates = input.items.map((item) => this.materializeContextItem(item));
-    const omitted = [...(input.omitted ?? [])];
-    return selectContextItems(candidates, input.maxTokens, input.maxItems ?? 24, omitted);
-  }
-
-  reduceOlderLargeToolResults(options: { keepLatestToolResults: number; includeLatest?: boolean }): readonly ContextHistoryReduction[] {
+  reduceOlderLargeToolResults(options: { keepLatestToolResults: number; includeLatest?: boolean }): readonly ModelWindowReduction[] {
     const toolItems = this.historyItems.filter((item): item is ContextToolResultItem => item.kind === 'tool_result');
     const keepLatest = Math.max(0, options.keepLatestToolResults);
     const latestKeepStart = Math.max(0, toolItems.length - keepLatest);
-    const reductions: ContextHistoryReduction[] = [];
+    const reductions: ModelWindowReduction[] = [];
 
     for (let index = 0; index < toolItems.length; index += 1) {
       if (!options.includeLatest && index >= latestKeepStart) {
@@ -492,7 +295,7 @@ export class ContextManager {
         continue;
       }
       item.useRetained = true;
-      reductions.push(createContextHistoryReduction({
+      reductions.push(createModelWindowReduction({
         itemId: item.id,
         kind: 'tool_result_reduced',
         beforeBytes,
@@ -500,11 +303,11 @@ export class ContextManager {
         toolName: item.toolName
       }));
     }
-    this.projectionReductions.push(...reductions);
+    this.pendingReductions.push(...reductions);
     return Object.freeze(reductions);
   }
 
-  installCheckpoint(): ContextHistoryReduction | undefined {
+  installCheckpoint(): ModelWindowReduction | undefined {
     if (this.historyItems.length === 0) {
       return undefined;
     }
@@ -513,7 +316,7 @@ export class ContextManager {
     }
     const beforeBytes = this.historyItems.reduce((total, item) => total + itemBytes(item), 0);
     const historySummary = checkpointHistorySummary(this.historyItems, 14);
-    const evidenceSummary = summarizeOmittedEvidence(this.evidenceRecords).slice(0, 12);
+    const omittedFactsSummary = summarizeOmittedFacts(this.observedFactRecords).slice(0, 12);
     const priorCheckpoint = [...this.historyItems].reverse().find((item): item is ContextCheckpointItem => item.kind === 'checkpoint');
     const message: ModelMessage = {
       role: 'user',
@@ -525,10 +328,10 @@ export class ContextManager {
         `Removed active history items: ${String(this.historyItems.length)}.`,
         ...(priorCheckpoint ? ['Prior compacted continuity:', compactText(priorCheckpoint.message.content, 32_000)] : []),
         ...(historySummary.length > 0 ? ['Compacted observations:', ...historySummary] : []),
-        ...(evidenceSummary.length > 0
+        ...(omittedFactsSummary.length > 0
           ? [
-            'Evidence summary:',
-            ...evidenceSummary.map((item) => `- ${item.toolName} ${item.action} ${item.outcome}: ${String(item.count)}`)
+            'Observed facts summary:',
+            ...omittedFactsSummary.map((item) => `- ${item.toolName} ${item.action} ${item.outcome}: ${String(item.count)}`)
           ]
           : [])
       ].join('\n'), 64 * 1024)
@@ -541,14 +344,14 @@ export class ContextManager {
       removedItems
     };
     this.historyItems.splice(0, this.historyItems.length, item);
-    const reduction = createContextHistoryReduction({
+    const reduction = createModelWindowReduction({
       itemId: item.id,
       kind: 'checkpoint_installed',
       beforeBytes,
       afterBytes: messageBytes(message),
       removedItems
     });
-    this.projectionReductions.push(reduction);
+    this.pendingReductions.push(reduction);
     return reduction;
   }
 
@@ -560,16 +363,24 @@ export class ContextManager {
     return this.historyItems.length;
   }
 
-  snapshot(): ContextManagerSnapshot {
+  continuity(): readonly string[] {
+    return Object.freeze(checkpointMessages(this.historyItems));
+  }
+
+  consumeReductions(): readonly ModelWindowReduction[] {
+    return Object.freeze(this.pendingReductions.splice(0));
+  }
+
+  snapshot(): ModelWindowSnapshot {
     return Object.freeze({
       activeItems: this.historyItems.length,
       compactedToolResults: this.compactedToolResultCount(),
       checkpoints: this.historyItems.filter((item) => item.kind === 'checkpoint').length,
-      evidenceRecords: this.evidenceRecords.length
+      observedFactRecords: this.observedFactRecords.length
     });
   }
 
-  private contextHistoryEntries(): ProjectableHistoryMessage[] {
+  private contextHistoryEntries(): WindowMessageEntry[] {
     return this.historyItems.map((item) => {
       if (item.kind === 'assistant_tool_call') {
         return { itemId: item.id, message: item.message, imageArtifacts: [] };
@@ -578,40 +389,27 @@ export class ContextManager {
         return undefined;
       }
       return { itemId: item.id, message: item.useRetained ? item.retainedMessage : item.immediateMessage, imageArtifacts: item.imageArtifacts };
-    }).filter((entry): entry is ProjectableHistoryMessage => entry !== undefined);
+    }).filter((entry): entry is WindowMessageEntry => entry !== undefined);
   }
 
-  private materializeContextItem(input: ContextItemInput): ContextItem {
-    const { id, tokenEstimate, ...rest } = input;
-    return Object.freeze({
-      ...rest,
-      id: id ?? contextId(input.sourceUri, input.title, input.content),
-      tokenEstimate: tokenEstimate ?? this.estimator.estimateText(input.content),
-      ...(input.range ? { range: Object.freeze({ ...input.range }) } : {})
-    });
-  }
-
-  private consumeProjectionReductions(): readonly ContextHistoryReduction[] {
-    return this.projectionReductions.splice(0);
-  }
 }
 
-function compactEvidenceRecords(records: readonly EvidenceRecord[]): EvidenceRecord[] {
+function compactObservedFactRecords(records: readonly ObservedFactRecord[]): ObservedFactRecord[] {
   return records.map((record) => {
     const resources = record.resources.slice(0, 8).map((resource) => ({
       ...resource,
       uri: compactText(resource.uri, 300)
     }));
-    return createEvidenceRecord({
+    return ownObservedFactRecord({
       ...record,
       resources,
       ...(record.summary ? { summary: compactText(record.summary, 300) } : {}),
-      ...(record.scope ? { scope: compactEvidenceScope(record.scope) } : {})
+      ...(record.scope ? { scope: compactObservationScope(record.scope) } : {})
     });
   });
 }
 
-function compactEvidenceScope(scope: NonNullable<EvidenceRecord['scope']>): NonNullable<EvidenceRecord['scope']> {
+function compactObservationScope(scope: NonNullable<ObservedFactRecord['scope']>): NonNullable<ObservedFactRecord['scope']> {
   const next = { ...scope };
   if (next.filters) {
     next.filters = compactJsonObject(next.filters, 1_000);
@@ -626,18 +424,18 @@ function compactEvidenceScope(scope: NonNullable<EvidenceRecord['scope']>): NonN
 }
 
 function fitOmittedSummary(
-  records: readonly EvidenceRecord[],
+  records: readonly ObservedFactRecord[],
   maxTokens: number,
   estimator: TokenEstimator
-): { readonly summary: readonly PromptEvidenceOmissionSummary[]; readonly tokens: number } {
+): { readonly summary: readonly PromptObservedFactsOmissionSummary[]; readonly tokens: number } {
   if (records.length === 0 || maxTokens <= 0) {
     return Object.freeze({ summary: Object.freeze([]), tokens: 0 });
   }
-  const selected: PromptEvidenceOmissionSummary[] = [];
+  const selected: PromptObservedFactsOmissionSummary[] = [];
   let tokens = 0;
-  for (const item of summarizeOmittedEvidence(records)) {
-    const candidate = [...selected, item];
-    const estimate = estimator.estimateText(JSON.stringify({ omittedSummary: candidate }));
+  for (const item of summarizeOmittedFacts(records)) {
+    const modelOutput = [...selected, item];
+    const estimate = estimator.estimateText(JSON.stringify({ omittedSummary: modelOutput }));
     if (estimate > maxTokens) {
       continue;
     }
@@ -647,8 +445,8 @@ function fitOmittedSummary(
   return Object.freeze({ summary: Object.freeze(selected), tokens });
 }
 
-function summarizeOmittedEvidence(records: readonly EvidenceRecord[]): readonly PromptEvidenceOmissionSummary[] {
-  const groups = new Map<string, { toolName: string; action: EvidenceRecord['action']; outcome: EvidenceRecord['outcome']; count: number }>();
+function summarizeOmittedFacts(records: readonly ObservedFactRecord[]): readonly PromptObservedFactsOmissionSummary[] {
+  const groups = new Map<string, { toolName: string; action: ObservedFactRecord['action']; outcome: ObservedFactRecord['outcome']; count: number }>();
   for (const record of records) {
     const key = [record.toolName, record.action, record.outcome].join('\0');
     const existing = groups.get(key);
@@ -732,26 +530,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function decodeContextRange(value: unknown): ContextRange {
-  if (!isRecord(value)) throw new TypeError('Context range must be an object.');
-  const unsupported = Object.keys(value).filter((key) => key !== 'kind' && key !== 'start' && key !== 'end');
-  if (unsupported.length > 0
-    || !oneOf(value.kind, ['line', 'byte'] as const)
-    || (value.start !== undefined && !nonnegativeInteger(value.start))
-    || (value.end !== undefined && !nonnegativeInteger(value.end))
-    || (typeof value.start === 'number' && typeof value.end === 'number' && value.end < value.start)) {
-    throw new TypeError('Context range is invalid.');
-  }
-  return Object.freeze({ kind: value.kind, ...(value.start === undefined ? {} : { start: value.start }), ...(value.end === undefined ? {} : { end: value.end }) });
-}
-
-function oneOf<const TValue extends readonly string[]>(value: unknown, choices: TValue): value is TValue[number] {
-  return typeof value === 'string' && choices.some((choice) => choice === value);
-}
-
-function finiteNumber(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value); }
-function nonnegativeInteger(value: unknown): value is number { return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0; }
-
 function compactJsonObject(value: JsonObject, maxBytes: number): JsonObject {
   const jsonBytes = Buffer.byteLength(JSON.stringify(value), 'utf8');
   if (jsonBytes <= maxBytes) {
@@ -774,84 +552,45 @@ function limitUtf8Bytes(value: string, maxBytes: number): string {
   return value.slice(0, end);
 }
 
-function selectContextItems(
-  candidates: ContextItem[],
-  maxTokens: number,
-  maxItems: number,
-  omitted: ContextOmission[]
-): ContextBundle {
-  const deduped = new Map<string, ContextItem>();
-  for (const candidate of candidates) {
-    const existing = deduped.get(candidate.id);
-    if (!existing || candidate.score > existing.score) {
-      deduped.set(candidate.id, candidate);
-    }
-  }
-
-  const sorted = [...deduped.values()].sort((left, right) => {
-    if (right.score !== left.score) {
-      return right.score - left.score;
-    }
-    return left.sourceUri.localeCompare(right.sourceUri);
-  });
-
-  const selected: ContextItem[] = [];
-  let totalTokens = 0;
-  for (const item of sorted) {
-    if (selected.length >= maxItems) {
-      omitted.push({ reason: 'max item count reached', sourceUri: item.sourceUri });
-      continue;
-    }
-    if (totalTokens + item.tokenEstimate > maxTokens) {
-      omitted.push({ reason: 'token budget exceeded', sourceUri: item.sourceUri });
-      continue;
-    }
-    selected.push(item);
-    totalTokens += item.tokenEstimate;
-  }
-
-  return Object.freeze({ items: Object.freeze(selected), totalTokens, omitted: Object.freeze(omitted.map((item) => Object.freeze({ ...item }))) });
-}
-
-interface ProjectableHistoryMessage {
+interface WindowMessageEntry {
   readonly itemId: string;
   readonly message: ModelMessage;
   readonly imageArtifacts: readonly PublicArtifactRef[];
 }
 
-interface ProjectedHistoryImages {
+interface SelectedWindowImages {
   readonly messages: ModelMessage[];
-  readonly reductions: ContextHistoryReduction[];
+  readonly reductions: ModelWindowReduction[];
 }
 
-function projectImagesForProfile(
-  entries: readonly ProjectableHistoryMessage[],
+function selectImagesForProfile(
+  entries: readonly WindowMessageEntry[],
   profile: ModelProfile,
-  limits: ContextImageLimits,
+  limits: ModelWindowImageLimits,
   estimator: TokenEstimator
-): ProjectedHistoryImages {
+): SelectedWindowImages {
   const supportsImages = profile.modalities.input.includes('image');
   const images = entries.flatMap((entry, messageIndex) => (entry.message.images ?? []).map((image, imageIndex) => ({
     entry, messageIndex, imageIndex, image, bytes: imageByteLength(image), tokens: estimator.estimateImage(image)
   })));
   const kept = new Set<string>();
-  const removalReasons = new Map<string, ContextHistoryReduction['reason']>();
+  const removalReasons = new Map<string, ModelWindowReduction['reason']>();
   let activeCount = 0;
   let activeBytes = 0;
   let activeTokens = 0;
   for (let index = images.length - 1; index >= 0; index -= 1) {
-    const candidate = images[index];
-    if (!candidate) continue;
-    const key = `${String(candidate.messageIndex)}:${String(candidate.imageIndex)}`;
+    const modelOutput = images[index];
+    if (!modelOutput) continue;
+    const key = `${String(modelOutput.messageIndex)}:${String(modelOutput.imageIndex)}`;
     if (!supportsImages) {
       removalReasons.set(key, 'unsupported_modality');
       continue;
     }
     const reason = activeCount + 1 > limits.maxCount
       ? 'image_count_limit'
-      : activeBytes + candidate.bytes > limits.maxBytes
+      : activeBytes + modelOutput.bytes > limits.maxBytes
         ? 'image_byte_limit'
-        : activeTokens + candidate.tokens > limits.maxEstimatedTokens
+        : activeTokens + modelOutput.tokens > limits.maxEstimatedTokens
           ? 'image_token_limit'
           : undefined;
     if (reason) {
@@ -860,17 +599,17 @@ function projectImagesForProfile(
     }
     kept.add(key);
     activeCount += 1;
-    activeBytes += candidate.bytes;
-    activeTokens += candidate.tokens;
+    activeBytes += modelOutput.bytes;
+    activeTokens += modelOutput.tokens;
   }
 
-  const reductions: ContextHistoryReduction[] = [];
+  const reductions: ModelWindowReduction[] = [];
   const messages = entries.map((entry, messageIndex) => {
     if (entry.message.role !== 'user' && entry.message.role !== 'tool') return entry.message;
     const { images: sourceImages = [], ...messageWithoutImages } = entry.message;
     if (sourceImages.length === 0) return entry.message;
     const retained: ModelImage[] = [];
-    const removed: { readonly image: ModelImage; readonly artifact?: PublicArtifactRef; readonly bytes: number; readonly tokens: number; readonly reason: NonNullable<ContextHistoryReduction['reason']> }[] = [];
+    const removed: { readonly image: ModelImage; readonly artifact?: PublicArtifactRef; readonly bytes: number; readonly tokens: number; readonly reason: NonNullable<ModelWindowReduction['reason']> }[] = [];
     for (let imageIndex = 0; imageIndex < sourceImages.length; imageIndex += 1) {
       const image = sourceImages[imageIndex];
       if (!image) continue;
@@ -890,23 +629,23 @@ function projectImagesForProfile(
     const metadata = removed.map((item) => item.artifact
       ? `- ${item.image.mediaType}, ${String(item.bytes)} bytes, public artifact ${item.artifact.artifactId} (${item.artifact.sha256}, ${String(item.artifact.size)} bytes).`
       : `- ${item.image.mediaType}, ${String(item.bytes)} bytes; its public artifact metadata remains in the tool-result presentation.`).join('\n');
-    const projected: ModelMessage = Object.freeze({
+    const deliveredMessage: ModelMessage = Object.freeze({
       ...messageWithoutImages,
       content: `${entry.message.content}\n[${String(removed.length)} image attachment${removed.length === 1 ? '' : 's'} omitted from active model context]\n${metadata}`,
       ...(retained.length > 0 ? { images: Object.freeze(retained) } : {})
     });
-    reductions.push(createContextHistoryReduction({
+    reductions.push(createModelWindowReduction({
       itemId: entry.itemId,
       kind: 'image_content_removed',
       beforeBytes: Buffer.byteLength(entry.message.content, 'utf8') + sourceImages.reduce((total, image) => total + imageByteLength(image), 0),
-      afterBytes: Buffer.byteLength(projected.content, 'utf8') + retained.reduce((total, image) => total + imageByteLength(image), 0),
+      afterBytes: Buffer.byteLength(deliveredMessage.content, 'utf8') + retained.reduce((total, image) => total + imageByteLength(image), 0),
       ...(entry.message.role === 'tool' ? { toolName: entry.message.toolName } : {}),
       removedItems: removed.length,
       removedImageBytes: removed.reduce((total, item) => total + item.bytes, 0),
       removedImageTokens: removed.reduce((total, item) => total + item.tokens, 0),
       reason: firstRemoved.reason
     }));
-    return projected;
+    return deliveredMessage;
   });
   return { messages, reductions };
 }
@@ -978,7 +717,7 @@ function sameToolCall(left: ModelToolCall, right: ModelToolCall): boolean {
   return left.name === right.name && left.type === right.type;
 }
 
-function createContextHistoryReduction(value: ContextHistoryReduction): ContextHistoryReduction {
+function createModelWindowReduction(value: ModelWindowReduction): ModelWindowReduction {
   return Object.freeze(value);
 }
 
@@ -1020,14 +759,4 @@ function itemBytes(item: ContextHistoryItem): number {
     return messageBytes(item.message);
   }
   return messageBytes(item.useRetained ? item.retainedMessage : item.immediateMessage);
-}
-
-function contextId(...parts: string[]): string {
-  let hash = 2166136261;
-  const text = parts.join('\0');
-  for (let index = 0; index < text.length; index += 1) {
-    hash ^= text.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-  return `ctx_${(hash >>> 0).toString(16)}`;
 }

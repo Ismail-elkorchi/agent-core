@@ -1,9 +1,9 @@
 import path from 'node:path';
-import type { ArtifactRepository } from '@agent-core/evidence';
+import type { ArtifactRepository } from '@agent-core/persistence';
 import { artifactScope, defineTool, requireToolService, ToolInputError } from '@agent-core/tools';
 import { fileScope } from '../../core/resources.js';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
-import { builtInReadEvidence } from '../../core/read-evidence.js';
+import { builtInObservedFacts } from '../../core/read-observed-facts.js';
 import { requireRootedFileAuthority } from '../../core/rooted-files.js';
 import { rootedFileIdentitiesEqual } from '../../core/rooted-file-authority.js';
 import { viewImageInputSchema, viewImageOutputSchema } from './schema.js';
@@ -74,7 +74,7 @@ export const viewImageTool = defineTool({
       ok: true,
       summary: `Loaded image ${input.path} (${String(bytes.byteLength)} encoded bytes).`,
       scope,
-      evidence: builtInReadEvidence('read', scope, `Read rooted image ${input.path}.`),
+      observedFacts: builtInObservedFacts('read', scope, `Read rooted image ${input.path}.`),
       content: [{ type: 'image' as const, artifact, detail: input.detail }],
       output
     };

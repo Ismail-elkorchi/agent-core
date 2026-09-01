@@ -1,7 +1,7 @@
 import { appendFile, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import * as z from 'zod';
-import { JsonlEventRepository } from '@agent-core/evidence/node';
+import { JsonlEventRepository } from '@agent-core/persistence/node';
 import { AgentRuntime, agentEventCodec } from '@agent-core/runtime';
 import { adoptToolDefinition } from '@agent-core/tools';
 

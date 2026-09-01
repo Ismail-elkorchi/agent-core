@@ -9,9 +9,9 @@ export type BudgetPressure = 'normal' | 'constrained' | 'critical' | 'exhausted'
 
 export interface RequestCostEstimate {
   messageTokens: number;
-  contextHistoryTokens: number;
+  modelWindowTokens: number;
   contextTokens: number;
-  evidenceTokens: number;
+  observedFactTokens: number;
   toolSchemaTokens: number;
   outputReserveTokens: number;
   totalPromptTokens: number;
@@ -69,19 +69,21 @@ export class BudgetAccountant {
 
   estimateRequest(input: {
     promptMessages: ModelMessage[];
-    contextHistoryTokens: number;
+    modelWindowTokens: number;
     contextTokens: number;
-    evidenceTokens?: number;
+    observedFactTokens?: number;
     tools: ModelTool[];
     outputReserveTokens?: number;
   }): RequestCostEstimate {
     const messageTokens = this.estimator.estimateMessages(input.promptMessages);
-    const contextHistoryTokens = input.contextHistoryTokens;
+    const modelWindowTokens = input.modelWindowTokens;
     const contextTokens = input.contextTokens;
-    const evidenceTokens = input.evidenceTokens ?? 0;
+    const observedFactTokens = input.observedFactTokens ?? 0;
     const toolSchemaTokens = estimateToolSchemaTokens(input.tools, this.estimator);
     const outputReserveTokens = input.outputReserveTokens ?? this.window.maxOutputTokens;
-    const totalPromptTokens = messageTokens + contextHistoryTokens + toolSchemaTokens;
+    // promptMessages is the final assembled window, including retained history,
+    // context, and observed facts. Component counts below are diagnostics only.
+    const totalPromptTokens = messageTokens + toolSchemaTokens;
     const totalRequestTokens = totalPromptTokens + outputReserveTokens;
     const warnings: string[] = [];
     if (toolSchemaTokens > Math.floor(this.window.maxPromptTokens * 0.2)) {
@@ -89,9 +91,9 @@ export class BudgetAccountant {
     }
     return {
       messageTokens,
-      contextHistoryTokens,
+      modelWindowTokens,
       contextTokens,
-      evidenceTokens,
+      observedFactTokens,
       toolSchemaTokens,
       outputReserveTokens,
       totalPromptTokens,

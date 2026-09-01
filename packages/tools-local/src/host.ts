@@ -1,5 +1,5 @@
 import path from 'node:path';
-import type { ArtifactRepository } from '@agent-core/evidence';
+import type { ArtifactRepository } from '@agent-core/persistence';
 import type {
   CommandExecution,
   CommandExecutionReport,

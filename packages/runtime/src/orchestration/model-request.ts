@@ -1,5 +1,5 @@
-import { type PromptInstructionBlock } from '../context/manager.js';
-import { type PromptInstruction } from '../context/prompt.js';
+import { type PromptInstructionBlock } from '../inference/prompt-material.js';
+import { type PromptInstruction } from '../inference/model-request-assembler.js';
 import {
   type ModelProfile,
   type ModelParameter,

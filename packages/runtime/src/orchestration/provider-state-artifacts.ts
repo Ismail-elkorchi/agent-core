@@ -1,4 +1,4 @@
-import type { ArtifactRef, ArtifactRepository } from '@agent-core/evidence';
+import type { ArtifactRef, ArtifactRepository } from '@agent-core/persistence';
 import type { ModelProviderState } from '@agent-core/model';
 import type { AgentProviderStateReference } from '../events.js';
 import { summarizeProviderState } from './event-summaries.js';

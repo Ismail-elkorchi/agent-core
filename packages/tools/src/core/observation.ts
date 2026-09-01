@@ -1,11 +1,11 @@
 import * as z from 'zod';
 import { decodeOwnedToolCall } from './call.js';
 import {
-  validatePublicArtifactRef,
-  encodeToolEvidenceDelta,
-  parseToolEvidenceDelta,
-  type ToolEvidenceDelta
-} from '@agent-core/evidence';
+  encodeToolResultFacts,
+  parseToolResultFacts,
+  type ToolResultFacts
+} from './observed-facts.js';
+import { validatePublicArtifactRef } from '@agent-core/persistence';
 import { parseJsonObject, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import type {
   InvalidArgumentsToolFailureOutput,
@@ -97,14 +97,14 @@ function isOwnedToolObservation(value: unknown): value is ToolObservation {
 }
 
 function parseOwnedToolObservation(tool: Pick<ToolDefinition, 'outputSchema'> | undefined, record: JsonObject): ToolObservation {
-  const unknown = Object.keys(record).filter((key) => !['kind', 'ok', 'summary', 'scope', 'content', 'metadata', 'evidence', 'output'].includes(key));
+  const unknown = Object.keys(record).filter((key) => !['kind', 'ok', 'summary', 'scope', 'content', 'metadata', 'observedFacts', 'output'].includes(key));
   if (unknown.length > 0) throw new Error('Tool observation contains unsupported fields: ' + unknown.join(', ') + '.');
   if (typeof record.summary !== 'string' || record.summary.trim().length === 0) throw new Error('Tool observation requires a non-empty summary.');
   if (Buffer.byteLength(record.summary, 'utf8') > 64_000) throw new Error('Tool observation summary exceeds the host limit.');
   const scope = parseToolScope(record.scope);
   const content = parseContent(record.content);
   const metadata = record.metadata === undefined ? undefined : requireJsonObject(record.metadata, 'Tool observation metadata');
-  const evidence = record.evidence === undefined ? undefined : parseEvidence(record.evidence);
+  const observedFacts = record.observedFacts === undefined ? undefined : parseObservedFacts(record.observedFacts);
   if (record.kind === 'result' && typeof record.ok === 'boolean') {
     if (!tool) throw new Error('A result observation requires its tool definition.');
     const parsed = tool.outputSchema.safeParse(record.output);
@@ -112,7 +112,7 @@ function parseOwnedToolObservation(tool: Pick<ToolDefinition, 'outputSchema'> | 
     const output = parseJsonValue(parsed.data, JSON_LIMITS);
     return ownResultObservation({
       kind: 'result', ok: record.ok, summary: record.summary, scope, output,
-      ...(content ? { content } : {}), ...(metadata ? { metadata } : {}), ...(evidence ? { evidence } : {})
+      ...(content ? { content } : {}), ...(metadata ? { metadata } : {}), ...(observedFacts ? { observedFacts } : {})
     });
   }
   if (record.kind !== 'failure' || record.ok !== false) throw new Error('Tool observation kind and ok fields are inconsistent.');
@@ -120,7 +120,7 @@ function parseOwnedToolObservation(tool: Pick<ToolDefinition, 'outputSchema'> | 
   const output = parseFailureOutput(requireJsonObject(record.output, 'Tool failure output'));
   return ownFailureObservation({
     kind: 'failure', ok: false, summary: record.summary, scope, output,
-    ...(content ? { content } : {}), ...(metadata ? { metadata } : {}), ...(evidence ? { evidence } : {})
+    ...(content ? { content } : {}), ...(metadata ? { metadata } : {}), ...(observedFacts ? { observedFacts } : {})
   });
 }
 
@@ -192,8 +192,8 @@ function parseContent(value: JsonValue | undefined): readonly ToolContent[] | un
     throw new Error('Tool observation content item is invalid or uses an unsupported modality.');
   }));
 }
-function parseEvidence(value: JsonValue): ToolEvidenceDelta {
-  return parseToolEvidenceDelta(requireJsonObject(value, 'Tool evidence'));
+function parseObservedFacts(value: JsonValue): ToolResultFacts {
+  return parseToolResultFacts(requireJsonObject(value, 'Tool result facts'));
 }
 function persistenceTool(): Pick<ToolDefinition, 'outputSchema'> {
   return { outputSchema: z.unknown() };
@@ -235,7 +235,7 @@ export function encodeToolObservation(observation: ToolObservation): JsonObject 
   return Object.freeze({
     kind: observation.kind, ok: observation.ok, summary: observation.summary, scope: encodeToolScope(observation.scope), output: observation.kind === 'result' ? observation.output : encodeToolFailureOutput(observation.output),
     ...(observation.content ? { content: Object.freeze(observation.content.map(encodeToolContent)) } : {}),
-    ...(observation.metadata ? { metadata: observation.metadata } : {}), ...(observation.evidence ? { evidence: encodeToolEvidenceDelta(observation.evidence) } : {})
+    ...(observation.metadata ? { metadata: observation.metadata } : {}), ...(observation.observedFacts ? { observedFacts: encodeToolResultFacts(observation.observedFacts) } : {})
   });
 }
 

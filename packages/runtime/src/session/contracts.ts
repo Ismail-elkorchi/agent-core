@@ -1,7 +1,7 @@
-import type { ArtifactRef } from '@agent-core/evidence';
+import type { ArtifactRef } from '@agent-core/persistence';
 import type { JsonObject, JsonValue } from '@agent-core/json';
 import type { ModelReasoningRequest, ModelResponseFormat } from '@agent-core/model';
-import type { ContextItemInput } from '../context/manager.js';
+import type { PromptContextItemInput } from '../inference/prompt-material.js';
 import type { SessionBinding, SessionBindingInput } from './binding.js';
 import type {
   AgentEffectiveInstruction,
@@ -10,7 +10,7 @@ import type {
   AgentToolCallIdentity,
   AgentTurnIdentity
 } from '../run/contracts.js';
-import type { AgentDecisionRequest } from '../operation/contracts.js';
+import type { AgentDecisionRequest } from '../run/control/contracts.js';
 
 export type SessionHeader = Readonly<{
   readonly type: 'session';
@@ -96,8 +96,8 @@ export type SessionCompactionEntry = BaseSessionEntry & Readonly<{
   readonly model: string;
 }>;
 
-export type SessionFinalProjection = Readonly<{
-  readonly type: 'final';
+export type SessionRunFinalization = Readonly<{
+  readonly type: 'run_finalization';
   readonly id: string;
   readonly timestamp: string;
   readonly throughEntryId: string;
@@ -127,7 +127,7 @@ export type SessionConversationItem =
 export interface SessionBranchPoint {
   readonly entryId: string;
   readonly timestamp: string;
-  readonly kind: 'final' | 'compaction';
+  readonly kind: 'run_finalization' | 'compaction';
   readonly runId?: string;
   readonly finalizationId?: string;
 }
@@ -135,7 +135,7 @@ export interface SessionBranchPoint {
 export interface SessionSubmissionInput {
   readonly task: string;
   readonly instructions?: readonly string[];
-  readonly contextItems?: readonly ContextItemInput[];
+  readonly contextItems?: readonly PromptContextItemInput[];
 }
 
 export interface SessionSubmissionConfiguration {
@@ -221,7 +221,7 @@ export interface SessionSummary {
 export interface SessionReplayState {
   readonly session: SessionDescriptor;
   readonly branch: readonly SessionBranchEntry[];
-  readonly terminalProjections: readonly SessionFinalProjection[];
+  readonly runFinalizations: readonly SessionRunFinalization[];
   readonly compaction?: SessionCompactionEntry;
   readonly ledgerRunIds: readonly string[];
 }
@@ -241,7 +241,7 @@ export interface SessionRepository {
   appendModelSettings(session: SessionDescriptor, settings: { provider: string; model: string; temperature?: number; reasoningEffort?: string }): Promise<SessionModelSettingsEntry>;
   appendCompaction(session: SessionDescriptor, input: { summary: string; provider: string; model: string }): Promise<SessionCompactionEntry>;
   branchFrom(session: SessionDescriptor, entryId: string, label?: string): Promise<SessionBranchMarkerEntry>;
-  projectFinal(session: SessionDescriptor, terminal: AgentTerminalSnapshot): Promise<SessionFinalProjection>;
+  recordRunFinalization(session: SessionDescriptor, terminal: AgentTerminalSnapshot): Promise<SessionRunFinalization>;
   enqueueSubmission(session: SessionDescriptor, input: { submissionId: string; runId: string; input: SessionSubmissionInput; configuration: SessionSubmissionConfiguration }): Promise<void>;
   transitionSubmission(session: SessionDescriptor, submissionId: string, outcome:
     | { readonly state: 'claimed' | 'completed' }

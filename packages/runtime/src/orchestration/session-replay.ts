@@ -1,5 +1,6 @@
-import { ContextManager, type ContextImageLimits } from '../context/manager.js';
-import type { ArtifactRef, ArtifactRepository, EventEnvelope, EventRepository, EvidenceRecord } from '@agent-core/evidence';
+import { ModelWindow, type ModelWindowImageLimits } from '../inference/model-window.js';
+import type { ArtifactRef, ArtifactRepository, EventEnvelope, EventRepository } from '@agent-core/persistence';
+import type { ObservedFactRecord } from '@agent-core/tools';
 import type { ModelProviderState, TokenEstimator } from '@agent-core/model';
 import type { SessionDescriptor, SessionRepository } from '../session/contracts.js';
 import type { AgentEvent, AgentProviderStateSummary } from '../events.js';
@@ -7,43 +8,43 @@ import { serializeToolObservationPresentation } from './observation-store.js';
 import { modelToolCallFromToolCall } from './model-request.js';
 import { readProviderStateArtifact } from './provider-state-artifacts.js';
 
-export interface ContextReplayResult {
-  readonly contextManager: ContextManager;
+export interface ModelWindowReplayResult {
+  readonly modelWindow: ModelWindow;
   readonly replayedLedgers: number;
   readonly replayedTurns: number;
   readonly replayedSessionEntries: number;
   readonly replayedCheckpoints: number;
   readonly replayedToolResults: number;
-  readonly replayedEvidenceRecords: number;
+  readonly replayedObservedFactRecords: number;
   readonly providerState?: ModelProviderState;
   readonly providerStateSummary?: AgentProviderStateSummary;
   readonly providerStateRef?: ArtifactRef;
 }
 
-export async function rebuildContextFromRepositories(input: {
+export async function rebuildModelWindowFromRepositories(input: {
   readonly session?: { readonly repository: SessionRepository; readonly descriptor: SessionDescriptor };
   readonly events: EventRepository<AgentEvent>;
   readonly artifacts?: ArtifactRepository;
   readonly estimator: TokenEstimator;
-  readonly contextImageLimits?: ContextImageLimits;
+  readonly modelWindowImageLimits?: ModelWindowImageLimits;
   readonly providerId: string;
   readonly model: string;
   readonly runIds?: readonly string[];
-}): Promise<ContextReplayResult> {
-  const contextManager = new ContextManager(input.estimator, input.contextImageLimits);
+}): Promise<ModelWindowReplayResult> {
+  const modelWindow = new ModelWindow(input.estimator, input.modelWindowImageLimits);
   const replayState = input.session ? await input.session.repository.loadReplayState(input.session.descriptor) : undefined;
   const runIds = [...new Set([...(replayState?.ledgerRunIds ?? []), ...(input.runIds ?? [])])];
   const usesCompaction = replayState?.compaction !== undefined;
   if (replayState?.compaction) {
-    contextManager.recordCheckpoint({ content: renderSemanticCompaction(replayState.compaction.summary) });
-  } else if (replayState && replayState.terminalProjections.length > 0) {
-    contextManager.recordCheckpoint({ content: renderSessionHistory(replayState.branch, replayState.terminalProjections) });
+    modelWindow.recordCheckpoint({ content: renderSemanticCompaction(replayState.compaction.summary) });
+  } else if (replayState && replayState.runFinalizations.length > 0) {
+    modelWindow.recordCheckpoint({ content: renderSessionHistory(replayState.branch, replayState.runFinalizations) });
   }
   if (runIds.length === 0) return {
-    ...emptyReplay(contextManager),
+    ...emptyReplay(modelWindow),
     replayedSessionEntries: replayState?.branch.length ?? 0,
-    replayedTurns: replayState?.terminalProjections.length ?? 0,
-    replayedCheckpoints: usesCompaction || (replayState?.terminalProjections.length ?? 0) > 0 ? 1 : 0
+    replayedTurns: replayState?.runFinalizations.length ?? 0,
+    replayedCheckpoints: usesCompaction || (replayState?.runFinalizations.length ?? 0) > 0 ? 1 : 0
   };
   const turns: ReplayTurn[] = [];
   for (const runId of runIds) {
@@ -57,38 +58,38 @@ export async function rebuildContextFromRepositories(input: {
     turns.push({ task: started.task, records, steering: Object.freeze(steering), ...(ended?.type === 'run.ended' ? { ended } : {}) });
   }
 
-  const hasCompletedHistory = (replayState?.terminalProjections.length ?? 0) > 0;
+  const hasCompletedHistory = (replayState?.runFinalizations.length ?? 0) > 0;
   let replayedCheckpoints = usesCompaction || hasCompletedHistory ? 1 : 0;
   let replayedToolResults = 0;
-  let replayedEvidenceRecords = 0;
+  let replayedObservedFactRecords = 0;
   for (const turn of turns) {
     if (turn.ended) {
       if (!hasCompletedHistory) {
-        const evidence = evidenceFromTurn(turn);
-        contextManager.recordEvidence(evidence);
-        replayedEvidenceRecords += evidence.length;
-        contextManager.recordCheckpoint({ content: renderTurnCheckpoint(turn, evidence.length), removedItems: protocolEventCount(turn) });
+        const observedFacts = observedFactsFromTurn(turn);
+        modelWindow.recordObservedFacts(observedFacts);
+        replayedObservedFactRecords += observedFacts.length;
+        modelWindow.recordCheckpoint({ content: renderTurnCheckpoint(turn, observedFacts.length), removedItems: protocolEventCount(turn) });
         replayedCheckpoints += 1;
       }
     } else {
-      contextManager.recordCheckpoint({ content: renderInterruptedTurnCheckpoint(turn) });
+      modelWindow.recordCheckpoint({ content: renderInterruptedTurnCheckpoint(turn) });
       replayedCheckpoints += 1;
-      const replayed = replayOpenProtocolTail(contextManager, turn);
+      const replayed = replayOpenProtocolTail(modelWindow, turn);
       replayedToolResults += replayed.toolResults;
-      replayedEvidenceRecords += replayed.evidenceRecords;
+      replayedObservedFactRecords += replayed.observedFactRecords;
     }
   }
   const providerState = input.artifacts
     ? await latestProviderState(turns, input.providerId, input.model, input.artifacts)
     : {};
   return {
-    contextManager,
+    modelWindow,
     replayedLedgers: turns.length,
-    replayedTurns: (replayState?.terminalProjections.length ?? 0) + turns.filter((turn) => !turn.ended).length,
+    replayedTurns: (replayState?.runFinalizations.length ?? 0) + turns.filter((turn) => !turn.ended).length,
     replayedSessionEntries: replayState?.branch.length ?? 0,
     replayedCheckpoints,
     replayedToolResults,
-    replayedEvidenceRecords,
+    replayedObservedFactRecords,
     ...providerState
   };
 }
@@ -103,7 +104,7 @@ function renderSemanticCompaction(summary: string): string {
 
 function renderSessionHistory(
   branch: readonly import('../session/contracts.js').SessionBranchEntry[],
-  terminals: readonly import('../session/contracts.js').SessionFinalProjection[]
+  terminals: readonly import('../session/contracts.js').SessionRunFinalization[]
 ): string {
   const taskByRun = new Map(branch.flatMap((entry) => entry.type === 'input' ? [[entry.runId, entry.task] as const] : []));
   const steeringByRun = new Map<string, string[]>();
@@ -113,11 +114,11 @@ function renderSessionHistory(
     values.push(compactLine(entry.content, 800));
     steeringByRun.set(entry.runId, values);
   }
-  const lines = terminals.map((projection) => {
-    const terminal = projection.terminal;
-    const result = terminal.candidate.status === 'absent' ? terminal.errorMessage : terminal.candidate.message;
-    const steering = steeringByRun.get(projection.runId) ?? [];
-    return `- ${projection.runId} | ${terminal.executionStatus}/${terminal.verificationStatus}/${terminal.terminationReason} | task: ${compactLine(taskByRun.get(projection.runId) ?? '', 800)}${steering.length > 0 ? ` | steering: ${steering.join(' | ')}` : ''}${result ? ` | result: ${compactLine(result, 1_200)}` : ''}`;
+  const lines = terminals.map((assembly) => {
+    const terminal = assembly.terminal;
+    const result = terminal.modelOutput.status === 'absent' ? terminal.errorMessage : terminal.modelOutput.message;
+    const steering = steeringByRun.get(assembly.runId) ?? [];
+    return `- ${assembly.runId} | ${terminal.executionStatus}/${terminal.verificationStatus}/${terminal.terminationReason} | task: ${compactLine(taskByRun.get(assembly.runId) ?? '', 800)}${steering.length > 0 ? ` | steering: ${steering.join(' | ')}` : ''}${result ? ` | result: ${compactLine(result, 1_200)}` : ''}`;
   });
   const recent = lines.slice(-8);
   const older = lines.slice(0, -8).join('\n');
@@ -136,16 +137,16 @@ interface ReplayTurn {
   readonly ended?: Extract<AgentEvent, { type: 'run.ended' }>;
 }
 
-function replayOpenProtocolTail(contextManager: ContextManager, turn: ReplayTurn): { toolResults: number; evidenceRecords: number } {
+function replayOpenProtocolTail(modelWindow: ModelWindow, turn: ReplayTurn): { toolResults: number; observedFactRecords: number } {
   let toolResults = 0;
-  let evidenceRecords = 0;
+  let observedFactRecords = 0;
   for (const record of turn.records) {
     const event = record.event;
     if (event.type === 'assistant.ended' && event.toolCalls && event.toolCalls.length > 0) {
-      contextManager.recordModelOutput({ turnIndex: event.turnIndex, content: event.content, toolCalls: event.toolCalls.map(modelToolCallFromToolCall) });
+      modelWindow.recordModelOutput({ turnIndex: event.turnIndex, content: event.content, toolCalls: event.toolCalls.map(modelToolCallFromToolCall) });
     } else if (event.type === 'observation.record.created') {
-      const evidence = event.evidence;
-      contextManager.recordToolResult({
+      const observedFacts = event.observedFacts;
+      modelWindow.recordToolResult({
         turnIndex: event.turnIndex,
         toolName: event.toolName,
         toolCallType: event.toolCallType,
@@ -153,17 +154,17 @@ function replayOpenProtocolTail(contextManager: ContextManager, turn: ReplayTurn
         immediateContent: serializeToolObservationPresentation(event.immediatePresentation),
         retainedContent: serializeToolObservationPresentation(event.retainedPresentation),
         useRetained: true,
-        evidence
+        observedFacts
       });
       toolResults += 1;
-      evidenceRecords += evidence.length;
+      observedFactRecords += observedFacts.length;
     }
   }
-  return { toolResults, evidenceRecords };
+  return { toolResults, observedFactRecords };
 }
 
-function evidenceFromTurn(turn: ReplayTurn): EvidenceRecord[] {
-  return turn.records.flatMap((record) => record.event.type === 'observation.record.created' ? record.event.evidence : []);
+function observedFactsFromTurn(turn: ReplayTurn): ObservedFactRecord[] {
+  return turn.records.flatMap((record) => record.event.type === 'observation.record.created' ? record.event.observedFacts : []);
 }
 
 async function latestProviderState(
@@ -191,9 +192,9 @@ async function latestProviderState(
   return {};
 }
 
-function renderTurnCheckpoint(turn: ReplayTurn, evidenceRecords: number): string {
+function renderTurnCheckpoint(turn: ReplayTurn, observedFactRecords: number): string {
   const terminal = turn.ended?.terminal;
-  const result = terminal?.candidate.status === 'absent' ? terminal.errorMessage : terminal?.candidate.message;
+  const result = terminal?.modelOutput.status === 'absent' ? terminal.errorMessage : terminal?.modelOutput.message;
   const status = terminal ? `${terminal.executionStatus}/${terminal.verificationStatus}/${terminal.terminationReason}` : 'open';
   return [
     'Prior session turn checkpoint:',
@@ -202,7 +203,7 @@ function renderTurnCheckpoint(turn: ReplayTurn, evidenceRecords: number): string
     `Status: ${status}`,
     `Turns: ${String(terminal?.turnCount ?? 0)}`,
     ...(turn.steering.length > 0 ? [`Accepted steering: ${turn.steering.map((item) => compactLine(item, 800)).join(' | ')}`] : []),
-    `Tool evidence records retained: ${String(evidenceRecords)}`,
+    `Tool observedFacts records retained: ${String(observedFactRecords)}`,
     ...(result ? [`Result: ${compactLine(result, 1_200)}`] : [])
   ].join('\n');
 }
@@ -220,6 +221,6 @@ function protocolEventCount(turn: ReplayTurn): number {
 }
 function compactLine(value: string, maxChars: number): string { const normalized = value.replace(/\s+/gu, ' ').trim(); return normalized.length <= maxChars ? normalized : `${normalized.slice(0, maxChars)}...`; }
 function keepTail(value: string, maxChars: number): string { return value.length <= maxChars ? value : value.slice(-maxChars); }
-function emptyReplay(contextManager: ContextManager): ContextReplayResult {
-  return { contextManager, replayedLedgers: 0, replayedTurns: 0, replayedSessionEntries: 0, replayedCheckpoints: 0, replayedToolResults: 0, replayedEvidenceRecords: 0 };
+function emptyReplay(modelWindow: ModelWindow): ModelWindowReplayResult {
+  return { modelWindow, replayedLedgers: 0, replayedTurns: 0, replayedSessionEntries: 0, replayedCheckpoints: 0, replayedToolResults: 0, replayedObservedFactRecords: 0 };
 }

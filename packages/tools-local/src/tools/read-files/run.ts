@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { ToolEvidenceItem } from '@agent-core/evidence';
+import type { ToolResultFact } from '@agent-core/tools';
 import { throwIfAborted, type ToolExecutionContext, type ToolObservationInput } from '@agent-core/tools';
 import { fileScope, rootedFileResource } from '../../core/resources.js';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
@@ -42,14 +42,14 @@ export async function readFiles(input: ReadFilesInput, context: ToolExecutionCon
     kind: 'result', ok: failures.length === 0,
     summary: 'Read ' + String(files.length) + ' of ' + String(input.files.length) + ' requested files' + (coverage === 'partial' ? ' with partial coverage.' : '.'),
     scope,
-    evidence: { items: readFileEvidence(files, failures, scope) },
+    observedFacts: { items: readFileObservedFacts(files, failures, scope) },
     output
   };
 }
 
-function readFileEvidence(files: readonly ReadFileResult[], failures: readonly ReadFileFailure[], scope: { readonly filters?: import('@agent-core/json').JsonObject; readonly limits?: import('@agent-core/json').JsonObject }): ToolEvidenceItem[] {
+function readFileObservedFacts(files: readonly ReadFileResult[], failures: readonly ReadFileFailure[], scope: { readonly filters?: import('@agent-core/json').JsonObject; readonly limits?: import('@agent-core/json').JsonObject }): ToolResultFact[] {
   return [
-    ...files.map((file): ToolEvidenceItem => ({
+    ...files.map((file): ToolResultFact => ({
       action: 'read',
       outcome: 'success',
       resources: [rootedFileResource(file.path, {
@@ -60,18 +60,18 @@ function readFileEvidence(files: readonly ReadFileResult[], failures: readonly R
       })],
       scope: {
         ...(scope.filters ? { filters: scope.filters } : {}),
-        coverage: 'complete', truncated: false, confidence: 'verified',
+        coverage: 'complete', truncated: false, actuality: 'observed',
         limits: { ...(scope.limits ?? {}), returnedBytes: file.bytes, fileBytes: file.fileBytes, eof: file.eof }
       },
       summary: `Read ${String(file.lineCount)} lines (${String(file.bytes)} bytes) from ${file.path}.`
     })),
-    ...failures.map((failure): ToolEvidenceItem => ({
+    ...failures.map((failure): ToolResultFact => ({
       action: 'read',
       outcome: 'failure',
       resources: [rootedFileResource(failure.path)],
       scope: {
         ...(scope.filters ? { filters: scope.filters } : {}), ...(scope.limits ? { limits: scope.limits } : {}),
-        coverage: 'absent', truncated: false, confidence: 'verified', omitted: { reason: failure.reason }
+        coverage: 'absent', truncated: false, actuality: 'observed', omitted: { reason: failure.reason }
       },
       summary: `Failed to read ${failure.path}: ${failure.reason}.`
     }))

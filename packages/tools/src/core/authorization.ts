@@ -1,5 +1,5 @@
 import type { ToolCall } from './definition.js';
-import type { ToolPreparationContext } from './context.js';
+import type { ToolPlanningContext } from './context.js';
 import { isRiskAllowed, type ToolRisk } from './policy.js';
 import { validateResourceScope } from './resources.js';
 import { parseJsonObject } from '@agent-core/json';
@@ -41,7 +41,7 @@ export interface ToolAuthorizationRequest {
   readonly input: unknown;
   readonly effects: ToolEffects;
   readonly fingerprint: string;
-  readonly context: ToolPreparationContext;
+  readonly context: ToolPlanningContext;
 }
 
 export type ToolAuthorizer = (request: ToolAuthorizationRequest) => ToolAuthorizationDecision | Promise<ToolAuthorizationDecision>;

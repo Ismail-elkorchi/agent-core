@@ -1,4 +1,4 @@
-import type { EvidenceAction, ToolEvidenceItem } from '@agent-core/evidence';
+import type { ObservationAction, ToolResultFact } from '@agent-core/tools';
 import { requireToolService, throwIfAborted, ToolInputError, type ToolExecutionContext } from '@agent-core/tools';
 import { PATCH_JOURNAL_SCOPE, fileScope, rootedFileResource } from '../../core/resources.js';
 import type { ToolObservationInput } from '@agent-core/tools';
@@ -11,7 +11,7 @@ import {
   sha256Text
 } from '../../core/filesystem.js';
 import { invalidToolInputObservation } from '@agent-core/tools';
-import { isTextPatchJournal, withTextFilePatchJournal, type PreparedTextPatchRemove, type PreparedTextPatchWrite, type TextPatchJournal, type TextPatchJournalAuthority, type TextTransactionResult } from '../../core/text-write.js';
+import { isTextPatchJournal, withTextFilePatchJournal, type TextPatchRemovePlan, type TextPatchWritePlan, type TextPatchJournal, type TextPatchJournalAuthority, type TextTransactionResult } from '../../core/text-write.js';
 import { splitLogicalLines } from '@agent-core/tools';
 import { applyPatchUpdate, PatchApplyError } from './apply-diff.js';
 import { PatchParseError, type ParsedApplyPatch, type ParsedPatchOperation } from './patch-parser.js';
@@ -34,10 +34,10 @@ export interface CanonicalApplyPatchInput extends ApplyPatchInput {
   };
 }
 
-interface PreparedPatchOperation {
+interface PlannedPatchOperation {
   output: ApplyPatchFileOutput;
-  write?: PreparedTextPatchWrite;
-  remove?: PreparedTextPatchRemove;
+  write?: TextPatchWritePlan;
+  remove?: TextPatchRemovePlan;
   parentDirsToCreate: readonly string[];
   createdPath?: string;
   deletedPath?: string;
@@ -57,17 +57,17 @@ export async function applyPatch(input: CanonicalApplyPatchInput, context: ToolE
 export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, context: ToolExecutionContext, authority?: TextPatchJournalAuthority): Promise<ToolObservationInput<ApplyPatchOutput>> {
   const root = requireRootedFileAuthority(context);
   const dryRun = input.dryRun;
-  await context.emitProgress?.({ type: 'status', stage: 'patch_preparing', message: 'Preparing patch transaction.', completed: 0, total: input.tree.operations.length });
-  const { prepared, failures } = await preparePatch(root, input);
+  await context.emitProgress?.({ type: 'status', stage: 'patch_staging', message: 'Staging patch transaction.', completed: 0, total: input.tree.operations.length });
+  const { planned, failures } = await planPatch(root, input);
 
   if (failures.length > 0) {
     return invalidToolInputObservation('apply_patch', summarizePatchFailures(failures), {
       failures
     });
   }
-  await emitCheckpoint(context, { type: 'status', stage: 'patch_prepared', message: 'Patch transaction prepared.', completed: prepared.length, total: input.tree.operations.length });
+  await emitCheckpoint(context, { type: 'status', stage: 'patch_planned', message: 'Patch transaction planned.', completed: planned.length, total: input.tree.operations.length });
 
-  const changed = prepared.filter((operation) => operation.output.plannedChange);
+  const changed = planned.filter((operation) => operation.output.plannedChange);
   let transactionOutcome: ApplyPatchOutput['transactionOutcome'];
   let transaction: TextTransactionResult | undefined;
   if (!dryRun && changed.length > 0) {
@@ -95,7 +95,7 @@ export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, c
   }
 
   const wouldChangePaths = uniquePaths(changed.flatMap((operation) => operation.changedPaths));
-  const operationStatus: ApplyPatchOutput['operationStatus'] = dryRun
+  const applicationStatus: ApplyPatchOutput['applicationStatus'] = dryRun
     ? 'dry_run'
     : changed.length === 0
       ? 'no_change'
@@ -104,21 +104,21 @@ export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, c
         : transactionOutcome === 'rolled_back'
           ? 'not_applied'
           : 'uncertain';
-  const contentsCommitted = operationStatus === 'applied';
+  const contentsCommitted = applicationStatus === 'applied';
   const changedPaths = dryRun || !contentsCommitted ? [] : [...wouldChangePaths];
   const wouldCreatePaths = changed.flatMap((operation) => operation.createdPath ? [operation.createdPath] : []);
   const wouldDeletePaths = changed.flatMap((operation) => operation.deletedPath ? [operation.deletedPath] : []);
   const wouldMovePaths = changed.flatMap((operation) => operation.move ? [operation.move] : []);
   const output: ApplyPatchOutput = {
-    operationStatus,
+    applicationStatus,
     ...(transactionOutcome ? { transactionOutcome } : {}),
-    rootState: operationStatus === 'uncertain' ? 'uncertain' : 'known',
+    rootState: applicationStatus === 'uncertain' ? 'uncertain' : 'known',
     dryRun,
-    files: prepared.map((operation) => ({
+    files: planned.map((operation) => ({
       ...operation.output,
-      finalState: !operation.output.plannedChange || dryRun || operationStatus === 'no_change' || operationStatus === 'not_applied'
+      finalState: !operation.output.plannedChange || dryRun || applicationStatus === 'no_change' || applicationStatus === 'not_applied'
         ? 'unchanged' as const
-        : operationStatus === 'uncertain'
+        : applicationStatus === 'uncertain'
           ? 'uncertain' as const
           : 'changed' as const
     })),
@@ -130,17 +130,17 @@ export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, c
     wouldDeletePaths,
     movedPaths: dryRun || !contentsCommitted ? [] : wouldMovePaths.map((item) => ({ ...item })),
     wouldMovePaths: wouldMovePaths.map((item) => ({ ...item })),
-    potentiallyAffectedPaths: operationStatus === 'uncertain' ? [...wouldChangePaths] : [],
+    potentiallyAffectedPaths: applicationStatus === 'uncertain' ? [...wouldChangePaths] : [],
     ...(transaction ? { transaction } : {}),
-    totalOperationCount: prepared.length,
-    totalHunkCount: prepared.reduce((total, operation) => total + operation.output.hunkCount, 0),
-    totalAdditions: prepared.reduce((total, operation) => total + operation.output.additions, 0),
-    totalDeletions: prepared.reduce((total, operation) => total + operation.output.deletions, 0)
+    totalOperationCount: planned.length,
+    totalHunkCount: planned.reduce((total, operation) => total + operation.output.hunkCount, 0),
+    totalAdditions: planned.reduce((total, operation) => total + operation.output.additions, 0),
+    totalDeletions: planned.reduce((total, operation) => total + operation.output.deletions, 0)
   };
   return {
     kind: 'result',
-    ok: operationStatus === 'dry_run' || operationStatus === 'no_change' || operationStatus === 'applied',
-    summary: operationStatus === 'dry_run' || operationStatus === 'no_change' || transactionOutcome === 'committed'
+    ok: applicationStatus === 'dry_run' || applicationStatus === 'no_change' || applicationStatus === 'applied',
+    summary: applicationStatus === 'dry_run' || applicationStatus === 'no_change' || transactionOutcome === 'committed'
       ? summarizePatchOutput(output)
       : transactionOutcome === 'committed_with_residue'
         ? transactionFailureMessage(transaction as Extract<TextTransactionResult, { outcome: 'committed_with_residue' }>)
@@ -149,32 +149,32 @@ export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, c
           : 'Patch rollback failed; rooted file state is uncertain for: ' + (wouldChangePaths.join(', ') || 'unknown paths') + '.',
     scope: {
       resources: transactionOutcome === 'committed_with_residue'
-        ? [...uniquePaths(prepared.flatMap((operation) => operation.changedPaths)).map((item) => fileScope(item)), PATCH_JOURNAL_SCOPE]
-        : uniquePaths(prepared.flatMap((operation) => operation.changedPaths)).map((item) => fileScope(item)),
-      coverage: transactionOutcome === 'committed_with_residue' || operationStatus === 'uncertain' ? 'partial' : 'complete',
+        ? [...uniquePaths(planned.flatMap((operation) => operation.changedPaths)).map((item) => fileScope(item)), PATCH_JOURNAL_SCOPE]
+        : uniquePaths(planned.flatMap((operation) => operation.changedPaths)).map((item) => fileScope(item)),
+      coverage: transactionOutcome === 'committed_with_residue' || applicationStatus === 'uncertain' ? 'partial' : 'complete',
       ...(transactionOutcome === 'committed_with_residue' ? { causes: ['journal_residue'], omitted: { cleanup: transaction?.outcome === 'committed_with_residue' ? transaction.cleanup.strandedPaths.length : 0 } } : {}),
-      ...(operationStatus === 'uncertain' ? { causes: ['rooted_file_state_uncertain'], omitted: { potentiallyAffectedPaths: wouldChangePaths.length } } : {})
+      ...(applicationStatus === 'uncertain' ? { causes: ['rooted_file_state_uncertain'], omitted: { potentiallyAffectedPaths: wouldChangePaths.length } } : {})
     },
     output,
-    evidence: { items: patchEvidenceItems(output) },
+    observedFacts: { items: patchObservedFacts(output) },
     ...(!dryRun ? { metadata: { changedPaths: output.changedPaths } } : {})
   };
 }
 
 /** Builds the one transaction plan used by both dry-run and commit execution. */
-export async function preparePatch(root: RootedFileAuthority, input: CanonicalApplyPatchInput): Promise<{
-  readonly prepared: PreparedPatchOperation[];
+export async function planPatch(root: RootedFileAuthority, input: CanonicalApplyPatchInput): Promise<{
+  readonly planned: PlannedPatchOperation[];
   readonly failures: ApplyPatchFailure[];
 }> {
-  const prepared: PreparedPatchOperation[] = [];
+  const planned: PlannedPatchOperation[] = [];
   const failures: ApplyPatchFailure[] = [];
   const reservedPaths = new Set<string>();
   for (const operation of input.tree.operations) {
-    const result = await prepareOperation(root, operation, input, reservedPaths);
-    if (result.ok) prepared.push(result.operation);
+    const result = await planOperation(root, operation, input, reservedPaths);
+    if (result.ok) planned.push(result.operation);
     else failures.push(result.failure);
   }
-  return { prepared, failures };
+  return { planned, failures };
 }
 
 function patchTransactionId(context: ToolExecutionContext): string | undefined {
@@ -196,12 +196,12 @@ function transactionFailureMessage(result: Exclude<TextTransactionResult, { outc
   return `Patch commit failed and rollback ${result.rollback.status}: ${result.failure.message}`;
 }
 
-function patchEvidenceItems(output: ApplyPatchOutput): ToolEvidenceItem[] {
-  if (output.operationStatus === 'not_applied' || output.operationStatus === 'no_change') return [];
+function patchObservedFacts(output: ApplyPatchOutput): ToolResultFact[] {
+  if (output.applicationStatus === 'not_applied' || output.applicationStatus === 'no_change') return [];
   return output.files
     .filter((file) => file.plannedChange)
     .map((file) => {
-      const action = evidenceActionForPatch(file.operation);
+      const action = observationActionForPatch(file.operation);
       const resources = [rootedFileResource(file.path, {
         ...(file.newSha256 ? { sha256: file.newSha256 } : {}),
         mediaType: 'text/plain'
@@ -214,51 +214,51 @@ function patchEvidenceItems(output: ApplyPatchOutput): ToolEvidenceItem[] {
       }
       return {
         action,
-        outcome: output.operationStatus === 'uncertain' ? 'failure' as const : 'success' as const,
+        outcome: output.applicationStatus === 'uncertain' ? 'failure' as const : 'success' as const,
         resources,
         scope: {
           limits: {
             dryRun: output.dryRun,
-            operationStatus: output.operationStatus,
+            applicationStatus: output.applicationStatus,
             ...(output.transactionOutcome ? { transactionOutcome: output.transactionOutcome } : {}),
             hunkCount: file.hunkCount,
             additions: file.additions,
             deletions: file.deletions
           },
           truncated: false,
-          confidence: output.dryRun || output.operationStatus === 'uncertain' ? 'unverified' : 'verified'
+          actuality: output.dryRun || output.applicationStatus === 'uncertain' ? 'predicted' : 'observed'
         },
         summary: `${output.dryRun ? 'Would ' : ''}${action} ${file.destinationPath ?? file.path}.`
       };
     });
 }
 
-function evidenceActionForPatch(operation: ApplyPatchFileOutput['operation']): EvidenceAction {
+function observationActionForPatch(operation: ApplyPatchFileOutput['operation']): ObservationAction {
   if (operation === 'add') return 'create';
   if (operation === 'delete') return 'delete';
   if (operation === 'move') return 'move';
   return 'update';
 }
 
-async function prepareOperation(
+async function planOperation(
   root: RootedFileAuthority,
   operation: ParsedPatchOperation,
   input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
 ): Promise<
-  | { ok: true; operation: PreparedPatchOperation }
+  | { ok: true; operation: PlannedPatchOperation }
   | { ok: false; failure: ApplyPatchFailure }
 > {
   if (operation.kind === 'add') {
-    return prepareAdd(root, operation.path, operation.content, operation.additions, input, reservedPaths);
+    return planAdd(root, operation.path, operation.content, operation.additions, input, reservedPaths);
   }
   if (operation.kind === 'delete') {
-    return prepareDelete(root, operation.path, input, reservedPaths);
+    return planDelete(root, operation.path, input, reservedPaths);
   }
-  return prepareUpdate(root, operation, input, reservedPaths);
+  return planUpdate(root, operation, input, reservedPaths);
 }
 
-async function prepareAdd(
+async function planAdd(
   root: RootedFileAuthority,
   requestedPath: string,
   content: string,
@@ -266,7 +266,7 @@ async function prepareAdd(
   input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
 ): Promise<
-  | { ok: true; operation: PreparedPatchOperation }
+  | { ok: true; operation: PlannedPatchOperation }
   | { ok: false; failure: ApplyPatchFailure }
 > {
   const target = await inspectNewTarget(root, requestedPath, 'already_exists');
@@ -330,13 +330,13 @@ async function prepareAdd(
   };
 }
 
-async function prepareDelete(
+async function planDelete(
   root: RootedFileAuthority,
   requestedPath: string,
   input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
 ): Promise<
-  | { ok: true; operation: PreparedPatchOperation }
+  | { ok: true; operation: PlannedPatchOperation }
   | { ok: false; failure: ApplyPatchFailure }
 > {
   const inspected = await inspectTextFile(root, requestedPath, input.limits.maxFileBytes);
@@ -380,13 +380,13 @@ async function prepareDelete(
   };
 }
 
-async function prepareUpdate(
+async function planUpdate(
   root: RootedFileAuthority,
   operation: Extract<ParsedPatchOperation, { kind: 'update' }>,
   input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
 ): Promise<
-  | { ok: true; operation: PreparedPatchOperation }
+  | { ok: true; operation: PlannedPatchOperation }
   | { ok: false; failure: ApplyPatchFailure }
 > {
   const inspected = await inspectTextFile(root, operation.path, input.limits.maxFileBytes);
@@ -654,7 +654,7 @@ function nextActionForFailure(failure: ApplyPatchFailure): string {
       : 'Inspect the exact current region again with unnumbered output, then rebuild this hunk from that current text.';
   }
   if (failure.reason === 'ambiguous_context') {
-    return 'Inspect the candidate region lines, then add more surrounding context or a narrower @@ header so this hunk matches exactly one location.';
+    return 'Inspect the matching region lines, then add more surrounding context or a narrower @@ header so this hunk matches exactly one location.';
   }
   if (failure.reason === 'patch_parse_error') {
     return 'Rewrite the patch using the supported *** Begin Patch wrapper and valid operation/hunk lines.';
@@ -695,9 +695,9 @@ function summarizePatchFailures(failures: ApplyPatchFailure[]): string {
 }
 
 function summarizePatchOutput(output: ApplyPatchOutput): string {
-  const verb = output.operationStatus === 'dry_run' ? 'Validated' : output.operationStatus === 'no_change' ? 'Completed' : 'Applied';
-  const changed = output.operationStatus === 'dry_run' ? output.wouldChangePaths.length : output.changedPaths.length;
-  const outcome = output.operationStatus === 'dry_run' ? 'would change' : output.operationStatus === 'no_change' ? 'changed' : 'changed';
+  const verb = output.applicationStatus === 'dry_run' ? 'Validated' : output.applicationStatus === 'no_change' ? 'Completed' : 'Applied';
+  const changed = output.applicationStatus === 'dry_run' ? output.wouldChangePaths.length : output.changedPaths.length;
+  const outcome = output.applicationStatus === 'dry_run' ? 'would change' : output.applicationStatus === 'no_change' ? 'changed' : 'changed';
   return `${verb} ${String(output.totalOperationCount)} patch operation${output.totalOperationCount === 1 ? '' : 's'}; ${String(changed)} path${changed === 1 ? '' : 's'} ${outcome}.`;
 }
 

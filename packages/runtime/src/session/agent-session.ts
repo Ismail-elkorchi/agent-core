@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { hashJson } from '@agent-core/evidence';
+import { hashJson } from '@agent-core/persistence';
 import { normalizeJsonSafe } from '@agent-core/json';
-import { AgentRuntime, type AgentRunControl, type AgentRunInput } from '../agent-runtime.js';
-import { AgentOperationCoordinator } from '../operation/driver.js';
+import { AgentRuntime, type AgentRunHandle, type AgentRunInput } from '../agent-runtime.js';
+import { AgentRunCoordinator } from '../run/control/driver.js';
 import type { AgentProgressEvent } from '../events.js';
 import type { AgentRunResult } from '../run/contracts.js';
 import type {
@@ -68,7 +68,7 @@ export interface AgentSessionOptions {
   readonly descriptor: SessionDescriptor;
   readonly expectedBinding: SessionBindingInput;
   readonly repository: SessionRepository;
-  readonly operations: AgentOperationCoordinator;
+  readonly runs: AgentRunCoordinator;
   readonly configuration: AgentSessionConfiguration;
   readonly createRuntime: (
     configuration: AgentSessionConfiguration,
@@ -86,7 +86,7 @@ export class AgentSession {
   private readonly listeners = new Set<(event: AgentSessionEvent) => void | Promise<void>>();
   private active: ActiveSubmission | undefined;
   private suspended: SuspendedSubmission | undefined;
-  private operations: Promise<void> = Promise.resolve();
+  private serialQueue: Promise<void> = Promise.resolve();
   private restored = false;
   private compacting = false;
 
@@ -216,24 +216,24 @@ export class AgentSession {
     readonly decisionRequestId: string;
     readonly choice: string;
     readonly fingerprint: string;
-    readonly expectedOperationRevision: number;
+    readonly expectedRunRevision: number;
   }): Promise<AgentRunResult> {
     const started = await this.serial(async () => {
       await this.restorePending();
       if (this.active) throw new Error(`Session ${this.options.descriptor.id} already has an active run.`);
       const suspended = this.requireSuspension('user_decision', input.runId);
-      const operation = await this.options.operations.inspect(input.runId);
-      const phase = operation.state.phase;
+      const run = await this.options.runs.inspect(input.runId);
+      const phase = run.state.phase;
       if (phase.kind !== 'suspended' || phase.reason !== 'user_decision') throw new Error(`Run ${input.runId} is not waiting for a user decision.`);
       const request = phase.decisionRequest;
       if (request.id !== input.decisionRequestId || request.fingerprint !== input.fingerprint
-        || request.operationRevision !== input.expectedOperationRevision
-        || (operation.state.control.status !== 'abort_requested' && operation.state.revision !== input.expectedOperationRevision)) {
+        || request.runRevision !== input.expectedRunRevision
+        || (run.state.control.status !== 'abort_requested' && run.state.revision !== input.expectedRunRevision)) {
         throw new Error(`Decision request for run ${input.runId} is stale.`);
       }
       if (!request.choices.includes(input.choice)) throw new Error(`Decision choice ${input.choice} is not permitted for ${request.id}.`);
       if (input.choice !== 'abort') throw new Error(`Decision choice ${input.choice} has no implemented continuation.`);
-      await this.options.operations.requestAbort(input.runId, request.reason);
+      await this.options.runs.requestAbort(input.runId, request.reason);
       return this.startSuspendedSubmission(suspended);
     });
     return started.completion;
@@ -275,7 +275,7 @@ export class AgentSession {
       }
       const suspended = this.suspended;
       if (!suspended || (expectedRunId !== undefined && suspended.runId !== expectedRunId)) return false;
-      await this.options.operations.requestAbort(suspended.runId, reason);
+      await this.options.runs.requestAbort(suspended.runId, reason);
       await this.options.repository.transitionSubmission(this.options.descriptor, suspended.submissionId, { state: 'claimed' });
       const runtime = await this.createRuntime(suspended.submissionId, suspended.runId, suspended.input, suspended.configuration, true);
       const control = runtime.resume(suspended.runId);
@@ -290,7 +290,7 @@ export class AgentSession {
     await this.startReadyWork();
     while (this.active || (!this.suspended && this.queued.length > 0)) {
       if (this.active) await this.active.pending.completion.catch(() => undefined);
-      await this.operations;
+      await this.serialQueue;
     }
   }
 
@@ -333,21 +333,21 @@ export class AgentSession {
     const pending = await this.options.repository.loadPendingSubmissions(this.options.descriptor);
     for (const submission of pending) {
       if (submission.state === 'claimed') {
-        const operation = await this.options.operations.inspect(submission.runId);
-        if (operation.state.phase.kind === 'approval') {
-          this.suspended = suspendedSubmission(submission, requireOperationSuspensionDescriptor(submission.submissionId, operation.state));
+        const run = await this.options.runs.inspect(submission.runId);
+        if (run.state.phase.kind === 'approval') {
+          this.suspended = suspendedSubmission(submission, requireRunSuspensionDescriptor(submission.submissionId, run.state));
         } else {
-          const descriptor = operationSuspensionDescriptor(submission.submissionId, operation.state);
+          const descriptor = runSuspensionDescriptor(submission.submissionId, run.state);
           if (descriptor) this.suspended = suspendedSubmission(submission, descriptor);
           else this.queued.push(pendingFromRecord(submission, true));
         }
       } else if (submission.state === 'suspended') {
         if (this.suspended) throw new Error(`Session has multiple suspended submissions: ${this.suspended.submissionId} and ${submission.submissionId}.`);
         if (!submission.suspension) throw new Error(`Suspended submission ${submission.submissionId} has no durable suspension descriptor.`);
-        const operation = await this.options.operations.inspect(submission.runId);
-        const current = operationSuspensionDescriptor(submission.submissionId, operation.state);
+        const run = await this.options.runs.inspect(submission.runId);
+        const current = runSuspensionDescriptor(submission.submissionId, run.state);
         if (submission.suspension.reason !== 'missing_implementation' && (!current || !sameSuspension(submission.suspension, current))) {
-          throw new Error(`Suspended submission ${submission.submissionId} contradicts its operation suspension.`);
+          throw new Error(`Suspended submission ${submission.submissionId} contradicts its run suspension.`);
         }
         this.suspended = suspendedSubmission(submission, submission.suspension);
       } else {
@@ -399,10 +399,10 @@ export class AgentSession {
     if (this.active !== active) return;
     let suspension: AgentSessionSuspensionDescriptor | undefined;
     if (result.state === 'suspended') {
-      const operation = await this.options.operations.inspect(result.runId);
+      const run = await this.options.runs.inspect(result.runId);
       suspension = result.reason === 'missing_implementation'
         ? suspensionFromResult(active.pending.id, result)
-        : requireOperationSuspensionDescriptor(active.pending.id, operation.state);
+        : requireRunSuspensionDescriptor(active.pending.id, run.state);
       await this.options.repository.transitionSubmission(this.options.descriptor, active.pending.id, { state: 'suspended', suspension });
     } else await this.options.repository.transitionSubmission(this.options.descriptor, active.pending.id, { state: 'completed' });
     this.active = undefined;
@@ -456,8 +456,8 @@ export class AgentSession {
   }
 
   private serial<T>(operation: () => T | Promise<T>): Promise<T> {
-    const result = this.operations.then(operation);
-    this.operations = result.then(() => undefined, () => undefined);
+    const result = this.serialQueue.then(operation);
+    this.serialQueue = result.then(() => undefined, () => undefined);
     return result;
   }
 }
@@ -474,7 +474,7 @@ interface PendingSubmission {
 }
 
 interface ActiveSubmission {
-  readonly control: AgentRunControl;
+  readonly control: AgentRunHandle;
   readonly pending: PendingSubmission;
   readonly configuration: AgentSessionConfiguration;
 }
@@ -524,13 +524,13 @@ function ownConfiguration(configuration: AgentSessionConfiguration): AgentSessio
 }
 
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
-function requireOperationSuspensionDescriptor(submissionId: string, state: import('../operation/contracts.js').AgentOperationState): AgentSessionSuspensionDescriptor {
-  const descriptor = operationSuspensionDescriptor(submissionId, state);
+function requireRunSuspensionDescriptor(submissionId: string, state: import('../run/control/contracts.js').AgentRunState): AgentSessionSuspensionDescriptor {
+  const descriptor = runSuspensionDescriptor(submissionId, state);
   if (!descriptor) throw new Error(`Run ${state.runId} has no durable suspension state.`);
   return descriptor;
 }
 
-function operationSuspensionDescriptor(submissionId: string, state: import('../operation/contracts.js').AgentOperationState): AgentSessionSuspensionDescriptor | undefined {
+function runSuspensionDescriptor(submissionId: string, state: import('../run/control/contracts.js').AgentRunState): AgentSessionSuspensionDescriptor | undefined {
   const phase = state.phase;
   if (phase.kind === 'approval') return Object.freeze({
     runId: state.runId, submissionId, category: 'approval', reason: 'approval_required', actions: suspensionActions('approval', 'abort')
@@ -554,7 +554,7 @@ function operationSuspensionDescriptor(submissionId: string, state: import('../o
 }
 
 function suspensionFromResult(submissionId: string, result: Extract<AgentRunResult, { readonly state: 'suspended' }>): AgentSessionSuspensionDescriptor {
-  if (result.reason !== 'missing_implementation') throw new Error(`Suspension ${result.reason} must be derived from durable operation state.`);
+  if (result.reason !== 'missing_implementation') throw new Error(`Suspension ${result.reason} must be derived from durable run state.`);
   return Object.freeze({
     runId: result.runId, submissionId, category: 'implementation', reason: result.reason,
     ...(result.effectId ? { effectId: result.effectId } : {}), actions: suspensionActions('resume', 'abort')

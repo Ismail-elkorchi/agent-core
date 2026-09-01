@@ -11,7 +11,7 @@ import {
   LocalArtifactRepository,
   PersistenceCorruptionError,
   typedEventCodec
-} from '@agent-core/evidence/node';
+} from '@agent-core/persistence/node';
 
 test('event repository initializes a missing nested root before acquiring its stream lock', async () => {
   const parent = await mkdtemp(path.join(tmpdir(), 'agent-events-missing-root-'));
@@ -130,41 +130,41 @@ for (const [name, create] of [
     });
     assert.deepEqual({ kind: conflict.kind, reason: conflict.reason }, { kind: 'rejected', reason: 'idempotency_conflict' });
 
-    const staleTail = await repository.appendConditional('conditional', { type: 'operation.transition' }, {
+    const staleTail = await repository.appendConditional('conditional', { type: 'run.state.changed' }, {
       idempotencyKey: 'transition:stale-tail',
       expectedTail: empty,
       driverGeneration: 1
     });
     assert.deepEqual({ kind: staleTail.kind, reason: staleTail.reason }, { kind: 'rejected', reason: 'stale_tail' });
 
-    const staleDriver = await repository.appendConditional('conditional', { type: 'operation.transition' }, {
+    const staleDriver = await repository.appendConditional('conditional', { type: 'run.state.changed' }, {
       idempotencyKey: 'transition:stale-driver',
       expectedTail: claimed.tail,
       driverGeneration: 0
     });
     assert.deepEqual({ kind: staleDriver.kind, reason: staleDriver.reason }, { kind: 'rejected', reason: 'stale_driver' });
 
-    const transitioned = await repository.appendConditional('conditional', { type: 'operation.transition', revision: 1 }, {
+    const transitioned = await repository.appendConditional('conditional', { type: 'run.state.changed', revision: 1 }, {
       idempotencyKey: 'transition:1',
       expectedTail: claimed.tail,
       driverGeneration: 1
     });
     assert.equal(transitioned.kind, 'committed');
     assert.equal((await repository.latestOfType('conditional', 'operation.claimed')).sequence, claimed.receipt.sequence);
-    assert.equal((await repository.latestOfType('conditional', 'operation.transition')).event.revision, 1);
+    assert.equal((await repository.latestOfType('conditional', 'run.state.changed')).event.revision, 1);
   });
 }
 
 test('JSONL latest event-type index survives reopening without a history scan', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'agent-events-type-index-'));
   let repository = new JsonlEventRepository({ rootDir: dir, codec: typedEventCodec });
-  await repository.append('typed', { type: 'operation.transition', revision: 1 });
+  await repository.append('typed', { type: 'run.state.changed', revision: 1 });
   await repository.append('typed', { type: 'audit.sample', value: 1 });
-  await repository.append('typed', { type: 'operation.transition', revision: 2 });
+  await repository.append('typed', { type: 'run.state.changed', revision: 2 });
   await repository.append('typed', { type: 'audit.sample', value: 2 });
 
   repository = new JsonlEventRepository({ rootDir: dir, codec: typedEventCodec });
-  const transition = await repository.latestOfType('typed', 'operation.transition');
+  const transition = await repository.latestOfType('typed', 'run.state.changed');
   assert.equal(transition.event.revision, 2);
   assert.equal(repository.indexMetrics().fullScans, 0);
 });

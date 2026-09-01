@@ -1,4 +1,4 @@
-import type { ProtectedArtifactRef, PublicArtifactRef } from '@agent-core/evidence';
+import type { ProtectedArtifactRef, PublicArtifactRef } from '@agent-core/persistence';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
 import type { ToolProgress, ToolResourceLease } from './context.js';
 import type { ResourceLeaseCoordinator } from './resource-leases.js';
@@ -23,7 +23,7 @@ export interface CommandExecutionDescriptor {
   readonly supportsPty: boolean;
 }
 
-export interface PrepareCommandRequest {
+export interface CommandExecutionPlanRequest {
   readonly command: string;
   /** Canonical path relative to the command authority's adopted root. */
   readonly rootedDirectory: string;
@@ -34,48 +34,48 @@ export interface PrepareCommandRequest {
   readonly owner: CommandExecutionOwner;
 }
 
-export interface StartPreparedCommandOptions {
+export interface StartCommandExecutionOptions {
   readonly signal?: AbortSignal;
   readonly lease?: ToolResourceLease;
   readonly onProgress?: (progress: ToolProgress) => void | Promise<void>;
 }
 
-/** Authority-owned command preparation. It may reserve resources but must not execute the target. */
-export interface CommandExecutionPreparation {
-  readonly [COMMAND_EXECUTION_PREPARATION]: true;
-  /** Exact, immutable evidence included in the tool authorization fingerprint. */
+/** Authority-owned command planning. It may reserve resources but must not execute the target. */
+export interface CommandExecutionReservation {
+  readonly [COMMAND_EXECUTION_RESERVATION]: true;
+  /** Exact, immutable observedFacts included in the tool authorization fingerprint. */
   readonly authorization: JsonObject;
   release(): void | Promise<void>;
 }
 
-const COMMAND_EXECUTION_PREPARATION = Symbol('agent-core.command-execution-preparation');
-const commandExecutionPreparations = new WeakSet<CommandExecutionPreparation>();
+const COMMAND_EXECUTION_RESERVATION = Symbol('agent-core.command-execution-planning');
+const commandExecutionReservations = new WeakSet<CommandExecutionReservation>();
 
-export function createCommandExecutionPreparation(
+export function createCommandExecutionReservation(
   authorizationValue: unknown,
   release: () => void | Promise<void>
-): CommandExecutionPreparation {
-  if (typeof release !== 'function') throw new TypeError('Command execution preparation release must be callable.');
+): CommandExecutionReservation {
+  if (typeof release !== 'function') throw new TypeError('Command execution planning release must be callable.');
   const authorization = parseJsonObject(authorizationValue, {
     maxDepth: 24,
     maxCollectionEntries: 2_000,
     maxStringBytes: 256_000,
     maxTotalBytes: 512_000
   });
-  const preparation = Object.freeze({
-    [COMMAND_EXECUTION_PREPARATION]: true as const,
+  const planning = Object.freeze({
+    [COMMAND_EXECUTION_RESERVATION]: true as const,
     authorization,
     release
   });
-  commandExecutionPreparations.add(preparation);
-  return preparation;
+  commandExecutionReservations.add(planning);
+  return planning;
 }
 
-const PREPARED_COMMAND_EXECUTION = Symbol('agent-core.prepared-command-execution');
-/** Opaque, single-authority preparation admitted by this package. */
-export interface PreparedCommandExecution {
-  readonly [PREPARED_COMMAND_EXECUTION]: true;
-  readonly request: PrepareCommandRequest;
+const COMMAND_EXECUTION_PLAN = Symbol('agent-core.plan-command-execution');
+/** Opaque, single-authority planning admitted by this package. */
+export interface CommandExecutionPlan {
+  readonly [COMMAND_EXECUTION_PLAN]: true;
+  readonly request: CommandExecutionPlanRequest;
   readonly authorization: JsonObject;
 }
 
@@ -128,8 +128,8 @@ export interface CommandReconciliationResult {
 export interface CommandExecution {
   readonly descriptor: CommandExecutionDescriptor;
   readonly resourceLeases: ResourceLeaseCoordinator;
-  prepare(request: PrepareCommandRequest): Promise<CommandExecutionPreparation>;
-  start(prepared: CommandExecutionPreparation, options?: StartPreparedCommandOptions): Promise<CommandExecutionResult>;
+  plan(request: CommandExecutionPlanRequest): Promise<CommandExecutionReservation>;
+  start(plan: CommandExecutionReservation, options?: StartCommandExecutionOptions): Promise<CommandExecutionResult>;
   query(processId: string, outputTokenBudget: number, yieldMs?: number, afterCursor?: number, requester?: CommandExecutionOwner): Promise<CommandExecutionResult>;
   writeInput(processId: string, text: string, requester?: CommandExecutionOwner): Promise<void>;
   closeInput(processId: string, requester?: CommandExecutionOwner): Promise<void>;
@@ -144,51 +144,51 @@ export interface CommandExecution {
 }
 
 const adoptedCommandExecutions = new WeakSet();
-const preparedCommands = new WeakMap<PreparedCommandExecution, {
-  state: 'prepared' | 'started' | 'released';
+const commandExecutionPlans = new WeakMap<CommandExecutionPlan, {
+  state: 'plan' | 'started' | 'released';
   readonly authority: CommandExecution;
-  readonly source: CommandExecutionPreparation;
+  readonly source: CommandExecutionReservation;
 }>();
 
-export async function prepareCommandExecution(
+export async function planCommandExecution(
   authority: CommandExecution,
-  request: PrepareCommandRequest
-): Promise<PreparedCommandExecution> {
+  request: CommandExecutionPlanRequest
+): Promise<CommandExecutionPlan> {
   if (!isCommandExecution(authority)) throw new TypeError('Command execution authority was not adopted.');
-  validatePrepareRequest(request);
-  const source = await authority.prepare(request);
-  if (!isCommandExecutionPreparation(source)) {
-    throw new TypeError('Command execution preparation is invalid.');
+  validateCommandExecutionPlanRequest(request);
+  const source = await authority.plan(request);
+  if (!isCommandExecutionReservation(source)) {
+    throw new TypeError('Command execution planning is invalid.');
   }
-  const prepared = Object.freeze({
-    [PREPARED_COMMAND_EXECUTION]: true as const,
+  const plan = Object.freeze({
+    [COMMAND_EXECUTION_PLAN]: true as const,
     request: Object.freeze({ ...request, owner: Object.freeze({ ...request.owner }) }),
     authorization: source.authorization
   });
-  preparedCommands.set(prepared, { state: 'prepared', authority, source });
-  return prepared;
+  commandExecutionPlans.set(plan, { state: 'plan', authority, source });
+  return plan;
 }
 
-export function isCommandExecutionPreparation(value: unknown): value is CommandExecutionPreparation {
-  return typeof value === 'object' && value !== null && commandExecutionPreparations.has(value as CommandExecutionPreparation);
+export function isCommandExecutionReservation(value: unknown): value is CommandExecutionReservation {
+  return typeof value === 'object' && value !== null && commandExecutionReservations.has(value as CommandExecutionReservation);
 }
 
-export async function startPreparedCommandExecution(
+export async function startCommandExecutionPlan(
   authority: CommandExecution,
-  prepared: PreparedCommandExecution,
-  options: StartPreparedCommandOptions = {}
+  plan: CommandExecutionPlan,
+  options: StartCommandExecutionOptions = {}
 ): Promise<CommandExecutionResult> {
-  const record = requirePreparedCommand(prepared, authority);
-  if (record.state !== 'prepared') throw new Error('Command execution preparation is single-use.');
+  const record = requireCommandExecutionPlan(plan, authority);
+  if (record.state !== 'plan') throw new Error('Command execution planning is single-use.');
   record.state = 'started';
   return authority.start(record.source, options);
 }
 
-export async function releasePreparedCommandExecution(
+export async function releaseCommandExecutionPlan(
   authority: CommandExecution,
-  prepared: PreparedCommandExecution
+  plan: CommandExecutionPlan
 ): Promise<void> {
-  const record = requirePreparedCommand(prepared, authority);
+  const record = requireCommandExecutionPlan(plan, authority);
   if (record.state === 'released') return;
   record.state = 'released';
   await record.source.release();
@@ -209,7 +209,7 @@ export function adoptCommandExecution(value: unknown): CommandExecution {
     throw new TypeError('Command execution descriptor and capabilities must be immutable.');
   }
   if (!isResourceLeaseCoordinator(candidate.resourceLeases)) throw new TypeError('Command execution resource lease coordinator is invalid.');
-  const complete = ['prepare', 'start', 'query', 'writeInput', 'closeInput', 'terminate', 'disposeRun', 'recoveredTerminalReports',
+  const complete = ['plan', 'start', 'query', 'writeInput', 'closeInput', 'terminate', 'disposeRun', 'recoveredTerminalReports',
     'acknowledgeTerminalReport', 'reconcile', 'retryReconciliation', 'acknowledgeUnresolved', 'close']
     .every((key) => typeof candidate[key as keyof CommandExecution] === 'function');
   if (!complete) throw new TypeError('Command execution behavior is incomplete.');
@@ -217,13 +217,13 @@ export function adoptCommandExecution(value: unknown): CommandExecution {
   return value as CommandExecution;
 }
 
-function requirePreparedCommand(prepared: PreparedCommandExecution, authority: CommandExecution) {
-  const record = preparedCommands.get(prepared);
-  if (record?.authority !== authority) throw new TypeError('Command preparation does not belong to this execution authority.');
+function requireCommandExecutionPlan(plan: CommandExecutionPlan, authority: CommandExecution) {
+  const record = commandExecutionPlans.get(plan);
+  if (record?.authority !== authority) throw new TypeError('Command planning does not belong to this execution authority.');
   return record;
 }
 
-function validatePrepareRequest(request: PrepareCommandRequest): void {
+function validateCommandExecutionPlanRequest(request: CommandExecutionPlanRequest): void {
   if (typeof request.command !== 'string' || request.command.length === 0) throw new TypeError('Command must be non-empty.');
   if (typeof request.rootedDirectory !== 'string') throw new TypeError('Command rooted directory must be a string.');
   if (typeof request.pty !== 'boolean') throw new TypeError('Command PTY selection must be boolean.');

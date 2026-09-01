@@ -7,7 +7,8 @@
   },
   "include": ["src"],
   "references": [
-    { "path": "../evidence" },
+    { "path": "../effects" },
+    { "path": "../persistence" },
     { "path": "../json" },
     { "path": "../tools" }
   ]

@@ -54,7 +54,7 @@ export interface ApplyPatchFailure {
 }
 
 export type ApplyPatchOperation = 'add' | 'update' | 'delete' | 'move';
-export type ApplyPatchOperationStatus = 'dry_run' | 'no_change' | 'applied' | 'not_applied' | 'uncertain';
+export type ApplyPatchApplicationStatus = 'dry_run' | 'no_change' | 'applied' | 'not_applied' | 'uncertain';
 export type ApplyPatchTransactionOutcome = 'committed' | 'committed_with_residue' | 'rolled_back' | 'rollback_failed';
 
 export type PatchMatchMode =
@@ -86,7 +86,7 @@ export interface ApplyPatchFileOutput {
 }
 
 export interface ApplyPatchOutput {
-  operationStatus: ApplyPatchOperationStatus;
+  applicationStatus: ApplyPatchApplicationStatus;
   transactionOutcome?: ApplyPatchTransactionOutcome;
   rootState: 'known' | 'uncertain';
   dryRun: boolean;
@@ -127,7 +127,7 @@ const patchFileOutputSchema = z.strictObject({
 const pathPairSchema = z.strictObject({ sourcePath: z.string(), destinationPath: z.string() });
 
 export const applyPatchOutputSchema = z.strictObject({
-  operationStatus: z.enum(['dry_run', 'no_change', 'applied', 'not_applied', 'uncertain']),
+  applicationStatus: z.enum(['dry_run', 'no_change', 'applied', 'not_applied', 'uncertain']),
   transactionOutcome: z.enum(['committed', 'committed_with_residue', 'rolled_back', 'rollback_failed']).optional(),
   rootState: z.enum(['known', 'uncertain']),
   dryRun: z.boolean(),
@@ -154,7 +154,7 @@ export const applyPatchOutputSchema = z.strictObject({
 });
 
 function transactionDiagnosticSchema() {
-  return z.strictObject({ operation: z.string(), path: z.string(), message: z.string(), code: z.string().optional() });
+  return z.strictObject({ action: z.string(), path: z.string(), message: z.string(), code: z.string().optional() });
 }
 function recoverySchema() {
   return z.strictObject({ status: z.enum(['succeeded', 'failed', 'uncertain']), diagnostics: z.array(transactionDiagnosticSchema()), strandedPaths: z.array(z.string()) });

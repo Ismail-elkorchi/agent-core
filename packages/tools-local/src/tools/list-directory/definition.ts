@@ -2,7 +2,7 @@ import { defineTool } from '@agent-core/tools';
 import { fileScope } from '../../core/resources.js';
 import { rootedFileSelector } from '../../core/rooted-file-selection.js';
 import { presentListDirectoryObservation } from '../../core/presenters.js';
-import { builtInReadEvidence } from '../../core/read-evidence.js';
+import { builtInObservedFacts } from '../../core/read-observed-facts.js';
 import { requireRootedFileAuthority } from '../../core/rooted-files.js';
 import { listDirectoryInputSchema, listDirectoryOutputSchema, type ListDirectoryInput } from './schema.js';
 
@@ -65,7 +65,7 @@ export const listDirectoryTool = defineTool({
       ok: true,
       summary: `Listed ${String(output.counts.returned)} entries under ${output.path}${output.coverage === 'partial' ? ' with partial coverage' : ''}.`,
       scope,
-      evidence: builtInReadEvidence('list', scope, `Listed ${String(output.counts.returned)} directory entries.`),
+      observedFacts: builtInObservedFacts('list', scope, `Listed ${String(output.counts.returned)} directory entries.`),
       output
     };
   }

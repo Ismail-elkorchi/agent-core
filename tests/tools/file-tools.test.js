@@ -4,8 +4,8 @@ import { createHash } from 'node:crypto';
 import { appendFile, chmod, mkdir, mkdtemp, rename, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { prepareToolCall } from '@agent-core/tools';
-import { invokePreparedForTest, invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
+import { planToolCall } from '@agent-core/tools';
+import { invokePlannedForTest, invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
 import {
   DEFAULT_LOCAL_TOOL_CONFIGURATION,
   RootedFileSelector,
@@ -356,10 +356,10 @@ test('search_text handles long repositories, context, per-file limits, abort, an
 
   const controller = new AbortController();
   const call = jsonToolCall('search_text', { path: 'many', query: 'nothing' });
-  const preparationContext = { ...context, signal: controller.signal, boundary: { authorizationPolicyId: 'tests/search@1', executionTargetId: root } };
-  const prepared = await prepareToolCall(call, [searchTextTool], preparationContext);
-  assert.equal(prepared.ok, true);
-  const abortedPromise = invokePreparedForTest(prepared.prepared, preparationContext);
+  const planningContext = { ...context, signal: controller.signal, boundary: { authorizationPolicyId: 'tests/search@1', executionTargetId: root } };
+  const plan = await planToolCall(call, [searchTextTool], planningContext);
+  assert.equal(plan.ok, true);
+  const abortedPromise = invokePlannedForTest(plan.plan, planningContext);
   setTimeout(() => controller.abort('search cancelled'), 1);
   const aborted = await abortedPromise;
   assert.equal(aborted.output.status, 'aborted');

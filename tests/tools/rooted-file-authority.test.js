@@ -31,11 +31,11 @@ test('rooted file authorities reject lexical escapes, reserved authority, aliase
   const root = RootedFileAuthority.adopt(rootPath);
   try {
     assert.throws(() => RootedFileAuthority.adopt(rootAlias), /aliased|directory/iu);
-    for (const candidate of ['../secret', '/etc/passwd', 'C:\\Windows\\win.ini', '\\\\server\\share\\secret', '\\\\?\\C:\\secret', 'nested/../../secret']) {
-      assert.throws(() => root.canonicalPath(candidate), /not allowed|escapes|Backslash/iu, candidate);
+    for (const modelOutput of ['../secret', '/etc/passwd', 'C:\\Windows\\win.ini', '\\\\server\\share\\secret', '\\\\?\\C:\\secret', 'nested/../../secret']) {
+      assert.throws(() => root.canonicalPath(modelOutput), /not allowed|escapes|Backslash/iu, modelOutput);
     }
-    for (const candidate of ['.agent-core/state', '.agent-core-patch-forged-stage']) {
-      assert.throws(() => root.canonicalPath(candidate), /reserved/iu, candidate);
+    for (const modelOutput of ['.agent-core/state', '.agent-core-patch-forged-stage']) {
+      assert.throws(() => root.canonicalPath(modelOutput), /reserved/iu, modelOutput);
     }
     assert.equal(root.canonicalPath('.git/config'), '.git/config');
     assert.equal(root.canonicalPath('nested/.git/config'), 'nested/.git/config');

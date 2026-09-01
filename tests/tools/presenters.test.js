@@ -68,7 +68,7 @@ test('domain presenters preserve their required shape while spending the supplie
   assertWithinBudget(searched, 700);
 
   const patched = present(applyPatchTool, {
-    operationStatus: 'uncertain', transactionOutcome: 'rollback_failed', rootState: 'uncertain', dryRun: false,
+    applicationStatus: 'uncertain', transactionOutcome: 'rollback_failed', rootState: 'uncertain', dryRun: false,
     files: [
       { path: 'a.txt', operation: 'update', hunkCount: 1, additions: 1, deletions: 1, oldBytes: 1, newBytes: 1, plannedChange: true, finalState: 'uncertain' },
       { path: 'old.txt', destinationPath: 'new.txt', operation: 'move', hunkCount: 0, additions: 0, deletions: 0, oldBytes: 1, newBytes: 1, plannedChange: true, finalState: 'uncertain' }
@@ -78,7 +78,7 @@ test('domain presenters preserve their required shape while spending the supplie
     totalOperationCount: 2, totalHunkCount: 1, totalAdditions: 1, totalDeletions: 1, failures: [],
     transaction: { outcome: 'rollback_failed', failure: { operation: 'commit_patch', path: 'a.txt', message: 'commit failed' }, rollback: { status: 'uncertain', diagnostics: [{ operation: 'restore', path: 'a.txt', message: 'state unknown' }], strandedPaths: ['a.txt'] } }
   }, { scope: { resources: ['files/a.txt', 'files/old.txt', 'files/new.txt'], coverage: 'partial', causes: ['rooted_file_state_uncertain'] }, ok: false });
-  assert.equal(patched.results.operationStatus, 'uncertain');
+  assert.equal(patched.results.applicationStatus, 'uncertain');
   assert.equal(patched.results.transactionOutcome, 'rollback_failed');
   assert.equal(patched.results.rootState, 'uncertain');
   assert.deepEqual(patched.results.files.map(file => [file.path, file.operation, file.additions, file.deletions]), [['a.txt', 'update', 1, 1], ['old.txt', 'move', 0, 0]]);

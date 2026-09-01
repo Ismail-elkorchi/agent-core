@@ -80,15 +80,15 @@ export function spawnSupervisedProcess(input: {
 
 export async function sendSupervisorCommand(
   supervision: ProcessSupervisorIdentity,
-  operation: 'challenge' | 'release' | 'stop',
+  action: 'challenge' | 'release' | 'stop',
   timeoutMs = 2_000
 ): Promise<SupervisorResponse> {
   const nonce = randomBytes(24).toString('hex');
-  const clientProof = hmac(supervision.authenticationToken, `client\n${supervision.identity}\n${nonce}\n${operation}`);
+  const clientProof = hmac(supervision.authenticationToken, `client\n${supervision.identity}\n${nonce}\n${action}`);
   const response = await exchange(supervision.endpoint, JSON.stringify({
     identity: supervision.identity,
     nonce,
-    operation,
+    action,
     clientProof
   }) + '\n', timeoutMs);
   const parsed: unknown = JSON.parse(response);
@@ -98,7 +98,7 @@ export async function sendSupervisorCommand(
   const processPid = parsed.processPid === undefined ? undefined : typeof parsed.processPid === 'number' && Number.isSafeInteger(parsed.processPid) && parsed.processPid > 0 ? parsed.processPid : invalidResponse();
   const processProof = parsed.processProof === undefined ? undefined : typeof parsed.processProof === 'string' ? parsed.processProof : invalidResponse();
   if ((processPid === undefined) !== (processProof === undefined)) throw new Error('Process supervisor returned incomplete process ownership.');
-  const expected = hmac(supervision.authenticationToken, `server\n${supervision.identity}\n${nonce}\n${operation}\n${String(processPid ?? '')}\n${processProof ?? ''}`);
+  const expected = hmac(supervision.authenticationToken, `server\n${supervision.identity}\n${nonce}\n${action}\n${String(processPid ?? '')}\n${processProof ?? ''}`);
   if (!safeEqual(parsed.serverProof, expected)) throw new Error('Process supervisor failed authenticated challenge.');
   if (processPid !== undefined && processProof !== processOwnershipProof(supervision, processPid)) throw new Error('Process supervisor returned invalid process ownership.');
   if (processPid === undefined || processProof === undefined) return Object.freeze({});
@@ -125,7 +125,7 @@ class SupervisorController implements SupervisedProcessTree {
   readonly started: Promise<void>;
   readonly supervision: ProcessSupervisorIdentity;
   readonly terminalState: Promise<SupervisorTerminalState | undefined>;
-  #operation: Promise<void> = Promise.resolve();
+  #pendingAction: Promise<void> = Promise.resolve();
   #processGroup: number | undefined;
   #releaseAttempted = false;
   #stopRequested = false;
@@ -159,7 +159,7 @@ class SupervisorController implements SupervisedProcessTree {
   stop(): void {
     if (this.#stopRequested) return;
     this.#stopRequested = true;
-    this.#operation = sendSupervisorCommand(this.supervision, 'stop', 5_000).then(() => undefined).catch(async (error: unknown) => {
+    this.#pendingAction = sendSupervisorCommand(this.supervision, 'stop', 5_000).then(() => undefined).catch(async (error: unknown) => {
       // This is the exact child handle created by this controller, not a recovered PID.
       try { this.child.kill('SIGKILL'); } catch { /* The supervisor already exited. */ }
       try { await this.terminalState; } catch { throw error; }
@@ -167,7 +167,7 @@ class SupervisorController implements SupervisedProcessTree {
   }
 
   async settle(): Promise<void> {
-    await this.#operation;
+    await this.#pendingAction;
     await this.terminalState;
   }
 

@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
-import { InMemoryArtifactRepository } from '@agent-core/evidence';
-import { LocalArtifactRepository } from '@agent-core/evidence/node';
+import { InMemoryArtifactRepository } from '@agent-core/persistence';
+import { LocalArtifactRepository } from '@agent-core/persistence/node';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -77,7 +77,7 @@ test('artifact-storage failure leaves a bounded terminal observation with an exp
   assert.equal(record.durableObservation.metadata.durableObservation.storedAsArtifact, false);
 });
 
-test('observation projection invokes domain presenters independently for immediate and retained modes', async () => {
+test('observation assembly invokes domain presenters independently for immediate and retained modes', async () => {
   const calls = [];
   const modeTool = defineTool({
     name: 'mode_presenter', implementationId: 'tests/mode-presenter@1', description: 'mode presenter',

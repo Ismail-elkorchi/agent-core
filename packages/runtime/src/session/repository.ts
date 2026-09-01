@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { hashJson, PersistenceConflictError, validateArtifactRef } from '@agent-core/evidence';
+import { hashJson, PersistenceConflictError, validateArtifactRef } from '@agent-core/persistence';
 import { normalizeJsonSafe, type JsonObject, type JsonValue } from '@agent-core/json';
 import { createAgentTerminalSnapshot, terminalSnapshotFingerprint, type AgentEffectiveInstruction, type AgentTerminalSnapshot, type AgentToolCallAttemptIdentity, type AgentToolCallIdentity, type AgentTurnIdentity } from '../run/contracts.js';
 import type {
@@ -12,7 +12,7 @@ import type {
   SessionBranchPoint,
   SessionCompactionEntry,
   SessionConversationItem,
-  SessionFinalProjection,
+  SessionRunFinalization,
   SessionHeader,
   SessionInputEntry,
   SessionModelSettingsEntry,
@@ -49,7 +49,7 @@ export class InMemorySessionRepository implements SessionRepository {
         ...(options.parent ? { parentSessionId: options.parent.id } : {}),
         ...(options.provider ? { provider: options.provider } : {}), ...(options.model ? { model: options.model } : {})
       });
-      const state = { header, branchEntries: [], projections: [], submissionRecords: [] };
+      const state = { header, branchEntries: [], finalizations: [], submissionRecords: [] };
       this.states.set(id, state);
       return sessionFromState(state);
     });
@@ -80,12 +80,12 @@ export class InMemorySessionRepository implements SessionRepository {
       const tailStart = compactionIndex + 1;
       const tailRunIds = [...new Set(branch.slice(tailStart).flatMap((entry) => entry.type === 'input' ? [entry.runId] : []))];
       const branchIds = new Set(branch.slice(tailStart).map((entry) => entry.id));
-      const terminalProjections = Object.freeze(state.projections.filter((projection) => branchIds.has(projection.throughEntryId)));
-      const endedRunIds = new Set(terminalProjections.map((projection) => projection.runId));
+      const runFinalizations = Object.freeze(state.finalizations.filter((finalization) => branchIds.has(finalization.throughEntryId)));
+      const endedRunIds = new Set(runFinalizations.map((finalization) => finalization.runId));
       const openRunIds = tailRunIds.filter((runId) => !endedRunIds.has(runId));
-      const latestEndedRunId = terminalProjections.at(-1)?.runId;
+      const latestEndedRunId = runFinalizations.at(-1)?.runId;
       const ledgerRunIds = Object.freeze([...openRunIds, ...(latestEndedRunId ? [latestEndedRunId] : [])]);
-      return Object.freeze({ session: current, branch, terminalProjections, ...(compaction ? { compaction } : {}), ledgerRunIds });
+      return Object.freeze({ session: current, branch, runFinalizations, ...(compaction ? { compaction } : {}), ledgerRunIds });
     });
   }
 
@@ -97,9 +97,9 @@ export class InMemorySessionRepository implements SessionRepository {
   listBranchPoints(session: SessionDescriptor): Promise<readonly SessionBranchPoint[]> {
     return this.serial(() => {
       const state = this.requireDescriptor(session);
-      const points: SessionBranchPoint[] = state.projections.map((projection) => Object.freeze({
-        entryId: projection.throughEntryId, timestamp: projection.timestamp, kind: 'final' as const,
-        finalizationId: projection.finalizationId, runId: projection.runId
+      const points: SessionBranchPoint[] = state.finalizations.map((finalization) => Object.freeze({
+        entryId: finalization.throughEntryId, timestamp: finalization.timestamp, kind: 'run_finalization' as const,
+        finalizationId: finalization.finalizationId, runId: finalization.runId
       }));
       for (const entry of state.branchEntries) {
         if (entry.type === 'compaction') points.push(Object.freeze({ entryId: entry.id, timestamp: entry.timestamp, kind: 'compaction' }));
@@ -133,7 +133,7 @@ export class InMemorySessionRepository implements SessionRepository {
       const existing = state.branchEntries.find((entry): entry is SessionAssistantEntry => entry.type === 'assistant'
         && entry.runId === input.runId && entry.turnId === input.identity.turnId && entry.requestAttempt === input.identity.requestAttempt);
       if (existing) {
-        if (existing.turnIndex !== input.identity.turnIndex || existing.content !== input.content) throw new PersistenceConflictError(`Conflicting assistant projection for ${input.runId}/${input.identity.turnId}/${String(input.identity.requestAttempt)}.`);
+        if (existing.turnIndex !== input.identity.turnIndex || existing.content !== input.content) throw new PersistenceConflictError(`Conflicting assistant finalization for ${input.runId}/${input.identity.turnId}/${String(input.identity.requestAttempt)}.`);
         return existing;
       }
       const entry: SessionAssistantEntry = Object.freeze({
@@ -198,7 +198,7 @@ export class InMemorySessionRepository implements SessionRepository {
       const state = this.requireDescriptor(session);
       const source = state.branchEntries.find((entry) => entry.id === entryId);
       if (!source) throw new Error(`Unknown entry: ${entryId}`);
-      if (source.type !== 'compaction' && !state.projections.some((projection) => projection.throughEntryId === entryId)) {
+      if (source.type !== 'compaction' && !state.finalizations.some((finalization) => finalization.throughEntryId === entryId)) {
         throw new Error(`Session branches require a completed final or compaction entry: ${entryId}`);
       }
       const entry: SessionBranchMarkerEntry = Object.freeze({ ...baseEntry(entryId), type: 'branch', fromEntryId: entryId, ...(label ? { label } : {}) });
@@ -206,21 +206,21 @@ export class InMemorySessionRepository implements SessionRepository {
       return entry;
     });
   }
-  projectFinal(session: SessionDescriptor, terminalInput: AgentTerminalSnapshot): Promise<SessionFinalProjection> {
+  recordRunFinalization(session: SessionDescriptor, terminalInput: AgentTerminalSnapshot): Promise<SessionRunFinalization> {
     return this.serial(() => {
       const state = this.requireDescriptor(session); const terminal = createAgentTerminalSnapshot(terminalInput);
-      const existing = state.projections.find((projection) => projection.finalizationId === terminal.finalizationId);
+      const existing = state.finalizations.find((finalization) => finalization.finalizationId === terminal.finalizationId);
       if (existing) {
         if (terminalSnapshotFingerprint(existing.terminal) !== terminalSnapshotFingerprint(terminal)) throw new PersistenceConflictError(`Conflicting finalization ${terminal.finalizationId}.`);
         return existing;
       }
       const throughEntryId = branchLeaf(state.branchEntries);
       if (!throughEntryId || !activeBranch(state.branchEntries, throughEntryId).some((entry) => entry.type === 'input' && entry.runId === terminal.runId)) {
-        throw new Error(`Cannot project finalization ${terminal.finalizationId}: run ${terminal.runId} is not on the active session branch.`);
+        throw new Error(`Cannot record finalization ${terminal.finalizationId}: run ${terminal.runId} is not on the active session branch.`);
       }
-      const projection: SessionFinalProjection = Object.freeze({ type: 'final', id: randomUUID(), timestamp: new Date().toISOString(), throughEntryId, runId: terminal.runId, finalizationId: terminal.finalizationId, terminal });
-      state.projections.push(projection);
-      return projection;
+      const finalization: SessionRunFinalization = Object.freeze({ type: 'run_finalization', id: randomUUID(), timestamp: new Date().toISOString(), throughEntryId, runId: terminal.runId, finalizationId: terminal.finalizationId, terminal });
+      state.finalizations.push(finalization);
+      return finalization;
     });
   }
 
@@ -261,11 +261,11 @@ export class InMemorySessionRepository implements SessionRepository {
 }
 
 function sessionUpdatedAt(state: SessionState): string {
-  return [...state.branchEntries, ...state.projections, ...state.submissionRecords]
+  return [...state.branchEntries, ...state.finalizations, ...state.submissionRecords]
     .reduce((latest, entry) => entry.timestamp > latest ? entry.timestamp : latest, state.header.timestamp);
 }
 
-interface SessionState { readonly header: SessionHeader; readonly branchEntries: SessionBranchEntry[]; readonly projections: SessionFinalProjection[]; readonly submissionRecords: SessionSubmissionRecord[] }
+interface SessionState { readonly header: SessionHeader; readonly branchEntries: SessionBranchEntry[]; readonly finalizations: SessionRunFinalization[]; readonly submissionRecords: SessionSubmissionRecord[] }
 function activeBranch(entries: readonly SessionBranchEntry[], leafId: string | null): SessionBranchEntry[] {
   const byId = new Map(entries.map((entry) => [entry.id, entry])); const output: SessionBranchEntry[] = []; let cursor = leafId;
   while (cursor) { const entry = byId.get(cursor); if (!entry) throw new Error(`Session branch points to missing entry: ${cursor}`); output.push(entry); cursor = entry.parentId; }
@@ -313,7 +313,7 @@ function observationPayload(value: SessionObservationEntry): Omit<SessionObserva
 
 function assertStableBranch(state: SessionState): void {
   const branch = activeBranch(state.branchEntries, branchLeaf(state.branchEntries));
-  const completed = new Set(state.projections.map((projection) => projection.runId));
+  const completed = new Set(state.finalizations.map((finalization) => finalization.runId));
   if (branch.some((entry) => entry.type === 'input' && !completed.has(entry.runId))) {
     throw new Error('Session compaction requires every run on the active branch to be finalized.');
   }

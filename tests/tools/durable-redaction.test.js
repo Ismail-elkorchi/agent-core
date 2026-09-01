@@ -6,7 +6,7 @@ import path from 'node:path';
 import * as z from 'zod';
 import { AgentRuntime, agentEventCodec } from '@agent-core/runtime';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
-import { JsonlEventRepository, LocalArtifactRepository } from '@agent-core/evidence/node';
+import { JsonlEventRepository, LocalArtifactRepository } from '@agent-core/persistence/node';
 import { defineTool } from '@agent-core/tools';
 import { DEFAULT_LOCAL_TOOL_CONFIGURATION, LocalCommandExecution, execCommandTool } from '@agent-core/tools-local';
 import { testRootedFileAuthority } from '../rooted-file-authority-helper.js';

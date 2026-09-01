@@ -1,4 +1,4 @@
-import type { EvidenceResource } from '@agent-core/evidence';
+import type { ObservedResource } from '@agent-core/tools';
 import { validateResourceScope } from '@agent-core/tools';
 
 export const FILES_SCOPE = 'files';
@@ -7,7 +7,7 @@ export const PATCH_JOURNAL_SCOPE = 'files/internal/patch-journal';
 
 export function fileScope(relativePath = ''): string { return scoped(FILES_SCOPE, relativePath); }
 export function processScope(processId = ''): string { return scoped(PROCESSES_SCOPE, processId); }
-export function rootedFileResource(path: string, options: Omit<EvidenceResource, 'uri'> = {}): EvidenceResource {
+export function rootedFileResource(path: string, options: Omit<ObservedResource, 'uri'> = {}): ObservedResource {
   const clean = path.replaceAll('\\', '/').replace(/^\.?\/+/u, '').replace(/\/+$/u, '');
   return { uri: clean.length === 0 || clean === '.' ? 'rooted-file:///' : `rooted-file:///${clean}`, ...options };
 }

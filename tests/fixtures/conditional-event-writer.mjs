@@ -1,4 +1,4 @@
-import { JsonlEventRepository, typedEventCodec } from '@agent-core/evidence/node';
+import { JsonlEventRepository, typedEventCodec } from '@agent-core/persistence/node';
 
 const [rootDir, runId, key, expectedJson] = process.argv.slice(2);
 const repository = new JsonlEventRepository({ rootDir, codec: typedEventCodec, lockTimeoutMs: 5_000, staleLockMs: 10 });

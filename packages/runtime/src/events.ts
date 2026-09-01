@@ -1,5 +1,7 @@
-import type { ContextBundle, ContextHistoryReduction, PromptProjection } from './context/manager.js';
-import { decodeOwnedArtifactRef, decodeOwnedEvidenceRecord, encodeEvidenceRecord, type ArtifactRef, type EvidenceRecord, type RuntimeCodec } from '@agent-core/evidence';
+import type { ModelWindowReduction } from './inference/model-window.js';
+import type { PromptContextDelivery, PromptMaterial } from './inference/prompt-material.js';
+import { decodeOwnedArtifactRef, type ArtifactRef, type RuntimeCodec } from '@agent-core/persistence';
+import { decodeOwnedObservedFactRecord, encodeObservedFactRecord, type ObservedFactRecord } from '@agent-core/tools';
 import { parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
 import type {
   ModelCapabilities,
@@ -15,10 +17,10 @@ import type {
 import { decodeOwnedModelCapabilities, decodeOwnedModelLimits, decodeOwnedModelModalities, decodeOwnedModelResponseFormat, decodeOwnedModelTransport, parseModelReasoningRequest, parseModelResponse, parseModelUsage } from '@agent-core/model';
 import {
   decodeAgentRunBudgetState,
-  decodeOwnedAgentCandidate,
+  decodeOwnedAgentModelOutput,
   decodeOwnedAgentCheckResult,
   decodeOwnedAgentTerminalSnapshot,
-  type AgentCandidate,
+  type AgentModelOutput,
   type AgentApprovalBinding,
   type AgentCheckRequirement,
   type AgentEffectiveInstruction,
@@ -27,7 +29,7 @@ import {
   type AgentDeliveryDiagnostic,
   type AgentRunBudgetState,
   type AgentRunPhase,
-  type AgentRequestSnapshotRecord,
+  type InferenceRequestFingerprintRecord,
   type AgentTerminalSnapshot,
   type AgentToolCallIdentity,
   type AgentToolCallAttemptIdentity,
@@ -37,8 +39,8 @@ import {
 import { decodeOwnedToolCall, decodeOwnedToolEffects, decodeOwnedToolObservationForPersistence, decodeOwnedToolPolicy, encodeToolObservation, type ToolCall, type ToolEffects, type ToolObservation, type ToolObservationPresentation, type ToolPolicy, type ToolProgress } from '@agent-core/tools';
 import type { BudgetAccountantSnapshot, RequestCostEstimate } from './orchestration/budget-accountant.js';
 import type { OverflowRecoveryResult } from './orchestration/overflow-recovery.js';
-import { decodeAgentOperationState, type AgentOperationState } from './operation/contracts.js';
-import { parseAgentDispositionDecision, type AgentDispositionDecision } from './operation/disposition/contracts.js';
+import { decodeAgentRunState, type AgentRunState } from './run/control/contracts.js';
+import { parseAgentDispositionDecision, type AgentDispositionDecision } from './run/control/disposition/contracts.js';
 
 export interface AgentProviderStateSummary {
   readonly provider: string;
@@ -120,19 +122,19 @@ export interface AgentReplayPayload {
   readonly replayedSessionEntries: number;
   readonly replayedCheckpoints: number;
   readonly replayedToolResults: number;
-  readonly replayedEvidenceRecords: number;
+  readonly replayedObservedFactRecords: number;
   readonly restoredProviderState?: AgentProviderStateSummary;
   readonly restoredProviderStateRef?: ArtifactRef;
 }
 
 export type AgentEvent =
-  | { readonly type: 'operation.transition'; readonly state: AgentOperationState }
+  | { readonly type: 'run.state.changed'; readonly state: AgentRunState }
   | { readonly type: 'run.started'; readonly runId: string; readonly finalizationId: string; readonly task: string; readonly model: string; readonly toolPolicy: ToolPolicy; readonly metadata?: Readonly<Record<string, string>> }
   | { readonly type: 'run.phase.changed'; readonly runId: string; readonly phase: AgentRunPhase; readonly budget: AgentRunBudgetState }
   | { readonly type: 'run.configured'; readonly configuration: AgentRunConfiguration }
   | { readonly type: 'turn.snapshot.created'; readonly snapshot: AgentTurnSnapshotRecord }
-  | { readonly type: 'request.snapshot.created'; readonly snapshot: AgentRequestSnapshotRecord }
-  | { readonly type: 'finalization.prepared'; readonly terminal: AgentTerminalSnapshot }
+  | { readonly type: 'inference.request.fingerprinted'; readonly fingerprint: InferenceRequestFingerprintRecord }
+  | { readonly type: 'run.finalization.staged'; readonly terminal: AgentTerminalSnapshot }
   | { readonly type: 'run.ended'; readonly terminal: AgentTerminalSnapshot; readonly diagnostic?: ModelProviderErrorDiagnostic & { readonly turnIndex?: number } }
   | { readonly type: 'delivery.failed'; readonly finalizationId: string; readonly diagnostic: AgentDeliveryDiagnostic }
   | { readonly type: 'process.ended'; readonly runId: string; readonly processId: string; readonly status: string; readonly result: JsonValue }
@@ -141,11 +143,11 @@ export type AgentEvent =
   | { readonly type: 'provider.state.restored'; readonly state: AgentProviderStateSummary; readonly stateRef?: ArtifactRef }
   | ({ readonly type: 'provider.state.updated'; readonly state: AgentProviderStateSummary; readonly stateRef: ArtifactRef } & AgentTurnIdentity)
   | { readonly type: 'input.received'; readonly task: string }
-  | { readonly type: 'context.bundle.created'; readonly bundle: ContextBundle }
-  | { readonly type: 'prompt.projection.created'; readonly projection: PromptProjection }
+  | { readonly type: 'prompt.context.delivered'; readonly delivery: PromptContextDelivery }
+  | { readonly type: 'prompt.material.selected'; readonly material: PromptMaterial }
   | ({ readonly type: 'assistant.started' } & AgentTurnIdentity)
-  | ({ readonly type: 'assistant.ended'; readonly content: string; readonly candidate: AgentCandidate; readonly toolCalls?: readonly ToolCall[] } & AgentTurnIdentity)
-  | ({ readonly type: 'assistant.interrupted'; readonly content: string; readonly candidate: AgentCandidate; readonly reasoningSummary?: string; readonly finalResponseReceived: boolean; readonly diagnostic?: ModelProviderErrorDiagnostic } & AgentTurnIdentity)
+  | ({ readonly type: 'assistant.ended'; readonly content: string; readonly modelOutput: AgentModelOutput; readonly toolCalls?: readonly ToolCall[] } & AgentTurnIdentity)
+  | ({ readonly type: 'assistant.interrupted'; readonly content: string; readonly modelOutput: AgentModelOutput; readonly reasoningSummary?: string; readonly finalResponseReceived: boolean; readonly diagnostic?: ModelProviderErrorDiagnostic } & AgentTurnIdentity)
   | ({ readonly type: 'model.failed'; readonly diagnostic: ModelProviderErrorDiagnostic } & AgentTurnIdentity)
   | ({ readonly type: 'model.requested'; readonly request: AgentModelRequestSummary } & AgentTurnIdentity)
   | ({ readonly type: 'provider.attempt.settled'; readonly effectId: string; readonly responseId: string; readonly response: ModelResponse; readonly providerState?: AgentProviderStateReference } & AgentTurnIdentity)
@@ -154,10 +156,10 @@ export type AgentEvent =
   | ({ readonly type: 'budget.provider_usage.recorded'; readonly usage: ModelUsage; readonly snapshot: BudgetAccountantSnapshot } & AgentTurnIdentity)
   | ({ readonly type: 'overflow.recovery.started'; readonly attempt: number; readonly estimate: RequestCostEstimate; readonly snapshot: BudgetAccountantSnapshot } & AgentTurnIdentity)
   | ({ readonly type: 'overflow.recovery.ended'; readonly attempt: number; readonly result: OverflowRecoveryResult } & AgentTurnIdentity)
-  | ({ readonly type: 'context.history.reduced'; readonly reductions: readonly ContextHistoryReduction[] } & AgentTurnIdentity)
+  | ({ readonly type: 'context.history.reduced'; readonly reductions: readonly ModelWindowReduction[] } & AgentTurnIdentity)
   | ({ readonly type: 'context.checkpoint.created'; readonly compactedToolResults: number; readonly removedItems?: number; readonly beforeBytes?: number; readonly afterBytes?: number } & AgentTurnIdentity)
-  | ({ readonly type: 'observation.record.created'; readonly id: string; readonly toolName: string; readonly call: ToolCall; readonly toolCallType: 'function' | 'custom'; readonly evidence: readonly EvidenceRecord[]; readonly immediatePresentation: ToolObservationPresentation; readonly retainedPresentation: ToolObservationPresentation; readonly durableStorageDegraded?: { readonly message: string } } & AgentToolCallAttemptIdentity)
-  | ({ readonly type: 'observation.projection.failed'; readonly id: string; readonly toolName: string; readonly message: string } & AgentToolCallAttemptIdentity)
+  | ({ readonly type: 'observation.record.created'; readonly id: string; readonly toolName: string; readonly call: ToolCall; readonly toolCallType: 'function' | 'custom'; readonly observedFacts: readonly ObservedFactRecord[]; readonly immediatePresentation: ToolObservationPresentation; readonly retainedPresentation: ToolObservationPresentation; readonly durableStorageDegraded?: { readonly message: string } } & AgentToolCallAttemptIdentity)
+  | ({ readonly type: 'observation.recording.failed'; readonly id: string; readonly toolName: string; readonly message: string } & AgentToolCallAttemptIdentity)
   | ({ readonly type: 'tool.authorization.decided'; readonly toolName: string; readonly fingerprint: string; readonly binding: AgentApprovalBinding; readonly decision: 'allow' | 'deny' | 'require_approval'; readonly reason?: string } & AgentToolCallIdentity)
   | ({ readonly type: 'approval.requested'; readonly runId: string; readonly approvalId: string; readonly toolName: string; readonly fingerprint: string; readonly input: JsonValue; readonly effects: ToolEffects; readonly binding: AgentApprovalBinding; readonly policyHash: string; readonly reason: string } & AgentToolCallIdentity)
   | ({ readonly type: 'approval.resolved'; readonly runId: string; readonly approvalId: string; readonly fingerprint: string; readonly binding: AgentApprovalBinding; readonly decision: 'allow' | 'deny' } & AgentToolCallIdentity)
@@ -166,9 +168,9 @@ export type AgentEvent =
   | ({ readonly type: 'tool.ended'; readonly toolName: string; readonly observation: ToolObservation } & AgentToolCallAttemptIdentity)
   | ({ readonly type: 'check.started'; readonly check: string; readonly implementationId: string; readonly requirement: AgentCheckRequirement; readonly timeoutMs: number } & AgentTurnIdentity)
   | ({ readonly type: 'check.ended'; readonly check: string; readonly result: AgentCheckResult } & AgentTurnIdentity)
-  | ({ readonly type: 'candidate.disposition.decided'; readonly revisionCount: number; readonly implementationId: string; readonly policyHash: string; readonly inputDigest: string; readonly outputDigest: string; readonly decision: AgentDispositionDecision } & AgentTurnIdentity);
+  | ({ readonly type: 'run.disposition.decided'; readonly revisionCount: number; readonly implementationId: string; readonly policyHash: string; readonly inputDigest: string; readonly outputDigest: string; readonly decision: AgentDispositionDecision } & AgentTurnIdentity);
 
-export type AgentAuditEvent = Exclude<AgentEvent, { readonly type: 'operation.transition' }>;
+export type AgentAuditEvent = Exclude<AgentEvent, { readonly type: 'run.state.changed' }>;
 
 export type AgentProgressEvent =
   | ({ readonly type: 'turn.started'; readonly runId: string; readonly task: string; readonly sessionId?: string; readonly sessionEntryId?: string } & AgentTurnIdentity)
@@ -176,15 +178,15 @@ export type AgentProgressEvent =
   | { readonly type: 'provider.state.restored'; readonly state: AgentProviderStateSummary; readonly stateRef?: ArtifactRef }
   | { readonly type: 'run.configured'; readonly configuration: AgentRunConfiguration }
   | { readonly type: 'run.phase.changed'; readonly phase: AgentRunPhase; readonly budget: AgentRunBudgetState }
-  | ({ readonly type: 'context.history.reduced'; readonly reductions: readonly ContextHistoryReduction[] } & AgentTurnIdentity)
+  | ({ readonly type: 'context.history.reduced'; readonly reductions: readonly ModelWindowReduction[] } & AgentTurnIdentity)
   | ({ readonly type: 'context.checkpoint.created'; readonly compactedToolResults: number; readonly removedItems?: number; readonly beforeBytes?: number; readonly afterBytes?: number } & AgentTurnIdentity)
   | ({ readonly type: 'assistant.started' } & AgentTurnIdentity)
   | ({ readonly type: 'assistant.delta'; readonly delta: string; readonly accumulated: string } & AgentTurnIdentity)
   | ({ readonly type: 'assistant.reasoning'; readonly delta: string; readonly accumulated: string; readonly channel?: 'reasoning' | 'summary' } & AgentTurnIdentity)
   | ({ readonly type: 'assistant.status'; readonly message: string } & AgentTurnIdentity)
   | ({ readonly type: 'tool.call.received'; readonly toolCall: ToolCall } & AgentToolCallIdentity)
-  | ({ readonly type: 'assistant.ended'; readonly content: string; readonly candidate: AgentCandidate; readonly toolCalls?: readonly ToolCall[] } & AgentTurnIdentity)
-  | ({ readonly type: 'assistant.interrupted'; readonly content: string; readonly candidate: AgentCandidate; readonly reasoningSummary?: string; readonly finalResponseReceived: boolean; readonly diagnostic?: ModelProviderErrorDiagnostic } & AgentTurnIdentity)
+  | ({ readonly type: 'assistant.ended'; readonly content: string; readonly modelOutput: AgentModelOutput; readonly toolCalls?: readonly ToolCall[] } & AgentTurnIdentity)
+  | ({ readonly type: 'assistant.interrupted'; readonly content: string; readonly modelOutput: AgentModelOutput; readonly reasoningSummary?: string; readonly finalResponseReceived: boolean; readonly diagnostic?: ModelProviderErrorDiagnostic } & AgentTurnIdentity)
   | ({ readonly type: 'model.failed'; readonly diagnostic: ModelProviderErrorDiagnostic } & AgentTurnIdentity)
   | ({ readonly type: 'tool.started'; readonly toolName: string; readonly input: ToolCall; readonly fingerprint: string; readonly effects: ToolEffects } & AgentToolCallAttemptIdentity)
   | ({ readonly type: 'tool.updated'; readonly toolName: string; readonly progress: ToolProgress } & AgentToolCallAttemptIdentity)
@@ -204,7 +206,7 @@ const AGENT_EVENT_MAX_COLLECTION_ENTRIES = 20_000;
 
 export function encodeAgentEvent(value: AgentEvent): JsonObject {
   const encoded = value.type === 'observation.record.created'
-    ? { ...value, evidence: Object.freeze(value.evidence.map(encodeEvidenceRecord)) }
+    ? { ...value, observedFacts: Object.freeze(value.observedFacts.map(encodeObservedFactRecord)) }
     : value.type === 'tool.ended'
       ? { ...value, observation: encodeToolObservation(value.observation) }
       : value;
@@ -244,9 +246,9 @@ type AgentEventOf<Type extends AgentEvent['type']> = Extract<AgentEvent, { reado
 type AgentEventDecoderMap = { readonly [Type in AgentEvent['type']]: (value: JsonObject) => AgentEventOf<Type> };
 
 const AGENT_EVENT_DECODERS = {
-  'operation.transition': (value) => {
+  'run.state.changed': (value) => {
     exact(value, ['type', 'state']);
-    return Object.freeze({ type: 'operation.transition', state: decodeAgentOperationState(requiredObject(value.state, 'state')) });
+    return Object.freeze({ type: 'run.state.changed', state: decodeAgentRunState(requiredObject(value.state, 'state')) });
   },
   'run.started': (value) => {
     exact(value, ['type', 'runId', 'finalizationId', 'task', 'model', 'toolPolicy', 'metadata']);
@@ -269,13 +271,13 @@ const AGENT_EVENT_DECODERS = {
     exact(value, ['type', 'snapshot']);
     return Object.freeze({ type: 'turn.snapshot.created', snapshot: decodeTurnSnapshot(value.snapshot) });
   },
-  'request.snapshot.created': (value) => {
-    exact(value, ['type', 'snapshot']);
-    return Object.freeze({ type: 'request.snapshot.created', snapshot: decodeRequestSnapshot(value.snapshot) });
+  'inference.request.fingerprinted': (value) => {
+    exact(value, ['type', 'fingerprint']);
+    return Object.freeze({ type: 'inference.request.fingerprinted', fingerprint: decodeInferenceRequestFingerprint(value.fingerprint) });
   },
-  'finalization.prepared': (value) => {
+  'run.finalization.staged': (value) => {
     exact(value, ['type', 'terminal']);
-    return Object.freeze({ type: 'finalization.prepared', terminal: decodeOwnedAgentTerminalSnapshot(requiredObject(value.terminal, 'terminal')) });
+    return Object.freeze({ type: 'run.finalization.staged', terminal: decodeOwnedAgentTerminalSnapshot(requiredObject(value.terminal, 'terminal')) });
   },
   'run.ended': (value) => {
     exact(value, ['type', 'terminal', 'diagnostic']);
@@ -313,34 +315,34 @@ const AGENT_EVENT_DECODERS = {
     exact(value, ['type', 'task']);
     return Object.freeze({ type: 'input.received', task: requiredString(value.task, 'task') });
   },
-  'context.bundle.created': (value) => {
-    exact(value, ['type', 'bundle']);
-    return Object.freeze({ type: 'context.bundle.created', bundle: decodeContextBundle(value.bundle) });
+  'prompt.context.delivered': (value) => {
+    exact(value, ['type', 'delivery']);
+    return Object.freeze({ type: 'prompt.context.delivered', delivery: decodePromptContextDelivery(value.delivery) });
   },
-  'prompt.projection.created': (value) => {
-    exact(value, ['type', 'projection']);
-    return Object.freeze({ type: 'prompt.projection.created', projection: decodePromptProjection(value.projection) });
+  'prompt.material.selected': (value) => {
+    exact(value, ['type', 'material']);
+    return Object.freeze({ type: 'prompt.material.selected', material: decodePromptMaterial(value.material) });
   },
   'assistant.started': (value) => {
     exact(value, ['type', ...TURN_KEYS]);
     return Object.freeze({ type: 'assistant.started', ...decodeTurnIdentity(value) });
   },
   'assistant.ended': (value) => {
-    exact(value, ['type', ...TURN_KEYS, 'content', 'candidate', 'toolCalls']);
+    exact(value, ['type', ...TURN_KEYS, 'content', 'modelOutput', 'toolCalls']);
     const identity = decodeTurnIdentity(value);
-    const candidate = decodeOwnedAgentCandidate(requiredObject(value.candidate, 'candidate'));
-    if (candidate.status !== 'absent' && candidate.turnIndex !== identity.turnIndex) throw malformed('candidate turnIndex does not match event turnIndex');
+    const modelOutput = decodeOwnedAgentModelOutput(requiredObject(value.modelOutput, 'modelOutput'));
+    if (modelOutput.status !== 'absent' && modelOutput.turnIndex !== identity.turnIndex) throw malformed('modelOutput turnIndex does not match event turnIndex');
     const toolCalls = optionalArray(value.toolCalls, 'toolCalls')?.map((call, index) => decodeOwnedToolCall(requiredObject(call, `toolCalls[${String(index)}]`)));
-    return Object.freeze({ type: 'assistant.ended', ...identity, content: requiredStringValue(value.content, 'content'), candidate, ...(toolCalls ? { toolCalls: Object.freeze(toolCalls) } : {}) });
+    return Object.freeze({ type: 'assistant.ended', ...identity, content: requiredStringValue(value.content, 'content'), modelOutput, ...(toolCalls ? { toolCalls: Object.freeze(toolCalls) } : {}) });
   },
   'assistant.interrupted': (value) => {
-    exact(value, ['type', ...TURN_KEYS, 'content', 'candidate', 'reasoningSummary', 'finalResponseReceived', 'diagnostic']);
+    exact(value, ['type', ...TURN_KEYS, 'content', 'modelOutput', 'reasoningSummary', 'finalResponseReceived', 'diagnostic']);
     const identity = decodeTurnIdentity(value);
-    const candidate = decodeOwnedAgentCandidate(requiredObject(value.candidate, 'candidate'));
-    if (candidate.status !== 'absent' && candidate.turnIndex !== identity.turnIndex) throw malformed('candidate turnIndex does not match event turnIndex');
+    const modelOutput = decodeOwnedAgentModelOutput(requiredObject(value.modelOutput, 'modelOutput'));
+    if (modelOutput.status !== 'absent' && modelOutput.turnIndex !== identity.turnIndex) throw malformed('modelOutput turnIndex does not match event turnIndex');
     const reasoningSummary = optionalStringValue(value.reasoningSummary, 'reasoningSummary');
     const diagnostic = optionalDiagnostic(value.diagnostic);
-    return Object.freeze({ type: 'assistant.interrupted', ...identity, content: requiredStringValue(value.content, 'content'), candidate, ...(reasoningSummary !== undefined ? { reasoningSummary } : {}), finalResponseReceived: requiredBoolean(value.finalResponseReceived, 'finalResponseReceived'), ...(diagnostic ? { diagnostic } : {}) });
+    return Object.freeze({ type: 'assistant.interrupted', ...identity, content: requiredStringValue(value.content, 'content'), modelOutput, ...(reasoningSummary !== undefined ? { reasoningSummary } : {}), finalResponseReceived: requiredBoolean(value.finalResponseReceived, 'finalResponseReceived'), ...(diagnostic ? { diagnostic } : {}) });
   },
   'model.failed': (value) => {
     exact(value, ['type', ...TURN_KEYS, 'diagnostic']);
@@ -389,19 +391,19 @@ const AGENT_EVENT_DECODERS = {
     return Object.freeze({ type: 'context.checkpoint.created', ...decodeTurnIdentity(value), compactedToolResults: nonnegativeInteger(value.compactedToolResults, 'compactedToolResults'), ...optionalNonnegativeFields(value, ['removedItems', 'beforeBytes', 'afterBytes']) });
   },
   'observation.record.created': (value) => {
-    exact(value, ['type', ...TOOL_ATTEMPT_KEYS, 'id', 'toolName', 'call', 'toolCallType', 'evidence', 'immediatePresentation', 'retainedPresentation', 'durableStorageDegraded']);
+    exact(value, ['type', ...TOOL_ATTEMPT_KEYS, 'id', 'toolName', 'call', 'toolCallType', 'observedFacts', 'immediatePresentation', 'retainedPresentation', 'durableStorageDegraded']);
     const degraded = value.durableStorageDegraded === undefined ? undefined : decodeMessageRecord(value.durableStorageDegraded, 'durableStorageDegraded');
-    const evidence = Object.freeze(requiredArray(value.evidence, 'evidence').map((item, index) => decodeOwnedEvidenceRecord(requiredObject(item, `evidence[${String(index)}]`))));
+    const observedFacts = Object.freeze(requiredArray(value.observedFacts, 'observedFacts').map((item, index) => decodeOwnedObservedFactRecord(requiredObject(item, `observedFacts[${String(index)}]`))));
     return Object.freeze({
       type: 'observation.record.created', ...decodeToolAttemptIdentity(value), id: requiredString(value.id, 'id'), toolName: requiredString(value.toolName, 'toolName'),
-      call: decodeOwnedToolCall(requiredObject(value.call, 'call')), toolCallType: requiredEnum(value.toolCallType, TOOL_CALL_TYPES, 'toolCallType'), evidence,
+      call: decodeOwnedToolCall(requiredObject(value.call, 'call')), toolCallType: requiredEnum(value.toolCallType, TOOL_CALL_TYPES, 'toolCallType'), observedFacts,
       immediatePresentation: decodePresentation(value.immediatePresentation, 'immediatePresentation'), retainedPresentation: decodePresentation(value.retainedPresentation, 'retainedPresentation'),
       ...(degraded ? { durableStorageDegraded: degraded } : {})
     });
   },
-  'observation.projection.failed': (value) => {
+  'observation.recording.failed': (value) => {
     exact(value, ['type', ...TOOL_ATTEMPT_KEYS, 'id', 'toolName', 'message']);
-    return Object.freeze({ type: 'observation.projection.failed', ...decodeToolAttemptIdentity(value), id: requiredString(value.id, 'id'), toolName: requiredString(value.toolName, 'toolName'), message: requiredStringValue(value.message, 'message') });
+    return Object.freeze({ type: 'observation.recording.failed', ...decodeToolAttemptIdentity(value), id: requiredString(value.id, 'id'), toolName: requiredString(value.toolName, 'toolName'), message: requiredStringValue(value.message, 'message') });
   },
   'tool.authorization.decided': (value) => {
     exact(value, ['type', ...TOOL_CALL_KEYS, 'toolName', 'fingerprint', 'binding', 'decision', 'reason']);
@@ -443,10 +445,10 @@ const AGENT_EVENT_DECODERS = {
     if (result.id !== check) throw malformed('check id does not match result id');
     return Object.freeze({ type: 'check.ended', ...decodeTurnIdentity(value), check, result });
   },
-  'candidate.disposition.decided': (value) => {
+  'run.disposition.decided': (value) => {
     exact(value, ['type', ...TURN_KEYS, 'revisionCount', 'implementationId', 'policyHash', 'inputDigest', 'outputDigest', 'decision']);
     return Object.freeze({
-      type: 'candidate.disposition.decided', ...decodeTurnIdentity(value),
+      type: 'run.disposition.decided', ...decodeTurnIdentity(value),
       revisionCount: nonnegativeInteger(value.revisionCount, 'revisionCount'),
       implementationId: requiredString(value.implementationId, 'implementationId'),
       policyHash: requiredDigest(value.policyHash, 'policyHash'),
@@ -461,8 +463,8 @@ const AGENT_EVENT_TYPES = Object.freeze(Object.keys(AGENT_EVENT_DECODERS)) as re
 const TURN_KEYS = ['turnIndex', 'turnId', 'requestAttempt'] as const;
 const TOOL_CALL_KEYS = [...TURN_KEYS, 'toolBatchId', 'callIndex', 'callId'] as const;
 const TOOL_ATTEMPT_KEYS = [...TOOL_CALL_KEYS, 'toolAttempt'] as const;
-const REPLAY_KEYS = ['sessionId', 'replayedLedgers', 'replayedTurns', 'replayedSessionEntries', 'replayedCheckpoints', 'replayedToolResults', 'replayedEvidenceRecords', 'restoredProviderState', 'restoredProviderStateRef'] as const;
-const RUN_PHASES = ['preparing', 'requesting_model', 'executing_tools', 'waiting_for_approval', 'verifying', 'deciding', 'finalizing', 'ended'] as const;
+const REPLAY_KEYS = ['sessionId', 'replayedLedgers', 'replayedTurns', 'replayedSessionEntries', 'replayedCheckpoints', 'replayedToolResults', 'replayedObservedFactRecords', 'restoredProviderState', 'restoredProviderStateRef'] as const;
+const RUN_PHASES = ['initializing', 'requesting_model', 'executing_tools', 'waiting_for_approval', 'verifying', 'deciding', 'finalizing', 'ended'] as const;
 const TOOL_CALL_TYPES = ['function', 'custom'] as const;
 const AUTHORIZATION_DECISIONS = ['allow', 'deny', 'require_approval'] as const;
 const APPROVAL_DECISIONS = ['allow', 'deny'] as const;
@@ -489,7 +491,7 @@ function decodeReplayPayload(value: JsonObject): AgentReplayPayload {
     sessionId: requiredString(value.sessionId, 'sessionId'), replayedLedgers: nonnegativeInteger(value.replayedLedgers, 'replayedLedgers'),
     replayedTurns: nonnegativeInteger(value.replayedTurns, 'replayedTurns'), replayedSessionEntries: nonnegativeInteger(value.replayedSessionEntries, 'replayedSessionEntries'),
     replayedCheckpoints: nonnegativeInteger(value.replayedCheckpoints, 'replayedCheckpoints'), replayedToolResults: nonnegativeInteger(value.replayedToolResults, 'replayedToolResults'),
-    replayedEvidenceRecords: nonnegativeInteger(value.replayedEvidenceRecords, 'replayedEvidenceRecords'),
+    replayedObservedFactRecords: nonnegativeInteger(value.replayedObservedFactRecords, 'replayedObservedFactRecords'),
     ...(restoredProviderState ? { restoredProviderState } : {}), ...(restoredProviderStateRef ? { restoredProviderStateRef } : {})
   });
 }
@@ -571,12 +573,12 @@ function decodeCheckBindings(value: JsonValue | undefined): readonly { readonly 
 }
  function decodeRunLimits(value: JsonValue | undefined): AgentRunLimits {
   const object = requiredObject(value, 'limits');
-  exact(object, ['maxConcurrentToolCalls', 'modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'candidateRevisions', 'elapsedMs', 'promptTokens', 'completionTokens', 'activeImageCount', 'activeImageBytes', 'activeImageTokens', 'knownCost', 'consecutiveProviderFailures', 'consecutiveToolFailures']);
+  exact(object, ['maxConcurrentToolCalls', 'modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'revisionAttempts', 'elapsedMs', 'promptTokens', 'completionTokens', 'activeImageCount', 'activeImageBytes', 'activeImageTokens', 'knownCost', 'consecutiveProviderFailures', 'consecutiveToolFailures']);
   const knownCost = requiredObject(object.knownCost, 'limits.knownCost');
   exact(knownCost, ['amount', 'currency']);
   return Object.freeze({
     maxConcurrentToolCalls: positiveInteger(object.maxConcurrentToolCalls, 'limits.maxConcurrentToolCalls'), modelTurns: positiveInteger(object.modelTurns, 'limits.modelTurns'),
-    totalToolCalls: positiveInteger(object.totalToolCalls, 'limits.totalToolCalls'), repeatedIdenticalToolCalls: positiveInteger(object.repeatedIdenticalToolCalls, 'limits.repeatedIdenticalToolCalls'), candidateRevisions: nonnegativeInteger(object.candidateRevisions, 'limits.candidateRevisions'),
+    totalToolCalls: positiveInteger(object.totalToolCalls, 'limits.totalToolCalls'), repeatedIdenticalToolCalls: positiveInteger(object.repeatedIdenticalToolCalls, 'limits.repeatedIdenticalToolCalls'), revisionAttempts: nonnegativeInteger(object.revisionAttempts, 'limits.revisionAttempts'),
     elapsedMs: positiveInteger(object.elapsedMs, 'limits.elapsedMs'), promptTokens: positiveInteger(object.promptTokens, 'limits.promptTokens'),
     completionTokens: positiveInteger(object.completionTokens, 'limits.completionTokens'), activeImageCount: positiveInteger(object.activeImageCount, 'limits.activeImageCount'),
     activeImageBytes: positiveInteger(object.activeImageBytes, 'limits.activeImageBytes'), activeImageTokens: positiveInteger(object.activeImageTokens, 'limits.activeImageTokens'),
@@ -584,15 +586,15 @@ function decodeCheckBindings(value: JsonValue | undefined): readonly { readonly 
     consecutiveProviderFailures: positiveInteger(object.consecutiveProviderFailures, 'limits.consecutiveProviderFailures'), consecutiveToolFailures: positiveInteger(object.consecutiveToolFailures, 'limits.consecutiveToolFailures')
   });
 }
-function decodeRequestSnapshot(value: JsonValue | undefined): AgentRequestSnapshotRecord {
-  const object = requiredObject(value, 'snapshot');
-  exact(object, [...TURN_KEYS, 'requestId', 'configuredContextIds', 'providerContextIds', 'runContextIds', 'effectiveInstructionHash', 'selectedEvidenceHash', 'retainedHistoryHash', 'modelToolSchemasHash', 'compiledPromptHash', 'reductions']);
+function decodeInferenceRequestFingerprint(value: JsonValue | undefined): InferenceRequestFingerprintRecord {
+  const object = requiredObject(value, 'request fingerprint');
+  exact(object, [...TURN_KEYS, 'requestId', 'configuredContextIds', 'providerContextIds', 'runContextIds', 'effectiveInstructionHash', 'selectedFactsHash', 'modelWindowHistoryHash', 'modelToolSchemasHash', 'modelWindowHash', 'reductions']);
   return Object.freeze({
-    ...decodeTurnIdentity(object), requestId: requiredString(object.requestId, 'snapshot.requestId'), configuredContextIds: stringArray(object.configuredContextIds, 'snapshot.configuredContextIds'),
-    providerContextIds: stringArray(object.providerContextIds, 'snapshot.providerContextIds'), runContextIds: stringArray(object.runContextIds, 'snapshot.runContextIds'),
-    effectiveInstructionHash: requiredString(object.effectiveInstructionHash, 'snapshot.effectiveInstructionHash'), selectedEvidenceHash: requiredString(object.selectedEvidenceHash, 'snapshot.selectedEvidenceHash'),
-    retainedHistoryHash: requiredString(object.retainedHistoryHash, 'snapshot.retainedHistoryHash'), modelToolSchemasHash: requiredString(object.modelToolSchemasHash, 'snapshot.modelToolSchemasHash'),
-    compiledPromptHash: requiredString(object.compiledPromptHash, 'snapshot.compiledPromptHash'),
+    ...decodeTurnIdentity(object), requestId: requiredString(object.requestId, 'fingerprint.requestId'), configuredContextIds: stringArray(object.configuredContextIds, 'fingerprint.configuredContextIds'),
+    providerContextIds: stringArray(object.providerContextIds, 'fingerprint.providerContextIds'), runContextIds: stringArray(object.runContextIds, 'fingerprint.runContextIds'),
+    effectiveInstructionHash: requiredString(object.effectiveInstructionHash, 'fingerprint.effectiveInstructionHash'), selectedFactsHash: requiredString(object.selectedFactsHash, 'fingerprint.selectedFactsHash'),
+    modelWindowHistoryHash: requiredString(object.modelWindowHistoryHash, 'fingerprint.modelWindowHistoryHash'), modelToolSchemasHash: requiredString(object.modelToolSchemasHash, 'fingerprint.modelToolSchemasHash'),
+    modelWindowHash: requiredString(object.modelWindowHash, 'fingerprint.modelWindowHash'),
     reductions: Object.freeze(requiredArray(object.reductions, 'snapshot.reductions').map((item, index) => {
       const reduction = requiredObject(item, `snapshot.reductions[${String(index)}]`);
       exact(reduction, ['kind', 'reason', 'sequence']);
@@ -643,10 +645,10 @@ function decodeModelResponseSummary(value: JsonValue | undefined): AgentModelRes
 }
   function decodeRequestCostEstimate(value: JsonValue | undefined): RequestCostEstimate {
   const object = requiredObject(value, 'estimate');
-  exact(object, ['messageTokens', 'contextHistoryTokens', 'contextTokens', 'evidenceTokens', 'toolSchemaTokens', 'outputReserveTokens', 'totalPromptTokens', 'totalRequestTokens', 'warnings']);
+  exact(object, ['messageTokens', 'modelWindowTokens', 'contextTokens', 'observedFactTokens', 'toolSchemaTokens', 'outputReserveTokens', 'totalPromptTokens', 'totalRequestTokens', 'warnings']);
   return Object.freeze({
-    messageTokens: nonnegativeInteger(object.messageTokens, 'estimate.messageTokens'), contextHistoryTokens: nonnegativeInteger(object.contextHistoryTokens, 'estimate.contextHistoryTokens'),
-    contextTokens: nonnegativeInteger(object.contextTokens, 'estimate.contextTokens'), evidenceTokens: nonnegativeInteger(object.evidenceTokens, 'estimate.evidenceTokens'),
+    messageTokens: nonnegativeInteger(object.messageTokens, 'estimate.messageTokens'), modelWindowTokens: nonnegativeInteger(object.modelWindowTokens, 'estimate.modelWindowTokens'),
+    contextTokens: nonnegativeInteger(object.contextTokens, 'estimate.contextTokens'), observedFactTokens: nonnegativeInteger(object.observedFactTokens, 'estimate.observedFactTokens'),
     toolSchemaTokens: nonnegativeInteger(object.toolSchemaTokens, 'estimate.toolSchemaTokens'), outputReserveTokens: nonnegativeInteger(object.outputReserveTokens, 'estimate.outputReserveTokens'),
     totalPromptTokens: nonnegativeInteger(object.totalPromptTokens, 'estimate.totalPromptTokens'), totalRequestTokens: nonnegativeInteger(object.totalRequestTokens, 'estimate.totalRequestTokens'), warnings: stringArray(object.warnings, 'estimate.warnings')
   });
@@ -683,25 +685,24 @@ function decodeOverflowResult(value: JsonValue | undefined): OverflowRecoveryRes
 function decodeOverflowAction(value: JsonValue | undefined, path: string): Extract<OverflowRecoveryResult, { kind: 'retry' }>['action'] {
   const object = requiredObject(value, path);
   if (object.kind === 'reduce_context_history') { exact(object, ['kind', 'reductions']); return Object.freeze({ kind: object.kind, reductions: positiveInteger(object.reductions, `${path}.reductions`) }); }
-  if (object.kind === 'reduce_context') { exact(object, ['kind', 'removedItems']); return Object.freeze({ kind: object.kind, removedItems: positiveInteger(object.removedItems, `${path}.removedItems`) }); }
-  if (object.kind === 'reduce_evidence') { exact(object, ['kind', 'removedRecords']); return Object.freeze({ kind: object.kind, removedRecords: positiveInteger(object.removedRecords, `${path}.removedRecords`) }); }
+  if (object.kind === 'reduce_observed_facts') { exact(object, ['kind', 'removedRecords']); return Object.freeze({ kind: object.kind, removedRecords: positiveInteger(object.removedRecords, `${path}.removedRecords`) }); }
   if (object.kind === 'install_checkpoint') { exact(object, ['kind', 'compactedToolResults']); return Object.freeze({ kind: object.kind, compactedToolResults: positiveInteger(object.compactedToolResults, `${path}.compactedToolResults`) }); }
   if (object.kind === 'diagnostic_failure') { exact(object, ['kind', 'diagnostic']); return Object.freeze({ kind: object.kind, diagnostic: decodeOverflowDiagnostic(object.diagnostic) }); }
   throw malformed(`${path}.kind is invalid`);
 }
 function decodeOverflowDiagnostic(value: JsonValue | undefined): Extract<OverflowRecoveryResult, { kind: 'diagnostic' }>['diagnostic'] {
   const object = requiredObject(value, 'overflow diagnostic');
-  exact(object, ['reason', 'messageTokens', 'contextHistoryTokens', 'contextTokens', 'evidenceTokens', 'toolSchemaTokens', 'outputReserveTokens', 'totalRequestTokens', 'reductionsAttempted']);
+  exact(object, ['reason', 'messageTokens', 'modelWindowTokens', 'contextTokens', 'observedFactTokens', 'toolSchemaTokens', 'outputReserveTokens', 'totalRequestTokens', 'reductionsAttempted']);
   return Object.freeze({
     reason: requiredEnum(object.reason, ['model_context_window', 'tool_schema_cost'] as const, 'diagnostic.reason'),
-    messageTokens: nonnegativeInteger(object.messageTokens, 'diagnostic.messageTokens'), contextHistoryTokens: nonnegativeInteger(object.contextHistoryTokens, 'diagnostic.contextHistoryTokens'),
-    contextTokens: nonnegativeInteger(object.contextTokens, 'diagnostic.contextTokens'), evidenceTokens: nonnegativeInteger(object.evidenceTokens, 'diagnostic.evidenceTokens'),
+    messageTokens: nonnegativeInteger(object.messageTokens, 'diagnostic.messageTokens'), modelWindowTokens: nonnegativeInteger(object.modelWindowTokens, 'diagnostic.modelWindowTokens'),
+    contextTokens: nonnegativeInteger(object.contextTokens, 'diagnostic.contextTokens'), observedFactTokens: nonnegativeInteger(object.observedFactTokens, 'diagnostic.observedFactTokens'),
     toolSchemaTokens: nonnegativeInteger(object.toolSchemaTokens, 'diagnostic.toolSchemaTokens'), outputReserveTokens: nonnegativeInteger(object.outputReserveTokens, 'diagnostic.outputReserveTokens'),
     totalRequestTokens: nonnegativeInteger(object.totalRequestTokens, 'diagnostic.totalRequestTokens'),
     reductionsAttempted: Object.freeze(requiredArray(object.reductionsAttempted, 'diagnostic.reductionsAttempted').map((item, index) => decodeOverflowAction(item, `diagnostic.reductionsAttempted[${String(index)}]`)))
   });
 }
-function decodeHistoryReduction(value: JsonValue, path: string): ContextHistoryReduction {
+function decodeHistoryReduction(value: JsonValue, path: string): ModelWindowReduction {
   const object = requiredObject(value, path);
   exact(object, ['itemId', 'kind', 'beforeBytes', 'afterBytes', 'toolName', 'removedItems', 'removedImageBytes', 'removedImageTokens', 'reason']);
   const toolName = optionalStringValue(object.toolName, `${path}.toolName`);
@@ -712,31 +713,25 @@ function decodeHistoryReduction(value: JsonValue, path: string): ContextHistoryR
     ...(toolName !== undefined ? { toolName } : {}), ...optionalNonnegativeFields(object, ['removedItems', 'removedImageBytes', 'removedImageTokens']), ...(reason ? { reason } : {})
   });
 }
-function decodeContextBundle(value: JsonValue | undefined): ContextBundle {
-  const object = requiredObject(value, 'bundle');
-  exact(object, ['items', 'totalTokens', 'omitted']);
+function decodePromptContextDelivery(value: JsonValue | undefined): PromptContextDelivery {
+  const object = requiredObject(value, 'prompt context delivery');
+  exact(object, ['items', 'totalTokens']);
   return Object.freeze({
-    items: requiredArray(object.items, 'bundle.items').map((item, index) => decodeContextItem(item, `bundle.items[${String(index)}]`)),
-    totalTokens: nonnegativeInteger(object.totalTokens, 'bundle.totalTokens'),
-    omitted: requiredArray(object.omitted, 'bundle.omitted').map((item, index) => {
-      const omission = requiredObject(item, `bundle.omitted[${String(index)}]`);
-      exact(omission, ['reason', 'sourceUri']);
-      const sourceUri = optionalStringValue(omission.sourceUri, 'omission.sourceUri');
-      return Object.freeze({ reason: requiredStringValue(omission.reason, 'omission.reason'), ...(sourceUri !== undefined ? { sourceUri } : {}) });
-    })
+    items: requiredArray(object.items, 'delivery.items').map((item, index) => decodePromptContextItem(item, `delivery.items[${String(index)}]`)),
+    totalTokens: nonnegativeInteger(object.totalTokens, 'delivery.totalTokens')
   });
 }
-function decodeContextItem(value: JsonValue, path: string): ContextBundle['items'][number] {
+function decodePromptContextItem(value: JsonValue, path: string): PromptContextDelivery['items'][number] {
   const object = requiredObject(value, path);
-  exact(object, ['id', 'sourceUri', 'sourceKind', 'confidence', 'representation', 'mediaType', 'title', 'content', 'range', 'tokenEstimate', 'selectionReason', 'score']);
-  const confidence = object.confidence === undefined ? undefined : requiredEnum(object.confidence, ['unverified', 'verified'] as const, `${path}.confidence`);
+  exact(object, ['id', 'sourceUri', 'sourceKind', 'integrity', 'representation', 'mediaType', 'title', 'content', 'range', 'tokenEstimate', 'purpose']);
+  const integrity = object.integrity === undefined ? undefined : requiredEnum(object.integrity, ['unverified', 'verified'] as const, `${path}.integrity`);
   const range = object.range === undefined ? undefined : decodeRange(object.range, `${path}.range`);
   return Object.freeze({
     id: requiredString(object.id, `${path}.id`), sourceUri: requiredString(object.sourceUri, `${path}.sourceUri`),
     sourceKind: requiredEnum(object.sourceKind, ['user', 'external', 'session', 'tool-observation', 'generated'] as const, `${path}.sourceKind`),
-    ...(confidence ? { confidence } : {}), representation: requiredEnum(object.representation, ['full', 'excerpt', 'summary'] as const, `${path}.representation`),
+    ...(integrity ? { integrity } : {}), representation: requiredEnum(object.representation, ['full', 'excerpt', 'summary'] as const, `${path}.representation`),
     mediaType: requiredString(object.mediaType, `${path}.mediaType`), title: requiredStringValue(object.title, `${path}.title`), content: requiredStringValue(object.content, `${path}.content`),
-    ...(range ? { range } : {}), tokenEstimate: nonnegativeInteger(object.tokenEstimate, `${path}.tokenEstimate`), selectionReason: requiredStringValue(object.selectionReason, `${path}.selectionReason`), score: finiteNumber(object.score, `${path}.score`)
+    ...(range ? { range } : {}), tokenEstimate: nonnegativeInteger(object.tokenEstimate, `${path}.tokenEstimate`), purpose: requiredStringValue(object.purpose, `${path}.purpose`)
   });
 }
 function decodeRange(value: JsonValue, path: string): { kind: 'line' | 'byte'; start?: number; end?: number } {
@@ -746,51 +741,51 @@ function decodeRange(value: JsonValue, path: string): { kind: 'line' | 'byte'; s
   const end = optionalNonnegativeNumber(object.end, `${path}.end`);
   return Object.freeze({ kind: requiredEnum(object.kind, ['line', 'byte'] as const, `${path}.kind`), ...(start !== undefined ? { start } : {}), ...(end !== undefined ? { end } : {}) });
 }
-function decodePromptProjection(value: JsonValue | undefined): PromptProjection {
-  const object = requiredObject(value, 'projection');
-  exact(object, ['id', 'task', 'instructions', 'notes', 'context', 'tools', 'continuity', 'evidence', 'outputContract', 'metadata']);
-  const evidence = object.evidence === undefined ? undefined : decodePromptEvidence(object.evidence);
+function decodePromptMaterial(value: JsonValue | undefined): PromptMaterial {
+  const object = requiredObject(value, 'prompt material');
+  exact(object, ['id', 'task', 'instructions', 'notes', 'context', 'tools', 'continuity', 'observedFacts', 'outputContract', 'metadata']);
+  const observedFacts = object.observedFacts === undefined ? undefined : decodeObservedFactsMaterial(object.observedFacts);
   const outputContract = object.outputContract === undefined ? undefined : decodeOutputContract(object.outputContract);
-  const metadata = optionalStringRecord(object.metadata, 'projection.metadata');
+  const metadata = optionalStringRecord(object.metadata, 'material.metadata');
   return Object.freeze({
-    id: requiredString(object.id, 'projection.id'), task: requiredStringValue(object.task, 'projection.task'),
-    instructions: requiredArray(object.instructions, 'projection.instructions').map((item, index) => decodePromptInstruction(item, `projection.instructions[${String(index)}]`)),
-    notes: [...stringArray(object.notes, 'projection.notes')], context: requiredArray(object.context, 'projection.context').map((item, index) => decodeContextItem(item, `projection.context[${String(index)}]`)),
-    tools: requiredArray(object.tools, 'projection.tools').map((item, index) => decodePromptTool(item, `projection.tools[${String(index)}]`)),
-    continuity: [...stringArray(object.continuity, 'projection.continuity')], ...(evidence ? { evidence } : {}), ...(outputContract ? { outputContract } : {}), ...(metadata ? { metadata: { ...metadata } } : {})
+    id: requiredString(object.id, 'material.id'), task: requiredStringValue(object.task, 'material.task'),
+    instructions: requiredArray(object.instructions, 'material.instructions').map((item, index) => decodePromptInstruction(item, `material.instructions[${String(index)}]`)),
+    notes: [...stringArray(object.notes, 'material.notes')], context: requiredArray(object.context, 'material.context').map((item, index) => decodePromptContextItem(item, `material.context[${String(index)}]`)),
+    tools: requiredArray(object.tools, 'material.tools').map((item, index) => decodePromptTool(item, `material.tools[${String(index)}]`)),
+    continuity: [...stringArray(object.continuity, 'material.continuity')], ...(observedFacts ? { observedFacts } : {}), ...(outputContract ? { outputContract } : {}), ...(metadata ? { metadata: { ...metadata } } : {})
   });
 }
-function decodePromptInstruction(value: JsonValue, path: string): PromptProjection['instructions'][number] {
+function decodePromptInstruction(value: JsonValue, path: string): PromptMaterial['instructions'][number] {
   const object = requiredObject(value, path);
   exact(object, ['id', 'role', 'content', 'sourceUri', 'priority']);
   const sourceUri = optionalStringValue(object.sourceUri, `${path}.sourceUri`);
   return Object.freeze({ id: requiredString(object.id, `${path}.id`), role: requiredEnum(object.role, ['system', 'developer', 'environment', 'user'] as const, `${path}.role`), content: requiredStringValue(object.content, `${path}.content`), ...(sourceUri !== undefined ? { sourceUri } : {}), priority: finiteNumber(object.priority, `${path}.priority`) });
 }
-function decodePromptTool(value: JsonValue, path: string): PromptProjection['tools'][number] {
+function decodePromptTool(value: JsonValue, path: string): PromptMaterial['tools'][number] {
   const object = requiredObject(value, path);
   exact(object, ['name', 'description', 'inputFormat', 'accessModes', 'promptGuide']);
   const promptGuide = optionalStringValue(object.promptGuide, `${path}.promptGuide`);
   return Object.freeze({ name: requiredString(object.name, `${path}.name`), description: requiredStringValue(object.description, `${path}.description`), inputFormat: requiredString(object.inputFormat, `${path}.inputFormat`), accessModes: [...stringArray(object.accessModes, `${path}.accessModes`)], ...(promptGuide !== undefined ? { promptGuide } : {}) });
 }
-function decodePromptEvidence(value: JsonValue): NonNullable<PromptProjection['evidence']> {
-  const object = requiredObject(value, 'projection.evidence');
+function decodeObservedFactsMaterial(value: JsonValue): NonNullable<PromptMaterial['observedFacts']> {
+  const object = requiredObject(value, 'material.observedFacts');
   exact(object, ['records', 'omittedRecords', 'omittedSummary', 'tokenEstimate', 'coverage']);
-  const omittedSummary = object.omittedSummary === undefined ? undefined : requiredArray(object.omittedSummary, 'projection.evidence.omittedSummary').map((item, index) => {
+  const omittedSummary = object.omittedSummary === undefined ? undefined : requiredArray(object.omittedSummary, 'material.observedFacts.omittedSummary').map((item, index) => {
     const summary = requiredObject(item, `omittedSummary[${String(index)}]`);
     exact(summary, ['toolName', 'action', 'outcome', 'count']);
     return Object.freeze({ toolName: requiredString(summary.toolName, 'omittedSummary.toolName'), action: requiredEnum(summary.action, ['list', 'search', 'read', 'execute', 'create', 'update', 'delete', 'move', 'verify'] as const, 'omittedSummary.action'), outcome: requiredEnum(summary.outcome, ['success', 'failure'] as const, 'omittedSummary.outcome'), count: positiveInteger(summary.count, 'omittedSummary.count') });
   });
   return Object.freeze({
-    records: requiredArray(object.records, 'projection.evidence.records').map((item, index) => decodeOwnedEvidenceRecord(requiredObject(item, `projection.evidence.records[${String(index)}]`))),
-    omittedRecords: nonnegativeInteger(object.omittedRecords, 'projection.evidence.omittedRecords'), ...(omittedSummary ? { omittedSummary } : {}),
-    tokenEstimate: nonnegativeInteger(object.tokenEstimate, 'projection.evidence.tokenEstimate'), coverage: requiredEnum(object.coverage, ['complete', 'partial'] as const, 'projection.evidence.coverage')
+    records: requiredArray(object.records, 'material.observedFacts.records').map((item, index) => decodeOwnedObservedFactRecord(requiredObject(item, `material.observedFacts.records[${String(index)}]`))),
+    omittedRecords: nonnegativeInteger(object.omittedRecords, 'material.observedFacts.omittedRecords'), ...(omittedSummary ? { omittedSummary } : {}),
+    tokenEstimate: nonnegativeInteger(object.tokenEstimate, 'material.observedFacts.tokenEstimate'), coverage: requiredEnum(object.coverage, ['complete', 'partial'] as const, 'material.observedFacts.coverage')
   });
 }
-function decodeOutputContract(value: JsonValue): NonNullable<PromptProjection['outputContract']> {
-  const object = requiredObject(value, 'projection.outputContract');
+function decodeOutputContract(value: JsonValue): NonNullable<PromptMaterial['outputContract']> {
+  const object = requiredObject(value, 'material.outputContract');
   exact(object, ['kind', 'description']);
-  if (object.kind !== 'text') throw malformed('projection.outputContract.kind is invalid');
-  return Object.freeze({ kind: 'text', description: requiredStringValue(object.description, 'projection.outputContract.description') });
+  if (object.kind !== 'text') throw malformed('material.outputContract.kind is invalid');
+  return Object.freeze({ kind: 'text', description: requiredStringValue(object.description, 'assembly.outputContract.description') });
 }
  function optionalArtifactRef(value: JsonValue | undefined): ArtifactRef | undefined { return value === undefined ? undefined : decodeOwnedArtifactRef(requiredObject(value, 'artifact')); }
 function decodeDiagnostic(value: JsonValue | undefined, allowTurnIndex = false): ModelProviderErrorDiagnostic & { readonly turnIndex?: number } {

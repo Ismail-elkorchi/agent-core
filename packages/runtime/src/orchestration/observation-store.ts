@@ -1,12 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import {
-  projectToolEvidence,
   redactJson,
   type ArtifactRef,
   type ArtifactRepository,
-  type EvidenceRecord,
   type PublicArtifactRef
-} from '@agent-core/evidence';
+} from '@agent-core/persistence';
 import { parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import { SimpleTokenEstimator, type ModelImage, type TokenEstimator } from '@agent-core/model';
 import {
@@ -16,6 +14,8 @@ import {
   updateToolObservation,
   type ToolCall,
   type ToolDefinition,
+  recordObservedFacts,
+  type ObservedFactRecord,
   type ToolObservationPresentation,
   type ToolObservation,
   toJsonValue,
@@ -38,7 +38,7 @@ export interface ToolObservationRecord {
   readonly retainedPresentation: ToolObservationPresentation;
   readonly immediateImages: readonly ModelImage[];
   readonly imageArtifacts: readonly PublicArtifactRef[];
-  readonly evidence: readonly EvidenceRecord[];
+  readonly observedFacts: readonly ObservedFactRecord[];
   readonly durableStorageDegraded?: { readonly message: string };
   readonly createdAt: string;
 }
@@ -145,7 +145,7 @@ export class ObservationStore {
       retainedPresentation,
       immediateImages,
       imageArtifacts,
-      evidence: Object.freeze(projectToolEvidence(committed.durableObservation.evidence, { observationId: committed.id, toolName: committed.toolName, createdAt: committed.createdAt })),
+      observedFacts: Object.freeze(recordObservedFacts(committed.durableObservation.observedFacts, { observationId: committed.id, toolName: committed.toolName, createdAt: committed.createdAt })),
       ...(committed.durableStorageDegraded ? { durableStorageDegraded: committed.durableStorageDegraded } : {}),
       createdAt: committed.createdAt
     });
@@ -225,7 +225,7 @@ function boundedFailureField(value: JsonValue | undefined): JsonValue | undefine
   return byteLength(serialized) <= 16_384 ? value : undefined;
 }
 
-/** Generic result-content projection. It is intentionally independent of tool names. */
+/** Generic result-content assembly. It is intentionally independent of tool names. */
 export function filterToolResultContentForModel(observation: ToolObservation, modelInputModalities: readonly string[]): ToolObservation {
   if (!observation.content?.some((item) => item.type === 'image') || modelInputModalities.includes('image')) return observation;
   const hiddenImages = observation.content.filter((item) => item.type === 'image');

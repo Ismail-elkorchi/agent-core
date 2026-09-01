@@ -1,4 +1,4 @@
-import { hashJson } from '@agent-core/evidence';
+import { hashJson } from '@agent-core/persistence';
 import { normalizeJsonSafe, parseJsonObject, type JsonValue } from '@agent-core/json';
 
 export interface SessionBindingInput {

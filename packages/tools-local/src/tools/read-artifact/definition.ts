@@ -1,8 +1,8 @@
-import type { ArtifactRepository } from '@agent-core/evidence';
+import type { ArtifactRepository } from '@agent-core/persistence';
 import { artifactScope, defineTool, requireToolService, ToolInputError } from '@agent-core/tools';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
 import { presentReadArtifactObservation } from '../../core/presenters.js';
-import { builtInReadEvidence } from '../../core/read-evidence.js';
+import { builtInObservedFacts } from '../../core/read-observed-facts.js';
 import { readArtifactInputSchema, readArtifactOutputSchema } from './schema.js';
 
 export const readArtifactTool = defineTool({
@@ -53,7 +53,7 @@ export const readArtifactTool = defineTool({
       ok: true,
       summary: `Read bytes ${String(input.offset)}-${String(end)} of ${String(artifact.size)} from ${artifact.artifactId}.`,
       scope,
-      evidence: builtInReadEvidence('read', scope, `Read ${String(selected.byteLength)} bytes from artifact ${artifact.artifactId}.`),
+      observedFacts: builtInObservedFacts('read', scope, `Read ${String(selected.byteLength)} bytes from artifact ${artifact.artifactId}.`),
       content,
       output
     };

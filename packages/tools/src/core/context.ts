@@ -53,22 +53,22 @@ export interface ToolAuthorizationBoundary {
   readonly executionTargetId: string;
 }
 
-export interface ToolPreparationContext extends Omit<ToolExecutionContext, 'signal'> {
+export interface ToolPlanningContext extends Omit<ToolExecutionContext, 'signal'> {
   readonly signal: AbortSignal;
   readonly boundary: ToolAuthorizationBoundary;
 }
 
-export interface ToolPreparationResource {
+export interface ToolPlanResource {
   release(): void | Promise<void>;
 }
 
-export interface ToolPreparationLifetime {
-  /** Transfer cleanup responsibility to this preparation, or release immediately if preparation already ended. */
-  own(resource: ToolPreparationResource): Promise<void>;
+export interface ToolPlanLifetime {
+  /** Transfer cleanup responsibility to this lifetime, or release immediately if lifetime already ended. */
+  own(resource: ToolPlanResource): Promise<void>;
 }
 
-export interface ToolCanonicalizationContext extends ToolPreparationContext {
-  readonly preparation: ToolPreparationLifetime;
+export interface ToolCanonicalizationContext extends ToolPlanningContext {
+  readonly lifetime: ToolPlanLifetime;
 }
 
 export interface ToolInvocationContext {

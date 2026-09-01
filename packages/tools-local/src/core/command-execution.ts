@@ -8,25 +8,25 @@ import {
   type ArtifactRepository,
   type ProtectedArtifactRef,
   type PublicArtifactRef
-} from '@agent-core/evidence';
-import { validateArtifactRef, validatePublicArtifactRef } from '@agent-core/evidence';
+} from '@agent-core/persistence';
+import { validateArtifactRef, validatePublicArtifactRef } from '@agent-core/persistence';
 import { parseJsonObject } from '@agent-core/json';
 import {
   ResourceLeaseCoordinator,
   adoptCommandExecution,
-  createCommandExecutionPreparation,
+  createCommandExecutionReservation,
   type CommandExecution,
   type CommandExecutionDescriptor,
   type CommandExecutionOwner,
-  type CommandExecutionPreparation,
+  type CommandExecutionReservation,
   type CommandExecutionReport,
   type CommandExecutionResult,
   type CommandExecutionStatus,
   type CommandOutputStream,
   type CommandOutputView,
   type CommandReconciliationResult,
-  type PrepareCommandRequest,
-  type StartPreparedCommandOptions,
+  type CommandExecutionPlanRequest,
+  type StartCommandExecutionOptions,
   type ToolProgress,
   type ToolResourceLease
 } from '@agent-core/tools';
@@ -73,7 +73,7 @@ interface ManagedProcess {
   readonly history: CapturedChunk[];
   readonly decoder: { readonly stdout: StringDecoder; readonly stderr: StringDecoder };
   readonly activityWaiters: Set<() => void>;
-  readonly onProgress?: StartPreparedCommandOptions['onProgress'];
+  readonly onProgress?: StartCommandExecutionOptions['onProgress'];
   readonly lease?: ToolResourceLease;
   readonly progressQueue: QueuedProgress[];
   status: CommandExecutionStatus;
@@ -121,13 +121,13 @@ interface ProcessLedgerEntry {
   readonly protectedArtifact?: ProtectedArtifactRef;
 }
 
-class LocalCommandPreparation {
+class LocalCommandReservationState {
   readonly authorization;
-  #state: 'prepared' | 'started' | 'released' = 'prepared';
+  #state: 'plan' | 'started' | 'released' = 'plan';
 
   constructor(
     readonly authority: LocalCommandExecution,
-    readonly request: PrepareCommandRequest,
+    readonly request: CommandExecutionPlanRequest,
     private readonly directory: { readonly path: string; close(): Promise<void> }
   ) {
     this.authorization = Object.freeze({
@@ -139,8 +139,8 @@ class LocalCommandPreparation {
     });
   }
 
-  start(): { readonly request: PrepareCommandRequest; readonly path: string } {
-    if (this.#state !== 'prepared') throw new Error('Local command preparation is single-use.');
+  start(): { readonly request: CommandExecutionPlanRequest; readonly path: string } {
+    if (this.#state !== 'plan') throw new Error('Local command reservation is single-use.');
     this.#state = 'started';
     return { request: this.request, path: this.directory.path };
   }
@@ -164,7 +164,7 @@ export class LocalCommandExecution implements CommandExecution {
   private readonly ready: Promise<CommandReconciliationResult>;
   private reconciliationState: CommandReconciliationResult | undefined;
   private reservedCapturedBytes = 0;
-  private readonly preparations = new WeakMap<CommandExecutionPreparation, LocalCommandPreparation>();
+  private readonly reservations = new WeakMap<CommandExecutionReservation, LocalCommandReservationState>();
 
   constructor(private readonly options: LocalCommandExecutionOptions) {
     if (!isRootedFileAuthority(options.rootedFileAuthority)) throw new TypeError('Local command execution requires an adopted RootedFileAuthority.');
@@ -186,17 +186,17 @@ export class LocalCommandExecution implements CommandExecution {
     adoptCommandExecution(this);
   }
 
-  async prepare(request: PrepareCommandRequest): Promise<CommandExecutionPreparation> {
+  async plan(request: CommandExecutionPlanRequest): Promise<CommandExecutionReservation> {
     const commandDirectory = await this.options.rootedFileAuthority.commandDirectory(request.rootedDirectory);
-    const owned = new LocalCommandPreparation(this, request, commandDirectory);
-    const preparation = createCommandExecutionPreparation(owned.authorization, () => owned.release());
-    this.preparations.set(preparation, owned);
-    return preparation;
+    const owned = new LocalCommandReservationState(this, request, commandDirectory);
+    const reservation = createCommandExecutionReservation(owned.authorization, () => owned.release());
+    this.reservations.set(reservation, owned);
+    return reservation;
   }
 
-  async start(preparation: CommandExecutionPreparation, options: StartPreparedCommandOptions = {}): Promise<CommandExecutionResult> {
-    const owned = this.preparations.get(preparation);
-    if (owned?.authority !== this) throw new TypeError('Command preparation does not belong to the local command authority.');
+  async start(reservation: CommandExecutionReservation, options: StartCommandExecutionOptions = {}): Promise<CommandExecutionResult> {
+    const owned = this.reservations.get(reservation);
+    if (owned?.authority !== this) throw new TypeError('Command reservation does not belong to the local command authority.');
     const adopted = owned.start();
     try {
       return await this.startInDirectory(adopted.request, options, adopted.path);
@@ -205,7 +205,7 @@ export class LocalCommandExecution implements CommandExecution {
     }
   }
 
-  private async startInDirectory(request: PrepareCommandRequest, options: StartPreparedCommandOptions, workingDirectory: string): Promise<CommandExecutionResult> {
+  private async startInDirectory(request: CommandExecutionPlanRequest, options: StartCommandExecutionOptions, workingDirectory: string): Promise<CommandExecutionResult> {
     const reconciliation = await this.ready;
     if (reconciliation.unresolved.length > 0) {
       throw new Error('An unresolved supervised process blocks new local command starts for this rooted authority.');

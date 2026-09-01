@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import * as z from 'zod';
 import { AgentRuntime, agentEventCodec } from '@agent-core/runtime';
-import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/evidence';
+import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import { adoptCommandExecution, defineTool } from '@agent-core/tools';
 import { DEFAULT_LOCAL_TOOL_CONFIGURATION, LocalCommandExecution, execCommandTool } from '@agent-core/tools-local';
 import { testRootedFileAuthority } from '../rooted-file-authority-helper.js';
@@ -78,7 +78,7 @@ test('abort and unknown provider outcome both clean active run processes before 
     assert.equal(state.manager.activeCount(runId), 0);
     const persisted = await records(state.events, runId);
     assert.equal(persisted.some((event) => event.type === 'process.ended'), true);
-    const finalOperation = persisted.filter((event) => event.type === 'operation.transition').at(-1);
+    const finalOperation = persisted.filter((event) => event.type === 'run.state.changed').at(-1);
     assert.equal(finalOperation.state.phase.kind, mode === 'abort' ? 'terminal' : 'provider');
     if (mode === 'failure') assert.equal(finalOperation.state.phase.stage, 'outcome_unknown');
     assert.equal(persisted.some((event) => event.type === 'run.ended'), mode === 'abort');
@@ -93,8 +93,8 @@ test('cleanup failure becomes terminal runtime_error and still commits run.ended
   assert.equal(result.state, 'ended');
   assert.equal(result.terminal.executionStatus, 'failed');
   assert.match(result.terminal.errorMessage, /cleanup broke/u);
-  assert.equal(result.terminal.candidate.status, 'complete');
-  assert.equal(result.terminal.candidate.message, 'done');
+  assert.equal(result.terminal.modelOutput.status, 'complete');
+  assert.equal(result.terminal.modelOutput.message, 'done');
   assert.equal(result.terminal.turnCount, 1);
   assert.equal(result.terminal.modelTerminationReason, 'stop');
   assert.deepEqual(result.terminal.cleanupDiagnostic, { kind: 'process_cleanup', message: 'cleanup broke' });
@@ -122,7 +122,7 @@ test('cleanup failure transforms prior partial, checked, and aborted decisions w
   const cases = [
     {
       runId: 'partial-cleanup', provider: new Provider([{ ...done, content: 'partial answer', terminationReason: 'output_limit' }]),
-      assertTerminal(terminal) { assert.equal(terminal.candidate.status, 'partial'); assert.equal(terminal.modelTerminationReason, 'output_limit'); }
+      assertTerminal(terminal) { assert.equal(terminal.modelOutput.status, 'partial'); assert.equal(terminal.modelTerminationReason, 'output_limit'); }
     },
     {
       runId: 'checked-cleanup', provider: new Provider([done]),
@@ -156,7 +156,7 @@ test('cleanup failure transforms prior partial, checked, and aborted decisions w
   const result = await agent.run({ runId: 'aborted-cleanup', task: 'abort', signal: controller.signal }).result;
   assert.equal(result.state, 'ended');
   assert.equal(result.terminal.executionStatus, 'failed');
-  assert.equal(result.terminal.candidate.status, 'absent');
+  assert.equal(result.terminal.modelOutput.status, 'absent');
   assert.match(result.terminal.errorMessage, /already aborted.*cleanup failed/iu);
 });
 
@@ -173,8 +173,8 @@ function commandExecutionWithCleanupFailure(commandExecution, message) {
 test('two runtimes sharing one manager clean only their own processes', async () => {
   const state = await setup();
   const ownerB = { runId: 'run-b', turnId: 'turn-b', toolBatchId: 'batch-b', callIndex: 0 };
-  const prepared = await state.manager.prepare({ command: longCommand, rootedDirectory: '.', pty: false, timeoutMs: 60_000, yieldMs: 100, outputTokenBudget: 1_000, owner: ownerB });
-  const running = await state.manager.start(prepared);
+  const plan = await state.manager.plan({ command: longCommand, rootedDirectory: '.', pty: false, timeoutMs: 60_000, yieldMs: 100, outputTokenBudget: 1_000, owner: ownerB });
+  const running = await state.manager.start(plan);
   assert.equal(running.status, 'running');
   const agentA = createRuntime({ ...state, provider: new Provider([done]) });
   const result = await agentA.run({ runId: 'run-a', task: 'finish a' }).result;

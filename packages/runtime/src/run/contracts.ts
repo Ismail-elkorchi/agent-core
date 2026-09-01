@@ -1,18 +1,18 @@
-import type { ArtifactRef } from '@agent-core/evidence';
-import { canonicalJsonString } from '@agent-core/evidence';
+import type { ArtifactRef } from '@agent-core/persistence';
+import { canonicalJsonString } from '@agent-core/persistence';
 import { parseJsonObject, parseJsonValue, type JsonNormalizationDiagnostic, type JsonObject, type JsonValue } from '@agent-core/json';
 import type { ModelReasoningRequest, ModelRequest, ModelResponseFormat, ModelTerminationReason } from '@agent-core/model';
 import type { ToolEffects } from '@agent-core/tools';
 import { decodeEffectRecoveryCapability, type EffectRecoveryCapability } from '@agent-core/effects';
 
-export type AgentCandidateStatus = 'complete' | 'partial' | 'indeterminate' | 'absent';
-export type AgentCandidateSource = 'content' | 'reasoning_summary' | 'stream_recovery';
+export type AgentModelOutputStatus = 'complete' | 'partial' | 'indeterminate' | 'absent';
+export type AgentModelOutputSource = 'content' | 'reasoning_summary' | 'stream_recovery';
 export type AgentVerificationStatus = 'not_required' | 'not_run' | 'passed' | 'failed' | 'inconclusive';
 export type AgentCompletedVerificationStatus = Exclude<AgentVerificationStatus, 'not_run'>;
 export type AgentCheckVerdict = 'passed' | 'failed' | 'unknown';
 export type AgentCheckRequirement = 'required' | 'advisory';
 export type AgentRunPhase =
-  | 'preparing'
+  | 'initializing'
   | 'requesting_model'
   | 'executing_tools'
   | 'waiting_for_approval'
@@ -73,21 +73,21 @@ export interface AgentApprovalSuspension extends AgentRunIdentity {
   readonly budget: AgentRunBudgetState;
 }
 
-export interface AgentOperationSuspension extends AgentRunIdentity {
+export interface AgentRunSuspension extends AgentRunIdentity {
   readonly state: 'suspended';
   readonly reason: 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'disposition_outcome_unknown' | 'missing_implementation' | 'user_decision';
   readonly effectId?: string;
-  readonly decisionRequest?: import('../operation/contracts.js').AgentDecisionRequest;
+  readonly decisionRequest?: import('./control/contracts.js').AgentDecisionRequest;
   readonly cleanupDiagnostic?: { readonly kind: 'process_cleanup'; readonly message: string };
   readonly budget: AgentRunBudgetState;
 }
 
-export type AgentCandidate = AgentAbsentCandidate | AgentPresentCandidate;
-export type AgentAbsentCandidate = Readonly<{ readonly status: 'absent' }>;
-export type AgentPresentCandidate = Readonly<{
-  readonly status: Exclude<AgentCandidateStatus, 'absent'>;
+export type AgentModelOutput = AgentAbsentModelOutput | AgentPresentModelOutput;
+export type AgentAbsentModelOutput = Readonly<{ readonly status: 'absent' }>;
+export type AgentPresentModelOutput = Readonly<{
+  readonly status: Exclude<AgentModelOutputStatus, 'absent'>;
   readonly message: string;
-  readonly source: AgentCandidateSource;
+  readonly source: AgentModelOutputSource;
   readonly turnIndex: number;
 }>;
 
@@ -124,24 +124,24 @@ export type AgentCheckResult = Readonly<{
   readonly diagnostic?: AgentCheckDiagnostic;
 }>;
 
-export interface AgentEvidencePage {
+export interface AgentObservedFactsPage {
   readonly items: readonly JsonValue[];
   readonly nextCursor?: string;
   readonly bytes: number;
   readonly truncated: boolean;
 }
-export interface AgentEvidenceReader {
-  read(input?: { readonly cursor?: string; readonly limit?: number; readonly maxBytes?: number }): Promise<AgentEvidencePage>;
+export interface AgentObservedFactsReader {
+  read(input?: { readonly cursor?: string; readonly limit?: number; readonly maxBytes?: number }): Promise<AgentObservedFactsPage>;
   readArtifact(ref: ArtifactRef, input?: { readonly maxBytes?: number }): Promise<Uint8Array>;
 }
 export interface AgentVerificationExecutionContext {
-  readonly evidence: AgentEvidenceReader;
+  readonly observedFacts: AgentObservedFactsReader;
 }
 export interface AgentCheckContext {
   readonly runId: string;
   readonly task: string;
   readonly instructions: readonly AgentEffectiveInstruction[];
-  readonly candidate: AgentPresentCandidate;
+  readonly modelOutput: AgentPresentModelOutput;
   readonly turnIndex: number;
   readonly turnId: string;
   readonly requestAttempt: number;
@@ -163,7 +163,7 @@ export interface AgentDeterministicCheckDefinition extends AgentCheckDefinitionB
 }
 export interface AgentEffectCheckDefinition extends AgentCheckDefinitionBase {
   readonly kind: 'effect';
-  prepare(context: AgentCheckContext): Promise<AgentCheckObservation | AgentPreparedCheckEffect>;
+  planEffect(context: AgentCheckContext): Promise<AgentCheckObservation | AgentCheckEffectPlan>;
 }
 export type AgentCheckDefinition = AgentDeterministicCheckDefinition | AgentEffectCheckDefinition;
 
@@ -171,7 +171,7 @@ export type AgentCheckEffectReconciliation =
   | Readonly<{ readonly status: 'settled'; readonly observation: AgentCheckObservation }>
   | Readonly<{ readonly status: 'running' | 'unknown' | 'expired' }>;
 
-export interface AgentPreparedCheckEffect {
+export interface AgentCheckEffectPlan {
   readonly authorization: JsonValue;
   readonly recovery: EffectRecoveryCapability;
   start(signal: AbortSignal): Promise<AgentCheckObservation>;
@@ -179,7 +179,7 @@ export interface AgentPreparedCheckEffect {
   release(): Promise<void>;
 }
 
-export interface AgentPreparedCheckEffectInput {
+export interface AgentCheckEffectPlanInput {
   readonly authorization: JsonValue;
   readonly recovery: EffectRecoveryCapability;
   readonly start: (signal: AbortSignal) => Promise<AgentCheckObservation>;
@@ -187,37 +187,37 @@ export interface AgentPreparedCheckEffectInput {
   readonly release: () => Promise<void>;
 }
 
-const PREPARED_CHECK_EFFECTS = new WeakSet();
+const CHECK_EFFECT_PLANS = new WeakSet();
 
-export function createAgentPreparedCheckEffect(input: AgentPreparedCheckEffectInput): AgentPreparedCheckEffect {
+export function createAgentCheckEffectPlan(input: AgentCheckEffectPlanInput): AgentCheckEffectPlan {
   if (typeof input.start !== 'function' || typeof input.reconcile !== 'function' || typeof input.release !== 'function') {
-    throw new TypeError('Prepared check effect requires start, reconcile, and release operations.');
+    throw new TypeError('Planned check effect requires start, reconcile, and release operations.');
   }
-  const prepared = Object.freeze({
+  const plan = Object.freeze({
     authorization: parseJsonValue(input.authorization),
     recovery: decodeEffectRecoveryCapability(input.recovery),
     start: input.start,
     reconcile: input.reconcile,
     release: input.release
   });
-  PREPARED_CHECK_EFFECTS.add(prepared);
-  return prepared;
+  CHECK_EFFECT_PLANS.add(plan);
+  return plan;
 }
 
-export function isAgentPreparedCheckEffect(value: unknown): value is AgentPreparedCheckEffect {
-  return typeof value === 'object' && value !== null && PREPARED_CHECK_EFFECTS.has(value);
+export function isAgentCheckEffectPlan(value: unknown): value is AgentCheckEffectPlan {
+  return typeof value === 'object' && value !== null && CHECK_EFFECT_PLANS.has(value);
 }
 
 export type AgentLimitKind =
   | 'model_turns' | 'total_tool_calls' | 'repeated_tool_calls' | 'elapsed_time'
   | 'prompt_tokens' | 'completion_tokens' | 'known_cost' | 'consecutive_provider_failures'
-  | 'consecutive_tool_failures' | 'candidate_revisions';
+  | 'consecutive_tool_failures' | 'revision_attempts';
 export interface AgentRunLimits {
   readonly maxConcurrentToolCalls: number;
   readonly modelTurns: number;
   readonly totalToolCalls: number;
   readonly repeatedIdenticalToolCalls: number;
-  readonly candidateRevisions: number;
+  readonly revisionAttempts: number;
   readonly elapsedMs: number;
   readonly promptTokens: number;
   readonly completionTokens: number;
@@ -233,7 +233,7 @@ export const DEFAULT_AGENT_RUN_LIMITS: AgentRunLimits = Object.freeze({
   modelTurns: 32,
   totalToolCalls: 128,
   repeatedIdenticalToolCalls: 3,
-  candidateRevisions: 3,
+  revisionAttempts: 3,
   elapsedMs: 30 * 60 * 1_000,
   promptTokens: 1_000_000,
   completionTokens: 250_000,
@@ -248,7 +248,7 @@ export type AgentRunBudgetState = Readonly<{
   readonly modelTurns: number;
   readonly totalToolCalls: number;
   readonly repeatedIdenticalToolCalls: number;
-  readonly candidateRevisions: number;
+  readonly revisionAttempts: number;
   readonly elapsedMs: number;
   readonly promptTokens: number;
   readonly completionTokens: number;
@@ -263,7 +263,7 @@ export type AgentRunBudgetState = Readonly<{
 }>;
 
 const AGENT_RUN_BUDGET_FIELDS = [
-  'modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'candidateRevisions', 'elapsedMs',
+  'modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'revisionAttempts', 'elapsedMs',
   'promptTokens', 'completionTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens',
   'knownCosts', 'pricingStatus', 'unknownPricedTokens', 'consecutiveProviderFailures', 'consecutiveToolFailures'
 ] as const;
@@ -298,27 +298,27 @@ export interface AgentTurnSnapshotRecord {
   readonly budget: AgentRunBudgetState;
 }
 
-export interface AgentRequestReductionRecord {
+export interface ModelRequestReductionRecord {
   readonly kind: string;
   readonly reason: string;
   readonly sequence: number;
 }
 
 /** The immutable request truth created only after every dynamic input has resolved. */
-export interface AgentRequestSnapshotRecord extends AgentTurnIdentity {
+export interface InferenceRequestFingerprintRecord extends AgentTurnIdentity {
   readonly requestId: string;
   readonly configuredContextIds: readonly string[];
   readonly providerContextIds: readonly string[];
   readonly runContextIds: readonly string[];
   readonly effectiveInstructionHash: string;
-  readonly selectedEvidenceHash: string;
-  readonly retainedHistoryHash: string;
+  readonly selectedFactsHash: string;
+  readonly modelWindowHistoryHash: string;
   readonly modelToolSchemasHash: string;
-  readonly compiledPromptHash: string;
-  readonly reductions: readonly AgentRequestReductionRecord[];
+  readonly modelWindowHash: string;
+  readonly reductions: readonly ModelRequestReductionRecord[];
 }
 
-export interface AgentExactRequestRecord extends AgentTurnIdentity {
+export interface LogicalModelRequestRecord extends AgentTurnIdentity {
   readonly requestId: string;
   readonly request: Omit<ModelRequest, 'signal'>;
 }
@@ -328,11 +328,11 @@ export type AgentFailureTerminationReason =
   | Exclude<AgentCompletedTerminationReason, 'model_completed'>
   | 'empty_response' | 'malformed_response' | 'provider_error' | 'runtime_error'
   | 'stream_interrupted' | 'request_too_large' | 'limit_exhausted'
-  | 'candidate_rejected' | 'disposition_inconclusive';
+  | 'model_output_rejected' | 'disposition_inconclusive';
 type AgentTerminalBase = AgentRunIdentity & Readonly<{
   readonly phase: 'ended';
   readonly turnCount: number;
-  readonly candidate: AgentCandidate;
+  readonly modelOutput: AgentModelOutput;
   readonly modelTerminationReason?: ModelTerminationReason;
   readonly providerTerminationReason?: string;
   readonly checkResults: readonly AgentCheckResult[];
@@ -342,21 +342,21 @@ type AgentTerminalBase = AgentRunIdentity & Readonly<{
 }>;
 export type AgentCompletedTerminalSnapshot = AgentTerminalBase & Readonly<{
   readonly executionStatus: 'completed';
-  readonly candidate: AgentPresentCandidate;
+  readonly modelOutput: AgentPresentModelOutput;
   readonly verificationStatus: AgentCompletedVerificationStatus;
   readonly terminationReason: AgentCompletedTerminationReason;
   readonly errorMessage?: never;
 }>;
 export type AgentFailedTerminalSnapshot = AgentTerminalBase & Readonly<{
   readonly executionStatus: 'failed';
-  readonly candidate: AgentCandidate;
+  readonly modelOutput: AgentModelOutput;
   readonly verificationStatus: AgentVerificationStatus;
   readonly terminationReason: AgentFailureTerminationReason;
   readonly errorMessage: string;
 }>;
 export type AgentAbortedTerminalSnapshot = AgentTerminalBase & Readonly<{
   readonly executionStatus: 'aborted';
-  readonly candidate: AgentAbsentCandidate | (AgentPresentCandidate & { readonly status: 'partial' });
+  readonly modelOutput: AgentAbsentModelOutput | (AgentPresentModelOutput & { readonly status: 'partial' });
   readonly verificationStatus: 'not_run';
   readonly terminationReason: 'aborted';
   readonly errorMessage: string;
@@ -368,7 +368,7 @@ export interface AgentEndedRunResult {
   readonly terminal: AgentTerminalSnapshot;
   readonly deliveryDiagnostics: readonly AgentDeliveryDiagnostic[];
 }
-export type AgentRunResult = AgentApprovalSuspension | AgentOperationSuspension | AgentEndedRunResult;
+export type AgentRunResult = AgentApprovalSuspension | AgentRunSuspension | AgentEndedRunResult;
 
 export class AgentContractError extends Error {
   readonly issues: readonly string[];
@@ -387,7 +387,7 @@ export function validateAgentRunLimits(input: Partial<AgentRunLimits> = {}): Age
     'consecutiveProviderFailures', 'consecutiveToolFailures'
   ];
   const issues = fields.flatMap((field) => positiveInteger(limits[field]) ? [] : [`${field} must be a positive finite integer.`]);
-  if (!Number.isSafeInteger(limits.candidateRevisions) || limits.candidateRevisions < 0) issues.push('candidateRevisions must be a nonnegative safe integer.');
+  if (!Number.isSafeInteger(limits.revisionAttempts) || limits.revisionAttempts < 0) issues.push('revisionAttempts must be a nonnegative safe integer.');
   if (!Number.isFinite(limits.knownCost.amount) || limits.knownCost.amount <= 0) issues.push('knownCost.amount must be positive and finite.');
   if (limits.knownCost.currency.trim().length === 0) issues.push('knownCost.currency must be non-empty.');
   if (issues.length > 0) throw new AgentContractError('Invalid run limits.', issues);
@@ -429,17 +429,17 @@ export function deriveAgentVerificationStatus(
   return 'passed';
 }
 
-export function decodeOwnedAgentCandidate(value: JsonObject): AgentCandidate {
-  if (typeof value.status !== 'string') throw contract('Invalid candidate.', ['Candidate must be a discriminated object.']);
+export function decodeOwnedAgentModelOutput(value: JsonObject): AgentModelOutput {
+  if (typeof value.status !== 'string') throw contract('Invalid modelOutput.', ['Model output must be a discriminated object.']);
   if (value.status === 'absent') {
-    if (Object.keys(value).some((key) => key !== 'status')) throw contract('Invalid absent candidate.', ['Absent candidates cannot carry message, source, or turnIndex.']);
+    if (Object.keys(value).some((key) => key !== 'status')) throw contract('Invalid absent modelOutput.', ['Absent modelOutputs cannot carry message, source, or turnIndex.']);
     return Object.freeze({ status: 'absent' });
   }
-  if (!oneOf(value.status, ['complete', 'partial', 'indeterminate'])) throw contract('Invalid candidate.', ['Unsupported candidate status.']);
-  if (typeof value.message !== 'string' || value.message.trim().length === 0) throw contract('Invalid candidate.', ['Candidate message must be non-empty.']);
-  if (!oneOf(value.source, ['content', 'reasoning_summary', 'stream_recovery'])) throw contract('Invalid candidate.', ['Unsupported candidate source.']);
-  if (!positiveInteger(value.turnIndex)) throw contract('Invalid candidate.', ['Candidate turnIndex must be a positive integer.']);
-  if (value.source === 'stream_recovery' && value.status !== 'partial') throw contract('Invalid candidate.', ['Stream recovery candidates must be partial.']);
+  if (!oneOf(value.status, ['complete', 'partial', 'indeterminate'])) throw contract('Invalid modelOutput.', ['Unsupported modelOutput status.']);
+  if (typeof value.message !== 'string' || value.message.trim().length === 0) throw contract('Invalid modelOutput.', ['Model output message must be non-empty.']);
+  if (!oneOf(value.source, ['content', 'reasoning_summary', 'stream_recovery'])) throw contract('Invalid modelOutput.', ['Unsupported modelOutput source.']);
+  if (!positiveInteger(value.turnIndex)) throw contract('Invalid modelOutput.', ['Model output turnIndex must be a positive integer.']);
+  if (value.source === 'stream_recovery' && value.status !== 'partial') throw contract('Invalid modelOutput.', ['Stream recovery modelOutputs must be partial.']);
   return Object.freeze({ status: value.status, message: value.message, source: value.source, turnIndex: value.turnIndex });
 }
 
@@ -483,7 +483,7 @@ export function createAgentTerminalSnapshot(value: AgentTerminalSnapshot): Agent
   if (!validIdentity(value.runId)) issues.push('runId must be non-empty and at most 256 UTF-8 bytes.');
   if (!validIdentity(value.finalizationId)) issues.push('finalizationId must be non-empty and at most 256 UTF-8 bytes.');
   if (!Number.isInteger(value.turnCount) || value.turnCount < 0) issues.push('turnCount must be a nonnegative integer.');
-  if (value.executionStatus === 'completed') issues.push(...completedCandidateIssues(value.terminationReason, value.candidate.status));
+  if (value.executionStatus === 'completed') issues.push(...completedModelOutputIssues(value.terminationReason, value.modelOutput.status));
   if (value.terminationReason === 'limit_exhausted' && value.exhaustedLimit === undefined) issues.push('limit_exhausted requires exhaustedLimit.');
   if (value.terminationReason !== 'limit_exhausted' && value.exhaustedLimit !== undefined) issues.push('exhaustedLimit is only legal for limit_exhausted.');
   issues.push(...modelTerminationIssues({
@@ -495,9 +495,9 @@ export function createAgentTerminalSnapshot(value: AgentTerminalSnapshot): Agent
   const checkResults = Object.freeze([...value.checkResults]);
   const budget = Object.freeze({ ...value.budget, knownCosts: Object.freeze({ ...value.budget.knownCosts }) });
   const cleanup = value.cleanupDiagnostic ? { cleanupDiagnostic: Object.freeze({ ...value.cleanupDiagnostic }) } : {};
-  if (value.executionStatus === 'completed') return Object.freeze({ ...value, candidate: Object.freeze({ ...value.candidate }), checkResults, budget, ...cleanup });
-  if (value.executionStatus === 'failed') return Object.freeze({ ...value, candidate: Object.freeze({ ...value.candidate }), checkResults, budget, ...cleanup });
-  return Object.freeze({ ...value, candidate: Object.freeze({ ...value.candidate }), checkResults, budget, ...cleanup });
+  if (value.executionStatus === 'completed') return Object.freeze({ ...value, modelOutput: Object.freeze({ ...value.modelOutput }), checkResults, budget, ...cleanup });
+  if (value.executionStatus === 'failed') return Object.freeze({ ...value, modelOutput: Object.freeze({ ...value.modelOutput }), checkResults, budget, ...cleanup });
+  return Object.freeze({ ...value, modelOutput: Object.freeze({ ...value.modelOutput }), checkResults, budget, ...cleanup });
 }
 
 export function decodeAgentTerminalSnapshot(value: unknown): AgentTerminalSnapshot {
@@ -506,11 +506,11 @@ export function decodeAgentTerminalSnapshot(value: unknown): AgentTerminalSnapsh
 
 export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTerminalSnapshot {
   const issues = terminalBaseIssues(value);
-  let candidate: AgentCandidate | undefined;
+  let modelOutput: AgentModelOutput | undefined;
   try {
-    const candidateValue = value.candidate;
-    if (candidateValue === undefined || !isJsonObject(candidateValue)) throw contract('Invalid candidate.', ['Candidate must be a discriminated object.']);
-    candidate = decodeOwnedAgentCandidate(candidateValue);
+    const candidateValue = value.modelOutput;
+    if (candidateValue === undefined || !isJsonObject(candidateValue)) throw contract('Invalid modelOutput.', ['Model output must be a discriminated object.']);
+    modelOutput = decodeOwnedAgentModelOutput(candidateValue);
   } catch (error) { issues.push(errorMessage(error)); }
   const checkResults: AgentCheckResult[] = [];
   if (!isJsonArray(value.checkResults)) issues.push('checkResults must be an array.');
@@ -523,17 +523,17 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
   const budget = isBudgetState(value.budget) ? value.budget : undefined;
   if (!budget) issues.push('budget is invalid.');
   if (value.executionStatus === 'completed') {
-    if (!candidate || candidate.status === 'absent') issues.push('Completed execution requires a present candidate.');
+    if (!modelOutput || modelOutput.status === 'absent') issues.push('Completed execution requires a present modelOutput.');
     if (!oneOf(value.verificationStatus, ['not_required', 'passed', 'failed', 'inconclusive'])) issues.push('Completed execution has an invalid verification status.');
     if (!oneOf(value.terminationReason, ['model_completed', 'model_output_limit', 'content_filtered', 'unknown_model_termination'])) issues.push('Completed execution has an invalid termination reason.');
-    if (candidate && candidate.status !== 'absent') issues.push(...completedCandidateIssues(value.terminationReason, candidate.status));
+    if (modelOutput && modelOutput.status !== 'absent') issues.push(...completedModelOutputIssues(value.terminationReason, modelOutput.status));
     if (value.errorMessage !== undefined) issues.push('Completed execution cannot have errorMessage.');
   } else if (value.executionStatus === 'failed') {
     if (!oneOf(value.verificationStatus, ['not_required', 'not_run', 'passed', 'failed', 'inconclusive'])) issues.push('Failed execution has an invalid verification status.');
     if (!oneOf(value.terminationReason, FAILURE_REASONS)) issues.push('Failed execution has an invalid termination reason.');
     if (typeof value.errorMessage !== 'string' || value.errorMessage.trim().length === 0) issues.push('Failed execution requires errorMessage.');
   } else if (value.executionStatus === 'aborted') {
-    if (candidate && candidate.status !== 'absent' && candidate.status !== 'partial') issues.push('Aborted execution can only preserve a partial candidate.');
+    if (modelOutput && modelOutput.status !== 'absent' && modelOutput.status !== 'partial') issues.push('Aborted execution can only preserve a partial modelOutput.');
     if (value.verificationStatus !== 'not_run' || value.terminationReason !== 'aborted') issues.push('Aborted execution must use aborted/not_run.');
     if (typeof value.errorMessage !== 'string' || value.errorMessage.trim().length === 0) issues.push('Aborted execution requires errorMessage.');
   } else issues.push('executionStatus is invalid.');
@@ -542,14 +542,14 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
   if (value.cleanupDiagnostic !== undefined && (!isRecord(value.cleanupDiagnostic) || value.cleanupDiagnostic.kind !== 'process_cleanup' || typeof value.cleanupDiagnostic.message !== 'string' || value.cleanupDiagnostic.message.length === 0)) issues.push('cleanupDiagnostic is invalid.');
   issues.push(...modelTerminationIssues(value));
   if (issues.length > 0) throw contract('Invalid terminal snapshot.', issues);
-  if (!candidate) throw contract('Invalid terminal snapshot.', ['candidate is invalid.']);
+  if (!modelOutput) throw contract('Invalid terminal snapshot.', ['modelOutput is invalid.']);
   if (!budget) throw contract('Invalid terminal snapshot.', ['budget is invalid.']);
   const base = {
     runId: value.runId as string,
     finalizationId: value.finalizationId as string,
     phase: 'ended' as const,
     turnCount: value.turnCount as number,
-    candidate,
+    modelOutput,
     checkResults: Object.freeze(checkResults),
     budget,
     ...(value.modelTerminationReason !== undefined ? { modelTerminationReason: value.modelTerminationReason as ModelTerminationReason } : {}),
@@ -560,7 +560,7 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
   if (value.executionStatus === 'completed') return Object.freeze({
     ...base,
     executionStatus: 'completed',
-    candidate: candidate as AgentPresentCandidate,
+    modelOutput: modelOutput as AgentPresentModelOutput,
     verificationStatus: value.verificationStatus as AgentCompletedVerificationStatus,
     terminationReason: value.terminationReason as AgentCompletedTerminationReason
   });
@@ -574,7 +574,7 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
   return Object.freeze({
     ...base,
     executionStatus: 'aborted',
-    candidate: candidate as AgentAbortedTerminalSnapshot['candidate'],
+    modelOutput: modelOutput as AgentAbortedTerminalSnapshot['modelOutput'],
     verificationStatus: 'not_run',
     terminationReason: 'aborted',
     errorMessage: value.errorMessage as string
@@ -584,11 +584,11 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
 export function terminalSnapshotFingerprint(snapshot: AgentTerminalSnapshot): string { return canonicalJsonString(snapshot); }
 const AGENT_LIMIT_KINDS: readonly AgentLimitKind[] = [
   'model_turns', 'total_tool_calls', 'repeated_tool_calls', 'elapsed_time', 'prompt_tokens',
-  'completion_tokens', 'known_cost', 'consecutive_provider_failures', 'consecutive_tool_failures', 'candidate_revisions'
+  'completion_tokens', 'known_cost', 'consecutive_provider_failures', 'consecutive_tool_failures', 'revision_attempts'
 ];
 const FAILURE_REASONS: readonly AgentFailureTerminationReason[] = [
   'model_output_limit', 'content_filtered', 'unknown_model_termination', 'empty_response', 'malformed_response',
-  'provider_error', 'runtime_error', 'stream_interrupted', 'request_too_large', 'limit_exhausted', 'candidate_rejected', 'disposition_inconclusive'
+  'provider_error', 'runtime_error', 'stream_interrupted', 'request_too_large', 'limit_exhausted', 'model_output_rejected', 'disposition_inconclusive'
 ];
 function terminalBaseIssues(value: Record<string, unknown>): string[] {
   const issues: string[] = [];
@@ -607,8 +607,8 @@ function modelTerminationIssues(value: Record<string, unknown>): string[] {
   const expected = typeof value.terminationReason === 'string' ? mapping[value.terminationReason] : undefined;
   return expected !== undefined && value.modelTerminationReason !== expected ? [`${String(value.terminationReason)} requires modelTerminationReason ${expected}.`] : [];
 }
-function completedCandidateIssues(terminationReason: unknown, candidateStatus: AgentPresentCandidate['status']): string[] {
-  const expected: Partial<Record<AgentCompletedTerminationReason, AgentPresentCandidate['status']>> = {
+function completedModelOutputIssues(terminationReason: unknown, candidateStatus: AgentPresentModelOutput['status']): string[] {
+  const expected: Partial<Record<AgentCompletedTerminationReason, AgentPresentModelOutput['status']>> = {
     model_completed: 'complete',
     model_output_limit: 'partial',
     content_filtered: 'partial',
@@ -616,12 +616,12 @@ function completedCandidateIssues(terminationReason: unknown, candidateStatus: A
   };
   const status = isCompletedTerminationReason(terminationReason) ? expected[terminationReason] : undefined;
   return status !== undefined && candidateStatus !== status
-    ? [`${String(terminationReason)} requires candidate status ${status}.`]
+    ? [`${String(terminationReason)} requires modelOutput status ${status}.`]
     : [];
 }
 function isBudgetState(value: unknown): value is AgentRunBudgetState {
   if (!isRecord(value)) return false;
-  const names = ['modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'candidateRevisions', 'elapsedMs', 'promptTokens', 'completionTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'unknownPricedTokens', 'consecutiveProviderFailures', 'consecutiveToolFailures'];
+  const names = ['modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'revisionAttempts', 'elapsedMs', 'promptTokens', 'completionTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'unknownPricedTokens', 'consecutiveProviderFailures', 'consecutiveToolFailures'];
   if (!names.every((name) => typeof value[name] === 'number' && Number.isFinite(value[name]) && Number.isInteger(value[name]) && (value[name]) >= 0)) return false;
   return finiteNonnegativeNumberRecord(value.knownCosts)
     && oneOf(value.pricingStatus, ['known', 'partial', 'unknown']);
@@ -652,7 +652,7 @@ function finiteNonnegativeNumberRecord(value: unknown): boolean {
 function positiveInteger(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value > 0; }
 function validIdentity(value: unknown): value is string { return typeof value === 'string' && value.trim().length > 0 && Buffer.byteLength(value, 'utf8') <= 256; }
 function isCompletedTerminationReason(value: unknown): value is AgentCompletedTerminationReason { return oneOf(value, ['model_completed', 'model_output_limit', 'content_filtered', 'unknown_model_termination']); }
-function oneOf<T extends string>(value: unknown, values: readonly T[]): value is T { return typeof value === 'string' && values.some((candidate) => candidate === value); }
+function oneOf<T extends string>(value: unknown, values: readonly T[]): value is T { return typeof value === 'string' && values.some((modelOutput) => modelOutput === value); }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function isJsonObject(value: JsonValue): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function isJsonArray(value: JsonValue | undefined): value is readonly JsonValue[] { return Array.isArray(value); }

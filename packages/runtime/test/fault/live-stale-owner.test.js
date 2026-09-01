@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import test from 'node:test';
-import { JsonlEventRepository } from '@agent-core/evidence/node';
+import { JsonlEventRepository } from '@agent-core/persistence/node';
 import { agentEventCodec } from '@agent-core/runtime';
 import { createLiveDriverRuntime } from './fixtures/live-driver-support.mjs';
 
@@ -50,7 +50,7 @@ for (const mode of modes) {
         : firstRecovery;
       assert.equal(finalResult.state, 'ended');
       assert.equal(finalResult.terminal.executionStatus, 'completed');
-      assert.equal(finalResult.terminal.candidate.message, 'replacement completed');
+      assert.equal(finalResult.terminal.modelOutput.message, 'replacement completed');
 
       const invocations = await readFile(path.join(root, 'external-invocations'), 'utf8');
       assert.deepEqual(invocations.trim().split('\n'), ['invoke']);

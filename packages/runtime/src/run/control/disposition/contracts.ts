@@ -1,6 +1,6 @@
 import { parseJsonObject, parseJsonValue, type JsonValue } from '@agent-core/json';
 import { decodeEffectRecoveryCapability, type EffectRecoveryCapability } from '@agent-core/effects';
-import type { AgentCandidate, AgentCheckResult, AgentRunBudgetState } from '../../run/contracts.js';
+import type { AgentModelOutput, AgentCheckResult, AgentRunBudgetState } from '../../contracts.js';
 
 export type AgentDispositionDecision =
   | Readonly<{ readonly kind: 'accept' }>
@@ -9,7 +9,7 @@ export type AgentDispositionDecision =
   | Readonly<{ readonly kind: 'inconclusive'; readonly reason: string }>;
 
 export interface AgentDispositionInput {
-  readonly candidate: AgentCandidate;
+  readonly modelOutput: AgentModelOutput;
   readonly checkResults: readonly AgentCheckResult[];
   readonly budget: AgentRunBudgetState;
   readonly control: Readonly<{
@@ -19,7 +19,7 @@ export interface AgentDispositionInput {
   readonly policyIdentity: JsonValue;
   readonly receipts: Readonly<{
     readonly providerSettlementEventId: string;
-    readonly candidateEventId: string;
+    readonly modelOutputEventId: string;
     readonly verificationEventIds: readonly string[];
   }>;
 }
@@ -27,7 +27,7 @@ export interface AgentDispositionInput {
 interface AgentDispositionPolicyBase {
   /** Stable identity for the admitted evaluator implementation and semantics. */
   readonly implementationId: string;
-  /** Canonical configuration consumed by the evaluator and captured with the operation. */
+  /** Canonical configuration consumed by the policy and captured with the run. */
   readonly policyIdentity: JsonValue;
 }
 
@@ -40,10 +40,10 @@ export interface AgentEffectDispositionPolicy extends AgentDispositionPolicyBase
   readonly kind: 'effect';
   /**
    * Returns a non-accepting decision when disposition needs no external side
-   * effect, or a prepared effect. Acceptance must cross the prepared effect
-   * boundary because an effect policy owns candidate publication.
+   * effect, or an effect plan. Acceptance must cross that plan's start
+   * boundary because an effect policy owns the acceptance side effect.
    */
-  readonly prepare: (input: AgentDispositionInput) => AgentDispositionDecision | AgentPreparedDispositionEffect | Promise<AgentDispositionDecision | AgentPreparedDispositionEffect>;
+  readonly planEffect: (input: AgentDispositionInput) => AgentDispositionDecision | AgentDispositionEffectPlan | Promise<AgentDispositionDecision | AgentDispositionEffectPlan>;
 }
 
 export type AgentDispositionPolicy = AgentDeterministicDispositionPolicy | AgentEffectDispositionPolicy;
@@ -52,7 +52,7 @@ export type AgentDispositionEffectReconciliation =
   | Readonly<{ readonly status: 'settled'; readonly decision: AgentDispositionDecision }>
   | Readonly<{ readonly status: 'running' | 'unknown' | 'expired' }>;
 
-export interface AgentPreparedDispositionEffect {
+export interface AgentDispositionEffectPlan {
   readonly authorization: JsonValue;
   readonly recovery: EffectRecoveryCapability;
   start(signal: AbortSignal): Promise<AgentDispositionDecision>;
@@ -60,7 +60,7 @@ export interface AgentPreparedDispositionEffect {
   release(): Promise<void>;
 }
 
-export interface AgentPreparedDispositionEffectInput {
+export interface AgentDispositionEffectPlanInput {
   readonly authorization: JsonValue;
   readonly recovery: EffectRecoveryCapability;
   readonly start: (signal: AbortSignal) => Promise<AgentDispositionDecision>;
@@ -68,10 +68,10 @@ export interface AgentPreparedDispositionEffectInput {
   readonly release: () => Promise<void>;
 }
 
-const PREPARED_DISPOSITION_EFFECTS = new WeakSet();
+const DISPOSITION_EFFECT_PLANS = new WeakSet();
 const MAX_DECISION_TEXT_BYTES = 32 * 1024;
 
-export const ACCEPT_CANDIDATE_DISPOSITION: AgentDeterministicDispositionPolicy = Object.freeze({
+export const DEFAULT_ACCEPT_DISPOSITION: AgentDeterministicDispositionPolicy = Object.freeze({
   kind: 'deterministic',
   implementationId: 'agent-core.disposition.accept-v1',
   policyIdentity: Object.freeze({ strategy: 'accept' }),
@@ -79,16 +79,16 @@ export const ACCEPT_CANDIDATE_DISPOSITION: AgentDeterministicDispositionPolicy =
 });
 
 export function validateAgentDispositionPolicy(policy: AgentDispositionPolicy | undefined): AgentDispositionPolicy {
-  const candidate = policy ?? ACCEPT_CANDIDATE_DISPOSITION;
-  const kind: string = candidate.kind;
-  if (!validIdentity(candidate.implementationId)) throw new TypeError('Disposition implementationId must be a non-empty bounded identity.');
-  const policyIdentity = parseJsonValue(candidate.policyIdentity);
-  if (kind === 'deterministic' && candidate.kind === 'deterministic') {
-    if (typeof candidate.evaluate !== 'function') throw new TypeError('A deterministic disposition policy requires evaluate().');
-    return Object.freeze({ kind: candidate.kind, implementationId: candidate.implementationId, policyIdentity, evaluate: candidate.evaluate });
+  const selectedPolicy = policy ?? DEFAULT_ACCEPT_DISPOSITION;
+  const kind: string = selectedPolicy.kind;
+  if (!validIdentity(selectedPolicy.implementationId)) throw new TypeError('Disposition implementationId must be a non-empty bounded identity.');
+  const policyIdentity = parseJsonValue(selectedPolicy.policyIdentity);
+  if (kind === 'deterministic' && selectedPolicy.kind === 'deterministic') {
+    if (typeof selectedPolicy.evaluate !== 'function') throw new TypeError('A deterministic disposition policy requires evaluate().');
+    return Object.freeze({ kind: selectedPolicy.kind, implementationId: selectedPolicy.implementationId, policyIdentity, evaluate: selectedPolicy.evaluate });
   }
-  if (kind !== 'effect' || candidate.kind !== 'effect' || typeof candidate.prepare !== 'function') throw new TypeError('Disposition policy kind must be deterministic or effect.');
-  return Object.freeze({ kind: candidate.kind, implementationId: candidate.implementationId, policyIdentity, prepare: candidate.prepare });
+  if (kind !== 'effect' || selectedPolicy.kind !== 'effect' || typeof selectedPolicy.planEffect !== 'function') throw new TypeError('Disposition policy kind must be deterministic or effect.');
+  return Object.freeze({ kind: selectedPolicy.kind, implementationId: selectedPolicy.implementationId, policyIdentity, planEffect: selectedPolicy.planEffect });
 }
 
 export function parseAgentDispositionDecision(value: unknown): AgentDispositionDecision {
@@ -121,23 +121,23 @@ export function parseAgentDispositionEffectReconciliation(value: unknown): Agent
   throw new TypeError('Disposition reconciliation status must be settled, running, unknown, or expired.');
 }
 
-export function createAgentPreparedDispositionEffect(input: AgentPreparedDispositionEffectInput): AgentPreparedDispositionEffect {
+export function createAgentDispositionEffectPlan(input: AgentDispositionEffectPlanInput): AgentDispositionEffectPlan {
   if (typeof input.start !== 'function' || typeof input.reconcile !== 'function' || typeof input.release !== 'function') {
-    throw new TypeError('Prepared disposition effect requires start, reconcile, and release operations.');
+    throw new TypeError('Planned disposition effect requires start, reconcile, and release operations.');
   }
-  const prepared = Object.freeze({
+  const plan = Object.freeze({
     authorization: parseJsonValue(input.authorization),
     recovery: decodeEffectRecoveryCapability(input.recovery),
     start: input.start,
     reconcile: input.reconcile,
     release: input.release
   });
-  PREPARED_DISPOSITION_EFFECTS.add(prepared);
-  return prepared;
+  DISPOSITION_EFFECT_PLANS.add(plan);
+  return plan;
 }
 
-export function isAgentPreparedDispositionEffect(value: unknown): value is AgentPreparedDispositionEffect {
-  return typeof value === 'object' && value !== null && PREPARED_DISPOSITION_EFFECTS.has(value);
+export function isAgentDispositionEffectPlan(value: unknown): value is AgentDispositionEffectPlan {
+  return typeof value === 'object' && value !== null && DISPOSITION_EFFECT_PLANS.has(value);
 }
 
 function decisionText(value: JsonValue | undefined, field: string): string {

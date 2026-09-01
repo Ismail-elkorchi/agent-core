@@ -3,14 +3,14 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { hashJson, InMemoryEventRepository } from '@agent-core/evidence';
-import { JsonlEventRepository } from '@agent-core/evidence/node';
-import { AgentOperationCoordinator, AgentRuntime, agentEventCodec } from '@agent-core/runtime';
+import { hashJson, InMemoryEventRepository } from '@agent-core/persistence';
+import { JsonlEventRepository } from '@agent-core/persistence/node';
+import { AgentRunCoordinator, AgentRuntime, agentEventCodec } from '@agent-core/runtime';
 
 const stores = [
   ['memory', async () => ({ repository: new InMemoryEventRepository(agentEventCodec), dispose: async () => undefined })],
   ['jsonl', async () => {
-    const directory = await mkdtemp(path.join(tmpdir(), 'agent-operation-boundaries-'));
+    const directory = await mkdtemp(path.join(tmpdir(), 'agent-run-boundaries-'));
     return {
       repository: new JsonlEventRepository({ rootDir: directory, codec: agentEventCodec }),
       dispose: () => rm(directory, { recursive: true, force: true })
@@ -20,18 +20,18 @@ const stores = [
 
 for (const [storeName, createStore] of stores) {
   for (const timing of ['before', 'after']) {
-    test(`${storeName} operation acceptance has one explicit recovery state after a ${timing}-commit fault`, async () => {
+    test(`${storeName} run acceptance has one explicit recovery state after a ${timing}-commit fault`, async () => {
       const { repository, dispose } = await createStore();
       const runId = `${storeName}-accept-${timing}`;
       try {
         const faulted = new OneShotConditionalFault(repository, timing);
-        await assert.rejects(new AgentOperationCoordinator(faulted).accept(acceptance(runId)), /injected conditional append fault/u);
-        const operations = new AgentOperationCoordinator(repository);
+        await assert.rejects(new AgentRunCoordinator(faulted).accept(acceptance(runId)), /injected conditional append fault/u);
+        const runs = new AgentRunCoordinator(repository);
         if (timing === 'before') {
-          await assert.rejects(operations.inspect(runId), /no durable operation/u);
-          assert.deepEqual(await operations.listUnfinished(), []);
+          await assert.rejects(runs.inspect(runId), /no durable run/u);
+          assert.deepEqual(await runs.listUnfinished(), []);
         } else {
-          const recovered = await operations.inspect(runId);
+          const recovered = await runs.inspect(runId);
           assert.equal(recovered.state.phase.kind, 'accepted');
           assert.deepEqual(recovered.instruction, { kind: 'wait', reason: 'driver' });
         }
@@ -44,14 +44,14 @@ for (const [storeName, createStore] of stores) {
       const { repository, dispose } = await createStore();
       const runId = `${storeName}-claim-${timing}`;
       try {
-        const operations = new AgentOperationCoordinator(repository);
-        await operations.accept(acceptance(runId));
-        const faulted = new AgentOperationCoordinator(new OneShotConditionalFault(repository, timing));
+        const runs = new AgentRunCoordinator(repository);
+        await runs.accept(acceptance(runId));
+        const faulted = new AgentRunCoordinator(new OneShotConditionalFault(repository, timing));
         await assert.rejects(faulted.attach(runId, 'uncertain-driver'), /injected conditional append fault/u);
-        const afterFault = await operations.inspect(runId);
+        const afterFault = await runs.inspect(runId);
         assert.equal(afterFault.state.driverGeneration, timing === 'before' ? 0 : 1);
         assert.equal(afterFault.state.control.status, timing === 'before' ? 'detached' : 'owned');
-        const replacement = await operations.attach(runId, 'replacement-driver');
+        const replacement = await runs.attach(runId, 'replacement-driver');
         assert.equal(replacement.state().driverGeneration, timing === 'before' ? 1 : 2);
         assert.equal(replacement.state().control.status, 'owned');
         assert.equal(replacement.state().control.driverId, 'replacement-driver');
@@ -63,15 +63,15 @@ for (const [storeName, createStore] of stores) {
 }
 
 test('an integrity-audited corrupt JSONL run is quarantined before provider execution', async () => {
-  const directory = await mkdtemp(path.join(tmpdir(), 'agent-operation-quarantine-'));
-  const runId = 'quarantined-operation';
+  const directory = await mkdtemp(path.join(tmpdir(), 'agent-run-quarantine-'));
+  const runId = 'quarantined-run';
   try {
     const repository = new JsonlEventRepository({ rootDir: directory, codec: agentEventCodec });
-    const operations = new AgentOperationCoordinator(repository);
-    await operations.accept(acceptance(runId, {
+    const runs = new AgentRunCoordinator(repository);
+    await runs.accept(acceptance(runId, {
       providerId: 'quarantine-provider',
       providerImplementationId: 'agent-core.tests.quarantine-provider@1',
-      runtimeImplementationId: 'agent-core.runtime.operation-v1',
+      runtimeImplementationId: 'agent-core.runtime.run-v1',
       disposition: {
         implementationId: 'agent-core.disposition.accept-v1',
         policyIdentity: { strategy: 'accept' },
@@ -79,11 +79,11 @@ test('an integrity-audited corrupt JSONL run is quarantined before provider exec
       },
       policyHash: hashJson({ allowedRisks: ['read'] })
     }));
-    await operations.attach(runId, 'original-driver');
+    await runs.attach(runId, 'original-driver');
 
     const ledger = repository.location(runId);
     const lines = (await readFile(ledger, 'utf8')).split('\n');
-    lines[1] = lines[1].replace('Perform one durable operation.', 'Corrupt one durable operation.');
+    lines[1] = lines[1].replace('Perform one durable run.', 'Corrupt one durable run.');
     await writeFile(ledger, lines.join('\n'));
 
     const reopened = new JsonlEventRepository({ rootDir: directory, codec: agentEventCodec });
@@ -151,12 +151,12 @@ function acceptance(runId, configuration = {}) {
   return {
     runId,
     finalizationId: `${runId}:final`,
-    input: { task: 'Perform one durable operation.', instructions: [], contextItems: [] },
+    input: { task: 'Perform one durable run.', instructions: [], contextItems: [] },
     configuration: {
       providerId: 'fixture',
-      providerImplementationId: 'agent-core.tests.operation-boundary-provider@1',
+      providerImplementationId: 'agent-core.tests.run-boundary-provider@1',
       model: 'fixture',
-      runtimeImplementationId: 'agent-core.tests.operation-boundary-runtime@1',
+      runtimeImplementationId: 'agent-core.tests.run-boundary-runtime@1',
       toolImplementationIds: [],
       checks: [],
       disposition: {
@@ -164,7 +164,7 @@ function acceptance(runId, configuration = {}) {
         policyIdentity: { strategy: 'accept' },
         policyHash: hashJson({ strategy: 'accept' })
       },
-      policyHash: 'operation-boundary-policy',
+      policyHash: 'run-boundary-policy',
       ...configuration
     }
   };

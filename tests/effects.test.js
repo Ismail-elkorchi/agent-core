@@ -18,7 +18,7 @@ const digest = (character) => character.repeat(64);
 function intent(recovery = { kind: 'unknown' }) {
   return decodeExternalEffectIntent({
     effectId: 'effect-1',
-    operationId: 'operation-1',
+    ownerId: 'run-1',
     implementationId: 'tests/effect@1',
     parametersDigest: digest('a'),
     recovery,

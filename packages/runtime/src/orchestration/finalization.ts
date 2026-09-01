@@ -1,4 +1,4 @@
-import type { EventAppendReceipt, EventRepository } from '@agent-core/evidence';
+import type { EventAppendReceipt, EventRepository } from '@agent-core/persistence';
 import {
   AgentContractError,
   createAgentTerminalSnapshot,
@@ -46,17 +46,17 @@ export class AgentRunFinalizer {
     terminal: AgentTerminalSnapshot,
     diagnostic: Extract<AgentEvent, { type: 'run.ended' }>['diagnostic'] | undefined
   ): Promise<AgentEndedRunResult> {
-    const progress: MutableFinalizationProgress = { prepared: false, sessionProjected: false, committed: false };
+    const progress: MutableFinalizationProgress = { staged: false, sessionRecorded: false, committed: false };
     try {
       await this.input.append(
-        { type: 'finalization.prepared', terminal },
-        `${this.input.finalizationId}:prepared`
+        { type: 'run.finalization.staged', terminal },
+        `${this.input.finalizationId}:staged`
       );
-      progress.prepared = true;
+      progress.staged = true;
       if (this.input.session) {
-        await this.input.session.repository.projectFinal(this.input.session.descriptor, terminal);
+        await this.input.session.repository.recordRunFinalization(this.input.session.descriptor, terminal);
       }
-      progress.sessionProjected = true;
+      progress.sessionRecorded = true;
       await this.input.append(
         { type: 'run.ended', terminal, ...(diagnostic ? { diagnostic } : {}) },
         `${this.input.finalizationId}:committed`
@@ -96,26 +96,26 @@ export class AgentRunFinalizer {
   }
 
   private async auditProgress(terminal: AgentTerminalSnapshot, fallback: MutableFinalizationProgress): Promise<AgentFinalizationProgress> {
-    let prepared = fallback.prepared;
+    let staged = fallback.staged;
     let committed = fallback.committed;
     const expected = terminalSnapshotFingerprint(terminal);
     for await (const envelope of this.input.events.read(this.input.runId)) {
-      if (envelope.event.type !== 'finalization.prepared' && envelope.event.type !== 'run.ended') continue;
+      if (envelope.event.type !== 'run.finalization.staged' && envelope.event.type !== 'run.ended') continue;
       if (envelope.event.terminal.finalizationId !== this.input.finalizationId) continue;
       if (terminalSnapshotFingerprint(envelope.event.terminal) !== expected) throw new AgentContractError('Conflicting durable finalization record.', [`Finalization ${this.input.finalizationId} changed while persistence was being reconciled.`]);
-      if (envelope.event.type === 'finalization.prepared') prepared = true;
+      if (envelope.event.type === 'run.finalization.staged') staged = true;
       else committed = true;
     }
-    let sessionProjected = this.input.session === undefined || fallback.sessionProjected;
+    let sessionRecorded = this.input.session === undefined || fallback.sessionRecorded;
     if (this.input.session) {
       const replay = await this.input.session.repository.loadReplayState(this.input.session.descriptor);
-      for (const projection of replay.terminalProjections) {
-        if (projection.finalizationId !== this.input.finalizationId) continue;
-        if (terminalSnapshotFingerprint(projection.terminal) !== expected) throw new AgentContractError('Conflicting durable session projection.', [`Finalization ${this.input.finalizationId} changed while persistence was being reconciled.`]);
-        sessionProjected = true;
+      for (const finalization of replay.runFinalizations) {
+        if (finalization.finalizationId !== this.input.finalizationId) continue;
+        if (terminalSnapshotFingerprint(finalization.terminal) !== expected) throw new AgentContractError('Conflicting durable session finalization.', [`Finalization ${this.input.finalizationId} changed while persistence was being reconciled.`]);
+        sessionRecorded = true;
       }
     }
-    return Object.freeze({ prepared, sessionProjected, committed, reconciliation: 'verified' });
+    return Object.freeze({ staged, sessionRecorded, committed, reconciliation: 'verified' });
   }
 }
 
@@ -139,8 +139,8 @@ export async function readCommittedTerminal(
 }
 
 interface MutableFinalizationProgress {
-  prepared: boolean;
-  sessionProjected: boolean;
+  staged: boolean;
+  sessionRecorded: boolean;
   committed: boolean;
 }
 

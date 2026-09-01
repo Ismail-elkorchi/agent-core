@@ -4,7 +4,7 @@ import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { AgentRuntime, agentEventCodec, InMemorySessionRepository } from '@agent-core/runtime';
-import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/evidence';
+import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import {
   DEFAULT_LOCAL_TOOL_CONFIGURATION,
   LocalCommandExecution,

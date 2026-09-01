@@ -1,6 +1,6 @@
 # Agent Core
 
-Agent Core is a pre-alpha, provider-neutral runtime for tool-using model sessions. It preserves native tool protocols, records structured evidence, reduces context deterministically, and reports execution, candidate completeness, and verification independently.
+Agent Core is a pre-alpha, provider-neutral runtime for tool-using model sessions. It preserves native tool protocols, records structured observed facts, assembles causally ordered model windows, and reports execution, model-output completeness, and verification independently.
 
 Schema version `1` means the current schema only. The unpublished project intentionally has no compatibility readers or migrations.
 
@@ -10,13 +10,13 @@ Schema version `1` means the current schema only. The unpublished project intent
 | --- | --- |
 | `@agent-core/runtime` | Run orchestration, context, session contracts, verification, approvals, recovery, and terminal contracts; `@agent-core/runtime/node` adds JSONL sessions. |
 | `@agent-core/model` | Provider-neutral model contracts and validation. |
-| `@agent-core/evidence` | JSON/evidence contracts and in-memory repositories; `@agent-core/evidence/node` adds filesystem persistence. |
+| `@agent-core/persistence` | Hash-chain, artifact, redaction, and in-memory repository contracts; `@agent-core/persistence/node` adds filesystem persistence. |
 | `@agent-core/tools` | Generic tool contracts, effects, authorization, policy, and observations. |
 | `@agent-core/tools-local` | Node workspace read, search, patch, shell, and process tools. |
 | `@agent-core/auth` | Provider-neutral credential sources and local credential storage. |
 | `@agent-core/provider-*` | Ollama, OpenRouter, OpenAI Platform, OpenAI Codex, and shared Responses framing. |
 
-Applications choose providers, tools, checks, policies, authorization, and repositories. The runtime does not impose coding tools or model-based judging.
+Applications choose providers, prompt material, tools, checks, policies, authorization, and repositories. The runtime does not impose coding workspaces, writing evidence policy, or model-based judging. Public terminology is defined in [`docs/GLOSSARY.md`](docs/GLOSSARY.md).
 
 ## Validate
 

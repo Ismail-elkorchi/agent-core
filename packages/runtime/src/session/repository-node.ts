@@ -5,7 +5,7 @@ import {
   hashJson,
   type ArtifactRef,
   validateArtifactRef
-} from '@agent-core/evidence';
+} from '@agent-core/persistence';
 import { normalizeJsonSafe, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import {
   PersistenceConflictError,
@@ -20,7 +20,7 @@ import {
   withPersistenceFileLock,
   type JsonlLine,
   type JsonlStorageStamp
-} from '@agent-core/evidence/node';
+} from '@agent-core/persistence/node';
 import {
   createAgentTerminalSnapshot,
   decodeOwnedAgentTerminalSnapshot,
@@ -31,7 +31,7 @@ import {
   type AgentTurnIdentity,
   type AgentTerminalSnapshot
 } from '../run/contracts.js';
-import { decodeContextItemInput } from '../context/manager.js';
+import { decodePromptContextItemInput } from '../inference/prompt-material.js';
 import type {
   SessionDescriptor,
   BaseSessionEntry,
@@ -42,7 +42,7 @@ import type {
   SessionBranchPoint,
   SessionCompactionEntry,
   SessionConversationItem,
-  SessionFinalProjection,
+  SessionRunFinalization,
   SessionHeader,
   SessionInputEntry,
   SessionModelSettingsEntry,
@@ -103,7 +103,7 @@ export class JsonlSessionRepository implements SessionRepository {
       const serialized = `${JSON.stringify(header)}\n`;
       await fs.writeFile(this.filePath(id), serialized, { encoding: 'utf8', flag: 'wx' });
       const completeBytes = Buffer.byteLength(serialized, 'utf8');
-      const state: SessionAppendIndex = { header, branchEntries: [], projections: [], submissionRecords: [], completeBytes, boundaryMarker: Buffer.from(serialized).subarray(-256).toString('base64'), storageStamp: await jsonlStorageStamp(this.filePath(id)) };
+      const state: SessionAppendIndex = { header, branchEntries: [], finalizations: [], submissionRecords: [], completeBytes, boundaryMarker: Buffer.from(serialized).subarray(-256).toString('base64'), storageStamp: await jsonlStorageStamp(this.filePath(id)) };
       this.indexes.set(id, state);
       return sessionFromState(state);
     }));
@@ -148,12 +148,12 @@ export class JsonlSessionRepository implements SessionRepository {
     const tailStart = compactionIndex + 1;
     const tailRunIds = [...new Set(branch.slice(tailStart).flatMap((entry) => entry.type === 'input' ? [entry.runId] : []))];
     const branchIds = new Set(branch.slice(tailStart).map((entry) => entry.id));
-    const terminalProjections = Object.freeze(state.projections.filter((projection) => branchIds.has(projection.throughEntryId)));
-    const endedRunIds = new Set(terminalProjections.map((projection) => projection.runId));
+    const runFinalizations = Object.freeze(state.finalizations.filter((finalization) => branchIds.has(finalization.throughEntryId)));
+    const endedRunIds = new Set(runFinalizations.map((finalization) => finalization.runId));
     const openRunIds = tailRunIds.filter((runId) => !endedRunIds.has(runId));
-    const latestEndedRunId = terminalProjections.at(-1)?.runId;
+    const latestEndedRunId = runFinalizations.at(-1)?.runId;
     const ledgerRunIds = Object.freeze([...openRunIds, ...(latestEndedRunId ? [latestEndedRunId] : [])]);
-    return Object.freeze({ session: current, branch, terminalProjections, ...(compaction ? { compaction } : {}), ledgerRunIds });
+    return Object.freeze({ session: current, branch, runFinalizations, ...(compaction ? { compaction } : {}), ledgerRunIds });
   }
 
   async readConversation(session: SessionDescriptor): Promise<readonly SessionConversationItem[]> {
@@ -165,9 +165,9 @@ export class JsonlSessionRepository implements SessionRepository {
     const sessionId = session.id;
     const state = await this.enqueue(sessionId, () => this.refreshIndex(sessionId, false));
     assertDescriptor(session, state);
-    const points: SessionBranchPoint[] = state.projections.map((projection) => Object.freeze({
-      entryId: projection.throughEntryId, timestamp: projection.timestamp, kind: 'final' as const,
-      finalizationId: projection.finalizationId, runId: projection.runId
+    const points: SessionBranchPoint[] = state.finalizations.map((finalization) => Object.freeze({
+      entryId: finalization.throughEntryId, timestamp: finalization.timestamp, kind: 'run_finalization' as const,
+      finalizationId: finalization.finalizationId, runId: finalization.runId
     }));
     for (const entry of state.branchEntries) if (entry.type === 'compaction') points.push(Object.freeze({ entryId: entry.id, timestamp: entry.timestamp, kind: 'compaction' }));
     return Object.freeze(points);
@@ -205,7 +205,7 @@ export class JsonlSessionRepository implements SessionRepository {
       const existing = state.branchEntries.find((entry): entry is SessionAssistantEntry => entry.type === 'assistant'
         && entry.runId === input.runId && entry.turnId === input.identity.turnId && entry.requestAttempt === input.identity.requestAttempt);
       if (existing) {
-        if (existing.turnIndex !== input.identity.turnIndex || existing.content !== input.content) throw new PersistenceConflictError(`Conflicting assistant projection for ${input.runId}/${input.identity.turnId}/${String(input.identity.requestAttempt)}.`);
+        if (existing.turnIndex !== input.identity.turnIndex || existing.content !== input.content) throw new PersistenceConflictError(`Conflicting assistant finalization for ${input.runId}/${input.identity.turnId}/${String(input.identity.requestAttempt)}.`);
         return existing;
       }
       const entry: SessionAssistantEntry = Object.freeze({ ...baseEntry(branchLeaf(state.branchEntries)), type: 'assistant', runId: input.runId, ...input.identity, content: input.content });
@@ -289,7 +289,7 @@ export class JsonlSessionRepository implements SessionRepository {
       assertDescriptor(session, state);
       const source = state.branchEntries.find((entry) => entry.id === entryId);
       if (!source) throw new Error(`Cannot branch from unknown entry: ${entryId}`);
-      if (source.type !== 'compaction' && !state.projections.some((projection) => projection.throughEntryId === entryId)) {
+      if (source.type !== 'compaction' && !state.finalizations.some((finalization) => finalization.throughEntryId === entryId)) {
         throw new Error(`Session branches require a completed final or compaction entry: ${entryId}`);
       }
       const entry: SessionBranchMarkerEntry = Object.freeze({ ...baseEntry(entryId), type: 'branch', fromEntryId: entryId, ...(label ? { label } : {}) });
@@ -302,31 +302,31 @@ export class JsonlSessionRepository implements SessionRepository {
     }));
   }
 
-  projectFinal(session: SessionDescriptor, terminalInput: AgentTerminalSnapshot): Promise<SessionFinalProjection> {
+  recordRunFinalization(session: SessionDescriptor, terminalInput: AgentTerminalSnapshot): Promise<SessionRunFinalization> {
     const sessionId = session.id;
     return this.enqueue(sessionId, () => withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
       const terminal = createAgentTerminalSnapshot(terminalInput);
       const state = await this.refreshIndex(sessionId, true);
       assertDescriptor(session, state);
-      const existing = state.projections.find((projection) => projection.finalizationId === terminal.finalizationId);
+      const existing = state.finalizations.find((finalization) => finalization.finalizationId === terminal.finalizationId);
       if (existing) {
-        if (terminalSnapshotFingerprint(existing.terminal) !== terminalSnapshotFingerprint(terminal)) throw new PersistenceConflictError(`Conflicting session projection for finalization ${terminal.finalizationId}.`);
+        if (terminalSnapshotFingerprint(existing.terminal) !== terminalSnapshotFingerprint(terminal)) throw new PersistenceConflictError(`Conflicting session finalization for finalization ${terminal.finalizationId}.`);
         return existing;
       }
       const throughEntryId = branchLeaf(state.branchEntries);
       if (!throughEntryId || !activeBranch(state.branchEntries, throughEntryId).some((entry) => entry.type === 'input' && entry.runId === terminal.runId)) {
-        throw new Error(`Cannot project finalization ${terminal.finalizationId}: run ${terminal.runId} is not on the active session branch.`);
+        throw new Error(`Cannot record finalization ${terminal.finalizationId}: run ${terminal.runId} is not on the active session branch.`);
       }
-      const projection: SessionFinalProjection = Object.freeze({
-        type: 'final', id: randomUUID(), timestamp: new Date().toISOString(), throughEntryId, runId: terminal.runId,
+      const finalization: SessionRunFinalization = Object.freeze({
+        type: 'run_finalization', id: randomUUID(), timestamp: new Date().toISOString(), throughEntryId, runId: terminal.runId,
         finalizationId: terminal.finalizationId, terminal
       });
-      await appendJsonlRecord(this.filePath(sessionId), projection);
-      state.projections.push(projection);
-      state.completeBytes += recordBytes(projection);
+      await appendJsonlRecord(this.filePath(sessionId), finalization);
+      state.finalizations.push(finalization);
+      state.completeBytes += recordBytes(finalization);
       state.boundaryMarker = await jsonlBoundaryMarker(this.filePath(sessionId), state.completeBytes);
       state.storageStamp = await jsonlStorageStamp(this.filePath(sessionId));
-      return projection;
+      return finalization;
     }));
   }
 
@@ -410,7 +410,7 @@ export class JsonlSessionRepository implements SessionRepository {
       const state = committed.state;
       this.fullScans += 1;
       index.branchEntries.splice(0, index.branchEntries.length, ...state.branchEntries);
-      index.projections.splice(0, index.projections.length, ...state.projections);
+      index.finalizations.splice(0, index.finalizations.length, ...state.finalizations);
       index.submissionRecords.splice(0, index.submissionRecords.length, ...state.submissionRecords);
       index.completeBytes = committed.completeBytes;
       index.boundaryMarker = await jsonlBoundaryMarker(filePath, index.completeBytes);
@@ -427,12 +427,12 @@ export class JsonlSessionRepository implements SessionRepository {
       const actualLine = sessionRecordCount(index) + 2;
       const value = parseJson({ ...line, line: actualLine }, filePath);
       try {
-        if (isJsonObject(value) && value.type === 'final') index.projections.push(parseFinalProjection(value));
+        if (isJsonObject(value) && value.type === 'run_finalization') index.finalizations.push(parseRunFinalization(value));
         else if (isJsonObject(value) && typeof value.type === 'string' && value.type.startsWith('submission.')) index.submissionRecords.push(parseSubmissionRecord(value));
         else {
           const entry = parseBranchEntry(value);
-          if (entry.parentId !== null && !index.branchEntries.some((candidate) => candidate.id === entry.parentId)) throw new Error(`Unknown parent ${entry.parentId}.`);
-          if (index.branchEntries.some((candidate) => candidate.id === entry.id)) throw new Error(`Duplicate session entry ${entry.id}.`);
+          if (entry.parentId !== null && !index.branchEntries.some((modelOutput) => modelOutput.id === entry.parentId)) throw new Error(`Unknown parent ${entry.parentId}.`);
+          if (index.branchEntries.some((modelOutput) => modelOutput.id === entry.id)) throw new Error(`Duplicate session entry ${entry.id}.`);
           index.branchEntries.push(entry);
         }
       } catch (error) { throw corruption(filePath, actualLine, line.byteOffset, errorMessage(error), 'invalid_record'); }
@@ -461,13 +461,13 @@ export class JsonlSessionRepository implements SessionRepository {
   }
 }
 
-interface SessionFileState { readonly header: SessionHeader; readonly branchEntries: SessionBranchEntry[]; readonly projections: SessionFinalProjection[]; readonly submissionRecords: SessionSubmissionRecord[] }
+interface SessionFileState { readonly header: SessionHeader; readonly branchEntries: SessionBranchEntry[]; readonly finalizations: SessionRunFinalization[]; readonly submissionRecords: SessionSubmissionRecord[] }
 interface SessionAppendIndex extends SessionFileState { completeBytes: number; boundaryMarker: string; storageStamp: JsonlStorageStamp }
 function sessionUpdatedAt(state: SessionFileState): string {
-  return [...state.branchEntries, ...state.projections, ...state.submissionRecords]
+  return [...state.branchEntries, ...state.finalizations, ...state.submissionRecords]
     .reduce((latest, entry) => entry.timestamp > latest ? entry.timestamp : latest, state.header.timestamp);
 }
-function sessionRecordCount(state: SessionFileState): number { return state.branchEntries.length + state.projections.length + state.submissionRecords.length; }
+function sessionRecordCount(state: SessionFileState): number { return state.branchEntries.length + state.finalizations.length + state.submissionRecords.length; }
 
 async function readSessionFile(filePath: string, sessionId: string): Promise<{ readonly state: SessionFileState; readonly completeBytes: number }> {
   const committed = await readJsonlCommittedFile(filePath);
@@ -479,13 +479,13 @@ async function readSessionFile(filePath: string, sessionId: string): Promise<{ r
   try { header = parseSessionHeader(parseJson(headerLine, filePath), sessionId); }
   catch (error) { throw corruption(filePath, 1, 0, errorMessage(error), 'invalid_header'); }
   const branchEntries: SessionBranchEntry[] = [];
-  const projections: SessionFinalProjection[] = [];
+  const finalizations: SessionRunFinalization[] = [];
   const submissionRecords: SessionSubmissionRecord[] = [];
   for (const line of lines.slice(1)) {
     if (line.text.trim().length === 0) continue;
     const value = parseJson(line, filePath);
     try {
-      if (isJsonObject(value) && value.type === 'final') projections.push(parseFinalProjection(value));
+      if (isJsonObject(value) && value.type === 'run_finalization') finalizations.push(parseRunFinalization(value));
       else if (isJsonObject(value) && typeof value.type === 'string' && value.type.startsWith('submission.')) submissionRecords.push(parseSubmissionRecord(value));
       else branchEntries.push(parseBranchEntry(value));
     } catch (error) { throw corruption(filePath, line.line, line.byteOffset, errorMessage(error), 'invalid_record'); }
@@ -496,7 +496,7 @@ async function readSessionFile(filePath: string, sessionId: string): Promise<{ r
     const last = lines.at(-1);
     throw corruption(filePath, last?.line ?? 1, last?.byteOffset ?? 0, errorMessage(error), 'invalid_record');
   }
-  return { state: { header, branchEntries, projections, submissionRecords }, completeBytes: committed.completeBytes };
+  return { state: { header, branchEntries, finalizations, submissionRecords }, completeBytes: committed.completeBytes };
 }
 
 function parseBranchEntry(value: JsonValue): SessionBranchEntry {
@@ -511,12 +511,12 @@ function parseBranchEntry(value: JsonValue): SessionBranchEntry {
   if (isSessionCompactionEntry(value)) return value;
   throw new Error(`Unsupported or malformed session entry: ${typeof value.type === 'string' ? value.type : 'unknown'}`);
 }
-function parseFinalProjection(value: JsonObject): SessionFinalProjection {
-  if (typeof value.id !== 'string' || typeof value.timestamp !== 'string' || typeof value.throughEntryId !== 'string' || typeof value.runId !== 'string' || typeof value.finalizationId !== 'string') throw new Error('Final projection identity is invalid.');
-  if (!isJsonObject(value.terminal)) throw new Error('Final projection terminal is invalid.');
+function parseRunFinalization(value: JsonObject): SessionRunFinalization {
+  if (typeof value.id !== 'string' || typeof value.timestamp !== 'string' || typeof value.throughEntryId !== 'string' || typeof value.runId !== 'string' || typeof value.finalizationId !== 'string') throw new Error('Final finalization identity is invalid.');
+  if (!isJsonObject(value.terminal)) throw new Error('Final finalization terminal is invalid.');
   const terminal = decodeOwnedAgentTerminalSnapshot(value.terminal);
-  if (terminal.runId !== value.runId || terminal.finalizationId !== value.finalizationId) throw new Error('Final projection identity conflicts with terminal snapshot.');
-  return Object.freeze({ type: 'final', id: value.id, timestamp: value.timestamp, throughEntryId: value.throughEntryId, runId: value.runId, finalizationId: value.finalizationId, terminal });
+  if (terminal.runId !== value.runId || terminal.finalizationId !== value.finalizationId) throw new Error('Final finalization identity conflicts with terminal snapshot.');
+  return Object.freeze({ type: 'run_finalization', id: value.id, timestamp: value.timestamp, throughEntryId: value.throughEntryId, runId: value.runId, finalizationId: value.finalizationId, terminal });
 }
 function activeBranch(entries: readonly SessionBranchEntry[], leafId: string | null): SessionBranchEntry[] {
   const byId = new Map(entries.map((entry) => [entry.id, entry])); const output: SessionBranchEntry[] = []; let cursor = leafId;
@@ -680,14 +680,14 @@ function parseSubmissionRecord(value: JsonObject): SessionSubmissionRecord {
 function parseSuspension(value: JsonValue | undefined, submissionId: string, runId: string): import('./contracts.js').SessionSuspensionDescriptor {
   if (!isJsonObject(value) || value.submissionId !== submissionId || value.runId !== runId || !Array.isArray(value.actions)) throw new Error('Session suspension is invalid.');
   const requestValue = value.decisionRequest;
-  let decisionRequest: import('../operation/contracts.js').AgentDecisionRequest | undefined;
+  let decisionRequest: import('../run/control/contracts.js').AgentDecisionRequest | undefined;
   if (requestValue !== undefined) {
     if (!isJsonObject(requestValue) || typeof requestValue.id !== 'string' || typeof requestValue.reason !== 'string'
       || !Array.isArray(requestValue.choices) || !requestValue.choices.every((choice): choice is string => typeof choice === 'string')
-      || typeof requestValue.fingerprint !== 'string' || typeof requestValue.operationRevision !== 'number') throw new Error('Session decision request is invalid.');
+      || typeof requestValue.fingerprint !== 'string' || typeof requestValue.runRevision !== 'number') throw new Error('Session decision request is invalid.');
     decisionRequest = Object.freeze({
       id: requestValue.id, reason: requestValue.reason, choices: Object.freeze([...requestValue.choices]),
-      fingerprint: requestValue.fingerprint, operationRevision: requestValue.operationRevision
+      fingerprint: requestValue.fingerprint, runRevision: requestValue.runRevision
     });
   }
   return ownSessionSuspensionDescriptor({
@@ -722,7 +722,7 @@ function parseSubmissionInput(value: JsonObject): SessionSubmissionInput {
     || (value.contextItems !== undefined && !Array.isArray(value.contextItems))) throw new Error('Session submission input is invalid.');
   return Object.freeze({ task: value.task,
     ...(value.instructions === undefined ? {} : { instructions: Object.freeze([...value.instructions]) }),
-    ...(value.contextItems === undefined ? {} : { contextItems: Object.freeze(value.contextItems.map((item) => decodeContextItemInput(item))) }) });
+    ...(value.contextItems === undefined ? {} : { contextItems: Object.freeze(value.contextItems.map((item) => decodePromptContextItemInput(item))) }) });
 }
 
 function parseSubmissionConfiguration(value: JsonObject): SessionSubmissionConfiguration {
@@ -783,7 +783,7 @@ function encodeSuspension(suspension: import('./contracts.js').SessionSuspension
     ...(suspension.decisionRequest === undefined ? {} : { decisionRequest: Object.freeze({
       id: suspension.decisionRequest.id, reason: suspension.decisionRequest.reason,
       choices: Object.freeze([...suspension.decisionRequest.choices]), fingerprint: suspension.decisionRequest.fingerprint,
-      operationRevision: suspension.decisionRequest.operationRevision
+      runRevision: suspension.decisionRequest.runRevision
     }) })
   });
 }
@@ -816,17 +816,17 @@ function encodeSubmissionInput(input: SessionSubmissionInput): JsonObject {
 
 function encodeContextItem(item: NonNullable<SessionSubmissionInput['contextItems']>[number]): JsonObject {
   return Object.freeze({ sourceUri: item.sourceUri, sourceKind: item.sourceKind,
-    ...(item.confidence === undefined ? {} : { confidence: item.confidence }), representation: item.representation,
+    ...(item.integrity === undefined ? {} : { integrity: item.integrity }), representation: item.representation,
     mediaType: item.mediaType, title: item.title, content: item.content,
     ...(item.range === undefined ? {} : { range: Object.freeze({ kind: item.range.kind,
       ...(item.range.start === undefined ? {} : { start: item.range.start }), ...(item.range.end === undefined ? {} : { end: item.range.end }) }) }),
-    selectionReason: item.selectionReason, score: item.score,
+    purpose: item.purpose,
     ...(item.id === undefined ? {} : { id: item.id }), ...(item.tokenEstimate === undefined ? {} : { tokenEstimate: item.tokenEstimate }) });
 }
 
 function assertStableBranch(state: SessionFileState): void {
   const branch = activeBranch(state.branchEntries, branchLeaf(state.branchEntries));
-  const completed = new Set(state.projections.map((projection) => projection.runId));
+  const completed = new Set(state.finalizations.map((finalization) => finalization.runId));
   if (branch.some((entry) => entry.type === 'input' && !completed.has(entry.runId))) throw new Error('Session compaction requires every run on the active branch to be finalized.');
 }
 

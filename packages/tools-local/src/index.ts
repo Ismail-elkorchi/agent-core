@@ -1,7 +1,6 @@
 export * from './core/configuration.js';
 export * from './core/command-execution.js';
 export * from './core/workspace-snapshot.js';
-export * from './core/candidate-workspace.js';
 export * from './core/rooted-file-selection.js';
 export {
   RootedFileAuthority,
@@ -21,9 +20,9 @@ export {
   type TextPatchJournalAuthority,
   type TextTransactionReceipt,
   type TextTransactionResult,
-  type PreparedTextPatchWrite,
-  type PreparedTextPatchRemove,
-  type PreparedTextPatchTransaction
+  type TextPatchWritePlan,
+  type TextPatchRemovePlan,
+  type TextPatchTransactionPlan
 } from './core/text-write.js';
 export * from './host.js';
 export * from './tools/list-directory/index.js';

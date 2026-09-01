@@ -1,4 +1,4 @@
-import { canonicalJsonString } from '@agent-core/evidence';
+import { canonicalJsonString } from '@agent-core/persistence';
 import type { ModelPricing, ModelUsage } from '@agent-core/model';
 import {
   systemAgentClock,
@@ -39,12 +39,12 @@ export class AgentRunController {
   private readonly startedAt: number;
   private readonly initialElapsedMs: number;
   private readonly callCounts = new Map<string, number>();
-  private currentPhase: AgentRunPhase = 'preparing';
+  private currentPhase: AgentRunPhase = 'initializing';
   private state: Omit<AgentRunBudgetState, 'elapsedMs'> = {
     modelTurns: 0,
     totalToolCalls: 0,
     repeatedIdenticalToolCalls: 0,
-    candidateRevisions: 0,
+    revisionAttempts: 0,
     promptTokens: 0,
     completionTokens: 0,
     cacheReadTokens: 0,
@@ -89,7 +89,7 @@ export class AgentRunController {
 
   get phase(): AgentRunPhase { return this.currentPhase; }
 
-  transition(phase: Exclude<AgentRunPhase, 'preparing' | 'waiting_for_approval' | 'ended'>): void { this.setPhase(phase); }
+  transition(phase: Exclude<AgentRunPhase, 'initializing' | 'waiting_for_approval' | 'ended'>): void { this.setPhase(phase); }
 
   waitForApproval(): void { this.setPhase('waiting_for_approval'); }
 
@@ -100,7 +100,7 @@ export class AgentRunController {
   private setPhase(next: AgentRunPhase): void {
     const previous = this.currentPhase;
     if (previous === next) return;
-    const allowed = (previous === 'preparing' && (next === 'requesting_model' || next === 'finalizing'))
+    const allowed = (previous === 'initializing' && (next === 'requesting_model' || next === 'finalizing'))
       || (previous === 'requesting_model' && (next === 'executing_tools' || next === 'verifying' || next === 'finalizing'))
       || (previous === 'executing_tools' && (next === 'waiting_for_approval' || next === 'requesting_model' || next === 'finalizing'))
       || (previous === 'waiting_for_approval' && (next === 'executing_tools' || next === 'finalizing'))
@@ -120,14 +120,14 @@ export class AgentRunController {
     this.state = { ...this.state, modelTurns: this.state.modelTurns + 1 };
   }
 
-  recordCandidateRevision(): void {
+  recordRevisionAttempt(): void {
     this.assertElapsed();
     const previous = this.snapshot();
-    const revisions = this.state.candidateRevisions + 1;
-    if (revisions > this.limits.candidateRevisions) {
-      throw this.limitError('candidate_revisions', revisions, this.limits.candidateRevisions, 1, previous, { ...previous, candidateRevisions: revisions }, false);
+    const revisions = this.state.revisionAttempts + 1;
+    if (revisions > this.limits.revisionAttempts) {
+      throw this.limitError('revision_attempts', revisions, this.limits.revisionAttempts, 1, previous, { ...previous, revisionAttempts: revisions }, false);
     }
-    this.state = { ...this.state, candidateRevisions: revisions };
+    this.state = { ...this.state, revisionAttempts: revisions };
   }
 
   recordToolCalls(calls: readonly ToolCall[]): void {
@@ -217,7 +217,7 @@ function calculateCost(usage: ModelUsage, pricing: ModelPricing | undefined): { 
   const cacheWrite = Math.min(usage.promptTokens - cacheRead, usage.cacheWriteTokens ?? 0);
   const regularInput = Math.max(0, usage.promptTokens - cacheRead - cacheWrite);
   const tier = pricing?.inputTiers
-    ?.filter((candidate) => usage.promptTokens > candidate.aboveInputTokens)
+    ?.filter((modelOutput) => usage.promptTokens > modelOutput.aboveInputTokens)
     .sort((left, right) => right.aboveInputTokens - left.aboveInputTokens)[0];
   const inputMultiplier = tier?.inputMultiplier ?? 1;
   const outputMultiplier = tier?.outputMultiplier ?? 1;

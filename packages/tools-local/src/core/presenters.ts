@@ -157,7 +157,7 @@ export const presentApplyPatchObservation: Presenter = ({ observation, maxTokens
   ]);
   const base = resultBase('Patch transaction', observation, {});
   let results: JsonObject = {
-    operationStatus: value(output.operationStatus), transactionOutcome: value(output.transactionOutcome), rootState: value(output.rootState), dryRun: value(output.dryRun),
+    applicationStatus: value(output.applicationStatus), transactionOutcome: value(output.transactionOutcome), rootState: value(output.rootState), dryRun: value(output.dryRun),
     files, affectedPaths, changedPaths: value(output.changedPaths), wouldChangePaths: value(output.wouldChangePaths),
     createdPaths: value(output.createdPaths), deletedPaths: value(output.deletedPaths), movedPaths: value(output.movedPaths),
     potentiallyAffectedPaths: value(output.potentiallyAffectedPaths), totalOperationCount: value(output.totalOperationCount),
@@ -166,7 +166,7 @@ export const presentApplyPatchObservation: Presenter = ({ observation, maxTokens
   };
   if (!fits({ ...base, results }, maxTokens)) {
     results = {
-      operationStatus: value(output.operationStatus), transactionOutcome: value(output.transactionOutcome), rootState: value(output.rootState), files, affectedPaths,
+      applicationStatus: value(output.applicationStatus), transactionOutcome: value(output.transactionOutcome), rootState: value(output.rootState), files, affectedPaths,
       totalOperationCount: value(output.totalOperationCount), totalAdditions: value(output.totalAdditions), totalDeletions: value(output.totalDeletions),
       transaction: compactTransaction(output.transaction, 96)
     };
@@ -186,14 +186,14 @@ export const presentEditTextObservation: Presenter = ({ observation, maxTokens }
   }));
   const base = resultBase('Text edit transaction', observation, {});
   let results: JsonObject = {
-    operationStatus: value(output.operationStatus), transactionOutcome: value(output.transactionOutcome), rootState: value(output.rootState), dryRun: value(output.dryRun),
+    applicationStatus: value(output.applicationStatus), transactionOutcome: value(output.transactionOutcome), rootState: value(output.rootState), dryRun: value(output.dryRun),
     files, changedPaths: value(output.changedPaths), wouldChangePaths: value(output.wouldChangePaths),
     potentiallyAffectedPaths: value(output.potentiallyAffectedPaths), diffSummary: value(output.diffSummary),
     transaction: compactTransaction(output.transaction, 512)
   };
   if (!fits({ ...base, results }, maxTokens)) {
     results = {
-      operationStatus: value(output.operationStatus), transactionOutcome: value(output.transactionOutcome), rootState: value(output.rootState),
+      applicationStatus: value(output.applicationStatus), transactionOutcome: value(output.transactionOutcome), rootState: value(output.rootState),
       files: files.map((file) => ({ path: file.path, changed: file.changed, finalState: file.finalState, newSha256: file.newSha256 })),
       changedPaths: value(output.changedPaths), wouldChangePaths: value(output.wouldChangePaths),
       transaction: compactTransaction(output.transaction, 96)
@@ -313,7 +313,7 @@ function compactTransaction(value: JsonValue | undefined, messageChars: number):
 }
 function compactTransactionDiagnostic(value: JsonObject, messageChars: number): JsonObject {
   return {
-    operation: value.operation ?? null, path: value.path ?? null, code: value.code ?? null,
+    action: value.action ?? null, path: value.path ?? null, code: value.code ?? null,
     message: typeof value.message === 'string' ? takeChars(value.message, messageChars) : ''
   };
 }

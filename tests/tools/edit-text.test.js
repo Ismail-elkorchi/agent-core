@@ -6,13 +6,13 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   createToolCall,
-  prepareToolCall,
-  recoverPreparedToolCall,
-  releasePreparedToolCall
+  planToolCall,
+  recoverToolCallPlan,
+  releaseToolCallPlan
 } from '@agent-core/tools';
 import { issueEffectStartTicket, NO_EFFECT_EXPOSURE, startExternalEffect } from '@agent-core/effects';
 import { DEFAULT_LOCAL_TOOL_CONFIGURATION, editTextTool } from '@agent-core/tools-local';
-import { invokePreparedForTest, invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
+import { invokePlannedForTest, invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
 import { testPatchJournal, testRootedFileAuthority } from '../rooted-file-authority-helper.js';
 
 const policy = { allowedRisks: ['read', 'write'] };
@@ -61,7 +61,7 @@ test('edit_text applies ordered Unicode-scalar replacements across files in one 
   ] }), [editTextTool], context);
 
   assert.equal(observation.ok, true);
-  assert.equal(observation.output.operationStatus, 'applied');
+  assert.equal(observation.output.applicationStatus, 'applied');
   assert.equal(observation.output.transactionOutcome, 'committed');
   assert.deepEqual(observation.output.changedPaths, ['first.txt', 'second.txt']);
   assert.equal(observation.output.files[0].newlineConvention, 'crlf');
@@ -107,14 +107,14 @@ test('edit_text revalidates physical identity immediately before publication and
   ] }), [editTextTool], {
     ...context,
     async persistProgressCheckpoint(progress) {
-      if (replaced || progress.stage !== 'text_edit_prepared') return;
+      if (replaced || progress.stage !== 'text_edit_planned') return;
       replaced = true;
       await rename(path.join(root, 'second.txt'), path.join(root, 'second-original.txt'));
       await writeFile(path.join(root, 'second.txt'), 'replacement\n');
     }
   });
   assert.equal(replaced, true);
-  assert.equal(observation.output.operationStatus, 'not_applied');
+  assert.equal(observation.output.applicationStatus, 'not_applied');
   assert.equal(observation.output.transactionOutcome, 'rolled_back');
   assert.equal(await readFile(path.join(root, 'first.txt'), 'utf8'), 'first old\n');
   assert.equal(await readFile(path.join(root, 'second.txt'), 'utf8'), 'replacement\n');
@@ -127,7 +127,7 @@ test('edit_text dry-run and abort-before-commit never mutate content', async () 
   await writeFile(path.join(root, 'note.txt'), original);
   const file = { path: 'note.txt', expectedSha256: sha(original), edits: [{ range: range(1, 1, 1, 7), expectedText: 'before', replacementText: 'after' }] };
   const dry = await invokeToolCall(jsonToolCall('edit_text', { files: [file], dryRun: true }), [editTextTool], { ...context, invocation: undefined, policy: { allowedRisks: ['read'] } });
-  assert.equal(dry.output.operationStatus, 'dry_run');
+  assert.equal(dry.output.applicationStatus, 'dry_run');
   assert.deepEqual(dry.output.changedPaths, []);
   assert.deepEqual(dry.output.wouldChangePaths, ['note.txt']);
   assert.equal(await readFile(path.join(root, 'note.txt'), 'utf8'), original);
@@ -137,7 +137,7 @@ test('edit_text dry-run and abort-before-commit never mutate content', async () 
     ...context,
     invocation: invocation(),
     signal: controller.signal,
-    persistProgressCheckpoint(progress) { if (progress.stage === 'text_edit_prepared') controller.abort('abort before text commit'); }
+    persistProgressCheckpoint(progress) { if (progress.stage === 'text_edit_planned') controller.abort('abort before text commit'); }
   });
   await assert.rejects(aborted, /abort before text commit|abort/iu);
   assert.equal(await readFile(path.join(root, 'note.txt'), 'utf8'), original);
@@ -150,25 +150,25 @@ test('edit_text reconciles a committed receipt idempotently without re-executing
   const call = createToolCall(jsonToolCall('edit_text', { files: [{
     path: 'note.txt', expectedSha256: sha(original), edits: [{ range: range(1, 1, 1, 4), expectedText: 'old', replacementText: 'new' }]
   }] }));
-  const preparationContext = {
+  const planningContext = {
     ...context,
     signal: new AbortController().signal,
     boundary: { authorizationPolicyId: 'tests/edit-recovery@1', executionTargetId: root }
   };
-  const first = await prepareToolCall(call, [editTextTool], preparationContext);
+  const first = await planToolCall(call, [editTextTool], planningContext);
   assert.equal(first.ok, true);
-  const applied = await invokePreparedForTest(first.prepared, preparationContext);
-  assert.equal(applied.output.operationStatus, 'applied');
+  const applied = await invokePlannedForTest(first.plan, planningContext);
+  assert.equal(applied.output.applicationStatus, 'applied');
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const prepared = await prepareToolCall(call, [editTextTool], preparationContext);
-    assert.equal(prepared.ok, true);
-    const started = startedEffect(prepared.prepared, attempt);
-    const recovered = await recoverPreparedToolCall(prepared.prepared, started, preparationContext);
+    const plan = await planToolCall(call, [editTextTool], planningContext);
+    assert.equal(plan.ok, true);
+    const started = startedEffect(plan.plan, attempt);
+    const recovered = await recoverToolCallPlan(plan.plan, started, planningContext);
     assert.equal(recovered.status, 'settled');
-    assert.equal(recovered.observation.output.operationStatus, 'applied');
+    assert.equal(recovered.observation.output.applicationStatus, 'applied');
     assert.deepEqual(recovered.observation.output.changedPaths, ['note.txt']);
-    await releasePreparedToolCall(prepared.prepared);
+    await releaseToolCallPlan(plan.plan);
   }
   assert.equal(await readFile(path.join(root, 'note.txt'), 'utf8'), 'new value\n');
 });
@@ -176,15 +176,15 @@ test('edit_text reconciles a committed receipt idempotently without re-executing
 function range(startLine, startColumn, endLine, endColumn) {
   return { start: { line: startLine, column: startColumn }, end: { line: endLine, column: endColumn } };
 }
-function startedEffect(prepared, attempt) {
+function startedEffect(plan, attempt) {
   const effectId = `edit-recovery-${String(attempt)}`;
   const issued = issueEffectStartTicket({
     intent: {
       effectId,
-      operationId: 'edit-recovery',
-      implementationId: prepared.toolImplementationId,
-      parametersDigest: prepared.fingerprint,
-      recovery: prepared.effects.recovery,
+      ownerId: 'edit-recovery',
+      implementationId: plan.toolImplementationId,
+      parametersDigest: plan.fingerprint,
+      recovery: plan.effects.recovery,
       exposure: NO_EFFECT_EXPOSURE
     },
     ticketId: `${effectId}-ticket`,

@@ -1,10 +1,10 @@
 import {
   defineTool,
   isCommandExecution,
-  prepareCommandExecution,
+  planCommandExecution,
   requireToolService,
-  releasePreparedCommandExecution,
-  startPreparedCommandExecution,
+  releaseCommandExecutionPlan,
+  startCommandExecutionPlan,
   type CommandExecution,
   type CommandExecutionOwner
 } from '@agent-core/tools';
@@ -41,7 +41,7 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
         outputTokenBudget: clampRequestedLimit(input.outputTokenBudget, limits.maxOutputTokens),
         owner
       });
-      const preparation = await prepareCommandExecution(executor, {
+      const reservation = await planCommandExecution(executor, {
         command: request.command,
         rootedDirectory: request.workdir,
         pty: request.pty,
@@ -50,8 +50,8 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
         outputTokenBudget: request.outputTokenBudget,
         owner
       });
-      await context.preparation.own({ release: () => releasePreparedCommandExecution(executor, preparation) });
-      return Object.freeze({ ...request, executor, preparation });
+      await context.lifetime.own({ release: () => releaseCommandExecutionPlan(executor, reservation) });
+      return Object.freeze({ ...request, executor, reservation });
     },
     snapshotInput(input) {
       return Object.freeze({
@@ -61,7 +61,7 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
         timeoutMs: input.timeoutMs,
         yieldMs: input.yieldMs,
         outputTokenBudget: input.outputTokenBudget,
-        execution: input.preparation.authorization
+        execution: input.reservation.authorization
       });
     },
     deriveEffects() {
@@ -71,7 +71,7 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
       await context.emitProgress?.({ type: 'status', stage: 'process_starting', message: 'Starting command.' });
       let result;
       try {
-        result = await startPreparedCommandExecution(input.executor, input.preparation, {
+        result = await startCommandExecutionPlan(input.executor, input.reservation, {
           ...(context.signal ? { signal: context.signal } : {}), ...(context.resourceLease ? { lease: context.resourceLease } : {}),
           onProgress: (progress) => context.emitProgress?.(progress)
         });

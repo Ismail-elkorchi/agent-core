@@ -4,21 +4,21 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import * as z from 'zod';
-import { createToolCall, defineTool, enforceAllowedEffects, prepareToolCall } from '@agent-core/tools';
+import { createToolCall, defineTool, enforceAllowedEffects, planToolCall } from '@agent-core/tools';
 import { applyPatchTool, DEFAULT_LOCAL_TOOL_CONFIGURATION } from '@agent-core/tools-local';
 import { testRootedFileAuthority } from '../rooted-file-authority-helper.js';
 
 const boundary = { authorizationPolicyId: 'tests/authorization@1', executionTargetId: 'rooted-authority' };
 const signal = new AbortController().signal;
 
-async function prepared(call, tools, policy, services = {}) {
-  const result = await prepareToolCall(createToolCall(call), tools, { policy, services, signal, boundary });
+async function plan(call, tools, policy, services = {}) {
+  const result = await planToolCall(createToolCall(call), tools, { policy, services, signal, boundary });
   assert.equal(result.ok, true, result.ok ? '' : result.observation.summary);
-  return result.prepared;
+  return result.plan;
 }
 
-function request(call, preparedCall, policy, services = {}) {
-  return { call, toolImplementationId: preparedCall.toolImplementationId, input: preparedCall.canonicalSnapshot, effects: preparedCall.effects, fingerprint: preparedCall.fingerprint, context: { policy, services, signal, boundary } };
+function request(call, plannedCall, policy, services = {}) {
+  return { call, toolImplementationId: plannedCall.toolImplementationId, input: plannedCall.canonicalSnapshot, effects: plannedCall.effects, fingerprint: plannedCall.fingerprint, context: { policy, services, signal, boundary } };
 }
 
 test('a read-only policy denies a writing apply_patch call before approval', async () => {
@@ -26,8 +26,8 @@ test('a read-only policy denies a writing apply_patch call before approval', asy
   const call = { name: 'apply_patch', input: { kind: 'text', value: '*** Begin Patch\n*** Add File: created.txt\n+created\n*** End Patch' } };
   const policy = { allowedRisks: ['read'] };
   const services = { rootedFileAuthority: testRootedFileAuthority(root), localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION };
-  const preparedCall = await prepared(call, [applyPatchTool], policy, services);
-  const denial = enforceAllowedEffects(request(call, preparedCall, policy, services));
+  const plannedCall = await plan(call, [applyPatchTool], policy, services);
+  const denial = enforceAllowedEffects(request(call, plannedCall, policy, services));
   assert.deepEqual(denial.decision, 'deny');
   assert.match(denial.reason, /write/u);
 });
@@ -42,7 +42,7 @@ test('an allowed write may require approval but approval never adds a denied ris
   });
   const call = { name: 'write', input: { kind: 'json', value: {} } };
   const allowedPolicy = { allowedRisks: ['read', 'write'] };
-  const allowed = await prepared(call, [writeTool], allowedPolicy);
+  const allowed = await plan(call, [writeTool], allowedPolicy);
   assert.equal(enforceAllowedEffects(request(call, allowed, allowedPolicy)), undefined);
   const approvalDecision = enforceAllowedEffects(request(call, allowed, allowedPolicy)) ?? { decision: 'require_approval', reason: 'confirm write' };
   assert.equal(approvalDecision.decision, 'require_approval');
@@ -57,7 +57,7 @@ test('delete may require approval only when destructive authority is already all
   const call = { name: 'apply_patch', input: { kind: 'text', value: '*** Begin Patch\n*** Delete File: delete.txt\n*** End Patch' } };
   const services = { rootedFileAuthority: testRootedFileAuthority(root), localToolConfiguration: DEFAULT_LOCAL_TOOL_CONFIGURATION };
   const allowedPolicy = { allowedRisks: ['read', 'write', 'destructive'] };
-  const allowed = await prepared(call, [applyPatchTool], allowedPolicy, services);
+  const allowed = await plan(call, [applyPatchTool], allowedPolicy, services);
   assert.equal(enforceAllowedEffects(request(call, allowed, allowedPolicy, services)), undefined);
   const approval = enforceAllowedEffects(request(call, allowed, allowedPolicy, services)) ?? { decision: 'require_approval', reason: 'confirm delete' };
   assert.equal(approval.decision, 'require_approval');
@@ -78,8 +78,8 @@ test('a mixed-access call is denied when any one derived access is prohibited', 
   });
   const call = { name: 'mixed', input: { kind: 'json', value: {} } };
   const policy = { allowedRisks: ['read'] };
-  const preparedCall = await prepared(call, [mixed], policy);
-  const denial = enforceAllowedEffects(request(call, preparedCall, policy));
+  const plannedCall = await plan(call, [mixed], policy);
+  const denial = enforceAllowedEffects(request(call, plannedCall, policy));
   assert.equal(denial.decision, 'deny');
   assert.match(denial.reason, /network/u);
 });

@@ -4,7 +4,7 @@ import { access, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promi
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { LocalArtifactRepository } from '@agent-core/evidence/node';
+import { LocalArtifactRepository } from '@agent-core/persistence/node';
 import { DEFAULT_LOCAL_TOOL_CONFIGURATION, LocalCommandExecution } from '@agent-core/tools-local';
 import { testRootedFileAuthority } from '../rooted-file-authority-helper.js';
 
@@ -129,8 +129,8 @@ function request(rootedDirectory, source, overrides = {}) {
 }
 async function startCommand(manager, input) {
   const { onProgress, ...request } = input;
-  const prepared = await manager.prepare(request);
-  return manager.start(prepared, onProgress ? { onProgress } : {});
+  const plan = await manager.plan(request);
+  return manager.start(plan, onProgress ? { onProgress } : {});
 }
 async function context() {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-process-faults-'));

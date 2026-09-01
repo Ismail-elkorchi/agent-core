@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { type ToolExecutionContext, type ToolObservationInput } from '@agent-core/tools';
 import { fileScope } from '../../core/resources.js';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
-import { builtInReadEvidence } from '../../core/read-evidence.js';
+import { builtInObservedFacts } from '../../core/read-observed-facts.js';
 import { requireRootedFileAuthority } from '../../core/rooted-files.js';
 import { rootedFileSelector } from '../../core/rooted-file-selection.js';
 import { rootedFileIdentitiesEqual, type RootedFileHandle, type RootedFileAuthority } from '../../core/rooted-file-authority.js';
@@ -118,13 +118,13 @@ export async function searchText(input: SearchTextInput, context: ToolExecutionC
         + (output.countCoverage === 'complete' ? '' : 'at least ') + String(output.matchingLineCount) + ' lines in ' + String(output.matchingFileCount) + ' files.'
       : 'Search failed: ' + status + '.',
     scope,
-    evidence: builtInReadEvidence(
+    observedFacts: builtInObservedFacts(
       'search',
       scope,
       `Searched ${String(output.examinedFileCount)} files and reported ${String(output.occurrenceCount)} occurrences.`,
       {
         outcome: status === 'completed' || status === 'partial' ? 'success' : 'failure',
-        confidence: output.countsCapped || output.outputTruncated ? 'unverified' : 'verified'
+        actuality: output.countsCapped || output.outputTruncated ? 'predicted' : 'observed'
       }
     ),
     output

@@ -12,32 +12,32 @@ const ownedJournals = new WeakSet<TextPatchJournal>();
 const MAX_JOURNAL_MANIFEST_BYTES = 16 * 1024 * 1024;
 const RECEIPTS_DIRECTORY = '.receipts';
 
-interface PreparedTextPatchWriteBase {
+interface TextPatchWritePlanBase {
   readonly path: string;
   readonly content: string;
   readonly mode?: number;
 }
 
-export type PreparedTextPatchWrite =
-  | PreparedTextPatchWriteBase & {
+export type TextPatchWritePlan =
+  | TextPatchWritePlanBase & {
     readonly overwrite: true;
     readonly expectedCurrentSha256: string;
     readonly expectedCurrentIdentity: RootedFileIdentity;
   }
-  | PreparedTextPatchWriteBase & {
+  | TextPatchWritePlanBase & {
     readonly overwrite: false;
     readonly expectedAbsent: true;
   };
 
-export interface PreparedTextPatchRemove {
+export interface TextPatchRemovePlan {
   readonly path: string;
   readonly expectedCurrentSha256: string;
   readonly expectedCurrentIdentity: RootedFileIdentity;
 }
 
-export interface PreparedTextPatchTransaction {
-  readonly writes: readonly PreparedTextPatchWrite[];
-  readonly removes: readonly PreparedTextPatchRemove[];
+export interface TextPatchTransactionPlan {
+  readonly writes: readonly TextPatchWritePlan[];
+  readonly removes: readonly TextPatchRemovePlan[];
   readonly parentDirsToCreate?: readonly string[];
 }
 
@@ -46,7 +46,7 @@ export interface TextTransactionOptions {
   readonly transactionId?: string;
   readonly recoveryPayload?: JsonObject;
 }
-export interface TextTransactionDiagnostic { readonly operation: string; readonly path: string; readonly message: string; readonly code?: string }
+export interface TextTransactionDiagnostic { readonly action: string; readonly path: string; readonly message: string; readonly code?: string }
 export type TextTransactionRecovery =
   | { readonly status: 'succeeded'; readonly diagnostics: readonly []; readonly strandedPaths: readonly [] }
   | { readonly status: 'failed' | 'uncertain'; readonly diagnostics: readonly TextTransactionDiagnostic[]; readonly strandedPaths: readonly string[] };
@@ -65,7 +65,7 @@ export interface TextTransactionReceipt {
 }
 
 export interface TextPatchJournalAuthority {
-  commit(transaction: PreparedTextPatchTransaction, options?: TextTransactionOptions): Promise<TextTransactionResult>;
+  commit(transaction: TextPatchTransactionPlan, options?: TextTransactionOptions): Promise<TextTransactionResult>;
   receipt(transactionId: string): Promise<TextTransactionReceipt | undefined>;
 }
 
@@ -109,7 +109,7 @@ export class TextPatchJournal {
         await recoverTransactions(root, authorityPath);
         let active = true;
         const authority: TextPatchJournalAuthority = Object.freeze({
-          commit: async (transaction: PreparedTextPatchTransaction, options: TextTransactionOptions = {}) => {
+          commit: async (transaction: TextPatchTransactionPlan, options: TextTransactionOptions = {}) => {
             this.#assertOpen();
             if (!active) throw new Error('Patch journal operation authority has expired.');
             await assertOwned();
@@ -157,7 +157,7 @@ export function withTextFilePatchJournal<T>(root: RootedFileAuthority, journal: 
   return journal.withAuthority(root, operation, signal);
 }
 
-export function commitTextFilePatchTransaction(root: RootedFileAuthority, journal: TextPatchJournal, transaction: PreparedTextPatchTransaction, options: TextTransactionOptions = {}): Promise<TextTransactionResult> {
+export function commitTextFilePatchTransaction(root: RootedFileAuthority, journal: TextPatchJournal, transaction: TextPatchTransactionPlan, options: TextTransactionOptions = {}): Promise<TextTransactionResult> {
   return journal.withAuthority(root, (authority) => authority.commit(transaction, options), options.signal);
 }
 
@@ -191,14 +191,14 @@ interface JournalManifest {
   readonly version: 1;
   readonly transactionId: string;
   readonly transactionDigest: string;
-  readonly phase: 'prepared' | 'committed';
+  readonly phase: 'planned' | 'committed';
   readonly createdDirectories: readonly JournalCreatedDirectory[];
   readonly writes: readonly JournalWrite[];
   readonly removes: readonly JournalRemove[];
   readonly recoveryPayload?: JsonObject;
 }
 
-async function commitTransaction(root: RootedFileAuthority, journalDirectory: string, transaction: PreparedTextPatchTransaction, options: TextTransactionOptions): Promise<TextTransactionResult> {
+async function commitTransaction(root: RootedFileAuthority, journalDirectory: string, transaction: TextPatchTransactionPlan, options: TextTransactionOptions): Promise<TextTransactionResult> {
   throwIfAborted(options.signal);
   const transactionId = safeTransactionId(options.transactionId ?? randomUUID());
   const token = createHash('sha256').update(transactionId).digest('hex').slice(0, 20);
@@ -239,7 +239,7 @@ async function commitTransaction(root: RootedFileAuthority, journalDirectory: st
     }
   }
   let manifest: JournalManifest = {
-    version: 1, transactionId, transactionDigest, phase: 'prepared', createdDirectories, writes, removes,
+    version: 1, transactionId, transactionDigest, phase: 'planned', createdDirectories, writes, removes,
     ...(recoveryPayload ? { recoveryPayload } : {})
   };
   validateManifest(root, manifest);
@@ -252,7 +252,7 @@ async function commitTransaction(root: RootedFileAuthority, journalDirectory: st
     manifest = await createParents(root, manifestPath, manifest);
     for (const [index, write] of writes.entries()) {
       const source = transaction.writes[index];
-      if (!source) throw new Error(`Missing prepared patch write ${String(index)}.`);
+      if (!source) throw new Error(`Missing planned patch write ${String(index)}.`);
       await withParent(root, write.path, async (directory) => { await directory.writeExclusive(write.stageName, source.content, write.mode); await directory.sync(); });
     }
     await validatePreconditions(root, writes, removes);
@@ -271,7 +271,7 @@ async function commitTransaction(root: RootedFileAuthority, journalDirectory: st
       outcome: 'committed_with_residue',
       cleanup: {
         status: 'uncertain',
-        diagnostics: [{ operation: 'complete_patch_cleanup', path: transactionDirectory, message: 'Committed content cleanup has not completed.' }],
+        diagnostics: [{ action: 'complete_patch_cleanup', path: transactionDirectory, message: 'Committed content cleanup has not completed.' }],
         strandedPaths: [transactionDirectory]
       }
     };
@@ -296,7 +296,7 @@ async function commitTransaction(root: RootedFileAuthority, journalDirectory: st
       try { await persistReceipt(journalDirectory, manifest, result); } catch { /* The committed manifest remains recoverable. */ }
       return result;
     }
-    const rollback = await rollbackPrepared(root, transactionDirectory, manifest);
+    const rollback = await rollbackStagedTransaction(root, transactionDirectory, manifest);
     const failure = diagnostic('commit_patch', transactionId, error);
     const result: TextTransactionResult = rollback.status === 'succeeded' ? { outcome: 'rolled_back', failure, rollback } : { outcome: 'rollback_failed', failure, rollback };
     await persistReceipt(journalDirectory, manifest, result);
@@ -346,15 +346,15 @@ async function moveCurrentToBackup(root: RootedFileAuthority, filePath: string, 
 
 async function cleanupCommitted(root: RootedFileAuthority, transactionDirectory: string, manifest: JournalManifest): Promise<TextTransactionRecovery> {
   return recoverThenRemoveJournal(transactionDirectory, [
-    ...manifest.writes.flatMap((write) => [write.stageName, ...(write.overwrite ? [write.backupName] : [])].map((name) => operation('remove_patch_temporary', joinParent(write.path, name), () => removeSibling(root, write.path, name)))),
-    ...manifest.removes.map((remove) => operation('remove_patch_backup', joinParent(remove.path, remove.backupName), () => removeSibling(root, remove.path, remove.backupName)))
+    ...manifest.writes.flatMap((write) => [write.stageName, ...(write.overwrite ? [write.backupName] : [])].map((name) => recoveryAction('remove_patch_temporary', joinParent(write.path, name), () => removeSibling(root, write.path, name)))),
+    ...manifest.removes.map((remove) => recoveryAction('remove_patch_backup', joinParent(remove.path, remove.backupName), () => removeSibling(root, remove.path, remove.backupName)))
   ]);
 }
 
-async function rollbackPrepared(root: RootedFileAuthority, transactionDirectory: string, manifest: JournalManifest): Promise<TextTransactionRecovery> {
-  const operations: RecoveryOperation[] = [];
+async function rollbackStagedTransaction(root: RootedFileAuthority, transactionDirectory: string, manifest: JournalManifest): Promise<TextTransactionRecovery> {
+  const operations: RecoveryAction[] = [];
   for (const write of [...manifest.writes].reverse()) {
-    operations.push(operation('rollback_patch_write', write.path, async () => {
+    operations.push(recoveryAction('rollback_patch_write', write.path, async () => {
       const backupPresent = write.overwrite ? await siblingExists(root, write.path, write.backupName) : false;
       const stageStatus = await siblingStatus(root, write.path, write.stageName);
       const status = await siblingStatus(root, write.path, splitParent(write.path).leaf);
@@ -367,9 +367,9 @@ async function rollbackPrepared(root: RootedFileAuthority, transactionDirectory:
       await removeSibling(root, write.path, write.stageName);
     }));
   }
-  for (const remove of [...manifest.removes].reverse()) operations.push(operation('restore_patch_remove', remove.path, () => restoreSibling(root, remove.path, remove.backupName, remove.expectedCurrentIdentity)));
+  for (const remove of [...manifest.removes].reverse()) operations.push(recoveryAction('restore_patch_remove', remove.path, () => restoreSibling(root, remove.path, remove.backupName, remove.expectedCurrentIdentity)));
   for (const directory of [...manifest.createdDirectories].reverse()) {
-    operations.push(operation('remove_patch_directory', directory.path, () => removeCreatedDirectory(root, directory)));
+    operations.push(recoveryAction('remove_patch_directory', directory.path, () => removeCreatedDirectory(root, directory)));
   }
   return recoverThenRemoveJournal(transactionDirectory, operations);
 }
@@ -386,7 +386,7 @@ async function recoverTransactions(root: RootedFileAuthority, journalDirectory: 
         outcome: 'committed_with_residue',
         cleanup: {
           status: 'uncertain',
-          diagnostics: [{ operation: 'complete_patch_cleanup', path: transactionDirectory, message: 'Recovering committed content cleanup.' }],
+          diagnostics: [{ action: 'complete_patch_cleanup', path: transactionDirectory, message: 'Recovering committed content cleanup.' }],
           strandedPaths: [transactionDirectory]
         }
       };
@@ -397,7 +397,7 @@ async function recoverTransactions(root: RootedFileAuthority, journalDirectory: 
       if (cleanup.status !== 'succeeded') throw new Error(`Patch recovery ${cleanup.status}: ${cleanup.diagnostics.map((item) => item.message).join('; ')}`);
       continue;
     }
-    const rollback = await rollbackPrepared(root, transactionDirectory, manifest);
+    const rollback = await rollbackStagedTransaction(root, transactionDirectory, manifest);
     const failure = diagnostic('interrupted_patch_transaction', manifest.transactionId, new Error('The process stopped before the patch transaction committed.'));
     const result: TextTransactionResult = rollback.status === 'succeeded' ? { outcome: 'rolled_back', failure, rollback } : { outcome: 'rollback_failed', failure, rollback };
     await persistReceipt(journalDirectory, manifest, result);
@@ -428,9 +428,9 @@ async function removeCreatedDirectory(root: RootedFileAuthority, item: JournalCr
     await directory.removeDirectory(leaf); await directory.sync();
   } finally { await directory.close(); }
 }
-async function withParent<T>(root: RootedFileAuthority, targetPath: string, operationValue: (directory: RootedMutationDirectory, leaf: string) => Promise<T>): Promise<T> {
+async function withParent<T>(root: RootedFileAuthority, targetPath: string, actionValue: (directory: RootedMutationDirectory, leaf: string) => Promise<T>): Promise<T> {
   const { parent, leaf } = splitParent(targetPath); const directory = await openRootedMutationDirectory(root, parent);
-  try { return await operationValue(directory, leaf); } finally { await directory.close(); }
+  try { return await actionValue(directory, leaf); } finally { await directory.close(); }
 }
 
 function splitParent(filePath: string): { readonly parent: string; readonly leaf: string } {
@@ -470,7 +470,7 @@ async function readManifest(manifestPath: string): Promise<JournalManifest> {
   return value.payload;
 }
 function isManifest(value: unknown): value is JournalManifest {
-  return record(value) && value.version === 1 && typeof value.transactionId === 'string' && sha256Value(value.transactionDigest) && (value.phase === 'prepared' || value.phase === 'committed')
+  return record(value) && value.version === 1 && typeof value.transactionId === 'string' && sha256Value(value.transactionDigest) && (value.phase === 'planned' || value.phase === 'committed')
     && Array.isArray(value.createdDirectories) && value.createdDirectories.every((item) => record(item) && typeof item.path === 'string' && (item.identity === undefined || isFileIdentity(item.identity)))
     && Array.isArray(value.writes) && value.writes.every((item) => {
       if (!record(item) || typeof item.path !== 'string' || typeof item.stageName !== 'string' || !sha256Value(item.newSha256)
@@ -563,7 +563,7 @@ function isRecovery(value: unknown): value is TextTransactionRecovery {
     && Array.isArray(value.strandedPaths) && value.strandedPaths.every((item) => typeof item === 'string');
 }
 function isDiagnostic(value: unknown): value is TextTransactionDiagnostic {
-  return record(value) && typeof value.operation === 'string' && typeof value.path === 'string' && typeof value.message === 'string'
+  return record(value) && typeof value.action === 'string' && typeof value.path === 'string' && typeof value.message === 'string'
     && (value.code === undefined || typeof value.code === 'string');
 }
 
@@ -591,23 +591,23 @@ function validateManifest(root: RootedFileAuthority, manifest: JournalManifest):
   }
 }
 
-interface RecoveryOperation { readonly operation: string; readonly path: string; run(): Promise<void> }
-function operation(name: string, pathValue: string, run: () => Promise<void>): RecoveryOperation { return { operation: name, path: pathValue, run }; }
-async function recoverOperations(operations: readonly RecoveryOperation[]): Promise<TextTransactionRecovery> {
+interface RecoveryAction { readonly action: string; readonly path: string; run(): Promise<void> }
+function recoveryAction(name: string, pathValue: string, run: () => Promise<void>): RecoveryAction { return { action: name, path: pathValue, run }; }
+async function recoverOperations(operations: readonly RecoveryAction[]): Promise<TextTransactionRecovery> {
   const diagnostics: TextTransactionDiagnostic[] = [];
-  for (const item of operations) try { await item.run(); } catch (error) { diagnostics.push(diagnostic(item.operation, item.path, error)); }
+  for (const item of operations) try { await item.run(); } catch (error) { diagnostics.push(diagnostic(item.action, item.path, error)); }
   return diagnostics.length === 0
     ? { status: 'succeeded', diagnostics: [], strandedPaths: [] }
     : { status: 'uncertain', diagnostics, strandedPaths: [...new Set(diagnostics.map((item) => item.path))] };
 }
-async function recoverThenRemoveJournal(transactionDirectory: string, operations: readonly RecoveryOperation[]): Promise<TextTransactionRecovery> {
+async function recoverThenRemoveJournal(transactionDirectory: string, operations: readonly RecoveryAction[]): Promise<TextTransactionRecovery> {
   const result = await recoverOperations(operations);
   if (result.status !== 'succeeded') return result;
-  return recoverOperations([operation('remove_patch_journal', transactionDirectory, () => removeJournal(transactionDirectory))]);
+  return recoverOperations([recoveryAction('remove_patch_journal', transactionDirectory, () => removeJournal(transactionDirectory))]);
 }
-function diagnostic(operationValue: string, pathValue: string, error: unknown): TextTransactionDiagnostic {
+function diagnostic(actionValue: string, pathValue: string, error: unknown): TextTransactionDiagnostic {
   const code = nodeCode(error);
-  return { operation: operationValue, path: pathValue, message: error instanceof Error ? error.message : String(error), ...(code === undefined ? {} : { code }) };
+  return { action: actionValue, path: pathValue, message: error instanceof Error ? error.message : String(error), ...(code === undefined ? {} : { code }) };
 }
 async function removeJournal(directory: string): Promise<void> { await rm(directory, { recursive: true, force: true }); await syncDirectory(path.dirname(directory)); }
 async function syncDirectory(directory: string): Promise<void> {
@@ -615,7 +615,7 @@ async function syncDirectory(directory: string): Promise<void> {
   const handle = await open(directory, 'r'); try { await handle.sync(); } finally { await handle.close(); }
 }
 
-async function withJournalLock<T>(journalDirectory: string, signal: AbortSignal | undefined, operationValue: (assertOwned: () => Promise<void>) => Promise<T>): Promise<T> {
+async function withJournalLock<T>(journalDirectory: string, signal: AbortSignal | undefined, actionValue: (assertOwned: () => Promise<void>) => Promise<T>): Promise<T> {
   const lockPath = path.join(journalDirectory, '.lock');
   const nonce = randomUUID();
   const processIdentity = linuxProcessIdentity(process.pid);
@@ -646,7 +646,7 @@ async function withJournalLock<T>(journalDirectory: string, signal: AbortSignal 
     const owner = await readLockOwner(lockPath);
     if (owner?.nonce !== nonce || owner.pid !== process.pid || owner.hostname !== hostname() || owner.processIdentity !== processIdentity) throw new Error('Patch journal lock ownership was lost.');
   };
-  try { return await operationValue(assertOwned); }
+  try { return await actionValue(assertOwned); }
   finally {
     const owner = await readLockOwner(lockPath);
     if (owner?.nonce === nonce) { await rm(lockPath, { recursive: true, force: true }); await syncDirectory(journalDirectory); }

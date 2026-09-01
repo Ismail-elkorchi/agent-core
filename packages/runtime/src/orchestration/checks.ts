@@ -1,4 +1,4 @@
-import { validateArtifactRef, type ArtifactRef } from '@agent-core/evidence';
+import { validateArtifactRef, type ArtifactRef } from '@agent-core/persistence';
 import { normalizeJsonSafe } from '@agent-core/json';
 import {
   parseAgentCheckResult,
@@ -8,8 +8,8 @@ import {
   type AgentCheckObservation,
   type AgentCheckResult,
   type AgentEffectiveInstruction,
-  type AgentEvidenceReader,
-  type AgentPresentCandidate,
+  type AgentObservedFactsReader,
+  type AgentPresentModelOutput,
   type AgentTurnIdentity,
   type AgentVerificationExecutionContext
 } from '../run/contracts.js';
@@ -32,7 +32,7 @@ export class AgentVerificationAbortedError extends Error {
   }
 }
 
-export const EMPTY_EVIDENCE_READER: AgentEvidenceReader = Object.freeze({
+export const EMPTY_OBSERVED_FACTS_READER: AgentObservedFactsReader = Object.freeze({
   read() { return Promise.resolve({ items: [], bytes: 0, truncated: false }); },
   readArtifact() { return Promise.reject(new Error('Artifact reading is unavailable for this verification run.')); }
 });
@@ -42,7 +42,7 @@ export async function runAgentChecks(input: {
   readonly checks: readonly AgentCheckDefinition[];
   readonly task: string;
   readonly instructions: readonly AgentEffectiveInstruction[];
-  readonly candidate: AgentPresentCandidate;
+  readonly modelOutput: AgentPresentModelOutput;
   readonly turnIndex: number;
   readonly turnId: string;
   readonly requestAttempt: number;
@@ -55,7 +55,7 @@ export async function runAgentChecks(input: {
 }): Promise<readonly AgentCheckResult[]> {
   const metadataValue = normalizeJsonSafe(input.metadata ?? {}).value;
   const metadata = isRecord(metadataValue) ? metadataValue : {};
-  const execution = input.execution ?? { evidence: EMPTY_EVIDENCE_READER };
+  const execution = input.execution ?? { observedFacts: EMPTY_OBSERVED_FACTS_READER };
   const results: AgentCheckResult[] = [];
   for (const check of input.checks) {
     if (check.kind !== 'deterministic') throw new TypeError(`Effectful check ${check.id} requires the durable verification driver.`);
@@ -71,7 +71,7 @@ export async function runAgentChecks(input: {
         runId: input.runId,
         task: input.task,
         instructions: input.instructions,
-        candidate: input.candidate,
+        modelOutput: input.modelOutput,
         ...identity,
         metadata,
         signal: input.signal,

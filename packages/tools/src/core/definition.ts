@@ -1,4 +1,5 @@
-import type { PublicArtifactRef, ToolEvidenceDelta } from '@agent-core/evidence';
+import type { PublicArtifactRef } from '@agent-core/persistence';
+import type { ToolResultFacts } from './observed-facts.js';
 import type { JsonObject, JsonValue } from '@agent-core/json';
 import type * as z from 'zod';
 import type { ToolCanonicalizationContext, ToolExecutionContext } from './context.js';
@@ -45,7 +46,7 @@ interface ToolObservationInputBase {
   scope: ToolScope;
   content?: readonly ToolContent[];
   metadata?: JsonObject;
-  evidence?: ToolEvidenceDelta;
+  observedFacts?: ToolResultFacts;
 }
 export interface ToolResultObservationInput<TOutput = unknown> extends ToolObservationInputBase { kind: 'result'; /** A negative domain result is still a completed tool invocation. */ ok: boolean; output: TOutput }
 export interface ToolFailureObservationInput<TOutput extends ToolFailureOutput = ToolFailureOutput> extends ToolObservationInputBase { kind: 'failure'; ok: false; output: TOutput }
@@ -57,7 +58,7 @@ interface ToolObservationBase {
   readonly scope: ToolScope;
   readonly content?: readonly ToolContent[];
   readonly metadata?: JsonObject;
-  readonly evidence?: ToolEvidenceDelta;
+  readonly observedFacts?: ToolResultFacts;
 }
 export interface ToolResultObservation<TOutput = JsonValue> extends ToolObservationBase { readonly kind: 'result'; /** A negative domain result is still a completed tool invocation. */ readonly ok: boolean; readonly output: JsonValue & TOutput }
 export interface ToolFailureObservation<TOutput extends ToolFailureOutput = ToolFailureOutput> extends ToolObservationBase { readonly kind: 'failure'; readonly ok: false; readonly output: TOutput }

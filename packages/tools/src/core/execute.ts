@@ -1,9 +1,9 @@
 import { MissingToolServiceError, throwIfAborted, ToolInputError, type ToolExecutionContext } from './context.js';
 import type { ToolObservation } from './definition.js';
-import { beginToolInvocation, ToolInvocationAuthorityError, type ToolInvocation } from './prepare.js';
+import { beginToolInvocation, ToolInvocationAuthorityError, type ToolInvocation } from './plan.js';
 import { invalidToolInputObservation, missingServiceObservation, runtimeErrorObservation } from './observation.js';
 
-export async function invokePreparedToolCall(invocation: ToolInvocation, context: ToolExecutionContext): Promise<ToolObservation> {
+export async function invokeToolCallPlan(invocation: ToolInvocation, context: ToolExecutionContext): Promise<ToolObservation> {
   throwIfAborted(context.signal);
   try {
     return await beginToolInvocation(invocation, context);

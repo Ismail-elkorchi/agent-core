@@ -27,7 +27,7 @@ import {
 import {
   type CodexContinuationResponse,
   normalizedOutputItems,
-  prepareCodexWebSocketRequest
+  assembleCodexWebSocketRequest
 } from './continuation.js';
 import {
   parseCodexJsonResponse,
@@ -314,10 +314,10 @@ class OpenAICodexProviderSession implements ModelProviderSession {
     const accountId = this.provider.codexAccountId(token);
     const socket = await this.ensureWebSocket(token.token, accountId, request.signal);
     const fullRequest = toCodexResponsesRequest(request, true);
-    const prepared = prepareCodexWebSocketRequest(fullRequest, this.lastRequest, this.lastResponse);
+    const assembly = assembleCodexWebSocketRequest(fullRequest, this.lastRequest, this.lastResponse);
     const wireRequest = {
       type: 'response.create',
-      ...prepared.request
+      ...assembly.request
     };
     const streamEvents = readCodexWebSocketEvents(socket, request.signal);
     await sendWebSocketJson(socket, wireRequest, request.signal);
@@ -336,9 +336,9 @@ class OpenAICodexProviderSession implements ModelProviderSession {
         const failure = summarizeCodexFailure(part);
         const causeSummary = {
           ...failure.causeSummary,
-          continuationStrategy: prepared.reusedContinuation ? 'websocket_delta' : 'websocket_full_replay',
-          reusedContinuation: prepared.reusedContinuation,
-          ...(prepared.reusedContinuation && this.lastResponse
+          continuationStrategy: assembly.reusedContinuation ? 'websocket_delta' : 'websocket_full_replay',
+          reusedContinuation: assembly.reusedContinuation,
+          ...(assembly.reusedContinuation && this.lastResponse
             ? { previousResponseId: this.lastResponse.responseId }
             : {})
         };
@@ -409,12 +409,12 @@ class OpenAICodexProviderSession implements ModelProviderSession {
 
     const responsePayload = completedResponse
       ? toModelResponse(this.provider.id, request, completedResponse, {
-        strategy: prepared.reusedContinuation ? 'websocket_delta' : 'websocket_full_replay',
-        reusedContinuation: prepared.reusedContinuation
+        strategy: assembly.reusedContinuation ? 'websocket_delta' : 'websocket_full_replay',
+        reusedContinuation: assembly.reusedContinuation
       })
       : fallbackStreamResponse(this.provider.id, request, content, reasoning, reasoningSummary, toolCalls, {
-        strategy: prepared.reusedContinuation ? 'websocket_delta' : 'websocket_full_replay',
-        reusedContinuation: prepared.reusedContinuation
+        strategy: assembly.reusedContinuation ? 'websocket_delta' : 'websocket_full_replay',
+        reusedContinuation: assembly.reusedContinuation
       });
     const responseToolCalls = dedupeToolCalls([...(responsePayload.toolCalls ?? []), ...toolCalls]);
     const recoveredResponse = parseCodexModelResponse({
@@ -425,7 +425,7 @@ class OpenAICodexProviderSession implements ModelProviderSession {
       ...(reasoningSummary && !responsePayload.reasoningSummary ? { reasoningSummary } : {}),
       ...(responseToolCalls.length > 0 ? { toolCalls: responseToolCalls } : {})
     });
-    this.rememberPreparedRequest(fullRequest, completedResponse);
+    this.rememberContinuationBase(fullRequest, completedResponse);
     yield {
       type: 'done',
       response: recoveredResponse
@@ -456,10 +456,10 @@ class OpenAICodexProviderSession implements ModelProviderSession {
     if (!payload) {
       return;
     }
-    this.rememberPreparedRequest(toCodexResponsesRequest(request, stream), payload);
+    this.rememberContinuationBase(toCodexResponsesRequest(request, stream), payload);
   }
 
-  private rememberPreparedRequest(fullRequest: Record<string, unknown>, payload: OpenAICodexResponsesPayload | undefined): void {
+  private rememberContinuationBase(fullRequest: Record<string, unknown>, payload: OpenAICodexResponsesPayload | undefined): void {
     if (!payload?.id) {
       return;
     }

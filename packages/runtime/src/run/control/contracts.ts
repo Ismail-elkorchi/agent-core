@@ -1,22 +1,22 @@
 import { parseJsonObject, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import { decodeEffectExecutionState, decodeEffectRecoveryCapability, type EffectExecutionState } from '@agent-core/effects';
-import { hashJson } from '@agent-core/evidence';
-import { decodeAgentRunBudgetState, decodeOwnedAgentCheckResult, type AgentCheckResult, type AgentRunBudgetState, type AgentTurnIdentity } from '../run/contracts.js';
-import { decodeContextItemInput, type ContextItemInput } from '../context/manager.js';
+import { hashJson } from '@agent-core/persistence';
+import { decodeAgentRunBudgetState, decodeOwnedAgentCheckResult, type AgentCheckResult, type AgentRunBudgetState, type AgentTurnIdentity } from '../contracts.js';
+import { decodePromptContextItemInput, type PromptContextItemInput } from '../../inference/prompt-material.js';
 import { decodeToolCall, type ToolCall } from '@agent-core/tools';
-import { decodeToolOperationPhase, nextStartableToolCallIndex, type AgentApprovalOperationPhase, type AgentToolOperationPhase } from './tool-state.js';
-import { decodeDispositionOperationPhase, type AgentDispositionOperationPhase } from './disposition/state.js';
+import { decodeToolPhase, nextStartableToolCallIndex, type AgentApprovalPhase, type AgentToolPhase } from './tool-state.js';
+import { decodeDispositionPhase, type AgentDispositionPhase } from './disposition/state.js';
 
-export type { AgentApprovalOperationPhase, AgentToolOperationPhase, AgentToolPreparationRecord, AgentToolSettlementRecord } from './tool-state.js';
-export type { AgentDispositionOperationPhase, AgentDispositionPreparationRecord } from './disposition/state.js';
+export type { AgentApprovalPhase, AgentToolPhase, AgentToolCallPlanRecord, AgentToolSettlementRecord } from './tool-state.js';
+export type { AgentDispositionPhase, AgentDispositionEffectPlanRecord } from './disposition/state.js';
 
-export interface AgentOperationInput {
+export interface AgentRunStateInput {
   readonly task: string;
   readonly instructions: readonly string[];
-  readonly contextItems: readonly ContextItemInput[];
+  readonly contextItems: readonly PromptContextItemInput[];
 }
 
-export interface AgentOperationConfiguration {
+export interface AgentRunControlConfiguration {
   readonly providerId: string;
   readonly providerImplementationId: string;
   readonly model: string;
@@ -27,7 +27,7 @@ export interface AgentOperationConfiguration {
   readonly policyHash: string;
 }
 
-export interface AgentCheckPreparationRecord {
+export interface AgentCheckEffectPlanRecord {
   readonly checkImplementationId: string;
   readonly fingerprint: string;
   readonly authorization: JsonValue;
@@ -42,7 +42,7 @@ interface AgentVerificationPhaseBase {
   readonly nextCheckIndex: number;
 }
 
-export type AgentOperationControl =
+export type AgentRunControl =
   | Readonly<{ readonly status: 'detached' }>
   | Readonly<{ readonly status: 'owned'; readonly driverId: string }>
   | Readonly<{ readonly status: 'abort_requested'; readonly driverId?: string; readonly reason: string }>;
@@ -53,7 +53,7 @@ interface AgentProviderPhaseBase {
   readonly toolBatchId: string;
 }
 
-export type AgentProviderOperationPhase =
+export type AgentProviderPhase =
   | Readonly<AgentProviderPhaseBase & { readonly stage: 'ready' }>
   | Readonly<AgentProviderPhaseBase & { readonly stage: 'effect_ready'; readonly requestEventId: string; readonly responseId: string; readonly effect: Extract<EffectExecutionState, { readonly phase: 'ticket_issued' }> }>
   | Readonly<AgentProviderPhaseBase & { readonly stage: 'effect_pending'; readonly requestEventId: string; readonly responseId: string; readonly effect: Extract<EffectExecutionState, { readonly phase: 'started' }> }>
@@ -65,7 +65,7 @@ export interface AgentDecisionRequest {
   readonly reason: string;
   readonly choices: readonly string[];
   readonly fingerprint: string;
-  readonly operationRevision: number;
+  readonly runRevision: number;
 }
 
 export interface AgentDecisionContinuation {
@@ -77,22 +77,22 @@ export interface AgentDecisionContinuation {
   }>;
 }
 
-export type AgentOperationPhase =
+export type AgentRunControlPhase =
   | Readonly<{ readonly kind: 'accepted' }>
-  | Readonly<{ readonly kind: 'preparing'; readonly step: 'initialize' | 'assemble_turn'; readonly turnIndex: number }>
-  | AgentProviderOperationPhase
-  | AgentToolOperationPhase
-  | AgentApprovalOperationPhase
+  | Readonly<{ readonly kind: 'initializing'; readonly step: 'initialize' | 'assemble_turn'; readonly turnIndex: number }>
+  | AgentProviderPhase
+  | AgentToolPhase
+  | AgentApprovalPhase
   | Readonly<AgentVerificationPhaseBase & { readonly stage: 'ready' }>
   | Readonly<AgentVerificationPhaseBase & { readonly stage: 'deterministic_pending' }>
-  | Readonly<AgentVerificationPhaseBase & { readonly stage: 'effect_ready'; readonly preparation: AgentCheckPreparationRecord; readonly effect: Extract<EffectExecutionState, { readonly phase: 'ticket_issued' }> }>
-  | Readonly<AgentVerificationPhaseBase & { readonly stage: 'effect_pending'; readonly preparation: AgentCheckPreparationRecord; readonly effect: Extract<EffectExecutionState, { readonly phase: 'started' }> }>
+  | Readonly<AgentVerificationPhaseBase & { readonly stage: 'effect_ready'; readonly plan: AgentCheckEffectPlanRecord; readonly effect: Extract<EffectExecutionState, { readonly phase: 'ticket_issued' }> }>
+  | Readonly<AgentVerificationPhaseBase & { readonly stage: 'effect_pending'; readonly plan: AgentCheckEffectPlanRecord; readonly effect: Extract<EffectExecutionState, { readonly phase: 'started' }> }>
   | Readonly<AgentVerificationPhaseBase & { readonly stage: 'settled'; readonly result: AgentCheckResult; readonly effect?: Extract<EffectExecutionState, { readonly phase: 'settled' | 'closed' }> }>
   | Readonly<AgentVerificationPhaseBase & { readonly stage: 'complete' }>
-  | AgentDispositionOperationPhase
+  | AgentDispositionPhase
   | Readonly<{
       readonly kind: 'finalization';
-      readonly stage: 'ready' | 'prepared' | 'session_projected' | 'committed';
+      readonly stage: 'ready' | 'staged' | 'session_recorded' | 'committed';
       readonly terminalEventId?: string;
     }>
   | Readonly<{ readonly kind: 'suspended'; readonly reason: 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'disposition_outcome_unknown' | 'missing_implementation'; readonly effectId?: string }>
@@ -103,41 +103,41 @@ export type AgentOperationPhase =
       readonly decisionRequest: AgentDecisionRequest;
       readonly continuation: AgentDecisionContinuation;
     }>
-  | Readonly<{ readonly kind: 'cancelling'; readonly stage: 'requested' | 'finalizing'; readonly toolBatch?: AgentToolOperationPhase }>
+  | Readonly<{ readonly kind: 'cancelling'; readonly stage: 'requested' | 'finalizing'; readonly toolBatch?: AgentToolPhase }>
   | Readonly<{ readonly kind: 'terminal'; readonly resultEventId: string }>;
 
-export interface AgentOperationState {
+export interface AgentRunState {
   readonly runId: string;
   readonly finalizationId: string;
   readonly revision: number;
   readonly driverGeneration: number;
-  readonly input: AgentOperationInput;
-  readonly configuration: AgentOperationConfiguration;
-  readonly control: AgentOperationControl;
-  readonly phase: AgentOperationPhase;
+  readonly input: AgentRunStateInput;
+  readonly configuration: AgentRunControlConfiguration;
+  readonly control: AgentRunControl;
+  readonly phase: AgentRunControlPhase;
   readonly toolCalls: readonly ToolCall[];
   readonly revisionInstructions: readonly string[];
   readonly budget?: AgentRunBudgetState;
 }
 
-export type AgentOperationProcedure =
-  | 'prepare'
+export type AgentRunProcedure =
+  | 'initialize_run'
   | 'assemble_turn'
-  | 'prepare_provider_request'
+  | 'authorize_provider_request'
   | 'start_provider_request'
   | 'reconcile_provider_request'
   | 'consume_provider_settlement'
-  | 'prepare_tool_call'
+  | 'plan_tool_call'
   | 'start_tool_call'
   | 'reconcile_tool_call'
-  | 'prepare_tool_projection'
-  | 'project_tool_settlement'
+  | 'begin_observation_recording'
+  | 'record_tool_observation'
   | 'advance_after_tools'
-  | 'prepare_verification'
+  | 'plan_check'
   | 'start_verification'
   | 'reconcile_verification'
   | 'consume_verification_settlement'
-  | 'prepare_disposition'
+  | 'plan_disposition'
   | 'start_disposition'
   | 'reconcile_disposition'
   | 'consume_disposition'
@@ -145,48 +145,48 @@ export type AgentOperationProcedure =
   | 'reconcile_finalization'
   | 'finalize_abort';
 
-export type AgentOperationInstruction =
-  | Readonly<{ readonly kind: 'execute'; readonly procedure: AgentOperationProcedure }>
+export type AgentRunInstruction =
+  | Readonly<{ readonly kind: 'execute'; readonly procedure: AgentRunProcedure }>
   | Readonly<{ readonly kind: 'wait'; readonly reason: 'approval' | 'external_outcome' | 'user_decision' | 'driver' }>
   | Readonly<{ readonly kind: 'complete' }>;
 
-export function nextAgentOperationInstruction(state: AgentOperationState): AgentOperationInstruction {
+export function nextAgentRunInstruction(state: AgentRunState): AgentRunInstruction {
   if (state.phase.kind === 'terminal') return Object.freeze({ kind: 'complete' });
   if (state.control.status === 'detached') return Object.freeze({ kind: 'wait', reason: 'driver' });
   if (state.control.status === 'abort_requested') return Object.freeze({ kind: 'execute', procedure: 'finalize_abort' });
   switch (state.phase.kind) {
-    case 'accepted': return Object.freeze({ kind: 'execute', procedure: 'prepare' });
-    case 'preparing': return Object.freeze({ kind: 'execute', procedure: state.phase.step === 'initialize' ? 'prepare' : 'assemble_turn' });
+    case 'accepted': return Object.freeze({ kind: 'execute', procedure: 'initialize_run' });
+    case 'initializing': return Object.freeze({ kind: 'execute', procedure: state.phase.step === 'initialize' ? 'initialize_run' : 'assemble_turn' });
     case 'provider':
-      if (state.phase.stage === 'ready') return Object.freeze({ kind: 'execute', procedure: 'prepare_provider_request' });
+      if (state.phase.stage === 'ready') return Object.freeze({ kind: 'execute', procedure: 'authorize_provider_request' });
       if (state.phase.stage === 'effect_ready') return Object.freeze({ kind: 'execute', procedure: 'start_provider_request' });
       if (state.phase.stage === 'effect_pending') return Object.freeze({ kind: 'execute', procedure: 'reconcile_provider_request' });
       if (state.phase.stage === 'settled') return Object.freeze({ kind: 'execute', procedure: 'consume_provider_settlement' });
       return Object.freeze({ kind: 'wait', reason: 'external_outcome' });
     case 'tools':
-      if (state.phase.nextProjectionIndex === state.phase.calls.length) return Object.freeze({ kind: 'execute', procedure: 'advance_after_tools' });
-      if (state.phase.callStates[state.phase.nextProjectionIndex]?.stage === 'projecting') return Object.freeze({ kind: 'execute', procedure: 'project_tool_settlement' });
+      if (state.phase.nextObservationIndex === state.phase.calls.length) return Object.freeze({ kind: 'execute', procedure: 'advance_after_tools' });
+      if (state.phase.callStates[state.phase.nextObservationIndex]?.stage === 'recording') return Object.freeze({ kind: 'execute', procedure: 'record_tool_observation' });
       if (state.phase.callStates.some((call) => (call.stage === 'effect_ready' || call.stage === 'effect_pending')
         && call.effect.ticket.driverGeneration !== state.driverGeneration)
         || state.phase.callStates.some((call) => call.stage === 'outcome_unknown' && call.effect.phase === 'started'
           && call.effect.intent.recovery.kind !== 'unknown' && call.effect.ticket.driverGeneration !== state.driverGeneration)) {
         return Object.freeze({ kind: 'execute', procedure: 'reconcile_tool_call' });
       }
-      if (state.phase.callStates.some((call) => call.stage === 'ready')) return Object.freeze({ kind: 'execute', procedure: 'prepare_tool_call' });
+      if (state.phase.callStates.some((call) => call.stage === 'ready')) return Object.freeze({ kind: 'execute', procedure: 'plan_tool_call' });
       if (nextStartableToolCallIndex(state.phase, state.driverGeneration) !== undefined) return Object.freeze({ kind: 'execute', procedure: 'start_tool_call' });
-      if (state.phase.callStates[state.phase.nextProjectionIndex]?.stage === 'settled') return Object.freeze({ kind: 'execute', procedure: 'prepare_tool_projection' });
+      if (state.phase.callStates[state.phase.nextObservationIndex]?.stage === 'settled') return Object.freeze({ kind: 'execute', procedure: 'begin_observation_recording' });
       if (state.phase.callStates.some((call) => call.stage === 'effect_pending')) return Object.freeze({ kind: 'execute', procedure: 'reconcile_tool_call' });
       if (state.phase.callStates.some((call) => call.stage === 'outcome_unknown')) return Object.freeze({ kind: 'wait', reason: 'external_outcome' });
-      throw new TypeError('Tool batch has no executable operation instruction.');
+      throw new TypeError('Tool batch has no executable run instruction.');
     case 'approval': return Object.freeze({ kind: 'wait', reason: 'approval' });
     case 'verification':
-      if (state.phase.stage === 'ready') return Object.freeze({ kind: 'execute', procedure: 'prepare_verification' });
+      if (state.phase.stage === 'ready') return Object.freeze({ kind: 'execute', procedure: 'plan_check' });
       if (state.phase.stage === 'effect_ready') return Object.freeze({ kind: 'execute', procedure: 'start_verification' });
       if (state.phase.stage === 'effect_pending') return Object.freeze({ kind: 'execute', procedure: 'reconcile_verification' });
       if (state.phase.stage === 'deterministic_pending') return Object.freeze({ kind: 'execute', procedure: 'reconcile_verification' });
       return Object.freeze({ kind: 'execute', procedure: 'consume_verification_settlement' });
     case 'disposition':
-      if (state.phase.stage === 'ready') return Object.freeze({ kind: 'execute', procedure: 'prepare_disposition' });
+      if (state.phase.stage === 'ready') return Object.freeze({ kind: 'execute', procedure: 'plan_disposition' });
       if (state.phase.stage === 'effect_ready') return Object.freeze({ kind: 'execute', procedure: 'start_disposition' });
       if (state.phase.stage === 'effect_pending') return Object.freeze({ kind: 'execute', procedure: 'reconcile_disposition' });
       if (state.phase.stage === 'outcome_unknown') return Object.freeze({ kind: 'wait', reason: 'external_outcome' });
@@ -198,10 +198,10 @@ export function nextAgentOperationInstruction(state: AgentOperationState): Agent
   }
 }
 
-export function decodeAgentOperationState(value: unknown): AgentOperationState {
+export function decodeAgentRunState(value: unknown): AgentRunState {
   let state: JsonObject;
   try { state = parseJsonObject(value, { maxDepth: 18, maxCollectionEntries: 20_000, maxStringBytes: 1024 * 1024, maxTotalBytes: 4 * 1024 * 1024 }); }
-  catch (error) { throw new TypeError('operation state is invalid.', { cause: error }); }
+  catch (error) { throw new TypeError('run state is invalid.', { cause: error }); }
   exact(state, ['runId', 'finalizationId', 'revision', 'driverGeneration', 'input', 'configuration', 'control', 'phase', 'toolCalls', 'revisionInstructions', 'budget']);
   const input = decodeInput(state.input);
   const configuration = decodeConfiguration(state.configuration);
@@ -213,11 +213,11 @@ export function decodeAgentOperationState(value: unknown): AgentOperationState {
   const runId = identifier(state.runId, 'runId');
   const revision = nonnegativeInteger(state.revision, 'revision');
   if (phase.kind === 'suspended' && phase.reason === 'user_decision') {
-    if (phase.decisionRequest.operationRevision > revision
-      || (control.status !== 'abort_requested' && phase.decisionRequest.operationRevision !== revision)) {
-      throw new TypeError('Decision request revision does not match the operation revision.');
+    if (phase.decisionRequest.runRevision > revision
+      || (control.status !== 'abort_requested' && phase.decisionRequest.runRevision !== revision)) {
+      throw new TypeError('Decision request revision does not match the run revision.');
     }
-    if (phase.continuation.blockedProvider.effect.intent.operationId !== runId) throw new TypeError('Decision continuation does not belong to this operation.');
+    if (phase.continuation.blockedProvider.effect.intent.ownerId !== runId) throw new TypeError('Decision continuation does not belong to this run.');
   }
   return Object.freeze({
     runId,
@@ -234,18 +234,18 @@ export function decodeAgentOperationState(value: unknown): AgentOperationState {
   });
 }
 
-function decodeInput(value: unknown): AgentOperationInput {
-  const input = object(value, 'operation input');
+function decodeInput(value: unknown): AgentRunStateInput {
+  const input = object(value, 'run input');
   exact(input, ['task', 'instructions', 'contextItems']);
   return Object.freeze({
     task: nonempty(input.task, 'task'),
     instructions: stringArray(input.instructions, 'instructions'),
-    contextItems: Object.freeze(array(input.contextItems, 'contextItems').map((item) => decodeContextItemInput(item)))
+    contextItems: Object.freeze(array(input.contextItems, 'contextItems').map((item) => decodePromptContextItemInput(item)))
   });
 }
 
-function decodeConfiguration(value: unknown): AgentOperationConfiguration {
-  const configuration = object(value, 'operation configuration');
+function decodeConfiguration(value: unknown): AgentRunControlConfiguration {
+  const configuration = object(value, 'run configuration');
   exact(configuration, ['providerId', 'providerImplementationId', 'model', 'runtimeImplementationId', 'toolImplementationIds', 'checks', 'disposition', 'policyHash']);
   const disposition = object(configuration.disposition, 'disposition configuration');
   exact(disposition, ['implementationId', 'policyIdentity', 'policyHash']);
@@ -281,19 +281,19 @@ function checkBindings(value: unknown): readonly { readonly id: string; readonly
   }));
 }
 
-function decodeCheckPreparation(value: unknown): AgentCheckPreparationRecord {
-  const preparation = object(value, 'verification preparation');
-  exact(preparation, ['checkImplementationId', 'fingerprint', 'authorization', 'recovery']);
+function decodeCheckPreparation(value: unknown): AgentCheckEffectPlanRecord {
+  const plan = object(value, 'verification plan');
+  exact(plan, ['checkImplementationId', 'fingerprint', 'authorization', 'recovery']);
   return Object.freeze({
-    checkImplementationId: identifier(preparation.checkImplementationId, 'verification preparation checkImplementationId'),
-    fingerprint: digest(preparation.fingerprint, 'verification preparation fingerprint'),
-    authorization: parseJsonValue(preparation.authorization),
-    recovery: decodeEffectRecoveryCapability(preparation.recovery)
+    checkImplementationId: identifier(plan.checkImplementationId, 'verification plan checkImplementationId'),
+    fingerprint: digest(plan.fingerprint, 'verification plan fingerprint'),
+    authorization: parseJsonValue(plan.authorization),
+    recovery: decodeEffectRecoveryCapability(plan.recovery)
   });
 }
 
-function decodeControl(value: unknown): AgentOperationControl {
-  const control = object(value, 'operation control');
+function decodeControl(value: unknown): AgentRunControl {
+  const control = object(value, 'run control');
   const status = enumeration(control.status, ['detached', 'owned', 'abort_requested'] as const, 'control.status');
   if (status === 'detached') {
     exact(control, ['status']);
@@ -308,14 +308,14 @@ function decodeControl(value: unknown): AgentOperationControl {
   return Object.freeze({ status, ...(driverId === undefined ? {} : { driverId }), reason: nonempty(control.reason, 'control.reason') });
 }
 
-function decodePhase(value: unknown): AgentOperationPhase {
-  const phase = object(value, 'operation phase');
-  const kind = enumeration(phase.kind, ['accepted', 'preparing', 'provider', 'tools', 'approval', 'verification', 'disposition', 'finalization', 'suspended', 'cancelling', 'terminal'] as const, 'phase.kind');
+function decodePhase(value: unknown): AgentRunControlPhase {
+  const phase = object(value, 'run phase');
+  const kind = enumeration(phase.kind, ['accepted', 'initializing', 'provider', 'tools', 'approval', 'verification', 'disposition', 'finalization', 'suspended', 'cancelling', 'terminal'] as const, 'phase.kind');
   switch (kind) {
     case 'accepted':
       exact(phase, ['kind']);
       return Object.freeze({ kind });
-    case 'preparing':
+    case 'initializing':
       exact(phase, ['kind', 'step', 'turnIndex']);
       return Object.freeze({ kind, step: enumeration(phase.step, ['initialize', 'assemble_turn'] as const, 'phase.step'), turnIndex: positiveInteger(phase.turnIndex, 'phase.turnIndex') });
     case 'provider': {
@@ -346,9 +346,9 @@ function decodePhase(value: unknown): AgentOperationPhase {
       return Object.freeze({ ...base, stage, requestEventId, responseId, effect });
     }
     case 'tools':
-    case 'approval': return decodeToolOperationPhase(phase);
+    case 'approval': return decodeToolPhase(phase);
     case 'verification': {
-      exact(phase, ['kind', 'stage', 'identity', 'providerSettlementEventId', 'checkIds', 'nextCheckIndex', 'preparation', 'effect', 'result']);
+      exact(phase, ['kind', 'stage', 'identity', 'providerSettlementEventId', 'checkIds', 'nextCheckIndex', 'plan', 'effect', 'result']);
       const identity = decodeTurnIdentity(phase.identity);
       const providerSettlementEventId = identifier(phase.providerSettlementEventId, 'phase.providerSettlementEventId');
       const checkIds = uniqueIdentifiers(phase.checkIds, 'phase.checkIds');
@@ -363,18 +363,18 @@ function decodePhase(value: unknown): AgentOperationPhase {
       if (nextCheckIndex >= checkIds.length) throw new TypeError(`Verification ${stage} requires a current check.`);
       if (stage === 'ready' || stage === 'deterministic_pending') return Object.freeze({ ...base, stage });
       if (stage === 'effect_ready') {
-        const preparation = decodeCheckPreparation(phase.preparation);
+        const plan = decodeCheckPreparation(phase.plan);
         const effect = decodeEffectExecutionState(phase.effect);
         if (effect.phase !== 'ticket_issued') throw new TypeError('Verification effect_ready has an invalid effect state.');
-        if (effect.intent.implementationId !== preparation.checkImplementationId || effect.intent.parametersDigest !== preparation.fingerprint) throw new TypeError('Verification effect does not match its preparation.');
-        return Object.freeze({ ...base, stage, preparation, effect });
+        if (effect.intent.implementationId !== plan.checkImplementationId || effect.intent.parametersDigest !== plan.fingerprint) throw new TypeError('Verification effect does not match its plan.');
+        return Object.freeze({ ...base, stage, plan, effect });
       }
       if (stage === 'effect_pending') {
-        const preparation = decodeCheckPreparation(phase.preparation);
+        const plan = decodeCheckPreparation(phase.plan);
         const effect = decodeEffectExecutionState(phase.effect);
         if (effect.phase !== 'started') throw new TypeError('Verification effect_pending has an invalid effect state.');
-        if (effect.intent.implementationId !== preparation.checkImplementationId || effect.intent.parametersDigest !== preparation.fingerprint) throw new TypeError('Verification effect does not match its preparation.');
-        return Object.freeze({ ...base, stage, preparation, effect });
+        if (effect.intent.implementationId !== plan.checkImplementationId || effect.intent.parametersDigest !== plan.fingerprint) throw new TypeError('Verification effect does not match its plan.');
+        return Object.freeze({ ...base, stage, plan, effect });
       }
       const result = decodeOwnedAgentCheckResult(object(phase.result, 'phase.result'));
       if (result.id !== checkIds[nextCheckIndex]) throw new TypeError('Settled verification result does not match the current check.');
@@ -382,11 +382,11 @@ function decodePhase(value: unknown): AgentOperationPhase {
       if (effect !== undefined && effect.phase !== 'settled' && effect.phase !== 'closed') throw new TypeError('Settled verification retains an invalid effect state.');
       return Object.freeze({ ...base, stage, result, ...(effect ? { effect } : {}) });
     }
-    case 'disposition': return decodeDispositionOperationPhase(phase);
+    case 'disposition': return decodeDispositionPhase(phase);
     case 'finalization': {
       exact(phase, ['kind', 'stage', 'terminalEventId']);
       const terminalEventId = optionalIdentifier(phase.terminalEventId, 'phase.terminalEventId');
-      return Object.freeze({ kind, stage: enumeration(phase.stage, ['ready', 'prepared', 'session_projected', 'committed'] as const, 'phase.stage'), ...(terminalEventId ? { terminalEventId } : {}) });
+      return Object.freeze({ kind, stage: enumeration(phase.stage, ['ready', 'staged', 'session_recorded', 'committed'] as const, 'phase.stage'), ...(terminalEventId ? { terminalEventId } : {}) });
     }
     case 'suspended': {
       const reason = enumeration(phase.reason, ['provider_outcome_unknown', 'tool_outcome_unknown', 'disposition_outcome_unknown', 'missing_implementation', 'user_decision'] as const, 'phase.reason');
@@ -401,7 +401,7 @@ function decodePhase(value: unknown): AgentOperationPhase {
           id: decisionRequest.id,
           reason: decisionRequest.reason,
           choices: decisionRequest.choices,
-          operationRevision: decisionRequest.operationRevision,
+          runRevision: decisionRequest.runRevision,
           effectId
         });
         if (decisionRequest.fingerprint !== expectedFingerprint) throw new TypeError('Decision request fingerprint is inconsistent.');
@@ -425,7 +425,7 @@ function decodePhase(value: unknown): AgentOperationPhase {
 
 function decodeDecisionRequest(value: unknown): AgentDecisionRequest {
   const request = object(value, 'decision request');
-  exact(request, ['id', 'reason', 'choices', 'fingerprint', 'operationRevision']);
+  exact(request, ['id', 'reason', 'choices', 'fingerprint', 'runRevision']);
   const choices = uniqueIdentifiers(request.choices, 'decisionRequest.choices');
   if (choices.length === 0) throw new TypeError('decisionRequest.choices must not be empty.');
   return Object.freeze({
@@ -433,7 +433,7 @@ function decodeDecisionRequest(value: unknown): AgentDecisionRequest {
     reason: nonempty(request.reason, 'decisionRequest.reason'),
     choices,
     fingerprint: digest(request.fingerprint, 'decisionRequest.fingerprint'),
-    operationRevision: nonnegativeInteger(request.operationRevision, 'decisionRequest.operationRevision')
+    runRevision: nonnegativeInteger(request.runRevision, 'decisionRequest.runRevision')
   });
 }
 
@@ -459,8 +459,8 @@ function decodeDecisionContinuation(value: unknown): AgentDecisionContinuation {
   });
 }
 
-function decodeCancellingToolBatch(value: unknown): AgentToolOperationPhase {
-  const batch = decodeToolOperationPhase(value);
+function decodeCancellingToolBatch(value: unknown): AgentToolPhase {
+  const batch = decodeToolPhase(value);
   if (batch.kind !== 'tools') throw new TypeError('A cancelling tool batch must retain tool state.');
   if (batch.callStates.some((call) => call.stage === 'ready' || call.stage === 'effect_ready' || call.stage === 'effect_pending')) {
     throw new TypeError('A cancelling tool batch cannot retain open tool calls.');
@@ -482,7 +482,7 @@ function object(value: unknown, name: string): JsonObject { if (!isJsonObject(va
 function exact(value: JsonObject, fields: readonly string[]): void {
   const allowed = new Set(fields);
   const unsupported = Object.keys(value).filter((field) => !allowed.has(field));
-  if (unsupported.length > 0) throw new TypeError(`Unsupported operation fields: ${unsupported.join(', ')}.`);
+  if (unsupported.length > 0) throw new TypeError(`Unsupported run fields: ${unsupported.join(', ')}.`);
 }
 function array(value: unknown, name: string): readonly unknown[] { if (!Array.isArray(value)) throw new TypeError(`${name} must be an array.`); return value; }
 function nonempty(value: unknown, name: string): string { if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`${name} must be a non-empty string.`); return value; }
@@ -495,5 +495,5 @@ function positiveInteger(value: unknown, name: string): number { if (typeof valu
 function stringArray(value: unknown, name: string): readonly string[] { return Object.freeze(array(value, name).map((item, index) => nonempty(item, `${name}[${String(index)}]`))); }
 function uniqueIdentifiers(value: unknown, name: string): readonly string[] { const items = Object.freeze(array(value, name).map((item, index) => identifier(item, `${name}[${String(index)}]`))); if (new Set(items).size !== items.length) throw new TypeError(`${name} contains duplicate identities.`); return items; }
 function enumeration<const T extends readonly string[]>(value: unknown, values: T, name: string): T[number] { if (!oneOf(value, values)) throw new TypeError(`${name} is invalid.`); return value; }
-function oneOf<const T extends readonly string[]>(value: unknown, values: T): value is T[number] { return typeof value === 'string' && values.some((candidate) => candidate === value); }
+function oneOf<const T extends readonly string[]>(value: unknown, values: T): value is T[number] { return typeof value === 'string' && values.some((modelOutput) => modelOutput === value); }
 function isJsonObject(value: unknown): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }

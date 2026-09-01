@@ -7,7 +7,7 @@ export interface CodexContinuationResponse {
   outputItems: unknown[];
 }
 
-export function prepareCodexWebSocketRequest(
+export function assembleCodexWebSocketRequest(
   fullRequest: Record<string, unknown>,
   previousRequest: Record<string, unknown> | undefined,
   previousResponse: CodexContinuationResponse | undefined

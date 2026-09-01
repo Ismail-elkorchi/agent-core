@@ -387,7 +387,7 @@ test('OpenAICodexProvider sends Codex Responses requests with ChatGPT account he
   });
 });
 
-test('OpenAICodexProvider HTTP transport replays full projected history without previous_response_id', async () => {
+test('OpenAICodexProvider HTTP transport replays full assembled history without previous_response_id', async () => {
   const calls = [];
   const provider = new OpenAICodexProvider({
     auth: bearerProvider(codexJwt('acct-123')),

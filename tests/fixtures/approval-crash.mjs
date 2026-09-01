@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import * as z from 'zod';
 import path from 'node:path';
 import { AgentRuntime, agentEventCodec } from '@agent-core/runtime';
-import { JsonlEventRepository, LocalArtifactRepository } from '@agent-core/evidence/node';
+import { JsonlEventRepository, LocalArtifactRepository } from '@agent-core/persistence/node';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 import { adoptToolDefinition, ResourceLeaseCoordinator } from '@agent-core/tools';
 
@@ -11,16 +11,16 @@ const [mode, root, runId, approvalId, fingerprint] = process.argv.slice(2);
 if (!mode || !root) throw new Error('mode and root are required');
 
 const storedEvents = new JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
-const events = mode === 'crash_after_ended' || mode === 'crash_before_started' || mode === 'crash_before_projection' ? {
+const events = mode === 'crash_after_ended' || mode === 'crash_before_started' || mode === 'crash_before_recording' ? {
   async append(...args) {
     return storedEvents.append(...args);
   },
   async appendConditional(...args) {
-    const phase = args[1]?.type === 'operation.transition' ? args[1].state.phase : undefined;
+    const phase = args[1]?.type === 'run.state.changed' ? args[1].state.phase : undefined;
     if (mode === 'crash_before_started' && phase?.kind === 'tools' && phase.callStates.some((call) => call.stage === 'effect_pending')) process.exit(45);
     const result = await storedEvents.appendConditional(...args);
     if (mode === 'crash_after_ended' && phase?.kind === 'tools' && phase.callStates.some((call) => call.stage === 'settled')) process.exit(43);
-    if (mode === 'crash_before_projection' && phase?.kind === 'tools' && phase.callStates.some((call) => call.stage === 'projecting')) process.exit(47);
+    if (mode === 'crash_before_recording' && phase?.kind === 'tools' && phase.callStates.some((call) => call.stage === 'recording')) process.exit(47);
     return result;
   },
   tail: (...args) => storedEvents.tail(...args),

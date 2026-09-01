@@ -1,4 +1,4 @@
-import type { ArtifactRepository, EventRepository } from '@agent-core/evidence';
+import type { ArtifactRepository, EventRepository } from '@agent-core/persistence';
 import type { SessionDescriptor, SessionRepository } from './session/contracts.js';
 import type { AgentEvent } from './events.js';
 
@@ -14,8 +14,8 @@ export interface AgentRuntimeRepositories {
 }
 
 export interface AgentFinalizationProgress {
-  readonly prepared: boolean;
-  readonly sessionProjected: boolean;
+  readonly staged: boolean;
+  readonly sessionRecorded: boolean;
   readonly committed: boolean;
   readonly reconciliation: 'verified' | 'unavailable';
 }
@@ -33,7 +33,7 @@ export class AgentFinalizationError extends Error {
     cause: unknown;
   }) {
     super(
-      `Finalization ${input.finalizationId} for run ${input.runId} failed: prepared=${String(input.progress.prepared)}, sessionProjected=${String(input.progress.sessionProjected)}, committed=${String(input.progress.committed)}, reconciliation=${input.progress.reconciliation}. ${errorMessage(input.cause)}`
+      `Finalization ${input.finalizationId} for run ${input.runId} failed: staged=${String(input.progress.staged)}, sessionRecorded=${String(input.progress.sessionRecorded)}, committed=${String(input.progress.committed)}, reconciliation=${input.progress.reconciliation}. ${errorMessage(input.cause)}`
     );
     this.name = 'AgentFinalizationError';
     this.runId = input.runId;

@@ -1,5 +1,5 @@
 {
-  "name": "@agent-core/evidence",
+  "name": "@agent-core/persistence",
   "version": "0.2.0",
   "description": "Event and artifact repositories plus bounded JSON normalization for Agent Core.",
   "type": "module",

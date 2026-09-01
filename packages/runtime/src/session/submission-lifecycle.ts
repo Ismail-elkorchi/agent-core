@@ -10,7 +10,7 @@ import type {
   SessionSuspensionDescriptor
 } from './contracts.js';
 import { parseJsonObject } from '@agent-core/json';
-import { hashJson } from '@agent-core/evidence';
+import { hashJson } from '@agent-core/persistence';
 import type { ModelReasoningRequest } from '@agent-core/model';
 
 type SubmissionState = SessionPendingSubmission['state'] | 'completed' | 'failed';
@@ -212,7 +212,7 @@ function suspensionAction(value: unknown): SessionSuspensionAction {
 
 function ownDecisionRequest(value: unknown): NonNullable<SessionSuspensionDescriptor['decisionRequest']> {
   const object = parseJsonObject(value);
-  if (Object.keys(object).length !== 5 || !Object.keys(object).every((field) => field === 'id' || field === 'reason' || field === 'choices' || field === 'fingerprint' || field === 'operationRevision')) {
+  if (Object.keys(object).length !== 5 || !Object.keys(object).every((field) => field === 'id' || field === 'reason' || field === 'choices' || field === 'fingerprint' || field === 'runRevision')) {
     throw new TypeError('Session decision request has unsupported or missing fields.');
   }
   const id = suspensionString(object.id, 'decision request id');
@@ -220,8 +220,8 @@ function ownDecisionRequest(value: unknown): NonNullable<SessionSuspensionDescri
   if (!Array.isArray(object.choices) || object.choices.length === 0 || !object.choices.every((choice) => typeof choice === 'string' && choice.length > 0)) throw new TypeError('Session decision request choices are invalid.');
   const choices = Object.freeze(object.choices.map((choice) => String(choice)));
   if (typeof object.fingerprint !== 'string' || !/^[a-f0-9]{64}$/u.test(object.fingerprint)) throw new TypeError('Session decision request fingerprint is invalid.');
-  if (typeof object.operationRevision !== 'number' || !Number.isSafeInteger(object.operationRevision) || object.operationRevision < 0) throw new TypeError('Session decision request revision is invalid.');
-  return Object.freeze({ id, reason, choices, fingerprint: object.fingerprint, operationRevision: object.operationRevision });
+  if (typeof object.runRevision !== 'number' || !Number.isSafeInteger(object.runRevision) || object.runRevision < 0) throw new TypeError('Session decision request revision is invalid.');
+  return Object.freeze({ id, reason, choices, fingerprint: object.fingerprint, runRevision: object.runRevision });
 }
 
 function submissionTransitionState(record: SessionSubmissionTransition): SessionSubmissionState {

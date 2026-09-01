@@ -42,7 +42,7 @@ export const editTextFileOutputSchema = z.strictObject({
   changedRanges: z.array(changedRangeSchema)
 });
 const transactionDiagnosticSchema = z.strictObject({
-  operation: z.string(), path: z.string(), message: z.string(), code: z.string().optional()
+  action: z.string(), path: z.string(), message: z.string(), code: z.string().optional()
 });
 const recoverySchema = z.strictObject({
   status: z.enum(['succeeded', 'failed', 'uncertain']),
@@ -57,7 +57,7 @@ const transactionSchema = z.union([
 ]);
 
 export const editTextOutputSchema = z.strictObject({
-  operationStatus: z.enum(['dry_run', 'no_change', 'applied', 'not_applied', 'uncertain']),
+  applicationStatus: z.enum(['dry_run', 'no_change', 'applied', 'not_applied', 'uncertain']),
   transactionOutcome: z.enum(['committed', 'committed_with_residue', 'rolled_back', 'rollback_failed']).optional(),
   rootState: z.enum(['known', 'uncertain']),
   dryRun: z.boolean(),

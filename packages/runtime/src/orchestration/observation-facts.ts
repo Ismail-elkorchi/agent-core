@@ -1,37 +1,38 @@
-import { encodeEvidenceRecord, validateArtifactRef, type ArtifactRef, type ArtifactRepository, type EvidenceRecord } from '@agent-core/evidence';
+import { validateArtifactRef, type ArtifactRef, type ArtifactRepository } from '@agent-core/persistence';
+import { encodeObservedFactRecord, type ObservedFactRecord } from '@agent-core/tools';
 import { parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
-import type { ContextManager } from '../context/manager.js';
-import type { AgentEvidencePage, AgentEvidenceReader, AgentVerificationExecutionContext } from '../run/contracts.js';
+import type { ModelWindow } from '../inference/model-window.js';
+import type { AgentObservedFactsPage, AgentObservedFactsReader, AgentVerificationExecutionContext } from '../run/contracts.js';
 
 const DEFAULT_LIMIT = 50;
 const DEFAULT_MAX_BYTES = 256 * 1024;
 
-/** Expose owned tool evidence to verification without granting effect authority. */
-export function contextEvidenceExecution(input: {
-  readonly contextManager: ContextManager;
+/** Expose owned tool observedFacts to verification without granting effect authority. */
+export function observationFactsExecution(input: {
+  readonly modelWindow: ModelWindow;
   readonly artifacts?: ArtifactRepository;
   readonly configured?: AgentVerificationExecutionContext;
 }): AgentVerificationExecutionContext {
-  const records = input.contextManager.evidenceSnapshot();
-  const evidence = contextEvidenceReader(records, input.artifacts, input.configured?.evidence);
-  return Object.freeze({ evidence });
+  const records = input.modelWindow.observedFactsSnapshot();
+  const observedFacts = observedFactsReader(records, input.artifacts, input.configured?.observedFacts);
+  return Object.freeze({ observedFacts });
 }
 
-function contextEvidenceReader(
-  records: readonly EvidenceRecord[],
+function observedFactsReader(
+  records: readonly ObservedFactRecord[],
   artifacts: ArtifactRepository | undefined,
-  configured: AgentEvidenceReader | undefined
-): AgentEvidenceReader {
-  const reader: AgentEvidenceReader = {
-    async read(request?: { readonly cursor?: string; readonly limit?: number; readonly maxBytes?: number }): Promise<AgentEvidencePage> {
+  configured: AgentObservedFactsReader | undefined
+): AgentObservedFactsReader {
+  const reader: AgentObservedFactsReader = {
+    async read(request?: { readonly cursor?: string; readonly limit?: number; readonly maxBytes?: number }): Promise<AgentObservedFactsPage> {
       const resolved = request ?? {};
       if (resolved.cursor?.startsWith('external:')) {
-        if (!configured) throw new Error('Evidence cursor refers to an unavailable external evidence reader.');
+        if (!configured) throw new Error('Observed facts cursor refers to an unavailable external observedFacts reader.');
         const cursor = decodeExternalCursor(resolved.cursor);
         const page = await configured.read(withCursor(resolved, cursor));
         return externalPage(page);
       }
-      if (resolved.cursor !== undefined && !resolved.cursor.startsWith('tool:')) throw new Error('Invalid evidence cursor.');
+      if (resolved.cursor !== undefined && !resolved.cursor.startsWith('tool:')) throw new Error('Invalid observedFacts cursor.');
       const start = resolved.cursor === undefined ? 0 : parseToolCursor(resolved.cursor);
       if (start >= records.length) {
         if (!configured) return Object.freeze({ items: Object.freeze([]), bytes: 0, truncated: false });
@@ -47,11 +48,11 @@ function contextEvidenceReader(
       while (index < records.length && items.length < limit) {
         const record = records[index];
         if (!record) break;
-        const item = encodeEvidenceRecord(record);
+        const item = encodeObservedFactRecord(record);
         const itemBytes = jsonBytes(item);
         if (items.length > 0 && bytes + itemBytes > maxBytes) break;
         if (items.length === 0 && itemBytes > maxBytes) {
-          const stub = oversizedEvidenceStub(record, itemBytes, maxBytes);
+          const stub = oversizedObservedFactStub(record, itemBytes, maxBytes);
           items.push(stub);
           bytes += jsonBytes(stub);
           index += 1;
@@ -68,7 +69,7 @@ function contextEvidenceReader(
     async readArtifact(ref: ArtifactRef, request?: { readonly maxBytes?: number }) {
       const resolved = request ?? {};
       validateArtifactRef(ref);
-      if (ref.visibility !== 'public') throw new Error('Protected artifacts are not available to verification evidence readers.');
+      if (ref.visibility !== 'public') throw new Error('Protected artifacts are not available to verification observedFacts readers.');
       const maxBytes = positiveLimit(resolved.maxBytes, DEFAULT_MAX_BYTES);
       if (artifacts && await artifacts.resolve(ref.artifactId)) {
         if (ref.size === 0) return new Uint8Array();
@@ -86,7 +87,7 @@ function contextEvidenceReader(
   return Object.freeze(reader);
 }
 
-function externalPage(page: AgentEvidencePage): AgentEvidencePage {
+function externalPage(page: AgentObservedFactsPage): AgentObservedFactsPage {
   const owned = parseJsonObject(page);
   const unknown = Object.keys(owned).filter((key) => !['items', 'bytes', 'truncated', 'nextCursor'].includes(key));
   if (unknown.length > 0 || !jsonArray(owned.items)
@@ -94,7 +95,7 @@ function externalPage(page: AgentEvidencePage): AgentEvidencePage {
     || typeof owned.truncated !== 'boolean'
     || (owned.nextCursor !== undefined && typeof owned.nextCursor !== 'string')
     || (owned.truncated && typeof owned.nextCursor !== 'string')) {
-    throw new Error('External evidence reader returned an invalid page.');
+    throw new Error('External observedFacts reader returned an invalid page.');
   }
   const items = Object.freeze([...owned.items]);
   return Object.freeze({
@@ -107,14 +108,14 @@ function externalPage(page: AgentEvidencePage): AgentEvidencePage {
 
 function jsonArray(value: JsonValue | undefined): value is readonly JsonValue[] { return Array.isArray(value); }
 
-function oversizedEvidenceStub(record: EvidenceRecord, originalBytes: number, maxBytes: number): JsonObject {
+function oversizedObservedFactStub(record: ObservedFactRecord, originalBytes: number, maxBytes: number): JsonObject {
   let id = record.id;
   let toolName = record.toolName;
   const build = (): JsonObject => Object.freeze({ id, action: record.action, outcome: record.outcome, toolName, originalBytes, truncated: true });
   let stub = build();
   if (jsonBytes(stub) <= maxBytes) return stub;
   const fixed = jsonBytes(Object.freeze({ id: '', action: record.action, outcome: record.outcome, toolName: '', originalBytes, truncated: true }));
-  if (fixed > maxBytes) throw new Error(`Evidence maxBytes ${String(maxBytes)} is too small for an oversized-item identity stub.`);
+  if (fixed > maxBytes) throw new Error(`Observed facts maxBytes ${String(maxBytes)} is too small for an oversized-item identity stub.`);
   const available = maxBytes - fixed;
   id = takeUtf8(id, Math.floor(available / 2));
   toolName = takeUtf8(toolName, available - Buffer.byteLength(id, 'utf8'));
@@ -137,7 +138,7 @@ function decodeExternalCursor(cursor: string): string | undefined {
 }
 function parseToolCursor(cursor: string): number {
   const value = Number(cursor.slice('tool:'.length));
-  if (!Number.isSafeInteger(value) || value < 0) throw new Error('Invalid tool evidence cursor.');
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error('Invalid tool observedFacts cursor.');
   return value;
 }
 function withCursor(

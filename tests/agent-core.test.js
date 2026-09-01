@@ -6,16 +6,16 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
   AgentRuntime,
-  AgentOperationCoordinator,
+  AgentRunCoordinator,
   AgentFinalizationError,
   AgentRunFinalizer,
   agentEventCodec,
-  createAgentPreparedDispositionEffect,
-  createAgentPreparedCheckEffect,
+  createAgentDispositionEffectPlan,
+  createAgentCheckEffectPlan,
   decodeAgentEvent,
   readCommittedTerminal
 } from '@agent-core/runtime';
-import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/evidence';
+import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import { ModelProviderError } from '@agent-core/model';
 import * as z from 'zod';
 import {
@@ -164,7 +164,7 @@ function modelToolName(tool) {
   return tool.type === 'function' ? tool.function.name : tool.name;
 }
 
-test('tool progress from preparation and invocation remains separate from the final observation', async () => {
+test('tool progress from planning and invocation remains separate from the final observation', async () => {
   const progress = [];
   const tool = adoptToolDefinition({
     name: 'progress_tool', implementationId: 'tests/progress-tool@1', description: 'progress', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope,
@@ -234,7 +234,7 @@ test('artifact-store failure after a completed tool effect still persists tool.e
   assert.equal(persisted.find(event => event.type === 'tool.ended').observation.metadata.durableStorage.status, 'degraded');
 });
 
-test('image and presenter projection failures happen after durable tool truth and preserve protocol pairing', async () => {
+test('image and presenter assembly failures happen after durable tool truth and preserve protocol pairing', async () => {
   const missingImage = {
     visibility: 'public', artifactId: 'missing-image', sha256: '0'.repeat(64), size: 4, mediaType: 'image/png'
   };
@@ -245,16 +245,16 @@ test('image and presenter projection failures happen after durable tool truth an
   const integrityImage = await integrityArtifacts.store({ label: 'integrity-image', content: new Uint8Array([1, 2, 3, 4]), mediaType: 'image/png' });
   const cases = [
     {
-      name: 'missing_image_projection', profile: { modalities: { input: ['text', 'image'], output: ['text'] } }, expected: /Unknown artifact/u,
+      name: 'missing_image_delivery', profile: { modalities: { input: ['text', 'image'], output: ['text'] } }, expected: /Unknown artifact/u,
       observation: { kind: 'result', ok: true, summary: 'image effect completed', scope: completeScope, content: [{ type: 'image', artifact: missingImage, detail: 'original' }], output: { artifact: missingImage } }
     },
     {
-      name: 'image_integrity_projection', profile: { modalities: { input: ['text', 'image'], output: ['text'] } }, expected: /integrity failure/u,
+      name: 'image_integrity_delivery', profile: { modalities: { input: ['text', 'image'], output: ['text'] } }, expected: /integrity failure/u,
       artifacts: integrityArtifacts,
       observation: { kind: 'result', ok: true, summary: 'image effect completed', scope: completeScope, content: [{ type: 'image', artifact: integrityImage, detail: 'original' }], output: { artifact: integrityImage } }
     },
     {
-      name: 'presenter_projection', expected: /presenter exploded/u,
+      name: 'presenter_delivery', expected: /presenter exploded/u,
       presentObservation() { throw new Error('presenter exploded'); },
       observation: { kind: 'result', ok: true, summary: 'presenter effect completed', scope: completeScope, output: { changed: true } }
     }
@@ -275,7 +275,7 @@ test('image and presenter projection failures happen after durable tool truth an
         const result = request.messages.find(message => message.role === 'tool' && message.toolName === scenario.name);
         assert.ok(result);
         assert.match(result.content, /durable tool result was committed/iu);
-        return response('stop', 'continued after projection failure');
+        return response('stop', 'continued after assembly failure');
       }
     ], { ...(scenario.profile ? { profile: scenario.profile } : {}) });
     const { agent, events } = await harness({ provider, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, withoutSession: true, ...(scenario.artifacts ? { artifacts: scenario.artifacts } : {}) });
@@ -284,47 +284,47 @@ test('image and presenter projection failures happen after durable tool truth an
     assert.equal(effects, 1);
     const persisted = await eventsFor(events, result.runId);
     const endedIndex = persisted.findIndex(event => event.type === 'tool.ended');
-    const failedIndex = persisted.findIndex(event => event.type === 'observation.projection.failed');
+    const failedIndex = persisted.findIndex(event => event.type === 'observation.recording.failed');
     assert.ok(endedIndex >= 0 && failedIndex > endedIndex);
     assert.match(persisted[failedIndex].message, scenario.expected);
     assert.equal(persisted.some(event => event.type === 'observation.record.created'), false);
   }
 });
 
-test('session and observation-record projection failures do not reclassify a completed effect', async () => {
+test('session and observation-record assembly failures do not reclassify a completed effect', async () => {
   class FailingSessionRepository extends InMemorySessionRepository {
-    async appendObservation() { throw new Error('session projection failed'); }
+    async appendObservation() { throw new Error('session assembly failed'); }
   }
   class FailingObservationEventRepository extends InMemoryEventRepository {
     failed = false;
     async appendConditional(runId, event, options) {
-      if (event.type === 'observation.record.created' && !this.failed) { this.failed = true; throw new Error('observation event projection failed'); }
+      if (event.type === 'observation.record.created' && !this.failed) { this.failed = true; throw new Error('observation event assembly failed'); }
       return super.appendConditional(runId, event, options);
     }
   }
   const cases = [
-    { sessions: new FailingSessionRepository(), expected: /session projection failed/u },
-    { events: new FailingObservationEventRepository(agentEventCodec), expected: /observation event projection failed/u }
+    { sessions: new FailingSessionRepository(), expected: /session assembly failed/u },
+    { events: new FailingObservationEventRepository(agentEventCodec), expected: /observation event assembly failed/u }
   ];
   for (const scenario of cases) {
     let effects = 0;
     const tool = {
-      name: 'projection_effect', implementationId: 'tests/projection-effect@1', description: 'projection effect', jsonSchema: { type: 'object' }, outputSchema: z.unknown(),
+      name: 'observation_delivery_effect', implementationId: 'tests/assembly-effect@1', description: 'assembly effect', jsonSchema: { type: 'object' }, outputSchema: z.unknown(),
       effectEnvelope: { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'] },
       decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'], recovery: { kind: 'unknown' } }; },
       async invoke() { effects += 1; return { kind: 'result', ok: true, summary: 'effect committed', scope: completeScope, output: { done: true } }; }
     };
-    const run = await harness({ ...scenario, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, script: [response('tool_calls', '', { toolCalls: [{ id: 'projection', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }] }), response()] });
-    const result = ended(await run.agent.run({ task: 'projection failure' }).result);
+    const run = await harness({ ...scenario, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, script: [response('tool_calls', '', { toolCalls: [{ id: 'assembly', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }] }), response()] });
+    const result = ended(await run.agent.run({ task: 'assembly failure' }).result);
     assert.equal(result.executionStatus, 'completed');
     assert.equal(effects, 1);
     const persisted = await eventsFor(run.events, result.runId);
     assert.equal(persisted.filter(event => event.type === 'tool.ended').length, 1);
-    assert.match(persisted.find(event => event.type === 'observation.projection.failed').message, scenario.expected);
+    assert.match(persisted.find(event => event.type === 'observation.recording.failed').message, scenario.expected);
   }
 });
 
-test('parallel tool settlements commit immediately while conversation projection remains a contiguous source-order prefix', async () => {
+test('parallel tool settlements commit immediately while conversation assembly remains a contiguous source-order prefix', async () => {
   const gates = [deferred(), deferred(), deferred()];
   const started = [deferred(), deferred(), deferred()];
   let active = 0;
@@ -347,35 +347,35 @@ test('parallel tool settlements commit immediately while conversation projection
     }
   };
   const calls = [0, 1, 2].map((index) => ({ id: `parallel-${String(index)}`, type: 'function', name: tool.name, input: { kind: 'json', value: { index } } }));
-  const run = await harness({
+  const fixture = await harness({
     tools: [tool], limits: { maxConcurrentToolCalls: 2 },
     script: [response('tool_calls', '', { toolCalls: calls }), response('stop', 'parallel complete')]
   });
-  const control = run.agent.run({ task: 'run independent calls' });
+  const control = fixture.agent.run({ task: 'run independent calls' });
   await Promise.all([started[0].promise, started[1].promise]);
-  let operation = await run.agent.inspectOperation(control.runId);
-  assert.equal(operation.state.phase.kind, 'tools');
-  assert.equal(operation.state.phase.maxConcurrency, 2);
-  assert.deepEqual(operation.state.phase.callStates.map((state) => state.stage), ['effect_pending', 'effect_pending', 'effect_ready']);
+  let inspection = await fixture.agent.inspectRun(control.runId);
+  assert.equal(inspection.state.phase.kind, 'tools');
+  assert.equal(inspection.state.phase.maxConcurrency, 2);
+  assert.deepEqual(inspection.state.phase.callStates.map((state) => state.stage), ['effect_pending', 'effect_pending', 'effect_ready']);
 
   gates[1].resolve();
   await started[2].promise;
   gates[2].resolve();
   for (;;) {
-    operation = await run.agent.inspectOperation(control.runId);
-    if (operation.state.phase.kind === 'tools' && operation.state.phase.callStates[1]?.stage === 'settled'
-      && operation.state.phase.callStates[2]?.stage === 'settled') break;
+    inspection = await fixture.agent.inspectRun(control.runId);
+    if (inspection.state.phase.kind === 'tools' && inspection.state.phase.callStates[1]?.stage === 'settled'
+      && inspection.state.phase.callStates[2]?.stage === 'settled') break;
     await Promise.resolve();
   }
-  assert.deepEqual(operation.state.phase.callStates.map((state) => state.stage), ['effect_pending', 'settled', 'settled']);
-  assert.equal(operation.state.phase.nextProjectionIndex, 0);
-  assert.equal((await eventsFor(run.events, control.runId)).some((event) => event.type === 'observation.record.created'), false);
+  assert.deepEqual(inspection.state.phase.callStates.map((state) => state.stage), ['effect_pending', 'settled', 'settled']);
+  assert.equal(inspection.state.phase.nextObservationIndex, 0);
+  assert.equal((await eventsFor(fixture.events, control.runId)).some((event) => event.type === 'observation.record.created'), false);
 
   gates[0].resolve();
   const result = ended(await control.result);
   assert.equal(result.executionStatus, 'completed');
   assert.equal(maximumActive, 2);
-  const events = await eventsFor(run.events, control.runId);
+  const events = await eventsFor(fixture.events, control.runId);
   assert.deepEqual(events.filter((event) => event.type === 'tool.ended').map((event) => event.callIndex), [1, 2, 0]);
   assert.deepEqual(events.filter((event) => event.type === 'observation.record.created').map((event) => event.callIndex), [0, 1, 2]);
 });
@@ -403,18 +403,18 @@ test('parallel scheduler enforces explicit dependencies and resource conflicts w
     }
   };
   const calls = [0, 1, 2, 3].map((index) => ({ id: `scheduled-${String(index)}`, type: 'function', name: tool.name, input: { kind: 'json', value: { index } } }));
-  const run = await harness({ tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, limits: { maxConcurrentToolCalls: 4 }, script: [response('tool_calls', '', { toolCalls: calls }), response()] });
-  const control = run.agent.run({ task: 'respect dependencies' });
+  const fixture = await harness({ tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, limits: { maxConcurrentToolCalls: 4 }, script: [response('tool_calls', '', { toolCalls: calls }), response()] });
+  const control = fixture.agent.run({ task: 'respect dependencies' });
   await Promise.all([started[0].promise, started[1].promise]);
-  let operation = await run.agent.inspectOperation(control.runId);
-  assert.equal(operation.state.phase.kind, 'tools');
-  assert.deepEqual(operation.state.phase.callStates.map((state) => state.stage), ['effect_pending', 'effect_pending', 'effect_ready', 'effect_ready']);
+  let inspection = await fixture.agent.inspectRun(control.runId);
+  assert.equal(inspection.state.phase.kind, 'tools');
+  assert.deepEqual(inspection.state.phase.callStates.map((state) => state.stage), ['effect_pending', 'effect_pending', 'effect_ready', 'effect_ready']);
 
   gates[1].resolve();
   await started[3].promise;
-  operation = await run.agent.inspectOperation(control.runId);
-  assert.equal(operation.state.phase.kind, 'tools');
-  assert.equal(operation.state.phase.callStates[2].stage, 'effect_ready');
+  inspection = await fixture.agent.inspectRun(control.runId);
+  assert.equal(inspection.state.phase.kind, 'tools');
+  assert.equal(inspection.state.phase.callStates[2].stage, 'effect_ready');
   gates[3].resolve();
   gates[0].resolve();
   await started[2].promise;
@@ -446,7 +446,7 @@ test('cancellation durably closes or marks every call in a parallel batch', asyn
   await control.abort('cancel parallel batch');
   const result = ended(await control.result);
   assert.equal(result.executionStatus, 'aborted');
-  const transitions = (await eventsFor(run.events, control.runId)).filter((event) => event.type === 'operation.transition');
+  const transitions = (await eventsFor(run.events, control.runId)).filter((event) => event.type === 'run.state.changed');
   const cancelling = transitions.find((event) => event.state.phase.kind === 'cancelling' && event.state.phase.toolBatch);
   assert.ok(cancelling);
   assert.deepEqual(cancelling.state.phase.toolBatch.callStates.map((state) => state.stage), ['outcome_unknown', 'outcome_unknown', 'cancelled']);
@@ -463,7 +463,7 @@ function toolStageKey(runId, identity, stage) {
   return `${runId}:tool:${identity.turnId}:${identity.toolBatchId}:${identity.callIndex}:attempt:${identity.toolAttempt}:${stage}`;
 }
 
-test('candidate mappings preserve execution, completeness, source, and verification independently', async () => {
+test('modelOutput mappings preserve execution, completeness, source, and verification independently', async () => {
   const cases = [
     [response('stop', 'complete'), 'completed', 'complete', 'content', 'model_completed'],
     [response('output_limit', 'partial'), 'completed', 'partial', 'content', 'model_output_limit'],
@@ -475,13 +475,13 @@ test('candidate mappings preserve execution, completeness, source, and verificat
   ];
   for (const [modelResponse, execution, status, source, termination] of cases) {
     const { agent, events } = await harness({ script: [modelResponse], withoutSession: true });
-    const result = ended(await agent.run({ task: 'map candidate' }).result);    assert.equal(result.executionStatus, execution);
-    assert.equal(result.candidate.status, status);
-    if (source) assert.equal(result.candidate.source, source);
+    const result = ended(await agent.run({ task: 'map modelOutput' }).result);    assert.equal(result.executionStatus, execution);
+    assert.equal(result.modelOutput.status, status);
+    if (source) assert.equal(result.modelOutput.source, source);
     assert.equal(result.terminationReason, termination);
     const assistant = (await eventsFor(events, result.runId)).find((event) => event.type === 'assistant.ended');
-    assert.equal(assistant.candidate.status, status);
-    if (source) assert.equal(assistant.candidate.source, source);
+    assert.equal(assistant.modelOutput.status, status);
+    if (source) assert.equal(assistant.modelOutput.source, source);
   }
 });
 
@@ -493,21 +493,21 @@ test('disposition decisions accept, revise, fail, or remain inconclusive from ex
     policyIdentity: { strategy: 'revise-once' },
     evaluate(input) {
       inputs.push(input);
-      assert.deepEqual(Object.keys(input).sort(), ['budget', 'candidate', 'checkResults', 'control', 'policyIdentity', 'receipts']);
-      return input.budget.candidateRevisions === 0
+      assert.deepEqual(Object.keys(input).sort(), ['budget', 'checkResults', 'control', 'modelOutput', 'policyIdentity', 'receipts']);
+      return input.budget.revisionAttempts === 0
         ? { kind: 'revise', instruction: 'Return a shorter, directly actionable answer.' }
         : { kind: 'accept' };
     }
   };
   const revised = await harness({
     disposition: revisionPolicy,
-    script: [response('stop', 'first candidate'), response('stop', 'revised candidate')],
+    script: [response('stop', 'first modelOutput'), response('stop', 'revised modelOutput')],
     withoutSession: true
   });
   const revisedResult = ended(await revised.agent.run({ task: 'revise once' }).result);
-  assert.equal(revisedResult.executionStatus, 'completed');
-  assert.equal(revisedResult.candidate.message, 'revised candidate');
-  assert.equal(revisedResult.budget.candidateRevisions, 1);
+  assert.equal(revisedResult.executionStatus, 'completed', JSON.stringify(revisedResult));
+  assert.equal(revisedResult.modelOutput.message, 'revised modelOutput');
+  assert.equal(revisedResult.budget.revisionAttempts, 1);
   assert.equal(inputs.length, 2);
   assert.equal(Object.isFrozen(inputs[0]), true);
   const records = [];
@@ -515,10 +515,10 @@ test('disposition decisions accept, revise, fail, or remain inconclusive from ex
   const eventIds = new Set(records.map(record => record.eventId));
   for (const input of inputs) {
     assert.equal(eventIds.has(input.receipts.providerSettlementEventId), true);
-    assert.equal(eventIds.has(input.receipts.candidateEventId), true);
+    assert.equal(eventIds.has(input.receipts.modelOutputEventId), true);
     assert.equal(input.receipts.verificationEventIds.every(eventId => eventIds.has(eventId)), true);
   }
-  const decisions = records.filter(record => record.event.type === 'candidate.disposition.decided').map(record => record.event);
+  const decisions = records.filter(record => record.event.type === 'run.disposition.decided').map(record => record.event);
   assert.deepEqual(decisions.map(event => event.decision.kind), ['revise', 'accept']);
   assert.deepEqual(decisions.map(event => event.revisionCount), [0, 1]);
   assert.equal(decisions.every(event => /^[0-9a-f]{64}$/u.test(event.inputDigest) && /^[0-9a-f]{64}$/u.test(event.outputDigest)), true);
@@ -526,8 +526,8 @@ test('disposition decisions accept, revise, fail, or remain inconclusive from ex
   assert.deepEqual(secondSnapshot.snapshot.instructions.filter(instruction => instruction.provenance === 'disposition').map(instruction => instruction.content), ['Return a shorter, directly actionable answer.']);
 
   const terminalCases = [
-    [{ kind: 'fail', reason: 'Candidate violates the admitted policy.' }, 'candidate_rejected'],
-    [{ kind: 'inconclusive', reason: 'The admitted policy lacks enough evidence.' }, 'disposition_inconclusive']
+    [{ kind: 'fail', reason: 'Model output violates the admitted policy.' }, 'model_output_rejected'],
+    [{ kind: 'inconclusive', reason: 'The admitted policy lacks enough observedFacts.' }, 'disposition_inconclusive']
   ];
   for (const [decision, terminationReason] of terminalCases) {
     const run = await harness({
@@ -535,14 +535,14 @@ test('disposition decisions accept, revise, fail, or remain inconclusive from ex
         kind: 'deterministic', implementationId: `agent-core.tests.${decision.kind}-disposition@1`,
         policyIdentity: { strategy: decision.kind }, evaluate: () => decision
       },
-      script: [response('stop', `${decision.kind} candidate`)],
+      script: [response('stop', `${decision.kind} modelOutput`)],
       withoutSession: true
     });
     const result = ended(await run.agent.run({ task: decision.kind }).result);
     assert.equal(result.executionStatus, 'failed');
     assert.equal(result.terminationReason, terminationReason);
     assert.equal(result.errorMessage, decision.reason);
-    assert.equal(result.candidate.status, 'complete');
+    assert.equal(result.modelOutput.status, 'complete');
     assert.equal(result.verificationStatus, 'not_required');
   }
 });
@@ -551,8 +551,8 @@ test('disposition decision commits recover before, after, and across their autho
   class InterruptedDispositionRepository extends InMemoryEventRepository {
     constructor(mode) { super(agentEventCodec); this.mode = mode; this.interrupted = false; }
     async appendConditional(runId, event, options) {
-      const decision = event.type === 'candidate.disposition.decided';
-      const decidedTransition = event.type === 'operation.transition' && event.state.phase.kind === 'disposition' && event.state.phase.stage === 'decided';
+      const decision = event.type === 'run.disposition.decided';
+      const decidedTransition = event.type === 'run.state.changed' && event.state.phase.kind === 'disposition' && event.state.phase.stage === 'decided';
       if (!this.interrupted && this.mode === 'before_event' && decision) { this.interrupted = true; throw new Error('interrupted before disposition event'); }
       const result = await super.appendConditional(runId, event, options);
       if (!this.interrupted && ((this.mode === 'after_event' && decision) || (this.mode === 'after_transition' && decidedTransition))) {
@@ -564,7 +564,7 @@ test('disposition decision commits recover before, after, and across their autho
   }
   for (const [mode, expectedEvaluations] of [['before_event', 2], ['after_event', 1], ['after_transition', 1]]) {
     const events = new InterruptedDispositionRepository(mode);
-    const provider = new ScriptedProvider([response('stop', `candidate ${mode}`)]);
+    const provider = new ScriptedProvider([response('stop', `modelOutput ${mode}`)]);
     let evaluations = 0;
     const disposition = {
       kind: 'deterministic', implementationId: 'agent-core.tests.crash-disposition@1', policyIdentity: { strategy: 'accept' },
@@ -576,25 +576,25 @@ test('disposition decision commits recover before, after, and across their autho
     const resumed = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events }, disposition });
     const result = ended(await resumed.resume(control.runId).result);
     assert.equal(result.executionStatus, 'completed');
-    assert.equal(result.candidate.message, `candidate ${mode}`);
+    assert.equal(result.modelOutput.message, `modelOutput ${mode}`);
     assert.equal(evaluations, expectedEvaluations);
     assert.equal(provider.calls.length, 1);
     const ledger = await eventsFor(events, control.runId);
-    assert.equal(ledger.filter(event => event.type === 'candidate.disposition.decided').length, 1);
+    assert.equal(ledger.filter(event => event.type === 'run.disposition.decided').length, 1);
     assert.equal(ledger.filter(event => event.type === 'run.ended').length, 1);
   }
 });
 
-test('disposition implementation mismatch suspends and revision exhaustion preserves checked candidate truth', async () => {
+test('disposition implementation mismatch suspends and revision exhaustion preserves checked modelOutput truth', async () => {
   class BeforeDecisionRepository extends InMemoryEventRepository {
     interrupted = false;
     async appendConditional(runId, event, options) {
-      if (!this.interrupted && event.type === 'candidate.disposition.decided') { this.interrupted = true; throw new Error('stop before decision'); }
+      if (!this.interrupted && event.type === 'run.disposition.decided') { this.interrupted = true; throw new Error('stop before decision'); }
       return super.appendConditional(runId, event, options);
     }
   }
   const events = new BeforeDecisionRepository(agentEventCodec);
-  const provider = new ScriptedProvider([response('stop', 'captured candidate')]);
+  const provider = new ScriptedProvider([response('stop', 'captured modelOutput')]);
   const original = {
     kind: 'deterministic', implementationId: 'agent-core.tests.original-disposition@1',
     policyIdentity: { strategy: 'accept' }, evaluate: () => ({ kind: 'accept' })
@@ -612,7 +612,7 @@ test('disposition implementation mismatch suspends and revision exhaustion prese
 
   const checked = {
     id: 'required', implementationId: 'agent-core.tests.required-check@1', kind: 'deterministic', requirement: 'required',
-    async run() { return { verdict: 'passed', summary: 'Candidate checked.' }; }
+    async run() { return { verdict: 'passed', summary: 'Model output checked.' }; }
   };
   const exhausted = await harness({
     checks: [checked],
@@ -620,38 +620,38 @@ test('disposition implementation mismatch suspends and revision exhaustion prese
       kind: 'deterministic', implementationId: 'agent-core.tests.always-revise@1', policyIdentity: { strategy: 'always-revise' },
       evaluate: () => ({ kind: 'revise', instruction: 'Revise again.' })
     },
-    limits: { candidateRevisions: 0 },
-    script: [response('stop', 'checked candidate')],
+    limits: { revisionAttempts: 0 },
+    script: [response('stop', 'checked modelOutput')],
     withoutSession: true
   });
   const exhaustedResult = ended(await exhausted.agent.run({ task: 'exhaust revisions' }).result);
   assert.equal(exhaustedResult.executionStatus, 'failed');
   assert.equal(exhaustedResult.terminationReason, 'limit_exhausted');
-  assert.equal(exhaustedResult.exhaustedLimit, 'candidate_revisions');
-  assert.equal(exhaustedResult.candidate.status, 'complete');
-  assert.equal(exhaustedResult.candidate.message, 'checked candidate');
+  assert.equal(exhaustedResult.exhaustedLimit, 'revision_attempts');
+  assert.equal(exhaustedResult.modelOutput.status, 'complete');
+  assert.equal(exhaustedResult.modelOutput.message, 'checked modelOutput');
   assert.equal(exhaustedResult.verificationStatus, 'passed');
   assert.deepEqual(exhaustedResult.checkResults.map(result => result.verdict), ['passed']);
-  assert.equal(exhaustedResult.budget.candidateRevisions, 0);
+  assert.equal(exhaustedResult.budget.revisionAttempts, 0);
 });
 
 test('queryable disposition effects reconcile a started decision without replay', async () => {
   class InterruptedEffectDecisionRepository extends InMemoryEventRepository {
     interrupted = false;
     async appendConditional(runId, event, options) {
-      if (!this.interrupted && event.type === 'candidate.disposition.decided') { this.interrupted = true; throw new Error('process stopped after evaluator effect'); }
+      if (!this.interrupted && event.type === 'run.disposition.decided') { this.interrupted = true; throw new Error('process stopped after evaluator effect'); }
       return super.appendConditional(runId, event, options);
     }
   }
   const events = new InterruptedEffectDecisionRepository(agentEventCodec);
-  const provider = new ScriptedProvider([response('stop', 'effect candidate')]);
+  const provider = new ScriptedProvider([response('stop', 'effect modelOutput')]);
   let starts = 0;
   let reconciliations = 0;
   let externalDecision;
   const disposition = {
     kind: 'effect', implementationId: 'agent-core.tests.effect-disposition@1', policyIdentity: { strategy: 'queryable' },
-    async prepare() {
-      return createAgentPreparedDispositionEffect({
+    async planEffect() {
+      return createAgentDispositionEffectPlan({
         authorization: { evaluator: 'remote-policy' },
         recovery: { kind: 'queryable', service: 'test-disposition', reconcilerId: 'test-disposition@1', externalExecutionId: 'decision-1', expiresAt: '2099-01-01T00:00:00.000Z' },
         async start() { starts += 1; externalDecision = { kind: 'accept' }; return externalDecision; },
@@ -663,7 +663,7 @@ test('queryable disposition effects reconcile a started decision without replay'
   const initial = await harness({ events, provider, disposition, withoutSession: true });
   const control = initial.agent.run({ task: 'recover effect decision' });
   await assert.rejects(control.result, /process stopped after evaluator effect/u);
-  const pending = await new AgentOperationCoordinator(events).inspect(control.runId);
+  const pending = await new AgentRunCoordinator(events).inspect(control.runId);
   assert.equal(pending.state.phase.kind, 'disposition');
   assert.equal(pending.state.phase.stage, 'effect_pending');
   const resumed = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events }, disposition });
@@ -673,24 +673,24 @@ test('queryable disposition effects reconcile a started decision without replay'
   assert.equal(reconciliations, 1);
   assert.equal(provider.calls.length, 1);
   const ledger = await eventsFor(events, control.runId);
-  assert.equal(ledger.filter(event => event.type === 'candidate.disposition.decided').length, 1);
+  assert.equal(ledger.filter(event => event.type === 'run.disposition.decided').length, 1);
 });
 
 test('effect disposition policies cannot bypass their durable effect boundary', async () => {
   const { agent, events } = await harness({
     disposition: {
       kind: 'effect', implementationId: 'agent-core.tests.invalid-effect-disposition@1', policyIdentity: { strategy: 'invalid-direct-decision' },
-      async prepare() { return { kind: 'accept' }; }
+      async planEffect() { return { kind: 'accept' }; }
     },
-    script: [response('stop', 'candidate without an effect')],
+    script: [response('stop', 'modelOutput without an effect')],
     withoutSession: true
   });
   const result = ended(await agent.run({ task: 'reject direct effect decision' }).result);
   assert.equal(result.executionStatus, 'failed');
   assert.equal(result.terminationReason, 'runtime_error');
-  assert.match(result.errorMessage, /must return a prepared external effect/u);
+  assert.match(result.errorMessage, /must return a plan external effect/u);
   const ledger = await eventsFor(events, result.runId);
-  assert.equal(ledger.some(event => event.type === 'candidate.disposition.decided'), false);
+  assert.equal(ledger.some(event => event.type === 'run.disposition.decided'), false);
 });
 
 test('stream interruption preserves an unknown provider outcome without treating partial output as settlement', async () => {
@@ -708,7 +708,7 @@ test('stream interruption preserves an unknown provider outcome without treating
   assert.equal(records.some((event) => event.type === 'provider.attempt.settled'), false);
 });
 
-test('abort during verification produces aborted/not_run and preserves a partial candidate', async () => {
+test('abort during verification produces aborted/not_run and preserves a partial modelOutput', async () => {
   const controller = new AbortController();
   const check = { id: 'wait', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run({ signal }) {
     setTimeout(() => controller.abort('stop verification'), 5);
@@ -718,8 +718,8 @@ test('abort during verification produces aborted/not_run and preserves a partial
   const { agent } = await harness({ checks: [check] });
   const result = ended(await agent.run({ task: 'abort verification', signal: controller.signal }).result);  assert.equal(result.executionStatus, 'aborted');
   assert.equal(result.verificationStatus, 'not_run');
-  assert.equal(result.candidate.status, 'partial');
-  assert.equal(result.candidate.message, 'done');
+  assert.equal(result.modelOutput.status, 'partial');
+  assert.equal(result.modelOutput.message, 'done');
 });
 
 test('abort requested while delivering the final check cannot commit completed verification', async () => {
@@ -730,27 +730,27 @@ test('abort requested while delivering the final check cannot commit completed v
   });
   const result = ended(await agent.run({ task: 'cancel at verification boundary', signal: controller.signal }).result);  assert.equal(result.executionStatus, 'aborted');
   assert.equal(result.verificationStatus, 'not_run');
-  assert.equal(result.candidate.status, 'partial');
+  assert.equal(result.modelOutput.status, 'partial');
   const records = await eventsFor(events, result.runId);
   assert.equal(records.filter((event) => event.type === 'run.ended').length, 1);
   assert.equal(records.find((event) => event.type === 'run.ended').terminal.executionStatus, 'aborted');
 });
 
-test('abort at the finalization boundary wins before terminal preparation', async () => {
+test('abort at the finalization boundary wins before terminal planning', async () => {
   const controller = new AbortController();
   const { agent, events } = await harness({
     onProgress(event) {
-      if (event.type === 'run.phase.changed' && event.phase === 'finalizing') controller.abort('cancel before terminal preparation');
+      if (event.type === 'run.phase.changed' && event.phase === 'finalizing') controller.abort('cancel before terminal planning');
     }
   });
   const result = ended(await agent.run({ task: 'cancel at finalization boundary', signal: controller.signal }).result);  assert.equal(result.executionStatus, 'aborted');
   assert.equal(result.verificationStatus, 'not_run');
-  assert.equal(result.candidate.status, 'partial');
+  assert.equal(result.modelOutput.status, 'partial');
   const records = await eventsFor(events, result.runId);
-  const prepared = records.find((event) => event.type === 'finalization.prepared');
+  const plan = records.find((event) => event.type === 'run.finalization.staged');
   const committed = records.find((event) => event.type === 'run.ended');
-  assert.equal(prepared.terminal.executionStatus, 'aborted');
-  assert.deepEqual(prepared.terminal, committed.terminal);
+  assert.equal(plan.terminal.executionStatus, 'aborted');
+  assert.deepEqual(plan.terminal, committed.terminal);
 });
 
 test('throwing check progress observer is a delivery diagnostic and cannot alter verification truth', async () => {
@@ -760,7 +760,7 @@ test('throwing check progress observer is a delivery diagnostic and cannot alter
   });
   const result = ended(await agent.run({ task: 'observer-independent verification' }).result);  assert.equal(result.executionStatus, 'completed');
   assert.equal(result.verificationStatus, 'passed');
-  assert.equal(result.candidate.status, 'complete');
+  assert.equal(result.modelOutput.status, 'complete');
   assert.equal(result.deliveryDiagnostics.some((item) => item.eventType === 'check.ended'), true);
   const records = await eventsFor(events, result.runId);
   assert.equal(records.filter((event) => event.type === 'run.ended').length, 1);
@@ -794,11 +794,11 @@ test('duplicate check IDs are rejected before model execution and missing requir
   assert.equal(deriveAgentVerificationStatus([{ id: 'missing', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required' }], []), 'inconclusive');
 });
 
-test('cyclic and oversized check output is bounded without losing the candidate', async () => {
+test('cyclic and oversized check output is bounded without losing the modelOutput', async () => {
   const cyclic = { huge: 'x'.repeat(100_000), values: Array.from({ length: 500 }, (_, index) => index) };
   cyclic.self = cyclic;
   const { agent } = await harness({ checks: [{ id: 'safe', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok', output: cyclic }; } }] });
-  const result = ended(await agent.run({ task: 'normalize' }).result);  assert.equal(result.candidate.message, 'done');
+  const result = ended(await agent.run({ task: 'normalize' }).result);  assert.equal(result.modelOutput.message, 'done');
   assert.equal(result.verificationStatus, 'passed');
   assert.ok(result.checkResults[0].outputNormalization.length > 0);
   assert.ok(JSON.stringify(result.checkResults[0].output).length < 40_000);
@@ -822,27 +822,27 @@ test('application, run, and steering instructions reach checks with provenance',
   assert.deepEqual(received.map((item) => item.provenance), ['application', 'run', 'steering']);
 });
 
-test('check artifacts and diagnostics agree across ledger, session projection, and replay state', async () => {
+test('check artifacts and diagnostics agree across ledger, session assembly, and replay state', async () => {
   const artifacts = new InMemoryArtifactRepository();
   const ref = await artifacts.store({ label: 'proof', content: new TextEncoder().encode('proof'), mediaType: 'text/plain' });
   const { agent, events, sessions, session } = await harness({ artifacts, checks: [{ id: 'advice', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'advisory', async run() { return { verdict: 'unknown', summary: 'unavailable', diagnostic: { kind: 'unavailable', message: 'offline' }, artifacts: [ref] }; } }] });
   const result = ended(await agent.run({ task: 'persist checks' }).result);  const ledgerFinal = (await eventsFor(events, result.runId)).find((event) => event.type === 'run.ended').terminal;
   const replay = await sessions.loadReplayState(session);
-  const projection = replay.terminalProjections[0].terminal;
+  const assembly = replay.runFinalizations[0].terminal;
   assert.deepEqual(ledgerFinal.checkResults, result.checkResults);
-  assert.deepEqual(projection.checkResults, result.checkResults);
-  assert.equal(projection.candidate.source, result.candidate.source);
+  assert.deepEqual(assembly.checkResults, result.checkResults);
+  assert.equal(assembly.modelOutput.source, result.modelOutput.source);
 });
 
 test('persisted terminal validation rejects illegal cross-field combinations', () => {
   assert.throws(() => decodeAgentTerminalSnapshot({ ...terminal(), executionStatus: 'completed', verificationStatus: 'not_run' }), /invalid verification/i);
-  assert.throws(() => decodeAgentTerminalSnapshot({ ...terminal(), candidate: { status: 'absent' } }), /present candidate/i);
-  assert.throws(() => decodeAgentTerminalSnapshot({ ...terminal(), terminationReason: 'model_output_limit', modelTerminationReason: 'output_limit' }), /candidate status partial/i);
-  assert.throws(() => decodeAgentTerminalSnapshot({ ...terminal(), terminationReason: 'content_filtered', modelTerminationReason: 'content_filter', candidate: { ...terminal().candidate, status: 'indeterminate' } }), /candidate status partial/i);
-  assert.throws(() => decodeAgentTerminalSnapshot({ ...terminal(), terminationReason: 'unknown_model_termination', modelTerminationReason: 'unknown' }), /candidate status indeterminate/i);
-  assert.throws(() => decodeAgentTerminalSnapshot({ ...terminal(), candidate: { ...terminal().candidate, status: 'partial' } }), /candidate status complete/i);
+  assert.throws(() => decodeAgentTerminalSnapshot({ ...terminal(), modelOutput: { status: 'absent' } }), /present modelOutput/i);
+  assert.throws(() => decodeAgentTerminalSnapshot({ ...terminal(), terminationReason: 'model_output_limit', modelTerminationReason: 'output_limit' }), /modelOutput status partial/i);
+  assert.throws(() => decodeAgentTerminalSnapshot({ ...terminal(), terminationReason: 'content_filtered', modelTerminationReason: 'content_filter', modelOutput: { ...terminal().modelOutput, status: 'indeterminate' } }), /modelOutput status partial/i);
+  assert.throws(() => decodeAgentTerminalSnapshot({ ...terminal(), terminationReason: 'unknown_model_termination', modelTerminationReason: 'unknown' }), /modelOutput status indeterminate/i);
+  assert.throws(() => decodeAgentTerminalSnapshot({ ...terminal(), modelOutput: { ...terminal().modelOutput, status: 'partial' } }), /modelOutput status complete/i);
   assert.throws(() => decodeAgentEvent({ type: 'obsolete.event', value: true }), /unsupported/i);
-  assert.throws(() => decodeAgentEvent({ type: 'assistant.ended', turnIndex: 2, turnId: 'turn-2', requestAttempt: 1, content: 'x', candidate: { status: 'complete', message: 'x', source: 'content', turnIndex: 1 } }), /candidate turnIndex/i);
+  assert.throws(() => decodeAgentEvent({ type: 'assistant.ended', turnIndex: 2, turnId: 'turn-2', requestAttempt: 1, content: 'x', modelOutput: { status: 'complete', message: 'x', source: 'content', turnIndex: 1 } }), /modelOutput turnIndex/i);
 });
 
 test('agent event persistence rejects hostile caller data before hashing or writing', async () => {
@@ -870,13 +870,13 @@ test('agent event persistence accepts long model answers within the runtime outp
     turnId: 'turn-1',
     requestAttempt: 1,
     content: message,
-    candidate: { status: 'complete', message, source: 'content', turnIndex: 1 }
+    modelOutput: { status: 'complete', message, source: 'content', turnIndex: 1 }
   });
   assert.equal(event.content, message);
   assert.throws(() => decodeAgentEvent({
     ...event,
     content: 'x'.repeat(1024 * 1024 + 1),
-    candidate: { status: 'complete', message: 'x'.repeat(1024 * 1024 + 1), source: 'content', turnIndex: 1 }
+    modelOutput: { status: 'complete', message: 'x'.repeat(1024 * 1024 + 1), source: 'content', turnIndex: 1 }
   }), /not safely serializable.*text_truncated/u);
 });
 
@@ -889,7 +889,7 @@ test('in-memory repositories run, reopen, and replay without filesystem paths', 
   const secondProvider = new ScriptedProvider([request => response('stop', request.messages.some(message => message.content.includes('Prior session context')) ? 'replayed' : 'missing')]);
   const second = new AgentRuntime({ provider: secondProvider, model: 'scripted', toolBoundary, repositories: { events: first.events, session: { repository: first.sessions, descriptor: reopened }, artifacts: first.artifacts } });
   const secondResult = ended(await second.run({ task: 'second' }).result);  assert.equal(firstResult.executionStatus, 'completed');
-  assert.equal(secondResult.candidate.message, 'replayed');
+  assert.equal(secondResult.modelOutput.message, 'replayed');
 });
 
 test('session replay preserves an accepted task from an interrupted run', async () => {
@@ -919,7 +919,7 @@ test('session replay preserves an accepted task from an interrupted run', async 
   });
 
   const result = ended(await reopened.run({ task: 'Continue after recovery.' }).result);
-  assert.equal(result.candidate.message, 'recovered interrupted task');
+  assert.equal(result.modelOutput.message, 'recovered interrupted task');
 });
 
 test('model-turn limits terminate deterministically', async () => {
@@ -934,21 +934,21 @@ test('model-turn limits terminate deterministically', async () => {
 
 test('provider failure preserves one durable unknown outcome without a second request', async () => {
   const provider = new ScriptedProvider([new ModelProviderError({ provider: 'scripted', code: 'provider_unavailable', message: 'unknown outcome', retryable: true }), response()]);
-  const run = await harness({ provider, withoutSession: true });
-  const result = await run.agent.run({ task: 'one provider attempt' }).result;
+  const fixture = await harness({ provider, withoutSession: true });
+  const result = await fixture.agent.run({ task: 'one provider attempt' }).result;
   assert.equal(result.state, 'suspended');
   assert.equal(result.reason, 'provider_outcome_unknown');
   assert.equal(provider.calls.length, 1);
-  const records = await eventsFor(run.events, result.runId);
+  const records = await eventsFor(fixture.events, result.runId);
   assert.equal(records.filter(event => event.type === 'model.requested').length, 1);
   assert.equal(records.filter(event => event.type === 'provider.attempt.settled').length, 0);
-  const operation = await new AgentOperationCoordinator(run.events).inspect(result.runId);
-  assert.equal(operation.state.phase.kind, 'provider');
-  assert.equal(operation.state.phase.stage, 'outcome_unknown');
-  assert.equal(operation.state.phase.effect.intent.implementationId, provider.implementationId);
-  assert.deepEqual(operation.state.phase.effect.intent.recovery, { kind: 'unknown' });
-  assert.deepEqual(operation.state.phase.effect.intent.exposure.quantities.map(quantity => quantity.unit), ['prompt_tokens', 'completion_tokens']);
-  assert.ok(operation.state.phase.effect.intent.exposure.quantities.every(quantity => quantity.amount > 0));
+  const inspection = await new AgentRunCoordinator(fixture.events).inspect(result.runId);
+  assert.equal(inspection.state.phase.kind, 'provider');
+  assert.equal(inspection.state.phase.stage, 'outcome_unknown');
+  assert.equal(inspection.state.phase.effect.intent.implementationId, provider.implementationId);
+  assert.deepEqual(inspection.state.phase.effect.intent.recovery, { kind: 'unknown' });
+  assert.deepEqual(inspection.state.phase.effect.intent.exposure.quantities.map(quantity => quantity.unit), ['prompt_tokens', 'completion_tokens']);
+  assert.ok(inspection.state.phase.effect.intent.exposure.quantities.every(quantity => quantity.amount > 0));
 });
 
 test('a provider start ticket stranded by process loss becomes an exact durable abort decision', async () => {
@@ -956,7 +956,7 @@ test('a provider start ticket stranded by process loss becomes an exact durable 
     interrupt = true;
     async appendConditional(runId, event, options) {
       const receipt = await super.appendConditional(runId, event, options);
-      if (this.interrupt && event.type === 'operation.transition'
+      if (this.interrupt && event.type === 'run.state.changed'
         && event.state.phase.kind === 'provider' && event.state.phase.stage === 'effect_ready') {
         this.interrupt = false;
         throw new Error('simulated process stop before provider start');
@@ -976,11 +976,11 @@ test('a provider start ticket stranded by process loss becomes an exact durable 
   assert.equal(result.state, 'suspended');
   assert.equal(result.reason, 'user_decision');
   assert.deepEqual(result.decisionRequest.choices, ['abort']);
-  assert.equal(result.decisionRequest.operationRevision, (await resumed.inspectOperation(control.runId)).state.revision);
+  assert.equal(result.decisionRequest.runRevision, (await resumed.inspectRun(control.runId)).state.revision);
   assert.match(result.decisionRequest.fingerprint, /^[a-f0-9]{64}$/u);
   assert.equal(provider.calls.length, 0);
 
-  const restored = await new AgentOperationCoordinator(events).inspect(control.runId);
+  const restored = await new AgentRunCoordinator(events).inspect(control.runId);
   assert.equal(restored.state.phase.kind, 'suspended');
   assert.equal(restored.state.phase.reason, 'user_decision');
   assert.deepEqual(restored.state.phase.decisionRequest, result.decisionRequest);
@@ -990,7 +990,7 @@ test('a persisted provider settlement resumes without issuing a duplicate reques
   class InterruptedSettlementRepository extends InMemoryEventRepository {
     interrupt = true;
     async appendConditional(runId, event, options) {
-      if (this.interrupt && event.type === 'operation.transition' && event.state.phase.kind === 'provider' && event.state.phase.stage === 'settled') {
+      if (this.interrupt && event.type === 'run.state.changed' && event.state.phase.kind === 'provider' && event.state.phase.stage === 'settled') {
         this.interrupt = false;
         throw new Error('simulated process stop after provider settlement');
       }
@@ -1003,13 +1003,13 @@ test('a persisted provider settlement resumes without issuing a duplicate reques
   const control = first.agent.run({ task: 'resume settled provider response' });
   await assert.rejects(control.result, /simulated process stop|unresolved started provider effect/);
   assert.equal(provider.calls.length, 1);
-  const operation = await new AgentOperationCoordinator(events).inspect(control.runId);
-  assert.equal(operation.state.phase.kind, 'provider');
-  assert.equal(operation.state.phase.stage, 'effect_pending');
+  const run = await new AgentRunCoordinator(events).inspect(control.runId);
+  assert.equal(run.state.phase.kind, 'provider');
+  assert.equal(run.state.phase.stage, 'effect_pending');
   const resumed = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events } });
   const result = ended(await resumed.resume(control.runId).result);
   assert.equal(result.executionStatus, 'completed');
-  assert.equal(result.candidate.message, 'persisted answer');
+  assert.equal(result.modelOutput.message, 'persisted answer');
   assert.equal(provider.calls.length, 1);
   const records = await eventsFor(events, control.runId);
   assert.equal(records.filter(event => event.type === 'provider.attempt.settled').length, 1);
@@ -1020,7 +1020,7 @@ test('a durably started verifier effect is reconciled after process loss without
   class InterruptedVerificationRepository extends InMemoryEventRepository {
     interrupt = true;
     async appendConditional(runId, event, options) {
-      if (this.interrupt && event.type === 'operation.transition'
+      if (this.interrupt && event.type === 'run.state.changed'
         && event.state.phase.kind === 'verification' && event.state.phase.stage === 'settled') {
         this.interrupt = false;
         throw new Error('simulated process stop after verifier completion');
@@ -1029,15 +1029,15 @@ test('a durably started verifier effect is reconciled after process loss without
     }
   }
   const events = new InterruptedVerificationRepository(agentEventCodec);
-  const provider = new ScriptedProvider([response('stop', 'candidate')]);
+  const provider = new ScriptedProvider([response('stop', 'modelOutput')]);
   let starts = 0;
   const check = {
     id: 'effect-check',
     implementationId: 'agent-core.tests.effect-check@1',
     kind: 'effect',
     requirement: 'required',
-    async prepare() {
-      return createAgentPreparedCheckEffect({
+    async planEffect() {
+      return createAgentCheckEffectPlan({
         authorization: { command: 'verify' },
         recovery: { kind: 'queryable', service: 'test-verifier', reconcilerId: 'test-verifier@1', externalExecutionId: 'verification-1', expiresAt: '2099-01-01T00:00:00.000Z' },
         async start() { starts += 1; return { verdict: 'passed', summary: 'verified' }; },
@@ -1050,7 +1050,7 @@ test('a durably started verifier effect is reconciled after process loss without
   const control = first.agent.run({ task: 'resume verifier effect' });
   await assert.rejects(control.result, /simulated process stop|unresolved verifier effect/);
   assert.equal(starts, 1);
-  const interrupted = await new AgentOperationCoordinator(events).inspect(control.runId);
+  const interrupted = await new AgentRunCoordinator(events).inspect(control.runId);
   assert.equal(interrupted.state.phase.kind, 'verification');
   assert.equal(interrupted.state.phase.stage, 'effect_pending');
 
@@ -1087,21 +1087,25 @@ test('provider takeover never starts a second request while the previous owner m
   assert.equal(provider.calls.length, 1);
 });
 
-test('final request snapshot separates every dynamic context provenance and hashes the prompt', async () => {
-  const item = (id, content) => ({ id, sourceUri: `memory:${id}`, sourceKind: 'external', representation: 'full', mediaType: 'text/plain', title: id, content, selectionReason: 'test', score: 1 });
-  const run = await harness({
+test('logical request fingerprint separates every dynamic context origin and hashes the prompt', async () => {
+  const item = (id, content) => ({
+    id, sourceUri: `memory:${id}`, sourceKind: 'external', representation: 'full', mediaType: 'text/plain', title: id, content,
+    integrity: 'unverified', purpose: 'reference'
+  });
+  const fixture = await harness({
     withoutSession: true,
     contextItems: [item('configured', 'configured context')],
     contextProvider: () => [item('provider', 'provider context')]
   });
-  const result = ended(await run.agent.run({ task: 'snapshot', contextItems: [item('run', 'run context')] }).result);  const snapshot = (await eventsFor(run.events, result.runId)).find(event => event.type === 'request.snapshot.created').snapshot;
-  assert.deepEqual(snapshot.configuredContextIds, ['configured']);
-  assert.deepEqual(snapshot.providerContextIds, ['provider']);
-  assert.deepEqual(snapshot.runContextIds, ['run']);
-  for (const field of ['effectiveInstructionHash', 'selectedEvidenceHash', 'retainedHistoryHash', 'modelToolSchemasHash', 'compiledPromptHash']) assert.match(snapshot[field], /^[a-f0-9]{64}$/);
+  const result = ended(await fixture.agent.run({ task: 'snapshot', contextItems: [item('run', 'run context')] }).result);
+  const fingerprint = (await eventsFor(fixture.events, result.runId)).find(event => event.type === 'inference.request.fingerprinted').fingerprint;
+  assert.deepEqual(fingerprint.configuredContextIds, ['configured']);
+  assert.deepEqual(fingerprint.providerContextIds, ['provider']);
+  assert.deepEqual(fingerprint.runContextIds, ['run']);
+  for (const field of ['effectiveInstructionHash', 'selectedFactsHash', 'modelWindowHistoryHash', 'modelToolSchemasHash', 'modelWindowHash']) assert.match(fingerprint[field], /^[a-f0-9]{64}$/);
 });
 
-test('tool preparation resources release after denial, approval suspension, authorization failure, and success', async () => {
+test('tool planning resources release after denial, approval suspension, authorization failure, and success', async () => {
   for (const outcome of ['denied', 'approval', 'authorization_failure', 'success']) {
     let releases = 0;
     const call = { id: outcome, type: 'function', name: 'lifetime', input: { kind: 'json', value: {} } };
@@ -1109,7 +1113,7 @@ test('tool preparation resources release after denial, approval suspension, auth
       name: 'lifetime', implementationId: `tests/lifetime-${outcome}@1`, description: 'lifetime', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema,
       effectEnvelope: readEnvelope,
       decodeInput() { return { ok: true, input: {} }; },
-      async canonicalizeInput(input, context) { await context.preparation.own({ release() { releases += 1; } }); return input; },
+      async canonicalizeInput(input, context) { await context.lifetime.own({ release() { releases += 1; } }); return input; },
       snapshotInput(input) { return input; }, deriveEffects() { return readEffects; },
       async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'done', scope: completeScope }; }
     };
@@ -1139,7 +1143,7 @@ test('durable approval resumes after repository reopen and rejects changed polic
     effectEnvelope: { accesses: [{ mode: 'write', scope: 'workspace' }], lockScopes: ['workspace'] },
     decodeInput(input) { return { ok: true, input: input.value }; },
     async canonicalizeInput(input, context) {
-      await context.preparation.own({ release() { preparationReleases += 1; } });
+      await context.lifetime.own({ release() { preparationReleases += 1; } });
       return { ...input, path: 'state' };
     }, snapshotInput(input) { return input; },
     deriveEffects(input) { return { accesses: [{ mode: 'write', scope: `workspace/${input.path}` }], lockScopes: [`workspace/${input.path}`], recovery: { kind: 'unknown' } }; },
@@ -1172,7 +1176,7 @@ test('durable approval resumes after repository reopen and rejects changed polic
   assert.equal(unavailable.state, 'suspended');
   assert.equal(unavailable.reason, 'missing_implementation');
   assert.equal(preparationReleases, 1);
-  assert.equal((await repositories.agent.inspectOperation(suspended.runId)).state.phase.kind, 'approval');
+  assert.equal((await repositories.agent.inspectRun(suspended.runId)).state.phase.kind, 'approval');
   assert.deepEqual(approval.binding, { toolImplementationId: tool.implementationId, ...toolBoundary });
 
   const reopened = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, descriptor: repositories.session }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, checks: [{ id: 'required', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
@@ -1236,7 +1240,7 @@ test('process death after an approved effect without recovery proof remains unce
   assert.equal(result.reason, 'tool_outcome_unknown');
   assert.equal(await readFile(path.join(root, 'effect.txt'), 'utf8'), 'effect\n');
 
-  const eventRepository = new (await import('@agent-core/evidence/node')).JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
+  const eventRepository = new (await import('@agent-core/persistence/node')).JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
   const records = await eventsFor(eventRepository, approval.runId);
   assert.equal(records.filter((event) => event.type === 'tool.started').length, 1);
   assert.equal(records.filter((event) => event.type === 'tool.ended').length, 0);
@@ -1255,7 +1259,7 @@ test('crashes while waiting for a lease or after acquisition but before tool.sta
     assert.equal(crash.status, exitStatus, crash.stderr);
     await assert.rejects(() => readFile(path.join(root, 'effect.txt'), 'utf8'), /ENOENT/u);
 
-    const eventRepository = new (await import('@agent-core/evidence/node')).JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
+    const eventRepository = new (await import('@agent-core/persistence/node')).JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
     let records = await eventsFor(eventRepository, approval.runId);
     assert.equal(records.filter((event) => event.type === 'tool.started').length, 0, mode);
     assert.equal(records.filter((event) => event.type === 'tool.ended').length, 0, mode);
@@ -1270,7 +1274,7 @@ test('crashes while waiting for a lease or after acquisition but before tool.sta
   }
 });
 
-test('process death after tool completion projects the durable observation without replay', async () => {
+test('process death after tool completion records the durable observation without replay', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-completed-crash-'));
   const fixture = path.resolve('tests/fixtures/approval-crash.mjs');
   const initial = spawnSync(process.execPath, [fixture, 'suspend', root], { encoding: 'utf8' });
@@ -1285,7 +1289,7 @@ test('process death after tool completion projects the durable observation witho
   const result = JSON.parse(recovered.stdout);
   assert.equal(result.executionStatus, 'completed');
   assert.equal(await readFile(path.join(root, 'effect.txt'), 'utf8'), 'effect\n');
-  const eventRepository = new (await import('@agent-core/evidence/node')).JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
+  const eventRepository = new (await import('@agent-core/persistence/node')).JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
   const records = await eventsFor(eventRepository, approval.runId);
   assert.equal(records.filter((event) => event.type === 'tool.ended').length, 1);
   assert.equal(records.filter((event) => event.type === 'observation.record.created').length, 1);
@@ -1295,19 +1299,19 @@ test('process death after tool completion projects the durable observation witho
   assert.equal(replay.branch.filter((entry) => entry.type === 'observation' && entry.toolName === 'effect').length, 1);
 });
 
-test('process death after the tool audit event resumes the separate conversation projection', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'agent-projection-crash-'));
+test('process death after the tool audit event resumes separate observation delivery', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-assembly-crash-'));
   const fixture = path.resolve('tests/fixtures/approval-crash.mjs');
   const initial = spawnSync(process.execPath, [fixture, 'suspend', root], { encoding: 'utf8' });
   assert.equal(initial.status, 0, initial.stderr);
   const approval = JSON.parse(initial.stdout);
-  const crash = spawnSync(process.execPath, [fixture, 'crash_before_projection', root, approval.runId, approval.approvalId, approval.fingerprint], { encoding: 'utf8' });
+  const crash = spawnSync(process.execPath, [fixture, 'crash_before_recording', root, approval.runId, approval.approvalId, approval.fingerprint], { encoding: 'utf8' });
   assert.equal(crash.status, 47, crash.stderr);
   const recovered = spawnSync(process.execPath, [fixture, 'recover', root, approval.runId, approval.approvalId, approval.fingerprint], { encoding: 'utf8' });
   assert.equal(recovered.status, 0, recovered.stderr);
   assert.equal(JSON.parse(recovered.stdout).executionStatus, 'completed');
   assert.equal(await readFile(path.join(root, 'effect.txt'), 'utf8'), 'effect\n');
-  const eventRepository = new (await import('@agent-core/evidence/node')).JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
+  const eventRepository = new (await import('@agent-core/persistence/node')).JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
   const records = await eventsFor(eventRepository, approval.runId);
   assert.equal(records.filter((event) => event.type === 'tool.started').length, 1);
   assert.equal(records.filter((event) => event.type === 'tool.ended').length, 1);
@@ -1332,7 +1336,7 @@ test('interrupted preconditioned reads reexecute only while every captured versi
     const result = JSON.parse(recovered.stdout);
     assert.equal(result.state ?? 'ended', sourceChanged ? 'suspended' : 'ended');
     if (sourceChanged) assert.equal(result.reason, 'tool_outcome_unknown');
-    const eventRepository = new (await import('@agent-core/evidence/node')).JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
+    const eventRepository = new (await import('@agent-core/persistence/node')).JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
     const records = await eventsFor(eventRepository, approval.runId);
     assert.deepEqual(records.filter((event) => event.type === 'tool.started').map((event) => event.toolAttempt), sourceChanged ? [1] : [1, 2]);
     assert.deepEqual(records.filter((event) => event.type === 'tool.ended').map((event) => event.toolAttempt), sourceChanged ? [] : [2]);
@@ -1354,7 +1358,7 @@ test('an interrupted buffered mutation settles from its durable receipt without 
   assert.equal(recovered.status, 0, recovered.stderr);
   assert.equal(JSON.parse(recovered.stdout).executionStatus, 'completed');
   assert.equal(await readFile(path.join(root, 'effect.txt'), 'utf8'), 'effect\n');
-  const eventRepository = new (await import('@agent-core/evidence/node')).JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
+  const eventRepository = new (await import('@agent-core/persistence/node')).JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
   const records = await eventsFor(eventRepository, approval.runId);
   assert.deepEqual(records.filter((event) => event.type === 'tool.started').map((event) => event.toolAttempt), [1]);
   assert.deepEqual(records.filter((event) => event.type === 'tool.ended').map((event) => event.toolAttempt), [1]);
@@ -1381,8 +1385,8 @@ test('semantic tool audit events cannot advance authoritative per-call recovery 
   const approval = suspended.pendingApprovals[0];
   const identity = { turnIndex: approval.turnIndex, turnId: approval.turnId, requestAttempt: approval.requestAttempt, toolBatchId: approval.toolBatchId, callIndex: approval.callIndex, callId: approval.callId, toolAttempt: 1 };
   await run.events.append(suspended.runId, { type: 'tool.started', ...identity, toolName: tool.name, input: persistedCall, fingerprint: approval.fingerprint, effects }, { idempotencyKey: toolStageKey(suspended.runId, identity, 'started') });
-  const operationBeforeResolution = await run.agent.inspectOperation(suspended.runId);
-  assert.equal(operationBeforeResolution.state.phase.kind, 'approval');
+  const runBeforeResolution = await run.agent.inspectRun(suspended.runId);
+  assert.equal(runBeforeResolution.state.phase.kind, 'approval');
   const result = ended(await (await run.agent.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result);  assert.equal(result.executionStatus, 'completed');
   assert.equal(invocations, 1);
   let records = await eventsFor(run.events, result.runId);
@@ -1418,7 +1422,7 @@ test('a live stale runtime settles its exact permit while its unknown call conti
   const first = await harness({ provider, tools: [tool], limits: { maxConcurrentToolCalls: 1 }, toolPolicy: { allowedRisks: ['read'] }, toolAuthorizer: () => ({ decision: 'allow' }), withoutSession: true });
   const firstControl = first.agent.run({ task: 'live takeover' });
   await invocationStarted;
-  const pending = await first.agent.inspectOperation(firstControl.runId);
+  const pending = await first.agent.inspectRun(firstControl.runId);
   assert.equal(pending.state.phase.kind, 'tools');
   assert.equal(pending.state.phase.callStates[0].stage, 'effect_pending');
   assert.equal(pending.state.phase.callStates[1].stage, 'effect_ready');
@@ -1434,12 +1438,12 @@ test('a live stale runtime settles its exact permit while its unknown call conti
   assert.equal(waiting.state, 'suspended');
   assert.equal(waiting.reason, 'tool_outcome_unknown');
   assert.deepEqual(invocations, [0]);
-  const unresolved = await replacement.inspectOperation(firstControl.runId);
+  const unresolved = await replacement.inspectRun(firstControl.runId);
   assert.equal(unresolved.state.phase.kind, 'tools');
   assert.deepEqual(unresolved.state.phase.callStates.map((state) => state.stage), ['outcome_unknown', 'effect_ready']);
   releaseInvocation();
   await assert.rejects(firstControl.result, /replacement driver/u);
-  const settled = await replacement.inspectOperation(firstControl.runId);
+  const settled = await replacement.inspectRun(firstControl.runId);
   assert.equal(settled.state.phase.kind, 'tools');
   assert.equal(settled.state.phase.callStates[0].stage, 'settled');
   assert.equal(settled.state.phase.callStates[1].stage, 'effect_ready');
@@ -1484,20 +1488,20 @@ test('elapsed limits abort a live provider request without inventing a known out
 });
 
 test('an immediate abort is durably accepted before local execution is cancelled', async () => {
-  const run = await harness({
+  const fixture = await harness({
     script: [request => new Promise((_resolve, reject) => request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true }))],
     withoutSession: true
   });
-  const control = run.agent.run({ task: 'abort immediately' });
+  const control = fixture.agent.run({ task: 'abort immediately' });
   await control.abort('stop before provider execution');
   const result = ended(await control.result);
   assert.equal(result.executionStatus, 'aborted');
-  const operation = await new AgentOperationCoordinator(run.events).inspect(control.runId);
-  assert.equal(operation.state.phase.kind, 'terminal');
-  assert.equal(operation.state.control.status, 'abort_requested');
+  const inspection = await new AgentRunCoordinator(fixture.events).inspect(control.runId);
+  assert.equal(inspection.state.phase.kind, 'terminal');
+  assert.equal(inspection.state.control.status, 'abort_requested');
 });
 
-test('tool preparation and authorization are abortable and elapsed-deadline bounded', async () => {
+test('tool planning and authorization are abortable and elapsed-deadline bounded', async () => {
   const callResponse = () => response('tool_calls', '', { toolCalls: [{ id: 'stall', type: 'function', name: 'stall', input: { kind: 'json', value: {} } }] });
   const baseTool = {
     name: 'stall', implementationId: 'tests/stalled-boundary@1', description: 'stalled boundary', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope,
@@ -1563,10 +1567,10 @@ test('finalization is idempotent, rejects conflicts, and recovers faults after e
   const first = finalizer.finalize(base);
   assert.equal(first, finalizer.finalize(base));
   const result = ended(await first);  assert.equal(result.executionStatus, 'completed');
-  assert.throws(() => finalizer.finalize({ ...base, candidate: { ...base.candidate, message: 'conflict' } }), /Conflicting terminal decision/);
+  assert.throws(() => finalizer.finalize({ ...base, modelOutput: { ...base.modelOutput, message: 'conflict' } }), /Conflicting terminal decision/);
   assert.equal((await eventsFor(events, base.runId)).filter(event => event.type === 'run.ended').length, 1);
 
-  for (const point of ['prepared', 'session', 'committed']) {
+  for (const point of ['plan', 'session', 'committed']) {
     const durableEvents = new InMemoryEventRepository(agentEventCodec);
     const durableSessions = new InMemorySessionRepository();
     const durableSession = await durableSessions.create({ binding: SESSION_BINDING });
@@ -1576,22 +1580,22 @@ test('finalization is idempotent, rejects conflicts, and recovers faults after e
       ...durableEvents,
       append: async (runId, event, options) => {
         const record = await durableEvents.append(runId, event, options);
-        if (!thrown && ((point === 'prepared' && event.type === 'finalization.prepared') || (point === 'committed' && event.type === 'run.ended'))) { thrown = true; throw new Error(`fault ${point}`); }
+        if (!thrown && ((point === 'plan' && event.type === 'run.finalization.staged') || (point === 'committed' && event.type === 'run.ended'))) { thrown = true; throw new Error(`fault ${point}`); }
         return record;
       },
       read: runId => durableEvents.read(runId), listRunIds: () => durableEvents.listRunIds(), verifyIntegrity: runId => durableEvents.verifyIntegrity(runId)
     };
     const faultSessions = point === 'session' ? {
       ...durableSessions,
-      projectFinal: async (sessionId, value) => { const projection = await durableSessions.projectFinal(sessionId, value); if (!thrown) { thrown = true; throw new Error('fault session'); } return projection; },
+      recordRunFinalization: async (sessionId, value) => { const assembly = await durableSessions.recordRunFinalization(sessionId, value); if (!thrown) { thrown = true; throw new Error('fault session'); } return assembly; },
       loadReplayState: (sessionId, leafId) => durableSessions.loadReplayState(sessionId, leafId)
     } : durableSessions;
     const broken = new AgentRunFinalizer({ runId: base.runId, finalizationId: base.finalizationId, events: faultEvents, append: (event, idempotencyKey) => faultEvents.append(base.runId, event, { idempotencyKey }), session: { repository: faultSessions, descriptor: durableSession } });
     await assert.rejects(broken.finalize(base), error => {
       assert.equal(error instanceof AgentFinalizationError, true);
       assert.equal(error.progress.reconciliation, 'verified');
-      assert.equal(error.progress.prepared, true);
-      assert.equal(error.progress.sessionProjected, point !== 'prepared');
+      assert.equal(error.progress.staged, true);
+      assert.equal(error.progress.sessionRecorded, point !== 'plan');
       assert.equal(error.progress.committed, point === 'committed');
       return true;
     });
@@ -1599,14 +1603,14 @@ test('finalization is idempotent, rejects conflicts, and recovers faults after e
     await recovered.finalize(base);
     assert.deepEqual(await readCommittedTerminal(durableEvents, base.runId), base);
     assert.equal((await eventsFor(durableEvents, base.runId)).filter(event => event.type === 'run.ended').length, 1);
-    assert.equal((await durableSessions.loadReplayState(durableSession)).terminalProjections.length, 1);
+    assert.equal((await durableSessions.loadReplayState(durableSession)).runFinalizations.length, 1);
   }
 });
 
 function terminal() {
   return decodeAgentTerminalSnapshot({
     runId: 'run-final', finalizationId: 'final-1', phase: 'ended', executionStatus: 'completed', verificationStatus: 'not_required', terminationReason: 'model_completed',
-    modelTerminationReason: 'stop', candidate: { status: 'complete', message: 'done', source: 'content', turnIndex: 1 }, turnCount: 1, checkResults: [],
-    budget: { modelTurns: 1, totalToolCalls: 0, repeatedIdenticalToolCalls: 0, candidateRevisions: 0, elapsedMs: 1, promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, knownCosts: {}, pricingStatus: 'unknown', unknownPricedTokens: 0, consecutiveProviderFailures: 0, consecutiveToolFailures: 0 }
+    modelTerminationReason: 'stop', modelOutput: { status: 'complete', message: 'done', source: 'content', turnIndex: 1 }, turnCount: 1, checkResults: [],
+    budget: { modelTurns: 1, totalToolCalls: 0, repeatedIdenticalToolCalls: 0, revisionAttempts: 0, elapsedMs: 1, promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, knownCosts: {}, pricingStatus: 'unknown', unknownPricedTokens: 0, consecutiveProviderFailures: 0, consecutiveToolFailures: 0 }
   });
 }

@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { access, mkdir, mkdtemp, readFile, readdir, rename, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { InMemoryArtifactRepository } from '@agent-core/evidence';
-import { LocalArtifactRepository } from '@agent-core/evidence/node';
+import { InMemoryArtifactRepository } from '@agent-core/persistence';
+import { LocalArtifactRepository } from '@agent-core/persistence/node';
 import { spawnSync } from 'node:child_process';
 import {
   DEFAULT_LOCAL_TOOL_CONFIGURATION,
@@ -24,8 +24,8 @@ const policy = { allowedRisks: ['read', 'execute'] };
 const invocation = { runId: 'process-test-run', turnId: 'turn-1', requestAttempt: 1, toolBatchId: 'batch-1', callIndex: 0, toolAttempt: 1 };
 
 async function startCommand(execution, request, options = {}) {
-  const prepared = await execution.prepare(request);
-  return execution.start(prepared, options);
+  const plan = await execution.plan(request);
+  return execution.start(plan, options);
 }
 
 async function processContext(options = {}, owner = invocation) {

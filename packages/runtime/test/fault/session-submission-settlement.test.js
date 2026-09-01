@@ -4,8 +4,8 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { JsonlEventRepository } from '@agent-core/evidence/node';
-import { AgentOperationCoordinator, AgentSession, agentEventCodec } from '@agent-core/runtime';
+import { JsonlEventRepository } from '@agent-core/persistence/node';
+import { AgentRunCoordinator, AgentSession, agentEventCodec } from '@agent-core/runtime';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 
 const binding = Object.freeze({ schemaId: 'agent-core.tests/session-settlement', schemaVersion: 1, subject: Object.freeze({ fixture: 'fault-session' }) });
@@ -26,7 +26,7 @@ for (const [timing, exitStatus, expectedResumes] of [['before', 64, 1], ['after'
         descriptor,
         expectedBinding: binding,
         repository,
-        operations: new AgentOperationCoordinator(events),
+        runs: new AgentRunCoordinator(events),
         configuration: { provider: 'fixture', model: 'fixture' },
         createRuntime() {
           return {

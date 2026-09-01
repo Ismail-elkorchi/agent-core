@@ -24,7 +24,7 @@ export interface EffectExposureReservation { readonly quantities: readonly Effec
 
 export interface ExternalEffectIntent {
   readonly effectId: string;
-  readonly operationId: string;
+  readonly ownerId: string;
   readonly implementationId: string;
   readonly parametersDigest: string;
   readonly recovery: EffectRecoveryCapability;
@@ -126,7 +126,7 @@ export function decodeEffectExposureReservation(value: unknown): EffectExposureR
 export function decodeExternalEffectIntent(value: unknown): ExternalEffectIntent {
   const record = object(value, 'external effect intent');
   return Object.freeze({
-    effectId: identifier(record.effectId, 'effectId'), operationId: identifier(record.operationId, 'operationId'),
+    effectId: identifier(record.effectId, 'effectId'), ownerId: identifier(record.ownerId, 'ownerId'),
     implementationId: identifier(record.implementationId, 'implementationId'), parametersDigest: digest(record.parametersDigest, 'parametersDigest'),
     recovery: decodeEffectRecoveryCapability(record.recovery), exposure: decodeEffectExposureReservation(record.exposure)
   });
@@ -172,7 +172,7 @@ export function encodeEffectExposureReservation(value: EffectExposureReservation
 
 export function encodeExternalEffectIntent(value: ExternalEffectIntent): JsonObject {
   return Object.freeze({
-    effectId: value.effectId, operationId: value.operationId, implementationId: value.implementationId, parametersDigest: value.parametersDigest,
+    effectId: value.effectId, ownerId: value.ownerId, implementationId: value.implementationId, parametersDigest: value.parametersDigest,
     recovery: encodeEffectRecoveryCapability(value.recovery), exposure: encodeEffectExposureReservation(value.exposure)
   });
 }

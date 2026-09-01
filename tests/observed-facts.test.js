@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  projectToolEvidence,
-  parseToolEvidenceDelta,
-  toEvidenceJsonObject
-} from '@agent-core/evidence';
+  recordObservedFacts,
+  parseToolResultFacts,
+  toObservationJsonObject
+} from '@agent-core/tools';
 import { normalizeJsonSafe, parseJsonObject } from '@agent-core/json';
 
 test('safe JSON parsing rejects accessors, cycles, prototypes, and limits while returning an owned frozen copy', () => {
@@ -64,8 +64,8 @@ test('JSON normalization duplicates shared values without misclassifying them as
   assert.deepEqual(JSON.parse(JSON.stringify(result.value)), { left: { value: 1 }, right: { value: 1 } });
 });
 
-test('decoded evidence deltas project into observation-scoped records', () => {
-  const delta = parseToolEvidenceDelta(parseJsonObject({ items: [
+test('decoded observedFacts deltas become observation-scoped records', () => {
+  const delta = parseToolResultFacts(parseJsonObject({ items: [
     {
       action: 'read',
       resources: [{
@@ -75,24 +75,24 @@ test('decoded evidence deltas project into observation-scoped records', () => {
         mediaType: 'text/plain'
       }],
       scope: {
-        filters: toEvidenceJsonObject({ hidden: 'exclude', ignored: undefined }),
-        limits: toEvidenceJsonObject({ maxBytes: 1200 }),
-        omitted: toEvidenceJsonObject({ bytes: 0 }),
+        filters: toObservationJsonObject({ hidden: 'exclude', ignored: undefined }),
+        limits: toObservationJsonObject({ maxBytes: 1200 }),
+        omitted: toObservationJsonObject({ bytes: 0 }),
         truncated: false,
-        confidence: 'verified'
+        actuality: 'observed'
       },
       summary: 'Read a window.',
       outcome: 'success'
     }
   ] }));
-  const records = projectToolEvidence(delta, {
+  const records = recordObservedFacts(delta, {
     observationId: 'obs-1',
     toolName: 'read_files',
     createdAt: '2026-06-23T00:00:00.000Z'
   });
 
   assert.equal(records.length, 1);
-  assert.equal(records[0].id, 'obs-1:evidence:1');
+  assert.equal(records[0].id, 'obs-1:fact:1');
   assert.equal(records[0].observationId, 'obs-1');
   assert.equal(records[0].toolName, 'read_files');
   assert.equal(records[0].action, 'read');
@@ -103,9 +103,9 @@ test('decoded evidence deltas project into observation-scoped records', () => {
     mediaType: 'text/plain'
   });
   assert.deepEqual(records[0].scope.filters, { hidden: 'exclude' });
-  assert.equal(records[0].scope.confidence, 'verified');
-  assert.throws(() => parseToolEvidenceDelta(parseJsonObject({ items: [{ action: 'not-real', outcome: 'success', resources: [] }] })), /action/u);
-  assert.throws(() => parseToolEvidenceDelta(parseJsonObject({ items: [{ action: 'read', outcome: 'success', resources: [{ uri: '' }] }] })), /URI/u);
-  assert.throws(() => parseToolEvidenceDelta(parseJsonObject({ items: [{ action: 'read', outcome: 'success', resources: [], scope: { coverage: 'complete', truncated: true } }] })), /complete and truncated/u);
-  assert.throws(() => parseToolEvidenceDelta(parseJsonObject({ items: [{ action: 'read', outcome: 'failure', resources: [], unexpected: true }] })), /unsupported fields/u);
+  assert.equal(records[0].scope.actuality, 'observed');
+  assert.throws(() => parseToolResultFacts(parseJsonObject({ items: [{ action: 'not-real', outcome: 'success', resources: [] }] })), /action/u);
+  assert.throws(() => parseToolResultFacts(parseJsonObject({ items: [{ action: 'read', outcome: 'success', resources: [{ uri: '' }] }] })), /URI/u);
+  assert.throws(() => parseToolResultFacts(parseJsonObject({ items: [{ action: 'read', outcome: 'success', resources: [], scope: { coverage: 'complete', truncated: true } }] })), /complete and truncated/u);
+  assert.throws(() => parseToolResultFacts(parseJsonObject({ items: [{ action: 'read', outcome: 'failure', resources: [], unexpected: true }] })), /unsupported fields/u);
 });

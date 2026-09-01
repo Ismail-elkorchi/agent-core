@@ -63,12 +63,12 @@ async function respond(socket: Socket, text: string): Promise<void> {
   try {
     const request: unknown = JSON.parse(text);
     if (!isRecord(request) || request.identity !== identity || typeof request.nonce !== 'string'
-      || (request.operation !== 'challenge' && request.operation !== 'release' && request.operation !== 'stop')
+      || (request.action !== 'challenge' && request.action !== 'release' && request.action !== 'stop')
       || typeof request.clientProof !== 'string') throw new Error('Invalid supervisor request.');
-    const expected = hmac(`client\n${identity}\n${request.nonce}\n${request.operation}`);
+    const expected = hmac(`client\n${identity}\n${request.nonce}\n${request.action}`);
     if (!safeEqual(request.clientProof, expected)) throw new Error('Supervisor authentication failed.');
-    if (request.operation === 'release') await release();
-    if (request.operation === 'stop') stop();
+    if (request.action === 'release') await release();
+    if (request.action === 'stop') stop();
     const processPid = userProcess?.pid;
     const processProof = processPid === undefined ? undefined : hmac(`process\n${identity}\n${processId}\n${ownerText(owner)}\n${String(processPid)}`);
     socket.end(JSON.stringify({
@@ -76,7 +76,7 @@ async function respond(socket: Socket, text: string): Promise<void> {
       identity,
       nonce: request.nonce,
       ...(processPid === undefined ? {} : { processPid, processProof }),
-      serverProof: hmac(`server\n${identity}\n${request.nonce}\n${request.operation}\n${String(processPid ?? '')}\n${processProof ?? ''}`)
+      serverProof: hmac(`server\n${identity}\n${request.nonce}\n${request.action}\n${String(processPid ?? '')}\n${processProof ?? ''}`)
     }) + '\n');
   } catch (error) {
     socket.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }) + '\n');

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { ToolEvidenceItem } from '@agent-core/evidence';
+import type { ToolResultFact } from '@agent-core/tools';
 import { parseJsonObject } from '@agent-core/json';
 import {
   invalidToolInputObservation,
@@ -14,7 +14,7 @@ import { requireRootedFileAuthority } from '../../core/rooted-files.js';
 import {
   isTextPatchJournal,
   withTextFilePatchJournal,
-  type PreparedTextPatchWrite,
+  type TextPatchWritePlan,
   type TextPatchJournal,
   type TextTransactionResult
 } from '../../core/text-write.js';
@@ -48,42 +48,42 @@ export interface CanonicalEditTextInput {
   };
 }
 
-interface PreparedFileEdit {
+interface PlannedFileEdit {
   readonly output: EditTextFileOutput;
-  readonly write?: PreparedTextPatchWrite;
+  readonly write?: TextPatchWritePlan;
   readonly diffLines: readonly string[];
 }
 
 export async function editText(input: CanonicalEditTextInput, context: ToolExecutionContext): Promise<ToolObservationInput<EditTextOutput>> {
   throwIfAborted(context.signal);
   const root = requireRootedFileAuthority(context);
-  const prepared: PreparedFileEdit[] = [];
+  const planned: PlannedFileEdit[] = [];
   const failures: { path: string; reason: string; message: string; editIndex?: number }[] = [];
   for (const file of input.files) {
-    const result = await prepareFile(root, file, input.limits);
-    if (result.ok) prepared.push(result.prepared);
+    const result = await planFile(root, file, input.limits);
+    if (result.ok) planned.push(result.planned);
     else failures.push(...result.failures);
   }
   if (failures.length > 0) {
     return invalidToolInputObservation('edit_text', `Text edit validation failed for ${String(failures.length)} item${failures.length === 1 ? '' : 's'}; no files were written.`, { failures });
   }
 
-  const summary = boundedDiffSummary(prepared.flatMap((file) => file.diffLines), input.limits.maxDiffSummaryBytes);
+  const summary = boundedDiffSummary(planned.flatMap((file) => file.diffLines), input.limits.maxDiffSummaryBytes);
   const recoveryPayload: EditTextRecoveryPayload = {
     kind: 'agent-core.edit-text-recovery',
     version: 1,
     transactionId: input.transactionId,
-    files: prepared.map((file) => file.output),
-    wouldChangePaths: prepared.filter((file) => file.output.changed).map((file) => file.output.path),
+    files: planned.map((file) => file.output),
+    wouldChangePaths: planned.filter((file) => file.output.changed).map((file) => file.output.path),
     diffSummary: summary
   };
   if (input.dryRun) return observationFromPlan(recoveryPayload, true);
 
   const journal = requireToolService<TextPatchJournal>(context, 'patchJournal', isTextPatchJournal, 'adopted TextPatchJournal');
-  await checkpoint(context, { type: 'status', stage: 'text_edit_prepared', message: 'Text edit transaction prepared.', completed: prepared.length, total: prepared.length });
+  await checkpoint(context, { type: 'status', stage: 'text_edit_planned', message: 'Text edit transaction planned.', completed: planned.length, total: planned.length });
   throwIfAborted(context.signal);
   const transaction = await withTextFilePatchJournal(root, journal, (authority) => authority.commit({
-    writes: prepared.flatMap((file) => file.write ? [file.write] : []),
+    writes: planned.flatMap((file) => file.write ? [file.write] : []),
     removes: []
   }, {
     transactionId: input.transactionId,
@@ -121,11 +121,11 @@ export async function recoverEditText(
   }, context.signal);
 }
 
-async function prepareFile(
+async function planFile(
   root: import('../../core/rooted-file-authority.js').RootedFileAuthority,
   request: CanonicalEditTextInput['files'][number],
   limits: CanonicalEditTextInput['limits']
-): Promise<{ ok: true; prepared: PreparedFileEdit } | { ok: false; failures: { path: string; reason: string; message: string; editIndex?: number }[] }> {
+): Promise<{ ok: true; planned: PlannedFileEdit } | { ok: false; failures: { path: string; reason: string; message: string; editIndex?: number }[] }> {
   const inspected = await inspectTextFile(root, request.path, limits.maxFileBytes);
   if (!inspected.ok) return { ok: false, failures: [{ path: inspected.failure.path, reason: inspected.failure.reason, message: inspected.failure.message }] };
   const file = inspected.file;
@@ -206,15 +206,15 @@ async function prepareFile(
   };
   return {
     ok: true,
-    prepared: {
+    planned: {
       output,
-      ...(changed ? { write: preparedWrite(file, content) } : {}),
+      ...(changed ? { write: plannedWrite(file, content) } : {}),
       diffLines
     }
   };
 }
 
-function preparedWrite(file: TextFileData, content: string): PreparedTextPatchWrite {
+function plannedWrite(file: TextFileData, content: string): TextPatchWritePlan {
   return {
     path: file.path,
     content,
@@ -228,7 +228,7 @@ function preparedWrite(file: TextFileData, content: string): PreparedTextPatchWr
 function observationFromPlan(payload: EditTextRecoveryPayload, dryRun: boolean, transaction?: TextTransactionResult): ToolObservationInput<EditTextOutput> {
   const wouldChangePaths = [...payload.wouldChangePaths];
   const transactionOutcome = transaction?.outcome;
-  const operationStatus: EditTextOutput['operationStatus'] = dryRun
+  const applicationStatus: EditTextOutput['applicationStatus'] = dryRun
     ? 'dry_run'
     : !transaction
       ? 'no_change'
@@ -237,18 +237,18 @@ function observationFromPlan(payload: EditTextRecoveryPayload, dryRun: boolean, 
         : transaction.outcome === 'rolled_back'
           ? 'not_applied'
           : 'uncertain';
-  const changedPaths = operationStatus === 'applied' ? wouldChangePaths : [];
-  const potentiallyAffectedPaths = operationStatus === 'uncertain' ? wouldChangePaths : [];
+  const changedPaths = applicationStatus === 'applied' ? wouldChangePaths : [];
+  const potentiallyAffectedPaths = applicationStatus === 'uncertain' ? wouldChangePaths : [];
   const output: EditTextOutput = {
-    operationStatus,
+    applicationStatus,
     ...(transactionOutcome ? { transactionOutcome } : {}),
-    rootState: operationStatus === 'uncertain' ? 'uncertain' : 'known',
+    rootState: applicationStatus === 'uncertain' ? 'uncertain' : 'known',
     dryRun,
     files: payload.files.map((file) => ({
       ...file,
-      finalState: !file.changed || dryRun || operationStatus === 'no_change' || operationStatus === 'not_applied'
+      finalState: !file.changed || dryRun || applicationStatus === 'no_change' || applicationStatus === 'not_applied'
         ? 'unchanged' as const
-        : operationStatus === 'uncertain' ? 'uncertain' as const : 'changed' as const
+        : applicationStatus === 'uncertain' ? 'uncertain' as const : 'changed' as const
     })),
     changedPaths,
     wouldChangePaths,
@@ -257,20 +257,20 @@ function observationFromPlan(payload: EditTextRecoveryPayload, dryRun: boolean, 
     ...(transaction ? { transaction: mutableTransaction(transaction) } : {})
   };
   const residue = transaction?.outcome === 'committed_with_residue';
-  const ok = operationStatus === 'dry_run' || operationStatus === 'no_change' || operationStatus === 'applied';
+  const ok = applicationStatus === 'dry_run' || applicationStatus === 'no_change' || applicationStatus === 'applied';
   return {
     kind: 'result',
     ok,
     summary: summarize(output),
     scope: {
       resources: [...wouldChangePaths.map(fileScope), ...(residue ? [PATCH_JOURNAL_SCOPE] : [])],
-      coverage: residue || operationStatus === 'uncertain' ? 'partial' : 'complete',
+      coverage: residue || applicationStatus === 'uncertain' ? 'partial' : 'complete',
       ...(residue ? { causes: ['journal_residue'], omitted: { cleanup: transaction.cleanup.strandedPaths.length } } : {}),
-      ...(operationStatus === 'uncertain' ? { causes: ['rooted_file_state_uncertain'], omitted: { potentiallyAffectedPaths: potentiallyAffectedPaths.length } } : {}),
+      ...(applicationStatus === 'uncertain' ? { causes: ['rooted_file_state_uncertain'], omitted: { potentiallyAffectedPaths: potentiallyAffectedPaths.length } } : {}),
       truncated: payload.diffSummary.truncated
     },
     output,
-    evidence: { items: editEvidence(output) },
+    observedFacts: { items: editObservedFacts(output) },
     ...(!dryRun ? { metadata: { changedPaths } } : {})
   };
 }
@@ -297,16 +297,16 @@ function mutableTransaction(transaction: TextTransactionResult): NonNullable<Edi
   };
 }
 
-function editEvidence(output: EditTextOutput): ToolEvidenceItem[] {
-  if (output.operationStatus === 'not_applied' || output.operationStatus === 'no_change') return [];
+function editObservedFacts(output: EditTextOutput): ToolResultFact[] {
+  if (output.applicationStatus === 'not_applied' || output.applicationStatus === 'no_change') return [];
   return output.files.filter((file) => file.changed).map((file) => ({
     action: 'update',
-    outcome: output.operationStatus === 'uncertain' ? 'failure' : 'success',
+    outcome: output.applicationStatus === 'uncertain' ? 'failure' : 'success',
     resources: [rootedFileResource(file.path, { sha256: file.newSha256, fullSha256: file.newSha256, mediaType: 'text/plain' })],
     scope: {
       limits: { dryRun: output.dryRun, changedRanges: file.changedRanges.length, oldSha256: file.oldSha256 },
       truncated: output.diffSummary.truncated,
-      confidence: output.dryRun || output.operationStatus === 'uncertain' ? 'unverified' : 'verified'
+      actuality: output.dryRun || output.applicationStatus === 'uncertain' ? 'predicted' : 'observed'
     },
     summary: `${output.dryRun ? 'Would update' : 'Updated'} ${file.path} with ${String(file.changedRanges.length)} localized replacement${file.changedRanges.length === 1 ? '' : 's'}.`
   }));
@@ -411,10 +411,10 @@ function formatRange(range: EditTextRange): string {
   return `L${String(range.start.line)}:C${String(range.start.column)}-L${String(range.end.line)}:C${String(range.end.column)}`;
 }
 function summarize(output: EditTextOutput): string {
-  if (output.operationStatus === 'dry_run') return `Validated ${String(output.diffSummary.totalChangedRanges)} localized text replacement${output.diffSummary.totalChangedRanges === 1 ? '' : 's'}; ${String(output.wouldChangePaths.length)} file${output.wouldChangePaths.length === 1 ? '' : 's'} would change.`;
-  if (output.operationStatus === 'no_change') return 'Text edit transaction completed with no content changes.';
-  if (output.operationStatus === 'applied') return `Applied ${String(output.diffSummary.totalChangedRanges)} localized text replacement${output.diffSummary.totalChangedRanges === 1 ? '' : 's'} across ${String(output.changedPaths.length)} file${output.changedPaths.length === 1 ? '' : 's'}.`;
-  if (output.operationStatus === 'not_applied') return 'Text edit transaction was rolled back; no requested content changes remain.';
+  if (output.applicationStatus === 'dry_run') return `Validated ${String(output.diffSummary.totalChangedRanges)} localized text replacement${output.diffSummary.totalChangedRanges === 1 ? '' : 's'}; ${String(output.wouldChangePaths.length)} file${output.wouldChangePaths.length === 1 ? '' : 's'} would change.`;
+  if (output.applicationStatus === 'no_change') return 'Text edit transaction completed with no content changes.';
+  if (output.applicationStatus === 'applied') return `Applied ${String(output.diffSummary.totalChangedRanges)} localized text replacement${output.diffSummary.totalChangedRanges === 1 ? '' : 's'} across ${String(output.changedPaths.length)} file${output.changedPaths.length === 1 ? '' : 's'}.`;
+  if (output.applicationStatus === 'not_applied') return 'Text edit transaction was rolled back; no requested content changes remain.';
   return `Text edit rollback is uncertain for: ${output.potentiallyAffectedPaths.join(', ') || 'unknown paths'}.`;
 }
 function checkpoint(context: ToolExecutionContext, progress: import('@agent-core/tools').ToolProgress): Promise<void> {

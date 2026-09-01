@@ -20,7 +20,7 @@ const manifest = {
   version: 1,
   transactionId,
   transactionDigest: '1'.repeat(64),
-  phase: 'prepared',
+  phase: 'planned',
   createdDirectories: [],
   writes: [{
     path: 'note.txt', stageName, backupName,

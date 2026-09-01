@@ -2,7 +2,7 @@ import { defineTool } from '@agent-core/tools';
 import { fileScope } from '../../core/resources.js';
 import { rootedFileSelector } from '../../core/rooted-file-selection.js';
 import { presentFindFilesObservation } from '../../core/presenters.js';
-import { builtInReadEvidence } from '../../core/read-evidence.js';
+import { builtInObservedFacts } from '../../core/read-observed-facts.js';
 import { requireRootedFileAuthority } from '../../core/rooted-files.js';
 import { findFilesInputSchema, findFilesOutputSchema, type FindFilesInput } from './schema.js';
 
@@ -59,7 +59,7 @@ export const findFilesTool = defineTool({
       ok: true,
       summary: `Found ${String(output.counts.returned)} paths under ${output.path}${output.coverage === 'partial' ? ' with partial coverage' : ''}.`,
       scope,
-      evidence: builtInReadEvidence('search', scope, `Found ${String(output.counts.returned)} matching paths.`),
+      observedFacts: builtInObservedFacts('search', scope, `Found ${String(output.counts.returned)} matching paths.`),
       output
     };
   }

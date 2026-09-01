@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
-import { InMemoryArtifactRepository } from '@agent-core/evidence';
+import { InMemoryArtifactRepository } from '@agent-core/persistence';
 import { filterToolResultContentForModel } from '@agent-core/runtime';
 import { defineTool, parseToolObservation } from '@agent-core/tools';
 import { DEFAULT_LOCAL_TOOL_CONFIGURATION, readArtifactTool } from '@agent-core/tools-local';
@@ -15,7 +15,7 @@ const mixedContentTool = defineTool({
   invoke: async () => ({ kind: 'result', ok: true, summary: 'unused', scope: { resources: [], coverage: 'complete' }, output: { status: 'complete' } })
 });
 
-test('read_artifact image content is retained for multimodal models and projected as metadata for text-only models', async () => {
+test('read_artifact image content is retained for multimodal models and represented as metadata for text-only models', async () => {
   const artifacts = new InMemoryArtifactRepository();
   const artifact = await artifacts.store({ label: 'pixel', mediaType: 'image/png', content: new Uint8Array([137, 80, 78, 71]) });
   const observation = await invokeToolCall(jsonToolCall('read_artifact', { artifactId: artifact.artifactId, byteCount: artifact.size }), [readArtifactTool], {

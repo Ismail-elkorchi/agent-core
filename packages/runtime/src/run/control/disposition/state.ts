@@ -1,10 +1,10 @@
 import { normalizeJsonSafe, parseJsonObject, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import { decodeEffectExecutionState, decodeEffectRecoveryCapability, type EffectExecutionState } from '@agent-core/effects';
-import { hashJson } from '@agent-core/evidence';
-import { decodeAgentRunBudgetState, type AgentRunBudgetState, type AgentTurnIdentity } from '../../run/contracts.js';
+import { hashJson } from '@agent-core/persistence';
+import { decodeAgentRunBudgetState, type AgentRunBudgetState, type AgentTurnIdentity } from '../../contracts.js';
 import { parseAgentDispositionDecision, type AgentDispositionDecision } from './contracts.js';
 
-export interface AgentDispositionPreparationRecord {
+export interface AgentDispositionEffectPlanRecord {
   readonly implementationId: string;
   readonly fingerprint: string;
   readonly authorization: JsonValue;
@@ -15,7 +15,7 @@ interface AgentDispositionPhaseBase {
   readonly kind: 'disposition';
   readonly identity: AgentTurnIdentity;
   readonly providerSettlementEventId: string;
-  readonly candidateEventId: string;
+  readonly modelOutputEventId: string;
   readonly verificationEventIds: readonly string[];
   readonly inputDigest: string;
   readonly revisionCount: number;
@@ -23,30 +23,30 @@ interface AgentDispositionPhaseBase {
   readonly budgetSnapshot: AgentRunBudgetState;
 }
 
-export type AgentDispositionOperationPhase =
+export type AgentDispositionPhase =
   | Readonly<AgentDispositionPhaseBase & { readonly stage: 'ready' }>
-  | Readonly<AgentDispositionPhaseBase & { readonly stage: 'effect_ready'; readonly preparation: AgentDispositionPreparationRecord; readonly effect: Extract<EffectExecutionState, { readonly phase: 'ticket_issued' }> }>
-  | Readonly<AgentDispositionPhaseBase & { readonly stage: 'effect_pending'; readonly preparation: AgentDispositionPreparationRecord; readonly effect: Extract<EffectExecutionState, { readonly phase: 'started' }> }>
-  | Readonly<AgentDispositionPhaseBase & { readonly stage: 'outcome_unknown'; readonly preparation: AgentDispositionPreparationRecord; readonly effect: Extract<EffectExecutionState, { readonly phase: 'started' | 'closed' }> }>
+  | Readonly<AgentDispositionPhaseBase & { readonly stage: 'effect_ready'; readonly plan: AgentDispositionEffectPlanRecord; readonly effect: Extract<EffectExecutionState, { readonly phase: 'ticket_issued' }> }>
+  | Readonly<AgentDispositionPhaseBase & { readonly stage: 'effect_pending'; readonly plan: AgentDispositionEffectPlanRecord; readonly effect: Extract<EffectExecutionState, { readonly phase: 'started' }> }>
+  | Readonly<AgentDispositionPhaseBase & { readonly stage: 'outcome_unknown'; readonly plan: AgentDispositionEffectPlanRecord; readonly effect: Extract<EffectExecutionState, { readonly phase: 'started' | 'closed' }> }>
   | Readonly<AgentDispositionPhaseBase & { readonly stage: 'decided'; readonly decision: AgentDispositionDecision; readonly decisionEventId: string; readonly outputDigest: string; readonly effect?: Extract<EffectExecutionState, { readonly phase: 'settled' }> }>;
 
-const BASE_FIELDS = ['kind', 'stage', 'identity', 'providerSettlementEventId', 'candidateEventId', 'verificationEventIds', 'inputDigest', 'revisionCount', 'controlSnapshot', 'budgetSnapshot'] as const;
+const BASE_FIELDS = ['kind', 'stage', 'identity', 'providerSettlementEventId', 'modelOutputEventId', 'verificationEventIds', 'inputDigest', 'revisionCount', 'controlSnapshot', 'budgetSnapshot'] as const;
 
-export function decodeDispositionOperationPhase(value: unknown): AgentDispositionOperationPhase {
+export function decodeDispositionPhase(value: unknown): AgentDispositionPhase {
   const phase = object(value, 'disposition phase');
   const stage = enumeration(phase.stage, ['ready', 'effect_ready', 'effect_pending', 'outcome_unknown', 'decided'] as const, 'disposition.stage');
   const base = {
     kind: 'disposition' as const,
     identity: decodeTurnIdentity(phase.identity),
     providerSettlementEventId: identifier(phase.providerSettlementEventId, 'disposition.providerSettlementEventId'),
-    candidateEventId: identifier(phase.candidateEventId, 'disposition.candidateEventId'),
+    modelOutputEventId: identifier(phase.modelOutputEventId, 'disposition.modelOutputEventId'),
     verificationEventIds: uniqueIdentifiers(phase.verificationEventIds, 'disposition.verificationEventIds'),
     inputDigest: digest(phase.inputDigest, 'disposition.inputDigest'),
     revisionCount: nonnegativeInteger(phase.revisionCount, 'disposition.revisionCount'),
     controlSnapshot: decodeControlSnapshot(phase.controlSnapshot),
     budgetSnapshot: decodeAgentRunBudgetState(phase.budgetSnapshot)
   };
-  if (base.budgetSnapshot.candidateRevisions !== base.revisionCount) throw new TypeError('Disposition budget snapshot contradicts its revision count.');
+  if (base.budgetSnapshot.revisionAttempts !== base.revisionCount) throw new TypeError('Disposition budget snapshot contradicts its revision count.');
   if (stage === 'ready') {
     exact(phase, BASE_FIELDS);
     return Object.freeze({ ...base, stage });
@@ -73,36 +73,36 @@ export function decodeDispositionOperationPhase(value: unknown): AgentDispositio
       ...(effect ? { effect } : {})
     });
   }
-  exact(phase, [...BASE_FIELDS, 'preparation', 'effect']);
-  const preparation = decodePreparation(phase.preparation, base.inputDigest);
+  exact(phase, [...BASE_FIELDS, 'plan', 'effect']);
+  const plan = decodeEffectPlan(phase.plan, base.inputDigest);
   const effect = decodeEffectExecutionState(phase.effect);
-  if (effect.intent.implementationId !== preparation.implementationId || effect.intent.parametersDigest !== preparation.fingerprint) {
-    throw new TypeError('Disposition effect does not match its preparation.');
+  if (effect.intent.implementationId !== plan.implementationId || effect.intent.parametersDigest !== plan.fingerprint) {
+    throw new TypeError('Disposition effect does not match its plan.');
   }
   if (stage === 'effect_ready') {
     if (effect.phase !== 'ticket_issued') throw new TypeError('An effect-ready disposition requires an issued ticket.');
-    return Object.freeze({ ...base, stage, preparation, effect });
+    return Object.freeze({ ...base, stage, plan, effect });
   }
   if (stage === 'effect_pending') {
     if (effect.phase !== 'started') throw new TypeError('An effect-pending disposition requires a started effect.');
-    return Object.freeze({ ...base, stage, preparation, effect });
+    return Object.freeze({ ...base, stage, plan, effect });
   }
   if (effect.phase !== 'started' && effect.phase !== 'closed') throw new TypeError('An unknown disposition outcome requires a started or closed effect.');
   if (effect.phase === 'closed' && effect.closure.reason === 'cancelled_before_start') throw new TypeError('An unknown disposition effect must have been started.');
-  return Object.freeze({ ...base, stage, preparation, effect });
+  return Object.freeze({ ...base, stage, plan, effect });
 }
 
-function decodePreparation(value: unknown, inputDigest: string): AgentDispositionPreparationRecord {
-  const preparation = object(value, 'disposition preparation');
-  exact(preparation, ['implementationId', 'fingerprint', 'authorization', 'recovery']);
+function decodeEffectPlan(value: unknown, inputDigest: string): AgentDispositionEffectPlanRecord {
+  const plan = object(value, 'disposition plan');
+  exact(plan, ['implementationId', 'fingerprint', 'authorization', 'recovery']);
   const decoded = Object.freeze({
-    implementationId: identifier(preparation.implementationId, 'disposition preparation implementationId'),
-    fingerprint: digest(preparation.fingerprint, 'disposition preparation fingerprint'),
-    authorization: parseJsonValue(preparation.authorization),
-    recovery: decodeEffectRecoveryCapability(preparation.recovery)
+    implementationId: identifier(plan.implementationId, 'disposition plan implementationId'),
+    fingerprint: digest(plan.fingerprint, 'disposition plan fingerprint'),
+    authorization: parseJsonValue(plan.authorization),
+    recovery: decodeEffectRecoveryCapability(plan.recovery)
   });
   const fingerprint = hashJson(normalizeJsonSafe(Object.freeze({ implementationId: decoded.implementationId, inputDigest, authorization: decoded.authorization, recovery: decoded.recovery })).value);
-  if (fingerprint !== decoded.fingerprint) throw new TypeError('Disposition preparation fingerprint does not match its captured intent.');
+  if (fingerprint !== decoded.fingerprint) throw new TypeError('Disposition plan fingerprint does not match its captured intent.');
   return decoded;
 }
 
@@ -163,6 +163,6 @@ function uniqueIdentifiers(value: JsonValue | undefined, label: string): readonl
 }
 
 function enumeration<const T extends readonly string[]>(value: JsonValue | undefined, values: T, label: string): T[number] {
-  if (typeof value !== 'string' || !values.some((candidate) => candidate === value)) throw new TypeError(`${label} is invalid.`);
+  if (typeof value !== 'string' || !values.some((modelOutput) => modelOutput === value)) throw new TypeError(`${label} is invalid.`);
   return value;
 }

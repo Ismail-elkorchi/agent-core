@@ -9,7 +9,7 @@ test('package engines and release CI enforce the stable path.matchesGlob Node fl
   const manifests = [
     'package.json',
     'packages/auth/package.json',
-    'packages/evidence/package.json',
+    'packages/persistence/package.json',
     'packages/json/package.json',
     'packages/model/package.json',
     'packages/runtime/package.json',
@@ -38,9 +38,9 @@ test('package engines and release CI enforce the stable path.matchesGlob Node fl
 test('the JSON foundation restores model dependency direction without domain behavior', async () => {
   const model = JSON.parse(await readFile(path.resolve('packages/model/package.json'), 'utf8'));
   assert.equal(model.dependencies['@agent-core/json'], '0.2.0');
-  assert.equal(model.dependencies['@agent-core/evidence'], undefined);
+  assert.equal(model.dependencies['@agent-core/persistence'], undefined);
   const foundation = JSON.parse(await readFile(path.resolve('packages/json/package.json'), 'utf8'));
   assert.deepEqual(foundation.dependencies ?? {}, {});
   const source = await readFile(path.resolve('packages/json/src/index.ts'), 'utf8');
-  assert.doesNotMatch(source, /evidence|artifact|provider|runtime|tool/iu);
+  assert.doesNotMatch(source, /observedFacts|artifact|provider|runtime|tool/iu);
 });

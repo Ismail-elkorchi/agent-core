@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as z from 'zod';
-import { canonicalJsonString, hashJson, InMemoryEventRepository, typedEventCodec } from '@agent-core/evidence';
+import { canonicalJsonString, hashJson, InMemoryEventRepository, typedEventCodec } from '@agent-core/persistence';
 import { normalizeJsonSafe } from '@agent-core/json';
 import { createModelRequest, parseModelRequest, parseModelResponse } from '@agent-core/model';
 import { agentEventCodec, decodeAgentEvent, encodeAgentEvent } from '@agent-core/runtime';
-import { adoptToolDefinition, createToolCall, defineTool, invalidOutputObservation, invalidToolInputObservation, parseToolObservation, prepareToolCall, ToolRegistry } from '@agent-core/tools';
+import { adoptToolDefinition, createToolCall, defineTool, invalidOutputObservation, invalidToolInputObservation, parseToolObservation, planToolCall, ToolRegistry } from '@agent-core/tools';
 
 test('normalized JSON is already recursively owned', () => {
   const nested = { values: [{ count: 1 }] };
@@ -96,19 +96,19 @@ test('authored tools retain identity and dynamic tools cross an explicit adopter
   assert.throws(() => adoptToolDefinition({ ...tool, unsupported: true }), /unsupported fields/u);
 });
 
-test('tool preparation accepts owned calls without decoding structural lookalikes', async () => {
+test('tool planning accepts owned calls without decoding structural lookalikes', async () => {
   const tool = defineTool({
-    name: 'prepared_tool', implementationId: 'tests/prepared-tool@1', description: 'Checks call ownership.', schema: z.strictObject({ value: z.string() }), outputSchema: z.strictObject({}),
+    name: 'planned_tool', implementationId: 'tests/plan-tool@1', description: 'Checks call ownership.', schema: z.strictObject({ value: z.string() }), outputSchema: z.strictObject({}),
     effectEnvelope: { accesses: [], lockScopes: [] }, canonicalizeInput: (input) => input, deriveEffects: () => ({ accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }),
     invoke: async () => ({ kind: 'result', ok: true, summary: 'ok', scope: { resources: [], coverage: 'complete' }, output: {} })
   });
   const input = { name: tool.name, input: { kind: 'json', value: { value: 'owned' } } };
   const context = { policy: { allowedRisks: [] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'tests', executionTargetId: 'tests' } };
-  await assert.rejects(prepareToolCall(input, [tool], context), /created or decoded/u);
+  await assert.rejects(planToolCall(input, [tool], context), /created or decoded/u);
   const call = createToolCall(input);
-  const prepared = await prepareToolCall(call, [tool], context);
-  assert.equal(prepared.ok, true);
-  assert.equal(prepared.prepared.call, call);
+  const plan = await planToolCall(call, [tool], context);
+  assert.equal(plan.ok, true);
+  assert.equal(plan.plan.call, call);
 });
 
 test('owned provider values are not decoded again', () => {
@@ -136,12 +136,12 @@ test('owned extension observations are not decoded again', () => {
   assert.equal(outputChecks, 1);
 });
 
-test('event decoding validates nested persisted evidence', () => {
+test('event decoding validates nested persisted observedFacts', () => {
   assert.throws(() => agentEventCodec.decode({
     type: 'observation.record.created', turnIndex: 1, turnId: 'turn-1', requestAttempt: 1,
     toolBatchId: 'batch-1', callIndex: 0, toolAttempt: 1, id: 'observation-1', toolName: 'read',
     call: { name: 'read', input: { kind: 'json', value: {} } }, toolCallType: 'function',
-    evidence: [{ id: 'evidence-1', observationId: 'observation-1', toolName: 'read', createdAt: '2026-01-01T00:00:00.000Z', action: 'read', resources: [{ uri: 42 }], outcome: 'success' }],
+    observedFacts: [{ id: 'observedFacts-1', observationId: 'observation-1', toolName: 'read', createdAt: '2026-01-01T00:00:00.000Z', action: 'read', resources: [{ uri: 42 }], outcome: 'success' }],
     immediatePresentation: { ok: true, title: 'Read', summary: 'Read a resource.' },
     retainedPresentation: { ok: true, title: 'Read', summary: 'Read a resource.' }
   }), /uri/iu);
