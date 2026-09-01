@@ -6,9 +6,12 @@ import {
   type ModelProviderSession,
   type ModelRequest,
   type ModelResponse,
-  type ModelStreamEvent
+  type ModelStreamEvent,
+  SimpleTokenEstimator,
+  type TokenEstimator
 } from '@agent-core/model';
 import { ModelStreamInterruptedError } from '../orchestration/model-stream.js';
+import { assertModelRequestFitsProfile } from './request-fit.js';
 
 export interface InferenceInvocation {
   readonly request: ModelRequest;
@@ -20,13 +23,14 @@ export interface InferenceInvocation {
 
 /** The only runtime path that invokes a provider session. */
 export class InferenceGateway {
-  constructor(readonly provider: ModelProvider) {}
+  constructor(readonly provider: ModelProvider, private readonly estimator: TokenEstimator = new SimpleTokenEstimator()) {}
 
   createSession(): ModelProviderSession {
     return this.provider.createSession?.() ?? directProviderSession(this.provider);
   }
 
   async invoke(input: InferenceInvocation): Promise<ModelResponse> {
+    assertModelRequestFitsProfile(input.request, input.profile, this.estimator);
     if (!input.profile.capabilities.streaming || !input.session.stream) {
       return parseModelResponse(await input.session.complete(input.request));
     }

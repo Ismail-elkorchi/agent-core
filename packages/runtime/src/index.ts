@@ -9,6 +9,7 @@ export * from './inference/model-window.js';
 export * from './inference/prompt-material.js';
 export * from './inference/model-request-assembler.js';
 export * from './inference/gateway.js';
+export * from './inference/request-fit.js';
 export * from './session/repository.js';
 export * from './session/contracts.js';
 export * from './session/agent-session.js';

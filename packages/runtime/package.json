@@ -1,7 +1,7 @@
 {
   "name": "@agent-core/runtime",
   "version": "0.2.0",
-  "description": "Provider-neutral Agent Core orchestration, contracts, context, session projections, verification, and recovery.",
+  "description": "Provider-neutral Agent Core orchestration, contracts, model windows, session persistence, verification, and recovery.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
