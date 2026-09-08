@@ -1529,10 +1529,16 @@ test('consumed provider usage remains in the terminal snapshot when it crosses a
   assert.equal(usage.snapshot.completionTokens, 11);
 });
 
-test('elapsed limits use the injected monotonic clock', async () => {
+test('elapsed limits use the injected monotonic clock even when the host timer fires first', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   let now = 0;
   const call = { id: '1', type: 'function', name: 'noop', input: { kind: 'json', value: {} } };
-  const provider = new ScriptedProvider([() => { now = 10; return response('tool_calls', '', { toolCalls: [call] }); }]);
+  const provider = new ScriptedProvider([request => {
+    t.mock.timers.tick(6);
+    assert.equal(request.signal.aborted, false, 'Host scheduling cannot advance the injected run clock.');
+    now = 10;
+    return response('tool_calls', '', { toolCalls: [call] });
+  }]);
   const noop = { name: 'noop', implementationId: 'tests/noop-elapsed@1', description: 'noop', jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema, effectEnvelope: readEnvelope, decodeInput() { return { ok: true, input: {} }; }, canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return readEffects; }, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope }; } };
   const run = await harness({ provider, tools: [noop], limits: { elapsedMs: 5 }, clock: { now: () => now }, withoutSession: true });
   const result = ended(await run.agent.run({ task: 'elapsed' }).result);  assert.equal(result.terminationReason, 'limit_exhausted');

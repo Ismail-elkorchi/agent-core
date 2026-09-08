@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, writeFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { evaluateContextPolicies, parseArguments, summarizeTrials, POLICIES } from '../scripts/evaluate-context-policies.mjs';
 import { contextWorkloads, scoreAnswer } from './fixtures/context-policies/workloads.mjs';
 
@@ -116,7 +117,7 @@ test('Codex auth and provider failures keep file contents and private errors out
   const dispatchMarker = path.join(valid.directory, 'dispatches');
   await writeFile(preload, `import { appendFile } from 'node:fs/promises';\nglobalThis.fetch = async (_url, init) => { await appendFile(${JSON.stringify(dispatchMarker)}, 'x'); throw new Error('upstream private error: ' + new Headers(init.headers).get('authorization')); };\n`);
   const failedOutput = path.join(valid.directory, 'failure-report.json');
-  const failed = spawnSync(process.execPath, ['--import', preload, ...args.slice(0, -2).map((arg) => arg === fixture.authFile ? valid.authFile : arg), '--output', failedOutput, '--trials', '1', '--delay', '1', '--policies', 'retained-history', '--max-total-invocations', '1'], { encoding: 'utf8', timeout: 30000 });
+  const failed = spawnSync(process.execPath, ['--import', pathToFileURL(preload).href, ...args.slice(0, -2).map((arg) => arg === fixture.authFile ? valid.authFile : arg), '--output', failedOutput, '--trials', '1', '--delay', '1', '--policies', 'retained-history', '--max-total-invocations', '1'], { encoding: 'utf8', timeout: 30000 });
   assert.equal(failed.status, 1, failed.stderr);
   const failedReport = await readFile(failedOutput, 'utf8');
   valid.assertPrivate(failedReport + failed.stdout + failed.stderr);

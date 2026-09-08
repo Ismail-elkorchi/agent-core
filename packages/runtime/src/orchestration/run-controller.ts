@@ -336,21 +336,6 @@ export class AgentRunController {
     return Math.max(0, this.limits.elapsedMs - this.elapsedMs());
   }
 
-  elapsedDeadlineError(): AgentLimitExceededError {
-    const previous = this.snapshot();
-    const attempted = Math.max(this.elapsedMs(), this.limits.elapsedMs + 1);
-    const resulting = Object.freeze({ ...previous, elapsedMs: attempted });
-    return this.limitError(
-      'elapsed_time',
-      attempted,
-      this.limits.elapsedMs,
-      Math.max(1, attempted - previous.elapsedMs),
-      previous,
-      resulting,
-      true
-    );
-  }
-
   snapshot(): AgentRunBudgetState {
     return Object.freeze({ ...this.state, elapsedMs: this.elapsedMs() });
   }

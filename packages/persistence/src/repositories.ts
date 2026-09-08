@@ -231,6 +231,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     try {
       return (await fs.readdir(this.rootDir))
         .flatMap((name) => /^run-(.+)\.jsonl$/u.exec(name)?.[1] ?? [])
+        .map((name) => decodeURIComponent(name))
         .sort();
     } catch (error) {
       if (nodeCode(error) === 'ENOENT') return [];
@@ -275,7 +276,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
 
   private filePath(runId: string): string {
     assertIdentifier(runId, 'runId');
-    return path.join(this.rootDir, `run-${runId}.jsonl`);
+    return path.join(this.rootDir, `run-${encodeURIComponent(runId)}.jsonl`);
   }
 
   private async ensureHeader(runId: string): Promise<void> {
@@ -392,11 +393,11 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   }
 
   private indexDirectory(runId: string): string {
-    return path.join(this.rootDir, `run-${runId}.index`);
+    return path.join(this.rootDir, `run-${encodeURIComponent(runId)}.index`);
   }
 
   private quarantinePath(runId: string): string {
-    return path.join(this.rootDir, `run-${runId}.quarantine.json`);
+    return path.join(this.rootDir, `run-${encodeURIComponent(runId)}.quarantine.json`);
   }
 
   private keyDirectory(runId: string): string {

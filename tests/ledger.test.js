@@ -32,6 +32,28 @@ test('concurrent event appends preserve sequence, hash chain, and ordering', asy
   assert.equal((await repository.verifyIntegrity('run-1')).ok, true);
 });
 
+test('namespaced stream identities use portable filenames without changing ledger identity', async () => {
+  const rootDir = await mkdtemp(path.join(tmpdir(), 'agent-events-portable-'));
+  const repository = new JsonlEventRepository({ rootDir, codec: typedEventCodec });
+  const ids = ['notes:session', 'notes-session', 'inference:owner:child'];
+  for (const runId of ids) {
+    const receipt = await repository.append(runId, { type: 'sample', runId }, { idempotencyKey: 'write:1' });
+    assert.equal(receipt.runId, runId);
+    assert.doesNotMatch(path.basename(repository.location(runId)), /[<>:"/\\|?*]/u);
+  }
+  const reopened = new JsonlEventRepository({ rootDir, codec: typedEventCodec });
+  assert.deepEqual(await reopened.listRunIds(), ids.toSorted());
+  for (const runId of ids) {
+    const records = [];
+    for await (const record of reopened.read(runId)) records.push(record);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].runId, runId);
+    const retry = await reopened.append(runId, { type: 'sample', runId }, { idempotencyKey: 'write:1' });
+    assert.equal(retry.eventId, records[0].eventId);
+    assert.equal((await reopened.verifyIntegrity(runId)).ok, true);
+  }
+});
+
 test('event repositories scan once and incrementally ingest another writer', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'agent-events-index-'));
   const first = new JsonlEventRepository({ rootDir: dir, codec: typedEventCodec });

@@ -4578,9 +4578,16 @@ function runSignalDeadline(
   parentSignal: AbortSignal
 ): { readonly signal: AbortSignal; readonly dispose: () => void } {
   const timeout = new AbortController();
-  const timer = setTimeout(() => {
-    timeout.abort(controller.elapsedDeadlineError());
-  }, controller.remainingElapsedMs() + 1);
+  const checkDeadline = (): void => {
+    try {
+      // A host timer is a wake-up, not elapsed-time evidence. Recheck the owning
+      // monotonic clock, including when an application supplies that clock.
+      timer = setTimeout(checkDeadline, controller.remainingElapsedMs() + 1);
+    } catch (error) {
+      timeout.abort(error);
+    }
+  };
+  let timer = setTimeout(checkDeadline, controller.remainingElapsedMs() + 1);
   return {
     signal: AbortSignal.any([parentSignal, timeout.signal]),
     dispose: () => {
