@@ -9,10 +9,14 @@ import {
   type ModelResponse,
   type ModelTool,
   type ModelToolCall,
-  type TokenEstimator,
   assertModelReasoningSupported
 } from '@agent-core/model';
-import { createToolCall, type ToolCall, type ToolDefinition, type ToolExecutionContext } from '@agent-core/tools';
+import {
+  createToolCall,
+  type ToolCall,
+  type ToolDefinition,
+  type ToolExecutionContext
+} from '@agent-core/tools';
 import { type RequestWindow } from './budget-accountant.js';
 
 export interface AgentInstructionInput {
@@ -24,7 +28,11 @@ export interface AgentInstructionInput {
 }
 
 export function normalizeModelToolCall(toolCall: ModelToolCall): ToolCall {
-  return createToolCall({ ...(toolCall.id ? { id: toolCall.id } : {}), name: toolCall.name, input: toolCall.input });
+  return createToolCall({
+    ...(toolCall.id ? { id: toolCall.id } : {}),
+    name: toolCall.name,
+    input: toolCall.input
+  });
 }
 
 export function modelToolCallFromToolCall(toolCall: ToolCall): ModelToolCall {
@@ -53,6 +61,7 @@ export function modelToolForDefinition(tool: ToolDefinition, modelProfile: Model
   const textInput = tool.textInput;
   if (textInput?.format.type === 'grammar' && supportsGrammar(textInput.format.syntax, supportedInputs)) {
     return {
+      ...(modelProfile.capabilities.protocol?.asyncTools ? { async: true } : {}),
       type: 'custom',
       name: tool.name,
       description: textInput.description ?? tool.description,
@@ -61,6 +70,7 @@ export function modelToolForDefinition(tool: ToolDefinition, modelProfile: Model
   }
   if (tool.textInput && supportedInputs.some((input) => input.kind === 'text')) {
     return {
+      ...(modelProfile.capabilities.protocol?.asyncTools ? { async: true } : {}),
       type: 'custom',
       name: tool.name,
       description: tool.textInput.description ?? tool.description,
@@ -69,6 +79,7 @@ export function modelToolForDefinition(tool: ToolDefinition, modelProfile: Model
   }
   if (supportedInputs.some((input) => input.kind === 'json')) {
     return {
+      ...(modelProfile.capabilities.protocol?.asyncTools ? { async: true } : {}),
       type: 'function',
       function: {
         name: tool.name,
@@ -77,10 +88,15 @@ export function modelToolForDefinition(tool: ToolDefinition, modelProfile: Model
       }
     };
   }
-  throw new Error(`Model ${modelProfile.id} cannot represent tool ${tool.name}: it supports neither the tool's text presentation nor JSON input.`);
+  throw new Error(
+    `Model ${modelProfile.id} cannot represent tool ${tool.name}: it supports neither the tool's text presentation nor JSON input.`
+  );
 }
 
-function supportsGrammar(syntax: string, inputs: ModelProfile['capabilities']['supportedToolInputs']): boolean {
+function supportsGrammar(
+  syntax: string,
+  inputs: ModelProfile['capabilities']['supportedToolInputs']
+): boolean {
   return inputs.some((input) => input.kind === 'grammar' && input.syntax === syntax);
 }
 
@@ -88,7 +104,13 @@ export function promptToolSpecs(
   tools: ToolDefinition[],
   modelProfile: ModelProfile,
   toolContext?: Omit<ToolExecutionContext, 'policy' | 'signal'>
-): { name: string; description: string; accessModes: string[]; inputFormat: string; promptGuide?: string }[] {
+): {
+  name: string;
+  description: string;
+  accessModes: string[];
+  inputFormat: string;
+  promptGuide?: string;
+}[] {
   return tools.map((tool) => ({
     name: tool.name,
     description: promptDescriptionForTool(tool, modelProfile),
@@ -109,7 +131,9 @@ export function validateModelRun(
     throw new Error(`Provider ${providerId} returned a model profile for provider ${modelProfile.provider}.`);
   }
   if (!modelProfile.capabilities.toolCalling && tools.length > 0) {
-    throw new Error(`Model ${modelProfile.id} on provider ${providerId} does not support native tool calling.`);
+    throw new Error(
+      `Model ${modelProfile.id} on provider ${providerId} does not support native tool calling.`
+    );
   }
   if (temperature !== undefined && !modelProfile.capabilities.temperature) {
     throw new Error(`Model ${modelProfile.id} on provider ${providerId} does not support temperature.`);
@@ -117,25 +141,37 @@ export function validateModelRun(
   assertModelReasoningSupported(modelProfile, reasoning);
 }
 
-export function requestWindowForModel(modelProfile: ModelProfile, requestedOutputTokens: number | undefined): RequestWindow {
+export function requestWindowForModel(
+  modelProfile: ModelProfile,
+  requestedOutputTokens: number | undefined
+): RequestWindow {
   const contextWindowTokens = modelProfile.limits.contextTokens;
   if (contextWindowTokens === undefined) {
-    throw new Error(`Model ${modelProfile.id} on provider ${modelProfile.provider} did not describe limits.contextTokens.`);
+    throw new Error(
+      `Model ${modelProfile.id} on provider ${modelProfile.provider} did not describe limits.contextTokens.`
+    );
   }
   if (!Number.isInteger(contextWindowTokens) || contextWindowTokens < 2) {
-    throw new Error(`Model ${modelProfile.id} on provider ${modelProfile.provider} returned an invalid context token limit.`);
+    throw new Error(
+      `Model ${modelProfile.id} on provider ${modelProfile.provider} returned an invalid context token limit.`
+    );
   }
-  const modelOutputTokens = modelProfile.limits.outputTokens ?? Math.max(1, Math.floor(contextWindowTokens * 0.25));
+  const modelOutputTokens =
+    modelProfile.limits.outputTokens ?? Math.max(1, Math.floor(contextWindowTokens * 0.25));
   if (!Number.isInteger(modelOutputTokens) || modelOutputTokens < 1) {
-    throw new Error(`Model ${modelProfile.id} on provider ${modelProfile.provider} returned an invalid output token limit.`);
+    throw new Error(
+      `Model ${modelProfile.id} on provider ${modelProfile.provider} returned an invalid output token limit.`
+    );
   }
-  const maxOutputTokens = requestedOutputTokens === undefined
-    ? Math.min(modelOutputTokens, Math.max(1, contextWindowTokens - 1))
-    : Math.min(requestedOutputTokens, modelOutputTokens, Math.max(1, contextWindowTokens - 1));
+  const maxOutputTokens =
+    requestedOutputTokens === undefined
+      ? Math.min(4_096, modelOutputTokens, Math.max(1, Math.floor(contextWindowTokens * 0.25)))
+      : Math.min(requestedOutputTokens, modelOutputTokens, Math.max(1, contextWindowTokens - 1));
   const contextPromptTokens = Math.max(1, contextWindowTokens - maxOutputTokens);
-  const maxPromptTokens = modelProfile.limits.maxInputTokens === undefined
-    ? contextPromptTokens
-    : Math.min(contextPromptTokens, modelProfile.limits.maxInputTokens);
+  const maxPromptTokens =
+    modelProfile.limits.maxInputTokens === undefined
+      ? contextPromptTokens
+      : Math.min(contextPromptTokens, modelProfile.limits.maxInputTokens);
   return {
     contextWindowTokens,
     maxOutputTokens,
@@ -155,29 +191,13 @@ export function promptInstructionsForRequest(input: {
       content: instruction.content,
       ...(instruction.sourceUri ? { sourceUri: instruction.sourceUri } : {})
     })),
-    ...input.runInstructions.map((content, index): PromptInstructionBlock => ({ id: `user-${String(index + 1)}`, role: 'user', priority: 950, content }))
+    ...input.runInstructions.map((content, index): PromptInstructionBlock => ({
+      id: `user-${String(index + 1)}`,
+      role: 'user',
+      priority: 950,
+      content
+    }))
   ];
-}
-
-export function estimatePromptScaffoldTokens(estimator: TokenEstimator, input: {
-  task: string;
-  runNotes: string[];
-  runInstructions: string[];
-  configuredInstructions: AgentInstructionInput[];
-  tools: ToolDefinition[];
-  modelProfile: ModelProfile;
-  toolContext?: Omit<ToolExecutionContext, 'policy' | 'signal'>;
-}): number {
-  const text = [
-    input.task,
-    ...promptInstructionsForRequest({
-      runInstructions: input.runInstructions,
-      configuredInstructions: input.configuredInstructions
-    }).map((instruction) => instruction.content),
-    ...input.runNotes.slice(-8),
-    ...promptToolSpecs(input.tools, input.modelProfile, input.toolContext).map((tool) => `${tool.name} ${tool.inputFormat} ${tool.accessModes.join(',')} ${tool.description} ${tool.promptGuide ?? ''}`)
-  ].join('\n\n');
-  return estimator.estimateText(text);
 }
 
 export function validateOptionalPositiveInteger(value: number | undefined, name: string): number | undefined {
@@ -188,14 +208,6 @@ export function validateOptionalPositiveInteger(value: number | undefined, name:
     throw new Error(`${name} must be a positive integer when provided.`);
   }
   return value;
-}
-
-export function normalizeStreamedFinalResponse(response: ModelResponse, streamedContent: string, streamedReasoningSummary: string): ModelResponse {
-  return Object.freeze({
-    ...response,
-    ...(response.content.length === 0 && streamedContent.length > 0 ? { content: streamedContent } : {}),
-    ...(!response.reasoningSummary && streamedReasoningSummary.length > 0 ? { reasoningSummary: streamedReasoningSummary } : {})
-  });
 }
 
 export function providerFailureDiagnostic(error: unknown): ModelProviderErrorDiagnostic | undefined {
@@ -225,7 +237,9 @@ function promptDescriptionForTool(tool: ToolDefinition, modelProfile: ModelProfi
 function promptInputFormatForTool(tool: ToolDefinition, modelProfile: ModelProfile): string {
   const selected = modelToolForDefinition(tool, modelProfile);
   if (selected.type === 'custom') {
-    return selected.format.type === 'grammar' ? `freeform grammar:${selected.format.syntax}` : 'freeform text';
+    return selected.format.type === 'grammar'
+      ? `freeform grammar:${selected.format.syntax}`
+      : 'freeform text';
   }
   return 'json function';
 }
@@ -251,12 +265,13 @@ function promptGuideResult(
   inputFormat: string,
   toolContext: Omit<ToolExecutionContext, 'policy' | 'signal'> | undefined
 ): { promptGuide?: string } {
-  const promptGuide = typeof guide === 'function'
-    ? guide({
-      inputFormat,
-      ...(toolContext?.services ? { services: toolContext.services } : {}),
-      ...(toolContext?.metadata ? { metadata: toolContext.metadata } : {})
-    })
-    : guide;
+  const promptGuide =
+    typeof guide === 'function'
+      ? guide({
+          inputFormat,
+          ...(toolContext?.services ? { services: toolContext.services } : {}),
+          ...(toolContext?.metadata ? { metadata: toolContext.metadata } : {})
+        })
+      : guide;
   return promptGuide && promptGuide.trim().length > 0 ? { promptGuide } : {};
 }

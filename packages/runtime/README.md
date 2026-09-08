@@ -1,5 +1,9 @@
 # `@agent-core/runtime`
 
-Run contracts, causal model windows, prompt-material assembly, the inference gateway, sessions, verification, approvals, recovery, and run finalization. Before transport, the gateway applies a model-profile-aware request-fit check covering messages, tool and response schemas, the model input limit, and output reserve. The root export contains no filesystem persistence; import `@agent-core/runtime/node` for `JsonlSessionRepository`.
+Run orchestration, governed inference, original history, scoped notes, conditional context windows, sessions, optional verification, approvals, recovery, and finalization. Admission uses the accounting for the exact compiled model input, including content, tools, media, protocol state, and an explicit output reservation.
+
+The root exports contracts and in-memory repositories. Import `@agent-core/runtime/node` for `JsonlSessionRepository`, `JsonlNoteRepository`, and `JsonlInferenceRepository`. Applications supply storage locations explicitly.
 
 Application-owned working copies and publication policy do not belong to this package. Core records effect truth and finalizes runs; Coding Agent owns repository isolation, checks, diffs, and publication.
+
+See the repository's [context composition guide](../../docs/CONTEXT.md) for service boundaries and the public tool factories.

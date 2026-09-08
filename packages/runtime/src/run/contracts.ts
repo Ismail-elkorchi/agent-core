@@ -1,7 +1,18 @@
 import type { ArtifactRef } from '@agent-core/persistence';
 import { canonicalJsonString } from '@agent-core/persistence';
-import { parseJsonObject, parseJsonValue, type JsonNormalizationDiagnostic, type JsonObject, type JsonValue } from '@agent-core/json';
-import type { ModelReasoningRequest, ModelRequest, ModelResponseFormat, ModelTerminationReason } from '@agent-core/model';
+import {
+  parseJsonObject,
+  parseJsonValue,
+  type JsonNormalizationDiagnostic,
+  type JsonObject,
+  type JsonValue
+} from '@agent-core/json';
+import type {
+  ModelReasoningRequest,
+  ModelRequest,
+  ModelResponseFormat,
+  ModelTerminationReason
+} from '@agent-core/model';
 import type { ToolEffects } from '@agent-core/tools';
 import { decodeEffectRecoveryCapability, type EffectRecoveryCapability } from '@agent-core/effects';
 
@@ -22,7 +33,9 @@ export type AgentRunPhase =
   | 'ended';
 
 /** A monotonic clock used for elapsed-time decisions. Values have no wall-clock meaning. */
-export interface AgentClock { now(): number }
+export interface AgentClock {
+  now(): number;
+}
 
 export function systemAgentClock(): AgentClock {
   return Object.freeze({ now: () => performance.now() });
@@ -34,18 +47,21 @@ export type AgentTurnIdentity = Readonly<{
   readonly requestAttempt: number;
 }>;
 
-export type AgentToolBatchIdentity = AgentTurnIdentity & Readonly<{
-  readonly toolBatchId: string;
-}>;
+export type AgentToolBatchIdentity = AgentTurnIdentity &
+  Readonly<{
+    readonly toolBatchId: string;
+  }>;
 
-export type AgentToolCallIdentity = AgentToolBatchIdentity & Readonly<{
-  readonly callIndex: number;
-  readonly callId?: string;
-}>;
+export type AgentToolCallIdentity = AgentToolBatchIdentity &
+  Readonly<{
+    readonly callIndex: number;
+    readonly callId?: string;
+  }>;
 
-export type AgentToolCallAttemptIdentity = AgentToolCallIdentity & Readonly<{
-  readonly toolAttempt: number;
-}>;
+export type AgentToolCallAttemptIdentity = AgentToolCallIdentity &
+  Readonly<{
+    readonly toolAttempt: number;
+  }>;
 
 export interface AgentApprovalBinding extends JsonObject {
   readonly toolImplementationId: string;
@@ -75,10 +91,18 @@ export interface AgentApprovalSuspension extends AgentRunIdentity {
 
 export interface AgentRunSuspension extends AgentRunIdentity {
   readonly state: 'suspended';
-  readonly reason: 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'disposition_outcome_unknown' | 'missing_implementation' | 'user_decision';
+  readonly reason:
+    | 'provider_outcome_unknown'
+    | 'tool_outcome_unknown'
+    | 'disposition_outcome_unknown'
+    | 'missing_implementation'
+    | 'user_decision';
   readonly effectId?: string;
   readonly decisionRequest?: import('./control/contracts.js').AgentDecisionRequest;
-  readonly cleanupDiagnostic?: { readonly kind: 'process_cleanup'; readonly message: string };
+  readonly cleanupDiagnostic?: {
+    readonly kind: 'process_cleanup';
+    readonly message: string;
+  };
   readonly budget: AgentRunBudgetState;
 }
 
@@ -91,7 +115,10 @@ export type AgentPresentModelOutput = Readonly<{
   readonly turnIndex: number;
 }>;
 
-export type AgentRunIdentity = Readonly<{ readonly runId: string; readonly finalizationId: string }>;
+export type AgentRunIdentity = Readonly<{
+  readonly runId: string;
+  readonly finalizationId: string;
+}>;
 
 export type AgentEffectiveInstruction = Readonly<{
   readonly id: string;
@@ -102,8 +129,13 @@ export type AgentEffectiveInstruction = Readonly<{
   readonly priority?: number;
 }>;
 
-export type AgentCheckDiagnosticKind = 'exception' | 'timeout' | 'unavailable' | 'permission_denied' | 'aborted' | 'invalid_result';
-export type AgentCheckDiagnostic = Readonly<{ readonly kind: AgentCheckDiagnosticKind; readonly message: string; readonly details?: JsonValue }>;
+export type AgentCheckDiagnosticKind =
+  'exception' | 'timeout' | 'unavailable' | 'permission_denied' | 'aborted' | 'invalid_result';
+export type AgentCheckDiagnostic = Readonly<{
+  readonly kind: AgentCheckDiagnosticKind;
+  readonly message: string;
+  readonly details?: JsonValue;
+}>;
 export interface AgentCheckObservation {
   readonly verdict: AgentCheckVerdict;
   readonly summary: string;
@@ -131,7 +163,11 @@ export interface AgentObservedFactsPage {
   readonly truncated: boolean;
 }
 export interface AgentObservedFactsReader {
-  read(input?: { readonly cursor?: string; readonly limit?: number; readonly maxBytes?: number }): Promise<AgentObservedFactsPage>;
+  read(input?: {
+    readonly cursor?: string;
+    readonly limit?: number;
+    readonly maxBytes?: number;
+  }): Promise<AgentObservedFactsPage>;
   readArtifact(ref: ArtifactRef, input?: { readonly maxBytes?: number }): Promise<Uint8Array>;
 }
 export interface AgentVerificationExecutionContext {
@@ -168,7 +204,10 @@ export interface AgentEffectCheckDefinition extends AgentCheckDefinitionBase {
 export type AgentCheckDefinition = AgentDeterministicCheckDefinition | AgentEffectCheckDefinition;
 
 export type AgentCheckEffectReconciliation =
-  | Readonly<{ readonly status: 'settled'; readonly observation: AgentCheckObservation }>
+  | Readonly<{
+      readonly status: 'settled';
+      readonly observation: AgentCheckObservation;
+    }>
   | Readonly<{ readonly status: 'running' | 'unknown' | 'expired' }>;
 
 export interface AgentCheckEffectPlan {
@@ -190,7 +229,11 @@ export interface AgentCheckEffectPlanInput {
 const CHECK_EFFECT_PLANS = new WeakSet();
 
 export function createAgentCheckEffectPlan(input: AgentCheckEffectPlanInput): AgentCheckEffectPlan {
-  if (typeof input.start !== 'function' || typeof input.reconcile !== 'function' || typeof input.release !== 'function') {
+  if (
+    typeof input.start !== 'function' ||
+    typeof input.reconcile !== 'function' ||
+    typeof input.release !== 'function'
+  ) {
     throw new TypeError('Planned check effect requires start, reconcile, and release operations.');
   }
   const plan = Object.freeze({
@@ -209,9 +252,16 @@ export function isAgentCheckEffectPlan(value: unknown): value is AgentCheckEffec
 }
 
 export type AgentLimitKind =
-  | 'model_turns' | 'total_tool_calls' | 'repeated_tool_calls' | 'elapsed_time'
-  | 'prompt_tokens' | 'completion_tokens' | 'known_cost' | 'consecutive_provider_failures'
-  | 'consecutive_tool_failures' | 'revision_attempts';
+  | 'model_turns'
+  | 'total_tool_calls'
+  | 'repeated_tool_calls'
+  | 'elapsed_time'
+  | 'prompt_tokens'
+  | 'completion_tokens'
+  | 'known_cost'
+  | 'consecutive_provider_failures'
+  | 'consecutive_tool_failures'
+  | 'revision_attempts';
 export interface AgentRunLimits {
   readonly maxConcurrentToolCalls: number;
   readonly modelTurns: number;
@@ -263,22 +313,43 @@ export type AgentRunBudgetState = Readonly<{
 }>;
 
 const AGENT_RUN_BUDGET_FIELDS = [
-  'modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'revisionAttempts', 'elapsedMs',
-  'promptTokens', 'completionTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens',
-  'knownCosts', 'pricingStatus', 'unknownPricedTokens', 'consecutiveProviderFailures', 'consecutiveToolFailures'
+  'modelTurns',
+  'totalToolCalls',
+  'repeatedIdenticalToolCalls',
+  'revisionAttempts',
+  'elapsedMs',
+  'promptTokens',
+  'completionTokens',
+  'cacheReadTokens',
+  'cacheWriteTokens',
+  'reasoningTokens',
+  'knownCosts',
+  'pricingStatus',
+  'unknownPricedTokens',
+  'consecutiveProviderFailures',
+  'consecutiveToolFailures'
 ] as const;
 
 export function decodeAgentRunBudgetState(value: unknown): AgentRunBudgetState {
   const object = parseJsonObject(value);
   const fields = Object.keys(object);
-  if (fields.length !== AGENT_RUN_BUDGET_FIELDS.length || fields.some((field) => !AGENT_RUN_BUDGET_FIELDS.includes(field as typeof AGENT_RUN_BUDGET_FIELDS[number]))) {
+  if (
+    fields.length !== AGENT_RUN_BUDGET_FIELDS.length ||
+    fields.some(
+      (field) => !AGENT_RUN_BUDGET_FIELDS.includes(field as (typeof AGENT_RUN_BUDGET_FIELDS)[number])
+    )
+  ) {
     throw contract('Invalid run budget.', ['budget fields are invalid.']);
   }
   if (!isBudgetState(object)) throw contract('Invalid run budget.', ['budget values are invalid.']);
-  return Object.freeze({ ...object, knownCosts: Object.freeze({ ...object.knownCosts }) });
+  return Object.freeze({
+    ...object,
+    knownCosts: Object.freeze({ ...object.knownCosts })
+  });
 }
 
 export interface AgentTurnSnapshotRecord {
+  readonly toolCatalog: import('./tool-catalog.js').ToolCatalogSnapshot;
   readonly turnIndex: number;
   readonly turnId: string;
   readonly requestAttempt: number;
@@ -293,7 +364,10 @@ export interface AgentTurnSnapshotRecord {
   readonly toolPolicyHash: string;
   readonly instructions: readonly AgentEffectiveInstruction[];
   readonly configuredContextSourceIds: readonly string[];
-  readonly checks: readonly { readonly id: string; readonly implementationId: string }[];
+  readonly checks: readonly {
+    readonly id: string;
+    readonly implementationId: string;
+  }[];
   readonly limits: AgentRunLimits;
   readonly budget: AgentRunBudgetState;
 }
@@ -306,6 +380,8 @@ export interface ModelRequestReductionRecord {
 
 /** The immutable request truth created only after every dynamic input has resolved. */
 export interface InferenceRequestFingerprintRecord extends AgentTurnIdentity {
+  readonly compiledInputIdentity: string;
+  readonly capabilityRevision: string;
   readonly requestId: string;
   readonly configuredContextIds: readonly string[];
   readonly providerContextIds: readonly string[];
@@ -323,46 +399,65 @@ export interface LogicalModelRequestRecord extends AgentTurnIdentity {
   readonly request: Omit<ModelRequest, 'signal'>;
 }
 
-export type AgentCompletedTerminationReason = 'model_completed' | 'model_output_limit' | 'content_filtered' | 'unknown_model_termination';
+export type AgentCompletedTerminationReason =
+  'model_completed' | 'model_output_limit' | 'content_filtered' | 'unknown_model_termination';
 export type AgentFailureTerminationReason =
   | Exclude<AgentCompletedTerminationReason, 'model_completed'>
-  | 'empty_response' | 'malformed_response' | 'provider_error' | 'runtime_error'
-  | 'stream_interrupted' | 'request_too_large' | 'limit_exhausted'
-  | 'model_output_rejected' | 'disposition_inconclusive';
-type AgentTerminalBase = AgentRunIdentity & Readonly<{
-  readonly phase: 'ended';
-  readonly turnCount: number;
-  readonly modelOutput: AgentModelOutput;
-  readonly modelTerminationReason?: ModelTerminationReason;
-  readonly providerTerminationReason?: string;
-  readonly checkResults: readonly AgentCheckResult[];
-  readonly budget: AgentRunBudgetState;
-  readonly exhaustedLimit?: AgentLimitKind;
-  readonly cleanupDiagnostic?: { readonly kind: 'process_cleanup'; readonly message: string };
-}>;
-export type AgentCompletedTerminalSnapshot = AgentTerminalBase & Readonly<{
-  readonly executionStatus: 'completed';
-  readonly modelOutput: AgentPresentModelOutput;
-  readonly verificationStatus: AgentCompletedVerificationStatus;
-  readonly terminationReason: AgentCompletedTerminationReason;
-  readonly errorMessage?: never;
-}>;
-export type AgentFailedTerminalSnapshot = AgentTerminalBase & Readonly<{
-  readonly executionStatus: 'failed';
-  readonly modelOutput: AgentModelOutput;
-  readonly verificationStatus: AgentVerificationStatus;
-  readonly terminationReason: AgentFailureTerminationReason;
-  readonly errorMessage: string;
-}>;
-export type AgentAbortedTerminalSnapshot = AgentTerminalBase & Readonly<{
-  readonly executionStatus: 'aborted';
-  readonly modelOutput: AgentAbsentModelOutput | (AgentPresentModelOutput & { readonly status: 'partial' });
-  readonly verificationStatus: 'not_run';
-  readonly terminationReason: 'aborted';
-  readonly errorMessage: string;
-}>;
-export type AgentTerminalSnapshot = AgentCompletedTerminalSnapshot | AgentFailedTerminalSnapshot | AgentAbortedTerminalSnapshot;
-export interface AgentDeliveryDiagnostic { readonly eventType: string; readonly message: string; readonly persisted: boolean }
+  | 'empty_response'
+  | 'malformed_response'
+  | 'provider_error'
+  | 'runtime_error'
+  | 'stream_interrupted'
+  | 'request_too_large'
+  | 'limit_exhausted'
+  | 'model_output_rejected'
+  | 'disposition_inconclusive';
+type AgentTerminalBase = AgentRunIdentity &
+  Readonly<{
+    readonly phase: 'ended';
+    readonly turnCount: number;
+    readonly modelOutput: AgentModelOutput;
+    readonly modelTerminationReason?: ModelTerminationReason;
+    readonly providerTerminationReason?: string;
+    readonly checkResults: readonly AgentCheckResult[];
+    readonly budget: AgentRunBudgetState;
+    readonly exhaustedLimit?: AgentLimitKind;
+    readonly cleanupDiagnostic?: {
+      readonly kind: 'process_cleanup';
+      readonly message: string;
+    };
+  }>;
+export type AgentCompletedTerminalSnapshot = AgentTerminalBase &
+  Readonly<{
+    readonly executionStatus: 'completed';
+    readonly modelOutput: AgentPresentModelOutput;
+    readonly verificationStatus: AgentCompletedVerificationStatus;
+    readonly terminationReason: AgentCompletedTerminationReason;
+    readonly errorMessage?: never;
+  }>;
+export type AgentFailedTerminalSnapshot = AgentTerminalBase &
+  Readonly<{
+    readonly executionStatus: 'failed';
+    readonly modelOutput: AgentModelOutput;
+    readonly verificationStatus: AgentVerificationStatus;
+    readonly terminationReason: AgentFailureTerminationReason;
+    readonly errorMessage: string;
+  }>;
+export type AgentAbortedTerminalSnapshot = AgentTerminalBase &
+  Readonly<{
+    readonly executionStatus: 'aborted';
+    readonly modelOutput: AgentAbsentModelOutput | (AgentPresentModelOutput & { readonly status: 'partial' });
+    readonly verificationStatus: 'not_run';
+    readonly terminationReason: 'aborted';
+    readonly errorMessage: string;
+  }>;
+export type AgentTerminalSnapshot =
+  AgentCompletedTerminalSnapshot | AgentFailedTerminalSnapshot | AgentAbortedTerminalSnapshot;
+export interface AgentDeliveryDiagnostic {
+  readonly eventType: string;
+  readonly message: string;
+  readonly persisted: boolean;
+}
 export interface AgentEndedRunResult {
   readonly state: 'ended';
   readonly terminal: AgentTerminalSnapshot;
@@ -380,21 +475,46 @@ export class AgentContractError extends Error {
 }
 
 export function validateAgentRunLimits(input: Partial<AgentRunLimits> = {}): AgentRunLimits {
-  const limits: AgentRunLimits = { ...DEFAULT_AGENT_RUN_LIMITS, ...input, knownCost: { ...DEFAULT_AGENT_RUN_LIMITS.knownCost, ...(input.knownCost ?? {}) } };
+  const limits: AgentRunLimits = {
+    ...DEFAULT_AGENT_RUN_LIMITS,
+    ...input,
+    knownCost: {
+      ...DEFAULT_AGENT_RUN_LIMITS.knownCost,
+      ...(input.knownCost ?? {})
+    }
+  };
   const fields: (keyof Omit<AgentRunLimits, 'knownCost'>)[] = [
-    'maxConcurrentToolCalls', 'modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'elapsedMs', 'promptTokens',
-    'completionTokens', 'activeImageCount', 'activeImageBytes', 'activeImageTokens',
-    'consecutiveProviderFailures', 'consecutiveToolFailures'
+    'maxConcurrentToolCalls',
+    'modelTurns',
+    'totalToolCalls',
+    'repeatedIdenticalToolCalls',
+    'elapsedMs',
+    'promptTokens',
+    'completionTokens',
+    'activeImageCount',
+    'activeImageBytes',
+    'activeImageTokens',
+    'consecutiveProviderFailures',
+    'consecutiveToolFailures'
   ];
-  const issues = fields.flatMap((field) => positiveInteger(limits[field]) ? [] : [`${field} must be a positive finite integer.`]);
-  if (!Number.isSafeInteger(limits.revisionAttempts) || limits.revisionAttempts < 0) issues.push('revisionAttempts must be a nonnegative safe integer.');
-  if (!Number.isFinite(limits.knownCost.amount) || limits.knownCost.amount <= 0) issues.push('knownCost.amount must be positive and finite.');
+  const issues = fields.flatMap((field) =>
+    positiveInteger(limits[field]) ? [] : [`${field} must be a positive finite integer.`]
+  );
+  if (!Number.isSafeInteger(limits.revisionAttempts) || limits.revisionAttempts < 0)
+    issues.push('revisionAttempts must be a nonnegative safe integer.');
+  if (!Number.isFinite(limits.knownCost.amount) || limits.knownCost.amount <= 0)
+    issues.push('knownCost.amount must be positive and finite.');
   if (limits.knownCost.currency.trim().length === 0) issues.push('knownCost.currency must be non-empty.');
   if (issues.length > 0) throw new AgentContractError('Invalid run limits.', issues);
-  return Object.freeze({ ...limits, knownCost: Object.freeze({ ...limits.knownCost }) });
+  return Object.freeze({
+    ...limits,
+    knownCost: Object.freeze({ ...limits.knownCost })
+  });
 }
 
-export function validateAgentCheckDefinitions(definitions: readonly AgentCheckDefinition[] | undefined): readonly AgentCheckDefinition[] {
+export function validateAgentCheckDefinitions(
+  definitions: readonly AgentCheckDefinition[] | undefined
+): readonly AgentCheckDefinition[] {
   const output = definitions ?? [];
   const issues: string[] = [];
   const ids = new Set<string>();
@@ -404,9 +524,12 @@ export function validateAgentCheckDefinitions(definitions: readonly AgentCheckDe
     if (id.trim().length === 0) issues.push(`Check at index ${String(index)} has an empty id.`);
     else if (ids.has(id)) issues.push(`Duplicate check id: ${id}.`);
     else ids.add(id);
-    if (!validIdentity(definition.implementationId)) issues.push(`Check ${label} implementationId must be a non-empty bounded identity.`);
-    if (!isAgentCheckKind(definition.kind)) issues.push(`Check ${label} kind must be deterministic or effect.`);
-    if (definition.timeoutMs !== undefined && !positiveInteger(definition.timeoutMs)) issues.push(`Check ${label} timeoutMs must be a positive finite integer.`);
+    if (!validIdentity(definition.implementationId))
+      issues.push(`Check ${label} implementationId must be a non-empty bounded identity.`);
+    if (!isAgentCheckKind(definition.kind))
+      issues.push(`Check ${label} kind must be deterministic or effect.`);
+    if (definition.timeoutMs !== undefined && !positiveInteger(definition.timeoutMs))
+      issues.push(`Check ${label} timeoutMs must be a positive finite integer.`);
   }
   if (issues.length > 0) throw new AgentContractError('Invalid check definitions.', issues);
   return Object.freeze([...output]);
@@ -430,47 +553,92 @@ export function deriveAgentVerificationStatus(
 }
 
 export function decodeOwnedAgentModelOutput(value: JsonObject): AgentModelOutput {
-  if (typeof value.status !== 'string') throw contract('Invalid modelOutput.', ['Model output must be a discriminated object.']);
+  if (typeof value.status !== 'string')
+    throw contract('Invalid modelOutput.', ['Model output must be a discriminated object.']);
   if (value.status === 'absent') {
-    if (Object.keys(value).some((key) => key !== 'status')) throw contract('Invalid absent modelOutput.', ['Absent modelOutputs cannot carry message, source, or turnIndex.']);
+    if (Object.keys(value).some((key) => key !== 'status'))
+      throw contract('Invalid absent modelOutput.', [
+        'Absent modelOutputs cannot carry message, source, or turnIndex.'
+      ]);
     return Object.freeze({ status: 'absent' });
   }
-  if (!oneOf(value.status, ['complete', 'partial', 'indeterminate'])) throw contract('Invalid modelOutput.', ['Unsupported modelOutput status.']);
-  if (typeof value.message !== 'string' || value.message.trim().length === 0) throw contract('Invalid modelOutput.', ['Model output message must be non-empty.']);
-  if (!oneOf(value.source, ['content', 'reasoning_summary', 'stream_recovery'])) throw contract('Invalid modelOutput.', ['Unsupported modelOutput source.']);
-  if (!positiveInteger(value.turnIndex)) throw contract('Invalid modelOutput.', ['Model output turnIndex must be a positive integer.']);
-  if (value.source === 'stream_recovery' && value.status !== 'partial') throw contract('Invalid modelOutput.', ['Stream recovery modelOutputs must be partial.']);
-  return Object.freeze({ status: value.status, message: value.message, source: value.source, turnIndex: value.turnIndex });
+  if (!oneOf(value.status, ['complete', 'partial', 'indeterminate']))
+    throw contract('Invalid modelOutput.', ['Unsupported modelOutput status.']);
+  if (typeof value.message !== 'string' || value.message.trim().length === 0)
+    throw contract('Invalid modelOutput.', ['Model output message must be non-empty.']);
+  if (!oneOf(value.source, ['content', 'reasoning_summary', 'stream_recovery']))
+    throw contract('Invalid modelOutput.', ['Unsupported modelOutput source.']);
+  if (!positiveInteger(value.turnIndex))
+    throw contract('Invalid modelOutput.', ['Model output turnIndex must be a positive integer.']);
+  if (value.source === 'stream_recovery' && value.status !== 'partial')
+    throw contract('Invalid modelOutput.', ['Stream recovery modelOutputs must be partial.']);
+  return Object.freeze({
+    status: value.status,
+    message: value.message,
+    source: value.source,
+    turnIndex: value.turnIndex
+  });
 }
 
 export function parseAgentCheckResult(value: unknown, measuredDurationMs?: number): AgentCheckResult {
   return decodeOwnedAgentCheckResult(parseJsonObject(value), measuredDurationMs);
 }
 
-export function decodeOwnedAgentCheckResult(object: JsonObject, measuredDurationMs?: number): AgentCheckResult {
+export function decodeOwnedAgentCheckResult(
+  object: JsonObject,
+  measuredDurationMs?: number
+): AgentCheckResult {
   const issues: string[] = [];
   const id = typeof object.id === 'string' && object.id.trim().length > 0 ? object.id : undefined;
-  const implementationId = typeof object.implementationId === 'string' && validIdentity(object.implementationId) ? object.implementationId : undefined;
+  const implementationId =
+    typeof object.implementationId === 'string' && validIdentity(object.implementationId)
+      ? object.implementationId
+      : undefined;
   const requirement = oneOf(object.requirement, ['required', 'advisory']) ? object.requirement : undefined;
   const verdict = oneOf(object.verdict, ['passed', 'failed', 'unknown']) ? object.verdict : undefined;
-  const summary = typeof object.summary === 'string' && object.summary.trim().length > 0 ? object.summary : undefined;
+  const summary =
+    typeof object.summary === 'string' && object.summary.trim().length > 0 ? object.summary : undefined;
   const rawDurationMs = measuredDurationMs ?? object.durationMs;
-  const durationMs = typeof rawDurationMs === 'number' && Number.isFinite(rawDurationMs) && rawDurationMs >= 0 ? rawDurationMs : undefined;
+  const durationMs =
+    typeof rawDurationMs === 'number' && Number.isFinite(rawDurationMs) && rawDurationMs >= 0
+      ? rawDurationMs
+      : undefined;
   if (!id) issues.push('id must be non-empty.');
   if (!implementationId) issues.push('implementationId must be a non-empty bounded identity.');
   if (!requirement) issues.push('requirement is invalid.');
   if (!verdict) issues.push('verdict is invalid.');
   if (!summary) issues.push('summary must be non-empty.');
   if (durationMs === undefined) issues.push('durationMs must be finite and nonnegative.');
-  const artifacts = object.artifacts === undefined ? undefined : Array.isArray(object.artifacts) && object.artifacts.every(isArtifactRef) ? Object.freeze([...object.artifacts]) : undefined;
+  const artifacts =
+    object.artifacts === undefined
+      ? undefined
+      : Array.isArray(object.artifacts) && object.artifacts.every(isArtifactRef)
+        ? Object.freeze([...object.artifacts])
+        : undefined;
   if (object.artifacts !== undefined && !artifacts) issues.push('artifacts are invalid.');
-  const diagnostic = object.diagnostic === undefined ? undefined : isCheckDiagnostic(object.diagnostic) ? object.diagnostic : undefined;
+  const diagnostic =
+    object.diagnostic === undefined
+      ? undefined
+      : isCheckDiagnostic(object.diagnostic)
+        ? object.diagnostic
+        : undefined;
   if (object.diagnostic !== undefined && !diagnostic) issues.push('diagnostic is invalid.');
-  const outputNormalization = object.outputNormalization === undefined ? undefined : decodeNormalizationDiagnostics(object.outputNormalization);
-  if (object.outputNormalization !== undefined && !outputNormalization) issues.push('outputNormalization is invalid.');
+  const outputNormalization =
+    object.outputNormalization === undefined
+      ? undefined
+      : decodeNormalizationDiagnostics(object.outputNormalization);
+  if (object.outputNormalization !== undefined && !outputNormalization)
+    issues.push('outputNormalization is invalid.');
   if (issues.length > 0) throw contract('Invalid check result.', issues);
-  if (!id || !implementationId || !requirement || !verdict || !summary || durationMs === undefined) throw contract('Invalid check result.', issues);
-  return Object.freeze({ id, implementationId, requirement, verdict, summary, durationMs,
+  if (!id || !implementationId || !requirement || !verdict || !summary || durationMs === undefined)
+    throw contract('Invalid check result.', issues);
+  return Object.freeze({
+    id,
+    implementationId,
+    requirement,
+    verdict,
+    summary,
+    durationMs,
     ...(object.output !== undefined ? { output: object.output } : {}),
     ...(outputNormalization ? { outputNormalization } : {}),
     ...(artifacts ? { artifacts } : {}),
@@ -481,23 +649,59 @@ export function decodeOwnedAgentCheckResult(object: JsonObject, measuredDuration
 export function createAgentTerminalSnapshot(value: AgentTerminalSnapshot): AgentTerminalSnapshot {
   const issues: string[] = [];
   if (!validIdentity(value.runId)) issues.push('runId must be non-empty and at most 256 UTF-8 bytes.');
-  if (!validIdentity(value.finalizationId)) issues.push('finalizationId must be non-empty and at most 256 UTF-8 bytes.');
-  if (!Number.isInteger(value.turnCount) || value.turnCount < 0) issues.push('turnCount must be a nonnegative integer.');
-  if (value.executionStatus === 'completed') issues.push(...completedModelOutputIssues(value.terminationReason, value.modelOutput.status));
-  if (value.terminationReason === 'limit_exhausted' && value.exhaustedLimit === undefined) issues.push('limit_exhausted requires exhaustedLimit.');
-  if (value.terminationReason !== 'limit_exhausted' && value.exhaustedLimit !== undefined) issues.push('exhaustedLimit is only legal for limit_exhausted.');
-  issues.push(...modelTerminationIssues({
-    terminationReason: value.terminationReason,
-    ...(value.modelTerminationReason !== undefined ? { modelTerminationReason: value.modelTerminationReason } : {}),
-    ...(value.providerTerminationReason !== undefined ? { providerTerminationReason: value.providerTerminationReason } : {})
-  }));
+  if (!validIdentity(value.finalizationId))
+    issues.push('finalizationId must be non-empty and at most 256 UTF-8 bytes.');
+  if (!Number.isInteger(value.turnCount) || value.turnCount < 0)
+    issues.push('turnCount must be a nonnegative integer.');
+  if (value.executionStatus === 'completed')
+    issues.push(...completedModelOutputIssues(value.terminationReason, value.modelOutput.status));
+  if (value.terminationReason === 'limit_exhausted' && value.exhaustedLimit === undefined)
+    issues.push('limit_exhausted requires exhaustedLimit.');
+  if (value.terminationReason !== 'limit_exhausted' && value.exhaustedLimit !== undefined)
+    issues.push('exhaustedLimit is only legal for limit_exhausted.');
+  issues.push(
+    ...modelTerminationIssues({
+      terminationReason: value.terminationReason,
+      ...(value.modelTerminationReason !== undefined
+        ? { modelTerminationReason: value.modelTerminationReason }
+        : {}),
+      ...(value.providerTerminationReason !== undefined
+        ? { providerTerminationReason: value.providerTerminationReason }
+        : {})
+    })
+  );
   if (issues.length > 0) throw contract('Invalid terminal snapshot.', issues);
   const checkResults = Object.freeze([...value.checkResults]);
-  const budget = Object.freeze({ ...value.budget, knownCosts: Object.freeze({ ...value.budget.knownCosts }) });
-  const cleanup = value.cleanupDiagnostic ? { cleanupDiagnostic: Object.freeze({ ...value.cleanupDiagnostic }) } : {};
-  if (value.executionStatus === 'completed') return Object.freeze({ ...value, modelOutput: Object.freeze({ ...value.modelOutput }), checkResults, budget, ...cleanup });
-  if (value.executionStatus === 'failed') return Object.freeze({ ...value, modelOutput: Object.freeze({ ...value.modelOutput }), checkResults, budget, ...cleanup });
-  return Object.freeze({ ...value, modelOutput: Object.freeze({ ...value.modelOutput }), checkResults, budget, ...cleanup });
+  const budget = Object.freeze({
+    ...value.budget,
+    knownCosts: Object.freeze({ ...value.budget.knownCosts })
+  });
+  const cleanup = value.cleanupDiagnostic
+    ? { cleanupDiagnostic: Object.freeze({ ...value.cleanupDiagnostic }) }
+    : {};
+  if (value.executionStatus === 'completed')
+    return Object.freeze({
+      ...value,
+      modelOutput: Object.freeze({ ...value.modelOutput }),
+      checkResults,
+      budget,
+      ...cleanup
+    });
+  if (value.executionStatus === 'failed')
+    return Object.freeze({
+      ...value,
+      modelOutput: Object.freeze({ ...value.modelOutput }),
+      checkResults,
+      budget,
+      ...cleanup
+    });
+  return Object.freeze({
+    ...value,
+    modelOutput: Object.freeze({ ...value.modelOutput }),
+    checkResults,
+    budget,
+    ...cleanup
+  });
 }
 
 export function decodeAgentTerminalSnapshot(value: unknown): AgentTerminalSnapshot {
@@ -509,37 +713,70 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
   let modelOutput: AgentModelOutput | undefined;
   try {
     const candidateValue = value.modelOutput;
-    if (candidateValue === undefined || !isJsonObject(candidateValue)) throw contract('Invalid modelOutput.', ['Model output must be a discriminated object.']);
+    if (candidateValue === undefined || !isJsonObject(candidateValue))
+      throw contract('Invalid modelOutput.', ['Model output must be a discriminated object.']);
     modelOutput = decodeOwnedAgentModelOutput(candidateValue);
-  } catch (error) { issues.push(errorMessage(error)); }
+  } catch (error) {
+    issues.push(errorMessage(error));
+  }
   const checkResults: AgentCheckResult[] = [];
   if (!isJsonArray(value.checkResults)) issues.push('checkResults must be an array.');
-  else for (const result of value.checkResults) {
-    try {
-      if (!isJsonObject(result)) throw contract('Invalid check result.', ['Check result must be an object.']);
-      checkResults.push(decodeOwnedAgentCheckResult(result));
-    } catch (error) { issues.push(errorMessage(error)); }
-  }
+  else
+    for (const result of value.checkResults) {
+      try {
+        if (!isJsonObject(result))
+          throw contract('Invalid check result.', ['Check result must be an object.']);
+        checkResults.push(decodeOwnedAgentCheckResult(result));
+      } catch (error) {
+        issues.push(errorMessage(error));
+      }
+    }
   const budget = isBudgetState(value.budget) ? value.budget : undefined;
   if (!budget) issues.push('budget is invalid.');
   if (value.executionStatus === 'completed') {
-    if (!modelOutput || modelOutput.status === 'absent') issues.push('Completed execution requires a present modelOutput.');
-    if (!oneOf(value.verificationStatus, ['not_required', 'passed', 'failed', 'inconclusive'])) issues.push('Completed execution has an invalid verification status.');
-    if (!oneOf(value.terminationReason, ['model_completed', 'model_output_limit', 'content_filtered', 'unknown_model_termination'])) issues.push('Completed execution has an invalid termination reason.');
-    if (modelOutput && modelOutput.status !== 'absent') issues.push(...completedModelOutputIssues(value.terminationReason, modelOutput.status));
+    if (!modelOutput || modelOutput.status === 'absent')
+      issues.push('Completed execution requires a present modelOutput.');
+    if (!oneOf(value.verificationStatus, ['not_required', 'passed', 'failed', 'inconclusive']))
+      issues.push('Completed execution has an invalid verification status.');
+    if (
+      !oneOf(value.terminationReason, [
+        'model_completed',
+        'model_output_limit',
+        'content_filtered',
+        'unknown_model_termination'
+      ])
+    )
+      issues.push('Completed execution has an invalid termination reason.');
+    if (modelOutput && modelOutput.status !== 'absent')
+      issues.push(...completedModelOutputIssues(value.terminationReason, modelOutput.status));
     if (value.errorMessage !== undefined) issues.push('Completed execution cannot have errorMessage.');
   } else if (value.executionStatus === 'failed') {
-    if (!oneOf(value.verificationStatus, ['not_required', 'not_run', 'passed', 'failed', 'inconclusive'])) issues.push('Failed execution has an invalid verification status.');
-    if (!oneOf(value.terminationReason, FAILURE_REASONS)) issues.push('Failed execution has an invalid termination reason.');
-    if (typeof value.errorMessage !== 'string' || value.errorMessage.trim().length === 0) issues.push('Failed execution requires errorMessage.');
+    if (!oneOf(value.verificationStatus, ['not_required', 'not_run', 'passed', 'failed', 'inconclusive']))
+      issues.push('Failed execution has an invalid verification status.');
+    if (!oneOf(value.terminationReason, FAILURE_REASONS))
+      issues.push('Failed execution has an invalid termination reason.');
+    if (typeof value.errorMessage !== 'string' || value.errorMessage.trim().length === 0)
+      issues.push('Failed execution requires errorMessage.');
   } else if (value.executionStatus === 'aborted') {
-    if (modelOutput && modelOutput.status !== 'absent' && modelOutput.status !== 'partial') issues.push('Aborted execution can only preserve a partial modelOutput.');
-    if (value.verificationStatus !== 'not_run' || value.terminationReason !== 'aborted') issues.push('Aborted execution must use aborted/not_run.');
-    if (typeof value.errorMessage !== 'string' || value.errorMessage.trim().length === 0) issues.push('Aborted execution requires errorMessage.');
+    if (modelOutput && modelOutput.status !== 'absent' && modelOutput.status !== 'partial')
+      issues.push('Aborted execution can only preserve a partial modelOutput.');
+    if (value.verificationStatus !== 'not_run' || value.terminationReason !== 'aborted')
+      issues.push('Aborted execution must use aborted/not_run.');
+    if (typeof value.errorMessage !== 'string' || value.errorMessage.trim().length === 0)
+      issues.push('Aborted execution requires errorMessage.');
   } else issues.push('executionStatus is invalid.');
-  if (value.terminationReason === 'limit_exhausted' && !oneOf(value.exhaustedLimit, AGENT_LIMIT_KINDS)) issues.push('limit_exhausted requires exhaustedLimit.');
-  if (value.terminationReason !== 'limit_exhausted' && value.exhaustedLimit !== undefined) issues.push('exhaustedLimit is only legal for limit_exhausted.');
-  if (value.cleanupDiagnostic !== undefined && (!isRecord(value.cleanupDiagnostic) || value.cleanupDiagnostic.kind !== 'process_cleanup' || typeof value.cleanupDiagnostic.message !== 'string' || value.cleanupDiagnostic.message.length === 0)) issues.push('cleanupDiagnostic is invalid.');
+  if (value.terminationReason === 'limit_exhausted' && !oneOf(value.exhaustedLimit, AGENT_LIMIT_KINDS))
+    issues.push('limit_exhausted requires exhaustedLimit.');
+  if (value.terminationReason !== 'limit_exhausted' && value.exhaustedLimit !== undefined)
+    issues.push('exhaustedLimit is only legal for limit_exhausted.');
+  if (
+    value.cleanupDiagnostic !== undefined &&
+    (!isRecord(value.cleanupDiagnostic) ||
+      value.cleanupDiagnostic.kind !== 'process_cleanup' ||
+      typeof value.cleanupDiagnostic.message !== 'string' ||
+      value.cleanupDiagnostic.message.length === 0)
+  )
+    issues.push('cleanupDiagnostic is invalid.');
   issues.push(...modelTerminationIssues(value));
   if (issues.length > 0) throw contract('Invalid terminal snapshot.', issues);
   if (!modelOutput) throw contract('Invalid terminal snapshot.', ['modelOutput is invalid.']);
@@ -552,25 +789,40 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
     modelOutput,
     checkResults: Object.freeze(checkResults),
     budget,
-    ...(value.modelTerminationReason !== undefined ? { modelTerminationReason: value.modelTerminationReason as ModelTerminationReason } : {}),
-    ...(typeof value.providerTerminationReason === 'string' ? { providerTerminationReason: value.providerTerminationReason } : {}),
+    ...(value.modelTerminationReason !== undefined
+      ? {
+          modelTerminationReason: value.modelTerminationReason as ModelTerminationReason
+        }
+      : {}),
+    ...(typeof value.providerTerminationReason === 'string'
+      ? { providerTerminationReason: value.providerTerminationReason }
+      : {}),
     ...(value.exhaustedLimit !== undefined ? { exhaustedLimit: value.exhaustedLimit as AgentLimitKind } : {}),
-    ...(value.cleanupDiagnostic !== undefined ? { cleanupDiagnostic: value.cleanupDiagnostic as { readonly kind: 'process_cleanup'; readonly message: string } } : {})
+    ...(value.cleanupDiagnostic !== undefined
+      ? {
+          cleanupDiagnostic: value.cleanupDiagnostic as {
+            readonly kind: 'process_cleanup';
+            readonly message: string;
+          }
+        }
+      : {})
   };
-  if (value.executionStatus === 'completed') return Object.freeze({
-    ...base,
-    executionStatus: 'completed',
-    modelOutput: modelOutput as AgentPresentModelOutput,
-    verificationStatus: value.verificationStatus as AgentCompletedVerificationStatus,
-    terminationReason: value.terminationReason as AgentCompletedTerminationReason
-  });
-  if (value.executionStatus === 'failed') return Object.freeze({
-    ...base,
-    executionStatus: 'failed',
-    verificationStatus: value.verificationStatus as AgentVerificationStatus,
-    terminationReason: value.terminationReason as AgentFailureTerminationReason,
-    errorMessage: value.errorMessage as string
-  });
+  if (value.executionStatus === 'completed')
+    return Object.freeze({
+      ...base,
+      executionStatus: 'completed',
+      modelOutput: modelOutput as AgentPresentModelOutput,
+      verificationStatus: value.verificationStatus as AgentCompletedVerificationStatus,
+      terminationReason: value.terminationReason as AgentCompletedTerminationReason
+    });
+  if (value.executionStatus === 'failed')
+    return Object.freeze({
+      ...base,
+      executionStatus: 'failed',
+      verificationStatus: value.verificationStatus as AgentVerificationStatus,
+      terminationReason: value.terminationReason as AgentFailureTerminationReason,
+      errorMessage: value.errorMessage as string
+    });
   return Object.freeze({
     ...base,
     executionStatus: 'aborted',
@@ -581,33 +833,68 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
   });
 }
 
-export function terminalSnapshotFingerprint(snapshot: AgentTerminalSnapshot): string { return canonicalJsonString(snapshot); }
+export function terminalSnapshotFingerprint(snapshot: AgentTerminalSnapshot): string {
+  return canonicalJsonString(snapshot);
+}
 const AGENT_LIMIT_KINDS: readonly AgentLimitKind[] = [
-  'model_turns', 'total_tool_calls', 'repeated_tool_calls', 'elapsed_time', 'prompt_tokens',
-  'completion_tokens', 'known_cost', 'consecutive_provider_failures', 'consecutive_tool_failures', 'revision_attempts'
+  'model_turns',
+  'total_tool_calls',
+  'repeated_tool_calls',
+  'elapsed_time',
+  'prompt_tokens',
+  'completion_tokens',
+  'known_cost',
+  'consecutive_provider_failures',
+  'consecutive_tool_failures',
+  'revision_attempts'
 ];
 const FAILURE_REASONS: readonly AgentFailureTerminationReason[] = [
-  'model_output_limit', 'content_filtered', 'unknown_model_termination', 'empty_response', 'malformed_response',
-  'provider_error', 'runtime_error', 'stream_interrupted', 'request_too_large', 'limit_exhausted', 'model_output_rejected', 'disposition_inconclusive'
+  'model_output_limit',
+  'content_filtered',
+  'unknown_model_termination',
+  'empty_response',
+  'malformed_response',
+  'provider_error',
+  'runtime_error',
+  'stream_interrupted',
+  'request_too_large',
+  'limit_exhausted',
+  'model_output_rejected',
+  'disposition_inconclusive'
 ];
 function terminalBaseIssues(value: Record<string, unknown>): string[] {
   const issues: string[] = [];
   if (!validIdentity(value.runId)) issues.push('runId must be non-empty and at most 256 UTF-8 bytes.');
-  if (!validIdentity(value.finalizationId)) issues.push('finalizationId must be non-empty and at most 256 UTF-8 bytes.');
+  if (!validIdentity(value.finalizationId))
+    issues.push('finalizationId must be non-empty and at most 256 UTF-8 bytes.');
   if (value.phase !== 'ended') issues.push('Terminal phase must be ended.');
-  if (typeof value.turnCount !== 'number' || !Number.isInteger(value.turnCount) || value.turnCount < 0) issues.push('turnCount must be a nonnegative integer.');
-  if (value.modelTerminationReason !== undefined && !oneOf(value.modelTerminationReason, ['stop', 'tool_calls', 'output_limit', 'content_filter', 'unknown'])) issues.push('modelTerminationReason is invalid.');
-  if (value.providerTerminationReason !== undefined && typeof value.providerTerminationReason !== 'string') issues.push('providerTerminationReason must be a string.');
+  if (typeof value.turnCount !== 'number' || !Number.isInteger(value.turnCount) || value.turnCount < 0)
+    issues.push('turnCount must be a nonnegative integer.');
+  if (
+    value.modelTerminationReason !== undefined &&
+    !oneOf(value.modelTerminationReason, ['stop', 'tool_calls', 'output_limit', 'content_filter', 'unknown'])
+  )
+    issues.push('modelTerminationReason is invalid.');
+  if (value.providerTerminationReason !== undefined && typeof value.providerTerminationReason !== 'string')
+    issues.push('providerTerminationReason must be a string.');
   return issues;
 }
 function modelTerminationIssues(value: Record<string, unknown>): string[] {
   const mapping: Partial<Record<string, ModelTerminationReason>> = {
-    model_completed: 'stop', model_output_limit: 'output_limit', content_filtered: 'content_filter', unknown_model_termination: 'unknown'
+    model_completed: 'stop',
+    model_output_limit: 'output_limit',
+    content_filtered: 'content_filter',
+    unknown_model_termination: 'unknown'
   };
   const expected = typeof value.terminationReason === 'string' ? mapping[value.terminationReason] : undefined;
-  return expected !== undefined && value.modelTerminationReason !== expected ? [`${String(value.terminationReason)} requires modelTerminationReason ${expected}.`] : [];
+  return expected !== undefined && value.modelTerminationReason !== expected
+    ? [`${String(value.terminationReason)} requires modelTerminationReason ${expected}.`]
+    : [];
 }
-function completedModelOutputIssues(terminationReason: unknown, candidateStatus: AgentPresentModelOutput['status']): string[] {
+function completedModelOutputIssues(
+  terminationReason: unknown,
+  candidateStatus: AgentPresentModelOutput['status']
+): string[] {
   const expected: Partial<Record<AgentCompletedTerminationReason, AgentPresentModelOutput['status']>> = {
     model_completed: 'complete',
     model_output_limit: 'partial',
@@ -621,40 +908,140 @@ function completedModelOutputIssues(terminationReason: unknown, candidateStatus:
 }
 function isBudgetState(value: unknown): value is AgentRunBudgetState {
   if (!isRecord(value)) return false;
-  const names = ['modelTurns', 'totalToolCalls', 'repeatedIdenticalToolCalls', 'revisionAttempts', 'elapsedMs', 'promptTokens', 'completionTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'unknownPricedTokens', 'consecutiveProviderFailures', 'consecutiveToolFailures'];
-  if (!names.every((name) => typeof value[name] === 'number' && Number.isFinite(value[name]) && Number.isInteger(value[name]) && (value[name]) >= 0)) return false;
-  return finiteNonnegativeNumberRecord(value.knownCosts)
-    && oneOf(value.pricingStatus, ['known', 'partial', 'unknown']);
+  const names = [
+    'modelTurns',
+    'totalToolCalls',
+    'repeatedIdenticalToolCalls',
+    'revisionAttempts',
+    'elapsedMs',
+    'promptTokens',
+    'completionTokens',
+    'cacheReadTokens',
+    'cacheWriteTokens',
+    'reasoningTokens',
+    'unknownPricedTokens',
+    'consecutiveProviderFailures',
+    'consecutiveToolFailures'
+  ];
+  if (
+    !names.every(
+      (name) =>
+        typeof value[name] === 'number' &&
+        Number.isFinite(value[name]) &&
+        Number.isInteger(value[name]) &&
+        value[name] >= 0
+    )
+  )
+    return false;
+  return (
+    finiteNonnegativeNumberRecord(value.knownCosts) &&
+    oneOf(value.pricingStatus, ['known', 'partial', 'unknown'])
+  );
 }
 function isCheckDiagnostic(value: unknown): value is AgentCheckDiagnostic {
-  return isRecord(value) && oneOf(value.kind, ['exception', 'timeout', 'unavailable', 'permission_denied', 'aborted', 'invalid_result'])
-    && typeof value.message === 'string';
+  return (
+    isRecord(value) &&
+    oneOf(value.kind, [
+      'exception',
+      'timeout',
+      'unavailable',
+      'permission_denied',
+      'aborted',
+      'invalid_result'
+    ]) &&
+    typeof value.message === 'string'
+  );
 }
-function decodeNormalizationDiagnostics(value: JsonValue): readonly JsonNormalizationDiagnostic[] | undefined {
+function decodeNormalizationDiagnostics(
+  value: JsonValue
+): readonly JsonNormalizationDiagnostic[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const diagnostics: JsonNormalizationDiagnostic[] = [];
   for (const item of value) {
-    if (!isRecord(item) || !NORMALIZATION_CODES.has(String(item.code)) || typeof item.path !== 'string' || typeof item.message !== 'string') return undefined;
-    diagnostics.push(Object.freeze({ code: item.code as JsonNormalizationDiagnostic['code'], path: item.path, message: item.message }));
+    if (
+      !isRecord(item) ||
+      !NORMALIZATION_CODES.has(String(item.code)) ||
+      typeof item.path !== 'string' ||
+      typeof item.message !== 'string'
+    )
+      return undefined;
+    diagnostics.push(
+      Object.freeze({
+        code: item.code as JsonNormalizationDiagnostic['code'],
+        path: item.path,
+        message: item.message
+      })
+    );
   }
   return Object.freeze(diagnostics);
 }
-const NORMALIZATION_CODES = new Set(['access_error', 'accessor', 'bigint', 'binary', 'circular', 'collection_truncated', 'depth_truncated', 'error', 'function', 'invalid_date', 'symbol', 'text_truncated', 'total_bytes_truncated', 'unsupported']);
+const NORMALIZATION_CODES = new Set([
+  'access_error',
+  'accessor',
+  'bigint',
+  'binary',
+  'circular',
+  'collection_truncated',
+  'depth_truncated',
+  'error',
+  'function',
+  'invalid_date',
+  'symbol',
+  'text_truncated',
+  'total_bytes_truncated',
+  'unsupported'
+]);
 function isArtifactRef(value: unknown): value is ArtifactRef {
-  return isRecord(value) && typeof value.artifactId === 'string' && typeof value.sha256 === 'string'
-    && typeof value.size === 'number' && Number.isInteger(value.size) && value.size >= 0 && typeof value.mediaType === 'string';
+  return (
+    isRecord(value) &&
+    typeof value.artifactId === 'string' &&
+    typeof value.sha256 === 'string' &&
+    typeof value.size === 'number' &&
+    Number.isInteger(value.size) &&
+    value.size >= 0 &&
+    typeof value.mediaType === 'string'
+  );
 }
 function finiteNonnegativeNumberRecord(value: unknown): boolean {
   if (!isRecord(value)) return false;
   const descriptors = Object.getOwnPropertyDescriptors(value);
-  return Object.values(descriptors).every((descriptor) => 'value' in descriptor && typeof descriptor.value === 'number' && Number.isFinite(descriptor.value) && descriptor.value >= 0);
+  return Object.values(descriptors).every(
+    (descriptor) =>
+      'value' in descriptor &&
+      typeof descriptor.value === 'number' &&
+      Number.isFinite(descriptor.value) &&
+      descriptor.value >= 0
+  );
 }
-function positiveInteger(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value > 0; }
-function validIdentity(value: unknown): value is string { return typeof value === 'string' && value.trim().length > 0 && Buffer.byteLength(value, 'utf8') <= 256; }
-function isCompletedTerminationReason(value: unknown): value is AgentCompletedTerminationReason { return oneOf(value, ['model_completed', 'model_output_limit', 'content_filtered', 'unknown_model_termination']); }
-function oneOf<T extends string>(value: unknown, values: readonly T[]): value is T { return typeof value === 'string' && values.some((modelOutput) => modelOutput === value); }
-function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
-function isJsonObject(value: JsonValue): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }
-function isJsonArray(value: JsonValue | undefined): value is readonly JsonValue[] { return Array.isArray(value); }
-function contract(message: string, issues: string[]): AgentContractError { return new AgentContractError(message, issues); }
-function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+function positiveInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value > 0;
+}
+function validIdentity(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0 && Buffer.byteLength(value, 'utf8') <= 256;
+}
+function isCompletedTerminationReason(value: unknown): value is AgentCompletedTerminationReason {
+  return oneOf(value, [
+    'model_completed',
+    'model_output_limit',
+    'content_filtered',
+    'unknown_model_termination'
+  ]);
+}
+function oneOf<T extends string>(value: unknown, values: readonly T[]): value is T {
+  return typeof value === 'string' && values.some((modelOutput) => modelOutput === value);
+}
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+function isJsonObject(value: JsonValue): value is JsonObject {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+function isJsonArray(value: JsonValue | undefined): value is readonly JsonValue[] {
+  return Array.isArray(value);
+}
+function contract(message: string, issues: string[]): AgentContractError {
+  return new AgentContractError(message, issues);
+}
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

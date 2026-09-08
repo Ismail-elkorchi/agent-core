@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ModelContractError,
-  SimpleTokenEstimator,
+  CompleteRequestEstimator,
   assertModelRequestSupported,
   parseModelProfile,
   parseModelRequest,
@@ -41,8 +41,8 @@ test('tool-result images validate, require image input support, and consume esti
   assert.throws(() => assertModelRequestSupported(profile, request), error => error instanceof ModelContractError && /image input/u.test(error.message));
   const imageProfile = parseModelProfile({ ...profile, modalities: { input: ['text', 'image'], output: ['text'] } });
   assert.doesNotThrow(() => assertModelRequestSupported(imageProfile, request));
-  const estimator = new SimpleTokenEstimator();
-  assert.ok(estimator.estimateMessages(request.messages) >= estimator.estimateImage(request.messages[0].images[0]));
+  const estimator = new CompleteRequestEstimator();
+  assert.ok(estimator.estimateItems(request.messages) >= estimator.estimateImage(request.messages[0].images[0]));
   assert.ok(estimator.estimateImage(request.messages[0].images[0]) > 0);
 });
 
@@ -105,7 +105,7 @@ test('model responses and terminal stream events own every nested provider value
     content: 'done', model: 'test', provider: 'provider', terminationReason: 'tool_calls',
     toolCalls: [{ id: 'call', type: 'function', name: 'read_files', input: { kind: 'json', value: { paths: ['a.txt'] } } }],
     usage: { promptTokens: 4, completionTokens: 2, totalTokens: 6 },
-    providerState: { provider: 'provider', model: 'test', kind: 'continuation', data: { responseId: 'one' } },
+    providerState: { version: 1, provider: 'provider', model: 'test', endpoint: 'https://provider.test/messages', kind: 'continuation', origin: { requestId: 'request-1', inputIdentity: 'sha256:original' }, compatibility: { model: 'test', endpoint: 'https://provider.test/messages', requiresExactPrefix: true }, replay: 'required', data: { responseId: 'one' } },
     transport: { provider: 'provider', strategy: 'http', responseId: 'response' },
     timings: { total: 10 },
     raw: { nested: ['provider-owned'] }

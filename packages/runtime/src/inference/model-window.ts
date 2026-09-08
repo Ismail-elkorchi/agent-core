@@ -1,11 +1,15 @@
+import { accountModelRequest } from '@agent-core/model';
 import { randomUUID } from 'node:crypto';
 import {
-  type ModelMessage,
+  type ModelInputItem,
+  type ModelOutputItem,
+  modelOutputToInput,
+  parseModelInputItem,
   type ModelImage,
   type ModelProfile,
   type ModelToolCall,
-  SimpleTokenEstimator,
-  type TokenEstimator
+  CompleteRequestEstimator,
+  type RequestEstimator
 } from '@agent-core/model';
 import type { PublicArtifactRef } from '@agent-core/persistence';
 import { ownObservedFactRecord, type ObservedFactRecord } from '@agent-core/tools';
@@ -13,7 +17,7 @@ import { parseJsonObject, type JsonObject } from '@agent-core/json';
 import type { PromptObservedFactsMaterial, PromptObservedFactsOmissionSummary } from './prompt-material.js';
 
 export interface ModelWindowMessages {
-  readonly messages: readonly ModelMessage[];
+  readonly messages: readonly ModelInputItem[];
   readonly estimatedTokens: number;
   readonly reductions: readonly ModelWindowReduction[];
 }
@@ -37,7 +41,7 @@ export interface ModelWindowPressureReduction {
 
 export interface ModelWindowReduction {
   readonly itemId: string;
-  readonly kind: 'tool_result_reduced' | 'checkpoint_installed' | 'image_content_removed';
+  readonly kind: 'tool_result_reduced' | 'image_content_removed';
   readonly beforeBytes: number;
   readonly afterBytes: number;
   readonly toolName?: string;
@@ -47,42 +51,33 @@ export interface ModelWindowReduction {
   readonly reason?: 'unsupported_modality' | 'image_count_limit' | 'image_byte_limit' | 'image_token_limit';
 }
 
-type ContextHistoryItem =
-  | ContextAssistantToolCallItem
-  | ContextToolResultItem
-  | ContextCheckpointItem;
+type ActiveWindowItem = ActiveMessageItem | ActiveToolResultItem;
 
-interface ContextAssistantToolCallItem {
-  kind: 'assistant_tool_call';
+interface ActiveMessageItem {
+  kind: 'message';
   id: string;
   turnIndex: number;
-  message: ModelMessage;
+  message: ModelInputItem;
 }
 
-interface ContextToolResultItem {
+interface ActiveToolResultItem {
   kind: 'tool_result';
   id: string;
   turnIndex: number;
   toolName: string;
   toolCallType: 'function' | 'custom';
   callId?: string;
-  immediateMessage: ModelMessage;
-  retainedMessage: ModelMessage;
+  immediateMessage: ModelInputItem;
+  retainedMessage: ModelInputItem;
   imageArtifacts: readonly PublicArtifactRef[];
   useRetained: boolean;
 }
 
-interface ContextCheckpointItem {
-  kind: 'checkpoint';
-  id: string;
-  message: ModelMessage;
-  removedItems: number;
-}
-
 export interface RecordModelOutputInput {
+  readonly output?: readonly ModelOutputItem[];
   turnIndex: number;
   content: string;
-  toolCalls: ModelToolCall[];
+  toolCalls: readonly ModelToolCall[];
 }
 
 export interface RecordToolResultInput {
@@ -98,37 +93,58 @@ export interface RecordToolResultInput {
   observedFacts?: readonly ObservedFactRecord[];
 }
 
-export interface RecordCheckpointInput {
-  content: string;
-  removedItems?: number;
-}
-
 export interface ModelWindowSnapshot {
   readonly activeItems: number;
   readonly compactedToolResults: number;
-  readonly checkpoints: number;
   readonly observedFactRecords: number;
 }
 
 export class ModelWindow {
-  private readonly estimator: TokenEstimator;
-  private readonly historyItems: ContextHistoryItem[] = [];
+  private readonly estimator: RequestEstimator;
+  private readonly activeItems: ActiveWindowItem[] = [];
+  private readonly priorItems = new Map<string, ModelInputItem>();
   private readonly observedFactRecords: ObservedFactRecord[] = [];
   private readonly pendingReductions: ModelWindowReduction[] = [];
   private readonly imageLimits: ModelWindowImageLimits;
 
-  constructor(estimator: TokenEstimator = new SimpleTokenEstimator(), imageLimits: ModelWindowImageLimits = DEFAULT_MODEL_WINDOW_IMAGE_LIMITS) {
+  constructor(
+    estimator: RequestEstimator = new CompleteRequestEstimator(),
+    imageLimits: ModelWindowImageLimits = DEFAULT_MODEL_WINDOW_IMAGE_LIMITS
+  ) {
     this.estimator = estimator;
-    if (![imageLimits.maxCount, imageLimits.maxBytes, imageLimits.maxEstimatedTokens].every((value) => Number.isSafeInteger(value) && value > 0)) throw new Error('Context image limits must be positive safe integers.');
+    if (
+      ![imageLimits.maxCount, imageLimits.maxBytes, imageLimits.maxEstimatedTokens].every(
+        (value) => Number.isSafeInteger(value) && value > 0
+      )
+    )
+      throw new Error('Context image limits must be positive safe integers.');
     this.imageLimits = Object.freeze({ ...imageLimits });
   }
 
-  recordModelOutput(input: RecordModelOutputInput): void {
-    if (input.toolCalls.length === 0) {
+  recordInput(sourceId: string, message: ModelInputItem, turnIndex = 0): void {
+    const existing = this.activeItems.find((item) => item.id === sourceId);
+    if (existing) {
+      if (existing.kind !== 'message' || JSON.stringify(existing.message) !== JSON.stringify(message))
+        throw new Error('Active source identity changed.');
       return;
     }
-    this.historyItems.push({
-      kind: 'assistant_tool_call',
+    this.activeItems.push({
+      kind: 'message',
+      id: sourceId,
+      turnIndex,
+      message: parseModelInputItem(message)
+    });
+  }
+
+  recordModelOutput(input: RecordModelOutputInput): void {
+    if (input.output?.length) {
+      for (const item of modelOutputToInput(input.output))
+        this.recordInput(`output_${randomUUID()}`, item, input.turnIndex);
+      return;
+    }
+
+    this.activeItems.push({
+      kind: 'message',
       id: `hist_${randomUUID()}`,
       turnIndex: input.turnIndex,
       message: Object.freeze({
@@ -139,12 +155,8 @@ export class ModelWindow {
     });
   }
 
-  recordToolCall(input: RecordModelOutputInput): void {
-    this.recordModelOutput(input);
-  }
-
   recordToolResult(input: RecordToolResultInput): void {
-    const item: ContextToolResultItem = {
+    const item: ActiveToolResultItem = {
       kind: 'tool_result',
       id: `hist_${randomUUID()}`,
       turnIndex: input.turnIndex,
@@ -152,42 +164,73 @@ export class ModelWindow {
       toolCallType: input.toolCallType,
       immediateMessage: toolResultMessage(input, 'immediate'),
       retainedMessage: toolResultMessage(input, 'retained'),
-      imageArtifacts: Object.freeze((input.imageArtifacts ?? []).map((artifact) => Object.freeze({ ...artifact }))),
+      imageArtifacts: Object.freeze(
+        (input.imageArtifacts ?? []).map((artifact) => Object.freeze({ ...artifact }))
+      ),
       useRetained: input.useRetained ?? false
     };
     if (input.callId) {
       item.callId = input.callId;
     }
-    this.historyItems.push(item);
+    this.activeItems.push(item);
     this.observedFactRecords.push(...compactObservedFactRecords(input.observedFacts ?? []));
+  }
+
+  toolResult(callId: string): Extract<ModelInputItem, { readonly role: 'tool' }> | undefined {
+    const item = this.activeItems.find((item) => item.kind === 'tool_result' && item.callId === callId);
+    if (item?.kind !== 'tool_result') return undefined;
+    const message = item.useRetained ? item.retainedMessage : item.immediateMessage;
+    return message.role === 'tool' ? message : undefined;
   }
 
   recordObservedFacts(records: readonly ObservedFactRecord[]): void {
     this.observedFactRecords.push(...compactObservedFactRecords(records));
   }
 
-  recordCheckpoint(input: RecordCheckpointInput): void {
-    const content = input.content.trim();
-    if (content.length === 0) {
-      return;
-    }
-    this.historyItems.push({
-      kind: 'checkpoint',
-      id: `hist_${randomUUID()}`,
-      message: {
-        role: 'user',
-        content
-      },
-      removedItems: input.removedItems ?? 0
+  /** Original selected source content, keyed by its immutable history reference. */
+  recordSourceItem(sourceId: string, message: ModelInputItem): void {
+    const prior = this.priorItems.get(sourceId);
+    if (prior && JSON.stringify(prior) !== JSON.stringify(message))
+      throw new Error(`History source ${sourceId} changed its immutable content.`);
+    this.priorItems.set(sourceId, parseModelInputItem(message));
+  }
+
+  activateSources(window: ModelWindow): void {
+    this.priorItems.clear();
+    for (const [source, item] of window.priorItems) this.priorItems.set(source, item);
+  }
+
+  priorMessagesFor(modelProfile: ModelProfile): ModelWindowMessages {
+    const entries = [...this.priorItems].map(([itemId, message]) => ({
+      itemId,
+      message,
+      imageArtifacts: []
+    }));
+    const selected = selectImagesForProfile(entries, modelProfile, this.imageLimits, this.estimator);
+    return Object.freeze({
+      messages: Object.freeze(normalizeToolProtocolMessages(selected.messages)),
+      estimatedTokens: accountModelRequest(
+        { model: modelProfile.id, messages: selected.messages },
+        modelProfile,
+        { estimator: this.estimator }
+      ).estimatedInputTokens,
+      reductions: Object.freeze(selected.reductions)
     });
   }
 
   messagesFor(modelProfile: ModelProfile): ModelWindowMessages {
-    const selectedImages = selectImagesForProfile(this.contextHistoryEntries(), modelProfile, this.imageLimits, this.estimator);
+    const selectedImages = selectImagesForProfile(
+      this.contextHistoryEntries(),
+      modelProfile,
+      this.imageLimits,
+      this.estimator
+    );
     const messages = normalizeToolProtocolMessages(selectedImages.messages);
     return Object.freeze({
       messages: Object.freeze(messages),
-      estimatedTokens: this.estimator.estimateMessages(messages),
+      estimatedTokens: accountModelRequest({ model: modelProfile.id, messages }, modelProfile, {
+        estimator: this.estimator
+      }).estimatedInputTokens,
       reductions: Object.freeze(selectedImages.reductions)
     });
   }
@@ -199,23 +242,36 @@ export class ModelWindow {
   }): ModelWindowPressureReduction {
     let assembly = this.messagesFor(input.modelProfile);
     if (assembly.estimatedTokens <= input.maxHistoryTokens) {
-      return Object.freeze({ reductions: Object.freeze([]), retainedTokens: assembly.estimatedTokens });
+      return Object.freeze({
+        reductions: Object.freeze([]),
+        retainedTokens: assembly.estimatedTokens
+      });
     }
 
-    const reductions = [...this.reduceOlderLargeToolResults({
-      keepLatestToolResults: input.keepLatestToolResults ?? 2
-    })];
+    const reductions = [
+      ...this.reduceOlderLargeToolResults({
+        keepLatestToolResults: input.keepLatestToolResults ?? 2
+      })
+    ];
     assembly = this.messagesFor(input.modelProfile);
     if (assembly.estimatedTokens <= input.maxHistoryTokens) {
-      return Object.freeze({ reductions: Object.freeze(reductions), retainedTokens: assembly.estimatedTokens });
+      return Object.freeze({
+        reductions: Object.freeze(reductions),
+        retainedTokens: assembly.estimatedTokens
+      });
     }
 
-    reductions.push(...this.reduceOlderLargeToolResults({
-      keepLatestToolResults: 0,
-      includeLatest: true
-    }));
+    reductions.push(
+      ...this.reduceOlderLargeToolResults({
+        keepLatestToolResults: 0,
+        includeLatest: true
+      })
+    );
     assembly = this.messagesFor(input.modelProfile);
-    return Object.freeze({ reductions: Object.freeze(reductions), retainedTokens: assembly.estimatedTokens });
+    return Object.freeze({
+      reductions: Object.freeze(reductions),
+      retainedTokens: assembly.estimatedTokens
+    });
   }
 
   selectObservedFacts(maxTokens: number): PromptObservedFactsMaterial {
@@ -275,8 +331,13 @@ export class ModelWindow {
     return Object.freeze([...this.observedFactRecords]);
   }
 
-  reduceOlderLargeToolResults(options: { keepLatestToolResults: number; includeLatest?: boolean }): readonly ModelWindowReduction[] {
-    const toolItems = this.historyItems.filter((item): item is ContextToolResultItem => item.kind === 'tool_result');
+  reduceOlderLargeToolResults(options: {
+    keepLatestToolResults: number;
+    includeLatest?: boolean;
+  }): readonly ModelWindowReduction[] {
+    const toolItems = this.activeItems.filter(
+      (item): item is ActiveToolResultItem => item.kind === 'tool_result'
+    );
     const keepLatest = Math.max(0, options.keepLatestToolResults);
     const latestKeepStart = Math.max(0, toolItems.length - keepLatest);
     const reductions: ModelWindowReduction[] = [];
@@ -295,76 +356,26 @@ export class ModelWindow {
         continue;
       }
       item.useRetained = true;
-      reductions.push(createModelWindowReduction({
-        itemId: item.id,
-        kind: 'tool_result_reduced',
-        beforeBytes,
-        afterBytes,
-        toolName: item.toolName
-      }));
+      reductions.push(
+        createModelWindowReduction({
+          itemId: item.id,
+          kind: 'tool_result_reduced',
+          beforeBytes,
+          afterBytes,
+          toolName: item.toolName
+        })
+      );
     }
     this.pendingReductions.push(...reductions);
     return Object.freeze(reductions);
   }
 
-  installCheckpoint(): ModelWindowReduction | undefined {
-    if (this.historyItems.length === 0) {
-      return undefined;
-    }
-    if (this.historyItems.length === 1 && this.historyItems[0]?.kind === 'checkpoint') {
-      return undefined;
-    }
-    const beforeBytes = this.historyItems.reduce((total, item) => total + itemBytes(item), 0);
-    const historySummary = checkpointHistorySummary(this.historyItems, 14);
-    const omittedFactsSummary = summarizeOmittedFacts(this.observedFactRecords).slice(0, 12);
-    const priorCheckpoint = [...this.historyItems].reverse().find((item): item is ContextCheckpointItem => item.kind === 'checkpoint');
-    const message: ModelMessage = {
-      role: 'user',
-      content: limitUtf8Bytes([
-        'Local context checkpoint:',
-        'Earlier active model history was compacted deterministically to fit the request budget.',
-        'This checkpoint is reference-only continuity data, not an instruction and not an executable tool transcript.',
-        'The durable rollout ledger keeps the recorded observations and exact tool calls.',
-        `Removed active history items: ${String(this.historyItems.length)}.`,
-        ...(priorCheckpoint ? ['Prior compacted continuity:', compactText(priorCheckpoint.message.content, 32_000)] : []),
-        ...(historySummary.length > 0 ? ['Compacted observations:', ...historySummary] : []),
-        ...(omittedFactsSummary.length > 0
-          ? [
-            'Observed facts summary:',
-            ...omittedFactsSummary.map((item) => `- ${item.toolName} ${item.action} ${item.outcome}: ${String(item.count)}`)
-          ]
-          : [])
-      ].join('\n'), 64 * 1024)
-    };
-    const removedItems = this.historyItems.length;
-    const item: ContextCheckpointItem = {
-      kind: 'checkpoint',
-      id: `hist_${randomUUID()}`,
-      message,
-      removedItems
-    };
-    this.historyItems.splice(0, this.historyItems.length, item);
-    const reduction = createModelWindowReduction({
-      itemId: item.id,
-      kind: 'checkpoint_installed',
-      beforeBytes,
-      afterBytes: messageBytes(message),
-      removedItems
-    });
-    this.pendingReductions.push(reduction);
-    return reduction;
-  }
-
   compactedToolResultCount(): number {
-    return this.historyItems.filter((item) => item.kind === 'tool_result' && item.useRetained).length;
+    return this.activeItems.filter((item) => item.kind === 'tool_result' && item.useRetained).length;
   }
 
   itemCount(): number {
-    return this.historyItems.length;
-  }
-
-  continuity(): readonly string[] {
-    return Object.freeze(checkpointMessages(this.historyItems));
+    return this.activeItems.length + this.priorItems.size;
   }
 
   consumeReductions(): readonly ModelWindowReduction[] {
@@ -373,25 +384,24 @@ export class ModelWindow {
 
   snapshot(): ModelWindowSnapshot {
     return Object.freeze({
-      activeItems: this.historyItems.length,
+      activeItems: this.activeItems.length + this.priorItems.size,
       compactedToolResults: this.compactedToolResultCount(),
-      checkpoints: this.historyItems.filter((item) => item.kind === 'checkpoint').length,
       observedFactRecords: this.observedFactRecords.length
     });
   }
 
   private contextHistoryEntries(): WindowMessageEntry[] {
-    return this.historyItems.map((item) => {
-      if (item.kind === 'assistant_tool_call') {
+    return this.activeItems.map((item) => {
+      if (item.kind === 'message') {
         return { itemId: item.id, message: item.message, imageArtifacts: [] };
       }
-      if (item.kind === 'checkpoint') {
-        return undefined;
-      }
-      return { itemId: item.id, message: item.useRetained ? item.retainedMessage : item.immediateMessage, imageArtifacts: item.imageArtifacts };
-    }).filter((entry): entry is WindowMessageEntry => entry !== undefined);
+      return {
+        itemId: item.id,
+        message: item.useRetained ? item.retainedMessage : item.immediateMessage,
+        imageArtifacts: item.imageArtifacts
+      };
+    });
   }
-
 }
 
 function compactObservedFactRecords(records: readonly ObservedFactRecord[]): ObservedFactRecord[] {
@@ -409,7 +419,9 @@ function compactObservedFactRecords(records: readonly ObservedFactRecord[]): Obs
   });
 }
 
-function compactObservationScope(scope: NonNullable<ObservedFactRecord['scope']>): NonNullable<ObservedFactRecord['scope']> {
+function compactObservationScope(
+  scope: NonNullable<ObservedFactRecord['scope']>
+): NonNullable<ObservedFactRecord['scope']> {
   const next = { ...scope };
   if (next.filters) {
     next.filters = compactJsonObject(next.filters, 1_000);
@@ -426,8 +438,11 @@ function compactObservationScope(scope: NonNullable<ObservedFactRecord['scope']>
 function fitOmittedSummary(
   records: readonly ObservedFactRecord[],
   maxTokens: number,
-  estimator: TokenEstimator
-): { readonly summary: readonly PromptObservedFactsOmissionSummary[]; readonly tokens: number } {
+  estimator: RequestEstimator
+): {
+  readonly summary: readonly PromptObservedFactsOmissionSummary[];
+  readonly tokens: number;
+} {
   if (records.length === 0 || maxTokens <= 0) {
     return Object.freeze({ summary: Object.freeze([]), tokens: 0 });
   }
@@ -445,8 +460,18 @@ function fitOmittedSummary(
   return Object.freeze({ summary: Object.freeze(selected), tokens });
 }
 
-function summarizeOmittedFacts(records: readonly ObservedFactRecord[]): readonly PromptObservedFactsOmissionSummary[] {
-  const groups = new Map<string, { toolName: string; action: ObservedFactRecord['action']; outcome: ObservedFactRecord['outcome']; count: number }>();
+function summarizeOmittedFacts(
+  records: readonly ObservedFactRecord[]
+): readonly PromptObservedFactsOmissionSummary[] {
+  const groups = new Map<
+    string,
+    {
+      toolName: string;
+      action: ObservedFactRecord['action'];
+      outcome: ObservedFactRecord['outcome'];
+      count: number;
+    }
+  >();
   for (const record of records) {
     const key = [record.toolName, record.action, record.outcome].join('\0');
     const existing = groups.get(key);
@@ -461,73 +486,22 @@ function summarizeOmittedFacts(records: readonly ObservedFactRecord[]): readonly
       count: 1
     });
   }
-  return Object.freeze([...groups.values()].sort((left, right) => {
-    if (right.count !== left.count) {
-      return right.count - left.count;
-    }
-    if (left.toolName !== right.toolName) {
-      return left.toolName.localeCompare(right.toolName);
-    }
-    if (left.action !== right.action) {
-      return left.action.localeCompare(right.action);
-    }
-    return left.outcome.localeCompare(right.outcome);
-  }).map((item) => Object.freeze({ ...item })));
-}
-
-function checkpointHistorySummary(items: readonly ContextHistoryItem[], maxItems: number): string[] {
-  const summaries = items
-    .flatMap((item) => {
-      if (item.kind === 'assistant_tool_call') {
-        const summary = checkpointAssistantSummary(item);
-        return summary ? [summary] : [];
-      }
-      if (item.kind === 'tool_result') {
-        const summary = checkpointToolResultSummary(item);
-        return summary ? [summary] : [];
-      }
-      return [];
-    });
-  return summaries.slice(-maxItems);
-}
-
-function checkpointAssistantSummary(item: ContextAssistantToolCallItem): string | undefined {
-  const content = item.message.content.replace(/\s+/g, ' ').trim();
-  if (content.length === 0) {
-    return undefined;
-  }
-  return `- turnIndex ${String(item.turnIndex)} assistant: ${compactText(content, 360)}`;
-}
-
-function checkpointToolResultSummary(item: ContextToolResultItem): string {
-  const message = item.retainedMessage;
-  const presentation = parseToolObservationPresentationSummary(message.content);
-  const parts = [
-    `turnIndex ${String(item.turnIndex)}`,
-    item.toolName,
-    presentation.ok === undefined ? undefined : presentation.ok ? 'ok' : 'failed'
-  ].filter((part): part is string => typeof part === 'string' && part.length > 0);
-  const summary = compactText(presentation.summary ?? message.content.replace(/\s+/g, ' ').trim(), 360);
-  return `- ${parts.join(' ')}: ${summary}`;
-}
-
-function parseToolObservationPresentationSummary(content: string): { ok?: boolean; summary?: string } {
-  try {
-    const parsed = JSON.parse(content) as unknown;
-    if (!isRecord(parsed)) {
-      return {};
-    }
-    return {
-      ...(typeof parsed.ok === 'boolean' ? { ok: parsed.ok } : {}),
-      ...(typeof parsed.summary === 'string' ? { summary: parsed.summary } : {})
-    };
-  } catch {
-    return {};
-  }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+  return Object.freeze(
+    [...groups.values()]
+      .sort((left, right) => {
+        if (right.count !== left.count) {
+          return right.count - left.count;
+        }
+        if (left.toolName !== right.toolName) {
+          return left.toolName.localeCompare(right.toolName);
+        }
+        if (left.action !== right.action) {
+          return left.action.localeCompare(right.action);
+        }
+        return left.outcome.localeCompare(right.outcome);
+      })
+      .map((item) => Object.freeze({ ...item }))
+  );
 }
 
 function compactJsonObject(value: JsonObject, maxBytes: number): JsonObject {
@@ -545,21 +519,14 @@ function compactText(value: string, maxChars: number): string {
   return value.length <= maxChars ? value : `${value.slice(0, maxChars)}...`;
 }
 
-function limitUtf8Bytes(value: string, maxBytes: number): string {
-  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
-  let end = Math.min(value.length, maxBytes);
-  while (end > 0 && Buffer.byteLength(value.slice(0, end), 'utf8') > maxBytes) end -= Math.max(1, Math.floor(end * 0.05));
-  return value.slice(0, end);
-}
-
 interface WindowMessageEntry {
   readonly itemId: string;
-  readonly message: ModelMessage;
+  readonly message: ModelInputItem;
   readonly imageArtifacts: readonly PublicArtifactRef[];
 }
 
 interface SelectedWindowImages {
-  readonly messages: ModelMessage[];
+  readonly messages: ModelInputItem[];
   readonly reductions: ModelWindowReduction[];
 }
 
@@ -567,12 +534,19 @@ function selectImagesForProfile(
   entries: readonly WindowMessageEntry[],
   profile: ModelProfile,
   limits: ModelWindowImageLimits,
-  estimator: TokenEstimator
+  estimator: RequestEstimator
 ): SelectedWindowImages {
   const supportsImages = profile.modalities.input.includes('image');
-  const images = entries.flatMap((entry, messageIndex) => (entry.message.images ?? []).map((image, imageIndex) => ({
-    entry, messageIndex, imageIndex, image, bytes: imageByteLength(image), tokens: estimator.estimateImage(image)
-  })));
+  const images = entries.flatMap((entry, messageIndex) =>
+    (entry.message.images ?? []).map((image, imageIndex) => ({
+      entry,
+      messageIndex,
+      imageIndex,
+      image,
+      bytes: imageByteLength(image),
+      tokens: estimator.estimateImage(image)
+    }))
+  );
   const kept = new Set<string>();
   const removalReasons = new Map<string, ModelWindowReduction['reason']>();
   let activeCount = 0;
@@ -586,13 +560,14 @@ function selectImagesForProfile(
       removalReasons.set(key, 'unsupported_modality');
       continue;
     }
-    const reason = activeCount + 1 > limits.maxCount
-      ? 'image_count_limit'
-      : activeBytes + modelOutput.bytes > limits.maxBytes
-        ? 'image_byte_limit'
-        : activeTokens + modelOutput.tokens > limits.maxEstimatedTokens
-          ? 'image_token_limit'
-          : undefined;
+    const reason =
+      activeCount + 1 > limits.maxCount
+        ? 'image_count_limit'
+        : activeBytes + modelOutput.bytes > limits.maxBytes
+          ? 'image_byte_limit'
+          : activeTokens + modelOutput.tokens > limits.maxEstimatedTokens
+            ? 'image_token_limit'
+            : undefined;
     if (reason) {
       removalReasons.set(key, reason);
       continue;
@@ -609,42 +584,59 @@ function selectImagesForProfile(
     const { images: sourceImages = [], ...messageWithoutImages } = entry.message;
     if (sourceImages.length === 0) return entry.message;
     const retained: ModelImage[] = [];
-    const removed: { readonly image: ModelImage; readonly artifact?: PublicArtifactRef; readonly bytes: number; readonly tokens: number; readonly reason: NonNullable<ModelWindowReduction['reason']> }[] = [];
+    const removed: {
+      readonly image: ModelImage;
+      readonly artifact?: PublicArtifactRef;
+      readonly bytes: number;
+      readonly tokens: number;
+      readonly reason: NonNullable<ModelWindowReduction['reason']>;
+    }[] = [];
     for (let imageIndex = 0; imageIndex < sourceImages.length; imageIndex += 1) {
       const image = sourceImages[imageIndex];
       if (!image) continue;
       const key = `${String(messageIndex)}:${String(imageIndex)}`;
       if (kept.has(key)) retained.push(image);
-      else removed.push({
-        image,
-        ...(entry.imageArtifacts[imageIndex] ? { artifact: entry.imageArtifacts[imageIndex] } : {}),
-        bytes: imageByteLength(image),
-        tokens: estimator.estimateImage(image),
-        reason: removalReasons.get(key) ?? 'unsupported_modality'
-      });
+      else
+        removed.push({
+          image,
+          ...(entry.imageArtifacts[imageIndex] ? { artifact: entry.imageArtifacts[imageIndex] } : {}),
+          bytes: imageByteLength(image),
+          tokens: estimator.estimateImage(image),
+          reason: removalReasons.get(key) ?? 'unsupported_modality'
+        });
     }
     if (removed.length === 0) return entry.message;
     const firstRemoved = removed[0];
     if (!firstRemoved) return entry.message;
-    const metadata = removed.map((item) => item.artifact
-      ? `- ${item.image.mediaType}, ${String(item.bytes)} bytes, public artifact ${item.artifact.artifactId} (${item.artifact.sha256}, ${String(item.artifact.size)} bytes).`
-      : `- ${item.image.mediaType}, ${String(item.bytes)} bytes; its public artifact metadata remains in the tool-result presentation.`).join('\n');
-    const deliveredMessage: ModelMessage = Object.freeze({
+    const metadata = removed
+      .map((item) =>
+        item.artifact
+          ? `- ${item.image.mediaType}, ${String(item.bytes)} bytes, public artifact ${item.artifact.artifactId} (${item.artifact.sha256}, ${String(item.artifact.size)} bytes).`
+          : `- ${item.image.mediaType}, ${String(item.bytes)} bytes; its public artifact metadata remains in the tool-result presentation.`
+      )
+      .join('\n');
+    const deliveredMessage: ModelInputItem = Object.freeze({
       ...messageWithoutImages,
       content: `${entry.message.content}\n[${String(removed.length)} image attachment${removed.length === 1 ? '' : 's'} omitted from active model context]\n${metadata}`,
       ...(retained.length > 0 ? { images: Object.freeze(retained) } : {})
     });
-    reductions.push(createModelWindowReduction({
-      itemId: entry.itemId,
-      kind: 'image_content_removed',
-      beforeBytes: Buffer.byteLength(entry.message.content, 'utf8') + sourceImages.reduce((total, image) => total + imageByteLength(image), 0),
-      afterBytes: Buffer.byteLength(deliveredMessage.content, 'utf8') + retained.reduce((total, image) => total + imageByteLength(image), 0),
-      ...(entry.message.role === 'tool' ? { toolName: entry.message.toolName } : {}),
-      removedItems: removed.length,
-      removedImageBytes: removed.reduce((total, item) => total + item.bytes, 0),
-      removedImageTokens: removed.reduce((total, item) => total + item.tokens, 0),
-      reason: firstRemoved.reason
-    }));
+    reductions.push(
+      createModelWindowReduction({
+        itemId: entry.itemId,
+        kind: 'image_content_removed',
+        beforeBytes:
+          Buffer.byteLength(entry.message.content, 'utf8') +
+          sourceImages.reduce((total, image) => total + imageByteLength(image), 0),
+        afterBytes:
+          Buffer.byteLength(deliveredMessage.content, 'utf8') +
+          retained.reduce((total, image) => total + imageByteLength(image), 0),
+        ...(entry.message.role === 'tool' ? { toolName: entry.message.toolName } : {}),
+        removedItems: removed.length,
+        removedImageBytes: removed.reduce((total, item) => total + item.bytes, 0),
+        removedImageTokens: removed.reduce((total, item) => total + item.tokens, 0),
+        reason: firstRemoved.reason
+      })
+    );
     return deliveredMessage;
   });
   return { messages, reductions };
@@ -653,11 +645,11 @@ function selectImagesForProfile(
 function imageByteLength(image: ModelImage): number {
   if (image.type === 'bytes') return image.data.byteLength;
   const padding = image.data.endsWith('==') ? 2 : image.data.endsWith('=') ? 1 : 0;
-  return Math.max(0, Math.floor(image.data.length * 3 / 4) - padding);
+  return Math.max(0, Math.floor((image.data.length * 3) / 4) - padding);
 }
 
-function normalizeToolProtocolMessages(messages: ModelMessage[]): ModelMessage[] {
-  const normalized: ModelMessage[] = [];
+function normalizeToolProtocolMessages(messages: ModelInputItem[]): ModelInputItem[] {
+  const normalized: ModelInputItem[] = [];
   const openCalls: ModelToolCall[] = [];
 
   for (const message of messages) {
@@ -696,16 +688,19 @@ function normalizeToolProtocolMessages(messages: ModelMessage[]): ModelMessage[]
     if (message.role !== 'assistant' || !message.toolCalls || message.toolCalls.length === 0) {
       return message;
     }
-    const retainedCalls = message.toolCalls.filter((call) => !openCalls.some((open) => sameToolCall(open, call)));
+    const retainedCalls = message.toolCalls.filter(
+      (call) => !openCalls.some((open) => sameToolCall(open, call))
+    );
     if (retainedCalls.length === message.toolCalls.length) {
       return message;
     }
     return Object.freeze({
       ...message,
       toolCalls: Object.freeze(retainedCalls),
-      content: retainedCalls.length > 0
-        ? message.content
-        : `${message.content}\n[tool calls removed from active history because their paired outputs were not retained]`.trim()
+      content:
+        retainedCalls.length > 0
+          ? message.content
+          : `${message.content}\n[tool calls removed from active history because their paired outputs were not retained]`.trim()
     });
   });
 }
@@ -721,42 +716,40 @@ function createModelWindowReduction(value: ModelWindowReduction): ModelWindowRed
   return Object.freeze(value);
 }
 
-function toolResultMessage(input: RecordToolResultInput, _detail: 'immediate' | 'retained'): ModelMessage {
+function toolResultMessage(input: RecordToolResultInput, _detail: 'immediate' | 'retained'): ModelInputItem {
   return Object.freeze({
     role: 'tool',
     toolName: input.toolName,
     toolCallType: input.toolCallType,
     content: _detail === 'immediate' ? input.immediateContent : input.retainedContent,
     ...(input.callId ? { toolCallId: input.callId } : {}),
-    ...(_detail === 'immediate' && input.immediateImages && input.immediateImages.length > 0 ? { images: Object.freeze(input.immediateImages.map(snapshotModelImage)) } : {})
+    ...(_detail === 'immediate' && input.immediateImages && input.immediateImages.length > 0
+      ? { images: Object.freeze(input.immediateImages.map(snapshotModelImage)) }
+      : {})
   });
 }
 
 function snapshotModelToolCall(call: ModelToolCall): ModelToolCall {
-  if (call.type === 'function') return Object.freeze({ ...call, input: Object.freeze({ kind: 'json', value: parseJsonObject(call.input.value) }) });
-  return Object.freeze({ ...call, input: Object.freeze({ kind: 'text', value: call.input.value }) });
+  if (call.type === 'function')
+    return Object.freeze({
+      ...call,
+      input: Object.freeze({
+        kind: 'json',
+        value: parseJsonObject(call.input.value)
+      })
+    });
+  return Object.freeze({
+    ...call,
+    input: Object.freeze({ kind: 'text', value: call.input.value })
+  });
 }
 
 function snapshotModelImage(image: ModelImage): ModelImage {
-  return image.type === 'bytes' ? Object.freeze({ ...image, data: new Uint8Array(image.data) }) : Object.freeze({ ...image });
+  return image.type === 'bytes'
+    ? Object.freeze({ ...image, data: new Uint8Array(image.data) })
+    : Object.freeze({ ...image });
 }
 
-function checkpointMessages(items: ContextHistoryItem[]): string[] {
-  return items
-    .filter((item): item is ContextCheckpointItem => item.kind === 'checkpoint')
-    .map((item) => item.message.content);
-}
-
-function messageBytes(message: ModelMessage): number {
+function messageBytes(message: ModelInputItem): number {
   return Buffer.byteLength(JSON.stringify(message), 'utf8');
-}
-
-function itemBytes(item: ContextHistoryItem): number {
-  if (item.kind === 'assistant_tool_call') {
-    return messageBytes(item.message);
-  }
-  if (item.kind === 'checkpoint') {
-    return messageBytes(item.message);
-  }
-  return messageBytes(item.useRetained ? item.retainedMessage : item.immediateMessage);
 }

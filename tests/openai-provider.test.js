@@ -179,7 +179,7 @@ test('OpenAIProvider sends Responses API requests with bearer auth, tools, text.
   assert.equal(body.model, 'gpt-5.6-sol');
   assert.equal(body.stream, false);
   assert.equal(body.store, false);
-  assert.equal(body.instructions, 'Return JSON.');
+  assert.deepEqual(body.input.shift(), { role: 'system', content: 'Return JSON.' });
   assert.equal(body.temperature, 0.2);
   assert.equal(body.top_p, 0.9);
   assert.equal(body.max_output_tokens, 128);
@@ -218,7 +218,7 @@ test('OpenAIProvider sends Responses API requests with bearer auth, tools, text.
     }
   });
   assert.deepEqual(body.reasoning, { effort: 'low', summary: 'concise', context: 'all_turns' });
-  assert.deepEqual(body.include, ['message.output_text.logprobs']);
+  assert.deepEqual(body.include, ['reasoning.encrypted_content', 'message.output_text.logprobs']);
   assert.equal(body.top_logprobs, 2);
   assert.deepEqual(body.metadata, { runId: 'run-1' });
   assert.equal('previous_response_id' in body, false);
@@ -278,13 +278,14 @@ test('OpenAIProvider sessions submit the complete logical request without remote
   assert.equal('previous_response_id' in body, false);
   assert.equal(body.store, false);
   assert.deepEqual(body.input.map((item) => item.type ?? item.role), [
+    'system',
     'user',
     'function_call',
     'function_call_output',
     'function_call',
     'function_call_output'
   ]);
-  assert.equal(body.input[4].call_id, 'call-shell-2');
+  assert.equal(body.input[5].call_id, 'call-shell-2');
   assert.equal(second.providerState, undefined);
 });
 
@@ -329,13 +330,13 @@ test('OpenAIProvider stateless replay preserves new feedback before an older nat
   const body = JSON.parse(calls[1].init.body);
   assert.equal('previous_response_id' in body, false);
   assert.equal(body.store, false);
-  assert.equal(body.instructions, 'Follow the current operation contract.');
+  assert.deepEqual(body.input.shift(), { role: 'system', content: 'Follow the current operation contract.' });
   assert.equal(body.input[0].content.includes('New disposition feedback'), true);
   assert.deepEqual(body.input.slice(1).map((item) => item.type ?? item.role), ['function_call', 'function_call_output']);
   assert.equal(second.providerState, undefined);
 });
 
-test('OpenAIProvider sessions ignore obsolete stored-response state and fully replay local context', async () => {
+test('OpenAIProvider stateless sessions expose no restore hook and fully replay local context', async () => {
   const calls = [];
   const provider = new OpenAIProvider({
     apiKey: 'test-key',
@@ -354,7 +355,7 @@ test('OpenAIProvider sessions ignore obsolete stored-response state and fully re
 
   const body = JSON.parse(calls[0].init.body);
   assert.equal('previous_response_id' in body, false);
-  assert.deepEqual(body.input.map((item) => item.type ?? item.role), ['user', 'function_call', 'function_call_output', 'function_call', 'function_call_output']);
+  assert.deepEqual(body.input.map((item) => item.type ?? item.role), ['system', 'user', 'function_call', 'function_call_output', 'function_call', 'function_call_output']);
   assert.equal(response.transport.reusedContinuation, false);
   assert.equal(response.providerState, undefined);
 });

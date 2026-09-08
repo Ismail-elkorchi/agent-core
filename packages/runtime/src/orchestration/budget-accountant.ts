@@ -1,9 +1,4 @@
-import {
-  type ModelMessage,
-  type ModelTool,
-  type ModelUsage,
-  type TokenEstimator
-} from '@agent-core/model';
+import { requestAccountingInputTokens, type ModelUsage, type RequestAccounting } from '@agent-core/model';
 
 export type BudgetPressure = 'normal' | 'constrained' | 'critical' | 'exhausted';
 
@@ -62,49 +57,36 @@ export class BudgetAccountant {
   private lastProviderUsage: ProviderUsageReport | undefined;
   private ratios: number[] = [];
 
-  constructor(
-    private readonly window: RequestWindow,
-    private readonly estimator: TokenEstimator
-  ) {}
+  constructor(private readonly window: RequestWindow) {}
 
   estimateRequest(input: {
-    promptMessages: ModelMessage[];
+    accounting: RequestAccounting;
     modelWindowTokens: number;
     contextTokens: number;
-    observedFactTokens?: number;
-    tools: ModelTool[];
-    outputReserveTokens?: number;
   }): RequestCostEstimate {
-    const messageTokens = this.estimator.estimateMessages(input.promptMessages);
-    const modelWindowTokens = input.modelWindowTokens;
-    const contextTokens = input.contextTokens;
-    const observedFactTokens = input.observedFactTokens ?? 0;
-    const toolSchemaTokens = estimateToolSchemaTokens(input.tools, this.estimator);
-    const outputReserveTokens = input.outputReserveTokens ?? this.window.maxOutputTokens;
-    // promptMessages is the final assembled window, including retained history,
-    // context, and observed facts. Component counts below are diagnostics only.
-    const totalPromptTokens = messageTokens + toolSchemaTokens;
-    const totalRequestTokens = totalPromptTokens + outputReserveTokens;
-    const warnings: string[] = [];
-    if (toolSchemaTokens > Math.floor(this.window.maxPromptTokens * 0.2)) {
-      warnings.push('Tool schema tokens are a large share of this request.');
-    }
+    const totalPromptTokens = requestAccountingInputTokens(input.accounting);
+    const toolSchemaTokens = input.accounting.components
+      .filter((part) => part.kind === 'tool_schema')
+      .reduce((sum, part) => sum + (part.tokens ?? 0), 0);
+    const outputReserveTokens = input.accounting.outputReservation;
     return {
-      messageTokens,
-      modelWindowTokens,
-      contextTokens,
-      observedFactTokens,
+      messageTokens: totalPromptTokens - toolSchemaTokens,
+      modelWindowTokens: input.modelWindowTokens,
+      contextTokens: input.contextTokens,
+      observedFactTokens: 0,
       toolSchemaTokens,
       outputReserveTokens,
       totalPromptTokens,
-      totalRequestTokens,
-      warnings
+      totalRequestTokens: totalPromptTokens + outputReserveTokens,
+      warnings: input.accounting.unknownComponents.map((part) => part.reason ?? 'Unknown request cost')
     };
   }
 
   canSend(estimate: RequestCostEstimate): boolean {
-    return estimate.totalPromptTokens <= this.window.maxPromptTokens
-      && estimate.totalRequestTokens <= this.window.contextWindowTokens;
+    return (
+      estimate.totalPromptTokens <= this.window.maxPromptTokens &&
+      estimate.totalRequestTokens <= this.window.contextWindowTokens
+    );
   }
 
   pressureAfter(estimate: RequestCostEstimate): BudgetPressure {
@@ -154,9 +136,13 @@ export class BudgetAccountant {
 
   snapshot(): BudgetAccountantSnapshot {
     const pendingPromptTokens = this.pendingPromptEstimate?.totalPromptTokens ?? 0;
-    const totalTokens = this.providerPromptTokens + this.estimatedPromptTokens + pendingPromptTokens + this.completionTokens;
+    const totalTokens =
+      this.providerPromptTokens + this.estimatedPromptTokens + pendingPromptTokens + this.completionTokens;
     const promptTokens = this.providerPromptTokens + this.estimatedPromptTokens + pendingPromptTokens;
-    const remainingPromptTokens = Math.max(0, this.window.maxPromptTokens - (this.lastEstimate?.totalPromptTokens ?? 0));
+    const remainingPromptTokens = Math.max(
+      0,
+      this.window.maxPromptTokens - (this.lastEstimate?.totalPromptTokens ?? 0)
+    );
     return {
       estimatedPromptTokens: this.estimatedPromptTokens + pendingPromptTokens,
       providerPromptTokens: this.providerPromptTokens,
@@ -177,17 +163,7 @@ export class BudgetAccountant {
   }
 }
 
-function estimateToolSchemaTokens(tools: ModelTool[], estimator: TokenEstimator): number {
-  if (tools.length === 0) {
-    return 0;
-  }
-  return estimator.estimateText(JSON.stringify(tools));
-}
-
-function pressureFor(input: {
-  promptUsed: number;
-  promptMax: number;
-}): BudgetPressure {
+function pressureFor(input: { promptUsed: number; promptMax: number }): BudgetPressure {
   const promptRatio = input.promptUsed / Math.max(1, input.promptMax);
   if (promptRatio >= 1) {
     return 'exhausted';

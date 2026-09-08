@@ -1,3 +1,4 @@
+import { responsesOutput } from '@agent-core/provider-openai-responses';
 import {
   ModelProviderError,
   type ModelRequest,
@@ -46,12 +47,12 @@ export interface StreamingCustomToolCallAccumulator {
   emittedKey?: string;
 }
 
-export function toModelResponse(
+export async function toModelResponse(
   provider: string,
   request: ModelRequest,
   payload: OpenAICodexResponsesPayload,
-  transport: { strategy: string; reusedContinuation?: boolean } = { strategy: 'http_full_replay' }
-): ModelResponse {
+  transport: { strategy: string; reusedContinuation?: boolean; endpoint: string }
+): Promise<ModelResponse> {
   if (payload.error) {
     const failure = summarizeCodexFailure(payload);
     throw new ModelProviderError({
@@ -75,13 +76,25 @@ export function toModelResponse(
       cause: payload
     });
   }
-  const content = typeof payload.output_text === 'string' ? payload.output_text : contentFromOutput(payload.output ?? []);
+  const content =
+    typeof payload.output_text === 'string' ? payload.output_text : contentFromOutput(payload.output ?? []);
   const toolCalls = normalizeToolCalls(provider, payload.output ?? []);
   const reasoningSummary = reasoningSummaryFromOutput(payload.output ?? []);
   const usage = normalizeUsage(payload.usage);
   const providerTerminationReason = payload.incomplete_details?.reason ?? payload.status;
   return parseCodexModelResponse({
     content,
+    output: await responsesOutput({
+      request,
+      provider,
+      endpoint: transport.endpoint,
+      requestId: payload.id ?? 'response-without-id',
+      items:
+        payload.output ??
+        (content
+          ? [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: content }] }]
+          : [])
+    }),
     model: payload.model ?? request.model,
     provider,
     terminationReason: normalizeOpenAITermination(payload, toolCalls.length > 0),
@@ -143,10 +156,17 @@ export function contentFromOutput(output: readonly OpenAICodexOutputItem[]): str
     .join('');
 }
 
-export function toolCallFromOutputItem(provider: string, item: OpenAICodexOutputItem | undefined): ModelToolCall | undefined {
+export function toolCallFromOutputItem(
+  provider: string,
+  item: OpenAICodexOutputItem | undefined
+): ModelToolCall | undefined {
   if (item?.type === 'custom_tool_call') {
     if (!item.name) {
-      throw new ModelProviderError({ provider, code: 'malformed_response', message: 'OpenAI Codex custom_tool_call item did not include name.' });
+      throw new ModelProviderError({
+        provider,
+        code: 'malformed_response',
+        message: 'OpenAI Codex custom_tool_call item did not include name.'
+      });
     }
     return {
       ...(item.call_id ? { id: item.call_id } : item.id ? { id: item.id } : {}),
@@ -159,7 +179,11 @@ export function toolCallFromOutputItem(provider: string, item: OpenAICodexOutput
     return undefined;
   }
   if (!item.name) {
-    throw new ModelProviderError({ provider, code: 'malformed_response', message: 'OpenAI Codex function_call item did not include name.' });
+    throw new ModelProviderError({
+      provider,
+      code: 'malformed_response',
+      message: 'OpenAI Codex function_call item did not include name.'
+    });
   }
   return {
     ...(item.call_id ? { id: item.call_id } : item.id ? { id: item.id } : {}),
@@ -169,7 +193,10 @@ export function toolCallFromOutputItem(provider: string, item: OpenAICodexOutput
   };
 }
 
-export function mergeStreamingFunctionCallParts(accumulators: Map<string, StreamingFunctionCallAccumulator>, part: OpenAICodexStreamData): ModelToolCall[] {
+export function mergeStreamingFunctionCallParts(
+  accumulators: Map<string, StreamingFunctionCallAccumulator>,
+  part: OpenAICodexStreamData
+): ModelToolCall[] {
   const eventType = part.type;
   if (!eventType.includes('function_call')) {
     return [];
@@ -193,7 +220,10 @@ export function mergeStreamingFunctionCallParts(accumulators: Map<string, Stream
   return [maybeToolCall];
 }
 
-export function mergeStreamingCustomToolCallParts(accumulators: Map<string, StreamingCustomToolCallAccumulator>, part: OpenAICodexStreamData): ModelToolCall[] {
+export function mergeStreamingCustomToolCallParts(
+  accumulators: Map<string, StreamingCustomToolCallAccumulator>,
+  part: OpenAICodexStreamData
+): ModelToolCall[] {
   const eventType = part.type;
   if (!eventType.includes('custom_tool_call')) {
     return [];
@@ -306,7 +336,11 @@ function parseToolArguments(provider: string, value: string | undefined): JsonOb
       cause: error
     });
   }
-  throw new ModelProviderError({ provider, code: 'malformed_response', message: 'OpenAI Codex tool call arguments must decode to a JSON object.' });
+  throw new ModelProviderError({
+    provider,
+    code: 'malformed_response',
+    message: 'OpenAI Codex tool call arguments must decode to a JSON object.'
+  });
 }
 
 function tryAccumulatorToToolCall(item: StreamingFunctionCallAccumulator): ModelToolCall | undefined {
@@ -351,8 +385,14 @@ function normalizeUsage(usage: OpenAICodexUsage | undefined): ModelUsage | undef
     promptTokens,
     completionTokens,
     totalTokens: usage.total_tokens ?? promptTokens + completionTokens,
-    ...(usage.input_tokens_details?.cached_tokens === undefined ? {} : { cacheReadTokens: usage.input_tokens_details.cached_tokens }),
-    ...(usage.input_tokens_details?.cache_write_tokens === undefined ? {} : { cacheWriteTokens: usage.input_tokens_details.cache_write_tokens }),
-    ...(usage.output_tokens_details?.reasoning_tokens === undefined ? {} : { reasoningTokens: usage.output_tokens_details.reasoning_tokens })
+    ...(usage.input_tokens_details?.cached_tokens === undefined
+      ? {}
+      : { cacheReadTokens: usage.input_tokens_details.cached_tokens }),
+    ...(usage.input_tokens_details?.cache_write_tokens === undefined
+      ? {}
+      : { cacheWriteTokens: usage.input_tokens_details.cache_write_tokens }),
+    ...(usage.output_tokens_details?.reasoning_tokens === undefined
+      ? {}
+      : { reasoningTokens: usage.output_tokens_details.reasoning_tokens })
   };
 }

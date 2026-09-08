@@ -1,9 +1,19 @@
+import { modelTransportSignal, type ModelTransportOptions } from '@agent-core/model';
+import {
+  compileModelRequest,
+  conservativeProtocolCapabilities,
+  assertProviderContextCompatible,
+  createProviderContextState,
+  type CompiledModelRequest,
+  type ModelOutputItem,
+  CompleteRequestEstimator
+} from '@agent-core/model';
 import { type ChatRequest, type Message, Ollama, type Tool } from 'ollama';
 import { parseJsonObject } from '@agent-core/json';
 import {
   type ModelCapabilities,
   ModelContractError,
-  type ModelMessage,
+  type ModelInputItem,
   type ModelProfile,
   type ModelProvider,
   ModelProviderError,
@@ -72,6 +82,9 @@ export type OllamaModelProfileOverride = Omit<ModelProfile, 'id' | 'provider'>;
 export class OllamaProvider implements ModelProvider {
   readonly id = 'ollama';
   readonly implementationId = 'agent-core.provider.ollama@1';
+  private readonly compiledWire = new WeakMap<CompiledModelRequest, ChatRequest & { stream: true }>();
+  private readonly endpoint: string;
+  private readonly compiledRequests = new WeakMap<ModelRequest, CompiledModelRequest>();
   private readonly clientFactory: () => OllamaClient;
   private readonly defaultModel: string;
   private readonly keepAlive: string | number | undefined;
@@ -82,29 +95,35 @@ export class OllamaProvider implements ModelProvider {
   private readonly discoveredProfiles = new Map<string, Promise<ModelProfile>>();
 
   constructor(options: OllamaProviderOptions = {}) {
+    this.endpoint = `${(options.host ?? 'http://127.0.0.1:11434').replace(/\/+$/u, '')}/api/chat`;
     this.defaultModel = options.model ?? 'llama3.1';
     const fetch = options.fetch ?? globalThis.fetch;
     const config = { ...(options.host ? { host: options.host } : {}), fetch };
-    this.clientFactory = options.clientFactory ?? (() => {
-      const client = new Ollama(config);
-      return {
-        chat: (request) => client.chat(request),
-        show: async (request) => {
-          const response = await client.show(request);
-          const modelInfo = toRecord(response.model_info);
-          return {
-            ...(response.parameters ? { parameters: response.parameters } : {}),
-            capabilities: response.capabilities,
-            ...(modelInfo ? { model_info: modelInfo } : {}),
-            details: toRecord(response.details) ?? {},
-            modified_at: response.modified_at instanceof Date ? response.modified_at.toISOString() : String(response.modified_at)
-          };
-        },
-        abort: () => {
-          client.abort();
-        }
-      };
-    });
+    this.clientFactory =
+      options.clientFactory ??
+      (() => {
+        const client = new Ollama(config);
+        return {
+          chat: (request) => client.chat(request),
+          show: async (request) => {
+            const response = await client.show(request);
+            const modelInfo = toRecord(response.model_info);
+            return {
+              ...(response.parameters ? { parameters: response.parameters } : {}),
+              capabilities: response.capabilities,
+              ...(modelInfo ? { model_info: modelInfo } : {}),
+              details: toRecord(response.details) ?? {},
+              modified_at:
+                response.modified_at instanceof Date
+                  ? response.modified_at.toISOString()
+                  : String(response.modified_at)
+            };
+          },
+          abort: () => {
+            client.abort();
+          }
+        };
+      });
     this.keepAlive = options.keepAlive;
     this.reasoning = options.reasoning;
     this.generationOptions = validateGenerationOptions({ ...(options.generationOptions ?? {}) });
@@ -123,7 +142,18 @@ export class OllamaProvider implements ModelProvider {
   describeModel(model: string): Promise<ModelProfile> {
     const selectedModel = model || this.defaultModel;
     const override = this.modelProfiles[selectedModel];
-    if (override) return Promise.resolve(parseModelProfile({ id: selectedModel, provider: this.id, ...override }));
+    if (override)
+      return Promise.resolve(
+        parseModelProfile({
+          id: selectedModel,
+          provider: this.id,
+          ...override,
+          capabilities: {
+            ...override.capabilities,
+            protocol: override.capabilities.protocol ?? this.protocol()
+          }
+        })
+      );
     let profile = this.discoveredProfiles.get(selectedModel);
     if (!profile) {
       profile = this.discoverModel(selectedModel).catch((error: unknown) => {
@@ -141,16 +171,90 @@ export class OllamaProvider implements ModelProvider {
     return this.describeModel(selectedModel);
   }
 
-  async complete(request: ModelRequest): Promise<ModelResponse> {
+  private protocol() {
+    return conservativeProtocolCapabilities(this.endpoint, {
+      reasoningAccounting: 'included_output',
+      revision: 'ollama-chat-2026-09-07-v2',
+      roles: ['system', 'developer', 'user', 'assistant'],
+      developerRole: 'system_if_no_system',
+      inputKinds: ['text', 'image', 'tool_call', 'tool_result', 'protocol'],
+      outputKinds: ['text', 'tool_call', 'protocol'],
+      state: 'exact'
+    });
+  }
+  async compileRequest(request: ModelRequest): Promise<CompiledModelRequest> {
+    request = parseModelRequest(request);
+    const cached = this.compiledRequests.get(request);
+    if (cached) return cached;
+    if (request.reasoning === undefined && this.reasoning !== undefined) {
+      request = parseModelRequest({ ...request, reasoning: this.reasoning });
+    }
+    const profile = await this.describeModel(request.model);
+    assertModelRequestSupported(profile, request);
+    for (const [index, item] of request.messages.entries())
+      if (item.role === 'protocol')
+        await assertProviderContextCompatible(
+          item.state,
+          request,
+          this.endpoint,
+          request.messages.slice(0, index),
+          this.id
+        );
+    const wire = this.toChatRequest(
+      request,
+      true,
+      profile.capabilities.protocol?.developerRole === 'system_if_no_system'
+    );
+    const body: Record<string, unknown> = { ...wire };
+    delete body.stream;
+    const compiled = await compileModelRequest({
+      request,
+      profile,
+      body,
+      payloadPaths: ollamaPayloadPaths(body),
+      ...(typeof wire.options?.num_predict === 'number' && wire.options.num_predict > 0
+        ? { outputReservation: wire.options.num_predict }
+        : {}),
+      endpoint: this.endpoint
+    });
+    this.compiledRequests.set(compiled.logicalRequest, compiled);
+    this.compiledWire.set(compiled, wire);
+    return compiled;
+  }
+  private assertCompiled(compiled: CompiledModelRequest): void {
+    if (this.compiledRequests.get(compiled.logicalRequest) !== compiled)
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'invalid_request',
+        message: 'Unrecognized compiled request.'
+      });
+  }
+  completeCompiled(compiled: CompiledModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
+    this.assertCompiled(compiled);
+    return this.complete(compiled.logicalRequest, options);
+  }
+  async *streamCompiled(
+    compiled: CompiledModelRequest,
+    options?: ModelTransportOptions
+  ): AsyncIterable<ModelStreamEvent> {
+    this.assertCompiled(compiled);
+    yield* this.stream(compiled.logicalRequest, options);
+  }
+
+  async complete(request: ModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
     let finalResponse: ModelResponse | undefined;
     try {
-      for await (const event of this.stream(request)) {
+      for await (const event of this.stream(request, options)) {
         if (event.type === 'done') {
           finalResponse = event.response;
         }
       }
       if (!finalResponse) {
-        throw new ModelProviderError({ provider: this.id, code: 'malformed_response', message: 'Ollama stream ended without a final response.' });
+        throw new ModelProviderError({
+          provider: this.id,
+          code: 'malformed_response',
+          message: 'Ollama stream ended without a final response.'
+        });
       }
       return finalResponse;
     } catch (error) {
@@ -158,17 +262,26 @@ export class OllamaProvider implements ModelProvider {
     }
   }
 
-  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+  async *stream(request: ModelRequest, options?: ModelTransportOptions): AsyncIterable<ModelStreamEvent> {
+    let compiled: CompiledModelRequest;
     try {
-      request = parseModelRequest(request);
-      assertModelRequestSupported(await this.describeModel(request.model), request);
+      compiled = await this.compileRequest(request);
+      request = compiled.logicalRequest;
+    } catch (error) {
+      throw this.normalizeError(error);
     }
-    catch (error) { throw this.normalizeError(error); }
-    throwIfAborted(request.signal);
+    const signal = modelTransportSignal(request, options);
+    throwIfAborted(signal);
     const client = this.clientFactory();
-    const chatRequest = this.toChatRequest(request, true);
-    const cleanupAbort = this.bindAbort(request.signal, client);
-    throwIfAborted(request.signal);
+    const chatRequest = this.compiledWire.get(compiled);
+    if (!chatRequest)
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'invalid_request',
+        message: 'Missing compiled Ollama request.'
+      });
+    const cleanupAbort = this.bindAbort(signal, client);
+    throwIfAborted(signal);
     let content = '';
     let reasoning = '';
     const toolCalls: ModelToolCall[] = [];
@@ -177,20 +290,41 @@ export class OllamaProvider implements ModelProvider {
       const stream = await client.chat(chatRequest);
       for await (const part of stream) {
         let wirePart: OllamaWireResponse;
-        try { wirePart = decodeOllamaWireResponse(part); }
-        catch (error) { throw new ModelProviderError({ provider: this.id, code: 'malformed_response', message: `Ollama response was malformed: ${error instanceof Error ? error.message : String(error)}`, cause: error }); }
-        if (wirePart.error) throw new ModelProviderError({ provider: this.id, code: 'provider_unavailable', message: `Ollama stream error: ${wirePart.error}`, retryable: content.length === 0, cause: wirePart });
-        throwIfAborted(request.signal);
+        try {
+          wirePart = decodeOllamaWireResponse(part);
+        } catch (error) {
+          throw new ModelProviderError({
+            provider: this.id,
+            code: 'malformed_response',
+            message: `Ollama response was malformed: ${error instanceof Error ? error.message : String(error)}`,
+            cause: error
+          });
+        }
+        if (wirePart.error)
+          throw new ModelProviderError({
+            provider: this.id,
+            code: 'provider_unavailable',
+            message: `Ollama stream error: ${wirePart.error}`,
+            retryable: content.length === 0,
+            cause: wirePart
+          });
+        throwIfAborted(signal);
         const delta = typeof wirePart.message?.content === 'string' ? wirePart.message.content : '';
         if (delta.length > 0) {
           content += delta;
           yield { type: 'content', content: delta, accumulated: content, raw: wirePart.raw };
         }
 
-        const reasoningDelta = typeof wirePart.message?.thinking === 'string' ? wirePart.message.thinking : '';
+        const reasoningDelta =
+          typeof wirePart.message?.thinking === 'string' ? wirePart.message.thinking : '';
         if (reasoningDelta.length > 0) {
           reasoning += reasoningDelta;
-          yield { type: 'reasoning', reasoning: reasoningDelta, accumulatedReasoning: reasoning, raw: wirePart.raw };
+          yield {
+            type: 'reasoning',
+            reasoning: reasoningDelta,
+            accumulatedReasoning: reasoning,
+            raw: wirePart.raw
+          };
         }
 
         for (const toolCall of normalizeToolCalls(wirePart.message?.tool_calls ?? [])) {
@@ -199,12 +333,16 @@ export class OllamaProvider implements ModelProvider {
         }
 
         if (wirePart.done) {
-          const response = this.toModelResponse(wirePart, request, content, reasoning, toolCalls);
+          const response = await this.toModelResponse(wirePart, request, content, reasoning, toolCalls);
           yield { type: 'done', response };
           return;
         }
       }
-      throw new ModelProviderError({ provider: this.id, code: 'malformed_response', message: 'Ollama stream ended before a done response.' });
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'malformed_response',
+        message: 'Ollama stream ended before a done response.'
+      });
     } catch (error) {
       throw this.normalizeError(error);
     } finally {
@@ -212,14 +350,23 @@ export class OllamaProvider implements ModelProvider {
     }
   }
 
-  private toChatRequest(request: ModelRequest, stream: true): ChatRequest & { stream: true } {
+  private toChatRequest(
+    request: ModelRequest,
+    stream: true,
+    lowerDeveloper: boolean
+  ): ChatRequest & { stream: true } {
     const options = this.toRuntimeOptions(request);
     const chatRequest: ChatRequest & { stream: true } = {
       model: request.model || this.defaultModel,
-      messages: request.messages.map(toOllamaMessage),
+      messages: toOllamaMessages(request.messages, lowerDeveloper),
       stream
     };
-    if (request.responseFormat !== undefined && this.deployment === 'cloud') throw new ModelProviderError({ provider: this.id, code: 'invalid_request', message: 'Ollama Cloud does not currently support structured-output formats.' });
+    if (request.responseFormat !== undefined && this.deployment === 'cloud')
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'invalid_request',
+        message: 'Ollama Cloud does not currently support structured-output formats.'
+      });
     const format = request.responseFormat ? toOllamaFormat(request.responseFormat) : undefined;
     if (format !== undefined) {
       chatRequest.format = format;
@@ -231,7 +378,7 @@ export class OllamaProvider implements ModelProvider {
     if (keepAlive !== undefined) {
       chatRequest.keep_alive = keepAlive;
     }
-    const think = toOllamaThink(request.reasoning ?? this.reasoning, request.model || this.defaultModel);
+    const think = toOllamaThink(request.reasoning);
     if (think !== undefined) {
       chatRequest.think = think;
     }
@@ -247,16 +394,20 @@ export class OllamaProvider implements ModelProvider {
     return chatRequest;
   }
 
-  private toModelResponse(
+  private async toModelResponse(
     response: OllamaWireResponse,
     request: ModelRequest,
     content: string,
     reasoning: string,
     streamedToolCalls: ModelToolCall[]
-  ): ModelResponse {
+  ): Promise<ModelResponse> {
     const fallbackContentValue: unknown = response.message?.content;
     if (fallbackContentValue !== undefined && typeof fallbackContentValue !== 'string') {
-      throw new ModelProviderError({ provider: this.id, code: 'malformed_response', message: 'Ollama response did not contain message.content.' });
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'malformed_response',
+        message: 'Ollama response did not contain message.content.'
+      });
     }
     const fallbackContent = fallbackContentValue ?? '';
     const responseToolCalls = normalizeToolCalls(response.message?.tool_calls ?? []);
@@ -264,17 +415,35 @@ export class OllamaProvider implements ModelProvider {
     const usage = normalizeUsage(response);
     const timings = normalizeTimings(response);
     const responseReasoning = reasoning || response.message?.thinking;
+    const output: ModelOutputItem[] = [];
+    if (responseReasoning)
+      output.push({
+        type: 'protocol',
+        state: await createProviderContextState({
+          request,
+          provider: this.id,
+          endpoint: this.endpoint,
+          requestId: 'ollama-response',
+          kind: 'ollama.thinking',
+          data: { thinking: responseReasoning },
+          tokenEstimate: new CompleteRequestEstimator().estimateText(responseReasoning)
+        })
+      });
+    if (content || fallbackContent) output.push({ type: 'text', text: content || fallbackContent });
+    output.push(...toolCalls.map((toolCall) => ({ type: 'tool_call' as const, toolCall })));
     return parseOllamaModelResponse({
+      output,
       content: content || fallbackContent,
       model: typeof response.model === 'string' && response.model.length > 0 ? response.model : request.model,
       provider: this.id,
-      terminationReason: toolCalls.length > 0
-        ? 'tool_calls'
-        : response.done_reason === 'length'
-          ? 'output_limit'
-          : response.done_reason === 'stop'
-            ? 'stop'
-            : 'unknown',
+      terminationReason:
+        toolCalls.length > 0
+          ? 'tool_calls'
+          : response.done_reason === 'length'
+            ? 'output_limit'
+            : response.done_reason === 'stop'
+              ? 'stop'
+              : 'unknown',
       ...(response.done_reason ? { providerTerminationReason: response.done_reason } : {}),
       ...(usage ? { usage } : {}),
       ...(responseReasoning ? { reasoning: responseReasoning } : {}),
@@ -302,10 +471,19 @@ export class OllamaProvider implements ModelProvider {
 
   private async discoverModel(model: string): Promise<ModelProfile> {
     const client = this.clientFactory();
-    if (!client.show) throw new ModelProviderError({ provider: this.id, code: 'model_unavailable', message: `Ollama model ${model} cannot be profiled because the client does not implement show(). Supply a complete modelProfiles override for offline or custom clients.` });
+    if (!client.show)
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'model_unavailable',
+        message: `Ollama model ${model} cannot be profiled because the client does not implement show(). Supply a complete modelProfiles override for offline or custom clients.`
+      });
     try {
       const details = decodeOllamaShowResponse(await client.show({ model, verbose: false }));
-      return parseModelProfile(profileFromShow(model, details, this.generationOptions, this.deployment));
+      const profile = profileFromShow(model, details, this.generationOptions, this.deployment);
+      return parseModelProfile({
+        ...profile,
+        capabilities: { ...profile.capabilities, protocol: this.protocol() }
+      });
     } catch (error) {
       throw this.normalizeError(error);
     }
@@ -321,7 +499,9 @@ export class OllamaProvider implements ModelProvider {
     }
     const abort = () => client.abort?.();
     signal.addEventListener('abort', abort, { once: true });
-    return () => { signal.removeEventListener('abort', abort); };
+    return () => {
+      signal.removeEventListener('abort', abort);
+    };
   }
 
   private normalizeError(error: unknown): ModelProviderError {
@@ -329,11 +509,23 @@ export class OllamaProvider implements ModelProvider {
       return error;
     }
     if (error instanceof ModelContractError) {
-      return new ModelProviderError({ provider: this.id, code: 'invalid_request', message: error.message, retryable: false, cause: error });
+      return new ModelProviderError({
+        provider: this.id,
+        code: 'invalid_request',
+        message: error.message,
+        retryable: false,
+        cause: error
+      });
     }
     const message = error instanceof Error ? error.message : String(error);
     if (isAbortError(error) || /abort/i.test(message)) {
-      return new ModelProviderError({ provider: this.id, code: 'aborted', message: `Ollama request aborted: ${message}`, retryable: false, cause: error });
+      return new ModelProviderError({
+        provider: this.id,
+        code: 'aborted',
+        message: `Ollama request aborted: ${message}`,
+        retryable: false,
+        cause: error
+      });
     }
     const statusCode = statusCodeFromError(error);
     const code = classifyError(message, statusCode);
@@ -357,14 +549,47 @@ function toRecord(value: unknown): Record<string, unknown> | undefined {
   return isJsonObject(value) ? { ...value } : undefined;
 }
 
-function toOllamaMessage(message: ModelMessage): Message {
+function toOllamaMessage(message: ModelInputItem, lowerDeveloper: boolean): Message {
+  if (message.role === 'control' || message.role === 'protocol')
+    throw new ModelProviderError({
+      provider: 'ollama',
+      code: 'invalid_request',
+      message: `Unsupported Ollama input role: ${message.role}.`
+    });
+  if (message.parts?.length) {
+    let sawImage = false;
+    let text = message.content;
+    const images = [...(message.images ?? [])];
+    for (const part of message.parts) {
+      if (part.type === 'text' && !sawImage) text += part.text;
+      else if (part.type === 'image') {
+        sawImage = true;
+        images.push(part.image);
+      } else
+        throw new ModelProviderError({
+          provider: 'ollama',
+          code: 'invalid_request',
+          message: 'Ollama cannot represent this ordered content sequence.'
+        });
+    }
+    if (images.length && message.role !== 'user' && message.role !== 'tool')
+      throw new ModelProviderError({
+        provider: 'ollama',
+        code: 'invalid_request',
+        message: 'Ollama media requires user or tool input.'
+      });
+    const plain = { ...message };
+    delete plain.parts;
+    return toOllamaMessage(
+      { ...plain, content: text, ...(images.length ? { images } : {}) } as ModelInputItem,
+      lowerDeveloper
+    );
+  }
   const ollamaMessage: Message = {
-    role: message.role,
+    role: message.role === 'developer' && lowerDeveloper ? 'system' : message.role,
     content: message.content
   };
-  if (message.reasoning) {
-    ollamaMessage.thinking = message.reasoning;
-  }
+
   const images = toOllamaImages(message.images);
   if (images) {
     ollamaMessage.images = images;
@@ -378,21 +603,30 @@ function toOllamaMessage(message: ModelMessage): Message {
   return ollamaMessage;
 }
 
-function toOllamaThink(reasoning: ModelReasoningRequest | undefined, model: string): boolean | 'high' | 'medium' | 'low' | undefined {
+function toOllamaThink(
+  reasoning: ModelReasoningRequest | undefined
+): boolean | 'high' | 'medium' | 'low' | undefined {
   if (!reasoning) {
     return undefined;
   }
-  if ('summary' in reasoning) throw new ModelProviderError({ provider: 'ollama', code: 'invalid_request', message: 'Ollama does not expose a reasoning summary control.' });
-  const gptOss = /(^|[/:])gpt-oss(?:[-:]|$)/i.test(model);
+  if ('summary' in reasoning)
+    throw new ModelProviderError({
+      provider: 'ollama',
+      code: 'invalid_request',
+      message: 'Ollama does not expose a reasoning summary control.'
+    });
   if (reasoning.strategy === 'disabled') {
-    if (gptOss) throw new ModelProviderError({ provider: 'ollama', code: 'invalid_request', message: 'Ollama GPT-OSS models do not allow thinking to be disabled.' });
     return false;
   }
   if (reasoning.strategy === 'enabled') {
-    if (gptOss) throw new ModelProviderError({ provider: 'ollama', code: 'invalid_request', message: 'Ollama GPT-OSS requires an explicit low, medium, or high reasoning effort.' });
     return true;
   }
-  if (reasoning.strategy === 'budget') throw new ModelProviderError({ provider: 'ollama', code: 'invalid_request', message: 'Ollama does not expose a thinking token budget.' });
+  if (reasoning.strategy === 'budget')
+    throw new ModelProviderError({
+      provider: 'ollama',
+      code: 'invalid_request',
+      message: 'Ollama does not expose a thinking token budget.'
+    });
   if (reasoning.effort === 'minimal' || reasoning.effort === 'xhigh' || reasoning.effort === 'max') {
     throw new ModelProviderError({
       provider: 'ollama',
@@ -403,18 +637,37 @@ function toOllamaThink(reasoning: ModelReasoningRequest | undefined, model: stri
   return reasoning.effort;
 }
 
-function profileFromShow(model: string, response: OllamaShowResponse, generationOptions: OllamaGenerationOptions, deployment: 'local' | 'cloud'): ModelProfile {
+// Exact documented names only. Custom model names require a profile override for effort control.
+const EFFORT_MODELS = new Set(['gpt-oss', 'gpt-oss:20b', 'gpt-oss:120b', 'gpt-oss:120b-cloud']);
+
+function profileFromShow(
+  model: string,
+  response: OllamaShowResponse,
+  generationOptions: OllamaGenerationOptions,
+  deployment: 'local' | 'cloud'
+): ModelProfile {
   const declared = new Set(response.capabilities ?? []);
-  if (!declared.has('completion')) throw new ModelProviderError({ provider: 'ollama', code: 'model_unavailable', message: `Ollama model ${model} does not declare the completion capability required for chat.` });
+  if (!declared.has('completion'))
+    throw new ModelProviderError({
+      provider: 'ollama',
+      code: 'model_unavailable',
+      message: `Ollama model ${model} does not declare the completion capability required for chat.`
+    });
   const modelContext = contextLengthFromModelInfo(response.model_info);
   const configuredContext = positiveIntegerOrUndefined(generationOptions.num_ctx);
   const parameterContext = positiveIntegerOrUndefined(parameterValue(response.parameters, 'num_ctx'));
   const contextTokens = configuredContext ?? parameterContext ?? modelContext;
-  if (!contextTokens) throw new ModelProviderError({ provider: 'ollama', code: 'malformed_response', message: `Ollama /api/show did not declare a usable context length for ${model}. Supply a complete modelProfiles override.` });
-  const outputTokens = positiveIntegerOrUndefined(generationOptions.num_predict)
-    ?? positiveIntegerOrUndefined(parameterValue(response.parameters, 'num_predict'));
+  if (!contextTokens)
+    throw new ModelProviderError({
+      provider: 'ollama',
+      code: 'malformed_response',
+      message: `Ollama /api/show did not declare a usable context length for ${model}. Supply a complete modelProfiles override.`
+    });
+  const outputTokens =
+    positiveIntegerOrUndefined(generationOptions.num_predict) ??
+    positiveIntegerOrUndefined(parameterValue(response.parameters, 'num_predict'));
   const supportsThinking = declared.has('thinking');
-  const gptOss = /(^|[/:])gpt-oss(?:[-:]|$)/i.test(model);
+  const gptOss = EFFORT_MODELS.has(model);
   const capabilities: ModelCapabilities = {
     streaming: true,
     toolCalling: declared.has('tools'),
@@ -424,11 +677,18 @@ function profileFromShow(model: string, response: OllamaShowResponse, generation
     logprobs: true,
     temperature: true,
     topP: true,
-    ...(supportsThinking ? {
-      reasoning: gptOss
-        ? { strategies: ['effort'], canDisable: false, efforts: ['low', 'medium', 'high'], separateOutput: true }
-        : { strategies: ['toggle'], canDisable: true, separateOutput: true }
-    } : {})
+    ...(supportsThinking
+      ? {
+          reasoning: gptOss
+            ? {
+                strategies: ['effort'],
+                canDisable: false,
+                efforts: ['low', 'medium', 'high'],
+                separateOutput: true
+              }
+            : { strategies: ['toggle'], canDisable: true, separateOutput: true }
+        }
+      : {})
   };
   const supportedParameters: ModelProfile['supportedParameters'] = [
     'temperature',
@@ -470,7 +730,10 @@ function contextLengthFromModelInfo(modelInfo: Record<string, unknown> | undefin
 
 function parameterValue(parameters: string | undefined, name: string): number | undefined {
   if (!parameters) return undefined;
-  const line = parameters.split(/\r?\n/).map((item) => item.trim()).find((item) => item.startsWith(`${name} `));
+  const line = parameters
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .find((item) => item.startsWith(`${name} `));
   if (!line) return undefined;
   const value = Number(line.slice(name.length).trim());
   return Number.isFinite(value) ? value : undefined;
@@ -478,21 +741,62 @@ function parameterValue(parameters: string | undefined, name: string): number | 
 
 function ollamaProviderOptions(request: ModelRequest): OllamaGenerationOptions {
   if (!request.providerOptions) return {};
-  if (request.providerOptions.provider !== 'ollama') throw new ModelProviderError({ provider: 'ollama', code: 'invalid_request', message: `Request options for ${request.providerOptions.provider} cannot be used with Ollama.` });
+  if (request.providerOptions.provider !== 'ollama')
+    throw new ModelProviderError({
+      provider: 'ollama',
+      code: 'invalid_request',
+      message: `Request options for ${request.providerOptions.provider} cannot be used with Ollama.`
+    });
   return validateGenerationOptions(request.providerOptions.values);
 }
 
 function validateGenerationOptions(value: Record<string, unknown>): OllamaGenerationOptions {
-  const allowed = new Set(['num_ctx', 'num_predict', 'temperature', 'top_p', 'seed', 'repeat_penalty', 'repeat_last_n', 'frequency_penalty', 'presence_penalty', 'stop', 'num_gpu', 'num_thread']);
+  const allowed = new Set([
+    'num_ctx',
+    'num_predict',
+    'temperature',
+    'top_p',
+    'seed',
+    'repeat_penalty',
+    'repeat_last_n',
+    'frequency_penalty',
+    'presence_penalty',
+    'stop',
+    'num_gpu',
+    'num_thread'
+  ]);
   const unknown = Object.keys(value).filter((key) => !allowed.has(key));
-  if (unknown.length > 0) throw new ModelProviderError({ provider: 'ollama', code: 'invalid_request', message: `Unsupported Ollama generation option(s): ${unknown.join(', ')}.` });
+  if (unknown.length > 0)
+    throw new ModelProviderError({
+      provider: 'ollama',
+      code: 'invalid_request',
+      message: `Unsupported Ollama generation option(s): ${unknown.join(', ')}.`
+    });
   for (const key of ['num_ctx', 'num_predict', 'seed', 'repeat_last_n', 'num_gpu', 'num_thread']) {
-    if (value[key] !== undefined && (typeof value[key] !== 'number' || !Number.isInteger(value[key]))) throw new ModelProviderError({ provider: 'ollama', code: 'invalid_request', message: `Ollama ${key} must be an integer.` });
+    if (value[key] !== undefined && (typeof value[key] !== 'number' || !Number.isInteger(value[key])))
+      throw new ModelProviderError({
+        provider: 'ollama',
+        code: 'invalid_request',
+        message: `Ollama ${key} must be an integer.`
+      });
   }
   for (const key of ['temperature', 'top_p', 'repeat_penalty', 'frequency_penalty', 'presence_penalty']) {
-    if (value[key] !== undefined && (typeof value[key] !== 'number' || !Number.isFinite(value[key]))) throw new ModelProviderError({ provider: 'ollama', code: 'invalid_request', message: `Ollama ${key} must be finite.` });
+    if (value[key] !== undefined && (typeof value[key] !== 'number' || !Number.isFinite(value[key])))
+      throw new ModelProviderError({
+        provider: 'ollama',
+        code: 'invalid_request',
+        message: `Ollama ${key} must be finite.`
+      });
   }
-  if (value.stop !== undefined && (!Array.isArray(value.stop) || !value.stop.every((item) => typeof item === 'string'))) throw new ModelProviderError({ provider: 'ollama', code: 'invalid_request', message: 'Ollama stop must be an array of strings.' });
+  if (
+    value.stop !== undefined &&
+    (!Array.isArray(value.stop) || !value.stop.every((item) => typeof item === 'string'))
+  )
+    throw new ModelProviderError({
+      provider: 'ollama',
+      code: 'invalid_request',
+      message: 'Ollama stop must be an array of strings.'
+    });
   return { ...value };
 }
 
@@ -501,28 +805,7 @@ function positiveIntegerOrUndefined(value: unknown): number | undefined {
 }
 
 function toOllamaImages(images: readonly ModelImage[] | undefined): Message['images'] | undefined {
-  if (!images || images.length === 0) {
-    return undefined;
-  }
-  const hasBytes = images.some((image) => image.type === 'bytes');
-  const hasBase64 = images.some((image) => image.type === 'base64');
-  if (hasBytes && hasBase64) {
-    return images.map(toBase64Image);
-  }
-  if (hasBytes) {
-    return images.map((image) => {
-      if (image.type !== 'bytes') {
-        throw new ModelProviderError({ provider: 'ollama', code: 'invalid_request', message: 'Ollama image array contained mixed image types.' });
-      }
-      return image.data;
-    });
-  }
-  return images.map((image) => {
-    if (image.type !== 'base64') {
-      throw new ModelProviderError({ provider: 'ollama', code: 'invalid_request', message: 'Ollama image array contained mixed image types.' });
-    }
-    return image.data;
-  });
+  return images?.length ? images.map(toBase64Image) : undefined;
 }
 
 function toBase64Image(image: ModelImage): string {
@@ -531,7 +814,11 @@ function toBase64Image(image: ModelImage): string {
 
 function toOllamaTool(tool: ModelTool): Tool {
   if (tool.type !== 'function') {
-    throw new ModelProviderError({ provider: 'ollama', code: 'invalid_request', message: `Ollama provider only supports JSON function tools: ${tool.name}` });
+    throw new ModelProviderError({
+      provider: 'ollama',
+      code: 'invalid_request',
+      message: `Ollama provider only supports JSON function tools: ${tool.name}`
+    });
   }
   const fn: Tool['function'] = { name: tool.function.name };
   if (tool.function.description) {
@@ -548,7 +835,11 @@ function toOllamaTool(tool: ModelTool): Tool {
 
 function toOllamaToolCall(toolCall: ModelToolCall): NonNullable<Message['tool_calls']>[number] {
   if (toolCall.input.kind !== 'json') {
-    throw new ModelProviderError({ provider: 'ollama', code: 'invalid_request', message: `Ollama provider only supports JSON function tool calls: ${toolCall.name}` });
+    throw new ModelProviderError({
+      provider: 'ollama',
+      code: 'invalid_request',
+      message: `Ollama provider only supports JSON function tool calls: ${toolCall.name}`
+    });
   }
   return {
     function: {
@@ -570,7 +861,11 @@ function toOllamaFormat(format: ModelResponseFormat): string | object | undefine
 
 function normalizeToolCalls(toolCalls: readonly OllamaWireToolCall[]): ModelToolCall[] {
   return toolCalls.map((toolCall) => {
-    return { type: 'function', name: toolCall.function.name, input: { kind: 'json', value: toolCall.function.arguments } };
+    return {
+      type: 'function',
+      name: toolCall.function.name,
+      input: { kind: 'json', value: toolCall.function.arguments }
+    };
   });
 }
 
@@ -605,7 +900,8 @@ function normalizeTimings(response: OllamaWireResponse): Record<string, number> 
   const timings: Record<string, number> = {};
   if (response.total_duration !== undefined) timings.totalDurationNs = response.total_duration;
   if (response.load_duration !== undefined) timings.loadDurationNs = response.load_duration;
-  if (response.prompt_eval_duration !== undefined) timings.promptEvalDurationNs = response.prompt_eval_duration;
+  if (response.prompt_eval_duration !== undefined)
+    timings.promptEvalDurationNs = response.prompt_eval_duration;
   if (response.eval_duration !== undefined) timings.evalDurationNs = response.eval_duration;
   return timings;
 }
@@ -627,7 +923,12 @@ function classifyError(message: string, statusCode: number | undefined): ModelPr
   if (statusCode === 404 || /not found|model .* not found/i.test(message)) {
     return 'model_unavailable';
   }
-  if (statusCode === 400 || /invalid|bad request|schema|format|does not support tools|tools?.*not supported|tool calling.*not supported/i.test(message)) {
+  if (
+    statusCode === 400 ||
+    /invalid|bad request|schema|format|does not support tools|tools?.*not supported|tool calling.*not supported/i.test(
+      message
+    )
+  ) {
     return 'invalid_request';
   }
   if (statusCode === 408 || /context|token|too large|maximum context/i.test(message)) {
@@ -661,8 +962,65 @@ function parseOllamaModelResponse(value: unknown): ModelResponse {
     return parseModelResponse(value);
   } catch (error) {
     if (error instanceof ModelContractError) {
-      throw new ModelProviderError({ provider: 'ollama', code: 'malformed_response', message: `Ollama response violated the model contract: ${error.message}`, cause: error });
+      throw new ModelProviderError({
+        provider: 'ollama',
+        code: 'malformed_response',
+        message: `Ollama response violated the model contract: ${error.message}`,
+        cause: error
+      });
     }
     throw error;
   }
+}
+
+function toOllamaMessages(items: readonly ModelInputItem[], lowerDeveloper: boolean): Message[] {
+  const messages: Message[] = [];
+  let thinking: string | undefined;
+  for (const item of items) {
+    if (item.role === 'protocol') {
+      if (
+        thinking !== undefined ||
+        item.state.kind !== 'ollama.thinking' ||
+        typeof item.state.data.thinking !== 'string'
+      )
+        throw new ModelProviderError({
+          provider: 'ollama',
+          code: 'invalid_request',
+          message: 'Unsupported Ollama thinking state.'
+        });
+      thinking = item.state.data.thinking;
+      continue;
+    }
+    if (thinking !== undefined && item.role !== 'assistant')
+      throw new ModelProviderError({
+        provider: 'ollama',
+        code: 'invalid_request',
+        message: 'Thinking must precede its assistant message.'
+      });
+    const message = toOllamaMessage(item, lowerDeveloper);
+    if (thinking !== undefined) {
+      message.thinking = thinking;
+      thinking = undefined;
+    }
+    const previous = messages.at(-1);
+    if (item.role === 'assistant' && previous?.role === 'assistant') {
+      previous.content += message.content;
+      if (message.tool_calls) previous.tool_calls = [...(previous.tool_calls ?? []), ...message.tool_calls];
+      if (message.thinking) previous.thinking = message.thinking;
+    } else messages.push(message);
+  }
+  if (thinking !== undefined) messages.push({ role: 'assistant', content: '', thinking });
+  return messages;
+}
+
+function ollamaPayloadPaths(body: Record<string, unknown>): readonly (readonly (string | number)[])[] {
+  const paths: (string | number)[][] = [];
+  if (!Array.isArray(body.messages)) return paths;
+  for (const [index, raw] of (body.messages as unknown[]).entries()) {
+    const message = parseJsonObject(raw);
+    if (message.images !== undefined) paths.push(['messages', index, 'images']);
+    if (message.role === 'assistant' && message.thinking !== undefined)
+      paths.push(['messages', index, 'thinking']);
+  }
+  return paths;
 }

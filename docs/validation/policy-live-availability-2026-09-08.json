@@ -1,0 +1,144 @@
+{
+  "format": "agent-core.context-policy-report/1",
+  "createdAt": "2026-09-08T02:20:48.698Z",
+  "mode": "live",
+  "measurement": "empirical-model-trials",
+  "configuration": {
+    "trials": 1,
+    "delay": 6,
+    "transitionEvery": 4,
+    "policies": [
+      "retained-history",
+      "history-retrieval",
+      "notes-retrieval",
+      "provider-native"
+    ],
+    "budgetPerTrial": {
+      "maxInvocations": 2,
+      "maxPromptTokens": 20000,
+      "maxCompletionTokens": 1024,
+      "maxOutputTokens": 128,
+      "timeoutMs": 15000
+    },
+    "maxTotalInvocations": 2,
+    "gates": {
+      "minimumTrials": 10,
+      "maximumSuccessRegression": 0.05,
+      "maximumCostRatio": 1.25
+    },
+    "gateFingerprint": "d65d1f389b689ffbfa7ea40a2f4fb488647b485d6b61e64bbfd2422fbdb29e9a",
+    "workloadFingerprint": "bad855bf85c50746d8e790a2f65877ec6c60725b18b9579a9f858fc3c2a97f7b",
+    "policyVersion": "context-policies/1",
+    "source": {
+      "runnerSha256": "c1e09e68a77f1ab6277e66b4949efc2bc7867430f1e209cb93714c2e6156e593",
+      "commit": "aaa3f2ceb3acc050eac36e6db28c8a4381114916",
+      "dirty": true
+    },
+    "notePolicy": "Fixed-interval governed note generation from attended public context; bounded model-selected reads. Note tools do not grant writes in these trials.",
+    "ordering": "Rotate policy order by trial; each policy gets a fresh session and matched workload/budget.",
+    "generation": {
+      "maxOutputTokens": 128,
+      "temperature": "provider-default",
+      "seed": "not-supported-by-common-contract",
+      "outputLimit": "admission-reservation-only"
+    }
+  },
+  "provider": {
+    "id": "openai-codex",
+    "model": "gpt-5.6-sol",
+    "endpoint": "https://chatgpt.com/backend-api/codex/responses",
+    "credentialsPresent": true,
+    "credentialSource": "caller-specified-read-only-file",
+    "credentialFileSpecified": true,
+    "transport": "http_sse",
+    "credentialRefresh": "disabled",
+    "configurationStatus": "configured",
+    "implementationId": "agent-core.provider.openai-codex@1",
+    "capabilityRevision": "codex-responses-2026-09-07-v1",
+    "protocol": {
+      "version": 1,
+      "revision": "codex-responses-2026-09-07-v1",
+      "endpoint": "https://chatgpt.com/backend-api/codex/responses",
+      "roles": [
+        "system",
+        "developer",
+        "user",
+        "assistant"
+      ],
+      "inputKinds": [
+        "text",
+        "image",
+        "tool_call",
+        "tool_result",
+        "protocol"
+      ],
+      "outputKinds": [
+        "text",
+        "tool_call",
+        "protocol",
+        "refusal"
+      ],
+      "toolChoice": [
+        "auto"
+      ],
+      "state": "exact",
+      "continuation": "exact_prefix",
+      "asyncTools": false,
+      "steering": "next_request",
+      "contextTransforms": [],
+      "counting": "estimate",
+      "reasoningAccounting": "included_output"
+    },
+    "limits": {
+      "contextTokens": 1050000,
+      "maxInputTokens": 922000,
+      "outputTokens": 128000
+    },
+    "profileFingerprint": "9af5390bca5f2e45c60d57cd566ba90c3697219ac46aa58535c37218a8c5fa3d",
+    "profileVersionSource": "adapter-profile; modelVersion is caller-declared",
+    "modelVersion": null
+  },
+  "accounting": {
+    "requests": 0,
+    "maxRequests": 8,
+    "costStatus": "not-used"
+  },
+  "availability": [
+    {
+      "policy": "retained-history",
+      "status": "unavailable",
+      "reason": "Live trials require CONTEXT_EVAL_MODEL_VERSION to identify the pinned deployment; aliases alone are not a version pin."
+    },
+    {
+      "policy": "history-retrieval",
+      "status": "unavailable",
+      "reason": "Live trials require CONTEXT_EVAL_MODEL_VERSION to identify the pinned deployment; aliases alone are not a version pin."
+    },
+    {
+      "policy": "notes-retrieval",
+      "status": "unavailable",
+      "reason": "Live trials require CONTEXT_EVAL_MODEL_VERSION to identify the pinned deployment; aliases alone are not a version pin."
+    },
+    {
+      "policy": "provider-native",
+      "status": "unavailable",
+      "reason": "Live trials require CONTEXT_EVAL_MODEL_VERSION to identify the pinned deployment; aliases alone are not a version pin."
+    }
+  ],
+  "trials": [],
+  "summary": [],
+  "defaultRecommendation": null,
+  "limitations": [
+    "These authored text-memory tasks do not establish general agent quality or model rankings.",
+    "Simulation measures plumbing only; repeated deterministic trials are not independent model-quality evidence.",
+    "Report contains metrics and identities, not credentials, transcripts, notes, or provider payloads. Runtime storage is ephemeral in-memory.",
+    "Mechanical checks cover observed trial history, scope reads, call/result pairing and settlement; the full regression/fault suite is a separate release gate.",
+    "There is no interactive rescue: scheduled workload inputs are not counted as user interventions. Failed trials remain in the denominator.",
+    "Token estimates and unknown pricing remain explicit. Known-rate cost totals based on estimated usage cannot pass the cost gate. A crossed usage limit can include the final consumed invocation. Invocations count attempted admissions; settlements come from the governed owner ledger.",
+    "OpenAI uses bounded provider token counting so opaque native state can be admitted without a fabricated token allowance. Counting requests have a separate four-per-invocation comparison ceiling; their monetary charges are unknown, so trials using them cannot pass total-cost gates.",
+    "Note deliveries count runtime-selected context injections; noteReads counts explicit notes_read tool calls. Unsettled invocation usage remains uncertain, never assumed free.",
+    "Repeated work counts identical tool inputs within a run. Provider-state invalidations are null when no authoritative invalidation counter is exposed; continuation fallbacks are counted separately.",
+    "Quality intervals are per workload/policy comparison, not a family-wide model ranking. The cost gate compares mean known USD cost; it has no cost confidence estimate.",
+    "No policy becomes a production default automatically."
+  ]
+}

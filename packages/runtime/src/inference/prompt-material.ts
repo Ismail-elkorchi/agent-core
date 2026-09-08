@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { SimpleTokenEstimator, type TokenEstimator } from '@agent-core/model';
+import { CompleteRequestEstimator, type RequestEstimator } from '@agent-core/model';
 import type { ObservedFactRecord } from '@agent-core/tools';
 
 export interface PromptContextRange {
@@ -38,7 +38,7 @@ export interface PromptContextDelivery {
 
 export interface PromptInstructionBlock {
   readonly id: string;
-  readonly role: 'system' | 'developer' | 'environment' | 'user';
+  readonly role: 'system' | 'developer' | 'user';
   readonly content: string;
   readonly sourceUri?: string;
   readonly priority: number;
@@ -77,10 +77,8 @@ export interface PromptMaterial {
   readonly id: string;
   readonly task: string;
   readonly instructions: readonly PromptInstructionBlock[];
-  readonly notes: readonly string[];
   readonly context: readonly PromptContextItem[];
   readonly tools: readonly PromptToolSummary[];
-  readonly continuity: readonly string[];
   readonly observedFacts?: PromptObservedFactsMaterial;
   readonly outputContract?: PromptOutputContract;
   readonly metadata?: Readonly<Record<string, string>>;
@@ -88,18 +86,37 @@ export interface PromptMaterial {
 
 export function decodePromptContextItemInput(value: unknown): PromptContextItemInput {
   if (!isRecord(value)) throw new TypeError('Prompt context item must be an object.');
-  const allowed = new Set(['id', 'sourceUri', 'sourceKind', 'integrity', 'representation', 'mediaType', 'title', 'content', 'range', 'tokenEstimate', 'purpose']);
+  const allowed = new Set([
+    'id',
+    'sourceUri',
+    'sourceKind',
+    'integrity',
+    'representation',
+    'mediaType',
+    'title',
+    'content',
+    'range',
+    'tokenEstimate',
+    'purpose'
+  ]);
   const unsupported = Object.keys(value).filter((key) => !allowed.has(key));
-  if (unsupported.length > 0) throw new TypeError(`Unsupported prompt context fields: ${unsupported.join(', ')}.`);
-  if (typeof value.sourceUri !== 'string' || value.sourceUri.length === 0
-    || !oneOf(value.sourceKind, ['user', 'external', 'session', 'tool-observation', 'generated'] as const)
-    || (value.integrity !== undefined && !oneOf(value.integrity, ['unverified', 'verified'] as const))
-    || !oneOf(value.representation, ['full', 'excerpt', 'summary'] as const)
-    || typeof value.mediaType !== 'string' || value.mediaType.length === 0
-    || typeof value.title !== 'string' || typeof value.content !== 'string'
-    || typeof value.purpose !== 'string' || value.purpose.trim().length === 0
-    || (value.id !== undefined && (typeof value.id !== 'string' || value.id.length === 0))
-    || (value.tokenEstimate !== undefined && !nonnegativeInteger(value.tokenEstimate))) {
+  if (unsupported.length > 0)
+    throw new TypeError(`Unsupported prompt context fields: ${unsupported.join(', ')}.`);
+  if (
+    typeof value.sourceUri !== 'string' ||
+    value.sourceUri.length === 0 ||
+    !oneOf(value.sourceKind, ['user', 'external', 'session', 'tool-observation', 'generated'] as const) ||
+    (value.integrity !== undefined && !oneOf(value.integrity, ['unverified', 'verified'] as const)) ||
+    !oneOf(value.representation, ['full', 'excerpt', 'summary'] as const) ||
+    typeof value.mediaType !== 'string' ||
+    value.mediaType.length === 0 ||
+    typeof value.title !== 'string' ||
+    typeof value.content !== 'string' ||
+    typeof value.purpose !== 'string' ||
+    value.purpose.trim().length === 0 ||
+    (value.id !== undefined && (typeof value.id !== 'string' || value.id.length === 0)) ||
+    (value.tokenEstimate !== undefined && !nonnegativeInteger(value.tokenEstimate))
+  ) {
     throw new TypeError('Prompt context item fields are invalid.');
   }
   const range = value.range === undefined ? undefined : decodePromptContextRange(value.range);
@@ -121,7 +138,7 @@ export function decodePromptContextItemInput(value: unknown): PromptContextItemI
 /** Preserve application order; Core does not rerank or silently select a second context set. */
 export function deliverPromptContext(
   inputs: readonly PromptContextItemInput[],
-  estimator: TokenEstimator = new SimpleTokenEstimator()
+  estimator: RequestEstimator = new CompleteRequestEstimator()
 ): PromptContextDelivery {
   const ids = new Set<string>();
   const items = inputs.map((input) => materializePromptContextItem(input, estimator));
@@ -135,20 +152,30 @@ export function deliverPromptContext(
   });
 }
 
-export function createPromptMaterial(input: Omit<PromptMaterial, 'id'> & { readonly id?: string }): PromptMaterial {
+export function createPromptMaterial(
+  input: Omit<PromptMaterial, 'id'> & { readonly id?: string }
+): PromptMaterial {
   return Object.freeze({
     ...input,
     id: input.id ?? `material_${randomUUID()}`,
     instructions: Object.freeze(input.instructions.map((item) => Object.freeze({ ...item }))),
-    notes: Object.freeze([...input.notes]),
     context: Object.freeze([...input.context]),
-    tools: Object.freeze(input.tools.map((tool) => Object.freeze({ ...tool, accessModes: Object.freeze([...tool.accessModes]) }))),
-    continuity: Object.freeze([...input.continuity]),
+    tools: Object.freeze(
+      input.tools.map((tool) =>
+        Object.freeze({
+          ...tool,
+          accessModes: Object.freeze([...tool.accessModes])
+        })
+      )
+    ),
     ...(input.metadata ? { metadata: Object.freeze({ ...input.metadata }) } : {})
   });
 }
 
-function materializePromptContextItem(input: PromptContextItemInput, estimator: TokenEstimator): PromptContextItem {
+function materializePromptContextItem(
+  input: PromptContextItemInput,
+  estimator: RequestEstimator
+): PromptContextItem {
   const { id, tokenEstimate, ...rest } = input;
   return Object.freeze({
     ...rest,
@@ -161,13 +188,20 @@ function materializePromptContextItem(input: PromptContextItemInput, estimator: 
 function decodePromptContextRange(value: unknown): PromptContextRange {
   if (!isRecord(value)) throw new TypeError('Prompt context range must be an object.');
   const unsupported = Object.keys(value).filter((key) => key !== 'kind' && key !== 'start' && key !== 'end');
-  if (unsupported.length > 0 || !oneOf(value.kind, ['line', 'byte'] as const)
-    || (value.start !== undefined && !nonnegativeInteger(value.start))
-    || (value.end !== undefined && !nonnegativeInteger(value.end))
-    || (typeof value.start === 'number' && typeof value.end === 'number' && value.end < value.start)) {
+  if (
+    unsupported.length > 0 ||
+    !oneOf(value.kind, ['line', 'byte'] as const) ||
+    (value.start !== undefined && !nonnegativeInteger(value.start)) ||
+    (value.end !== undefined && !nonnegativeInteger(value.end)) ||
+    (typeof value.start === 'number' && typeof value.end === 'number' && value.end < value.start)
+  ) {
     throw new TypeError('Prompt context range is invalid.');
   }
-  return Object.freeze({ kind: value.kind, ...(value.start === undefined ? {} : { start: value.start }), ...(value.end === undefined ? {} : { end: value.end }) });
+  return Object.freeze({
+    kind: value.kind,
+    ...(value.start === undefined ? {} : { start: value.start }),
+    ...(value.end === undefined ? {} : { end: value.end })
+  });
 }
 
 function contextId(...parts: string[]): string {
@@ -183,7 +217,10 @@ function contextId(...parts: string[]): string {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
-function oneOf<const TValue extends readonly string[]>(value: unknown, choices: TValue): value is TValue[number] {
+function oneOf<const TValue extends readonly string[]>(
+  value: unknown,
+  choices: TValue
+): value is TValue[number] {
   return typeof value === 'string' && choices.some((choice) => choice === value);
 }
 function nonnegativeInteger(value: unknown): value is number {

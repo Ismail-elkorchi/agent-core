@@ -123,7 +123,7 @@ test('trusted model request construction owns retained input before provider val
   message.content = 'after';
   message.images[0].data[0] = 2;
   assert.equal(request.messages[0].content, 'before');
-  assert.equal(request.messages[0].images[0].data[0], 1);
+  assert.deepEqual([...Buffer.from(request.messages[0].images[0].data, 'base64')], [1]);
   assert.equal(parseModelRequest(request), request);
 });
 

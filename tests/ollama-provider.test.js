@@ -357,3 +357,44 @@ test('OllamaProvider declares GPT-OSS effort semantics without a disable path', 
     error => error.code === 'invalid_request' && /cannot be disabled/.test(error.message)
   );
 });
+
+test('OllamaProvider validates configured reasoning against the discovered exact profile', async () => {
+  const client = new FakeOllamaClient([]);
+  const provider = new OllamaProvider({ clientFactory: () => client, reasoning: { strategy: 'effort', effort: 'low' } });
+  await assert.rejects(
+    () => provider.complete({ model: 'llama3.1', messages: [{ role: 'user', content: 'hi' }] }),
+    error => error.code === 'invalid_request' && /reasoning/.test(error.message)
+  );
+  assert.equal(client.requests.length, 0);
+  const unknown = await provider.describeModel('custom/gpt-oss-invented');
+  assert.deepEqual(unknown.capabilities.reasoning.strategies, ['toggle']);
+});
+
+test('OllamaProvider sends the admitted default reasoning and body unchanged', async () => {
+  const client = new FakeOllamaClient([{ model: 'gpt-oss:20b', message: { content: 'ok' }, done: true }]);
+  const reasoning = { strategy: 'effort', effort: 'low' };
+  const provider = new OllamaProvider({ clientFactory: () => client, reasoning });
+  const original = { model: 'gpt-oss:20b', messages: [{ role: 'user', content: 'original' }], maxOutputTokens: 100 };
+  const compiled = await provider.compileRequest(original);
+  reasoning.effort = 'high';
+  original.messages[0].content = 'changed';
+  assert.equal(await provider.compileRequest(compiled.logicalRequest), compiled);
+  await provider.completeCompiled(compiled);
+  const { stream, ...body } = client.requests[0];
+  assert.equal(stream, true);
+  assert.equal(body.think, 'low');
+  assert.deepEqual(body, compiled.body);
+});
+
+test('Ollama declares developer-only lowering while preserving logical authority and user attribution', async () => {
+  const client = new FakeOllamaClient([{ model: 'llama3.1', message: { content: 'ok' }, done: true }]);
+  const provider = new OllamaProvider({ clientFactory: () => client });
+  const messages = [{ role: 'developer', content: 'Application policy' }, { role: 'user', content: 'Untrusted retrieved guidance' }];
+  const compiled = await provider.compileRequest({ model: 'llama3.1', messages, maxOutputTokens: 100 });
+  assert.equal((await provider.describeModel('llama3.1')).capabilities.protocol.developerRole, 'system_if_no_system');
+  assert.deepEqual(compiled.logicalRequest.messages.map(item => item.role), ['developer', 'user']);
+  assert.deepEqual(compiled.body.messages, [{ role: 'system', content: 'Application policy' }, messages[1]]);
+  await provider.completeCompiled(compiled);
+  await assert.rejects(() => provider.compileRequest({ model: 'llama3.1', messages: [{ role: 'system', content: 'Higher priority policy' }, ...messages] }), /mixed system and developer/u);
+  assert.equal(client.requests.length, 1);
+});

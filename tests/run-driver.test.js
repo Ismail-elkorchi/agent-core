@@ -27,6 +27,14 @@ const acceptance = (runId = 'run-run') => ({
   }
 });
 
+const sourceFor = calls => {
+  const entries = [{ name: 'read', implementationId: 'read-v1', definitionHash: 'b'.repeat(64) }];
+  return {
+    source: { responseId: 'response-1', catalog: { revision: hashJson(entries), entries } },
+    modelCalls: calls.map(call => ({ id: call.id, name: call.name, type: 'function', input: call.input }))
+  };
+};
+
 test('run acceptance is durable and inspection is read-only', async () => {
   const events = new InMemoryEventRepository(agentEventCodec);
   const runs = new AgentRunCoordinator(events);
@@ -90,9 +98,10 @@ test('a stale live owner may settle only its exact started tool effect permit', 
   const pending = decodeAgentRunState({
     ...staleOwner.state(),
     revision: staleOwner.state().revision + 1,
-    phase: {
+    phase: { kind: 'active' },
+    toolBatches: [{
       kind: 'tools', identity: { turnIndex: 1, turnId: 'turn-1', requestAttempt: 1 },
-      toolBatchId: 'batch-1', calls: [call], maxConcurrency: 1, nextObservationIndex: 0,
+      toolBatchId: 'batch-1', calls: [call], maxConcurrency: 1, ...sourceFor([call]),
       instructions: [], modelInputModalities: ['text'],
       callStates: [{
         stage: 'effect_pending',
@@ -105,7 +114,7 @@ test('a stale live owner may settle only its exact started tool effect permit', 
         toolAttempt: 1,
         effect
       }]
-    },
+    }],
     budget: {
       modelTurns: 1, totalToolCalls: 1, repeatedIdenticalToolCalls: 0, revisionAttempts: 0, elapsedMs: 1,
       promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0,
@@ -130,14 +139,14 @@ test('a stale live owner may settle only its exact started tool effect permit', 
     /settlement authority was rejected/u
   );
   const settled = await runs.settleToolEffect('effect-settlement', { effectId, permit, settlement });
-  assert.equal(settled.state.phase.kind, 'tools');
-  assert.equal(settled.state.phase.callStates[0].stage, 'settled');
+  assert.equal(settled.state.phase.kind, 'active');
+  assert.equal(settled.state.toolBatches[0].callStates[0].stage, 'settled');
   const synchronized = await staleOwner.synchronize();
   assert.equal(synchronized.state.control.status, 'owned');
   assert.equal(synchronized.state.control.driverId, 'driver-two');
 });
 
-test('every parallel completion permutation survives driver replacement and records only the settled source-order prefix', async () => {
+test('every completion permutation survives takeover and records each settled call immediately', async () => {
   const permutations = [
     [0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]
   ];
@@ -170,10 +179,11 @@ test('every parallel completion permutation survives driver replacement and reco
     }));
     const pending = decodeAgentRunState({
       ...initial.state(), revision: initial.state().revision + 1,
-      phase: {
+      phase: { kind: 'active' },
+      toolBatches: [{
         kind: 'tools', identity: { turnIndex: 1, turnId: 'turn-1', requestAttempt: 1 }, toolBatchId: 'batch-1', calls,
-        callStates, maxConcurrency: 3, nextObservationIndex: 0, instructions: [], modelInputModalities: ['text']
-      },
+        callStates, maxConcurrency: 3, ...sourceFor(calls), instructions: [], modelInputModalities: ['text']
+      }],
       budget: {
         modelTurns: 1, totalToolCalls: 3, repeatedIdenticalToolCalls: 1, revisionAttempts: 0, elapsedMs: 1,
         promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0,
@@ -200,32 +210,25 @@ test('every parallel completion permutation survives driver replacement and reco
       await runs.settleToolEffect(runId, { effectId: effect.intent.effectId, permit: effect.settlementPermit, settlement });
       await runs.settleToolEffect(runId, { effectId: effect.intent.effectId, permit: effect.settlementPermit, settlement });
       driver = await runs.attach(runId, `driver-after-${String(completionIndex)}`);
-      const phase = driver.state().phase;
-      assert.equal(phase.kind, 'tools');
+      const phase = driver.state().toolBatches[0];
       assert.equal(phase.callStates[callIndex].stage, 'settled');
-      assert.equal(phase.nextObservationIndex, 0);
-    }
-    assert.deepEqual(nextAgentRunInstruction(driver.state()), { kind: 'execute', procedure: 'begin_observation_recording' });
-
-    for (let callIndex = 0; callIndex < calls.length; callIndex += 1) {
-      let result = await driver.drive(({ state, instruction }) => {
-        assert.equal(instruction.procedure, 'begin_observation_recording');
-        const phase = state.phase;
-        assert.equal(phase.kind, 'tools');
-        const states = [...phase.callStates];
-        states[callIndex] = { ...states[callIndex], stage: 'recording' };
-        return { phase: { ...phase, callStates: states } };
-      });
-      assert.equal(result.kind, 'advanced');
-      result = await driver.drive(({ state, instruction }) => {
-        assert.equal(instruction.procedure, 'record_tool_observation');
-        const phase = state.phase;
-        assert.equal(phase.kind, 'tools');
-        const states = [...phase.callStates];
-        states[callIndex] = { ...states[callIndex], stage: 'recorded' };
-        return { phase: { ...phase, callStates: states, nextObservationIndex: callIndex + 1 } };
-      });
-      assert.equal(result.kind, 'advanced');
+      const instruction = nextAgentRunInstruction(driver.state());
+      assert.equal(instruction.procedure, 'begin_observation_recording');
+      assert.deepEqual(instruction.target, { kind: 'tool', toolBatchId: 'batch-1', callIndex });
+      const target = { toolBatchId: 'batch-1', callIndex };
+      await driver.transitionTool('begin_observation_recording', target, call => ({ ...call, stage: 'recording' }));
+      await driver.transitionTool('record_tool_observation', target, call => ({ ...call, stage: 'recorded' }));
+      assert.equal(driver.state().toolBatches[0].callStates[callIndex].stage, 'recorded');
+      // Recording an out-of-order result cannot invent observations for other calls.
+      for (const otherIndex of permutation.slice(completionIndex + 1)) {
+        assert.equal(driver.state().toolBatches[0].callStates[otherIndex].stage, 'effect_pending');
+      }
+      await assert.rejects(runs.settleToolEffect(runId, {
+        effectId: effect.intent.effectId,
+        permit: { ...effect.settlementPermit, permitId: 'forged-after-recording' }, settlement
+      }), /settlement authority/u);
+      const unchanged = await runs.settleToolEffect(runId, { effectId: effect.intent.effectId, permit: effect.settlementPermit, settlement });
+      assert.equal(unchanged.state.toolBatches[0].callStates[callIndex].stage, 'recorded');
     }
     assert.deepEqual(nextAgentRunInstruction(driver.state()), { kind: 'execute', procedure: 'advance_after_tools' });
   }
@@ -253,6 +256,8 @@ test('total run states select one explicit procedure, wait, or completion', () =
     driverGeneration: 0,
     control: { status: 'detached' },
     phase: { kind: 'accepted' },
+    providerRequests: [],
+    toolBatches: [],
     toolCalls: [],
     revisionInstructions: []
   });

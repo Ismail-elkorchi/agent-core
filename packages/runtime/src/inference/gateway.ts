@@ -2,37 +2,84 @@ import {
   parseModelResponse,
   parseModelStreamEvent,
   type ModelProfile,
+  type ModelTransportOptions,
   type ModelProvider,
   type ModelProviderSession,
   type ModelRequest,
   type ModelResponse,
   type ModelStreamEvent,
-  SimpleTokenEstimator,
-  type TokenEstimator
+  compileModelRequest,
+  assertRequestAccountingFits,
+  type CompiledModelRequest
 } from '@agent-core/model';
 import { ModelStreamInterruptedError } from '../orchestration/model-stream.js';
-import { assertModelRequestFitsProfile } from './request-fit.js';
 
 export interface InferenceInvocation {
+  readonly transport?: ModelTransportOptions;
   readonly request: ModelRequest;
+  readonly admitted?: CompiledModelRequest;
   readonly profile: ModelProfile;
   readonly session: ModelProviderSession;
   readonly turnIndex: number;
-  readonly onStreamEvent?: (event: Exclude<ModelStreamEvent, { readonly type: 'done' }>) => void | Promise<void>;
+  readonly onStreamEvent?: (
+    event: Exclude<ModelStreamEvent, { readonly type: 'done' }>
+  ) => void | Promise<void>;
 }
 
 /** The only runtime path that invokes a provider session. */
 export class InferenceGateway {
-  constructor(readonly provider: ModelProvider, private readonly estimator: TokenEstimator = new SimpleTokenEstimator()) {}
+  constructor(readonly provider: ModelProvider) {}
 
   createSession(): ModelProviderSession {
     return this.provider.createSession?.() ?? directProviderSession(this.provider);
   }
 
+  async compile(request: ModelRequest, profile: ModelProfile): Promise<CompiledModelRequest> {
+    request.signal?.throwIfAborted();
+    if (profile.provider !== this.provider.id || request.model !== profile.id)
+      throw new Error('Inference profile does not match its provider and model.');
+    const body = { ...request };
+    delete body.signal;
+    const compiled = this.provider.compileRequest
+      ? await this.provider.compileRequest(request)
+      : await compileModelRequest({
+          request,
+          profile,
+          body: JSON.parse(JSON.stringify(body)) as unknown,
+          endpoint: profile.capabilities.protocol?.endpoint ?? this.provider.id
+        });
+    if (
+      compiled.provider !== profile.provider ||
+      compiled.model !== profile.id ||
+      compiled.capabilityRevision !== (profile.capabilities.protocol?.revision ?? 'conservative-v1')
+    )
+      throw new Error('Compiled input changed the admitted model or capability revision.');
+    return compiled;
+  }
+
+  async admit(request: ModelRequest, profile: ModelProfile): Promise<CompiledModelRequest> {
+    const compiled = await this.compile(request, profile);
+    assertRequestAccountingFits(compiled.accounting);
+    return compiled;
+  }
+
   async invoke(input: InferenceInvocation): Promise<ModelResponse> {
-    assertModelRequestFitsProfile(input.request, input.profile, this.estimator);
-    if (!input.profile.capabilities.streaming || !input.session.stream) {
-      return parseModelResponse(await input.session.complete(input.request));
+    const admitted = input.admitted ?? (await this.admit(input.request, input.profile));
+    assertRequestAccountingFits(admitted.accounting);
+    input.request.signal?.throwIfAborted();
+    const compiledStream = input.session.streamCompiled?.bind(input.session);
+    const logicalStream = input.session.stream?.bind(input.session);
+    const stream = compiledStream
+      ? () => compiledStream(admitted, input.transport)
+      : logicalStream
+        ? () => logicalStream(admitted.logicalRequest)
+        : undefined;
+    if (!input.profile.capabilities.streaming || !stream) {
+      return parseModelResponse(
+        await (input.session.completeCompiled
+          ? input.session.completeCompiled(admitted, input.transport)
+          : input.session.complete(admitted.logicalRequest))
+      );
     }
 
     let response: ModelResponse | undefined;
@@ -40,7 +87,7 @@ export class InferenceGateway {
     let reasoningSummary = '';
     let terminalEvents = 0;
     try {
-      for await (const rawEvent of input.session.stream(input.request)) {
+      for await (const rawEvent of stream()) {
         const event = parseModelStreamEvent(rawEvent);
         if (terminalEvents > 0) throw new Error('Provider stream emitted an event after its terminal event.');
         if (event.type === 'done') {
@@ -49,14 +96,21 @@ export class InferenceGateway {
           continue;
         }
         if (event.type === 'content') content = event.accumulated;
-        if (event.type === 'reasoning' && event.channel === 'summary') reasoningSummary = event.accumulatedReasoning;
+        if (event.type === 'reasoning' && event.channel === 'summary')
+          reasoningSummary = event.accumulatedReasoning;
         await input.onStreamEvent?.(event);
       }
     } catch (cause) {
       throw interrupted(input.turnIndex, cause, content, reasoningSummary, response !== undefined);
     }
     if (!response) {
-      throw interrupted(input.turnIndex, new Error('Model stream ended without a final response.'), content, reasoningSummary, false);
+      throw interrupted(
+        input.turnIndex,
+        new Error('Model stream ended without a final response.'),
+        content,
+        reasoningSummary,
+        false
+      );
     }
     return Object.freeze({
       ...response,
@@ -70,11 +124,19 @@ function directProviderSession(provider: ModelProvider): ModelProviderSession {
   const stream = provider.stream?.bind(provider);
   return Object.freeze({
     complete: (request: ModelRequest) => provider.complete(request),
-    ...(stream ? { stream: (request: ModelRequest) => stream(request) } : {})
+    ...(stream ? { stream: (request: ModelRequest) => stream(request) } : {}),
+    ...(provider.completeCompiled ? { completeCompiled: provider.completeCompiled.bind(provider) } : {}),
+    ...(provider.streamCompiled ? { streamCompiled: provider.streamCompiled.bind(provider) } : {})
   });
 }
 
-function interrupted(turnIndex: number, cause: unknown, content: string, reasoningSummary: string, finalResponseReceived: boolean): ModelStreamInterruptedError {
+function interrupted(
+  turnIndex: number,
+  cause: unknown,
+  content: string,
+  reasoningSummary: string,
+  finalResponseReceived: boolean
+): ModelStreamInterruptedError {
   return new ModelStreamInterruptedError({
     turnIndex,
     cause,

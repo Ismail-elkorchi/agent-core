@@ -1,3 +1,4 @@
+import { ClaudeProvider } from '@agent-core/provider-claude';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ModelProviderError, parseModelProfile, parseModelResponse, parseModelStreamEvent } from '@agent-core/model';
@@ -8,7 +9,7 @@ import { OpenRouterProvider } from '@agent-core/provider-openrouter';
 
 const request = { model: 'test-model', messages: [{ role: 'user', content: 'hello' }] };
 
-for (const adapter of [ollamaAdapter(), openAIAdapter(), openAICodexAdapter(), openRouterAdapter()]) {
+for (const adapter of [ollamaAdapter(), openAIAdapter(), openAICodexAdapter(), openRouterAdapter(), claudeAdapter()]) {
   test(`${adapter.name} passes the shared provider conformance kit`, async () => {
     const provider = adapter.create();
     const profile = parseModelProfile(await provider.describeModel(adapter.model));
@@ -18,6 +19,24 @@ for (const adapter of [ollamaAdapter(), openAIAdapter(), openAICodexAdapter(), o
     assert.equal(complete.content, 'hello');
     assert.equal(complete.terminationReason, 'stop');
     assertUsage(complete.usage);
+
+    const compiled = await provider.compileRequest({ ...request, model: adapter.model });
+    const originalBody = compiled.body;
+    const cancelledTransport = new AbortController();
+    cancelledTransport.abort();
+    await assert.rejects(() => provider.completeCompiled(compiled, { signal: cancelledTransport.signal }), error => error instanceof ModelProviderError && error.code === 'aborted');
+    await assert.rejects(async () => {
+      for await (const event of provider.streamCompiled(compiled, { signal: cancelledTransport.signal })) void event;
+    }, error => error instanceof ModelProviderError && error.code === 'aborted');
+    const compiledSession = provider.createSession?.();
+    if (compiledSession?.completeCompiled) {
+      await assert.rejects(() => compiledSession.completeCompiled(compiled, { signal: cancelledTransport.signal }), error => error instanceof ModelProviderError && error.code === 'aborted');
+      await compiledSession.close?.();
+    }
+    assert.equal((await provider.completeCompiled(compiled)).content, 'hello', 'transport cancellation does not invalidate immutable admission');
+    assert.equal(compiled.body, originalBody);
+    assert(Object.isFrozen(compiled));
+    await assert.rejects(async () => provider.completeCompiled({ ...compiled }), /compiled|admitted|Unrecognized/iu);
 
     const imageResult = parseModelResponse(await provider.complete(toolImageRequest(adapter.model)));
     assert.equal(imageResult.terminationReason, 'stop', 'a view_image tool result may carry its image into the next provider request');
@@ -230,3 +249,20 @@ function assertUsage(usage) { assert.ok(usage); for (const value of Object.value
 function json(body) { return new Response(JSON.stringify(body), { headers: { 'content-type': 'application/json' } }); }
 function sse(chunks) { return new Response([...chunks.map(chunk => `data: ${JSON.stringify(chunk)}`), 'data: [DONE]'].join('\n\n'), { headers: { 'content-type': 'text/event-stream' } }); }
 function codexToken() { return `header.${Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'account' } })).toString('base64url')}.signature`; }
+
+function claudeAdapter() {
+  const message = { id: 'msg-conformance', type: 'message', role: 'assistant', model: 'claude-sonnet-4-6', stop_reason: 'end_turn', content: [{ type: 'text', text: 'hello' }], usage: { input_tokens: 2, output_tokens: 1 } };
+  return {
+    name: 'ClaudeProvider', model: 'claude-sonnet-4-6',
+    create() { return new ClaudeProvider({ apiKey: 'test', fetch: async (_url, init) => JSON.parse(init.body).stream ? sse([
+      { type: 'message_start', message: { ...message, content: [], stop_reason: null, usage: { input_tokens: 2, output_tokens: 0 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'hello' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } },
+      { type: 'message_stop' }
+    ]) : json(message) }); },
+    createMalformed() { return new ClaudeProvider({ apiKey: 'test', fetch: async () => json({ ...message, content: [{ type: 'tool_use', id: 'bad', name: 'bad', input: 'not-json-object' }] }) }); },
+    createMalformedUsage() { return new ClaudeProvider({ apiKey: 'test', fetch: async () => json({ ...message, usage: { input_tokens: -1, output_tokens: 1 } }) }); }
+  };
+}

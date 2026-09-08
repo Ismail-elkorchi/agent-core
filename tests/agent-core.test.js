@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import {
   AgentRuntime,
   AgentRunCoordinator,
+  PendingCallCoordinator,
   AgentFinalizationError,
   AgentRunFinalizer,
   agentEventCodec,
@@ -324,7 +325,7 @@ test('session and observation-record assembly failures do not reclassify a compl
   }
 });
 
-test('parallel tool settlements commit immediately while conversation assembly remains a contiguous source-order prefix', async () => {
+test('parallel tool observations commit independently while an earlier call remains pending', async () => {
   const gates = [deferred(), deferred(), deferred()];
   const started = [deferred(), deferred(), deferred()];
   let active = 0;
@@ -354,22 +355,26 @@ test('parallel tool settlements commit immediately while conversation assembly r
   const control = fixture.agent.run({ task: 'run independent calls' });
   await Promise.all([started[0].promise, started[1].promise]);
   let inspection = await fixture.agent.inspectRun(control.runId);
-  assert.equal(inspection.state.phase.kind, 'tools');
-  assert.equal(inspection.state.phase.maxConcurrency, 2);
-  assert.deepEqual(inspection.state.phase.callStates.map((state) => state.stage), ['effect_pending', 'effect_pending', 'effect_ready']);
+  assert.equal(inspection.state.phase.kind, 'active');
+  assert.equal(inspection.state.toolBatches[0].maxConcurrency, 2);
+  assert.deepEqual(inspection.state.toolBatches[0].callStates.map((state) => state.stage), ['effect_pending', 'effect_pending', 'effect_ready']);
 
   gates[1].resolve();
   await started[2].promise;
   gates[2].resolve();
   for (;;) {
     inspection = await fixture.agent.inspectRun(control.runId);
-    if (inspection.state.phase.kind === 'tools' && inspection.state.phase.callStates[1]?.stage === 'settled'
-      && inspection.state.phase.callStates[2]?.stage === 'settled') break;
+    if (inspection.state.phase.kind === 'active' && inspection.state.toolBatches[0].callStates[1]?.stage === 'recorded'
+      && inspection.state.toolBatches[0].callStates[2]?.stage === 'recorded') break;
     await Promise.resolve();
   }
-  assert.deepEqual(inspection.state.phase.callStates.map((state) => state.stage), ['effect_pending', 'settled', 'settled']);
-  assert.equal(inspection.state.phase.nextObservationIndex, 0);
-  assert.equal((await eventsFor(fixture.events, control.runId)).some((event) => event.type === 'observation.record.created'), false);
+  assert.deepEqual(inspection.state.toolBatches[0].callStates.map((state) => state.stage), ['effect_pending', 'recorded', 'recorded']);
+  const pending = await PendingCallCoordinator.recover(fixture.events,control.runId);
+  assert.deepEqual(pending.pending().map((call)=>call.callId),['parallel-0']);
+  assert.deepEqual(pending.inspect().map((call)=>call.state.stage),['effect_pending','recorded','recorded']);
+  assert.equal(new Set(pending.inspect().map((call)=>call.catalogRevision)).size,1);
+  assert.throws(()=>pending.assertTransitionBoundary(),/exact results/);
+  assert.deepEqual((await eventsFor(fixture.events, control.runId)).filter((event) => event.type === 'observation.record.created').map(event => event.callIndex), [1, 2]);
 
   gates[0].resolve();
   const result = ended(await control.result);
@@ -377,7 +382,11 @@ test('parallel tool settlements commit immediately while conversation assembly r
   assert.equal(maximumActive, 2);
   const events = await eventsFor(fixture.events, control.runId);
   assert.deepEqual(events.filter((event) => event.type === 'tool.ended').map((event) => event.callIndex), [1, 2, 0]);
-  assert.deepEqual(events.filter((event) => event.type === 'observation.record.created').map((event) => event.callIndex), [0, 1, 2]);
+  assert.deepEqual(events.filter((event) => event.type === 'observation.record.created').map((event) => event.callIndex), [1, 2, 0]);
+  const settledCalls = await PendingCallCoordinator.recover(fixture.events,control.runId);
+  assert.equal(settledCalls.inspect().length,3);
+  assert.deepEqual(settledCalls.pending(),[]);
+  settledCalls.assertTransitionBoundary();
 });
 
 test('parallel scheduler enforces explicit dependencies and resource conflicts without serializing unrelated calls', async () => {
@@ -407,14 +416,14 @@ test('parallel scheduler enforces explicit dependencies and resource conflicts w
   const control = fixture.agent.run({ task: 'respect dependencies' });
   await Promise.all([started[0].promise, started[1].promise]);
   let inspection = await fixture.agent.inspectRun(control.runId);
-  assert.equal(inspection.state.phase.kind, 'tools');
-  assert.deepEqual(inspection.state.phase.callStates.map((state) => state.stage), ['effect_pending', 'effect_pending', 'effect_ready', 'effect_ready']);
+  assert.equal(inspection.state.phase.kind, 'active');
+  assert.deepEqual(inspection.state.toolBatches[0].callStates.map((state) => state.stage), ['effect_pending', 'effect_pending', 'effect_ready', 'effect_ready']);
 
   gates[1].resolve();
   await started[3].promise;
   inspection = await fixture.agent.inspectRun(control.runId);
-  assert.equal(inspection.state.phase.kind, 'tools');
-  assert.equal(inspection.state.phase.callStates[2].stage, 'effect_ready');
+  assert.equal(inspection.state.phase.kind, 'active');
+  assert.equal(inspection.state.toolBatches[0].callStates[2].stage, 'effect_ready');
   gates[3].resolve();
   gates[0].resolve();
   await started[2].promise;
@@ -422,6 +431,56 @@ test('parallel scheduler enforces explicit dependencies and resource conflicts w
   const result = ended(await control.result);
   assert.equal(result.executionStatus, 'completed', JSON.stringify(result));
   assert.deepEqual(startOrder, [0, 1, 3, 2]);
+});
+
+test('approval waits for earlier unplanned calls and binds the revision after preceding effects', async () => {
+  const readStarted = deferred();
+  const readGate = deferred();
+  const laterPlanned = deferred();
+  let revision = 0;
+  const writes = [];
+  const tool = {
+    name: 'revision_order', implementationId: 'tests/approval-order@1', description: 'revision-bound effects',
+    jsonSchema: { type: 'object', properties: { index: { type: 'integer' } }, required: ['index'] },
+    outputSchema: emptyOutputSchema,
+    effectEnvelope: { accesses: [{ mode: 'read', scope: 'revision' }, { mode: 'write', scope: 'revision' }], lockScopes: [] },
+    decodeInput(input) { return { ok: true, input: input.value }; },
+    canonicalizeInput(input) { return { index: input.index, revision }; },
+    snapshotInput(input) { return input; },
+    deriveEffects(input) { return { accesses: [{ mode: input.index === 0 ? 'read' : 'write', scope: 'revision' }], lockScopes: [], recovery: { kind: 'unknown' } }; },
+    async invoke(input) {
+      if (input.index === 0) {
+        readStarted.resolve();
+        await readGate.promise;
+      } else {
+        assert.equal(input.revision, revision);
+        writes.push(input.index);
+        revision += 1;
+      }
+      return { kind: 'result', ok: true, output: {}, summary: 'settled', scope: completeScope };
+    }
+  };
+  const fixture = await harness({
+    tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] },
+    toolAuthorizer(request) {
+      if (request.input.index === 2) laterPlanned.resolve();
+      return request.input.index === 0 ? { decision: 'allow' } : { decision: 'require_approval', reason: 'Approve this revision.' };
+    },
+    script: [response('tool_calls', '', { toolCalls: [0, 1, 2].map((index) => ({ id: `revision-${index}`, type: 'function', name: tool.name, input: { kind: 'json', value: { index } } })) }), response()]
+  });
+  const control = fixture.agent.run({ task: 'Approve effects against their current revisions.' });
+  await Promise.all([readStarted.promise, laterPlanned.promise]);
+  readGate.resolve();
+  let result = await control.result;
+  for (const index of [1, 2]) {
+    assert.equal(result.state, 'suspended', JSON.stringify(result));
+    assert.equal(result.pendingApprovals.length, 1);
+    const approval = result.pendingApprovals[0];
+    assert.deepEqual(approval.input, { index, revision: index - 1 });
+    result = await (await fixture.agent.resolveApproval({ runId: result.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result;
+  }
+  assert.equal(ended(result).executionStatus, 'completed');
+  assert.deepEqual(writes, [1, 2]);
 });
 
 test('cancellation durably closes or marks every call in a parallel batch', async () => {
@@ -447,10 +506,10 @@ test('cancellation durably closes or marks every call in a parallel batch', asyn
   const result = ended(await control.result);
   assert.equal(result.executionStatus, 'aborted');
   const transitions = (await eventsFor(run.events, control.runId)).filter((event) => event.type === 'run.state.changed');
-  const cancelling = transitions.find((event) => event.state.phase.kind === 'cancelling' && event.state.phase.toolBatch);
+  const cancelling = transitions.find((event) => event.state.phase.kind === 'cancelling' && event.state.toolBatches.length);
   assert.ok(cancelling);
-  assert.deepEqual(cancelling.state.phase.toolBatch.callStates.map((state) => state.stage), ['outcome_unknown', 'outcome_unknown', 'cancelled']);
-  assert.equal(cancelling.state.phase.toolBatch.callStates.every((state) => state.stage !== 'ready' && state.stage !== 'effect_ready' && state.stage !== 'effect_pending'), true);
+  assert.deepEqual(cancelling.state.toolBatches[0].callStates.map((state) => state.stage), ['outcome_unknown', 'outcome_unknown', 'cancelled']);
+  assert.equal(cancelling.state.toolBatches[0].callStates.every((state) => state.stage !== 'ready' && state.stage !== 'effect_ready' && state.stage !== 'effect_pending'), true);
 });
 
 async function eventsFor(repository, runId) {
@@ -886,7 +945,7 @@ test('in-memory repositories run, reopen, and replay without filesystem paths', 
   assert.equal(started.finalizationId, firstResult.finalizationId);
   const reopened = await first.sessions.open(first.session.id, SESSION_BINDING);
   assert.equal(reopened.id, first.session.id);
-  const secondProvider = new ScriptedProvider([request => response('stop', request.messages.some(message => message.content.includes('Prior session context')) ? 'replayed' : 'missing')]);
+  const secondProvider = new ScriptedProvider([request => response('stop', request.messages.some(message => message.role === 'user' && message.content === 'first') && request.messages.some(message => message.role === 'assistant' && message.content === 'first') ? 'replayed' : 'missing')]);
   const second = new AgentRuntime({ provider: secondProvider, model: 'scripted', toolBoundary, repositories: { events: first.events, session: { repository: first.sessions, descriptor: reopened }, artifacts: first.artifacts } });
   const secondResult = ended(await second.run({ task: 'second' }).result);  assert.equal(firstResult.executionStatus, 'completed');
   assert.equal(secondResult.modelOutput.message, 'replayed');
@@ -943,22 +1002,25 @@ test('provider failure preserves one durable unknown outcome without a second re
   assert.equal(records.filter(event => event.type === 'model.requested').length, 1);
   assert.equal(records.filter(event => event.type === 'provider.attempt.settled').length, 0);
   const inspection = await new AgentRunCoordinator(fixture.events).inspect(result.runId);
-  assert.equal(inspection.state.phase.kind, 'provider');
-  assert.equal(inspection.state.phase.stage, 'outcome_unknown');
-  assert.equal(inspection.state.phase.effect.intent.implementationId, provider.implementationId);
-  assert.deepEqual(inspection.state.phase.effect.intent.recovery, { kind: 'unknown' });
-  assert.deepEqual(inspection.state.phase.effect.intent.exposure.quantities.map(quantity => quantity.unit), ['prompt_tokens', 'completion_tokens']);
-  assert.ok(inspection.state.phase.effect.intent.exposure.quantities.every(quantity => quantity.amount > 0));
+  assert.equal(inspection.state.phase.kind, 'active');
+  assert.equal(inspection.state.providerRequests.at(-1).stage, 'outcome_unknown');
+  assert.equal(inspection.state.providerRequests.at(-1).effect.intent.implementationId, provider.implementationId);
+  assert.deepEqual(inspection.state.providerRequests.at(-1).effect.intent.recovery, { kind: 'unknown' });
+  assert.deepEqual(inspection.state.providerRequests.at(-1).effect.intent.exposure.quantities.map(quantity => quantity.unit), ['prompt_tokens', 'completion_tokens']);
+  assert.ok(inspection.state.providerRequests.at(-1).effect.intent.exposure.quantities.every(quantity => quantity.amount > 0));
 });
 
 test('a provider start ticket stranded by process loss becomes an exact durable abort decision', async () => {
   class InterruptedProviderStartRepository extends InMemoryEventRepository {
     interrupt = true;
+    stopped = false;
     async appendConditional(runId, event, options) {
+      if (this.stopped) throw new Error('simulated process stop before provider start');
       const receipt = await super.appendConditional(runId, event, options);
       if (this.interrupt && event.type === 'run.state.changed'
-        && event.state.phase.kind === 'provider' && event.state.phase.stage === 'effect_ready') {
+        && event.state.providerRequests.some(request => request.stage === 'effect_ready')) {
         this.interrupt = false;
+        this.stopped = true;
         throw new Error('simulated process stop before provider start');
       }
       return receipt;
@@ -971,6 +1033,7 @@ test('a provider start ticket stranded by process loss becomes an exact durable 
   await assert.rejects(control.result, /simulated process stop before provider start|outcome is unknown|stale_tail/u);
   assert.equal(provider.calls.length, 0);
 
+  events.stopped = false;
   const resumed = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events } });
   const result = await resumed.resume(control.runId).result;
   assert.equal(result.state, 'suspended');
@@ -990,7 +1053,7 @@ test('a persisted provider settlement resumes without issuing a duplicate reques
   class InterruptedSettlementRepository extends InMemoryEventRepository {
     interrupt = true;
     async appendConditional(runId, event, options) {
-      if (this.interrupt && event.type === 'run.state.changed' && event.state.phase.kind === 'provider' && event.state.phase.stage === 'settled') {
+      if (this.interrupt && event.type === 'run.state.changed' && event.state.providerRequests.some(request => request.stage === 'settled')) {
         this.interrupt = false;
         throw new Error('simulated process stop after provider settlement');
       }
@@ -1004,8 +1067,8 @@ test('a persisted provider settlement resumes without issuing a duplicate reques
   await assert.rejects(control.result, /simulated process stop|unresolved started provider effect/);
   assert.equal(provider.calls.length, 1);
   const run = await new AgentRunCoordinator(events).inspect(control.runId);
-  assert.equal(run.state.phase.kind, 'provider');
-  assert.equal(run.state.phase.stage, 'effect_pending');
+  assert.equal(run.state.phase.kind, 'active');
+  assert.equal(run.state.providerRequests.at(-1).stage, 'effect_pending');
   const resumed = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events } });
   const result = ended(await resumed.resume(control.runId).result);
   assert.equal(result.executionStatus, 'completed');
@@ -1176,7 +1239,7 @@ test('durable approval resumes after repository reopen and rejects changed polic
   assert.equal(unavailable.state, 'suspended');
   assert.equal(unavailable.reason, 'missing_implementation');
   assert.equal(preparationReleases, 1);
-  assert.equal((await repositories.agent.inspectRun(suspended.runId)).state.phase.kind, 'approval');
+  assert.equal((await repositories.agent.inspectRun(suspended.runId)).state.toolBatches[0].callStates[0].stage, 'approval');
   assert.deepEqual(approval.binding, { toolImplementationId: tool.implementationId, ...toolBoundary });
 
   const reopened = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events: repositories.events, session: { repository: repositories.sessions, descriptor: repositories.session }, artifacts: repositories.artifacts }, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write'] }, checks: [{ id: 'required', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok' }; } }] });
@@ -1386,7 +1449,7 @@ test('semantic tool audit events cannot advance authoritative per-call recovery 
   const identity = { turnIndex: approval.turnIndex, turnId: approval.turnId, requestAttempt: approval.requestAttempt, toolBatchId: approval.toolBatchId, callIndex: approval.callIndex, callId: approval.callId, toolAttempt: 1 };
   await run.events.append(suspended.runId, { type: 'tool.started', ...identity, toolName: tool.name, input: persistedCall, fingerprint: approval.fingerprint, effects }, { idempotencyKey: toolStageKey(suspended.runId, identity, 'started') });
   const runBeforeResolution = await run.agent.inspectRun(suspended.runId);
-  assert.equal(runBeforeResolution.state.phase.kind, 'approval');
+  assert.equal(runBeforeResolution.state.toolBatches[0].callStates[0].stage, 'approval');
   const result = ended(await (await run.agent.resolveApproval({ runId: suspended.runId, approvalId: approval.approvalId, fingerprint: approval.fingerprint, decision: 'allow' })).result);  assert.equal(result.executionStatus, 'completed');
   assert.equal(invocations, 1);
   let records = await eventsFor(run.events, result.runId);
@@ -1423,11 +1486,11 @@ test('a live stale runtime settles its exact permit while its unknown call conti
   const firstControl = first.agent.run({ task: 'live takeover' });
   await invocationStarted;
   const pending = await first.agent.inspectRun(firstControl.runId);
-  assert.equal(pending.state.phase.kind, 'tools');
-  assert.equal(pending.state.phase.callStates[0].stage, 'effect_pending');
-  assert.equal(pending.state.phase.callStates[1].stage, 'effect_ready');
-  assert.equal(pending.state.phase.maxConcurrency, 1);
-  assert.deepEqual(pending.state.phase.callStates[0].effect.intent.exposure, { quantities: [{ unit: 'tool_invocations', amount: 1 }] });
+  assert.equal(pending.state.phase.kind, 'active');
+  assert.equal(pending.state.toolBatches[0].callStates[0].stage, 'effect_pending');
+  assert.equal(pending.state.toolBatches[0].callStates[1].stage, 'effect_ready');
+  assert.equal(pending.state.toolBatches[0].maxConcurrency, 1);
+  assert.deepEqual(pending.state.toolBatches[0].callStates[0].effect.intent.exposure, { quantities: [{ unit: 'tool_invocations', amount: 1 }] });
 
   const replacement = new AgentRuntime({
     provider, model: 'scripted', toolBoundary,
@@ -1439,15 +1502,15 @@ test('a live stale runtime settles its exact permit while its unknown call conti
   assert.equal(waiting.reason, 'tool_outcome_unknown');
   assert.deepEqual(invocations, [0]);
   const unresolved = await replacement.inspectRun(firstControl.runId);
-  assert.equal(unresolved.state.phase.kind, 'tools');
-  assert.deepEqual(unresolved.state.phase.callStates.map((state) => state.stage), ['outcome_unknown', 'effect_ready']);
+  assert.equal(unresolved.state.phase.kind, 'active');
+  assert.deepEqual(unresolved.state.toolBatches[0].callStates.map((state) => state.stage), ['outcome_unknown', 'effect_ready']);
   releaseInvocation();
   await assert.rejects(firstControl.result, /replacement driver/u);
   const settled = await replacement.inspectRun(firstControl.runId);
-  assert.equal(settled.state.phase.kind, 'tools');
-  assert.equal(settled.state.phase.callStates[0].stage, 'settled');
-  assert.equal(settled.state.phase.callStates[1].stage, 'effect_ready');
-  assert.deepEqual(settled.state.phase.callStates[0].effect.settlement.exposure, { status: 'known', quantities: [{ unit: 'tool_invocations', amount: 1 }] });
+  assert.equal(settled.state.phase.kind, 'active');
+  assert.equal(settled.state.toolBatches[0].callStates[0].stage, 'settled');
+  assert.equal(settled.state.toolBatches[0].callStates[1].stage, 'effect_ready');
+  assert.deepEqual(settled.state.toolBatches[0].callStates[0].effect.settlement.exposure, { status: 'known', quantities: [{ unit: 'tool_invocations', amount: 1 }] });
 
   const completed = ended(await replacement.resume(firstControl.runId).result);
   assert.equal(completed.executionStatus, 'completed');

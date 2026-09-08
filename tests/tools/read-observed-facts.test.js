@@ -144,8 +144,8 @@ test('read-tool observedFacts reaches durable observations, session context, pro
   assert.equal(requests.length, 2);
   const secondRequest = JSON.stringify(requests[1].messages);
   assert.match(secondRequest, /list_directory/u);
-  assert.match(secondRequest, /observed_facts/u);
-  assert.match(secondRequest, /rooted-file:\/\/\//u);
+  assert.match(secondRequest, /visible\.txt/u);
+  assert.equal(requests[1].messages.filter(item => item.role === 'tool' && item.toolName === 'list_directory').length, 1);
   assert.equal(checkedFacts.items.some((item) => item.toolName === 'list_directory' && item.action === 'list'), true);
 
   const replay = await sessions.loadReplayState(session);

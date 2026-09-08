@@ -1,5 +1,8 @@
 import { createHash } from 'node:crypto';
-import type { JsonValue } from '@agent-core/json';
+import { isOwnedJsonValue, type JsonValue } from '@agent-core/json';
+
+const canonicalSnapshots = new WeakMap<object, string>();
+const MAX_CACHED_CANONICAL_LENGTH = 8 * 1024;
 
 export type EventActor = 'user' | 'runtime' | 'model' | 'tool' | 'system' | 'check';
 
@@ -66,6 +69,9 @@ function canonicalJson(value: unknown, path: string, ancestors: WeakSet<object>)
     return JSON.stringify(value);
   }
   if (typeof value !== 'object') throw new TypeError(`${path} is outside the canonical JSON domain.`);
+  const owned = isOwnedJsonValue(value);
+  const cached = owned ? canonicalSnapshots.get(value) : undefined;
+  if (cached !== undefined) return cached;
   if (ancestors.has(value)) throw new TypeError(`${path} contains a cycle.`);
   ancestors.add(value);
   try {
@@ -73,14 +79,21 @@ function canonicalJson(value: unknown, path: string, ancestors: WeakSet<object>)
       const entries: string[] = [];
       for (let index = 0; index < value.length; index += 1) {
         const descriptor = Object.getOwnPropertyDescriptor(value as object, String(index));
-        if (!descriptor || !('value' in descriptor)) throw new TypeError(`${path}[${String(index)}] is sparse or accessor-backed.`);
+        if (!descriptor || !('value' in descriptor))
+          throw new TypeError(`${path}[${String(index)}] is sparse or accessor-backed.`);
         entries.push(canonicalJson(descriptor.value as unknown, `${path}[${String(index)}]`, ancestors));
       }
-      if (Reflect.ownKeys(value).some((key) => key !== 'length' && (typeof key !== 'string' || !/^(0|[1-9][0-9]*)$/u.test(key)))) throw new TypeError(`${path} has non-JSON array properties.`);
-      return `[${entries.join(',')}]`;
+      if (
+        Reflect.ownKeys(value).some(
+          (key) => key !== 'length' && (typeof key !== 'string' || !/^(0|[1-9][0-9]*)$/u.test(key))
+        )
+      )
+        throw new TypeError(`${path} has non-JSON array properties.`);
+      return rememberCanonical(value, `[${entries.join(',')}]`, owned);
     }
     const prototype: unknown = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) throw new TypeError(`${path} must be a plain JSON object.`);
+    if (prototype !== Object.prototype && prototype !== null)
+      throw new TypeError(`${path} must be a plain JSON object.`);
     const descriptors = Object.getOwnPropertyDescriptors(value);
     const keys = Reflect.ownKeys(descriptors);
     if (keys.some((key) => typeof key !== 'string')) throw new TypeError(`${path} has symbol properties.`);
@@ -89,15 +102,25 @@ function canonicalJson(value: unknown, path: string, ancestors: WeakSet<object>)
       if (typeof key !== 'string') throw new TypeError(`${path} has symbol properties.`);
       stringKeys.push(key);
       const descriptor = descriptors[key];
-      if (!descriptor?.enumerable || !('value' in descriptor)) throw new TypeError(`${path}.${key} is non-enumerable or accessor-backed.`);
+      if (!descriptor?.enumerable || !('value' in descriptor))
+        throw new TypeError(`${path}.${key} is non-enumerable or accessor-backed.`);
     }
-    stringKeys.sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
-    return `{${stringKeys.map((key) => {
-      const descriptor = descriptors[key];
-      if (!descriptor || !('value' in descriptor)) throw new TypeError(`${path}.${key} is accessor-backed.`);
-      return `${JSON.stringify(key)}:${canonicalJson(descriptor.value as unknown, `${path}.${key}`, ancestors)}`;
-    }).join(',')}}`;
+    stringKeys.sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+    const text = `{${stringKeys
+      .map((key) => {
+        const descriptor = descriptors[key];
+        if (!descriptor || !('value' in descriptor))
+          throw new TypeError(`${path}.${key} is accessor-backed.`);
+        return `${JSON.stringify(key)}:${canonicalJson(descriptor.value as unknown, `${path}.${key}`, ancestors)}`;
+      })
+      .join(',')}}`;
+    return rememberCanonical(value, text, owned);
   } finally {
     ancestors.delete(value);
   }
+}
+
+function rememberCanonical(value: object, text: string, owned: boolean): string {
+  if (owned && text.length <= MAX_CACHED_CANONICAL_LENGTH) canonicalSnapshots.set(value, text);
+  return text;
 }

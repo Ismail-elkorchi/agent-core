@@ -2,11 +2,39 @@
 
 Agent Core models provider features as discovered capabilities, not as a lowest-common-denominator request bag. `@agent-core/model` owns canonical parameter names, reasoning strategies, profile validation, request validation, and request-versus-profile validation. Provider-specific controls live only in namespaced `providerOptions` and cannot overwrite canonical fields.
 
+## Typed input and accounting
+
+Each profile carries a versioned protocol declaration for its endpoint. Typed input
+preserves instruction authority, media, tool calls/results, and required protocol
+state. Adapters reject unsupported combinations before dispatch; display reasoning
+is never a substitute for required signed or opaque state.
+
+First-party adapters compile an owned wire body and dispatch that same admitted
+body. Request accounting distinguishes provider counts, estimates, and unknown
+components. OpenAI Platform and Claude offer opt-in bounded counting endpoints;
+other adapters use declared complete estimates and explicit allowances for unknown
+state. Cached input still occupies context. Codex uses an application-supplied
+output reservation because its subscription endpoint rejects the Platform output
+cap parameter.
+
+| Protocol family | Preserved state | Native execution boundary |
+| --- | --- | --- |
+| OpenAI Responses | Required reasoning items and exact continuation identities | Native steering requires the supported model profile and WebSocket transport; async tools and compaction require their explicit capability declarations. |
+| Codex Responses | Subscription-compatible reasoning and conservative continuation | Platform native steering is not inferred from the shared Responses format. |
+| OpenRouter Chat Completions | Original reasoning content/details and tool-call associations | Ordinary response/tool-result boundaries; routed capabilities come from the declared profile. |
+| Ollama Chat | Declared thinking output and native tool-call associations | Ordinary request/response execution with explicit unsupported-control errors. |
+| Claude Messages | Thinking signatures and redacted-thinking blocks in original order | Ordinary Messages execution; no advertised native steering, async tools, or context editing. |
+
+These are adapter conformance claims. They do not establish model quality or live
+account availability. Qwen/Kimi/GLM-compatible Chat fixtures exercise routed wire
+fields without claiming direct vendor adapters. Unverified model families require
+explicit profiles and their own conformance evidence.
+
 ## OpenAI Platform
 
 `@agent-core/provider-openai` uses the Responses API and defaults to `gpt-5.6-sol`. Trusted built-ins cover the `gpt-5.6` Sol alias, Sol, Terra, Luna, GPT-5.5, and GPT-5.5 Pro; unknown model IDs require a complete explicit profile rather than an optimistic fallback. Explicit Platform profiles are complete replacements, not partial overlays.
 
-The GPT-5.6 profiles declare 1,050,000 context tokens, 922,000 maximum input tokens, 128,000 maximum output tokens, efforts `low|medium|high|xhigh|max` plus the neutral disabled strategy for wire effort `none`, and independent `standard|pro` modes. The adapter serializes the official `reasoning.mode` field. Sol is the highest-capability default; Terra is the balanced price/latency choice; Luna is the high-volume choice. These are provider-owned profiles, not model IDs or tier logic embedded in the core. Pricing includes cache read/write rates and the whole-request multiplier above 272,000 input tokens. Ordinary Platform calls submit the full logical input with `store:false` and no response-ID continuation. Namespaced options expose current `reasoning.context`, `prompt_cache_options`, and service tiers `auto|default|flex|priority`; the deprecated GPT-5.6 `prompt_cache_retention` field and undocumented `scale` tier are rejected before network I/O.
+The GPT-5.6 profiles declare 1,050,000 context tokens, 922,000 maximum input tokens, 128,000 maximum output tokens, efforts `low|medium|high|xhigh|max` plus the neutral disabled strategy for wire effort `none`, and independent `standard|pro` modes. The adapter serializes the official `reasoning.mode` field. Sol is the highest-capability default; Terra is the balanced price/latency choice; Luna is the high-volume choice. These are provider-owned profiles, not model IDs or tier logic embedded in the core. Pricing includes cache read/write rates and the whole-request multiplier above 272,000 input tokens. Stateless HTTP Platform calls submit the full logical input with `store:false` and no response-ID continuation. Namespaced options expose current `reasoning.context`, `prompt_cache_options`, and service tiers `auto|default|flex|priority`; the deprecated GPT-5.6 `prompt_cache_retention` field and undocumented `scale` tier are rejected before network I/O.
 
 References: [model catalog](https://developers.openai.com/api/docs/models), [Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol), [Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra), [Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna), and [reasoning mode](https://developers.openai.com/api/docs/guides/reasoning#reasoning-mode).
 
@@ -31,6 +59,21 @@ References: [models](https://openrouter.ai/docs/guides/overview/models), [provid
 The default deployment is `local`, where JSON and JSON-Schema formats are declared. `deployment: 'cloud'` removes those capabilities and rejects response formats because Ollama Cloud does not currently support structured outputs. Request-scoped clients isolate aborts, and midstream NDJSON errors preserve already-emitted visible content at the core boundary.
 
 References: [show details](https://docs.ollama.com/api-reference/show-model-details), [thinking](https://docs.ollama.com/capabilities/thinking), [tool calling](https://docs.ollama.com/capabilities/tool-calling), [structured outputs](https://docs.ollama.com/capabilities/structured-outputs), and [errors](https://docs.ollama.com/api/errors).
+
+## Claude Messages
+
+`@agent-core/provider-claude` is a native Messages reference adapter. It supports
+text, images, PDF documents, JSON tools, manual thinking budgets, cache usage, and
+partial/refusal output. Thinking signatures and redacted-thinking blocks survive
+replay unchanged. Its built-in reference model is `claude-sonnet-4-6`; other models
+require explicit verified profiles. The adapter does not guess unknown capacity,
+pricing, or account access.
+
+`countTokens: true` uses a bounded, cancellable Messages counting request during
+compilation. Native steering, async tools, hosted server tools, adaptive thinking,
+and context editing are not implemented. See the
+[adapter contract](../packages/providers/claude/README.md) for exact scope and
+protocol fixture references.
 
 ## Adding a provider
 

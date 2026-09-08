@@ -1,11 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {
-  InferenceGateway,
-  ModelRequestFitError,
-  assertModelRequestFitsProfile,
-  estimateModelRequestFit
-} from '@agent-core/runtime';
+import { InferenceGateway } from '@agent-core/runtime';
+import { accountModelRequest, assertRequestAccountingFits, ModelContractError } from '@agent-core/model';
 
 const profile = Object.freeze({
   id: 'fit-model',
@@ -33,13 +29,10 @@ test('model request fit accounts for messages, tool and response schemas, and th
     responseFormat: { type: 'json_schema', schema: { type: 'object', properties: { answer: { type: 'string' } } } },
     maxOutputTokens: 10
   };
-  const fit = estimateModelRequestFit(request, profile);
-  assert.ok(fit.messageTokens > 0);
-  assert.ok(fit.toolTokens > 0);
-  assert.ok(fit.responseFormatTokens > 0);
-  assert.equal(fit.promptTokens, fit.messageTokens + fit.toolTokens + fit.responseFormatTokens);
-  assert.equal(fit.outputReserveTokens, 10);
-  assert.deepEqual(assertModelRequestFitsProfile(request, profile), fit);
+  const fit = accountModelRequest(request, { ...profile, limits: {contextTokens:2000, maxInputTokens:1900,outputTokens:25} });
+  for (const kind of ['text', 'tool_schema', 'response_schema']) assert.ok(fit.components.some(part => part.kind === kind && part.tokens > 0));
+  assert.equal(fit.outputReservation, 10);
+  assertRequestAccountingFits(fit);
 });
 
 test('inference gateway rejects an oversized logical request before provider invocation', async () => {
@@ -61,7 +54,7 @@ test('inference gateway rejects an oversized logical request before provider inv
   const session = gateway.createSession();
   await assert.rejects(
     gateway.invoke({ request: { model: profile.id, messages: [{ role: 'user', content: 'x'.repeat(400) }] }, profile, session, turnIndex: 0 }),
-    error => error instanceof ModelRequestFitError && error.fit.promptTokens > error.fit.maxPromptTokens
+    error => error instanceof ModelContractError
   );
   assert.equal(calls, 0);
 });

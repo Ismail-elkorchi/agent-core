@@ -33,6 +33,26 @@ test('OpenAICodexProvider describes the ChatGPT subscription Responses profile',
   assert.deepEqual(Object.keys(profile.metadata).sort(), ['api', 'auth', 'defaultReasoningEffort', 'modelTier']);
 });
 
+test('Codex compiled admission is bound to its provider instance and reservation policy', async () => {
+  let sent = 0;
+  const options = { auth: bearerProvider(codexJwt()), fetch: async () => {
+    sent++;
+    return jsonResponse({ id: 'compiled-instance', model: 'gpt-5.6', status: 'completed', output_text: 'done' });
+  } };
+  const first = new OpenAICodexProvider({ ...options, outputReservation: 100 });
+  const second = new OpenAICodexProvider({ ...options, outputReservation: 200 });
+  const admitted = await first.compileRequest({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hello' }] });
+  assert.throws(() => second.completeCompiled(admitted), /provider instance/u);
+  const readmitted = await second.compileRequest(admitted.logicalRequest);
+  assert.notEqual(readmitted, admitted);
+  assert.equal(admitted.accounting.outputReservation, 100);
+  assert.equal(readmitted.accounting.outputReservation, 200);
+  assert.equal(await first.compileRequest(admitted.logicalRequest), admitted);
+  await first.createSession().completeCompiled(admitted);
+  await second.createSession().completeCompiled(readmitted);
+  assert.equal(sent, 2);
+});
+
 test('OpenAICodexProvider supports GPT-5.6 max effort but does not claim subscription Pro mode', async () => {
   let fetchCalls = 0;
   const provider = new OpenAICodexProvider({

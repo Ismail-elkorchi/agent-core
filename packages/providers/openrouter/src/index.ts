@@ -1,8 +1,16 @@
+import { modelTransportSignal, type ModelTransportOptions } from '@agent-core/model';
+import { chatProtocolMessages, chatOutput, mergeReasoningDetails } from './protocol.js';
+import {
+  compileModelRequest,
+  conservativeProtocolCapabilities,
+  assertProviderContextCompatible,
+  type CompiledModelRequest
+} from '@agent-core/model';
 import {
   type ModelCapabilities,
   ModelContractError,
   type ModelImage,
-  type ModelMessage,
+  type ModelInputItem,
   type ModelModality,
   type ModelPricing,
   type ModelProfile,
@@ -71,6 +79,7 @@ const CONTENT_TYPE_JSON = 'application/json';
 export class OpenRouterProvider implements ModelProvider {
   readonly id = OPENROUTER_PROVIDER_ID;
   readonly implementationId = 'agent-core.provider.openrouter@1';
+  private readonly compiledRequests = new WeakMap<ModelRequest, CompiledModelRequest>();
   private readonly apiKey: string | undefined;
   private readonly baseUrl: string;
   private readonly defaultModel: string;
@@ -114,33 +123,95 @@ export class OpenRouterProvider implements ModelProvider {
         message: `OpenRouter model not found in catalog: ${selectedModel}`
       });
     }
-    return parseModelProfile(modelRecordToProfile(record));
+    const profile = modelRecordToProfile(record);
+    return parseModelProfile({
+      ...profile,
+      capabilities: {
+        ...profile.capabilities,
+        protocol: conservativeProtocolCapabilities(`${this.baseUrl}/chat/completions`, {
+          reasoningAccounting: 'included_output',
+          revision: 'openrouter-chat-2026-09-07-v1',
+          roles: ['system', 'developer', 'user', 'assistant'],
+          inputKinds: ['text', 'image', 'tool_call', 'tool_result', 'protocol'],
+          outputKinds: ['text', 'tool_call', 'protocol'],
+          state: 'exact'
+        })
+      }
+    });
   }
 
-  async complete(request: ModelRequest): Promise<ModelResponse> {
+  async compileRequest(request: ModelRequest): Promise<CompiledModelRequest> {
+    request = await this.validateRequest(request);
+    const cached = this.compiledRequests.get(request);
+    if (cached) return cached;
+    const body = toOpenRouterChatRequest(request, false);
+    delete body.stream;
+    const compiled = await compileModelRequest({
+      request,
+      profile: await this.describeModel(request.model),
+      body,
+      payloadPaths: chatPayloadPaths(body),
+      endpoint: `${this.baseUrl}/chat/completions`
+    });
+    this.compiledRequests.set(compiled.logicalRequest, compiled);
+    return compiled;
+  }
+  private assertCompiled(compiled: CompiledModelRequest): void {
+    if (this.compiledRequests.get(compiled.logicalRequest) !== compiled)
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'invalid_request',
+        message: 'Unrecognized compiled request.'
+      });
+  }
+  completeCompiled(compiled: CompiledModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
+    this.assertCompiled(compiled);
+    return this.complete(compiled.logicalRequest, options);
+  }
+  async *streamCompiled(
+    compiled: CompiledModelRequest,
+    options?: ModelTransportOptions
+  ): AsyncIterable<ModelStreamEvent> {
+    this.assertCompiled(compiled);
+    yield* this.stream(compiled.logicalRequest, options);
+  }
+
+  async complete(request: ModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
     try {
       request = await this.validateRequest(request);
-      const response = await this.fetchChatCompletion(request, false);
-      const payload = await decodeJsonResponse(this.id, response, decodeOpenRouterChatResponse, 'OpenRouter chat response');
-      return toModelResponse(this.id, request, payload);
+      const signal = modelTransportSignal(request, options);
+      signal?.throwIfAborted();
+      const response = await this.fetchChatCompletion(request, false, options);
+      const payload = await decodeJsonResponse(
+        this.id,
+        response,
+        decodeOpenRouterChatResponse,
+        'OpenRouter chat response'
+      );
+      return await toModelResponse(this.id, request, payload, `${this.baseUrl}/chat/completions`);
     } catch (error) {
       throw normalizeError(this.id, error);
     }
   }
 
-  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+  async *stream(request: ModelRequest, options?: ModelTransportOptions): AsyncIterable<ModelStreamEvent> {
     try {
       request = await this.validateRequest(request);
-      const responsePromise = this.fetchChatCompletion(request, true);
+      const signal = modelTransportSignal(request, options);
+      signal?.throwIfAborted();
+      const responsePromise = this.fetchChatCompletion(request, true, options);
       const startedAt = Date.now();
       let response: Response | undefined;
       while (!response) {
-        const result = await waitForResponseOrStatus(responsePromise, this.statusIntervalMs, request.signal);
+        const result = await waitForResponseOrStatus(responsePromise, this.statusIntervalMs, signal);
         if (result.type === 'response') {
           response = result.response;
         } else {
           const elapsedSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1_000));
-          yield { type: 'status', message: `Waiting for OpenRouter stream response (${String(elapsedSeconds)}s).` };
+          yield {
+            type: 'status',
+            message: `Waiting for OpenRouter stream response (${String(elapsedSeconds)}s).`
+          };
         }
       }
 
@@ -154,6 +225,9 @@ export class OpenRouterProvider implements ModelProvider {
 
       let content = '';
       let reasoning = '';
+      let preservedReasoning = '';
+      let reasoningContent = '';
+      const reasoningDetails = new Map<number, JsonObject>();
       let usage: ModelUsage | undefined;
       let providerTerminationReason: string | undefined;
       let responseId: string | undefined;
@@ -162,13 +236,21 @@ export class OpenRouterProvider implements ModelProvider {
       const toolCallParts = new Map<number, StreamingToolCallAccumulator>();
       const toolCalls: ModelToolCall[] = [];
 
-      for await (const event of readSseEvents(response.body, request.signal, this.statusIntervalMs, this.streamIdleTimeoutMs)) {
+      for await (const event of readSseEvents(
+        response.body,
+        signal,
+        this.statusIntervalMs,
+        this.streamIdleTimeoutMs
+      )) {
         if (event.type === 'comment') {
           yield { type: 'status', message: `OpenRouter stream status: ${event.comment}`, raw: event };
           continue;
         }
         if (event.type === 'status') {
-          yield { type: 'status', message: `Waiting for OpenRouter stream data (${String(Math.max(1, Math.round(event.idleMs / 1_000)))}s).` };
+          yield {
+            type: 'status',
+            message: `Waiting for OpenRouter stream data (${String(Math.max(1, Math.round(event.idleMs / 1_000)))}s).`
+          };
           continue;
         }
         if (event.data === '[DONE]') {
@@ -187,16 +269,37 @@ export class OpenRouterProvider implements ModelProvider {
           providerTerminationReason = choice.finish_reason;
         }
 
+        if (typeof delta?.reasoning === 'string') preservedReasoning += delta.reasoning;
+        if (typeof delta?.reasoning_content === 'string') reasoningContent += delta.reasoning_content;
+        try {
+          mergeReasoningDetails(reasoningDetails, delta?.reasoning_details);
+        } catch (error) {
+          throw new ModelProviderError({
+            provider: this.id,
+            code: 'malformed_response',
+            message: error instanceof Error ? error.message : String(error)
+          });
+        }
         const contentDelta = contentFromWire(delta?.content);
         if (contentDelta.length > 0) {
           content += contentDelta;
-          yield { type: 'content', content: contentDelta, accumulated: content, raw: normalizeJsonSafe(part).value };
+          yield {
+            type: 'content',
+            content: contentDelta,
+            accumulated: content,
+            raw: normalizeJsonSafe(part).value
+          };
         }
 
         const reasoningDelta = reasoningFromWire(delta);
         if (reasoningDelta.length > 0) {
           reasoning += reasoningDelta;
-          yield { type: 'reasoning', reasoning: reasoningDelta, accumulatedReasoning: reasoning, raw: normalizeJsonSafe(part).value };
+          yield {
+            type: 'reasoning',
+            reasoning: reasoningDelta,
+            accumulatedReasoning: reasoning,
+            raw: normalizeJsonSafe(part).value
+          };
         }
 
         for (const toolCall of mergeStreamingToolCalls(toolCallParts, delta?.tool_calls ?? [])) {
@@ -208,20 +311,48 @@ export class OpenRouterProvider implements ModelProvider {
         }
       }
 
-      const finalToolCalls = Array.from(toolCallParts.values()).map((item) => accumulatorToToolCall(this.id, item));
+      const finalToolCalls = Array.from(toolCallParts.values()).map((item) =>
+        accumulatorToToolCall(this.id, item)
+      );
       const responseToolCalls = dedupeToolCalls([...toolCalls, ...finalToolCalls]);
-      yield { type: 'done', response: parseOpenRouterModelResponse({
-        content,
-        model: actualModel,
-        provider: this.id,
-        terminationReason: normalizeOpenRouterTermination(this.id, providerTerminationReason, responseToolCalls.length > 0),
-        ...(providerTerminationReason ? { providerTerminationReason: providerTerminationReason } : {}),
-        ...(responseId ? { requestId: responseId } : {}),
-        ...(usage ? { usage } : {}),
-        ...(reasoning ? { reasoning } : {}),
-        ...(responseToolCalls.length > 0 ? { toolCalls: responseToolCalls } : {}),
-        ...(lastRaw === undefined ? {} : { raw: normalizeJsonSafe(lastRaw).value })
-      }) };
+      const fields = parseJsonObject({
+        ...(preservedReasoning ? { reasoning: preservedReasoning } : {}),
+        ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
+        ...(reasoningDetails.size
+          ? {
+              reasoning_details: Array.from(reasoningDetails.entries())
+                .sort(([a], [b]) => a - b)
+                .map(([, value]) => value)
+            }
+          : {})
+      });
+      yield {
+        type: 'done',
+        response: parseOpenRouterModelResponse({
+          output: await chatOutput(
+            request,
+            `${this.baseUrl}/chat/completions`,
+            responseId ?? 'stream-response',
+            fields,
+            content,
+            responseToolCalls
+          ),
+          content,
+          model: actualModel,
+          provider: this.id,
+          terminationReason: normalizeOpenRouterTermination(
+            this.id,
+            providerTerminationReason,
+            responseToolCalls.length > 0
+          ),
+          ...(providerTerminationReason ? { providerTerminationReason: providerTerminationReason } : {}),
+          ...(responseId ? { requestId: responseId } : {}),
+          ...(usage ? { usage } : {}),
+          ...(reasoning ? { reasoning } : {}),
+          ...(responseToolCalls.length > 0 ? { toolCalls: responseToolCalls } : {}),
+          ...(lastRaw === undefined ? {} : { raw: normalizeJsonSafe(lastRaw).value })
+        })
+      };
     } catch (error) {
       throw normalizeError(this.id, error);
     }
@@ -261,6 +392,15 @@ export class OpenRouterProvider implements ModelProvider {
       });
     }
     assertModelRequestSupported(await this.describeModel(owned.model), owned);
+    for (const [index, item] of owned.messages.entries())
+      if (item.role === 'protocol')
+        await assertProviderContextCompatible(
+          item.state,
+          owned,
+          `${this.baseUrl}/chat/completions`,
+          owned.messages.slice(0, index),
+          this.id
+        );
     return owned;
   }
 
@@ -271,7 +411,12 @@ export class OpenRouterProvider implements ModelProvider {
         headers: this.headers(false)
       });
       await throwIfBadResponse(this.id, response);
-      const payload = await decodeJsonResponse(this.id, response, decodeOpenRouterModelCatalog, 'OpenRouter model catalog');
+      const payload = await decodeJsonResponse(
+        this.id,
+        response,
+        decodeOpenRouterModelCatalog,
+        'OpenRouter model catalog'
+      );
       if (payload.data === undefined) {
         throw new ModelProviderError({
           provider: this.id,
@@ -285,7 +430,11 @@ export class OpenRouterProvider implements ModelProvider {
     }
   }
 
-  private async fetchChatCompletion(request: ModelRequest, stream: boolean): Promise<Response> {
+  private async fetchChatCompletion(
+    request: ModelRequest,
+    stream: boolean,
+    options?: ModelTransportOptions
+  ): Promise<Response> {
     const apiKey = this.apiKey?.trim();
     if (!apiKey) {
       throw new ModelProviderError({
@@ -294,14 +443,16 @@ export class OpenRouterProvider implements ModelProvider {
         message: 'OpenRouter API key is required. Set OPENROUTER_API_KEY or pass apiKey.'
       });
     }
+    const signal = modelTransportSignal(request, options);
+    signal?.throwIfAborted();
     try {
       const init: RequestInit = {
         method: 'POST',
         headers: this.headers(true),
-        body: JSON.stringify(toOpenRouterChatRequest(request, stream))
+        body: JSON.stringify({ ...(await this.compileRequest(request)).body, stream })
       };
-      if (request.signal) {
-        init.signal = request.signal;
+      if (signal) {
+        init.signal = signal;
       }
       const response = await this.fetchImpl(`${this.baseUrl}/chat/completions`, init);
       await throwIfBadResponse(this.id, response);
@@ -333,7 +484,7 @@ export class OpenRouterProvider implements ModelProvider {
 function toOpenRouterChatRequest(request: ModelRequest, stream: boolean): Record<string, unknown> {
   const body: Record<string, unknown> = {
     model: request.model,
-    messages: request.messages.map(toOpenRouterMessage),
+    messages: chatProtocolMessages(request.messages, toOpenRouterMessage),
     stream
   };
   if (request.temperature !== undefined) body.temperature = request.temperature;
@@ -349,24 +500,50 @@ function toOpenRouterChatRequest(request: ModelRequest, stream: boolean): Record
   return body;
 }
 
-function toOpenRouterMessage(message: ModelMessage): Record<string, unknown> {
+function toOpenRouterMessage(message: ModelInputItem): Record<string, unknown> {
   const body: Record<string, unknown> = {
     role: message.role
   };
   if (message.name) body.name = message.name;
-  if (message.reasoning) body.reasoning = message.reasoning;
-  if (message.toolCalls && message.toolCalls.length > 0) body.tool_calls = message.toolCalls.map(toOpenRouterToolCall);
+
+  if (message.toolCalls && message.toolCalls.length > 0)
+    body.tool_calls = message.toolCalls.map(toOpenRouterToolCall);
   if (message.toolCallId) body.tool_call_id = message.toolCallId;
   if (message.toolName) body.name = message.toolName;
   body.content = contentForOpenRouterMessage(message);
   return body;
 }
 
-function contentForOpenRouterMessage(message: ModelMessage): unknown {
+function contentForOpenRouterMessage(message: ModelInputItem): unknown {
+  if (message.role === 'control' || message.role === 'protocol')
+    throw new ModelProviderError({
+      provider: OPENROUTER_PROVIDER_ID,
+      code: 'invalid_request',
+      message: 'Unsupported native input item.'
+    });
+  if (message.parts?.length)
+    return [
+      ...(message.content ? [{ type: 'text', text: message.content }] : []),
+      ...(message.images ?? []).flatMap((image) => toOpenRouterContentParts('', [image])),
+      ...message.parts.map((part) => {
+        if (part.type === 'text') return { type: 'text', text: part.text };
+        if (part.type === 'image') return toOpenRouterContentParts('', [part.image])[0];
+        throw new ModelProviderError({
+          provider: OPENROUTER_PROVIDER_ID,
+          code: 'invalid_request',
+          message: `Unsupported OpenRouter media: ${part.type}.`
+        });
+      })
+    ];
   if (message.images && message.images.length > 0) {
     return toOpenRouterContentParts(message.content, message.images);
   }
-  if (message.role === 'assistant' && message.content.length === 0 && message.toolCalls && message.toolCalls.length > 0) {
+  if (
+    message.role === 'assistant' &&
+    message.content.length === 0 &&
+    message.toolCalls &&
+    message.toolCalls.length > 0
+  ) {
     return null;
   }
   return message.content;
@@ -391,7 +568,11 @@ function imageToBase64(image: ModelImage): string {
 
 function toOpenRouterTool(tool: ModelTool): Record<string, unknown> {
   if (tool.type !== 'function') {
-    throw new ModelProviderError({ provider: OPENROUTER_PROVIDER_ID, code: 'invalid_request', message: `OpenRouter provider only supports JSON function tools: ${tool.name}` });
+    throw new ModelProviderError({
+      provider: OPENROUTER_PROVIDER_ID,
+      code: 'invalid_request',
+      message: `OpenRouter provider only supports JSON function tools: ${tool.name}`
+    });
   }
   const body: Record<string, unknown> = {
     type: tool.type,
@@ -406,7 +587,11 @@ function toOpenRouterTool(tool: ModelTool): Record<string, unknown> {
 
 function toOpenRouterToolCall(toolCall: ModelToolCall): Record<string, unknown> {
   if (toolCall.input.kind !== 'json') {
-    throw new ModelProviderError({ provider: OPENROUTER_PROVIDER_ID, code: 'invalid_request', message: `OpenRouter provider only supports JSON function tool calls: ${toolCall.name}` });
+    throw new ModelProviderError({
+      provider: OPENROUTER_PROVIDER_ID,
+      code: 'invalid_request',
+      message: `OpenRouter provider only supports JSON function tool calls: ${toolCall.name}`
+    });
   }
   return {
     ...(toolCall.id ? { id: toolCall.id } : {}),
@@ -436,24 +621,66 @@ function toOpenRouterResponseFormat(format: ModelResponseFormat): unknown {
 }
 
 function toOpenRouterReasoning(reasoning: ModelReasoningRequest): Record<string, unknown> | undefined {
-  if ('summary' in reasoning) throw new ModelProviderError({ provider: OPENROUTER_PROVIDER_ID, code: 'invalid_request', message: 'OpenRouter does not expose a route-neutral reasoning summary control.' });
+  if ('summary' in reasoning)
+    throw new ModelProviderError({
+      provider: OPENROUTER_PROVIDER_ID,
+      code: 'invalid_request',
+      message: 'OpenRouter does not expose a route-neutral reasoning summary control.'
+    });
   if (reasoning.strategy === 'disabled') return { enabled: false };
   if (reasoning.strategy === 'enabled') return { enabled: true };
   if (reasoning.strategy === 'budget') return { max_tokens: reasoning.maxTokens };
-  if (reasoning.mode !== undefined) throw new ModelProviderError({ provider: OPENROUTER_PROVIDER_ID, code: 'invalid_request', message: 'OpenRouter does not expose OpenAI standard/pro reasoning mode as a route-neutral control.' });
+  if (reasoning.mode !== undefined)
+    throw new ModelProviderError({
+      provider: OPENROUTER_PROVIDER_ID,
+      code: 'invalid_request',
+      message: 'OpenRouter does not expose OpenAI standard/pro reasoning mode as a route-neutral control.'
+    });
   return { effort: reasoning.effort };
 }
 
 function applyOpenRouterProviderOptions(body: Record<string, unknown>, request: ModelRequest): void {
   if (!request.providerOptions) return;
-  if (request.providerOptions.provider !== OPENROUTER_PROVIDER_ID) throw new ModelProviderError({ provider: OPENROUTER_PROVIDER_ID, code: 'invalid_request', message: `Request options for ${request.providerOptions.provider} cannot be used with OpenRouter.` });
+  if (request.providerOptions.provider !== OPENROUTER_PROVIDER_ID)
+    throw new ModelProviderError({
+      provider: OPENROUTER_PROVIDER_ID,
+      code: 'invalid_request',
+      message: `Request options for ${request.providerOptions.provider} cannot be used with OpenRouter.`
+    });
   const values = request.providerOptions.values;
   const allowed = new Set(['provider', 'transforms', 'reasoningOutput']);
   const unknown = Object.keys(values).filter((key) => !allowed.has(key));
-  if (unknown.length > 0) throw new ModelProviderError({ provider: OPENROUTER_PROVIDER_ID, code: 'invalid_request', message: `Unsupported OpenRouter provider option(s): ${unknown.join(', ')}.` });
-  if (values.provider !== undefined && !isJsonObject(values.provider)) throw new ModelProviderError({ provider: OPENROUTER_PROVIDER_ID, code: 'invalid_request', message: 'OpenRouter provider routing options must be a JSON object.' });
-  if (values.transforms !== undefined && (!Array.isArray(values.transforms) || !values.transforms.every((item) => typeof item === 'string'))) throw new ModelProviderError({ provider: OPENROUTER_PROVIDER_ID, code: 'invalid_request', message: 'OpenRouter transforms must be an array of strings.' });
-  if (values.reasoningOutput !== undefined && values.reasoningOutput !== 'include' && values.reasoningOutput !== 'omit') throw new ModelProviderError({ provider: OPENROUTER_PROVIDER_ID, code: 'invalid_request', message: 'OpenRouter reasoningOutput must be include or omit.' });
+  if (unknown.length > 0)
+    throw new ModelProviderError({
+      provider: OPENROUTER_PROVIDER_ID,
+      code: 'invalid_request',
+      message: `Unsupported OpenRouter provider option(s): ${unknown.join(', ')}.`
+    });
+  if (values.provider !== undefined && !isJsonObject(values.provider))
+    throw new ModelProviderError({
+      provider: OPENROUTER_PROVIDER_ID,
+      code: 'invalid_request',
+      message: 'OpenRouter provider routing options must be a JSON object.'
+    });
+  if (
+    values.transforms !== undefined &&
+    (!Array.isArray(values.transforms) || !values.transforms.every((item) => typeof item === 'string'))
+  )
+    throw new ModelProviderError({
+      provider: OPENROUTER_PROVIDER_ID,
+      code: 'invalid_request',
+      message: 'OpenRouter transforms must be an array of strings.'
+    });
+  if (
+    values.reasoningOutput !== undefined &&
+    values.reasoningOutput !== 'include' &&
+    values.reasoningOutput !== 'omit'
+  )
+    throw new ModelProviderError({
+      provider: OPENROUTER_PROVIDER_ID,
+      code: 'invalid_request',
+      message: 'OpenRouter reasoningOutput must be include or omit.'
+    });
   if (values.provider !== undefined) body.provider = values.provider;
   if (values.transforms !== undefined) body.transforms = values.transforms;
   if (values.reasoningOutput !== undefined) {
@@ -462,26 +689,58 @@ function applyOpenRouterProviderOptions(body: Record<string, unknown>, request: 
   }
 }
 
-function toModelResponse(provider: string, request: ModelRequest, payload: OpenRouterChatResponse): ModelResponse {
+async function toModelResponse(
+  provider: string,
+  request: ModelRequest,
+  payload: OpenRouterChatResponse,
+  endpoint: string
+): Promise<ModelResponse> {
   throwIfOpenRouterError(provider, payload, false);
   const choice = payload.choices?.[0];
   const message = choice?.message;
   if (!message) {
-    throw new ModelProviderError({ provider, code: 'malformed_response', message: 'OpenRouter response did not include choices[0].message.' });
+    throw new ModelProviderError({
+      provider,
+      code: 'malformed_response',
+      message: 'OpenRouter response did not include choices[0].message.'
+    });
   }
   const content = contentFromWire(message.content);
   const toolCalls = normalizeToolCalls(provider, message.tool_calls ?? []);
   const usage = normalizeUsage(payload.usage);
   const reasoning = reasoningFromWire(message);
+  const fields = parseJsonObject({
+    ...(message.reasoning === undefined || message.reasoning === null
+      ? {}
+      : { reasoning: message.reasoning }),
+    ...(message.reasoning_content === undefined || message.reasoning_content === null
+      ? {}
+      : { reasoning_content: message.reasoning_content }),
+    ...(message.reasoning_details === undefined ? {} : { reasoning_details: message.reasoning_details })
+  });
+  const details = new Map<number, JsonObject>();
+  try {
+    mergeReasoningDetails(details, message.reasoning_details);
+  } catch (error) {
+    throw new ModelProviderError({
+      provider,
+      code: 'malformed_response',
+      message: error instanceof Error ? error.message : String(error)
+    });
+  }
   return parseOpenRouterModelResponse({
+    output: await chatOutput(
+      request,
+      endpoint,
+      payload.id ?? 'response-without-id',
+      fields,
+      content,
+      toolCalls
+    ),
     content,
     model: payload.model ?? request.model,
     provider,
-    terminationReason: normalizeOpenRouterTermination(
-      provider,
-      choice.finish_reason,
-      toolCalls.length > 0
-    ),
+    terminationReason: normalizeOpenRouterTermination(provider, choice.finish_reason, toolCalls.length > 0),
     ...(choice.finish_reason ? { providerTerminationReason: choice.finish_reason } : {}),
     ...(payload.id ? { requestId: payload.id } : {}),
     ...(usage ? { usage } : {}),
@@ -551,7 +810,11 @@ function normalizeToolCalls(provider: string, toolCalls: readonly OpenRouterWire
 function wireToolCallToModelToolCall(provider: string, toolCall: OpenRouterWireToolCall): ModelToolCall {
   const name = toolCall.function?.name;
   if (!name) {
-    throw new ModelProviderError({ provider, code: 'malformed_response', message: 'OpenRouter tool call did not include function.name.' });
+    throw new ModelProviderError({
+      provider,
+      code: 'malformed_response',
+      message: 'OpenRouter tool call did not include function.name.'
+    });
   }
   return {
     ...(toolCall.id ? { id: toolCall.id } : {}),
@@ -561,7 +824,10 @@ function wireToolCallToModelToolCall(provider: string, toolCall: OpenRouterWireT
   };
 }
 
-function parseToolArguments(provider: string, value: string | Readonly<Record<string, unknown>> | undefined): JsonObject {
+function parseToolArguments(
+  provider: string,
+  value: string | Readonly<Record<string, unknown>> | undefined
+): JsonObject {
   if (value === undefined || value === '') {
     return Object.freeze({});
   }
@@ -578,10 +844,17 @@ function parseToolArguments(provider: string, value: string | Readonly<Record<st
       cause: error
     });
   }
-  throw new ModelProviderError({ provider, code: 'malformed_response', message: 'OpenRouter tool call arguments must decode to a JSON object.' });
+  throw new ModelProviderError({
+    provider,
+    code: 'malformed_response',
+    message: 'OpenRouter tool call arguments must decode to a JSON object.'
+  });
 }
 
-function mergeStreamingToolCalls(accumulators: Map<number, StreamingToolCallAccumulator>, deltas: readonly OpenRouterWireToolCall[]): ModelToolCall[] {
+function mergeStreamingToolCalls(
+  accumulators: Map<number, StreamingToolCallAccumulator>,
+  deltas: readonly OpenRouterWireToolCall[]
+): ModelToolCall[] {
   const toolCalls: ModelToolCall[] = [];
   for (const delta of deltas) {
     const index = delta.index ?? 0;
@@ -633,7 +906,11 @@ function isJsonObject(value: unknown): value is Record<string, unknown> {
 
 function accumulatorToToolCall(provider: string, item: StreamingToolCallAccumulator): ModelToolCall {
   if (!item.name) {
-    throw new ModelProviderError({ provider, code: 'malformed_response', message: 'OpenRouter streamed tool call did not include function.name.' });
+    throw new ModelProviderError({
+      provider,
+      code: 'malformed_response',
+      message: 'OpenRouter streamed tool call did not include function.name.'
+    });
   }
   return {
     ...(item.id ? { id: item.id } : {}),
@@ -680,7 +957,11 @@ function canonicalOpenRouterParameters(parameters: readonly string[]): ModelProf
   return [...supported];
 }
 
-function throwIfOpenRouterError(provider: string, payload: OpenRouterChatResponse, afterVisibleContent: boolean): void {
+function throwIfOpenRouterError(
+  provider: string,
+  payload: OpenRouterChatResponse,
+  afterVisibleContent: boolean
+): void {
   if (!payload.error) return;
   const message = payload.error.message ?? 'OpenRouter returned an error payload.';
   const code = typeof payload.error.code === 'number' ? payload.error.code : Number(payload.error.code);
@@ -708,7 +989,8 @@ function modelRecordToProfile(record: OpenRouterModelRecord): ModelProfile {
   const supportedParameters = canonicalOpenRouterParameters(wireParameters);
   const hasReasoning = record.reasoning !== undefined || supported.has('reasoning');
   const reasoningEfforts = openRouterReasoningEfforts(record.reasoning);
-  const contextTokens = numberOrUndefined(record.top_provider?.context_length) ?? numberOrUndefined(record.context_length);
+  const contextTokens =
+    numberOrUndefined(record.top_provider?.context_length) ?? numberOrUndefined(record.context_length);
   const outputTokens = numberOrUndefined(record.top_provider?.max_completion_tokens);
   const pricing = normalizePricing(record.pricing);
   const capabilities: ModelCapabilities = {
@@ -721,12 +1003,18 @@ function modelRecordToProfile(record: OpenRouterModelRecord): ModelProfile {
     temperature: supported.has('temperature'),
     topP: supported.has('top_p'),
     ...(hasReasoning
-      ? { reasoning: {
-        strategies: ['toggle', ...(reasoningEfforts.length > 0 ? ['effort' as const] : []), ...(record.reasoning?.supports_max_tokens === true ? ['budget' as const] : [])],
-        canDisable: record.reasoning?.mandatory !== true,
-        ...(reasoningEfforts.length > 0 ? { efforts: reasoningEfforts } : {}),
-        separateOutput: supported.has('include_reasoning')
-      } }
+      ? {
+          reasoning: {
+            strategies: [
+              'toggle',
+              ...(reasoningEfforts.length > 0 ? ['effort' as const] : []),
+              ...(record.reasoning?.supports_max_tokens === true ? ['budget' as const] : [])
+            ],
+            canDisable: record.reasoning?.mandatory !== true,
+            ...(reasoningEfforts.length > 0 ? { efforts: reasoningEfforts } : {}),
+            separateOutput: supported.has('include_reasoning')
+          }
+        }
       : {})
   };
   return {
@@ -740,7 +1028,9 @@ function modelRecordToProfile(record: OpenRouterModelRecord): ModelProfile {
     },
     limits: {
       ...(contextTokens !== undefined ? { contextTokens } : {}),
-      ...(contextTokens !== undefined && outputTokens !== undefined ? { maxInputTokens: Math.max(1, contextTokens - outputTokens) } : {}),
+      ...(contextTokens !== undefined && outputTokens !== undefined
+        ? { maxInputTokens: Math.max(1, contextTokens - outputTokens) }
+        : {}),
       ...(outputTokens !== undefined ? { outputTokens } : {})
     },
     supportedParameters,
@@ -749,12 +1039,17 @@ function modelRecordToProfile(record: OpenRouterModelRecord): ModelProfile {
   };
 }
 
-function openRouterReasoningEfforts(reasoning: OpenRouterModelRecord['reasoning']): ('minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max')[] {
+function openRouterReasoningEfforts(
+  reasoning: OpenRouterModelRecord['reasoning']
+): ('minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max')[] {
   const values = reasoning?.supported_efforts;
   if (values === null) return ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
   if (!Array.isArray(values)) return [];
   const supported = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
-  return values.filter((value): value is 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' => typeof value === 'string' && supported.has(value));
+  return values.filter(
+    (value): value is 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' =>
+      typeof value === 'string' && supported.has(value)
+  );
 }
 
 function modelMetadata(record: OpenRouterModelRecord): Record<string, unknown> {
@@ -767,7 +1062,10 @@ function modelMetadata(record: OpenRouterModelRecord): Record<string, unknown> {
   };
 }
 
-function normalizeModalities(value: readonly string[] | undefined, fallback: ModelModality[]): ModelModality[] {
+function normalizeModalities(
+  value: readonly string[] | undefined,
+  fallback: ModelModality[]
+): ModelModality[] {
   return value && value.length > 0 ? [...value] : fallback;
 }
 
@@ -784,12 +1082,23 @@ function normalizePricing(pricing: OpenRouterModelRecord['pricing']): ModelPrici
   if (output !== undefined) rates.output = output;
   if (cacheRead !== undefined) rates.cacheRead = cacheRead;
   if (cacheWrite !== undefined) rates.cacheWrite = cacheWrite;
-  const metadata = Object.fromEntries(Object.entries(pricing).filter(([key]) => !['prompt', 'completion', 'input_cache_read', 'input_cache_write'].includes(key)));
-  return Object.keys(rates).length > 0 || Object.keys(metadata).length > 0 ? { currency: 'USD', rates, ...(Object.keys(metadata).length > 0 ? { metadata: parseJsonObject(metadata) } : {}) } : undefined;
+  const metadata = Object.fromEntries(
+    Object.entries(pricing).filter(
+      ([key]) => !['prompt', 'completion', 'input_cache_read', 'input_cache_write'].includes(key)
+    )
+  );
+  return Object.keys(rates).length > 0 || Object.keys(metadata).length > 0
+    ? {
+        currency: 'USD',
+        rates,
+        ...(Object.keys(metadata).length > 0 ? { metadata: parseJsonObject(metadata) } : {})
+      }
+    : undefined;
 }
 
 function pricePerMillion(value: string | number | null | undefined): number | undefined {
-  const numberValue = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : Number.NaN;
+  const numberValue =
+    typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : Number.NaN;
   if (!Number.isFinite(numberValue) || numberValue < 0) {
     return undefined;
   }
@@ -806,24 +1115,53 @@ function normalizeUsage(usage: OpenRouterUsage | undefined): ModelUsage | undefi
     promptTokens,
     completionTokens,
     totalTokens: usage.total_tokens ?? promptTokens + completionTokens,
-    ...(usage.prompt_tokens_details?.cached_tokens === undefined ? {} : { cacheReadTokens: usage.prompt_tokens_details.cached_tokens }),
-    ...(usage.prompt_tokens_details?.cache_write_tokens === undefined ? {} : { cacheWriteTokens: usage.prompt_tokens_details.cache_write_tokens }),
-    ...(usage.completion_tokens_details?.reasoning_tokens === undefined ? {} : { reasoningTokens: usage.completion_tokens_details.reasoning_tokens })
+    ...(usage.prompt_tokens_details?.cached_tokens === undefined
+      ? {}
+      : { cacheReadTokens: usage.prompt_tokens_details.cached_tokens }),
+    ...(usage.prompt_tokens_details?.cache_write_tokens === undefined
+      ? {}
+      : { cacheWriteTokens: usage.prompt_tokens_details.cache_write_tokens }),
+    ...(usage.completion_tokens_details?.reasoning_tokens === undefined
+      ? {}
+      : { reasoningTokens: usage.completion_tokens_details.reasoning_tokens })
   };
 }
 
-function readSseEvents(body: ReadableStream<Uint8Array>, signal: AbortSignal | undefined, statusIntervalMs: number, idleTimeoutMs: number): AsyncIterable<OpenRouterSseEvent> {
+function readSseEvents(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal | undefined,
+  statusIntervalMs: number,
+  idleTimeoutMs: number
+): AsyncIterable<OpenRouterSseEvent> {
   return readJsonSseEvents(body, {
     ...(signal ? { signal } : {}),
     statusIntervalMs,
     idleTimeoutMs,
     decodeData: decodeOpenRouterChatResponse,
-    createMalformedError: (message, cause) => new ModelProviderError({ provider: OPENROUTER_PROVIDER_ID, code: 'malformed_response', message: `OpenRouter ${message}`, cause }),
-    createIdleError: (idleMs) => new ModelProviderError({ provider: OPENROUTER_PROVIDER_ID, code: 'provider_unavailable', message: `OpenRouter stream was idle for ${String(idleMs)}ms.`, retryable: true, diagnostic: { transport: 'http_sse', causeSummary: { idleMs } } })
+    createMalformedError: (message, cause) =>
+      new ModelProviderError({
+        provider: OPENROUTER_PROVIDER_ID,
+        code: 'malformed_response',
+        message: `OpenRouter ${message}`,
+        cause
+      }),
+    createIdleError: (idleMs) =>
+      new ModelProviderError({
+        provider: OPENROUTER_PROVIDER_ID,
+        code: 'provider_unavailable',
+        message: `OpenRouter stream was idle for ${String(idleMs)}ms.`,
+        retryable: true,
+        diagnostic: { transport: 'http_sse', causeSummary: { idleMs } }
+      })
   });
 }
 
-async function decodeJsonResponse<T>(provider: string, response: Response, decode: (value: unknown) => T, label: string): Promise<T> {
+async function decodeJsonResponse<T>(
+  provider: string,
+  response: Response,
+  decode: (value: unknown) => T,
+  label: string
+): Promise<T> {
   try {
     return decode(await readBoundedJsonResponse(response));
   } catch (error) {
@@ -873,11 +1211,22 @@ function normalizeError(provider: string, error: unknown): ModelProviderError {
     return error;
   }
   if (error instanceof ModelContractError) {
-    return new ModelProviderError({ provider, code: 'invalid_request', message: error.message, retryable: false, cause: error });
+    return new ModelProviderError({
+      provider,
+      code: 'invalid_request',
+      message: error.message,
+      retryable: false,
+      cause: error
+    });
   }
   const message = error instanceof Error ? error.message : String(error);
   if (isAbortError(error) || /abort/i.test(message)) {
-    return new ModelProviderError({ provider, code: 'aborted', message: `OpenRouter request aborted: ${message}`, cause: error });
+    return new ModelProviderError({
+      provider,
+      code: 'aborted',
+      message: `OpenRouter request aborted: ${message}`,
+      cause: error
+    });
   }
   return new ModelProviderError({
     provider,
@@ -893,7 +1242,12 @@ function parseOpenRouterModelResponse(value: unknown): ModelResponse {
     return parseModelResponse(value);
   } catch (error) {
     if (error instanceof ModelContractError) {
-      throw new ModelProviderError({ provider: OPENROUTER_PROVIDER_ID, code: 'malformed_response', message: `OpenRouter response violated the model contract: ${error.message}`, cause: error });
+      throw new ModelProviderError({
+        provider: OPENROUTER_PROVIDER_ID,
+        code: 'malformed_response',
+        message: `OpenRouter response violated the model contract: ${error.message}`,
+        cause: error
+      });
     }
     throw error;
   }
@@ -903,7 +1257,8 @@ function classifyStatus(status: number, body: string): ModelProviderErrorCode {
   if (status === 404) return 'model_unavailable';
   if (status === 408 || status === 413 || /context|token|too large/i.test(body)) return 'context_overflow';
   if (status === 429) return 'rate_limited';
-  if (status === 400 || status === 401 || status === 402 || status === 403 || status === 422) return 'invalid_request';
+  if (status === 400 || status === 401 || status === 402 || status === 403 || status === 422)
+    return 'invalid_request';
   if (status >= 500) return 'provider_unavailable';
   return 'unknown';
 }
@@ -916,7 +1271,11 @@ function extractErrorMessage(body: string): string {
     const parsed: unknown = JSON.parse(body);
     if (!isJsonObject(parsed)) return body;
     const error = isJsonObject(parsed.error) ? parsed.error : undefined;
-    return typeof error?.message === 'string' ? error.message : typeof parsed.message === 'string' ? parsed.message : body;
+    return typeof error?.message === 'string'
+      ? error.message
+      : typeof parsed.message === 'string'
+        ? parsed.message
+        : body;
   } catch {
     return body;
   }
@@ -951,4 +1310,21 @@ function requiredString(value: unknown, message: string): string {
 
 function numberOrUndefined(value: number | null | undefined): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function chatPayloadPaths(body: Record<string, unknown>): readonly (readonly (string | number)[])[] {
+  const paths: (string | number)[][] = [];
+  if (!Array.isArray(body.messages)) return paths;
+  for (const [index, raw] of (body.messages as unknown[]).entries()) {
+    const message = parseJsonObject(raw);
+    if (message.role === 'assistant')
+      for (const key of ['reasoning', 'reasoning_content', 'reasoning_details'])
+        if (message[key] !== undefined) paths.push(['messages', index, key]);
+    if (!Array.isArray(message.content)) continue;
+    for (const [partIndex, rawPart] of message.content.entries()) {
+      const part = parseJsonObject(rawPart);
+      if (part.type === 'image_url') paths.push(['messages', index, 'content', partIndex, 'image_url']);
+    }
+  }
+  return paths;
 }

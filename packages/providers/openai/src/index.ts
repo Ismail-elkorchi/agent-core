@@ -1,3 +1,28 @@
+import { modelTransportSignal, type ModelTransportOptions } from '@agent-core/model';
+import {
+  NativeResponsesSession,
+  defaultOpenAIResponsesWebSocketFactory,
+  type OpenAIResponsesWebSocketFactory
+} from './native-session.js';
+import {
+  createProviderContextState,
+  parseModelContextTransformResult,
+  type ModelContextTransformRequest,
+  type ModelContextTransformResult
+} from '@agent-core/model';
+export type { OpenAIResponsesWebSocket, OpenAIResponsesWebSocketFactory } from './native-session.js';
+import {
+  responsesInput,
+  responsesOutput,
+  responsesPayloadPaths,
+  validatedResponsesReplayItems
+} from '@agent-core/provider-openai-responses';
+import {
+  compileModelRequest,
+  conservativeProtocolCapabilities,
+  assertProviderContextCompatible,
+  type CompiledModelRequest
+} from '@agent-core/model';
 import {
   AuthError,
   type BearerTokenProvider,
@@ -11,8 +36,6 @@ import { normalizeJsonSafe, parseJsonObject, type JsonObject } from '@agent-core
 import {
   type ModelCapabilities,
   ModelContractError,
-  type ModelImage,
-  type ModelMessage,
   type ModelProfile,
   type ModelProvider,
   ModelProviderError,
@@ -48,6 +71,13 @@ import {
 } from '@agent-core/provider-openai-responses';
 
 export interface OpenAIProviderOptions {
+  countTokens?: boolean;
+  maxConcurrentCounts?: number;
+  defaultOutputTokens?: number;
+  /** Reservation policy for compaction output; /compact does not accept a generation cap. */
+  contextOutputReservation?: number;
+  transport?: 'http_sse' | 'websocket';
+  webSocketFactory?: OpenAIResponsesWebSocketFactory;
   auth?: ProviderAuth | BearerTokenProvider;
   apiKey?: string;
   baseUrl?: string;
@@ -73,6 +103,7 @@ interface OpenAIBuiltInProfile {
 type OpenAISseEvent = JsonSseEvent<OpenAIStreamData>;
 
 interface StreamingFunctionCallAccumulator {
+  async?: boolean;
   id?: string;
   callId?: string;
   name?: string;
@@ -81,6 +112,7 @@ interface StreamingFunctionCallAccumulator {
 }
 
 interface StreamingCustomToolCallAccumulator {
+  async?: boolean;
   id?: string;
   callId?: string;
   name?: string;
@@ -101,7 +133,12 @@ const OPENAI_DEFAULT_LIMITS: ModelProfile['limits'] = {
 const DEFAULT_CAPABILITIES: ModelCapabilities = {
   streaming: true,
   toolCalling: true,
-  supportedToolInputs: [{ kind: 'json' }, { kind: 'text' }, { kind: 'grammar', syntax: 'lark' }, { kind: 'grammar', syntax: 'regex' }],
+  supportedToolInputs: [
+    { kind: 'json' },
+    { kind: 'text' },
+    { kind: 'grammar', syntax: 'lark' },
+    { kind: 'grammar', syntax: 'regex' }
+  ],
   jsonMode: true,
   jsonSchema: true,
   logprobs: true,
@@ -133,6 +170,15 @@ const DEFAULT_SUPPORTED_PARAMETERS: ModelProfile['supportedParameters'] = [
 export class OpenAIProvider implements ModelProvider {
   readonly id = OPENAI_PROVIDER_ID;
   readonly implementationId = 'agent-core.provider.openai-responses@1';
+  private readonly countTokens: boolean;
+  private readonly maxConcurrentCounts: number;
+  private activeCounts = 0;
+  private readonly defaultOutputTokens: number;
+  private readonly contextOutputReservation: number;
+  private readonly compiledTransforms = new WeakMap<CompiledModelRequest, string>();
+  private readonly transport: 'http_sse' | 'websocket';
+  private readonly webSocketFactory: OpenAIResponsesWebSocketFactory;
+  private readonly compiledRequests = new WeakMap<ModelRequest, CompiledModelRequest>();
   private readonly tokenProvider: BearerTokenProvider;
   private readonly baseUrl: string;
   private readonly defaultModel: string;
@@ -142,6 +188,18 @@ export class OpenAIProvider implements ModelProvider {
   private readonly modelProfiles: Record<string, OpenAIModelProfileDefinition>;
 
   constructor(options: OpenAIProviderOptions = {}) {
+    this.countTokens = options.countTokens ?? false;
+    this.maxConcurrentCounts = options.maxConcurrentCounts ?? 2;
+    if (!Number.isSafeInteger(this.maxConcurrentCounts) || this.maxConcurrentCounts < 1)
+      throw new RangeError('maxConcurrentCounts must be positive.');
+    this.defaultOutputTokens = options.defaultOutputTokens ?? 4096;
+    if (!Number.isSafeInteger(this.defaultOutputTokens) || this.defaultOutputTokens < 1)
+      throw new RangeError('defaultOutputTokens must be positive.');
+    this.contextOutputReservation = options.contextOutputReservation ?? this.defaultOutputTokens;
+    if (!Number.isSafeInteger(this.contextOutputReservation) || this.contextOutputReservation < 1)
+      throw new RangeError('contextOutputReservation must be positive.');
+    this.transport = options.transport ?? 'http_sse';
+    this.webSocketFactory = options.webSocketFactory ?? defaultOpenAIResponsesWebSocketFactory;
     this.baseUrl = stripTrailingSlash(options.baseUrl ?? OPENAI_BASE_URL);
     this.defaultModel = options.model ?? OPENAI_DEFAULT_MODEL;
     this.fetchImpl = options.fetch ?? fetch;
@@ -160,7 +218,9 @@ export class OpenAIProvider implements ModelProvider {
   }
 
   createSession(): ModelProviderSession {
-    return new OpenAIProviderSession(this);
+    return this.transport === 'websocket'
+      ? new NativeResponsesSession(this, this.webSocketFactory, this.streamIdleTimeoutMs)
+      : new OpenAIProviderSession(this);
   }
 
   describeModel(model: string): Promise<ModelProfile> {
@@ -168,67 +228,356 @@ export class OpenAIProvider implements ModelProvider {
     const builtIn = openAIBuiltInProfile(selectedModel);
     const explicit = this.modelProfiles[selectedModel];
     if (explicit) {
-      return Promise.resolve(parseModelProfile({ id: selectedModel, provider: this.id, ...explicit }));
+      return Promise.resolve(
+        parseModelProfile({
+          id: selectedModel,
+          provider: this.id,
+          ...explicit,
+          capabilities: {
+            ...explicit.capabilities,
+            protocol: explicit.capabilities.protocol ?? this.protocolFor(selectedModel)
+          }
+        })
+      );
     }
     if (!builtIn) {
-      return Promise.reject(new ModelProviderError({
-        provider: this.id,
-        code: 'model_unavailable',
-        message: `OpenAI model ${selectedModel} has no trusted built-in profile. Supply a complete modelProfiles definition after verifying its contract.`
-      }));
+      return Promise.reject(
+        new ModelProviderError({
+          provider: this.id,
+          code: 'model_unavailable',
+          message: `OpenAI model ${selectedModel} has no trusted built-in profile. Supply a complete modelProfiles definition after verifying its contract.`
+        })
+      );
     }
     const displayName = builtIn.displayName;
     const pricing = builtIn.pricing;
-    return Promise.resolve(parseModelProfile({
-      id: selectedModel,
+    return Promise.resolve(
+      parseModelProfile({
+        id: selectedModel,
+        provider: this.id,
+        ...(displayName ? { displayName } : {}),
+        capabilities: {
+          ...DEFAULT_CAPABILITIES,
+          protocol: this.protocolFor(selectedModel),
+          ...(builtIn.capabilities ?? {})
+        },
+        modalities: {
+          input: builtIn.modalities?.input ?? ['text', 'image'],
+          output: builtIn.modalities?.output ?? ['text']
+        },
+        limits: {
+          ...OPENAI_DEFAULT_LIMITS,
+          ...(builtIn.limits ?? {})
+        },
+        supportedParameters: builtIn.supportedParameters ?? DEFAULT_SUPPORTED_PARAMETERS,
+        ...(pricing ? { pricing } : {}),
+        metadata: {
+          api: 'responses',
+          ...(builtIn.metadata ?? {})
+        }
+      })
+    );
+  }
+
+  private protocolFor(model: string) {
+    const modern = model === 'gpt-6-astra' && this.baseUrl === 'https://api.openai.com/v1';
+    return conservativeProtocolCapabilities(this.endpoint(), {
+      reasoningAccounting: 'included_output',
+      revision: modern ? 'responses-astra-2026-09-07-v1' : 'responses-2026-09-07-v1',
+      roles: ['system', 'developer', 'user', 'assistant'],
+      inputKinds: [
+        'text',
+        'image',
+        'document',
+        'tool_call',
+        'tool_result',
+        'protocol',
+        ...(modern ? ['control' as const] : [])
+      ],
+      outputKinds: ['text', 'tool_call', 'protocol', 'refusal'],
+      state: 'exact',
+      counting: this.countTokens ? 'provider' : 'estimate',
+      asyncTools: modern,
+      steering: modern && this.transport === 'websocket' ? 'native' : 'next_request',
+      contextTransforms: modern ? ['responses.compact'] : []
+    });
+  }
+
+  async nativeSupported(model: string): Promise<boolean> {
+    return (await this.describeModel(model)).capabilities.protocol?.steering === 'native';
+  }
+  async nativeHeaders(signal?: AbortSignal): Promise<Readonly<Record<string, string>>> {
+    const token = await this.tokenProvider.getBearerToken(signal);
+    return { Authorization: `Bearer ${token.token}` };
+  }
+  async decodeNativeResponse(request: ModelRequest, payload: unknown): Promise<ModelResponse> {
+    return toModelResponse(this.id, request, decodeResponsesPayload(payload), this.endpoint());
+  }
+  async transformContext(transform: ModelContextTransformRequest): Promise<ModelContextTransformResult> {
+    return this.transformContextCompiled(
+      transform.transformId,
+      await this.compileContextTransform(transform)
+    );
+  }
+  async compileContextTransform(transform: ModelContextTransformRequest): Promise<CompiledModelRequest> {
+    if (typeof transform.transformId !== 'string' || !transform.transformId)
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'invalid_request',
+        message: 'A context transform identity is required.'
+      });
+    const source = parseModelRequest({
+      ...transform.request,
+      ...(transform.signal ? { signal: transform.signal } : {})
+    });
+    // Native compaction consumes the conversation. Generation controls and tool definitions are not sent.
+    const request = await this.validateRequest({
+      model: source.model,
+      messages: source.messages,
+      ...(source.signal ? { signal: source.signal } : {})
+    });
+    const profile = await this.describeModel(request.model);
+    if (!profile.capabilities.protocol?.contextTransforms.includes('responses.compact'))
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'invalid_request',
+        message: 'Native compaction is not declared for this exact endpoint/model.'
+      });
+    const lowered = responsesInput(request, this.id);
+    const body = {
+      model: request.model,
+      input: lowered.input,
+      ...(lowered.instructions ? { instructions: lowered.instructions } : {})
+    };
+    const providerInputTokens = this.countTokens ? await this.countInput(body, request.signal) : undefined;
+    const compiled = await compileModelRequest({
+      request,
+      profile,
+      body,
+      endpoint: `${this.endpoint()}/compact`,
+      payloadPaths: responsesPayloadPaths(body),
+      outputReservation: source.maxOutputTokens ?? this.contextOutputReservation,
+      ...(providerInputTokens === undefined ? {} : { providerInputTokens })
+    });
+    this.compiledTransforms.set(compiled, transform.transformId);
+    return compiled;
+  }
+  async transformContextCompiled(
+    transformId: string,
+    compiled: CompiledModelRequest,
+    options?: ModelTransportOptions
+  ): Promise<ModelContextTransformResult> {
+    if (
+      this.compiledTransforms.get(compiled) !== transformId ||
+      compiled.endpoint !== `${this.endpoint()}/compact`
+    )
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'invalid_request',
+        message: 'Context transform was not admitted by this provider instance with this identity.'
+      });
+    const request = compiled.logicalRequest;
+    const signal = modelTransportSignal(request, options);
+    signal?.throwIfAborted();
+    const token = await this.tokenProvider.getBearerToken(signal);
+    const response = await this.fetchImpl(compiled.endpoint, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token.token}`, 'Content-Type': CONTENT_TYPE_JSON },
+      body: JSON.stringify(compiled.body),
+      ...(signal ? { signal: signal } : {})
+    });
+    await this.throwIfBadResponse(response);
+    const payload = decodeResponsesPayload(await readBoundedJsonResponse(response));
+    if (!payload.id || !payload.output?.some((item) => item.type === 'compaction'))
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'malformed_response',
+        message: 'Compaction did not return its canonical native window.'
+      });
+    const state = await createProviderContextState({
       provider: this.id,
-      ...(displayName ? { displayName } : {}),
-      capabilities: {
-        ...DEFAULT_CAPABILITIES,
-        ...(builtIn.capabilities ?? {})
-      },
-      modalities: {
-        input: builtIn.modalities?.input ?? ['text', 'image'],
-        output: builtIn.modalities?.output ?? ['text']
-      },
-      limits: {
-        ...OPENAI_DEFAULT_LIMITS,
-        ...(builtIn.limits ?? {})
-      },
-      supportedParameters: builtIn.supportedParameters ?? DEFAULT_SUPPORTED_PARAMETERS,
-      ...(pricing ? { pricing } : {}),
-      metadata: {
-        api: 'responses',
-        ...(builtIn.metadata ?? {})
-      }
-    }));
+      endpoint: this.endpoint(),
+      request,
+      requestId: payload.id,
+      kind: 'responses.compaction',
+      requiresExactPrefix: false,
+      data: { items: validatedResponsesReplayItems(payload.output, this.id) }
+    });
+    const usage = normalizeUsage(payload.usage);
+    return parseModelContextTransformResult({
+      transformId,
+      state,
+      input: [{ role: 'protocol', content: '', state }],
+      ...(usage ? { usage } : {})
+    });
   }
 
-  async complete(request: ModelRequest): Promise<ModelResponse> {
-    return this.createSession().complete(request);
+  async compileRequest(request: ModelRequest): Promise<CompiledModelRequest> {
+    request = await this.validateRequest(request);
+    const cached = this.compiledRequests.get(request);
+    if (cached) return cached;
+    const profile = await this.describeModel(request.model);
+    if (request.maxOutputTokens === undefined && profile.supportedParameters.includes('maxOutputTokens'))
+      request = parseModelRequest({ ...request, maxOutputTokens: this.defaultOutputTokens });
+    const body = toOpenAIResponsesRequest(request, false);
+    delete body.stream;
+    if (this.transport === 'websocket') body.type = 'response.create';
+    const providerInputTokens = this.countTokens ? await this.countInput(body, request.signal) : undefined;
+    const compiled = await compileModelRequest({
+      request,
+      profile: await this.describeModel(request.model),
+      ...(providerInputTokens === undefined ? {} : { providerInputTokens }),
+      body,
+      payloadPaths: responsesPayloadPaths(body),
+      endpoint: `${this.baseUrl}/responses`
+    });
+    this.compiledRequests.set(compiled.logicalRequest, compiled);
+    return compiled;
+  }
+  async compileNativeFrame(
+    request: ModelRequest,
+    body: JsonObject,
+    retainedBody: JsonObject,
+    retainedInputTokenReservation: number
+  ): Promise<CompiledModelRequest> {
+    const effective = await this.compileRequest(request);
+    return compileModelRequest({
+      request: effective.logicalRequest,
+      profile: await this.describeModel(request.model),
+      body,
+      retainedBody,
+      retainedInputTokenReservation,
+      payloadPaths: responsesPayloadPaths(body),
+      retainedPayloadPaths: responsesPayloadPaths(retainedBody),
+      ...(this.countTokens ? { providerInputTokens: effective.accounting.estimatedInputTokens } : {}),
+      endpoint: this.endpoint()
+    });
   }
 
-  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
-    const session = this.createSession();
-    if (!session.stream) {
-      throw new ModelProviderError({ provider: this.id, code: 'invalid_request', message: 'OpenAI provider session does not support streaming.' });
+  private async countInput(body: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<number> {
+    if (this.activeCounts >= this.maxConcurrentCounts)
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'rate_limited',
+        message: 'Responses token-count concurrency limit reached.'
+      });
+    this.activeCounts++;
+    try {
+      signal?.throwIfAborted();
+      const token = await this.tokenProvider.getBearerToken(signal);
+      const countBody = Object.fromEntries(
+        Object.entries(body).filter(([key]) =>
+          [
+            'model',
+            'input',
+            'instructions',
+            'tools',
+            'text',
+            'reasoning',
+            'tool_choice',
+            'parallel_tool_calls'
+          ].includes(key)
+        )
+      );
+      const response = await this.fetchImpl(`${this.endpoint()}/input_tokens`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token.token}`, 'Content-Type': CONTENT_TYPE_JSON },
+        body: JSON.stringify(countBody),
+        ...(signal ? { signal } : {})
+      });
+      await this.throwIfBadResponse(response);
+      const count = parseJsonObject(await readBoundedJsonResponse(response));
+      if (
+        typeof count.input_tokens !== 'number' ||
+        !Number.isSafeInteger(count.input_tokens) ||
+        count.input_tokens < 0
+      )
+        throw new ModelProviderError({
+          provider: this.id,
+          code: 'malformed_response',
+          message: 'Malformed Responses input token count.'
+        });
+      return count.input_tokens;
+    } finally {
+      this.activeCounts--;
     }
-    yield* session.stream(request);
   }
 
-  async *streamResponse(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+  completeCompiled(compiled: CompiledModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
+    this.assertCompiled(compiled);
+    return this.complete(compiled.logicalRequest, options);
+  }
+  async *streamCompiled(
+    compiled: CompiledModelRequest,
+    options?: ModelTransportOptions
+  ): AsyncIterable<ModelStreamEvent> {
+    this.assertCompiled(compiled);
+    yield* this.stream(compiled.logicalRequest, options);
+  }
+  assertCompiled(compiled: CompiledModelRequest): void {
+    if (this.compiledRequests.get(compiled.logicalRequest) !== compiled)
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'invalid_request',
+        message: 'Compiled request was not admitted by this provider instance.'
+      });
+  }
+  endpoint(): string {
+    return `${this.baseUrl}/responses`;
+  }
+
+  async complete(request: ModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
+    const session = this.createSession();
+    if (!session.completeCompiled)
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'invalid_request',
+        message: 'Session has no compiled completion transport.'
+      });
+    try {
+      return await session.completeCompiled(await this.compileRequest(request), options);
+    } catch (error) {
+      throw normalizeError(this.id, error);
+    }
+  }
+
+  async *stream(request: ModelRequest, options?: ModelTransportOptions): AsyncIterable<ModelStreamEvent> {
+    const session = this.createSession();
+    if (!session.streamCompiled) {
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'invalid_request',
+        message: 'OpenAI provider session does not support streaming.'
+      });
+    }
+    try {
+      yield* session.streamCompiled(await this.compileRequest(request), options);
+    } catch (error) {
+      throw normalizeError(this.id, error);
+    }
+  }
+
+  async *streamResponse(
+    request: ModelRequest,
+    options?: ModelTransportOptions
+  ): AsyncIterable<ModelStreamEvent> {
     try {
       request = await this.validateRequest(request);
-      const responsePromise = this.fetchResponse(request, true);
+      const signal = modelTransportSignal(request, options);
+      signal?.throwIfAborted();
+      const responsePromise = this.fetchResponse(request, true, options);
       const startedAt = Date.now();
       let response: Response | undefined;
       while (!response) {
-        const result = await waitForResponseOrStatus(responsePromise, this.statusIntervalMs, request.signal);
+        const result = await waitForResponseOrStatus(responsePromise, this.statusIntervalMs, signal);
         if (result.type === 'response') {
           response = result.response;
         } else {
           const elapsedSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1_000));
-          yield { type: 'status', message: `Waiting for OpenAI stream response (${String(elapsedSeconds)}s).` };
+          yield {
+            type: 'status',
+            message: `Waiting for OpenAI stream response (${String(elapsedSeconds)}s).`
+          };
         }
       }
 
@@ -248,13 +597,21 @@ export class OpenAIProvider implements ModelProvider {
       const accumulators = new Map<string, StreamingFunctionCallAccumulator>();
       const customAccumulators = new Map<string, StreamingCustomToolCallAccumulator>();
 
-      for await (const event of readSseEvents(response.body, request.signal, this.statusIntervalMs, this.streamIdleTimeoutMs)) {
+      for await (const event of readSseEvents(
+        response.body,
+        signal,
+        this.statusIntervalMs,
+        this.streamIdleTimeoutMs
+      )) {
         if (event.type === 'comment') {
           yield { type: 'status', message: `OpenAI stream status: ${event.comment}`, raw: event };
           continue;
         }
         if (event.type === 'status') {
-          yield { type: 'status', message: `Waiting for OpenAI stream data (${String(Math.max(1, Math.round(event.idleMs / 1_000)))}s).` };
+          yield {
+            type: 'status',
+            message: `Waiting for OpenAI stream data (${String(Math.max(1, Math.round(event.idleMs / 1_000)))}s).`
+          };
           continue;
         }
         if (event.data === '[DONE]') {
@@ -286,7 +643,12 @@ export class OpenAIProvider implements ModelProvider {
         const contentDelta = stringValue(part.delta);
         if (eventType === 'response.output_text.delta' && contentDelta.length > 0) {
           content += contentDelta;
-          yield { type: 'content', content: contentDelta, accumulated: content, raw: normalizeJsonSafe(part).value };
+          yield {
+            type: 'content',
+            content: contentDelta,
+            accumulated: content,
+            raw: normalizeJsonSafe(part).value
+          };
           continue;
         }
 
@@ -294,10 +656,22 @@ export class OpenAIProvider implements ModelProvider {
         if (reasoningChannel && contentDelta.length > 0) {
           if (reasoningChannel === 'summary') {
             reasoningSummary += contentDelta;
-            yield { type: 'reasoning', reasoning: contentDelta, accumulatedReasoning: reasoningSummary, channel: 'summary', raw: normalizeJsonSafe(part).value };
+            yield {
+              type: 'reasoning',
+              reasoning: contentDelta,
+              accumulatedReasoning: reasoningSummary,
+              channel: 'summary',
+              raw: normalizeJsonSafe(part).value
+            };
           } else {
             reasoning += contentDelta;
-            yield { type: 'reasoning', reasoning: contentDelta, accumulatedReasoning: reasoning, channel: 'reasoning', raw: normalizeJsonSafe(part).value };
+            yield {
+              type: 'reasoning',
+              reasoning: contentDelta,
+              accumulatedReasoning: reasoning,
+              channel: 'reasoning',
+              raw: normalizeJsonSafe(part).value
+            };
           }
           continue;
         }
@@ -327,7 +701,7 @@ export class OpenAIProvider implements ModelProvider {
       }
 
       const responsePayload = completedResponse
-        ? toModelResponse(this.id, request, completedResponse)
+        ? await toModelResponse(this.id, request, completedResponse, this.endpoint())
         : fallbackStreamResponse(this.id, request, content, reasoning, reasoningSummary, toolCalls);
       const responseToolCalls = dedupeToolCalls([...(responsePayload.toolCalls ?? []), ...toolCalls]);
       const recoveredResponse = parseOpenAIModelResponse({
@@ -344,19 +718,25 @@ export class OpenAIProvider implements ModelProvider {
     }
   }
 
-  async fetchResponse(request: ModelRequest, stream: boolean): Promise<Response> {
+  async fetchResponse(
+    request: ModelRequest,
+    stream: boolean,
+    options?: ModelTransportOptions
+  ): Promise<Response> {
+    const signal = modelTransportSignal(request, options);
+    signal?.throwIfAborted();
     try {
-      const token = await this.tokenProvider.getBearerToken(request.signal);
+      const token = await this.tokenProvider.getBearerToken(signal);
       const init: RequestInit = {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${token.token}`,
           'Content-Type': CONTENT_TYPE_JSON
         },
-        body: JSON.stringify(toOpenAIResponsesRequest(request, stream))
+        body: JSON.stringify({ ...(await this.compileRequest(request)).body, stream })
       };
-      if (request.signal) {
-        init.signal = request.signal;
+      if (signal) {
+        init.signal = signal;
       }
       const response = await this.fetchImpl(`${this.baseUrl}/responses`, init);
       await this.throwIfBadResponse(response);
@@ -370,6 +750,15 @@ export class OpenAIProvider implements ModelProvider {
     const owned = parseModelRequest(request);
     throwIfAborted(owned.signal);
     assertModelRequestSupported(await this.describeModel(owned.model), owned);
+    for (const [index, item] of owned.messages.entries())
+      if (item.role === 'protocol')
+        await assertProviderContextCompatible(
+          item.state,
+          owned,
+          this.endpoint(),
+          owned.messages.slice(0, index),
+          this.id
+        );
     return owned;
   }
 
@@ -400,30 +789,77 @@ export class OpenAIProvider implements ModelProvider {
 }
 
 function openAIBuiltInProfile(model: string): OpenAIBuiltInProfile | undefined {
+  if (model === 'gpt-6-astra')
+    return {
+      displayName: 'GPT-6 Astra',
+      limits: { contextTokens: 1_050_000, maxInputTokens: 922_000, outputTokens: 128_000 },
+      pricing: tieredOpenAIPricing(10, 50),
+      capabilities: {
+        temperature: false,
+        topP: false,
+        logprobs: false,
+        reasoning: {
+          strategies: ['effort'],
+          canDisable: false,
+          efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+          modes: ['standard', 'pro'],
+          summaries: ['auto', 'concise', 'detailed'],
+          separateOutput: true
+        }
+      },
+      supportedParameters: DEFAULT_SUPPORTED_PARAMETERS.filter(
+        (parameter) => !['temperature', 'topP', 'logprobs', 'topLogprobs'].includes(parameter)
+      ),
+      metadata: {
+        profileSource: 'https://developers.openai.com/api/docs/models/gpt-6-astra',
+        verifiedAt: '2026-09-07'
+      }
+    };
   if (model === 'gpt-5.6-sol' || model === 'gpt-5.6') return gpt56Profile('GPT-5.6 Sol', 'sol', 5, 30);
   if (model === 'gpt-5.6-terra') return gpt56Profile('GPT-5.6 Terra', 'terra', 2.5, 15);
   if (model === 'gpt-5.6-luna') return gpt56Profile('GPT-5.6 Luna', 'luna', 1, 6);
-  if (model === 'gpt-5.5') return {
-    displayName: 'GPT-5.5',
-    limits: { contextTokens: 1_050_000, maxInputTokens: 922_000, outputTokens: 128_000 },
-    pricing: tieredOpenAIPricing(5, 30),
-    capabilities: { reasoning: { strategies: ['effort'], canDisable: true, efforts: ['low', 'medium', 'high', 'xhigh'], summaries: ['auto', 'concise', 'detailed'], separateOutput: true } },
-    metadata: { modelTier: 'gpt-5.5', defaultReasoningEffort: 'medium' }
-  };
-  if (model === 'gpt-5.5-pro') return {
-    displayName: 'GPT-5.5 Pro',
-    limits: { contextTokens: 1_050_000, maxInputTokens: 922_000, outputTokens: 128_000 },
-    pricing: { currency: 'USD', rates: { input: 30, output: 180 } },
-    capabilities: {
-      streaming: false,
-      reasoning: { strategies: ['effort'], canDisable: false, efforts: ['medium', 'high', 'xhigh'], summaries: ['auto', 'concise', 'detailed'], separateOutput: true }
-    },
-    metadata: { modelTier: 'standalone-pro-model', defaultReasoningEffort: 'high' }
-  };
+  if (model === 'gpt-5.5')
+    return {
+      displayName: 'GPT-5.5',
+      limits: { contextTokens: 1_050_000, maxInputTokens: 922_000, outputTokens: 128_000 },
+      pricing: tieredOpenAIPricing(5, 30),
+      capabilities: {
+        reasoning: {
+          strategies: ['effort'],
+          canDisable: true,
+          efforts: ['low', 'medium', 'high', 'xhigh'],
+          summaries: ['auto', 'concise', 'detailed'],
+          separateOutput: true
+        }
+      },
+      metadata: { modelTier: 'gpt-5.5', defaultReasoningEffort: 'medium' }
+    };
+  if (model === 'gpt-5.5-pro')
+    return {
+      displayName: 'GPT-5.5 Pro',
+      limits: { contextTokens: 1_050_000, maxInputTokens: 922_000, outputTokens: 128_000 },
+      pricing: { currency: 'USD', rates: { input: 30, output: 180 } },
+      capabilities: {
+        streaming: false,
+        reasoning: {
+          strategies: ['effort'],
+          canDisable: false,
+          efforts: ['medium', 'high', 'xhigh'],
+          summaries: ['auto', 'concise', 'detailed'],
+          separateOutput: true
+        }
+      },
+      metadata: { modelTier: 'standalone-pro-model', defaultReasoningEffort: 'high' }
+    };
   return undefined;
 }
 
-function gpt56Profile(displayName: string, modelTier: string, inputRate: number, outputRate: number): OpenAIBuiltInProfile {
+function gpt56Profile(
+  displayName: string,
+  modelTier: string,
+  inputRate: number,
+  outputRate: number
+): OpenAIBuiltInProfile {
   return {
     displayName,
     limits: { contextTokens: 1_050_000, maxInputTokens: 922_000, outputTokens: 128_000 },
@@ -442,21 +878,32 @@ function tieredOpenAIPricing(inputRate: number, outputRate: number): NonNullable
 
 class OpenAIProviderSession implements ModelProviderSession {
   constructor(private readonly provider: OpenAIProvider) {}
+  completeCompiled(compiled: CompiledModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
+    this.provider.assertCompiled(compiled);
+    return this.complete(compiled.logicalRequest, options);
+  }
+  async *streamCompiled(
+    compiled: CompiledModelRequest,
+    options?: ModelTransportOptions
+  ): AsyncIterable<ModelStreamEvent> {
+    this.provider.assertCompiled(compiled);
+    yield* this.stream(compiled.logicalRequest, options);
+  }
 
-  async complete(request: ModelRequest): Promise<ModelResponse> {
+  async complete(request: ModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
     try {
       request = await this.provider.validateRequest(request);
-      const response = await this.provider.fetchResponse(request, false);
+      const response = await this.provider.fetchResponse(request, false, options);
       const payload = await parseJsonResponse(this.provider.id, response);
-      return toModelResponse(this.provider.id, request, payload);
+      return await toModelResponse(this.provider.id, request, payload, this.provider.endpoint());
     } catch (error) {
       throw normalizeError(this.provider.id, error);
     }
   }
 
-  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+  async *stream(request: ModelRequest, options?: ModelTransportOptions): AsyncIterable<ModelStreamEvent> {
     try {
-      yield* this.provider.streamResponse(request);
+      yield* this.provider.streamResponse(request, options);
     } catch (error) {
       throw normalizeError(this.provider.id, error);
     }
@@ -485,11 +932,12 @@ function isBearerTokenProvider(value: ProviderAuth | BearerTokenProvider): value
 }
 
 function toOpenAIResponsesRequest(request: ModelRequest, stream: boolean): Record<string, unknown> {
-  const { instructions, input } = toOpenAIInput(request.messages);
+  const { instructions, input } = responsesInput(request, OPENAI_PROVIDER_ID);
   const body: Record<string, unknown> = {
     model: request.model,
     input,
     store: false,
+    include: ['reasoning.encrypted_content'],
     stream
   };
   if (instructions.length > 0) body.instructions = instructions;
@@ -502,7 +950,7 @@ function toOpenAIResponsesRequest(request: ModelRequest, stream: boolean): Recor
   const reasoning = toOpenAIReasoning(request.reasoning);
   if (reasoning) body.reasoning = reasoning;
   if (request.logprobs !== undefined || request.topLogprobs !== undefined) {
-    body.include = ['message.output_text.logprobs'];
+    body.include = ['reasoning.encrypted_content', 'message.output_text.logprobs'];
     if (request.topLogprobs !== undefined) body.top_logprobs = request.topLogprobs;
   }
   if (request.metadata && Object.keys(request.metadata).length > 0) body.metadata = request.metadata;
@@ -513,111 +961,103 @@ function toOpenAIResponsesRequest(request: ModelRequest, stream: boolean): Recor
 function applyOpenAIProviderOptions(body: Record<string, unknown>, request: ModelRequest): void {
   const options = providerOptionsFor(request, OPENAI_PROVIDER_ID);
   if (!options) return;
-  const allowed = new Set(['serviceTier', 'safetyIdentifier', 'promptCacheKey', 'promptCacheOptions', 'reasoningContext']);
+  const allowed = new Set([
+    'serviceTier',
+    'safetyIdentifier',
+    'promptCacheKey',
+    'promptCacheOptions',
+    'reasoningContext'
+  ]);
   rejectUnknownProviderOptions(options, allowed, OPENAI_PROVIDER_ID);
   if (options.serviceTier !== undefined) body.service_tier = options.serviceTier;
   if (options.safetyIdentifier !== undefined) body.safety_identifier = options.safetyIdentifier;
   if (options.promptCacheKey !== undefined) body.prompt_cache_key = options.promptCacheKey;
   if (options.promptCacheOptions !== undefined) body.prompt_cache_options = options.promptCacheOptions;
-  if (options.reasoningContext !== undefined) body.reasoning = { ...(isJsonObject(body.reasoning) ? body.reasoning : {}), context: options.reasoningContext };
+  if (options.reasoningContext !== undefined)
+    body.reasoning = {
+      ...(isJsonObject(body.reasoning) ? body.reasoning : {}),
+      context: options.reasoningContext
+    };
 }
 
 function providerOptionsFor(request: ModelRequest, provider: string): Record<string, unknown> | undefined {
   if (!request.providerOptions) return undefined;
   if (request.providerOptions.provider !== provider) {
-    throw new ModelProviderError({ provider, code: 'invalid_request', message: `Request options for ${request.providerOptions.provider} cannot be used with ${provider}.` });
+    throw new ModelProviderError({
+      provider,
+      code: 'invalid_request',
+      message: `Request options for ${request.providerOptions.provider} cannot be used with ${provider}.`
+    });
   }
   return request.providerOptions.values;
 }
 
-function rejectUnknownProviderOptions(options: Record<string, unknown>, allowed: ReadonlySet<string>, provider: string): void {
+function rejectUnknownProviderOptions(
+  options: Record<string, unknown>,
+  allowed: ReadonlySet<string>,
+  provider: string
+): void {
   const unknown = Object.keys(options).filter((key) => !allowed.has(key));
-  if (unknown.length > 0) throw new ModelProviderError({ provider, code: 'invalid_request', message: `Unsupported ${provider} provider option(s): ${unknown.join(', ')}.` });
-  if (options.serviceTier !== undefined && (typeof options.serviceTier !== 'string' || !['auto', 'default', 'flex', 'priority'].includes(options.serviceTier))) throw new ModelProviderError({ provider, code: 'invalid_request', message: 'OpenAI serviceTier is invalid.' });
-  if (options.promptCacheOptions !== undefined && (!isJsonObject(options.promptCacheOptions) || !onlyOpenAIOptionKeys(options.promptCacheOptions, ['mode', 'ttl']) || (options.promptCacheOptions.mode !== undefined && options.promptCacheOptions.mode !== 'implicit' && options.promptCacheOptions.mode !== 'explicit') || (options.promptCacheOptions.ttl !== undefined && options.promptCacheOptions.ttl !== '30m'))) throw new ModelProviderError({ provider, code: 'invalid_request', message: 'OpenAI promptCacheOptions must use mode implicit|explicit and ttl 30m.' });
-  if (options.reasoningContext !== undefined && options.reasoningContext !== 'auto' && options.reasoningContext !== 'current_turn' && options.reasoningContext !== 'all_turns') throw new ModelProviderError({ provider, code: 'invalid_request', message: 'OpenAI reasoningContext is invalid.' });
-  for (const key of ['safetyIdentifier', 'promptCacheKey']) if (options[key] !== undefined && (typeof options[key] !== 'string' || options[key].length === 0)) throw new ModelProviderError({ provider, code: 'invalid_request', message: `OpenAI ${key} must be a non-empty string.` });
-}
-
-function onlyOpenAIOptionKeys(value: Record<string, unknown>, allowed: string[]): boolean { const keys = new Set(allowed); return Object.keys(value).every((key) => keys.has(key)); }
-
-function toOpenAIInput(messages: readonly ModelMessage[]): { instructions: string; input: unknown[] } {
-  const instructionMessages = instructionMessagesFrom(messages);
-  const input: unknown[] = [];
-  for (const message of messages) {
-    if (message.role === 'system') {
-      continue;
-    }
-    if (message.role === 'tool') {
-      input.push(toolCallOutputForOpenAIMessage(message));
-      if (message.images && message.images.length > 0) input.push({ role: 'user', content: contentForOpenAIMessage({ role: 'user', content: '', images: message.images }) });
-      continue;
-    }
-    if (message.role === 'assistant') {
-      if (message.content.length > 0) {
-        input.push({ role: 'assistant', content: message.content });
-      }
-      for (const toolCall of message.toolCalls ?? []) {
-        input.push(toOpenAIFunctionCallInput(toolCall));
-      }
-      continue;
-    }
-    input.push({
-      role: 'user',
-      content: contentForOpenAIMessage(message)
+  if (unknown.length > 0)
+    throw new ModelProviderError({
+      provider,
+      code: 'invalid_request',
+      message: `Unsupported ${provider} provider option(s): ${unknown.join(', ')}.`
     });
-  }
-  return {
-    instructions: instructionMessages.join('\n\n'),
-    input
-  };
+  if (
+    options.serviceTier !== undefined &&
+    (typeof options.serviceTier !== 'string' ||
+      !['auto', 'default', 'flex', 'priority'].includes(options.serviceTier))
+  )
+    throw new ModelProviderError({
+      provider,
+      code: 'invalid_request',
+      message: 'OpenAI serviceTier is invalid.'
+    });
+  if (
+    options.promptCacheOptions !== undefined &&
+    (!isJsonObject(options.promptCacheOptions) ||
+      !onlyOpenAIOptionKeys(options.promptCacheOptions, ['mode', 'ttl']) ||
+      (options.promptCacheOptions.mode !== undefined &&
+        options.promptCacheOptions.mode !== 'implicit' &&
+        options.promptCacheOptions.mode !== 'explicit') ||
+      (options.promptCacheOptions.ttl !== undefined && options.promptCacheOptions.ttl !== '30m'))
+  )
+    throw new ModelProviderError({
+      provider,
+      code: 'invalid_request',
+      message: 'OpenAI promptCacheOptions must use mode implicit|explicit and ttl 30m.'
+    });
+  if (
+    options.reasoningContext !== undefined &&
+    options.reasoningContext !== 'auto' &&
+    options.reasoningContext !== 'current_turn' &&
+    options.reasoningContext !== 'all_turns'
+  )
+    throw new ModelProviderError({
+      provider,
+      code: 'invalid_request',
+      message: 'OpenAI reasoningContext is invalid.'
+    });
+  for (const key of ['safetyIdentifier', 'promptCacheKey'])
+    if (options[key] !== undefined && (typeof options[key] !== 'string' || options[key].length === 0))
+      throw new ModelProviderError({
+        provider,
+        code: 'invalid_request',
+        message: `OpenAI ${key} must be a non-empty string.`
+      });
 }
 
-function instructionMessagesFrom(messages: readonly ModelMessage[]): string[] {
-  return messages
-    .filter((message) => message.role === 'system' && message.content.trim().length > 0)
-    .map((message) => message.content);
-}
-
-function contentForOpenAIMessage(message: ModelMessage): string | Record<string, unknown>[] {
-  if (!message.images || message.images.length === 0) {
-    return message.content;
-  }
-  return [
-    ...(message.content.length > 0 ? [{ type: 'input_text', text: message.content }] : []),
-    ...message.images.map((image) => ({
-      type: 'input_image',
-      image_url: `data:${image.mediaType};base64,${imageToBase64(image)}`,
-      ...(image.detail ? { detail: image.detail } : {})
-    }))
-  ];
-}
-
-function imageToBase64(image: ModelImage): string {
-  return image.type === 'base64' ? image.data : Buffer.from(image.data).toString('base64');
-}
-
-function toOpenAIFunctionCallInput(toolCall: ModelToolCall): Record<string, unknown> {
-  if (toolCall.input.kind === 'text') {
-    return {
-      type: 'custom_tool_call',
-      call_id: toolCall.id ?? `call_${toolCall.name}`,
-      name: toolCall.name,
-      input: toolCall.input.value
-    };
-  }
-  return {
-    type: 'function_call',
-    call_id: toolCall.id ?? `call_${toolCall.name}`,
-    name: toolCall.name,
-    arguments: JSON.stringify(toolCall.input.value)
-  };
+function onlyOpenAIOptionKeys(value: Record<string, unknown>, allowed: string[]): boolean {
+  const keys = new Set(allowed);
+  return Object.keys(value).every((key) => keys.has(key));
 }
 
 function toOpenAITool(tool: ModelTool): Record<string, unknown> {
   if (tool.type === 'custom') {
     return {
       type: 'custom',
+      ...(tool.async === undefined ? {} : { async: tool.async }),
       name: tool.name,
       ...(tool.description ? { description: tool.description } : {}),
       format: tool.format
@@ -625,25 +1065,10 @@ function toOpenAITool(tool: ModelTool): Record<string, unknown> {
   }
   return {
     type: 'function',
+    ...(tool.async === undefined ? {} : { async: tool.async }),
     name: tool.function.name,
     ...(tool.function.description ? { description: tool.function.description } : {}),
     ...(tool.function.parameters ? { parameters: tool.function.parameters } : {})
-  };
-}
-
-function toolCallOutputForOpenAIMessage(message: ModelMessage): Record<string, unknown> {
-  const callId = message.toolCallId ?? message.toolName ?? message.name ?? 'call_unknown';
-  if (message.toolCallType === 'custom') {
-    return {
-      type: 'custom_tool_call_output',
-      call_id: callId,
-      output: message.content
-    };
-  }
-  return {
-    type: 'function_call_output',
-    call_id: callId,
-    output: message.content
   };
 }
 
@@ -664,13 +1089,25 @@ function toOpenAITextConfig(format: ModelResponseFormat | undefined): Record<str
   };
 }
 
-function toOpenAIReasoning(reasoning: ModelReasoningRequest | undefined): Record<string, unknown> | undefined {
+function toOpenAIReasoning(
+  reasoning: ModelReasoningRequest | undefined
+): Record<string, unknown> | undefined {
   if (!reasoning) {
     return undefined;
   }
   if (reasoning.strategy === 'disabled') return { effort: 'none' };
-  if (reasoning.strategy === 'enabled') throw new ModelProviderError({ provider: OPENAI_PROVIDER_ID, code: 'invalid_request', message: 'OpenAI Responses requires an explicit reasoning effort.' });
-  if (reasoning.strategy === 'budget') throw new ModelProviderError({ provider: OPENAI_PROVIDER_ID, code: 'invalid_request', message: 'OpenAI Responses does not accept a reasoning token budget.' });
+  if (reasoning.strategy === 'enabled')
+    throw new ModelProviderError({
+      provider: OPENAI_PROVIDER_ID,
+      code: 'invalid_request',
+      message: 'OpenAI Responses requires an explicit reasoning effort.'
+    });
+  if (reasoning.strategy === 'budget')
+    throw new ModelProviderError({
+      provider: OPENAI_PROVIDER_ID,
+      code: 'invalid_request',
+      message: 'OpenAI Responses does not accept a reasoning token budget.'
+    });
   return {
     effort: reasoning.effort,
     ...(reasoning.mode ? { mode: reasoning.mode } : {}),
@@ -678,11 +1115,12 @@ function toOpenAIReasoning(reasoning: ModelReasoningRequest | undefined): Record
   };
 }
 
-function toModelResponse(
+async function toModelResponse(
   provider: string,
   request: ModelRequest,
-  payload: OpenAIResponsesPayload
-): ModelResponse {
+  payload: OpenAIResponsesPayload,
+  endpoint: string
+): Promise<ModelResponse> {
   if (payload.error) {
     const failure = summarizeOpenAIFailure(payload);
     throw new ModelProviderError({
@@ -706,13 +1144,25 @@ function toModelResponse(
       cause: payload
     });
   }
-  const content = typeof payload.output_text === 'string' ? payload.output_text : contentFromOutput(payload.output ?? []);
+  const content =
+    typeof payload.output_text === 'string' ? payload.output_text : contentFromOutput(payload.output ?? []);
   const toolCalls = normalizeToolCalls(provider, payload.output ?? []);
   const reasoningSummary = reasoningSummaryFromOutput(payload.output ?? []);
   const providerTerminationReason = payload.incomplete_details?.reason ?? payload.status;
   const usage = normalizeUsage(payload.usage);
   return parseOpenAIModelResponse({
     content,
+    output: await responsesOutput({
+      request,
+      provider,
+      endpoint,
+      requestId: payload.id ?? 'response-without-id',
+      items:
+        payload.output ??
+        (content
+          ? [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: content }] }]
+          : [])
+    }),
     model: payload.model ?? request.model,
     provider,
     terminationReason: normalizeOpenAITermination(payload, toolCalls.length > 0),
@@ -805,15 +1255,23 @@ function normalizeToolCalls(provider: string, output: readonly OpenAIOutputItem[
     .filter((toolCall): toolCall is ModelToolCall => toolCall !== undefined);
 }
 
-function toolCallFromOutputItem(provider: string, item: OpenAIOutputItem | undefined): ModelToolCall | undefined {
+function toolCallFromOutputItem(
+  provider: string,
+  item: OpenAIOutputItem | undefined
+): ModelToolCall | undefined {
   if (item?.type === 'custom_tool_call') {
     if (!item.name) {
-      throw new ModelProviderError({ provider, code: 'malformed_response', message: 'OpenAI custom_tool_call item did not include name.' });
+      throw new ModelProviderError({
+        provider,
+        code: 'malformed_response',
+        message: 'OpenAI custom_tool_call item did not include name.'
+      });
     }
     return {
       ...(item.call_id ? { id: item.call_id } : item.id ? { id: item.id } : {}),
       type: 'custom',
       name: item.name,
+      ...(typeof item.async === 'boolean' ? { async: item.async } : {}),
       input: { kind: 'text', value: stringValue(item.input) }
     };
   }
@@ -821,12 +1279,17 @@ function toolCallFromOutputItem(provider: string, item: OpenAIOutputItem | undef
     return undefined;
   }
   if (!item.name) {
-    throw new ModelProviderError({ provider, code: 'malformed_response', message: 'OpenAI function_call item did not include name.' });
+    throw new ModelProviderError({
+      provider,
+      code: 'malformed_response',
+      message: 'OpenAI function_call item did not include name.'
+    });
   }
   return {
     ...(item.call_id ? { id: item.call_id } : item.id ? { id: item.id } : {}),
     type: 'function',
     name: item.name,
+    ...(typeof item.async === 'boolean' ? { async: item.async } : {}),
     input: { kind: 'json', value: parseToolArguments(provider, item.arguments) }
   };
 }
@@ -845,10 +1308,17 @@ function parseToolArguments(provider: string, value: string | undefined): JsonOb
       cause: error
     });
   }
-  throw new ModelProviderError({ provider, code: 'malformed_response', message: 'OpenAI tool call arguments must decode to a JSON object.' });
+  throw new ModelProviderError({
+    provider,
+    code: 'malformed_response',
+    message: 'OpenAI tool call arguments must decode to a JSON object.'
+  });
 }
 
-function mergeStreamingFunctionCallParts(accumulators: Map<string, StreamingFunctionCallAccumulator>, part: OpenAIStreamData): ModelToolCall[] {
+function mergeStreamingFunctionCallParts(
+  accumulators: Map<string, StreamingFunctionCallAccumulator>,
+  part: OpenAIStreamData
+): ModelToolCall[] {
   const eventType = part.type;
   if (!eventType.includes('function_call')) {
     return [];
@@ -885,6 +1355,7 @@ function tryAccumulatorToToolCall(item: StreamingFunctionCallAccumulator): Model
       ...(item.callId ? { id: item.callId } : item.id ? { id: item.id } : {}),
       type: 'function',
       name: item.name,
+      ...(typeof item.async === 'boolean' ? { async: item.async } : {}),
       input: { kind: 'json', value: parseJsonObject(parsed) }
     };
   } catch {
@@ -892,7 +1363,10 @@ function tryAccumulatorToToolCall(item: StreamingFunctionCallAccumulator): Model
   }
 }
 
-function mergeStreamingCustomToolCallParts(accumulators: Map<string, StreamingCustomToolCallAccumulator>, part: OpenAIStreamData): ModelToolCall[] {
+function mergeStreamingCustomToolCallParts(
+  accumulators: Map<string, StreamingCustomToolCallAccumulator>,
+  part: OpenAIStreamData
+): ModelToolCall[] {
   const eventType = part.type;
   if (!eventType.includes('custom_tool_call')) {
     return [];
@@ -930,6 +1404,7 @@ function tryCustomAccumulatorToToolCall(item: StreamingCustomToolCallAccumulator
     ...(item.callId ? { id: item.callId } : item.id ? { id: item.id } : {}),
     type: 'custom',
     name: item.name,
+    ...(typeof item.async === 'boolean' ? { async: item.async } : {}),
     input: { kind: 'text', value: item.inputText }
   };
 }
@@ -970,20 +1445,44 @@ function normalizeUsage(usage: OpenAIUsage | undefined): ModelUsage | undefined 
     promptTokens,
     completionTokens,
     totalTokens: usage.total_tokens ?? promptTokens + completionTokens,
-    ...(usage.input_tokens_details?.cached_tokens === undefined ? {} : { cacheReadTokens: usage.input_tokens_details.cached_tokens }),
-    ...(usage.input_tokens_details?.cache_write_tokens === undefined ? {} : { cacheWriteTokens: usage.input_tokens_details.cache_write_tokens }),
-    ...(usage.output_tokens_details?.reasoning_tokens === undefined ? {} : { reasoningTokens: usage.output_tokens_details.reasoning_tokens })
+    ...(usage.input_tokens_details?.cached_tokens === undefined
+      ? {}
+      : { cacheReadTokens: usage.input_tokens_details.cached_tokens }),
+    ...(usage.input_tokens_details?.cache_write_tokens === undefined
+      ? {}
+      : { cacheWriteTokens: usage.input_tokens_details.cache_write_tokens }),
+    ...(usage.output_tokens_details?.reasoning_tokens === undefined
+      ? {}
+      : { reasoningTokens: usage.output_tokens_details.reasoning_tokens })
   };
 }
 
-function readSseEvents(body: ReadableStream<Uint8Array>, signal: AbortSignal | undefined, statusIntervalMs: number, idleTimeoutMs: number): AsyncIterable<OpenAISseEvent> {
+function readSseEvents(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal | undefined,
+  statusIntervalMs: number,
+  idleTimeoutMs: number
+): AsyncIterable<OpenAISseEvent> {
   return readJsonSseEvents(body, {
     ...(signal ? { signal } : {}),
     statusIntervalMs,
     idleTimeoutMs,
     decodeData: (value) => decodeResponsesStreamData(value, 'OpenAI stream event'),
-    createMalformedError: (message, cause) => new ModelProviderError({ provider: OPENAI_PROVIDER_ID, code: 'malformed_response', message: `OpenAI ${message}`, cause }),
-    createIdleError: (idleMs) => new ModelProviderError({ provider: OPENAI_PROVIDER_ID, code: 'provider_unavailable', message: `OpenAI stream was idle for ${String(idleMs)}ms.`, retryable: true, diagnostic: { transport: 'http_sse', causeSummary: { idleMs } } })
+    createMalformedError: (message, cause) =>
+      new ModelProviderError({
+        provider: OPENAI_PROVIDER_ID,
+        code: 'malformed_response',
+        message: `OpenAI ${message}`,
+        cause
+      }),
+    createIdleError: (idleMs) =>
+      new ModelProviderError({
+        provider: OPENAI_PROVIDER_ID,
+        code: 'provider_unavailable',
+        message: `OpenAI stream was idle for ${String(idleMs)}ms.`,
+        retryable: true,
+        diagnostic: { transport: 'http_sse', causeSummary: { idleMs } }
+      })
   });
 }
 
@@ -1024,7 +1523,12 @@ function normalizeError(provider: string, error: unknown): ModelProviderError {
   }
   const message = errorMessage(error);
   if (isAbortError(error) || /abort/i.test(message)) {
-    return new ModelProviderError({ provider, code: 'aborted', message: `OpenAI request aborted: ${message}`, cause: error });
+    return new ModelProviderError({
+      provider,
+      code: 'aborted',
+      message: `OpenAI request aborted: ${message}`,
+      cause: error
+    });
   }
   return new ModelProviderError({
     provider,
@@ -1040,7 +1544,12 @@ function parseOpenAIModelResponse(value: unknown): ModelResponse {
     return parseModelResponse(value);
   } catch (error) {
     if (error instanceof ModelContractError) {
-      throw new ModelProviderError({ provider: OPENAI_PROVIDER_ID, code: 'malformed_response', message: `OpenAI response violated the model contract: ${error.message}`, cause: error });
+      throw new ModelProviderError({
+        provider: OPENAI_PROVIDER_ID,
+        code: 'malformed_response',
+        message: `OpenAI response violated the model contract: ${error.message}`,
+        cause: error
+      });
     }
     throw error;
   }
@@ -1060,7 +1569,8 @@ function classifyStatus(status: number, body: string): ModelProviderErrorCode {
   if (status === 404) return 'model_unavailable';
   if (status === 408 || status === 413 || /context|token|too large/i.test(body)) return 'context_overflow';
   if (status === 429) return 'rate_limited';
-  if (status === 400 || status === 401 || status === 402 || status === 403 || status === 422) return 'invalid_request';
+  if (status === 400 || status === 401 || status === 402 || status === 403 || status === 422)
+    return 'invalid_request';
   if (status >= 500) return 'provider_unavailable';
   return 'unknown';
 }
@@ -1103,7 +1613,11 @@ function summarizeOpenAIFailure(payload: OpenAIStreamData | OpenAIResponsesPaylo
   addDiagnosticField(causeSummary, 'errorMessage', error?.message);
   addDiagnosticField(causeSummary, 'errorCode', error?.code);
   addDiagnosticField(causeSummary, 'errorType', error?.type);
-  addDiagnosticField(causeSummary, 'incompleteReason', payloadIncompleteDetails?.reason ?? response?.incomplete_details?.reason);
+  addDiagnosticField(
+    causeSummary,
+    'incompleteReason',
+    payloadIncompleteDetails?.reason ?? response?.incomplete_details?.reason
+  );
 
   const outputError = firstOutputError(payloadOutput ?? response?.output);
   if (outputError) {
@@ -1113,12 +1627,13 @@ function summarizeOpenAIFailure(payload: OpenAIStreamData | OpenAIResponsesPaylo
     addDiagnosticField(causeSummary, 'outputErrorCode', outputError.code);
   }
 
-  const message = error?.message
-    ?? error?.code
-    ?? error?.type
-    ?? outputError?.message
-    ?? outputError?.code
-    ?? summarizedFailureMessage(causeSummary);
+  const message =
+    error?.message ??
+    error?.code ??
+    error?.type ??
+    outputError?.message ??
+    outputError?.code ??
+    summarizedFailureMessage(causeSummary);
   return {
     message,
     ...(typeof causeSummary.eventType === 'string' ? { eventType: causeSummary.eventType } : {}),
@@ -1140,12 +1655,14 @@ function summarizedFailureMessage(summary: Record<string, ModelProviderErrorDiag
   return parts.length > 0 ? parts.join('; ') : 'provider returned a failed response without error details';
 }
 
-function firstOutputError(items: readonly OpenAIOutputItem[] | undefined): {
-  type?: string;
-  status?: string;
-  message?: string;
-  code?: string;
-} | undefined {
+function firstOutputError(items: readonly OpenAIOutputItem[] | undefined):
+  | {
+      type?: string;
+      status?: string;
+      message?: string;
+      code?: string;
+    }
+  | undefined {
   for (const item of items ?? []) {
     if (item.status === 'failed' || item.type === 'error' || isJsonObject(item.error)) {
       const error = item.error;

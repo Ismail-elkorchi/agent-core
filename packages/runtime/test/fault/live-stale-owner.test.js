@@ -42,7 +42,7 @@ for (const mode of modes) {
       await writeFile(path.join(root, 'release-old'), 'release\n');
       const oldOutcome = await nextMessage(lines);
       assert.equal(oldOutcome.type, 'error');
-      assert.match(oldOutcome.message, /driver|stale|tail|replacement|already terminal/iu);
+      assert.match(oldOutcome.message, /driver|stale|tail|replacement|terminal run|already terminal/iu);
       assert.equal(await exitCode(child), 0, stderr);
 
       const finalResult = mode === 'inside_effect'

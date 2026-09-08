@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { glob, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -10,10 +10,13 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const npmCli = process.env.npm_execpath;
 if (!npmCli) throw new Error('npm_execpath is required to verify packed consumers.');
 const tscCli = path.join(root, 'node_modules', 'typescript', 'bin', 'tsc');
-const packageDirs = [
-  'packages/auth', 'packages/json', 'packages/effects', 'packages/persistence', 'packages/model', 'packages/runtime', 'packages/tools', 'packages/tools-local',
-  'packages/providers/ollama', 'packages/providers/openai-responses', 'packages/providers/openai', 'packages/providers/openai-codex', 'packages/providers/openrouter'
-];
+const workspaceManifest = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
+const packageDirs = [];
+for await (const file of glob(workspaceManifest.workspaces.map((workspace) => `${workspace}/package.json`), { cwd: root })) {
+  const manifest = JSON.parse(await readFile(path.join(root, file), 'utf8'));
+  if (!manifest.private) packageDirs.push(path.dirname(file));
+}
+packageDirs.sort();
 
 function assertCleanArchivePaths(paths) {
   const forbidden = paths.filter((name) => /(^|\/)node_modules(\/|$)|(^|\/)\.agent-core(\/|$)|\.tsbuildinfo$|(^|\/)\.env($|\.)|(^|\/)(credentials?|secrets?)\.(json|ya?ml|txt)$/iu.test(name.replaceAll('\\', '/')));
@@ -38,6 +41,11 @@ try {
     const files = packed.files.map((file) => file.path);
     assertCleanArchivePaths(files);
     if (!files.some((file) => file.startsWith('dist/'))) throw new Error(`${relative} is missing compiled output.`);
+    for (const file of files.filter((name) => name.endsWith('.d.ts'))) {
+      const declaration = await readFile(path.join(directory, file), 'utf8');
+      const retired = /\b(?:ModelMessage|ModelProviderState|SimpleTokenEstimator|TokenEstimator|SessionCompactionEntry|AgentSessionCompactionRequest|appendCompaction|summarizeConversation|executeAssistantToolCalls|nextObservationIndex)\b/u.exec(declaration);
+      if (retired) throw new Error(`${relative}/${file} still exports retired contract ${retired[0]}.`);
+    }
     dependencies[manifest.name] = `file:${path.join(packs, packed.filename)}`;
   }
   await mkdir(consumer, { recursive: true });
@@ -58,18 +66,26 @@ try {
     "import * as tools from '@agent-core/tools';",
     "import * as local from '@agent-core/tools-local';",
     "import * as nodePersistence from '@agent-core/persistence/node';",
-    "if (!runtime.decodeAgentTerminalSnapshot || !runtime.AgentRuntime || !runtime.AgentSession || !runtime.InMemorySessionRepository || !nodeRuntime.JsonlSessionRepository || !model.parseModelResponse || !json.parseJsonObject || !effects.decodeExternalEffectIntent || !persistence.InMemoryEventRepository || !nodePersistence.JsonlEventRepository || !tools.planToolCall || !tools.invokeToolCallPlan || !tools.isCommandExecution || !local.LocalCommandExecution) throw new Error('public runtime exports missing');"
+    "if (!runtime.decodeAgentTerminalSnapshot || !runtime.AgentRuntime || !runtime.AgentSession || !runtime.InMemorySessionRepository || !nodeRuntime.JsonlSessionRepository || !model.parseModelResponse || !json.parseJsonObject || !effects.decodeExternalEffectIntent || !persistence.InMemoryEventRepository || !nodePersistence.JsonlEventRepository || !tools.planToolCall || !tools.invokeToolCallPlan || !tools.isCommandExecution || !local.LocalCommandExecution) throw new Error('public runtime exports missing');",
+    "if (!runtime.HistoryReader || !runtime.ContextService || !runtime.InferenceService || !runtime.InMemoryNoteRepository || !runtime.InMemoryInferenceRepository || !nodeRuntime.JsonlNoteRepository || !nodeRuntime.JsonlInferenceRepository || !runtime.createHistoryTools || !runtime.createNotesTools || !runtime.createContextTools || !model.accountModelRequest || !model.compileModelRequest) throw new Error('persistent context exports missing');"
   ].join('\n'));
   await exec(process.execPath, ['runtime.mjs'], { cwd: consumer });
 
   await writeFile(path.join(consumer, 'consumer.ts'), [
     "import type { JsonObject } from '@agent-core/json';",
-    "import type { ModelProviderState } from '@agent-core/model';",
+    "import type { ModelInputItem, ModelOutputItem, ProviderContextState, CompiledModelRequest, RequestAccounting } from '@agent-core/model';",
     "import type { EffectRecoveryCapability } from '@agent-core/effects';",
-    "import type { AgentModelOutput, AgentRunControl, AgentSessionState, AgentTerminalSnapshot } from '@agent-core/runtime';",
+    "import type { AgentModelOutput, AgentRunControl, AgentSessionState, AgentTerminalSnapshot, ContextWindowRecord, HistorySourceRef, NoteRepository } from '@agent-core/runtime';",
     "import type { ToolEffects, ToolObservation, ToolObservationInput } from '@agent-core/tools';",
     "const json: JsonObject = { nested: { ok: true }, values: [1, 'two'] };",
-    "const providerState: ModelProviderState = { provider: 'test', model: 'test-model', kind: 'response', data: { responseId: 'resp', nested: { count: 1 } } };",
+    "const providerState: ProviderContextState = { version: 1, provider: 'test', model: 'test-model', endpoint: 'https://provider.invalid', kind: 'response', data: { responseId: 'resp' }, origin: { requestId: 'request', inputIdentity: 'input' }, compatibility: { model: 'test-model', endpoint: 'https://provider.invalid', requiresExactPrefix: true }, replay: 'required' };",
+    "const developerInput: ModelInputItem = { role: 'developer', content: 'Application-owned instruction.' };",
+    "declare const outputItem: ModelOutputItem;",
+    "declare const compiled: CompiledModelRequest;",
+    "declare const accounting: RequestAccounting;",
+    "declare const window: ContextWindowRecord;",
+    "declare const source: HistorySourceRef;",
+    "declare const notes: NoteRepository;",
     "const modelOutput: AgentModelOutput = { status: 'complete', message: 'done', source: 'content', turnIndex: 1 };",
     "const recovery: EffectRecoveryCapability = { kind: 'unknown' };",
     "const effects: ToolEffects = { accesses: [{ mode: 'read', scope: 'workspace' }], lockScopes: [], recovery };",
@@ -82,7 +98,7 @@ try {
     "declare const terminal: AgentTerminalSnapshot;",
     "declare const run: AgentRunControl;",
     "declare const sessionState: AgentSessionState;",
-    "void [json, providerState, modelOutput, recovery, effects, rawObservation, ownedObservation, immutableObservation, terminal, run, sessionState];"
+    "void [json, providerState, developerInput, outputItem, compiled, accounting, window, source, notes, modelOutput, recovery, effects, rawObservation, ownedObservation, immutableObservation, terminal, run, sessionState];"
   ].join('\n'));
   for (const exactOptionalPropertyTypes of [true, false]) {
     const config = `tsconfig-${String(exactOptionalPropertyTypes)}.json`;

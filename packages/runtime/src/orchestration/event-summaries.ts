@@ -1,7 +1,7 @@
 import type {
   ModelProfile,
   ModelProviderInfo,
-  ModelProviderState,
+  ProviderContextState,
   ModelRequest,
   ModelResponse
 } from '@agent-core/model';
@@ -36,9 +36,15 @@ export function summarizeRunConfiguration(input: {
       provider: input.model.provider,
       ...(input.model.displayName ? { displayName: input.model.displayName } : {}),
       limits: {
-        ...(input.model.limits.contextTokens === undefined ? {} : { contextTokens: input.model.limits.contextTokens }),
-        ...(input.model.limits.maxInputTokens === undefined ? {} : { maxInputTokens: input.model.limits.maxInputTokens }),
-        ...(input.model.limits.outputTokens === undefined ? {} : { outputTokens: input.model.limits.outputTokens })
+        ...(input.model.limits.contextTokens === undefined
+          ? {}
+          : { contextTokens: input.model.limits.contextTokens }),
+        ...(input.model.limits.maxInputTokens === undefined
+          ? {}
+          : { maxInputTokens: input.model.limits.maxInputTokens }),
+        ...(input.model.limits.outputTokens === undefined
+          ? {}
+          : { outputTokens: input.model.limits.outputTokens })
       },
       modalities: { input: [...input.model.modalities.input], output: [...input.model.modalities.output] },
       capabilities: {
@@ -50,24 +56,39 @@ export function summarizeRunConfiguration(input: {
         logprobs: input.model.capabilities.logprobs,
         temperature: input.model.capabilities.temperature,
         topP: input.model.capabilities.topP,
-        ...(input.model.capabilities.reasoning === undefined ? {} : { reasoning: {
-          strategies: [...input.model.capabilities.reasoning.strategies],
-          canDisable: input.model.capabilities.reasoning.canDisable,
-          ...(input.model.capabilities.reasoning.efforts === undefined ? {} : { efforts: [...input.model.capabilities.reasoning.efforts] }),
-          ...(input.model.capabilities.reasoning.modes === undefined ? {} : { modes: [...input.model.capabilities.reasoning.modes] }),
-          ...(input.model.capabilities.reasoning.summaries === undefined ? {} : { summaries: [...input.model.capabilities.reasoning.summaries] }),
-          separateOutput: input.model.capabilities.reasoning.separateOutput
-        } })
+        ...(input.model.capabilities.reasoning === undefined
+          ? {}
+          : {
+              reasoning: {
+                strategies: [...input.model.capabilities.reasoning.strategies],
+                canDisable: input.model.capabilities.reasoning.canDisable,
+                ...(input.model.capabilities.reasoning.efforts === undefined
+                  ? {}
+                  : { efforts: [...input.model.capabilities.reasoning.efforts] }),
+                ...(input.model.capabilities.reasoning.modes === undefined
+                  ? {}
+                  : { modes: [...input.model.capabilities.reasoning.modes] }),
+                ...(input.model.capabilities.reasoning.summaries === undefined
+                  ? {}
+                  : { summaries: [...input.model.capabilities.reasoning.summaries] }),
+                separateOutput: input.model.capabilities.reasoning.separateOutput
+              }
+            })
       },
       supportedParameters: [...input.model.supportedParameters]
     },
-    tools: input.tools.map((tool) => ({ name: tool.name, accessModes: [...new Set(tool.effectEnvelope.accesses.map((access) => access.mode))].sort() })),
+    tools: input.tools.map((tool) => ({
+      name: tool.name,
+      accessModes: [...new Set(tool.effectEnvelope.accesses.map((access) => access.mode))].sort()
+    })),
     toolPolicy: input.toolPolicy,
     requestWindow: {
       contextWindowTokens: input.requestWindow.contextWindowTokens,
       maxOutputTokens: input.requestWindow.maxOutputTokens,
       maxPromptTokens: input.requestWindow.maxPromptTokens,
-      ...(input.requestedMaxOutputTokens === undefined ? {} : { requestedMaxOutputTokens: input.requestedMaxOutputTokens })
+      ...(input.requestedMaxOutputTokens === undefined
+        ? {}
+        : { requestedMaxOutputTokens: input.requestedMaxOutputTokens })
     },
     runtime: {
       ...(input.temperature === undefined ? {} : { temperature: input.temperature }),
@@ -85,7 +106,7 @@ export function summarizeModelRequest(request: Omit<ModelRequest, 'signal'>): Ag
     messageRoleCounts: countMessageRoles(request.messages),
     messageBytes: jsonBytes(request.messages),
     toolCount: tools.length,
-    toolNames: tools.map((tool) => tool.type === 'function' ? tool.function.name : tool.name),
+    toolNames: tools.map((tool) => (tool.type === 'function' ? tool.function.name : tool.name)),
     toolSchemaBytes: jsonBytes(tools),
     ...(request.maxOutputTokens === undefined ? {} : { maxOutputTokens: request.maxOutputTokens }),
     ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
@@ -114,16 +135,20 @@ export function summarizeModelResponse(
     ...(response.providerTerminationReason === undefined
       ? {}
       : { providerTerminationReason: response.providerTerminationReason }),
-    ...(response.reasoningSummary === undefined ? {} : { reasoningSummaryChars: response.reasoningSummary.length }),
+    ...(response.reasoningSummary === undefined
+      ? {}
+      : { reasoningSummaryChars: response.reasoningSummary.length }),
     ...(response.raw === undefined ? {} : { rawBytes: jsonBytes(response.raw) }),
-    ...(providerState === undefined ? {} : {
-      providerState: providerState.summary,
-      providerStateRef: providerState.artifact
-    })
+    ...(providerState === undefined
+      ? {}
+      : {
+          providerState: providerState.summary,
+          providerStateRef: providerState.artifact
+        })
   };
 }
 
-export function summarizeProviderState(state: ModelProviderState): AgentProviderStateSummary {
+export function summarizeProviderState(state: ProviderContextState): AgentProviderStateSummary {
   return {
     provider: state.provider,
     model: state.model,

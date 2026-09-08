@@ -1,27 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { glob, readFile } from 'node:fs/promises';
 import path from 'node:path';
 
 const minimumNode = '>=24.8.0';
 
 test('package engines and release CI enforce the stable path.matchesGlob Node floor', async () => {
-  const manifests = [
-    'package.json',
-    'packages/auth/package.json',
-    'packages/persistence/package.json',
-    'packages/json/package.json',
-    'packages/model/package.json',
-    'packages/runtime/package.json',
-    'packages/tools/package.json',
-    'packages/tools-local/package.json',
-    'packages/providers/ollama/package.json',
-    'packages/providers/openai/package.json',
-    'packages/providers/openai-codex/package.json',
-    'packages/providers/openai-responses/package.json',
-    'packages/providers/openrouter/package.json'
-  ];
-  for (const manifest of manifests) {
+  const root = JSON.parse(await readFile(path.resolve('package.json'), 'utf8'));
+  const manifests = glob(['package.json', ...root.workspaces.map((workspace) => `${workspace}/package.json`)]);
+  for await (const manifest of manifests) {
     const parsed = JSON.parse(await readFile(path.resolve(manifest), 'utf8'));
     assert.equal(parsed.engines.node, minimumNode, manifest);
   }

@@ -79,8 +79,8 @@ test('abort and unknown provider outcome both clean active run processes before 
     const persisted = await records(state.events, runId);
     assert.equal(persisted.some((event) => event.type === 'process.ended'), true);
     const finalOperation = persisted.filter((event) => event.type === 'run.state.changed').at(-1);
-    assert.equal(finalOperation.state.phase.kind, mode === 'abort' ? 'terminal' : 'provider');
-    if (mode === 'failure') assert.equal(finalOperation.state.phase.stage, 'outcome_unknown');
+    assert.equal(finalOperation.state.phase.kind, mode === 'abort' ? 'terminal' : 'active');
+    if (mode === 'failure') assert.equal(finalOperation.state.providerRequests.at(-1).stage, 'outcome_unknown');
     assert.equal(persisted.some((event) => event.type === 'run.ended'), mode === 'abort');
   }
 });

@@ -16,11 +16,11 @@ const events = mode === 'crash_after_ended' || mode === 'crash_before_started' |
     return storedEvents.append(...args);
   },
   async appendConditional(...args) {
-    const phase = args[1]?.type === 'run.state.changed' ? args[1].state.phase : undefined;
-    if (mode === 'crash_before_started' && phase?.kind === 'tools' && phase.callStates.some((call) => call.stage === 'effect_pending')) process.exit(45);
+    const batches = args[1]?.type === 'run.state.changed' ? args[1].state.toolBatches : [];
+    if (mode === 'crash_before_started' && batches.some(batch => batch.callStates.some(call => call.stage === 'effect_pending'))) process.exit(45);
     const result = await storedEvents.appendConditional(...args);
-    if (mode === 'crash_after_ended' && phase?.kind === 'tools' && phase.callStates.some((call) => call.stage === 'settled')) process.exit(43);
-    if (mode === 'crash_before_recording' && phase?.kind === 'tools' && phase.callStates.some((call) => call.stage === 'recording')) process.exit(47);
+    if (mode === 'crash_after_ended' && batches.some(batch => batch.callStates.some(call => call.stage === 'settled'))) process.exit(43);
+    if (mode === 'crash_before_recording' && batches.some(batch => batch.callStates.some(call => call.stage === 'recording'))) process.exit(47);
     return result;
   },
   tail: (...args) => storedEvents.tail(...args),

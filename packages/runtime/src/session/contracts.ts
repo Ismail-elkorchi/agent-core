@@ -1,6 +1,11 @@
+import type {
+  ContextTransitionCommit,
+  ContextTransitionRecord,
+  ContextWindowRecord
+} from '../context/contracts.js';
 import type { ArtifactRef } from '@agent-core/persistence';
 import type { JsonObject, JsonValue } from '@agent-core/json';
-import type { ModelReasoningRequest, ModelResponseFormat } from '@agent-core/model';
+import type { ModelOutputItem, ModelReasoningRequest, ModelResponseFormat } from '@agent-core/model';
 import type { PromptContextItemInput } from '../inference/prompt-material.js';
 import type { SessionBinding, SessionBindingInput } from './binding.js';
 import type {
@@ -15,6 +20,7 @@ import type { AgentDecisionRequest } from '../run/control/contracts.js';
 export type SessionHeader = Readonly<{
   readonly type: 'session';
   readonly version: 1;
+  readonly format: 'agent-core.session/2';
   readonly id: string;
   readonly timestamp: string;
   readonly binding: SessionBinding;
@@ -33,68 +39,89 @@ export type BaseSessionEntry = Readonly<{
   readonly id: string;
   readonly parentId: string | null;
   readonly timestamp: string;
+  readonly source?: import('../history/contracts.js').HistoryEventSource;
 }>;
 
-export type SessionInputEntry = BaseSessionEntry & Readonly<{
-  readonly type: 'input';
-  readonly runId: string;
-  readonly task: string;
-  readonly instructions: readonly AgentEffectiveInstruction[];
-}>;
+export type SessionInputEntry = BaseSessionEntry &
+  Readonly<{
+    readonly type: 'input';
+    readonly runId: string;
+    readonly task: string;
+    readonly originalInput?: SessionSubmissionInput;
+    readonly instructions: readonly AgentEffectiveInstruction[];
+  }>;
 
-export type SessionSteeringEntry = BaseSessionEntry & Readonly<{
-  readonly type: 'steering';
-  readonly runId: string;
-  readonly content: string;
-}>;
+export type SessionSteeringEntry = BaseSessionEntry &
+  Readonly<{
+    readonly type: 'steering';
+    readonly runId: string;
+    readonly deliveryId?: string;
+    readonly originalInput?: SessionSubmissionInput;
+    readonly content: string;
+    readonly relationship?: SessionInputRelationship;
+  }>;
 
-export type SessionAssistantEntry = BaseSessionEntry & AgentTurnIdentity & Readonly<{
-  readonly type: 'assistant';
-  readonly runId: string;
-  readonly content: string;
-}>;
+export type SessionAssistantEntry = BaseSessionEntry &
+  AgentTurnIdentity &
+  Readonly<{
+    readonly type: 'assistant';
+    readonly runId: string;
+    readonly content: string;
+    readonly output?: readonly ModelOutputItem[];
+    readonly completeness?: 'complete' | 'partial' | 'indeterminate' | 'absent';
+  }>;
 
-export type SessionToolCallEntry = BaseSessionEntry & AgentToolCallIdentity & Readonly<{
-  readonly type: 'tool_call';
-  readonly runId: string;
-  readonly call: JsonValue;
-}>;
+export type SessionToolCallEntry = BaseSessionEntry &
+  AgentToolCallIdentity &
+  Readonly<{
+    readonly type: 'tool_call';
+    readonly runId: string;
+    readonly call: JsonValue;
+  }>;
 
-export type SessionObservationEntry = BaseSessionEntry & AgentTurnIdentity & Readonly<{
-  readonly type: 'observation';
-  readonly runId: string;
-  readonly toolBatchId?: string;
-  readonly callIndex?: number;
-  readonly callId?: string;
-  readonly toolAttempt?: number;
-  readonly toolName: string;
-  readonly ok: boolean;
-  readonly summary: string;
-  readonly output?: JsonValue;
-  readonly artifacts?: readonly ArtifactRef[];
-  readonly metadata?: JsonObject;
-}>;
+export type SessionObservationEntry = BaseSessionEntry &
+  AgentTurnIdentity &
+  Readonly<{
+    readonly type: 'observation';
+    readonly runId: string;
+    readonly toolBatchId?: string;
+    readonly callIndex?: number;
+    readonly callId?: string;
+    readonly toolAttempt?: number;
+    readonly toolName: string;
+    readonly ok: boolean;
+    readonly summary: string;
+    readonly output?: JsonValue;
+    readonly artifacts?: readonly ArtifactRef[];
+    readonly metadata?: JsonObject;
+  }>;
 
-export type SessionBranchMarkerEntry = BaseSessionEntry & Readonly<{
-  readonly type: 'branch';
-  readonly fromEntryId: string;
-  readonly label?: string;
-}>;
+export type SessionBranchMarkerEntry = BaseSessionEntry &
+  Readonly<{
+    readonly type: 'branch';
+    readonly fromEntryId: string;
+    readonly noteSource?: {
+      readonly scope: import('../notes/contracts.js').NoteScope;
+      readonly watermark: number;
+    };
+    readonly label?: string;
+  }>;
 
-export type SessionModelSettingsEntry = BaseSessionEntry & Readonly<{
-  readonly type: 'model_settings';
-  readonly provider: string;
-  readonly model: string;
-  readonly temperature?: number;
-  readonly reasoningEffort?: string;
-}>;
+export type SessionModelSettingsEntry = BaseSessionEntry &
+  Readonly<{
+    readonly type: 'model_settings';
+    readonly provider: string;
+    readonly model: string;
+    readonly temperature?: number;
+    readonly reasoningEffort?: string;
+  }>;
 
-export type SessionCompactionEntry = BaseSessionEntry & Readonly<{
-  readonly type: 'compaction';
-  readonly summary: string;
-  readonly provider: string;
-  readonly model: string;
-}>;
+export type SessionContextTransitionEntry = BaseSessionEntry &
+  Readonly<{
+    readonly type: 'context_transition';
+    readonly window: ContextWindowRecord;
+    readonly transition: ContextTransitionRecord;
+  }>;
 
 export type SessionRunFinalization = Readonly<{
   readonly type: 'run_finalization';
@@ -114,25 +141,30 @@ export type SessionBranchEntry =
   | SessionObservationEntry
   | SessionBranchMarkerEntry
   | SessionModelSettingsEntry
-  | SessionCompactionEntry;
+  | SessionContextTransitionEntry;
 
 export type SessionConversationItem =
   | SessionInputEntry
   | SessionSteeringEntry
   | SessionAssistantEntry
   | SessionToolCallEntry
-  | SessionObservationEntry
-  | SessionCompactionEntry;
+  | SessionObservationEntry;
 
 export interface SessionBranchPoint {
   readonly entryId: string;
   readonly timestamp: string;
-  readonly kind: 'run_finalization' | 'compaction';
+  readonly kind: 'run_finalization' | 'context_transition';
   readonly runId?: string;
   readonly finalizationId?: string;
 }
 
+export interface SessionInputRelationship {
+  readonly kind: 'continue' | 'correct' | 'side_question' | 'replace';
+  readonly relatedSources?: readonly import('../history/contracts.js').HistorySourceRef[] | undefined;
+}
+
 export interface SessionSubmissionInput {
+  readonly relationship?: SessionInputRelationship;
   readonly task: string;
   readonly instructions?: readonly string[];
   readonly contextItems?: readonly PromptContextItemInput[];
@@ -163,7 +195,13 @@ export interface SessionSuspensionDescriptor {
   readonly runId: string;
   readonly submissionId: string;
   readonly category: SessionSuspensionCategory;
-  readonly reason: 'approval_required' | 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'disposition_outcome_unknown' | 'missing_implementation' | 'user_decision';
+  readonly reason:
+    | 'approval_required'
+    | 'provider_outcome_unknown'
+    | 'tool_outcome_unknown'
+    | 'disposition_outcome_unknown'
+    | 'missing_implementation'
+    | 'user_decision';
   readonly effectId?: string;
   readonly actions: readonly SessionSuspensionAction[];
   readonly decisionRequest?: AgentDecisionRequest;
@@ -176,9 +214,12 @@ type SessionSubmissionTransitionBase = Readonly<{
 }>;
 
 export type SessionSubmissionTransition =
-  | (SessionSubmissionTransitionBase & Readonly<{ readonly type: 'submission.claimed' | 'submission.completed' }>)
-  | (SessionSubmissionTransitionBase & Readonly<{ readonly type: 'submission.suspended'; readonly suspension: SessionSuspensionDescriptor }>)
-  | (SessionSubmissionTransitionBase & Readonly<{ readonly type: 'submission.failed'; readonly errorMessage: string }>);
+  | (SessionSubmissionTransitionBase &
+      Readonly<{ readonly type: 'submission.claimed' | 'submission.completed' }>)
+  | (SessionSubmissionTransitionBase &
+      Readonly<{ readonly type: 'submission.suspended'; readonly suspension: SessionSuspensionDescriptor }>)
+  | (SessionSubmissionTransitionBase &
+      Readonly<{ readonly type: 'submission.failed'; readonly errorMessage: string }>);
 
 export type SessionSubmissionRecord = SessionQueuedSubmission | SessionSubmissionTransition;
 
@@ -222,7 +263,8 @@ export interface SessionReplayState {
   readonly session: SessionDescriptor;
   readonly branch: readonly SessionBranchEntry[];
   readonly runFinalizations: readonly SessionRunFinalization[];
-  readonly compaction?: SessionCompactionEntry;
+  readonly contextWindow?: ContextWindowRecord;
+  readonly sourceRevision: number;
   readonly ledgerRunIds: readonly string[];
 }
 
@@ -233,19 +275,79 @@ export interface SessionRepository {
   loadReplayState(session: SessionDescriptor, leafId?: string | null): Promise<SessionReplayState>;
   readConversation(session: SessionDescriptor): Promise<readonly SessionConversationItem[]>;
   listBranchPoints(session: SessionDescriptor): Promise<readonly SessionBranchPoint[]>;
-  appendInput(session: SessionDescriptor, input: { runId: string; task: string; instructions?: readonly AgentEffectiveInstruction[] }): Promise<SessionInputEntry>;
-  appendSteering(session: SessionDescriptor, input: { runId: string; content: string }): Promise<SessionSteeringEntry>;
-  appendAssistant(session: SessionDescriptor, input: { runId: string; identity: AgentTurnIdentity; content: string }): Promise<SessionAssistantEntry>;
-  appendToolCall(session: SessionDescriptor, input: { runId: string; identity: AgentToolCallIdentity; call: unknown }): Promise<SessionToolCallEntry>;
-  appendObservation(session: SessionDescriptor, input: { runId: string; identity: AgentTurnIdentity & Partial<Pick<AgentToolCallAttemptIdentity, 'toolBatchId' | 'callIndex' | 'callId' | 'toolAttempt'>>; toolName: string; observation: SessionObservationInput }): Promise<SessionObservationEntry>;
-  appendModelSettings(session: SessionDescriptor, settings: { provider: string; model: string; temperature?: number; reasoningEffort?: string }): Promise<SessionModelSettingsEntry>;
-  appendCompaction(session: SessionDescriptor, input: { summary: string; provider: string; model: string }): Promise<SessionCompactionEntry>;
-  branchFrom(session: SessionDescriptor, entryId: string, label?: string): Promise<SessionBranchMarkerEntry>;
-  recordRunFinalization(session: SessionDescriptor, terminal: AgentTerminalSnapshot): Promise<SessionRunFinalization>;
-  enqueueSubmission(session: SessionDescriptor, input: { submissionId: string; runId: string; input: SessionSubmissionInput; configuration: SessionSubmissionConfiguration }): Promise<void>;
-  transitionSubmission(session: SessionDescriptor, submissionId: string, outcome:
-    | { readonly state: 'claimed' | 'completed' }
-    | { readonly state: 'suspended'; readonly suspension: SessionSuspensionDescriptor }
-    | { readonly state: 'failed'; readonly errorMessage: string }): Promise<void>;
+  appendInput(
+    session: SessionDescriptor,
+    input: { runId: string; task: string; instructions?: readonly AgentEffectiveInstruction[] }
+  ): Promise<SessionInputEntry>;
+  appendSteering(
+    session: SessionDescriptor,
+    input: {
+      runId: string;
+      content: string;
+      deliveryId?: string;
+      relationship?: SessionInputRelationship;
+      originalInput?: SessionSubmissionInput;
+    }
+  ): Promise<SessionSteeringEntry>;
+  appendAssistant(
+    session: SessionDescriptor,
+    input: {
+      runId: string;
+      identity: AgentTurnIdentity;
+      content: string;
+      output?: readonly ModelOutputItem[];
+      completeness?: SessionAssistantEntry['completeness'];
+      source?: import('../history/contracts.js').HistoryEventSource;
+    }
+  ): Promise<SessionAssistantEntry>;
+  appendToolCall(
+    session: SessionDescriptor,
+    input: { runId: string; identity: AgentToolCallIdentity; call: unknown }
+  ): Promise<SessionToolCallEntry>;
+  appendObservation(
+    session: SessionDescriptor,
+    input: {
+      runId: string;
+      identity: AgentTurnIdentity &
+        Partial<Pick<AgentToolCallAttemptIdentity, 'toolBatchId' | 'callIndex' | 'callId' | 'toolAttempt'>>;
+      toolName: string;
+      observation: SessionObservationInput;
+    }
+  ): Promise<SessionObservationEntry>;
+  appendModelSettings(
+    session: SessionDescriptor,
+    settings: { provider: string; model: string; temperature?: number; reasoningEffort?: string }
+  ): Promise<SessionModelSettingsEntry>;
+  commitContextTransition(
+    session: SessionDescriptor,
+    input: ContextTransitionCommit
+  ): Promise<SessionContextTransitionEntry>;
+  branchFrom(
+    session: SessionDescriptor,
+    entryId: string,
+    label?: string,
+    noteSource?: SessionBranchMarkerEntry['noteSource']
+  ): Promise<SessionBranchMarkerEntry>;
+  recordRunFinalization(
+    session: SessionDescriptor,
+    terminal: AgentTerminalSnapshot
+  ): Promise<SessionRunFinalization>;
+  enqueueSubmission(
+    session: SessionDescriptor,
+    input: {
+      submissionId: string;
+      runId: string;
+      input: SessionSubmissionInput;
+      configuration: SessionSubmissionConfiguration;
+    }
+  ): Promise<void>;
+  transitionSubmission(
+    session: SessionDescriptor,
+    submissionId: string,
+    outcome:
+      | { readonly state: 'claimed' | 'completed' }
+      | { readonly state: 'suspended'; readonly suspension: SessionSuspensionDescriptor }
+      | { readonly state: 'failed'; readonly errorMessage: string }
+  ): Promise<void>;
   loadPendingSubmissions(session: SessionDescriptor): Promise<readonly SessionPendingSubmission[]>;
 }

@@ -1,3 +1,12 @@
+import { modelTransportSignal, type ModelTransportOptions } from '@agent-core/model';
+import { responsesPayloadPaths } from '@agent-core/provider-openai-responses';
+import {
+  compileModelRequest,
+  conservativeProtocolCapabilities,
+  assertProviderContextCompatible,
+  parseModelProfile,
+  type CompiledModelRequest
+} from '@agent-core/model';
 import {
   type BearerToken,
   type BearerTokenProvider,
@@ -19,11 +28,7 @@ import {
   parseModelRequest
 } from '@agent-core/model';
 
-import {
-  OPENAI_CODEX_BASE_URL,
-  OPENAI_CODEX_DEFAULT_MODEL,
-  OPENAI_CODEX_PROVIDER_ID
-} from './constants.js';
+import { OPENAI_CODEX_BASE_URL, OPENAI_CODEX_DEFAULT_MODEL, OPENAI_CODEX_PROVIDER_ID } from './constants.js';
 import {
   type CodexContinuationResponse,
   normalizedOutputItems,
@@ -54,10 +59,7 @@ import {
   requestHeaders,
   streamCodexHttp
 } from './http-transport.js';
-import {
-  type OpenAICodexModelProfileDefinition,
-  describeOpenAICodexModel
-} from './model-profile.js';
+import { type OpenAICodexModelProfileDefinition, describeOpenAICodexModel } from './model-profile.js';
 import {
   type OpenAICodexDeviceCodeInfo,
   type OpenAICodexDeviceCodeLoginOptions,
@@ -66,7 +68,7 @@ import {
   accountIdFromToken,
   resolveTokenProvider
 } from './oauth.js';
-import { toCodexResponsesRequest } from './request.js';
+import { toCodexResponsesRequest, cacheCodexCompiledRequest, codexCompiledRequest } from './request.js';
 import {
   type CodexWebSocket,
   type CodexWebSocketFactory,
@@ -82,10 +84,7 @@ import {
 } from './websocket-transport.js';
 import { errorMessage, stringValue, throwIfAborted } from './utils.js';
 
-export {
-  OpenAICodexTokenRefresher,
-  loginOpenAICodexDeviceCode
-};
+export { OpenAICodexTokenRefresher, loginOpenAICodexDeviceCode };
 export type {
   CodexWebSocket,
   CodexWebSocketFactory,
@@ -98,6 +97,7 @@ export type {
 export type OpenAICodexTransport = 'http_sse' | 'websocket';
 
 export interface OpenAICodexProviderOptions {
+  outputReservation?: number;
   auth?: ProviderAuth | BearerTokenProvider;
   credentialStore?: CredentialStore;
   credentialKey?: string;
@@ -115,6 +115,8 @@ export interface OpenAICodexProviderOptions {
 export class OpenAICodexProvider implements ModelProvider {
   readonly id = OPENAI_CODEX_PROVIDER_ID;
   readonly implementationId = 'agent-core.provider.openai-codex@1';
+  private readonly admittedRequests = new WeakSet<CompiledModelRequest>();
+  private readonly outputReservation: number | undefined;
   private readonly tokenProvider: BearerTokenProvider;
   private readonly baseUrl: string;
   private readonly defaultModel: string;
@@ -127,6 +129,12 @@ export class OpenAICodexProvider implements ModelProvider {
   private readonly modelProfiles: Record<string, OpenAICodexModelProfileDefinition>;
 
   constructor(options: OpenAICodexProviderOptions = {}) {
+    this.outputReservation = options.outputReservation;
+    if (
+      this.outputReservation !== undefined &&
+      (!Number.isSafeInteger(this.outputReservation) || this.outputReservation < 1)
+    )
+      throw new RangeError('outputReservation must be positive.');
     this.baseUrl = resolveCodexUrl(options.baseUrl ?? OPENAI_CODEX_BASE_URL);
     this.defaultModel = options.model ?? OPENAI_CODEX_DEFAULT_MODEL;
     this.fetchImpl = options.fetch ?? fetch;
@@ -152,36 +160,137 @@ export class OpenAICodexProvider implements ModelProvider {
   }
 
   describeModel(model: string) {
-    return Promise.resolve(describeOpenAICodexModel(model || this.defaultModel, this.modelProfiles));
+    const profile = describeOpenAICodexModel(model || this.defaultModel, this.modelProfiles);
+    return Promise.resolve(
+      parseModelProfile({
+        ...profile,
+        capabilities: {
+          ...profile.capabilities,
+          protocol: conservativeProtocolCapabilities(this.baseUrl, {
+            reasoningAccounting: 'included_output',
+            revision: 'codex-responses-2026-09-07-v1',
+            roles: ['system', 'developer', 'user', 'assistant'],
+            inputKinds: ['text', 'image', 'tool_call', 'tool_result', 'protocol'],
+            outputKinds: ['text', 'tool_call', 'protocol', 'refusal'],
+            state: 'exact',
+            continuation: 'exact_prefix'
+          })
+        }
+      })
+    );
   }
 
-  async complete(request: ModelRequest): Promise<ModelResponse> {
-    return this.createSession().complete(request);
+  async compileRequest(request: ModelRequest): Promise<CompiledModelRequest> {
+    request = await this.validateRequest(request);
+    const cached = codexCompiledRequest(request);
+    if (cached && this.admittedRequests.has(cached)) return cached;
+    // Shared framing caches cannot establish another provider instance's capability admission.
+    if (cached) request = parseModelRequest({ ...request });
+    const body = toCodexResponsesRequest(request, false);
+    delete body.stream;
+    const compiled = await compileModelRequest({
+      request,
+      profile: await this.describeModel(request.model),
+      body,
+      payloadPaths: responsesPayloadPaths(body),
+      ...(this.outputReservation === undefined ? {} : { outputReservation: this.outputReservation }),
+      endpoint: this.baseUrl
+    });
+    cacheCodexCompiledRequest(compiled);
+    this.admittedRequests.add(compiled);
+    return compiled;
+  }
+  assertCompiled(compiled: CompiledModelRequest): void {
+    if (
+      !this.admittedRequests.has(compiled) ||
+      compiled.endpoint !== this.baseUrl ||
+      codexCompiledRequest(compiled.logicalRequest) !== compiled
+    )
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'invalid_request',
+        message: 'Compiled request was not admitted by this provider instance.'
+      });
+  }
+  completeCompiled(compiled: CompiledModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
+    this.assertCompiled(compiled);
+    return this.complete(compiled.logicalRequest, options);
+  }
+  async *streamCompiled(
+    compiled: CompiledModelRequest,
+    options?: ModelTransportOptions
+  ): AsyncIterable<ModelStreamEvent> {
+    this.assertCompiled(compiled);
+    yield* this.stream(compiled.logicalRequest, options);
   }
 
-  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+  async complete(request: ModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
     const session = this.createSession();
-    if (!session.stream) {
-      throw new ModelProviderError({ provider: this.id, code: 'invalid_request', message: 'OpenAI Codex provider session does not support streaming.' });
+    if (!session.completeCompiled)
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'invalid_request',
+        message: 'Session has no compiled completion transport.'
+      });
+    return session.completeCompiled(await this.compileRequest(request), options);
+  }
+
+  async *stream(request: ModelRequest, options?: ModelTransportOptions): AsyncIterable<ModelStreamEvent> {
+    const session = this.createSession();
+    if (!session.streamCompiled) {
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'invalid_request',
+        message: 'OpenAI Codex provider session does not support streaming.'
+      });
     }
-    yield* session.stream(request);
+    yield* session.streamCompiled(await this.compileRequest(request), options);
   }
 
-  async fetchResponse(request: ModelRequest, stream: boolean): Promise<Response> {
-    return fetchCodexResponse(this.httpTransportConfig(), request, stream);
+  async fetchResponse(
+    request: ModelRequest,
+    stream: boolean,
+    options?: ModelTransportOptions
+  ): Promise<Response> {
+    const compiled = await this.compileRequest(request);
+    return fetchCodexResponse(
+      this.httpTransportConfig(),
+      compiled.logicalRequest,
+      stream,
+      modelTransportSignal(compiled.logicalRequest, options)
+    );
   }
 
-  async *streamHttp(request: ModelRequest, onResponsePayload?: (payload: OpenAICodexResponsesPayload) => void): AsyncIterable<ModelStreamEvent> {
-    yield* streamCodexHttp({ ...this.httpTransportConfig(), ...(onResponsePayload ? { onResponsePayload } : {}) }, request);
+  async *streamHttp(
+    request: ModelRequest,
+    onResponsePayload?: (payload: OpenAICodexResponsesPayload) => void,
+    options?: ModelTransportOptions
+  ): AsyncIterable<ModelStreamEvent> {
+    const compiled = await this.compileRequest(request);
+    yield* streamCodexHttp(
+      { ...this.httpTransportConfig(), ...(onResponsePayload ? { onResponsePayload } : {}) },
+      compiled.logicalRequest,
+      modelTransportSignal(compiled.logicalRequest, options)
+    );
   }
 
   async validateRequest(request: ModelRequest): Promise<ModelRequest> {
     try {
       const owned = parseModelRequest(request);
       assertModelRequestSupported(await this.describeModel(owned.model), owned);
+      for (const [index, item] of owned.messages.entries())
+        if (item.role === 'protocol')
+          await assertProviderContextCompatible(
+            item.state,
+            owned,
+            this.baseUrl,
+            owned.messages.slice(0, index),
+            this.id
+          );
       return owned;
+    } catch (error) {
+      throw normalizeError(this.id, error);
     }
-    catch (error) { throw normalizeError(this.id, error); }
   }
 
   async tokenForRequest(signal: AbortSignal | undefined): Promise<BearerToken> {
@@ -236,14 +345,27 @@ class OpenAICodexProviderSession implements ModelProviderSession {
   private lastResponse: CodexContinuationResponse | undefined;
 
   constructor(private readonly provider: OpenAICodexProvider) {}
+  completeCompiled(compiled: CompiledModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
+    this.provider.assertCompiled(compiled);
+    return this.complete(compiled.logicalRequest, options);
+  }
+  async *streamCompiled(
+    compiled: CompiledModelRequest,
+    options?: ModelTransportOptions
+  ): AsyncIterable<ModelStreamEvent> {
+    this.provider.assertCompiled(compiled);
+    yield* this.stream(compiled.logicalRequest, options);
+  }
 
-
-  async complete(request: ModelRequest): Promise<ModelResponse> {
+  async complete(request: ModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
     try {
-      request = await this.provider.validateRequest(request);
-      const response = await this.provider.fetchResponse(request, false);
+      request = (await this.provider.compileRequest(request)).logicalRequest;
+      const response = await this.provider.fetchResponse(request, false, options);
       const payload = await parseCodexJsonResponse(this.provider.id, response);
-      const modelResponse = toModelResponse(this.provider.id, request, payload, { strategy: 'http_full_replay' });
+      const modelResponse = await toModelResponse(this.provider.id, request, payload, {
+        strategy: 'http_full_replay',
+        endpoint: this.provider.httpUrl()
+      });
       this.rememberFullHttpRequest(request, false, payload);
       return modelResponse;
     } catch (error) {
@@ -252,16 +374,16 @@ class OpenAICodexProviderSession implements ModelProviderSession {
     }
   }
 
-  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
-    request = await this.provider.validateRequest(request);
+  async *stream(request: ModelRequest, options?: ModelTransportOptions): AsyncIterable<ModelStreamEvent> {
+    request = (await this.provider.compileRequest(request)).logicalRequest;
     if (!this.provider.shouldUseWebSocket()) {
-      yield* this.streamHttp(request);
+      yield* this.streamHttp(request, options);
       return;
     }
 
     let emittedModelEvent = false;
     try {
-      for await (const event of this.streamWebSocket(request)) {
+      for await (const event of this.streamWebSocket(request, options)) {
         if (event.type === 'content' || event.type === 'reasoning' || event.type === 'tool_call') {
           emittedModelEvent = true;
         }
@@ -269,7 +391,11 @@ class OpenAICodexProviderSession implements ModelProviderSession {
       }
     } catch (error) {
       this.resetContinuation('websocket_error');
-      const webSocketError = websocketFailureError(this.provider.id, error, emittedModelEvent ? 'after_model_event' : 'before_model_event');
+      const webSocketError = websocketFailureError(
+        this.provider.id,
+        error,
+        emittedModelEvent ? 'after_model_event' : 'before_model_event'
+      );
       if (emittedModelEvent || isWebSocketProviderResponseFailure(webSocketError)) {
         throw webSocketError;
       }
@@ -280,7 +406,7 @@ class OpenAICodexProviderSession implements ModelProviderSession {
           message: `OpenAI Codex WebSocket unavailable; transport=websocket; phase=before_model_event; falling back to transport=http_sse: ${errorMessage(error)}`
         };
       }
-      yield* this.streamHttp(request);
+      yield* this.streamHttp(request, options);
     }
   }
 
@@ -296,9 +422,18 @@ class OpenAICodexProviderSession implements ModelProviderSession {
     return Promise.resolve();
   }
 
-  private async *streamHttp(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+  private async *streamHttp(
+    request: ModelRequest,
+    options?: ModelTransportOptions
+  ): AsyncIterable<ModelStreamEvent> {
     let payload: OpenAICodexResponsesPayload | undefined;
-    for await (const event of this.provider.streamHttp(request, (value) => { payload = value; })) {
+    for await (const event of this.provider.streamHttp(
+      request,
+      (value) => {
+        payload = value;
+      },
+      options
+    )) {
       if (event.type === 'done') {
         this.rememberFullHttpRequest(request, true, payload);
         yield event;
@@ -308,19 +443,24 @@ class OpenAICodexProviderSession implements ModelProviderSession {
     }
   }
 
-  private async *streamWebSocket(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
-    throwIfAborted(request.signal);
-    const token = await this.provider.tokenForRequest(request.signal);
+  private async *streamWebSocket(
+    request: ModelRequest,
+    options?: ModelTransportOptions
+  ): AsyncIterable<ModelStreamEvent> {
+    const signal = modelTransportSignal(request, options);
+    throwIfAborted(signal);
+    const token = await this.provider.tokenForRequest(signal);
     const accountId = this.provider.codexAccountId(token);
-    const socket = await this.ensureWebSocket(token.token, accountId, request.signal);
+    const socket = await this.ensureWebSocket(token.token, accountId, signal);
+    await this.provider.compileRequest(request);
     const fullRequest = toCodexResponsesRequest(request, true);
     const assembly = assembleCodexWebSocketRequest(fullRequest, this.lastRequest, this.lastResponse);
     const wireRequest = {
       type: 'response.create',
       ...assembly.request
     };
-    const streamEvents = readCodexWebSocketEvents(socket, request.signal);
-    await sendWebSocketJson(socket, wireRequest, request.signal);
+    const streamEvents = readCodexWebSocketEvents(socket, signal);
+    await sendWebSocketJson(socket, wireRequest, signal);
 
     let content = '';
     let reasoning = '';
@@ -363,7 +503,12 @@ class OpenAICodexProviderSession implements ModelProviderSession {
       const contentDelta = stringValue(part.delta);
       if (eventType === 'response.output_text.delta' && contentDelta.length > 0) {
         content += contentDelta;
-        yield { type: 'content', content: contentDelta, accumulated: content, raw: normalizeJsonSafe(part).value };
+        yield {
+          type: 'content',
+          content: contentDelta,
+          accumulated: content,
+          raw: normalizeJsonSafe(part).value
+        };
         continue;
       }
 
@@ -371,10 +516,22 @@ class OpenAICodexProviderSession implements ModelProviderSession {
       if (reasoningChannel && contentDelta.length > 0) {
         if (reasoningChannel === 'summary') {
           reasoningSummary += contentDelta;
-          yield { type: 'reasoning', reasoning: contentDelta, accumulatedReasoning: reasoningSummary, channel: 'summary', raw: normalizeJsonSafe(part).value };
+          yield {
+            type: 'reasoning',
+            reasoning: contentDelta,
+            accumulatedReasoning: reasoningSummary,
+            channel: 'summary',
+            raw: normalizeJsonSafe(part).value
+          };
         } else {
           reasoning += contentDelta;
-          yield { type: 'reasoning', reasoning: contentDelta, accumulatedReasoning: reasoning, channel: 'reasoning', raw: normalizeJsonSafe(part).value };
+          yield {
+            type: 'reasoning',
+            reasoning: contentDelta,
+            accumulatedReasoning: reasoning,
+            channel: 'reasoning',
+            raw: normalizeJsonSafe(part).value
+          };
         }
         continue;
       }
@@ -408,14 +565,15 @@ class OpenAICodexProviderSession implements ModelProviderSession {
     }
 
     const responsePayload = completedResponse
-      ? toModelResponse(this.provider.id, request, completedResponse, {
-        strategy: assembly.reusedContinuation ? 'websocket_delta' : 'websocket_full_replay',
-        reusedContinuation: assembly.reusedContinuation
-      })
+      ? await toModelResponse(this.provider.id, request, completedResponse, {
+          endpoint: this.provider.httpUrl(),
+          strategy: assembly.reusedContinuation ? 'websocket_delta' : 'websocket_full_replay',
+          reusedContinuation: assembly.reusedContinuation
+        })
       : fallbackStreamResponse(this.provider.id, request, content, reasoning, reasoningSummary, toolCalls, {
-        strategy: assembly.reusedContinuation ? 'websocket_delta' : 'websocket_full_replay',
-        reusedContinuation: assembly.reusedContinuation
-      });
+          strategy: assembly.reusedContinuation ? 'websocket_delta' : 'websocket_full_replay',
+          reusedContinuation: assembly.reusedContinuation
+        });
     const responseToolCalls = dedupeToolCalls([...(responsePayload.toolCalls ?? []), ...toolCalls]);
     const recoveredResponse = parseCodexModelResponse({
       ...responsePayload,
@@ -432,7 +590,11 @@ class OpenAICodexProviderSession implements ModelProviderSession {
     };
   }
 
-  private async ensureWebSocket(token: string, accountId: string, signal: AbortSignal | undefined): Promise<CodexWebSocket> {
+  private async ensureWebSocket(
+    token: string,
+    accountId: string,
+    signal: AbortSignal | undefined
+  ): Promise<CodexWebSocket> {
     if (this.webSocket?.readyState === 1) {
       return this.webSocket;
     }
@@ -452,14 +614,21 @@ class OpenAICodexProviderSession implements ModelProviderSession {
     return socket;
   }
 
-  private rememberFullHttpRequest(request: ModelRequest, stream: boolean, payload: OpenAICodexResponsesPayload | undefined): void {
+  private rememberFullHttpRequest(
+    request: ModelRequest,
+    stream: boolean,
+    payload: OpenAICodexResponsesPayload | undefined
+  ): void {
     if (!payload) {
       return;
     }
     this.rememberContinuationBase(toCodexResponsesRequest(request, stream), payload);
   }
 
-  private rememberContinuationBase(fullRequest: Record<string, unknown>, payload: OpenAICodexResponsesPayload | undefined): void {
+  private rememberContinuationBase(
+    fullRequest: Record<string, unknown>,
+    payload: OpenAICodexResponsesPayload | undefined
+  ): void {
     if (!payload?.id) {
       return;
     }
@@ -469,13 +638,14 @@ class OpenAICodexProviderSession implements ModelProviderSession {
       outputItems: normalizedOutputItems(this.provider.id, payload)
     };
   }
-
 }
 
 function isWebSocketProviderResponseFailure(error: unknown): boolean {
-  return error instanceof ModelProviderError
-    && error.diagnostic.transport === 'websocket'
-    && typeof error.diagnostic.eventType === 'string';
+  return (
+    error instanceof ModelProviderError &&
+    error.diagnostic.transport === 'websocket' &&
+    typeof error.diagnostic.eventType === 'string'
+  );
 }
 
 function websocketFailureError(

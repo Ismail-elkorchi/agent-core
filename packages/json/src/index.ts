@@ -1,6 +1,8 @@
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | readonly JsonValue[] | JsonObject;
-export interface JsonObject { readonly [key: string]: JsonValue }
+export interface JsonObject {
+  readonly [key: string]: JsonValue;
+}
 
 export type JsonNormalizationDiagnosticCode =
   | 'access_error'
@@ -39,7 +41,10 @@ interface JsonNormalizationResultBase {
 
 export type JsonNormalizationResult =
   | (JsonNormalizationResultBase & { readonly status: 'clean'; readonly diagnostics: readonly [] })
-  | (JsonNormalizationResultBase & { readonly status: 'normalized_with_diagnostics'; readonly diagnostics: readonly [JsonNormalizationDiagnostic, ...JsonNormalizationDiagnostic[]] });
+  | (JsonNormalizationResultBase & {
+      readonly status: 'normalized_with_diagnostics';
+      readonly diagnostics: readonly [JsonNormalizationDiagnostic, ...JsonNormalizationDiagnostic[]];
+    });
 
 export const DEFAULT_JSON_NORMALIZATION_LIMITS: JsonNormalizationLimits = Object.freeze({
   maxDepth: 8,
@@ -61,19 +66,55 @@ export const DEFAULT_SAFE_JSON_PARSE_LIMITS: SafeJsonParseLimits = Object.freeze
   maxTotalBytes: 4 * 1024 * 1024
 });
 
+interface JsonShape {
+  readonly entries: number;
+  readonly stringBytes: number;
+  readonly maxStringBytes: number;
+  readonly depth: number;
+  readonly totalBytes: number;
+}
+
+interface JsonParseState {
+  entries: number;
+  stringBytes: number;
+  maxStringBytes: number;
+  depth: number;
+}
+
+const ownedSnapshots = new WeakMap<object, JsonShape | undefined>();
+
+/** Identifies immutable snapshots issued by this module, never merely frozen input. */
+export function isOwnedJsonValue(value: unknown): value is JsonObject | readonly JsonValue[] {
+  return value !== null && typeof value === 'object' && ownedSnapshots.has(value);
+}
+
 /** Strict JSON ownership boundary. It never invokes accessors and returns a frozen owned snapshot. */
 export function parseJsonValue(input: unknown, requested: Partial<SafeJsonParseLimits> = {}): JsonValue {
   const limits = validateLimits({ ...DEFAULT_SAFE_JSON_PARSE_LIMITS, ...requested });
-  const state = { entries: 0, stringBytes: 0 };
+  if (isOwnedJsonValue(input)) {
+    const proof = ownedSnapshots.get(input);
+    if (
+      proof &&
+      proof.depth <= limits.maxDepth &&
+      proof.entries <= limits.maxCollectionEntries &&
+      proof.maxStringBytes <= limits.maxStringBytes &&
+      proof.totalBytes <= limits.maxTotalBytes
+    )
+      return input;
+  }
+  const state: JsonParseState = { entries: 0, stringBytes: 0, maxStringBytes: 0, depth: 0 };
   const value = copyJson(input, '$', 0, limits, state, new WeakSet());
   const totalBytes = utf8Bytes(JSON.stringify(value));
-  if (totalBytes > limits.maxTotalBytes) throw new Error('JSON value exceeds the total byte limit of ' + String(limits.maxTotalBytes) + '.');
+  if (totalBytes > limits.maxTotalBytes)
+    throw new Error('JSON value exceeds the total byte limit of ' + String(limits.maxTotalBytes) + '.');
+  if (value !== null && typeof value === 'object') ownedSnapshots.set(value, { ...state, totalBytes });
   return value;
 }
 
 export function parseJsonObject(input: unknown, requested: Partial<SafeJsonParseLimits> = {}): JsonObject {
   const value = parseJsonValue(input, requested);
-  if (value === null || Array.isArray(value) || typeof value !== 'object') throw new Error('JSON value must be an object.');
+  if (value === null || Array.isArray(value) || typeof value !== 'object')
+    throw new Error('JSON value must be an object.');
   return value as JsonObject;
 }
 
@@ -100,15 +141,31 @@ export function normalizeJsonSafe(
     });
     text = JSON.stringify(output);
   }
-  const truncated = diagnostics.some((diagnostic) => diagnostic.code.includes('truncated') || diagnostic.code === 'circular');
+  const truncated = diagnostics.some(
+    (diagnostic) => diagnostic.code.includes('truncated') || diagnostic.code === 'circular'
+  );
+  output = ownJsonSnapshot(output);
   if (diagnostics.length === 0) {
     const emptyDiagnostics: readonly [] = Object.freeze([]);
-    return Object.freeze({ status: 'clean', value: output, bytes: utf8Bytes(text), truncated, diagnostics: emptyDiagnostics });
+    return Object.freeze({
+      status: 'clean',
+      value: output,
+      bytes: utf8Bytes(text),
+      truncated,
+      diagnostics: emptyDiagnostics
+    });
   }
   const [first, ...rest] = diagnostics;
   if (!first) throw new Error('JSON normalization diagnostic invariant violated.');
-  const nonemptyDiagnostics: readonly [JsonNormalizationDiagnostic, ...JsonNormalizationDiagnostic[]] = Object.freeze([Object.freeze(first), ...rest.map((diagnostic) => Object.freeze(diagnostic))]);
-  return Object.freeze({ status: 'normalized_with_diagnostics', value: output, bytes: utf8Bytes(text), truncated, diagnostics: nonemptyDiagnostics });
+  const nonemptyDiagnostics: readonly [JsonNormalizationDiagnostic, ...JsonNormalizationDiagnostic[]] =
+    Object.freeze([Object.freeze(first), ...rest.map((diagnostic) => Object.freeze(diagnostic))]);
+  return Object.freeze({
+    status: 'normalized_with_diagnostics',
+    value: output,
+    bytes: utf8Bytes(text),
+    truncated,
+    diagnostics: nonemptyDiagnostics
+  });
 }
 
 function copyJson(
@@ -116,7 +173,7 @@ function copyJson(
   path: string,
   depth: number,
   limits: SafeJsonParseLimits,
-  state: { entries: number; stringBytes: number },
+  state: JsonParseState,
   seen: WeakSet<object>
 ): JsonValue {
   if (value === null || typeof value === 'boolean') return value;
@@ -128,36 +185,62 @@ function copyJson(
     const bytes = utf8Bytes(value);
     if (bytes > limits.maxStringBytes) throw new Error(path + ' exceeds the string byte limit.');
     state.stringBytes += bytes;
-    if (state.stringBytes > limits.maxTotalBytes) throw new Error('JSON strings exceed the total byte limit.');
+    state.maxStringBytes = Math.max(state.maxStringBytes, bytes);
+    if (state.stringBytes > limits.maxTotalBytes)
+      throw new Error('JSON strings exceed the total byte limit.');
     return value;
   }
   if (typeof value !== 'object') throw new Error(path + ' contains a non-JSON value.');
   if (depth >= limits.maxDepth) throw new Error(path + ' exceeds the JSON depth limit.');
+  if (isOwnedJsonValue(value)) {
+    const proof = ownedSnapshots.get(value);
+    if (
+      proof &&
+      depth + proof.depth <= limits.maxDepth &&
+      state.entries + proof.entries <= limits.maxCollectionEntries &&
+      state.stringBytes + proof.stringBytes <= limits.maxTotalBytes &&
+      proof.maxStringBytes <= limits.maxStringBytes
+    ) {
+      state.entries += proof.entries;
+      state.stringBytes += proof.stringBytes;
+      state.maxStringBytes = Math.max(state.maxStringBytes, proof.maxStringBytes);
+      state.depth = Math.max(state.depth, depth + proof.depth);
+      return value;
+    }
+  }
+  state.depth = Math.max(state.depth, depth + 1);
   if (seen.has(value)) throw new Error(path + ' contains a cycle.');
   seen.add(value);
   try {
     if (Array.isArray(value)) {
       const length = dataDescriptor(value, 'length', path);
-      if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) throw new Error(path + ' has an invalid array length.');
+      if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0)
+        throw new Error(path + ' has an invalid array length.');
       state.entries += length;
-      if (state.entries > limits.maxCollectionEntries) throw new Error(path + ' exceeds the JSON collection limit.');
+      if (state.entries > limits.maxCollectionEntries)
+        throw new Error(path + ' exceeds the JSON collection limit.');
       const output: JsonValue[] = [];
       for (let index = 0; index < length; index += 1) {
         const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
-        if (!descriptor || !('value' in descriptor)) throw new Error(path + '[' + String(index) + '] must be a data property.');
-        output.push(copyJson(descriptor.value, path + '[' + String(index) + ']', depth + 1, limits, state, seen));
+        if (!descriptor || !('value' in descriptor))
+          throw new Error(path + '[' + String(index) + '] must be a data property.');
+        output.push(
+          copyJson(descriptor.value, path + '[' + String(index) + ']', depth + 1, limits, state, seen)
+        );
       }
       return Object.freeze(output);
     }
     const prototype: unknown = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) throw new Error(path + ' has an unsupported object prototype.');
+    if (prototype !== Object.prototype && prototype !== null)
+      throw new Error(path + ' has an unsupported object prototype.');
     const output: JsonObject = {};
     const keys = Reflect.ownKeys(value);
     if (keys.some((key) => typeof key === 'symbol')) throw new Error(path + ' contains a symbol key.');
     const stringKeys = keys as string[];
     state.entries += stringKeys.length;
-    if (state.entries > limits.maxCollectionEntries) throw new Error(path + ' exceeds the JSON collection limit.');
-    for (const key of stringKeys.sort((a, b) => a.localeCompare(b, 'en'))) {
+    if (state.entries > limits.maxCollectionEntries)
+      throw new Error(path + ' exceeds the JSON collection limit.');
+    for (const key of stringKeys.sort()) {
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
       if (descriptor?.enumerable !== true) continue;
       if (!('value' in descriptor)) throw new Error(path + '.' + key + ' is an accessor property.');
@@ -173,9 +256,18 @@ function copyJson(
     seen.delete(value);
   }
 }
+
+function ownJsonSnapshot<T extends JsonValue>(value: T): T {
+  if (value !== null && typeof value === 'object') {
+    Object.freeze(value);
+    if (!ownedSnapshots.has(value)) ownedSnapshots.set(value, undefined);
+  }
+  return value;
+}
 function dataDescriptor(object: object, key: string, path: string): unknown {
   const descriptor = Object.getOwnPropertyDescriptor(object, key);
-  if (!descriptor || !('value' in descriptor)) throw new Error(path + '.' + key + ' must be a data property.');
+  if (!descriptor || !('value' in descriptor))
+    throw new Error(path + '.' + key + ' must be a data property.');
   return descriptor.value;
 }
 
@@ -190,7 +282,11 @@ function normalizeValue(
   try {
     return normalizeValueUnsafe(value, path, depth, limits, diagnostics, seen);
   } catch (error) {
-    diagnostics.push({ code: 'access_error', path, message: `Value could not be inspected: ${safeErrorMessage(error)}.` });
+    diagnostics.push({
+      code: 'access_error',
+      path,
+      message: `Value could not be inspected: ${safeErrorMessage(error)}.`
+    });
     return '[value inspection failed]';
   }
 }
@@ -207,7 +303,11 @@ function normalizeValueUnsafe(
   if (typeof value === 'string') {
     const truncated = truncateText(value, limits.maxStringBytes);
     if (truncated !== value) {
-      diagnostics.push({ code: 'text_truncated', path, message: `String exceeded ${String(limits.maxStringBytes)} bytes.` });
+      diagnostics.push({
+        code: 'text_truncated',
+        path,
+        message: `String exceeded ${String(limits.maxStringBytes)} bytes.`
+      });
     }
     return truncated;
   }
@@ -232,18 +332,33 @@ function normalizeValueUnsafe(
   if (isDate(value)) {
     const timestamp = Date.prototype.getTime.call(value);
     if (!Number.isFinite(timestamp)) {
-      diagnostics.push({ code: 'invalid_date', path, message: 'Invalid Date was replaced with a descriptive marker.' });
+      diagnostics.push({
+        code: 'invalid_date',
+        path,
+        message: 'Invalid Date was replaced with a descriptive marker.'
+      });
       return '[invalid date]';
     }
     return new Date(timestamp).toISOString();
   }
   if (isUint8Array(value)) {
     const byteLength = value.byteLength;
-    diagnostics.push({ code: 'binary', path, message: `Binary value (${String(byteLength)} bytes) was replaced with metadata.` });
-    return nullPrototypeObject([['type', 'binary'], ['bytes', byteLength]]);
+    diagnostics.push({
+      code: 'binary',
+      path,
+      message: `Binary value (${String(byteLength)} bytes) was replaced with metadata.`
+    });
+    return nullPrototypeObject([
+      ['type', 'binary'],
+      ['bytes', byteLength]
+    ]);
   }
   if (depth >= limits.maxDepth) {
-    diagnostics.push({ code: 'depth_truncated', path, message: `Value exceeded maximum depth ${String(limits.maxDepth)}.` });
+    diagnostics.push({
+      code: 'depth_truncated',
+      path,
+      message: `Value exceeded maximum depth ${String(limits.maxDepth)}.`
+    });
     return '[maximum depth reached]';
   }
   if (typeof value === 'object') {
@@ -256,16 +371,33 @@ function normalizeValueUnsafe(
     try {
       if (Array.isArray(value)) {
         const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
-        const length = typeof lengthDescriptor?.value === 'number' && Number.isSafeInteger(lengthDescriptor.value) && lengthDescriptor.value >= 0
-          ? lengthDescriptor.value
-          : 0;
+        const length =
+          typeof lengthDescriptor?.value === 'number' &&
+          Number.isSafeInteger(lengthDescriptor.value) &&
+          lengthDescriptor.value >= 0
+            ? lengthDescriptor.value
+            : 0;
         const selectedLength = Math.min(length, limits.maxCollectionEntries);
         const output: JsonValue[] = [];
         for (let index = 0; index < selectedLength; index += 1) {
-          output.push(normalizeOwnProperty(value, String(index), `${path}[${String(index)}]`, depth + 1, limits, diagnostics, seen));
+          output.push(
+            normalizeOwnProperty(
+              value,
+              String(index),
+              `${path}[${String(index)}]`,
+              depth + 1,
+              limits,
+              diagnostics,
+              seen
+            )
+          );
         }
         if (selectedLength < length) {
-          diagnostics.push({ code: 'collection_truncated', path, message: `Array was truncated from ${String(length)} entries.` });
+          diagnostics.push({
+            code: 'collection_truncated',
+            path,
+            message: `Array was truncated from ${String(length)} entries.`
+          });
           output.push(`[${String(length - selectedLength)} entries omitted]`);
         }
         return Object.freeze(output);
@@ -284,10 +416,18 @@ function normalizeValueUnsafe(
       const selected = enumerableKeys.slice(0, limits.maxCollectionEntries);
       const output = Object.create(null) as JsonObject;
       for (const key of selected) {
-        defineJsonProperty(output, key, normalizeOwnProperty(value, key, `${path}.${key}`, depth + 1, limits, diagnostics, seen));
+        defineJsonProperty(
+          output,
+          key,
+          normalizeOwnProperty(value, key, `${path}.${key}`, depth + 1, limits, diagnostics, seen)
+        );
       }
       if (selected.length < enumerableKeys.length) {
-        diagnostics.push({ code: 'collection_truncated', path, message: `Object was truncated from ${String(enumerableKeys.length)} entries.` });
+        diagnostics.push({
+          code: 'collection_truncated',
+          path,
+          message: `Object was truncated from ${String(enumerableKeys.length)} entries.`
+        });
         defineJsonProperty(output, '__omittedEntries', enumerableKeys.length - selected.length);
       }
       return Object.freeze(output);
@@ -295,7 +435,11 @@ function normalizeValueUnsafe(
       seen.delete(value);
     }
   }
-  diagnostics.push({ code: 'unsupported', path, message: 'Unsupported value was replaced with its object tag.' });
+  diagnostics.push({
+    code: 'unsupported',
+    path,
+    message: 'Unsupported value was replaced with its object tag.'
+  });
   return Object.prototype.toString.call(value);
 }
 
@@ -317,7 +461,11 @@ function normalizeOwnProperty(
     }
     return normalizeValue(descriptor.value, path, depth, limits, diagnostics, seen);
   } catch (error) {
-    diagnostics.push({ code: 'access_error', path, message: `Property could not be inspected: ${safeErrorMessage(error)}.` });
+    diagnostics.push({
+      code: 'access_error',
+      path,
+      message: `Property could not be inspected: ${safeErrorMessage(error)}.`
+    });
     return '[property inspection failed]';
   }
 }
@@ -333,14 +481,23 @@ function normalizeError(
   const output = Object.create(null) as JsonObject;
   for (const key of ['name', 'message', 'stack'] as const) {
     const value = safeErrorField(error, key);
-    if (value !== undefined) defineJsonProperty(output, key, normalizeValue(value, `${path}.${key}`, depth + 1, limits, diagnostics, seen));
+    if (value !== undefined)
+      defineJsonProperty(
+        output,
+        key,
+        normalizeValue(value, `${path}.${key}`, depth + 1, limits, diagnostics, seen)
+      );
   }
   const keys = Reflect.ownKeys(error);
   for (const key of keys) {
     if (typeof key !== 'string' || key === 'name' || key === 'message' || key === 'stack') continue;
     const descriptor = Object.getOwnPropertyDescriptor(error, key);
     if (descriptor?.enumerable !== true) continue;
-    defineJsonProperty(output, key, normalizeOwnProperty(error, key, `${path}.${key}`, depth + 1, limits, diagnostics, seen));
+    defineJsonProperty(
+      output,
+      key,
+      normalizeOwnProperty(error, key, `${path}.${key}`, depth + 1, limits, diagnostics, seen)
+    );
   }
   return Object.freeze(output);
 }
@@ -351,14 +508,46 @@ function safeErrorField(error: Error, key: 'name' | 'message' | 'stack'): unknow
     if (descriptor && 'value' in descriptor) return descriptor.value;
     if (key === 'name') return 'Error';
     return undefined;
-  } catch { return undefined; }
+  } catch {
+    return undefined;
+  }
 }
 
-function isError(value: object): value is Error { try { return value instanceof Error; } catch { return false; } }
-function isDate(value: object): value is Date { try { return value instanceof Date; } catch { return false; } }
-function isUint8Array(value: object): value is Uint8Array { try { return value instanceof Uint8Array; } catch { return false; } }
-function safeFunctionName(value: { readonly name?: unknown }): string { try { return typeof value.name === 'string' && value.name.length > 0 ? value.name : 'anonymous'; } catch { return 'uninspectable'; } }
-function safeErrorMessage(error: unknown): string { try { return error instanceof Error ? error.message : String(error); } catch { return 'unknown inspection error'; } }
+function isError(value: object): value is Error {
+  try {
+    return value instanceof Error;
+  } catch {
+    return false;
+  }
+}
+function isDate(value: object): value is Date {
+  try {
+    return value instanceof Date;
+  } catch {
+    return false;
+  }
+}
+function isUint8Array(value: object): value is Uint8Array {
+  try {
+    return value instanceof Uint8Array;
+  } catch {
+    return false;
+  }
+}
+function safeFunctionName(value: { readonly name?: unknown }): string {
+  try {
+    return typeof value.name === 'string' && value.name.length > 0 ? value.name : 'anonymous';
+  } catch {
+    return 'uninspectable';
+  }
+}
+function safeErrorMessage(error: unknown): string {
+  try {
+    return error instanceof Error ? error.message : String(error);
+  } catch {
+    return 'unknown inspection error';
+  }
+}
 function defineJsonProperty(object: JsonObject, key: string, value: JsonValue): void {
   Object.defineProperty(object, key, { value, enumerable: true, configurable: false, writable: false });
 }
@@ -389,6 +578,16 @@ function truncateText(value: string, maxBytes: number): string {
   return `${value.slice(0, low)}...[truncated]`;
 }
 
+const utf8Encoder = new TextEncoder();
+const utf8Scratch = new Uint8Array(64 * 1024);
+
 function utf8Bytes(value: string): number {
-  return new TextEncoder().encode(value).byteLength;
+  let consumed = 0;
+  let bytes = 0;
+  while (consumed < value.length) {
+    const chunk = utf8Encoder.encodeInto(value.slice(consumed), utf8Scratch);
+    consumed += chunk.read;
+    bytes += chunk.written;
+  }
+  return bytes;
 }

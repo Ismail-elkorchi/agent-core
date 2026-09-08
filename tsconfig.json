@@ -39,6 +39,9 @@
     },
     {
       "path": "packages/providers/openai-codex"
+    },
+    {
+      "path": "packages/providers/claude"
     }
   ]
 }

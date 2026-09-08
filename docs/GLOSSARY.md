@@ -7,9 +7,17 @@ events, state fields, and documentation use them consistently.
 | --- | --- |
 | **run** | One admitted agent execution from task input to suspension or finalization. Core does not call this an operation. |
 | **model output** | Content returned by a model invocation. `candidate` is not a Core synonym. |
-| **model window** | The bounded, causally ordered messages submitted for one active run window. |
+| **context window** | A committed selection of session history and derived artifacts. It can span many completed runs; run completion does not evict history. |
+| **history position** | A branch boundary and the exact committed source records visible at that boundary. Independent run ledgers do not share a fabricated global sequence. |
+| **history selection** | Explicit original-source and derived-artifact references retained for inference, with bounded retrieval of omitted material. |
+| **model note** | Attributed, revisioned model-authored text or structured data. A note is neither user authority nor a verification result. |
+| **context transition** | A conditional change to the active context selection after checking source visibility, mandatory material, request fit, and provider protocol obligations. |
 | **prompt material** | Typed application or runtime material available to the request assembler. |
 | **logical model request** | Provider-neutral request assembled by Core before wire serialization. |
+| **compiled model request** | The immutable provider input admitted for invocation, with its capability revision and accounting. Credentials are transport configuration, not persisted input. |
+| **request accounting** | Complete component accounting for a compiled input, identifying estimates and unknown costs separately from exact counts. |
+| **provider context state** | Versioned, provider-bound continuation or reasoning material with explicit compatibility and replay rules. It is separate from public history and notes. |
+| **inference invocation** | One governed model operation with captured input, budget, cancellation, and durable settlement or explicit uncertainty. It need not be an interactive agent run. |
 | **request fingerprint** | Stable identity of the logical request and the inputs that produced it. It is not proof of provider-visible bytes. |
 | **observation** | A tool or effect result recorded in the run log. |
 | **observed fact** | A bounded, normalized fact derived from an observation for persistence or later selection. |
