@@ -7,6 +7,12 @@ import { EffectExecutor, effectExecutionEventCodec } from '@agent-core/runtime';
 import { InMemoryEventRepository, hashJson } from '@agent-core/persistence';
 import { JsonlEventRepository } from '@agent-core/persistence/node';
 import { parseJsonObject } from '@agent-core/json';
+import {
+  closeExternalEffect,
+  issueEffectStartTicket,
+  settleExternalEffect,
+  startExternalEffect
+} from '@agent-core/effects';
 
 const codec = { encode: parseJsonObject, decode: parseJsonObject };
 function effect(overrides = {}) {
@@ -32,6 +38,63 @@ function effect(overrides = {}) {
     ...overrides
   };
 }
+
+test('effect event admission requires an exact observation only for a known settlement', () => {
+  const intent = effect().intent;
+  const issued = issueEffectStartTicket({
+    intent,
+    ticketId: 'ticket',
+    settlementPermitId: 'permit',
+    driverGeneration: 1,
+    currentDriverGeneration: 1
+  });
+  const started = startExternalEffect(issued.state, issued.state.ticket, 1).state;
+  for (const state of [
+    issued.state,
+    started,
+    closeExternalEffect(issued.state, 'cancelled_before_start'),
+    closeExternalEffect(started, 'unknown_outcome')
+  ]) {
+    const event = { type: 'execution.state.changed', state };
+    assert.deepEqual(effectExecutionEventCodec.decode(effectExecutionEventCodec.encode(event)), event);
+    assert.throws(
+      () => effectExecutionEventCodec.decode({ ...event, observation: {} }),
+      /An unsettled effect cannot own an observation/
+    );
+  }
+  for (const outcome of ['succeeded', 'failed', 'cancelled']) {
+    const observation = { export: { artifactId: 'original' } };
+    const state = settleExternalEffect(started, started.settlementPermit, {
+      outcome,
+      resultDigest: hashJson(observation),
+      exposure: effect().exposure()
+    }).state;
+    const event = { type: 'execution.state.changed', state, observation };
+    assert.deepEqual(effectExecutionEventCodec.decode(effectExecutionEventCodec.encode(event)), event);
+    assert.throws(
+      () => effectExecutionEventCodec.decode({ type: event.type, state }),
+      /Effect observation does not match its settlement/
+    );
+    assert.throws(
+      () => effectExecutionEventCodec.decode({ ...event, observation: {} }),
+      /Effect observation does not match its settlement/
+    );
+    const decoded = effectExecutionEventCodec.decode(event);
+    observation.export.artifactId = 'changed';
+    assert.equal(decoded.observation.export.artifactId, 'original');
+    assert.equal(Object.isFrozen(decoded.observation.export), true);
+  }
+  const state = settleExternalEffect(started, started.settlementPermit, {
+    outcome: 'unknown',
+    exposure: { status: 'unknown', reserved: intent.exposure.quantities }
+  }).state;
+  for (const fields of [{}, { observation: {} }]) {
+    assert.throws(
+      () => effectExecutionEventCodec.decode({ type: 'execution.state.changed', state, ...fields }),
+      /Effect observation does not match its settlement/
+    );
+  }
+});
 
 for (const persistence of ['memory', 'jsonl']) {
   test(`${persistence}: application effects settle once and reject changed authorization`, async (t) => {

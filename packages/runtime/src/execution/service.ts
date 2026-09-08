@@ -9,7 +9,8 @@ import {
   startExternalEffect,
   type EffectExecutionState,
   type EffectExposureSettlement,
-  type ExternalEffectIntent
+  type ExternalEffectIntent,
+  type ExternalEffectSettlement
 } from '@agent-core/effects';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
 import {
@@ -22,11 +23,20 @@ import {
 } from '@agent-core/persistence';
 import { randomUUID } from 'node:crypto';
 
-export interface EffectExecutionEvent {
+export type EffectExecutionEvent = {
   readonly type: 'execution.state.changed';
-  readonly state: EffectExecutionState;
-  readonly observation?: JsonObject;
-}
+} & (
+  | {
+      readonly state: Exclude<EffectExecutionState, { readonly phase: 'settled' }>;
+      readonly observation?: never;
+    }
+  | {
+      readonly state: Extract<EffectExecutionState, { readonly phase: 'settled' }> & {
+        readonly settlement: Exclude<ExternalEffectSettlement, { readonly outcome: 'unknown' }>;
+      };
+      readonly observation: JsonObject;
+    }
+);
 
 export interface AdmittedEffect<T> {
   readonly intent: ExternalEffectIntent;
@@ -62,18 +72,23 @@ export const effectExecutionEventCodec: RuntimeCodec<EffectExecutionEvent> = {
     const state = decodeEffectExecutionState(event.state);
     const observation = event.observation === undefined ? undefined : parseJsonObject(event.observation);
     if (state.phase === 'settled') {
+      const settlement = state.settlement;
       if (
-        state.settlement.outcome === 'unknown' ||
+        settlement.outcome === 'unknown' ||
         observation === undefined ||
-        hashJson(observation) !== state.settlement.resultDigest
+        hashJson(observation) !== settlement.resultDigest
       )
         throw new TypeError('Effect observation does not match its settlement.');
-    } else if (observation !== undefined)
-      throw new TypeError('An unsettled effect cannot own an observation.');
+      return Object.freeze({
+        type: 'execution.state.changed',
+        state: Object.freeze({ ...state, settlement }),
+        observation
+      });
+    }
+    if (observation !== undefined) throw new TypeError('An unsettled effect cannot own an observation.');
     return Object.freeze({
       type: 'execution.state.changed',
-      state,
-      ...(observation === undefined ? {} : { observation })
+      state
     });
   }
 };
@@ -207,14 +222,14 @@ export class EffectExecutor {
     effect: AdmittedEffect<T>,
     event: EffectExecutionEvent
   ): EffectExecutionResult<T> | undefined {
+    if (event.observation !== undefined)
+      return { status: 'settled', observation: effect.codec.decode(event.observation), replayed: true };
     if (event.state.phase === 'closed')
       return {
         status:
           event.state.closure.reason === 'cancelled_before_start' ? 'cancelled_before_start' : 'unknown'
       };
-    if (event.state.phase !== 'settled') return undefined;
-    if (event.observation === undefined) throw new Error('Settled effect has no committed observation.');
-    return { status: 'settled', observation: effect.codec.decode(event.observation), replayed: true };
+    return undefined;
   }
 
   private assertIntent(recorded: ExternalEffectIntent, requested: ExternalEffectIntent): void {

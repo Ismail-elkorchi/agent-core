@@ -115,16 +115,21 @@ export type EffectStartResult =
       readonly reason: 'stale_driver' | 'ticket_mismatch' | 'ticket_consumed' | 'effect_terminal';
     };
 
-export type EffectSettlementResult =
+export type EffectSettlementResult<Settlement extends ExternalEffectSettlement> =
   | {
       readonly status: 'settled';
-      readonly state: Extract<EffectExecutionState, { readonly phase: 'settled' }>;
+      readonly state: Extract<EffectExecutionState, { readonly phase: 'settled' }> & {
+        readonly settlement: Settlement;
+      };
     }
   | {
       readonly status: 'already_settled';
       readonly state: Extract<EffectExecutionState, { readonly phase: 'settled' }>;
     }
-  | { readonly status: 'late'; readonly state: Extract<EffectExecutionState, { readonly phase: 'closed' }> }
+  | {
+      readonly status: 'late';
+      readonly state: Extract<EffectExecutionState, { readonly phase: 'closed' }>;
+    }
   | {
       readonly status: 'rejected';
       readonly reason: 'effect_not_started' | 'permit_mismatch' | 'settlement_conflict';
@@ -391,11 +396,11 @@ export function startExternalEffect(
   });
 }
 
-export function settleExternalEffect(
+export function settleExternalEffect<Settlement extends ExternalEffectSettlement>(
   state: EffectExecutionState,
   permit: EffectSettlementPermit,
-  settlement: ExternalEffectSettlement
-): EffectSettlementResult {
+  settlement: Settlement
+): EffectSettlementResult<Settlement> {
   if (!permitsEqual(state.settlementPermit, permit))
     return Object.freeze({ status: 'rejected', reason: 'permit_mismatch' });
   if (state.phase === 'ticket_issued')
