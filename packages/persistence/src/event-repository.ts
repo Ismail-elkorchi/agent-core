@@ -1,7 +1,8 @@
+import { canonicalJsonString } from '@agent-core/json';
 import { randomUUID } from 'node:crypto';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
 import type { AppendEventOptions, EventActor, EventAppendReceipt, EventEnvelope, LedgerIntegrityReport, TypedEvent } from './ledger.js';
-import { hashJson, canonicalJsonString } from './ledger.js';
+import { hashJson } from './ledger.js';
 
 export interface RuntimeCodec<T> {
   encode(value: T): JsonObject;

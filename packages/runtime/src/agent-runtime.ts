@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto';
 import { type ModelWindowReduction, ModelWindow } from './inference/model-window.js';
 import { decodePromptContextItemInput, type PromptContextItemInput } from './inference/prompt-material.js';
 import { hashJson, type EventAppendReceipt } from '@agent-core/persistence';
-import { normalizeJsonSafe, parseJsonValue, type JsonValue } from '@agent-core/json';
+import { parseJsonValue, type JsonValue } from '@agent-core/json';
 import {
   NO_EFFECT_EXPOSURE,
   closeExternalEffect,
@@ -207,7 +207,8 @@ export interface AgentRuntimeOptions {
   readonly repositories: AgentRuntimeRepositories;
   readonly tools?: readonly CompiledToolDefinition[];
   readonly toolCatalogProvider?: () =>
-    readonly CompiledToolDefinition[] | Promise<readonly CompiledToolDefinition[]>;
+    | readonly CompiledToolDefinition[]
+    | Promise<readonly CompiledToolDefinition[]>;
   readonly toolBoundary: ToolAuthorizationBoundary;
   readonly toolContext?: Omit<ToolExecutionContext, 'policy' | 'signal'>;
   readonly toolResourceLeases?: ResourceLeaseCoordinator;
@@ -329,7 +330,10 @@ type TerminalDecision =
   | {
       readonly executionStatus: 'completed';
       readonly terminationReason:
-        'model_completed' | 'model_output_limit' | 'content_filtered' | 'unknown_model_termination';
+        | 'model_completed'
+        | 'model_output_limit'
+        | 'content_filtered'
+        | 'unknown_model_termination';
       readonly modelOutput: AgentPresentModelOutput;
       readonly turnCount: number;
       readonly checkResults: readonly AgentCheckResult[];
@@ -459,6 +463,7 @@ class AgentExecutionError extends Error {
 }
 
 export class AgentRuntime {
+  private readonly metadata: Readonly<Record<string, string>> | undefined;
   private readonly estimator: RequestEstimator;
   private readonly maxOutputTokens: number | undefined;
   private readonly toolPolicy: ToolPolicy;
@@ -492,6 +497,7 @@ export class AgentRuntime {
   private static readonly MAX_STEERING_ITEMS = 1024;
 
   constructor(private readonly options: AgentRuntimeOptions) {
+    this.metadata = options.metadata === undefined ? undefined : Object.freeze({ ...options.metadata });
     this.estimator = options.estimator ?? new CompleteRequestEstimator();
     this.requestAssembler = new ModelRequestAssembler(this.estimator);
     this.inferenceService = options.inferenceService ?? new InferenceService({ provider: options.provider });
@@ -802,7 +808,7 @@ export class AgentRuntime {
         if (settlement) {
           const settled = settleExternalEffect(phase.effect, phase.effect.settlementPermit, {
             outcome: 'succeeded',
-            resultDigest: hashJson(normalizeJsonSafe(settlement.event).value),
+            resultDigest: hashJson(settlement.event),
             exposure: settlement.event.response.usage
               ? knownEffectExposure(providerUsageQuantities(settlement.event.response.usage))
               : unknownEffectExposure(phase.effect.intent.exposure)
@@ -1114,7 +1120,7 @@ export class AgentRuntime {
           task: runtime.input.task,
           model: this.options.model,
           toolPolicy: this.toolPolicy,
-          ...(this.options.metadata ? { metadata: this.options.metadata } : {})
+          ...(this.metadata ? { metadata: this.metadata } : {})
         },
         `${runtime.runId}:started`
       );
@@ -1382,7 +1388,7 @@ export class AgentRuntime {
                   ? {}
                   : { temperature: configuration.temperature }),
                 ...(configuration.reasoning === undefined ? {} : { reasoning: configuration.reasoning }),
-                ...(this.options.metadata === undefined ? {} : { metadata: this.options.metadata })
+                ...(this.metadata === undefined ? {} : { metadata: this.metadata })
               })
             };
             await runtime.append(configuredEvent);
@@ -1684,8 +1690,7 @@ export class AgentRuntime {
     readonly modelOutput: AgentPresentModelOutput;
     readonly modelWindow: ModelWindow;
   }): Promise<readonly AgentCheckResult[]> {
-    const metadataValue = normalizeJsonSafe(this.options.metadata ?? {}).value;
-    const metadata = isRecord(metadataValue) ? metadataValue : Object.freeze({});
+    const metadata = this.metadata ?? Object.freeze({});
     const execution = observationFactsExecution({
       modelWindow: input.modelWindow,
       ...(this.options.repositories.artifacts ? { artifacts: this.options.repositories.artifacts } : {}),
@@ -1850,7 +1855,7 @@ export class AgentRuntime {
           });
           const settled = settleExternalEffect(started.state, started.state.settlementPermit, {
             outcome: result.diagnostic ? 'failed' : 'succeeded',
-            resultDigest: hashJson(normalizeJsonSafe(result).value),
+            resultDigest: hashJson(result),
             exposure: knownEffectExposure([])
           });
           if (settled.status !== 'settled' && settled.status !== 'already_settled')
@@ -1886,7 +1891,7 @@ export class AgentRuntime {
             });
             const settlement = settleExternalEffect(phase.effect, phase.effect.settlementPermit, {
               outcome: result.diagnostic ? 'failed' : 'succeeded',
-              resultDigest: hashJson(normalizeJsonSafe(result).value),
+              resultDigest: hashJson(result),
               exposure: knownEffectExposure([])
             });
             if (settlement.status !== 'settled' && settlement.status !== 'already_settled')
@@ -1998,22 +2003,13 @@ export class AgentRuntime {
       phase.providerSettlementEventId,
       phase.checkIds
     );
-    if (
-      hashJson(normalizeJsonSafe(observedFacts.modelOutput).value) !==
-      hashJson(normalizeJsonSafe(modelOutput).value)
-    ) {
+    if (hashJson(observedFacts.modelOutput) !== hashJson(modelOutput)) {
       throw new Error(`Run ${runtime.runId} modelOutput does not match its exact assistant settlement.`);
     }
-    if (
-      hashJson(normalizeJsonSafe(observedFacts.checkResults).value) !==
-      hashJson(normalizeJsonSafe(checkResults).value)
-    ) {
+    if (hashJson(observedFacts.checkResults) !== hashJson(checkResults)) {
       throw new Error(`Run ${runtime.runId} verification results do not match their exact settlements.`);
     }
-    if (
-      hashJson(normalizeJsonSafe(observedFacts.response).value) !==
-      hashJson(normalizeJsonSafe(response).value)
-    ) {
+    if (hashJson(observedFacts.response) !== hashJson(response)) {
       throw new Error(`Run ${runtime.runId} provider response does not match its exact settlement.`);
     }
     const state = runtime.run.state();
@@ -2025,7 +2021,7 @@ export class AgentRuntime {
       driverGeneration: state.driverGeneration
     });
     const input = dispositionInput(state, observedFacts, budget, controlSnapshot);
-    const inputDigest = hashJson(normalizeJsonSafe(input).value);
+    const inputDigest = hashJson(input);
     await this.advanceRun(runtime.run, 'consume_verification_settlement', {
       phase: Object.freeze({
         kind: 'disposition' as const,
@@ -2275,11 +2271,7 @@ export class AgentRuntime {
           } finally {
             deadline.dispose();
           }
-          const settled = settleDispositionEffect(
-            started.state,
-            hashJson(normalizeJsonSafe(decision).value),
-            runtime.runId
-          );
+          const settled = settleDispositionEffect(started.state, hashJson(decision), runtime.runId);
           await this.commitDispositionDecision(
             runtime,
             runtime.run.state().phase,
@@ -2301,7 +2293,7 @@ export class AgentRuntime {
           deadline.dispose();
         }
         if (reconciliation.status === 'settled') {
-          const outputDigest = hashJson(normalizeJsonSafe(reconciliation.decision).value);
+          const outputDigest = hashJson(reconciliation.decision);
           const settled = settleDispositionEffect(phase.effect, outputDigest, runtime.runId);
           await this.commitDispositionDecision(
             runtime,
@@ -2358,7 +2350,8 @@ export class AgentRuntime {
   private async commitDispositionDecision(
     runtime: RunExecutionRuntime,
     phase:
-      Extract<AgentDispositionPhase, { readonly stage: 'ready' | 'effect_pending' }> | AgentRunControlPhase,
+      | Extract<AgentDispositionPhase, { readonly stage: 'ready' | 'effect_pending' }>
+      | AgentRunControlPhase,
     decision: AgentDispositionDecision,
     procedure: 'plan_disposition' | 'reconcile_disposition',
     effect?: Extract<
@@ -2370,7 +2363,7 @@ export class AgentRuntime {
       throw new Error(
         `Run ${runtime.runId} cannot commit a decision outside an active disposition boundary.`
       );
-    const outputDigest = hashJson(normalizeJsonSafe(decision).value);
+    const outputDigest = hashJson(decision);
     const configuration = runtime.run.state().configuration.disposition;
     try {
       const receipt = await runtime.append(
@@ -2421,7 +2414,7 @@ export class AgentRuntime {
       })
     );
     const input = dispositionInput(state, observedFacts, phase.budgetSnapshot, phase.controlSnapshot);
-    const restoredInputDigest = hashJson(normalizeJsonSafe(input).value);
+    const restoredInputDigest = hashJson(input);
     if (restoredInputDigest !== phase.inputDigest)
       throw new Error(`Run ${runId} disposition input no longer matches its captured digest.`);
     return Object.freeze({
@@ -2541,7 +2534,7 @@ export class AgentRuntime {
       match.event.implementationId !== configuration.implementationId ||
       match.event.policyHash !== configuration.policyHash ||
       match.event.inputDigest !== continuation.phase.inputDigest ||
-      match.event.outputDigest !== hashJson(normalizeJsonSafe(match.event.decision).value)
+      match.event.outputDigest !== hashJson(match.event.decision)
     ) {
       throw new Error(
         `Run ${runId} contains a disposition decision with contradictory evaluator binding or digests.`
@@ -2551,7 +2544,7 @@ export class AgentRuntime {
       continuation.phase.stage === 'decided' &&
       (continuation.phase.decisionEventId !== match.eventId ||
         continuation.phase.outputDigest !== match.event.outputDigest ||
-        hashJson(normalizeJsonSafe(continuation.phase.decision).value) !== match.event.outputDigest)
+        hashJson(continuation.phase.decision) !== match.event.outputDigest)
     ) {
       throw new Error(`Run ${runId} durable disposition state contradicts its decision event.`);
     }
@@ -2787,7 +2780,7 @@ export class AgentRuntime {
       requestAttempt: input.requestAttempt,
       provider: this.options.provider.id,
       model: input.configuration.model,
-      profileHash: hashJson(normalizeJsonSafe(input.profile).value),
+      profileHash: hashJson(input.profile),
       continuationEligible: input.continuationEligible,
       ...(input.configuration.temperature === undefined
         ? {}
@@ -2824,7 +2817,7 @@ export class AgentRuntime {
     if (record.provider !== this.options.provider.id || record.model !== this.options.model)
       throw new Error(`Persisted turn ${record.turnId} does not match the configured provider and model.`);
     const profile = parseModelProfile(await this.options.provider.describeModel(record.model));
-    if (hashJson(normalizeJsonSafe(profile).value) !== record.profileHash)
+    if (hashJson(profile) !== record.profileHash)
       throw new Error(`Provider model profile changed for persisted turn ${record.turnId}.`);
     if (this.options.toolCatalogProvider)
       this.tools = Object.freeze(new ToolRegistry(await this.options.toolCatalogProvider()).list());
@@ -2913,10 +2906,7 @@ export class AgentRuntime {
       const request = context.compiled.logicalRequest;
       const tools =
         context.dispatch?.kind === 'steering' ? (active?.request.snapshot.tools ?? nextTools) : nextTools;
-      if (
-        hashJson(normalizeJsonSafe(toolsForModel([...tools], context.profile)).value) !==
-        hashJson(normalizeJsonSafe(request.tools ?? []).value)
-      ) {
+      if (hashJson(toolsForModel([...tools], context.profile)) !== hashJson(request.tools ?? [])) {
         throw new Error('Native dispatch changed the captured tool catalog.');
       }
       const snapshot = first
@@ -2983,9 +2973,9 @@ export class AgentRuntime {
             runContextIds: assembly.fingerprint.runContextIds,
             effectiveInstructionHash: assembly.fingerprint.effectiveInstructionHash,
             selectedFactsHash: hashJson(null),
-            modelWindowHistoryHash: hashJson(normalizeJsonSafe(request.messages).value),
-            modelToolSchemasHash: hashJson(normalizeJsonSafe(request.tools ?? []).value),
-            modelWindowHash: hashJson(normalizeJsonSafe(request.messages).value),
+            modelWindowHistoryHash: hashJson(request.messages),
+            modelToolSchemasHash: hashJson(request.tools ?? []),
+            modelWindowHash: hashJson(request.messages),
             reductions: []
           };
       await runtime.append({
@@ -3551,11 +3541,11 @@ export class AgentRuntime {
           configuredContextIds: contextSourceIds(contextInputs.configured, 'configured'),
           providerContextIds: contextSourceIds(contextInputs.provider, 'provider'),
           runContextIds: contextSourceIds(contextInputs.run, 'run'),
-          effectiveInstructionHash: hashJson(normalizeJsonSafe(request.snapshot.instructions).value),
-          selectedFactsHash: hashJson(normalizeJsonSafe(assembly.material.observedFacts ?? null).value),
-          modelWindowHistoryHash: hashJson(normalizeJsonSafe(assembly.historyMessages).value),
-          modelToolSchemasHash: hashJson(normalizeJsonSafe(modelTools).value),
-          modelWindowHash: hashJson(normalizeJsonSafe(assembly.messages).value),
+          effectiveInstructionHash: hashJson(request.snapshot.instructions),
+          selectedFactsHash: hashJson(assembly.material.observedFacts ?? null),
+          modelWindowHistoryHash: hashJson(assembly.historyMessages),
+          modelToolSchemasHash: hashJson(modelTools),
+          modelWindowHash: hashJson(assembly.messages),
           reductions: reductionRecords
         });
         return {
@@ -3766,7 +3756,8 @@ export class AgentRuntime {
     run: AgentRunDriver,
     procedure: AgentRunProcedure,
     advance:
-      AgentRunAdvance | ((state: import('./run/control/contracts.js').AgentRunState) => AgentRunAdvance)
+      | AgentRunAdvance
+      | ((state: import('./run/control/contracts.js').AgentRunState) => AgentRunAdvance)
   ): Promise<void> {
     await run.transition(procedure, typeof advance === 'function' ? advance : () => advance);
     this.pendingCalls.observeState(run.state());
@@ -4299,7 +4290,7 @@ export class AgentRuntime {
   private assertRuntimeMatchesRun(run: AgentRunDriver): void {
     const captured = run.state().configuration;
     const current = this.currentRunConfiguration();
-    if (hashJson(normalizeJsonSafe(captured).value) !== hashJson(normalizeJsonSafe(current).value)) {
+    if (hashJson(captured) !== hashJson(current)) {
       throw new Error(
         `Run ${run.state().runId} was captured for a different runtime implementation or configuration.`
       );
@@ -4530,7 +4521,7 @@ function durableProcessTermination(value: unknown): {
   return {
     processId: record.processId,
     status: record.status,
-    result: normalizeJsonSafe({
+    result: parseJsonValue({
       owner: record.owner,
       cursorEnd: record.cursorEnd,
       stdout: stream(record.stdout),
@@ -4542,7 +4533,7 @@ function durableProcessTermination(value: unknown): {
       ...(isRecord(outer) && outer.protectedArtifact !== undefined
         ? { protectedArtifact: outer.protectedArtifact }
         : {})
-    }).value
+    })
   };
 }
 function cleanupFailureDecision(previous: TerminalDecision | undefined, error: Error): TerminalDecision {
@@ -4781,7 +4772,7 @@ function contextSourceIds(
   return (items ?? []).map((item, index) =>
     isRecord(item) && typeof item.id === 'string' && item.id.length > 0
       ? item.id
-      : `${provenance}-context-${String(index + 1)}-${hashJson(normalizeJsonSafe(item).value).slice(0, 12)}`
+      : `${provenance}-context-${String(index + 1)}-${hashJson(item).slice(0, 12)}`
   );
 }
 function turnIdentity(snapshot: AgentTurnSnapshotRecord): AgentTurnIdentity {
@@ -4839,7 +4830,7 @@ function checkEffectPlanRecord(
   });
   return Object.freeze({
     ...record,
-    fingerprint: hashJson(normalizeJsonSafe(record).value)
+    fingerprint: hashJson(record)
   });
 }
 async function requireMatchingCheckEffectPlan(
@@ -4859,8 +4850,7 @@ async function requireMatchingCheckEffectPlan(
     actual.fingerprint !== expected.fingerprint ||
     actual.checkImplementationId !== expected.checkImplementationId ||
     hashJson(actual.authorization) !== hashJson(expected.authorization) ||
-    hashJson(normalizeJsonSafe(actual.recovery).value) !==
-      hashJson(normalizeJsonSafe(expected.recovery).value)
+    hashJson(actual.recovery) !== hashJson(expected.recovery)
   ) {
     await plan.release();
     throw new Error(`Verifier ${check.id} plan changed after its durable intent was recorded.`);
@@ -4915,7 +4905,7 @@ function dispositionPreparation(
 ): AgentDispositionEffectPlanRecord {
   const record = Object.freeze({
     implementationId: policy.implementationId,
-    inputDigest: hashJson(normalizeJsonSafe(input).value),
+    inputDigest: hashJson(input),
     authorization: plan.authorization,
     recovery: plan.recovery
   });
@@ -4923,7 +4913,7 @@ function dispositionPreparation(
     implementationId: record.implementationId,
     authorization: record.authorization,
     recovery: record.recovery,
-    fingerprint: hashJson(normalizeJsonSafe(record).value)
+    fingerprint: hashJson(record)
   });
 }
 function requireMatchingDispositionPreparation(
@@ -4937,8 +4927,7 @@ function requireMatchingDispositionPreparation(
     actual.implementationId !== expected.implementationId ||
     actual.fingerprint !== expected.fingerprint ||
     hashJson(actual.authorization) !== hashJson(expected.authorization) ||
-    hashJson(normalizeJsonSafe(actual.recovery).value) !==
-      hashJson(normalizeJsonSafe(expected.recovery).value)
+    hashJson(actual.recovery) !== hashJson(expected.recovery)
   ) {
     throw new Error(
       `Disposition ${policy.implementationId} plan changed after its durable intent was recorded.`
@@ -4946,7 +4935,7 @@ function requireMatchingDispositionPreparation(
   }
 }
 function dispositionEffectId(runId: string, identity: AgentTurnIdentity, revisionCount: number): string {
-  return `disposition:${hashJson(normalizeJsonSafe({ runId, identity, revisionCount }).value)}`;
+  return `disposition:${hashJson({ runId, identity, revisionCount })}`;
 }
 function settleDispositionEffect(
   effect: Extract<AgentDispositionPhase, { readonly stage: 'effect_pending' }>['effect'],
@@ -5255,7 +5244,7 @@ function sameResourcePreconditions(
   left: readonly import('@agent-core/effects').EffectResourcePrecondition[],
   right: readonly import('@agent-core/effects').EffectResourcePrecondition[]
 ): boolean {
-  return hashJson(normalizeJsonSafe(left).value) === hashJson(normalizeJsonSafe(right).value);
+  return hashJson(left) === hashJson(right);
 }
 class AgentRunOwnershipLostError extends Error {
   constructor(runId: string) {

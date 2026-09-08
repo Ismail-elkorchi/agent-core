@@ -43,7 +43,7 @@ try {
     if (!files.some((file) => file.startsWith('dist/'))) throw new Error(`${relative} is missing compiled output.`);
     for (const file of files.filter((name) => name.endsWith('.d.ts'))) {
       const declaration = await readFile(path.join(directory, file), 'utf8');
-      const retired = /\b(?:ModelMessage|ModelProviderState|SimpleTokenEstimator|TokenEstimator|SessionCompactionEntry|AgentSessionCompactionRequest|appendCompaction|summarizeConversation|executeAssistantToolCalls|nextObservationIndex)\b/u.exec(declaration);
+      const retired = /\b(?:ModelMessage|ModelProviderState|SimpleTokenEstimator|TokenEstimator|SessionCompactionEntry|AgentSessionCompactionRequest|appendCompaction|summarizeConversation|executeAssistantToolCalls|nextObservationIndex|normalizeJsonSafe|JsonNormalizationDiagnostic|JsonNormalizationResult|outputNormalization|toObservationJsonObject|toJsonValue)\b/u.exec(declaration);
       if (retired) throw new Error(`${relative}/${file} still exports retired contract ${retired[0]}.`);
     }
     dependencies[manifest.name] = `file:${path.join(packs, packed.filename)}`;
@@ -61,6 +61,8 @@ try {
     "import * as nodeRuntime from '@agent-core/runtime/node';",
     "import * as model from '@agent-core/model';",
     "import * as json from '@agent-core/json';",
+    "import { renderDiagnostic } from '@agent-core/json/diagnostics';",
+    "if (json.canonicalJsonString({ b: 1, a: 2 }) !== '{\"a\":2,\"b\":1}' || renderDiagnostic('large', { maxBytes: 1 }).bytes > 1) throw new Error('JSON boundary exports failed');",
     "import * as persistence from '@agent-core/persistence';",
     "import * as effects from '@agent-core/effects';",
     "import * as tools from '@agent-core/tools';",
@@ -73,6 +75,10 @@ try {
 
   await writeFile(path.join(consumer, 'consumer.ts'), [
     "import type { JsonObject } from '@agent-core/json';",
+    "import { renderDiagnostic } from '@agent-core/json/diagnostics';",
+    "const diagnostic = renderDiagnostic(new Error('example'));",
+    "// @ts-expect-error diagnostic text is not an authoritative JSON payload",
+    "diagnostic.value;",
     "import type { ModelInputItem, ModelOutputItem, ProviderContextState, CompiledModelRequest, RequestAccounting } from '@agent-core/model';",
     "import type { EffectRecoveryCapability } from '@agent-core/effects';",
     "import type { AgentModelOutput, AgentRunControl, AgentSessionState, AgentTerminalSnapshot, ContextWindowRecord, HistorySourceRef, NoteRepository } from '@agent-core/runtime';",

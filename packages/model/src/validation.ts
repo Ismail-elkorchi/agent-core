@@ -28,7 +28,7 @@ import type {
   ModelTransportMetadata,
   ModelUsage
 } from './index.js';
-import { normalizeJsonSafe, parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
+import { parseJsonValue, parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
 
 const MODEL_JSON_LIMITS = {
   maxDepth: 32,
@@ -859,8 +859,8 @@ export function parseModelResponse(value: unknown): ModelResponse {
       ? { providerTerminationReason: value.providerTerminationReason }
       : {}),
     ...(timings ? { timings } : {}),
-    ...(Object.hasOwn(value, 'logprobs') ? { logprobs: ownedOpaque(value.logprobs) } : {}),
-    ...(Object.hasOwn(value, 'raw') ? { raw: ownedOpaque(value.raw) } : {})
+    ...(Object.hasOwn(value, 'logprobs') ? { logprobs: parseJsonValue(value.logprobs) } : {}),
+    ...(Object.hasOwn(value, 'raw') ? { raw: parseJsonValue(value.raw) } : {})
   };
   return own(OWNED_RESPONSES, Object.freeze(response));
 }
@@ -1248,14 +1248,6 @@ function parseFiniteNumberRecord(value: unknown): Record<string, number> {
   }
   return Object.freeze(output);
 }
-function ownedOpaque(value: unknown): JsonValue {
-  return normalizeJsonSafe(value, {
-    maxDepth: 32,
-    maxCollectionEntries: 20_000,
-    maxStringBytes: 1024 * 1024,
-    maxTotalBytes: 4 * 1024 * 1024
-  }).value;
-}
 function validReasoningRequest(value: unknown): value is ModelReasoningRequest {
   if (!isRecord(value)) return false;
   if (value.strategy === 'disabled') return Object.keys(value).length === 1;
@@ -1334,7 +1326,7 @@ function isModelToolInputSupport(
   );
 }
 function optionalRaw(value: Record<string, unknown>): { raw?: JsonValue } {
-  return Object.hasOwn(value, 'raw') ? { raw: ownedOpaque(value.raw) } : {};
+  return Object.hasOwn(value, 'raw') ? { raw: parseJsonValue(value.raw) } : {};
 }
 function finiteInRange(value: unknown, minimum: number, maximum: number): boolean {
   return typeof value === 'number' && Number.isFinite(value) && value >= minimum && value <= maximum;

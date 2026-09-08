@@ -1,6 +1,6 @@
+import { canonicalJsonString } from '@agent-core/json';
 import type { EventRepository } from '@agent-core/persistence';
-import { canonicalJsonString } from '@agent-core/persistence';
-import { parseJsonValue } from '@agent-core/json';
+
 import type { AgentEvent } from '../events.js';
 import type { AgentRunState } from './control/contracts.js';
 import type { AgentToolCallState } from './control/tool-state.js';
@@ -52,7 +52,7 @@ export class PendingCallCoordinator {
         const previous = this.calls.get(key);
         if (
           previous &&
-          canonicalJsonString(parseJsonValue(previous.call)) !== canonicalJsonString(parseJsonValue(call))
+          canonicalJsonString(previous.call) !== canonicalJsonString(call)
         )
           throw new Error('A pending call changed its original call identity or arguments.');
         this.calls.set(

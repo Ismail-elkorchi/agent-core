@@ -1,5 +1,5 @@
 import { type BearerTokenProvider } from '@agent-core/auth';
-import { normalizeJsonSafe } from '@agent-core/json';
+import { parseJsonValue } from '@agent-core/json';
 import {
   ModelProviderError,
   type ModelRequest,
@@ -159,7 +159,7 @@ export async function* streamCodexHttp(
           type: 'content',
           content: contentDelta,
           accumulated: content,
-          raw: normalizeJsonSafe(part).value
+          raw: parseJsonValue(part)
         };
         continue;
       }
@@ -173,7 +173,7 @@ export async function* streamCodexHttp(
             reasoning: contentDelta,
             accumulatedReasoning: reasoningSummary,
             channel: 'summary',
-            raw: normalizeJsonSafe(part).value
+            raw: parseJsonValue(part)
           };
         } else {
           reasoning += contentDelta;
@@ -182,7 +182,7 @@ export async function* streamCodexHttp(
             reasoning: contentDelta,
             accumulatedReasoning: reasoning,
             channel: 'reasoning',
-            raw: normalizeJsonSafe(part).value
+            raw: parseJsonValue(part)
           };
         }
         continue;
@@ -192,7 +192,7 @@ export async function* streamCodexHttp(
       if (eventType === 'response.output_item.done' && toolCall) {
         const deduped = addUniqueToolCall(toolCalls, toolCall);
         if (deduped) {
-          yield { type: 'tool_call', toolCall, raw: normalizeJsonSafe(part).value };
+          yield { type: 'tool_call', toolCall, raw: parseJsonValue(part) };
         }
         continue;
       }
@@ -200,14 +200,14 @@ export async function* streamCodexHttp(
       for (const streamedToolCall of mergeStreamingFunctionCallParts(accumulators, part)) {
         const deduped = addUniqueToolCall(toolCalls, streamedToolCall);
         if (deduped) {
-          yield { type: 'tool_call', toolCall: streamedToolCall, raw: normalizeJsonSafe(part).value };
+          yield { type: 'tool_call', toolCall: streamedToolCall, raw: parseJsonValue(part) };
         }
       }
 
       for (const streamedToolCall of mergeStreamingCustomToolCallParts(customAccumulators, part)) {
         const deduped = addUniqueToolCall(toolCalls, streamedToolCall);
         if (deduped) {
-          yield { type: 'tool_call', toolCall: streamedToolCall, raw: normalizeJsonSafe(part).value };
+          yield { type: 'tool_call', toolCall: streamedToolCall, raw: parseJsonValue(part) };
         }
       }
     }

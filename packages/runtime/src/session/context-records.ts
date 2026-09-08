@@ -71,7 +71,7 @@ export function validateContextCommit(
     input.transition.windowId !== input.window.windowId
   )
     throw new Error('Context transition identities do not match its captured boundary.');
-  const refs = new Map(branch.map((entry) => [entry.id, hashJson(parseJsonObject(entry))]));
+  const refs = new Map(branch.map((entry) => [entry.id, hashJson(entry)]));
   for (const ref of input.window.selection.retained) {
     const ledger = ref.event ? cut.ledgerHeads?.find((head) => head.runId === ref.event?.runId) : undefined;
     const finalized =
@@ -99,8 +99,8 @@ export function contextCommitRetry(
   if (
     existing &&
     (existing.transition.requestFingerprint !== input.transition.requestFingerprint ||
-      hashJson(parseJsonObject(existing.window.selection)) !==
-        hashJson(parseJsonObject(input.window.selection)) ||
+      hashJson(existing.window.selection) !==
+        hashJson(input.window.selection) ||
       existing.window.reason !== input.window.reason)
   )
     throw new PersistenceConflictError('Context transition idempotency key has conflicting content.');
@@ -117,7 +117,7 @@ export function decodeContextTransitionEntry(value: unknown): SessionContextTran
     throw new Error('Context transition record identities disagree.');
   }
   const fingerprint = hashJson(
-    parseJsonObject({
+    {
       expectedWindowId: entry.transition.previousWindowId,
       idempotencyKey: entry.transition.idempotencyKey,
       selection: {
@@ -130,9 +130,9 @@ export function decodeContextTransitionEntry(value: unknown): SessionContextTran
       ...(entry.transition.requestedSourceRevision === undefined
         ? {}
         : { expectedSourceRevision: entry.transition.requestedSourceRevision })
-    })
+    }
   );
-  if (hashJson(parseJsonObject(entry.window.selection)) !== entry.transition.selectionFingerprint)
+  if (hashJson(entry.window.selection) !== entry.transition.selectionFingerprint)
     throw new Error('Context selected provider state fingerprint does not match its committed window.');
   if (fingerprint !== entry.transition.requestFingerprint)
     throw new Error('Context transition request fingerprint does not match its committed selection.');

@@ -1,6 +1,5 @@
-import { parseJsonObject, type JsonObject, type JsonPrimitive, type JsonValue } from '@agent-core/json';
+import { parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
 
-export type JsonMember = JsonValue;
 
 export type ObservationAction =
   | 'list'
@@ -135,17 +134,6 @@ export function parseToolResultFacts(value: JsonObject): ToolResultFacts {
   return Object.freeze({ items: Object.freeze(value.items.map((item, index) => parseToolResultFact(item, index))) });
 }
 
-export function toObservationJsonObject(value: Record<string, unknown>): JsonObject {
-  const output: Record<string, JsonValue> = {};
-  for (const [key, item] of Object.entries(value)) {
-    const json = toObservationJsonMember(item);
-    if (json !== undefined) {
-      output[key] = json;
-    }
-  }
-  return Object.freeze(output);
-}
-
 function parseToolResultFact(value: JsonValue, index: number): ToolResultFact {
   const item = requireJsonObject(value, `Tool result facts item ${String(index)}`);
   rejectUnknown(item, ['action', 'resources', 'scope', 'summary', 'outcome'], `Tool result facts item ${String(index)}`);
@@ -255,42 +243,6 @@ function requireJsonObject(value: JsonValue, label: string): JsonObject {
 }
 function jsonArray(value: JsonValue | undefined): value is readonly JsonValue[] { return Array.isArray(value); }
 
-function toObservationJsonMember(value: unknown): JsonMember | undefined {
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') {
-    return value;
-  }
-  if (typeof value === 'number') {
-    return Number.isFinite(value) ? value : undefined;
-  }
-  if (Array.isArray(value)) {
-    const items = value.map(toObservationJsonPrimitive).filter((item): item is JsonPrimitive => item !== undefined);
-    return items.length === value.length ? Object.freeze(items) : undefined;
-  }
-  if (isRecord(value)) {
-    const output: Record<string, JsonPrimitive | JsonPrimitive[]> = {};
-    for (const [key, item] of Object.entries(value)) {
-      const json = Array.isArray(item)
-        ? item.map(toObservationJsonPrimitive).filter((entry): entry is JsonPrimitive => entry !== undefined)
-        : toObservationJsonPrimitive(item);
-      if (json !== undefined) {
-        output[key] = json;
-      }
-    }
-    return Object.freeze(output);
-  }
-  return undefined;
-}
-
-function toObservationJsonPrimitive(value: unknown): JsonPrimitive | undefined {
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') {
-    return value;
-  }
-  if (typeof value === 'number') {
-    return Number.isFinite(value) ? value : undefined;
-  }
-  return undefined;
-}
-
 function isObservationAction(value: unknown): value is ObservationAction {
   return value === 'list'
     || value === 'search'
@@ -301,8 +253,4 @@ function isObservationAction(value: unknown): value is ObservationAction {
     || value === 'delete'
     || value === 'move'
     || value === 'verify';
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

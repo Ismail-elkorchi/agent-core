@@ -1,5 +1,6 @@
+import { canonicalJsonString } from '@agent-core/json';
 import { calculateInferenceCost } from '../inference/usage-cost.js';
-import { canonicalJsonString } from '@agent-core/persistence';
+
 import type { ModelPricing, ModelUsage } from '@agent-core/model';
 import {
   systemAgentClock,

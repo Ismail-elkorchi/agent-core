@@ -14,7 +14,7 @@ import {
   type CredentialStore,
   type ProviderAuth
 } from '@agent-core/auth';
-import { normalizeJsonSafe } from '@agent-core/json';
+import { parseJsonValue } from '@agent-core/json';
 import {
   assertModelRequestSupported,
   type ModelProvider,
@@ -507,7 +507,7 @@ class OpenAICodexProviderSession implements ModelProviderSession {
           type: 'content',
           content: contentDelta,
           accumulated: content,
-          raw: normalizeJsonSafe(part).value
+          raw: parseJsonValue(part)
         };
         continue;
       }
@@ -521,7 +521,7 @@ class OpenAICodexProviderSession implements ModelProviderSession {
             reasoning: contentDelta,
             accumulatedReasoning: reasoningSummary,
             channel: 'summary',
-            raw: normalizeJsonSafe(part).value
+            raw: parseJsonValue(part)
           };
         } else {
           reasoning += contentDelta;
@@ -530,7 +530,7 @@ class OpenAICodexProviderSession implements ModelProviderSession {
             reasoning: contentDelta,
             accumulatedReasoning: reasoning,
             channel: 'reasoning',
-            raw: normalizeJsonSafe(part).value
+            raw: parseJsonValue(part)
           };
         }
         continue;
@@ -540,7 +540,7 @@ class OpenAICodexProviderSession implements ModelProviderSession {
       if (eventType === 'response.output_item.done' && toolCall) {
         const deduped = addUniqueToolCall(toolCalls, toolCall);
         if (deduped) {
-          yield { type: 'tool_call', toolCall, raw: normalizeJsonSafe(part).value };
+          yield { type: 'tool_call', toolCall, raw: parseJsonValue(part) };
         }
         continue;
       }
@@ -548,14 +548,14 @@ class OpenAICodexProviderSession implements ModelProviderSession {
       for (const streamedToolCall of mergeStreamingFunctionCallParts(accumulators, part)) {
         const deduped = addUniqueToolCall(toolCalls, streamedToolCall);
         if (deduped) {
-          yield { type: 'tool_call', toolCall: streamedToolCall, raw: normalizeJsonSafe(part).value };
+          yield { type: 'tool_call', toolCall: streamedToolCall, raw: parseJsonValue(part) };
         }
       }
 
       for (const streamedToolCall of mergeStreamingCustomToolCallParts(customAccumulators, part)) {
         const deduped = addUniqueToolCall(toolCalls, streamedToolCall);
         if (deduped) {
-          yield { type: 'tool_call', toolCall: streamedToolCall, raw: normalizeJsonSafe(part).value };
+          yield { type: 'tool_call', toolCall: streamedToolCall, raw: parseJsonValue(part) };
         }
       }
 

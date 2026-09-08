@@ -1,15 +1,16 @@
+import { canonicalJsonString } from '@agent-core/json';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as z from 'zod';
-import { canonicalJsonString, hashJson, InMemoryEventRepository, typedEventCodec } from '@agent-core/persistence';
-import { normalizeJsonSafe } from '@agent-core/json';
+import { hashJson, InMemoryEventRepository, typedEventCodec } from '@agent-core/persistence';
+import { parseJsonValue } from '@agent-core/json';
 import { createModelRequest, parseModelRequest, parseModelResponse } from '@agent-core/model';
 import { agentEventCodec, decodeAgentEvent, encodeAgentEvent } from '@agent-core/runtime';
 import { adoptToolDefinition, createToolCall, defineTool, invalidOutputObservation, invalidToolInputObservation, parseToolObservation, planToolCall, ToolRegistry } from '@agent-core/tools';
 
-test('normalized JSON is already recursively owned', () => {
+test('captured JSON is already recursively owned', () => {
   const nested = { values: [{ count: 1 }] };
-  const normalized = normalizeJsonSafe(nested).value;
+  const normalized = parseJsonValue(nested);
   assert.ok(Object.isFrozen(normalized));
   assert.equal(Array.isArray(normalized), false);
   assert.ok(Object.isFrozen(normalized.values));

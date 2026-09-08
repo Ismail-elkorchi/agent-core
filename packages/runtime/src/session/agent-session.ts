@@ -3,7 +3,6 @@ import type { ContextTransitionRequest } from '../context/contracts.js';
 import type { NoteRepository } from '../notes/contracts.js';
 import { randomUUID } from 'node:crypto';
 import { hashJson } from '@agent-core/persistence';
-import { normalizeJsonSafe } from '@agent-core/json';
 import { AgentRuntime, type AgentRunHandle, type AgentRunInput } from '../agent-runtime.js';
 import { AgentRunCoordinator } from '../run/control/driver.js';
 import type { AgentProgressEvent } from '../events.js';
@@ -900,5 +899,5 @@ function sameSuspension(
   left: AgentSessionSuspensionDescriptor,
   right: AgentSessionSuspensionDescriptor
 ): boolean {
-  return hashJson(normalizeJsonSafe(left).value) === hashJson(normalizeJsonSafe(right).value);
+  return hashJson(left) === hashJson(right);
 }

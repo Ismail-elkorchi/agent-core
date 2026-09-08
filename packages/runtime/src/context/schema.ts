@@ -19,8 +19,18 @@ export const contextSelectionSchema = z
       .readonly(),
     strategy: z.enum(['retain', 'notes', 'provider']),
     providerState: z
-      .record(z.string(), z.json())
-      .transform((value) => parseJsonObject(value))
+      .unknown()
+      .transform((value, context) => {
+        try {
+          return parseJsonObject(value);
+        } catch (error) {
+          context.addIssue({
+            code: 'custom',
+            message: error instanceof Error ? error.message : 'Invalid JSON object.'
+          });
+          return z.NEVER;
+        }
+      })
       .optional()
   })
   .readonly();

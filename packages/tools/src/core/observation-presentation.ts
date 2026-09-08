@@ -1,4 +1,4 @@
-import { normalizeJsonSafe, parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
+import { parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
 import type { ToolCall, ToolObservation } from './definition.js';
 export type { JsonObject, JsonValue } from '@agent-core/json';
 
@@ -62,10 +62,6 @@ export function validateToolObservationPresentation(value: unknown): ToolObserva
     ...(Array.isArray(owned.warnings) ? { warnings: Object.freeze(owned.warnings.filter((entry): entry is string => typeof entry === 'string')) } : {}),
     ...(typeof owned.next === 'string' ? { next: owned.next } : {})
   }) };
-}
-
-export function toJsonValue(value: unknown): JsonValue {
-  return normalizeJsonSafe(value, { maxDepth: 32, maxCollectionEntries: 20_000, maxStringBytes: 2_000_000, maxTotalBytes: 4_000_000 }).value;
 }
 
 function requireType(value: JsonObject, key: string, expected: 'boolean' | 'string', issues: ToolObservationPresentationValidationIssue[]): void {

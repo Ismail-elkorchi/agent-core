@@ -140,31 +140,30 @@ test('session repositories scan once and incrementally preserve a cross-instance
   assert.ok(second.indexMetrics().incrementalRefreshes > 0);
 });
 
-test('session observations normalize hostile output and metadata before durable replay', async () => {
-  const rootDir = await mkdtemp(path.join(tmpdir(), 'agent-session-hostile-json-'));
-  const repository = new JsonlSessionRepository({ rootDir });
-  const session = await repository.create({ id: 'hostile-json', binding: TEST_SESSION_BINDING });
-  await repository.appendInput(session, { runId: 'run-hostile', task: 'persist hostile observation' });
-  let getterCalls = 0;
-  const output = Object.create(null);
-  Object.defineProperty(output, 'getter', { enumerable: true, get() { getterCalls += 1; throw new Error('must not run'); } });
-  Object.defineProperty(output, '__proto__', { enumerable: true, value: { retained: true } });
-  output.cycle = output;
-  const metadata = new Proxy({}, { ownKeys() { throw new Error('ownKeys denied'); } });
-  await repository.appendObservation(session, {
-    runId: 'run-hostile',
-    identity: { turnIndex: 1, turnId: 'turn-hostile', requestAttempt: 1 },
-    toolName: 'hostile_tool',
-    observation: { ok: true, summary: 'bounded', output, metadata }
-  });
-
-  const replay = await new JsonlSessionRepository({ rootDir }).loadReplayState(session);
-  const observation = replay.branch.find((entry) => entry.type === 'observation');
-  assert.equal(getterCalls, 0);
-  assert.equal(observation.output.getter, '[accessor omitted]');
-  assert.equal(observation.output.__proto__.retained, true);
-  assert.match(observation.output.cycle, /circular/u);
-  assert.deepEqual(observation.metadata, { value: '[value inspection failed]' });
+test('session observations reject non-JSON data and replay complete outputs and metadata', async () => {
+  const rootDir = await mkdtemp(path.join(tmpdir(), 'agent-session-exact-json-'));
+  for (const repository of [new InMemorySessionRepository(), new JsonlSessionRepository({ rootDir })]) {
+    const session = await repository.create({ id: 'exact-json', binding: TEST_SESSION_BINDING });
+    await repository.appendInput(session, { runId: 'run-exact', task: 'persist exact observation' });
+    let getterCalls = 0;
+    const accessor = Object.defineProperty({}, 'getter', { enumerable: true, get() { getterCalls++; return 'hidden'; } });
+    const cycle = {}; cycle.self = cycle;
+    const request = { runId: 'run-exact', identity: { turnIndex: 1, turnId: 'turn-exact', requestAttempt: 1 }, toolName: 'exact_tool' };
+    for (const output of [accessor, cycle, { count: 1n }]) {
+      await assert.rejects(repository.appendObservation(session, { ...request, observation: { ok: true, summary: 'invalid', output } }));
+    }
+    await assert.rejects(repository.appendObservation(session, { ...request, observation: { ok: true, summary: 'invalid metadata', metadata: accessor } }));
+    assert.equal(getterCalls, 0);
+    const output = { text: 'x'.repeat(100_000) + 'output end' };
+    const metadata = { text: 'y'.repeat(20_000) + 'metadata end' };
+    await repository.appendObservation(session, { ...request, observation: { ok: true, summary: 'complete', output, metadata } });
+    const reader = repository instanceof JsonlSessionRepository ? new JsonlSessionRepository({ rootDir }) : repository;
+    const replay = await reader.loadReplayState(session);
+    const observations = replay.branch.filter((entry) => entry.type === 'observation');
+    assert.equal(observations.length, 1);
+    assert.deepEqual(observations[0].output, output);
+    assert.deepEqual(observations[0].metadata, metadata);
+  }
 });
 
 test('session repositories retain and expose only owned session state', async () => {

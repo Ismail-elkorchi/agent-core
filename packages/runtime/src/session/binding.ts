@@ -1,5 +1,5 @@
 import { hashJson } from '@agent-core/persistence';
-import { normalizeJsonSafe, parseJsonObject, type JsonValue } from '@agent-core/json';
+import { parseJsonValue, parseJsonObject, type JsonValue } from '@agent-core/json';
 
 export interface SessionBindingInput {
   readonly schemaId: string;
@@ -26,7 +26,7 @@ export class SessionBindingMismatchError extends Error {
 export function createSessionBinding(input: SessionBindingInput): SessionBinding {
   const schemaId = sessionBindingSchemaId(input.schemaId);
   const schemaVersion = sessionBindingSchemaVersion(input.schemaVersion);
-  const subject = normalizeJsonSafe(input.subject).value;
+  const subject = parseJsonValue(input.subject);
   const canonical = Object.freeze({ schemaId, schemaVersion, subject });
   return Object.freeze({ ...canonical, bindingSha256: hashJson(canonical) });
 }

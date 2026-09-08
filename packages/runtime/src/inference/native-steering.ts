@@ -1,7 +1,6 @@
 import type { ModelProviderSession, ModelSteeringDelivery, ModelStreamEvent } from '@agent-core/model';
 import type { AgentAuditEvent, AgentEvent } from '../events.js';
 import { hashJson, type EventRepository } from '@agent-core/persistence';
-import { parseJsonObject } from '@agent-core/json';
 
 export class SteeringDeliveryUnknownError extends Error {
   constructor(readonly deliveryId: string) {
@@ -158,7 +157,7 @@ export class NativeSteeringCoordinator {
     }
     await this.options.append(
       { type: 'input.steering.delivery', delivery },
-      `steering:${delivery.deliveryId}:${hashJson(parseJsonObject(delivery))}`
+      `steering:${delivery.deliveryId}:${hashJson(delivery)}`
     );
     input.delivery = Object.freeze({ ...delivery });
   }

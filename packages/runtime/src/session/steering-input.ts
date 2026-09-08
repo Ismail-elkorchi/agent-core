@@ -33,7 +33,7 @@ export function sameSessionSteering(
   existing: SessionSteeringEntry,
   input: SteeringInput
 ): SessionSteeringEntry {
-  if (hashJson(parseJsonObject(ownSessionSteeringInput(existing))) !== hashJson(parseJsonObject(input)))
+  if (hashJson(ownSessionSteeringInput(existing)) !== hashJson(input))
     throw new PersistenceConflictError('Steering delivery identity has conflicting original input.');
   return existing;
 }

@@ -1,6 +1,7 @@
+import { canonicalJsonString } from '@agent-core/json';
 import { promises as fs } from 'node:fs';
 import type { JsonValue } from '@agent-core/json';
-import { canonicalJsonString } from './ledger.js';
+
 
 const SCAN_CHUNK_BYTES = 64 * 1024;
 

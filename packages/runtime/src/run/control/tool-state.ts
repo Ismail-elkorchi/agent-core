@@ -178,7 +178,7 @@ function decodeCallState(value: unknown, callIndex: number, callCount: number): 
       approval.fingerprint !== plan.fingerprint ||
       hashJson(approval.binding) !== hashJson(plan.binding) ||
       hashJson(approval.input) !== hashJson(plan.canonicalInput) ||
-      hashJson(parseJsonValue(approval.effects)) !== hashJson(parseJsonValue(plan.effects))
+      hashJson(approval.effects) !== hashJson(plan.effects)
     ) {
       throw new TypeError('Approval identity does not match its tool-call plan.');
     }

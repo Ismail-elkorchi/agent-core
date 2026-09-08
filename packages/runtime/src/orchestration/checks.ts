@@ -1,7 +1,7 @@
-import { validateArtifactRef, type ArtifactRef } from '@agent-core/persistence';
-import { normalizeJsonSafe } from '@agent-core/json';
+import { parseJsonObject } from '@agent-core/json';
+import { renderDiagnostic } from '@agent-core/json/diagnostics';
 import {
-  parseAgentCheckResult,
+  decodeOwnedAgentCheckResult,
   type AgentCheckContext,
   type AgentCheckDefinition,
   type AgentCheckDiagnostic,
@@ -27,14 +27,24 @@ export type {
 
 export class AgentVerificationAbortedError extends Error {
   constructor(readonly reasonValue: unknown) {
-    super(reasonValue instanceof Error ? reasonValue.message : typeof reasonValue === 'string' ? reasonValue : 'Verification aborted.');
+    super(
+      reasonValue instanceof Error
+        ? reasonValue.message
+        : typeof reasonValue === 'string'
+          ? reasonValue
+          : 'Verification aborted.'
+    );
     this.name = 'AgentVerificationAbortedError';
   }
 }
 
 export const EMPTY_OBSERVED_FACTS_READER: AgentObservedFactsReader = Object.freeze({
-  read() { return Promise.resolve({ items: [], bytes: 0, truncated: false }); },
-  readArtifact() { return Promise.reject(new Error('Artifact reading is unavailable for this verification run.')); }
+  read() {
+    return Promise.resolve({ items: [], bytes: 0, truncated: false });
+  },
+  readArtifact() {
+    return Promise.reject(new Error('Artifact reading is unavailable for this verification run.'));
+  }
 });
 
 export async function runAgentChecks(input: {
@@ -53,16 +63,27 @@ export async function runAgentChecks(input: {
   readonly append: (event: AgentAuditEvent) => Promise<unknown>;
   readonly emit: (event: AgentProgressEvent) => Promise<void>;
 }): Promise<readonly AgentCheckResult[]> {
-  const metadataValue = normalizeJsonSafe(input.metadata ?? {}).value;
-  const metadata = isRecord(metadataValue) ? metadataValue : {};
+  const metadata = parseJsonObject(input.metadata ?? {});
   const execution = input.execution ?? { observedFacts: EMPTY_OBSERVED_FACTS_READER };
   const results: AgentCheckResult[] = [];
   for (const check of input.checks) {
-    if (check.kind !== 'deterministic') throw new TypeError(`Effectful check ${check.id} requires the durable verification driver.`);
+    if (check.kind !== 'deterministic')
+      throw new TypeError(`Effectful check ${check.id} requires the durable verification driver.`);
     throwIfVerificationAborted(input.signal);
     const timeoutMs = check.timeoutMs ?? input.defaultTimeoutMs ?? 30_000;
-    const identity: AgentTurnIdentity = { turnIndex: input.turnIndex, turnId: input.turnId, requestAttempt: input.requestAttempt };
-    await input.append({ type: 'check.started', ...identity, check: check.id, implementationId: check.implementationId, requirement: check.requirement, timeoutMs });
+    const identity: AgentTurnIdentity = {
+      turnIndex: input.turnIndex,
+      turnId: input.turnId,
+      requestAttempt: input.requestAttempt
+    };
+    await input.append({
+      type: 'check.started',
+      ...identity,
+      check: check.id,
+      implementationId: check.implementationId,
+      requirement: check.requirement,
+      timeoutMs
+    });
     const result = await executeAgentCheckAction({
       check,
       timeoutMs,
@@ -98,7 +119,9 @@ export async function executeAgentCheckAction(input: {
   readonly action: (context: AgentCheckContext) => Promise<AgentCheckObservation>;
 }): Promise<AgentCheckResult> {
   const controller = new AbortController();
-  const forwardAbort = () => { controller.abort(input.parentSignal.reason); };
+  const forwardAbort = () => {
+    controller.abort(input.parentSignal.reason);
+  };
   if (input.parentSignal.aborted) forwardAbort();
   else input.parentSignal.addEventListener('abort', forwardAbort, { once: true });
   let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -115,71 +138,70 @@ export async function executeAgentCheckAction(input: {
       timeoutPromise
     ]);
     throwIfVerificationAborted(input.parentSignal);
-    return parseAgentCheckResult(normalizeObservation(input.check, observation), Math.max(0, performance.now() - startedAt));
+    const durationMs = Math.max(0, performance.now() - startedAt);
+    try {
+      const owned = parseJsonObject(observation);
+      return decodeOwnedAgentCheckResult(
+        {
+          ...owned,
+          id: input.check.id,
+          implementationId: input.check.implementationId,
+          requirement: input.check.requirement
+        },
+        durationMs
+      );
+    } catch (error) {
+      const message = renderDiagnostic(error).text;
+      return Object.freeze({
+        id: input.check.id,
+        implementationId: input.check.implementationId,
+        requirement: input.check.requirement,
+        verdict: 'unknown',
+        summary: 'Verifier returned an invalid result.',
+        diagnostic: Object.freeze({ kind: 'invalid_result', message }),
+        durationMs
+      });
+    }
   } catch (error) {
     throwIfVerificationAborted(input.parentSignal);
-    const details = safeDetails(error);
-    const diagnostic: AgentCheckDiagnostic = error instanceof CheckTimeoutError
-      ? { kind: 'timeout', message: error.message }
-      : { kind: diagnosticKind(error), message: errorMessage(error), ...(details === undefined ? {} : { details }) };
-    return parseAgentCheckResult({
+    const details = renderDiagnostic(error).text;
+    const diagnostic: AgentCheckDiagnostic =
+      error instanceof CheckTimeoutError
+        ? { kind: 'timeout', message: error.message }
+        : { kind: diagnosticKind(error), message: details, details };
+    return Object.freeze({
       id: input.check.id,
       implementationId: input.check.implementationId,
       requirement: input.check.requirement,
       verdict: 'unknown',
       summary: diagnostic.message,
-      diagnostic
-    }, Math.max(0, performance.now() - startedAt));
+      diagnostic: Object.freeze(diagnostic),
+      durationMs: Math.max(0, performance.now() - startedAt)
+    });
   } finally {
     if (timeout !== undefined) clearTimeout(timeout);
     input.parentSignal.removeEventListener('abort', forwardAbort);
   }
 }
 
-function normalizeObservation(check: AgentCheckDefinition, value: unknown): Omit<AgentCheckResult, 'durationMs'> {
-  if (!isRecord(value)) return invalidResult(check, 'Verifier returned no result object.');
-  if (value.verdict !== 'passed' && value.verdict !== 'failed' && value.verdict !== 'unknown') return invalidResult(check, 'Verifier returned an unsupported verdict.');
-  if (typeof value.summary !== 'string' || value.summary.trim().length === 0) return invalidResult(check, 'Verifier returned a malformed summary.');
-  if (value.artifacts !== undefined && !validArtifacts(value.artifacts)) return invalidResult(check, 'Verifier returned malformed artifacts.');
-  const diagnostic = normalizeDiagnostic(value.diagnostic);
-  if (value.diagnostic !== undefined && diagnostic === undefined) return invalidResult(check, 'Verifier returned a malformed diagnostic.');
-  const normalized = value.output === undefined ? undefined : normalizeJsonSafe(value.output);
-  return {
-    id: check.id,
-    implementationId: check.implementationId,
-    requirement: check.requirement,
-    verdict: value.verdict,
-    summary: value.summary.trim(),
-    ...(normalized ? { output: normalized.value, ...(normalized.diagnostics.length > 0 ? { outputNormalization: normalized.diagnostics } : {}) } : {}),
-    ...(validArtifacts(value.artifacts) ? { artifacts: Object.freeze(value.artifacts.map((artifact) => Object.freeze({ ...artifact }))) } : {}),
-    ...(diagnostic ? { diagnostic } : {})
-  };
+function throwIfVerificationAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw new AgentVerificationAbortedError(signal.reason);
 }
-
-function invalidResult(check: AgentCheckDefinition, message: string): Omit<AgentCheckResult, 'durationMs'> {
-  return { id: check.id, implementationId: check.implementationId, requirement: check.requirement, verdict: 'unknown', summary: message, diagnostic: { kind: 'invalid_result', message } };
-}
-
-function normalizeDiagnostic(value: unknown): AgentCheckDiagnostic | undefined {
-  if (value === undefined) return undefined;
-  if (!isRecord(value) || !isDiagnosticKind(value.kind) || typeof value.message !== 'string' || value.message.trim().length === 0) return undefined;
-  const details = value.details === undefined ? undefined : normalizeJsonSafe(value.details).value;
-  return { kind: value.kind, message: value.message.trim(), ...(details === undefined ? {} : { details }) };
-}
-
-function validArtifact(value: unknown): value is ArtifactRef { try { validateArtifactRef(value); return true; } catch { return false; } }
-function validArtifacts(value: unknown): value is readonly ArtifactRef[] { return Array.isArray(value) && value.every(validArtifact); }
-function isDiagnosticKind(value: unknown): value is AgentCheckDiagnostic['kind'] { return value === 'exception' || value === 'timeout' || value === 'unavailable' || value === 'permission_denied' || value === 'aborted' || value === 'invalid_result'; }
-function throwIfVerificationAborted(signal: AbortSignal): void { if (signal.aborted) throw new AgentVerificationAbortedError(signal.reason); }
 function diagnosticKind(error: unknown): AgentCheckDiagnostic['kind'] {
-  if (isRecord(error) && error.code === 'EACCES') return 'permission_denied';
-  if (isRecord(error) && (error.code === 'ENOENT' || error.code === 'ENOTSUP')) return 'unavailable';
+  if (typeof error !== 'object' || error === null) return 'exception';
+  try {
+    const code: unknown = Object.getOwnPropertyDescriptor(error, 'code')?.value;
+    if (code === 'EACCES') return 'permission_denied';
+    if (code === 'ENOENT' || code === 'ENOTSUP') return 'unavailable';
+  } catch {
+    /* Uninspectable exceptions still have a bounded diagnostic. */
+  }
   return 'exception';
 }
-function safeDetails(error: unknown) { return normalizeJsonSafe(error).value ?? undefined; }
-function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
-function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 
 class CheckTimeoutError extends Error {
-  constructor(timeoutMs: number) { super(`Verifier timed out after ${String(timeoutMs)}ms.`); this.name = 'CheckTimeoutError'; }
+  constructor(timeoutMs: number) {
+    super(`Verifier timed out after ${String(timeoutMs)}ms.`);
+    this.name = 'CheckTimeoutError';
+  }
 }

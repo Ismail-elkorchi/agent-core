@@ -1,3 +1,4 @@
+import { captureObservationInput } from './observation.js';
 import { ownSessionSteeringInput, sameSessionSteering } from './steering-input.js';
 import { historyEventSourceSchema } from '../history/schema.js';
 import { ownSessionAssistantOutput } from './assistant-output.js';
@@ -14,7 +15,7 @@ import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { hashJson, type ArtifactRef, validateArtifactRef } from '@agent-core/persistence';
-import { normalizeJsonSafe, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
+import { parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import {
   PersistenceConflictError,
   PersistenceCorruptionError,
@@ -337,11 +338,11 @@ export class JsonlSessionRepository implements SessionRepository {
           if (
             existing.turnIndex !== input.identity.turnIndex ||
             existing.content !== input.content ||
-            hashJson(parseJsonValue(existing.output ?? null)) !==
-              hashJson(parseJsonValue(input.output ?? null)) ||
+            hashJson(existing.output ?? null) !==
+              hashJson(input.output ?? null) ||
             existing.completeness !== input.completeness ||
-            hashJson(parseJsonValue(existing.source ?? null)) !==
-              hashJson(parseJsonValue(input.source ?? null))
+            hashJson(existing.source ?? null) !==
+              hashJson(input.source ?? null)
           )
             throw new PersistenceConflictError(
               `Conflicting assistant finalization for ${input.runId}/${input.identity.turnId}/${String(input.identity.requestAttempt)}.`
@@ -428,7 +429,7 @@ export class JsonlSessionRepository implements SessionRepository {
       withPersistenceFileLock(this.filePath(sessionId), this.lockTimeoutMs, this.staleLockMs, async () => {
         const state = await this.refreshIndex(sessionId, true);
         assertDescriptor(session, state);
-        const normalized = normalizedObservationInput(input);
+        const normalized = captureObservationInput(input);
         const key = sessionObservationKey(normalized);
         const existing = key
           ? state.branchEntries.find(
@@ -1003,45 +1004,6 @@ function assertDescriptor(session: SessionDescriptor, state: SessionFileState): 
 }
 function recordBytes(record: unknown): number {
   return Buffer.byteLength(`${JSON.stringify(record)}\n`, 'utf8');
-}
-function normalizedObservationInput(input: {
-  runId: string;
-  identity: AgentTurnIdentity &
-    Partial<Pick<AgentToolCallAttemptIdentity, 'toolBatchId' | 'callIndex' | 'callId' | 'toolAttempt'>>;
-  toolName: string;
-  observation: SessionObservationInput;
-}): Omit<SessionObservationEntry, keyof BaseSessionEntry | 'type'> {
-  const artifacts = input.observation.artifacts?.map((artifact) => {
-    validateArtifactRef(artifact);
-    return Object.freeze({ ...artifact });
-  });
-  return {
-    runId: input.runId,
-    ...input.identity,
-    toolName: input.toolName,
-    ok: input.observation.ok,
-    summary: input.observation.summary,
-    ...(input.observation.output === undefined
-      ? {}
-      : { output: normalizeObservationOutput(input.observation.output) }),
-    ...(artifacts && artifacts.length > 0 ? { artifacts: Object.freeze(artifacts) } : {}),
-    ...(input.observation.metadata ? { metadata: normalizeMetadata(input.observation.metadata) } : {})
-  };
-}
-function normalizeObservationOutput(value: unknown): JsonValue {
-  return normalizeJsonSafe(value, {
-    maxDepth: 16,
-    maxCollectionEntries: 20_000,
-    maxStringBytes: 1024 * 1024,
-    maxTotalBytes: 4 * 1024 * 1024
-  }).value;
-}
-function normalizeMetadata(value: unknown): JsonObject {
-  const normalized = normalizeJsonSafe(value).value;
-  return isOwnedJsonObject(normalized) ? normalized : Object.freeze({ value: normalized });
-}
-function isOwnedJsonObject(value: JsonValue): value is JsonObject {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 function validArtifactRefs(value: unknown): value is readonly ArtifactRef[] | undefined {
   if (value === undefined) return true;

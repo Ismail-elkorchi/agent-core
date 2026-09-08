@@ -45,7 +45,7 @@ export class HistoryReader {
       if (!this.lexicalIndex.add(`${source.entryId}:${source.sha256}`, publicText(entry))) break;
       indexed++;
     }
-    if (indexed === view.entries.length) this.indexedCutFingerprint = hashJson(parseJsonObject(view.cut));
+    if (indexed === view.entries.length) this.indexedCutFingerprint = hashJson(view.cut);
     return Object.freeze({
       ...this.lexicalIndex.inspect(),
       cut: view.cut,
@@ -167,7 +167,7 @@ export class HistoryReader {
     const maxScanned = bound(request.maxScanned, MAX_SCANNED, MAX_SCANNED, 'maxScanned');
     if ((request.query?.length ?? 0) > 4096) throw new Error('History query exceeds 4096 characters.');
     const queryFingerprint = hashJson(
-      parseJsonObject({ query: request.query ?? '', filter: request.filter ?? {} })
+      { query: request.query ?? '', filter: request.filter ?? {} }
     );
     const cursor = request.cursor ? decodeCursor(request.cursor) : undefined;
     if (cursor && cursor.queryFingerprint !== queryFingerprint)
@@ -175,7 +175,7 @@ export class HistoryReader {
     if (
       cursor &&
       request.cut &&
-      hashJson(parseJsonObject(cursor.cut)) !== hashJson(parseJsonObject(request.cut))
+      hashJson(cursor.cut) !== hashJson(request.cut)
     )
       throw new Error('History cursor source cut mismatch.');
     const view = await this.view(cursor?.cut ?? request.cut);
@@ -240,7 +240,7 @@ export class HistoryReader {
       index: Object.freeze({
         ...this.lexicalIndex.inspect(),
         coverage:
-          this.indexedCutFingerprint === hashJson(parseJsonObject(view.cut))
+          this.indexedCutFingerprint === hashJson(view.cut)
             ? ('complete' as const)
             : ('partial' as const)
       }),
@@ -419,7 +419,7 @@ function decodeCursor(value: string): SearchCursor {
 }
 
 export function sameHistorySource(left: HistorySourceRef, right: HistorySourceRef): boolean {
-  return hashJson(parseJsonObject(left)) === hashJson(parseJsonObject(right));
+  return hashJson(left) === hashJson(right);
 }
 
 interface ViewPositions {

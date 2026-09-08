@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { normalizeJsonSafe } from '@agent-core/json';
+import { canonicalJsonString } from '@agent-core/json';
 import {
   ArtifactIntegrityError,
   artifactExtension,
@@ -81,10 +81,9 @@ export class LocalArtifactRepository implements ArtifactRepository {
   }
 
   storeJson(label: string, value: unknown, description?: string): Promise<PublicArtifactRef> {
-    const normalized = normalizeJsonSafe(value);
     return this.store({
       label,
-      content: new TextEncoder().encode(`${JSON.stringify(normalized.value, null, 2)}\n`),
+      content: new TextEncoder().encode(`${canonicalJsonString(value)}\n`),
       mediaType: 'application/json; charset=utf-8',
       ...(description ? { description } : {})
     });

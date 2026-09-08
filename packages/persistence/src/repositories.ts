@@ -1,9 +1,10 @@
+import { canonicalJsonString } from '@agent-core/json';
 import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
 import type { EventActor, EventAppendReceipt, EventEnvelope, LedgerIntegrityReport, TypedEvent } from './ledger.js';
-import { hashJson, canonicalJsonString } from './ledger.js';
+import { hashJson } from './ledger.js';
 import {
   PersistenceConflictError,
   PersistenceCorruptionError,

@@ -1,7 +1,8 @@
+import { canonicalJsonString } from '@agent-core/json';
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { isOwnedJsonValue, normalizeJsonSafe, parseJsonValue } from '@agent-core/json';
-import { canonicalJsonString, hashJson } from '@agent-core/persistence';
+import { isOwnedJsonValue, parseJsonValue } from '@agent-core/json';
+import { hashJson } from '@agent-core/persistence';
 
 test('owned JSON can be reused while fresh mutable input still crosses the ownership boundary', () => {
   const input = { nested: { value: 'before' } };
@@ -63,9 +64,9 @@ test('canonical reuse cannot be forged by freezing a mutable object or an access
   assert.equal(accessed, 0);
 });
 
-test('normalized snapshots remain immutable and canonical identities are locale independent', () => {
+test('captured snapshots remain immutable and canonical identities are locale independent', () => {
   const source = { z: [{ value: 1 }], 'é': 'accent', a: 'first' };
-  const normalized = normalizeJsonSafe(source).value;
+  const normalized = parseJsonValue(source);
   assert.equal(isOwnedJsonValue(normalized), true);
   const before = canonicalJsonString(normalized);
   source.z[0].value = 2;

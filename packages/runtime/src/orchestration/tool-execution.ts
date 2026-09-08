@@ -1,4 +1,3 @@
-import { parseJsonValue } from '@agent-core/json';
 import { hashJson } from '@agent-core/persistence';
 import { issueEffectStartTicket, startExternalEffect } from '@agent-core/effects';
 import {
@@ -272,8 +271,8 @@ async function planAndAuthorizeCall(
     ready.approved?.approval.fingerprint === callPlan.fingerprint &&
     ready.approved.approval.policyHash === hashJson(input.toolContext.policy) &&
     hashJson(ready.approved.approval.binding) === hashJson(approvalBinding(callPlan, input.toolContext)) &&
-    hashJson(parseJsonValue(ready.approved.approval.effects)) ===
-      hashJson(parseJsonValue(callPlan.effects)) &&
+    hashJson(ready.approved.approval.effects) ===
+      hashJson(callPlan.effects) &&
     hashJson(ready.approved.approval.input) === hashJson(callPlan.canonicalSnapshot)
       ? ready.approved
       : undefined;

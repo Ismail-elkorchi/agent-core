@@ -32,7 +32,7 @@ import {
   type ProviderAuth,
   StaticBearerTokenProvider
 } from '@agent-core/auth';
-import { normalizeJsonSafe, parseJsonObject, type JsonObject } from '@agent-core/json';
+import { parseJsonValue, parseJsonObject, type JsonObject } from '@agent-core/json';
 import {
   type ModelCapabilities,
   ModelContractError,
@@ -647,7 +647,7 @@ export class OpenAIProvider implements ModelProvider {
             type: 'content',
             content: contentDelta,
             accumulated: content,
-            raw: normalizeJsonSafe(part).value
+            raw: parseJsonValue(part)
           };
           continue;
         }
@@ -661,7 +661,7 @@ export class OpenAIProvider implements ModelProvider {
               reasoning: contentDelta,
               accumulatedReasoning: reasoningSummary,
               channel: 'summary',
-              raw: normalizeJsonSafe(part).value
+              raw: parseJsonValue(part)
             };
           } else {
             reasoning += contentDelta;
@@ -670,7 +670,7 @@ export class OpenAIProvider implements ModelProvider {
               reasoning: contentDelta,
               accumulatedReasoning: reasoning,
               channel: 'reasoning',
-              raw: normalizeJsonSafe(part).value
+              raw: parseJsonValue(part)
             };
           }
           continue;
@@ -680,7 +680,7 @@ export class OpenAIProvider implements ModelProvider {
         if (eventType === 'response.output_item.done' && toolCall) {
           const deduped = addUniqueToolCall(toolCalls, toolCall);
           if (deduped) {
-            yield { type: 'tool_call', toolCall, raw: normalizeJsonSafe(part).value };
+            yield { type: 'tool_call', toolCall, raw: parseJsonValue(part) };
           }
           continue;
         }
@@ -688,14 +688,14 @@ export class OpenAIProvider implements ModelProvider {
         for (const streamedToolCall of mergeStreamingFunctionCallParts(accumulators, part)) {
           const deduped = addUniqueToolCall(toolCalls, streamedToolCall);
           if (deduped) {
-            yield { type: 'tool_call', toolCall: streamedToolCall, raw: normalizeJsonSafe(part).value };
+            yield { type: 'tool_call', toolCall: streamedToolCall, raw: parseJsonValue(part) };
           }
         }
 
         for (const streamedToolCall of mergeStreamingCustomToolCallParts(customAccumulators, part)) {
           const deduped = addUniqueToolCall(toolCalls, streamedToolCall);
           if (deduped) {
-            yield { type: 'tool_call', toolCall: streamedToolCall, raw: normalizeJsonSafe(part).value };
+            yield { type: 'tool_call', toolCall: streamedToolCall, raw: parseJsonValue(part) };
           }
         }
       }
@@ -1171,7 +1171,7 @@ async function toModelResponse(
     ...(usage ? { usage } : {}),
     ...(reasoningSummary ? { reasoningSummary } : {}),
     ...(toolCalls.length > 0 ? { toolCalls } : {}),
-    raw: normalizeJsonSafe(payload).value,
+    raw: parseJsonValue(payload),
     transport: responseTransport(provider, payload.id)
   });
 }

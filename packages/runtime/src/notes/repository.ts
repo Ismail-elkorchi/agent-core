@@ -202,7 +202,7 @@ export class EventNoteRepository implements NoteRepository {
       parentWatermark,
       inherited
     });
-    await this.append(scope.sessionId, state, event, `fork:${hashJson(parseJsonObject(scope))}`);
+    await this.append(scope.sessionId, state, event, `fork:${hashJson(scope)}`);
   }
 
   async read(input: NoteReadRequest): Promise<NoteReadResult> {
@@ -259,7 +259,7 @@ export class EventNoteRepository implements NoteRepository {
     );
     if ((input.query?.length ?? 0) > 4096) throw new Error('Note query exceeds 4096 characters.');
     const state = await this.state(scope.sessionId);
-    const fingerprint = hashJson(parseJsonObject({ scope, query: input.query ?? '', search }));
+    const fingerprint = hashJson({ scope, query: input.query ?? '', search });
     const cursor = input.cursor ? decodeCursor(input.cursor, fingerprint, state.tail.sequence) : undefined;
     const watermark = cursor?.watermark ?? state.tail.sequence;
     const notes = [...visible(state.events.slice(0, watermark + 1), scope).values()]
@@ -331,9 +331,9 @@ export class EventNoteRepository implements NoteRepository {
     identifier(input.invocationId, 'invocationId');
     if (input.expectedRevision !== null) identifier(input.expectedRevision, 'expectedRevision');
     const owned = parseJsonObject(input, NOTE_LIMITS);
-    const fingerprint = hashJson(parseJsonObject({ remove, input: owned }));
+    const fingerprint = hashJson({ remove, input: owned });
     const key = hashJson(
-      parseJsonObject({ scope, invocationId: input.invocationId, idempotencyKey: input.idempotencyKey })
+      { scope, invocationId: input.invocationId, idempotencyKey: input.idempotencyKey }
     );
     let state = await this.state(scope.sessionId);
     const retry = state.events.find(
@@ -402,7 +402,7 @@ export class EventNoteRepository implements NoteRepository {
         createdAt: new Date().toISOString()
       });
       try {
-        await this.append(scope.sessionId, state, reservation, `reserve:${hashJson(parseJsonValue(key))}`);
+        await this.append(scope.sessionId, state, reservation, `reserve:${hashJson(key)}`);
       } catch (error) {
         if (!(error instanceof PersistenceConflictError)) throw error;
         const refreshed = await this.state(scope.sessionId);
@@ -474,7 +474,7 @@ export class EventNoteRepository implements NoteRepository {
       fingerprint
     });
     try {
-      await this.append(scope.sessionId, state, event, `write:${hashJson(parseJsonValue(key))}`);
+      await this.append(scope.sessionId, state, event, `write:${hashJson(key)}`);
     } catch (error) {
       if (!(error instanceof PersistenceConflictError)) throw error;
       const refreshed = await this.state(scope.sessionId);
@@ -566,7 +566,7 @@ function scopeKey(scope: NoteScope): string {
   return JSON.stringify([scope.sessionId, scope.branchId]);
 }
 function streamId(sessionId: string): string {
-  return `notes:${hashJson(parseJsonValue(sessionId))}`;
+  return `notes:${hashJson(sessionId)}`;
 }
 function identifier(value: unknown, name: string): asserts value is string {
   if (typeof value !== 'string' || value.length === 0 || value.length > 512 || hasControlCharacter(value))
@@ -661,7 +661,7 @@ function validateNoteStream(events: readonly NoteEvent[], sessionId: string): vo
       )
         throw new Error('Invalid note branch source cut.');
       const inherited = [...visible(events.slice(0, event.parentWatermark + 1), event.parentScope).values()];
-      if (hashJson(parseJsonValue(inherited)) !== hashJson(parseJsonValue(event.inherited)))
+      if (hashJson(inherited) !== hashJson(event.inherited))
         throw new Error('Note branch inheritance does not match its pinned parent revisions.');
       branches.set(
         scopeKey(event.scope),

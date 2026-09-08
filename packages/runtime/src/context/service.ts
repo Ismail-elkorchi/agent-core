@@ -101,7 +101,7 @@ export class ContextService {
       throw new Error(
         'Context provider state must come from governed host validation, not the transition request.'
       );
-    const fingerprint = hashJson(parseJsonObject(request));
+    const fingerprint = hashJson(request);
     const view = await this.history.view();
     const previous = view.entries.find(
       (entry): entry is SessionContextTransitionEntry =>
@@ -267,7 +267,7 @@ export class ContextService {
         previousWindowId: request.expectedWindowId,
         windowId,
         requestFingerprint: fingerprint,
-        selectionFingerprint: hashJson(parseJsonObject(selection)),
+        selectionFingerprint: hashJson(selection),
         ...(request.expectedSourceRevision === undefined
           ? {}
           : { requestedSourceRevision: request.expectedSourceRevision }),

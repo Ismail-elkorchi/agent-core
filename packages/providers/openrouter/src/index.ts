@@ -31,7 +31,7 @@ import {
   parseModelRequest,
   parseModelResponse
 } from '@agent-core/model';
-import { normalizeJsonSafe, parseJsonObject, type JsonObject } from '@agent-core/json';
+import { parseJsonValue, parseJsonObject, type JsonObject } from '@agent-core/json';
 import {
   readBoundedJsonResponse,
   readBoundedResponseText,
@@ -287,7 +287,7 @@ export class OpenRouterProvider implements ModelProvider {
             type: 'content',
             content: contentDelta,
             accumulated: content,
-            raw: normalizeJsonSafe(part).value
+            raw: parseJsonValue(part)
           };
         }
 
@@ -298,7 +298,7 @@ export class OpenRouterProvider implements ModelProvider {
             type: 'reasoning',
             reasoning: reasoningDelta,
             accumulatedReasoning: reasoning,
-            raw: normalizeJsonSafe(part).value
+            raw: parseJsonValue(part)
           };
         }
 
@@ -306,7 +306,7 @@ export class OpenRouterProvider implements ModelProvider {
           const key = JSON.stringify(toolCall);
           if (!toolCalls.some((existing) => JSON.stringify(existing) === key)) {
             toolCalls.push(toolCall);
-            yield { type: 'tool_call', toolCall, raw: normalizeJsonSafe(part).value };
+            yield { type: 'tool_call', toolCall, raw: parseJsonValue(part) };
           }
         }
       }
@@ -350,7 +350,7 @@ export class OpenRouterProvider implements ModelProvider {
           ...(usage ? { usage } : {}),
           ...(reasoning ? { reasoning } : {}),
           ...(responseToolCalls.length > 0 ? { toolCalls: responseToolCalls } : {}),
-          ...(lastRaw === undefined ? {} : { raw: normalizeJsonSafe(lastRaw).value })
+          ...(lastRaw === undefined ? {} : { raw: parseJsonValue(lastRaw) })
         })
       };
     } catch (error) {
@@ -746,7 +746,7 @@ async function toModelResponse(
     ...(usage ? { usage } : {}),
     ...(reasoning ? { reasoning } : {}),
     ...(toolCalls.length > 0 ? { toolCalls } : {}),
-    raw: normalizeJsonSafe(payload).value
+    raw: parseJsonValue(payload)
   });
 }
 

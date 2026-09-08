@@ -273,7 +273,7 @@ test('a live writer lock is not stolen after its stale interval', async () => {
 test('artifact JSON media type, concurrent atomic writes, confinement, and SHA verification work', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'agent-artifacts-'));
   const repository = new LocalArtifactRepository({ rootDir: dir });
-  const refs = await Promise.all(Array.from({ length: 12 }, () => repository.storeJson('same', { value: 1n })));
+  const refs = await Promise.all(Array.from({ length: 12 }, () => repository.storeJson('same', { value: '1n' })));
   assert.equal(new Set(refs.map(ref => ref.artifactId)).size, 1);
   assert.equal(refs[0].mediaType, 'application/json; charset=utf-8');
   assert.match(new TextDecoder().decode(await repository.readVerified(refs[0])), /"1n"/);
@@ -282,25 +282,21 @@ test('artifact JSON media type, concurrent atomic writes, confinement, and SHA v
   await assert.rejects(repository.readVerified(refs[0]), ArtifactIntegrityError);
 });
 
-test('artifact JSON persistence bounds hostile values without invoking accessors', async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), 'agent-artifacts-hostile-json-'));
+test('artifact JSON rejects unsupported data and preserves complete valid values', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'agent-artifacts-exact-json-'));
   const repository = new LocalArtifactRepository({ rootDir: dir });
   let getterCalls = 0;
-  const value = Object.create(null);
-  Object.defineProperty(value, 'getter', { enumerable: true, get() { getterCalls += 1; throw new Error('must not run'); } });
-  Object.defineProperty(value, '__proto__', { enumerable: true, value: { retained: true } });
-  value.cycle = value;
-  value.invalidDate = new Date(Number.NaN);
-  value.big = 7n;
-
-  const ref = await repository.storeJson('hostile', value);
-  const persisted = JSON.parse(new TextDecoder().decode(await repository.readVerified(ref)));
+  const accessor = Object.defineProperty({}, 'getter', { enumerable: true, get() { getterCalls++; return 'hidden'; } });
+  const cycle = {}; cycle.self = cycle;
+  for (const value of [accessor, cycle, new Date(), { bigint: 7n }, { missing: undefined }]) {
+    assert.throws(() => repository.storeJson('invalid', value), TypeError);
+  }
   assert.equal(getterCalls, 0);
-  assert.equal(ref.mediaType, 'application/json; charset=utf-8');
-  assert.equal(Object.hasOwn(persisted, '__proto__'), true);
-  assert.equal(persisted.__proto__.retained, true);
-  assert.equal(persisted.getter, '[accessor omitted]');
-  assert.equal(persisted.invalidDate, '[invalid date]');
-  assert.match(persisted.cycle, /circular/u);
-  assert.equal(persisted.big, '7n');
+  const value = JSON.parse('{"__proto__":{"retained":true}}');
+  value.text = 'x'.repeat(100_000) + 'complete';
+  const ref = await repository.storeJson('exact', value);
+  const persisted = JSON.parse(new TextDecoder().decode(await repository.readVerified(ref)));
+  assert.deepEqual(persisted, value);
+  const different = await repository.storeJson('exact', { ...value, text: value.text + '!' });
+  assert.notEqual(different.sha256, ref.sha256);
 });

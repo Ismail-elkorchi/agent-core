@@ -451,8 +451,8 @@ export class InferenceService {
         `Inference ${identity.invocationId} was already admitted with different input or configuration.`
       );
     if (
-      hashJson(parseJsonObject(existing.start.limits)) !==
-      hashJson(parseJsonObject(this.options.budget ?? {}))
+      hashJson(existing.start.limits) !==
+      hashJson(this.options.budget ?? {})
     )
       throw new Error('Inference owner budget policy changed after admission.');
     if (input.profile) {
@@ -783,10 +783,10 @@ function assertBudget(state: InferenceOwnerState, next: InferenceReservation, li
   let prompt = next.promptTokens;
   let completion = next.completionTokens;
   let knownCost = next.cost.currency === limits.maxKnownCost?.currency ? (next.cost.amount ?? 0) : 0;
-  const policy = hashJson(parseJsonObject(limits));
+  const policy = hashJson(limits);
   let invocations = 1;
   for (const item of state.invocations.values()) {
-    if (hashJson(parseJsonObject(item.start.limits)) !== policy)
+    if (hashJson(item.start.limits) !== policy)
       throw new Error('Inference owner budget policy changed after admission.');
     if (item.notSent) continue;
     invocations++;

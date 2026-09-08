@@ -1,5 +1,4 @@
 import { hashJson, type EventRepository } from '@agent-core/persistence';
-import { parseJsonObject } from '@agent-core/json';
 import type { AgentAuditEvent, AgentEvent } from '../events.js';
 import { contextTransitionRequestSchema } from '../context/schema.js';
 import type { ContextTransitionRequest } from '../context/contracts.js';
@@ -45,7 +44,7 @@ export class RunContextTransitions {
     const action = this.writes.then(async () => {
       const prior = this.requests.get(requestId);
       if (prior) {
-        if (hashJson(parseJsonObject(prior.requested)) !== hashJson(parseJsonObject(request)))
+        if (hashJson(prior.requested) !== hashJson(request))
           throw new Error('Context transition request identity has conflicting content.');
         return;
       }

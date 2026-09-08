@@ -6,7 +6,7 @@ import {
   type ModelToolCall,
   type ModelUsage
 } from '@agent-core/model';
-import { normalizeJsonSafe, parseJsonObject, type JsonObject } from '@agent-core/json';
+import { parseJsonValue, parseJsonObject, type JsonObject } from '@agent-core/json';
 import type {
   ResponsesContentPart,
   ResponsesErrorBody,
@@ -103,7 +103,7 @@ export async function toModelResponse(
     ...(usage ? { usage } : {}),
     ...(reasoningSummary ? { reasoningSummary } : {}),
     ...(toolCalls.length > 0 ? { toolCalls } : {}),
-    raw: normalizeJsonSafe(payload).value,
+    raw: parseJsonValue(payload),
     transport: responseTransport(provider, transport.strategy, payload.id, transport)
   });
 }

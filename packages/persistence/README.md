@@ -1,6 +1,6 @@
 # `@agent-core/persistence`
 
-Hash-chain contracts, bounded JSON-safe normalization, redaction, artifacts, and pathless in-memory repositories. Import `@agent-core/persistence/node` for local JSONL and filesystem implementations. Tool observations and observed-fact contracts belong to `@agent-core/tools`.
+Hash-chain contracts, exact JSON hashing, redaction, artifacts, and pathless in-memory repositories. JSON encoding and ownership belong to `@agent-core/json`; diagnostic text belongs to its `/diagnostics` subpath. Import `@agent-core/persistence/node` for local JSONL and filesystem implementations. Tool observations and observed-fact contracts belong to `@agent-core/tools`.
 
 The event repository exposes two different operations:
 

@@ -15,7 +15,6 @@ import {
   type CompiledModelRequest
 } from '@agent-core/model';
 import { hashJson, type ArtifactRepository, type EventAppendReceipt } from '@agent-core/persistence';
-import { normalizeJsonSafe } from '@agent-core/json';
 import {
   UNKNOWN_EFFECT_RECOVERY,
   decodeEffectRecoveryCapability,
@@ -252,7 +251,7 @@ export function createRunInferenceLifecycle(input: RunInferenceInput): {
         throw new Error(`Provider effect ${effectId} completed outside its durable start state.`);
       const effectSettlement = settleExternalEffect(pending.effect, pending.effect.settlementPermit, {
         outcome: 'succeeded',
-        resultDigest: hashJson(normalizeJsonSafe(settlementEvent).value),
+        resultDigest: hashJson(settlementEvent),
         exposure: response.usage
           ? knownEffectExposure(providerUsageQuantities(response.usage))
           : unknownEffectExposure(pending.effect.intent.exposure)

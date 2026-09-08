@@ -1,9 +1,8 @@
 import type { ArtifactRef } from '@agent-core/persistence';
-import { canonicalJsonString } from '@agent-core/persistence';
 import {
+  canonicalJsonString,
   parseJsonObject,
   parseJsonValue,
-  type JsonNormalizationDiagnostic,
   type JsonObject,
   type JsonValue
 } from '@agent-core/json';
@@ -130,7 +129,12 @@ export type AgentEffectiveInstruction = Readonly<{
 }>;
 
 export type AgentCheckDiagnosticKind =
-  'exception' | 'timeout' | 'unavailable' | 'permission_denied' | 'aborted' | 'invalid_result';
+  | 'exception'
+  | 'timeout'
+  | 'unavailable'
+  | 'permission_denied'
+  | 'aborted'
+  | 'invalid_result';
 export type AgentCheckDiagnostic = Readonly<{
   readonly kind: AgentCheckDiagnosticKind;
   readonly message: string;
@@ -151,7 +155,6 @@ export type AgentCheckResult = Readonly<{
   readonly summary: string;
   readonly durationMs: number;
   readonly output?: JsonValue;
-  readonly outputNormalization?: readonly JsonNormalizationDiagnostic[];
   readonly artifacts?: readonly ArtifactRef[];
   readonly diagnostic?: AgentCheckDiagnostic;
 }>;
@@ -400,7 +403,10 @@ export interface LogicalModelRequestRecord extends AgentTurnIdentity {
 }
 
 export type AgentCompletedTerminationReason =
-  'model_completed' | 'model_output_limit' | 'content_filtered' | 'unknown_model_termination';
+  | 'model_completed'
+  | 'model_output_limit'
+  | 'content_filtered'
+  | 'unknown_model_termination';
 export type AgentFailureTerminationReason =
   | Exclude<AgentCompletedTerminationReason, 'model_completed'>
   | 'empty_response'
@@ -452,7 +458,9 @@ export type AgentAbortedTerminalSnapshot = AgentTerminalBase &
     readonly errorMessage: string;
   }>;
 export type AgentTerminalSnapshot =
-  AgentCompletedTerminalSnapshot | AgentFailedTerminalSnapshot | AgentAbortedTerminalSnapshot;
+  | AgentCompletedTerminalSnapshot
+  | AgentFailedTerminalSnapshot
+  | AgentAbortedTerminalSnapshot;
 export interface AgentDeliveryDiagnostic {
   readonly eventType: string;
   readonly message: string;
@@ -589,6 +597,20 @@ export function decodeOwnedAgentCheckResult(
   measuredDurationMs?: number
 ): AgentCheckResult {
   const issues: string[] = [];
+  const fields = [
+    'id',
+    'implementationId',
+    'requirement',
+    'verdict',
+    'summary',
+    'durationMs',
+    'output',
+    'artifacts',
+    'diagnostic'
+  ];
+  for (const key of Object.keys(object)) {
+    if (!fields.includes(key)) issues.push(`Unsupported check result field: ${key}.`);
+  }
   const id = typeof object.id === 'string' && object.id.trim().length > 0 ? object.id : undefined;
   const implementationId =
     typeof object.implementationId === 'string' && validIdentity(object.implementationId)
@@ -623,12 +645,6 @@ export function decodeOwnedAgentCheckResult(
         ? object.diagnostic
         : undefined;
   if (object.diagnostic !== undefined && !diagnostic) issues.push('diagnostic is invalid.');
-  const outputNormalization =
-    object.outputNormalization === undefined
-      ? undefined
-      : decodeNormalizationDiagnostics(object.outputNormalization);
-  if (object.outputNormalization !== undefined && !outputNormalization)
-    issues.push('outputNormalization is invalid.');
   if (issues.length > 0) throw contract('Invalid check result.', issues);
   if (!id || !implementationId || !requirement || !verdict || !summary || durationMs === undefined)
     throw contract('Invalid check result.', issues);
@@ -640,7 +656,6 @@ export function decodeOwnedAgentCheckResult(
     summary,
     durationMs,
     ...(object.output !== undefined ? { output: object.output } : {}),
-    ...(outputNormalization ? { outputNormalization } : {}),
     ...(artifacts ? { artifacts } : {}),
     ...(diagnostic ? { diagnostic } : {})
   });
@@ -952,45 +967,6 @@ function isCheckDiagnostic(value: unknown): value is AgentCheckDiagnostic {
     typeof value.message === 'string'
   );
 }
-function decodeNormalizationDiagnostics(
-  value: JsonValue
-): readonly JsonNormalizationDiagnostic[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const diagnostics: JsonNormalizationDiagnostic[] = [];
-  for (const item of value) {
-    if (
-      !isRecord(item) ||
-      !NORMALIZATION_CODES.has(String(item.code)) ||
-      typeof item.path !== 'string' ||
-      typeof item.message !== 'string'
-    )
-      return undefined;
-    diagnostics.push(
-      Object.freeze({
-        code: item.code as JsonNormalizationDiagnostic['code'],
-        path: item.path,
-        message: item.message
-      })
-    );
-  }
-  return Object.freeze(diagnostics);
-}
-const NORMALIZATION_CODES = new Set([
-  'access_error',
-  'accessor',
-  'bigint',
-  'binary',
-  'circular',
-  'collection_truncated',
-  'depth_truncated',
-  'error',
-  'function',
-  'invalid_date',
-  'symbol',
-  'text_truncated',
-  'total_bytes_truncated',
-  'unsupported'
-]);
 function isArtifactRef(value: unknown): value is ArtifactRef {
   return (
     isRecord(value) &&

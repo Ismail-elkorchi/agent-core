@@ -1,6 +1,5 @@
-import { parseJsonValue } from '@agent-core/json';
+import { canonicalJsonString } from '@agent-core/json';
 import {
-  canonicalJsonString,
   hashJson,
   type ConditionalEventAppendResult,
   type EventAppendReceipt,
@@ -296,7 +295,7 @@ export class AgentRunCoordinator {
         callState.stage !== 'ready' &&
         callState.stage !== 'approval' &&
         callState.effect &&
-        hashJson(parseJsonValue(callState.effect.settlementPermit)) !== hashJson(parseJsonValue(permit))
+        hashJson(callState.effect.settlementPermit) !== hashJson(permit)
       ) {
         throw new AgentRunConflictError(
           runId,
@@ -900,12 +899,11 @@ function assertWorkAdvance(
     if (!next) throw new TypeError('Retained tool work cannot be removed.');
     const { callStates: oldStates, ...source } = batch;
     const { callStates: nextStates, ...nextSource } = next;
-    if (hashJson(parseJsonValue(source)) !== hashJson(parseJsonValue(nextSource)))
-      throw new TypeError('Original tool source cannot change.');
+    if (hashJson(source) !== hashJson(nextSource)) throw new TypeError('Original tool source cannot change.');
     for (const [callIndex, call] of oldStates.entries()) {
       const updated = nextStates[callIndex];
       if (!updated) throw new TypeError('Retained call cannot be removed.');
-      if (hashJson(parseJsonValue(call)) === hashJson(parseJsonValue(updated))) continue;
+      if (hashJson(call) === hashJson(updated)) continue;
       if (
         target &&
         (target.kind !== 'tool' || target.toolBatchId !== batch.toolBatchId || target.callIndex !== callIndex)
@@ -942,7 +940,7 @@ function assertWorkAdvance(
     if (hashJson(request.identity) !== hashJson(next.identity) || request.toolBatchId !== next.toolBatchId) {
       throw new TypeError('Original provider identity cannot change.');
     }
-    if (hashJson(parseJsonValue(request)) === hashJson(parseJsonValue(next))) continue;
+    if (hashJson(request) === hashJson(next)) continue;
     if (
       target &&
       (target.kind !== 'provider' ||
@@ -983,7 +981,7 @@ function assertToolAdvance(
   if (procedure === 'record_tool_delivery' && previous.stage === 'recorded' && next.stage === 'recorded') {
     const { delivery: oldDelivery, ...oldRecord } = previous;
     const { delivery: newDelivery, ...newRecord } = next;
-    if (!newDelivery || hashJson(parseJsonValue(oldRecord)) !== hashJson(parseJsonValue(newRecord))) {
+    if (!newDelivery || hashJson(oldRecord) !== hashJson(newRecord)) {
       throw new TypeError('Delivery cannot change the original observation.');
     }
     if (oldDelivery) {
@@ -1023,16 +1021,15 @@ function assertToolAdvance(
   ) {
     const { stage: oldStage, ...oldRecord } = previous;
     const { stage: newStage, ...newRecord } = next;
-    if (oldStage === newStage || hashJson(parseJsonValue(oldRecord)) !== hashJson(parseJsonValue(newRecord)))
+    if (oldStage === newStage || hashJson(oldRecord) !== hashJson(newRecord))
       throw new TypeError('Recording cannot change the settled observation or effect.');
   }
   if (previous.stage === 'effect_ready' && next.stage === 'effect_pending') {
     if (
-      hashJson(parseJsonValue(previous.effect.intent)) !== hashJson(parseJsonValue(next.effect.intent)) ||
-      hashJson(parseJsonValue(previous.effect.ticket)) !== hashJson(parseJsonValue(next.effect.ticket)) ||
-      hashJson(parseJsonValue(previous.effect.settlementPermit)) !==
-        hashJson(parseJsonValue(next.effect.settlementPermit)) ||
-      hashJson(parseJsonValue(previous.plan)) !== hashJson(parseJsonValue(next.plan)) ||
+      hashJson(previous.effect.intent) !== hashJson(next.effect.intent) ||
+      hashJson(previous.effect.ticket) !== hashJson(next.effect.ticket) ||
+      hashJson(previous.effect.settlementPermit) !== hashJson(next.effect.settlementPermit) ||
+      hashJson(previous.plan) !== hashJson(next.plan) ||
       previous.toolAttempt !== next.toolAttempt
     ) {
       throw new TypeError('Tool start must consume the exact issued ticket and plan.');
@@ -1068,7 +1065,7 @@ function assertProviderAdvance(
     next.stage !== 'ready' &&
     (previous.requestEventId !== next.requestEventId ||
       previous.responseId !== next.responseId ||
-      hashJson(parseJsonValue(previous.effect.intent)) !== hashJson(parseJsonValue(next.effect.intent)))
+      hashJson(previous.effect.intent) !== hashJson(next.effect.intent))
   )
     throw new TypeError('Provider source and intent cannot change.');
 }

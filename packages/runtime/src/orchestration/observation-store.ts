@@ -18,7 +18,6 @@ import {
   type ObservedFactRecord,
   type ToolObservationPresentation,
   type ToolObservation,
-  toJsonValue,
   validateToolObservationPresentation
 } from '@agent-core/tools';
 
@@ -484,7 +483,7 @@ function fallbackToolObservationPresentation(
       ...base,
       results: Object.freeze({
         output: observation.output,
-        ...(observation.content ? { content: toJsonValue(observation.content) } : {}),
+        ...(observation.content ? { content: parseJsonValue(observation.content) } : {}),
         ...(observation.metadata ? { metadata: observation.metadata } : {})
       }),
       ...(observation.scope.coverage === 'partial'

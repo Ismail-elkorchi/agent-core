@@ -190,7 +190,7 @@ export function createSessionSubmissionTransition(
     if (current.state === state) {
       if (
         current.suspension === undefined ||
-        hashJson(parseJsonObject(current.suspension)) !== hashJson(parseJsonObject(suspension))
+        hashJson(current.suspension) !== hashJson(suspension)
       )
         throw new Error(`Conflicting suspension for session submission: ${submissionId}`);
       return undefined;

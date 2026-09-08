@@ -17,28 +17,26 @@ export function captureToolCatalog(tools: readonly CompiledToolDefinition[]): To
       Object.freeze({
         name: tool.name,
         implementationId: tool.implementationId,
-        definitionHash: hashJson(
-          parseJsonObject({
-            name: tool.name,
-            implementationId: tool.implementationId,
-            description: tool.description,
-            jsonSchema: tool.jsonSchema,
-            effectEnvelope: tool.effectEnvelope,
-            ...(tool.textInput
-              ? {
-                  textInput: {
-                    description: tool.textInput.description ?? '',
-                    format: tool.textInput.format
-                  }
+        definitionHash: hashJson({
+          name: tool.name,
+          implementationId: tool.implementationId,
+          description: tool.description,
+          jsonSchema: tool.jsonSchema,
+          effectEnvelope: tool.effectEnvelope,
+          ...(tool.textInput
+            ? {
+                textInput: {
+                  description: tool.textInput.description ?? '',
+                  format: tool.textInput.format
                 }
-              : {})
-          })
-        )
+              }
+            : {})
+        })
       })
     )
   );
   return Object.freeze({
-    revision: hashJson(entries.map((entry) => parseJsonObject(entry))),
+    revision: hashJson(entries),
     entries
   });
 }
@@ -69,7 +67,7 @@ export function decodeToolCatalog(value: JsonValue | undefined): ToolCatalogSnap
   );
   if (
     new Set(entries.map((entry) => entry.name)).size !== entries.length ||
-    hashJson(entries.map((entry) => parseJsonObject(entry))) !== object.revision
+    hashJson(entries) !== object.revision
   )
     throw new Error('Tool catalog revision mismatch.');
   return Object.freeze({ revision: object.revision, entries });

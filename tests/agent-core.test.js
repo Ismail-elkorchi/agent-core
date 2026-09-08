@@ -544,6 +544,38 @@ test('modelOutput mappings preserve execution, completeness, source, and verific
   }
 });
 
+test('disposition rejects settlement differences beyond the former normalization prefix', async () => {
+  const text = 'x'.repeat(9_000) + 'original';
+  for (const kind of ['assistant.ended', 'check.ended', 'provider.attempt.settled']) {
+    class ChangedSettlementRepository extends InMemoryEventRepository {
+      async *read(runId) {
+        for await (const record of super.read(runId)) {
+          const event = record.event;
+          if (event.type !== kind) { yield record; continue; }
+          const changed = event.type === 'assistant.ended'
+            ? { ...event, modelOutput: { ...event.modelOutput, message: text + 'changed' } }
+            : event.type === 'check.ended'
+              ? { ...event, result: { ...event.result, output: text + 'changed' } }
+              : { ...event, response: { ...event.response, content: text + 'changed' } };
+          yield { ...record, event: changed };
+        }
+      }
+    }
+    let evaluated = false;
+    const fixture = await harness({
+      events: new ChangedSettlementRepository(agentEventCodec),
+      withoutSession: true,
+      script: [response('stop', text)],
+      checks: [{ id: 'exact', implementationId: 'tests/exact-check@1', kind: 'deterministic', requirement: 'required', async run() { return { verdict: 'passed', summary: 'checked', output: text }; } }],
+      disposition: { kind: 'deterministic', implementationId: 'tests/exact-disposition@1', policyIdentity: {}, evaluate() { evaluated = true; return { kind: 'accept' }; } }
+    });
+    const result = ended(await fixture.agent.run({ task: 'Check complete settlement equality.' }).result);
+    assert.equal(result.executionStatus, 'failed', kind);
+    assert.match(result.errorMessage, /does not match|do not match/u);
+    assert.equal(evaluated, false, kind);
+  }
+});
+
 test('disposition decisions accept, revise, fail, or remain inconclusive from exact persisted inputs', async () => {
   const inputs = [];
   const revisionPolicy = {
@@ -853,14 +885,14 @@ test('duplicate check IDs are rejected before model execution and missing requir
   assert.equal(deriveAgentVerificationStatus([{ id: 'missing', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required' }], []), 'inconclusive');
 });
 
-test('cyclic and oversized check output is bounded without losing the modelOutput', async () => {
+test('non-JSON check output is invalid without losing the modelOutput', async () => {
   const cyclic = { huge: 'x'.repeat(100_000), values: Array.from({ length: 500 }, (_, index) => index) };
   cyclic.self = cyclic;
   const { agent } = await harness({ checks: [{ id: 'safe', implementationId: 'agent-core.test.check.v1', kind: 'deterministic', requirement: 'required', async run() { return { verdict: 'passed', summary: 'ok', output: cyclic }; } }] });
-  const result = ended(await agent.run({ task: 'normalize' }).result);  assert.equal(result.modelOutput.message, 'done');
-  assert.equal(result.verificationStatus, 'passed');
-  assert.ok(result.checkResults[0].outputNormalization.length > 0);
-  assert.ok(JSON.stringify(result.checkResults[0].output).length < 40_000);
+  const result = ended(await agent.run({ task: 'invalid output' }).result);  assert.equal(result.modelOutput.message, 'done');
+  assert.equal(result.verificationStatus, 'inconclusive');
+  assert.equal(result.checkResults[0].diagnostic.kind, 'invalid_result');
+  assert.equal(result.checkResults[0].output, undefined);
 });
 
 test('application, run, and steering instructions reach checks with provenance', async () => {
