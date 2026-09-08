@@ -1,8 +1,8 @@
-import { accountModelRequest } from '@agent-core/model';
 import {
+  accountModelRequest,
+  CompleteRequestEstimator,
   type ModelInputItem,
   type ModelProfile,
-  CompleteRequestEstimator,
   type RequestEstimator
 } from '@agent-core/model';
 import { ModelWindow, type ModelWindowReduction } from './model-window.js';
@@ -18,8 +18,8 @@ import {
 } from './prompt-material.js';
 
 export type {
-  PromptInstructionBlock as PromptInstruction,
   PromptOutputContract as OutputContract,
+  PromptInstructionBlock as PromptInstruction,
   PromptMaterial,
   PromptToolSummary as PromptToolSpec
 } from './prompt-material.js';
@@ -31,14 +31,12 @@ export interface ModelRequestAssemblyInput {
   readonly contextItems?: readonly PromptContextItemInput[];
   readonly tools: readonly PromptToolSummary[];
   readonly modelProfile: ModelProfile;
-  readonly maxPromptTokens: number;
   readonly metadata?: Readonly<Record<string, string>>;
 }
 
 export interface ModelRequestAssemblyEstimate {
   readonly modelWindowTokens: number;
   readonly contextTokens: number;
-  readonly observedFactTokens: number;
 }
 
 export interface ModelRequestAssembly {
@@ -63,6 +61,7 @@ export class ModelRequestAssembler {
 
   assemble(input: ModelRequestAssemblyInput): ModelRequestAssembly {
     const history = input.window.messagesFor(input.modelProfile);
+    const prior = input.window.priorMessagesFor(input.modelProfile);
     const context = deliverPromptContext(input.contextItems ?? [], this.estimator);
     const material = createPromptMaterial({
       task: input.task,
@@ -74,7 +73,7 @@ export class ModelRequestAssembler {
     const compiled = compilePromptMaterial(material);
     const messages = Object.freeze([
       ...compiled.instructionMessages.filter((item) => item.role !== 'user'),
-      ...input.window.priorMessagesFor(input.modelProfile).messages,
+      ...prior.messages,
       compiled.taskMessage,
       ...compiled.instructionMessages.filter((item) => item.role === 'user'),
       ...history.messages,
@@ -85,15 +84,14 @@ export class ModelRequestAssembler {
       messages,
       historyMessages: history.messages,
       context,
-      reductions: Object.freeze([...input.window.consumeReductions(), ...history.reductions]),
+      reductions: input.window.consumeReductions(),
       estimate: Object.freeze({
         modelWindowTokens: accountModelRequest(
           { model: input.modelProfile.id, messages },
           input.modelProfile,
           { estimator: this.estimator }
         ).estimatedInputTokens,
-        contextTokens: context.totalTokens,
-        observedFactTokens: 0
+        contextTokens: context.totalTokens
       })
     });
   }

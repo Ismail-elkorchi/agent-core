@@ -1,33 +1,20 @@
-import type { ArtifactRef } from '@agent-core/persistence';
-import {
-  canonicalJsonString,
-  parseJsonObject,
-  parseJsonValue,
-  type JsonObject,
-  type JsonValue
-} from '@agent-core/json';
+import { canonicalJsonString, parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
 import type {
   ModelReasoningRequest,
   ModelRequest,
   ModelResponseFormat,
   ModelTerminationReason
 } from '@agent-core/model';
+import type { ArtifactRef } from '@agent-core/persistence';
 import type { ToolEffects } from '@agent-core/tools';
-import { decodeEffectRecoveryCapability, type EffectRecoveryCapability } from '@agent-core/effects';
 
 export type AgentModelOutputStatus = 'complete' | 'partial' | 'indeterminate' | 'absent';
 export type AgentModelOutputSource = 'content' | 'reasoning_summary' | 'stream_recovery';
-export type AgentVerificationStatus = 'not_required' | 'not_run' | 'passed' | 'failed' | 'inconclusive';
-export type AgentCompletedVerificationStatus = Exclude<AgentVerificationStatus, 'not_run'>;
-export type AgentCheckVerdict = 'passed' | 'failed' | 'unknown';
-export type AgentCheckRequirement = 'required' | 'advisory';
 export type AgentRunPhase =
   | 'initializing'
   | 'requesting_model'
   | 'executing_tools'
   | 'waiting_for_approval'
-  | 'verifying'
-  | 'deciding'
   | 'finalizing'
   | 'ended';
 
@@ -93,13 +80,12 @@ export interface AgentRunSuspension extends AgentRunIdentity {
   readonly reason:
     | 'provider_outcome_unknown'
     | 'tool_outcome_unknown'
-    | 'disposition_outcome_unknown'
     | 'missing_implementation'
     | 'user_decision';
   readonly effectId?: string;
   readonly decisionRequest?: import('./control/contracts.js').AgentDecisionRequest;
   readonly cleanupDiagnostic?: {
-    readonly kind: 'process_cleanup';
+    readonly kind: 'resource_cleanup';
     readonly message: string;
   };
   readonly budget: AgentRunBudgetState;
@@ -122,41 +108,10 @@ export type AgentRunIdentity = Readonly<{
 export type AgentEffectiveInstruction = Readonly<{
   readonly id: string;
   readonly content: string;
-  readonly provenance: 'application' | 'run' | 'steering' | 'disposition';
+  readonly provenance: 'application' | 'run' | 'steering';
   readonly role?: string;
   readonly sourceUri?: string;
   readonly priority?: number;
-}>;
-
-export type AgentCheckDiagnosticKind =
-  | 'exception'
-  | 'timeout'
-  | 'unavailable'
-  | 'permission_denied'
-  | 'aborted'
-  | 'invalid_result';
-export type AgentCheckDiagnostic = Readonly<{
-  readonly kind: AgentCheckDiagnosticKind;
-  readonly message: string;
-  readonly details?: JsonValue;
-}>;
-export interface AgentCheckObservation {
-  readonly verdict: AgentCheckVerdict;
-  readonly summary: string;
-  readonly output?: unknown;
-  readonly artifacts?: readonly ArtifactRef[];
-  readonly diagnostic?: AgentCheckDiagnostic;
-}
-export type AgentCheckResult = Readonly<{
-  readonly id: string;
-  readonly implementationId: string;
-  readonly requirement: AgentCheckRequirement;
-  readonly verdict: AgentCheckVerdict;
-  readonly summary: string;
-  readonly durationMs: number;
-  readonly output?: JsonValue;
-  readonly artifacts?: readonly ArtifactRef[];
-  readonly diagnostic?: AgentCheckDiagnostic;
 }>;
 
 export interface AgentObservedFactsPage {
@@ -173,85 +128,8 @@ export interface AgentObservedFactsReader {
   }): Promise<AgentObservedFactsPage>;
   readArtifact(ref: ArtifactRef, input?: { readonly maxBytes?: number }): Promise<Uint8Array>;
 }
-export interface AgentVerificationExecutionContext {
+export interface ObservationAccess {
   readonly observedFacts: AgentObservedFactsReader;
-}
-export interface AgentCheckContext {
-  readonly runId: string;
-  readonly task: string;
-  readonly instructions: readonly AgentEffectiveInstruction[];
-  readonly modelOutput: AgentPresentModelOutput;
-  readonly turnIndex: number;
-  readonly turnId: string;
-  readonly requestAttempt: number;
-  readonly metadata: Readonly<JsonObject>;
-  readonly signal: AbortSignal;
-  readonly execution: AgentVerificationExecutionContext;
-}
-interface AgentCheckDefinitionBase {
-  readonly id: string;
-  /** Stable identity for the admitted verifier implementation and semantics. */
-  readonly implementationId: string;
-  readonly requirement: AgentCheckRequirement;
-  readonly description?: string;
-  readonly timeoutMs?: number;
-}
-export interface AgentDeterministicCheckDefinition extends AgentCheckDefinitionBase {
-  readonly kind: 'deterministic';
-  run(context: AgentCheckContext): Promise<AgentCheckObservation>;
-}
-export interface AgentEffectCheckDefinition extends AgentCheckDefinitionBase {
-  readonly kind: 'effect';
-  planEffect(context: AgentCheckContext): Promise<AgentCheckObservation | AgentCheckEffectPlan>;
-}
-export type AgentCheckDefinition = AgentDeterministicCheckDefinition | AgentEffectCheckDefinition;
-
-export type AgentCheckEffectReconciliation =
-  | Readonly<{
-      readonly status: 'settled';
-      readonly observation: AgentCheckObservation;
-    }>
-  | Readonly<{ readonly status: 'running' | 'unknown' | 'expired' }>;
-
-export interface AgentCheckEffectPlan {
-  readonly authorization: JsonValue;
-  readonly recovery: EffectRecoveryCapability;
-  start(signal: AbortSignal): Promise<AgentCheckObservation>;
-  reconcile(signal: AbortSignal): Promise<AgentCheckEffectReconciliation>;
-  release(): Promise<void>;
-}
-
-export interface AgentCheckEffectPlanInput {
-  readonly authorization: JsonValue;
-  readonly recovery: EffectRecoveryCapability;
-  readonly start: (signal: AbortSignal) => Promise<AgentCheckObservation>;
-  readonly reconcile: (signal: AbortSignal) => Promise<AgentCheckEffectReconciliation>;
-  readonly release: () => Promise<void>;
-}
-
-const CHECK_EFFECT_PLANS = new WeakSet();
-
-export function createAgentCheckEffectPlan(input: AgentCheckEffectPlanInput): AgentCheckEffectPlan {
-  if (
-    typeof input.start !== 'function' ||
-    typeof input.reconcile !== 'function' ||
-    typeof input.release !== 'function'
-  ) {
-    throw new TypeError('Planned check effect requires start, reconcile, and release operations.');
-  }
-  const plan = Object.freeze({
-    authorization: parseJsonValue(input.authorization),
-    recovery: decodeEffectRecoveryCapability(input.recovery),
-    start: input.start,
-    reconcile: input.reconcile,
-    release: input.release
-  });
-  CHECK_EFFECT_PLANS.add(plan);
-  return plan;
-}
-
-export function isAgentCheckEffectPlan(value: unknown): value is AgentCheckEffectPlan {
-  return typeof value === 'object' && value !== null && CHECK_EFFECT_PLANS.has(value);
 }
 
 export type AgentLimitKind =
@@ -263,14 +141,12 @@ export type AgentLimitKind =
   | 'completion_tokens'
   | 'known_cost'
   | 'consecutive_provider_failures'
-  | 'consecutive_tool_failures'
-  | 'revision_attempts';
+  | 'consecutive_tool_failures';
 export interface AgentRunLimits {
   readonly maxConcurrentToolCalls: number;
   readonly modelTurns: number;
   readonly totalToolCalls: number;
   readonly repeatedIdenticalToolCalls: number;
-  readonly revisionAttempts: number;
   readonly elapsedMs: number;
   readonly promptTokens: number;
   readonly completionTokens: number;
@@ -286,7 +162,6 @@ export const DEFAULT_AGENT_RUN_LIMITS: AgentRunLimits = Object.freeze({
   modelTurns: 32,
   totalToolCalls: 128,
   repeatedIdenticalToolCalls: 3,
-  revisionAttempts: 3,
   elapsedMs: 30 * 60 * 1_000,
   promptTokens: 1_000_000,
   completionTokens: 250_000,
@@ -301,7 +176,6 @@ export type AgentRunBudgetState = Readonly<{
   readonly modelTurns: number;
   readonly totalToolCalls: number;
   readonly repeatedIdenticalToolCalls: number;
-  readonly revisionAttempts: number;
   readonly elapsedMs: number;
   readonly promptTokens: number;
   readonly completionTokens: number;
@@ -319,7 +193,6 @@ const AGENT_RUN_BUDGET_FIELDS = [
   'modelTurns',
   'totalToolCalls',
   'repeatedIdenticalToolCalls',
-  'revisionAttempts',
   'elapsedMs',
   'promptTokens',
   'completionTokens',
@@ -367,10 +240,6 @@ export interface AgentTurnSnapshotRecord {
   readonly toolPolicyHash: string;
   readonly instructions: readonly AgentEffectiveInstruction[];
   readonly configuredContextSourceIds: readonly string[];
-  readonly checks: readonly {
-    readonly id: string;
-    readonly implementationId: string;
-  }[];
   readonly limits: AgentRunLimits;
   readonly budget: AgentRunBudgetState;
 }
@@ -390,7 +259,6 @@ export interface InferenceRequestFingerprintRecord extends AgentTurnIdentity {
   readonly providerContextIds: readonly string[];
   readonly runContextIds: readonly string[];
   readonly effectiveInstructionHash: string;
-  readonly selectedFactsHash: string;
   readonly modelWindowHistoryHash: string;
   readonly modelToolSchemasHash: string;
   readonly modelWindowHash: string;
@@ -415,9 +283,7 @@ export type AgentFailureTerminationReason =
   | 'runtime_error'
   | 'stream_interrupted'
   | 'request_too_large'
-  | 'limit_exhausted'
-  | 'model_output_rejected'
-  | 'disposition_inconclusive';
+  | 'limit_exhausted';
 type AgentTerminalBase = AgentRunIdentity &
   Readonly<{
     readonly phase: 'ended';
@@ -425,11 +291,10 @@ type AgentTerminalBase = AgentRunIdentity &
     readonly modelOutput: AgentModelOutput;
     readonly modelTerminationReason?: ModelTerminationReason;
     readonly providerTerminationReason?: string;
-    readonly checkResults: readonly AgentCheckResult[];
     readonly budget: AgentRunBudgetState;
     readonly exhaustedLimit?: AgentLimitKind;
     readonly cleanupDiagnostic?: {
-      readonly kind: 'process_cleanup';
+      readonly kind: 'resource_cleanup';
       readonly message: string;
     };
   }>;
@@ -437,7 +302,6 @@ export type AgentCompletedTerminalSnapshot = AgentTerminalBase &
   Readonly<{
     readonly executionStatus: 'completed';
     readonly modelOutput: AgentPresentModelOutput;
-    readonly verificationStatus: AgentCompletedVerificationStatus;
     readonly terminationReason: AgentCompletedTerminationReason;
     readonly errorMessage?: never;
   }>;
@@ -445,15 +309,15 @@ export type AgentFailedTerminalSnapshot = AgentTerminalBase &
   Readonly<{
     readonly executionStatus: 'failed';
     readonly modelOutput: AgentModelOutput;
-    readonly verificationStatus: AgentVerificationStatus;
     readonly terminationReason: AgentFailureTerminationReason;
     readonly errorMessage: string;
   }>;
 export type AgentAbortedTerminalSnapshot = AgentTerminalBase &
   Readonly<{
     readonly executionStatus: 'aborted';
-    readonly modelOutput: AgentAbsentModelOutput | (AgentPresentModelOutput & { readonly status: 'partial' });
-    readonly verificationStatus: 'not_run';
+    readonly modelOutput:
+      | AgentAbsentModelOutput
+      | (AgentPresentModelOutput & { readonly status: 'partial' });
     readonly terminationReason: 'aborted';
     readonly errorMessage: string;
   }>;
@@ -508,8 +372,6 @@ export function validateAgentRunLimits(input: Partial<AgentRunLimits> = {}): Age
   const issues = fields.flatMap((field) =>
     positiveInteger(limits[field]) ? [] : [`${field} must be a positive finite integer.`]
   );
-  if (!Number.isSafeInteger(limits.revisionAttempts) || limits.revisionAttempts < 0)
-    issues.push('revisionAttempts must be a nonnegative safe integer.');
   if (!Number.isFinite(limits.knownCost.amount) || limits.knownCost.amount <= 0)
     issues.push('knownCost.amount must be positive and finite.');
   if (limits.knownCost.currency.trim().length === 0) issues.push('knownCost.currency must be non-empty.');
@@ -518,46 +380,6 @@ export function validateAgentRunLimits(input: Partial<AgentRunLimits> = {}): Age
     ...limits,
     knownCost: Object.freeze({ ...limits.knownCost })
   });
-}
-
-export function validateAgentCheckDefinitions(
-  definitions: readonly AgentCheckDefinition[] | undefined
-): readonly AgentCheckDefinition[] {
-  const output = definitions ?? [];
-  const issues: string[] = [];
-  const ids = new Set<string>();
-  for (const [index, definition] of output.entries()) {
-    const id = definition.id;
-    const label = id.length > 0 ? id : String(index);
-    if (id.trim().length === 0) issues.push(`Check at index ${String(index)} has an empty id.`);
-    else if (ids.has(id)) issues.push(`Duplicate check id: ${id}.`);
-    else ids.add(id);
-    if (!validIdentity(definition.implementationId))
-      issues.push(`Check ${label} implementationId must be a non-empty bounded identity.`);
-    if (!isAgentCheckKind(definition.kind))
-      issues.push(`Check ${label} kind must be deterministic or effect.`);
-    if (definition.timeoutMs !== undefined && !positiveInteger(definition.timeoutMs))
-      issues.push(`Check ${label} timeoutMs must be a positive finite integer.`);
-  }
-  if (issues.length > 0) throw new AgentContractError('Invalid check definitions.', issues);
-  return Object.freeze([...output]);
-}
-
-function isAgentCheckKind(value: unknown): value is AgentCheckDefinition['kind'] {
-  return value === 'deterministic' || value === 'effect';
-}
-
-export function deriveAgentVerificationStatus(
-  definitions: readonly Pick<AgentCheckDefinition, 'id' | 'requirement'>[],
-  results: readonly AgentCheckResult[]
-): AgentCompletedVerificationStatus {
-  if (definitions.length === 0) return 'not_required';
-  const byId = new Map(results.map((result) => [result.id, result]));
-  const required = definitions.filter((definition) => definition.requirement === 'required');
-  if (required.length === 0) return 'not_required';
-  if (required.some((definition) => byId.get(definition.id)?.verdict === 'failed')) return 'failed';
-  if (required.some((definition) => byId.get(definition.id)?.verdict !== 'passed')) return 'inconclusive';
-  return 'passed';
 }
 
 export function decodeOwnedAgentModelOutput(value: JsonObject): AgentModelOutput {
@@ -588,79 +410,6 @@ export function decodeOwnedAgentModelOutput(value: JsonObject): AgentModelOutput
   });
 }
 
-export function parseAgentCheckResult(value: unknown, measuredDurationMs?: number): AgentCheckResult {
-  return decodeOwnedAgentCheckResult(parseJsonObject(value), measuredDurationMs);
-}
-
-export function decodeOwnedAgentCheckResult(
-  object: JsonObject,
-  measuredDurationMs?: number
-): AgentCheckResult {
-  const issues: string[] = [];
-  const fields = [
-    'id',
-    'implementationId',
-    'requirement',
-    'verdict',
-    'summary',
-    'durationMs',
-    'output',
-    'artifacts',
-    'diagnostic'
-  ];
-  for (const key of Object.keys(object)) {
-    if (!fields.includes(key)) issues.push(`Unsupported check result field: ${key}.`);
-  }
-  const id = typeof object.id === 'string' && object.id.trim().length > 0 ? object.id : undefined;
-  const implementationId =
-    typeof object.implementationId === 'string' && validIdentity(object.implementationId)
-      ? object.implementationId
-      : undefined;
-  const requirement = oneOf(object.requirement, ['required', 'advisory']) ? object.requirement : undefined;
-  const verdict = oneOf(object.verdict, ['passed', 'failed', 'unknown']) ? object.verdict : undefined;
-  const summary =
-    typeof object.summary === 'string' && object.summary.trim().length > 0 ? object.summary : undefined;
-  const rawDurationMs = measuredDurationMs ?? object.durationMs;
-  const durationMs =
-    typeof rawDurationMs === 'number' && Number.isFinite(rawDurationMs) && rawDurationMs >= 0
-      ? rawDurationMs
-      : undefined;
-  if (!id) issues.push('id must be non-empty.');
-  if (!implementationId) issues.push('implementationId must be a non-empty bounded identity.');
-  if (!requirement) issues.push('requirement is invalid.');
-  if (!verdict) issues.push('verdict is invalid.');
-  if (!summary) issues.push('summary must be non-empty.');
-  if (durationMs === undefined) issues.push('durationMs must be finite and nonnegative.');
-  const artifacts =
-    object.artifacts === undefined
-      ? undefined
-      : Array.isArray(object.artifacts) && object.artifacts.every(isArtifactRef)
-        ? Object.freeze([...object.artifacts])
-        : undefined;
-  if (object.artifacts !== undefined && !artifacts) issues.push('artifacts are invalid.');
-  const diagnostic =
-    object.diagnostic === undefined
-      ? undefined
-      : isCheckDiagnostic(object.diagnostic)
-        ? object.diagnostic
-        : undefined;
-  if (object.diagnostic !== undefined && !diagnostic) issues.push('diagnostic is invalid.');
-  if (issues.length > 0) throw contract('Invalid check result.', issues);
-  if (!id || !implementationId || !requirement || !verdict || !summary || durationMs === undefined)
-    throw contract('Invalid check result.', issues);
-  return Object.freeze({
-    id,
-    implementationId,
-    requirement,
-    verdict,
-    summary,
-    durationMs,
-    ...(object.output !== undefined ? { output: object.output } : {}),
-    ...(artifacts ? { artifacts } : {}),
-    ...(diagnostic ? { diagnostic } : {})
-  });
-}
-
 export function createAgentTerminalSnapshot(value: AgentTerminalSnapshot): AgentTerminalSnapshot {
   const issues: string[] = [];
   if (!validIdentity(value.runId)) issues.push('runId must be non-empty and at most 256 UTF-8 bytes.');
@@ -686,7 +435,6 @@ export function createAgentTerminalSnapshot(value: AgentTerminalSnapshot): Agent
     })
   );
   if (issues.length > 0) throw contract('Invalid terminal snapshot.', issues);
-  const checkResults = Object.freeze([...value.checkResults]);
   const budget = Object.freeze({
     ...value.budget,
     knownCosts: Object.freeze({ ...value.budget.knownCosts })
@@ -698,7 +446,6 @@ export function createAgentTerminalSnapshot(value: AgentTerminalSnapshot): Agent
     return Object.freeze({
       ...value,
       modelOutput: Object.freeze({ ...value.modelOutput }),
-      checkResults,
       budget,
       ...cleanup
     });
@@ -706,14 +453,12 @@ export function createAgentTerminalSnapshot(value: AgentTerminalSnapshot): Agent
     return Object.freeze({
       ...value,
       modelOutput: Object.freeze({ ...value.modelOutput }),
-      checkResults,
       budget,
       ...cleanup
     });
   return Object.freeze({
     ...value,
     modelOutput: Object.freeze({ ...value.modelOutput }),
-    checkResults,
     budget,
     ...cleanup
   });
@@ -734,25 +479,11 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
   } catch (error) {
     issues.push(errorMessage(error));
   }
-  const checkResults: AgentCheckResult[] = [];
-  if (!isJsonArray(value.checkResults)) issues.push('checkResults must be an array.');
-  else
-    for (const result of value.checkResults) {
-      try {
-        if (!isJsonObject(result))
-          throw contract('Invalid check result.', ['Check result must be an object.']);
-        checkResults.push(decodeOwnedAgentCheckResult(result));
-      } catch (error) {
-        issues.push(errorMessage(error));
-      }
-    }
   const budget = isBudgetState(value.budget) ? value.budget : undefined;
   if (!budget) issues.push('budget is invalid.');
   if (value.executionStatus === 'completed') {
     if (!modelOutput || modelOutput.status === 'absent')
       issues.push('Completed execution requires a present modelOutput.');
-    if (!oneOf(value.verificationStatus, ['not_required', 'passed', 'failed', 'inconclusive']))
-      issues.push('Completed execution has an invalid verification status.');
     if (
       !oneOf(value.terminationReason, [
         'model_completed',
@@ -766,8 +497,6 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
       issues.push(...completedModelOutputIssues(value.terminationReason, modelOutput.status));
     if (value.errorMessage !== undefined) issues.push('Completed execution cannot have errorMessage.');
   } else if (value.executionStatus === 'failed') {
-    if (!oneOf(value.verificationStatus, ['not_required', 'not_run', 'passed', 'failed', 'inconclusive']))
-      issues.push('Failed execution has an invalid verification status.');
     if (!oneOf(value.terminationReason, FAILURE_REASONS))
       issues.push('Failed execution has an invalid termination reason.');
     if (typeof value.errorMessage !== 'string' || value.errorMessage.trim().length === 0)
@@ -775,8 +504,7 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
   } else if (value.executionStatus === 'aborted') {
     if (modelOutput && modelOutput.status !== 'absent' && modelOutput.status !== 'partial')
       issues.push('Aborted execution can only preserve a partial modelOutput.');
-    if (value.verificationStatus !== 'not_run' || value.terminationReason !== 'aborted')
-      issues.push('Aborted execution must use aborted/not_run.');
+    if (value.terminationReason !== 'aborted') issues.push('Aborted execution must use aborted.');
     if (typeof value.errorMessage !== 'string' || value.errorMessage.trim().length === 0)
       issues.push('Aborted execution requires errorMessage.');
   } else issues.push('executionStatus is invalid.');
@@ -787,7 +515,7 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
   if (
     value.cleanupDiagnostic !== undefined &&
     (!isRecord(value.cleanupDiagnostic) ||
-      value.cleanupDiagnostic.kind !== 'process_cleanup' ||
+      value.cleanupDiagnostic.kind !== 'resource_cleanup' ||
       typeof value.cleanupDiagnostic.message !== 'string' ||
       value.cleanupDiagnostic.message.length === 0)
   )
@@ -802,7 +530,6 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
     phase: 'ended' as const,
     turnCount: value.turnCount as number,
     modelOutput,
-    checkResults: Object.freeze(checkResults),
     budget,
     ...(value.modelTerminationReason !== undefined
       ? {
@@ -812,11 +539,13 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
     ...(typeof value.providerTerminationReason === 'string'
       ? { providerTerminationReason: value.providerTerminationReason }
       : {}),
-    ...(value.exhaustedLimit !== undefined ? { exhaustedLimit: value.exhaustedLimit as AgentLimitKind } : {}),
+    ...(value.exhaustedLimit !== undefined
+      ? { exhaustedLimit: value.exhaustedLimit as AgentLimitKind }
+      : {}),
     ...(value.cleanupDiagnostic !== undefined
       ? {
           cleanupDiagnostic: value.cleanupDiagnostic as {
-            readonly kind: 'process_cleanup';
+            readonly kind: 'resource_cleanup';
             readonly message: string;
           }
         }
@@ -827,14 +556,12 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
       ...base,
       executionStatus: 'completed',
       modelOutput: modelOutput as AgentPresentModelOutput,
-      verificationStatus: value.verificationStatus as AgentCompletedVerificationStatus,
       terminationReason: value.terminationReason as AgentCompletedTerminationReason
     });
   if (value.executionStatus === 'failed')
     return Object.freeze({
       ...base,
       executionStatus: 'failed',
-      verificationStatus: value.verificationStatus as AgentVerificationStatus,
       terminationReason: value.terminationReason as AgentFailureTerminationReason,
       errorMessage: value.errorMessage as string
     });
@@ -842,7 +569,6 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
     ...base,
     executionStatus: 'aborted',
     modelOutput: modelOutput as AgentAbortedTerminalSnapshot['modelOutput'],
-    verificationStatus: 'not_run',
     terminationReason: 'aborted',
     errorMessage: value.errorMessage as string
   });
@@ -860,8 +586,7 @@ const AGENT_LIMIT_KINDS: readonly AgentLimitKind[] = [
   'completion_tokens',
   'known_cost',
   'consecutive_provider_failures',
-  'consecutive_tool_failures',
-  'revision_attempts'
+  'consecutive_tool_failures'
 ];
 const FAILURE_REASONS: readonly AgentFailureTerminationReason[] = [
   'model_output_limit',
@@ -873,12 +598,27 @@ const FAILURE_REASONS: readonly AgentFailureTerminationReason[] = [
   'runtime_error',
   'stream_interrupted',
   'request_too_large',
-  'limit_exhausted',
-  'model_output_rejected',
-  'disposition_inconclusive'
+  'limit_exhausted'
 ];
 function terminalBaseIssues(value: Record<string, unknown>): string[] {
   const issues: string[] = [];
+  const fields = [
+    'runId',
+    'finalizationId',
+    'phase',
+    'turnCount',
+    'modelOutput',
+    'modelTerminationReason',
+    'providerTerminationReason',
+    'exhaustedLimit',
+    'budget',
+    'cleanupDiagnostic',
+    'executionStatus',
+    'terminationReason',
+    'errorMessage'
+  ];
+  for (const field of Object.keys(value))
+    if (!fields.includes(field)) issues.push(`Unsupported terminal field: ${field}.`);
   if (!validIdentity(value.runId)) issues.push('runId must be non-empty and at most 256 UTF-8 bytes.');
   if (!validIdentity(value.finalizationId))
     issues.push('finalizationId must be non-empty and at most 256 UTF-8 bytes.');
@@ -887,7 +627,13 @@ function terminalBaseIssues(value: Record<string, unknown>): string[] {
     issues.push('turnCount must be a nonnegative integer.');
   if (
     value.modelTerminationReason !== undefined &&
-    !oneOf(value.modelTerminationReason, ['stop', 'tool_calls', 'output_limit', 'content_filter', 'unknown'])
+    !oneOf(value.modelTerminationReason, [
+      'stop',
+      'tool_calls',
+      'output_limit',
+      'content_filter',
+      'unknown'
+    ])
   )
     issues.push('modelTerminationReason is invalid.');
   if (value.providerTerminationReason !== undefined && typeof value.providerTerminationReason !== 'string')
@@ -901,7 +647,8 @@ function modelTerminationIssues(value: Record<string, unknown>): string[] {
     content_filtered: 'content_filter',
     unknown_model_termination: 'unknown'
   };
-  const expected = typeof value.terminationReason === 'string' ? mapping[value.terminationReason] : undefined;
+  const expected =
+    typeof value.terminationReason === 'string' ? mapping[value.terminationReason] : undefined;
   return expected !== undefined && value.modelTerminationReason !== expected
     ? [`${String(value.terminationReason)} requires modelTerminationReason ${expected}.`]
     : [];
@@ -927,7 +674,6 @@ function isBudgetState(value: unknown): value is AgentRunBudgetState {
     'modelTurns',
     'totalToolCalls',
     'repeatedIdenticalToolCalls',
-    'revisionAttempts',
     'elapsedMs',
     'promptTokens',
     'completionTokens',
@@ -951,31 +697,6 @@ function isBudgetState(value: unknown): value is AgentRunBudgetState {
   return (
     finiteNonnegativeNumberRecord(value.knownCosts) &&
     oneOf(value.pricingStatus, ['known', 'partial', 'unknown'])
-  );
-}
-function isCheckDiagnostic(value: unknown): value is AgentCheckDiagnostic {
-  return (
-    isRecord(value) &&
-    oneOf(value.kind, [
-      'exception',
-      'timeout',
-      'unavailable',
-      'permission_denied',
-      'aborted',
-      'invalid_result'
-    ]) &&
-    typeof value.message === 'string'
-  );
-}
-function isArtifactRef(value: unknown): value is ArtifactRef {
-  return (
-    isRecord(value) &&
-    typeof value.artifactId === 'string' &&
-    typeof value.sha256 === 'string' &&
-    typeof value.size === 'number' &&
-    Number.isInteger(value.size) &&
-    value.size >= 0 &&
-    typeof value.mediaType === 'string'
   );
 }
 function finiteNonnegativeNumberRecord(value: unknown): boolean {
@@ -1011,9 +732,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 function isJsonObject(value: JsonValue): value is JsonObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-function isJsonArray(value: JsonValue | undefined): value is readonly JsonValue[] {
-  return Array.isArray(value);
 }
 function contract(message: string, issues: string[]): AgentContractError {
   return new AgentContractError(message, issues);

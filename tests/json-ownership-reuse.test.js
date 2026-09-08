@@ -13,7 +13,9 @@ test('owned JSON can be reused while fresh mutable input still crosses the owner
   input.nested.value = 'after';
   assert.equal(owned.nested.value, 'before');
   assert.equal(parseJsonValue(input).nested.value, 'after');
-  assert.throws(() => { owned.nested.value = 'mutated'; }, TypeError);
+  assert.throws(() => {
+    owned.nested.value = 'mutated';
+  }, TypeError);
 });
 
 test('ownership reuse never bypasses a subsequently tighter bound', () => {
@@ -30,7 +32,10 @@ test('nested owned values share storage while contributing their full shape to l
   const parent = parseJsonValue({ child });
   assert.equal(parent.child, child);
   assert.throws(() => parseJsonValue({ child }, { maxDepth: 2 }), /depth/u);
-  assert.throws(() => parseJsonValue({ first: child, second: child }, { maxCollectionEntries: 6 }), /collection/u);
+  assert.throws(
+    () => parseJsonValue({ first: child, second: child }, { maxCollectionEntries: 6 }),
+    /collection/u
+  );
   assert.throws(() => parseJsonValue({ child }, { maxStringBytes: 5 }), /string/u);
   assert.throws(() => parseJsonValue({ child }, { maxTotalBytes: 30 }), /byte/u);
 });
@@ -41,7 +46,10 @@ test('UTF-8 limits remain exact across chunk boundaries, escapes, and surrogate 
     const jsonBytes = Buffer.byteLength(JSON.stringify(text));
     assert.equal(parseJsonValue(text, { maxStringBytes: rawBytes, maxTotalBytes: jsonBytes }), text);
     assert.throws(() => parseJsonValue(text, { maxStringBytes: rawBytes - 1 }), /string/u);
-    assert.throws(() => parseJsonValue(text, { maxStringBytes: rawBytes, maxTotalBytes: jsonBytes - 1 }), /byte/u);
+    assert.throws(
+      () => parseJsonValue(text, { maxStringBytes: rawBytes, maxTotalBytes: jsonBytes - 1 }),
+      /byte/u
+    );
   }
 });
 
@@ -54,10 +62,15 @@ test('canonical reuse cannot be forged by freezing a mutable object or an access
   assert.notEqual(hashJson(shallow), before);
 
   let accessed = 0;
-  const accessor = Object.freeze(Object.defineProperty({}, 'value', {
-    enumerable: true,
-    get() { accessed++; return 'untrusted'; }
-  }));
+  const accessor = Object.freeze(
+    Object.defineProperty({}, 'value', {
+      enumerable: true,
+      get() {
+        accessed++;
+        return 'untrusted';
+      }
+    })
+  );
   assert.equal(isOwnedJsonValue(accessor), false);
   assert.throws(() => hashJson(accessor), /accessor/u);
   assert.throws(() => parseJsonValue(accessor), /accessor/u);
@@ -65,7 +78,7 @@ test('canonical reuse cannot be forged by freezing a mutable object or an access
 });
 
 test('captured snapshots remain immutable and canonical identities are locale independent', () => {
-  const source = { z: [{ value: 1 }], 'é': 'accent', a: 'first' };
+  const source = { z: [{ value: 1 }], é: 'accent', a: 'first' };
   const normalized = parseJsonValue(source);
   assert.equal(isOwnedJsonValue(normalized), true);
   const before = canonicalJsonString(normalized);
@@ -73,4 +86,20 @@ test('captured snapshots remain immutable and canonical identities are locale in
   assert.equal(canonicalJsonString(normalized), before);
   assert.equal(before, '{"a":"first","z":[{"value":1}],"é":"accent"}');
   assert.equal(hashJson(parseJsonValue(normalized)), hashJson(normalized));
+});
+
+test('owned encoding preserves canonical numeric-key order and exact Unicode byte limits', () => {
+  const encoder = new TextEncoder();
+  for (const value of [
+    { 2: 'second', 10: 'tenth', a: [{ 0: 'zero', '00': 'not an index' }] },
+    { array: [{ 3: 'three', 12: 'twelve' }], plain: { b: 2, a: 1 } },
+    { text: Array.from({ length: 65536 }, (_, index) => String.fromCharCode(index)).join('') },
+    { text: '\ud800x\udfff\ud800\udc00😀é\n' }
+  ]) {
+    const bytes = encoder.encode(JSON.stringify(value)).byteLength;
+    const owned = parseJsonValue(value, { maxTotalBytes: bytes });
+    assert.equal(canonicalJsonString(owned), canonicalJsonString(value));
+    assert.throws(() => parseJsonValue(value, { maxTotalBytes: bytes - 1 }), /byte/u);
+    assert.throws(() => parseJsonValue(owned, { maxTotalBytes: bytes - 1 }), /byte/u);
+  }
 });

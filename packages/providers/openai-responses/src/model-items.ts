@@ -75,7 +75,13 @@ export function responsesToolCall(call: ModelToolCall, provider: string): Record
   if (!call.id) throw invalid(provider, 'Responses tool calls require the original call identity.');
   const asyncField = call.async === undefined ? {} : { async: call.async };
   return call.type === 'custom'
-    ? { ...asyncField, type: 'custom_tool_call', call_id: call.id, name: call.name, input: call.input.value }
+    ? {
+        ...asyncField,
+        type: 'custom_tool_call',
+        call_id: call.id,
+        name: call.name,
+        input: call.input.value
+      }
     : {
         ...asyncField,
         type: 'function_call',
@@ -125,6 +131,7 @@ export async function responsesOutput(options: {
   provider: string;
   endpoint: string;
   requestId: string;
+  protocolRevision: string;
   items: readonly ResponsesOutputItem[];
 }): Promise<readonly ModelOutputItem[]> {
   const output: ModelOutputItem[] = [];
@@ -133,6 +140,7 @@ export async function responsesOutput(options: {
       const prefix = [...options.request.messages, ...modelOutputToInput(output)];
       const state = await createProviderContextState({
         provider: options.provider,
+        protocolRevision: options.protocolRevision,
         endpoint: options.endpoint,
         request: { ...options.request, messages: prefix },
         requestId: options.requestId,
@@ -141,7 +149,8 @@ export async function responsesOutput(options: {
       });
       output.push({ type: 'protocol', state });
     } else if (item.type === 'function_call' || item.type === 'custom_tool_call') {
-      if (!item.call_id || !item.name) throw invalidOutput(options.provider, 'Missing native tool identity.');
+      if (!item.call_id || !item.name)
+        throw invalidOutput(options.provider, 'Missing native tool identity.');
       if (item.async !== undefined && typeof item.async !== 'boolean')
         throw invalidOutput(options.provider, 'Invalid async tool-call mode.');
       if (
@@ -240,7 +249,9 @@ export function validatedResponsesReplayItems(
       if (
         !item.call_id ||
         !item.name ||
-        (item.type === 'function_call' ? typeof item.arguments !== 'string' : typeof item.input !== 'string')
+        (item.type === 'function_call'
+          ? typeof item.arguments !== 'string'
+          : typeof item.input !== 'string')
       )
         throw invalid(provider, 'Malformed native call in replay window.');
     } else if (item.type === 'function_call_output' || item.type === 'custom_tool_call_output') {

@@ -1,44 +1,33 @@
-import { modelTransportSignal, type ModelTransportOptions } from '@agent-core/model';
-import {
-  NativeResponsesSession,
-  defaultOpenAIResponsesWebSocketFactory,
-  type OpenAIResponsesWebSocketFactory
-} from './native-session.js';
-import {
-  createProviderContextState,
-  parseModelContextTransformResult,
-  type ModelContextTransformRequest,
-  type ModelContextTransformResult
-} from '@agent-core/model';
-export type { OpenAIResponsesWebSocket, OpenAIResponsesWebSocketFactory } from './native-session.js';
-import {
-  responsesInput,
-  responsesOutput,
-  responsesPayloadPaths,
-  validatedResponsesReplayItems
-} from '@agent-core/provider-openai-responses';
-import {
-  compileModelRequest,
-  conservativeProtocolCapabilities,
-  assertProviderContextCompatible,
-  type CompiledModelRequest
-} from '@agent-core/model';
 import {
   AuthError,
-  type BearerTokenProvider,
   CachedBearerTokenProvider,
   createBearerTokenProvider,
   EnvBearerTokenProvider,
-  type ProviderAuth,
-  StaticBearerTokenProvider
+  StaticBearerTokenProvider,
+  type BearerTokenProvider,
+  type ProviderAuth
 } from '@agent-core/auth';
-import { parseJsonValue, parseJsonObject, type JsonObject } from '@agent-core/json';
+import { parseJsonObject, parseJsonValue, type JsonObject } from '@agent-core/json';
 import {
-  type ModelCapabilities,
+  assertModelRequestSupported,
+  assertProviderContextCompatible,
+  compileModelRequest,
+  conservativeProtocolCapabilities,
+  createProviderContextState,
   ModelContractError,
+  ModelProviderError,
+  modelTransportSignal,
+  parseModelContextTransformResult,
+  parseModelProfile,
+  parseModelRequest,
+  parseModelResponse,
+  requiredProtocolRevision,
+  type CompiledModelRequest,
+  type ModelCapabilities,
+  type ModelContextTransformRequest,
+  type ModelContextTransformResult,
   type ModelProfile,
   type ModelProvider,
-  ModelProviderError,
   type ModelProviderErrorCode,
   type ModelProviderErrorDiagnosticValue,
   type ModelProviderInfo,
@@ -50,11 +39,8 @@ import {
   type ModelStreamEvent,
   type ModelTool,
   type ModelToolCall,
-  type ModelUsage,
-  assertModelRequestSupported,
-  parseModelProfile,
-  parseModelRequest,
-  parseModelResponse
+  type ModelTransportOptions,
+  type ModelUsage
 } from '@agent-core/model';
 import {
   decodeResponsesPayload,
@@ -62,6 +48,10 @@ import {
   readBoundedJsonResponse,
   readBoundedResponseText,
   readJsonSseEvents,
+  responsesInput,
+  responsesOutput,
+  responsesPayloadPaths,
+  validatedResponsesReplayItems,
   waitForResponseOrStatus,
   type JsonSseEvent,
   type ResponsesOutputItem as OpenAIOutputItem,
@@ -69,6 +59,12 @@ import {
   type ResponsesStreamData as OpenAIStreamData,
   type ResponsesUsage as OpenAIUsage
 } from '@agent-core/provider-openai-responses';
+import {
+  defaultOpenAIResponsesWebSocketFactory,
+  NativeResponsesSession,
+  type OpenAIResponsesWebSocketFactory
+} from './native-session.js';
+export type { OpenAIResponsesWebSocket, OpenAIResponsesWebSocketFactory } from './native-session.js';
 
 export interface OpenAIProviderOptions {
   countTokens?: boolean;
@@ -311,7 +307,13 @@ export class OpenAIProvider implements ModelProvider {
     return { Authorization: `Bearer ${token.token}` };
   }
   async decodeNativeResponse(request: ModelRequest, payload: unknown): Promise<ModelResponse> {
-    return toModelResponse(this.id, request, decodeResponsesPayload(payload), this.endpoint());
+    return toModelResponse(
+      this.id,
+      request,
+      decodeResponsesPayload(payload),
+      this.endpoint(),
+      requiredProtocolRevision(await this.describeModel(request.model))
+    );
   }
   async transformContext(transform: ModelContextTransformRequest): Promise<ModelContextTransformResult> {
     return this.transformContextCompiled(
@@ -395,6 +397,7 @@ export class OpenAIProvider implements ModelProvider {
         message: 'Compaction did not return its canonical native window.'
       });
     const state = await createProviderContextState({
+      protocolRevision: requiredProtocolRevision(await this.describeModel(request.model)),
       provider: this.id,
       endpoint: this.endpoint(),
       request,
@@ -503,7 +506,10 @@ export class OpenAIProvider implements ModelProvider {
     }
   }
 
-  completeCompiled(compiled: CompiledModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
+  completeCompiled(
+    compiled: CompiledModelRequest,
+    options?: ModelTransportOptions
+  ): Promise<ModelResponse> {
     this.assertCompiled(compiled);
     return this.complete(compiled.logicalRequest, options);
   }
@@ -701,7 +707,13 @@ export class OpenAIProvider implements ModelProvider {
       }
 
       const responsePayload = completedResponse
-        ? await toModelResponse(this.id, request, completedResponse, this.endpoint())
+        ? await toModelResponse(
+            this.id,
+            request,
+            completedResponse,
+            this.endpoint(),
+            requiredProtocolRevision(await this.describeModel(request.model))
+          )
         : fallbackStreamResponse(this.id, request, content, reasoning, reasoningSummary, toolCalls);
       const responseToolCalls = dedupeToolCalls([...(responsePayload.toolCalls ?? []), ...toolCalls]);
       const recoveredResponse = parseOpenAIModelResponse({
@@ -757,7 +769,8 @@ export class OpenAIProvider implements ModelProvider {
           owned,
           this.endpoint(),
           owned.messages.slice(0, index),
-          this.id
+          this.id,
+          requiredProtocolRevision(await this.describeModel(owned.model))
         );
     return owned;
   }
@@ -871,14 +884,22 @@ function gpt56Profile(
 function tieredOpenAIPricing(inputRate: number, outputRate: number): NonNullable<ModelProfile['pricing']> {
   return {
     currency: 'USD',
-    rates: { input: inputRate, cacheRead: inputRate / 10, cacheWrite: inputRate * 1.25, output: outputRate },
+    rates: {
+      input: inputRate,
+      cacheRead: inputRate / 10,
+      cacheWrite: inputRate * 1.25,
+      output: outputRate
+    },
     inputTiers: [{ aboveInputTokens: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 }]
   };
 }
 
 class OpenAIProviderSession implements ModelProviderSession {
   constructor(private readonly provider: OpenAIProvider) {}
-  completeCompiled(compiled: CompiledModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
+  completeCompiled(
+    compiled: CompiledModelRequest,
+    options?: ModelTransportOptions
+  ): Promise<ModelResponse> {
     this.provider.assertCompiled(compiled);
     return this.complete(compiled.logicalRequest, options);
   }
@@ -895,7 +916,13 @@ class OpenAIProviderSession implements ModelProviderSession {
       request = await this.provider.validateRequest(request);
       const response = await this.provider.fetchResponse(request, false, options);
       const payload = await parseJsonResponse(this.provider.id, response);
-      return await toModelResponse(this.provider.id, request, payload, this.provider.endpoint());
+      return await toModelResponse(
+        this.provider.id,
+        request,
+        payload,
+        this.provider.endpoint(),
+        requiredProtocolRevision(await this.provider.describeModel(request.model))
+      );
     } catch (error) {
       throw normalizeError(this.provider.id, error);
     }
@@ -1119,7 +1146,8 @@ async function toModelResponse(
   provider: string,
   request: ModelRequest,
   payload: OpenAIResponsesPayload,
-  endpoint: string
+  endpoint: string,
+  protocolRevision: string
 ): Promise<ModelResponse> {
   if (payload.error) {
     const failure = summarizeOpenAIFailure(payload);
@@ -1153,6 +1181,7 @@ async function toModelResponse(
   return parseOpenAIModelResponse({
     content,
     output: await responsesOutput({
+      protocolRevision,
       request,
       provider,
       endpoint,
@@ -1396,7 +1425,9 @@ function mergeStreamingCustomToolCallParts(
   return [maybeToolCall];
 }
 
-function tryCustomAccumulatorToToolCall(item: StreamingCustomToolCallAccumulator): ModelToolCall | undefined {
+function tryCustomAccumulatorToToolCall(
+  item: StreamingCustomToolCallAccumulator
+): ModelToolCall | undefined {
   if (!item.name || item.inputText.length === 0) {
     return undefined;
   }

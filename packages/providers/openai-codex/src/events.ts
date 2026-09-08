@@ -1,4 +1,4 @@
-import { responsesOutput } from '@agent-core/provider-openai-responses';
+import { parseJsonObject, parseJsonValue, type JsonObject } from '@agent-core/json';
 import {
   ModelProviderError,
   type ModelRequest,
@@ -6,7 +6,6 @@ import {
   type ModelToolCall,
   type ModelUsage
 } from '@agent-core/model';
-import { parseJsonValue, parseJsonObject, type JsonObject } from '@agent-core/json';
 import type {
   ResponsesContentPart,
   ResponsesErrorBody,
@@ -15,6 +14,7 @@ import type {
   ResponsesStreamData,
   ResponsesUsage
 } from '@agent-core/provider-openai-responses';
+import { responsesOutput } from '@agent-core/provider-openai-responses';
 
 import { parseCodexModelResponse, summarizeCodexFailure } from './errors.js';
 import { errorMessage, isJsonObject, stringValue } from './utils.js';
@@ -85,6 +85,7 @@ export async function toModelResponse(
   return parseCodexModelResponse({
     content,
     output: await responsesOutput({
+      protocolRevision: 'codex-responses-2026-09-07-v1',
       request,
       provider,
       endpoint: transport.endpoint,
@@ -363,7 +364,9 @@ function tryAccumulatorToToolCall(item: StreamingFunctionCallAccumulator): Model
   }
 }
 
-function tryCustomAccumulatorToToolCall(item: StreamingCustomToolCallAccumulator): ModelToolCall | undefined {
+function tryCustomAccumulatorToToolCall(
+  item: StreamingCustomToolCallAccumulator
+): ModelToolCall | undefined {
   if (!item.name || item.inputText.length === 0) {
     return undefined;
   }

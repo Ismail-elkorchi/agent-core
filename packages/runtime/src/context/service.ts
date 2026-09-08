@@ -1,9 +1,8 @@
-import { contextTransitionRequestSchema } from './schema.js';
-import { randomUUID } from 'node:crypto';
-import { hashJson, PersistenceConflictError } from '@agent-core/persistence';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
-import { HistoryReader, sourceRef, sameHistorySource } from '../history/reader.js';
+import { hashJson, PersistenceConflictError } from '@agent-core/persistence';
+import { randomUUID } from 'node:crypto';
 import type { HistorySourceCut, HistorySourceRef, HistoryView } from '../history/contracts.js';
+import { HistoryReader, sameHistorySource, sourceRef } from '../history/reader.js';
 import type { NoteReadResult, NoteRepository } from '../notes/contracts.js';
 import type {
   SessionBranchEntry,
@@ -12,6 +11,7 @@ import type {
   SessionRepository
 } from '../session/contracts.js';
 import type { ContextSelection, ContextTransitionRequest } from './contracts.js';
+import { contextTransitionRequestSchema } from './schema.js';
 
 export interface ContextBootstrapPolicy {
   /** Byte bound is a deterministic bootstrap bound, never an exact token estimate. */
@@ -64,12 +64,14 @@ export class ContextService {
           retained: window.selection.retained,
           notes: window.selection.notes,
           omitted: window.selection.omitted,
-          strategy: window.selection.strategy
+          strategy: window.selection.strategy,
+          ...(window.selection.representations ? { representations: window.selection.representations } : {})
         }
       : undefined;
     return Object.freeze({
       cut: view.cut,
-      window: window && selection ? Object.freeze({ ...window, selection: Object.freeze(selection) }) : null,
+      window:
+        window && selection ? Object.freeze({ ...window, selection: Object.freeze(selection) }) : null,
       budget: Object.freeze({ maxBytes: this.options.bootstrap.maxBytes, quality: 'byte_bound' as const }),
       pendingWork: Object.freeze(
         pending.map((item) =>
@@ -132,6 +134,19 @@ export class ContextService {
     }
     if (selected.length !== retained.size)
       throw new Error('Context retained source is outside the authorized branch.');
+    const represented = new Set<string>();
+    for (const representation of request.selection.representations ?? []) {
+      const source = representation.source;
+      if (represented.has(source.entryId)) throw new Error('Context source has multiple representations.');
+      represented.add(source.entryId);
+      const entry = selected.find((item) => sameHistorySource(sourceRef(view.cut.sessionId, item), source));
+      if (entry?.type !== 'observation')
+        throw new Error('Only a retained observation may select its recorded summary representation.');
+    }
+    if (represented.size > 0 && !(await this.retrievalAvailable()))
+      throw new Error(
+        'context_admission_failed: summarized observations require authorized original-source retrieval.'
+      );
     const finalizedRuns = new Set(view.runFinalizations.map((record) => record.runId));
     for (const entry of view.entries) {
       if (entry.type !== 'input' || finalizedRuns.has(entry.runId)) continue;
@@ -140,7 +155,11 @@ export class ContextService {
     }
     if (request.selection.strategy !== 'provider') {
       for (const entry of selected) {
-        if (entry.type !== 'observation' || entry.toolBatchId === undefined || entry.callIndex === undefined)
+        if (
+          entry.type !== 'observation' ||
+          entry.toolBatchId === undefined ||
+          entry.callIndex === undefined
+        )
           continue;
         const call = selected.find(
           (item) =>
@@ -213,7 +232,15 @@ export class ContextService {
     const pending = await this.options.repository.loadPendingSubmissions(this.options.session);
     const bytes = Buffer.byteLength(
       JSON.stringify({
-        selected: request.selection.strategy === 'provider' ? [] : selected,
+        selected:
+          request.selection.strategy === 'provider'
+            ? []
+            : selected.map((entry) =>
+                entry.type === 'observation' &&
+                represented.has(sourceRef(view.cut.sessionId, entry).entryId)
+                  ? { ...entry, output: undefined, representation: 'summary' }
+                  : entry
+              ),
         notes,
         acceptedInput: pending.map((item) => item.input)
       })

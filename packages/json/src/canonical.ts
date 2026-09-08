@@ -1,4 +1,4 @@
-import { isOwnedJsonValue } from './value.js';
+import { hasCanonicalJsonOrder, isOwnedJsonValue } from './value.js';
 
 const canonicalSnapshots = new WeakMap<object, string>();
 const MAX_CACHED_CANONICAL_LENGTH = 8 * 1024;
@@ -9,15 +9,31 @@ export function canonicalJsonString(value: unknown): string {
 }
 
 function canonicalJson(value: unknown, path: string, ancestors: WeakSet<object>): string {
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
+  if (value === null || typeof value === 'string' || typeof value === 'boolean')
+    return JSON.stringify(value);
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) throw new TypeError(`${path} contains a non-finite number.`);
     return JSON.stringify(value);
   }
   if (typeof value !== 'object') throw new TypeError(`${path} is outside the canonical JSON domain.`);
   const owned = isOwnedJsonValue(value);
+  if (owned && hasCanonicalJsonOrder(value)) return JSON.stringify(value);
   const cached = owned ? canonicalSnapshots.get(value) : undefined;
   if (cached !== undefined) return cached;
+  // Capture has already proved these snapshots are immutable, acyclic JSON data.
+  // Preserve canonical key ordering without repeating the external-object checks.
+  if (owned) {
+    const text = Array.isArray(value)
+      ? `[${value.map((item) => canonicalJson(item, path, ancestors)).join(',')}]`
+      : `{${Object.keys(value)
+          .sort()
+          .map(
+            (key) =>
+              `${JSON.stringify(key)}:${canonicalJson(Reflect.get(value, key) as unknown, path, ancestors)}`
+          )
+          .join(',')}}`;
+    return rememberCanonical(value, text);
+  }
   if (ancestors.has(value)) throw new TypeError(`${path} contains a cycle.`);
   ancestors.add(value);
   try {
@@ -38,7 +54,7 @@ function canonicalJson(value: unknown, path: string, ancestors: WeakSet<object>)
           throw new TypeError(`${path}[${String(index)}] is sparse or accessor-backed.`);
         entries.push(canonicalJson(descriptor.value as unknown, `${path}[${String(index)}]`, ancestors));
       }
-      return rememberCanonical(value, `[${entries.join(',')}]`, owned);
+      return `[${entries.join(',')}]`;
     }
     const prototype: unknown = Object.getPrototypeOf(value);
     if (prototype !== Object.prototype && prototype !== null)
@@ -58,13 +74,13 @@ function canonicalJson(value: unknown, path: string, ancestors: WeakSet<object>)
       );
     }
     const text = `{${entries.join(',')}}`;
-    return rememberCanonical(value, text, owned);
+    return text;
   } finally {
     ancestors.delete(value);
   }
 }
 
-function rememberCanonical(value: object, text: string, owned: boolean): string {
-  if (owned && text.length <= MAX_CACHED_CANONICAL_LENGTH) canonicalSnapshots.set(value, text);
+function rememberCanonical(value: object, text: string): string {
+  if (text.length <= MAX_CACHED_CANONICAL_LENGTH) canonicalSnapshots.set(value, text);
   return text;
 }

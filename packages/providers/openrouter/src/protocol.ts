@@ -3,8 +3,8 @@ import {
   createProviderContextState,
   ModelProviderError,
   type ModelInputItem,
-  type ModelRequest,
   type ModelOutputItem,
+  type ModelRequest,
   type ModelToolCall
 } from '@agent-core/model';
 
@@ -76,6 +76,7 @@ export async function chatOutput(
     output.push({
       type: 'protocol',
       state: await createProviderContextState({
+        protocolRevision: 'openrouter-chat-2026-09-07-v1',
         request,
         endpoint,
         requestId,

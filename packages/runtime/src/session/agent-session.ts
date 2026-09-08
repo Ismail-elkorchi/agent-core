@@ -1,26 +1,26 @@
-import type { ContextService } from '../context/service.js';
-import type { ContextTransitionRequest } from '../context/contracts.js';
-import type { NoteRepository } from '../notes/contracts.js';
-import { randomUUID } from 'node:crypto';
 import { hashJson } from '@agent-core/persistence';
+import { randomUUID } from 'node:crypto';
 import { AgentRuntime, type AgentRunHandle, type AgentRunInput } from '../agent-runtime.js';
-import { AgentRunCoordinator } from '../run/control/driver.js';
+import type { ContextTransitionRequest } from '../context/contracts.js';
+import type { ContextService } from '../context/service.js';
 import type { AgentProgressEvent } from '../events.js';
+import type { NoteRepository } from '../notes/contracts.js';
 import type { AgentRunResult } from '../run/contracts.js';
+import { AgentRunCoordinator } from '../run/control/driver.js';
+import { assertSessionBinding, decodeSessionBinding, type SessionBindingInput } from './binding.js';
 import type {
-  SessionContextTransitionEntry,
   SessionBranchMarkerEntry,
+  SessionContextTransitionEntry,
   SessionDescriptor,
-  SessionPendingSubmission,
   SessionInputRelationship,
+  SessionPendingSubmission,
   SessionRepository,
+  SessionSubmissionConfiguration,
+  SessionSubmissionInput,
   SessionSuspensionAction,
   SessionSuspensionCategory,
-  SessionSuspensionDescriptor,
-  SessionSubmissionConfiguration,
-  SessionSubmissionInput
+  SessionSuspensionDescriptor
 } from './contracts.js';
-import { assertSessionBinding, decodeSessionBinding, type SessionBindingInput } from './binding.js';
 import { ownSessionSubmissionConfiguration } from './submission-lifecycle.js';
 
 export type AgentSessionConfiguration = SessionSubmissionConfiguration;
@@ -93,6 +93,8 @@ export interface AgentSessionOptions {
   readonly context?: ContextService;
   readonly notes?: NoteRepository;
   readonly maximumQueuedInputs?: number;
+  /** Manual scheduling leaves admitted input durable until its application starts it. */
+  readonly scheduling?: 'automatic' | 'manual';
 }
 
 export class AgentSession {
@@ -138,6 +140,23 @@ export class AgentSession {
 
   restore(): Promise<void> {
     return this.serial(() => this.restorePending());
+  }
+
+  startNextSubmission(): Promise<AgentSessionSubmissionResult | undefined> {
+    return this.serial(async () => {
+      await this.restorePending();
+      if (this.active || this.suspended) return undefined;
+      const next = this.queued.shift();
+      if (!next) return undefined;
+      try {
+        return await this.launch(next);
+      } catch (error) {
+        const failure = error instanceof Error ? error : new Error(String(error));
+        next.reject(failure);
+        await this.emit({ type: 'run.failed', runId: next.runId, error: failure });
+        throw error;
+      }
+    });
   }
 
   private startReadyWork(): Promise<void> {
@@ -200,7 +219,10 @@ export class AgentSession {
         { ...input, task },
         this.configuration
       );
-      if (this.active && this.queued.length >= this.maximumQueuedInputs) {
+      if (
+        (this.active || this.options.scheduling === 'manual') &&
+        this.queued.length >= this.maximumQueuedInputs
+      ) {
         throw new Error(`Session input queue limit of ${String(this.maximumQueuedInputs)} was reached.`);
       }
       await this.options.repository.enqueueSubmission(this.options.descriptor, {
@@ -212,7 +234,7 @@ export class AgentSession {
         },
         configuration: pending.configuration
       });
-      if (this.active || this.queued.length > 0) {
+      if (this.options.scheduling === 'manual' || this.active || this.queued.length > 0) {
         this.enqueue(pending);
         if (!this.active) await this.launchNext();
         return { kind: 'queued', submissionId, completion: pending.completion };
@@ -344,10 +366,14 @@ export class AgentSession {
         return { completion: pending.completion };
       } catch (error) {
         this.suspended = undefined;
-        await this.options.repository.transitionSubmission(this.options.descriptor, suspended.submissionId, {
-          state: 'failed',
-          errorMessage: errorMessage(error)
-        });
+        await this.options.repository.transitionSubmission(
+          this.options.descriptor,
+          suspended.submissionId,
+          {
+            state: 'failed',
+            errorMessage: errorMessage(error)
+          }
+        );
         await this.launchNext();
         throw error;
       }
@@ -390,8 +416,11 @@ export class AgentSession {
   }
 
   async waitForIdle(): Promise<void> {
-    await this.startReadyWork();
-    while (this.active || (!this.suspended && this.queued.length > 0)) {
+    if (this.options.scheduling !== 'manual') await this.startReadyWork();
+    while (
+      this.active ||
+      (this.options.scheduling !== 'manual' && !this.suspended && this.queued.length > 0)
+    ) {
       if (this.active) await this.active.pending.completion.catch(() => undefined);
       await this.serialQueue;
     }
@@ -492,7 +521,9 @@ export class AgentSession {
           submission.suspension.reason !== 'missing_implementation' &&
           (!current || !sameSuspension(submission.suspension, current))
         ) {
-          throw new Error(`Suspended submission ${submission.submissionId} contradicts its run suspension.`);
+          throw new Error(
+            `Suspended submission ${submission.submissionId} contradicts its run suspension.`
+          );
         }
         this.suspended = suspendedSubmission(submission, submission.suspension);
       } else {
@@ -632,6 +663,7 @@ export class AgentSession {
   }
 
   private async launchNext(): Promise<void> {
+    if (this.options.scheduling === 'manual') return;
     while (!this.active && !this.suspended) {
       const next = this.queued.shift();
       if (!next) return;
@@ -827,13 +859,6 @@ function runSuspensionDescriptor(
         actions: suspensionActions('approval', 'abort')
       });
   }
-  if (phase.kind === 'disposition' && phase.stage === 'outcome_unknown')
-    return externalSuspension(
-      submissionId,
-      state.runId,
-      'disposition_outcome_unknown',
-      phase.effect.intent.effectId
-    );
   if (phase.kind !== 'suspended') return undefined;
   if (phase.reason === 'missing_implementation')
     return Object.freeze({
@@ -876,7 +901,7 @@ function suspensionFromResult(
 function externalSuspension(
   submissionId: string,
   runId: string,
-  reason: 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'disposition_outcome_unknown',
+  reason: 'provider_outcome_unknown' | 'tool_outcome_unknown',
   effectId?: string
 ): AgentSessionSuspensionDescriptor {
   return Object.freeze({

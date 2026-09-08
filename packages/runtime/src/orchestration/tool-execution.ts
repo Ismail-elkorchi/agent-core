@@ -1,21 +1,23 @@
-import { hashJson } from '@agent-core/persistence';
 import { issueEffectStartTicket, startExternalEffect } from '@agent-core/effects';
+import { hashJson } from '@agent-core/persistence';
 import {
   POLICY_TOOL_AUTHORIZER,
   abortableToolBoundary,
-  enforceAllowedEffects,
+  contextRequiredObservation,
   effectsConflict,
+  enforceAllowedEffects,
   invokeToolCallPlan,
-  policyBlockedObservation,
   planToolCall,
+  policyBlockedObservation,
   releaseToolCallPlan,
   releaseToolInvocation,
   startToolCallPlan,
-  type ToolCallPlan,
+  type CompiledToolDefinition,
   type ResourceLeaseCoordinator,
+  type ToolAuthorizationRequest,
   type ToolAuthorizer,
   type ToolCall,
-  type CompiledToolDefinition,
+  type ToolCallPlan,
   type ToolEffects,
   type ToolInvocation,
   type ToolObservation,
@@ -23,29 +25,30 @@ import {
   type ToolProgress
 } from '@agent-core/tools';
 import type { AgentAuditEvent, AgentProgressEvent } from '../events.js';
-import { AgentToolStartBlockedError } from '../run/control/driver.js';
-import {
-  toolWork,
-  type AgentRunState,
-  type AgentRunProcedure,
-  type AgentToolTarget
-} from '../run/control/contracts.js';
-import { captureToolCatalog, type ToolCatalogSnapshot } from '../run/tool-catalog.js';
-import {
-  isToolCallStartable,
-  type AgentToolCallState,
-  type AgentToolPhase,
-  type AgentToolCallPlanRecord,
-  type AgentToolSettlementRecord
-} from '../run/control/tool-state.js';
+import type { ModelWindow } from '../inference/model-window.js';
+import type { PromptContextItemInput } from '../inference/prompt-material.js';
 import type {
   AgentApprovalBinding,
   AgentApprovalRequest,
   AgentToolCallAttemptIdentity,
   AgentToolCallIdentity
 } from '../run/contracts.js';
+import {
+  toolWork,
+  type AgentRunProcedure,
+  type AgentRunState,
+  type AgentToolTarget
+} from '../run/control/contracts.js';
+import { AgentToolStartBlockedError } from '../run/control/driver.js';
+import {
+  isToolCallStartable,
+  type AgentToolCallPlanRecord,
+  type AgentToolCallState,
+  type AgentToolPhase,
+  type AgentToolSettlementRecord
+} from '../run/control/tool-state.js';
+import { captureToolCatalog, type ToolCatalogSnapshot } from '../run/tool-catalog.js';
 import type { SessionDescriptor, SessionRepository } from '../session/contracts.js';
-import type { ModelWindow } from '../inference/model-window.js';
 import {
   ObservationStore,
   serializeToolObservationPresentation,
@@ -53,13 +56,24 @@ import {
 } from './observation-store.js';
 import type { AgentRunController } from './run-controller.js';
 
+export type ToolContextPrerequisite = (request: ToolAuthorizationRequest) => Promise<
+  | {
+      readonly summary: string;
+      readonly context: readonly PromptContextItemInput[];
+    }
+  | undefined
+>;
+
 export interface ToolExecutionInput {
   readonly runId: string;
   readonly driverGeneration: number;
   readonly resolveTools: (source: ToolCatalogSnapshot) => readonly CompiledToolDefinition[];
-  readonly currentTools: () => readonly CompiledToolDefinition[] | Promise<readonly CompiledToolDefinition[]>;
+  readonly currentTools: () =>
+    | readonly CompiledToolDefinition[]
+    | Promise<readonly CompiledToolDefinition[]>;
   readonly toolContext: ToolPlanningContext;
   readonly authorizer?: ToolAuthorizer;
+  readonly contextPrerequisite?: ToolContextPrerequisite;
   readonly resourceLeases?: ResourceLeaseCoordinator;
   readonly modelWindow: Pick<ModelWindow, 'recordToolResult'>;
   readonly observationStore: Pick<ObservationStore, 'commitToolObservation' | 'projectToolObservation'>;
@@ -233,6 +247,23 @@ async function callAvailable(
   );
 }
 
+async function contextPrerequisiteObservation(
+  input: ToolExecutionInput,
+  plan: ToolCallPlan
+): Promise<ToolObservation | undefined> {
+  if (!input.contextPrerequisite) return undefined;
+  const prerequisite = await input.contextPrerequisite({
+    call: plan.call,
+    toolImplementationId: plan.toolImplementationId,
+    input: plan.canonicalSnapshot,
+    effects: plan.effects,
+    fingerprint: plan.fingerprint,
+    context: input.toolContext
+  });
+  if (!prerequisite) return undefined;
+  return contextRequiredObservation(prerequisite.summary, prerequisite.context);
+}
+
 async function planAndAuthorizeCall(
   input: ToolExecutionInput,
   phase: AgentToolPhase,
@@ -271,8 +302,7 @@ async function planAndAuthorizeCall(
     ready.approved?.approval.fingerprint === callPlan.fingerprint &&
     ready.approved.approval.policyHash === hashJson(input.toolContext.policy) &&
     hashJson(ready.approved.approval.binding) === hashJson(approvalBinding(callPlan, input.toolContext)) &&
-    hashJson(ready.approved.approval.effects) ===
-      hashJson(callPlan.effects) &&
+    hashJson(ready.approved.approval.effects) === hashJson(callPlan.effects) &&
     hashJson(ready.approved.approval.input) === hashJson(callPlan.canonicalSnapshot)
       ? ready.approved
       : undefined;
@@ -284,7 +314,10 @@ async function planAndAuthorizeCall(
             decision: 'allow' as const,
             ...(currentAuthorization.reason ? { reason: currentAuthorization.reason } : {})
           }
-        : { decision: 'deny' as const, reason: currentAuthorization.reason ?? storedApproval.approval.reason }
+        : {
+            decision: 'deny' as const,
+            reason: currentAuthorization.reason ?? storedApproval.approval.reason
+          }
     : currentAuthorization;
   const planRecord = Object.freeze({
     ...toolCallPlanRecord(callPlan, input.toolContext, authorization.decision, authorization.reason),
@@ -359,6 +392,22 @@ async function planAndAuthorizeCall(
     const state: AgentToolCallState = Object.freeze({
       stage: 'settled',
       plan: planRecord,
+      toolAttempt: 1,
+      settlement: settlementRecord(committed)
+    });
+    await replaceCall(input, phase, 'plan_tool_call', callIndex, state);
+    await appendToolEnded(input, phase, callIndex, call, state);
+    committedObservations.set(key, committed);
+    await releaseToolCallPlan(callPlan);
+    retainedPlans.delete(key);
+    return true;
+  }
+
+  const prerequisite = await contextPrerequisiteObservation(input, callPlan);
+  if (prerequisite) {
+    const committed = await commitObservation(input, phase, call, undefined, prerequisite);
+    const state: AgentToolCallState = Object.freeze({
+      stage: 'settled',
       toolAttempt: 1,
       settlement: settlementRecord(committed)
     });
@@ -447,6 +496,27 @@ async function startCall(
       if (lease && !lease.transferred) lease.release();
       await releaseToolCallPlan(plan);
       return { completion: Promise.resolve({ outcome: 'owned' }) };
+    }
+    const prerequisite = await contextPrerequisiteObservation(input, plan);
+    if (prerequisite) {
+      const committed = await commitObservation(input, phase, call, undefined, prerequisite);
+      const state: AgentToolCallState = Object.freeze({
+        stage: 'settled',
+        toolAttempt: callState.toolAttempt,
+        settlement: settlementRecord(committed)
+      });
+      await replaceCall(
+        input,
+        phase,
+        'start_tool_call',
+        callIndex,
+        state,
+        callState.effect.intent.effectId
+      );
+      await appendToolEnded(input, phase, callIndex, call, state);
+      if (lease && !lease.transferred) lease.release();
+      await releaseToolCallPlan(plan);
+      return { completion: Promise.resolve({ outcome: 'owned', committed }) };
     }
     const started = startExternalEffect(callState.effect, callState.effect.ticket, input.driverGeneration);
     if (started.status !== 'started') throw new Error(`Tool effect start was rejected: ${started.reason}.`);
@@ -723,7 +793,10 @@ async function recordObservation(
 ): Promise<void> {
   const identity = attemptIdentity(phase, callIndex, call, state.toolAttempt);
   try {
-    const record = await input.observationStore.projectToolObservation(committed, phase.modelInputModalities);
+    const record = await input.observationStore.projectToolObservation(
+      committed,
+      phase.modelInputModalities
+    );
     await input.session?.repository.appendObservation(input.session.descriptor, {
       runId: input.runId,
       identity,
@@ -751,10 +824,7 @@ async function recordObservation(
       ...(call.id ? { callId: call.id } : {}),
       toolCallType: call.input.kind === 'text' ? 'custom' : 'function',
       immediateContent: serializeToolObservationPresentation(record.immediatePresentation),
-      retainedContent: serializeToolObservationPresentation(record.retainedPresentation),
-      immediateImages: record.immediateImages,
-      imageArtifacts: record.imageArtifacts,
-      observedFacts: [...record.observedFacts]
+      immediateImages: record.immediateImages
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -768,8 +838,7 @@ async function recordObservation(
       toolName: call.name,
       ...(call.id ? { callId: call.id } : {}),
       toolCallType: call.input.kind === 'text' ? 'custom' : 'function',
-      immediateContent: fallback,
-      retainedContent: fallback
+      immediateContent: fallback
     });
   }
   await input.emit({
@@ -789,7 +858,8 @@ function committedFromState(
   const tool = state.plan
     ? sourceTools(input, phase, call).find(
         (modelOutput) =>
-          modelOutput.name === call.name && modelOutput.implementationId === state.plan?.toolImplementationId
+          modelOutput.name === call.name &&
+          modelOutput.implementationId === state.plan?.toolImplementationId
       )
     : undefined;
   return Object.freeze({
@@ -1042,7 +1112,10 @@ function minimalToolResultPresentation(
     summary: `${observation.summary} The durable tool result was committed, but its rich model presentation could not be recorded.`,
     scope: observation.scope,
     coverage: observation.scope.coverage,
-    results: { artifacts: observationArtifacts(observation), recordingError: recordingError.slice(0, 1_000) }
+    results: {
+      artifacts: observationArtifacts(observation),
+      recordingError: recordingError.slice(0, 1_000)
+    }
   });
 }
 function observationArtifacts(observation: ToolObservation) {

@@ -1,7 +1,7 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { createServer, type Socket } from 'node:net';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import { mkdir, open, rename, rm } from 'node:fs/promises';
+import { createServer, type Socket } from 'node:net';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -17,7 +17,8 @@ const command = required('command');
 const releaseTimeoutMs = positive(required('release-timeout-ms'));
 const tokenValue = process.env.AGENT_CORE_SUPERVISOR_TOKEN;
 delete process.env.AGENT_CORE_SUPERVISOR_TOKEN;
-if (!tokenValue || !/^[a-f0-9]{64}$/u.test(tokenValue)) throw new Error('Process supervisor authentication token is unavailable.');
+if (!tokenValue || !/^[a-f0-9]{64}$/u.test(tokenValue))
+  throw new Error('Process supervisor authentication token is unavailable.');
 const authenticationToken: string = tokenValue;
 
 let userProcess: ChildProcess | undefined;
@@ -30,11 +31,15 @@ if (process.platform !== 'win32') {
   await mkdir(path.dirname(endpoint), { recursive: true, mode: 0o700 });
   await rm(endpoint, { force: true });
 }
-const server = createServer((socket) => { handleConnection(socket); });
+const server = createServer((socket) => {
+  handleConnection(socket);
+});
 server.unref();
 await new Promise<void>((resolve, reject) => {
   server.once('error', reject);
-  server.listen(endpoint, () => { resolve(); });
+  server.listen(endpoint, () => {
+    resolve();
+  });
 });
 server.ref();
 
@@ -44,15 +49,22 @@ const releaseTimer = setTimeout(() => {
 }, releaseTimeoutMs);
 releaseTimer.unref();
 
-process.stdout.on('error', () => { /* The manager may have crashed. */ });
-process.stderr.on('error', () => { /* The manager may have crashed. */ });
+process.stdout.on('error', () => {
+  /* The manager may have crashed. */
+});
+process.stderr.on('error', () => {
+  /* The manager may have crashed. */
+});
 
 function handleConnection(socket: Socket): void {
   socket.setEncoding('utf8');
   let request = '';
   socket.on('data', (chunk: string) => {
     request += chunk;
-    if (Buffer.byteLength(request, 'utf8') > 16_384) { socket.destroy(); return; }
+    if (Buffer.byteLength(request, 'utf8') > 16_384) {
+      socket.destroy();
+      return;
+    }
     if (!request.includes('\n')) return;
     socket.removeAllListeners('data');
     void respond(socket, request.slice(0, request.indexOf('\n')));
@@ -62,24 +74,38 @@ function handleConnection(socket: Socket): void {
 async function respond(socket: Socket, text: string): Promise<void> {
   try {
     const request: unknown = JSON.parse(text);
-    if (!isRecord(request) || request.identity !== identity || typeof request.nonce !== 'string'
-      || (request.action !== 'challenge' && request.action !== 'release' && request.action !== 'stop')
-      || typeof request.clientProof !== 'string') throw new Error('Invalid supervisor request.');
+    if (
+      !isRecord(request) ||
+      request.identity !== identity ||
+      typeof request.nonce !== 'string' ||
+      (request.action !== 'challenge' && request.action !== 'release' && request.action !== 'stop') ||
+      typeof request.clientProof !== 'string'
+    )
+      throw new Error('Invalid supervisor request.');
     const expected = hmac(`client\n${identity}\n${request.nonce}\n${request.action}`);
     if (!safeEqual(request.clientProof, expected)) throw new Error('Supervisor authentication failed.');
     if (request.action === 'release') await release();
     if (request.action === 'stop') stop();
     const processPid = userProcess?.pid;
-    const processProof = processPid === undefined ? undefined : hmac(`process\n${identity}\n${processId}\n${ownerText(owner)}\n${String(processPid)}`);
-    socket.end(JSON.stringify({
-      ok: true,
-      identity,
-      nonce: request.nonce,
-      ...(processPid === undefined ? {} : { processPid, processProof }),
-      serverProof: hmac(`server\n${identity}\n${request.nonce}\n${request.action}\n${String(processPid ?? '')}\n${processProof ?? ''}`)
-    }) + '\n');
+    const processProof =
+      processPid === undefined
+        ? undefined
+        : hmac(`process\n${identity}\n${processId}\n${ownerText(owner)}\n${String(processPid)}`);
+    socket.end(
+      JSON.stringify({
+        ok: true,
+        identity,
+        nonce: request.nonce,
+        ...(processPid === undefined ? {} : { processPid, processProof }),
+        serverProof: hmac(
+          `server\n${identity}\n${request.nonce}\n${request.action}\n${String(processPid ?? '')}\n${processProof ?? ''}`
+        )
+      }) + '\n'
+    );
   } catch (error) {
-    socket.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }) + '\n');
+    socket.end(
+      JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }) + '\n'
+    );
   }
 }
 
@@ -87,25 +113,43 @@ async function release(): Promise<void> {
   if (released) return;
   released = true;
   clearTimeout(releaseTimer);
-  const child = spawn(process.platform === 'win32' ? process.execPath : command, process.platform === 'win32'
-    ? [fileURLToPath(new URL('./process-command-host.js', import.meta.url)), cwd, command]
-    : [], {
-    cwd,
-    env: process.env,
-    shell: process.platform !== 'win32',
-    stdio: process.platform === 'win32' ? ['pipe', 'pipe', 'pipe', 'ipc'] : ['pipe', 'pipe', 'pipe'],
-    detached: true,
-    windowsHide: true
-  });
-  if (!child.stdin || !child.stdout || !child.stderr) throw new Error('Process supervisor requires piped command streams.');
+  const child = spawn(
+    process.platform === 'win32' ? process.execPath : command,
+    process.platform === 'win32'
+      ? [fileURLToPath(new URL('./process-command-host.js', import.meta.url)), cwd, command]
+      : [],
+    {
+      cwd,
+      env: process.env,
+      shell: process.platform !== 'win32',
+      stdio: process.platform === 'win32' ? ['pipe', 'pipe', 'pipe', 'ipc'] : ['pipe', 'pipe', 'pipe'],
+      detached: true,
+      windowsHide: true
+    }
+  );
+  if (!child.stdin || !child.stdout || !child.stderr)
+    throw new Error('Process supervisor requires piped command streams.');
   userProcess = child;
   process.stdin.pipe(child.stdin);
   child.stdout.pipe(process.stdout, { end: false });
   child.stderr.pipe(process.stderr, { end: false });
-  child.once('error', (error) => { void finish('failed', null, null, 71, error.message); });
-  child.once('close', (exitCode, signal) => { void finish(stopRequested ? 'stopped' : exitCode === null ? 'failed' : 'exited', exitCode, signal, exitCode ?? 1); });
+  child.once('error', (error) => {
+    void finish('failed', null, null, 71, error.message);
+  });
+  child.once('close', (exitCode, signal) => {
+    void finish(
+      stopRequested ? 'stopped' : exitCode === null ? 'failed' : 'exited',
+      exitCode,
+      signal,
+      exitCode ?? 1
+    );
+  });
   await new Promise<void>((resolve, reject) => {
-    if (process.platform === 'win32') child.once('message', (message) => { if (message === 'ready') resolve(); else reject(new Error('Invalid process command host readiness response.')); });
+    if (process.platform === 'win32')
+      child.once('message', (message) => {
+        if (message === 'ready') resolve();
+        else reject(new Error('Invalid process command host readiness response.'));
+      });
     else child.once('spawn', resolve);
     child.once('error', reject);
   });
@@ -113,7 +157,12 @@ async function release(): Promise<void> {
 
 function stop(): void {
   stopRequested = true;
-  if (!userProcess) { setImmediate(() => { void finish('stopped', null, null, 0); }); return; }
+  if (!userProcess) {
+    setImmediate(() => {
+      void finish('stopped', null, null, 0);
+    });
+    return;
+  }
   if (process.platform === 'win32') {
     const pid = userProcess.pid;
     if (pid) spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
@@ -122,11 +171,19 @@ function stop(): void {
   }
   const child = userProcess;
   signalTree(child, 'SIGTERM');
-  forceTimer = setTimeout(() => { signalTree(child, 'SIGKILL'); }, 500);
+  forceTimer = setTimeout(() => {
+    signalTree(child, 'SIGKILL');
+  }, 500);
   forceTimer.unref();
 }
 
-async function finish(state: 'exited' | 'stopped' | 'failed', exitCode: number | null, signal: string | null, supervisorExitCode: number, diagnostic?: string): Promise<void> {
+async function finish(
+  state: 'exited' | 'stopped' | 'failed',
+  exitCode: number | null,
+  signal: string | null,
+  supervisorExitCode: number,
+  diagnostic?: string
+): Promise<void> {
   if (terminal) return;
   terminal = true;
   clearTimeout(releaseTimer);
@@ -139,15 +196,25 @@ async function finish(state: 'exited' | 'stopped' | 'failed', exitCode: number |
     exitCode,
     signal,
     ...(diagnostic ? { diagnostic } : {}),
-    proof: hmac(`terminal\n${identity}\n${processId}\n${ownerText(owner)}\n${state}\n${String(exitCode)}\n${String(signal)}`)
+    proof: hmac(
+      `terminal\n${identity}\n${processId}\n${ownerText(owner)}\n${state}\n${String(exitCode)}\n${String(signal)}`
+    )
   };
   await mkdir(path.dirname(stateFile), { recursive: true, mode: 0o700 });
   const temporary = `${stateFile}.${String(process.pid)}.tmp`;
   const handle = await open(temporary, 'wx', 0o600);
-  try { await handle.writeFile(JSON.stringify(value) + '\n', 'utf8'); await handle.sync(); }
-  finally { await handle.close(); }
+  try {
+    await handle.writeFile(JSON.stringify(value) + '\n', 'utf8');
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
   await rename(temporary, stateFile);
-  await new Promise<void>((resolve) => server.close(() => { resolve(); }));
+  await new Promise<void>((resolve) =>
+    server.close(() => {
+      resolve();
+    })
+  );
   if (process.platform !== 'win32') await rm(endpoint, { force: true });
   process.exitCode = supervisorExitCode;
 }
@@ -155,29 +222,81 @@ async function finish(state: 'exited' | 'stopped' | 'failed', exitCode: number |
 function signalTree(child: ChildProcess, signal: 'SIGTERM' | 'SIGKILL'): void {
   const pid = child.pid;
   if (!pid) return;
-  try { process.kill(-pid, signal); }
-  catch { try { child.kill(signal); } catch { /* Already exited. */ } }
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    try {
+      child.kill(signal);
+    } catch {
+      /* Already exited. */
+    }
+  }
 }
 function argumentsMap(values: readonly string[]): Map<string, string> {
   const result = new Map<string, string>();
   for (let index = 0; index < values.length; index += 2) {
-    const key = values[index]; const value = values[index + 1];
-    if (!key?.startsWith('--') || value === undefined) throw new Error('Invalid process supervisor arguments.');
+    const key = values[index];
+    const value = values[index + 1];
+    if (!key?.startsWith('--') || value === undefined)
+      throw new Error('Invalid process supervisor arguments.');
     result.set(key.slice(2), value);
   }
   return result;
 }
-function required(name: string): string { const value = args.get(name); if (!value) throw new Error(`Missing process supervisor argument: ${name}`); return value; }
-function positive(value: string): number { const number = Number(value); if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid release timeout.'); return number; }
-function parseOwner(value: string): { readonly runId: string; readonly turnId: string; readonly toolBatchId: string; readonly callIndex: number } {
+function required(name: string): string {
+  const value = args.get(name);
+  if (!value) throw new Error(`Missing process supervisor argument: ${name}`);
+  return value;
+}
+function positive(value: string): number {
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid release timeout.');
+  return number;
+}
+function parseOwner(value: string): {
+  readonly ownerId: string;
+  readonly runId: string;
+  readonly turnId: string;
+  readonly toolBatchId: string;
+  readonly callIndex: number;
+} {
   const parsed: unknown = JSON.parse(value);
-  if (!isRecord(parsed) || typeof parsed.runId !== 'string' || typeof parsed.turnId !== 'string' || typeof parsed.toolBatchId !== 'string'
-    || typeof parsed.callIndex !== 'number' || !Number.isSafeInteger(parsed.callIndex) || parsed.callIndex < 0) throw new Error('Invalid process execution owner.');
-  return Object.freeze({ runId: parsed.runId, turnId: parsed.turnId, toolBatchId: parsed.toolBatchId, callIndex: parsed.callIndex });
+  if (
+    !isRecord(parsed) ||
+    typeof parsed.ownerId !== 'string' ||
+    typeof parsed.runId !== 'string' ||
+    typeof parsed.turnId !== 'string' ||
+    typeof parsed.toolBatchId !== 'string' ||
+    typeof parsed.callIndex !== 'number' ||
+    !Number.isSafeInteger(parsed.callIndex) ||
+    parsed.callIndex < 0
+  )
+    throw new Error('Invalid process execution owner.');
+  return Object.freeze({
+    ownerId: parsed.ownerId,
+    runId: parsed.runId,
+    turnId: parsed.turnId,
+    toolBatchId: parsed.toolBatchId,
+    callIndex: parsed.callIndex
+  });
 }
-function ownerText(value: { readonly runId: string; readonly turnId: string; readonly toolBatchId: string; readonly callIndex: number }): string {
-  return `${value.runId}\n${value.turnId}\n${value.toolBatchId}\n${String(value.callIndex)}`;
+function ownerText(value: {
+  readonly ownerId: string;
+  readonly runId: string;
+  readonly turnId: string;
+  readonly toolBatchId: string;
+  readonly callIndex: number;
+}): string {
+  return `${value.ownerId}\n${value.runId}\n${value.turnId}\n${value.toolBatchId}\n${String(value.callIndex)}`;
 }
-function hmac(value: string): string { return createHmac('sha256', authenticationToken).update(value).digest('hex'); }
-function safeEqual(actual: string, expected: string): boolean { const left = Buffer.from(actual); const right = Buffer.from(expected); return left.length === right.length && timingSafeEqual(left, right); }
-function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
+function hmac(value: string): string {
+  return createHmac('sha256', authenticationToken).update(value).digest('hex');
+}
+function safeEqual(actual: string, expected: string): boolean {
+  const left = Buffer.from(actual);
+  const right = Buffer.from(expected);
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}

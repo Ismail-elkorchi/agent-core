@@ -69,7 +69,7 @@ try {
     "import * as local from '@agent-core/tools-local';",
     "import * as nodePersistence from '@agent-core/persistence/node';",
     "if (!runtime.decodeAgentTerminalSnapshot || !runtime.AgentRuntime || !runtime.AgentSession || !runtime.InMemorySessionRepository || !nodeRuntime.JsonlSessionRepository || !model.parseModelResponse || !json.parseJsonObject || !effects.decodeExternalEffectIntent || !persistence.InMemoryEventRepository || !nodePersistence.JsonlEventRepository || !tools.planToolCall || !tools.invokeToolCallPlan || !tools.isCommandExecution || !local.LocalCommandExecution) throw new Error('public runtime exports missing');",
-    "if (!runtime.HistoryReader || !runtime.ContextService || !runtime.InferenceService || !runtime.InMemoryNoteRepository || !runtime.InMemoryInferenceRepository || !nodeRuntime.JsonlNoteRepository || !nodeRuntime.JsonlInferenceRepository || !runtime.createHistoryTools || !runtime.createNotesTools || !runtime.createContextTools || !model.accountModelRequest || !model.compileModelRequest) throw new Error('persistent context exports missing');"
+    "if (!runtime.HistoryReader || !runtime.ContextService || !runtime.InferenceService || !runtime.InMemoryNoteRepository || !runtime.InMemoryInferenceRepository || !nodeRuntime.JsonlNoteRepository || !nodeRuntime.JsonlInferenceRepository || !runtime.createHistoryTools || !runtime.createNotesTools || !runtime.createContextTools || !runtime.EffectExecutor || !runtime.createObservationAccess || !tools.commandExecutionResources || !tools.contextRequiredObservation || !model.accountModelRequest || !model.compileModelRequest) throw new Error('persistent context exports missing');"
   ].join('\n'));
   await exec(process.execPath, ['runtime.mjs'], { cwd: consumer });
 
@@ -81,10 +81,10 @@ try {
     "diagnostic.value;",
     "import type { ModelInputItem, ModelOutputItem, ProviderContextState, CompiledModelRequest, RequestAccounting } from '@agent-core/model';",
     "import type { EffectRecoveryCapability } from '@agent-core/effects';",
-    "import type { AgentModelOutput, AgentRunControl, AgentSessionState, AgentTerminalSnapshot, ContextWindowRecord, HistorySourceRef, NoteRepository } from '@agent-core/runtime';",
-    "import type { ToolEffects, ToolObservation, ToolObservationInput } from '@agent-core/tools';",
+    "import type { AgentModelOutput, AgentRunControl, AgentSessionState, AgentTerminalSnapshot, AgentRuntimeOptions, ContextWindowRecord, HistorySourceRef, NoteRepository } from '@agent-core/runtime';",
+    "import type { ExecutionResources, ToolEffects, ToolObservation, ToolObservationInput } from '@agent-core/tools';",
     "const json: JsonObject = { nested: { ok: true }, values: [1, 'two'] };",
-    "const providerState: ProviderContextState = { version: 1, provider: 'test', model: 'test-model', endpoint: 'https://provider.invalid', kind: 'response', data: { responseId: 'resp' }, origin: { requestId: 'request', inputIdentity: 'input' }, compatibility: { model: 'test-model', endpoint: 'https://provider.invalid', requiresExactPrefix: true }, replay: 'required' };",
+    "const providerState: ProviderContextState = { version: 1, provider: 'test', model: 'test-model', endpoint: 'https://provider.invalid', kind: 'response', data: { responseId: 'resp' }, origin: { requestId: 'request', inputIdentity: 'input' }, compatibility: { model: 'test-model', endpoint: 'https://provider.invalid', protocolRevision: 'conservative-v1', requiresExactPrefix: true }, replay: 'required' };",
     "const developerInput: ModelInputItem = { role: 'developer', content: 'Application-owned instruction.' };",
     "declare const outputItem: ModelOutputItem;",
     "declare const compiled: CompiledModelRequest;",
@@ -102,9 +102,18 @@ try {
     "// @ts-expect-error owned observation fields are readonly",
     "immutableObservation.output = {};",
     "declare const terminal: AgentTerminalSnapshot;",
+    "declare const options: AgentRuntimeOptions;",
+    "// @ts-expect-error application checks are not a kernel option",
+    "options.checks;",
+    "// @ts-expect-error application disposition is not a kernel option",
+    "options.disposition;",
+    "// @ts-expect-error application verification is not execution truth",
+    "terminal.verificationStatus;",
+    "declare const resources: ExecutionResources;",
+    "const lifetime = resources.lifetime;",
     "declare const run: AgentRunControl;",
     "declare const sessionState: AgentSessionState;",
-    "void [json, providerState, developerInput, outputItem, compiled, accounting, window, source, notes, modelOutput, recovery, effects, rawObservation, ownedObservation, immutableObservation, terminal, run, sessionState];"
+    "void [json, providerState, developerInput, outputItem, compiled, accounting, window, source, notes, modelOutput, recovery, effects, rawObservation, ownedObservation, immutableObservation, terminal, options, lifetime, run, sessionState];"
   ].join('\n'));
   for (const exactOptionalPropertyTypes of [true, false]) {
     const config = `tsconfig-${String(exactOptionalPropertyTypes)}.json`;

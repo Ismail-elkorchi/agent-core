@@ -5,22 +5,28 @@ import {
   type CommandExecution,
   type CommandExecutionOwner
 } from '@agent-core/tools';
-import { processScope } from '../../core/resources.js';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
 import { presentProcessObservation } from '../../core/presenters.js';
+import { processScope } from '../../core/resources.js';
 import { isSuccessfulProcessResult } from '../process-output.js';
 import { writeStdinInputSchema, writeStdinOutputSchema } from './schema.js';
 
 export const writeStdinTool = defineTool({
-  name: 'write_stdin', implementationId: 'agent-core.write-stdin.v1',
+  name: 'write_stdin',
+  implementationId: 'agent-core.write-stdin.v1',
   description: 'Write to, close, or poll a process started by exec_command using a stable output cursor.',
-  schema: writeStdinInputSchema, outputSchema: writeStdinOutputSchema,
+  schema: writeStdinInputSchema,
+  outputSchema: writeStdinOutputSchema,
   presentObservation: presentProcessObservation,
   requirements: { services: ['localToolConfiguration', 'commandExecution'] },
   effectEnvelope: { accesses: [{ mode: 'execute', scope: processScope() }], lockScopes: [processScope()] },
   canonicalizeInput(input, context) {
     const limits = requireLocalToolConfiguration(context).process;
-    return { ...input, yieldMs: clampRequestedLimit(input.yieldMs, limits.maxYieldMs), outputTokenBudget: clampRequestedLimit(input.outputTokenBudget, limits.maxOutputTokens) };
+    return {
+      ...input,
+      yieldMs: clampRequestedLimit(input.yieldMs, limits.maxYieldMs),
+      outputTokenBudget: clampRequestedLimit(input.outputTokenBudget, limits.maxOutputTokens)
+    };
   },
   deriveEffects(input) {
     return {
@@ -30,23 +36,54 @@ export const writeStdinTool = defineTool({
     };
   },
   async invoke(input, context) {
-    const executor = requireToolService<CommandExecution>(context, 'commandExecution', isCommandExecution, 'CommandExecution');
-    const owner = processOwner(context.invocation);
-    if (input.text !== undefined && input.text.length > 0) await executor.writeInput(input.processId, input.text, owner);
+    const executor = requireToolService<CommandExecution>(
+      context,
+      'commandExecution',
+      isCommandExecution,
+      'CommandExecution'
+    );
+    const owner = processOwner(context);
+    if (input.text !== undefined && input.text.length > 0)
+      await executor.writeInput(input.processId, input.text, owner);
     if (input.closeStdin) await executor.closeInput(input.processId, owner);
-    const result = await executor.query(input.processId, input.outputTokenBudget, input.yieldMs, input.afterCursor, owner);
+    const result = await executor.query(
+      input.processId,
+      input.outputTokenBudget,
+      input.yieldMs,
+      input.afterCursor,
+      owner
+    );
     return {
-      kind: 'result' as const, ok: isSuccessfulProcessResult(result),
-      summary: result.status === 'running' ? 'Process ' + result.processId + ' is still running.' : 'Process ' + result.processId + ' is ' + result.status + '.',
+      kind: 'result' as const,
+      ok: isSuccessfulProcessResult(result),
+      summary:
+        result.status === 'running'
+          ? 'Process ' + result.processId + ' is still running.'
+          : 'Process ' + result.processId + ' is ' + result.status + '.',
       scope: {
-        resources: [processScope(result.processId)], coverage: result.combined.omittedBytes > 0 || result.cursorExpired ? 'partial' : 'complete',
-        ...(result.combined.omittedBytes > 0 || result.cursorExpired ? { truncated: true, causes: [result.cursorExpired ? 'cursor_expired' : 'output_budget'], omitted: { bytes: result.combined.omittedBytes } } : {})
+        resources: [processScope(result.processId)],
+        coverage: result.combined.omittedBytes > 0 || result.cursorExpired ? 'partial' : 'complete',
+        ...(result.combined.omittedBytes > 0 || result.cursorExpired
+          ? {
+              truncated: true,
+              causes: [result.cursorExpired ? 'cursor_expired' : 'output_budget'],
+              omitted: { bytes: result.combined.omittedBytes }
+            }
+          : {})
       },
-      ...(result.artifact ? { content: [{ type: 'artifact' as const, artifact: result.artifact }] } : {}), output: result
+      ...(result.artifact ? { content: [{ type: 'artifact' as const, artifact: result.artifact }] } : {}),
+      output: result
     };
   }
 });
-function processOwner(invocation: import('@agent-core/tools').ToolInvocationContext | undefined): CommandExecutionOwner {
+function processOwner(context: import('@agent-core/tools').ToolExecutionContext): CommandExecutionOwner {
+  const invocation = context.invocation;
   if (!invocation) throw new Error('Process tools require a runtime invocation owner.');
-  return Object.freeze({ runId: invocation.runId, turnId: invocation.turnId, toolBatchId: invocation.toolBatchId, callIndex: invocation.callIndex });
+  return Object.freeze({
+    ownerId: context.resourceOwnerId ?? invocation.runId,
+    runId: invocation.runId,
+    turnId: invocation.turnId,
+    toolBatchId: invocation.toolBatchId,
+    callIndex: invocation.callIndex
+  });
 }

@@ -1,21 +1,24 @@
-import { modelTransportSignal, type ModelTransportOptions } from '@agent-core/model';
-import { chatProtocolMessages, chatOutput, mergeReasoningDetails } from './protocol.js';
+import { parseJsonObject, parseJsonValue, type JsonObject } from '@agent-core/json';
 import {
+  assertModelRequestSupported,
+  assertProviderContextCompatible,
   compileModelRequest,
   conservativeProtocolCapabilities,
-  assertProviderContextCompatible,
-  type CompiledModelRequest
-} from '@agent-core/model';
-import {
-  type ModelCapabilities,
   ModelContractError,
+  ModelProviderError,
+  modelTransportSignal,
+  parseModelProfile,
+  parseModelRequest,
+  parseModelResponse,
+  requiredProtocolRevision,
+  type CompiledModelRequest,
+  type ModelCapabilities,
   type ModelImage,
   type ModelInputItem,
   type ModelModality,
   type ModelPricing,
   type ModelProfile,
   type ModelProvider,
-  ModelProviderError,
   type ModelProviderErrorCode,
   type ModelProviderInfo,
   type ModelReasoningRequest,
@@ -25,13 +28,9 @@ import {
   type ModelStreamEvent,
   type ModelTool,
   type ModelToolCall,
-  type ModelUsage,
-  assertModelRequestSupported,
-  parseModelProfile,
-  parseModelRequest,
-  parseModelResponse
+  type ModelTransportOptions,
+  type ModelUsage
 } from '@agent-core/model';
-import { parseJsonValue, parseJsonObject, type JsonObject } from '@agent-core/json';
 import {
   readBoundedJsonResponse,
   readBoundedResponseText,
@@ -39,6 +38,7 @@ import {
   waitForResponseOrStatus,
   type JsonSseEvent
 } from '@agent-core/provider-openai-responses';
+import { chatOutput, chatProtocolMessages, mergeReasoningDetails } from './protocol.js';
 import {
   decodeOpenRouterChatResponse,
   decodeOpenRouterModelCatalog,
@@ -164,7 +164,10 @@ export class OpenRouterProvider implements ModelProvider {
         message: 'Unrecognized compiled request.'
       });
   }
-  completeCompiled(compiled: CompiledModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
+  completeCompiled(
+    compiled: CompiledModelRequest,
+    options?: ModelTransportOptions
+  ): Promise<ModelResponse> {
     this.assertCompiled(compiled);
     return this.complete(compiled.logicalRequest, options);
   }
@@ -399,7 +402,8 @@ export class OpenRouterProvider implements ModelProvider {
           owned,
           `${this.baseUrl}/chat/completions`,
           owned.messages.slice(0, index),
-          this.id
+          this.id,
+          requiredProtocolRevision(await this.describeModel(owned.model))
         );
     return owned;
   }
@@ -549,7 +553,10 @@ function contentForOpenRouterMessage(message: ModelInputItem): unknown {
   return message.content;
 }
 
-function toOpenRouterContentParts(content: string, images: readonly ModelImage[]): Record<string, unknown>[] {
+function toOpenRouterContentParts(
+  content: string,
+  images: readonly ModelImage[]
+): Record<string, unknown>[] {
   return [
     ...(content.length > 0 ? [{ type: 'text', text: content }] : []),
     ...images.map((image) => ({
@@ -803,7 +810,10 @@ function reasoningFromWire(message: OpenRouterResponseMessage | undefined): stri
   return '';
 }
 
-function normalizeToolCalls(provider: string, toolCalls: readonly OpenRouterWireToolCall[]): ModelToolCall[] {
+function normalizeToolCalls(
+  provider: string,
+  toolCalls: readonly OpenRouterWireToolCall[]
+): ModelToolCall[] {
   return toolCalls.map((toolCall) => wireToolCallToModelToolCall(provider, toolCall));
 }
 

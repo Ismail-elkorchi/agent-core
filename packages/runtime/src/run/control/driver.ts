@@ -1,3 +1,9 @@
+import {
+  decodeEffectSettlementPermit,
+  knownEffectExposure,
+  settleExternalEffect,
+  type EffectSettlementPermit
+} from '@agent-core/effects';
 import { canonicalJsonString } from '@agent-core/json';
 import {
   hashJson,
@@ -6,39 +12,33 @@ import {
   type EventLedgerTail,
   type EventRepository
 } from '@agent-core/persistence';
+import type { ToolCall } from '@agent-core/tools';
+import { encodeToolObservation } from '@agent-core/tools';
 import { encodeAgentEvent, type AgentAuditEvent, type AgentEvent } from '../../events.js';
+import type { AgentRunBudgetState } from '../contracts.js';
 import {
   decodeAgentRunState,
   nextAgentRunInstruction,
-  toolWork,
   providerWork,
-  type AgentRunProcedure,
-  type AgentRunTarget,
-  type AgentToolTarget,
-  type AgentProviderTarget,
+  toolWork,
   type AgentProviderPhase,
+  type AgentProviderTarget,
   type AgentRunControlConfiguration,
-  type AgentRunStateInput,
-  type AgentRunInstruction,
   type AgentRunControlPhase,
-  type AgentRunState
+  type AgentRunInstruction,
+  type AgentRunProcedure,
+  type AgentRunState,
+  type AgentRunStateInput,
+  type AgentRunTarget,
+  type AgentToolTarget
 } from './contracts.js';
-import type { AgentRunBudgetState } from '../contracts.js';
-import type { ToolCall } from '@agent-core/tools';
-import { encodeToolObservation } from '@agent-core/tools';
-import {
-  decodeEffectSettlementPermit,
-  knownEffectExposure,
-  settleExternalEffect,
-  type EffectSettlementPermit
-} from '@agent-core/effects';
 import {
   decodeAgentToolSettlementRecord,
   decodeToolResultDelivery,
   isToolCallStartable,
-  type AgentToolResultDelivery,
   type AgentToolCallState,
   type AgentToolPhase,
+  type AgentToolResultDelivery,
   type AgentToolSettlementRecord
 } from './tool-state.js';
 
@@ -66,7 +66,6 @@ export interface AgentRunAdvance {
   readonly toolBatches?: readonly AgentToolPhase[];
   readonly budget?: AgentRunBudgetState;
   readonly toolCalls?: readonly ToolCall[];
-  readonly revisionInstructions?: readonly string[];
 }
 
 export interface AgentRunProcedureContext {
@@ -126,8 +125,7 @@ export class AgentRunCoordinator {
       phase: { kind: 'accepted' },
       providerRequests: [],
       toolBatches: [],
-      toolCalls: [],
-      revisionInstructions: []
+      toolCalls: []
     });
     const expectedTail = await this.events.tail(state.runId);
     if (expectedTail.sequence !== -1) {
@@ -167,7 +165,8 @@ export class AgentRunCoordinator {
         before.driverGeneration !== tail.driverGeneration
       )
         continue;
-      if (transition?.event.type !== 'run.state.changed') throw new Error(`Run ${runId} has no durable run.`);
+      if (transition?.event.type !== 'run.state.changed')
+        throw new Error(`Run ${runId} has no durable run.`);
       const state = transition.event.state;
       if (state.runId !== runId || state.driverGeneration !== transition.driverGeneration) {
         throw new Error(`Run ${runId} has a contradictory run transition.`);
@@ -189,7 +188,10 @@ export class AgentRunCoordinator {
     const unfinished: AgentRunInspection[] = [];
     for (const runId of await this.events.listRunIds()) {
       const transition = await this.events.latestOfType(runId, 'run.state.changed');
-      if (transition?.event.type !== 'run.state.changed' || transition.event.state.phase.kind === 'terminal')
+      if (
+        transition?.event.type !== 'run.state.changed' ||
+        transition.event.state.phase.kind === 'terminal'
+      )
         continue;
       unfinished.push(await this.inspect(runId));
     }
@@ -252,7 +254,10 @@ export class AgentRunCoordinator {
           driverGeneration: current.tail.driverGeneration
         }
       );
-      if (result.kind === 'rejected' && (result.reason === 'stale_tail' || result.reason === 'stale_driver'))
+      if (
+        result.kind === 'rejected' &&
+        (result.reason === 'stale_tail' || result.reason === 'stale_driver')
+      )
         continue;
       acceptConditionalResult(runId, result);
       return this.inspect(runId);
@@ -365,7 +370,10 @@ export class AgentRunCoordinator {
           driverGeneration: current.state.driverGeneration
         }
       );
-      if (result.kind === 'rejected' && (result.reason === 'stale_tail' || result.reason === 'stale_driver'))
+      if (
+        result.kind === 'rejected' &&
+        (result.reason === 'stale_tail' || result.reason === 'stale_driver')
+      )
         continue;
       acceptConditionalResult(runId, result);
       return this.inspect(runId);
@@ -398,7 +406,8 @@ export class AgentRunDriver {
   drive(execute: AgentRunProcedureExecutor): Promise<AgentRunDriveResult> {
     return this.serial(async () => {
       const inspection = this.inspection();
-      if (inspection.instruction.kind === 'complete') return Object.freeze({ kind: 'complete', inspection });
+      if (inspection.instruction.kind === 'complete')
+        return Object.freeze({ kind: 'complete', inspection });
       if (inspection.instruction.kind === 'wait')
         return Object.freeze({ kind: 'waiting', inspection, reason: inspection.instruction.reason });
       const advance = await execute(
@@ -547,7 +556,9 @@ export class AgentRunDriver {
         ) ?? -1;
       const call = batch?.callStates[callIndex];
       if (!batch || call?.stage !== 'approval')
-        throw new TypeError(`Run ${this.stateValue.runId} is not waiting for approval ${input.approvalId}.`);
+        throw new TypeError(
+          `Run ${this.stateValue.runId} is not waiting for approval ${input.approvalId}.`
+        );
       if (call.approval.fingerprint !== input.fingerprint)
         throw new TypeError(`Approval fingerprint mismatch for ${input.approvalId}.`);
       return this.commitState({
@@ -575,7 +586,10 @@ export class AgentRunDriver {
       if (reason.trim().length === 0) throw new TypeError('Abort reason must not be empty.');
       for (;;) {
         await this.refresh();
-        if (this.stateValue.phase.kind === 'terminal' || this.stateValue.control.status === 'abort_requested')
+        if (
+          this.stateValue.phase.kind === 'terminal' ||
+          this.stateValue.control.status === 'abort_requested'
+        )
           return this.inspection();
         if (
           this.stateValue.control.status !== 'owned' ||
@@ -640,7 +654,9 @@ export class AgentRunDriver {
       let budget = advance.budget ?? this.stateValue.budget;
       if (budget) {
         for (const batch of advance.toolBatches ?? []) {
-          const previous = this.stateValue.toolBatches.find((item) => item.toolBatchId === batch.toolBatchId);
+          const previous = this.stateValue.toolBatches.find(
+            (item) => item.toolBatchId === batch.toolBatchId
+          );
           for (const [index, call] of batch.callStates.entries()) {
             if (call.stage === 'recorded' && previous?.callStates[index]?.stage === 'recording') {
               budget = {
@@ -666,7 +682,6 @@ export class AgentRunDriver {
       providerRequests: advance.providerRequests ?? this.stateValue.providerRequests,
       toolBatches: advance.toolBatches ?? this.stateValue.toolBatches,
       toolCalls: advance.toolCalls ?? this.stateValue.toolCalls,
-      revisionInstructions: advance.revisionInstructions ?? this.stateValue.revisionInstructions,
       ...(advance.budget === undefined
         ? this.stateValue.budget === undefined
           ? {}
@@ -735,7 +750,8 @@ export class AgentRunDriver {
         'A terminal run cannot advance.'
       );
     if (
-      (this.stateValue.control.status !== 'owned' && this.stateValue.control.status !== 'abort_requested') ||
+      (this.stateValue.control.status !== 'owned' &&
+        this.stateValue.control.status !== 'abort_requested') ||
       this.stateValue.control.driverId !== this.driverId ||
       this.stateValue.driverGeneration !== this.generation
     ) {
@@ -817,10 +833,14 @@ function toolSettlementDigest(settlement: AgentToolSettlementRecord): string {
 
 function abortAdministrativeEvent(event: AgentAuditEvent): boolean {
   return (
+    event.type === 'context.transition.requested' ||
+    event.type === 'context.transition.admitted' ||
+    event.type === 'context.transition.completed' ||
+    event.type === 'context.transition.rejected' ||
     event.type === 'run.finalization.staged' ||
     event.type === 'run.ended' ||
     event.type === 'delivery.failed' ||
-    event.type === 'process.ended' ||
+    event.type === 'resource.released' ||
     (event.type === 'run.phase.changed' && event.phase === 'finalizing')
   );
 }
@@ -847,37 +867,8 @@ function advanceMatchesProcedure(procedure: AgentRunProcedure, phase: AgentRunCo
         phase.kind === 'suspended' ||
         phase.kind === 'cancelling' ||
         phase.kind === 'initializing' ||
-        phase.kind === 'verification' ||
-        phase.kind === 'disposition' ||
         phase.kind === 'finalization'
       );
-    case 'plan_check':
-      return (
-        phase.kind === 'verification' &&
-        (phase.stage === 'deterministic_pending' ||
-          phase.stage === 'effect_ready' ||
-          phase.stage === 'settled' ||
-          phase.stage === 'complete')
-      );
-    case 'start_verification':
-      return (
-        (phase.kind === 'verification' && phase.stage === 'effect_pending') || phase.kind === 'finalization'
-      );
-    case 'reconcile_verification':
-      return (
-        (phase.kind === 'verification' && phase.stage === 'settled') ||
-        phase.kind === 'suspended' ||
-        phase.kind === 'finalization'
-      );
-    case 'consume_verification_settlement':
-      return phase.kind === 'verification' || phase.kind === 'disposition' || phase.kind === 'finalization';
-    case 'plan_disposition':
-    case 'start_disposition':
-      return phase.kind === 'disposition' || phase.kind === 'finalization';
-    case 'reconcile_disposition':
-      return phase.kind === 'disposition' || phase.kind === 'suspended' || phase.kind === 'finalization';
-    case 'consume_disposition':
-      return phase.kind === 'initializing' || phase.kind === 'finalization';
     case 'finalize':
     case 'reconcile_finalization':
       return phase.kind === 'finalization' || phase.kind === 'terminal';
@@ -899,14 +890,17 @@ function assertWorkAdvance(
     if (!next) throw new TypeError('Retained tool work cannot be removed.');
     const { callStates: oldStates, ...source } = batch;
     const { callStates: nextStates, ...nextSource } = next;
-    if (hashJson(source) !== hashJson(nextSource)) throw new TypeError('Original tool source cannot change.');
+    if (hashJson(source) !== hashJson(nextSource))
+      throw new TypeError('Original tool source cannot change.');
     for (const [callIndex, call] of oldStates.entries()) {
       const updated = nextStates[callIndex];
       if (!updated) throw new TypeError('Retained call cannot be removed.');
       if (hashJson(call) === hashJson(updated)) continue;
       if (
         target &&
-        (target.kind !== 'tool' || target.toolBatchId !== batch.toolBatchId || target.callIndex !== callIndex)
+        (target.kind !== 'tool' ||
+          target.toolBatchId !== batch.toolBatchId ||
+          target.callIndex !== callIndex)
       ) {
         throw new TypeError('Targeted transition changed unrelated tool work.');
       }
@@ -937,7 +931,10 @@ function assertWorkAdvance(
         item.identity.requestAttempt === request.identity.requestAttempt
     );
     if (!next) throw new TypeError('Retained provider work cannot be removed.');
-    if (hashJson(request.identity) !== hashJson(next.identity) || request.toolBatchId !== next.toolBatchId) {
+    if (
+      hashJson(request.identity) !== hashJson(next.identity) ||
+      request.toolBatchId !== next.toolBatchId
+    ) {
       throw new TypeError('Original provider identity cannot change.');
     }
     if (hashJson(request) === hashJson(next)) continue;
@@ -1057,7 +1054,9 @@ function assertProviderAdvance(
               ? next.stage === 'outcome_unknown'
               : false;
   if (!valid)
-    throw new TypeError(`Procedure ${procedure} cannot change provider ${previous.stage} to ${next.stage}.`);
+    throw new TypeError(
+      `Procedure ${procedure} cannot change provider ${previous.stage} to ${next.stage}.`
+    );
   if (next.stage === 'effect_pending' && next.effect.ticket.driverGeneration !== generation)
     throw new TypeError('Provider start belongs to a stale driver.');
   if (

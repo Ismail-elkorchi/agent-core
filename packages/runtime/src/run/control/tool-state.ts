@@ -1,6 +1,6 @@
-import { parseModelToolCall, type ModelToolCall } from '@agent-core/model';
-import { decodeToolCatalog, type ToolCatalogSnapshot } from '../tool-catalog.js';
+import { decodeEffectExecutionState, type EffectExecutionState } from '@agent-core/effects';
 import { parseJsonObject, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
+import { parseModelToolCall, type ModelToolCall } from '@agent-core/model';
 import { hashJson } from '@agent-core/persistence';
 import {
   decodeOwnedToolEffects,
@@ -12,13 +12,13 @@ import {
   type ToolEffects,
   type ToolObservation
 } from '@agent-core/tools';
-import { decodeEffectExecutionState, type EffectExecutionState } from '@agent-core/effects';
 import type {
   AgentApprovalBinding,
   AgentApprovalRequest,
   AgentEffectiveInstruction,
   AgentTurnIdentity
 } from '../contracts.js';
+import { decodeToolCatalog, type ToolCatalogSnapshot } from '../tool-catalog.js';
 
 export interface AgentToolCallPlanRecord {
   readonly toolImplementationId: string;
@@ -254,7 +254,10 @@ function decodeCallState(value: unknown, callIndex: number, callCount: number): 
   if (effect && plan) assertEffectMatchesPlan(effect, plan);
   if (effect?.settlement.outcome === 'unknown')
     throw new TypeError('A durable tool observation cannot be backed by an unknown effect settlement.');
-  if (effect && effect.settlement.resultDigest !== hashJson(encodeToolObservation(settlement.observation))) {
+  if (
+    effect &&
+    effect.settlement.resultDigest !== hashJson(encodeToolObservation(settlement.observation))
+  ) {
     throw new TypeError('External effect settlement does not match the durable tool observation.');
   }
   return Object.freeze({
@@ -297,11 +300,15 @@ function decodeCommon(value: JsonObject): Omit<AgentToolBatchBase, 'kind'> {
     ...(sourceValue.nativeCatalogIdentity === undefined
       ? {}
       : {
-          nativeCatalogIdentity: identifier(sourceValue.nativeCatalogIdentity, 'source.nativeCatalogIdentity')
+          nativeCatalogIdentity: identifier(
+            sourceValue.nativeCatalogIdentity,
+            'source.nativeCatalogIdentity'
+          )
         })
   });
   const modelCalls = Object.freeze(array(value.modelCalls, 'modelCalls').map(parseModelToolCall));
-  if (modelCalls.length !== calls.length) throw new TypeError('Each call requires its original model call.');
+  if (modelCalls.length !== calls.length)
+    throw new TypeError('Each call requires its original model call.');
   for (const [index, call] of calls.entries()) {
     const modelCall = modelCalls[index];
     if (
@@ -548,7 +555,7 @@ function decodeInstruction(value: unknown, path: string): AgentEffectiveInstruct
     content: nonempty(record.content, `${path}.content`),
     provenance: enumeration(
       record.provenance,
-      ['application', 'run', 'steering', 'disposition'] as const,
+      ['application', 'run', 'steering'] as const,
       `${path}.provenance`
     ),
     ...(role ? { role } : {}),
@@ -639,7 +646,11 @@ function uniqueStrings(value: unknown, label: string): readonly string[] {
   if (new Set(strings).size !== strings.length) throw new TypeError(`${label} must be unique.`);
   return Object.freeze(strings);
 }
-function enumeration<const T extends readonly string[]>(value: unknown, values: T, label: string): T[number] {
+function enumeration<const T extends readonly string[]>(
+  value: unknown,
+  values: T,
+  label: string
+): T[number] {
   if (typeof value !== 'string' || !values.includes(value)) throw new TypeError(`${label} is invalid.`);
   return value;
 }

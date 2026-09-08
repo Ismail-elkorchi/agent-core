@@ -1,5 +1,5 @@
-import type { ProtectedArtifactRef, PublicArtifactRef } from '@agent-core/persistence';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
+import type { ProtectedArtifactRef, PublicArtifactRef } from '@agent-core/persistence';
 import type { ToolProgress, ToolResourceLease } from './context.js';
 import type { ResourceLeaseCoordinator } from './resource-leases.js';
 import { isResourceLeaseCoordinator } from './resource-leases.js';
@@ -8,6 +8,7 @@ export type CommandOutputStream = 'stdout' | 'stderr';
 export type CommandExecutionStatus = 'running' | 'exited' | 'stopped' | 'timed_out' | 'failed';
 
 export interface CommandExecutionOwner {
+  readonly ownerId: string;
   readonly runId: string;
   readonly turnId: string;
   readonly toolBatchId: string;
@@ -55,7 +56,8 @@ export function createCommandExecutionReservation(
   authorizationValue: unknown,
   release: () => void | Promise<void>
 ): CommandExecutionReservation {
-  if (typeof release !== 'function') throw new TypeError('Command execution planning release must be callable.');
+  if (typeof release !== 'function')
+    throw new TypeError('Command execution planning release must be callable.');
   const authorization = parseJsonObject(authorizationValue, {
     maxDepth: 24,
     maxCollectionEntries: 2_000,
@@ -129,12 +131,21 @@ export interface CommandExecution {
   readonly descriptor: CommandExecutionDescriptor;
   readonly resourceLeases: ResourceLeaseCoordinator;
   plan(request: CommandExecutionPlanRequest): Promise<CommandExecutionReservation>;
-  start(plan: CommandExecutionReservation, options?: StartCommandExecutionOptions): Promise<CommandExecutionResult>;
-  query(processId: string, outputTokenBudget: number, yieldMs?: number, afterCursor?: number, requester?: CommandExecutionOwner): Promise<CommandExecutionResult>;
+  start(
+    plan: CommandExecutionReservation,
+    options?: StartCommandExecutionOptions
+  ): Promise<CommandExecutionResult>;
+  query(
+    processId: string,
+    outputTokenBudget: number,
+    yieldMs?: number,
+    afterCursor?: number,
+    requester?: CommandExecutionOwner
+  ): Promise<CommandExecutionResult>;
   writeInput(processId: string, text: string, requester?: CommandExecutionOwner): Promise<void>;
   closeInput(processId: string, requester?: CommandExecutionOwner): Promise<void>;
   terminate(processId: string, requester?: CommandExecutionOwner): Promise<CommandExecutionResult>;
-  disposeRun(runId: string): Promise<readonly CommandExecutionReport[]>;
+  disposeOwner(ownerId: string): Promise<readonly CommandExecutionReport[]>;
   recoveredTerminalReports(): readonly CommandExecutionReport[];
   acknowledgeTerminalReport(processId: string): Promise<void>;
   reconcile(): Promise<CommandReconciliationResult>;
@@ -144,11 +155,14 @@ export interface CommandExecution {
 }
 
 const adoptedCommandExecutions = new WeakSet();
-const commandExecutionPlans = new WeakMap<CommandExecutionPlan, {
-  state: 'plan' | 'started' | 'released';
-  readonly authority: CommandExecution;
-  readonly source: CommandExecutionReservation;
-}>();
+const commandExecutionPlans = new WeakMap<
+  CommandExecutionPlan,
+  {
+    state: 'plan' | 'started' | 'released';
+    readonly authority: CommandExecution;
+    readonly source: CommandExecutionReservation;
+  }
+>();
 
 export async function planCommandExecution(
   authority: CommandExecution,
@@ -170,7 +184,11 @@ export async function planCommandExecution(
 }
 
 export function isCommandExecutionReservation(value: unknown): value is CommandExecutionReservation {
-  return typeof value === 'object' && value !== null && commandExecutionReservations.has(value as CommandExecutionReservation);
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    commandExecutionReservations.has(value as CommandExecutionReservation)
+  );
 }
 
 export async function startCommandExecutionPlan(
@@ -196,22 +214,42 @@ export async function releaseCommandExecutionPlan(
 
 export function adoptCommandExecution(value: unknown): CommandExecution {
   if (isCommandExecution(value)) return value;
-  if (typeof value !== 'object' || value === null) throw new TypeError('Command execution must be an object.');
+  if (typeof value !== 'object' || value === null)
+    throw new TypeError('Command execution must be an object.');
   const candidate = value as Partial<Record<keyof CommandExecution, unknown>>;
   const descriptor = candidate.descriptor;
-  if (typeof descriptor !== 'object' || descriptor === null) throw new TypeError('Command execution descriptor is required.');
+  if (typeof descriptor !== 'object' || descriptor === null)
+    throw new TypeError('Command execution descriptor is required.');
   const owned = descriptor as Partial<CommandExecutionDescriptor>;
-  if (!validIdentity(owned.implementationId) || !validIdentity(owned.recoveryIdentity)
-    || !Array.isArray(owned.capabilities) || !owned.capabilities.every((item) => validIdentity(item))
-    || new Set(owned.capabilities).size !== owned.capabilities.length
-    || typeof owned.supportsPty !== 'boolean') throw new TypeError('Command execution descriptor is invalid.');
+  if (
+    !validIdentity(owned.implementationId) ||
+    !validIdentity(owned.recoveryIdentity) ||
+    !Array.isArray(owned.capabilities) ||
+    !owned.capabilities.every((item) => validIdentity(item)) ||
+    new Set(owned.capabilities).size !== owned.capabilities.length ||
+    typeof owned.supportsPty !== 'boolean'
+  )
+    throw new TypeError('Command execution descriptor is invalid.');
   if (!Object.isFrozen(descriptor) || !Object.isFrozen(owned.capabilities)) {
     throw new TypeError('Command execution descriptor and capabilities must be immutable.');
   }
-  if (!isResourceLeaseCoordinator(candidate.resourceLeases)) throw new TypeError('Command execution resource lease coordinator is invalid.');
-  const complete = ['plan', 'start', 'query', 'writeInput', 'closeInput', 'terminate', 'disposeRun', 'recoveredTerminalReports',
-    'acknowledgeTerminalReport', 'reconcile', 'retryReconciliation', 'acknowledgeUnresolved', 'close']
-    .every((key) => typeof candidate[key as keyof CommandExecution] === 'function');
+  if (!isResourceLeaseCoordinator(candidate.resourceLeases))
+    throw new TypeError('Command execution resource lease coordinator is invalid.');
+  const complete = [
+    'plan',
+    'start',
+    'query',
+    'writeInput',
+    'closeInput',
+    'terminate',
+    'disposeOwner',
+    'recoveredTerminalReports',
+    'acknowledgeTerminalReport',
+    'reconcile',
+    'retryReconciliation',
+    'acknowledgeUnresolved',
+    'close'
+  ].every((key) => typeof candidate[key as keyof CommandExecution] === 'function');
   if (!complete) throw new TypeError('Command execution behavior is incomplete.');
   adoptedCommandExecutions.add(value);
   return value as CommandExecution;
@@ -219,19 +257,33 @@ export function adoptCommandExecution(value: unknown): CommandExecution {
 
 function requireCommandExecutionPlan(plan: CommandExecutionPlan, authority: CommandExecution) {
   const record = commandExecutionPlans.get(plan);
-  if (record?.authority !== authority) throw new TypeError('Command planning does not belong to this execution authority.');
+  if (record?.authority !== authority)
+    throw new TypeError('Command planning does not belong to this execution authority.');
   return record;
 }
 
 function validateCommandExecutionPlanRequest(request: CommandExecutionPlanRequest): void {
-  if (typeof request.command !== 'string' || request.command.length === 0) throw new TypeError('Command must be non-empty.');
-  if (typeof request.rootedDirectory !== 'string') throw new TypeError('Command rooted directory must be a string.');
+  if (typeof request.command !== 'string' || request.command.length === 0)
+    throw new TypeError('Command must be non-empty.');
+  if (typeof request.rootedDirectory !== 'string')
+    throw new TypeError('Command rooted directory must be a string.');
   if (typeof request.pty !== 'boolean') throw new TypeError('Command PTY selection must be boolean.');
-  for (const [name, value] of [['timeoutMs', request.timeoutMs], ['yieldMs', request.yieldMs], ['outputTokenBudget', request.outputTokenBudget]] as const) {
-    if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${name} must be a non-negative safe integer.`);
+  for (const [name, value] of [
+    ['timeoutMs', request.timeoutMs],
+    ['yieldMs', request.yieldMs],
+    ['outputTokenBudget', request.outputTokenBudget]
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 0)
+      throw new TypeError(`${name} must be a non-negative safe integer.`);
   }
-  if (!validIdentity(request.owner.runId) || !validIdentity(request.owner.turnId)
-    || !validIdentity(request.owner.toolBatchId) || !Number.isSafeInteger(request.owner.callIndex) || request.owner.callIndex < 0) {
+  if (
+    !validIdentity(request.owner.ownerId) ||
+    !validIdentity(request.owner.runId) ||
+    !validIdentity(request.owner.turnId) ||
+    !validIdentity(request.owner.toolBatchId) ||
+    !Number.isSafeInteger(request.owner.callIndex) ||
+    request.owner.callIndex < 0
+  ) {
     throw new TypeError('Command execution owner is invalid.');
   }
 }
@@ -241,7 +293,8 @@ export function isCommandExecution(value: unknown): value is CommandExecution {
 }
 
 function validIdentity(value: unknown): value is string {
-  if (typeof value !== 'string' || value.length === 0 || value.length > 256 || value.trim() !== value) return false;
+  if (typeof value !== 'string' || value.length === 0 || value.length > 256 || value.trim() !== value)
+    return false;
   for (const character of value) {
     const codePoint = character.codePointAt(0);
     if (codePoint !== undefined && (codePoint <= 0x1f || codePoint === 0x7f)) return false;

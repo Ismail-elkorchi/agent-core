@@ -21,17 +21,15 @@ const acceptance = (runId = 'run-run') => ({
     model: 'scripted-model',
     runtimeImplementationId: 'runtime-test-v1',
     toolImplementationIds: ['read-v1'],
-    checks: [{ id: 'required-check', implementationId: 'agent-core.test.check.v1' }],
-    disposition: { implementationId: 'agent-core.tests.accept-disposition@1', policyIdentity: { strategy: 'accept' }, policyHash: hashJson({ strategy: 'accept' }) },
     policyHash: 'policy-hash'
   }
 });
 
-const sourceFor = calls => {
+const sourceFor = (calls) => {
   const entries = [{ name: 'read', implementationId: 'read-v1', definitionHash: 'b'.repeat(64) }];
   return {
     source: { responseId: 'response-1', catalog: { revision: hashJson(entries), entries } },
-    modelCalls: calls.map(call => ({ id: call.id, name: call.name, type: 'function', input: call.input }))
+    modelCalls: calls.map((call) => ({ id: call.id, name: call.name, type: 'function', input: call.input }))
   };
 };
 
@@ -56,7 +54,9 @@ test('driver attachment fences a live stale owner and all writes retain one tail
   await first.append({ type: 'input.received', task: 'Perform a bounded task.' }, 'fenced:input');
 
   let release;
-  const blocked = new Promise(resolve => { release = resolve; });
+  const blocked = new Promise((resolve) => {
+    release = resolve;
+  });
   const staleDrive = first.drive(async ({ instruction }) => {
     assert.equal(instruction.procedure, 'initialize_run');
     await blocked;
@@ -65,7 +65,7 @@ test('driver attachment fences a live stale owner and all writes retain one tail
 
   const second = await runs.attach('fenced', 'driver-two');
   release();
-  await assert.rejects(staleDrive, error => {
+  await assert.rejects(staleDrive, (error) => {
     assert.ok(error instanceof AgentRunConflictError);
     assert.ok(error.reason === 'stale_tail' || error.reason === 'stale_driver');
     return true;
@@ -91,7 +91,14 @@ test('a stale live owner may settle only its exact started tool effect permit', 
   const permit = { permitId: 'settle-effect-1', effectId, parametersDigest: digest };
   const effect = {
     phase: 'started',
-    intent: { effectId, ownerId: 'effect-settlement', implementationId: 'read-v1', parametersDigest: digest, recovery: { kind: 'unknown' }, exposure: { quantities: [] } },
+    intent: {
+      effectId,
+      ownerId: 'effect-settlement',
+      implementationId: 'read-v1',
+      parametersDigest: digest,
+      recovery: { kind: 'unknown' },
+      exposure: { quantities: [] }
+    },
     ticket: { ticketId: 'start-effect-1', effectId, parametersDigest: digest, driverGeneration: 1 },
     settlementPermit: permit
   };
@@ -99,43 +106,90 @@ test('a stale live owner may settle only its exact started tool effect permit', 
     ...staleOwner.state(),
     revision: staleOwner.state().revision + 1,
     phase: { kind: 'active' },
-    toolBatches: [{
-      kind: 'tools', identity: { turnIndex: 1, turnId: 'turn-1', requestAttempt: 1 },
-      toolBatchId: 'batch-1', calls: [call], maxConcurrency: 1, ...sourceFor([call]),
-      instructions: [], modelInputModalities: ['text'],
-      callStates: [{
-        stage: 'effect_pending',
-        plan: {
-          toolImplementationId: 'read-v1', canonicalInput: {}, fingerprint: digest,
-          effects: { accesses: [{ mode: 'read', scope: 'memory' }], lockScopes: [], recovery: { kind: 'unknown' } },
-          binding: { toolImplementationId: 'read-v1', authorizationPolicyId: 'policy-1', executionTargetId: 'target-1' },
-          authorization: 'allow'
-        },
-        toolAttempt: 1,
-        effect
-      }]
-    }],
+    toolBatches: [
+      {
+        kind: 'tools',
+        identity: { turnIndex: 1, turnId: 'turn-1', requestAttempt: 1 },
+        toolBatchId: 'batch-1',
+        calls: [call],
+        maxConcurrency: 1,
+        ...sourceFor([call]),
+        instructions: [],
+        modelInputModalities: ['text'],
+        callStates: [
+          {
+            stage: 'effect_pending',
+            plan: {
+              toolImplementationId: 'read-v1',
+              canonicalInput: {},
+              fingerprint: digest,
+              effects: {
+                accesses: [{ mode: 'read', scope: 'memory' }],
+                lockScopes: [],
+                recovery: { kind: 'unknown' }
+              },
+              binding: {
+                toolImplementationId: 'read-v1',
+                authorizationPolicyId: 'policy-1',
+                executionTargetId: 'target-1'
+              },
+              authorization: 'allow'
+            },
+            toolAttempt: 1,
+            effect
+          }
+        ]
+      }
+    ],
     budget: {
-      modelTurns: 1, totalToolCalls: 1, repeatedIdenticalToolCalls: 0, revisionAttempts: 0, elapsedMs: 1,
-      promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0,
-      knownCosts: {}, pricingStatus: 'known', unknownPricedTokens: 0, consecutiveProviderFailures: 0, consecutiveToolFailures: 0
+      modelTurns: 1,
+      totalToolCalls: 1,
+      repeatedIdenticalToolCalls: 0,
+      elapsedMs: 1,
+      promptTokens: 0,
+      completionTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      reasoningTokens: 0,
+      knownCosts: {},
+      pricingStatus: 'known',
+      unknownPricedTokens: 0,
+      consecutiveProviderFailures: 0,
+      consecutiveToolFailures: 0
     },
     toolCalls: [call]
   });
   const tail = await events.tail('effect-settlement');
-  const installed = await events.appendConditional('effect-settlement', { type: 'run.state.changed', state: pending }, {
-    idempotencyKey: 'effect-settlement:pending', expectedTail: tail, driverGeneration: 1
-  });
+  const installed = await events.appendConditional(
+    'effect-settlement',
+    { type: 'run.state.changed', state: pending },
+    {
+      idempotencyKey: 'effect-settlement:pending',
+      expectedTail: tail,
+      driverGeneration: 1
+    }
+  );
   assert.equal(installed.kind, 'committed');
   const replacement = await runs.attach('effect-settlement', 'driver-two');
   assert.equal(replacement.state().driverGeneration, 2);
-  const observation = parseToolObservation({ outputSchema: z.strictObject({ value: z.string() }) }, {
-    kind: 'result', ok: true, output: { value: 'settled' }, summary: 'read completed', scope: { resources: ['memory'], coverage: 'complete' }
-  });
+  const observation = parseToolObservation(
+    { outputSchema: z.strictObject({ value: z.string() }) },
+    {
+      kind: 'result',
+      ok: true,
+      output: { value: 'settled' },
+      summary: 'read completed',
+      scope: { resources: ['memory'], coverage: 'complete' }
+    }
+  );
   const settlement = { observationId: 'observation-1', observation, createdAt: new Date(0).toISOString() };
 
   await assert.rejects(
-    runs.settleToolEffect('effect-settlement', { effectId, permit: { ...permit, permitId: 'wrong-permit' }, settlement }),
+    runs.settleToolEffect('effect-settlement', {
+      effectId,
+      permit: { ...permit, permitId: 'wrong-permit' },
+      settlement
+    }),
     /settlement authority was rejected/u
   );
   const settled = await runs.settleToolEffect('effect-settlement', { effectId, permit, settlement });
@@ -148,7 +202,12 @@ test('a stale live owner may settle only its exact started tool effect permit', 
 
 test('every completion permutation survives takeover and records each settled call immediately', async () => {
   const permutations = [
-    [0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]
+    [0, 1, 2],
+    [0, 2, 1],
+    [1, 0, 2],
+    [1, 2, 0],
+    [2, 0, 1],
+    [2, 1, 0]
   ];
   for (const [permutationIndex, permutation] of permutations.entries()) {
     const runId = `parallel-permutation-${String(permutationIndex)}`;
@@ -156,59 +215,130 @@ test('every completion permutation survives takeover and records each settled ca
     const runs = new AgentRunCoordinator(events);
     await runs.accept(acceptance(runId));
     const initial = await runs.attach(runId, 'driver-initial');
-    const calls = [0, 1, 2].map((index) => createToolCall({ id: `call-${String(index)}`, name: 'read', input: { kind: 'json', value: { index } } }));
+    const calls = [0, 1, 2].map((index) =>
+      createToolCall({
+        id: `call-${String(index)}`,
+        name: 'read',
+        input: { kind: 'json', value: { index } }
+      })
+    );
     const effects = calls.map((_call, index) => {
       const parametersDigest = String(index + 1).repeat(64);
       const effectId = `${runId}:effect:${String(index)}`;
       return {
         phase: 'started',
-        intent: { effectId, ownerId: runId, implementationId: 'read-v1', parametersDigest, recovery: { kind: 'unknown' }, exposure: { quantities: [] } },
-        ticket: { ticketId: `${effectId}:start`, effectId, parametersDigest, driverGeneration: initial.state().driverGeneration },
+        intent: {
+          effectId,
+          ownerId: runId,
+          implementationId: 'read-v1',
+          parametersDigest,
+          recovery: { kind: 'unknown' },
+          exposure: { quantities: [] }
+        },
+        ticket: {
+          ticketId: `${effectId}:start`,
+          effectId,
+          parametersDigest,
+          driverGeneration: initial.state().driverGeneration
+        },
         settlementPermit: { permitId: `${effectId}:settle`, effectId, parametersDigest }
       };
     });
     const callStates = effects.map((effect, index) => ({
       stage: 'effect_pending',
       plan: {
-        toolImplementationId: 'read-v1', canonicalInput: { index }, fingerprint: effect.intent.parametersDigest,
-        effects: { accesses: [{ mode: 'read', scope: `memory/${String(index)}` }], lockScopes: [], recovery: { kind: 'unknown' } },
-        binding: { toolImplementationId: 'read-v1', authorizationPolicyId: 'policy-1', executionTargetId: 'target-1' }, authorization: 'allow'
+        toolImplementationId: 'read-v1',
+        canonicalInput: { index },
+        fingerprint: effect.intent.parametersDigest,
+        effects: {
+          accesses: [{ mode: 'read', scope: `memory/${String(index)}` }],
+          lockScopes: [],
+          recovery: { kind: 'unknown' }
+        },
+        binding: {
+          toolImplementationId: 'read-v1',
+          authorizationPolicyId: 'policy-1',
+          executionTargetId: 'target-1'
+        },
+        authorization: 'allow'
       },
       toolAttempt: 1,
       effect
     }));
     const pending = decodeAgentRunState({
-      ...initial.state(), revision: initial.state().revision + 1,
+      ...initial.state(),
+      revision: initial.state().revision + 1,
       phase: { kind: 'active' },
-      toolBatches: [{
-        kind: 'tools', identity: { turnIndex: 1, turnId: 'turn-1', requestAttempt: 1 }, toolBatchId: 'batch-1', calls,
-        callStates, maxConcurrency: 3, ...sourceFor(calls), instructions: [], modelInputModalities: ['text']
-      }],
+      toolBatches: [
+        {
+          kind: 'tools',
+          identity: { turnIndex: 1, turnId: 'turn-1', requestAttempt: 1 },
+          toolBatchId: 'batch-1',
+          calls,
+          callStates,
+          maxConcurrency: 3,
+          ...sourceFor(calls),
+          instructions: [],
+          modelInputModalities: ['text']
+        }
+      ],
       budget: {
-        modelTurns: 1, totalToolCalls: 3, repeatedIdenticalToolCalls: 1, revisionAttempts: 0, elapsedMs: 1,
-        promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0,
-        knownCosts: {}, pricingStatus: 'known', unknownPricedTokens: 0, consecutiveProviderFailures: 0, consecutiveToolFailures: 0
+        modelTurns: 1,
+        totalToolCalls: 3,
+        repeatedIdenticalToolCalls: 1,
+        elapsedMs: 1,
+        promptTokens: 0,
+        completionTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        knownCosts: {},
+        pricingStatus: 'known',
+        unknownPricedTokens: 0,
+        consecutiveProviderFailures: 0,
+        consecutiveToolFailures: 0
       },
       toolCalls: calls
     });
-    const installed = await events.appendConditional(runId, { type: 'run.state.changed', state: pending }, {
-      idempotencyKey: `${runId}:pending`, expectedTail: await events.tail(runId), driverGeneration: initial.state().driverGeneration
-    });
+    const installed = await events.appendConditional(
+      runId,
+      { type: 'run.state.changed', state: pending },
+      {
+        idempotencyKey: `${runId}:pending`,
+        expectedTail: await events.tail(runId),
+        driverGeneration: initial.state().driverGeneration
+      }
+    );
     assert.equal(installed.kind, 'committed');
 
     let driver = initial;
     const settlements = calls.map((_call, index) => ({
       observationId: `observation-${String(index)}`,
-      observation: parseToolObservation({ outputSchema: z.strictObject({ index: z.int() }) }, {
-        kind: 'result', ok: true, output: { index }, summary: `settled ${String(index)}`, scope: { resources: [`memory/${String(index)}`], coverage: 'complete' }
-      }),
+      observation: parseToolObservation(
+        { outputSchema: z.strictObject({ index: z.int() }) },
+        {
+          kind: 'result',
+          ok: true,
+          output: { index },
+          summary: `settled ${String(index)}`,
+          scope: { resources: [`memory/${String(index)}`], coverage: 'complete' }
+        }
+      ),
       createdAt: new Date(index).toISOString()
     }));
     for (const [completionIndex, callIndex] of permutation.entries()) {
       const effect = effects[callIndex];
       const settlement = settlements[callIndex];
-      await runs.settleToolEffect(runId, { effectId: effect.intent.effectId, permit: effect.settlementPermit, settlement });
-      await runs.settleToolEffect(runId, { effectId: effect.intent.effectId, permit: effect.settlementPermit, settlement });
+      await runs.settleToolEffect(runId, {
+        effectId: effect.intent.effectId,
+        permit: effect.settlementPermit,
+        settlement
+      });
+      await runs.settleToolEffect(runId, {
+        effectId: effect.intent.effectId,
+        permit: effect.settlementPermit,
+        settlement
+      });
       driver = await runs.attach(runId, `driver-after-${String(completionIndex)}`);
       const phase = driver.state().toolBatches[0];
       assert.equal(phase.callStates[callIndex].stage, 'settled');
@@ -216,21 +346,38 @@ test('every completion permutation survives takeover and records each settled ca
       assert.equal(instruction.procedure, 'begin_observation_recording');
       assert.deepEqual(instruction.target, { kind: 'tool', toolBatchId: 'batch-1', callIndex });
       const target = { toolBatchId: 'batch-1', callIndex };
-      await driver.transitionTool('begin_observation_recording', target, call => ({ ...call, stage: 'recording' }));
-      await driver.transitionTool('record_tool_observation', target, call => ({ ...call, stage: 'recorded' }));
+      await driver.transitionTool('begin_observation_recording', target, (call) => ({
+        ...call,
+        stage: 'recording'
+      }));
+      await driver.transitionTool('record_tool_observation', target, (call) => ({
+        ...call,
+        stage: 'recorded'
+      }));
       assert.equal(driver.state().toolBatches[0].callStates[callIndex].stage, 'recorded');
       // Recording an out-of-order result cannot invent observations for other calls.
       for (const otherIndex of permutation.slice(completionIndex + 1)) {
         assert.equal(driver.state().toolBatches[0].callStates[otherIndex].stage, 'effect_pending');
       }
-      await assert.rejects(runs.settleToolEffect(runId, {
+      await assert.rejects(
+        runs.settleToolEffect(runId, {
+          effectId: effect.intent.effectId,
+          permit: { ...effect.settlementPermit, permitId: 'forged-after-recording' },
+          settlement
+        }),
+        /settlement authority/u
+      );
+      const unchanged = await runs.settleToolEffect(runId, {
         effectId: effect.intent.effectId,
-        permit: { ...effect.settlementPermit, permitId: 'forged-after-recording' }, settlement
-      }), /settlement authority/u);
-      const unchanged = await runs.settleToolEffect(runId, { effectId: effect.intent.effectId, permit: effect.settlementPermit, settlement });
+        permit: effect.settlementPermit,
+        settlement
+      });
       assert.equal(unchanged.state.toolBatches[0].callStates[callIndex].stage, 'recorded');
     }
-    assert.deepEqual(nextAgentRunInstruction(driver.state()), { kind: 'execute', procedure: 'advance_after_tools' });
+    assert.deepEqual(nextAgentRunInstruction(driver.state()), {
+      kind: 'execute',
+      procedure: 'advance_after_tools'
+    });
   }
 });
 
@@ -258,15 +405,27 @@ test('total run states select one explicit procedure, wait, or completion', () =
     phase: { kind: 'accepted' },
     providerRequests: [],
     toolBatches: [],
-    toolCalls: [],
-    revisionInstructions: []
+    toolCalls: []
   });
   assert.deepEqual(nextAgentRunInstruction(accepted), { kind: 'wait', reason: 'driver' });
-  const owned = decodeAgentRunState({ ...accepted, revision: 1, driverGeneration: 1, control: { status: 'owned', driverId: 'driver' } });
+  const owned = decodeAgentRunState({
+    ...accepted,
+    revision: 1,
+    driverGeneration: 1,
+    control: { status: 'owned', driverId: 'driver' }
+  });
   assert.deepEqual(nextAgentRunInstruction(owned), { kind: 'execute', procedure: 'initialize_run' });
-  const suspended = decodeAgentRunState({ ...owned, revision: 2, phase: { kind: 'suspended', reason: 'tool_outcome_unknown', effectId: 'effect-1' } });
+  const suspended = decodeAgentRunState({
+    ...owned,
+    revision: 2,
+    phase: { kind: 'suspended', reason: 'tool_outcome_unknown', effectId: 'effect-1' }
+  });
   assert.deepEqual(nextAgentRunInstruction(suspended), { kind: 'wait', reason: 'external_outcome' });
-  const terminal = decodeAgentRunState({ ...owned, revision: 3, phase: { kind: 'terminal', resultEventId: 'event-terminal' } });
+  const terminal = decodeAgentRunState({
+    ...owned,
+    revision: 3,
+    phase: { kind: 'terminal', resultEventId: 'event-terminal' }
+  });
   assert.deepEqual(nextAgentRunInstruction(terminal), { kind: 'complete' });
   assert.throws(() => decodeAgentRunState({ ...owned, phase: { kind: 'not-real' } }), /phase.kind/u);
 });

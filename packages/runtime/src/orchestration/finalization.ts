@@ -1,4 +1,6 @@
 import type { EventAppendReceipt, EventRepository } from '@agent-core/persistence';
+import type { AgentAuditEvent, AgentEvent, AgentProgressEvent } from '../events.js';
+import { AgentFinalizationError, type AgentFinalizationProgress } from '../ports.js';
 import {
   AgentContractError,
   createAgentTerminalSnapshot,
@@ -8,50 +10,72 @@ import {
   type AgentTerminalSnapshot
 } from '../run/contracts.js';
 import type { SessionDescriptor, SessionRepository } from '../session/contracts.js';
-import type { AgentAuditEvent, AgentEvent, AgentProgressEvent } from '../events.js';
-import { AgentFinalizationError, type AgentFinalizationProgress } from '../ports.js';
 
 export class AgentRunFinalizer {
   private decisionFingerprint: string | undefined;
   private finalizationPromise: Promise<AgentEndedRunResult> | undefined;
 
-  constructor(private readonly input: {
-    readonly runId: string;
-    readonly finalizationId: string;
-    readonly events: EventRepository<AgentEvent>;
-    readonly append: (event: AgentAuditEvent, idempotencyKey: string) => Promise<EventAppendReceipt>;
-    readonly session?: { readonly repository: SessionRepository; readonly descriptor: SessionDescriptor };
-    readonly deliver?: (event: AgentProgressEvent) => void | Promise<void>;
-    readonly deliveryDiagnostics?: AgentDeliveryDiagnostic[];
-  }) {}
+  constructor(
+    private readonly input: {
+      readonly runId: string;
+      readonly finalizationId: string;
+      readonly events: EventRepository<AgentEvent>;
+      readonly append: (event: AgentAuditEvent, idempotencyKey: string) => Promise<EventAppendReceipt>;
+      readonly session?: { readonly repository: SessionRepository; readonly descriptor: SessionDescriptor };
+      readonly deliver?: (event: AgentProgressEvent) => void | Promise<void>;
+      readonly deliveryDiagnostics?: AgentDeliveryDiagnostic[];
+    }
+  ) {}
 
   finalize(
     terminalInput: AgentTerminalSnapshot,
     diagnostic?: Extract<AgentEvent, { type: 'run.ended' }>['diagnostic']
   ): Promise<AgentEndedRunResult> {
+    const terminal = this.bindTerminal(terminalInput);
+    this.finalizationPromise ??= this.commit(terminal, diagnostic);
+    return this.finalizationPromise;
+  }
+
+  /** Persist the immutable execution outcome before completing remaining session control work. */
+  async stage(
+    terminalInput: AgentTerminalSnapshot,
+    diagnostic?: Extract<AgentEvent, { type: 'run.ended' }>['diagnostic']
+  ): Promise<void> {
+    const terminal = this.bindTerminal(terminalInput);
+    await this.input.append(
+      { type: 'run.finalization.staged', terminal, ...(diagnostic ? { diagnostic } : {}) },
+      `${this.input.finalizationId}:staged`
+    );
+  }
+
+  private bindTerminal(terminalInput: AgentTerminalSnapshot): AgentTerminalSnapshot {
     const terminal = createAgentTerminalSnapshot(terminalInput);
     if (terminal.runId !== this.input.runId || terminal.finalizationId !== this.input.finalizationId) {
-      throw new AgentContractError('Finalization identity mismatch.', ['The terminal decision does not belong to this finalizer.']);
+      throw new AgentContractError('Finalization identity mismatch.', [
+        'The terminal decision does not belong to this finalizer.'
+      ]);
     }
     const fingerprint = terminalSnapshotFingerprint(terminal);
     if (this.decisionFingerprint !== undefined && this.decisionFingerprint !== fingerprint) {
-      throw new AgentContractError('Conflicting terminal decision.', [`Finalization ${this.input.finalizationId} already has an immutable decision.`]);
+      throw new AgentContractError('Conflicting terminal decision.', [
+        `Finalization ${this.input.finalizationId} already has an immutable decision.`
+      ]);
     }
     this.decisionFingerprint = fingerprint;
-    this.finalizationPromise ??= this.commit(terminal, diagnostic);
-    return this.finalizationPromise;
+    return terminal;
   }
 
   private async commit(
     terminal: AgentTerminalSnapshot,
     diagnostic: Extract<AgentEvent, { type: 'run.ended' }>['diagnostic'] | undefined
   ): Promise<AgentEndedRunResult> {
-    const progress: MutableFinalizationProgress = { staged: false, sessionRecorded: false, committed: false };
+    const progress: MutableFinalizationProgress = {
+      staged: false,
+      sessionRecorded: false,
+      committed: false
+    };
     try {
-      await this.input.append(
-        { type: 'run.finalization.staged', terminal },
-        `${this.input.finalizationId}:staged`
-      );
+      await this.stage(terminal, diagnostic);
       progress.staged = true;
       if (this.input.session) {
         await this.input.session.repository.recordRunFinalization(this.input.session.descriptor, terminal);
@@ -64,8 +88,11 @@ export class AgentRunFinalizer {
       progress.committed = true;
     } catch (error) {
       let observed: AgentFinalizationProgress;
-      try { observed = await this.auditProgress(terminal, progress); }
-      catch { observed = freezeProgress(progress, 'unavailable'); }
+      try {
+        observed = await this.auditProgress(terminal, progress);
+      } catch {
+        observed = freezeProgress(progress, 'unavailable');
+      }
       throw new AgentFinalizationError({
         runId: this.input.runId,
         finalizationId: this.input.finalizationId,
@@ -77,13 +104,21 @@ export class AgentRunFinalizer {
     const deliveryDiagnostics = this.input.deliveryDiagnostics ?? [];
     if (this.input.deliver) {
       try {
-        await this.input.deliver({ type: 'run.ended', terminal, deliveryDiagnostics: Object.freeze([...deliveryDiagnostics]) });
+        await this.input.deliver({
+          type: 'run.ended',
+          terminal,
+          deliveryDiagnostics: Object.freeze([...deliveryDiagnostics])
+        });
       } catch (error) {
         const base = { eventType: 'run.ended', message: errorMessage(error) };
         try {
           const diagnosticEvent: AgentDeliveryDiagnostic = { ...base, persisted: true };
           await this.input.append(
-            { type: 'delivery.failed', finalizationId: this.input.finalizationId, diagnostic: diagnosticEvent },
+            {
+              type: 'delivery.failed',
+              finalizationId: this.input.finalizationId,
+              diagnostic: diagnosticEvent
+            },
             `${this.input.finalizationId}:delivery:turn.ended`
           );
           deliveryDiagnostics.push(diagnosticEvent);
@@ -92,17 +127,28 @@ export class AgentRunFinalizer {
         }
       }
     }
-    return Object.freeze({ state: 'ended', terminal, deliveryDiagnostics: Object.freeze(deliveryDiagnostics) });
+    return Object.freeze({
+      state: 'ended',
+      terminal,
+      deliveryDiagnostics: Object.freeze(deliveryDiagnostics)
+    });
   }
 
-  private async auditProgress(terminal: AgentTerminalSnapshot, fallback: MutableFinalizationProgress): Promise<AgentFinalizationProgress> {
+  private async auditProgress(
+    terminal: AgentTerminalSnapshot,
+    fallback: MutableFinalizationProgress
+  ): Promise<AgentFinalizationProgress> {
     let staged = fallback.staged;
     let committed = fallback.committed;
     const expected = terminalSnapshotFingerprint(terminal);
     for await (const envelope of this.input.events.read(this.input.runId)) {
-      if (envelope.event.type !== 'run.finalization.staged' && envelope.event.type !== 'run.ended') continue;
+      if (envelope.event.type !== 'run.finalization.staged' && envelope.event.type !== 'run.ended')
+        continue;
       if (envelope.event.terminal.finalizationId !== this.input.finalizationId) continue;
-      if (terminalSnapshotFingerprint(envelope.event.terminal) !== expected) throw new AgentContractError('Conflicting durable finalization record.', [`Finalization ${this.input.finalizationId} changed while persistence was being reconciled.`]);
+      if (terminalSnapshotFingerprint(envelope.event.terminal) !== expected)
+        throw new AgentContractError('Conflicting durable finalization record.', [
+          `Finalization ${this.input.finalizationId} changed while persistence was being reconciled.`
+        ]);
       if (envelope.event.type === 'run.finalization.staged') staged = true;
       else committed = true;
     }
@@ -111,7 +157,10 @@ export class AgentRunFinalizer {
       const replay = await this.input.session.repository.loadReplayState(this.input.session.descriptor);
       for (const finalization of replay.runFinalizations) {
         if (finalization.finalizationId !== this.input.finalizationId) continue;
-        if (terminalSnapshotFingerprint(finalization.terminal) !== expected) throw new AgentContractError('Conflicting durable session finalization.', [`Finalization ${this.input.finalizationId} changed while persistence was being reconciled.`]);
+        if (terminalSnapshotFingerprint(finalization.terminal) !== expected)
+          throw new AgentContractError('Conflicting durable session finalization.', [
+            `Finalization ${this.input.finalizationId} changed while persistence was being reconciled.`
+          ]);
         sessionRecorded = true;
       }
     }
@@ -127,10 +176,17 @@ export async function readCommittedTerminal(
   for await (const envelope of events.read(runId)) {
     if (envelope.event.type === 'run.ended') {
       if (envelope.event.terminal.runId !== runId) {
-        throw new AgentContractError('Terminal commit identity mismatch.', [`Ledger ${runId} contains terminal truth for ${envelope.event.terminal.runId}.`]);
+        throw new AgentContractError('Terminal commit identity mismatch.', [
+          `Ledger ${runId} contains terminal truth for ${envelope.event.terminal.runId}.`
+        ]);
       }
-      if (terminal && terminalSnapshotFingerprint(terminal) !== terminalSnapshotFingerprint(envelope.event.terminal)) {
-        throw new AgentContractError('Contradictory terminal commits.', [`Run ${runId} has more than one terminal truth.`]);
+      if (
+        terminal &&
+        terminalSnapshotFingerprint(terminal) !== terminalSnapshotFingerprint(envelope.event.terminal)
+      ) {
+        throw new AgentContractError('Contradictory terminal commits.', [
+          `Run ${runId} has more than one terminal truth.`
+        ]);
       }
       terminal = envelope.event.terminal;
     }
@@ -144,7 +200,10 @@ interface MutableFinalizationProgress {
   committed: boolean;
 }
 
-function freezeProgress(value: MutableFinalizationProgress, reconciliation: AgentFinalizationProgress['reconciliation']): AgentFinalizationProgress {
+function freezeProgress(
+  value: MutableFinalizationProgress,
+  reconciliation: AgentFinalizationProgress['reconciliation']
+): AgentFinalizationProgress {
   return Object.freeze({ ...value, reconciliation });
 }
 

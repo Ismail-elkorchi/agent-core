@@ -1,21 +1,6 @@
-import { captureObservationInput } from './observation.js';
-import { ownSessionSteeringInput, sameSessionSteering } from './steering-input.js';
-import { historyEventSourceSchema } from '../history/schema.js';
-import { ownSessionAssistantOutput } from './assistant-output.js';
-import type { ModelOutputItem } from '@agent-core/model';
-import type { ContextTransitionCommit } from '../context/contracts.js';
-import {
-  contextCommitRetry,
-  decodeContextTransitionEntry,
-  ownBranchNoteSource,
-  sessionReplayState,
-  validateContextCommit
-} from './context-records.js';
-import { randomUUID } from 'node:crypto';
-import { promises as fs } from 'node:fs';
-import path from 'node:path';
-import { hashJson, type ArtifactRef, validateArtifactRef } from '@agent-core/persistence';
 import { parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
+import type { ModelOutputItem } from '@agent-core/model';
+import { hashJson, validateArtifactRef, type ArtifactRef } from '@agent-core/persistence';
 import {
   PersistenceConflictError,
   PersistenceCorruptionError,
@@ -30,20 +15,37 @@ import {
   type JsonlLine,
   type JsonlStorageStamp
 } from '@agent-core/persistence/node';
+import { randomUUID } from 'node:crypto';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+import type { ContextTransitionCommit } from '../context/contracts.js';
+import { historyEventSourceSchema } from '../history/schema.js';
+import { decodePromptContextItemInput } from '../inference/prompt-material.js';
 import {
   createAgentTerminalSnapshot,
   decodeOwnedAgentTerminalSnapshot,
   terminalSnapshotFingerprint,
   type AgentEffectiveInstruction,
+  type AgentTerminalSnapshot,
   type AgentToolCallAttemptIdentity,
   type AgentToolCallIdentity,
-  type AgentTurnIdentity,
-  type AgentTerminalSnapshot
+  type AgentTurnIdentity
 } from '../run/contracts.js';
-import { decodePromptContextItemInput } from '../inference/prompt-material.js';
+import { ownSessionAssistantOutput } from './assistant-output.js';
+import {
+  assertSessionBinding,
+  createSessionBinding,
+  decodeSessionBinding,
+  type SessionBindingInput
+} from './binding.js';
+import {
+  contextCommitRetry,
+  decodeContextTransitionEntry,
+  ownBranchNoteSource,
+  sessionReplayState,
+  validateContextCommit
+} from './context-records.js';
 import type {
-  SessionDescriptor,
-  SessionInputRelationship,
   BaseSessionEntry,
   CreateSessionOptions,
   SessionAssistantEntry,
@@ -52,22 +54,26 @@ import type {
   SessionBranchPoint,
   SessionContextTransitionEntry,
   SessionConversationItem,
-  SessionRunFinalization,
+  SessionDescriptor,
   SessionHeader,
   SessionInputEntry,
+  SessionInputRelationship,
   SessionModelSettingsEntry,
   SessionObservationEntry,
   SessionObservationInput,
   SessionPendingSubmission,
   SessionReplayState,
   SessionRepository,
-  SessionSubmissionInput,
+  SessionRunFinalization,
+  SessionSteeringEntry,
   SessionSubmissionConfiguration,
+  SessionSubmissionInput,
   SessionSubmissionRecord,
   SessionSummary,
-  SessionSteeringEntry,
   SessionToolCallEntry
 } from './contracts.js';
+import { captureObservationInput } from './observation.js';
+import { ownSessionSteeringInput, sameSessionSteering } from './steering-input.js';
 import {
   createSessionSubmissionTransition,
   decodeSessionInputRelationship,
@@ -76,12 +82,6 @@ import {
   ownSessionSuspensionDescriptor,
   pendingSessionSubmissions
 } from './submission-lifecycle.js';
-import {
-  assertSessionBinding,
-  createSessionBinding,
-  decodeSessionBinding,
-  type SessionBindingInput
-} from './binding.js';
 
 export interface JsonlSessionRepositoryOptions {
   readonly rootDir: string;
@@ -338,11 +338,9 @@ export class JsonlSessionRepository implements SessionRepository {
           if (
             existing.turnIndex !== input.identity.turnIndex ||
             existing.content !== input.content ||
-            hashJson(existing.output ?? null) !==
-              hashJson(input.output ?? null) ||
+            hashJson(existing.output ?? null) !== hashJson(input.output ?? null) ||
             existing.completeness !== input.completeness ||
-            hashJson(existing.source ?? null) !==
-              hashJson(input.source ?? null)
+            hashJson(existing.source ?? null) !== hashJson(input.source ?? null)
           )
             throw new PersistenceConflictError(
               `Conflicting assistant finalization for ${input.runId}/${input.identity.turnId}/${String(input.identity.requestAttempt)}.`
@@ -845,7 +843,11 @@ async function readSessionFile(
     try {
       if (isJsonObject(value) && value.type === 'run_finalization')
         finalizations.push(parseRunFinalization(value));
-      else if (isJsonObject(value) && typeof value.type === 'string' && value.type.startsWith('submission.'))
+      else if (
+        isJsonObject(value) &&
+        typeof value.type === 'string' &&
+        value.type.startsWith('submission.')
+      )
         submissionRecords.push(parseSubmissionRecord(value));
       else branchEntries.push(parseBranchEntry(value));
     } catch (error) {
@@ -857,7 +859,13 @@ async function readSessionFile(
     pendingSessionSubmissions(submissionRecords);
   } catch (error) {
     const last = lines.at(-1);
-    throw corruption(filePath, last?.line ?? 1, last?.byteOffset ?? 0, errorMessage(error), 'invalid_record');
+    throw corruption(
+      filePath,
+      last?.line ?? 1,
+      last?.byteOffset ?? 0,
+      errorMessage(error),
+      'invalid_record'
+    );
   }
   return {
     state: { header, branchEntries, finalizations, submissionRecords },
@@ -971,7 +979,9 @@ const SESSION_HEADER_FIELDS = new Set([
 
 function parseSessionHeader(value: JsonValue, sessionId: string): SessionHeader {
   if (!isJsonObject(value) || value.format !== 'agent-core.session/2')
-    throw new Error('Incompatible session format. Start a new session; existing data has not been changed.');
+    throw new Error(
+      'Incompatible session format. Start a new session; existing data has not been changed.'
+    );
   if (
     !isJsonObject(value) ||
     value.type !== 'session' ||
@@ -1112,7 +1122,9 @@ function validTurnIdentity(
     value.requestAttempt > 0
   );
 }
-function validBaseEntry(value: Record<string, unknown>): value is Record<string, unknown> & BaseSessionEntry {
+function validBaseEntry(
+  value: Record<string, unknown>
+): value is Record<string, unknown> & BaseSessionEntry {
   return (
     typeof value.id === 'string' &&
     value.id.length > 0 &&
@@ -1127,13 +1139,11 @@ function isEffectiveInstruction(value: unknown): value is AgentEffectiveInstruct
     typeof value.id === 'string' &&
     value.id.length > 0 &&
     typeof value.content === 'string' &&
-    (value.provenance === 'application' ||
-      value.provenance === 'run' ||
-      value.provenance === 'steering' ||
-      value.provenance === 'disposition') &&
+    (value.provenance === 'application' || value.provenance === 'run' || value.provenance === 'steering') &&
     (value.role === undefined || typeof value.role === 'string') &&
     (value.sourceUri === undefined || typeof value.sourceUri === 'string') &&
-    (value.priority === undefined || (typeof value.priority === 'number' && Number.isFinite(value.priority)))
+    (value.priority === undefined ||
+      (typeof value.priority === 'number' && Number.isFinite(value.priority)))
   );
 }
 function isSessionInputEntry(
@@ -1157,7 +1167,8 @@ function isSessionSteeringEntry(
     value.runId.length > 0 &&
     typeof value.content === 'string' &&
     value.content.length > 0 &&
-    (value.deliveryId === undefined || (typeof value.deliveryId === 'string' && value.deliveryId.length > 0))
+    (value.deliveryId === undefined ||
+      (typeof value.deliveryId === 'string' && value.deliveryId.length > 0))
   );
 }
 function isSessionAssistantEntry(
@@ -1349,7 +1360,6 @@ function parseSuspensionReason(
     value === 'approval_required' ||
     value === 'provider_outcome_unknown' ||
     value === 'tool_outcome_unknown' ||
-    value === 'disposition_outcome_unknown' ||
     value === 'missing_implementation' ||
     value === 'user_decision'
   )
@@ -1387,7 +1397,9 @@ function parseSubmissionInput(value: JsonObject): SessionSubmissionInput {
     ...(value.instructions === undefined ? {} : { instructions: Object.freeze([...value.instructions]) }),
     ...(value.contextItems === undefined
       ? {}
-      : { contextItems: Object.freeze(value.contextItems.map((item) => decodePromptContextItemInput(item))) })
+      : {
+          contextItems: Object.freeze(value.contextItems.map((item) => decodePromptContextItemInput(item)))
+        })
   });
 }
 

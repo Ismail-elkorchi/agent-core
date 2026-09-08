@@ -22,6 +22,7 @@ interface JsonShape {
   maxStringBytes: number;
   depth: number;
   totalBytes: number;
+  canonicalOrder: boolean;
 }
 interface Snapshot {
   readonly value: JsonValue;
@@ -32,6 +33,11 @@ const ownedSnapshots = new WeakMap<object, JsonShape>();
 /** Only snapshots captured here carry an ownership proof; Object.freeze alone is insufficient. */
 export function isOwnedJsonValue(value: unknown): value is JsonObject | readonly JsonValue[] {
   return value !== null && typeof value === 'object' && ownedSnapshots.has(value);
+}
+
+/** Internal encoding proof: native JSON enumeration agrees with canonical key order throughout. */
+export function hasCanonicalJsonOrder(value: object): boolean {
+  return ownedSnapshots.get(value)?.canonicalOrder === true;
 }
 
 /** Captures external JSON once, without invoking accessors or coercing unsupported values. */
@@ -73,7 +79,7 @@ export function parseJsonValue(input: unknown, requested: Partial<SafeJsonParseL
       const maxStringBytes = typeof value === 'string' ? stringSize(value) : 0;
       const totalBytes = utf8Bytes(JSON.stringify(value));
       charge(totalBytes);
-      return { value, shape: { entries: 0, maxStringBytes, depth: 0, totalBytes } };
+      return { value, shape: { entries: 0, maxStringBytes, depth: 0, totalBytes, canonicalOrder: true } };
     }
     if (typeof value !== 'object') throw new TypeError('JSON contains a non-JSON value.');
     const proof = ownedSnapshots.get(value);
@@ -87,7 +93,13 @@ export function parseJsonValue(input: unknown, requested: Partial<SafeJsonParseL
     if (depth >= limits.maxDepth) throw new TypeError('JSON exceeds the depth limit.');
     if (ancestors.has(value)) throw new TypeError('JSON contains a cycle.');
     ancestors.add(value);
-    const shape: JsonShape = { entries: 0, maxStringBytes: 0, depth: 1, totalBytes: 2 };
+    const shape: JsonShape = {
+      entries: 0,
+      maxStringBytes: 0,
+      depth: 1,
+      totalBytes: 2,
+      canonicalOrder: true
+    };
     charge(2);
     function child(input: unknown, keyBytes: number, keySize: number): JsonValue {
       const punctuation = keyBytes + (shape.entries === 0 ? 0 : 1);
@@ -97,6 +109,7 @@ export function parseJsonValue(input: unknown, requested: Partial<SafeJsonParseL
       shape.totalBytes += punctuation + nested.shape.totalBytes;
       shape.depth = Math.max(shape.depth, nested.shape.depth + 1);
       shape.maxStringBytes = Math.max(shape.maxStringBytes, keySize, nested.shape.maxStringBytes);
+      shape.canonicalOrder &&= nested.shape.canonicalOrder;
       return nested.value;
     }
     let output: JsonObject | readonly JsonValue[];
@@ -131,6 +144,7 @@ export function parseJsonValue(input: unknown, requested: Partial<SafeJsonParseL
         Object.defineProperty(record, key, { value: nested, enumerable: true });
       }
       output = Object.freeze(record);
+      shape.canonicalOrder &&= Object.keys(output).every((key, index) => key === keys[index]);
     }
     ancestors.delete(value);
     ownedSnapshots.set(output, shape);
@@ -153,16 +167,21 @@ function dataProperty(value: object, key: string): unknown {
   return descriptor.value;
 }
 
-const utf8Encoder = new TextEncoder();
-const utf8Scratch = new Uint8Array(64 * 1024);
-
 function utf8Bytes(value: string): number {
-  let consumed = 0;
   let bytes = 0;
-  while (consumed < value.length) {
-    const chunk = utf8Encoder.encodeInto(value.slice(consumed), utf8Scratch);
-    consumed += chunk.read;
-    bytes += chunk.written;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code < 0x80) bytes++;
+    else if (code < 0x800) bytes += 2;
+    else if (
+      code >= 0xd800 &&
+      code <= 0xdbff &&
+      value.charCodeAt(index + 1) >= 0xdc00 &&
+      value.charCodeAt(index + 1) <= 0xdfff
+    ) {
+      bytes += 4;
+      index++;
+    } else bytes += 3; // A lone surrogate encodes as U+FFFD.
   }
   return bytes;
 }

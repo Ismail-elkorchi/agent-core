@@ -1,8 +1,21 @@
 import { scopesOverlap, type ToolEffects, type ToolResourceAccess } from './authorization.js';
 import type { ToolResourceLease } from './context.js';
 
-interface ActiveLease { readonly id: number; readonly owner: string; readonly effects: ToolEffects; processId?: string; controlScope?: string }
-interface Waiter { readonly effects: ToolEffects; readonly owner: string; readonly resolve: (lease: ToolResourceLease) => void; readonly reject: (error: Error) => void; readonly signal?: AbortSignal; abort?: () => void }
+interface ActiveLease {
+  readonly id: number;
+  readonly owner: string;
+  readonly effects: ToolEffects;
+  resourceId?: string;
+  controlScope?: string;
+}
+interface Waiter {
+  readonly effects: ToolEffects;
+  readonly owner: string;
+  readonly resolve: (lease: ToolResourceLease) => void;
+  readonly reject: (error: Error) => void;
+  readonly signal?: AbortSignal;
+  abort?: () => void;
+}
 const coordinators = new WeakSet<ResourceLeaseCoordinator>();
 
 export class ResourceLeaseCoordinator {
@@ -10,7 +23,9 @@ export class ResourceLeaseCoordinator {
   private readonly waiters: Waiter[] = [];
   private nextId = 1;
 
-  constructor() { coordinators.add(this); }
+  constructor() {
+    coordinators.add(this);
+  }
 
   acquire(effects: ToolEffects, owner: string, signal?: AbortSignal): Promise<ToolResourceLease> {
     if (signal?.aborted) return Promise.reject(abortError(signal));
@@ -32,21 +47,33 @@ export class ResourceLeaseCoordinator {
 
   /** FIFO for conflicting waiters, with compatible batching when no earlier waiter conflicts. */
   wouldWait(effects: ToolEffects): boolean {
-    return [...this.active.values()].some((lease) => leasesConflict(lease, effects))
-      || this.waiters.some((waiter) => effectsConflict(waiter.effects, effects));
+    return (
+      [...this.active.values()].some((lease) => leasesConflict(lease, effects)) ||
+      this.waiters.some((waiter) => effectsConflict(waiter.effects, effects))
+    );
   }
 
-  releaseProcess(processId: string): void {
-    for (const active of this.active.values()) if (active.processId === processId) this.releaseLease(active.id);
+  releaseResource(resourceId: string): void {
+    for (const active of this.active.values())
+      if (active.resourceId === resourceId) this.releaseLease(active.id);
   }
-  activeCount(): number { return this.active.size; }
+  activeCount(): number {
+    return this.active.size;
+  }
 
   private drain(): void {
     const retained: Waiter[] = [];
     for (const waiter of this.waiters.splice(0)) {
-      const conflictsWithActive = [...this.active.values()].some((lease) => leasesConflict(lease, waiter.effects));
-      const bypassesEarlierConflict = retained.some((earlier) => effectsConflict(earlier.effects, waiter.effects));
-      if (conflictsWithActive || bypassesEarlierConflict) { retained.push(waiter); continue; }
+      const conflictsWithActive = [...this.active.values()].some((lease) =>
+        leasesConflict(lease, waiter.effects)
+      );
+      const bypassesEarlierConflict = retained.some((earlier) =>
+        effectsConflict(earlier.effects, waiter.effects)
+      );
+      if (conflictsWithActive || bypassesEarlierConflict) {
+        retained.push(waiter);
+        continue;
+      }
       if (waiter.abort && waiter.signal) waiter.signal.removeEventListener('abort', waiter.abort);
       const active: ActiveLease = { id: this.nextId++, owner: waiter.owner, effects: waiter.effects };
       this.active.set(active.id, active);
@@ -54,15 +81,17 @@ export class ResourceLeaseCoordinator {
     }
     this.waiters.push(...retained);
   }
-  releaseLease(id: number): void { if (this.active.delete(id)) this.drain(); }
-  transferLease(id: number, processId: string, controlScope: string): void {
+  releaseLease(id: number): void {
+    if (this.active.delete(id)) this.drain();
+  }
+  transferLease(id: number, resourceId: string, controlScope: string): void {
     const active = this.active.get(id);
     if (!active) throw new Error('Cannot transfer a released resource lease.');
-    if (active.processId !== undefined) {
-      if (active.processId === processId && active.controlScope === controlScope) return;
+    if (active.resourceId !== undefined) {
+      if (active.resourceId === resourceId && active.controlScope === controlScope) return;
       throw new Error('Resource lease has already been transferred.');
     }
-    active.processId = processId;
+    active.resourceId = resourceId;
     active.controlScope = controlScope;
   }
 }
@@ -73,13 +102,19 @@ export function isResourceLeaseCoordinator(value: unknown): value is ResourceLea
 
 class Lease implements ToolResourceLease {
   private released = false;
-  private processId: string | undefined;
-  constructor(private readonly coordinator: ResourceLeaseCoordinator, private readonly active: ActiveLease) {}
-  get transferred(): boolean { return this.processId !== undefined; }
-  transferToProcess(processId: string, controlScope: string): void {
-    if (this.released || processId.trim().length === 0 || controlScope.trim().length === 0) throw new Error('Cannot transfer this resource lease.');
-    this.coordinator.transferLease(this.active.id, processId, controlScope);
-    this.processId = processId;
+  private resourceId: string | undefined;
+  constructor(
+    private readonly coordinator: ResourceLeaseCoordinator,
+    private readonly active: ActiveLease
+  ) {}
+  get transferred(): boolean {
+    return this.resourceId !== undefined;
+  }
+  transferToResource(resourceId: string, controlScope: string): void {
+    if (this.released || resourceId.trim().length === 0 || controlScope.trim().length === 0)
+      throw new Error('Cannot transfer this resource lease.');
+    this.coordinator.transferLease(this.active.id, resourceId, controlScope);
+    this.resourceId = resourceId;
   }
   release(): void {
     if (this.released) return;
@@ -88,22 +123,34 @@ class Lease implements ToolResourceLease {
   }
 }
 function leasesConflict(active: ActiveLease, waiting: ToolEffects): boolean {
-  if (active.processId !== undefined && active.controlScope !== undefined && processControlOnly(waiting, active.controlScope)) return false;
+  if (
+    active.resourceId !== undefined &&
+    active.controlScope !== undefined &&
+    resourceControlOnly(waiting, active.controlScope)
+  )
+    return false;
   return effectsConflict(active.effects, waiting);
 }
-function processControlOnly(effects: ToolEffects, controlScope: string): boolean {
-  return effects.accesses.length > 0 && effects.accesses.every((access) => access.mode === 'execute' && access.scope === controlScope)
-    && effects.lockScopes.every((lock) => lock === controlScope);
+function resourceControlOnly(effects: ToolEffects, controlScope: string): boolean {
+  return (
+    effects.accesses.length > 0 &&
+    effects.accesses.every((access) => access.mode === 'execute' && access.scope === controlScope) &&
+    effects.lockScopes.every((lock) => lock === controlScope)
+  );
 }
 export function effectsConflict(left: ToolEffects, right: ToolEffects): boolean {
   if (left.lockScopes.some((a) => right.lockScopes.some((b) => scopesOverlap(a, b)))) return true;
-  if (left.lockScopes.some((lock) => right.accesses.some((access) => scopesOverlap(lock, access.scope)))) return true;
-  if (right.lockScopes.some((lock) => left.accesses.some((access) => scopesOverlap(lock, access.scope)))) return true;
+  if (left.lockScopes.some((lock) => right.accesses.some((access) => scopesOverlap(lock, access.scope))))
+    return true;
+  if (right.lockScopes.some((lock) => left.accesses.some((access) => scopesOverlap(lock, access.scope))))
+    return true;
   return left.accesses.some((a) => right.accesses.some((b) => accessConflict(a, b)));
 }
 function accessConflict(left: ToolResourceAccess, right: ToolResourceAccess): boolean {
   return scopesOverlap(left.scope, right.scope) && (left.mode !== 'read' || right.mode !== 'read');
 }
 function abortError(signal: AbortSignal): Error {
-  return signal.reason instanceof Error ? signal.reason : new Error(typeof signal.reason === 'string' ? signal.reason : 'Resource lease acquisition aborted.');
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error(typeof signal.reason === 'string' ? signal.reason : 'Resource lease acquisition aborted.');
 }

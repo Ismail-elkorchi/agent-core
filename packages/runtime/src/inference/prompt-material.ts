@@ -1,6 +1,5 @@
-import { randomUUID } from 'node:crypto';
 import { CompleteRequestEstimator, type RequestEstimator } from '@agent-core/model';
-import type { ObservedFactRecord } from '@agent-core/tools';
+import { randomUUID } from 'node:crypto';
 
 export interface PromptContextRange {
   readonly kind: 'line' | 'byte';
@@ -57,21 +56,6 @@ export interface PromptOutputContract {
   readonly description: string;
 }
 
-export interface PromptObservedFactsMaterial {
-  readonly records: readonly ObservedFactRecord[];
-  readonly omittedRecords: number;
-  readonly omittedSummary?: readonly PromptObservedFactsOmissionSummary[];
-  readonly tokenEstimate: number;
-  readonly coverage: 'complete' | 'partial';
-}
-
-export interface PromptObservedFactsOmissionSummary {
-  readonly toolName: string;
-  readonly action: ObservedFactRecord['action'];
-  readonly outcome: ObservedFactRecord['outcome'];
-  readonly count: number;
-}
-
 /** Typed material selected by the application and runtime before message framing. */
 export interface PromptMaterial {
   readonly id: string;
@@ -79,7 +63,6 @@ export interface PromptMaterial {
   readonly instructions: readonly PromptInstructionBlock[];
   readonly context: readonly PromptContextItem[];
   readonly tools: readonly PromptToolSummary[];
-  readonly observedFacts?: PromptObservedFactsMaterial;
   readonly outputContract?: PromptOutputContract;
   readonly metadata?: Readonly<Record<string, string>>;
 }
@@ -187,7 +170,9 @@ function materializePromptContextItem(
 
 function decodePromptContextRange(value: unknown): PromptContextRange {
   if (!isRecord(value)) throw new TypeError('Prompt context range must be an object.');
-  const unsupported = Object.keys(value).filter((key) => key !== 'kind' && key !== 'start' && key !== 'end');
+  const unsupported = Object.keys(value).filter(
+    (key) => key !== 'kind' && key !== 'start' && key !== 'end'
+  );
   if (
     unsupported.length > 0 ||
     !oneOf(value.kind, ['line', 'byte'] as const) ||

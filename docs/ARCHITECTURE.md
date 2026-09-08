@@ -1,6 +1,6 @@
 # Architecture
 
-Agent Core is an application-neutral substrate. `@agent-core/runtime` owns orchestration, model-window assembly, sessions, verification, approvals, recovery, and terminal contracts. It depends on repository capabilities rather than filesystem paths.
+Agent Core is an application-neutral substrate. `@agent-core/runtime` owns orchestration, model-window assembly, sessions, approvals, recovery, and immutable execution outcomes. It depends on repository capabilities rather than filesystem paths.
 
 `@agent-core/model` owns provider-neutral model contracts. Provider packages adapt external transports and decode their outputs before returning owned model values. `@agent-core/tools` owns domain-neutral tool definitions, effects, authorization, scheduling, observations, and registries. `@agent-core/tools-local` supplies optional Node and workspace implementations without making them runtime defaults.
 
@@ -22,19 +22,25 @@ Application state has application-defined meaning and immutable revision identit
 
 Model notes are attributed text or structured data with revision checks, scope, quotas, and source references. Writing a note is a storage operation. It cannot grant permission, alter an accepted requirement, or certify a check result. Notes are retrieved selectively; storing one does not inject it into every request.
 
-Provider context state contains versioned continuation or reasoning material. Its adapter declares endpoint/model compatibility and replay rules. Signed or opaque protocol state is distinct from display reasoning summaries and is not exposed through public history tools. A model switch must preserve only compatible state or explicitly reset that continuity.
+Provider context state contains versioned continuation or reasoning material. Its adapter declares endpoint/model/protocol-revision compatibility and replay rules. Signed or opaque protocol state is distinct from display reasoning summaries and is not exposed through public history tools. A model switch must preserve only compatible state or explicitly reset that continuity.
 
 ## Inference and execution
 
 Prompt assembly preserves declared system, developer, and user authority. Retrieved text and notes remain attributed data. Tool definitions are advertised through the provider catalog rather than duplicated as full prose. Applications supply purpose, tone, output policy, and any desired workflow; Core adds no universal persona or mandatory reflection cycle.
 
-An inference invocation captures its owner, purpose, request identity, resources, cancellation, and durable result or uncertain outcome. Ordinary agent steps and auxiliary work share the inference service. A classifier or verifier does not need a complete conversational run just to invoke a model.
+An inference invocation captures its owner, purpose, request identity, resources, cancellation, and durable result or uncertain outcome. Ordinary agent steps and auxiliary work share the inference service. A classifier or verifier does not need a complete conversational run just to invoke a model. Both durable and in-memory inference compositions include repositories, accounting, and recovery; partial compositions are rejected. Applications assign the budget owner independently of the current run.
 
 The provider adapter compiles input before admission. Accounting covers actual tool arguments and results, schemas, control fields, content, media, and provider state. Estimates disclose their method and uncertainty; unknown opaque costs need an explicit admission policy. Context capacity, requested output, and the owning work's total budget are separate limits.
 
 Provider capabilities are versioned contracts for a concrete endpoint and model. An optional method or marketing name is not proof of protocol support. Unsupported combinations fail explicitly. Native steering, asynchronous results, and context transforms must preserve the same input-delivery, effect-authorization, and settlement invariants as conservative request/response execution.
 
-The single run state retains independent provider requests and tool groups alongside its lifecycle phase. Targeted transitions preserve unrelated work. Effect execution retains exact call identities, authorization fingerprints, locks, start fencing, and recovery evidence. A response ending, a tool job ending, and application work completing are independent facts. Known settled effects are not repeated after recovery; an unknown outcome does not become a successful observation.
+The single run state retains independent provider requests and tool groups alongside its lifecycle phase. Targeted transitions preserve unrelated work. Effect execution retains exact call identities, authorization fingerprints, locks, start fencing, and recovery records. A response ending, a tool job ending, and application work completing are independent facts. Known settled effects are not repeated after recovery; an unknown outcome does not become a successful observation.
+
+Applications sequence verification, acceptance and publication through the shared effect executor. Core has no verification or disposition phase. `AgentSession` can leave submissions durably queued until an application explicitly starts the next one; notification handlers do not confer execution authority.
+
+Execution resources have an explicitly granted lifetime owner independent of their originating call. A resource may span runs; adapters implement acquisition, control and release without changing its causal identity. Commands and filesystem resources are optional integrations.
+
+Selected observation summaries and image representations are admitted context choices. Core preserves selected images or explicitly rejects a modality or resource-limit mismatch; it does not remove older attachments during assembly. Native-state invalidation retains portable original history and protected artifacts.
 
 ## Breaking formats and release evidence
 

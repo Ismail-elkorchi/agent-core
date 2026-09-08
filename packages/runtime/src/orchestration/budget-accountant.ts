@@ -6,7 +6,6 @@ export interface RequestCostEstimate {
   messageTokens: number;
   modelWindowTokens: number;
   contextTokens: number;
-  observedFactTokens: number;
   toolSchemaTokens: number;
   outputReserveTokens: number;
   totalPromptTokens: number;
@@ -73,7 +72,6 @@ export class BudgetAccountant {
       messageTokens: totalPromptTokens - toolSchemaTokens,
       modelWindowTokens: input.modelWindowTokens,
       contextTokens: input.contextTokens,
-      observedFactTokens: 0,
       toolSchemaTokens,
       outputReserveTokens,
       totalPromptTokens,

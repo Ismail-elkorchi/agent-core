@@ -1,7 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
-import { adoptToolDefinition, beginToolInvocation, createToolCall, defineTool, parseToolObservation, planToolCall, releaseToolCallPlan, releaseToolInvocation, ResourceLeaseCoordinator, startToolCallPlan } from '@agent-core/tools';
+import {
+  adoptToolDefinition,
+  beginToolInvocation,
+  createToolCall,
+  defineTool,
+  parseToolObservation,
+  planToolCall,
+  releaseToolCallPlan,
+  releaseToolInvocation,
+  ResourceLeaseCoordinator,
+  startToolCallPlan
+} from '@agent-core/tools';
 import { issueEffectStartTicket, NO_EFFECT_EXPOSURE, startExternalEffect } from '@agent-core/effects';
 import {
   applyPatchTool,
@@ -18,10 +29,37 @@ import {
 } from '@agent-core/tools-local';
 import { invokePlannedForTest } from '../tool-call-helpers.js';
 
-const builtins = [listDirectoryTool, findFilesTool, readFilesTool, searchTextTool, editTextTool, applyPatchTool, execCommandTool, writeStdinTool, stopProcessTool, viewImageTool, readArtifactTool];
+const builtins = [
+  listDirectoryTool,
+  findFilesTool,
+  readFilesTool,
+  searchTextTool,
+  editTextTool,
+  applyPatchTool,
+  execCommandTool,
+  writeStdinTool,
+  stopProcessTool,
+  viewImageTool,
+  readArtifactTool
+];
 
 test('every built-in has a strict output schema and the final tool set is exact', () => {
-  assert.deepEqual(builtins.map((tool) => tool.name), ['list_directory', 'find_files', 'read_files', 'search_text', 'edit_text', 'apply_patch', 'exec_command', 'write_stdin', 'stop_process', 'view_image', 'read_artifact']);
+  assert.deepEqual(
+    builtins.map((tool) => tool.name),
+    [
+      'list_directory',
+      'find_files',
+      'read_files',
+      'search_text',
+      'edit_text',
+      'apply_patch',
+      'exec_command',
+      'write_stdin',
+      'stop_process',
+      'view_image',
+      'read_artifact'
+    ]
+  );
   for (const tool of builtins) {
     assert.equal(typeof tool.outputSchema.safeParse, 'function', tool.name);
     assert.equal('risk' in tool, false, tool.name);
@@ -31,25 +69,62 @@ test('every built-in has a strict output schema and the final tool set is exact'
 
 test('derived effects cannot exceed their envelope and output is validated before persistence', async () => {
   const escape = defineTool({
-    name: 'escape', implementationId: 'tests.escape.v1', description: 'escape', schema: z.strictObject({}), outputSchema: z.strictObject({ value: z.string() }),
+    name: 'escape',
+    implementationId: 'tests.escape.v1',
+    description: 'escape',
+    schema: z.strictObject({}),
+    outputSchema: z.strictObject({ value: z.string() }),
     effectEnvelope: { accesses: [{ mode: 'read', scope: 'files' }], lockScopes: [] },
     canonicalizeInput: (input) => input,
-    deriveEffects: () => ({ accesses: [{ mode: 'write', scope: 'files/a' }], lockScopes: [], recovery: { kind: 'unknown' } }),
-    invoke: async () => ({ kind: 'result', ok: true, summary: 'bad', scope: { resources: [], coverage: 'complete' }, output: { value: 'x' } })
+    deriveEffects: () => ({
+      accesses: [{ mode: 'write', scope: 'files/a' }],
+      lockScopes: [],
+      recovery: { kind: 'unknown' }
+    }),
+    invoke: async () => ({
+      kind: 'result',
+      ok: true,
+      summary: 'bad',
+      scope: { resources: [], coverage: 'complete' },
+      output: { value: 'x' }
+    })
   });
   const controller = new AbortController();
-  const context = { policy: { allowedRisks: ['read', 'write'] }, signal: controller.signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } };
-  const plan = await planToolCall(createToolCall({ name: 'escape', input: { kind: 'json', value: {} } }), [escape], context);
+  const context = {
+    policy: { allowedRisks: ['read', 'write'] },
+    signal: controller.signal,
+    boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' }
+  };
+  const plan = await planToolCall(
+    createToolCall({ name: 'escape', input: { kind: 'json', value: {} } }),
+    [escape],
+    context
+  );
   assert.equal(plan.ok, false);
   assert.match(plan.observation.summary, /exceeds the tool effect envelope/u);
 
   const invalidOutput = defineTool({
-    name: 'invalid_output', implementationId: 'tests.invalid-output.v1', description: 'invalid', schema: z.strictObject({}), outputSchema: z.strictObject({ value: z.string() }),
-    effectEnvelope: { accesses: [], lockScopes: [] }, canonicalizeInput: (input) => input,
+    name: 'invalid_output',
+    implementationId: 'tests.invalid-output.v1',
+    description: 'invalid',
+    schema: z.strictObject({}),
+    outputSchema: z.strictObject({ value: z.string() }),
+    effectEnvelope: { accesses: [], lockScopes: [] },
+    canonicalizeInput: (input) => input,
     deriveEffects: () => ({ accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }),
-    invoke: async () => ({ kind: 'result', ok: true, summary: 'bad', scope: { resources: [], coverage: 'complete' }, output: { value: 42 } })
+    invoke: async () => ({
+      kind: 'result',
+      ok: true,
+      summary: 'bad',
+      scope: { resources: [], coverage: 'complete' },
+      output: { value: 42 }
+    })
   });
-  const validPlan = await planToolCall(createToolCall({ name: 'invalid_output', input: { kind: 'json', value: {} } }), [invalidOutput], context);
+  const validPlan = await planToolCall(
+    createToolCall({ name: 'invalid_output', input: { kind: 'json', value: {} } }),
+    [invalidOutput],
+    context
+  );
   assert.equal(validPlan.ok, true);
   const observation = await invokePlannedForTest(validPlan.plan, context);
   assert.equal(observation.kind, 'failure');
@@ -59,17 +134,36 @@ test('derived effects cannot exceed their envelope and output is validated befor
 test('tool planning authority transfers once and releases every owned resource', async () => {
   let releases = 0;
   const tool = defineTool({
-    name: 'lifetime', implementationId: 'tests.lifetime.v1', description: 'lifetime', schema: z.strictObject({}), outputSchema: z.strictObject({}),
+    name: 'lifetime',
+    implementationId: 'tests.lifetime.v1',
+    description: 'lifetime',
+    schema: z.strictObject({}),
+    outputSchema: z.strictObject({}),
     effectEnvelope: { accesses: [], lockScopes: [] },
     async canonicalizeInput(input, context) {
-      await context.lifetime.own({ release() { releases += 1; } });
+      await context.lifetime.own({
+        release() {
+          releases += 1;
+        }
+      });
       return input;
     },
     deriveEffects: () => ({ accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }),
-    invoke: async () => ({ kind: 'result', ok: true, summary: 'done', scope: { resources: [], coverage: 'complete' }, output: {} })
+    invoke: async () => ({
+      kind: 'result',
+      ok: true,
+      summary: 'done',
+      scope: { resources: [], coverage: 'complete' },
+      output: {}
+    })
   });
-  const context = { policy: { allowedRisks: [] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } };
-  const plan = () => planToolCall(createToolCall({ name: tool.name, input: { kind: 'json', value: {} } }), [tool], context);
+  const context = {
+    policy: { allowedRisks: [] },
+    signal: new AbortController().signal,
+    boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' }
+  };
+  const plan = () =>
+    planToolCall(createToolCall({ name: tool.name, input: { kind: 'json', value: {} } }), [tool], context);
   const rejected = await plan();
   assert.equal(rejected.ok, true);
   const staleEffect = effectFor(rejected.plan, 1);
@@ -94,7 +188,10 @@ test('tool planning authority transfers once and releases every owned resource',
   const repeated = effectFor(accepted.plan, 3);
   const repeatedStart = startExternalEffect(repeated, repeated.ticket, 3);
   assert.equal(repeatedStart.status, 'started');
-  await assert.rejects(startToolCallPlan(accepted.plan, repeatedStart.state), /already transferred or been released/u);
+  await assert.rejects(
+    startToolCallPlan(accepted.plan, repeatedStart.state),
+    /already transferred or been released/u
+  );
 });
 
 test('aborted and failed planning release resources before returning control', async () => {
@@ -102,20 +199,40 @@ test('aborted and failed planning release resources before returning control', a
     let releases = 0;
     const controller = new AbortController();
     const tool = defineTool({
-      name: `planning_${mode}`, implementationId: `tests.planning-${mode}.v1`, description: mode, schema: z.strictObject({}), outputSchema: z.strictObject({}),
+      name: `planning_${mode}`,
+      implementationId: `tests.planning-${mode}.v1`,
+      description: mode,
+      schema: z.strictObject({}),
+      outputSchema: z.strictObject({}),
       effectEnvelope: { accesses: [], lockScopes: [] },
       async canonicalizeInput(input, context) {
-        await context.lifetime.own({ release() { releases += 1; } });
+        await context.lifetime.own({
+          release() {
+            releases += 1;
+          }
+        });
         if (mode === 'abort') controller.abort('planning cancelled');
         else throw new Error('canonicalization failed');
         return input;
       },
       deriveEffects: () => ({ accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }),
-      invoke: async () => ({ kind: 'result', ok: true, summary: 'unused', scope: { resources: [], coverage: 'complete' }, output: {} })
+      invoke: async () => ({
+        kind: 'result',
+        ok: true,
+        summary: 'unused',
+        scope: { resources: [], coverage: 'complete' },
+        output: {}
+      })
     });
-    const planning = planToolCall(createToolCall({ name: tool.name, input: { kind: 'json', value: {} } }), [tool], {
-      policy: { allowedRisks: [] }, signal: controller.signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' }
-    });
+    const planning = planToolCall(
+      createToolCall({ name: tool.name, input: { kind: 'json', value: {} } }),
+      [tool],
+      {
+        policy: { allowedRisks: [] },
+        signal: controller.signal,
+        boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' }
+      }
+    );
     if (mode === 'abort') await assert.rejects(planning, /planning cancelled/u);
     else assert.equal((await planning).ok, false);
     assert.equal(releases, 1, mode);
@@ -143,16 +260,38 @@ function effectFor(plan, generation) {
 
 test('runtime resource leases span batches until a running process exits', async () => {
   const coordinator = new ResourceLeaseCoordinator();
-  const command = await coordinator.acquire({ accesses: [{ mode: 'execute', scope: 'processes/p1' }], lockScopes: ['files'], recovery: { kind: 'unknown' } }, 'batch-1');
-  command.transferToProcess('p1', 'processes/p1');
-  assert.doesNotThrow(() => command.transferToProcess('p1', 'processes/p1'));
-  assert.throws(() => command.transferToProcess('p1', 'processes/p2'), /already been transferred/u);
+  const command = await coordinator.acquire(
+    {
+      accesses: [{ mode: 'execute', scope: 'processes/p1' }],
+      lockScopes: ['files'],
+      recovery: { kind: 'unknown' }
+    },
+    'batch-1'
+  );
+  command.transferToResource('p1', 'processes/p1');
+  assert.doesNotThrow(() => command.transferToResource('p1', 'processes/p1'));
+  assert.throws(() => command.transferToResource('p1', 'processes/p2'), /already been transferred/u);
   let acquired = false;
-  const blocked = coordinator.acquire({ accesses: [{ mode: 'read', scope: 'files/a' }], lockScopes: [], recovery: { kind: 'unknown' } }, 'batch-2').then((lease) => { acquired = true; return lease; });
+  const blocked = coordinator
+    .acquire(
+      { accesses: [{ mode: 'read', scope: 'files/a' }], lockScopes: [], recovery: { kind: 'unknown' } },
+      'batch-2'
+    )
+    .then((lease) => {
+      acquired = true;
+      return lease;
+    });
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(acquired, false);
 
-  const control = await coordinator.acquire({ accesses: [{ mode: 'execute', scope: 'processes/p1' }], lockScopes: ['processes/p1'], recovery: { kind: 'unknown' } }, 'batch-3');
+  const control = await coordinator.acquire(
+    {
+      accesses: [{ mode: 'execute', scope: 'processes/p1' }],
+      lockScopes: ['processes/p1'],
+      recovery: { kind: 'unknown' }
+    },
+    'batch-3'
+  );
   control.release();
   command.release();
   const released = await blocked;
@@ -163,13 +302,27 @@ test('runtime resource leases span batches until a running process exits', async
 
 test('resource lease queue is fair, batches compatible readers, and removes aborted waiters', async () => {
   const coordinator = new ResourceLeaseCoordinator();
-  const read = { accesses: [{ mode: 'read', scope: 'files/a' }], lockScopes: [], recovery: { kind: 'unknown' } };
-  const write = { accesses: [{ mode: 'write', scope: 'files/a' }], lockScopes: ['files/a'], recovery: { kind: 'unknown' } };
+  const read = {
+    accesses: [{ mode: 'read', scope: 'files/a' }],
+    lockScopes: [],
+    recovery: { kind: 'unknown' }
+  };
+  const write = {
+    accesses: [{ mode: 'write', scope: 'files/a' }],
+    lockScopes: ['files/a'],
+    recovery: { kind: 'unknown' }
+  };
   const first = await coordinator.acquire(read, 'reader-1');
   const order = [];
-  const writerPromise = coordinator.acquire(write, 'writer').then(lease => { order.push('writer'); return lease; });
-  const laterReaderPromise = coordinator.acquire(read, 'reader-2').then(lease => { order.push('reader-2'); return lease; });
-  await new Promise(resolve => setTimeout(resolve, 10));
+  const writerPromise = coordinator.acquire(write, 'writer').then((lease) => {
+    order.push('writer');
+    return lease;
+  });
+  const laterReaderPromise = coordinator.acquire(read, 'reader-2').then((lease) => {
+    order.push('reader-2');
+    return lease;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
   assert.deepEqual(order, []);
   first.release();
   const writer = await writerPromise;
@@ -182,7 +335,8 @@ test('resource lease queue is fair, batches compatible readers, and removes abor
   const compatibleA = await coordinator.acquire(read, 'compatible-a');
   const compatibleB = await coordinator.acquire(read, 'compatible-b');
   assert.equal(coordinator.activeCount(), 2);
-  compatibleA.release(); compatibleB.release();
+  compatibleA.release();
+  compatibleB.release();
 
   const blocker = await coordinator.acquire(read, 'blocker');
   const controller = new AbortController();
@@ -191,18 +345,32 @@ test('resource lease queue is fair, batches compatible readers, and removes abor
   controller.abort('cancel waiter');
   await assert.rejects(aborted, /cancel waiter/u);
   const reader = await unblockedReader;
-  blocker.release(); reader.release();
+  blocker.release();
+  reader.release();
   assert.equal(coordinator.activeCount(), 0);
 });
 
 test('a queued writer cannot starve behind a continuing stream of readers', async () => {
   const coordinator = new ResourceLeaseCoordinator();
-  const read = { accesses: [{ mode: 'read', scope: 'files/a' }], lockScopes: [], recovery: { kind: 'unknown' } };
-  const write = { accesses: [{ mode: 'write', scope: 'files/a' }], lockScopes: ['files/a'], recovery: { kind: 'unknown' } };
+  const read = {
+    accesses: [{ mode: 'read', scope: 'files/a' }],
+    lockScopes: [],
+    recovery: { kind: 'unknown' }
+  };
+  const write = {
+    accesses: [{ mode: 'write', scope: 'files/a' }],
+    lockScopes: ['files/a'],
+    recovery: { kind: 'unknown' }
+  };
   const initial = await coordinator.acquire(read, 'initial');
   let writerAcquired = false;
-  const writerPromise = coordinator.acquire(write, 'writer').then(lease => { writerAcquired = true; return lease; });
-  const laterReaders = Array.from({ length: 20 }, (_, index) => coordinator.acquire(read, `later-${index}`));
+  const writerPromise = coordinator.acquire(write, 'writer').then((lease) => {
+    writerAcquired = true;
+    return lease;
+  });
+  const laterReaders = Array.from({ length: 20 }, (_, index) =>
+    coordinator.acquire(read, `later-${index}`)
+  );
   initial.release();
   const writer = await writerPromise;
   assert.equal(writerAcquired, true);
@@ -213,30 +381,100 @@ test('a queued writer cannot starve behind a continuing stream of readers', asyn
 
 test('one observation parser validates complete results, failures, artifacts, and returns an immutable snapshot', () => {
   const tool = defineTool({
-    name: 'observation', implementationId: 'tests/observation@1', description: 'observation', schema: z.strictObject({}), outputSchema: z.strictObject({ value: z.string() }),
-    effectEnvelope: { accesses: [], lockScopes: [] }, canonicalizeInput: (input) => input, deriveEffects: () => ({ accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }),
-    invoke: async () => ({ kind: 'result', ok: true, summary: 'ok', scope: { resources: [], coverage: 'complete' }, output: { value: 'ok' } })
+    name: 'observation',
+    implementationId: 'tests/observation@1',
+    description: 'observation',
+    schema: z.strictObject({}),
+    outputSchema: z.strictObject({ value: z.string() }),
+    effectEnvelope: { accesses: [], lockScopes: [] },
+    canonicalizeInput: (input) => input,
+    deriveEffects: () => ({ accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }),
+    invoke: async () => ({
+      kind: 'result',
+      ok: true,
+      summary: 'ok',
+      scope: { resources: [], coverage: 'complete' },
+      output: { value: 'ok' }
+    })
   });
-  const source = { kind: 'result', ok: true, summary: 'ok', scope: { resources: ['files/a'], coverage: 'complete' }, output: { value: 'owned' }, metadata: { nested: ['value'] } };
+  const source = {
+    kind: 'result',
+    ok: true,
+    summary: 'ok',
+    scope: { resources: ['files/a'], coverage: 'complete' },
+    output: { value: 'owned' },
+    metadata: { nested: ['value'] }
+  };
   const parsed = parseToolObservation(tool, source);
-  source.output.value = 'mutated'; source.metadata.nested[0] = 'mutated';
+  source.output.value = 'mutated';
+  source.metadata.nested[0] = 'mutated';
   assert.equal(parsed.output.value, 'owned');
   assert.equal(parsed.metadata.nested[0], 'value');
   assert.equal(Object.isFrozen(parsed), true);
   assert.equal(Object.isFrozen(parsed.metadata), true);
   assert.throws(() => parseToolObservation(tool, { ...source, output: { value: 42 } }));
-  assert.throws(() => parseToolObservation(undefined, { kind: 'failure', ok: false, summary: 'bad', scope: { resources: [], coverage: 'partial' }, output: { reason: 'runtime_error' } }));
-  assert.throws(() => parseToolObservation(tool, { ...source, content: [{ type: 'artifact', artifact: { artifactId: 'bad', sha256: 'bad', size: -1, mediaType: 'text/plain' } }] }));
-  assert.throws(() => parseToolObservation(tool, {
-    ...source,
-    observedFacts: { items: [{ action: 'read', outcome: 'success', resources: [{ uri: '' }], scope: { coverage: 'complete' } }] }
-  }), /observedFacts.*URI|resource.*URI/iu);
-  assert.throws(() => parseToolObservation(tool, {
-    ...source,
-    observedFacts: { items: [{ action: 'search', outcome: 'success', resources: [], scope: { coverage: 'complete', truncated: true } }] }
-  }), /complete and truncated/iu);
+  assert.throws(() =>
+    parseToolObservation(undefined, {
+      kind: 'failure',
+      ok: false,
+      summary: 'bad',
+      scope: { resources: [], coverage: 'partial' },
+      output: { reason: 'runtime_error' }
+    })
+  );
+  assert.throws(() =>
+    parseToolObservation(tool, {
+      ...source,
+      content: [
+        {
+          type: 'artifact',
+          artifact: { artifactId: 'bad', sha256: 'bad', size: -1, mediaType: 'text/plain' }
+        }
+      ]
+    })
+  );
+  assert.throws(
+    () =>
+      parseToolObservation(tool, {
+        ...source,
+        observedFacts: {
+          items: [
+            {
+              action: 'read',
+              outcome: 'success',
+              resources: [{ uri: '' }],
+              scope: { coverage: 'complete' }
+            }
+          ]
+        }
+      }),
+    /observedFacts.*URI|resource.*URI/iu
+  );
+  assert.throws(
+    () =>
+      parseToolObservation(tool, {
+        ...source,
+        observedFacts: {
+          items: [
+            {
+              action: 'search',
+              outcome: 'success',
+              resources: [],
+              scope: { coverage: 'complete', truncated: true }
+            }
+          ]
+        }
+      }),
+    /complete and truncated/iu
+  );
   let outputGetterCalls = 0;
-  const hostileOutput = Object.defineProperty({}, 'value', { enumerable: true, get() { outputGetterCalls += 1; return 'stolen'; } });
+  const hostileOutput = Object.defineProperty({}, 'value', {
+    enumerable: true,
+    get() {
+      outputGetterCalls += 1;
+      return 'stolen';
+    }
+  });
   assert.throws(() => parseToolObservation(tool, { ...source, output: hostileOutput }), /accessor/iu);
   assert.equal(outputGetterCalls, 0);
 });
@@ -245,12 +483,30 @@ test('dynamic tool adoption snapshots mutable consumer definition contracts', ()
   const accesses = [{ mode: 'read', scope: 'files' }];
   const requirements = ['workspaceRoot'];
   const definition = defineTool({
-    name: 'snapshot', implementationId: 'tests/snapshot@1', description: 'snapshot', schema: z.strictObject({}), outputSchema: z.strictObject({}), requirements: { services: requirements },
-    effectEnvelope: { accesses, lockScopes: [] }, canonicalizeInput: (input) => input, deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'files' }], lockScopes: [], recovery: { kind: 'unknown' } }),
-    invoke: async () => ({ kind: 'result', ok: true, summary: 'ok', scope: { resources: [], coverage: 'complete' }, output: {} })
+    name: 'snapshot',
+    implementationId: 'tests/snapshot@1',
+    description: 'snapshot',
+    schema: z.strictObject({}),
+    outputSchema: z.strictObject({}),
+    requirements: { services: requirements },
+    effectEnvelope: { accesses, lockScopes: [] },
+    canonicalizeInput: (input) => input,
+    deriveEffects: () => ({
+      accesses: [{ mode: 'read', scope: 'files' }],
+      lockScopes: [],
+      recovery: { kind: 'unknown' }
+    }),
+    invoke: async () => ({
+      kind: 'result',
+      ok: true,
+      summary: 'ok',
+      scope: { resources: [], coverage: 'complete' },
+      output: {}
+    })
   });
   const registered = adoptToolDefinition(definition);
-  accesses[0].mode = 'write'; requirements[0] = 'commandExecution';
+  accesses[0].mode = 'write';
+  requirements[0] = 'commandExecution';
   assert.equal(registered.effectEnvelope.accesses[0].mode, 'read');
   assert.deepEqual(registered.requirements.services, ['workspaceRoot']);
   assert.equal(Object.isFrozen(registered.effectEnvelope.accesses), true);
@@ -259,40 +515,137 @@ test('dynamic tool adoption snapshots mutable consumer definition contracts', ()
 test('every effect and observation resource scope uses the strict canonical scope grammar', async () => {
   const malformedScopes = ['files//a', 'files/./a', 'files/../a', 'files\\a', 'files/a/'];
   for (const scope of malformedScopes) {
-    assert.throws(() => adoptToolDefinition({
-      name: 'bad_scope', implementationId: 'tests/bad-scope@1', description: 'bad', jsonSchema: { type: 'object' }, outputSchema: z.strictObject({}),
-      effectEnvelope: { accesses: [{ mode: 'read', scope }], lockScopes: [] }, decodeInput() { return { ok: true, input: {} }; },
-      canonicalizeInput(input) { return input; }, snapshotInput(input) { return input; }, deriveEffects() { return { accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }; },
-      async invoke() { return { kind: 'result', ok: true, summary: 'bad', scope: { resources: [], coverage: 'complete' }, output: {} }; }
-    }), /scope/iu, scope);
+    assert.throws(
+      () =>
+        adoptToolDefinition({
+          name: 'bad_scope',
+          implementationId: 'tests/bad-scope@1',
+          description: 'bad',
+          jsonSchema: { type: 'object' },
+          outputSchema: z.strictObject({}),
+          effectEnvelope: { accesses: [{ mode: 'read', scope }], lockScopes: [] },
+          decodeInput() {
+            return { ok: true, input: {} };
+          },
+          canonicalizeInput(input) {
+            return input;
+          },
+          snapshotInput(input) {
+            return input;
+          },
+          deriveEffects() {
+            return { accesses: [], lockScopes: [], recovery: { kind: 'unknown' } };
+          },
+          async invoke() {
+            return {
+              kind: 'result',
+              ok: true,
+              summary: 'bad',
+              scope: { resources: [], coverage: 'complete' },
+              output: {}
+            };
+          }
+        }),
+      /scope/iu,
+      scope
+    );
   }
   const duplicate = defineTool({
-    name: 'duplicate_scope', implementationId: 'tests/duplicate-scope@1', description: 'duplicate', schema: z.strictObject({}), outputSchema: z.strictObject({}),
-    effectEnvelope: { accesses: [{ mode: 'read', scope: 'files/a' }], lockScopes: [] }, canonicalizeInput: input => input,
-    deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'files/a' }, { mode: 'read', scope: 'files/a' }], lockScopes: [], recovery: { kind: 'unknown' } }),
-    invoke: async () => ({ kind: 'result', ok: true, summary: 'duplicate', scope: { resources: [], coverage: 'complete' }, output: {} })
+    name: 'duplicate_scope',
+    implementationId: 'tests/duplicate-scope@1',
+    description: 'duplicate',
+    schema: z.strictObject({}),
+    outputSchema: z.strictObject({}),
+    effectEnvelope: { accesses: [{ mode: 'read', scope: 'files/a' }], lockScopes: [] },
+    canonicalizeInput: (input) => input,
+    deriveEffects: () => ({
+      accesses: [
+        { mode: 'read', scope: 'files/a' },
+        { mode: 'read', scope: 'files/a' }
+      ],
+      lockScopes: [],
+      recovery: { kind: 'unknown' }
+    }),
+    invoke: async () => ({
+      kind: 'result',
+      ok: true,
+      summary: 'duplicate',
+      scope: { resources: [], coverage: 'complete' },
+      output: {}
+    })
   });
-  const plan = await planToolCall(createToolCall({ name: duplicate.name, input: { kind: 'json', value: {} } }), [duplicate], { policy: { allowedRisks: ['read'] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } });
+  const plan = await planToolCall(
+    createToolCall({ name: duplicate.name, input: { kind: 'json', value: {} } }),
+    [duplicate],
+    {
+      policy: { allowedRisks: ['read'] },
+      signal: new AbortController().signal,
+      boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' }
+    }
+  );
   assert.equal(plan.ok, false);
   assert.match(plan.observation.summary, /unique/iu);
-  assert.throws(() => parseToolObservation(duplicate, { kind: 'result', ok: true, summary: 'bad scope', scope: { resources: ['files//a'], coverage: 'complete' }, output: {} }), /scope/iu);
+  assert.throws(
+    () =>
+      parseToolObservation(duplicate, {
+        kind: 'result',
+        ok: true,
+        summary: 'bad scope',
+        scope: { resources: ['files//a'], coverage: 'complete' },
+        output: {}
+      }),
+    /scope/iu
+  );
 });
 
 test('authoritative canonicalization owns input before effects, fingerprinting, and invocation', async () => {
   const callerOwned = { path: 'before.txt', nested: { value: 1 } };
   let invoked;
   const tool = defineTool({
-    name: 'owned_input', implementationId: 'tests/owned-input@1', description: 'owned', schema: z.strictObject({}), outputSchema: z.strictObject({ path: z.string(), value: z.number() }),
+    name: 'owned_input',
+    implementationId: 'tests/owned-input@1',
+    description: 'owned',
+    schema: z.strictObject({}),
+    outputSchema: z.strictObject({ path: z.string(), value: z.number() }),
     effectEnvelope: { accesses: [{ mode: 'read', scope: 'files' }], lockScopes: [] },
-    canonicalizeInput() { return Object.freeze({ path: callerOwned.path, nested: Object.freeze({ value: callerOwned.nested.value }) }); },
-    deriveEffects(input) { return { accesses: [{ mode: 'read', scope: `files/${input.path}` }], lockScopes: [], recovery: { kind: 'unknown' } }; },
-    async invoke(input) { invoked = input; return { kind: 'result', ok: true, summary: 'owned', scope: { resources: [`files/${input.path}`], coverage: 'complete' }, output: { path: input.path, value: input.nested.value } }; }
+    canonicalizeInput() {
+      return Object.freeze({
+        path: callerOwned.path,
+        nested: Object.freeze({ value: callerOwned.nested.value })
+      });
+    },
+    deriveEffects(input) {
+      return {
+        accesses: [{ mode: 'read', scope: `files/${input.path}` }],
+        lockScopes: [],
+        recovery: { kind: 'unknown' }
+      };
+    },
+    async invoke(input) {
+      invoked = input;
+      return {
+        kind: 'result',
+        ok: true,
+        summary: 'owned',
+        scope: { resources: [`files/${input.path}`], coverage: 'complete' },
+        output: { path: input.path, value: input.nested.value }
+      };
+    }
   });
-  const context = { policy: { allowedRisks: ['read'] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } };
-  const planning = await planToolCall(createToolCall({ name: tool.name, input: { kind: 'json', value: {} } }), [tool], context);
+  const context = {
+    policy: { allowedRisks: ['read'] },
+    signal: new AbortController().signal,
+    boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' }
+  };
+  const planning = await planToolCall(
+    createToolCall({ name: tool.name, input: { kind: 'json', value: {} } }),
+    [tool],
+    context
+  );
   assert.equal(planning.ok, true);
   const fingerprint = planning.plan.fingerprint;
-  callerOwned.path = 'after.txt'; callerOwned.nested.value = 2;
+  callerOwned.path = 'after.txt';
+  callerOwned.nested.value = 2;
   const observation = await invokePlannedForTest(planning.plan, context);
   assert.equal(observation.output.path, 'before.txt');
   assert.equal(observation.output.value, 1);
@@ -305,29 +658,93 @@ test('authoritative canonicalization owns input before effects, fingerprinting, 
 test('canonicalization rejects accessors and cycles without invoking accessors', async () => {
   let accesses = 0;
   const hostile = {};
-  Object.defineProperty(hostile, 'secret', { enumerable: true, get() { accesses += 1; return 'value'; } });
-  const cyclic = {}; cyclic.self = cyclic;
-  const makeTool = (name, value) => defineTool({
-    name, implementationId: `tests/${name}@1`, description: name, schema: z.strictObject({}), outputSchema: z.strictObject({}), effectEnvelope: { accesses: [], lockScopes: [] },
-    canonicalizeInput() { return value; }, deriveEffects() { return { accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }; },
-    invoke: async () => ({ kind: 'result', ok: true, summary: 'never', scope: { resources: [], coverage: 'complete' }, output: {} })
+  Object.defineProperty(hostile, 'secret', {
+    enumerable: true,
+    get() {
+      accesses += 1;
+      return 'value';
+    }
   });
-  for (const [name, value] of [['accessor_input', hostile], ['cyclic_input', cyclic]]) {
-    const plan = await planToolCall(createToolCall({ name, input: { kind: 'json', value: {} } }), [makeTool(name, value)], { policy: { allowedRisks: [] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } });
+  const cyclic = {};
+  cyclic.self = cyclic;
+  const makeTool = (name, value) =>
+    defineTool({
+      name,
+      implementationId: `tests/${name}@1`,
+      description: name,
+      schema: z.strictObject({}),
+      outputSchema: z.strictObject({}),
+      effectEnvelope: { accesses: [], lockScopes: [] },
+      canonicalizeInput() {
+        return value;
+      },
+      deriveEffects() {
+        return { accesses: [], lockScopes: [], recovery: { kind: 'unknown' } };
+      },
+      invoke: async () => ({
+        kind: 'result',
+        ok: true,
+        summary: 'never',
+        scope: { resources: [], coverage: 'complete' },
+        output: {}
+      })
+    });
+  for (const [name, value] of [
+    ['accessor_input', hostile],
+    ['cyclic_input', cyclic]
+  ]) {
+    const plan = await planToolCall(
+      createToolCall({ name, input: { kind: 'json', value: {} } }),
+      [makeTool(name, value)],
+      {
+        policy: { allowedRisks: [] },
+        signal: new AbortController().signal,
+        boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' }
+      }
+    );
     assert.equal(plan.ok, false);
   }
   assert.equal(accesses, 0);
 
   let effectAccesses = 0;
   const hostileEffects = {};
-  Object.defineProperty(hostileEffects, 'accesses', { enumerable: true, get() { effectAccesses += 1; return []; } });
-  Object.defineProperties(hostileEffects, { lockScopes: { enumerable: true, value: [] }, recovery: { enumerable: true, value: { kind: 'unknown' } } });
-  const effectsTool = defineTool({
-    name: 'hostile_effects', implementationId: 'tests/hostile-effects@1', description: 'hostile effects', schema: z.strictObject({}), outputSchema: z.strictObject({}),
-    effectEnvelope: { accesses: [], lockScopes: [] }, canonicalizeInput: input => input, deriveEffects: () => hostileEffects,
-    invoke: async () => ({ kind: 'result', ok: true, summary: 'never', scope: { resources: [], coverage: 'complete' }, output: {} })
+  Object.defineProperty(hostileEffects, 'accesses', {
+    enumerable: true,
+    get() {
+      effectAccesses += 1;
+      return [];
+    }
   });
-  const effectsPreparation = await planToolCall(createToolCall({ name: effectsTool.name, input: { kind: 'json', value: {} } }), [effectsTool], { policy: { allowedRisks: [] }, signal: new AbortController().signal, boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } });
+  Object.defineProperties(hostileEffects, {
+    lockScopes: { enumerable: true, value: [] },
+    recovery: { enumerable: true, value: { kind: 'unknown' } }
+  });
+  const effectsTool = defineTool({
+    name: 'hostile_effects',
+    implementationId: 'tests/hostile-effects@1',
+    description: 'hostile effects',
+    schema: z.strictObject({}),
+    outputSchema: z.strictObject({}),
+    effectEnvelope: { accesses: [], lockScopes: [] },
+    canonicalizeInput: (input) => input,
+    deriveEffects: () => hostileEffects,
+    invoke: async () => ({
+      kind: 'result',
+      ok: true,
+      summary: 'never',
+      scope: { resources: [], coverage: 'complete' },
+      output: {}
+    })
+  });
+  const effectsPreparation = await planToolCall(
+    createToolCall({ name: effectsTool.name, input: { kind: 'json', value: {} } }),
+    [effectsTool],
+    {
+      policy: { allowedRisks: [] },
+      signal: new AbortController().signal,
+      boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' }
+    }
+  );
   assert.equal(effectsPreparation.ok, false);
   assert.equal(effectAccesses, 0);
 });

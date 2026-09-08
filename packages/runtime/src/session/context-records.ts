@@ -1,8 +1,8 @@
-import { scopeSchema } from '../history/schema.js';
-import { contextEntrySchema } from '../context/schema.js';
-import { hashJson, PersistenceConflictError } from '@agent-core/persistence';
 import { parseJsonObject } from '@agent-core/json';
+import { hashJson, PersistenceConflictError } from '@agent-core/persistence';
 import type { ContextTransitionCommit, ContextWindowRecord } from '../context/contracts.js';
+import { contextEntrySchema } from '../context/schema.js';
+import { scopeSchema } from '../history/schema.js';
 import type {
   SessionBranchEntry,
   SessionContextTransitionEntry,
@@ -36,7 +36,9 @@ export function sessionReplayState(
     ...(contextWindow ? { contextWindow } : {})
   });
 }
-export function latestContextWindow(branch: readonly SessionBranchEntry[]): ContextWindowRecord | undefined {
+export function latestContextWindow(
+  branch: readonly SessionBranchEntry[]
+): ContextWindowRecord | undefined {
   for (let index = branch.length - 1; index >= 0; index--) {
     const entry = branch[index];
     if (entry?.type === 'context_transition') return entry.window;
@@ -99,8 +101,7 @@ export function contextCommitRetry(
   if (
     existing &&
     (existing.transition.requestFingerprint !== input.transition.requestFingerprint ||
-      hashJson(existing.window.selection) !==
-        hashJson(input.window.selection) ||
+      hashJson(existing.window.selection) !== hashJson(input.window.selection) ||
       existing.window.reason !== input.window.reason)
   )
     throw new PersistenceConflictError('Context transition idempotency key has conflicting content.');
@@ -116,22 +117,23 @@ export function decodeContextTransitionEntry(value: unknown): SessionContextTran
   ) {
     throw new Error('Context transition record identities disagree.');
   }
-  const fingerprint = hashJson(
-    {
-      expectedWindowId: entry.transition.previousWindowId,
-      idempotencyKey: entry.transition.idempotencyKey,
-      selection: {
-        retained: entry.window.selection.retained,
-        notes: entry.window.selection.notes,
-        omitted: entry.window.selection.omitted,
-        strategy: entry.window.selection.strategy
-      },
-      reason: entry.window.reason,
-      ...(entry.transition.requestedSourceRevision === undefined
-        ? {}
-        : { expectedSourceRevision: entry.transition.requestedSourceRevision })
-    }
-  );
+  const fingerprint = hashJson({
+    expectedWindowId: entry.transition.previousWindowId,
+    idempotencyKey: entry.transition.idempotencyKey,
+    selection: {
+      retained: entry.window.selection.retained,
+      notes: entry.window.selection.notes,
+      omitted: entry.window.selection.omitted,
+      strategy: entry.window.selection.strategy,
+      ...(entry.window.selection.representations
+        ? { representations: entry.window.selection.representations }
+        : {})
+    },
+    reason: entry.window.reason,
+    ...(entry.transition.requestedSourceRevision === undefined
+      ? {}
+      : { expectedSourceRevision: entry.transition.requestedSourceRevision })
+  });
   if (hashJson(entry.window.selection) !== entry.transition.selectionFingerprint)
     throw new Error('Context selected provider state fingerprint does not match its committed window.');
   if (fingerprint !== entry.transition.requestFingerprint)

@@ -1,47 +1,47 @@
-import type { InferenceLifecycle } from './lifecycle.js';
+import type { EffectLifecycle } from '@agent-core/effects';
+import {
+  UNKNOWN_EFFECT_RECOVERY,
+  closeExternalEffect,
+  decodeEffectRecoveryCapability,
+  issueEffectStartTicket,
+  knownEffectExposure,
+  settleExternalEffect,
+  startExternalEffect,
+  unknownEffectExposure,
+  type EffectExposureQuantity,
+  type EffectExposureReservation
+} from '@agent-core/effects';
 import type { ModelStreamEvent } from '@agent-core/model';
-import type { NativeSteeringCoordinator } from './native-steering.js';
-import { providerWork } from '../run/control/contracts.js';
-import { randomUUID } from 'node:crypto';
 import {
   createModelRequest,
   parseModelResponse,
-  type ModelProvider,
+  type CompiledModelRequest,
   type ModelProfile,
+  type ModelProvider,
+  type ModelProviderSession,
   type ModelRequest,
   type ModelResponse,
-  type ModelProviderSession,
-  type ModelUsage,
-  type CompiledModelRequest
+  type ModelUsage
 } from '@agent-core/model';
 import { hashJson, type ArtifactRepository, type EventAppendReceipt } from '@agent-core/persistence';
-import {
-  UNKNOWN_EFFECT_RECOVERY,
-  decodeEffectRecoveryCapability,
-  issueEffectStartTicket,
-  startExternalEffect,
-  settleExternalEffect,
-  closeExternalEffect,
-  knownEffectExposure,
-  unknownEffectExposure,
-  type EffectExposureReservation,
-  type EffectExposureQuantity
-} from '@agent-core/effects';
-import type { InferenceService } from './service.js';
+import { randomUUID } from 'node:crypto';
 import type { AgentAuditEvent, AgentEvent, AgentProgressEvent } from '../events.js';
+import type { RequestCostEstimate } from '../orchestration/budget-accountant.js';
+import type { summarizeModelRequest } from '../orchestration/event-summaries.js';
+import { normalizeModelToolCall } from '../orchestration/model-request.js';
+import { storeProviderStateArtifact } from '../orchestration/provider-state-artifacts.js';
+import { AgentRunController } from '../orchestration/run-controller.js';
 import type {
   AgentTurnIdentity,
   AgentTurnSnapshotRecord,
   InferenceRequestFingerprintRecord,
   LogicalModelRequestRecord
 } from '../run/contracts.js';
-import type { AgentRunDriver, AgentRunAdvance } from '../run/control/driver.js';
 import type { AgentRunProcedure } from '../run/control/contracts.js';
-import { AgentRunController } from '../orchestration/run-controller.js';
-import { normalizeModelToolCall } from '../orchestration/model-request.js';
-import { storeProviderStateArtifact } from '../orchestration/provider-state-artifacts.js';
-import type { RequestCostEstimate } from '../orchestration/budget-accountant.js';
-import type { summarizeModelRequest } from '../orchestration/event-summaries.js';
+import { providerWork } from '../run/control/contracts.js';
+import type { AgentRunAdvance, AgentRunDriver } from '../run/control/driver.js';
+import type { NativeSteeringCoordinator } from './native-steering.js';
+import type { InferenceService } from './service.js';
 
 export type RunInferenceResult =
   | {
@@ -55,6 +55,7 @@ export interface RunInferenceInput {
   readonly steering?: NativeSteeringCoordinator;
   readonly options: {
     readonly provider: ModelProvider;
+    readonly inferenceOwnerId?: string;
     readonly repositories: { readonly artifacts?: ArtifactRepository };
     readonly recordLogicalRequest?: (record: LogicalModelRequestRecord) => void | Promise<void>;
   };
@@ -84,7 +85,7 @@ export interface RunInferenceInput {
   ) => Promise<void>;
 }
 export function createRunInferenceLifecycle(input: RunInferenceInput): {
-  readonly lifecycle: InferenceLifecycle<RunInferenceResult>;
+  readonly lifecycle: EffectLifecycle<RunInferenceResult, ModelResponse>;
   readonly onStreamEvent: (event: Exclude<ModelStreamEvent, { readonly type: 'done' }>) => Promise<void>;
 } {
   const { request, requestEstimate, requestFingerprint, requestSummary, turnRequest, append, emit } = input;
@@ -137,7 +138,7 @@ export function createRunInferenceLifecycle(input: RunInferenceInput): {
         message: event.message
       });
   };
-  const lifecycle: InferenceLifecycle<RunInferenceResult> = {
+  const lifecycle: EffectLifecycle<RunInferenceResult, ModelResponse> = {
     start: async () => {
       await append({
         type: 'turn.snapshot.created',
@@ -303,7 +304,7 @@ export async function invokeRunInference(input: RunInferenceInput): Promise<RunI
     governed.lifecycle,
     {
       invocationId: input.requestFingerprint.requestId,
-      ownerId: input.turnRequest.runId,
+      ownerId: input.options.inferenceOwnerId ?? input.turnRequest.runId,
       purpose: 'agent_step'
     }
   );

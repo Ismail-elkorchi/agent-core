@@ -4,7 +4,12 @@ import { appendFile, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { hashJson, InMemoryEventRepository, PersistenceCorruptionError } from '@agent-core/persistence';
-import { closeExternalEffect, issueEffectStartTicket, settleExternalEffect, startExternalEffect } from '@agent-core/effects';
+import {
+  closeExternalEffect,
+  issueEffectStartTicket,
+  settleExternalEffect,
+  startExternalEffect
+} from '@agent-core/effects';
 import {
   AgentRunCoordinator,
   AgentSession,
@@ -28,29 +33,55 @@ const TEST_SESSION_BINDING = Object.freeze({
 
 test('session bindings are canonical, required, and do not disclose their subject on mismatch', async () => {
   const left = createSessionBinding({
-    schemaId: 'agent-core.tests/writer', schemaVersion: 3,
-    subject: { workspace: '/private/work', document: 'draft', options: { language: 'en', audience: 'expert' } }
+    schemaId: 'agent-core.tests/writer',
+    schemaVersion: 3,
+    subject: {
+      workspace: '/private/work',
+      document: 'draft',
+      options: { language: 'en', audience: 'expert' }
+    }
   });
   const reordered = createSessionBinding({
-    schemaId: 'agent-core.tests/writer', schemaVersion: 3,
-    subject: { options: { audience: 'expert', language: 'en' }, document: 'draft', workspace: '/private/work' }
+    schemaId: 'agent-core.tests/writer',
+    schemaVersion: 3,
+    subject: {
+      options: { audience: 'expert', language: 'en' },
+      document: 'draft',
+      workspace: '/private/work'
+    }
   });
   assert.equal(left.bindingSha256, reordered.bindingSha256);
   assert.equal(Object.isFrozen(left), true);
 
   const repository = new InMemorySessionRepository();
   const descriptor = await repository.create({ id: 'bound', binding: left });
-  const wrong = { schemaId: left.schemaId, schemaVersion: left.schemaVersion, subject: { workspace: '/private/other', secret: 'must-not-leak' } };
+  const wrong = {
+    schemaId: left.schemaId,
+    schemaVersion: left.schemaVersion,
+    subject: { workspace: '/private/other', secret: 'must-not-leak' }
+  };
   await assert.rejects(repository.open(descriptor.id, wrong), (error) => {
     assert.equal(error instanceof SessionBindingMismatchError, true);
     assert.doesNotMatch(error.message, /must-not-leak|private\/other/u);
     return true;
   });
-  await assert.rejects(repository.loadReplayState({ ...descriptor, header: { ...descriptor.header, binding: createSessionBinding(wrong) } }), SessionBindingMismatchError);
-  await assert.rejects(repository.loadReplayState({
-    ...descriptor,
-    header: { ...descriptor.header, binding: { ...descriptor.header.binding, bindingSha256: '0'.repeat(64) } }
-  }), /binding hash is invalid/u);
+  await assert.rejects(
+    repository.loadReplayState({
+      ...descriptor,
+      header: { ...descriptor.header, binding: createSessionBinding(wrong) }
+    }),
+    SessionBindingMismatchError
+  );
+  await assert.rejects(
+    repository.loadReplayState({
+      ...descriptor,
+      header: {
+        ...descriptor.header,
+        binding: { ...descriptor.header.binding, bindingSha256: '0'.repeat(64) }
+      }
+    }),
+    /binding hash is invalid/u
+  );
 });
 
 test('child sessions inherit the application binding exactly', async () => {
@@ -58,21 +89,32 @@ test('child sessions inherit the application binding exactly', async () => {
   const parent = await repository.create({ id: 'bound-parent', binding: TEST_SESSION_BINDING });
   const child = await repository.create({ id: 'bound-child', binding: TEST_SESSION_BINDING, parent });
   assert.equal(child.header.parentSessionId, parent.id);
-  await assert.rejects(repository.create({
-    id: 'wrong-child', parent,
-    binding: { schemaId: TEST_SESSION_BINDING.schemaId, schemaVersion: 2, subject: TEST_SESSION_BINDING.subject }
-  }), SessionBindingMismatchError);
+  await assert.rejects(
+    repository.create({
+      id: 'wrong-child',
+      parent,
+      binding: {
+        schemaId: TEST_SESSION_BINDING.schemaId,
+        schemaVersion: 2,
+        subject: TEST_SESSION_BINDING.subject
+      }
+    }),
+    SessionBindingMismatchError
+  );
 });
 
 test('JSONL session headers reject missing or tampered bindings before replay', async () => {
   const rootDir = await mkdtemp(path.join(tmpdir(), 'agent-session-binding-corruption-'));
   const repository = new JsonlSessionRepository({ rootDir });
   const descriptor = await repository.create({ id: 'binding-corruption', binding: TEST_SESSION_BINDING });
-  await assert.rejects(repository.open(descriptor.id, {
-    schemaId: TEST_SESSION_BINDING.schemaId,
-    schemaVersion: TEST_SESSION_BINDING.schemaVersion,
-    subject: { application: 'another-agent' }
-  }), SessionBindingMismatchError);
+  await assert.rejects(
+    repository.open(descriptor.id, {
+      schemaId: TEST_SESSION_BINDING.schemaId,
+      schemaVersion: TEST_SESSION_BINDING.schemaVersion,
+      subject: { application: 'another-agent' }
+    }),
+    SessionBindingMismatchError
+  );
   const file = repository.location(descriptor.id);
   const lines = (await readFile(file, 'utf8')).trimEnd().split('\n');
   const header = JSON.parse(lines[0]);
@@ -107,11 +149,16 @@ test('concurrent session appends preserve one parent chain and leaf', async () =
   const rootDir = await mkdtemp(path.join(tmpdir(), 'agent-session-concurrent-'));
   const repository = new JsonlSessionRepository({ rootDir });
   const session = await repository.create({ id: 'concurrent', binding: TEST_SESSION_BINDING });
-  await Promise.all(Array.from({ length: 30 }, (_, index) => repository.appendInput(session, { runId: `run-${index}`, task: `task ${index}` })));
+  await Promise.all(
+    Array.from({ length: 30 }, (_, index) =>
+      repository.appendInput(session, { runId: `run-${index}`, task: `task ${index}` })
+    )
+  );
   const replay = await repository.loadReplayState(session);
   assert.equal(replay.branch.length, 30);
   assert.equal(replay.branch[0].parentId, null);
-  for (let index = 1; index < replay.branch.length; index += 1) assert.equal(replay.branch[index].parentId, replay.branch[index - 1].id);
+  for (let index = 1; index < replay.branch.length; index += 1)
+    assert.equal(replay.branch[index].parentId, replay.branch[index - 1].id);
   assert.equal((await repository.open(session.id, TEST_SESSION_BINDING)).leafId, replay.branch.at(-1).id);
 });
 
@@ -128,13 +175,19 @@ test('session repositories scan once and incrementally preserve a cross-instance
   await first.appendInput(session, { runId: 'run-0', task: 'task-0' });
   await second.appendInput(secondDescriptor, { runId: 'run-1', task: 'task-1' });
   await first.appendInput(session, { runId: 'run-2', task: 'task-2' });
-  await Promise.all(Array.from({ length: 21 }, (_, offset) => {
-    const index = offset + 3;
-    return (index % 2 === 0 ? first : second).appendInput(index % 2 === 0 ? session : secondDescriptor, { runId: `run-${index}`, task: `task-${index}` });
-  }));
+  await Promise.all(
+    Array.from({ length: 21 }, (_, offset) => {
+      const index = offset + 3;
+      return (index % 2 === 0 ? first : second).appendInput(index % 2 === 0 ? session : secondDescriptor, {
+        runId: `run-${index}`,
+        task: `task-${index}`
+      });
+    })
+  );
   const replay = await first.loadReplayState(session);
   assert.equal(replay.branch.length, 24);
-  for (let index = 1; index < replay.branch.length; index += 1) assert.equal(replay.branch[index].parentId, replay.branch[index - 1].id);
+  for (let index = 1; index < replay.branch.length; index += 1)
+    assert.equal(replay.branch[index].parentId, replay.branch[index - 1].id);
   assert.ok(first.indexMetrics().incrementalRefreshes > 0);
   assert.equal(second.indexMetrics().fullScans, 1);
   assert.ok(second.indexMetrics().incrementalRefreshes > 0);
@@ -146,18 +199,43 @@ test('session observations reject non-JSON data and replay complete outputs and 
     const session = await repository.create({ id: 'exact-json', binding: TEST_SESSION_BINDING });
     await repository.appendInput(session, { runId: 'run-exact', task: 'persist exact observation' });
     let getterCalls = 0;
-    const accessor = Object.defineProperty({}, 'getter', { enumerable: true, get() { getterCalls++; return 'hidden'; } });
-    const cycle = {}; cycle.self = cycle;
-    const request = { runId: 'run-exact', identity: { turnIndex: 1, turnId: 'turn-exact', requestAttempt: 1 }, toolName: 'exact_tool' };
+    const accessor = Object.defineProperty({}, 'getter', {
+      enumerable: true,
+      get() {
+        getterCalls++;
+        return 'hidden';
+      }
+    });
+    const cycle = {};
+    cycle.self = cycle;
+    const request = {
+      runId: 'run-exact',
+      identity: { turnIndex: 1, turnId: 'turn-exact', requestAttempt: 1 },
+      toolName: 'exact_tool'
+    };
     for (const output of [accessor, cycle, { count: 1n }]) {
-      await assert.rejects(repository.appendObservation(session, { ...request, observation: { ok: true, summary: 'invalid', output } }));
+      await assert.rejects(
+        repository.appendObservation(session, {
+          ...request,
+          observation: { ok: true, summary: 'invalid', output }
+        })
+      );
     }
-    await assert.rejects(repository.appendObservation(session, { ...request, observation: { ok: true, summary: 'invalid metadata', metadata: accessor } }));
+    await assert.rejects(
+      repository.appendObservation(session, {
+        ...request,
+        observation: { ok: true, summary: 'invalid metadata', metadata: accessor }
+      })
+    );
     assert.equal(getterCalls, 0);
     const output = { text: 'x'.repeat(100_000) + 'output end' };
     const metadata = { text: 'y'.repeat(20_000) + 'metadata end' };
-    await repository.appendObservation(session, { ...request, observation: { ok: true, summary: 'complete', output, metadata } });
-    const reader = repository instanceof JsonlSessionRepository ? new JsonlSessionRepository({ rootDir }) : repository;
+    await repository.appendObservation(session, {
+      ...request,
+      observation: { ok: true, summary: 'complete', output, metadata }
+    });
+    const reader =
+      repository instanceof JsonlSessionRepository ? new JsonlSessionRepository({ rootDir }) : repository;
     const replay = await reader.loadReplayState(session);
     const observations = replay.branch.filter((entry) => entry.type === 'observation');
     assert.equal(observations.length, 1);
@@ -170,9 +248,17 @@ test('session repositories retain and expose only owned session state', async ()
   const rootDir = await mkdtemp(path.join(tmpdir(), 'agent-session-owned-'));
   const repositories = [new InMemorySessionRepository(), new JsonlSessionRepository({ rootDir })];
   for (const [index, repository] of repositories.entries()) {
-    const session = await repository.create({ id: `owned-${String(index)}`, model: 'original', binding: TEST_SESSION_BINDING });
+    const session = await repository.create({
+      id: `owned-${String(index)}`,
+      model: 'original',
+      binding: TEST_SESSION_BINDING
+    });
     const instruction = { id: 'instruction', content: 'original', provenance: 'run' };
-    const input = await repository.appendInput(session, { runId: 'run', task: 'original', instructions: [instruction] });
+    const input = await repository.appendInput(session, {
+      runId: 'run',
+      task: 'original',
+      instructions: [instruction]
+    });
     instruction.content = 'mutated';
 
     assert.equal(input.instructions[0].content, 'original');
@@ -181,14 +267,18 @@ test('session repositories retain and expose only owned session state', async ()
     assert.equal(Object.isFrozen(input), true);
     assert.equal(Object.isFrozen(input.instructions), true);
     assert.equal(Object.isFrozen(input.instructions[0]), true);
-    assert.throws(() => { input.instructions[0].content = 'changed'; }, TypeError);
+    assert.throws(() => {
+      input.instructions[0].content = 'changed';
+    }, TypeError);
 
     const replay = await repository.loadReplayState(session);
     assert.equal(Object.isFrozen(replay), true);
     assert.equal(Object.isFrozen(replay.branch), true);
     assert.equal(Object.isFrozen(replay.runFinalizations), true);
     assert.equal(Object.isFrozen(replay.ledgerRunIds), true);
-    assert.throws(() => { replay.branch.pop(); }, TypeError);
+    assert.throws(() => {
+      replay.branch.pop();
+    }, TypeError);
     assert.equal((await repository.loadReplayState(session)).branch[0].instructions[0].content, 'original');
   }
 });
@@ -199,9 +289,30 @@ test('session run finalizations are idempotent and validate the complete termina
   const session = await repository.create({ id: 'final', binding: TEST_SESSION_BINDING });
   await repository.appendInput(session, { runId: 'run', task: 'finish the run' });
   const terminal = decodeAgentTerminalSnapshot({
-    runId: 'run', finalizationId: 'fin', phase: 'ended', executionStatus: 'completed', verificationStatus: 'not_required', terminationReason: 'model_completed', modelTerminationReason: 'stop',
-    modelOutput: { status: 'complete', message: 'done', source: 'content', turnIndex: 1 }, turnCount: 1, checkResults: [],
-    budget: { modelTurns: 1, totalToolCalls: 0, repeatedIdenticalToolCalls: 0, revisionAttempts: 0, elapsedMs: 1, promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, knownCosts: {}, pricingStatus: 'unknown', unknownPricedTokens: 0, consecutiveProviderFailures: 0, consecutiveToolFailures: 0 }
+    runId: 'run',
+    finalizationId: 'fin',
+    phase: 'ended',
+    executionStatus: 'completed',
+    terminationReason: 'model_completed',
+    modelTerminationReason: 'stop',
+    modelOutput: { status: 'complete', message: 'done', source: 'content', turnIndex: 1 },
+    turnCount: 1,
+    budget: {
+      modelTurns: 1,
+      totalToolCalls: 0,
+      repeatedIdenticalToolCalls: 0,
+      elapsedMs: 1,
+      promptTokens: 0,
+      completionTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      reasoningTokens: 0,
+      knownCosts: {},
+      pricingStatus: 'unknown',
+      unknownPricedTokens: 0,
+      consecutiveProviderFailures: 0,
+      consecutiveToolFailures: 0
+    }
   });
   const first = await repository.recordRunFinalization(session, terminal);
   const second = await repository.recordRunFinalization(session, terminal);
@@ -211,8 +322,15 @@ test('session run finalizations are idempotent and validate the complete termina
   assert.equal(first.throughEntryId, replay.branch[0].id);
 
   const file = repository.location(session.id);
-  await writeFile(file, `${await readFile(file, 'utf8')}${JSON.stringify({ type: 'final', id: 'bad', timestamp: new Date().toISOString(), runId: 'bad', finalizationId: 'bad', terminal: { ...terminal, runId: 'bad', finalizationId: 'bad', modelOutput: { status: 'absent' } } })}\n`, 'utf8');
-  await assert.rejects(repository.open(session.id, TEST_SESSION_BINDING), error => error instanceof PersistenceCorruptionError && error.code === 'invalid_record');
+  await writeFile(
+    file,
+    `${await readFile(file, 'utf8')}${JSON.stringify({ type: 'final', id: 'bad', timestamp: new Date().toISOString(), runId: 'bad', finalizationId: 'bad', terminal: { ...terminal, runId: 'bad', finalizationId: 'bad', modelOutput: { status: 'absent' } } })}\n`,
+    'utf8'
+  );
+  await assert.rejects(
+    repository.open(session.id, TEST_SESSION_BINDING),
+    (error) => error instanceof PersistenceCorruptionError && error.code === 'invalid_record'
+  );
 });
 
 test('session replay derives bounded continuity without persisted context records', async () => {
@@ -221,12 +339,19 @@ test('session replay derives bounded continuity without persisted context record
   for (let index = 0; index < 300; index += 1) {
     const runId = `run-${String(index)}`;
     await repository.appendInput(session, { runId, task: `${'任務'.repeat(600)} ${String(index)}` });
-    await repository.recordRunFinalization(session, completedTerminal(runId, `final-${String(index)}`, `${'結果'.repeat(900)} ${String(index)}`));
+    await repository.recordRunFinalization(
+      session,
+      completedTerminal(runId, `final-${String(index)}`, `${'結果'.repeat(900)} ${String(index)}`)
+    );
   }
 
   const replay = await repository.loadReplayState(session);
   assert.equal(replay.branch.length, 300, 'the durable branch retains every input');
-  assert.equal(replay.runFinalizations.length, 300, 'run finalizations remain authoritative inputs to derived continuity');
+  assert.equal(
+    replay.runFinalizations.length,
+    300,
+    'run finalizations remain authoritative inputs to derived continuity'
+  );
   assert.deepEqual(replay.ledgerRunIds, ['run-299']);
 });
 
@@ -241,7 +366,10 @@ test('session JSONL tolerates a torn tail and identifies middle corruption', asy
   const lines = (await readFile(file, 'utf8')).split('\n');
   lines.splice(1, 0, '{bad');
   await writeFile(file, lines.join('\n'), 'utf8');
-  await assert.rejects(repository.open(session.id, TEST_SESSION_BINDING), error => error instanceof PersistenceCorruptionError && error.line === 2 && error.byteOffset > 0);
+  await assert.rejects(
+    repository.open(session.id, TEST_SESSION_BINDING),
+    (error) => error instanceof PersistenceCorruptionError && error.line === 2 && error.byteOffset > 0
+  );
 });
 
 test('session JSONL indexes only newline-committed records and repairs arbitrarily large torn tails', async () => {
@@ -258,7 +386,10 @@ test('session JSONL indexes only newline-committed records and repairs arbitrari
   session = await repository.open(session.id, TEST_SESSION_BINDING);
   await repository.appendInput(session, { runId: 'replacement', task: 'replacement' });
   let replay = await new JsonlSessionRepository({ rootDir }).loadReplayState(session);
-  assert.deepEqual(replay.branch.map(entry => entry.runId), ['one', 'replacement']);
+  assert.deepEqual(
+    replay.branch.map((entry) => entry.runId),
+    ['one', 'replacement']
+  );
   assert.equal(replay.branch[1].parentId, replay.branch[0].id);
 
   repository = new JsonlSessionRepository({ rootDir });
@@ -269,7 +400,10 @@ test('session JSONL indexes only newline-committed records and repairs arbitrari
   const replacementDescriptor = await replacementRepository.open(session.id, TEST_SESSION_BINDING);
   await replacementRepository.appendInput(replacementDescriptor, { runId: 'two', task: 'two' });
   replay = await new JsonlSessionRepository({ rootDir }).loadReplayState(replacementDescriptor);
-  assert.deepEqual(replay.branch.map(entry => entry.runId), ['one', 'two']);
+  assert.deepEqual(
+    replay.branch.map((entry) => entry.runId),
+    ['one', 'two']
+  );
   assert.equal(replay.branch[1].parentId, replay.branch[0].id);
 });
 
@@ -278,8 +412,15 @@ test('session JSONL owns queued configuration and validates submission lifecycle
   let repository = new JsonlSessionRepository({ rootDir });
   let session = await repository.create({ id: 'submissions', binding: TEST_SESSION_BINDING });
   await repository.enqueueSubmission(session, {
-    submissionId: 'submission', runId: 'run', input: { task: 'persisted task' },
-    configuration: { provider: 'test', model: 'captured-model', reasoning: { strategy: 'effort', effort: 'high' }, responseFormat: { type: 'json_schema', schema: { type: 'object' } } }
+    submissionId: 'submission',
+    runId: 'run',
+    input: { task: 'persisted task' },
+    configuration: {
+      provider: 'test',
+      model: 'captured-model',
+      reasoning: { strategy: 'effort', effort: 'high' },
+      responseFormat: { type: 'json_schema', schema: { type: 'object' } }
+    }
   });
   repository = new JsonlSessionRepository({ rootDir });
   session = await repository.open(session.id, TEST_SESSION_BINDING);
@@ -287,13 +428,25 @@ test('session JSONL owns queued configuration and validates submission lifecycle
   assert.equal(pending[0].configuration.model, 'captured-model');
   assert.equal(Object.isFrozen(pending[0].configuration.responseFormat.schema), true);
   await repository.transitionSubmission(session, 'submission', { state: 'claimed' });
-  const suspension = { runId: 'run', submissionId: 'submission', category: 'implementation', reason: 'missing_implementation', actions: ['resume', 'abort'] };
+  const suspension = {
+    runId: 'run',
+    submissionId: 'submission',
+    category: 'implementation',
+    reason: 'missing_implementation',
+    actions: ['resume', 'abort']
+  };
   await repository.transitionSubmission(session, 'submission', { state: 'suspended', suspension });
   pending = await new JsonlSessionRepository({ rootDir }).loadPendingSubmissions(session);
   assert.equal(pending[0].state, 'suspended');
 
-  await appendFile(repository.location(session.id), `${JSON.stringify({ type: 'submission.completed', submissionId: 'submission', runId: 'run', timestamp: new Date().toISOString() })}\n`);
-  await assert.rejects(new JsonlSessionRepository({ rootDir }).open(session.id, TEST_SESSION_BINDING), error => error instanceof PersistenceCorruptionError && error.code === 'invalid_record');
+  await appendFile(
+    repository.location(session.id),
+    `${JSON.stringify({ type: 'submission.completed', submissionId: 'submission', runId: 'run', timestamp: new Date().toISOString() })}\n`
+  );
+  await assert.rejects(
+    new JsonlSessionRepository({ rootDir }).open(session.id, TEST_SESSION_BINDING),
+    (error) => error instanceof PersistenceCorruptionError && error.code === 'invalid_record'
+  );
 });
 
 function completedTerminal(runId, finalizationId, message) {
@@ -302,17 +455,14 @@ function completedTerminal(runId, finalizationId, message) {
     finalizationId,
     phase: 'ended',
     executionStatus: 'completed',
-    verificationStatus: 'not_required',
     terminationReason: 'model_completed',
     modelTerminationReason: 'stop',
     modelOutput: { status: 'complete', message, source: 'content', turnIndex: 1 },
     turnCount: 1,
-    checkResults: [],
     budget: {
       modelTurns: 1,
       totalToolCalls: 0,
       repeatedIdenticalToolCalls: 0,
-      revisionAttempts: 0,
       elapsedMs: 1,
       promptTokens: 0,
       completionTokens: 0,
@@ -328,7 +478,9 @@ function completedTerminal(runId, finalizationId, message) {
   };
 }
 
-function testBudget() { return completedTerminal('run', 'final', 'result').budget; }
+function testBudget() {
+  return completedTerminal('run', 'final', 'result').budget;
+}
 
 function runCoordinator() {
   return new AgentRunCoordinator(new InMemoryEventRepository(agentEventCodec));
@@ -339,7 +491,14 @@ async function acceptTestRun(runs, runId) {
     runId,
     finalizationId: `${runId}:final`,
     input: { task: 'claimed', instructions: [], contextItems: [] },
-    configuration: { providerId: 'test', providerImplementationId: 'agent-core.tests.session-provider@1', model: 'model', runtimeImplementationId: 'test/runtime@1', toolImplementationIds: [], checks: [], disposition: { implementationId: 'agent-core.tests.accept-disposition@1', policyIdentity: { strategy: 'accept' }, policyHash: hashJson({ strategy: 'accept' }) }, policyHash: 'policy' }
+    configuration: {
+      providerId: 'test',
+      providerImplementationId: 'agent-core.tests.session-provider@1',
+      model: 'model',
+      runtimeImplementationId: 'test/runtime@1',
+      toolImplementationIds: [],
+      policyHash: 'policy'
+    }
   });
 }
 
@@ -355,25 +514,136 @@ async function acceptApprovalRun(runs, runId) {
     assert.equal(result.kind, 'advanced');
   };
   await advance('initialize_run', { phase: { kind: 'initializing', step: 'assemble_turn', turnIndex: 1 } });
-  await advance('assemble_turn', { phase: { kind: 'active' }, providerRequests: [{ kind: 'provider', stage: 'ready', identity, toolBatchId: 'batch' }] });
-  const issued = issueEffectStartTicket({ intent: { effectId: 'provider-effect', ownerId: runId, implementationId: 'agent-core.tests.session-provider@1', parametersDigest: '0'.repeat(64), recovery: { kind: 'unknown' }, exposure: { quantities: [] } }, ticketId: 'provider-ticket', settlementPermitId: 'provider-permit', driverGeneration: driver.state().driverGeneration, currentDriverGeneration: driver.state().driverGeneration });
+  await advance('assemble_turn', {
+    phase: { kind: 'active' },
+    providerRequests: [{ kind: 'provider', stage: 'ready', identity, toolBatchId: 'batch' }]
+  });
+  const issued = issueEffectStartTicket({
+    intent: {
+      effectId: 'provider-effect',
+      ownerId: runId,
+      implementationId: 'agent-core.tests.session-provider@1',
+      parametersDigest: '0'.repeat(64),
+      recovery: { kind: 'unknown' },
+      exposure: { quantities: [] }
+    },
+    ticketId: 'provider-ticket',
+    settlementPermitId: 'provider-permit',
+    driverGeneration: driver.state().driverGeneration,
+    currentDriverGeneration: driver.state().driverGeneration
+  });
   assert.equal(issued.status, 'issued');
-  await advance('authorize_provider_request', { phase: { kind: 'active' }, providerRequests: [{ kind: 'provider', stage: 'effect_ready', identity, toolBatchId: 'batch', requestEventId: 'request', responseId: 'response', effect: issued.state }] });
+  await advance('authorize_provider_request', {
+    phase: { kind: 'active' },
+    providerRequests: [
+      {
+        kind: 'provider',
+        stage: 'effect_ready',
+        identity,
+        toolBatchId: 'batch',
+        requestEventId: 'request',
+        responseId: 'response',
+        effect: issued.state
+      }
+    ]
+  });
   const started = startExternalEffect(issued.state, issued.state.ticket, driver.state().driverGeneration);
   assert.equal(started.status, 'started');
-  await advance('start_provider_request', { phase: { kind: 'active' }, providerRequests: [{ kind: 'provider', stage: 'effect_pending', identity, toolBatchId: 'batch', requestEventId: 'request', responseId: 'response', effect: started.state }] });
-  const settled = settleExternalEffect(started.state, started.state.settlementPermit, { outcome: 'succeeded', resultDigest: '1'.repeat(64), exposure: { status: 'known', quantities: [] } });
+  await advance('start_provider_request', {
+    phase: { kind: 'active' },
+    providerRequests: [
+      {
+        kind: 'provider',
+        stage: 'effect_pending',
+        identity,
+        toolBatchId: 'batch',
+        requestEventId: 'request',
+        responseId: 'response',
+        effect: started.state
+      }
+    ]
+  });
+  const settled = settleExternalEffect(started.state, started.state.settlementPermit, {
+    outcome: 'succeeded',
+    resultDigest: '1'.repeat(64),
+    exposure: { status: 'known', quantities: [] }
+  });
   assert.equal(settled.status, 'settled');
-  await advance('reconcile_provider_request', { phase: { kind: 'active' }, providerRequests: [{ kind: 'provider', stage: 'settled', identity, toolBatchId: 'batch', requestEventId: 'request', responseId: 'response', settlementEventId: 'response-event', effect: settled.state }] });
+  await advance('reconcile_provider_request', {
+    phase: { kind: 'active' },
+    providerRequests: [
+      {
+        kind: 'provider',
+        stage: 'settled',
+        identity,
+        toolBatchId: 'batch',
+        requestEventId: 'request',
+        responseId: 'response',
+        settlementEventId: 'response-event',
+        effect: settled.state
+      }
+    ]
+  });
   const call = createToolCall({ id: 'call', name: 'write', input: { kind: 'json', value: {} } });
-  const effects = { accesses: [{ mode: 'write', scope: 'workspace/file' }], lockScopes: ['workspace/file'], recovery: { kind: 'unknown' } };
-  const binding = { toolImplementationId: 'test/write@1', authorizationPolicyId: 'test-policy', executionTargetId: 'test-target' };
-  const plan = { toolImplementationId: binding.toolImplementationId, canonicalInput: {}, fingerprint: '2'.repeat(64), effects, binding, authorization: 'require_approval', authorizationReason: 'confirm' };
-  const approval = { runId, ...identity, toolBatchId: 'batch', callIndex: 0, callId: 'call', approvalId: 'approval', status: 'pending', toolName: 'write', fingerprint: plan.fingerprint, input: {}, effects, binding, policyHash: '3'.repeat(64), reason: 'confirm' };
-  const entries = [{ name: 'write', implementationId: binding.toolImplementationId, definitionHash: '4'.repeat(64) }];
-  const batch = { kind: 'tools', identity, toolBatchId: 'batch', calls: [call], modelCalls: [{ type: 'function', id: call.id, name: call.name, input: call.input }], source: { responseId: 'response', catalog: { revision: hashJson(entries), entries } }, callStates: [{ stage: 'ready' }], maxConcurrency: 1, instructions: [], modelInputModalities: ['text'] };
-  await advance('consume_provider_settlement', { phase: { kind: 'active' }, providerRequests: driver.state().providerRequests.map((request) => ({ ...request, stage: 'consumed' })), toolBatches: [batch] });
-  await advance('plan_tool_call', { phase: { kind: 'suspended', reason: 'approval', approvalId: approval.approvalId }, toolBatches: [{ ...batch, callStates: [{ stage: 'approval', plan, approval }] }] });
+  const effects = {
+    accesses: [{ mode: 'write', scope: 'workspace/file' }],
+    lockScopes: ['workspace/file'],
+    recovery: { kind: 'unknown' }
+  };
+  const binding = {
+    toolImplementationId: 'test/write@1',
+    authorizationPolicyId: 'test-policy',
+    executionTargetId: 'test-target'
+  };
+  const plan = {
+    toolImplementationId: binding.toolImplementationId,
+    canonicalInput: {},
+    fingerprint: '2'.repeat(64),
+    effects,
+    binding,
+    authorization: 'require_approval',
+    authorizationReason: 'confirm'
+  };
+  const approval = {
+    runId,
+    ...identity,
+    toolBatchId: 'batch',
+    callIndex: 0,
+    callId: 'call',
+    approvalId: 'approval',
+    status: 'pending',
+    toolName: 'write',
+    fingerprint: plan.fingerprint,
+    input: {},
+    effects,
+    binding,
+    policyHash: '3'.repeat(64),
+    reason: 'confirm'
+  };
+  const entries = [
+    { name: 'write', implementationId: binding.toolImplementationId, definitionHash: '4'.repeat(64) }
+  ];
+  const batch = {
+    kind: 'tools',
+    identity,
+    toolBatchId: 'batch',
+    calls: [call],
+    modelCalls: [{ type: 'function', id: call.id, name: call.name, input: call.input }],
+    source: { responseId: 'response', catalog: { revision: hashJson(entries), entries } },
+    callStates: [{ stage: 'ready' }],
+    maxConcurrency: 1,
+    instructions: [],
+    modelInputModalities: ['text']
+  };
+  await advance('consume_provider_settlement', {
+    phase: { kind: 'active' },
+    providerRequests: driver.state().providerRequests.map((request) => ({ ...request, stage: 'consumed' })),
+    toolBatches: [batch]
+  });
+  await advance('plan_tool_call', {
+    phase: { kind: 'suspended', reason: 'approval', approvalId: approval.approvalId },
+    toolBatches: [{ ...batch, callStates: [{ stage: 'approval', plan, approval }] }]
+  });
 }
 
 async function acceptExternalRecoveryRun(runs, runId) {
@@ -388,19 +658,52 @@ async function acceptExternalRecoveryRun(runs, runId) {
     assert.equal(result.kind, 'advanced');
   };
   await advance('initialize_run', { phase: { kind: 'initializing', step: 'assemble_turn', turnIndex: 1 } });
-  await advance('assemble_turn', { phase: { kind: 'active' }, providerRequests: [{ kind: 'provider', stage: 'ready', identity, toolBatchId: 'batch' }] });
+  await advance('assemble_turn', {
+    phase: { kind: 'active' },
+    providerRequests: [{ kind: 'provider', stage: 'ready', identity, toolBatchId: 'batch' }]
+  });
   const issued = issueEffectStartTicket({
-    intent: { effectId: 'provider-effect', ownerId: runId, implementationId: 'agent-core.tests.session-provider@1', parametersDigest: '0'.repeat(64), recovery: { kind: 'unknown' }, exposure: { quantities: [] } },
-    ticketId: 'provider-ticket', settlementPermitId: 'provider-permit',
-    driverGeneration: driver.state().driverGeneration, currentDriverGeneration: driver.state().driverGeneration
+    intent: {
+      effectId: 'provider-effect',
+      ownerId: runId,
+      implementationId: 'agent-core.tests.session-provider@1',
+      parametersDigest: '0'.repeat(64),
+      recovery: { kind: 'unknown' },
+      exposure: { quantities: [] }
+    },
+    ticketId: 'provider-ticket',
+    settlementPermitId: 'provider-permit',
+    driverGeneration: driver.state().driverGeneration,
+    currentDriverGeneration: driver.state().driverGeneration
   });
   assert.equal(issued.status, 'issued');
-  const provider = { kind: 'provider', identity, toolBatchId: 'batch', requestEventId: 'request', responseId: 'response' };
-  await advance('authorize_provider_request', { phase: { kind: 'active' }, providerRequests: [{ ...provider, stage: 'effect_ready', effect: issued.state }] });
+  const provider = {
+    kind: 'provider',
+    identity,
+    toolBatchId: 'batch',
+    requestEventId: 'request',
+    responseId: 'response'
+  };
+  await advance('authorize_provider_request', {
+    phase: { kind: 'active' },
+    providerRequests: [{ ...provider, stage: 'effect_ready', effect: issued.state }]
+  });
   const started = startExternalEffect(issued.state, issued.state.ticket, driver.state().driverGeneration);
   assert.equal(started.status, 'started');
-  await advance('start_provider_request', { phase: { kind: 'active' }, providerRequests: [{ ...provider, stage: 'effect_pending', effect: started.state }] });
-  await advance('reconcile_provider_request', { phase: { kind: 'active' }, providerRequests: [{ ...provider, stage: 'outcome_unknown', effect: closeExternalEffect(started.state, 'unknown_outcome') }] });
+  await advance('start_provider_request', {
+    phase: { kind: 'active' },
+    providerRequests: [{ ...provider, stage: 'effect_pending', effect: started.state }]
+  });
+  await advance('reconcile_provider_request', {
+    phase: { kind: 'active' },
+    providerRequests: [
+      {
+        ...provider,
+        stage: 'outcome_unknown',
+        effect: closeExternalEffect(started.state, 'unknown_outcome')
+      }
+    ]
+  });
 }
 
 async function acceptUserDecisionRun(runs, runId) {
@@ -415,15 +718,36 @@ async function acceptUserDecisionRun(runs, runId) {
     assert.equal(result.kind, 'advanced');
   };
   await advance('initialize_run', { phase: { kind: 'initializing', step: 'assemble_turn', turnIndex: 1 } });
-  await advance('assemble_turn', { phase: { kind: 'active' }, providerRequests: [{ kind: 'provider', stage: 'ready', identity, toolBatchId: 'batch' }] });
+  await advance('assemble_turn', {
+    phase: { kind: 'active' },
+    providerRequests: [{ kind: 'provider', stage: 'ready', identity, toolBatchId: 'batch' }]
+  });
   const issued = issueEffectStartTicket({
-    intent: { effectId: 'provider-effect', ownerId: runId, implementationId: 'agent-core.tests.session-provider@1', parametersDigest: '0'.repeat(64), recovery: { kind: 'unknown' }, exposure: { quantities: [] } },
-    ticketId: 'provider-ticket', settlementPermitId: 'provider-permit',
-    driverGeneration: driver.state().driverGeneration, currentDriverGeneration: driver.state().driverGeneration
+    intent: {
+      effectId: 'provider-effect',
+      ownerId: runId,
+      implementationId: 'agent-core.tests.session-provider@1',
+      parametersDigest: '0'.repeat(64),
+      recovery: { kind: 'unknown' },
+      exposure: { quantities: [] }
+    },
+    ticketId: 'provider-ticket',
+    settlementPermitId: 'provider-permit',
+    driverGeneration: driver.state().driverGeneration,
+    currentDriverGeneration: driver.state().driverGeneration
   });
   assert.equal(issued.status, 'issued');
-  const blockedProvider = { kind: 'provider', identity, toolBatchId: 'batch', requestEventId: 'request', responseId: 'response' };
-  await advance('authorize_provider_request', { phase: { kind: 'active' }, providerRequests: [{ ...blockedProvider, stage: 'effect_ready', effect: issued.state }] });
+  const blockedProvider = {
+    kind: 'provider',
+    identity,
+    toolBatchId: 'batch',
+    requestEventId: 'request',
+    responseId: 'response'
+  };
+  await advance('authorize_provider_request', {
+    phase: { kind: 'active' },
+    providerRequests: [{ ...blockedProvider, stage: 'effect_ready', effect: issued.state }]
+  });
   const effect = closeExternalEffect(issued.state, 'cancelled_before_start');
   const runRevision = driver.state().revision + 1;
   const id = `${runId}:decision:${effect.intent.effectId}`;
@@ -432,8 +756,13 @@ async function acceptUserDecisionRun(runs, runId) {
   const fingerprint = hashJson({ id, reason, choices, runRevision, effectId: effect.intent.effectId });
   const decisionRequest = { id, reason, choices, fingerprint, runRevision };
   await advance('start_provider_request', {
-    phase: { kind: 'suspended', reason: 'user_decision', effectId: effect.intent.effectId, decisionRequest,
-      continuation: { kind: 'cancelled_provider_start', blockedProvider: { ...blockedProvider, effect } } },
+    phase: {
+      kind: 'suspended',
+      reason: 'user_decision',
+      effectId: effect.intent.effectId,
+      decisionRequest,
+      continuation: { kind: 'cancelled_provider_start', blockedProvider: { ...blockedProvider, effect } }
+    },
     providerRequests: [{ ...blockedProvider, stage: 'outcome_unknown', effect }]
   });
   return Object.freeze({ ...decisionRequest, choices: Object.freeze(choices) });
@@ -441,16 +770,26 @@ async function acceptUserDecisionRun(runs, runId) {
 
 test('AgentSession rejects a mismatched binding before restoration or runtime construction', async () => {
   const repository = new InMemorySessionRepository();
-  const descriptor = await repository.create({ id: 'session-binding-boundary', binding: TEST_SESSION_BINDING });
+  const descriptor = await repository.create({
+    id: 'session-binding-boundary',
+    binding: TEST_SESSION_BINDING
+  });
   let runtimeCreations = 0;
-  assert.throws(() => new AgentSession({
-    descriptor,
-    expectedBinding: { ...TEST_SESSION_BINDING, subject: { application: 'another-agent' } },
-    repository,
-    runs: runCoordinator(),
-    configuration: { provider: 'test', model: 'model' },
-    createRuntime() { runtimeCreations += 1; throw new Error('must not execute'); }
-  }), SessionBindingMismatchError);
+  assert.throws(
+    () =>
+      new AgentSession({
+        descriptor,
+        expectedBinding: { ...TEST_SESSION_BINDING, subject: { application: 'another-agent' } },
+        repository,
+        runs: runCoordinator(),
+        configuration: { provider: 'test', model: 'model' },
+        createRuntime() {
+          runtimeCreations += 1;
+          throw new Error('must not execute');
+        }
+      }),
+    SessionBindingMismatchError
+  );
   assert.equal(runtimeCreations, 0);
 });
 
@@ -474,8 +813,20 @@ test('AgentSession serializes admission, preserves steering identity, and snapsh
         run(input) {
           let resolve;
           const steering = [];
-          const result = new Promise((done) => { resolve = done; });
-          const control = { runId: input.runId, steering, resolve, result, injectSteering(value) { steering.push(value.instruction); return { id: 'steer', runId: input.runId, timestamp: new Date().toISOString() }; }, abort() {} };
+          const result = new Promise((done) => {
+            resolve = done;
+          });
+          const control = {
+            runId: input.runId,
+            steering,
+            resolve,
+            result,
+            injectSteering(value) {
+              steering.push(value.instruction);
+              return { id: 'steer', runId: input.runId, timestamp: new Date().toISOString() };
+            },
+            abort() {}
+          };
           controls.push(control);
           return control;
         }
@@ -486,7 +837,10 @@ test('AgentSession serializes admission, preserves steering identity, and snapsh
   assert.equal(first.kind, 'started');
   const stale = await session.submit({ task: 'stale' }, { delivery: 'steer', expectedRunId: 'wrong' });
   assert.deepEqual(stale, { kind: 'rejected', reason: 'run_mismatch' });
-  const steered = await session.submit({ task: 'focus' }, { delivery: 'steer', expectedRunId: first.runId });
+  const steered = await session.submit(
+    { task: 'focus' },
+    { delivery: 'steer', expectedRunId: first.runId }
+  );
   assert.equal(steered.kind, 'steered');
   assert.deepEqual(controls[0].steering, ['focus']);
   await session.configure({ model: 'second' });
@@ -520,14 +874,23 @@ test('session branches require stable boundaries and record assistant turns once
   const input = await repository.appendInput(session, { runId: 'run', task: 'work' });
   await assert.rejects(repository.branchFrom(session, input.id), /completed final or context transition/u);
   await repository.appendAssistant(session, {
-    runId: 'run', identity: { turnIndex: 1, turnId: 'turn', requestAttempt: 1 }, content: 'answer'
+    runId: 'run',
+    identity: { turnIndex: 1, turnId: 'turn', requestAttempt: 1 },
+    content: 'answer'
   });
   await repository.appendSteering(session, { runId: 'run', content: 'preserve this accepted correction' });
-  await assert.rejects(repository.appendAssistant(session, {
-    runId: 'run', identity: { turnIndex: 1, turnId: 'turn', requestAttempt: 1 }, content: 'conflicting answer'
-  }), /Conflicting assistant finalization/u);
+  await assert.rejects(
+    repository.appendAssistant(session, {
+      runId: 'run',
+      identity: { turnIndex: 1, turnId: 'turn', requestAttempt: 1 },
+      content: 'conflicting answer'
+    }),
+    /Conflicting assistant finalization/u
+  );
   await repository.appendAssistant(session, {
-    runId: 'run', identity: { turnIndex: 1, turnId: 'turn', requestAttempt: 1 }, content: 'answer'
+    runId: 'run',
+    identity: { turnIndex: 1, turnId: 'turn', requestAttempt: 1 },
+    content: 'answer'
   });
   await repository.recordRunFinalization(session, completedTerminal('run', 'final', 'answer'));
   const points = await repository.listBranchPoints(session);
@@ -542,9 +905,24 @@ test('AgentSession restores claimed and queued work without starting execution d
   const repository = new InMemorySessionRepository();
   const descriptor = await repository.create({ id: 'durable-admission', binding: TEST_SESSION_BINDING });
   const blocked = new AgentSession({
-    descriptor, expectedBinding: TEST_SESSION_BINDING, repository, runs: runCoordinator(), configuration: { provider: 'test', model: 'model' },
+    descriptor,
+    expectedBinding: TEST_SESSION_BINDING,
+    repository,
+    runs: runCoordinator(),
+    configuration: { provider: 'test', model: 'model' },
     createRuntime() {
-      return { run(input) { return { runId: input.runId, result: new Promise(() => {}), injectSteering() { throw new Error('unused'); }, abort() {} }; } };
+      return {
+        run(input) {
+          return {
+            runId: input.runId,
+            result: new Promise(() => {}),
+            injectSteering() {
+              throw new Error('unused');
+            },
+            abort() {}
+          };
+        }
+      };
     }
   });
   const claimed = await blocked.submit({ task: 'claimed' });
@@ -558,20 +936,45 @@ test('AgentSession restores claimed and queued work without starting execution d
   const executed = [];
   const failures = [];
   const recovered = new AgentSession({
-    descriptor, expectedBinding: TEST_SESSION_BINDING, repository, runs, configuration: { provider: 'test', model: 'different-model' },
+    descriptor,
+    expectedBinding: TEST_SESSION_BINDING,
+    repository,
+    runs,
+    configuration: { provider: 'test', model: 'different-model' },
     createRuntime(configuration, _onProgress, context) {
       const execute = (input) => {
         executed.push({ task: input.task, model: configuration.model, resuming: context.resuming });
-        return { runId: input.runId, result: Promise.resolve({ state: 'ended', terminal: { runId: input.runId }, deliveryDiagnostics: [] }), injectSteering() { throw new Error('unused'); }, abort() {} };
+        return {
+          runId: input.runId,
+          result: Promise.resolve({
+            state: 'ended',
+            terminal: { runId: input.runId },
+            deliveryDiagnostics: []
+          }),
+          injectSteering() {
+            throw new Error('unused');
+          },
+          abort() {}
+        };
       };
-      return { run: execute, resume(runId) { return execute({ runId, task: 'claimed' }); } };
+      return {
+        run: execute,
+        resume(runId) {
+          return execute({ runId, task: 'claimed' });
+        }
+      };
     }
   });
-  recovered.subscribe((event) => { if (event.type === 'run.failed') failures.push(event.error.message); });
+  recovered.subscribe((event) => {
+    if (event.type === 'run.failed') failures.push(event.error.message);
+  });
   await recovered.restore();
   assert.deepEqual(executed, []);
   await recovered.waitForIdle();
-  assert.deepEqual(executed, [{ task: 'claimed', model: 'model', resuming: true }, { task: 'recover me', model: 'model', resuming: false }]);
+  assert.deepEqual(executed, [
+    { task: 'claimed', model: 'model', resuming: true },
+    { task: 'recover me', model: 'model', resuming: false }
+  ]);
   assert.equal(failures.length, 0);
   assert.deepEqual(await repository.loadPendingSubmissions(descriptor), []);
 });
@@ -580,16 +983,45 @@ test('context transitions commit once without evicting original session records'
   const repository = new InMemorySessionRepository();
   const descriptor = await repository.create({ id: 'context-transition', binding: TEST_SESSION_BINDING });
   await repository.appendInput(descriptor, { runId: 'run', task: 'retain this decision' });
-  await repository.appendAssistant(descriptor, { runId: 'run', identity: { turnIndex: 1, turnId: 'turn', requestAttempt: 1 }, content: 'decision retained' });
-  await repository.recordRunFinalization(descriptor, completedTerminal('run', 'final', 'decision retained'));
+  await repository.appendAssistant(descriptor, {
+    runId: 'run',
+    identity: { turnIndex: 1, turnId: 'turn', requestAttempt: 1 },
+    content: 'decision retained'
+  });
+  await repository.recordRunFinalization(
+    descriptor,
+    completedTerminal('run', 'final', 'decision retained')
+  );
   const history = new HistoryReader({ repository, session: descriptor });
-  const context = new ContextService({ repository, session: descriptor, history, bootstrap: { validate: async () => {}, maxBytes: 64 * 1024 } });
+  const context = new ContextService({
+    repository,
+    session: descriptor,
+    history,
+    bootstrap: { validate: async () => {}, maxBytes: 64 * 1024 }
+  });
   const view = await history.view();
-  const request = { expectedWindowId: null, idempotencyKey: 'retain-once', reason: 'Explicit attention boundary',
-    selection: { strategy: 'retain', retained: view.entries.map((entry) => sourceRef(descriptor.id, entry)), notes: [], omitted: [] } };
-  const agent = new AgentSession({ descriptor, expectedBinding: TEST_SESSION_BINDING, repository, runs: runCoordinator(),
-    configuration: { provider: 'test', model: 'model' }, context,
-    createRuntime() { throw new Error('No inference required by this transition'); } });
+  const request = {
+    expectedWindowId: null,
+    idempotencyKey: 'retain-once',
+    reason: 'Explicit attention boundary',
+    selection: {
+      strategy: 'retain',
+      retained: view.entries.map((entry) => sourceRef(descriptor.id, entry)),
+      notes: [],
+      omitted: []
+    }
+  };
+  const agent = new AgentSession({
+    descriptor,
+    expectedBinding: TEST_SESSION_BINDING,
+    repository,
+    runs: runCoordinator(),
+    configuration: { provider: 'test', model: 'model' },
+    context,
+    createRuntime() {
+      throw new Error('No inference required by this transition');
+    }
+  });
   const first = await agent.transitionContext(request);
   assert.equal(Object.isFrozen(first.window.selection), true);
   assert.equal((await agent.transitionContext(request)).id, first.id);
@@ -607,16 +1039,40 @@ test('approval suspension remains durable and blocks queued follow-ups until res
   const approvalOperations = new AgentRunCoordinator(approvalEvents);
   let resolveFirst;
   const firstProcess = new AgentSession({
-    descriptor, expectedBinding: TEST_SESSION_BINDING, repository, runs: approvalOperations, configuration: { provider: 'test', model: 'model' },
-    createRuntime() { return { run(input) {
-      return { runId: input.runId, result: new Promise((resolve) => { resolveFirst = resolve; }), injectSteering() { throw new Error('unused'); }, abort() {} };
-    } }; }
+    descriptor,
+    expectedBinding: TEST_SESSION_BINDING,
+    repository,
+    runs: approvalOperations,
+    configuration: { provider: 'test', model: 'model' },
+    createRuntime() {
+      return {
+        run(input) {
+          return {
+            runId: input.runId,
+            result: new Promise((resolve) => {
+              resolveFirst = resolve;
+            }),
+            injectSteering() {
+              throw new Error('unused');
+            },
+            abort() {}
+          };
+        }
+      };
+    }
   });
   const first = await firstProcess.submit({ task: 'needs approval' });
   const followUp = await firstProcess.submit({ task: 'after approval' });
   assert.equal(followUp.kind, 'queued');
   await acceptApprovalRun(approvalOperations, first.runId);
-  resolveFirst({ state: 'suspended', reason: 'approval_required', runId: first.runId, finalizationId: 'final', pendingApprovals: [], budget: testBudget() });
+  resolveFirst({
+    state: 'suspended',
+    reason: 'approval_required',
+    runId: first.runId,
+    finalizationId: 'final',
+    pendingApprovals: [],
+    budget: testBudget()
+  });
   await first.completion;
   assert.equal(firstProcess.state().phase, 'suspended');
   const rejected = await firstProcess.submit({ task: 'must not enter the durable queue' });
@@ -626,21 +1082,54 @@ test('approval suspension remains durable and blocks queued follow-ups until res
 
   const executed = [];
   const restarted = new AgentSession({
-    descriptor, expectedBinding: TEST_SESSION_BINDING, repository, runs: approvalOperations, configuration: { provider: 'test', model: 'model' },
-    createRuntime() { return {
-      run(input) {
-        executed.push(input.task);
-        return { runId: input.runId, result: Promise.resolve({ state: 'ended', terminal: { runId: input.runId }, deliveryDiagnostics: [] }), injectSteering() { throw new Error('unused'); }, abort() {} };
-      },
-      resolveApproval(input) {
-        return Promise.resolve({ runId: input.runId, result: Promise.resolve({ state: 'ended', terminal: { runId: input.runId }, deliveryDiagnostics: [] }), injectSteering() { throw new Error('unused'); }, abort() {} });
-      }
-    }; }
+    descriptor,
+    expectedBinding: TEST_SESSION_BINDING,
+    repository,
+    runs: approvalOperations,
+    configuration: { provider: 'test', model: 'model' },
+    createRuntime() {
+      return {
+        run(input) {
+          executed.push(input.task);
+          return {
+            runId: input.runId,
+            result: Promise.resolve({
+              state: 'ended',
+              terminal: { runId: input.runId },
+              deliveryDiagnostics: []
+            }),
+            injectSteering() {
+              throw new Error('unused');
+            },
+            abort() {}
+          };
+        },
+        resolveApproval(input) {
+          return Promise.resolve({
+            runId: input.runId,
+            result: Promise.resolve({
+              state: 'ended',
+              terminal: { runId: input.runId },
+              deliveryDiagnostics: []
+            }),
+            injectSteering() {
+              throw new Error('unused');
+            },
+            abort() {}
+          });
+        }
+      };
+    }
   });
   await restarted.restore();
   assert.equal(restarted.state().phase, 'suspended');
   assert.deepEqual(executed, []);
-  await restarted.resolveApproval({ runId: first.runId, approvalId: 'approval', fingerprint: 'fingerprint', decision: 'allow' });
+  await restarted.resolveApproval({
+    runId: first.runId,
+    approvalId: 'approval',
+    fingerprint: 'fingerprint',
+    decision: 'allow'
+  });
   await restarted.waitForIdle();
   assert.deepEqual(executed, ['after approval']);
 });
@@ -653,29 +1142,69 @@ test('external recovery suspension remains explicit and unresolved reconciliatio
   let settleInitial;
   let resumes = 0;
   const session = new AgentSession({
-    descriptor, expectedBinding: TEST_SESSION_BINDING, repository, runs,
+    descriptor,
+    expectedBinding: TEST_SESSION_BINDING,
+    repository,
+    runs,
     configuration: { provider: 'test', model: 'model' },
     createRuntime() {
       return {
         run(input) {
-          return { runId: input.runId, result: new Promise((resolve) => { settleInitial = resolve; }), injectSteering() { throw new Error('unused'); }, abort() {} };
+          return {
+            runId: input.runId,
+            result: new Promise((resolve) => {
+              settleInitial = resolve;
+            }),
+            injectSteering() {
+              throw new Error('unused');
+            },
+            abort() {}
+          };
         },
         resume(runId) {
           resumes += 1;
-          const result = runs.inspect(runId).then((run) => run.state.control.status === 'abort_requested'
-            ? { state: 'ended', terminal: { runId }, deliveryDiagnostics: [] }
-            : { state: 'suspended', reason: 'provider_outcome_unknown', runId, finalizationId: `${runId}:final`, effectId: 'provider-effect', budget: testBudget() });
-          return { runId, result, injectSteering() { throw new Error('unused'); }, abort() {} };
+          const result = runs.inspect(runId).then((run) =>
+            run.state.control.status === 'abort_requested'
+              ? { state: 'ended', terminal: { runId }, deliveryDiagnostics: [] }
+              : {
+                  state: 'suspended',
+                  reason: 'provider_outcome_unknown',
+                  runId,
+                  finalizationId: `${runId}:final`,
+                  effectId: 'provider-effect',
+                  budget: testBudget()
+                }
+          );
+          return {
+            runId,
+            result,
+            injectSteering() {
+              throw new Error('unused');
+            },
+            abort() {}
+          };
         }
       };
     }
   });
   const submission = await session.submit({ task: 'external effect' });
   await acceptExternalRecoveryRun(runs, submission.runId);
-  settleInitial({ state: 'suspended', reason: 'provider_outcome_unknown', runId: submission.runId, finalizationId: `${submission.runId}:final`, effectId: 'provider-effect', budget: testBudget() });
+  settleInitial({
+    state: 'suspended',
+    reason: 'provider_outcome_unknown',
+    runId: submission.runId,
+    finalizationId: `${submission.runId}:final`,
+    effectId: 'provider-effect',
+    budget: testBudget()
+  });
   await submission.completion;
   assert.deepEqual(session.inspectSuspension(), {
-    runId: submission.runId, submissionId: submission.submissionId, category: 'external_recovery', reason: 'provider_outcome_unknown', effectId: 'provider-effect', actions: ['reconcile', 'abort']
+    runId: submission.runId,
+    submissionId: submission.submissionId,
+    category: 'external_recovery',
+    reason: 'provider_outcome_unknown',
+    effectId: 'provider-effect',
+    actions: ['reconcile', 'abort']
   });
   await assert.rejects(session.resumeImplementation(submission.runId), /does not permit/u);
   const unresolved = await session.reconcileExternal(submission.runId);
@@ -690,28 +1219,56 @@ test('external recovery suspension remains explicit and unresolved reconciliatio
 
 test('missing implementation suspension resumes only through its category-specific run', async () => {
   const repository = new InMemorySessionRepository();
-  const descriptor = await repository.create({ id: 'implementation-suspension', binding: TEST_SESSION_BINDING });
+  const descriptor = await repository.create({
+    id: 'implementation-suspension',
+    binding: TEST_SESSION_BINDING
+  });
   const runs = runCoordinator();
   let settleInitial;
   let resumes = 0;
   const session = new AgentSession({
-    descriptor, expectedBinding: TEST_SESSION_BINDING, repository, runs,
+    descriptor,
+    expectedBinding: TEST_SESSION_BINDING,
+    repository,
+    runs,
     configuration: { provider: 'test', model: 'model' },
     createRuntime() {
       return {
         run(input) {
-          return { runId: input.runId, result: new Promise((resolve) => { settleInitial = resolve; }), injectSteering() { throw new Error('unused'); }, abort() {} };
+          return {
+            runId: input.runId,
+            result: new Promise((resolve) => {
+              settleInitial = resolve;
+            }),
+            injectSteering() {
+              throw new Error('unused');
+            },
+            abort() {}
+          };
         },
         resume(runId) {
           resumes += 1;
-          return { runId, result: Promise.resolve({ state: 'ended', terminal: { runId }, deliveryDiagnostics: [] }), injectSteering() { throw new Error('unused'); }, abort() {} };
+          return {
+            runId,
+            result: Promise.resolve({ state: 'ended', terminal: { runId }, deliveryDiagnostics: [] }),
+            injectSteering() {
+              throw new Error('unused');
+            },
+            abort() {}
+          };
         }
       };
     }
   });
   const submission = await session.submit({ task: 'requires unavailable implementation' });
   await acceptTestRun(runs, submission.runId);
-  settleInitial({ state: 'suspended', reason: 'missing_implementation', runId: submission.runId, finalizationId: `${submission.runId}:final`, budget: testBudget() });
+  settleInitial({
+    state: 'suspended',
+    reason: 'missing_implementation',
+    runId: submission.runId,
+    finalizationId: `${submission.runId}:final`,
+    budget: testBudget()
+  });
   await submission.completion;
   assert.equal(session.inspectSuspension().category, 'implementation');
   assert.deepEqual(session.inspectSuspension().actions, ['resume', 'abort']);
@@ -730,16 +1287,30 @@ test('durable user decisions enforce every identity and revision guard before ab
   const runId = 'decision-run';
   const request = await acceptUserDecisionRun(runs, runId);
   await repository.enqueueSubmission(descriptor, {
-    submissionId: 'decision-submission', runId, input: { task: 'requires a decision' }, configuration: { provider: 'test', model: 'model' }
+    submissionId: 'decision-submission',
+    runId,
+    input: { task: 'requires a decision' },
+    configuration: { provider: 'test', model: 'model' }
   });
   await repository.transitionSubmission(descriptor, 'decision-submission', { state: 'claimed' });
   await repository.transitionSubmission(descriptor, 'decision-submission', {
     state: 'suspended',
-    suspension: { runId, submissionId: 'decision-submission', category: 'user_decision', reason: 'user_decision', effectId: 'provider-effect', actions: ['decide', 'abort'], decisionRequest: request }
+    suspension: {
+      runId,
+      submissionId: 'decision-submission',
+      category: 'user_decision',
+      reason: 'user_decision',
+      effectId: 'provider-effect',
+      actions: ['decide', 'abort'],
+      decisionRequest: request
+    }
   });
   let resumes = 0;
   const session = new AgentSession({
-    descriptor, expectedBinding: TEST_SESSION_BINDING, repository, runs,
+    descriptor,
+    expectedBinding: TEST_SESSION_BINDING,
+    repository,
+    runs,
     configuration: { provider: 'test', model: 'model' },
     createRuntime() {
       return {
@@ -749,7 +1320,14 @@ test('durable user decisions enforce every identity and revision guard before ab
             assert.equal(run.state.control.status, 'abort_requested');
             return { state: 'ended', terminal: { runId: resumedRunId }, deliveryDiagnostics: [] };
           });
-          return { runId: resumedRunId, result, injectSteering() { throw new Error('unused'); }, abort() {} };
+          return {
+            runId: resumedRunId,
+            result,
+            injectSteering() {
+              throw new Error('unused');
+            },
+            abort() {}
+          };
         }
       };
     }
@@ -758,11 +1336,23 @@ test('durable user decisions enforce every identity and revision guard before ab
   const suspension = session.inspectSuspension();
   assert.equal(suspension.category, 'user_decision');
   assert.deepEqual(suspension.actions, ['decide', 'abort']);
-  const exact = { runId, decisionRequestId: request.id, choice: 'abort', fingerprint: request.fingerprint, expectedRunRevision: request.runRevision };
+  const exact = {
+    runId,
+    decisionRequestId: request.id,
+    choice: 'abort',
+    fingerprint: request.fingerprint,
+    expectedRunRevision: request.runRevision
+  };
   await assert.rejects(session.resolveDecision({ ...exact, runId: 'stale-run' }), /suspended on run/u);
-  await assert.rejects(session.resolveDecision({ ...exact, decisionRequestId: 'stale-decision' }), /stale/u);
+  await assert.rejects(
+    session.resolveDecision({ ...exact, decisionRequestId: 'stale-decision' }),
+    /stale/u
+  );
   await assert.rejects(session.resolveDecision({ ...exact, fingerprint: '0'.repeat(64) }), /stale/u);
-  await assert.rejects(session.resolveDecision({ ...exact, expectedRunRevision: request.runRevision - 1 }), /stale/u);
+  await assert.rejects(
+    session.resolveDecision({ ...exact, expectedRunRevision: request.runRevision - 1 }),
+    /stale/u
+  );
   await assert.rejects(session.resolveDecision({ ...exact, choice: 'retry' }), /not permitted/u);
   await runs.requestAbort(runId, request.reason);
   const result = await session.resolveDecision(exact);
@@ -788,7 +1378,13 @@ test('aborting a suspended submission commits cancellation before starting final
   await acceptApprovalRun(runs, runId);
   await repository.transitionSubmission(descriptor, 'submission', {
     state: 'suspended',
-    suspension: { runId, submissionId: 'submission', category: 'approval', reason: 'approval_required', actions: ['approval', 'abort'] }
+    suspension: {
+      runId,
+      submissionId: 'submission',
+      category: 'approval',
+      reason: 'approval_required',
+      actions: ['approval', 'abort']
+    }
   });
   let resumed = false;
   const session = new AgentSession({
@@ -805,7 +1401,16 @@ test('aborting a suspended submission commits cancellation before starting final
             assert.equal(inspection.state.control.status, 'abort_requested');
             return { state: 'ended', terminal: { runId: resumedRunId }, deliveryDiagnostics: [] };
           });
-          return { runId: resumedRunId, result, injectSteering() { throw new Error('unused'); }, abort() { return Promise.resolve(); } };
+          return {
+            runId: resumedRunId,
+            result,
+            injectSteering() {
+              throw new Error('unused');
+            },
+            abort() {
+              return Promise.resolve();
+            }
+          };
         }
       };
     }
@@ -820,11 +1425,60 @@ test('aborting a suspended submission commits cancellation before starting final
 test('session listing orders sessions by latest committed activity', async () => {
   const repository = new InMemorySessionRepository();
   const first = await repository.create({ id: 'first', binding: TEST_SESSION_BINDING });
-  await new Promise(resolve => setTimeout(resolve, 2));
+  await new Promise((resolve) => setTimeout(resolve, 2));
   await repository.create({ id: 'second', binding: TEST_SESSION_BINDING });
-  await new Promise(resolve => setTimeout(resolve, 2));
+  await new Promise((resolve) => setTimeout(resolve, 2));
   await repository.appendInput(first, { runId: 'run', task: 'recent activity' });
   const sessions = await repository.list();
   assert.equal(sessions[0].id, first.id);
   assert.ok(sessions[0].updatedAt >= sessions[0].timestamp);
+});
+
+test('manual session scheduling preserves queued contributions across restart and starts only one admitted run', async () => {
+  const repository = new InMemorySessionRepository();
+  const descriptor = await repository.create({ binding: TEST_SESSION_BINDING });
+  const started = [];
+  const options = {
+    descriptor,
+    expectedBinding: TEST_SESSION_BINDING,
+    repository,
+    runs: runCoordinator(),
+    scheduling: 'manual',
+    configuration: { provider: 'test', model: 'model' },
+    createRuntime() {
+      return {
+        run(input) {
+          started.push(input.task);
+          return {
+            runId: input.runId,
+            result: Promise.resolve({
+              state: 'ended',
+              terminal: { runId: input.runId },
+              deliveryDiagnostics: []
+            }),
+            injectSteering() {},
+            abort() {}
+          };
+        }
+      };
+    }
+  };
+  const first = new AgentSession(options);
+  await first.submit({ task: 'First original contribution.' });
+  await first.submit({ task: 'Second original contribution.' });
+  await first.waitForIdle();
+  assert.deepEqual(started, []);
+  const reopened = new AgentSession(options);
+  await reopened.restore();
+  assert.equal(reopened.state().queuedInputs, 2);
+  const run = await reopened.startNextSubmission();
+  assert.equal(run.kind, 'started');
+  await run.completion;
+  await reopened.waitForIdle();
+  assert.deepEqual(started, ['First original contribution.']);
+  assert.equal(reopened.state().queuedInputs, 1);
+  await (
+    await reopened.startNextSubmission()
+  ).completion;
+  assert.deepEqual(started, ['First original contribution.', 'Second original contribution.']);
 });

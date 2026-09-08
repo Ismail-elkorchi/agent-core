@@ -1,12 +1,3 @@
-import { modelTransportSignal, type ModelTransportOptions } from '@agent-core/model';
-import { responsesPayloadPaths } from '@agent-core/provider-openai-responses';
-import {
-  compileModelRequest,
-  conservativeProtocolCapabilities,
-  assertProviderContextCompatible,
-  parseModelProfile,
-  type CompiledModelRequest
-} from '@agent-core/model';
 import {
   type BearerToken,
   type BearerTokenProvider,
@@ -16,7 +7,7 @@ import {
 } from '@agent-core/auth';
 import { parseJsonValue } from '@agent-core/json';
 import {
-  assertModelRequestSupported,
+  type CompiledModelRequest,
   type ModelProvider,
   ModelProviderError,
   type ModelProviderInfo,
@@ -25,18 +16,31 @@ import {
   type ModelResponse,
   type ModelStreamEvent,
   type ModelToolCall,
-  parseModelRequest
+  type ModelTransportOptions,
+  assertModelRequestSupported,
+  assertProviderContextCompatible,
+  compileModelRequest,
+  conservativeProtocolCapabilities,
+  modelTransportSignal,
+  parseModelProfile,
+  parseModelRequest,
+  requiredProtocolRevision
 } from '@agent-core/model';
+import { responsesPayloadPaths } from '@agent-core/provider-openai-responses';
 
-import { OPENAI_CODEX_BASE_URL, OPENAI_CODEX_DEFAULT_MODEL, OPENAI_CODEX_PROVIDER_ID } from './constants.js';
+import {
+  OPENAI_CODEX_BASE_URL,
+  OPENAI_CODEX_DEFAULT_MODEL,
+  OPENAI_CODEX_PROVIDER_ID
+} from './constants.js';
 import {
   type CodexContinuationResponse,
-  normalizedOutputItems,
-  assembleCodexWebSocketRequest
+  assembleCodexWebSocketRequest,
+  normalizedOutputItems
 } from './continuation.js';
 import {
-  parseCodexJsonResponse,
   normalizeError,
+  parseCodexJsonResponse,
   parseCodexModelResponse,
   summarizeCodexFailure
 } from './errors.js';
@@ -64,11 +68,12 @@ import {
   type OpenAICodexDeviceCodeInfo,
   type OpenAICodexDeviceCodeLoginOptions,
   OpenAICodexTokenRefresher,
-  loginOpenAICodexDeviceCode,
   accountIdFromToken,
+  loginOpenAICodexDeviceCode,
   resolveTokenProvider
 } from './oauth.js';
-import { toCodexResponsesRequest, cacheCodexCompiledRequest, codexCompiledRequest } from './request.js';
+import { cacheCodexCompiledRequest, codexCompiledRequest, toCodexResponsesRequest } from './request.js';
+import { errorMessage, stringValue, throwIfAborted } from './utils.js';
 import {
   type CodexWebSocket,
   type CodexWebSocketFactory,
@@ -82,7 +87,6 @@ import {
   waitForWebSocketOpen,
   websocketHeaders
 } from './websocket-transport.js';
-import { errorMessage, stringValue, throwIfAborted } from './utils.js';
 
 export { OpenAICodexTokenRefresher, loginOpenAICodexDeviceCode };
 export type {
@@ -212,7 +216,10 @@ export class OpenAICodexProvider implements ModelProvider {
         message: 'Compiled request was not admitted by this provider instance.'
       });
   }
-  completeCompiled(compiled: CompiledModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
+  completeCompiled(
+    compiled: CompiledModelRequest,
+    options?: ModelTransportOptions
+  ): Promise<ModelResponse> {
     this.assertCompiled(compiled);
     return this.complete(compiled.logicalRequest, options);
   }
@@ -285,7 +292,8 @@ export class OpenAICodexProvider implements ModelProvider {
             owned,
             this.baseUrl,
             owned.messages.slice(0, index),
-            this.id
+            this.id,
+            requiredProtocolRevision(await this.describeModel(owned.model))
           );
       return owned;
     } catch (error) {
@@ -345,7 +353,10 @@ class OpenAICodexProviderSession implements ModelProviderSession {
   private lastResponse: CodexContinuationResponse | undefined;
 
   constructor(private readonly provider: OpenAICodexProvider) {}
-  completeCompiled(compiled: CompiledModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
+  completeCompiled(
+    compiled: CompiledModelRequest,
+    options?: ModelTransportOptions
+  ): Promise<ModelResponse> {
     this.provider.assertCompiled(compiled);
     return this.complete(compiled.logicalRequest, options);
   }

@@ -1,38 +1,38 @@
-import { modelTransportSignal, type ModelTransportOptions } from '@agent-core/model';
-import {
-  compileModelRequest,
-  conservativeProtocolCapabilities,
-  assertProviderContextCompatible,
-  createProviderContextState,
-  type CompiledModelRequest,
-  type ModelOutputItem,
-  CompleteRequestEstimator
-} from '@agent-core/model';
-import { type ChatRequest, type Message, Ollama, type Tool } from 'ollama';
 import { parseJsonObject } from '@agent-core/json';
 import {
+  assertModelRequestSupported,
+  assertProviderContextCompatible,
+  type CompiledModelRequest,
+  compileModelRequest,
+  CompleteRequestEstimator,
+  conservativeProtocolCapabilities,
+  createProviderContextState,
   type ModelCapabilities,
   ModelContractError,
+  type ModelImage,
   type ModelInputItem,
+  type ModelOutputItem,
   type ModelProfile,
   type ModelProvider,
   ModelProviderError,
   type ModelProviderErrorCode,
   type ModelProviderInfo,
+  type ModelReasoningRequest,
   type ModelRequest,
   type ModelResponse,
   type ModelResponseFormat,
-  type ModelImage,
-  type ModelReasoningRequest,
   type ModelStreamEvent,
   type ModelTool,
   type ModelToolCall,
+  type ModelTransportOptions,
+  modelTransportSignal,
   type ModelUsage,
-  assertModelRequestSupported,
   parseModelProfile,
   parseModelRequest,
-  parseModelResponse
+  parseModelResponse,
+  requiredProtocolRevision
 } from '@agent-core/model';
+import { type ChatRequest, type Message, Ollama, type Tool } from 'ollama';
 import {
   decodeOllamaShowResponse,
   decodeOllamaWireResponse,
@@ -198,7 +198,8 @@ export class OllamaProvider implements ModelProvider {
           request,
           this.endpoint,
           request.messages.slice(0, index),
-          this.id
+          this.id,
+          requiredProtocolRevision(await this.describeModel(request.model))
         );
     const wire = this.toChatRequest(
       request,
@@ -229,7 +230,10 @@ export class OllamaProvider implements ModelProvider {
         message: 'Unrecognized compiled request.'
       });
   }
-  completeCompiled(compiled: CompiledModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
+  completeCompiled(
+    compiled: CompiledModelRequest,
+    options?: ModelTransportOptions
+  ): Promise<ModelResponse> {
     this.assertCompiled(compiled);
     return this.complete(compiled.logicalRequest, options);
   }
@@ -420,6 +424,7 @@ export class OllamaProvider implements ModelProvider {
       output.push({
         type: 'protocol',
         state: await createProviderContextState({
+          protocolRevision: requiredProtocolRevision(await this.describeModel(request.model)),
           request,
           provider: this.id,
           endpoint: this.endpoint,
@@ -434,7 +439,8 @@ export class OllamaProvider implements ModelProvider {
     return parseOllamaModelResponse({
       output,
       content: content || fallbackContent,
-      model: typeof response.model === 'string' && response.model.length > 0 ? response.model : request.model,
+      model:
+        typeof response.model === 'string' && response.model.length > 0 ? response.model : request.model,
       provider: this.id,
       terminationReason:
         toolCalls.length > 0

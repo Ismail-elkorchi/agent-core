@@ -8,14 +8,23 @@ import { JsonlEventRepository } from '@agent-core/persistence/node';
 import { AgentRunCoordinator, AgentRuntime, agentEventCodec } from '@agent-core/runtime';
 
 const stores = [
-  ['memory', async () => ({ repository: new InMemoryEventRepository(agentEventCodec), dispose: async () => undefined })],
-  ['jsonl', async () => {
-    const directory = await mkdtemp(path.join(tmpdir(), 'agent-run-boundaries-'));
-    return {
-      repository: new JsonlEventRepository({ rootDir: directory, codec: agentEventCodec }),
-      dispose: () => rm(directory, { recursive: true, force: true })
-    };
-  }]
+  [
+    'memory',
+    async () => ({
+      repository: new InMemoryEventRepository(agentEventCodec),
+      dispose: async () => undefined
+    })
+  ],
+  [
+    'jsonl',
+    async () => {
+      const directory = await mkdtemp(path.join(tmpdir(), 'agent-run-boundaries-'));
+      return {
+        repository: new JsonlEventRepository({ rootDir: directory, codec: agentEventCodec }),
+        dispose: () => rm(directory, { recursive: true, force: true })
+      };
+    }
+  ]
 ];
 
 for (const [storeName, createStore] of stores) {
@@ -25,7 +34,10 @@ for (const [storeName, createStore] of stores) {
       const runId = `${storeName}-accept-${timing}`;
       try {
         const faulted = new OneShotConditionalFault(repository, timing);
-        await assert.rejects(new AgentRunCoordinator(faulted).accept(acceptance(runId)), /injected conditional append fault/u);
+        await assert.rejects(
+          new AgentRunCoordinator(faulted).accept(acceptance(runId)),
+          /injected conditional append fault/u
+        );
         const runs = new AgentRunCoordinator(repository);
         if (timing === 'before') {
           await assert.rejects(runs.inspect(runId), /no durable run/u);
@@ -47,7 +59,10 @@ for (const [storeName, createStore] of stores) {
         const runs = new AgentRunCoordinator(repository);
         await runs.accept(acceptance(runId));
         const faulted = new AgentRunCoordinator(new OneShotConditionalFault(repository, timing));
-        await assert.rejects(faulted.attach(runId, 'uncertain-driver'), /injected conditional append fault/u);
+        await assert.rejects(
+          faulted.attach(runId, 'uncertain-driver'),
+          /injected conditional append fault/u
+        );
         const afterFault = await runs.inspect(runId);
         assert.equal(afterFault.state.driverGeneration, timing === 'before' ? 0 : 1);
         assert.equal(afterFault.state.control.status, timing === 'before' ? 'detached' : 'owned');
@@ -68,17 +83,14 @@ test('an integrity-audited corrupt JSONL run is quarantined before provider exec
   try {
     const repository = new JsonlEventRepository({ rootDir: directory, codec: agentEventCodec });
     const runs = new AgentRunCoordinator(repository);
-    await runs.accept(acceptance(runId, {
-      providerId: 'quarantine-provider',
-      providerImplementationId: 'agent-core.tests.quarantine-provider@1',
-      runtimeImplementationId: 'agent-core.runtime.run-v1',
-      disposition: {
-        implementationId: 'agent-core.disposition.accept-v1',
-        policyIdentity: { strategy: 'accept' },
-        policyHash: hashJson({ strategy: 'accept' })
-      },
-      policyHash: hashJson({ allowedRisks: ['read'] })
-    }));
+    await runs.accept(
+      acceptance(runId, {
+        providerId: 'quarantine-provider',
+        providerImplementationId: 'agent-core.tests.quarantine-provider@1',
+        runtimeImplementationId: 'agent-core.runtime.run-v1',
+        policyHash: hashJson({ allowedRisks: ['read'] })
+      })
+    );
     await runs.attach(runId, 'original-driver');
 
     const ledger = repository.location(runId);
@@ -93,18 +105,37 @@ test('an integrity-audited corrupt JSONL run is quarantined before provider exec
     const provider = {
       id: 'quarantine-provider',
       implementationId: 'agent-core.tests.quarantine-provider@1',
-      describe() { return { id: this.id, displayName: 'Quarantine provider', defaultModel: 'fixture' }; },
+      describe() {
+        return { id: this.id, displayName: 'Quarantine provider', defaultModel: 'fixture' };
+      },
       async describeModel() {
         providerCalls += 1;
         return {
-          id: 'fixture', provider: this.id, modalities: { input: ['text'], output: ['text'] },
-          capabilities: { streaming: false, toolCalling: false, supportedToolInputs: [], jsonMode: false, jsonSchema: false, logprobs: false, temperature: false, topP: false },
-          limits: { contextTokens: 1_000, outputTokens: 100 }, supportedParameters: ['maxOutputTokens']
+          id: 'fixture',
+          provider: this.id,
+          modalities: { input: ['text'], output: ['text'] },
+          capabilities: {
+            streaming: false,
+            toolCalling: false,
+            supportedToolInputs: [],
+            jsonMode: false,
+            jsonSchema: false,
+            logprobs: false,
+            temperature: false,
+            topP: false
+          },
+          limits: { contextTokens: 1_000, outputTokens: 100 },
+          supportedParameters: ['maxOutputTokens']
         };
       },
       async complete() {
         providerCalls += 1;
-        return { content: 'must not execute', model: 'fixture', provider: this.id, terminationReason: 'stop' };
+        return {
+          content: 'must not execute',
+          model: 'fixture',
+          provider: this.id,
+          terminationReason: 'stop'
+        };
       }
     };
     const runtime = new AgentRuntime({
@@ -126,7 +157,9 @@ class OneShotConditionalFault {
     this.repository = repository;
     this.timing = timing;
   }
-  append(runId, event, options) { return this.repository.append(runId, event, options); }
+  append(runId, event, options) {
+    return this.repository.append(runId, event, options);
+  }
   async appendConditional(runId, event, options) {
     if (!this.fired && this.timing === 'before') {
       this.fired = true;
@@ -139,12 +172,24 @@ class OneShotConditionalFault {
     }
     return result;
   }
-  tail(runId) { return this.repository.tail(runId); }
-  latest(runId) { return this.repository.latest(runId); }
-  latestOfType(runId, type) { return this.repository.latestOfType(runId, type); }
-  read(runId) { return this.repository.read(runId); }
-  listRunIds() { return this.repository.listRunIds(); }
-  verifyIntegrity(runId) { return this.repository.verifyIntegrity(runId); }
+  tail(runId) {
+    return this.repository.tail(runId);
+  }
+  latest(runId) {
+    return this.repository.latest(runId);
+  }
+  latestOfType(runId, type) {
+    return this.repository.latestOfType(runId, type);
+  }
+  read(runId) {
+    return this.repository.read(runId);
+  }
+  listRunIds() {
+    return this.repository.listRunIds();
+  }
+  verifyIntegrity(runId) {
+    return this.repository.verifyIntegrity(runId);
+  }
 }
 
 function acceptance(runId, configuration = {}) {
@@ -158,12 +203,6 @@ function acceptance(runId, configuration = {}) {
       model: 'fixture',
       runtimeImplementationId: 'agent-core.tests.run-boundary-runtime@1',
       toolImplementationIds: [],
-      checks: [],
-      disposition: {
-        implementationId: 'agent-core.tests.accept-disposition@1',
-        policyIdentity: { strategy: 'accept' },
-        policyHash: hashJson({ strategy: 'accept' })
-      },
       policyHash: 'run-boundary-policy',
       ...configuration
     }

@@ -2,7 +2,14 @@ import type { JsonObject } from '@agent-core/json';
 import type { HistorySourceCut, HistorySourceRef } from '../history/contracts.js';
 import type { NoteReference } from '../notes/contracts.js';
 
+export interface ContextRepresentation {
+  readonly source: HistorySourceRef;
+  readonly presentation: 'summary';
+}
+
 export interface ContextSelection {
+  /** Unlisted sources retain their complete recorded representation. */
+  readonly representations?: readonly ContextRepresentation[] | undefined;
   readonly retained: readonly HistorySourceRef[];
   readonly notes: readonly NoteReference[];
   readonly omitted: readonly {

@@ -1,15 +1,15 @@
+import type { EffectRecoveryCapability } from '@agent-core/effects';
+import type { JsonObject, JsonValue } from '@agent-core/json';
 import type {
-  ModelTransportOptions,
-  ModelToolResultSubmission,
-  ModelToolResultDelivery,
   ModelNativeContinuation,
   ModelNativeDelivery,
   ModelNativeResponseBoundary,
-  ModelNativeToolCallIdentity
+  ModelNativeToolCallIdentity,
+  ModelToolResultDelivery,
+  ModelToolResultSubmission,
+  ModelTransportOptions
 } from './native.js';
 export * from './native.js';
-import type { JsonObject, JsonValue } from '@agent-core/json';
-import type { EffectRecoveryCapability } from '@agent-core/effects';
 
 export type ModelImage =
   | {
@@ -258,7 +258,9 @@ export interface ModelRequest {
 }
 
 export type ModelResponseFormat =
-  'text' | 'json' | { readonly type: 'json_schema'; readonly schema: JsonObject };
+  | 'text'
+  | 'json'
+  | { readonly type: 'json_schema'; readonly schema: JsonObject };
 
 export type ModelToolInputSupport =
   | { readonly kind: 'json' }
@@ -266,7 +268,8 @@ export type ModelToolInputSupport =
   | { readonly kind: 'grammar'; readonly syntax: string };
 
 export type ModelToolInput =
-  { readonly kind: 'json'; readonly value: JsonObject } | { readonly kind: 'text'; readonly value: string };
+  | { readonly kind: 'json'; readonly value: JsonObject }
+  | { readonly kind: 'text'; readonly value: string };
 
 export type ModelToolKind = 'function' | 'custom';
 
@@ -283,7 +286,8 @@ export interface ModelFunctionTool {
 }
 
 export type ModelCustomToolFormat =
-  { type: 'text' } | { type: 'grammar'; syntax: string; definition: string };
+  | { type: 'text' }
+  | { type: 'grammar'; syntax: string; definition: string };
 
 export interface ModelCustomTool {
   readonly async?: boolean;
@@ -344,6 +348,7 @@ export interface ProviderContextState {
   readonly compatibility: {
     readonly model: string;
     readonly endpoint: string;
+    readonly protocolRevision: string;
     readonly requiresExactPrefix: boolean;
   };
   readonly replay: 'required' | 'optional' | 'handle';
@@ -360,7 +365,15 @@ export interface ModelProtocolCapabilities {
   /** A single native system channel can carry developer authority only when no system contribution is present. */
   readonly developerRole?: 'native' | 'system_if_no_system' | 'unsupported';
   readonly inputKinds: readonly (
-    'text' | 'image' | 'audio' | 'video' | 'document' | 'tool_call' | 'tool_result' | 'protocol' | 'control'
+    | 'text'
+    | 'image'
+    | 'audio'
+    | 'video'
+    | 'document'
+    | 'tool_call'
+    | 'tool_result'
+    | 'protocol'
+    | 'control'
   )[];
   readonly outputKinds: readonly ModelOutputItem['type'][];
   readonly state: 'none' | 'exact';

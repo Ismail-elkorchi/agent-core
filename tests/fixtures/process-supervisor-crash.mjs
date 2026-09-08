@@ -1,7 +1,11 @@
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { LocalArtifactRepository } from '@agent-core/persistence/node';
-import { DEFAULT_LOCAL_TOOL_CONFIGURATION, LocalCommandExecution, RootedFileAuthority } from '@agent-core/tools-local';
+import {
+  DEFAULT_LOCAL_TOOL_CONFIGURATION,
+  LocalCommandExecution,
+  RootedFileAuthority
+} from '@agent-core/tools-local';
 
 const root = path.resolve(process.argv[2]);
 const phase = process.argv[3];
@@ -26,6 +30,12 @@ const plan = await manager.plan({
   timeoutMs: 60_000,
   yieldMs: 1,
   outputTokenBudget: 100,
-  owner: { runId: `crash-${phase}`, turnId: 'turn', toolBatchId: 'batch', callIndex: 0 }
+  owner: {
+    ownerId: `crash-${phase}`,
+    runId: `crash-${phase}`,
+    turnId: 'turn',
+    toolBatchId: 'batch',
+    callIndex: 0
+  }
 });
 await manager.start(plan);

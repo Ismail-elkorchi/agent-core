@@ -1,4 +1,5 @@
-import { parseJsonObject, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
+import { canonicalJsonString, parseJsonObject, parseJsonValue, type JsonObject } from '@agent-core/json';
+import { MODEL_REQUEST_JSON_LIMITS } from './json-limits.js';
 import { parseModelRequest, ModelContractError } from './validation.js';
 import type {
   ModelContentPart,
@@ -18,8 +19,9 @@ export interface RequestEstimator {
 /** Diagnostic heuristic, never a tokenizer or an exact admission guarantee. */
 export class CompleteRequestEstimator implements RequestEstimator {
   static readonly DEFAULT_IMAGE_TOKENS = 2_000;
+  private readonly encoder = new TextEncoder();
   estimateText(text: string): number {
-    return Math.ceil(new TextEncoder().encode(text).byteLength / 3);
+    return Math.ceil(this.encoder.encode(text).byteLength / 3);
   }
   estimateImage(image: ModelImage): number {
     void image;
@@ -248,12 +250,7 @@ export async function compileModelRequest(
   }
 ): Promise<CompiledModelRequest> {
   const request = parseModelRequest(options.request);
-  const body = parseJsonObject(options.body, {
-    maxDepth: 64,
-    maxCollectionEntries: 100_000,
-    maxStringBytes: 32 * 1024 * 1024,
-    maxTotalBytes: 64 * 1024 * 1024
-  });
+  const body = parseJsonObject(options.body, MODEL_REQUEST_JSON_LIMITS);
   const estimator = options.estimator ?? new CompleteRequestEstimator();
   // Count the provider representation once. Native payloads use semantic accounting separately.
   const semantic = accountModelRequest(request, options.profile, options);
@@ -277,7 +274,8 @@ export async function compileModelRequest(
       tokens: checked(estimator.estimateText(JSON.stringify({ [key]: value })), key)
     });
   }
-  const retainedBody = options.retainedBody === undefined ? undefined : parseJsonObject(options.retainedBody);
+  const retainedBody =
+    options.retainedBody === undefined ? undefined : parseJsonObject(options.retainedBody);
   if (retainedBody) {
     const retained = omitPayloads(retainedBody, options.retainedPayloadPaths ?? []);
     for (const [key, value] of Object.entries(retained))
@@ -322,29 +320,16 @@ export async function compileModelRequest(
 }
 /** Exact SHA-256 identity of canonical JSON; not a claim about tokenization. */
 export async function modelInputIdentity(value: unknown): Promise<string> {
-  const owned = parseJsonValue(value, {
-    maxDepth: 64,
-    maxCollectionEntries: 100_000,
-    maxStringBytes: 32 * 1024 * 1024,
-    maxTotalBytes: 64 * 1024 * 1024
-  });
-  const bytes = new TextEncoder().encode(canonical(owned));
+  const owned = parseJsonValue(value, MODEL_REQUEST_JSON_LIMITS);
+  const bytes = new TextEncoder().encode(canonicalJsonString(owned));
   const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
   return `sha256:${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
-}
-function canonical(value: JsonValue): string {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
-  if (value !== null && typeof value === 'object')
-    return `{${Object.entries(value)
-      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-      .map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`)
-      .join(',')}}`;
-  return JSON.stringify(value);
 }
 function omitPayloads(
   body: JsonObject,
   paths: readonly (readonly (string | number)[])[]
 ): Record<string, unknown> {
+  if (paths.length === 0) return body;
   const copy: Record<string, unknown> = JSON.parse(JSON.stringify(body)) as Record<string, unknown>;
   for (const path of paths) {
     if (!path.length) throw new RangeError('A payload path cannot omit the entire request.');
@@ -355,7 +340,12 @@ function omitPayloads(
       current = Reflect.get(current, segment) as unknown;
     }
     const key = path.at(-1);
-    if (key === undefined || current === null || typeof current !== 'object' || !Object.hasOwn(current, key))
+    if (
+      key === undefined ||
+      current === null ||
+      typeof current !== 'object' ||
+      !Object.hasOwn(current, key)
+    )
       throw new RangeError('Payload path does not exist in compiled body.');
     Reflect.set(current, key, '[native payload]');
   }
@@ -384,7 +374,8 @@ function accountItems(
       })
     );
     parts.push({ kind: 'framing', path, status: 'estimated', tokens: 4 });
-    for (const call of item.toolCalls ?? []) add('tool_arguments', `${path}.toolCalls`, JSON.stringify(call));
+    for (const call of item.toolCalls ?? [])
+      add('tool_arguments', `${path}.toolCalls`, JSON.stringify(call));
     for (const image of item.images ?? [])
       parts.push({
         kind: 'media',

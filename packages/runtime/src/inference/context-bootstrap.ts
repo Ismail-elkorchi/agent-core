@@ -1,16 +1,20 @@
-import { modelInputIdentity } from '@agent-core/model';
-import { sourceRef } from '../history/reader.js';
-import { encodeContextTransformReference } from './context-transform.js';
-import type { InferenceService } from './service.js';
-import { assertRequestAccountingFits, type ModelProvider, type ModelProfile } from '@agent-core/model';
+import {
+  assertRequestAccountingFits,
+  modelInputIdentity,
+  type ModelProfile,
+  type ModelProvider
+} from '@agent-core/model';
 import type { CompiledToolDefinition } from '@agent-core/tools';
 import type { ContextBootstrapPolicy } from '../context/service.js';
-import { selectedHistoryEntries, replaySourceEntries } from '../orchestration/session-replay.js';
-import { ModelWindow } from './model-window.js';
-import { ModelRequestAssembler } from './model-request-assembler.js';
-import type { PromptInstructionBlock, PromptContextItemInput } from './prompt-material.js';
+import { sourceRef } from '../history/reader.js';
+import { requestWindowForModel, supportsParameter, toolsForModel } from '../orchestration/model-request.js';
+import { replaySourceEntries, selectedHistoryEntries } from '../orchestration/session-replay.js';
+import { encodeContextTransformReference } from './context-transform.js';
 import { InferenceGateway } from './gateway.js';
-import { toolsForModel, supportsParameter, requestWindowForModel } from '../orchestration/model-request.js';
+import { ModelRequestAssembler } from './model-request-assembler.js';
+import { ModelWindow } from './model-window.js';
+import type { PromptContextItemInput, PromptInstructionBlock } from './prompt-material.js';
+import type { InferenceService } from './service.js';
 
 export interface RuntimeContextBootstrapOptions {
   readonly nativeTransform?: {
@@ -22,7 +26,8 @@ export interface RuntimeContextBootstrapOptions {
   readonly tools: () => readonly CompiledToolDefinition[] | Promise<readonly CompiledToolDefinition[]>;
   readonly instructions?: readonly PromptInstructionBlock[];
   readonly contextItems?: () =>
-    readonly PromptContextItemInput[] | Promise<readonly PromptContextItemInput[]>;
+    | readonly PromptContextItemInput[]
+    | Promise<readonly PromptContextItemInput[]>;
   readonly maxOutputTokens?: number;
   readonly task?: () => string | Promise<string>;
   /** The active runtime supplies pending calls; idle controls normally have none. */
@@ -68,7 +73,8 @@ export function createRuntimeContextBootstrapValidator(
       ) ||
       results.some(
         (result) =>
-          result.callId && !calls.some((call) => call.runId === result.runId && call.callId === result.callId)
+          result.callId &&
+          !calls.some((call) => call.runId === result.runId && call.callId === result.callId)
       )
     ) {
       throw new Error(
@@ -89,7 +95,12 @@ export function createRuntimeContextBootstrapValidator(
           'context_admission_failed: no completed source window is available for native transformation.'
         );
       const transformWindow = new ModelWindow();
-      replaySourceEntries(transformWindow, view.cut.sessionId, represented);
+      replaySourceEntries(transformWindow, view.cut.sessionId, represented, selection.representations);
+      transformWindow.invalidateProviderState({
+        provider: options.provider.id,
+        model: options.model,
+        ...(profile.capabilities.protocol ? { protocol: profile.capabilities.protocol } : {})
+      });
       const sources = represented.map((entry) => sourceRef(view.cut.sessionId, entry));
       const invocationId = `context-transform-${(await modelInputIdentity({ sessionId: view.cut.sessionId, branchId: view.cut.branchId, sources, model: options.model })).slice(7)}`;
       const transformed = await options.nativeTransform.inference.transformContext({
@@ -111,7 +122,8 @@ export function createRuntimeContextBootstrapValidator(
       replaySourceEntries(
         window,
         view.cut.sessionId,
-        selected.filter((entry) => !representedIds.has(sourceRef(view.cut.sessionId, entry).entryId))
+        selected.filter((entry) => !representedIds.has(sourceRef(view.cut.sessionId, entry).entryId)),
+        selection.representations
       );
       providerState = encodeContextTransformReference({
         format: 'agent-core.context-transform/1',
@@ -121,7 +133,12 @@ export function createRuntimeContextBootstrapValidator(
         artifact: transformed.artifact,
         sources
       });
-    } else replaySourceEntries(window, view.cut.sessionId, selected);
+    } else replaySourceEntries(window, view.cut.sessionId, selected, selection.representations);
+    window.invalidateProviderState({
+      provider: options.provider.id,
+      model: options.model,
+      ...(profile.capabilities.protocol ? { protocol: profile.capabilities.protocol } : {})
+    });
     const context: PromptContextItemInput[] = [...((await options.contextItems?.()) ?? [])];
     for (const note of notes) {
       if (note.status !== 'available' || note.truncated)
@@ -144,15 +161,16 @@ export function createRuntimeContextBootstrapValidator(
       instructions: options.instructions ?? [],
       contextItems: context,
       tools: [],
-      modelProfile: profile,
-      maxPromptTokens: limits.maxPromptTokens
+      modelProfile: profile
     });
     const compiled = await gateway.compile(
       {
         model: options.model,
         messages: assembled.messages,
         tools: toolsForModel([...tools], profile),
-        ...(supportsParameter(profile, 'maxOutputTokens') ? { maxOutputTokens: limits.maxOutputTokens } : {}),
+        ...(supportsParameter(profile, 'maxOutputTokens')
+          ? { maxOutputTokens: limits.maxOutputTokens }
+          : {}),
         ...(signal ? { signal } : {})
       },
       profile

@@ -1,9 +1,15 @@
-import { decodeOwnedArtifactRef, type ArtifactRef, type ArtifactRepository } from '@agent-core/persistence';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
-import { parseModelContextTransformResult, type ModelInputItem } from '@agent-core/model';
+import {
+  parseModelContextTransformResult,
+  providerContextIncompatibility,
+  type ModelInputItem,
+  type ModelProtocolCapabilities,
+  type ProviderContextState
+} from '@agent-core/model';
+import { decodeOwnedArtifactRef, type ArtifactRef, type ArtifactRepository } from '@agent-core/persistence';
 import type { HistorySourceRef, HistoryView } from '../history/contracts.js';
+import { sameHistorySource, sourceRef } from '../history/reader.js';
 import { sourceSchema } from '../history/schema.js';
-import { sourceRef, sameHistorySource } from '../history/reader.js';
 
 export interface ContextTransformReference {
   readonly format: 'agent-core.context-transform/1';
@@ -47,9 +53,11 @@ export async function readTransformedContext(input: {
   readonly artifacts: ArtifactRepository;
   readonly provider: string;
   readonly model: string;
+  readonly protocol?: ModelProtocolCapabilities;
 }): Promise<{
   readonly input: readonly ModelInputItem[];
   readonly represented: ReadonlySet<string>;
+  readonly invalidation?: { readonly state: ProviderContextState; readonly reason: string };
 }> {
   const window = input.view.contextWindow;
   if (window?.selection.strategy !== 'provider') return { input: [], represented: new Set() };
@@ -80,11 +88,9 @@ export async function readTransformedContext(input: {
   const result = parseModelContextTransformResult(
     JSON.parse(new TextDecoder().decode(await input.artifacts.readVerified(reference.artifact))) as unknown
   );
-  if (
-    result.transformId !== reference.transformId ||
-    result.state.provider !== input.provider ||
-    result.state.model !== input.model
-  )
-    throw new Error('Context transform changed its admitted model or identity.');
+  if (result.transformId !== reference.transformId)
+    throw new Error('Context transform changed its admitted identity.');
+  const reason = providerContextIncompatibility(result.state, input);
+  if (reason) return { input: [], represented: new Set(), invalidation: { state: result.state, reason } };
   return Object.freeze({ input: result.input, represented });
 }

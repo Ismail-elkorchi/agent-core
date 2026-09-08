@@ -1,18 +1,19 @@
-import { modelTransportSignal, type ModelTransportOptions } from '@agent-core/model';
 import type { BearerTokenProvider } from '@agent-core/auth';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
 import {
-  ModelProviderError,
   ModelContractError,
+  ModelProviderError,
   assertModelRequestSupported,
   assertProviderContextCompatible,
   compileModelRequest,
   conservativeProtocolCapabilities,
   createProviderContextState,
   modelOutputToInput,
+  modelTransportSignal,
+  parseModelProfile,
   parseModelRequest,
   parseModelResponse,
-  parseModelProfile,
+  requiredProtocolRevision,
   type CompiledModelRequest,
   type ModelContentPart,
   type ModelInputItem,
@@ -24,6 +25,7 @@ import {
   type ModelResponse,
   type ModelStreamEvent,
   type ModelToolCall,
+  type ModelTransportOptions,
   type ModelUsage
 } from '@agent-core/model';
 import {
@@ -137,7 +139,8 @@ export class ClaudeProvider implements ModelProvider {
             request,
             `${this.baseUrl}/messages`,
             request.messages.slice(0, index),
-            this.id
+            this.id,
+            requiredProtocolRevision(await this.describeModel(request.model))
           );
       const body = claudeRequest(request, this.options.defaultOutputTokens ?? 4096);
       const tokens = this.options.countTokens ? await this.countInput(body, request.signal) : undefined;
@@ -352,6 +355,7 @@ export class ClaudeProvider implements ModelProvider {
         output.push({
           type: 'protocol',
           state: await createProviderContextState({
+            protocolRevision: requiredProtocolRevision(await this.describeModel(request.model)),
             provider: this.id,
             endpoint: `${this.baseUrl}/messages`,
             request: { ...request, messages: [...request.messages, ...modelOutputToInput(output)] },
@@ -389,7 +393,10 @@ export class ClaudeProvider implements ModelProvider {
       usage: claudeUsage(payload.usage)
     });
   }
-  private async countInput(body: Record<string, unknown>, signal: AbortSignal | undefined): Promise<number> {
+  private async countInput(
+    body: Record<string, unknown>,
+    signal: AbortSignal | undefined
+  ): Promise<number> {
     if (this.counting >= (this.options.maxConcurrentCounts ?? 2))
       throw this.error('rate_limited', 'Claude token-count concurrency limit reached.');
     this.counting++;
@@ -572,7 +579,8 @@ function claudePart(part: ModelContentPart): unknown {
       source: {
         type: 'base64',
         media_type: part.image.mediaType,
-        data: part.image.type === 'base64' ? part.image.data : Buffer.from(part.image.data).toString('base64')
+        data:
+          part.image.type === 'base64' ? part.image.data : Buffer.from(part.image.data).toString('base64')
       }
     };
   if (part.type === 'document' && part.source.type !== 'file')

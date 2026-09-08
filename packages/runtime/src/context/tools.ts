@@ -1,10 +1,10 @@
-import { historyCutSchema } from '../history/schema.js';
-import * as z from 'zod';
 import { parseJsonObject } from '@agent-core/json';
 import type { CompiledToolDefinition } from '@agent-core/tools';
+import * as z from 'zod';
+import { historyCutSchema } from '../history/schema.js';
 import { scopedTool, scopePath } from '../history/tool-support.js';
-import type { ContextService } from './service.js';
 import { contextSelectionSchema, contextTransitionRequestSchema } from './schema.js';
+import type { ContextService } from './service.js';
 export function createContextTools(options: {
   readonly context: ContextService;
   readonly prefix?: string;
@@ -42,10 +42,7 @@ export function createContextTools(options: {
       async canonicalize(value) {
         const cut = await options.context.history.capture();
         return {
-          value: parseJsonObject({
-            ...value,
-            expectedSourceRevision: value.expectedSourceRevision ?? cut.sourceRevision
-          }),
+          value: parseJsonObject(value),
           scope: scopePath('context', cut.sessionId, cut.branchId)
         };
       },

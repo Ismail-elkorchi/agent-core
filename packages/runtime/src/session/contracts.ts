@@ -1,13 +1,12 @@
+import type { JsonObject, JsonValue } from '@agent-core/json';
+import type { ModelOutputItem, ModelReasoningRequest, ModelResponseFormat } from '@agent-core/model';
+import type { ArtifactRef } from '@agent-core/persistence';
 import type {
   ContextTransitionCommit,
   ContextTransitionRecord,
   ContextWindowRecord
 } from '../context/contracts.js';
-import type { ArtifactRef } from '@agent-core/persistence';
-import type { JsonObject, JsonValue } from '@agent-core/json';
-import type { ModelOutputItem, ModelReasoningRequest, ModelResponseFormat } from '@agent-core/model';
 import type { PromptContextItemInput } from '../inference/prompt-material.js';
-import type { SessionBinding, SessionBindingInput } from './binding.js';
 import type {
   AgentEffectiveInstruction,
   AgentTerminalSnapshot,
@@ -16,6 +15,7 @@ import type {
   AgentTurnIdentity
 } from '../run/contracts.js';
 import type { AgentDecisionRequest } from '../run/control/contracts.js';
+import type { SessionBinding, SessionBindingInput } from './binding.js';
 
 export type SessionHeader = Readonly<{
   readonly type: 'session';
@@ -189,7 +189,11 @@ export type SessionQueuedSubmission = Readonly<{
 
 export type SessionSubmissionState = 'claimed' | 'suspended' | 'completed' | 'failed';
 
-export type SessionSuspensionCategory = 'approval' | 'external_recovery' | 'implementation' | 'user_decision';
+export type SessionSuspensionCategory =
+  | 'approval'
+  | 'external_recovery'
+  | 'implementation'
+  | 'user_decision';
 export type SessionSuspensionAction = 'approval' | 'reconcile' | 'resume' | 'decide' | 'abort';
 export interface SessionSuspensionDescriptor {
   readonly runId: string;
@@ -199,7 +203,6 @@ export interface SessionSuspensionDescriptor {
     | 'approval_required'
     | 'provider_outcome_unknown'
     | 'tool_outcome_unknown'
-    | 'disposition_outcome_unknown'
     | 'missing_implementation'
     | 'user_decision';
   readonly effectId?: string;

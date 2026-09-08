@@ -1,11 +1,3 @@
-import { isDeepStrictEqual } from 'node:util';
-import { NativeResponsesConnection, type OpenAIResponsesWebSocketFactory } from './native-connection.js';
-export {
-  defaultOpenAIResponsesWebSocketFactory,
-  type OpenAIResponsesWebSocket,
-  type OpenAIResponsesWebSocketFactory
-} from './native-connection.js';
-import { nativeFailure as failure, aggregateResponses } from './native-output.js';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
 import {
   ModelProviderError,
@@ -13,11 +5,17 @@ import {
   modelInputIdentity,
   modelOutputToInput,
   modelTransportSignal,
-  parseModelRequest,
   parseModelInputItem,
   parseModelNativeToolCallIdentity,
+  parseModelRequest,
+  requiredProtocolRevision,
   type CompiledModelRequest,
   type ModelInputItem,
+  type ModelNativeContinuation,
+  type ModelNativeDelivery,
+  type ModelNativeDispatch,
+  type ModelNativeResponseBoundary,
+  type ModelNativeToolCallIdentity,
   type ModelProviderSession,
   type ModelRequest,
   type ModelResponse,
@@ -25,22 +23,26 @@ import {
   type ModelSteeringSubmission,
   type ModelStreamEvent,
   type ModelToolCall,
-  type ModelTransportOptions,
-  type ModelNativeDelivery,
-  type ModelToolResultSubmission,
   type ModelToolResultDelivery,
-  type ModelNativeContinuation,
-  type ModelNativeResponseBoundary,
-  type ModelNativeToolCallIdentity,
-  type ModelNativeDispatch
+  type ModelToolResultSubmission,
+  type ModelTransportOptions
 } from '@agent-core/model';
 import {
   decodeResponsesPayload,
   responsesInput,
   responsesOutput
 } from '@agent-core/provider-openai-responses';
+import { isDeepStrictEqual } from 'node:util';
+import { NativeResponsesConnection, type OpenAIResponsesWebSocketFactory } from './native-connection.js';
+import { aggregateResponses, nativeFailure as failure } from './native-output.js';
+export {
+  defaultOpenAIResponsesWebSocketFactory,
+  type OpenAIResponsesWebSocket,
+  type OpenAIResponsesWebSocketFactory
+} from './native-connection.js';
 
 export interface NativeResponsesHost {
+  describeModel(model: string): Promise<import('@agent-core/model').ModelProfile>;
   compileRequest(request: ModelRequest): Promise<CompiledModelRequest>;
   compileNativeFrame(
     request: ModelRequest,
@@ -246,7 +248,9 @@ export class NativeResponsesSession implements ModelProviderSession {
     try {
       if (!(await this.host.nativeSupported(model)))
         throw failure('invalid_request', 'Native continuation is unsupported by this model/endpoint.');
-      const steering = this.pendingDeliveries().filter((item) => item !== entry && item.kind === 'steering');
+      const steering = this.pendingDeliveries().filter(
+        (item) => item !== entry && item.kind === 'steering'
+      );
       const retainedRequest = parseModelRequest({
         ...this.logical,
         messages: [...this.logical.messages, ...steering.flatMap((item) => item.input)]
@@ -485,7 +489,11 @@ export class NativeResponsesSession implements ModelProviderSession {
                   status: 'acknowledged'
                 });
               }
-              this.update(entry, { ...entry.delivery, successorResponseId: response.id, status: 'applied' });
+              this.update(entry, {
+                ...entry.delivery,
+                successorResponseId: response.id,
+                status: 'applied'
+              });
               for (const source of entry.sourceCalls) this.pendingTools.delete(source.toolCallId);
             }
           }
@@ -538,7 +546,10 @@ export class NativeResponsesSession implements ModelProviderSession {
                 typeof stub.call_id !== 'string' ||
                 !this.pendingTools.has(stub.call_id)
               )
-                throw failure('malformed_response', 'Unsupported or unmatched pending steering dependency.');
+                throw failure(
+                  'malformed_response',
+                  'Unsupported or unmatched pending steering dependency.'
+                );
               return stub.call_id;
             });
             entry.delivery = Object.freeze({ ...entry.delivery, requiredToolCallIds: Object.freeze(ids) });
@@ -562,6 +573,9 @@ export class NativeResponsesSession implements ModelProviderSession {
         if (event.type === 'response.output_item.done') {
           const payload = decodeResponsesPayload({ output: [event.item] });
           for (const item of await responsesOutput({
+            protocolRevision: requiredProtocolRevision(
+              await this.host.describeModel(this.active.boundary.request.model)
+            ),
             request: this.active.boundary.request,
             provider: 'openai',
             endpoint: this.host.endpoint(),
@@ -582,7 +596,10 @@ export class NativeResponsesSession implements ModelProviderSession {
           continue;
         }
         if (event.type === 'response.completed' || event.type === 'response.incomplete') {
-          const response = await this.host.decodeNativeResponse(this.active.boundary.request, event.response);
+          const response = await this.host.decodeNativeResponse(
+            this.active.boundary.request,
+            event.response
+          );
           if (
             !response.requestId ||
             response.requestId !== this.active.boundary.responseId ||
@@ -598,7 +615,10 @@ export class NativeResponsesSession implements ModelProviderSession {
           this.active.terminal = true;
           this.logical = parseModelRequest({
             ...this.active.boundary.request,
-            messages: [...this.active.boundary.request.messages, ...modelOutputToInput(response.output ?? [])]
+            messages: [
+              ...this.active.boundary.request.messages,
+              ...modelOutputToInput(response.output ?? [])
+            ]
           });
           yield {
             type: 'response_boundary',
@@ -654,7 +674,10 @@ export class NativeResponsesSession implements ModelProviderSession {
       throw failure('malformed_response', 'Native tool call omitted its response/call identity.');
     const prior = this.seenCalls.get(call.id);
     if (prior) {
-      if (prior.source.responseId !== this.active.boundary.responseId || !isDeepStrictEqual(prior.call, call))
+      if (
+        prior.source.responseId !== this.active.boundary.responseId ||
+        !isDeepStrictEqual(prior.call, call)
+      )
         throw failure('malformed_response', 'Native call ID was reused for different output.');
       return false;
     }

@@ -1,0 +1,99 @@
+{
+  "format": "agent-core.context-policy-report/1",
+  "createdAt": "2026-09-08T15:09:38.660Z",
+  "mode": "live",
+  "measurement": "empirical-model-trials",
+  "configuration": {
+    "trials": 1,
+    "delay": 2,
+    "transitionEvery": 4,
+    "policies": [
+      "retained-history",
+      "history-retrieval",
+      "notes-retrieval",
+      "provider-native"
+    ],
+    "budgetPerTrial": {
+      "maxInvocations": 64,
+      "maxPromptTokens": 200000,
+      "maxCompletionTokens": 16000,
+      "maxOutputTokens": 512,
+      "timeoutMs": 20000
+    },
+    "maxTotalInvocations": 8,
+    "gates": {
+      "minimumTrials": 10,
+      "maximumSuccessRegression": 0.05,
+      "maximumCostRatio": 1.25
+    },
+    "gateFingerprint": "d65d1f389b689ffbfa7ea40a2f4fb488647b485d6b61e64bbfd2422fbdb29e9a",
+    "workloadFingerprint": "656811ec84124df2145c247898f0470dcd791b75d1b72df7fbe47521e9da076e",
+    "policyVersion": "context-policies/1",
+    "source": {
+      "runnerSha256": "672ab3c8e3b7b72856ea7b3e763fc5c16cf9316fbfb147d4758a23b4dd967bb9",
+      "commit": "393249ae01c8e5d3ed5e2f653655fefe5105db98",
+      "dirty": true
+    },
+    "notePolicy": "Fixed-interval governed note generation from attended public context; bounded model-selected reads. Note tools do not grant writes in these trials.",
+    "ordering": "Rotate policy order by trial; each policy gets a fresh session and matched workload/budget.",
+    "generation": {
+      "maxOutputTokens": 512,
+      "temperature": "provider-default",
+      "seed": "not-supported-by-common-contract"
+    }
+  },
+  "provider": {
+    "id": "codex",
+    "model": "gpt-6-astra",
+    "endpoint": "https://chatgpt.com/backend-api/codex/responses",
+    "credentialsPresent": null,
+    "credentialSource": "caller-specified-read-only-file",
+    "credentialFileSpecified": true,
+    "transport": "http_sse",
+    "credentialRefresh": "disabled",
+    "configurationStatus": "configured"
+  },
+  "accounting": {
+    "requests": 0,
+    "maxRequests": 32,
+    "costStatus": "not-used"
+  },
+  "availability": [
+    {
+      "policy": "retained-history",
+      "status": "unavailable",
+      "reason": "Provider profile could not be resolved; no generation was attempted. Provider diagnostic: model_unavailable."
+    },
+    {
+      "policy": "history-retrieval",
+      "status": "unavailable",
+      "reason": "Provider profile could not be resolved; no generation was attempted. Provider diagnostic: model_unavailable."
+    },
+    {
+      "policy": "notes-retrieval",
+      "status": "unavailable",
+      "reason": "Provider profile could not be resolved; no generation was attempted. Provider diagnostic: model_unavailable."
+    },
+    {
+      "policy": "provider-native",
+      "status": "unavailable",
+      "reason": "Provider profile could not be resolved; no generation was attempted. Provider diagnostic: model_unavailable."
+    }
+  ],
+  "trials": [],
+  "summary": [],
+  "defaultRecommendation": null,
+  "limitations": [
+    "These authored text-memory tasks do not establish general agent quality or model rankings.",
+    "Simulation measures plumbing only; repeated deterministic trials are not independent model-quality evidence.",
+    "Report contains metrics and identities, not credentials, transcripts, notes, or provider payloads. Runtime storage is ephemeral in-memory.",
+    "Mechanical checks cover observed trial history, scope reads, call/result pairing and settlement; the full regression/fault suite is a separate release gate.",
+    "There is no interactive rescue: scheduled workload inputs are not counted as user interventions. Failed trials remain in the denominator.",
+    "Token estimates and unknown pricing remain explicit. Known-rate cost totals based on estimated usage cannot pass the cost gate. A crossed usage limit can include the final consumed invocation. Invocations count attempted admissions; settlements come from the governed owner ledger.",
+    "OpenAI uses bounded provider token counting so opaque native state can be admitted without a fabricated token allowance. Counting requests have a separate four-per-invocation comparison ceiling; their monetary charges are unknown, so trials using them cannot pass total-cost gates.",
+    "Note deliveries count runtime-selected context injections; noteReads counts explicit notes_read tool calls. Unsettled invocation usage remains uncertain, never assumed free.",
+    "Repeated work counts identical tool inputs within a run. Provider-state invalidations are null when no authoritative invalidation counter is exposed; continuation fallbacks are counted separately.",
+    "Quality intervals are per workload/policy comparison, not a family-wide model ranking. The cost gate compares mean known USD cost; it has no cost confidence estimate.",
+    "No policy becomes a production default automatically."
+  ]
+}

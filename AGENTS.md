@@ -1,35 +1,39 @@
-# Agent Core engineering invariants
+# Agent Core engineering rules
 
-## Package direction
+## Ownership
 
-- `@agent-core/runtime` owns run orchestration, model-window assembly, sessions, verification, approvals, recovery, and finalization contracts.
-- Runtime code depends on repository capabilities. Root exports contain contracts and in-memory repositories; filesystem persistence is isolated in `@agent-core/persistence/node` and `@agent-core/runtime/node`.
-- `@agent-core/tools` contains domain-neutral tool contracts and policy. Node/workspace implementations belong in `@agent-core/tools-local`.
-- Provider packages depend on `@agent-core/model` and pass the shared conformance suite. OpenAI adapters may share only dependency-light Responses framing, never credentials or product policy.
-- Runnable applications own committed configuration, environment layout, and presentation. Core packages receive capabilities and explicit persistence locations.
+- Core owns reliable execution, sessions, context admission, capabilities, accounting, and recovery. Applications own domain work, requirements, verification meaning, acceptance, and workflow sequencing.
+- Keep Core general: no mandatory shell, workspace, memory schema, cognitive sequence, or agent hierarchy. Applications supply configuration, capabilities, and explicit persistence locations.
+- Depend on repository capabilities. Root exports provide contracts and in-memory implementations; filesystem repositories use explicit `/node` exports. Local tool implementations belong in `@agent-core/tools-local`.
+- Providers use `@agent-core/model` and pass shared conformance tests. Share protocol encoding, decoding, and framing where appropriate; keep credentials, endpoint capabilities, and product policy in their adapters.
 
-## Runtime truth
+## Recorded truth
 
-- Stable `runId`, `finalizationId`, `turnId`, `requestAttempt`, `toolBatchId`, and call identities survive persistence, approvals, diagnostics, and replay.
-- A run result is either `suspended` for a durable approval request or `ended` with one immutable terminal snapshot.
-- Execution, model-output completeness, and verification are independent dimensions.
-- `run.ended` is the authoritative commit marker. Session run finalizations are idempotent records keyed by `finalizationId`.
-- Finalization order is staging, session recording, then `run.ended`. Delivery failures cannot change terminal truth.
-- Run limits are central. Consumed provider usage is recorded before a crossed limit terminates a run; planned tool operations are reserved transactionally.
+- Distinguish session, application work, run, inference invocation, tool call, and resource lifetime. Preserve causal identities across persistence, authorization, diagnostics, and replay.
+- Suspended runs record their reason and continuation or recovery requirements. Ended runs have one immutable terminal snapshot.
+- Finalization order is staging, session recording, then the authoritative `run.ended` commit. Session finalizations are idempotent by `finalizationId`; delivery failures cannot change terminal truth.
+- Execution outcome, output completeness, verification, coverage, acceptance, and publication are independent facts.
+- Enforce limits centrally with explicit budget owners and transactional reservations. New runs must not implicitly reset continuing-work allowances. Record consumed usage before terminating for a crossed limit.
 
-## Verification, tools, and approvals
+## Context and observations
 
-- Validate check definitions before execution and every observation before deriving verification.
-- Required failures produce `failed`; missing or unknown required results produce `inconclusive`; advisory results never block.
-- Verification is read-only unless an application explicitly grants a verification command executor.
-- Tool input is parsed, canonicalized, and used to derive call-specific effects before authorization.
-- Approval applies only to the exact persisted fingerprint. Changed input, resource, definition, effects, policy, or boundary requires a new request.
-- Non-idempotent or uncertain side effects are never retried automatically.
+- Committed observations and authorized artifacts are independent of model presentations. Shortening cannot alter authoritative values or conceal incomplete coverage. Preserve integrity, redaction, and access boundaries.
+- Preserve original history subject to explicit retention rules. Notes are attributed, revisioned model-authored material; they cannot grant authority, supersede user requirements, or establish verification.
+- Context changes bind selected sources and representations to compiled request admission. Preserve accepted contributions, source revisions, complete accounting, and outstanding protocol obligations; reject invalid or oversized requests explicitly.
+- Preserve required provider reasoning, continuation state, call identities, and configuration changes. Enforce compatibility when switching models; do not flatten native state into notes or silently discard it.
 
-## Contracts and completion
+## Authority and type trust
 
-- This repository is pre-alpha. Schema version `1` means only the current schema; replace contracts in place without migrations, aliases, shims, or old-format readers.
-- Treat `docs/GLOSSARY.md` as the naming contract. Do not add public or persisted names using `projection`, ambiguous `candidate`, catch-all `prepare`/`prepared`, or production `evaluation` terminology.
-- Consumer tests use documented exports. Do not import generated `dist` internals.
+- Validate external and persisted inputs at trust boundaries, establish owned immutable values, then trust domain types internally. Revalidate only at a new trust, revision, or authority boundary. Keep JSON capture and identity exact; presentation shortening is separate.
+- Derive call-specific effects from parsed, canonical inputs before authorization. Approval binds to the exact persisted fingerprint; changed inputs, resources, definitions, effects, policy, or boundaries require matching new authorization.
+- Verification is read-only unless the application explicitly grants a bounded executor. Effectful checks use the shared execution guarantees.
+- Preserve driver and lease fencing, idempotency, and reconciliation. Never automatically retry a possibly executed non-idempotent effect; cancellation or timeout does not prove it did not execute.
+
+## Changes and completion
+
+- Use `docs/GLOSSARY.md` consistently in APIs, persisted fields, tests, and documentation, including its adapter-boundary exceptions. Name actual domain objects and transitions; prefer cohesive modules, precise types, and explicit states over defensive wrappers or casts.
+- This repository is pre-alpha: replace contracts in place without backward compatibility, migrations, aliases, shims, old-format readers, or parallel legacy engines. Reject incompatible records explicitly and leave user data intact.
+- Correct ownership and underlying causes. Remove dead, unused, and superseded code together with its callers, exports, configuration, dependencies, and obsolete tests; do not preserve symptoms behind larger limits or exception lists.
+- Test observable guarantees and meaningful failures. Consumer tests use documented exports, not generated `dist` internals. Distinguish structural tests from live model evaluations; missing live runs prove no behavioral improvement.
+- For implementation, API, build, packaging, or dependency changes, run `npm run verify:release` before delivery. For documentation-only changes, use relevant document checks. Read-only reviews need no release build. Verify required CI on exact pushed revisions when publishing changes.
 - Do not commit `.agent-core`, `node_modules`, `dist`, `.tsbuildinfo`, credentials, sessions, or ledgers.
-- Before completion run `npm run verify:release`.

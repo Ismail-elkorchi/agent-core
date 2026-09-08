@@ -1,28 +1,35 @@
-import { readTransformedContext } from '../inference/context-transform.js';
-import { ModelWindow, type ModelWindowImageLimits } from '../inference/model-window.js';
-import type { ArtifactRef, ArtifactRepository, EventRepository } from '@agent-core/persistence';
-import { decodeToolCall } from '@agent-core/tools';
 import {
   modelOutputToInput,
+  providerContextIncompatibility,
+  type ModelInputItem,
+  type ModelOutputItem,
+  type ModelProtocolCapabilities,
   type ProviderContextState,
-  type RequestEstimator,
-  type ModelOutputItem
+  type RequestEstimator
 } from '@agent-core/model';
-import type { SessionBranchEntry, SessionDescriptor, SessionRepository } from '../session/contracts.js';
+import type { ArtifactRef, ArtifactRepository, EventRepository } from '@agent-core/persistence';
+import { decodeToolCall } from '@agent-core/tools';
+import type { ContextRepresentation } from '../context/contracts.js';
 import type { AgentEvent, AgentProviderStateSummary } from '../events.js';
-import { HistoryReader, sourceRef, historySourceAfterCut } from '../history/reader.js';
 import type { HistoryView } from '../history/contracts.js';
-import { serializeToolObservationPresentation } from './observation-store.js';
+import { HistoryReader, historySourceAfterCut, sourceRef } from '../history/reader.js';
+import { readTransformedContext } from '../inference/context-transform.js';
+import { ModelWindow, type ModelWindowImageLimits } from '../inference/model-window.js';
+import type { SessionBranchEntry, SessionDescriptor, SessionRepository } from '../session/contracts.js';
 import { modelToolCallFromToolCall } from './model-request.js';
+import { serializeToolObservationPresentation } from './observation-store.js';
 import { readProviderStateArtifact } from './provider-state-artifacts.js';
 
 export interface ModelWindowReplayResult {
   readonly modelWindow: ModelWindow;
+  readonly invalidatedProviderStates: readonly {
+    readonly state: ProviderContextState;
+    readonly reason: string;
+  }[];
   readonly replayedLedgers: number;
   readonly replayedTurns: number;
   readonly replayedSessionEntries: number;
   readonly replayedToolResults: number;
-  readonly replayedObservedFactRecords: number;
   readonly providerState?: ProviderContextState;
   readonly providerStateSummary?: AgentProviderStateSummary;
   readonly providerStateRef?: ArtifactRef;
@@ -40,6 +47,7 @@ export async function rebuildModelWindowFromRepositories(input: {
   readonly modelWindowImageLimits?: ModelWindowImageLimits;
   readonly providerId: string;
   readonly model: string;
+  readonly protocol?: ModelProtocolCapabilities;
   readonly runIds?: readonly string[];
   readonly currentRunId?: string;
 }): Promise<ModelWindowReplayResult> {
@@ -61,9 +69,16 @@ export async function rebuildModelWindowFromRepositories(input: {
           view,
           artifacts: input.artifacts,
           provider: input.providerId,
-          model: input.model
+          model: input.model,
+          ...(input.protocol ? { protocol: input.protocol } : {})
         })
       : undefined;
+  const invalidatedProviderStates = transformed?.invalidation ? [transformed.invalidation] : [];
+  const target = {
+    provider: input.providerId,
+    model: input.model,
+    ...(input.protocol ? { protocol: input.protocol } : {})
+  };
   for (const [index, item] of (transformed?.input ?? []).entries())
     modelWindow.recordSourceItem(
       `context-transform:${view?.contextWindow?.windowId ?? ''}:${String(index)}`,
@@ -75,8 +90,12 @@ export async function rebuildModelWindowFromRepositories(input: {
       !transformed?.represented.has(sourceRef(view?.cut.sessionId ?? 'local', entry).entryId)
   );
   let replayedToolResults = 0;
-  let replayedObservedFactRecords = 0;
-  replayedToolResults += replaySourceEntries(modelWindow, view?.cut.sessionId ?? 'local', prior);
+  replayedToolResults += replaySourceEntries(
+    modelWindow,
+    view?.cut.sessionId ?? 'local',
+    prior,
+    view?.contextWindow?.selection.representations
+  );
   // Only the owning unfinished run may use an open ledger tail. Completed history
   // is branch-scoped above; reading entire historical ledgers would cross a fork.
   let replayedLedgers = 0;
@@ -114,25 +133,15 @@ export async function rebuildModelWindowFromRepositories(input: {
           toolCalls: (event.toolCalls ?? []).map(modelToolCallFromToolCall),
           ...(output ? { output } : {})
         });
-      else if (event.type === 'run.disposition.decided' && event.decision.kind === 'revise')
-        modelWindow.recordInput(
-          `disposition-${String(event.revisionCount + 1)}`,
-          { role: 'user', content: event.decision.instruction },
-          event.turnIndex
-        );
       else if (event.type === 'observation.record.created') {
         modelWindow.recordToolResult({
           turnIndex: event.turnIndex,
           toolName: event.toolName,
           toolCallType: event.toolCallType,
           ...(event.callId ? { callId: event.callId } : {}),
-          immediateContent: serializeToolObservationPresentation(event.immediatePresentation),
-          retainedContent: serializeToolObservationPresentation(event.retainedPresentation),
-          useRetained: true,
-          observedFacts: event.observedFacts
+          immediateContent: serializeToolObservationPresentation(event.immediatePresentation)
         });
         replayedToolResults++;
-        replayedObservedFactRecords += event.observedFacts.length;
       }
       const ref =
         event.type === 'provider.state.updated'
@@ -143,6 +152,11 @@ export async function rebuildModelWindowFromRepositories(input: {
                 ref: event.providerState.artifact
               }
             : undefined;
+      if (ref) {
+        providerState = undefined;
+        providerStateSummary = undefined;
+        providerStateRef = undefined;
+      }
       if (
         ref &&
         input.artifacts &&
@@ -153,7 +167,9 @@ export async function rebuildModelWindowFromRepositories(input: {
           artifacts: input.artifacts,
           ref: ref.ref
         });
-        if (state) {
+        const reason = state ? providerContextIncompatibility(state, target) : undefined;
+        if (state && reason) invalidatedProviderStates.push({ state, reason });
+        if (state && !reason) {
           providerState = state;
           providerStateSummary = ref.summary;
           providerStateRef = ref.ref;
@@ -161,13 +177,16 @@ export async function rebuildModelWindowFromRepositories(input: {
       }
     }
   }
+  if (view && input.currentRunId)
+    modelWindow.selectToolResultPresentations(activeObservationRepresentations(view, input.currentRunId));
+  invalidatedProviderStates.push(...modelWindow.invalidateProviderState(target));
   return {
     modelWindow,
+    invalidatedProviderStates: Object.freeze(invalidatedProviderStates),
     replayedLedgers,
     replayedTurns: view?.runFinalizations.length ?? 0,
     replayedSessionEntries: prior.length,
     replayedToolResults,
-    replayedObservedFactRecords,
     ...(providerState ? { providerState } : {}),
     ...(providerStateSummary ? { providerStateSummary } : {}),
     ...(providerStateRef ? { providerStateRef } : {})
@@ -192,8 +211,10 @@ export function selectedHistoryEntries(view: HistoryView): readonly SessionBranc
 export function replaySourceEntries(
   modelWindow: ModelWindow,
   sessionId: string,
-  prior: readonly SessionBranchEntry[]
+  prior: readonly SessionBranchEntry[],
+  representations: readonly ContextRepresentation[] = []
 ): number {
+  const summaries = new Set(representations.map((item) => item.source.entryId));
   let toolResults = 0;
   const callGroups = new Map<string, Extract<SessionBranchEntry, { type: 'tool_call' }>[]>();
   const callsById = new Map<string, Extract<SessionBranchEntry, { type: 'tool_call' }>>();
@@ -267,19 +288,54 @@ export function replaySourceEntries(
         toolName: entry.toolName,
         toolCallId: entry.callId,
         toolCallType: toolCall.input.kind === 'text' ? 'custom' : 'function',
-        content: JSON.stringify({
-          ok: entry.ok,
-          summary: entry.summary,
-          ...(entry.output !== undefined ? { output: entry.output } : {}),
-          ...(entry.artifacts
-            ? {
-                artifacts: entry.artifacts.filter((ref) => ref.visibility === 'public')
-              }
-            : {})
-        })
+        content: observationContextContent(entry, source, summaries.has(source.entryId))
       });
       toolResults++;
     }
   }
   return toolResults;
+}
+
+export function observationContextContent(
+  entry: Extract<SessionBranchEntry, { readonly type: 'observation' }>,
+  source: ReturnType<typeof sourceRef>,
+  summary: boolean
+): string {
+  return JSON.stringify({
+    ok: entry.ok,
+    summary: entry.summary,
+    ...(!summary && entry.output !== undefined ? { output: entry.output } : {}),
+    ...(entry.artifacts ? { artifacts: entry.artifacts.filter((ref) => ref.visibility === 'public') } : {}),
+    ...(summary ? { representation: 'summary', source } : {})
+  });
+}
+
+export function activeObservationRepresentations(
+  view: HistoryView,
+  runId: string
+): ReadonlyMap<string, Extract<ModelInputItem, { readonly role: 'tool' }>> {
+  const selected = new Set(
+    view.contextWindow?.selection.representations?.map((item) => item.source.entryId)
+  );
+  const messages = new Map<string, Extract<ModelInputItem, { readonly role: 'tool' }>>();
+  for (const entry of view.entries) {
+    if (entry.type !== 'observation' || entry.runId !== runId || !entry.callId) continue;
+    const source = sourceRef(view.cut.sessionId, entry);
+    if (!selected.has(source.entryId)) continue;
+    const call = view.entries.find(
+      (item) => item.type === 'tool_call' && item.runId === runId && item.callId === entry.callId
+    );
+    if (call?.type !== 'tool_call') throw new Error('Selected observation has no original call.');
+    messages.set(
+      entry.callId,
+      Object.freeze({
+        role: 'tool',
+        toolName: entry.toolName,
+        toolCallId: entry.callId,
+        toolCallType: decodeToolCall(call.call).input.kind === 'text' ? 'custom' : 'function',
+        content: observationContextContent(entry, source, true)
+      })
+    );
+  }
+  return messages;
 }

@@ -3,6 +3,11 @@ import * as z from 'zod';
 import { historyCutSchema, noteRefSchema, sourceSchema } from '../history/schema.js';
 export const contextSelectionSchema = z
   .strictObject({
+    representations: z
+      .array(z.strictObject({ source: sourceSchema, presentation: z.literal('summary') }).readonly())
+      .max(10_000)
+      .readonly()
+      .optional(),
     retained: z.array(sourceSchema).max(10_000).readonly(),
     notes: z.array(noteRefSchema).max(256).readonly(),
     omitted: z

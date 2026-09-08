@@ -1,47 +1,52 @@
-import {
-  invokeNativeInference,
-  type NativeInferenceInput,
-  type NativeGenerationContext
-} from './native-inference.js';
-import { parseInferenceBudget } from './repository.js';
-import { randomUUID } from 'node:crypto';
-import { hashJson, type ArtifactRepository, type ArtifactRef } from '@agent-core/persistence';
+import { executeEffectLifecycle, type EffectLifecycle } from '@agent-core/effects';
 import { parseJsonObject } from '@agent-core/json';
 import {
+  CompleteRequestEstimator,
+  assertRequestAccountingFits,
   createModelRequest,
+  modelInputIdentity,
+  parseModelContextTransformResult,
   parseModelProfile,
   parseModelResponse,
-  parseModelContextTransformResult,
   requestAccountingInputTokens,
-  assertRequestAccountingFits,
-  modelInputIdentity,
-  CompleteRequestEstimator,
-  type ModelProvider,
-  type ModelProfile,
-  type ModelRequest,
-  type ModelResponse,
-  type ModelProviderSession,
-  type ModelStreamEvent,
   type CompiledModelRequest,
   type ModelContextTransformResult,
+  type ModelProfile,
+  type ModelProvider,
+  type ModelProviderSession,
+  type ModelRequest,
+  type ModelResponse,
+  type ModelStreamEvent,
   type ModelUsage
 } from '@agent-core/model';
+import {
+  InMemoryArtifactRepository,
+  hashJson,
+  type ArtifactRef,
+  type ArtifactRepository
+} from '@agent-core/persistence';
+import { randomUUID } from 'node:crypto';
 import { InferenceGateway, type InferenceInvocation } from './gateway.js';
-import { executeInferenceLifecycle, type InferenceLifecycle } from './lifecycle.js';
+import {
+  invokeNativeInference,
+  type NativeGenerationContext,
+  type NativeInferenceInput
+} from './native-inference.js';
 import type {
   InferenceBudget,
-  InferenceIdentity,
-  InferenceRepository,
   InferenceEvent,
+  InferenceIdentity,
   InferenceOwnerState,
+  InferenceRepository,
   InferenceReservation
 } from './repository.js';
+import { InMemoryInferenceRepository, parseInferenceBudget } from './repository.js';
 import { calculateInferenceCost, type InferenceCost } from './usage-cost.js';
 
 export interface InferenceServiceOptions {
   readonly provider: ModelProvider;
-  readonly repository?: InferenceRepository;
-  readonly artifacts?: ArtifactRepository;
+  readonly repository: InferenceRepository;
+  readonly artifacts: ArtifactRepository;
   readonly budget?: InferenceBudget;
 }
 export interface GovernedInferenceInput extends InferenceIdentity {
@@ -121,11 +126,27 @@ interface DurableOperation<T extends { readonly usage?: ModelUsage }> {
 /** One admission ledger, reservation policy, cancellation path, and settlement lifecycle for all inference. */
 export class InferenceService {
   private readonly gateway: InferenceGateway;
-  constructor(readonly options: InferenceServiceOptions) {
+  readonly options: InferenceServiceOptions;
+  constructor(options: InferenceServiceOptions);
+  constructor(
+    options: Omit<InferenceServiceOptions, 'repository' | 'artifacts'> &
+      Partial<Pick<InferenceServiceOptions, 'repository' | 'artifacts'>>
+  ) {
+    if (!options.repository || !options.artifacts)
+      throw new TypeError('Inference composition requires explicit invocation and artifact repositories.');
     this.gateway = new InferenceGateway(options.provider);
     this.options = Object.freeze({
       ...options,
+      repository: options.repository,
+      artifacts: options.artifacts,
       budget: parseInferenceBudget(options.budget ?? {})
+    });
+  }
+  static inMemory(options: Omit<InferenceServiceOptions, 'repository' | 'artifacts'>): InferenceService {
+    return new InferenceService({
+      ...options,
+      repository: new InMemoryInferenceRepository(),
+      artifacts: new InMemoryArtifactRepository()
     });
   }
   createSession(): ModelProviderSession {
@@ -136,37 +157,32 @@ export class InferenceService {
   }
   async invokeWithLifecycle<TResult>(
     input: InferenceInvocation,
-    lifecycle: InferenceLifecycle<TResult>,
-    identity?: InferenceIdentity
+    lifecycle: EffectLifecycle<TResult, ModelResponse>,
+    identity: InferenceIdentity
   ): Promise<TResult> {
-    if (this.options.repository && this.options.artifacts) {
-      if (!identity) throw new Error('A durable inference service requires the owning invocation identity.');
-      const dispatch = { started: false };
-      let result: InferenceResult;
-      try {
-        result = await this.invokeDurably(
-          {
-            ...identity,
-            request: input.request,
-            profile: input.profile,
-            session: input.session,
-            ...(input.admitted ? { admitted: input.admitted } : {}),
-            ...(input.onStreamEvent ? { onStreamEvent: input.onStreamEvent } : {})
-          },
-          async () => {
-            await lifecycle.start();
-            dispatch.started = true;
-          }
-        );
-      } catch (cause) {
-        if (!dispatch.started) throw cause;
-        return lifecycle.uncertain(cause);
-      }
-      if (!dispatch.started) await lifecycle.start();
-      return lifecycle.settle(result.response);
+    const dispatch = { started: false };
+    let result: InferenceResult;
+    try {
+      result = await this.invokeDurably(
+        {
+          ...identity,
+          request: input.request,
+          profile: input.profile,
+          session: input.session,
+          ...(input.admitted ? { admitted: input.admitted } : {}),
+          ...(input.onStreamEvent ? { onStreamEvent: input.onStreamEvent } : {})
+        },
+        async () => {
+          await lifecycle.start();
+          dispatch.started = true;
+        }
+      );
+    } catch (cause) {
+      if (!dispatch.started) throw cause;
+      return lifecycle.uncertain(cause);
     }
-    const admitted = input.admitted ?? (await this.gateway.admit(input.request, input.profile));
-    return executeInferenceLifecycle(lifecycle, () => this.gateway.invoke({ ...input, admitted }));
+    if (!dispatch.started) await lifecycle.start();
+    return lifecycle.settle(result.response);
   }
   async invoke(input: GovernedInferenceInput): Promise<InferenceResult> {
     return this.invokeDurably(input);
@@ -188,7 +204,6 @@ export class InferenceService {
         artifact: replayed.artifact,
         replayed: true
       });
-    this.requireDurability();
     const signal = input.signal ?? input.request.signal;
     signal?.throwIfAborted();
     const profile = parseModelProfile(
@@ -243,7 +258,6 @@ export class InferenceService {
   }
 
   async invokeNative(input: NativeInferenceInput) {
-    this.requireDurability();
     return invokeNativeInference(
       {
         gateway: this.gateway,
@@ -278,7 +292,7 @@ export class InferenceService {
     context: NativeGenerationContext,
     compiled: CompiledModelRequest
   ): Promise<void> {
-    const { repository, artifacts } = this.requireDurability();
+    const { repository, artifacts } = this.options;
     assertCompiledProfile(compiled, context.profile);
     assertRequestAccountingFits(compiled.accounting);
     const promptTokens = requestAccountingInputTokens(compiled.accounting);
@@ -363,7 +377,6 @@ export class InferenceService {
         response: replayed.value,
         replayed: true
       });
-    this.requireDurability();
     const signal = input.signal ?? input.request.signal;
     signal?.throwIfAborted();
     const profile = parseModelProfile(
@@ -438,7 +451,7 @@ export class InferenceService {
     decode: (value: unknown) => T,
     discriminator?: string
   ): Promise<DurableResult<T> | undefined> {
-    const { repository, artifacts } = this.requireDurability();
+    const { repository, artifacts } = this.options;
     (input.signal ?? input.request.signal)?.throwIfAborted();
     const identity = ownIdentity(input);
     const existing = (await repository.load(identity.ownerId)).invocations.get(identity.invocationId);
@@ -450,10 +463,7 @@ export class InferenceService {
       throw new Error(
         `Inference ${identity.invocationId} was already admitted with different input or configuration.`
       );
-    if (
-      hashJson(existing.start.limits) !==
-      hashJson(this.options.budget ?? {})
-    )
+    if (hashJson(existing.start.limits) !== hashJson(this.options.budget ?? {}))
       throw new Error('Inference owner budget policy changed after admission.');
     if (input.profile) {
       const record = parseJsonObject(
@@ -496,19 +506,10 @@ export class InferenceService {
     });
   }
 
-  private requireDurability(): {
-    repository: InferenceRepository;
-    artifacts: ArtifactRepository;
-  } {
-    const { repository, artifacts } = this.options;
-    if (!repository || !artifacts)
-      throw new Error('Auxiliary inference requires explicit invocation and artifact repositories.');
-    return { repository, artifacts };
-  }
   private async executeDurably<T extends { readonly usage?: ModelUsage }>(
     input: DurableOperation<T>
   ): Promise<DurableResult<T>> {
-    const { repository, artifacts } = this.requireDurability();
+    const { repository, artifacts } = this.options;
     const { identity, profile, compiled, signal } = input;
     signal?.throwIfAborted();
     assertCompiledProfile(compiled, profile);
@@ -529,7 +530,7 @@ export class InferenceService {
         implementation: this.options.provider.implementationId,
         profile,
         inputIdentity: compiled.inputIdentity,
-        request: JSON.parse(JSON.stringify(logical)) as unknown
+        sourceFingerprint
       })
     ).slice(7);
     const promptTokens = requestAccountingInputTokens(compiled.accounting);
@@ -729,7 +730,7 @@ export class InferenceService {
         throw new InferenceNotSentError(identity.invocationId, message);
       }
     };
-    const operation = executeInferenceLifecycle({ start: authorize, settle, uncertain }, () => {
+    const operation = executeEffectLifecycle({ start: authorize, settle, uncertain }, () => {
       dispatchStarted = true;
       return input.dispatch();
     });
@@ -779,7 +780,11 @@ function assertCompiledProfile(compiled: CompiledModelRequest, profile: ModelPro
   )
     throw new Error('Compiled inference changed the admitted model or capability revision.');
 }
-function assertBudget(state: InferenceOwnerState, next: InferenceReservation, limits: InferenceBudget): void {
+function assertBudget(
+  state: InferenceOwnerState,
+  next: InferenceReservation,
+  limits: InferenceBudget
+): void {
   let prompt = next.promptTokens;
   let completion = next.completionTokens;
   let knownCost = next.cost.currency === limits.maxKnownCost?.currency ? (next.cost.amount ?? 0) : 0;

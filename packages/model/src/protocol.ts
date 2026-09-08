@@ -1,20 +1,20 @@
 import { parseJsonObject } from '@agent-core/json';
+import { modelInputIdentity } from './accounting.js';
+import type {
+  ModelContextTransformResult,
+  ModelInputItem,
+  ModelOutputItem,
+  ModelProtocolCapabilities,
+  ModelRequest,
+  ModelResponse,
+  ProviderContextState
+} from './index.js';
 import {
   ModelContractError,
   parseModelRequest,
   parseModelUsage,
   parseProviderContextState
 } from './validation.js';
-import { modelInputIdentity } from './accounting.js';
-import type {
-  ModelInputItem,
-  ModelProtocolCapabilities,
-  ModelRequest,
-  ModelResponse,
-  ModelOutputItem,
-  ProviderContextState,
-  ModelContextTransformResult
-} from './index.js';
 
 export function conservativeProtocolCapabilities(
   endpoint: string,
@@ -158,7 +158,8 @@ export async function assertProviderContextCompatible(
   request: ModelRequest,
   endpoint: string,
   prefix: readonly ModelInputItem[],
-  provider: string
+  provider: string,
+  protocolRevision: string
 ): Promise<void> {
   state = parseProviderContextState(state);
   if (
@@ -166,10 +167,11 @@ export async function assertProviderContextCompatible(
     state.model !== request.model ||
     state.endpoint !== endpoint ||
     state.compatibility.model !== request.model ||
-    state.compatibility.endpoint !== endpoint
+    state.compatibility.endpoint !== endpoint ||
+    state.compatibility.protocolRevision !== protocolRevision
   )
     throw new ModelContractError('Incompatible provider context state.', [
-      'Provider, endpoint and model must match exactly.'
+      'Provider, endpoint, model and protocol revision must match exactly.'
     ]);
   if (
     state.compatibility.requiresExactPrefix &&
@@ -184,6 +186,7 @@ export async function createProviderContextState(options: {
   readonly endpoint: string;
   readonly request: ModelRequest;
   readonly requestId: string;
+  readonly protocolRevision: string;
   readonly kind: string;
   readonly data: unknown;
   readonly replay?: ProviderContextState['replay'];
@@ -204,6 +207,7 @@ export async function createProviderContextState(options: {
     compatibility: {
       model: request.model,
       endpoint: options.endpoint,
+      protocolRevision: options.protocolRevision,
       requiresExactPrefix: options.requiresExactPrefix ?? true
     },
     ...(options.tokenCount === undefined ? {} : { tokenCount: options.tokenCount }),
@@ -226,4 +230,30 @@ export function modelOutputToInput(output: readonly ModelOutputItem[]): readonly
     if (item.type === 'media') return { role: 'assistant', content: '', parts: [item.part] };
     return { role: 'assistant', content: item.text };
   });
+}
+
+export function requiredProtocolRevision(profile: import('./index.js').ModelProfile): string {
+  const protocol = profile.capabilities.protocol;
+  if (!protocol)
+    throw new ModelContractError('Provider state requires protocol capabilities.', [
+      'The adapter must declare its protocol revision.'
+    ]);
+  return protocol.revision;
+}
+
+/** Native state is portable only within its exact adapter contract. */
+export function providerContextIncompatibility(
+  state: ProviderContextState,
+  target: {
+    readonly provider: string;
+    readonly model: string;
+    readonly protocol?: import('./index.js').ModelProtocolCapabilities;
+  }
+): string | undefined {
+  if (state.provider !== target.provider) return 'provider_changed';
+  if (state.model !== target.model) return 'model_changed';
+  if (!target.protocol) return 'protocol_unavailable';
+  if (state.endpoint !== target.protocol.endpoint) return 'endpoint_changed';
+  if (state.compatibility.protocolRevision !== target.protocol.revision) return 'protocol_revision_changed';
+  return undefined;
 }

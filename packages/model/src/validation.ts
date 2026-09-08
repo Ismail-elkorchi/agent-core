@@ -1,34 +1,35 @@
-import {
-  parseModelNativeResponseBoundary,
-  parseModelNativeToolCallIdentity,
-  parseModelNativeDelivery,
-  parseModelToolResultDelivery
-} from './native.js';
-import { parseModelProtocolCapabilities } from './protocol.js';
+import { parseJsonObject, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
+import { MODEL_REQUEST_JSON_LIMITS } from './json-limits.js';
 import type {
-  ModelProfile,
   ModelCapabilities,
-  ModelLimits,
-  ModelInputItem,
   ModelContentPart,
-  ModelOutputItem,
+  ModelInputItem,
+  ModelLimits,
   ModelModalities,
+  ModelOutputItem,
   ModelPricing,
+  ModelProfile,
   ModelProviderOptions,
   ModelReasoningEffort,
   ModelReasoningRequest,
   ModelRequest,
-  ModelResponseFormat,
-  ProviderContextState,
   ModelResponse,
+  ModelResponseFormat,
   ModelStreamEvent,
   ModelTerminationReason,
   ModelTool,
   ModelToolCall,
   ModelTransportMetadata,
-  ModelUsage
+  ModelUsage,
+  ProviderContextState
 } from './index.js';
-import { parseJsonValue, parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
+import {
+  parseModelNativeDelivery,
+  parseModelNativeResponseBoundary,
+  parseModelNativeToolCallIdentity,
+  parseModelToolResultDelivery
+} from './native.js';
+import { parseModelProtocolCapabilities } from './protocol.js';
 
 const MODEL_JSON_LIMITS = {
   maxDepth: 32,
@@ -38,6 +39,7 @@ const MODEL_JSON_LIMITS = {
 };
 const OWNED_PROFILES = new WeakSet<ModelProfile>();
 const OWNED_REQUESTS = new WeakSet<ModelRequest>();
+const OWNED_INPUT_ITEMS = new WeakSet<ModelInputItem>();
 const OWNED_RESPONSES = new WeakSet<ModelResponse>();
 const OWNED_PROVIDER_STATES = new WeakSet<ProviderContextState>();
 const OWNED_STREAM_EVENTS = new WeakSet<ModelStreamEvent>();
@@ -276,7 +278,10 @@ export function assertModelRequestSupported(profile: ModelProfile, request: Mode
     issues.push(`temperature is not supported by ${profile.id}.`);
   if (request.topP !== undefined && !profile.capabilities.topP)
     issues.push(`topP is not supported by ${profile.id}.`);
-  if ((request.logprobs !== undefined || request.topLogprobs !== undefined) && !profile.capabilities.logprobs)
+  if (
+    (request.logprobs !== undefined || request.topLogprobs !== undefined) &&
+    !profile.capabilities.logprobs
+  )
     issues.push(`log probabilities are not supported by ${profile.id}.`);
   if (request.responseFormat === 'json' && !profile.capabilities.jsonMode)
     issues.push(`JSON mode is not supported by ${profile.id}.`);
@@ -385,6 +390,15 @@ function modelReasoningSupportIssues(
 }
 
 function decodeMessage(value: unknown, index: number): ModelInputItem {
+  if (ownedBy(OWNED_INPUT_ITEMS, value)) return value;
+  const decoded = decodeFreshMessage(value, index);
+  // The semantic decoder normalizes media to JSON. Capture preserves that validated
+  // shape and establishes shared ownership for compilation, identity and persistence.
+  const captured = parseJsonObject(decoded, MODEL_REQUEST_JSON_LIMITS) as JsonObject & ModelInputItem;
+  return own(OWNED_INPUT_ITEMS, captured);
+}
+
+function decodeFreshMessage(value: unknown, index: number): ModelInputItem {
   const path = `messages[${String(index)}]`;
   if (
     !isRecord(value) ||
@@ -709,7 +723,7 @@ export function parseProviderContextState(value: unknown): ProviderContextState 
   const inputIdentity = stateString(origin, 'inputIdentity');
   if (
     !onlyKeys(origin, ['requestId', 'inputIdentity']) ||
-    !onlyKeys(compatibility, ['model', 'endpoint', 'requiresExactPrefix']) ||
+    !onlyKeys(compatibility, ['model', 'endpoint', 'protocolRevision', 'requiresExactPrefix']) ||
     compatibility.model !== model ||
     compatibility.endpoint !== endpoint ||
     typeof compatibility.requiresExactPrefix !== 'boolean' ||
@@ -723,7 +737,10 @@ export function parseProviderContextState(value: unknown): ProviderContextState 
     const reference = parseJsonObject(record.artifact);
     if (!onlyKeys(reference, ['id', 'digest']))
       throw contract('Invalid provider artifact.', ['Unknown artifact reference fields.']);
-    artifact = Object.freeze({ id: stateString(reference, 'id'), digest: stateString(reference, 'digest') });
+    artifact = Object.freeze({
+      id: stateString(reference, 'id'),
+      digest: stateString(reference, 'digest')
+    });
   }
   const tokenCount = record.tokenCount === undefined ? undefined : stateTokenCount(record.tokenCount);
   const tokenEstimate =
@@ -748,6 +765,7 @@ export function parseProviderContextState(value: unknown): ProviderContextState 
       compatibility: Object.freeze({
         model,
         endpoint,
+        protocolRevision: stateString(compatibility, 'protocolRevision'),
         requiresExactPrefix: compatibility.requiresExactPrefix
       }),
       replay: record.replay,
@@ -875,7 +893,11 @@ export function parseModelStreamEvent(value: unknown): ModelStreamEvent {
       throw contract('Invalid native boundary.', ['Response identity conflicts with stream event.']);
     return own(
       OWNED_STREAM_EVENTS,
-      Object.freeze({ type: 'response_started', responseId: value.responseId, ...(native ? { native } : {}) })
+      Object.freeze({
+        type: 'response_started',
+        responseId: value.responseId,
+        ...(native ? { native } : {})
+      })
     );
   }
   if (value.type === 'response_boundary') {
@@ -891,7 +913,10 @@ export function parseModelStreamEvent(value: unknown): ModelStreamEvent {
   if (value.type === 'tool_result_delivery')
     return own(
       OWNED_STREAM_EVENTS,
-      Object.freeze({ type: 'tool_result_delivery', delivery: parseModelToolResultDelivery(value.delivery) })
+      Object.freeze({
+        type: 'tool_result_delivery',
+        delivery: parseModelToolResultDelivery(value.delivery)
+      })
     );
   if (value.type === 'native_delivery')
     return own(
@@ -911,7 +936,9 @@ export function parseModelStreamEvent(value: unknown): ModelStreamEvent {
         delivery.status !== 'failed' &&
         delivery.status !== 'uncertain')
     )
-      throw contract('Invalid steering delivery.', ['Exact delivery/response identity and status required.']);
+      throw contract('Invalid steering delivery.', [
+        'Exact delivery/response identity and status required.'
+      ]);
     for (const key of ['inputIdentity', 'successorResponseId'])
       if (delivery[key] !== undefined && (typeof delivery[key] !== 'string' || !delivery[key]))
         throw contract('Invalid steering delivery.', ['Invalid identity.']);
@@ -1051,14 +1078,19 @@ export function decodeOwnedModelCapabilities(value: unknown): ModelCapabilities 
     'topP'
   ])
     if (typeof value[name] !== 'boolean') throw new Error(`capabilities.${name} must be boolean.`);
-  if (!Array.isArray(value.supportedToolInputs) || !value.supportedToolInputs.every(isModelToolInputSupport))
+  if (
+    !Array.isArray(value.supportedToolInputs) ||
+    !value.supportedToolInputs.every(isModelToolInputSupport)
+  )
     throw new Error('capabilities.supportedToolInputs is invalid.');
   const reasoning =
     value.reasoning === undefined ? undefined : decodeOwnedModelReasoningCapabilities(value.reasoning);
   return Object.freeze({
     streaming: value.streaming as boolean,
     toolCalling: value.toolCalling as boolean,
-    supportedToolInputs: Object.freeze(value.supportedToolInputs.map((input) => Object.freeze({ ...input }))),
+    supportedToolInputs: Object.freeze(
+      value.supportedToolInputs.map((input) => Object.freeze({ ...input }))
+    ),
     jsonMode: value.jsonMode as boolean,
     jsonSchema: value.jsonSchema as boolean,
     logprobs: value.logprobs as boolean,
@@ -1132,7 +1164,10 @@ function isReasoningSummary(value: unknown): value is 'auto' | 'concise' | 'deta
 export function decodeOwnedModelModalities(value: unknown): ModelModalities {
   if (!isRecord(value) || !stringArray(value.input) || !stringArray(value.output))
     throw new Error('modalities is invalid.');
-  return Object.freeze({ input: Object.freeze([...value.input]), output: Object.freeze([...value.output]) });
+  return Object.freeze({
+    input: Object.freeze([...value.input]),
+    output: Object.freeze([...value.output])
+  });
 }
 export function decodeOwnedModelLimits(value: unknown): ModelLimits {
   if (!isRecord(value)) throw new Error('limits must be an object.');
@@ -1171,7 +1206,8 @@ function decodePricing(value: unknown): ModelPricing {
   for (const name of ['input', 'output', 'cacheRead', 'cacheWrite']) {
     const rate = value.rates[name];
     if (rate !== undefined) {
-      if (!nonnegativeFinite(rate)) throw new Error('pricing must contain finite nonnegative numeric rates.');
+      if (!nonnegativeFinite(rate))
+        throw new Error('pricing must contain finite nonnegative numeric rates.');
       rates[name] = rate;
     }
   }

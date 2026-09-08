@@ -1,9 +1,12 @@
-import { decodePromptContextItemInput } from '../inference/prompt-material.js';
+import { parseJsonObject } from '@agent-core/json';
+import type { ModelReasoningRequest } from '@agent-core/model';
+import { hashJson } from '@agent-core/persistence';
 import * as z from 'zod';
 import { sourceSchema } from '../history/schema.js';
+import { decodePromptContextItemInput } from '../inference/prompt-material.js';
 import type {
-  SessionPendingSubmission,
   SessionInputRelationship,
+  SessionPendingSubmission,
   SessionSubmissionConfiguration,
   SessionSubmissionInput,
   SessionSubmissionRecord,
@@ -13,9 +16,6 @@ import type {
   SessionSuspensionCategory,
   SessionSuspensionDescriptor
 } from './contracts.js';
-import { parseJsonObject } from '@agent-core/json';
-import { hashJson } from '@agent-core/persistence';
-import type { ModelReasoningRequest } from '@agent-core/model';
 
 type SubmissionState = SessionPendingSubmission['state'] | 'completed' | 'failed';
 type FoldedSubmission = Omit<SessionPendingSubmission, 'state'> & {
@@ -44,7 +44,9 @@ export function ownSessionSubmissionInput(value: unknown): SessionSubmissionInpu
   if (contextItems !== undefined && !Array.isArray(contextItems))
     throw new Error('Session context items must be an array.');
   if (
-    Object.keys(input).some((key) => !['task', 'instructions', 'contextItems', 'relationship'].includes(key))
+    Object.keys(input).some(
+      (key) => !['task', 'instructions', 'contextItems', 'relationship'].includes(key)
+    )
   )
     throw new Error('Unsupported session submission input field.');
   return Object.freeze({
@@ -188,10 +190,7 @@ export function createSessionSubmissionTransition(
     if (suspension.submissionId !== submissionId || suspension.runId !== current.runId)
       throw new Error(`Session suspension identity changed: ${submissionId}`);
     if (current.state === state) {
-      if (
-        current.suspension === undefined ||
-        hashJson(current.suspension) !== hashJson(suspension)
-      )
+      if (current.suspension === undefined || hashJson(current.suspension) !== hashJson(suspension))
         throw new Error(`Conflicting suspension for session submission: ${submissionId}`);
       return undefined;
     }
@@ -247,7 +246,9 @@ function foldSubmissions(records: readonly SessionSubmissionRecord[]): Map<strin
     const state = submissionTransitionState(record);
     assertTransition(current.state, state, record.submissionId);
     const suspension =
-      record.type === 'submission.suspended' ? ownSessionSuspensionDescriptor(record.suspension) : undefined;
+      record.type === 'submission.suspended'
+        ? ownSessionSuspensionDescriptor(record.suspension)
+        : undefined;
     submissions.set(
       record.submissionId,
       Object.freeze({
@@ -278,7 +279,8 @@ export function ownSessionSuspensionDescriptor(value: unknown): SessionSuspensio
   const submissionId = suspensionString(object.submissionId, 'submissionId');
   const category = suspensionCategory(object.category);
   const reason = suspensionReason(object.reason);
-  const effectId = object.effectId === undefined ? undefined : suspensionString(object.effectId, 'effectId');
+  const effectId =
+    object.effectId === undefined ? undefined : suspensionString(object.effectId, 'effectId');
   if (!Array.isArray(object.actions) || object.actions.length === 0)
     throw new TypeError('Session suspension actions are invalid.');
   const actions = object.actions.map(suspensionAction);
@@ -341,7 +343,6 @@ function suspensionReason(value: unknown): SessionSuspensionDescriptor['reason']
     value !== 'approval_required' &&
     value !== 'provider_outcome_unknown' &&
     value !== 'tool_outcome_unknown' &&
-    value !== 'disposition_outcome_unknown' &&
     value !== 'missing_implementation' &&
     value !== 'user_decision'
   )

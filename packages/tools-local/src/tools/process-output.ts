@@ -1,5 +1,5 @@
-import * as z from 'zod';
 import type { CommandExecutionResult } from '@agent-core/tools';
+import * as z from 'zod';
 
 export const artifactRefSchema = z.strictObject({
   artifactId: z.string(),
@@ -22,7 +22,13 @@ const streamOutputSchema = z.strictObject({
 
 export const processOutputSchema = z.strictObject({
   processId: z.string(),
-  owner: z.strictObject({ runId: z.string(), turnId: z.string(), toolBatchId: z.string(), callIndex: z.int().nonnegative() }),
+  owner: z.strictObject({
+    ownerId: z.string(),
+    runId: z.string(),
+    turnId: z.string(),
+    toolBatchId: z.string(),
+    callIndex: z.int().nonnegative()
+  }),
   status: z.enum(['running', 'exited', 'stopped', 'timed_out', 'failed']),
   cursorStart: z.int().nonnegative(),
   cursorEnd: z.int().nonnegative(),
@@ -39,5 +45,5 @@ export const processOutputSchema = z.strictObject({
 });
 
 export function isSuccessfulProcessResult(result: CommandExecutionResult): boolean {
-  return result.status === 'running' || result.status === 'exited' && result.exitCode === 0;
+  return result.status === 'running' || (result.status === 'exited' && result.exitCode === 0);
 }

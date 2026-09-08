@@ -1,27 +1,19 @@
-import { parseJsonObject, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
-import {
-  decodeEffectExecutionState,
-  decodeEffectRecoveryCapability,
-  type EffectExecutionState
-} from '@agent-core/effects';
+import { decodeEffectExecutionState, type EffectExecutionState } from '@agent-core/effects';
+import { parseJsonObject, type JsonObject } from '@agent-core/json';
 import { hashJson } from '@agent-core/persistence';
-import {
-  decodeAgentRunBudgetState,
-  decodeOwnedAgentCheckResult,
-  type AgentCheckResult,
-  type AgentRunBudgetState,
-  type AgentTurnIdentity
-} from '../contracts.js';
+import { decodeToolCall, type ToolCall } from '@agent-core/tools';
 import {
   decodePromptContextItemInput,
   type PromptContextItemInput
 } from '../../inference/prompt-material.js';
-import { decodeToolCall, type ToolCall } from '@agent-core/tools';
+import {
+  decodeAgentRunBudgetState,
+  type AgentRunBudgetState,
+  type AgentTurnIdentity
+} from '../contracts.js';
 import { decodeToolPhase, isToolCallStartable, type AgentToolPhase } from './tool-state.js';
-import { decodeDispositionPhase, type AgentDispositionPhase } from './disposition/state.js';
 
-export type { AgentToolPhase, AgentToolCallPlanRecord, AgentToolSettlementRecord } from './tool-state.js';
-export type { AgentDispositionPhase, AgentDispositionEffectPlanRecord } from './disposition/state.js';
+export type { AgentToolCallPlanRecord, AgentToolPhase, AgentToolSettlementRecord } from './tool-state.js';
 
 export interface AgentRunStateInput {
   readonly task: string;
@@ -35,28 +27,8 @@ export interface AgentRunControlConfiguration {
   readonly model: string;
   readonly runtimeImplementationId: string;
   readonly toolImplementationIds: readonly string[];
-  readonly checks: readonly { readonly id: string; readonly implementationId: string }[];
-  readonly disposition: Readonly<{
-    readonly implementationId: string;
-    readonly policyIdentity: JsonValue;
-    readonly policyHash: string;
-  }>;
+
   readonly policyHash: string;
-}
-
-export interface AgentCheckEffectPlanRecord {
-  readonly checkImplementationId: string;
-  readonly fingerprint: string;
-  readonly authorization: JsonValue;
-  readonly recovery: import('@agent-core/effects').EffectRecoveryCapability;
-}
-
-interface AgentVerificationPhaseBase {
-  readonly kind: 'verification';
-  readonly identity: AgentTurnIdentity;
-  readonly providerSettlementEventId: string;
-  readonly checkIds: readonly string[];
-  readonly nextCheckIndex: number;
 }
 
 export type AgentRunControl =
@@ -142,31 +114,6 @@ export type AgentRunControlPhase =
       readonly turnIndex: number;
     }>
   | Readonly<{ readonly kind: 'active' }>
-  | Readonly<AgentVerificationPhaseBase & { readonly stage: 'ready' }>
-  | Readonly<AgentVerificationPhaseBase & { readonly stage: 'deterministic_pending' }>
-  | Readonly<
-      AgentVerificationPhaseBase & {
-        readonly stage: 'effect_ready';
-        readonly plan: AgentCheckEffectPlanRecord;
-        readonly effect: Extract<EffectExecutionState, { readonly phase: 'ticket_issued' }>;
-      }
-    >
-  | Readonly<
-      AgentVerificationPhaseBase & {
-        readonly stage: 'effect_pending';
-        readonly plan: AgentCheckEffectPlanRecord;
-        readonly effect: Extract<EffectExecutionState, { readonly phase: 'started' }>;
-      }
-    >
-  | Readonly<
-      AgentVerificationPhaseBase & {
-        readonly stage: 'settled';
-        readonly result: AgentCheckResult;
-        readonly effect?: Extract<EffectExecutionState, { readonly phase: 'settled' | 'closed' }>;
-      }
-    >
-  | Readonly<AgentVerificationPhaseBase & { readonly stage: 'complete' }>
-  | AgentDispositionPhase
   | Readonly<{
       readonly kind: 'finalization';
       readonly stage: 'ready' | 'staged' | 'session_recorded' | 'committed';
@@ -174,11 +121,7 @@ export type AgentRunControlPhase =
     }>
   | Readonly<{
       readonly kind: 'suspended';
-      readonly reason:
-        | 'provider_outcome_unknown'
-        | 'tool_outcome_unknown'
-        | 'disposition_outcome_unknown'
-        | 'missing_implementation';
+      readonly reason: 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'missing_implementation';
       readonly effectId?: string;
     }>
   | Readonly<{
@@ -204,7 +147,6 @@ export interface AgentRunState {
   readonly providerRequests: readonly AgentProviderPhase[];
   readonly toolBatches: readonly AgentToolPhase[];
   readonly toolCalls: readonly ToolCall[];
-  readonly revisionInstructions: readonly string[];
   readonly budget?: AgentRunBudgetState;
 }
 
@@ -222,14 +164,6 @@ export type AgentRunProcedure =
   | 'record_tool_observation'
   | 'record_tool_delivery'
   | 'advance_after_tools'
-  | 'plan_check'
-  | 'start_verification'
-  | 'reconcile_verification'
-  | 'consume_verification_settlement'
-  | 'plan_disposition'
-  | 'start_disposition'
-  | 'reconcile_disposition'
-  | 'consume_disposition'
   | 'finalize'
   | 'reconcile_finalization'
   | 'finalize_abort';
@@ -268,25 +202,6 @@ export function nextAgentRunInstruction(state: AgentRunState): AgentRunInstructi
       });
     case 'active':
       return activeInstructions(state)[0] ?? Object.freeze({ kind: 'wait', reason: 'external_outcome' });
-    case 'verification':
-      if (state.phase.stage === 'ready') return Object.freeze({ kind: 'execute', procedure: 'plan_check' });
-      if (state.phase.stage === 'effect_ready')
-        return Object.freeze({ kind: 'execute', procedure: 'start_verification' });
-      if (state.phase.stage === 'effect_pending')
-        return Object.freeze({ kind: 'execute', procedure: 'reconcile_verification' });
-      if (state.phase.stage === 'deterministic_pending')
-        return Object.freeze({ kind: 'execute', procedure: 'reconcile_verification' });
-      return Object.freeze({ kind: 'execute', procedure: 'consume_verification_settlement' });
-    case 'disposition':
-      if (state.phase.stage === 'ready')
-        return Object.freeze({ kind: 'execute', procedure: 'plan_disposition' });
-      if (state.phase.stage === 'effect_ready')
-        return Object.freeze({ kind: 'execute', procedure: 'start_disposition' });
-      if (state.phase.stage === 'effect_pending')
-        return Object.freeze({ kind: 'execute', procedure: 'reconcile_disposition' });
-      if (state.phase.stage === 'outcome_unknown')
-        return Object.freeze({ kind: 'wait', reason: 'external_outcome' });
-      return Object.freeze({ kind: 'execute', procedure: 'consume_disposition' });
     case 'finalization':
       return Object.freeze({
         kind: 'execute',
@@ -410,7 +325,8 @@ export function providerWork(
   target: Pick<AgentProviderTarget, 'turnId' | 'requestAttempt'>
 ): AgentProviderPhase {
   const request = state.providerRequests.find(
-    (item) => item.identity.turnId === target.turnId && item.identity.requestAttempt === target.requestAttempt
+    (item) =>
+      item.identity.turnId === target.turnId && item.identity.requestAttempt === target.requestAttempt
   );
   if (!request) throw new TypeError('Provider target does not identify retained work.');
   return request;
@@ -428,7 +344,10 @@ export function outstandingToolObligations(state: AgentRunState): readonly Reado
   return Object.freeze(
     state.toolBatches.flatMap((batch) =>
       batch.callStates.flatMap((call, callIndex) => {
-        if (call.stage === 'cancelled' || (call.stage === 'recorded' && call.delivery?.status === 'applied'))
+        if (
+          call.stage === 'cancelled' ||
+          (call.stage === 'recorded' && call.delivery?.status === 'applied')
+        )
           return [];
         const modelCall = batch.modelCalls[callIndex];
         return [
@@ -470,7 +389,6 @@ export function decodeAgentRunState(value: unknown): AgentRunState {
     'providerRequests',
     'toolBatches',
     'toolCalls',
-    'revisionInstructions',
     'budget'
   ]);
   const input = decodeInput(state.input);
@@ -508,7 +426,6 @@ export function decodeAgentRunState(value: unknown): AgentRunState {
     effectIds.add(effect.intent.effectId);
   }
   const toolCalls = Object.freeze(array(state.toolCalls, 'toolCalls').map((call) => decodeToolCall(call)));
-  const revisionInstructions = stringArray(state.revisionInstructions, 'revisionInstructions');
   const budget = state.budget === undefined ? undefined : decodeBudget(state.budget);
   const runId = identifier(state.runId, 'runId');
   const revision = nonnegativeInteger(state.revision, 'revision');
@@ -534,7 +451,6 @@ export function decodeAgentRunState(value: unknown): AgentRunState {
     providerRequests,
     toolBatches,
     toolCalls,
-    revisionInstructions,
     ...(budget === undefined ? {} : { budget })
   });
 }
@@ -559,60 +475,18 @@ function decodeConfiguration(value: unknown): AgentRunControlConfiguration {
     'model',
     'runtimeImplementationId',
     'toolImplementationIds',
-    'checks',
-    'disposition',
     'policyHash'
   ]);
-  const disposition = object(configuration.disposition, 'disposition configuration');
-  exact(disposition, ['implementationId', 'policyIdentity', 'policyHash']);
-  const dispositionPolicyIdentity = parseJsonValue(disposition.policyIdentity);
-  const dispositionPolicyHash = digest(disposition.policyHash, 'disposition.policyHash');
-  if (hashJson(dispositionPolicyIdentity) !== dispositionPolicyHash)
-    throw new TypeError('disposition.policyHash does not match disposition.policyIdentity.');
   return Object.freeze({
     providerId: identifier(configuration.providerId, 'providerId'),
-    providerImplementationId: identifier(configuration.providerImplementationId, 'providerImplementationId'),
+    providerImplementationId: identifier(
+      configuration.providerImplementationId,
+      'providerImplementationId'
+    ),
     model: nonempty(configuration.model, 'model'),
     runtimeImplementationId: identifier(configuration.runtimeImplementationId, 'runtimeImplementationId'),
     toolImplementationIds: uniqueIdentifiers(configuration.toolImplementationIds, 'toolImplementationIds'),
-    checks: checkBindings(configuration.checks),
-    disposition: Object.freeze({
-      implementationId: identifier(disposition.implementationId, 'disposition.implementationId'),
-      policyIdentity: dispositionPolicyIdentity,
-      policyHash: dispositionPolicyHash
-    }),
     policyHash: nonempty(configuration.policyHash, 'policyHash')
-  });
-}
-
-function checkBindings(
-  value: unknown
-): readonly { readonly id: string; readonly implementationId: string }[] {
-  if (!Array.isArray(value)) throw new TypeError('checks must be an array.');
-  const ids = new Set<string>();
-  return Object.freeze(
-    value.map((entry, index) => {
-      const object = parseJsonObject(entry);
-      exact(object, ['id', 'implementationId']);
-      const id = identifier(object.id, `checks[${String(index)}].id`);
-      if (ids.has(id)) throw new TypeError(`checks contains duplicate id: ${id}`);
-      ids.add(id);
-      return Object.freeze({
-        id,
-        implementationId: identifier(object.implementationId, `checks[${String(index)}].implementationId`)
-      });
-    })
-  );
-}
-
-function decodeCheckPreparation(value: unknown): AgentCheckEffectPlanRecord {
-  const plan = object(value, 'verification plan');
-  exact(plan, ['checkImplementationId', 'fingerprint', 'authorization', 'recovery']);
-  return Object.freeze({
-    checkImplementationId: identifier(plan.checkImplementationId, 'verification plan checkImplementationId'),
-    fingerprint: digest(plan.fingerprint, 'verification plan fingerprint'),
-    authorization: parseJsonValue(plan.authorization),
-    recovery: decodeEffectRecoveryCapability(plan.recovery)
   });
 }
 
@@ -645,17 +519,7 @@ function decodePhase(value: unknown): AgentRunControlPhase {
   const phase = object(value, 'run phase');
   const kind = enumeration(
     phase.kind,
-    [
-      'accepted',
-      'initializing',
-      'active',
-      'verification',
-      'disposition',
-      'finalization',
-      'suspended',
-      'cancelling',
-      'terminal'
-    ] as const,
+    ['accepted', 'initializing', 'active', 'finalization', 'suspended', 'cancelling', 'terminal'] as const,
     'phase.kind'
   );
   switch (kind) {
@@ -672,75 +536,6 @@ function decodePhase(value: unknown): AgentRunControlPhase {
     case 'active':
       exact(phase, ['kind']);
       return Object.freeze({ kind });
-    case 'verification': {
-      exact(phase, [
-        'kind',
-        'stage',
-        'identity',
-        'providerSettlementEventId',
-        'checkIds',
-        'nextCheckIndex',
-        'plan',
-        'effect',
-        'result'
-      ]);
-      const identity = decodeTurnIdentity(phase.identity);
-      const providerSettlementEventId = identifier(
-        phase.providerSettlementEventId,
-        'phase.providerSettlementEventId'
-      );
-      const checkIds = uniqueIdentifiers(phase.checkIds, 'phase.checkIds');
-      const nextCheckIndex = nonnegativeInteger(phase.nextCheckIndex, 'phase.nextCheckIndex');
-      if (nextCheckIndex > checkIds.length)
-        throw new TypeError('phase.nextCheckIndex exceeds phase.checkIds length.');
-      const stage = enumeration(
-        phase.stage,
-        ['ready', 'deterministic_pending', 'effect_ready', 'effect_pending', 'settled', 'complete'] as const,
-        'phase.stage'
-      );
-      const base = { kind, identity, providerSettlementEventId, checkIds, nextCheckIndex } as const;
-      if (stage === 'complete') {
-        if (nextCheckIndex !== checkIds.length)
-          throw new TypeError('Complete verification must consume every check.');
-        return Object.freeze({ ...base, stage });
-      }
-      if (nextCheckIndex >= checkIds.length)
-        throw new TypeError(`Verification ${stage} requires a current check.`);
-      if (stage === 'ready' || stage === 'deterministic_pending') return Object.freeze({ ...base, stage });
-      if (stage === 'effect_ready') {
-        const plan = decodeCheckPreparation(phase.plan);
-        const effect = decodeEffectExecutionState(phase.effect);
-        if (effect.phase !== 'ticket_issued')
-          throw new TypeError('Verification effect_ready has an invalid effect state.');
-        if (
-          effect.intent.implementationId !== plan.checkImplementationId ||
-          effect.intent.parametersDigest !== plan.fingerprint
-        )
-          throw new TypeError('Verification effect does not match its plan.');
-        return Object.freeze({ ...base, stage, plan, effect });
-      }
-      if (stage === 'effect_pending') {
-        const plan = decodeCheckPreparation(phase.plan);
-        const effect = decodeEffectExecutionState(phase.effect);
-        if (effect.phase !== 'started')
-          throw new TypeError('Verification effect_pending has an invalid effect state.');
-        if (
-          effect.intent.implementationId !== plan.checkImplementationId ||
-          effect.intent.parametersDigest !== plan.fingerprint
-        )
-          throw new TypeError('Verification effect does not match its plan.');
-        return Object.freeze({ ...base, stage, plan, effect });
-      }
-      const result = decodeOwnedAgentCheckResult(object(phase.result, 'phase.result'));
-      if (result.id !== checkIds[nextCheckIndex])
-        throw new TypeError('Settled verification result does not match the current check.');
-      const effect = phase.effect === undefined ? undefined : decodeEffectExecutionState(phase.effect);
-      if (effect !== undefined && effect.phase !== 'settled' && effect.phase !== 'closed')
-        throw new TypeError('Settled verification retains an invalid effect state.');
-      return Object.freeze({ ...base, stage, result, ...(effect ? { effect } : {}) });
-    }
-    case 'disposition':
-      return decodeDispositionPhase(phase);
     case 'finalization': {
       exact(phase, ['kind', 'stage', 'terminalEventId']);
       const terminalEventId = optionalIdentifier(phase.terminalEventId, 'phase.terminalEventId');
@@ -761,7 +556,6 @@ function decodePhase(value: unknown): AgentRunControlPhase {
           'approval',
           'provider_outcome_unknown',
           'tool_outcome_unknown',
-          'disposition_outcome_unknown',
           'missing_implementation',
           'user_decision'
         ] as const,
@@ -861,7 +655,8 @@ export function decodeProviderPhase(value: unknown): AgentProviderPhase {
       throw new TypeError('A settled provider phase requires effect and response settlement.');
     return Object.freeze({ ...base, stage, requestEventId, responseId, effect, settlementEventId });
   }
-  if (effect.phase !== 'closed') throw new TypeError('An unknown provider outcome requires a closed effect.');
+  if (effect.phase !== 'closed')
+    throw new TypeError('An unknown provider outcome requires a closed effect.');
   return Object.freeze({ ...base, stage, requestEventId, responseId, effect });
 }
 
@@ -882,7 +677,8 @@ function decodeDecisionRequest(value: unknown): AgentDecisionRequest {
 function decodeDecisionContinuation(value: unknown): AgentDecisionContinuation {
   const continuation = object(value, 'decision continuation');
   exact(continuation, ['kind', 'blockedProvider']);
-  if (continuation.kind !== 'cancelled_provider_start') throw new TypeError('Unknown decision continuation.');
+  if (continuation.kind !== 'cancelled_provider_start')
+    throw new TypeError('Unknown decision continuation.');
   const blockedProvider = object(continuation.blockedProvider, 'blocked provider continuation');
   exact(blockedProvider, ['kind', 'identity', 'toolBatchId', 'requestEventId', 'responseId', 'effect']);
   if (blockedProvider.kind !== 'provider')
@@ -967,7 +763,9 @@ function positiveInteger(value: unknown, name: string): number {
   return value;
 }
 function stringArray(value: unknown, name: string): readonly string[] {
-  return Object.freeze(array(value, name).map((item, index) => nonempty(item, `${name}[${String(index)}]`)));
+  return Object.freeze(
+    array(value, name).map((item, index) => nonempty(item, `${name}[${String(index)}]`))
+  );
 }
 function uniqueIdentifiers(value: unknown, name: string): readonly string[] {
   const items = Object.freeze(
@@ -976,7 +774,11 @@ function uniqueIdentifiers(value: unknown, name: string): readonly string[] {
   if (new Set(items).size !== items.length) throw new TypeError(`${name} contains duplicate identities.`);
   return items;
 }
-function enumeration<const T extends readonly string[]>(value: unknown, values: T, name: string): T[number] {
+function enumeration<const T extends readonly string[]>(
+  value: unknown,
+  values: T,
+  name: string
+): T[number] {
   if (!oneOf(value, values)) throw new TypeError(`${name} is invalid.`);
   return value;
 }

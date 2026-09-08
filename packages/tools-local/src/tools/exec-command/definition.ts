@@ -2,15 +2,15 @@ import {
   defineTool,
   isCommandExecution,
   planCommandExecution,
-  requireToolService,
   releaseCommandExecutionPlan,
+  requireToolService,
   startCommandExecutionPlan,
   type CommandExecution,
   type CommandExecutionOwner
 } from '@agent-core/tools';
-import { fileScope, processScope } from '../../core/resources.js';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
 import { presentProcessObservation } from '../../core/presenters.js';
+import { fileScope, processScope } from '../../core/resources.js';
 import { requireRootedFileAuthority } from '../../core/rooted-files.js';
 import { isSuccessfulProcessResult } from '../process-output.js';
 import { execCommandOutputSchema, execCommandSchema } from './schema.js';
@@ -32,10 +32,17 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
       const directory = await root.openDirectory(workdir);
       await directory.close();
       const limits = requireLocalToolConfiguration(context).process;
-      const executor = requireToolService<CommandExecution>(context, 'commandExecution', isCommandExecution, 'CommandExecution');
-      const owner = processOwner(context.invocation);
+      const executor = requireToolService<CommandExecution>(
+        context,
+        'commandExecution',
+        isCommandExecution,
+        'CommandExecution'
+      );
+      const owner = processOwner(context);
       const request = Object.freeze({
-        ...input, pty: 'pty' in input && input.pty === true, workdir,
+        ...input,
+        pty: 'pty' in input && input.pty === true,
+        workdir,
         yieldMs: clampRequestedLimit(input.yieldMs, limits.maxYieldMs),
         timeoutMs: clampRequestedLimit(input.timeoutMs, limits.maxTimeoutMs),
         outputTokenBudget: clampRequestedLimit(input.outputTokenBudget, limits.maxOutputTokens),
@@ -65,27 +72,53 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
       });
     },
     deriveEffects() {
-      return { accesses: [{ mode: 'execute', scope: processScope() }], lockScopes: [fileScope()], recovery: { kind: 'unknown' } };
+      return {
+        accesses: [{ mode: 'execute', scope: processScope() }],
+        lockScopes: [fileScope()],
+        recovery: { kind: 'unknown' }
+      };
     },
     async invoke(input, context) {
-      await context.emitProgress?.({ type: 'status', stage: 'process_starting', message: 'Starting command.' });
+      await context.emitProgress?.({
+        type: 'status',
+        stage: 'process_starting',
+        message: 'Starting command.'
+      });
       let result;
       try {
         result = await startCommandExecutionPlan(input.executor, input.reservation, {
-          ...(context.signal ? { signal: context.signal } : {}), ...(context.resourceLease ? { lease: context.resourceLease } : {}),
+          ...(context.signal ? { signal: context.signal } : {}),
+          ...(context.resourceLease ? { lease: context.resourceLease } : {}),
           onProgress: (progress) => context.emitProgress?.(progress)
         });
       } catch (error) {
-        await context.emitProgress?.({ type: 'status', stage: 'process_failed', message: error instanceof Error ? error.message : String(error) });
+        await context.emitProgress?.({
+          type: 'status',
+          stage: 'process_failed',
+          message: error instanceof Error ? error.message : String(error)
+        });
         throw error;
       }
       return {
-        kind: 'result' as const, ok: isSuccessfulProcessResult(result),
-        summary: result.status === 'running' ? 'Process continues as ' + result.processId + '.' : 'Process ' + result.status + (result.exitCode === undefined ? '' : ' with exit code ' + String(result.exitCode)) + '.',
+        kind: 'result' as const,
+        ok: isSuccessfulProcessResult(result),
+        summary:
+          result.status === 'running'
+            ? 'Process continues as ' + result.processId + '.'
+            : 'Process ' +
+              result.status +
+              (result.exitCode === undefined ? '' : ' with exit code ' + String(result.exitCode)) +
+              '.',
         scope: {
           resources: [processScope(result.processId), fileScope(input.workdir)],
           coverage: result.combined.omittedBytes > 0 ? 'partial' : 'complete',
-          ...(result.combined.omittedBytes > 0 ? { truncated: true, causes: ['output_budget'], omitted: { bytes: result.combined.omittedBytes } } : {})
+          ...(result.combined.omittedBytes > 0
+            ? {
+                truncated: true,
+                causes: ['output_budget'],
+                omitted: { bytes: result.combined.omittedBytes }
+              }
+            : {})
         },
         ...(result.artifact ? { content: [{ type: 'artifact' as const, artifact: result.artifact }] } : {}),
         output: result
@@ -94,7 +127,14 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
   });
 }
 export const execCommandTool = createExecCommandTool();
-function processOwner(invocation: import('@agent-core/tools').ToolInvocationContext | undefined): CommandExecutionOwner {
+function processOwner(context: import('@agent-core/tools').ToolExecutionContext): CommandExecutionOwner {
+  const invocation = context.invocation;
   if (!invocation) throw new Error('Process tools require a runtime invocation owner.');
-  return Object.freeze({ runId: invocation.runId, turnId: invocation.turnId, toolBatchId: invocation.toolBatchId, callIndex: invocation.callIndex });
+  return Object.freeze({
+    ownerId: context.resourceOwnerId ?? invocation.runId,
+    runId: invocation.runId,
+    turnId: invocation.turnId,
+    toolBatchId: invocation.toolBatchId,
+    callIndex: invocation.callIndex
+  });
 }

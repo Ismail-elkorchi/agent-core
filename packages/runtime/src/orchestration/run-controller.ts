@@ -2,6 +2,7 @@ import { canonicalJsonString } from '@agent-core/json';
 import { calculateInferenceCost } from '../inference/usage-cost.js';
 
 import type { ModelPricing, ModelUsage } from '@agent-core/model';
+import type { ToolCall } from '@agent-core/tools';
 import {
   systemAgentClock,
   validateAgentRunLimits,
@@ -11,7 +12,6 @@ import {
   type AgentRunLimits,
   type AgentRunPhase
 } from '../run/contracts.js';
-import type { ToolCall } from '@agent-core/tools';
 
 export class AgentLimitExceededError extends Error {
   readonly attempted: number;
@@ -58,7 +58,6 @@ export class AgentRunController {
     modelTurns: 0,
     totalToolCalls: 0,
     repeatedIdenticalToolCalls: 0,
-    revisionAttempts: 0,
     promptTokens: 0,
     completionTokens: 0,
     cacheReadTokens: 0,
@@ -135,13 +134,10 @@ export class AgentRunController {
     if (previous === next) return;
     const allowed =
       (previous === 'initializing' && (next === 'requesting_model' || next === 'finalizing')) ||
-      (previous === 'requesting_model' &&
-        (next === 'executing_tools' || next === 'verifying' || next === 'finalizing')) ||
+      (previous === 'requesting_model' && (next === 'executing_tools' || next === 'finalizing')) ||
       (previous === 'executing_tools' &&
         (next === 'waiting_for_approval' || next === 'requesting_model' || next === 'finalizing')) ||
       (previous === 'waiting_for_approval' && (next === 'executing_tools' || next === 'finalizing')) ||
-      (previous === 'verifying' && (next === 'deciding' || next === 'finalizing')) ||
-      (previous === 'deciding' && (next === 'requesting_model' || next === 'finalizing')) ||
       (previous === 'finalizing' && next === 'ended');
     if (!allowed) throw new Error(`Illegal run transition: ${previous} -> ${next}.`);
     this.currentPhase = next;
@@ -162,24 +158,6 @@ export class AgentRunController {
       );
     }
     this.state = { ...this.state, modelTurns: this.state.modelTurns + 1 };
-  }
-
-  recordRevisionAttempt(): void {
-    this.assertElapsed();
-    const previous = this.snapshot();
-    const revisions = this.state.revisionAttempts + 1;
-    if (revisions > this.limits.revisionAttempts) {
-      throw this.limitError(
-        'revision_attempts',
-        revisions,
-        this.limits.revisionAttempts,
-        1,
-        previous,
-        { ...previous, revisionAttempts: revisions },
-        false
-      );
-    }
-    this.state = { ...this.state, revisionAttempts: revisions };
   }
 
   recordToolCalls(calls: readonly ToolCall[]): void {

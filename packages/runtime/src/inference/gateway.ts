@@ -1,4 +1,5 @@
 import {
+  createModelRequest,
   parseModelResponse,
   parseModelStreamEvent,
   type ModelProfile,
@@ -35,6 +36,7 @@ export class InferenceGateway {
   }
 
   async compile(request: ModelRequest, profile: ModelProfile): Promise<CompiledModelRequest> {
+    request = createModelRequest(request);
     request.signal?.throwIfAborted();
     if (profile.provider !== this.provider.id || request.model !== profile.id)
       throw new Error('Inference profile does not match its provider and model.');
@@ -45,7 +47,7 @@ export class InferenceGateway {
       : await compileModelRequest({
           request,
           profile,
-          body: JSON.parse(JSON.stringify(body)) as unknown,
+          body,
           endpoint: profile.capabilities.protocol?.endpoint ?? this.provider.id
         });
     if (
@@ -89,7 +91,8 @@ export class InferenceGateway {
     try {
       for await (const rawEvent of stream()) {
         const event = parseModelStreamEvent(rawEvent);
-        if (terminalEvents > 0) throw new Error('Provider stream emitted an event after its terminal event.');
+        if (terminalEvents > 0)
+          throw new Error('Provider stream emitted an event after its terminal event.');
         if (event.type === 'done') {
           terminalEvents += 1;
           response = event.response;
