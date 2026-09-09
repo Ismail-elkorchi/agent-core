@@ -35,6 +35,52 @@ export interface SessionDescriptor {
   readonly leafId: string | null;
 }
 
+export interface SessionBranchBoundary {
+  readonly sessionId: string;
+  readonly leafId: string | null;
+  readonly leafHash: string | null;
+}
+
+export interface SessionBranchCursor {
+  readonly boundary: SessionBranchBoundary;
+  /** First not-yet-returned ancestor, inclusive. */
+  readonly entryId: string;
+}
+
+interface SessionBranchReadLimits {
+  readonly limit?: number;
+  readonly maxBytes?: number;
+}
+
+type SessionBranchReadPosition =
+  | { readonly leafId?: string | null; readonly cursor?: never }
+  | { readonly cursor: SessionBranchCursor; readonly leafId?: never };
+
+export type SessionBranchPageRequest = SessionBranchReadLimits &
+  SessionBranchReadPosition & {
+    readonly direction?: 'older' | 'newer';
+  };
+
+export interface SessionBranchPage {
+  readonly boundary: SessionBranchBoundary;
+  readonly entries: readonly SessionBranchEntry[];
+  readonly older?: SessionBranchCursor;
+  readonly newer?: SessionBranchCursor;
+}
+
+export type SessionBranchSearchRequest = SessionBranchReadLimits &
+  SessionBranchReadPosition & {
+    /** Literal, case-sensitive text. Search cursors retain the exact query. */
+    readonly query: string;
+    readonly cursor?: SessionBranchCursor & { readonly query: string };
+  };
+
+export interface SessionBranchSearchResult {
+  readonly boundary: SessionBranchBoundary;
+  readonly matches: readonly { readonly entryId: string; readonly excerpt: string }[];
+  readonly older?: SessionBranchCursor & { readonly query: string };
+}
+
 export type BaseSessionEntry = Readonly<{
   readonly id: string;
   readonly parentId: string | null;
@@ -187,13 +233,9 @@ export type SessionQueuedSubmission = Readonly<{
   readonly configuration: SessionSubmissionConfiguration;
 }>;
 
-export type SessionSubmissionState = 'claimed' | 'suspended' | 'completed' | 'failed';
+export type SessionSubmissionState = 'claimed' | 'suspended' | 'completed' | 'failed' | 'cancelled';
 
-export type SessionSuspensionCategory =
-  | 'approval'
-  | 'external_recovery'
-  | 'implementation'
-  | 'user_decision';
+export type SessionSuspensionCategory = 'approval' | 'external_recovery' | 'implementation' | 'user_decision';
 export type SessionSuspensionAction = 'approval' | 'reconcile' | 'resume' | 'decide' | 'abort';
 export interface SessionSuspensionDescriptor {
   readonly runId: string;
@@ -224,7 +266,21 @@ export type SessionSubmissionTransition =
   | (SessionSubmissionTransitionBase &
       Readonly<{ readonly type: 'submission.failed'; readonly errorMessage: string }>);
 
-export type SessionSubmissionRecord = SessionQueuedSubmission | SessionSubmissionTransition;
+export type SessionSubmissionUpdate = SessionSubmissionTransitionBase &
+  (
+    | { readonly type: 'submission.revised'; readonly input: SessionSubmissionInput }
+    | { readonly type: 'submission.cancelled' }
+  );
+
+export type SessionQueuedSubmissionChange = { readonly expectedInput: SessionSubmissionInput } & (
+  | { readonly kind: 'replace'; readonly input: SessionSubmissionInput }
+  | { readonly kind: 'cancel' }
+);
+
+export type SessionSubmissionRecord =
+  | SessionQueuedSubmission
+  | SessionSubmissionTransition
+  | SessionSubmissionUpdate;
 
 export interface SessionPendingSubmission {
   readonly submissionId: string;
@@ -353,4 +409,19 @@ export interface SessionRepository {
       | { readonly state: 'failed'; readonly errorMessage: string }
   ): Promise<void>;
   loadPendingSubmissions(session: SessionDescriptor): Promise<readonly SessionPendingSubmission[]>;
+  updateQueuedSubmission(
+    session: SessionDescriptor,
+    submissionId: string,
+    change: SessionQueuedSubmissionChange
+  ): Promise<void>;
+  readBranchPage(session: SessionDescriptor, request?: SessionBranchPageRequest): Promise<SessionBranchPage>;
+  searchBranch(
+    session: SessionDescriptor,
+    request: SessionBranchSearchRequest
+  ): Promise<SessionBranchSearchResult>;
+  readBranchEntry(
+    session: SessionDescriptor,
+    boundary: SessionBranchBoundary,
+    entryId: string
+  ): Promise<SessionBranchEntry>;
 }

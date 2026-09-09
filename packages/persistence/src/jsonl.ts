@@ -1,7 +1,6 @@
+import type { JsonValue } from '@agent-core/json';
 import { canonicalJsonString } from '@agent-core/json';
 import { promises as fs } from 'node:fs';
-import type { JsonValue } from '@agent-core/json';
-
 
 const SCAN_CHUNK_BYTES = 64 * 1024;
 
@@ -79,15 +78,28 @@ export async function readJsonlBytes(filePath: string, offset: number, length: n
 }
 
 /** Streams complete JSONL lines with bounded retained memory. Offsets must be record boundaries. */
-export async function* readJsonlLines(filePath: string, options: JsonlLineReadOptions = {}): AsyncIterable<JsonlLine> {
+export async function* readJsonlLines(
+  filePath: string,
+  options: JsonlLineReadOptions = {}
+): AsyncIterable<JsonlLine> {
   const startOffset = options.startOffset ?? 0;
   const firstLine = options.firstLine ?? 1;
-  const endOffset = options.endOffset ?? await jsonlCommittedBytes(filePath);
+  const endOffset = options.endOffset ?? (await jsonlCommittedBytes(filePath));
   const maxLineBytes = options.maxLineBytes ?? 8_500_000;
-  if (!Number.isSafeInteger(startOffset) || startOffset < 0 || !Number.isSafeInteger(endOffset) || endOffset < startOffset) {
+  if (
+    !Number.isSafeInteger(startOffset) ||
+    startOffset < 0 ||
+    !Number.isSafeInteger(endOffset) ||
+    endOffset < startOffset
+  ) {
     throw new RangeError('JSONL stream offsets are invalid.');
   }
-  if (!Number.isSafeInteger(firstLine) || firstLine < 1 || !Number.isSafeInteger(maxLineBytes) || maxLineBytes < 1) {
+  if (
+    !Number.isSafeInteger(firstLine) ||
+    firstLine < 1 ||
+    !Number.isSafeInteger(maxLineBytes) ||
+    maxLineBytes < 1
+  ) {
     throw new RangeError('JSONL stream bounds are invalid.');
   }
   const handle = await fs.open(filePath, 'r');
@@ -101,14 +113,25 @@ export async function* readJsonlLines(filePath: string, options: JsonlLineReadOp
       const { bytesRead } = await handle.read(chunk, 0, length, cursor);
       if (bytesRead === 0) throw new Error(`JSONL file ended before committed offset ${String(endOffset)}.`);
       cursor += bytesRead;
-      pending = pending.length === 0 ? chunk.subarray(0, bytesRead) : Buffer.concat([pending, chunk.subarray(0, bytesRead)]);
-      if (pending.length > maxLineBytes && pending.indexOf(10) < 0) throw new Error(`JSONL line exceeds ${String(maxLineBytes)} bytes.`);
+      pending =
+        pending.length === 0
+          ? chunk.subarray(0, bytesRead)
+          : Buffer.concat([pending, chunk.subarray(0, bytesRead)]);
+      if (pending.length > maxLineBytes && pending.indexOf(10) < 0)
+        throw new Error(`JSONL line exceeds ${String(maxLineBytes)} bytes.`);
       let start = 0;
       for (;;) {
         const newline = pending.indexOf(10, start);
         if (newline < 0) break;
+        if (newline - start > maxLineBytes)
+          throw new Error(`JSONL line exceeds ${String(maxLineBytes)} bytes.`);
         const byteOffset = cursor - pending.length + start;
-        yield Object.freeze({ text: pending.subarray(start, newline).toString('utf8'), line, byteOffset, terminated: true });
+        yield Object.freeze({
+          text: pending.subarray(start, newline).toString('utf8'),
+          line,
+          byteOffset,
+          terminated: true
+        });
         line += 1;
         start = newline + 1;
       }

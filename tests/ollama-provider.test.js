@@ -62,7 +62,11 @@ test('OllamaProvider maps the full chat surface and normalizes streamed response
   const toolCall = { function: { name: 'read_files', arguments: { files: [{ path: 'package.json' }] } } };
   const client = new FakeOllamaClient([
     { model: 'llama3.1', message: { role: 'assistant', content: '{"ok":' }, done: false },
-    { model: 'llama3.1', message: { role: 'assistant', content: 'true', thinking: 'checking', tool_calls: [toolCall] }, done: false },
+    {
+      model: 'llama3.1',
+      message: { role: 'assistant', content: 'true', thinking: 'checking', tool_calls: [toolCall] },
+      done: false
+    },
     {
       model: 'llama3.1',
       message: { role: 'assistant', content: '}', tool_calls: [toolCall] },
@@ -165,11 +169,17 @@ test('OllamaProvider stream emits reasoning deltas when the wire response has th
   const provider = new OllamaProvider({ clientFactory: () => client });
 
   const events = [];
-  for await (const event of provider.stream({ model: 'llama3.1', messages: [{ role: 'user', content: 'hi' }] })) {
+  for await (const event of provider.stream({
+    model: 'llama3.1',
+    messages: [{ role: 'user', content: 'hi' }]
+  })) {
     events.push(event);
   }
 
-  assert.deepEqual(events.filter((event) => event.type === 'reasoning').map((event) => event.reasoning), ['plan']);
+  assert.deepEqual(
+    events.filter((event) => event.type === 'reasoning').map((event) => event.reasoning),
+    ['plan']
+  );
   assert.equal(events.at(-1).response.reasoning, 'plan');
 });
 
@@ -177,16 +187,29 @@ test('OllamaProvider stream emits content deltas and final response', async () =
   const client = new FakeOllamaClient([
     { model: 'llama3.1', message: { role: 'assistant', content: 'hel' }, done: false },
     { model: 'llama3.1', message: { role: 'assistant', content: 'lo' }, done: false },
-    { model: 'llama3.1', message: { role: 'assistant', content: '' }, done: true, prompt_eval_count: 1, eval_count: 2 }
+    {
+      model: 'llama3.1',
+      message: { role: 'assistant', content: '' },
+      done: true,
+      prompt_eval_count: 1,
+      eval_count: 2
+    }
   ]);
   const provider = new OllamaProvider({ clientFactory: () => client });
 
   const events = [];
-  for await (const event of provider.stream({ model: 'llama3.1', messages: [{ role: 'user', content: 'hi' }], responseFormat: 'json' })) {
+  for await (const event of provider.stream({
+    model: 'llama3.1',
+    messages: [{ role: 'user', content: 'hi' }],
+    responseFormat: 'json'
+  })) {
     events.push(event);
   }
 
-  assert.deepEqual(events.filter((event) => event.type === 'content').map((event) => event.content), ['hel', 'lo']);
+  assert.deepEqual(
+    events.filter((event) => event.type === 'content').map((event) => event.content),
+    ['hel', 'lo']
+  );
   assert.equal(events.at(-1).type, 'done');
   assert.equal(events.at(-1).response.content, 'hello');
   assert.equal(client.requests[0].format, 'json');
@@ -200,13 +223,18 @@ test('OllamaProvider aborts active streamed requests when signal aborts', async 
   ]);
   const provider = new OllamaProvider({ clientFactory: () => client });
   const controller = new AbortController();
-  const iterator = provider.stream({ model: 'llama3.1', messages: [{ role: 'user', content: 'hi' }], signal: controller.signal })[Symbol.asyncIterator]();
+  const iterator = provider
+    .stream({ model: 'llama3.1', messages: [{ role: 'user', content: 'hi' }], signal: controller.signal })
+    [Symbol.asyncIterator]();
 
   const first = await iterator.next();
   assert.equal(first.value.type, 'content');
   controller.abort('stop now');
 
-  await assert.rejects(() => iterator.next(), (error) => error.code === 'aborted' && /stop now/.test(error.message));
+  await assert.rejects(
+    () => iterator.next(),
+    (error) => error.code === 'aborted' && /stop now/.test(error.message)
+  );
   assert.equal(client.abortCount, 1);
 });
 
@@ -227,10 +255,12 @@ test('OllamaProvider uses request-scoped clients for concurrent stream aborts', 
   const provider = new OllamaProvider({ clientFactory: () => clients[nextClient++] });
   const controller = new AbortController();
 
-  const firstIterator = provider.stream({ model: 'llama3.1', messages: [{ role: 'user', content: 'first' }], signal: controller.signal })[
-    Symbol.asyncIterator
-  ]();
-  const secondIterator = provider.stream({ model: 'llama3.1', messages: [{ role: 'user', content: 'second' }] })[Symbol.asyncIterator]();
+  const firstIterator = provider
+    .stream({ model: 'llama3.1', messages: [{ role: 'user', content: 'first' }], signal: controller.signal })
+    [Symbol.asyncIterator]();
+  const secondIterator = provider
+    .stream({ model: 'llama3.1', messages: [{ role: 'user', content: 'second' }] })
+    [Symbol.asyncIterator]();
 
   const first = await firstIterator.next();
   assert.equal(first.value.type, 'content');
@@ -238,7 +268,10 @@ test('OllamaProvider uses request-scoped clients for concurrent stream aborts', 
   assert.equal(second.value.type, 'content');
   controller.abort('stop first');
 
-  await assert.rejects(() => firstIterator.next(), (error) => error.code === 'aborted');
+  await assert.rejects(
+    () => firstIterator.next(),
+    (error) => error.code === 'aborted'
+  );
   const secondDone = await secondIterator.next();
 
   assert.equal(clients[1].abortCount, 1);
@@ -284,10 +317,15 @@ test('OllamaProvider classifies response errors', async () => {
 });
 
 test('OllamaProvider decodes injected client output before trusting nested fields', async () => {
-  const provider = new OllamaProvider({ clientFactory: () => new FakeOllamaClient([{ model: 'llama3.1', message: { content: 42 }, done: true }]) });
+  const provider = new OllamaProvider({
+    clientFactory: () => new FakeOllamaClient([{ model: 'llama3.1', message: { content: 42 }, done: true }])
+  });
   await assert.rejects(
     () => provider.complete({ model: 'llama3.1', messages: [{ role: 'user', content: 'hi' }] }),
-    error => error instanceof ModelProviderError && error.code === 'malformed_response' && /message\.content/u.test(error.message)
+    (error) =>
+      error instanceof ModelProviderError &&
+      error.code === 'malformed_response' &&
+      /message\.content/u.test(error.message)
   );
 });
 
@@ -296,7 +334,12 @@ test('OllamaProvider treats unsupported tool models as invalid requests', async 
   const provider = new OllamaProvider({ clientFactory: () => new FakeOllamaClient(unsupported) });
 
   await assert.rejects(
-    () => provider.complete({ model: 'gemma3:270m', messages: [{ role: 'user', content: 'hi' }], tools: [{ type: 'function', function: { name: 'read_files' } }] }),
+    () =>
+      provider.complete({
+        model: 'gemma3:270m',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [{ type: 'function', function: { name: 'read_files' } }]
+      }),
     (error) => error.code === 'invalid_request' && error.retryable === false
   );
 });
@@ -307,24 +350,36 @@ test('OllamaProvider default client does not inject an unbounded timeout dispatc
   globalThis.fetch = async (input, init) => {
     requests.push(init);
     if (String(input).includes('/api/show')) {
-      return new Response(JSON.stringify({ capabilities: ['completion'], model_info: { 'test.context_length': 32768 } }), {
-        headers: { 'content-type': 'application/json' }
-      });
+      return new Response(
+        JSON.stringify({ capabilities: ['completion'], model_info: { 'test.context_length': 32768 } }),
+        {
+          headers: { 'content-type': 'application/json' }
+        }
+      );
     }
-    return new Response(`${JSON.stringify({ model: 'llama3.1', message: { role: 'assistant', content: 'ok' }, done: true })}\n`, {
-      headers: { 'content-type': 'application/x-ndjson' }
-    });
+    return new Response(
+      `${JSON.stringify({ model: 'llama3.1', message: { role: 'assistant', content: 'ok' }, done: true })}\n`,
+      {
+        headers: { 'content-type': 'application/x-ndjson' }
+      }
+    );
   };
 
   try {
     const provider = new OllamaProvider();
     const events = [];
-    for await (const event of provider.stream({ model: 'llama3.1', messages: [{ role: 'user', content: 'hi' }] })) {
+    for await (const event of provider.stream({
+      model: 'llama3.1',
+      messages: [{ role: 'user', content: 'hi' }]
+    })) {
       events.push(event);
     }
 
     assert.equal(events.at(-1).response.content, 'ok');
-    assert.equal(requests.every((request) => request?.dispatcher === undefined), true);
+    assert.equal(
+      requests.every((request) => request?.dispatcher === undefined),
+      true
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -338,8 +393,13 @@ test('OllamaProvider distinguishes cloud structured-output availability', async 
   assert.equal(profile.capabilities.jsonSchema, false);
   assert.equal(profile.supportedParameters.includes('responseFormat'), false);
   await assert.rejects(
-    () => provider.complete({ model: 'llama3.1', messages: [{ role: 'user', content: 'hi' }], responseFormat: 'json' }),
-    error => error.code === 'invalid_request' && /not declared|not supported/.test(error.message)
+    () =>
+      provider.complete({
+        model: 'llama3.1',
+        messages: [{ role: 'user', content: 'hi' }],
+        responseFormat: 'json'
+      }),
+    (error) => error.code === 'invalid_request' && /not declared|not supported/.test(error.message)
   );
   assert.equal(client.requests.length, 0);
 });
@@ -351,19 +411,32 @@ test('OllamaProvider declares GPT-OSS effort semantics without a disable path', 
   });
   const provider = new OllamaProvider({ model: 'gpt-oss:20b', clientFactory: () => client });
   const profile = await provider.describeModel('gpt-oss:20b');
-  assert.deepEqual(profile.capabilities.reasoning, { strategies: ['effort'], canDisable: false, efforts: ['low', 'medium', 'high'], separateOutput: true });
+  assert.deepEqual(profile.capabilities.reasoning, {
+    strategies: ['effort'],
+    canDisable: false,
+    efforts: ['low', 'medium', 'high'],
+    separateOutput: true
+  });
   await assert.rejects(
-    () => provider.complete({ model: 'gpt-oss:20b', messages: [{ role: 'user', content: 'hi' }], reasoning: { strategy: 'disabled' } }),
-    error => error.code === 'invalid_request' && /cannot be disabled/.test(error.message)
+    () =>
+      provider.complete({
+        model: 'gpt-oss:20b',
+        messages: [{ role: 'user', content: 'hi' }],
+        reasoning: { strategy: 'disabled' }
+      }),
+    (error) => error.code === 'invalid_request' && /cannot be disabled/.test(error.message)
   );
 });
 
 test('OllamaProvider validates configured reasoning against the discovered exact profile', async () => {
   const client = new FakeOllamaClient([]);
-  const provider = new OllamaProvider({ clientFactory: () => client, reasoning: { strategy: 'effort', effort: 'low' } });
+  const provider = new OllamaProvider({
+    clientFactory: () => client,
+    reasoning: { strategy: 'effort', effort: 'low' }
+  });
   await assert.rejects(
     () => provider.complete({ model: 'llama3.1', messages: [{ role: 'user', content: 'hi' }] }),
-    error => error.code === 'invalid_request' && /reasoning/.test(error.message)
+    (error) => error.code === 'invalid_request' && /reasoning/.test(error.message)
   );
   assert.equal(client.requests.length, 0);
   const unknown = await provider.describeModel('custom/gpt-oss-invented');
@@ -374,7 +447,11 @@ test('OllamaProvider sends the admitted default reasoning and body unchanged', a
   const client = new FakeOllamaClient([{ model: 'gpt-oss:20b', message: { content: 'ok' }, done: true }]);
   const reasoning = { strategy: 'effort', effort: 'low' };
   const provider = new OllamaProvider({ clientFactory: () => client, reasoning });
-  const original = { model: 'gpt-oss:20b', messages: [{ role: 'user', content: 'original' }], maxOutputTokens: 100 };
+  const original = {
+    model: 'gpt-oss:20b',
+    messages: [{ role: 'user', content: 'original' }],
+    maxOutputTokens: 100
+  };
   const compiled = await provider.compileRequest(original);
   reasoning.effort = 'high';
   original.messages[0].content = 'changed';
@@ -389,12 +466,57 @@ test('OllamaProvider sends the admitted default reasoning and body unchanged', a
 test('Ollama declares developer-only lowering while preserving logical authority and user attribution', async () => {
   const client = new FakeOllamaClient([{ model: 'llama3.1', message: { content: 'ok' }, done: true }]);
   const provider = new OllamaProvider({ clientFactory: () => client });
-  const messages = [{ role: 'developer', content: 'Application policy' }, { role: 'user', content: 'Untrusted retrieved guidance' }];
+  const messages = [
+    { role: 'developer', content: 'Application policy' },
+    { role: 'user', content: 'Untrusted retrieved guidance' }
+  ];
   const compiled = await provider.compileRequest({ model: 'llama3.1', messages, maxOutputTokens: 100 });
-  assert.equal((await provider.describeModel('llama3.1')).capabilities.protocol.developerRole, 'system_if_no_system');
-  assert.deepEqual(compiled.logicalRequest.messages.map(item => item.role), ['developer', 'user']);
+  assert.equal(
+    (await provider.describeModel('llama3.1')).capabilities.protocol.developerRole,
+    'system_if_no_system'
+  );
+  assert.deepEqual(
+    compiled.logicalRequest.messages.map((item) => item.role),
+    ['developer', 'user']
+  );
   assert.deepEqual(compiled.body.messages, [{ role: 'system', content: 'Application policy' }, messages[1]]);
   await provider.completeCompiled(compiled);
-  await assert.rejects(() => provider.compileRequest({ model: 'llama3.1', messages: [{ role: 'system', content: 'Higher priority policy' }, ...messages] }), /mixed system and developer/u);
+  await assert.rejects(
+    () =>
+      provider.compileRequest({
+        model: 'llama3.1',
+        messages: [{ role: 'system', content: 'Higher priority policy' }, ...messages]
+      }),
+    /mixed system and developer/u
+  );
   assert.equal(client.requests.length, 1);
+});
+
+test('Ollama cancellation aborts the transport before response headers arrive', async () => {
+  let entered;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  let transportSignal;
+  const provider = new OllamaProvider({
+    fetch: async (input, init) => {
+      if (String(input).includes('/api/show'))
+        return Response.json({ capabilities: ['completion'], model_info: { 'test.context_length': 32768 } });
+      transportSignal = init.signal;
+      entered();
+      return new Promise((resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+      });
+    }
+  });
+  const controller = new AbortController();
+  const completion = provider.complete({
+    model: 'llama3.1',
+    messages: [{ role: 'user', content: 'Cancel before headers.' }],
+    signal: controller.signal
+  });
+  await started;
+  controller.abort('stop');
+  assert.equal(transportSignal.aborted, true);
+  await assert.rejects(completion, (error) => error.code === 'aborted');
 });

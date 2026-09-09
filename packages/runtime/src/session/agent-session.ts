@@ -21,7 +21,7 @@ import type {
   SessionSuspensionCategory,
   SessionSuspensionDescriptor
 } from './contracts.js';
-import { ownSessionSubmissionConfiguration } from './submission-lifecycle.js';
+import { ownSessionSubmissionConfiguration, ownSessionSubmissionInput } from './submission-lifecycle.js';
 
 export type AgentSessionConfiguration = SessionSubmissionConfiguration;
 
@@ -53,6 +53,11 @@ export type AgentSessionEvent =
   | { readonly type: 'configuration.changed'; readonly configuration: AgentSessionConfiguration }
   | { readonly type: 'input.queued'; readonly submissionId: string; readonly queuedInputs: number }
   | {
+      readonly type: 'input.revised' | 'input.cancelled';
+      readonly submissionId: string;
+      readonly runId: string;
+    }
+  | {
       readonly type: 'context.transitioned';
       readonly window: SessionContextTransitionEntry['window'];
       readonly transition: SessionContextTransitionEntry['transition'];
@@ -71,7 +76,12 @@ export type AgentSessionSubmissionResult =
       readonly runId: string;
       readonly completion: Promise<AgentRunResult>;
     }
-  | { readonly kind: 'queued'; readonly submissionId: string; readonly completion: Promise<AgentRunResult> }
+  | {
+      readonly kind: 'queued';
+      readonly submissionId: string;
+      readonly runId: string;
+      readonly completion: Promise<AgentRunResult>;
+    }
   | { readonly kind: 'rejected'; readonly reason: 'no_active_run' | 'run_mismatch' }
   | {
       readonly kind: 'rejected';
@@ -140,6 +150,22 @@ export class AgentSession {
 
   restore(): Promise<void> {
     return this.serial(() => this.restorePending());
+  }
+
+  /** Observe submission admission and run controls at one session scheduling boundary. */
+  inspect() {
+    return this.serial(async () => {
+      await this.restorePending();
+      const pendingSubmissions = await this.options.repository.loadPendingSubmissions(
+        this.options.descriptor
+      );
+      const runs = await Promise.all(
+        pendingSubmissions
+          .filter((submission) => submission.state !== 'queued')
+          .map((submission) => this.options.runs.inspect(submission.runId))
+      );
+      return { session: this.state(), pendingSubmissions, runs };
+    });
   }
 
   startNextSubmission(): Promise<AgentSessionSubmissionResult | undefined> {
@@ -237,7 +263,7 @@ export class AgentSession {
       if (this.options.scheduling === 'manual' || this.active || this.queued.length > 0) {
         this.enqueue(pending);
         if (!this.active) await this.launchNext();
-        return { kind: 'queued', submissionId, completion: pending.completion };
+        return { kind: 'queued', submissionId, runId: pending.runId, completion: pending.completion };
       }
       return this.launch(pending);
     });
@@ -252,6 +278,33 @@ export class AgentSession {
     const entry = await this.options.context.transition(request, options);
     await this.emit({ type: 'context.transitioned', window: entry.window, transition: entry.transition });
     return entry;
+  }
+
+  updateQueuedSubmission(
+    submissionId: string,
+    change: Parameters<SessionRepository['updateQueuedSubmission']>[2]
+  ): Promise<void> {
+    return this.serial(async () => {
+      await this.restorePending();
+      const index = this.queued.findIndex(
+        (pending) => pending.id === submissionId && !pending.resumeExisting
+      );
+      const pending = this.queued[index];
+      if (pending === undefined) throw new Error(`Submission is no longer queued: ${submissionId}`);
+      const owned =
+        change.kind === 'replace' ? { ...change, input: ownSessionSubmissionInput(change.input) } : change;
+      await this.options.repository.updateQueuedSubmission(this.options.descriptor, submissionId, owned);
+      if (owned.kind === 'replace') this.queued[index] = { ...pending, input: owned.input };
+      else {
+        this.queued.splice(index, 1);
+        pending.reject(new AgentSubmissionCancelledError(submissionId, pending.runId));
+      }
+      await this.emit({
+        type: owned.kind === 'replace' ? 'input.revised' : 'input.cancelled',
+        submissionId,
+        runId: pending.runId
+      });
+    });
   }
 
   branchFrom(entryId: string, label?: string): Promise<SessionBranchMarkerEntry> {
@@ -365,16 +418,7 @@ export class AgentSession {
         this.observe({ control, pending, configuration });
         return { completion: pending.completion };
       } catch (error) {
-        this.suspended = undefined;
-        await this.options.repository.transitionSubmission(
-          this.options.descriptor,
-          suspended.submissionId,
-          {
-            state: 'failed',
-            errorMessage: errorMessage(error)
-          }
-        );
-        await this.launchNext();
+        await this.restoreContinuation(suspended);
         throw error;
       }
     });
@@ -476,13 +520,26 @@ export class AgentSession {
       this.observe({ control, pending, configuration: suspended.configuration });
       return { completion: pending.completion };
     } catch (error) {
-      this.suspended = undefined;
-      await this.options.repository.transitionSubmission(this.options.descriptor, suspended.submissionId, {
-        state: 'failed',
-        errorMessage: errorMessage(error)
-      });
-      await this.launchNext();
+      await this.restoreContinuation(suspended);
       throw error;
+    }
+  }
+
+  /** A rejected continuation is not a failed submission; the run still owns its durable outcome. */
+  private async restoreContinuation(previous: SuspendedSubmission): Promise<void> {
+    const run = await this.options.runs.inspect(previous.runId);
+    const descriptor = runSuspensionDescriptor(previous.submissionId, run.state);
+    if (descriptor !== undefined) {
+      await this.options.repository.transitionSubmission(this.options.descriptor, previous.submissionId, {
+        state: 'suspended',
+        suspension: descriptor
+      });
+      this.suspended = { ...previous, descriptor };
+    } else {
+      this.suspended = undefined;
+      this.queued.unshift(
+        pendingSubmission(previous.submissionId, previous.runId, previous.input, previous.configuration, true)
+      );
     }
   }
 
@@ -521,9 +578,7 @@ export class AgentSession {
           submission.suspension.reason !== 'missing_implementation' &&
           (!current || !sameSuspension(submission.suspension, current))
         ) {
-          throw new Error(
-            `Suspended submission ${submission.submissionId} contradicts its run suspension.`
-          );
+          throw new Error(`Suspended submission ${submission.submissionId} contradicts its run suspension.`);
         }
         this.suspended = suspendedSubmission(submission, submission.suspension);
       } else {
@@ -925,4 +980,14 @@ function sameSuspension(
   right: AgentSessionSuspensionDescriptor
 ): boolean {
   return hashJson(left) === hashJson(right);
+}
+
+export class AgentSubmissionCancelledError extends Error {
+  constructor(
+    readonly submissionId: string,
+    readonly runId: string
+  ) {
+    super(`Queued submission cancelled: ${submissionId}`);
+    this.name = 'AgentSubmissionCancelledError';
+  }
 }

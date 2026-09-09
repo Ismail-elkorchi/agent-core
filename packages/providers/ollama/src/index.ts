@@ -98,11 +98,19 @@ export class OllamaProvider implements ModelProvider {
     this.endpoint = `${(options.host ?? 'http://127.0.0.1:11434').replace(/\/+$/u, '')}/api/chat`;
     this.defaultModel = options.model ?? 'llama3.1';
     const fetch = options.fetch ?? globalThis.fetch;
-    const config = { ...(options.host ? { host: options.host } : {}), fetch };
     this.clientFactory =
       options.clientFactory ??
       (() => {
-        const client = new Ollama(config);
+        const transport = new AbortController();
+        const client = new Ollama({
+          ...(options.host ? { host: options.host } : {}),
+          fetch: (input, init) =>
+            fetch(input, {
+              ...init,
+              signal:
+                init?.signal == null ? transport.signal : AbortSignal.any([transport.signal, init.signal])
+            })
+        });
         return {
           chat: (request) => client.chat(request),
           show: async (request) => {
@@ -120,6 +128,7 @@ export class OllamaProvider implements ModelProvider {
             };
           },
           abort: () => {
+            transport.abort();
             client.abort();
           }
         };
@@ -230,10 +239,7 @@ export class OllamaProvider implements ModelProvider {
         message: 'Unrecognized compiled request.'
       });
   }
-  completeCompiled(
-    compiled: CompiledModelRequest,
-    options?: ModelTransportOptions
-  ): Promise<ModelResponse> {
+  completeCompiled(compiled: CompiledModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
     this.assertCompiled(compiled);
     return this.complete(compiled.logicalRequest, options);
   }
@@ -439,8 +445,7 @@ export class OllamaProvider implements ModelProvider {
     return parseOllamaModelResponse({
       output,
       content: content || fallbackContent,
-      model:
-        typeof response.model === 'string' && response.model.length > 0 ? response.model : request.model,
+      model: typeof response.model === 'string' && response.model.length > 0 ? response.model : request.model,
       provider: this.id,
       terminationReason:
         toolCalls.length > 0

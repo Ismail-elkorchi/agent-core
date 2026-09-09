@@ -38,6 +38,8 @@ import {
   decodeSessionBinding,
   type SessionBindingInput
 } from './binding.js';
+import { JsonlBranchIndex } from './branch-index-node.js';
+import { assertBranchEntry, readBranchPage, searchBranch } from './branch-page.js';
 import {
   contextCommitRetry,
   decodeContextTransitionEntry,
@@ -75,8 +77,10 @@ import type {
 import { captureObservationInput } from './observation.js';
 import { ownSessionSteeringInput, sameSessionSteering } from './steering-input.js';
 import {
+  createQueuedSubmissionUpdate,
   createSessionSubmissionTransition,
   decodeSessionInputRelationship,
+  originalAcceptedInput,
   ownSessionSubmissionConfiguration,
   ownSessionSubmissionInput,
   ownSessionSuspensionDescriptor,
@@ -95,6 +99,7 @@ export class JsonlSessionRepository implements SessionRepository {
   private readonly staleLockMs: number;
   private readonly queues = new Map<string, Promise<void>>();
   private readonly indexes = new Map<string, SessionAppendIndex>();
+  private readonly branchIndexes = new Map<string, JsonlBranchIndex>();
   private fullScans = 0;
   private incrementalRefreshes = 0;
 
@@ -218,25 +223,57 @@ export class JsonlSessionRepository implements SessionRepository {
     );
   }
 
-  async listBranchPoints(session: SessionDescriptor): Promise<readonly SessionBranchPoint[]> {
-    const sessionId = session.id;
-    const state = await this.enqueue(sessionId, () => this.refreshIndex(sessionId, false));
-    assertDescriptor(session, state);
-    const points: SessionBranchPoint[] = state.finalizations.map((finalization) =>
-      Object.freeze({
-        entryId: finalization.throughEntryId,
-        timestamp: finalization.timestamp,
-        kind: 'run_finalization' as const,
-        finalizationId: finalization.finalizationId,
-        runId: finalization.runId
-      })
+  readBranchPage(session: SessionDescriptor, request?: Parameters<SessionRepository['readBranchPage']>[1]) {
+    return this.enqueue(session.id, async () =>
+      readBranchPage(await this.branchIndex(session.id).source(session), request)
     );
-    for (const entry of state.branchEntries)
-      if (entry.type === 'context_transition')
-        points.push(
-          Object.freeze({ entryId: entry.id, timestamp: entry.timestamp, kind: 'context_transition' })
-        );
-    return Object.freeze(points);
+  }
+
+  searchBranch(session: SessionDescriptor, request: Parameters<SessionRepository['searchBranch']>[1]) {
+    return this.enqueue(session.id, async () =>
+      searchBranch(await this.branchIndex(session.id).source(session), request)
+    );
+  }
+
+  readBranchEntry(
+    session: SessionDescriptor,
+    boundary: Parameters<SessionRepository['readBranchEntry']>[1],
+    entryId: string
+  ) {
+    return this.enqueue(session.id, async () => {
+      const source = await this.branchIndex(session.id).source(session);
+      assertBranchEntry(source, boundary, entryId);
+      return source.read(entryId);
+    });
+  }
+
+  historyReadMetrics(sessionId: string) {
+    return this.branchIndex(sessionId).metrics();
+  }
+
+  private branchIndex(sessionId: string): JsonlBranchIndex {
+    let index = this.branchIndexes.get(sessionId);
+    if (index === undefined) {
+      const filePath = this.filePath(sessionId);
+      index = new JsonlBranchIndex(
+        filePath,
+        (line) => parseSessionHeader(parseJson(line, filePath), sessionId),
+        (line) => {
+          const value = parseJson(line, filePath);
+          if (isJsonObject(value) && value.type === 'run_finalization') return parseRunFinalization(value);
+          if (isJsonObject(value) && typeof value.type === 'string' && value.type.startsWith('submission.')) {
+            return parseSubmissionRecord(value);
+          }
+          return parseBranchEntry(value);
+        }
+      );
+      this.branchIndexes.set(sessionId, index);
+    }
+    return index;
+  }
+
+  listBranchPoints(session: SessionDescriptor): Promise<readonly SessionBranchPoint[]> {
+    return this.enqueue(session.id, () => this.branchIndex(session.id).points(session));
   }
 
   appendInput(
@@ -644,6 +681,22 @@ export class JsonlSessionRepository implements SessionRepository {
     return pendingSessionSubmissions(state.submissionRecords);
   }
 
+  updateQueuedSubmission(
+    session: SessionDescriptor,
+    submissionId: string,
+    change: Parameters<SessionRepository['updateQueuedSubmission']>[2]
+  ): Promise<void> {
+    return this.enqueue(session.id, () =>
+      withPersistenceFileLock(this.filePath(session.id), this.lockTimeoutMs, this.staleLockMs, async () => {
+        const state = await this.refreshIndex(session.id, true);
+        assertDescriptor(session, state);
+        const record = createQueuedSubmissionUpdate(state.submissionRecords, submissionId, change);
+        await this.appendRecord(session.id, state, record);
+        state.submissionRecords.push(record);
+      })
+    );
+  }
+
   private async appendRecord(
     sessionId: string,
     state: SessionAppendIndex,
@@ -843,11 +896,7 @@ async function readSessionFile(
     try {
       if (isJsonObject(value) && value.type === 'run_finalization')
         finalizations.push(parseRunFinalization(value));
-      else if (
-        isJsonObject(value) &&
-        typeof value.type === 'string' &&
-        value.type.startsWith('submission.')
-      )
+      else if (isJsonObject(value) && typeof value.type === 'string' && value.type.startsWith('submission.'))
         submissionRecords.push(parseSubmissionRecord(value));
       else branchEntries.push(parseBranchEntry(value));
     } catch (error) {
@@ -859,13 +908,7 @@ async function readSessionFile(
     pendingSessionSubmissions(submissionRecords);
   } catch (error) {
     const last = lines.at(-1);
-    throw corruption(
-      filePath,
-      last?.line ?? 1,
-      last?.byteOffset ?? 0,
-      errorMessage(error),
-      'invalid_record'
-    );
+    throw corruption(filePath, last?.line ?? 1, last?.byteOffset ?? 0, errorMessage(error), 'invalid_record');
   }
   return {
     state: { header, branchEntries, finalizations, submissionRecords },
@@ -979,9 +1022,7 @@ const SESSION_HEADER_FIELDS = new Set([
 
 function parseSessionHeader(value: JsonValue, sessionId: string): SessionHeader {
   if (!isJsonObject(value) || value.format !== 'agent-core.session/2')
-    throw new Error(
-      'Incompatible session format. Start a new session; existing data has not been changed.'
-    );
+    throw new Error('Incompatible session format. Start a new session; existing data has not been changed.');
   if (
     !isJsonObject(value) ||
     value.type !== 'session' ||
@@ -1122,9 +1163,7 @@ function validTurnIdentity(
     value.requestAttempt > 0
   );
 }
-function validBaseEntry(
-  value: Record<string, unknown>
-): value is Record<string, unknown> & BaseSessionEntry {
+function validBaseEntry(value: Record<string, unknown>): value is Record<string, unknown> & BaseSessionEntry {
   return (
     typeof value.id === 'string' &&
     value.id.length > 0 &&
@@ -1142,8 +1181,7 @@ function isEffectiveInstruction(value: unknown): value is AgentEffectiveInstruct
     (value.provenance === 'application' || value.provenance === 'run' || value.provenance === 'steering') &&
     (value.role === undefined || typeof value.role === 'string') &&
     (value.sourceUri === undefined || typeof value.sourceUri === 'string') &&
-    (value.priority === undefined ||
-      (typeof value.priority === 'number' && Number.isFinite(value.priority)))
+    (value.priority === undefined || (typeof value.priority === 'number' && Number.isFinite(value.priority)))
   );
 }
 function isSessionInputEntry(
@@ -1167,8 +1205,7 @@ function isSessionSteeringEntry(
     value.runId.length > 0 &&
     typeof value.content === 'string' &&
     value.content.length > 0 &&
-    (value.deliveryId === undefined ||
-      (typeof value.deliveryId === 'string' && value.deliveryId.length > 0))
+    (value.deliveryId === undefined || (typeof value.deliveryId === 'string' && value.deliveryId.length > 0))
   );
 }
 function isSessionAssistantEntry(
@@ -1274,12 +1311,18 @@ function parseSubmissionRecord(value: JsonObject): SessionSubmissionRecord {
   }
   if (
     value.type !== 'submission.claimed' &&
+    value.type !== 'submission.revised' &&
+    value.type !== 'submission.cancelled' &&
     value.type !== 'submission.suspended' &&
     value.type !== 'submission.completed' &&
     value.type !== 'submission.failed'
   )
     throw new Error('Session submission state is invalid.');
   const base = { submissionId: value.submissionId, runId: value.runId, timestamp: value.timestamp };
+  if (value.type === 'submission.revised') {
+    if (!isJsonObject(value.input)) throw new Error('Revised session input is invalid.');
+    return Object.freeze({ ...base, type: value.type, input: parseSubmissionInput(value.input) });
+  }
   if (value.type === 'submission.suspended')
     return Object.freeze({
       ...base,
@@ -1482,6 +1525,8 @@ function isOptionalStringArray(value: JsonValue | undefined): value is readonly 
 }
 
 function encodeSubmissionRecord(record: SessionSubmissionRecord): JsonObject {
+  if (record.type === 'submission.revised')
+    return Object.freeze({ ...record, input: encodeSubmissionInput(record.input) });
   if (record.type === 'submission.queued')
     return Object.freeze({
       type: record.type,
@@ -1622,14 +1667,4 @@ function nodeCode(error: unknown): string | undefined {
 }
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function originalAcceptedInput(
-  records: readonly SessionSubmissionRecord[],
-  runId: string
-): { readonly originalInput?: SessionSubmissionInput } {
-  const accepted = records.find((record) => record.type === 'submission.queued' && record.runId === runId);
-  return accepted?.type === 'submission.queued'
-    ? { originalInput: ownSessionSubmissionInput(accepted.input) }
-    : {};
 }

@@ -1,19 +1,9 @@
-import { captureObservationInput } from './observation.js';
-import { ownSessionSteeringInput, sameSessionSteering } from './steering-input.js';
-import { historyEventSourceSchema } from '../history/schema.js';
-import { ownSessionAssistantOutput } from './assistant-output.js';
-import type { ModelOutputItem } from '@agent-core/model';
-import type { ContextTransitionCommit } from '../context/contracts.js';
-import {
-  contextCommitRetry,
-  decodeContextTransitionEntry,
-  ownBranchNoteSource,
-  sessionReplayState,
-  validateContextCommit
-} from './context-records.js';
-import { randomUUID } from 'node:crypto';
-import { hashJson, PersistenceConflictError } from '@agent-core/persistence';
 import { parseJsonValue } from '@agent-core/json';
+import type { ModelOutputItem } from '@agent-core/model';
+import { hashJson, PersistenceConflictError } from '@agent-core/persistence';
+import { randomUUID } from 'node:crypto';
+import type { ContextTransitionCommit } from '../context/contracts.js';
+import { historyEventSourceSchema } from '../history/schema.js';
 import {
   createAgentTerminalSnapshot,
   terminalSnapshotFingerprint,
@@ -23,9 +13,22 @@ import {
   type AgentToolCallIdentity,
   type AgentTurnIdentity
 } from '../run/contracts.js';
+import { ownSessionAssistantOutput } from './assistant-output.js';
+import {
+  assertSessionBinding,
+  createSessionBinding,
+  decodeSessionBinding,
+  type SessionBindingInput
+} from './binding.js';
+import { assertBranchEntry, memoryBranchSource, readBranchPage, searchBranch } from './branch-page.js';
+import {
+  contextCommitRetry,
+  decodeContextTransitionEntry,
+  ownBranchNoteSource,
+  sessionReplayState,
+  validateContextCommit
+} from './context-records.js';
 import type {
-  SessionDescriptor,
-  SessionInputRelationship,
   BaseSessionEntry,
   CreateSessionOptions,
   SessionAssistantEntry,
@@ -34,34 +37,34 @@ import type {
   SessionBranchPoint,
   SessionContextTransitionEntry,
   SessionConversationItem,
-  SessionRunFinalization,
+  SessionDescriptor,
   SessionHeader,
   SessionInputEntry,
+  SessionInputRelationship,
   SessionModelSettingsEntry,
   SessionObservationEntry,
   SessionObservationInput,
   SessionPendingSubmission,
   SessionReplayState,
   SessionRepository,
-  SessionSubmissionInput,
+  SessionRunFinalization,
+  SessionSteeringEntry,
   SessionSubmissionConfiguration,
+  SessionSubmissionInput,
   SessionSubmissionRecord,
   SessionSummary,
-  SessionSteeringEntry,
   SessionToolCallEntry
 } from './contracts.js';
+import { captureObservationInput } from './observation.js';
+import { ownSessionSteeringInput, sameSessionSteering } from './steering-input.js';
 import {
+  createQueuedSubmissionUpdate,
   createSessionSubmissionTransition,
+  originalAcceptedInput,
   ownSessionSubmissionConfiguration,
   ownSessionSubmissionInput,
   pendingSessionSubmissions
 } from './submission-lifecycle.js';
-import {
-  assertSessionBinding,
-  createSessionBinding,
-  decodeSessionBinding,
-  type SessionBindingInput
-} from './binding.js';
 
 export class InMemorySessionRepository implements SessionRepository {
   private readonly states = new Map<string, SessionState>();
@@ -146,6 +149,30 @@ export class InMemorySessionRepository implements SessionRepository {
           entry.type !== 'branch' && entry.type !== 'model_settings' && entry.type !== 'context_transition'
       )
     );
+  }
+
+  readBranchPage(session: SessionDescriptor, request?: Parameters<SessionRepository['readBranchPage']>[1]) {
+    return this.serial(() =>
+      readBranchPage(memoryBranchSource(session.id, this.requireDescriptor(session).branchEntries), request)
+    );
+  }
+
+  searchBranch(session: SessionDescriptor, request: Parameters<SessionRepository['searchBranch']>[1]) {
+    return this.serial(() =>
+      searchBranch(memoryBranchSource(session.id, this.requireDescriptor(session).branchEntries), request)
+    );
+  }
+
+  readBranchEntry(
+    session: SessionDescriptor,
+    boundary: Parameters<SessionRepository['readBranchEntry']>[1],
+    entryId: string
+  ) {
+    return this.serial(() => {
+      const source = memoryBranchSource(session.id, this.requireDescriptor(session).branchEntries);
+      assertBranchEntry(source, boundary, entryId);
+      return source.read(entryId);
+    });
   }
 
   listBranchPoints(session: SessionDescriptor): Promise<readonly SessionBranchPoint[]> {
@@ -255,8 +282,7 @@ export class InMemorySessionRepository implements SessionRepository {
         if (
           existing.turnIndex !== input.identity.turnIndex ||
           existing.content !== input.content ||
-          hashJson(existing.output ?? null) !==
-            hashJson(input.output ?? null) ||
+          hashJson(existing.output ?? null) !== hashJson(input.output ?? null) ||
           existing.completeness !== input.completeness ||
           hashJson(existing.source ?? null) !== hashJson(input.source ?? null)
         )
@@ -509,6 +535,19 @@ export class InMemorySessionRepository implements SessionRepository {
     return this.serial(() => pendingSessionSubmissions(this.requireDescriptor(session).submissionRecords));
   }
 
+  updateQueuedSubmission(
+    session: SessionDescriptor,
+    submissionId: string,
+    change: Parameters<SessionRepository['updateQueuedSubmission']>[2]
+  ): Promise<void> {
+    return this.serial(() => {
+      const state = this.requireDescriptor(session);
+      state.submissionRecords.push(
+        createQueuedSubmissionUpdate(state.submissionRecords, submissionId, change)
+      );
+    });
+  }
+
   private append<T extends SessionBranchEntry>(
     session: SessionDescriptor,
     create: (parentId: string | null) => T
@@ -627,13 +666,3 @@ function observationPayload(
 }
 
 export type * from './contracts.js';
-
-function originalAcceptedInput(
-  records: readonly SessionSubmissionRecord[],
-  runId: string
-): { readonly originalInput?: SessionSubmissionInput } {
-  const accepted = records.find((record) => record.type === 'submission.queued' && record.runId === runId);
-  return accepted?.type === 'submission.queued'
-    ? { originalInput: ownSessionSubmissionInput(accepted.input) }
-    : {};
-}

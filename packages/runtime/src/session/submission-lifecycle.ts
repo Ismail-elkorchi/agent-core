@@ -7,17 +7,19 @@ import { decodePromptContextItemInput } from '../inference/prompt-material.js';
 import type {
   SessionInputRelationship,
   SessionPendingSubmission,
+  SessionQueuedSubmissionChange,
   SessionSubmissionConfiguration,
   SessionSubmissionInput,
   SessionSubmissionRecord,
   SessionSubmissionState,
   SessionSubmissionTransition,
+  SessionSubmissionUpdate,
   SessionSuspensionAction,
   SessionSuspensionCategory,
   SessionSuspensionDescriptor
 } from './contracts.js';
 
-type SubmissionState = SessionPendingSubmission['state'] | 'completed' | 'failed';
+type SubmissionState = SessionPendingSubmission['state'] | 'completed' | 'failed' | 'cancelled';
 type FoldedSubmission = Omit<SessionPendingSubmission, 'state'> & {
   readonly state: SubmissionState;
   readonly errorMessage?: string;
@@ -44,9 +46,7 @@ export function ownSessionSubmissionInput(value: unknown): SessionSubmissionInpu
   if (contextItems !== undefined && !Array.isArray(contextItems))
     throw new Error('Session context items must be an array.');
   if (
-    Object.keys(input).some(
-      (key) => !['task', 'instructions', 'contextItems', 'relationship'].includes(key)
-    )
+    Object.keys(input).some((key) => !['task', 'instructions', 'contextItems', 'relationship'].includes(key))
   )
     throw new Error('Unsupported session submission input field.');
   return Object.freeze({
@@ -152,7 +152,7 @@ export function pendingSessionSubmissions(
 ): readonly SessionPendingSubmission[] {
   return Object.freeze(
     [...foldSubmissions(records).values()].flatMap((submission) =>
-      submission.state === 'completed' || submission.state === 'failed'
+      submission.state === 'completed' || submission.state === 'failed' || submission.state === 'cancelled'
         ? []
         : [
             Object.freeze({
@@ -243,12 +243,20 @@ function foldSubmissions(records: readonly SessionSubmissionRecord[]): Map<strin
       throw new Error(`Session submission transition has no queued record: ${record.submissionId}`);
     if (current.runId !== record.runId)
       throw new Error(`Session submission run identity changed: ${record.submissionId}`);
+    if (record.type === 'submission.revised' || record.type === 'submission.cancelled') {
+      if (current.state !== 'queued') throw new Error(`Only queued input can change: ${record.submissionId}`);
+      submissions.set(
+        record.submissionId,
+        record.type === 'submission.revised'
+          ? Object.freeze({ ...current, input: record.input })
+          : Object.freeze({ ...current, state: 'cancelled' })
+      );
+      continue;
+    }
     const state = submissionTransitionState(record);
     assertTransition(current.state, state, record.submissionId);
     const suspension =
-      record.type === 'submission.suspended'
-        ? ownSessionSuspensionDescriptor(record.suspension)
-        : undefined;
+      record.type === 'submission.suspended' ? ownSessionSuspensionDescriptor(record.suspension) : undefined;
     submissions.set(
       record.submissionId,
       Object.freeze({
@@ -260,6 +268,31 @@ function foldSubmissions(records: readonly SessionSubmissionRecord[]): Map<strin
     );
   }
   return submissions;
+}
+
+export function createQueuedSubmissionUpdate(
+  records: readonly SessionSubmissionRecord[],
+  submissionId: string,
+  change: SessionQueuedSubmissionChange
+): SessionSubmissionUpdate {
+  const current = foldSubmissions(records).get(submissionId);
+  if (current?.state !== 'queued') throw new Error(`Submission is no longer queued: ${submissionId}`);
+  if (hashJson(current.input) !== hashJson(ownSessionSubmissionInput(change.expectedInput)))
+    throw new Error(`Queued input changed since it was read: ${submissionId}`);
+  const base = { submissionId, runId: current.runId, timestamp: new Date().toISOString() };
+  return Object.freeze(
+    change.kind === 'replace'
+      ? { ...base, type: 'submission.revised', input: ownSessionSubmissionInput(change.input) }
+      : { ...base, type: 'submission.cancelled' }
+  );
+}
+
+export function originalAcceptedInput(
+  records: readonly SessionSubmissionRecord[],
+  runId: string
+): { readonly originalInput?: SessionSubmissionInput } {
+  const accepted = [...foldSubmissions(records).values()].find((submission) => submission.runId === runId);
+  return accepted === undefined ? {} : { originalInput: accepted.input };
 }
 
 export function ownSessionSuspensionDescriptor(value: unknown): SessionSuspensionDescriptor {
@@ -279,8 +312,7 @@ export function ownSessionSuspensionDescriptor(value: unknown): SessionSuspensio
   const submissionId = suspensionString(object.submissionId, 'submissionId');
   const category = suspensionCategory(object.category);
   const reason = suspensionReason(object.reason);
-  const effectId =
-    object.effectId === undefined ? undefined : suspensionString(object.effectId, 'effectId');
+  const effectId = object.effectId === undefined ? undefined : suspensionString(object.effectId, 'effectId');
   if (!Array.isArray(object.actions) || object.actions.length === 0)
     throw new TypeError('Session suspension actions are invalid.');
   const actions = object.actions.map(suspensionAction);
@@ -403,7 +435,9 @@ function ownDecisionRequest(value: unknown): NonNullable<SessionSuspensionDescri
   });
 }
 
-function submissionTransitionState(record: SessionSubmissionTransition): SessionSubmissionState {
+function submissionTransitionState(
+  record: SessionSubmissionTransition
+): Exclude<SessionSubmissionState, 'cancelled'> {
   switch (record.type) {
     case 'submission.claimed':
       return 'claimed';

@@ -837,10 +837,7 @@ test('AgentSession serializes admission, preserves steering identity, and snapsh
   assert.equal(first.kind, 'started');
   const stale = await session.submit({ task: 'stale' }, { delivery: 'steer', expectedRunId: 'wrong' });
   assert.deepEqual(stale, { kind: 'rejected', reason: 'run_mismatch' });
-  const steered = await session.submit(
-    { task: 'focus' },
-    { delivery: 'steer', expectedRunId: first.runId }
-  );
+  const steered = await session.submit({ task: 'focus' }, { delivery: 'steer', expectedRunId: first.runId });
   assert.equal(steered.kind, 'steered');
   assert.deepEqual(controls[0].steering, ['focus']);
   await session.configure({ model: 'second' });
@@ -988,10 +985,7 @@ test('context transitions commit once without evicting original session records'
     identity: { turnIndex: 1, turnId: 'turn', requestAttempt: 1 },
     content: 'decision retained'
   });
-  await repository.recordRunFinalization(
-    descriptor,
-    completedTerminal('run', 'final', 'decision retained')
-  );
+  await repository.recordRunFinalization(descriptor, completedTerminal('run', 'final', 'decision retained'));
   const history = new HistoryReader({ repository, session: descriptor });
   const context = new ContextService({
     repository,
@@ -1105,6 +1099,8 @@ test('approval suspension remains durable and blocks queued follow-ups until res
           };
         },
         resolveApproval(input) {
+          if (input.fingerprint !== 'fingerprint')
+            return Promise.reject(new Error('Approval fingerprint mismatch'));
           return Promise.resolve({
             runId: input.runId,
             result: Promise.resolve({
@@ -1123,6 +1119,23 @@ test('approval suspension remains durable and blocks queued follow-ups until res
   });
   await restarted.restore();
   assert.equal(restarted.state().phase, 'suspended');
+  assert.deepEqual(executed, []);
+  await assert.rejects(
+    restarted.resolveApproval({
+      runId: first.runId,
+      approvalId: 'approval',
+      fingerprint: 'stale',
+      decision: 'allow'
+    }),
+    /fingerprint mismatch/
+  );
+  assert.equal(restarted.state().phase, 'suspended');
+  assert.equal(
+    (await repository.loadPendingSubmissions(descriptor)).find(
+      (submission) => submission.runId === first.runId
+    ).state,
+    'suspended'
+  );
   assert.deepEqual(executed, []);
   await restarted.resolveApproval({
     runId: first.runId,
@@ -1344,10 +1357,7 @@ test('durable user decisions enforce every identity and revision guard before ab
     expectedRunRevision: request.runRevision
   };
   await assert.rejects(session.resolveDecision({ ...exact, runId: 'stale-run' }), /suspended on run/u);
-  await assert.rejects(
-    session.resolveDecision({ ...exact, decisionRequestId: 'stale-decision' }),
-    /stale/u
-  );
+  await assert.rejects(session.resolveDecision({ ...exact, decisionRequestId: 'stale-decision' }), /stale/u);
   await assert.rejects(session.resolveDecision({ ...exact, fingerprint: '0'.repeat(64) }), /stale/u);
   await assert.rejects(
     session.resolveDecision({ ...exact, expectedRunRevision: request.runRevision - 1 }),
