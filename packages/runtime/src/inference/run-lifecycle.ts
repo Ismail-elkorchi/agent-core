@@ -28,7 +28,8 @@ import { randomUUID } from 'node:crypto';
 import type { AgentAuditEvent, AgentEvent, AgentProgressEvent } from '../events.js';
 import type { RequestCostEstimate } from '../orchestration/budget-accountant.js';
 import type { summarizeModelRequest } from '../orchestration/event-summaries.js';
-import { normalizeModelToolCall } from '../orchestration/model-request.js';
+import { ModelStreamInterruptedError } from '../orchestration/model-stream.js';
+import { normalizeModelToolCall, providerFailureDiagnostic } from '../orchestration/model-request.js';
 import { storeProviderStateArtifact } from '../orchestration/provider-state-artifacts.js';
 import { AgentRunController } from '../orchestration/run-controller.js';
 import type {
@@ -41,7 +42,7 @@ import type { AgentRunProcedure } from '../run/control/contracts.js';
 import { providerWork } from '../run/control/contracts.js';
 import type { AgentRunAdvance, AgentRunDriver } from '../run/control/driver.js';
 import type { NativeSteeringCoordinator } from './native-steering.js';
-import type { InferenceService } from './service.js';
+import { InferenceOutcomeUnknownError, type InferenceService } from './service.js';
 
 export type RunInferenceResult =
   | {
@@ -285,6 +286,46 @@ export function createRunInferenceLifecycle(input: RunInferenceInput): {
         stage: 'outcome_unknown',
         effect: closed
       }));
+      const failure = error instanceof InferenceOutcomeUnknownError ? error.cause ?? error : error;
+      const cause = failure instanceof ModelStreamInterruptedError ? failure.cause : failure;
+      const providerDiagnostic = providerFailureDiagnostic(cause);
+      const diagnostic = {
+        provider: input.options.provider.id,
+        code: 'unknown' as const,
+        retryable: false,
+        ...providerDiagnostic,
+        causeSummary: {
+          ...providerDiagnostic?.causeSummary,
+          message: cause instanceof Error ? cause.message : String(cause)
+        }
+      };
+      if (failure instanceof ModelStreamInterruptedError) {
+        const visible = failure.content.trim() || failure.reasoningSummary?.trim();
+        const event = {
+          type: 'assistant.interrupted' as const,
+          ...identity,
+          content: failure.content,
+          modelOutput: visible
+            ? {
+                status: 'partial' as const,
+                message: visible,
+                source: 'stream_recovery' as const,
+                turnIndex: identity.turnIndex
+              }
+            : { status: 'absent' as const },
+          ...(failure.reasoningSummary === undefined
+            ? {}
+            : { reasoningSummary: failure.reasoningSummary }),
+          finalResponseReceived: failure.finalResponseReceived,
+          diagnostic
+        };
+        await append(event);
+        await emit(event);
+      } else {
+        const event = { type: 'model.failed' as const, ...identity, diagnostic };
+        await append(event);
+        await emit(event);
+      }
       return Object.freeze({ kind: 'outcome_unknown', effectId });
     }
   };
@@ -295,7 +336,7 @@ export async function invokeRunInference(input: RunInferenceInput): Promise<RunI
   return input.service.invokeWithLifecycle(
     {
       request: input.request,
-      admitted: input.compiled,
+      compiled: input.compiled,
       profile: input.turnRequest.snapshot.profile,
       session: input.turnRequest.modelSession,
       turnIndex: input.turnRequest.turnIndex,

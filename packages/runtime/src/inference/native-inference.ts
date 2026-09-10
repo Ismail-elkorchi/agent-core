@@ -167,7 +167,7 @@ export async function invokeNativeInference(
   try {
     await authority.gateway.invoke({
       request: input.request,
-      admitted: input.compiled,
+      compiled: input.compiled,
       profile: input.profile,
       session: input.session,
       turnIndex: 0,

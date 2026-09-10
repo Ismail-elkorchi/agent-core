@@ -1070,10 +1070,10 @@ test('stream interruption preserves an unknown provider outcome without treating
   assert.equal(result.state, 'suspended');
   assert.equal(result.reason, 'provider_outcome_unknown');
   const records = await eventsFor(events, result.runId);
-  assert.equal(
-    records.some((event) => event.type === 'assistant.interrupted'),
-    false
-  );
+  const interrupted = records.find((event) => event.type === 'assistant.interrupted');
+  assert.equal(interrupted.content, 'part');
+  assert.equal(interrupted.modelOutput.status, 'partial');
+  assert.equal(interrupted.diagnostic.causeSummary.message, 'socket closed');
   assert.equal(
     records.some((event) => event.type === 'provider.attempt.settled'),
     false

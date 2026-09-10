@@ -23,6 +23,7 @@ import {
   parseModelResponse,
   requiredProtocolRevision,
   type CompiledModelRequest,
+  type ModelCompilationOptions,
   type ModelCapabilities,
   type ModelContextTransformRequest,
   type ModelContextTransformResult,
@@ -70,8 +71,6 @@ export interface OpenAIProviderOptions {
   countTokens?: boolean;
   maxConcurrentCounts?: number;
   defaultOutputTokens?: number;
-  /** Reservation policy for compaction output; /compact does not accept a generation cap. */
-  contextOutputReservation?: number;
   transport?: 'http_sse' | 'websocket';
   webSocketFactory?: OpenAIResponsesWebSocketFactory;
   auth?: ProviderAuth | BearerTokenProvider;
@@ -170,7 +169,6 @@ export class OpenAIProvider implements ModelProvider {
   private readonly maxConcurrentCounts: number;
   private activeCounts = 0;
   private readonly defaultOutputTokens: number;
-  private readonly contextOutputReservation: number;
   private readonly compiledTransforms = new WeakMap<CompiledModelRequest, string>();
   private readonly transport: 'http_sse' | 'websocket';
   private readonly webSocketFactory: OpenAIResponsesWebSocketFactory;
@@ -191,9 +189,6 @@ export class OpenAIProvider implements ModelProvider {
     this.defaultOutputTokens = options.defaultOutputTokens ?? 4096;
     if (!Number.isSafeInteger(this.defaultOutputTokens) || this.defaultOutputTokens < 1)
       throw new RangeError('defaultOutputTokens must be positive.');
-    this.contextOutputReservation = options.contextOutputReservation ?? this.defaultOutputTokens;
-    if (!Number.isSafeInteger(this.contextOutputReservation) || this.contextOutputReservation < 1)
-      throw new RangeError('contextOutputReservation must be positive.');
     this.transport = options.transport ?? 'http_sse';
     this.webSocketFactory = options.webSocketFactory ?? defaultOpenAIResponsesWebSocketFactory;
     this.baseUrl = stripTrailingSlash(options.baseUrl ?? OPENAI_BASE_URL);
@@ -321,7 +316,10 @@ export class OpenAIProvider implements ModelProvider {
       await this.compileContextTransform(transform)
     );
   }
-  async compileContextTransform(transform: ModelContextTransformRequest): Promise<CompiledModelRequest> {
+  async compileContextTransform(
+    transform: ModelContextTransformRequest,
+    options?: ModelCompilationOptions
+  ): Promise<CompiledModelRequest> {
     if (typeof transform.transformId !== 'string' || !transform.transformId)
       throw new ModelProviderError({
         provider: this.id,
@@ -358,7 +356,7 @@ export class OpenAIProvider implements ModelProvider {
       body,
       endpoint: `${this.endpoint()}/compact`,
       payloadPaths: responsesPayloadPaths(body),
-      outputReservation: source.maxOutputTokens ?? this.contextOutputReservation,
+      outputReservation: source.maxOutputTokens ?? options?.outputReservation ?? this.defaultOutputTokens,
       ...(providerInputTokens === undefined ? {} : { providerInputTokens })
     });
     this.compiledTransforms.set(compiled, transform.transformId);
@@ -415,18 +413,27 @@ export class OpenAIProvider implements ModelProvider {
     });
   }
 
-  async compileRequest(request: ModelRequest): Promise<CompiledModelRequest> {
+  async compileRequest(
+    request: ModelRequest,
+    options?: ModelCompilationOptions
+  ): Promise<CompiledModelRequest> {
     request = await this.validateRequest(request);
     const cached = this.compiledRequests.get(request);
-    if (cached) return cached;
+    if (
+      cached &&
+      (options === undefined || options.outputReservation === cached.accounting.outputReservation)
+    )
+      return cached;
+    if (cached) request = parseModelRequest({ ...request });
     const profile = await this.describeModel(request.model);
     if (request.maxOutputTokens === undefined && profile.supportedParameters.includes('maxOutputTokens'))
-      request = parseModelRequest({ ...request, maxOutputTokens: this.defaultOutputTokens });
+      request = parseModelRequest({ ...request, maxOutputTokens: options?.outputReservation ?? this.defaultOutputTokens });
     const body = toOpenAIResponsesRequest(request, false);
     delete body.stream;
     if (this.transport === 'websocket') body.type = 'response.create';
     const providerInputTokens = this.countTokens ? await this.countInput(body, request.signal) : undefined;
     const compiled = await compileModelRequest({
+      ...options,
       request,
       profile: await this.describeModel(request.model),
       ...(providerInputTokens === undefined ? {} : { providerInputTokens }),
@@ -450,6 +457,7 @@ export class OpenAIProvider implements ModelProvider {
       body,
       retainedBody,
       retainedInputTokenReservation,
+      outputReservation: effective.accounting.outputReservation,
       payloadPaths: responsesPayloadPaths(body),
       retainedPayloadPaths: responsesPayloadPaths(retainedBody),
       ...(this.countTokens ? { providerInputTokens: effective.accounting.estimatedInputTokens } : {}),

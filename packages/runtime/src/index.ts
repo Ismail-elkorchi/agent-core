@@ -1,6 +1,6 @@
 export * from './agent-runtime.js';
 export * from './events.js';
-export * from './inference/gateway.js';
+export type { InferenceInvocation } from './inference/gateway.js';
 export * from './inference/model-request-assembler.js';
 export * from './inference/model-window.js';
 export * from './inference/prompt-material.js';

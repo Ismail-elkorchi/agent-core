@@ -10,15 +10,16 @@ import {
   type ModelResponse,
   type ModelStreamEvent,
   compileModelRequest,
-  assertRequestAccountingFits,
+  type ModelCompilationOptions,
   type CompiledModelRequest
 } from '@agent-core/model';
+import { requestWindowForModel } from '../orchestration/model-request.js';
 import { ModelStreamInterruptedError } from '../orchestration/model-stream.js';
 
 export interface InferenceInvocation {
   readonly transport?: ModelTransportOptions;
   readonly request: ModelRequest;
-  readonly admitted?: CompiledModelRequest;
+  readonly compiled?: CompiledModelRequest;
   readonly profile: ModelProfile;
   readonly session: ModelProviderSession;
   readonly turnIndex: number;
@@ -35,18 +36,27 @@ export class InferenceGateway {
     return this.provider.createSession?.() ?? directProviderSession(this.provider);
   }
 
-  async compile(request: ModelRequest, profile: ModelProfile): Promise<CompiledModelRequest> {
+  async compile(
+    request: ModelRequest,
+    profile: ModelProfile,
+    options?: ModelCompilationOptions
+  ): Promise<CompiledModelRequest> {
     request = createModelRequest(request);
     request.signal?.throwIfAborted();
     if (profile.provider !== this.provider.id || request.model !== profile.id)
       throw new Error('Inference profile does not match its provider and model.');
     const body = { ...request };
     delete body.signal;
+    const policy = {
+      outputReservation: requestWindowForModel(profile, options?.outputReservation ?? request.maxOutputTokens)
+        .maxOutputTokens
+    };
     const compiled = this.provider.compileRequest
-      ? await this.provider.compileRequest(request)
+      ? await this.provider.compileRequest(request, policy)
       : await compileModelRequest({
           request,
           profile,
+          ...policy,
           body,
           endpoint: profile.capabilities.protocol?.endpoint ?? this.provider.id
         });
@@ -59,28 +69,23 @@ export class InferenceGateway {
     return compiled;
   }
 
-  async admit(request: ModelRequest, profile: ModelProfile): Promise<CompiledModelRequest> {
-    const compiled = await this.compile(request, profile);
-    assertRequestAccountingFits(compiled.accounting);
-    return compiled;
-  }
-
-  async invoke(input: InferenceInvocation): Promise<ModelResponse> {
-    const admitted = input.admitted ?? (await this.admit(input.request, input.profile));
-    assertRequestAccountingFits(admitted.accounting);
+  async invoke(
+    input: InferenceInvocation & { readonly compiled: CompiledModelRequest }
+  ): Promise<ModelResponse> {
+    const compiled = input.compiled;
     input.request.signal?.throwIfAborted();
     const compiledStream = input.session.streamCompiled?.bind(input.session);
     const logicalStream = input.session.stream?.bind(input.session);
     const stream = compiledStream
-      ? () => compiledStream(admitted, input.transport)
+      ? () => compiledStream(compiled, input.transport)
       : logicalStream
-        ? () => logicalStream(admitted.logicalRequest)
+        ? () => logicalStream(compiled.logicalRequest)
         : undefined;
     if (!input.profile.capabilities.streaming || !stream) {
       return parseModelResponse(
         await (input.session.completeCompiled
-          ? input.session.completeCompiled(admitted, input.transport)
-          : input.session.complete(admitted.logicalRequest))
+          ? input.session.completeCompiled(compiled, input.transport)
+          : input.session.complete(compiled.logicalRequest))
       );
     }
 

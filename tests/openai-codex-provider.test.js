@@ -39,18 +39,26 @@ test('Codex compiled admission is bound to its provider instance and reservation
     sent++;
     return jsonResponse({ id: 'compiled-instance', model: 'gpt-5.6', status: 'completed', output_text: 'done' });
   } };
-  const first = new OpenAICodexProvider({ ...options, outputReservation: 100 });
-  const second = new OpenAICodexProvider({ ...options, outputReservation: 200 });
-  const admitted = await first.compileRequest({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hello' }] });
+  const first = new OpenAICodexProvider(options);
+  const second = new OpenAICodexProvider(options);
+  const admitted = await first.compileRequest({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hello' }] }, { outputReservation: 100 });
   assert.throws(() => second.completeCompiled(admitted), /provider instance/u);
-  const readmitted = await second.compileRequest(admitted.logicalRequest);
+  const readmitted = await second.compileRequest(admitted.logicalRequest, { outputReservation: 200 });
   assert.notEqual(readmitted, admitted);
   assert.equal(admitted.accounting.outputReservation, 100);
   assert.equal(readmitted.accounting.outputReservation, 200);
   assert.equal(await first.compileRequest(admitted.logicalRequest), admitted);
   await first.createSession().completeCompiled(admitted);
   await second.createSession().completeCompiled(readmitted);
-  assert.equal(sent, 2);
+  const recompiled = await first.compileRequest(admitted.logicalRequest, { outputReservation: 300 });
+  assert.notEqual(recompiled, admitted);
+  assert.equal(recompiled.accounting.outputReservation, 300);
+  await first.createSession().completeCompiled(admitted);
+  await first.createSession().completeCompiled(recompiled);
+  assert.equal(sent, 4);
+  for (const outputReservation of [0, -1, 1.5]) {
+    await assert.rejects(first.compileRequest(admitted.logicalRequest, { outputReservation }), /positive safe integer/);
+  }
 });
 
 test('OpenAICodexProvider supports GPT-5.6 max effort but does not claim subscription Pro mode', async () => {

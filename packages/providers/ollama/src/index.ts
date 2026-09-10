@@ -3,6 +3,7 @@ import {
   assertModelRequestSupported,
   assertProviderContextCompatible,
   type CompiledModelRequest,
+  type ModelCompilationOptions,
   compileModelRequest,
   CompleteRequestEstimator,
   conservativeProtocolCapabilities,
@@ -191,10 +192,18 @@ export class OllamaProvider implements ModelProvider {
       state: 'exact'
     });
   }
-  async compileRequest(request: ModelRequest): Promise<CompiledModelRequest> {
+  async compileRequest(
+    request: ModelRequest,
+    options?: ModelCompilationOptions
+  ): Promise<CompiledModelRequest> {
     request = parseModelRequest(request);
     const cached = this.compiledRequests.get(request);
-    if (cached) return cached;
+    if (
+      cached &&
+      (options === undefined || options.outputReservation === cached.accounting.outputReservation)
+    )
+      return cached;
+    if (cached) request = parseModelRequest({ ...request });
     if (request.reasoning === undefined && this.reasoning !== undefined) {
       request = parseModelRequest({ ...request, reasoning: this.reasoning });
     }
@@ -218,6 +227,7 @@ export class OllamaProvider implements ModelProvider {
     const body: Record<string, unknown> = { ...wire };
     delete body.stream;
     const compiled = await compileModelRequest({
+      ...options,
       request,
       profile,
       body,

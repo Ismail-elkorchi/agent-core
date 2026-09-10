@@ -12,6 +12,7 @@ import {
   parseModelResponse,
   requiredProtocolRevision,
   type CompiledModelRequest,
+  type ModelCompilationOptions,
   type ModelCapabilities,
   type ModelImage,
   type ModelInputItem,
@@ -140,13 +141,22 @@ export class OpenRouterProvider implements ModelProvider {
     });
   }
 
-  async compileRequest(request: ModelRequest): Promise<CompiledModelRequest> {
+  async compileRequest(
+    request: ModelRequest,
+    options?: ModelCompilationOptions
+  ): Promise<CompiledModelRequest> {
     request = await this.validateRequest(request);
     const cached = this.compiledRequests.get(request);
-    if (cached) return cached;
+    if (
+      cached &&
+      (options === undefined || options.outputReservation === cached.accounting.outputReservation)
+    )
+      return cached;
+    if (cached) request = parseModelRequest({ ...request });
     const body = toOpenRouterChatRequest(request, false);
     delete body.stream;
     const compiled = await compileModelRequest({
+      ...options,
       request,
       profile: await this.describeModel(request.model),
       body,

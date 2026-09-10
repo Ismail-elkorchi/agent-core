@@ -173,7 +173,8 @@ export function createRuntimeContextBootstrapValidator(
           : {}),
         ...(signal ? { signal } : {})
       },
-      profile
+      profile,
+      { outputReservation: limits.maxOutputTokens }
     );
     assertRequestAccountingFits(compiled.accounting);
     return providerState ? { providerState } : undefined;

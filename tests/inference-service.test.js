@@ -432,3 +432,109 @@ test('runtime binds cancellation before compilation and dispatches the exact imm
   assert.equal(ended.terminal.executionStatus, 'completed');
   assert.equal(sends, 1);
 });
+
+test('precompiled input is admitted before any invocation or external effect is started', async () => {
+  const { compileModelRequest } = await import('@agent-core/model');
+  let calls = 0;
+  let starts = 0;
+  const provider = fixture(async (request) => { calls++; return response(request); });
+  const repository = new InMemoryInferenceRepository();
+  const service = new InferenceService({ provider, repository, artifacts: new InMemoryArtifactRepository() });
+  const request = { model: profile.id, messages: [{ role: 'user', content: 'Hello' }] };
+  for (const policy of [{}, { outputReservation: 100_000 }]) {
+    const compiled = await compileModelRequest({ request, profile, body: request, endpoint: 'fixture', ...policy });
+    await assert.rejects(service.invokeWithLifecycle(
+      { request, compiled, profile, session: service.createSession(), turnIndex: 1 },
+      {
+        async start() { starts++; },
+        async settle() { assert.fail('Rejected input cannot settle'); },
+        async uncertain() { assert.fail('Admission failure is not an unknown provider outcome'); }
+      },
+      input()
+    ), /admission limits/);
+  }
+  assert.equal(starts, 0);
+  assert.equal(calls, 0);
+  assert.equal((await repository.load('work')).invocations.size, 0);
+  await service.invoke(input());
+  assert.equal(calls, 1);
+});
+
+test('runtime reserves Codex output without sending an unsupported generation control', async () => {
+  const { OpenAICodexProvider } = await import('@agent-core/provider-openai-codex');
+  const token = `test.${Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'offline-test' } })).toString('base64url')}.test`;
+  const requests = [];
+  const provider = new OpenAICodexProvider({
+    auth: { type: 'bearer', tokenProvider: {
+      describe: () => ({ type: 'oauth', label: 'offline test', provider: 'openai-codex' }),
+      async getBearerToken() { return { token }; }
+    } },
+    async fetch(_url, init) {
+      const body = JSON.parse(init.body);
+      requests.push(body);
+      assert.equal('max_output_tokens' in body, false);
+      return new Response(`data: ${JSON.stringify({ type: 'response.completed', response: { id: 'first-response', model: body.model, status: 'completed', output_text: 'Hello.', output: [] } })}\n\n`, { headers: { 'Content-Type': 'text/event-stream' } });
+    }
+  });
+  const repository = new InMemoryInferenceRepository();
+  const service = new InferenceService({ provider, repository, artifacts: new InMemoryArtifactRepository() });
+  for (const maxOutputTokens of [undefined, 777]) {
+    const runtime = new AgentRuntime({
+      provider, model: 'gpt-5.6-luna', inferenceService: service,
+      repositories: { events: new InMemoryEventRepository(agentEventCodec) },
+      toolBoundary: { authorizationPolicyId: 'none', executionTargetId: 'none' },
+      ...(maxOutputTokens === undefined ? {} : { maxOutputTokens })
+    });
+    const run = runtime.run({ task: 'Say hello.' });
+    const result = await run.result;
+    assert.equal(result.state, 'ended');
+    assert.equal(result.terminal.executionStatus, 'completed', JSON.stringify(result));
+    const invocations = [...(await repository.load(result.terminal.runId)).invocations.values()];
+    assert.equal(invocations.length, 1);
+    assert.equal(invocations[0].start.reservation.completionTokens, maxOutputTokens ?? 4096);
+    assert.ok(invocations[0].settlement);
+    assert.equal(invocations[0].uncertain, undefined);
+  }
+  assert.equal(requests.length, 2);
+});
+
+test('interrupted provider output preserves the cause and partial text without redispatch', async () => {
+  const events = [];
+  const repository = new InMemoryEventRepository(agentEventCodec);
+  let calls = 0;
+  const provider = {
+    ...fixture(async () => assert.fail('stream required')),
+    describeModel: async () => ({ ...profile, capabilities: { ...profile.capabilities, streaming: true } }),
+    async *stream() {
+      calls++;
+      yield { type: 'content', content: 'Partial answer', accumulated: 'Partial answer' };
+      throw new Error('Connection closed while reading the response');
+    }
+  };
+  const runtime = new AgentRuntime({ provider, model: profile.id, onProgress: event => { events.push(event); },
+    repositories: { events: repository },
+    toolBoundary: { authorizationPolicyId: 'none', executionTargetId: 'none' }
+  });
+  const run = runtime.run({ task: 'Explain.' });
+  const result = await run.result;
+  assert.equal(result.state, 'suspended');
+  assert.equal(result.reason, 'provider_outcome_unknown');
+  assert.equal(calls, 1);
+  const interrupted = events.find(event => event.type === 'assistant.interrupted');
+  assert.equal(interrupted.content, 'Partial answer');
+  assert.equal(interrupted.modelOutput.status, 'partial');
+  assert.equal(interrupted.diagnostic.causeSummary.message, 'Connection closed while reading the response');
+});
+
+
+test('durable replay binds the output reservation policy independently of the wire request', async () => {
+  let calls = 0;
+  const provider = fixture(async request => { calls++; return response(request); });
+  const service = InferenceService.inMemory({ provider });
+  const request = { model: profile.id, messages: [{ role: 'user', content: 'Hello' }] };
+  const invocation = { ...input(), request, outputReservation: 100 };
+  await service.invoke(invocation);
+  assert.equal((await service.invoke(invocation)).replayed, true);
+  await assert.rejects(service.invoke({ ...invocation, outputReservation: 200 }), /different input or configuration/);
+  assert.equal(calls, 1);
+});

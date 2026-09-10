@@ -10,6 +10,7 @@ import {
   parseModelResponse,
   requestAccountingInputTokens,
   type CompiledModelRequest,
+  type ModelCompilationOptions,
   type ModelContextTransformResult,
   type ModelProfile,
   type ModelProvider,
@@ -26,6 +27,7 @@ import {
   type ArtifactRepository
 } from '@agent-core/persistence';
 import { randomUUID } from 'node:crypto';
+import { requestWindowForModel } from '../orchestration/model-request.js';
 import { InferenceGateway, type InferenceInvocation } from './gateway.js';
 import {
   invokeNativeInference,
@@ -49,7 +51,7 @@ export interface InferenceServiceOptions {
   readonly artifacts: ArtifactRepository;
   readonly budget?: InferenceBudget;
 }
-export interface GovernedInferenceInput extends InferenceIdentity {
+export interface GovernedInferenceInput extends InferenceIdentity, ModelCompilationOptions {
   readonly request: ModelRequest;
   readonly profile?: ModelProfile;
   readonly signal?: AbortSignal;
@@ -62,7 +64,7 @@ export interface GovernedContextTransformInput extends Omit<GovernedInferenceInp
 }
 interface DurableInferenceInput extends GovernedInferenceInput {
   readonly session?: ModelProviderSession;
-  readonly admitted?: CompiledModelRequest;
+  readonly compiled?: CompiledModelRequest;
 }
 export interface InferenceCharges {
   readonly usage: ModelUsage;
@@ -98,9 +100,10 @@ export class InferenceNotSentError extends Error {
 export class InferenceOutcomeUnknownError extends Error {
   constructor(
     readonly invocationId: string,
-    message: string
+    message: string,
+    options?: ErrorOptions
   ) {
-    super(message);
+    super(message, options);
     this.name = 'InferenceOutcomeUnknownError';
   }
 }
@@ -116,6 +119,7 @@ interface DurableOperation<T extends { readonly usage?: ModelUsage }> {
   readonly profile: ModelProfile;
   readonly compiled: CompiledModelRequest;
   readonly sourceRequest: ModelRequest;
+  readonly outputReservation?: number;
   readonly signal?: AbortSignal;
   readonly discriminator?: string;
   readonly dispatch: () => Promise<T>;
@@ -152,8 +156,8 @@ export class InferenceService {
   createSession(): ModelProviderSession {
     return this.gateway.createSession();
   }
-  async compile(request: ModelRequest, profile: ModelProfile) {
-    return this.gateway.compile(request, profile);
+  async compile(request: ModelRequest, profile: ModelProfile, options?: ModelCompilationOptions) {
+    return this.gateway.compile(request, profile, options);
   }
   async invokeWithLifecycle<TResult>(
     input: InferenceInvocation,
@@ -169,7 +173,9 @@ export class InferenceService {
           request: input.request,
           profile: input.profile,
           session: input.session,
-          ...(input.admitted ? { admitted: input.admitted } : {}),
+          ...(input.compiled
+            ? { compiled: input.compiled, outputReservation: input.compiled.accounting.outputReservation }
+            : {}),
           ...(input.onStreamEvent ? { onStreamEvent: input.onStreamEvent } : {})
         },
         async () => {
@@ -221,17 +227,18 @@ export class InferenceService {
       ...(signal ? { signal } : {})
     });
     const transform = provider.transformContextCompiled.bind(provider);
-    const compiled = await provider.compileContextTransform({
-      transformId: input.transformId,
-      request,
-      ...(signal ? { signal } : {})
-    });
-    assertCompiledProfile(compiled, profile);
-    assertRequestAccountingFits(compiled.accounting);
+    const compiled = await provider.compileContextTransform(
+      { transformId: input.transformId, request, ...(signal ? { signal } : {}) },
+      {
+        outputReservation: requestWindowForModel(profile, input.outputReservation ?? request.maxOutputTokens)
+          .maxOutputTokens
+      }
+    );
     const result = await this.executeDurably({
       identity: ownIdentity(input),
       operation: 'context_transform',
       sourceRequest: request,
+      ...(input.outputReservation === undefined ? {} : { outputReservation: input.outputReservation }),
       profile,
       compiled,
       discriminator: input.transformId,
@@ -313,6 +320,7 @@ export class InferenceService {
       await modelInputIdentity({
         identity: ownIdentity(context),
         inputIdentity: compiled.inputIdentity,
+        accounting: compiled.accounting,
         profile: context.profile
       })
     ).slice(7);
@@ -386,7 +394,7 @@ export class InferenceService {
       ...input.request,
       ...(signal ? { signal } : {})
     });
-    const compiled = input.admitted ?? (await this.gateway.admit(request, profile));
+    const compiled = input.compiled ?? (await this.gateway.compile(request, profile, input));
     const session = input.session ?? this.gateway.createSession();
     let dispatchPromise: Promise<ModelResponse> | undefined;
     try {
@@ -394,6 +402,7 @@ export class InferenceService {
         identity: ownIdentity(input),
         operation: 'generation',
         sourceRequest: request,
+        ...(input.outputReservation === undefined ? {} : { outputReservation: input.outputReservation }),
         profile,
         compiled,
         ...(signal ? { signal } : {}),
@@ -404,7 +413,7 @@ export class InferenceService {
             profile,
             session,
             turnIndex: 0,
-            admitted: compiled,
+            compiled,
             ...(input.onStreamEvent ? { onStreamEvent: input.onStreamEvent } : {})
           });
           return dispatchPromise;
@@ -430,7 +439,8 @@ export class InferenceService {
     identity: InferenceIdentity,
     operation: 'generation' | 'context_transform' | 'native_generation',
     request: ModelRequest,
-    discriminator?: string
+    discriminator?: string,
+    outputReservation?: number
   ): Promise<string> {
     return (
       await modelInputIdentity({
@@ -439,7 +449,8 @@ export class InferenceService {
         discriminator: discriminator ?? null,
         provider: this.options.provider.id,
         implementation: this.options.provider.implementationId,
-        request: recordableSourceRequest(request)
+        request: recordableSourceRequest(request),
+        outputReservation: outputReservation ?? null
       })
     ).slice(7);
   }
@@ -458,7 +469,7 @@ export class InferenceService {
     if (!existing) return undefined;
     if (
       existing.start.sourceFingerprint !==
-      (await this.sourceFingerprint(identity, operation, input.request, discriminator))
+      (await this.sourceFingerprint(identity, operation, input.request, discriminator, input.outputReservation))
     )
       throw new Error(
         `Inference ${identity.invocationId} was already admitted with different input or configuration.`
@@ -513,13 +524,15 @@ export class InferenceService {
     const { identity, profile, compiled, signal } = input;
     signal?.throwIfAborted();
     assertCompiledProfile(compiled, profile);
+    assertRequestAccountingFits(compiled.accounting);
     const logical = { ...compiled.logicalRequest };
     delete logical.signal;
     const sourceFingerprint = await this.sourceFingerprint(
       identity,
       input.operation,
       input.sourceRequest,
-      input.discriminator
+      input.discriminator,
+      input.outputReservation
     );
     const fingerprint = (
       await modelInputIdentity({
@@ -530,6 +543,7 @@ export class InferenceService {
         implementation: this.options.provider.implementationId,
         profile,
         inputIdentity: compiled.inputIdentity,
+        accounting: compiled.accounting,
         sourceFingerprint
       })
     ).slice(7);
@@ -696,7 +710,8 @@ export class InferenceService {
       }
       throw new InferenceOutcomeUnknownError(
         identity.invocationId,
-        'Provider dispatch ended without a durable known result; the invocation will not be retried.'
+        cause instanceof Error ? cause.message : String(cause),
+        { cause }
       );
     };
     let dispatchStarted = false;

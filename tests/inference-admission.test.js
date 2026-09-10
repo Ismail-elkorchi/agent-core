@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { InferenceGateway } from '@agent-core/runtime';
+import { InferenceService } from '@agent-core/runtime';
 import { accountModelRequest, assertRequestAccountingFits, ModelContractError } from '@agent-core/model';
 
 const profile = Object.freeze({
@@ -35,7 +35,7 @@ test('model request fit accounts for messages, tool and response schemas, and th
   assertRequestAccountingFits(fit);
 });
 
-test('inference gateway rejects an oversized logical request before provider invocation', async () => {
+test('inference admission rejects an oversized logical request before provider invocation', async () => {
   let calls = 0;
   const provider = {
     id: profile.provider,
@@ -50,10 +50,9 @@ test('inference gateway rejects an oversized logical request before provider inv
     }),
     complete: async (request) => ({ content: '', model: request.model, provider: profile.provider, terminationReason: 'stop' })
   };
-  const gateway = new InferenceGateway(provider);
-  const session = gateway.createSession();
+  const service = InferenceService.inMemory({ provider });
   await assert.rejects(
-    gateway.invoke({ request: { model: profile.id, messages: [{ role: 'user', content: 'x'.repeat(400) }] }, profile, session, turnIndex: 0 }),
+    service.invoke({ ownerId: 'test', invocationId: 'oversized', purpose: 'admission', request: { model: profile.id, messages: [{ role: 'user', content: 'x'.repeat(400) }] }, profile }),
     error => error instanceof ModelContractError
   );
   assert.equal(calls, 0);

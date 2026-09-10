@@ -463,7 +463,10 @@ export interface ModelProvider {
   readonly id: string;
   /** Stable identity of the adapter implementation whose request and recovery semantics are in force. */
   readonly implementationId: string;
-  compileRequest?(request: ModelRequest): Promise<import('./accounting.js').CompiledModelRequest>;
+  compileRequest?(
+    request: ModelRequest,
+    options?: import('./accounting.js').ModelCompilationOptions
+  ): Promise<import('./accounting.js').CompiledModelRequest>;
   completeCompiled?(
     request: import('./accounting.js').CompiledModelRequest,
     options?: ModelTransportOptions
@@ -474,7 +477,8 @@ export interface ModelProvider {
   ): AsyncIterable<ModelStreamEvent>;
   transformContext?(request: ModelContextTransformRequest): Promise<ModelContextTransformResult>;
   compileContextTransform?(
-    request: ModelContextTransformRequest
+    request: ModelContextTransformRequest,
+    options?: import('./accounting.js').ModelCompilationOptions
   ): Promise<import('./accounting.js').CompiledModelRequest>;
   transformContextCompiled?(
     transformId: string,

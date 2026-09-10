@@ -8,6 +8,7 @@ import {
 import { parseJsonValue } from '@agent-core/json';
 import {
   type CompiledModelRequest,
+  type ModelCompilationOptions,
   type ModelProvider,
   ModelProviderError,
   type ModelProviderInfo,
@@ -101,7 +102,6 @@ export type {
 export type OpenAICodexTransport = 'http_sse' | 'websocket';
 
 export interface OpenAICodexProviderOptions {
-  outputReservation?: number;
   auth?: ProviderAuth | BearerTokenProvider;
   credentialStore?: CredentialStore;
   credentialKey?: string;
@@ -119,8 +119,7 @@ export interface OpenAICodexProviderOptions {
 export class OpenAICodexProvider implements ModelProvider {
   readonly id = OPENAI_CODEX_PROVIDER_ID;
   readonly implementationId = 'agent-core.provider.openai-codex@1';
-  private readonly admittedRequests = new WeakSet<CompiledModelRequest>();
-  private readonly outputReservation: number | undefined;
+  private readonly compiledRequests = new WeakSet<CompiledModelRequest>();
   private readonly tokenProvider: BearerTokenProvider;
   private readonly baseUrl: string;
   private readonly defaultModel: string;
@@ -133,12 +132,6 @@ export class OpenAICodexProvider implements ModelProvider {
   private readonly modelProfiles: Record<string, OpenAICodexModelProfileDefinition>;
 
   constructor(options: OpenAICodexProviderOptions = {}) {
-    this.outputReservation = options.outputReservation;
-    if (
-      this.outputReservation !== undefined &&
-      (!Number.isSafeInteger(this.outputReservation) || this.outputReservation < 1)
-    )
-      throw new RangeError('outputReservation must be positive.');
     this.baseUrl = resolveCodexUrl(options.baseUrl ?? OPENAI_CODEX_BASE_URL);
     this.defaultModel = options.model ?? OPENAI_CODEX_DEFAULT_MODEL;
     this.fetchImpl = options.fetch ?? fetch;
@@ -184,11 +177,19 @@ export class OpenAICodexProvider implements ModelProvider {
     );
   }
 
-  async compileRequest(request: ModelRequest): Promise<CompiledModelRequest> {
+  async compileRequest(
+    request: ModelRequest,
+    options?: ModelCompilationOptions
+  ): Promise<CompiledModelRequest> {
     request = await this.validateRequest(request);
     const cached = codexCompiledRequest(request);
-    if (cached && this.admittedRequests.has(cached)) return cached;
-    // Shared framing caches cannot establish another provider instance's capability admission.
+    if (
+      cached &&
+      this.compiledRequests.has(cached) &&
+      (options === undefined || options.outputReservation === cached.accounting.outputReservation)
+    )
+      return cached;
+    // Each compilation keeps its own logical identity across provider instances and policies.
     if (cached) request = parseModelRequest({ ...request });
     const body = toCodexResponsesRequest(request, false);
     delete body.stream;
@@ -197,16 +198,16 @@ export class OpenAICodexProvider implements ModelProvider {
       profile: await this.describeModel(request.model),
       body,
       payloadPaths: responsesPayloadPaths(body),
-      ...(this.outputReservation === undefined ? {} : { outputReservation: this.outputReservation }),
+      ...options,
       endpoint: this.baseUrl
     });
     cacheCodexCompiledRequest(compiled);
-    this.admittedRequests.add(compiled);
+    this.compiledRequests.add(compiled);
     return compiled;
   }
   assertCompiled(compiled: CompiledModelRequest): void {
     if (
-      !this.admittedRequests.has(compiled) ||
+      !this.compiledRequests.has(compiled) ||
       compiled.endpoint !== this.baseUrl ||
       codexCompiledRequest(compiled.logicalRequest) !== compiled
     )

@@ -80,9 +80,12 @@ export interface RequestAccounting {
   };
   readonly uncertainty: { readonly calibrated: false; readonly headroomRatio: number };
 }
-export interface RequestAccountingOptions {
-  readonly estimator?: RequestEstimator;
+/** Admission policy, independent of provider generation controls. */
+export interface ModelCompilationOptions {
   readonly outputReservation?: number;
+}
+export interface RequestAccountingOptions extends ModelCompilationOptions {
+  readonly estimator?: RequestEstimator;
   /** Bounded parent output that can enter a preauthorized native successor. */
   readonly retainedInputTokenReservation?: number;
   readonly unknownTokenAllowance?: number;
@@ -155,7 +158,8 @@ function assembleAccounting(
   const unknown = components.filter((part) => part.status === 'unknown');
   const outputReservation = checked(
     request.maxOutputTokens ?? options.outputReservation ?? 0,
-    'outputReservation'
+    'outputReservation',
+    request.maxOutputTokens !== undefined || options.outputReservation !== undefined
   );
   const unknownTokenAllowance =
     options.unknownTokenAllowance === undefined

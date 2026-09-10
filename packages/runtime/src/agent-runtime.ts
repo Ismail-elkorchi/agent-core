@@ -2496,7 +2496,9 @@ export class AgentRuntime {
           ? { responseFormat: request.snapshot.configuration.responseFormat }
           : {})
       };
-      const compiled = await this.inferenceService.compile(modelRequest, request.snapshot.profile);
+      const compiled = await this.inferenceService.compile(modelRequest, request.snapshot.profile, {
+        outputReservation: outputReserveTokens
+      });
       const estimate = request.snapshot.budgetAccountant.estimateRequest({
         accounting: compiled.accounting,
         modelWindowTokens: assembly.estimate.modelWindowTokens,
