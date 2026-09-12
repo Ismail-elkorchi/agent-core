@@ -10,6 +10,7 @@ import {
   PendingCallCoordinator,
   AgentFinalizationError,
   AgentRunFinalizer,
+  applyAgentRunStateTransition,
   agentEventCodec,
   decodeAgentEvent,
   readCommittedTerminal
@@ -985,19 +986,23 @@ test('cancellation durably closes or marks every call in a parallel batch', asyn
   await control.abort('cancel parallel batch');
   const result = ended(await control.result);
   assert.equal(result.executionStatus, 'aborted');
-  const transitions = (await eventsFor(run.events, control.runId)).filter(
-    (event) => event.type === 'run.state.changed'
-  );
+  let projected;
+  const transitions = [];
+  for (const event of await eventsFor(run.events, control.runId)) {
+    if (event.type !== 'run.state.transitioned') continue;
+    projected = applyAgentRunStateTransition(projected, event.transition);
+    transitions.push(projected);
+  }
   const cancelling = transitions.find(
-    (event) => event.state.phase.kind === 'cancelling' && event.state.toolBatches.length
+    (state) => state.phase.kind === 'cancelling' && state.toolBatches.length
   );
   assert.ok(cancelling);
   assert.deepEqual(
-    cancelling.state.toolBatches[0].callStates.map((state) => state.stage),
+    cancelling.toolBatches[0].callStates.map((state) => state.stage),
     ['outcome_unknown', 'outcome_unknown', 'cancelled']
   );
   assert.equal(
-    cancelling.state.toolBatches[0].callStates.every(
+    cancelling.toolBatches[0].callStates.every(
       (state) =>
         state.stage !== 'ready' && state.stage !== 'effect_ready' && state.stage !== 'effect_pending'
     ),
@@ -1365,8 +1370,9 @@ test('a provider start ticket stranded by process loss becomes an exact durable 
       const receipt = await super.appendConditional(runId, event, options);
       if (
         this.interrupt &&
-        event.type === 'run.state.changed' &&
-        event.state.providerRequests.some((request) => request.stage === 'effect_ready')
+        event.type === 'run.state.transitioned' &&
+        event.transition.kind === 'updated' &&
+        event.transition.providerRequests?.some((entry) => entry.value.stage === 'effect_ready')
       ) {
         this.interrupt = false;
         this.stopped = true;
@@ -1410,8 +1416,9 @@ test('a persisted provider settlement resumes without issuing a duplicate reques
     async appendConditional(runId, event, options) {
       if (
         this.interrupt &&
-        event.type === 'run.state.changed' &&
-        event.state.providerRequests.some((request) => request.stage === 'settled')
+        event.type === 'run.state.transitioned' &&
+        event.transition.kind === 'updated' &&
+        event.transition.providerRequests?.some((entry) => entry.value.stage === 'settled')
       ) {
         this.interrupt = false;
         throw new Error('simulated process stop after provider settlement');
@@ -2665,7 +2672,6 @@ function terminal() {
     budget: {
       modelTurns: 1,
       totalToolCalls: 0,
-      repeatedIdenticalToolCalls: 0,
       elapsedMs: 1,
       promptTokens: 0,
       completionTokens: 0,

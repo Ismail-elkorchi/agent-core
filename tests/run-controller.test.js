@@ -43,22 +43,3 @@ test('unknown pricing and mixed currencies are tracked explicitly', () => {
   assert.deepEqual(controller.snapshot().knownCosts, { EUR: 2, USD: 4 });
   assert.equal(controller.snapshot().pricingStatus, 'partial');
 });
-
-test('approval restart reconstructs repeated-call fingerprints from persisted history', () => {
-  const call = { id: 'read-1', type: 'function', name: 'read', input: { kind: 'json', value: { path: 'same.txt' } } };
-  const first = new AgentRunController({ limits: { repeatedIdenticalToolCalls: 1 } });
-  first.recordToolCalls([call]);
-  const restored = new AgentRunController({
-    limits: { repeatedIdenticalToolCalls: 1 },
-    initialBudget: first.snapshot(),
-    initialToolCalls: [call]
-  });
-  assert.throws(() => restored.recordToolCalls([call]), error => {
-    assert.ok(error instanceof AgentLimitExceededError);
-    assert.equal(error.limit, 'repeated_tool_calls');
-    assert.equal(error.consumed, false);
-    return true;
-  });
-  assert.equal(restored.snapshot().totalToolCalls, 1);
-  assert.equal(restored.snapshot().repeatedIdenticalToolCalls, 1);
-});

@@ -135,7 +135,6 @@ export interface ObservationAccess {
 export type AgentLimitKind =
   | 'model_turns'
   | 'total_tool_calls'
-  | 'repeated_tool_calls'
   | 'elapsed_time'
   | 'prompt_tokens'
   | 'completion_tokens'
@@ -146,7 +145,6 @@ export interface AgentRunLimits {
   readonly maxConcurrentToolCalls: number;
   readonly modelTurns: number;
   readonly totalToolCalls: number;
-  readonly repeatedIdenticalToolCalls: number;
   readonly elapsedMs: number;
   readonly promptTokens: number;
   readonly completionTokens: number;
@@ -161,7 +159,6 @@ export const DEFAULT_AGENT_RUN_LIMITS: AgentRunLimits = Object.freeze({
   maxConcurrentToolCalls: 4,
   modelTurns: 32,
   totalToolCalls: 128,
-  repeatedIdenticalToolCalls: 3,
   elapsedMs: 30 * 60 * 1_000,
   promptTokens: 1_000_000,
   completionTokens: 250_000,
@@ -175,7 +172,6 @@ export const DEFAULT_AGENT_RUN_LIMITS: AgentRunLimits = Object.freeze({
 export type AgentRunBudgetState = Readonly<{
   readonly modelTurns: number;
   readonly totalToolCalls: number;
-  readonly repeatedIdenticalToolCalls: number;
   readonly elapsedMs: number;
   readonly promptTokens: number;
   readonly completionTokens: number;
@@ -192,7 +188,6 @@ export type AgentRunBudgetState = Readonly<{
 const AGENT_RUN_BUDGET_FIELDS = [
   'modelTurns',
   'totalToolCalls',
-  'repeatedIdenticalToolCalls',
   'elapsedMs',
   'promptTokens',
   'completionTokens',
@@ -359,7 +354,6 @@ export function validateAgentRunLimits(input: Partial<AgentRunLimits> = {}): Age
     'maxConcurrentToolCalls',
     'modelTurns',
     'totalToolCalls',
-    'repeatedIdenticalToolCalls',
     'elapsedMs',
     'promptTokens',
     'completionTokens',
@@ -580,7 +574,6 @@ export function terminalSnapshotFingerprint(snapshot: AgentTerminalSnapshot): st
 const AGENT_LIMIT_KINDS: readonly AgentLimitKind[] = [
   'model_turns',
   'total_tool_calls',
-  'repeated_tool_calls',
   'elapsed_time',
   'prompt_tokens',
   'completion_tokens',
@@ -673,7 +666,6 @@ function isBudgetState(value: unknown): value is AgentRunBudgetState {
   const names = [
     'modelTurns',
     'totalToolCalls',
-    'repeatedIdenticalToolCalls',
     'elapsedMs',
     'promptTokens',
     'completionTokens',

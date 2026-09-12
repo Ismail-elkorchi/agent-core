@@ -12,6 +12,7 @@ export * from './ports.js';
 export * from './run/contracts.js';
 export * from './run/control/contracts.js';
 export * from './run/control/driver.js';
+export * from './run/control/state-transition.js';
 export * from './session/agent-session.js';
 export * from './session/binding.js';
 export * from './session/contracts.js';

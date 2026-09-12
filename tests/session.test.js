@@ -300,7 +300,6 @@ test('session run finalizations are idempotent and validate the complete termina
     budget: {
       modelTurns: 1,
       totalToolCalls: 0,
-      repeatedIdenticalToolCalls: 0,
       elapsedMs: 1,
       promptTokens: 0,
       completionTokens: 0,
@@ -462,7 +461,6 @@ function completedTerminal(runId, finalizationId, message) {
     budget: {
       modelTurns: 1,
       totalToolCalls: 0,
-      repeatedIdenticalToolCalls: 0,
       elapsedMs: 1,
       promptTokens: 0,
       completionTokens: 0,
@@ -964,7 +962,7 @@ test('AgentSession restores claimed and queued work without starting execution d
   });
   recovered.subscribe((event) => {
     if (event.type === 'run.failed') failures.push(event.error.message);
-  });
+  }, assert.fail);
   await recovered.restore();
   assert.deepEqual(executed, []);
   await recovered.waitForIdle();

@@ -6,6 +6,7 @@ import {
   AgentRunConflictError,
   AgentRunCoordinator,
   agentEventCodec,
+  createAgentRunStateTransition,
   decodeAgentRunState,
   nextAgentRunInstruction
 } from '@agent-core/runtime';
@@ -144,7 +145,6 @@ test('a stale live owner may settle only its exact started tool effect permit', 
     budget: {
       modelTurns: 1,
       totalToolCalls: 1,
-      repeatedIdenticalToolCalls: 0,
       elapsedMs: 1,
       promptTokens: 0,
       completionTokens: 0,
@@ -156,13 +156,12 @@ test('a stale live owner may settle only its exact started tool effect permit', 
       unknownPricedTokens: 0,
       consecutiveProviderFailures: 0,
       consecutiveToolFailures: 0
-    },
-    toolCalls: [call]
+    }
   });
   const tail = await events.tail('effect-settlement');
   const installed = await events.appendConditional(
     'effect-settlement',
-    { type: 'run.state.changed', state: pending },
+    { type: 'run.state.transitioned', transition: createAgentRunStateTransition(staleOwner.state(), pending) },
     {
       idempotencyKey: 'effect-settlement:pending',
       expectedTail: tail,
@@ -285,7 +284,6 @@ test('every completion permutation survives takeover and records each settled ca
       budget: {
         modelTurns: 1,
         totalToolCalls: 3,
-        repeatedIdenticalToolCalls: 1,
         elapsedMs: 1,
         promptTokens: 0,
         completionTokens: 0,
@@ -297,12 +295,11 @@ test('every completion permutation survives takeover and records each settled ca
         unknownPricedTokens: 0,
         consecutiveProviderFailures: 0,
         consecutiveToolFailures: 0
-      },
-      toolCalls: calls
+      }
     });
     const installed = await events.appendConditional(
       runId,
-      { type: 'run.state.changed', state: pending },
+      { type: 'run.state.transitioned', transition: createAgentRunStateTransition(initial.state(), pending) },
       {
         idempotencyKey: `${runId}:pending`,
         expectedTail: await events.tail(runId),
@@ -404,8 +401,7 @@ test('total run states select one explicit procedure, wait, or completion', () =
     control: { status: 'detached' },
     phase: { kind: 'accepted' },
     providerRequests: [],
-    toolBatches: [],
-    toolCalls: []
+    toolBatches: []
   });
   assert.deepEqual(nextAgentRunInstruction(accepted), { kind: 'wait', reason: 'driver' });
   const owned = decodeAgentRunState({

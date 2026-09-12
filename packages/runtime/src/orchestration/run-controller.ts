@@ -1,4 +1,3 @@
-import { canonicalJsonString } from '@agent-core/json';
 import { calculateInferenceCost } from '../inference/usage-cost.js';
 
 import type { ModelPricing, ModelUsage } from '@agent-core/model';
@@ -52,12 +51,10 @@ export class AgentRunController {
   private readonly clock: AgentClock;
   private readonly startedAt: number;
   private readonly initialElapsedMs: number;
-  private readonly callCounts = new Map<string, number>();
   private currentPhase: AgentRunPhase = 'initializing';
   private state: Omit<AgentRunBudgetState, 'elapsedMs'> = {
     modelTurns: 0,
     totalToolCalls: 0,
-    repeatedIdenticalToolCalls: 0,
     promptTokens: 0,
     completionTokens: 0,
     cacheReadTokens: 0,
@@ -75,7 +72,6 @@ export class AgentRunController {
       readonly clock?: AgentClock;
       readonly limits?: Partial<AgentRunLimits>;
       readonly initialBudget?: AgentRunBudgetState;
-      readonly initialToolCalls?: readonly ToolCall[];
     } = {}
   ) {
     this.limits = validateAgentRunLimits(input.limits);
@@ -85,28 +81,9 @@ export class AgentRunController {
       const { elapsedMs, ...rest } = input.initialBudget;
       this.initialElapsedMs = elapsedMs;
       this.state = { ...rest };
-      if (input.initialToolCalls) this.restoreToolCallHistory(input.initialToolCalls);
     } else {
       this.initialElapsedMs = 0;
-      if (input.initialToolCalls && input.initialToolCalls.length > 0)
-        throw new Error('Initial tool-call history requires an initial budget snapshot.');
     }
-  }
-
-  private restoreToolCallHistory(calls: readonly ToolCall[]): void {
-    if (calls.length !== this.state.totalToolCalls)
-      throw new Error(
-        `Recovered tool-call history count ${String(calls.length)} does not match budget total ${String(this.state.totalToolCalls)}.`
-      );
-    for (const call of calls) {
-      const fingerprint = `${call.name}:${canonicalJsonString(call.input)}`;
-      this.callCounts.set(fingerprint, (this.callCounts.get(fingerprint) ?? 0) + 1);
-    }
-    const recoveredMaximum = Math.max(0, ...this.callCounts.values());
-    if (recoveredMaximum !== this.state.repeatedIdenticalToolCalls)
-      throw new Error(
-        `Recovered repeated-call maximum ${String(recoveredMaximum)} does not match budget value ${String(this.state.repeatedIdenticalToolCalls)}.`
-      );
   }
 
   get phase(): AgentRunPhase {
@@ -174,34 +151,9 @@ export class AgentRunController {
         { ...previous, totalToolCalls: total },
         false
       );
-    let maximum = this.state.repeatedIdenticalToolCalls;
-    const nextCounts = new Map(this.callCounts);
-    for (const call of calls) {
-      const fingerprint = `${call.name}:${canonicalJsonString(call.input)}`;
-      const count = (nextCounts.get(fingerprint) ?? 0) + 1;
-      nextCounts.set(fingerprint, count);
-      maximum = Math.max(maximum, count);
-      if (count > this.limits.repeatedIdenticalToolCalls)
-        throw this.limitError(
-          'repeated_tool_calls',
-          count,
-          this.limits.repeatedIdenticalToolCalls,
-          1,
-          previous,
-          {
-            ...previous,
-            totalToolCalls: total,
-            repeatedIdenticalToolCalls: maximum
-          },
-          false
-        );
-    }
-    this.callCounts.clear();
-    for (const [key, count] of nextCounts) this.callCounts.set(key, count);
     this.state = {
       ...this.state,
-      totalToolCalls: total,
-      repeatedIdenticalToolCalls: maximum
+      totalToolCalls: total
     };
   }
 

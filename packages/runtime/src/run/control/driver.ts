@@ -12,9 +12,8 @@ import {
   type EventLedgerTail,
   type EventRepository
 } from '@agent-core/persistence';
-import type { ToolCall } from '@agent-core/tools';
 import { encodeToolObservation } from '@agent-core/tools';
-import { encodeAgentEvent, type AgentAuditEvent, type AgentEvent } from '../../events.js';
+import type { AgentAuditEvent, AgentEvent } from '../../events.js';
 import type { AgentRunBudgetState } from '../contracts.js';
 import {
   decodeAgentRunState,
@@ -32,6 +31,11 @@ import {
   type AgentRunTarget,
   type AgentToolTarget
 } from './contracts.js';
+import {
+  applyAgentRunStateTransition,
+  createAgentRunStateTransition,
+  type AgentRunStateTransition
+} from './state-transition.js';
 import {
   decodeAgentToolSettlementRecord,
   decodeToolResultDelivery,
@@ -65,7 +69,6 @@ export interface AgentRunAdvance {
   readonly providerRequests?: readonly AgentProviderPhase[];
   readonly toolBatches?: readonly AgentToolPhase[];
   readonly budget?: AgentRunBudgetState;
-  readonly toolCalls?: readonly ToolCall[];
 }
 
 export interface AgentRunProcedureContext {
@@ -124,17 +127,12 @@ export class AgentRunCoordinator {
       control: { status: 'detached' },
       phase: { kind: 'accepted' },
       providerRequests: [],
-      toolBatches: [],
-      toolCalls: []
+      toolBatches: []
     });
     const expectedTail = await this.events.tail(state.runId);
     if (expectedTail.sequence !== -1) {
       const existing = await this.inspect(state.runId);
-      if (
-        canonicalJsonString(encodeAgentEvent({ type: 'run.state.changed', state: existing.state })) ===
-        canonicalJsonString(encodeAgentEvent({ type: 'run.state.changed', state }))
-      )
-        return existing;
+      if (canonicalJsonString(existing.state) === canonicalJsonString(state)) return existing;
       throw new AgentRunConflictError(
         state.runId,
         'stale_tail',
@@ -143,7 +141,7 @@ export class AgentRunCoordinator {
     }
     const result = await this.events.appendConditional(
       state.runId,
-      { type: 'run.state.changed', state },
+      transitionEvent(undefined, state),
       {
         idempotencyKey: `${state.runId}:run:accepted`,
         expectedTail,
@@ -157,7 +155,17 @@ export class AgentRunCoordinator {
   async inspect(runId: string): Promise<AgentRunInspection> {
     for (;;) {
       const before = await this.events.tail(runId);
-      const transition = await this.events.latestOfType(runId, 'run.state.changed');
+      let state: AgentRunState | undefined;
+      let transition:
+        | Readonly<{ readonly eventId: string; readonly sequence: number; readonly hash: string; readonly driverGeneration: number }>
+        | undefined;
+      for await (const record of this.events.read(runId)) {
+        if (record.event.type !== 'run.state.transitioned') continue;
+        state = applyAgentRunStateTransition(state, record.event.transition);
+        if (state.runId !== runId || state.driverGeneration !== record.driverGeneration)
+          throw new Error(`Run ${runId} has a contradictory run transition.`);
+        transition = record;
+      }
       const tail = await this.events.tail(runId);
       if (
         before.sequence !== tail.sequence ||
@@ -165,12 +173,7 @@ export class AgentRunCoordinator {
         before.driverGeneration !== tail.driverGeneration
       )
         continue;
-      if (transition?.event.type !== 'run.state.changed')
-        throw new Error(`Run ${runId} has no durable run.`);
-      const state = transition.event.state;
-      if (state.runId !== runId || state.driverGeneration !== transition.driverGeneration) {
-        throw new Error(`Run ${runId} has a contradictory run transition.`);
-      }
+      if (!transition || !state) throw new Error(`Run ${runId} has no durable run.`);
       return Object.freeze({
         state,
         transition: Object.freeze({
@@ -187,13 +190,8 @@ export class AgentRunCoordinator {
   async listUnfinished(): Promise<readonly AgentRunInspection[]> {
     const unfinished: AgentRunInspection[] = [];
     for (const runId of await this.events.listRunIds()) {
-      const transition = await this.events.latestOfType(runId, 'run.state.changed');
-      if (
-        transition?.event.type !== 'run.state.changed' ||
-        transition.event.state.phase.kind === 'terminal'
-      )
-        continue;
-      unfinished.push(await this.inspect(runId));
+      const run = await this.inspect(runId);
+      if (run.state.phase.kind !== 'terminal') unfinished.push(run);
     }
     return Object.freeze(unfinished);
   }
@@ -220,7 +218,7 @@ export class AgentRunCoordinator {
     });
     const result = await this.events.appendConditional(
       runId,
-      { type: 'run.state.changed', state },
+      transitionEvent(current.state, state),
       {
         idempotencyKey: `${runId}:driver:${String(generation)}`,
         expectedTail: current.tail,
@@ -245,11 +243,12 @@ export class AgentRunCoordinator {
           reason
         }
       });
+      const event = transitionEvent(current.state, state);
       const result = await this.events.appendConditional(
         runId,
-        { type: 'run.state.changed', state },
+        event,
         {
-          idempotencyKey: transitionKey(state),
+          idempotencyKey: transitionKey(state, event.transition),
           expectedTail: current.tail,
           driverGeneration: current.tail.driverGeneration
         }
@@ -363,7 +362,7 @@ export class AgentRunCoordinator {
       });
       const result = await this.events.appendConditional(
         runId,
-        { type: 'run.state.changed', state },
+        transitionEvent(current.state, state),
         {
           idempotencyKey: `${runId}:tool-effect:${input.effectId}:settled:${resultDigest}`,
           expectedTail: current.tail,
@@ -606,11 +605,12 @@ export class AgentRunDriver {
           revision: this.stateValue.revision + 1,
           control: { status: 'abort_requested', driverId: this.driverId, reason }
         });
+        const event = transitionEvent(this.stateValue, state);
         const result = await this.events.appendConditional(
           state.runId,
-          { type: 'run.state.changed', state },
+          event,
           {
-            idempotencyKey: transitionKey(state),
+            idempotencyKey: transitionKey(state, event.transition),
             expectedTail: this.tailValue,
             driverGeneration: state.driverGeneration
           }
@@ -681,18 +681,18 @@ export class AgentRunDriver {
       phase: advance.phase,
       providerRequests: advance.providerRequests ?? this.stateValue.providerRequests,
       toolBatches: advance.toolBatches ?? this.stateValue.toolBatches,
-      toolCalls: advance.toolCalls ?? this.stateValue.toolCalls,
       ...(advance.budget === undefined
         ? this.stateValue.budget === undefined
           ? {}
           : { budget: this.stateValue.budget }
         : { budget: advance.budget })
     });
+    const event = transitionEvent(this.stateValue, state);
     const result = await this.events.appendConditional(
       state.runId,
-      { type: 'run.state.changed', state },
+      event,
       {
-        idempotencyKey: transitionKey(state),
+        idempotencyKey: transitionKey(state, event.transition),
         expectedTail: this.tailValue,
         driverGeneration: state.driverGeneration
       }
@@ -817,8 +817,18 @@ function acceptConditionalResult(
   );
 }
 
-function transitionKey(state: AgentRunState): string {
-  return `${state.runId}:run:revision:${String(state.revision)}:${hashJson(encodeAgentEvent({ type: 'run.state.changed', state }))}`;
+function transitionEvent(
+  previous: AgentRunState | undefined,
+  state: AgentRunState
+): Extract<AgentEvent, { readonly type: 'run.state.transitioned' }> {
+  return Object.freeze({
+    type: 'run.state.transitioned',
+    transition: createAgentRunStateTransition(previous, state)
+  });
+}
+
+function transitionKey(state: AgentRunState, transition: AgentRunStateTransition): string {
+  return `${state.runId}:run:revision:${String(state.revision)}:${hashJson(transition)}`;
 }
 
 function toolSettlementDigest(settlement: AgentToolSettlementRecord): string {

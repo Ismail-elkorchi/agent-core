@@ -24,7 +24,6 @@
   "limits": {
     "modelTurns": 32,
     "totalToolCalls": 128,
-    "repeatedIdenticalToolCalls": 3,
     "elapsedMs": 1800000,
     "promptTokens": 1000000,
     "completionTokens": 250000,

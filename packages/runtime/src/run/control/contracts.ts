@@ -1,7 +1,6 @@
 import { decodeEffectExecutionState, type EffectExecutionState } from '@agent-core/effects';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
 import { hashJson } from '@agent-core/persistence';
-import { decodeToolCall, type ToolCall } from '@agent-core/tools';
 import {
   decodePromptContextItemInput,
   type PromptContextItemInput
@@ -146,7 +145,6 @@ export interface AgentRunState {
   readonly phase: AgentRunControlPhase;
   readonly providerRequests: readonly AgentProviderPhase[];
   readonly toolBatches: readonly AgentToolPhase[];
-  readonly toolCalls: readonly ToolCall[];
   readonly budget?: AgentRunBudgetState;
 }
 
@@ -388,13 +386,12 @@ export function decodeAgentRunState(value: unknown): AgentRunState {
     'phase',
     'providerRequests',
     'toolBatches',
-    'toolCalls',
     'budget'
   ]);
-  const input = decodeInput(state.input);
-  const configuration = decodeConfiguration(state.configuration);
-  const control = decodeControl(state.control);
-  const phase = decodePhase(state.phase);
+  const input = decodeAgentRunStateInput(state.input);
+  const configuration = decodeAgentRunControlConfiguration(state.configuration);
+  const control = decodeAgentRunControl(state.control);
+  const phase = decodeAgentRunControlPhase(state.phase);
   const providerRequests = Object.freeze(
     array(state.providerRequests, 'providerRequests').map(decodeProviderPhase)
   );
@@ -425,7 +422,6 @@ export function decodeAgentRunState(value: unknown): AgentRunState {
     }
     effectIds.add(effect.intent.effectId);
   }
-  const toolCalls = Object.freeze(array(state.toolCalls, 'toolCalls').map((call) => decodeToolCall(call)));
   const budget = state.budget === undefined ? undefined : decodeBudget(state.budget);
   const runId = identifier(state.runId, 'runId');
   const revision = nonnegativeInteger(state.revision, 'revision');
@@ -450,12 +446,11 @@ export function decodeAgentRunState(value: unknown): AgentRunState {
     phase,
     providerRequests,
     toolBatches,
-    toolCalls,
     ...(budget === undefined ? {} : { budget })
   });
 }
 
-function decodeInput(value: unknown): AgentRunStateInput {
+export function decodeAgentRunStateInput(value: unknown): AgentRunStateInput {
   const input = object(value, 'run input');
   exact(input, ['task', 'instructions', 'contextItems']);
   return Object.freeze({
@@ -467,7 +462,7 @@ function decodeInput(value: unknown): AgentRunStateInput {
   });
 }
 
-function decodeConfiguration(value: unknown): AgentRunControlConfiguration {
+export function decodeAgentRunControlConfiguration(value: unknown): AgentRunControlConfiguration {
   const configuration = object(value, 'run configuration');
   exact(configuration, [
     'providerId',
@@ -490,7 +485,7 @@ function decodeConfiguration(value: unknown): AgentRunControlConfiguration {
   });
 }
 
-function decodeControl(value: unknown): AgentRunControl {
+export function decodeAgentRunControl(value: unknown): AgentRunControl {
   const control = object(value, 'run control');
   const status = enumeration(
     control.status,
@@ -515,7 +510,7 @@ function decodeControl(value: unknown): AgentRunControl {
   });
 }
 
-function decodePhase(value: unknown): AgentRunControlPhase {
+export function decodeAgentRunControlPhase(value: unknown): AgentRunControlPhase {
   const phase = object(value, 'run phase');
   const kind = enumeration(
     phase.kind,

@@ -4,7 +4,12 @@ import * as z from 'zod';
 import { hashJson, InMemoryEventRepository } from '@agent-core/persistence';
 import { issueEffectStartTicket, startExternalEffect, settleExternalEffect } from '@agent-core/effects';
 import { createToolCall, parseToolObservation } from '@agent-core/tools';
-import { AgentRunCoordinator, agentEventCodec, decodeAgentRunState } from '@agent-core/runtime';
+import {
+  AgentRunCoordinator,
+  agentEventCodec,
+  createAgentRunStateTransition,
+  decodeAgentRunState
+} from '@agent-core/runtime';
 
 function acceptance(runId) {
   return {
@@ -148,7 +153,7 @@ async function fixture(runId, toolBatches, providerRequests = []) {
   });
   await events.appendConditional(
     runId,
-    { type: 'run.state.changed', state },
+    { type: 'run.state.transitioned', transition: createAgentRunStateTransition(initial.state(), state) },
     {
       idempotencyKey: `${runId}:work`,
       expectedTail: await events.tail(runId),

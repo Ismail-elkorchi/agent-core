@@ -829,12 +829,7 @@ export class AgentRuntime {
     const controller = new AgentRunController({
       ...(this.options.clock ? { clock: this.options.clock } : {}),
       ...(this.options.limits ? { limits: this.options.limits } : {}),
-      ...(durableState.budget
-        ? {
-            initialBudget: durableState.budget,
-            initialToolCalls: durableState.toolCalls
-          }
-        : {})
+      ...(durableState.budget ? { initialBudget: durableState.budget } : {})
     });
     const deliveryDiagnostics: {
       eventType: string;
@@ -1519,8 +1514,7 @@ export class AgentRuntime {
               : record
           ),
           toolBatches: [...state.toolBatches, group],
-          budget: runtime.controller.snapshot(),
-          toolCalls: [...state.toolCalls, ...toolCalls]
+          budget: runtime.controller.snapshot()
         }));
         await this.enterPhase(
           runtime.runId,
@@ -1691,9 +1685,8 @@ export class AgentRuntime {
     const cause = executionError?.cause ?? runtime.error;
     const attached = executionError?.context;
     const turnCount =
-      cause instanceof ModelStreamInterruptedError
-        ? cause.turnIndex
-        : (attached?.lastStartedTurnIndex ?? 0);
+      attached?.lastStartedTurnIndex ??
+      (cause instanceof ModelStreamInterruptedError ? cause.turnIndex : 0);
     const attachedIdentity = attached?.activeTurnIdentity ?? {
       turnIndex: Math.max(1, turnCount),
       turnId: `unidentified-turn-${String(Math.max(1, turnCount))}`,
@@ -1715,13 +1708,12 @@ export class AgentRuntime {
             status: 'partial',
             message: visible,
             source: 'stream_recovery',
-            turnIndex: cause.turnIndex
+            turnIndex: attachedIdentity.turnIndex
           }
         : { status: 'absent' };
       const interrupted = {
         type: 'assistant.interrupted' as const,
         ...attachedIdentity,
-        turnIndex: cause.turnIndex,
         content: cause.content,
         modelOutput: recoveredModelOutput,
         ...(cause.reasoningSummary !== undefined ? { reasoningSummary: cause.reasoningSummary } : {}),
@@ -2148,7 +2140,6 @@ export class AgentRuntime {
                   : record
               ),
               toolBatches: [...state.toolBatches, batch],
-              toolCalls: [...state.toolCalls, ...calls],
               budget: runtime.controller.snapshot()
             }));
           }

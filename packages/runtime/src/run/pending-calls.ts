@@ -3,6 +3,7 @@ import type { EventRepository } from '@agent-core/persistence';
 
 import type { AgentEvent } from '../events.js';
 import type { AgentRunState } from './control/contracts.js';
+import { applyAgentRunStateTransition } from './control/state-transition.js';
 import type { AgentToolCallState } from './control/tool-state.js';
 import type { AgentToolCallIdentity, AgentTurnSnapshotRecord } from './contracts.js';
 import type { ToolCall } from '@agent-core/tools';
@@ -26,9 +27,13 @@ export class PendingCallCoordinator {
 
   static async recover(events: EventRepository<AgentEvent>, runId: string): Promise<PendingCallCoordinator> {
     const coordinator = new PendingCallCoordinator();
+    let state: AgentRunState | undefined;
     for await (const record of events.read(runId)) {
       if (record.event.type === 'turn.snapshot.created') coordinator.bindCatalog(record.event.snapshot);
-      if (record.event.type === 'run.state.changed') coordinator.observeState(record.event.state);
+      if (record.event.type === 'run.state.transitioned') {
+        state = applyAgentRunStateTransition(state, record.event.transition);
+        coordinator.observeState(state);
+      }
     }
     return coordinator;
   }

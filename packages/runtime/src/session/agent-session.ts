@@ -111,7 +111,10 @@ export class AgentSession {
   private configuration: AgentSessionConfiguration;
   private readonly maximumQueuedInputs: number;
   private readonly queued: PendingSubmission[] = [];
-  private readonly listeners = new Set<(event: AgentSessionEvent) => void | Promise<void>>();
+  private readonly listeners = new Set<Readonly<{
+    listener: (event: AgentSessionEvent) => void | Promise<void>;
+    onFailure: (error: Error) => void | Promise<void>;
+  }>>();
   private active: ActiveSubmission | undefined;
   private suspended: SuspendedSubmission | undefined;
   private serialQueue: Promise<void> = Promise.resolve();
@@ -141,10 +144,14 @@ export class AgentSession {
     });
   }
 
-  subscribe(listener: (event: AgentSessionEvent) => void | Promise<void>): () => void {
-    this.listeners.add(listener);
+  subscribe(
+    listener: (event: AgentSessionEvent) => void | Promise<void>,
+    onFailure: (error: Error) => void | Promise<void>
+  ): () => void {
+    const subscription = Object.freeze({ listener, onFailure });
+    this.listeners.add(subscription);
     return () => {
-      this.listeners.delete(listener);
+      this.listeners.delete(subscription);
     };
   }
 
@@ -738,11 +745,16 @@ export class AgentSession {
   }
 
   private async emit(event: AgentSessionEvent): Promise<void> {
-    for (const listener of this.listeners) {
+    for (const subscription of this.listeners) {
       try {
-        await listener(event);
-      } catch {
-        /* Delivery observers cannot change authoritative session state. */
+        await subscription.listener(event);
+      } catch (cause) {
+        this.listeners.delete(subscription);
+        try {
+          await subscription.onFailure(cause instanceof Error ? cause : new Error(String(cause)));
+        } catch {
+          /* The detached owner has no remaining delivery authority. */
+        }
       }
     }
   }

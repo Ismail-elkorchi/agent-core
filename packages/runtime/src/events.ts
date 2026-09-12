@@ -67,7 +67,10 @@ import {
   type AgentTurnSnapshotRecord,
   type InferenceRequestFingerprintRecord
 } from './run/contracts.js';
-import { decodeAgentRunState, type AgentRunState } from './run/control/contracts.js';
+import {
+  decodeAgentRunStateTransition,
+  type AgentRunStateTransition
+} from './run/control/state-transition.js';
 import { decodeToolCatalog } from './run/tool-catalog.js';
 
 export interface AgentProviderStateSummary {
@@ -190,7 +193,7 @@ export type AgentEvent =
       readonly type: 'input.steering.local_applied';
       readonly deliveryId: string;
     }
-  | { readonly type: 'run.state.changed'; readonly state: AgentRunState }
+  | { readonly type: 'run.state.transitioned'; readonly transition: AgentRunStateTransition }
   | {
       readonly type: 'run.started';
       readonly runId: string;
@@ -397,7 +400,7 @@ export type AgentEvent =
       readonly observation: ToolObservation;
     } & AgentToolCallAttemptIdentity);
 
-export type AgentAuditEvent = Exclude<AgentEvent, { readonly type: 'run.state.changed' }>;
+export type AgentAuditEvent = Exclude<AgentEvent, { readonly type: 'run.state.transitioned' }>;
 
 export type AgentProgressEvent =
   | {
@@ -500,6 +503,7 @@ export const agentEventCodec: RuntimeCodec<AgentEvent> = {
 const AGENT_EVENT_MAX_STRING_BYTES = 1024 * 1024;
 const AGENT_EVENT_MAX_TOTAL_BYTES = 4 * 1024 * 1024;
 const AGENT_EVENT_MAX_COLLECTION_ENTRIES = 20_000;
+const AGENT_EVENT_MAX_DEPTH = 20;
 
 export function encodeAgentEvent(value: AgentEvent): JsonObject {
   const encoded =
@@ -524,7 +528,7 @@ function ownEventJson(value: unknown): JsonObject {
   let owned: JsonObject;
   try {
     owned = parseJsonObject(value, {
-      maxDepth: 16,
+      maxDepth: AGENT_EVENT_MAX_DEPTH,
       maxCollectionEntries: AGENT_EVENT_MAX_COLLECTION_ENTRIES,
       maxStringBytes: AGENT_EVENT_MAX_STRING_BYTES,
       maxTotalBytes: AGENT_EVENT_MAX_TOTAL_BYTES
@@ -617,11 +621,11 @@ const AGENT_EVENT_DECODERS = {
       message: requiredString(value.message, 'message')
     });
   },
-  'run.state.changed': (value) => {
-    exact(value, ['type', 'state']);
+  'run.state.transitioned': (value) => {
+    exact(value, ['type', 'transition']);
     return Object.freeze({
-      type: 'run.state.changed',
-      state: decodeAgentRunState(requiredObject(value.state, 'state'))
+      type: 'run.state.transitioned',
+      transition: decodeAgentRunStateTransition(requiredObject(value.transition, 'transition'))
     });
   },
   'run.started': (value) => {
@@ -1266,7 +1270,6 @@ function decodeRunLimits(value: JsonValue | undefined): AgentRunLimits {
     'maxConcurrentToolCalls',
     'modelTurns',
     'totalToolCalls',
-    'repeatedIdenticalToolCalls',
     'elapsedMs',
     'promptTokens',
     'completionTokens',
@@ -1283,10 +1286,6 @@ function decodeRunLimits(value: JsonValue | undefined): AgentRunLimits {
     maxConcurrentToolCalls: positiveInteger(object.maxConcurrentToolCalls, 'limits.maxConcurrentToolCalls'),
     modelTurns: positiveInteger(object.modelTurns, 'limits.modelTurns'),
     totalToolCalls: positiveInteger(object.totalToolCalls, 'limits.totalToolCalls'),
-    repeatedIdenticalToolCalls: positiveInteger(
-      object.repeatedIdenticalToolCalls,
-      'limits.repeatedIdenticalToolCalls'
-    ),
     elapsedMs: positiveInteger(object.elapsedMs, 'limits.elapsedMs'),
     promptTokens: positiveInteger(object.promptTokens, 'limits.promptTokens'),
     completionTokens: positiveInteger(object.completionTokens, 'limits.completionTokens'),

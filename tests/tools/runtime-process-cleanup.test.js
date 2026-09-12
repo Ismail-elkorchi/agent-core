@@ -4,7 +4,7 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import * as z from 'zod';
-import { AgentRuntime, agentEventCodec } from '@agent-core/runtime';
+import { AgentRuntime, agentEventCodec, applyAgentRunStateTransition } from '@agent-core/runtime';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import { adoptCommandExecution, commandExecutionResources, defineTool } from '@agent-core/tools';
 import {
@@ -179,10 +179,13 @@ test('abort and unknown provider outcome both clean active run processes before 
       persisted.some((event) => event.type === 'resource.released'),
       true
     );
-    const finalOperation = persisted.filter((event) => event.type === 'run.state.changed').at(-1);
-    assert.equal(finalOperation.state.phase.kind, mode === 'abort' ? 'terminal' : 'active');
+    let finalOperation;
+    for (const event of persisted)
+      if (event.type === 'run.state.transitioned')
+        finalOperation = applyAgentRunStateTransition(finalOperation, event.transition);
+    assert.equal(finalOperation.phase.kind, mode === 'abort' ? 'terminal' : 'active');
     if (mode === 'failure')
-      assert.equal(finalOperation.state.providerRequests.at(-1).stage, 'outcome_unknown');
+      assert.equal(finalOperation.providerRequests.at(-1).stage, 'outcome_unknown');
     assert.equal(
       persisted.some((event) => event.type === 'run.ended'),
       mode === 'abort'
@@ -212,7 +215,8 @@ test('cleanup failure becomes terminal runtime_error and still commits run.ended
   });
   const persisted = await records(state.events, 'cleanup-failure-run');
   assert.equal(persisted.at(-2).type, 'run.ended');
-  assert.equal(persisted.at(-1).state.phase.kind, 'terminal');
+  assert.equal(persisted.at(-1).type, 'run.state.transitioned');
+  assert.equal((await agent.inspectRun('cleanup-failure-run')).state.phase.kind, 'terminal');
 });
 
 test('natural process exit is persisted exactly once even when the model never polls it', async () => {
