@@ -10,6 +10,7 @@ import {
   ModelContractError,
   parseModelProfile,
   type CompiledModelRequest,
+  type ModelOutputItem,
   type ModelProfile,
   type ModelProvider,
   type ModelProviderErrorDiagnostic,
@@ -836,8 +837,12 @@ export class AgentRuntime {
       message: string;
       persisted: boolean;
     }[] = [];
-    const append = (event: AgentAuditEvent, idempotencyKey?: string) =>
-      run.append(event, idempotencyKey ?? `${runId}:event:${hashJson(encodeAgentEvent(event))}`);
+    const append = async (event: AgentAuditEvent, idempotencyKey?: string) => {
+      const receipt = await run.append(event, idempotencyKey ?? `${runId}:event:${hashJson(encodeAgentEvent(event))}`);
+      if (event.type === 'assistant.interrupted')
+        await this.recordSessionAssistant(runId, event, receipt);
+      return receipt;
+    };
     const emit = (event: AgentProgressEvent) =>
       this.emitProgress(finalizationId, event, deliveryDiagnostics, append);
     const finalizer = new AgentRunFinalizer({
@@ -1678,7 +1683,7 @@ export class AgentRuntime {
     readonly signal: AbortSignal;
     readonly runId: string;
     readonly controller: AgentRunController;
-    readonly append: (event: AgentAuditEvent) => Promise<unknown>;
+    readonly append: (event: AgentAuditEvent) => Promise<EventAppendReceipt>;
     readonly emit: (event: AgentProgressEvent) => Promise<void>;
   }): Promise<TerminalDecision> {
     const executionError = runtime.error instanceof AgentExecutionError ? runtime.error : undefined;
@@ -1720,7 +1725,7 @@ export class AgentRuntime {
         finalResponseReceived: cause.finalResponseReceived,
         ...(diagnostic ? { diagnostic } : {})
       };
-      await safePersist(runtime.append, interrupted);
+      await runtime.append(interrupted);
       await runtime.emit(interrupted);
     }
     if (diagnostic && turnCount > 0) {
@@ -1730,7 +1735,7 @@ export class AgentRuntime {
         turnIndex: Math.max(1, turnCount),
         diagnostic
       };
-      await safePersist(runtime.append, failed);
+      await runtime.append(failed);
       await runtime.emit(failed);
     }
     const message = errorMessage(cause);
@@ -2328,26 +2333,35 @@ export class AgentRuntime {
       ...(toolCalls.length > 0 ? { toolCalls } : {})
     };
     const assistantReceipt = await append(assistantEnded);
+    await this.recordSessionAssistant(request.runId, assistantEnded, assistantReceipt, response.output);
     await emit(assistantEnded);
+    return { kind: 'settled', response, toolCalls, modelOutput };
+  }
+
+  private async recordSessionAssistant(
+    runId: string,
+    event: Extract<AgentAuditEvent, { readonly type: 'assistant.ended' | 'assistant.interrupted' }>,
+    receipt: EventAppendReceipt,
+    output?: readonly ModelOutputItem[]
+  ): Promise<void> {
     if (this.options.repositories.session) {
       await this.options.repositories.session.repository.appendAssistant(
         this.options.repositories.session.descriptor,
         {
-          runId: request.runId,
-          identity: responseIdentity,
+          runId,
+          identity: { turnId: event.turnId, turnIndex: event.turnIndex, requestAttempt: event.requestAttempt },
           source: {
-            runId: request.runId,
-            eventId: assistantReceipt.eventId,
-            sequence: assistantReceipt.sequence,
-            hash: assistantReceipt.hash
+            runId,
+            eventId: receipt.eventId,
+            sequence: receipt.sequence,
+            hash: receipt.hash
           },
-          content: response.content,
-          completeness: modelOutput.status,
-          ...(response.output ? { output: response.output } : {})
+          content: event.content,
+          completeness: event.modelOutput.status,
+          ...(output ? { output } : {})
         }
       );
     }
-    return { kind: 'settled', response, toolCalls, modelOutput };
   }
 
   private async assembleModelRequest(
@@ -3632,16 +3646,6 @@ function throwIfAborted(signal: AbortSignal): void {
   throw signal.reason instanceof Error
     ? signal.reason
     : new Error(typeof signal.reason === 'string' ? signal.reason : 'Agent run aborted.');
-}
-async function safePersist(
-  append: (event: AgentAuditEvent) => Promise<unknown>,
-  event: AgentAuditEvent
-): Promise<void> {
-  try {
-    await append(event);
-  } catch {
-    /* Terminal finalization will report its own persistence state. */
-  }
 }
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);

@@ -1070,7 +1070,7 @@ test('stream interruption preserves an unknown provider outcome without treating
       throw new Error('socket closed');
     }
   });
-  const { agent, events } = await harness({ provider, withoutSession: true });
+  const { agent, events, sessions, session } = await harness({ provider });
   const result = await agent.run({ task: 'stream' }).result;
   assert.equal(result.state, 'suspended');
   assert.equal(result.reason, 'provider_outcome_unknown');
@@ -1079,6 +1079,12 @@ test('stream interruption preserves an unknown provider outcome without treating
   assert.equal(interrupted.content, 'part');
   assert.equal(interrupted.modelOutput.status, 'partial');
   assert.equal(interrupted.diagnostic.causeSummary.message, 'socket closed');
+  const replay = await sessions.loadReplayState(session);
+  const partial = replay.branch.find((entry) => entry.type === 'assistant');
+  assert.equal(partial.content, 'part');
+  assert.equal(partial.completeness, 'partial');
+  assert.equal(partial.source.runId, result.runId);
+  assert.equal(partial.turnId, interrupted.turnId);
   assert.equal(
     records.some((event) => event.type === 'provider.attempt.settled'),
     false

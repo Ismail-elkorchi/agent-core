@@ -2,6 +2,7 @@ export * from './core/configuration.js';
 export * from './core/command-execution.js';
 export * from './core/workspace-snapshot.js';
 export * from './core/rooted-file-selection.js';
+export { fileScope, processScope } from './core/resources.js';
 export {
   RootedFileAuthority,
   isRootedFileAuthority,

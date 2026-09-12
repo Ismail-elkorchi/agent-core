@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFile, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { hashJson, InMemoryEventRepository, PersistenceCorruptionError } from '@agent-core/persistence';
@@ -861,6 +861,33 @@ test('AgentSession serializes admission, preserves steering identity, and snapsh
   await third.completion;
   await assert.rejects(fourth.completion, /unsupported model/u);
   assert.equal(session.state().phase, 'idle');
+});
+
+for (const storage of ['memory', 'jsonl']) test(`assistant mirrors distinguish interrupted and settled events for one request in ${storage}`, async (t) => {
+  const rootDir = await mkdtemp(path.join(tmpdir(), 'assistant-events-'));
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const repository = storage === 'memory' ? new InMemorySessionRepository() : new JsonlSessionRepository({ rootDir });
+  const session = await repository.create({ id: 'assistant-events', binding: TEST_SESSION_BINDING });
+  await repository.appendInput(session, { runId: 'run', task: 'work' });
+  const partial = {
+    runId: 'run', identity: { turnId: 'turn', turnIndex: 1, requestAttempt: 1 },
+    content: 'Partial', completeness: 'partial',
+    source: { runId: 'run', eventId: 'interrupted', sequence: 1, hash: 'a'.repeat(64) }
+  };
+  const first = await repository.appendAssistant(session, partial);
+  const final = await repository.appendAssistant(session, {
+    ...partial, content: 'Partial reply completed.', completeness: 'complete',
+    source: { runId: 'run', eventId: 'settled', sequence: 2, hash: 'b'.repeat(64) }
+  });
+  assert.notEqual(first.id, final.id);
+  assert.equal((await repository.appendAssistant(session, partial)).id, first.id);
+  await assert.rejects(repository.appendAssistant(session, { ...partial, content: 'Conflicting content' }), /Conflicting assistant finalization/);
+  const reopened = storage === 'memory' ? repository : new JsonlSessionRepository({ rootDir });
+  const replay = await reopened.loadReplayState(session);
+  assert.deepEqual(replay.branch.filter((entry) => entry.type === 'assistant').map(({ content, completeness }) => ({ content, completeness })), [
+    { content: 'Partial', completeness: 'partial' },
+    { content: 'Partial reply completed.', completeness: 'complete' }
+  ]);
 });
 
 test('session branches require stable boundaries and record assistant turns once', async () => {

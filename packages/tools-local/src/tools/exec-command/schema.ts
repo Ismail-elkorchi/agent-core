@@ -4,7 +4,7 @@ import { processOutputSchema } from '../process-output.js';
 export function execCommandSchema(ptySupported: boolean) {
   return z.strictObject({
     command: z.string().trim().min(1),
-    workdir: z.string().trim().min(1).default('.'),
+    workdir: z.string().trim().min(1).default('.').describe('Directory relative to the workspace root. Use "." for the root; absolute paths are not accepted.'),
     ...(ptySupported ? { pty: z.boolean().default(false) } : {}),
     yieldMs: z.int().min(0).default(10_000),
     timeoutMs: z.int().min(1).default(60_000),

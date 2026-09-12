@@ -369,7 +369,8 @@ export class JsonlSessionRepository implements SessionRepository {
             entry.type === 'assistant' &&
             entry.runId === input.runId &&
             entry.turnId === input.identity.turnId &&
-            entry.requestAttempt === input.identity.requestAttempt
+            entry.requestAttempt === input.identity.requestAttempt &&
+            entry.source?.eventId === input.source?.eventId
         );
         if (existing) {
           if (
