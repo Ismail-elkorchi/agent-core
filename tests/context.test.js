@@ -24,6 +24,55 @@ const modelProfile = {
 };
 const imageProfile = { ...modelProfile, modalities: { input: ['text', 'image'], output: ['text'] } };
 
+test('application context precedes retained conversation and never follows a tool response', () => {
+  const window = new ModelWindow();
+  window.recordSourceItem('request-1', { role: 'user', content: 'Retain this requirement.' });
+  window.recordSourceItem('answer-1', { role: 'assistant', content: 'Previous answer.' });
+  const input = {
+    window,
+    task: 'Revise the result.',
+    instructions: [{ id: 'preference', role: 'user', content: 'Keep it concise.', priority: 1 }],
+    tools: [],
+    modelProfile,
+    contextItems: [{
+      id: 'environment', sourceUri: 'application://environment', sourceKind: 'external',
+      representation: 'full', mediaType: 'text/plain', title: 'Environment',
+      content: 'Current environment.', purpose: 'Execution context.'
+    }]
+  };
+  const assembler = new ModelRequestAssembler();
+  const initial = assembler.assemble(input).messages;
+  assert.match(initial[0].content, /Current environment/);
+  assert.deepEqual(initial.slice(1), [
+    { role: 'user', content: 'Retain this requirement.' },
+    { role: 'assistant', content: 'Previous answer.' },
+    { role: 'user', content: 'Keep it concise.' },
+    { role: 'user', content: 'Revise the result.' }
+  ]);
+
+  window.recordModelOutput({
+    turnIndex: 1, content: '',
+    toolCalls: [{ id: 'read-1', type: 'function', name: 'read', input: { kind: 'json', value: {} } }]
+  });
+  window.recordToolResult({
+    turnIndex: 1, toolName: 'read', toolCallType: 'function', callId: 'read-1',
+    immediateContent: 'Observed result.'
+  });
+  const continuation = assembler.assemble(input).messages;
+  assert.deepEqual(continuation.slice(0, initial.length), initial);
+  assert.equal(continuation.at(-2).toolCalls[0].id, 'read-1');
+  assert.equal(continuation.at(-1).role, 'tool');
+  assert.equal(continuation.at(-1).toolCallId, 'read-1');
+  assert.equal(continuation.at(-1).content, 'Observed result.');
+
+  const refreshed = assembler.assemble({
+    ...input,
+    contextItems: [{ ...input.contextItems[0], content: 'Updated environment.' }]
+  }).messages;
+  assert.match(refreshed[0].content, /Updated environment/);
+  assert.deepEqual(refreshed.slice(1), continuation.slice(1));
+});
+
 function assembleWindow(window, input) {
   const assembled = new ModelRequestAssembler().assemble({
     window,
