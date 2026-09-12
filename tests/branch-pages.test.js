@@ -45,8 +45,6 @@ async function fixture(t, count = 700) {
             knownCosts: {},
             pricingStatus: 'unknown',
             unknownPricedTokens: 0,
-            consecutiveProviderFailures: 0,
-            consecutiveToolFailures: 0
           }
         })
       );

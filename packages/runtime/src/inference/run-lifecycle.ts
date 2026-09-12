@@ -269,7 +269,6 @@ export function createRunInferenceLifecycle(input: RunInferenceInput): {
         effect: effectSettlement.state,
         settlementEventId: settlementReceipt.eventId
       }));
-      turnRequest.controller.recordProviderSuccess();
       return Object.freeze({
         kind: 'settled',
         response,
@@ -277,7 +276,6 @@ export function createRunInferenceLifecycle(input: RunInferenceInput): {
       });
     },
     uncertain: async (error) => {
-      turnRequest.controller.recordProviderFailure();
       const pending = providerWork(turnRequest.run.state(), identity);
       if (pending.stage !== 'effect_pending' || pending.effect.intent.effectId !== effectId) throw error;
       const closed = closeExternalEffect(pending.effect, 'unknown_outcome');

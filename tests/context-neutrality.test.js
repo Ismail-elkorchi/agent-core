@@ -52,7 +52,7 @@ async function composition(provider, options = {}) {
       toolBoundary,
       repositories: { artifacts, events, session: { repository, descriptor } },
       maxOutputTokens: 128,
-      limits: { modelTurns: 4, totalToolCalls: 4, consecutiveProviderFailures: 1 },
+      limits: { modelTurns: 4, totalToolCalls: 4 },
       ...options,
       ...additional
     });

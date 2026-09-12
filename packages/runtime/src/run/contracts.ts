@@ -138,36 +138,25 @@ export type AgentLimitKind =
   | 'elapsed_time'
   | 'prompt_tokens'
   | 'completion_tokens'
-  | 'known_cost'
-  | 'consecutive_provider_failures'
-  | 'consecutive_tool_failures';
+  | 'known_cost';
 export interface AgentRunLimits {
   readonly maxConcurrentToolCalls: number;
-  readonly modelTurns: number;
-  readonly totalToolCalls: number;
-  readonly elapsedMs: number;
-  readonly promptTokens: number;
-  readonly completionTokens: number;
+  readonly modelTurns?: number;
+  readonly totalToolCalls?: number;
+  readonly elapsedMs?: number;
+  readonly promptTokens?: number;
+  readonly completionTokens?: number;
   readonly activeImageCount: number;
   readonly activeImageBytes: number;
   readonly activeImageTokens: number;
-  readonly knownCost: { readonly amount: number; readonly currency: string };
-  readonly consecutiveProviderFailures: number;
-  readonly consecutiveToolFailures: number;
+  readonly knownCost?: { readonly amount: number; readonly currency: string };
 }
+/** Execution capacity defaults; work budgets are chosen explicitly by the application. */
 export const DEFAULT_AGENT_RUN_LIMITS: AgentRunLimits = Object.freeze({
   maxConcurrentToolCalls: 4,
-  modelTurns: 32,
-  totalToolCalls: 128,
-  elapsedMs: 30 * 60 * 1_000,
-  promptTokens: 1_000_000,
-  completionTokens: 250_000,
   activeImageCount: 16,
   activeImageBytes: 64 * 1024 * 1024,
-  activeImageTokens: 32_000,
-  knownCost: Object.freeze({ amount: 10, currency: 'USD' }),
-  consecutiveProviderFailures: 3,
-  consecutiveToolFailures: 5
+  activeImageTokens: 32_000
 });
 export type AgentRunBudgetState = Readonly<{
   readonly modelTurns: number;
@@ -181,8 +170,6 @@ export type AgentRunBudgetState = Readonly<{
   readonly knownCosts: Readonly<Record<string, number>>;
   readonly pricingStatus: 'known' | 'partial' | 'unknown';
   readonly unknownPricedTokens: number;
-  readonly consecutiveProviderFailures: number;
-  readonly consecutiveToolFailures: number;
 }>;
 
 const AGENT_RUN_BUDGET_FIELDS = [
@@ -196,9 +183,7 @@ const AGENT_RUN_BUDGET_FIELDS = [
   'reasoningTokens',
   'knownCosts',
   'pricingStatus',
-  'unknownPricedTokens',
-  'consecutiveProviderFailures',
-  'consecutiveToolFailures'
+  'unknownPricedTokens'
 ] as const;
 
 export function decodeAgentRunBudgetState(value: unknown): AgentRunBudgetState {
@@ -310,9 +295,7 @@ export type AgentFailedTerminalSnapshot = AgentTerminalBase &
 export type AgentAbortedTerminalSnapshot = AgentTerminalBase &
   Readonly<{
     readonly executionStatus: 'aborted';
-    readonly modelOutput:
-      | AgentAbsentModelOutput
-      | (AgentPresentModelOutput & { readonly status: 'partial' });
+    readonly modelOutput: AgentAbsentModelOutput | (AgentPresentModelOutput & { readonly status: 'partial' });
     readonly terminationReason: 'aborted';
     readonly errorMessage: string;
   }>;
@@ -342,37 +325,28 @@ export class AgentContractError extends Error {
 }
 
 export function validateAgentRunLimits(input: Partial<AgentRunLimits> = {}): AgentRunLimits {
-  const limits: AgentRunLimits = {
-    ...DEFAULT_AGENT_RUN_LIMITS,
-    ...input,
-    knownCost: {
-      ...DEFAULT_AGENT_RUN_LIMITS.knownCost,
-      ...(input.knownCost ?? {})
-    }
-  };
-  const fields: (keyof Omit<AgentRunLimits, 'knownCost'>)[] = [
+  const limits: AgentRunLimits = { ...DEFAULT_AGENT_RUN_LIMITS, ...input };
+  const capacities = [
     'maxConcurrentToolCalls',
-    'modelTurns',
-    'totalToolCalls',
-    'elapsedMs',
-    'promptTokens',
-    'completionTokens',
     'activeImageCount',
     'activeImageBytes',
-    'activeImageTokens',
-    'consecutiveProviderFailures',
-    'consecutiveToolFailures'
-  ];
-  const issues = fields.flatMap((field) =>
-    positiveInteger(limits[field]) ? [] : [`${field} must be a positive finite integer.`]
-  );
-  if (!Number.isFinite(limits.knownCost.amount) || limits.knownCost.amount <= 0)
-    issues.push('knownCost.amount must be positive and finite.');
-  if (limits.knownCost.currency.trim().length === 0) issues.push('knownCost.currency must be non-empty.');
+    'activeImageTokens'
+  ] as const;
+  const budgets = ['modelTurns', 'totalToolCalls', 'elapsedMs', 'promptTokens', 'completionTokens'] as const;
+  const issues = [
+    ...capacities.filter((field) => !positiveInteger(limits[field])),
+    ...budgets.filter((field) => limits[field] !== undefined && !positiveInteger(limits[field]))
+  ].map((field) => `${field} must be a positive finite integer.`);
+  const knownCost = limits.knownCost;
+  if (knownCost !== undefined) {
+    if (!Number.isFinite(knownCost.amount) || knownCost.amount <= 0)
+      issues.push('knownCost.amount must be positive and finite.');
+    if (knownCost.currency.trim().length === 0) issues.push('knownCost.currency must be non-empty.');
+  }
   if (issues.length > 0) throw new AgentContractError('Invalid run limits.', issues);
   return Object.freeze({
     ...limits,
-    knownCost: Object.freeze({ ...limits.knownCost })
+    ...(knownCost === undefined ? {} : { knownCost: Object.freeze({ ...knownCost }) })
   });
 }
 
@@ -533,9 +507,7 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
     ...(typeof value.providerTerminationReason === 'string'
       ? { providerTerminationReason: value.providerTerminationReason }
       : {}),
-    ...(value.exhaustedLimit !== undefined
-      ? { exhaustedLimit: value.exhaustedLimit as AgentLimitKind }
-      : {}),
+    ...(value.exhaustedLimit !== undefined ? { exhaustedLimit: value.exhaustedLimit as AgentLimitKind } : {}),
     ...(value.cleanupDiagnostic !== undefined
       ? {
           cleanupDiagnostic: value.cleanupDiagnostic as {
@@ -577,9 +549,7 @@ const AGENT_LIMIT_KINDS: readonly AgentLimitKind[] = [
   'elapsed_time',
   'prompt_tokens',
   'completion_tokens',
-  'known_cost',
-  'consecutive_provider_failures',
-  'consecutive_tool_failures'
+  'known_cost'
 ];
 const FAILURE_REASONS: readonly AgentFailureTerminationReason[] = [
   'model_output_limit',
@@ -620,13 +590,7 @@ function terminalBaseIssues(value: Record<string, unknown>): string[] {
     issues.push('turnCount must be a nonnegative integer.');
   if (
     value.modelTerminationReason !== undefined &&
-    !oneOf(value.modelTerminationReason, [
-      'stop',
-      'tool_calls',
-      'output_limit',
-      'content_filter',
-      'unknown'
-    ])
+    !oneOf(value.modelTerminationReason, ['stop', 'tool_calls', 'output_limit', 'content_filter', 'unknown'])
   )
     issues.push('modelTerminationReason is invalid.');
   if (value.providerTerminationReason !== undefined && typeof value.providerTerminationReason !== 'string')
@@ -640,8 +604,7 @@ function modelTerminationIssues(value: Record<string, unknown>): string[] {
     content_filtered: 'content_filter',
     unknown_model_termination: 'unknown'
   };
-  const expected =
-    typeof value.terminationReason === 'string' ? mapping[value.terminationReason] : undefined;
+  const expected = typeof value.terminationReason === 'string' ? mapping[value.terminationReason] : undefined;
   return expected !== undefined && value.modelTerminationReason !== expected
     ? [`${String(value.terminationReason)} requires modelTerminationReason ${expected}.`]
     : [];
@@ -672,9 +635,7 @@ function isBudgetState(value: unknown): value is AgentRunBudgetState {
     'cacheReadTokens',
     'cacheWriteTokens',
     'reasoningTokens',
-    'unknownPricedTokens',
-    'consecutiveProviderFailures',
-    'consecutiveToolFailures'
+    'unknownPricedTokens'
   ];
   if (
     !names.every(

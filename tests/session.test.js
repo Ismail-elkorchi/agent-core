@@ -309,8 +309,6 @@ test('session run finalizations are idempotent and validate the complete termina
       knownCosts: {},
       pricingStatus: 'unknown',
       unknownPricedTokens: 0,
-      consecutiveProviderFailures: 0,
-      consecutiveToolFailures: 0
     }
   });
   const first = await repository.recordRunFinalization(session, terminal);
@@ -470,8 +468,6 @@ function completedTerminal(runId, finalizationId, message) {
       knownCosts: {},
       pricingStatus: 'unknown',
       unknownPricedTokens: 0,
-      consecutiveProviderFailures: 0,
-      consecutiveToolFailures: 0
     }
   };
 }
@@ -1516,4 +1512,41 @@ test('manual session scheduling preserves queued contributions across restart an
     await reopened.startNextSubmission()
   ).completion;
   assert.deepEqual(started, ['First original contribution.', 'Second original contribution.']);
+});
+
+test('closing a session stops its active run without dispatching or discarding queued input', async () => {
+  const repository = new InMemorySessionRepository();
+  const descriptor = await repository.create({ binding: TEST_SESSION_BINDING });
+  const tasks = [];
+  const options = {
+    descriptor, repository, expectedBinding: TEST_SESSION_BINDING, runs: runCoordinator(),
+    configuration: { provider: 'test', model: 'model' },
+    createRuntime() {
+      return { run(input) {
+        tasks.push(input.task);
+        let finish;
+        const result = new Promise((resolve) => { finish = resolve; });
+        const terminal = { state: 'ended', terminal: { runId: input.runId }, deliveryDiagnostics: [] };
+        if (tasks.length > 1) finish(terminal);
+        return { runId: input.runId, result, injectSteering() {}, async abort() { finish(terminal); } };
+      } };
+    }
+  };
+  const session = new AgentSession(options);
+  const active = await session.submit({ task: 'Active request.' });
+  const queued = await session.submit({ task: 'Queued request.' });
+  const rejected = assert.rejects(queued.completion, /remains recorded/);
+  const closing = session.close();
+  assert.equal(session.close(), closing);
+  await closing;
+  await rejected;
+  await active.completion;
+  await session.waitForIdle();
+  assert.deepEqual(tasks, ['Active request.']);
+  assert.equal((await repository.loadPendingSubmissions(descriptor))[0].input.task, 'Queued request.');
+  await assert.rejects(session.submit({ task: 'Too late.' }), /closed/);
+  const reopened = new AgentSession(options);
+  await reopened.waitForIdle();
+  assert.deepEqual(tasks, ['Active request.', 'Queued request.']);
+  await reopened.close();
 });

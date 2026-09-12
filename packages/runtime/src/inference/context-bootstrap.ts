@@ -87,12 +87,14 @@ export function createRuntimeContextBootstrapValidator(
         throw new Error(
           'context_admission_failed: native transformation requires governed inference and an owning budget identity.'
         );
-      // Open obligations and the active run stay in their original protocol form.
+      // Calls have settled at this boundary. Active user inputs remain explicit;
+      // completed exchanges can be transformed without ending their owning run.
       const finalized = new Set(view.runFinalizations.map((run) => run.runId));
-      const represented = selected.filter((entry) => 'runId' in entry && finalized.has(entry.runId));
+      const represented = selected.filter((entry) => 'runId' in entry &&
+        (entry.type !== 'input' || finalized.has(entry.runId)));
       if (represented.length === 0)
         throw new Error(
-          'context_admission_failed: no completed source window is available for native transformation.'
+          'context_admission_failed: no settled source window is available for native transformation.'
         );
       const transformWindow = new ModelWindow();
       replaySourceEntries(transformWindow, view.cut.sessionId, represented, selection.representations);

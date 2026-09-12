@@ -702,7 +702,6 @@ async function runTrial({
           promptTokens: options.maxPromptTokens - result.metrics.promptTokens,
           completionTokens: options.maxCompletionTokens - result.metrics.completionTokens,
           totalToolCalls: 16,
-          consecutiveProviderFailures: 1,
           elapsedMs: Math.max(1, options.timeoutMs - Math.floor(performance.now() - start))
         },
         recordLogicalRequest: ({ request }) => {

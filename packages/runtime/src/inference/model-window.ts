@@ -189,7 +189,8 @@ export class ModelWindow {
     this.priorItems.set(sourceId, owned);
   }
 
-  activateSources(window: ModelWindow): void {
+  replaceWith(window: ModelWindow): void {
+    this.activeItems.splice(0, this.activeItems.length, ...window.activeItems);
     this.priorItems.clear();
     for (const [source, item] of window.priorItems) this.priorItems.set(source, item);
   }

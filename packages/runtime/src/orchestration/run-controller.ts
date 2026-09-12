@@ -62,9 +62,7 @@ export class AgentRunController {
     reasoningTokens: 0,
     knownCosts: {},
     pricingStatus: 'unknown',
-    unknownPricedTokens: 0,
-    consecutiveProviderFailures: 0,
-    consecutiveToolFailures: 0
+    unknownPricedTokens: 0
   };
 
   constructor(
@@ -122,7 +120,7 @@ export class AgentRunController {
 
   beginModelTurn(): void {
     this.assertElapsed();
-    if (this.state.modelTurns >= this.limits.modelTurns) {
+    if (this.limits.modelTurns !== undefined && this.state.modelTurns >= this.limits.modelTurns) {
       const previous = this.snapshot();
       throw this.limitError(
         'model_turns',
@@ -141,7 +139,7 @@ export class AgentRunController {
     this.assertElapsed();
     const previous = this.snapshot();
     const total = this.state.totalToolCalls + calls.length;
-    if (total > this.limits.totalToolCalls)
+    if (this.limits.totalToolCalls !== undefined && total > this.limits.totalToolCalls)
       throw this.limitError(
         'total_tool_calls',
         total,
@@ -179,7 +177,7 @@ export class AgentRunController {
       pricingStatus,
       unknownPricedTokens
     };
-    if (promptTokens > this.limits.promptTokens)
+    if (this.limits.promptTokens !== undefined && promptTokens > this.limits.promptTokens)
       throw this.limitError(
         'prompt_tokens',
         promptTokens,
@@ -189,7 +187,7 @@ export class AgentRunController {
         this.snapshot(),
         true
       );
-    if (completionTokens > this.limits.completionTokens)
+    if (this.limits.completionTokens !== undefined && completionTokens > this.limits.completionTokens)
       throw this.limitError(
         'completion_tokens',
         completionTokens,
@@ -199,47 +197,14 @@ export class AgentRunController {
         this.snapshot(),
         true
       );
-    const limitedCost = knownCosts[this.limits.knownCost.currency] ?? 0;
-    if (limitedCost > this.limits.knownCost.amount)
+    const costLimit = this.limits.knownCost;
+    const limitedCost = costLimit === undefined ? 0 : (knownCosts[costLimit.currency] ?? 0);
+    if (costLimit !== undefined && limitedCost > costLimit.amount)
       throw this.limitError(
         'known_cost',
         limitedCost,
-        this.limits.knownCost.amount,
-        priced.currency === this.limits.knownCost.currency ? (priced.amount ?? 0) : 0,
-        previous,
-        this.snapshot(),
-        true
-      );
-  }
-
-  recordProviderSuccess(): void {
-    this.state = { ...this.state, consecutiveProviderFailures: 0 };
-  }
-  recordProviderFailure(): void {
-    const previous = this.snapshot();
-    const failures = this.state.consecutiveProviderFailures + 1;
-    this.state = { ...this.state, consecutiveProviderFailures: failures };
-    if (failures > this.limits.consecutiveProviderFailures)
-      throw this.limitError(
-        'consecutive_provider_failures',
-        failures,
-        this.limits.consecutiveProviderFailures,
-        1,
-        previous,
-        this.snapshot(),
-        true
-      );
-  }
-  recordToolResult(ok: boolean): void {
-    const previous = this.snapshot();
-    const failures = ok ? 0 : this.state.consecutiveToolFailures + 1;
-    this.state = { ...this.state, consecutiveToolFailures: failures };
-    if (failures > this.limits.consecutiveToolFailures)
-      throw this.limitError(
-        'consecutive_tool_failures',
-        failures,
-        this.limits.consecutiveToolFailures,
-        1,
+        costLimit.amount,
+        priced.currency === costLimit.currency ? (priced.amount ?? 0) : 0,
         previous,
         this.snapshot(),
         true
@@ -248,7 +213,7 @@ export class AgentRunController {
 
   assertElapsed(): void {
     const elapsed = this.elapsedMs();
-    if (elapsed > this.limits.elapsedMs) {
+    if (this.limits.elapsedMs !== undefined && elapsed > this.limits.elapsedMs) {
       const snapshot = this.snapshot();
       throw this.limitError(
         'elapsed_time',
@@ -262,9 +227,11 @@ export class AgentRunController {
     }
   }
 
-  remainingElapsedMs(): number {
+  remainingElapsedMs(): number | undefined {
     this.assertElapsed();
-    return Math.max(0, this.limits.elapsedMs - this.elapsedMs());
+    return this.limits.elapsedMs === undefined
+      ? undefined
+      : Math.max(0, this.limits.elapsedMs - this.elapsedMs());
   }
 
   snapshot(): AgentRunBudgetState {

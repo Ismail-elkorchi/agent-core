@@ -950,7 +950,7 @@ export class AgentRuntime {
     if (this.options.context && !signal.aborted && this.pendingCalls.pending().length === 0) {
       await this.contextTransitions?.drain({
         context: this.options.context,
-        admit: (request) => this.retainActiveSources(request, runId),
+        admit: (request) => this.retainPendingSources(request, runId),
         committed: (entry) =>
           emit({
             type: 'context.transitioned',
@@ -1002,7 +1002,7 @@ export class AgentRuntime {
     if (this.options.context && !signal.aborted)
       await this.contextTransitions.drain({
         context: this.options.context,
-        admit: (request) => this.retainActiveSources(request, runId),
+        admit: (request) => this.retainPendingSources(request, runId),
         signal,
         committed: (entry) =>
           this.emitProgress(
@@ -1178,9 +1178,7 @@ export class AgentRuntime {
         turnIndex += 1;
       }
       let providerResume = runtime.providerContinuation;
-      const availableTurnEntries =
-        runtime.controller.limits.modelTurns - runtime.controller.snapshot().modelTurns + 1;
-      for (let turnEntry = 0; turnEntry < availableTurnEntries; turnEntry += 1) {
+      for (;;) {
         runtime.controller.assertElapsed();
         throwIfAborted(runtime.signal);
         const steering = await this.consumeSteeringInstructions(runtime.runId);
@@ -1206,7 +1204,6 @@ export class AgentRuntime {
           activeTurnIdentity = providerResume.identity;
           lastStartedTurnIndex = turnIndex;
           runtime.controller.transition('requesting_model');
-          runtime.controller.recordProviderSuccess();
           modelSession = this.inferenceService.createSession();
           sessionModel = snapshot.configuration.model;
           if (
@@ -1558,9 +1555,6 @@ export class AgentRuntime {
         });
         turnIndex += 1;
       }
-      throw new Error(
-        'Model-turn execution exhausted its available entries without a terminal or limit decision.'
-      );
     } catch (error) {
       if (error instanceof AgentRunOwnershipLostError || error instanceof AgentExecutionError) throw error;
       throw new AgentExecutionError(error, {
@@ -1597,7 +1591,6 @@ export class AgentRuntime {
       modelWindow,
       observationStore,
       ...(this.options.repositories.session ? { session: this.options.repositories.session } : {}),
-      controller: runtime.controller,
       state: () => runtime.run.state(),
       transitionTool: async (procedure, target, update) => {
         await runtime.run.transitionTool(procedure, target, update, runtime.controller.snapshot());
@@ -2374,7 +2367,7 @@ export class AgentRuntime {
       this.pendingCalls.assertTransitionBoundary();
       await this.contextTransitions?.drain({
         context: this.options.context,
-        admit: (transition) => this.retainActiveSources(transition, request.runId),
+        admit: (transition) => this.retainPendingSources(transition, request.runId),
         committed: (entry) =>
           emit({
             type: 'context.transitioned',
@@ -2531,7 +2524,7 @@ export class AgentRuntime {
         });
         if (transition) {
           const committed = await this.options.context.transition(
-            await this.retainActiveSources(transition, request.runId),
+            await this.retainPendingSources(transition, request.runId),
             { signal: request.signal }
           );
           await emit({
@@ -2614,7 +2607,8 @@ export class AgentRuntime {
       providerId: this.options.provider.id,
       model: this.options.model,
       ...protocolTarget(profile),
-      currentRunId: runId
+      currentRunId: runId,
+      runIds: [runId]
     });
     for (const invalidated of replay.invalidatedProviderStates) {
       const event = {
@@ -2627,7 +2621,7 @@ export class AgentRuntime {
         `${runId}:native-invalidation:${hashJson(encodeAgentEvent(event))}`
       );
     }
-    window.activateSources(replay.modelWindow);
+    window.replaceWith(replay.modelWindow);
     window.selectToolResultPresentations(
       activeObservationRepresentations(await this.options.context.history.view(), runId)
     );
@@ -2642,24 +2636,28 @@ export class AgentRuntime {
     return this.contextTransitions.schedule(request);
   }
 
-  private async retainActiveSources(
+  private async retainPendingSources(
     transition: ContextTransitionRequest,
     runId: string
   ): Promise<ContextTransitionRequest> {
     if (!this.options.context) throw new Error('Context service is unavailable.');
     const view = await this.options.context.history.view();
-    const retained = new Map(
-      transition.selection.retained.map((reference) => [reference.entryId, reference])
-    );
-    for (const entry of view.entries)
-      if ('runId' in entry && entry.runId === runId) {
+    const retained = new Map(transition.selection.retained.map((reference) => [reference.entryId, reference]));
+    // The transition tool's own exchange is newer than the model's selection.
+    // Retain that tail, rather than undoing the model's selection of settled work.
+    const lastSelected = view.entries.reduce((index, entry, position) =>
+      retained.has(sourceRef(view.cut.sessionId, entry).entryId) ? position : index, -1);
+    const lastOmitted = view.entries.reduce((index, entry, position) =>
+      transition.selection.omitted.some((range) =>
+        range.toEntryId === entry.id || range.toEntryId === sourceRef(view.cut.sessionId, entry).entryId
+      ) ? Math.max(index, position) : index, -1);
+    const through = Math.max(lastSelected, lastOmitted);
+    for (const [index, entry] of view.entries.entries())
+      if ('runId' in entry && entry.runId === runId && (entry.type === 'input' || index > through)) {
         const source = sourceRef(view.cut.sessionId, entry);
         retained.set(source.entryId, source);
       }
-    return {
-      ...transition,
-      selection: { ...transition.selection, retained: [...retained.values()] }
-    };
+    return { ...transition, selection: { ...transition.selection, retained: [...retained.values()] } };
   }
 
   pendingToolCalls() {
@@ -3397,22 +3395,22 @@ function runSignalDeadline(
   controller: AgentRunController,
   parentSignal: AbortSignal
 ): { readonly signal: AbortSignal; readonly dispose: () => void } {
+  const remaining = controller.remainingElapsedMs();
+  if (remaining === undefined) return { signal: parentSignal, dispose: () => undefined };
   const timeout = new AbortController();
+  const schedule = (milliseconds: number) => setTimeout(checkDeadline, Math.min(milliseconds + 1, 2_147_483_647));
   const checkDeadline = (): void => {
     try {
-      // A host timer is a wake-up, not elapsed-time evidence. Recheck the owning
-      // monotonic clock, including when an application supplies that clock.
-      timer = setTimeout(checkDeadline, controller.remainingElapsedMs() + 1);
+      const next = controller.remainingElapsedMs();
+      if (next !== undefined) timer = schedule(next);
     } catch (error) {
       timeout.abort(error);
     }
   };
-  let timer = setTimeout(checkDeadline, controller.remainingElapsedMs() + 1);
+  let timer = schedule(remaining);
   return {
     signal: AbortSignal.any([parentSignal, timeout.signal]),
-    dispose: () => {
-      clearTimeout(timer);
-    }
+    dispose: () => { clearTimeout(timer); }
   };
 }
 

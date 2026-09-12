@@ -1,3 +1,4 @@
+import { assertAgentRunStateInvariants } from './state-invariants.js';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
 import { hashJson } from '@agent-core/persistence';
 import { decodeAgentRunBudgetState, type AgentRunBudgetState } from '../contracts.js';
@@ -92,7 +93,7 @@ export function applyAgentRunStateTransition(
   )
     throw new Error(`Run ${transition.runId} contains a non-contiguous transition.`);
   const budget = transition.budget ?? previous.budget;
-  return decodeAgentRunState({
+  const state: AgentRunState = Object.freeze({
     ...previous,
     revision: transition.revision,
     driverGeneration: transition.driverGeneration,
@@ -102,6 +103,8 @@ export function applyAgentRunStateTransition(
     toolBatches: applyIndexed(previous.toolBatches, transition.toolBatches),
     ...(budget === undefined ? {} : { budget })
   });
+  assertAgentRunStateInvariants(state);
+  return state;
 }
 
 export function decodeAgentRunStateTransition(value: unknown): AgentRunStateTransition {

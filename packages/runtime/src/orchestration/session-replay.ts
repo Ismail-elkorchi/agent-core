@@ -89,6 +89,26 @@ export async function rebuildModelWindowFromRepositories(input: {
       (!('runId' in entry) || entry.runId !== input.currentRunId) &&
       !transformed?.represented.has(sourceRef(view?.cut.sessionId ?? 'local', entry).entryId)
   );
+  const active = selected.filter(
+    (entry) =>
+      'runId' in entry &&
+      entry.runId === input.currentRunId &&
+      !transformed?.represented.has(sourceRef(view?.cut.sessionId ?? 'local', entry).entryId)
+  );
+  const retainedAssistantEvents = new Set(
+    active.flatMap((entry) => (entry.type === 'assistant' && entry.source ? [entry.source.eventId] : []))
+  );
+  const retainedObservations = new Set(
+    active.flatMap((entry) =>
+      entry.type === 'observation'
+        ? [`${String(entry.toolBatchId)}:${String(entry.callIndex)}:${String(entry.toolAttempt)}`]
+        : []
+    )
+  );
+  const retainedSteering = new Set(
+    active.flatMap((entry) => (entry.type === 'steering' ? [entry.deliveryId] : []))
+  );
+  const selectedWindow = view?.contextWindow !== undefined;
   let replayedToolResults = 0;
   replayedToolResults += replaySourceEntries(
     modelWindow,
@@ -116,7 +136,7 @@ export async function rebuildModelWindowFromRepositories(input: {
         const deliveryId =
           event.type === 'input.steering.local_applied' ? event.deliveryId : event.delivery.deliveryId;
         const content = steering.get(deliveryId);
-        if (content)
+        if (content && (!selectedWindow || retainedSteering.has(deliveryId)))
           modelWindow.recordInput(`steering:${deliveryId}`, {
             role: 'user',
             content
@@ -126,14 +146,23 @@ export async function rebuildModelWindowFromRepositories(input: {
         outputByTurn.set(`${event.turnId}:${String(event.requestAttempt)}`, event.response.output);
       const output =
         'turnId' in event ? outputByTurn.get(`${event.turnId}:${String(event.requestAttempt)}`) : undefined;
-      if (event.type === 'assistant.ended')
+      if (
+        event.type === 'assistant.ended' &&
+        (!selectedWindow || retainedAssistantEvents.has(record.eventId))
+      )
         modelWindow.recordModelOutput({
           turnIndex: event.turnIndex,
           content: event.content,
           toolCalls: (event.toolCalls ?? []).map(modelToolCallFromToolCall),
           ...(output ? { output } : {})
         });
-      else if (event.type === 'observation.record.created') {
+      else if (
+        event.type === 'observation.record.created' &&
+        (!selectedWindow ||
+          retainedObservations.has(
+            `${event.toolBatchId}:${String(event.callIndex)}:${String(event.toolAttempt)}`
+          ))
+      ) {
         modelWindow.recordToolResult({
           turnIndex: event.turnIndex,
           toolName: event.toolName,
@@ -314,9 +343,7 @@ export function activeObservationRepresentations(
   view: HistoryView,
   runId: string
 ): ReadonlyMap<string, Extract<ModelInputItem, { readonly role: 'tool' }>> {
-  const selected = new Set(
-    view.contextWindow?.selection.representations?.map((item) => item.source.entryId)
-  );
+  const selected = new Set(view.contextWindow?.selection.representations?.map((item) => item.source.entryId));
   const messages = new Map<string, Extract<ModelInputItem, { readonly role: 'tool' }>>();
   for (const entry of view.entries) {
     if (entry.type !== 'observation' || entry.runId !== runId || !entry.callId) continue;

@@ -54,7 +54,6 @@ import {
   serializeToolObservationPresentation,
   type CommittedToolObservation
 } from './observation-store.js';
-import type { AgentRunController } from './run-controller.js';
 
 export type ToolContextPrerequisite = (request: ToolAuthorizationRequest) => Promise<
   | {
@@ -78,7 +77,6 @@ export interface ToolExecutionInput {
   readonly modelWindow: Pick<ModelWindow, 'recordToolResult'>;
   readonly observationStore: Pick<ObservationStore, 'commitToolObservation' | 'projectToolObservation'>;
   readonly session?: { readonly repository: SessionRepository; readonly descriptor: SessionDescriptor };
-  readonly controller: Pick<AgentRunController, 'recordToolResult'>;
   readonly state: () => AgentRunState;
   readonly transitionTool: (
     procedure: AgentRunProcedure,
@@ -657,7 +655,6 @@ async function finishObservationRecording(
       return Object.freeze({ ...current, stage: 'recorded' });
     }
   );
-  input.controller.recordToolResult(state.settlement.observation.ok);
 }
 
 function planningContext(

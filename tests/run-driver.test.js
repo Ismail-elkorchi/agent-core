@@ -154,8 +154,6 @@ test('a stale live owner may settle only its exact started tool effect permit', 
       knownCosts: {},
       pricingStatus: 'known',
       unknownPricedTokens: 0,
-      consecutiveProviderFailures: 0,
-      consecutiveToolFailures: 0
     }
   });
   const tail = await events.tail('effect-settlement');
@@ -293,8 +291,6 @@ test('every completion permutation survives takeover and records each settled ca
         knownCosts: {},
         pricingStatus: 'known',
         unknownPricedTokens: 0,
-        consecutiveProviderFailures: 0,
-        consecutiveToolFailures: 0
       }
     });
     const installed = await events.appendConditional(

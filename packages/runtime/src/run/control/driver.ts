@@ -650,27 +650,6 @@ export class AgentRunDriver {
       throw new TypeError(`Procedure ${procedure} cannot advance to ${advance.phase.kind}.`);
     }
     assertWorkAdvance(this.stateValue, advance, procedure, target);
-    if (procedure === 'record_tool_observation') {
-      let budget = advance.budget ?? this.stateValue.budget;
-      if (budget) {
-        for (const batch of advance.toolBatches ?? []) {
-          const previous = this.stateValue.toolBatches.find(
-            (item) => item.toolBatchId === batch.toolBatchId
-          );
-          for (const [index, call] of batch.callStates.entries()) {
-            if (call.stage === 'recorded' && previous?.callStates[index]?.stage === 'recording') {
-              budget = {
-                ...budget,
-                consecutiveToolFailures: call.settlement.observation.ok
-                  ? 0
-                  : budget.consecutiveToolFailures + 1
-              };
-            }
-          }
-        }
-        return this.commitState({ ...advance, budget });
-      }
-    }
     return this.commitState(advance);
   }
 

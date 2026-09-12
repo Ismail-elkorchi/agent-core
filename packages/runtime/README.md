@@ -9,3 +9,7 @@ Application-owned working copies and publication policy do not belong to this pa
 `EffectExecutionEvent` requires an observation for a settled state with a known outcome and forbids observations on other states. The event decoder verifies the observation's digest against the settlement before repository consumers use it.
 
 See the repository's [context composition guide](../../docs/CONTEXT.md) for service boundaries and the public tool factories.
+
+Work budgets are opt-in: applications may bound turns, tool calls, elapsed time, tokens, and cost. Defaults cover execution capacity, not task duration or a failure streak. Accounting continues without a configured budget. Context selection can omit settled exchanges within an active run while preserving original history, current input, and pending protocol obligations. Provider-native transforms may represent settled active exchanges when supported.
+
+`AgentSession.close()` stops scheduling, interrupts the active run, and waits for its settlement. Queued submissions and suspended outcomes stay recorded for a new session instance; closing does not dispatch queued work or retry unknown effects.

@@ -119,6 +119,8 @@ export class AgentSession {
   private suspended: SuspendedSubmission | undefined;
   private serialQueue: Promise<void> = Promise.resolve();
   private restored = false;
+  private closed = false;
+  private closeCompletion: Promise<void> | undefined;
 
   constructor(private readonly options: AgentSessionOptions) {
     assertSessionBinding(options.expectedBinding, decodeSessionBinding(options.descriptor.header.binding));
@@ -201,6 +203,7 @@ export class AgentSession {
 
   configure(settings: Partial<AgentSessionConfiguration>): Promise<AgentSessionState> {
     return this.serial(async () => {
+      this.assertOpen();
       this.configuration = ownConfiguration({ ...this.configuration, ...settings });
       await this.emit({ type: 'configuration.changed', configuration: this.configuration });
       return this.state();
@@ -467,14 +470,36 @@ export class AgentSession {
   }
 
   async waitForIdle(): Promise<void> {
-    if (this.options.scheduling !== 'manual') await this.startReadyWork();
+    if (!this.closed && this.options.scheduling !== 'manual') await this.startReadyWork();
     while (
       this.active ||
-      (this.options.scheduling !== 'manual' && !this.suspended && this.queued.length > 0)
+      (!this.closed && this.options.scheduling !== 'manual' && !this.suspended && this.queued.length > 0)
     ) {
       if (this.active) await this.active.pending.completion.catch(() => undefined);
       await this.serialQueue;
     }
+  }
+
+  /** Stops this instance without dispatching or discarding durable queued input. */
+  close(): Promise<void> {
+    if (this.closeCompletion) return this.closeCompletion;
+    this.closed = true;
+    this.closeCompletion = this.serial(async () => {
+      for (const pending of this.queued.splice(0))
+        pending.reject(new Error('Session instance closed; queued input remains recorded.'));
+      const completion = this.active?.pending.completion;
+      await this.active?.control.abort('Session instance closed.');
+      return { completion };
+    }).then(async ({ completion }) => {
+      // Settlement runs on the serial queue; await it outside the close transaction.
+      await completion?.catch(() => undefined);
+      this.listeners.clear();
+    });
+    return this.closeCompletion;
+  }
+
+  private assertOpen(): void {
+    if (this.closed) throw new Error('Session instance is closed.');
   }
 
   private async continueSuspension(
@@ -551,6 +576,7 @@ export class AgentSession {
   }
 
   private async restorePending(): Promise<void> {
+    this.assertOpen();
     if (this.restored) return;
     if (this.options.notes) {
       const replay = await this.options.repository.loadReplayState(this.options.descriptor);
@@ -726,7 +752,7 @@ export class AgentSession {
 
   private async launchNext(): Promise<void> {
     if (this.options.scheduling === 'manual') return;
-    while (!this.active && !this.suspended) {
+    while (!this.closed && !this.active && !this.suspended) {
       const next = this.queued.shift();
       if (!next) return;
       try {

@@ -1277,33 +1277,24 @@ function decodeRunLimits(value: JsonValue | undefined): AgentRunLimits {
     'activeImageBytes',
     'activeImageTokens',
     'knownCost',
-    'consecutiveProviderFailures',
-    'consecutiveToolFailures'
   ]);
-  const knownCost = requiredObject(object.knownCost, 'limits.knownCost');
-  exact(knownCost, ['amount', 'currency']);
+  const knownCost = object.knownCost === undefined ? undefined : requiredObject(object.knownCost, 'limits.knownCost');
+  if (knownCost) exact(knownCost, ['amount', 'currency']);
+  const optional = Object.fromEntries(
+    ['modelTurns', 'totalToolCalls', 'elapsedMs', 'promptTokens', 'completionTokens'].flatMap((field) =>
+      object[field] === undefined ? [] : [[field, positiveInteger(object[field], `limits.${field}`)]]
+    )
+  );
   return Object.freeze({
     maxConcurrentToolCalls: positiveInteger(object.maxConcurrentToolCalls, 'limits.maxConcurrentToolCalls'),
-    modelTurns: positiveInteger(object.modelTurns, 'limits.modelTurns'),
-    totalToolCalls: positiveInteger(object.totalToolCalls, 'limits.totalToolCalls'),
-    elapsedMs: positiveInteger(object.elapsedMs, 'limits.elapsedMs'),
-    promptTokens: positiveInteger(object.promptTokens, 'limits.promptTokens'),
-    completionTokens: positiveInteger(object.completionTokens, 'limits.completionTokens'),
     activeImageCount: positiveInteger(object.activeImageCount, 'limits.activeImageCount'),
     activeImageBytes: positiveInteger(object.activeImageBytes, 'limits.activeImageBytes'),
     activeImageTokens: positiveInteger(object.activeImageTokens, 'limits.activeImageTokens'),
-    knownCost: Object.freeze({
+    ...optional,
+    ...(knownCost === undefined ? {} : { knownCost: Object.freeze({
       amount: positiveNumber(knownCost.amount, 'limits.knownCost.amount'),
       currency: requiredString(knownCost.currency, 'limits.knownCost.currency')
-    }),
-    consecutiveProviderFailures: positiveInteger(
-      object.consecutiveProviderFailures,
-      'limits.consecutiveProviderFailures'
-    ),
-    consecutiveToolFailures: positiveInteger(
-      object.consecutiveToolFailures,
-      'limits.consecutiveToolFailures'
-    )
+    }) })
   });
 }
 function decodeInferenceRequestFingerprint(

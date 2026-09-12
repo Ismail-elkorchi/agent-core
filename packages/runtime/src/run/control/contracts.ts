@@ -1,3 +1,4 @@
+import { assertAgentRunStateInvariants } from './state-invariants.js';
 import { decodeEffectExecutionState, type EffectExecutionState } from '@agent-core/effects';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
 import { hashJson } from '@agent-core/persistence';
@@ -396,46 +397,10 @@ export function decodeAgentRunState(value: unknown): AgentRunState {
     array(state.providerRequests, 'providerRequests').map(decodeProviderPhase)
   );
   const toolBatches = Object.freeze(array(state.toolBatches, 'toolBatches').map(decodeToolPhase));
-  if (
-    new Set(
-      providerRequests.map(
-        (request) => `${request.identity.turnId}:${String(request.identity.requestAttempt)}`
-      )
-    ).size !== providerRequests.length
-  ) {
-    throw new TypeError('Provider request identities must be unique.');
-  }
-  if (new Set(toolBatches.map((batch) => batch.toolBatchId)).size !== toolBatches.length) {
-    throw new TypeError('Tool batch identities must be unique.');
-  }
-  const effectIds = new Set<string>();
-  for (const effect of [
-    ...providerRequests.flatMap((request) => (request.stage === 'ready' ? [] : [request.effect])),
-    ...toolBatches.flatMap((batch) =>
-      batch.callStates.flatMap((call) =>
-        call.stage === 'ready' || call.stage === 'approval' || !call.effect ? [] : [call.effect]
-      )
-    )
-  ]) {
-    if (effect.intent.ownerId !== state.runId || effectIds.has(effect.intent.effectId)) {
-      throw new TypeError('Effect identity must be unique and belong to the run.');
-    }
-    effectIds.add(effect.intent.effectId);
-  }
   const budget = state.budget === undefined ? undefined : decodeBudget(state.budget);
   const runId = identifier(state.runId, 'runId');
   const revision = nonnegativeInteger(state.revision, 'revision');
-  if (phase.kind === 'suspended' && phase.reason === 'user_decision') {
-    if (
-      phase.decisionRequest.runRevision > revision ||
-      (control.status !== 'abort_requested' && phase.decisionRequest.runRevision !== revision)
-    ) {
-      throw new TypeError('Decision request revision does not match the run revision.');
-    }
-    if (phase.continuation.blockedProvider.effect.intent.ownerId !== runId)
-      throw new TypeError('Decision continuation does not belong to this run.');
-  }
-  return Object.freeze({
+  const decoded: AgentRunState = Object.freeze({
     runId,
     finalizationId: identifier(state.finalizationId, 'finalizationId'),
     revision,
@@ -448,6 +413,8 @@ export function decodeAgentRunState(value: unknown): AgentRunState {
     toolBatches,
     ...(budget === undefined ? {} : { budget })
   });
+  assertAgentRunStateInvariants(decoded);
+  return decoded;
 }
 
 export function decodeAgentRunStateInput(value: unknown): AgentRunStateInput {
