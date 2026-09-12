@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { compilePromptMaterial } from '@agent-core/runtime';
+import { createProviderContextState } from '@agent-core/model';
+import { responsesInput } from '@agent-core/provider-openai-responses';
 
 test('prompt compilation separates background data from instructions and the current request', () => {
   const instructions = [
@@ -52,4 +54,29 @@ test('plain conversational material adds no persona, output contract, duplicated
     outputContract: { kind: 'text', description: 'Return one category identifier.' }
   });
   assert.deepEqual(configured[0], { role: 'developer', content: 'Return one category identifier.' });
+});
+
+test('current application context preserves the provider-native compacted window prefix', async () => {
+  const compacted = { type: 'compaction', encrypted_content: 'opaque-provider-fixture' };
+  const state = await createProviderContextState({
+    provider: 'openai', protocolRevision: 'fixture', endpoint: 'https://api.openai.com/v1',
+    request: { model: 'fixture', messages: [{ role: 'user', content: 'Original requirement.' }] },
+    requestId: 'compacted', kind: 'responses.compaction', requiresExactPrefix: false,
+    data: { items: [compacted] }
+  });
+  const messages = compilePromptMaterial({
+    id: 'material', task: 'Continue the work.', tools: [],
+    instructions: [{ id: 'authority', role: 'developer', content: 'Current authority.', priority: 1 }],
+    context: [{
+      id: 'environment', sourceUri: 'application://environment', sourceKind: 'external',
+      representation: 'full', mediaType: 'text/plain', title: 'Environment',
+      content: 'Current environment.', purpose: 'Execution context.', tokenEstimate: 5
+    }]
+  }, { prior: [{ role: 'protocol', content: '', state }], current: [] });
+  const { input } = responsesInput({ model: 'fixture', messages }, 'openai');
+  assert.deepEqual(input[0], compacted);
+  assert.equal(input[1].role, 'developer');
+  assert.equal(input[2].role, 'user');
+  assert.match(input[2].content, /Current environment/);
+  assert.deepEqual(input[3], { role: 'user', content: 'Continue the work.' });
 });

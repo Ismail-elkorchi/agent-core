@@ -84,7 +84,7 @@ export class ModelRequestAssembler {
   }
 }
 
-/** Keep background material before the conversation without elevating its instruction authority. */
+/** Keep current background material before the new request, after any retained native window. */
 export function compilePromptMaterial(
   material: PromptMaterial,
   conversation: {
@@ -119,8 +119,8 @@ export function compilePromptMaterial(
     : undefined;
   return Object.freeze([
     ...instructionMessages.filter((item) => item.role !== 'user'),
-    ...(contextMessage ? [contextMessage] : []),
     ...conversation.prior,
+    ...(contextMessage ? [contextMessage] : []),
     ...instructionMessages.filter((item) => item.role === 'user'),
     taskMessage,
     ...conversation.current

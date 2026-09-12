@@ -24,7 +24,7 @@ const modelProfile = {
 };
 const imageProfile = { ...modelProfile, modalities: { input: ['text', 'image'], output: ['text'] } };
 
-test('application context precedes retained conversation and never follows a tool response', () => {
+test('application context follows retained history and precedes the current request and its tool responses', () => {
   const window = new ModelWindow();
   window.recordSourceItem('request-1', { role: 'user', content: 'Retain this requirement.' });
   window.recordSourceItem('answer-1', { role: 'assistant', content: 'Previous answer.' });
@@ -42,10 +42,12 @@ test('application context precedes retained conversation and never follows a too
   };
   const assembler = new ModelRequestAssembler();
   const initial = assembler.assemble(input).messages;
-  assert.match(initial[0].content, /Current environment/);
-  assert.deepEqual(initial.slice(1), [
+  assert.deepEqual(initial.slice(0, 2), [
     { role: 'user', content: 'Retain this requirement.' },
-    { role: 'assistant', content: 'Previous answer.' },
+    { role: 'assistant', content: 'Previous answer.' }
+  ]);
+  assert.match(initial[2].content, /Current environment/);
+  assert.deepEqual(initial.slice(3), [
     { role: 'user', content: 'Keep it concise.' },
     { role: 'user', content: 'Revise the result.' }
   ]);
@@ -69,8 +71,9 @@ test('application context precedes retained conversation and never follows a too
     ...input,
     contextItems: [{ ...input.contextItems[0], content: 'Updated environment.' }]
   }).messages;
-  assert.match(refreshed[0].content, /Updated environment/);
-  assert.deepEqual(refreshed.slice(1), continuation.slice(1));
+  assert.match(refreshed[2].content, /Updated environment/);
+  assert.deepEqual(refreshed.slice(0, 2), continuation.slice(0, 2));
+  assert.deepEqual(refreshed.slice(3), continuation.slice(3));
 });
 
 function assembleWindow(window, input) {
