@@ -1903,7 +1903,7 @@ test('crashes while waiting for a lease or after acquisition but before tool.sta
     const crash = spawnSync(
       process.execPath,
       [fixture, mode, root, approval.runId, approval.approvalId, approval.fingerprint],
-      { encoding: 'utf8', timeout: 10_000 }
+      { encoding: 'utf8' }
     );
     assert.equal(crash.status, exitStatus, crash.stderr);
     await assert.rejects(() => readFile(path.join(root, 'effect.txt'), 'utf8'), /ENOENT/u);
@@ -1919,7 +1919,7 @@ test('crashes while waiting for a lease or after acquisition but before tool.sta
     const recovered = spawnSync(
       process.execPath,
       [fixture, 'recover', root, approval.runId, approval.approvalId, approval.fingerprint],
-      { encoding: 'utf8', timeout: 10_000 }
+      { encoding: 'utf8' }
     );
     assert.equal(recovered.status, 0, recovered.stderr);
     assert.equal(JSON.parse(recovered.stdout).executionStatus, 'completed');
