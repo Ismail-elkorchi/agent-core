@@ -6,3 +6,5 @@ export { exportConversation } from './export-node.js';
 export { runTerminalApplication } from './lifecycle-node.js';
 
 export { FileSessionNames } from './session-names-node.js';
+
+export { openBrowser } from './browser-node.js';

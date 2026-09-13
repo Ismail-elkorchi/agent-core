@@ -38,6 +38,7 @@ import { diagnosticMessage } from './diagnostics.js';
 import { panel } from './panel.js';
 
 export interface ConfigurationOperations {
+  openBrowser?(url: string, signal: AbortSignal): Promise<void>;
   readonly providers: readonly { readonly id: string; readonly label: string }[];
   connect(provider: string, endpoint?: string): ModelProvider | Promise<ModelProvider>;
   save(selection: ModelSelection, provider: ModelProvider): Promise<void>;
@@ -72,6 +73,7 @@ export interface ConfigurationState {
 }
 
 export type ConfigurationMessage =
+  | { readonly type: 'configuration.open-browser' }
   | { readonly type: 'configuration.scroll'; readonly offset: number }
   | { readonly type: 'configuration.copy'; readonly target: 'url' | 'code' }
   | { readonly type: 'configuration.notice'; readonly id: string; readonly message: string }
@@ -175,6 +177,39 @@ function reduceConfiguration(
       return { state: { ...state, offset: message.offset } };
     case 'configuration.notice':
       return { state: { ...state, notice: message.message } };
+    case 'configuration.open-browser': {
+      const challenge = state.challenge;
+      const open = operations.openBrowser?.bind(operations);
+      if (challenge === undefined || open === undefined) return { state };
+      return {
+        state,
+        effects: [
+          {
+            id: 'configuration-browser',
+            concurrency: 'keep-first',
+            async run({ signal }) {
+              await open(challenge.url, signal);
+              return {
+                kind: 'message',
+                message: {
+                  type: 'configuration.notice',
+                  id: state.id,
+                  message: 'Sign-in page opened in your browser.'
+                }
+              };
+            },
+            onError: ({ diagnostic }) => ({
+              kind: 'message',
+              message: {
+                type: 'configuration.notice',
+                id: state.id,
+                message: diagnosticMessage(diagnostic)
+              }
+            })
+          }
+        ]
+      };
+    }
     case 'configuration.copy': {
       const value = state.challenge?.[message.target];
       return value === undefined
@@ -612,6 +647,17 @@ export function configurationView(
           ...(state.challenge === undefined
             ? []
             : [
+                ...(operations.openBrowser === undefined
+                  ? [
+                      text({
+                        content: 'Browser launch is unavailable; copy the link to open it elsewhere.'
+                      })
+                    ]
+                  : [
+                      action('configuration-open-browser', 'Open in browser', {
+                        type: 'configuration.open-browser'
+                      })
+                    ]),
                 action('configuration-copy-url', 'Copy sign-in link', {
                   type: 'configuration.copy',
                   target: 'url'

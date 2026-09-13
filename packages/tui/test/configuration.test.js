@@ -136,3 +136,43 @@ test('an empty panel closes on a raw Escape without a dummy focus target', async
   await input.pending;
   assert.equal(runtime.state(), false);
 });
+
+test('browser launch uses only its explicit optional capability without starting authentication', async () => {
+  const calls = [];
+  const operations = {
+    providers: [],
+    openBrowser: async (url) => {
+      calls.push(url);
+    }
+  };
+  const state = {
+    ...configurationState(undefined, []),
+    stage: 'authentication',
+    challenge: {
+      url: 'https://example.test/sign-in',
+      code: 'CODE',
+      complete: () => {
+        throw new Error('Unexpected authentication');
+      }
+    }
+  };
+  const result = updateConfiguration(state, { type: 'configuration.open-browser' }, operations);
+  assert.deepEqual(calls, []);
+  const output = await result.effects[0].run({ signal: new AbortController().signal });
+  assert.deepEqual(calls, [state.challenge.url]);
+  assert.equal(output.message.type, 'configuration.notice');
+  assert.equal(result.state, state);
+  assert.equal(
+    updateConfiguration(state, { type: 'configuration.open-browser' }, { providers: [] }).effects,
+    undefined
+  );
+});
+
+test('the Node browser helper rejects non-web links and canceled launches before spawning', async () => {
+  const { openBrowser } = await import('@agent-core/tui/node');
+  await assert.rejects(openBrowser('file:///tmp/secret', new AbortController().signal), /HTTP and HTTPS/);
+  await assert.rejects(
+    openBrowser('https://example.test', AbortSignal.abort(new Error('Canceled'))),
+    /Canceled/
+  );
+});

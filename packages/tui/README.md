@@ -4,7 +4,7 @@ Shared terminal presentation for the application adapters. `MarkdownDocument` re
 
 Links expose only HTTP, HTTPS, and mail destinations and never open automatically. HTML and images remain literal descriptions. Parser resource errors leave the exact source accessible. Syntax highlighting uses Prism's token API; unsupported languages remain plain code.
 
-Import reusable components from `@agent-core/tui` and external-editor integration from `@agent-core/tui/node`. Applications own policy and session lifetime. Components use the consumer's terminal-ui peer instance; install local file dependencies as packages rather than symlinking across independently installed terminal-ui copies.
+Import reusable components from `@agent-core/tui` and external-editor and explicit browser-launch integration from `@agent-core/tui/node`. Applications own policy and session lifetime. Components use the consumer's terminal-ui peer instance; install local file dependencies as packages rather than symlinking across independently installed terminal-ui copies.
 
 Shared components also provide source-selection copying, attributed note paging, history bookmarks, and retained list measurements. Source text stays exact in memory and storage. The installed clipboard API normalizes some text; exact-copy requests detect and report this limitation instead of sending altered content.
 
