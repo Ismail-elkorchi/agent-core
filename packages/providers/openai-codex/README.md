@@ -2,7 +2,7 @@
 
 OpenAI Codex/ChatGPT subscription adapter for the provider-neutral contracts in `@agent-core/model`.
 
-The default is the documented `gpt-5.6` alias, with trusted Sol, Terra, and Luna identities and efforts through `max`. Unknown or locally enabled models require a complete `OpenAICodexModelProfileDefinition`; explicit definitions replace built-ins instead of partially merging guessed capabilities. The subscription channel deliberately does not claim Platform pricing, `standard|pro` mode support, or a disable-reasoning path. Namespaced service tier accepts `default|priority`; obsolete aliases are rejected. HTTP full replay and WebSocket incremental continuation remain explicit strategies, and failed continuation resets conservatively.
+The default is `gpt-5.6`, with built-in Sol, Terra, and Luna profiles. `listModels()` discovers the authenticated account's model catalog; `describeModel()` discovers models without a built-in profile. Discovered profiles preserve the catalog's reasoning efforts and replace built-ins once the catalog is loaded. Complete `OpenAICodexModelProfileDefinition` overrides take precedence. Subscription capabilities come from this endpoint, including whether reasoning can be disabled; Platform pricing and `standard|pro` mode support are not inferred. Namespaced service tier accepts `default|priority`; obsolete aliases are rejected. HTTP full replay and WebSocket incremental continuation remain explicit strategies, and failed continuation resets conservatively. Both `complete()` and `stream()` use streaming transport; `complete()` collects its terminal response.
 
 Bounded Responses framing is shared with the Platform adapter; credentials, headers, model policy, and continuation behavior are not.
 

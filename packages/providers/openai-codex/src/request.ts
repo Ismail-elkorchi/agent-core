@@ -18,15 +18,15 @@ export function codexCompiledRequest(request: ModelRequest): CompiledModelReques
   return compiledRequests.get(request);
 }
 
-export function toCodexResponsesRequest(request: ModelRequest, stream: boolean): Record<string, unknown> {
+export function toCodexResponsesRequest(request: ModelRequest): Record<string, unknown> {
   const compiled = compiledRequests.get(request);
-  if (compiled) return { ...compiled.body, stream };
+  if (compiled) return { ...compiled.body, stream: true };
   assertCodexRequestCompatibility(request);
   const { instructions, input } = responsesInput(request, OPENAI_CODEX_PROVIDER_ID, true);
   const body: Record<string, unknown> = {
     model: request.model,
     input,
-    stream,
+    stream: true,
     store: false,
     tool_choice: 'auto',
     parallel_tool_calls: true

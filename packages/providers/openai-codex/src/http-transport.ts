@@ -50,10 +50,9 @@ export interface CodexHttpTransportConfig {
   onResponsePayload?: (payload: OpenAICodexResponsesPayload) => void;
 }
 
-export async function fetchCodexResponse(
+async function fetchCodexResponse(
   config: CodexHttpTransportConfig,
   request: ModelRequest,
-  stream: boolean,
   signal: AbortSignal | undefined = request.signal
 ): Promise<Response> {
   try {
@@ -61,8 +60,8 @@ export async function fetchCodexResponse(
     const accountId = accountIdFromToken(token);
     const init: RequestInit = {
       method: 'POST',
-      headers: requestHeaders(token.token, accountId, stream, config.originator),
-      body: JSON.stringify(toCodexResponsesRequest(request, stream))
+      headers: requestHeaders(token.token, accountId, true, config.originator),
+      body: JSON.stringify(toCodexResponsesRequest(request))
     };
     if (signal) {
       init.signal = signal;
@@ -82,7 +81,7 @@ export async function* streamCodexHttp(
 ): AsyncIterable<ModelStreamEvent> {
   throwIfAborted(signal);
   try {
-    const responsePromise = fetchCodexResponse(config, request, true, signal);
+    const responsePromise = fetchCodexResponse(config, request, signal);
     const startedAt = Date.now();
     let response: Response | undefined;
     while (!response) {

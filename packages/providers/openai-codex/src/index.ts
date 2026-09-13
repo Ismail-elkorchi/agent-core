@@ -45,7 +45,6 @@ import {
 } from './continuation.js';
 import {
   normalizeError,
-  parseCodexJsonResponse,
   parseCodexModelResponse,
   summarizeCodexFailure
 } from './errors.js';
@@ -64,7 +63,6 @@ import {
 } from './events.js';
 import {
   type CodexHttpTransportConfig,
-  fetchCodexResponse,
   requestHeaders,
   streamCodexHttp
 } from './http-transport.js';
@@ -274,7 +272,7 @@ export class OpenAICodexProvider implements ModelProvider {
       return cached;
     // Each compilation keeps its own logical identity across provider instances and policies.
     if (cached) request = parseModelRequest({ ...request });
-    const body = toCodexResponsesRequest(request, false);
+    const body = toCodexResponsesRequest(request);
     delete body.stream;
     const compiled = await compileModelRequest({
       request,
@@ -323,7 +321,11 @@ export class OpenAICodexProvider implements ModelProvider {
         code: 'invalid_request',
         message: 'Session has no compiled completion transport.'
       });
-    return session.completeCompiled(await this.compileRequest(request), options);
+    try {
+      return await session.completeCompiled(await this.compileRequest(request), options);
+    } finally {
+      await session.close?.();
+    }
   }
 
   async *stream(request: ModelRequest, options?: ModelTransportOptions): AsyncIterable<ModelStreamEvent> {
@@ -335,21 +337,11 @@ export class OpenAICodexProvider implements ModelProvider {
         message: 'OpenAI Codex provider session does not support streaming.'
       });
     }
-    yield* session.streamCompiled(await this.compileRequest(request), options);
-  }
-
-  async fetchResponse(
-    request: ModelRequest,
-    stream: boolean,
-    options?: ModelTransportOptions
-  ): Promise<Response> {
-    const compiled = await this.compileRequest(request);
-    return fetchCodexResponse(
-      this.httpTransportConfig(),
-      compiled.logicalRequest,
-      stream,
-      modelTransportSignal(compiled.logicalRequest, options)
-    );
+    try {
+      yield* session.streamCompiled(await this.compileRequest(request), options);
+    } finally {
+      await session.close?.();
+    }
   }
 
   async *streamHttp(
@@ -453,20 +445,14 @@ class OpenAICodexProviderSession implements ModelProviderSession {
   }
 
   async complete(request: ModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
-    try {
-      request = (await this.provider.compileRequest(request)).logicalRequest;
-      const response = await this.provider.fetchResponse(request, false, options);
-      const payload = await parseCodexJsonResponse(this.provider.id, response);
-      const modelResponse = await toModelResponse(this.provider.id, request, payload, {
-        strategy: 'http_full_replay',
-        endpoint: this.provider.httpUrl()
-      });
-      this.rememberFullHttpRequest(request, false, payload);
-      return modelResponse;
-    } catch (error) {
-      this.resetContinuation('error');
-      throw normalizeError(this.provider.id, error);
+    for await (const event of this.stream(request, options)) {
+      if (event.type === 'done') return event.response;
     }
+    throw new ModelProviderError({
+      provider: this.provider.id,
+      code: 'malformed_response',
+      message: 'OpenAI Codex stream ended without a response.'
+    });
   }
 
   async *stream(request: ModelRequest, options?: ModelTransportOptions): AsyncIterable<ModelStreamEvent> {
@@ -530,7 +516,7 @@ class OpenAICodexProviderSession implements ModelProviderSession {
       options
     )) {
       if (event.type === 'done') {
-        this.rememberFullHttpRequest(request, true, payload);
+        this.rememberFullHttpRequest(request, payload);
         yield event;
         continue;
       }
@@ -548,7 +534,7 @@ class OpenAICodexProviderSession implements ModelProviderSession {
     const accountId = this.provider.codexAccountId(token);
     const socket = await this.ensureWebSocket(token.token, accountId, signal);
     await this.provider.compileRequest(request);
-    const fullRequest = toCodexResponsesRequest(request, true);
+    const fullRequest = toCodexResponsesRequest(request);
     const assembly = assembleCodexWebSocketRequest(fullRequest, this.lastRequest, this.lastResponse);
     const wireRequest = {
       type: 'response.create',
@@ -711,13 +697,12 @@ class OpenAICodexProviderSession implements ModelProviderSession {
 
   private rememberFullHttpRequest(
     request: ModelRequest,
-    stream: boolean,
     payload: OpenAICodexResponsesPayload | undefined
   ): void {
     if (!payload) {
       return;
     }
-    this.rememberContinuationBase(toCodexResponsesRequest(request, stream), payload);
+    this.rememberContinuationBase(toCodexResponsesRequest(request), payload);
   }
 
   private rememberContinuationBase(

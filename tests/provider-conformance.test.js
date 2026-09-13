@@ -164,7 +164,8 @@ function openAICodexAdapter() {
             { type: 'response.output_text.delta', delta: 'hello' },
             { type: 'response.completed', response: openAIFinal('gpt-test') }
           ];
-          return JSON.parse(init.body).stream ? sse(chunks) : json(openAIFinal('gpt-test'));
+          assert.equal(JSON.parse(init.body).stream, true);
+          return sse(chunks);
         }
       });
     },
@@ -172,14 +173,14 @@ function openAICodexAdapter() {
       return new OpenAICodexProvider({
         modelProfiles: { 'gpt-test': testModelProfile() },
         auth: { describe() { return { type: 'bearer', label: 'test' }; }, async getBearerToken() { return { token: codexToken() }; }, async invalidate() {} },
-        fetch: async () => json({ id: 'bad', model: 'gpt-test', status: 'completed', output: [{ type: 'function_call', name: 'bad', arguments: '{' }] })
+        fetch: async () => sse([{ type: 'response.completed', response: { id: 'bad', model: 'gpt-test', status: 'completed', output: [{ type: 'function_call', name: 'bad', arguments: '{' }] } }])
       });
     },
     createMalformedUsage() {
       return new OpenAICodexProvider({
         modelProfiles: { 'gpt-test': testModelProfile() },
         auth: { describe() { return { type: 'bearer', label: 'test' }; }, async getBearerToken() { return { token: codexToken() }; }, async invalidate() {} },
-        fetch: async () => json({ ...openAIFinal('gpt-test'), usage: { input_tokens: -1, output_tokens: 1, total_tokens: 0 } })
+        fetch: async () => sse([{ type: 'response.completed', response: { ...openAIFinal('gpt-test'), usage: { input_tokens: -1, output_tokens: 1, total_tokens: 0 } } }])
       });
     }
   };

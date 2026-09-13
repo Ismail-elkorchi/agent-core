@@ -9,6 +9,51 @@ import { FileCredentialStore } from '@agent-core/auth';
 import { ModelProviderError } from '@agent-core/model';
 import { OpenAICodexProvider, loginOpenAICodexDeviceCode } from '@agent-core/provider-openai-codex';
 
+test('Codex catalog efforts do not prevent low or high requests for Astra or other models', async () => {
+  const efforts = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'provider-defined-effort'];
+  const calls = [];
+  let catalogRequests = 0;
+  const provider = new OpenAICodexProvider({
+    auth: bearerProvider(codexJwt()),
+    fetch: async (url, init) => {
+      if (new URL(url).pathname.endsWith('/models')) {
+        catalogRequests++;
+        return jsonResponse({ models: ['gpt-6-astra', 'another-model'].map((slug) => ({
+          slug,
+          display_name: slug,
+          input_modalities: ['text', 'image'],
+          context_window: 1_050_000,
+          default_reasoning_level: 'medium',
+          supported_reasoning_levels: efforts.map((effort) => ({ effort, description: effort }))
+        })) });
+      }
+      const body = JSON.parse(init.body);
+      assert.equal(body.stream, true);
+      calls.push(body);
+      return completionResponse({ id: `response-${calls.length}`, model: body.model, status: 'completed', output_text: 'done' });
+    }
+  });
+  for (const model of ['gpt-6-astra', 'another-model']) {
+    assert.deepEqual((await provider.describeModel(model)).capabilities.reasoning.efforts, efforts);
+    for (const effort of ['low', 'high', 'provider-defined-effort']) {
+      const compiled = await provider.compileRequest({
+        model,
+        messages: [{ role: 'user', content: 'hello' }],
+        reasoning: { strategy: 'effort', effort }
+      }, { outputReservation: 100 });
+      assert.equal((await provider.completeCompiled(compiled)).content, 'done');
+      assert.equal(calls.at(-1).reasoning.effort, effort);
+    }
+  }
+  await assert.rejects(provider.compileRequest({
+    model: 'gpt-6-astra',
+    messages: [{ role: 'user', content: 'hello' }],
+    reasoning: { strategy: 'effort', effort: 'unadvertised' }
+  }), /reasoning effort unadvertised is not supported/u);
+  assert.equal(catalogRequests, 1);
+  assert.equal(calls.length, 6);
+});
+
 test('OpenAICodexProvider describes the ChatGPT subscription Responses profile', async () => {
   const provider = new OpenAICodexProvider({ auth: bearerProvider(codexJwt()) });
   assert.deepEqual(provider.describe(), {
@@ -48,7 +93,7 @@ test('Codex compiled admission is bound to its provider instance and reservation
     auth: bearerProvider(codexJwt()),
     fetch: async () => {
       sent++;
-      return jsonResponse({
+      return completionResponse({
         id: 'compiled-instance',
         model: 'gpt-5.6',
         status: 'completed',
@@ -101,7 +146,7 @@ test('OpenAICodexProvider supports GPT-5.6 max effort but does not claim subscri
           ]
         });
       fetchCalls += 1;
-      return jsonResponse({
+      return completionResponse({
         id: 'unexpected',
         model: 'gpt-5.6',
         status: 'completed',
@@ -150,7 +195,7 @@ test('OpenAICodexProvider serializes documented service tiers and rejects obsole
     auth: bearerProvider(codexJwt()),
     fetch: async (_input, init) => {
       calls.push(JSON.parse(init.body));
-      return jsonResponse({
+      return completionResponse({
         id: 'resp-priority',
         model: 'gpt-5.6',
         status: 'completed',
@@ -182,14 +227,14 @@ test('OpenAICodexProvider defaults to HTTP full replay transport', async () => {
   const requests = [];
   const server = createServer((request, response) => {
     requests.push(request);
-    response.writeHead(200, { 'content-type': 'application/json' });
-    response.end(JSON.stringify({
+    response.writeHead(200, { 'content-type': 'text/event-stream' });
+    response.end(`data: ${JSON.stringify({ type: 'response.completed', response: {
       id: 'resp-http-default',
       model: 'gpt-5.6',
       status: 'completed',
       output_text: 'http ok',
       output: []
-    }));
+    } })}\n\n`);
   });
   server.listen(0);
   await listening(server);
@@ -355,7 +400,7 @@ test('OpenAICodexProvider rejects malformed nested Responses fields', async () =
   const provider = new OpenAICodexProvider({
     auth: bearerProvider(codexJwt()),
     fetch: async () =>
-      jsonResponse({
+      completionResponse({
         id: 'bad',
         model: 'gpt-5.6',
         status: 'completed',
@@ -459,7 +504,7 @@ test('OpenAICodexProvider sends Codex Responses requests with ChatGPT account he
     auth: bearerProvider(codexJwt('acct-123')),
     fetch: async (input, init) => {
       calls.push({ input: String(input), init });
-      return jsonResponse({
+      return completionResponse({
         id: 'resp-1',
         model: 'gpt-5.6',
         status: 'completed',
@@ -504,7 +549,7 @@ test('OpenAICodexProvider sends Codex Responses requests with ChatGPT account he
   assert.equal(calls[0].init.headers.originator, 'agent-core');
   const body = JSON.parse(calls[0].init.body);
   assert.equal(body.model, 'gpt-5.6');
-  assert.equal(body.stream, false);
+  assert.equal(body.stream, true);
   assert.equal(body.store, false);
   assert.equal(body.instructions, 'Be concise.');
   assert.equal('previous_response_id' in body, false);
@@ -535,7 +580,7 @@ test('OpenAICodexProvider HTTP transport replays full assembled history without 
     auth: bearerProvider(codexJwt('acct-123')),
     fetch: async (input, init) => {
       calls.push({ input: String(input), init });
-      return jsonResponse({ id: 'resp-2', model: 'gpt-5.6', status: 'completed', output_text: 'done' });
+      return completionResponse({ id: 'resp-2', model: 'gpt-5.6', status: 'completed', output_text: 'done' });
     }
   });
 
@@ -566,7 +611,7 @@ test('OpenAICodexProvider HTTP sessions replay the full transcript without persi
     auth: bearerProvider(codexJwt('acct-123')),
     fetch: async (input, init) => {
       calls.push({ input: String(input), init });
-      return jsonResponse(responses.shift());
+      return completionResponse(responses.shift());
     }
   });
   const session = provider.createSession();
@@ -1160,7 +1205,7 @@ test('OpenAICodexProvider refreshes stored credentials before request', async ()
           token_type: 'Bearer'
         });
       }
-      return jsonResponse({ id: 'resp-3', model: 'gpt-5.6', status: 'completed', output_text: 'ok' });
+      return completionResponse({ id: 'resp-3', model: 'gpt-5.6', status: 'completed', output_text: 'ok' });
     }
   });
 
@@ -1520,6 +1565,10 @@ function codexJwt(accountId = 'acct-test') {
 
 function base64Url(text) {
   return Buffer.from(text, 'utf8').toString('base64url');
+}
+
+function completionResponse(response) {
+  return sseResponse([{ type: 'response.completed', response }]);
 }
 
 function jsonResponse(body, options = {}) {

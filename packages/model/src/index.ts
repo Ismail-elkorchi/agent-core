@@ -223,7 +223,8 @@ export interface ModelDiscoveryOptions {
   readonly refresh?: boolean;
 }
 
-export type ModelReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+/** A non-empty provider-defined value. Supported values belong to each model profile. */
+export type ModelReasoningEffort = string;
 export type ModelReasoningMode = 'standard' | 'pro';
 
 export type ModelReasoningRequest =
@@ -236,7 +237,8 @@ export type ModelReasoningRequest =
     }
   | {
       readonly strategy: 'effort';
-      readonly effort: Exclude<ModelReasoningEffort, 'none'>;
+      /** Use the disabled strategy for the reserved value `none`. */
+      readonly effort: ModelReasoningEffort;
       /** A provider-declared execution mode, serialized only by adapters that support it. */
       readonly mode?: ModelReasoningMode;
       readonly summary?: ModelReasoningSummary;

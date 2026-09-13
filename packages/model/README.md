@@ -10,6 +10,8 @@ Provider-neutral typed input/output, capability revisions, immutable compiled re
 
 `parseModelRequest`, `parseModelInputItem`, `parseModelResponse`, `parseProviderContextState`, `parseModelStreamEvent` and `parseModelProfile` validate and own boundary values. `assertModelRequestSupported` applies the resolved model capability contract.
 
+Reasoning efforts are non-empty provider-defined strings, preserved exactly. Model profiles declare their supported efforts; request validation checks membership in that profile instead of a global enumeration. Use `{ strategy: 'disabled' }` to request disabled reasoning, subject to the profile's `canDisable` capability.
+
 `CompleteRequestEstimator` implements `RequestEstimator` for diagnostics, including tool arguments and all known media/control fields. Its UTF-8 heuristic is explicitly uncalibrated. `estimateItems` rejects unknown opaque/media costs. Production admission uses `accountModelRequest` or adapter `compileRequest` results and `assertRequestAccountingFits`. Components report counted/estimated/unknown status, method/version, uncertainty headroom, separate output/reasoning reservations and pricing semantics. A missing output policy or unknown input cost cannot silently become zero.
 
 `compileModelRequest` owns the actual provider body, capability revision and canonical SHA-256 input identity. Serialized sections count once, with semantic media/opaque costs accounted separately. Adapters identify exact payload paths so arbitrary user JSON keys are never suppressed. Encrypted byte size is not its logical token cost. Provider counts can replace heuristic input estimates; unknown costs require an explicit allowance.

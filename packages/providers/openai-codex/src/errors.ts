@@ -7,7 +7,6 @@ import {
   type ModelProviderErrorCode,
   type ModelProviderErrorDiagnosticValue
 } from '@agent-core/model';
-import { decodeResponsesPayload, readBoundedJsonResponse } from '@agent-core/provider-openai-responses';
 
 import { OPENAI_CODEX_PROVIDER_ID } from './constants.js';
 import type {
@@ -16,19 +15,6 @@ import type {
   OpenAICodexStreamData
 } from './events.js';
 import { errorMessage, isAbortError, isJsonObject } from './utils.js';
-
-export async function parseCodexJsonResponse(provider: string, response: Response): Promise<OpenAICodexResponsesPayload> {
-  try {
-    return decodeResponsesPayload(await readBoundedJsonResponse(response), 'OpenAI Codex response');
-  } catch (error) {
-    throw new ModelProviderError({
-      provider,
-      code: 'malformed_response',
-      message: `OpenAI Codex response was not valid JSON: ${errorMessage(error)}`,
-      cause: error
-    });
-  }
-}
 
 export function normalizeError(provider: string, error: unknown): ModelProviderError {
   if (error instanceof ModelProviderError) {

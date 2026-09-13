@@ -1119,7 +1119,7 @@ export function decodeOwnedModelReasoningCapabilities(
     value.efforts !== undefined &&
     (!Array.isArray(value.efforts) || !value.efforts.every(isReasoningEffort))
   )
-    throw new Error('capabilities.reasoning is invalid.');
+    throw new Error('capabilities.reasoning.efforts must contain non-empty strings.');
   if (value.strategies.includes('effort') !== (Array.isArray(value.efforts) && value.efforts.length > 0))
     throw new Error('capabilities.reasoning is invalid.');
   if (
@@ -1156,7 +1156,7 @@ function isReasoningStrategy(value: unknown): value is 'toggle' | 'effort' | 'bu
   return value === 'toggle' || value === 'effort' || value === 'budget';
 }
 function isReasoningEffort(value: unknown): value is ModelReasoningEffort {
-  return typeof value === 'string' && REASONING_EFFORTS.has(value);
+  return typeof value === 'string' && value.trim().length > 0;
 }
 function isReasoningMode(value: unknown): value is 'standard' | 'pro' {
   return value === 'standard' || value === 'pro';
@@ -1294,9 +1294,8 @@ function validReasoningRequest(value: unknown): value is ModelReasoningRequest {
     return validSummary(value.summary) && onlyKeys(value, ['strategy', 'summary']);
   if (value.strategy === 'effort')
     return (
-      typeof value.effort === 'string' &&
+      isReasoningEffort(value.effort) &&
       value.effort !== 'none' &&
-      REASONING_EFFORTS.has(value.effort) &&
       (value.mode === undefined || value.mode === 'standard' || value.mode === 'pro') &&
       validSummary(value.summary) &&
       onlyKeys(value, ['strategy', 'effort', 'mode', 'summary'])
@@ -1376,7 +1375,6 @@ function nonnegativeInteger(value: unknown): value is number {
 function positiveFinite(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0;
 }
-const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 const MODEL_PARAMETERS = new Set([
   'temperature',
   'topP',

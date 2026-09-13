@@ -5,13 +5,23 @@ import { createTuiRuntime, defineTui } from '@ismail-elkorchi/terminal-ui/tui';
 import { text } from '@ismail-elkorchi/terminal-ui/components';
 import { renderFramePlain } from '@ismail-elkorchi/terminal-ui/renderer';
 import { configurationState, configurationView, updateConfiguration } from '@agent-core/tui';
+import { parseModelProfile } from '@agent-core/model';
 
-const profile = {
+const profile = parseModelProfile({
   id: 'available-model',
   provider: 'neutral',
   limits: { contextTokens: 10000 },
-  capabilities: { reasoning: { strategies: ['effort'], efforts: ['low', 'high'], canDisable: false } }
-};
+  modalities: { input: ['text'], output: ['text'] },
+  supportedParameters: ['reasoning'],
+  capabilities: {
+    streaming: true, toolCalling: false, supportedToolInputs: [], jsonMode: false,
+    jsonSchema: false, logprobs: false, temperature: false, topP: false,
+    reasoning: {
+      strategies: ['effort'], efforts: ['low', 'high', 'provider-defined-effort'],
+      canDisable: false, separateOutput: true
+    }
+  }
+});
 const key = (key, modifiers = {}) => ({
   kind: 'key',
   key,
@@ -89,9 +99,17 @@ test('a neutral consumer discovers, reviews and saves a model without typing its
   await runtime.handleInput(key('enter'));
   await settle(() => runtime.state().stage === 'review');
   assert.equal(saved.length, 0, 'highlighting and review do not commit configuration');
+  await runtime.dispatch({ type: 'configuration.stage', stage: 'reasoning' });
+  assert.ok(renderFramePlain(runtime.frame()).includes('provider-defined-effort'));
+  for (let i = 0; i < 3; i++) await runtime.handleInput(key('arrowDown'));
+  await runtime.handleInput(key('enter'));
+  assert.equal(runtime.state().stage, 'review');
   await runtime.dispatch({ type: 'configuration.save' });
   await settle(() => saved.length === 1);
-  assert.deepEqual(saved[0].selection, { provider: 'neutral', model: 'available-model' });
+  assert.deepEqual(saved[0].selection, {
+    provider: 'neutral', model: 'available-model',
+    reasoning: { strategy: 'effort', effort: 'provider-defined-effort' }
+  });
   assert.equal(saved[0].provider, adapter);
 });
 

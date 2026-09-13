@@ -5,6 +5,7 @@ import {
   CompleteRequestEstimator,
   assertModelRequestSupported,
   parseModelProfile,
+  parseModelReasoningRequest,
   parseModelRequest,
   parseModelResponse,
   parseModelStreamEvent
@@ -34,6 +35,46 @@ const profile = {
   limits: { contextTokens: 1000, maxInputTokens: 900, outputTokens: 100 },
   supportedParameters: ['reasoning']
 };
+
+test('reasoning efforts belong to model profiles rather than a global vocabulary', () => {
+  const efforts = ['low', 'high', 'ultra', 'provider-defined-effort'];
+  const discovered = parseModelProfile({
+    ...profile,
+    capabilities: {
+      ...profile.capabilities,
+      reasoning: { ...profile.capabilities.reasoning, efforts }
+    }
+  });
+  assert.deepEqual(discovered.capabilities.reasoning.efforts, efforts);
+  for (const effort of efforts) {
+    const request = parseModelRequest({
+      model: profile.id,
+      messages: [{ role: 'user', content: 'hello' }],
+      reasoning: { strategy: 'effort', effort }
+    });
+    assert.doesNotThrow(() => assertModelRequestSupported(discovered, request));
+  }
+  assert.throws(
+    () => assertModelRequestSupported(discovered, {
+      model: profile.id,
+      messages: [{ role: 'user', content: 'hello' }],
+      reasoning: { strategy: 'effort', effort: 'unadvertised' }
+    }),
+    /reasoning effort unadvertised is not supported/u
+  );
+  for (const effort of ['', '  ', 1, null, {}]) {
+    assert.throws(() => parseModelReasoningRequest({ strategy: 'effort', effort }), ModelContractError);
+    assert.throws(() => parseModelProfile({
+      ...profile,
+      capabilities: {
+        ...profile.capabilities,
+        reasoning: { ...profile.capabilities.reasoning, efforts: [effort] }
+      }
+    }), /capabilities.reasoning.efforts/u);
+  }
+  assert.throws(() => parseModelReasoningRequest({ strategy: 'effort', effort: 'none' }), ModelContractError);
+  assert.deepEqual(parseModelReasoningRequest({ strategy: 'disabled' }), { strategy: 'disabled' });
+});
 
 test('model request validation rejects illegal message combinations and unsafe options', () => {
   const cyclic = {};

@@ -1096,15 +1096,10 @@ function modelRecordToProfile(record: OpenRouterModelRecord): ModelProfile {
 
 function openRouterReasoningEfforts(
   reasoning: OpenRouterModelRecord['reasoning']
-): ('minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max')[] {
+): readonly string[] {
   const values = reasoning?.supported_efforts;
   if (values === null) return ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
-  if (!Array.isArray(values)) return [];
-  const supported = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
-  return values.filter(
-    (value): value is 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' =>
-      typeof value === 'string' && supported.has(value)
-  );
+  return values ?? [];
 }
 
 function modelMetadata(record: OpenRouterModelRecord): Record<string, unknown> {

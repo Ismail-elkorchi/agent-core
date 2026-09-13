@@ -704,14 +704,13 @@ function toOllamaThink(
       code: 'invalid_request',
       message: 'Ollama does not expose a thinking token budget.'
     });
-  if (reasoning.effort === 'minimal' || reasoning.effort === 'xhigh' || reasoning.effort === 'max') {
-    throw new ModelProviderError({
-      provider: 'ollama',
-      code: 'invalid_request',
-      message: `Ollama reasoning effort is not supported: ${reasoning.effort}`
-    });
-  }
-  return reasoning.effort;
+  if (reasoning.effort === 'low' || reasoning.effort === 'medium' || reasoning.effort === 'high')
+    return reasoning.effort;
+  throw new ModelProviderError({
+    provider: 'ollama',
+    code: 'invalid_request',
+    message: `Ollama reasoning effort is not supported: ${reasoning.effort}`
+  });
 }
 
 // Exact documented names only. Custom model names require a profile override for effort control.

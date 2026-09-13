@@ -83,7 +83,7 @@ test('OpenRouterProvider derives structured output and reasoning controls from e
     {
       ...catalogRecord('catalog/response-format-only'),
       supported_parameters: ['reasoning', 'response_format'],
-      reasoning: { supported_efforts: ['low'], mandatory: true }
+      reasoning: { supported_efforts: ['low', 'provider-defined-effort'], mandatory: true }
     },
     {
       ...catalogRecord('catalog/all-efforts'),
@@ -101,6 +101,7 @@ test('OpenRouterProvider derives structured output and reasoning controls from e
   assert.equal(responseFormatOnly.capabilities.jsonSchema, false);
   assert.deepEqual(responseFormatOnly.capabilities.reasoning.strategies, ['toggle', 'effort']);
   assert.equal(responseFormatOnly.capabilities.reasoning.canDisable, false);
+  assert.deepEqual(responseFormatOnly.capabilities.reasoning.efforts, ['low', 'provider-defined-effort']);
 
   const allEfforts = await provider.describeModel('catalog/all-efforts');
   assert.equal(allEfforts.capabilities.jsonMode, false);
