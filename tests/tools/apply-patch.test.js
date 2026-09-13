@@ -498,10 +498,13 @@ test('the patch journal lock isolates separate Agent Core processes', async () =
   await mkdir(journalDirectory, { recursive: true, mode: 0o700 });
   await writeFile(path.join(root, 'shared.txt'), 'base\n');
   const expected = createHash('sha256').update('base\n').digest('hex');
+  const authority = testRootedFileAuthority(root);
+  const expectedIdentity = JSON.stringify(await authority.fileIdentity('shared.txt'));
+  authority.close();
   const fixture = path.resolve('tests/fixtures/patch-concurrency.mjs');
   const results = await Promise.all([
-    runPatchChild(fixture, [root, journalDirectory, 'shared.txt', expected, 'one\n']),
-    runPatchChild(fixture, [root, journalDirectory, 'shared.txt', expected, 'two\n'])
+    runPatchChild(fixture, [root, journalDirectory, 'shared.txt', expected, expectedIdentity, 'one\n']),
+    runPatchChild(fixture, [root, journalDirectory, 'shared.txt', expected, expectedIdentity, 'two\n'])
   ]);
   assert.equal(results.filter((item) => item.outcome === 'committed').length, 1);
   assert.equal(results.filter((item) => item.outcome === 'rolled_back').length, 1);
