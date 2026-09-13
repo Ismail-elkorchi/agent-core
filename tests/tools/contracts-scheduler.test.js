@@ -536,13 +536,18 @@ test('every effect and observation resource scope uses the strict canonical scop
           deriveEffects() {
             return { accesses: [], lockScopes: [], recovery: { kind: 'unknown' } };
           },
-          async invoke() {
+          bindExecution(input) {
             return {
-              kind: 'result',
-              ok: true,
-              summary: 'bad',
-              scope: { resources: [], coverage: 'complete' },
-              output: {}
+              snapshot: this.snapshotInput(input),
+              async invoke() {
+                return {
+                  kind: 'result',
+                  ok: true,
+                  summary: 'bad',
+                  scope: { resources: [], coverage: 'complete' },
+                  output: {}
+                };
+              }
             };
           }
         }),
@@ -747,4 +752,24 @@ test('canonicalization rejects accessors and cycles without invoking accessors',
   );
   assert.equal(effectsPreparation.ok, false);
   assert.equal(effectAccesses, 0);
+});
+
+test('a failed retained resource rejects dependent work without releasing uncertain authority', async () => {
+  const coordinator = new ResourceLeaseCoordinator();
+  const effects = { accesses: [{ mode: 'execute', scope: 'processes' }], lockScopes: ['files'], recovery: { kind: 'unknown' } };
+  const read = { accesses: [{ mode: 'read', scope: 'files/source' }], lockScopes: [], recovery: { kind: 'unknown' } };
+  const process = await coordinator.acquire(effects, 'command');
+  process.transferToResource('command-1', 'processes/command-1');
+  const failure = new Error('Command output integrity could not be established.');
+  const pending = assert.rejects(coordinator.acquire(read, 'reader'), failure);
+  coordinator.failResource('command-1', failure);
+  await pending;
+  await assert.rejects(coordinator.acquire(read, 'later-reader'), failure);
+  assert.equal(coordinator.activeCount(), 1);
+  const control = await coordinator.acquire({ accesses: [{ mode: 'execute', scope: 'processes/command-1' }], lockScopes: [], recovery: { kind: 'unknown' } }, 'reconcile');
+  control.release();
+  coordinator.releaseResource('command-1');
+  const recovered = await coordinator.acquire(read, 'after-reconciliation');
+  recovered.release();
+  assert.equal(coordinator.activeCount(), 0);
 });

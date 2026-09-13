@@ -1,7 +1,7 @@
 import * as z from 'zod';
 import { parseJsonObject, parseJsonValue, type JsonValue } from '@agent-core/json';
 import type { ToolCanonicalizationContext, ToolExecutionContext } from './context.js';
-import type { ToolDefinition, ToolEffectRecoveryResult, ToolInput, ToolObservationInput, ToolPromptGuide, ToolRequirements, ToolTextInputDefinition } from './definition.js';
+import type { ToolExecutionBinding, ToolDefinition, ToolEffectRecoveryResult, ToolInput, ToolObservationInput, ToolPromptGuide, ToolRequirements, ToolTextInputDefinition } from './definition.js';
 import type { EffectExecutionState } from '@agent-core/effects';
 import type { ToolObservationPresentation, ToolObservationPresentationRequest } from './observation-presentation.js';
 import type { ToolPolicy } from './policy.js';
@@ -9,7 +9,7 @@ import { invalidArgumentsObservation, invalidToolInputObservation } from './obse
 import { validateToolEffectEnvelope, type ToolEffectEnvelope, type ToolEffects } from './authorization.js';
 import { markCompiledTool, type CompiledToolDefinition } from './compiled.js';
 
-export interface DefineToolOptions<Schema extends z.ZodType, TCanonicalInput, TOutput> {
+interface ToolOptions<Schema extends z.ZodType, TCanonicalInput, TOutput> {
   name: string;
   implementationId: string;
   description: string;
@@ -24,11 +24,23 @@ export interface DefineToolOptions<Schema extends z.ZodType, TCanonicalInput, TO
   canonicalizeInput: (input: z.output<Schema>, context: ToolCanonicalizationContext) => TCanonicalInput | Promise<TCanonicalInput>;
   snapshotInput?: (input: TCanonicalInput) => JsonValue;
   deriveEffects: (input: TCanonicalInput, context: ToolCanonicalizationContext) => ToolEffects | Promise<ToolEffects>;
-  recover?: (input: TCanonicalInput, effect: Extract<EffectExecutionState, { readonly phase: 'started' }>, context: ToolExecutionContext) => ToolEffectRecoveryResult<TOutput> | Promise<ToolEffectRecoveryResult<TOutput>>;
   isAvailable?: (policy: ToolPolicy) => boolean;
-  invoke: (input: TCanonicalInput, context: ToolExecutionContext) => Promise<ToolObservationInput<TOutput>>;
   presentObservation?: (request: ToolObservationPresentationRequest<TCanonicalInput, TOutput>) => ToolObservationPresentation;
 }
+
+export type DefineToolOptions<Schema extends z.ZodType, TCanonicalInput, TOutput> =
+  ToolOptions<Schema, TCanonicalInput, TOutput> & (
+    | {
+        bindExecution: (input: TCanonicalInput, context: ToolCanonicalizationContext) => ToolExecutionBinding<TOutput> | Promise<ToolExecutionBinding<TOutput>>;
+        invoke?: never;
+        recover?: never;
+      }
+    | {
+        bindExecution?: never;
+        invoke: (input: TCanonicalInput, context: ToolExecutionContext) => Promise<ToolObservationInput<TOutput>>;
+        recover?: (input: TCanonicalInput, effect: Extract<EffectExecutionState, { readonly phase: 'started' }>, context: ToolExecutionContext) => ToolEffectRecoveryResult<TOutput> | Promise<ToolEffectRecoveryResult<TOutput>>;
+      }
+  );
 
 export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
   definition: DefineToolOptions<Schema, TCanonicalInput, TOutput>
@@ -94,8 +106,15 @@ export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
     canonicalizeInput: definition.canonicalizeInput,
     snapshotInput: (input) => parseJsonValue(snapshotInput(input), { maxDepth: 32, maxCollectionEntries: 20_000, maxStringBytes: 4_000_000, maxTotalBytes: 8_000_000 }),
     deriveEffects: definition.deriveEffects,
-    ...(definition.recover ? { recover: definition.recover } : {}),
-    invoke: definition.invoke
+    bindExecution: (input, context) => {
+      if (definition.bindExecution) return definition.bindExecution(input, context);
+      const { invoke, recover } = definition;
+      return {
+        snapshot: tool.snapshotInput(input),
+        invoke: (executionContext) => invoke(input, executionContext),
+        ...(recover ? { recover: (effect: Extract<EffectExecutionState, { readonly phase: 'started' }>, executionContext: ToolExecutionContext) => recover(input, effect, executionContext) } : {})
+      };
+    }
   };
   return markCompiledTool(Object.freeze(tool));
 }

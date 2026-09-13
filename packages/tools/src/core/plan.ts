@@ -1,10 +1,10 @@
 import { hashJson } from '@agent-core/persistence';
 import { decodeEffectRecoveryCapability, type EffectExecutionState } from '@agent-core/effects';
-import type { JsonObject, JsonValue } from '@agent-core/json';
+import { parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import { abortableToolBoundary, MissingToolServiceError, throwIfAborted, ToolInputError, type ToolCanonicalizationContext, type ToolExecutionContext, type ToolPlanningContext, type ToolPlanLifetime, type ToolPlanResource } from './context.js';
 import type { ToolCall, ToolDefinition, ToolEffectRecoveryResult, ToolObservation } from './definition.js';
 import { invalidOutputObservation, invalidToolInputObservation, missingServiceObservation, parseToolObservation, runtimeErrorObservation, unknownToolObservation } from './observation.js';
-import { assertEffectsWithinEnvelope, encodeToolEffects, validateToolEffects, type ToolEffects } from './authorization.js';
+import { assertEffectsWithinEnvelope, encodeToolEffects, validateToolEffects, type ToolEffects, type ToolAuthorizationRequest } from './authorization.js';
 import { encodeToolPolicy } from './policy.js';
 
 const TOOL_CALL_PLAN = Symbol('agent-core.plan-tool-call');
@@ -34,12 +34,15 @@ export class ToolInvocationAuthorityError extends Error {
   }
 }
 
+export type ToolInputInspection = Omit<ToolAuthorizationRequest, 'fingerprint'>;
+export type ToolInputPrerequisite = (request: ToolInputInspection) => Promise<ToolObservation | undefined>;
+
 export type ToolCallPlanningResult =
   | { readonly ok: true; readonly plan: ToolCallPlan }
   | { readonly ok: false; readonly observation: ToolObservation };
 
 /** Resolve, parse, canonicalize, and derive effects before any authorization decision. */
-export async function planToolCall(call: ToolCall, tools: readonly ToolDefinition[], context: ToolPlanningContext): Promise<ToolCallPlanningResult> {
+export async function planToolCall(call: ToolCall, tools: readonly ToolDefinition[], context: ToolPlanningContext, prerequisite?: ToolInputPrerequisite): Promise<ToolCallPlanningResult> {
   if (!isOwnedToolCall(call)) throw new Error('Tool calls must be created or decoded before lifetime.');
   const tool = tools.find((candidate) => candidate.name === call.name);
   if (!tool) return { ok: false, observation: unknownToolObservation(call) };
@@ -49,9 +52,18 @@ export async function planToolCall(call: ToolCall, tools: readonly ToolDefinitio
     const decoded = tool.decodeInput(call.input);
     if (!decoded.ok) return { ok: false, observation: decoded.observation };
     const canonicalized = await abortableToolBoundary(context.signal, () => tool.canonicalizeInput(decoded.input, planningContext));
-    const canonicalSnapshot = tool.snapshotInput(canonicalized);
+    const inspectedInput = tool.snapshotInput(canonicalized);
     const effects = validateToolEffects(await abortableToolBoundary(context.signal, () => tool.deriveEffects(canonicalized, planningContext)));
     assertEffectsWithinEnvelope(effects, tool.effectEnvelope);
+    const requiredContext = prerequisite
+      ? await abortableToolBoundary(context.signal, () => prerequisite({ call, toolImplementationId: tool.implementationId, input: inspectedInput, effects, context }))
+      : undefined;
+    if (requiredContext) {
+      await lifetime.release();
+      return { ok: false, observation: requiredContext };
+    }
+    const binding = await abortableToolBoundary(context.signal, () => tool.bindExecution(canonicalized, planningContext));
+    const canonicalSnapshot = parseJsonValue(binding.snapshot, { maxDepth: 32, maxCollectionEntries: 20_000, maxStringBytes: 4_000_000, maxTotalBytes: 8_000_000 });
     const fingerprintInput: JsonObject = Object.freeze({
       tool: Object.freeze({
         name: tool.name,
@@ -76,7 +88,7 @@ export async function planToolCall(call: ToolCall, tools: readonly ToolDefinitio
       effects,
       fingerprint: hashJson(fingerprintInput)
     });
-    const recover = tool.recover?.bind(tool);
+    const recover = binding.recover?.bind(binding);
     toolCallPlans.set(plan, {
       state: 'planned',
       lifetime,
@@ -84,7 +96,7 @@ export async function planToolCall(call: ToolCall, tools: readonly ToolDefinitio
         recover: async (effect: Extract<EffectExecutionState, { readonly phase: 'started' }>, executionContext: ToolExecutionContext) => {
           let result: unknown;
           try {
-            result = await recover(canonicalized, effect, executionContext);
+            result = await recover(effect, executionContext);
           } catch (error) {
             if (executionContext.signal?.aborted) throwIfAborted(executionContext.signal);
             return Object.freeze({ status: 'unavailable', reason: error instanceof Error ? error.message : String(error) });
@@ -93,14 +105,15 @@ export async function planToolCall(call: ToolCall, tools: readonly ToolDefinitio
         }
       } : {}),
       invoke: async (executionContext: ToolExecutionContext) => {
-        const observation = await tool.invoke(canonicalized, executionContext);
+        const observation = await binding.invoke(executionContext);
         try { return parseToolObservation(tool, observation); }
         catch (error) { return invalidOutputObservation(tool.name, error instanceof Error ? error : new Error(String(error))); }
       }
     });
     return { ok: true, plan };
   } catch (error) {
-    await lifetime.release();
+    try { await lifetime.release(); }
+    catch (releaseError) { throw new AggregateError([error, releaseError], 'Tool planning and resource release failed.', { cause: releaseError }); }
     if (context.signal.aborted) { throwIfAborted(context.signal); }
     if (error instanceof ToolInputError) return { ok: false, observation: invalidToolInputObservation(tool.name, error.message, error.details) };
     if (error instanceof MissingToolServiceError) return { ok: false, observation: missingServiceObservation(tool.name, error.serviceName, undefined, error.details) };

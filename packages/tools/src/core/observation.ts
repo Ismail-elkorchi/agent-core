@@ -1,3 +1,4 @@
+import { describeError } from './errors.js';
 import { parseJsonObject, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import { validatePublicArtifactRef } from '@agent-core/persistence';
 import * as z from 'zod';
@@ -135,7 +136,7 @@ export function runtimeErrorObservation(
   error: unknown,
   details?: unknown
 ): ToolFailureObservation<RuntimeErrorToolFailureOutput> {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = describeError(error);
   return freezeFailure('Tool ' + toolName + ' failed: ' + message, {
     blocked: true,
     reason: 'runtime_error',

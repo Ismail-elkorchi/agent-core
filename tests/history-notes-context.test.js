@@ -614,10 +614,10 @@ test('tool factories bind effects to host scope and context handlers schedule wi
     policy: {},
     invocation: { runId: 'run', ...identity, toolBatchId: 'batch', callIndex: 0, toolAttempt: 1 }
   };
-  const result = await write.invoke(canonical, toolContext);
+  const result = await (await write.bindExecution(canonical, {})).invoke(toolContext);
   assert.equal(result.output.status, 'committed');
   assert.equal(
-    (await write.invoke(canonical, toolContext)).output.revision.revisionId,
+    (await (await write.bindExecution(canonical, {})).invoke(toolContext)).output.revision.revisionId,
     result.output.revision.revisionId
   );
   assert.equal(
@@ -637,7 +637,7 @@ test('tool factories bind effects to host scope and context handlers schedule wi
       selection: { strategy: 'retain', retained: [], notes: [], omitted: [] }
     }
   });
-  await tool.invoke(await tool.canonicalizeInput(decodedTransition.input, {}), toolContext);
+  await (await tool.bindExecution(await tool.canonicalizeInput(decodedTransition.input, {}), {})).invoke(toolContext);
   assert.equal(scheduled.length, 1);
   assert.equal((await history.view()).contextWindow, undefined);
 });

@@ -75,31 +75,37 @@ const tool = {
     }
     return { accesses: [{ mode: 'write', scope: 'fixture/effect' }], lockScopes: ['fixture/effect'], recovery: { kind: 'unknown' } };
   },
-  async recover(_input, effect) {
-    if (effect.intent.recovery.kind === 'preconditioned_reexecution') {
-      const preconditions = effect.intent.recovery.preconditions;
-      return await sourceVersion() === preconditions[0]?.expectedVersion
-        ? { status: 'reexecute', preconditions }
-        : { status: 'unavailable', reason: 'The source changed after the interrupted read.' };
-    }
-    if (effect.intent.recovery.kind === 'buffered_mutation') {
-      const receipt = await readFile(path.join(root, 'buffered-receipt.json'), 'utf8').then(JSON.parse, () => undefined);
-      return receipt?.transactionId === effect.intent.recovery.transactionId
-        ? { status: 'settled', observation: { kind: 'result', ok: true, output: {}, summary: 'reconciled buffered mutation', scope: { resources: ['fixture/effect'], coverage: 'complete' } } }
-        : { status: 'not_found', reason: 'No committed mutation receipt exists.' };
-    }
-    return { status: 'unavailable', reason: 'Unknown effects cannot be reconciled.' };
-  },
-  async invoke(_input, context) {
-    if (recoveryKind === 'buffered') await appendFile(path.join(root, 'buffered-receipt.json'), JSON.stringify({ transactionId: 'effect-1' }));
-    if (recoveryKind === 'preconditioned') {
-      const expected = context.invocation?.recovery?.preconditions[0]?.expectedVersion;
-      if (context.invocation?.toolAttempt > 1 && await sourceVersion() !== expected) throw new Error('Recovered read precondition changed before invocation.');
-      await readFile(path.join(root, 'source.txt'));
-    }
-    await appendFile(path.join(root, 'effect.txt'), 'effect\n');
-    if (mode === 'crash') process.exit(42);
-    return { kind: 'result', ok: true, output: {}, summary: 'effect happened again', scope: { resources: ['fixture/effect'], coverage: 'complete' } };
+
+  bindExecution(input) {
+    return {
+      snapshot: this.snapshotInput(input),
+      async invoke(context) {
+        if (recoveryKind === 'buffered') await appendFile(path.join(root, 'buffered-receipt.json'), JSON.stringify({ transactionId: 'effect-1' }));
+        if (recoveryKind === 'preconditioned') {
+          const expected = context.invocation?.recovery?.preconditions[0]?.expectedVersion;
+          if (context.invocation?.toolAttempt > 1 && await sourceVersion() !== expected) throw new Error('Recovered read precondition changed before invocation.');
+          await readFile(path.join(root, 'source.txt'));
+        }
+        await appendFile(path.join(root, 'effect.txt'), 'effect\n');
+        if (mode === 'crash') process.exit(42);
+        return { kind: 'result', ok: true, output: {}, summary: 'effect happened again', scope: { resources: ['fixture/effect'], coverage: 'complete' } };
+      },
+      async recover(effect) {
+        if (effect.intent.recovery.kind === 'preconditioned_reexecution') {
+          const preconditions = effect.intent.recovery.preconditions;
+          return await sourceVersion() === preconditions[0]?.expectedVersion
+            ? { status: 'reexecute', preconditions }
+            : { status: 'unavailable', reason: 'The source changed after the interrupted read.' };
+        }
+        if (effect.intent.recovery.kind === 'buffered_mutation') {
+          const receipt = await readFile(path.join(root, 'buffered-receipt.json'), 'utf8').then(JSON.parse, () => undefined);
+          return receipt?.transactionId === effect.intent.recovery.transactionId
+            ? { status: 'settled', observation: { kind: 'result', ok: true, output: {}, summary: 'reconciled buffered mutation', scope: { resources: ['fixture/effect'], coverage: 'complete' } } }
+            : { status: 'not_found', reason: 'No committed mutation receipt exists.' };
+        }
+        return { status: 'unavailable', reason: 'Unknown effects cannot be reconciled.' };
+      }
+    };
   }
 };
 

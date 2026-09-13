@@ -7,6 +7,7 @@ import { defineTool } from '@agent-core/tools';
 
 test('host guidance is presented before a mutation without using its tool output schema or presenter', async () => {
   let mutations = 0,
+    preparations = 0,
     needsGuidance = true,
     requests = 0;
   const events = new InMemoryEventRepository(agentEventCodec);
@@ -23,14 +24,15 @@ test('host guidance is presented before a mutation without using its tool output
       lockScopes: ['value'],
       recovery: { kind: 'unknown' }
     }),
-    async invoke(input) {
-      mutations++;
+    async bindExecution(input, context) {
+      preparations++;
+      await context.lifetime.own({ release() {} });
       return {
-        kind: 'result',
-        ok: true,
-        summary: 'Written.',
-        scope: { resources: ['value'], coverage: 'complete' },
-        output: { written: input.value }
+        snapshot: { ...input, authorization: 'exact-prepared-authority' },
+        async invoke() {
+          mutations++;
+          return { kind: 'result', ok: true, summary: 'Written.', scope: { resources: ['value'], coverage: 'complete' }, output: { written: input.value } };
+        }
       };
     },
     presentObservation({ observation }) {
@@ -80,6 +82,7 @@ test('host guidance is presented before a mutation without using its tool output
       if (requests === 1) return call('original-call');
       if (requests === 2) {
         assert.equal(mutations, 0);
+        assert.equal(preparations, 0);
         assert.ok(
           request.messages.some(
             (item) =>
@@ -121,6 +124,7 @@ test('host guidance is presented before a mutation without using its tool output
   assert.equal(result.state, 'ended');
   assert.equal(result.terminal.executionStatus, 'completed', JSON.stringify(result.terminal));
   assert.equal(mutations, 1);
+  assert.equal(preparations, 1);
   const starts = [];
   for await (const record of events.read('guidance-run'))
     if (record.event.type === 'tool.started') starts.push(record.event.callId);

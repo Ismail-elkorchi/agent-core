@@ -83,6 +83,12 @@ export interface MissingServiceToolFailureOutput extends BaseToolFailureOutput {
 export interface RuntimeErrorToolFailureOutput extends BaseToolFailureOutput { readonly reason: 'runtime_error'; readonly error: string; readonly details?: JsonObject }
 export type ToolFailureOutput = UnknownToolFailureOutput | PolicyToolFailureOutput | InvalidArgumentsToolFailureOutput | InvalidOutputToolFailureOutput | MissingServiceToolFailureOutput | RuntimeErrorToolFailureOutput;
 
+export interface ToolExecutionBinding<TOutput = unknown> {
+  readonly snapshot: JsonValue;
+  invoke(context: ToolExecutionContext): Promise<ToolObservationInput<TOutput>>;
+  recover?(effect: Extract<EffectExecutionState, { readonly phase: 'started' }>, context: ToolExecutionContext): ToolEffectRecoveryResult<TOutput> | Promise<ToolEffectRecoveryResult<TOutput>>;
+}
+
 export interface ToolDefinition<TDecodedInput = unknown, TCanonicalInput = TDecodedInput, TOutput = unknown> {
   readonly name: string;
   readonly implementationId: string;
@@ -98,7 +104,6 @@ export interface ToolDefinition<TDecodedInput = unknown, TCanonicalInput = TDeco
   canonicalizeInput(input: TDecodedInput, context: ToolCanonicalizationContext): TCanonicalInput | Promise<TCanonicalInput>;
   snapshotInput(input: TCanonicalInput): JsonValue;
   deriveEffects(input: TCanonicalInput, context: ToolCanonicalizationContext): ToolEffects | Promise<ToolEffects>;
-  recover?(input: TCanonicalInput, effect: Extract<EffectExecutionState, { readonly phase: 'started' }>, context: ToolExecutionContext): ToolEffectRecoveryResult<TOutput> | Promise<ToolEffectRecoveryResult<TOutput>>;
-  invoke(input: TCanonicalInput, context: ToolExecutionContext): Promise<ToolObservationInput<TOutput>>;
+  bindExecution(input: TCanonicalInput, context: ToolCanonicalizationContext): ToolExecutionBinding<TOutput> | Promise<ToolExecutionBinding<TOutput>>;
   presentObservation?(request: ToolObservationPresentationRequest<TCanonicalInput, TOutput>): ToolObservationPresentation;
 }

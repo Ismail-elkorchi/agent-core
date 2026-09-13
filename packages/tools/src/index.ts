@@ -7,6 +7,7 @@ export * from './core/context.js';
 export * from './core/define.js';
 export * from './core/definition.js';
 export * from './core/execute.js';
+export { describeError } from './core/errors.js';
 export * from './core/execution-resources.js';
 export * from './core/observation-presentation.js';
 export * from './core/observation.js';

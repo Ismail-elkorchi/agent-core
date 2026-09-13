@@ -7,6 +7,7 @@ interface ActiveLease {
   readonly effects: ToolEffects;
   resourceId?: string;
   controlScope?: string;
+  failure?: Error;
 }
 interface Waiter {
   readonly effects: ToolEffects;
@@ -57,6 +58,11 @@ export class ResourceLeaseCoordinator {
     for (const active of this.active.values())
       if (active.resourceId === resourceId) this.releaseLease(active.id);
   }
+  failResource(resourceId: string, failure: Error): void {
+    for (const active of this.active.values())
+      if (active.resourceId === resourceId) active.failure = failure;
+    this.drain();
+  }
   activeCount(): number {
     return this.active.size;
   }
@@ -64,6 +70,12 @@ export class ResourceLeaseCoordinator {
   private drain(): void {
     const retained: Waiter[] = [];
     for (const waiter of this.waiters.splice(0)) {
+      const failed = [...this.active.values()].find((lease) => lease.failure && leasesConflict(lease, waiter.effects));
+      if (failed?.failure) {
+        if (waiter.abort && waiter.signal) waiter.signal.removeEventListener('abort', waiter.abort);
+        waiter.reject(failed.failure);
+        continue;
+      }
       const conflictsWithActive = [...this.active.values()].some((lease) =>
         leasesConflict(lease, waiter.effects)
       );

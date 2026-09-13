@@ -26,9 +26,14 @@ function tool(name, invoke) {
     effectEnvelope: envelope,
     decodeInput: () => ({ ok: true, input: {} }), canonicalizeInput: value => value, snapshotInput: value => value,
     deriveEffects: () => ({ ...envelope, recovery: { kind: 'unknown' } }),
-    async invoke() {
-      await invoke();
-      return { kind: 'result', ok: true, output: {}, summary: `${name} finished`, scope: { resources: ['memory'], coverage: 'complete' } };
+    bindExecution(input) {
+      return {
+        snapshot: this.snapshotInput(input),
+        async invoke() {
+          await invoke();
+          return { kind: 'result', ok: true, output: {}, summary: `${name} finished`, scope: { resources: ['memory'], coverage: 'complete' } };
+        }
+      };
     }
   });
 }

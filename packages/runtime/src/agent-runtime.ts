@@ -1,3 +1,4 @@
+import { describeError as errorMessage } from '@agent-core/tools';
 import {
   closeExternalEffect,
   issueEffectStartTicket,
@@ -3840,9 +3841,6 @@ function completedRunControl(runId: string, result: AgentRunResult): AgentRunHan
     abort: () => Promise.resolve(),
     result: Promise.resolve(result)
   });
-}
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function promptInstructionRole(role: string | undefined): PromptInstruction['role'] {

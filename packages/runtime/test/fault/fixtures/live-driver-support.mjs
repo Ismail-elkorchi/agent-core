@@ -86,19 +86,24 @@ export function createLiveDriverRuntime({ root, mode, role, onCheckpoint = () =>
         }
       };
     },
-    async recover() {
-      const receipt = await readFile(path.join(root, 'external-receipt.json'), 'utf8').then(JSON.parse, () => undefined);
-      if (receipt?.value === 'one external completion') return { status: 'settled', observation: observation() };
-      const started = await readFile(path.join(root, 'external-started'), 'utf8').then(() => true, () => false);
-      return started ? { status: 'running' } : { status: 'not_found' };
-    },
-    async invoke() {
-      await appendFile(path.join(root, 'external-invocations'), 'invoke\n');
-      await writeFile(path.join(root, 'external-started'), 'started\n');
-      if (role === 'old' && mode === 'inside_effect') await checkpoint(root, mode, onCheckpoint);
-      await writeFile(path.join(root, 'external-receipt.json'), JSON.stringify({ value: 'one external completion' }));
-      if (role === 'old' && mode === 'after_completion') await checkpoint(root, mode, onCheckpoint);
-      return observation();
+    bindExecution(input) {
+      return {
+        snapshot: input,
+        async recover() {
+          const receipt = await readFile(path.join(root, 'external-receipt.json'), 'utf8').then(JSON.parse, () => undefined);
+          if (receipt?.value === 'one external completion') return { status: 'settled', observation: observation() };
+          const started = await readFile(path.join(root, 'external-started'), 'utf8').then(() => true, () => false);
+          return started ? { status: 'running' } : { status: 'not_found' };
+        },
+        async invoke() {
+          await appendFile(path.join(root, 'external-invocations'), 'invoke\n');
+          await writeFile(path.join(root, 'external-started'), 'started\n');
+          if (role === 'old' && mode === 'inside_effect') await checkpoint(root, mode, onCheckpoint);
+          await writeFile(path.join(root, 'external-receipt.json'), JSON.stringify({ value: 'one external completion' }));
+          if (role === 'old' && mode === 'after_completion') await checkpoint(root, mode, onCheckpoint);
+          return observation();
+        }
+      };
     }
   });
   return new AgentRuntime({

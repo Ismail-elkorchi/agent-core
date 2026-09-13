@@ -14,12 +14,12 @@ import {
   startToolCallPlan,
   type CompiledToolDefinition,
   type ResourceLeaseCoordinator,
-  type ToolAuthorizationRequest,
   type ToolAuthorizer,
   type ToolCall,
   type ToolCallPlan,
   type ToolEffects,
   type ToolInvocation,
+  type ToolInputInspection,
   type ToolObservation,
   type ToolPlanningContext,
   type ToolProgress
@@ -55,7 +55,7 @@ import {
   type CommittedToolObservation
 } from './observation-store.js';
 
-export type ToolContextPrerequisite = (request: ToolAuthorizationRequest) => Promise<
+export type ToolContextPrerequisite = (request: ToolInputInspection) => Promise<
   | {
       readonly summary: string;
       readonly context: readonly PromptContextItemInput[];
@@ -255,7 +255,6 @@ async function contextPrerequisiteObservation(
     toolImplementationId: plan.toolImplementationId,
     input: plan.canonicalSnapshot,
     effects: plan.effects,
-    fingerprint: plan.fingerprint,
     context: input.toolContext
   });
   if (!prerequisite) return undefined;
@@ -277,7 +276,11 @@ async function planAndAuthorizeCall(
   const result = await planToolCall(
     call,
     sourceTools(input, phase, call),
-    planningContext(input, phase, callIndex, call)
+    planningContext(input, phase, callIndex, call),
+    async (request) => {
+      const prerequisite = await input.contextPrerequisite?.(request);
+      return prerequisite ? contextRequiredObservation(prerequisite.summary, prerequisite.context) : undefined;
+    }
   );
   if (!result.ok) {
     const committed = await commitObservation(input, phase, call, undefined, result.observation);
@@ -390,22 +393,6 @@ async function planAndAuthorizeCall(
     const state: AgentToolCallState = Object.freeze({
       stage: 'settled',
       plan: planRecord,
-      toolAttempt: 1,
-      settlement: settlementRecord(committed)
-    });
-    await replaceCall(input, phase, 'plan_tool_call', callIndex, state);
-    await appendToolEnded(input, phase, callIndex, call, state);
-    committedObservations.set(key, committed);
-    await releaseToolCallPlan(callPlan);
-    retainedPlans.delete(key);
-    return true;
-  }
-
-  const prerequisite = await contextPrerequisiteObservation(input, callPlan);
-  if (prerequisite) {
-    const committed = await commitObservation(input, phase, call, undefined, prerequisite);
-    const state: AgentToolCallState = Object.freeze({
-      stage: 'settled',
       toolAttempt: 1,
       settlement: settlementRecord(committed)
     });
@@ -737,7 +724,7 @@ async function acquireLease(
       progress: {
         type: 'status',
         stage: 'resource_lease_waiting',
-        message: 'Waiting for a conflicting resource lease held by another run.'
+        message: 'Waiting for an operation holding conflicting resources.'
       }
     });
   }

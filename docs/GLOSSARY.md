@@ -48,3 +48,5 @@ terminology everywhere else.
 
 Local variables may use ordinary English where there is no domain ambiguity, but
 persisted fields and exported APIs must name the exact state transition.
+
+Tool input inspection contains normalized input and derived effects, before execution resources are bound or an approval fingerprint exists. Applications can supply missing context at this stage. An execution binding captures the exact input snapshot, invocation, optional recovery operation, and owned resources. Authorization fingerprints that bound snapshot before an effect can start. Simple tools use `defineTool` with `invoke`; tools that acquire execution resources use `bindExecution` and return the bound invocation. Both authoring forms produce the same execution binding.

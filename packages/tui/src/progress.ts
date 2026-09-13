@@ -45,8 +45,9 @@ export function presentProgress(
     case 'tool.call.received':
       return { ...state, label: 'Planning tool' };
     case 'tool.started':
-    case 'tool.updated':
       return { ...state, label: 'Running tool' };
+    case 'tool.updated':
+      return { ...state, label: event.progress.type === 'status' ? event.progress.message ?? event.progress.stage : 'Running tool' };
     case 'tool.ended':
     case 'assistant.ended':
       return { ...state, label: 'Working' };

@@ -161,8 +161,13 @@ test('runtime exposes artifact and image tools only with the required repository
     deriveEffects() {
       return readEffects;
     },
-    async invoke() {
-      return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope };
+    bindExecution(input) {
+      return {
+        snapshot: this.snapshotInput(input),
+        async invoke() {
+          return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope };
+        }
+      };
     }
   });
   const tools = [conditionalTool('read_artifact'), conditionalTool('view_image')].map(adoptToolDefinition);
@@ -224,9 +229,14 @@ test('tool progress from planning and invocation remains separate from the final
     deriveEffects() {
       return readEffects;
     },
-    async invoke(_input, context) {
-      await context.emitProgress?.({ type: 'status', stage: 'invoke' });
-      return { kind: 'result', ok: true, output: {}, summary: 'done', scope: completeScope };
+    bindExecution(input) {
+      return {
+        snapshot: this.snapshotInput(input),
+        async invoke(context) {
+          await context.emitProgress?.({ type: 'status', stage: 'invoke' });
+          return { kind: 'result', ok: true, output: {}, summary: 'done', scope: completeScope };
+        }
+      };
     }
   });
   const { agent, events } = await harness({
@@ -284,13 +294,18 @@ test('oversized tool observations keep domain output intact in an artifact', asy
     deriveEffects() {
       return readEffects;
     },
-    async invoke() {
+    bindExecution(input) {
       return {
-        kind: 'result',
-        ok: true,
-        output: { items },
-        summary: 'large result complete',
-        scope: completeScope
+        snapshot: this.snapshotInput(input),
+        async invoke() {
+          return {
+            kind: 'result',
+            ok: true,
+            output: { items },
+            summary: 'large result complete',
+            scope: completeScope
+          };
+        }
       };
     }
   });
@@ -348,14 +363,19 @@ test('artifact-store failure after a completed tool effect still persists tool.e
         recovery: { kind: 'unknown' }
       };
     },
-    async invoke() {
-      effects += 1;
+    bindExecution(input) {
       return {
-        kind: 'result',
-        ok: true,
-        output: { payload: 'x'.repeat(400_000) },
-        summary: 'effect completed',
-        scope: completeScope
+        snapshot: this.snapshotInput(input),
+        async invoke() {
+          effects += 1;
+          return {
+            kind: 'result',
+            ok: true,
+            output: { payload: 'x'.repeat(400_000) },
+            summary: 'effect completed',
+            scope: completeScope
+          };
+        }
       };
     }
   };
@@ -477,9 +497,14 @@ test('image and presenter assembly failures happen after durable tool truth and 
           recovery: { kind: 'unknown' }
         };
       },
-      async invoke() {
-        effects += 1;
-        return scenario.observation;
+      bindExecution(input) {
+        return {
+          snapshot: this.snapshotInput(input),
+          async invoke() {
+            effects += 1;
+            return scenario.observation;
+          }
+        };
       }
     };
     const provider = new ScriptedProvider(
@@ -575,14 +600,19 @@ test('session and observation-record assembly failures do not reclassify a compl
           recovery: { kind: 'unknown' }
         };
       },
-      async invoke() {
-        effects += 1;
+      bindExecution(input) {
         return {
-          kind: 'result',
-          ok: true,
-          summary: 'effect committed',
-          scope: completeScope,
-          output: { done: true }
+          snapshot: this.snapshotInput(input),
+          async invoke() {
+            effects += 1;
+            return {
+              kind: 'result',
+              ok: true,
+              summary: 'effect committed',
+              scope: completeScope,
+              output: { done: true }
+            };
+          }
         };
       }
     };
@@ -646,22 +676,27 @@ test('parallel tool observations commit independently while an earlier call rema
         recovery: { kind: 'unknown' }
       };
     },
-    async invoke(input) {
-      active += 1;
-      maximumActive = Math.max(maximumActive, active);
-      started[input.index].resolve();
-      try {
-        await gates[input.index].promise;
-        return {
-          kind: 'result',
-          ok: true,
-          output: { index: input.index },
-          summary: `parallel ${String(input.index)}`,
-          scope: completeScope
-        };
-      } finally {
-        active -= 1;
-      }
+    bindExecution(input) {
+      return {
+        snapshot: this.snapshotInput(input),
+        async invoke() {
+          active += 1;
+          maximumActive = Math.max(maximumActive, active);
+          started[input.index].resolve();
+          try {
+            await gates[input.index].promise;
+            return {
+              kind: 'result',
+              ok: true,
+              output: { index: input.index },
+              summary: `parallel ${String(input.index)}`,
+              scope: completeScope
+            };
+          } finally {
+            active -= 1;
+          }
+        }
+      };
     }
   };
   const calls = [0, 1, 2].map((index) => ({
@@ -792,16 +827,21 @@ test('parallel scheduler enforces explicit dependencies and resource conflicts w
         recovery: { kind: 'unknown' }
       };
     },
-    async invoke(input) {
-      startOrder.push(input.index);
-      started[input.index].resolve();
-      await gates[input.index].promise;
+    bindExecution(input) {
       return {
-        kind: 'result',
-        ok: true,
-        output: { index: input.index },
-        summary: `scheduled ${String(input.index)}`,
-        scope: completeScope
+        snapshot: this.snapshotInput(input),
+        async invoke() {
+          startOrder.push(input.index);
+          started[input.index].resolve();
+          await gates[input.index].promise;
+          return {
+            kind: 'result',
+            ok: true,
+            output: { index: input.index },
+            summary: `scheduled ${String(input.index)}`,
+            scope: completeScope
+          };
+        }
       };
     }
   };
@@ -875,16 +915,21 @@ test('approval waits for earlier unplanned calls and binds the revision after pr
         recovery: { kind: 'unknown' }
       };
     },
-    async invoke(input) {
-      if (input.index === 0) {
-        readStarted.resolve();
-        await readGate.promise;
-      } else {
-        assert.equal(input.revision, revision);
-        writes.push(input.index);
-        revision += 1;
-      }
-      return { kind: 'result', ok: true, output: {}, summary: 'settled', scope: completeScope };
+    bindExecution(input) {
+      return {
+        snapshot: this.snapshotInput(input),
+        async invoke() {
+          if (input.index === 0) {
+            readStarted.resolve();
+            await readGate.promise;
+          } else {
+            assert.equal(input.revision, revision);
+            writes.push(input.index);
+            revision += 1;
+          }
+          return { kind: 'result', ok: true, output: {}, summary: 'settled', scope: completeScope };
+        }
+      };
     }
   };
   const fixture = await harness({
@@ -962,12 +1007,17 @@ test('cancellation durably closes or marks every call in a parallel batch', asyn
         recovery: { kind: 'unknown' }
       };
     },
-    async invoke(input, context) {
-      if (input.index < 2) started[input.index].resolve();
-      await new Promise((_resolve, reject) =>
-        context.signal.addEventListener('abort', () => reject(context.signal.reason), { once: true })
-      );
-      throw new Error('unreachable');
+    bindExecution(input) {
+      return {
+        snapshot: this.snapshotInput(input),
+        async invoke(context) {
+          if (input.index < 2) started[input.index].resolve();
+          await new Promise((_resolve, reject) =>
+            context.signal.addEventListener('abort', () => reject(context.signal.reason), { once: true })
+          );
+          throw new Error('unreachable');
+        }
+      };
     }
   };
   const calls = [0, 1, 2].map((index) => ({
@@ -1318,8 +1368,13 @@ test('model-turn limits terminate deterministically', async () => {
     deriveEffects() {
       return readEffects;
     },
-    async invoke() {
-      return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope };
+    bindExecution(input) {
+      return {
+        snapshot: this.snapshotInput(input),
+        async invoke() {
+          return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope };
+        }
+      };
     }
   };
   const { agent } = await harness({ provider, tools: [noop], limits: { modelTurns: 1 } });
@@ -1552,8 +1607,13 @@ test('tool planning resources release after denial, approval suspension, authori
       deriveEffects() {
         return readEffects;
       },
-      async invoke() {
-        return { kind: 'result', ok: true, output: {}, summary: 'done', scope: completeScope };
+      bindExecution(input) {
+        return {
+          snapshot: this.snapshotInput(input),
+          async invoke() {
+            return { kind: 'result', ok: true, output: {}, summary: 'done', scope: completeScope };
+          }
+        };
       }
     };
     const run = await harness({
@@ -1613,14 +1673,19 @@ test('durable approval resumes after repository reopen and rejects changed polic
         recovery: { kind: 'unknown' }
       };
     },
-    async invoke() {
-      effects += 1;
+    bindExecution(input) {
       return {
-        kind: 'result',
-        ok: true,
-        output: {},
-        summary: 'changed',
-        scope: { resources: ['workspace/state'], coverage: 'complete' }
+        snapshot: this.snapshotInput(input),
+        async invoke() {
+          effects += 1;
+          return {
+            kind: 'result',
+            ok: true,
+            output: {},
+            summary: 'changed',
+            scope: { resources: ['workspace/state'], coverage: 'complete' }
+          };
+        }
       };
     }
   });
@@ -1792,14 +1857,19 @@ test('current authorization is re-evaluated and may veto a stored approval', asy
         recovery: { kind: 'unknown' }
       };
     },
-    async invoke() {
-      effects += 1;
+    bindExecution(input) {
       return {
-        kind: 'result',
-        ok: true,
-        output: {},
-        summary: 'changed',
-        scope: { resources: ['state'], coverage: 'complete' }
+        snapshot: this.snapshotInput(input),
+        async invoke() {
+          effects += 1;
+          return {
+            kind: 'result',
+            ok: true,
+            output: {},
+            summary: 'changed',
+            scope: { resources: ['state'], coverage: 'complete' }
+          };
+        }
       };
     }
   });
@@ -2112,15 +2182,20 @@ test('semantic tool audit events cannot advance authoritative per-call recovery 
     deriveEffects() {
       return effects;
     },
-    async invoke(_input, context) {
-      invocations += 1;
-      assert.equal(context.invocation.toolAttempt, 2);
+    bindExecution(input) {
       return {
-        kind: 'result',
-        ok: true,
-        output: { retried: true },
-        summary: 'must not retry',
-        scope: { resources: ['state/effect'], coverage: 'complete' }
+        snapshot: this.snapshotInput(input),
+        async invoke(context) {
+          invocations += 1;
+          assert.equal(context.invocation.toolAttempt, 2);
+          return {
+            kind: 'result',
+            ok: true,
+            output: { retried: true },
+            summary: 'must not retry',
+            scope: { resources: ['state/effect'], coverage: 'complete' }
+          };
+        }
       };
     }
   };
@@ -2229,18 +2304,23 @@ test('a live stale runtime settles its exact permit while its unknown call conti
         recovery: { kind: 'unknown' }
       };
     },
-    async invoke(input) {
-      invocations.push(input.index);
-      if (input.index === 0) {
-        markInvocationStarted();
-        await invocationRelease;
-      }
+    bindExecution(input) {
       return {
-        kind: 'result',
-        ok: true,
-        output: { index: input.index },
-        summary: `settled effect ${String(input.index)}`,
-        scope: { resources: [`state/effect-${String(input.index)}`], coverage: 'complete' }
+        snapshot: this.snapshotInput(input),
+        async invoke() {
+          invocations.push(input.index);
+          if (input.index === 0) {
+            markInvocationStarted();
+            await invocationRelease;
+          }
+          return {
+            kind: 'result',
+            ok: true,
+            output: { index: input.index },
+            summary: `settled effect ${String(input.index)}`,
+            scope: { resources: [`state/effect-${String(input.index)}`], coverage: 'complete' }
+          };
+        }
       };
     }
   });
@@ -2355,8 +2435,13 @@ test('elapsed limits use the injected monotonic clock even when the host timer f
     deriveEffects() {
       return readEffects;
     },
-    async invoke() {
-      return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope };
+    bindExecution(input) {
+      return {
+        snapshot: this.snapshotInput(input),
+        async invoke() {
+          return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope };
+        }
+      };
     }
   };
   const run = await harness({
@@ -2437,8 +2522,13 @@ test('tool planning and authorization are abortable and elapsed-deadline bounded
     deriveEffects() {
       return readEffects;
     },
-    async invoke() {
-      return { kind: 'result', ok: true, output: {}, summary: 'unexpected', scope: completeScope };
+    bindExecution(input) {
+      return {
+        snapshot: this.snapshotInput(input),
+        async invoke() {
+          return { kind: 'result', ok: true, output: {}, summary: 'unexpected', scope: completeScope };
+        }
+      };
     }
   };
   const cases = [
@@ -2532,14 +2622,19 @@ test('completed tool failures with unknown recovery are not replayed automatical
         recovery: { kind: 'unknown' }
       };
     },
-    async invoke() {
-      invocations += 1;
+    bindExecution(input) {
       return {
-        kind: 'failure',
-        ok: false,
-        output: { blocked: true, reason: 'runtime_error', error: 'failed', recovery: 'stop' },
-        summary: 'failed',
-        scope: { resources: ['state'], coverage: 'partial', cause: 'failed' }
+        snapshot: this.snapshotInput(input),
+        async invoke() {
+          invocations += 1;
+          return {
+            kind: 'failure',
+            ok: false,
+            output: { blocked: true, reason: 'runtime_error', error: 'failed', recovery: 'stop' },
+            summary: 'failed',
+            scope: { resources: ['state'], coverage: 'partial', cause: 'failed' }
+          };
+        }
       };
     }
   };
@@ -2713,4 +2808,27 @@ test('process loss before terminal staging leaves the settled provider response 
   assert.equal(result.modelOutput.message, 'original final answer');
   const records = await eventsFor(events, handle.runId);
   assert.equal(records.filter((event) => event.type === 'run.ended').length, 1);
+});
+
+test('runtime terminal diagnostics preserve the underlying preparation release error', async () => {
+  const { defineTool } = await import('@agent-core/tools');
+  const tool = defineTool({
+    name: 'release_failure', implementationId: 'tests/release-failure@1', description: 'Exercises resource release.',
+    schema: z.strictObject({}), outputSchema: emptyOutputSchema,
+    effectEnvelope: readEnvelope,
+    canonicalizeInput: (input) => input,
+    deriveEffects: () => readEffects,
+    async bindExecution(input, context) {
+      await context.lifetime.own({ release() { throw new Error('Cancellation has not reached terminal publication.'); } });
+      return { snapshot: input, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'Observed.', scope: completeScope }; } };
+    }
+  });
+  const run = await harness({ tools: [tool], script: [response('tool_calls', '', { toolCalls: [{ id: 'release-1', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }] })] });
+  const result = await run.agent.run({ task: 'Inspect.' }).result;
+  assert.equal(result.state, 'ended');
+  assert.equal(result.terminal.executionStatus, 'failed');
+  assert.match(result.terminal.errorMessage, /Tool lifetime resource release failed/);
+  assert.match(result.terminal.errorMessage, /Cancellation has not reached terminal publication/);
+  const terminal = await readCommittedTerminal(run.events, result.terminal.runId);
+  assert.equal(terminal.errorMessage, result.terminal.errorMessage);
 });

@@ -6,7 +6,10 @@ import {
   requireToolService,
   startCommandExecutionPlan,
   type CommandExecution,
-  type CommandExecutionOwner
+  type CommandExecutionOwner,
+  type CommandExecutionPlan,
+  type CommandExecutionPlanRequest,
+  type ToolExecutionContext
 } from '@agent-core/tools';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
 import { presentProcessObservation } from '../../core/presenters.js';
@@ -48,28 +51,10 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
         outputTokenBudget: clampRequestedLimit(input.outputTokenBudget, limits.maxOutputTokens),
         owner
       });
-      const reservation = await planCommandExecution(executor, {
-        command: request.command,
-        rootedDirectory: request.workdir,
-        pty: request.pty,
-        timeoutMs: request.timeoutMs,
-        yieldMs: request.yieldMs,
-        outputTokenBudget: request.outputTokenBudget,
-        owner
-      });
-      await context.lifetime.own({ release: () => releaseCommandExecutionPlan(executor, reservation) });
-      return Object.freeze({ ...request, executor, reservation });
+      return Object.freeze({ ...request, executor });
     },
     snapshotInput(input) {
-      return Object.freeze({
-        command: input.command,
-        workdir: input.workdir,
-        pty: input.pty,
-        timeoutMs: input.timeoutMs,
-        yieldMs: input.yieldMs,
-        outputTokenBudget: input.outputTokenBudget,
-        execution: input.reservation.authorization
-      });
+      return commandSnapshot(input);
     },
     deriveEffects() {
       return {
@@ -78,56 +63,77 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
         recovery: { kind: 'unknown' }
       };
     },
-    async invoke(input, context) {
-      await context.emitProgress?.({
-        type: 'status',
-        stage: 'process_starting',
-        message: 'Starting command.'
+    async bindExecution(input, context) {
+      const { executor, ...request } = input;
+      const reservation = await planCommandExecution(executor, {
+        command: request.command,
+        rootedDirectory: request.workdir,
+        pty: request.pty,
+        timeoutMs: request.timeoutMs,
+        yieldMs: request.yieldMs,
+        outputTokenBudget: request.outputTokenBudget,
+        owner: request.owner
       });
-      let result;
-      try {
-        result = await startCommandExecutionPlan(input.executor, input.reservation, {
-          ...(context.signal ? { signal: context.signal } : {}),
-          ...(context.resourceLease ? { lease: context.resourceLease } : {}),
-          onProgress: (progress) => context.emitProgress?.(progress)
-        });
-      } catch (error) {
-        await context.emitProgress?.({
-          type: 'status',
-          stage: 'process_failed',
-          message: error instanceof Error ? error.message : String(error)
-        });
-        throw error;
-      }
+      await context.lifetime.own({ release: () => releaseCommandExecutionPlan(executor, reservation) });
       return {
-        kind: 'result' as const,
-        ok: isSuccessfulProcessResult(result),
-        summary:
-          result.status === 'running'
-            ? 'Process continues as ' + result.processId + '.'
-            : 'Process ' +
-              result.status +
-              (result.exitCode === undefined ? '' : ' with exit code ' + String(result.exitCode)) +
-              '.',
-        scope: {
-          resources: [processScope(result.processId), fileScope(input.workdir)],
-          coverage: result.combined.omittedBytes > 0 ? 'partial' : 'complete',
-          ...(result.combined.omittedBytes > 0
-            ? {
-                truncated: true,
-                causes: ['output_budget'],
-                omitted: { bytes: result.combined.omittedBytes }
-              }
-            : {})
-        },
-        ...(result.artifact ? { content: [{ type: 'artifact' as const, artifact: result.artifact }] } : {}),
-        output: result
+        snapshot: { ...commandSnapshot(input), execution: reservation.authorization },
+        invoke: (executionContext) => executeCommand({ ...input, reservation }, executionContext)
       };
     }
   });
 }
+
+async function executeCommand(
+  input: CommandInput & { readonly reservation: CommandExecutionPlan },
+  context: ToolExecutionContext
+) {
+  await context.emitProgress?.({
+    type: 'status',
+    stage: 'process_starting',
+    message: 'Starting command.'
+  });
+  let result;
+  try {
+    result = await startCommandExecutionPlan(input.executor, input.reservation, {
+      ...(context.signal ? { signal: context.signal } : {}),
+      ...(context.resourceLease ? { lease: context.resourceLease } : {}),
+      onProgress: (progress) => context.emitProgress?.(progress)
+    });
+  } catch (error) {
+    await context.emitProgress?.({
+      type: 'status',
+      stage: 'process_failed',
+      message: error instanceof Error ? error.message : String(error)
+    });
+    throw error;
+  }
+  return {
+    kind: 'result' as const,
+    ok: isSuccessfulProcessResult(result),
+    summary:
+      result.status === 'running'
+        ? 'Process continues as ' + result.processId + '.'
+        : 'Process ' +
+          result.status +
+          (result.exitCode === undefined ? '' : ' with exit code ' + String(result.exitCode)) +
+          '.',
+    scope: {
+      resources: [processScope(result.processId), fileScope(input.workdir)],
+      coverage: result.combined.omittedBytes > 0 ? ('partial' as const) : ('complete' as const),
+      ...(result.combined.omittedBytes > 0
+        ? {
+            truncated: true,
+            causes: ['output_budget'],
+            omitted: { bytes: result.combined.omittedBytes }
+          }
+        : {})
+    },
+    ...(result.artifact ? { content: [{ type: 'artifact' as const, artifact: result.artifact }] } : {}),
+    output: result
+  };
+}
 export const execCommandTool = createExecCommandTool();
-function processOwner(context: import('@agent-core/tools').ToolExecutionContext): CommandExecutionOwner {
+function processOwner(context: ToolExecutionContext): CommandExecutionOwner {
   const invocation = context.invocation;
   if (!invocation) throw new Error('Process tools require a runtime invocation owner.');
   return Object.freeze({
@@ -137,4 +143,20 @@ function processOwner(context: import('@agent-core/tools').ToolExecutionContext)
     toolBatchId: invocation.toolBatchId,
     callIndex: invocation.callIndex
   });
+}
+
+interface CommandInput extends Omit<CommandExecutionPlanRequest, 'rootedDirectory'> {
+  readonly workdir: string;
+  readonly executor: CommandExecution;
+}
+
+function commandSnapshot(input: CommandInput) {
+  return {
+    command: input.command,
+    workdir: input.workdir,
+    pty: input.pty,
+    timeoutMs: input.timeoutMs,
+    yieldMs: input.yieldMs,
+    outputTokenBudget: input.outputTokenBudget
+  };
 }
