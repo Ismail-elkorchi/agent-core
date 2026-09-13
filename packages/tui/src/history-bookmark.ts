@@ -1,16 +1,16 @@
 import type { SessionBranchCursor, SessionBranchEntry, SessionBranchPage } from '@agent-core/runtime';
-import type { MeasuredWindowAnchor } from '@ismail-elkorchi/terminal-ui/collection';
+import type { MeasuredViewportAnchor } from '@ismail-elkorchi/terminal-ui/interaction';
 
 export interface HistoryBookmark {
   readonly cursor?: SessionBranchCursor;
-  readonly anchor?: MeasuredWindowAnchor;
+  readonly anchor?: MeasuredViewportAnchor;
   readonly followTail: boolean;
 }
 
 /** Store source positions instead of retaining rendered pages for inactive sessions. */
 export function historyBookmark(
   pages: readonly SessionBranchPage[],
-  anchor: MeasuredWindowAnchor | undefined,
+  anchor: MeasuredViewportAnchor | undefined,
   followTail: boolean,
   identify: (entry: SessionBranchEntry) => string
 ): HistoryBookmark {

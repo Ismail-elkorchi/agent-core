@@ -75,18 +75,19 @@ for (const columns of [48, 120])
     assert.equal(requests[1].offset, 10);
   });
 
-test('exact-copy requests reject terminal-ui normalization instead of silently changing source', async () => {
+test('exact-copy requests preserve source through clipboard transport', async () => {
   const { copySource } = await import('@agent-core/tui');
   const { createClipboardWriteSequence } = await import('@ismail-elkorchi/terminal-ui/protocol');
   const original = 'a\t文\r\nb';
   const encoded = createClipboardWriteSequence(original, { allowed: true });
   assert.equal(encoded.status, 'encoded');
-  assert.notEqual(Buffer.from(encoded.sequence.split(';')[2].slice(0, -1), 'base64').toString(), original);
+  assert.equal(Buffer.from(encoded.sequence.split(';')[2].slice(0, -1), 'base64').toString(), original);
   const effect = copySource(original, (message) => ({ type: 'notice', message }));
   const result = await effect.run({
-    copySelectedText() {
-      assert.fail('Source-changing copy must not be sent');
+    async copySelectedText({ selection }) {
+      assert.equal(selection.text, original);
+      return { status: 'copied' };
     }
   });
-  assert.match(result.message.message, /Exact copy is unavailable/);
+  assert.equal(result.message.message, 'Source sent to clipboard.');
 });

@@ -1,34 +1,43 @@
-import {
-  appendMeasuredItems,
-  createMeasuredCollection,
-  measuredAnchorAt,
-  measuredCollectionItemById,
-  removeMeasuredItems,
-  replaceMeasuredItem,
-  type MeasuredCollection
-} from '@ismail-elkorchi/terminal-ui/collection';
+import type { Element } from '@ismail-elkorchi/terminal-ui/components';
+import type { MeasuredViewportLayout } from '@ismail-elkorchi/terminal-ui/layout';
+import type { MeasuredViewportAnchor } from '@ismail-elkorchi/terminal-ui/interaction';
 import { MarkdownDocument } from './markdown.js';
 
-/** Derived presentation belongs to one terminal session and survives unrelated state updates. */
-export class RetainedListPresentation<Entry extends { readonly id: string }> {
+interface RetainedElement<Entry, Message> {
+  readonly entry: Entry;
+  readonly expanded: boolean;
+  readonly key: string;
+  readonly element: Element<Message>;
+}
+
+/** Retained presentation and the latest renderer-derived navigation geometry. */
+export class RetainedListPresentation<Entry extends { readonly id: string }, Message> {
   private readonly documents = new Map<string, MarkdownDocument>();
-  private collection = createMeasuredCollection<Entry>([]);
+  private elements = new Map<string, RetainedElement<Entry, Message>>();
   private entries: readonly Entry[] = [];
-  private expanded: readonly string[] = [];
-  private measurementKey = '';
+  layout: MeasuredViewportLayout = {
+    entries: [],
+    geometry: { contentRows: 0, contentColumns: 0, viewportRows: 0, viewportColumns: 0 },
+    scroll: { offsetRow: 0, offsetColumn: 0, followTail: true }
+  };
 
   anchor(offsetRow: number) {
-    return measuredAnchorAt(this.collection, { offsetRow });
+    const entry = this.layout.entries.find(
+      (item) => item.rowOffset <= offsetRow && item.rowOffset + item.rows > offsetRow
+    );
+    return entry === undefined
+      ? undefined
+      : { itemId: entry.id, rowWithinItem: offsetRow - entry.rowOffset, viewportRow: 0 };
   }
 
   adjacentMessage(
-    offsetRow: number | 'end' | import('@ismail-elkorchi/terminal-ui/collection').MeasuredWindowAnchor,
+    offsetRow: number | 'end' | MeasuredViewportAnchor,
     direction: 'previous' | 'next'
   ) {
     const anchor =
       typeof offsetRow === 'object'
         ? offsetRow
-        : this.anchor(offsetRow === 'end' ? Math.max(0, this.collection.totalRows - 1) : offsetRow);
+        : this.anchor(offsetRow === 'end' ? Math.max(0, this.layout.geometry.contentRows - 1) : offsetRow);
     if (anchor === undefined) return undefined;
     const index = this.entries.findIndex((entry) => entry.id === anchor.itemId);
     const destination =
@@ -48,55 +57,26 @@ export class RetainedListPresentation<Entry extends { readonly id: string }> {
     return document;
   }
 
-  measure(
+  render(
     entries: readonly Entry[],
     expanded: readonly string[],
     key: string,
-    rows: (entry: Entry) => number
-  ): MeasuredCollection<Entry> {
-    if (entries === this.entries && expanded === this.expanded && key === this.measurementKey)
-      return this.collection;
-    const retained = new Set(entries.map((entry) => entry.id));
-    for (const id of this.documents.keys()) if (!retained.has(id)) this.documents.delete(id);
-    const previous = this.collection;
-    const next = entries.map((entry) => {
-      const cached = measuredCollectionItemById(previous, entry.id);
-      return cached?.value === entry &&
-        key === this.measurementKey &&
-        expanded.includes(entry.id) === this.expanded.includes(entry.id)
-        ? cached
-        : { id: entry.id, value: entry, rows: rows(entry) };
+    render: (entry: Entry) => Element<Message>
+  ): readonly Element<Message>[] {
+    const retained = new Map<string, RetainedElement<Entry, Message>>();
+    const result = entries.map((entry) => {
+      const cached = this.elements.get(entry.id);
+      const isExpanded = expanded.includes(entry.id);
+      const item =
+        cached?.entry === entry && cached.expanded === isExpanded && cached.key === key
+          ? cached
+          : { entry, expanded: isExpanded, key, element: render(entry) };
+      retained.set(entry.id, item);
+      return item.element;
     });
-    const existingOrder = this.entries.filter((entry) => retained.has(entry.id)).map((entry) => entry.id);
-    const nextExistingOrder = entries
-      .filter((entry) => measuredCollectionItemById(previous, entry.id) !== undefined)
-      .map((entry) => entry.id);
-    const appendedOnly = next
-      .slice(0, nextExistingOrder.length)
-      .every((item) => measuredCollectionItemById(previous, item.id) !== undefined);
-    if (
-      key !== this.measurementKey ||
-      !appendedOnly ||
-      existingOrder.some((id, index) => id !== nextExistingOrder[index])
-    ) {
-      this.collection = createMeasuredCollection(next);
-    } else {
-      this.collection = removeMeasuredItems(
-        this.collection,
-        this.entries.filter((entry) => !retained.has(entry.id)).map((entry) => entry.id)
-      );
-      for (const item of next) {
-        const old = measuredCollectionItemById(previous, item.id);
-        if (old !== undefined && old !== item) this.collection = replaceMeasuredItem(this.collection, item);
-      }
-      this.collection = appendMeasuredItems(
-        this.collection,
-        next.filter((item) => measuredCollectionItemById(previous, item.id) === undefined)
-      );
-    }
+    for (const id of this.documents.keys()) if (!retained.has(id)) this.documents.delete(id);
+    this.elements = retained;
     this.entries = entries;
-    this.expanded = expanded;
-    this.measurementKey = key;
-    return this.collection;
+    return result;
   }
 }

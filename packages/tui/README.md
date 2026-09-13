@@ -6,6 +6,6 @@ Links expose only HTTP, HTTPS, and mail destinations and never open automaticall
 
 Import reusable components from `@agent-core/tui` and external-editor and explicit browser-launch integration from `@agent-core/tui/node`. Applications own policy and session lifetime. Components use the consumer's terminal-ui peer instance; install local file dependencies as packages rather than symlinking across independently installed terminal-ui copies.
 
-Shared components also provide source-selection copying, attributed note paging, history bookmarks, and retained list measurements. Source text stays exact in memory and storage. The installed clipboard API normalizes some text; exact-copy requests detect and report this limitation instead of sending altered content.
+Shared components also provide source-selection copying, attributed note paging, history bookmarks, and retained list elements and renderer-derived navigation geometry. Source text stays exact in memory and storage. Clipboard transport preserves the selected source, including tabs and line endings.
 
 Configuration components consume provider discovery/authentication capabilities and a single validated save operation. Conversation projections preserve run/turn/call identity; draft, queue, recall, source, notes, and settings components remain caller-controlled. Applications supply optional attachment readers, resource search, session names, export, and notifications. Node integrations keep private presentation preferences and unsent drafts separate from accepted history.
