@@ -42,6 +42,12 @@
     },
     {
       "path": "packages/providers/claude"
+    },
+    {
+      "path": "packages/rpc"
+    },
+    {
+      "path": "packages/tui"
     }
   ]
 }

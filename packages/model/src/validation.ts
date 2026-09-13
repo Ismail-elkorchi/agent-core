@@ -1,5 +1,4 @@
 import { parseJsonObject, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
-import { MODEL_REQUEST_JSON_LIMITS } from './json-limits.js';
 import type {
   ModelCapabilities,
   ModelContentPart,
@@ -23,6 +22,7 @@ import type {
   ModelUsage,
   ProviderContextState
 } from './index.js';
+import { MODEL_REQUEST_JSON_LIMITS } from './json-limits.js';
 import {
   parseModelNativeDelivery,
   parseModelNativeResponseBoundary,
@@ -422,7 +422,7 @@ function decodeFreshMessage(value: unknown, index: number): ModelInputItem {
     return Object.freeze({
       role: 'user',
       ...common,
-      ...(value.images === undefined ? {} : { images: decodeImages(value.images, path) })
+      ...(value.images === undefined ? {} : { images: parseModelImages(value.images, path) })
     });
   }
   if (value.role === 'assistant') {
@@ -460,7 +460,7 @@ function decodeFreshMessage(value: unknown, index: number): ModelInputItem {
       toolName: value.toolName,
       toolCallType: value.toolCallType,
       ...(typeof value.toolCallId === 'string' ? { toolCallId: value.toolCallId } : {}),
-      ...(value.images === undefined ? {} : { images: decodeImages(value.images, path) })
+      ...(value.images === undefined ? {} : { images: parseModelImages(value.images, path) })
     });
   }
   if (value.role === 'protocol' && value.content === '' && onlyKeys(value, ['role', 'content', 'state']))
@@ -487,7 +487,10 @@ function decodeFreshMessage(value: unknown, index: number): ModelInputItem {
   throw new Error(`${path}.role is invalid.`);
 }
 
-function decodeImages(value: unknown, path: string): readonly import('./index.js').ModelImage[] {
+export function parseModelImages(
+  value: unknown,
+  path = 'input'
+): readonly Extract<import('./index.js').ModelImage, { readonly type: 'base64' }>[] {
   if (!Array.isArray(value)) throw new Error(`${path}.images is invalid.`);
   return Object.freeze(
     value.map((item) => {
@@ -1421,7 +1424,7 @@ function decodeContentParts(value: unknown): readonly ModelContentPart[] {
       if (part.type === 'text' && typeof part.text === 'string' && onlyKeys(part, ['type', 'text']))
         return Object.freeze({ type: 'text', text: part.text });
       if (part.type === 'image' && onlyKeys(part, ['type', 'image'])) {
-        const image = decodeImages([part.image], 'parts')[0];
+        const image = parseModelImages([part.image], 'parts')[0];
         if (!image) throw new Error('Missing image.');
         return Object.freeze({ type: 'image', image });
       }

@@ -28,8 +28,8 @@ import { randomUUID } from 'node:crypto';
 import type { AgentAuditEvent, AgentEvent, AgentProgressEvent } from '../events.js';
 import type { RequestCostEstimate } from '../orchestration/budget-accountant.js';
 import type { summarizeModelRequest } from '../orchestration/event-summaries.js';
-import { ModelStreamInterruptedError } from '../orchestration/model-stream.js';
 import { normalizeModelToolCall, providerFailureDiagnostic } from '../orchestration/model-request.js';
+import { ModelStreamInterruptedError } from '../orchestration/model-stream.js';
 import { storeProviderStateArtifact } from '../orchestration/provider-state-artifacts.js';
 import { AgentRunController } from '../orchestration/run-controller.js';
 import type {
@@ -170,6 +170,15 @@ export function createRunInferenceLifecycle(input: RunInferenceInput): {
         ...identity,
         request: requestSummary
       });
+      await emit({
+        type: 'model.requested',
+        ...identity,
+        request: requestSummary,
+        estimate: requestEstimate,
+        ...(turnRequest.snapshot.profile.limits.contextTokens === undefined
+          ? {}
+          : { contextWindowTokens: turnRequest.snapshot.profile.limits.contextTokens })
+      });
       const exactRequest = recordableModelRequest(request);
       const parametersDigest = input.compiled.inputIdentity.replace(/^sha256:/u, '');
       const recovery = input.options.provider.requestRecovery
@@ -238,7 +247,10 @@ export function createRunInferenceLifecycle(input: RunInferenceInput): {
               state: responseWithPrivateState.providerState
             })
           : undefined;
-      const response = durableProviderResponse(responseWithPrivateState);
+      const response = durableProviderResponse(
+        responseWithPrivateState,
+        turnRequest.snapshot.profile.capabilities.reasoning?.separateOutput === true
+      );
       const settlementEvent: Extract<AgentEvent, { type: 'provider.attempt.settled' }> = {
         type: 'provider.attempt.settled',
         ...identity,
@@ -284,7 +296,7 @@ export function createRunInferenceLifecycle(input: RunInferenceInput): {
         stage: 'outcome_unknown',
         effect: closed
       }));
-      const failure = error instanceof InferenceOutcomeUnknownError ? error.cause ?? error : error;
+      const failure = error instanceof InferenceOutcomeUnknownError ? (error.cause ?? error) : error;
       const cause = failure instanceof ModelStreamInterruptedError ? failure.cause : failure;
       const providerDiagnostic = providerFailureDiagnostic(cause);
       const diagnostic = {
@@ -311,9 +323,11 @@ export function createRunInferenceLifecycle(input: RunInferenceInput): {
                 turnIndex: identity.turnIndex
               }
             : { status: 'absent' as const },
-          ...(failure.reasoningSummary === undefined
+          ...(turnRequest.snapshot.profile.capabilities.reasoning?.separateOutput !== true ||
+          failure.reasoning === undefined
             ? {}
-            : { reasoningSummary: failure.reasoningSummary }),
+            : { reasoning: failure.reasoning }),
+          ...(failure.reasoningSummary === undefined ? {} : { reasoningSummary: failure.reasoningSummary }),
           finalResponseReceived: failure.finalResponseReceived,
           diagnostic
         };
@@ -395,7 +409,7 @@ export function providerUsageQuantities(usage: ModelUsage): readonly EffectExpos
   ]);
 }
 
-function durableProviderResponse(response: ModelResponse): ModelResponse {
+function durableProviderResponse(response: ModelResponse, reasoningVisible: boolean): ModelResponse {
   return parseModelResponse({
     content: response.content,
     ...(response.output === undefined ? {} : { output: response.output }),
@@ -404,6 +418,7 @@ function durableProviderResponse(response: ModelResponse): ModelResponse {
     ...(response.requestId === undefined ? {} : { requestId: response.requestId }),
     ...(response.transport === undefined ? {} : { transport: response.transport }),
     ...(response.usage === undefined ? {} : { usage: response.usage }),
+    ...(!reasoningVisible || response.reasoning === undefined ? {} : { reasoning: response.reasoning }),
     ...(response.reasoningSummary === undefined ? {} : { reasoningSummary: response.reasoningSummary }),
     ...(response.toolCalls === undefined ? {} : { toolCalls: response.toolCalls }),
     terminationReason: response.terminationReason,

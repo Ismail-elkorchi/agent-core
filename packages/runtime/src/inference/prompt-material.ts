@@ -1,5 +1,6 @@
 import { CompleteRequestEstimator, type RequestEstimator } from '@agent-core/model';
 import { randomUUID } from 'node:crypto';
+import { parseSessionImages } from '../session/images.js';
 
 export interface PromptContextRange {
   readonly kind: 'line' | 'byte';
@@ -60,6 +61,7 @@ export interface PromptOutputContract {
 export interface PromptMaterial {
   readonly id: string;
   readonly task: string;
+  readonly images?: readonly import('../session/images.js').SessionImageInput[];
   readonly instructions: readonly PromptInstructionBlock[];
   readonly context: readonly PromptContextItem[];
   readonly tools: readonly PromptToolSummary[];
@@ -141,6 +143,7 @@ export function createPromptMaterial(
   return Object.freeze({
     ...input,
     id: input.id ?? `material_${randomUUID()}`,
+    ...(input.images === undefined ? {} : { images: parseSessionImages(input.images) }),
     instructions: Object.freeze(input.instructions.map((item) => Object.freeze({ ...item }))),
     context: Object.freeze([...input.context]),
     tools: Object.freeze(

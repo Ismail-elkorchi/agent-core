@@ -3,6 +3,7 @@ import {
   providerContextIncompatibility,
   type ModelInputItem,
   type ModelOutputItem,
+  type ModelProfile,
   type ModelProtocolCapabilities,
   type ProviderContextState,
   type RequestEstimator
@@ -16,6 +17,7 @@ import { HistoryReader, historySourceAfterCut, sourceRef } from '../history/read
 import { readTransformedContext } from '../inference/context-transform.js';
 import { ModelWindow, type ModelWindowImageLimits } from '../inference/model-window.js';
 import type { SessionBranchEntry, SessionDescriptor, SessionRepository } from '../session/contracts.js';
+import { resolveSessionImages } from '../session/images.js';
 import { modelToolCallFromToolCall } from './model-request.js';
 import { serializeToolObservationPresentation } from './observation-store.js';
 import { readProviderStateArtifact } from './provider-state-artifacts.js';
@@ -110,11 +112,12 @@ export async function rebuildModelWindowFromRepositories(input: {
   );
   const selectedWindow = view?.contextWindow !== undefined;
   let replayedToolResults = 0;
-  replayedToolResults += replaySourceEntries(
+  replayedToolResults += await replaySourceEntries(
     modelWindow,
     view?.cut.sessionId ?? 'local',
     prior,
-    view?.contextWindow?.selection.representations
+    view?.contextWindow?.selection.representations,
+    input.artifacts
   );
   // Only the owning unfinished run may use an open ledger tail. Completed history
   // is branch-scoped above; reading entire historical ledgers would cross a fork.
@@ -237,12 +240,13 @@ export function selectedHistoryEntries(view: HistoryView): readonly SessionBranc
   });
 }
 
-export function replaySourceEntries(
+export async function replaySourceEntries(
   modelWindow: ModelWindow,
   sessionId: string,
   prior: readonly SessionBranchEntry[],
-  representations: readonly ContextRepresentation[] = []
-): number {
+  representations: readonly ContextRepresentation[] = [],
+  artifacts?: ArtifactRepository
+): Promise<number> {
   const summaries = new Set(representations.map((item) => item.source.entryId));
   let toolResults = 0;
   const callGroups = new Map<string, Extract<SessionBranchEntry, { type: 'tool_call' }>[]>();
@@ -264,7 +268,15 @@ export function replaySourceEntries(
     const source = sourceRef(sessionId, entry);
     const key = `${source.sessionId}:${source.entryId}:${source.sha256}`;
     if (entry.type === 'input') {
-      modelWindow.recordSourceItem(key, { role: 'user', content: entry.task });
+      modelWindow.recordSourceItem(key, {
+        role: 'user',
+        content: entry.task,
+        ...(entry.images === undefined
+          ? {}
+          : {
+              images: await resolveSessionImages(entry.images, artifacts, modelWindow.imageLimits.maxBytes)
+            })
+      });
       for (const [index, instruction] of entry.instructions.entries()) {
         if (instruction.provenance === 'application') continue;
         modelWindow.recordSourceItem(`${key}:instruction:${String(index)}`, {
@@ -343,7 +355,9 @@ export function activeObservationRepresentations(
   view: HistoryView,
   runId: string
 ): ReadonlyMap<string, Extract<ModelInputItem, { readonly role: 'tool' }>> {
-  const selected = new Set(view.contextWindow?.selection.representations?.map((item) => item.source.entryId));
+  const selected = new Set(
+    view.contextWindow?.selection.representations?.map((item) => item.source.entryId)
+  );
   const messages = new Map<string, Extract<ModelInputItem, { readonly role: 'tool' }>>();
   for (const entry of view.entries) {
     if (entry.type !== 'observation' || entry.runId !== runId || !entry.callId) continue;
@@ -365,4 +379,45 @@ export function activeObservationRepresentations(
     );
   }
   return messages;
+}
+
+/** Validates a proposed selection without changing admitted context or immutable history. */
+export async function assertHistoryModelCompatibility(input: {
+  readonly history: HistoryReader;
+  readonly artifacts: ArtifactRepository;
+  readonly profile: ModelProfile;
+}): Promise<void> {
+  const view = await input.history.view();
+  const target = {
+    provider: input.profile.provider,
+    model: input.profile.id,
+    ...(input.profile.capabilities.protocol === undefined
+      ? {}
+      : { protocol: input.profile.capabilities.protocol })
+  };
+  const transformed = await readTransformedContext({ view, artifacts: input.artifacts, ...target });
+  const incompatible = (reason: string): never => {
+    throw new Error(
+      `This session requires native provider state that the selected configuration cannot use (${reason}). Start a new session to use this configuration.`
+    );
+  };
+  if (transformed.invalidation !== undefined) incompatible(transformed.invalidation.reason);
+  for (const entry of selectedHistoryEntries(view)) {
+    if (transformed.represented.has(sourceRef(view.cut.sessionId, entry).entryId)) continue;
+    if (
+      entry.type === 'input' &&
+      entry.images?.length &&
+      !input.profile.modalities.input.includes('image')
+    ) {
+      throw new Error(
+        'The selected model cannot receive images in this session. Choose an image-capable model or start a new session.'
+      );
+    }
+    if (entry.type !== 'assistant') continue;
+    for (const item of entry.output ?? []) {
+      if (item.type !== 'protocol') continue;
+      const reason = providerContextIncompatibility(item.state, target);
+      if (reason !== undefined) incompatible(reason);
+    }
+  }
 }

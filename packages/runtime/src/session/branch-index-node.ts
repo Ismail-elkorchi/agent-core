@@ -17,7 +17,8 @@ import type {
   SessionDescriptor,
   SessionHeader,
   SessionRunFinalization,
-  SessionSubmissionRecord
+  SessionSubmissionRecord,
+  SessionSummary
 } from './contracts.js';
 
 interface RecordPosition extends BranchEntryPosition {
@@ -27,6 +28,7 @@ interface RecordPosition extends BranchEntryPosition {
 
 /** Rebuildable offsets into the session ledger; document bodies are never retained here. */
 export class JsonlBranchIndex {
+  private summaryValue: SessionSummary | undefined;
   private positions = new Map<string, RecordPosition>();
   private readonly branchPoints: SessionBranchPoint[] = [];
   private header: SessionHeader | undefined;
@@ -54,6 +56,12 @@ export class JsonlBranchIndex {
       bodyBytesRead: this.bodyBytesRead,
       bodyRecordsRead: this.bodyRecordsRead
     });
+  }
+
+  async summary(): Promise<SessionSummary> {
+    await this.refresh();
+    if (this.summaryValue === undefined) throw new Error('Session history has no committed header.');
+    return this.summaryValue;
   }
 
   async source(session: SessionDescriptor): Promise<BranchPageSource> {
@@ -87,6 +95,7 @@ export class JsonlBranchIndex {
       this.positions = new Map();
       this.branchPoints.length = 0;
       this.header = undefined;
+      this.summaryValue = undefined;
       this.leafId = null;
       this.completeBytes = 0;
       this.lineCount = 0;
@@ -95,6 +104,7 @@ export class JsonlBranchIndex {
     const additions = new Map<string, RecordPosition>();
     const points: SessionBranchPoint[] = [];
     let header = this.header;
+    let summary = this.summaryValue;
     let leafId = this.leafId;
     let lineCount = this.lineCount;
     for await (const line of readJsonlLines(this.filePath, {
@@ -108,10 +118,28 @@ export class JsonlBranchIndex {
       this.scannedBytes += bytes;
       if (line.line === 1) {
         header = this.decodeHeader(line);
+        summary = {
+          id: header.id,
+          timestamp: header.timestamp,
+          updatedAt: header.timestamp,
+          ...(header.provider === undefined ? {} : { provider: header.provider }),
+          ...(header.model === undefined ? {} : { model: header.model }),
+          bindingSchemaId: header.binding.schemaId,
+          bindingSchemaVersion: header.binding.schemaVersion,
+          bindingSha256: header.binding.bindingSha256
+        };
         continue;
       }
       if (line.text.trim().length === 0) continue;
       const entry = this.decodeRecord(line);
+      if (summary === undefined) throw new Error('Session record precedes its header.');
+      summary = {
+        ...summary,
+        updatedAt: entry.timestamp > summary.updatedAt ? entry.timestamp : summary.updatedAt,
+        ...(summary.preview === undefined && entry.type === 'input'
+          ? { preview: entry.task.replace(/\s+/gu, ' ').slice(0, 160) }
+          : {})
+      };
       if ('submissionId' in entry) continue;
       if (entry.type === 'run_finalization') {
         points.push(
@@ -146,6 +174,7 @@ export class JsonlBranchIndex {
     for (const [id, entry] of additions) this.positions.set(id, entry);
     this.branchPoints.push(...points);
     this.header = header;
+    this.summaryValue = summary === undefined ? undefined : Object.freeze(summary);
     this.leafId = leafId;
     this.lineCount = lineCount;
     this.completeBytes = endOffset;

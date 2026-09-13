@@ -211,6 +211,18 @@ export interface ModelProviderInfo {
   readonly defaultModel: string;
 }
 
+export interface ModelCatalogEntry {
+  readonly unavailableReason?: string;
+  readonly id: string;
+  readonly displayName?: string;
+  readonly description?: string;
+}
+
+export interface ModelDiscoveryOptions {
+  readonly signal?: AbortSignal;
+  readonly refresh?: boolean;
+}
+
 export type ModelReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 export type ModelReasoningMode = 'standard' | 'pro';
 
@@ -486,6 +498,9 @@ export interface ModelProvider {
     options?: ModelTransportOptions
   ): Promise<ModelContextTransformResult>;
   describe(): ModelProviderInfo;
+  authentication?(): import('@agent-core/auth').ProviderAuthentication | undefined;
+  /** Discover identities from this endpoint/account. Selection still requires describeModel. */
+  listModels?(options?: ModelDiscoveryOptions): Promise<readonly ModelCatalogEntry[]>;
   describeModel(model: string): Promise<ModelProfile>;
   createSession?(): ModelProviderSession;
   complete(request: ModelRequest): Promise<ModelResponse>;
@@ -576,3 +591,15 @@ export class ModelProviderError extends Error {
 export * from './accounting.js';
 export * from './protocol.js';
 export * from './validation.js';
+
+export interface ModelSelection {
+  readonly provider: string;
+  readonly model: string;
+  readonly endpoint?: string;
+  readonly reasoning?: ModelReasoningRequest;
+  readonly temperature?: number;
+}
+
+export { parseModelSelection } from './selection.js';
+
+export { parseModelImages } from './validation.js';

@@ -1,0 +1,36 @@
+{
+  "name": "@agent-core/tui",
+  "version": "0.2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./node": "./dist/node.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=24.8.0"
+  },
+  "dependencies": {
+    "diff": "9.0.0",
+    "markspan": "github:Ismail-elkorchi/markspan#c883b9a518cf96b967eadba31c3f2d08db1f5946",
+    "prismjs": "1.30.0",
+    "@agent-core/runtime": "0.2.0",
+    "@agent-core/model": "0.2.0",
+    "@agent-core/tools": "0.2.0",
+    "@agent-core/auth": "0.2.0",
+    "@agent-core/persistence": "0.2.0",
+    "@agent-core/json": "0.2.0"
+  },
+  "devDependencies": {
+    "@types/prismjs": "1.26.6",
+    "@ismail-elkorchi/terminal-ui": "github:Ismail-elkorchi/terminal-ui#e9ec556d96814a8029936106e5a1a6ef70b5da3c"
+  },
+  "peerDependencies": {
+    "@ismail-elkorchi/terminal-ui": ">=0.1.5"
+  }
+}

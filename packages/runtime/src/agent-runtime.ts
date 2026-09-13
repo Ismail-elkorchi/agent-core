@@ -134,6 +134,7 @@ import {
 import type { AgentToolCallPlanRecord, AgentToolCallState } from './run/control/tool-state.js';
 import { PendingCallCoordinator } from './run/pending-calls.js';
 import { assertToolCatalogCurrent, captureToolCatalog } from './run/tool-catalog.js';
+import { parseSessionImages } from './session/images.js';
 
 export type {} from './run/contracts.js';
 
@@ -198,6 +199,7 @@ export interface AgentRuntimeOptions {
 
 export interface AgentRunInput {
   readonly task: string;
+  readonly images?: readonly import('./session/images.js').SessionImageInput[];
   readonly runId?: string;
   readonly finalizationId?: string;
   readonly instructions?: readonly string[];
@@ -423,7 +425,7 @@ export class AgentRuntime {
   constructor(private readonly options: AgentRuntimeOptions) {
     this.metadata = options.metadata === undefined ? undefined : Object.freeze({ ...options.metadata });
     this.estimator = options.estimator ?? new CompleteRequestEstimator();
-    this.requestAssembler = new ModelRequestAssembler(this.estimator);
+    this.requestAssembler = new ModelRequestAssembler(this.estimator, options.repositories.artifacts);
     this.inferenceService =
       options.inferenceService ?? InferenceService.inMemory({ provider: options.provider });
     this.maxOutputTokens = validateOptionalPositiveInteger(options.maxOutputTokens, 'maxOutputTokens');
@@ -793,6 +795,7 @@ export class AgentRuntime {
       }
       const input: ResolvedAgentRunInput = {
         task: run.state().input.task,
+        ...(run.state().input.images === undefined ? {} : { images: run.state().input.images }),
         runId,
         finalizationId: run.state().finalizationId,
         instructions: run.state().input.instructions,
@@ -838,9 +841,11 @@ export class AgentRuntime {
       persisted: boolean;
     }[] = [];
     const append = async (event: AgentAuditEvent, idempotencyKey?: string) => {
-      const receipt = await run.append(event, idempotencyKey ?? `${runId}:event:${hashJson(encodeAgentEvent(event))}`);
-      if (event.type === 'assistant.interrupted')
-        await this.recordSessionAssistant(runId, event, receipt);
+      const receipt = await run.append(
+        event,
+        idempotencyKey ?? `${runId}:event:${hashJson(encodeAgentEvent(event))}`
+      );
+      if (event.type === 'assistant.interrupted') await this.recordSessionAssistant(runId, event, receipt);
       return receipt;
     };
     const emit = (event: AgentProgressEvent) =>
@@ -1104,13 +1109,18 @@ export class AgentRuntime {
       });
     }
     if (!(await this.options.repositories.events.latestOfType(runtime.runId, 'input.received')))
-      await runtime.append({ type: 'input.received', task: runtime.input.task });
+      await runtime.append({
+        type: 'input.received',
+        task: runtime.input.task,
+        ...(runtime.input.images === undefined ? {} : { images: runtime.input.images })
+      });
     let sessionEntryId: string | undefined;
     if (this.options.repositories.session) {
       const { repository, descriptor } = this.options.repositories.session;
       const inputEntry = await repository.appendInput(descriptor, {
         runId: runtime.runId,
         task: runtime.input.task,
+        ...(runtime.input.images === undefined ? {} : { images: runtime.input.images }),
         instructions: originalInstructions ?? [
           ...applicationInstructions(this.options.instructions),
           ...runInstructions(runtime.input.instructions)
@@ -1323,9 +1333,10 @@ export class AgentRuntime {
                 ...(configuration.temperature === undefined
                   ? {}
                   : { temperature: configuration.temperature }),
-                ...(configuration.reasoning?.strategy === 'effort'
-                  ? { reasoningEffort: configuration.reasoning.effort }
-                  : {})
+                ...(configuration.reasoning === undefined ? {} : { reasoning: configuration.reasoning }),
+                ...(profile.capabilities.protocol === undefined
+                  ? {}
+                  : { endpoint: profile.capabilities.protocol.endpoint })
               }
             );
           }
@@ -1714,6 +1725,7 @@ export class AgentRuntime {
         ...attachedIdentity,
         content: cause.content,
         modelOutput: recoveredModelOutput,
+        ...(cause.reasoning === undefined ? {} : { reasoning: cause.reasoning }),
         ...(cause.reasoningSummary !== undefined ? { reasoningSummary: cause.reasoningSummary } : {}),
         finalResponseReceived: cause.finalResponseReceived,
         ...(diagnostic ? { diagnostic } : {})
@@ -2297,12 +2309,14 @@ export class AgentRuntime {
       });
     if (response.usage) {
       const budget = request.snapshot.budgetAccountant.recordProviderUsage(response.usage);
-      await append({
-        type: 'budget.provider_usage.recorded',
+      const usageEvent = {
+        type: 'budget.provider_usage.recorded' as const,
         ...responseIdentity,
         usage: response.usage,
         snapshot: budget
-      });
+      };
+      await append(usageEvent);
+      await emit(usageEvent);
       request.controller.recordUsage(response.usage, request.snapshot.profile.pricing);
     } else {
       const completionTokens = this.estimateAssistantOutput(response);
@@ -2322,6 +2336,8 @@ export class AgentRuntime {
       type: 'assistant.ended' as const,
       ...responseIdentity,
       content: response.content,
+      ...(response.reasoning === undefined ? {} : { reasoning: response.reasoning }),
+      ...(response.reasoningSummary === undefined ? {} : { reasoningSummary: response.reasoningSummary }),
       modelOutput,
       ...(toolCalls.length > 0 ? { toolCalls } : {})
     };
@@ -2342,7 +2358,11 @@ export class AgentRuntime {
         this.options.repositories.session.descriptor,
         {
           runId,
-          identity: { turnId: event.turnId, turnIndex: event.turnIndex, requestAttempt: event.requestAttempt },
+          identity: {
+            turnId: event.turnId,
+            turnIndex: event.turnIndex,
+            requestAttempt: event.requestAttempt
+          },
           source: {
             runId,
             eventId: receipt.eventId,
@@ -2350,6 +2370,8 @@ export class AgentRuntime {
             hash: receipt.hash
           },
           content: event.content,
+          ...(event.reasoning === undefined ? {} : { reasoning: event.reasoning }),
+          ...(event.reasoningSummary === undefined ? {} : { reasoningSummary: event.reasoningSummary }),
           completeness: event.modelOutput.status,
           ...(output ? { output } : {})
         }
@@ -2413,9 +2435,10 @@ export class AgentRuntime {
       .filter((item) => item.provenance === 'run')
       .map((item) => item.content);
     for (;;) {
-      const assembly = this.requestAssembler.assemble({
+      const assembly = await this.requestAssembler.assemble({
         window: request.modelWindow,
         task: request.input.task,
+        ...(request.input.images === undefined ? {} : { images: request.input.images }),
         instructions: promptInstructionsForRequest({
           runInstructions,
           configuredInstructions: request.snapshot.instructions
@@ -2642,15 +2665,26 @@ export class AgentRuntime {
   ): Promise<ContextTransitionRequest> {
     if (!this.options.context) throw new Error('Context service is unavailable.');
     const view = await this.options.context.history.view();
-    const retained = new Map(transition.selection.retained.map((reference) => [reference.entryId, reference]));
+    const retained = new Map(
+      transition.selection.retained.map((reference) => [reference.entryId, reference])
+    );
     // The transition tool's own exchange is newer than the model's selection.
     // Retain that tail, rather than undoing the model's selection of settled work.
-    const lastSelected = view.entries.reduce((index, entry, position) =>
-      retained.has(sourceRef(view.cut.sessionId, entry).entryId) ? position : index, -1);
-    const lastOmitted = view.entries.reduce((index, entry, position) =>
-      transition.selection.omitted.some((range) =>
-        range.toEntryId === entry.id || range.toEntryId === sourceRef(view.cut.sessionId, entry).entryId
-      ) ? Math.max(index, position) : index, -1);
+    const lastSelected = view.entries.reduce(
+      (index, entry, position) =>
+        retained.has(sourceRef(view.cut.sessionId, entry).entryId) ? position : index,
+      -1
+    );
+    const lastOmitted = view.entries.reduce(
+      (index, entry, position) =>
+        transition.selection.omitted.some(
+          (range) =>
+            range.toEntryId === entry.id || range.toEntryId === sourceRef(view.cut.sessionId, entry).entryId
+        )
+          ? Math.max(index, position)
+          : index,
+      -1
+    );
     const through = Math.max(lastSelected, lastOmitted);
     for (const [index, entry] of view.entries.entries())
       if ('runId' in entry && entry.runId === runId && (entry.type === 'input' || index > through)) {
@@ -3171,6 +3205,7 @@ export class AgentRuntime {
       finalizationId: input.finalizationId,
       input: Object.freeze({
         task: input.task,
+        ...(input.images === undefined ? {} : { images: parseSessionImages(input.images) }),
         instructions: Object.freeze([...(input.instructions ?? [])]),
         contextItems: Object.freeze(
           (input.contextItems ?? []).map((item) => decodePromptContextItemInput(item))
@@ -3398,7 +3433,8 @@ function runSignalDeadline(
   const remaining = controller.remainingElapsedMs();
   if (remaining === undefined) return { signal: parentSignal, dispose: () => undefined };
   const timeout = new AbortController();
-  const schedule = (milliseconds: number) => setTimeout(checkDeadline, Math.min(milliseconds + 1, 2_147_483_647));
+  const schedule = (milliseconds: number) =>
+    setTimeout(checkDeadline, Math.min(milliseconds + 1, 2_147_483_647));
   const checkDeadline = (): void => {
     try {
       const next = controller.remainingElapsedMs();
@@ -3410,7 +3446,9 @@ function runSignalDeadline(
   let timer = schedule(remaining);
   return {
     signal: AbortSignal.any([parentSignal, timeout.signal]),
-    dispose: () => { clearTimeout(timer); }
+    dispose: () => {
+      clearTimeout(timer);
+    }
   };
 }
 
@@ -3609,6 +3647,7 @@ function runInput(
 ): ResolvedAgentRunInput {
   return {
     task: state.input.task,
+    ...(state.input.images === undefined ? {} : { images: state.input.images }),
     runId: state.runId,
     finalizationId: state.finalizationId,
     instructions: state.input.instructions,

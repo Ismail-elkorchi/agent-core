@@ -1,14 +1,17 @@
 import {
   type BearerToken,
   type BearerTokenProvider,
-  CachedBearerTokenProvider,
   type CredentialStore,
-  type ProviderAuth
+  FileCredentialStore,
+  type ProviderAuth,
+  type ProviderAuthentication
 } from '@agent-core/auth';
 import { parseJsonValue } from '@agent-core/json';
 import {
   type CompiledModelRequest,
   type ModelCompilationOptions,
+  type ModelDiscoveryOptions,
+  type ModelProfile,
   type ModelProvider,
   ModelProviderError,
   type ModelProviderInfo,
@@ -27,7 +30,8 @@ import {
   parseModelRequest,
   requiredProtocolRevision
 } from '@agent-core/model';
-import { responsesPayloadPaths } from '@agent-core/provider-openai-responses';
+import { readBoundedJsonResponse, responsesPayloadPaths } from '@agent-core/provider-openai-responses';
+import { type CodexCatalogModel, decodeCodexCatalog } from './catalog.js';
 
 import {
   OPENAI_CODEX_BASE_URL,
@@ -70,6 +74,7 @@ import {
   type OpenAICodexDeviceCodeLoginOptions,
   OpenAICodexTokenRefresher,
   accountIdFromToken,
+  beginOpenAICodexDeviceCode,
   loginOpenAICodexDeviceCode,
   resolveTokenProvider
 } from './oauth.js';
@@ -120,7 +125,11 @@ export class OpenAICodexProvider implements ModelProvider {
   readonly id = OPENAI_CODEX_PROVIDER_ID;
   readonly implementationId = 'agent-core.provider.openai-codex@1';
   private readonly compiledRequests = new WeakSet<CompiledModelRequest>();
+  private readonly credentialStore: CredentialStore;
+  private readonly credentialKey: string;
+  private catalog: readonly CodexCatalogModel[] | undefined;
   private readonly tokenProvider: BearerTokenProvider;
+  private readonly ownsCredentials: boolean;
   private readonly baseUrl: string;
   private readonly defaultModel: string;
   private readonly fetchImpl: typeof fetch;
@@ -132,6 +141,8 @@ export class OpenAICodexProvider implements ModelProvider {
   private readonly modelProfiles: Record<string, OpenAICodexModelProfileDefinition>;
 
   constructor(options: OpenAICodexProviderOptions = {}) {
+    this.credentialStore = options.credentialStore ?? new FileCredentialStore();
+    this.credentialKey = options.credentialKey ?? this.id;
     this.baseUrl = resolveCodexUrl(options.baseUrl ?? OPENAI_CODEX_BASE_URL);
     this.defaultModel = options.model ?? OPENAI_CODEX_DEFAULT_MODEL;
     this.fetchImpl = options.fetch ?? fetch;
@@ -141,7 +152,8 @@ export class OpenAICodexProvider implements ModelProvider {
     this.streamIdleTimeoutMs = Math.max(1, options.streamIdleTimeoutMs ?? 120_000);
     this.originator = options.originator ?? 'agent-core';
     this.modelProfiles = options.modelProfiles ?? {};
-    this.tokenProvider = new CachedBearerTokenProvider(resolveTokenProvider(options, this.fetchImpl));
+    this.tokenProvider = resolveTokenProvider(options, this.fetchImpl);
+    this.ownsCredentials = options.auth === undefined;
   }
 
   describe(): ModelProviderInfo {
@@ -156,8 +168,79 @@ export class OpenAICodexProvider implements ModelProvider {
     return new OpenAICodexProviderSession(this);
   }
 
-  describeModel(model: string) {
-    const profile = describeOpenAICodexModel(model || this.defaultModel, this.modelProfiles);
+  authentication(): ProviderAuthentication | undefined {
+    if (!this.ownsCredentials) return undefined;
+    return {
+      kind: 'device_code',
+      begin: async (signal) => {
+        const challenge = await beginOpenAICodexDeviceCode({
+          store: this.credentialStore,
+          key: this.credentialKey,
+          signal,
+          fetch: this.fetchImpl
+        });
+        return {
+          url: challenge.info.verificationUri,
+          code: challenge.info.userCode,
+          complete: async (signal) => {
+            await challenge.complete(signal);
+          }
+        };
+      },
+      logout: () => this.credentialStore.delete(this.credentialKey)
+    };
+  }
+
+  async listModels(options: ModelDiscoveryOptions = {}): Promise<readonly CodexCatalogModel[]> {
+    options.signal?.throwIfAborted();
+    if (this.catalog !== undefined && !options.refresh) return this.catalog;
+    const token = await this.tokenForRequest(options.signal);
+    const url = new URL(this.baseUrl.replace(/\/responses$/u, '/models'));
+    url.searchParams.set('client_version', '0.154.0');
+    const response = await this.fetchImpl(url, {
+      headers: this.headersForRequest(token.token, this.codexAccountId(token), false),
+      ...(options.signal === undefined ? {} : { signal: options.signal })
+    });
+    if (!response.ok)
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'provider_unavailable',
+        message: `Model discovery failed (HTTP ${String(response.status)}).`
+      });
+    const catalog = decodeCodexCatalog(await readBoundedJsonResponse(response));
+    options.signal?.throwIfAborted();
+    this.catalog = catalog;
+    return catalog;
+  }
+
+  async describeModel(model: string) {
+    const selectedModel = model || this.defaultModel;
+    let discovered = this.catalog?.find((entry) => entry.id === selectedModel);
+    let profile: ModelProfile;
+    if (this.modelProfiles[selectedModel] !== undefined)
+      profile = describeOpenAICodexModel(selectedModel, this.modelProfiles);
+    else if (discovered !== undefined) profile = discovered.profile;
+    else if (this.catalog !== undefined)
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'model_unavailable',
+        message: `Model is unavailable in this account: ${selectedModel}`
+      });
+    else {
+      try {
+        profile = describeOpenAICodexModel(selectedModel, this.modelProfiles);
+      } catch (error) {
+        if (!(error instanceof ModelProviderError) || error.code !== 'model_unavailable') throw error;
+        discovered = (await this.listModels()).find((entry) => entry.id === selectedModel);
+        if (discovered === undefined)
+          throw new ModelProviderError({
+            provider: this.id,
+            code: 'model_unavailable',
+            message: `Model is unavailable in this account: ${selectedModel}`
+          });
+        profile = discovered.profile;
+      }
+    }
     return Promise.resolve(
       parseModelProfile({
         ...profile,

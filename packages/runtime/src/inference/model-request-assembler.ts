@@ -5,7 +5,13 @@ import {
   type ModelProfile,
   type RequestEstimator
 } from '@agent-core/model';
-import { ModelWindow, type ModelWindowReduction } from './model-window.js';
+import type { ArtifactRepository } from '@agent-core/persistence';
+import { resolveSessionImages } from '../session/images.js';
+import {
+  DEFAULT_MODEL_WINDOW_IMAGE_LIMITS,
+  ModelWindow,
+  type ModelWindowReduction
+} from './model-window.js';
 import {
   createPromptMaterial,
   deliverPromptContext,
@@ -27,6 +33,7 @@ export type {
 export interface ModelRequestAssemblyInput {
   readonly window: ModelWindow;
   readonly task: string;
+  readonly images?: readonly import('../session/images.js').SessionImageInput[];
   readonly instructions: readonly PromptInstructionBlock[];
   readonly contextItems?: readonly PromptContextItemInput[];
   readonly tools: readonly PromptToolSummary[];
@@ -49,23 +56,29 @@ export interface ModelRequestAssembly {
 }
 
 export class ModelRequestAssembler {
-  constructor(private readonly estimator: RequestEstimator = new CompleteRequestEstimator()) {}
+  constructor(
+    private readonly estimator: RequestEstimator = new CompleteRequestEstimator(),
+    private readonly artifacts?: ArtifactRepository
+  ) {}
 
-  assemble(input: ModelRequestAssemblyInput): ModelRequestAssembly {
+  async assemble(input: ModelRequestAssemblyInput): Promise<ModelRequestAssembly> {
     const history = input.window.messagesFor(input.modelProfile);
     const prior = input.window.priorMessagesFor(input.modelProfile);
     const context = deliverPromptContext(input.contextItems ?? [], this.estimator);
     const material = createPromptMaterial({
       task: input.task,
+      ...(input.images === undefined ? {} : { images: input.images }),
       instructions: input.instructions,
       context: context.items,
       tools: input.tools,
       ...(input.metadata ? { metadata: input.metadata } : {})
     });
-    const messages = compilePromptMaterial(material, {
-      prior: prior.messages,
-      current: history.messages
-    });
+    const messages = await compilePromptMaterial(
+      material,
+      { prior: prior.messages, current: history.messages },
+      { artifacts: this.artifacts, maxImageBytes: input.window.imageLimits.maxBytes }
+    );
+    input.window.assertImagesAdmitted(messages, input.modelProfile);
     return Object.freeze({
       material,
       messages,
@@ -85,13 +98,14 @@ export class ModelRequestAssembler {
 }
 
 /** Keep current background material before the new request, after any retained native window. */
-export function compilePromptMaterial(
+export async function compilePromptMaterial(
   material: PromptMaterial,
   conversation: {
     readonly prior: readonly ModelInputItem[];
     readonly current: readonly ModelInputItem[];
-  } = { prior: [], current: [] }
-): readonly ModelInputItem[] {
+  } = { prior: [], current: [] },
+  options: { readonly artifacts?: ArtifactRepository | undefined; readonly maxImageBytes?: number } = {}
+): Promise<readonly ModelInputItem[]> {
   const instructionMessages: ModelInputItem[] = material.instructions.map((instruction) =>
     Object.freeze({
       role: instruction.role,
@@ -111,7 +125,16 @@ export function compilePromptMaterial(
     instructionMessages.push(Object.freeze({ role: 'developer', content: guides.join('\n\n') }));
   const taskMessage: ModelInputItem = Object.freeze({
     role: 'user',
-    content: material.task
+    content: material.task,
+    ...(material.images === undefined
+      ? {}
+      : {
+          images: await resolveSessionImages(
+            material.images,
+            options.artifacts,
+            options.maxImageBytes ?? DEFAULT_MODEL_WINDOW_IMAGE_LIMITS.maxBytes
+          )
+        })
   });
   const contextText = renderContext(material.context);
   const contextMessage: ModelInputItem | undefined = contextText

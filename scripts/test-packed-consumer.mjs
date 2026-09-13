@@ -36,118 +36,187 @@ try {
   for (const relative of packageDirs) {
     const directory = path.join(root, relative);
     const manifest = JSON.parse(await readFile(path.join(directory, 'package.json'), 'utf8'));
-    const { stdout } = await exec(process.execPath, [npmCli, 'pack', '--json', '--pack-destination', packs], { cwd: directory, maxBuffer: 10 * 1024 * 1024 });
+    const { stdout } = await exec(
+      process.execPath,
+      [npmCli, 'pack', '--json', '--pack-destination', packs],
+      { cwd: directory, maxBuffer: 10 * 1024 * 1024 }
+    );
     const packed = JSON.parse(stdout)[0];
     const files = packed.files.map((file) => file.path);
     assertCleanArchivePaths(files);
-    if (!files.some((file) => file.startsWith('dist/'))) throw new Error(`${relative} is missing compiled output.`);
+    if (!files.some((file) => file.startsWith('dist/')))
+      throw new Error(`${relative} is missing compiled output.`);
     for (const file of files.filter((name) => name.endsWith('.d.ts'))) {
       const declaration = await readFile(path.join(directory, file), 'utf8');
-      const retired = /\b(?:ModelMessage|ModelProviderState|SimpleTokenEstimator|TokenEstimator|SessionCompactionEntry|AgentSessionCompactionRequest|appendCompaction|summarizeConversation|executeAssistantToolCalls|nextObservationIndex|normalizeJsonSafe|JsonNormalizationDiagnostic|JsonNormalizationResult|outputNormalization|toObservationJsonObject|toJsonValue)\b/u.exec(declaration);
+      const retired =
+        /\b(?:ModelMessage|ModelProviderState|SimpleTokenEstimator|TokenEstimator|SessionCompactionEntry|AgentSessionCompactionRequest|appendCompaction|summarizeConversation|executeAssistantToolCalls|nextObservationIndex|normalizeJsonSafe|JsonNormalizationDiagnostic|JsonNormalizationResult|outputNormalization|toObservationJsonObject|toJsonValue)\b/u.exec(
+          declaration
+        );
       if (retired) throw new Error(`${relative}/${file} still exports retired contract ${retired[0]}.`);
     }
     dependencies[manifest.name] = `file:${path.join(packs, packed.filename)}`;
   }
+  for (const name of ['@ismail-elkorchi/terminal-ui', 'markspan']) {
+    const directory = path.join(root, 'node_modules', name);
+    const { stdout } = await exec(
+      process.execPath,
+      [npmCli, 'pack', '--json', '--ignore-scripts', '--pack-destination', packs],
+      { cwd: directory, maxBuffer: 10 * 1024 * 1024 }
+    );
+    dependencies[name] = `file:${path.join(packs, JSON.parse(stdout)[0].filename)}`;
+  }
   await mkdir(consumer, { recursive: true });
-  await writeFile(path.join(consumer, 'package.json'), `${JSON.stringify({
-    name: 'agent-core-consumer',
-    private: true,
-    type: 'module',
-    dependencies
-  }, null, 2)}\n`);
-  await exec(process.execPath, [npmCli, 'install', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: consumer, maxBuffer: 20 * 1024 * 1024 });
-  await writeFile(path.join(consumer, 'runtime.mjs'), [
-    "import * as runtime from '@agent-core/runtime';",
-    "import * as nodeRuntime from '@agent-core/runtime/node';",
-    "import * as model from '@agent-core/model';",
-    "import * as json from '@agent-core/json';",
-    "import { renderDiagnostic } from '@agent-core/json/diagnostics';",
-    "if (json.canonicalJsonString({ b: 1, a: 2 }) !== '{\"a\":2,\"b\":1}' || renderDiagnostic('large', { maxBytes: 1 }).bytes > 1) throw new Error('JSON boundary exports failed');",
-    "import * as persistence from '@agent-core/persistence';",
-    "import * as effects from '@agent-core/effects';",
-    "import * as tools from '@agent-core/tools';",
-    "import * as local from '@agent-core/tools-local';",
-    "import * as nodePersistence from '@agent-core/persistence/node';",
-    "if (!runtime.decodeAgentTerminalSnapshot || !runtime.AgentRuntime || !runtime.AgentSession || !runtime.InMemorySessionRepository || !nodeRuntime.JsonlSessionRepository || !model.parseModelResponse || !json.parseJsonObject || !effects.decodeExternalEffectIntent || !persistence.InMemoryEventRepository || !nodePersistence.JsonlEventRepository || !tools.planToolCall || !tools.invokeToolCallPlan || !tools.isCommandExecution || !local.LocalCommandExecution) throw new Error('public runtime exports missing');",
-    "if (!runtime.HistoryReader || !runtime.ContextService || !runtime.InferenceService || !runtime.InMemoryNoteRepository || !runtime.InMemoryInferenceRepository || !nodeRuntime.JsonlNoteRepository || !nodeRuntime.JsonlInferenceRepository || !runtime.createHistoryTools || !runtime.createNotesTools || !runtime.createContextTools || !runtime.EffectExecutor || !runtime.createObservationAccess || !tools.commandExecutionResources || !tools.contextRequiredObservation || !model.accountModelRequest || !model.compileModelRequest) throw new Error('persistent context exports missing');"
-  ].join('\n'));
+  await writeFile(
+    path.join(consumer, 'package.json'),
+    `${JSON.stringify(
+      {
+        name: 'agent-core-consumer',
+        private: true,
+        type: 'module',
+        dependencies,
+        overrides: {
+          '@ismail-elkorchi/terminal-ui': '$@ismail-elkorchi/terminal-ui',
+          markspan: '$markspan'
+        }
+      },
+      null,
+      2
+    )}\n`
+  );
+  await exec(process.execPath, [npmCli, 'install', '--ignore-scripts', '--no-audit', '--no-fund'], {
+    cwd: consumer,
+    maxBuffer: 20 * 1024 * 1024
+  });
+  await writeFile(
+    path.join(consumer, 'runtime.mjs'),
+    [
+      "import * as runtime from '@agent-core/runtime';",
+      "import * as nodeRuntime from '@agent-core/runtime/node';",
+      "import * as model from '@agent-core/model';",
+      "import * as json from '@agent-core/json';",
+      "import { renderDiagnostic } from '@agent-core/json/diagnostics';",
+      "if (json.canonicalJsonString({ b: 1, a: 2 }) !== '{\"a\":2,\"b\":1}' || renderDiagnostic('large', { maxBytes: 1 }).bytes > 1) throw new Error('JSON boundary exports failed');",
+      "import * as persistence from '@agent-core/persistence';",
+      "import * as effects from '@agent-core/effects';",
+      "import * as tools from '@agent-core/tools';",
+      "import * as local from '@agent-core/tools-local';",
+      "import * as nodePersistence from '@agent-core/persistence/node';",
+      "if (!runtime.decodeAgentTerminalSnapshot || !runtime.AgentRuntime || !runtime.AgentSession || !runtime.InMemorySessionRepository || !nodeRuntime.JsonlSessionRepository || !model.parseModelResponse || !json.parseJsonObject || !effects.decodeExternalEffectIntent || !persistence.InMemoryEventRepository || !nodePersistence.JsonlEventRepository || !tools.planToolCall || !tools.invokeToolCallPlan || !tools.isCommandExecution || !local.LocalCommandExecution) throw new Error('public runtime exports missing');",
+      "if (!runtime.HistoryReader || !runtime.ContextService || !runtime.InferenceService || !runtime.InMemoryNoteRepository || !runtime.InMemoryInferenceRepository || !nodeRuntime.JsonlNoteRepository || !nodeRuntime.JsonlInferenceRepository || !runtime.createHistoryTools || !runtime.createNotesTools || !runtime.createContextTools || !runtime.EffectExecutor || !runtime.createObservationAccess || !tools.commandExecutionResources || !tools.contextRequiredObservation || !model.accountModelRequest || !model.compileModelRequest) throw new Error('persistent context exports missing');"
+    ].join('\n')
+  );
   await exec(process.execPath, ['runtime.mjs'], { cwd: consumer });
+  await writeFile(
+    path.join(consumer, 'neutral.mjs'),
+    [
+      "import assert from 'node:assert/strict';",
+      "import { registerHooks } from 'node:module';",
+      "const hook = registerHooks({ resolve(specifier, context, next) { const resolved = next(specifier, context); if (resolved.url.includes('/terminal-ui/') || /@agent-core\\/(tui|rpc)\\//u.test(resolved.url)) throw new Error('Headless import initialized a presentation or transport package: ' + resolved.url); return resolved; } });",
+      "await import('@agent-core/runtime'); await import('@agent-core/model'); hook.deregister();",
+      "const { sessionRpcMethods } = await import('@agent-core/rpc'); await import('@agent-core/rpc/node');",
+      "const session = { id: 'memory-conversation' };",
+      'const methods = sessionRpcMethods({ async readSession() { return session; }, async listSessions() { return [session]; }, async selectSession(id) { assert.equal(id, session.id); return session; } });',
+      "assert.deepEqual(await methods['session.read'].invoke({}), session); assert.deepEqual(await methods['session.select'].invoke({ sessionId: session.id }), session); await assert.rejects(methods['session.select'].invoke({ sessionId: 4 }));",
+      "const { panel } = await import('@agent-core/tui'); await import('@agent-core/tui/node');",
+      "const { createMemoryTerminalHost } = await import('@ismail-elkorchi/terminal-ui/host');",
+      "const { text } = await import('@ismail-elkorchi/terminal-ui/components');",
+      "const { defineTui, createTuiRuntime } = await import('@ismail-elkorchi/terminal-ui/tui');",
+      'const host = createMemoryTerminalHost({ terminalSize: { columns: 48, rows: 18 } });',
+      "const app = defineTui({ id: 'neutral', init: () => ({ state: { open: true } }), update: (state, message) => ({ state: { open: message.type !== 'close' } }), view: (state) => state.open ? panel({ id: 'neutral', title: 'Conversation', width: 44, height: 14, onClose: () => ({ type: 'close' }), slots: { content: text({ content: 'No file, process or domain authority required.' }) } }) : text({ content: 'Closed' }) });",
+      "const runtime = createTuiRuntime({ app, host }); await runtime.start(); const pending = await runtime.handleInputChunk({ data: '\u001b' }); host.clock.advance(100); await pending.pending; assert.equal(runtime.state().open, false); await runtime.dispose(); await host.dispose();"
+    ].join('\n')
+  );
+  await exec(process.execPath, ['neutral.mjs'], { cwd: consumer });
 
-  await writeFile(path.join(consumer, 'consumer.ts'), [
-    "import type { JsonObject } from '@agent-core/json';",
-    "import { renderDiagnostic } from '@agent-core/json/diagnostics';",
-    "const diagnostic = renderDiagnostic(new Error('example'));",
-    "// @ts-expect-error diagnostic text is not an authoritative JSON payload",
-    "diagnostic.value;",
-    "import type { ModelInputItem, ModelOutputItem, ProviderContextState, CompiledModelRequest, RequestAccounting } from '@agent-core/model';",
-    "import { settleExternalEffect, type EffectExecutionState, type EffectRecoveryCapability } from '@agent-core/effects';",
-    "import type { AgentModelOutput, AgentRunControl, AgentSessionState, AgentTerminalSnapshot, AgentRuntimeOptions, ContextWindowRecord, EffectExecutionEvent, HistorySourceRef, NoteRepository } from '@agent-core/runtime';",
-    "import type { ExecutionResources, ToolEffects, ToolObservation, ToolObservationInput } from '@agent-core/tools';",
-    "const json: JsonObject = { nested: { ok: true }, values: [1, 'two'] };",
-    "declare const unsettledState: Exclude<EffectExecutionState, { phase: 'settled' }>;",
-    "const unsettledEvent: EffectExecutionEvent = { type: 'execution.state.changed', state: unsettledState };",
-    "// @ts-expect-error unsettled effects cannot own observations",
-    "const invalidUnsettled: EffectExecutionEvent = { type: 'execution.state.changed', state: unsettledState, observation: json };",
-    "const settled = settleExternalEffect(unsettledState, unsettledState.settlementPermit, { outcome: 'succeeded', resultDigest: 'a'.repeat(64), exposure: { status: 'known', quantities: [] } });",
-    "if (settled.status === 'settled') {",
-    "  const outcome: 'succeeded' = settled.state.settlement.outcome;",
-    "  const event: EffectExecutionEvent = { type: 'execution.state.changed', state: settled.state, observation: json };",
-    "  // @ts-expect-error settled effects require their observation",
-    "  const missing: EffectExecutionEvent = { type: 'execution.state.changed', state: settled.state };",
-    "  // @ts-expect-error undefined is not a settled observation under either optional-property setting",
-    "  const undefinedObservation: EffectExecutionEvent = { type: 'execution.state.changed', state: settled.state, observation: undefined };",
-    "}",
-    "const unknown = settleExternalEffect(unsettledState, unsettledState.settlementPermit, { outcome: 'unknown', exposure: { status: 'unknown', reserved: [] } });",
-    "if (unknown.status === 'settled') {",
-    "  // @ts-expect-error an unknown settlement cannot identify an observed result",
-    "  const invalidUnknown: EffectExecutionEvent = { type: 'execution.state.changed', state: unknown.state, observation: json };",
-    "  // @ts-expect-error runtime execution events do not admit unknown settlements without observations either",
-    "  const missingUnknown: EffectExecutionEvent = { type: 'execution.state.changed', state: unknown.state };",
-    "}",
-    "declare const executionEvent: EffectExecutionEvent;",
-    "if (executionEvent.observation !== undefined) {",
-    "  const phase: 'settled' = executionEvent.state.phase;",
-    "  const digest: string = executionEvent.state.settlement.resultDigest;",
-    "}",
-    "const providerState: ProviderContextState = { version: 1, provider: 'test', model: 'test-model', endpoint: 'https://provider.invalid', kind: 'response', data: { responseId: 'resp' }, origin: { requestId: 'request', inputIdentity: 'input' }, compatibility: { model: 'test-model', endpoint: 'https://provider.invalid', protocolRevision: 'conservative-v1', requiresExactPrefix: true }, replay: 'required' };",
-    "const developerInput: ModelInputItem = { role: 'developer', content: 'Application-owned instruction.' };",
-    "declare const outputItem: ModelOutputItem;",
-    "declare const compiled: CompiledModelRequest;",
-    "declare const accounting: RequestAccounting;",
-    "declare const window: ContextWindowRecord;",
-    "declare const source: HistorySourceRef;",
-    "declare const notes: NoteRepository;",
-    "const modelOutput: AgentModelOutput = { status: 'complete', message: 'done', source: 'content', turnIndex: 1 };",
-    "const recovery: EffectRecoveryCapability = { kind: 'unknown' };",
-    "const effects: ToolEffects = { accesses: [{ mode: 'read', scope: 'workspace' }], lockScopes: [], recovery };",
-    "const rawObservation: ToolObservationInput<{ value: string }> = { kind: 'result', ok: true, summary: 'raw', scope: { resources: [], coverage: 'complete' }, output: { value: 'raw' } };",
-    "// @ts-expect-error raw extension output is not an owned observation",
-    "const ownedObservation: ToolObservation = rawObservation;",
-    "declare const immutableObservation: ToolObservation;",
-    "// @ts-expect-error owned observation fields are readonly",
-    "immutableObservation.output = {};",
-    "declare const terminal: AgentTerminalSnapshot;",
-    "declare const options: AgentRuntimeOptions;",
-    "// @ts-expect-error application checks are not a kernel option",
-    "options.checks;",
-    "// @ts-expect-error application disposition is not a kernel option",
-    "options.disposition;",
-    "// @ts-expect-error application verification is not execution truth",
-    "terminal.verificationStatus;",
-    "declare const resources: ExecutionResources;",
-    "const lifetime = resources.lifetime;",
-    "declare const run: AgentRunControl;",
-    "declare const sessionState: AgentSessionState;",
-    "void [json, providerState, developerInput, outputItem, compiled, accounting, window, source, notes, modelOutput, recovery, effects, rawObservation, ownedObservation, immutableObservation, terminal, options, lifetime, run, sessionState];"
-  ].join('\n'));
+  await writeFile(
+    path.join(consumer, 'consumer.ts'),
+    [
+      "import type { JsonObject } from '@agent-core/json';",
+      "import { renderDiagnostic } from '@agent-core/json/diagnostics';",
+      "const diagnostic = renderDiagnostic(new Error('example'));",
+      '// @ts-expect-error diagnostic text is not an authoritative JSON payload',
+      'diagnostic.value;',
+      "import type { ModelInputItem, ModelOutputItem, ProviderContextState, CompiledModelRequest, RequestAccounting } from '@agent-core/model';",
+      "import { settleExternalEffect, type EffectExecutionState, type EffectRecoveryCapability } from '@agent-core/effects';",
+      "import type { AgentModelOutput, AgentRunControl, AgentSessionState, AgentTerminalSnapshot, AgentRuntimeOptions, ContextWindowRecord, EffectExecutionEvent, HistorySourceRef, NoteRepository } from '@agent-core/runtime';",
+      "import type { ExecutionResources, ToolEffects, ToolObservation, ToolObservationInput } from '@agent-core/tools';",
+      "const json: JsonObject = { nested: { ok: true }, values: [1, 'two'] };",
+      "declare const unsettledState: Exclude<EffectExecutionState, { phase: 'settled' }>;",
+      "const unsettledEvent: EffectExecutionEvent = { type: 'execution.state.changed', state: unsettledState };",
+      '// @ts-expect-error unsettled effects cannot own observations',
+      "const invalidUnsettled: EffectExecutionEvent = { type: 'execution.state.changed', state: unsettledState, observation: json };",
+      "const settled = settleExternalEffect(unsettledState, unsettledState.settlementPermit, { outcome: 'succeeded', resultDigest: 'a'.repeat(64), exposure: { status: 'known', quantities: [] } });",
+      "if (settled.status === 'settled') {",
+      "  const outcome: 'succeeded' = settled.state.settlement.outcome;",
+      "  const event: EffectExecutionEvent = { type: 'execution.state.changed', state: settled.state, observation: json };",
+      '  // @ts-expect-error settled effects require their observation',
+      "  const missing: EffectExecutionEvent = { type: 'execution.state.changed', state: settled.state };",
+      '  // @ts-expect-error undefined is not a settled observation under either optional-property setting',
+      "  const undefinedObservation: EffectExecutionEvent = { type: 'execution.state.changed', state: settled.state, observation: undefined };",
+      '}',
+      "const unknown = settleExternalEffect(unsettledState, unsettledState.settlementPermit, { outcome: 'unknown', exposure: { status: 'unknown', reserved: [] } });",
+      "if (unknown.status === 'settled') {",
+      '  // @ts-expect-error an unknown settlement cannot identify an observed result',
+      "  const invalidUnknown: EffectExecutionEvent = { type: 'execution.state.changed', state: unknown.state, observation: json };",
+      '  // @ts-expect-error runtime execution events do not admit unknown settlements without observations either',
+      "  const missingUnknown: EffectExecutionEvent = { type: 'execution.state.changed', state: unknown.state };",
+      '}',
+      'declare const executionEvent: EffectExecutionEvent;',
+      'if (executionEvent.observation !== undefined) {',
+      "  const phase: 'settled' = executionEvent.state.phase;",
+      '  const digest: string = executionEvent.state.settlement.resultDigest;',
+      '}',
+      "const providerState: ProviderContextState = { version: 1, provider: 'test', model: 'test-model', endpoint: 'https://provider.invalid', kind: 'response', data: { responseId: 'resp' }, origin: { requestId: 'request', inputIdentity: 'input' }, compatibility: { model: 'test-model', endpoint: 'https://provider.invalid', protocolRevision: 'conservative-v1', requiresExactPrefix: true }, replay: 'required' };",
+      "const developerInput: ModelInputItem = { role: 'developer', content: 'Application-owned instruction.' };",
+      'declare const outputItem: ModelOutputItem;',
+      'declare const compiled: CompiledModelRequest;',
+      'declare const accounting: RequestAccounting;',
+      'declare const window: ContextWindowRecord;',
+      'declare const source: HistorySourceRef;',
+      'declare const notes: NoteRepository;',
+      "const modelOutput: AgentModelOutput = { status: 'complete', message: 'done', source: 'content', turnIndex: 1 };",
+      "const recovery: EffectRecoveryCapability = { kind: 'unknown' };",
+      "const effects: ToolEffects = { accesses: [{ mode: 'read', scope: 'workspace' }], lockScopes: [], recovery };",
+      "const rawObservation: ToolObservationInput<{ value: string }> = { kind: 'result', ok: true, summary: 'raw', scope: { resources: [], coverage: 'complete' }, output: { value: 'raw' } };",
+      '// @ts-expect-error raw extension output is not an owned observation',
+      'const ownedObservation: ToolObservation = rawObservation;',
+      'declare const immutableObservation: ToolObservation;',
+      '// @ts-expect-error owned observation fields are readonly',
+      'immutableObservation.output = {};',
+      'declare const terminal: AgentTerminalSnapshot;',
+      'declare const options: AgentRuntimeOptions;',
+      '// @ts-expect-error application checks are not a kernel option',
+      'options.checks;',
+      '// @ts-expect-error application disposition is not a kernel option',
+      'options.disposition;',
+      '// @ts-expect-error application verification is not execution truth',
+      'terminal.verificationStatus;',
+      'declare const resources: ExecutionResources;',
+      'const lifetime = resources.lifetime;',
+      'declare const run: AgentRunControl;',
+      'declare const sessionState: AgentSessionState;',
+      'void [json, providerState, developerInput, outputItem, compiled, accounting, window, source, notes, modelOutput, recovery, effects, rawObservation, ownedObservation, immutableObservation, terminal, options, lifetime, run, sessionState];'
+    ].join('\n')
+  );
   for (const exactOptionalPropertyTypes of [true, false]) {
     const config = `tsconfig-${String(exactOptionalPropertyTypes)}.json`;
-    await writeFile(path.join(consumer, config), `${JSON.stringify({ compilerOptions: { target: 'ES2022', module: 'NodeNext', moduleResolution: 'NodeNext', strict: true, skipLibCheck: false, exactOptionalPropertyTypes, noEmit: true }, files: ['consumer.ts'] }, null, 2)}\n`);
-    await exec(process.execPath, [tscCli, '-p', config, '--pretty', 'false'], { cwd: consumer, maxBuffer: 20 * 1024 * 1024 });
+    await writeFile(
+      path.join(consumer, config),
+      `${JSON.stringify({ compilerOptions: { target: 'ES2022', module: 'NodeNext', moduleResolution: 'NodeNext', strict: true, skipLibCheck: false, exactOptionalPropertyTypes, noEmit: true }, files: ['consumer.ts'] }, null, 2)}\n`
+    );
+    await exec(process.execPath, [tscCli, '-p', config, '--pretty', 'false'], {
+      cwd: consumer,
+      maxBuffer: 20 * 1024 * 1024
+    });
   }
-  const testFiles = (await exec('rg', ['--files', 'tests'], { cwd: root })).stdout.trim().split('\n').filter(Boolean);
+  const testFiles = (await exec('rg', ['--files', 'tests'], { cwd: root })).stdout
+    .trim()
+    .split('\n')
+    .filter(Boolean);
   for (const file of testFiles) assertNoDistImports(await readFile(path.join(root, file), 'utf8'), file);
-  console.log('Packed consumer runtime and exactOptionalPropertyTypes=true/false declaration checks passed.');
+  console.log(
+    'Packed consumer runtime and exactOptionalPropertyTypes=true/false declaration checks passed.'
+  );
 } finally {
   await rm(temporary, { recursive: true, force: true });
 }

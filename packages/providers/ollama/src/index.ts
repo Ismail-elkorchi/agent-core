@@ -3,13 +3,15 @@ import {
   assertModelRequestSupported,
   assertProviderContextCompatible,
   type CompiledModelRequest,
-  type ModelCompilationOptions,
   compileModelRequest,
   CompleteRequestEstimator,
   conservativeProtocolCapabilities,
   createProviderContextState,
   type ModelCapabilities,
+  type ModelCatalogEntry,
+  type ModelCompilationOptions,
   ModelContractError,
+  type ModelDiscoveryOptions,
   type ModelImage,
   type ModelInputItem,
   type ModelOutputItem,
@@ -46,6 +48,7 @@ export type { OllamaShowResponse } from './wire.js';
 
 export interface OllamaClient {
   chat(request: ChatRequest & { stream: true }): Promise<AsyncIterable<unknown>>;
+  list?(): Promise<unknown>;
   show?(request: { model: string; verbose?: boolean }): Promise<unknown>;
   abort?(): void;
 }
@@ -114,6 +117,7 @@ export class OllamaProvider implements ModelProvider {
         });
         return {
           chat: (request) => client.chat(request),
+          list: () => client.list(),
           show: async (request) => {
             const response = await client.show(request);
             const modelInfo = toRecord(response.model_info);
@@ -147,6 +151,54 @@ export class OllamaProvider implements ModelProvider {
       displayName: `Ollama ${this.deployment} model provider`,
       defaultModel: this.defaultModel
     };
+  }
+
+  async listModels(options: ModelDiscoveryOptions = {}): Promise<readonly ModelCatalogEntry[]> {
+    options.signal?.throwIfAborted();
+    const client = this.clientFactory();
+    if (client.list === undefined)
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'provider_unavailable',
+        message: 'This Ollama client does not support model discovery.'
+      });
+    const abort = () => client.abort?.();
+    options.signal?.addEventListener('abort', abort, { once: true });
+    try {
+      const response = await client.list();
+      // The SDK includes Date objects; only the documented identity fields enter the catalog.
+      if (
+        typeof response !== 'object' ||
+        response === null ||
+        !('models' in response) ||
+        !Array.isArray(response.models)
+      )
+        throw new ModelProviderError({
+          provider: this.id,
+          code: 'malformed_response',
+          message: 'Ollama model discovery response has no models array.'
+        });
+      const entries: unknown[] = response.models;
+      const result = entries.map((entry) => {
+        if (
+          typeof entry !== 'object' ||
+          entry === null ||
+          !('name' in entry) ||
+          typeof entry.name !== 'string' ||
+          !entry.name
+        )
+          throw new ModelProviderError({
+            provider: this.id,
+            code: 'malformed_response',
+            message: 'Ollama catalog model name is missing.'
+          });
+        return { id: entry.name };
+      });
+      options.signal?.throwIfAborted();
+      return result;
+    } finally {
+      options.signal?.removeEventListener('abort', abort);
+    }
   }
 
   describeModel(model: string): Promise<ModelProfile> {
@@ -249,7 +301,10 @@ export class OllamaProvider implements ModelProvider {
         message: 'Unrecognized compiled request.'
       });
   }
-  completeCompiled(compiled: CompiledModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
+  completeCompiled(
+    compiled: CompiledModelRequest,
+    options?: ModelTransportOptions
+  ): Promise<ModelResponse> {
     this.assertCompiled(compiled);
     return this.complete(compiled.logicalRequest, options);
   }
@@ -455,7 +510,8 @@ export class OllamaProvider implements ModelProvider {
     return parseOllamaModelResponse({
       output,
       content: content || fallbackContent,
-      model: typeof response.model === 'string' && response.model.length > 0 ? response.model : request.model,
+      model:
+        typeof response.model === 'string' && response.model.length > 0 ? response.model : request.model,
       provider: this.id,
       terminationReason:
         toolCalls.length > 0

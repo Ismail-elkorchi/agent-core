@@ -14,6 +14,8 @@ Schema version `1` means the current schema only. The unpublished project intent
 | `@agent-core/tools` | Generic tool contracts, effects, authorization, policy, and observations. |
 | `@agent-core/tools-local` | Node workspace read, search, patch, shell, and process tools. |
 | `@agent-core/auth` | Provider-neutral credential sources and local credential storage. |
+| `@agent-core/rpc` | Optional JSON-RPC boundary schemas and session/input/history/notes/recovery mappings; `/node` owns JSONL stream lifetime. |
+| `@agent-core/tui` | Optional conversation, configuration, source, draft, queue, and preference components using the consumer's terminal-ui peer; `/node` adds host/editor and UI storage integration. |
 | `@agent-core/provider-*` | Ollama, OpenRouter, OpenAI Platform, OpenAI Codex, Claude Messages, and shared Responses framing. |
 
 Applications choose providers, prompt material, tools, checks, policies, authorization, and repositories. The runtime does not impose coding workspaces, writing evidence policy, or model-based judging. Public terminology is defined in [`docs/GLOSSARY.md`](docs/GLOSSARY.md).
@@ -37,4 +39,4 @@ npm run verify:release
 
 `verify:release` cleans and builds once, lints, runs unit and focused recovery/provider tests, then packs every publishable package once and checks it from a strict external consumer.
 
-Runnable applications are maintained separately in [Ismail-elkorchi/agents](https://github.com/Ismail-elkorchi/agents). Agent Core does not own application configuration, terminal presentation, or workspace layout.
+Runnable applications are maintained separately in [Ismail-elkorchi/agents](https://github.com/Ismail-elkorchi/agents). Applications own workspace layout, permission policy, and domain presentation. Core components accept data and optional capabilities without requiring a coding or writing application.

@@ -84,7 +84,7 @@ export class ModelWindow {
   private readonly activeItems: ActiveWindowItem[] = [];
   private readonly priorItems = new Map<string, ModelInputItem>();
   private readonly pendingReductions: ModelWindowReduction[] = [];
-  private readonly imageLimits: ModelWindowImageLimits;
+  readonly imageLimits: ModelWindowImageLimits;
 
   constructor(
     estimator: RequestEstimator = new CompleteRequestEstimator(),
@@ -195,6 +195,10 @@ export class ModelWindow {
     for (const [source, item] of window.priorItems) this.priorItems.set(source, item);
   }
 
+  assertImagesAdmitted(messages: readonly ModelInputItem[], profile: ModelProfile): void {
+    assertImagesAdmitted(messages, profile, this.imageLimits, this.estimator);
+  }
+
   priorMessagesFor(modelProfile: ModelProfile): ModelWindowMessages {
     const entries = [...this.priorItems].map(([itemId, message]) => ({
       itemId,
@@ -300,18 +304,28 @@ function admitImagesForProfile(
   estimator: RequestEstimator
 ): SelectedWindowImages {
   const messages = entries.map((entry) => entry.message);
-  const images = messages.flatMap((message) => message.images ?? []);
+  assertImagesAdmitted(messages, profile, limits, estimator);
+  return { messages };
+}
+
+function assertImagesAdmitted(
+  messages: readonly ModelInputItem[],
+  profile: ModelProfile,
+  limits: ModelWindowImageLimits,
+  estimator: RequestEstimator
+): void {
+  const images = messages.flatMap((message) => [
+    ...(message.images ?? []),
+    ...(message.parts?.flatMap((part) => (part.type === 'image' ? [part.image] : [])) ?? [])
+  ]);
   if (images.length > 0 && !profile.modalities.input.includes('image'))
-    throw new Error(
-      'context_admission_failed: selected images require an image-capable model or an explicitly selected representation.'
-    );
+    throw new Error('context_admission_failed: selected images require an image-capable model.');
   const bytes = images.reduce((total, image) => total + imageByteLength(image), 0);
   const tokens = images.reduce((total, image) => total + estimator.estimateImage(image), 0);
   if (images.length > limits.maxCount || bytes > limits.maxBytes || tokens > limits.maxEstimatedTokens)
     throw new Error(
       'context_admission_failed: selected images exceed the admitted count, byte or token limit.'
     );
-  return { messages };
 }
 
 function imageByteLength(image: ModelImage): number {

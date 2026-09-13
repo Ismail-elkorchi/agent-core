@@ -45,4 +45,17 @@ export {
 
 export type { ToolContextPrerequisite } from './orchestration/tool-execution.js';
 
-export { ownSessionSubmissionInput } from './session/submission-lifecycle.js';
+export {
+  decodeSessionInputRelationship,
+  ownSessionSubmissionInput
+} from './session/submission-lifecycle.js';
+
+export * from './history/history-search.js';
+export * from './notes/session-notes.js';
+export * from './session/event-delivery.js';
+export * from './session/progress.js';
+
+export { assertHistoryModelCompatibility } from './orchestration/session-replay.js';
+export { parseSessionImages, type SessionImageInput } from './session/images.js';
+
+export { assertSessionImagesSupported } from './session/images.js';

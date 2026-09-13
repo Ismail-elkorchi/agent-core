@@ -21,6 +21,7 @@ import type {
   SessionSuspensionCategory,
   SessionSuspensionDescriptor
 } from './contracts.js';
+import { parseSessionImages } from './images.js';
 import { ownSessionSubmissionConfiguration, ownSessionSubmissionInput } from './submission-lifecycle.js';
 
 export type AgentSessionConfiguration = SessionSubmissionConfiguration;
@@ -111,10 +112,12 @@ export class AgentSession {
   private configuration: AgentSessionConfiguration;
   private readonly maximumQueuedInputs: number;
   private readonly queued: PendingSubmission[] = [];
-  private readonly listeners = new Set<Readonly<{
-    listener: (event: AgentSessionEvent) => void | Promise<void>;
-    onFailure: (error: Error) => void | Promise<void>;
-  }>>();
+  private readonly listeners = new Set<
+    Readonly<{
+      listener: (event: AgentSessionEvent) => void | Promise<void>;
+      onFailure: (error: Error) => void | Promise<void>;
+    }>
+  >();
   private active: ActiveSubmission | undefined;
   private suspended: SuspendedSubmission | undefined;
   private serialQueue: Promise<void> = Promise.resolve();
@@ -225,6 +228,8 @@ export class AgentSession {
       const submissionId = randomUUID();
       const delivery = options.delivery ?? 'default';
       if (delivery === 'steer') {
+        if (input.images?.length || input.contextItems?.length || input.instructions?.length)
+          throw new Error('Steering accepts instruction text. Send attachments as a follow-up input.');
         if (!this.active) return { kind: 'rejected', reason: 'no_active_run' };
         if (options.expectedRunId !== undefined && options.expectedRunId !== this.active.control.runId)
           return { kind: 'rejected', reason: 'run_mismatch' };
@@ -570,7 +575,13 @@ export class AgentSession {
     } else {
       this.suspended = undefined;
       this.queued.unshift(
-        pendingSubmission(previous.submissionId, previous.runId, previous.input, previous.configuration, true)
+        pendingSubmission(
+          previous.submissionId,
+          previous.runId,
+          previous.input,
+          previous.configuration,
+          true
+        )
       );
     }
   }
@@ -611,7 +622,9 @@ export class AgentSession {
           submission.suspension.reason !== 'missing_implementation' &&
           (!current || !sameSuspension(submission.suspension, current))
         ) {
-          throw new Error(`Suspended submission ${submission.submissionId} contradicts its run suspension.`);
+          throw new Error(
+            `Suspended submission ${submission.submissionId} contradicts its run suspension.`
+          );
         }
         this.suspended = suspendedSubmission(submission, submission.suspension);
       } else {
@@ -859,6 +872,7 @@ function pendingSubmission(
   void completion.catch(() => undefined);
   const ownedInput: AgentRunInput = Object.freeze({
     task: input.task,
+    ...(input.images === undefined ? {} : { images: parseSessionImages(input.images) }),
     runId,
     ...(input.instructions === undefined ? {} : { instructions: Object.freeze([...input.instructions]) }),
     ...(input.contextItems === undefined
@@ -889,6 +903,7 @@ function pendingSubmission(
 function submissionInput(input: AgentRunInput): SessionSubmissionInput {
   return Object.freeze({
     task: input.task,
+    ...(input.images === undefined ? {} : { images: parseSessionImages(input.images) }),
     ...(input.instructions === undefined ? {} : { instructions: input.instructions }),
     ...(input.contextItems === undefined ? {} : { contextItems: input.contextItems })
   });

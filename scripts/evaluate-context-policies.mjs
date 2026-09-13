@@ -382,8 +382,16 @@ export async function loadProvider(options, env, accounting) {
       ...providerOptions,
       ...(options.provider === 'openai' ? { countTokens: true, maxConcurrentCounts: 1 } : {}),
       fetch: (url, init) => {
-        if (options.provider === 'codex' && String(url) !== CODEX_ENDPOINT)
-          throw new Error('Unexpected Codex transport destination.');
+        if (options.provider === 'codex') {
+          const target = new URL(url);
+          const models = new URL(CODEX_ENDPOINT.replace(/\/responses$/u, '/models'));
+          const catalogRead =
+            (init?.method ?? 'GET') === 'GET' &&
+            target.origin === models.origin &&
+            target.pathname === models.pathname;
+          if (String(url) !== CODEX_ENDPOINT && !catalogRead)
+            throw new Error('Unexpected Codex transport destination.');
+        }
         if (options.provider === 'openai' && new URL(url).pathname.endsWith('/responses/input_tokens')) {
           if (accounting.requests >= accounting.maxRequests)
             throw new Error('Comparison accounting request budget exhausted.');

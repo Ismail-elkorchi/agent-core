@@ -21,7 +21,11 @@ test('OpenAICodexProvider describes the ChatGPT subscription Responses profile',
   assert.equal(profile.provider, 'openai-codex');
   assert.equal(profile.capabilities.streaming, true);
   assert.equal(profile.capabilities.toolCalling, true);
-  assert.deepEqual(profile.limits, { contextTokens: 1_050_000, maxInputTokens: 922_000, outputTokens: 128_000 });
+  assert.deepEqual(profile.limits, {
+    contextTokens: 1_050_000,
+    maxInputTokens: 922_000,
+    outputTokens: 128_000
+  });
   assert.equal(profile.supportedParameters.includes('maxOutputTokens'), false);
   assert.equal(profile.metadata.api, 'codex-responses');
   assert.equal(profile.metadata.auth, 'chatgpt-subscription');
@@ -30,18 +34,34 @@ test('OpenAICodexProvider describes the ChatGPT subscription Responses profile',
   assert.deepEqual(profile.capabilities.reasoning.efforts, ['low', 'medium', 'high', 'xhigh', 'max']);
   assert.equal(profile.capabilities.reasoning.canDisable, false);
   assert.equal(profile.capabilities.reasoning.modes, undefined);
-  assert.deepEqual(Object.keys(profile.metadata).sort(), ['api', 'auth', 'defaultReasoningEffort', 'modelTier']);
+  assert.deepEqual(Object.keys(profile.metadata).sort(), [
+    'api',
+    'auth',
+    'defaultReasoningEffort',
+    'modelTier'
+  ]);
 });
 
 test('Codex compiled admission is bound to its provider instance and reservation policy', async () => {
   let sent = 0;
-  const options = { auth: bearerProvider(codexJwt()), fetch: async () => {
-    sent++;
-    return jsonResponse({ id: 'compiled-instance', model: 'gpt-5.6', status: 'completed', output_text: 'done' });
-  } };
+  const options = {
+    auth: bearerProvider(codexJwt()),
+    fetch: async () => {
+      sent++;
+      return jsonResponse({
+        id: 'compiled-instance',
+        model: 'gpt-5.6',
+        status: 'completed',
+        output_text: 'done'
+      });
+    }
+  };
   const first = new OpenAICodexProvider(options);
   const second = new OpenAICodexProvider(options);
-  const admitted = await first.compileRequest({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hello' }] }, { outputReservation: 100 });
+  const admitted = await first.compileRequest(
+    { model: 'gpt-5.6', messages: [{ role: 'user', content: 'hello' }] },
+    { outputReservation: 100 }
+  );
   assert.throws(() => second.completeCompiled(admitted), /provider instance/u);
   const readmitted = await second.compileRequest(admitted.logicalRequest, { outputReservation: 200 });
   assert.notEqual(readmitted, admitted);
@@ -57,7 +77,10 @@ test('Codex compiled admission is bound to its provider instance and reservation
   await first.createSession().completeCompiled(recompiled);
   assert.equal(sent, 4);
   for (const outputReservation of [0, -1, 1.5]) {
-    await assert.rejects(first.compileRequest(admitted.logicalRequest, { outputReservation }), /positive safe integer/);
+    await assert.rejects(
+      first.compileRequest(admitted.logicalRequest, { outputReservation }),
+      /positive safe integer/
+    );
   }
 });
 
@@ -65,23 +88,58 @@ test('OpenAICodexProvider supports GPT-5.6 max effort but does not claim subscri
   let fetchCalls = 0;
   const provider = new OpenAICodexProvider({
     auth: bearerProvider(codexJwt()),
-    fetch: async () => {
+    fetch: async (url) => {
+      if (String(url).includes('/models'))
+        return jsonResponse({
+          models: [
+            {
+              slug: 'gpt-5.6',
+              display_name: 'GPT-5.6',
+              input_modalities: ['text', 'image'],
+              supported_reasoning_levels: [{ effort: 'high' }, { effort: 'max' }]
+            }
+          ]
+        });
       fetchCalls += 1;
-      return jsonResponse({ id: 'unexpected', model: 'gpt-5.6', status: 'completed', output_text: 'unexpected' });
+      return jsonResponse({
+        id: 'unexpected',
+        model: 'gpt-5.6',
+        status: 'completed',
+        output_text: 'unexpected'
+      });
     }
   });
-  await provider.complete({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'solve' }], reasoning: { strategy: 'effort', effort: 'max' } });
+  await provider.complete({
+    model: 'gpt-5.6',
+    messages: [{ role: 'user', content: 'solve' }],
+    reasoning: { strategy: 'effort', effort: 'max' }
+  });
   await assert.rejects(
-    () => provider.complete({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'solve' }], reasoning: { strategy: 'effort', effort: 'high', mode: 'pro' } }),
-    error => error instanceof ModelProviderError && error.code === 'invalid_request'
+    () =>
+      provider.complete({
+        model: 'gpt-5.6',
+        messages: [{ role: 'user', content: 'solve' }],
+        reasoning: { strategy: 'effort', effort: 'high', mode: 'pro' }
+      }),
+    (error) => error instanceof ModelProviderError && error.code === 'invalid_request'
   );
   await assert.rejects(
-    () => provider.complete({ model: 'gpt-5.5', messages: [{ role: 'user', content: 'solve' }], reasoning: { strategy: 'effort', effort: 'max' } }),
-    error => error instanceof ModelProviderError && error.code === 'model_unavailable'
+    () =>
+      provider.complete({
+        model: 'gpt-5.5',
+        messages: [{ role: 'user', content: 'solve' }],
+        reasoning: { strategy: 'effort', effort: 'max' }
+      }),
+    (error) => error instanceof ModelProviderError && error.code === 'model_unavailable'
   );
   await assert.rejects(
-    () => provider.complete({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'solve' }], reasoning: { strategy: 'disabled' } }),
-    error => error instanceof ModelProviderError && error.code === 'invalid_request'
+    () =>
+      provider.complete({
+        model: 'gpt-5.6',
+        messages: [{ role: 'user', content: 'solve' }],
+        reasoning: { strategy: 'disabled' }
+      }),
+    (error) => error instanceof ModelProviderError && error.code === 'invalid_request'
   );
   assert.equal(fetchCalls, 1);
 });
@@ -92,7 +150,12 @@ test('OpenAICodexProvider serializes documented service tiers and rejects obsole
     auth: bearerProvider(codexJwt()),
     fetch: async (_input, init) => {
       calls.push(JSON.parse(init.body));
-      return jsonResponse({ id: 'resp-priority', model: 'gpt-5.6', status: 'completed', output_text: 'done' });
+      return jsonResponse({
+        id: 'resp-priority',
+        model: 'gpt-5.6',
+        status: 'completed',
+        output_text: 'done'
+      });
     }
   });
 
@@ -104,12 +167,13 @@ test('OpenAICodexProvider serializes documented service tiers and rejects obsole
   assert.equal(calls[0].service_tier, 'priority');
 
   await assert.rejects(
-    () => provider.complete({
-      model: 'gpt-5.6',
-      messages: [{ role: 'user', content: 'solve' }],
-      providerOptions: { provider: 'openai-codex', values: { serviceTier: 'fast' } }
-    }),
-    error => error instanceof ModelProviderError && error.code === 'invalid_request'
+    () =>
+      provider.complete({
+        model: 'gpt-5.6',
+        messages: [{ role: 'user', content: 'solve' }],
+        providerOptions: { provider: 'openai-codex', values: { serviceTier: 'fast' } }
+      }),
+    (error) => error instanceof ModelProviderError && error.code === 'invalid_request'
   );
   assert.equal(calls.length, 1);
 });
@@ -159,37 +223,42 @@ test('OpenAICodexProvider defaults to HTTP full replay transport', async () => {
 test('OpenAICodexProvider accepts nullable response fields in HTTP stream events', async () => {
   const provider = new OpenAICodexProvider({
     auth: bearerProvider(codexJwt()),
-    fetch: async () => sseResponse([
-      {
-        type: 'response.created',
-        response: {
-          id: 'resp-nullable',
-          model: 'gpt-5.6',
-          status: 'in_progress',
-          output: [],
-          usage: null,
-          error: null,
-          incomplete_details: null
+    fetch: async () =>
+      sseResponse([
+        {
+          type: 'response.created',
+          response: {
+            id: 'resp-nullable',
+            model: 'gpt-5.6',
+            status: 'in_progress',
+            output: [],
+            usage: null,
+            error: null,
+            incomplete_details: null
+          }
+        },
+        {
+          type: 'response.completed',
+          response: {
+            id: 'resp-nullable',
+            model: 'gpt-5.6',
+            status: 'completed',
+            output_text: 'stream ok',
+            output: [],
+            usage: { input_tokens: 4, output_tokens: 2, total_tokens: 6 },
+            error: null,
+            incomplete_details: null
+          }
         }
-      },
-      {
-        type: 'response.completed',
-        response: {
-          id: 'resp-nullable',
-          model: 'gpt-5.6',
-          status: 'completed',
-          output_text: 'stream ok',
-          output: [],
-          usage: { input_tokens: 4, output_tokens: 2, total_tokens: 6 },
-          error: null,
-          incomplete_details: null
-        }
-      }
-    ])
+      ])
   });
 
   const events = [];
-  for await (const event of provider.stream({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hi' }] })) events.push(event);
+  for await (const event of provider.stream({
+    model: 'gpt-5.6',
+    messages: [{ role: 'user', content: 'hi' }]
+  }))
+    events.push(event);
   const done = events.find((event) => event.type === 'done');
   assert.equal(done.response.content, 'stream ok');
   assert.deepEqual(done.response.usage, { promptTokens: 4, completionTokens: 2, totalTokens: 6 });
@@ -200,22 +269,26 @@ test('OpenAICodexProvider accepts nullable response fields in HTTP stream events
 test('OpenAICodexProvider summarizes failed stream events without error bodies', async () => {
   const provider = new OpenAICodexProvider({
     auth: bearerProvider(codexJwt()),
-    fetch: async () => sseResponse([
-      {
-        type: 'response.failed',
-        response: {
-          id: 'resp-failed',
-          model: 'gpt-5.6',
-          status: 'failed',
-          incomplete_details: { reason: 'server_shutdown' }
+    fetch: async () =>
+      sseResponse([
+        {
+          type: 'response.failed',
+          response: {
+            id: 'resp-failed',
+            model: 'gpt-5.6',
+            status: 'failed',
+            incomplete_details: { reason: 'server_shutdown' }
+          }
         }
-      }
-    ])
+      ])
   });
 
   await assert.rejects(
     async () => {
-      for await (const _event of provider.stream({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hi' }] })) {
+      for await (const _event of provider.stream({
+        model: 'gpt-5.6',
+        messages: [{ role: 'user', content: 'hi' }]
+      })) {
         // Consume stream.
       }
     },
@@ -234,11 +307,24 @@ test('OpenAICodexProvider summarizes failed stream events without error bodies',
 test('OpenAICodexProvider treats generic HTTP error events as terminal provider failures', async () => {
   const provider = new OpenAICodexProvider({
     auth: bearerProvider(codexJwt()),
-    fetch: async () => sseResponse([{ type: 'error', error: { message: 'backend rejected the stream', code: 'backend_error' } }])
+    fetch: async () =>
+      sseResponse([
+        { type: 'error', error: { message: 'backend rejected the stream', code: 'backend_error' } }
+      ])
   });
   await assert.rejects(
-    async () => { for await (const _event of provider.stream({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hi' }] })) { /* consume */ } },
-    error => error instanceof ModelProviderError && error.code === 'provider_unavailable' && error.diagnostic.eventType === 'error'
+    async () => {
+      for await (const _event of provider.stream({
+        model: 'gpt-5.6',
+        messages: [{ role: 'user', content: 'hi' }]
+      })) {
+        /* consume */
+      }
+    },
+    (error) =>
+      error instanceof ModelProviderError &&
+      error.code === 'provider_unavailable' &&
+      error.diagnostic.eventType === 'error'
   );
 });
 
@@ -250,16 +336,39 @@ test('OpenAICodexProvider bounds post-header stream idleness', async () => {
     fetch: async () => stalledSseResponse()
   });
   await assert.rejects(
-    async () => { for await (const _event of provider.stream({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hi' }] })) { /* consume */ } },
-    error => error instanceof ModelProviderError && error.code === 'provider_unavailable' && /idle/iu.test(error.message)
+    async () => {
+      for await (const _event of provider.stream({
+        model: 'gpt-5.6',
+        messages: [{ role: 'user', content: 'hi' }]
+      })) {
+        /* consume */
+      }
+    },
+    (error) =>
+      error instanceof ModelProviderError &&
+      error.code === 'provider_unavailable' &&
+      /idle/iu.test(error.message)
   );
 });
 
 test('OpenAICodexProvider rejects malformed nested Responses fields', async () => {
-  const provider = new OpenAICodexProvider({ auth: bearerProvider(codexJwt()), fetch: async () => jsonResponse({ id: 'bad', model: 'gpt-5.6', status: 'completed', output_text: 'x', usage: { input_tokens: 'one' } }) });
+  const provider = new OpenAICodexProvider({
+    auth: bearerProvider(codexJwt()),
+    fetch: async () =>
+      jsonResponse({
+        id: 'bad',
+        model: 'gpt-5.6',
+        status: 'completed',
+        output_text: 'x',
+        usage: { input_tokens: 'one' }
+      })
+  });
   await assert.rejects(
     () => provider.complete({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hi' }] }),
-    error => error instanceof ModelProviderError && error.code === 'malformed_response' && /input_tokens/u.test(error.message)
+    (error) =>
+      error instanceof ModelProviderError &&
+      error.code === 'malformed_response' &&
+      /input_tokens/u.test(error.message)
   );
 });
 
@@ -296,16 +405,18 @@ test('OpenAICodexProvider default WebSocket factory sends Codex headers', async 
     requests.push(request);
     socket.on('message', (data) => {
       messages.push(JSON.parse(String(data)));
-      socket.send(JSON.stringify({
-        type: 'response.completed',
-        response: {
-          id: 'resp-ws-real',
-          model: 'gpt-5.6',
-          status: 'completed',
-          output_text: 'ws ok',
-          output: []
-        }
-      }));
+      socket.send(
+        JSON.stringify({
+          type: 'response.completed',
+          response: {
+            id: 'resp-ws-real',
+            model: 'gpt-5.6',
+            status: 'completed',
+            output_text: 'ws ok',
+            output: []
+          }
+        })
+      );
     });
   });
   await listening(server);
@@ -320,7 +431,10 @@ test('OpenAICodexProvider default WebSocket factory sends Codex headers', async 
   const session = provider.createSession();
   const events = [];
   try {
-    for await (const event of session.stream({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hi' }] })) {
+    for await (const event of session.stream({
+      model: 'gpt-5.6',
+      messages: [{ role: 'user', content: 'hi' }]
+    })) {
       events.push(event);
     }
   } finally {
@@ -432,13 +546,10 @@ test('OpenAICodexProvider HTTP transport replays full assembled history without 
 
   const body = JSON.parse(calls[0].init.body);
   assert.equal('previous_response_id' in body, false);
-  assert.deepEqual(body.input.map((item) => item.type ?? item.role), [
-    'user',
-    'function_call',
-    'function_call_output',
-    'function_call',
-    'function_call_output'
-  ]);
+  assert.deepEqual(
+    body.input.map((item) => item.type ?? item.role),
+    ['user', 'function_call', 'function_call_output', 'function_call', 'function_call_output']
+  );
   assert.equal(body.input[1].call_id, 'call-shell-1');
   assert.equal(body.input[2].call_id, 'call-shell-1');
   assert.equal(body.input[3].call_id, 'call-shell-2');
@@ -540,7 +651,10 @@ test('OpenAICodexProvider WebSocket session continues with only incremental inpu
   assert.equal(secondBody.type, 'response.create');
   assert.equal('previous_response_id' in firstBody, false);
   assert.equal(secondBody.previous_response_id, 'resp-ws-1');
-  assert.deepEqual(secondBody.input.map((item) => item.type ?? item.role), ['function_call_output']);
+  assert.deepEqual(
+    secondBody.input.map((item) => item.type ?? item.role),
+    ['function_call_output']
+  );
   assert.equal(secondBody.input[0].call_id, 'call-shell-1');
   assert.equal(secondEvents.at(-1).response.transport.strategy, 'websocket_delta');
 
@@ -577,11 +691,10 @@ test('OpenAICodexProvider WebSocket session continues with only incremental inpu
   assert.equal(sockets[0].sent.length, 3);
   const thirdBody = JSON.parse(sockets[0].sent[2]);
   assert.equal('previous_response_id' in thirdBody, false);
-  assert.deepEqual(thirdBody.input.map((item) => item.type ?? item.role), [
-    'user',
-    'function_call',
-    'function_call_output'
-  ]);
+  assert.deepEqual(
+    thirdBody.input.map((item) => item.type ?? item.role),
+    ['user', 'function_call', 'function_call_output']
+  );
   assert.equal(thirdEvents.at(-1).response.transport.strategy, 'websocket_full_replay');
 });
 
@@ -807,7 +920,10 @@ test('OpenAICodexProvider WebSocket continuation accounts for output_text-only r
     }
   ];
 
-  for await (const _event of session.stream({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'Run pwd.' }] })) {
+  for await (const _event of session.stream({
+    model: 'gpt-5.6',
+    messages: [{ role: 'user', content: 'Run pwd.' }]
+  })) {
     // Drain.
   }
   for await (const _event of session.stream({ model: 'gpt-5.6', messages: toolTranscript })) {
@@ -835,27 +951,32 @@ test('OpenAICodexProvider reports useful WebSocket fallback diagnostics', async 
   const provider = new OpenAICodexProvider({
     auth: bearerProvider(codexJwt()),
     transport: 'websocket',
-    webSocketFactory: () => new FailingCodexWebSocket({
-      type: 'error',
-      message: 'TLS handshake failed',
-      error: new Error('proxy refused CONNECT')
-    }),
-    fetch: async () => sseResponse([
-      {
-        type: 'response.completed',
-        response: {
-          id: 'resp-http-fallback',
-          model: 'gpt-5.6',
-          status: 'completed',
-          output_text: 'fallback ok'
+    webSocketFactory: () =>
+      new FailingCodexWebSocket({
+        type: 'error',
+        message: 'TLS handshake failed',
+        error: new Error('proxy refused CONNECT')
+      }),
+    fetch: async () =>
+      sseResponse([
+        {
+          type: 'response.completed',
+          response: {
+            id: 'resp-http-fallback',
+            model: 'gpt-5.6',
+            status: 'completed',
+            output_text: 'fallback ok'
+          }
         }
-      }
-    ])
+      ])
   });
 
   const session = provider.createSession();
   const events = [];
-  for await (const event of session.stream({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hi' }] })) {
+  for await (const event of session.stream({
+    model: 'gpt-5.6',
+    messages: [{ role: 'user', content: 'hi' }]
+  })) {
     events.push(event);
   }
 
@@ -867,11 +988,19 @@ test('OpenAICodexProvider reports useful WebSocket fallback diagnostics', async 
   assert.equal(events.at(-1).response.content, 'fallback ok');
 
   const secondEvents = [];
-  for await (const event of session.stream({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'again' }] })) {
+  for await (const event of session.stream({
+    model: 'gpt-5.6',
+    messages: [{ role: 'user', content: 'again' }]
+  })) {
     secondEvents.push(event);
   }
 
-  assert.equal(secondEvents.some((event) => event.type === 'status' && event.message.includes('WebSocket unavailable')), false);
+  assert.equal(
+    secondEvents.some(
+      (event) => event.type === 'status' && event.message.includes('WebSocket unavailable')
+    ),
+    false
+  );
   assert.equal(secondEvents.at(-1).type, 'done');
   assert.equal(secondEvents.at(-1).response.content, 'fallback ok');
 });
@@ -889,7 +1018,10 @@ test('OpenAICodexProvider reports WebSocket close diagnostics after streaming st
 
   await assert.rejects(
     async () => {
-      for await (const event of provider.stream({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hi' }] })) {
+      for await (const event of provider.stream({
+        model: 'gpt-5.6',
+        messages: [{ role: 'user', content: 'hi' }]
+      })) {
         events.push(event);
       }
     },
@@ -906,46 +1038,65 @@ test('OpenAICodexProvider reports WebSocket close diagnostics after streaming st
     }
   );
 
-  assert.equal(events.some((event) => event.type === 'content' && event.content === 'partial'), true);
+  assert.equal(
+    events.some((event) => event.type === 'content' && event.content === 'partial'),
+    true
+  );
 });
 
 test('OpenAICodexProvider streams content, reasoning, tool calls, and final metadata', async () => {
   const provider = new OpenAICodexProvider({
     auth: bearerProvider(codexJwt()),
-    fetch: async () => sseResponse([
-      { type: 'response.reasoning_summary_text.delta', delta: 'plan ' },
-      { type: 'response.output_text.delta', delta: 'hi' },
-      {
-        type: 'response.output_item.done',
-        item: {
-          type: 'function_call',
-          call_id: 'call-2',
-          name: 'list_directory',
-          arguments: '{"path":"."}'
+    fetch: async () =>
+      sseResponse([
+        { type: 'response.reasoning_summary_text.delta', delta: 'plan ' },
+        { type: 'response.output_text.delta', delta: 'hi' },
+        {
+          type: 'response.output_item.done',
+          item: {
+            type: 'function_call',
+            call_id: 'call-2',
+            name: 'list_directory',
+            arguments: '{"path":"."}'
+          }
+        },
+        {
+          type: 'response.completed',
+          response: {
+            id: 'resp-2',
+            model: 'gpt-5.6',
+            status: 'completed',
+            output_text: 'hi',
+            usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 }
+          }
         }
-      },
-      {
-        type: 'response.completed',
-        response: {
-          id: 'resp-2',
-          model: 'gpt-5.6',
-          status: 'completed',
-          output_text: 'hi',
-          usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 }
-        }
-      }
-    ])
+      ])
   });
 
   const events = [];
-  for await (const event of provider.stream({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hi' }] })) {
+  for await (const event of provider.stream({
+    model: 'gpt-5.6',
+    messages: [{ role: 'user', content: 'hi' }]
+  })) {
     events.push(event);
   }
 
-  assert.deepEqual(events.filter((event) => event.type === 'reasoning').map((event) => event.reasoning), ['plan ']);
-  assert.deepEqual(events.filter((event) => event.type === 'reasoning').map((event) => event.channel), ['summary']);
-  assert.deepEqual(events.filter((event) => event.type === 'content').map((event) => event.content), ['hi']);
-  assert.deepEqual(events.filter((event) => event.type === 'tool_call').map((event) => event.toolCall.name), ['list_directory']);
+  assert.deepEqual(
+    events.filter((event) => event.type === 'reasoning').map((event) => event.reasoning),
+    ['plan ']
+  );
+  assert.deepEqual(
+    events.filter((event) => event.type === 'reasoning').map((event) => event.channel),
+    ['summary']
+  );
+  assert.deepEqual(
+    events.filter((event) => event.type === 'content').map((event) => event.content),
+    ['hi']
+  );
+  assert.deepEqual(
+    events.filter((event) => event.type === 'tool_call').map((event) => event.toolCall.name),
+    ['list_directory']
+  );
   const done = events.at(-1);
   assert.equal(done.type, 'done');
   assert.equal(done.response.reasoningSummary, 'plan ');
@@ -959,23 +1110,27 @@ test('OpenAICodexProvider streams content, reasoning, tool calls, and final meta
 test('OpenAICodexProvider preserves accumulated streamed content when completed payload has no visible text', async () => {
   const provider = new OpenAICodexProvider({
     auth: bearerProvider(codexJwt()),
-    fetch: async () => sseResponse([
-      { type: 'response.output_text.delta', delta: 'visible ' },
-      { type: 'response.output_text.delta', delta: 'text' },
-      {
-        type: 'response.completed',
-        response: {
-          id: 'resp-empty',
-          model: 'gpt-5.6',
-          status: 'completed',
-          output: []
+    fetch: async () =>
+      sseResponse([
+        { type: 'response.output_text.delta', delta: 'visible ' },
+        { type: 'response.output_text.delta', delta: 'text' },
+        {
+          type: 'response.completed',
+          response: {
+            id: 'resp-empty',
+            model: 'gpt-5.6',
+            status: 'completed',
+            output: []
+          }
         }
-      }
-    ])
+      ])
   });
 
   const events = [];
-  for await (const event of provider.stream({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hi' }] })) {
+  for await (const event of provider.stream({
+    model: 'gpt-5.6',
+    messages: [{ role: 'user', content: 'hi' }]
+  })) {
     events.push(event);
   }
 
@@ -1009,7 +1164,10 @@ test('OpenAICodexProvider refreshes stored credentials before request', async ()
     }
   });
 
-  const response = await provider.complete({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hi' }] });
+  const response = await provider.complete({
+    model: 'gpt-5.6',
+    messages: [{ role: 'user', content: 'hi' }]
+  });
   assert.equal(response.content, 'ok');
   assert.equal(calls[0].input, 'https://auth.openai.com/oauth/token');
   assert.equal(calls[1].init.headers['chatgpt-account-id'], 'new-acct');
@@ -1019,7 +1177,9 @@ test('OpenAICodexProvider refreshes stored credentials before request', async ()
 test('OpenAICodexProvider fails before fetch when stored credentials are missing', async () => {
   let calls = 0;
   const provider = new OpenAICodexProvider({
-    credentialStore: new FileCredentialStore({ rootDir: await mkdtemp(path.join(tmpdir(), 'agent-core-codex-auth-')) }),
+    credentialStore: new FileCredentialStore({
+      rootDir: await mkdtemp(path.join(tmpdir(), 'agent-core-codex-auth-'))
+    }),
     fetch: async () => {
       calls += 1;
       return jsonResponse({});
@@ -1028,7 +1188,10 @@ test('OpenAICodexProvider fails before fetch when stored credentials are missing
 
   await assert.rejects(
     () => provider.complete({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hi' }] }),
-    (error) => error instanceof ModelProviderError && error.code === 'invalid_request' && /credentials/.test(error.message)
+    (error) =>
+      error instanceof ModelProviderError &&
+      error.code === 'invalid_request' &&
+      /credentials/.test(error.message)
   );
   assert.equal(calls, 0);
 });
@@ -1369,13 +1532,27 @@ function jsonResponse(body, options = {}) {
 test('OpenAICodexProvider preserves visible output from an incomplete response', async () => {
   const provider = new OpenAICodexProvider({
     auth: bearerProvider(codexJwt()),
-    fetch: async () => sseResponse([
-      { type: 'response.output_text.delta', delta: 'partial codex answer' },
-      { type: 'response.incomplete', response: { id: 'resp-partial', model: 'gpt-5.6', status: 'incomplete', output: [], incomplete_details: { reason: 'max_output_tokens' } } }
-    ])
+    fetch: async () =>
+      sseResponse([
+        { type: 'response.output_text.delta', delta: 'partial codex answer' },
+        {
+          type: 'response.incomplete',
+          response: {
+            id: 'resp-partial',
+            model: 'gpt-5.6',
+            status: 'incomplete',
+            output: [],
+            incomplete_details: { reason: 'max_output_tokens' }
+          }
+        }
+      ])
   });
   const events = [];
-  for await (const event of provider.stream({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'answer' }] })) events.push(event);
+  for await (const event of provider.stream({
+    model: 'gpt-5.6',
+    messages: [{ role: 'user', content: 'answer' }]
+  }))
+    events.push(event);
   assert.equal(events.at(-1).response.content, 'partial codex answer');
   assert.equal(events.at(-1).response.terminationReason, 'output_limit');
   assert.equal(events.at(-1).response.providerTerminationReason, 'max_output_tokens');
@@ -1481,5 +1658,12 @@ function sseResponse(chunks) {
 
 function stalledSseResponse() {
   const encoder = new TextEncoder();
-  return new Response(new ReadableStream({ start(controller) { controller.enqueue(encoder.encode(': CONNECTED\n\n')); } }), { headers: { 'content-type': 'text/event-stream' } });
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(': CONNECTED\n\n'));
+      }
+    }),
+    { headers: { 'content-type': 'text/event-stream' } }
+  );
 }

@@ -1,5 +1,10 @@
 import type { JsonObject, JsonValue } from '@agent-core/json';
-import type { ModelOutputItem, ModelReasoningRequest, ModelResponseFormat } from '@agent-core/model';
+import type {
+  ModelOutputItem,
+  ModelReasoningRequest,
+  ModelResponseFormat,
+  ModelSelection
+} from '@agent-core/model';
 import type { ArtifactRef } from '@agent-core/persistence';
 import type {
   ContextTransitionCommit,
@@ -62,6 +67,8 @@ export type SessionBranchPageRequest = SessionBranchReadLimits &
   };
 
 export interface SessionBranchPage {
+  /** A single entry exceeds this page's byte bound. Retrieve it explicitly; cursors continue around it. */
+  readonly oversizedEntry?: { readonly entryId: string; readonly bytes: number };
   readonly boundary: SessionBranchBoundary;
   readonly entries: readonly SessionBranchEntry[];
   readonly older?: SessionBranchCursor;
@@ -76,6 +83,8 @@ export type SessionBranchSearchRequest = SessionBranchReadLimits &
   };
 
 export interface SessionBranchSearchResult {
+  /** This entry was not searched because it exceeds the bounded page size. */
+  readonly oversizedEntry?: SessionBranchPage['oversizedEntry'];
   readonly boundary: SessionBranchBoundary;
   readonly matches: readonly { readonly entryId: string; readonly excerpt: string }[];
   readonly older?: SessionBranchCursor & { readonly query: string };
@@ -93,6 +102,7 @@ export type SessionInputEntry = BaseSessionEntry &
     readonly type: 'input';
     readonly runId: string;
     readonly task: string;
+    readonly images?: readonly import('./images.js').SessionImageInput[];
     readonly originalInput?: SessionSubmissionInput;
     readonly instructions: readonly AgentEffectiveInstruction[];
   }>;
@@ -111,6 +121,8 @@ export type SessionAssistantEntry = BaseSessionEntry &
   AgentTurnIdentity &
   Readonly<{
     readonly type: 'assistant';
+    readonly reasoning?: string;
+    readonly reasoningSummary?: string;
     readonly runId: string;
     readonly content: string;
     readonly output?: readonly ModelOutputItem[];
@@ -159,7 +171,8 @@ export type SessionModelSettingsEntry = BaseSessionEntry &
     readonly provider: string;
     readonly model: string;
     readonly temperature?: number;
-    readonly reasoningEffort?: string;
+    readonly reasoning?: ModelReasoningRequest;
+    readonly endpoint?: string;
   }>;
 
 export type SessionContextTransitionEntry = BaseSessionEntry &
@@ -212,6 +225,7 @@ export interface SessionInputRelationship {
 export interface SessionSubmissionInput {
   readonly relationship?: SessionInputRelationship;
   readonly task: string;
+  readonly images?: readonly import('./images.js').SessionImageInput[];
   readonly instructions?: readonly string[];
   readonly contextItems?: readonly PromptContextItemInput[];
 }
@@ -235,7 +249,11 @@ export type SessionQueuedSubmission = Readonly<{
 
 export type SessionSubmissionState = 'claimed' | 'suspended' | 'completed' | 'failed' | 'cancelled';
 
-export type SessionSuspensionCategory = 'approval' | 'external_recovery' | 'implementation' | 'user_decision';
+export type SessionSuspensionCategory =
+  | 'approval'
+  | 'external_recovery'
+  | 'implementation'
+  | 'user_decision';
 export type SessionSuspensionAction = 'approval' | 'reconcile' | 'resume' | 'decide' | 'abort';
 export interface SessionSuspensionDescriptor {
   readonly runId: string;
@@ -308,6 +326,7 @@ export interface SessionObservationInput {
 }
 
 export interface SessionSummary {
+  readonly preview?: string;
   readonly id: string;
   readonly timestamp: string;
   readonly updatedAt: string;
@@ -336,7 +355,12 @@ export interface SessionRepository {
   listBranchPoints(session: SessionDescriptor): Promise<readonly SessionBranchPoint[]>;
   appendInput(
     session: SessionDescriptor,
-    input: { runId: string; task: string; instructions?: readonly AgentEffectiveInstruction[] }
+    input: {
+      runId: string;
+      task: string;
+      images?: SessionSubmissionInput['images'];
+      instructions?: readonly AgentEffectiveInstruction[];
+    }
   ): Promise<SessionInputEntry>;
   appendSteering(
     session: SessionDescriptor,
@@ -354,6 +378,8 @@ export interface SessionRepository {
       runId: string;
       identity: AgentTurnIdentity;
       content: string;
+      reasoning?: string;
+      reasoningSummary?: string;
       output?: readonly ModelOutputItem[];
       completeness?: SessionAssistantEntry['completeness'];
       source?: import('../history/contracts.js').HistoryEventSource;
@@ -375,7 +401,7 @@ export interface SessionRepository {
   ): Promise<SessionObservationEntry>;
   appendModelSettings(
     session: SessionDescriptor,
-    settings: { provider: string; model: string; temperature?: number; reasoningEffort?: string }
+    settings: ModelSelection
   ): Promise<SessionModelSettingsEntry>;
   commitContextTransition(
     session: SessionDescriptor,
@@ -414,7 +440,10 @@ export interface SessionRepository {
     submissionId: string,
     change: SessionQueuedSubmissionChange
   ): Promise<void>;
-  readBranchPage(session: SessionDescriptor, request?: SessionBranchPageRequest): Promise<SessionBranchPage>;
+  readBranchPage(
+    session: SessionDescriptor,
+    request?: SessionBranchPageRequest
+  ): Promise<SessionBranchPage>;
   searchBranch(
     session: SessionDescriptor,
     request: SessionBranchSearchRequest

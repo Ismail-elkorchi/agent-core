@@ -1,5 +1,5 @@
 import { parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
-import type { ModelOutputItem } from '@agent-core/model';
+import { parseModelSelection, type ModelOutputItem, type ModelSelection } from '@agent-core/model';
 import { hashJson, validateArtifactRef, type ArtifactRef } from '@agent-core/persistence';
 import {
   PersistenceConflictError,
@@ -20,7 +20,6 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { ContextTransitionCommit } from '../context/contracts.js';
 import { historyEventSourceSchema } from '../history/schema.js';
-import { decodePromptContextItemInput } from '../inference/prompt-material.js';
 import {
   createAgentTerminalSnapshot,
   decodeOwnedAgentTerminalSnapshot,
@@ -74,12 +73,12 @@ import type {
   SessionSummary,
   SessionToolCallEntry
 } from './contracts.js';
+import { parseSessionImages } from './images.js';
 import { captureObservationInput } from './observation.js';
 import { ownSessionSteeringInput, sameSessionSteering } from './steering-input.js';
 import {
   createQueuedSubmissionUpdate,
   createSessionSubmissionTransition,
-  decodeSessionInputRelationship,
   originalAcceptedInput,
   ownSessionSubmissionConfiguration,
   ownSessionSubmissionInput,
@@ -179,20 +178,7 @@ export class JsonlSessionRepository implements SessionRepository {
     for (const name of names.sort()) {
       const id = /^session-(.+)\.jsonl$/u.exec(name)?.[1];
       if (!id) continue;
-      const state = await this.enqueue(id, () => this.refreshIndex(id, false));
-      const session = sessionFromState(state);
-      summaries.push(
-        Object.freeze({
-          id,
-          timestamp: session.header.timestamp,
-          updatedAt: sessionUpdatedAt(state),
-          ...(session.header.provider ? { provider: session.header.provider } : {}),
-          ...(session.header.model ? { model: session.header.model } : {}),
-          bindingSchemaId: session.header.binding.schemaId,
-          bindingSchemaVersion: session.header.binding.schemaVersion,
-          bindingSha256: session.header.binding.bindingSha256
-        })
-      );
+      summaries.push(await this.enqueue(id, () => this.branchIndex(id).summary()));
     }
     return Object.freeze(summaries.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)));
   }
@@ -261,7 +247,11 @@ export class JsonlSessionRepository implements SessionRepository {
         (line) => {
           const value = parseJson(line, filePath);
           if (isJsonObject(value) && value.type === 'run_finalization') return parseRunFinalization(value);
-          if (isJsonObject(value) && typeof value.type === 'string' && value.type.startsWith('submission.')) {
+          if (
+            isJsonObject(value) &&
+            typeof value.type === 'string' &&
+            value.type.startsWith('submission.')
+          ) {
             return parseSubmissionRecord(value);
           }
           return parseBranchEntry(value);
@@ -278,7 +268,7 @@ export class JsonlSessionRepository implements SessionRepository {
 
   appendInput(
     session: SessionDescriptor,
-    input: { runId: string; task: string; instructions?: readonly AgentEffectiveInstruction[] }
+    input: Parameters<SessionRepository['appendInput']>[1]
   ): Promise<SessionInputEntry> {
     const sessionId = session.id;
     return this.enqueue(sessionId, () =>
@@ -298,6 +288,7 @@ export class JsonlSessionRepository implements SessionRepository {
           type: 'input',
           runId: input.runId,
           task: input.task,
+          ...(input.images === undefined ? {} : { images: parseSessionImages(input.images) }),
           ...originalAcceptedInput(state.submissionRecords, input.runId),
           instructions: Object.freeze(
             (input.instructions ?? []).map((instruction) => Object.freeze({ ...instruction }))
@@ -354,6 +345,8 @@ export class JsonlSessionRepository implements SessionRepository {
       runId: string;
       identity: AgentTurnIdentity;
       content: string;
+      reasoning?: string;
+      reasoningSummary?: string;
       output?: readonly ModelOutputItem[];
       completeness?: SessionAssistantEntry['completeness'];
       source?: import('../history/contracts.js').HistoryEventSource;
@@ -376,6 +369,8 @@ export class JsonlSessionRepository implements SessionRepository {
           if (
             existing.turnIndex !== input.identity.turnIndex ||
             existing.content !== input.content ||
+            existing.reasoning !== input.reasoning ||
+            existing.reasoningSummary !== input.reasoningSummary ||
             hashJson(existing.output ?? null) !== hashJson(input.output ?? null) ||
             existing.completeness !== input.completeness ||
             hashJson(existing.source ?? null) !== hashJson(input.source ?? null)
@@ -391,6 +386,8 @@ export class JsonlSessionRepository implements SessionRepository {
           runId: input.runId,
           ...input.identity,
           content: input.content,
+          ...(input.reasoning === undefined ? {} : { reasoning: input.reasoning }),
+          ...(input.reasoningSummary === undefined ? {} : { reasoningSummary: input.reasoningSummary }),
           ...(input.source ? { source: historyEventSourceSchema.parse(input.source) } : {}),
           ...(input.output ? { output: ownSessionAssistantOutput(input.output) } : {}),
           ...(input.completeness ? { completeness: input.completeness } : {})
@@ -495,16 +492,13 @@ export class JsonlSessionRepository implements SessionRepository {
 
   appendModelSettings(
     session: SessionDescriptor,
-    settings: { provider: string; model: string; temperature?: number; reasoningEffort?: string }
+    settings: ModelSelection
   ): Promise<SessionModelSettingsEntry> {
     return this.appendBranchEntry(session, (parentId) =>
       Object.freeze({
         ...baseEntry(parentId),
         type: 'model_settings',
-        provider: settings.provider,
-        model: settings.model,
-        ...(settings.temperature === undefined ? {} : { temperature: settings.temperature }),
-        ...(settings.reasoningEffort === undefined ? {} : { reasoningEffort: settings.reasoningEffort })
+        ...parseModelSelection(settings)
       })
     );
   }
@@ -863,12 +857,6 @@ interface SessionAppendIndex extends SessionFileState {
   boundaryMarker: string;
   storageStamp: JsonlStorageStamp;
 }
-function sessionUpdatedAt(state: SessionFileState): string {
-  return [...state.branchEntries, ...state.finalizations, ...state.submissionRecords].reduce(
-    (latest, entry) => (entry.timestamp > latest ? entry.timestamp : latest),
-    state.header.timestamp
-  );
-}
 function sessionRecordCount(state: SessionFileState): number {
   return state.branchEntries.length + state.finalizations.length + state.submissionRecords.length;
 }
@@ -897,7 +885,11 @@ async function readSessionFile(
     try {
       if (isJsonObject(value) && value.type === 'run_finalization')
         finalizations.push(parseRunFinalization(value));
-      else if (isJsonObject(value) && typeof value.type === 'string' && value.type.startsWith('submission.'))
+      else if (
+        isJsonObject(value) &&
+        typeof value.type === 'string' &&
+        value.type.startsWith('submission.')
+      )
         submissionRecords.push(parseSubmissionRecord(value));
       else branchEntries.push(parseBranchEntry(value));
     } catch (error) {
@@ -909,7 +901,13 @@ async function readSessionFile(
     pendingSessionSubmissions(submissionRecords);
   } catch (error) {
     const last = lines.at(-1);
-    throw corruption(filePath, last?.line ?? 1, last?.byteOffset ?? 0, errorMessage(error), 'invalid_record');
+    throw corruption(
+      filePath,
+      last?.line ?? 1,
+      last?.byteOffset ?? 0,
+      errorMessage(error),
+      'invalid_record'
+    );
   }
   return {
     state: { header, branchEntries, finalizations, submissionRecords },
@@ -922,6 +920,7 @@ function parseBranchEntry(value: JsonValue): SessionBranchEntry {
   if (isSessionInputEntry(value)) {
     return Object.freeze({
       ...value,
+      ...(value.images === undefined ? {} : { images: parseSessionImages(value.images) }),
       ...(value.originalInput === undefined
         ? {}
         : { originalInput: ownSessionSubmissionInput(value.originalInput) })
@@ -946,7 +945,17 @@ function parseBranchEntry(value: JsonValue): SessionBranchEntry {
       ...value,
       ...(value.noteSource === undefined ? {} : { noteSource: ownBranchNoteSource(value.noteSource) })
     });
-  if (isSessionModelSettingsEntry(value)) return value;
+  if (value.type === 'model_settings') {
+    const { type, id, parentId, timestamp, source, ...settings } = value;
+    return Object.freeze({
+      type,
+      id,
+      parentId,
+      timestamp,
+      ...parseModelSelection(settings),
+      ...(source === undefined ? {} : { source: historyEventSourceSchema.parse(source) })
+    });
+  }
   if (value.type === 'context_transition') return decodeContextTransitionEntry(value);
   throw new Error(
     `Unsupported or malformed session entry: ${typeof value.type === 'string' ? value.type : 'unknown'}`
@@ -1023,7 +1032,9 @@ const SESSION_HEADER_FIELDS = new Set([
 
 function parseSessionHeader(value: JsonValue, sessionId: string): SessionHeader {
   if (!isJsonObject(value) || value.format !== 'agent-core.session/2')
-    throw new Error('Incompatible session format. Start a new session; existing data has not been changed.');
+    throw new Error(
+      'Incompatible session format. Start a new session; existing data has not been changed.'
+    );
   if (
     !isJsonObject(value) ||
     value.type !== 'session' ||
@@ -1085,14 +1096,11 @@ function sameObservation(
 
 function sameSessionInput(
   existing: SessionInputEntry,
-  input: {
-    readonly runId: string;
-    readonly task: string;
-    readonly instructions?: readonly AgentEffectiveInstruction[];
-  }
+  input: Parameters<SessionRepository['appendInput']>[1]
 ): boolean {
   return (
     existing.task === input.task &&
+    JSON.stringify(existing.images ?? []) === JSON.stringify(input.images ?? []) &&
     JSON.stringify(existing.instructions) === JSON.stringify(input.instructions ?? [])
   );
 }
@@ -1164,7 +1172,9 @@ function validTurnIdentity(
     value.requestAttempt > 0
   );
 }
-function validBaseEntry(value: Record<string, unknown>): value is Record<string, unknown> & BaseSessionEntry {
+function validBaseEntry(
+  value: Record<string, unknown>
+): value is Record<string, unknown> & BaseSessionEntry {
   return (
     typeof value.id === 'string' &&
     value.id.length > 0 &&
@@ -1182,7 +1192,8 @@ function isEffectiveInstruction(value: unknown): value is AgentEffectiveInstruct
     (value.provenance === 'application' || value.provenance === 'run' || value.provenance === 'steering') &&
     (value.role === undefined || typeof value.role === 'string') &&
     (value.sourceUri === undefined || typeof value.sourceUri === 'string') &&
-    (value.priority === undefined || (typeof value.priority === 'number' && Number.isFinite(value.priority)))
+    (value.priority === undefined ||
+      (typeof value.priority === 'number' && Number.isFinite(value.priority)))
   );
 }
 function isSessionInputEntry(
@@ -1206,7 +1217,8 @@ function isSessionSteeringEntry(
     value.runId.length > 0 &&
     typeof value.content === 'string' &&
     value.content.length > 0 &&
-    (value.deliveryId === undefined || (typeof value.deliveryId === 'string' && value.deliveryId.length > 0))
+    (value.deliveryId === undefined ||
+      (typeof value.deliveryId === 'string' && value.deliveryId.length > 0))
   );
 }
 function isSessionAssistantEntry(
@@ -1218,6 +1230,8 @@ function isSessionAssistantEntry(
     typeof value.runId === 'string' &&
     value.runId.length > 0 &&
     typeof value.content === 'string' &&
+    (value.reasoning === undefined || typeof value.reasoning === 'string') &&
+    (value.reasoningSummary === undefined || typeof value.reasoningSummary === 'string') &&
     (value.completeness === undefined ||
       value.completeness === 'complete' ||
       value.completeness === 'partial' ||
@@ -1273,21 +1287,6 @@ function isSessionBranchMarkerEntry(
     (value.label === undefined || typeof value.label === 'string')
   );
 }
-function isSessionModelSettingsEntry(
-  value: Record<string, unknown> & BaseSessionEntry
-): value is Record<string, unknown> & SessionModelSettingsEntry {
-  return (
-    value.type === 'model_settings' &&
-    typeof value.provider === 'string' &&
-    value.provider.length > 0 &&
-    typeof value.model === 'string' &&
-    value.model.length > 0 &&
-    (value.temperature === undefined ||
-      (typeof value.temperature === 'number' && Number.isFinite(value.temperature))) &&
-    (value.reasoningEffort === undefined || typeof value.reasoningEffort === 'string')
-  );
-}
-
 function parseSubmissionRecord(value: JsonObject): SessionSubmissionRecord {
   if (
     typeof value.submissionId !== 'string' ||
@@ -1306,7 +1305,7 @@ function parseSubmissionRecord(value: JsonObject): SessionSubmissionRecord {
       submissionId: value.submissionId,
       runId: value.runId,
       timestamp: value.timestamp,
-      input: parseSubmissionInput(value.input),
+      input: ownSessionSubmissionInput(value.input),
       configuration: parseSubmissionConfiguration(value.configuration)
     });
   }
@@ -1322,7 +1321,7 @@ function parseSubmissionRecord(value: JsonObject): SessionSubmissionRecord {
   const base = { submissionId: value.submissionId, runId: value.runId, timestamp: value.timestamp };
   if (value.type === 'submission.revised') {
     if (!isJsonObject(value.input)) throw new Error('Revised session input is invalid.');
-    return Object.freeze({ ...base, type: value.type, input: parseSubmissionInput(value.input) });
+    return Object.freeze({ ...base, type: value.type, input: ownSessionSubmissionInput(value.input) });
   }
   if (value.type === 'submission.suspended')
     return Object.freeze({
@@ -1426,27 +1425,6 @@ function requiredString(value: JsonValue | undefined, name: string): string {
   return value;
 }
 
-function parseSubmissionInput(value: JsonObject): SessionSubmissionInput {
-  if (
-    typeof value.task !== 'string' ||
-    !isOptionalStringArray(value.instructions) ||
-    (value.contextItems !== undefined && !Array.isArray(value.contextItems))
-  )
-    throw new Error('Session submission input is invalid.');
-  return Object.freeze({
-    task: value.task,
-    ...(value.relationship === undefined
-      ? {}
-      : { relationship: decodeSessionInputRelationship(value.relationship) }),
-    ...(value.instructions === undefined ? {} : { instructions: Object.freeze([...value.instructions]) }),
-    ...(value.contextItems === undefined
-      ? {}
-      : {
-          contextItems: Object.freeze(value.contextItems.map((item) => decodePromptContextItemInput(item)))
-        })
-  });
-}
-
 function parseSubmissionConfiguration(value: JsonObject): SessionSubmissionConfiguration {
   if (
     typeof value.provider !== 'string' ||
@@ -1519,10 +1497,6 @@ function parseSubmissionResponseFormat(
   if (!isJsonObject(value) || value.type !== 'json_schema' || !isJsonObject(value.schema))
     throw new Error('Session submission response format is invalid.');
   return Object.freeze({ type: 'json_schema', schema: value.schema });
-}
-
-function isOptionalStringArray(value: JsonValue | undefined): value is readonly string[] | undefined {
-  return value === undefined || (Array.isArray(value) && value.every((item) => typeof item === 'string'));
 }
 
 function encodeSubmissionRecord(record: SessionSubmissionRecord): JsonObject {
@@ -1625,6 +1599,7 @@ function encodeSubmissionReasoning(
 function encodeSubmissionInput(input: SessionSubmissionInput): JsonObject {
   return Object.freeze({
     task: input.task,
+    ...(input.images === undefined ? {} : { images: parseJsonValue(input.images) }),
     ...(input.relationship ? { relationship: parseJsonValue(input.relationship) } : {}),
     ...(input.instructions === undefined ? {} : { instructions: Object.freeze([...input.instructions]) }),
     ...(input.contextItems === undefined

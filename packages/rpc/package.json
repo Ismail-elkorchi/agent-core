@@ -1,0 +1,22 @@
+{
+  "name": "@agent-core/rpc",
+  "version": "0.2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./node": "./dist/node.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=24.8.0"
+  },
+  "dependencies": {
+    "zod": "4.4.3",
+    "@agent-core/runtime": "0.2.0"
+  }
+}

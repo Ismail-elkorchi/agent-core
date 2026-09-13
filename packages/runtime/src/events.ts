@@ -72,6 +72,7 @@ import {
   type AgentRunStateTransition
 } from './run/control/state-transition.js';
 import { decodeToolCatalog } from './run/tool-catalog.js';
+import { parseSessionImages } from './session/images.js';
 
 export interface AgentProviderStateSummary {
   readonly provider: string;
@@ -268,7 +269,11 @@ export type AgentEvent =
       readonly state: AgentProviderStateSummary;
       readonly reason: string;
     }
-  | { readonly type: 'input.received'; readonly task: string }
+  | {
+      readonly type: 'input.received';
+      readonly task: string;
+      readonly images?: readonly import('./session/images.js').SessionImageInput[];
+    }
   | {
       readonly type: 'prompt.context.delivered';
       readonly delivery: PromptContextDelivery;
@@ -281,6 +286,8 @@ export type AgentEvent =
   | ({
       readonly type: 'assistant.ended';
       readonly content: string;
+      readonly reasoning?: string;
+      readonly reasoningSummary?: string;
       readonly modelOutput: AgentModelOutput;
       readonly toolCalls?: readonly ToolCall[];
     } & AgentTurnIdentity)
@@ -289,6 +296,7 @@ export type AgentEvent =
       readonly content: string;
       readonly modelOutput: AgentModelOutput;
       readonly reasoningSummary?: string;
+      readonly reasoning?: string;
       readonly finalResponseReceived: boolean;
       readonly diagnostic?: ModelProviderErrorDiagnostic;
     } & AgentTurnIdentity)
@@ -403,6 +411,13 @@ export type AgentEvent =
 export type AgentAuditEvent = Exclude<AgentEvent, { readonly type: 'run.state.transitioned' }>;
 
 export type AgentProgressEvent =
+  | ({
+      readonly type: 'model.requested';
+      readonly request: AgentModelRequestSummary;
+      readonly estimate: RequestCostEstimate;
+      readonly contextWindowTokens?: number;
+    } & AgentTurnIdentity)
+  | Extract<AgentEvent, { readonly type: 'budget.provider_usage.recorded' }>
   | {
       readonly type: 'context.transitioned';
       readonly window: ContextWindowRecord;
@@ -457,6 +472,8 @@ export type AgentProgressEvent =
   | ({
       readonly type: 'assistant.ended';
       readonly content: string;
+      readonly reasoning?: string;
+      readonly reasoningSummary?: string;
       readonly modelOutput: AgentModelOutput;
       readonly toolCalls?: readonly ToolCall[];
     } & AgentTurnIdentity)
@@ -465,6 +482,7 @@ export type AgentProgressEvent =
       readonly content: string;
       readonly modelOutput: AgentModelOutput;
       readonly reasoningSummary?: string;
+      readonly reasoning?: string;
       readonly finalResponseReceived: boolean;
       readonly diagnostic?: ModelProviderErrorDiagnostic;
     } & AgentTurnIdentity)
@@ -754,9 +772,10 @@ const AGENT_EVENT_DECODERS = {
     });
   },
   'input.received': (value) => {
-    exact(value, ['type', 'task']);
+    exact(value, ['type', 'task', 'images']);
     return Object.freeze({
       type: 'input.received',
+      ...(value.images === undefined ? {} : { images: parseSessionImages(value.images) }),
       task: requiredString(value.task, 'task')
     });
   },
@@ -782,7 +801,15 @@ const AGENT_EVENT_DECODERS = {
     });
   },
   'assistant.ended': (value) => {
-    exact(value, ['type', ...TURN_KEYS, 'content', 'modelOutput', 'toolCalls']);
+    exact(value, [
+      'type',
+      ...TURN_KEYS,
+      'content',
+      'modelOutput',
+      'toolCalls',
+      'reasoning',
+      'reasoningSummary'
+    ]);
     const identity = decodeTurnIdentity(value);
     const modelOutput = decodeOwnedAgentModelOutput(requiredObject(value.modelOutput, 'modelOutput'));
     if (modelOutput.status !== 'absent' && modelOutput.turnIndex !== identity.turnIndex)
@@ -794,6 +821,7 @@ const AGENT_EVENT_DECODERS = {
       type: 'assistant.ended',
       ...identity,
       content: requiredStringValue(value.content, 'content'),
+      ...decodeReasoningOutput(value),
       modelOutput,
       ...(toolCalls ? { toolCalls: Object.freeze(toolCalls) } : {})
     });
@@ -805,6 +833,7 @@ const AGENT_EVENT_DECODERS = {
       'content',
       'modelOutput',
       'reasoningSummary',
+      'reasoning',
       'finalResponseReceived',
       'diagnostic'
     ]);
@@ -812,14 +841,13 @@ const AGENT_EVENT_DECODERS = {
     const modelOutput = decodeOwnedAgentModelOutput(requiredObject(value.modelOutput, 'modelOutput'));
     if (modelOutput.status !== 'absent' && modelOutput.turnIndex !== identity.turnIndex)
       throw malformed('modelOutput turnIndex does not match event turnIndex');
-    const reasoningSummary = optionalStringValue(value.reasoningSummary, 'reasoningSummary');
     const diagnostic = optionalDiagnostic(value.diagnostic);
     return Object.freeze({
       type: 'assistant.interrupted',
       ...identity,
       content: requiredStringValue(value.content, 'content'),
+      ...decodeReasoningOutput(value),
       modelOutput,
-      ...(reasoningSummary !== undefined ? { reasoningSummary } : {}),
       finalResponseReceived: requiredBoolean(value.finalResponseReceived, 'finalResponseReceived'),
       ...(diagnostic ? { diagnostic } : {})
     });
@@ -845,12 +873,8 @@ const AGENT_EVENT_DECODERS = {
     const providerState =
       value.providerState === undefined ? undefined : decodeProviderStateReference(value.providerState);
     const response = parseModelResponse(value.response);
-    if (
-      response.providerState !== undefined ||
-      response.reasoning !== undefined ||
-      response.raw !== undefined
-    )
-      throw malformed('provider settlement contains non-durable provider or private reasoning data');
+    if (response.providerState !== undefined || response.raw !== undefined)
+      throw malformed('provider settlement contains non-durable provider state or raw response data');
     return Object.freeze({
       type: 'provider.attempt.settled',
       ...decodeTurnIdentity(value),
@@ -1276,9 +1300,10 @@ function decodeRunLimits(value: JsonValue | undefined): AgentRunLimits {
     'activeImageCount',
     'activeImageBytes',
     'activeImageTokens',
-    'knownCost',
+    'knownCost'
   ]);
-  const knownCost = object.knownCost === undefined ? undefined : requiredObject(object.knownCost, 'limits.knownCost');
+  const knownCost =
+    object.knownCost === undefined ? undefined : requiredObject(object.knownCost, 'limits.knownCost');
   if (knownCost) exact(knownCost, ['amount', 'currency']);
   const optional = Object.fromEntries(
     ['modelTurns', 'totalToolCalls', 'elapsedMs', 'promptTokens', 'completionTokens'].flatMap((field) =>
@@ -1291,10 +1316,14 @@ function decodeRunLimits(value: JsonValue | undefined): AgentRunLimits {
     activeImageBytes: positiveInteger(object.activeImageBytes, 'limits.activeImageBytes'),
     activeImageTokens: positiveInteger(object.activeImageTokens, 'limits.activeImageTokens'),
     ...optional,
-    ...(knownCost === undefined ? {} : { knownCost: Object.freeze({
-      amount: positiveNumber(knownCost.amount, 'limits.knownCost.amount'),
-      currency: requiredString(knownCost.currency, 'limits.knownCost.currency')
-    }) })
+    ...(knownCost === undefined
+      ? {}
+      : {
+          knownCost: Object.freeze({
+            amount: positiveNumber(knownCost.amount, 'limits.knownCost.amount'),
+            currency: requiredString(knownCost.currency, 'limits.knownCost.currency')
+          })
+        })
   });
 }
 function decodeInferenceRequestFingerprint(
@@ -1673,13 +1702,14 @@ function decodeRange(
 }
 function decodePromptMaterial(value: JsonValue | undefined): PromptMaterial {
   const object = requiredObject(value, 'prompt material');
-  exact(object, ['id', 'task', 'instructions', 'context', 'tools', 'outputContract', 'metadata']);
+  exact(object, ['id', 'task', 'images', 'instructions', 'context', 'tools', 'outputContract', 'metadata']);
   const outputContract =
     object.outputContract === undefined ? undefined : decodeOutputContract(object.outputContract);
   const metadata = optionalStringRecord(object.metadata, 'material.metadata');
   return Object.freeze({
     id: requiredString(object.id, 'material.id'),
     task: requiredStringValue(object.task, 'material.task'),
+    ...(object.images === undefined ? {} : { images: parseSessionImages(object.images) }),
     instructions: requiredArray(object.instructions, 'material.instructions').map((item, index) =>
       decodePromptInstruction(item, `material.instructions[${String(index)}]`)
     ),
@@ -2030,4 +2060,13 @@ function exact(value: JsonObject, keys: readonly string[]): void {
 }
 function malformed(message: string): Error {
   return new Error(`Malformed Agent event: ${message}.`);
+}
+
+function decodeReasoningOutput(value: JsonObject) {
+  const reasoning = optionalStringValue(value.reasoning, 'reasoning');
+  const reasoningSummary = optionalStringValue(value.reasoningSummary, 'reasoningSummary');
+  return {
+    ...(reasoning === undefined ? {} : { reasoning }),
+    ...(reasoningSummary === undefined ? {} : { reasoningSummary })
+  };
 }

@@ -69,8 +69,12 @@ async function codexFixture(t, { expires = 4102444800 } = {}) {
 
 test('Codex flags are explicit, dry mode does not read auth, and subscription endpoints are restricted', async (t) => {
   const fixture = await codexFixture(t);
-  t.mock.method(globalThis, 'fetch', () => {
-    assert.fail('No network in dry/capabilities mode.');
+  const discovery = t.mock.method(globalThis, 'fetch', (url, init) => {
+    assert.equal(new URL(url).pathname.endsWith('/models'), true);
+    assert.equal(init?.method ?? 'GET', 'GET');
+    return Promise.resolve(
+      new Response(JSON.stringify({ models: [] }), { headers: { 'content-type': 'application/json' } })
+    );
   });
   const argv = [
     '--provider',
@@ -96,6 +100,7 @@ test('Codex flags are explicit, dry mode does not read auth, and subscription en
   );
   assert.ok(dry.availability.every((item) => item.status === 'not-probed'));
   assert.equal(dry.provider.credentialsPresent, null);
+  assert.equal(discovery.mock.callCount(), 0);
   const report = await evaluateContextPolicies({ ...options, mode: 'capabilities' }, {});
   assert.equal(report.provider.id, 'openai-codex');
   assert.equal(report.provider.model, 'gpt-5.6');

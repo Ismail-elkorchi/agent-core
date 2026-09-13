@@ -5,9 +5,18 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "include": ["src"],
+  "include": [
+    "src"
+  ],
   "references": [
-    { "path": "../effects" },
-    { "path": "../json" }
+    {
+      "path": "../effects"
+    },
+    {
+      "path": "../json"
+    },
+    {
+      "path": "../auth"
+    }
   ]
 }

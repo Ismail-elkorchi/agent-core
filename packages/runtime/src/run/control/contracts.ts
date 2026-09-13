@@ -1,4 +1,3 @@
-import { assertAgentRunStateInvariants } from './state-invariants.js';
 import { decodeEffectExecutionState, type EffectExecutionState } from '@agent-core/effects';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
 import { hashJson } from '@agent-core/persistence';
@@ -6,17 +5,20 @@ import {
   decodePromptContextItemInput,
   type PromptContextItemInput
 } from '../../inference/prompt-material.js';
+import { parseSessionImages } from '../../session/images.js';
 import {
   decodeAgentRunBudgetState,
   type AgentRunBudgetState,
   type AgentTurnIdentity
 } from '../contracts.js';
+import { assertAgentRunStateInvariants } from './state-invariants.js';
 import { decodeToolPhase, isToolCallStartable, type AgentToolPhase } from './tool-state.js';
 
 export type { AgentToolCallPlanRecord, AgentToolPhase, AgentToolSettlementRecord } from './tool-state.js';
 
 export interface AgentRunStateInput {
   readonly task: string;
+  readonly images?: readonly import('../../session/images.js').SessionImageInput[];
   readonly instructions: readonly string[];
   readonly contextItems: readonly PromptContextItemInput[];
 }
@@ -419,9 +421,10 @@ export function decodeAgentRunState(value: unknown): AgentRunState {
 
 export function decodeAgentRunStateInput(value: unknown): AgentRunStateInput {
   const input = object(value, 'run input');
-  exact(input, ['task', 'instructions', 'contextItems']);
+  exact(input, ['task', 'instructions', 'contextItems', 'images']);
   return Object.freeze({
     task: nonempty(input.task, 'task'),
+    ...(input.images === undefined ? {} : { images: parseSessionImages(input.images) }),
     instructions: stringArray(input.instructions, 'instructions'),
     contextItems: Object.freeze(
       array(input.contextItems, 'contextItems').map((item) => decodePromptContextItemInput(item))

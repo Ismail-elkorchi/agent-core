@@ -8,6 +8,18 @@ import { JsonlSessionRepository } from '@agent-core/runtime/node';
 
 const binding = { schemaId: 'tests/branch-pages', schemaVersion: 1, subject: {} };
 
+test('session summaries reuse the incremental index without reading transcript bodies', async (t) => {
+  const { repository, memory, session } = await fixture(t, 3);
+  const summaries = await repository.list();
+  assert.deepEqual(summaries, await memory.list());
+  assert.match(summaries[0].preview, /^NEEDLE outside retained history/);
+  assert.equal(repository.historyReadMetrics(session.id).bodyRecordsRead, 0);
+  await repository.appendInput(session, { runId: 'later', task: 'Later request' });
+  const updated = await repository.list();
+  assert.equal(updated[0].preview, summaries[0].preview);
+  assert.ok(updated[0].updatedAt >= summaries[0].updatedAt);
+});
+
 async function fixture(t, count = 700) {
   const root = await mkdtemp(path.join(tmpdir(), 'branch-pages-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -44,7 +56,7 @@ async function fixture(t, count = 700) {
             reasoningTokens: 0,
             knownCosts: {},
             pricingStatus: 'unknown',
-            unknownPricedTokens: 0,
+            unknownPricedTokens: 0
           }
         })
       );
@@ -140,7 +152,13 @@ test('snapshot cursors remain stable after append and reject another branch, ses
 test('oversized page entries stay available through explicit source reads', async (t) => {
   const { repository, session } = await fixture(t, 1);
   const page = await repository.readBranchPage(session);
-  await assert.rejects(repository.readBranchPage(session, { maxBytes: 100 }), /read this entry explicitly/);
+  const bounded = await repository.readBranchPage(session, { maxBytes: 100 });
+  assert.equal(bounded.entries.length, 0);
+  assert.ok(bounded.oversizedEntry.bytes > 100);
+  assert.equal(
+    (await repository.readBranchEntry(session, bounded.boundary, bounded.oversizedEntry.entryId)).id,
+    bounded.oversizedEntry.entryId
+  );
   assert.equal(
     (await repository.readBranchEntry(session, page.boundary, page.entries[0].id)).task,
     page.entries[0].task

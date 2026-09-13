@@ -50,7 +50,11 @@ export async function readBranchPage(
   request: SessionBranchPageRequest = {}
 ): Promise<SessionBranchPage> {
   const limit = boundedInteger(request.limit ?? 64, 256, 'History page entry limit');
-  const maxBytes = boundedInteger(request.maxBytes ?? 256 * 1024, 8 * 1024 * 1024, 'History page byte limit');
+  const maxBytes = boundedInteger(
+    request.maxBytes ?? 256 * 1024,
+    8 * 1024 * 1024,
+    'History page byte limit'
+  );
   const boundary = request.cursor?.boundary ?? branchBoundary(source, request.leafId);
   const next = request.cursor?.entryId ?? boundary.leafId;
   if (next !== null) assertBranchEntry(source, boundary, next);
@@ -63,14 +67,15 @@ export async function readBranchPage(
   let first = index;
   let last = index;
   let bytes = 0;
+  let oversizedEntry: SessionBranchPage['oversizedEntry'];
   while (index >= 0 && index < path.ids.length && entries.length < limit) {
     const entryId = path.ids[index];
     if (entryId === undefined) break;
     const metadata = position(source, entryId);
-    if (metadata.bytes > maxBytes && entries.length === 0)
-      throw new RangeError(
-        `History entry ${entryId} exceeds the page byte limit; read this entry explicitly.`
-      );
+    if (metadata.bytes > maxBytes && entries.length === 0) {
+      oversizedEntry = Object.freeze({ entryId, bytes: metadata.bytes });
+      break;
+    }
     if (bytes + metadata.bytes > maxBytes) break;
     entries.push(await source.read(entryId));
     bytes += metadata.bytes;
@@ -83,6 +88,7 @@ export async function readBranchPage(
   return Object.freeze({
     boundary,
     entries: Object.freeze(step < 0 ? entries.reverse() : entries),
+    ...(oversizedEntry === undefined ? {} : { oversizedEntry }),
     ...(older === undefined ? {} : { older: Object.freeze({ boundary, entryId: older }) }),
     ...(newer === undefined ? {} : { newer: Object.freeze({ boundary, entryId: newer }) })
   });
@@ -111,6 +117,7 @@ export async function searchBranch(
   return Object.freeze({
     boundary: page.boundary,
     matches: Object.freeze(matches),
+    ...(page.oversizedEntry === undefined ? {} : { oversizedEntry: page.oversizedEntry }),
     ...(page.older === undefined ? {} : { older: Object.freeze({ ...page.older, query: request.query }) })
   });
 }

@@ -1,3 +1,4 @@
+import { apiKeyAuthentication, FileCredentialStore } from '@agent-core/auth';
 import { parseJsonObject, parseJsonValue, type JsonObject } from '@agent-core/json';
 import {
   assertModelRequestSupported,
@@ -12,8 +13,10 @@ import {
   parseModelResponse,
   requiredProtocolRevision,
   type CompiledModelRequest,
-  type ModelCompilationOptions,
   type ModelCapabilities,
+  type ModelCatalogEntry,
+  type ModelCompilationOptions,
+  type ModelDiscoveryOptions,
   type ModelImage,
   type ModelInputItem,
   type ModelModality,
@@ -82,6 +85,8 @@ export class OpenRouterProvider implements ModelProvider {
   readonly implementationId = 'agent-core.provider.openrouter@1';
   private readonly compiledRequests = new WeakMap<ModelRequest, CompiledModelRequest>();
   private readonly apiKey: string | undefined;
+  private readonly ownsCredentials: boolean;
+  private readonly credentials = new FileCredentialStore();
   private readonly baseUrl: string;
   private readonly defaultModel: string;
   private readonly appUrl: string | undefined;
@@ -95,6 +100,7 @@ export class OpenRouterProvider implements ModelProvider {
 
   constructor(options: OpenRouterProviderOptions = {}) {
     this.apiKey = options.apiKey ?? process.env.OPENROUTER_API_KEY;
+    this.ownsCredentials = options.apiKey === undefined;
     this.baseUrl = stripTrailingSlash(options.baseUrl ?? OPENROUTER_BASE_URL);
     this.defaultModel = options.model ?? OPENROUTER_DEFAULT_MODEL;
     this.appUrl = options.appUrl ?? process.env.OPENROUTER_APP_URL;
@@ -111,6 +117,47 @@ export class OpenRouterProvider implements ModelProvider {
       displayName: 'OpenRouter model provider',
       defaultModel: this.defaultModel
     };
+  }
+
+  authentication() {
+    if (!this.ownsCredentials) return undefined;
+    return apiKeyAuthentication(this.credentials, this.id, 'OPENROUTER_API_KEY');
+  }
+
+  private async accessToken(): Promise<string> {
+    const token = this.apiKey ?? (await this.credentials.read(this.id))?.token;
+    if (!token?.trim())
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'invalid_request',
+        message: 'OpenRouter API key is required. Sign in or set OPENROUTER_API_KEY.'
+      });
+    return token.trim();
+  }
+
+  async listModels(options: ModelDiscoveryOptions = {}): Promise<readonly ModelCatalogEntry[]> {
+    options.signal?.throwIfAborted();
+    const records = options.refresh
+      ? await this.fetchModelCatalog(options.signal)
+      : await this.modelCatalog();
+    options.signal?.throwIfAborted();
+    if (options.refresh) {
+      this.modelCatalogPromise = Promise.resolve(records);
+      this.modelCatalogExpiresAt = Date.now() + this.catalogTtlMs;
+    }
+    return records.map((record) => {
+      if (!record.id)
+        throw new ModelProviderError({
+          provider: this.id,
+          code: 'malformed_response',
+          message: 'Catalog model ID is missing.'
+        });
+      return {
+        id: record.id,
+        ...(record.name === undefined ? {} : { displayName: record.name }),
+        ...(record.description === undefined ? {} : { description: record.description })
+      };
+    });
   }
 
   async describeModel(model: string): Promise<ModelProfile> {
@@ -397,13 +444,7 @@ export class OpenRouterProvider implements ModelProvider {
   private async validateRequest(request: ModelRequest): Promise<ModelRequest> {
     const owned = parseModelRequest(request);
     throwIfAborted(owned.signal);
-    if (!this.apiKey?.trim()) {
-      throw new ModelProviderError({
-        provider: this.id,
-        code: 'invalid_request',
-        message: 'OpenRouter API key is required. Set OPENROUTER_API_KEY or pass apiKey.'
-      });
-    }
+    await this.accessToken();
     assertModelRequestSupported(await this.describeModel(owned.model), owned);
     for (const [index, item] of owned.messages.entries())
       if (item.role === 'protocol')
@@ -418,11 +459,12 @@ export class OpenRouterProvider implements ModelProvider {
     return owned;
   }
 
-  private async fetchModelCatalog(): Promise<readonly OpenRouterModelRecord[]> {
+  private async fetchModelCatalog(signal?: AbortSignal): Promise<readonly OpenRouterModelRecord[]> {
     try {
       const response = await this.fetchImpl(`${this.baseUrl}/models`, {
         method: 'GET',
-        headers: this.headers(false)
+        headers: this.headers(false),
+        ...(signal === undefined ? {} : { signal })
       });
       await throwIfBadResponse(this.id, response);
       const payload = await decodeJsonResponse(
@@ -449,20 +491,13 @@ export class OpenRouterProvider implements ModelProvider {
     stream: boolean,
     options?: ModelTransportOptions
   ): Promise<Response> {
-    const apiKey = this.apiKey?.trim();
-    if (!apiKey) {
-      throw new ModelProviderError({
-        provider: this.id,
-        code: 'invalid_request',
-        message: 'OpenRouter API key is required. Set OPENROUTER_API_KEY or pass apiKey.'
-      });
-    }
+    const apiKey = await this.accessToken();
     const signal = modelTransportSignal(request, options);
     signal?.throwIfAborted();
     try {
       const init: RequestInit = {
         method: 'POST',
-        headers: this.headers(true),
+        headers: { ...this.headers(true), Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify({ ...(await this.compileRequest(request)).body, stream })
       };
       if (signal) {
@@ -476,7 +511,7 @@ export class OpenRouterProvider implements ModelProvider {
     }
   }
 
-  private headers(includeJson: boolean): HeadersInit {
+  private headers(includeJson: boolean): Record<string, string> {
     const headers: Record<string, string> = {};
     const apiKey = this.apiKey?.trim();
     if (apiKey) {

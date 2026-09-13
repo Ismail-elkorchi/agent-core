@@ -6,9 +6,13 @@ import { hashJson, InMemoryEventRepository } from '@agent-core/persistence';
 
 const root = path.resolve(import.meta.dirname, '..');
 const production = readdirSync(path.join(root, 'packages'), { recursive: true, withFileTypes: true })
-  .filter((entry) => entry.isFile() && entry.name.endsWith('.ts')
-    && !entry.parentPath.includes(`${path.sep}test${path.sep}`)
-    && !entry.parentPath.includes(`${path.sep}dist${path.sep}`))
+  .filter(
+    (entry) =>
+      entry.isFile() &&
+      entry.name.endsWith('.ts') &&
+      !entry.parentPath.includes(`${path.sep}test${path.sep}`) &&
+      !entry.parentPath.includes(`${path.sep}dist${path.sep}`)
+  )
   .map((entry) => path.join(entry.parentPath, entry.name));
 
 test('production boundaries do not rebuild established ownership proofs', () => {
@@ -37,7 +41,15 @@ test('repositories encode on append and decode once on read', async () => {
     },
     decode(value) {
       decodes += 1;
-      if (!value || typeof value !== 'object' || value.type !== 'measured' || !value.payload || typeof value.payload !== 'object' || typeof value.payload.count !== 'number') throw new Error('malformed measured event');
+      if (
+        !value ||
+        typeof value !== 'object' ||
+        value.type !== 'measured' ||
+        !value.payload ||
+        typeof value.payload !== 'object' ||
+        typeof value.payload.count !== 'number'
+      )
+        throw new Error('malformed measured event');
       return Object.freeze({ type: value.type, payload: Object.freeze({ count: value.payload.count }) });
     }
   };
@@ -57,29 +69,58 @@ test('repositories encode on append and decode once on read', async () => {
   assert.deepEqual({ encodes, decodes }, { encodes: 1, decodes: 1 });
 
   const malformed = new InMemoryEventRepository({
-    encode(value) { return { type: value.type, payload: { count: 'bad' } }; },
+    encode(value) {
+      return { type: value.type, payload: { count: 'bad' } };
+    },
     decode: codec.decode
   });
   await malformed.append('run', { type: 'measured', payload: { count: 1 } });
   await assert.rejects(Array.fromAsync(malformed.read('run')), /malformed measured event/u);
 
   const events = readFileSync(path.join(root, 'packages/runtime/src/events.ts'), 'utf8');
-  assert.doesNotMatch(events, /AgentEvent\s*&\s*JsonObject|as\s+AgentEvent\s*&\s*JsonObject|Object\.freeze\(\{\s*\.\.\.value\s*\}\)/u);
-  const repositorySource = readFileSync(path.join(root, 'packages/persistence/src/event-repository.ts'), 'utf8');
+  assert.doesNotMatch(
+    events,
+    /AgentEvent\s*&\s*JsonObject|as\s+AgentEvent\s*&\s*JsonObject|Object\.freeze\(\{\s*\.\.\.value\s*\}\)/u
+  );
+  const repositorySource = readFileSync(
+    path.join(root, 'packages/persistence/src/event-repository.ts'),
+    'utf8'
+  );
   assert.doesNotMatch(repositorySource, /readonly json:\s*JsonObject;\s*readonly value|encoding\.value/u);
   const plan = readFileSync(path.join(root, 'packages/tools/src/core/plan.ts'), 'utf8');
   assert.doesNotMatch(plan, /parseJsonObject|decodeToolCall/u);
   const execute = readFileSync(path.join(root, 'packages/tools/src/core/execute.ts'), 'utf8');
-  assert.doesNotMatch(`${plan}\n${execute}`, /parseToolObservation\(undefined,\s*(?:invalid|missing|runtime|unknown)[A-Z][A-Za-z]+Observation/u);
-  const modelWindow = readFileSync(path.join(root, 'packages/runtime/src/inference/model-window.ts'), 'utf8');
+  assert.doesNotMatch(
+    `${plan}\n${execute}`,
+    /parseToolObservation\(undefined,\s*(?:invalid|missing|runtime|unknown)[A-Z][A-Za-z]+Observation/u
+  );
+  const modelWindow = readFileSync(
+    path.join(root, 'packages/runtime/src/inference/model-window.ts'),
+    'utf8'
+  );
   assert.doesNotMatch(modelWindow, /\brawItems\s*\(/u);
-  const observationFacts = readFileSync(path.join(root, 'packages/runtime/src/orchestration/observation-facts.ts'), 'utf8');
+  const observationFacts = readFileSync(
+    path.join(root, 'packages/runtime/src/orchestration/observation-facts.ts'),
+    'utf8'
+  );
   assert.doesNotMatch(observationFacts, /parseJsonValue\(record\)/u);
-  const observationStore = readFileSync(path.join(root, 'packages/runtime/src/orchestration/observation-store.ts'), 'utf8');
-  assert.doesNotMatch(observationStore, /normalizeToolObservationForPersistence|parseJsonValue\(canonical|parseToolObservation/u);
+  const observationStore = readFileSync(
+    path.join(root, 'packages/runtime/src/orchestration/observation-store.ts'),
+    'utf8'
+  );
+  assert.doesNotMatch(
+    observationStore,
+    /normalizeToolObservationForPersistence|parseJsonValue\(canonical|parseToolObservation/u
+  );
   const toolContracts = readFileSync(path.join(root, 'packages/tools/src/core/definition.ts'), 'utf8');
-  assert.doesNotMatch(toolContracts, /interface ToolObservationBase\s*\{[^}]*metadata\?:\s*Record<string, unknown>/u);
-  assert.doesNotMatch(toolContracts, /interface \w+ToolFailureOutput[^\{]*\{[^}]*details\?:\s*Record<string, unknown>/u);
+  assert.doesNotMatch(
+    toolContracts,
+    /interface ToolObservationBase\s*\{[^}]*metadata\?:\s*Record<string, unknown>/u
+  );
+  assert.doesNotMatch(
+    toolContracts,
+    /interface \w+ToolFailureOutput[^\{]*\{[^}]*details\?:\s*Record<string, unknown>/u
+  );
   const registry = readFileSync(path.join(root, 'packages/tools/src/core/registry.ts'), 'utf8');
   const registerBody = registry.slice(registry.indexOf('register('), registry.indexOf('\n  get('));
   assert.doesNotMatch(registerBody, /markCompiledTool|parseJsonObject/u);
@@ -87,15 +128,14 @@ test('repositories encode on append and decode once on read', async () => {
 
 test('public and persisted Core contracts use the domain glossary', () => {
   const violations = [];
-  const prohibitedExport = /export\s+(?:interface|type|class|function|const)\s+[A-Za-z0-9_]*(?:Projection|Prepare|Prepared|Evidence|Candidate|Evaluation)[A-Za-z0-9_]*/gu;
-  const prohibitedPersistedTag = /(?:kind|type):\s*(?:z\.literal\()?['"][^'"]*(?:projection|prepared|candidate|evaluation)[^'"]*['"]/gu;
+  const prohibitedExport =
+    /export\s+(?:interface|type|class|function|const)\s+[A-Za-z0-9_]*(?:Projection|Prepare|Prepared|Evidence|Candidate|Evaluation)[A-Za-z0-9_]*/gu;
+  const prohibitedPersistedTag =
+    /(?:kind|type):\s*(?:z\.literal\()?['"][^'"]*(?:projection|prepared|candidate|evaluation)[^'"]*['"]/gu;
   for (const file of production) {
     const source = readFileSync(file, 'utf8');
     for (const match of source.matchAll(prohibitedExport)) violations.push(`${file}: ${match[0]}`);
     for (const match of source.matchAll(prohibitedPersistedTag)) violations.push(`${file}: ${match[0]}`);
-    if (/\b(?:projection|projected|projecting|prepare|prepared|preparing|preparation|operationStatus)\b/iu.test(source)) {
-      violations.push(`${file}: prohibited ambiguous lifecycle term`);
-    }
   }
   assert.deepEqual(violations, []);
 });

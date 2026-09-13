@@ -17,6 +17,7 @@ import type { PromptContextItemInput, PromptInstructionBlock } from './prompt-ma
 import type { InferenceService } from './service.js';
 
 export interface RuntimeContextBootstrapOptions {
+  readonly artifacts?: import('@agent-core/persistence').ArtifactRepository;
   readonly nativeTransform?: {
     readonly inference: InferenceService;
     readonly ownerId: () => string | Promise<string>;
@@ -90,14 +91,21 @@ export function createRuntimeContextBootstrapValidator(
       // Calls have settled at this boundary. Active user inputs remain explicit;
       // completed exchanges can be transformed without ending their owning run.
       const finalized = new Set(view.runFinalizations.map((run) => run.runId));
-      const represented = selected.filter((entry) => 'runId' in entry &&
-        (entry.type !== 'input' || finalized.has(entry.runId)));
+      const represented = selected.filter(
+        (entry) => 'runId' in entry && (entry.type !== 'input' || finalized.has(entry.runId))
+      );
       if (represented.length === 0)
         throw new Error(
           'context_admission_failed: no settled source window is available for native transformation.'
         );
       const transformWindow = new ModelWindow();
-      replaySourceEntries(transformWindow, view.cut.sessionId, represented, selection.representations);
+      await replaySourceEntries(
+        transformWindow,
+        view.cut.sessionId,
+        represented,
+        selection.representations,
+        options.artifacts
+      );
       transformWindow.invalidateProviderState({
         provider: options.provider.id,
         model: options.model,
@@ -121,11 +129,12 @@ export function createRuntimeContextBootstrapValidator(
       for (const [index, item] of transformed.result.input.entries())
         window.recordSourceItem(`${invocationId}:${String(index)}`, item);
       const representedIds = new Set(sources.map((source) => source.entryId));
-      replaySourceEntries(
+      await replaySourceEntries(
         window,
         view.cut.sessionId,
         selected.filter((entry) => !representedIds.has(sourceRef(view.cut.sessionId, entry).entryId)),
-        selection.representations
+        selection.representations,
+        options.artifacts
       );
       providerState = encodeContextTransformReference({
         format: 'agent-core.context-transform/1',
@@ -135,7 +144,14 @@ export function createRuntimeContextBootstrapValidator(
         artifact: transformed.artifact,
         sources
       });
-    } else replaySourceEntries(window, view.cut.sessionId, selected, selection.representations);
+    } else
+      await replaySourceEntries(
+        window,
+        view.cut.sessionId,
+        selected,
+        selection.representations,
+        options.artifacts
+      );
     window.invalidateProviderState({
       provider: options.provider.id,
       model: options.model,
@@ -157,7 +173,7 @@ export function createRuntimeContextBootstrapValidator(
     }
     const tools = await options.tools();
     const limits = requestWindowForModel(profile, options.maxOutputTokens);
-    const assembled = new ModelRequestAssembler().assemble({
+    const assembled = await new ModelRequestAssembler(undefined, options.artifacts).assemble({
       window,
       task: (await options.task?.()) ?? '',
       instructions: options.instructions ?? [],

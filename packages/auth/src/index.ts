@@ -135,7 +135,7 @@ export class EnvBearerTokenProvider implements BearerTokenProvider {
 
   constructor(
     private readonly envVar: string,
-    options: { env?: NodeJS.ProcessEnv; label?: string; provider?: string } = {}
+    options: { env?: Readonly<Record<string, string | undefined>>; label?: string; provider?: string } = {}
   ) {
     this.env = options.env ?? process.env;
     this.info = {
@@ -146,7 +146,7 @@ export class EnvBearerTokenProvider implements BearerTokenProvider {
     };
   }
 
-  private readonly env: NodeJS.ProcessEnv;
+  private readonly env: Readonly<Record<string, string | undefined>>;
 
   describe(): AuthSourceInfo {
     return this.info;
@@ -468,8 +468,14 @@ function parseCredentialRecord(value: unknown, key: string): CredentialRecord | 
   const issuedAt = optionalNumber(value.issuedAt, 'issuedAt', key);
   const expiresAt = optionalNumber(value.expiresAt, 'expiresAt', key);
   const metadata = isJsonObject(value.metadata) ? value.metadata : undefined;
-  const refreshToken = typeof value.refreshToken === 'string' && value.refreshToken.trim().length > 0 ? value.refreshToken.trim() : undefined;
-  const tokenType = typeof value.tokenType === 'string' && value.tokenType.trim().length > 0 ? value.tokenType.trim() : undefined;
+  const refreshToken =
+    typeof value.refreshToken === 'string' && value.refreshToken.trim().length > 0
+      ? value.refreshToken.trim()
+      : undefined;
+  const tokenType =
+    typeof value.tokenType === 'string' && value.tokenType.trim().length > 0
+      ? value.tokenType.trim()
+      : undefined;
   const scopes = parseScopes(value.scopes, key);
   return {
     token,
@@ -559,11 +565,13 @@ function delay(ms: number, signal: AbortSignal | undefined): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       const reason: unknown = signal.reason;
-      reject(new AuthError({
-        code: 'aborted',
-        message: typeof reason === 'string' ? reason : 'Device-code polling aborted.',
-        cause: reason
-      }));
+      reject(
+        new AuthError({
+          code: 'aborted',
+          message: typeof reason === 'string' ? reason : 'Device-code polling aborted.',
+          cause: reason
+        })
+      );
       return;
     }
     const timeout = setTimeout(() => {
@@ -573,11 +581,13 @@ function delay(ms: number, signal: AbortSignal | undefined): Promise<void> {
     const onAbort = () => {
       cleanup();
       const reason: unknown = signal?.reason;
-      reject(new AuthError({
-        code: 'aborted',
-        message: typeof reason === 'string' ? reason : 'Device-code polling aborted.',
-        cause: reason
-      }));
+      reject(
+        new AuthError({
+          code: 'aborted',
+          message: typeof reason === 'string' ? reason : 'Device-code polling aborted.',
+          cause: reason
+        })
+      );
     };
     const cleanup = () => {
       clearTimeout(timeout);
@@ -586,3 +596,9 @@ function delay(ms: number, signal: AbortSignal | undefined): Promise<void> {
     signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
+
+export {
+  apiKeyAuthentication,
+  type DeviceAuthenticationChallenge,
+  type ProviderAuthentication
+} from './interaction.js';

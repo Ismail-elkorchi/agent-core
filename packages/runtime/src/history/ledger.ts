@@ -1,6 +1,6 @@
-import type { ArtifactRepository, EventEnvelope, EventRepository } from '@agent-core/persistence';
 import { parseJsonValue } from '@agent-core/json';
 import type { ModelOutputItem } from '@agent-core/model';
+import type { ArtifactRepository, EventEnvelope, EventRepository } from '@agent-core/persistence';
 import type { AgentEvent } from '../events.js';
 import type {
   SessionAssistantEntry,
@@ -238,6 +238,8 @@ function publicEventEntry(
       turnIndex: event.turnIndex,
       requestAttempt: event.requestAttempt,
       content: event.content,
+      ...(event.reasoning === undefined ? {} : { reasoning: event.reasoning }),
+      ...(event.reasoningSummary === undefined ? {} : { reasoningSummary: event.reasoningSummary }),
       completeness: event.modelOutput.status,
       ...(output ? { output } : {})
     });

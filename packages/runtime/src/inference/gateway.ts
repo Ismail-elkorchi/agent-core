@@ -1,17 +1,17 @@
 import {
+  compileModelRequest,
   createModelRequest,
   parseModelResponse,
   parseModelStreamEvent,
+  type CompiledModelRequest,
+  type ModelCompilationOptions,
   type ModelProfile,
-  type ModelTransportOptions,
   type ModelProvider,
   type ModelProviderSession,
   type ModelRequest,
   type ModelResponse,
   type ModelStreamEvent,
-  compileModelRequest,
-  type ModelCompilationOptions,
-  type CompiledModelRequest
+  type ModelTransportOptions
 } from '@agent-core/model';
 import { requestWindowForModel } from '../orchestration/model-request.js';
 import { ModelStreamInterruptedError } from '../orchestration/model-stream.js';
@@ -48,8 +48,10 @@ export class InferenceGateway {
     const body = { ...request };
     delete body.signal;
     const policy = {
-      outputReservation: requestWindowForModel(profile, options?.outputReservation ?? request.maxOutputTokens)
-        .maxOutputTokens
+      outputReservation: requestWindowForModel(
+        profile,
+        options?.outputReservation ?? request.maxOutputTokens
+      ).maxOutputTokens
     };
     const compiled = this.provider.compileRequest
       ? await this.provider.compileRequest(request, policy)
@@ -58,6 +60,18 @@ export class InferenceGateway {
           profile,
           ...policy,
           body,
+          payloadPaths: request.messages.flatMap((message, messageIndex) => [
+            ...(message.images?.map((_image, imageIndex) => [
+              'messages',
+              messageIndex,
+              'images',
+              imageIndex,
+              'data'
+            ]) ?? []),
+            ...(message.parts?.flatMap((part, partIndex) =>
+              part.type === 'image' ? [['messages', messageIndex, 'parts', partIndex, 'image', 'data']] : []
+            ) ?? [])
+          ]),
           endpoint: profile.capabilities.protocol?.endpoint ?? this.provider.id
         });
     if (
@@ -92,6 +106,7 @@ export class InferenceGateway {
     let response: ModelResponse | undefined;
     let content = '';
     let reasoningSummary = '';
+    let reasoning = '';
     let terminalEvents = 0;
     try {
       for await (const rawEvent of stream()) {
@@ -104,12 +119,21 @@ export class InferenceGateway {
           continue;
         }
         if (event.type === 'content') content = event.accumulated;
-        if (event.type === 'reasoning' && event.channel === 'summary')
-          reasoningSummary = event.accumulatedReasoning;
+        if (event.type === 'reasoning') {
+          if (event.channel === 'summary') reasoningSummary = event.accumulatedReasoning;
+          else reasoning = event.accumulatedReasoning;
+        }
         await input.onStreamEvent?.(event);
       }
     } catch (cause) {
-      throw interrupted(input.turnIndex, cause, content, reasoningSummary, response !== undefined);
+      throw interrupted(
+        input.turnIndex,
+        cause,
+        content,
+        reasoningSummary,
+        reasoning,
+        response !== undefined
+      );
     }
     if (!response) {
       throw interrupted(
@@ -117,12 +141,14 @@ export class InferenceGateway {
         new Error('Model stream ended without a final response.'),
         content,
         reasoningSummary,
+        reasoning,
         false
       );
     }
     return Object.freeze({
       ...response,
       ...(response.content.length === 0 && content.length > 0 ? { content } : {}),
+      ...(!response.reasoning && reasoning.length > 0 ? { reasoning } : {}),
       ...(!response.reasoningSummary && reasoningSummary.length > 0 ? { reasoningSummary } : {})
     });
   }
@@ -143,6 +169,7 @@ function interrupted(
   cause: unknown,
   content: string,
   reasoningSummary: string,
+  reasoning: string,
   finalResponseReceived: boolean
 ): ModelStreamInterruptedError {
   return new ModelStreamInterruptedError({
@@ -150,6 +177,7 @@ function interrupted(
     cause,
     content,
     finalResponseReceived,
+    ...(reasoning.length > 0 ? { reasoning } : {}),
     ...(reasoningSummary.length > 0 ? { reasoningSummary } : {})
   });
 }

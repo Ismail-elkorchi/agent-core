@@ -24,7 +24,7 @@ const modelProfile = {
 };
 const imageProfile = { ...modelProfile, modalities: { input: ['text', 'image'], output: ['text'] } };
 
-test('application context follows retained history and precedes the current request and its tool responses', () => {
+test('application context follows retained history and precedes the current request and its tool responses', async () => {
   const window = new ModelWindow();
   window.recordSourceItem('request-1', { role: 'user', content: 'Retain this requirement.' });
   window.recordSourceItem('answer-1', { role: 'assistant', content: 'Previous answer.' });
@@ -34,14 +34,21 @@ test('application context follows retained history and precedes the current requ
     instructions: [{ id: 'preference', role: 'user', content: 'Keep it concise.', priority: 1 }],
     tools: [],
     modelProfile,
-    contextItems: [{
-      id: 'environment', sourceUri: 'application://environment', sourceKind: 'external',
-      representation: 'full', mediaType: 'text/plain', title: 'Environment',
-      content: 'Current environment.', purpose: 'Execution context.'
-    }]
+    contextItems: [
+      {
+        id: 'environment',
+        sourceUri: 'application://environment',
+        sourceKind: 'external',
+        representation: 'full',
+        mediaType: 'text/plain',
+        title: 'Environment',
+        content: 'Current environment.',
+        purpose: 'Execution context.'
+      }
+    ]
   };
   const assembler = new ModelRequestAssembler();
-  const initial = assembler.assemble(input).messages;
+  const initial = (await assembler.assemble(input)).messages;
   assert.deepEqual(initial.slice(0, 2), [
     { role: 'user', content: 'Retain this requirement.' },
     { role: 'assistant', content: 'Previous answer.' }
@@ -53,31 +60,37 @@ test('application context follows retained history and precedes the current requ
   ]);
 
   window.recordModelOutput({
-    turnIndex: 1, content: '',
+    turnIndex: 1,
+    content: '',
     toolCalls: [{ id: 'read-1', type: 'function', name: 'read', input: { kind: 'json', value: {} } }]
   });
   window.recordToolResult({
-    turnIndex: 1, toolName: 'read', toolCallType: 'function', callId: 'read-1',
+    turnIndex: 1,
+    toolName: 'read',
+    toolCallType: 'function',
+    callId: 'read-1',
     immediateContent: 'Observed result.'
   });
-  const continuation = assembler.assemble(input).messages;
+  const continuation = (await assembler.assemble(input)).messages;
   assert.deepEqual(continuation.slice(0, initial.length), initial);
   assert.equal(continuation.at(-2).toolCalls[0].id, 'read-1');
   assert.equal(continuation.at(-1).role, 'tool');
   assert.equal(continuation.at(-1).toolCallId, 'read-1');
   assert.equal(continuation.at(-1).content, 'Observed result.');
 
-  const refreshed = assembler.assemble({
-    ...input,
-    contextItems: [{ ...input.contextItems[0], content: 'Updated environment.' }]
-  }).messages;
+  const refreshed = (
+    await assembler.assemble({
+      ...input,
+      contextItems: [{ ...input.contextItems[0], content: 'Updated environment.' }]
+    })
+  ).messages;
   assert.match(refreshed[2].content, /Updated environment/);
   assert.deepEqual(refreshed.slice(0, 2), continuation.slice(0, 2));
   assert.deepEqual(refreshed.slice(3), continuation.slice(3));
 });
 
-function assembleWindow(window, input) {
-  const assembled = new ModelRequestAssembler().assemble({
+async function assembleWindow(window, input) {
+  const assembled = await new ModelRequestAssembler().assemble({
     window,
     task: input.task,
     instructions: input.instructions,
@@ -162,7 +175,7 @@ test('context compaction keeps image tool protocol and public references while d
   assert.match(assembly.messages[1].content, /artifact-1-0/u);
 });
 
-test('returned context reductions cannot mutate pending manager state', () => {
+test('returned context reductions cannot mutate pending manager state', async () => {
   const manager = new ModelWindow();
   manager.recordToolResult({
     turnIndex: 1,
@@ -193,7 +206,7 @@ test('returned context reductions cannot mutate pending manager state', () => {
     reduction.afterBytes = 0;
   }, TypeError);
   assert.throws(() => reductions.push(reduction), TypeError);
-  const assembly = assembleWindow(manager, {
+  const assembly = await assembleWindow(manager, {
     task: 'continue',
     instructions: [],
     notes: [],
@@ -301,7 +314,7 @@ test('prompt context delivery does not silently omit application-selected materi
   );
 });
 
-test('ModelWindow preserves native tool call/result pairs in model-window history', () => {
+test('ModelWindow preserves native tool call/result pairs in model-window history', async () => {
   const manager = new ModelWindow();
   manager.recordModelOutput({
     turnIndex: 1,
@@ -323,7 +336,7 @@ test('ModelWindow preserves native tool call/result pairs in model-window histor
     immediateContent: '{"ok":true,"summary":"read a.txt"}'
   });
 
-  const assembly = assembleWindow(manager, {
+  const assembly = await assembleWindow(manager, {
     task: 'summarize',
     instructions: [],
     notes: [],
@@ -341,14 +354,14 @@ test('ModelWindow preserves native tool call/result pairs in model-window histor
   assert.equal(assembly.windowMessages[1].toolCallId, 'call-1');
 });
 
-test('selected source records preserve complete conversation independently of result presentation reduction', () => {
+test('selected source records preserve complete conversation independently of result presentation reduction', async () => {
   const window = new ModelWindow();
   const original = 'original constraint ' + '中'.repeat(1200) + ' KEEP THE LATE CORRECTION';
   window.recordSourceItem('source:user:1', { role: 'user', content: original });
   window.recordSourceItem('source:assistant:1', { role: 'assistant', content: 'answer '.repeat(1000) });
   window.recordSourceItem('source:user:1', { role: 'user', content: original });
   window.selectToolResultPresentations(new Map());
-  const assembled = new ModelRequestAssembler().assemble({
+  const assembled = await new ModelRequestAssembler().assemble({
     window,
     task: 'new task',
     instructions: [],

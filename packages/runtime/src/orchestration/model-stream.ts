@@ -3,6 +3,7 @@ export interface ModelStreamInterruptedInput {
   cause: unknown;
   content: string;
   reasoningSummary?: string;
+  reasoning?: string;
   finalResponseReceived: boolean;
 }
 
@@ -11,6 +12,7 @@ export class ModelStreamInterruptedError extends Error {
   override readonly cause: unknown;
   readonly content: string;
   readonly reasoningSummary: string | undefined;
+  readonly reasoning: string | undefined;
   readonly finalResponseReceived: boolean;
 
   constructor(input: ModelStreamInterruptedInput) {
@@ -20,6 +22,7 @@ export class ModelStreamInterruptedError extends Error {
     this.cause = input.cause;
     this.content = input.content;
     this.reasoningSummary = input.reasoningSummary;
+    this.reasoning = input.reasoning;
     this.finalResponseReceived = input.finalResponseReceived;
   }
 }

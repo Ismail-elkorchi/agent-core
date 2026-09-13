@@ -1,5 +1,5 @@
 import { parseJsonValue } from '@agent-core/json';
-import type { ModelOutputItem } from '@agent-core/model';
+import { parseModelSelection, type ModelOutputItem, type ModelSelection } from '@agent-core/model';
 import { hashJson, PersistenceConflictError } from '@agent-core/persistence';
 import { randomUUID } from 'node:crypto';
 import type { ContextTransitionCommit } from '../context/contracts.js';
@@ -7,7 +7,6 @@ import { historyEventSourceSchema } from '../history/schema.js';
 import {
   createAgentTerminalSnapshot,
   terminalSnapshotFingerprint,
-  type AgentEffectiveInstruction,
   type AgentTerminalSnapshot,
   type AgentToolCallAttemptIdentity,
   type AgentToolCallIdentity,
@@ -55,6 +54,7 @@ import type {
   SessionSummary,
   SessionToolCallEntry
 } from './contracts.js';
+import { parseSessionImages } from './images.js';
 import { captureObservationInput } from './observation.js';
 import { ownSessionSteeringInput, sameSessionSteering } from './steering-input.js';
 import {
@@ -108,8 +108,12 @@ export class InMemorySessionRepository implements SessionRepository {
     return this.serial(() =>
       Object.freeze(
         [...this.states.values()]
-          .map((state) =>
-            Object.freeze({
+          .map((state) => {
+            const firstInput = state.branchEntries.find((entry) => entry.type === 'input');
+            return Object.freeze({
+              ...(firstInput === undefined
+                ? {}
+                : { preview: firstInput.task.replace(/\s+/gu, ' ').slice(0, 160) }),
               id: state.header.id,
               timestamp: state.header.timestamp,
               updatedAt: sessionUpdatedAt(state),
@@ -118,8 +122,8 @@ export class InMemorySessionRepository implements SessionRepository {
               bindingSchemaId: state.header.binding.schemaId,
               bindingSchemaVersion: state.header.binding.schemaVersion,
               bindingSha256: state.header.binding.bindingSha256
-            })
-          )
+            });
+          })
           .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
       )
     );
@@ -199,7 +203,7 @@ export class InMemorySessionRepository implements SessionRepository {
 
   appendInput(
     session: SessionDescriptor,
-    input: { runId: string; task: string; instructions?: readonly AgentEffectiveInstruction[] }
+    input: Parameters<SessionRepository['appendInput']>[1]
   ): Promise<SessionInputEntry> {
     return this.serial(() => {
       const state = this.requireDescriptor(session);
@@ -216,6 +220,7 @@ export class InMemorySessionRepository implements SessionRepository {
         type: 'input' as const,
         runId: input.runId,
         task: input.task,
+        ...(input.images === undefined ? {} : { images: parseSessionImages(input.images) }),
         ...originalAcceptedInput(state.submissionRecords, input.runId),
         instructions: Object.freeze(
           (input.instructions ?? []).map((instruction) => Object.freeze({ ...instruction }))
@@ -264,6 +269,8 @@ export class InMemorySessionRepository implements SessionRepository {
       runId: string;
       identity: AgentTurnIdentity;
       content: string;
+      reasoning?: string;
+      reasoningSummary?: string;
       output?: readonly ModelOutputItem[];
       completeness?: SessionAssistantEntry['completeness'];
       source?: import('../history/contracts.js').HistoryEventSource;
@@ -283,6 +290,8 @@ export class InMemorySessionRepository implements SessionRepository {
         if (
           existing.turnIndex !== input.identity.turnIndex ||
           existing.content !== input.content ||
+          existing.reasoning !== input.reasoning ||
+          existing.reasoningSummary !== input.reasoningSummary ||
           hashJson(existing.output ?? null) !== hashJson(input.output ?? null) ||
           existing.completeness !== input.completeness ||
           hashJson(existing.source ?? null) !== hashJson(input.source ?? null)
@@ -298,6 +307,8 @@ export class InMemorySessionRepository implements SessionRepository {
         runId: input.runId,
         ...input.identity,
         content: input.content,
+        ...(input.reasoning === undefined ? {} : { reasoning: input.reasoning }),
+        ...(input.reasoningSummary === undefined ? {} : { reasoningSummary: input.reasoningSummary }),
         ...(input.source ? { source: historyEventSourceSchema.parse(input.source) } : {}),
         ...(input.output ? { output: ownSessionAssistantOutput(input.output) } : {}),
         ...(input.completeness ? { completeness: input.completeness } : {})
@@ -384,16 +395,13 @@ export class InMemorySessionRepository implements SessionRepository {
   }
   appendModelSettings(
     session: SessionDescriptor,
-    settings: { provider: string; model: string; temperature?: number; reasoningEffort?: string }
+    settings: ModelSelection
   ): Promise<SessionModelSettingsEntry> {
     return this.append(session, (parentId) =>
       Object.freeze({
         ...baseEntry(parentId),
         type: 'model_settings',
-        provider: settings.provider,
-        model: settings.model,
-        ...(settings.temperature === undefined ? {} : { temperature: settings.temperature }),
-        ...(settings.reasoningEffort === undefined ? {} : { reasoningEffort: settings.reasoningEffort })
+        ...parseModelSelection(settings)
       })
     );
   }
@@ -437,7 +445,9 @@ export class InMemorySessionRepository implements SessionRepository {
         source.type !== 'context_transition' &&
         !state.finalizations.some((finalization) => finalization.throughEntryId === entryId)
       ) {
-        throw new Error(`Session branches require a completed final or context transition entry: ${entryId}`);
+        throw new Error(
+          `Session branches require a completed final or context transition entry: ${entryId}`
+        );
       }
       const entry: SessionBranchMarkerEntry = Object.freeze({
         ...baseEntry(entryId),
@@ -634,14 +644,11 @@ function sameObservation(
 }
 function sameSessionInput(
   existing: SessionInputEntry,
-  input: {
-    readonly runId: string;
-    readonly task: string;
-    readonly instructions?: readonly AgentEffectiveInstruction[];
-  }
+  input: Parameters<SessionRepository['appendInput']>[1]
 ): boolean {
   return (
     existing.task === input.task &&
+    JSON.stringify(existing.images ?? []) === JSON.stringify(input.images ?? []) &&
     JSON.stringify(existing.instructions) === JSON.stringify(input.instructions ?? [])
   );
 }

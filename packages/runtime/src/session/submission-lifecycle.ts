@@ -1,5 +1,5 @@
 import { parseJsonObject } from '@agent-core/json';
-import type { ModelReasoningRequest } from '@agent-core/model';
+import { type ModelReasoningRequest } from '@agent-core/model';
 import { hashJson } from '@agent-core/persistence';
 import * as z from 'zod';
 import { sourceSchema } from '../history/schema.js';
@@ -18,6 +18,7 @@ import type {
   SessionSuspensionCategory,
   SessionSuspensionDescriptor
 } from './contracts.js';
+import { parseSessionImages } from './images.js';
 
 type SubmissionState = SessionPendingSubmission['state'] | 'completed' | 'failed' | 'cancelled';
 type FoldedSubmission = Omit<SessionPendingSubmission, 'state'> & {
@@ -46,11 +47,14 @@ export function ownSessionSubmissionInput(value: unknown): SessionSubmissionInpu
   if (contextItems !== undefined && !Array.isArray(contextItems))
     throw new Error('Session context items must be an array.');
   if (
-    Object.keys(input).some((key) => !['task', 'instructions', 'contextItems', 'relationship'].includes(key))
+    Object.keys(input).some(
+      (key) => !['task', 'instructions', 'contextItems', 'relationship', 'images'].includes(key)
+    )
   )
     throw new Error('Unsupported session submission input field.');
   return Object.freeze({
     task: input.task,
+    ...(input.images === undefined ? {} : { images: parseSessionImages(input.images) }),
     ...(input.relationship === undefined
       ? {}
       : { relationship: decodeSessionInputRelationship(input.relationship) }),
@@ -244,7 +248,8 @@ function foldSubmissions(records: readonly SessionSubmissionRecord[]): Map<strin
     if (current.runId !== record.runId)
       throw new Error(`Session submission run identity changed: ${record.submissionId}`);
     if (record.type === 'submission.revised' || record.type === 'submission.cancelled') {
-      if (current.state !== 'queued') throw new Error(`Only queued input can change: ${record.submissionId}`);
+      if (current.state !== 'queued')
+        throw new Error(`Only queued input can change: ${record.submissionId}`);
       submissions.set(
         record.submissionId,
         record.type === 'submission.revised'
@@ -256,7 +261,9 @@ function foldSubmissions(records: readonly SessionSubmissionRecord[]): Map<strin
     const state = submissionTransitionState(record);
     assertTransition(current.state, state, record.submissionId);
     const suspension =
-      record.type === 'submission.suspended' ? ownSessionSuspensionDescriptor(record.suspension) : undefined;
+      record.type === 'submission.suspended'
+        ? ownSessionSuspensionDescriptor(record.suspension)
+        : undefined;
     submissions.set(
       record.submissionId,
       Object.freeze({
@@ -312,7 +319,8 @@ export function ownSessionSuspensionDescriptor(value: unknown): SessionSuspensio
   const submissionId = suspensionString(object.submissionId, 'submissionId');
   const category = suspensionCategory(object.category);
   const reason = suspensionReason(object.reason);
-  const effectId = object.effectId === undefined ? undefined : suspensionString(object.effectId, 'effectId');
+  const effectId =
+    object.effectId === undefined ? undefined : suspensionString(object.effectId, 'effectId');
   if (!Array.isArray(object.actions) || object.actions.length === 0)
     throw new TypeError('Session suspension actions are invalid.');
   const actions = object.actions.map(suspensionAction);

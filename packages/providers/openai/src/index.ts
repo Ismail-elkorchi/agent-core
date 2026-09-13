@@ -1,9 +1,11 @@
 import {
+  apiKeyAuthentication,
   AuthError,
-  CachedBearerTokenProvider,
   createBearerTokenProvider,
   EnvBearerTokenProvider,
+  FileCredentialStore,
   StaticBearerTokenProvider,
+  StoredBearerTokenProvider,
   type BearerTokenProvider,
   type ProviderAuth
 } from '@agent-core/auth';
@@ -23,10 +25,12 @@ import {
   parseModelResponse,
   requiredProtocolRevision,
   type CompiledModelRequest,
-  type ModelCompilationOptions,
   type ModelCapabilities,
+  type ModelCatalogEntry,
+  type ModelCompilationOptions,
   type ModelContextTransformRequest,
   type ModelContextTransformResult,
+  type ModelDiscoveryOptions,
   type ModelProfile,
   type ModelProvider,
   type ModelProviderErrorCode,
@@ -174,6 +178,7 @@ export class OpenAIProvider implements ModelProvider {
   private readonly webSocketFactory: OpenAIResponsesWebSocketFactory;
   private readonly compiledRequests = new WeakMap<ModelRequest, CompiledModelRequest>();
   private readonly tokenProvider: BearerTokenProvider;
+  private readonly ownsCredentials: boolean;
   private readonly baseUrl: string;
   private readonly defaultModel: string;
   private readonly fetchImpl: typeof fetch;
@@ -197,7 +202,8 @@ export class OpenAIProvider implements ModelProvider {
     this.statusIntervalMs = Math.max(1, options.statusIntervalMs ?? 15_000);
     this.streamIdleTimeoutMs = Math.max(1, options.streamIdleTimeoutMs ?? 120_000);
     this.modelProfiles = options.modelProfiles ?? {};
-    this.tokenProvider = new CachedBearerTokenProvider(resolveTokenProvider(options));
+    this.tokenProvider = resolveTokenProvider(options);
+    this.ownsCredentials = options.auth === undefined && options.apiKey === undefined;
   }
 
   describe(): ModelProviderInfo {
@@ -212,6 +218,51 @@ export class OpenAIProvider implements ModelProvider {
     return this.transport === 'websocket'
       ? new NativeResponsesSession(this, this.webSocketFactory, this.streamIdleTimeoutMs)
       : new OpenAIProviderSession(this);
+  }
+
+  authentication() {
+    if (!this.ownsCredentials) return undefined;
+    return apiKeyAuthentication(new FileCredentialStore(), this.id, 'OPENAI_API_KEY');
+  }
+
+  async listModels(options: ModelDiscoveryOptions = {}): Promise<readonly ModelCatalogEntry[]> {
+    const token = await this.tokenProvider.getBearerToken(options.signal);
+    const response = await this.fetchImpl(`${this.baseUrl}/models`, {
+      headers: { Authorization: `Bearer ${token.token}` },
+      ...(options.signal === undefined ? {} : { signal: options.signal })
+    });
+    if (!response.ok)
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'provider_unavailable',
+        message: `Model discovery failed (HTTP ${String(response.status)}).`
+      });
+    const catalog = parseJsonObject(await readBoundedJsonResponse(response));
+    if (!Array.isArray(catalog.data))
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'malformed_response',
+        message: 'Model discovery response has no data array.'
+      });
+    return Promise.all(
+      catalog.data.map(async (value) => {
+        const entry = parseJsonObject(value);
+        if (typeof entry.id !== 'string' || !entry.id)
+          throw new ModelProviderError({
+            provider: this.id,
+            code: 'malformed_response',
+            message: 'Catalog model ID is missing.'
+          });
+        try {
+          await this.describeModel(entry.id);
+          return { id: entry.id };
+        } catch (error) {
+          if (error instanceof ModelProviderError && error.code === 'model_unavailable')
+            return { id: entry.id, unavailableReason: error.message };
+          throw error;
+        }
+      })
+    );
   }
 
   describeModel(model: string): Promise<ModelProfile> {
@@ -427,7 +478,10 @@ export class OpenAIProvider implements ModelProvider {
     if (cached) request = parseModelRequest({ ...request });
     const profile = await this.describeModel(request.model);
     if (request.maxOutputTokens === undefined && profile.supportedParameters.includes('maxOutputTokens'))
-      request = parseModelRequest({ ...request, maxOutputTokens: options?.outputReservation ?? this.defaultOutputTokens });
+      request = parseModelRequest({
+        ...request,
+        maxOutputTokens: options?.outputReservation ?? this.defaultOutputTokens
+      });
     const body = toOpenAIResponsesRequest(request, false);
     delete body.stream;
     if (this.transport === 'websocket') body.type = 'response.create';
@@ -956,6 +1010,11 @@ function resolveTokenProvider(options: OpenAIProviderOptions): BearerTokenProvid
       provider: OPENAI_PROVIDER_ID
     });
   }
+  if (!process.env.OPENAI_API_KEY)
+    return new StoredBearerTokenProvider(new FileCredentialStore(), OPENAI_PROVIDER_ID, {
+      type: 'api_key',
+      provider: OPENAI_PROVIDER_ID
+    });
   return new EnvBearerTokenProvider('OPENAI_API_KEY', {
     label: 'OPENAI_API_KEY environment variable',
     provider: OPENAI_PROVIDER_ID

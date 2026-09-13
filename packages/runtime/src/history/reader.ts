@@ -1,9 +1,6 @@
-import { LiteralHistoryIndex } from './literal-index.js';
-import { historyCutSchema } from './schema.js';
-import type { AgentEvent } from '../events.js';
-import { joinHistoryLedgers } from './ledger.js';
-import { hashJson, type ArtifactRepository, type EventRepository } from '@agent-core/persistence';
 import { parseJsonObject } from '@agent-core/json';
+import { hashJson, type ArtifactRepository, type EventRepository } from '@agent-core/persistence';
+import type { AgentEvent } from '../events.js';
 import type { SessionBranchEntry, SessionDescriptor, SessionRepository } from '../session/contracts.js';
 import type {
   HistoryFilter,
@@ -16,6 +13,9 @@ import type {
   HistorySourceRef,
   HistoryView
 } from './contracts.js';
+import { joinHistoryLedgers } from './ledger.js';
+import { LiteralHistoryIndex } from './literal-index.js';
+import { historyCutSchema } from './schema.js';
 
 const MAX_BYTES = 256 * 1024;
 const MAX_SCANNED = 1000;
@@ -73,7 +73,8 @@ export class HistoryReader {
       )
         throw new Error('History cut is outside the authorized branch or incompatible.');
       const throughEntryId = cut.throughEntryId;
-      const index = throughEntryId === null ? -1 : entries.findIndex((entry) => entry.id === throughEntryId);
+      const index =
+        throughEntryId === null ? -1 : entries.findIndex((entry) => entry.id === throughEntryId);
       if (cut.throughEntryId !== null && index === -1)
         throw new Error('History cut is unavailable on the authorized branch.');
       entries = Object.freeze(entries.slice(0, index + 1));
@@ -107,7 +108,9 @@ export class HistoryReader {
         ledgerHeads: joined?.heads ?? mirroredOpenHeads(entries, current.runFinalizations)
       });
     const ids = new Set(entries.map((entry) => entry.id));
-    const contextWindow = [...entries].reverse().find((entry) => entry.type === 'context_transition')?.window;
+    const contextWindow = [...entries]
+      .reverse()
+      .find((entry) => entry.type === 'context_transition')?.window;
     return Object.freeze({
       cut: position,
       entries,
@@ -166,17 +169,11 @@ export class HistoryReader {
     const maxBytes = bound(request.maxBytes, 32 * 1024, MAX_BYTES, 'maxBytes');
     const maxScanned = bound(request.maxScanned, MAX_SCANNED, MAX_SCANNED, 'maxScanned');
     if ((request.query?.length ?? 0) > 4096) throw new Error('History query exceeds 4096 characters.');
-    const queryFingerprint = hashJson(
-      { query: request.query ?? '', filter: request.filter ?? {} }
-    );
+    const queryFingerprint = hashJson({ query: request.query ?? '', filter: request.filter ?? {} });
     const cursor = request.cursor ? decodeCursor(request.cursor) : undefined;
     if (cursor && cursor.queryFingerprint !== queryFingerprint)
       throw new Error('History cursor query mismatch.');
-    if (
-      cursor &&
-      request.cut &&
-      hashJson(cursor.cut) !== hashJson(request.cut)
-    )
+    if (cursor && request.cut && hashJson(cursor.cut) !== hashJson(request.cut))
       throw new Error('History cursor source cut mismatch.');
     const view = await this.view(cursor?.cut ?? request.cut);
     let position = cursor?.position ?? 0;
@@ -240,9 +237,7 @@ export class HistoryReader {
       index: Object.freeze({
         ...this.lexicalIndex.inspect(),
         coverage:
-          this.indexedCutFingerprint === hashJson(view.cut)
-            ? ('complete' as const)
-            : ('partial' as const)
+          this.indexedCutFingerprint === hashJson(view.cut) ? ('complete' as const) : ('partial' as const)
       }),
       ...(!complete ? { cursor: encodeCursor({ cut: view.cut, position, queryFingerprint }) } : {})
     });
@@ -311,7 +306,8 @@ function publicText(entry: SessionBranchEntry): string {
         provider: entry.provider,
         model: entry.model,
         temperature: entry.temperature,
-        reasoningEffort: entry.reasoningEffort
+        reasoning: entry.reasoning,
+        endpoint: entry.endpoint
       });
     case 'branch':
       return JSON.stringify({ fromEntryId: entry.fromEntryId, label: entry.label });
