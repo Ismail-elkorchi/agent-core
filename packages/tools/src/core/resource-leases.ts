@@ -63,14 +63,33 @@ export class ResourceLeaseCoordinator {
       if (active.resourceId === resourceId) active.failure = failure;
     this.drain();
   }
+  clearResourceFailure(resourceId: string): void {
+    for (const lease of this.active.values())
+      if (lease.resourceId === resourceId) delete lease.failure;
+  }
   activeCount(): number {
     return this.active.size;
+  }
+
+  /** Reattach an already admitted external effect; this does not authorize a new effect. */
+  restoreResource(resourceId: string, effects: ToolEffects, controlScope: string): void {
+    if ([...this.active.values()].some((lease) => lease.resourceId === resourceId)) return;
+    const lease: ActiveLease = {
+      id: this.nextId++,
+      owner: resourceId,
+      resourceId,
+      controlScope,
+      effects
+    };
+    this.active.set(lease.id, lease);
   }
 
   private drain(): void {
     const retained: Waiter[] = [];
     for (const waiter of this.waiters.splice(0)) {
-      const failed = [...this.active.values()].find((lease) => lease.failure && leasesConflict(lease, waiter.effects));
+      const failed = [...this.active.values()].find(
+        (lease) => lease.failure && leasesConflict(lease, waiter.effects)
+      );
       if (failed?.failure) {
         if (waiter.abort && waiter.signal) waiter.signal.removeEventListener('abort', waiter.abort);
         waiter.reject(failed.failure);
@@ -87,7 +106,11 @@ export class ResourceLeaseCoordinator {
         continue;
       }
       if (waiter.abort && waiter.signal) waiter.signal.removeEventListener('abort', waiter.abort);
-      const active: ActiveLease = { id: this.nextId++, owner: waiter.owner, effects: waiter.effects };
+      const active: ActiveLease = {
+        id: this.nextId++,
+        owner: waiter.owner,
+        effects: waiter.effects
+      };
       this.active.set(active.id, active);
       waiter.resolve(new Lease(this, active));
     }
@@ -109,7 +132,11 @@ export class ResourceLeaseCoordinator {
 }
 
 export function isResourceLeaseCoordinator(value: unknown): value is ResourceLeaseCoordinator {
-  return typeof value === 'object' && value !== null && coordinators.has(value as ResourceLeaseCoordinator);
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    coordinators.has(value as ResourceLeaseCoordinator)
+  );
 }
 
 class Lease implements ToolResourceLease {
@@ -146,15 +173,25 @@ function leasesConflict(active: ActiveLease, waiting: ToolEffects): boolean {
 function resourceControlOnly(effects: ToolEffects, controlScope: string): boolean {
   return (
     effects.accesses.length > 0 &&
-    effects.accesses.every((access) => access.mode === 'execute' && access.scope === controlScope) &&
+    effects.accesses.every(
+      (access) => access.mode === 'execute' && access.scope === controlScope
+    ) &&
     effects.lockScopes.every((lock) => lock === controlScope)
   );
 }
 export function effectsConflict(left: ToolEffects, right: ToolEffects): boolean {
   if (left.lockScopes.some((a) => right.lockScopes.some((b) => scopesOverlap(a, b)))) return true;
-  if (left.lockScopes.some((lock) => right.accesses.some((access) => scopesOverlap(lock, access.scope))))
+  if (
+    left.lockScopes.some((lock) =>
+      right.accesses.some((access) => scopesOverlap(lock, access.scope))
+    )
+  )
     return true;
-  if (right.lockScopes.some((lock) => left.accesses.some((access) => scopesOverlap(lock, access.scope))))
+  if (
+    right.lockScopes.some((lock) =>
+      left.accesses.some((access) => scopesOverlap(lock, access.scope))
+    )
+  )
     return true;
   return left.accesses.some((a) => right.accesses.some((b) => accessConflict(a, b)));
 }
@@ -164,5 +201,7 @@ function accessConflict(left: ToolResourceAccess, right: ToolResourceAccess): bo
 function abortError(signal: AbortSignal): Error {
   return signal.reason instanceof Error
     ? signal.reason
-    : new Error(typeof signal.reason === 'string' ? signal.reason : 'Resource lease acquisition aborted.');
+    : new Error(
+        typeof signal.reason === 'string' ? signal.reason : 'Resource lease acquisition aborted.'
+      );
 }

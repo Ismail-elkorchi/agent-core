@@ -1,3 +1,4 @@
+import { recordInferenceEvents } from './inference-audit-helper.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
@@ -147,6 +148,7 @@ test(
     const artifacts = new InMemoryArtifactRepository();
     const events = new InMemoryEventRepository(agentEventCodec);
     const inference = new InMemoryInferenceRepository();
+    const inferenceAudit = recordInferenceEvents(inference);
     const slowTool = tool('slow', async () => {
       slowInvocations++;
       await slow;
@@ -199,8 +201,8 @@ test(
     assert.deepEqual(state.providerRequests, []);
     assert.deepEqual(state.toolBatches, []);
     const ledger = await inference.load('native-independent');
-    assert.equal(ledger.invocations.size, 3);
-    assert.ok([...ledger.invocations.values()].every((invocation) => invocation.settlement));
+    assert.equal(ledger.committed.invocations, 3);
+    assert.equal(ledger.settledUsage.invocations, 3);
   }
 );
 
@@ -237,6 +239,7 @@ async function deliveryFixture({ maxInvocations = 3, disconnect = false } = {}) 
   const events = new InMemoryEventRepository(agentEventCodec);
   const artifacts = new InMemoryArtifactRepository();
   const inference = new InMemoryInferenceRepository();
+    const inferenceAudit = recordInferenceEvents(inference);
   const options = {
     provider,
     model: 'gpt-6-astra',
@@ -273,7 +276,7 @@ test('native successor spends the shared owner allowance before any result frame
   assert.equal(state.toolBatches[0].callStates[0].delivery, undefined);
   const audit = await Array.fromAsync(fixture.events.read('delivery-boundary'));
   assert.equal(audit.filter(({ event }) => event.type === 'tool.ended').length, 1);
-  assert.equal((await fixture.inference.load('delivery-boundary')).invocations.size, 1);
+  assert.equal((await fixture.inference.load('delivery-boundary')).committed.invocations, 1);
 });
 
 test('disconnect after result transmission preserves uncertain delivery and never repeats the known effect', async () => {
@@ -293,7 +296,7 @@ test('disconnect after result transmission preserves uncertain delivery and neve
   assert.equal(resumed.state, 'suspended');
   assert.equal(resumed.reason, 'provider_outcome_unknown');
   assert.equal(fixture.socket.sent.length, 2);
-  assert.equal((await fixture.inference.load('delivery-boundary')).invocations.size, 2);
+  assert.equal((await fixture.inference.load('delivery-boundary')).committed.invocations, 2);
 });
 
 for (const [requiresResult, reportsUsage] of [
@@ -366,6 +369,7 @@ for (const [requiresResult, reportsUsage] of [
     const artifacts = new InMemoryArtifactRepository();
     const events = new InMemoryEventRepository(agentEventCodec);
     const inference = new InMemoryInferenceRepository();
+    const inferenceAudit = recordInferenceEvents(inference);
     const runtime = new AgentRuntime({
       provider,
       model: 'gpt-6-astra',
@@ -402,9 +406,7 @@ for (const [requiresResult, reportsUsage] of [
       'ended',
       JSON.stringify({
         result,
-        uncertain: [...(await inference.load('steered-runtime')).invocations.values()].map(
-          (item) => item.uncertain
-        )
+        inference: await inference.load('steered-runtime')
       })
     );
     assert.equal(result.terminal.executionStatus, 'completed', JSON.stringify(result.terminal));
@@ -415,9 +417,9 @@ for (const [requiresResult, reportsUsage] of [
     }
     assert.equal(socket.sent.length, requiresResult ? 3 : 2);
     const owner = await inference.load('steered-runtime');
-    assert.equal(owner.invocations.size, 2);
+    assert.equal(owner.committed.invocations, 2);
     assert.equal(
-      [...owner.invocations.values()].reduce((sum, item) => sum + item.extensions.length, 0),
+      inferenceAudit.filter(({ event }) => event.type === 'inference.extended').length,
       requiresResult ? 1 : 0
     );
     const audit = [];

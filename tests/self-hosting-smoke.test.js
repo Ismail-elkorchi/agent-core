@@ -89,6 +89,7 @@ test(
       )
     };
     const options = {
+      maxOutputTokens: 64,
       provider,
       model: 'scripted',
       inferenceService: new InferenceService({

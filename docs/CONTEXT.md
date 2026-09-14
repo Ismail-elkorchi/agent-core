@@ -131,7 +131,22 @@ a late response can still settle its original permit.
 Adapters compile immutable input before admission. Accounting covers the compiled
 body, actual tool arguments and results, schemas, media, and protocol state. Exact
 counts, estimates, and unknown components remain distinct. Configure an explicit
-output reservation policy for endpoints that do not accept a generation cap.
+output allowance for every invocation (`AgentRuntime.maxOutputTokens`, or the
+inference request's cap / explicit `outputReservation`). Core has no generation
+allowance default and does not infer unknown provider output capacity. Endpoints
+that reject a cap still reserve the host allowance and settle actual usage.
+
+Selected sources are membership: admission and replay restore branch input order
+and each run's event sequence. Source byte/entry capacity conflicts suspend at the
+same admission boundary as compiled token conflicts, with source references and
+bounds instead of fabricated compiled accounting. Authorized automatic renewal
+can select a smaller window while retaining accepted inputs and native obligations.
+
+Inference repositories advance from verified ledger tails. `load(ownerId)` returns
+committed liabilities and settled totals; optional `invocationId` and `runId` queries
+retrieve one invocation or per-run totals. `settledRunUsage()` replaces cumulative
+charge arrays. Provider settlements use exact event references and idempotency keys;
+ordinary admission and accounting do not replay historical settlement bodies.
 
 ## Independent provider and tool work
 

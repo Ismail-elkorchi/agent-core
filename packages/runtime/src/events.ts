@@ -257,6 +257,12 @@ export type AgentEvent =
       readonly diagnostic: AgentDeliveryDiagnostic;
     }
   | {
+      readonly type: 'resource.observed';
+      readonly runId: string;
+      readonly resourceId: string;
+      readonly details: JsonObject;
+    }
+  | {
       readonly type: 'resource.released';
       readonly runId: string;
       readonly resourceId: string;
@@ -733,6 +739,15 @@ const AGENT_EVENT_DECODERS = {
       type: 'delivery.failed',
       finalizationId: requiredString(value.finalizationId, 'finalizationId'),
       diagnostic: decodeDeliveryDiagnostic(value.diagnostic)
+    });
+  },
+  'resource.observed': (value) => {
+    exact(value, ['type', 'runId', 'resourceId', 'details']);
+    return Object.freeze({
+      type: 'resource.observed',
+      runId: requiredString(value.runId, 'runId'),
+      resourceId: requiredString(value.resourceId, 'resourceId'),
+      details: requiredObject(value.details, 'details')
     });
   },
   'resource.released': (value) => {

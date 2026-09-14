@@ -1,3 +1,5 @@
+import { providerSettlementKey } from './inference/run-lifecycle.js';
+import { ContextSourceCapacityError } from './run/context-admission.js';
 import { agentRunActivity } from './run/control/contracts.js';
 import { describeError as errorMessage } from '@agent-core/tools';
 import {
@@ -101,8 +103,7 @@ import {
   requestWindowForModel,
   supportsParameter,
   toolsForModel,
-  validateModelRun,
-  validateOptionalPositiveInteger
+  validateModelRun
 } from './orchestration/model-request.js';
 import { ModelStreamInterruptedError } from './orchestration/model-stream.js';
 import { NativeToolDelivery } from './orchestration/native-tool-delivery.js';
@@ -202,7 +203,7 @@ export interface AgentRuntimeOptions {
     readonly sourceIds: readonly string[];
   }) => void | Promise<void>;
   readonly estimator?: RequestEstimator;
-  readonly maxOutputTokens?: number;
+  readonly maxOutputTokens: number;
   readonly temperature?: number;
   readonly reasoning?: ModelReasoningRequest;
   readonly responseFormat?: ModelResponseFormat;
@@ -408,7 +409,7 @@ class AgentExecutionError extends Error {
 export class AgentRuntime {
   private readonly metadata: Readonly<Record<string, string>> | undefined;
   private readonly estimator: RequestEstimator;
-  private readonly maxOutputTokens: number | undefined;
+  private readonly maxOutputTokens: number;
   private readonly toolPolicy: ToolPolicy;
   private tools: readonly CompiledToolDefinition[];
   private readonly resourceLeases: ResourceLeaseCoordinator;
@@ -465,10 +466,9 @@ export class AgentRuntime {
         typeof options.provider.compileContextTransform === 'function' &&
         typeof options.provider.transformContextCompiled === 'function'
     });
-    this.maxOutputTokens = validateOptionalPositiveInteger(
-      options.maxOutputTokens,
-      'maxOutputTokens'
-    );
+    if (!Number.isSafeInteger(options.maxOutputTokens) || options.maxOutputTokens < 1)
+      throw new TypeError('AgentRuntime requires an explicit positive maxOutputTokens allowance.');
+    this.maxOutputTokens = options.maxOutputTokens;
     this.toolPolicy = parseToolPolicy(options.toolPolicy ?? READ_ONLY_TOOL_POLICY);
     this.tools = Object.freeze(new ToolRegistry(options.tools ?? []).list());
     this.resourceLeases =
@@ -805,7 +805,7 @@ export class AgentRuntime {
         return runSuspension(run.state());
       }
       if (phase?.stage === 'effect_pending') {
-        const settlement = await this.findProviderSettlement(
+        const settlement = await this.readProviderSettlement(
           runId,
           phase.effect.intent.effectId,
           phase.responseId
@@ -829,7 +829,7 @@ export class AgentRuntime {
               ...phase,
               stage: 'settled',
               effect: settled.state,
-              settlementEventId: settlement.eventId
+              settlementReference: settlement.reference
             }),
             run.state().budget
           );
@@ -971,24 +971,17 @@ export class AgentRuntime {
     } catch (error) {
       if (error instanceof AgentRunOwnershipLostError) throw error;
       const admissionError = error instanceof AgentExecutionError ? error.cause : error;
-      if (admissionError instanceof ContextAdmissionError && !signal.aborted) {
+      if (
+        (admissionError instanceof ContextAdmissionError ||
+          admissionError instanceof ContextSourceCapacityError) &&
+        !signal.aborted
+      ) {
         const instruction = nextAgentRunInstruction(run.state());
         if (instruction.kind !== 'execute') throw admissionError;
-        const accounting = admissionError.compiled.accounting;
-        const conflict = {
-          message: admissionError.message,
-          inputIdentity: admissionError.compiled.inputIdentity,
-          estimatedInputTokens: accounting.estimatedInputTokens,
-          outputReservation: accounting.outputReservation,
-          reasoningReservation: accounting.reasoningReservation,
-          ...(accounting.limits.contextTokens === undefined
-            ? {}
-            : { contextTokens: accounting.limits.contextTokens }),
-          ...(accounting.limits.maxInputTokens === undefined
-            ? {}
-            : { maxInputTokens: accounting.limits.maxInputTokens }),
-          actions: ['select_sources', 'reduce_reservation', 'change_model', 'cancel'] as const
-        };
+        const conflict =
+          admissionError instanceof ContextSourceCapacityError
+            ? admissionError.conflict
+            : requestCapacityConflict(admissionError);
         await this.advanceRun(run, instruction.procedure, {
           phase: {
             kind: 'suspended',
@@ -1219,24 +1212,34 @@ export class AgentRuntime {
       });
       sessionEntryId = inputEntry.id;
     }
-    const replay = await rebuildModelWindowFromRepositories({
-      ...(this.history ? { history: this.history } : {}),
-      events: this.options.repositories.events,
-      ...(this.options.repositories.artifacts
-        ? { artifacts: this.options.repositories.artifacts }
-        : {}),
-      estimator: this.estimator,
-      modelWindowImageLimits: {
-        maxCount: runtime.controller.limits.activeImageCount,
-        maxBytes: runtime.controller.limits.activeImageBytes,
-        maxEstimatedTokens: runtime.controller.limits.activeImageTokens
-      },
-      providerId: this.options.provider.id,
-      model: this.options.model,
-      ...protocolTarget(await this.options.provider.describeModel(this.options.model)),
-      currentRunId: runtime.runId,
-      ...(runtime.restoring || runtime.providerContinuation ? { runIds: [runtime.runId] } : {})
-    });
+    const rebuild = async () =>
+      rebuildModelWindowFromRepositories({
+        ...(this.history ? { history: this.history } : {}),
+        events: this.options.repositories.events,
+        ...(this.options.repositories.artifacts
+          ? { artifacts: this.options.repositories.artifacts }
+          : {}),
+        estimator: this.estimator,
+        modelWindowImageLimits: {
+          maxCount: runtime.controller.limits.activeImageCount,
+          maxBytes: runtime.controller.limits.activeImageBytes,
+          maxEstimatedTokens: runtime.controller.limits.activeImageTokens
+        },
+        providerId: this.options.provider.id,
+        model: this.options.model,
+        ...protocolTarget(await this.options.provider.describeModel(this.options.model)),
+        currentRunId: runtime.runId,
+        ...(runtime.restoring || runtime.providerContinuation ? { runIds: [runtime.runId] } : {})
+      });
+    let replay;
+    try {
+      replay = await rebuild();
+    } catch (error) {
+      if (!(error instanceof ContextSourceCapacityError) || !this.options.contextRenewal?.automatic)
+        throw error;
+      await this.prepareContextAdmission(runtime.run, runtime.signal, 1);
+      replay = await rebuild();
+    }
     const modelWindow = replay.modelWindow;
     const observationStore = new ObservationStore({
       ...(this.options.repositories.artifacts
@@ -1458,9 +1461,7 @@ export class AgentRuntime {
                 tools: [...tools],
                 toolPolicy: this.toolPolicy,
                 requestWindow,
-                ...(this.maxOutputTokens === undefined
-                  ? {}
-                  : { requestedMaxOutputTokens: this.maxOutputTokens }),
+                requestedMaxOutputTokens: this.maxOutputTokens,
                 ...(configuration.temperature === undefined
                   ? {}
                   : { temperature: configuration.temperature }),
@@ -2432,7 +2433,7 @@ export class AgentRuntime {
         const identity = turnIdentity(request.snapshot.record);
         const assembly = await this.assembleModelRequest(request, append, emit, rejected);
         await request.controller.recordUsage(
-          await this.inferenceService.settledRunCharges(
+          await this.inferenceService.settledRunUsage(
             this.options.inferenceOwnerId ?? request.runId,
             request.runId
           )
@@ -2542,12 +2543,13 @@ export class AgentRuntime {
     const providerPhase = providerWork(request.run.state(), input.identity);
     if (providerPhase.stage !== 'settled')
       throw new Error('Provider response is not durably settled.');
-    const settlementRecord = await this.findProviderSettlement(
+    const settlementRecord = await this.readProviderSettlement(
       request.runId,
       providerPhase.effect.intent.effectId,
-      providerPhase.responseId
+      providerPhase.responseId,
+      providerPhase.settlementReference
     );
-    if (settlementRecord?.eventId !== providerPhase.settlementEventId)
+    if (settlementRecord === undefined)
       throw new Error('Provider response settlement is missing or contradictory.');
     const providerState = settlementRecord.event.providerState;
     await append({
@@ -2563,7 +2565,7 @@ export class AgentRuntime {
         stateRef: providerState.artifact
       });
     await request.controller.recordUsage(
-      await this.inferenceService.settledRunCharges(
+      await this.inferenceService.settledRunUsage(
         this.options.inferenceOwnerId ?? request.runId,
         request.runId
       )
@@ -2636,10 +2638,11 @@ export class AgentRuntime {
     }
   }
 
-  private async admitContextResumption(run: AgentRunDriver, signal: AbortSignal): Promise<boolean> {
-    const phase = run.state().phase;
-    if (phase.kind !== 'suspended' || phase.reason !== 'context_admission') return false;
-    const revision = run.state().revision;
+  private async prepareContextAdmission(
+    run: AgentRunDriver,
+    signal: AbortSignal,
+    turnIndex: number
+  ): Promise<RequestAssemblyResult> {
     const input = runInput(run.state(), signal);
     const controller = new AgentRunBudget({
       run,
@@ -2654,7 +2657,7 @@ export class AgentRuntime {
       this.tools = Object.freeze(new ToolRegistry(await this.options.toolCatalogProvider()).list());
     const tools = this.availableTools(profile);
     const snapshot = this.createTurnSnapshot({
-      turnIndex: phase.turnIndex,
+      turnIndex: turnIndex,
       turnId: randomUUID(),
       requestAttempt: 1,
       configuration,
@@ -2673,7 +2676,7 @@ export class AgentRuntime {
       const request: AssistantTurnRequest = {
         runId: input.runId,
         input,
-        turnIndex: phase.turnIndex,
+        turnIndex: turnIndex,
         toolBatchId: randomUUID(),
         snapshot,
         modelSession: session,
@@ -2682,12 +2685,23 @@ export class AgentRuntime {
         controller,
         run
       };
-      const assembly = await this.assembleModelRequest(
+      return await this.assembleModelRequest(
         request,
         (event) =>
           run.append(event, `${input.runId}:context-resume:${hashJson(encodeAgentEvent(event))}`),
         () => Promise.resolve(undefined)
       );
+    } finally {
+      await session.close?.();
+    }
+  }
+
+  private async admitContextResumption(run: AgentRunDriver, signal: AbortSignal): Promise<boolean> {
+    const phase = run.state().phase;
+    if (phase.kind !== 'suspended' || phase.reason !== 'context_admission') return false;
+    const revision = run.state().revision;
+    try {
+      const assembly = await this.prepareContextAdmission(run, signal, phase.turnIndex);
       const { accounting, inputIdentity } = assembly.compiled;
       const previous = phase.conflict;
       if (
@@ -2712,10 +2726,9 @@ export class AgentRuntime {
       });
       return true;
     } catch (cause) {
-      if (cause instanceof ContextAdmissionError) return false;
+      if (cause instanceof ContextAdmissionError || cause instanceof ContextSourceCapacityError)
+        return false;
       throw cause;
-    } finally {
-      await session.close?.();
     }
   }
 
@@ -2726,7 +2739,13 @@ export class AgentRuntime {
     rejected?: CompiledModelRequest
   ): Promise<RequestAssemblyResult> {
     const identity = turnIdentity(request.snapshot.record);
-    await this.activateCommittedContext(request.modelWindow, request.runId);
+    let sourceConflict: ContextSourceCapacityError | undefined;
+    try {
+      await this.activateCommittedContext(request.modelWindow, request.runId);
+    } catch (error) {
+      if (!(error instanceof ContextSourceCapacityError)) throw error;
+      sourceConflict = error;
+    }
     const contextInputs = await this.collectContextItems(
       request.input,
       request.turnIndex,
@@ -2865,7 +2884,38 @@ export class AgentRuntime {
         signal: request.signal
       });
     }
-    const selectedNotes = await this.selectedNoteContext();
+    let selectedNotes: readonly PromptContextItemInput[] = [];
+    try {
+      selectedNotes = await this.selectedNoteContext();
+    } catch (error) {
+      if (!(error instanceof ContextSourceCapacityError)) throw error;
+      sourceConflict = error;
+    }
+    if (sourceConflict && !selected) {
+      if (!this.options.context || !this.options.contextRenewal?.automatic) throw sourceConflict;
+      const context = await this.options.context.inspect();
+      const renewal = await this.retainPendingSources(
+        {
+          expectedWindowId: context.window?.windowId ?? null,
+          expectedSourceRevision: context.cut.sourceRevision,
+          idempotencyKey: `source-renewal:${request.runId}:${hashJson(sourceConflict.conflict)}`,
+          reason: 'Source materialization capacity requires a smaller selection.',
+          selection: { strategy: 'sources', retained: [], notes: [] }
+        },
+        request.runId
+      );
+      const entry = await this.options.context.transition(renewal, {
+        signal: request.signal,
+        admit: validate
+      });
+      await this.activateCommittedContext(request.modelWindow, request.runId);
+      await emit({
+        type: 'context.transitioned',
+        window: entry.window,
+        transition: entry.transition
+      });
+    }
+    if (sourceConflict) selectedNotes = await this.selectedNoteContext();
     let result = selected ?? (await assemble(request.modelWindow, selectedNotes));
     let pressureReminderKey: string | undefined;
     const capacity = requestCapacity(result.compiled.accounting);
@@ -3195,11 +3245,16 @@ export class AgentRuntime {
       });
       if (
         note.status !== 'available' ||
-        note.truncated ||
         note.revision.scope.sessionId !== reference.scope.sessionId ||
         note.revision.scope.branchId !== reference.scope.branchId
       )
         throw new Error('Selected note revision is unavailable for the committed context window.');
+      if (note.truncated)
+        throw new ContextSourceCapacityError(context.cut, {
+          unit: 'bytes',
+          limit: 256 * 1024,
+          observedAtLeast: 256 * 1024 + 1
+        });
       items.push({
         id: `note:${reference.noteId}:${reference.revisionId}`,
         sourceUri: `note://${reference.scope.sessionId}/${reference.noteId}/${reference.revisionId}`,
@@ -3292,35 +3347,30 @@ export class AgentRuntime {
       budget: state.budget
     });
   }
-  private async findProviderSettlement(
+  private async readProviderSettlement(
     runId: string,
     effectId: string,
-    responseId: string
-  ): Promise<
-    | {
-        readonly eventId: string;
-        readonly event: Extract<AgentEvent, { readonly type: 'provider.attempt.settled' }>;
-      }
-    | undefined
-  > {
-    let match:
-      | {
-          readonly eventId: string;
-          readonly event: Extract<AgentEvent, { readonly type: 'provider.attempt.settled' }>;
-        }
-      | undefined;
-    for await (const record of this.options.repositories.events.read(runId)) {
-      if (
-        record.event.type !== 'provider.attempt.settled' ||
-        record.event.effectId !== effectId ||
-        record.event.responseId !== responseId
-      )
-        continue;
-      if (match)
-        throw new Error(`Run ${runId} contains duplicate provider settlements for ${responseId}.`);
-      match = Object.freeze({ eventId: record.eventId, event: record.event });
-    }
-    return match;
+    responseId: string,
+    reference?: import('@agent-core/persistence').EventReference
+  ) {
+    const source =
+      reference ??
+      (await this.options.repositories.events.referenceByKey(
+        runId,
+        providerSettlementKey(effectId, responseId)
+      ));
+    if (!source) return undefined;
+    if (source.runId !== runId) throw new Error('Provider settlement belongs to another run.');
+    const record = await this.options.repositories.events.readReference(source);
+    if (
+      record.event.type !== 'provider.attempt.settled' ||
+      record.event.effectId !== effectId ||
+      record.event.responseId !== responseId
+    )
+      throw new Error(
+        'Provider settlement reference does not match its effect and response identity.'
+      );
+    return Object.freeze({ reference: source, event: record.event });
   }
   private async reconcileDurableToolBatch(
     run: AgentRunDriver,
@@ -3576,14 +3626,15 @@ export class AgentRuntime {
       throw new Error(`Run ${state.runId} has no settled provider response to resume.`);
     if (!state.budget)
       throw new Error(`Run ${state.runId} has no durable budget at its provider settlement.`);
-    const settlement = await this.findProviderSettlement(
+    const settlement = await this.readProviderSettlement(
       state.runId,
       phase.effect.intent.effectId,
-      phase.responseId
+      phase.responseId,
+      phase.settlementReference
     );
-    if (settlement?.eventId !== phase.settlementEventId)
+    if (settlement === undefined)
       throw new Error(
-        `Run ${state.runId} is missing its exact provider settlement ${phase.settlementEventId}.`
+        `Run ${state.runId} is missing its exact provider settlement ${phase.settlementReference.eventId}.`
       );
     let turnSnapshot: AgentTurnSnapshotRecord | undefined;
     let requestEstimate: RequestCostEstimate | undefined;
@@ -4398,4 +4449,25 @@ function protocolTarget(profile: ModelProfile): {
   readonly protocol?: import('@agent-core/model').ModelProtocolCapabilities;
 } {
   return profile.capabilities.protocol ? { protocol: profile.capabilities.protocol } : {};
+}
+
+function requestCapacityConflict(
+  error: ContextAdmissionError
+): import('./run/context-admission.js').ContextAdmissionConflict {
+  const { inputIdentity, accounting } = error.compiled;
+  return {
+    kind: 'request_capacity',
+    message: error.message,
+    inputIdentity,
+    estimatedInputTokens: accounting.estimatedInputTokens,
+    outputReservation: accounting.outputReservation,
+    reasoningReservation: accounting.reasoningReservation,
+    ...(accounting.limits.contextTokens === undefined
+      ? {}
+      : { contextTokens: accounting.limits.contextTokens }),
+    ...(accounting.limits.maxInputTokens === undefined
+      ? {}
+      : { maxInputTokens: accounting.limits.maxInputTokens }),
+    actions: ['select_sources', 'reduce_reservation', 'change_model', 'cancel']
+  };
 }

@@ -1,3 +1,4 @@
+import { recordInferenceEvents } from './inference-audit-helper.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -101,9 +102,9 @@ test('classification uses durable invocation without a session, workflow, checks
     /different input/
   );
   await assert.rejects(service.invoke(input('two')), InferenceBudgetExceededError);
-  const state = await repository.load('work');
-  assert.equal(state.invocations.size, 1);
-  assert.equal(state.invocations.get('one').settlement.usage.promptTokens, 40);
+  const state = await repository.load('work', { invocationId: 'one' });
+  assert.equal(state.committed.invocations, 1);
+  assert.equal(state.invocation.settlement.usage.promptTokens, 40);
 });
 
 test('concurrent auxiliary invocations reserve one shared owner budget transactionally', async () => {
@@ -159,7 +160,7 @@ test('aborted dispatch remains uncertain, does not replay spend, and a late resu
   await assert.rejects(service.invoke(input()), InferenceOutcomeUnknownError);
   assert.equal(calls, 1);
   release();
-  while (!(await repository.load('work')).invocations.get('one').settlement)
+  while (!(await repository.load('work', { invocationId: 'one' })).invocation.settlement)
     await new Promise((resolve) => setTimeout(resolve, 1));
   const replay = await service.invoke(input());
   assert.equal(replay.response.content, 'late');
@@ -216,7 +217,7 @@ test('aborting before admission consumes no invocation and auxiliary inference r
     service.invoke({ ...input(), signal: AbortSignal.abort(new Error('before')) }),
     /before/
   );
-  assert.equal((await repository.load('work')).invocations.size, 0);
+  assert.equal((await repository.load('work')).committed.invocations, 0);
   assert.equal(calls, 0);
   assert.throws(
     () => new InferenceService({ provider }),
@@ -256,7 +257,7 @@ test('primary runtime requests and auxiliary verification consume the same durab
     InferenceBudgetExceededError
   );
   assert.equal(calls, 1);
-  assert.equal((await repository.load('shared-owner')).invocations.size, 1);
+  assert.equal((await repository.load('shared-owner')).committed.invocations, 1);
 });
 
 test('durable output replay preserves binary media and provider protocol ownership', async () => {
@@ -315,7 +316,7 @@ test('known monetary spend persists before later admission rejects and unknown p
   assert.ok(Math.abs(settled.cost.amount - 0.0004) < 1e-12);
   assert.ok(
     Math.abs(
-      (await repository.load('work')).invocations.get('one').settlement.cost.amount - 0.0004
+      (await repository.load('work', { invocationId: 'one' })).invocation.settlement.cost.amount - 0.0004
     ) < 1e-12
   );
   await assert.rejects(
@@ -365,7 +366,7 @@ test('fencing rejection before dispatch durably releases the owning reservation'
     ),
     /fencing denied/
   );
-  const rejected = (await repository.load('work')).invocations.get('one');
+  const rejected = (await repository.load('work', { invocationId: 'one' })).invocation;
   assert.equal(rejected.notSent.type, 'inference.not_sent');
   assert.equal(rejected.uncertain, undefined);
   assert.equal(calls, 0);
@@ -393,7 +394,7 @@ test('cancellation during durable reservation releases only a request that never
   });
   await assert.rejects(service.invoke({ ...input(), signal: abort.signal }), /before dispatch/);
   assert.equal(calls, 0);
-  const record = (await repository.load('work')).invocations.get('one');
+  const record = (await repository.load('work', { invocationId: 'one' })).invocation;
   assert.ok(record.notSent);
   assert.equal(record.uncertain, undefined);
 });
@@ -506,7 +507,7 @@ test('precompiled input is admitted before any invocation or external effect is 
   }
   assert.equal(starts, 0);
   assert.equal(calls, 0);
-  assert.equal((await repository.load('work')).invocations.size, 0);
+  assert.equal((await repository.load('work')).committed.invocations, 0);
   await service.invoke(input());
   assert.equal(calls, 1);
 });
@@ -541,24 +542,26 @@ test('runtime reserves Codex output without sending an unsupported generation co
     repository,
     artifacts: new InMemoryArtifactRepository()
   });
-  for (const maxOutputTokens of [undefined, 777]) {
+  const audit = recordInferenceEvents(repository);
+  for (const maxOutputTokens of [64, 777]) {
     const runtime = new AgentRuntime({
+      maxOutputTokens,
       provider,
       model: 'gpt-5.6-luna',
       inferenceService: service,
       repositories: { events: new InMemoryEventRepository(agentEventCodec) },
-      toolBoundary: { authorizationPolicyId: 'none', executionTargetId: 'none' },
-      ...(maxOutputTokens === undefined ? {} : { maxOutputTokens })
+      toolBoundary: { authorizationPolicyId: 'none', executionTargetId: 'none' }
     });
     const run = runtime.run({ task: 'Say hello.' });
     const result = await run.result;
     assert.equal(result.state, 'ended');
     assert.equal(result.terminal.executionStatus, 'completed', JSON.stringify(result));
-    const invocations = [...(await repository.load(result.terminal.runId)).invocations.values()];
-    assert.equal(invocations.length, 1);
-    assert.equal(invocations[0].start.reservation.completionTokens, maxOutputTokens ?? 4096);
-    assert.ok(invocations[0].settlement);
-    assert.equal(invocations[0].uncertain, undefined);
+    const started = audit.filter(({ ownerId, event }) => ownerId === result.terminal.runId && event.type === 'inference.started');
+    assert.equal(started.length, 1);
+    const invocation = (await repository.load(result.terminal.runId, { invocationId: started[0].event.invocationId })).invocation;
+    assert.equal(invocation.start.reservation.completionTokens, maxOutputTokens);
+    assert.ok(invocation.settlement);
+    assert.equal(invocation.uncertain, undefined);
   }
   assert.equal(requests.length, 2);
 });
@@ -579,7 +582,7 @@ test('interrupted provider output preserves the cause and partial text without r
       throw new Error('Connection closed while reading the response');
     }
   };
-  const runtime = new AgentRuntime({
+  const runtime = new AgentRuntime({ maxOutputTokens: 64,
     provider,
     model: profile.id,
     onProgress: (event) => {
@@ -635,7 +638,7 @@ test('definitive context rejection is recorded and replay cannot dispatch the re
   const open = () =>
     new InferenceService({ provider, repository, artifacts, budget: { maxInvocations: 1 } });
   await assert.rejects(open().invoke(input()), InferenceContextRejectedError);
-  const recorded = (await repository.load('work')).invocations.get('one');
+  const recorded = (await repository.load('work', { invocationId: 'one' })).invocation;
   assert.equal(recorded.rejected.code, 'context_overflow');
   assert.equal(recorded.notSent, undefined, 'A rejected network request was still sent.');
   assert.equal(recorded.uncertain, undefined);
@@ -677,8 +680,51 @@ test('context error after partial streamed output remains uncertain', async () =
       artifacts: new InMemoryArtifactRepository()
     });
     await assert.rejects(service.invoke(input()), InferenceOutcomeUnknownError);
-    const recorded = (await repository.load('work')).invocations.get('one');
+    const recorded = (await repository.load('work', { invocationId: 'one' })).invocation;
     assert.ok(recorded.uncertain);
     assert.equal(recorded.rejected, undefined);
   }
+});
+
+test('accounting catches up once and reads only new records across invocations and runs', async () => {
+  const { EventInferenceRepository, inferenceEventCodec } = await import('@agent-core/runtime');
+  const events = new InMemoryEventRepository(inferenceEventCodec);
+  let recordsRead = 0;
+  const observedEvents = {
+    tail: events.tail.bind(events), appendConditional: events.appendConditional.bind(events),
+    async readRange(...args) {
+      const page = await events.readRange(...args);
+      recordsRead += page.records.length;
+      return page;
+    }
+  };
+  let repository = new EventInferenceRepository(observedEvents);
+  const artifacts = new InMemoryArtifactRepository();
+  const provider = fixture(async (request) => response(request));
+  for (let index = 0; index < 40; index++) {
+    if (index === 20) {
+      repository = new EventInferenceRepository(observedEvents);
+      await repository.load('work'); // Explicit cold rebuild, outside the hot-path measurement.
+    }
+    const before = recordsRead;
+    const service = new InferenceService({ provider, repository, artifacts });
+    await service.invoke({ ...input(`invocation-${index}`), runId: `run-${index}` });
+    const run = await service.settledRunUsage('work', `run-${index}`);
+    const owner = await repository.load('work');
+    assert.equal(run.invocations, 1);
+    assert.equal(owner.settledUsage.invocations, index + 1);
+    assert.equal(owner.settledUsage.usage.promptTokens, (index + 1) * 40);
+    assert.ok(recordsRead - before <= 2, `Invocation ${index} reread ${recordsRead - before} records.`);
+  }
+});
+
+test('generation allowance is required even when provider output capacity is unknown', async () => {
+  const provider = fixture(async (request) => response(request));
+  const service = InferenceService.inMemory({ provider });
+  const { maxOutputTokens, ...request } = input().request;
+  await assert.rejects(service.invoke({ ...input(), request }), /explicit.*allowance|explicit.*reservation/i);
+  await assert.rejects(service.invoke({ ...input(), request: { ...request, maxOutputTokens: 1001 } }), /capacity/i);
+  const unknown = { ...profile, limits: { contextTokens: 20000 } };
+  const result = await service.invoke({ ...input(), profile: unknown, request: { ...request, maxOutputTokens } });
+  assert.equal(result.status, 'settled');
 });

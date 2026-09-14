@@ -31,6 +31,8 @@ export function commandReleaseReport(report: CommandExecutionReport): ResourceRe
       stderr: outputCounts(result.stderr),
       combined: outputCounts(result.combined),
       ...(result.artifact === undefined ? {} : { artifact: result.artifact }),
+      ...(result.originalOutput === undefined ? {} : { originalOutput: result.originalOutput }),
+      ...(result.diagnostic === undefined ? {} : { diagnostic: result.diagnostic }),
       ...(result.exitCode === undefined ? {} : { exitCode: result.exitCode }),
       ...(result.signal === undefined ? {} : { signal: result.signal }),
       ...(report.protectedArtifact === undefined ? {} : { protectedArtifact: report.protectedArtifact })

@@ -124,7 +124,7 @@ function createRuntime(options) {
     runtimeRepositories.set(events, shared);
   }
   const artifacts = options.repositories.artifacts ?? shared.artifacts;
-  return new AgentRuntime({
+  return new AgentRuntime({ maxOutputTokens: 64,
     ...options,
     inferenceService: new InferenceService({
       provider: options.provider,

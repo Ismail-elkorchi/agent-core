@@ -28,12 +28,6 @@ async function fixture(limits) {
   const run = await runs.attach('budget-run');
   return { runs, run, budget: new AgentRunBudget({ run, limits }) };
 }
-const charge = (promptTokens, completionTokens = 0, cost) => ({
-  usage: { promptTokens, completionTokens, totalTokens: promptTokens + completionTokens },
-  usageSource: 'provider',
-  cost: cost ?? { status: 'unknown', unknownTokens: promptTokens + completionTokens }
-});
-
 test('tool limits reject unconsumed work transactionally in the driver', async () => {
   const { budget, runs, run } = await fixture({ totalToolCalls: 1 });
   await assert.rejects(
@@ -47,9 +41,9 @@ test('tool limits reject unconsumed work transactionally in the driver', async (
 
 test('incurred charges commit before a crossed limit; repeated settlement and restart do not double count', async () => {
   const { budget, runs } = await fixture({ promptTokens: 5 });
-  const charges = [charge(6, 2)];
+  const totals = { invocations: 1, usage: { promptTokens: 6, completionTokens: 2, totalTokens: 8, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, knownCosts: {}, unknownPricedTokens: 8 };
   await assert.rejects(
-    budget.recordUsage(charges),
+    budget.recordUsage(totals),
     (error) =>
       error instanceof AgentLimitExceededError &&
       error.consumed &&
@@ -60,17 +54,13 @@ test('incurred charges commit before a crossed limit; repeated settlement and re
     run: await runs.attach('budget-run'),
     limits: { promptTokens: 5 }
   });
-  await assert.rejects(resumed.recordUsage(charges), AgentLimitExceededError);
+  await assert.rejects(resumed.recordUsage(totals), AgentLimitExceededError);
   assert.equal(resumed.snapshot().promptTokens, 6);
 });
 
 test('run usage preserves unknown pricing and distinct currencies from inference settlement', async () => {
   const { budget } = await fixture({});
-  await budget.recordUsage([
-    charge(100, 50),
-    charge(1000, 0, { status: 'known', amount: 2, currency: 'EUR', unknownTokens: 0 }),
-    charge(0, 1000, { status: 'known', amount: 4, currency: 'USD', unknownTokens: 0 })
-  ]);
+  await budget.recordUsage({ invocations: 3, usage: { promptTokens: 1100, completionTokens: 1050, totalTokens: 2150, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, knownCosts: { EUR: 2, USD: 4 }, unknownPricedTokens: 150 });
   assert.deepEqual(budget.snapshot().knownCosts, { EUR: 2, USD: 4 });
   assert.equal(budget.snapshot().pricingStatus, 'partial');
   assert.equal(budget.snapshot().unknownPricedTokens, 150);

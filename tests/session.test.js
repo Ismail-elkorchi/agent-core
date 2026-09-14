@@ -615,7 +615,7 @@ async function acceptApprovalRun(runs, runId) {
         toolBatchId: 'batch',
         requestEventId: 'request',
         responseId: 'response',
-        settlementEventId: 'response-event',
+        settlementReference: { runId, eventId: 'response-event', sequence: 1, hash: 'a'.repeat(64) },
         effect: settled.state
       }
     ]

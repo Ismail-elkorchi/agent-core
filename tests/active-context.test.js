@@ -138,7 +138,7 @@ for (const strategy of ['sources', 'provider']) {
         historyRead: { history, isAvailable: () => true }
       }
     });
-    runtime = new AgentRuntime({
+    runtime = new AgentRuntime({ maxOutputTokens: 64,
       provider,
       model: simulationProfile.id,
       inferenceService: inference,
@@ -218,7 +218,7 @@ test(
       const provider = new Provider((_request, turn) =>
         turn <= 7 ? call('inspect_item', `inspect-${turn}`) : { content: 'Finished.' }
       );
-      const runtime = new AgentRuntime({
+      const runtime = new AgentRuntime({ maxOutputTokens: 64,
         provider,
         model: simulationProfile.id,
         tools: [tool],

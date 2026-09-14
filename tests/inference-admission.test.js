@@ -52,7 +52,7 @@ test('inference admission rejects an oversized logical request before provider i
   };
   const service = InferenceService.inMemory({ provider });
   await assert.rejects(
-    service.invoke({ ownerId: 'test', invocationId: 'oversized', purpose: 'admission', request: { model: profile.id, messages: [{ role: 'user', content: 'x'.repeat(400) }] }, profile }),
+    service.invoke({ ownerId: 'test', invocationId: 'oversized', purpose: 'admission', request: { maxOutputTokens: 10, model: profile.id, messages: [{ role: 'user', content: 'x'.repeat(400) }] }, profile }),
     error => error instanceof ModelContractError
   );
   assert.equal(calls, 0);

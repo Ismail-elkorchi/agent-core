@@ -297,82 +297,184 @@ function count(value: JsonValue | undefined): number {
     throw new Error('Invalid inference token count.');
   return value;
 }
+export interface InferenceInvocation {
+  readonly start: Extract<InferenceEvent, { type: 'inference.started' }>;
+  readonly extension?: Extract<InferenceEvent, { type: 'inference.extended' }>;
+  readonly settlement?: Extract<InferenceEvent, { type: 'inference.settled' }>;
+  readonly rejected?: Extract<InferenceEvent, { type: 'inference.rejected' }>;
+  readonly notSent?: Extract<InferenceEvent, { type: 'inference.not_sent' }>;
+  readonly uncertain?: Extract<InferenceEvent, { type: 'inference.uncertain' }>;
+}
+export interface InferenceUsageTotals {
+  readonly invocations: number;
+  readonly usage: Required<ModelUsage>;
+  readonly knownCosts: Readonly<Record<string, number>>;
+  readonly unknownPricedTokens: number;
+}
 export interface InferenceOwnerState {
   readonly tail: EventLedgerTail;
-  readonly invocations: ReadonlyMap<
-    string,
-    {
-      readonly start: Extract<InferenceEvent, { type: 'inference.started' }>;
-      readonly extensions: readonly Extract<InferenceEvent, { type: 'inference.extended' }>[];
-      readonly settlement?: Extract<InferenceEvent, { type: 'inference.settled' }>;
-      readonly rejected?: Extract<InferenceEvent, { type: 'inference.rejected' }>;
-      readonly notSent?: Extract<InferenceEvent, { type: 'inference.not_sent' }>;
-      readonly uncertain?: Extract<InferenceEvent, { type: 'inference.uncertain' }>;
-    }
-  >;
+  readonly policyFingerprint?: string;
+  /** Settled consumption plus outstanding reservations. */
+  readonly committed: InferenceUsageTotals;
+  readonly invocation?: InferenceInvocation;
+  readonly settledUsage: InferenceUsageTotals;
 }
 export interface InferenceRepository {
-  load(ownerId: string): Promise<InferenceOwnerState>;
+  load(
+    ownerId: string,
+    query?: { readonly invocationId?: string; readonly runId?: string }
+  ): Promise<InferenceOwnerState>;
   append(ownerId: string, event: InferenceEvent, tail: EventLedgerTail): Promise<boolean>;
 }
+interface OwnerIndex {
+  tail: EventLedgerTail;
+  policyFingerprint?: string;
+  committed: InferenceUsageTotals;
+  settled: InferenceUsageTotals;
+  readonly invocations: Map<string, InferenceInvocation>;
+  readonly runs: Map<string, InferenceUsageTotals>;
+}
 export class EventInferenceRepository implements InferenceRepository {
+  private readonly owners = new Map<string, OwnerIndex>();
+  private readonly pending = new Map<string, Promise<unknown>>();
   constructor(
-    readonly events: Pick<EventRepository<InferenceEvent>, 'read' | 'appendConditional'>
+    readonly events: Pick<
+      EventRepository<InferenceEvent>,
+      'tail' | 'readRange' | 'appendConditional'
+    >
   ) {}
-  async load(ownerId: string): Promise<InferenceOwnerState> {
-    const invocations = new Map<
-      string,
-      {
-        start: Extract<InferenceEvent, { type: 'inference.started' }>;
-        extensions: Extract<InferenceEvent, { type: 'inference.extended' }>[];
-        settlement?: Extract<InferenceEvent, { type: 'inference.settled' }>;
-        rejected?: Extract<InferenceEvent, { type: 'inference.rejected' }>;
-        notSent?: Extract<InferenceEvent, { type: 'inference.not_sent' }>;
-        uncertain?: Extract<InferenceEvent, { type: 'inference.uncertain' }>;
+
+  load(
+    ownerId: string,
+    query: { readonly invocationId?: string; readonly runId?: string } = {}
+  ): Promise<InferenceOwnerState> {
+    const previous = this.pending.get(ownerId) ?? Promise.resolve();
+    const task = previous.catch(() => undefined).then(() => this.read(ownerId, query));
+    this.pending.set(ownerId, task);
+    void task
+      .finally(() => {
+        if (this.pending.get(ownerId) === task) this.pending.delete(ownerId);
+      })
+      .catch(() => undefined);
+    return task;
+  }
+
+  private async read(
+    ownerId: string,
+    query: { readonly invocationId?: string; readonly runId?: string }
+  ): Promise<InferenceOwnerState> {
+    const key = ownerKey(ownerId);
+    const tail = await this.events.tail(key);
+    const index: OwnerIndex = this.owners.get(ownerId) ?? {
+      tail: { sequence: -1, driverGeneration: 0 },
+      committed: emptyInferenceUsage(),
+      settled: emptyInferenceUsage(),
+      invocations: new Map(),
+      runs: new Map()
+    };
+    if (
+      tail.sequence < index.tail.sequence ||
+      (tail.sequence === index.tail.sequence && tail.hash !== index.tail.hash)
+    )
+      throw new Error('Inference history changed behind its verified boundary.');
+    try {
+      while (index.tail.sequence < tail.sequence) {
+        const page = await this.events.readRange(key, {
+          afterSequence: index.tail.sequence,
+          through: tail,
+          limit: 256
+        });
+        if (page.oversized || page.nextSequence <= index.tail.sequence)
+          throw new Error('Inference index could not advance through its ledger boundary.');
+        for (const record of page.records) this.apply(index, ownerId, record.event);
+        const last = page.records.at(-1);
+        if (!last) throw new Error('Inference ledger advanced without accounting records.');
+        index.tail = {
+          sequence: page.nextSequence,
+          driverGeneration: tail.driverGeneration,
+          hash: last.hash
+        };
       }
-    >();
-    let tail: EventLedgerTail = { sequence: -1, driverGeneration: 0 };
-    for await (const record of this.events.read(ownerKey(ownerId))) {
-      tail = {
-        sequence: record.sequence,
-        hash: record.hash,
-        driverGeneration: record.driverGeneration
-      };
-      const event = record.event;
-      if (event.type === 'inference.started') {
-        if (event.ownerId !== ownerId || invocations.has(event.invocationId))
-          throw new Error('Contradictory inference admission.');
-        invocations.set(event.invocationId, { start: event, extensions: [] });
-      } else {
-        const prior = invocations.get(event.invocationId);
-        if (
-          prior?.start.permit !== event.permit ||
-          prior.settlement ||
-          prior.notSent ||
-          prior.rejected
-        )
-          throw new Error('Contradictory inference settlement permit.');
-        if (event.type === 'inference.extended') {
-          if (
-            prior.start.operation !== 'native_generation' ||
-            prior.uncertain ||
-            event.revision !== prior.extensions.length + 1
-          )
-            throw new Error('Contradictory native inference input extension.');
-          prior.extensions.push(event);
-        } else if (event.type === 'inference.rejected') {
-          if (prior.uncertain)
-            throw new Error('A context rejection cannot override an uncertain dispatch.');
-          prior.rejected = event;
-        } else if (event.type === 'inference.settled') prior.settlement = event;
-        else if (event.type === 'inference.not_sent') {
-          if (prior.uncertain)
-            throw new Error('An uncertain dispatch cannot be released without evidence.');
-          prior.notSent = event;
-        } else prior.uncertain = event;
+      index.tail = tail;
+      this.owners.delete(ownerId);
+      this.owners.set(ownerId, index);
+      for (const id of this.owners.keys()) {
+        if (this.owners.size <= 8) break;
+        this.owners.delete(id);
       }
+    } catch (error) {
+      this.owners.delete(ownerId);
+      throw error;
     }
-    return { tail, invocations };
+    const invocation =
+      query.invocationId === undefined ? undefined : index.invocations.get(query.invocationId);
+    return Object.freeze({
+      tail,
+      ...(index.policyFingerprint ? { policyFingerprint: index.policyFingerprint } : {}),
+      committed: index.committed,
+      ...(invocation ? { invocation } : {}),
+      settledUsage:
+        query.runId === undefined
+          ? index.settled
+          : (index.runs.get(query.runId) ?? emptyInferenceUsage())
+    });
+  }
+
+  private apply(index: OwnerIndex, ownerId: string, event: InferenceEvent): void {
+    const prior = index.invocations.get(event.invocationId);
+    let next: InferenceInvocation;
+    if (event.type === 'inference.started') {
+      const policy = hashJson(event.limits);
+      if (
+        event.ownerId !== ownerId ||
+        prior ||
+        (index.policyFingerprint !== undefined && index.policyFingerprint !== policy)
+      )
+        throw new Error('Contradictory inference admission or owner policy.');
+      index.policyFingerprint = policy;
+      next = Object.freeze({ start: event });
+    } else {
+      if (
+        prior?.start.permit !== event.permit ||
+        prior.settlement ||
+        prior.notSent ||
+        prior.rejected
+      )
+        throw new Error('Contradictory inference settlement permit.');
+      if (event.type === 'inference.extended') {
+        if (
+          prior.start.operation !== 'native_generation' ||
+          prior.uncertain ||
+          event.revision !== (prior.extension?.revision ?? 0) + 1
+        )
+          throw new Error('Contradictory native inference input extension.');
+        next = Object.freeze({ ...prior, extension: event });
+      } else if (event.type === 'inference.rejected') {
+        if (prior.uncertain)
+          throw new Error('A context rejection cannot override an uncertain dispatch.');
+        next = Object.freeze({ ...prior, rejected: event });
+      } else if (event.type === 'inference.not_sent') {
+        if (prior.uncertain)
+          throw new Error('An uncertain dispatch cannot be released without evidence.');
+        next = Object.freeze({ ...prior, notSent: event });
+      } else if (event.type === 'inference.settled') {
+        next = Object.freeze({ ...prior, settlement: event });
+        index.settled = addInferenceUsage(index.settled, event.usage, event.cost, 1);
+        if (prior.start.runId !== null)
+          index.runs.set(
+            prior.start.runId,
+            addInferenceUsage(
+              index.runs.get(prior.start.runId) ?? emptyInferenceUsage(),
+              event.usage,
+              event.cost,
+              1
+            )
+          );
+      } else next = Object.freeze({ ...prior, uncertain: event });
+    }
+    if (prior && !prior.notSent) index.committed = accountInvocation(index.committed, prior, -1);
+    if (!next.notSent) index.committed = accountInvocation(index.committed, next, 1);
+    index.invocations.set(event.invocationId, next);
   }
   async append(ownerId: string, event: InferenceEvent, tail: EventLedgerTail): Promise<boolean> {
     const result = await this.events.appendConditional(ownerKey(ownerId), event, {
@@ -399,4 +501,60 @@ export class InMemoryInferenceRepository extends EventInferenceRepository {
 function ownerKey(ownerId: string): string {
   if (ownerId.trim().length === 0) throw new Error('Inference ownerId must be non-empty.');
   return `inference-${hashJson(ownerId)}`;
+}
+
+export function emptyInferenceUsage(): InferenceUsageTotals {
+  return Object.freeze({
+    invocations: 0,
+    usage: Object.freeze({
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      reasoningTokens: 0
+    }),
+    knownCosts: Object.freeze({}),
+    unknownPricedTokens: 0
+  });
+}
+function accountInvocation(
+  total: InferenceUsageTotals,
+  invocation: InferenceInvocation,
+  direction: 1 | -1
+): InferenceUsageTotals {
+  const reservation = invocation.extension?.reservation ?? invocation.start.reservation;
+  return addInferenceUsage(
+    total,
+    invocation.settlement?.usage ?? {
+      promptTokens: reservation.promptTokens,
+      completionTokens: reservation.completionTokens,
+      totalTokens: reservation.promptTokens + reservation.completionTokens
+    },
+    invocation.settlement?.cost ?? reservation.cost,
+    direction
+  );
+}
+function addInferenceUsage(
+  total: InferenceUsageTotals,
+  usage: ModelUsage,
+  cost: InferenceCost,
+  direction: 1 | -1
+): InferenceUsageTotals {
+  const knownCosts = { ...total.knownCosts };
+  if (cost.currency !== undefined && cost.amount !== undefined)
+    knownCosts[cost.currency] = (knownCosts[cost.currency] ?? 0) + direction * cost.amount;
+  return Object.freeze({
+    invocations: total.invocations + direction,
+    usage: Object.freeze({
+      promptTokens: total.usage.promptTokens + direction * usage.promptTokens,
+      completionTokens: total.usage.completionTokens + direction * usage.completionTokens,
+      totalTokens: total.usage.totalTokens + direction * usage.totalTokens,
+      cacheReadTokens: total.usage.cacheReadTokens + direction * (usage.cacheReadTokens ?? 0),
+      cacheWriteTokens: total.usage.cacheWriteTokens + direction * (usage.cacheWriteTokens ?? 0),
+      reasoningTokens: total.usage.reasoningTokens + direction * (usage.reasoningTokens ?? 0)
+    }),
+    knownCosts: Object.freeze(knownCosts),
+    unknownPricedTokens: total.unknownPricedTokens + direction * cost.unknownTokens
+  });
 }

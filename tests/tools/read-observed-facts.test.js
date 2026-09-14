@@ -176,7 +176,7 @@ test('read-tool observedFacts reaches durable observations, session context, pro
       };
     }
   };
-  const runtime = new AgentRuntime({
+  const runtime = new AgentRuntime({ maxOutputTokens: 64,
     provider,
     model: 'observedFacts-model',
     repositories: { events, session: { repository: sessions, descriptor: session }, artifacts },

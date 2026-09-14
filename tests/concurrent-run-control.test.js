@@ -227,7 +227,7 @@ test('an older driver settles A while R2 independently settles, without replacin
         ...request,
         stage: 'settled',
         effect: responseSettlement.state,
-        settlementEventId: 'r2:settled'
+        settlementReference: { runId, eventId: 'r2:settled', sequence: 1, hash: 'a'.repeat(64) }
       })
     )
   ]);
@@ -417,4 +417,33 @@ test('owning codecs reject rewritten original model calls, duplicate effect auth
     }),
     /Original tool source/u
   );
+});
+
+test('independent resource observations cannot invalidate an unchanged driver write', async () => {
+  const events = new InMemoryEventRepository(agentEventCodec);
+  const runs = new AgentRunCoordinator(events, new InMemoryArtifactRepository());
+  await runs.accept(acceptance('observation-race'));
+  const driver = await runs.attach('observation-race');
+  const append = events.appendConditional.bind(events);
+  let injected = false;
+  events.appendConditional = async (runId, event, options) => {
+    if (!injected) {
+      injected = true;
+      await events.append(runId, { type: 'resource.observed', runId, resourceId: 'background', details: { cursorEnd: 12 } });
+    }
+    return append(runId, event, options);
+  };
+  await driver.append({ type: 'resource.observed', runId: 'observation-race', resourceId: 'foreground', details: { cursorEnd: 1 } }, 'foreground-observation');
+  assert.ok(await events.referenceByKey('observation-race', 'foreground-observation'));
+  assert.equal((await runs.inspect('observation-race')).state.revision, driver.state().revision);
+});
+
+test('a replacement driver still fences a write racing with observations', async () => {
+  const events = new InMemoryEventRepository(agentEventCodec);
+  const runs = new AgentRunCoordinator(events, new InMemoryArtifactRepository());
+  await runs.accept(acceptance('fenced-observation'));
+  const driver = await runs.attach('fenced-observation');
+  await runs.attach('fenced-observation');
+  await assert.rejects(driver.append({ type: 'resource.observed', runId: 'fenced-observation', resourceId: 'old-driver', details: {} }, 'stale-observation'), /driver|fenc/i);
+  assert.equal(await events.referenceByKey('fenced-observation', 'stale-observation'), undefined);
 });

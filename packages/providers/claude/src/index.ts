@@ -15,6 +15,7 @@ import {
   parseModelResponse,
   requiredProtocolRevision,
   type CompiledModelRequest,
+  type ModelCompilationOptions,
   type ModelContentPart,
   type ModelInputItem,
   type ModelOutputItem,
@@ -42,7 +43,6 @@ export interface ClaudeProviderOptions {
   readonly model?: string;
   readonly fetch?: typeof fetch;
   readonly modelProfiles?: Readonly<Record<string, ClaudeModelProfileDefinition>>;
-  readonly defaultOutputTokens?: number;
   readonly countTokens?: boolean;
   readonly maxConcurrentCounts?: number;
 }
@@ -57,11 +57,6 @@ export class ClaudeProvider implements ModelProvider {
   constructor(private readonly options: ClaudeProviderOptions = {}) {
     this.baseUrl = (options.baseUrl ?? 'https://api.anthropic.com/v1').replace(/\/+$/u, '');
     this.fetchImpl = options.fetch ?? globalThis.fetch;
-    if (
-      options.defaultOutputTokens !== undefined &&
-      (!Number.isSafeInteger(options.defaultOutputTokens) || options.defaultOutputTokens < 1)
-    )
-      throw new RangeError('defaultOutputTokens must be positive.');
     if (
       options.maxConcurrentCounts !== undefined &&
       (!Number.isSafeInteger(options.maxConcurrentCounts) || options.maxConcurrentCounts < 1)
@@ -124,12 +119,20 @@ export class ClaudeProvider implements ModelProvider {
       })
     );
   }
-  async compileRequest(request: ModelRequest): Promise<CompiledModelRequest> {
+  async compileRequest(
+    request: ModelRequest,
+    options?: ModelCompilationOptions
+  ): Promise<CompiledModelRequest> {
     try {
       request = parseModelRequest(request);
       request.signal?.throwIfAborted();
       const cached = this.compiledRequests.get(request);
-      if (cached) return cached;
+      if (
+        cached &&
+        (options?.outputReservation === undefined ||
+          options.outputReservation === cached.accounting.outputReservation)
+      )
+        return cached;
       const profile = await this.describeModel(request.model);
       assertModelRequestSupported(profile, request);
       for (const [index, item] of request.messages.entries())
@@ -142,8 +145,18 @@ export class ClaudeProvider implements ModelProvider {
             this.id,
             requiredProtocolRevision(await this.describeModel(request.model))
           );
-      const body = claudeRequest(request, this.options.defaultOutputTokens ?? 4096);
-      const tokens = this.options.countTokens ? await this.countInput(body, request.signal) : undefined;
+      const maxOutputTokens = request.maxOutputTokens ?? options?.outputReservation;
+      if (maxOutputTokens === undefined)
+        throw new ModelProviderError({
+          provider: this.id,
+          code: 'invalid_request',
+          message: 'Claude requires an explicit output allowance for max_tokens.'
+        });
+      request = parseModelRequest({ ...request, maxOutputTokens });
+      const body = claudeRequest(request, maxOutputTokens);
+      const tokens = this.options.countTokens
+        ? await this.countInput(body, request.signal)
+        : undefined;
       const compiled = await compileModelRequest({
         request,
         profile,
@@ -178,7 +191,10 @@ export class ClaudeProvider implements ModelProvider {
     const signal = modelTransportSignal(compiled.logicalRequest, options);
     try {
       const response = await this.post('/messages', { ...compiled.body, stream: false }, signal);
-      return await this.decodeResponse(compiled.logicalRequest, await readBoundedJsonResponse(response));
+      return await this.decodeResponse(
+        compiled.logicalRequest,
+        await readBoundedJsonResponse(response)
+      );
     } catch (error) {
       throw this.normalize(error, signal);
     }
@@ -226,7 +242,10 @@ export class ClaudeProvider implements ModelProvider {
           continue;
         }
         if (!message)
-          throw this.error('malformed_response', 'Claude stream item arrived before message_start.');
+          throw this.error(
+            'malformed_response',
+            'Claude stream item arrived before message_start.'
+          );
         if (part.type === 'content_block_start') {
           const index = blockIndex(part.index);
           if (blocks.has(index)) throw this.error('malformed_response', 'Duplicate content block.');
@@ -239,7 +258,11 @@ export class ClaudeProvider implements ModelProvider {
           if (!block || stopped.has(index))
             throw this.error('malformed_response', 'Delta has no active content block.');
           const delta = parseJsonObject(part.delta);
-          if (delta.type === 'text_delta' && block.type === 'text' && typeof delta.text === 'string') {
+          if (
+            delta.type === 'text_delta' &&
+            block.type === 'text' &&
+            typeof delta.text === 'string'
+          ) {
             block.text = `${typeof block.text === 'string' ? block.text : ''}${delta.text}`;
             content += delta.text;
             if (delta.text) yield { type: 'content', content: delta.text, accumulated: content };
@@ -269,7 +292,8 @@ export class ClaudeProvider implements ModelProvider {
             typeof delta.partial_json === 'string'
           )
             inputs.set(index, `${inputs.get(index) ?? ''}${delta.partial_json}`);
-          else throw this.error('malformed_response', 'Unknown or incompatible Claude content delta.');
+          else
+            throw this.error('malformed_response', 'Unknown or incompatible Claude content delta.');
           continue;
         }
         if (part.type === 'content_block_stop') {
@@ -280,7 +304,8 @@ export class ClaudeProvider implements ModelProvider {
           const input = inputs.get(index);
           if (input !== undefined) block.input = parseJsonObject(JSON.parse(input) as unknown);
           stopped.add(index);
-          if (block.type === 'tool_use') yield { type: 'tool_call', toolCall: claudeToolCall(block) };
+          if (block.type === 'tool_use')
+            yield { type: 'tool_call', toolCall: claudeToolCall(block) };
           continue;
         }
         if (part.type === 'message_delta') {
@@ -295,7 +320,10 @@ export class ClaudeProvider implements ModelProvider {
         }
         if (part.type === 'message_stop') {
           if (blocks.size !== stopped.size)
-            throw this.error('malformed_response', 'Claude stopped with unfinished content blocks.');
+            throw this.error(
+              'malformed_response',
+              'Claude stopped with unfinished content blocks.'
+            );
           ended = true;
           break;
         }
@@ -346,9 +374,14 @@ export class ClaudeProvider implements ModelProvider {
       } else if (block.type === 'thinking' || block.type === 'redacted_thinking') {
         if (
           block.type === 'thinking' &&
-          (typeof block.thinking !== 'string' || typeof block.signature !== 'string' || !block.signature)
+          (typeof block.thinking !== 'string' ||
+            typeof block.signature !== 'string' ||
+            !block.signature)
         )
-          throw this.error('malformed_response', 'Claude thinking block lacks its original signature.');
+          throw this.error(
+            'malformed_response',
+            'Claude thinking block lacks its original signature.'
+          );
         if (block.type === 'redacted_thinking' && (typeof block.data !== 'string' || !block.data))
           throw this.error('malformed_response', 'Claude redacted thinking lacks data.');
         if (typeof block.thinking === 'string') reasoningSummary += block.thinking;
@@ -430,7 +463,11 @@ export class ClaudeProvider implements ModelProvider {
     if (!key) throw this.error('invalid_request', 'Claude requires explicit API credentials.');
     const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
       method: 'POST',
-      headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      headers: {
+        'x-api-key': key,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json'
+      },
       body: JSON.stringify(body),
       ...(signal ? { signal } : {})
     });
@@ -467,7 +504,7 @@ export class ClaudeProvider implements ModelProvider {
     );
   }
 }
-function claudeRequest(request: ModelRequest, defaultOutput: number): Record<string, unknown> {
+function claudeRequest(request: ModelRequest, maxOutputTokens: number): Record<string, unknown> {
   const system: unknown[] = [];
   const messages: { role: 'user' | 'assistant'; content: unknown[] }[] = [];
   const append = (role: 'user' | 'assistant', content: unknown[]) => {
@@ -526,7 +563,7 @@ function claudeRequest(request: ModelRequest, defaultOutput: number): Record<str
   }
   const body: Record<string, unknown> = {
     model: request.model,
-    max_tokens: request.maxOutputTokens ?? defaultOutput,
+    max_tokens: maxOutputTokens,
     messages,
     ...(system.length ? { system } : {})
   };
@@ -558,7 +595,8 @@ function claudeRequest(request: ModelRequest, defaultOutput: number): Record<str
       throw new ModelProviderError({
         provider: 'claude',
         code: 'invalid_request',
-        message: 'Claude manual thinking needs a budget >= 1024 below max output and no sampling controls.'
+        message:
+          'Claude manual thinking needs a budget >= 1024 below max output and no sampling controls.'
       });
     body.thinking = { type: 'enabled', budget_tokens: request.reasoning.maxTokens };
   }
@@ -580,7 +618,9 @@ function claudePart(part: ModelContentPart): unknown {
         type: 'base64',
         media_type: part.image.mediaType,
         data:
-          part.image.type === 'base64' ? part.image.data : Buffer.from(part.image.data).toString('base64')
+          part.image.type === 'base64'
+            ? part.image.data
+            : Buffer.from(part.image.data).toString('base64')
       }
     };
   if (part.type === 'document' && part.source.type !== 'file')
@@ -638,15 +678,19 @@ function blockIndex(value: unknown): number {
   return value;
 }
 
-function claudePayloadPaths(body: Record<string, unknown>): readonly (readonly (string | number)[])[] {
+function claudePayloadPaths(
+  body: Record<string, unknown>
+): readonly (readonly (string | number)[])[] {
   const paths: (string | number)[][] = [];
   if (!Array.isArray(body.messages)) return paths;
   const visit = (value: unknown, path: (string | number)[]): void => {
     if (!Array.isArray(value)) return;
     for (const [index, raw] of (value as unknown[]).entries()) {
       const block = parseJsonObject(raw);
-      if (block.type === 'thinking' || block.type === 'redacted_thinking') paths.push([...path, index]);
-      else if (block.type === 'image' || block.type === 'document') paths.push([...path, index, 'source']);
+      if (block.type === 'thinking' || block.type === 'redacted_thinking')
+        paths.push([...path, index]);
+      else if (block.type === 'image' || block.type === 'document')
+        paths.push([...path, index, 'source']);
       else if (block.type === 'tool_result') visit(block.content, [...path, index, 'content']);
     }
   };

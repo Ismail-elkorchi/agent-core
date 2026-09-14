@@ -176,7 +176,8 @@ test('model renewal uses invocation identity and retains its own complete tool e
       };
     }
   };
-  const result = await new AgentRuntime({ ...state.options, provider }).run({
+  const result = await new AgentRuntime({
+    ...state.options, provider }).run({
     task: 'Current accepted task'
   }).result;
   assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
@@ -231,7 +232,7 @@ test('definitive provider overflow retries only a reduced admitted selection and
       }
     };
     const result = await new AgentRuntime({
-      ...state.options,
+    ...state.options,
       provider,
       contextRenewal: { automatic: true }
     }).run({ task: 'Current work' }).result;
@@ -294,7 +295,7 @@ for (const [length, retainedNotes] of [
     });
     state.setCapacity(6000);
     const result = await new AgentRuntime({
-      ...state.options,
+    ...state.options,
       contextRenewal: { automatic: true }
     }).run({ task: 'Continue the same task.' }).result;
     assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
@@ -383,11 +384,56 @@ test('definitive provider rejection cannot be retried by resuming the same input
       });
     }
   };
-  const runtime = new AgentRuntime({ ...state.options, provider });
+  const runtime = new AgentRuntime({
+    ...state.options, provider });
   const result = await runtime.run({ task: 'Keep this original instruction.' }).result;
   assert.equal(result.reason, 'context_admission', JSON.stringify(result));
   const resumed = await runtime.resume(result.runId).result;
   assert.equal(resumed.reason, 'context_admission', JSON.stringify(resumed));
   assert.equal(requests, 1);
   assert.equal((await state.context.inspect()).admission.status, 'blocked');
+});
+
+test('retained source membership cannot reorder original user and assistant turns', async () => {
+  const state = await fixture();
+  const runtime = new AgentRuntime(state.options);
+  await runtime.run({ task: 'First original request.' }).result;
+  await runtime.run({ task: 'Second original correction.' }).result;
+  const originals = await state.history.search({ query: '', limit: 100 });
+  const retained = originals.items.map((item) => item.source).reverse();
+  const cut = await state.history.capture();
+  await state.context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
+    idempotencyKey: 'reversed-membership', reason: 'Retain all originals.', selection: { strategy: 'sources', retained, notes: [] } });
+  const result = await new AgentRuntime(state.options).run({ task: 'Follow up.' }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  const messages = state.requests.at(-1).messages.filter((item) => item.role === 'user' || item.role === 'assistant');
+  assert.deepEqual(messages.map((item) => item.content), ['First original request.', 'Recorded answer.', 'Second original correction.', 'Recorded answer.', 'Follow up.']);
+});
+
+test('source byte exhaustion automatically selects a bounded window before provider dispatch', { timeout: 120000 }, async () => {
+  const state = await fixture();
+  state.setCapacity(10000000);
+  const runtime = new AgentRuntime(state.options);
+  for (let index = 0; index < 11; index++) {
+    const result = await runtime.run({ task: `Original ${index}: ${'x'.repeat(750000)}` }).result;
+    assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  }
+  const before = state.requests.length;
+  const task = `Current accepted input: ${'y'.repeat(200000)}`;
+  const suspended = await new AgentRuntime(state.options).run({ runId: 'source-overflow', task }).result;
+  assert.equal(suspended.reason, 'context_admission', JSON.stringify(suspended));
+  assert.equal(suspended.contextAdmission.kind, 'source_capacity');
+  assert.equal(suspended.contextAdmission.inputIdentity, undefined);
+  assert.equal(state.requests.length, before);
+  const tiny = new ContextService({ repository: state.sessions, session: state.session, history: state.history,
+    notes: state.notes, policy: { maxSourceBytes: 1, historyRead: { history: state.history, isAvailable: () => true } } });
+  const blocked = await new AgentRuntime({ ...state.options, context: tiny, contextRenewal: { automatic: true } }).resume('source-overflow').result;
+  assert.equal(blocked.reason, 'context_admission', JSON.stringify(blocked));
+  assert.equal(state.requests.length, before);
+  const result = await new AgentRuntime({ ...state.options, contextRenewal: { automatic: true } }).resume('source-overflow').result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.equal(state.requests.length, before + 1);
+  assert.equal(state.requests.at(-1).messages.filter((item) => item.content === task).length, 1);
+  assert.ok(JSON.stringify(state.requests.at(-1)).length < 500000);
+  assert.equal((await state.context.inspect()).window.selection.strategy, 'sources');
 });

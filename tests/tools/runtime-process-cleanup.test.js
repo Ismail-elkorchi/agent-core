@@ -92,7 +92,7 @@ async function setup() {
   return { root, artifacts, manager, events, services };
 }
 function createRuntime(input) {
-  return new AgentRuntime({
+  return new AgentRuntime({ maxOutputTokens: 64,
     provider: input.provider,
     model: 'scripted',
     toolBoundary: boundary,
@@ -276,7 +276,7 @@ test('cleanup failure transforms prior partial, completed, and aborted decisions
   for (const item of cases) {
     const state = await setup();
     const failingManager = commandExecutionWithCleanupFailure(state.manager, 'cleanup failed');
-    const agent = new AgentRuntime({
+    const agent = new AgentRuntime({ maxOutputTokens: 64,
       provider: item.provider,
       model: 'scripted',
       toolBoundary: boundary,
@@ -370,7 +370,7 @@ test('an explicitly admitted work owner keeps a process across runs with its ori
     toolContext: { services: state.services },
     resources
   };
-  const first = await new AgentRuntime({
+  const first = await new AgentRuntime({ maxOutputTokens: 64,
     ...options,
     provider: new Provider([
       toolResponse('exec_command', { command: longCommand, yieldMs: 100 }),
@@ -405,7 +405,7 @@ test('an explicitly admitted work owner keeps a process across runs with its ori
     state.manager.query(processId, 100, 20, 0, { ...laterOwner, ownerId: 'different-work' }),
     /another resource owner/
   );
-  const second = await new AgentRuntime({
+  const second = await new AgentRuntime({ maxOutputTokens: 64,
     ...options,
     provider: new Provider([done]),
     tools: []

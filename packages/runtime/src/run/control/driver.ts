@@ -854,16 +854,7 @@ export class AgentRunDriver {
     idempotencyKey: string
   ): Promise<EventAppendReceipt> {
     this.assertEventAuthority(event);
-    const result = await this.events.appendConditional(this.stateValue.runId, event, {
-      idempotencyKey,
-      expectedTail: this.tailValue,
-      driverGeneration: this.stateValue.driverGeneration
-    });
-    if (
-      result.kind === 'rejected' &&
-      (result.reason === 'stale_tail' || result.reason === 'stale_driver')
-    )
-      await this.refresh();
+    const result = await this.appendAtCurrentState(event, idempotencyKey);
     const committed = acceptConditionalResult(this.stateValue.runId, result);
     this.tailValue = committed.tail;
     return committed.receipt;
@@ -940,21 +931,32 @@ export class AgentRunDriver {
       event.transition,
       new AgentRunRecords(this.artifacts)
     );
-    const result = await this.events.appendConditional(state.runId, event, {
-      idempotencyKey: transitionKey(state, event.transition),
-      expectedTail: this.tailValue,
-      driverGeneration: state.driverGeneration
-    });
-    if (
-      result.kind === 'rejected' &&
-      (result.reason === 'stale_tail' || result.reason === 'stale_driver')
-    )
-      await this.refresh();
+    const result = await this.appendAtCurrentState(event, transitionKey(state, event.transition));
     const committed = acceptConditionalResult(state.runId, result);
     this.stateValue = ownedState;
     this.tailValue = committed.tail;
     this.transitionValue = committed.receipt;
     return this.inspection();
+  }
+
+  private async appendAtCurrentState(event: AgentEvent, idempotencyKey: string) {
+    const expectedState = this.stateValue;
+    for (;;) {
+      const result = await this.events.appendConditional(expectedState.runId, event, {
+        idempotencyKey,
+        expectedTail: this.tailValue,
+        driverGeneration: expectedState.driverGeneration
+      });
+      if (
+        result.kind !== 'rejected' ||
+        (result.reason !== 'stale_tail' && result.reason !== 'stale_driver')
+      )
+        return result;
+      await this.refresh();
+      // Independent observations may extend the ledger without changing control.
+      // A changed driver, phase, budget, or abort decision must still reject this write.
+      if (result.reason === 'stale_driver' || this.stateValue !== expectedState) return result;
+    }
   }
 
   private inspection(): AgentRunInspection {
@@ -1137,6 +1139,7 @@ function abortAdministrativeEvent(event: AgentAuditEvent): boolean {
     event.type === 'run.ended' ||
     event.type === 'delivery.failed' ||
     event.type === 'resource.released' ||
+    event.type === 'resource.observed' ||
     (event.type === 'run.phase.changed' && event.phase === 'finalizing')
   );
 }

@@ -806,13 +806,12 @@ async function runTrial({
             invocationId,
             ownerId: runId,
             purpose: 'context-policy-note',
+            outputReservation: options.maxOutputTokens,
             request,
             profile,
             signal
           });
-          const settlement = (await invocationRepository.load(runId)).invocations.get(
-            invocationId
-          )?.settlement;
+          const settlement = (await invocationRepository.load(runId, { invocationId })).invocation?.settlement;
           if (!settlement) throw new Error('Missing durable note settlement.');
           addUsage(result.metrics, settlement);
           const sourceView = await readHistoryEntries(history);
@@ -873,13 +872,10 @@ async function runTrial({
   ).length;
   for (const runId of result.runIds) {
     const state = await invocationRepository.load(runId);
-    for (const invocation of state.invocations.values()) {
-      if (invocation.settlement) result.metrics.settledInvocations += 1;
-      else {
-        result.metrics.uncertainInvocations += 1;
-        result.metrics.costStatus = 'unknown-or-partial';
-      }
-    }
+    result.metrics.settledInvocations += state.settledUsage.invocations;
+    const unsettled = state.committed.invocations - state.settledUsage.invocations;
+    result.metrics.uncertainInvocations += unsettled;
+    if (unsettled > 0) result.metrics.costStatus = 'unknown-or-partial';
   }
   result.metrics.latencyMs = Math.round(performance.now() - start);
   result.metrics.accountingRequests = accounting.requests - accountingStart;

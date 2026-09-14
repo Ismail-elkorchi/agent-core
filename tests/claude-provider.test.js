@@ -67,3 +67,15 @@ test('Claude bounded provider counting resolves opaque/media admission and sends
   assert.deepEqual(calls[0][1].messages, calls[1][1].messages);
   assert.equal('max_tokens' in calls[0][1], false);
 });
+
+test('Claude requires a host allowance and compiles an explicit reservation into max_tokens', async () => {
+  let calls = 0;
+  const provider = new ClaudeProvider({ apiKey: 'fixture', fetch: async () => { calls++; return Response.json(payload); } });
+  const request = { model: initial.model, messages: initial.messages };
+  await assert.rejects(provider.compileRequest(request), /explicit output allowance/);
+  assert.equal(calls, 0);
+  const compiled = await provider.compileRequest(request, { outputReservation: 900 });
+  assert.equal(compiled.body.max_tokens, 900);
+  assert.equal(compiled.logicalRequest.maxOutputTokens, 900);
+  assert.equal(compiled.accounting.outputReservation, 900);
+});

@@ -243,6 +243,70 @@ export class HistoryReader {
     return entry.type === 'context_transition' ? entry.window : undefined;
   }
 
+  /** Original conversation order is branch position, then sequence within that run. */
+  orderSources(
+    sources: readonly HistorySourceRef[],
+    cut: HistorySourceCut
+  ): Promise<readonly HistorySourceRef[]> {
+    return this.order(sources, (source) => source, cut);
+  }
+
+  orderEntries(
+    entries: readonly SessionBranchEntry[],
+    cut: HistorySourceCut
+  ): Promise<readonly SessionBranchEntry[]> {
+    return this.order(entries, (entry) => sourceRef(cut.sessionId, entry), cut);
+  }
+
+  private async order<T>(
+    values: readonly T[],
+    sourceOf: (value: T) => HistorySourceRef,
+    cut: HistorySourceCut
+  ): Promise<readonly T[]> {
+    const snapshot = await this.snapshot(cut);
+    const index = metadataIndex(snapshot);
+    const heads = new Map(cut.ledgerHeads?.map((head) => [head.runId, head]));
+    const unique = new Map<
+      string,
+      { source: HistorySourceRef; value: T; position: number; sequence: number }
+    >();
+    for (const value of values) {
+      const source = sourceOf(value);
+      if (source.sessionId !== cut.sessionId)
+        throw new Error('Selected source belongs to another session.');
+      let position: number | undefined;
+      let sequence = -1;
+      if (source.event && cut.ledgerCoverage === 'authoritative') {
+        const head =
+          heads.get(source.event.runId) ?? (await this.head(source.event.runId, cut, snapshot));
+        heads.set(source.event.runId, head);
+        if (
+          source.entryId !== `event:${source.event.eventId}` ||
+          source.sha256 !== source.event.hash ||
+          source.event.sequence > head.sequence
+        )
+          throw new Error('Selected event is outside its authorized history boundary.');
+        position = index.inputs.get(source.event.runId);
+        sequence = source.event.sequence;
+      } else {
+        const metadata = index.bySource.get(source.entryId);
+        if (metadata && sameHistorySource(metadataSource(cut.sessionId, metadata), source))
+          position = index.positions.get(metadata.entryId);
+      }
+      if (position === undefined)
+        throw new Error('Selected source is outside the authorized branch.');
+      const previous = unique.get(source.entryId);
+      if (previous && !sameHistorySource(previous.source, source))
+        throw new Error('Selected source identities conflict.');
+      unique.set(source.entryId, { source, value, position, sequence });
+    }
+    return Object.freeze(
+      [...unique.values()]
+        .sort((a, b) => a.position - b.position || a.sequence - b.sequence)
+        .map(({ value }) => value)
+    );
+  }
+
   async resolve(
     source: HistorySourceRef,
     cut?: HistorySourceCut,
@@ -984,10 +1048,18 @@ function decodeCursor(value: string): SearchCursor {
 }
 
 export function sameHistorySource(left: HistorySourceRef, right: HistorySourceRef): boolean {
-  return hashJson(left) === hashJson(right);
+  return (
+    left.sessionId === right.sessionId &&
+    left.entryId === right.entryId &&
+    left.sha256 === right.sha256 &&
+    left.event?.runId === right.event?.runId &&
+    left.event?.eventId === right.event?.eventId &&
+    left.event?.sequence === right.event?.sequence &&
+    left.event?.hash === right.event?.hash
+  );
 }
 
-class HistorySourceTooLargeError extends Error {
+export class HistorySourceTooLargeError extends Error {
   constructor(
     readonly source: HistorySourceRef,
     readonly bytes: number

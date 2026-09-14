@@ -18,7 +18,8 @@ import { decodeToolCall } from '@agent-core/tools';
 import type { AgentEvent, AgentProviderStateSummary } from '../events.js';
 import type { HistorySourceCut } from '../history/contracts.js';
 import type { ContextWindowRecord } from '../context/contracts.js';
-import { HistoryReader, sourceRef } from '../history/reader.js';
+import { ContextSourceCapacityError } from '../run/context-admission.js';
+import { HistorySourceTooLargeError, HistoryReader, sourceRef } from '../history/reader.js';
 import { readTransformedContext } from '../inference/context-transform.js';
 import { ModelWindow, type ModelWindowImageLimits } from '../inference/model-window.js';
 import type { SessionBranchEntry } from '../session/contracts.js';
@@ -237,7 +238,10 @@ export interface SelectedHistorySources {
 
 /** Resolve only the selected originals and the bounded tail following their immutable cut. */
 // One bounded selected window per reader; immutable cuts remain the authority.
-const selectedSourceCache = new WeakMap<HistoryReader, SelectedHistorySources>();
+const selectedSourceCache = new WeakMap<
+  HistoryReader,
+  { readonly value: SelectedHistorySources; readonly bytes: number }
+>();
 export async function readSelectedHistorySources(
   history: HistoryReader,
   cut?: HistorySourceCut
@@ -247,37 +251,59 @@ export async function readSelectedHistorySources(
   const cached = selectedSourceCache.get(history);
   const previous =
     cached &&
-    cached.contextWindow?.windowId === contextWindow?.windowId &&
-    (await history.extendsCut(cached.cut, cut))
+    cached.value.contextWindow?.windowId === contextWindow?.windowId &&
+    (await history.extendsCut(cached.value.cut, cut))
       ? cached
       : undefined;
 
-  const entries: SessionBranchEntry[] = [];
-  const ids = new Set<string>();
-  let bytes = 0;
+  const entries: SessionBranchEntry[] = [...(previous?.value.entries ?? [])];
+  const ids = new Set(entries.map((entry) => sourceRef(cut.sessionId, entry).entryId));
+  let bytes = previous?.bytes ?? 0;
   const append = (entry: SessionBranchEntry) => {
     const id = sourceRef(cut.sessionId, entry).entryId;
     if (ids.has(id)) return;
     bytes += new TextEncoder().encode(JSON.stringify(entry)).byteLength;
     if (bytes > 8 * 1024 * 1024 || entries.length >= 10000)
-      throw new Error(
-        'Selected original context exceeds the bounded source read. Select a smaller window explicitly.'
+      throw new ContextSourceCapacityError(
+        cut,
+        bytes > 8 * 1024 * 1024
+          ? { unit: 'bytes', limit: 8 * 1024 * 1024, observedAtLeast: bytes }
+          : { unit: 'entries', limit: 10000, observedAtLeast: entries.length + 1 }
       );
     entries.push(entry);
     ids.add(id);
   };
-  for (const entry of previous?.entries ?? []) append(entry);
   for (const source of previous ? [] : (contextWindow?.selection.retained ?? [])) {
-    const entry = await history.resolve(source, cut);
+    let entry;
+    try {
+      entry = await history.resolve(source, cut, Math.max(1, 8 * 1024 * 1024 - bytes));
+    } catch (error) {
+      if (!(error instanceof HistorySourceTooLargeError)) throw error;
+      throw new ContextSourceCapacityError(
+        cut,
+        {
+          unit: 'bytes',
+          limit: 8 * 1024 * 1024,
+          observedAtLeast: Math.max(8 * 1024 * 1024 + 1, bytes + error.bytes)
+        },
+        source
+      );
+    }
     if (!entry) throw new Error('Committed context source is unavailable at its history cut.');
     append(entry);
   }
   let cursor: string | undefined;
   do {
+    if (bytes >= 8 * 1024 * 1024)
+      throw new ContextSourceCapacityError(cut, {
+        unit: 'bytes',
+        limit: 8 * 1024 * 1024,
+        observedAtLeast: bytes + 1
+      });
     const page = await history.page({
       cut,
       ...(previous
-        ? { after: previous.cut }
+        ? { after: previous.value.cut }
         : contextWindow
           ? { after: contextWindow.historyPosition }
           : {}),
@@ -285,19 +311,28 @@ export async function readSelectedHistorySources(
       limit: 1000,
       maxBytes: 8 * 1024 * 1024 - bytes
     });
-    if (page.unavailable?.length)
-      throw new Error(
-        'Selected original context source exceeds its bounded read; explicit source selection is required.'
+    const unavailable = page.unavailable?.[0];
+    if (unavailable)
+      throw new ContextSourceCapacityError(
+        cut,
+        unavailable.records
+          ? { unit: 'records', limit: 1000, observedAtLeast: unavailable.records }
+          : {
+              unit: 'bytes',
+              limit: 8 * 1024 * 1024,
+              observedAtLeast: Math.max(8 * 1024 * 1024 + 1, bytes + unavailable.bytes)
+            },
+        unavailable.source
       );
     for (const entry of page.entries) append(entry);
     cursor = page.cursor;
   } while (cursor);
   const result = Object.freeze({
     cut,
-    entries: Object.freeze(entries),
+    entries: await history.orderEntries(entries, cut),
     ...(contextWindow ? { contextWindow } : {})
   });
-  selectedSourceCache.set(history, result);
+  selectedSourceCache.set(history, { value: result, bytes });
   return result;
 }
 

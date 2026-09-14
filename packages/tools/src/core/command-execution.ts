@@ -101,6 +101,10 @@ export interface CommandExecutionResult {
   readonly stderr: CommandOutputView;
   readonly combined: CommandOutputView;
   readonly artifact?: PublicArtifactRef;
+  /** Original output coverage is independent of this result's presentation window. */
+  readonly originalOutput?:
+    | Readonly<{ kind: 'captured'; cursorEnd: number; omittedBytes: number }>
+    | Readonly<{ kind: 'unavailable'; cursorEnd: number; diagnostic: string }>;
   readonly exitCode?: number | null;
   readonly signal?: string | null;
   readonly diagnostic?: string;
@@ -168,7 +172,8 @@ export async function planCommandExecution(
   authority: CommandExecution,
   request: CommandExecutionPlanRequest
 ): Promise<CommandExecutionPlan> {
-  if (!isCommandExecution(authority)) throw new TypeError('Command execution authority was not adopted.');
+  if (!isCommandExecution(authority))
+    throw new TypeError('Command execution authority was not adopted.');
   validateCommandExecutionPlanRequest(request);
   const source = await authority.plan(request);
   if (!isCommandExecutionReservation(source)) {
@@ -183,7 +188,9 @@ export async function planCommandExecution(
   return plan;
 }
 
-export function isCommandExecutionReservation(value: unknown): value is CommandExecutionReservation {
+export function isCommandExecutionReservation(
+  value: unknown
+): value is CommandExecutionReservation {
   return (
     typeof value === 'object' &&
     value !== null &&
@@ -267,7 +274,8 @@ function validateCommandExecutionPlanRequest(request: CommandExecutionPlanReques
     throw new TypeError('Command must be non-empty.');
   if (typeof request.rootedDirectory !== 'string')
     throw new TypeError('Command rooted directory must be a string.');
-  if (typeof request.pty !== 'boolean') throw new TypeError('Command PTY selection must be boolean.');
+  if (typeof request.pty !== 'boolean')
+    throw new TypeError('Command PTY selection must be boolean.');
   for (const [name, value] of [
     ['timeoutMs', request.timeoutMs],
     ['yieldMs', request.yieldMs],
@@ -293,7 +301,12 @@ export function isCommandExecution(value: unknown): value is CommandExecution {
 }
 
 function validIdentity(value: unknown): value is string {
-  if (typeof value !== 'string' || value.length === 0 || value.length > 256 || value.trim() !== value)
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.length > 256 ||
+    value.trim() !== value
+  )
     return false;
   for (const character of value) {
     const codePoint = character.codePointAt(0);

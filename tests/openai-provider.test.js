@@ -799,3 +799,13 @@ function sseResponse(chunks) {
     headers: { 'content-type': 'text/event-stream' }
   });
 }
+
+test('OpenAI compilation uses an explicit reservation without an adapter output default', async () => {
+  const provider = new OpenAIProvider({ apiKey: 'fixture' });
+  const request = { model: 'gpt-5.6-sol', messages: [{ role: 'user', content: 'Hello.' }] };
+  const uncapped = await provider.compileRequest(request);
+  assert.equal(uncapped.body.max_output_tokens, undefined);
+  const governed = await provider.compileRequest(request, { outputReservation: 900 });
+  assert.equal(governed.body.max_output_tokens, 900);
+  assert.equal(governed.accounting.outputReservation, 900);
+});

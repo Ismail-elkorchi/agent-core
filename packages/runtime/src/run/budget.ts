@@ -1,4 +1,4 @@
-import type { InferenceCharges } from '../inference/service.js';
+import type { InferenceUsageTotals } from '../inference/repository.js';
 import type { AgentRunDriver } from './control/driver.js';
 
 import type { ToolCall } from '@agent-core/tools';
@@ -114,28 +114,9 @@ export class AgentRunBudget {
     return Object.freeze({ ...previous, totalToolCalls: total });
   }
 
-  async recordUsage(charges: readonly InferenceCharges[]): Promise<void> {
+  async recordUsage(totals: InferenceUsageTotals): Promise<void> {
     const previous = this.snapshot();
-    const usage = {
-      promptTokens: 0,
-      completionTokens: 0,
-      cacheReadTokens: 0,
-      cacheWriteTokens: 0,
-      reasoningTokens: 0
-    };
-    const knownCosts: Record<string, number> = {};
-    let unknownPricedTokens = 0;
-    for (const charge of charges) {
-      usage.promptTokens += charge.usage.promptTokens;
-      usage.completionTokens += charge.usage.completionTokens;
-      usage.cacheReadTokens += charge.usage.cacheReadTokens ?? 0;
-      usage.cacheWriteTokens += charge.usage.cacheWriteTokens ?? 0;
-      usage.reasoningTokens += charge.usage.reasoningTokens ?? 0;
-      const priced = charge.cost;
-      if (priced.amount !== undefined && priced.currency)
-        knownCosts[priced.currency] = (knownCosts[priced.currency] ?? 0) + priced.amount;
-      unknownPricedTokens += priced.unknownTokens;
-    }
+    const { usage, knownCosts, unknownPricedTokens } = totals;
     const { promptTokens, completionTokens } = usage;
     if (
       promptTokens < previous.promptTokens ||
@@ -150,7 +131,7 @@ export class AgentRunBudget {
       );
     const hasKnown = Object.keys(knownCosts).length > 0;
     const pricingStatus =
-      charges.length === 0
+      totals.invocations === 0
         ? previous.pricingStatus
         : unknownPricedTokens > 0
           ? hasKnown

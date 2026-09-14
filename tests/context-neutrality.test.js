@@ -182,9 +182,9 @@ test('standalone governed classifier settles structured output with no natural-l
   const replay = await service.invoke(input);
   assert.equal(replay.replayed, true);
   assert.equal(provider.calls.length, 1);
-  const state = await repository.load(input.ownerId);
-  assert.equal(state.invocations.size, 1);
-  assert.ok(state.invocations.get(input.invocationId).settlement);
+  const state = await repository.load(input.ownerId, { invocationId: input.invocationId });
+  assert.equal(state.committed.invocations, 1);
+  assert.ok(state.invocation.settlement);
 });
 
 test('read-only monitor becomes idle until a real external contribution resumes its session', async () => {

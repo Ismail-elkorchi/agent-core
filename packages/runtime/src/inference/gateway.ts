@@ -50,7 +50,7 @@ export class InferenceGateway {
     const policy = {
       outputReservation: requestWindowForModel(
         profile,
-        options?.outputReservation ?? request.maxOutputTokens
+        request.maxOutputTokens ?? options?.outputReservation
       ).maxOutputTokens
     };
     const compiled = this.provider.compileRequest

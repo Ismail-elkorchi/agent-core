@@ -7,11 +7,11 @@ import { ClaudeProvider } from '@agent-core/provider-claude';
 
 const provider = new ClaudeProvider({
   apiKey: process.env.ANTHROPIC_API_KEY,
-  defaultOutputTokens: 4096,
   countTokens: true
 });
 const response = await provider.complete({
   model: 'claude-sonnet-4-6',
+  maxOutputTokens: 512,
   messages: [{ role: 'user', content: 'Explain the result.' }]
 });
 ```
@@ -31,3 +31,5 @@ Protocol fixture sources, checked 2026-09-07:
 - [Extended thinking streaming](https://platform.claude.com/docs/en/docs/build-with-claude/extended-thinking)
 
 Deterministic tests cover signatures, redaction, deltas, endpoint/prefix rejection, missing terminal events, counting, usage and shared provider conformance. Live model/account access was not exercised.
+
+Claude requires an explicit request `maxOutputTokens` or compilation `outputReservation`; the adapter has no generation allowance default.

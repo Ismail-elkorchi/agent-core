@@ -1,3 +1,4 @@
+import { recordInferenceEvents } from './inference-audit-helper.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { compileModelRequest, createProviderContextState } from '@agent-core/model';
@@ -50,6 +51,7 @@ const profile = {
 async function fixture({ tokenCount = 32, gate, budget } = {}) {
   const artifacts = new InMemoryArtifactRepository();
   const repository = new InMemoryInferenceRepository();
+  const inferenceAudit = recordInferenceEvents(repository);
   const requests = [];
   let transforms = 0;
   const admitted = new WeakSet();
@@ -138,6 +140,7 @@ async function fixture({ tokenCount = 32, gate, budget } = {}) {
     history,
     context,
     options,
+    inferenceAudit,
     requests,
     transforms: () => transforms
   };
@@ -191,7 +194,7 @@ test('provider transform settlement is followed by actual next-generation admiss
   );
   const owner = await state.repository.load('transform-run');
   assert.deepEqual(
-    [...owner.invocations.values()].map((item) => item.start.operation),
+    state.inferenceAudit.filter(({ ownerId, event }) => ownerId === 'transform-run' && event.type === 'inference.started').map(({ event }) => event.operation),
     ['context_transform', 'generation']
   );
 });
@@ -203,11 +206,7 @@ test('oversized transformed context is charged but never activated', async () =>
   assert.equal(state.transforms(), 1);
   assert.equal((await state.context.inspect()).window, null);
   const owner = await state.repository.load('transform-run');
-  assert.ok(
-    [...owner.invocations.values()].some(
-      (item) => item.start.operation === 'context_transform' && item.settlement
-    )
-  );
+  assert.equal(owner.settledUsage.invocations, 2);
 });
 
 test('canceled native transforms remain uncertain and late results settle the original shared permit', async () => {
@@ -235,7 +234,7 @@ test('canceled native transforms remain uncertain and late results settle the or
   await assert.rejects(state.inference.transformContext(request), InferenceOutcomeUnknownError);
   assert.equal(state.transforms(), 1);
   release();
-  while (!(await state.repository.load('owner')).invocations.get('transform-one').settlement)
+  while (!(await state.repository.load('owner', { invocationId: 'transform-one' })).invocation.settlement)
     await new Promise((resolve) => setTimeout(resolve, 1));
   const replay = await state.inference.transformContext(request);
   assert.equal(replay.replayed, true);

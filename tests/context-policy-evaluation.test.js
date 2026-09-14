@@ -636,11 +636,9 @@ test('deterministic native transform settles and replays through the shared infe
   assert.deepEqual(replay.result, transformed.result);
   assert.equal(provider.transforms.length, 1);
   const owner = await repository.load('native-owner');
-  assert.deepEqual(
-    [...owner.invocations.values()].map((item) => item.start.operation),
-    ['generation', 'context_transform']
-  );
-  assert.ok([...owner.invocations.values()].every((item) => item.settlement));
+  assert.equal(owner.settledUsage.invocations, 2);
+  assert.equal((await repository.load('native-owner', { invocationId: 'primary' })).invocation.start.operation, 'generation');
+  assert.equal((await repository.load('native-owner', { invocationId: 'native-transform' })).invocation.start.operation, 'context_transform');
   await assert.rejects(
     service.invoke({ invocationId: 'too-many', ownerId: 'native-owner', purpose: 'agent-step', request }),
     InferenceBudgetExceededError

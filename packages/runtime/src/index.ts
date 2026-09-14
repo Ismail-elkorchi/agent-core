@@ -67,6 +67,7 @@ export { assertSessionImagesSupported } from './session/images.js';
 
 export { RequestAdmission, ContextAdmissionError } from './inference/request-admission.js';
 
+export { ContextSourceCapacityError } from './run/context-admission.js';
 export type { ContextAdmissionConflict, ContextAdmissionAction } from './run/context-admission.js';
 
 export * from './run/control/records.js';

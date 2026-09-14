@@ -36,6 +36,20 @@ export const processOutputSchema = z.strictObject({
   stderr: streamOutputSchema,
   combined: streamOutputSchema,
   artifact: artifactRefSchema.optional(),
+  originalOutput: z
+    .discriminatedUnion('kind', [
+      z.strictObject({
+        kind: z.literal('captured'),
+        cursorEnd: z.int().nonnegative(),
+        omittedBytes: z.int().nonnegative()
+      }),
+      z.strictObject({
+        kind: z.literal('unavailable'),
+        cursorEnd: z.int().nonnegative(),
+        diagnostic: z.string()
+      })
+    ])
+    .optional(),
   exitCode: z.int().nullable().optional(),
   signal: z.string().nullable().optional(),
   diagnostic: z.string().optional(),

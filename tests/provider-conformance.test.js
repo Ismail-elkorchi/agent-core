@@ -7,13 +7,14 @@ import { OpenAIProvider } from '@agent-core/provider-openai';
 import { OpenAICodexProvider } from '@agent-core/provider-openai-codex';
 import { OpenRouterProvider } from '@agent-core/provider-openrouter';
 
-const request = { model: 'test-model', messages: [{ role: 'user', content: 'hello' }] };
 
 for (const adapter of [ollamaAdapter(), openAIAdapter(), openAICodexAdapter(), openRouterAdapter(), claudeAdapter()]) {
   test(`${adapter.name} passes the shared provider conformance kit`, async () => {
     const provider = adapter.create();
     const profile = parseModelProfile(await provider.describeModel(adapter.model));
     assert.equal(profile.provider, provider.id);
+    const allowance = profile.supportedParameters.includes('maxOutputTokens') ? { maxOutputTokens: 64 } : {};
+    const request = { model: adapter.model, messages: [{ role: 'user', content: 'hello' }], ...allowance };
 
     const complete = parseModelResponse(await provider.complete({ ...request, model: adapter.model }));
     assert.equal(complete.content, 'hello');
@@ -38,7 +39,7 @@ for (const adapter of [ollamaAdapter(), openAIAdapter(), openAICodexAdapter(), o
     assert(Object.isFrozen(compiled));
     await assert.rejects(async () => provider.completeCompiled({ ...compiled }), /compiled|admitted|Unrecognized/iu);
 
-    const imageResult = parseModelResponse(await provider.complete(toolImageRequest(adapter.model)));
+    const imageResult = parseModelResponse(await provider.complete({ ...toolImageRequest(adapter.model), ...allowance }));
     assert.equal(imageResult.terminationReason, 'stop', 'a view_image tool result may carry its image into the next provider request');
 
     const events = [];

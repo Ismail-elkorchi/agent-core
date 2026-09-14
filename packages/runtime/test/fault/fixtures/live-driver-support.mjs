@@ -139,6 +139,7 @@ export function createLiveDriverRuntime({ root, mode, role, onCheckpoint = () =>
     }
   });
   return new AgentRuntime({
+      maxOutputTokens: 64,
     provider,
     model: 'fixture',
     toolBoundary: {

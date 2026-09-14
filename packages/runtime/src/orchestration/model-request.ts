@@ -166,17 +166,24 @@ export function requestWindowForModel(
       `Model ${modelProfile.id} on provider ${modelProfile.provider} returned an invalid context token limit.`
     );
   }
-  const modelOutputTokens =
-    modelProfile.limits.outputTokens ?? Math.max(1, Math.floor(contextWindowTokens * 0.25));
-  if (!Number.isInteger(modelOutputTokens) || modelOutputTokens < 1) {
-    throw new Error(
-      `Model ${modelProfile.id} on provider ${modelProfile.provider} returned an invalid output token limit.`
+  if (
+    requestedOutputTokens === undefined ||
+    !Number.isSafeInteger(requestedOutputTokens) ||
+    requestedOutputTokens < 1
+  )
+    throw new TypeError(
+      'An explicit positive output reservation is required. Applications choose generation allowances.'
     );
-  }
-  const maxOutputTokens =
-    requestedOutputTokens === undefined
-      ? Math.min(4_096, modelOutputTokens, Math.max(1, Math.floor(contextWindowTokens * 0.25)))
-      : Math.min(requestedOutputTokens, modelOutputTokens, Math.max(1, contextWindowTokens - 1));
+  if (
+    modelProfile.limits.outputTokens !== undefined &&
+    requestedOutputTokens > modelProfile.limits.outputTokens
+  )
+    throw new RangeError(
+      'Requested output allowance exceeds the advertised model output capacity.'
+    );
+  if (requestedOutputTokens >= contextWindowTokens)
+    throw new RangeError('Output reservation leaves no model input capacity.');
+  const maxOutputTokens = requestedOutputTokens;
   const contextPromptTokens = Math.max(1, contextWindowTokens - maxOutputTokens);
   const maxPromptTokens =
     modelProfile.limits.maxInputTokens === undefined
@@ -208,19 +215,6 @@ export function promptInstructionsForRequest(input: {
       content
     }))
   ];
-}
-
-export function validateOptionalPositiveInteger(
-  value: number | undefined,
-  name: string
-): number | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  if (!Number.isInteger(value) || value < 1) {
-    throw new Error(`${name} must be a positive integer when provided.`);
-  }
-  return value;
 }
 
 export function providerFailureDiagnostic(

@@ -4,7 +4,7 @@ import {
 } from '../context-admission.js';
 import { decodeEffectExecutionState, type EffectExecutionState } from '@agent-core/effects';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
-import { hashJson } from '@agent-core/persistence';
+import { hashJson, type EventReference } from '@agent-core/persistence';
 import {
   decodePromptContextItemInput,
   type PromptContextItemInput
@@ -80,7 +80,7 @@ export type AgentProviderPhase =
         readonly requestEventId: string;
         readonly responseId: string;
         readonly effect: Extract<EffectExecutionState, { readonly phase: 'settled' }>;
-        readonly settlementEventId: string;
+        readonly settlementReference: EventReference;
       }
     >
   | Readonly<
@@ -89,7 +89,7 @@ export type AgentProviderPhase =
         readonly requestEventId: string;
         readonly responseId: string;
         readonly effect: Extract<EffectExecutionState, { readonly phase: 'settled' }>;
-        readonly settlementEventId: string;
+        readonly settlementReference: EventReference;
       }
     >
   | Readonly<
@@ -98,7 +98,7 @@ export type AgentProviderPhase =
         readonly requestEventId: string;
         readonly responseId: string;
         readonly effect: Extract<EffectExecutionState, { readonly phase: 'settled' }>;
-        readonly settlementEventId: string;
+        readonly settlementReference: EventReference;
       }
     >
   | Readonly<
@@ -677,7 +677,7 @@ export function decodeProviderPhase(value: unknown): AgentProviderPhase {
     'requestEventId',
     'responseId',
     'effect',
-    'settlementEventId'
+    'settlementReference'
   ]);
   const stage = enumeration(
     phase.stage,
@@ -694,9 +694,12 @@ export function decodeProviderPhase(value: unknown): AgentProviderPhase {
   );
   const requestEventId = optionalIdentifier(phase.requestEventId, 'phase.requestEventId');
   const responseId = optionalIdentifier(phase.responseId, 'phase.responseId');
-  const settlementEventId = optionalIdentifier(phase.settlementEventId, 'phase.settlementEventId');
+  const settlementReference =
+    phase.settlementReference === undefined
+      ? undefined
+      : providerSettlementReference(phase.settlementReference);
   const effect = phase.effect === undefined ? undefined : decodeEffectExecutionState(phase.effect);
-  if (stage === 'ready' && (requestEventId || responseId || effect || settlementEventId))
+  if (stage === 'ready' && (requestEventId || responseId || effect || settlementReference))
     throw new TypeError('A ready provider phase cannot retain effect state.');
   if (stage !== 'ready' && (!requestEventId || !responseId || !effect))
     throw new TypeError(`Provider stage ${stage} requires request, response, and effect identity.`);
@@ -719,11 +722,18 @@ export function decodeProviderPhase(value: unknown): AgentProviderPhase {
     return Object.freeze({ ...base, stage, requestEventId, responseId, effect });
   }
   if (stage === 'settled' || stage === 'rejected' || stage === 'consumed') {
-    if (effect.phase !== 'settled' || !settlementEventId)
+    if (effect.phase !== 'settled' || !settlementReference)
       throw new TypeError('A settled provider phase requires effect and response settlement.');
     if (stage === 'rejected' && effect.settlement.outcome !== 'failed')
       throw new TypeError('Rejected provider input requires a recorded failed dispatch.');
-    return Object.freeze({ ...base, stage, requestEventId, responseId, effect, settlementEventId });
+    return Object.freeze({
+      ...base,
+      stage,
+      requestEventId,
+      responseId,
+      effect,
+      settlementReference
+    });
   }
   if (effect.phase !== 'closed')
     throw new TypeError('An unknown provider outcome requires a closed effect.');
@@ -896,4 +906,21 @@ export function agentRunActivity(state: AgentRunState): import('../contracts.js'
   )
     return 'executing_tools';
   return 'initializing';
+}
+
+function providerSettlementReference(value: unknown): EventReference {
+  const object = parseJsonObject(value);
+  if (
+    Object.keys(object).some((key) => !['runId', 'eventId', 'sequence', 'hash'].includes(key)) ||
+    typeof object.sequence !== 'number' ||
+    !Number.isSafeInteger(object.sequence) ||
+    object.sequence < 0
+  )
+    throw new TypeError('Invalid provider settlement reference.');
+  return Object.freeze({
+    runId: identifier(object.runId, 'settlement.runId'),
+    eventId: identifier(object.eventId, 'settlement.eventId'),
+    sequence: object.sequence,
+    hash: identifier(object.hash, 'settlement.hash')
+  });
 }

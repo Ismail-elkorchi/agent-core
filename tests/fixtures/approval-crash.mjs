@@ -255,7 +255,7 @@ if (mode === 'crash_waiting_for_lease') {
   );
 }
 
-const agent = new AgentRuntime({
+const agent = new AgentRuntime({ maxOutputTokens: 64,
   provider,
   model: 'fixture',
   toolBoundary: { authorizationPolicyId: 'tests/crash-policy@1', executionTargetId: root },

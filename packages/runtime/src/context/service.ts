@@ -1,3 +1,5 @@
+import { ContextSourceCapacityError } from '../run/context-admission.js';
+import { HistorySourceTooLargeError } from '../history/reader.js';
 import { requestCapacity } from '../inference/request-admission.js';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
 import { hashJson, PersistenceConflictError } from '@agent-core/persistence';
@@ -176,6 +178,13 @@ export class ContextService {
         }
       });
     }
+    request = ownRequest({
+      ...request,
+      selection: {
+        ...request.selection,
+        retained: await this.history.orderSources(request.selection.retained, cut)
+      }
+    });
     const selectionRequest = { ...request };
     delete selectionRequest.toolInvocation;
     const fingerprint = hashJson(selectionRequest);
@@ -197,15 +206,36 @@ export class ContextService {
     const selected: SessionBranchEntry[] = [];
     let sourceBytes = 0;
     for (const ref of retained.values()) {
-      const entry = await this.history.resolve(
-        ref,
-        cut,
-        Math.max(1, this.options.policy.maxSourceBytes - sourceBytes)
-      );
+      let entry;
+      try {
+        entry = await this.history.resolve(
+          ref,
+          cut,
+          Math.max(1, this.options.policy.maxSourceBytes - sourceBytes)
+        );
+      } catch (error) {
+        if (!(error instanceof HistorySourceTooLargeError)) throw error;
+        throw new ContextSourceCapacityError(
+          cut,
+          {
+            unit: 'bytes',
+            limit: this.options.policy.maxSourceBytes,
+            observedAtLeast: Math.max(
+              this.options.policy.maxSourceBytes + 1,
+              sourceBytes + error.bytes
+            )
+          },
+          ref
+        );
+      }
       if (!entry) throw new Error('Context source is unavailable on the authorized branch.');
       sourceBytes += Buffer.byteLength(JSON.stringify(entry));
       if (sourceBytes > this.options.policy.maxSourceBytes)
-        throw new Error('Selected sources exceed the source byte bound.');
+        throw new ContextSourceCapacityError(cut, {
+          unit: 'bytes',
+          limit: this.options.policy.maxSourceBytes,
+          observedAtLeast: sourceBytes
+        });
       selected.push(entry);
     }
     for (const source of await this.protectedSources(cut, false)) {
@@ -278,9 +308,11 @@ export class ContextService {
       )
         throw new Error('context_admission_failed: note revision or artifact is unavailable.');
       if (note.truncated)
-        throw new Error(
-          'context_admission_failed: selected note exceeds source selection byte budget.'
-        );
+        throw new ContextSourceCapacityError(cut, {
+          unit: 'bytes',
+          limit: Math.min(this.options.policy.maxSourceBytes, 256 * 1024),
+          observedAtLeast: Math.min(this.options.policy.maxSourceBytes, 256 * 1024) + 1
+        });
       notes.push(note);
     }
     const pending = await this.options.repository.loadPendingSubmissions(this.options.session);
@@ -292,9 +324,11 @@ export class ContextService {
       })
     );
     if (bytes > this.options.policy.maxSourceBytes)
-      throw new Error(
-        'context_admission_failed: mandatory or selected source selection exceeds byte budget.'
-      );
+      throw new ContextSourceCapacityError(cut, {
+        unit: 'bytes',
+        limit: this.options.policy.maxSourceBytes,
+        observedAtLeast: bytes
+      });
     const validation = await options.admit?.({
       cut,
       entries: selected,

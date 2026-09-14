@@ -164,7 +164,7 @@ test('durable event and session JSONL redact tool, metadata, failure, and proces
     rootedFileAuthority: testRootedFileAuthority(root),
     ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process
   });
-  const agent = new AgentRuntime({
+  const agent = new AgentRuntime({ maxOutputTokens: 64,
     provider: new Provider(),
     model: 'scripted',
     toolBoundary: { authorizationPolicyId: 'tests/redaction@1', executionTargetId: root },

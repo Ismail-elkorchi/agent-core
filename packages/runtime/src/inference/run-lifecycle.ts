@@ -286,7 +286,10 @@ export function createRunInferenceLifecycle(input: RunInferenceInput): {
         response,
         ...(providerState ? { providerState } : {})
       };
-      const settlementReceipt = await append(settlementEvent);
+      const settlementReceipt = await turnRequest.run.append(
+        settlementEvent,
+        providerSettlementKey(effectId, responseId)
+      );
       const pending = providerWork(turnRequest.run.state(), identity);
       if (pending.stage !== 'effect_pending' || pending.effect.intent.effectId !== effectId)
         throw new Error(`Provider effect ${effectId} completed outside its durable start state.`);
@@ -310,7 +313,12 @@ export function createRunInferenceLifecycle(input: RunInferenceInput): {
         ...pending,
         stage: 'settled',
         effect: effectSettlement.state,
-        settlementEventId: settlementReceipt.eventId
+        settlementReference: {
+          runId: turnRequest.runId,
+          eventId: settlementReceipt.eventId,
+          sequence: settlementReceipt.sequence,
+          hash: settlementReceipt.hash
+        }
       }));
       return Object.freeze({
         kind: 'settled',
@@ -353,7 +361,12 @@ export function createRunInferenceLifecycle(input: RunInferenceInput): {
           ...pending,
           stage: 'rejected',
           effect: settled.state,
-          settlementEventId: receipt.eventId
+          settlementReference: {
+            runId: turnRequest.runId,
+            eventId: receipt.eventId,
+            sequence: receipt.sequence,
+            hash: receipt.hash
+          }
         }));
         await emit({ type: 'model.failed', ...identity, diagnostic });
         return Object.freeze({
@@ -510,4 +523,8 @@ function durableProviderResponse(
       ? {}
       : { providerTerminationReason: response.providerTerminationReason })
   });
+}
+
+export function providerSettlementKey(effectId: string, responseId: string): string {
+  return `provider-settlement:${effectId}:${responseId}`;
 }

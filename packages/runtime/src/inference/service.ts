@@ -177,25 +177,12 @@ export class InferenceService {
     });
   }
   /** Settled invocation identities are counted once, including transforms and native generations. */
-  async settledRunCharges(ownerId: string, runId: string): Promise<readonly InferenceCharges[]> {
-    const state = await this.options.repository.load(ownerId);
-    return Object.freeze(
-      [...state.invocations.values()].flatMap((invocation) =>
-        invocation.start.runId === runId && invocation.settlement
-          ? [
-              Object.freeze({
-                usage: invocation.settlement.usage,
-                usageSource: invocation.settlement.usageSource,
-                cost: invocation.settlement.cost
-              })
-            ]
-          : []
-      )
-    );
+  async settledRunUsage(ownerId: string, runId: string) {
+    return (await this.options.repository.load(ownerId, { runId })).settledUsage;
   }
 
   async contextRejection(ownerId: string, invocationId: string) {
-    return (await this.options.repository.load(ownerId)).invocations.get(invocationId)?.rejected;
+    return (await this.options.repository.load(ownerId, { invocationId })).invocation?.rejected;
   }
 
   createSession(): ModelProviderSession {
@@ -280,7 +267,7 @@ export class InferenceService {
       {
         outputReservation: requestWindowForModel(
           profile,
-          input.outputReservation ?? request.maxOutputTokens
+          request.maxOutputTokens ?? input.outputReservation
         ).maxOutputTokens
       }
     );
@@ -379,8 +366,8 @@ export class InferenceService {
       })
     ).slice(7);
     for (;;) {
-      const state = await repository.load(context.ownerId);
-      const current = state.invocations.get(context.invocationId);
+      const state = await repository.load(context.ownerId, { invocationId: context.invocationId });
+      const current = state.invocation;
       if (
         current?.start.operation !== 'native_generation' ||
         current.settlement ||
@@ -389,10 +376,13 @@ export class InferenceService {
         current.rejected
       )
         throw new Error('Native input extension requires an unresolved admitted generation.');
-      if (current.extensions.at(-1)?.fingerprint === fingerprint) return;
-      const other = new Map(state.invocations);
-      other.delete(context.invocationId);
-      assertBudget({ ...state, invocations: other }, reservation, this.options.budget ?? {});
+      if (current.extension?.fingerprint === fingerprint) return;
+      assertBudget(
+        state,
+        reservation,
+        this.options.budget ?? {},
+        current.extension?.reservation ?? current.start.reservation
+      );
       const requestRef = await artifacts.storeProtected({
         label: 'native-inference-input-extension',
         mediaType: 'application/json',
@@ -416,7 +406,7 @@ export class InferenceService {
             type: 'inference.extended',
             invocationId: context.invocationId,
             permit: current.start.permit,
-            revision: current.extensions.length + 1,
+            revision: (current.extension?.revision ?? 0) + 1,
             fingerprint,
             requestRef,
             reservation
@@ -528,9 +518,9 @@ export class InferenceService {
     const { repository, artifacts } = this.options;
     (input.signal ?? input.request.signal)?.throwIfAborted();
     const identity = ownIdentity(input);
-    const existing = (await repository.load(identity.ownerId)).invocations.get(
-      identity.invocationId
-    );
+    const existing = (
+      await repository.load(identity.ownerId, { invocationId: identity.invocationId })
+    ).invocation;
     if (!existing) return undefined;
     if (
       existing.start.sourceFingerprint !==
@@ -648,8 +638,10 @@ export class InferenceService {
     let start: Extract<InferenceEvent, { type: 'inference.started' }>;
     for (;;) {
       signal?.throwIfAborted();
-      const state = await repository.load(identity.ownerId);
-      const existing = state.invocations.get(identity.invocationId);
+      const state = await repository.load(identity.ownerId, {
+        invocationId: identity.invocationId
+      });
+      const existing = state.invocation;
       if (existing) {
         if (existing.start.fingerprint !== fingerprint)
           throw new Error(
@@ -734,8 +726,10 @@ export class InferenceService {
         : new CompleteRequestEstimator().estimateText(JSON.stringify(value));
       let settlement: Extract<InferenceEvent, { type: 'inference.settled' }>;
       for (;;) {
-        const state = await repository.load(identity.ownerId);
-        const prior = state.invocations.get(identity.invocationId);
+        const state = await repository.load(identity.ownerId, {
+          invocationId: identity.invocationId
+        });
+        const prior = state.invocation;
         if (prior?.start.permit !== permit) throw new Error('Inference settlement permit changed.');
         if (prior.settlement) {
           if (prior.settlement.resultRef.sha256 !== resultRef.sha256)
@@ -743,8 +737,7 @@ export class InferenceService {
           settlement = prior.settlement;
           break;
         }
-        const promptTokens = (prior.extensions.at(-1)?.reservation ?? prior.start.reservation)
-          .promptTokens;
+        const promptTokens = (prior.extension?.reservation ?? prior.start.reservation).promptTokens;
         const usage = value.usage ?? {
           promptTokens,
           completionTokens: estimatedOutput,
@@ -789,8 +782,10 @@ export class InferenceService {
         !signal?.aborted
       ) {
         for (;;) {
-          const state = await repository.load(identity.ownerId);
-          const prior = state.invocations.get(identity.invocationId);
+          const state = await repository.load(identity.ownerId, {
+            invocationId: identity.invocationId
+          });
+          const prior = state.invocation;
           if (prior?.start.permit !== permit)
             throw new Error('Inference rejection permit changed.');
           if (prior.settlement || prior.uncertain || prior.notSent) break;
@@ -817,8 +812,10 @@ export class InferenceService {
         }
       }
       for (;;) {
-        const state = await repository.load(identity.ownerId);
-        const prior = state.invocations.get(identity.invocationId);
+        const state = await repository.load(identity.ownerId, {
+          invocationId: identity.invocationId
+        });
+        const prior = state.invocation;
         if (prior?.settlement || prior?.uncertain || prior?.rejected) break;
         if (
           await repository.append(
@@ -849,8 +846,10 @@ export class InferenceService {
       } catch (cause) {
         const message = cause instanceof Error ? cause.message : String(cause);
         for (;;) {
-          const state = await repository.load(identity.ownerId);
-          const prior = state.invocations.get(identity.invocationId);
+          const state = await repository.load(identity.ownerId, {
+            invocationId: identity.invocationId
+          });
+          const prior = state.invocation;
           if (
             prior?.start.permit !== permit ||
             prior.settlement ||
@@ -932,25 +931,23 @@ function assertCompiledProfile(compiled: CompiledModelRequest, profile: ModelPro
 function assertBudget(
   state: InferenceOwnerState,
   next: InferenceReservation,
-  limits: InferenceBudget
+  limits: InferenceBudget,
+  replacing?: InferenceReservation
 ): void {
-  let prompt = next.promptTokens;
-  let completion = next.completionTokens;
-  let knownCost =
-    next.cost.currency === limits.maxKnownCost?.currency ? (next.cost.amount ?? 0) : 0;
-  const policy = hashJson(limits);
-  let invocations = 1;
-  for (const item of state.invocations.values()) {
-    if (hashJson(item.start.limits) !== policy)
-      throw new Error('Inference owner budget policy changed after admission.');
-    if (item.notSent) continue;
-    invocations++;
-    const reserved = item.extensions.at(-1)?.reservation ?? item.start.reservation;
-    prompt += item.settlement?.usage.promptTokens ?? reserved.promptTokens;
-    completion += item.settlement?.usage.completionTokens ?? reserved.completionTokens;
-    const cost = item.settlement?.cost ?? reserved.cost;
-    if (cost.currency === limits.maxKnownCost?.currency) knownCost += cost.amount ?? 0;
-  }
+  if (state.policyFingerprint !== undefined && state.policyFingerprint !== hashJson(limits))
+    throw new Error('Inference owner budget policy changed after admission.');
+  const prompt =
+    state.committed.usage.promptTokens + next.promptTokens - (replacing?.promptTokens ?? 0);
+  const completion =
+    state.committed.usage.completionTokens +
+    next.completionTokens -
+    (replacing?.completionTokens ?? 0);
+  const currency = limits.maxKnownCost?.currency;
+  const knownCost =
+    (currency === undefined ? 0 : (state.committed.knownCosts[currency] ?? 0)) +
+    (next.cost.currency === currency ? (next.cost.amount ?? 0) : 0) -
+    (replacing?.cost.currency === currency ? (replacing?.cost.amount ?? 0) : 0);
+  const invocations = state.committed.invocations + (replacing === undefined ? 1 : 0);
   if (limits.maxInvocations !== undefined && invocations > limits.maxInvocations)
     throw new InferenceBudgetExceededError('invocations');
   if (limits.maxPromptTokens !== undefined && prompt > limits.maxPromptTokens)

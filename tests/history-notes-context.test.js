@@ -329,7 +329,7 @@ for (const kind of ['memory', 'jsonl']) {
           notes: []
         }
       }),
-      /byte (?:budget|limit)/u
+      /source bound/u
     );
     assert.equal((await history.selectedContext()).windowId, transition.window.windowId);
   });

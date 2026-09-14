@@ -26,6 +26,7 @@ export {
 } from './core/text-write.js';
 export * from './core/workspace-snapshot.js';
 export * from './host.js';
+export { processOutputSchema } from './tools/process-output.js';
 export * from './tools/apply-patch/index.js';
 export * from './tools/edit-text/index.js';
 export * from './tools/exec-command/index.js';

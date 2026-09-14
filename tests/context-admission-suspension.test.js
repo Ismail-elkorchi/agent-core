@@ -22,6 +22,7 @@ const acceptance = {
   }
 };
 const conflict = {
+  kind: 'request_capacity',
   message: 'Protected input and output reservation exceed the context window.',
   inputIdentity: 'sha256:compiled-input',
   estimatedInputTokens: 12000,

@@ -82,6 +82,7 @@ export interface RequestAccounting {
 }
 /** Admission policy, independent of provider generation controls. */
 export interface ModelCompilationOptions {
+  /** Reservation when the logical request has no explicit output cap. A cap remains authoritative. */
   readonly outputReservation?: number;
 }
 export interface RequestAccountingOptions extends ModelCompilationOptions {

@@ -145,6 +145,7 @@ test('an integrity-audited corrupt JSONL run is quarantined before provider exec
       }
     };
     const runtime = new AgentRuntime({
+      maxOutputTokens: 64,
       provider,
       model: 'fixture',
       toolBoundary: { authorizationPolicyId: 'test-policy', executionTargetId: 'test-target' },

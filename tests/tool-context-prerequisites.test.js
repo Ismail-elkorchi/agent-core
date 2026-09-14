@@ -98,7 +98,7 @@ test('host guidance is presented before a mutation without using its tool output
       return { provider: 'fixture', model: 'fixture', content: 'Done.', terminationReason: 'stop' };
     }
   };
-  const runtime = new AgentRuntime({
+  const runtime = new AgentRuntime({ maxOutputTokens: 64,
     provider,
     model: 'fixture',
     tools: [tool],
