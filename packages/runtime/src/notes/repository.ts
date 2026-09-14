@@ -63,9 +63,15 @@ export const noteEventCodec: RuntimeCodec<NoteEvent> = {
   decode(value) {
     const record = parseJsonObject(value, NOTE_LIMITS);
     if (record.format !== 'agent-core.notes/1')
-      throw new Error('Incompatible notes format. Start a new session; existing data has not been changed.');
+      throw new Error(
+        'Incompatible notes format. Start a new session; existing data has not been changed.'
+      );
     if (record.type === 'note.content_reserved') {
-      if (typeof record.bytes !== 'number' || !Number.isSafeInteger(record.bytes) || record.bytes < 0)
+      if (
+        typeof record.bytes !== 'number' ||
+        !Number.isSafeInteger(record.bytes) ||
+        record.bytes < 0
+      )
         throw new Error('Invalid note content reservation.');
       return Object.freeze({
         type: record.type,
@@ -117,6 +123,7 @@ const NOTE_LIMITS = {
   maxTotalBytes: 8 * 1024 * 1024
 } as const;
 const DEFAULT_QUOTAS: NoteQuotas = Object.freeze({
+  maxIndexBytes: 32 * 1024 * 1024,
   maxNotes: 256,
   maxNoteBytes: 256 * 1024,
   maxTotalBytes: 16 * 1024 * 1024,
@@ -131,8 +138,28 @@ export interface EventNoteRepositoryOptions {
   readonly jsonSchemas?: Readonly<Record<string, (value: JsonValue) => JsonValue>>;
 }
 interface State {
-  readonly tail: EventLedgerTail;
-  readonly events: readonly NoteEvent[];
+  tail: EventLedgerTail;
+  readonly reservations: Map<string, Extract<NoteEvent, { type: 'note.content_reserved' }>>;
+  readonly committed: Map<string, Extract<NoteEvent, { type: 'note.committed' }>>;
+  readonly forks: Map<string, Extract<NoteEvent, { type: 'notes.forked' }>>;
+  readonly branches: Map<string, Map<string, { sequence: number; revision: NoteRevision }[]>>;
+  readonly revisions: Map<string, Map<string, NoteRevision>>;
+  readonly noteIds: Set<string>;
+  storedBytes: number;
+  indexBytes: number;
+}
+function emptyState(): State {
+  return {
+    tail: { sequence: -1, driverGeneration: 0 },
+    reservations: new Map(),
+    committed: new Map(),
+    forks: new Map(),
+    branches: new Map(),
+    revisions: new Map(),
+    noteIds: new Set(),
+    storedBytes: 0,
+    indexBytes: 0
+  };
 }
 
 /** A single conditional event stream per session makes CAS and storage quota reservation atomic. */
@@ -143,7 +170,8 @@ export class EventNoteRepository implements NoteRepository {
   constructor(private readonly options: EventNoteRepositoryOptions) {
     this.quotas = Object.freeze({ ...DEFAULT_QUOTAS, ...options.quotas });
     for (const [key, value] of Object.entries(this.quotas))
-      if (!Number.isSafeInteger(value) || value < 1) throw new Error(`Invalid notes quota: ${key}.`);
+      if (!Number.isSafeInteger(value) || value < 1)
+        throw new Error(`Invalid notes quota: ${key}.`);
   }
   write(input: NoteWriteRequest): Promise<NoteWriteResult> {
     return this.commit(input, false);
@@ -159,15 +187,14 @@ export class EventNoteRepository implements NoteRepository {
   }): Promise<void> {
     const scope = ownScope(input.scope);
     const parentScope = ownScope(input.parentScope);
-    if (scopeKey(scope) === scopeKey(parentScope)) throw new Error('A note branch cannot inherit itself.');
+    if (scopeKey(scope) === scopeKey(parentScope))
+      throw new Error('A note branch cannot inherit itself.');
     if (scope.sessionId !== parentScope.sessionId)
       throw new Error(
         'Note inheritance requires a common session; cross-session sharing needs an explicit application repository grant.'
       );
     const state = await this.state(scope.sessionId);
-    const existing = state.events.find(
-      (event) => event.type === 'notes.forked' && scopeKey(event.scope) === scopeKey(scope)
-    );
+    const existing = state.forks.get(scopeKey(scope));
     if (existing?.type === 'notes.forked') {
       if (
         scopeKey(existing.parentScope) !== scopeKey(parentScope) ||
@@ -176,13 +203,11 @@ export class EventNoteRepository implements NoteRepository {
         throw new PersistenceConflictError('Note branch already has a different parent.');
       return;
     }
-    if (
-      state.events.some(
-        (event) => event.type === 'note.committed' && scopeKey(event.revision.scope) === scopeKey(scope)
-      )
-    )
-      throw new PersistenceConflictError('Cannot inherit notes into a branch with committed writes.');
-    if (state.events.length >= this.quotas.maxRevisions * 3)
+    if (state.branches.has(scopeKey(scope)))
+      throw new PersistenceConflictError(
+        'Cannot inherit notes into a branch with committed writes.'
+      );
+    if (state.tail.sequence + 1 >= this.quotas.maxRevisions * 3)
       throw new Error('Notes branch storage quota exceeded.');
     const parentWatermark = input.throughRevision ?? state.tail.sequence;
     if (
@@ -191,9 +216,7 @@ export class EventNoteRepository implements NoteRepository {
       parentWatermark > state.tail.sequence
     )
       throw new Error('Invalid note inheritance source revision.');
-    const inherited = Object.freeze([
-      ...visible(state.events.slice(0, parentWatermark + 1), parentScope).values()
-    ]);
+    const inherited = Object.freeze([...visible(state, parentScope, parentWatermark).values()]);
     const event: NoteEvent = Object.freeze({
       type: 'notes.forked',
       format: 'agent-core.notes/1',
@@ -210,13 +233,14 @@ export class EventNoteRepository implements NoteRepository {
     identifier(input.noteId, 'noteId');
     const maxBytes = bound(input.maxBytes, 16 * 1024, this.quotas.maxQueryBytes, 'maxBytes');
     const state = await this.state(scope.sessionId);
-    const revisions = visibleRevisions(state.events, scope);
     const revision = input.revisionId
-      ? revisions.find((item) => item.noteId === input.noteId && item.revisionId === input.revisionId)
-      : visible(state.events, scope).get(input.noteId);
+      ? state.revisions.get(scopeKey(scope))?.get(input.revisionId)
+      : currentNoteRevision(state, scope, input.noteId);
+    if (revision && revision.noteId !== input.noteId) return Object.freeze({ status: 'missing' });
     if (!revision) return Object.freeze({ status: 'missing' });
     if (revision.tombstone) return Object.freeze({ status: 'tombstone', revision });
-    if (!revision.contentArtifact) throw new Error('Committed note is missing its artifact reference.');
+    if (!revision.contentArtifact)
+      throw new Error('Committed note is missing its artifact reference.');
     let bytes: Uint8Array;
     try {
       bytes = await this.options.artifacts.readVerified(revision.contentArtifact);
@@ -260,31 +284,66 @@ export class EventNoteRepository implements NoteRepository {
     if ((input.query?.length ?? 0) > 4096) throw new Error('Note query exceeds 4096 characters.');
     const state = await this.state(scope.sessionId);
     const fingerprint = hashJson({ scope, query: input.query ?? '', search });
-    const cursor = input.cursor ? decodeCursor(input.cursor, fingerprint, state.tail.sequence) : undefined;
+    const cursor = input.cursor
+      ? decodeCursor(input.cursor, fingerprint, state.tail.sequence)
+      : undefined;
     const watermark = cursor?.watermark ?? state.tail.sequence;
-    const notes = [...visible(state.events.slice(0, watermark + 1), scope).values()]
+    const notes = [...visible(state, scope, watermark).values()]
       .filter((note) => !note.tombstone)
       .sort((a, b) => a.noteId.localeCompare(b.noteId));
     let at = cursor?.at ?? 0;
     let scanned = 0;
     let bytes = 0;
     let incompleteArtifact = false;
+    let scannedBytes = 0;
+    const maxScannedBytes = bound(
+      input.maxScannedBytes,
+      this.quotas.maxQueryBytes,
+      64 * 1024 * 1024,
+      'maxScannedBytes'
+    );
+    const unavailable: NonNullable<NoteQueryResult['unavailable']>[number][] = [];
     if (at > notes.length) throw new Error('Invalid note cursor position.');
     const items: NoteRevision[] = [];
     while (at < notes.length && scanned < maxScanned && items.length < limit && bytes < maxBytes) {
       const note = notes[at++];
       scanned++;
       if (!note) continue;
+      const metadataBytes = Buffer.byteLength(JSON.stringify(note));
+      if (scannedBytes + metadataBytes > maxScannedBytes) {
+        if (metadataBytes > maxScannedBytes) {
+          unavailable.push({ revision: note, reason: 'source_too_large' });
+          incompleteArtifact = true;
+        } else {
+          at--;
+          scanned--;
+        }
+        break;
+      }
+      scannedBytes += metadataBytes;
       if (input.query) {
         let found = note.title.includes(input.query);
         if (!found && search && note.contentArtifact) {
+          if (scannedBytes + note.contentArtifact.size > maxScannedBytes) {
+            if (note.contentArtifact.size + metadataBytes > maxScannedBytes) {
+              unavailable.push({ revision: note, reason: 'source_too_large' });
+              incompleteArtifact = true;
+            } else {
+              at--;
+              scanned--;
+            }
+            break;
+          }
+          scannedBytes += note.contentArtifact.size;
           try {
             const text = new TextDecoder('utf-8', { fatal: true }).decode(
               await this.options.artifacts.readVerified(note.contentArtifact)
             );
             this.lexicalIndex.add(note.revisionId, text);
-            found = this.lexicalIndex.matches(note.revisionId, input.query) ?? text.includes(input.query);
+            found =
+              this.lexicalIndex.matches(note.revisionId, input.query) ?? text.includes(input.query);
           } catch {
+            unavailable.push({ revision: note, reason: 'artifact_unavailable' });
             incompleteArtifact = true;
           }
         }
@@ -304,6 +363,8 @@ export class EventNoteRepository implements NoteRepository {
     return Object.freeze({
       items: Object.freeze(items),
       watermark,
+      scannedBytes,
+      ...(unavailable.length ? { unavailable: Object.freeze(unavailable) } : {}),
       coverage: complete && !incompleteArtifact ? 'complete' : 'partial',
       scanned,
       bytes,
@@ -332,19 +393,19 @@ export class EventNoteRepository implements NoteRepository {
     if (input.expectedRevision !== null) identifier(input.expectedRevision, 'expectedRevision');
     const owned = parseJsonObject(input, NOTE_LIMITS);
     const fingerprint = hashJson({ remove, input: owned });
-    const key = hashJson(
-      { scope, invocationId: input.invocationId, idempotencyKey: input.idempotencyKey }
-    );
+    const key = hashJson({
+      scope,
+      invocationId: input.invocationId,
+      idempotencyKey: input.idempotencyKey
+    });
     let state = await this.state(scope.sessionId);
-    const retry = state.events.find(
-      (event) => event.type === 'note.committed' && event.idempotencyKey === key
-    );
+    const retry = state.committed.get(key);
     if (retry?.type === 'note.committed') {
       if (retry.fingerprint !== fingerprint)
         throw new PersistenceConflictError('Note idempotency key has conflicting content.');
       return Object.freeze({ status: 'committed', revision: retry.revision });
     }
-    const current = visible(state.events, scope).get(input.noteId);
+    const current = currentNoteRevision(state, scope, input.noteId);
     if ((current?.revisionId ?? null) !== input.expectedRevision)
       return Object.freeze({ status: 'conflict', currentRevision: current?.revisionId ?? null });
     if (remove && !current) return Object.freeze({ status: 'conflict', currentRevision: null });
@@ -362,10 +423,14 @@ export class EventNoteRepository implements NoteRepository {
     if (write?.schemaId !== undefined && write.mediaType !== 'application/json')
       throw new Error('Only JSON notes can bind a schema.');
     const json =
-      write?.mediaType === 'application/json' ? parseJsonValue(write.content, NOTE_LIMITS) : undefined;
-    const schema = write?.schemaId === undefined ? undefined : this.options.jsonSchemas?.[write.schemaId];
+      write?.mediaType === 'application/json'
+        ? parseJsonValue(write.content, NOTE_LIMITS)
+        : undefined;
+    const schema =
+      write?.schemaId === undefined ? undefined : this.options.jsonSchemas?.[write.schemaId];
     if (write?.schemaId !== undefined && !schema) throw new Error('Unknown note JSON schema.');
-    const validatedJson = schema && json !== undefined ? parseJsonValue(schema(json), NOTE_LIMITS) : json;
+    const validatedJson =
+      schema && json !== undefined ? parseJsonValue(schema(json), NOTE_LIMITS) : json;
     const text = write
       ? write.mediaType === 'application/json'
         ? JSON.stringify(validatedJson)
@@ -374,19 +439,18 @@ export class EventNoteRepository implements NoteRepository {
           : ''
       : '';
     const size = Buffer.byteLength(text);
-    let reservation = state.events.find(
-      (event) => event.type === 'note.content_reserved' && event.idempotencyKey === key
-    );
+    let reservation = state.reservations.get(key);
     if (reservation?.type === 'note.content_reserved' && reservation.fingerprint !== fingerprint)
-      throw new PersistenceConflictError('Note reservation idempotency key has conflicting content.');
+      throw new PersistenceConflictError(
+        'Note reservation idempotency key has conflicting content.'
+      );
     if (!reservation) {
-      const reservations = state.events.filter((event) => event.type === 'note.content_reserved');
-      const storedBytes = reservations.reduce((total, event) => total + event.bytes, 0);
-      const noteIds = new Set(reservations.map((event) => `${scopeKey(event.scope)}:${event.noteId}`));
+      const storedBytes = state.storedBytes;
+      const noteIds = state.noteIds;
       if (
         size > this.quotas.maxNoteBytes ||
         storedBytes + size > this.quotas.maxTotalBytes ||
-        reservations.length >= this.quotas.maxRevisions ||
+        state.reservations.size >= this.quotas.maxRevisions ||
         (!current && noteIds.size >= this.quotas.maxNotes)
       )
         throw new Error('Notes storage quota exceeded.');
@@ -406,14 +470,10 @@ export class EventNoteRepository implements NoteRepository {
       } catch (error) {
         if (!(error instanceof PersistenceConflictError)) throw error;
         const refreshed = await this.state(scope.sessionId);
-        const committed = refreshed.events.find(
-          (event) => event.type === 'note.committed' && event.idempotencyKey === key
-        );
+        const committed = refreshed.committed.get(key);
         if (committed?.type === 'note.committed' && committed.fingerprint === fingerprint)
           return Object.freeze({ status: 'committed', revision: committed.revision });
-        const staged = refreshed.events.find(
-          (event) => event.type === 'note.content_reserved' && event.idempotencyKey === key
-        );
+        const staged = refreshed.reservations.get(key);
         if (staged?.type === 'note.content_reserved') {
           if (staged.fingerprint !== fingerprint)
             throw new PersistenceConflictError('Note idempotency key has conflicting content.');
@@ -421,22 +481,19 @@ export class EventNoteRepository implements NoteRepository {
         } else {
           return Object.freeze({
             status: 'conflict',
-            currentRevision: visible(refreshed.events, scope).get(input.noteId)?.revisionId ?? null
+            currentRevision: currentNoteRevision(refreshed, scope, input.noteId)?.revisionId ?? null
           });
         }
       }
       state = await this.state(scope.sessionId);
     }
-    const concurrentCommit = state.events.find(
-      (event) => event.type === 'note.committed' && event.idempotencyKey === key
-    );
+    const concurrentCommit = state.committed.get(key);
     if (concurrentCommit?.type === 'note.committed') {
       if (concurrentCommit.fingerprint !== fingerprint)
         throw new PersistenceConflictError('Note idempotency key has conflicting content.');
       return Object.freeze({ status: 'committed', revision: concurrentCommit.revision });
     }
-    if (reservation.type !== 'note.content_reserved') throw new Error('Invalid note reservation state.');
-    const latestRevision = visible(state.events, scope).get(input.noteId)?.revisionId ?? null;
+    const latestRevision = currentNoteRevision(state, scope, input.noteId)?.revisionId ?? null;
     if (latestRevision !== input.expectedRevision)
       return Object.freeze({ status: 'conflict', currentRevision: latestRevision });
     const artifact = write
@@ -478,9 +535,7 @@ export class EventNoteRepository implements NoteRepository {
     } catch (error) {
       if (!(error instanceof PersistenceConflictError)) throw error;
       const refreshed = await this.state(scope.sessionId);
-      const committed = refreshed.events.find(
-        (item) => item.type === 'note.committed' && item.idempotencyKey === key
-      );
+      const committed = refreshed.committed.get(key);
       if (committed?.type === 'note.committed') {
         if (committed.fingerprint !== fingerprint)
           throw new PersistenceConflictError('Note idempotency key has conflicting content.');
@@ -488,25 +543,100 @@ export class EventNoteRepository implements NoteRepository {
       }
       return Object.freeze({
         status: 'conflict',
-        currentRevision: visible(refreshed.events, scope).get(input.noteId)?.revisionId ?? null
+        currentRevision: currentNoteRevision(refreshed, scope, input.noteId)?.revisionId ?? null
       });
     }
     return Object.freeze({ status: 'committed', revision });
   }
-  private async state(sessionId: string): Promise<State> {
+  private readonly refreshes = new Map<string, Promise<State>>();
+  private state(sessionId: string): Promise<State> {
+    const previous = this.refreshes.get(sessionId) ?? Promise.resolve(undefined);
+    const pending = previous
+      .catch(() => undefined)
+      .then(async () => ({ ...(await this.refresh(sessionId)) }));
+    this.refreshes.set(sessionId, pending);
+    void pending
+      .finally(() => {
+        if (this.refreshes.get(sessionId) === pending) this.refreshes.delete(sessionId);
+      })
+      .catch(() => undefined);
+    return pending;
+  }
+  async rebuildIndex(
+    sessionId: string,
+    options: {
+      readonly signal?: AbortSignal;
+      readonly onProgress?: (progress: { records: number; throughSequence: number }) => void;
+    } = {}
+  ): Promise<void> {
+    options.signal?.throwIfAborted();
+    await this.refreshes.get(sessionId);
+    this.cache.delete(sessionId);
+    await this.refresh(sessionId, options);
+  }
+  private async refresh(
+    sessionId: string,
+    options?: {
+      readonly signal?: AbortSignal;
+      readonly onProgress?: (progress: { records: number; throughSequence: number }) => void;
+    }
+  ): Promise<State> {
     const stream = streamId(sessionId);
     const tail = await this.options.events.tail(stream);
-    const cached = this.cache.get(sessionId);
-    if (cached?.tail.hash === tail.hash && cached?.tail.sequence === tail.sequence) return cached;
-    const events: NoteEvent[] = [];
-    for await (const envelope of this.options.events.read(stream)) {
-      if (envelope.sequence > tail.sequence) break;
-      events.push(noteEventCodec.decode(envelope.event));
+    const state = this.cache.get(sessionId) ?? emptyState();
+    if (
+      state.tail.sequence > tail.sequence ||
+      (state.tail.sequence === tail.sequence && state.tail.hash !== tail.hash)
+    )
+      throw new Error('Notes source boundary changed; stored data has not been modified.');
+    if (state.tail.sequence === tail.sequence) return state;
+    // Each refresh validates and indexes only newly committed metadata, under storage quotas.
+    try {
+      while (state.tail.sequence < tail.sequence) {
+        options?.signal?.throwIfAborted();
+        const page = await this.options.events.readRange(stream, {
+          afterSequence: state.tail.sequence,
+          through: tail
+        });
+        if (page.oversized) throw new Error('Note record exceeds the bounded index read.');
+        if (page.records.length === 0) throw new Error('Notes event stream is incomplete.');
+        for (const envelope of page.records) {
+          if (
+            envelope.sequence !== state.tail.sequence + 1 ||
+            envelope.previousHash !== state.tail.hash
+          )
+            throw new Error('Notes event stream lost its committed hash chain.');
+          if (envelope.sequence >= this.quotas.maxRevisions * 3)
+            throw new Error('Notes index storage quota exceeded.');
+          const eventBytes = Buffer.byteLength(JSON.stringify(envelope.event));
+          if (state.indexBytes + eventBytes > this.quotas.maxIndexBytes)
+            throw new Error('Notes metadata index byte quota exceeded.');
+          acceptNoteEvent(state, envelope.event, sessionId, envelope.sequence);
+          state.indexBytes += eventBytes;
+          if (
+            state.reservations.size > this.quotas.maxRevisions ||
+            state.storedBytes > this.quotas.maxTotalBytes ||
+            state.noteIds.size > this.quotas.maxNotes
+          )
+            throw new Error('Persisted notes exceed configured storage quotas.');
+          state.tail = {
+            sequence: envelope.sequence,
+            hash: envelope.hash,
+            driverGeneration: envelope.driverGeneration
+          };
+          options?.onProgress?.({ records: envelope.sequence + 1, throughSequence: tail.sequence });
+        }
+      }
+    } catch (error) {
+      this.cache.delete(sessionId);
+      throw error;
     }
-    if (events.length !== tail.sequence + 1) throw new Error('Notes event stream is incomplete.');
-    validateNoteStream(events, sessionId);
-    const state = { tail, events: Object.freeze(events) };
+    this.cache.delete(sessionId);
     this.cache.set(sessionId, state);
+    while (this.cache.size > 4) {
+      const oldest = this.cache.keys().next().value;
+      if (oldest !== undefined) this.cache.delete(oldest);
+    }
     return state;
   }
   private async append(
@@ -515,13 +645,14 @@ export class EventNoteRepository implements NoteRepository {
     event: NoteEvent,
     idempotencyKey: string
   ): Promise<void> {
+    if (state.indexBytes + Buffer.byteLength(JSON.stringify(event)) > this.quotas.maxIndexBytes)
+      throw new Error('Notes metadata index byte quota exceeded.');
     const result = await this.options.events.appendConditional(streamId(sessionId), event, {
       expectedTail: state.tail,
       driverGeneration: state.tail.driverGeneration,
       idempotencyKey,
       actor: 'model'
     });
-    this.cache.delete(sessionId);
     if (result.kind === 'rejected')
       throw new PersistenceConflictError(`Notes commit rejected: ${result.reason}.`);
     if (result.kind === 'not_committed' || result.kind === 'outcome_unknown')
@@ -544,17 +675,34 @@ export class InMemoryNoteRepository extends EventNoteRepository {
     });
   }
 }
-function visibleRevisions(events: readonly NoteEvent[], scope: NoteScope): NoteRevision[] {
-  return events.flatMap((event) =>
-    event.type === 'notes.forked' && scopeKey(event.scope) === scopeKey(scope)
-      ? event.inherited
-      : event.type === 'note.committed' && scopeKey(event.revision.scope) === scopeKey(scope)
-        ? [event.revision]
-        : []
-  );
+function currentNoteRevision(
+  state: State,
+  scope: NoteScope,
+  noteId: string,
+  watermark = state.tail.sequence
+): NoteRevision | undefined {
+  const history = state.branches.get(scopeKey(scope))?.get(noteId);
+  if (!history) return undefined;
+  let low = 0,
+    high = history.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if ((history[middle]?.sequence ?? Number.POSITIVE_INFINITY) <= watermark) low = middle + 1;
+    else high = middle;
+  }
+  return history[low - 1]?.revision;
 }
-function visible(events: readonly NoteEvent[], scope: NoteScope): Map<string, NoteRevision> {
-  return new Map(visibleRevisions(events, scope).map((revision) => [revision.noteId, revision]));
+function visible(
+  state: State,
+  scope: NoteScope,
+  watermark = state.tail.sequence
+): Map<string, NoteRevision> {
+  const notes = new Map<string, NoteRevision>();
+  for (const noteId of state.branches.get(scopeKey(scope))?.keys() ?? []) {
+    const revision = currentNoteRevision(state, scope, noteId, watermark);
+    if (revision) notes.set(noteId, revision);
+  }
+  return notes;
 }
 export function ownScope(value: unknown): NoteScope {
   const scope = parseJsonObject(value);
@@ -569,7 +717,12 @@ function streamId(sessionId: string): string {
   return `notes:${hashJson(sessionId)}`;
 }
 function identifier(value: unknown, name: string): asserts value is string {
-  if (typeof value !== 'string' || value.length === 0 || value.length > 512 || hasControlCharacter(value))
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.length > 512 ||
+    hasControlCharacter(value)
+  )
     throw new Error(`Invalid ${name}.`);
 }
 function decodeRevision(value: unknown): NoteRevision {
@@ -613,9 +766,15 @@ function decodeRevision(value: unknown): NoteRevision {
     createdAt: requiredString(item.createdAt)
   });
 }
-function decodeCursor(value: string, fingerprint: string, latest: number): { at: number; watermark: number } {
+function decodeCursor(
+  value: string,
+  fingerprint: string,
+  latest: number
+): { at: number; watermark: number } {
   if (value.length > 4096) throw new Error('Note cursor too large.');
-  const cursor: JsonObject = parseJsonObject(JSON.parse(Buffer.from(value, 'base64url').toString('utf8')));
+  const cursor: JsonObject = parseJsonObject(
+    JSON.parse(Buffer.from(value, 'base64url').toString('utf8'))
+  );
   if (
     cursor.format !== 'agent-core.note-cursor/1' ||
     cursor.fingerprint !== fingerprint ||
@@ -641,52 +800,72 @@ function hasControlCharacter(value: string): boolean {
   return false;
 }
 
-function validateNoteStream(events: readonly NoteEvent[], sessionId: string): void {
-  const reservations = new Map<string, Extract<NoteEvent, { type: 'note.content_reserved' }>>();
-  const branches = new Map<string, Map<string, NoteRevision>>();
-  const committedKeys = new Set<string>();
-  for (const [index, event] of events.entries()) {
-    if (event.type === 'note.content_reserved') {
-      if (event.scope.sessionId !== sessionId || reservations.has(event.idempotencyKey))
-        throw new Error('Invalid or duplicate note content reservation.');
-      reservations.set(event.idempotencyKey, event);
-      continue;
-    }
-    if (event.type === 'notes.forked') {
-      if (
-        event.scope.sessionId !== sessionId ||
-        event.parentScope.sessionId !== sessionId ||
-        event.parentWatermark >= index ||
-        branches.has(scopeKey(event.scope))
-      )
-        throw new Error('Invalid note branch source cut.');
-      const inherited = [...visible(events.slice(0, event.parentWatermark + 1), event.parentScope).values()];
-      if (hashJson(inherited) !== hashJson(event.inherited))
-        throw new Error('Note branch inheritance does not match its pinned parent revisions.');
-      branches.set(
-        scopeKey(event.scope),
-        new Map(event.inherited.map((revision) => [revision.noteId, revision]))
-      );
-      continue;
-    }
-    const reservation = reservations.get(event.idempotencyKey);
-    const revision = event.revision;
-    if (
-      !reservation ||
-      committedKeys.has(event.idempotencyKey) ||
-      reservation.fingerprint !== event.fingerprint ||
-      reservation.revisionId !== revision.revisionId ||
-      reservation.noteId !== revision.noteId ||
-      scopeKey(reservation.scope) !== scopeKey(revision.scope) ||
-      reservation.createdAt !== revision.createdAt ||
-      reservation.bytes !== (revision.contentArtifact?.size ?? 0)
-    )
-      throw new Error('Note commit has no matching content reservation.');
-    const branch = branches.get(scopeKey(revision.scope)) ?? new Map<string, NoteRevision>();
-    if ((branch.get(revision.noteId)?.revisionId ?? null) !== revision.parentRevision)
-      throw new Error('Note revision violates its committed compare-and-swap boundary.');
-    branch.set(revision.noteId, revision);
-    branches.set(scopeKey(revision.scope), branch);
-    committedKeys.add(event.idempotencyKey);
+function acceptNoteEvent(
+  state: State,
+  event: NoteEvent,
+  sessionId: string,
+  sequence: number
+): void {
+  if (event.type === 'note.content_reserved') {
+    if (event.scope.sessionId !== sessionId || state.reservations.has(event.idempotencyKey))
+      throw new Error('Invalid or duplicate note content reservation.');
+    state.reservations.set(event.idempotencyKey, event);
+    state.storedBytes += event.bytes;
+    state.noteIds.add(`${scopeKey(event.scope)}:${event.noteId}`);
+    return;
   }
+  if (event.type === 'notes.forked') {
+    if (
+      event.scope.sessionId !== sessionId ||
+      event.parentScope.sessionId !== sessionId ||
+      event.parentWatermark >= sequence ||
+      state.branches.has(scopeKey(event.scope)) ||
+      state.forks.has(scopeKey(event.scope)) ||
+      scopeKey(event.scope) === scopeKey(event.parentScope)
+    )
+      throw new Error('Invalid note branch source cut.');
+    const inherited = [...visible(state, event.parentScope, event.parentWatermark).values()];
+    if (hashJson(inherited) !== hashJson(event.inherited))
+      throw new Error('Note branch inheritance does not match its pinned parent revisions.');
+    state.forks.set(scopeKey(event.scope), event);
+    for (const revision of event.inherited) indexRevision(state, event.scope, revision, sequence);
+    return;
+  }
+  const reservation = state.reservations.get(event.idempotencyKey);
+  const revision = event.revision;
+  if (
+    !reservation ||
+    state.committed.has(event.idempotencyKey) ||
+    reservation.fingerprint !== event.fingerprint ||
+    reservation.revisionId !== revision.revisionId ||
+    reservation.noteId !== revision.noteId ||
+    scopeKey(reservation.scope) !== scopeKey(revision.scope) ||
+    reservation.createdAt !== revision.createdAt ||
+    reservation.bytes !== (revision.contentArtifact?.size ?? 0)
+  )
+    throw new Error('Note commit has no matching content reservation.');
+  if (
+    (currentNoteRevision(state, revision.scope, revision.noteId)?.revisionId ?? null) !==
+    revision.parentRevision
+  )
+    throw new Error('Note revision violates its committed compare-and-swap boundary.');
+  state.committed.set(event.idempotencyKey, event);
+  indexRevision(state, revision.scope, revision, sequence);
+}
+function indexRevision(
+  state: State,
+  scope: NoteScope,
+  revision: NoteRevision,
+  sequence: number
+): void {
+  const key = scopeKey(scope);
+  const branch =
+    state.branches.get(key) ?? new Map<string, { sequence: number; revision: NoteRevision }[]>();
+  const history = branch.get(revision.noteId) ?? [];
+  history.push({ sequence, revision });
+  branch.set(revision.noteId, history);
+  state.branches.set(key, branch);
+  const revisions = state.revisions.get(key) ?? new Map<string, NoteRevision>();
+  revisions.set(revision.revisionId, revision);
+  state.revisions.set(key, revisions);
 }

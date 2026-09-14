@@ -1,3 +1,4 @@
+import { agentRunActivity } from './run/control/contracts.js';
 import { describeError as errorMessage } from '@agent-core/tools';
 import {
   closeExternalEffect,
@@ -8,6 +9,7 @@ import {
 } from '@agent-core/effects';
 import {
   CompleteRequestEstimator,
+  requestAccountingInputTokens,
   ModelContractError,
   parseModelProfile,
   type CompiledModelRequest,
@@ -44,19 +46,32 @@ import {
 } from '@agent-core/tools';
 import { randomUUID } from 'node:crypto';
 import type { ContextTransitionRequest } from './context/contracts.js';
-import type { ContextService } from './context/service.js';
+import type { ContextAdmissionInput, ContextService } from './context/service.js';
 import {
   encodeAgentEvent,
   type AgentAuditEvent,
   type AgentEvent,
   type AgentProgressEvent
 } from './events.js';
-import { sourceRef } from './history/reader.js';
-import { ModelRequestAssembler, type PromptInstruction } from './inference/model-request-assembler.js';
+import { HistoryReader, sourceRef } from './history/reader.js';
+import {
+  ModelRequestAssembler,
+  type PromptInstruction
+} from './inference/model-request-assembler.js';
+import {
+  RequestAdmission,
+  ContextAdmissionError,
+  requestCapacity
+} from './inference/request-admission.js';
+import { replaySourceEntries } from './orchestration/session-replay.js';
+import { encodeContextTransformReference } from './inference/context-transform.js';
 import { ModelWindow } from './inference/model-window.js';
 import type { NativeGenerationContext } from './inference/native-inference.js';
 import { NativeSteeringCoordinator } from './inference/native-steering.js';
-import { decodePromptContextItemInput, type PromptContextItemInput } from './inference/prompt-material.js';
+import {
+  decodePromptContextItemInput,
+  type PromptContextItemInput
+} from './inference/prompt-material.js';
 import {
   createRunInferenceLifecycle,
   invokeRunInference,
@@ -92,19 +107,20 @@ import {
 import { ModelStreamInterruptedError } from './orchestration/model-stream.js';
 import { NativeToolDelivery } from './orchestration/native-tool-delivery.js';
 import { ObservationStore } from './orchestration/observation-store.js';
-import { createOverflowDiagnostic, type OverflowDiagnostic } from './orchestration/overflow-recovery.js';
 import { readProviderStateArtifact } from './orchestration/provider-state-artifacts.js';
-import { AgentLimitExceededError, AgentRunController } from './orchestration/run-controller.js';
-import {
-  activeObservationRepresentations,
-  rebuildModelWindowFromRepositories
-} from './orchestration/session-replay.js';
+import { AgentLimitExceededError, AgentRunBudget } from './run/budget.js';
+import { rebuildModelWindowFromRepositories } from './orchestration/session-replay.js';
 import { ToolCallExecutor } from './orchestration/tool-execution.js';
-import { ToolWorkPump, toolObservationsComplete, type ToolWorkStatus } from './orchestration/tool-work.js';
+import {
+  ToolWorkPump,
+  toolObservationsComplete,
+  type ToolWorkStatus
+} from './orchestration/tool-work.js';
 import type { AgentRuntimeRepositories } from './ports.js';
 import { RunContextTransitions } from './run/context-transitions.js';
 import {
   createAgentTerminalSnapshot,
+  assistantResponseKey,
   type AgentApprovalRequest,
   type AgentClock,
   type AgentEffectiveInstruction,
@@ -133,7 +149,7 @@ import {
   type AgentRunDriver
 } from './run/control/driver.js';
 import type { AgentToolCallPlanRecord, AgentToolCallState } from './run/control/tool-state.js';
-import { PendingCallCoordinator } from './run/pending-calls.js';
+import { pendingToolCalls, assertToolTransitionBoundary } from './run/pending-calls.js';
 import { assertToolCatalogCurrent, captureToolCatalog } from './run/tool-catalog.js';
 import { parseSessionImages } from './session/images.js';
 
@@ -164,8 +180,7 @@ export interface AgentRuntimeOptions {
   readonly repositories: AgentRuntimeRepositories;
   readonly tools?: readonly CompiledToolDefinition[];
   readonly toolCatalogProvider?: () =>
-    | readonly CompiledToolDefinition[]
-    | Promise<readonly CompiledToolDefinition[]>;
+    readonly CompiledToolDefinition[] | Promise<readonly CompiledToolDefinition[]>;
   readonly toolBoundary: ToolAuthorizationBoundary;
   readonly toolContext?: Omit<ToolExecutionContext, 'policy' | 'signal'>;
   readonly toolResourceLeases?: ResourceLeaseCoordinator;
@@ -174,16 +189,18 @@ export interface AgentRuntimeOptions {
   readonly toolPolicy?: ToolPolicy;
   readonly toolAuthorizer?: ToolAuthorizer;
   readonly toolContextPrerequisite?: import('./orchestration/tool-execution.js').ToolContextPrerequisite;
-  readonly instructions?: readonly AgentInstruction[];
+  readonly instructions?:
+    | readonly AgentInstruction[]
+    | (() => readonly AgentInstruction[] | Promise<readonly AgentInstruction[]>);
   readonly contextItems?: readonly PromptContextItemInput[];
   readonly contextProvider?: AgentContextProvider;
   readonly context?: ContextService;
   readonly notes?: NoteRepository;
-  readonly contextPressurePolicy?: (input: {
-    readonly context: Awaited<ReturnType<ContextService['inspect']>>;
-    readonly estimate: RequestCostEstimate;
-    readonly signal: AbortSignal;
-  }) => ContextTransitionRequest | undefined | Promise<ContextTransitionRequest | undefined>;
+  readonly contextRenewal?: { readonly automatic: boolean };
+  readonly onRequestAdmitted?: (input: {
+    readonly requestId: string;
+    readonly sourceIds: readonly string[];
+  }) => void | Promise<void>;
   readonly estimator?: RequestEstimator;
   readonly maxOutputTokens?: number;
   readonly temperature?: number;
@@ -260,7 +277,7 @@ interface AssistantTurnRequest {
   readonly modelSession: ModelProviderSession;
   readonly signal: AbortSignal;
   readonly modelWindow: ModelWindow;
-  readonly controller: AgentRunController;
+  readonly controller: AgentRunBudget;
   readonly run: AgentRunDriver;
 }
 
@@ -270,28 +287,24 @@ type AssistantTurnResult =
       readonly response: ModelResponse;
       readonly toolCalls: readonly ToolCall[];
       readonly modelOutput: AgentModelOutput;
-      readonly nativeTurn?: { readonly snapshot: TurnSnapshot; readonly toolBatchId: string };
+      readonly turn: { readonly snapshot: TurnSnapshot; readonly toolBatchId: string };
+      readonly native: boolean;
     }
+  | { readonly kind: 'renew_context' }
   | { readonly kind: 'waiting'; readonly decision: ExecutionDecision }
   | { readonly kind: 'outcome_unknown'; readonly effectId: string };
-type RequestAssemblyResult =
-  | {
-      readonly ok: true;
-      readonly request: ModelRequest;
-      readonly compiled: CompiledModelRequest;
-      readonly estimate: RequestCostEstimate;
-      readonly fingerprint: InferenceRequestFingerprintRecord;
-    }
-  | { readonly ok: false; readonly diagnostic: OverflowDiagnostic };
+interface RequestAssemblyResult {
+  readonly request: ModelRequest;
+  readonly compiled: CompiledModelRequest;
+  readonly estimate: RequestCostEstimate;
+  readonly fingerprint: InferenceRequestFingerprintRecord;
+}
 
 type TerminalDecision =
   | {
       readonly executionStatus: 'completed';
       readonly terminationReason:
-        | 'model_completed'
-        | 'model_output_limit'
-        | 'content_filtered'
-        | 'unknown_model_termination';
+        'model_completed' | 'model_output_limit' | 'content_filtered' | 'unknown_model_termination';
       readonly modelOutput: AgentPresentModelOutput;
       readonly turnCount: number;
       readonly modelTerminationReason: ModelResponse['terminationReason'];
@@ -368,7 +381,7 @@ interface RunExecutionRuntime {
   readonly runId: string;
   readonly input: ResolvedAgentRunInput;
   readonly signal: AbortSignal;
-  readonly controller: AgentRunController;
+  readonly controller: AgentRunBudget;
   readonly providerContinuation?: ProviderExecutionContinuation;
   readonly restoring?: boolean;
   readonly run: AgentRunDriver;
@@ -400,8 +413,10 @@ export class AgentRuntime {
   private tools: readonly CompiledToolDefinition[];
   private readonly resourceLeases: ResourceLeaseCoordinator;
   private readonly requestAssembler: ModelRequestAssembler;
+  private readonly history: HistoryReader | undefined;
+  private readonly requestAdmission: RequestAdmission;
+  private readonly unbindContext: (() => void) | undefined;
   private readonly inferenceService: InferenceService;
-  private pendingCalls = new PendingCallCoordinator();
   private readonly catalogTools = new Map<string, readonly CompiledToolDefinition[]>();
   private contextTransitions: RunContextTransitions | undefined;
   private activeContextIdentity: string | null | undefined;
@@ -424,16 +439,42 @@ export class AgentRuntime {
   private static readonly MAX_STEERING_ITEMS = 1024;
 
   constructor(private readonly options: AgentRuntimeOptions) {
-    this.metadata = options.metadata === undefined ? undefined : Object.freeze({ ...options.metadata });
+    this.metadata =
+      options.metadata === undefined ? undefined : Object.freeze({ ...options.metadata });
     this.estimator = options.estimator ?? new CompleteRequestEstimator();
-    this.requestAssembler = new ModelRequestAssembler(this.estimator, options.repositories.artifacts);
+    this.history =
+      options.context?.history ??
+      (options.repositories.session
+        ? new HistoryReader({
+            repository: options.repositories.session.repository,
+            session: options.repositories.session.descriptor,
+            events: options.repositories.events,
+            ...(options.repositories.artifacts ? { artifacts: options.repositories.artifacts } : {})
+          })
+        : undefined);
+    this.requestAssembler = new ModelRequestAssembler(
+      this.estimator,
+      options.repositories.artifacts
+    );
     this.inferenceService =
       options.inferenceService ?? InferenceService.inMemory({ provider: options.provider });
-    this.maxOutputTokens = validateOptionalPositiveInteger(options.maxOutputTokens, 'maxOutputTokens');
+    this.requestAdmission = new RequestAdmission(this.requestAssembler, this.inferenceService);
+    this.unbindContext = options.context?.bindRuntime({
+      schedule: (request) => this.scheduleContextTransition(request),
+      providerTransform:
+        typeof options.provider.compileContextTransform === 'function' &&
+        typeof options.provider.transformContextCompiled === 'function'
+    });
+    this.maxOutputTokens = validateOptionalPositiveInteger(
+      options.maxOutputTokens,
+      'maxOutputTokens'
+    );
     this.toolPolicy = parseToolPolicy(options.toolPolicy ?? READ_ONLY_TOOL_POLICY);
     this.tools = Object.freeze(new ToolRegistry(options.tools ?? []).list());
     this.resourceLeases =
-      options.toolResourceLeases ?? options.resources?.resourceLeases ?? new ResourceLeaseCoordinator();
+      options.toolResourceLeases ??
+      options.resources?.resourceLeases ??
+      new ResourceLeaseCoordinator();
     validateToolBoundary(options.toolBoundary);
   }
 
@@ -444,12 +485,18 @@ export class AgentRuntime {
   }
 
   inspectRun(runId: string) {
-    return new AgentRunCoordinator(this.options.repositories.events).inspect(runId);
+    return new AgentRunCoordinator(
+      this.options.repositories.events,
+      this.options.repositories.artifacts ?? this.inferenceService.options.artifacts
+    ).inspect(runId);
   }
 
   resume(runId: string, signal?: AbortSignal): AgentRunHandle {
     if (this.activeAbortController) throw new Error('AgentRuntime already has an active run.');
-    const runs = new AgentRunCoordinator(this.options.repositories.events);
+    const runs = new AgentRunCoordinator(
+      this.options.repositories.events,
+      this.options.repositories.artifacts ?? this.inferenceService.options.artifacts
+    );
     const abortController = new AbortController();
     const runReady = Promise.resolve();
     this.activeAbortController = abortController;
@@ -508,7 +555,10 @@ export class AgentRuntime {
         })
       );
     }
-    const run = await new AgentRunCoordinator(this.options.repositories.events).attach(input.runId);
+    const run = await new AgentRunCoordinator(
+      this.options.repositories.events,
+      this.options.repositories.artifacts ?? this.inferenceService.options.artifacts
+    ).attach(input.runId);
     if (this.hasToolImplementationMismatch(run)) {
       await this.releaseResources();
       return completedRunControl(input.runId, missingImplementationSuspension(run.state()));
@@ -524,7 +574,9 @@ export class AgentRuntime {
       approval.binding.authorizationPolicyId !== this.options.toolBoundary.authorizationPolicyId ||
       approval.binding.executionTargetId !== this.options.toolBoundary.executionTargetId
     ) {
-      throw new Error(`Approval boundary changed for ${input.approvalId}; a new approval is required.`);
+      throw new Error(
+        `Approval boundary changed for ${input.approvalId}; a new approval is required.`
+      );
     }
     const call = pendingApproval.batch.calls[pendingApproval.callIndex];
     if (!call) throw new Error(`Approval ${input.approvalId} has no durable tool call.`);
@@ -549,7 +601,9 @@ export class AgentRuntime {
             `Approved tool implementation changed for ${input.approvalId}; a new approval is required.`
           )
         : current.plan.fingerprint !== approval.fingerprint
-          ? new Error(`Approval fingerprint changed for ${input.approvalId}; a new approval is required.`)
+          ? new Error(
+              `Approval fingerprint changed for ${input.approvalId}; a new approval is required.`
+            )
           : undefined;
     try {
       await releaseToolCallPlan(current.plan);
@@ -611,7 +665,10 @@ export class AgentRuntime {
     if (this.activeAbortController) throw new Error('AgentRuntime already has an active run.');
     const { runId } = input;
     const abortController = new AbortController();
-    const runs = new AgentRunCoordinator(this.options.repositories.events);
+    const runs = new AgentRunCoordinator(
+      this.options.repositories.events,
+      this.options.repositories.artifacts ?? this.inferenceService.options.artifacts
+    );
     const runReady = attachedRun
       ? Promise.resolve()
       : runs.accept(this.runAcceptance(input)).then(() => undefined);
@@ -625,7 +682,8 @@ export class AgentRuntime {
       const run = attachedRun ?? (await runs.attach(runId));
       this.activeRunDriver = run;
       this.assertRuntimeMatchesRun(run);
-      if (input.signal?.aborted) await this.scheduleAbortRun(runId, abortReason(input.signal.reason));
+      if (input.signal?.aborted)
+        await this.scheduleAbortRun(runId, abortReason(input.signal.reason));
       else
         cleanupExternalAbort = bindExternalAbort(
           input.signal,
@@ -675,9 +733,9 @@ export class AgentRuntime {
         });
       }
       const run = await runs.attach(runId);
-      this.pendingCalls = await PendingCallCoordinator.recover(this.options.repositories.events, runId);
       this.activeRunDriver = run;
-      if (this.hasToolImplementationMismatch(run)) return missingImplementationSuspension(run.state());
+      if (this.hasToolImplementationMismatch(run))
+        return missingImplementationSuspension(run.state());
       this.assertRuntimeMatchesRun(run);
       if (signal?.aborted) await this.scheduleAbortRun(runId, abortReason(signal.reason));
       else
@@ -686,21 +744,44 @@ export class AgentRuntime {
           () => this.scheduleAbortRun(runId, abortReason(signal?.reason)),
           abortController
         );
-      const staged = await this.options.repositories.events.latestOfType(runId, 'run.finalization.staged');
+      const staged = await this.options.repositories.events.latestOfType(
+        runId,
+        'run.finalization.staged'
+      );
       if (staged?.event.type === 'run.finalization.staged')
-        return await this.resumeFinalization(run, staged.event, abortController.signal);
+        return await this.resumeFinalization(run, staged.event);
       const runState = run.state();
       if (runState.control.status === 'abort_requested') {
         abortController.abort(runState.control.reason);
-        return await this.runInternal(runInput(runState), abortController.signal, run, undefined, true);
+        return await this.runInternal(
+          runInput(runState),
+          abortController.signal,
+          run,
+          undefined,
+          true
+        );
       }
       if (findPendingApproval(runState)) return this.approvalSuspension(runState);
+      if (runState.phase.kind === 'suspended' && runState.phase.reason === 'context_admission') {
+        if (!(await this.admitContextResumption(run, abortController.signal)))
+          return runSuspension(run.state());
+        return await this.runInternal(
+          runInput(run.state()),
+          abortController.signal,
+          run,
+          undefined,
+          true
+        );
+      }
       if (runState.phase.kind === 'suspended') return runSuspension(runState);
       const phase = currentProviderRequest(runState);
       if (phase?.stage === 'outcome_unknown') return runSuspension(run.state());
       if (phase?.stage === 'effect_ready') {
         const closed = closeExternalEffect(phase.effect, 'cancelled_before_start');
-        const decisionRequest = cancelledProviderStartDecisionRequest(run.state(), closed.intent.effectId);
+        const decisionRequest = cancelledProviderStartDecisionRequest(
+          run.state(),
+          closed.intent.effectId
+        );
         await this.advanceRun(run, 'start_provider_request', {
           phase: {
             kind: 'suspended',
@@ -778,7 +859,10 @@ export class AgentRuntime {
         run
           .state()
           .toolBatches.some((batch) =>
-            batch.callStates.some((call) => call.stage !== 'recorded' && call.stage !== 'cancelled')
+            batch.callStates.some(
+              (call) =>
+                call.stage !== 'recorded' && call.stage !== 'resolved' && call.stage !== 'cancelled'
+            )
           ) &&
         !(await this.reconcileDurableToolBatch(run, abortController.signal))
       ) {
@@ -818,6 +902,7 @@ export class AgentRuntime {
   }
 
   private releaseResources(): Promise<void> {
+    this.unbindContext?.();
     this.releasePromise ??= Promise.resolve(this.options.release?.()).then(() => undefined);
     return this.releasePromise;
   }
@@ -830,11 +915,10 @@ export class AgentRuntime {
     restoring = false
   ): Promise<AgentRunResult> {
     const { runId, finalizationId } = input;
-    const durableState = run.state();
-    const controller = new AgentRunController({
+    const controller = new AgentRunBudget({
+      run,
       ...(this.options.clock ? { clock: this.options.clock } : {}),
-      ...(this.options.limits ? { limits: this.options.limits } : {}),
-      ...(durableState.budget ? { initialBudget: durableState.budget } : {})
+      ...(this.options.limits ? { limits: this.options.limits } : {})
     });
     const deliveryDiagnostics: {
       eventType: string;
@@ -846,7 +930,8 @@ export class AgentRuntime {
         event,
         idempotencyKey ?? `${runId}:event:${hashJson(encodeAgentEvent(event))}`
       );
-      if (event.type === 'assistant.interrupted') await this.recordSessionAssistant(runId, event, receipt);
+      if (event.type === 'assistant.interrupted')
+        await this.recordSessionAssistant(runId, event, receipt);
       return receipt;
     };
     const emit = (event: AgentProgressEvent) =>
@@ -885,6 +970,43 @@ export class AgentRuntime {
       });
     } catch (error) {
       if (error instanceof AgentRunOwnershipLostError) throw error;
+      const admissionError = error instanceof AgentExecutionError ? error.cause : error;
+      if (admissionError instanceof ContextAdmissionError && !signal.aborted) {
+        const instruction = nextAgentRunInstruction(run.state());
+        if (instruction.kind !== 'execute') throw admissionError;
+        const accounting = admissionError.compiled.accounting;
+        const conflict = {
+          message: admissionError.message,
+          inputIdentity: admissionError.compiled.inputIdentity,
+          estimatedInputTokens: accounting.estimatedInputTokens,
+          outputReservation: accounting.outputReservation,
+          reasoningReservation: accounting.reasoningReservation,
+          ...(accounting.limits.contextTokens === undefined
+            ? {}
+            : { contextTokens: accounting.limits.contextTokens }),
+          ...(accounting.limits.maxInputTokens === undefined
+            ? {}
+            : { maxInputTokens: accounting.limits.maxInputTokens }),
+          actions: ['select_sources', 'reduce_reservation', 'change_model', 'cancel'] as const
+        };
+        await this.advanceRun(run, instruction.procedure, {
+          phase: {
+            kind: 'suspended',
+            reason: 'context_admission',
+            conflict,
+            turnIndex: currentProviderRequest(run.state())?.identity.turnIndex ?? 1
+          },
+          budget: controller.snapshot()
+        });
+        return {
+          state: 'suspended',
+          reason: 'context_admission',
+          runId,
+          finalizationId,
+          contextAdmission: conflict,
+          budget: controller.snapshot()
+        };
+      }
       decision = await this.decisionFromError({
         error,
         signal,
@@ -897,17 +1019,16 @@ export class AgentRuntime {
     if (decision.executionStatus === 'waiting_for_approval') {
       const cleanupError = await this.releaseOwnedResources(runId, append);
       if (!cleanupError) {
-        controller.waitForApproval();
         const budget = controller.snapshot();
         await append({
           type: 'run.phase.changed',
           runId,
-          phase: 'waiting_for_approval',
+          phase: agentRunActivity(run.state()),
           budget
         });
         await emit({
           type: 'run.phase.changed',
-          phase: 'waiting_for_approval',
+          phase: agentRunActivity(run.state()),
           budget
         });
         return Object.freeze({
@@ -942,31 +1063,19 @@ export class AgentRuntime {
       const cleanupError = await this.releaseOwnedResources(runId, append);
       if (cleanupError) decision = cleanupFailureDecision(decision, cleanupError);
     }
-    await this.enterPhase(runId, controller, 'finalizing', append, emit);
     await this.waitForAbortRequest(runId);
     decision = decisionBeforeFinalization(decision, signal);
     if (
       decision.executionStatus !== 'aborted' &&
       run.state().providerRequests.some((request) => request.stage === 'effect_pending')
     )
-      throw new Error('An unresolved started provider effect must be reconciled before terminal staging.');
+      throw new Error(
+        'An unresolved started provider effect must be reconciled before terminal staging.'
+      );
     const terminal = terminalSnapshot(runId, finalizationId, decision, controller);
     await finalizer.stage(terminal, 'diagnostic' in decision ? decision.diagnostic : undefined);
     await this.enterRunFinalization(run, controller.snapshot());
-    if (this.options.context && !signal.aborted && this.pendingCalls.pending().length === 0) {
-      await this.contextTransitions?.drain({
-        context: this.options.context,
-        admit: (request) => this.retainPendingSources(request, runId),
-        committed: (entry) =>
-          emit({
-            type: 'context.transitioned',
-            window: entry.window,
-            transition: entry.transition
-          }),
-        signal
-      });
-    }
-
+    await this.reportActivity(runId, controller, append, emit);
     const result = await finalizer.finalize(
       terminal,
       'diagnostic' in decision ? decision.diagnostic : undefined
@@ -977,22 +1086,23 @@ export class AgentRuntime {
     const terminalInstruction = nextAgentRunInstruction(run.state());
     if (
       terminalInstruction.kind !== 'execute' ||
-      (terminalInstruction.procedure !== 'finalize' && terminalInstruction.procedure !== 'finalize_abort')
+      (terminalInstruction.procedure !== 'finalize' &&
+        terminalInstruction.procedure !== 'finalize_abort')
     ) {
-      throw new Error(`Run ${runId} cannot publish its durable terminal run from the current phase.`);
+      throw new Error(
+        `Run ${runId} cannot publish its durable terminal run from the current phase.`
+      );
     }
     await this.advanceRun(run, terminalInstruction.procedure, {
       phase: { kind: 'terminal', resultEventId: terminalRecord.eventId },
       budget: controller.snapshot()
     });
-    controller.commitTerminal();
     return result;
   }
 
   private async resumeFinalization(
     run: AgentRunDriver,
-    staged: Extract<AgentEvent, { readonly type: 'run.finalization.staged' }>,
-    signal: AbortSignal
+    staged: Extract<AgentEvent, { readonly type: 'run.finalization.staged' }>
   ): Promise<AgentRunResult> {
     const runId = run.state().runId;
     await this.enterRunFinalization(run, staged.terminal.budget);
@@ -1005,23 +1115,6 @@ export class AgentRuntime {
       append
     });
     await this.contextTransitions.restore();
-    if (this.options.context && !signal.aborted)
-      await this.contextTransitions.drain({
-        context: this.options.context,
-        admit: (request) => this.retainPendingSources(request, runId),
-        signal,
-        committed: (entry) =>
-          this.emitProgress(
-            staged.terminal.finalizationId,
-            {
-              type: 'context.transitioned',
-              window: entry.window,
-              transition: entry.transition
-            },
-            deliveryDiagnostics,
-            append
-          )
-      });
     const finalizer = new AgentRunFinalizer({
       runId,
       finalizationId: staged.terminal.finalizationId,
@@ -1063,10 +1156,6 @@ export class AgentRuntime {
       append: (event, key) => runtime.run.append(event, key)
     });
     await this.contextTransitions.restore();
-    this.pendingCalls = await PendingCallCoordinator.recover(
-      this.options.repositories.events,
-      runtime.runId
-    );
     const initialPhase = runtime.run.state().phase;
     const initialToolPhase = currentToolBatch(runtime.run.state());
     const durableInstructions = initialToolPhase?.instructions;
@@ -1078,7 +1167,8 @@ export class AgentRuntime {
             )
           ).branch.find((entry) => entry.type === 'input' && entry.runId === runtime.runId)
         : undefined;
-    const originalInstructions = recordedInput?.type === 'input' ? recordedInput.instructions : undefined;
+    const originalInstructions =
+      recordedInput?.type === 'input' ? recordedInput.instructions : undefined;
     const effectiveInstructions = durableInstructions
       ? [...durableInstructions]
       : runtime.providerContinuation
@@ -1086,7 +1176,7 @@ export class AgentRuntime {
         : originalInstructions
           ? [...originalInstructions]
           : [
-              ...applicationInstructions(this.options.instructions),
+              ...(await this.currentApplicationInstructions()),
               ...runInstructions(runtime.input.instructions)
             ];
     if (!(await this.options.repositories.events.latestOfType(runtime.runId, 'run.started'))) {
@@ -1123,16 +1213,18 @@ export class AgentRuntime {
         task: runtime.input.task,
         ...(runtime.input.images === undefined ? {} : { images: runtime.input.images }),
         instructions: originalInstructions ?? [
-          ...applicationInstructions(this.options.instructions),
+          ...(await this.currentApplicationInstructions()),
           ...runInstructions(runtime.input.instructions)
         ]
       });
       sessionEntryId = inputEntry.id;
     }
     const replay = await rebuildModelWindowFromRepositories({
-      ...(this.options.repositories.session ? { session: this.options.repositories.session } : {}),
+      ...(this.history ? { history: this.history } : {}),
       events: this.options.repositories.events,
-      ...(this.options.repositories.artifacts ? { artifacts: this.options.repositories.artifacts } : {}),
+      ...(this.options.repositories.artifacts
+        ? { artifacts: this.options.repositories.artifacts }
+        : {}),
       estimator: this.estimator,
       modelWindowImageLimits: {
         maxCount: runtime.controller.limits.activeImageCount,
@@ -1147,8 +1239,9 @@ export class AgentRuntime {
     });
     const modelWindow = replay.modelWindow;
     const observationStore = new ObservationStore({
-      estimator: this.estimator,
-      ...(this.options.repositories.artifacts ? { artifacts: this.options.repositories.artifacts } : {})
+      ...(this.options.repositories.artifacts
+        ? { artifacts: this.options.repositories.artifacts }
+        : {})
     });
     for (const invalidated of replay.invalidatedProviderStates)
       await runtime.append({
@@ -1164,7 +1257,9 @@ export class AgentRuntime {
         replayedTurns: replay.replayedTurns,
         replayedSessionEntries: replay.replayedSessionEntries,
         replayedToolResults: replay.replayedToolResults,
-        ...(replay.providerStateSummary ? { restoredProviderState: replay.providerStateSummary } : {}),
+        ...(replay.providerStateSummary
+          ? { restoredProviderState: replay.providerStateSummary }
+          : {}),
         ...(replay.providerStateRef ? { restoredProviderStateRef: replay.providerStateRef } : {})
       };
       await runtime.append(replayEvent);
@@ -1184,7 +1279,11 @@ export class AgentRuntime {
     let replayRestored = false;
     try {
       if (initialToolPhase) {
-        const resumeDecision = await this.resumeDurableToolBatch(runtime, modelWindow, observationStore);
+        const resumeDecision = await this.resumeDurableToolBatch(
+          runtime,
+          modelWindow,
+          observationStore
+        );
         if (resumeDecision) return resumeDecision;
         turnIndex += 1;
       }
@@ -1214,7 +1313,6 @@ export class AgentRuntime {
           toolBatchId = providerResume.toolBatchId;
           activeTurnIdentity = providerResume.identity;
           lastStartedTurnIndex = turnIndex;
-          runtime.controller.transition('requesting_model');
           modelSession = this.inferenceService.createSession();
           sessionModel = snapshot.configuration.model;
           if (
@@ -1238,6 +1336,7 @@ export class AgentRuntime {
               runId: runtime.runId,
               turnIndex,
               snapshot,
+              toolBatchId,
               controller: runtime.controller,
               run: runtime.run
             },
@@ -1249,12 +1348,16 @@ export class AgentRuntime {
           });
           providerResume = undefined;
         } else {
-          runtime.controller.beginModelTurn();
+          runtime.controller.reserveModelTurn();
           const configuration = this.captureRuntimeConfiguration();
-          const profile = parseModelProfile(await this.options.provider.describeModel(configuration.model));
+          const profile = parseModelProfile(
+            await this.options.provider.describeModel(configuration.model)
+          );
           const providerInfo = this.options.provider.describe();
           if (this.options.toolCatalogProvider)
-            this.tools = Object.freeze(new ToolRegistry(await this.options.toolCatalogProvider()).list());
+            this.tools = Object.freeze(
+              new ToolRegistry(await this.options.toolCatalogProvider()).list()
+            );
           const tools = Object.freeze(this.availableTools(profile));
           validateModelRun(
             providerInfo.id,
@@ -1264,11 +1367,8 @@ export class AgentRuntime {
             configuration.reasoning
           );
           const requestWindow = requestWindowForModel(profile, this.maxOutputTokens);
-          observationStore.setTokenBudgets({
-            immediate: Math.max(256, Math.min(4_000, Math.floor(requestWindow.maxPromptTokens * 0.12))),
-            retained: Math.max(128, Math.min(1_000, Math.floor(requestWindow.maxPromptTokens * 0.03)))
-          });
-          const continuationEligible = modelSession !== undefined && sessionModel === configuration.model;
+          const continuationEligible =
+            modelSession !== undefined && sessionModel === configuration.model;
           if (!continuationEligible) {
             if (modelSession) {
               modelSession.resetContinuation?.('Model changed between immutable turn snapshots.');
@@ -1300,6 +1400,12 @@ export class AgentRuntime {
           }
           const turnId = randomUUID();
           toolBatchId = randomUUID();
+          effectiveInstructions.splice(
+            0,
+            effectiveInstructions.length,
+            ...(await this.currentApplicationInstructions()),
+            ...effectiveInstructions.filter((item) => item.provenance !== 'application')
+          );
           snapshot = this.createTurnSnapshot({
             turnIndex,
             turnId,
@@ -1334,7 +1440,9 @@ export class AgentRuntime {
                 ...(configuration.temperature === undefined
                   ? {}
                   : { temperature: configuration.temperature }),
-                ...(configuration.reasoning === undefined ? {} : { reasoning: configuration.reasoning }),
+                ...(configuration.reasoning === undefined
+                  ? {}
+                  : { reasoning: configuration.reasoning }),
                 ...(profile.capabilities.protocol === undefined
                   ? {}
                   : { endpoint: profile.capabilities.protocol.endpoint })
@@ -1356,7 +1464,9 @@ export class AgentRuntime {
                 ...(configuration.temperature === undefined
                   ? {}
                   : { temperature: configuration.temperature }),
-                ...(configuration.reasoning === undefined ? {} : { reasoning: configuration.reasoning }),
+                ...(configuration.reasoning === undefined
+                  ? {}
+                  : { reasoning: configuration.reasoning }),
                 ...(this.metadata === undefined ? {} : { metadata: this.metadata })
               })
             };
@@ -1367,14 +1477,18 @@ export class AgentRuntime {
             phase: { kind: 'active' },
             providerRequests: [
               ...state.providerRequests,
-              { kind: 'provider', stage: 'ready', identity: turnIdentity(snapshot.record), toolBatchId }
+              {
+                kind: 'provider',
+                stage: 'ready',
+                identity: turnIdentity(snapshot.record),
+                toolBatchId
+              }
             ],
-            budget: runtime.controller.snapshot()
+            budget: runtime.controller.reserveModelTurn()
           }));
-          await this.enterPhase(
+          await this.reportActivity(
             runtime.runId,
             runtime.controller,
-            'requesting_model',
             runtime.append,
             runtime.emit
           );
@@ -1405,9 +1519,17 @@ export class AgentRuntime {
           );
         }
         if (assistant.kind === 'waiting') return assistant.decision;
-        if (assistant.kind === 'settled' && assistant.nativeTurn) {
-          snapshot = assistant.nativeTurn.snapshot;
-          toolBatchId = assistant.nativeTurn.toolBatchId;
+        if (assistant.kind === 'renew_context') {
+          await modelSession?.close?.();
+          modelSession = undefined;
+          sessionModel = undefined;
+          turnIndex++;
+          continue;
+        }
+        if (assistant.kind === 'settled') {
+          const admitted = assistant.turn;
+          snapshot = admitted.snapshot;
+          toolBatchId = admitted.toolBatchId;
           activeTurnIdentity = turnIdentity(snapshot.record);
           turnIndex = snapshot.record.turnIndex;
           lastStartedTurnIndex = turnIndex;
@@ -1442,7 +1564,7 @@ export class AgentRuntime {
         }
 
         if (toolCalls.length === 0) {
-          if (!assistant.nativeTurn)
+          if (!assistant.native)
             modelWindow.recordModelOutput({
               turnIndex,
               content: response.content,
@@ -1456,20 +1578,13 @@ export class AgentRuntime {
             ]
               .filter(Boolean)
               .join(' ');
-            await this.options.repositories.session?.repository.appendObservation(
-              this.options.repositories.session.descriptor,
-              {
-                runId: runtime.runId,
-                identity: turnIdentity(snapshot.record),
-                toolName: 'assistant_response',
-                observation: {
-                  ok: false,
-                  summary: emptyMessage,
-                  output: { content: response.content }
-                }
-              }
+            return failedDecision(
+              'empty_response',
+              activeModelOutput,
+              emptyMessage,
+              turnIndex,
+              response
             );
-            return failedDecision('empty_response', activeModelOutput, emptyMessage, turnIndex, response);
           }
           const providerSettlement = providerWork(runtime.run.state(), snapshot.record);
           if (providerSettlement.stage !== 'settled')
@@ -1477,7 +1592,7 @@ export class AgentRuntime {
           return completedDecision(activeModelOutput, turnIndex, response);
         }
 
-        runtime.controller.recordToolCalls(toolCalls);
+        runtime.controller.reserveToolCalls(toolCalls);
         modelWindow.recordModelOutput({
           turnIndex,
           content: response.content,
@@ -1511,7 +1626,8 @@ export class AgentRuntime {
           calls: toolCalls,
           modelCalls: response.toolCalls ?? [],
           source: {
-            responseId: response.requestId ?? response.transport?.responseId ?? sourceRequest.responseId,
+            responseId:
+              response.requestId ?? response.transport?.responseId ?? sourceRequest.responseId,
             catalog: snapshot.record.toolCatalog
           },
           callStates: toolCalls.map(() => ({ stage: 'ready' })),
@@ -1528,15 +1644,9 @@ export class AgentRuntime {
               : record
           ),
           toolBatches: [...state.toolBatches, group],
-          budget: runtime.controller.snapshot()
+          budget: runtime.controller.reserveToolCalls(group.calls)
         }));
-        await this.enterPhase(
-          runtime.runId,
-          runtime.controller,
-          'executing_tools',
-          runtime.append,
-          runtime.emit
-        );
+        await this.reportActivity(runtime.runId, runtime.controller, runtime.append, runtime.emit);
         const toolDeadline = runSignalDeadline(runtime.controller, runtime.signal);
         let toolResult;
         try {
@@ -1555,8 +1665,10 @@ export class AgentRuntime {
             approvals: toolResult.approvals
           };
         }
-        if (toolResult.outcome === 'ownership_lost') throw new AgentRunOwnershipLostError(runtime.runId);
-        if (toolResult.outcome === 'waiting_for_recovery') return toolRecoveryDecision(runtime.run.state());
+        if (toolResult.outcome === 'ownership_lost')
+          throw new AgentRunOwnershipLostError(runtime.runId);
+        if (toolResult.outcome === 'waiting_for_recovery')
+          return toolRecoveryDecision(runtime.run.state());
         await this.advanceRun(runtime.run, 'advance_after_tools', {
           phase: {
             kind: 'initializing',
@@ -1568,7 +1680,8 @@ export class AgentRuntime {
         turnIndex += 1;
       }
     } catch (error) {
-      if (error instanceof AgentRunOwnershipLostError || error instanceof AgentExecutionError) throw error;
+      if (error instanceof AgentRunOwnershipLostError || error instanceof AgentExecutionError)
+        throw error;
       throw new AgentExecutionError(error, {
         lastStartedTurnIndex,
         activeModelOutput,
@@ -1591,7 +1704,9 @@ export class AgentRuntime {
       resolveTools: (catalog) => this.catalogTools.get(catalog.revision) ?? this.tools,
       currentTools: async () => {
         if (this.options.toolCatalogProvider)
-          this.tools = Object.freeze(new ToolRegistry(await this.options.toolCatalogProvider()).list());
+          this.tools = Object.freeze(
+            new ToolRegistry(await this.options.toolCatalogProvider()).list()
+          );
         return this.tools;
       },
       toolContext: this.toolContext(signal),
@@ -1606,7 +1721,6 @@ export class AgentRuntime {
       state: () => runtime.run.state(),
       transitionTool: async (procedure, target, update) => {
         await runtime.run.transitionTool(procedure, target, update, runtime.controller.snapshot());
-        this.pendingCalls.observeState(runtime.run.state());
       },
       settle: (settlement) => this.settleToolEffect(runtime.run, settlement),
       append: runtime.append,
@@ -1639,18 +1753,16 @@ export class AgentRuntime {
   ): Promise<ExecutionDecision | undefined> {
     const initial = currentToolBatch(runtime.run.state());
     if (!initial) throw new Error('Run does not have a durable tool batch to resume.');
-    runtime.controller.transition('requesting_model');
-    runtime.controller.transition('executing_tools');
     const resumedBudget = runtime.controller.snapshot();
     await runtime.append({
       type: 'run.phase.changed',
       runId: runtime.runId,
-      phase: 'executing_tools',
+      phase: agentRunActivity(runtime.run.state()),
       budget: resumedBudget
     });
     await runtime.emit({
       type: 'run.phase.changed',
-      phase: 'executing_tools',
+      phase: agentRunActivity(runtime.run.state()),
       budget: resumedBudget
     });
     const toolDeadline = runSignalDeadline(runtime.controller, runtime.signal);
@@ -1665,13 +1777,15 @@ export class AgentRuntime {
     } finally {
       toolDeadline.dispose();
     }
-    if (resumedTools.outcome === 'ownership_lost') throw new AgentRunOwnershipLostError(runtime.runId);
+    if (resumedTools.outcome === 'ownership_lost')
+      throw new AgentRunOwnershipLostError(runtime.runId);
     if (resumedTools.outcome === 'waiting_for_approval')
       return {
         executionStatus: 'waiting_for_approval',
         approvals: resumedTools.approvals
       };
-    if (resumedTools.outcome === 'waiting_for_recovery') return toolRecoveryDecision(runtime.run.state());
+    if (resumedTools.outcome === 'waiting_for_recovery')
+      return toolRecoveryDecision(runtime.run.state());
     await this.advanceRun(runtime.run, 'advance_after_tools', {
       phase: {
         kind: 'initializing',
@@ -1687,7 +1801,7 @@ export class AgentRuntime {
     readonly error: unknown;
     readonly signal: AbortSignal;
     readonly runId: string;
-    readonly controller: AgentRunController;
+    readonly controller: AgentRunBudget;
     readonly append: (event: AgentAuditEvent) => Promise<EventAppendReceipt>;
     readonly emit: (event: AgentProgressEvent) => Promise<void>;
   }): Promise<TerminalDecision> {
@@ -1711,8 +1825,7 @@ export class AgentRuntime {
     let recoveredModelOutput: AgentModelOutput = existingModelOutput;
     if (cause instanceof ModelStreamInterruptedError) {
       const content = cause.content.trim();
-      const summary = cause.reasoningSummary?.trim() ?? '';
-      const visible = content.length > 0 ? content : summary;
+      const visible = content;
       recoveredModelOutput = visible
         ? {
             status: 'partial',
@@ -1727,7 +1840,9 @@ export class AgentRuntime {
         content: cause.content,
         modelOutput: recoveredModelOutput,
         ...(cause.reasoning === undefined ? {} : { reasoning: cause.reasoning }),
-        ...(cause.reasoningSummary !== undefined ? { reasoningSummary: cause.reasoningSummary } : {}),
+        ...(cause.reasoningSummary !== undefined
+          ? { reasoningSummary: cause.reasoningSummary }
+          : {}),
         finalResponseReceived: cause.finalResponseReceived,
         ...(diagnostic ? { diagnostic } : {})
       };
@@ -1775,11 +1890,9 @@ export class AgentRuntime {
         ? 'malformed_response'
         : cause instanceof ModelStreamInterruptedError
           ? 'stream_interrupted'
-          : cause instanceof RequestAssemblyError
-            ? 'request_too_large'
-            : diagnostic
-              ? 'provider_error'
-              : 'runtime_error';
+          : diagnostic
+            ? 'provider_error'
+            : 'runtime_error';
     return {
       executionStatus: 'failed',
       terminationReason,
@@ -1799,7 +1912,7 @@ export class AgentRuntime {
     readonly requestWindow: RequestWindow;
     readonly tools: readonly CompiledToolDefinition[];
     readonly instructions: readonly AgentEffectiveInstruction[];
-    readonly controller: AgentRunController;
+    readonly controller: AgentRunBudget;
     readonly continuationEligible: boolean;
   }): TurnSnapshot {
     const record: AgentTurnSnapshotRecord = Object.freeze({
@@ -1813,7 +1926,9 @@ export class AgentRuntime {
       ...(input.configuration.temperature === undefined
         ? {}
         : { temperature: input.configuration.temperature }),
-      ...(input.configuration.reasoning === undefined ? {} : { reasoning: input.configuration.reasoning }),
+      ...(input.configuration.reasoning === undefined
+        ? {}
+        : { reasoning: input.configuration.reasoning }),
       ...(input.configuration.responseFormat === undefined
         ? {}
         : { responseFormat: input.configuration.responseFormat }),
@@ -1825,7 +1940,6 @@ export class AgentRuntime {
       limits: input.controller.limits,
       budget: input.controller.snapshot()
     });
-    this.pendingCalls.bindCatalog(record);
     return Object.freeze({
       record,
       profile: input.profile,
@@ -1842,7 +1956,9 @@ export class AgentRuntime {
     requestEstimate: RequestCostEstimate
   ): Promise<TurnSnapshot> {
     if (record.provider !== this.options.provider.id || record.model !== this.options.model)
-      throw new Error(`Persisted turn ${record.turnId} does not match the configured provider and model.`);
+      throw new Error(
+        `Persisted turn ${record.turnId} does not match the configured provider and model.`
+      );
     const profile = parseModelProfile(await this.options.provider.describeModel(record.model));
     if (hashJson(profile) !== record.profileHash)
       throw new Error(`Provider model profile changed for persisted turn ${record.turnId}.`);
@@ -1878,7 +1994,7 @@ export class AgentRuntime {
 
   private async requestNativeTurns(
     initial: AssistantTurnRequest,
-    assembly: Extract<RequestAssemblyResult, { readonly ok: true }>,
+    assembly: RequestAssemblyResult,
     runtime: RunExecutionRuntime,
     observationStore: ObservationStore
   ): Promise<AssistantTurnResult> {
@@ -1912,6 +2028,7 @@ export class AgentRuntime {
     let final: Extract<AssistantTurnResult, { readonly kind: 'settled' }> | undefined;
     let paused: ExecutionDecision | undefined;
     let unknownEffect: string | undefined;
+    const transition = { renewed: false };
     let nextTools = initial.snapshot.tools;
     const pause = new Error('Native execution reached a durable suspension boundary.');
     const pauseFor = (status: ToolWorkStatus): void => {
@@ -1929,21 +2046,31 @@ export class AgentRuntime {
       return value;
     };
     const createGeneration = async (context: NativeGenerationContext): Promise<Generation> => {
+      await this.requestAdmission.admit(context.compiled, context.profile);
       const first = context.generationDeliveryId === 'initial';
-      if (!first) runtime.controller.beginModelTurn();
+      if (!first) runtime.controller.reserveModelTurn();
       const request = context.compiled.logicalRequest;
       const tools =
-        context.dispatch?.kind === 'steering' ? (active?.request.snapshot.tools ?? nextTools) : nextTools;
+        context.dispatch?.kind === 'steering'
+          ? (active?.request.snapshot.tools ?? nextTools)
+          : nextTools;
       if (hashJson(toolsForModel([...tools], context.profile)) !== hashJson(request.tools ?? [])) {
         throw new Error('Native dispatch changed the captured tool catalog.');
       }
       const snapshot = first
         ? initial.snapshot
         : this.createTurnSnapshot({
-            turnIndex: runtime.controller.snapshot().modelTurns,
+            turnIndex: runtime.controller.snapshot().modelTurns + 1,
             turnId: randomUUID(),
             requestAttempt: 1,
-            configuration: initial.snapshot.configuration,
+            configuration: {
+              model: request.model,
+              ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
+              ...(request.reasoning === undefined ? {} : { reasoning: request.reasoning }),
+              ...(request.responseFormat === undefined
+                ? {}
+                : { responseFormat: request.responseFormat })
+            },
             profile: context.profile,
             requestWindow: initial.snapshot.requestWindow,
             tools,
@@ -1972,7 +2099,7 @@ export class AgentRuntime {
               toolBatchId: turn.toolBatchId
             }
           ],
-          budget: runtime.controller.snapshot()
+          budget: runtime.controller.reserveModelTurn()
         }));
         const started = {
           type: 'turn.started' as const,
@@ -1996,14 +2123,16 @@ export class AgentRuntime {
             requestId: context.invocationId,
             compiledInputIdentity: context.compiled.inputIdentity,
             capabilityRevision: context.compiled.capabilityRevision,
-            configuredContextIds: assembly.fingerprint.configuredContextIds,
-            providerContextIds: assembly.fingerprint.providerContextIds,
-            runContextIds: assembly.fingerprint.runContextIds,
-            effectiveInstructionHash: assembly.fingerprint.effectiveInstructionHash,
+            ...(context.parentInvocationId ? { parentRequestId: context.parentInvocationId } : {}),
+            configuredContextIds: [],
+            providerContextIds: [],
+            runContextIds: [],
+            effectiveInstructionHash: hashJson(
+              request.messages.filter((item) => item.role === 'system' || item.role === 'developer')
+            ),
             modelWindowHistoryHash: hashJson(request.messages),
             modelToolSchemasHash: hashJson(request.tools ?? []),
-            modelWindowHash: hashJson(request.messages),
-            reductions: []
+            modelWindowHash: hashJson(request.messages)
           };
       await runtime.append({
         type: 'budget.estimate.created',
@@ -2012,6 +2141,33 @@ export class AgentRuntime {
         estimate,
         snapshot: snapshot.budgetAccountant.snapshot()
       });
+      if (!first && context.dispatch) {
+        const deliveredIds = new Set(context.dispatch.sourceCalls.map((call) => call.toolCallId));
+        const sourceIds: string[] = [];
+        for (const batch of runtime.run.state().toolBatches)
+          for (const [index, call] of batch.callStates.entries()) {
+            if (call.stage !== 'recorded' || !deliveredIds.has(batch.modelCalls[index]?.id ?? ''))
+              continue;
+            const observation = call.settlement.observation;
+            if (!observation) continue;
+            const output = observation.output;
+            if (
+              observation.execution?.state !== 'not_started' ||
+              typeof output !== 'object' ||
+              output === null ||
+              !('status' in output) ||
+              output.status !== 'context_required' ||
+              !('context' in output) ||
+              !Array.isArray(output.context)
+            )
+              continue;
+            for (const value of output.context) {
+              const item = decodePromptContextItemInput(value);
+              if (item.id) sourceIds.push(item.id);
+            }
+          }
+        await this.options.onRequestAdmitted?.({ requestId: context.invocationId, sourceIds });
+      }
       const started = { type: 'assistant.started' as const, ...turnIdentity(snapshot.record) };
       await runtime.append(started);
       await runtime.emit(started);
@@ -2044,6 +2200,7 @@ export class AgentRuntime {
         invocationId: assembly.fingerprint.requestId,
         ownerId: this.options.inferenceOwnerId ?? runtime.runId,
         purpose: 'agent_step',
+        runId: runtime.runId,
         request: assembly.request,
         compiled: assembly.compiled,
         profile: initial.snapshot.profile,
@@ -2053,6 +2210,7 @@ export class AgentRuntime {
           await createGeneration(context);
         },
         extended: async (context, dispatch) => {
+          await this.requestAdmission.admit(dispatch.compiled, context.profile);
           const item = generation(context);
           const estimate = item.request.snapshot.budgetAccountant.estimateRequest({
             accounting: dispatch.compiled.accounting,
@@ -2077,20 +2235,26 @@ export class AgentRuntime {
         onStreamEvent: async (event) => {
           await this.nativeSteering?.observe(event);
           if (event.type === 'response_started') {
-            if (!event.native) throw new Error('Native response is missing its admission manifest.');
-            if (active) {
-              const prior = providerWork(runtime.run.state(), active.request.snapshot.record);
-              if (prior.stage === 'settled') {
-                await runtime.run.transitionProvider(
-                  'consume_provider_settlement',
-                  prior.identity,
-                  () => ({ ...prior, stage: 'consumed' }),
-                  runtime.controller.snapshot()
-                );
-              }
+            if (!event.native)
+              throw new Error('Native response is missing its admission manifest.');
+            const previous = active?.request.snapshot.record;
+            const prior =
+              previous &&
+              runtime.run
+                .state()
+                .providerRequests.find((request) => sameTurnIdentity(request.identity, previous));
+            if (prior?.stage === 'settled') {
+              await runtime.run.transitionProvider(
+                'consume_provider_settlement',
+                prior.identity,
+                () => ({ ...prior, stage: 'consumed' }),
+                runtime.controller.snapshot()
+              );
             }
             const deliveryId = event.native.generationDeliveryId ?? 'initial';
-            active = [...generations.values()].find((item) => item.generationDeliveryId === deliveryId);
+            active = [...generations.values()].find(
+              (item) => item.generationDeliveryId === deliveryId
+            );
             if (!active) throw new Error('Native response started without matching run authority.');
           }
           if (event.type === 'tool_result_delivery') await deliveries.observe(event.delivery);
@@ -2111,11 +2275,38 @@ export class AgentRuntime {
           });
           final = {
             ...assistant,
-            nativeTurn: { snapshot: item.request.snapshot, toolBatchId: item.request.toolBatchId }
+            native: true
           };
           const calls = assistant.toolCalls;
+          if (
+            !calls.length &&
+            !boundary.pendingToolCalls.length &&
+            this.contextTransitions?.hasPending()
+          ) {
+            const source = providerWork(runtime.run.state(), item.request.snapshot.record);
+            if (source.stage !== 'settled')
+              throw new Error('Native renewal requires settled provider work.');
+            assertToolTransitionBoundary(runtime.run.state());
+            await runtime.run.transitionProvider(
+              'consume_provider_settlement',
+              source.identity,
+              () => ({ ...source, stage: 'consumed' })
+            );
+            await this.advanceRun(runtime.run, 'advance_after_tools', {
+              phase: {
+                kind: 'initializing',
+                step: 'assemble_turn',
+                turnIndex: item.request.turnIndex + 1
+              }
+            });
+            transition.renewed = true;
+            return;
+          }
+
           if (calls.length && response.terminationReason !== 'tool_calls') {
-            throw new Error('Native response returned calls with an incompatible termination reason.');
+            throw new Error(
+              'Native response returned calls with an incompatible termination reason.'
+            );
           }
           initial.modelWindow.recordModelOutput({
             turnIndex: item.request.turnIndex,
@@ -2124,9 +2315,10 @@ export class AgentRuntime {
             ...(response.output ? { output: response.output } : {})
           });
           if (calls.length) {
-            runtime.controller.recordToolCalls(calls);
+            runtime.controller.reserveToolCalls(calls);
             const source = providerWork(runtime.run.state(), item.request.snapshot.record);
-            if (source.stage !== 'settled') throw new Error('Native tool source is not durably settled.');
+            if (source.stage !== 'settled')
+              throw new Error('Native tool source is not durably settled.');
             const batch: AgentToolPhase = {
               kind: 'tools',
               identity: source.identity,
@@ -2151,7 +2343,7 @@ export class AgentRuntime {
                   : record
               ),
               toolBatches: [...state.toolBatches, batch],
-              budget: runtime.controller.snapshot()
+              budget: runtime.controller.reserveToolCalls(batch.calls)
             }));
           }
           await pump.advance();
@@ -2173,7 +2365,9 @@ export class AgentRuntime {
           }
           if (!ready.results.length && !calls.length) return;
           if (this.options.toolCatalogProvider) {
-            this.tools = Object.freeze(new ToolRegistry(await this.options.toolCatalogProvider()).list());
+            this.tools = Object.freeze(
+              new ToolRegistry(await this.options.toolCatalogProvider()).list()
+            );
           }
           nextTools = Object.freeze(this.availableTools(context.profile));
           const tools = toolsForModel([...nextTools], context.profile);
@@ -2208,6 +2402,7 @@ export class AgentRuntime {
         }
       });
       await this.nativeSteering?.finishResponse();
+      if (transition.renewed) return { kind: 'renew_context' };
       if (!final || final.toolCalls.length)
         throw new Error('Native execution ended with unresolved model work.');
       return final;
@@ -2224,61 +2419,119 @@ export class AgentRuntime {
     request: AssistantTurnRequest,
     append: (event: AgentAuditEvent) => Promise<EventAppendReceipt>,
     emit: (event: AgentProgressEvent) => Promise<void>,
-    nativeWork: { readonly runtime: RunExecutionRuntime; readonly observationStore: ObservationStore }
+    nativeWork: {
+      readonly runtime: RunExecutionRuntime;
+      readonly observationStore: ObservationStore;
+    }
   ): Promise<AssistantTurnResult> {
     const deadline = runSignalDeadline(request.controller, request.signal);
     request = { ...request, signal: deadline.signal };
     try {
-      const identity = turnIdentity(request.snapshot.record);
-      const assembly = await this.assembleModelRequest(request, append, emit);
-      if (!assembly.ok) throw new RequestAssemblyError(formatOverflowDiagnostic(assembly.diagnostic));
-      const protocol = request.snapshot.profile.capabilities.protocol;
-      if (
-        request.modelSession.continueNative &&
-        (protocol?.asyncTools || protocol?.steering === 'native')
-      ) {
-        return await this.requestNativeTurns(
-          request,
-          assembly,
-          nativeWork.runtime,
-          nativeWork.observationStore
+      let rejected: CompiledModelRequest | undefined;
+      for (let retry = 0; retry < 2; retry++) {
+        const identity = turnIdentity(request.snapshot.record);
+        const assembly = await this.assembleModelRequest(request, append, emit, rejected);
+        await request.controller.recordUsage(
+          await this.inferenceService.settledRunCharges(
+            this.options.inferenceOwnerId ?? request.runId,
+            request.runId
+          )
         );
+        const protocol = request.snapshot.profile.capabilities.protocol;
+        if (
+          request.modelSession.continueNative &&
+          (protocol?.asyncTools || protocol?.steering === 'native')
+        ) {
+          return await this.requestNativeTurns(
+            request,
+            assembly,
+            nativeWork.runtime,
+            nativeWork.observationStore
+          );
+        }
+        request.snapshot.budgetAccountant.recordSent(assembly.estimate);
+        const ledgerModelRequest = { ...assembly.request };
+        delete ledgerModelRequest.signal;
+        await append({ type: 'assistant.started', ...identity });
+        await emit({ type: 'assistant.started', ...identity });
+        const completedAttempt = await invokeRunInference({
+          service: this.inferenceService,
+          ...(this.nativeSteering ? { steering: this.nativeSteering } : {}),
+          options: this.options,
+          request: assembly.request,
+          compiled: assembly.compiled,
+          requestEstimate: assembly.estimate,
+          requestFingerprint: assembly.fingerprint,
+          requestSummary: summarizeModelRequest(ledgerModelRequest),
+          turnRequest: request,
+          append,
+          emit,
+          advanceRun: (driver, procedure, advance) => this.advanceRun(driver, procedure, advance)
+        });
+        if (completedAttempt.kind === 'outcome_unknown') return completedAttempt;
+        if (completedAttempt.kind === 'context_rejected') {
+          if (retry === 1 || !this.options.contextRenewal?.automatic || !this.options.context)
+            throw new ContextAdmissionError(
+              assembly.compiled,
+              new Error(
+                'Provider rejected context capacity; adjust selected sources, reservations, or model capacity.'
+              )
+            );
+          const phase = providerWork(request.run.state(), completedAttempt.identity);
+          if (phase.stage !== 'rejected')
+            throw new Error('Capacity rejection has no durable settlement.');
+          await request.run.transitionProvider(
+            'consume_provider_settlement',
+            completedAttempt.identity,
+            () => ({ ...phase, stage: 'consumed' })
+          );
+          await this.advanceRun(request.run, 'advance_after_tools', {
+            phase: { kind: 'initializing', step: 'assemble_turn', turnIndex: request.turnIndex }
+          });
+          const snapshot = {
+            ...request.snapshot,
+            record: {
+              ...request.snapshot.record,
+              requestAttempt: request.snapshot.record.requestAttempt + 1
+            }
+          };
+          request = { ...request, snapshot };
+          await this.advanceRun(request.run, 'assemble_turn', {
+            phase: { kind: 'active' },
+            providerRequests: [
+              {
+                kind: 'provider',
+                stage: 'ready',
+                identity: turnIdentity(snapshot.record),
+                toolBatchId: request.toolBatchId
+              }
+            ]
+          });
+          rejected = assembly.compiled;
+          continue;
+        }
+
+        const settled = await this.consumeProviderSettlement({
+          request,
+          requestEstimate: assembly.estimate,
+          response: completedAttempt.response,
+          identity: completedAttempt.identity,
+          append,
+          emit
+        });
+        return settled;
       }
-      request.snapshot.budgetAccountant.recordSent(assembly.estimate);
-      const ledgerModelRequest = { ...assembly.request };
-      delete ledgerModelRequest.signal;
-      await append({ type: 'assistant.started', ...identity });
-      await emit({ type: 'assistant.started', ...identity });
-      const completedAttempt = await invokeRunInference({
-        service: this.inferenceService,
-        ...(this.nativeSteering ? { steering: this.nativeSteering } : {}),
-        options: this.options,
-        request: assembly.request,
-        compiled: assembly.compiled,
-        requestEstimate: assembly.estimate,
-        requestFingerprint: assembly.fingerprint,
-        requestSummary: summarizeModelRequest(ledgerModelRequest),
-        turnRequest: request,
-        append,
-        emit,
-        advanceRun: (driver, procedure, advance) => this.advanceRun(driver, procedure, advance)
-      });
-      if (completedAttempt.kind === 'outcome_unknown') return completedAttempt;
-      return await this.consumeProviderSettlement({
-        request,
-        requestEstimate: assembly.estimate,
-        response: completedAttempt.response,
-        identity: completedAttempt.identity,
-        append,
-        emit
-      });
+      throw new Error('Bounded context admission attempts exhausted.');
     } finally {
       deadline.dispose();
     }
   }
 
   private async consumeProviderSettlement(input: {
-    readonly request: Pick<AssistantTurnRequest, 'runId' | 'turnIndex' | 'snapshot' | 'controller' | 'run'>;
+    readonly request: Pick<
+      AssistantTurnRequest,
+      'runId' | 'turnIndex' | 'snapshot' | 'controller' | 'run' | 'toolBatchId'
+    >;
     readonly requestEstimate: RequestCostEstimate;
     readonly response: ModelResponse;
     readonly identity: AgentTurnIdentity;
@@ -2287,7 +2540,8 @@ export class AgentRuntime {
   }): Promise<Extract<AssistantTurnResult, { readonly kind: 'settled' }>> {
     const { request, response, identity: responseIdentity, append, emit } = input;
     const providerPhase = providerWork(request.run.state(), input.identity);
-    if (providerPhase.stage !== 'settled') throw new Error('Provider response is not durably settled.');
+    if (providerPhase.stage !== 'settled')
+      throw new Error('Provider response is not durably settled.');
     const settlementRecord = await this.findProviderSettlement(
       request.runId,
       providerPhase.effect.intent.effectId,
@@ -2308,29 +2562,12 @@ export class AgentRuntime {
         state: providerState.summary,
         stateRef: providerState.artifact
       });
-    if (response.usage) {
-      const budget = request.snapshot.budgetAccountant.recordProviderUsage(response.usage);
-      const usageEvent = {
-        type: 'budget.provider_usage.recorded' as const,
-        ...responseIdentity,
-        usage: response.usage,
-        snapshot: budget
-      };
-      await append(usageEvent);
-      await emit(usageEvent);
-      request.controller.recordUsage(response.usage, request.snapshot.profile.pricing);
-    } else {
-      const completionTokens = this.estimateAssistantOutput(response);
-      request.snapshot.budgetAccountant.recordEstimatedResponse(completionTokens);
-      request.controller.recordUsage(
-        {
-          promptTokens: input.requestEstimate.totalPromptTokens,
-          completionTokens,
-          totalTokens: input.requestEstimate.totalPromptTokens + completionTokens
-        },
-        request.snapshot.profile.pricing
-      );
-    }
+    await request.controller.recordUsage(
+      await this.inferenceService.settledRunCharges(
+        this.options.inferenceOwnerId ?? request.runId,
+        request.runId
+      )
+    );
     const toolCalls = Object.freeze((response.toolCalls ?? []).map(normalizeModelToolCall));
     const modelOutput = modelOutputFromResponse(response, request.turnIndex, toolCalls.length > 0);
     const assistantEnded = {
@@ -2338,14 +2575,31 @@ export class AgentRuntime {
       ...responseIdentity,
       content: response.content,
       ...(response.reasoning === undefined ? {} : { reasoning: response.reasoning }),
-      ...(response.reasoningSummary === undefined ? {} : { reasoningSummary: response.reasoningSummary }),
+      ...(response.reasoningSummary === undefined
+        ? {}
+        : { reasoningSummary: response.reasoningSummary }),
       modelOutput,
       ...(toolCalls.length > 0 ? { toolCalls } : {})
     };
-    const assistantReceipt = await append(assistantEnded);
-    await this.recordSessionAssistant(request.runId, assistantEnded, assistantReceipt, response.output);
+    const assistantReceipt = await request.run.append(
+      assistantEnded,
+      assistantResponseKey(request.runId, responseIdentity)
+    );
+    await this.recordSessionAssistant(
+      request.runId,
+      assistantEnded,
+      assistantReceipt,
+      response.output
+    );
     await emit(assistantEnded);
-    return { kind: 'settled', response, toolCalls, modelOutput };
+    return {
+      kind: 'settled',
+      response,
+      toolCalls,
+      modelOutput,
+      native: false,
+      turn: { snapshot: request.snapshot, toolBatchId: request.toolBatchId }
+    };
   }
 
   private async recordSessionAssistant(
@@ -2372,7 +2626,9 @@ export class AgentRuntime {
           },
           content: event.content,
           ...(event.reasoning === undefined ? {} : { reasoning: event.reasoning }),
-          ...(event.reasoningSummary === undefined ? {} : { reasoningSummary: event.reasoningSummary }),
+          ...(event.reasoningSummary === undefined
+            ? {}
+            : { reasoningSummary: event.reasoningSummary }),
           completeness: event.modelOutput.status,
           ...(output ? { output } : {})
         }
@@ -2380,239 +2636,457 @@ export class AgentRuntime {
     }
   }
 
+  private async admitContextResumption(run: AgentRunDriver, signal: AbortSignal): Promise<boolean> {
+    const phase = run.state().phase;
+    if (phase.kind !== 'suspended' || phase.reason !== 'context_admission') return false;
+    const revision = run.state().revision;
+    const input = runInput(run.state(), signal);
+    const controller = new AgentRunBudget({
+      run,
+      ...(this.options.clock ? { clock: this.options.clock } : {}),
+      ...(this.options.limits ? { limits: this.options.limits } : {})
+    });
+    const configuration = this.captureRuntimeConfiguration();
+    const profile = parseModelProfile(
+      await this.options.provider.describeModel(configuration.model)
+    );
+    if (this.options.toolCatalogProvider)
+      this.tools = Object.freeze(new ToolRegistry(await this.options.toolCatalogProvider()).list());
+    const tools = this.availableTools(profile);
+    const snapshot = this.createTurnSnapshot({
+      turnIndex: phase.turnIndex,
+      turnId: randomUUID(),
+      requestAttempt: 1,
+      configuration,
+      profile,
+      requestWindow: requestWindowForModel(profile, this.maxOutputTokens),
+      tools,
+      instructions: [
+        ...(await this.currentApplicationInstructions()),
+        ...runInstructions(input.instructions)
+      ],
+      controller,
+      continuationEligible: false
+    });
+    const session = this.inferenceService.createSession();
+    try {
+      const request: AssistantTurnRequest = {
+        runId: input.runId,
+        input,
+        turnIndex: phase.turnIndex,
+        toolBatchId: randomUUID(),
+        snapshot,
+        modelSession: session,
+        signal,
+        modelWindow: new ModelWindow(this.estimator),
+        controller,
+        run
+      };
+      const assembly = await this.assembleModelRequest(
+        request,
+        (event) =>
+          run.append(event, `${input.runId}:context-resume:${hashJson(encodeAgentEvent(event))}`),
+        () => Promise.resolve(undefined)
+      );
+      const { accounting, inputIdentity } = assembly.compiled;
+      const previous = phase.conflict;
+      if (
+        inputIdentity === previous.inputIdentity &&
+        accounting.estimatedInputTokens === previous.estimatedInputTokens &&
+        accounting.outputReservation === previous.outputReservation &&
+        accounting.reasoningReservation === previous.reasoningReservation &&
+        accounting.limits.contextTokens === previous.contextTokens &&
+        accounting.limits.maxInputTokens === previous.maxInputTokens
+      ) {
+        this.options.context?.recordAdmission({
+          status: 'blocked',
+          inputIdentity,
+          accounting,
+          message: previous.message
+        });
+        return false;
+      }
+      await run.resumeContextAdmission({
+        expectedRevision: revision,
+        inputIdentity: assembly.compiled.inputIdentity
+      });
+      return true;
+    } catch (cause) {
+      if (cause instanceof ContextAdmissionError) return false;
+      throw cause;
+    } finally {
+      await session.close?.();
+    }
+  }
+
   private async assembleModelRequest(
     request: AssistantTurnRequest,
     append: (event: AgentAuditEvent) => Promise<EventAppendReceipt>,
-    emit: (event: AgentProgressEvent) => Promise<void>
+    emit: (event: AgentProgressEvent) => Promise<void>,
+    rejected?: CompiledModelRequest
   ): Promise<RequestAssemblyResult> {
     const identity = turnIdentity(request.snapshot.record);
-    if (this.options.context) {
-      this.pendingCalls.assertTransitionBoundary();
-      await this.contextTransitions?.drain({
-        context: this.options.context,
-        admit: (transition) => this.retainPendingSources(transition, request.runId),
-        committed: (entry) =>
-          emit({
-            type: 'context.transitioned',
-            window: entry.window,
-            transition: entry.transition
-          }),
-        signal: request.signal
-      });
-    }
     await this.activateCommittedContext(request.modelWindow, request.runId);
-    for (const invalidated of request.modelWindow.invalidateProviderState({
-      provider: this.options.provider.id,
-      model: request.snapshot.configuration.model,
-      ...protocolTarget(request.snapshot.profile)
-    }))
-      await append({
-        type: 'provider.state.invalidated',
-        state: summarizeProviderState(invalidated.state),
-        reason: invalidated.reason
-      });
     const contextInputs = await this.collectContextItems(
       request.input,
       request.turnIndex,
       request.snapshot.instructions
     );
-    const allContextInputs = [
+    const capturedContext = [
       ...contextInputs.configured,
       ...contextInputs.provider,
-      ...contextInputs.run,
-      ...(await this.selectedNoteContext())
+      ...contextInputs.run
     ];
-    let attempt = 1;
-    let transitionAttempted = false;
-    const modelTools = toolsForModel([...request.snapshot.tools], request.snapshot.profile);
-    const outputReserveTokens = request.snapshot.requestWindow.maxOutputTokens;
-    const reductionRecords: {
-      kind: string;
-      reason: string;
-      sequence: number;
-    }[] = [];
-    const recordedWindowReductions = new Set<string>();
-    const runInstructions = request.snapshot.instructions
-      .filter((item) => item.provenance === 'run')
-      .map((item) => item.content);
-    for (;;) {
-      const assembly = await this.requestAssembler.assemble({
-        window: request.modelWindow,
-        task: request.input.task,
-        ...(request.input.images === undefined ? {} : { images: request.input.images }),
-        instructions: promptInstructionsForRequest({
-          runInstructions,
-          configuredInstructions: request.snapshot.instructions
-            .filter((instruction) => instruction.provenance === 'application')
-            .map((instruction) => ({
-              id: instruction.id,
-              content: instruction.content,
-              role: promptInstructionRole(instruction.role),
-              ...(instruction.priority === undefined ? {} : { priority: instruction.priority }),
-              ...(instruction.sourceUri ? { sourceUri: instruction.sourceUri } : {})
-            }))
-        }),
-        contextItems: allContextInputs,
-        tools: promptToolSpecs(
-          [...request.snapshot.tools],
-          request.snapshot.profile,
-          this.options.toolContext
-        ),
-        modelProfile: request.snapshot.profile
+    const assemble = (window: ModelWindow, notes: readonly PromptContextItemInput[]) =>
+      this.requestAdmission.assemble(
+        {
+          window,
+          task: request.input.task,
+          ...(request.input.images === undefined ? {} : { images: request.input.images }),
+          instructions: promptInstructionsForRequest({
+            runInstructions: request.snapshot.instructions
+              .filter((item) => item.provenance === 'run')
+              .map((item) => item.content),
+            configuredInstructions: request.snapshot.instructions
+              .filter((item) => item.provenance === 'application')
+              .map((item) => ({
+                id: item.id,
+                content: item.content,
+                role: promptInstructionRole(item.role),
+                ...(item.priority === undefined ? {} : { priority: item.priority }),
+                ...(item.sourceUri ? { sourceUri: item.sourceUri } : {})
+              }))
+          }),
+          contextItems: [...capturedContext, ...notes],
+          tools: promptToolSpecs(
+            [...request.snapshot.tools],
+            request.snapshot.profile,
+            this.options.toolContext
+          ),
+          modelProfile: request.snapshot.profile,
+          ...(this.metadata ? { metadata: this.metadata } : {})
+        },
+        {
+          model: request.snapshot.configuration.model,
+          tools: toolsForModel([...request.snapshot.tools], request.snapshot.profile),
+          ...(supportsParameter(request.snapshot.profile, 'maxOutputTokens')
+            ? { maxOutputTokens: request.snapshot.requestWindow.maxOutputTokens }
+            : {}),
+          signal: request.signal,
+          ...(request.snapshot.configuration.temperature === undefined
+            ? {}
+            : { temperature: request.snapshot.configuration.temperature }),
+          ...(request.snapshot.configuration.reasoning === undefined
+            ? {}
+            : { reasoning: request.snapshot.configuration.reasoning }),
+          ...(request.snapshot.configuration.responseFormat === undefined
+            ? {}
+            : { responseFormat: request.snapshot.configuration.responseFormat })
+        },
+        request.snapshot.requestWindow.maxOutputTokens
+      );
+    let selected: Awaited<ReturnType<typeof assemble>> | undefined;
+    const validate = async (input: ContextAdmissionInput) => {
+      assertToolTransitionBoundary(request.run.state());
+      const boundary = request.run.state().revision;
+      const notes = input.notes.map((note) => {
+        if (note.status !== 'available' || note.truncated)
+          throw new Error('Selected note is unavailable.');
+        return {
+          id: `note:${note.revision.noteId}:${note.revision.revisionId}`,
+          sourceUri: `note://${note.revision.scope.sessionId}/${note.revision.noteId}/${note.revision.revisionId}`,
+          sourceKind: 'generated' as const,
+          representation: 'full' as const,
+          mediaType: note.revision.mediaType,
+          title: note.revision.title,
+          content: note.text,
+          purpose: 'selected model note'
+        };
       });
-      const newWindowReductions = assembly.reductions.filter((reduction) => {
-        const key = JSON.stringify([
-          reduction.itemId,
-          reduction.kind,
-          reduction.beforeBytes,
-          reduction.afterBytes
-        ]);
-        if (recordedWindowReductions.has(key)) return false;
-        recordedWindowReductions.add(key);
-        return true;
-      });
-      if (newWindowReductions.length > 0) {
-        const firstSequence = reductionRecords.length + 1;
-        reductionRecords.push(
-          ...newWindowReductions.map((reduction, index) => ({
-            kind: reduction.kind,
-            reason: 'selected representation',
-            sequence: firstSequence + index
-          }))
-        );
-        await append({
-          type: 'context.history.reduced',
-          ...identity,
-          reductions: newWindowReductions
-        });
-        await emit({
-          type: 'context.history.reduced',
-          ...identity,
-          reductions: newWindowReductions
-        });
-      }
-      await append({
-        type: 'prompt.context.delivered',
-        delivery: assembly.context
-      });
-      await append({
-        type: 'prompt.material.selected',
-        material: assembly.material
-      });
-      const modelRequest: ModelRequest = {
-        model: request.snapshot.configuration.model,
-        messages: [...assembly.messages],
-        ...(supportsParameter(request.snapshot.profile, 'maxOutputTokens')
-          ? { maxOutputTokens: outputReserveTokens }
-          : {}),
-        ...(modelTools.length > 0 ? { tools: modelTools } : {}),
-        signal: request.signal,
-        ...(request.snapshot.configuration.temperature !== undefined
-          ? { temperature: request.snapshot.configuration.temperature }
-          : {}),
-        ...(request.snapshot.configuration.reasoning !== undefined &&
-        supportsParameter(request.snapshot.profile, 'reasoning')
-          ? { reasoning: request.snapshot.configuration.reasoning }
-          : {}),
-        ...(request.snapshot.configuration.responseFormat !== undefined
-          ? { responseFormat: request.snapshot.configuration.responseFormat }
-          : {})
-      };
-      const compiled = await this.inferenceService.compile(modelRequest, request.snapshot.profile, {
-        outputReservation: outputReserveTokens
-      });
-      const estimate = request.snapshot.budgetAccountant.estimateRequest({
-        accounting: compiled.accounting,
-        modelWindowTokens: assembly.estimate.modelWindowTokens,
-        contextTokens: assembly.estimate.contextTokens
-      });
-      await append({
-        type: 'budget.estimate.created',
-        ...identity,
-        attempt,
-        estimate,
-        snapshot: request.snapshot.budgetAccountant.snapshot()
-      });
+      const proposed = await this.contextWindowForAdmission(
+        input,
+        request,
+        async (window) => (await assemble(window, notes)).request
+      );
+      const result = await assemble(proposed.window, notes);
+      await this.requestAdmission.admit(result.compiled, request.snapshot.profile);
       if (
-        !transitionAttempted &&
-        this.options.context &&
-        this.options.contextPressurePolicy &&
-        request.snapshot.budgetAccountant.pressureAfter(estimate) !== 'normal'
-      ) {
-        transitionAttempted = true;
-        const context = await this.options.context.inspect();
-        const transition = await this.options.contextPressurePolicy({
-          context,
-          estimate,
-          signal: request.signal
-        });
-        if (transition) {
-          const committed = await this.options.context.transition(
-            await this.retainPendingSources(transition, request.runId),
-            { signal: request.signal }
-          );
+        rejected &&
+        (result.compiled.inputIdentity === rejected.inputIdentity ||
+          Buffer.byteLength(JSON.stringify(result.compiled.body)) >=
+            Buffer.byteLength(JSON.stringify(rejected.body)) ||
+          requestAccountingInputTokens(result.compiled.accounting) >
+            requestAccountingInputTokens(rejected.accounting))
+      )
+        throw new ContextAdmissionError(
+          result.compiled,
+          new Error('Renewal did not reduce the rejected provider input.')
+        );
+      const tail = await this.options.repositories.events.tail(request.runId);
+      if (
+        tail.driverGeneration !== request.run.state().driverGeneration ||
+        request.run.state().revision !== boundary ||
+        request.run.state().control.status !== 'owned'
+      )
+        throw new Error('Context admission boundary changed during compilation.');
+      request.signal.throwIfAborted();
+      selected = result;
+      return {
+        compiledInputIdentity: result.compiled.inputIdentity,
+        capabilityRevision: result.compiled.capabilityRevision,
+        ...(proposed.providerState ? { providerState: proposed.providerState } : {})
+      };
+    };
+    if (this.options.context) {
+      await this.contextTransitions?.drain({
+        context: this.options.context,
+        admit: (transition) => this.retainPendingSources(transition, request.runId),
+        validate,
+        committed: async (entry) => {
+          await this.activateCommittedContext(request.modelWindow, request.runId);
           await emit({
             type: 'context.transitioned',
-            window: committed.window,
-            transition: committed.transition
+            window: entry.window,
+            transition: entry.transition
           });
-          await this.activateCommittedContext(request.modelWindow, request.runId);
-          allContextInputs.splice(
-            0,
-            allContextInputs.length,
-            ...contextInputs.configured,
-            ...contextInputs.provider,
-            ...contextInputs.run,
-            ...(await this.selectedNoteContext())
-          );
-          attempt++;
-          continue;
+        },
+        rejected: (requestId, message) =>
+          capturedContext.push({
+            id: requestId,
+            sourceUri: `runtime://context-selection/${requestId}`,
+            sourceKind: 'generated',
+            representation: 'full',
+            mediaType: 'text/plain',
+            title: 'Context selection rejected',
+            content: message,
+            purpose:
+              'The requested selection was not committed; the preceding window remains active.'
+          }),
+        signal: request.signal
+      });
+    }
+    const selectedNotes = await this.selectedNoteContext();
+    let result = selected ?? (await assemble(request.modelWindow, selectedNotes));
+    let pressureReminderKey: string | undefined;
+    const capacity = requestCapacity(result.compiled.accounting);
+    if (!selected && this.options.context && capacity.pressure === 'continuity') {
+      const window = await this.options.context.history.selectedContext();
+      const key = `${request.runId}:context-pressure:${window?.windowId ?? 'initial'}`;
+      if (!(await this.options.repositories.events.referenceByKey(request.runId, key))) {
+        capturedContext.push({
+          id: key,
+          sourceUri: 'runtime://context-capacity',
+          sourceKind: 'generated',
+          representation: 'full',
+          mediaType: 'text/plain',
+          title: 'Working context capacity',
+          purpose: 'Available capacity and continuity operations',
+          content: `The current request has about ${String(capacity.remainingTokens ?? 'unknown')} input tokens remaining after output and reasoning reservations. It has reached the ${String(capacity.continuityHeadroomTokens)}-token continuity allowance. Use available retrieval, note, and context-selection operations when useful. Notes are optional. Original history remains available after renewal; this does not complete the task.`
+        });
+        const withReminder = await assemble(request.modelWindow, selectedNotes);
+        try {
+          await this.requestAdmission.admit(withReminder.compiled, request.snapshot.profile);
+          result = withReminder;
+          pressureReminderKey = key;
+        } catch (cause) {
+          if (!(cause instanceof ContextAdmissionError)) throw cause;
+          capturedContext.pop();
         }
       }
-      if (request.snapshot.budgetAccountant.canSend(estimate)) {
-        const requestFingerprint: InferenceRequestFingerprintRecord = Object.freeze({
-          ...identity,
-          requestId: randomUUID(),
-          compiledInputIdentity: compiled.inputIdentity,
-          capabilityRevision: compiled.capabilityRevision,
-          configuredContextIds: contextSourceIds(contextInputs.configured, 'configured'),
-          providerContextIds: contextSourceIds(contextInputs.provider, 'provider'),
-          runContextIds: contextSourceIds(contextInputs.run, 'run'),
-          effectiveInstructionHash: hashJson(request.snapshot.instructions),
-          modelWindowHistoryHash: hashJson(assembly.historyMessages),
-          modelToolSchemasHash: hashJson(modelTools),
-          modelWindowHash: hashJson(assembly.messages),
-          reductions: reductionRecords
-        });
-        return {
-          ok: true,
-          request: modelRequest,
-          compiled,
-          estimate,
-          fingerprint: requestFingerprint
-        };
-      }
-      await append({
-        type: 'overflow.recovery.started',
-        ...identity,
-        attempt,
-        estimate,
-        snapshot: request.snapshot.budgetAccountant.snapshot()
-      });
-      const diagnostic = createOverflowDiagnostic(estimate);
-      await append({
-        type: 'overflow.recovery.ended',
-        ...identity,
-        attempt,
-        result: { kind: 'diagnostic', diagnostic }
-      });
-      return { ok: false, diagnostic };
     }
+    try {
+      await this.requestAdmission.admit(result.compiled, request.snapshot.profile);
+      if (rejected)
+        throw new ContextAdmissionError(rejected, new Error('Provider rejected context capacity.'));
+    } catch (cause) {
+      if (!(cause instanceof ContextAdmissionError)) throw cause;
+      if (!this.options.context || !this.options.contextRenewal?.automatic) {
+        this.options.context?.recordAdmission({
+          status: 'blocked',
+          inputIdentity: result.compiled.inputIdentity,
+          accounting: result.compiled.accounting,
+          message: cause.message
+        });
+        throw cause;
+      }
+      // One bounded candidate, with no generated summary or optional note requirement.
+      const context = await this.options.context.inspect();
+      const renewal = await this.retainPendingSources(
+        {
+          expectedWindowId: context.window?.windowId ?? null,
+          expectedSourceRevision: context.cut.sourceRevision,
+          idempotencyKey: `policy-renewal:${request.runId}:${identity.turnId}:${result.compiled.inputIdentity}`,
+          reason: 'policy-triggered working-window renewal',
+          selection: {
+            strategy: 'sources',
+            retained: [],
+            notes: context.window?.selection.notes ?? []
+          }
+        },
+        request.runId
+      );
+      if (pressureReminderKey) {
+        const index = capturedContext.findIndex((item) => item.id === pressureReminderKey);
+        if (index >= 0) capturedContext.splice(index, 1);
+        pressureReminderKey = undefined;
+      }
+      try {
+        let entry;
+        try {
+          entry = await this.options.context.transition(renewal, {
+            signal: request.signal,
+            admit: validate
+          });
+        } catch (cause) {
+          if (!(cause instanceof ContextAdmissionError) || renewal.selection.notes.length === 0)
+            throw cause;
+          entry = await this.options.context.transition(
+            {
+              ...renewal,
+              reason:
+                'policy-triggered working-window renewal; optional notes exceed admitted capacity',
+              selection: { ...renewal.selection, notes: [] }
+            },
+            { signal: request.signal, admit: validate }
+          );
+        }
+        await this.activateCommittedContext(request.modelWindow, request.runId);
+        await emit({
+          type: 'context.transitioned',
+          window: entry.window,
+          transition: entry.transition
+        });
+        if (!selected) throw new Error('Renewal did not admit a captured request.', { cause });
+        result = selected;
+      } catch (error) {
+        this.options.context.recordAdmission({
+          status: 'blocked',
+          inputIdentity: result.compiled.inputIdentity,
+          accounting: result.compiled.accounting,
+          message: error instanceof Error ? error.message : String(error)
+        });
+        throw error;
+      }
+    }
+    const { assembly, compiled } = result;
+    const estimate = request.snapshot.budgetAccountant.estimateRequest({
+      accounting: compiled.accounting,
+      modelWindowTokens: assembly.estimate.modelWindowTokens,
+      contextTokens: assembly.estimate.contextTokens
+    });
+    const fingerprint: InferenceRequestFingerprintRecord = Object.freeze({
+      ...identity,
+      requestId: randomUUID(),
+      compiledInputIdentity: compiled.inputIdentity,
+      capabilityRevision: compiled.capabilityRevision,
+      configuredContextIds: contextSourceIds(contextInputs.configured, 'configured'),
+      providerContextIds: contextSourceIds(contextInputs.provider, 'provider'),
+      runContextIds: contextSourceIds(contextInputs.run, 'run'),
+      effectiveInstructionHash: hashJson(request.snapshot.instructions),
+      modelWindowHistoryHash: hashJson(assembly.historyMessages),
+      modelToolSchemasHash: hashJson(result.request.tools ?? []),
+      modelWindowHash: hashJson(assembly.messages)
+    });
+    if (pressureReminderKey)
+      await request.run.append(
+        { type: 'prompt.context.delivered', delivery: assembly.context },
+        pressureReminderKey
+      );
+    else await append({ type: 'prompt.context.delivered', delivery: assembly.context });
+    await append({ type: 'prompt.material.selected', material: assembly.material });
+    await append({
+      type: 'budget.estimate.created',
+      ...identity,
+      attempt: 1,
+      estimate,
+      snapshot: request.snapshot.budgetAccountant.snapshot()
+    });
+    this.options.context?.recordAdmission({
+      status: 'admitted',
+      inputIdentity: compiled.inputIdentity,
+      accounting: compiled.accounting
+    });
+    await this.options.onRequestAdmitted?.({
+      requestId: fingerprint.requestId,
+      sourceIds: [
+        ...request.snapshot.instructions.map((item) => item.id),
+        ...assembly.context.items.map((item) => item.id)
+      ]
+    });
+    return { request: result.request, compiled, estimate, fingerprint };
+  }
+
+  private async currentApplicationInstructions(): Promise<AgentEffectiveInstruction[]> {
+    const source = this.options.instructions;
+    return applicationInstructions(typeof source === 'function' ? await source() : source);
+  }
+
+  private async contextWindowForAdmission(
+    input: ContextAdmissionInput,
+    request: AssistantTurnRequest,
+    prepare: (window: ModelWindow) => Promise<ModelRequest>
+  ) {
+    const window = new ModelWindow(this.estimator);
+    const selected = input.entries;
+    let providerState: ReturnType<typeof encodeContextTransformReference> | undefined;
+    if (input.selection.strategy === 'provider') {
+      const transformedWindow = new ModelWindow(this.estimator);
+      const represented = selected.filter(
+        (entry) => entry.type !== 'input' || entry.runId !== request.runId
+      );
+      await replaySourceEntries(
+        transformedWindow,
+        input.cut.sessionId,
+        represented,
+        this.options.repositories.artifacts,
+        new Set(input.selection.continuity?.sources.map((source) => source.entryId)),
+        request.runId
+      );
+      const sources = represented.map((entry) => sourceRef(input.cut.sessionId, entry));
+      const invocationId = `context-transform-${hashJson({ sources, model: request.snapshot.configuration.model, runId: request.runId, turnId: request.snapshot.record.turnId })}`;
+      const transformed = await this.inferenceService.transformContext({
+        ownerId: this.options.inferenceOwnerId ?? request.runId,
+        invocationId,
+        purpose: 'context_transformation',
+        runId: request.runId,
+        transformId: invocationId,
+        request: await prepare(transformedWindow),
+        profile: request.snapshot.profile,
+        signal: request.signal
+      });
+      for (const [index, item] of transformed.result.input.entries())
+        window.recordSourceItem(`${invocationId}:${String(index)}`, item);
+      await replaySourceEntries(
+        window,
+        input.cut.sessionId,
+        selected.filter((entry) => !represented.includes(entry)),
+        this.options.repositories.artifacts,
+        new Set(input.selection.continuity?.sources.map((source) => source.entryId)),
+        request.runId
+      );
+      providerState = encodeContextTransformReference({
+        format: 'agent-core.context-transform/1',
+        ownerId: transformed.ownerId,
+        invocationId,
+        transformId: transformed.result.transformId,
+        artifact: transformed.artifact,
+        sources
+      });
+    } else
+      await replaySourceEntries(
+        window,
+        input.cut.sessionId,
+        selected,
+        this.options.repositories.artifacts,
+        new Set(input.selection.continuity?.sources.map((source) => source.entryId)),
+        request.runId
+      );
+    return { window, providerState };
   }
 
   private async activateCommittedContext(window: ModelWindow, runId: string): Promise<void> {
     if (!this.options.context || !this.options.repositories.session) return;
-    this.pendingCalls.assertTransitionBoundary();
+    if (this.activeRunDriver) assertToolTransitionBoundary(this.activeRunDriver.state());
     const context = await this.options.context.inspect();
     const windowId = context.window?.windowId ?? null;
     const profile = await this.options.provider.describeModel(this.options.model);
@@ -2624,9 +3098,11 @@ export class AgentRuntime {
     });
     if (this.activeContextIdentity === identity) return;
     const replay = await rebuildModelWindowFromRepositories({
-      session: this.options.repositories.session,
+      ...(this.history ? { history: this.history } : {}),
       events: this.options.repositories.events,
-      ...(this.options.repositories.artifacts ? { artifacts: this.options.repositories.artifacts } : {}),
+      ...(this.options.repositories.artifacts
+        ? { artifacts: this.options.repositories.artifacts }
+        : {}),
       estimator: this.estimator,
       providerId: this.options.provider.id,
       model: this.options.model,
@@ -2646,9 +3122,6 @@ export class AgentRuntime {
       );
     }
     window.replaceWith(replay.modelWindow);
-    window.selectToolResultPresentations(
-      activeObservationRepresentations(await this.options.context.history.view(), runId)
-    );
     this.activeContextIdentity = identity;
   }
 
@@ -2665,38 +3138,45 @@ export class AgentRuntime {
     runId: string
   ): Promise<ContextTransitionRequest> {
     if (!this.options.context) throw new Error('Context service is unavailable.');
-    const view = await this.options.context.history.view();
+    const cut = await this.options.context.history.capture();
+    const window = await this.options.context.history.selectedContext(cut);
+    if ((window?.windowId ?? null) !== transition.expectedWindowId)
+      throw new Error('Context selection window is stale.');
     const retained = new Map(
       transition.selection.retained.map((reference) => [reference.entryId, reference])
     );
-    // The transition tool's own exchange is newer than the model's selection.
-    // Retain that tail, rather than undoing the model's selection of settled work.
-    const lastSelected = view.entries.reduce(
-      (index, entry, position) =>
-        retained.has(sourceRef(view.cut.sessionId, entry).entryId) ? position : index,
-      -1
-    );
-    const lastOmitted = view.entries.reduce(
-      (index, entry, position) =>
-        transition.selection.omitted.some(
-          (range) =>
-            range.toEntryId === entry.id || range.toEntryId === sourceRef(view.cut.sessionId, entry).entryId
-        )
-          ? Math.max(index, position)
-          : index,
-      -1
-    );
-    const through = Math.max(lastSelected, lastOmitted);
-    for (const [index, entry] of view.entries.entries())
-      if ('runId' in entry && entry.runId === runId && (entry.type === 'input' || index > through)) {
-        const source = sourceRef(view.cut.sessionId, entry);
+    for (const source of await this.options.context.protectedSources(cut))
+      retained.set(source.entryId, source);
+    if (transition.toolInvocation) {
+      if (transition.toolInvocation.runId !== runId)
+        throw new Error('Context operation belongs to another run.');
+      for (const source of await this.options.context.history.toolSources(
+        transition.toolInvocation,
+        cut
+      ))
         retained.set(source.entryId, source);
+    }
+    const continuity = transition.selection.continuity ?? window?.selection.continuity;
+    return {
+      ...transition,
+      expectedSourceRevision: cut.sourceRevision,
+      selection: {
+        ...transition.selection,
+        retained: [...retained.values()],
+        ...(continuity
+          ? {
+              continuity: {
+                ...continuity,
+                sources: continuity.sources.filter((source) => retained.has(source.entryId))
+              }
+            }
+          : {})
       }
-    return { ...transition, selection: { ...transition.selection, retained: [...retained.values()] } };
+    };
   }
 
   pendingToolCalls() {
-    return this.pendingCalls.pending();
+    return this.activeRunDriver ? pendingToolCalls(this.activeRunDriver.state()) : [];
   }
 
   private async selectedNoteContext(): Promise<readonly PromptContextItemInput[]> {
@@ -2734,14 +3214,14 @@ export class AgentRuntime {
     return items;
   }
 
-  private async enterPhase(
+  private async reportActivity(
     runId: string,
-    controller: AgentRunController,
-    phase: Parameters<AgentRunController['transition']>[0],
+    controller: AgentRunBudget,
     append: (event: AgentAuditEvent) => Promise<unknown>,
     emit: (event: AgentProgressEvent) => Promise<void>
   ): Promise<void> {
-    controller.transition(phase);
+    if (!this.activeRunDriver) throw new Error('Run activity requires its current driver.');
+    const phase = agentRunActivity(this.activeRunDriver.state());
     const budget = controller.snapshot();
     await append({ type: 'run.phase.changed', runId, phase, budget });
     await emit({ type: 'run.phase.changed', phase, budget });
@@ -2777,21 +3257,28 @@ export class AgentRuntime {
       | ((state: import('./run/control/contracts.js').AgentRunState) => AgentRunAdvance)
   ): Promise<void> {
     await run.transition(procedure, typeof advance === 'function' ? advance : () => advance);
-    this.pendingCalls.observeState(run.state());
+    const requiredCatalogs = new Set(
+      run.state().toolBatches.map((batch) => batch.source.catalog.revision)
+    );
+    const latestCatalog = [...this.catalogTools.keys()].at(-1);
+    if (latestCatalog) requiredCatalogs.add(latestCatalog);
+    for (const revision of this.catalogTools.keys())
+      if (!requiredCatalogs.has(revision)) this.catalogTools.delete(revision);
   }
   private async settleToolEffect(
     run: AgentRunDriver,
     input: Parameters<AgentRunCoordinator['settleToolEffect']>[1]
   ): Promise<'owned' | 'ownership_lost'> {
     const synchronized = await run.settleToolEffect(input);
-    this.pendingCalls.observeState(synchronized.state);
     const control = synchronized.state.control;
     return (control.status === 'owned' || control.status === 'abort_requested') &&
       control.driverId === run.driverId
       ? 'owned'
       : 'ownership_lost';
   }
-  private approvalSuspension(state: import('./run/control/contracts.js').AgentRunState): AgentRunResult {
+  private approvalSuspension(
+    state: import('./run/control/contracts.js').AgentRunState
+  ): AgentRunResult {
     const approval = findPendingApproval(state);
     if (!approval) throw new Error(`Run ${state.runId} is not waiting for approval.`);
     if (!state.budget)
@@ -2829,12 +3316,16 @@ export class AgentRuntime {
         record.event.responseId !== responseId
       )
         continue;
-      if (match) throw new Error(`Run ${runId} contains duplicate provider settlements for ${responseId}.`);
+      if (match)
+        throw new Error(`Run ${runId} contains duplicate provider settlements for ${responseId}.`);
       match = Object.freeze({ eventId: record.eventId, event: record.event });
     }
     return match;
   }
-  private async reconcileDurableToolBatch(run: AgentRunDriver, signal: AbortSignal): Promise<boolean> {
+  private async reconcileDurableToolBatch(
+    run: AgentRunDriver,
+    signal: AbortSignal
+  ): Promise<boolean> {
     const attempted = new Set<string>();
     for (;;) {
       const eligible = run.state().toolBatches.flatMap((batch) =>
@@ -2854,7 +3345,9 @@ export class AgentRuntime {
       if (!eligible)
         return !run
           .state()
-          .toolBatches.some((batch) => batch.callStates.some((call) => call.stage === 'outcome_unknown'));
+          .toolBatches.some((batch) =>
+            batch.callStates.some((call) => call.stage === 'outcome_unknown')
+          );
       const { phase, callIndex } = eligible;
       const callState = phase.callStates[callIndex];
       if (callState?.stage === 'effect_ready') {
@@ -2884,7 +3377,8 @@ export class AgentRuntime {
             run.state().budget
           );
         } catch (error) {
-          if (!(error instanceof AgentRunConflictError) || error.reason !== 'stale_tail') throw error;
+          if (!(error instanceof AgentRunConflictError) || error.reason !== 'stale_tail')
+            throw error;
         }
         continue;
       }
@@ -2921,9 +3415,13 @@ export class AgentRuntime {
             run.state().budget
           );
         } catch (error) {
-          if (!(error instanceof AgentRunConflictError) || error.reason !== 'stale_tail') throw error;
-          const current = run.state().toolBatches.find((batch) => batch.toolBatchId === phase.toolBatchId)
-            ?.callStates[callIndex];
+          if (!(error instanceof AgentRunConflictError) || error.reason !== 'stale_tail')
+            throw error;
+          const current = run
+            .state()
+            .toolBatches.find((batch) => batch.toolBatchId === phase.toolBatchId)?.callStates[
+            callIndex
+          ];
           if (current?.stage === 'effect_pending')
             attempted.delete(`${phase.toolBatchId}:${String(callIndex)}`);
         }
@@ -2983,23 +3481,29 @@ export class AgentRuntime {
           );
         }
         const observationStore = new ObservationStore({
-          estimator: this.estimator,
-          ...(this.options.repositories.artifacts ? { artifacts: this.options.repositories.artifacts } : {})
+          ...(this.options.repositories.artifacts
+            ? { artifacts: this.options.repositories.artifacts }
+            : {})
         });
         const tool = this.tools.find(
           (modelOutput) =>
-            modelOutput.name === call.name && modelOutput.implementationId === plan.toolImplementationId
+            modelOutput.name === call.name &&
+            modelOutput.implementationId === plan.toolImplementationId
         );
         const committed = await observationStore.commitToolObservation({
           turnIndex: phase.identity.turnIndex,
           call,
           canonicalSnapshot: plan.canonicalSnapshot,
           tool,
-          observation: recovery.observation
+          observation: recovery.observation,
+          modelInputModalities: phase.modelInputModalities
         });
         const settlement = {
           observationId: committed.id,
-          observation: committed.durableObservation,
+          ...(committed.durableObservation ? { observation: committed.durableObservation } : {}),
+          original: committed.original,
+          modelContent: committed.modelContent,
+          ...(committed.modelContentRef ? { modelContentRef: committed.modelContentRef } : {}),
           createdAt: committed.createdAt
         };
         try {
@@ -3120,7 +3624,8 @@ export class AgentRuntime {
     for (let transitions = 0; transitions < 4; transitions += 1) {
       const state = run.state();
       if (state.phase.kind === 'finalization') return;
-      if (state.phase.kind === 'terminal') throw new Error(`Run ${state.runId} is already terminal.`);
+      if (state.phase.kind === 'terminal')
+        throw new Error(`Run ${state.runId} is already terminal.`);
       const next = nextAgentRunInstruction(state);
       if (next.kind !== 'execute')
         throw new Error(
@@ -3129,7 +3634,10 @@ export class AgentRuntime {
       const instruction = next.procedure;
       if (
         state.toolBatches.some((batch) =>
-          batch.callStates.some((call) => call.stage !== 'recorded' && call.stage !== 'cancelled')
+          batch.callStates.some(
+            (call) =>
+              call.stage !== 'recorded' && call.stage !== 'resolved' && call.stage !== 'cancelled'
+          )
         ) &&
         state.phase.kind !== 'cancelling'
       ) {
@@ -3258,7 +3766,9 @@ export class AgentRuntime {
       model: this.options.model,
       ...(this.options.temperature === undefined ? {} : { temperature: this.options.temperature }),
       ...(this.options.reasoning === undefined ? {} : { reasoning: this.options.reasoning }),
-      ...(this.options.responseFormat === undefined ? {} : { responseFormat: this.options.responseFormat })
+      ...(this.options.responseFormat === undefined
+        ? {}
+        : { responseFormat: this.options.responseFormat })
     });
   }
   private toolContext(signal: AbortSignal): ToolPlanningContext {
@@ -3296,10 +3806,6 @@ export class AgentRuntime {
       provider: Object.freeze([...providerItems]),
       run: Object.freeze([...(input.contextItems ?? [])])
     });
-  }
-  private estimateAssistantOutput(response: ModelResponse): number {
-    const toolText = response.toolCalls?.length ? `\n${JSON.stringify(response.toolCalls)}` : '';
-    return this.estimator.estimateText(`${response.content}${response.reasoningSummary ?? ''}${toolText}`);
   }
   private availableTools(profile?: ModelProfile): CompiledToolDefinition[] {
     const context = this.toolContext(new AbortController().signal);
@@ -3350,7 +3856,8 @@ export class AgentRuntime {
   }
   private injectSteering(runId: string, input: AgentSteeringInput): AgentSteeringReceipt {
     if (this.activeRunId !== runId) throw new Error(`Run ${runId} is not active.`);
-    if (input.instruction.trim().length === 0) throw new Error('Steering instruction must not be empty.');
+    if (input.instruction.trim().length === 0)
+      throw new Error('Steering instruction must not be empty.');
     if (input.deliveryId !== undefined && !input.deliveryId)
       throw new Error('Steering delivery identity must not be empty.');
     const previous = input.deliveryId ? this.steeringReceipts.get(input.deliveryId) : undefined;
@@ -3369,7 +3876,9 @@ export class AgentRuntime {
     this.steerQueue.push({ ...receipt, instruction: input.instruction });
     const steering = this.nativeSteering;
     if (steering)
-      this.steeringWrites = this.steeringWrites.then(() => steering.accept(receipt.id, input.instruction));
+      this.steeringWrites = this.steeringWrites.then(() =>
+        steering.accept(receipt.id, input.instruction)
+      );
     return receipt;
   }
   private async abortRun(runId: string, reason = 'Agent run aborted.'): Promise<void> {
@@ -3404,7 +3913,10 @@ export class AgentRuntime {
   }
 }
 
-function cleanupFailureDecision(previous: TerminalDecision | undefined, error: Error): TerminalDecision {
+function cleanupFailureDecision(
+  previous: TerminalDecision | undefined,
+  error: Error
+): TerminalDecision {
   const cleanupDiagnostic = {
     kind: 'resource_cleanup' as const,
     message: error.message
@@ -3428,7 +3940,7 @@ function cleanupFailureDecision(previous: TerminalDecision | undefined, error: E
 }
 
 function runSignalDeadline(
-  controller: AgentRunController,
+  controller: AgentRunBudget,
   parentSignal: AbortSignal
 ): { readonly signal: AbortSignal; readonly dispose: () => void } {
   const remaining = controller.remainingElapsedMs();
@@ -3457,7 +3969,7 @@ function terminalSnapshot(
   runId: string,
   finalizationId: string,
   decision: TerminalDecision,
-  controller: AgentRunController
+  controller: AgentRunBudget
 ): AgentTerminalSnapshot {
   const common = {
     runId,
@@ -3490,7 +4002,9 @@ function terminalSnapshot(
     if (modelOutput.status !== 'absent' && modelOutput.status !== 'partial')
       throw new Error('Aborted execution can only preserve a partial modelOutput.');
     const abortedModelOutput: import('./run/contracts.js').AgentAbortedTerminalSnapshot['modelOutput'] =
-      modelOutput.status === 'absent' ? modelOutput : Object.freeze({ ...modelOutput, status: 'partial' });
+      modelOutput.status === 'absent'
+        ? modelOutput
+        : Object.freeze({ ...modelOutput, status: 'partial' });
     return createAgentTerminalSnapshot({
       ...common,
       modelOutput: abortedModelOutput,
@@ -3515,7 +4029,7 @@ function modelOutputFromResponse(
   if (continuingWithTools) return { status: 'absent' };
   const message = finalMessageFromResponse(response);
   if (!message) return { status: 'absent' };
-  const source = response.content.trim().length > 0 ? ('content' as const) : ('reasoning_summary' as const);
+  const source = 'content' as const;
   const status =
     response.terminationReason === 'stop'
       ? ('complete' as const)
@@ -3572,7 +4086,10 @@ function failedDecision(
 function partialOrAbsent(modelOutput: AgentModelOutput): AgentModelOutput {
   return modelOutput.status === 'absent' ? modelOutput : { ...modelOutput, status: 'partial' };
 }
-function decisionBeforeFinalization(decision: TerminalDecision, signal: AbortSignal): TerminalDecision {
+function decisionBeforeFinalization(
+  decision: TerminalDecision,
+  signal: AbortSignal
+): TerminalDecision {
   if (!signal.aborted || decision.executionStatus === 'aborted' || decision.cleanupDiagnostic)
     return decision;
   return {
@@ -3602,7 +4119,10 @@ function runInstructions(input: readonly string[] | undefined): AgentEffectiveIn
     provenance: 'run'
   }));
 }
-function steeringInstructions(input: readonly string[], offset: number): AgentEffectiveInstruction[] {
+function steeringInstructions(
+  input: readonly string[],
+  offset: number
+): AgentEffectiveInstruction[] {
   return input.map((content, index) => ({
     id: `steering-${String(offset + index + 1)}`,
     content,
@@ -3633,15 +4153,6 @@ function sameTurnIdentity(left: AgentTurnIdentity, right: AgentTurnIdentity): bo
     left.requestAttempt === right.requestAttempt
   );
 }
-function formatOverflowDiagnostic(diagnostic: OverflowDiagnostic): string {
-  return [
-    'Request assembly exceeded budget after overflow recovery.',
-    `Reason: ${diagnostic.reason}.`,
-    `Components: messages=${String(diagnostic.messageTokens)}, contextHistory=${String(diagnostic.modelWindowTokens)}, context=${String(diagnostic.contextTokens)}, toolSchemas=${String(diagnostic.toolSchemaTokens)}, outputReserve=${String(diagnostic.outputReserveTokens)}.`,
-    `Total request tokens=${String(diagnostic.totalRequestTokens)}.`
-  ].join(' ');
-}
-class RequestAssemblyError extends Error {}
 function runInput(
   state: import('./run/control/contracts.js').AgentRunState,
   signal?: AbortSignal
@@ -3694,7 +4205,10 @@ function validateToolBoundary(value: unknown): asserts value is ToolAuthorizatio
     if (typeof member !== 'string' || member.trim().length === 0)
       throw new Error(`toolBoundary.${name} must be a non-empty string.`);
   }
-  if (typeof value.authorizationPolicyId !== 'string' || typeof value.executionTargetId !== 'string')
+  if (
+    typeof value.authorizationPolicyId !== 'string' ||
+    typeof value.executionTargetId !== 'string'
+  )
     throw new Error('toolBoundary requires authorizationPolicyId and executionTargetId.');
 }
 function removeRunItems(items: { readonly runId: string }[], runId: string): void {
@@ -3702,7 +4216,8 @@ function removeRunItems(items: { readonly runId: string }[], runId: string): voi
     if (items[index]?.runId === runId) items.splice(index, 1);
 }
 function assertQueueCapacity(items: readonly unknown[], maximum: number, label: string): void {
-  if (items.length >= maximum) throw new Error(`${label} queue limit of ${String(maximum)} was reached.`);
+  if (items.length >= maximum)
+    throw new Error(`${label} queue limit of ${String(maximum)} was reached.`);
 }
 function runSuspension(state: AgentRunState): AgentRunResult {
   if (!state.budget) throw new Error(`Run ${state.runId} has no durable budget at suspension.`);
@@ -3740,7 +4255,8 @@ function runSuspension(state: AgentRunState): AgentRunResult {
     state: 'suspended',
     reason: phase.reason,
     ...shared,
-    ...(phase.effectId ? { effectId: phase.effectId } : {}),
+    ...('effectId' in phase && phase.effectId ? { effectId: phase.effectId } : {}),
+    ...(phase.reason === 'context_admission' ? { contextAdmission: phase.conflict } : {}),
     ...(phase.reason === 'user_decision' ? { decisionRequest: phase.decisionRequest } : {})
   };
 }
@@ -3806,7 +4322,9 @@ function missingImplementationSuspension(
   state: import('./run/control/contracts.js').AgentRunState
 ): AgentRunResult {
   if (!state.budget)
-    throw new Error(`Run ${state.runId} has no durable budget at its tool implementation boundary.`);
+    throw new Error(
+      `Run ${state.runId} has no durable budget at its tool implementation boundary.`
+    );
   return Object.freeze({
     state: 'suspended',
     reason: 'missing_implementation',
@@ -3854,14 +4372,20 @@ function currentProviderRequest(state: AgentRunState): AgentProviderPhase | unde
 }
 function currentToolBatch(state: AgentRunState): AgentToolPhase | undefined {
   return state.toolBatches.find((batch) =>
-    batch.callStates.some((call) => call.stage !== 'recorded' && call.stage !== 'cancelled')
+    batch.callStates.some(
+      (call) => call.stage !== 'recorded' && call.stage !== 'resolved' && call.stage !== 'cancelled'
+    )
   );
 }
 function findPendingApproval(
   state: AgentRunState,
   approvalId?: string
 ):
-  | { readonly batch: AgentToolPhase; readonly callIndex: number; readonly approval: AgentApprovalRequest }
+  | {
+      readonly batch: AgentToolPhase;
+      readonly callIndex: number;
+      readonly approval: AgentApprovalRequest;
+    }
   | undefined {
   for (const batch of state.toolBatches)
     for (const [callIndex, call] of batch.callStates.entries())

@@ -28,11 +28,13 @@ export interface InferenceReservation {
 export interface InferenceIdentity {
   readonly invocationId: string;
   readonly ownerId: string;
+  readonly runId?: string;
   readonly parentInvocationId?: string;
   readonly purpose: string;
 }
 export type InferenceEvent =
-  | (InferenceIdentity & {
+  | (Omit<InferenceIdentity, 'runId'> & {
+      readonly runId: string | null;
       readonly type: 'inference.started';
       readonly format: 'agent-core.inference/1';
       readonly operation: 'generation' | 'context_transform' | 'native_generation';
@@ -62,6 +64,14 @@ export type InferenceEvent =
       readonly cost: InferenceCost;
     }
   | {
+      readonly type: 'inference.rejected';
+      readonly invocationId: string;
+      readonly permit: string;
+      readonly code: 'context_overflow';
+      readonly inputIdentity: string;
+      readonly message: string;
+    }
+  | {
       readonly type: 'inference.not_sent';
       readonly invocationId: string;
       readonly permit: string;
@@ -89,6 +99,7 @@ function decodeInferenceEvent(value: unknown): InferenceEvent {
       'operation',
       'invocationId',
       'ownerId',
+      'runId',
       'parentInvocationId',
       'purpose',
       'fingerprint',
@@ -99,7 +110,9 @@ function decodeInferenceEvent(value: unknown): InferenceEvent {
       'permit'
     ]);
     if (event.format !== 'agent-core.inference/1')
-      throw new Error('Incompatible inference format; start a new owner without deleting prior state.');
+      throw new Error(
+        'Incompatible inference format; start a new owner without deleting prior state.'
+      );
     const reservation = parseJsonObject(event.reservation);
     exact(reservation, ['promptTokens', 'completionTokens', 'cost']);
     const limits = parseJsonObject(event.limits);
@@ -117,6 +130,13 @@ function decodeInferenceEvent(value: unknown): InferenceEvent {
       invocationId,
       permit,
       ownerId: text(event.ownerId, 'ownerId'),
+      runId:
+        event.runId === null
+          ? null
+          : text(
+              event.runId,
+              'runId (required; obsolete inference records need their original application)'
+            ),
       purpose: text(event.purpose, 'purpose'),
       fingerprint: text(event.fingerprint, 'fingerprint'),
       sourceFingerprint: text(event.sourceFingerprint, 'sourceFingerprint'),
@@ -135,7 +155,15 @@ function decodeInferenceEvent(value: unknown): InferenceEvent {
     });
   }
   if (event.type === 'inference.extended') {
-    exact(event, ['type', 'invocationId', 'permit', 'revision', 'fingerprint', 'requestRef', 'reservation']);
+    exact(event, [
+      'type',
+      'invocationId',
+      'permit',
+      'revision',
+      'fingerprint',
+      'requestRef',
+      'reservation'
+    ]);
     const reservation = parseJsonObject(event.reservation);
     exact(reservation, ['promptTokens', 'completionTokens', 'cost']);
     return Object.freeze({
@@ -167,6 +195,18 @@ function decodeInferenceEvent(value: unknown): InferenceEvent {
       cost: decodeCost(event.cost)
     });
   }
+  if (event.type === 'inference.rejected') {
+    exact(event, ['type', 'invocationId', 'permit', 'code', 'inputIdentity', 'message']);
+    if (event.code !== 'context_overflow') throw new Error('Invalid inference rejection.');
+    return Object.freeze({
+      type: 'inference.rejected',
+      invocationId,
+      permit,
+      code: event.code,
+      inputIdentity: text(event.inputIdentity, 'inputIdentity'),
+      message: text(event.message, 'message')
+    });
+  }
   if (event.type === 'inference.not_sent') {
     exact(event, ['type', 'invocationId', 'permit', 'message']);
     return Object.freeze({
@@ -191,8 +231,12 @@ export function parseInferenceBudget(value: unknown): InferenceBudget {
   const limits = parseJsonObject(value);
   exact(limits, ['maxInvocations', 'maxPromptTokens', 'maxCompletionTokens', 'maxKnownCost']);
   return Object.freeze({
-    ...(limits.maxInvocations === undefined ? {} : { maxInvocations: count(limits.maxInvocations) }),
-    ...(limits.maxPromptTokens === undefined ? {} : { maxPromptTokens: count(limits.maxPromptTokens) }),
+    ...(limits.maxInvocations === undefined
+      ? {}
+      : { maxInvocations: count(limits.maxInvocations) }),
+    ...(limits.maxPromptTokens === undefined
+      ? {}
+      : { maxPromptTokens: count(limits.maxPromptTokens) }),
     ...(limits.maxCompletionTokens === undefined
       ? {}
       : { maxCompletionTokens: count(limits.maxCompletionTokens) }),
@@ -261,6 +305,7 @@ export interface InferenceOwnerState {
       readonly start: Extract<InferenceEvent, { type: 'inference.started' }>;
       readonly extensions: readonly Extract<InferenceEvent, { type: 'inference.extended' }>[];
       readonly settlement?: Extract<InferenceEvent, { type: 'inference.settled' }>;
+      readonly rejected?: Extract<InferenceEvent, { type: 'inference.rejected' }>;
       readonly notSent?: Extract<InferenceEvent, { type: 'inference.not_sent' }>;
       readonly uncertain?: Extract<InferenceEvent, { type: 'inference.uncertain' }>;
     }
@@ -271,7 +316,9 @@ export interface InferenceRepository {
   append(ownerId: string, event: InferenceEvent, tail: EventLedgerTail): Promise<boolean>;
 }
 export class EventInferenceRepository implements InferenceRepository {
-  constructor(readonly events: Pick<EventRepository<InferenceEvent>, 'read' | 'appendConditional'>) {}
+  constructor(
+    readonly events: Pick<EventRepository<InferenceEvent>, 'read' | 'appendConditional'>
+  ) {}
   async load(ownerId: string): Promise<InferenceOwnerState> {
     const invocations = new Map<
       string,
@@ -279,6 +326,7 @@ export class EventInferenceRepository implements InferenceRepository {
         start: Extract<InferenceEvent, { type: 'inference.started' }>;
         extensions: Extract<InferenceEvent, { type: 'inference.extended' }>[];
         settlement?: Extract<InferenceEvent, { type: 'inference.settled' }>;
+        rejected?: Extract<InferenceEvent, { type: 'inference.rejected' }>;
         notSent?: Extract<InferenceEvent, { type: 'inference.not_sent' }>;
         uncertain?: Extract<InferenceEvent, { type: 'inference.uncertain' }>;
       }
@@ -297,7 +345,12 @@ export class EventInferenceRepository implements InferenceRepository {
         invocations.set(event.invocationId, { start: event, extensions: [] });
       } else {
         const prior = invocations.get(event.invocationId);
-        if (prior?.start.permit !== event.permit || prior.settlement || prior.notSent)
+        if (
+          prior?.start.permit !== event.permit ||
+          prior.settlement ||
+          prior.notSent ||
+          prior.rejected
+        )
           throw new Error('Contradictory inference settlement permit.');
         if (event.type === 'inference.extended') {
           if (
@@ -307,9 +360,14 @@ export class EventInferenceRepository implements InferenceRepository {
           )
             throw new Error('Contradictory native inference input extension.');
           prior.extensions.push(event);
+        } else if (event.type === 'inference.rejected') {
+          if (prior.uncertain)
+            throw new Error('A context rejection cannot override an uncertain dispatch.');
+          prior.rejected = event;
         } else if (event.type === 'inference.settled') prior.settlement = event;
         else if (event.type === 'inference.not_sent') {
-          if (prior.uncertain) throw new Error('An uncertain dispatch cannot be released without evidence.');
+          if (prior.uncertain)
+            throw new Error('An uncertain dispatch cannot be released without evidence.');
           prior.notSent = event;
         } else prior.uncertain = event;
       }

@@ -1,3 +1,7 @@
+import {
+  decodeContextAdmissionConflict,
+  type ContextAdmissionConflict
+} from '../context-admission.js';
 import { decodeEffectExecutionState, type EffectExecutionState } from '@agent-core/effects';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
 import { hashJson } from '@agent-core/persistence';
@@ -14,7 +18,11 @@ import {
 import { assertAgentRunStateInvariants } from './state-invariants.js';
 import { decodeToolPhase, isToolCallStartable, type AgentToolPhase } from './tool-state.js';
 
-export type { AgentToolCallPlanRecord, AgentToolPhase, AgentToolSettlementRecord } from './tool-state.js';
+export type {
+  AgentToolCallPlanRecord,
+  AgentToolPhase,
+  AgentToolSettlementRecord
+} from './tool-state.js';
 
 export interface AgentRunStateInput {
   readonly task: string;
@@ -36,7 +44,11 @@ export interface AgentRunControlConfiguration {
 export type AgentRunControl =
   | Readonly<{ readonly status: 'detached' }>
   | Readonly<{ readonly status: 'owned'; readonly driverId: string }>
-  | Readonly<{ readonly status: 'abort_requested'; readonly driverId?: string; readonly reason: string }>;
+  | Readonly<{
+      readonly status: 'abort_requested';
+      readonly driverId?: string;
+      readonly reason: string;
+    }>;
 
 interface AgentProviderPhaseBase {
   readonly kind: 'provider';
@@ -65,6 +77,15 @@ export type AgentProviderPhase =
   | Readonly<
       AgentProviderPhaseBase & {
         readonly stage: 'settled';
+        readonly requestEventId: string;
+        readonly responseId: string;
+        readonly effect: Extract<EffectExecutionState, { readonly phase: 'settled' }>;
+        readonly settlementEventId: string;
+      }
+    >
+  | Readonly<
+      AgentProviderPhaseBase & {
+        readonly stage: 'rejected';
         readonly requestEventId: string;
         readonly responseId: string;
         readonly effect: Extract<EffectExecutionState, { readonly phase: 'settled' }>;
@@ -123,7 +144,8 @@ export type AgentRunControlPhase =
     }>
   | Readonly<{
       readonly kind: 'suspended';
-      readonly reason: 'provider_outcome_unknown' | 'tool_outcome_unknown' | 'missing_implementation';
+      readonly reason:
+        'provider_outcome_unknown' | 'tool_outcome_unknown' | 'missing_implementation';
       readonly effectId?: string;
     }>
   | Readonly<{
@@ -133,7 +155,17 @@ export type AgentRunControlPhase =
       readonly decisionRequest: AgentDecisionRequest;
       readonly continuation: AgentDecisionContinuation;
     }>
-  | Readonly<{ readonly kind: 'suspended'; readonly reason: 'approval'; readonly approvalId: string }>
+  | Readonly<{
+      readonly kind: 'suspended';
+      readonly reason: 'context_admission';
+      readonly conflict: ContextAdmissionConflict;
+      readonly turnIndex: number;
+    }>
+  | Readonly<{
+      readonly kind: 'suspended';
+      readonly reason: 'approval';
+      readonly approvalId: string;
+    }>
   | Readonly<{ readonly kind: 'cancelling'; readonly stage: 'requested' | 'finalizing' }>
   | Readonly<{ readonly kind: 'terminal'; readonly resultEventId: string }>;
 
@@ -170,7 +202,11 @@ export type AgentRunProcedure =
   | 'finalize_abort';
 
 export type AgentRunTarget =
-  | Readonly<{ readonly kind: 'provider'; readonly turnId: string; readonly requestAttempt: number }>
+  | Readonly<{
+      readonly kind: 'provider';
+      readonly turnId: string;
+      readonly requestAttempt: number;
+    }>
   | Readonly<{ readonly kind: 'tool'; readonly toolBatchId: string; readonly callIndex: number }>;
 
 export type AgentToolTarget = Extract<AgentRunTarget, { readonly kind: 'tool' }>;
@@ -184,7 +220,8 @@ export type AgentRunInstruction =
     }>
   | Readonly<{
       readonly kind: 'wait';
-      readonly reason: 'approval' | 'external_outcome' | 'user_decision' | 'driver';
+      readonly reason:
+        'approval' | 'external_outcome' | 'user_decision' | 'context_admission' | 'driver';
     }>
   | Readonly<{ readonly kind: 'complete' }>;
 
@@ -202,7 +239,9 @@ export function nextAgentRunInstruction(state: AgentRunState): AgentRunInstructi
         procedure: state.phase.step === 'initialize' ? 'initialize_run' : 'assemble_turn'
       });
     case 'active':
-      return activeInstructions(state)[0] ?? Object.freeze({ kind: 'wait', reason: 'external_outcome' });
+      return (
+        activeInstructions(state)[0] ?? Object.freeze({ kind: 'wait', reason: 'external_outcome' })
+      );
     case 'finalization':
       return Object.freeze({
         kind: 'execute',
@@ -212,11 +251,14 @@ export function nextAgentRunInstruction(state: AgentRunState): AgentRunInstructi
       return Object.freeze({
         kind: 'wait',
         reason:
-          state.phase.reason === 'approval'
-            ? 'approval'
-            : state.phase.reason === 'user_decision' || state.phase.reason === 'missing_implementation'
-              ? 'user_decision'
-              : 'external_outcome'
+          state.phase.reason === 'context_admission'
+            ? 'context_admission'
+            : state.phase.reason === 'approval'
+              ? 'approval'
+              : state.phase.reason === 'user_decision' ||
+                  state.phase.reason === 'missing_implementation'
+                ? 'user_decision'
+                : 'external_outcome'
       });
     case 'cancelling':
       return Object.freeze({ kind: 'execute', procedure: 'finalize_abort' });
@@ -229,7 +271,9 @@ export function nextAgentRunInstructions(state: AgentRunState): readonly AgentRu
     return Object.freeze([nextAgentRunInstruction(state)]);
   }
   const instructions = activeInstructions(state);
-  return instructions.length ? instructions : Object.freeze([{ kind: 'wait', reason: 'external_outcome' }]);
+  return instructions.length
+    ? instructions
+    : Object.freeze([{ kind: 'wait', reason: 'external_outcome' }]);
 }
 
 function activeInstructions(state: AgentRunState): readonly AgentRunInstruction[] {
@@ -284,27 +328,38 @@ function activeInstructions(state: AgentRunState): readonly AgentRunInstruction[
       turnId: request.identity.turnId,
       requestAttempt: request.identity.requestAttempt
     });
-    if (request.stage === 'settled') execute('consume_provider_settlement', target);
+    if (request.stage === 'settled' || request.stage === 'rejected')
+      execute('consume_provider_settlement', target);
     else if (request.stage === 'effect_pending') execute('reconcile_provider_request', target);
     else if (!approval && request.stage === 'ready') execute('authorize_provider_request', target);
-    else if (!approval && request.stage === 'effect_ready') execute('start_provider_request', target);
+    else if (!approval && request.stage === 'effect_ready')
+      execute('start_provider_request', target);
   }
   if (instructions.length === 0) {
     if (approval) instructions.push(Object.freeze({ kind: 'wait', reason: 'approval' }));
     else if (
       state.toolBatches.every((batch) =>
-        batch.callStates.every((call) => call.stage === 'recorded' || call.stage === 'cancelled')
+        batch.callStates.every(
+          (call) =>
+            call.stage === 'recorded' || call.stage === 'resolved' || call.stage === 'cancelled'
+        )
       ) &&
       state.providerRequests.every((request) => request.stage === 'consumed')
     )
       execute('advance_after_tools');
     else if (
-      state.toolBatches.some((batch) => batch.callStates.some((call) => call.stage === 'effect_pending'))
+      state.toolBatches.some((batch) =>
+        batch.callStates.some((call) => call.stage === 'effect_pending')
+      )
     ) {
       for (const batch of state.toolBatches) {
         const callIndex = batch.callStates.findIndex((call) => call.stage === 'effect_pending');
         if (callIndex >= 0)
-          execute('reconcile_tool_call', { kind: 'tool', toolBatchId: batch.toolBatchId, callIndex });
+          execute('reconcile_tool_call', {
+            kind: 'tool',
+            toolBatchId: batch.toolBatchId,
+            callIndex
+          });
       }
     }
   }
@@ -327,7 +382,8 @@ export function providerWork(
 ): AgentProviderPhase {
   const request = state.providerRequests.find(
     (item) =>
-      item.identity.turnId === target.turnId && item.identity.requestAttempt === target.requestAttempt
+      item.identity.turnId === target.turnId &&
+      item.identity.requestAttempt === target.requestAttempt
   );
   if (!request) throw new TypeError('Provider target does not identify retained work.');
   return request;
@@ -346,14 +402,20 @@ export function outstandingToolObligations(state: AgentRunState): readonly Reado
     state.toolBatches.flatMap((batch) =>
       batch.callStates.flatMap((call, callIndex) => {
         if (
+          call.stage === 'resolved' ||
           call.stage === 'cancelled' ||
-          (call.stage === 'recorded' && call.delivery?.status === 'applied')
+          (call.stage === 'recorded' &&
+            (!batch.source.nativeCatalogIdentity || call.delivery?.status === 'applied'))
         )
           return [];
         const modelCall = batch.modelCalls[callIndex];
         return [
           Object.freeze({
-            target: Object.freeze({ kind: 'tool' as const, toolBatchId: batch.toolBatchId, callIndex }),
+            target: Object.freeze({
+              kind: 'tool' as const,
+              toolBatchId: batch.toolBatchId,
+              callIndex
+            }),
             responseId: batch.source.responseId,
             ...(modelCall?.id ? { callId: modelCall.id } : {}),
             async: modelCall?.async === true,
@@ -449,8 +511,14 @@ export function decodeAgentRunControlConfiguration(value: unknown): AgentRunCont
       'providerImplementationId'
     ),
     model: nonempty(configuration.model, 'model'),
-    runtimeImplementationId: identifier(configuration.runtimeImplementationId, 'runtimeImplementationId'),
-    toolImplementationIds: uniqueIdentifiers(configuration.toolImplementationIds, 'toolImplementationIds'),
+    runtimeImplementationId: identifier(
+      configuration.runtimeImplementationId,
+      'runtimeImplementationId'
+    ),
+    toolImplementationIds: uniqueIdentifiers(
+      configuration.toolImplementationIds,
+      'toolImplementationIds'
+    ),
     policyHash: nonempty(configuration.policyHash, 'policyHash')
   });
 }
@@ -484,7 +552,15 @@ export function decodeAgentRunControlPhase(value: unknown): AgentRunControlPhase
   const phase = object(value, 'run phase');
   const kind = enumeration(
     phase.kind,
-    ['accepted', 'initializing', 'active', 'finalization', 'suspended', 'cancelling', 'terminal'] as const,
+    [
+      'accepted',
+      'initializing',
+      'active',
+      'finalization',
+      'suspended',
+      'cancelling',
+      'terminal'
+    ] as const,
     'phase.kind'
   );
   switch (kind) {
@@ -522,13 +598,27 @@ export function decodeAgentRunControlPhase(value: unknown): AgentRunControlPhase
           'provider_outcome_unknown',
           'tool_outcome_unknown',
           'missing_implementation',
+          'context_admission',
           'user_decision'
         ] as const,
         'phase.reason'
       );
+      if (reason === 'context_admission') {
+        exact(phase, ['kind', 'reason', 'conflict', 'turnIndex']);
+        return Object.freeze({
+          kind,
+          reason,
+          conflict: decodeContextAdmissionConflict(phase.conflict),
+          turnIndex: positiveInteger(phase.turnIndex, 'phase.turnIndex')
+        });
+      }
       if (reason === 'approval') {
         exact(phase, ['kind', 'reason', 'approvalId']);
-        return Object.freeze({ kind, reason, approvalId: identifier(phase.approvalId, 'approvalId') });
+        return Object.freeze({
+          kind,
+          reason,
+          approvalId: identifier(phase.approvalId, 'approvalId')
+        });
       }
       exact(
         phase,
@@ -542,7 +632,9 @@ export function decodeAgentRunControlPhase(value: unknown): AgentRunControlPhase
         const decisionRequest = decodeDecisionRequest(phase.decisionRequest);
         const continuation = decodeDecisionContinuation(phase.continuation);
         if (continuation.blockedProvider.effect.intent.effectId !== effectId)
-          throw new TypeError('Decision continuation effect identity does not match its suspension.');
+          throw new TypeError(
+            'Decision continuation effect identity does not match its suspension.'
+          );
         const expectedFingerprint = hashJson({
           id: decisionRequest.id,
           reason: decisionRequest.reason,
@@ -566,7 +658,10 @@ export function decodeAgentRunControlPhase(value: unknown): AgentRunControlPhase
       });
     case 'terminal':
       exact(phase, ['kind', 'resultEventId']);
-      return Object.freeze({ kind, resultEventId: identifier(phase.resultEventId, 'phase.resultEventId') });
+      return Object.freeze({
+        kind,
+        resultEventId: identifier(phase.resultEventId, 'phase.resultEventId')
+      });
   }
 }
 
@@ -586,7 +681,15 @@ export function decodeProviderPhase(value: unknown): AgentProviderPhase {
   ]);
   const stage = enumeration(
     phase.stage,
-    ['ready', 'effect_ready', 'effect_pending', 'settled', 'consumed', 'outcome_unknown'] as const,
+    [
+      'ready',
+      'effect_ready',
+      'effect_pending',
+      'settled',
+      'rejected',
+      'consumed',
+      'outcome_unknown'
+    ] as const,
     'phase.stage'
   );
   const requestEventId = optionalIdentifier(phase.requestEventId, 'phase.requestEventId');
@@ -615,9 +718,11 @@ export function decodeProviderPhase(value: unknown): AgentProviderPhase {
       throw new TypeError('An effect-pending provider phase requires a started effect.');
     return Object.freeze({ ...base, stage, requestEventId, responseId, effect });
   }
-  if (stage === 'settled' || stage === 'consumed') {
+  if (stage === 'settled' || stage === 'rejected' || stage === 'consumed') {
     if (effect.phase !== 'settled' || !settlementEventId)
       throw new TypeError('A settled provider phase requires effect and response settlement.');
+    if (stage === 'rejected' && effect.settlement.outcome !== 'failed')
+      throw new TypeError('Rejected provider input requires a recorded failed dispatch.');
     return Object.freeze({ ...base, stage, requestEventId, responseId, effect, settlementEventId });
   }
   if (effect.phase !== 'closed')
@@ -645,7 +750,14 @@ function decodeDecisionContinuation(value: unknown): AgentDecisionContinuation {
   if (continuation.kind !== 'cancelled_provider_start')
     throw new TypeError('Unknown decision continuation.');
   const blockedProvider = object(continuation.blockedProvider, 'blocked provider continuation');
-  exact(blockedProvider, ['kind', 'identity', 'toolBatchId', 'requestEventId', 'responseId', 'effect']);
+  exact(blockedProvider, [
+    'kind',
+    'identity',
+    'toolBatchId',
+    'requestEventId',
+    'responseId',
+    'effect'
+  ]);
   if (blockedProvider.kind !== 'provider')
     throw new TypeError('Decision continuation must retain a blocked provider phase.');
   const effect = decodeEffectExecutionState(blockedProvider.effect);
@@ -657,7 +769,10 @@ function decodeDecisionContinuation(value: unknown): AgentDecisionContinuation {
       kind: blockedProvider.kind,
       identity: decodeTurnIdentity(blockedProvider.identity),
       toolBatchId: identifier(blockedProvider.toolBatchId, 'decision continuation toolBatchId'),
-      requestEventId: identifier(blockedProvider.requestEventId, 'decision continuation requestEventId'),
+      requestEventId: identifier(
+        blockedProvider.requestEventId,
+        'decision continuation requestEventId'
+      ),
       responseId: identifier(blockedProvider.responseId, 'decision continuation responseId'),
       effect
     })
@@ -685,7 +800,8 @@ function object(value: unknown, name: string): JsonObject {
 function exact(value: JsonObject, fields: readonly string[]): void {
   const allowed = new Set(fields);
   const unsupported = Object.keys(value).filter((field) => !allowed.has(field));
-  if (unsupported.length > 0) throw new TypeError(`Unsupported run fields: ${unsupported.join(', ')}.`);
+  if (unsupported.length > 0)
+    throw new TypeError(`Unsupported run fields: ${unsupported.join(', ')}.`);
 }
 function array(value: unknown, name: string): readonly unknown[] {
   if (!Array.isArray(value)) throw new TypeError(`${name} must be an array.`);
@@ -736,7 +852,8 @@ function uniqueIdentifiers(value: unknown, name: string): readonly string[] {
   const items = Object.freeze(
     array(value, name).map((item, index) => identifier(item, `${name}[${String(index)}]`))
   );
-  if (new Set(items).size !== items.length) throw new TypeError(`${name} contains duplicate identities.`);
+  if (new Set(items).size !== items.length)
+    throw new TypeError(`${name} contains duplicate identities.`);
   return items;
 }
 function enumeration<const T extends readonly string[]>(
@@ -752,4 +869,31 @@ function oneOf<const T extends readonly string[]>(value: unknown, values: T): va
 }
 function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Display activity is derived from current obligations and grants no execution authority. */
+export function agentRunActivity(state: AgentRunState): import('../contracts.js').AgentRunPhase {
+  if (state.phase.kind === 'terminal') return 'ended';
+  if (state.phase.kind === 'finalization' || state.phase.kind === 'cancelling') return 'finalizing';
+  if (state.toolBatches.some((batch) => batch.callStates.some((call) => call.stage === 'approval')))
+    return 'waiting_for_approval';
+  if (
+    state.providerRequests.some(
+      (request) =>
+        request.stage === 'effect_pending' ||
+        request.stage === 'effect_ready' ||
+        request.stage === 'ready'
+    )
+  )
+    return 'requesting_model';
+  if (
+    state.toolBatches.some((batch) =>
+      batch.callStates.some(
+        (call) =>
+          call.stage !== 'recorded' && call.stage !== 'resolved' && call.stage !== 'cancelled'
+      )
+    )
+  )
+    return 'executing_tools';
+  return 'initializing';
 }

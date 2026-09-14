@@ -7,73 +7,163 @@ import { isCompiledTool, markCompiledTool, type CompiledToolDefinition } from '.
 
 export class ToolRegistry {
   private readonly tools = new Map<string, CompiledToolDefinition>();
-  constructor(tools: readonly CompiledToolDefinition[] = []) { for (const tool of tools) this.register(tool); }
+  constructor(tools: readonly CompiledToolDefinition[] = []) {
+    for (const tool of tools) this.register(tool);
+  }
   register(tool: CompiledToolDefinition): void {
-    if (!isCompiledTool(tool)) throw new Error('Tool definitions must be created by defineTool() or adoptToolDefinition().');
+    if (!isCompiledTool(tool))
+      throw new Error('Tool definitions must be created by defineTool() or adoptToolDefinition().');
     if (this.tools.has(tool.name)) throw new Error('Tool already registered: ' + tool.name);
     this.tools.set(tool.name, tool);
   }
-  get(name: string): CompiledToolDefinition | undefined { return this.tools.get(name); }
+  get(name: string): CompiledToolDefinition | undefined {
+    return this.tools.get(name);
+  }
   require(name: string): CompiledToolDefinition {
     const tool = this.get(name);
     if (!tool) throw new Error('Unknown tool: ' + name);
     return tool;
   }
-  list(): CompiledToolDefinition[] { return [...this.tools.values()].sort((a, b) => a.name.localeCompare(b.name, 'en')); }
-  available(policy: ToolPolicy): CompiledToolDefinition[] { return this.list().filter((tool) => isToolAvailable(tool, policy)); }
+  list(): CompiledToolDefinition[] {
+    return [...this.tools.values()].sort((a, b) => a.name.localeCompare(b.name, 'en'));
+  }
+  available(policy: ToolPolicy): CompiledToolDefinition[] {
+    return this.list().filter((tool) => isToolAvailable(tool, policy));
+  }
 }
 
 export function adoptToolDefinition(tool: unknown): CompiledToolDefinition {
   if (isCompiledTool(tool)) return tool;
   if (!record(tool)) throw new Error('Tool definition must be an object.');
   const unexpected = Object.keys(tool).filter((key) => !KEYS.has(key));
-  if (unexpected.length > 0) throw new Error('Tool definition has unsupported fields: ' + unexpected.sort().join(', ') + '.');
+  if (unexpected.length > 0)
+    throw new Error(
+      'Tool definition has unsupported fields: ' + unexpected.sort().join(', ') + '.'
+    );
   const name = nonEmpty(tool.name, 'name');
   const implementationId = nonEmpty(tool.implementationId, 'implementationId');
   const description = nonEmpty(tool.description, 'description');
-  if (!schema(tool.outputSchema)) throw new Error('Tool ' + name + ' outputSchema must be a Zod schema.');
-  for (const member of ['decodeInput', 'canonicalizeInput', 'snapshotInput', 'deriveEffects', 'bindExecution'] as const) if (typeof tool[member] !== 'function') throw new Error('Tool ' + name + ' ' + member + ' must be callable.');
+  if (!schema(tool.outputSchema))
+    throw new Error('Tool ' + name + ' outputSchema must be a Zod schema.');
+  for (const member of [
+    'decodeInput',
+    'canonicalizeInput',
+    'snapshotInput',
+    'deriveEffects',
+    'bindExecution'
+  ] as const)
+    if (typeof tool[member] !== 'function')
+      throw new Error('Tool ' + name + ' ' + member + ' must be callable.');
   const snapshotInput = tool.snapshotInput as ToolDefinition['snapshotInput'];
-  if (tool.promptGuide !== undefined && typeof tool.promptGuide !== 'string' && typeof tool.promptGuide !== 'function') throw new Error('Tool promptGuide is invalid.');
-  if (tool.isAvailable !== undefined && typeof tool.isAvailable !== 'function') throw new Error('Tool isAvailable is invalid.');
-  if (tool.presentObservation !== undefined && typeof tool.presentObservation !== 'function') throw new Error('Tool presentObservation is invalid.');
+  if (
+    tool.promptGuide !== undefined &&
+    typeof tool.promptGuide !== 'string' &&
+    typeof tool.promptGuide !== 'function'
+  )
+    throw new Error('Tool promptGuide is invalid.');
+  if (tool.isAvailable !== undefined && typeof tool.isAvailable !== 'function')
+    throw new Error('Tool isAvailable is invalid.');
+  if (tool.buildModelContent !== undefined && typeof tool.buildModelContent !== 'function')
+    throw new Error('Tool buildModelContent is invalid.');
   const textInput = tool.textInput === undefined ? undefined : snapshotTextInput(tool.textInput);
-  const jsonSchema = parseJsonObject(tool.jsonSchema, { maxDepth: 64, maxCollectionEntries: 50_000, maxStringBytes: 1_000_000, maxTotalBytes: 4_000_000 });
+  const jsonSchema = parseJsonObject(tool.jsonSchema, {
+    maxDepth: 64,
+    maxCollectionEntries: 50_000,
+    maxStringBytes: 1_000_000,
+    maxTotalBytes: 4_000_000
+  });
   const requirements = validateToolRequirements(tool.requirements);
-  return markCompiledTool(Object.freeze({
-    name, implementationId, description,
-    ...(tool.promptGuide !== undefined ? { promptGuide: tool.promptGuide as NonNullable<ToolDefinition['promptGuide']> } : {}),
-    jsonSchema,
-    outputSchema: tool.outputSchema,
-    ...(textInput ? { textInput } : {}),
-    effectEnvelope: validateToolEffectEnvelope(tool.effectEnvelope),
-    ...(requirements !== undefined ? { requirements } : {}),
-    ...(tool.isAvailable ? { isAvailable: tool.isAvailable as NonNullable<ToolDefinition['isAvailable']> } : {}),
-    decodeInput: tool.decodeInput as ToolDefinition['decodeInput'],
-    canonicalizeInput: tool.canonicalizeInput as ToolDefinition['canonicalizeInput'],
-    snapshotInput: (input: unknown) => parseJsonValue(snapshotInput(input)),
-    deriveEffects: tool.deriveEffects as ToolDefinition['deriveEffects'],
-    bindExecution: tool.bindExecution as ToolDefinition['bindExecution'],
-    ...(tool.presentObservation ? { presentObservation: tool.presentObservation as NonNullable<ToolDefinition['presentObservation']> } : {})
-  }));
+  return markCompiledTool(
+    Object.freeze({
+      name,
+      implementationId,
+      description,
+      ...(tool.promptGuide !== undefined
+        ? { promptGuide: tool.promptGuide as NonNullable<ToolDefinition['promptGuide']> }
+        : {}),
+      jsonSchema,
+      outputSchema: tool.outputSchema,
+      ...(textInput ? { textInput } : {}),
+      effectEnvelope: validateToolEffectEnvelope(tool.effectEnvelope),
+      ...(requirements !== undefined ? { requirements } : {}),
+      ...(tool.isAvailable
+        ? { isAvailable: tool.isAvailable as NonNullable<ToolDefinition['isAvailable']> }
+        : {}),
+      decodeInput: tool.decodeInput as ToolDefinition['decodeInput'],
+      canonicalizeInput: tool.canonicalizeInput as ToolDefinition['canonicalizeInput'],
+      snapshotInput: (input: unknown) => parseJsonValue(snapshotInput(input)),
+      deriveEffects: tool.deriveEffects as ToolDefinition['deriveEffects'],
+      bindExecution: tool.bindExecution as ToolDefinition['bindExecution'],
+      ...(tool.buildModelContent
+        ? {
+            buildModelContent: tool.buildModelContent as NonNullable<
+              ToolDefinition['buildModelContent']
+            >
+          }
+        : {})
+    })
+  );
 }
 
-const KEYS = new Set(['name', 'implementationId', 'description', 'promptGuide', 'jsonSchema', 'outputSchema', 'textInput', 'effectEnvelope', 'requirements', 'isAvailable', 'decodeInput', 'canonicalizeInput', 'snapshotInput', 'deriveEffects', 'bindExecution', 'presentObservation']);
+const KEYS = new Set([
+  'name',
+  'implementationId',
+  'description',
+  'promptGuide',
+  'jsonSchema',
+  'outputSchema',
+  'textInput',
+  'effectEnvelope',
+  'requirements',
+  'isAvailable',
+  'decodeInput',
+  'canonicalizeInput',
+  'snapshotInput',
+  'deriveEffects',
+  'bindExecution',
+  'buildModelContent'
+]);
 function snapshotTextInput(value: unknown): NonNullable<ToolDefinition['textInput']> {
-  if (!record(value) || !record(value.format) || typeof value.decode !== 'function') throw new Error('Tool textInput is invalid.');
-  if (value.description !== undefined && typeof value.description !== 'string') throw new Error('Tool textInput description is invalid.');
-  if (value.promptGuide !== undefined && typeof value.promptGuide !== 'string' && typeof value.promptGuide !== 'function') throw new Error('Tool textInput promptGuide is invalid.');
-  const format = value.format.type === 'text'
-    ? Object.freeze({ type: 'text' as const })
-    : value.format.type === 'grammar' && typeof value.format.syntax === 'string' && typeof value.format.definition === 'string'
-      ? Object.freeze({ type: 'grammar' as const, syntax: value.format.syntax, definition: value.format.definition })
-      : undefined;
+  if (!record(value) || !record(value.format) || typeof value.decode !== 'function')
+    throw new Error('Tool textInput is invalid.');
+  if (value.description !== undefined && typeof value.description !== 'string')
+    throw new Error('Tool textInput description is invalid.');
+  if (
+    value.promptGuide !== undefined &&
+    typeof value.promptGuide !== 'string' &&
+    typeof value.promptGuide !== 'function'
+  )
+    throw new Error('Tool textInput promptGuide is invalid.');
+  const format =
+    value.format.type === 'text'
+      ? Object.freeze({ type: 'text' as const })
+      : value.format.type === 'grammar' &&
+          typeof value.format.syntax === 'string' &&
+          typeof value.format.definition === 'string'
+        ? Object.freeze({
+            type: 'grammar' as const,
+            syntax: value.format.syntax,
+            definition: value.format.definition
+          })
+        : undefined;
   if (!format) throw new Error('Tool textInput format is invalid.');
-  return Object.freeze({ format, ...(typeof value.description === 'string' ? { description: value.description } : {}), ...(value.promptGuide ? { promptGuide: value.promptGuide as NonNullable<ToolDefinition['promptGuide']> } : {}), decode: value.decode as (text: string) => unknown });
+  return Object.freeze({
+    format,
+    ...(typeof value.description === 'string' ? { description: value.description } : {}),
+    ...(value.promptGuide
+      ? { promptGuide: value.promptGuide as NonNullable<ToolDefinition['promptGuide']> }
+      : {}),
+    decode: value.decode as (text: string) => unknown
+  });
 }
 function nonEmpty(value: unknown, field: string): string {
-  if (typeof value !== 'string' || value.trim().length === 0) throw new Error('Tool ' + field + ' must be a non-empty string.');
+  if (typeof value !== 'string' || value.trim().length === 0)
+    throw new Error('Tool ' + field + ' must be a non-empty string.');
   return value;
 }
-function record(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
-function schema(value: unknown): value is import('zod').ZodType { return record(value) && typeof value.safeParse === 'function'; }
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+function schema(value: unknown): value is import('zod').ZodType {
+  return record(value) && typeof value.safeParse === 'function';
+}

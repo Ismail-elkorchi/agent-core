@@ -7,11 +7,7 @@ import {
 } from '@agent-core/model';
 import type { ArtifactRepository } from '@agent-core/persistence';
 import { resolveSessionImages } from '../session/images.js';
-import {
-  DEFAULT_MODEL_WINDOW_IMAGE_LIMITS,
-  ModelWindow,
-  type ModelWindowReduction
-} from './model-window.js';
+import { DEFAULT_MODEL_WINDOW_IMAGE_LIMITS, ModelWindow } from './model-window.js';
 import {
   createPromptMaterial,
   deliverPromptContext,
@@ -51,7 +47,6 @@ export interface ModelRequestAssembly {
   readonly messages: readonly ModelInputItem[];
   readonly historyMessages: readonly ModelInputItem[];
   readonly context: PromptContextDelivery;
-  readonly reductions: readonly ModelWindowReduction[];
   readonly estimate: ModelRequestAssemblyEstimate;
 }
 
@@ -84,7 +79,6 @@ export class ModelRequestAssembler {
       messages,
       historyMessages: history.messages,
       context,
-      reductions: input.window.consumeReductions(),
       estimate: Object.freeze({
         modelWindowTokens: accountModelRequest(
           { model: input.modelProfile.id, messages },
@@ -104,7 +98,10 @@ export async function compilePromptMaterial(
     readonly prior: readonly ModelInputItem[];
     readonly current: readonly ModelInputItem[];
   } = { prior: [], current: [] },
-  options: { readonly artifacts?: ArtifactRepository | undefined; readonly maxImageBytes?: number } = {}
+  options: {
+    readonly artifacts?: ArtifactRepository | undefined;
+    readonly maxImageBytes?: number;
+  } = {}
 ): Promise<readonly ModelInputItem[]> {
   const instructionMessages: ModelInputItem[] = material.instructions.map((instruction) =>
     Object.freeze({

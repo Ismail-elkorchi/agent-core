@@ -6,20 +6,23 @@ import {
   type CommandExecutionOwner
 } from '@agent-core/tools';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
-import { presentProcessObservation } from '../../core/presenters.js';
+import { buildProcessContent } from '../../core/model-content.js';
 import { processScope } from '../../core/resources.js';
-import { isSuccessfulProcessResult } from '../process-output.js';
 import { writeStdinInputSchema, writeStdinOutputSchema } from './schema.js';
 
 export const writeStdinTool = defineTool({
   name: 'write_stdin',
   implementationId: 'agent-core.write-stdin.v1',
-  description: 'Write to, close, or poll a process started by exec_command using a stable output cursor.',
+  description:
+    'Write to, close, or poll a process started by exec_command using a stable output cursor.',
   schema: writeStdinInputSchema,
   outputSchema: writeStdinOutputSchema,
-  presentObservation: presentProcessObservation,
+  buildModelContent: buildProcessContent,
   requirements: { services: ['localToolConfiguration', 'commandExecution'] },
-  effectEnvelope: { accesses: [{ mode: 'execute', scope: processScope() }], lockScopes: [processScope()] },
+  effectEnvelope: {
+    accesses: [{ mode: 'execute', scope: processScope() }],
+    lockScopes: [processScope()]
+  },
   canonicalizeInput(input, context) {
     const limits = requireLocalToolConfiguration(context).process;
     return {
@@ -55,7 +58,9 @@ export const writeStdinTool = defineTool({
     );
     return {
       kind: 'result' as const,
-      ok: isSuccessfulProcessResult(result),
+      execution: {
+        state: result.status === 'running' ? ('active' as const) : ('settled' as const)
+      },
       summary:
         result.status === 'running'
           ? 'Process ' + result.processId + ' is still running.'
@@ -71,12 +76,16 @@ export const writeStdinTool = defineTool({
             }
           : {})
       },
-      ...(result.artifact ? { content: [{ type: 'artifact' as const, artifact: result.artifact }] } : {}),
+      ...(result.artifact
+        ? { content: [{ type: 'artifact' as const, artifact: result.artifact }] }
+        : {}),
       output: result
     };
   }
 });
-function processOwner(context: import('@agent-core/tools').ToolExecutionContext): CommandExecutionOwner {
+function processOwner(
+  context: import('@agent-core/tools').ToolExecutionContext
+): CommandExecutionOwner {
   const invocation = context.invocation;
   if (!invocation) throw new Error('Process tools require a runtime invocation owner.');
   return Object.freeze({

@@ -4,7 +4,13 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import * as z from 'zod';
-import { AgentRuntime, agentEventCodec, applyAgentRunStateTransition } from '@agent-core/runtime';
+import {
+  AgentRuntime,
+  AgentRunRecords,
+  resolveToolObservation,
+  agentEventCodec,
+  applyAgentRunStateTransition
+} from '@agent-core/runtime';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import { adoptCommandExecution, commandExecutionResources, defineTool } from '@agent-core/tools';
 import {
@@ -35,7 +41,12 @@ const profile = {
   limits: { contextTokens: 16_000, outputTokens: 2_000 },
   supportedParameters: ['tools', 'maxOutputTokens']
 };
-const done = { content: 'done', model: 'scripted', provider: 'scripted', terminationReason: 'stop' };
+const done = {
+  content: 'done',
+  model: 'scripted',
+  provider: 'scripted',
+  terminationReason: 'stop'
+};
 class Provider {
   id = 'scripted';
   implementationId = 'agent-core.tests.runtime-process-provider@1';
@@ -119,7 +130,7 @@ const approvalTool = defineTool({
   }),
   invoke: async () => ({
     kind: 'result',
-    ok: true,
+
     summary: 'written',
     scope: { resources: ['files/approval'], coverage: 'complete' },
     output: {}
@@ -182,7 +193,11 @@ test('abort and unknown provider outcome both clean active run processes before 
     let finalOperation;
     for (const event of persisted)
       if (event.type === 'run.state.transitioned')
-        finalOperation = applyAgentRunStateTransition(finalOperation, event.transition);
+        finalOperation = await applyAgentRunStateTransition(
+          finalOperation,
+          event.transition,
+          new AgentRunRecords(state.artifacts)
+        );
     assert.equal(finalOperation.phase.kind, mode === 'abort' ? 'terminal' : 'active');
     if (mode === 'failure')
       assert.equal(finalOperation.providerRequests.at(-1).stage, 'outcome_unknown');
@@ -242,7 +257,9 @@ test('cleanup failure transforms prior partial, completed, and aborted decisions
   const cases = [
     {
       runId: 'partial-cleanup',
-      provider: new Provider([{ ...done, content: 'partial answer', terminationReason: 'output_limit' }]),
+      provider: new Provider([
+        { ...done, content: 'partial answer', terminationReason: 'output_limit' }
+      ]),
       assertTerminal(terminal) {
         assert.equal(terminal.modelOutput.status, 'partial');
         assert.equal(terminal.modelTerminationReason, 'output_limit');
@@ -285,8 +302,11 @@ test('cleanup failure transforms prior partial, completed, and aborted decisions
   });
   const controller = new AbortController();
   controller.abort('already aborted');
-  const result = await agent.run({ runId: 'aborted-cleanup', task: 'abort', signal: controller.signal })
-    .result;
+  const result = await agent.run({
+    runId: 'aborted-cleanup',
+    task: 'abort',
+    signal: controller.signal
+  }).result;
   assert.equal(result.state, 'ended');
   assert.equal(result.terminal.executionStatus, 'failed');
   assert.equal(result.terminal.modelOutput.status, 'absent');
@@ -338,7 +358,10 @@ test('two runtimes sharing one manager clean only their own processes', async ()
 test('an explicitly admitted work owner keeps a process across runs with its original causal identity', async (t) => {
   const state = await setup();
   t.after(() => state.manager.close());
-  const resources = commandExecutionResources(state.manager, { kind: 'owner', ownerId: 'coding-work' });
+  const resources = commandExecutionResources(state.manager, {
+    kind: 'owner',
+    ownerId: 'coding-work'
+  });
   const options = {
     model: 'scripted',
     toolBoundary: boundary,
@@ -349,19 +372,25 @@ test('an explicitly admitted work owner keeps a process across runs with its ori
   };
   const first = await new AgentRuntime({
     ...options,
-    provider: new Provider([toolResponse('exec_command', { command: longCommand, yieldMs: 100 }), done]),
+    provider: new Provider([
+      toolResponse('exec_command', { command: longCommand, yieldMs: 100 }),
+      done
+    ]),
     tools: [execCommandTool]
   }).run({ runId: 'first-attempt', task: 'Start the work process.' }).result;
   assert.equal(first.terminal.executionStatus, 'completed');
   assert.equal(state.manager.activeCount('coding-work'), 1);
   assert.equal(
-    (await records(state.events, 'first-attempt')).some((event) => event.type === 'resource.released'),
+    (await records(state.events, 'first-attempt')).some(
+      (event) => event.type === 'resource.released'
+    ),
     false
   );
   const observed = (await records(state.events, 'first-attempt')).find(
     (event) => event.type === 'tool.ended'
   );
-  const processId = observed.observation.output.processId;
+  const processId = (await resolveToolObservation(observed.observation, state.artifacts)).output
+    .processId;
   const laterOwner = {
     ownerId: 'coding-work',
     runId: 'later-attempt',
@@ -376,7 +405,11 @@ test('an explicitly admitted work owner keeps a process across runs with its ori
     state.manager.query(processId, 100, 20, 0, { ...laterOwner, ownerId: 'different-work' }),
     /another resource owner/
   );
-  const second = await new AgentRuntime({ ...options, provider: new Provider([done]), tools: [] }).run({
+  const second = await new AgentRuntime({
+    ...options,
+    provider: new Provider([done]),
+    tools: []
+  }).run({
     runId: 'later-attempt',
     task: 'Continue the same work.'
   }).result;

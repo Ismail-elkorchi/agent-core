@@ -1,4 +1,3 @@
-import type { ModelUsage } from '@agent-core/model';
 import type { AgentProgressEvent, AgentRunBudgetState } from '@agent-core/runtime';
 import type { StatusField } from './preferences.js';
 
@@ -21,7 +20,6 @@ export interface ProgressPresentation {
   readonly label: string;
   readonly budget?: AgentRunBudgetState;
   readonly request?: Extract<AgentProgressEvent, { readonly type: 'model.requested' }>;
-  readonly usage?: ModelUsage;
 }
 export function presentProgress(
   state: ProgressPresentation,
@@ -47,7 +45,13 @@ export function presentProgress(
     case 'tool.started':
       return { ...state, label: 'Running tool' };
     case 'tool.updated':
-      return { ...state, label: event.progress.type === 'status' ? event.progress.message ?? event.progress.stage : 'Running tool' };
+      return {
+        ...state,
+        label:
+          event.progress.type === 'status'
+            ? (event.progress.message ?? event.progress.stage)
+            : 'Running tool'
+      };
     case 'tool.ended':
     case 'assistant.ended':
       return { ...state, label: 'Working' };
@@ -55,8 +59,6 @@ export function presentProgress(
       return { ...state, budget: event.budget };
     case 'run.ended':
       return { ...state, label: event.terminal.executionStatus, budget: event.terminal.budget };
-    case 'budget.provider_usage.recorded':
-      return { ...state, usage: event.usage };
     case 'assistant.interrupted':
     case 'model.failed':
       return { ...state, label: 'Response interrupted' };
@@ -66,7 +68,6 @@ export function presentProgress(
 }
 export function progressStatusFields(state: ProgressPresentation): readonly StatusField[] {
   const request = state.request;
-  const usage = state.usage;
   const budget = state.budget;
   return [
     {
@@ -77,13 +78,17 @@ export function progressStatusFields(state: ProgressPresentation): readonly Stat
         : {
             value:
               `≈${String(request.estimate.totalPromptTokens)}` +
-              (request.contextWindowTokens === undefined ? '' : ` / ${String(request.contextWindowTokens)}`)
+              (request.contextWindowTokens === undefined
+                ? ''
+                : ` / ${String(request.contextWindowTokens)}`)
           })
     },
     {
       id: 'usage',
-      label: 'Latest provider response tokens',
-      ...(usage?.totalTokens === undefined ? {} : { value: `${String(usage.totalTokens)} response tokens` })
+      label: 'Recorded run tokens',
+      ...(budget === undefined
+        ? {}
+        : { value: `${String(budget.promptTokens + budget.completionTokens)} run tokens` })
     },
     {
       id: 'elapsed',

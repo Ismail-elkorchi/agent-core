@@ -1,5 +1,10 @@
 import type { ObservationAction, ToolResultFact } from '@agent-core/tools';
-import { requireToolService, throwIfAborted, ToolInputError, type ToolExecutionContext } from '@agent-core/tools';
+import {
+  requireToolService,
+  throwIfAborted,
+  ToolInputError,
+  type ToolExecutionContext
+} from '@agent-core/tools';
 import { PATCH_JOURNAL_SCOPE, fileScope, rootedFileResource } from '../../core/resources.js';
 import type { ToolObservationInput } from '@agent-core/tools';
 import { requireRootedFileAuthority } from '../../core/rooted-files.js';
@@ -11,10 +16,22 @@ import {
   sha256Text
 } from '../../core/filesystem.js';
 import { invalidToolInputObservation } from '@agent-core/tools';
-import { isTextPatchJournal, withTextFilePatchJournal, type TextPatchRemovePlan, type TextPatchWritePlan, type TextPatchJournal, type TextPatchJournalAuthority, type TextTransactionResult } from '../../core/text-write.js';
+import {
+  isTextPatchJournal,
+  withTextFilePatchJournal,
+  type TextPatchRemovePlan,
+  type TextPatchWritePlan,
+  type TextPatchJournal,
+  type TextPatchJournalAuthority,
+  type TextTransactionResult
+} from '../../core/text-write.js';
 import { splitLogicalLines } from '@agent-core/tools';
 import { applyPatchUpdate, PatchApplyError } from './apply-diff.js';
-import { PatchParseError, type ParsedApplyPatch, type ParsedPatchOperation } from './patch-parser.js';
+import {
+  PatchParseError,
+  type ParsedApplyPatch,
+  type ParsedPatchOperation
+} from './patch-parser.js';
 import type {
   ApplyPatchFailure,
   ApplyPatchFileOutput,
@@ -45,19 +62,45 @@ interface PlannedPatchOperation {
   changedPaths: string[];
 }
 
-export async function applyPatch(input: CanonicalApplyPatchInput, context: ToolExecutionContext): Promise<ToolObservationInput<ApplyPatchOutput>> {
+export async function applyPatch(
+  input: CanonicalApplyPatchInput,
+  context: ToolExecutionContext
+): Promise<ToolObservationInput<ApplyPatchOutput>> {
   throwIfAborted(context.signal);
   const root = requireRootedFileAuthority(context);
   const dryRun = input.dryRun;
-  const journal = dryRun ? undefined : requireToolService<TextPatchJournal>(context, 'patchJournal', isTextPatchJournal, 'adopted TextPatchJournal');
-  if (journal) return withTextFilePatchJournal(root, journal, (authority) => applyPatchWithAuthority(input, context, authority), context.signal);
+  const journal = dryRun
+    ? undefined
+    : requireToolService<TextPatchJournal>(
+        context,
+        'patchJournal',
+        isTextPatchJournal,
+        'adopted TextPatchJournal'
+      );
+  if (journal)
+    return withTextFilePatchJournal(
+      root,
+      journal,
+      (authority) => applyPatchWithAuthority(input, context, authority),
+      context.signal
+    );
   return applyPatchWithAuthority(input, context);
 }
 
-export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, context: ToolExecutionContext, authority?: TextPatchJournalAuthority): Promise<ToolObservationInput<ApplyPatchOutput>> {
+export async function applyPatchWithAuthority(
+  input: CanonicalApplyPatchInput,
+  context: ToolExecutionContext,
+  authority?: TextPatchJournalAuthority
+): Promise<ToolObservationInput<ApplyPatchOutput>> {
   const root = requireRootedFileAuthority(context);
   const dryRun = input.dryRun;
-  await context.emitProgress?.({ type: 'status', stage: 'patch_staging', message: 'Staging patch transaction.', completed: 0, total: input.tree.operations.length });
+  await context.emitProgress?.({
+    type: 'status',
+    stage: 'patch_staging',
+    message: 'Staging patch transaction.',
+    completed: 0,
+    total: input.tree.operations.length
+  });
   const { planned, failures } = await planPatch(root, input);
 
   if (failures.length > 0) {
@@ -65,31 +108,57 @@ export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, c
       failures
     });
   }
-  await emitCheckpoint(context, { type: 'status', stage: 'patch_planned', message: 'Patch transaction planned.', completed: planned.length, total: input.tree.operations.length });
+  await emitCheckpoint(context, {
+    type: 'status',
+    stage: 'patch_planned',
+    message: 'Patch transaction planned.',
+    completed: planned.length,
+    total: input.tree.operations.length
+  });
 
   const changed = planned.filter((operation) => operation.output.plannedChange);
   let transactionOutcome: ApplyPatchOutput['transactionOutcome'];
   let transaction: TextTransactionResult | undefined;
   if (!dryRun && changed.length > 0) {
-    if (!authority) throw new Error('Patch journal authority is unavailable for a write transaction.');
+    if (!authority)
+      throw new Error('Patch journal authority is unavailable for a write transaction.');
     throwIfAborted(context.signal);
-    await context.emitProgress?.({ type: 'status', stage: 'patch_committing', message: 'Committing patch transaction.', completed: 0, total: changed.length });
-    const transactionId = patchTransactionId(context);
-    transaction = await authority.commit({
-      writes: changed.flatMap((operation) => operation.write ? [operation.write] : []),
-      removes: changed.flatMap((operation) => operation.remove ? [operation.remove] : []),
-      parentDirsToCreate: changed.flatMap((operation) => operation.parentDirsToCreate)
-    }, {
-      ...(context.signal ? { signal: context.signal } : {}),
-      ...(transactionId ? { transactionId } : {})
+    await context.emitProgress?.({
+      type: 'status',
+      stage: 'patch_committing',
+      message: 'Committing patch transaction.',
+      completed: 0,
+      total: changed.length
     });
+    const transactionId = patchTransactionId(context);
+    transaction = await authority.commit(
+      {
+        writes: changed.flatMap((operation) => (operation.write ? [operation.write] : [])),
+        removes: changed.flatMap((operation) => (operation.remove ? [operation.remove] : [])),
+        parentDirsToCreate: changed.flatMap((operation) => operation.parentDirsToCreate)
+      },
+      {
+        ...(context.signal ? { signal: context.signal } : {}),
+        ...(transactionId ? { transactionId } : {})
+      }
+    );
     transactionOutcome = transaction.outcome;
     if (transaction.outcome === 'rolled_back' || transaction.outcome === 'rollback_failed') {
-      await emitCheckpoint(context, { type: 'status', stage: 'rollback_completed', message: `Patch rollback ${transactionRecovery(transaction)}.` });
+      await emitCheckpoint(context, {
+        type: 'status',
+        stage: 'rollback_completed',
+        message: `Patch rollback ${transactionRecovery(transaction)}.`
+      });
     } else {
       await emitCheckpoint(context, {
-        type: 'status', stage: 'patch_committed', completed: changed.length, total: changed.length,
-        message: transaction.outcome === 'committed' ? 'Patch transaction committed.' : transactionFailureMessage(transaction)
+        type: 'status',
+        stage: 'patch_committed',
+        completed: changed.length,
+        total: changed.length,
+        message:
+          transaction.outcome === 'committed'
+            ? 'Patch transaction committed.'
+            : transactionFailureMessage(transaction)
       });
     }
   }
@@ -106,9 +175,13 @@ export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, c
           : 'uncertain';
   const contentsCommitted = applicationStatus === 'applied';
   const changedPaths = dryRun || !contentsCommitted ? [] : [...wouldChangePaths];
-  const wouldCreatePaths = changed.flatMap((operation) => operation.createdPath ? [operation.createdPath] : []);
-  const wouldDeletePaths = changed.flatMap((operation) => operation.deletedPath ? [operation.deletedPath] : []);
-  const wouldMovePaths = changed.flatMap((operation) => operation.move ? [operation.move] : []);
+  const wouldCreatePaths = changed.flatMap((operation) =>
+    operation.createdPath ? [operation.createdPath] : []
+  );
+  const wouldDeletePaths = changed.flatMap((operation) =>
+    operation.deletedPath ? [operation.deletedPath] : []
+  );
+  const wouldMovePaths = changed.flatMap((operation) => (operation.move ? [operation.move] : []));
   const output: ApplyPatchOutput = {
     applicationStatus,
     ...(transactionOutcome ? { transactionOutcome } : {}),
@@ -116,11 +189,15 @@ export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, c
     dryRun,
     files: planned.map((operation) => ({
       ...operation.output,
-      finalState: !operation.output.plannedChange || dryRun || applicationStatus === 'no_change' || applicationStatus === 'not_applied'
-        ? 'unchanged' as const
-        : applicationStatus === 'uncertain'
-          ? 'uncertain' as const
-          : 'changed' as const
+      finalState:
+        !operation.output.plannedChange ||
+        dryRun ||
+        applicationStatus === 'no_change' ||
+        applicationStatus === 'not_applied'
+          ? ('unchanged' as const)
+          : applicationStatus === 'uncertain'
+            ? ('uncertain' as const)
+            : ('changed' as const)
     })),
     changedPaths,
     wouldChangePaths,
@@ -139,21 +216,54 @@ export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, c
   };
   return {
     kind: 'result',
-    ok: applicationStatus === 'dry_run' || applicationStatus === 'no_change' || applicationStatus === 'applied',
-    summary: applicationStatus === 'dry_run' || applicationStatus === 'no_change' || transactionOutcome === 'committed'
-      ? summarizePatchOutput(output)
-      : transactionOutcome === 'committed_with_residue'
-        ? transactionFailureMessage(transaction as Extract<TextTransactionResult, { outcome: 'committed_with_residue' }>)
-        : transactionOutcome === 'rolled_back'
-          ? 'Patch transaction was rolled back; no requested file changes remain.'
-          : 'Patch rollback failed; rooted file state is uncertain for: ' + (wouldChangePaths.join(', ') || 'unknown paths') + '.',
+    execution: { state: applicationStatus === 'uncertain' ? 'unknown' : 'settled' },
+    summary:
+      applicationStatus === 'dry_run' ||
+      applicationStatus === 'no_change' ||
+      transactionOutcome === 'committed'
+        ? summarizePatchOutput(output)
+        : transactionOutcome === 'committed_with_residue'
+          ? transactionFailureMessage(
+              transaction as Extract<TextTransactionResult, { outcome: 'committed_with_residue' }>
+            )
+          : transactionOutcome === 'rolled_back'
+            ? 'Patch transaction was rolled back; no requested file changes remain.'
+            : 'Patch rollback failed; rooted file state is uncertain for: ' +
+              (wouldChangePaths.join(', ') || 'unknown paths') +
+              '.',
     scope: {
-      resources: transactionOutcome === 'committed_with_residue'
-        ? [...uniquePaths(planned.flatMap((operation) => operation.changedPaths)).map((item) => fileScope(item)), PATCH_JOURNAL_SCOPE]
-        : uniquePaths(planned.flatMap((operation) => operation.changedPaths)).map((item) => fileScope(item)),
-      coverage: transactionOutcome === 'committed_with_residue' || applicationStatus === 'uncertain' ? 'partial' : 'complete',
-      ...(transactionOutcome === 'committed_with_residue' ? { causes: ['journal_residue'], omitted: { cleanup: transaction?.outcome === 'committed_with_residue' ? transaction.cleanup.strandedPaths.length : 0 } } : {}),
-      ...(applicationStatus === 'uncertain' ? { causes: ['rooted_file_state_uncertain'], omitted: { potentiallyAffectedPaths: wouldChangePaths.length } } : {})
+      resources:
+        transactionOutcome === 'committed_with_residue'
+          ? [
+              ...uniquePaths(planned.flatMap((operation) => operation.changedPaths)).map((item) =>
+                fileScope(item)
+              ),
+              PATCH_JOURNAL_SCOPE
+            ]
+          : uniquePaths(planned.flatMap((operation) => operation.changedPaths)).map((item) =>
+              fileScope(item)
+            ),
+      coverage:
+        transactionOutcome === 'committed_with_residue' || applicationStatus === 'uncertain'
+          ? 'partial'
+          : 'complete',
+      ...(transactionOutcome === 'committed_with_residue'
+        ? {
+            causes: ['journal_residue'],
+            omitted: {
+              cleanup:
+                transaction?.outcome === 'committed_with_residue'
+                  ? transaction.cleanup.strandedPaths.length
+                  : 0
+            }
+          }
+        : {}),
+      ...(applicationStatus === 'uncertain'
+        ? {
+            causes: ['rooted_file_state_uncertain'],
+            omitted: { potentiallyAffectedPaths: wouldChangePaths.length }
+          }
+        : {})
     },
     output,
     observedFacts: { items: patchObservedFacts(output) },
@@ -162,7 +272,10 @@ export async function applyPatchWithAuthority(input: CanonicalApplyPatchInput, c
 }
 
 /** Builds the one transaction plan used by both dry-run and commit execution. */
-export async function planPatch(root: RootedFileAuthority, input: CanonicalApplyPatchInput): Promise<{
+export async function planPatch(
+  root: RootedFileAuthority,
+  input: CanonicalApplyPatchInput
+): Promise<{
   readonly planned: PlannedPatchOperation[];
   readonly failures: ApplyPatchFailure[];
 }> {
@@ -184,37 +297,57 @@ function patchTransactionId(context: ToolExecutionContext): string | undefined {
     : undefined;
 }
 
-function emitCheckpoint(context: ToolExecutionContext, progress: import('@agent-core/tools').ToolProgress): Promise<void> {
-  return Promise.resolve(context.persistProgressCheckpoint ? context.persistProgressCheckpoint(progress) : context.emitProgress?.(progress));
+function emitCheckpoint(
+  context: ToolExecutionContext,
+  progress: import('@agent-core/tools').ToolProgress
+): Promise<void> {
+  return Promise.resolve(
+    context.persistProgressCheckpoint
+      ? context.persistProgressCheckpoint(progress)
+      : context.emitProgress?.(progress)
+  );
 }
 
-function transactionRecovery(result: Exclude<TextTransactionResult, { outcome: 'committed' }>): 'succeeded' | 'failed' | 'uncertain' {
-  return result.outcome === 'committed_with_residue' ? result.cleanup.status : result.rollback.status;
+function transactionRecovery(
+  result: Exclude<TextTransactionResult, { outcome: 'committed' }>
+): 'succeeded' | 'failed' | 'uncertain' {
+  return result.outcome === 'committed_with_residue'
+    ? result.cleanup.status
+    : result.rollback.status;
 }
-function transactionFailureMessage(result: Exclude<TextTransactionResult, { outcome: 'committed' }>): string {
-  if (result.outcome === 'committed_with_residue') return `Patch contents were committed, but cleanup ${result.cleanup.status}; residue may remain at: ${result.cleanup.strandedPaths.join(', ') || 'unknown paths'}.`;
+function transactionFailureMessage(
+  result: Exclude<TextTransactionResult, { outcome: 'committed' }>
+): string {
+  if (result.outcome === 'committed_with_residue')
+    return `Patch contents were committed, but cleanup ${result.cleanup.status}; residue may remain at: ${result.cleanup.strandedPaths.join(', ') || 'unknown paths'}.`;
   return `Patch commit failed and rollback ${result.rollback.status}: ${result.failure.message}`;
 }
 
 function patchObservedFacts(output: ApplyPatchOutput): ToolResultFact[] {
-  if (output.applicationStatus === 'not_applied' || output.applicationStatus === 'no_change') return [];
+  if (output.applicationStatus === 'not_applied' || output.applicationStatus === 'no_change')
+    return [];
   return output.files
     .filter((file) => file.plannedChange)
     .map((file) => {
       const action = observationActionForPatch(file.operation);
-      const resources = [rootedFileResource(file.path, {
-        ...(file.newSha256 ? { sha256: file.newSha256 } : {}),
-        mediaType: 'text/plain'
-      })];
-      if (file.destinationPath && file.destinationPath !== file.path) {
-        resources.push(rootedFileResource(file.destinationPath, {
+      const resources = [
+        rootedFileResource(file.path, {
           ...(file.newSha256 ? { sha256: file.newSha256 } : {}),
           mediaType: 'text/plain'
-        }));
+        })
+      ];
+      if (file.destinationPath && file.destinationPath !== file.path) {
+        resources.push(
+          rootedFileResource(file.destinationPath, {
+            ...(file.newSha256 ? { sha256: file.newSha256 } : {}),
+            mediaType: 'text/plain'
+          })
+        );
       }
       return {
         action,
-        outcome: output.applicationStatus === 'uncertain' ? 'failure' as const : 'success' as const,
+        outcome:
+          output.applicationStatus === 'uncertain' ? ('failure' as const) : ('success' as const),
         resources,
         scope: {
           limits: {
@@ -226,14 +359,17 @@ function patchObservedFacts(output: ApplyPatchOutput): ToolResultFact[] {
             deletions: file.deletions
           },
           truncated: false,
-          actuality: output.dryRun || output.applicationStatus === 'uncertain' ? 'predicted' : 'observed'
+          actuality:
+            output.dryRun || output.applicationStatus === 'uncertain' ? 'predicted' : 'observed'
         },
         summary: `${output.dryRun ? 'Would ' : ''}${action} ${file.destinationPath ?? file.path}.`
       };
     });
 }
 
-function observationActionForPatch(operation: ApplyPatchFileOutput['operation']): ObservationAction {
+function observationActionForPatch(
+  operation: ApplyPatchFileOutput['operation']
+): ObservationAction {
   if (operation === 'add') return 'create';
   if (operation === 'delete') return 'delete';
   if (operation === 'move') return 'move';
@@ -246,11 +382,17 @@ async function planOperation(
   input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
 ): Promise<
-  | { ok: true; operation: PlannedPatchOperation }
-  | { ok: false; failure: ApplyPatchFailure }
+  { ok: true; operation: PlannedPatchOperation } | { ok: false; failure: ApplyPatchFailure }
 > {
   if (operation.kind === 'add') {
-    return planAdd(root, operation.path, operation.content, operation.additions, input, reservedPaths);
+    return planAdd(
+      root,
+      operation.path,
+      operation.content,
+      operation.additions,
+      input,
+      reservedPaths
+    );
   }
   if (operation.kind === 'delete') {
     return planDelete(root, operation.path, input, reservedPaths);
@@ -266,8 +408,7 @@ async function planAdd(
   input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
 ): Promise<
-  | { ok: true; operation: PlannedPatchOperation }
-  | { ok: false; failure: ApplyPatchFailure }
+  { ok: true; operation: PlannedPatchOperation } | { ok: false; failure: ApplyPatchFailure }
 > {
   const target = await inspectNewTarget(root, requestedPath, 'already_exists');
   if (!target.ok) {
@@ -298,7 +439,8 @@ async function planAdd(
         operation: 'add',
         reason: 'binary',
         message: `Refusing probable binary content for text file: ${target.path}`,
-        nextAction: 'Use apply_patch only for text files; use a different mechanism for binary content.'
+        nextAction:
+          'Use apply_patch only for text files; use a different mechanism for binary content.'
       }
     };
   }
@@ -336,19 +478,32 @@ async function planDelete(
   input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
 ): Promise<
-  | { ok: true; operation: PlannedPatchOperation }
-  | { ok: false; failure: ApplyPatchFailure }
+  { ok: true; operation: PlannedPatchOperation } | { ok: false; failure: ApplyPatchFailure }
 > {
   const inspected = await inspectTextFile(root, requestedPath, input.limits.maxFileBytes);
   if (!inspected.ok) {
-    return { ok: false, failure: textFileFailure(inspected.failure.path, inspected.failure.reason, inspected.failure.message, 'delete') };
+    return {
+      ok: false,
+      failure: textFileFailure(
+        inspected.failure.path,
+        inspected.failure.reason,
+        inspected.failure.message,
+        'delete'
+      )
+    };
   }
   const duplicate = reservePath(reservedPaths, inspected.file.path);
   if (duplicate) {
     return { ok: false, failure: withFailureContext(duplicate, 'delete') };
   }
   const oldSha256 = inspected.file.sha256;
-  const shaFailure = validateExpectedSha(input, requestedPath, inspected.file.path, oldSha256, 'delete');
+  const shaFailure = validateExpectedSha(
+    input,
+    requestedPath,
+    inspected.file.path,
+    oldSha256,
+    'delete'
+  );
   if (shaFailure) {
     return { ok: false, failure: shaFailure };
   }
@@ -386,20 +541,36 @@ async function planUpdate(
   input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
 ): Promise<
-  | { ok: true; operation: PlannedPatchOperation }
-  | { ok: false; failure: ApplyPatchFailure }
+  { ok: true; operation: PlannedPatchOperation } | { ok: false; failure: ApplyPatchFailure }
 > {
   const inspected = await inspectTextFile(root, operation.path, input.limits.maxFileBytes);
   if (!inspected.ok) {
-    return { ok: false, failure: textFileFailure(inspected.failure.path, inspected.failure.reason, inspected.failure.message, 'update') };
+    return {
+      ok: false,
+      failure: textFileFailure(
+        inspected.failure.path,
+        inspected.failure.reason,
+        inspected.failure.message,
+        'update'
+      )
+    };
   }
   const sourceDuplicate = reservePath(reservedPaths, inspected.file.path);
   if (sourceDuplicate) {
-    return { ok: false, failure: withFailureContext(sourceDuplicate, operation.moveTo ? 'move' : 'update') };
+    return {
+      ok: false,
+      failure: withFailureContext(sourceDuplicate, operation.moveTo ? 'move' : 'update')
+    };
   }
 
   const oldSha256 = inspected.file.sha256;
-  const shaFailure = validateExpectedSha(input, operation.path, inspected.file.path, oldSha256, operation.moveTo ? 'move' : 'update');
+  const shaFailure = validateExpectedSha(
+    input,
+    operation.path,
+    inspected.file.path,
+    oldSha256,
+    operation.moveTo ? 'move' : 'update'
+  );
   if (shaFailure) {
     return { ok: false, failure: shaFailure };
   }
@@ -408,7 +579,14 @@ async function planUpdate(
   try {
     patched = applyPatchUpdate(inspected.file.content, operation);
   } catch (error) {
-    return { ok: false, failure: patchFailureFromError(inspected.file.path, error, operation.moveTo ? 'move' : 'update') };
+    return {
+      ok: false,
+      failure: patchFailureFromError(
+        inspected.file.path,
+        error,
+        operation.moveTo ? 'move' : 'update'
+      )
+    };
   }
 
   const newBytes = byteLengthUtf8(patched.content);
@@ -490,16 +668,18 @@ async function planUpdate(
         matchModes: patched.matchModes,
         exact: patched.exact
       },
-      ...(patched.changed ? {
-        write: {
-          path: inspected.file.path,
-          content: patched.content,
-          mode: inspected.file.mode,
-          overwrite: true,
-          expectedCurrentSha256: oldSha256,
-          expectedCurrentIdentity: inspected.file.identity
-        }
-      } : {}),
+      ...(patched.changed
+        ? {
+            write: {
+              path: inspected.file.path,
+              content: patched.content,
+              mode: inspected.file.mode,
+              overwrite: true,
+              expectedCurrentSha256: oldSha256,
+              expectedCurrentIdentity: inspected.file.identity
+            }
+          }
+        : {}),
       parentDirsToCreate: [],
       changedPaths: patched.changed ? [inspected.file.path] : []
     }
@@ -519,23 +699,37 @@ async function inspectNewTarget(
     normalizedPath = root.canonicalPath(requestedPath);
   } catch (error) {
     if (error instanceof ToolInputError) {
-      return { ok: false, failure: { path: requestedPath, reason: 'path_outside_root', message: error.message } };
+      return {
+        ok: false,
+        failure: { path: requestedPath, reason: 'path_outside_root', message: error.message }
+      };
     }
     throw error;
   }
   try {
     const status = await root.inspectPath(normalizedPath);
     if (status.kind === 'symlink') {
-      return { ok: false, failure: { path: normalizedPath, reason: 'symlink', message: `Refusing to write through symlink path: ${requestedPath}` } };
+      return {
+        ok: false,
+        failure: {
+          path: normalizedPath,
+          reason: 'symlink',
+          message: `Refusing to write through symlink path: ${requestedPath}`
+        }
+      };
     }
-    if (status.kind !== 'absent') return {
-      ok: false,
-      failure: {
-        path: normalizedPath,
-        reason: existsReason,
-        message: existsReason === 'already_exists' ? `File already exists: ${requestedPath}` : `Destination already exists: ${requestedPath}`
-      }
-    };
+    if (status.kind !== 'absent')
+      return {
+        ok: false,
+        failure: {
+          path: normalizedPath,
+          reason: existsReason,
+          message:
+            existsReason === 'already_exists'
+              ? `File already exists: ${requestedPath}`
+              : `Destination already exists: ${requestedPath}`
+        }
+      };
     const parentDirsToCreate = await root.missingParentDirectories(normalizedPath);
     return {
       ok: true,
@@ -543,7 +737,14 @@ async function inspectNewTarget(
       parentDirsToCreate
     };
   } catch (error) {
-    return { ok: false, failure: { path: normalizedPath, reason: 'parent_not_directory', message: error instanceof Error ? error.message : String(error) } };
+    return {
+      ok: false,
+      failure: {
+        path: normalizedPath,
+        reason: 'parent_not_directory',
+        message: error instanceof Error ? error.message : String(error)
+      }
+    };
   }
 }
 
@@ -559,56 +760,82 @@ function reservePath(paths: Set<string>, displayPath: string): ApplyPatchFailure
   return undefined;
 }
 
-function validateExpectedSha(input: CanonicalApplyPatchInput, requestedPath: string, displayPath: string, actualSha256: string, operation: ApplyPatchOperation): ApplyPatchFailure | undefined {
-  const expected = input.expectedOldSha256?.[requestedPath] ?? input.expectedOldSha256?.[displayPath];
+function validateExpectedSha(
+  input: CanonicalApplyPatchInput,
+  requestedPath: string,
+  displayPath: string,
+  actualSha256: string,
+  operation: ApplyPatchOperation
+): ApplyPatchFailure | undefined {
+  const expected =
+    input.expectedOldSha256?.[requestedPath] ?? input.expectedOldSha256?.[displayPath];
   if (expected && expected !== actualSha256) {
     return {
       path: displayPath,
       operation,
       reason: 'sha256_mismatch',
       message: `Expected SHA-256 did not match current file content for ${displayPath}.`,
-      nextAction: 'Read the current file, refresh expectedOldSha256, and rebuild the patch against the current content.'
+      nextAction:
+        'Read the current file, refresh expectedOldSha256, and rebuild the patch against the current content.'
     };
   }
   return undefined;
 }
 
-function textFileFailure(path: string, reason: ApplyPatchFailure['reason'], message: string, operation: ApplyPatchOperation): ApplyPatchFailure {
+function textFileFailure(
+  path: string,
+  reason: ApplyPatchFailure['reason'],
+  message: string,
+  operation: ApplyPatchOperation
+): ApplyPatchFailure {
   return withFailureContext({ path, reason, message }, operation);
 }
 
-export function patchFailureFromError(filePath: string, error: unknown, operation?: ApplyPatchOperation): ApplyPatchFailure {
+export function patchFailureFromError(
+  filePath: string,
+  error: unknown,
+  operation?: ApplyPatchOperation
+): ApplyPatchFailure {
   if (error instanceof PatchParseError) {
-    return withFailureContext({
-      path: error.path ?? filePath,
-      reason: 'patch_parse_error',
-      message: error.message,
-      ...(error.hunkIndex !== undefined ? { hunkIndex: error.hunkIndex } : {}),
-      ...(error.header ? { header: error.header } : {}),
-      ...(error.failingLine !== undefined ? { failingLine: error.failingLine } : {}),
-      ...(error.oldPreview ? { oldPreview: error.oldPreview } : {}),
-      nextAction: nextActionForParseError(error)
-    }, operation);
+    return withFailureContext(
+      {
+        path: error.path ?? filePath,
+        reason: 'patch_parse_error',
+        message: error.message,
+        ...(error.hunkIndex !== undefined ? { hunkIndex: error.hunkIndex } : {}),
+        ...(error.header ? { header: error.header } : {}),
+        ...(error.failingLine !== undefined ? { failingLine: error.failingLine } : {}),
+        ...(error.oldPreview ? { oldPreview: error.oldPreview } : {}),
+        nextAction: nextActionForParseError(error)
+      },
+      operation
+    );
   }
   if (error instanceof PatchApplyError) {
-    return withFailureContext({
-      path: filePath,
-      reason: error.reason,
-      message: error.message,
-      hunkIndex: error.hunkIndex,
-      ...(error.header ? { header: error.header } : {}),
-      ...(error.failingLine ? { failingLine: error.failingLine } : {}),
-      oldPreview: error.oldPreview,
-      ...(error.matchCount !== undefined ? { matchCount: error.matchCount } : {}),
-      ...(error.candidateLines ? { candidateLines: error.candidateLines } : {}),
-      ...(error.possiblyAlreadyApplied ? { possiblyAlreadyApplied: true } : {})
-    }, operation);
+    return withFailureContext(
+      {
+        path: filePath,
+        reason: error.reason,
+        message: error.message,
+        hunkIndex: error.hunkIndex,
+        ...(error.header ? { header: error.header } : {}),
+        ...(error.failingLine ? { failingLine: error.failingLine } : {}),
+        oldPreview: error.oldPreview,
+        ...(error.matchCount !== undefined ? { matchCount: error.matchCount } : {}),
+        ...(error.candidateLines ? { candidateLines: error.candidateLines } : {}),
+        ...(error.possiblyAlreadyApplied ? { possiblyAlreadyApplied: true } : {})
+      },
+      operation
+    );
   }
-  return withFailureContext({
-    path: filePath,
-    reason: 'patch_parse_error',
-    message: error instanceof Error ? error.message : String(error)
-  }, operation);
+  return withFailureContext(
+    {
+      path: filePath,
+      reason: 'patch_parse_error',
+      message: error instanceof Error ? error.message : String(error)
+    },
+    operation
+  );
 }
 
 function nextActionForParseError(error: PatchParseError): string {
@@ -639,11 +866,19 @@ function nextActionForParseError(error: PatchParseError): string {
   return 'Rewrite the patch using the supported *** Begin Patch wrapper and valid operation/hunk lines.';
 }
 
-function withFailureContext(failure: ApplyPatchFailure, operation: ApplyPatchOperation | undefined): ApplyPatchFailure {
+function withFailureContext(
+  failure: ApplyPatchFailure,
+  operation: ApplyPatchOperation | undefined
+): ApplyPatchFailure {
   return {
     ...failure,
     ...(operation && !failure.operation ? { operation } : {}),
-    nextAction: failure.nextAction ?? nextActionForFailure({ ...failure, ...(operation && !failure.operation ? { operation } : {}) })
+    nextAction:
+      failure.nextAction ??
+      nextActionForFailure({
+        ...failure,
+        ...(operation && !failure.operation ? { operation } : {})
+      })
   };
 }
 
@@ -686,18 +921,35 @@ function summarizePatchFailures(failures: ApplyPatchFailure[]): string {
     first.operation ? `operation=${first.operation}` : '',
     first.path ? `path=${first.path}` : '',
     first.hunkIndex !== undefined ? `hunk=${String(first.hunkIndex + 1)}` : ''
-  ].filter((item) => item.length > 0).join(', ');
+  ]
+    .filter((item) => item.length > 0)
+    .join(', ');
   return [
     'Patch validation failed. No files were written.',
     `${first.reason}${location ? ` (${location})` : ''}: ${first.message}`,
     first.nextAction ? `Next: ${first.nextAction}` : ''
-  ].filter((item) => item.length > 0).join(' ');
+  ]
+    .filter((item) => item.length > 0)
+    .join(' ');
 }
 
 function summarizePatchOutput(output: ApplyPatchOutput): string {
-  const verb = output.applicationStatus === 'dry_run' ? 'Validated' : output.applicationStatus === 'no_change' ? 'Completed' : 'Applied';
-  const changed = output.applicationStatus === 'dry_run' ? output.wouldChangePaths.length : output.changedPaths.length;
-  const outcome = output.applicationStatus === 'dry_run' ? 'would change' : output.applicationStatus === 'no_change' ? 'changed' : 'changed';
+  const verb =
+    output.applicationStatus === 'dry_run'
+      ? 'Validated'
+      : output.applicationStatus === 'no_change'
+        ? 'Completed'
+        : 'Applied';
+  const changed =
+    output.applicationStatus === 'dry_run'
+      ? output.wouldChangePaths.length
+      : output.changedPaths.length;
+  const outcome =
+    output.applicationStatus === 'dry_run'
+      ? 'would change'
+      : output.applicationStatus === 'no_change'
+        ? 'changed'
+        : 'changed';
   return `${verb} ${String(output.totalOperationCount)} patch operation${output.totalOperationCount === 1 ? '' : 's'}; ${String(changed)} path${changed === 1 ? '' : 's'} ${outcome}.`;
 }
 

@@ -1,10 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
-import { hashJson, InMemoryEventRepository } from '@agent-core/persistence';
+import {
+  hashJson,
+  InMemoryEventRepository,
+  InMemoryArtifactRepository
+} from '@agent-core/persistence';
 import {
   AgentRunConflictError,
   AgentRunCoordinator,
+  AgentRunRecords,
+  storedToolObservation,
   agentEventCodec,
   createAgentRunStateTransition,
   decodeAgentRunState,
@@ -30,13 +36,18 @@ const sourceFor = (calls) => {
   const entries = [{ name: 'read', implementationId: 'read-v1', definitionHash: 'b'.repeat(64) }];
   return {
     source: { responseId: 'response-1', catalog: { revision: hashJson(entries), entries } },
-    modelCalls: calls.map((call) => ({ id: call.id, name: call.name, type: 'function', input: call.input }))
+    modelCalls: calls.map((call) => ({
+      id: call.id,
+      name: call.name,
+      type: 'function',
+      input: call.input
+    }))
   };
 };
 
 test('run acceptance is durable and inspection is read-only', async () => {
   const events = new InMemoryEventRepository(agentEventCodec);
-  const runs = new AgentRunCoordinator(events);
+  const runs = new AgentRunCoordinator(events, new InMemoryArtifactRepository());
   const accepted = await runs.accept(acceptance());
   assert.equal(accepted.state.phase.kind, 'accepted');
   assert.deepEqual(accepted.instruction, { kind: 'wait', reason: 'driver' });
@@ -49,7 +60,7 @@ test('run acceptance is durable and inspection is read-only', async () => {
 
 test('driver attachment fences a live stale owner and all writes retain one tail authority', async () => {
   const events = new InMemoryEventRepository(agentEventCodec);
-  const runs = new AgentRunCoordinator(events);
+  const runs = new AgentRunCoordinator(events, new InMemoryArtifactRepository());
   await runs.accept(acceptance('fenced'));
   const first = await runs.attach('fenced', 'driver-one');
   await first.append({ type: 'input.received', task: 'Perform a bounded task.' }, 'fenced:input');
@@ -83,7 +94,7 @@ test('driver attachment fences a live stale owner and all writes retain one tail
 
 test('a stale live owner may settle only its exact started tool effect permit', async () => {
   const events = new InMemoryEventRepository(agentEventCodec);
-  const runs = new AgentRunCoordinator(events);
+  const runs = new AgentRunCoordinator(events, new InMemoryArtifactRepository());
   await runs.accept(acceptance('effect-settlement'));
   const staleOwner = await runs.attach('effect-settlement', 'driver-one');
   const call = createToolCall({ id: 'call-1', name: 'read', input: { kind: 'json', value: {} } });
@@ -153,13 +164,20 @@ test('a stale live owner may settle only its exact started tool effect permit', 
       reasoningTokens: 0,
       knownCosts: {},
       pricingStatus: 'known',
-      unknownPricedTokens: 0,
+      unknownPricedTokens: 0
     }
   });
   const tail = await events.tail('effect-settlement');
   const installed = await events.appendConditional(
     'effect-settlement',
-    { type: 'run.state.transitioned', transition: createAgentRunStateTransition(staleOwner.state(), pending) },
+    {
+      type: 'run.state.transitioned',
+      transition: await createAgentRunStateTransition(
+        staleOwner.state(),
+        pending,
+        new AgentRunRecords(runs.artifacts)
+      )
+    },
     {
       idempotencyKey: 'effect-settlement:pending',
       expectedTail: tail,
@@ -173,13 +191,19 @@ test('a stale live owner may settle only its exact started tool effect permit', 
     { outputSchema: z.strictObject({ value: z.string() }) },
     {
       kind: 'result',
-      ok: true,
+
       output: { value: 'settled' },
       summary: 'read completed',
       scope: { resources: ['memory'], coverage: 'complete' }
     }
   );
-  const settlement = { observationId: 'observation-1', observation, createdAt: new Date(0).toISOString() };
+  const settlement = {
+    observationId: 'observation-1',
+    observation,
+    original: storedToolObservation(observation),
+    modelContent: [],
+    createdAt: new Date(0).toISOString()
+  };
 
   await assert.rejects(
     runs.settleToolEffect('effect-settlement', {
@@ -189,7 +213,11 @@ test('a stale live owner may settle only its exact started tool effect permit', 
     }),
     /settlement authority was rejected/u
   );
-  const settled = await runs.settleToolEffect('effect-settlement', { effectId, permit, settlement });
+  const settled = await runs.settleToolEffect('effect-settlement', {
+    effectId,
+    permit,
+    settlement
+  });
   assert.equal(settled.state.phase.kind, 'active');
   assert.equal(settled.state.toolBatches[0].callStates[0].stage, 'settled');
   const synchronized = await staleOwner.synchronize();
@@ -209,7 +237,7 @@ test('every completion permutation survives takeover and records each settled ca
   for (const [permutationIndex, permutation] of permutations.entries()) {
     const runId = `parallel-permutation-${String(permutationIndex)}`;
     const events = new InMemoryEventRepository(agentEventCodec);
-    const runs = new AgentRunCoordinator(events);
+    const runs = new AgentRunCoordinator(events, new InMemoryArtifactRepository());
     await runs.accept(acceptance(runId));
     const initial = await runs.attach(runId, 'driver-initial');
     const calls = [0, 1, 2].map((index) =>
@@ -290,12 +318,19 @@ test('every completion permutation survives takeover and records each settled ca
         reasoningTokens: 0,
         knownCosts: {},
         pricingStatus: 'known',
-        unknownPricedTokens: 0,
+        unknownPricedTokens: 0
       }
     });
     const installed = await events.appendConditional(
       runId,
-      { type: 'run.state.transitioned', transition: createAgentRunStateTransition(initial.state(), pending) },
+      {
+        type: 'run.state.transitioned',
+        transition: await createAgentRunStateTransition(
+          initial.state(),
+          pending,
+          new AgentRunRecords(runs.artifacts)
+        )
+      },
       {
         idempotencyKey: `${runId}:pending`,
         expectedTail: await events.tail(runId),
@@ -305,20 +340,26 @@ test('every completion permutation survives takeover and records each settled ca
     assert.equal(installed.kind, 'committed');
 
     let driver = initial;
-    const settlements = calls.map((_call, index) => ({
-      observationId: `observation-${String(index)}`,
-      observation: parseToolObservation(
-        { outputSchema: z.strictObject({ index: z.int() }) },
-        {
-          kind: 'result',
-          ok: true,
-          output: { index },
-          summary: `settled ${String(index)}`,
-          scope: { resources: [`memory/${String(index)}`], coverage: 'complete' }
-        }
-      ),
-      createdAt: new Date(index).toISOString()
-    }));
+    const settlements = calls
+      .map((_call, index) => ({
+        observationId: `observation-${String(index)}`,
+        observation: parseToolObservation(
+          { outputSchema: z.strictObject({ index: z.int() }) },
+          {
+            kind: 'result',
+
+            output: { index },
+            summary: `settled ${String(index)}`,
+            scope: { resources: [`memory/${String(index)}`], coverage: 'complete' }
+          }
+        ),
+        createdAt: new Date(index).toISOString()
+      }))
+      .map((record) => ({
+        ...record,
+        original: storedToolObservation(record.observation),
+        modelContent: []
+      }));
     for (const [completionIndex, callIndex] of permutation.entries()) {
       const effect = effects[callIndex];
       const settlement = settlements[callIndex];
@@ -376,7 +417,7 @@ test('every completion permutation survives takeover and records each settled ca
 
 test('abort retries a lost tail race and becomes the durable control state', async () => {
   const events = new InMemoryEventRepository(agentEventCodec);
-  const runs = new AgentRunCoordinator(events);
+  const runs = new AgentRunCoordinator(events, new InMemoryArtifactRepository());
   await runs.accept(acceptance('abort-race'));
   const driver = await runs.attach('abort-race', 'driver');
   const results = await Promise.allSettled([
@@ -406,18 +447,27 @@ test('total run states select one explicit procedure, wait, or completion', () =
     driverGeneration: 1,
     control: { status: 'owned', driverId: 'driver' }
   });
-  assert.deepEqual(nextAgentRunInstruction(owned), { kind: 'execute', procedure: 'initialize_run' });
+  assert.deepEqual(nextAgentRunInstruction(owned), {
+    kind: 'execute',
+    procedure: 'initialize_run'
+  });
   const suspended = decodeAgentRunState({
     ...owned,
     revision: 2,
     phase: { kind: 'suspended', reason: 'tool_outcome_unknown', effectId: 'effect-1' }
   });
-  assert.deepEqual(nextAgentRunInstruction(suspended), { kind: 'wait', reason: 'external_outcome' });
+  assert.deepEqual(nextAgentRunInstruction(suspended), {
+    kind: 'wait',
+    reason: 'external_outcome'
+  });
   const terminal = decodeAgentRunState({
     ...owned,
     revision: 3,
     phase: { kind: 'terminal', resultEventId: 'event-terminal' }
   });
   assert.deepEqual(nextAgentRunInstruction(terminal), { kind: 'complete' });
-  assert.throws(() => decodeAgentRunState({ ...owned, phase: { kind: 'not-real' } }), /phase.kind/u);
+  assert.throws(
+    () => decodeAgentRunState({ ...owned, phase: { kind: 'not-real' } }),
+    /phase.kind/u
+  );
 });

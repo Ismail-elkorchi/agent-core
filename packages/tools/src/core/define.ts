@@ -1,12 +1,26 @@
+import type { ToolContent } from './definition.js';
 import * as z from 'zod';
 import { parseJsonObject, parseJsonValue, type JsonValue } from '@agent-core/json';
 import type { ToolCanonicalizationContext, ToolExecutionContext } from './context.js';
-import type { ToolExecutionBinding, ToolDefinition, ToolEffectRecoveryResult, ToolInput, ToolObservationInput, ToolPromptGuide, ToolRequirements, ToolTextInputDefinition } from './definition.js';
+import type {
+  ToolExecutionBinding,
+  ToolDefinition,
+  ToolEffectRecoveryResult,
+  ToolInput,
+  ToolObservationInput,
+  ToolPromptGuide,
+  ToolRequirements,
+  ToolTextInputDefinition
+} from './definition.js';
 import type { EffectExecutionState } from '@agent-core/effects';
-import type { ToolObservationPresentation, ToolObservationPresentationRequest } from './observation-presentation.js';
+import type { ToolModelContentRequest } from './model-content.js';
 import type { ToolPolicy } from './policy.js';
 import { invalidArgumentsObservation, invalidToolInputObservation } from './observation.js';
-import { validateToolEffectEnvelope, type ToolEffectEnvelope, type ToolEffects } from './authorization.js';
+import {
+  validateToolEffectEnvelope,
+  type ToolEffectEnvelope,
+  type ToolEffects
+} from './authorization.js';
 import { markCompiledTool, type CompiledToolDefinition } from './compiled.js';
 
 interface ToolOptions<Schema extends z.ZodType, TCanonicalInput, TOutput> {
@@ -21,24 +35,46 @@ interface ToolOptions<Schema extends z.ZodType, TCanonicalInput, TOutput> {
   };
   effectEnvelope: ToolEffectEnvelope;
   requirements?: ToolRequirements;
-  canonicalizeInput: (input: z.output<Schema>, context: ToolCanonicalizationContext) => TCanonicalInput | Promise<TCanonicalInput>;
+  canonicalizeInput: (
+    input: z.output<Schema>,
+    context: ToolCanonicalizationContext
+  ) => TCanonicalInput | Promise<TCanonicalInput>;
   snapshotInput?: (input: TCanonicalInput) => JsonValue;
-  deriveEffects: (input: TCanonicalInput, context: ToolCanonicalizationContext) => ToolEffects | Promise<ToolEffects>;
+  deriveEffects: (
+    input: TCanonicalInput,
+    context: ToolCanonicalizationContext
+  ) => ToolEffects | Promise<ToolEffects>;
   isAvailable?: (policy: ToolPolicy) => boolean;
-  presentObservation?: (request: ToolObservationPresentationRequest<TCanonicalInput, TOutput>) => ToolObservationPresentation;
+  buildModelContent?: (
+    request: ToolModelContentRequest<TCanonicalInput, TOutput>
+  ) => readonly ToolContent[];
 }
 
-export type DefineToolOptions<Schema extends z.ZodType, TCanonicalInput, TOutput> =
-  ToolOptions<Schema, TCanonicalInput, TOutput> & (
+export type DefineToolOptions<Schema extends z.ZodType, TCanonicalInput, TOutput> = ToolOptions<
+  Schema,
+  TCanonicalInput,
+  TOutput
+> &
+  (
     | {
-        bindExecution: (input: TCanonicalInput, context: ToolCanonicalizationContext) => ToolExecutionBinding<TOutput> | Promise<ToolExecutionBinding<TOutput>>;
+        bindExecution: (
+          input: TCanonicalInput,
+          context: ToolCanonicalizationContext
+        ) => ToolExecutionBinding<TOutput> | Promise<ToolExecutionBinding<TOutput>>;
         invoke?: never;
         recover?: never;
       }
     | {
         bindExecution?: never;
-        invoke: (input: TCanonicalInput, context: ToolExecutionContext) => Promise<ToolObservationInput<TOutput>>;
-        recover?: (input: TCanonicalInput, effect: Extract<EffectExecutionState, { readonly phase: 'started' }>, context: ToolExecutionContext) => ToolEffectRecoveryResult<TOutput> | Promise<ToolEffectRecoveryResult<TOutput>>;
+        invoke: (
+          input: TCanonicalInput,
+          context: ToolExecutionContext
+        ) => Promise<ToolObservationInput<TOutput>>;
+        recover?: (
+          input: TCanonicalInput,
+          effect: Extract<EffectExecutionState, { readonly phase: 'started' }>,
+          context: ToolExecutionContext
+        ) => ToolEffectRecoveryResult<TOutput> | Promise<ToolEffectRecoveryResult<TOutput>>;
       }
   );
 
@@ -46,33 +82,52 @@ export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
   definition: DefineToolOptions<Schema, TCanonicalInput, TOutput>
 ): CompiledToolDefinition<z.output<Schema>, TCanonicalInput, TOutput> {
   const snapshotInput = definition.snapshotInput ?? ((input: TCanonicalInput) => input);
-  const requirements = definition.requirements ? Object.freeze({
-    ...(definition.requirements.services ? { services: Object.freeze([...definition.requirements.services]) } : {}),
-    ...(definition.requirements.modelInputModalities ? { modelInputModalities: Object.freeze([...definition.requirements.modelInputModalities]) } : {}),
-    ...(definition.requirements.hostCapabilities ? { hostCapabilities: Object.freeze([...definition.requirements.hostCapabilities]) } : {})
-  }) : undefined;
+  const requirements = definition.requirements
+    ? Object.freeze({
+        ...(definition.requirements.services
+          ? { services: Object.freeze([...definition.requirements.services]) }
+          : {}),
+        ...(definition.requirements.modelInputModalities
+          ? {
+              modelInputModalities: Object.freeze([...definition.requirements.modelInputModalities])
+            }
+          : {}),
+        ...(definition.requirements.hostCapabilities
+          ? { hostCapabilities: Object.freeze([...definition.requirements.hostCapabilities]) }
+          : {})
+      })
+    : undefined;
   const textInput: ToolTextInputDefinition<z.output<Schema>> | undefined = definition.textInput
     ? {
-      format: definition.textInput.format,
-      ...(definition.textInput.description ? { description: definition.textInput.description } : {}),
-      ...(definition.textInput.promptGuide ? { promptGuide: definition.textInput.promptGuide } : {}),
-      decode(text) {
-        return definition.schema.parse(definition.textInput?.decode(text));
+        format: definition.textInput.format,
+        ...(definition.textInput.description
+          ? { description: definition.textInput.description }
+          : {}),
+        ...(definition.textInput.promptGuide
+          ? { promptGuide: definition.textInput.promptGuide }
+          : {}),
+        decode(text) {
+          return definition.schema.parse(definition.textInput?.decode(text));
+        }
       }
-    }
     : undefined;
   const tool: ToolDefinition<z.output<Schema>, TCanonicalInput, TOutput> = {
     name: definition.name,
     implementationId: definition.implementationId,
     description: definition.description,
     ...(definition.promptGuide ? { promptGuide: definition.promptGuide } : {}),
-    jsonSchema: parseJsonObject(toToolJsonSchema(definition.schema), { maxDepth: 64, maxCollectionEntries: 50_000, maxStringBytes: 1_000_000, maxTotalBytes: 4_000_000 }),
+    jsonSchema: parseJsonObject(toToolJsonSchema(definition.schema), {
+      maxDepth: 64,
+      maxCollectionEntries: 50_000,
+      maxStringBytes: 1_000_000,
+      maxTotalBytes: 4_000_000
+    }),
     outputSchema: definition.outputSchema,
     ...(textInput ? { textInput } : {}),
     effectEnvelope: validateToolEffectEnvelope(definition.effectEnvelope),
     ...(requirements ? { requirements } : {}),
     ...(definition.isAvailable ? { isAvailable: definition.isAvailable } : {}),
-    ...(definition.presentObservation ? { presentObservation: definition.presentObservation } : {}),
+    ...(definition.buildModelContent ? { buildModelContent: definition.buildModelContent } : {}),
     decodeInput(input: ToolInput) {
       let candidate: unknown;
       if (input.kind === 'json') {
@@ -83,28 +138,45 @@ export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
         } catch (error) {
           return {
             ok: false,
-            observation: invalidToolInputObservation(definition.name, error instanceof Error ? error.message : String(error), {
-              inputKind: input.kind
-            })
+            observation: invalidToolInputObservation(
+              definition.name,
+              error instanceof Error ? error.message : String(error),
+              {
+                inputKind: input.kind
+              }
+            )
           };
         }
       } else {
         return {
           ok: false,
-          observation: invalidToolInputObservation(definition.name, 'This tool does not accept freeform text input.', {
-            inputKind: input.kind,
-            expectedInputKind: 'json'
-          })
+          observation: invalidToolInputObservation(
+            definition.name,
+            'This tool does not accept freeform text input.',
+            {
+              inputKind: input.kind,
+              expectedInputKind: 'json'
+            }
+          )
         };
       }
       const parsed = definition.schema.safeParse(candidate);
       if (!parsed.success) {
-        return { ok: false, observation: invalidArgumentsObservation(definition.name, parsed.error) };
+        return {
+          ok: false,
+          observation: invalidArgumentsObservation(definition.name, parsed.error)
+        };
       }
       return { ok: true, input: parsed.data };
     },
     canonicalizeInput: definition.canonicalizeInput,
-    snapshotInput: (input) => parseJsonValue(snapshotInput(input), { maxDepth: 32, maxCollectionEntries: 20_000, maxStringBytes: 4_000_000, maxTotalBytes: 8_000_000 }),
+    snapshotInput: (input) =>
+      parseJsonValue(snapshotInput(input), {
+        maxDepth: 32,
+        maxCollectionEntries: 20_000,
+        maxStringBytes: 4_000_000,
+        maxTotalBytes: 8_000_000
+      }),
     deriveEffects: definition.deriveEffects,
     bindExecution: (input, context) => {
       if (definition.bindExecution) return definition.bindExecution(input, context);
@@ -112,7 +184,14 @@ export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
       return {
         snapshot: tool.snapshotInput(input),
         invoke: (executionContext) => invoke(input, executionContext),
-        ...(recover ? { recover: (effect: Extract<EffectExecutionState, { readonly phase: 'started' }>, executionContext: ToolExecutionContext) => recover(input, effect, executionContext) } : {})
+        ...(recover
+          ? {
+              recover: (
+                effect: Extract<EffectExecutionState, { readonly phase: 'started' }>,
+                executionContext: ToolExecutionContext
+              ) => recover(input, effect, executionContext)
+            }
+          : {})
       };
     }
   };
@@ -121,7 +200,8 @@ export function defineTool<Schema extends z.ZodType, TCanonicalInput, TOutput>(
 
 function toToolJsonSchema(schema: z.ZodType): Record<string, unknown> {
   const normalized = normalizeJsonSchema(z.toJSONSchema(schema));
-  if (!isJsonObject(normalized)) throw new Error('Tool schema conversion did not produce a JSON object.');
+  if (!isJsonObject(normalized))
+    throw new Error('Tool schema conversion did not produce a JSON object.');
   const jsonSchema = normalized;
   delete jsonSchema.$schema;
   return jsonSchema;
@@ -134,7 +214,9 @@ function normalizeJsonSchema(value: unknown): unknown {
   if (!isJsonObject(value)) {
     return value;
   }
-  const normalized = Object.fromEntries(Object.entries(value).map(([key, item]) => [key, normalizeJsonSchema(item)]));
+  const normalized = Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [key, normalizeJsonSchema(item)])
+  );
   const properties = normalized.properties;
   if (isJsonObject(properties) && Array.isArray(normalized.required)) {
     const required = normalized.required.filter((item): item is string => {

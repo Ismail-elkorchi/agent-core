@@ -1,3 +1,6 @@
+import { InferenceService } from '@agent-core/runtime';
+import { JsonlInferenceRepository } from '@agent-core/runtime/node';
+import { LocalArtifactRepository } from '@agent-core/persistence/node';
 import { appendFile, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import * as z from 'zod';
@@ -8,7 +11,10 @@ import { adoptToolDefinition } from '@agent-core/tools';
 const WAIT_LIMIT_MS = 10_000;
 
 export function createLiveDriverRuntime({ root, mode, role, onCheckpoint = () => undefined }) {
-  const events = new JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
+  const events = new JsonlEventRepository({
+    rootDir: path.join(root, 'events'),
+    codec: agentEventCodec
+  });
   const provider = {
     id: 'live-driver-fixture',
     implementationId: 'agent-core.tests.live-driver-provider@1',
@@ -37,19 +43,30 @@ export function createLiveDriverRuntime({ root, mode, role, onCheckpoint = () =>
     async complete(request) {
       const hasToolResult = request.messages.some((message) => message.role === 'tool');
       return hasToolResult
-        ? { content: 'replacement completed', model: request.model, provider: this.id, terminationReason: 'stop' }
+        ? {
+            content: 'replacement completed',
+            model: request.model,
+            provider: this.id,
+            terminationReason: 'stop'
+          }
         : {
             content: '',
             model: request.model,
             provider: this.id,
             terminationReason: 'tool_calls',
-            toolCalls: [{ id: 'live-call', type: 'function', name: 'live_effect', input: { kind: 'json', value: {} } }]
+            toolCalls: [
+              {
+                id: 'live-call',
+                type: 'function',
+                name: 'live_effect',
+                input: { kind: 'json', value: {} }
+              }
+            ]
           };
     }
   };
   const observation = () => ({
     kind: 'result',
-    ok: true,
     output: { value: 'one external completion' },
     summary: 'one external completion',
     scope: { resources: ['fixture/external-effect'], coverage: 'complete' }
@@ -60,7 +77,10 @@ export function createLiveDriverRuntime({ root, mode, role, onCheckpoint = () =>
     description: 'A queryable effect controlled by a live-process test.',
     jsonSchema: { type: 'object', additionalProperties: false },
     outputSchema: z.strictObject({ value: z.string() }),
-    effectEnvelope: { accesses: [{ mode: 'write', scope: 'fixture/external-effect' }], lockScopes: ['fixture/external-effect'] },
+    effectEnvelope: {
+      accesses: [{ mode: 'write', scope: 'fixture/external-effect' }],
+      lockScopes: ['fixture/external-effect']
+    },
     decodeInput(input) {
       return input.kind === 'json' && Object.keys(input.value).length === 0
         ? { ok: true, input: {} }
@@ -90,17 +110,29 @@ export function createLiveDriverRuntime({ root, mode, role, onCheckpoint = () =>
       return {
         snapshot: input,
         async recover() {
-          const receipt = await readFile(path.join(root, 'external-receipt.json'), 'utf8').then(JSON.parse, () => undefined);
-          if (receipt?.value === 'one external completion') return { status: 'settled', observation: observation() };
-          const started = await readFile(path.join(root, 'external-started'), 'utf8').then(() => true, () => false);
+          const receipt = await readFile(path.join(root, 'external-receipt.json'), 'utf8').then(
+            JSON.parse,
+            () => undefined
+          );
+          if (receipt?.value === 'one external completion')
+            return { status: 'settled', observation: observation() };
+          const started = await readFile(path.join(root, 'external-started'), 'utf8').then(
+            () => true,
+            () => false
+          );
           return started ? { status: 'running' } : { status: 'not_found' };
         },
         async invoke() {
           await appendFile(path.join(root, 'external-invocations'), 'invoke\n');
           await writeFile(path.join(root, 'external-started'), 'started\n');
-          if (role === 'old' && mode === 'inside_effect') await checkpoint(root, mode, onCheckpoint);
-          await writeFile(path.join(root, 'external-receipt.json'), JSON.stringify({ value: 'one external completion' }));
-          if (role === 'old' && mode === 'after_completion') await checkpoint(root, mode, onCheckpoint);
+          if (role === 'old' && mode === 'inside_effect')
+            await checkpoint(root, mode, onCheckpoint);
+          await writeFile(
+            path.join(root, 'external-receipt.json'),
+            JSON.stringify({ value: 'one external completion' })
+          );
+          if (role === 'old' && mode === 'after_completion')
+            await checkpoint(root, mode, onCheckpoint);
           return observation();
         }
       };
@@ -113,7 +145,15 @@ export function createLiveDriverRuntime({ root, mode, role, onCheckpoint = () =>
       authorizationPolicyId: 'agent-core.tests.live-driver-policy@1',
       executionTargetId: root
     },
-    repositories: { events },
+    inferenceService: new InferenceService({
+      provider,
+      repository: new JsonlInferenceRepository({ rootDir: path.join(root, 'inference') }),
+      artifacts: new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts') })
+    }),
+    repositories: {
+      events,
+      artifacts: new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts') })
+    },
     tools: [tool],
     toolPolicy: { allowedRisks: ['read', 'write'] },
     toolAuthorizer: () => ({ decision: 'allow' })
@@ -126,7 +166,13 @@ async function checkpoint(root, mode, onCheckpoint) {
   const release = path.join(root, 'release-old');
   const deadline = Date.now() + WAIT_LIMIT_MS;
   while (Date.now() < deadline) {
-    if (await readFile(release, 'utf8').then(() => true, () => false)) return;
+    if (
+      await readFile(release, 'utf8').then(
+        () => true,
+        () => false
+      )
+    )
+      return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`Timed out waiting to release old driver at ${mode}.`);

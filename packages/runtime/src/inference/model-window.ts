@@ -30,14 +30,6 @@ export const DEFAULT_MODEL_WINDOW_IMAGE_LIMITS: ModelWindowImageLimits = Object.
   maxEstimatedTokens: 32_000
 });
 
-export interface ModelWindowReduction {
-  readonly itemId: string;
-  readonly kind: 'tool_result_reduced';
-  readonly beforeBytes: number;
-  readonly afterBytes: number;
-  readonly toolName?: string;
-}
-
 type ActiveWindowItem = ActiveMessageItem | ActiveToolResultItem;
 
 interface ActiveMessageItem {
@@ -55,7 +47,6 @@ interface ActiveToolResultItem {
   toolCallType: 'function' | 'custom';
   callId?: string;
   immediateMessage: ModelInputItem;
-  selectedMessage?: Extract<ModelInputItem, { readonly role: 'tool' }> | undefined;
 }
 
 export interface RecordModelOutputInput {
@@ -74,16 +65,10 @@ export interface RecordToolResultInput {
   immediateImages?: readonly ModelImage[];
 }
 
-export interface ModelWindowSnapshot {
-  readonly activeItems: number;
-  readonly compactedToolResults: number;
-}
-
 export class ModelWindow {
   private readonly estimator: RequestEstimator;
   private readonly activeItems: ActiveWindowItem[] = [];
   private readonly priorItems = new Map<string, ModelInputItem>();
-  private readonly pendingReductions: ModelWindowReduction[] = [];
   readonly imageLimits: ModelWindowImageLimits;
 
   constructor(
@@ -174,9 +159,11 @@ export class ModelWindow {
   }
 
   toolResult(callId: string): Extract<ModelInputItem, { readonly role: 'tool' }> | undefined {
-    const item = this.activeItems.find((item) => item.kind === 'tool_result' && item.callId === callId);
+    const item = this.activeItems.find(
+      (item) => item.kind === 'tool_result' && item.callId === callId
+    );
     if (item?.kind !== 'tool_result') return undefined;
-    const message = item.selectedMessage ?? item.immediateMessage;
+    const message = item.immediateMessage;
     return message.role === 'tool' ? message : undefined;
   }
 
@@ -223,56 +210,8 @@ export class ModelWindow {
     });
   }
 
-  /** Apply only representations admitted by the context service; chronology is not policy. */
-  selectToolResultPresentations(
-    selected: ReadonlyMap<string, Extract<ModelInputItem, { readonly role: 'tool' }>>
-  ): void {
-    for (const item of this.activeItems) {
-      if (item.kind !== 'tool_result') continue;
-      const before = item.selectedMessage ?? item.immediateMessage;
-      const selectedItem = item.callId === undefined ? undefined : selected.get(item.callId);
-      const owned = selectedItem === undefined ? undefined : parseModelInputItem(selectedItem);
-      if (
-        owned !== undefined &&
-        (owned.role !== 'tool' ||
-          owned.toolCallId !== item.callId ||
-          owned.toolCallType !== item.toolCallType)
-      )
-        throw new TypeError('Context representation changed the original tool-call binding.');
-      item.selectedMessage = owned;
-      const after = item.selectedMessage ?? item.immediateMessage;
-      if (messageBytes(after) < messageBytes(before))
-        this.pendingReductions.push(
-          createModelWindowReduction({
-            itemId: item.id,
-            kind: 'tool_result_reduced',
-            toolName: item.toolName,
-            beforeBytes: messageBytes(before),
-            afterBytes: messageBytes(after)
-          })
-        );
-    }
-  }
-
-  compactedToolResultCount(): number {
-    return this.activeItems.filter(
-      (item) => item.kind === 'tool_result' && item.selectedMessage !== undefined
-    ).length;
-  }
-
   itemCount(): number {
     return this.activeItems.length + this.priorItems.size;
-  }
-
-  consumeReductions(): readonly ModelWindowReduction[] {
-    return Object.freeze(this.pendingReductions.splice(0));
-  }
-
-  snapshot(): ModelWindowSnapshot {
-    return Object.freeze({
-      activeItems: this.activeItems.length + this.priorItems.size,
-      compactedToolResults: this.compactedToolResultCount()
-    });
   }
 
   private contextHistoryEntries(): WindowMessageEntry[] {
@@ -282,7 +221,7 @@ export class ModelWindow {
       }
       return {
         itemId: item.id,
-        message: item.selectedMessage ?? item.immediateMessage
+        message: item.immediateMessage
       };
     });
   }
@@ -322,7 +261,11 @@ function assertImagesAdmitted(
     throw new Error('context_admission_failed: selected images require an image-capable model.');
   const bytes = images.reduce((total, image) => total + imageByteLength(image), 0);
   const tokens = images.reduce((total, image) => total + estimator.estimateImage(image), 0);
-  if (images.length > limits.maxCount || bytes > limits.maxBytes || tokens > limits.maxEstimatedTokens)
+  if (
+    images.length > limits.maxCount ||
+    bytes > limits.maxBytes ||
+    tokens > limits.maxEstimatedTokens
+  )
     throw new Error(
       'context_admission_failed: selected images exceed the admitted count, byte or token limit.'
     );
@@ -398,10 +341,6 @@ function sameToolCall(left: ModelToolCall, right: ModelToolCall): boolean {
   return left.name === right.name && left.type === right.type;
 }
 
-function createModelWindowReduction(value: ModelWindowReduction): ModelWindowReduction {
-  return Object.freeze(value);
-}
-
 function toolResultMessage(input: RecordToolResultInput): ModelInputItem {
   return Object.freeze({
     role: 'tool',
@@ -434,8 +373,4 @@ function snapshotModelImage(image: ModelImage): ModelImage {
   return image.type === 'bytes'
     ? Object.freeze({ ...image, data: new Uint8Array(image.data) })
     : Object.freeze({ ...image });
-}
-
-function messageBytes(message: ModelInputItem): number {
-  return Buffer.byteLength(JSON.stringify(message), 'utf8');
 }

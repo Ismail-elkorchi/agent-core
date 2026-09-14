@@ -3,6 +3,11 @@ import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import {
+  assertEventReference,
+  eventRangeBounds,
+  type EventReference,
+  type EventRangeRequest,
+  type EventRangePage,
   PersistenceConflictError,
   PersistenceCorruptionError,
   type ConditionalEventAppendOptions,
@@ -18,6 +23,8 @@ import {
   jsonlCommittedBytes,
   jsonlStorageStamp,
   readJsonlLines,
+  readJsonlBytes,
+  sameJsonlStorageStamp,
   type JsonlLine,
   type JsonlStorageStamp
 } from './jsonl.js';
@@ -54,6 +61,9 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   private readonly quarantined = new Map<string, PersistenceCorruptionError>();
   private fullScans = 0;
   private incrementalRefreshes = 0;
+  private bodyBytesRead = 0;
+  private bodyRecordsRead = 0;
+  private indexedBytes = 0;
 
   constructor(options: JsonlEventRepositoryOptions<TEvent>) {
     this.rootDir = path.resolve(options.rootDir);
@@ -70,15 +80,26 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     fullScans: number;
     incrementalRefreshes: number;
     retainedTailRecords: number;
+    bodyBytesRead: number;
+    bodyRecordsRead: number;
+    indexedBytes: number;
   }> {
     return Object.freeze({
+      bodyBytesRead: this.bodyBytesRead,
+      bodyRecordsRead: this.bodyRecordsRead,
+      indexedBytes: this.indexedBytes,
       fullScans: this.fullScans,
       incrementalRefreshes: this.incrementalRefreshes,
-      retainedTailRecords: [...this.indexes.values()].filter((index) => index.tail !== undefined).length
+      retainedTailRecords: [...this.indexes.values()].filter((index) => index.tail !== undefined)
+        .length
     });
   }
 
-  append(runId: string, event: TEvent, options: EventAppendOptions = {}): Promise<EventAppendReceipt> {
+  append(
+    runId: string,
+    event: TEvent,
+    options: EventAppendOptions = {}
+  ): Promise<EventAppendReceipt> {
     return this.enqueue(runId, async () =>
       withPersistenceFileLock(
         this.filePath(runId),
@@ -181,7 +202,10 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
               ...(previous ? { previousHash: previous.hash } : {}),
               driverGeneration: options.driverGeneration
             });
-            const encodedEnvelope: EncodedEnvelope = Object.freeze({ ...base, hash: hashJson(base) });
+            const encodedEnvelope: EncodedEnvelope = Object.freeze({
+              ...base,
+              hash: hashJson(base)
+            });
             try {
               await assertOwned();
               await appendJsonlRecord(this.filePath(runId), encodedEnvelope);
@@ -200,7 +224,11 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
               });
             }
             const tail = tailFromEncoded(encodedEnvelope);
-            return Object.freeze({ kind: 'committed', receipt: receiptFromEncoded(encodedEnvelope), tail });
+            return Object.freeze({
+              kind: 'committed',
+              receipt: receiptFromEncoded(encodedEnvelope),
+              tail
+            });
           }
         );
       } catch (error) {
@@ -231,30 +259,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
         throw error;
       }
       if (index.tail === undefined) return undefined;
-      let latest: EncodedEnvelope | undefined;
-      for await (const line of readJsonlLines(this.filePath(runId), {
-        startOffset: index.tail.byteOffset,
-        endOffset: index.completeBytes,
-        firstLine: index.recordCount + 1
-      })) {
-        if (latest !== undefined)
-          throw new PersistenceCorruptionError({
-            code: 'integrity',
-            storage: this.filePath(runId),
-            line: line.line,
-            byteOffset: line.byteOffset,
-            message: 'Tail index spans more than one record.'
-          });
-        latest = parseEnvelopeLine(line, this.filePath(runId), runId);
-      }
-      if (latest?.hash !== index.tail.hash)
-        throw new PersistenceCorruptionError({
-          code: 'integrity',
-          storage: this.filePath(runId),
-          line: index.recordCount + 1,
-          byteOffset: index.tail.byteOffset,
-          message: 'Tail index does not resolve to its ledger record.'
-        });
+      const latest = await this.readIndexedEnvelope(runId, index, index.tail);
       return domainEnvelope(latest, this.codec.decode(latest.event));
     });
   }
@@ -287,10 +292,238 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     });
   }
 
+  latestReferenceOfType(runId: string, type: TEvent['type']): Promise<EventReference | undefined> {
+    return this.enqueue(runId, async () => {
+      assertIdentifier(type, 'type');
+      let index: EventAppendIndex;
+      try {
+        index = await this.refreshIndex(runId, false);
+      } catch (error) {
+        if (nodeCode(error) === 'ENOENT') return undefined;
+        throw error;
+      }
+      const pointer = index.latestByType.get(type);
+      return pointer
+        ? Object.freeze({
+            runId,
+            eventId: pointer.eventId,
+            sequence: pointer.sequence,
+            hash: pointer.hash
+          })
+        : undefined;
+    });
+  }
+
+  referenceByKey(runId: string, idempotencyKey: string): Promise<EventReference | undefined> {
+    return this.enqueue(runId, async () => {
+      assertIdentifier(idempotencyKey, 'idempotencyKey');
+      try {
+        await this.refreshIndex(runId, false);
+      } catch (error) {
+        if (nodeCode(error) === 'ENOENT') return undefined;
+        throw error;
+      }
+      const entry = await this.idempotencyEntry(runId, idempotencyKey);
+      const receipt = entry?.receipt;
+      return receipt
+        ? Object.freeze({
+            runId,
+            eventId: receipt.eventId,
+            sequence: receipt.sequence,
+            hash: receipt.hash
+          })
+        : undefined;
+    });
+  }
+
+  async readReference(reference: EventReference): Promise<EventEnvelope<TEvent>> {
+    assertEventReference(reference);
+    reference = Object.freeze({ ...reference });
+    return this.enqueue(reference.runId, async () => {
+      const index = await this.refreshIndex(reference.runId, false);
+      if (reference.sequence >= index.recordCount)
+        throw new PersistenceConflictError('Event reference is missing.');
+      const pointer = await this.sequencePointer(reference.runId, reference.sequence, index);
+      if (pointer.eventId !== reference.eventId || pointer.hash !== reference.hash)
+        throw new PersistenceConflictError('Event reference identity changed.');
+      const encoded = await this.readSequenceEnvelope(reference.runId, pointer);
+      return domainEnvelope(encoded, this.codec.decode(encoded.event));
+    });
+  }
+
+  async readRange(runId: string, request: EventRangeRequest = {}): Promise<EventRangePage<TEvent>> {
+    const { after, limit, maxBytes, through, types } = eventRangeBounds(request);
+    return this.enqueue(runId, async () => {
+      let index: EventAppendIndex;
+      try {
+        index = await this.refreshIndex(runId, false);
+      } catch (error) {
+        if (nodeCode(error) !== 'ENOENT') throw error;
+        if ((through?.sequence ?? -1) !== -1 || after !== -1)
+          throw new PersistenceConflictError('Event range boundary is missing.');
+        return Object.freeze({
+          records: [],
+          tail: tailFromEncoded(undefined),
+          nextSequence: -1,
+          complete: true,
+          scanned: 0,
+          bytes: 0
+        });
+      }
+      const requested = through ?? tailFromEncoded(index.tail);
+      if (requested.sequence >= index.recordCount)
+        throw new PersistenceConflictError('Event range boundary is missing.');
+      const tail =
+        requested.sequence < 0
+          ? tailFromEncoded(undefined)
+          : tailFromEncoded(await this.sequencePointer(runId, requested.sequence, index));
+      if (
+        tail.sequence !== requested.sequence ||
+        tail.hash !== requested.hash ||
+        (requested.driverGeneration !== undefined &&
+          requested.driverGeneration !== tail.driverGeneration)
+      )
+        throw new PersistenceConflictError(
+          'Event range boundary is missing or its identity changed.'
+        );
+      if (after > tail.sequence) throw new RangeError('Event range starts beyond its boundary.');
+      const records: EventEnvelope<TEvent>[] = [];
+      let nextSequence = after,
+        scanned = 0,
+        bytes = 0;
+      let oversized: EventRangePage<TEvent>['oversized'];
+      while (nextSequence < tail.sequence && scanned < limit) {
+        const pointer = await this.sequencePointer(runId, nextSequence + 1, index);
+        if (!types || types.includes(pointer.type)) {
+          if (bytes + pointer.bytes > maxBytes) {
+            if (pointer.bytes > maxBytes)
+              oversized = {
+                reference: {
+                  runId,
+                  eventId: pointer.eventId,
+                  sequence: pointer.sequence,
+                  hash: pointer.hash
+                },
+                bytes: pointer.bytes
+              };
+            break;
+          }
+          const encoded = await this.readSequenceEnvelope(runId, pointer);
+          records.push(domainEnvelope(encoded, this.codec.decode(encoded.event)));
+          bytes += pointer.bytes;
+        }
+        nextSequence++;
+        scanned++;
+      }
+      return Object.freeze({
+        records: Object.freeze(records),
+        tail,
+        nextSequence,
+        complete: nextSequence === tail.sequence,
+        scanned,
+        bytes,
+        ...(oversized ? { oversized: Object.freeze(oversized) } : {})
+      });
+    });
+  }
+
+  private sequencePath(runId: string, sequence: number): string {
+    return path.join(this.indexDirectory(runId), 'sequences', `${String(sequence)}.json`);
+  }
+
+  private async writeSequencePointer(
+    runId: string,
+    envelope: EncodedEnvelope,
+    byteOffset: number,
+    bytes: number
+  ): Promise<void> {
+    const content = { ...tailRecord(envelope, byteOffset), type: eventType(envelope), bytes };
+    await atomicWritePrivateJson(this.sequencePath(runId, envelope.sequence), {
+      ...content,
+      contentHash: hashJson(content)
+    });
+  }
+
+  private async sequencePointer(
+    runId: string,
+    sequence: number,
+    index: EventAppendIndex
+  ): Promise<EventSequencePointer> {
+    try {
+      const raw = parseJsonObject(
+        JSON.parse(await fs.readFile(this.sequencePath(runId, sequence), 'utf8'))
+      );
+      const { contentHash, ...content } = raw;
+      const pointer = parseEventTailRecord(content, 'Event sequence index');
+      if (
+        contentHash !== hashJson(content) ||
+        pointer.sequence !== sequence ||
+        typeof content.type !== 'string' ||
+        !Number.isSafeInteger(content.bytes) ||
+        typeof content.bytes !== 'number' ||
+        content.bytes < 1 ||
+        pointer.byteOffset + content.bytes > index.completeBytes
+      )
+        throw new TypeError('Event sequence index is invalid.');
+      return { ...pointer, type: content.type, bytes: content.bytes };
+    } catch (error) {
+      if (
+        nodeCode(error) !== 'ENOENT' &&
+        !(error instanceof SyntaxError) &&
+        !(error instanceof TypeError)
+      )
+        throw error;
+      // Derived offsets can be rebuilt; authoritative records are never rewritten.
+      const rebuilt = await this.rebuildIndex(runId, index.completeBytes, index.storageStamp);
+      this.indexes.set(runId, rebuilt);
+      const raw = parseJsonObject(
+        JSON.parse(await fs.readFile(this.sequencePath(runId, sequence), 'utf8'))
+      );
+      const pointer = parseEventTailRecord(raw, 'Rebuilt event sequence index');
+      if (typeof raw.type !== 'string' || typeof raw.bytes !== 'number')
+        throw new TypeError('Invalid rebuilt event index.', { cause: error });
+      return { ...pointer, type: raw.type, bytes: raw.bytes };
+    }
+  }
+
+  private async readSequenceEnvelope(
+    runId: string,
+    pointer: EventSequencePointer
+  ): Promise<EncodedEnvelope> {
+    const bytes = await readJsonlBytes(this.filePath(runId), pointer.byteOffset, pointer.bytes);
+    this.bodyBytesRead += bytes.length;
+    this.bodyRecordsRead++;
+    const line: JsonlLine = {
+      text: Buffer.from(bytes).toString('utf8').replace(/\n$/u, ''),
+      line: pointer.sequence + 2,
+      byteOffset: pointer.byteOffset,
+      terminated: true
+    };
+    const encoded = parseEnvelopeLine(line, this.filePath(runId), runId);
+    const { hash, ...base } = encoded;
+    if (
+      bytes.length !== pointer.bytes ||
+      bytes.at(-1) !== 10 ||
+      hash !== hashJson(base) ||
+      hash !== pointer.hash ||
+      encoded.eventId !== pointer.eventId ||
+      encoded.sequence !== pointer.sequence ||
+      eventType(encoded) !== pointer.type
+    )
+      throw corruption(
+        'integrity',
+        this.filePath(runId),
+        line,
+        'Event sequence index does not resolve to its exact committed record.'
+      );
+    return encoded;
+  }
+
   async *read(runId: string): AsyncIterable<EventEnvelope<TEvent>> {
     let completeBytes: number;
     try {
-      completeBytes = (await this.enqueue(runId, () => this.refreshIndex(runId, false))).completeBytes;
+      completeBytes = (await this.enqueue(runId, () => this.refreshIndex(runId, false)))
+        .completeBytes;
     } catch (error) {
       if (nodeCode(error) === 'ENOENT') return;
       throw error;
@@ -323,6 +556,40 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     }
   }
 
+  /** Explicit cold rebuild with bounded streaming memory and cancellable progress. */
+  rebuild(
+    runId: string,
+    options: {
+      readonly signal?: AbortSignal;
+      readonly onProgress?: (progress: {
+        records: number;
+        bytes: number;
+        totalBytes: number;
+      }) => void;
+    } = {}
+  ): Promise<void> {
+    return this.enqueue(runId, () =>
+      withPersistenceFileLock(
+        this.filePath(runId),
+        this.lockTimeoutMs,
+        this.staleLockMs,
+        async () => {
+          options.signal?.throwIfAborted();
+          const stamp = await jsonlStorageStamp(this.filePath(runId));
+          const complete = await jsonlCommittedBytes(this.filePath(runId), stamp.size);
+          this.indexes.delete(runId);
+          const index = await this.rebuildIndex(runId, complete, stamp, options);
+          this.indexes.set(runId, index);
+          options.onProgress?.({
+            records: index.recordCount,
+            bytes: complete,
+            totalBytes: complete
+          });
+        }
+      )
+    );
+  }
+
   async verifyIntegrity(runId: string): Promise<LedgerIntegrityReport> {
     const errors: string[] = [];
     let records = 0;
@@ -331,7 +598,9 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     try {
       const index = await this.refreshIndex(runId, false);
       let first = true;
-      for await (const line of readJsonlLines(this.filePath(runId), { endOffset: index.completeBytes })) {
+      for await (const line of readJsonlLines(this.filePath(runId), {
+        endOffset: index.completeBytes
+      })) {
         if (first) {
           first = false;
           continue;
@@ -339,11 +608,14 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
         const record = parseEnvelopeLine(line, this.filePath(runId), runId);
         this.codec.decode(record.event);
         if (record.sequence !== records)
-          errors.push(`sequence mismatch at index ${String(records)}: got ${String(record.sequence)}`);
+          errors.push(
+            `sequence mismatch at index ${String(records)}: got ${String(record.sequence)}`
+          );
         if (record.previousHash !== previousHash)
           errors.push(`previousHash mismatch at sequence ${String(record.sequence)}`);
         const { hash, ...base } = record;
-        if (hash !== hashJson(base)) errors.push(`hash mismatch at sequence ${String(record.sequence)}`);
+        if (hash !== hashJson(base))
+          errors.push(`hash mismatch at sequence ${String(record.sequence)}`);
         previousHash = record.hash;
         records += 1;
       }
@@ -396,13 +668,20 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   private async refreshIndex(runId: string, repairTornTail: boolean): Promise<EventAppendIndex> {
     const filePath = this.filePath(runId);
     const stamp = await jsonlStorageStamp(filePath);
+    const cached = this.indexes.get(runId);
+    if (
+      cached &&
+      sameJsonlStorageStamp(stamp, cached.storageStamp) &&
+      (!repairTornTail || stamp.size === cached.completeBytes)
+    )
+      return cached;
     const committedBytes = await jsonlCommittedBytes(filePath, stamp.size);
-    let index = this.indexes.get(runId) ?? (await this.readPersistedTailIndex(runId));
+    let index = cached ?? (await this.readPersistedTailIndex(runId));
     if (
       index !== undefined &&
       (index.completeBytes > committedBytes ||
         (await jsonlBoundaryMarker(filePath, index.completeBytes)) !== index.boundaryMarker ||
-        !(await this.persistedTailMatches(runId, index)))
+        (cached === undefined && !(await this.persistedTailMatches(runId, index))))
     ) {
       if (index.completeBytes > committedBytes) {
         throw new PersistenceCorruptionError({
@@ -418,7 +697,13 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     if (index === undefined) {
       index = await this.rebuildIndex(runId, committedBytes, stamp);
     } else if (committedBytes > index.completeBytes) {
-      await this.ingestRange(runId, index, index.completeBytes, committedBytes, index.recordCount + 2);
+      await this.ingestRange(
+        runId,
+        index,
+        index.completeBytes,
+        committedBytes,
+        index.recordCount + 2
+      );
       index.completeBytes = committedBytes;
       index.boundaryMarker = await jsonlBoundaryMarker(filePath, committedBytes);
       index.storageStamp = stamp;
@@ -427,7 +712,12 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     } else {
       index.storageStamp = stamp;
     }
+    this.indexes.delete(runId);
     this.indexes.set(runId, index);
+    while (this.indexes.size > 128) {
+      const oldest = this.indexes.keys().next().value;
+      if (oldest !== undefined) this.indexes.delete(oldest);
+    }
     if (repairTornTail && stamp.size > committedBytes) {
       await fs.truncate(filePath, committedBytes);
       const handle = await fs.open(filePath, 'r+');
@@ -444,7 +734,15 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   private async rebuildIndex(
     runId: string,
     completeBytes: number,
-    storageStamp: JsonlStorageStamp
+    storageStamp: JsonlStorageStamp,
+    progress?: {
+      readonly signal?: AbortSignal;
+      readonly onProgress?: (progress: {
+        records: number;
+        bytes: number;
+        totalBytes: number;
+      }) => void;
+    }
   ): Promise<EventAppendIndex> {
     const filePath = this.filePath(runId);
     await fs.rm(this.indexDirectory(runId), { recursive: true, force: true });
@@ -458,6 +756,13 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       storageStamp
     };
     for await (const line of readJsonlLines(filePath, { endOffset: completeBytes })) {
+      progress?.signal?.throwIfAborted();
+      this.indexedBytes += Buffer.byteLength(line.text) + 1;
+      progress?.onProgress?.({
+        records: index.recordCount,
+        bytes: line.byteOffset,
+        totalBytes: completeBytes
+      });
       if (first) {
         first = false;
         const header = parseLine(line, filePath);
@@ -469,6 +774,12 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       const envelope = parseEnvelopeLine(line, filePath, runId);
       validateNextEnvelope(index.tail, envelope, index.recordCount, filePath, line);
       await this.writeIdempotencyEntry(runId, envelope);
+      await this.writeSequencePointer(
+        runId,
+        envelope,
+        line.byteOffset,
+        Buffer.byteLength(line.text) + 1
+      );
       index.tail = tailRecord(envelope, line.byteOffset);
       index.latestByType.set(eventType(envelope), index.tail);
       index.recordCount += 1;
@@ -498,9 +809,16 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   ): Promise<void> {
     const filePath = this.filePath(runId);
     for await (const line of readJsonlLines(filePath, { startOffset, endOffset, firstLine })) {
+      this.indexedBytes += Buffer.byteLength(line.text) + 1;
       const envelope = parseEnvelopeLine(line, filePath, runId);
       validateNextEnvelope(index.tail, envelope, index.recordCount, filePath, line);
       await this.writeIdempotencyEntry(runId, envelope);
+      await this.writeSequencePointer(
+        runId,
+        envelope,
+        line.byteOffset,
+        Buffer.byteLength(line.text) + 1
+      );
       index.tail = tailRecord(envelope, line.byteOffset);
       index.latestByType.set(eventType(envelope), index.tail);
       index.recordCount += 1;
@@ -514,6 +832,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   ): Promise<void> {
     const serializedBytes = Buffer.byteLength(`${canonicalJsonString(envelope)}\n`, 'utf8');
     await this.writeIdempotencyEntry(runId, envelope);
+    await this.writeSequencePointer(runId, envelope, index.completeBytes, serializedBytes);
     index.tail = tailRecord(envelope, index.completeBytes);
     index.latestByType.set(eventType(envelope), index.tail);
     index.recordCount += 1;
@@ -549,7 +868,11 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       const raw: unknown = JSON.parse(await fs.readFile(this.tailIndexPath(runId), 'utf8'));
       return parseTailIndex(raw, runId);
     } catch (error) {
-      if (nodeCode(error) === 'ENOENT' || error instanceof SyntaxError || error instanceof TypeError)
+      if (
+        nodeCode(error) === 'ENOENT' ||
+        error instanceof SyntaxError ||
+        error instanceof TypeError
+      )
         return undefined;
       throw error;
     }
@@ -591,7 +914,10 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       ),
       ...(index.tail === undefined ? {} : { tail: index.tail })
     } as const;
-    await atomicWritePrivateJson(this.tailIndexPath(runId), { ...content, contentHash: hashJson(content) });
+    await atomicWritePrivateJson(this.tailIndexPath(runId), {
+      ...content,
+      contentHash: hashJson(content)
+    });
   }
 
   private async readIndexedEnvelope(
@@ -599,28 +925,26 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     index: EventAppendIndex,
     pointer: EventTailRecord
   ): Promise<EncodedEnvelope> {
-    let found: EncodedEnvelope | undefined;
-    for await (const line of readJsonlLines(this.filePath(runId), {
-      startOffset: pointer.byteOffset,
-      endOffset: index.completeBytes,
-      firstLine: pointer.sequence + 2
-    })) {
-      found = parseEnvelopeLine(line, this.filePath(runId), runId);
-      break;
-    }
-    if (found?.sequence !== pointer.sequence || found.hash !== pointer.hash) {
+    const indexed = await this.sequencePointer(runId, pointer.sequence, index);
+    if (
+      indexed.hash !== pointer.hash ||
+      indexed.eventId !== pointer.eventId ||
+      indexed.byteOffset !== pointer.byteOffset
+    )
       throw new PersistenceCorruptionError({
         code: 'integrity',
         storage: this.filePath(runId),
         line: pointer.sequence + 2,
         byteOffset: pointer.byteOffset,
-        message: 'Event index does not resolve to its ledger record.'
+        message: 'Event-type index does not resolve to its ledger record.'
       });
-    }
-    return found;
+    return this.readSequenceEnvelope(runId, indexed);
   }
 
-  private async idempotencyEntry(runId: string, key: string): Promise<IdempotencyIndexEntry | undefined> {
+  private async idempotencyEntry(
+    runId: string,
+    key: string
+  ): Promise<IdempotencyIndexEntry | undefined> {
     try {
       const raw: unknown = JSON.parse(await fs.readFile(this.idempotencyPath(runId, key), 'utf8'));
       return parseIdempotencyEntry(raw, runId, key);
@@ -630,7 +954,9 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       await fs.rm(this.indexDirectory(runId), { recursive: true, force: true });
       await this.refreshIndex(runId, false);
       try {
-        const raw: unknown = JSON.parse(await fs.readFile(this.idempotencyPath(runId, key), 'utf8'));
+        const raw: unknown = JSON.parse(
+          await fs.readFile(this.idempotencyPath(runId, key), 'utf8')
+        );
         return parseIdempotencyEntry(raw, runId, key);
       } catch (rebuildError) {
         if (nodeCode(rebuildError) === 'ENOENT') return undefined;
@@ -657,7 +983,10 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       receipt: receiptFromEncoded(envelope)
     };
     if (existing !== undefined) {
-      if (existing.eventDigest !== entry.eventDigest || existing.receipt.hash !== entry.receipt.hash) {
+      if (
+        existing.eventDigest !== entry.eventDigest ||
+        existing.receipt.hash !== entry.receipt.hash
+      ) {
         throw new PersistenceCorruptionError({
           code: 'integrity',
           storage: target,
@@ -879,7 +1208,12 @@ function validateNextEnvelope(
       `Event sequence mismatch: expected ${String(expectedSequence)}, got ${String(record.sequence)}.`
     );
   if (record.previousHash !== previous?.hash)
-    throw corruption('integrity', filePath, line, 'Event previousHash does not match the indexed leaf.');
+    throw corruption(
+      'integrity',
+      filePath,
+      line,
+      'Event previousHash does not match the indexed leaf.'
+    );
   const { hash, ...base } = record;
   if (hash !== hashJson(base))
     throw corruption('integrity', filePath, line, 'Event hash does not match its record bytes.');
@@ -1130,7 +1464,11 @@ function tailFromEncoded(encoded: EventTailRecord | EncodedEnvelope | undefined)
   return Object.freeze(
     encoded === undefined
       ? { sequence: -1, driverGeneration: 0 }
-      : { sequence: encoded.sequence, hash: encoded.hash, driverGeneration: encoded.driverGeneration }
+      : {
+          sequence: encoded.sequence,
+          hash: encoded.hash,
+          driverGeneration: encoded.driverGeneration
+        }
   );
 }
 
@@ -1143,7 +1481,11 @@ function sameTail(left: EventLedgerTail, right: EventLedgerTail): boolean {
 }
 
 function assertConditionalOptions(options: unknown): void {
-  if (!isRecord(options) || typeof options.idempotencyKey !== 'string' || !isRecord(options.expectedTail)) {
+  if (
+    !isRecord(options) ||
+    typeof options.idempotencyKey !== 'string' ||
+    !isRecord(options.expectedTail)
+  ) {
     throw new TypeError('Conditional event append options are invalid.');
   }
   const expected = options.expectedTail;
@@ -1357,4 +1699,9 @@ function inferActor(type: string): EventActor {
   if (type.startsWith('check.')) return 'check';
   if (type.startsWith('input.')) return 'user';
   return 'runtime';
+}
+
+interface EventSequencePointer extends EventTailRecord {
+  readonly type: string;
+  readonly bytes: number;
 }

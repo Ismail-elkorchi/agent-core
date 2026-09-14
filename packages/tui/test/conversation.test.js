@@ -92,7 +92,10 @@ test('reused provider call IDs remain separate calls and streamed output settles
     toolName: 'observe',
     progress: { type: 'output', stream: 'stdout', text: 'second\n' }
   });
-  assert.match(entries[0].details.find((detail) => detail.id === 'live:stdout').content, /first\nsecond\n/);
+  assert.match(
+    entries[0].details.find((detail) => detail.id === 'live:stdout').content,
+    /first\nsecond\n/
+  );
   const ended = {
     ...identity,
     type: 'tool.ended',
@@ -107,4 +110,44 @@ test('reused provider call IDs remain separate calls and streamed output settles
   );
   emit({ ...identity, turnId: 'later', type: 'tool.call.received', toolCall: call });
   assert.equal(entries.length, 2);
+});
+
+test('live output previews are bounded and presentation cannot hide execution uncertainty', async () => {
+  const { updatedToolActivity, completedToolActivity, completedSessionToolActivity } =
+    await import('@agent-core/tui');
+  let activity;
+  for (let i = 0; i < 100; i++)
+    activity = updatedToolActivity(activity, 'tool', 'stream', {
+      type: 'output',
+      stream: 'stdout',
+      text: '文😀'.repeat(1000)
+    });
+  assert.ok(activity.details[0].content.length <= 32768);
+  assert.match(activity.details[0].content, /Earlier live preview omitted/);
+  const observation = {
+    kind: 'result',
+    execution: { state: 'unknown' },
+    output: {},
+    summary: 'No confirmed outcome',
+    scope: { resources: [], coverage: 'partial' }
+  };
+  const rendered = completedToolActivity(undefined, 'tool', 'stream', observation, () => ({
+    status: 'complete'
+  }));
+  assert.equal(rendered.status, 'warning');
+  const stored = completedSessionToolActivity(
+    undefined,
+    {
+      id: 'source',
+      runId: 'run',
+      turnId: 'turn',
+      toolName: 'stream',
+      kind: 'result',
+      summary: 'Result',
+      originalUnavailable: { message: 'Storage unavailable', bytes: 100, digest: 'a'.repeat(64) }
+    },
+    () => ({ status: 'complete', summary: 'Looks complete' })
+  );
+  assert.equal(stored.status, 'warning');
+  assert.match(stored.summary, /Original observation unavailable/);
 });

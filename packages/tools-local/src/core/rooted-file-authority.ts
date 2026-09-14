@@ -166,6 +166,46 @@ export class RootedFileAuthority {
   get displayPath(): string {
     return this.#displayPath;
   }
+
+  /** Independently owned handle to this admitted root, with only additional restrictions. */
+  derive(options: RootedFileAuthorityOptions = {}): RootedFileAuthority {
+    this.#assertOpen();
+    const denied = ownDeniedEntries([
+      ...this.#deniedRootEntries,
+      ...(options.additionalDeniedEntries ?? [])
+    ]);
+    let probe: number | undefined;
+    let derived: number | undefined;
+    try {
+      // Check the public location without following aliases, then duplicate the
+      // held root. A replacement can never become the derived capability.
+      probe = openHostDirectoryWithoutAliases(this.#displayPath);
+      const stat = fstatSync(probe, { bigint: true });
+      if (
+        String(stat.dev) !== this.#identity.device ||
+        String(stat.ino) !== this.#identity.inode ||
+        readMountId(probe) !== this.#rootMountId
+      )
+        throw new Error('Workspace directory identity changed. Reopen the workspace.');
+      derived = openSync(fdPath(this.#rootFd), fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
+      this.#assertMount(derived, this.#displayPath);
+      const openedPath = readlinkSync(fdPath(derived));
+      if (openedPath !== this.#displayPath)
+        throw new Error('Workspace directory identity changed. Reopen the workspace.');
+      const authority = new RootedFileAuthority(
+        this.#displayPath,
+        derived,
+        this.#rootMountId,
+        this.#identity,
+        denied
+      );
+      derived = undefined;
+      return authority;
+    } finally {
+      if (probe !== undefined) closeSync(probe);
+      if (derived !== undefined) closeSync(derived);
+    }
+  }
   get identity(): RootIdentity {
     this.#assertOpen();
     return this.#identity;
@@ -178,7 +218,9 @@ export class RootedFileAuthority {
 
   isReservedPath(requestedPath: string): boolean {
     this.#assertOpen();
-    const segments = requestedPath.split('/').filter((segment) => segment !== '' && segment !== '.');
+    const segments = requestedPath
+      .split('/')
+      .filter((segment) => segment !== '' && segment !== '.');
     return segments.some(
       (segment) => this.#deniedRootEntries.has(segment) || segment.startsWith(RESERVED_ENTRY_PREFIX)
     );
@@ -201,7 +243,9 @@ export class RootedFileAuthority {
         this.#assertMount(handle.fd, requestedPath);
         const stat: BigIntStats = await handle.stat({ bigint: true });
         if (!stat.isFile())
-          throw new ToolInputError(`Path is not a regular file: ${requestedPath}`, { path: requestedPath });
+          throw new ToolInputError(`Path is not a regular file: ${requestedPath}`, {
+            path: requestedPath
+          });
         if (stat.nlink !== 1n)
           throw new ToolInputError(`Refusing a multiply linked file: ${requestedPath}`, {
             path: requestedPath,
@@ -256,7 +300,8 @@ export class RootedFileAuthority {
     try {
       parent = await this.#openDirectorySegments(segments, requestedPath);
     } catch (error) {
-      if (nodeCode(error) === 'ENOENT') return Object.freeze({ kind: 'absent', path: rootedDirectory });
+      if (nodeCode(error) === 'ENOENT')
+        return Object.freeze({ kind: 'absent', path: rootedDirectory });
       throw error;
     }
     try {
@@ -264,7 +309,8 @@ export class RootedFileAuthority {
       try {
         stat = await lstat(`${fdPath(parent.handle.fd)}/${leaf}`, { bigint: true });
       } catch (error) {
-        if (nodeCode(error) === 'ENOENT') return Object.freeze({ kind: 'absent', path: rootedDirectory });
+        if (nodeCode(error) === 'ENOENT')
+          return Object.freeze({ kind: 'absent', path: rootedDirectory });
         throw error;
       }
       if (stat.isSymbolicLink()) return Object.freeze({ kind: 'symlink', path: rootedDirectory });
@@ -465,7 +511,8 @@ export class RootedFileAuthority {
         const handle = await open(entryPath(name), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
         try {
           const stat: BigIntStats = await handle.stat({ bigint: true });
-          if (!stat.isFile()) throw new Error(`Rooted transaction entry is not a regular file: ${name}`);
+          if (!stat.isFile())
+            throw new Error(`Rooted transaction entry is not a regular file: ${name}`);
           if (stat.size > BigInt(maxBytes))
             throw new Error(`Rooted transaction entry exceeds the read limit: ${name}`);
           return await handle.readFile();
@@ -592,10 +639,15 @@ export function openRootedMutationDirectory(
 }
 
 export function isRootedFileAuthority(value: unknown): value is RootedFileAuthority {
-  return typeof value === 'object' && value !== null && ownedRoots.has(value as RootedFileAuthority);
+  return (
+    typeof value === 'object' && value !== null && ownedRoots.has(value as RootedFileAuthority)
+  );
 }
 
-export function rootedFileIdentitiesEqual(left: RootedFileIdentity, right: RootedFileIdentity): boolean {
+export function rootedFileIdentitiesEqual(
+  left: RootedFileIdentity,
+  right: RootedFileIdentity
+): boolean {
   return (
     left.device === right.device &&
     left.inode === right.inode &&
@@ -690,7 +742,9 @@ function normalizeRootedPath(
   if (requestedPath.includes('\0'))
     throw new ToolInputError('Path contains a null byte.', { path: requestedPath });
   if (requestedPath.includes('\\'))
-    throw new ToolInputError('Backslash path separators are not accepted.', { path: requestedPath });
+    throw new ToolInputError('Backslash path separators are not accepted.', {
+      path: requestedPath
+    });
   if (
     path.isAbsolute(requestedPath) ||
     path.win32.isAbsolute(requestedPath) ||
@@ -702,10 +756,14 @@ function normalizeRootedPath(
   }
   const segments = requestedPath.split('/').filter((segment) => segment !== '' && segment !== '.');
   if (segments.some((segment) => segment === '..'))
-    throw new ToolInputError(`Path escapes configured root: ${requestedPath}`, { path: requestedPath });
+    throw new ToolInputError(`Path escapes configured root: ${requestedPath}`, {
+      path: requestedPath
+    });
   if (
     !allowReservedInternal &&
-    segments.some((segment) => deniedRootEntries.has(segment) || segment.startsWith(RESERVED_ENTRY_PREFIX))
+    segments.some(
+      (segment) => deniedRootEntries.has(segment) || segment.startsWith(RESERVED_ENTRY_PREFIX)
+    )
   ) {
     throw new ToolInputError(`Path is reserved by the host application: ${requestedPath}`, {
       path: requestedPath
@@ -758,8 +816,13 @@ function fdPath(fd: number): string {
 /** Package-internal adoption primitive. It is deliberately absent from the package entrypoint. */
 export function openHostDirectoryWithoutAliases(absolutePath: string): number {
   if (process.platform !== 'linux')
-    throw new Error(`Handle-relative host directory adoption is unavailable on ${process.platform}.`);
-  let current = openSync('/', fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+    throw new Error(
+      `Handle-relative host directory adoption is unavailable on ${process.platform}.`
+    );
+  let current = openSync(
+    '/',
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW
+  );
   try {
     for (const segment of absolutePath.split('/').filter(Boolean)) {
       let next: number;
@@ -770,9 +833,12 @@ export function openHostDirectoryWithoutAliases(absolutePath: string): number {
         );
       } catch (error) {
         if (nodeCode(error) === 'ELOOP' || nodeCode(error) === 'ENOTDIR')
-          throw new Error(`Root path contains an aliased or non-directory component: ${absolutePath}`, {
-            cause: error
-          });
+          throw new Error(
+            `Root path contains an aliased or non-directory component: ${absolutePath}`,
+            {
+              cause: error
+            }
+          );
         throw error;
       }
       closeSync(current);
@@ -788,7 +854,8 @@ export function openHostDirectoryWithoutAliases(absolutePath: string): number {
 function readMountId(fd: number): string {
   const info = readFileSyncUtf8(`/proc/self/fdinfo/${String(fd)}`);
   const match = /^mnt_id:\s*(\d+)$/mu.exec(info);
-  if (!match?.[1]) throw new Error(`Cannot establish mount identity for file descriptor ${String(fd)}.`);
+  if (!match?.[1])
+    throw new Error(`Cannot establish mount identity for file descriptor ${String(fd)}.`);
   return match[1];
 }
 
@@ -804,7 +871,10 @@ function numberFromBigInt(value: bigint, label: string): number {
 }
 
 function nodeCode(error: unknown): string | undefined {
-  return typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string'
+  return typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    typeof error.code === 'string'
     ? error.code
     : undefined;
 }

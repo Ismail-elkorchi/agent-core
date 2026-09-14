@@ -10,7 +10,11 @@ import {
   recoverToolCallPlan,
   releaseToolCallPlan
 } from '@agent-core/tools';
-import { issueEffectStartTicket, NO_EFFECT_EXPOSURE, startExternalEffect } from '@agent-core/effects';
+import {
+  issueEffectStartTicket,
+  NO_EFFECT_EXPOSURE,
+  startExternalEffect
+} from '@agent-core/effects';
 import { DEFAULT_LOCAL_TOOL_CONFIGURATION, editTextTool } from '@agent-core/tools-local';
 import { invokePlannedForTest, invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
 import { testPatchJournal, testRootedFileAuthority } from '../rooted-file-authority-helper.js';
@@ -18,10 +22,19 @@ import { testPatchJournal, testRootedFileAuthority } from '../rooted-file-author
 const policy = { allowedRisks: ['read', 'write'] };
 let identity = 0;
 
-function sha(value) { return createHash('sha256').update(value).digest('hex'); }
+function sha(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
 function invocation() {
   identity += 1;
-  return { runId: `run-${String(identity)}`, turnId: 'turn-1', requestAttempt: 1, toolBatchId: 'batch-1', callIndex: 0, toolAttempt: 1 };
+  return {
+    runId: `run-${String(identity)}`,
+    turnId: 'turn-1',
+    requestAttempt: 1,
+    toolBatchId: 'batch-1',
+    callIndex: 0,
+    toolAttempt: 1
+  };
 }
 async function editHost() {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-edit-text-'));
@@ -46,27 +59,52 @@ test('edit_text applies ordered Unicode-scalar replacements across files in one 
   const second = 'alpha beta gamma\n';
   await writeFile(path.join(root, 'first.txt'), first);
   await writeFile(path.join(root, 'second.txt'), second);
-  const observation = await invokeToolCall(jsonToolCall('edit_text', { files: [
-    {
-      path: './first.txt', expectedSha256: sha(first), edits: [
-        { range: { start: { line: 1, column: 3 }, end: { line: 1, column: 4 } }, expectedText: '😀', replacementText: 'bright' },
-        { range: { start: { line: 2, column: 1 }, end: { line: 2, column: 7 } }, expectedText: 'second', replacementText: 'final' }
+  const observation = await invokeToolCall(
+    jsonToolCall('edit_text', {
+      files: [
+        {
+          path: './first.txt',
+          expectedSha256: sha(first),
+          edits: [
+            {
+              range: { start: { line: 1, column: 3 }, end: { line: 1, column: 4 } },
+              expectedText: '😀',
+              replacementText: 'bright'
+            },
+            {
+              range: { start: { line: 2, column: 1 }, end: { line: 2, column: 7 } },
+              expectedText: 'second',
+              replacementText: 'final'
+            }
+          ]
+        },
+        {
+          path: 'second.txt',
+          expectedSha256: sha(second),
+          edits: [
+            {
+              range: { start: { line: 1, column: 7 }, end: { line: 1, column: 11 } },
+              expectedText: 'beta',
+              replacementText: 'delta'
+            }
+          ]
+        }
       ]
-    },
-    {
-      path: 'second.txt', expectedSha256: sha(second), edits: [
-        { range: { start: { line: 1, column: 7 }, end: { line: 1, column: 11 } }, expectedText: 'beta', replacementText: 'delta' }
-      ]
-    }
-  ] }), [editTextTool], context);
+    }),
+    [editTextTool],
+    context
+  );
 
-  assert.equal(observation.ok, true);
+  assert.equal(observation.kind, 'result');
   assert.equal(observation.output.applicationStatus, 'applied');
   assert.equal(observation.output.transactionOutcome, 'committed');
   assert.deepEqual(observation.output.changedPaths, ['first.txt', 'second.txt']);
   assert.equal(observation.output.files[0].newlineConvention, 'crlf');
   assert.equal(observation.output.files[0].changedRanges[0].expectedScalars, 1);
-  assert.equal(await readFile(path.join(root, 'first.txt'), 'utf8'), 'A bright value\r\nfinal line\r\n');
+  assert.equal(
+    await readFile(path.join(root, 'first.txt'), 'utf8'),
+    'A bright value\r\nfinal line\r\n'
+  );
   assert.equal(await readFile(path.join(root, 'second.txt'), 'utf8'), 'alpha delta gamma\n');
 });
 
@@ -78,19 +116,48 @@ test('edit_text rejects stale hashes, mismatched expected text, overlaps, malfor
   await link(path.join(root, 'plain.txt'), path.join(root, 'linked.txt'));
 
   const cases = [
-    { path: 'plain.txt', expectedSha256: '0'.repeat(64), edits: [{ range: range(1, 1, 1, 2), expectedText: 'a', replacementText: 'x' }] },
-    { path: 'plain.txt', expectedSha256: sha('abcdef\n'), edits: [{ range: range(1, 1, 1, 2), expectedText: 'z', replacementText: 'x' }] },
-    { path: 'plain.txt', expectedSha256: sha('abcdef\n'), edits: [
-      { range: range(1, 1, 1, 4), expectedText: 'abc', replacementText: 'x' },
-      { range: range(1, 3, 1, 5), expectedText: 'cd', replacementText: 'y' }
-    ] },
-    { path: 'invalid.txt', expectedSha256: sha(Buffer.from([0x66, 0x80])), edits: [{ range: range(1, 1, 1, 2), expectedText: 'f', replacementText: 'x' }] },
-    { path: 'alias.txt', expectedSha256: sha('abcdef\n'), edits: [{ range: range(1, 1, 1, 2), expectedText: 'a', replacementText: 'x' }] },
-    { path: 'linked.txt', expectedSha256: sha('abcdef\n'), edits: [{ range: range(1, 1, 1, 2), expectedText: 'a', replacementText: 'x' }] }
+    {
+      path: 'plain.txt',
+      expectedSha256: '0'.repeat(64),
+      edits: [{ range: range(1, 1, 1, 2), expectedText: 'a', replacementText: 'x' }]
+    },
+    {
+      path: 'plain.txt',
+      expectedSha256: sha('abcdef\n'),
+      edits: [{ range: range(1, 1, 1, 2), expectedText: 'z', replacementText: 'x' }]
+    },
+    {
+      path: 'plain.txt',
+      expectedSha256: sha('abcdef\n'),
+      edits: [
+        { range: range(1, 1, 1, 4), expectedText: 'abc', replacementText: 'x' },
+        { range: range(1, 3, 1, 5), expectedText: 'cd', replacementText: 'y' }
+      ]
+    },
+    {
+      path: 'invalid.txt',
+      expectedSha256: sha(Buffer.from([0x66, 0x80])),
+      edits: [{ range: range(1, 1, 1, 2), expectedText: 'f', replacementText: 'x' }]
+    },
+    {
+      path: 'alias.txt',
+      expectedSha256: sha('abcdef\n'),
+      edits: [{ range: range(1, 1, 1, 2), expectedText: 'a', replacementText: 'x' }]
+    },
+    {
+      path: 'linked.txt',
+      expectedSha256: sha('abcdef\n'),
+      edits: [{ range: range(1, 1, 1, 2), expectedText: 'a', replacementText: 'x' }]
+    }
   ];
   for (const file of cases) {
-    const observation = await invokeToolCall(jsonToolCall('edit_text', { files: [file] }), [editTextTool], { ...context, invocation: invocation() });
+    const observation = await invokeToolCall(
+      jsonToolCall('edit_text', { files: [file] }),
+      [editTextTool],
+      { ...context, invocation: invocation() }
+    );
     assert.equal(observation.kind, 'failure', file.path);
+    assert.equal(observation.execution.state, 'not_started', file.path);
     assert.equal(observation.output.reason, 'invalid_arguments', file.path);
   }
   assert.equal(await readFile(path.join(root, 'plain.txt'), 'utf8'), 'abcdef\n');
@@ -101,18 +168,32 @@ test('edit_text revalidates physical identity immediately before publication and
   await writeFile(path.join(root, 'first.txt'), 'first old\n');
   await writeFile(path.join(root, 'second.txt'), 'second old\n');
   let replaced = false;
-  const observation = await invokeToolCall(jsonToolCall('edit_text', { files: [
-    { path: 'first.txt', expectedSha256: sha('first old\n'), edits: [{ range: range(1, 7, 1, 10), expectedText: 'old', replacementText: 'new' }] },
-    { path: 'second.txt', expectedSha256: sha('second old\n'), edits: [{ range: range(1, 8, 1, 11), expectedText: 'old', replacementText: 'new' }] }
-  ] }), [editTextTool], {
-    ...context,
-    async persistProgressCheckpoint(progress) {
-      if (replaced || progress.stage !== 'text_edit_planned') return;
-      replaced = true;
-      await rename(path.join(root, 'second.txt'), path.join(root, 'second-original.txt'));
-      await writeFile(path.join(root, 'second.txt'), 'replacement\n');
+  const observation = await invokeToolCall(
+    jsonToolCall('edit_text', {
+      files: [
+        {
+          path: 'first.txt',
+          expectedSha256: sha('first old\n'),
+          edits: [{ range: range(1, 7, 1, 10), expectedText: 'old', replacementText: 'new' }]
+        },
+        {
+          path: 'second.txt',
+          expectedSha256: sha('second old\n'),
+          edits: [{ range: range(1, 8, 1, 11), expectedText: 'old', replacementText: 'new' }]
+        }
+      ]
+    }),
+    [editTextTool],
+    {
+      ...context,
+      async persistProgressCheckpoint(progress) {
+        if (replaced || progress.stage !== 'text_edit_planned') return;
+        replaced = true;
+        await rename(path.join(root, 'second.txt'), path.join(root, 'second-original.txt'));
+        await writeFile(path.join(root, 'second.txt'), 'replacement\n');
+      }
     }
-  });
+  );
   assert.equal(replaced, true);
   assert.equal(observation.output.applicationStatus, 'not_applied');
   assert.equal(observation.output.transactionOutcome, 'rolled_back');
@@ -125,8 +206,16 @@ test('edit_text dry-run and abort-before-commit never mutate content', async () 
   const { root, context } = await editHost();
   const original = 'before\n';
   await writeFile(path.join(root, 'note.txt'), original);
-  const file = { path: 'note.txt', expectedSha256: sha(original), edits: [{ range: range(1, 1, 1, 7), expectedText: 'before', replacementText: 'after' }] };
-  const dry = await invokeToolCall(jsonToolCall('edit_text', { files: [file], dryRun: true }), [editTextTool], { ...context, invocation: undefined, policy: { allowedRisks: ['read'] } });
+  const file = {
+    path: 'note.txt',
+    expectedSha256: sha(original),
+    edits: [{ range: range(1, 1, 1, 7), expectedText: 'before', replacementText: 'after' }]
+  };
+  const dry = await invokeToolCall(
+    jsonToolCall('edit_text', { files: [file], dryRun: true }),
+    [editTextTool],
+    { ...context, invocation: undefined, policy: { allowedRisks: ['read'] } }
+  );
   assert.equal(dry.output.applicationStatus, 'dry_run');
   assert.deepEqual(dry.output.changedPaths, []);
   assert.deepEqual(dry.output.wouldChangePaths, ['note.txt']);
@@ -137,7 +226,9 @@ test('edit_text dry-run and abort-before-commit never mutate content', async () 
     ...context,
     invocation: invocation(),
     signal: controller.signal,
-    persistProgressCheckpoint(progress) { if (progress.stage === 'text_edit_planned') controller.abort('abort before text commit'); }
+    persistProgressCheckpoint(progress) {
+      if (progress.stage === 'text_edit_planned') controller.abort('abort before text commit');
+    }
   });
   await assert.rejects(aborted, /abort before text commit|abort/iu);
   assert.equal(await readFile(path.join(root, 'note.txt'), 'utf8'), original);
@@ -147,9 +238,17 @@ test('edit_text reconciles a committed receipt idempotently without re-executing
   const { root, context } = await editHost();
   const original = 'old value\n';
   await writeFile(path.join(root, 'note.txt'), original);
-  const call = createToolCall(jsonToolCall('edit_text', { files: [{
-    path: 'note.txt', expectedSha256: sha(original), edits: [{ range: range(1, 1, 1, 4), expectedText: 'old', replacementText: 'new' }]
-  }] }));
+  const call = createToolCall(
+    jsonToolCall('edit_text', {
+      files: [
+        {
+          path: 'note.txt',
+          expectedSha256: sha(original),
+          edits: [{ range: range(1, 1, 1, 4), expectedText: 'old', replacementText: 'new' }]
+        }
+      ]
+    })
+  );
   const planningContext = {
     ...context,
     signal: new AbortController().signal,
@@ -174,7 +273,10 @@ test('edit_text reconciles a committed receipt idempotently without re-executing
 });
 
 function range(startLine, startColumn, endLine, endColumn) {
-  return { start: { line: startLine, column: startColumn }, end: { line: endLine, column: endColumn } };
+  return {
+    start: { line: startLine, column: startColumn },
+    end: { line: endLine, column: endColumn }
+  };
 }
 function startedEffect(plan, attempt) {
   const effectId = `edit-recovery-${String(attempt)}`;

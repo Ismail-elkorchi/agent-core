@@ -1,5 +1,9 @@
 import { hashJson } from '@agent-core/persistence';
+import { entryIdentity } from '../history/ledger.js';
 import type {
+  SessionSourceMetadata,
+  SessionSourceSnapshot,
+  SessionRunFinalization,
   SessionBranchBoundary,
   SessionBranchEntry,
   SessionBranchPage,
@@ -9,6 +13,12 @@ import type {
 } from './contracts.js';
 
 export interface BranchEntryPosition {
+  readonly identity: string;
+  readonly type: SessionBranchEntry['type'];
+  readonly runId?: string;
+  readonly source?: SessionBranchEntry['source'];
+  readonly fromEntryId?: string | null;
+  readonly historyPosition?: import('../history/contracts.js').HistorySourceCut;
   readonly parentId: string | null;
   readonly hash: string;
   readonly bytes: number;
@@ -21,7 +31,10 @@ export interface BranchPageSource {
   read(entryId: string): Promise<SessionBranchEntry>;
 }
 
-export function branchBoundary(source: BranchPageSource, leafId = source.leafId): SessionBranchBoundary {
+export function branchBoundary(
+  source: BranchPageSource,
+  leafId = source.leafId
+): SessionBranchBoundary {
   return Object.freeze({
     sessionId: source.sessionId,
     leafId,
@@ -118,7 +131,9 @@ export async function searchBranch(
     boundary: page.boundary,
     matches: Object.freeze(matches),
     ...(page.oversizedEntry === undefined ? {} : { oversizedEntry: page.oversizedEntry }),
-    ...(page.older === undefined ? {} : { older: Object.freeze({ ...page.older, query: request.query }) })
+    ...(page.older === undefined
+      ? {}
+      : { older: Object.freeze({ ...page.older, query: request.query }) })
   });
 }
 
@@ -143,6 +158,7 @@ export function memoryBranchSource(
   for (const entry of entries.slice(index.count)) {
     index.byId.set(entry.id, entry);
     index.positions.set(entry.id, {
+      ...branchEntryMetadata(entry),
       parentId: entry.parentId,
       hash: hashJson(entry),
       bytes: Buffer.byteLength(JSON.stringify(entry))
@@ -219,4 +235,64 @@ function branchEntryText(entry: SessionBranchEntry): string {
     case 'context_transition':
       return entry.window.reason;
   }
+}
+
+export function branchEntryMetadata(entry: SessionBranchEntry) {
+  return {
+    identity: entryIdentity(entry),
+    type: entry.type,
+    ...('runId' in entry ? { runId: entry.runId } : {}),
+    ...(entry.source ? { source: entry.source } : {}),
+    ...(entry.type === 'branch' ? { fromEntryId: entry.fromEntryId } : {}),
+    ...(entry.type === 'context_transition'
+      ? { historyPosition: entry.window.historyPosition }
+      : {})
+  };
+}
+const snapshots = new WeakMap<BranchPath, readonly SessionSourceMetadata[]>();
+const sourceSnapshots = new WeakMap<BranchPath, SessionSourceSnapshot>();
+export function sourceSnapshot(
+  source: BranchPageSource,
+  sourceRevision: number,
+  finalizations: readonly Pick<
+    SessionRunFinalization,
+    'runId' | 'finalizationId' | 'throughEntryId'
+  >[],
+  leafId = source.leafId
+): SessionSourceSnapshot {
+  const boundary = branchBoundary(source, leafId);
+  const path = branchPath(source, boundary);
+  const cached = sourceSnapshots.get(path);
+  if (cached?.sourceRevision === sourceRevision) return cached;
+  let entries = snapshots.get(path);
+  if (!entries) {
+    entries = Object.freeze(
+      path.ids.map((entryId) => {
+        const metadata = position(source, entryId);
+        return Object.freeze({
+          entryId,
+          parentId: metadata.parentId,
+          sha256: metadata.hash,
+          bytes: metadata.bytes,
+          identity: metadata.identity,
+          type: metadata.type,
+          ...(metadata.runId ? { runId: metadata.runId } : {}),
+          ...(metadata.source ? { source: metadata.source } : {}),
+          ...(metadata.fromEntryId === undefined ? {} : { fromEntryId: metadata.fromEntryId }),
+          ...(metadata.historyPosition ? { historyPosition: metadata.historyPosition } : {})
+        });
+      })
+    );
+    snapshots.set(path, entries);
+  }
+  const snapshot = Object.freeze({
+    boundary,
+    sourceRevision,
+    entries,
+    branchId:
+      [...entries].reverse().find((entry) => entry.type === 'branch')?.entryId ?? source.sessionId,
+    finalizations: Object.freeze(finalizations.filter((item) => path.byId.has(item.throughEntryId)))
+  });
+  sourceSnapshots.set(path, snapshot);
+  return snapshot;
 }

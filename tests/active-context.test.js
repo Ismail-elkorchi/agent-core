@@ -10,12 +10,14 @@ import {
   InMemoryInferenceRepository,
   InMemorySessionRepository,
   agentEventCodec,
-  createRuntimeContextBootstrapValidator,
   sourceRef,
   validateAgentRunLimits
 } from '@agent-core/runtime';
 import { defineTool } from '@agent-core/tools';
-import { MemorySimulationProvider, simulationProfile } from './fixtures/context-policies/simulation.mjs';
+import {
+  MemorySimulationProvider,
+  simulationProfile
+} from './fixtures/context-policies/simulation.mjs';
 
 const call = (name, id) => ({
   content: '',
@@ -24,7 +26,7 @@ const call = (name, id) => ({
 });
 const result = (output) => ({
   kind: 'result',
-  ok: true,
+
   output,
   summary: 'Observed.',
   scope: { resources: ['fixture'], coverage: 'complete' }
@@ -46,7 +48,7 @@ class Provider extends MemorySimulationProvider {
   }
 }
 
-for (const strategy of ['retain', 'provider']) {
+for (const strategy of ['sources', 'provider']) {
   test(`${strategy}: settled exchanges leave an active run's attention while history survives`, async () => {
     const sessions = new InMemorySessionRepository();
     const session = await sessions.create({
@@ -98,32 +100,29 @@ for (const strategy of ['retain', 'provider']) {
           recovery: { kind: 'unknown' }
         }),
         effectEnvelope: { accesses: [{ mode: 'write', scope: 'context' }], lockScopes: [] },
-        async invoke() {
-          const view = await history.view();
-          const exchange = view.entries.filter((entry) => 'turnIndex' in entry && entry.turnIndex === 1);
+        async invoke(_input, execution) {
+          const view = await history.page({ limit: 1000, maxBytes: 4 * 1024 * 1024 });
+          const exchange = view.entries.filter(
+            (entry) => 'turnIndex' in entry && entry.turnIndex === 1
+          );
           original = exchange.find((entry) => entry.type === 'observation');
           const retained =
             strategy === 'provider'
               ? view.entries
               : view.entries.filter((entry) => !exchange.includes(entry));
           await runtime.scheduleContextTransition({
+            toolInvocation: Object.fromEntries(
+              ['runId', 'turnId', 'requestAttempt', 'toolBatchId', 'callIndex', 'toolAttempt'].map(
+                (key) => [key, execution.invocation[key]]
+              )
+            ),
             expectedWindowId: null,
             idempotencyKey: 'select',
             reason: 'Completed exchange is no longer needed.',
             selection: {
               strategy,
               retained: retained.map((entry) => sourceRef(session.id, entry)),
-              notes: [],
-              omitted:
-                strategy === 'provider'
-                  ? []
-                  : [
-                      {
-                        fromEntryId: exchange[0].id,
-                        toEntryId: exchange.at(-1).id,
-                        reason: 'Settled exchange.'
-                      }
-                    ]
+              notes: []
             }
           });
           return result({ scheduled: true });
@@ -134,16 +133,9 @@ for (const strategy of ['retain', 'provider']) {
       repository: sessions,
       session,
       history,
-      bootstrap: {
-        maxBytes: 1_000_000,
-        historyRead: { history, isAvailable: () => true },
-        validate: createRuntimeContextBootstrapValidator({
-          provider,
-          model: simulationProfile.id,
-          tools: () => tools,
-          pendingCallIds: () => runtime.pendingToolCalls().map((item) => item.callId),
-          nativeTransform: { inference, ownerId: () => 'work' }
-        })
+      policy: {
+        maxSourceBytes: 1_000_000,
+        historyRead: { history, isAvailable: () => true }
       }
     });
     runtime = new AgentRuntime({
@@ -157,9 +149,15 @@ for (const strategy of ['retain', 'provider']) {
       toolPolicy: { allowedRisks: ['read', 'write'] },
       toolBoundary: { authorizationPolicyId: 'fixture', executionTargetId: 'fixture' }
     });
-    const completed = await runtime.run({ runId: 'work', task: 'Keep working after changing context.' })
-      .result;
-    assert.equal(completed.terminal.executionStatus, 'completed');
+    const completed = await runtime.run({
+      runId: 'work',
+      task: 'Keep working after changing context.'
+    }).result;
+    assert.equal(
+      completed.terminal?.executionStatus,
+      'completed',
+      JSON.stringify({ completed, events: await Array.fromAsync(events.read('work')) })
+    );
     const records = [];
     for await (const record of events.read('work'))
       if (record.event.type === 'context.transition.rejected' || record.event.type === 'tool.ended')
@@ -168,16 +166,22 @@ for (const strategy of ['retain', 'provider']) {
     const next = provider.calls.at(-1);
     assert.ok(!JSON.stringify(next.messages).includes('ARCHIVED-DETAIL-739'));
     assert.equal(
-      next.messages.filter((message) => message.content === 'Keep working after changing context.').length,
+      next.messages.filter((message) => message.content === 'Keep working after changing context.')
+        .length,
       1
     );
-    const archived = await history.read({ source: sourceRef(session.id, original), maxBytes: 16_384 });
+    const archived = await history.read({
+      source: sourceRef(session.id, original),
+      maxBytes: 16_384
+    });
     assert.equal(archived.status, 'available');
     assert.match(archived.item.text, /ARCHIVED-DETAIL-739/);
     if (strategy === 'provider')
       assert.equal(next.messages.filter((message) => message.role === 'protocol').length, 1);
     else
-      assert.ok(next.messages.some((message) => message.role === 'tool' && message.toolCallId === 'select'));
+      assert.ok(
+        next.messages.some((message) => message.role === 'tool' && message.toolCallId === 'select')
+      );
   });
 }
 
@@ -208,7 +212,7 @@ test(
         recovery: { kind: 'unknown' }
       }),
       effectEnvelope: { accesses: [{ mode: 'read', scope: 'fixture' }], lockScopes: [] },
-      invoke: () => ({ ...result({ available: false }), ok: false })
+      invoke: () => result({ available: false })
     });
     for (const limits of [undefined, { modelTurns: 3 }]) {
       const provider = new Provider((_request, turn) =>
@@ -226,7 +230,10 @@ test(
         toolPolicy: { allowedRisks: ['read'] },
         toolBoundary: { authorizationPolicyId: 'fixture', executionTargetId: 'fixture' }
       });
-      const completed = await runtime.run({ task: 'Inspect the requested items.', signal: t.signal }).result;
+      const completed = await runtime.run({
+        task: 'Inspect the requested items.',
+        signal: t.signal
+      }).result;
       assert.equal(completed.terminal.executionStatus, limits ? 'failed' : 'completed');
       assert.equal(completed.terminal.budget.modelTurns, limits ? 3 : 8);
       if (limits) assert.equal(completed.terminal.exhaustedLimit, 'model_turns');

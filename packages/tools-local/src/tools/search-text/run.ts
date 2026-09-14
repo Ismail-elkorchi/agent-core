@@ -5,16 +5,29 @@ import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/c
 import { builtInObservedFacts } from '../../core/read-observed-facts.js';
 import { requireRootedFileAuthority } from '../../core/rooted-files.js';
 import { rootedFileSelector } from '../../core/rooted-file-selection.js';
-import { rootedFileIdentitiesEqual, type RootedFileHandle, type RootedFileAuthority } from '../../core/rooted-file-authority.js';
+import {
+  rootedFileIdentitiesEqual,
+  type RootedFileHandle,
+  type RootedFileAuthority
+} from '../../core/rooted-file-authority.js';
 import type { SearchTextInput, SearchTextOutput } from './schema.js';
 
 interface RipgrepData {
   readonly path?: { readonly text?: string };
   readonly lines?: { readonly text?: string };
   readonly line_number?: number;
-  readonly submatches?: readonly { readonly start?: number; readonly end?: number; readonly match?: { readonly text?: string } }[];
+  readonly submatches?: readonly {
+    readonly start?: number;
+    readonly end?: number;
+    readonly match?: { readonly text?: string };
+  }[];
 }
-interface MatchRecord { path: string; lineNumber: number; text: string; occurrences: { startByte: number; endByte: number; text: string }[] }
+interface MatchRecord {
+  path: string;
+  lineNumber: number;
+  text: string;
+  occurrences: { startByte: number; endByte: number; text: string }[];
+}
 type SearchStatus = SearchTextOutput['status'];
 interface SearchAggregate {
   files: Set<string>;
@@ -30,12 +43,23 @@ interface SearchAggregate {
   outputTruncated: boolean;
 }
 
-export async function searchText(input: SearchTextInput, context: ToolExecutionContext): Promise<ToolObservationInput<SearchTextOutput>> {
+export async function searchText(
+  input: SearchTextInput,
+  context: ToolExecutionContext
+): Promise<ToolObservationInput<SearchTextOutput>> {
   const root = requireRootedFileAuthority(context);
   const limits = requireLocalToolConfiguration(context).searchText;
   const resultLimit = clampRequestedLimit(input.resultLimit, limits.maxResults);
   const perFileLimit = clampRequestedLimit(input.perFileLimit, limits.maxResults);
-  const args = ['--json', '--stats', '--line-number', '--color', 'never', '--max-filesize', String(limits.maxFileBytes)];
+  const args = [
+    '--json',
+    '--stats',
+    '--line-number',
+    '--color',
+    'never',
+    '--max-filesize',
+    String(limits.maxFileBytes)
+  ];
   if (input.mode !== 'count') args.push('--max-count', String(perFileLimit + 1));
   if (input.contextLines > 0) args.push('--context', String(input.contextLines));
   if (input.fixedStrings) args.push('--fixed-strings');
@@ -46,77 +70,174 @@ export async function searchText(input: SearchTextInput, context: ToolExecutionC
   let aggregate: SearchAggregate;
   try {
     const selection = await rootedFileSelector(context).select({
-      startPath: input.path, patterns: input.patterns, type: 'file', respectGitIgnore: input.respectGitIgnore,
-      includeHidden: input.includeHidden, exclude: input.exclude, ...(context.signal ? { signal: context.signal } : {})
+      startPath: input.path,
+      patterns: input.patterns,
+      type: 'file',
+      respectGitIgnore: input.respectGitIgnore,
+      includeHidden: input.includeHidden,
+      exclude: input.exclude,
+      ...(context.signal ? { signal: context.signal } : {})
     });
-    aggregate = await runRipgrep(root, selection.entries.map((entry) => entry.path), args, limits.maxOutputBytes, limits.maxFileBytes, input.mode, input.mode === 'count' ? undefined : perFileLimit, context.signal);
+    aggregate = await runRipgrep(
+      root,
+      selection.entries.map((entry) => entry.path),
+      args,
+      limits.maxOutputBytes,
+      limits.maxFileBytes,
+      input.mode,
+      input.mode === 'count' ? undefined : perFileLimit,
+      context.signal
+    );
     if (selection.coverage === 'partial' && aggregate.status === 'completed') {
       aggregate.status = 'partial';
       aggregate.diagnostic = `File discovery was partial: ${selection.causes.join(', ')}.`;
     }
   } catch (error) {
     if (!context.signal?.aborted) throw error;
-    aggregate = { files: new Set(), counts: new Map(), matches: [], contexts: new Map(), matchingLineCount: 0, occurrenceCount: 0, examinedFileCount: 0, status: 'aborted', diagnostic: message(context.signal.reason), perFileOmissions: new Map(), outputTruncated: false };
+    aggregate = {
+      files: new Set(),
+      counts: new Map(),
+      matches: [],
+      contexts: new Map(),
+      matchingLineCount: 0,
+      occurrenceCount: 0,
+      examinedFileCount: 0,
+      status: 'aborted',
+      diagnostic: message(context.signal.reason),
+      perFileOmissions: new Map(),
+      outputTruncated: false
+    };
   }
-  const perFileOmitted = [...aggregate.perFileOmissions.values()].reduce((sum, count) => sum + count, 0);
-  const globallyOmitted = input.mode === 'matches'
-    ? Math.max(0, aggregate.matchingLineCount - Math.min(aggregate.matches.length, resultLimit))
-    : Math.max(0, aggregate.files.size - Math.min(aggregate.files.size, resultLimit));
+  const perFileOmitted = [...aggregate.perFileOmissions.values()].reduce(
+    (sum, count) => sum + count,
+    0
+  );
+  const globallyOmitted =
+    input.mode === 'matches'
+      ? Math.max(0, aggregate.matchingLineCount - Math.min(aggregate.matches.length, resultLimit))
+      : Math.max(0, aggregate.files.size - Math.min(aggregate.files.size, resultLimit));
   const omittedResultCount = globallyOmitted + (input.mode === 'matches' ? perFileOmitted : 0);
   const failed = aggregate.status !== 'completed';
-  const resultCoverage = failed || aggregate.outputTruncated || globallyOmitted > 0 || (input.mode === 'matches' && perFileOmitted > 0) ? 'partial' as const : 'complete' as const;
-  const countCoverage = failed || aggregate.outputTruncated || perFileOmitted > 0 ? 'partial' as const : 'complete' as const;
+  const resultCoverage =
+    failed ||
+    aggregate.outputTruncated ||
+    globallyOmitted > 0 ||
+    (input.mode === 'matches' && perFileOmitted > 0)
+      ? ('partial' as const)
+      : ('complete' as const);
+  const countCoverage =
+    failed || aggregate.outputTruncated || perFileOmitted > 0
+      ? ('partial' as const)
+      : ('complete' as const);
   const limited = resultCoverage === 'partial' || countCoverage === 'partial';
-  const status: SearchStatus = aggregate.status === 'completed' && limited ? 'partial' : aggregate.status;
+  const status: SearchStatus =
+    aggregate.status === 'completed' && limited ? 'partial' : aggregate.status;
   const common = {
-    query: input.query, status, ...(aggregate.diagnostic ? { diagnostic: aggregate.diagnostic } : {}), resultCoverage, countCoverage,
-    examinedFileCount: aggregate.examinedFileCount, matchingFileCount: aggregate.files.size,
-    matchingLineCount: aggregate.matchingLineCount, occurrenceCount: aggregate.occurrenceCount, omittedResultCount,
+    query: input.query,
+    status,
+    ...(aggregate.diagnostic ? { diagnostic: aggregate.diagnostic } : {}),
+    resultCoverage,
+    countCoverage,
+    examinedFileCount: aggregate.examinedFileCount,
+    matchingFileCount: aggregate.files.size,
+    matchingLineCount: aggregate.matchingLineCount,
+    occurrenceCount: aggregate.occurrenceCount,
+    omittedResultCount,
     countsCapped: countCoverage === 'partial',
     omittedResultCountIsLowerBound: perFileOmitted > 0 || aggregate.outputTruncated,
     outputTruncated: aggregate.outputTruncated,
-    perFileOmissions: [...aggregate.perFileOmissions.entries()].sort(([a], [b]) => compare(a, b)).map(([file, omittedAtLeast]) => ({
-      path: file, cause: 'per_file_limit' as const, retainedMatches: perFileLimit, omittedAtLeast
-    }))
+    perFileOmissions: [...aggregate.perFileOmissions.entries()]
+      .sort(([a], [b]) => compare(a, b))
+      .map(([file, omittedAtLeast]) => ({
+        path: file,
+        cause: 'per_file_limit' as const,
+        retainedMatches: perFileLimit,
+        omittedAtLeast
+      }))
   };
   let output: SearchTextOutput;
-  if (input.mode === 'files') output = { ...common, mode: 'files', results: [...aggregate.files].sort(compare).slice(0, resultLimit) };
-  else if (input.mode === 'count') output = { ...common, mode: 'count', results: [...aggregate.counts.entries()].sort(([a], [b]) => compare(a, b)).slice(0, resultLimit).map(([file, count]) => ({ path: file, ...count })) };
+  if (input.mode === 'files')
+    output = {
+      ...common,
+      mode: 'files',
+      results: [...aggregate.files].sort(compare).slice(0, resultLimit)
+    };
+  else if (input.mode === 'count')
+    output = {
+      ...common,
+      mode: 'count',
+      results: [...aggregate.counts.entries()]
+        .sort(([a], [b]) => compare(a, b))
+        .slice(0, resultLimit)
+        .map(([file, count]) => ({ path: file, ...count }))
+    };
   else {
-    const results = aggregate.matches.sort((a, b) => compare(a.path, b.path) || a.lineNumber - b.lineNumber).slice(0, resultLimit).map((match) => {
-      if (input.contextLines === 0) return match;
-      const lines = aggregate.contexts.get(match.path);
-      return {
-        ...match,
-        context: {
-          before: range(match.lineNumber - input.contextLines, match.lineNumber - 1).flatMap((line) => {
-            const text = lines?.get(line); return text === undefined ? [] : [{ lineNumber: line, text }];
-          }),
-          after: range(match.lineNumber + 1, match.lineNumber + input.contextLines).flatMap((line) => {
-            const text = lines?.get(line); return text === undefined ? [] : [{ lineNumber: line, text }];
-          })
-        }
-      };
-    });
+    const results = aggregate.matches
+      .sort((a, b) => compare(a.path, b.path) || a.lineNumber - b.lineNumber)
+      .slice(0, resultLimit)
+      .map((match) => {
+        if (input.contextLines === 0) return match;
+        const lines = aggregate.contexts.get(match.path);
+        return {
+          ...match,
+          context: {
+            before: range(match.lineNumber - input.contextLines, match.lineNumber - 1).flatMap(
+              (line) => {
+                const text = lines?.get(line);
+                return text === undefined ? [] : [{ lineNumber: line, text }];
+              }
+            ),
+            after: range(match.lineNumber + 1, match.lineNumber + input.contextLines).flatMap(
+              (line) => {
+                const text = lines?.get(line);
+                return text === undefined ? [] : [{ lineNumber: line, text }];
+              }
+            )
+          }
+        };
+      });
     output = { ...common, mode: 'matches', results };
   }
-  const coverage = resultCoverage === 'complete' && countCoverage === 'complete' ? 'complete' as const : 'partial' as const;
+  const coverage =
+    resultCoverage === 'complete' && countCoverage === 'complete'
+      ? ('complete' as const)
+      : ('partial' as const);
   const scope = {
-    resources: [fileScope(input.path)], coverage,
-    filters: { patterns: input.patterns, exclude: input.exclude, respectGitIgnore: input.respectGitIgnore, query: input.query, mode: input.mode },
+    resources: [fileScope(input.path)],
+    coverage,
+    filters: {
+      patterns: input.patterns,
+      exclude: input.exclude,
+      respectGitIgnore: input.respectGitIgnore,
+      query: input.query,
+      mode: input.mode
+    },
     limits: { resultLimit, perFileLimit, contextLines: input.contextLines },
-    ...(coverage === 'partial' ? { causes: [
-      ...(status !== 'partial' ? [status] : []),
-      ...(globallyOmitted > 0 ? ['result_limit'] : []),
-      ...(perFileOmitted > 0 ? ['per_file_limit'] : [])
-    ], omitted: { results: omittedResultCount, perFile: perFileOmitted }, truncated: aggregate.outputTruncated || limited } : {})
+    ...(coverage === 'partial'
+      ? {
+          causes: [
+            ...(status !== 'partial' ? [status] : []),
+            ...(globallyOmitted > 0 ? ['result_limit'] : []),
+            ...(perFileOmitted > 0 ? ['per_file_limit'] : [])
+          ],
+          omitted: { results: omittedResultCount, perFile: perFileOmitted },
+          truncated: aggregate.outputTruncated || limited
+        }
+      : {})
   } as const;
   return {
-    kind: 'result', ok: status === 'completed' || status === 'partial',
-    summary: status === 'completed' || status === 'partial'
-      ? (output.countCoverage === 'complete' ? 'Found ' : 'Reported at least ') + String(output.occurrenceCount) + ' occurrences on '
-        + (output.countCoverage === 'complete' ? '' : 'at least ') + String(output.matchingLineCount) + ' lines in ' + String(output.matchingFileCount) + ' files.'
-      : 'Search failed: ' + status + '.',
+    kind: 'result',
+    summary:
+      status === 'completed' || status === 'partial'
+        ? (output.countCoverage === 'complete' ? 'Found ' : 'Reported at least ') +
+          String(output.occurrenceCount) +
+          ' occurrences on ' +
+          (output.countCoverage === 'complete' ? '' : 'at least ') +
+          String(output.matchingLineCount) +
+          ' lines in ' +
+          String(output.matchingFileCount) +
+          ' files.'
+        : 'Search failed: ' + status + '.',
     scope,
     observedFacts: builtInObservedFacts(
       'search',
@@ -131,8 +252,28 @@ export async function searchText(input: SearchTextInput, context: ToolExecutionC
   };
 }
 
-async function runRipgrep(root: RootedFileAuthority, files: readonly string[], args: readonly string[], maxOutputBytes: number, maxFileBytes: number, mode: SearchTextInput['mode'], perFileLimit?: number, signal?: AbortSignal): Promise<SearchAggregate> {
-  const aggregate: SearchAggregate = { files: new Set(), counts: new Map(), matches: [], contexts: new Map(), matchingLineCount: 0, occurrenceCount: 0, examinedFileCount: 0, status: 'completed', perFileOmissions: new Map(), outputTruncated: false };
+async function runRipgrep(
+  root: RootedFileAuthority,
+  files: readonly string[],
+  args: readonly string[],
+  maxOutputBytes: number,
+  maxFileBytes: number,
+  mode: SearchTextInput['mode'],
+  perFileLimit?: number,
+  signal?: AbortSignal
+): Promise<SearchAggregate> {
+  const aggregate: SearchAggregate = {
+    files: new Set(),
+    counts: new Map(),
+    matches: [],
+    contexts: new Map(),
+    matchingLineCount: 0,
+    occurrenceCount: 0,
+    examinedFileCount: 0,
+    status: 'completed',
+    perFileOmissions: new Map(),
+    outputTruncated: false
+  };
   let observedBytes = 0;
   const batches = files.length === 0 ? [Object.freeze([] as string[])] : batchesOf(files, 64);
   for (const batch of batches) {
@@ -141,31 +282,66 @@ async function runRipgrep(root: RootedFileAuthority, files: readonly string[], a
     for (const filePath of batch) {
       try {
         const handle = await root.openFile(filePath);
-        if (handle.size > maxFileBytes) { await handle.close(); continue; }
+        if (handle.size > maxFileBytes) {
+          await handle.close();
+          continue;
+        }
         opened.push({ path: filePath, handle });
       } catch (error) {
-        aggregate.status = 'io_error'; aggregate.diagnostic = message(error); break;
+        aggregate.status = 'io_error';
+        aggregate.diagnostic = message(error);
+        break;
       }
     }
     try {
-      observedBytes = await runRipgrepBatch(opened, args, maxOutputBytes, observedBytes, aggregate, mode, perFileLimit, signal);
+      observedBytes = await runRipgrepBatch(
+        opened,
+        args,
+        maxOutputBytes,
+        observedBytes,
+        aggregate,
+        mode,
+        perFileLimit,
+        signal
+      );
       aggregate.examinedFileCount += opened.length;
       if (!signal?.aborted) {
         for (const { path: rootedDirectory, handle } of opened) {
           let currentPathIdentity;
-          try { currentPathIdentity = await root.fileIdentity(rootedDirectory); }
-          catch { aggregate.status = 'io_error'; aggregate.diagnostic = `Search source was replaced while it was being read: ${rootedDirectory}`; break; }
-          if (!rootedFileIdentitiesEqual(await handle.identityNow(), handle.identity) || !rootedFileIdentitiesEqual(currentPathIdentity, handle.identity)) {
-            aggregate.status = 'io_error'; aggregate.diagnostic = `Search source changed while it was being read: ${rootedDirectory}`; break;
+          try {
+            currentPathIdentity = await root.fileIdentity(rootedDirectory);
+          } catch {
+            aggregate.status = 'io_error';
+            aggregate.diagnostic = `Search source was replaced while it was being read: ${rootedDirectory}`;
+            break;
+          }
+          if (
+            !rootedFileIdentitiesEqual(await handle.identityNow(), handle.identity) ||
+            !rootedFileIdentitiesEqual(currentPathIdentity, handle.identity)
+          ) {
+            aggregate.status = 'io_error';
+            aggregate.diagnostic = `Search source changed while it was being read: ${rootedDirectory}`;
+            break;
           }
         }
       }
-    } finally { await Promise.all(opened.map(({ handle }) => handle.close())); }
+    } finally {
+      await Promise.all(opened.map(({ handle }) => handle.close()));
+    }
   }
   return aggregate;
 }
 
-async function runRipgrepBatch(opened: readonly { readonly path: string; readonly handle: RootedFileHandle }[], args: readonly string[], maxOutputBytes: number, initialObservedBytes: number, aggregate: SearchAggregate, mode: SearchTextInput['mode'], perFileLimit?: number, signal?: AbortSignal): Promise<number> {
+async function runRipgrepBatch(
+  opened: readonly { readonly path: string; readonly handle: RootedFileHandle }[],
+  args: readonly string[],
+  maxOutputBytes: number,
+  initialObservedBytes: number,
+  aggregate: SearchAggregate,
+  mode: SearchTextInput['mode'],
+  perFileLimit?: number,
+  signal?: AbortSignal
+): Promise<number> {
   let child;
   const pathMap = new Map<string, string>();
   const inheritedPaths = opened.map(({ path: rootedDirectory }, index) => {
@@ -178,26 +354,42 @@ async function runRipgrepBatch(opened: readonly { readonly path: string; readonl
       stdio: ['ignore', 'pipe', 'pipe', ...opened.map(({ handle }) => handle.descriptor)],
       ...(signal ? { signal } : {})
     });
+  } catch (error) {
+    aggregate.status =
+      code(error) === 'ENOENT' ? 'missing_ripgrep' : signal?.aborted ? 'aborted' : 'failed';
+    aggregate.diagnostic = message(error);
+    return initialObservedBytes;
   }
-  catch (error) { aggregate.status = code(error) === 'ENOENT' ? 'missing_ripgrep' : signal?.aborted ? 'aborted' : 'failed'; aggregate.diagnostic = message(error); return initialObservedBytes; }
-  const stdoutStream = child.stdout; const stderrStream = child.stderr;
+  const stdoutStream = child.stdout;
+  const stderrStream = child.stderr;
   if (!stdoutStream || !stderrStream) throw new Error('Ripgrep pipes were not created.');
-  stdoutStream.setEncoding('utf8'); stderrStream.setEncoding('utf8');
-  let stdout = ''; let stderr = ''; let observedBytes = initialObservedBytes; let spawnError: unknown;
+  stdoutStream.setEncoding('utf8');
+  stderrStream.setEncoding('utf8');
+  let stdout = '';
+  let stderr = '';
+  let observedBytes = initialObservedBytes;
+  let spawnError: unknown;
   const bounded = (chunk: string): string => {
     const remaining = Math.max(0, maxOutputBytes - observedBytes);
     observedBytes += Buffer.byteLength(chunk, 'utf8');
     if (Buffer.byteLength(chunk, 'utf8') <= remaining) return chunk;
-    aggregate.status = 'output_limit'; aggregate.outputTruncated = true; child.kill('SIGTERM');
+    aggregate.status = 'output_limit';
+    aggregate.outputTruncated = true;
+    child.kill('SIGTERM');
     return takeUtf8(chunk, remaining);
   };
   stdoutStream.on('data', (chunk: string) => {
     stdout += bounded(chunk);
-    const lines = stdout.split('\n'); stdout = lines.pop() ?? '';
+    const lines = stdout.split('\n');
+    stdout = lines.pop() ?? '';
     for (const line of lines) consume(line, aggregate, mode, perFileLimit, pathMap);
   });
-  stderrStream.on('data', (chunk: string) => { stderr += bounded(chunk); });
-  child.once('error', (error) => { spawnError = error; });
+  stderrStream.on('data', (chunk: string) => {
+    stderr += bounded(chunk);
+  });
+  child.once('error', (error) => {
+    spawnError = error;
+  });
   const exitCode = await new Promise<number | null>((resolve) => child.once('close', resolve));
   if (stdout.length > 0) {
     const complete = consume(stdout, aggregate, mode, perFileLimit, pathMap);
@@ -209,54 +401,94 @@ async function runRipgrepBatch(opened: readonly { readonly path: string; readonl
   }
   const diagnostic = stderr.trim();
   if (spawnError) {
-    aggregate.status = code(spawnError) === 'ENOENT' ? 'missing_ripgrep' : signal?.aborted ? 'aborted' : 'failed';
+    aggregate.status =
+      code(spawnError) === 'ENOENT' ? 'missing_ripgrep' : signal?.aborted ? 'aborted' : 'failed';
     aggregate.diagnostic = message(spawnError);
   } else if (signal?.aborted) {
-    aggregate.status = 'aborted'; aggregate.diagnostic = message(signal.reason);
+    aggregate.status = 'aborted';
+    aggregate.diagnostic = message(signal.reason);
   } else if (aggregate.status === 'output_limit') {
-    aggregate.diagnostic = [aggregate.diagnostic, 'ripgrep output exceeded the host byte limit; a terminal JSON event may be incomplete.'].filter(Boolean).join(' ');
+    aggregate.diagnostic = [
+      aggregate.diagnostic,
+      'ripgrep output exceeded the host byte limit; a terminal JSON event may be incomplete.'
+    ]
+      .filter(Boolean)
+      .join(' ');
   } else if (exitCode === 2) {
-    aggregate.status = /regex parse error|error parsing regex|invalid regular expression/iu.test(diagnostic) ? 'invalid_pattern' : /permission denied|I\/O error|no such file/iu.test(diagnostic) ? 'io_error' : 'failed';
+    aggregate.status = /regex parse error|error parsing regex|invalid regular expression/iu.test(
+      diagnostic
+    )
+      ? 'invalid_pattern'
+      : /permission denied|I\/O error|no such file/iu.test(diagnostic)
+        ? 'io_error'
+        : 'failed';
     aggregate.diagnostic = diagnostic || 'ripgrep rejected the search request.';
   } else if (exitCode !== 0 && exitCode !== 1) {
-    aggregate.status = 'failed'; aggregate.diagnostic = diagnostic || 'ripgrep exited with code ' + String(exitCode) + '.';
+    aggregate.status = 'failed';
+    aggregate.diagnostic = diagnostic || 'ripgrep exited with code ' + String(exitCode) + '.';
   }
   return observedBytes;
 }
-function consume(line: string, aggregate: SearchAggregate, mode: SearchTextInput['mode'], perFileLimit: number | undefined, pathMap: ReadonlyMap<string, string>): boolean {
+function consume(
+  line: string,
+  aggregate: SearchAggregate,
+  mode: SearchTextInput['mode'],
+  perFileLimit: number | undefined,
+  pathMap: ReadonlyMap<string, string>
+): boolean {
   if (line.trim().length === 0) return true;
   let event: unknown;
-  try { event = JSON.parse(line); } catch { return false; }
+  try {
+    event = JSON.parse(line);
+  } catch {
+    return false;
+  }
   if (!record(event) || typeof event.type !== 'string' || !record(event.data)) return true;
   if (event.type === 'summary' && record(event.data.stats)) {
     const searches = event.data.stats.searches;
-    if (typeof searches === 'number' && Number.isSafeInteger(searches) && searches >= 0) aggregate.examinedFileCount = searches;
+    if (typeof searches === 'number' && Number.isSafeInteger(searches) && searches >= 0)
+      aggregate.examinedFileCount = searches;
     return true;
   }
   if (event.type !== 'match' && event.type !== 'context') return true;
   const data = event.data as RipgrepData;
-  const rawFile = data.path?.text; const lineNumber = data.line_number;
+  const rawFile = data.path?.text;
+  const lineNumber = data.line_number;
   if (typeof rawFile !== 'string' || typeof lineNumber !== 'number') return true;
   const normalizedFile = rawFile.replaceAll('\\', '/').replace(/^\.\//u, '');
   const file = pathMap.get(normalizedFile) ?? normalizedFile;
   const text = data.lines?.text?.replace(/\r?\n$/u, '') ?? '';
   let contexts = aggregate.contexts.get(file);
-  if (!contexts) { contexts = new Map(); aggregate.contexts.set(file, contexts); }
+  if (!contexts) {
+    contexts = new Map();
+    aggregate.contexts.set(file, contexts);
+  }
   contexts.set(lineNumber, text);
   if (event.type === 'context') return true;
-  const occurrences = (data.submatches ?? []).map((match) => ({ startByte: match.start ?? 0, endByte: match.end ?? match.start ?? 0, text: match.match?.text ?? '' }));
+  const occurrences = (data.submatches ?? []).map((match) => ({
+    startByte: match.start ?? 0,
+    endByte: match.end ?? match.start ?? 0,
+    text: match.match?.text ?? ''
+  }));
   const count = aggregate.counts.get(file) ?? { matchingLineCount: 0, occurrenceCount: 0 };
   aggregate.files.add(file);
   if (perFileLimit !== undefined && count.matchingLineCount >= perFileLimit) {
     aggregate.perFileOmissions.set(file, (aggregate.perFileOmissions.get(file) ?? 0) + 1);
     return true;
   }
-  aggregate.matchingLineCount += 1; aggregate.occurrenceCount += occurrences.length;
-  count.matchingLineCount += 1; count.occurrenceCount += occurrences.length; aggregate.counts.set(file, count);
+  aggregate.matchingLineCount += 1;
+  aggregate.occurrenceCount += occurrences.length;
+  count.matchingLineCount += 1;
+  count.occurrenceCount += occurrences.length;
+  aggregate.counts.set(file, count);
   if (mode === 'matches') aggregate.matches.push({ path: file, lineNumber, text, occurrences });
   return true;
 }
-function range(start: number, end: number): number[] { const output: number[] = []; for (let value = Math.max(1, start); value <= end; value += 1) output.push(value); return output; }
+function range(start: number, end: number): number[] {
+  const output: number[] = [];
+  for (let value = Math.max(1, start); value <= end; value += 1) output.push(value);
+  return output;
+}
 function takeUtf8(value: string, maxBytes: number): string {
   const bytes = Buffer.from(value, 'utf8');
   if (bytes.byteLength <= maxBytes) return value;
@@ -265,17 +497,27 @@ function takeUtf8(value: string, maxBytes: number): string {
   const lead = bytes[end];
   if (lead !== undefined) {
     const width = lead < 0x80 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
-    if (end + width > maxBytes) { /* Exclude the incomplete final code point. */ }
-    else end = maxBytes;
+    if (end + width > maxBytes) {
+      /* Exclude the incomplete final code point. */
+    } else end = maxBytes;
   }
   return bytes.subarray(0, end).toString('utf8');
 }
-function compare(a: string, b: string): number { return a.localeCompare(b, 'en'); }
-function record(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
-function code(error: unknown): string | undefined { return record(error) && typeof error.code === 'string' ? error.code : undefined; }
-function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+function compare(a: string, b: string): number {
+  return a.localeCompare(b, 'en');
+}
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+function code(error: unknown): string | undefined {
+  return record(error) && typeof error.code === 'string' ? error.code : undefined;
+}
+function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 function batchesOf<T>(values: readonly T[], size: number): readonly (readonly T[])[] {
   const batches: T[][] = [];
-  for (let index = 0; index < values.length; index += size) batches.push(values.slice(index, index + size));
+  for (let index = 0; index < values.length; index += size)
+    batches.push(values.slice(index, index + size));
   return batches;
 }

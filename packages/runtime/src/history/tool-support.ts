@@ -1,5 +1,9 @@
 import * as z from 'zod';
-import { defineTool, type CompiledToolDefinition, type ToolExecutionContext } from '@agent-core/tools';
+import {
+  defineTool,
+  type CompiledToolDefinition,
+  type ToolExecutionContext
+} from '@agent-core/tools';
 import { parseJsonObject, parseJsonValue, type JsonObject } from '@agent-core/json';
 
 export { sourceSchema, scopeSchema, noteRefSchema } from './schema.js';
@@ -28,6 +32,7 @@ export function scopedTool(input: {
   readonly name: string;
   readonly description: string;
   readonly schema: z.ZodType;
+  readonly buildModelContent?: import('@agent-core/tools').ToolDefinition['buildModelContent'];
   readonly mode: 'read' | 'write';
   readonly root: string;
   readonly canonicalize: (
@@ -40,6 +45,7 @@ export function scopedTool(input: {
     implementationId: `agent-core.${input.name}.v1`,
     description: input.description,
     schema: input.schema,
+    ...(input.buildModelContent ? { buildModelContent: input.buildModelContent } : {}),
     outputSchema: z.json(),
     effectEnvelope: {
       accesses: [{ mode: input.mode, scope: input.root }],
@@ -60,7 +66,9 @@ export function scopedTool(input: {
     },
     async invoke(value: unknown, context) {
       if (context.signal?.aborted)
-        throw context.signal.reason instanceof Error ? context.signal.reason : new Error('Tool aborted.');
+        throw context.signal.reason instanceof Error
+          ? context.signal.reason
+          : new Error('Tool aborted.');
       const canonical = parseJsonObject(value);
       if (typeof canonical.scope !== 'string') throw new Error('Missing tool scope.');
       const output = parseJsonValue(await input.invoke(parseJsonObject(canonical.value), context), {
@@ -70,20 +78,22 @@ export function scopedTool(input: {
         maxTotalBytes: 2 * 1024 * 1024
       });
       const result =
-        typeof output === 'object' && output !== null && !Array.isArray(output) ? output : undefined;
+        typeof output === 'object' && output !== null && !Array.isArray(output)
+          ? output
+          : undefined;
       const status =
-        result && 'status' in result && typeof result.status === 'string' ? result.status : 'completed';
-      const ok = !['conflict', 'missing', 'tombstone', 'artifact_unavailable', 'unavailable'].includes(
-        status
-      );
+        result && 'status' in result && typeof result.status === 'string'
+          ? result.status
+          : 'completed';
       return {
         kind: 'result',
-        ok,
+        execution: { state: 'settled' },
         summary: `${input.name}: ${status}.`,
         output,
         scope: {
           resources: [canonical.scope],
-          coverage: result && 'coverage' in result && result.coverage === 'partial' ? 'partial' : 'complete'
+          coverage:
+            result && 'coverage' in result && result.coverage === 'partial' ? 'partial' : 'complete'
         }
       };
     }

@@ -58,7 +58,12 @@ class Provider {
   async complete(request) {
     this.calls += 1;
     if (this.calls > 1)
-      return { content: 'done', provider: 'scripted', model: request.model, terminationReason: 'stop' };
+      return {
+        content: 'done',
+        provider: 'scripted',
+        model: request.model,
+        terminationReason: 'stop'
+      };
     const script =
       "console.log('PROCESS_SECRET=' + process.env.AGENT_CORE_TEST_PROCESS_SECRET + ' Authorization: Bearer ' + process.env.AGENT_CORE_TEST_BEARER_SECRET)";
     const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`;
@@ -102,7 +107,8 @@ const secretResult = defineTool({
   deriveEffects: () => ({ ...base, recovery: { kind: 'unknown' } }),
   invoke: async () => ({
     kind: 'result',
-    ok: true,
+    execution: { state: 'settled' },
+
     summary: 'secret output',
     scope: { resources: ['memory/secrets'], coverage: 'complete' },
     output: {
@@ -125,13 +131,12 @@ const secretFailure = defineTool({
   deriveEffects: () => ({ ...base, recovery: { kind: 'unknown' } }),
   invoke: async () => ({
     kind: 'failure',
-    ok: false,
+    execution: { state: 'settled' },
+
     summary: 'failed safely',
     scope: { resources: ['memory/secrets'], coverage: 'partial', causes: ['runtime_error'] },
     output: {
-      blocked: true,
       reason: 'runtime_error',
-      recovery: 'retry without secrets',
       error: `Authorization: Bearer ${secrets[1]}`,
       details: { password: secrets[2], token: secrets[0] }
     }

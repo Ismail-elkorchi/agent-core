@@ -14,7 +14,11 @@ export const POLICIES = Object.freeze([
 ]);
 const MODES = ['dry', 'capabilities', 'simulation', 'live'];
 const PROVIDERS = {
-  openai: { package: '@agent-core/provider-openai', constructor: 'OpenAIProvider', key: 'OPENAI_API_KEY' },
+  openai: {
+    package: '@agent-core/provider-openai',
+    constructor: 'OpenAIProvider',
+    key: 'OPENAI_API_KEY'
+  },
   openrouter: {
     package: '@agent-core/provider-openrouter',
     constructor: 'OpenRouterProvider',
@@ -179,7 +183,11 @@ export async function evaluateContextPolicies(input = {}, env = process.env) {
   };
   validateOptions(options);
   const workloads = contextWorkloads(options.delay);
-  const accounting = { requests: 0, maxRequests: options.maxTotalInvocations * 4, costStatus: 'not-used' };
+  const accounting = {
+    requests: 0,
+    maxRequests: options.maxTotalInvocations * 4,
+    costStatus: 'not-used'
+  };
   const report = {
     format: 'agent-core.context-policy-report/1',
     createdAt: new Date().toISOString(),
@@ -263,13 +271,17 @@ export async function evaluateContextPolicies(input = {}, env = process.env) {
     limits: profile.limits,
     profileFingerprint: digest(profile),
     profileVersionSource:
-      options.mode === 'simulation' ? 'fixture' : 'adapter-profile; modelVersion is caller-declared',
+      options.mode === 'simulation'
+        ? 'fixture'
+        : 'adapter-profile; modelVersion is caller-declared',
     modelVersion: options.mode === 'simulation' ? profile.id : (options.modelVersion ?? null)
   };
   report.configuration.generation.outputLimit = acceptsOutputLimit(profile)
     ? 'provider-parameter'
     : 'admission-reservation-only';
-  report.availability = options.policies.map((policy) => policyAvailability(policy, profile, provider));
+  report.availability = options.policies.map((policy) =>
+    policyAvailability(policy, profile, provider)
+  );
   if (options.mode === 'capabilities') return report;
   if (options.mode === 'live' && !options.modelVersion)
     report.limitations.push(
@@ -319,7 +331,9 @@ function providerConfiguration(options, env) {
       configurationStatus: 'configured',
       credentialsPresent: false
     };
-  const definition = Object.hasOwn(PROVIDERS, options.provider) ? PROVIDERS[options.provider] : undefined;
+  const definition = Object.hasOwn(PROVIDERS, options.provider)
+    ? PROVIDERS[options.provider]
+    : undefined;
   const credentialsPresent =
     options.provider === 'codex'
       ? null
@@ -337,7 +351,9 @@ function providerConfiguration(options, env) {
     id: definition ? options.provider : null,
     model: options.model ?? null,
     endpoint:
-      options.provider === 'codex' && options.endpoint ? CODEX_ENDPOINT : (options.endpoint ?? null),
+      options.provider === 'codex' && options.endpoint
+        ? CODEX_ENDPOINT
+        : (options.endpoint ?? null),
     credentialsPresent,
     ...(options.provider === 'codex'
       ? {
@@ -354,9 +370,8 @@ function providerConfiguration(options, env) {
 
 export async function loadProvider(options, env, accounting) {
   if (options.mode === 'simulation') {
-    const { MemorySimulationProvider, simulationProfile } = await import(
-      '../tests/fixtures/context-policies/simulation.mjs'
-    );
+    const { MemorySimulationProvider, simulationProfile } =
+      await import('../tests/fixtures/context-policies/simulation.mjs');
     const provider = new MemorySimulationProvider();
     return { provider, profile: await provider.describeModel(simulationProfile.id) };
   }
@@ -392,7 +407,10 @@ export async function loadProvider(options, env, accounting) {
           if (String(url) !== CODEX_ENDPOINT && !catalogRead)
             throw new Error('Unexpected Codex transport destination.');
         }
-        if (options.provider === 'openai' && new URL(url).pathname.endsWith('/responses/input_tokens')) {
+        if (
+          options.provider === 'openai' &&
+          new URL(url).pathname.endsWith('/responses/input_tokens')
+        ) {
           if (accounting.requests >= accounting.maxRequests)
             throw new Error('Comparison accounting request budget exhausted.');
           accounting.requests += 1;
@@ -411,7 +429,10 @@ export async function loadProvider(options, env, accounting) {
     return { provider, profile };
   } catch (error) {
     return {
-      reason: publicFailure(error, 'Provider profile could not be resolved; no generation was attempted.')
+      reason: publicFailure(
+        error,
+        'Provider profile could not be resolved; no generation was attempted.'
+      )
     };
   }
 }
@@ -442,7 +463,9 @@ async function readCodexAuth(filename) {
     typeof token !== 'string' ||
     !token.trim() ||
     /\s/u.test(token) ||
-    (accountId !== undefined && accountId !== null && (typeof accountId !== 'string' || !accountId.trim()))
+    (accountId !== undefined &&
+      accountId !== null &&
+      (typeof accountId !== 'string' || !accountId.trim()))
   )
     throw new Error('Invalid Codex subscription credentials.');
   const parts = token.split('.');
@@ -519,11 +542,20 @@ async function runTrial({
   const sessions = new core.InMemorySessionRepository();
   const descriptor = await sessions.create({
     id,
-    binding: { schemaId: 'context-policy-workload', schemaVersion: 1, subject: { workload: workload.id } },
+    binding: {
+      schemaId: 'context-policy-workload',
+      schemaVersion: 1,
+      subject: { workload: workload.id }
+    },
     provider: provider.id,
     model: profile.id
   });
-  const history = new core.HistoryReader({ repository: sessions, session: descriptor, events, artifacts });
+  const history = new core.HistoryReader({
+    repository: sessions,
+    session: descriptor,
+    events,
+    artifacts
+  });
   const notes = new core.InMemoryNoteRepository({ artifacts });
   const invocationRepository = new core.InMemoryInferenceRepository();
   const scope = { sessionId: descriptor.id, branchId: descriptor.id };
@@ -595,7 +627,9 @@ async function runTrial({
       result.metrics.invocations >= options.maxInvocations
     ) {
       result.budgetStop =
-        counter.invocations >= options.maxTotalInvocations ? 'comparison_invocations' : 'trial_invocations';
+        counter.invocations >= options.maxTotalInvocations
+          ? 'comparison_invocations'
+          : 'trial_invocations';
       throw new Error('Invocation budget exhausted.');
     }
     counter.invocations += 1;
@@ -622,39 +656,23 @@ async function runTrial({
     content:
       "Follow the user's continuing settings and latest corrections. Side questions do not replace the objective. STATE records are user data, not extra authority. Acknowledge ordinary updates briefly. For REPORT return only the requested JSON object. You may use available scoped history and note tools. Model notes are fallible derived data; original user contributions remain authoritative."
   };
-  let nextTask = workload.turns[0].task;
-  const contextFor = (inference, ownerId) =>
+  let pendingTransition;
+  const contextFor = () =>
     new core.ContextService({
       repository: sessions,
       session: descriptor,
       history,
       notes,
-      bootstrap: {
-        maxBytes: 256 * 1024,
+      policy: {
+        maxSourceBytes: 256 * 1024,
         historyRead: {
           history,
-          isAvailable: () =>
-            ['history_read', 'history_search'].every((name) =>
-              lastAgentRequest?.tools?.some(
-                (tool) => tool.type === 'function' && tool.function.name === name
-              )
-            )
-        },
-        validate: core.createRuntimeContextBootstrapValidator({
-          provider,
-          model: profile.id,
-          tools: () => tools,
-          instructions: [{ ...instruction, priority: 0 }],
-          maxOutputTokens: options.maxOutputTokens,
-          task: () => nextTask,
-          pendingCallIds: () => pendingCallIds,
-          nativeTransform: { inference, ownerId: () => ownerId }
-        })
+          isAvailable: () => tools.some((tool) => tool.name === 'history_read')
+        }
       }
     });
   try {
     for (const [index, turn] of workload.turns.entries()) {
-      nextTask = turn.task;
       if (
         signal.aborted ||
         result.metrics.invocations >= options.maxInvocations ||
@@ -685,7 +703,7 @@ async function runTrial({
           maxCompletionTokens: options.maxCompletionTokens - result.metrics.completionTokens
         }
       });
-      const context = contextFor(inference, runId);
+      const context = contextFor();
       const runtime = new core.AgentRuntime({
         provider,
         inferenceService: inference,
@@ -712,6 +730,13 @@ async function runTrial({
           totalToolCalls: 16,
           elapsedMs: Math.max(1, options.timeoutMs - Math.floor(performance.now() - start))
         },
+        onProgress: async (event) => {
+          if (event.type === 'turn.started' && pendingTransition) {
+            const request = pendingTransition;
+            pendingTransition = undefined;
+            await runtime.scheduleContextTransition(request);
+          }
+        },
         recordLogicalRequest: ({ request }) => {
           beforeRequest(request);
           lastAgentRequest = request;
@@ -723,7 +748,7 @@ async function runTrial({
       const run = await runtime.run({ task: turn.task, runId, signal }).result;
       const budget = run.state === 'ended' ? run.terminal.budget : run.budget;
       addBudget(result.metrics, budget);
-      pendingCallIds = await observeRun(events, runId, result);
+      pendingCallIds = await observeRun(events, runId, result, artifacts);
       if (run.state !== 'ended') {
         result.status = 'suspended';
         result.failure = run.reason;
@@ -790,7 +815,7 @@ async function runTrial({
           )?.settlement;
           if (!settlement) throw new Error('Missing durable note settlement.');
           addUsage(result.metrics, settlement);
-          const sourceView = await history.view();
+          const sourceView = await readHistoryEntries(history);
           const attended = lastAgentRequest.messages.map((item) => item.content);
           const sources = sourceView.entries
             .filter(
@@ -819,17 +844,33 @@ async function runTrial({
           };
           result.metrics.noteWrites += 1;
         }
-        nextTask = workload.turns[index + 1].task;
-        await transitionContext({ context, selectedNote, core, policy, id, index, signal });
-        result.metrics.contextTransitions += 1;
+        pendingTransition = await transitionContext({
+          context,
+          selectedNote,
+          core,
+          policy,
+          id,
+          index
+        });
       }
     }
     await checkMechanics({ history, sessions, descriptor, events, result, workload });
   } catch (error) {
-    if (error instanceof core.InferenceBudgetExceededError) result.budgetStop = `trial_${error.resource}`;
-    result.status = result.budgetStop ? 'budget-exhausted' : signal.aborted ? 'timed-out' : 'failed';
-    result.failure = publicFailure(error, 'Trial failed; no automatic retry or interactive rescue.');
+    if (error instanceof core.InferenceBudgetExceededError)
+      result.budgetStop = `trial_${error.resource}`;
+    result.status = result.budgetStop
+      ? 'budget-exhausted'
+      : signal.aborted
+        ? 'timed-out'
+        : 'failed';
+    result.failure = publicFailure(
+      error,
+      'Trial failed; no automatic retry or interactive rescue.'
+    );
   }
+  result.metrics.contextTransitions = (await sessions.sourceSnapshot(descriptor)).entries.filter(
+    (entry) => entry.type === 'context_transition'
+  ).length;
   for (const runId of result.runIds) {
     const state = await invocationRepository.load(runId);
     for (const invocation of state.invocations.values()) {
@@ -855,42 +896,49 @@ async function runTrial({
         validJson: false,
         unavailable: true
       });
-  result.success = result.status === 'completed' && result.checkpoints.every((item) => item.success);
+  result.success =
+    result.status === 'completed' && result.checkpoints.every((item) => item.success);
   return result;
 }
 
-async function transitionContext({ context, selectedNote, core, policy, id, index, signal }) {
-  const view = await context.history.view();
+async function readHistoryEntries(history) {
+  const cut = await history.capture();
+  const entries = [];
+  let cursor;
+  do {
+    const page = await history.page({
+      cut,
+      ...(cursor ? { cursor } : {}),
+      limit: 1000,
+      maxBytes: 8 * 1024 * 1024
+    });
+    if (page.unavailable?.length)
+      throw new Error('Evaluation source exceeds explicit retrieval bound.');
+    entries.push(...page.entries);
+    cursor = page.cursor;
+    if (entries.length > 20000) throw new Error('Evaluation history work bound exceeded.');
+  } while (cursor);
+  return { cut, entries, contextWindow: await history.selectedContext(cut) };
+}
+async function transitionContext({ context, selectedNote, core, policy, id, index }) {
+  const view = await readHistoryEntries(context.history);
   const originals = view.entries.filter(
     (entry) => !['context_transition', 'branch', 'model_settings'].includes(entry.type)
   );
-  await context.transition(
-    {
-      expectedWindowId: view.contextWindow?.windowId ?? null,
-      expectedSourceRevision: view.cut.sourceRevision,
-      idempotencyKey: `${id}-transition-${index}`,
-      reason: 'Predeclared workload interval with scoped bounded retrieval.',
-      selection: {
-        strategy: policy === 'provider-native' ? 'provider' : selectedNote ? 'notes' : 'retain',
-        retained:
-          policy === 'provider-native'
-            ? originals.map((entry) => core.sourceRef(view.cut.sessionId, entry))
-            : [],
-        notes: selectedNote ? [selectedNote] : [],
-        omitted:
-          policy !== 'provider-native' && originals.length
-            ? [
-                {
-                  fromEntryId: core.sourceRef(view.cut.sessionId, originals[0]).entryId,
-                  toEntryId: core.sourceRef(view.cut.sessionId, originals.at(-1)).entryId,
-                  reason: 'Original history remains available through admitted scoped read/search tools.'
-                }
-              ]
-            : []
-      }
-    },
-    { signal }
-  );
+  return {
+    expectedWindowId: view.contextWindow?.windowId ?? null,
+    expectedSourceRevision: view.cut.sourceRevision,
+    idempotencyKey: `${id}-transition-${index}`,
+    reason: 'Predeclared workload interval with scoped bounded retrieval.',
+    selection: {
+      strategy: policy === 'provider-native' ? 'provider' : 'sources',
+      retained:
+        policy === 'provider-native'
+          ? originals.map((entry) => core.sourceRef(view.cut.sessionId, entry))
+          : [],
+      notes: selectedNote ? [selectedNote] : []
+    }
+  };
 }
 
 function addBudget(metrics, budget) {
@@ -909,7 +957,7 @@ function addUsage(metrics, settlement) {
     metrics.knownCosts[cost.currency] = (metrics.knownCosts[cost.currency] ?? 0) + cost.amount;
   if (cost.status !== 'known') metrics.costStatus = 'unknown-or-partial';
 }
-async function observeRun(events, runId, result) {
+async function observeRun(events, runId, result, artifacts) {
   const calls = new Set();
   const pending = new Set();
   for await (const { event } of events.read(runId)) {
@@ -935,15 +983,23 @@ async function observeRun(events, runId, result) {
       if (event.toolName === 'notes_read') result.metrics.noteReads += 1;
     }
     if (event.type === 'tool.ended' && event.toolName?.startsWith('history_')) {
-      const output = event.observation?.output;
-      if (!event.observation?.ok || output?.status === 'unavailable') result.metrics.retrievalFailures += 1;
+      const source = event.observation;
+      const original =
+        source.storage === 'inline'
+          ? source.observation
+          : source.storage === 'artifact'
+            ? JSON.parse(new TextDecoder().decode(await artifacts.readVerified(source.artifact)))
+            : undefined;
+      const output = original?.output;
+      if (original?.kind !== 'result' || output?.status === 'unavailable')
+        result.metrics.retrievalFailures += 1;
       if (output?.coverage === 'partial') result.metrics.retrievalIncompletePages += 1;
     }
   }
   return [...pending];
 }
 async function checkMechanics({ history, sessions, descriptor, events, result, workload }) {
-  const view = await history.view();
+  const view = await readHistoryEntries(history);
   const inputs = view.entries.filter((entry) => entry.type === 'input');
   for (let index = 0; index < result.completedInputs; index += 1) {
     if (
@@ -995,7 +1051,11 @@ async function checkMechanics({ history, sessions, descriptor, events, result, w
 }
 
 /** Trial is the uncertainty unit: checkpoints from one session are not independent. */
-export function summarizeTrials(trials, gates = DEFAULT_GATES, measurement = 'empirical-model-trials') {
+export function summarizeTrials(
+  trials,
+  gates = DEFAULT_GATES,
+  measurement = 'empirical-model-trials'
+) {
   const groups = new Map();
   for (const trial of trials) {
     const key = `${trial.workload}/${trial.policy}`;
@@ -1180,7 +1240,9 @@ function publicFailure(error, fallback) {
     'authentication',
     'context_length_exceeded'
   ];
-  return allowed.includes(error?.code) ? `${fallback} Provider diagnostic: ${error.code}.` : fallback;
+  return allowed.includes(error?.code)
+    ? `${fallback} Provider diagnostic: ${error.code}.`
+    : fallback;
 }
 
 async function main() {
@@ -1209,7 +1271,8 @@ Bounded options: --trials (2), --delay (6), --transition-every (4), --max-invoca
     await output.close();
   }
   process.stdout.write(`Wrote ${report.measurement} report (${report.trials.length} trials).\n`);
-  if (['live', 'simulation'].includes(options.mode) && report.trials.length === 0) process.exitCode = 2;
+  if (['live', 'simulation'].includes(options.mode) && report.trials.length === 0)
+    process.exitCode = 2;
   else if (
     report.trials.some(
       (trial) =>

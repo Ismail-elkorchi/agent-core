@@ -11,7 +11,6 @@ const runId = 'verification-run';
 const createEvents = () => new InMemoryEventRepository(agentEventCodec);
 
 async function recordFacts(events, records) {
-  const presentation = { title: 'read_files', summary: 'Short presentation', ok: true, results: {} };
   await events.append(runId, {
     type: 'observation.record.created',
     id: 'observation-1',
@@ -25,8 +24,9 @@ async function recordFacts(events, records) {
     call: { name: 'read_files', input: { kind: 'json', value: {} } },
     toolCallType: 'function',
     observedFacts: records,
-    immediatePresentation: presentation,
-    retainedPresentation: presentation
+    kind: 'result',
+    summary: 'Read source',
+    modelContent: [{ type: 'text', text: 'Source excerpt' }]
   });
 }
 
@@ -92,7 +92,12 @@ test('verification owns external pages and routes public artifact ranges locally
       }
     }
   };
-  const execution = createObservationAccess({ events: createEvents(), runId, artifacts, configured });
+  const execution = createObservationAccess({
+    events: createEvents(),
+    runId,
+    artifacts,
+    configured
+  });
   assert.equal(
     new TextDecoder().decode(await execution.observedFacts.readArtifact(local, { maxBytes: 5 })),
     'local'

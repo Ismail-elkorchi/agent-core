@@ -14,14 +14,20 @@ import {
 } from '@agent-core/runtime';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import { defineTool } from '@agent-core/tools';
-import { MemorySimulationProvider, simulationProfile } from './fixtures/context-policies/simulation.mjs';
+import {
+  MemorySimulationProvider,
+  simulationProfile
+} from './fixtures/context-policies/simulation.mjs';
 
 const binding = {
   schemaId: 'neutral-composition',
   schemaVersion: 1,
   subject: { application: 'neutral-tests' }
 };
-const toolBoundary = { authorizationPolicyId: 'neutral-read@1', executionTargetId: 'neutral-memory' };
+const toolBoundary = {
+  authorizationPolicyId: 'neutral-read@1',
+  executionTargetId: 'neutral-memory'
+};
 
 class NeutralProvider extends MemorySimulationProvider {
   constructor(respond) {
@@ -83,7 +89,8 @@ test('plain assistant retains complete user contributions across runs without a 
   assertNeutralCompletion(await app.runtime().run({ task: 'What bird did I mention?' }).result);
   const request = provider.calls.at(-1);
   assert.equal(
-    request.messages.filter((item) => item.role === 'user' && item.content.includes(original)).length,
+    request.messages.filter((item) => item.role === 'user' && item.content.includes(original))
+      .length,
     1
   );
   assert.deepEqual(
@@ -146,7 +153,8 @@ test('standalone governed classifier settles structured output with no natural-l
       messages: [
         {
           role: 'developer',
-          content: 'Classify the message using the classify structured result. No prose answer is required.'
+          content:
+            'Classify the message using the classify structured result. No prose answer is required.'
         },
         { role: 'user', content: 'Please help restore my account access.' }
       ],
@@ -196,7 +204,7 @@ test('read-only monitor becomes idle until a real external contribution resumes 
       reads += 1;
       return {
         kind: 'result',
-        ok: true,
+
         output: { status: externalStatus },
         summary: externalStatus,
         scope: { resources: ['external-status'], coverage: 'complete' }
@@ -218,12 +226,15 @@ test('read-only monitor becomes idle until a real external contribution resumes 
       terminationReason: 'tool_calls'
     };
   });
-  const app = await composition(provider, { tools: [readStatus], toolPolicy: { allowedRisks: ['read'] } });
+  const app = await composition(provider, {
+    tools: [readStatus],
+    toolPolicy: { allowedRisks: ['read'] }
+  });
   const session = new AgentSession({
     descriptor: app.descriptor,
     expectedBinding: binding,
     repository: app.repository,
-    runs: new AgentRunCoordinator(app.events),
+    runs: new AgentRunCoordinator(app.events, app.artifacts),
     configuration: { provider: provider.id, model: simulationProfile.id },
     createRuntime: (_configuration, onProgress) => app.runtime({ onProgress })
   });
@@ -233,7 +244,10 @@ test('read-only monitor becomes idle until a real external contribution resumes 
   assert.equal(first.kind, 'started');
   const waiting = await first.completion;
   assertNeutralCompletion(waiting);
-  assert.equal(JSON.parse(waiting.terminal.modelOutput.message).state, 'waiting_for_external_input');
+  assert.equal(
+    JSON.parse(waiting.terminal.modelOutput.message).state,
+    'waiting_for_external_input'
+  );
   assert.equal(session.state().phase, 'idle');
   const callsWhileWaiting = provider.calls.length;
   await setImmediate();

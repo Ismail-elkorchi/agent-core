@@ -1,4 +1,8 @@
-import { requestAccountingInputTokens, type ModelUsage, type RequestAccounting } from '@agent-core/model';
+import {
+  requestAccountingInputTokens,
+  type ModelUsage,
+  type RequestAccounting
+} from '@agent-core/model';
 
 export type BudgetPressure = 'normal' | 'constrained' | 'critical' | 'exhausted';
 
@@ -76,22 +80,10 @@ export class BudgetAccountant {
       outputReserveTokens,
       totalPromptTokens,
       totalRequestTokens: totalPromptTokens + outputReserveTokens,
-      warnings: input.accounting.unknownComponents.map((part) => part.reason ?? 'Unknown request cost')
+      warnings: input.accounting.unknownComponents.map(
+        (part) => part.reason ?? 'Unknown request cost'
+      )
     };
-  }
-
-  canSend(estimate: RequestCostEstimate): boolean {
-    return (
-      estimate.totalPromptTokens <= this.window.maxPromptTokens &&
-      estimate.totalRequestTokens <= this.window.contextWindowTokens
-    );
-  }
-
-  pressureAfter(estimate: RequestCostEstimate): BudgetPressure {
-    return pressureFor({
-      promptUsed: estimate.totalPromptTokens,
-      promptMax: this.window.maxPromptTokens
-    });
   }
 
   recordSent(estimate: RequestCostEstimate): BudgetAccountantSnapshot {
@@ -111,7 +103,9 @@ export class BudgetAccountant {
       source: 'provider'
     };
     if (this.pendingPromptEstimate) {
-      this.ratios.push(usage.promptTokens / Math.max(1, this.pendingPromptEstimate.totalPromptTokens));
+      this.ratios.push(
+        usage.promptTokens / Math.max(1, this.pendingPromptEstimate.totalPromptTokens)
+      );
       this.pendingPromptEstimate = undefined;
     }
     this.providerPromptTokens += usage.promptTokens;
@@ -135,8 +129,12 @@ export class BudgetAccountant {
   snapshot(): BudgetAccountantSnapshot {
     const pendingPromptTokens = this.pendingPromptEstimate?.totalPromptTokens ?? 0;
     const totalTokens =
-      this.providerPromptTokens + this.estimatedPromptTokens + pendingPromptTokens + this.completionTokens;
-    const promptTokens = this.providerPromptTokens + this.estimatedPromptTokens + pendingPromptTokens;
+      this.providerPromptTokens +
+      this.estimatedPromptTokens +
+      pendingPromptTokens +
+      this.completionTokens;
+    const promptTokens =
+      this.providerPromptTokens + this.estimatedPromptTokens + pendingPromptTokens;
     const remainingPromptTokens = Math.max(
       0,
       this.window.maxPromptTokens - (this.lastEstimate?.totalPromptTokens ?? 0)
@@ -156,7 +154,9 @@ export class BudgetAccountant {
       }),
       ...(this.lastEstimate ? { lastEstimate: this.lastEstimate } : {}),
       ...(this.lastProviderUsage ? { lastProviderUsage: this.lastProviderUsage } : {}),
-      ...(this.ratios.length > 0 ? { estimateToActualRatio: this.ratios[this.ratios.length - 1] ?? 1 } : {})
+      ...(this.ratios.length > 0
+        ? { estimateToActualRatio: this.ratios[this.ratios.length - 1] ?? 1 }
+        : {})
     };
   }
 }

@@ -11,7 +11,8 @@ import { viewImageInputSchema, viewImageOutputSchema } from './schema.js';
 export const viewImageTool = defineTool({
   name: 'view_image',
   implementationId: 'agent-core.view-image.v1',
-  description: 'Load a rooted image as model image content without placing a data URL in the event log.',
+  description:
+    'Load a rooted image as model image content without placing a data URL in the event log.',
   schema: viewImageInputSchema,
   outputSchema: viewImageOutputSchema,
   requirements: {
@@ -67,7 +68,6 @@ export const viewImageTool = defineTool({
     };
     return {
       kind: 'result' as const,
-      ok: true,
       summary: `Loaded image ${input.path} (${String(bytes.byteLength)} encoded bytes).`,
       scope,
       observedFacts: builtInObservedFacts('read', scope, `Read rooted image ${input.path}.`),

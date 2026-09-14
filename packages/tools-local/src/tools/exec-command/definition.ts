@@ -12,10 +12,9 @@ import {
   type ToolExecutionContext
 } from '@agent-core/tools';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
-import { presentProcessObservation } from '../../core/presenters.js';
+import { buildProcessContent } from '../../core/model-content.js';
 import { fileScope, processScope } from '../../core/resources.js';
 import { requireRootedFileAuthority } from '../../core/rooted-files.js';
-import { isSuccessfulProcessResult } from '../process-output.js';
 import { execCommandOutputSchema, execCommandSchema } from './schema.js';
 
 export function createExecCommandTool(options: { readonly ptySupported?: boolean } = {}) {
@@ -23,12 +22,18 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
   return defineTool({
     name: 'exec_command',
     implementationId: 'agent-core.exec-command.v1',
-    description: 'Start a persistent command through the application-supplied command execution authority.',
+    description:
+      'Start a persistent command through the application-supplied command execution authority.',
     schema: execCommandSchema(ptySupported),
     outputSchema: execCommandOutputSchema,
-    presentObservation: presentProcessObservation,
-    requirements: { services: ['rootedFileAuthority', 'localToolConfiguration', 'commandExecution'] },
-    effectEnvelope: { accesses: [{ mode: 'execute', scope: processScope() }], lockScopes: [fileScope()] },
+    buildModelContent: buildProcessContent,
+    requirements: {
+      services: ['rootedFileAuthority', 'localToolConfiguration', 'commandExecution']
+    },
+    effectEnvelope: {
+      accesses: [{ mode: 'execute', scope: processScope() }],
+      lockScopes: [fileScope()]
+    },
     async canonicalizeInput(input, context) {
       const root = requireRootedFileAuthority(context);
       const workdir = root.canonicalPath(input.workdir);
@@ -74,7 +79,9 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
         outputTokenBudget: request.outputTokenBudget,
         owner: request.owner
       });
-      await context.lifetime.own({ release: () => releaseCommandExecutionPlan(executor, reservation) });
+      await context.lifetime.own({
+        release: () => releaseCommandExecutionPlan(executor, reservation)
+      });
       return {
         snapshot: { ...commandSnapshot(input), execution: reservation.authorization },
         invoke: (executionContext) => executeCommand({ ...input, reservation }, executionContext)
@@ -109,7 +116,7 @@ async function executeCommand(
   }
   return {
     kind: 'result' as const,
-    ok: isSuccessfulProcessResult(result),
+    execution: { state: result.status === 'running' ? ('active' as const) : ('settled' as const) },
     summary:
       result.status === 'running'
         ? 'Process continues as ' + result.processId + '.'
@@ -128,7 +135,9 @@ async function executeCommand(
           }
         : {})
     },
-    ...(result.artifact ? { content: [{ type: 'artifact' as const, artifact: result.artifact }] } : {}),
+    ...(result.artifact
+      ? { content: [{ type: 'artifact' as const, artifact: result.artifact }] }
+      : {}),
     output: result
   };
 }

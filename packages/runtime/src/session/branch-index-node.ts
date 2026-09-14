@@ -10,7 +10,12 @@ import {
   type JsonlStorageStamp
 } from '@agent-core/persistence/node';
 import { assertSessionBinding } from './binding.js';
-import type { BranchEntryPosition, BranchPageSource } from './branch-page.js';
+import {
+  branchEntryMetadata,
+  sourceSnapshot,
+  type BranchEntryPosition,
+  type BranchPageSource
+} from './branch-page.js';
 import type {
   SessionBranchEntry,
   SessionBranchPoint,
@@ -33,6 +38,11 @@ export class JsonlBranchIndex {
   private readonly branchPoints: SessionBranchPoint[] = [];
   private header: SessionHeader | undefined;
   private leafId: string | null = null;
+  private sourceRevision = 0;
+  private readonly finalizations: Pick<
+    SessionRunFinalization,
+    'runId' | 'finalizationId' | 'throughEntryId'
+  >[] = [];
   private completeBytes = 0;
   private lineCount = 0;
   private marker = '';
@@ -60,7 +70,8 @@ export class JsonlBranchIndex {
 
   async summary(): Promise<SessionSummary> {
     await this.refresh();
-    if (this.summaryValue === undefined) throw new Error('Session history has no committed header.');
+    if (this.summaryValue === undefined)
+      throw new Error('Session history has no committed header.');
     return this.summaryValue;
   }
 
@@ -68,7 +79,8 @@ export class JsonlBranchIndex {
     await this.refresh();
     const header = this.header;
     if (header === undefined) throw new Error('Session history has no committed header.');
-    if (session.id !== header.id) throw new Error('Session history descriptor does not match its header.');
+    if (session.id !== header.id)
+      throw new Error('Session history descriptor does not match its header.');
     assertSessionBinding(session.header.binding, header.binding);
     return {
       sessionId: session.id,
@@ -83,15 +95,56 @@ export class JsonlBranchIndex {
     return Object.freeze([...this.branchPoints]);
   }
 
-  private async refresh(): Promise<void> {
+  async snapshot(session: SessionDescriptor, leafId?: string | null) {
+    const source = await this.source(session);
+    return sourceSnapshot(source, this.sourceRevision, this.finalizations, leafId);
+  }
+
+  async rebuild(
+    session: SessionDescriptor,
+    options: {
+      readonly signal?: AbortSignal;
+      readonly onProgress?: (progress: {
+        records: number;
+        bytes: number;
+        totalBytes: number;
+      }) => void;
+    } = {}
+  ): Promise<void> {
+    options.signal?.throwIfAborted();
+    this.positions = new Map();
+    this.branchPoints.length = 0;
+    this.finalizations.length = 0;
+    this.header = undefined;
+    this.summaryValue = undefined;
+    this.leafId = null;
+    this.completeBytes = 0;
+    this.lineCount = 0;
+    this.sourceRevision = 0;
+    this.stamp = undefined;
+    await this.refresh(options);
+    await this.source(session);
+  }
+
+  private async refresh(options?: {
+    readonly signal?: AbortSignal;
+    readonly onProgress?: (progress: {
+      records: number;
+      bytes: number;
+      totalBytes: number;
+    }) => void;
+  }): Promise<void> {
     const stamp = await jsonlStorageStamp(this.filePath);
     if (this.stamp !== undefined && sameJsonlStorageStamp(stamp, this.stamp)) return;
-    if (stamp.size < this.completeBytes) throw new Error('Session history was truncated after indexing.');
+    if (stamp.size < this.completeBytes)
+      throw new Error('Session history was truncated after indexing.');
     if (
       this.completeBytes > 0 &&
       (stamp.size === this.completeBytes ||
         (await jsonlBoundaryMarker(this.filePath, this.completeBytes)) !== this.marker)
     ) {
+      this.sourceRevision = 0;
+      this.finalizations.length = 0;
       this.positions = new Map();
       this.branchPoints.length = 0;
       this.header = undefined;
@@ -107,12 +160,16 @@ export class JsonlBranchIndex {
     let summary = this.summaryValue;
     let leafId = this.leafId;
     let lineCount = this.lineCount;
+    let revision = this.sourceRevision;
+    const finalizations: typeof this.finalizations = [];
     for await (const line of readJsonlLines(this.filePath, {
       startOffset: this.completeBytes,
       firstLine: this.lineCount + 1,
       endOffset,
       maxLineBytes: 64 * 1024 * 1024
     })) {
+      options?.signal?.throwIfAborted();
+      options?.onProgress?.({ records: revision, bytes: line.byteOffset, totalBytes: endOffset });
       lineCount = line.line;
       const bytes = Buffer.byteLength(line.text) + 1;
       this.scannedBytes += bytes;
@@ -132,6 +189,7 @@ export class JsonlBranchIndex {
       }
       if (line.text.trim().length === 0) continue;
       const entry = this.decodeRecord(line);
+      revision++;
       if (summary === undefined) throw new Error('Session record precedes its header.');
       summary = {
         ...summary,
@@ -142,6 +200,11 @@ export class JsonlBranchIndex {
       };
       if ('submissionId' in entry) continue;
       if (entry.type === 'run_finalization') {
+        finalizations.push({
+          runId: entry.runId,
+          finalizationId: entry.finalizationId,
+          throughEntryId: entry.throughEntryId
+        });
         points.push(
           Object.freeze({
             entryId: entry.throughEntryId,
@@ -155,9 +218,14 @@ export class JsonlBranchIndex {
       }
       if (this.positions.has(entry.id) || additions.has(entry.id))
         throw new Error(`Duplicate session history entry: ${entry.id}`);
-      if (entry.parentId !== null && !this.positions.has(entry.parentId) && !additions.has(entry.parentId))
+      if (
+        entry.parentId !== null &&
+        !this.positions.has(entry.parentId) &&
+        !additions.has(entry.parentId)
+      )
         throw new Error(`Missing session history parent: ${entry.parentId}`);
       additions.set(entry.id, {
+        ...branchEntryMetadata(entry),
         offset: line.byteOffset,
         bytes,
         line: line.line,
@@ -166,13 +234,20 @@ export class JsonlBranchIndex {
       });
       if (entry.type === 'context_transition')
         points.push(
-          Object.freeze({ entryId: entry.id, timestamp: entry.timestamp, kind: 'context_transition' })
+          Object.freeze({
+            entryId: entry.id,
+            timestamp: entry.timestamp,
+            kind: 'context_transition'
+          })
         );
       leafId = entry.id;
     }
     const marker = await jsonlBoundaryMarker(this.filePath, endOffset);
     for (const [id, entry] of additions) this.positions.set(id, entry);
     this.branchPoints.push(...points);
+    this.finalizations.push(...finalizations);
+    this.sourceRevision = revision;
+    options?.onProgress?.({ records: revision, bytes: endOffset, totalBytes: endOffset });
     this.header = header;
     this.summaryValue = summary === undefined ? undefined : Object.freeze(summary);
     this.leafId = leafId;

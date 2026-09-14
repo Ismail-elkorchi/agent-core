@@ -1,13 +1,18 @@
+import { decodeAgentRunRecordRef, type AgentRunRecordRef } from './records.js';
+import {
+  decodeStoredToolObservation,
+  type StoredToolObservation
+} from '../../orchestration/observation-source.js';
 import { decodeEffectExecutionState, type EffectExecutionState } from '@agent-core/effects';
 import { parseJsonObject, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import { parseModelToolCall, type ModelToolCall } from '@agent-core/model';
-import { hashJson } from '@agent-core/persistence';
+import { hashJson, validatePublicArtifactRef } from '@agent-core/persistence';
 import {
   decodeOwnedToolEffects,
+  decodeToolContent,
   decodeOwnedToolObservationForPersistence,
   decodeToolCall,
   effectsConflict,
-  encodeToolObservation,
   type ToolCall,
   type ToolEffects,
   type ToolObservation
@@ -33,7 +38,10 @@ export interface AgentToolCallPlanRecord {
 
 export interface AgentToolSettlementRecord {
   readonly observationId: string;
-  readonly observation: ToolObservation;
+  readonly observation?: ToolObservation;
+  readonly original: StoredToolObservation;
+  readonly modelContentRef?: import('@agent-core/persistence').PublicArtifactRef;
+  readonly modelContent: readonly import('@agent-core/tools').ToolContent[];
   readonly createdAt: string;
 }
 
@@ -63,6 +71,14 @@ interface AgentToolBatchBase {
 }
 
 export type AgentToolCallState =
+  | Readonly<{
+      readonly stage: 'resolved';
+      readonly toolAttempt: number;
+      readonly record: AgentRunRecordRef;
+      readonly effect?: never;
+      readonly plan?: never;
+      readonly settlement?: never;
+    }>
   | Readonly<{
       readonly stage: 'approval';
       readonly plan: AgentToolCallPlanRecord;
@@ -125,7 +141,11 @@ export type AgentToolCallState =
 export type AgentToolPhase = Readonly<AgentToolBatchBase>;
 
 export function decodeToolPhase(value: unknown): AgentToolPhase {
-  const phase = object(value, 'tool work');
+  const phase = parseJsonObject(value);
+  return decodeOwnedToolPhase(phase);
+}
+
+export function decodeOwnedToolPhase(phase: JsonObject): AgentToolPhase {
   if (phase.kind !== 'tools') throw new TypeError('Tool work kind must be tools.');
   exact(phase, [...COMMON_FIELDS, 'kind']);
   const common = decodeCommon(phase);
@@ -157,6 +177,7 @@ function decodeCallState(value: unknown, callIndex: number, callCount: number): 
   const stage = enumeration(
     state.stage,
     [
+      'resolved',
       'approval',
       'ready',
       'effect_ready',
@@ -169,6 +190,17 @@ function decodeCallState(value: unknown, callIndex: number, callCount: number): 
     ] as const,
     `callStates[${String(callIndex)}].stage`
   );
+  if (stage === 'resolved') {
+    exact(state, ['stage', 'toolAttempt', 'record']);
+    const record = decodeAgentRunRecordRef(state.record);
+    if (record.kind !== 'tool_call')
+      throw new TypeError('Resolved tool work requires its original call record.');
+    return Object.freeze({
+      stage,
+      toolAttempt: positiveInteger(state.toolAttempt, 'resolved.toolAttempt'),
+      record
+    });
+  }
   if (stage === 'approval') {
     exact(state, ['stage', 'plan', 'approval']);
     const plan = decodeToolCallPlan(state.plan);
@@ -203,7 +235,10 @@ function decodeCallState(value: unknown, callIndex: number, callCount: number): 
       throw new TypeError('Stored approval decision does not match its tool-call index.');
     return Object.freeze({ stage, ...(approved ? { approved } : {}) });
   }
-  const toolAttempt = positiveInteger(state.toolAttempt, `callStates[${String(callIndex)}].toolAttempt`);
+  const toolAttempt = positiveInteger(
+    state.toolAttempt,
+    `callStates[${String(callIndex)}].toolAttempt`
+  );
   const plan = state.plan === undefined ? undefined : decodeToolCallPlan(state.plan);
   const effect = state.effect === undefined ? undefined : decodeEffectExecutionState(state.effect);
   if (stage === 'effect_ready') {
@@ -241,23 +276,29 @@ function decodeCallState(value: unknown, callIndex: number, callCount: number): 
     ) {
       throw new TypeError('A cancelled tool call may retain only an effect closed before start.');
     }
-    if (effect && !plan) throw new TypeError('A cancelled external tool effect requires its plan record.');
+    if (effect && !plan)
+      throw new TypeError('A cancelled external tool effect requires its plan record.');
     if (plan) assertToolDependencies(plan.effects, callIndex, callCount);
     if (effect && plan) assertEffectMatchesPlan(effect, plan);
-    return Object.freeze({ stage, ...(plan ? { plan } : {}), toolAttempt, ...(effect ? { effect } : {}) });
+    return Object.freeze({
+      stage,
+      ...(plan ? { plan } : {}),
+      toolAttempt,
+      ...(effect ? { effect } : {})
+    });
   }
   const settlement = decodeAgentToolSettlementRecord(state.settlement);
   if (plan) assertToolDependencies(plan.effects, callIndex, callCount);
   if (effect !== undefined && effect.phase !== 'settled')
     throw new TypeError('A settled tool call may retain only a settled external effect.');
-  if (effect && !plan) throw new TypeError('A settled external tool effect requires its plan record.');
+  if (effect && !plan)
+    throw new TypeError('A settled external tool effect requires its plan record.');
   if (effect && plan) assertEffectMatchesPlan(effect, plan);
   if (effect?.settlement.outcome === 'unknown')
-    throw new TypeError('A durable tool observation cannot be backed by an unknown effect settlement.');
-  if (
-    effect &&
-    effect.settlement.resultDigest !== hashJson(encodeToolObservation(settlement.observation))
-  ) {
+    throw new TypeError(
+      'A durable tool observation cannot be backed by an unknown effect settlement.'
+    );
+  if (effect && effect.settlement.resultDigest !== settlement.original.digest) {
     throw new TypeError('External effect settlement does not match the durable tool observation.');
   }
   return Object.freeze({
@@ -366,18 +407,23 @@ export function isToolCallStartable(
     phase.maxConcurrency,
     ...batches
       .filter((batch) =>
-        batch.callStates.some((call) => call.stage !== 'recorded' && call.stage !== 'cancelled')
+        batch.callStates.some(
+          (call) =>
+            call.stage !== 'recorded' && call.stage !== 'resolved' && call.stage !== 'cancelled'
+        )
       )
       .map((batch) => batch.maxConcurrency)
   );
   if (active.length >= concurrency) return false;
-  if (active.some((running) => effectsConflict(running.plan.effects, state.plan.effects))) return false;
+  if (active.some((running) => effectsConflict(running.plan.effects, state.plan.effects)))
+    return false;
   return !(state.plan.effects.dependsOnCallIndices ?? []).some((dependency) => {
     const dependencyState = phase.callStates[dependency];
     return (
       dependencyState?.stage !== 'settled' &&
       dependencyState?.stage !== 'recording' &&
-      dependencyState?.stage !== 'recorded'
+      dependencyState?.stage !== 'recorded' &&
+      dependencyState?.stage !== 'resolved'
     );
   });
 }
@@ -385,7 +431,9 @@ export function isToolCallStartable(
 function assertToolDependencies(effects: ToolEffects, callIndex: number, callCount: number): void {
   for (const dependency of effects.dependsOnCallIndices ?? []) {
     if (dependency >= callIndex || dependency >= callCount) {
-      throw new TypeError(`Tool call ${String(callIndex)} has invalid dependency ${String(dependency)}.`);
+      throw new TypeError(
+        `Tool call ${String(callIndex)} has invalid dependency ${String(dependency)}.`
+      );
     }
   }
 }
@@ -416,7 +464,10 @@ function assertApprovalCall(
   }
 }
 
-function assertEffectMatchesPlan(effect: EffectExecutionState, plan: AgentToolCallPlanRecord): void {
+function assertEffectMatchesPlan(
+  effect: EffectExecutionState,
+  plan: AgentToolCallPlanRecord
+): void {
   if (
     effect.intent.implementationId !== plan.toolImplementationId ||
     effect.intent.parametersDigest !== plan.fingerprint
@@ -437,7 +488,10 @@ function decodeToolCallPlan(value: unknown): AgentToolCallPlanRecord {
     'authorizationReason',
     'approval'
   ]);
-  const authorizationReason = optionalString(record.authorizationReason, 'plan.authorizationReason');
+  const authorizationReason = optionalString(
+    record.authorizationReason,
+    'plan.authorizationReason'
+  );
   return Object.freeze({
     toolImplementationId: identifier(record.toolImplementationId, 'plan.toolImplementationId'),
     canonicalInput: parseJsonValue(record.canonicalInput),
@@ -456,8 +510,17 @@ function decodeToolCallPlan(value: unknown): AgentToolCallPlanRecord {
 
 export function decodeToolResultDelivery(value: unknown): AgentToolResultDelivery {
   const record = parseJsonObject(value);
-  exact(record, ['deliveryId', 'inputIdentity', 'targetResponseId', 'status', 'successorResponseId']);
-  const successorResponseId = optionalString(record.successorResponseId, 'delivery.successorResponseId');
+  exact(record, [
+    'deliveryId',
+    'inputIdentity',
+    'targetResponseId',
+    'status',
+    'successorResponseId'
+  ]);
+  const successorResponseId = optionalString(
+    record.successorResponseId,
+    'delivery.successorResponseId'
+  );
   return Object.freeze({
     deliveryId: identifier(record.deliveryId, 'delivery.deliveryId'),
     inputIdentity: identifier(record.inputIdentity, 'delivery.inputIdentity'),
@@ -473,12 +536,31 @@ export function decodeToolResultDelivery(value: unknown): AgentToolResultDeliver
 
 export function decodeAgentToolSettlementRecord(value: unknown): AgentToolSettlementRecord {
   const record = object(value, 'tool settlement');
-  exact(record, ['observationId', 'observation', 'createdAt']);
+  exact(record, [
+    'observationId',
+    'observation',
+    'original',
+    'modelContent',
+    'modelContentRef',
+    'createdAt'
+  ]);
+  const original = decodeStoredToolObservation(record.original);
+  if ((record.observation === undefined) !== (original.storage === 'unavailable'))
+    throw new Error('Original observation availability is inconsistent.');
   return Object.freeze({
     observationId: identifier(record.observationId, 'settlement.observationId'),
-    observation: decodeOwnedToolObservationForPersistence(
-      object(record.observation, 'settlement.observation')
-    ),
+    modelContent: decodeToolContent(record.modelContent),
+    original,
+    ...(record.modelContentRef === undefined
+      ? {}
+      : { modelContentRef: publicModelContentRef(record.modelContentRef) }),
+    ...(record.observation === undefined
+      ? {}
+      : {
+          observation: decodeOwnedToolObservationForPersistence(
+            object(record.observation, 'settlement.observation')
+          )
+        }),
     createdAt: timestamp(record.createdAt, 'settlement.createdAt')
   });
 }
@@ -539,7 +621,10 @@ function decodeBinding(value: unknown): AgentApprovalBinding {
   exact(record, ['toolImplementationId', 'authorizationPolicyId', 'executionTargetId']);
   return Object.freeze({
     toolImplementationId: identifier(record.toolImplementationId, 'binding.toolImplementationId'),
-    authorizationPolicyId: identifier(record.authorizationPolicyId, 'binding.authorizationPolicyId'),
+    authorizationPolicyId: identifier(
+      record.authorizationPolicyId,
+      'binding.authorizationPolicyId'
+    ),
     executionTargetId: identifier(record.executionTargetId, 'binding.executionTargetId')
   });
 }
@@ -549,7 +634,8 @@ function decodeInstruction(value: unknown, path: string): AgentEffectiveInstruct
   exact(record, ['id', 'content', 'provenance', 'role', 'sourceUri', 'priority']);
   const role = optionalString(record.role, `${path}.role`);
   const sourceUri = optionalString(record.sourceUri, `${path}.sourceUri`);
-  const priority = record.priority === undefined ? undefined : finite(record.priority, `${path}.priority`);
+  const priority =
+    record.priority === undefined ? undefined : finite(record.priority, `${path}.priority`);
   return Object.freeze({
     id: identifier(record.id, `${path}.id`),
     content: nonempty(record.content, `${path}.content`),
@@ -574,16 +660,11 @@ function decodeTurnIdentity(value: unknown): AgentTurnIdentity {
 }
 
 function object(value: unknown, label: string): JsonObject {
-  try {
-    return parseJsonObject(value, {
-      maxDepth: 24,
-      maxCollectionEntries: 20_000,
-      maxStringBytes: 1024 * 1024,
-      maxTotalBytes: 4 * 1024 * 1024
-    });
-  } catch (error) {
-    throw new TypeError(`${label} must be bounded JSON object data.`, { cause: error });
-  }
+  if (!isObject(value)) throw new TypeError(`${label} must be object data.`);
+  return value;
+}
+function isObject(value: unknown): value is JsonObject {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 function array(value: unknown, label: string): readonly unknown[] {
   if (!Array.isArray(value)) throw new TypeError(`${label} must be an array.`);
@@ -592,7 +673,8 @@ function array(value: unknown, label: string): readonly unknown[] {
 function exact(value: JsonObject, fields: readonly string[]): void {
   const allowed = new Set(fields);
   const unknown = Object.keys(value).filter((key) => !allowed.has(key));
-  if (unknown.length) throw new TypeError(`Unsupported tool operation fields: ${unknown.join(', ')}.`);
+  if (unknown.length)
+    throw new TypeError(`Unsupported tool operation fields: ${unknown.join(', ')}.`);
 }
 function identifier(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.trim().length === 0 || hasControlCharacter(value))
@@ -633,7 +715,8 @@ function positiveInteger(value: unknown, label: string): number {
   return number;
 }
 function finite(value: unknown, label: string): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) throw new TypeError(`${label} must be finite.`);
+  if (typeof value !== 'number' || !Number.isFinite(value))
+    throw new TypeError(`${label} must be finite.`);
   return value;
 }
 function timestamp(value: unknown, label: string): string {
@@ -651,6 +734,15 @@ function enumeration<const T extends readonly string[]>(
   values: T,
   label: string
 ): T[number] {
-  if (typeof value !== 'string' || !values.includes(value)) throw new TypeError(`${label} is invalid.`);
+  if (typeof value !== 'string' || !values.includes(value))
+    throw new TypeError(`${label} is invalid.`);
   return value;
+}
+
+function publicModelContentRef(
+  value: unknown
+): import('@agent-core/persistence').PublicArtifactRef {
+  const ref = parseJsonObject(value);
+  validatePublicArtifactRef(ref);
+  return ref;
 }

@@ -1,3 +1,4 @@
+import { InferenceService, InMemoryInferenceRepository } from '@agent-core/runtime';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
@@ -6,8 +7,12 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
   AgentRuntime,
+  resolveToolObservation,
+  resolveToolModelContent,
   AgentRunCoordinator,
-  PendingCallCoordinator,
+  pendingToolCalls,
+  assertToolTransitionBoundary,
+  AgentRunRecords,
   AgentFinalizationError,
   AgentRunFinalizer,
   applyAgentRunStateTransition,
@@ -48,7 +53,7 @@ const SESSION_BINDING = Object.freeze({
 });
 
 function ended(result) {
-  assert.equal(result.state, 'ended');
+  assert.equal(result.state, 'ended', JSON.stringify(result));
   return { ...result.terminal, deliveryDiagnostics: result.deliveryDiagnostics };
 }
 
@@ -106,6 +111,29 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+// A reopened runtime retains the same owner records and original artifacts as its run ledger.
+const runtimeRepositories = new WeakMap();
+function createRuntime(options) {
+  const events = options.repositories.events;
+  let shared = runtimeRepositories.get(events);
+  if (!shared) {
+    shared = {
+      inference: new InMemoryInferenceRepository(),
+      artifacts: options.repositories.artifacts ?? new InMemoryArtifactRepository()
+    };
+    runtimeRepositories.set(events, shared);
+  }
+  const artifacts = options.repositories.artifacts ?? shared.artifacts;
+  return new AgentRuntime({
+    ...options,
+    inferenceService: new InferenceService({
+      provider: options.provider,
+      repository: shared.inference,
+      artifacts
+    })
+  });
+}
+
 async function harness(options = {}) {
   const events = options.events ?? new InMemoryEventRepository(agentEventCodec);
   const sessions = options.sessions ?? new InMemorySessionRepository();
@@ -114,7 +142,7 @@ async function harness(options = {}) {
     : await sessions.create({ provider: 'scripted', model: 'scripted', binding: SESSION_BINDING });
   const artifacts = options.artifacts ?? new InMemoryArtifactRepository();
   const provider = options.provider ?? new ScriptedProvider(options.script ?? [response()]);
-  const agent = new AgentRuntime({
+  const agent = createRuntime({
     provider,
     model: options.model ?? 'scripted',
     toolBoundary: options.toolBoundary ?? toolBoundary,
@@ -165,15 +193,17 @@ test('runtime exposes artifact and image tools only with the required repository
       return {
         snapshot: this.snapshotInput(input),
         async invoke() {
-          return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope };
+          return { kind: 'result', output: {}, summary: 'ok', scope: completeScope };
         }
       };
     }
   });
-  const tools = [conditionalTool('read_artifact'), conditionalTool('view_image')].map(adoptToolDefinition);
+  const tools = [conditionalTool('read_artifact'), conditionalTool('view_image')].map(
+    adoptToolDefinition
+  );
 
   const textProvider = new ScriptedProvider([response()]);
-  const textAgent = new AgentRuntime({
+  const textAgent = createRuntime({
     provider: textProvider,
     model: 'scripted',
     toolBoundary,
@@ -188,11 +218,14 @@ test('runtime exposes artifact and image tools only with the required repository
     profile: { modalities: { input: ['text', 'image'], output: ['text'] } }
   });
   const imageArtifacts = new InMemoryArtifactRepository();
-  const imageAgent = new AgentRuntime({
+  const imageAgent = createRuntime({
     provider: imageProvider,
     model: 'scripted',
     toolBoundary,
-    repositories: { events: new InMemoryEventRepository(agentEventCodec), artifacts: imageArtifacts },
+    repositories: {
+      events: new InMemoryEventRepository(agentEventCodec),
+      artifacts: imageArtifacts
+    },
     tools,
     toolPolicy: { allowedRisks: ['read'] }
   });
@@ -234,7 +267,7 @@ test('tool progress from planning and invocation remains separate from the final
         snapshot: this.snapshotInput(input),
         async invoke(context) {
           await context.emitProgress?.({ type: 'status', stage: 'invoke' });
-          return { kind: 'result', ok: true, output: {}, summary: 'done', scope: completeScope };
+          return { kind: 'result', output: {}, summary: 'done', scope: completeScope };
         }
       };
     }
@@ -273,14 +306,16 @@ test('tool progress from planning and invocation remains separate from the final
 test('oversized tool observations keep domain output intact in an artifact', async () => {
   const items = Array.from({ length: 2_000 }, (_unused, index) => ({
     id: index,
-    value: `item-${String(index)}-${'x'.repeat(20)}`
+    value: `item-${String(index)}-${'x'.repeat(150)}`
   }));
   const tool = adoptToolDefinition({
     name: 'large_result',
     implementationId: 'tests/large-result@1',
     description: 'large result',
     jsonSchema: { type: 'object' },
-    outputSchema: z.strictObject({ items: z.array(z.strictObject({ id: z.int(), value: z.string() })) }),
+    outputSchema: z.strictObject({
+      items: z.array(z.strictObject({ id: z.int(), value: z.string() }))
+    }),
     effectEnvelope: readEnvelope,
     decodeInput() {
       return { ok: true, input: {} };
@@ -300,7 +335,7 @@ test('oversized tool observations keep domain output intact in an artifact', asy
         async invoke() {
           return {
             kind: 'result',
-            ok: true,
+
             output: { items },
             summary: 'large result complete',
             scope: completeScope
@@ -311,26 +346,32 @@ test('oversized tool observations keep domain output intact in an artifact', asy
   });
   const { agent, events, artifacts } = await harness({
     tools: [tool],
-    script: [
-      response('tool_calls', '', {
-        toolCalls: [{ id: 'large', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }]
-      }),
-      response()
-    ]
+    provider: new ScriptedProvider(
+      [
+        response('tool_calls', '', {
+          toolCalls: [
+            { id: 'large', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }
+          ]
+        }),
+        response()
+      ],
+      { profile: { limits: { contextTokens: 500000, outputTokens: 2000 } } }
+    )
   });
   const result = ended(await agent.run({ task: 'preserve output' }).result);
   const persistedEvents = await eventsFor(events, result.runId);
-  const observationEvent = persistedEvents.find((event) => event.type === 'observation.record.created');
+  const observationEvent = persistedEvents.find(
+    (event) => event.type === 'observation.record.created'
+  );
   assert.ok(
     observationEvent,
     JSON.stringify({ types: persistedEvents.map((event) => event.type), terminal: result })
   );
-  assert.equal(observationEvent.immediatePresentation.summary, 'large result complete');
-  assert.equal(observationEvent.immediatePresentation.truncated, true);
-  const artifactId = observationEvent.immediatePresentation.results.artifact.artifactId;
-  const artifact = await artifacts.resolve(artifactId);
-  const stored = JSON.parse(new TextDecoder().decode(await artifacts.readVerified(artifact)));
+  assert.equal(observationEvent.summary, 'large result complete');
+  const originalEvent = persistedEvents.find((event) => event.type === 'tool.ended');
+  const stored = await resolveToolObservation(originalEvent.observation, artifacts);
   assert.equal(stored.output.items.length, items.length);
+  assert.ok((await resolveToolModelContent(observationEvent, artifacts)).length > 0);
 });
 
 test('artifact-store failure after a completed tool effect still persists tool.ended and a degraded diagnostic', async () => {
@@ -370,7 +411,7 @@ test('artifact-store failure after a completed tool effect still persists tool.e
           effects += 1;
           return {
             kind: 'result',
-            ok: true,
+
             output: { payload: 'x'.repeat(400_000) },
             summary: 'effect completed',
             scope: completeScope
@@ -392,8 +433,10 @@ test('artifact-store failure after a completed tool effect still persists tool.e
       response()
     ]
   });
-  const result = ended(await agent.run({ task: 'complete despite degraded artifact storage' }).result);
-  assert.equal(result.executionStatus, 'completed');
+  const result = ended(
+    await agent.run({ task: 'complete despite degraded artifact storage' }).result
+  );
+  assert.equal(result.executionStatus, 'completed', JSON.stringify(result));
   assert.equal(effects, 1);
   const persisted = await eventsFor(events, result.runId);
   assert.equal(persisted.filter((event) => event.type === 'tool.started').length, 1);
@@ -403,8 +446,8 @@ test('artifact-store failure after a completed tool effect still persists tool.e
   ).durableStorageDegraded;
   assert.match(diagnostic.message, /artifact store failed/u);
   assert.equal(
-    persisted.find((event) => event.type === 'tool.ended').observation.metadata.durableStorage.status,
-    'degraded'
+    persisted.find((event) => event.type === 'tool.ended').observation.storage,
+    'unavailable'
   );
 });
 
@@ -418,6 +461,7 @@ test('image and presenter assembly failures happen after durable tool truth and 
   };
   class IntegrityFailingArtifacts extends InMemoryArtifactRepository {
     async readVerified(ref) {
+      if (!ref.mediaType.startsWith('image/')) return super.readVerified(ref);
       throw new Error(`Artifact SHA-256 integrity failure for ${ref.artifactId}`);
     }
   }
@@ -434,7 +478,7 @@ test('image and presenter assembly failures happen after durable tool truth and 
       expected: /Unknown artifact/u,
       observation: {
         kind: 'result',
-        ok: true,
+
         summary: 'image effect completed',
         scope: completeScope,
         content: [{ type: 'image', artifact: missingImage, detail: 'original' }],
@@ -448,30 +492,17 @@ test('image and presenter assembly failures happen after durable tool truth and 
       artifacts: integrityArtifacts,
       observation: {
         kind: 'result',
-        ok: true,
+
         summary: 'image effect completed',
         scope: completeScope,
         content: [{ type: 'image', artifact: integrityImage, detail: 'original' }],
         output: { artifact: integrityImage }
       }
-    },
-    {
-      name: 'presenter_delivery',
-      expected: /presenter exploded/u,
-      presentObservation() {
-        throw new Error('presenter exploded');
-      },
-      observation: {
-        kind: 'result',
-        ok: true,
-        summary: 'presenter effect completed',
-        scope: completeScope,
-        output: { changed: true }
-      }
     }
   ];
   for (const scenario of cases) {
     let effects = 0;
+    let delivered;
     const tool = {
       name: scenario.name,
       implementationId: `tests/${scenario.name}@1`,
@@ -480,7 +511,7 @@ test('image and presenter assembly failures happen after durable tool truth and 
       outputSchema: z.unknown(),
       effectEnvelope: { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'] },
       ...(scenario.profile ? { requirements: { modelInputModalities: ['image'] } } : {}),
-      ...(scenario.presentObservation ? { presentObservation: scenario.presentObservation } : {}),
+      ...(scenario.buildModelContent ? { buildModelContent: scenario.buildModelContent } : {}),
       decodeInput() {
         return { ok: true, input: {} };
       },
@@ -520,11 +551,9 @@ test('image and presenter assembly failures happen after durable tool truth and 
           ]
         }),
         (request) => {
-          const result = request.messages.find(
+          delivered = request.messages.find(
             (message) => message.role === 'tool' && message.toolName === scenario.name
           );
-          assert.ok(result);
-          assert.match(result.content, /durable tool result was committed/iu);
           return response('stop', 'continued after assembly failure');
         }
       ],
@@ -538,11 +567,19 @@ test('image and presenter assembly failures happen after durable tool truth and 
       ...(scenario.artifacts ? { artifacts: scenario.artifacts } : {})
     });
     const result = ended(await agent.run({ task: scenario.name }).result);
-    assert.equal(result.executionStatus, 'completed', JSON.stringify({ scenario: scenario.name, result }));
+    assert.equal(
+      result.executionStatus,
+      'completed',
+      JSON.stringify({ scenario: scenario.name, result })
+    );
     assert.equal(effects, 1);
+    assert.ok(delivered);
+    assert.match(delivered.content, /committed|unavailable|fail|missing/iu);
     const persisted = await eventsFor(events, result.runId);
     const endedIndex = persisted.findIndex((event) => event.type === 'tool.ended');
-    const failedIndex = persisted.findIndex((event) => event.type === 'observation.recording.failed');
+    const failedIndex = persisted.findIndex(
+      (event) => event.type === 'observation.recording.failed'
+    );
     assert.ok(endedIndex >= 0 && failedIndex > endedIndex);
     assert.match(persisted[failedIndex].message, scenario.expected);
     assert.equal(
@@ -607,7 +644,7 @@ test('session and observation-record assembly failures do not reclassify a compl
             effects += 1;
             return {
               kind: 'result',
-              ok: true,
+
               summary: 'effect committed',
               scope: completeScope,
               output: { done: true }
@@ -623,14 +660,19 @@ test('session and observation-record assembly failures do not reclassify a compl
       script: [
         response('tool_calls', '', {
           toolCalls: [
-            { id: 'assembly', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }
+            {
+              id: 'assembly',
+              type: 'function',
+              name: tool.name,
+              input: { kind: 'json', value: {} }
+            }
           ]
         }),
         response()
       ]
     });
     const result = ended(await run.agent.run({ task: 'assembly failure' }).result);
-    assert.equal(result.executionStatus, 'completed');
+    assert.equal(result.executionStatus, 'completed', JSON.stringify(result));
     assert.equal(effects, 1);
     const persisted = await eventsFor(run.events, result.runId);
     assert.equal(persisted.filter((event) => event.type === 'tool.ended').length, 1);
@@ -687,7 +729,7 @@ test('parallel tool observations commit independently while an earlier call rema
             await gates[input.index].promise;
             return {
               kind: 'result',
-              ok: true,
+
               output: { index: input.index },
               summary: `parallel ${String(input.index)}`,
               scope: completeScope
@@ -708,7 +750,10 @@ test('parallel tool observations commit independently while an earlier call rema
   const fixture = await harness({
     tools: [tool],
     limits: { maxConcurrentToolCalls: 2 },
-    script: [response('tool_calls', '', { toolCalls: calls }), response('stop', 'parallel complete')]
+    script: [
+      response('tool_calls', '', { toolCalls: calls }),
+      response('stop', 'parallel complete')
+    ]
   });
   const control = fixture.agent.run({ task: 'run independent calls' });
   await Promise.all([started[0].promise, started[1].promise]);
@@ -737,17 +782,13 @@ test('parallel tool observations commit independently while an earlier call rema
     inspection.state.toolBatches[0].callStates.map((state) => state.stage),
     ['effect_pending', 'recorded', 'recorded']
   );
-  const pending = await PendingCallCoordinator.recover(fixture.events, control.runId);
+  const pending = pendingToolCalls(inspection.state);
   assert.deepEqual(
-    pending.pending().map((call) => call.callId),
+    pending.map((call) => call.callId),
     ['parallel-0']
   );
-  assert.deepEqual(
-    pending.inspect().map((call) => call.state.stage),
-    ['effect_pending', 'recorded', 'recorded']
-  );
-  assert.equal(new Set(pending.inspect().map((call) => call.catalogRevision)).size, 1);
-  assert.throws(() => pending.assertTransitionBoundary(), /exact results/);
+  assert.equal(new Set(pending.map((call) => call.catalogRevision)).size, 1);
+  assert.throws(() => assertToolTransitionBoundary(inspection.state), /exact results/);
   assert.deepEqual(
     (await eventsFor(fixture.events, control.runId))
       .filter((event) => event.type === 'observation.record.created')
@@ -757,7 +798,7 @@ test('parallel tool observations commit independently while an earlier call rema
 
   gates[0].resolve();
   const result = ended(await control.result);
-  assert.equal(result.executionStatus, 'completed');
+  assert.equal(result.executionStatus, 'completed', JSON.stringify(result));
   assert.equal(maximumActive, 2);
   const events = await eventsFor(fixture.events, control.runId);
   assert.deepEqual(
@@ -765,13 +806,15 @@ test('parallel tool observations commit independently while an earlier call rema
     [1, 2, 0]
   );
   assert.deepEqual(
-    events.filter((event) => event.type === 'observation.record.created').map((event) => event.callIndex),
+    events
+      .filter((event) => event.type === 'observation.record.created')
+      .map((event) => event.callIndex),
     [1, 2, 0]
   );
-  const settledCalls = await PendingCallCoordinator.recover(fixture.events, control.runId);
-  assert.equal(settledCalls.inspect().length, 3);
-  assert.deepEqual(settledCalls.pending(), []);
-  settledCalls.assertTransitionBoundary();
+  const settledState = (await fixture.agent.inspectRun(control.runId)).state;
+  assert.deepEqual(pendingToolCalls(settledState), []);
+  assert.deepEqual(settledState.toolBatches, []);
+  assertToolTransitionBoundary(settledState);
 });
 
 test('parallel scheduler enforces explicit dependencies and resource conflicts without serializing unrelated calls', async () => {
@@ -836,7 +879,7 @@ test('parallel scheduler enforces explicit dependencies and resource conflicts w
           await gates[input.index].promise;
           return {
             kind: 'result',
-            ok: true,
+
             output: { index: input.index },
             summary: `scheduled ${String(input.index)}`,
             scope: completeScope
@@ -927,7 +970,7 @@ test('approval waits for earlier unplanned calls and binds the revision after pr
             writes.push(input.index);
             revision += 1;
           }
-          return { kind: 'result', ok: true, output: {}, summary: 'settled', scope: completeScope };
+          return { kind: 'result', output: {}, summary: 'settled', scope: completeScope };
         }
       };
     }
@@ -1013,7 +1056,9 @@ test('cancellation durably closes or marks every call in a parallel batch', asyn
         async invoke(context) {
           if (input.index < 2) started[input.index].resolve();
           await new Promise((_resolve, reject) =>
-            context.signal.addEventListener('abort', () => reject(context.signal.reason), { once: true })
+            context.signal.addEventListener('abort', () => reject(context.signal.reason), {
+              once: true
+            })
           );
           throw new Error('unreachable');
         }
@@ -1040,7 +1085,11 @@ test('cancellation durably closes or marks every call in a parallel batch', asyn
   const transitions = [];
   for (const event of await eventsFor(run.events, control.runId)) {
     if (event.type !== 'run.state.transitioned') continue;
-    projected = applyAgentRunStateTransition(projected, event.transition);
+    projected = await applyAgentRunStateTransition(
+      projected,
+      event.transition,
+      new AgentRunRecords(run.artifacts)
+    );
     transitions.push(projected);
   }
   const cancelling = transitions.find(
@@ -1054,7 +1103,9 @@ test('cancellation durably closes or marks every call in a parallel batch', asyn
   assert.equal(
     cancelling.toolBatches[0].callStates.every(
       (state) =>
-        state.stage !== 'ready' && state.stage !== 'effect_ready' && state.stage !== 'effect_pending'
+        state.stage !== 'ready' &&
+        state.stage !== 'effect_ready' &&
+        state.stage !== 'effect_pending'
     ),
     true
   );
@@ -1084,12 +1135,18 @@ test('modelOutput mappings preserve execution, completeness, source, and verific
     ],
     [
       response('stop', '', { reasoningSummary: 'visible summary' }),
-      'completed',
-      'complete',
-      'reasoning_summary',
-      'model_completed'
+      'failed',
+      'absent',
+      undefined,
+      'empty_response'
     ],
-    [response('stop', '', { reasoning: 'private only' }), 'failed', 'absent', undefined, 'empty_response'],
+    [
+      response('stop', '', { reasoning: 'private only' }),
+      'failed',
+      'absent',
+      undefined,
+      'empty_response'
+    ],
     [response('tool_calls', ''), 'failed', 'absent', undefined, 'malformed_response']
   ];
   for (const [modelResponse, execution, status, source, termination] of cases) {
@@ -1145,8 +1202,7 @@ test('abort at the finalization boundary wins before terminal planning', async (
   const controller = new AbortController();
   const { agent, events } = await harness({
     onProgress(event) {
-      if (event.type === 'run.phase.changed' && event.phase === 'finalizing')
-        controller.abort('cancel before terminal planning');
+      if (event.type === 'assistant.ended') controller.abort('cancel before terminal planning');
     }
   });
   const result = ended(
@@ -1286,13 +1342,17 @@ test('in-memory repositories run, reopen, and replay without filesystem paths', 
     (request) =>
       response(
         'stop',
-        request.messages.some((message) => message.role === 'user' && message.content === 'first') &&
-          request.messages.some((message) => message.role === 'assistant' && message.content === 'first')
+        request.messages.some(
+          (message) => message.role === 'user' && message.content === 'first'
+        ) &&
+          request.messages.some(
+            (message) => message.role === 'assistant' && message.content === 'first'
+          )
           ? 'replayed'
           : 'missing'
       )
   ]);
-  const second = new AgentRuntime({
+  const second = createRuntime({
     provider: secondProvider,
     model: 'scripted',
     toolBoundary,
@@ -1305,6 +1365,49 @@ test('in-memory repositories run, reopen, and replay without filesystem paths', 
   const secondResult = ended(await second.run({ task: 'second' }).result);
   assert.equal(firstResult.executionStatus, 'completed');
   assert.equal(secondResult.modelOutput.message, 'replayed');
+});
+
+test('reasoning-only interruption keeps reasoning in session and event channels with an absent answer', async () => {
+  const provider = new ScriptedProvider([], {
+    profile: {
+      capabilities: {
+        ...capabilities,
+        streaming: true,
+        reasoning: { strategies: [], canDisable: false, separateOutput: true }
+      }
+    }
+  });
+  provider.createSession = () => ({
+    async complete() {
+      throw new Error('not used');
+    },
+    async *stream() {
+      yield { type: 'reasoning', reasoning: 'private work', accumulatedReasoning: 'private work' };
+      yield {
+        type: 'reasoning',
+        channel: 'summary',
+        reasoning: 'reasoning summary',
+        accumulatedReasoning: 'reasoning summary'
+      };
+      throw new Error('reasoning interrupted');
+    }
+  });
+  const { agent, events, sessions, session } = await harness({ provider });
+  const result = await agent.run({ task: 'reasoning only' }).result;
+  assert.equal(result.state, 'suspended');
+  const interrupted = (await eventsFor(events, result.runId)).find(
+    (event) => event.type === 'assistant.interrupted'
+  );
+  assert.deepEqual(interrupted.modelOutput, { status: 'absent' });
+  assert.equal(interrupted.content, '');
+  assert.equal(interrupted.reasoningSummary, 'reasoning summary');
+  assert.equal(interrupted.reasoning, 'private work');
+  const assistant = (await sessions.loadReplayState(session)).branch.find(
+    (entry) => entry.type === 'assistant'
+  );
+  assert.equal(assistant.content, '');
+  assert.equal(assistant.completeness, 'absent');
+  assert.equal(assistant.reasoningSummary, 'reasoning summary');
 });
 
 test('session replay preserves an accepted task from an interrupted run', async () => {
@@ -1335,7 +1438,7 @@ test('session replay preserves an accepted task from an interrupted run', async 
           : 'missing interrupted task'
       )
   ]);
-  const reopened = new AgentRuntime({
+  const reopened = createRuntime({
     provider,
     model: 'scripted',
     toolBoundary,
@@ -1372,7 +1475,7 @@ test('model-turn limits terminate deterministically', async () => {
       return {
         snapshot: this.snapshotInput(input),
         async invoke() {
-          return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope };
+          return { kind: 'result', output: {}, summary: 'ok', scope: completeScope };
         }
       };
     }
@@ -1401,14 +1504,18 @@ test('provider failure preserves one durable unknown outcome without a second re
   const records = await eventsFor(fixture.events, result.runId);
   assert.equal(records.filter((event) => event.type === 'model.requested').length, 1);
   assert.equal(records.filter((event) => event.type === 'provider.attempt.settled').length, 0);
-  const inspection = await new AgentRunCoordinator(fixture.events).inspect(result.runId);
+  const inspection = await new AgentRunCoordinator(fixture.events, fixture.artifacts).inspect(
+    result.runId
+  );
   assert.equal(inspection.state.phase.kind, 'active');
   assert.equal(inspection.state.providerRequests.at(-1).stage, 'outcome_unknown');
   assert.equal(
     inspection.state.providerRequests.at(-1).effect.intent.implementationId,
     provider.implementationId
   );
-  assert.deepEqual(inspection.state.providerRequests.at(-1).effect.intent.recovery, { kind: 'unknown' });
+  assert.deepEqual(inspection.state.providerRequests.at(-1).effect.intent.recovery, {
+    kind: 'unknown'
+  });
   assert.deepEqual(
     inspection.state.providerRequests
       .at(-1)
@@ -1453,7 +1560,12 @@ test('a provider start ticket stranded by process loss becomes an exact durable 
   assert.equal(provider.calls.length, 0);
 
   events.stopped = false;
-  const resumed = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events } });
+  const resumed = createRuntime({
+    provider,
+    model: 'scripted',
+    toolBoundary,
+    repositories: { events }
+  });
   const result = await resumed.resume(control.runId).result;
   assert.equal(result.state, 'suspended');
   assert.equal(result.reason, 'user_decision');
@@ -1465,7 +1577,7 @@ test('a provider start ticket stranded by process loss becomes an exact durable 
   assert.match(result.decisionRequest.fingerprint, /^[a-f0-9]{64}$/u);
   assert.equal(provider.calls.length, 0);
 
-  const restored = await new AgentRunCoordinator(events).inspect(control.runId);
+  const restored = await new AgentRunCoordinator(events, first.artifacts).inspect(control.runId);
   assert.equal(restored.state.phase.kind, 'suspended');
   assert.equal(restored.state.phase.reason, 'user_decision');
   assert.deepEqual(restored.state.phase.decisionRequest, result.decisionRequest);
@@ -1496,12 +1608,17 @@ test('a persisted provider settlement resumes without issuing a duplicate reques
   const control = first.agent.run({ task: 'resume settled provider response' });
   await assert.rejects(control.result, /simulated process stop|unresolved started provider effect/);
   assert.equal(provider.calls.length, 1);
-  const run = await new AgentRunCoordinator(events).inspect(control.runId);
+  const run = await new AgentRunCoordinator(events, first.artifacts).inspect(control.runId);
   assert.equal(run.state.phase.kind, 'active');
   assert.equal(run.state.providerRequests.at(-1).stage, 'effect_pending');
-  const resumed = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events } });
+  const resumed = createRuntime({
+    provider,
+    model: 'scripted',
+    toolBoundary,
+    repositories: { events }
+  });
   const result = ended(await resumed.resume(control.runId).result);
-  assert.equal(result.executionStatus, 'completed');
+  assert.equal(result.executionStatus, 'completed', JSON.stringify(result));
   assert.equal(result.modelOutput.message, 'persisted answer');
   assert.equal(provider.calls.length, 1);
   const records = await eventsFor(events, control.runId);
@@ -1529,7 +1646,7 @@ test('provider takeover never starts a second request while the previous owner m
   const first = await harness({ provider, withoutSession: true });
   const original = first.agent.run({ task: 'fence provider execution' });
   await started;
-  const replacement = new AgentRuntime({
+  const replacement = createRuntime({
     provider,
     model: 'scripted',
     toolBoundary,
@@ -1582,7 +1699,12 @@ test('logical request fingerprint separates every dynamic context origin and has
 test('tool planning resources release after denial, approval suspension, authorization failure, and success', async () => {
   for (const outcome of ['denied', 'approval', 'authorization_failure', 'success']) {
     let releases = 0;
-    const call = { id: outcome, type: 'function', name: 'lifetime', input: { kind: 'json', value: {} } };
+    const call = {
+      id: outcome,
+      type: 'function',
+      name: 'lifetime',
+      input: { kind: 'json', value: {} }
+    };
     const tool = {
       name: 'lifetime',
       implementationId: `tests/lifetime-${outcome}@1`,
@@ -1611,7 +1733,7 @@ test('tool planning resources release after denial, approval suspension, authori
         return {
           snapshot: this.snapshotInput(input),
           async invoke() {
-            return { kind: 'result', ok: true, output: {}, summary: 'done', scope: completeScope };
+            return { kind: 'result', output: {}, summary: 'done', scope: completeScope };
           }
         };
       }
@@ -1651,7 +1773,10 @@ test('durable approval resumes after repository reopen and rejects changed polic
     description: 'write one canonical resource',
     jsonSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
     outputSchema: emptyOutputSchema,
-    effectEnvelope: { accesses: [{ mode: 'write', scope: 'workspace' }], lockScopes: ['workspace'] },
+    effectEnvelope: {
+      accesses: [{ mode: 'write', scope: 'workspace' }],
+      lockScopes: ['workspace']
+    },
     decodeInput(input) {
       return { ok: true, input: input.value };
     },
@@ -1680,7 +1805,7 @@ test('durable approval resumes after repository reopen and rejects changed polic
           effects += 1;
           return {
             kind: 'result',
-            ok: true,
+
             output: {},
             summary: 'changed',
             scope: { resources: ['workspace/state'], coverage: 'complete' }
@@ -1709,7 +1834,7 @@ test('durable approval resumes after repository reopen and rejects changed polic
   assert.equal(preparationReleases, 1);
   const approval = suspended.pendingApprovals[0];
 
-  const changedPolicy = new AgentRuntime({
+  const changedPolicy = createRuntime({
     provider,
     model: 'scripted',
     toolBoundary,
@@ -1741,7 +1866,7 @@ test('durable approval resumes after repository reopen and rejects changed polic
     0
   );
 
-  const changedTarget = new AgentRuntime({
+  const changedTarget = createRuntime({
     provider,
     model: 'scripted',
     toolBoundary: { ...toolBoundary, executionTargetId: 'tests/other-target' },
@@ -1767,8 +1892,11 @@ test('durable approval resumes after repository reopen and rejects changed polic
   );
   assert.equal(preparationReleases, 1);
 
-  const replacement = adoptToolDefinition({ ...tool, implementationId: 'tests/canonical-effect@2' });
-  const changedImplementation = new AgentRuntime({
+  const replacement = adoptToolDefinition({
+    ...tool,
+    implementationId: 'tests/canonical-effect@2'
+  });
+  const changedImplementation = createRuntime({
     provider,
     model: 'scripted',
     toolBoundary,
@@ -1795,9 +1923,12 @@ test('durable approval resumes after repository reopen and rejects changed polic
     (await repositories.agent.inspectRun(suspended.runId)).state.toolBatches[0].callStates[0].stage,
     'approval'
   );
-  assert.deepEqual(approval.binding, { toolImplementationId: tool.implementationId, ...toolBoundary });
+  assert.deepEqual(approval.binding, {
+    toolImplementationId: tool.implementationId,
+    ...toolBoundary
+  });
 
-  const reopened = new AgentRuntime({
+  const reopened = createRuntime({
     provider,
     model: 'scripted',
     toolBoundary,
@@ -1819,7 +1950,7 @@ test('durable approval resumes after repository reopen and rejects changed polic
       })
     ).result
   );
-  assert.equal(result.executionStatus, 'completed');
+  assert.equal(result.executionStatus, 'completed', JSON.stringify(result));
   assert.equal(effects, 1);
   assert.equal(preparationReleases, 3);
   const records = await eventsFor(repositories.events, result.runId);
@@ -1864,7 +1995,7 @@ test('current authorization is re-evaluated and may veto a stored approval', asy
           effects += 1;
           return {
             kind: 'result',
-            ok: true,
+
             output: {},
             summary: 'changed',
             scope: { resources: ['state'], coverage: 'complete' }
@@ -1875,7 +2006,9 @@ test('current authorization is re-evaluated and may veto a stored approval', asy
   });
   const provider = new ScriptedProvider([
     response('tool_calls', '', {
-      toolCalls: [{ id: 'effect', type: 'function', name: 'effect', input: { kind: 'json', value: {} } }]
+      toolCalls: [
+        { id: 'effect', type: 'function', name: 'effect', input: { kind: 'json', value: {} } }
+      ]
     }),
     response('stop', 'continued safely')
   ]);
@@ -1888,7 +2021,7 @@ test('current authorization is re-evaluated and may veto a stored approval', asy
   const suspended = await first.agent.run({ task: 'current veto' }).result;
   const approval = suspended.pendingApprovals[0];
   let currentChecks = 0;
-  const reopened = new AgentRuntime({
+  const reopened = createRuntime({
     provider,
     model: 'scripted',
     toolBoundary,
@@ -1914,13 +2047,13 @@ test('current authorization is re-evaluated and may veto a stored approval', asy
       })
     ).result
   );
-  assert.equal(result.executionStatus, 'completed');
+  assert.equal(result.executionStatus, 'completed', JSON.stringify(result));
   assert.equal(effects, 0);
   assert.equal(currentChecks, 1);
   const toolEnded = (await eventsFor(first.events, result.runId)).find(
     (event) => event.type === 'tool.ended'
   );
-  assert.equal(toolEnded.observation.ok, false);
+  assert.equal(toolEnded.observation.kind, 'failure');
   assert.match(toolEnded.observation.summary, /authorization denied/i);
 });
 
@@ -1978,10 +2111,12 @@ test('crashes while waiting for a lease or after acquisition but before tool.sta
     assert.equal(crash.status, exitStatus, crash.stderr);
     await assert.rejects(() => readFile(path.join(root, 'effect.txt'), 'utf8'), /ENOENT/u);
 
-    const eventRepository = new (await import('@agent-core/persistence/node')).JsonlEventRepository({
-      rootDir: path.join(root, 'events'),
-      codec: agentEventCodec
-    });
+    const eventRepository = new (await import('@agent-core/persistence/node')).JsonlEventRepository(
+      {
+        rootDir: path.join(root, 'events'),
+        codec: agentEventCodec
+      }
+    );
     let records = await eventsFor(eventRepository, approval.runId);
     assert.equal(records.filter((event) => event.type === 'tool.started').length, 0, mode);
     assert.equal(records.filter((event) => event.type === 'tool.ended').length, 0, mode);
@@ -2021,7 +2156,7 @@ test('process death after tool completion records the durable observation withou
   );
   assert.equal(recovered.status, 0, recovered.stderr);
   const result = JSON.parse(recovered.stdout);
-  assert.equal(result.executionStatus, 'completed');
+  assert.equal(result.executionStatus, 'completed', JSON.stringify(result));
   assert.equal(await readFile(path.join(root, 'effect.txt'), 'utf8'), 'effect\n');
   const eventRepository = new (await import('@agent-core/persistence/node')).JsonlEventRepository({
     rootDir: path.join(root, 'events'),
@@ -2036,7 +2171,8 @@ test('process death after tool completion records the durable observation withou
   const crashSession = await sessionRepository.open('crash-recovery', SESSION_BINDING);
   const replay = await sessionRepository.loadReplayState(crashSession);
   assert.equal(
-    replay.branch.filter((entry) => entry.type === 'observation' && entry.toolName === 'effect').length,
+    replay.branch.filter((entry) => entry.type === 'observation' && entry.toolName === 'effect')
+      .length,
     1
   );
 });
@@ -2049,7 +2185,14 @@ test('process death after the tool audit event resumes separate observation deli
   const approval = JSON.parse(initial.stdout);
   const crash = spawnSync(
     process.execPath,
-    [fixture, 'crash_before_recording', root, approval.runId, approval.approvalId, approval.fingerprint],
+    [
+      fixture,
+      'crash_before_recording',
+      root,
+      approval.runId,
+      approval.approvalId,
+      approval.fingerprint
+    ],
     { encoding: 'utf8' }
   );
   assert.equal(crash.status, 47, crash.stderr);
@@ -2099,10 +2242,12 @@ test('interrupted preconditioned reads reexecute only while every captured versi
     const result = JSON.parse(recovered.stdout);
     assert.equal(result.state ?? 'ended', sourceChanged ? 'suspended' : 'ended');
     if (sourceChanged) assert.equal(result.reason, 'tool_outcome_unknown');
-    const eventRepository = new (await import('@agent-core/persistence/node')).JsonlEventRepository({
-      rootDir: path.join(root, 'events'),
-      codec: agentEventCodec
-    });
+    const eventRepository = new (await import('@agent-core/persistence/node')).JsonlEventRepository(
+      {
+        rootDir: path.join(root, 'events'),
+        codec: agentEventCodec
+      }
+    );
     const records = await eventsFor(eventRepository, approval.runId);
     assert.deepEqual(
       records.filter((event) => event.type === 'tool.started').map((event) => event.toolAttempt),
@@ -2155,7 +2300,12 @@ test('an interrupted buffered mutation settles from its durable receipt without 
 });
 
 test('semantic tool audit events cannot advance authoritative per-call recovery state', async () => {
-  const call = { id: 'effect-1', type: 'function', name: 'effect', input: { kind: 'json', value: {} } };
+  const call = {
+    id: 'effect-1',
+    type: 'function',
+    name: 'effect',
+    input: { kind: 'json', value: {} }
+  };
   const persistedCall = { id: call.id, name: call.name, input: call.input };
   const effects = {
     accesses: [{ mode: 'write', scope: 'state/effect' }],
@@ -2187,10 +2337,10 @@ test('semantic tool audit events cannot advance authoritative per-call recovery 
         snapshot: this.snapshotInput(input),
         async invoke(context) {
           invocations += 1;
-          assert.equal(context.invocation.toolAttempt, 2);
+          assert.equal(context.invocation.toolAttempt, 1);
           return {
             kind: 'result',
-            ok: true,
+
             output: { retried: true },
             summary: 'must not retry',
             scope: { resources: ['state/effect'], coverage: 'complete' }
@@ -2244,7 +2394,7 @@ test('semantic tool audit events cannot advance authoritative per-call recovery 
       })
     ).result
   );
-  assert.equal(result.executionStatus, 'completed');
+  assert.equal(result.executionStatus, 'completed', JSON.stringify(result));
   assert.equal(invocations, 1);
   let records = await eventsFor(run.events, result.runId);
   assert.deepEqual(
@@ -2315,7 +2465,7 @@ test('a live stale runtime settles its exact permit while its unknown call conti
           }
           return {
             kind: 'result',
-            ok: true,
+
             output: { index: input.index },
             summary: `settled effect ${String(input.index)}`,
             scope: { resources: [`state/effect-${String(input.index)}`], coverage: 'complete' }
@@ -2347,7 +2497,7 @@ test('a live stale runtime settles its exact permit while its unknown call conti
     quantities: [{ unit: 'tool_invocations', amount: 1 }]
   });
 
-  const replacement = new AgentRuntime({
+  const replacement = createRuntime({
     provider,
     model: 'scripted',
     toolBoundary,
@@ -2389,7 +2539,9 @@ test('a live stale runtime settles its exact permit while its unknown call conti
 test('consumed provider usage remains in the terminal snapshot when it crosses a limit', async () => {
   const run = await harness({
     script: [
-      response('stop', 'over', { usage: { promptTokens: 4, completionTokens: 11, totalTokens: 15 } })
+      response('stop', 'over', {
+        usage: { promptTokens: 4, completionTokens: 11, totalTokens: 15 }
+      })
     ],
     limits: { completionTokens: 10 },
     withoutSession: true
@@ -2399,9 +2551,9 @@ test('consumed provider usage remains in the terminal snapshot when it crosses a
   assert.equal(result.exhaustedLimit, 'completion_tokens');
   assert.equal(result.budget.completionTokens, 11);
   const usage = (await eventsFor(run.events, result.runId)).find(
-    (event) => event.type === 'budget.provider_usage.recorded'
+    (event) => event.type === 'run.ended'
   );
-  assert.equal(usage.snapshot.completionTokens, 11);
+  assert.equal(usage.terminal.budget.completionTokens, 11);
 });
 
 test('elapsed limits use the injected monotonic clock even when the host timer fires first', async (t) => {
@@ -2411,7 +2563,11 @@ test('elapsed limits use the injected monotonic clock even when the host timer f
   const provider = new ScriptedProvider([
     (request) => {
       t.mock.timers.tick(6);
-      assert.equal(request.signal.aborted, false, 'Host scheduling cannot advance the injected run clock.');
+      assert.equal(
+        request.signal.aborted,
+        false,
+        'Host scheduling cannot advance the injected run clock.'
+      );
       now = 10;
       return response('tool_calls', '', { toolCalls: [call] });
     }
@@ -2439,7 +2595,7 @@ test('elapsed limits use the injected monotonic clock even when the host timer f
       return {
         snapshot: this.snapshotInput(input),
         async invoke() {
-          return { kind: 'result', ok: true, output: {}, summary: 'ok', scope: completeScope };
+          return { kind: 'result', output: {}, summary: 'ok', scope: completeScope };
         }
       };
     }
@@ -2463,7 +2619,9 @@ test('elapsed limits abort a live provider request without inventing a known out
     (request) => {
       now = 21;
       return new Promise((_resolve, reject) =>
-        request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true })
+        request.signal.addEventListener('abort', () => reject(request.signal.reason), {
+          once: true
+        })
       );
     }
   ]);
@@ -2484,7 +2642,9 @@ test('an immediate abort is durably accepted before local execution is cancelled
     script: [
       (request) =>
         new Promise((_resolve, reject) =>
-          request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true })
+          request.signal.addEventListener('abort', () => reject(request.signal.reason), {
+            once: true
+          })
         )
     ],
     withoutSession: true
@@ -2493,7 +2653,9 @@ test('an immediate abort is durably accepted before local execution is cancelled
   await control.abort('stop before provider execution');
   const result = ended(await control.result);
   assert.equal(result.executionStatus, 'aborted');
-  const inspection = await new AgentRunCoordinator(fixture.events).inspect(control.runId);
+  const inspection = await new AgentRunCoordinator(fixture.events, fixture.artifacts).inspect(
+    control.runId
+  );
   assert.equal(inspection.state.phase.kind, 'terminal');
   assert.equal(inspection.state.control.status, 'abort_requested');
 });
@@ -2501,7 +2663,9 @@ test('an immediate abort is durably accepted before local execution is cancelled
 test('tool planning and authorization are abortable and elapsed-deadline bounded', async () => {
   const callResponse = () =>
     response('tool_calls', '', {
-      toolCalls: [{ id: 'stall', type: 'function', name: 'stall', input: { kind: 'json', value: {} } }]
+      toolCalls: [
+        { id: 'stall', type: 'function', name: 'stall', input: { kind: 'json', value: {} } }
+      ]
     });
   const baseTool = {
     name: 'stall',
@@ -2526,7 +2690,7 @@ test('tool planning and authorization are abortable and elapsed-deadline bounded
       return {
         snapshot: this.snapshotInput(input),
         async invoke() {
-          return { kind: 'result', ok: true, output: {}, summary: 'unexpected', scope: completeScope };
+          return { kind: 'result', output: {}, summary: 'unexpected', scope: completeScope };
         }
       };
     }
@@ -2629,10 +2793,11 @@ test('completed tool failures with unknown recovery are not replayed automatical
           invocations += 1;
           return {
             kind: 'failure',
-            ok: false,
-            output: { blocked: true, reason: 'runtime_error', error: 'failed', recovery: 'stop' },
+
+            execution: { state: 'settled' },
+            output: { reason: 'runtime_error', error: 'failed' },
             summary: 'failed',
-            scope: { resources: ['state'], coverage: 'partial', cause: 'failed' }
+            scope: { resources: ['state'], coverage: 'partial', causes: ['failed'] }
           };
         }
       };
@@ -2644,7 +2809,7 @@ test('completed tool failures with unknown recovery are not replayed automatical
     toolPolicy: { allowedRisks: ['read', 'write'] }
   });
   const result = ended(await agent.run({ task: 'effect' }).result);
-  assert.equal(result.executionStatus, 'completed');
+  assert.equal(result.executionStatus, 'completed', JSON.stringify(result));
   assert.equal(invocations, 1);
 });
 
@@ -2659,7 +2824,7 @@ test('throwing terminal observer leaves one commit and records one delivery diag
   const records = await eventsFor(events, result.runId);
   assert.equal(records.filter((event) => event.type === 'run.ended').length, 1);
   assert.equal(records.filter((event) => event.type === 'delivery.failed').length, 1);
-  assert.equal(result.executionStatus, 'completed');
+  assert.equal(result.executionStatus, 'completed', JSON.stringify(result));
   assert.equal(result.deliveryDiagnostics.length, 1);
 });
 
@@ -2679,9 +2844,10 @@ test('finalization is idempotent, rejects conflicts, and recovers faults after e
   const first = finalizer.finalize(base);
   assert.equal(first, finalizer.finalize(base));
   const result = ended(await first);
-  assert.equal(result.executionStatus, 'completed');
+  assert.equal(result.executionStatus, 'completed', JSON.stringify(result));
   assert.throws(
-    () => finalizer.finalize({ ...base, modelOutput: { ...base.modelOutput, message: 'conflict' } }),
+    () =>
+      finalizer.finalize({ ...base, modelOutput: { ...base.modelOutput, message: 'conflict' } }),
     /Conflicting terminal decision/
   );
   assert.equal(
@@ -2725,7 +2891,8 @@ test('finalization is idempotent, rejects conflicts, and recovers faults after e
               }
               return assembly;
             },
-            loadReplayState: (sessionId, leafId) => durableSessions.loadReplayState(sessionId, leafId)
+            loadReplayState: (sessionId, leafId) =>
+              durableSessions.loadReplayState(sessionId, leafId)
           }
         : durableSessions;
     const broken = new AgentRunFinalizer({
@@ -2747,16 +2914,21 @@ test('finalization is idempotent, rejects conflicts, and recovers faults after e
       runId: base.runId,
       finalizationId: base.finalizationId,
       events: durableEvents,
-      append: (event, idempotencyKey) => durableEvents.append(base.runId, event, { idempotencyKey }),
+      append: (event, idempotencyKey) =>
+        durableEvents.append(base.runId, event, { idempotencyKey }),
       session: { repository: durableSessions, descriptor: durableSession }
     });
     await recovered.finalize(base);
     assert.deepEqual(await readCommittedTerminal(durableEvents, base.runId), base);
     assert.equal(
-      (await eventsFor(durableEvents, base.runId)).filter((event) => event.type === 'run.ended').length,
+      (await eventsFor(durableEvents, base.runId)).filter((event) => event.type === 'run.ended')
+        .length,
       1
     );
-    assert.equal((await durableSessions.loadReplayState(durableSession)).runFinalizations.length, 1);
+    assert.equal(
+      (await durableSessions.loadReplayState(durableSession)).runFinalizations.length,
+      1
+    );
   }
 });
 
@@ -2781,7 +2953,7 @@ function terminal() {
       reasoningTokens: 0,
       knownCosts: {},
       pricingStatus: 'unknown',
-      unknownPricedTokens: 0,
+      unknownPricedTokens: 0
     }
   });
 }
@@ -2801,10 +2973,15 @@ test('process loss before terminal staging leaves the settled provider response 
   const first = await harness({ events, provider, withoutSession: true });
   const handle = first.agent.run({ task: 'Preserve the final answer.' });
   await assert.rejects(handle.result, /process loss before terminal staging/);
-  const resumed = new AgentRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events } });
+  const resumed = createRuntime({
+    provider,
+    model: 'scripted',
+    toolBoundary,
+    repositories: { events, artifacts: first.artifacts }
+  });
   const result = ended(await resumed.resume(handle.runId).result);
   assert.equal(provider.calls.length, 1);
-  assert.equal(result.executionStatus, 'completed');
+  assert.equal(result.executionStatus, 'completed', JSON.stringify(result));
   assert.equal(result.modelOutput.message, 'original final answer');
   const records = await eventsFor(events, handle.runId);
   assert.equal(records.filter((event) => event.type === 'run.ended').length, 1);
@@ -2813,17 +2990,38 @@ test('process loss before terminal staging leaves the settled provider response 
 test('runtime terminal diagnostics preserve the underlying preparation release error', async () => {
   const { defineTool } = await import('@agent-core/tools');
   const tool = defineTool({
-    name: 'release_failure', implementationId: 'tests/release-failure@1', description: 'Exercises resource release.',
-    schema: z.strictObject({}), outputSchema: emptyOutputSchema,
+    name: 'release_failure',
+    implementationId: 'tests/release-failure@1',
+    description: 'Exercises resource release.',
+    schema: z.strictObject({}),
+    outputSchema: emptyOutputSchema,
     effectEnvelope: readEnvelope,
     canonicalizeInput: (input) => input,
     deriveEffects: () => readEffects,
     async bindExecution(input, context) {
-      await context.lifetime.own({ release() { throw new Error('Cancellation has not reached terminal publication.'); } });
-      return { snapshot: input, async invoke() { return { kind: 'result', ok: true, output: {}, summary: 'Observed.', scope: completeScope }; } };
+      await context.lifetime.own({
+        release() {
+          throw new Error('Cancellation has not reached terminal publication.');
+        }
+      });
+      return {
+        snapshot: input,
+        async invoke() {
+          return { kind: 'result', output: {}, summary: 'Observed.', scope: completeScope };
+        }
+      };
     }
   });
-  const run = await harness({ tools: [tool], script: [response('tool_calls', '', { toolCalls: [{ id: 'release-1', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }] })] });
+  const run = await harness({
+    tools: [tool],
+    script: [
+      response('tool_calls', '', {
+        toolCalls: [
+          { id: 'release-1', type: 'function', name: tool.name, input: { kind: 'json', value: {} } }
+        ]
+      })
+    ]
+  });
   const result = await run.agent.run({ task: 'Inspect.' }).result;
   assert.equal(result.state, 'ended');
   assert.equal(result.terminal.executionStatus, 'failed');

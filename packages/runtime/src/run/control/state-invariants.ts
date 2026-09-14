@@ -4,6 +4,13 @@ import type { AgentRunState } from './contracts.js';
 export function assertAgentRunStateInvariants(state: AgentRunState): void {
   const { providerRequests, toolBatches, phase, revision, control, runId } = state;
   if (
+    providerRequests.length > 256 ||
+    toolBatches.reduce((count, batch) => count + batch.calls.length, 0) > 256
+  )
+    throw new TypeError(
+      'Outstanding run work exceeds its admission bound (256 requests or tool calls).'
+    );
+  if (
     new Set(
       providerRequests.map(
         (request) => `${request.identity.turnId}:${String(request.identity.requestAttempt)}`
@@ -40,4 +47,3 @@ export function assertAgentRunStateInvariants(state: AgentRunState): void {
       throw new TypeError('Decision continuation does not belong to this run.');
   }
 }
-

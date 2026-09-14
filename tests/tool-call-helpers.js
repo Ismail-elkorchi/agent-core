@@ -8,7 +8,11 @@ import {
   releaseToolInvocation,
   startToolCallPlan
 } from '@agent-core/tools';
-import { issueEffectStartTicket, NO_EFFECT_EXPOSURE, startExternalEffect } from '@agent-core/effects';
+import {
+  issueEffectStartTicket,
+  NO_EFFECT_EXPOSURE,
+  startExternalEffect
+} from '@agent-core/effects';
 import { testPatchJournal } from './rooted-file-authority-helper.js';
 
 export function jsonToolCall(name, value = {}, id) {
@@ -24,7 +28,10 @@ export async function invokeToolCall(call, tools, context) {
   const controller = new AbortController();
   const rootedFileAuthority = context.services?.rootedFileAuthority;
   const services = rootedFileAuthority
-    ? { ...context.services, patchJournal: context.services.patchJournal ?? testPatchJournal(rootedFileAuthority) }
+    ? {
+        ...context.services,
+        patchJournal: context.services.patchJournal ?? testPatchJournal(rootedFileAuthority)
+      }
     : context.services;
   const planningContext = {
     ...context,
@@ -50,7 +57,7 @@ export async function invokeToolCall(call, tools, context) {
     return policyBlockedObservation(`Tool authorization denied: ${call.name}`, {
       tool: call.name,
       policyReason: authorization.decision,
-      recovery: authorization.reason
+      details: { message: authorization.reason ?? authorization.decision }
     });
   }
   return invokePlannedForTest(planning.plan, planningContext);
@@ -78,34 +85,9 @@ export async function invokePlannedForTest(plan, context) {
   const started = startExternalEffect(issued.state, issued.state.ticket, 1);
   if (started.status !== 'started') throw new Error('Test effect start was rejected.');
   const invocation = await startToolCallPlan(plan, started.state);
-  try { return await invokeToolCallPlan(invocation, context); }
-  finally { await releaseToolInvocation(invocation); }
-}
-
-export async function presentToolObservation(tool, call, observation, context, maxTokens) {
-  const ownedCall = createToolCall(call);
-  const controller = new AbortController();
-  const planningContext = {
-    ...context,
-    signal: context.signal ?? controller.signal,
-    boundary: context.boundary ?? {
-      authorizationPolicyId: 'tests/tool-policy@1',
-      executionTargetId: String(context.services?.rootedFileAuthority?.displayPath ?? 'tests')
-    }
-  };
-  const planning = await planToolCall(ownedCall, [tool], planningContext);
-  if (!planning.ok) {
-    if (observation.kind !== 'failure') throw new Error(`Cannot present a result for an invalid tool call: ${planning.observation.summary}`);
-    return tool.presentObservation({ call, input: undefined, observation, mode: 'immediate', maxTokens });
-  }
   try {
-    return tool.presentObservation({
-      call,
-      input: planning.plan.canonicalSnapshot,
-      observation,
-      mode: 'immediate', maxTokens
-    });
+    return await invokeToolCallPlan(invocation, context);
   } finally {
-    await releaseToolCallPlan(planning.plan);
+    await releaseToolInvocation(invocation);
   }
 }

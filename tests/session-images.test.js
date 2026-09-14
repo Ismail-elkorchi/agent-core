@@ -47,7 +47,11 @@ test('native images survive queued revision, restart, provider encoding material
   t.after(() => rm(directory, { recursive: true, force: true }));
   const artifacts = new LocalArtifactRepository({ rootDir: path.join(directory, 'artifacts') });
   const image = {
-    artifact: await artifacts.store({ label: 'image', content: imageBytes, mediaType: 'image/png' }),
+    artifact: await artifacts.store({
+      label: 'image',
+      content: imageBytes,
+      mediaType: 'image/png'
+    }),
     detail: 'original'
   };
   const sessions = new JsonlSessionRepository(path.join(directory, 'sessions'));
@@ -89,7 +93,7 @@ test('native images survive queued revision, restart, provider encoding material
   });
   const session = new AgentSession({
     expectedBinding: binding,
-    runs: new AgentRunCoordinator(events),
+    runs: new AgentRunCoordinator(events, artifacts),
     createRuntime: () => runtime,
     repository,
     descriptor: reopened,
@@ -102,7 +106,11 @@ test('native images survive queued revision, restart, provider encoding material
   const first = await session.startNextSubmission();
   const firstResult = await first.completion;
   assert.equal(firstResult.state, 'ended');
-  assert.equal(firstResult.terminal.executionStatus, 'completed', JSON.stringify(firstResult.terminal));
+  assert.equal(
+    firstResult.terminal.executionStatus,
+    'completed',
+    JSON.stringify(firstResult.terminal)
+  );
   const second = await runtime.run({ task: 'What did you observe?' }).result;
   assert.equal(second.state, 'ended');
   assert.equal(second.terminal.executionStatus, 'completed', JSON.stringify(second.terminal));
@@ -111,11 +119,14 @@ test('native images survive queued revision, restart, provider encoding material
     assert.deepEqual(images, [modelImage]);
     assert.ok(!request.messages.some((message) => message.content?.includes(modelImage.data)));
   }
-  const recorded = await new JsonlSessionRepository(path.join(directory, 'sessions')).readConversation(
-    reopened
-  );
+  const recorded = await new JsonlSessionRepository(
+    path.join(directory, 'sessions')
+  ).readConversation(reopened);
   assert.deepEqual(recorded.find((entry) => entry.type === 'input').images, [image]);
-  assert.equal(recorded.find((entry) => entry.type === 'assistant').reasoning, 'Visible reasoning.');
+  assert.equal(
+    recorded.find((entry) => entry.type === 'assistant').reasoning,
+    'Visible reasoning.'
+  );
 });
 
 test('one image budget covers current input and selected history, including native parts', async () => {

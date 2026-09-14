@@ -1,28 +1,22 @@
+import { parseModelSelection } from '@agent-core/model';
 import { parseJsonObject } from '@agent-core/json';
 import * as z from 'zod';
 import { historyCutSchema, noteRefSchema, sourceSchema } from '../history/schema.js';
 export const contextSelectionSchema = z
   .strictObject({
-    representations: z
-      .array(z.strictObject({ source: sourceSchema, presentation: z.literal('summary') }).readonly())
-      .max(10_000)
+    protected: z.array(sourceSchema).max(10000).readonly().optional(),
+    continuity: z
+      .strictObject({
+        kind: z.literal('fresh'),
+        resetId: z.string().min(1),
+        model: z.unknown().transform((value) => parseModelSelection(value)),
+        sources: z.array(sourceSchema).max(10000).readonly()
+      })
       .readonly()
       .optional(),
     retained: z.array(sourceSchema).max(10_000).readonly(),
     notes: z.array(noteRefSchema).max(256).readonly(),
-    omitted: z
-      .array(
-        z
-          .strictObject({
-            fromEntryId: z.string().min(1),
-            toEntryId: z.string().min(1),
-            reason: z.string().min(1)
-          })
-          .readonly()
-      )
-      .max(1000)
-      .readonly(),
-    strategy: z.enum(['retain', 'notes', 'provider']),
+    strategy: z.enum(['sources', 'provider']),
     providerState: z
       .unknown()
       .transform((value, context) => {
@@ -41,6 +35,17 @@ export const contextSelectionSchema = z
   .readonly();
 export const contextTransitionRequestSchema = z
   .strictObject({
+    toolInvocation: z
+      .strictObject({
+        runId: z.string().min(1),
+        turnId: z.string().min(1),
+        requestAttempt: z.int().positive(),
+        toolBatchId: z.string().min(1),
+        callIndex: z.int().nonnegative(),
+        toolAttempt: z.int().positive()
+      })
+      .readonly()
+      .optional(),
     expectedWindowId: z.string().min(1).nullable(),
     expectedSourceRevision: z.number().int().min(0).optional(),
     idempotencyKey: z.string().min(1),
@@ -61,6 +66,8 @@ export const contextWindowSchema = z
 export const contextTransitionSchema = z
   .strictObject({
     transitionId: z.string().min(1),
+    compiledInputIdentity: z.string().min(1).optional(),
+    capabilityRevision: z.string().min(1).optional(),
     idempotencyKey: z.string().min(1),
     previousWindowId: z.string().min(1).nullable(),
     windowId: z.string().min(1),

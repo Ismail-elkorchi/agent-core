@@ -1,3 +1,4 @@
+import { InMemoryArtifactRepository } from '@agent-core/persistence';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -35,10 +36,12 @@ for (const [storeName, createStore] of stores) {
       try {
         const faulted = new OneShotConditionalFault(repository, timing);
         await assert.rejects(
-          new AgentRunCoordinator(faulted).accept(acceptance(runId)),
+          new AgentRunCoordinator(faulted, new InMemoryArtifactRepository()).accept(
+            acceptance(runId)
+          ),
           /injected conditional append fault/u
         );
-        const runs = new AgentRunCoordinator(repository);
+        const runs = new AgentRunCoordinator(repository, new InMemoryArtifactRepository());
         if (timing === 'before') {
           await assert.rejects(runs.inspect(runId), /no durable run/u);
           assert.deepEqual(await runs.listUnfinished(), []);
@@ -56,9 +59,12 @@ for (const [storeName, createStore] of stores) {
       const { repository, dispose } = await createStore();
       const runId = `${storeName}-claim-${timing}`;
       try {
-        const runs = new AgentRunCoordinator(repository);
+        const runs = new AgentRunCoordinator(repository, new InMemoryArtifactRepository());
         await runs.accept(acceptance(runId));
-        const faulted = new AgentRunCoordinator(new OneShotConditionalFault(repository, timing));
+        const faulted = new AgentRunCoordinator(
+          new OneShotConditionalFault(repository, timing),
+          new InMemoryArtifactRepository()
+        );
         await assert.rejects(
           faulted.attach(runId, 'uncertain-driver'),
           /injected conditional append fault/u
@@ -82,7 +88,7 @@ test('an integrity-audited corrupt JSONL run is quarantined before provider exec
   const runId = 'quarantined-run';
   try {
     const repository = new JsonlEventRepository({ rootDir: directory, codec: agentEventCodec });
-    const runs = new AgentRunCoordinator(repository);
+    const runs = new AgentRunCoordinator(repository, new InMemoryArtifactRepository());
     await runs.accept(
       acceptance(runId, {
         providerId: 'quarantine-provider',
@@ -142,7 +148,9 @@ test('an integrity-audited corrupt JSONL run is quarantined before provider exec
       provider,
       model: 'fixture',
       toolBoundary: { authorizationPolicyId: 'test-policy', executionTargetId: 'test-target' },
-      repositories: { events: new JsonlEventRepository({ rootDir: directory, codec: agentEventCodec }) }
+      repositories: {
+        events: new JsonlEventRepository({ rootDir: directory, codec: agentEventCodec })
+      }
     });
     await assert.rejects(runtime.resume(runId).result, /quarant|integrity|hash mismatch/iu);
     assert.equal(providerCalls, 0);
@@ -183,6 +191,18 @@ class OneShotConditionalFault {
   }
   read(runId) {
     return this.repository.read(runId);
+  }
+  readRange(runId, request) {
+    return this.repository.readRange(runId, request);
+  }
+  referenceByKey(runId, key) {
+    return this.repository.referenceByKey(runId, key);
+  }
+  latestReferenceOfType(runId, type) {
+    return this.repository.latestReferenceOfType(runId, type);
+  }
+  readReference(reference) {
+    return this.repository.readReference(reference);
   }
   listRunIds() {
     return this.repository.listRunIds();

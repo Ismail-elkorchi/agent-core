@@ -1,3 +1,4 @@
+import { LocalArtifactRepository } from '@agent-core/persistence/node';
 import path from 'node:path';
 import { hashJson, JsonlEventRepository } from '@agent-core/persistence/node';
 import { AgentRunCoordinator, AgentSession, agentEventCodec } from '@agent-core/runtime';
@@ -85,8 +86,14 @@ const descriptor = await storedSessions.create({
   binding
 });
 const repository = new CrashOnCompletionRepository(storedSessions, timing);
-const events = new JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
-const runs = new AgentRunCoordinator(events);
+const events = new JsonlEventRepository({
+  rootDir: path.join(root, 'events'),
+  codec: agentEventCodec
+});
+const runs = new AgentRunCoordinator(
+  events,
+  new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts') })
+);
 const session = new AgentSession({
   descriptor,
   expectedBinding: binding,

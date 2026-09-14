@@ -4,7 +4,10 @@ import { ToolCallExecutor, type ToolCallCompletion } from './tool-execution.js';
 
 export type ToolWorkStatus =
   | { readonly outcome: 'completed' | 'ownership_lost' | 'waiting_for_recovery' }
-  | { readonly outcome: 'waiting_for_approval'; readonly approvals: readonly AgentApprovalRequest[] };
+  | {
+      readonly outcome: 'waiting_for_approval';
+      readonly approvals: readonly AgentApprovalRequest[];
+    };
 
 /** Drives the same per-call procedures at synchronous and native response boundaries. */
 export class ToolWorkPump {
@@ -25,7 +28,8 @@ export class ToolWorkPump {
     this.queue = this.queue
       .then(() => this.drive())
       .catch((error: unknown) => {
-        this.failure = error instanceof Error ? error : new Error('Tool work failed.', { cause: error });
+        this.failure =
+          error instanceof Error ? error : new Error('Tool work failed.', { cause: error });
       });
     await this.queue;
     this.assertAvailable();
@@ -61,7 +65,8 @@ export class ToolWorkPump {
       progressed = false;
       for (const batch of this.state().toolBatches) {
         for (const [callIndex, call] of batch.callStates.entries()) {
-          if (call.stage === 'recorded' || call.stage === 'cancelled') continue;
+          if (call.stage === 'recorded' || call.stage === 'resolved' || call.stage === 'cancelled')
+            continue;
           const key = `${batch.toolBatchId}:${String(callIndex)}`;
           if (this.active.has(key)) continue;
           const step = await this.executor.step({ toolBatchId: batch.toolBatchId, callIndex });
@@ -81,7 +86,8 @@ export class ToolWorkPump {
         this.lostOwnership ||= result.outcome === 'ownership_lost';
       })
       .catch((error: unknown) => {
-        this.failure = error instanceof Error ? error : new Error('Tool work failed.', { cause: error });
+        this.failure =
+          error instanceof Error ? error : new Error('Tool work failed.', { cause: error });
       })
       .finally(() => {
         this.active.delete(key);
@@ -123,6 +129,8 @@ export class ToolWorkPump {
 
 export function toolObservationsComplete(state: AgentRunState): boolean {
   return state.toolBatches.every((batch) =>
-    batch.callStates.every((call) => call.stage === 'recorded' || call.stage === 'cancelled')
+    batch.callStates.every(
+      (call) => call.stage === 'recorded' || call.stage === 'resolved' || call.stage === 'cancelled'
+    )
   );
 }

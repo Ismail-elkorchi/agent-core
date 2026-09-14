@@ -3,7 +3,13 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { AgentRuntime, agentEventCodec, InMemorySessionRepository } from '@agent-core/runtime';
+import {
+  AgentRuntime,
+  InferenceService,
+  InMemoryInferenceRepository,
+  agentEventCodec,
+  InMemorySessionRepository
+} from '@agent-core/runtime';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import {
   DEFAULT_LOCAL_TOOL_CONFIGURATION,
@@ -85,6 +91,11 @@ test(
     const options = {
       provider,
       model: 'scripted',
+      inferenceService: new InferenceService({
+        provider,
+        repository: new InMemoryInferenceRepository(),
+        artifacts
+      }),
       toolBoundary: { authorizationPolicyId: 'tests/self-host-policy@1', executionTargetId: root },
       repositories: { events, session: { repository: sessions, descriptor: session }, artifacts },
       tools,
@@ -118,7 +129,7 @@ test(
     const ledger = [];
     for await (const envelope of events.read(result.terminal.runId)) ledger.push(envelope.event);
     const failedObservations = ledger.filter(
-      (event) => event.type === 'tool.ended' && !event.observation.ok
+      (event) => event.type === 'tool.ended' && event.observation.kind === 'failure'
     );
     assert.equal(
       result.terminal.executionStatus,
@@ -127,7 +138,9 @@ test(
     );
     assert.equal(await readFile(path.join(root, 'note.txt'), 'utf8'), 'beta\n');
     assert.equal(ledger.filter((event) => event.type === 'run.ended').length, 1);
-    const endedTools = ledger.filter((event) => event.type === 'tool.ended').map((event) => event.toolName);
+    const endedTools = ledger
+      .filter((event) => event.type === 'tool.ended')
+      .map((event) => event.toolName);
     assert.equal(endedTools.length, tools.length);
     assert.deepEqual(endedTools.toSorted(), tools.map((tool) => tool.name).toSorted());
   }
@@ -149,7 +162,11 @@ class ScriptedProvider {
       capabilities: {
         streaming: false,
         toolCalling: true,
-        supportedToolInputs: [{ kind: 'json' }, { kind: 'text' }, { kind: 'grammar', syntax: 'lark' }],
+        supportedToolInputs: [
+          { kind: 'json' },
+          { kind: 'text' },
+          { kind: 'grammar', syntax: 'lark' }
+        ],
         jsonMode: false,
         jsonSchema: false,
         logprobs: false,

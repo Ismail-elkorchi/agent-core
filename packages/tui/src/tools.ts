@@ -9,6 +9,17 @@ interface ExistingActivity {
   readonly details?: readonly ActivityDetail[];
 }
 
+export type ToolActivityRenderer = (
+  toolName: string,
+  observation: { readonly kind: 'result' | 'failure'; readonly output?: unknown }
+) =>
+  | {
+      readonly status?: ConversationActivityEntry['status'];
+      readonly summary?: string;
+      readonly details?: readonly ActivityDetail[];
+    }
+  | undefined;
+
 type ToolDisplayValue = ToolCall['input']['value'] | ToolObservation['output'];
 
 export function toolActivityId(identity: {
@@ -23,10 +34,14 @@ export function toolActivityId(identity: {
 
 export function completedSessionToolActivity(
   current: ExistingActivity | undefined,
-  entry: import('@agent-core/runtime').SessionObservationEntry
+  entry: import('@agent-core/runtime').SessionObservationEntry,
+  render?: ToolActivityRenderer
 ): ToolActivity {
   const details = settleDetails(current, [
-    detail('output', entry.output === undefined ? undefined : `Output\n${formatValue(entry.output)}`),
+    detail(
+      'output',
+      entry.output === undefined ? undefined : `Output\n${formatValue(entry.output)}`
+    ),
     detail(
       'artifacts',
       entry.artifacts?.length
@@ -42,9 +57,26 @@ export function completedSessionToolActivity(
     kind: 'activity',
     activity: 'tool',
     label: current?.label ?? humanize(entry.toolName),
-    status: entry.ok ? 'success' : 'failed',
-    summary: compact(entry.summary),
-    ...(details.length === 0 ? {} : { details: details })
+    status: entry.originalUnavailable
+      ? 'warning'
+      : entry.kind === 'failure'
+        ? 'failed'
+        : 'complete',
+    summary: compact(
+      entry.originalUnavailable
+        ? `${entry.summary} Original observation unavailable: ${entry.originalUnavailable.message}`
+        : entry.summary
+    ),
+    ...(details.length === 0 ? {} : { details: details }),
+    ...renderObservation(render, entry.toolName, entry),
+    ...(entry.originalUnavailable
+      ? {
+          status: 'warning' as const,
+          summary: compact(
+            `${entry.summary} Original observation unavailable: ${entry.originalUnavailable.message}`
+          )
+        }
+      : {})
   };
 }
 
@@ -62,7 +94,11 @@ export function sessionObservationActivityId(
   return `tool:${entry.runId}:observation:${entry.id}`;
 }
 
-export function pendingToolActivity(id: string, call: ToolCall, label = humanize(call.name)): ToolActivity {
+export function pendingToolActivity(
+  id: string,
+  call: ToolCall,
+  label = humanize(call.name)
+): ToolActivity {
   return {
     id,
     kind: 'activity',
@@ -115,10 +151,14 @@ export function updatedToolActivity(
     details:
       progress.type === 'output'
         ? [
-            ...(current?.details ?? []).filter((section) => section.id !== `live:${progress.stream}`),
+            ...(current?.details ?? []).filter(
+              (section) => section.id !== `live:${progress.stream}`
+            ),
             {
               id: `live:${progress.stream}`,
-              content: `${current?.details?.find((section) => section.id === `live:${progress.stream}`)?.content ?? `${progress.stream}\n`}${progress.text}`
+              content: liveOutputTail(
+                `${current?.details?.find((section) => section.id === `live:${progress.stream}`)?.content ?? `${progress.stream}\n`}${progress.text}`
+              )
             }
           ]
         : (current?.details ?? [])
@@ -129,7 +169,8 @@ export function completedToolActivity(
   current: ExistingActivity | undefined,
   id: string,
   toolName: string,
-  observation: ToolObservation
+  observation: ToolObservation,
+  render?: ToolActivityRenderer
 ): ToolActivity {
   const summary = compact(observation.summary);
   const details = settleDetails(current, [
@@ -141,9 +182,22 @@ export function completedToolActivity(
     kind: 'activity',
     activity: 'tool',
     label: current?.label ?? humanize(toolName),
-    status: observation.ok ? 'success' : 'failed',
+    status:
+      observation.kind === 'failure'
+        ? 'failed'
+        : observation.execution?.state === 'unknown'
+          ? 'warning'
+          : observation.execution?.state === 'active'
+            ? 'running'
+            : 'complete',
     ...(summary.length === 0 ? {} : { summary }),
-    ...(details.length === 0 ? {} : { details: details })
+    ...(details.length === 0 ? {} : { details: details }),
+    ...renderObservation(render, toolName, observation),
+    ...(observation.execution?.state === 'unknown'
+      ? { status: 'warning' as const }
+      : observation.execution?.state === 'active'
+        ? { status: 'running' as const }
+        : {})
   };
 }
 
@@ -157,7 +211,9 @@ function formatToolInput(call: ToolCall): string {
 }
 
 function formatEffects(effects: ToolEffects): string {
-  const accesses = effects.accesses.map((access) => `${humanize(access.mode)} ${access.scope}`).join(', ');
+  const accesses = effects.accesses
+    .map((access) => `${humanize(access.mode)} ${access.scope}`)
+    .join(', ');
   const locks = effects.lockScopes.length > 0 ? ` · locks ${effects.lockScopes.join(', ')}` : '';
   return `Effects\n${accesses || 'none'}${locks} · ${formatRecovery(effects.recovery)}`;
 }
@@ -167,8 +223,11 @@ function formatRecovery(recovery: ToolEffects['recovery']): string {
   if (recovery.kind === 'preconditioned_reexecution')
     return `re-executable with ${String(recovery.preconditions.length)} precondition${recovery.preconditions.length === 1 ? '' : 's'}`;
   if (recovery.kind === 'queryable')
-    return recovery.expiresAt === null ? 'durable reconciliation' : `queryable until ${recovery.expiresAt}`;
-  if (recovery.kind === 'idempotency_key') return `parameter-bound idempotency until ${recovery.expiresAt}`;
+    return recovery.expiresAt === null
+      ? 'durable reconciliation'
+      : `queryable until ${recovery.expiresAt}`;
+  if (recovery.kind === 'idempotency_key')
+    return `parameter-bound idempotency until ${recovery.expiresAt}`;
   return `journal-reconcilable ${recovery.transactionId}`;
 }
 
@@ -189,7 +248,7 @@ function formatObservedFacts(observation: ToolObservation): string | undefined {
 
 function formatValue(value: ToolDisplayValue): string {
   if (typeof value === 'string') return value;
-  return JSON.stringify(value, null, 2);
+  return bounded(JSON.stringify(value, null, 2), 32768);
 }
 
 function compact(value: string): string {
@@ -198,6 +257,16 @@ function compact(value: string): string {
 
 function bounded(value: string, maximum: number): string {
   return value.length <= maximum ? value : `${value.slice(0, Math.max(0, maximum - 1))}…`;
+}
+
+function liveOutputTail(value: string): string {
+  const maximum = 32768;
+  if (value.length <= maximum) return value;
+  const prefix = 'Earlier live preview omitted.\n';
+  let start = value.length - maximum + prefix.length;
+  const unit = value.charCodeAt(start);
+  if (unit >= 0xdc00 && unit <= 0xdfff) start++;
+  return prefix + value.slice(start);
 }
 
 function humanize(value: string): string {
@@ -213,7 +282,64 @@ function settleDetails(
   output: readonly (ActivityDetail | undefined)[]
 ): readonly ActivityDetail[] {
   return [
-    ...(current?.details ?? []).filter((section) => section.id === 'input' || section.id === 'effects'),
+    ...(current?.details ?? []).filter(
+      (section) => section.id === 'input' || section.id === 'effects'
+    ),
     ...output.filter((section): section is ActivityDetail => section !== undefined)
   ];
+}
+
+function renderObservation(
+  render: ToolActivityRenderer | undefined,
+  toolName: string,
+  observation: { readonly kind: 'result' | 'failure'; readonly output?: unknown }
+): ReturnType<ToolActivityRenderer> {
+  if (!render) return undefined;
+  try {
+    const rendered = render(toolName, observation);
+    if (!rendered) return undefined;
+    if (
+      rendered.status !== undefined &&
+      !['running', 'complete', 'success', 'warning', 'failed'].includes(rendered.status)
+    )
+      throw new Error('Invalid tool display state.');
+    if (rendered.summary !== undefined && typeof rendered.summary !== 'string')
+      throw new Error('Invalid tool summary.');
+    if (
+      rendered.details?.some(
+        (item) => typeof item.id !== 'string' || typeof item.content !== 'string'
+      )
+    )
+      throw new Error('Invalid tool details.');
+    return {
+      ...rendered,
+      ...(rendered.details
+        ? {
+            details: rendered.details.map((item) => ({
+              ...item,
+              content: bounded(item.content, 32768)
+            }))
+          }
+        : {}),
+      ...(observation.kind === 'failure' ? { status: 'failed' as const } : {})
+    };
+  } catch (error) {
+    return {
+      details: [
+        {
+          id: 'output',
+          content: bounded(
+            typeof observation.output === 'string'
+              ? observation.output
+              : JSON.stringify(observation.output),
+            32768
+          )
+        },
+        {
+          id: 'presentation-diagnostic',
+          content: `Tool display unavailable: ${error instanceof Error ? error.message : String(error)}`
+        }
+      ]
+    };
+  }
 }

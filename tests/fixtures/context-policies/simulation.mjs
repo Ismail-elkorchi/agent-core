@@ -42,7 +42,11 @@ export class MemorySimulationProvider {
   transforms = [];
   admittedTransforms = new WeakSet();
   describe() {
-    return { id: this.id, displayName: 'Deterministic simulation', defaultModel: simulationProfile.id };
+    return {
+      id: this.id,
+      displayName: 'Deterministic simulation',
+      defaultModel: simulationProfile.id
+    };
   }
   async describeModel() {
     return simulationProfile;
@@ -98,14 +102,18 @@ export class MemorySimulationProvider {
       (item) => item.role === 'user' && !item.content.startsWith('Context bundle:')
     );
     const lastUser = request.messages[taskIndex]?.content ?? '';
-    const hasToolResult = request.messages.slice(taskIndex + 1).some((item) => item.role === 'tool');
+    const hasToolResult = request.messages
+      .slice(taskIndex + 1)
+      .some((item) => item.role === 'tool');
     let content = 'ACK';
     let toolCalls;
     if (
       lastUser.includes('REPORT:') &&
       !hasToolResult &&
       !request.messages.some((item) => item.role === 'protocol') &&
-      request.tools?.some((tool) => tool.type === 'function' && tool.function.name === 'history_search')
+      request.tools?.some(
+        (tool) => tool.type === 'function' && tool.function.name === 'history_search'
+      )
     ) {
       toolCalls = [
         {
@@ -162,7 +170,7 @@ function strings(text) {
   if (typeof text !== 'string') return [];
   try {
     const jsonStart = text.indexOf('\n[');
-    const value = JSON.parse(jsonStart >= 0 ? text.slice(jsonStart + 1) : text);
+    const value = JSON.parse(jsonStart >= 0 ? text.slice(jsonStart + 1) : text.split('\n\n', 1)[0]);
     const visit = (item) =>
       typeof item === 'string'
         ? [item]

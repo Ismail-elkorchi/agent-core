@@ -1,6 +1,6 @@
 import * as z from 'zod';
 import { parseJsonObject } from '@agent-core/json';
-import type { CompiledToolDefinition } from '@agent-core/tools';
+import { defaultToolModelContent, type CompiledToolDefinition } from '@agent-core/tools';
 import type { HistoryReader } from './reader.js';
 import { historyCutSchema } from './schema.js';
 import { queryShape, rangeShape, scopedTool, scopePath, sourceSchema } from './tool-support.js';
@@ -12,11 +12,35 @@ export function createHistoryTools(options: {
   const read = z.strictObject({
     source: sourceSchema,
     ...rangeShape,
-    neighbors: z.number().int().min(0).max(10).optional()
+    maxSourceBytes: z
+      .number()
+      .int()
+      .min(1)
+      .max(8 * 1024 * 1024)
+      .optional(),
+    maxBytes: z
+      .number()
+      .int()
+      .min(1)
+      .max(1024 * 1024)
+      .optional(),
+    neighbors: z.number().int().min(0).max(32).optional()
   });
   const search = z.strictObject({
     query: z.string().max(4096).optional(),
     ...queryShape,
+    maxScannedBytes: z
+      .number()
+      .int()
+      .min(1)
+      .max(8 * 1024 * 1024)
+      .optional(),
+    maxBytes: z
+      .number()
+      .int()
+      .min(1)
+      .max(1024 * 1024)
+      .optional(),
     filter: z
       .strictObject({
         sourceType: z
@@ -46,6 +70,17 @@ export function createHistoryTools(options: {
       schema: read,
       mode: 'read',
       root: 'history',
+      buildModelContent({ observation }) {
+        if (observation.kind !== 'result') return defaultToolModelContent(observation);
+        const result = parseJsonObject(observation.output);
+        if (result.status !== 'available') return defaultToolModelContent(observation);
+        const item = parseJsonObject(result.item);
+        const { text, ...source } = item;
+        return [
+          { type: 'text', text: JSON.stringify({ ...result, item: source }, null, 2) },
+          { type: 'text', text: typeof text === 'string' ? text : JSON.stringify(text) }
+        ];
+      },
       async canonicalize(value) {
         const cut = await options.history.capture();
         return {
@@ -72,7 +107,7 @@ export function createHistoryTools(options: {
         };
       },
       async invoke(value) {
-        await options.history.view(historyCutSchema.parse(value.authorizedCut));
+        await options.history.validateCut(historyCutSchema.parse(value.authorizedCut));
         const request = search.parse(value.request);
         return options.history.search({
           ...request,

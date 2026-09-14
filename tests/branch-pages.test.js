@@ -63,7 +63,9 @@ async function fixture(t, count = 700) {
   }
   const repository = new JsonlSessionRepository({ rootDir: root });
   const file = repository.location(session.id);
-  const source = [session.header, ...records].map((record) => JSON.stringify(record) + '\n').join('');
+  const source = [session.header, ...records]
+    .map((record) => JSON.stringify(record) + '\n')
+    .join('');
   await writeFile(file, source);
   return { memory, session, entries, file, source, repository };
 }
@@ -81,7 +83,11 @@ test('offset-based pages retain bounded bodies while all history beyond 512 entr
     }
     if (!page.older) break;
     const before = repository.historyReadMetrics(session.id);
-    page = await repository.readBranchPage(session, { cursor: page.older, limit: 20, maxBytes: 64 * 1024 });
+    page = await repository.readBranchPage(session, {
+      cursor: page.older,
+      limit: 20,
+      maxBytes: 64 * 1024
+    });
     const after = repository.historyReadMetrics(session.id);
     assert(after.bodyBytesRead - before.bodyBytesRead <= 64 * 1024);
     assert(after.bodyRecordsRead - before.bodyRecordsRead <= 20);
@@ -94,7 +100,11 @@ test('offset-based pages retain bounded bodies while all history beyond 512 entr
     'page retrieval never opens the full replay repository index'
   );
   const metrics = repository.historyReadMetrics(session.id);
-  assert.equal(metrics.scannedBytes, Buffer.byteLength(source), 'one cold metadata scan is explicit');
+  assert.equal(
+    metrics.scannedBytes,
+    Buffer.byteLength(source),
+    'one cold metadata scan is explicit'
+  );
   assert.equal(metrics.bodyRecordsRead, entries.length);
 });
 
@@ -111,7 +121,11 @@ test('search walks beyond loaded pages and binds continuations to the original q
   for (;;) {
     matches.push(...result.matches);
     if (!result.older) break;
-    result = await repository.searchBranch(session, { query: 'NEEDLE', cursor: result.older, limit: 64 });
+    result = await repository.searchBranch(session, {
+      query: 'NEEDLE',
+      cursor: result.older,
+      limit: 64
+    });
   }
   assert.equal(matches.length, 1);
   const entry = await repository.readBranchEntry(session, result.boundary, matches[0].entryId);
@@ -146,7 +160,10 @@ test('snapshot cursors remain stable after append and reject another branch, ses
   );
   const rewritten = source.replace('Input 4', 'Changed');
   await writeFile(file, rewritten + JSON.stringify(branch) + '\n' + JSON.stringify(next) + '\n');
-  await assert.rejects(repository.readBranchPage(session, { cursor: first.older }), /does not match/);
+  await assert.rejects(
+    repository.readBranchPage(session, { cursor: first.older }),
+    /does not match/
+  );
 });
 
 test('oversized page entries stay available through explicit source reads', async (t) => {
@@ -156,11 +173,48 @@ test('oversized page entries stay available through explicit source reads', asyn
   assert.equal(bounded.entries.length, 0);
   assert.ok(bounded.oversizedEntry.bytes > 100);
   assert.equal(
-    (await repository.readBranchEntry(session, bounded.boundary, bounded.oversizedEntry.entryId)).id,
+    (await repository.readBranchEntry(session, bounded.boundary, bounded.oversizedEntry.entryId))
+      .id,
     bounded.oversizedEntry.entryId
   );
   assert.equal(
     (await repository.readBranchEntry(session, page.boundary, page.entries[0].id)).task,
     page.entries[0].task
   );
+});
+
+test('source snapshots advance membership metadata without historical body reads and rebuild is cancellable', async (t) => {
+  const { repository, memory, session, file } = await fixture(t, 8);
+  const first = await repository.sourceSnapshot(session);
+  const before = repository.historyReadMetrics(session.id);
+  assert.equal(first.sourceRevision, 9);
+  assert.equal(first.entries.length, 8);
+  assert.equal(first.finalizations.length, 1);
+  assert(
+    first.entries.every(
+      (entry) => !('task' in entry) && typeof entry.sha256 === 'string' && entry.bytes > 0
+    )
+  );
+  const appended = await memory.appendInput(session, { runId: 'append', task: 'new source' });
+  const encoded = JSON.stringify(appended) + '\n';
+  await appendFile(file, encoded);
+  const latest = await repository.sourceSnapshot(session);
+  assert.equal(latest.sourceRevision, first.sourceRevision + 1);
+  assert.equal(
+    repository.historyReadMetrics(session.id).scannedBytes - before.scannedBytes,
+    Buffer.byteLength(encoded)
+  );
+  assert.equal(repository.historyReadMetrics(session.id).bodyRecordsRead, before.bodyRecordsRead);
+  assert.equal(first.entries.length, 8, 'captured metadata is immutable');
+  const controller = new AbortController();
+  await assert.rejects(
+    repository.rebuildHistoryIndex(session, {
+      signal: controller.signal,
+      onProgress(progress) {
+        if (progress.records >= 3) controller.abort();
+      }
+    }),
+    /abort/i
+  );
+  assert.equal((await repository.sourceSnapshot(session)).entries.length, 9);
 });

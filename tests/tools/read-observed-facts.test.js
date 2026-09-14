@@ -64,7 +64,7 @@ test('every built-in read tool derives observedFacts from its persisted ToolScop
 
   for (const [tool, input, action] of calls) {
     const observation = await invokeToolCall(jsonToolCall(tool.name, input), [tool], context);
-    assert.equal(observation.ok, true, tool.name);
+    assert.equal(observation.kind, 'result', tool.name);
     assert.equal(observation.observedFacts.items.length, 1, tool.name);
     const observedFacts = observation.observedFacts.items[0];
     assert.equal(observedFacts.action, action, tool.name);
@@ -126,7 +126,11 @@ test('read-tool observedFacts reaches durable observations, session context, pro
     id: 'observedFacts-provider',
     implementationId: 'agent-core.tests.observedFacts-provider@1',
     describe() {
-      return { id: this.id, displayName: 'Observed facts provider', defaultModel: 'observedFacts-model' };
+      return {
+        id: this.id,
+        displayName: 'Observed facts provider',
+        defaultModel: 'observedFacts-model'
+      };
     },
     async describeModel() {
       return {
@@ -200,8 +204,9 @@ test('read-tool observedFacts reaches durable observations, session context, pro
   assert.match(secondRequest, /list_directory/u);
   assert.match(secondRequest, /visible\.txt/u);
   assert.equal(
-    requests[1].messages.filter((item) => item.role === 'tool' && item.toolName === 'list_directory')
-      .length,
+    requests[1].messages.filter(
+      (item) => item.role === 'tool' && item.toolName === 'list_directory'
+    ).length,
     1
   );
   assert.equal(
@@ -211,7 +216,9 @@ test('read-tool observedFacts reaches durable observations, session context, pro
 
   const replay = await sessions.loadReplayState(session);
   assert.equal(
-    replay.branch.some((entry) => entry.type === 'observation' && entry.toolName === 'list_directory'),
+    replay.branch.some(
+      (entry) => entry.type === 'observation' && entry.toolName === 'list_directory'
+    ),
     true
   );
 });

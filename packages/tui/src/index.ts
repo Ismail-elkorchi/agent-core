@@ -13,7 +13,13 @@ export { providerFailureText, suspensionPresentation } from './recovery.js';
 
 export { copySource, selectedSource } from './copy.js';
 export { historyBookmark, type HistoryBookmark } from './history-bookmark.js';
-export { notesView, updateNotes, type NoteReader, type NotesMessage, type NotesState } from './notes.js';
+export {
+  notesView,
+  updateNotes,
+  type NoteReader,
+  type NotesMessage,
+  type NotesState
+} from './notes.js';
 export { RetainedListPresentation } from './retained-list.js';
 
 export {
@@ -153,7 +159,12 @@ export {
 
 export { reconcileConversationEntries } from './conversation.js';
 
-export { createSessionName, loadSessionName, sessionNameView, updateSessionName } from './session-name.js';
+export {
+  createSessionName,
+  loadSessionName,
+  sessionNameView,
+  updateSessionName
+} from './session-name.js';
 export type { SessionNameMessage, SessionNameState, SessionNames } from './session-name.js';
 
 export { composerControls } from './composer-controls.js';
@@ -171,3 +182,12 @@ export { insertAcceptedInput } from './conversation.js';
 export { adjacentHistoryMatch, selectHistoryMatch } from './history-matches.js';
 export type { HistoryMatchPosition } from './history-matches.js';
 export { reasoningLabel } from './progress.js';
+
+export type { ToolActivityRenderer } from './tools.js';
+export { createContextState, updateContext, contextView } from './context.js';
+export type {
+  ContextInspection,
+  ContextOperations,
+  ContextState,
+  ContextMessage
+} from './context.js';

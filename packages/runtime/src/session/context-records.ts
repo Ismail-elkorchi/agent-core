@@ -75,12 +75,15 @@ export function validateContextCommit(
     throw new Error('Context transition identities do not match its captured boundary.');
   const refs = new Map(branch.map((entry) => [entry.id, hashJson(entry)]));
   for (const ref of input.window.selection.retained) {
-    const ledger = ref.event ? cut.ledgerHeads?.find((head) => head.runId === ref.event?.runId) : undefined;
+    const ledger = ref.event
+      ? cut.ledgerHeads?.find((head) => head.runId === ref.event?.runId)
+      : undefined;
     const finalized =
       ref.event &&
       finalizations.some(
         (record) =>
-          record.runId === ref.event?.runId && branch.some((entry) => entry.id === record.throughEntryId)
+          record.runId === ref.event?.runId &&
+          branch.some((entry) => entry.id === record.throughEntryId)
       );
     const eventCovered =
       ref.sha256 === ref.event?.hash &&
@@ -104,7 +107,9 @@ export function contextCommitRetry(
       hashJson(existing.window.selection) !== hashJson(input.window.selection) ||
       existing.window.reason !== input.window.reason)
   )
-    throw new PersistenceConflictError('Context transition idempotency key has conflicting content.');
+    throw new PersistenceConflictError(
+      'Context transition idempotency key has conflicting content.'
+    );
   return existing;
 }
 
@@ -123,10 +128,10 @@ export function decodeContextTransitionEntry(value: unknown): SessionContextTran
     selection: {
       retained: entry.window.selection.retained,
       notes: entry.window.selection.notes,
-      omitted: entry.window.selection.omitted,
       strategy: entry.window.selection.strategy,
-      ...(entry.window.selection.representations
-        ? { representations: entry.window.selection.representations }
+      ...(entry.window.selection.protected ? { protected: entry.window.selection.protected } : {}),
+      ...(entry.window.selection.continuity
+        ? { continuity: entry.window.selection.continuity }
         : {})
     },
     reason: entry.window.reason,
@@ -135,9 +140,13 @@ export function decodeContextTransitionEntry(value: unknown): SessionContextTran
       : { expectedSourceRevision: entry.transition.requestedSourceRevision })
   });
   if (hashJson(entry.window.selection) !== entry.transition.selectionFingerprint)
-    throw new Error('Context selected provider state fingerprint does not match its committed window.');
+    throw new Error(
+      'Context selected provider state fingerprint does not match its committed window.'
+    );
   if (fingerprint !== entry.transition.requestFingerprint)
-    throw new Error('Context transition request fingerprint does not match its committed selection.');
+    throw new Error(
+      'Context transition request fingerprint does not match its committed selection.'
+    );
   return entry;
 }
 

@@ -22,7 +22,10 @@ const modelProfile = {
   limits: { contextTokens: 20_000, outputTokens: 4_000 },
   supportedParameters: ['tools']
 };
-const imageProfile = { ...modelProfile, modalities: { input: ['text', 'image'], output: ['text'] } };
+const imageProfile = {
+  ...modelProfile,
+  modalities: { input: ['text', 'image'], output: ['text'] }
+};
 
 test('application context follows retained history and precedes the current request and its tool responses', async () => {
   const window = new ModelWindow();
@@ -62,7 +65,9 @@ test('application context follows retained history and precedes the current requ
   window.recordModelOutput({
     turnIndex: 1,
     content: '',
-    toolCalls: [{ id: 'read-1', type: 'function', name: 'read', input: { kind: 'json', value: {} } }]
+    toolCalls: [
+      { id: 'read-1', type: 'function', name: 'read', input: { kind: 'json', value: {} } }
+    ]
   });
   window.recordToolResult({
     turnIndex: 1,
@@ -153,72 +158,6 @@ test('image limits reject the selection instead of silently removing older attac
     assert.throws(() => manager.messagesFor(imageProfile), /context_admission_failed/);
     assert.equal(manager.toolResult('image-call-1').images.length, 1);
   }
-});
-
-test('context compaction keeps image tool protocol and public references while dropping active bytes', () => {
-  const manager = new ModelWindow();
-  recordImageResult(manager, 1, [
-    { type: 'bytes', data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }
-  ]);
-  const original = manager.toolResult('image-call-1');
-  manager.selectToolResultPresentations(
-    new Map([['image-call-1', { ...original, images: undefined, content: 'artifact-1-0' }]])
-  );
-  const reductions = manager.consumeReductions();
-  assert.equal(reductions.length, 1);
-  assert.ok(Object.isFrozen(reductions));
-  assert.ok(Object.isFrozen(reductions[0]));
-  const assembly = manager.messagesFor(imageProfile);
-  assert.equal(assembly.messages.length, 2);
-  assert.equal(assembly.messages[0].toolCalls[0].id, assembly.messages[1].toolCallId);
-  assert.equal(assembly.messages[1].images, undefined);
-  assert.match(assembly.messages[1].content, /artifact-1-0/u);
-});
-
-test('returned context reductions cannot mutate pending manager state', async () => {
-  const manager = new ModelWindow();
-  manager.recordToolResult({
-    turnIndex: 1,
-    toolName: 'exec_command',
-    toolCallType: 'function',
-    callId: 'result-1',
-    immediateContent: JSON.stringify({ output: 'x'.repeat(2_000) })
-  });
-  manager.selectToolResultPresentations(
-    new Map([
-      [
-        'result-1',
-        {
-          role: 'tool',
-          toolName: 'exec_command',
-          toolCallType: 'function',
-          toolCallId: 'result-1',
-          content: 'retained'
-        }
-      ]
-    ])
-  );
-  const reductions = manager.consumeReductions();
-  const reduction = reductions[0];
-  assert.ok(reduction);
-  const expected = { ...reduction };
-  assert.throws(() => {
-    reduction.afterBytes = 0;
-  }, TypeError);
-  assert.throws(() => reductions.push(reduction), TypeError);
-  const assembly = await assembleWindow(manager, {
-    task: 'continue',
-    instructions: [],
-    notes: [],
-    contextItems: [],
-    tools: [],
-    modelTools: [],
-    modelProfile,
-    requestWindow: { contextWindowTokens: 20_000, maxPromptTokens: 16_000, maxOutputTokens: 4_000 }
-  });
-  assert.deepEqual(reductions[0], expected);
-  assert.ok(Object.isFrozen(reductions[0]));
-  assert.equal('installCheckpoint' in manager, false);
 });
 
 test('prompt context delivery preserves application order without a second Core selection', () => {
@@ -354,13 +293,15 @@ test('ModelWindow preserves native tool call/result pairs in model-window histor
   assert.equal(assembly.windowMessages[1].toolCallId, 'call-1');
 });
 
-test('selected source records preserve complete conversation independently of result presentation reduction', async () => {
+test('selected source records preserve complete conversation without content rewriting', async () => {
   const window = new ModelWindow();
   const original = 'original constraint ' + '中'.repeat(1200) + ' KEEP THE LATE CORRECTION';
   window.recordSourceItem('source:user:1', { role: 'user', content: original });
-  window.recordSourceItem('source:assistant:1', { role: 'assistant', content: 'answer '.repeat(1000) });
+  window.recordSourceItem('source:assistant:1', {
+    role: 'assistant',
+    content: 'answer '.repeat(1000)
+  });
   window.recordSourceItem('source:user:1', { role: 'user', content: original });
-  window.selectToolResultPresentations(new Map());
   const assembled = await new ModelRequestAssembler().assemble({
     window,
     task: 'new task',
@@ -397,22 +338,8 @@ test('all exact tool arguments survive presentation pressure, including argument
     callId: 'large',
     immediateContent: 'large result '.repeat(5000)
   });
-  window.selectToolResultPresentations(
-    new Map([
-      [
-        'large',
-        {
-          role: 'tool',
-          toolName: 'inspect',
-          toolCallType: 'function',
-          toolCallId: 'large',
-          content: 'retained observation'
-        }
-      ]
-    ])
-  );
   const history = window.messagesFor(modelProfile);
   assert.equal(history.messages[0].toolCalls[0].input.value.value, value);
   assert.equal(history.messages[1].toolCallId, 'large');
-  assert.equal(history.messages[1].content, 'retained observation');
+  assert.equal(history.messages[1].content, 'large result '.repeat(5000));
 });

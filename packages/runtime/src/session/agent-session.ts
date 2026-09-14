@@ -1,4 +1,16 @@
-import { hashJson } from '@agent-core/persistence';
+import { hashJson, type ArtifactRepository } from '@agent-core/persistence';
+import {
+  assertModelRequestSupported,
+  type ModelProfile,
+  type ModelSelection
+} from '@agent-core/model';
+import { parseModelChangeRequest, type ModelChangeOptions } from '../orchestration/model-change.js';
+import {
+  assertHistoryModelCompatibility,
+  assertPortableHistoryCompatibility,
+  readSelectedHistorySources
+} from '../orchestration/session-replay.js';
+import { sourceRef } from '../history/reader.js';
 import { randomUUID } from 'node:crypto';
 import { AgentRuntime, type AgentRunHandle, type AgentRunInput } from '../agent-runtime.js';
 import type { ContextTransitionRequest } from '../context/contracts.js';
@@ -22,7 +34,10 @@ import type {
   SessionSuspensionDescriptor
 } from './contracts.js';
 import { parseSessionImages } from './images.js';
-import { ownSessionSubmissionConfiguration, ownSessionSubmissionInput } from './submission-lifecycle.js';
+import {
+  ownSessionSubmissionConfiguration,
+  ownSessionSubmissionInput
+} from './submission-lifecycle.js';
 
 export type AgentSessionConfiguration = SessionSubmissionConfiguration;
 
@@ -44,7 +59,9 @@ export interface AgentSessionState {
 
 export type AgentSessionSuspensionCategory = SessionSuspensionCategory;
 export type AgentSessionSuspensionAction = SessionSuspensionAction;
-export type AgentSessionDecisionRequest = NonNullable<SessionSuspensionDescriptor['decisionRequest']>;
+export type AgentSessionDecisionRequest = NonNullable<
+  SessionSuspensionDescriptor['decisionRequest']
+>;
 export type AgentSessionSuspensionDescriptor = SessionSuspensionDescriptor;
 
 export type AgentSessionEvent =
@@ -126,7 +143,10 @@ export class AgentSession {
   private closeCompletion: Promise<void> | undefined;
 
   constructor(private readonly options: AgentSessionOptions) {
-    assertSessionBinding(options.expectedBinding, decodeSessionBinding(options.descriptor.header.binding));
+    assertSessionBinding(
+      options.expectedBinding,
+      decodeSessionBinding(options.descriptor.header.binding)
+    );
     const maximumQueuedInputs = options.maximumQueuedInputs ?? 1024;
     if (!Number.isSafeInteger(maximumQueuedInputs) || maximumQueuedInputs < 0)
       throw new Error('maximumQueuedInputs must be a non-negative safe integer.');
@@ -229,9 +249,14 @@ export class AgentSession {
       const delivery = options.delivery ?? 'default';
       if (delivery === 'steer') {
         if (input.images?.length || input.contextItems?.length || input.instructions?.length)
-          throw new Error('Steering accepts instruction text. Send attachments as a follow-up input.');
+          throw new Error(
+            'Steering accepts instruction text. Send attachments as a follow-up input.'
+          );
         if (!this.active) return { kind: 'rejected', reason: 'no_active_run' };
-        if (options.expectedRunId !== undefined && options.expectedRunId !== this.active.control.runId)
+        if (
+          options.expectedRunId !== undefined &&
+          options.expectedRunId !== this.active.control.runId
+        )
           return { kind: 'rejected', reason: 'run_mismatch' };
         await this.options.repository.appendSteering(this.options.descriptor, {
           runId: this.active.control.runId,
@@ -253,7 +278,11 @@ export class AgentSession {
           'Durable session submissions cannot retain an AbortSignal; abort the active run through AgentSession.abort().'
         );
       if (this.suspended)
-        return { kind: 'rejected', reason: 'session_suspended', suspension: this.suspended.descriptor };
+        return {
+          kind: 'rejected',
+          reason: 'session_suspended',
+          suspension: this.suspended.descriptor
+        };
       const pending = pendingSubmission(
         submissionId,
         input.runId ?? randomUUID(),
@@ -264,7 +293,9 @@ export class AgentSession {
         (this.active || this.options.scheduling === 'manual') &&
         this.queued.length >= this.maximumQueuedInputs
       ) {
-        throw new Error(`Session input queue limit of ${String(this.maximumQueuedInputs)} was reached.`);
+        throw new Error(
+          `Session input queue limit of ${String(this.maximumQueuedInputs)} was reached.`
+        );
       }
       await this.options.repository.enqueueSubmission(this.options.descriptor, {
         submissionId,
@@ -278,10 +309,125 @@ export class AgentSession {
       if (this.options.scheduling === 'manual' || this.active || this.queued.length > 0) {
         this.enqueue(pending);
         if (!this.active) await this.launchNext();
-        return { kind: 'queued', submissionId, runId: pending.runId, completion: pending.completion };
+        return {
+          kind: 'queued',
+          submissionId,
+          runId: pending.runId,
+          completion: pending.completion
+        };
       }
       return this.launch(pending);
     });
+  }
+
+  /** Changes future inference only after durable pending work has reached a lawful boundary. */
+  changeModel(
+    input: ModelChangeOptions & {
+      readonly selection: ModelSelection;
+      readonly profile: ModelProfile;
+      readonly artifacts: ArtifactRepository;
+    }
+  ): Promise<AgentSessionState> {
+    const { selection, options } = parseModelChangeRequest({
+      ...input.selection,
+      ...(input.continuation === undefined ? {} : { continuation: input.continuation })
+    });
+    return this.serial(async () => {
+      this.assertOpen();
+      await this.restorePending();
+      if (this.active || this.suspended || this.queued.length > 0)
+        throw new Error(
+          'Settle or reconcile pending work and native result deliveries before changing models. Unknown effects remain unresolved.'
+        );
+      if (input.profile.provider !== selection.provider || input.profile.id !== selection.model)
+        throw new Error('The target model profile does not match the selected configuration.');
+      assertModelRequestSupported(input.profile, {
+        model: selection.model,
+        messages: [],
+        ...(selection.reasoning === undefined ? {} : { reasoning: selection.reasoning }),
+        ...(selection.temperature === undefined ? {} : { temperature: selection.temperature })
+      });
+      const context = this.options.context;
+      if (!context) throw new Error('Model changes require the session context service.');
+      if (options.continuation === 'fresh') {
+        const view = await readSelectedHistorySources(context.history);
+        const entries = view.entries.filter(
+          (entry) =>
+            entry.type !== 'context_transition' &&
+            entry.type !== 'model_settings' &&
+            entry.type !== 'branch'
+        );
+        await assertPortableHistoryCompatibility({
+          sessionId: view.cut.sessionId,
+          entries,
+          profile: input.profile,
+          artifacts: input.artifacts
+        });
+        const retained = entries.map((entry) => sourceRef(view.cut.sessionId, entry));
+        const entry = await context.transition({
+          expectedWindowId: view.contextWindow?.windowId ?? null,
+          expectedSourceRevision: view.cut.sourceRevision,
+          idempotencyKey: randomUUID(),
+          reason: 'User explicitly selected fresh inference continuation.',
+          selection: {
+            strategy: 'sources',
+            retained,
+            notes: view.contextWindow?.selection.notes ?? [],
+            ...(view.contextWindow?.selection.protected === undefined
+              ? {}
+              : { protected: view.contextWindow.selection.protected }),
+            continuity: {
+              kind: 'fresh',
+              resetId: randomUUID(),
+              model: selection,
+              sources: retained
+            }
+          }
+        });
+        await this.emit({
+          type: 'context.transitioned',
+          window: entry.window,
+          transition: entry.transition
+        });
+      } else {
+        await assertHistoryModelCompatibility({
+          history: context.history,
+          artifacts: input.artifacts,
+          profile: input.profile
+        });
+        await this.options.repository.appendModelSettings(this.options.descriptor, selection);
+      }
+      // Fresh targets are committed with their source selection in one record. An interrupted
+      // observer/default write cannot leave a reset governed by the old target model.
+      this.configuration = ownConfiguration({
+        provider: selection.provider,
+        model: selection.model,
+        ...(selection.reasoning === undefined ? {} : { reasoning: selection.reasoning }),
+        ...(selection.temperature === undefined ? {} : { temperature: selection.temperature }),
+        ...(this.configuration.responseFormat === undefined
+          ? {}
+          : { responseFormat: this.configuration.responseFormat })
+      });
+      await this.emit({ type: 'configuration.changed', configuration: this.configuration });
+      return this.state();
+    });
+  }
+
+  async renewContext(selection?: import('../context/contracts.js').ContextSelection) {
+    if (!this.options.context) throw new Error('This session has no context service.');
+    await this.restore();
+    const result = await this.options.context.request({
+      ...(selection ? { selection } : {}),
+      reason: 'User-requested working-window renewal',
+      idempotencyKey: randomUUID()
+    });
+    if (result.kind === 'selected')
+      await this.emit({
+        type: 'context.transitioned',
+        window: result.entry.window,
+        transition: result.entry.transition
+      });
+    return result;
   }
 
   async transitionContext(
@@ -291,7 +437,11 @@ export class AgentSession {
     if (!this.options.context) throw new Error('This session has no context transition service.');
     await this.restore();
     const entry = await this.options.context.transition(request, options);
-    await this.emit({ type: 'context.transitioned', window: entry.window, transition: entry.transition });
+    await this.emit({
+      type: 'context.transitioned',
+      window: entry.window,
+      transition: entry.transition
+    });
     return entry;
   }
 
@@ -307,8 +457,14 @@ export class AgentSession {
       const pending = this.queued[index];
       if (pending === undefined) throw new Error(`Submission is no longer queued: ${submissionId}`);
       const owned =
-        change.kind === 'replace' ? { ...change, input: ownSessionSubmissionInput(change.input) } : change;
-      await this.options.repository.updateQueuedSubmission(this.options.descriptor, submissionId, owned);
+        change.kind === 'replace'
+          ? { ...change, input: ownSessionSubmissionInput(change.input) }
+          : change;
+      await this.options.repository.updateQueuedSubmission(
+        this.options.descriptor,
+        submissionId,
+        owned
+      );
       if (owned.kind === 'replace') this.queued[index] = { ...pending, input: owned.input };
       else {
         this.queued.splice(index, 1);
@@ -327,13 +483,18 @@ export class AgentSession {
       await this.restorePending();
       if (this.active || this.suspended || this.queued.length > 0)
         throw new Error('Session branching requires an idle session with no queued work.');
-      const replay = await this.options.repository.loadReplayState(this.options.descriptor, entryId);
+      const replay = await this.options.repository.loadReplayState(
+        this.options.descriptor,
+        entryId
+      );
       const parentBranchId =
         [...replay.branch].reverse().find((entry) => entry.type === 'branch')?.id ??
         this.options.descriptor.id;
       const parentScope = { sessionId: this.options.descriptor.id, branchId: parentBranchId };
       const parentNotes = await this.options.notes?.list({ scope: parentScope, limit: 1 });
-      const noteSource = parentNotes ? { scope: parentScope, watermark: parentNotes.watermark } : undefined;
+      const noteSource = parentNotes
+        ? { scope: parentScope, watermark: parentNotes.watermark }
+        : undefined;
       const branch = await this.options.repository.branchFrom(
         this.options.descriptor,
         entryId,
@@ -357,6 +518,10 @@ export class AgentSession {
     return this.continueSuspension('external_recovery', expectedRunId);
   }
 
+  async resumeContextAdmission(expectedRunId: string): Promise<AgentRunResult> {
+    return this.continueSuspension('context_admission', expectedRunId);
+  }
+
   async resumeImplementation(expectedRunId: string): Promise<AgentRunResult> {
     return this.continueSuspension('implementation', expectedRunId);
   }
@@ -370,7 +535,8 @@ export class AgentSession {
   }): Promise<AgentRunResult> {
     const started = await this.serial(async () => {
       await this.restorePending();
-      if (this.active) throw new Error(`Session ${this.options.descriptor.id} already has an active run.`);
+      if (this.active)
+        throw new Error(`Session ${this.options.descriptor.id} already has an active run.`);
       const suspended = this.requireSuspension('user_decision', input.runId);
       const run = await this.options.runs.inspect(input.runId);
       const phase = run.state.phase;
@@ -381,7 +547,8 @@ export class AgentSession {
         request.id !== input.decisionRequestId ||
         request.fingerprint !== input.fingerprint ||
         request.runRevision !== input.expectedRunRevision ||
-        (run.state.control.status !== 'abort_requested' && run.state.revision !== input.expectedRunRevision)
+        (run.state.control.status !== 'abort_requested' &&
+          run.state.revision !== input.expectedRunRevision)
       ) {
         throw new Error(`Decision request for run ${input.runId} is stale.`);
       }
@@ -404,16 +571,21 @@ export class AgentSession {
   }): Promise<AgentRunResult> {
     const started = await this.serial(async () => {
       await this.restorePending();
-      if (this.active) throw new Error(`Session ${this.options.descriptor.id} already has an active run.`);
+      if (this.active)
+        throw new Error(`Session ${this.options.descriptor.id} already has an active run.`);
       if (this.suspended?.descriptor.reason !== 'approval_required')
         throw new Error(`Session ${this.options.descriptor.id} is not waiting for approval.`);
       if (this.suspended.runId !== input.runId)
         throw new Error(`Session is suspended on run ${this.suspended.runId}, not ${input.runId}.`);
       const suspended = this.suspended;
       const configuration = suspended.configuration;
-      await this.options.repository.transitionSubmission(this.options.descriptor, suspended.submissionId, {
-        state: 'claimed'
-      });
+      await this.options.repository.transitionSubmission(
+        this.options.descriptor,
+        suspended.submissionId,
+        {
+          state: 'claimed'
+        }
+      );
       try {
         const runtime = await this.createRuntime(
           suspended.submissionId,
@@ -444,16 +616,22 @@ export class AgentSession {
     return this.serial(async () => {
       await this.restorePending();
       if (this.active) {
-        if (expectedRunId !== undefined && this.active.control.runId !== expectedRunId) return false;
+        if (expectedRunId !== undefined && this.active.control.runId !== expectedRunId)
+          return false;
         await this.active.control.abort(reason);
         return true;
       }
       const suspended = this.suspended;
-      if (!suspended || (expectedRunId !== undefined && suspended.runId !== expectedRunId)) return false;
+      if (!suspended || (expectedRunId !== undefined && suspended.runId !== expectedRunId))
+        return false;
       await this.options.runs.requestAbort(suspended.runId, reason);
-      await this.options.repository.transitionSubmission(this.options.descriptor, suspended.submissionId, {
-        state: 'claimed'
-      });
+      await this.options.repository.transitionSubmission(
+        this.options.descriptor,
+        suspended.submissionId,
+        {
+          state: 'claimed'
+        }
+      );
       const runtime = await this.createRuntime(
         suspended.submissionId,
         suspended.runId,
@@ -478,7 +656,10 @@ export class AgentSession {
     if (!this.closed && this.options.scheduling !== 'manual') await this.startReadyWork();
     while (
       this.active ||
-      (!this.closed && this.options.scheduling !== 'manual' && !this.suspended && this.queued.length > 0)
+      (!this.closed &&
+        this.options.scheduling !== 'manual' &&
+        !this.suspended &&
+        this.queued.length > 0)
     ) {
       if (this.active) await this.active.pending.completion.catch(() => undefined);
       await this.serialQueue;
@@ -508,12 +689,13 @@ export class AgentSession {
   }
 
   private async continueSuspension(
-    category: 'external_recovery' | 'implementation',
+    category: 'external_recovery' | 'implementation' | 'context_admission',
     expectedRunId: string
   ): Promise<AgentRunResult> {
     const started = await this.serial(async () => {
       await this.restorePending();
-      if (this.active) throw new Error(`Session ${this.options.descriptor.id} already has an active run.`);
+      if (this.active)
+        throw new Error(`Session ${this.options.descriptor.id} already has an active run.`);
       return this.startSuspendedSubmission(this.requireSuspension(category, expectedRunId));
     });
     return started.completion;
@@ -528,16 +710,22 @@ export class AgentSession {
     if (suspended.runId !== expectedRunId)
       throw new Error(`Session is suspended on run ${suspended.runId}, not ${expectedRunId}.`);
     if (suspended.descriptor.category !== category)
-      throw new Error(`Session suspension ${suspended.descriptor.reason} does not permit this action.`);
+      throw new Error(
+        `Session suspension ${suspended.descriptor.reason} does not permit this action.`
+      );
     return suspended;
   }
 
   private async startSuspendedSubmission(
     suspended: SuspendedSubmission
   ): Promise<{ readonly completion: Promise<AgentRunResult> }> {
-    await this.options.repository.transitionSubmission(this.options.descriptor, suspended.submissionId, {
-      state: 'claimed'
-    });
+    await this.options.repository.transitionSubmission(
+      this.options.descriptor,
+      suspended.submissionId,
+      {
+        state: 'claimed'
+      }
+    );
     try {
       const runtime = await this.createRuntime(
         suspended.submissionId,
@@ -567,10 +755,14 @@ export class AgentSession {
     const run = await this.options.runs.inspect(previous.runId);
     const descriptor = runSuspensionDescriptor(previous.submissionId, run.state);
     if (descriptor !== undefined) {
-      await this.options.repository.transitionSubmission(this.options.descriptor, previous.submissionId, {
-        state: 'suspended',
-        suspension: descriptor
-      });
+      await this.options.repository.transitionSubmission(
+        this.options.descriptor,
+        previous.submissionId,
+        {
+          state: 'suspended',
+          suspension: descriptor
+        }
+      );
       this.suspended = { ...previous, descriptor };
     } else {
       this.suspended = undefined;
@@ -715,14 +907,22 @@ export class AgentSession {
         result.reason === 'missing_implementation'
           ? suspensionFromResult(active.pending.id, result)
           : requireRunSuspensionDescriptor(active.pending.id, run.state);
-      await this.options.repository.transitionSubmission(this.options.descriptor, active.pending.id, {
-        state: 'suspended',
-        suspension
-      });
+      await this.options.repository.transitionSubmission(
+        this.options.descriptor,
+        active.pending.id,
+        {
+          state: 'suspended',
+          suspension
+        }
+      );
     } else
-      await this.options.repository.transitionSubmission(this.options.descriptor, active.pending.id, {
-        state: 'completed'
-      });
+      await this.options.repository.transitionSubmission(
+        this.options.descriptor,
+        active.pending.id,
+        {
+          state: 'completed'
+        }
+      );
     this.active = undefined;
     this.suspended = suspension
       ? {
@@ -744,10 +944,14 @@ export class AgentSession {
     let failure = cause;
     let persisted = true;
     try {
-      await this.options.repository.transitionSubmission(this.options.descriptor, active.pending.id, {
-        state: 'failed',
-        errorMessage: cause.message
-      });
+      await this.options.repository.transitionSubmission(
+        this.options.descriptor,
+        active.pending.id,
+        {
+          state: 'failed',
+          errorMessage: cause.message
+        }
+      );
     } catch (persistenceError) {
       persisted = false;
       failure = new AggregateError(
@@ -780,7 +984,11 @@ export class AgentSession {
 
   private enqueue(pending: PendingSubmission): void {
     this.queued.push(pending);
-    void this.emit({ type: 'input.queued', submissionId: pending.id, queuedInputs: this.queued.length });
+    void this.emit({
+      type: 'input.queued',
+      submissionId: pending.id,
+      queuedInputs: this.queued.length
+    });
   }
 
   private async emit(event: AgentSessionEvent): Promise<void> {
@@ -846,7 +1054,10 @@ function suspendedSubmission(
   });
 }
 
-function pendingFromRecord(record: SessionPendingSubmission, resumeExisting: boolean): PendingSubmission {
+function pendingFromRecord(
+  record: SessionPendingSubmission,
+  resumeExisting: boolean
+): PendingSubmission {
   return pendingSubmission(
     record.submissionId,
     record.runId,
@@ -874,7 +1085,9 @@ function pendingSubmission(
     task: input.task,
     ...(input.images === undefined ? {} : { images: parseSessionImages(input.images) }),
     runId,
-    ...(input.instructions === undefined ? {} : { instructions: Object.freeze([...input.instructions]) }),
+    ...(input.instructions === undefined
+      ? {}
+      : { instructions: Object.freeze([...input.instructions]) }),
     ...(input.contextItems === undefined
       ? {}
       : {
@@ -958,7 +1171,9 @@ function runSuspensionDescriptor(
           unknown.effect.intent.effectId
         );
     }
-    if (state.toolBatches.some((batch) => batch.callStates.some((call) => call.stage === 'approval')))
+    if (
+      state.toolBatches.some((batch) => batch.callStates.some((call) => call.stage === 'approval'))
+    )
       return Object.freeze({
         runId: state.runId,
         submissionId,
@@ -968,6 +1183,15 @@ function runSuspensionDescriptor(
       });
   }
   if (phase.kind !== 'suspended') return undefined;
+  if (phase.reason === 'context_admission')
+    return Object.freeze({
+      runId: state.runId,
+      submissionId,
+      category: 'context_admission',
+      reason: phase.reason,
+      contextAdmission: phase.conflict,
+      actions: suspensionActions('context', 'abort')
+    });
   if (phase.reason === 'missing_implementation')
     return Object.freeze({
       runId: state.runId,

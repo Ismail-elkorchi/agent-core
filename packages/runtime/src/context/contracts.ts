@@ -2,22 +2,21 @@ import type { JsonObject } from '@agent-core/json';
 import type { HistorySourceCut, HistorySourceRef } from '../history/contracts.js';
 import type { NoteReference } from '../notes/contracts.js';
 
-export interface ContextRepresentation {
-  readonly source: HistorySourceRef;
-  readonly presentation: 'summary';
-}
-
 export interface ContextSelection {
-  /** Unlisted sources retain their complete recorded representation. */
-  readonly representations?: readonly ContextRepresentation[] | undefined;
+  /** Explicit host/user retention across subsequent renewals. */
+  readonly protected?: readonly HistorySourceRef[] | undefined;
+  readonly continuity?:
+    | {
+        readonly kind: 'fresh';
+        readonly resetId: string;
+        readonly model: import('@agent-core/model').ModelSelection;
+        readonly sources: readonly HistorySourceRef[];
+      }
+    | undefined;
+
   readonly retained: readonly HistorySourceRef[];
   readonly notes: readonly NoteReference[];
-  readonly omitted: readonly {
-    readonly fromEntryId: string;
-    readonly toEntryId: string;
-    readonly reason: string;
-  }[];
-  readonly strategy: 'retain' | 'notes' | 'provider';
+  readonly strategy: 'sources' | 'provider';
   readonly providerState?: JsonObject | undefined;
 }
 export interface ContextWindowRecord {
@@ -29,6 +28,8 @@ export interface ContextWindowRecord {
   readonly createdAt: string;
 }
 export interface ContextTransitionRecord {
+  readonly compiledInputIdentity?: string | undefined;
+  readonly capabilityRevision?: string | undefined;
   readonly transitionId: string;
   readonly idempotencyKey: string;
   readonly previousWindowId: string | null;
@@ -46,6 +47,12 @@ export interface ContextTransitionCommit {
   readonly transition: ContextTransitionRecord;
 }
 export interface ContextTransitionRequest {
+  readonly toolInvocation?:
+    | Pick<
+        import('@agent-core/tools').ToolInvocationContext,
+        'runId' | 'turnId' | 'requestAttempt' | 'toolBatchId' | 'callIndex' | 'toolAttempt'
+      >
+    | undefined;
   readonly expectedWindowId: string | null;
   readonly expectedSourceRevision?: number | undefined;
   readonly idempotencyKey: string;

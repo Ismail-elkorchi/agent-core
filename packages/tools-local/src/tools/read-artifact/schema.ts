@@ -17,3 +17,5 @@ export const readArtifactOutputSchema = z.strictObject({
   text: z.string().optional(),
   contentType: z.enum(['text', 'image', 'artifact'])
 });
+
+export type ReadArtifactOutput = z.output<typeof readArtifactOutputSchema>;

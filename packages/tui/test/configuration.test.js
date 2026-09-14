@@ -14,11 +14,19 @@ const profile = parseModelProfile({
   modalities: { input: ['text'], output: ['text'] },
   supportedParameters: ['reasoning'],
   capabilities: {
-    streaming: true, toolCalling: false, supportedToolInputs: [], jsonMode: false,
-    jsonSchema: false, logprobs: false, temperature: false, topP: false,
+    streaming: true,
+    toolCalling: false,
+    supportedToolInputs: [],
+    jsonMode: false,
+    jsonSchema: false,
+    logprobs: false,
+    temperature: false,
+    topP: false,
     reasoning: {
-      strategies: ['effort'], efforts: ['low', 'high', 'provider-defined-effort'],
-      canDisable: false, separateOutput: true
+      strategies: ['effort'],
+      efforts: ['low', 'high', 'provider-defined-effort'],
+      canDisable: false,
+      separateOutput: true
     }
   }
 });
@@ -34,7 +42,10 @@ for (const columns of [48, 80, 120])
   test(`model review keeps complete actions reachable at ${columns} columns`, async (t) => {
     const operations = { providers: [{ id: 'neutral', label: 'Neutral' }] };
     const selected = {
-      ...configurationState({ provider: 'neutral', model: 'available-model' }, operations.providers),
+      ...configurationState(
+        { provider: 'neutral', model: 'available-model' },
+        operations.providers
+      ),
       stage: 'review',
       profile: { ...profile, capabilities: { ...profile.capabilities, temperature: true } }
     };
@@ -67,13 +78,17 @@ for (const columns of [48, 80, 120])
       assert.ok(reached.has(id), id);
   });
 async function settle(condition) {
-  for (let i = 0; i < 200 && !condition(); i++) await new Promise((resolve) => setTimeout(resolve, 5));
+  for (let i = 0; i < 200 && !condition(); i++)
+    await new Promise((resolve) => setTimeout(resolve, 5));
   assert.ok(condition(), 'configuration effect should settle');
 }
 
 test('a neutral consumer discovers, reviews and saves a model without typing its ID', async (t) => {
   const saved = [];
-  const adapter = { describeModel: async () => profile, listModels: async () => [{ id: profile.id }] };
+  const adapter = {
+    describeModel: async () => profile,
+    listModels: async () => [{ id: profile.id }]
+  };
   const operations = {
     providers: [{ id: 'neutral', label: 'Neutral service' }],
     connect: async () => adapter,
@@ -107,7 +122,8 @@ test('a neutral consumer discovers, reviews and saves a model without typing its
   await runtime.dispatch({ type: 'configuration.save' });
   await settle(() => saved.length === 1);
   assert.deepEqual(saved[0].selection, {
-    provider: 'neutral', model: 'available-model',
+    provider: 'neutral',
+    model: 'available-model',
     reasoning: { strategy: 'effort', effort: 'provider-defined-effort' }
   });
   assert.equal(saved[0].provider, adapter);
@@ -119,7 +135,13 @@ test('a dismissed configuration cannot accept the response of an earlier picker'
   const current = configurationState(undefined, providers);
   const result = updateConfiguration(
     current,
-    { type: 'configuration.catalog', id: old.id, request: 'old', adapter: {}, models: [{ id: 'stale' }] },
+    {
+      type: 'configuration.catalog',
+      id: old.id,
+      request: 'old',
+      adapter: {},
+      models: [{ id: 'stale' }]
+    },
     { providers }
   );
   assert.equal(result.state, current);
@@ -188,9 +210,55 @@ test('browser launch uses only its explicit optional capability without starting
 
 test('the Node browser helper rejects non-web links and canceled launches before spawning', async () => {
   const { openBrowser } = await import('@agent-core/tui/node');
-  await assert.rejects(openBrowser('file:///tmp/secret', new AbortController().signal), /HTTP and HTTPS/);
+  await assert.rejects(
+    openBrowser('file:///tmp/secret', new AbortController().signal),
+    /HTTP and HTTPS/
+  );
   await assert.rejects(
     openBrowser('https://example.test', AbortSignal.abort(new Error('Canceled'))),
     /Canceled/
+  );
+});
+
+test('native incompatibility offers a separate explicit fresh-continuation action', async () => {
+  const { ModelContinuationRequiredError } = await import('@agent-core/runtime');
+  const choices = [];
+  const adapter = { describeModel: async () => profile };
+  const operations = {
+    providers: [{ id: 'neutral', label: 'Neutral' }],
+    save: async (_selection, _adapter, options) => {
+      choices.push(options);
+      if (options.continuation !== 'fresh')
+        throw new ModelContinuationRequiredError('opaque state');
+    }
+  };
+  let state = {
+    ...configurationState({ provider: 'neutral', model: profile.id }, operations.providers),
+    stage: 'review',
+    adapter,
+    profile
+  };
+  assert.equal(
+    updateConfiguration(state, { type: 'configuration.save', continuation: 'fresh' }, operations)
+      .effects,
+    undefined
+  );
+  let result = updateConfiguration(state, { type: 'configuration.save' }, operations);
+  let completion = await result.effects[0].run({ signal: new AbortController().signal });
+  state = updateConfiguration(result.state, completion.message, operations).state;
+  assert.equal(state.freshContinuationAvailable, true);
+  assert.deepEqual(choices, [{}]);
+  result = updateConfiguration(
+    state,
+    { type: 'configuration.save', continuation: 'fresh' },
+    operations
+  );
+  completion = await result.effects[0].run({ signal: new AbortController().signal });
+  assert.equal(completion.message.type, 'configuration.saved');
+  assert.deepEqual(choices, [{}, { continuation: 'fresh' }]);
+  assert.equal(
+    updateConfiguration(state, { type: 'configuration.stage', stage: 'model' }, operations).state
+      .freshContinuationAvailable,
+    undefined
   );
 });

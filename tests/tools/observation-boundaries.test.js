@@ -2,122 +2,197 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
 import { InMemoryArtifactRepository } from '@agent-core/persistence';
-import { LocalArtifactRepository } from '@agent-core/persistence/node';
-import { mkdtemp } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import path from 'node:path';
-import { ObservationStore } from '@agent-core/runtime';
-import { defineTool, parseToolObservation } from '@agent-core/tools';
+import {
+  ObservationStore,
+  resolveToolObservation,
+  resolveToolModelContent,
+  agentEventCodec
+} from '@agent-core/runtime';
+import {
+  defineTool,
+  parseToolObservation,
+  decodeOwnedToolObservationForPersistence,
+  createToolCall
+} from '@agent-core/tools';
 
 const tool = defineTool({
-  name: 'large_observation', implementationId: 'tests/large-observation@1', description: 'large observation',
-  schema: z.strictObject({}), outputSchema: z.strictObject({ chunks: z.array(z.string()) }),
-  effectEnvelope: { accesses: [{ mode: 'read', scope: 'memory' }], lockScopes: [] }, canonicalizeInput: input => input,
-  deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'memory' }], lockScopes: [], recovery: { kind: 'unknown' } }),
-  invoke: async () => ({ kind: 'result', ok: true, summary: 'unused', scope: { resources: ['memory'], coverage: 'complete' }, output: { chunks: [] } })
+  name: 'source',
+  implementationId: 'tests/source',
+  description: 'Read original source',
+  schema: z.strictObject({}),
+  outputSchema: z.json(),
+  effectEnvelope: { accesses: [{ mode: 'read', scope: 'source' }], lockScopes: [] },
+  canonicalizeInput: (input) => input,
+  deriveEffects: () => ({
+    accesses: [{ mode: 'read', scope: 'source' }],
+    lockScopes: [],
+    recovery: { kind: 'unknown' }
+  }),
+  invoke: async () => ({
+    kind: 'result',
+    summary: 'Read',
+    scope: { resources: ['source'], coverage: 'complete' },
+    output: {}
+  })
 });
-const call = { name: tool.name, input: { kind: 'json', value: {} } };
-
-test('canonical result observations share one 8 MiB boundary before artifact extraction', async () => {
-  for (const bytes of [0.5 * 1024 * 1024, 4.5 * 1024 * 1024, 7.5 * 1024 * 1024]) {
-    const artifacts = new LocalArtifactRepository({ rootDir: await mkdtemp(path.join(tmpdir(), 'agent-core-observation-result-')) });
-    const store = new ObservationStore({ artifacts });
-    const chunks = chunksOf(Math.floor(bytes));
-    const record = await commitAndProject(store, {
-      turnIndex: 1, call, tool, modelInputModalities: ['text'],
-      observation: { kind: 'result', ok: true, summary: 'large result', scope: { resources: ['memory'], coverage: 'complete' }, output: { chunks } }
-    });
-    assert.equal(record.durableObservation.kind, 'result');
-    assert.equal(record.durableObservation.output.truncatedForPersistence, true);
-    assert.ok(record.durableObservation.metadata.durableObservation.originalBytes >= bytes);
-    const ref = record.durableObservation.metadata.durableObservation.artifact;
-    assert.ok(ref.size >= bytes);
-  }
-  const store = new ObservationStore({ artifacts: new InMemoryArtifactRepository() });
-  await assert.rejects(() => commitAndProject(store, {
-    turnIndex: 1, call, tool, modelInputModalities: ['text'],
-    observation: { kind: 'result', ok: true, summary: 'too large', scope: { resources: ['memory'], coverage: 'complete' }, output: { chunks: chunksOf(Math.floor(8.25 * 1024 * 1024)) } }
-  }), /total byte limit|exceeds/iu);
-});
-
-test('oversized failure observations retain blocked semantics, recovery, reason, artifact, and original bytes', async () => {
-  for (const bytes of [0.5 * 1024 * 1024, 4.5 * 1024 * 1024, 7.5 * 1024 * 1024]) {
-    const artifacts = new LocalArtifactRepository({ rootDir: await mkdtemp(path.join(tmpdir(), 'agent-core-observation-failure-')) });
-    const store = new ObservationStore({ artifacts });
-    const record = await commitAndProject(store, {
-      turnIndex: 1, call, tool: undefined, modelInputModalities: ['text'],
-      observation: {
-        kind: 'failure', ok: false, summary: 'large failure', scope: { resources: ['memory'], coverage: 'partial', causes: ['failure'] },
-        output: { blocked: true, reason: 'runtime_error', error: 'effect returned a failure observation', recovery: 'Inspect the durable artifact.', details: { chunks: chunksOf(Math.floor(bytes)) } }
-      }
-    });
-    assert.equal(record.durableObservation.output.blocked, true);
-    assert.equal(record.durableObservation.output.reason, 'runtime_error');
-    assert.equal(record.durableObservation.output.recovery, 'Inspect the durable artifact.');
-    assert.equal(record.durableObservation.output.error, 'effect returned a failure observation');
-    assert.ok(record.durableObservation.metadata.durableObservation.originalBytes >= bytes);
-    assert.equal(record.durableObservation.metadata.durableObservation.artifact.visibility, 'public');
-  }
-  const store = new ObservationStore({ artifacts: new InMemoryArtifactRepository() });
-  await assert.rejects(() => commitAndProject(store, {
-    turnIndex: 1, call, tool: undefined,
-    observation: { kind: 'failure', ok: false, summary: 'too large', scope: { resources: ['memory'], coverage: 'partial', causes: ['failure'] }, output: { blocked: true, reason: 'runtime_error', error: 'large', recovery: 'retry', details: { chunks: chunksOf(Math.floor(8.25 * 1024 * 1024)) } } }
-  }), /total byte limit|exceeds/iu);
-});
-
-test('artifact-storage failure leaves a bounded terminal observation with an explicit degraded diagnostic', async () => {
-  class FailingArtifacts extends InMemoryArtifactRepository { async store() { throw new Error('artifact disk unavailable'); } }
-  const record = await commitAndProject(new ObservationStore({ artifacts: new FailingArtifacts() }), {
-    turnIndex: 1, call, tool,
-    observation: { kind: 'result', ok: true, summary: 'effect completed', scope: { resources: ['memory'], coverage: 'complete' }, output: { chunks: chunksOf(512 * 1024) } }
+const call = createToolCall({ name: tool.name, input: { kind: 'json', value: {} } });
+const observation = (output, extras = {}) =>
+  parseToolObservation(tool, {
+    kind: 'result',
+    summary: 'Original source',
+    scope: { resources: ['source'], coverage: 'complete' },
+    output,
+    ...extras
   });
-  assert.match(record.durableStorageDegraded.message, /disk unavailable/u);
-  assert.equal(record.durableObservation.metadata.durableStorage.status, 'degraded');
-  assert.equal(record.durableObservation.output.truncatedForPersistence, true);
-  assert.equal(record.durableObservation.metadata.durableObservation.storedAsArtifact, false);
-});
 
-test('observation assembly invokes domain presenters independently for immediate and retained modes', async () => {
-  const calls = [];
-  const modeTool = defineTool({
-    name: 'mode_presenter', implementationId: 'tests/mode-presenter@1', description: 'mode presenter',
-    schema: z.strictObject({}), outputSchema: z.strictObject({ value: z.string() }),
-    effectEnvelope: { accesses: [], lockScopes: [] },
-    canonicalizeInput: input => input,
-    deriveEffects: () => ({ accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }),
-    invoke: async () => ({ kind: 'result', ok: true, summary: 'unused', scope: { resources: [], coverage: 'complete' }, output: { value: 'unused' } }),
-    presentObservation(request) {
-      calls.push({ mode: request.mode, maxTokens: request.maxTokens });
-      return { ok: true, title: request.mode, summary: request.mode, results: { value: request.observation.output.value }, coverage: 'complete' };
-    }
-  });
-  const store = new ObservationStore({ budgets: { immediate: 321, retained: 123 } });
-  const modeCall = { name: modeTool.name, input: { kind: 'json', value: {} } };
-  const record = await commitAndProject(store, {
-    turnIndex: 1, call: modeCall, tool: modeTool,
-    observation: { kind: 'result', ok: true, summary: 'done', scope: { resources: [], coverage: 'complete' }, output: { value: 'owned' } }
-  });
-  assert.deepEqual(calls, [{ mode: 'immediate', maxTokens: 321 }, { mode: 'retained', maxTokens: 123 }]);
-  assert.equal(record.immediatePresentation.title, 'immediate');
-  assert.equal(record.retainedPresentation.title, 'retained');
-});
-
-async function commitAndProject(store, input) {
-  const { modelInputModalities, ...commitInput } = input;
+test('large originals and exact delivered content resolve independently without field guessing', async () => {
+  const artifacts = new InMemoryArtifactRepository();
+  const store = new ObservationStore({ artifacts });
+  const original = {
+    unusualDomainField: 'original quotation\n'.repeat(24000),
+    other: { detail: 'retained' }
+  };
   const committed = await store.commitToolObservation({
-    ...commitInput,
-    observation: parseToolObservation(commitInput.tool, commitInput.observation)
+    turnIndex: 1,
+    call,
+    tool,
+    observation: observation(original)
   });
-  return store.projectToolObservation(committed, modelInputModalities);
-}
+  assert.equal(committed.original.storage, 'artifact');
+  assert.deepEqual((await resolveToolObservation(committed.original, artifacts)).output, original);
+  const projected = await store.projectToolObservation(committed);
+  assert.ok(
+    projected.modelText.includes(original.unusualDomainField.slice(0, 40).replaceAll('\n', '\\n'))
+  );
+  assert.deepEqual(
+    await resolveToolModelContent({ modelContentRef: committed.modelContentRef }, artifacts),
+    committed.modelContent
+  );
+  await assert.rejects(resolveToolObservation(committed.original), /unavailable/);
+  await assert.rejects(
+    resolveToolObservation(
+      {
+        ...committed.original,
+        artifact: { ...committed.original.artifact, sha256: 'a'.repeat(64) }
+      },
+      artifacts
+    )
+  );
+});
 
-function chunksOf(total) {
-  const chunks = [];
-  let remaining = total;
-  while (remaining > 0) {
-    const length = Math.min(3 * 1024 * 1024, remaining);
-    chunks.push('x'.repeat(length));
-    remaining -= length;
+test('content is selected once before settlement and reused even when formatter changes', async () => {
+  let count = 0;
+  const formatter = {
+    ...tool,
+    buildModelContent: ({ observation }) => [
+      { type: 'text', text: `${++count}:${observation.output}` }
+    ]
+  };
+  const store = new ObservationStore();
+  const committed = await store.commitToolObservation({
+    turnIndex: 1,
+    call,
+    tool: formatter,
+    observation: observation('exact')
+  });
+  formatter.buildModelContent = () => {
+    throw new Error('new formatter');
+  };
+  assert.equal((await store.projectToolObservation(committed)).modelText, '1:exact');
+  assert.equal((await store.projectToolObservation(committed)).modelText, '1:exact');
+  assert.equal(count, 1);
+});
+
+test('storage and formatter failures preserve the actual observation and known lifecycle', async () => {
+  class Unavailable extends InMemoryArtifactRepository {
+    async store() {
+      throw new Error('disk unavailable');
+    }
   }
-  return chunks;
-}
+  const value = observation(
+    { diagnostic: 'x'.repeat(300000), outcome: 'uncertain' },
+    { execution: { state: 'unknown' } }
+  );
+  const committed = await new ObservationStore({
+    artifacts: new Unavailable()
+  }).commitToolObservation({
+    turnIndex: 1,
+    call,
+    tool: {
+      ...tool,
+      buildModelContent() {
+        throw new Error('display');
+      }
+    },
+    observation: value
+  });
+  assert.equal(committed.original.storage, 'unavailable');
+  assert.equal(committed.original.execution.state, 'unknown');
+  assert.equal(committed.durableObservation, undefined);
+  assert.equal(committed.fullObservation, undefined);
+  assert(committed.original.bytes > 300000);
+  assert.match(committed.durableStorageDegraded.message, /disk unavailable/);
+});
+
+test('obsolete observation and failure contracts are rejected without migration', () => {
+  assert.throws(() => parseToolObservation(tool, { ...observation({}), ok: true }), /unsupported/);
+  assert.throws(
+    () =>
+      decodeOwnedToolObservationForPersistence({
+        kind: 'failure',
+        summary: 'failed',
+        scope: { resources: [], coverage: 'partial' },
+        output: {
+          reason: 'runtime_error',
+          error: 'lost response',
+          blocked: true,
+          recovery: 'retry'
+        }
+      }),
+    /unsupported/
+  );
+  assert.throws(
+    () =>
+      agentEventCodec.decode({
+        type: 'tool.ended',
+        turnIndex: 1,
+        turnId: 't',
+        requestAttempt: 1,
+        toolBatchId: 'b',
+        callIndex: 0,
+        toolAttempt: 1,
+        toolName: 'source',
+        observation: {
+          kind: 'result',
+          summary: 'old',
+          scope: { resources: [], coverage: 'complete' },
+          output: {}
+        }
+      }),
+    /Incompatible|identity/
+  );
+});
+
+test('image selection discloses unavailable modality and retains original artifact access', async () => {
+  const artifacts = new InMemoryArtifactRepository();
+  const artifact = await artifacts.store({
+    label: 'image',
+    content: new Uint8Array([1, 2, 3]),
+    mediaType: 'image/png'
+  });
+  const store = new ObservationStore({ artifacts });
+  const committed = await store.commitToolObservation({
+    turnIndex: 1,
+    call,
+    tool,
+    modelInputModalities: ['text'],
+    observation: observation(
+      { description: 'image' },
+      { content: [{ type: 'image', artifact, detail: 'original' }] }
+    )
+  });
+  const record = await store.projectToolObservation(committed);
+  assert.equal(record.modelImages.length, 0);
+  assert.ok(record.modelContent.some((part) => part.type === 'artifact'));
+  assert.match(record.modelText, /image|Image/);
+});

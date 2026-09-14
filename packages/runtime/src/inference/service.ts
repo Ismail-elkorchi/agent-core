@@ -1,7 +1,9 @@
+import { ModelStreamInterruptedError } from '../orchestration/model-stream.js';
 import { executeEffectLifecycle, type EffectLifecycle } from '@agent-core/effects';
 import { parseJsonObject } from '@agent-core/json';
 import {
   CompleteRequestEstimator,
+  ModelProviderError,
   assertRequestAccountingFits,
   createModelRequest,
   modelInputIdentity,
@@ -59,7 +61,10 @@ export interface GovernedInferenceInput extends InferenceIdentity, ModelCompilat
     event: Exclude<ModelStreamEvent, { readonly type: 'done' }>
   ) => void | Promise<void>;
 }
-export interface GovernedContextTransformInput extends Omit<GovernedInferenceInput, 'onStreamEvent'> {
+export interface GovernedContextTransformInput extends Omit<
+  GovernedInferenceInput,
+  'onStreamEvent'
+> {
   readonly transformId: string;
 }
 interface DurableInferenceInput extends GovernedInferenceInput {
@@ -88,6 +93,17 @@ export interface ContextTransformResult extends InferenceIdentity, InferenceChar
   readonly artifact: ArtifactRef;
   readonly replayed: boolean;
 }
+export class InferenceContextRejectedError extends Error {
+  constructor(
+    readonly invocationId: string,
+    readonly inputIdentity: string,
+    message: string
+  ) {
+    super(message);
+    this.name = 'InferenceContextRejectedError';
+  }
+}
+
 export class InferenceNotSentError extends Error {
   constructor(
     readonly invocationId: string,
@@ -108,7 +124,9 @@ export class InferenceOutcomeUnknownError extends Error {
   }
 }
 export class InferenceBudgetExceededError extends Error {
-  constructor(readonly resource: 'invocations' | 'prompt_tokens' | 'completion_tokens' | 'known_cost') {
+  constructor(
+    readonly resource: 'invocations' | 'prompt_tokens' | 'completion_tokens' | 'known_cost'
+  ) {
     super(`Inference owner budget exhausted: ${resource}.`);
     this.name = 'InferenceBudgetExceededError';
   }
@@ -125,6 +143,7 @@ interface DurableOperation<T extends { readonly usage?: ModelUsage }> {
   readonly dispatch: () => Promise<T>;
   readonly decode: (value: unknown) => T;
   readonly startAuthority?: () => Promise<void>;
+  readonly canRejectContext?: () => boolean;
 }
 
 /** One admission ledger, reservation policy, cancellation path, and settlement lifecycle for all inference. */
@@ -137,7 +156,9 @@ export class InferenceService {
       Partial<Pick<InferenceServiceOptions, 'repository' | 'artifacts'>>
   ) {
     if (!options.repository || !options.artifacts)
-      throw new TypeError('Inference composition requires explicit invocation and artifact repositories.');
+      throw new TypeError(
+        'Inference composition requires explicit invocation and artifact repositories.'
+      );
     this.gateway = new InferenceGateway(options.provider);
     this.options = Object.freeze({
       ...options,
@@ -146,13 +167,37 @@ export class InferenceService {
       budget: parseInferenceBudget(options.budget ?? {})
     });
   }
-  static inMemory(options: Omit<InferenceServiceOptions, 'repository' | 'artifacts'>): InferenceService {
+  static inMemory(
+    options: Omit<InferenceServiceOptions, 'repository' | 'artifacts'>
+  ): InferenceService {
     return new InferenceService({
       ...options,
       repository: new InMemoryInferenceRepository(),
       artifacts: new InMemoryArtifactRepository()
     });
   }
+  /** Settled invocation identities are counted once, including transforms and native generations. */
+  async settledRunCharges(ownerId: string, runId: string): Promise<readonly InferenceCharges[]> {
+    const state = await this.options.repository.load(ownerId);
+    return Object.freeze(
+      [...state.invocations.values()].flatMap((invocation) =>
+        invocation.start.runId === runId && invocation.settlement
+          ? [
+              Object.freeze({
+                usage: invocation.settlement.usage,
+                usageSource: invocation.settlement.usageSource,
+                cost: invocation.settlement.cost
+              })
+            ]
+          : []
+      )
+    );
+  }
+
+  async contextRejection(ownerId: string, invocationId: string) {
+    return (await this.options.repository.load(ownerId)).invocations.get(invocationId)?.rejected;
+  }
+
   createSession(): ModelProviderSession {
     return this.gateway.createSession();
   }
@@ -174,7 +219,10 @@ export class InferenceService {
           profile: input.profile,
           session: input.session,
           ...(input.compiled
-            ? { compiled: input.compiled, outputReservation: input.compiled.accounting.outputReservation }
+            ? {
+                compiled: input.compiled,
+                outputReservation: input.compiled.accounting.outputReservation
+              }
             : {}),
           ...(input.onStreamEvent ? { onStreamEvent: input.onStreamEvent } : {})
         },
@@ -230,15 +278,19 @@ export class InferenceService {
     const compiled = await provider.compileContextTransform(
       { transformId: input.transformId, request, ...(signal ? { signal } : {}) },
       {
-        outputReservation: requestWindowForModel(profile, input.outputReservation ?? request.maxOutputTokens)
-          .maxOutputTokens
+        outputReservation: requestWindowForModel(
+          profile,
+          input.outputReservation ?? request.maxOutputTokens
+        ).maxOutputTokens
       }
     );
     const result = await this.executeDurably({
       identity: ownIdentity(input),
       operation: 'context_transform',
       sourceRequest: request,
-      ...(input.outputReservation === undefined ? {} : { outputReservation: input.outputReservation }),
+      ...(input.outputReservation === undefined
+        ? {}
+        : { outputReservation: input.outputReservation }),
       profile,
       compiled,
       discriminator: input.transformId,
@@ -281,7 +333,9 @@ export class InferenceService {
             decode: parseModelResponse
           });
           if (result.replayed)
-            throw new Error('A settled native invocation cannot be redispatched as a new connection.');
+            throw new Error(
+              'A settled native invocation cannot be redispatched as a new connection.'
+            );
           return Object.freeze({
             ...chargesAndIdentity(result),
             status: 'settled',
@@ -331,7 +385,8 @@ export class InferenceService {
         current?.start.operation !== 'native_generation' ||
         current.settlement ||
         current.uncertain ||
-        current.notSent
+        current.notSent ||
+        current.rejected
       )
         throw new Error('Native input extension requires an unresolved admitted generation.');
       if (current.extensions.at(-1)?.fingerprint === fingerprint) return;
@@ -397,16 +452,20 @@ export class InferenceService {
     const compiled = input.compiled ?? (await this.gateway.compile(request, profile, input));
     const session = input.session ?? this.gateway.createSession();
     let dispatchPromise: Promise<ModelResponse> | undefined;
+    let sawOutput = false;
     try {
       const result = await this.executeDurably({
         identity: ownIdentity(input),
         operation: 'generation',
         sourceRequest: request,
-        ...(input.outputReservation === undefined ? {} : { outputReservation: input.outputReservation }),
+        ...(input.outputReservation === undefined
+          ? {}
+          : { outputReservation: input.outputReservation }),
         profile,
         compiled,
         ...(signal ? { signal } : {}),
         ...(startAuthority ? { startAuthority } : {}),
+        canRejectContext: () => !sawOutput,
         dispatch: () => {
           dispatchPromise = this.gateway.invoke({
             request,
@@ -414,7 +473,10 @@ export class InferenceService {
             session,
             turnIndex: 0,
             compiled,
-            ...(input.onStreamEvent ? { onStreamEvent: input.onStreamEvent } : {})
+            onStreamEvent: async (event) => {
+              if (event.type !== 'status') sawOutput = true;
+              await input.onStreamEvent?.(event);
+            }
           });
           return dispatchPromise;
         },
@@ -429,7 +491,8 @@ export class InferenceService {
     } finally {
       if (!input.session) {
         // The detached request retains its session until its original late outcome arrives.
-        if (dispatchPromise) void dispatchPromise.finally(() => session.close?.()).catch(() => undefined);
+        if (dispatchPromise)
+          void dispatchPromise.finally(() => session.close?.()).catch(() => undefined);
         else await session.close?.();
       }
     }
@@ -465,11 +528,19 @@ export class InferenceService {
     const { repository, artifacts } = this.options;
     (input.signal ?? input.request.signal)?.throwIfAborted();
     const identity = ownIdentity(input);
-    const existing = (await repository.load(identity.ownerId)).invocations.get(identity.invocationId);
+    const existing = (await repository.load(identity.ownerId)).invocations.get(
+      identity.invocationId
+    );
     if (!existing) return undefined;
     if (
       existing.start.sourceFingerprint !==
-      (await this.sourceFingerprint(identity, operation, input.request, discriminator, input.outputReservation))
+      (await this.sourceFingerprint(
+        identity,
+        operation,
+        input.request,
+        discriminator,
+        input.outputReservation
+      ))
     )
       throw new Error(
         `Inference ${identity.invocationId} was already admitted with different input or configuration.`
@@ -494,7 +565,14 @@ export class InferenceService {
       )
         throw new Error('Inference profile differs from its captured admission.');
     }
-    if (existing.notSent) throw new InferenceNotSentError(identity.invocationId, existing.notSent.message);
+    if (existing.rejected)
+      throw new InferenceContextRejectedError(
+        identity.invocationId,
+        existing.rejected.inputIdentity,
+        existing.rejected.message
+      );
+    if (existing.notSent)
+      throw new InferenceNotSentError(identity.invocationId, existing.notSent.message);
     if (!existing.settlement)
       throw new InferenceOutcomeUnknownError(
         identity.invocationId,
@@ -503,7 +581,9 @@ export class InferenceService {
       );
     const settled = existing.settlement;
     const value = decode(
-      JSON.parse(new TextDecoder().decode(await artifacts.readVerified(settled.resultRef))) as unknown
+      JSON.parse(
+        new TextDecoder().decode(await artifacts.readVerified(settled.resultRef))
+      ) as unknown
     );
     return Object.freeze({
       ...identity,
@@ -575,6 +655,12 @@ export class InferenceService {
           throw new Error(
             `Inference ${identity.invocationId} was already admitted with different input or configuration.`
           );
+        if (existing.rejected)
+          throw new InferenceContextRejectedError(
+            identity.invocationId,
+            existing.rejected.inputIdentity,
+            existing.rejected.message
+          );
         if (existing.notSent)
           throw new InferenceNotSentError(identity.invocationId, existing.notSent.message);
         if (existing.settlement) {
@@ -619,6 +705,7 @@ export class InferenceService {
       signal?.throwIfAborted();
       const proposed: Extract<InferenceEvent, { type: 'inference.started' }> = {
         ...identity,
+        runId: identity.runId ?? null,
         type: 'inference.started',
         format: 'agent-core.inference/1',
         operation: input.operation,
@@ -645,13 +732,7 @@ export class InferenceService {
       const estimatedOutput = value.usage
         ? 0
         : new CompleteRequestEstimator().estimateText(JSON.stringify(value));
-      const usage = value.usage ?? {
-        promptTokens: reservation.promptTokens,
-        completionTokens: estimatedOutput,
-        totalTokens: reservation.promptTokens + estimatedOutput
-      };
-      const cost = calculateInferenceCost(usage, profile.pricing);
-      const usageSource = value.usage ? 'provider' : 'estimate';
+      let settlement: Extract<InferenceEvent, { type: 'inference.settled' }>;
       for (;;) {
         const state = await repository.load(identity.ownerId);
         const prior = state.invocations.get(identity.invocationId);
@@ -659,24 +740,26 @@ export class InferenceService {
         if (prior.settlement) {
           if (prior.settlement.resultRef.sha256 !== resultRef.sha256)
             throw new Error('Contradictory inference result.');
+          settlement = prior.settlement;
           break;
         }
-        if (
-          await repository.append(
-            identity.ownerId,
-            {
-              type: 'inference.settled',
-              invocationId: identity.invocationId,
-              permit,
-              resultRef,
-              usage,
-              usageSource,
-              cost
-            },
-            state.tail
-          )
-        )
-          break;
+        const promptTokens = (prior.extensions.at(-1)?.reservation ?? prior.start.reservation)
+          .promptTokens;
+        const usage = value.usage ?? {
+          promptTokens,
+          completionTokens: estimatedOutput,
+          totalTokens: promptTokens + estimatedOutput
+        };
+        settlement = {
+          type: 'inference.settled',
+          invocationId: identity.invocationId,
+          permit,
+          resultRef,
+          usage,
+          usageSource: value.usage ? 'provider' : 'estimate',
+          cost: calculateInferenceCost(usage, profile.pricing)
+        };
+        if (await repository.append(identity.ownerId, settlement, state.tail)) break;
       }
       return Object.freeze({
         ...identity,
@@ -684,16 +767,59 @@ export class InferenceService {
         value,
         artifact: resultRef,
         replayed: false,
-        usage,
-        usageSource,
-        cost
+        usage: settlement.usage,
+        usageSource: settlement.usageSource,
+        cost: settlement.cost
       });
     };
     const uncertain = async (cause: unknown): Promise<DurableResult<T>> => {
+      const failure = cause instanceof ModelStreamInterruptedError ? cause.cause : cause;
+      const emptyStream =
+        !(cause instanceof ModelStreamInterruptedError) ||
+        (!cause.content &&
+          !cause.reasoning &&
+          !cause.reasoningSummary &&
+          !cause.finalResponseReceived);
+      if (
+        input.canRejectContext?.() &&
+        emptyStream &&
+        failure instanceof ModelProviderError &&
+        failure.provider === this.options.provider.id &&
+        failure.code === 'context_overflow' &&
+        !signal?.aborted
+      ) {
+        for (;;) {
+          const state = await repository.load(identity.ownerId);
+          const prior = state.invocations.get(identity.invocationId);
+          if (prior?.start.permit !== permit)
+            throw new Error('Inference rejection permit changed.');
+          if (prior.settlement || prior.uncertain || prior.notSent) break;
+          if (
+            prior.rejected ||
+            (await repository.append(
+              identity.ownerId,
+              {
+                type: 'inference.rejected',
+                invocationId: identity.invocationId,
+                permit,
+                code: 'context_overflow',
+                inputIdentity: compiled.inputIdentity,
+                message: failure.message
+              },
+              state.tail
+            ))
+          )
+            throw new InferenceContextRejectedError(
+              identity.invocationId,
+              compiled.inputIdentity,
+              failure.message
+            );
+        }
+      }
       for (;;) {
         const state = await repository.load(identity.ownerId);
         const prior = state.invocations.get(identity.invocationId);
-        if (prior?.settlement || prior?.uncertain) break;
+        if (prior?.settlement || prior?.uncertain || prior?.rejected) break;
         if (
           await repository.append(
             identity.ownerId,
@@ -725,8 +851,15 @@ export class InferenceService {
         for (;;) {
           const state = await repository.load(identity.ownerId);
           const prior = state.invocations.get(identity.invocationId);
-          if (prior?.start.permit !== permit || prior.settlement || prior.uncertain)
-            throw new Error('Inference admission cannot be released after dispatch evidence.', { cause });
+          if (
+            prior?.start.permit !== permit ||
+            prior.settlement ||
+            prior.uncertain ||
+            prior.rejected
+          )
+            throw new Error('Inference admission cannot be released after dispatch evidence.', {
+              cause
+            });
           if (
             prior.notSent ||
             (await repository.append(
@@ -775,6 +908,7 @@ function ownIdentity(input: InferenceIdentity): InferenceIdentity {
   return Object.freeze({
     invocationId: input.invocationId,
     ownerId: input.ownerId,
+    ...(input.runId ? { runId: input.runId } : {}),
     purpose: input.purpose,
     ...(input.parentInvocationId ? { parentInvocationId: input.parentInvocationId } : {})
   });
@@ -802,7 +936,8 @@ function assertBudget(
 ): void {
   let prompt = next.promptTokens;
   let completion = next.completionTokens;
-  let knownCost = next.cost.currency === limits.maxKnownCost?.currency ? (next.cost.amount ?? 0) : 0;
+  let knownCost =
+    next.cost.currency === limits.maxKnownCost?.currency ? (next.cost.amount ?? 0) : 0;
   const policy = hashJson(limits);
   let invocations = 1;
   for (const item of state.invocations.values()) {

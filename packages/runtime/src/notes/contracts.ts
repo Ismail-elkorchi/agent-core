@@ -63,6 +63,7 @@ export type NoteReadResult =
     }>
   | Readonly<{ status: 'missing' | 'tombstone' | 'artifact_unavailable'; revision?: NoteRevision }>;
 export interface NoteQuery {
+  readonly maxScannedBytes?: number | undefined;
   readonly scope: NoteScope;
   readonly query?: string | undefined;
   readonly cursor?: string | undefined;
@@ -71,6 +72,11 @@ export interface NoteQuery {
   readonly maxScanned?: number | undefined;
 }
 export interface NoteQueryResult {
+  readonly scannedBytes: number;
+  readonly unavailable?: readonly {
+    readonly revision: NoteRevision;
+    readonly reason: 'source_too_large' | 'artifact_unavailable';
+  }[];
   readonly index?: {
     readonly sources: number;
     readonly bytes: number;
@@ -85,6 +91,7 @@ export interface NoteQueryResult {
   readonly cursor?: string;
 }
 export interface NoteQuotas {
+  readonly maxIndexBytes: number;
   readonly maxNotes: number;
   readonly maxNoteBytes: number;
   readonly maxTotalBytes: number;

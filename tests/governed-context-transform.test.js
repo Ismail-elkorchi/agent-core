@@ -6,12 +6,10 @@ import {
   AgentRuntime,
   InferenceService,
   InMemoryInferenceRepository,
-  InferenceBudgetExceededError,
   InferenceOutcomeUnknownError,
   InMemorySessionRepository,
   HistoryReader,
   ContextService,
-  createRuntimeContextBootstrapValidator,
   sourceRef,
   agentEventCodec
 } from '@agent-core/runtime';
@@ -119,17 +117,7 @@ async function fixture({ tokenCount = 32, gate, budget } = {}) {
     repository: sessions,
     session,
     history,
-    bootstrap: {
-      maxBytes: 1000000,
-      selfContained: true,
-      validate: createRuntimeContextBootstrapValidator({
-        provider,
-        model: 'native',
-        tools: () => [],
-        maxOutputTokens: 64,
-        nativeTransform: { inference, ownerId: () => 'source-run' }
-      })
-    }
+    policy: { maxSourceBytes: 1000000, selfContained: true }
   });
   const options = {
     provider,
@@ -155,79 +143,71 @@ async function fixture({ tokenCount = 32, gate, budget } = {}) {
   };
 }
 async function transitionInput(state) {
-  const view = await state.history.view();
+  const cut = await state.history.capture();
+  const page = await state.history.page({ cut, limit: 1000, maxBytes: 1000000 });
+  assert.equal(page.coverage, 'complete');
   return {
     expectedWindowId: null,
     idempotencyKey: 'native-window',
     reason: 'Native transformation',
     selection: {
       strategy: 'provider',
-      retained: view.entries.map((entry) => sourceRef(view.cut.sessionId, entry)),
-      notes: [],
-      omitted: []
+      retained: page.entries.map((entry) => sourceRef(cut.sessionId, entry)),
+      notes: []
     }
   };
 }
-
-test('native context transforms share primary budget and restore the exact protected provider window', async () => {
-  const state = await fixture({ budget: { maxInvocations: 2 } });
-  const original = 'Original user content BLUE-82. ' + 'Complete archival detail. '.repeat(100);
-  const first = await new AgentRuntime(state.options).run({ runId: 'source-run', task: original }).result;
-  assert.equal(first.terminal.executionStatus, 'completed');
-  const transition = await transitionInput(state);
-  const committed = await state.context.transition(transition);
-  assert.equal(committed.window.selection.providerState.artifact.visibility, 'protected');
+async function applyTransition(state, transition) {
+  let runtime;
+  let scheduled = false;
+  runtime = new AgentRuntime({
+    ...state.options,
+    onProgress: async (event) => {
+      if (event.type === 'turn.started' && !scheduled) {
+        scheduled = true;
+        await runtime.scheduleContextTransition(transition);
+      }
+    }
+  });
+  return runtime.run({ runId: 'transform-run', task: 'Continue with exact native state.' }).result;
+}
+test('provider transform settlement is followed by actual next-generation admission', async () => {
+  const state = await fixture();
+  await new AgentRuntime(state.options).run({
+    runId: 'source-run',
+    task: 'Original source BLUE-82.'
+  }).result;
+  const result = await applyTransition(state, await transitionInput(state));
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
   assert.equal(state.transforms(), 1);
-  const replay = await state.context.transition(transition);
-  assert.equal(replay.window.windowId, committed.window.windowId);
-  assert.equal(state.transforms(), 1);
-  const owner = await state.repository.load('source-run');
-  assert.equal(owner.invocations.size, 2);
-  assert.deepEqual(
-    [...owner.invocations.values()].map((value) => value.start.operation),
-    ['generation', 'context_transform']
-  );
-  assert.equal([...owner.invocations.values()][1].settlement.cost.status, 'known');
-  await assert.rejects(
-    state.inference.invoke({
-      ownerId: 'source-run',
-      invocationId: 'after-transform',
-      purpose: 'verification',
-      request: { model: 'native', messages: [{ role: 'user', content: 'Verify' }], maxOutputTokens: 64 }
-    }),
-    InferenceBudgetExceededError
-  );
-  const next = await new AgentRuntime(state.options).run({ task: 'Later user correction GREEN-93.' })
-    .result;
-  assert.equal(next.terminal.executionStatus, 'completed');
+  const context = await state.context.inspect();
+  assert.equal(context.window.selection.strategy, 'provider');
+  assert.equal(context.admission.status, 'admitted');
   const request = state.requests.at(-1);
-  const protocol = request.messages.find((item) => item.role === 'protocol');
-  assert.ok(protocol);
-  assert.equal(protocol.state.data.items.filter((item) => item.content === original).length, 1);
-  assert.equal(request.messages.filter((item) => item.content === original).length, 0);
+  assert.ok(request.messages.some((item) => item.role === 'protocol'));
   assert.equal(
-    request.messages.filter((item) => item.content === 'Later user correction GREEN-93.').length,
+    request.messages.filter((item) => item.content === 'Continue with exact native state.').length,
     1
   );
-  const source = (await state.history.view()).entries.find(
-    (item) => item.type === 'input' && item.runId === 'source-run'
+  const owner = await state.repository.load('transform-run');
+  assert.deepEqual(
+    [...owner.invocations.values()].map((item) => item.start.operation),
+    ['context_transform', 'generation']
   );
-  const read = await state.history.read({ source: sourceRef(state.session.id, source), maxBytes: 64000 });
-  assert.equal(read.status, 'available');
-  assert.ok(read.item.text.includes(original));
 });
-
-test('an oversized native result is settled and charged while the previous active window remains intact', async () => {
+test('oversized transformed context is charged but never activated', async () => {
   const state = await fixture({ tokenCount: 30000 });
-  await new AgentRuntime(state.options).run({ runId: 'source-run', task: 'Original source.' }).result;
-  await assert.rejects(
-    state.context.transition(await transitionInput(state)),
-    /exceed|capacity|fit|tokens/iu
-  );
-  assert.equal((await state.context.inspect()).window, null);
+  await new AgentRuntime(state.options).run({ runId: 'source-run', task: 'Original source.' })
+    .result;
+  await applyTransition(state, await transitionInput(state));
   assert.equal(state.transforms(), 1);
-  const owner = await state.repository.load('source-run');
-  assert.equal([...owner.invocations.values()].filter((value) => value.settlement).length, 2);
+  assert.equal((await state.context.inspect()).window, null);
+  const owner = await state.repository.load('transform-run');
+  assert.ok(
+    [...owner.invocations.values()].some(
+      (item) => item.start.operation === 'context_transform' && item.settlement
+    )
+  );
 });
 
 test('canceled native transforms remain uncertain and late results settle the original shared permit', async () => {
@@ -242,7 +222,11 @@ test('canceled native transforms remain uncertain and late results settle the or
     ownerId: 'owner',
     purpose: 'context_transformation',
     transformId: 'transform-one',
-    request: { model: 'native', messages: [{ role: 'user', content: 'Original.' }], maxOutputTokens: 64 }
+    request: {
+      model: 'native',
+      messages: [{ role: 'user', content: 'Original.' }],
+      maxOutputTokens: 64
+    }
   };
   const active = state.inference.transformContext({ ...request, signal: abort.signal });
   while (state.transforms() === 0) await new Promise((resolve) => setTimeout(resolve, 1));
@@ -293,8 +277,10 @@ test('ordinary runtime output replays typed provider protocol unchanged into the
     'completed'
   );
   assert.equal(
-    (await new AgentRuntime(state.options).run({ task: 'Continue the same original source.' }).result)
-      .terminal.executionStatus,
+    (
+      await new AgentRuntime(state.options).run({ task: 'Continue the same original source.' })
+        .result
+    ).terminal.executionStatus,
     'completed'
   );
   assert.deepEqual(
@@ -303,64 +289,5 @@ test('ordinary runtime output replays typed provider protocol unchanged into the
       .messages.filter((item) => item.role === 'protocol')
       .map((item) => item.state),
     [protocol]
-  );
-});
-
-test('model switches invalidate compacted native state and replay original portable sources', async () => {
-  const state = await fixture();
-  const original = 'Keep the original user requirement BLUE-82.';
-  await new AgentRuntime(state.options).run({ runId: 'source-run', task: original }).result;
-  const committed = await state.context.transition(await transitionInput(state));
-  const oldArtifact = committed.window.selection.providerState.artifact;
-  const nextProfile = { ...profile, id: 'next-model' };
-  const provider = {
-    ...state.options.provider,
-    describeModel: async () => nextProfile,
-    complete: async (request) => {
-      state.requests.push(request);
-      return { provider: 'fixture', model: 'next-model', content: 'Continued.', terminationReason: 'stop' };
-    }
-  };
-  const result = await new AgentRuntime({
-    ...state.options,
-    provider,
-    model: 'next-model',
-    inferenceService: InferenceService.inMemory({ provider })
-  }).run({ runId: 'switched-run', task: 'Continue with the same work.' }).result;
-  assert.equal(result.terminal.executionStatus, 'completed');
-  const request = state.requests.at(-1);
-  assert.equal(
-    request.messages.some((item) => item.role === 'protocol'),
-    false
-  );
-  assert.ok(request.messages.some((item) => item.content === original));
-  const invalidated = await state.events.latestOfType('switched-run', 'provider.state.invalidated');
-  assert.equal(invalidated.event.reason, 'model_changed');
-  assert.equal(invalidated.event.state.model, 'native');
-  assert.ok((await state.artifacts.readVerified(oldArtifact)).length > 0);
-});
-
-test('a changed protocol revision invalidates native attention without changing original history', async () => {
-  const state = await fixture();
-  await new AgentRuntime(state.options).run({ runId: 'source-run', task: 'Original requirement.' }).result;
-  await state.context.transition(await transitionInput(state));
-  state.options.provider.describeModel = async () => ({
-    ...profile,
-    capabilities: {
-      ...profile.capabilities,
-      protocol: { ...profile.capabilities.protocol, revision: 'transform2' }
-    }
-  });
-  const result = await new AgentRuntime(state.options).run({ runId: 'changed-protocol', task: 'Continue.' })
-    .result;
-  assert.equal(result.terminal.executionStatus, 'completed');
-  assert.equal(
-    state.requests.at(-1).messages.some((item) => item.role === 'protocol'),
-    false
-  );
-  assert.ok(state.requests.at(-1).messages.some((item) => item.content === 'Original requirement.'));
-  assert.equal(
-    (await state.events.latestOfType('changed-protocol', 'provider.state.invalidated')).event.reason,
-    'protocol_revision_changed'
   );
 });

@@ -13,10 +13,40 @@ run event and artifact repositories to include authoritative output that committ
 before its session copy. Session copies and run events resolve to one source
 identity; committed partial output remains distinguishable from completed output.
 
-`capture()` records a branch boundary. `read()` retrieves an exact source and byte
-range. `search()` returns bounded snippets, coverage, and continuation information.
-The optional lexical index is rebuildable; it does not become a second authority
-for conversation. A cursor cannot broaden the reader's host-bound scope.
+`capture()` reads committed branch metadata and independent open-run heads; it
+never loads transcript bodies. `resolve(source, cut)` validates an exact source's
+identity and branch membership. `read()` returns its bounded UTF-8 range, requested
+neighbors, and explicit unavailable/oversized results. `search()` binds its cursor
+to the branch, cut, query and filters. `maxScanned` and `maxScannedBytes` bound work
+before unrelated bodies are decoded; `maxBytes` separately bounds returned text.
+An oversized source stays identifiable in `unavailable` and can be requested with
+a larger source allowance. Later appends cannot enter an existing cursor.
+
+For request assembly, `selectedContext(cut)` reads only the selected window record;
+`page({cut, after, cursor, limit, maxBytes})` and `entriesAfter(after, through, bounds)`
+enumerate bounded original sources. Follow the cursor and check `unavailable`
+before claiming complete coverage. There is no full-view gateway or exhaustive
+omission list. Session repositories expose `sourceSnapshot()` for cached branch
+membership, source digests, sizes and finalization pointers without source bodies.
+
+`EventRepository.readReference()` verifies a committed event's run, sequence, ID
+and digest. `readRange()` scans strictly after `afterSequence`, through a pinned
+sequence/hash, with record and byte limits applied before domain decoding. Its
+`nextSequence` is the last scanned sequence, suitable for the next request's
+`afterSequence`; `oversized` leaves that record unconsumed. Type filters use derived
+metadata. `latestReferenceOfType()` and `referenceByKey()` return exact pointers
+without decoding their payloads. Both memory and JSONL repositories have the same
+query and conflict semantics. Tool history joins original results and recorded
+model content through the existing idempotency index, at the selected cut.
+
+JSONL uses rebuildable sequence offsets alongside its existing tail/type indexes.
+Warm append refresh reads only newly committed records, and caches at most 128
+run-tail indexes. No history cache retains completed run bodies. Cold construction
+and explicit integrity verification still scan authoritative storage; first-ever
+unindexed access is not constant cost. `JsonlEventRepository.rebuild()` and
+`JsonlSessionRepository.rebuildHistoryIndex()` accept cancellation and progress
+callbacks. Interrupted rebuilds leave original ledgers intact. The bounded lexical
+index is optional and rebuildable; a cursor cannot broaden host-granted scope.
 
 Keep original user contributions in history even after a context transition.
 Applications can associate a contribution with a continuation, correction, side
@@ -36,6 +66,17 @@ revision delivered. Forks inherit a pinned revision boundary; later parent edits
 do not silently change a child branch. Quotas include staged storage so failed or
 contending writes cannot evade resource limits.
 
+Note repositories index committed revisions, reservations and branch inheritance
+incrementally from the last sequence/hash. A mutation preserves earlier index
+work; exact revision reads never replay the note log. Lists and searches pin a
+watermark, and deletions leave earlier selected revisions readable with their
+original authorship. `maxScannedBytes` limits search content reads independently
+of returned bytes; inaccessible or oversized sources produce explicit coverage
+limits. Metadata indexes obey `maxIndexBytes` (32 MiB by default) and storage
+quotas, with at most four session indexes cached. `rebuildIndex()` is an explicit
+cancellable scan with progress, available on `EventNoteRepository` and its memory
+and JSONL implementations.
+
 `createNotesTools` exposes a host-bound repository scope. Storing a note does not
 automatically add it to a prompt. Selected note revisions remain attributed model
 data and cannot grant tool permissions or change application acceptance state.
@@ -45,22 +86,33 @@ The model cannot obtain that grant by supplying another session or branch ID.
 
 ## Context transitions
 
-Compose `createHistoryTools`, `createNotesTools`, and `createContextTools` with the
-ordinary tool registry and authorization policy. A `ContextService` validates and
-commits retained source references, selected note revisions, and explained omitted
-ranges. Its expected window and source revision protect against stale transitions.
+Compose `createHistoryTools`, optional `createNotesTools`, and `createContextTools`
+with the ordinary tool registry and authorization policy. `ContextService` records
+selected original sources and exact note revisions at an immutable history cut.
+Unselected material remains retrievable; no exhaustive omission partition is needed.
 
-The bootstrap policy identifies actual retrieval availability, mandatory sources,
-and a byte ceiling. Use `createRuntimeContextBootstrapValidator` with the actual
-provider, model, current tools, instructions, and application context to validate
-the next compiled request and its protocol obligations. Bytes alone do not prove
-that model input fits.
+Configure `policy.maxSourceBytes` and authorized original-history retrieval on the
+service. Byte bounds govern source access. `RequestAdmission` assembles the actual
+task, attachments, instructions, dynamic context, selected notes, tool guides,
+catalog and generation settings, then compiles the provider request.
+`assertRequestAccountingFits` alone decides fit, including separate reasoning and
+output reservations. Counts, estimates, and unknown components stay distinguishable.
 
-The host's context command and context pressure policy use this same service.
-Model tool requests are scheduled for a legal runtime boundary. Generation and
-validation happen outside session command serialization; only the final conditional
-commit activates the new window. Accepted input and outstanding synchronous tool
-obligations cannot disappear during that change.
+`context_transition` requests a fresh window with an optional source/note selection.
+The runtime binds the operation to its tool invocation, protects active accepted
+input and steering, preserves complete protocol exchanges, and schedules admission
+at the next lawful request boundary. Provider transforms are explicit governed
+invocations; their result must pass next-generation admission before activation.
+Idle source selection records intent without pretending to admit a future task.
+
+Core hosts opt into `contextRenewal: { automatic: true }`; both applications enable
+it by default. One bounded fallback candidate retains active and protected input
+and may omit optional conversation and notes. It creates no summary and requires
+no note. Irreducible input/catalog/reservation conflicts suspend the owning driver
+with actionable context diagnostics. Changing selection or model can resolve a
+conflict; retrying an unchanged request cannot. Session, work, accounting and live
+resources retain their identities across renewal. `/context` inspects the selection
+and compiled capacity; `/renew-context` and RPC `context.renew` submit renewal choices.
 
 ## Governed inference
 

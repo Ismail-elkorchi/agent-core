@@ -35,8 +35,13 @@ export interface NativeInferenceInput extends InferenceIdentity {
   readonly start: (context: NativeGenerationContext) => Promise<void>;
   readonly settled: (settlement: NativeGenerationSettlement) => Promise<void>;
   readonly uncertain: (context: NativeGenerationContext, cause: unknown) => Promise<void>;
-  readonly extended?: (context: NativeGenerationContext, dispatch: ModelNativeDispatch) => Promise<void>;
-  readonly onStreamEvent?: (event: Exclude<ModelStreamEvent, { type: 'done' }>) => void | Promise<void>;
+  readonly extended?: (
+    context: NativeGenerationContext,
+    dispatch: ModelNativeDispatch
+  ) => Promise<void>;
+  readonly onStreamEvent?: (
+    event: Exclude<ModelStreamEvent, { type: 'done' }>
+  ) => void | Promise<void>;
 }
 export interface NativeInferenceAuthority {
   readonly gateway: InferenceGateway;
@@ -46,7 +51,10 @@ export interface NativeInferenceAuthority {
     readonly authorize: () => Promise<void>;
     readonly dispatch: () => Promise<ModelResponse>;
   }) => Promise<InferenceResult>;
-  readonly extend: (context: NativeGenerationContext, compiled: CompiledModelRequest) => Promise<void>;
+  readonly extend: (
+    context: NativeGenerationContext,
+    compiled: CompiledModelRequest
+  ) => Promise<void>;
 }
 interface Generation {
   context: NativeGenerationContext;
@@ -89,7 +97,12 @@ export async function invokeNativeInference(
       }
     });
     void result.catch(rejected);
-    const generation: Generation = { context, result, complete: resolveResponse, fail: rejectResponse };
+    const generation: Generation = {
+      context,
+      result,
+      complete: resolveResponse,
+      fail: rejectResponse
+    };
     generations.set(context.generationDeliveryId, generation);
     try {
       await admitted;
@@ -102,6 +115,7 @@ export async function invokeNativeInference(
   const initialContext: NativeGenerationContext = {
     invocationId: input.invocationId,
     ownerId: input.ownerId,
+    ...(input.runId ? { runId: input.runId } : {}),
     purpose: input.purpose,
     ...(input.parentInvocationId ? { parentInvocationId: input.parentInvocationId } : {}),
     generationDeliveryId: 'initial',
@@ -126,6 +140,7 @@ export async function invokeNativeInference(
       const context: NativeGenerationContext = {
         invocationId: `native-${hashJson({ parentInvocationId: input.invocationId, generationId })}`,
         ownerId: input.ownerId,
+        ...(input.runId ? { runId: input.runId } : {}),
         parentInvocationId: input.invocationId,
         purpose: 'native_continuation',
         generationDeliveryId: generationId,
@@ -150,7 +165,8 @@ export async function invokeNativeInference(
           ? generations.get([...ids][0] ?? '')
           : undefined;
     if (!generation) throw new Error('Native response has no unique pre-admitted generation.');
-    if (known && known !== generation) throw new Error('Native response changed its admitted generation.');
+    if (known && known !== generation)
+      throw new Error('Native response changed its admitted generation.');
     if (boundary.inputIdentity !== generation.context.compiled.inputIdentity)
       throw new Error('Native response input differs from its exact admitted dispatch.');
     if (
@@ -174,11 +190,13 @@ export async function invokeNativeInference(
       transport: { ...(signal ? { signal } : {}), native: { admit } },
       onStreamEvent: async (event) => {
         if (event.type === 'response_started') {
-          if (!event.native) throw new Error('Native response started without its causal input manifest.');
+          if (!event.native)
+            throw new Error('Native response started without its causal input manifest.');
           latest = match(event.native);
         }
         if (event.type === 'response_boundary') {
-          if (!event.native) throw new Error('Native response boundary has no causal input manifest.');
+          if (!event.native)
+            throw new Error('Native response boundary has no causal input manifest.');
           const generation = match(event.native);
           const response = parseModelResponse(event.response);
           if (generation.settlement) {
@@ -199,7 +217,10 @@ export async function invokeNativeInference(
         await input.onStreamEvent?.(event);
       }
     });
-    if (!latest.settlement || [...generations.values()].some((generation) => !generation.settlement))
+    if (
+      !latest.settlement ||
+      [...generations.values()].some((generation) => !generation.settlement)
+    )
       throw new Error('Native transport closed with an unsettled admitted generation.');
     return Object.freeze(
       [...generations.values()].flatMap((generation) =>

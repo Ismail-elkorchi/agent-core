@@ -1,4 +1,9 @@
-import { canonicalJsonString, parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
+import {
+  canonicalJsonString,
+  parseJsonObject,
+  type JsonObject,
+  type JsonValue
+} from '@agent-core/json';
 import type {
   ModelReasoningRequest,
   ModelRequest,
@@ -9,7 +14,7 @@ import type { ArtifactRef } from '@agent-core/persistence';
 import type { ToolEffects } from '@agent-core/tools';
 
 export type AgentModelOutputStatus = 'complete' | 'partial' | 'indeterminate' | 'absent';
-export type AgentModelOutputSource = 'content' | 'reasoning_summary' | 'stream_recovery';
+export type AgentModelOutputSource = 'content' | 'stream_recovery';
 export type AgentRunPhase =
   | 'initializing'
   | 'requesting_model'
@@ -49,6 +54,24 @@ export type AgentToolCallAttemptIdentity = AgentToolCallIdentity &
     readonly toolAttempt: number;
   }>;
 
+export function toolEventKey(
+  runId: string,
+  identity: Pick<
+    AgentToolCallAttemptIdentity,
+    'turnId' | 'toolBatchId' | 'callIndex' | 'toolAttempt'
+  >,
+  stage: string
+): string {
+  return `${runId}:tool:${identity.turnId}:${identity.toolBatchId}:${String(identity.callIndex)}:attempt:${String(identity.toolAttempt)}:${stage}`;
+}
+
+export function assistantResponseKey(
+  runId: string,
+  identity: Pick<AgentTurnIdentity, 'turnId' | 'requestAttempt'>
+): string {
+  return `${runId}:assistant:${identity.turnId}:${String(identity.requestAttempt)}:ended`;
+}
+
 export interface AgentApprovalBinding extends JsonObject {
   readonly toolImplementationId: string;
   readonly authorizationPolicyId: string;
@@ -76,11 +99,13 @@ export interface AgentApprovalSuspension extends AgentRunIdentity {
 }
 
 export interface AgentRunSuspension extends AgentRunIdentity {
+  readonly contextAdmission?: import('./context-admission.js').ContextAdmissionConflict;
   readonly state: 'suspended';
   readonly reason:
     | 'provider_outcome_unknown'
     | 'tool_outcome_unknown'
     | 'missing_implementation'
+    | 'context_admission'
     | 'user_decision';
   readonly effectId?: string;
   readonly decisionRequest?: import('./control/contracts.js').AgentDecisionRequest;
@@ -192,7 +217,8 @@ export function decodeAgentRunBudgetState(value: unknown): AgentRunBudgetState {
   if (
     fields.length !== AGENT_RUN_BUDGET_FIELDS.length ||
     fields.some(
-      (field) => !AGENT_RUN_BUDGET_FIELDS.includes(field as (typeof AGENT_RUN_BUDGET_FIELDS)[number])
+      (field) =>
+        !AGENT_RUN_BUDGET_FIELDS.includes(field as (typeof AGENT_RUN_BUDGET_FIELDS)[number])
     )
   ) {
     throw contract('Invalid run budget.', ['budget fields are invalid.']);
@@ -224,14 +250,9 @@ export interface AgentTurnSnapshotRecord {
   readonly budget: AgentRunBudgetState;
 }
 
-export interface ModelRequestReductionRecord {
-  readonly kind: string;
-  readonly reason: string;
-  readonly sequence: number;
-}
-
 /** The immutable request truth created only after every dynamic input has resolved. */
 export interface InferenceRequestFingerprintRecord extends AgentTurnIdentity {
+  readonly parentRequestId?: string;
   readonly compiledInputIdentity: string;
   readonly capabilityRevision: string;
   readonly requestId: string;
@@ -242,7 +263,6 @@ export interface InferenceRequestFingerprintRecord extends AgentTurnIdentity {
   readonly modelWindowHistoryHash: string;
   readonly modelToolSchemasHash: string;
   readonly modelWindowHash: string;
-  readonly reductions: readonly ModelRequestReductionRecord[];
 }
 
 export interface LogicalModelRequestRecord extends AgentTurnIdentity {
@@ -251,10 +271,7 @@ export interface LogicalModelRequestRecord extends AgentTurnIdentity {
 }
 
 export type AgentCompletedTerminationReason =
-  | 'model_completed'
-  | 'model_output_limit'
-  | 'content_filtered'
-  | 'unknown_model_termination';
+  'model_completed' | 'model_output_limit' | 'content_filtered' | 'unknown_model_termination';
 export type AgentFailureTerminationReason =
   | Exclude<AgentCompletedTerminationReason, 'model_completed'>
   | 'empty_response'
@@ -295,14 +312,13 @@ export type AgentFailedTerminalSnapshot = AgentTerminalBase &
 export type AgentAbortedTerminalSnapshot = AgentTerminalBase &
   Readonly<{
     readonly executionStatus: 'aborted';
-    readonly modelOutput: AgentAbsentModelOutput | (AgentPresentModelOutput & { readonly status: 'partial' });
+    readonly modelOutput:
+      AgentAbsentModelOutput | (AgentPresentModelOutput & { readonly status: 'partial' });
     readonly terminationReason: 'aborted';
     readonly errorMessage: string;
   }>;
 export type AgentTerminalSnapshot =
-  | AgentCompletedTerminalSnapshot
-  | AgentFailedTerminalSnapshot
-  | AgentAbortedTerminalSnapshot;
+  AgentCompletedTerminalSnapshot | AgentFailedTerminalSnapshot | AgentAbortedTerminalSnapshot;
 export interface AgentDeliveryDiagnostic {
   readonly eventType: string;
   readonly message: string;
@@ -332,7 +348,13 @@ export function validateAgentRunLimits(input: Partial<AgentRunLimits> = {}): Age
     'activeImageBytes',
     'activeImageTokens'
   ] as const;
-  const budgets = ['modelTurns', 'totalToolCalls', 'elapsedMs', 'promptTokens', 'completionTokens'] as const;
+  const budgets = [
+    'modelTurns',
+    'totalToolCalls',
+    'elapsedMs',
+    'promptTokens',
+    'completionTokens'
+  ] as const;
   const issues = [
     ...capacities.filter((field) => !positiveInteger(limits[field])),
     ...budgets.filter((field) => limits[field] !== undefined && !positiveInteger(limits[field]))
@@ -341,7 +363,8 @@ export function validateAgentRunLimits(input: Partial<AgentRunLimits> = {}): Age
   if (knownCost !== undefined) {
     if (!Number.isFinite(knownCost.amount) || knownCost.amount <= 0)
       issues.push('knownCost.amount must be positive and finite.');
-    if (knownCost.currency.trim().length === 0) issues.push('knownCost.currency must be non-empty.');
+    if (knownCost.currency.trim().length === 0)
+      issues.push('knownCost.currency must be non-empty.');
   }
   if (issues.length > 0) throw new AgentContractError('Invalid run limits.', issues);
   return Object.freeze({
@@ -364,7 +387,7 @@ export function decodeOwnedAgentModelOutput(value: JsonObject): AgentModelOutput
     throw contract('Invalid modelOutput.', ['Unsupported modelOutput status.']);
   if (typeof value.message !== 'string' || value.message.trim().length === 0)
     throw contract('Invalid modelOutput.', ['Model output message must be non-empty.']);
-  if (!oneOf(value.source, ['content', 'reasoning_summary', 'stream_recovery']))
+  if (!oneOf(value.source, ['content', 'stream_recovery']))
     throw contract('Invalid modelOutput.', ['Unsupported modelOutput source.']);
   if (!positiveInteger(value.turnIndex))
     throw contract('Invalid modelOutput.', ['Model output turnIndex must be a positive integer.']);
@@ -380,7 +403,8 @@ export function decodeOwnedAgentModelOutput(value: JsonObject): AgentModelOutput
 
 export function createAgentTerminalSnapshot(value: AgentTerminalSnapshot): AgentTerminalSnapshot {
   const issues: string[] = [];
-  if (!validIdentity(value.runId)) issues.push('runId must be non-empty and at most 256 UTF-8 bytes.');
+  if (!validIdentity(value.runId))
+    issues.push('runId must be non-empty and at most 256 UTF-8 bytes.');
   if (!validIdentity(value.finalizationId))
     issues.push('finalizationId must be non-empty and at most 256 UTF-8 bytes.');
   if (!Number.isInteger(value.turnCount) || value.turnCount < 0)
@@ -463,7 +487,8 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
       issues.push('Completed execution has an invalid termination reason.');
     if (modelOutput && modelOutput.status !== 'absent')
       issues.push(...completedModelOutputIssues(value.terminationReason, modelOutput.status));
-    if (value.errorMessage !== undefined) issues.push('Completed execution cannot have errorMessage.');
+    if (value.errorMessage !== undefined)
+      issues.push('Completed execution cannot have errorMessage.');
   } else if (value.executionStatus === 'failed') {
     if (!oneOf(value.terminationReason, FAILURE_REASONS))
       issues.push('Failed execution has an invalid termination reason.');
@@ -476,7 +501,10 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
     if (typeof value.errorMessage !== 'string' || value.errorMessage.trim().length === 0)
       issues.push('Aborted execution requires errorMessage.');
   } else issues.push('executionStatus is invalid.');
-  if (value.terminationReason === 'limit_exhausted' && !oneOf(value.exhaustedLimit, AGENT_LIMIT_KINDS))
+  if (
+    value.terminationReason === 'limit_exhausted' &&
+    !oneOf(value.exhaustedLimit, AGENT_LIMIT_KINDS)
+  )
     issues.push('limit_exhausted requires exhaustedLimit.');
   if (value.terminationReason !== 'limit_exhausted' && value.exhaustedLimit !== undefined)
     issues.push('exhaustedLimit is only legal for limit_exhausted.');
@@ -507,7 +535,9 @@ export function decodeOwnedAgentTerminalSnapshot(value: JsonObject): AgentTermin
     ...(typeof value.providerTerminationReason === 'string'
       ? { providerTerminationReason: value.providerTerminationReason }
       : {}),
-    ...(value.exhaustedLimit !== undefined ? { exhaustedLimit: value.exhaustedLimit as AgentLimitKind } : {}),
+    ...(value.exhaustedLimit !== undefined
+      ? { exhaustedLimit: value.exhaustedLimit as AgentLimitKind }
+      : {}),
     ...(value.cleanupDiagnostic !== undefined
       ? {
           cleanupDiagnostic: value.cleanupDiagnostic as {
@@ -582,18 +612,32 @@ function terminalBaseIssues(value: Record<string, unknown>): string[] {
   ];
   for (const field of Object.keys(value))
     if (!fields.includes(field)) issues.push(`Unsupported terminal field: ${field}.`);
-  if (!validIdentity(value.runId)) issues.push('runId must be non-empty and at most 256 UTF-8 bytes.');
+  if (!validIdentity(value.runId))
+    issues.push('runId must be non-empty and at most 256 UTF-8 bytes.');
   if (!validIdentity(value.finalizationId))
     issues.push('finalizationId must be non-empty and at most 256 UTF-8 bytes.');
   if (value.phase !== 'ended') issues.push('Terminal phase must be ended.');
-  if (typeof value.turnCount !== 'number' || !Number.isInteger(value.turnCount) || value.turnCount < 0)
+  if (
+    typeof value.turnCount !== 'number' ||
+    !Number.isInteger(value.turnCount) ||
+    value.turnCount < 0
+  )
     issues.push('turnCount must be a nonnegative integer.');
   if (
     value.modelTerminationReason !== undefined &&
-    !oneOf(value.modelTerminationReason, ['stop', 'tool_calls', 'output_limit', 'content_filter', 'unknown'])
+    !oneOf(value.modelTerminationReason, [
+      'stop',
+      'tool_calls',
+      'output_limit',
+      'content_filter',
+      'unknown'
+    ])
   )
     issues.push('modelTerminationReason is invalid.');
-  if (value.providerTerminationReason !== undefined && typeof value.providerTerminationReason !== 'string')
+  if (
+    value.providerTerminationReason !== undefined &&
+    typeof value.providerTerminationReason !== 'string'
+  )
     issues.push('providerTerminationReason must be a string.');
   return issues;
 }
@@ -604,7 +648,8 @@ function modelTerminationIssues(value: Record<string, unknown>): string[] {
     content_filtered: 'content_filter',
     unknown_model_termination: 'unknown'
   };
-  const expected = typeof value.terminationReason === 'string' ? mapping[value.terminationReason] : undefined;
+  const expected =
+    typeof value.terminationReason === 'string' ? mapping[value.terminationReason] : undefined;
   return expected !== undefined && value.modelTerminationReason !== expected
     ? [`${String(value.terminationReason)} requires modelTerminationReason ${expected}.`]
     : [];
@@ -613,13 +658,17 @@ function completedModelOutputIssues(
   terminationReason: unknown,
   candidateStatus: AgentPresentModelOutput['status']
 ): string[] {
-  const expected: Partial<Record<AgentCompletedTerminationReason, AgentPresentModelOutput['status']>> = {
+  const expected: Partial<
+    Record<AgentCompletedTerminationReason, AgentPresentModelOutput['status']>
+  > = {
     model_completed: 'complete',
     model_output_limit: 'partial',
     content_filtered: 'partial',
     unknown_model_termination: 'indeterminate'
   };
-  const status = isCompletedTerminationReason(terminationReason) ? expected[terminationReason] : undefined;
+  const status = isCompletedTerminationReason(terminationReason)
+    ? expected[terminationReason]
+    : undefined;
   return status !== undefined && candidateStatus !== status
     ? [`${String(terminationReason)} requires modelOutput status ${status}.`]
     : [];
@@ -664,10 +713,14 @@ function finiteNonnegativeNumberRecord(value: unknown): boolean {
   );
 }
 function positiveInteger(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value > 0;
+  return (
+    typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value > 0
+  );
 }
 function validIdentity(value: unknown): value is string {
-  return typeof value === 'string' && value.trim().length > 0 && Buffer.byteLength(value, 'utf8') <= 256;
+  return (
+    typeof value === 'string' && value.trim().length > 0 && Buffer.byteLength(value, 'utf8') <= 256
+  );
 }
 function isCompletedTerminationReason(value: unknown): value is AgentCompletedTerminationReason {
   return oneOf(value, [

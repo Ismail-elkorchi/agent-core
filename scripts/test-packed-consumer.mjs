@@ -177,7 +177,7 @@ try {
       "const modelOutput: AgentModelOutput = { status: 'complete', message: 'done', source: 'content', turnIndex: 1 };",
       "const recovery: EffectRecoveryCapability = { kind: 'unknown' };",
       "const effects: ToolEffects = { accesses: [{ mode: 'read', scope: 'workspace' }], lockScopes: [], recovery };",
-      "const rawObservation: ToolObservationInput<{ value: string }> = { kind: 'result', ok: true, summary: 'raw', scope: { resources: [], coverage: 'complete' }, output: { value: 'raw' } };",
+      "const rawObservation: ToolObservationInput<{ value: string }> = { kind: 'result', summary: 'raw', scope: { resources: [], coverage: 'complete' }, output: { value: 'raw' } };",
       '// @ts-expect-error raw extension output is not an owned observation',
       'const ownedObservation: ToolObservation = rawObservation;',
       'declare const immutableObservation: ToolObservation;',

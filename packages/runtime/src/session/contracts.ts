@@ -147,7 +147,15 @@ export type SessionObservationEntry = BaseSessionEntry &
     readonly callId?: string;
     readonly toolAttempt?: number;
     readonly toolName: string;
-    readonly ok: boolean;
+    readonly kind: 'result' | 'failure';
+    readonly modelContent?: readonly import('@agent-core/tools').ToolContent[];
+    readonly modelContentRef?: import('@agent-core/persistence').PublicArtifactRef;
+    readonly originalArtifact?: import('@agent-core/persistence').PublicArtifactRef;
+    readonly originalUnavailable?: {
+      readonly message: string;
+      readonly bytes: number;
+      readonly digest: string;
+    };
     readonly summary: string;
     readonly output?: JsonValue;
     readonly artifacts?: readonly ArtifactRef[];
@@ -219,7 +227,8 @@ export interface SessionBranchPoint {
 
 export interface SessionInputRelationship {
   readonly kind: 'continue' | 'correct' | 'side_question' | 'replace';
-  readonly relatedSources?: readonly import('../history/contracts.js').HistorySourceRef[] | undefined;
+  readonly relatedSources?:
+    readonly import('../history/contracts.js').HistorySourceRef[] | undefined;
 }
 
 export interface SessionSubmissionInput {
@@ -250,12 +259,11 @@ export type SessionQueuedSubmission = Readonly<{
 export type SessionSubmissionState = 'claimed' | 'suspended' | 'completed' | 'failed' | 'cancelled';
 
 export type SessionSuspensionCategory =
-  | 'approval'
-  | 'external_recovery'
-  | 'implementation'
-  | 'user_decision';
-export type SessionSuspensionAction = 'approval' | 'reconcile' | 'resume' | 'decide' | 'abort';
+  'approval' | 'external_recovery' | 'implementation' | 'context_admission' | 'user_decision';
+export type SessionSuspensionAction =
+  'approval' | 'reconcile' | 'resume' | 'decide' | 'context' | 'abort';
 export interface SessionSuspensionDescriptor {
+  readonly contextAdmission?: import('../run/context-admission.js').ContextAdmissionConflict;
   readonly runId: string;
   readonly submissionId: string;
   readonly category: SessionSuspensionCategory;
@@ -264,6 +272,7 @@ export interface SessionSuspensionDescriptor {
     | 'provider_outcome_unknown'
     | 'tool_outcome_unknown'
     | 'missing_implementation'
+    | 'context_admission'
     | 'user_decision';
   readonly effectId?: string;
   readonly actions: readonly SessionSuspensionAction[];
@@ -280,7 +289,10 @@ export type SessionSubmissionTransition =
   | (SessionSubmissionTransitionBase &
       Readonly<{ readonly type: 'submission.claimed' | 'submission.completed' }>)
   | (SessionSubmissionTransitionBase &
-      Readonly<{ readonly type: 'submission.suspended'; readonly suspension: SessionSuspensionDescriptor }>)
+      Readonly<{
+        readonly type: 'submission.suspended';
+        readonly suspension: SessionSuspensionDescriptor;
+      }>)
   | (SessionSubmissionTransitionBase &
       Readonly<{ readonly type: 'submission.failed'; readonly errorMessage: string }>);
 
@@ -291,14 +303,11 @@ export type SessionSubmissionUpdate = SessionSubmissionTransitionBase &
   );
 
 export type SessionQueuedSubmissionChange = { readonly expectedInput: SessionSubmissionInput } & (
-  | { readonly kind: 'replace'; readonly input: SessionSubmissionInput }
-  | { readonly kind: 'cancel' }
+  { readonly kind: 'replace'; readonly input: SessionSubmissionInput } | { readonly kind: 'cancel' }
 );
 
 export type SessionSubmissionRecord =
-  | SessionQueuedSubmission
-  | SessionSubmissionTransition
-  | SessionSubmissionUpdate;
+  SessionQueuedSubmission | SessionSubmissionTransition | SessionSubmissionUpdate;
 
 export interface SessionPendingSubmission {
   readonly submissionId: string;
@@ -318,7 +327,15 @@ export interface CreateSessionOptions {
 }
 
 export interface SessionObservationInput {
-  readonly ok: boolean;
+  readonly kind: 'result' | 'failure';
+  readonly modelContent?: readonly import('@agent-core/tools').ToolContent[];
+  readonly modelContentRef?: import('@agent-core/persistence').PublicArtifactRef;
+  readonly originalArtifact?: import('@agent-core/persistence').PublicArtifactRef;
+  readonly originalUnavailable?: {
+    readonly message: string;
+    readonly bytes: number;
+    readonly digest: string;
+  };
   readonly summary: string;
   readonly output?: unknown;
   readonly artifacts?: readonly ArtifactRef[];
@@ -346,11 +363,39 @@ export interface SessionReplayState {
   readonly ledgerRunIds: readonly string[];
 }
 
+/** Rebuildable branch membership and source pointers; no historical bodies. */
+export interface SessionSourceMetadata {
+  readonly identity: string;
+  readonly entryId: string;
+  readonly parentId: string | null;
+  readonly sha256: string;
+  readonly bytes: number;
+  readonly type: SessionBranchEntry['type'];
+  readonly runId?: string;
+  readonly source?: import('../history/contracts.js').HistoryEventSource;
+  readonly fromEntryId?: string | null;
+  readonly historyPosition?: import('../history/contracts.js').HistorySourceCut;
+}
+export interface SessionSourceSnapshot {
+  readonly boundary: SessionBranchBoundary;
+  readonly branchId: string;
+  readonly sourceRevision: number;
+  readonly entries: readonly SessionSourceMetadata[];
+  readonly finalizations: readonly Pick<
+    SessionRunFinalization,
+    'runId' | 'finalizationId' | 'throughEntryId'
+  >[];
+}
+
 export interface SessionRepository {
   create(options: CreateSessionOptions): Promise<SessionDescriptor>;
   open(sessionId: string, expectedBinding: SessionBindingInput): Promise<SessionDescriptor>;
   list(): Promise<readonly SessionSummary[]>;
   loadReplayState(session: SessionDescriptor, leafId?: string | null): Promise<SessionReplayState>;
+  sourceSnapshot(
+    session: SessionDescriptor,
+    leafId?: string | null
+  ): Promise<SessionSourceSnapshot>;
   readConversation(session: SessionDescriptor): Promise<readonly SessionConversationItem[]>;
   listBranchPoints(session: SessionDescriptor): Promise<readonly SessionBranchPoint[]>;
   appendInput(
@@ -394,7 +439,9 @@ export interface SessionRepository {
     input: {
       runId: string;
       identity: AgentTurnIdentity &
-        Partial<Pick<AgentToolCallAttemptIdentity, 'toolBatchId' | 'callIndex' | 'callId' | 'toolAttempt'>>;
+        Partial<
+          Pick<AgentToolCallAttemptIdentity, 'toolBatchId' | 'callIndex' | 'callId' | 'toolAttempt'>
+        >;
       toolName: string;
       observation: SessionObservationInput;
     }

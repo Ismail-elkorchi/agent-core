@@ -1,3 +1,4 @@
+import { decodeContextAdmissionConflict } from '../run/context-admission.js';
 import { parseJsonObject } from '@agent-core/json';
 import { type ModelReasoningRequest } from '@agent-core/model';
 import { hashJson } from '@agent-core/persistence';
@@ -63,7 +64,8 @@ export function ownSessionSubmissionInput(value: unknown): SessionSubmissionInpu
       : {
           instructions: Object.freeze(
             instructions.map((item) => {
-              if (typeof item !== 'string') throw new Error('Session instructions must be strings.');
+              if (typeof item !== 'string')
+                throw new Error('Session instructions must be strings.');
               return item;
             })
           )
@@ -92,7 +94,9 @@ export function ownSessionSubmissionConfiguration(
     provider: configuration.provider,
     model: configuration.model,
     ...(configuration.temperature === undefined ? {} : { temperature: configuration.temperature }),
-    ...(configuration.reasoning === undefined ? {} : { reasoning: ownReasoning(configuration.reasoning) }),
+    ...(configuration.reasoning === undefined
+      ? {}
+      : { reasoning: ownReasoning(configuration.reasoning) }),
     ...(configuration.responseFormat === undefined
       ? {}
       : {
@@ -156,7 +160,9 @@ export function pendingSessionSubmissions(
 ): readonly SessionPendingSubmission[] {
   return Object.freeze(
     [...foldSubmissions(records).values()].flatMap((submission) =>
-      submission.state === 'completed' || submission.state === 'failed' || submission.state === 'cancelled'
+      submission.state === 'completed' ||
+      submission.state === 'failed' ||
+      submission.state === 'cancelled'
         ? []
         : [
             Object.freeze({
@@ -214,7 +220,8 @@ export function createSessionSubmissionTransition(
     return Object.freeze({ ...base, type: 'submission.failed', errorMessage });
   }
   if (current.state === state) {
-    if (state === 'claimed') throw new Error(`Session submission is already claimed: ${submissionId}`);
+    if (state === 'claimed')
+      throw new Error(`Session submission is already claimed: ${submissionId}`);
     return undefined;
   }
   assertTransition(current.state, state, submissionId);
@@ -224,7 +231,9 @@ export function createSessionSubmissionTransition(
   });
 }
 
-function foldSubmissions(records: readonly SessionSubmissionRecord[]): Map<string, FoldedSubmission> {
+function foldSubmissions(
+  records: readonly SessionSubmissionRecord[]
+): Map<string, FoldedSubmission> {
   const submissions = new Map<string, FoldedSubmission>();
   for (const record of records) {
     if (record.type === 'submission.queued') {
@@ -283,7 +292,8 @@ export function createQueuedSubmissionUpdate(
   change: SessionQueuedSubmissionChange
 ): SessionSubmissionUpdate {
   const current = foldSubmissions(records).get(submissionId);
-  if (current?.state !== 'queued') throw new Error(`Submission is no longer queued: ${submissionId}`);
+  if (current?.state !== 'queued')
+    throw new Error(`Submission is no longer queued: ${submissionId}`);
   if (hashJson(current.input) !== hashJson(ownSessionSubmissionInput(change.expectedInput)))
     throw new Error(`Queued input changed since it was read: ${submissionId}`);
   const base = { submissionId, runId: current.runId, timestamp: new Date().toISOString() };
@@ -298,7 +308,9 @@ export function originalAcceptedInput(
   records: readonly SessionSubmissionRecord[],
   runId: string
 ): { readonly originalInput?: SessionSubmissionInput } {
-  const accepted = [...foldSubmissions(records).values()].find((submission) => submission.runId === runId);
+  const accepted = [...foldSubmissions(records).values()].find(
+    (submission) => submission.runId === runId
+  );
   return accepted === undefined ? {} : { originalInput: accepted.input };
 }
 
@@ -311,7 +323,8 @@ export function ownSessionSuspensionDescriptor(value: unknown): SessionSuspensio
     'reason',
     'effectId',
     'actions',
-    'decisionRequest'
+    'decisionRequest',
+    'contextAdmission'
   ]);
   if (Object.keys(object).some((field) => !allowed.has(field)))
     throw new TypeError('Session suspension has unsupported fields.');
@@ -331,17 +344,34 @@ export function ownSessionSuspensionDescriptor(value: unknown): SessionSuspensio
       ? ['approval', 'abort']
       : category === 'external_recovery'
         ? ['reconcile', 'abort']
-        : category === 'implementation'
-          ? ['resume', 'abort']
-          : ['decide', 'abort'];
-  if (actions.length !== expected.length || !actions.every((action, index) => action === expected[index]))
+        : category === 'context_admission'
+          ? ['context', 'abort']
+          : category === 'implementation'
+            ? ['resume', 'abort']
+            : ['decide', 'abort'];
+  if (
+    actions.length !== expected.length ||
+    !actions.every((action, index) => action === expected[index])
+  )
     throw new TypeError('Session suspension actions do not match its category.');
   if (
     (category === 'approval') !== (reason === 'approval_required') ||
     (category === 'implementation') !== (reason === 'missing_implementation') ||
-    (category === 'user_decision') !== (reason === 'user_decision')
+    (category === 'user_decision') !== (reason === 'user_decision') ||
+    (category === 'context_admission') !== (reason === 'context_admission')
   )
     throw new TypeError('Session suspension category does not match its reason.');
+  const contextAdmission =
+    object.contextAdmission === undefined
+      ? undefined
+      : decodeContextAdmissionConflict(object.contextAdmission);
+  if (
+    (category === 'context_admission') !== (contextAdmission !== undefined) ||
+    (category === 'context_admission' && effectId !== undefined)
+  )
+    throw new TypeError(
+      'Context admission suspension requires its conflict and cannot identify an effect.'
+    );
   const request =
     object.decisionRequest === undefined ? undefined : ownDecisionRequest(object.decisionRequest);
   if (category === 'user_decision' && request === undefined)
@@ -355,9 +385,15 @@ export function ownSessionSuspensionDescriptor(value: unknown): SessionSuspensio
     reason,
     ...(effectId === undefined ? {} : { effectId }),
     actions: Object.freeze(actions),
+    ...(contextAdmission === undefined ? {} : { contextAdmission }),
     ...(request === undefined
       ? {}
-      : { decisionRequest: Object.freeze({ ...request, choices: Object.freeze([...request.choices]) }) })
+      : {
+          decisionRequest: Object.freeze({
+            ...request,
+            choices: Object.freeze([...request.choices])
+          })
+        })
   });
 }
 
@@ -372,7 +408,8 @@ function suspensionCategory(value: unknown): SessionSuspensionCategory {
     value !== 'approval' &&
     value !== 'external_recovery' &&
     value !== 'implementation' &&
-    value !== 'user_decision'
+    value !== 'user_decision' &&
+    value !== 'context_admission'
   )
     throw new TypeError('Session suspension category is invalid.');
   return value;
@@ -384,7 +421,8 @@ function suspensionReason(value: unknown): SessionSuspensionDescriptor['reason']
     value !== 'provider_outcome_unknown' &&
     value !== 'tool_outcome_unknown' &&
     value !== 'missing_implementation' &&
-    value !== 'user_decision'
+    value !== 'user_decision' &&
+    value !== 'context_admission'
   )
     throw new TypeError('Session suspension reason is invalid.');
   return value;
@@ -396,13 +434,16 @@ function suspensionAction(value: unknown): SessionSuspensionAction {
     value !== 'reconcile' &&
     value !== 'resume' &&
     value !== 'decide' &&
+    value !== 'context' &&
     value !== 'abort'
   )
     throw new TypeError('Session suspension action is invalid.');
   return value;
 }
 
-function ownDecisionRequest(value: unknown): NonNullable<SessionSuspensionDescriptor['decisionRequest']> {
+function ownDecisionRequest(
+  value: unknown
+): NonNullable<SessionSuspensionDescriptor['decisionRequest']> {
   const object = parseJsonObject(value);
   if (
     Object.keys(object).length !== 5 ||

@@ -23,15 +23,22 @@ import {
   type ModelResponse,
   type ModelUsage
 } from '@agent-core/model';
-import { hashJson, type ArtifactRepository, type EventAppendReceipt } from '@agent-core/persistence';
+import {
+  hashJson,
+  type ArtifactRepository,
+  type EventAppendReceipt
+} from '@agent-core/persistence';
 import { randomUUID } from 'node:crypto';
 import type { AgentAuditEvent, AgentEvent, AgentProgressEvent } from '../events.js';
 import type { RequestCostEstimate } from '../orchestration/budget-accountant.js';
 import type { summarizeModelRequest } from '../orchestration/event-summaries.js';
-import { normalizeModelToolCall, providerFailureDiagnostic } from '../orchestration/model-request.js';
+import {
+  normalizeModelToolCall,
+  providerFailureDiagnostic
+} from '../orchestration/model-request.js';
 import { ModelStreamInterruptedError } from '../orchestration/model-stream.js';
 import { storeProviderStateArtifact } from '../orchestration/provider-state-artifacts.js';
-import { AgentRunController } from '../orchestration/run-controller.js';
+import { AgentRunBudget } from '../run/budget.js';
 import type {
   AgentTurnIdentity,
   AgentTurnSnapshotRecord,
@@ -42,13 +49,23 @@ import type { AgentRunProcedure } from '../run/control/contracts.js';
 import { providerWork } from '../run/control/contracts.js';
 import type { AgentRunAdvance, AgentRunDriver } from '../run/control/driver.js';
 import type { NativeSteeringCoordinator } from './native-steering.js';
-import { InferenceOutcomeUnknownError, type InferenceService } from './service.js';
+import {
+  InferenceContextRejectedError,
+  InferenceOutcomeUnknownError,
+  type InferenceService
+} from './service.js';
 
 export type RunInferenceResult =
   | {
       readonly kind: 'settled';
       readonly response: ModelResponse;
       readonly identity: AgentTurnIdentity;
+    }
+  | {
+      readonly kind: 'context_rejected';
+      readonly identity: AgentTurnIdentity;
+      readonly inputIdentity: string;
+      readonly diagnostic: import('@agent-core/model').ModelProviderErrorDiagnostic;
     }
   | { readonly kind: 'outcome_unknown'; readonly effectId: string };
 export interface RunInferenceInput {
@@ -74,7 +91,7 @@ export interface RunInferenceInput {
       readonly record: AgentTurnSnapshotRecord;
       readonly profile: ModelProfile;
     };
-    readonly controller: AgentRunController;
+    readonly controller: AgentRunBudget;
     readonly run: AgentRunDriver;
   };
   readonly append: (event: AgentAuditEvent) => Promise<EventAppendReceipt>;
@@ -87,9 +104,19 @@ export interface RunInferenceInput {
 }
 export function createRunInferenceLifecycle(input: RunInferenceInput): {
   readonly lifecycle: EffectLifecycle<RunInferenceResult, ModelResponse>;
-  readonly onStreamEvent: (event: Exclude<ModelStreamEvent, { readonly type: 'done' }>) => Promise<void>;
+  readonly onStreamEvent: (
+    event: Exclude<ModelStreamEvent, { readonly type: 'done' }>
+  ) => Promise<void>;
 } {
-  const { request, requestEstimate, requestFingerprint, requestSummary, turnRequest, append, emit } = input;
+  const {
+    request,
+    requestEstimate,
+    requestFingerprint,
+    requestSummary,
+    turnRequest,
+    append,
+    emit
+  } = input;
   const identity = {
     turnIndex: turnRequest.snapshot.record.turnIndex,
     turnId: turnRequest.snapshot.record.turnId,
@@ -263,13 +290,17 @@ export function createRunInferenceLifecycle(input: RunInferenceInput): {
       const pending = providerWork(turnRequest.run.state(), identity);
       if (pending.stage !== 'effect_pending' || pending.effect.intent.effectId !== effectId)
         throw new Error(`Provider effect ${effectId} completed outside its durable start state.`);
-      const effectSettlement = settleExternalEffect(pending.effect, pending.effect.settlementPermit, {
-        outcome: 'succeeded',
-        resultDigest: hashJson(settlementEvent),
-        exposure: response.usage
-          ? knownEffectExposure(providerUsageQuantities(response.usage))
-          : unknownEffectExposure(pending.effect.intent.exposure)
-      });
+      const effectSettlement = settleExternalEffect(
+        pending.effect,
+        pending.effect.settlementPermit,
+        {
+          outcome: 'succeeded',
+          resultDigest: hashJson(settlementEvent),
+          exposure: response.usage
+            ? knownEffectExposure(providerUsageQuantities(response.usage))
+            : unknownEffectExposure(pending.effect.intent.exposure)
+        }
+      );
       if (effectSettlement.status !== 'settled' && effectSettlement.status !== 'already_settled') {
         throw new Error(
           `Provider effect ${effectId} could not settle: ${effectSettlement.status === 'rejected' ? effectSettlement.reason : 'effect was already closed'}.`
@@ -289,14 +320,57 @@ export function createRunInferenceLifecycle(input: RunInferenceInput): {
     },
     uncertain: async (error) => {
       const pending = providerWork(turnRequest.run.state(), identity);
-      if (pending.stage !== 'effect_pending' || pending.effect.intent.effectId !== effectId) throw error;
+      if (pending.stage !== 'effect_pending' || pending.effect.intent.effectId !== effectId)
+        throw error;
+      if (
+        error instanceof InferenceContextRejectedError &&
+        !sawUpdate &&
+        error.inputIdentity === input.compiled.inputIdentity
+      ) {
+        const diagnostic = Object.freeze({
+          provider: input.options.provider.id,
+          code: 'context_overflow' as const,
+          retryable: false,
+          causeSummary: Object.freeze({ message: error.message })
+        });
+        const rejection = {
+          type: 'provider.attempt.rejected' as const,
+          ...identity,
+          effectId,
+          responseId,
+          inputIdentity: error.inputIdentity,
+          diagnostic
+        };
+        const receipt = await append(rejection);
+        const settled = settleExternalEffect(pending.effect, pending.effect.settlementPermit, {
+          outcome: 'failed',
+          resultDigest: hashJson(rejection),
+          exposure: unknownEffectExposure(pending.effect.intent.exposure)
+        });
+        if (settled.status !== 'settled' && settled.status !== 'already_settled')
+          throw new Error('Rejected provider dispatch could not settle its original effect.');
+        await turnRequest.run.transitionProvider('reconcile_provider_request', identity, () => ({
+          ...pending,
+          stage: 'rejected',
+          effect: settled.state,
+          settlementEventId: receipt.eventId
+        }));
+        await emit({ type: 'model.failed', ...identity, diagnostic });
+        return Object.freeze({
+          kind: 'context_rejected',
+          identity: Object.freeze(identity),
+          inputIdentity: error.inputIdentity,
+          diagnostic
+        });
+      }
       const closed = closeExternalEffect(pending.effect, 'unknown_outcome');
       await turnRequest.run.transitionProvider('reconcile_provider_request', identity, () => ({
         ...pending,
         stage: 'outcome_unknown',
         effect: closed
       }));
-      const failure = error instanceof InferenceOutcomeUnknownError ? (error.cause ?? error) : error;
+      const failure =
+        error instanceof InferenceOutcomeUnknownError ? (error.cause ?? error) : error;
       const cause = failure instanceof ModelStreamInterruptedError ? failure.cause : failure;
       const providerDiagnostic = providerFailureDiagnostic(cause);
       const diagnostic = {
@@ -310,7 +384,7 @@ export function createRunInferenceLifecycle(input: RunInferenceInput): {
         }
       };
       if (failure instanceof ModelStreamInterruptedError) {
-        const visible = failure.content.trim() || failure.reasoningSummary?.trim();
+        const visible = failure.content.trim();
         const event = {
           type: 'assistant.interrupted' as const,
           ...identity,
@@ -327,7 +401,9 @@ export function createRunInferenceLifecycle(input: RunInferenceInput): {
           failure.reasoning === undefined
             ? {}
             : { reasoning: failure.reasoning }),
-          ...(failure.reasoningSummary === undefined ? {} : { reasoningSummary: failure.reasoningSummary }),
+          ...(failure.reasoningSummary === undefined
+            ? {}
+            : { reasoningSummary: failure.reasoningSummary }),
           finalResponseReceived: failure.finalResponseReceived,
           diagnostic
         };
@@ -358,7 +434,8 @@ export async function invokeRunInference(input: RunInferenceInput): Promise<RunI
     {
       invocationId: input.requestFingerprint.requestId,
       ownerId: input.options.inferenceOwnerId ?? input.turnRequest.runId,
-      purpose: 'agent_step'
+      purpose: 'agent_step',
+      runId: input.turnRequest.runId
     }
   );
 }
@@ -409,7 +486,10 @@ export function providerUsageQuantities(usage: ModelUsage): readonly EffectExpos
   ]);
 }
 
-function durableProviderResponse(response: ModelResponse, reasoningVisible: boolean): ModelResponse {
+function durableProviderResponse(
+  response: ModelResponse,
+  reasoningVisible: boolean
+): ModelResponse {
   return parseModelResponse({
     content: response.content,
     ...(response.output === undefined ? {} : { output: response.output }),
@@ -418,8 +498,12 @@ function durableProviderResponse(response: ModelResponse, reasoningVisible: bool
     ...(response.requestId === undefined ? {} : { requestId: response.requestId }),
     ...(response.transport === undefined ? {} : { transport: response.transport }),
     ...(response.usage === undefined ? {} : { usage: response.usage }),
-    ...(!reasoningVisible || response.reasoning === undefined ? {} : { reasoning: response.reasoning }),
-    ...(response.reasoningSummary === undefined ? {} : { reasoningSummary: response.reasoningSummary }),
+    ...(!reasoningVisible || response.reasoning === undefined
+      ? {}
+      : { reasoning: response.reasoning }),
+    ...(response.reasoningSummary === undefined
+      ? {}
+      : { reasoningSummary: response.reasoningSummary }),
     ...(response.toolCalls === undefined ? {} : { toolCalls: response.toolCalls }),
     terminationReason: response.terminationReason,
     ...(response.providerTerminationReason === undefined

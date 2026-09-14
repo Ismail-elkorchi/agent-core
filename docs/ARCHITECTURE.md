@@ -34,13 +34,13 @@ The provider adapter compiles input before admission. Accounting covers actual t
 
 Provider capabilities are versioned contracts for a concrete endpoint and model. An optional method or marketing name is not proof of protocol support. Unsupported combinations fail explicitly. Native steering, asynchronous results, and context transforms must preserve the same input-delivery, effect-authorization, and settlement invariants as conservative request/response execution.
 
-The single run state retains independent provider requests and tool groups alongside its lifecycle phase. Targeted transitions preserve unrelated work. Effect execution retains exact call identities, authorization fingerprints, locks, start fencing, and recovery records. A response ending, a tool job ending, and application work completing are independent facts. Known settled effects are not repeated after recovery; an unknown outcome does not become a successful observation.
+The durable driver retains outstanding provider requests and tool groups alongside its lifecycle phase. Completed work leaves those collections after its recording and delivery obligations resolve; protected, run-scoped immutable records preserve original inputs, approvals, effects, and observations. References are committed only after their records are durable, and recovery verifies their scope and digest. Targeted transitions preserve unrelated work. Effect execution retains exact call identities, authorization fingerprints, locks, start fencing, and recovery records. A response ending, a tool job ending, and application work completing are independent facts. Known settled effects are not repeated after recovery; an unknown outcome does not become a successful observation.
 
 Applications sequence verification, acceptance and publication through the shared effect executor. Core has no verification or disposition phase. `AgentSession` can leave submissions durably queued until an application explicitly starts the next one; notification handlers do not confer execution authority.
 
 Execution resources have an explicitly granted lifetime owner independent of their originating call. A resource may span runs; adapters implement acquisition, control and release without changing its causal identity. Commands and filesystem resources are optional integrations.
 
-Selected observation summaries and image representations are admitted context choices. Core preserves selected images or explicitly rejects a modality or resource-limit mismatch; it does not remove older attachments during assembly. Native-state invalidation retains portable original history and protected artifacts.
+Selected original sources, tool model content, and optional note revisions are admitted context choices. Core preserves selected images or explicitly rejects a modality or resource-limit mismatch; it does not remove older attachments during assembly. Native-state invalidation retains portable original history and protected artifacts.
 
 ## Breaking formats and release evidence
 

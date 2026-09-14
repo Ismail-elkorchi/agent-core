@@ -56,10 +56,16 @@ export function toolsForModel(tools: ToolDefinition[], modelProfile: ModelProfil
   return tools.map((tool) => modelToolForDefinition(tool, modelProfile));
 }
 
-export function modelToolForDefinition(tool: ToolDefinition, modelProfile: ModelProfile): ModelTool {
+export function modelToolForDefinition(
+  tool: ToolDefinition,
+  modelProfile: ModelProfile
+): ModelTool {
   const supportedInputs = modelProfile.capabilities.supportedToolInputs;
   const textInput = tool.textInput;
-  if (textInput?.format.type === 'grammar' && supportsGrammar(textInput.format.syntax, supportedInputs)) {
+  if (
+    textInput?.format.type === 'grammar' &&
+    supportsGrammar(textInput.format.syntax, supportedInputs)
+  ) {
     return {
       ...(modelProfile.capabilities.protocol?.asyncTools ? { async: true } : {}),
       type: 'custom',
@@ -128,7 +134,9 @@ export function validateModelRun(
   reasoning: ModelReasoningRequest | undefined
 ): void {
   if (modelProfile.provider !== providerId) {
-    throw new Error(`Provider ${providerId} returned a model profile for provider ${modelProfile.provider}.`);
+    throw new Error(
+      `Provider ${providerId} returned a model profile for provider ${modelProfile.provider}.`
+    );
   }
   if (!modelProfile.capabilities.toolCalling && tools.length > 0) {
     throw new Error(
@@ -136,7 +144,9 @@ export function validateModelRun(
     );
   }
   if (temperature !== undefined && !modelProfile.capabilities.temperature) {
-    throw new Error(`Model ${modelProfile.id} on provider ${providerId} does not support temperature.`);
+    throw new Error(
+      `Model ${modelProfile.id} on provider ${providerId} does not support temperature.`
+    );
   }
   assertModelReasoningSupported(modelProfile, reasoning);
 }
@@ -200,7 +210,10 @@ export function promptInstructionsForRequest(input: {
   ];
 }
 
-export function validateOptionalPositiveInteger(value: number | undefined, name: string): number | undefined {
+export function validateOptionalPositiveInteger(
+  value: number | undefined,
+  name: string
+): number | undefined {
   if (value === undefined) {
     return undefined;
   }
@@ -210,7 +223,9 @@ export function validateOptionalPositiveInteger(value: number | undefined, name:
   return value;
 }
 
-export function providerFailureDiagnostic(error: unknown): ModelProviderErrorDiagnostic | undefined {
+export function providerFailureDiagnostic(
+  error: unknown
+): ModelProviderErrorDiagnostic | undefined {
   return error instanceof ModelProviderError ? error.diagnostic : undefined;
 }
 
@@ -219,11 +234,7 @@ export function supportsParameter(modelProfile: ModelProfile, parameter: ModelPa
 }
 
 export function finalMessageFromResponse(response: ModelResponse): string {
-  const content = response.content.trim();
-  if (content.length > 0) {
-    return content;
-  }
-  return response.reasoningSummary?.trim() ?? '';
+  return response.content.trim();
 }
 
 function promptDescriptionForTool(tool: ToolDefinition, modelProfile: ModelProfile): string {

@@ -1,5 +1,4 @@
-import type { SessionBranchEntry, SessionRunFinalization } from '../session/contracts.js';
-import type { ContextWindowRecord } from '../context/contracts.js';
+import type { SessionBranchEntry } from '../session/contracts.js';
 
 export interface HistorySourceCut {
   readonly format: 'agent-core.history/1';
@@ -16,12 +15,6 @@ export interface HistorySourceRef {
   readonly sha256: string;
   readonly event?: HistoryEventSource | undefined;
 }
-export interface HistoryView {
-  readonly cut: HistorySourceCut;
-  readonly entries: readonly SessionBranchEntry[];
-  readonly runFinalizations: readonly SessionRunFinalization[];
-  readonly contextWindow?: ContextWindowRecord | undefined;
-}
 export interface HistoryFilter {
   readonly sourceType?: SessionBranchEntry['type'] | undefined;
   readonly role?: 'user' | 'assistant' | 'tool' | 'control' | undefined;
@@ -30,6 +23,7 @@ export interface HistoryFilter {
   readonly resource?: string | undefined;
 }
 export interface HistorySearchRequest {
+  readonly maxScannedBytes?: number | undefined;
   readonly query?: string | undefined;
   readonly filter?: HistoryFilter | undefined;
   readonly cut?: HistorySourceCut | undefined;
@@ -48,6 +42,12 @@ export interface HistoryItem {
   readonly completeness?: 'complete' | 'partial' | 'indeterminate' | 'absent' | undefined;
 }
 export interface HistorySearchResult {
+  readonly scannedBytes: number;
+  readonly unavailable?: readonly {
+    readonly source: HistorySourceRef;
+    readonly bytes: number;
+    readonly records?: number;
+  }[];
   readonly items: readonly HistoryItem[];
   readonly cut: HistorySourceCut;
   readonly indexWatermark: HistorySourceCut;
@@ -63,6 +63,7 @@ export interface HistorySearchResult {
   readonly cursor?: string | undefined;
 }
 export interface HistoryReadRequest {
+  readonly maxSourceBytes?: number | undefined;
   readonly source: HistorySourceRef;
   readonly cut?: HistorySourceCut | undefined;
   readonly offset?: number | undefined;
@@ -81,7 +82,8 @@ export type HistoryReadResult =
     }>
   | Readonly<{
       readonly status: 'unavailable';
-      readonly reason: 'outside_scope' | 'missing' | 'identity_mismatch';
+      readonly reason: 'outside_scope' | 'missing' | 'identity_mismatch' | 'source_too_large';
+      readonly bytes?: number;
       readonly source: HistorySourceRef;
     }>;
 
@@ -95,4 +97,30 @@ export interface HistoryLedgerHead {
   readonly runId: string;
   readonly sequence: number;
   readonly hash?: string | undefined;
+}
+
+export interface HistoryEntryPageRequest {
+  /** Resolve bounded original observation artifacts as well as event/session records. */
+  readonly originals?: boolean;
+  /** Include related recorded representations and accepted input attachments. */
+  readonly enrich?: boolean;
+  readonly cut?: HistorySourceCut | undefined;
+  readonly after?: HistorySourceCut | undefined;
+  readonly cursor?: string | undefined;
+  readonly limit?: number | undefined;
+  readonly maxBytes?: number | undefined;
+  readonly filter?: HistoryFilter | undefined;
+}
+export interface HistoryEntryPage {
+  readonly entries: readonly SessionBranchEntry[];
+  readonly cut: HistorySourceCut;
+  readonly coverage: 'complete' | 'partial';
+  readonly scanned: number;
+  readonly bytes: number;
+  readonly cursor?: string;
+  readonly unavailable?: readonly {
+    readonly source: HistorySourceRef;
+    readonly bytes: number;
+    readonly records?: number;
+  }[];
 }

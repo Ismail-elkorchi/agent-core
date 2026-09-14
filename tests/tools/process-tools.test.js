@@ -1,6 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { access, mkdir, mkdtemp, readFile, readdir, rename, symlink, writeFile } from 'node:fs/promises';
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  symlink,
+  writeFile
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { InMemoryArtifactRepository } from '@agent-core/persistence';
@@ -70,7 +79,12 @@ async function pollUntilSettled(processId, context, afterCursor = 0) {
   let result;
   do {
     result = await invokeToolCall(
-      jsonToolCall('write_stdin', { processId, afterCursor, yieldMs: 100, outputTokenBudget: 4_000 }),
+      jsonToolCall('write_stdin', {
+        processId,
+        afterCursor,
+        yieldMs: 100,
+        outputTokenBudget: 4_000
+      }),
       tools,
       context
     );
@@ -208,13 +222,14 @@ test('a nonzero command exit is a negative tool result, not a tool failure', asy
   if (result.output.status === 'running')
     result = await pollUntilSettled(result.output.processId, context, result.output.cursorEnd);
   assert.equal(result.kind, 'result');
-  assert.equal(result.ok, false);
+  assert.equal(result.execution.state, 'settled');
   assert.equal(result.output.exitCode, 7);
 });
 
 test('stop_process force-kills descendants that ignore graceful termination', async () => {
   const { context } = await processContext();
-  const script = "console.log(process.pid); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)";
+  const script =
+    "console.log(process.pid); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)";
   const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`;
   const started = await invokeToolCall(
     jsonToolCall('exec_command', { command, yieldMs: 500, timeoutMs: 60_000 }),
@@ -300,49 +315,57 @@ test('process polls use stable cursors, preserve split UTF-8, and retain a compl
   assert.equal(manager.has(started.output.processId), true);
 });
 
-test('expired cursors are explicit and process limits are enforced', { timeout: 10000 }, async () => {
-  const { context } = await processContext({
-    maxCapturedBytes: 128,
-    tailBytes: 48,
-    maxPendingOutputBytes: 64,
-    maxActiveProcessesPerOwner: 1
-  });
-  const noisy = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('x'.repeat(5000)); setInterval(()=>{},1000)")}`;
-  let first = await invokeToolCall(
-    jsonToolCall('exec_command', { command: noisy, yieldMs: 200 }),
-    tools,
-    context
-  );
-  while (first.output.status === 'running' && first.output.stdout.observedBytes < 5000) {
-    first = await invokeToolCall(
-      jsonToolCall('write_stdin', { processId: first.output.processId, afterCursor: 0, yieldMs: 50 }),
+test(
+  'expired cursors are explicit and process limits are enforced',
+  { timeout: 10000 },
+  async () => {
+    const { context } = await processContext({
+      maxCapturedBytes: 128,
+      tailBytes: 48,
+      maxPendingOutputBytes: 64,
+      maxActiveProcessesPerOwner: 1
+    });
+    const noisy = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('x'.repeat(5000)); setInterval(()=>{},1000)")}`;
+    let first = await invokeToolCall(
+      jsonToolCall('exec_command', { command: noisy, yieldMs: 200 }),
+      tools,
+      context
+    );
+    while (first.output.status === 'running' && first.output.stdout.observedBytes < 5000) {
+      first = await invokeToolCall(
+        jsonToolCall('write_stdin', {
+          processId: first.output.processId,
+          afterCursor: 0,
+          yieldMs: 50
+        }),
+        tools,
+        context
+      );
+    }
+    assert.equal(first.output.cursorExpired, true);
+    const expired = await invokeToolCall(
+      jsonToolCall('write_stdin', { processId: first.output.processId, afterCursor: 1 }),
+      tools,
+      context
+    );
+    assert.equal(expired.output.cursorExpired, true);
+    const limited = await invokeToolCall(
+      jsonToolCall('exec_command', { command: noisy, yieldMs: 10 }),
+      tools,
+      context
+    );
+    assert.equal(limited.kind, 'failure');
+    assert.match(limited.summary, /active process count/u);
+    await invokeToolCall(
+      jsonToolCall('stop_process', {
+        processId: first.output.processId,
+        afterCursor: first.output.cursorEnd
+      }),
       tools,
       context
     );
   }
-  assert.equal(first.output.cursorExpired, true);
-  const expired = await invokeToolCall(
-    jsonToolCall('write_stdin', { processId: first.output.processId, afterCursor: 1 }),
-    tools,
-    context
-  );
-  assert.equal(expired.output.cursorExpired, true);
-  const limited = await invokeToolCall(
-    jsonToolCall('exec_command', { command: noisy, yieldMs: 10 }),
-    tools,
-    context
-  );
-  assert.equal(limited.kind, 'failure');
-  assert.match(limited.summary, /active process count/u);
-  await invokeToolCall(
-    jsonToolCall('stop_process', {
-      processId: first.output.processId,
-      afterCursor: first.output.cursorEnd
-    }),
-    tools,
-    context
-  );
-});
+);
 
 test('process ownership and run cleanup cannot affect another run', async () => {
   const ownerA = { ...invocation, ownerId: 'run-a', runId: 'run-a' };
@@ -395,7 +418,8 @@ test('natural termination is reported once whether or not the process was polled
     } else if (mode === 'stopped') {
       result = await manager.terminate(result.processId, owner);
     } else {
-      while (manager.activeCount(owner.runId) > 0) await new Promise((resolve) => setTimeout(resolve, 10));
+      while (manager.activeCount(owner.runId) > 0)
+        await new Promise((resolve) => setTimeout(resolve, 10));
     }
     const reports = await manager.disposeOwner(owner.runId);
     assert.equal(reports.length, 1, mode);
@@ -502,7 +526,9 @@ test('public process redaction detects a secret split across output chunks', asy
   });
   while (result.status === 'running')
     result = await manager.query(result.processId, 100, 50, result.cursorEnd, owner);
-  const publicPayload = JSON.parse(new TextDecoder().decode(await artifacts.readVerified(result.artifact)));
+  const publicPayload = JSON.parse(
+    new TextDecoder().decode(await artifacts.readVerified(result.artifact))
+  );
   const publicOutput = publicPayload.chunks.map((chunk) => chunk.text).join('');
   assert.doesNotMatch(publicOutput, new RegExp(secret, 'u'));
   assert.match(publicOutput, /REDACTED/u);
@@ -514,7 +540,11 @@ test('public process artifacts preserve output larger than the strict JSON strin
     maxCapturedBytes: 5_000_000,
     maxTotalCapturedBytes: 5_000_000
   });
-  const owner = { ...invocation, ownerId: 'large-public-output-run', runId: 'large-public-output-run' };
+  const owner = {
+    ...invocation,
+    ownerId: 'large-public-output-run',
+    runId: 'large-public-output-run'
+  };
   const outputBytes = 4_300_000;
   let result = await startCommand(manager, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`process.stdout.write('x'.repeat(${String(outputBytes)}))`)}`,
@@ -529,7 +559,9 @@ test('public process artifacts preserve output larger than the strict JSON strin
     result = await manager.query(result.processId, 100, 100, result.cursorEnd, owner);
   assert.equal(result.artifact.visibility, 'public');
   assert.ok(result.artifact.size > 4_000_000);
-  const publicPayload = JSON.parse(new TextDecoder().decode(await artifacts.readVerified(result.artifact)));
+  const publicPayload = JSON.parse(
+    new TextDecoder().decode(await artifacts.readVerified(result.artifact))
+  );
   assert.equal(
     publicPayload.chunks.reduce((total, chunk) => total + Buffer.byteLength(chunk.text, 'utf8'), 0),
     outputBytes
@@ -539,7 +571,11 @@ test('public process artifacts preserve output larger than the strict JSON strin
 
 test('process output keeps raw protected bytes internal and exposes only a redacted public artifact', async () => {
   const { root, artifacts, manager } = await processContext();
-  const owner = { ...invocation, ownerId: 'artifact-visibility-run', runId: 'artifact-visibility-run' };
+  const owner = {
+    ...invocation,
+    ownerId: 'artifact-visibility-run',
+    runId: 'artifact-visibility-run'
+  };
   const secret = 'super-secret-value';
   let result = await startCommand(manager, {
     command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`process.stdout.write('API_TOKEN=${secret}')`)}`,
@@ -559,7 +595,9 @@ test('process output keeps raw protected bytes internal and exposes only a redac
   assert.equal(JSON.stringify(result).includes('protected-'), false);
   const reports = await manager.disposeOwner(owner.runId);
   assert.equal(reports[0].protectedArtifact.visibility, 'protected');
-  const rawText = new TextDecoder().decode(await artifacts.readVerified(reports[0].protectedArtifact));
+  const rawText = new TextDecoder().decode(
+    await artifacts.readVerified(reports[0].protectedArtifact)
+  );
   assert.match(rawText, new RegExp(secret, 'u'));
   assert.equal(await artifacts.resolve(reports[0].protectedArtifact.artifactId), undefined);
   await manager.acknowledgeTerminalReport(result.processId);
@@ -606,7 +644,9 @@ test('asynchronous process progress is ordered, bounded, and catches callback fa
       result = await manager.query(result.processId, 1_000, 100, result.cursorEnd);
     await new Promise((resolve) => setTimeout(resolve, 100));
     result = await manager.query(result.processId, 1_000);
-    const sequences = delivered.filter((item) => item.type === 'output').map((item) => item.sequence);
+    const sequences = delivered
+      .filter((item) => item.type === 'output')
+      .map((item) => item.sequence);
     assert.deepEqual(
       sequences,
       [...sequences].sort((a, b) => a - b)
@@ -615,7 +655,8 @@ test('asynchronous process progress is ordered, bounded, and catches callback fa
     assert.equal(result.progressDroppedEvents > 0, true);
     assert.equal(unhandled.length, 0);
     assert.equal(
-      delivered.find((item) => item.type === 'status' && item.stage === 'process_started') !== undefined,
+      delivered.find((item) => item.type === 'status' && item.stage === 'process_started') !==
+        undefined,
       true
     );
     assert.equal(
@@ -635,7 +676,11 @@ test('asynchronous process progress is ordered, bounded, and catches callback fa
     );
     const deliveredAtTerminal = delivered.length;
     await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.equal(delivered.length, deliveredAtTerminal, 'no progress is delivered after a terminal result');
+    assert.equal(
+      delivered.length,
+      deliveredAtTerminal,
+      'no progress is delivered after a terminal result'
+    );
     await manager.disposeOwner('progress-run');
   } finally {
     process.off('unhandledRejection', listener);
@@ -724,14 +769,21 @@ test('process ledger restores unreported terminal records across manager restart
 test('startup reconciliation stops an orphaned child process tree and resolves its atomic ledger', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-process-orphan-'));
   const fixture = path.resolve('tests/fixtures/process-orphan.mjs');
-  const crashed = spawnSync(process.execPath, [fixture, root], { encoding: 'utf8', timeout: 10_000 });
+  const crashed = spawnSync(process.execPath, [fixture, root], {
+    encoding: 'utf8',
+    timeout: 10_000
+  });
   assert.equal(crashed.status, 44, crashed.stderr);
   const { processId } = JSON.parse(crashed.stdout);
   const ledgerDirectory = path.join(root, 'processes');
-  const ledgerName = (await readdir(ledgerDirectory)).find((name) => /^proc_[a-f0-9-]+\.json$/u.test(name));
+  const ledgerName = (await readdir(ledgerDirectory)).find((name) =>
+    /^proc_[a-f0-9-]+\.json$/u.test(name)
+  );
   const ledger = JSON.parse(await readFile(path.join(ledgerDirectory, ledgerName), 'utf8'));
   const manager = new LocalCommandExecution({
-    artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'artifacts-recovered') }),
+    artifactRepository: new LocalArtifactRepository({
+      rootDir: path.join(root, 'artifacts-recovered')
+    }),
     rootedFileAuthority: testRootedFileAuthority(root),
     ledgerDirectory,
     ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process
@@ -764,7 +816,13 @@ test('reconciliation never signals a PID without authenticated supervisor identi
         process.platform === 'win32'
           ? '\\\\.\\pipe\\missing-agent-core-supervisor'
           : path.join(ledgerDirectory, 'missing.sock'),
-      owner: { ownerId: 'old-run', runId: 'old-run', turnId: 'turn', toolBatchId: 'batch', callIndex: 0 },
+      owner: {
+        ownerId: 'old-run',
+        runId: 'old-run',
+        turnId: 'turn',
+        toolBatchId: 'batch',
+        callIndex: 0
+      },
       startedAt: new Date().toISOString(),
       rootPath: root,
       state: 'running',
@@ -800,7 +858,13 @@ test('reconciliation never signals a PID without authenticated supervisor identi
       timeoutMs: 1_000,
       yieldMs: 1,
       outputTokenBudget: 100,
-      owner: { ownerId: 'new-run', runId: 'new-run', turnId: 'turn', toolBatchId: 'batch', callIndex: 0 }
+      owner: {
+        ownerId: 'new-run',
+        runId: 'new-run',
+        turnId: 'turn',
+        toolBatchId: 'batch',
+        callIndex: 0
+      }
     }),
     /unresolved supervised process/u
   );
@@ -843,7 +907,9 @@ test('supervisor handshake prevents user code before durable release and reconci
     }
     const ledgerDirectory = path.join(root, 'processes');
     const manager = new LocalCommandExecution({
-      artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'recovered-artifacts') }),
+      artifactRepository: new LocalArtifactRepository({
+        rootDir: path.join(root, 'recovered-artifacts')
+      }),
       rootedFileAuthority: testRootedFileAuthority(root),
       ledgerDirectory,
       ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process
@@ -866,7 +932,10 @@ test('supervisor handshake prevents user code before durable release and reconci
 test('local host durably hands recovered terminal reports to old runs during startup', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-terminal-handoff-'));
   const fixture = path.resolve('tests/fixtures/process-orphan.mjs');
-  const crashed = spawnSync(process.execPath, [fixture, root], { encoding: 'utf8', timeout: 10_000 });
+  const crashed = spawnSync(process.execPath, [fixture, root], {
+    encoding: 'utf8',
+    timeout: 10_000
+  });
   assert.equal(crashed.status, 44, crashed.stderr);
   const { processId } = JSON.parse(crashed.stdout);
   const delivered = [];

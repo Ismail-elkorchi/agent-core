@@ -19,7 +19,13 @@ import {
   decodeSessionBinding,
   type SessionBindingInput
 } from './binding.js';
-import { assertBranchEntry, memoryBranchSource, readBranchPage, searchBranch } from './branch-page.js';
+import {
+  sourceSnapshot,
+  assertBranchEntry,
+  memoryBranchSource,
+  readBranchPage,
+  searchBranch
+} from './branch-page.js';
 import {
   contextCommitRetry,
   decodeContextTransitionEntry,
@@ -145,25 +151,55 @@ export class InMemorySessionRepository implements SessionRepository {
     });
   }
 
+  sourceSnapshot(session: SessionDescriptor, leafId?: string | null) {
+    return this.serial(() => {
+      const state = this.requireDescriptor(session);
+      return sourceSnapshot(
+        memoryBranchSource(session.id, state.branchEntries),
+        state.branchEntries.length + state.finalizations.length + state.submissionRecords.length,
+        state.finalizations.map(({ runId, finalizationId, throughEntryId }) => ({
+          runId,
+          finalizationId,
+          throughEntryId
+        })),
+        leafId
+      );
+    });
+  }
+
   async readConversation(session: SessionDescriptor): Promise<readonly SessionConversationItem[]> {
     const replay = await this.loadReplayState(session);
     return Object.freeze(
       replay.branch.filter(
         (entry): entry is SessionConversationItem =>
-          entry.type !== 'branch' && entry.type !== 'model_settings' && entry.type !== 'context_transition'
+          entry.type !== 'branch' &&
+          entry.type !== 'model_settings' &&
+          entry.type !== 'context_transition'
       )
     );
   }
 
-  readBranchPage(session: SessionDescriptor, request?: Parameters<SessionRepository['readBranchPage']>[1]) {
+  readBranchPage(
+    session: SessionDescriptor,
+    request?: Parameters<SessionRepository['readBranchPage']>[1]
+  ) {
     return this.serial(() =>
-      readBranchPage(memoryBranchSource(session.id, this.requireDescriptor(session).branchEntries), request)
+      readBranchPage(
+        memoryBranchSource(session.id, this.requireDescriptor(session).branchEntries),
+        request
+      )
     );
   }
 
-  searchBranch(session: SessionDescriptor, request: Parameters<SessionRepository['searchBranch']>[1]) {
+  searchBranch(
+    session: SessionDescriptor,
+    request: Parameters<SessionRepository['searchBranch']>[1]
+  ) {
     return this.serial(() =>
-      searchBranch(memoryBranchSource(session.id, this.requireDescriptor(session).branchEntries), request)
+      searchBranch(
+        memoryBranchSource(session.id, this.requireDescriptor(session).branchEntries),
+        request
+      )
     );
   }
 
@@ -194,7 +230,11 @@ export class InMemorySessionRepository implements SessionRepository {
       for (const entry of state.branchEntries) {
         if (entry.type === 'context_transition')
           points.push(
-            Object.freeze({ entryId: entry.id, timestamp: entry.timestamp, kind: 'context_transition' })
+            Object.freeze({
+              entryId: entry.id,
+              timestamp: entry.timestamp,
+              kind: 'context_transition'
+            })
           );
       }
       return Object.freeze(points);
@@ -308,7 +348,9 @@ export class InMemorySessionRepository implements SessionRepository {
         ...input.identity,
         content: input.content,
         ...(input.reasoning === undefined ? {} : { reasoning: input.reasoning }),
-        ...(input.reasoningSummary === undefined ? {} : { reasoningSummary: input.reasoningSummary }),
+        ...(input.reasoningSummary === undefined
+          ? {}
+          : { reasoningSummary: input.reasoningSummary }),
         ...(input.source ? { source: historyEventSourceSchema.parse(input.source) } : {}),
         ...(input.output ? { output: ownSessionAssistantOutput(input.output) } : {}),
         ...(input.completeness ? { completeness: input.completeness } : {})
@@ -364,7 +406,9 @@ export class InMemorySessionRepository implements SessionRepository {
     input: {
       runId: string;
       identity: AgentTurnIdentity &
-        Partial<Pick<AgentToolCallAttemptIdentity, 'toolBatchId' | 'callIndex' | 'callId' | 'toolAttempt'>>;
+        Partial<
+          Pick<AgentToolCallAttemptIdentity, 'toolBatchId' | 'callIndex' | 'callId' | 'toolAttempt'>
+        >;
       toolName: string;
       observation: SessionObservationInput;
     }
@@ -471,8 +515,12 @@ export class InMemorySessionRepository implements SessionRepository {
         (finalization) => finalization.finalizationId === terminal.finalizationId
       );
       if (existing) {
-        if (terminalSnapshotFingerprint(existing.terminal) !== terminalSnapshotFingerprint(terminal))
-          throw new PersistenceConflictError(`Conflicting finalization ${terminal.finalizationId}.`);
+        if (
+          terminalSnapshotFingerprint(existing.terminal) !== terminalSnapshotFingerprint(terminal)
+        )
+          throw new PersistenceConflictError(
+            `Conflicting finalization ${terminal.finalizationId}.`
+          );
         return existing;
       }
       const throughEntryId = branchLeaf(state.branchEntries);
@@ -538,12 +586,18 @@ export class InMemorySessionRepository implements SessionRepository {
   ): Promise<void> {
     return this.serial(() => {
       const state = this.requireDescriptor(session);
-      const record = createSessionSubmissionTransition(state.submissionRecords, submissionId, outcome);
+      const record = createSessionSubmissionTransition(
+        state.submissionRecords,
+        submissionId,
+        outcome
+      );
       if (record) state.submissionRecords.push(record);
     });
   }
   loadPendingSubmissions(session: SessionDescriptor): Promise<readonly SessionPendingSubmission[]> {
-    return this.serial(() => pendingSessionSubmissions(this.requireDescriptor(session).submissionRecords));
+    return this.serial(() =>
+      pendingSessionSubmissions(this.requireDescriptor(session).submissionRecords)
+    );
   }
 
   updateQueuedSubmission(
@@ -603,7 +657,10 @@ interface SessionState {
   readonly finalizations: SessionRunFinalization[];
   readonly submissionRecords: SessionSubmissionRecord[];
 }
-function activeBranch(entries: readonly SessionBranchEntry[], leafId: string | null): SessionBranchEntry[] {
+function activeBranch(
+  entries: readonly SessionBranchEntry[],
+  leafId: string | null
+): SessionBranchEntry[] {
   const byId = new Map(entries.map((entry) => [entry.id, entry]));
   const output: SessionBranchEntry[] = [];
   let cursor = leafId;
@@ -630,9 +687,13 @@ function baseEntry(parentId: string | null): BaseSessionEntry {
 }
 function sessionObservationKey(
   value: Pick<SessionObservationEntry, 'runId' | 'turnId'> &
-    Partial<Pick<SessionObservationEntry, 'requestAttempt' | 'toolBatchId' | 'callIndex' | 'toolAttempt'>>
+    Partial<
+      Pick<SessionObservationEntry, 'requestAttempt' | 'toolBatchId' | 'callIndex' | 'toolAttempt'>
+    >
 ): string | undefined {
-  return value.toolBatchId !== undefined && value.callIndex !== undefined && value.toolAttempt !== undefined
+  return value.toolBatchId !== undefined &&
+    value.callIndex !== undefined &&
+    value.toolAttempt !== undefined
     ? `${value.runId}:${value.turnId}:${String(value.requestAttempt)}:${value.toolBatchId}:${String(value.callIndex)}:${String(value.toolAttempt)}`
     : undefined;
 }
@@ -665,7 +726,11 @@ function observationPayload(
     ...(value.callId === undefined ? {} : { callId: value.callId }),
     ...(value.toolAttempt === undefined ? {} : { toolAttempt: value.toolAttempt }),
     toolName: value.toolName,
-    ok: value.ok,
+    kind: value.kind,
+    ...(value.originalUnavailable ? { originalUnavailable: value.originalUnavailable } : {}),
+    ...(value.modelContentRef === undefined ? {} : { modelContentRef: value.modelContentRef }),
+    ...(value.originalArtifact === undefined ? {} : { originalArtifact: value.originalArtifact }),
+    ...(value.modelContent === undefined ? {} : { modelContent: value.modelContent }),
     summary: value.summary,
     ...(value.output === undefined ? {} : { output: value.output }),
     ...(value.artifacts === undefined ? {} : { artifacts: value.artifacts }),

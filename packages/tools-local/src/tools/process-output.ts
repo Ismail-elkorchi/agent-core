@@ -1,4 +1,3 @@
-import type { CommandExecutionResult } from '@agent-core/tools';
 import * as z from 'zod';
 
 export const artifactRefSchema = z.strictObject({
@@ -44,6 +43,4 @@ export const processOutputSchema = z.strictObject({
   progressDeliveryErrors: z.int().nonnegative().optional()
 });
 
-export function isSuccessfulProcessResult(result: CommandExecutionResult): boolean {
-  return result.status === 'running' || (result.status === 'exited' && result.exitCode === 0);
-}
+export type ProcessOutput = z.output<typeof processOutputSchema>;

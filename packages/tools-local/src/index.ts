@@ -41,3 +41,5 @@ export * from './tools/write-stdin/index.js';
 export { readRootedImage } from './core/image.js';
 
 export { readRootedText } from './core/text.js';
+
+export { renderLocalToolObservation } from './core/human-output.js';

@@ -13,7 +13,11 @@ import {
   ResourceLeaseCoordinator,
   startToolCallPlan
 } from '@agent-core/tools';
-import { issueEffectStartTicket, NO_EFFECT_EXPOSURE, startExternalEffect } from '@agent-core/effects';
+import {
+  issueEffectStartTicket,
+  NO_EFFECT_EXPOSURE,
+  startExternalEffect
+} from '@agent-core/effects';
 import {
   applyPatchTool,
   editTextTool,
@@ -83,7 +87,7 @@ test('derived effects cannot exceed their envelope and output is validated befor
     }),
     invoke: async () => ({
       kind: 'result',
-      ok: true,
+
       summary: 'bad',
       scope: { resources: [], coverage: 'complete' },
       output: { value: 'x' }
@@ -114,7 +118,7 @@ test('derived effects cannot exceed their envelope and output is validated befor
     deriveEffects: () => ({ accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }),
     invoke: async () => ({
       kind: 'result',
-      ok: true,
+
       summary: 'bad',
       scope: { resources: [], coverage: 'complete' },
       output: { value: 42 }
@@ -151,7 +155,7 @@ test('tool planning authority transfers once and releases every owned resource',
     deriveEffects: () => ({ accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }),
     invoke: async () => ({
       kind: 'result',
-      ok: true,
+
       summary: 'done',
       scope: { resources: [], coverage: 'complete' },
       output: {}
@@ -163,7 +167,11 @@ test('tool planning authority transfers once and releases every owned resource',
     boundary: { authorizationPolicyId: 'test', executionTargetId: 'test' }
   };
   const plan = () =>
-    planToolCall(createToolCall({ name: tool.name, input: { kind: 'json', value: {} } }), [tool], context);
+    planToolCall(
+      createToolCall({ name: tool.name, input: { kind: 'json', value: {} } }),
+      [tool],
+      context
+    );
   const rejected = await plan();
   assert.equal(rejected.ok, true);
   const staleEffect = effectFor(rejected.plan, 1);
@@ -179,7 +187,7 @@ test('tool planning authority transfers once and releases every owned resource',
   assert.equal(started.status, 'started');
   const invocation = await startToolCallPlan(accepted.plan, started.state);
   const observation = await beginToolInvocation(invocation, context);
-  assert.equal(observation.ok, true);
+  assert.equal(observation.kind, 'result');
   assert.throws(() => beginToolInvocation(invocation, context), /single-use/u);
   await releaseToolInvocation(invocation);
   await releaseToolInvocation(invocation);
@@ -218,7 +226,7 @@ test('aborted and failed planning release resources before returning control', a
       deriveEffects: () => ({ accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }),
       invoke: async () => ({
         kind: 'result',
-        ok: true,
+
         summary: 'unused',
         scope: { resources: [], coverage: 'complete' },
         output: {}
@@ -270,11 +278,18 @@ test('runtime resource leases span batches until a running process exits', async
   );
   command.transferToResource('p1', 'processes/p1');
   assert.doesNotThrow(() => command.transferToResource('p1', 'processes/p1'));
-  assert.throws(() => command.transferToResource('p1', 'processes/p2'), /already been transferred/u);
+  assert.throws(
+    () => command.transferToResource('p1', 'processes/p2'),
+    /already been transferred/u
+  );
   let acquired = false;
   const blocked = coordinator
     .acquire(
-      { accesses: [{ mode: 'read', scope: 'files/a' }], lockScopes: [], recovery: { kind: 'unknown' } },
+      {
+        accesses: [{ mode: 'read', scope: 'files/a' }],
+        lockScopes: [],
+        recovery: { kind: 'unknown' }
+      },
       'batch-2'
     )
     .then((lease) => {
@@ -391,7 +406,7 @@ test('one observation parser validates complete results, failures, artifacts, an
     deriveEffects: () => ({ accesses: [], lockScopes: [], recovery: { kind: 'unknown' } }),
     invoke: async () => ({
       kind: 'result',
-      ok: true,
+
       summary: 'ok',
       scope: { resources: [], coverage: 'complete' },
       output: { value: 'ok' }
@@ -399,7 +414,7 @@ test('one observation parser validates complete results, failures, artifacts, an
   });
   const source = {
     kind: 'result',
-    ok: true,
+
     summary: 'ok',
     scope: { resources: ['files/a'], coverage: 'complete' },
     output: { value: 'owned' },
@@ -416,7 +431,7 @@ test('one observation parser validates complete results, failures, artifacts, an
   assert.throws(() =>
     parseToolObservation(undefined, {
       kind: 'failure',
-      ok: false,
+
       summary: 'bad',
       scope: { resources: [], coverage: 'partial' },
       output: { reason: 'runtime_error' }
@@ -475,7 +490,10 @@ test('one observation parser validates complete results, failures, artifacts, an
       return 'stolen';
     }
   });
-  assert.throws(() => parseToolObservation(tool, { ...source, output: hostileOutput }), /accessor/iu);
+  assert.throws(
+    () => parseToolObservation(tool, { ...source, output: hostileOutput }),
+    /accessor/iu
+  );
   assert.equal(outputGetterCalls, 0);
 });
 
@@ -498,7 +516,7 @@ test('dynamic tool adoption snapshots mutable consumer definition contracts', ()
     }),
     invoke: async () => ({
       kind: 'result',
-      ok: true,
+
       summary: 'ok',
       scope: { resources: [], coverage: 'complete' },
       output: {}
@@ -542,7 +560,7 @@ test('every effect and observation resource scope uses the strict canonical scop
               async invoke() {
                 return {
                   kind: 'result',
-                  ok: true,
+
                   summary: 'bad',
                   scope: { resources: [], coverage: 'complete' },
                   output: {}
@@ -573,7 +591,7 @@ test('every effect and observation resource scope uses the strict canonical scop
     }),
     invoke: async () => ({
       kind: 'result',
-      ok: true,
+
       summary: 'duplicate',
       scope: { resources: [], coverage: 'complete' },
       output: {}
@@ -594,7 +612,7 @@ test('every effect and observation resource scope uses the strict canonical scop
     () =>
       parseToolObservation(duplicate, {
         kind: 'result',
-        ok: true,
+
         summary: 'bad scope',
         scope: { resources: ['files//a'], coverage: 'complete' },
         output: {}
@@ -630,7 +648,7 @@ test('authoritative canonicalization owns input before effects, fingerprinting, 
       invoked = input;
       return {
         kind: 'result',
-        ok: true,
+
         summary: 'owned',
         scope: { resources: [`files/${input.path}`], coverage: 'complete' },
         output: { path: input.path, value: input.nested.value }
@@ -688,7 +706,7 @@ test('canonicalization rejects accessors and cycles without invoking accessors',
       },
       invoke: async () => ({
         kind: 'result',
-        ok: true,
+
         summary: 'never',
         scope: { resources: [], coverage: 'complete' },
         output: {}
@@ -735,7 +753,7 @@ test('canonicalization rejects accessors and cycles without invoking accessors',
     deriveEffects: () => hostileEffects,
     invoke: async () => ({
       kind: 'result',
-      ok: true,
+
       summary: 'never',
       scope: { resources: [], coverage: 'complete' },
       output: {}
@@ -756,8 +774,16 @@ test('canonicalization rejects accessors and cycles without invoking accessors',
 
 test('a failed retained resource rejects dependent work without releasing uncertain authority', async () => {
   const coordinator = new ResourceLeaseCoordinator();
-  const effects = { accesses: [{ mode: 'execute', scope: 'processes' }], lockScopes: ['files'], recovery: { kind: 'unknown' } };
-  const read = { accesses: [{ mode: 'read', scope: 'files/source' }], lockScopes: [], recovery: { kind: 'unknown' } };
+  const effects = {
+    accesses: [{ mode: 'execute', scope: 'processes' }],
+    lockScopes: ['files'],
+    recovery: { kind: 'unknown' }
+  };
+  const read = {
+    accesses: [{ mode: 'read', scope: 'files/source' }],
+    lockScopes: [],
+    recovery: { kind: 'unknown' }
+  };
   const process = await coordinator.acquire(effects, 'command');
   process.transferToResource('command-1', 'processes/command-1');
   const failure = new Error('Command output integrity could not be established.');
@@ -766,7 +792,14 @@ test('a failed retained resource rejects dependent work without releasing uncert
   await pending;
   await assert.rejects(coordinator.acquire(read, 'later-reader'), failure);
   assert.equal(coordinator.activeCount(), 1);
-  const control = await coordinator.acquire({ accesses: [{ mode: 'execute', scope: 'processes/command-1' }], lockScopes: [], recovery: { kind: 'unknown' } }, 'reconcile');
+  const control = await coordinator.acquire(
+    {
+      accesses: [{ mode: 'execute', scope: 'processes/command-1' }],
+      lockScopes: [],
+      recovery: { kind: 'unknown' }
+    },
+    'reconcile'
+  );
   control.release();
   coordinator.releaseResource('command-1');
   const recovered = await coordinator.acquire(read, 'after-reconciliation');

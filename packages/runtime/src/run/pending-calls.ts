@@ -1,13 +1,8 @@
-import { canonicalJsonString } from '@agent-core/json';
-import type { EventRepository } from '@agent-core/persistence';
-
-import type { AgentEvent } from '../events.js';
 import type { AgentRunState } from './control/contracts.js';
-import { applyAgentRunStateTransition } from './control/state-transition.js';
+import { outstandingToolObligations } from './control/contracts.js';
 import type { AgentToolCallState } from './control/tool-state.js';
-import type { AgentToolCallIdentity, AgentTurnSnapshotRecord } from './contracts.js';
+import type { AgentToolCallIdentity } from './contracts.js';
 import type { ToolCall } from '@agent-core/tools';
-import type { ToolCatalogSnapshot } from './tool-catalog.js';
 
 export interface PendingToolCall extends AgentToolCallIdentity {
   readonly runId: string;
@@ -17,86 +12,35 @@ export interface PendingToolCall extends AgentToolCallIdentity {
   readonly protocol: 'synchronous' | 'asynchronous';
 }
 
-/**
- * Independent call tracking over the existing effect driver's authoritative records.
- * Rebuildable from those records; it never grants a second effect-start authority.
- */
-export class PendingCallCoordinator {
-  private readonly calls = new Map<string, PendingToolCall>();
-  private readonly catalogs = new Map<string, ToolCatalogSnapshot>();
-
-  static async recover(events: EventRepository<AgentEvent>, runId: string): Promise<PendingCallCoordinator> {
-    const coordinator = new PendingCallCoordinator();
-    let state: AgentRunState | undefined;
-    for await (const record of events.read(runId)) {
-      if (record.event.type === 'turn.snapshot.created') coordinator.bindCatalog(record.event.snapshot);
-      if (record.event.type === 'run.state.transitioned') {
-        state = applyAgentRunStateTransition(state, record.event.transition);
-        coordinator.observeState(state);
-      }
-    }
-    return coordinator;
-  }
-
-  bindCatalog(snapshot: AgentTurnSnapshotRecord): void {
-    const key = turnKey(snapshot);
-    const previous = this.catalogs.get(key);
-    if (previous && previous.revision !== snapshot.toolCatalog.revision)
-      throw new Error('A model request cannot change its advertised catalog.');
-    this.catalogs.set(key, snapshot.toolCatalog);
-  }
-
-  observeState(state: AgentRunState): void {
-    for (const phase of state.toolBatches) {
-      const catalog = this.catalogs.get(turnKey(phase.identity));
-      if (!catalog) throw new Error('Tool work has no immutable request catalog.');
-      for (const [callIndex, call] of phase.calls.entries()) {
-        const callState = phase.callStates[callIndex];
-        if (!callState) throw new Error('Pending call lost its effect state.');
-        const key = `${state.runId}:${phase.toolBatchId}:${String(callIndex)}`;
-        const previous = this.calls.get(key);
-        if (
-          previous &&
-          canonicalJsonString(previous.call) !== canonicalJsonString(call)
-        )
-          throw new Error('A pending call changed its original call identity or arguments.');
-        this.calls.set(
-          key,
-          Object.freeze({
-            runId: state.runId,
-            ...phase.identity,
-            toolBatchId: phase.toolBatchId,
-            callIndex,
-            ...(call.id ? { callId: call.id } : {}),
-            call,
-            catalogRevision: catalog.revision,
-            state: callState,
-            protocol: phase.modelCalls[callIndex]?.async ? 'asynchronous' : 'synchronous'
-          })
-        );
-      }
-    }
-  }
-
-  inspect(): readonly PendingToolCall[] {
-    return Object.freeze([...this.calls.values()]);
-  }
-
-  pending(): readonly PendingToolCall[] {
-    return Object.freeze(
-      this.inspect().filter((call) => call.state.stage !== 'recorded' && call.state.stage !== 'cancelled')
-    );
-  }
-
-  assertTransitionBoundary(): void {
-    const pending = this.pending().filter((call) => call.protocol === 'synchronous');
-    if (pending.length)
-      throw new Error(
-        `Context transition requires the exact results of pending calls: ${pending.map((call) => call.callId ?? `${call.toolBatchId}:${String(call.callIndex)}`).join(', ')}.`
-      );
-  }
+/** A query over the driver's current obligations, including unacknowledged native delivery. */
+export function pendingToolCalls(state: AgentRunState): readonly PendingToolCall[] {
+  return Object.freeze(
+    outstandingToolObligations(state).map(({ target }) => {
+      const batch = state.toolBatches.find((item) => item.toolBatchId === target.toolBatchId);
+      const call = batch?.calls[target.callIndex];
+      const callState = batch?.callStates[target.callIndex];
+      if (!batch || !call || !callState)
+        throw new Error('Outstanding tool obligation lost its source.');
+      return Object.freeze({
+        runId: state.runId,
+        ...batch.identity,
+        ...target,
+        ...(call.id ? { callId: call.id } : {}),
+        call,
+        catalogRevision: batch.source.catalog.revision,
+        state: callState,
+        protocol: batch.modelCalls[target.callIndex]?.async
+          ? ('asynchronous' as const)
+          : ('synchronous' as const)
+      });
+    })
+  );
 }
 
-function turnKey(identity: { readonly turnId: string; readonly requestAttempt: number }): string {
-  return `${identity.turnId}:${String(identity.requestAttempt)}`;
+export function assertToolTransitionBoundary(state: AgentRunState): void {
+  const pending = pendingToolCalls(state).filter((call) => call.protocol === 'synchronous');
+  if (pending.length)
+    throw new Error(
+      `Context transition requires the exact results of pending calls: ${pending.map((call) => call.callId ?? `${call.toolBatchId}:${String(call.callIndex)}`).join(', ')}.`
+    );
 }

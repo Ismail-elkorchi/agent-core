@@ -7,7 +7,7 @@ export * from './inference/prompt-material.js';
 export * from './orchestration/finalization.js';
 export * from './orchestration/observation-facts.js';
 export * from './orchestration/observation-store.js';
-export * from './orchestration/run-controller.js';
+export * from './run/budget.js';
 export * from './ports.js';
 export * from './run/contracts.js';
 export * from './run/control/contracts.js';
@@ -20,7 +20,6 @@ export * from './session/repository.js';
 
 export * from './context/index.js';
 export * from './history/index.js';
-export * from './inference/context-bootstrap.js';
 export * from './inference/native-inference.js';
 export * from './inference/native-steering.js';
 export * from './inference/repository.js';
@@ -55,7 +54,21 @@ export * from './notes/session-notes.js';
 export * from './session/event-delivery.js';
 export * from './session/progress.js';
 
+export {
+  ModelContinuationRequiredError,
+  parseModelChangeRequest,
+  recordedModelSelection,
+  type ModelChangeOptions
+} from './orchestration/model-change.js';
 export { assertHistoryModelCompatibility } from './orchestration/session-replay.js';
 export { parseSessionImages, type SessionImageInput } from './session/images.js';
 
 export { assertSessionImagesSupported } from './session/images.js';
+
+export { RequestAdmission, ContextAdmissionError } from './inference/request-admission.js';
+
+export type { ContextAdmissionConflict, ContextAdmissionAction } from './run/context-admission.js';
+
+export * from './run/control/records.js';
+
+export * from './orchestration/observation-source.js';

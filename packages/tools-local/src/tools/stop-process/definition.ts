@@ -6,7 +6,7 @@ import {
   type CommandExecutionOwner
 } from '@agent-core/tools';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
-import { presentProcessObservation } from '../../core/presenters.js';
+import { buildProcessContent } from '../../core/model-content.js';
 import { processScope } from '../../core/resources.js';
 import { stopProcessInputSchema, stopProcessOutputSchema } from './schema.js';
 
@@ -16,9 +16,12 @@ export const stopProcessTool = defineTool({
   description: 'Idempotently stop a process started by exec_command.',
   schema: stopProcessInputSchema,
   outputSchema: stopProcessOutputSchema,
-  presentObservation: presentProcessObservation,
+  buildModelContent: buildProcessContent,
   requirements: { services: ['localToolConfiguration', 'commandExecution'] },
-  effectEnvelope: { accesses: [{ mode: 'execute', scope: processScope() }], lockScopes: [processScope()] },
+  effectEnvelope: {
+    accesses: [{ mode: 'execute', scope: processScope() }],
+    lockScopes: [processScope()]
+  },
   canonicalizeInput(input, context) {
     return {
       ...input,
@@ -53,7 +56,9 @@ export const stopProcessTool = defineTool({
     );
     return {
       kind: 'result' as const,
-      ok: true,
+      execution: {
+        state: result.status === 'running' ? ('active' as const) : ('settled' as const)
+      },
       summary: 'Process ' + result.processId + ' is ' + result.status + '.',
       scope: {
         resources: [processScope(result.processId)],
@@ -66,12 +71,16 @@ export const stopProcessTool = defineTool({
             }
           : {})
       },
-      ...(result.artifact ? { content: [{ type: 'artifact' as const, artifact: result.artifact }] } : {}),
+      ...(result.artifact
+        ? { content: [{ type: 'artifact' as const, artifact: result.artifact }] }
+        : {}),
       output: result
     };
   }
 });
-function processOwner(context: import('@agent-core/tools').ToolExecutionContext): CommandExecutionOwner {
+function processOwner(
+  context: import('@agent-core/tools').ToolExecutionContext
+): CommandExecutionOwner {
   const invocation = context.invocation;
   if (!invocation) throw new Error('Process tools require a runtime invocation owner.');
   return Object.freeze({

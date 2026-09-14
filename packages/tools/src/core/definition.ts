@@ -3,21 +3,39 @@ import type { ToolResultFacts } from './observed-facts.js';
 import type { JsonObject, JsonValue } from '@agent-core/json';
 import type * as z from 'zod';
 import type { ToolCanonicalizationContext, ToolExecutionContext } from './context.js';
-import type { ToolObservationPresentation, ToolObservationPresentationRequest } from './observation-presentation.js';
+import type { ToolModelContentRequest } from './model-content.js';
 import type { ToolPolicy } from './policy.js';
 import type { ToolEffectEnvelope, ToolEffects } from './authorization.js';
 import type { EffectExecutionState, EffectResourcePrecondition } from '@agent-core/effects';
 
 declare const ownedToolCall: unique symbol;
 declare const ownedToolObservation: unique symbol;
-export interface ToolCallInput { readonly id?: string; readonly name: string; readonly input: ToolInput }
+export interface ToolCallInput {
+  readonly id?: string;
+  readonly name: string;
+  readonly input: ToolInput;
+}
 export type ToolCall = Readonly<ToolCallInput & { readonly [ownedToolCall]: true }>;
-export type ToolInput = { readonly kind: 'json'; readonly value: JsonObject } | { readonly kind: 'text'; readonly value: string };
-export type ToolTextInputFormat = { type: 'text' } | { type: 'grammar'; syntax: string; definition: string };
-export interface ToolPromptGuideRequest { inputFormat: string; services?: Record<string, unknown>; metadata?: Record<string, unknown> }
+export type ToolInput =
+  | { readonly kind: 'json'; readonly value: JsonObject }
+  | { readonly kind: 'text'; readonly value: string };
+export type ToolTextInputFormat =
+  { type: 'text' } | { type: 'grammar'; syntax: string; definition: string };
+export interface ToolPromptGuideRequest {
+  inputFormat: string;
+  services?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+}
 export type ToolPromptGuide = string | ((request: ToolPromptGuideRequest) => string | undefined);
-export interface ToolTextInputDefinition<TInput = unknown> { format: ToolTextInputFormat; description?: string; promptGuide?: ToolPromptGuide; decode(text: string): TInput }
-export type ToolInputParseResult<TInput> = { ok: true; input: TInput } | { ok: false; observation: ToolFailureObservation<InvalidArgumentsToolFailureOutput> };
+export interface ToolTextInputDefinition<TInput = unknown> {
+  format: ToolTextInputFormat;
+  description?: string;
+  promptGuide?: ToolPromptGuide;
+  decode(text: string): TInput;
+}
+export type ToolInputParseResult<TInput> =
+  | { ok: true; input: TInput }
+  | { ok: false; observation: ToolFailureObservation<InvalidArgumentsToolFailureOutput> };
 
 export interface ToolScope {
   readonly resources: readonly string[];
@@ -31,7 +49,11 @@ export interface ToolScope {
 
 export type ToolContent =
   | { readonly type: 'text'; readonly text: string; readonly mediaType?: string }
-  | { readonly type: 'image'; readonly artifact: PublicArtifactRef; readonly detail: 'high' | 'original' }
+  | {
+      readonly type: 'image';
+      readonly artifact: PublicArtifactRef;
+      readonly detail: 'high' | 'original';
+    }
   | { readonly type: 'artifact'; readonly artifact: PublicArtifactRef };
 
 export type ModelInputModality = 'text' | 'image';
@@ -41,18 +63,34 @@ export interface ToolRequirements {
   readonly hostCapabilities?: readonly string[];
 }
 
+/** Executor-owned lifecycle facts. Active resources outlive the invocation. */
+export interface ToolExecutionObservation {
+  readonly state: 'not_started' | 'settled' | 'active' | 'unknown';
+}
+
 interface ToolObservationInputBase {
+  execution?: ToolExecutionObservation;
   summary: string;
   scope: ToolScope;
   content?: readonly ToolContent[];
   metadata?: JsonObject;
   observedFacts?: ToolResultFacts;
 }
-export interface ToolResultObservationInput<TOutput = unknown> extends ToolObservationInputBase { kind: 'result'; /** A negative domain result is still a completed tool invocation. */ ok: boolean; output: TOutput }
-export interface ToolFailureObservationInput<TOutput extends ToolFailureOutput = ToolFailureOutput> extends ToolObservationInputBase { kind: 'failure'; ok: false; output: TOutput }
-export type ToolObservationInput<TOutput = unknown> = ToolResultObservationInput<TOutput> | ToolFailureObservationInput;
+export interface ToolResultObservationInput<TOutput = unknown> extends ToolObservationInputBase {
+  kind: 'result';
+  output: TOutput;
+}
+export interface ToolFailureObservationInput<
+  TOutput extends ToolFailureOutput = ToolFailureOutput
+> extends ToolObservationInputBase {
+  kind: 'failure';
+  output: TOutput;
+}
+export type ToolObservationInput<TOutput = unknown> =
+  ToolResultObservationInput<TOutput> | ToolFailureObservationInput;
 
 interface ToolObservationBase {
+  readonly execution?: ToolExecutionObservation;
   readonly [ownedToolObservation]: true;
   readonly summary: string;
   readonly scope: ToolScope;
@@ -60,36 +98,101 @@ interface ToolObservationBase {
   readonly metadata?: JsonObject;
   readonly observedFacts?: ToolResultFacts;
 }
-export interface ToolResultObservation<TOutput = JsonValue> extends ToolObservationBase { readonly kind: 'result'; /** A negative domain result is still a completed tool invocation. */ readonly ok: boolean; readonly output: JsonValue & TOutput }
-export interface ToolFailureObservation<TOutput extends ToolFailureOutput = ToolFailureOutput> extends ToolObservationBase { readonly kind: 'failure'; readonly ok: false; readonly output: TOutput }
-export type ToolObservation<TOutput = JsonValue> = ToolResultObservation<TOutput> | ToolFailureObservation;
+export interface ToolResultObservation<TOutput = JsonValue> extends ToolObservationBase {
+  readonly kind: 'result';
+  readonly output: JsonValue & TOutput;
+}
+export interface ToolFailureObservation<
+  TOutput extends ToolFailureOutput = ToolFailureOutput
+> extends ToolObservationBase {
+  readonly kind: 'failure';
+  readonly output: TOutput;
+}
+export type ToolObservation<TOutput = JsonValue> =
+  ToolResultObservation<TOutput> | ToolFailureObservation;
 
 export type ToolEffectRecoveryResult<TOutput = unknown> =
   | { readonly status: 'reexecute'; readonly preconditions: readonly EffectResourcePrecondition[] }
   | { readonly status: 'settled'; readonly observation: ToolObservationInput<TOutput> }
   | { readonly status: 'running' }
-  | { readonly status: 'not_found' | 'expired' | 'unavailable' | 'parameter_mismatch'; readonly reason?: string };
+  | {
+      readonly status: 'not_found' | 'expired' | 'unavailable' | 'parameter_mismatch';
+      readonly reason?: string;
+    };
 
-export type ToolFailureReason = 'unknown_tool' | 'policy' | 'invalid_arguments' | 'invalid_output' | 'missing_service' | 'runtime_error';
-export interface BaseToolFailureOutput { readonly blocked: true; readonly reason: ToolFailureReason; readonly recovery: string }
-export interface UnknownToolFailureOutput extends BaseToolFailureOutput { readonly reason: 'unknown_tool'; readonly toolCall: ToolCall }
-export interface PolicyToolFailureOutput extends BaseToolFailureOutput { readonly reason: 'policy'; readonly tool?: string; readonly policyReason?: string; readonly details?: JsonObject }
-export interface ToolValidationIssue { readonly path: readonly (string | number)[]; readonly code: string; readonly message: string }
-export interface ToolValidationIssues { readonly issues: readonly ToolValidationIssue[] }
-export interface InvalidArgumentsToolFailureOutput extends BaseToolFailureOutput { readonly reason: 'invalid_arguments'; readonly issues?: ToolValidationIssues; readonly details?: JsonObject }
-export interface InvalidOutputToolFailureOutput extends BaseToolFailureOutput { readonly reason: 'invalid_output'; readonly issues: ToolValidationIssues }
-export interface MissingServiceDetails { readonly expected?: string; readonly actualType?: string }
-export interface MissingServiceToolFailureOutput extends BaseToolFailureOutput { readonly reason: 'missing_service'; readonly service: string; readonly details?: JsonObject }
-export interface RuntimeErrorToolFailureOutput extends BaseToolFailureOutput { readonly reason: 'runtime_error'; readonly error: string; readonly details?: JsonObject }
-export type ToolFailureOutput = UnknownToolFailureOutput | PolicyToolFailureOutput | InvalidArgumentsToolFailureOutput | InvalidOutputToolFailureOutput | MissingServiceToolFailureOutput | RuntimeErrorToolFailureOutput;
+export type ToolFailureReason =
+  | 'unknown_tool'
+  | 'policy'
+  | 'invalid_arguments'
+  | 'invalid_output'
+  | 'missing_service'
+  | 'runtime_error';
+export interface BaseToolFailureOutput {
+  readonly reason: ToolFailureReason;
+}
+export interface UnknownToolFailureOutput extends BaseToolFailureOutput {
+  readonly reason: 'unknown_tool';
+  readonly toolCall: ToolCall;
+}
+export interface PolicyToolFailureOutput extends BaseToolFailureOutput {
+  readonly reason: 'policy';
+  readonly tool?: string;
+  readonly policyReason?: string;
+  readonly details?: JsonObject;
+}
+export interface ToolValidationIssue {
+  readonly path: readonly (string | number)[];
+  readonly code: string;
+  readonly message: string;
+}
+export interface ToolValidationIssues {
+  readonly issues: readonly ToolValidationIssue[];
+}
+export interface InvalidArgumentsToolFailureOutput extends BaseToolFailureOutput {
+  readonly reason: 'invalid_arguments';
+  readonly issues?: ToolValidationIssues;
+  readonly details?: JsonObject;
+}
+export interface InvalidOutputToolFailureOutput extends BaseToolFailureOutput {
+  readonly reason: 'invalid_output';
+  readonly issues: ToolValidationIssues;
+}
+export interface MissingServiceDetails {
+  readonly expected?: string;
+  readonly actualType?: string;
+}
+export interface MissingServiceToolFailureOutput extends BaseToolFailureOutput {
+  readonly reason: 'missing_service';
+  readonly service: string;
+  readonly details?: JsonObject;
+}
+export interface RuntimeErrorToolFailureOutput extends BaseToolFailureOutput {
+  readonly reason: 'runtime_error';
+  readonly error: string;
+  readonly details?: JsonObject;
+}
+export type ToolFailureOutput =
+  | UnknownToolFailureOutput
+  | PolicyToolFailureOutput
+  | InvalidArgumentsToolFailureOutput
+  | InvalidOutputToolFailureOutput
+  | MissingServiceToolFailureOutput
+  | RuntimeErrorToolFailureOutput;
 
 export interface ToolExecutionBinding<TOutput = unknown> {
   readonly snapshot: JsonValue;
   invoke(context: ToolExecutionContext): Promise<ToolObservationInput<TOutput>>;
-  recover?(effect: Extract<EffectExecutionState, { readonly phase: 'started' }>, context: ToolExecutionContext): ToolEffectRecoveryResult<TOutput> | Promise<ToolEffectRecoveryResult<TOutput>>;
+  recover?(
+    effect: Extract<EffectExecutionState, { readonly phase: 'started' }>,
+    context: ToolExecutionContext
+  ): ToolEffectRecoveryResult<TOutput> | Promise<ToolEffectRecoveryResult<TOutput>>;
 }
 
-export interface ToolDefinition<TDecodedInput = unknown, TCanonicalInput = TDecodedInput, TOutput = unknown> {
+export interface ToolDefinition<
+  TDecodedInput = unknown,
+  TCanonicalInput = TDecodedInput,
+  TOutput = unknown
+> {
   readonly name: string;
   readonly implementationId: string;
   readonly description: string;
@@ -101,9 +204,20 @@ export interface ToolDefinition<TDecodedInput = unknown, TCanonicalInput = TDeco
   readonly requirements?: ToolRequirements;
   readonly isAvailable?: (policy: ToolPolicy) => boolean;
   decodeInput(input: ToolInput): ToolInputParseResult<TDecodedInput>;
-  canonicalizeInput(input: TDecodedInput, context: ToolCanonicalizationContext): TCanonicalInput | Promise<TCanonicalInput>;
+  canonicalizeInput(
+    input: TDecodedInput,
+    context: ToolCanonicalizationContext
+  ): TCanonicalInput | Promise<TCanonicalInput>;
   snapshotInput(input: TCanonicalInput): JsonValue;
-  deriveEffects(input: TCanonicalInput, context: ToolCanonicalizationContext): ToolEffects | Promise<ToolEffects>;
-  bindExecution(input: TCanonicalInput, context: ToolCanonicalizationContext): ToolExecutionBinding<TOutput> | Promise<ToolExecutionBinding<TOutput>>;
-  presentObservation?(request: ToolObservationPresentationRequest<TCanonicalInput, TOutput>): ToolObservationPresentation;
+  deriveEffects(
+    input: TCanonicalInput,
+    context: ToolCanonicalizationContext
+  ): ToolEffects | Promise<ToolEffects>;
+  bindExecution(
+    input: TCanonicalInput,
+    context: ToolCanonicalizationContext
+  ): ToolExecutionBinding<TOutput> | Promise<ToolExecutionBinding<TOutput>>;
+  buildModelContent?(
+    request: ToolModelContentRequest<TCanonicalInput, TOutput>
+  ): readonly ToolContent[];
 }

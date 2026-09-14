@@ -1,3 +1,4 @@
+import type { ToolActivityRenderer } from './tools.js';
 import type { AgentProgressEvent, SessionBranchEntry } from '@agent-core/runtime';
 import { decodeToolCall, type ToolCall } from '@agent-core/tools';
 import {
@@ -49,7 +50,7 @@ export interface ConversationActivityEntry extends ConversationIdentity {
   readonly kind: 'activity';
   readonly activity: string;
   readonly label: string;
-  readonly status: 'running' | 'success' | 'warning' | 'failed';
+  readonly status: 'running' | 'complete' | 'success' | 'warning' | 'failed';
   readonly summary?: string;
   readonly details?: readonly ActivityDetail[];
 }
@@ -71,7 +72,9 @@ export function sessionConversationId(entry: SessionBranchEntry): string {
     case 'observation':
       return sessionObservationActivityId(entry);
     case 'steering':
-      return entry.deliveryId === undefined ? `session:${entry.id}` : `steering:${entry.deliveryId}`;
+      return entry.deliveryId === undefined
+        ? `session:${entry.id}`
+        : `steering:${entry.deliveryId}`;
     case 'context_transition':
       return `session:${entry.window.windowId}`;
     default:
@@ -83,7 +86,8 @@ export function sessionConversationId(entry: SessionBranchEntry): string {
 function sessionEntries(
   entry: SessionBranchEntry,
   current?: ConversationActivityEntry,
-  label?: (call: ToolCall) => string
+  label?: (call: ToolCall) => string,
+  renderTool?: ToolActivityRenderer
 ): readonly ConversationEntry[] {
   const id = sessionConversationId(entry);
   switch (entry.type) {
@@ -104,7 +108,9 @@ function sessionEntries(
         ...assistant(
           entry.turnId,
           entry.content,
-          entry.completeness === undefined || entry.completeness === 'complete' ? 'complete' : 'interrupted'
+          entry.completeness === undefined || entry.completeness === 'complete'
+            ? 'complete'
+            : 'interrupted'
         )
       ];
     case 'tool_call': {
@@ -112,9 +118,11 @@ function sessionEntries(
       return [pendingToolActivity(id, call, label?.(call))];
     }
     case 'observation':
-      return [completedSessionToolActivity(current, entry)];
+      return [completedSessionToolActivity(current, entry, renderTool)];
     case 'context_transition':
-      return [{ id, kind: 'notice', tone: 'info', text: `Context changed · ${entry.window.reason}` }];
+      return [
+        { id, kind: 'notice', tone: 'info', text: `Context changed · ${entry.window.reason}` }
+      ];
     case 'branch':
       return [
         {
@@ -132,7 +140,8 @@ function sessionEntries(
 function progressEntries(
   input: { readonly runId: string; readonly event: AgentProgressEvent },
   entries: readonly ConversationEntry[],
-  label?: (call: ToolCall) => string
+  label?: (call: ToolCall) => string,
+  renderTool?: ToolActivityRenderer
 ): readonly ConversationEntry[] {
   const { event, runId } = input;
   switch (event.type) {
@@ -159,9 +168,30 @@ function progressEntries(
         ...reasoningEntries(event.turnId, event),
         ...assistant(event.turnId, event.content, 'interrupted')
       ];
+    case 'tool.observation.unavailable':
+      return [
+        {
+          id: toolActivityId({ ...event, runId }),
+          kind: 'activity',
+          activity: 'tool',
+          label: event.toolName,
+          status: 'warning',
+          summary: `${event.original.summary} Original observation unavailable: ${event.original.message}`,
+          details: [
+            {
+              id: 'execution',
+              content: `Invocation ${event.original.kind}; execution ${event.original.execution?.state ?? 'not established'}. Original output lost (${String(event.original.bytes)} bytes).`
+            }
+          ]
+        }
+      ];
     case 'tool.call.received':
       return [
-        pendingToolActivity(toolActivityId({ ...event, runId }), event.toolCall, label?.(event.toolCall))
+        pendingToolActivity(
+          toolActivityId({ ...event, runId }),
+          event.toolCall,
+          label?.(event.toolCall)
+        )
       ];
     case 'tool.started':
       return [
@@ -181,7 +211,7 @@ function progressEntries(
       return [
         event.type === 'tool.updated'
           ? updatedToolActivity(current, id, event.toolName, event.progress)
-          : completedToolActivity(current, id, event.toolName, event.observation)
+          : completedToolActivity(current, id, event.toolName, event.observation, renderTool)
       ];
     }
     default:
@@ -214,7 +244,9 @@ function assistant(
   text: string,
   status: ConversationAssistantEntry['status']
 ): readonly ConversationAssistantEntry[] {
-  return text.length === 0 ? [] : [{ id: `assistant:${turnId}`, kind: 'assistant', turnId, text, status }];
+  return text.length === 0
+    ? []
+    : [{ id: `assistant:${turnId}`, kind: 'assistant', turnId, text, status }];
 }
 function reasoningEntries(
   turnId: string,
@@ -311,26 +343,33 @@ export function oversizedHistoryEntry(
 export function projectSessionEntry(
   entry: SessionBranchEntry,
   current?: ConversationActivityEntry,
-  label?: (call: ToolCall) => string
+  label?: (call: ToolCall) => string,
+  renderTool?: ToolActivityRenderer
 ): readonly ConversationEntry[] {
-  const entries = sessionEntries(entry, current, label);
-  return 'runId' in entry
-    ? entries.map((item) => ({ ...item, runId: entry.runId }))
-    : entries;
+  const entries = sessionEntries(entry, current, label, renderTool);
+  return 'runId' in entry ? entries.map((item) => ({ ...item, runId: entry.runId })) : entries;
 }
 export function projectProgress(
   input: { readonly runId: string; readonly event: AgentProgressEvent },
   entries: readonly ConversationEntry[],
-  label?: (call: ToolCall) => string
+  label?: (call: ToolCall) => string,
+  renderTool?: ToolActivityRenderer
 ): readonly ConversationEntry[] {
-  return progressEntries(input, entries, label).map((entry) => ({ ...entry, runId: input.runId }));
+  return progressEntries(input, entries, label, renderTool).map((entry) => ({
+    ...entry,
+    runId: input.runId
+  }));
 }
 /** Acceptance can arrive after progress. Place the input before output from its own run. */
 export function insertAcceptedInput(
   entries: readonly ConversationEntry[],
   input: ConversationUserEntry
 ): readonly ConversationEntry[] {
-  if (entries.some((entry) => entry.id === input.id)) return mergeConversationEntries(entries, [input]);
-  const index = input.runId === undefined ? -1 : entries.findIndex((entry) => entry.runId === input.runId);
-  return index < 0 ? [...entries, input] : [...entries.slice(0, index), input, ...entries.slice(index)];
+  if (entries.some((entry) => entry.id === input.id))
+    return mergeConversationEntries(entries, [input]);
+  const index =
+    input.runId === undefined ? -1 : entries.findIndex((entry) => entry.runId === input.runId);
+  return index < 0
+    ? [...entries, input]
+    : [...entries.slice(0, index), input, ...entries.slice(index)];
 }

@@ -1,3 +1,4 @@
+import { ModelContinuationRequiredError, type ModelChangeOptions } from '@agent-core/runtime';
 import type { DeviceAuthenticationChallenge } from '@agent-core/auth';
 import type {
   ModelCatalogEntry,
@@ -41,7 +42,11 @@ export interface ConfigurationOperations {
   openBrowser?(url: string, signal: AbortSignal): Promise<void>;
   readonly providers: readonly { readonly id: string; readonly label: string }[];
   connect(provider: string, endpoint?: string): ModelProvider | Promise<ModelProvider>;
-  save(selection: ModelSelection, provider: ModelProvider): Promise<void>;
+  save(
+    selection: ModelSelection,
+    provider: ModelProvider,
+    options?: ModelChangeOptions
+  ): Promise<void>;
 }
 
 export interface ConfigurationState {
@@ -69,6 +74,7 @@ export interface ConfigurationState {
   readonly profile?: ModelProfile;
   readonly pending?: string | undefined;
   readonly error?: string;
+  readonly freshContinuationAvailable?: boolean;
   readonly notice?: string;
 }
 
@@ -95,11 +101,14 @@ export type ConfigurationMessage =
   | { readonly type: 'configuration.authenticated'; readonly id: string; readonly request: string }
   | { readonly type: 'configuration.stage'; readonly stage: ConfigurationState['stage'] }
   | { readonly type: 'configuration.pick'; readonly value: string }
-  | { readonly type: 'configuration.transition'; readonly transition: SearchPickerControlTransition }
+  | {
+      readonly type: 'configuration.transition';
+      readonly transition: SearchPickerControlTransition;
+    }
   | { readonly type: 'configuration.edit'; readonly transition: TextAreaTransition }
   | { readonly type: 'configuration.input' }
   | { readonly type: 'configuration.refresh' }
-  | { readonly type: 'configuration.save' }
+  | { readonly type: 'configuration.save'; readonly continuation?: 'fresh' }
   | { readonly type: 'configuration.saved'; readonly id: string }
   | {
       readonly type: 'configuration.catalog';
@@ -119,6 +128,7 @@ export type ConfigurationMessage =
       readonly id: string;
       readonly request: string;
       readonly error: string;
+      readonly freshContinuationAvailable?: boolean;
     };
 
 export function configurationState(
@@ -154,11 +164,14 @@ export function updateConfiguration(
   ) {
     const editing = { ...state };
     delete editing.error;
+    delete editing.freshContinuationAvailable;
     delete editing.notice;
     current = editing;
   }
   const result = reduceConfiguration(current, message, operations);
-  return result.state.stage === state.stage ? result : { ...result, state: { ...result.state, offset: 0 } };
+  return result.state.stage === state.stage
+    ? result
+    : { ...result, state: { ...result.state, offset: 0 } };
 }
 
 function reduceConfiguration(
@@ -217,7 +230,11 @@ function reduceConfiguration(
         : {
             state,
             effects: [
-              copySource(value, (message) => ({ type: 'configuration.notice', id: state.id, message }))
+              copySource(value, (message) => ({
+                type: 'configuration.notice',
+                id: state.id,
+                message
+              }))
             ]
           };
     }
@@ -326,7 +343,9 @@ function reduceConfiguration(
         if (reasoning === undefined || reasoning.strategy === 'disabled') return { state };
         if (state.stage === 'reasoning-mode') {
           if (reasoning.strategy !== 'effort') return { state };
-          const mode = state.profile?.capabilities.reasoning?.modes?.find((mode) => mode === message.value);
+          const mode = state.profile?.capabilities.reasoning?.modes?.find(
+            (mode) => mode === message.value
+          );
           const next = { ...reasoning };
           delete next.mode;
           return {
@@ -406,7 +425,9 @@ function reduceConfiguration(
       if (state.stage === 'reasoning-budget') {
         const maxTokens = Number(value);
         if (!Number.isSafeInteger(maxTokens) || maxTokens < 1)
-          return { state: { ...state, error: 'Enter a positive whole number of reasoning tokens.' } };
+          return {
+            state: { ...state, error: 'Enter a positive whole number of reasoning tokens.' }
+          };
         return {
           state: {
             ...state,
@@ -451,45 +472,93 @@ function reduceConfiguration(
                 ? {}
                 : {
                     id:
-                      message.models.find((model) => model.id === searchPickerView(state.picker).activeId)
-                        ?.id ??
+                      message.models.find(
+                        (model) => model.id === searchPickerView(state.picker).activeId
+                      )?.id ??
                       message.models.find((model) => model.id === state.selection.model)?.id ??
                       message.models[0].id
                   })
             },
-            { searchPickerIndex: configurationIndex({ ...state, models: message.models }, operations) }
+            {
+              searchPickerIndex: configurationIndex(
+                { ...state, models: message.models },
+                operations
+              )
+            }
           )
         }
       };
     case 'configuration.profile': {
-      const next = { ...state, pending: undefined, profile: message.profile, stage: 'review' as const };
+      const next = {
+        ...state,
+        pending: undefined,
+        profile: message.profile,
+        stage: 'review' as const
+      };
       try {
         assertModelRequestSupported(message.profile, {
           model: state.selection.model,
           messages: [],
-          ...(state.selection.reasoning === undefined ? {} : { reasoning: state.selection.reasoning }),
-          ...(state.selection.temperature === undefined ? {} : { temperature: state.selection.temperature })
+          ...(state.selection.reasoning === undefined
+            ? {}
+            : { reasoning: state.selection.reasoning }),
+          ...(state.selection.temperature === undefined
+            ? {}
+            : { temperature: state.selection.temperature })
         });
         return { state: next };
       } catch (error) {
-        return { state: { ...next, error: error instanceof Error ? error.message : String(error) } };
+        return {
+          state: { ...next, error: error instanceof Error ? error.message : String(error) }
+        };
       }
     }
     case 'configuration.failed':
-      return { state: { ...state, pending: undefined, error: message.error } };
+      return {
+        state: {
+          ...state,
+          pending: undefined,
+          error: message.error,
+          freshContinuationAvailable: message.freshContinuationAvailable ?? false
+        }
+      };
     case 'configuration.save': {
       const adapter = state.adapter;
       const profile = state.profile;
-      if (adapter === undefined || profile?.id !== state.selection.model || state.pending !== undefined)
+      if (
+        adapter === undefined ||
+        profile?.id !== state.selection.model ||
+        state.pending !== undefined
+      )
         return { state };
-      return operation(state, async () => {
+      if (message.continuation === 'fresh' && !state.freshContinuationAvailable) return { state };
+      return operation(state, async (request) => {
         assertModelRequestSupported(profile, {
           model: state.selection.model,
           messages: [],
-          ...(state.selection.reasoning === undefined ? {} : { reasoning: state.selection.reasoning }),
-          ...(state.selection.temperature === undefined ? {} : { temperature: state.selection.temperature })
+          ...(state.selection.reasoning === undefined
+            ? {}
+            : { reasoning: state.selection.reasoning }),
+          ...(state.selection.temperature === undefined
+            ? {}
+            : { temperature: state.selection.temperature })
         });
-        await operations.save(state.selection, adapter);
+        try {
+          await operations.save(
+            state.selection,
+            adapter,
+            message.continuation === 'fresh' ? { continuation: 'fresh' } : {}
+          );
+        } catch (error) {
+          if (!(error instanceof ModelContinuationRequiredError)) throw error;
+          return {
+            type: 'configuration.failed',
+            id: state.id,
+            request,
+            error: error.message,
+            freshContinuationAvailable: true
+          };
+        }
         return { type: 'configuration.saved', id: state.id };
       });
     }
@@ -552,9 +621,11 @@ function operation(
   };
 }
 
-function reasoningChoices(
-  profile?: ModelProfile
-): readonly { readonly id: string; readonly label: string; readonly value?: ModelReasoningRequest }[] {
+function reasoningChoices(profile?: ModelProfile): readonly {
+  readonly id: string;
+  readonly label: string;
+  readonly value?: ModelReasoningRequest;
+}[] {
   const reasoning = profile?.capabilities.reasoning;
   return [
     { id: 'default', label: 'Provider default' },
@@ -650,7 +721,8 @@ export function configurationView(
                 ...(operations.openBrowser === undefined
                   ? [
                       text({
-                        content: 'Browser launch is unavailable; copy the link to open it elsewhere.'
+                        content:
+                          'Browser launch is unavailable; copy the link to open it elsewhere.'
                       })
                     ]
                   : [
@@ -667,7 +739,9 @@ export function configurationView(
                   target: 'code'
                 })
               ]),
-          action('configuration-logout', 'Log out stored credentials', { type: 'configuration.logout' })
+          action('configuration-logout', 'Log out stored credentials', {
+            type: 'configuration.logout'
+          })
         ])
       : editing
         ? column([
@@ -715,7 +789,10 @@ export function configurationView(
               }),
               flow(
                 [
-                  action('configuration-model', 'Model', { type: 'configuration.stage', stage: 'model' }),
+                  action('configuration-model', 'Model', {
+                    type: 'configuration.stage',
+                    stage: 'model'
+                  }),
                   action('configuration-reasoning', 'Reasoning', {
                     type: 'configuration.stage',
                     stage: 'reasoning'
@@ -725,6 +802,22 @@ export function configurationView(
                         action('configuration-temperature', 'Temperature', {
                           type: 'configuration.stage',
                           stage: 'temperature'
+                        })
+                      ]
+                    : []),
+                  ...(state.freshContinuationAvailable
+                    ? [
+                        button({
+                          id: 'configuration-fresh',
+                          label: 'Continue fresh in this session',
+                          ...(state.pending === undefined
+                            ? {
+                                onPress: (): Message => ({
+                                  type: 'configuration.save',
+                                  continuation: 'fresh'
+                                })
+                              }
+                            : { disabled: true })
                         })
                       ]
                     : []),
@@ -786,7 +879,9 @@ export function configurationView(
               offset: request.nextState.offsetRow
             })
           }),
-          text({ content: state.error ?? state.notice ?? (state.pending === undefined ? '' : 'Working…') })
+          text({
+            content: state.error ?? state.notice ?? (state.pending === undefined ? '' : 'Working…')
+          })
         ],
         { sizes: [{ kind: 'fill' }, { kind: 'fixed', cells: 2 }] }
       ),
@@ -800,7 +895,10 @@ export function configurationView(
                   stage: 'authentication'
                 })
               ]),
-          action('configuration-providers', 'Provider', { type: 'configuration.stage', stage: 'provider' }),
+          action('configuration-providers', 'Provider', {
+            type: 'configuration.stage',
+            stage: 'provider'
+          }),
           ...(state.selection.provider
             ? [
                 action('configuration-refresh', 'Refresh', { type: 'configuration.refresh' }),

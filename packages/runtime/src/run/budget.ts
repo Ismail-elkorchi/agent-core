@@ -1,6 +1,6 @@
-import { calculateInferenceCost } from '../inference/usage-cost.js';
+import type { InferenceCharges } from '../inference/service.js';
+import type { AgentRunDriver } from './control/driver.js';
 
-import type { ModelPricing, ModelUsage } from '@agent-core/model';
 import type { ToolCall } from '@agent-core/tools';
 import {
   systemAgentClock,
@@ -8,9 +8,8 @@ import {
   type AgentClock,
   type AgentLimitKind,
   type AgentRunBudgetState,
-  type AgentRunLimits,
-  type AgentRunPhase
-} from '../run/contracts.js';
+  type AgentRunLimits
+} from './contracts.js';
 
 export class AgentLimitExceededError extends Error {
   readonly attempted: number;
@@ -46,13 +45,12 @@ export class AgentLimitExceededError extends Error {
   }
 }
 
-export class AgentRunController {
+export class AgentRunBudget {
   readonly limits: AgentRunLimits;
   private readonly clock: AgentClock;
   private readonly startedAt: number;
   private readonly initialElapsedMs: number;
-  private currentPhase: AgentRunPhase = 'initializing';
-  private state: Omit<AgentRunBudgetState, 'elapsedMs'> = {
+  private readonly emptyState: Omit<AgentRunBudgetState, 'elapsedMs'> = {
     modelTurns: 0,
     totalToolCalls: 0,
     promptTokens: 0,
@@ -65,80 +63,44 @@ export class AgentRunController {
     unknownPricedTokens: 0
   };
 
-  constructor(
-    input: {
-      readonly clock?: AgentClock;
-      readonly limits?: Partial<AgentRunLimits>;
-      readonly initialBudget?: AgentRunBudgetState;
-    } = {}
-  ) {
+  constructor(input: {
+    readonly clock?: AgentClock;
+    readonly limits?: Partial<AgentRunLimits>;
+    readonly run: AgentRunDriver;
+  }) {
+    this.run = input.run;
     this.limits = validateAgentRunLimits(input.limits);
     this.clock = input.clock ?? systemAgentClock();
     this.startedAt = this.clock.now();
-    if (input.initialBudget) {
-      const { elapsedMs, ...rest } = input.initialBudget;
-      this.initialElapsedMs = elapsedMs;
-      this.state = { ...rest };
-    } else {
-      this.initialElapsedMs = 0;
-    }
+    this.initialElapsedMs = input.run.state().budget?.elapsedMs ?? 0;
   }
 
-  get phase(): AgentRunPhase {
-    return this.currentPhase;
+  private readonly run: AgentRunDriver;
+  private get state(): Omit<AgentRunBudgetState, 'elapsedMs'> {
+    return this.run.state().budget ?? this.emptyState;
   }
 
-  transition(phase: Exclude<AgentRunPhase, 'initializing' | 'waiting_for_approval' | 'ended'>): void {
-    this.setPhase(phase);
-  }
-
-  waitForApproval(): void {
-    this.setPhase('waiting_for_approval');
-  }
-
-  resumeApprovedTools(): void {
-    this.setPhase('executing_tools');
-  }
-
-  commitTerminal(): void {
-    this.setPhase('ended');
-  }
-
-  private setPhase(next: AgentRunPhase): void {
-    const previous = this.currentPhase;
-    if (previous === next) return;
-    const allowed =
-      (previous === 'initializing' && (next === 'requesting_model' || next === 'finalizing')) ||
-      (previous === 'requesting_model' && (next === 'executing_tools' || next === 'finalizing')) ||
-      (previous === 'executing_tools' &&
-        (next === 'waiting_for_approval' || next === 'requesting_model' || next === 'finalizing')) ||
-      (previous === 'waiting_for_approval' && (next === 'executing_tools' || next === 'finalizing')) ||
-      (previous === 'finalizing' && next === 'ended');
-    if (!allowed) throw new Error(`Illegal run transition: ${previous} -> ${next}.`);
-    this.currentPhase = next;
-  }
-
-  beginModelTurn(): void {
+  reserveModelTurn(): AgentRunBudgetState {
     this.assertElapsed();
-    if (this.limits.modelTurns !== undefined && this.state.modelTurns >= this.limits.modelTurns) {
-      const previous = this.snapshot();
+    const previous = this.snapshot();
+    const total = previous.modelTurns + 1;
+    if (this.limits.modelTurns !== undefined && total > this.limits.modelTurns)
       throw this.limitError(
         'model_turns',
-        this.state.modelTurns + 1,
+        total,
         this.limits.modelTurns,
         1,
         previous,
-        { ...previous, modelTurns: this.state.modelTurns + 1 },
+        { ...previous, modelTurns: total },
         false
       );
-    }
-    this.state = { ...this.state, modelTurns: this.state.modelTurns + 1 };
+    return Object.freeze({ ...previous, modelTurns: total });
   }
 
-  recordToolCalls(calls: readonly ToolCall[]): void {
+  reserveToolCalls(calls: readonly ToolCall[]): AgentRunBudgetState {
     this.assertElapsed();
     const previous = this.snapshot();
-    const total = this.state.totalToolCalls + calls.length;
+    const total = previous.totalToolCalls + calls.length;
     if (this.limits.totalToolCalls !== undefined && total > this.limits.totalToolCalls)
       throw this.limitError(
         'total_tool_calls',
@@ -149,50 +111,82 @@ export class AgentRunController {
         { ...previous, totalToolCalls: total },
         false
       );
-    this.state = {
-      ...this.state,
-      totalToolCalls: total
-    };
+    return Object.freeze({ ...previous, totalToolCalls: total });
   }
 
-  recordUsage(usage: ModelUsage, pricing?: ModelPricing): void {
+  async recordUsage(charges: readonly InferenceCharges[]): Promise<void> {
     const previous = this.snapshot();
-    const promptTokens = this.state.promptTokens + usage.promptTokens;
-    const completionTokens = this.state.completionTokens + usage.completionTokens;
-    const priced = calculateInferenceCost(usage, pricing);
-    const knownCosts = { ...this.state.knownCosts };
-    if (priced.amount !== undefined && priced.currency)
-      knownCosts[priced.currency] = (knownCosts[priced.currency] ?? 0) + priced.amount;
-    const unknownPricedTokens = this.state.unknownPricedTokens + priced.unknownTokens;
+    const usage = {
+      promptTokens: 0,
+      completionTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      reasoningTokens: 0
+    };
+    const knownCosts: Record<string, number> = {};
+    let unknownPricedTokens = 0;
+    for (const charge of charges) {
+      usage.promptTokens += charge.usage.promptTokens;
+      usage.completionTokens += charge.usage.completionTokens;
+      usage.cacheReadTokens += charge.usage.cacheReadTokens ?? 0;
+      usage.cacheWriteTokens += charge.usage.cacheWriteTokens ?? 0;
+      usage.reasoningTokens += charge.usage.reasoningTokens ?? 0;
+      const priced = charge.cost;
+      if (priced.amount !== undefined && priced.currency)
+        knownCosts[priced.currency] = (knownCosts[priced.currency] ?? 0) + priced.amount;
+      unknownPricedTokens += priced.unknownTokens;
+    }
+    const { promptTokens, completionTokens } = usage;
+    if (
+      promptTokens < previous.promptTokens ||
+      completionTokens < previous.completionTokens ||
+      unknownPricedTokens < previous.unknownPricedTokens ||
+      Object.entries(previous.knownCosts).some(
+        ([currency, amount]) => (knownCosts[currency] ?? 0) < amount
+      )
+    )
+      throw new Error(
+        'The inference owner is missing previously settled run usage; restore its original repository before continuing.'
+      );
     const hasKnown = Object.keys(knownCosts).length > 0;
-    const pricingStatus = unknownPricedTokens > 0 ? (hasKnown ? 'partial' : 'unknown') : 'known';
-    this.state = {
-      ...this.state,
+    const pricingStatus =
+      charges.length === 0
+        ? previous.pricingStatus
+        : unknownPricedTokens > 0
+          ? hasKnown
+            ? 'partial'
+            : 'unknown'
+          : 'known';
+    await this.run.recordBudget(() => ({
+      ...this.snapshot(),
       promptTokens,
       completionTokens,
-      cacheReadTokens: this.state.cacheReadTokens + (usage.cacheReadTokens ?? 0),
-      cacheWriteTokens: this.state.cacheWriteTokens + (usage.cacheWriteTokens ?? 0),
-      reasoningTokens: this.state.reasoningTokens + (usage.reasoningTokens ?? 0),
+      cacheReadTokens: usage.cacheReadTokens,
+      cacheWriteTokens: usage.cacheWriteTokens,
+      reasoningTokens: usage.reasoningTokens,
       knownCosts,
       pricingStatus,
       unknownPricedTokens
-    };
+    }));
     if (this.limits.promptTokens !== undefined && promptTokens > this.limits.promptTokens)
       throw this.limitError(
         'prompt_tokens',
         promptTokens,
         this.limits.promptTokens,
-        usage.promptTokens,
+        Math.max(0, promptTokens - previous.promptTokens),
         previous,
         this.snapshot(),
         true
       );
-    if (this.limits.completionTokens !== undefined && completionTokens > this.limits.completionTokens)
+    if (
+      this.limits.completionTokens !== undefined &&
+      completionTokens > this.limits.completionTokens
+    )
       throw this.limitError(
         'completion_tokens',
         completionTokens,
         this.limits.completionTokens,
-        usage.completionTokens,
+        Math.max(0, completionTokens - previous.completionTokens),
         previous,
         this.snapshot(),
         true
@@ -204,7 +198,7 @@ export class AgentRunController {
         'known_cost',
         limitedCost,
         costLimit.amount,
-        priced.currency === costLimit.currency ? (priced.amount ?? 0) : 0,
+        Math.max(0, limitedCost - (previous.knownCosts[costLimit.currency] ?? 0)),
         previous,
         this.snapshot(),
         true

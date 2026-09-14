@@ -12,7 +12,7 @@ import {
   type AgentRunControlPhase,
   type AgentRunState
 } from './contracts.js';
-import { decodeToolPhase, type AgentToolPhase } from './tool-state.js';
+import { AgentRunRecords, decodeAgentToolWorkRecord, type AgentToolWorkRecord } from './records.js';
 
 export type AgentRunStateTransition =
   | Readonly<{ readonly kind: 'accepted'; readonly state: AgentRunState }>
@@ -24,7 +24,9 @@ export type AgentRunStateTransition =
       readonly control?: AgentRunControl;
       readonly phase?: AgentRunControlPhase;
       readonly providerRequests?: readonly IndexedProviderRequest[];
-      readonly toolBatches?: readonly IndexedToolBatch[];
+      readonly toolRecords?: readonly IndexedToolBatch[];
+      readonly providerRequestCount?: number;
+      readonly toolBatchCount?: number;
       readonly budget?: AgentRunBudgetState;
     }>;
 
@@ -35,14 +37,20 @@ export interface IndexedProviderRequest {
 
 export interface IndexedToolBatch {
   readonly index: number;
-  readonly value: AgentToolPhase;
+  readonly value: AgentToolWorkRecord;
 }
 
-export function createAgentRunStateTransition(
+export async function createAgentRunStateTransition(
   previous: AgentRunState | undefined,
-  next: AgentRunState
-): AgentRunStateTransition {
-  if (!previous) return Object.freeze({ kind: 'accepted', state: next });
+  next: AgentRunState,
+  records: AgentRunRecords
+): Promise<AgentRunStateTransition> {
+  assertAgentRunStateInvariants(next);
+  if (!previous) {
+    if (next.toolBatches.length || next.providerRequests.length)
+      throw new Error('Acceptance cannot contain uncommitted work.');
+    return Object.freeze({ kind: 'accepted', state: next });
+  }
   if (
     previous.runId !== next.runId ||
     previous.finalizationId !== next.finalizationId ||
@@ -56,10 +64,20 @@ export function createAgentRunStateTransition(
     next.driverGeneration < previous.driverGeneration ||
     next.driverGeneration > previous.driverGeneration + 1
   )
-    throw new Error('A run transition must preserve or advance its driver generation exactly once.');
+    throw new Error(
+      'A run transition must preserve or advance its driver generation exactly once.'
+    );
 
-  const providerRequests = indexedChanges(previous.providerRequests, next.providerRequests);
-  const toolBatches = indexedChanges(previous.toolBatches, next.toolBatches);
+  assertRetainedWork(previous, next);
+  const providerRequests = indexedChanges(previous.providerRequests, next.providerRequests).map(
+    (entry) => Object.freeze({ index: entry.index, value: decodeProviderPhase(entry.value) })
+  );
+  const toolRecords = await Promise.all(
+    indexedChanges(previous.toolBatches, next.toolBatches).map(async (entry) => ({
+      index: entry.index,
+      value: await records.storeTools(next.runId, entry.value)
+    }))
+  );
   if (previous.budget !== undefined && next.budget === undefined)
     throw new Error('A run transition cannot remove an accepted budget state.');
 
@@ -68,23 +86,35 @@ export function createAgentRunStateTransition(
     runId: next.runId,
     revision: next.revision,
     driverGeneration: next.driverGeneration,
-    ...(same(previous.control, next.control) ? {} : { control: next.control }),
-    ...(same(previous.phase, next.phase) ? {} : { phase: next.phase }),
-    ...(providerRequests.length === 0 ? {} : { providerRequests }),
-    ...(toolBatches.length === 0 ? {} : { toolBatches }),
-    ...(same(previous.budget, next.budget) || next.budget === undefined ? {} : { budget: next.budget })
+    ...(same(previous.control, next.control)
+      ? {}
+      : { control: decodeAgentRunControl(next.control) }),
+    ...(same(previous.phase, next.phase) ? {} : { phase: decodeAgentRunControlPhase(next.phase) }),
+    ...(providerRequests.length === 0 &&
+    previous.providerRequests.length === next.providerRequests.length
+      ? {}
+      : { providerRequests, providerRequestCount: next.providerRequests.length }),
+    ...(toolRecords.length === 0 && previous.toolBatches.length === next.toolBatches.length
+      ? {}
+      : { toolRecords, toolBatchCount: next.toolBatches.length }),
+    ...(same(previous.budget, next.budget) || next.budget === undefined
+      ? {}
+      : { budget: decodeAgentRunBudgetState(next.budget) })
   });
 }
 
-export function applyAgentRunStateTransition(
+export async function applyAgentRunStateTransition(
   previous: AgentRunState | undefined,
-  transition: AgentRunStateTransition
-): AgentRunState {
+  transition: AgentRunStateTransition,
+  records: AgentRunRecords
+): Promise<AgentRunState> {
   if (transition.kind === 'accepted') {
-    if (previous) throw new Error(`Run ${previous.runId} contains more than one acceptance transition.`);
+    if (previous)
+      throw new Error(`Run ${previous.runId} contains more than one acceptance transition.`);
     return transition.state;
   }
-  if (!previous) throw new Error(`Run ${transition.runId} starts without an acceptance transition.`);
+  if (!previous)
+    throw new Error(`Run ${transition.runId} starts without an acceptance transition.`);
   if (
     transition.runId !== previous.runId ||
     transition.revision !== previous.revision + 1 ||
@@ -99,11 +129,27 @@ export function applyAgentRunStateTransition(
     driverGeneration: transition.driverGeneration,
     control: transition.control ?? previous.control,
     phase: transition.phase ?? previous.phase,
-    providerRequests: applyIndexed(previous.providerRequests, transition.providerRequests),
-    toolBatches: applyIndexed(previous.toolBatches, transition.toolBatches),
+    providerRequests: applyIndexed(
+      previous.providerRequests,
+      transition.providerRequests,
+      transition.providerRequestCount
+    ),
+    toolBatches: applyIndexed(
+      previous.toolBatches,
+      transition.toolRecords
+        ? await Promise.all(
+            transition.toolRecords.map(async (entry) => ({
+              index: entry.index,
+              value: await records.loadTools(previous.runId, entry.value)
+            }))
+          )
+        : undefined,
+      transition.toolBatchCount
+    ),
     ...(budget === undefined ? {} : { budget })
   });
   assertAgentRunStateInvariants(state);
+  assertRetainedWork(previous, state);
   return state;
 }
 
@@ -116,7 +162,18 @@ export function decodeAgentRunStateTransition(value: unknown): AgentRunStateTran
   });
   if (object.kind === 'accepted') {
     exact(object, ['kind', 'state']);
-    return Object.freeze({ kind: 'accepted', state: decodeAgentRunState(object.state) });
+    const state = decodeAgentRunState(object.state);
+    if (
+      state.phase.kind !== 'accepted' ||
+      state.revision !== 0 ||
+      state.driverGeneration !== 0 ||
+      state.providerRequests.length ||
+      state.toolBatches.length
+    )
+      throw new TypeError(
+        'Incompatible run acceptance: work must be admitted through referenced transitions; retain original data.'
+      );
+    return Object.freeze({ kind: 'accepted', state });
   }
   if (object.kind !== 'updated') throw new TypeError('Run state transition kind is invalid.');
   exact(object, [
@@ -127,7 +184,9 @@ export function decodeAgentRunStateTransition(value: unknown): AgentRunStateTran
     'control',
     'phase',
     'providerRequests',
-    'toolBatches',
+    'toolRecords',
+    'providerRequestCount',
+    'toolBatchCount',
     'budget'
   ]);
   const runId = identifier(object.runId, 'runId');
@@ -135,8 +194,27 @@ export function decodeAgentRunStateTransition(value: unknown): AgentRunStateTran
   const driverGeneration = nonnegativeInteger(object.driverGeneration, 'driverGeneration');
   const control = object.control === undefined ? undefined : decodeAgentRunControl(object.control);
   const phase = object.phase === undefined ? undefined : decodeAgentRunControlPhase(object.phase);
-  const providerRequests = decodeIndexed(object.providerRequests, decodeProviderPhase, 'providerRequests');
-  const toolBatches = decodeIndexed(object.toolBatches, decodeToolPhase, 'toolBatches');
+  const providerRequests = decodeIndexed(
+    object.providerRequests,
+    decodeProviderPhase,
+    'providerRequests'
+  );
+  const toolRecords = decodeIndexed(object.toolRecords, decodeAgentToolWorkRecord, 'toolRecords');
+  const providerRequestCount =
+    object.providerRequestCount === undefined
+      ? undefined
+      : nonnegativeInteger(object.providerRequestCount, 'providerRequestCount');
+  const toolBatchCount =
+    object.toolBatchCount === undefined
+      ? undefined
+      : nonnegativeInteger(object.toolBatchCount, 'toolBatchCount');
+  if (
+    (providerRequests === undefined) !== (providerRequestCount === undefined) ||
+    (toolRecords === undefined) !== (toolBatchCount === undefined)
+  )
+    throw new TypeError(
+      'Incompatible run transition: work replacements require explicit outstanding counts; retain old data and start a new run.'
+    );
   const budget = object.budget === undefined ? undefined : decodeAgentRunBudgetState(object.budget);
   return Object.freeze({
     kind: 'updated',
@@ -145,33 +223,43 @@ export function decodeAgentRunStateTransition(value: unknown): AgentRunStateTran
     driverGeneration,
     ...(control ? { control } : {}),
     ...(phase ? { phase } : {}),
-    ...(providerRequests ? { providerRequests } : {}),
-    ...(toolBatches ? { toolBatches } : {}),
+    ...(providerRequests && providerRequestCount !== undefined
+      ? { providerRequests, providerRequestCount }
+      : {}),
+    ...(toolRecords && toolBatchCount !== undefined ? { toolRecords, toolBatchCount } : {}),
     ...(budget ? { budget } : {})
   });
 }
 
-function indexedChanges<T>(previous: readonly T[], next: readonly T[]): readonly { index: number; value: T }[] {
-  if (next.length < previous.length) throw new Error('Run work collections cannot shrink.');
+function indexedChanges<T>(
+  previous: readonly T[],
+  next: readonly T[]
+): readonly { index: number; value: T }[] {
   const changes: { index: number; value: T }[] = [];
   for (let index = 0; index < next.length; index += 1) {
     const value = next[index];
-    if (value !== undefined && !same(previous[index], value)) changes.push(Object.freeze({ index, value }));
+    if (value !== undefined && !same(previous[index], value))
+      changes.push(Object.freeze({ index, value }));
   }
   return Object.freeze(changes);
 }
 
 function applyIndexed<T>(
   previous: readonly T[],
-  changes: readonly { readonly index: number; readonly value: T }[] | undefined
+  changes: readonly { readonly index: number; readonly value: T }[] | undefined,
+  count: number | undefined
 ): readonly T[] {
   if (!changes) return previous;
+  if (count === undefined) throw new Error('Run work replacement has no bound.');
   const next = [...previous];
   for (const change of changes) {
-    if (change.index > next.length) throw new Error('Run collection transition has a positional gap.');
+    if (change.index >= count) throw new Error('Run work change is outside its declared count.');
+    if (change.index > next.length)
+      throw new Error('Run collection transition has a positional gap.');
     next[change.index] = change.value;
   }
-  return Object.freeze(next);
+  if (count > next.length) throw new Error('Run work count is inconsistent.');
+  return Object.freeze(next.slice(0, count));
 }
 
 function decodeIndexed<T>(
@@ -195,7 +283,10 @@ function decodeIndexed<T>(
 }
 
 function same(left: unknown, right: unknown): boolean {
-  return left === right || (left !== undefined && right !== undefined && hashJson(left) === hashJson(right));
+  return (
+    left === right ||
+    (left !== undefined && right !== undefined && hashJson(left) === hashJson(right))
+  );
 }
 
 function objectValue(value: unknown, label: string): JsonObject {
@@ -210,7 +301,8 @@ function exact(value: JsonObject, fields: readonly string[]): void {
 }
 
 function identifier(value: unknown, label: string): string {
-  if (typeof value !== 'string' || value.length === 0) throw new TypeError(`${label} must be non-empty.`);
+  if (typeof value !== 'string' || value.length === 0)
+    throw new TypeError(`${label} must be non-empty.`);
   return value;
 }
 
@@ -218,4 +310,48 @@ function nonnegativeInteger(value: unknown, label: string): number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0)
     throw new TypeError(`${label} must be a non-negative safe integer.`);
   return value;
+}
+
+function assertRetainedWork(previous: AgentRunState, next: AgentRunState): void {
+  for (const request of previous.providerRequests) {
+    const retained = next.providerRequests.find(
+      (item) =>
+        item.identity.turnId === request.identity.turnId &&
+        item.identity.requestAttempt === request.identity.requestAttempt
+    );
+    const reprepare =
+      request.stage === 'ready' &&
+      previous.phase.kind === 'suspended' &&
+      previous.phase.reason === 'context_admission' &&
+      next.phase.kind === 'initializing' &&
+      next.phase.step === 'assemble_turn' &&
+      next.phase.turnIndex === previous.phase.turnIndex;
+    if (!retained && request.stage !== 'consumed' && !reprepare)
+      throw new Error('Unresolved provider work cannot be removed.');
+    if (
+      retained &&
+      (!same(request.identity, retained.identity) || request.toolBatchId !== retained.toolBatchId)
+    )
+      throw new Error('Provider source identity changed.');
+  }
+  for (const batch of previous.toolBatches) {
+    const retained = next.toolBatches.find((item) => item.toolBatchId === batch.toolBatchId);
+    if (!retained) {
+      if (
+        !batch.callStates.every(
+          (call) =>
+            call.stage === 'resolved' ||
+            call.stage === 'cancelled' ||
+            (call.stage === 'recorded' &&
+              (!batch.source.nativeCatalogIdentity || call.delivery?.status === 'applied'))
+        )
+      )
+        throw new Error('Unresolved tool or delivery work cannot be removed.');
+    } else {
+      const { callStates: oldCalls, ...oldSource } = batch;
+      const { callStates: newCalls, ...newSource } = retained;
+      if (oldCalls.length !== newCalls.length || !same(oldSource, newSource))
+        throw new Error('Original tool source cannot change.');
+    }
+  }
 }

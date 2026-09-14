@@ -1,11 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
-import { hashJson, InMemoryEventRepository } from '@agent-core/persistence';
-import { issueEffectStartTicket, startExternalEffect, settleExternalEffect } from '@agent-core/effects';
+import {
+  hashJson,
+  InMemoryEventRepository,
+  InMemoryArtifactRepository
+} from '@agent-core/persistence';
+import {
+  issueEffectStartTicket,
+  startExternalEffect,
+  settleExternalEffect
+} from '@agent-core/effects';
 import { createToolCall, parseToolObservation } from '@agent-core/tools';
 import {
   AgentRunCoordinator,
+  AgentRunRecords,
+  storedToolObservation,
   agentEventCodec,
   createAgentRunStateTransition,
   decodeAgentRunState
@@ -122,26 +132,26 @@ function provider(runId) {
   };
 }
 
-function observation(id, ok = true) {
-  return {
+function observation(id) {
+  const record = {
     observationId: `observation:${id}`,
     createdAt: new Date(0).toISOString(),
     observation: parseToolObservation(
       { outputSchema: z.strictObject({ value: z.string() }) },
       {
         kind: 'result',
-        ok,
         output: { value: id },
         summary: `Completed ${id}`,
         scope: { resources: ['memory'], coverage: 'complete' }
       }
     )
   };
+  return { ...record, original: storedToolObservation(record.observation), modelContent: [] };
 }
 
 async function fixture(runId, toolBatches, providerRequests = []) {
   const events = new InMemoryEventRepository(agentEventCodec);
-  const runs = new AgentRunCoordinator(events);
+  const runs = new AgentRunCoordinator(events, new InMemoryArtifactRepository());
   await runs.accept(acceptance(runId));
   const initial = await runs.attach(runId, 'original');
   const state = decodeAgentRunState({
@@ -153,7 +163,14 @@ async function fixture(runId, toolBatches, providerRequests = []) {
   });
   await events.appendConditional(
     runId,
-    { type: 'run.state.transitioned', transition: createAgentRunStateTransition(initial.state(), state) },
+    {
+      type: 'run.state.transitioned',
+      transition: await createAgentRunStateTransition(
+        initial.state(),
+        state,
+        new AgentRunRecords(runs.artifacts)
+      )
+    },
     {
       idempotencyKey: `${runId}:work`,
       expectedTail: await events.tail(runId),
@@ -164,12 +181,12 @@ async function fixture(runId, toolBatches, providerRequests = []) {
   return { events, runs, initial };
 }
 
-function settle(runs, runId, work, callIndex = 0, ok = true) {
+function settle(runs, runId, work, callIndex = 0) {
   const state = work.callStates[callIndex];
   return runs.settleToolEffect(runId, {
     effectId: state.effect.intent.effectId,
     permit: state.effect.settlementPermit,
-    settlement: observation(`${work.toolBatchId}:${callIndex}`, ok)
+    settlement: observation(`${work.toolBatchId}:${callIndex}`)
   });
 }
 
@@ -241,9 +258,12 @@ test('suspension and cancellation preserve an already-started call and its late 
     const later = provider(runId);
     const { runs, initial } = await fixture(runId, [original], [later]);
     const replacement = await runs.attach(runId, 'replacement');
-    await replacement.transition(phase.kind === 'cancelling' ? 'finalize_abort' : 'reconcile_tool_call', {
-      phase
-    });
+    await replacement.transition(
+      phase.kind === 'cancelling' ? 'finalize_abort' : 'reconcile_tool_call',
+      {
+        phase
+      }
+    );
     await initial.settleToolEffect({
       effectId: original.callStates[0].effect.intent.effectId,
       permit: original.callStates[0].effect.settlementPermit,
@@ -325,7 +345,11 @@ test('result delivery uncertainty retains the original observation and forbids a
   await settle(runs, runId, work);
   await record(initial, work);
   const target = { toolBatchId: 'r1', callIndex: 0 };
-  const identity = { deliveryId: 'result:A', inputIdentity: hashJson('result:A'), targetResponseId: 'r2' };
+  const identity = {
+    deliveryId: 'result:A',
+    inputIdentity: hashJson('result:A'),
+    targetResponseId: 'r2'
+  };
   for (const status of ['admitted', 'submitted', 'uncertain'])
     await initial.recordToolDelivery(target, { ...identity, status });
   const replacement = await runs.attach(runId, 'replacement');
@@ -354,7 +378,10 @@ test('result delivery uncertainty retains the original observation and forbids a
     }),
     /identity cannot change/u
   );
-  assert.deepEqual(replacement.state().toolBatches[0].callStates[0].settlement, observation('r1:0'));
+  assert.deepEqual(
+    replacement.state().toolBatches[0].callStates[0].settlement,
+    observation('r1:0')
+  );
   await settle(runs, runId, work);
   assert.equal(
     (await runs.inspect(runId)).state.toolBatches[0].callStates[0].delivery.successorResponseId,

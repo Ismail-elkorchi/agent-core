@@ -1,116 +1,129 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  applyPatchTool,
-  execCommandTool,
-  findFilesTool,
-  listDirectoryTool,
-  readArtifactTool,
   readFilesTool,
+  execCommandTool,
   searchTextTool,
-  stopProcessTool,
-  writeStdinTool
+  renderLocalToolObservation
 } from '@agent-core/tools-local';
-
-const hash = 'a'.repeat(64);
-const completeScope = { resources: ['files'], coverage: 'complete' };
-
-function present(tool, output, options = {}) {
-  const scope = options.scope ?? completeScope;
-  return tool.presentObservation({
-    call: { name: tool.name, input: { kind: 'json', value: {} } }, input: {}, mode: options.mode ?? 'immediate', maxTokens: options.maxTokens ?? 500,
-    observation: { kind: 'result', ok: options.ok ?? true, summary: `${tool.name} result`, scope, output }
+import { serializeToolModelContent } from '@agent-core/tools';
+function content(tool, output) {
+  return tool.buildModelContent({
+    call: { name: tool.name, input: { kind: 'json', value: {} } },
+    input: {},
+    observation: {
+      kind: 'result',
+      summary: 'Source',
+      scope: { resources: [], coverage: 'complete' },
+      output
+    }
   });
 }
 
-test('domain presenters preserve their required shape while spending the supplied budget', () => {
-  const listed = present(listDirectoryTool, {
-    path: '.', depth: { requested: 1, effective: 1, hostMaximum: 16 }, coverage: 'partial', causes: ['result_limit'],
-    counts: { visited: 12, returned: 9, omitted: { count: 3, relation: 'at_least' } },
-    omitted: { ignoreFiles: { count: 0, relation: 'exact' } }, omissions: [{ cause: 'result_limit', count: 3, relation: 'at_least' }], omissionSamples: [],
-    entries: ['a/1', 'a/2', 'a/3', 'b/1', 'b/2', 'b/3', 'c/1', 'c/2', 'c/3'].map(path => ({ path, type: 'file' }))
-  }, { scope: { resources: ['files'], coverage: 'partial', causes: ['result_limit'], omitted: { entries: 3 } }, maxTokens: 300 });
-  assert.deepEqual([...new Set(listed.results.entries.map(entry => entry.path.split('/')[0]))], ['a', 'b', 'c']);
-  assert.deepEqual(listed.results.counts, { visited: 12, returned: 9, omitted: { count: 3, relation: 'at_least' } });
-  assert.match(listed.next, /narrower/u);
-  assertWithinBudget(listed, 300);
-
-  const foundComplete = present(findFilesTool, {
-    path: '.', hostMaximumDepth: 16, patterns: ['**/*.ts'], coverage: 'complete', causes: [],
-    counts: { visited: 5, returned: 3, omitted: { count: 0, relation: 'exact' } },
-    omitted: { ignoreFiles: { count: 0, relation: 'exact' } }, omissions: [], omissionSamples: [],
-    entries: [{ path: 'z.ts', type: 'file' }, { path: 'a.ts', type: 'file' }, { path: 'm.ts', type: 'file' }]
-  });
-  assert.deepEqual(foundComplete.results.entries.map(entry => entry.path), ['a.ts', 'm.ts', 'z.ts']);
-  assert.equal('next' in foundComplete, false);
-  assertWithinBudget(foundComplete, 500);
-
-  const read = present(readFilesTool, {
-    requestedFiles: 3, returnedFiles: 3, failedFiles: 0, returnedBytes: 18_000, coverage: 'partial', failures: [],
-    files: ['a.txt', 'b.txt', 'c.txt'].map((path, index) => ({ path, startLine: 1, lineCount: 100, content: String(index).repeat(6_000), bytes: 6_000, fileBytes: 6_000, eof: false, truncated: true, nextStartLine: 101, rangeSha256: hash, fullFileSha256: hash, newlineConvention: 'lf', utf8Validation: 'valid' }))
-  }, { scope: { resources: ['files/a.txt', 'files/b.txt', 'files/c.txt'], coverage: 'partial', causes: ['range_limit'] }, maxTokens: 700 });
-  assert.deepEqual(read.results.files.map(file => file.path), ['a.txt', 'b.txt', 'c.txt']);
-  assert.equal(read.results.files.every(file => file.content.length > 0 && file.continuationLine === 101), true);
-  assertWithinBudget(read, 700);
-
-  const searched = present(searchTextTool, {
-    query: 'needle', mode: 'matches', status: 'partial', resultCoverage: 'partial', countCoverage: 'partial', examinedFileCount: 2, matchingFileCount: 2, matchingLineCount: 4,
-    occurrenceCount: 4, omittedResultCount: 2, countsCapped: false, omittedResultCountIsLowerBound: false, outputTruncated: false,
-    perFileOmissions: [{ path: 'a.txt', cause: 'per_file_limit', retainedMatches: 1, omittedAtLeast: 1 }],
-    results: [
-      { path: 'a.txt', lineNumber: 1, text: 'needle ' + 'a'.repeat(2_000), occurrences: [{ startByte: 0, endByte: 6, text: 'needle' }] },
-      { path: 'a.txt', lineNumber: 2, text: 'needle again', occurrences: [{ startByte: 0, endByte: 6, text: 'needle' }] },
-      { path: 'b.txt', lineNumber: 3, text: 'needle ' + 'b'.repeat(2_000), occurrences: [{ startByte: 0, endByte: 6, text: 'needle' }] }
-    ]
-  }, { scope: { resources: ['files'], coverage: 'partial', causes: ['per_file_limit'] }, maxTokens: 700 });
-  assert.deepEqual([...new Set(searched.results.results.map(match => match.path))], ['a.txt', 'b.txt']);
-  assert.equal(searched.results.perFileOmissions[0].cause, 'per_file_limit');
-  assertWithinBudget(searched, 700);
-
-  const patched = present(applyPatchTool, {
-    applicationStatus: 'uncertain', transactionOutcome: 'rollback_failed', rootState: 'uncertain', dryRun: false,
+test('file content preserves large admissible source text and edit preconditions', () => {
+  const source = 'const quotation = "Original αβγ";\n'.repeat(4000);
+  const output = {
+    coverage: 'partial',
     files: [
-      { path: 'a.txt', operation: 'update', hunkCount: 1, additions: 1, deletions: 1, oldBytes: 1, newBytes: 1, plannedChange: true, finalState: 'uncertain' },
-      { path: 'old.txt', destinationPath: 'new.txt', operation: 'move', hunkCount: 0, additions: 0, deletions: 0, oldBytes: 1, newBytes: 1, plannedChange: true, finalState: 'uncertain' }
+      {
+        path: 'source.ts',
+        startLine: 12,
+        lineCount: 4000,
+        nextStartLine: 4012,
+        fullFileSha256: 'a'.repeat(64),
+        rangeSha256: 'b'.repeat(64),
+        bytes: Buffer.byteLength(source),
+        fileBytes: Buffer.byteLength(source) + 300,
+        eof: false,
+        truncated: true,
+        newlineConvention: 'lf',
+        utf8Validation: 'valid',
+        content: source
+      }
     ],
-    changedPaths: [], wouldChangePaths: ['a.txt', 'old.txt', 'new.txt'], createdPaths: [], wouldCreatePaths: [], deletedPaths: [], wouldDeletePaths: [],
-    movedPaths: [], wouldMovePaths: [{ sourcePath: 'old.txt', destinationPath: 'new.txt' }], potentiallyAffectedPaths: ['a.txt', 'old.txt', 'new.txt'],
-    totalOperationCount: 2, totalHunkCount: 1, totalAdditions: 1, totalDeletions: 1, failures: [],
-    transaction: { outcome: 'rollback_failed', failure: { operation: 'commit_patch', path: 'a.txt', message: 'commit failed' }, rollback: { status: 'uncertain', diagnostics: [{ operation: 'restore', path: 'a.txt', message: 'state unknown' }], strandedPaths: ['a.txt'] } }
-  }, { scope: { resources: ['files/a.txt', 'files/old.txt', 'files/new.txt'], coverage: 'partial', causes: ['rooted_file_state_uncertain'] }, ok: false });
-  assert.equal(patched.results.applicationStatus, 'uncertain');
-  assert.equal(patched.results.transactionOutcome, 'rollback_failed');
-  assert.equal(patched.results.rootState, 'uncertain');
-  assert.deepEqual(patched.results.files.map(file => [file.path, file.operation, file.additions, file.deletions]), [['a.txt', 'update', 1, 1], ['old.txt', 'move', 0, 0]]);
-  assert.equal(patched.results.transaction.outcome, 'rollback_failed');
-  assertWithinBudget(patched, 500);
-
-  for (const tool of [execCommandTool, writeStdinTool, stopProcessTool]) {
-    const process = present(tool, {
-      status: 'exited', processId: 'proc-1', exitCode: 0, cursorStart: 0, cursorEnd: 5_000, cursorExpired: false,
-      stdout: { text: '', bytes: 0, omittedBytes: 0 }, stderr: { text: '', bytes: 0, omittedBytes: 0 },
-      combined: { text: 'START' + 'x'.repeat(5_000) + 'TRUE_TAIL', bytes: 5_014, omittedBytes: 100 },
-      artifact: { artifactId: 'public.txt', sha256: hash, size: 5_014, mediaType: 'text/plain', visibility: 'public' }
-    }, { maxTokens: 250 });
-    assert.equal(process.results.processId, 'proc-1');
-    assert.equal(process.results.exitCode, 0);
-    assert.match(process.results.outputTail, /TRUE_TAIL$/u);
-    assert.equal(process.results.artifact.visibility, 'public');
-    assertWithinBudget(process, 250);
-  }
-
-  const completeArtifact = present(readArtifactTool, {
-    artifact: { artifactId: 'public.txt', sha256: hash, size: 4, mediaType: 'text/plain', visibility: 'public' }, fullSize: 4,
-    returnedRange: { start: 0, end: 4 }, returnedBytes: 4, coverage: 'complete', text: 'body', contentType: 'text'
-  });
-  assert.equal(completeArtifact.results.artifactId, 'public.txt');
-  assert.equal(completeArtifact.results.fullSize, 4);
-  assert.equal(completeArtifact.results.textExcerpt, 'body');
-  assert.equal('next' in completeArtifact, false);
-  assert.equal('nextOffset' in completeArtifact.results, false);
-  assertWithinBudget(completeArtifact, 500);
+    failures: [],
+    requestedFiles: 1,
+    returnedFiles: 1,
+    failedFiles: 0,
+    returnedBytes: Buffer.byteLength(source)
+  };
+  const parts = content(readFilesTool, output);
+  assert.ok(parts.some((part) => part.type === 'text' && part.text === source));
+  assert.match(serializeToolModelContent(parts), /fullFileSha256|nextStartLine/);
+  assert.match(
+    renderLocalToolObservation('read_files', { kind: 'result', output }).details[0].content,
+    /12 │ const quotation/
+  );
 });
 
-function assertWithinBudget(presentation, maxTokens) {
-  assert.ok(Buffer.byteLength(JSON.stringify(presentation), 'utf8') <= maxTokens * 4, `presentation exceeded ${maxTokens} tokens`);
-}
+test('process content retains beginning, middle and end of selected logs without telemetry', () => {
+  const log = 'first diagnostic\n' + 'detail\n'.repeat(4000) + 'last diagnostic';
+  const output = {
+    processId: 'process-1',
+    status: 'exited',
+    exitCode: 7,
+    cursorStart: 0,
+    cursorEnd: log.length,
+    combined: {
+      text: log,
+      observedBytes: log.length,
+      capturedBytes: log.length,
+      omittedBytes: 0,
+      startsAtOutputStart: true,
+      endsAtOutputEnd: true
+    },
+    progressDroppedEvents: 19,
+    progressDeliveryErrors: 3,
+    owner: {
+      ownerId: 'internal',
+      runId: 'internal',
+      turnId: 'turn',
+      toolBatchId: 'batch',
+      callIndex: 0
+    },
+    stdout: {
+      text: log,
+      observedBytes: log.length,
+      capturedBytes: log.length,
+      omittedBytes: 0,
+      startsAtOutputStart: true,
+      endsAtOutputEnd: true
+    },
+    stderr: {
+      text: '',
+      observedBytes: 0,
+      capturedBytes: 0,
+      omittedBytes: 0,
+      startsAtOutputStart: true,
+      endsAtOutputEnd: true
+    }
+  };
+  const parts = content(execCommandTool, output);
+  assert.ok(parts.some((part) => part.text === log));
+  const serialized = serializeToolModelContent(parts);
+  assert.match(serialized, /"exitCode": 7/);
+  assert.doesNotMatch(serialized, /progressDroppedEvents|progressDeliveryErrors|internal/);
+  assert.equal(
+    renderLocalToolObservation('exec_command', { kind: 'result', output }).status,
+    'failed'
+  );
+  assert.equal(
+    renderLocalToolObservation('exec_command', {
+      kind: 'result',
+      output: { ...output, status: 'running' }
+    }).status,
+    'running'
+  );
+});
+
+test('search matches retain exact source bytes and omission facts', () => {
+  const source = 'needle ' + 'α'.repeat(8000);
+  const parts = content(searchTextTool, {
+    mode: 'matches',
+    resultCoverage: 'partial',
+    omittedResultCount: 2,
+    results: [{ path: 'a', lineNumber: 30, text: source }]
+  });
+  assert.ok(parts.some((part) => part.text === source));
+  assert.match(serializeToolModelContent(parts), /omittedResultCount/);
+});

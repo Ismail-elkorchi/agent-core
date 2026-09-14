@@ -17,8 +17,7 @@ import {
   createHistoryTools,
   createNotesTools,
   createContextTools,
-  sourceRef,
-  historySourceAfterCut
+  sourceRef
 } from '@agent-core/runtime';
 import { JsonlSessionRepository, JsonlNoteRepository } from '@agent-core/runtime/node';
 
@@ -46,7 +45,7 @@ function terminal(runId) {
       reasoningTokens: 0,
       knownCosts: {},
       pricingStatus: 'unknown',
-      unknownPricedTokens: 0,
+      unknownPricedTokens: 0
     }
   };
 }
@@ -77,7 +76,10 @@ async function backend(kind) {
     root,
     sessions: new JsonlSessionRepository(path.join(root, 'sessions')),
     notes: new JsonlNoteRepository({ rootDir: path.join(root, 'notes'), artifacts }),
-    events: new JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec }),
+    events: new JsonlEventRepository({
+      rootDir: path.join(root, 'events'),
+      codec: agentEventCodec
+    }),
     artifacts
   };
 }
@@ -100,7 +102,12 @@ for (const kind of ['memory', 'jsonl']) {
       await sessions.recordRunFinalization(session, terminal(`run-${i}`));
     }
     const history = new HistoryReader({ repository: sessions, session });
-    let page = await history.search({ query: 'original-', maxScanned: 37, limit: 11, maxBytes: 8192 });
+    let page = await history.search({
+      query: 'original-',
+      maxScanned: 37,
+      limit: 11,
+      maxBytes: 8192
+    });
     const cut = page.cut;
     const sources = [];
     while (true) {
@@ -132,7 +139,10 @@ for (const kind of ['memory', 'jsonl']) {
     assert.equal(wrong.status, 'unavailable');
     assert.equal(wrong.reason, 'identity_mismatch');
     if (kind === 'jsonl')
-      assert.ok(sessions.indexMetrics().fullScans <= 1, 'JSONL cache must not rescan the file per page');
+      assert.ok(
+        sessions.indexMetrics().fullScans <= 1,
+        'JSONL cache must not rescan the file per page'
+      );
   });
 
   test(`${kind}: accepted input owns original context attachments and strict branch scope`, async () => {
@@ -161,7 +171,10 @@ for (const kind of ['memory', 'jsonl']) {
     });
     input.task = 'mutated';
     input.contextItems[0].content = 'mutated';
-    const first = await sessions.appendInput(session, { runId: 'run', task: 'runtime transformed task' });
+    const first = await sessions.appendInput(session, {
+      runId: 'run',
+      task: 'runtime transformed task'
+    });
     await sessions.recordRunFinalization(session, terminal('run'));
     assert.equal(first.originalInput.task, 'Original input');
     assert.equal(first.originalInput.contextItems[0].content, 'unmodified attachment');
@@ -173,9 +186,13 @@ for (const kind of ['memory', 'jsonl']) {
     await sessions.branchFrom(session, first.id);
     const reader = new HistoryReader({ repository: sessions, session });
     assert.equal((await reader.search({ query: 'sibling-only' })).items.length, 0);
-    assert.equal((await reader.read({ source: sourceRef(session.id, secret) })).status, 'unavailable');
     assert.equal(
-      (await reader.read({ source: { ...sourceRef(session.id, first), sessionId: 'other' } })).reason,
+      (await reader.read({ source: sourceRef(session.id, secret) })).status,
+      'unavailable'
+    );
+    assert.equal(
+      (await reader.read({ source: { ...sourceRef(session.id, first), sessionId: 'other' } }))
+        .reason,
       'outside_scope'
     );
   });
@@ -186,7 +203,10 @@ for (const kind of ['memory', 'jsonl']) {
     assert.equal(initial.status, 'committed');
     const retry = await notes.write(writeRequest());
     assert.equal(retry.revision.revisionId, initial.revision.revisionId);
-    await assert.rejects(notes.write(writeRequest({ content: 'conflicting retry' })), /idempotency/u);
+    await assert.rejects(
+      notes.write(writeRequest({ content: 'conflicting retry' })),
+      /idempotency/u
+    );
     const concurrent = await Promise.all([
       notes.write(
         writeRequest({
@@ -220,7 +240,8 @@ for (const kind of ['memory', 'jsonl']) {
       parent.revisionId
     );
     assert.equal(
-      (await notes.read({ scope: child, noteId: 'entry', revisionId: next.revision.revisionId })).status,
+      (await notes.read({ scope: child, noteId: 'entry', revisionId: next.revision.revisionId }))
+        .status,
       'missing'
     );
     const removed = await notes.remove({
@@ -248,10 +269,13 @@ for (const kind of ['memory', 'jsonl']) {
     assert.equal(same[0].revision.revisionId, same[1].revision.revisionId);
   });
 
-  test(`${kind}: context commit retains the post-boundary tail and rejects stale input/oversized bootstrap`, async () => {
+  test(`${kind}: context commit retains the post-boundary tail and rejects stale input/oversized source selection`, async () => {
     const { sessions, notes } = await backend(kind);
     const session = await sessions.create({ id: 'session', binding });
-    const first = await sessions.appendInput(session, { runId: 'one', task: 'original requirement' });
+    const first = await sessions.appendInput(session, {
+      runId: 'one',
+      task: 'original requirement'
+    });
     await sessions.recordRunFinalization(session, terminal('one'));
     const history = new HistoryReader({ repository: sessions, session });
     const note = await notes.write(writeRequest());
@@ -260,9 +284,8 @@ for (const kind of ['memory', 'jsonl']) {
       session,
       history,
       notes,
-      bootstrap: {
-        validate: async () => {},
-        maxBytes: 16 * 1024,
+      policy: {
+        maxSourceBytes: 16 * 1024,
         historyRead: { history, isAvailable: () => true }
       }
     });
@@ -271,10 +294,9 @@ for (const kind of ['memory', 'jsonl']) {
       idempotencyKey: 'transition',
       reason: 'Use note and retrieve originals',
       selection: {
-        strategy: 'notes',
+        strategy: 'sources',
         retained: [],
-        notes: [{ scope, noteId: 'entry', revisionId: note.revision.revisionId }],
-        omitted: [{ fromEntryId: first.id, toEntryId: first.id, reason: 'Retrievable original' }]
+        notes: [{ scope, noteId: 'entry', revisionId: note.revision.revisionId }]
       }
     };
     const transition = await service.transition(request);
@@ -283,15 +305,18 @@ for (const kind of ['memory', 'jsonl']) {
       runId: 'two',
       task: 'later correction must survive'
     });
-    const view = await history.view();
-    assert.equal(view.contextWindow.windowId, transition.window.windowId);
+    const view = await history.page();
+    assert.equal((await history.selectedContext()).windowId, transition.window.windowId);
     assert.ok(view.entries.some((entry) => entry.id === later.id));
-    assert.equal((await history.read({ source: sourceRef(session.id, first) })).status, 'available');
+    assert.equal(
+      (await history.read({ source: sourceRef(session.id, first) })).status,
+      'available'
+    );
     await assert.rejects(service.transition({ ...request, idempotencyKey: 'stale' }), /stale/u);
     const tiny = new ContextService({
       repository: sessions,
       session,
-      bootstrap: { validate: async () => {}, maxBytes: 1, selfContained: true }
+      policy: { maxSourceBytes: 1 }
     });
     await assert.rejects(
       tiny.transition({
@@ -299,15 +324,14 @@ for (const kind of ['memory', 'jsonl']) {
         idempotencyKey: 'oversized',
         reason: 'test',
         selection: {
-          strategy: 'retain',
+          strategy: 'sources',
           retained: view.entries.map((entry) => sourceRef(session.id, entry)),
-          notes: [],
-          omitted: []
+          notes: []
         }
       }),
-      /byte budget/u
+      /byte (?:budget|limit)/u
     );
-    assert.equal((await history.view()).contextWindow.windowId, transition.window.windowId);
+    assert.equal((await history.selectedContext()).windowId, transition.window.windowId);
   });
 }
 
@@ -330,7 +354,7 @@ for (const kind of ['memory', 'jsonl']) {
     });
     const history = new HistoryReader({ repository: sessions, session, events });
     const cut = await history.capture();
-    const view = await history.view(cut);
+    const view = await history.page({ cut });
     const answer = view.entries.find((entry) => entry.type === 'assistant');
     assert.equal(answer.content, 'committed partial answer');
     assert.equal(answer.completeness, 'partial');
@@ -341,14 +365,20 @@ for (const kind of ['memory', 'jsonl']) {
       type: 'assistant.ended',
       ...identity,
       content: 'later settled answer',
-      modelOutput: { status: 'complete', message: 'later settled answer', source: 'content', turnIndex: 1 }
+      modelOutput: {
+        status: 'complete',
+        message: 'later settled answer',
+        source: 'content',
+        turnIndex: 1
+      }
     });
     assert.equal((await history.read({ source, cut })).item.text, 'committed partial answer');
-    const latest = await history.view();
+    const latest = await history.page();
     assert.equal(latest.entries.filter((entry) => entry.type === 'assistant').length, 2);
     assert.equal(
-      latest.entries.find((entry) => entry.type === 'assistant' && entry.completeness === 'complete')
-        .content,
+      latest.entries.find(
+        (entry) => entry.type === 'assistant' && entry.completeness === 'complete'
+      ).content,
       'later settled answer'
     );
     await sessions.appendAssistant(session, {
@@ -357,7 +387,7 @@ for (const kind of ['memory', 'jsonl']) {
       content: 'later settled answer'
     });
     assert.equal(
-      (await history.view()).entries.filter((entry) => entry.type === 'assistant').length,
+      (await history.page()).entries.filter((entry) => entry.type === 'assistant').length,
       2,
       'mirror cannot duplicate authoritative output'
     );
@@ -381,31 +411,37 @@ test('context validation releases the session queue and accepted queued input ma
   const context = new ContextService({
     repository: sessions,
     session,
-    bootstrap: {
-      maxBytes: 8192,
-      async validate() {
-        entered();
-        await gate;
-      }
-    }
+    policy: { maxSourceBytes: 8192 }
   });
   const agent = new AgentSession({
     descriptor: session,
     expectedBinding: binding,
     repository: sessions,
     context,
-    runs: new AgentRunCoordinator(new InMemoryEventRepository(agentEventCodec)),
+    runs: new AgentRunCoordinator(
+      new InMemoryEventRepository(agentEventCodec),
+      new InMemoryArtifactRepository()
+    ),
     configuration: { provider: 'test', model: 'test' },
     createRuntime() {
       throw new Error('No runtime needed');
     }
   });
-  const changing = agent.transitionContext({
-    expectedWindowId: null,
-    idempotencyKey: 'pending',
-    reason: 'capture',
-    selection: { strategy: 'retain', retained: [sourceRef(session.id, first)], notes: [], omitted: [] }
-  });
+  const changing = context.transition(
+    {
+      expectedWindowId: null,
+      idempotencyKey: 'pending',
+      reason: 'capture',
+      selection: { strategy: 'sources', retained: [sourceRef(session.id, first)], notes: [] }
+    },
+    {
+      admit: async () => {
+        entered();
+        await gate;
+        return { compiledInputIdentity: 'captured-request', capabilityRevision: 'fixture' };
+      }
+    }
+  );
   await ready;
   assert.equal(
     await agent.abort('No active run'),
@@ -419,7 +455,7 @@ test('context validation releases the session queue and accepted queued input ma
     configuration: { provider: 'test', model: 'test' }
   });
   release();
-  await assert.rejects(changing, /stale/u);
+  await assert.rejects(changing, /boundary changed/u);
   assert.equal((await sessions.loadReplayState(session)).contextWindow, undefined);
 });
 
@@ -432,18 +468,16 @@ test('context requires available scoped retrieval before omissions and checks ex
   await sessions.recordRunFinalization(session, terminal('one'));
   const history = new HistoryReader({ repository: sessions, session });
   const selection = {
-    strategy: 'notes',
+    strategy: 'sources',
     retained: [],
-    notes: [],
-    omitted: [{ fromEntryId: first.id, toEntryId: first.id, reason: 'retrieve' }]
+    notes: []
   };
   const unavailable = new ContextService({
     repository: sessions,
     session,
     history,
-    bootstrap: {
-      validate: async () => {},
-      maxBytes: 8192,
+    policy: {
+      maxSourceBytes: 8192,
       historyRead: { history, isAvailable: () => false }
     }
   });
@@ -466,9 +500,8 @@ test('context requires available scoped retrieval before omissions and checks ex
     session,
     history,
     notes,
-    bootstrap: {
-      validate: async () => {},
-      maxBytes: 8192,
+    policy: {
+      maxSourceBytes: 8192,
       historyRead: { history, isAvailable: () => true }
     }
   });
@@ -528,7 +561,10 @@ test('small UTF-8 ranges fail explicitly instead of returning an endless empty c
   const session = await sessions.create({ binding });
   const entry = await sessions.appendInput(session, { runId: 'run', task: '改正😀' });
   const history = new HistoryReader({ repository: sessions, session });
-  await assert.rejects(history.read({ source: sourceRef(session.id, entry), maxBytes: 1 }), /UTF-8/u);
+  await assert.rejects(
+    history.read({ source: sourceRef(session.id, entry), maxBytes: 1 }),
+    /UTF-8/u
+  );
   const range = await history.read({ source: sourceRef(session.id, entry), maxBytes: 4 });
   assert.equal(range.item.text, '改');
   assert.equal(range.nextOffset, 3);
@@ -537,22 +573,26 @@ test('small UTF-8 ranges fail explicitly instead of returning an endless empty c
 test('JSONL restart observes committed notes/windows and rejects incompatible session format without rewriting data', async () => {
   const { root, sessions, notes, artifacts } = await backend('jsonl');
   const session = await sessions.create({ id: scope.sessionId, binding });
-  const entry = await sessions.appendInput(session, { runId: 'run', task: 'retained across restart' });
+  const entry = await sessions.appendInput(session, {
+    runId: 'run',
+    task: 'retained across restart'
+  });
   const written = await notes.write(writeRequest());
   const context = new ContextService({
     repository: sessions,
     session,
-    bootstrap: { validate: async () => {}, maxBytes: 8192 }
+    policy: { maxSourceBytes: 8192 }
   });
   const committed = await context.transition({
     expectedWindowId: null,
     idempotencyKey: 'restart',
     reason: 'restart',
-    selection: { strategy: 'retain', retained: [sourceRef(session.id, entry)], notes: [], omitted: [] }
+    selection: { strategy: 'sources', retained: [sourceRef(session.id, entry)], notes: [] }
   });
   const reopened = new JsonlSessionRepository(path.join(root, 'sessions'));
   assert.equal(
-    (await reopened.loadReplayState(await reopened.open(session.id, binding))).contextWindow.windowId,
+    (await reopened.loadReplayState(await reopened.open(session.id, binding))).contextWindow
+      .windowId,
     committed.window.windowId
   );
   const reopenedNotes = new JsonlNoteRepository({ rootDir: path.join(root, 'notes'), artifacts });
@@ -580,13 +620,13 @@ test('tool factories bind effects to host scope and context handlers schedule wi
     repository: sessions,
     session,
     history,
-    bootstrap: {
-      validate: async () => {},
-      maxBytes: 8192,
-      async schedule(request) {
-        scheduled.push(request);
-        return { requestId: request.idempotencyKey };
-      }
+    policy: { maxSourceBytes: 8192 }
+  });
+  context.bindRuntime({
+    providerTransform: false,
+    async schedule(request) {
+      scheduled.push(request);
+      return { requestId: request.idempotencyKey };
     }
   });
   assert.deepEqual(
@@ -602,8 +642,7 @@ test('tool factories bind effects to host scope and context handlers schedule wi
       title: 'note',
       mediaType: 'text/plain',
       content: 'model hypothesis',
-      expectedRevision: null,
-      idempotencyKey: 'key'
+      expectedRevision: null
     }
   });
   assert.equal(decoded.ok, true);
@@ -617,7 +656,8 @@ test('tool factories bind effects to host scope and context handlers schedule wi
   const result = await (await write.bindExecution(canonical, {})).invoke(toolContext);
   assert.equal(result.output.status, 'committed');
   assert.equal(
-    (await (await write.bindExecution(canonical, {})).invoke(toolContext)).output.revision.revisionId,
+    (await (await write.bindExecution(canonical, {})).invoke(toolContext)).output.revision
+      .revisionId,
     result.output.revision.revisionId
   );
   assert.equal(
@@ -631,15 +671,15 @@ test('tool factories bind effects to host scope and context handlers schedule wi
   const decodedTransition = tool.decodeInput({
     kind: 'json',
     value: {
-      expectedWindowId: null,
-      idempotencyKey: 'scheduled',
       reason: 'test',
-      selection: { strategy: 'retain', retained: [], notes: [], omitted: [] }
+      selection: { strategy: 'sources', retained: [], notes: [] }
     }
   });
-  await (await tool.bindExecution(await tool.canonicalizeInput(decodedTransition.input, {}), {})).invoke(toolContext);
+  await (
+    await tool.bindExecution(await tool.canonicalizeInput(decodedTransition.input, {}), {})
+  ).invoke(toolContext);
   assert.equal(scheduled.length, 1);
-  assert.equal((await history.view()).contextWindow, undefined);
+  assert.equal(await history.selectedContext(), undefined);
 });
 
 test('note artifact reservations survive a failed store and prevent quota bypass on restart', async () => {
@@ -692,7 +732,10 @@ test('a crash between session fork and note fork restores the pinned parent revi
     expectedBinding: binding,
     repository: restartedSessions,
     notes: restartedNotes,
-    runs: new AgentRunCoordinator(new InMemoryEventRepository(agentEventCodec)),
+    runs: new AgentRunCoordinator(
+      new InMemoryEventRepository(agentEventCodec),
+      new InMemoryArtifactRepository()
+    ),
     configuration: { provider: 'test', model: 'test' },
     createRuntime() {
       throw new Error('No run');
@@ -764,8 +807,8 @@ test('rebuildable lexical index reports partial coverage and scans new source id
   await sessions.appendInput(session, { runId: 'three', task: 'new gamma correction' });
   const fresh = await history.search({ query: 'gamma' });
   assert.equal(fresh.items.length, 1);
-  assert.equal(fresh.index.coverage, 'partial');
-  assert.equal(fresh.coverage, 'complete', 'bounded source fallback covers the stale index tail');
+  assert.equal(fresh.index.coverage, 'complete');
+  assert.equal(fresh.coverage, 'complete', 'incremental refresh includes the new source');
 });
 
 test('original accepted whitespace and relationship survive JSONL restart independently of scheduling', async () => {
@@ -824,7 +867,7 @@ test('assistant media bytes persist losslessly and protocol payloads stay out of
   const view = await new HistoryReader({
     repository: reopened,
     session: await reopened.open(session.id, binding)
-  }).view();
+  }).page();
   const image = view.entries.find((item) => item.type === 'assistant').output[0].part.image;
   assert.equal(image.type, 'base64');
   assert.deepEqual([...Buffer.from(image.data, 'base64')], [1, 2, 3, 4]);
@@ -844,29 +887,23 @@ test('assistant media bytes persist losslessly and protocol payloads stay out of
   );
 });
 
-test('every transition needs request-fit validation and active input/tool-result dependencies cannot be omitted', async () => {
+test('active accepted input and tool-result dependencies cannot be omitted', async () => {
   const sessions = new InMemorySessionRepository();
   const session = await sessions.create({ binding });
-  assert.throws(
-    () =>
-      new ContextService({
-        repository: sessions,
-        session,
-        bootstrap: { maxBytes: 8192, selfContained: true }
-      }),
-    /request-fit validation/u
-  );
-  const input = await sessions.appendInput(session, { runId: 'run', task: 'mandatory current task' });
+  const input = await sessions.appendInput(session, {
+    runId: 'run',
+    task: 'mandatory current task'
+  });
   const observation = await sessions.appendObservation(session, {
     runId: 'run',
     identity: { ...identity, toolBatchId: 'batch', callIndex: 0, callId: 'call', toolAttempt: 1 },
     toolName: 'read',
-    observation: { ok: true, summary: 'result' }
+    observation: { kind: 'result', summary: 'result', output: {} }
   });
   const context = new ContextService({
     repository: sessions,
     session,
-    bootstrap: { validate: async () => {}, maxBytes: 8192, selfContained: true }
+    policy: { maxSourceBytes: 8192 }
   });
   await assert.rejects(
     context.transition({
@@ -874,10 +911,9 @@ test('every transition needs request-fit validation and active input/tool-result
       idempotencyKey: 'orphan',
       reason: 'test',
       selection: {
-        strategy: 'retain',
+        strategy: 'sources',
         retained: [sourceRef(session.id, input), sourceRef(session.id, observation)],
-        notes: [],
-        omitted: []
+        notes: []
       }
     }),
     /no matching original call/u
@@ -888,20 +924,22 @@ test('every transition needs request-fit validation and active input/tool-result
       idempotencyKey: 'omit-active',
       reason: 'test',
       selection: {
-        strategy: 'notes',
+        strategy: 'sources',
         retained: [],
-        notes: [],
-        omitted: [{ fromEntryId: input.id, toEntryId: observation.id, reason: 'cannot omit active input' }]
+        notes: []
       }
     }),
-    /active accepted input is mandatory/u
+    /active accepted or protected input is mandatory/u
   );
 });
 
 test('native context selection binds only validated host state and rejects caller-supplied state', async () => {
   const sessions = new InMemorySessionRepository();
   const session = await sessions.create({ binding });
-  const input = await sessions.appendInput(session, { runId: 'run', task: 'original native input' });
+  const input = await sessions.appendInput(session, {
+    runId: 'run',
+    task: 'original native input'
+  });
   await sessions.recordRunFinalization(session, terminal('run'));
   const state = {
     artifact: { id: 'host-validated-artifact', sha256: 'a'.repeat(64) },
@@ -910,13 +948,12 @@ test('native context selection binds only validated host state and rejects calle
   const context = new ContextService({
     repository: sessions,
     session,
-    bootstrap: { maxBytes: 8192, selfContained: true, validate: async () => ({ providerState: state }) }
+    policy: { maxSourceBytes: 8192 }
   });
   const selection = {
     strategy: 'provider',
     retained: [sourceRef(session.id, input)],
-    notes: [],
-    omitted: []
+    notes: []
   };
   await assert.rejects(
     context.transition({
@@ -927,12 +964,21 @@ test('native context selection binds only validated host state and rejects calle
     }),
     /governed host validation/u
   );
-  const committed = await context.transition({
-    expectedWindowId: null,
-    idempotencyKey: 'native',
-    reason: 'test',
-    selection
-  });
+  const committed = await context.transition(
+    {
+      expectedWindowId: null,
+      idempotencyKey: 'native',
+      reason: 'test',
+      selection
+    },
+    {
+      admit: async () => ({
+        compiledInputIdentity: 'native-request',
+        capabilityRevision: 'fixture',
+        providerState: state
+      })
+    }
+  );
   state.artifact.id = 'mutated';
   assert.equal(committed.window.selection.providerState.artifact.id, 'host-validated-artifact');
   assert.equal(Object.isFrozen(committed.window.selection.providerState.artifact), true);
@@ -952,14 +998,19 @@ test('ledger source refs survive delayed mirrors and event heads decide transiti
     type: 'assistant.ended',
     ...identity,
     content: 'committed before mirror',
-    modelOutput: { status: 'complete', message: 'committed before mirror', source: 'content', turnIndex: 1 }
+    modelOutput: {
+      status: 'complete',
+      message: 'committed before mirror',
+      source: 'content',
+      turnIndex: 1
+    }
   });
   const reader = new HistoryReader({ repository: sessions, session, events });
-  const captured = await reader.view();
+  const captured = await reader.page();
   const answer = captured.entries.find((entry) => entry.type === 'assistant');
   const source = sourceRef(session.id, answer);
   assert.equal(
-    historySourceAfterCut(captured, answer, captured.cut),
+    await sourceAfter(reader, answer, captured.cut),
     false,
     'a missing mirror is still covered by the captured ledger head'
   );
@@ -968,7 +1019,12 @@ test('ledger source refs survive delayed mirrors and event heads decide transiti
     identity,
     content: answer.content,
     completeness: 'complete',
-    source: { runId: 'run', eventId: receipt.eventId, sequence: receipt.sequence, hash: receipt.hash }
+    source: {
+      runId: 'run',
+      eventId: receipt.eventId,
+      sequence: receipt.sequence,
+      hash: receipt.hash
+    }
   });
   const plain = new HistoryReader({ repository: sessions, session });
   assert.equal((await plain.read({ source })).item.text, answer.content);
@@ -981,10 +1037,10 @@ test('ledger source refs survive delayed mirrors and event heads decide transiti
     content: 'new tail',
     modelOutput: { status: 'complete', message: 'new tail', source: 'content', turnIndex: 2 }
   });
-  const latest = await reader.view();
+  const latest = await reader.page();
   assert.equal(
-    historySourceAfterCut(
-      latest,
+    await sourceAfter(
+      reader,
       latest.entries.find((entry) => entry.type === 'assistant' && entry.turnId === 'next-turn'),
       captured.cut
     ),
@@ -1003,7 +1059,7 @@ for (const kind of ['memory', 'jsonl']) {
       content: '  corrected identifier  '
     });
     const reader = new HistoryReader({ repository: sessions, session, events });
-    const before = await reader.view();
+    const before = await reader.page();
     const source = sourceRef(
       session.id,
       before.entries.find((entry) => entry.type === 'steering')
@@ -1032,12 +1088,12 @@ for (const kind of ['memory', 'jsonl']) {
       session: await sessions.open(session.id, binding),
       events
     });
-    const after = await reopened.view();
+    const after = await reopened.page();
     const steering = after.entries.filter((entry) => entry.type === 'steering');
     assert.equal(steering.length, 1);
     assert.deepEqual(sourceRef(session.id, steering[0]), source);
     assert.deepEqual(steering[0].originalInput, originalInput);
-    assert.equal(historySourceAfterCut(after, steering[0], before.cut), false);
+    assert.equal(await sourceAfter(reopened, steering[0], before.cut), false);
     assert.match((await reopened.read({ source })).item.text, /corrected identifier/u);
   });
 
@@ -1059,20 +1115,28 @@ for (const kind of ['memory', 'jsonl']) {
       runId: 'run',
       identity,
       content: 'late source',
-      source: { runId: 'run', eventId: receipt.eventId, sequence: receipt.sequence, hash: receipt.hash }
+      source: {
+        runId: 'run',
+        eventId: receipt.eventId,
+        sequence: receipt.sequence,
+        hash: receipt.hash
+      }
     });
-    const view = await reader.view();
+    const view = await reader.page();
     const assistant = view.entries.find((entry) => entry.type === 'assistant');
-    assert.equal(historySourceAfterCut(view, assistant, openCut), true);
-    assert.equal(historySourceAfterCut(view, assistant, finalizedCut), true);
+    assert.equal(await sourceAfter(reader, assistant, openCut), true);
+    assert.equal(await sourceAfter(reader, assistant, finalizedCut), true);
     const { ledgerHeads, ...noLedgerCut } = openCut;
-    assert.equal(historySourceAfterCut(view, assistant, noLedgerCut), true);
+    assert.equal(await sourceAfter(reader, assistant, noLedgerCut), true);
   });
 
   test(`${kind}: canonical tool arguments retain content beyond normalization limits`, async () => {
     const { sessions } = await backend(kind);
     const session = await sessions.create({ binding });
-    await sessions.appendInput(session, { runId: 'run', task: 'read complete tool arguments later' });
+    await sessions.appendInput(session, {
+      runId: 'run',
+      task: 'read complete tool arguments later'
+    });
     const text = `${'x'.repeat(100000)} exact final constraint`;
     const call = await sessions.appendToolCall(session, {
       runId: 'run',
@@ -1086,20 +1150,172 @@ for (const kind of ['memory', 'jsonl']) {
   });
 }
 
-test('context discovery advertises native strategy only when the host currently supports it', async () => {
+test('context discovery advertises provider transformation only while a capable runtime is bound', async () => {
   const sessions = new InMemorySessionRepository();
   const session = await sessions.create({ binding });
-  let available = false;
   const context = new ContextService({
     repository: sessions,
     session,
-    bootstrap: {
-      maxBytes: 8192,
-      validate: async () => undefined,
-      providerStrategyAvailable: async () => available
-    }
+    policy: { maxSourceBytes: 8192 }
   });
-  assert.deepEqual((await context.inspect()).legalTransitions, ['retain']);
-  available = true;
-  assert.deepEqual((await context.inspect()).legalTransitions, ['retain', 'provider']);
+  assert.deepEqual((await context.inspect()).legalTransitions, ['sources']);
+  const unbind = context.bindRuntime({
+    providerTransform: true,
+    schedule: async () => ({ requestId: 'request' })
+  });
+  assert.deepEqual((await context.inspect()).legalTransitions, ['sources', 'provider']);
+  unbind();
+  assert.deepEqual((await context.inspect()).legalTransitions, ['sources']);
+});
+
+async function sourceAfter(reader, source, cut) {
+  let page = await reader.entriesAfter(cut);
+  for (;;) {
+    if (
+      page.entries.some(
+        (entry) => (entry.source?.eventId ?? entry.id) === (source.source?.eventId ?? source.id)
+      )
+    )
+      return true;
+    if (!page.cursor) return false;
+    page = await reader.entriesAfter(cut, page.cut, { cursor: page.cursor });
+  }
+}
+
+for (const kind of ['memory', 'jsonl']) {
+  test(`${kind}: warm notes refresh only new records and old revision dependencies remain exact`, async (t) => {
+    const { EventNoteRepository, noteEventCodec } = await import('@agent-core/runtime');
+    const root = await mkdtemp(path.join(tmpdir(), 'incremental-notes-'));
+    t.after(async () => {
+      const { rm } = await import('node:fs/promises');
+      await rm(root, { recursive: true, force: true });
+    });
+    let decoded = 0;
+    const codec = {
+      encode: noteEventCodec.encode,
+      decode(value) {
+        decoded++;
+        return noteEventCodec.decode(value);
+      }
+    };
+    const events =
+      kind === 'memory'
+        ? new InMemoryEventRepository(codec)
+        : new JsonlEventRepository({ rootDir: root, codec });
+    events.read = () => {
+      throw new Error('Notes must not replay their stream.');
+    };
+    const notes = new EventNoteRepository({ events, artifacts: new InMemoryArtifactRepository() });
+    let revision;
+    for (let at = 0; at < 80; at++) {
+      const result = await notes.write(
+        writeRequest({
+          noteId: `note-${at}`,
+          content: `original ${at}`,
+          idempotencyKey: `create-${at}`
+        })
+      );
+      if (at === 0) revision = result.revision;
+    }
+    await notes.list({ scope });
+    const before = decoded;
+    const changed = await notes.write(
+      writeRequest({
+        noteId: revision.noteId,
+        expectedRevision: revision.revisionId,
+        content: 'new text',
+        idempotencyKey: 'update'
+      })
+    );
+    await notes.list({ scope });
+    assert.equal(decoded - before, 2, 'only reservation and commit are decoded after one write');
+    await notes.remove({
+      scope,
+      noteId: revision.noteId,
+      expectedRevision: changed.revision.revisionId,
+      authorId: 'model',
+      invocationId: 'delete',
+      idempotencyKey: 'delete'
+    });
+    const original = await notes.read({
+      scope,
+      noteId: revision.noteId,
+      revisionId: revision.revisionId
+    });
+    assert.equal(original.status, 'available');
+    assert.equal(original.text, 'original 0');
+    assert.deepEqual(original.revision, revision);
+    assert.equal((await notes.read({ scope, noteId: revision.noteId })).status, 'tombstone');
+    const first = await notes.search({
+      scope,
+      query: 'original',
+      limit: 2,
+      maxScanned: 3,
+      maxScannedBytes: 4096
+    });
+    assert(first.scannedBytes <= 4096);
+    await notes.write(
+      writeRequest({ noteId: 'ahead', content: 'original after cut', idempotencyKey: 'late' })
+    );
+    const continuation = await notes.search({
+      scope,
+      query: 'original',
+      cursor: first.cursor,
+      limit: 2,
+      maxScanned: 3,
+      maxScannedBytes: 4096
+    });
+    assert.equal(continuation.watermark, first.watermark);
+    assert(!continuation.items.some((note) => note.noteId === 'ahead'));
+  });
+}
+
+test('history direct lookup, cut capture and bounded search do not call replay', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'incremental-history-'));
+  t.after(async () => {
+    const { rm } = await import('node:fs/promises');
+    await rm(root, { recursive: true, force: true });
+  });
+  const sessions = new JsonlSessionRepository(root);
+  const session = await sessions.create({ id: 'bounded', binding });
+  const entries = [];
+  for (let at = 0; at < 120; at++)
+    entries.push(
+      await sessions.appendInput(session, { runId: `run-${at}`, task: `${at} ${'z'.repeat(2048)}` })
+    );
+  sessions.loadReplayState = () => {
+    throw new Error('History must not load replay state.');
+  };
+  const history = new HistoryReader({ repository: sessions, session });
+  const cut = await history.capture();
+  const before = sessions.historyReadMetrics(session.id);
+  await history.capture();
+  assert.equal(sessions.historyReadMetrics(session.id).bodyRecordsRead, before.bodyRecordsRead);
+  const source = sourceRef(session.id, entries[70]);
+  const read = await history.read({ source, cut, maxBytes: 100, maxSourceBytes: 4096 });
+  assert.equal(read.status, 'available');
+  assert.equal(sessions.historyReadMetrics(session.id).bodyRecordsRead - before.bodyRecordsRead, 1);
+  const beforeSearch = sessions.historyReadMetrics(session.id);
+  const result = await history.search({
+    query: 'absent',
+    cut,
+    maxScanned: 5,
+    maxScannedBytes: 8192
+  });
+  const afterSearch = sessions.historyReadMetrics(session.id);
+  assert(afterSearch.bodyRecordsRead - beforeSearch.bodyRecordsRead <= 5);
+  assert(afterSearch.bodyBytesRead - beforeSearch.bodyBytesRead <= 8192);
+  assert.equal(result.scannedBytes, afterSearch.bodyBytesRead - beforeSearch.bodyBytesRead);
+  const oversized = await history.read({ source, maxSourceBytes: 100 });
+  assert.equal(oversized.reason, 'source_too_large');
+  assert.equal(
+    sessions.historyReadMetrics(session.id).bodyRecordsRead,
+    afterSearch.bodyRecordsRead
+  );
+  const filtered = await history.search({ filter: { sourceType: 'observation' }, maxScanned: 5 });
+  assert.equal(filtered.scanned, 5);
+  assert.equal(
+    sessions.historyReadMetrics(session.id).bodyRecordsRead,
+    afterSearch.bodyRecordsRead
+  );
 });

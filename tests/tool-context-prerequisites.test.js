@@ -31,18 +31,19 @@ test('host guidance is presented before a mutation without using its tool output
         snapshot: { ...input, authorization: 'exact-prepared-authority' },
         async invoke() {
           mutations++;
-          return { kind: 'result', ok: true, summary: 'Written.', scope: { resources: ['value'], coverage: 'complete' }, output: { written: input.value } };
+          return {
+            kind: 'result',
+            execution: { state: 'settled' },
+            summary: 'Written.',
+            scope: { resources: ['value'], coverage: 'complete' },
+            output: { written: input.value }
+          };
         }
       };
     },
-    presentObservation({ observation }) {
+    buildModelContent({ observation }) {
       assert.equal(observation.output.written, 'new');
-      return {
-        ok: true,
-        title: 'Written value',
-        summary: 'Written.',
-        results: { written: observation.output.written }
-      };
+      return [{ type: 'text', text: observation.summary }];
     }
   });
   const call = (id) => ({

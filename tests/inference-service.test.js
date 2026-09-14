@@ -4,12 +4,14 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
+import { ModelProviderError } from '@agent-core/model';
 import {
   AgentRuntime,
   agentEventCodec,
   InferenceService,
   InMemoryInferenceRepository,
   InferenceOutcomeUnknownError,
+  InferenceContextRejectedError,
   InferenceBudgetExceededError
 } from '@agent-core/runtime';
 import { JsonlInferenceRepository } from '@agent-core/runtime/node';
@@ -75,7 +77,12 @@ test('classification uses durable invocation without a session, workflow, checks
     assert.equal(request.messages.length, 2);
     return response(request);
   });
-  const service = new InferenceService({ provider, repository, artifacts, budget: { maxInvocations: 1 } });
+  const service = new InferenceService({
+    provider,
+    repository,
+    artifacts,
+    budget: { maxInvocations: 1 }
+  });
   const first = await service.invoke(input());
   assert.deepEqual(JSON.parse(first.response.content), { category: 'inquiry' });
   const replay = await new InferenceService({
@@ -171,9 +178,12 @@ test('unavailable provider outcome survives repository reopen and preserves rese
       throw new Error('disconnect');
     });
     await assert.rejects(
-      new InferenceService({ provider, repository, artifacts, budget: { maxInvocations: 1 } }).invoke(
-        input()
-      ),
+      new InferenceService({
+        provider,
+        repository,
+        artifacts,
+        budget: { maxInvocations: 1 }
+      }).invoke(input()),
       InferenceOutcomeUnknownError
     );
     const reopened = new InferenceService({
@@ -208,7 +218,10 @@ test('aborting before admission consumes no invocation and auxiliary inference r
   );
   assert.equal((await repository.load('work')).invocations.size, 0);
   assert.equal(calls, 0);
-  assert.throws(() => new InferenceService({ provider }), /explicit invocation and artifact repositories/);
+  assert.throws(
+    () => new InferenceService({ provider }),
+    /explicit invocation and artifact repositories/
+  );
 });
 
 test('primary runtime requests and auxiliary verification consume the same durable owner allowance', async () => {
@@ -219,7 +232,12 @@ test('primary runtime requests and auxiliary verification consume the same durab
   });
   const repository = new InMemoryInferenceRepository();
   const artifacts = new InMemoryArtifactRepository();
-  const service = new InferenceService({ provider, repository, artifacts, budget: { maxInvocations: 1 } });
+  const service = new InferenceService({
+    provider,
+    repository,
+    artifacts,
+    budget: { maxInvocations: 1 }
+  });
   const events = new InMemoryEventRepository(agentEventCodec);
   const runtime = new AgentRuntime({
     provider,
@@ -229,7 +247,8 @@ test('primary runtime requests and auxiliary verification consume the same durab
     repositories: { events, artifacts },
     toolBoundary: { authorizationPolicyId: 'none', executionTargetId: 'none' }
   });
-  const result = await runtime.run({ runId: 'shared-owner', task: 'Produce the primary result.' }).result;
+  const result = await runtime.run({ runId: 'shared-owner', task: 'Produce the primary result.' })
+    .result;
   assert.equal(result.state, 'ended');
   assert.equal(result.terminal.executionStatus, 'completed');
   await assert.rejects(
@@ -264,7 +283,10 @@ test('durable output replay preserves binary media and provider protocol ownersh
   const replay = await new InferenceService({ provider, repository, artifacts }).invoke(input());
   assert.equal(calls, 1);
   assert.deepEqual(replay.response.output, first.response.output);
-  assert.deepEqual([...Buffer.from(replay.response.output[0].part.image.data, 'base64')], [0, 127, 255]);
+  assert.deepEqual(
+    [...Buffer.from(replay.response.output[0].part.image.data, 'base64')],
+    [0, 127, 255]
+  );
 });
 
 test('known monetary spend persists before later admission rejects and unknown prices remain explicit', async () => {
@@ -292,7 +314,9 @@ test('known monetary spend persists before later admission rejects and unknown p
   assert.equal(settled.cost.status, 'known');
   assert.ok(Math.abs(settled.cost.amount - 0.0004) < 1e-12);
   assert.ok(
-    Math.abs((await repository.load('work')).invocations.get('one').settlement.cost.amount - 0.0004) < 1e-12
+    Math.abs(
+      (await repository.load('work')).invocations.get('one').settlement.cost.amount - 0.0004
+    ) < 1e-12
   );
   await assert.rejects(
     service.invoke(input('after')),
@@ -317,7 +341,12 @@ test('fencing rejection before dispatch durably releases the owning reservation'
     calls++;
     return response(request);
   });
-  const service = new InferenceService({ provider, repository, artifacts, budget: { maxInvocations: 1 } });
+  const service = new InferenceService({
+    provider,
+    repository,
+    artifacts,
+    budget: { maxInvocations: 1 }
+  });
   await assert.rejects(
     service.invokeWithLifecycle(
       { request: input().request, profile, session: { complete: provider.complete }, turnIndex: 0 },
@@ -437,21 +466,43 @@ test('precompiled input is admitted before any invocation or external effect is 
   const { compileModelRequest } = await import('@agent-core/model');
   let calls = 0;
   let starts = 0;
-  const provider = fixture(async (request) => { calls++; return response(request); });
+  const provider = fixture(async (request) => {
+    calls++;
+    return response(request);
+  });
   const repository = new InMemoryInferenceRepository();
-  const service = new InferenceService({ provider, repository, artifacts: new InMemoryArtifactRepository() });
+  const service = new InferenceService({
+    provider,
+    repository,
+    artifacts: new InMemoryArtifactRepository()
+  });
   const request = { model: profile.id, messages: [{ role: 'user', content: 'Hello' }] };
   for (const policy of [{}, { outputReservation: 100_000 }]) {
-    const compiled = await compileModelRequest({ request, profile, body: request, endpoint: 'fixture', ...policy });
-    await assert.rejects(service.invokeWithLifecycle(
-      { request, compiled, profile, session: service.createSession(), turnIndex: 1 },
-      {
-        async start() { starts++; },
-        async settle() { assert.fail('Rejected input cannot settle'); },
-        async uncertain() { assert.fail('Admission failure is not an unknown provider outcome'); }
-      },
-      input()
-    ), /admission limits/);
+    const compiled = await compileModelRequest({
+      request,
+      profile,
+      body: request,
+      endpoint: 'fixture',
+      ...policy
+    });
+    await assert.rejects(
+      service.invokeWithLifecycle(
+        { request, compiled, profile, session: service.createSession(), turnIndex: 1 },
+        {
+          async start() {
+            starts++;
+          },
+          async settle() {
+            assert.fail('Rejected input cannot settle');
+          },
+          async uncertain() {
+            assert.fail('Admission failure is not an unknown provider outcome');
+          }
+        },
+        input()
+      ),
+      /admission limits/
+    );
   }
   assert.equal(starts, 0);
   assert.equal(calls, 0);
@@ -465,22 +516,36 @@ test('runtime reserves Codex output without sending an unsupported generation co
   const token = `test.${Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'offline-test' } })).toString('base64url')}.test`;
   const requests = [];
   const provider = new OpenAICodexProvider({
-    auth: { type: 'bearer', tokenProvider: {
-      describe: () => ({ type: 'oauth', label: 'offline test', provider: 'openai-codex' }),
-      async getBearerToken() { return { token }; }
-    } },
+    auth: {
+      type: 'bearer',
+      tokenProvider: {
+        describe: () => ({ type: 'oauth', label: 'offline test', provider: 'openai-codex' }),
+        async getBearerToken() {
+          return { token };
+        }
+      }
+    },
     async fetch(_url, init) {
       const body = JSON.parse(init.body);
       requests.push(body);
       assert.equal('max_output_tokens' in body, false);
-      return new Response(`data: ${JSON.stringify({ type: 'response.completed', response: { id: 'first-response', model: body.model, status: 'completed', output_text: 'Hello.', output: [] } })}\n\n`, { headers: { 'Content-Type': 'text/event-stream' } });
+      return new Response(
+        `data: ${JSON.stringify({ type: 'response.completed', response: { id: 'first-response', model: body.model, status: 'completed', output_text: 'Hello.', output: [] } })}\n\n`,
+        { headers: { 'Content-Type': 'text/event-stream' } }
+      );
     }
   });
   const repository = new InMemoryInferenceRepository();
-  const service = new InferenceService({ provider, repository, artifacts: new InMemoryArtifactRepository() });
+  const service = new InferenceService({
+    provider,
+    repository,
+    artifacts: new InMemoryArtifactRepository()
+  });
   for (const maxOutputTokens of [undefined, 777]) {
     const runtime = new AgentRuntime({
-      provider, model: 'gpt-5.6-luna', inferenceService: service,
+      provider,
+      model: 'gpt-5.6-luna',
+      inferenceService: service,
       repositories: { events: new InMemoryEventRepository(agentEventCodec) },
       toolBoundary: { authorizationPolicyId: 'none', executionTargetId: 'none' },
       ...(maxOutputTokens === undefined ? {} : { maxOutputTokens })
@@ -504,14 +569,22 @@ test('interrupted provider output preserves the cause and partial text without r
   let calls = 0;
   const provider = {
     ...fixture(async () => assert.fail('stream required')),
-    describeModel: async () => ({ ...profile, capabilities: { ...profile.capabilities, streaming: true } }),
+    describeModel: async () => ({
+      ...profile,
+      capabilities: { ...profile.capabilities, streaming: true }
+    }),
     async *stream() {
       calls++;
       yield { type: 'content', content: 'Partial answer', accumulated: 'Partial answer' };
       throw new Error('Connection closed while reading the response');
     }
   };
-  const runtime = new AgentRuntime({ provider, model: profile.id, onProgress: event => { events.push(event); },
+  const runtime = new AgentRuntime({
+    provider,
+    model: profile.id,
+    onProgress: (event) => {
+      events.push(event);
+    },
     repositories: { events: repository },
     toolBoundary: { authorizationPolicyId: 'none', executionTargetId: 'none' }
   });
@@ -520,21 +593,92 @@ test('interrupted provider output preserves the cause and partial text without r
   assert.equal(result.state, 'suspended');
   assert.equal(result.reason, 'provider_outcome_unknown');
   assert.equal(calls, 1);
-  const interrupted = events.find(event => event.type === 'assistant.interrupted');
+  const interrupted = events.find((event) => event.type === 'assistant.interrupted');
   assert.equal(interrupted.content, 'Partial answer');
   assert.equal(interrupted.modelOutput.status, 'partial');
-  assert.equal(interrupted.diagnostic.causeSummary.message, 'Connection closed while reading the response');
+  assert.equal(
+    interrupted.diagnostic.causeSummary.message,
+    'Connection closed while reading the response'
+  );
 });
-
 
 test('durable replay binds the output reservation policy independently of the wire request', async () => {
   let calls = 0;
-  const provider = fixture(async request => { calls++; return response(request); });
+  const provider = fixture(async (request) => {
+    calls++;
+    return response(request);
+  });
   const service = InferenceService.inMemory({ provider });
   const request = { model: profile.id, messages: [{ role: 'user', content: 'Hello' }] };
   const invocation = { ...input(), request, outputReservation: 100 };
   await service.invoke(invocation);
   assert.equal((await service.invoke(invocation)).replayed, true);
-  await assert.rejects(service.invoke({ ...invocation, outputReservation: 200 }), /different input or configuration/);
+  await assert.rejects(
+    service.invoke({ ...invocation, outputReservation: 200 }),
+    /different input or configuration/
+  );
   assert.equal(calls, 1);
+});
+
+test('definitive context rejection is recorded and replay cannot dispatch the rejected request', async () => {
+  const repository = new InMemoryInferenceRepository();
+  const artifacts = new InMemoryArtifactRepository();
+  let calls = 0;
+  const provider = fixture(async () => {
+    calls++;
+    throw new ModelProviderError({
+      provider: 'fixture',
+      code: 'context_overflow',
+      message: 'Input exceeds the provider context limit.'
+    });
+  });
+  const open = () =>
+    new InferenceService({ provider, repository, artifacts, budget: { maxInvocations: 1 } });
+  await assert.rejects(open().invoke(input()), InferenceContextRejectedError);
+  const recorded = (await repository.load('work')).invocations.get('one');
+  assert.equal(recorded.rejected.code, 'context_overflow');
+  assert.equal(recorded.notSent, undefined, 'A rejected network request was still sent.');
+  assert.equal(recorded.uncertain, undefined);
+  assert.equal(recorded.settlement, undefined, 'No model response or usage was invented.');
+  assert.match(recorded.rejected.inputIdentity, /^sha256:/u);
+  await assert.rejects(open().invoke(input()), InferenceContextRejectedError);
+  await assert.rejects(open().invoke(input('another')), InferenceBudgetExceededError);
+  assert.equal(calls, 1, 'Neither replay nor an exhausted attempt budget can dispatch.');
+});
+
+test('context error after partial streamed output remains uncertain', async () => {
+  for (const update of [
+    { type: 'content', content: 'Original answer', accumulated: 'Original answer' },
+    {
+      type: 'reasoning',
+      reasoning: 'Original reasoning',
+      accumulatedReasoning: 'Original reasoning'
+    }
+  ]) {
+    const repository = new InMemoryInferenceRepository();
+    const provider = {
+      ...fixture(async () => assert.fail('Expected streaming')),
+      describeModel: async () => ({
+        ...profile,
+        capabilities: { ...profile.capabilities, streaming: true }
+      }),
+      async *stream() {
+        yield update;
+        throw new ModelProviderError({
+          provider: 'fixture',
+          code: 'context_overflow',
+          message: 'Capacity error after output.'
+        });
+      }
+    };
+    const service = new InferenceService({
+      provider,
+      repository,
+      artifacts: new InMemoryArtifactRepository()
+    });
+    await assert.rejects(service.invoke(input()), InferenceOutcomeUnknownError);
+    const recorded = (await repository.load('work')).invocations.get('one');
+    assert.ok(recorded.uncertain);
+    assert.equal(recorded.rejected, undefined);
+  }
 });

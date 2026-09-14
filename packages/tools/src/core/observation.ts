@@ -23,14 +23,16 @@ import type {
   ToolValidationIssues,
   UnknownToolFailureOutput
 } from './definition.js';
-import { encodeToolResultFacts, parseToolResultFacts, type ToolResultFacts } from './observed-facts.js';
+import {
+  encodeToolResultFacts,
+  parseToolResultFacts,
+  type ToolResultFacts
+} from './observed-facts.js';
 import { validateResourceScope } from './resources.js';
 
 const OWNED_TOOL_OBSERVATIONS = new WeakSet();
 
-type PolicyFailureDetails = Omit<PolicyToolFailureOutput, 'blocked' | 'reason' | 'recovery'> & {
-  recovery?: string;
-};
+type PolicyFailureDetails = Omit<PolicyToolFailureOutput, 'reason'>;
 const JSON_LIMITS = {
   maxDepth: 32,
   maxCollectionEntries: 50_000,
@@ -46,30 +48,32 @@ export function contextRequiredObservation(
   validateSummary(summary);
   return ownResultObservation({
     kind: 'result',
-    ok: true,
+    execution: { state: 'not_started' },
     summary,
     scope: Object.freeze({ resources: Object.freeze([]), coverage: 'complete' }),
-    output: parseJsonObject({ status: 'context_required', effectStarted: false, context }, JSON_LIMITS)
+    output: parseJsonObject(
+      { status: 'context_required', effectStarted: false, context },
+      JSON_LIMITS
+    )
   });
 }
 
-export function unknownToolObservation(call: ToolCall): ToolFailureObservation<UnknownToolFailureOutput> {
+export function unknownToolObservation(
+  call: ToolCall
+): ToolFailureObservation<UnknownToolFailureOutput> {
   return freezeFailure('Unknown tool: ' + call.name, {
-    blocked: true,
     reason: 'unknown_tool',
-    toolCall: call,
-    recovery: 'Call one of the native tools provided in the current model request.'
+    toolCall: call
   });
 }
 export function policyBlockedObservation(
   summary: string,
   details: PolicyFailureDetails = {}
 ): ToolFailureObservation<PolicyToolFailureOutput> {
-  const { recovery, ...rest } = details;
+  const rest = details;
   return freezeFailure(summary, {
-    blocked: true,
     reason: 'policy',
-    recovery: recovery ?? 'Choose an available tool or ask the user to allow the required resource access.',
+
     ...rest,
     ...(rest.details ? { details: ownDetails(rest.details) } : {})
   });
@@ -79,9 +83,8 @@ export function invalidArgumentsObservation(
   error: z.ZodError
 ): ToolFailureObservation<InvalidArgumentsToolFailureOutput> {
   return freezeFailure('Invalid arguments for ' + toolName + ': ' + z.prettifyError(error), {
-    blocked: true,
     reason: 'invalid_arguments',
-    recovery: 'Fix the arguments according to the tool schema and call this tool again.',
+
     issues: validationIssues(error)
   });
 }
@@ -94,15 +97,21 @@ export function invalidOutputObservation(
       ? validationIssues(error)
       : Object.freeze({
           issues: Object.freeze([
-            Object.freeze({ path: Object.freeze([]), code: 'invalid_observation', message: error.message })
+            Object.freeze({
+              path: Object.freeze([]),
+              code: 'invalid_observation',
+              message: error.message
+            })
           ])
         });
-  return freezeFailure('Tool ' + toolName + ' returned an observation that violates its contract.', {
-    blocked: true,
-    reason: 'invalid_output',
-    recovery: 'Treat this invocation as a tool implementation failure.',
-    issues
-  });
+  return freezeFailure(
+    'Tool ' + toolName + ' returned an observation that violates its contract.',
+    {
+      reason: 'invalid_output',
+
+      issues
+    }
+  );
 }
 export function invalidToolInputObservation(
   toolName: string,
@@ -110,25 +119,21 @@ export function invalidToolInputObservation(
   details: unknown = {}
 ): ToolFailureObservation<InvalidArgumentsToolFailureOutput> {
   return freezeFailure('Invalid arguments for ' + toolName + ': ' + message, {
-    blocked: true,
     reason: 'invalid_arguments',
-    recovery: 'Fix the arguments according to the tool schema and call this tool again.',
+
     details: ownDetails(details)
   });
 }
 export function missingServiceObservation(
   toolName: string,
   serviceName: string,
-  recovery = 'This tool cannot run until the caller provides the required execution service.',
   details: unknown = {}
 ): ToolFailureObservation<MissingServiceToolFailureOutput> {
   const ownedDetails = ownDetails(details);
   return freezeFailure('Tool ' + toolName + ' is missing required service: ' + serviceName, {
-    blocked: true,
     reason: 'missing_service',
     service: serviceName,
-    ...(Object.keys(ownedDetails).length > 0 ? { details: ownedDetails } : {}),
-    recovery
+    ...(Object.keys(ownedDetails).length > 0 ? { details: ownedDetails } : {})
   });
 }
 export function runtimeErrorObservation(
@@ -138,11 +143,9 @@ export function runtimeErrorObservation(
 ): ToolFailureObservation<RuntimeErrorToolFailureOutput> {
   const message = describeError(error);
   return freezeFailure('Tool ' + toolName + ' failed: ' + message, {
-    blocked: true,
     reason: 'runtime_error',
     error: message,
-    ...(details ? { details: ownDetails(details) } : {}),
-    recovery: 'Use the observation to adjust the next tool call or choose another available tool.'
+    ...(details ? { details: ownDetails(details) } : {})
   });
 }
 
@@ -165,11 +168,21 @@ function parseOwnedToolObservation(
 ): ToolObservation {
   const unknown = Object.keys(record).filter(
     (key) =>
-      !['kind', 'ok', 'summary', 'scope', 'content', 'metadata', 'observedFacts', 'output'].includes(key)
+      ![
+        'kind',
+        'execution',
+        'summary',
+        'scope',
+        'content',
+        'metadata',
+        'observedFacts',
+        'output'
+      ].includes(key)
   );
   if (unknown.length > 0)
     throw new Error('Tool observation contains unsupported fields: ' + unknown.join(', ') + '.');
   const summary = validateSummary(record.summary);
+  const execution = parseExecution(record.execution);
   const scope = parseToolScope(record.scope);
   const content = parseContent(record.content);
   const metadata =
@@ -178,14 +191,15 @@ function parseOwnedToolObservation(
       : requireJsonObject(record.metadata, 'Tool observation metadata');
   const observedFacts =
     record.observedFacts === undefined ? undefined : parseObservedFacts(record.observedFacts);
-  if (record.kind === 'result' && typeof record.ok === 'boolean') {
+  if (record.kind === 'result') {
     if (!tool) throw new Error('A result observation requires its tool definition.');
     const parsed = tool.outputSchema.safeParse(record.output);
     if (!parsed.success) throw parsed.error;
     const output = parseJsonValue(parsed.data, JSON_LIMITS);
     return ownResultObservation({
       kind: 'result',
-      ok: record.ok,
+      ...(execution ? { execution } : {}),
+
       summary,
       scope,
       output,
@@ -194,13 +208,12 @@ function parseOwnedToolObservation(
       ...(observedFacts ? { observedFacts } : {})
     });
   }
-  if (record.kind !== 'failure' || record.ok !== false)
-    throw new Error('Tool observation kind and ok fields are inconsistent.');
+  if (record.kind !== 'failure') throw new Error('Tool observation kind is invalid.');
   if (record.output === undefined) throw new Error('Tool failure output must be an object.');
   const output = parseFailureOutput(requireJsonObject(record.output, 'Tool failure output'));
   return ownFailureObservation({
     kind: 'failure',
-    ok: false,
+    ...(execution ? { execution } : {}),
     summary,
     scope,
     output,
@@ -235,18 +248,27 @@ function ownFailureObservation<TOutput extends ToolFailureOutput>(
 }
 
 export function decodeOwnedToolObservationForPersistence(record: JsonObject): ToolObservation {
-  return parseOwnedToolObservation(record.kind === 'result' ? persistenceTool() : undefined, record);
+  return parseOwnedToolObservation(
+    record.kind === 'result' ? persistenceTool() : undefined,
+    record
+  );
 }
 
 function parseToolScope(value: JsonValue | undefined): ToolScope {
   if (value === undefined) throw new Error('Tool scope must be an object.');
   const record = requireJsonObject(value, 'Tool scope');
   const unknown = Object.keys(record).filter(
-    (key) => !['resources', 'filters', 'limits', 'omitted', 'coverage', 'truncated', 'causes'].includes(key)
+    (key) =>
+      !['resources', 'filters', 'limits', 'omitted', 'coverage', 'truncated', 'causes'].includes(
+        key
+      )
   );
   if (unknown.length > 0)
     throw new Error('Tool scope contains unsupported fields: ' + unknown.join(', ') + '.');
-  if (!Array.isArray(record.resources) || !record.resources.every((item) => typeof item === 'string'))
+  if (
+    !Array.isArray(record.resources) ||
+    !record.resources.every((item) => typeof item === 'string')
+  )
     throw new Error('Tool scope resources must be strings.');
   if (record.coverage !== 'complete' && record.coverage !== 'partial')
     throw new Error('Tool scope coverage is invalid.');
@@ -255,18 +277,25 @@ function parseToolScope(value: JsonValue | undefined): ToolScope {
   const rawCauses = record.causes;
   if (
     rawCauses !== undefined &&
-    (!Array.isArray(rawCauses) || !rawCauses.every((item) => typeof item === 'string' && item.length > 0))
+    (!Array.isArray(rawCauses) ||
+      !rawCauses.every((item) => typeof item === 'string' && item.length > 0))
   )
     throw new Error('Tool scope causes must be non-empty strings.');
   const resources = Object.freeze(record.resources.map(validateResourceScope));
-  if (new Set(resources).size !== resources.length) throw new Error('Tool scope resources must be unique.');
+  if (new Set(resources).size !== resources.length)
+    throw new Error('Tool scope resources must be unique.');
   const filters =
-    record.filters === undefined ? undefined : requireJsonObject(record.filters, 'Tool scope filters');
+    record.filters === undefined
+      ? undefined
+      : requireJsonObject(record.filters, 'Tool scope filters');
   const limits =
     record.limits === undefined ? undefined : requireJsonObject(record.limits, 'Tool scope limits');
   const omitted =
-    record.omitted === undefined ? undefined : requireJsonObject(record.omitted, 'Tool scope omitted');
-  const causes = rawCauses === undefined ? undefined : Object.freeze([...new Set(rawCauses as string[])]);
+    record.omitted === undefined
+      ? undefined
+      : requireJsonObject(record.omitted, 'Tool scope omitted');
+  const causes =
+    rawCauses === undefined ? undefined : Object.freeze([...new Set(rawCauses as string[])]);
   if (record.coverage === 'complete' && (record.truncated === true || (causes?.length ?? 0) > 0))
     throw new Error('A complete tool scope cannot be truncated or have omission causes.');
   return Object.freeze({
@@ -281,17 +310,15 @@ function parseToolScope(value: JsonValue | undefined): ToolScope {
 }
 
 function parseFailureOutput(value: JsonObject): ToolFailureOutput {
-  if (value.blocked !== true || typeof value.recovery !== 'string' || value.recovery.length === 0)
-    throw new Error('Tool failure output must be blocked and provide recovery guidance.');
   switch (value.reason) {
     case 'unknown_tool': {
-      exactFailure(value, ['blocked', 'reason', 'recovery', 'toolCall']);
+      exactFailure(value, ['reason', 'toolCall']);
       const toolCall = decodeToolCall(value.toolCall);
       if (!toolCall) break;
-      return Object.freeze({ blocked: true, reason: value.reason, recovery: value.recovery, toolCall });
+      return Object.freeze({ reason: value.reason, toolCall });
     }
     case 'policy':
-      exactFailure(value, ['blocked', 'reason', 'recovery', 'tool', 'policyReason', 'details']);
+      exactFailure(value, ['reason', 'tool', 'policyReason', 'details']);
       if (
         (value.tool !== undefined && typeof value.tool !== 'string') ||
         (value.policyReason !== undefined && typeof value.policyReason !== 'string') ||
@@ -299,15 +326,14 @@ function parseFailureOutput(value: JsonObject): ToolFailureOutput {
       )
         break;
       return Object.freeze({
-        blocked: true,
         reason: value.reason,
-        recovery: value.recovery,
+
         ...(typeof value.tool === 'string' ? { tool: value.tool } : {}),
         ...(typeof value.policyReason === 'string' ? { policyReason: value.policyReason } : {}),
         ...(jsonObject(value.details) ? { details: value.details } : {})
       });
     case 'invalid_arguments': {
-      exactFailure(value, ['blocked', 'reason', 'recovery', 'issues', 'details']);
+      exactFailure(value, ['reason', 'issues', 'details']);
       const issues = value.issues === undefined ? undefined : decodeValidationIssues(value.issues);
       if (
         (value.issues !== undefined && !issues) ||
@@ -315,38 +341,41 @@ function parseFailureOutput(value: JsonObject): ToolFailureOutput {
       )
         break;
       return Object.freeze({
-        blocked: true,
         reason: value.reason,
-        recovery: value.recovery,
+
         ...(issues ? { issues } : {}),
         ...(jsonObject(value.details) ? { details: value.details } : {})
       });
     }
     case 'invalid_output': {
-      exactFailure(value, ['blocked', 'reason', 'recovery', 'issues']);
+      exactFailure(value, ['reason', 'issues']);
       const issues = decodeValidationIssues(value.issues);
       if (!issues) break;
-      return Object.freeze({ blocked: true, reason: value.reason, recovery: value.recovery, issues });
+      return Object.freeze({ reason: value.reason, issues });
     }
     case 'missing_service':
-      exactFailure(value, ['blocked', 'reason', 'recovery', 'service', 'details']);
-      if (typeof value.service !== 'string' || (value.details !== undefined && !jsonObject(value.details)))
+      exactFailure(value, ['reason', 'service', 'details']);
+      if (
+        typeof value.service !== 'string' ||
+        (value.details !== undefined && !jsonObject(value.details))
+      )
         break;
       return Object.freeze({
-        blocked: true,
         reason: value.reason,
-        recovery: value.recovery,
+
         service: value.service,
         ...(jsonObject(value.details) ? { details: value.details } : {})
       });
     case 'runtime_error':
-      exactFailure(value, ['blocked', 'reason', 'recovery', 'error', 'details']);
-      if (typeof value.error !== 'string' || (value.details !== undefined && !jsonObject(value.details)))
+      exactFailure(value, ['reason', 'error', 'details']);
+      if (
+        typeof value.error !== 'string' ||
+        (value.details !== undefined && !jsonObject(value.details))
+      )
         break;
       return Object.freeze({
-        blocked: true,
         reason: value.reason,
-        recovery: value.recovery,
+
         error: value.error,
         ...(jsonObject(value.details) ? { details: value.details } : {})
       });
@@ -361,6 +390,14 @@ function parseContent(value: JsonValue | undefined): readonly ToolContent[] | un
   return Object.freeze(
     value.map((item): ToolContent => {
       const record = requireJsonObject(item, 'Tool content');
+      const keys =
+        record.type === 'text'
+          ? ['type', 'text', 'mediaType']
+          : record.type === 'image'
+            ? ['type', 'artifact', 'detail']
+            : ['type', 'artifact'];
+      if (Object.keys(record).some((key) => !keys.includes(key)))
+        throw new Error('Tool content contains unsupported fields.');
       if (
         record.type === 'text' &&
         typeof record.text === 'string' &&
@@ -371,7 +408,10 @@ function parseContent(value: JsonValue | undefined): readonly ToolContent[] | un
           text: record.text,
           ...(record.mediaType ? { mediaType: record.mediaType } : {})
         });
-      if ((record.type === 'image' || record.type === 'artifact') && record.artifact !== undefined) {
+      if (
+        (record.type === 'image' || record.type === 'artifact') &&
+        record.artifact !== undefined
+      ) {
         const artifact = requireJsonObject(record.artifact, 'Tool content artifact');
         validatePublicArtifactRef(artifact);
         if (record.type === 'image' && (record.detail === 'high' || record.detail === 'original'))
@@ -388,11 +428,14 @@ function parseObservedFacts(value: JsonValue): ToolResultFacts {
 function persistenceTool(): Pick<ToolDefinition, 'outputSchema'> {
   return { outputSchema: z.unknown() };
 }
-function freezeFailure<T extends ToolFailureOutput>(summary: string, output: T): ToolFailureObservation<T> {
+function freezeFailure<T extends ToolFailureOutput>(
+  summary: string,
+  output: T
+): ToolFailureObservation<T> {
   if (summary.trim().length === 0 || Buffer.byteLength(summary, 'utf8') > 64_000)
     throw new Error('Tool failure summary is invalid.');
   Object.freeze(output);
-  return ownFailureObservation({ kind: 'failure', ok: false, summary, scope: failureScope(), output });
+  return ownFailureObservation({ kind: 'failure', summary, scope: failureScope(), output });
 }
 function failureScope(): ToolScope {
   return Object.freeze({
@@ -432,7 +475,11 @@ function decodeValidationIssues(value: JsonValue | undefined): ToolValidationIss
     )
       return undefined;
     issues.push(
-      Object.freeze({ path: Object.freeze([...issue.path]), code: issue.code, message: issue.message })
+      Object.freeze({
+        path: Object.freeze([...issue.path]),
+        code: issue.code,
+        message: issue.message
+      })
     );
   }
   return Object.freeze({ issues: Object.freeze(issues) });
@@ -442,7 +489,9 @@ function validationIssues(error: z.ZodError): ToolValidationIssues {
     issues: Object.freeze(
       error.issues.map((issue) =>
         Object.freeze({
-          path: Object.freeze(issue.path.map((item) => (typeof item === 'number' ? item : String(item)))),
+          path: Object.freeze(
+            issue.path.map((item) => (typeof item === 'number' ? item : String(item)))
+          ),
           code: issue.code,
           message: issue.message
         })
@@ -464,12 +513,17 @@ export function encodeToolObservation(observation: ToolObservation): JsonObject 
     throw new Error('Tool observations must be decoded or constructed before encoding.');
   return Object.freeze({
     kind: observation.kind,
-    ok: observation.ok,
+    ...(observation.execution ? { execution: { ...observation.execution } } : {}),
+
     summary: observation.summary,
     scope: encodeToolScope(observation.scope),
     output:
-      observation.kind === 'result' ? observation.output : encodeToolFailureOutput(observation.output),
-    ...(observation.content ? { content: Object.freeze(observation.content.map(encodeToolContent)) } : {}),
+      observation.kind === 'result'
+        ? observation.output
+        : encodeToolFailureOutput(observation.output),
+    ...(observation.content
+      ? { content: Object.freeze(observation.content.map(encodeToolContent)) }
+      : {}),
     ...(observation.metadata ? { metadata: observation.metadata } : {}),
     ...(observation.observedFacts
       ? { observedFacts: encodeToolResultFacts(observation.observedFacts) }
@@ -480,6 +534,7 @@ export function encodeToolObservation(observation: ToolObservation): JsonObject 
 export function updateToolObservation(
   observation: ToolObservation,
   changes: {
+    readonly execution?: import('./definition.js').ToolExecutionObservation;
     readonly summary?: string;
     readonly content?: readonly ToolContent[];
     readonly metadata?: JsonObject;
@@ -488,6 +543,9 @@ export function updateToolObservation(
 ): ToolObservation {
   if (!isOwnedToolObservation(observation))
     throw new Error('Tool observations must be owned before updating.');
+  const execution = changes.execution
+    ? parseExecution(parseJsonValue(changes.execution))
+    : observation.execution;
   const summary = changes.summary ?? observation.summary;
   if (summary.trim().length === 0 || Buffer.byteLength(summary, 'utf8') > 64_000)
     throw new Error('Tool observation summary is invalid.');
@@ -496,7 +554,9 @@ export function updateToolObservation(
       ? observation.content
       : parseContent(parseJsonValue(changes.content, JSON_LIMITS));
   const metadata =
-    changes.metadata === undefined ? observation.metadata : parseJsonObject(changes.metadata, JSON_LIMITS);
+    changes.metadata === undefined
+      ? observation.metadata
+      : parseJsonObject(changes.metadata, JSON_LIMITS);
   if (observation.kind === 'failure') {
     const output =
       changes.output === undefined
@@ -506,6 +566,7 @@ export function updateToolObservation(
           );
     return ownFailureObservation({
       ...observation,
+      ...(execution ? { execution } : {}),
       summary,
       output,
       ...(content ? { content } : {}),
@@ -516,6 +577,7 @@ export function updateToolObservation(
     changes.output === undefined ? observation.output : parseJsonValue(changes.output, JSON_LIMITS);
   return ownResultObservation({
     ...observation,
+    ...(execution ? { execution } : {}),
     summary,
     output,
     ...(content ? { content } : {}),
@@ -548,7 +610,7 @@ function encodeToolContent(content: ToolContent): JsonObject {
       });
 }
 export function encodeToolFailureOutput(output: ToolFailureOutput): JsonObject {
-  const common = { blocked: true, reason: output.reason, recovery: output.recovery } as const;
+  const common = { reason: output.reason } as const;
   if (output.reason === 'unknown_tool')
     return Object.freeze({
       ...common,
@@ -592,8 +654,42 @@ function encodeValidationIssues(value: ToolValidationIssues): JsonObject {
   return Object.freeze({
     issues: Object.freeze(
       value.issues.map((issue) =>
-        Object.freeze({ path: Object.freeze([...issue.path]), code: issue.code, message: issue.message })
+        Object.freeze({
+          path: Object.freeze([...issue.path]),
+          code: issue.code,
+          message: issue.message
+        })
       )
     )
+  });
+}
+
+export function decodeToolContent(value: unknown): readonly ToolContent[] {
+  const content = parseContent(
+    parseJsonValue(value, {
+      maxDepth: 40,
+      maxCollectionEntries: 100000,
+      maxStringBytes: 16000000,
+      maxTotalBytes: 16000000
+    })
+  );
+  if (!content) throw new Error('Tool content is required.');
+  return content;
+}
+
+function parseExecution(
+  value: JsonValue | undefined
+): import('./definition.js').ToolExecutionObservation | undefined {
+  if (value === undefined) return undefined;
+  const record = requireJsonObject(value, 'Tool execution observation');
+  if (
+    Object.keys(record).length !== 1 ||
+    !['not_started', 'settled', 'active', 'unknown'].includes(
+      typeof record.state === 'string' ? record.state : ''
+    )
+  )
+    throw new Error('Tool execution observation is invalid.');
+  return Object.freeze({
+    state: record.state as import('./definition.js').ToolExecutionObservation['state']
   });
 }

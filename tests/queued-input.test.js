@@ -1,3 +1,4 @@
+import { InMemoryArtifactRepository } from '@agent-core/persistence';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -21,7 +22,9 @@ for (const kind of ['memory', 'jsonl']) {
     const root = await mkdtemp(path.join(tmpdir(), 'queued-input-'));
     t.after(() => rm(root, { recursive: true, force: true }));
     const repository =
-      kind === 'memory' ? new InMemorySessionRepository() : new JsonlSessionRepository({ rootDir: root });
+      kind === 'memory'
+        ? new InMemorySessionRepository()
+        : new JsonlSessionRepository({ rootDir: root });
     const descriptor = await repository.create({ binding });
     const session = new AgentSession({
       descriptor,
@@ -29,7 +32,10 @@ for (const kind of ['memory', 'jsonl']) {
       repository,
       configuration,
       scheduling: 'manual',
-      runs: new AgentRunCoordinator(new InMemoryEventRepository(agentEventCodec)),
+      runs: new AgentRunCoordinator(
+        new InMemoryEventRepository(agentEventCodec),
+        new InMemoryArtifactRepository()
+      ),
       createRuntime() {
         throw new Error('Queued work must not execute.');
       }
@@ -60,12 +66,16 @@ for (const kind of ['memory', 'jsonl']) {
     await assert.rejects(
       accepted.completion,
       (error) =>
-        error instanceof AgentSubmissionCancelledError && error.submissionId === accepted.submissionId
+        error instanceof AgentSubmissionCancelledError &&
+        error.submissionId === accepted.submissionId
     );
     assert.equal(session.state().queuedInputs, 0);
     assert.deepEqual(await reopened.loadPendingSubmissions(descriptor), []);
     await assert.rejects(
-      session.updateQueuedSubmission(accepted.submissionId, { kind: 'cancel', expectedInput: pending.input }),
+      session.updateQueuedSubmission(accepted.submissionId, {
+        kind: 'cancel',
+        expectedInput: pending.input
+      }),
       /no longer queued/
     );
   });
@@ -74,7 +84,9 @@ for (const kind of ['memory', 'jsonl']) {
     const root = await mkdtemp(path.join(tmpdir(), 'queued-input-claim-'));
     t.after(() => rm(root, { recursive: true, force: true }));
     const repository =
-      kind === 'memory' ? new InMemorySessionRepository() : new JsonlSessionRepository({ rootDir: root });
+      kind === 'memory'
+        ? new InMemorySessionRepository()
+        : new JsonlSessionRepository({ rootDir: root });
     const descriptor = await repository.create({ binding });
     await repository.enqueueSubmission(descriptor, {
       submissionId: 'submission',

@@ -5,6 +5,12 @@ export function suspensionPresentation(reason: AgentSessionSuspensionDescriptor[
   readonly explanation: string;
 } {
   switch (reason) {
+    case 'context_admission':
+      return {
+        title: 'Context needs adjustment',
+        explanation:
+          'Inspect the request conflict and adjust its source selection, model, or optional reservation before continuing.'
+      };
     case 'provider_outcome_unknown':
       return {
         title: 'Response interrupted',

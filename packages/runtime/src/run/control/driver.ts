@@ -1,3 +1,6 @@
+import { AgentRunRecords, AgentRunRecordStorageError } from './records.js';
+import type { ArtifactRepository } from '@agent-core/persistence';
+import { assertAgentRunStateInvariants } from './state-invariants.js';
 import {
   decodeEffectSettlementPermit,
   knownEffectExposure,
@@ -37,7 +40,6 @@ import {
   type AgentRunStateTransition
 } from './state-transition.js';
 import {
-  decodeAgentToolSettlementRecord,
   decodeToolResultDelivery,
   isToolCallStartable,
   type AgentToolCallState,
@@ -114,7 +116,14 @@ export class AgentToolStartBlockedError extends Error {
 }
 
 export class AgentRunCoordinator {
-  constructor(private readonly events: EventRepository<AgentEvent>) {}
+  private readonly records: AgentRunRecords;
+  private lastInspection: AgentRunInspection | undefined;
+  constructor(
+    private readonly events: EventRepository<AgentEvent>,
+    readonly artifacts: ArtifactRepository
+  ) {
+    this.records = new AgentRunRecords(artifacts);
+  }
 
   async accept(value: AgentRunAcceptance): Promise<AgentRunInspection> {
     const state = decodeAgentRunState({
@@ -141,7 +150,7 @@ export class AgentRunCoordinator {
     }
     const result = await this.events.appendConditional(
       state.runId,
-      transitionEvent(undefined, state),
+      await transitionEvent(undefined, state, this.records),
       {
         idempotencyKey: `${state.runId}:run:accepted`,
         expectedTail,
@@ -155,16 +164,34 @@ export class AgentRunCoordinator {
   async inspect(runId: string): Promise<AgentRunInspection> {
     for (;;) {
       const before = await this.events.tail(runId);
-      let state: AgentRunState | undefined;
-      let transition:
-        | Readonly<{ readonly eventId: string; readonly sequence: number; readonly hash: string; readonly driverGeneration: number }>
-        | undefined;
-      for await (const record of this.events.read(runId)) {
-        if (record.event.type !== 'run.state.transitioned') continue;
-        state = applyAgentRunStateTransition(state, record.event.transition);
-        if (state.runId !== runId || state.driverGeneration !== record.driverGeneration)
-          throw new Error(`Run ${runId} has a contradictory run transition.`);
-        transition = record;
+      const cached = this.lastInspection?.state.runId === runId ? this.lastInspection : undefined;
+      if (
+        cached?.tail.sequence === before.sequence &&
+        cached.tail.hash === before.hash &&
+        cached.tail.driverGeneration === before.driverGeneration
+      )
+        return cached;
+      let state = cached?.state;
+      let transition = cached?.transition;
+      let cursor = cached?.tail.sequence ?? -1;
+      for (;;) {
+        const page = await this.events.readRange(runId, {
+          afterSequence: cursor,
+          through: before,
+          types: ['run.state.transitioned']
+        });
+        if (page.oversized) throw new Error('Run transition exceeds its independent record bound.');
+        for (const record of page.records) {
+          if (record.event.type !== 'run.state.transitioned') continue;
+          state = await applyAgentRunStateTransition(state, record.event.transition, this.records);
+          if (state.runId !== runId || state.driverGeneration !== record.driverGeneration)
+            throw new Error(`Run ${runId} has a contradictory run transition.`);
+          transition = record;
+        }
+        if (page.complete) break;
+        if (page.nextSequence <= cursor)
+          throw new Error('Run transition recovery made no progress.');
+        cursor = page.nextSequence;
       }
       const tail = await this.events.tail(runId);
       if (
@@ -174,7 +201,7 @@ export class AgentRunCoordinator {
       )
         continue;
       if (!transition || !state) throw new Error(`Run ${runId} has no durable run.`);
-      return Object.freeze({
+      this.lastInspection = Object.freeze({
         state,
         transition: Object.freeze({
           eventId: transition.eventId,
@@ -184,6 +211,7 @@ export class AgentRunCoordinator {
         tail,
         instruction: nextAgentRunInstruction(state)
       });
+      return this.lastInspection;
     }
   }
 
@@ -198,27 +226,40 @@ export class AgentRunCoordinator {
 
   async attach(runId: string, driverId = crypto.randomUUID()): Promise<AgentRunDriver> {
     const current = await this.inspect(runId);
-    if (current.state.phase.kind === 'terminal') throw new Error(`Run ${runId} is already terminal.`);
+    if (current.state.phase.kind === 'terminal')
+      throw new Error(`Run ${runId} is already terminal.`);
     if (
-      (current.state.control.status === 'owned' || current.state.control.status === 'abort_requested') &&
+      (current.state.control.status === 'owned' ||
+        current.state.control.status === 'abort_requested') &&
       current.state.control.driverId === driverId &&
       current.state.driverGeneration === current.tail.driverGeneration
     ) {
-      return new AgentRunDriver(this.events, current.state, current.tail, current.transition, driverId);
+      return new AgentRunDriver(
+        this.events,
+        this.artifacts,
+        current.state,
+        current.tail,
+        current.transition,
+        driverId
+      );
     }
     const generation = current.tail.driverGeneration + 1;
-    const state = decodeAgentRunState({
+    const state: AgentRunState = Object.freeze({
       ...current.state,
       revision: current.state.revision + 1,
       driverGeneration: generation,
       control:
         current.state.control.status === 'abort_requested'
-          ? { status: 'abort_requested', driverId, reason: current.state.control.reason }
-          : { status: 'owned', driverId }
+          ? Object.freeze({
+              status: 'abort_requested' as const,
+              driverId,
+              reason: current.state.control.reason
+            })
+          : Object.freeze({ status: 'owned' as const, driverId })
     });
     const result = await this.events.appendConditional(
       runId,
-      transitionEvent(current.state, state),
+      await transitionEvent(current.state, state, this.records),
       {
         idempotencyKey: `${runId}:driver:${String(generation)}`,
         expectedTail: current.tail,
@@ -226,33 +267,41 @@ export class AgentRunCoordinator {
       }
     );
     const committed = acceptConditionalResult(runId, result);
-    return new AgentRunDriver(this.events, state, committed.tail, committed.receipt, driverId);
+    return new AgentRunDriver(
+      this.events,
+      this.artifacts,
+      state,
+      committed.tail,
+      committed.receipt,
+      driverId
+    );
   }
 
   async requestAbort(runId: string, reason: string): Promise<AgentRunInspection> {
     for (;;) {
       const current = await this.inspect(runId);
-      if (current.state.phase.kind === 'terminal' || current.state.control.status === 'abort_requested')
+      if (
+        current.state.phase.kind === 'terminal' ||
+        current.state.control.status === 'abort_requested'
+      )
         return current;
-      const state = decodeAgentRunState({
+      const state: AgentRunState = Object.freeze({
         ...current.state,
         revision: current.state.revision + 1,
         control: {
-          status: 'abort_requested',
-          ...(current.state.control.status === 'owned' ? { driverId: current.state.control.driverId } : {}),
+          status: 'abort_requested' as const,
+          ...(current.state.control.status === 'owned'
+            ? { driverId: current.state.control.driverId }
+            : {}),
           reason
         }
       });
-      const event = transitionEvent(current.state, state);
-      const result = await this.events.appendConditional(
-        runId,
-        event,
-        {
-          idempotencyKey: transitionKey(state, event.transition),
-          expectedTail: current.tail,
-          driverGeneration: current.tail.driverGeneration
-        }
-      );
+      const event = await transitionEvent(current.state, state, this.records);
+      const result = await this.events.appendConditional(runId, event, {
+        idempotencyKey: transitionKey(state, event.transition),
+        expectedTail: current.tail,
+        driverGeneration: current.tail.driverGeneration
+      });
       if (
         result.kind === 'rejected' &&
         (result.reason === 'stale_tail' || result.reason === 'stale_driver')
@@ -274,7 +323,7 @@ export class AgentRunCoordinator {
     if (typeof input.effectId !== 'string' || input.effectId.trim().length === 0)
       throw new TypeError('Tool effect identity must be non-empty.');
     const permit = decodeEffectSettlementPermit(input.permit);
-    const settlement = decodeAgentToolSettlementRecord(input.settlement);
+    const settlement = input.settlement;
     for (;;) {
       const current = await this.inspect(runId);
       const batchIndex = current.state.toolBatches.findIndex((batch) =>
@@ -294,6 +343,21 @@ export class AgentRunCoordinator {
             call.effect?.intent.effectId === input.effectId
         ) ?? -1;
       const callState = batch?.callStates[callIndex];
+      if (!callState) {
+        const committed = await this.findToolSettlement(runId, input.effectId);
+        if (committed) {
+          if (
+            hashJson(committed.effect.settlementPermit) !== hashJson(permit) ||
+            toolSettlementDigest(committed.settlement) !== toolSettlementDigest(settlement)
+          )
+            throw new AgentRunConflictError(
+              runId,
+              'idempotency_conflict',
+              'Historical effect settlement does not match its immutable permit and observation.'
+            );
+          return current;
+        }
+      }
       if (
         callState &&
         callState.stage !== 'ready' &&
@@ -333,42 +397,79 @@ export class AgentRunCoordinator {
           `Tool effect ${input.effectId} is no longer awaiting settlement.`
         );
       }
-      const resultDigest = hashJson(encodeToolObservation(settlement.observation));
-      const settled = settleExternalEffect(callState.effect, permit, {
-        outcome: settlement.observation.ok ? 'succeeded' : 'failed',
-        resultDigest,
-        exposure: knownEffectExposure(callState.effect.intent.exposure.quantities)
-      });
-      if (settled.status !== 'settled' && settled.status !== 'already_settled') {
+      const resultDigest = settlement.original.digest;
+      const execution = settlement.original.execution;
+      const uncertain = execution?.state === 'unknown';
+      // Settlement confirms the invocation boundary. Process/check/task outcomes remain in
+      // the observation; active processes retain their separate owner and transferred lease.
+      const settled = uncertain
+        ? undefined
+        : settleExternalEffect(callState.effect, permit, {
+            outcome: 'succeeded',
+            resultDigest,
+            exposure: knownEffectExposure(callState.effect.intent.exposure.quantities)
+          });
+      if (settled && settled.status !== 'settled' && settled.status !== 'already_settled') {
         throw new AgentRunConflictError(
           runId,
           'idempotency_conflict',
           `Tool effect ${input.effectId} settlement authority was rejected: ${settled.status}.`
         );
       }
-      const state = decodeAgentRunState({
+      const state: AgentRunState = Object.freeze({
         ...current.state,
         revision: current.state.revision + 1,
         toolBatches: replaceAt(current.state.toolBatches, batchIndex, {
           ...batch,
-          callStates: replaceAt(batch.callStates, callIndex, {
-            stage: 'settled',
-            plan: callState.plan,
-            toolAttempt: callState.toolAttempt,
-            effect: settled.state,
-            settlement
-          })
+          callStates: replaceAt(
+            batch.callStates,
+            callIndex,
+            settled
+              ? {
+                  stage: 'settled',
+                  plan: callState.plan,
+                  toolAttempt: callState.toolAttempt,
+                  effect: settled.state,
+                  settlement
+                }
+              : {
+                  stage: 'outcome_unknown',
+                  plan: callState.plan,
+                  toolAttempt: callState.toolAttempt,
+                  effect: callState.effect
+                }
+          )
         })
       });
-      const result = await this.events.appendConditional(
-        runId,
-        transitionEvent(current.state, state),
-        {
-          idempotencyKey: `${runId}:tool-effect:${input.effectId}:settled:${resultDigest}`,
-          expectedTail: current.tail,
-          driverGeneration: current.state.driverGeneration
+      let event: Extract<AgentEvent, { readonly type: 'run.state.transitioned' }>;
+      try {
+        event = await transitionEvent(current.state, state, this.records);
+      } catch (error) {
+        if (error instanceof AgentRunRecordStorageError) {
+          const loss = await this.events.appendConditional(
+            runId,
+            {
+              type: 'run.record.unavailable',
+              runId,
+              effectId: input.effectId,
+              resultDigest,
+              message: error.message
+            },
+            {
+              expectedTail: current.tail,
+              driverGeneration: current.state.driverGeneration,
+              idempotencyKey: `${runId}:tool-effect:${input.effectId}:record-unavailable:${resultDigest}`
+            }
+          );
+          acceptConditionalResult(runId, loss);
         }
-      );
+        throw error;
+      }
+      const result = await this.events.appendConditional(runId, event, {
+        idempotencyKey: `${runId}:tool-effect:${input.effectId}:settled:${resultDigest}`,
+        expectedTail: current.tail,
+        driverGeneration: current.state.driverGeneration
+      });
       if (
         result.kind === 'rejected' &&
         (result.reason === 'stale_tail' || result.reason === 'stale_driver')
@@ -378,14 +479,61 @@ export class AgentRunCoordinator {
       return this.inspect(runId);
     }
   }
+  private async findToolSettlement(
+    runId: string,
+    effectId: string
+  ): Promise<
+    | (Extract<AgentToolCallState, { readonly stage: 'settled' | 'recording' | 'recorded' }> & {
+        readonly effect: NonNullable<
+          Extract<AgentToolCallState, { readonly stage: 'settled' }>['effect']
+        >;
+      })
+    | undefined
+  > {
+    const through = await this.events.tail(runId);
+    let cursor = -1;
+    for (;;) {
+      const page = await this.events.readRange(runId, {
+        afterSequence: cursor,
+        through,
+        types: ['run.state.transitioned']
+      });
+      if (page.oversized)
+        throw new Error('Historical settlement transition exceeds its record bound.');
+      for (const event of page.records) {
+        if (
+          event.event.type !== 'run.state.transitioned' ||
+          event.event.transition.kind !== 'updated'
+        )
+          continue;
+        for (const entry of event.event.transition.toolRecords ?? []) {
+          const batch = await this.records.loadTools(runId, entry.value);
+          for (const call of batch.callStates)
+            if (
+              (call.stage === 'settled' ||
+                call.stage === 'recording' ||
+                call.stage === 'recorded') &&
+              call.effect?.intent.effectId === effectId
+            )
+              return { ...call, effect: call.effect };
+        }
+      }
+      if (page.complete) return undefined;
+      if (page.nextSequence <= cursor)
+        throw new Error('Historical settlement lookup made no progress.');
+      cursor = page.nextSequence;
+    }
+  }
 }
 
 export class AgentRunDriver {
+  private readonly coordinator: AgentRunCoordinator;
   private queue: Promise<void> = Promise.resolve();
   private readonly generation: number;
 
   constructor(
     private readonly events: EventRepository<AgentEvent>,
+    readonly artifacts: ArtifactRepository,
     private stateValue: AgentRunState,
     private tailValue: EventLedgerTail,
     private transitionValue: Readonly<{
@@ -396,6 +544,7 @@ export class AgentRunDriver {
     readonly driverId: string
   ) {
     this.generation = stateValue.driverGeneration;
+    this.coordinator = new AgentRunCoordinator(events, artifacts);
   }
 
   state(): AgentRunState {
@@ -408,12 +557,17 @@ export class AgentRunDriver {
       if (inspection.instruction.kind === 'complete')
         return Object.freeze({ kind: 'complete', inspection });
       if (inspection.instruction.kind === 'wait')
-        return Object.freeze({ kind: 'waiting', inspection, reason: inspection.instruction.reason });
+        return Object.freeze({
+          kind: 'waiting',
+          inspection,
+          reason: inspection.instruction.reason
+        });
       const advance = await execute(
         Object.freeze({
           state: this.stateValue,
           instruction: inspection.instruction,
-          append: (event: AgentAuditEvent, idempotencyKey: string) => this.appendNow(event, idempotencyKey)
+          append: (event: AgentAuditEvent, idempotencyKey: string) =>
+            this.appendNow(event, idempotencyKey)
         })
       );
       const next = await this.transitionNow(
@@ -442,7 +596,7 @@ export class AgentRunDriver {
     readonly settlement: AgentToolSettlementRecord;
   }): Promise<AgentRunInspection> {
     return this.serial(async () => {
-      await new AgentRunCoordinator(this.events).settleToolEffect(this.stateValue.runId, input);
+      await this.coordinator.settleToolEffect(this.stateValue.runId, input);
       await this.refresh();
       return this.inspection();
     });
@@ -475,10 +629,69 @@ export class AgentRunDriver {
     });
   }
 
+  resumeContextAdmission(input: {
+    readonly expectedRevision: number;
+    readonly inputIdentity: string;
+  }): Promise<AgentRunInspection> {
+    return this.serial(async () => {
+      await this.refresh();
+      const state = this.stateValue;
+      if (
+        state.revision !== input.expectedRevision ||
+        state.phase.kind !== 'suspended' ||
+        state.phase.reason !== 'context_admission'
+      )
+        throw new AgentRunConflictError(
+          state.runId,
+          'stale_tail',
+          'Context suspension changed during admission.'
+        );
+      if (
+        state.providerRequests.some(
+          (request) => request.stage !== 'ready' && request.stage !== 'consumed'
+        ) ||
+        state.toolBatches.some(
+          (batch) =>
+            !batch.callStates.every(
+              (call) =>
+                call.stage === 'resolved' || call.stage === 'cancelled' || call.stage === 'recorded'
+            )
+        )
+      )
+        throw new Error('Context admission cannot bypass unresolved provider or tool obligations.');
+      this.assertTransitionAuthority({
+        kind: 'initializing',
+        step: 'assemble_turn',
+        turnIndex: state.phase.turnIndex
+      });
+      return this.commitState({
+        phase: { kind: 'initializing', step: 'assemble_turn', turnIndex: state.phase.turnIndex },
+        providerRequests: []
+      });
+    });
+  }
+
+  recordBudget(
+    update: (budget: AgentRunBudgetState | undefined) => AgentRunBudgetState
+  ): Promise<AgentRunInspection> {
+    return this.serial(async () => {
+      await this.refresh();
+      this.assertTransitionAuthority(this.stateValue.phase);
+      return this.commitState({
+        phase: this.stateValue.phase,
+        budget: update(this.stateValue.budget)
+      });
+    });
+  }
+
   transitionTool(
     procedure: AgentRunProcedure,
     target: Pick<AgentToolTarget, 'toolBatchId' | 'callIndex'>,
-    update: (call: AgentToolCallState, batch: AgentToolPhase, state: AgentRunState) => AgentToolCallState,
+    update: (
+      call: AgentToolCallState,
+      batch: AgentToolPhase,
+      state: AgentRunState
+    ) => AgentToolCallState,
     budget?: AgentRunBudgetState
   ): Promise<AgentRunInspection> {
     return this.transition(
@@ -531,7 +744,8 @@ export class AgentRunDriver {
   ): Promise<AgentRunInspection> {
     const owned = decodeToolResultDelivery(delivery);
     return this.transitionTool('record_tool_delivery', target, (call) => {
-      if (call.stage !== 'recorded') throw new TypeError('Only a recorded observation can be delivered.');
+      if (call.stage !== 'recorded')
+        throw new TypeError('Only a recorded observation can be delivered.');
       return Object.freeze({ ...call, delivery: owned });
     });
   }
@@ -565,17 +779,21 @@ export class AgentRunDriver {
           this.stateValue.phase.kind === 'suspended' && this.stateValue.phase.reason === 'approval'
             ? { kind: 'active' }
             : this.stateValue.phase,
-        toolBatches: replaceAt(this.stateValue.toolBatches, this.stateValue.toolBatches.indexOf(batch), {
-          ...batch,
-          callStates: replaceAt(
-            batch.callStates,
-            callIndex,
-            Object.freeze({
-              stage: 'ready',
-              approved: Object.freeze({ approval: call.approval, decision: input.decision })
-            })
-          )
-        })
+        toolBatches: replaceAt(
+          this.stateValue.toolBatches,
+          this.stateValue.toolBatches.indexOf(batch),
+          {
+            ...batch,
+            callStates: replaceAt(
+              batch.callStates,
+              callIndex,
+              Object.freeze({
+                stage: 'ready',
+                approved: Object.freeze({ approval: call.approval, decision: input.decision })
+              })
+            )
+          }
+        )
       });
     });
   }
@@ -600,21 +818,26 @@ export class AgentRunDriver {
             `Driver ${this.driverId} cannot abort run ${this.stateValue.runId}.`
           );
         }
-        const state = decodeAgentRunState({
+        const state: AgentRunState = Object.freeze({
           ...this.stateValue,
           revision: this.stateValue.revision + 1,
-          control: { status: 'abort_requested', driverId: this.driverId, reason }
+          control: Object.freeze({
+            status: 'abort_requested' as const,
+            driverId: this.driverId,
+            reason
+          })
         });
-        const event = transitionEvent(this.stateValue, state);
-        const result = await this.events.appendConditional(
-          state.runId,
-          event,
-          {
-            idempotencyKey: transitionKey(state, event.transition),
-            expectedTail: this.tailValue,
-            driverGeneration: state.driverGeneration
-          }
+        assertAgentRunStateInvariants(state);
+        const event = await transitionEvent(
+          this.stateValue,
+          state,
+          new AgentRunRecords(this.artifacts)
         );
+        const result = await this.events.appendConditional(state.runId, event, {
+          idempotencyKey: transitionKey(state, event.transition),
+          expectedTail: this.tailValue,
+          driverGeneration: state.driverGeneration
+        });
         if (result.kind === 'rejected' && result.reason === 'stale_tail') continue;
         if (result.kind === 'rejected' && result.reason === 'stale_driver') await this.refresh();
         const committed = acceptConditionalResult(state.runId, result);
@@ -626,14 +849,20 @@ export class AgentRunDriver {
     });
   }
 
-  private async appendNow(event: AgentAuditEvent, idempotencyKey: string): Promise<EventAppendReceipt> {
+  private async appendNow(
+    event: AgentAuditEvent,
+    idempotencyKey: string
+  ): Promise<EventAppendReceipt> {
     this.assertEventAuthority(event);
     const result = await this.events.appendConditional(this.stateValue.runId, event, {
       idempotencyKey,
       expectedTail: this.tailValue,
       driverGeneration: this.stateValue.driverGeneration
     });
-    if (result.kind === 'rejected' && (result.reason === 'stale_tail' || result.reason === 'stale_driver'))
+    if (
+      result.kind === 'rejected' &&
+      (result.reason === 'stale_tail' || result.reason === 'stale_driver')
+    )
       await this.refresh();
     const committed = acceptConditionalResult(this.stateValue.runId, result);
     this.tailValue = committed.tail;
@@ -654,32 +883,75 @@ export class AgentRunDriver {
   }
 
   private async commitState(advance: AgentRunAdvance): Promise<AgentRunInspection> {
-    const state = decodeAgentRunState({
+    const requests = advance.providerRequests ?? this.stateValue.providerRequests;
+    const batches = advance.toolBatches ?? this.stateValue.toolBatches;
+    const releaseCompleted =
+      advance.phase.kind === 'initializing' ||
+      advance.phase.kind === 'finalization' ||
+      advance.phase.kind === 'terminal' ||
+      requests.some(
+        (request) =>
+          !this.stateValue.providerRequests.includes(request) && request.stage === 'ready'
+      );
+    const state: AgentRunState = Object.freeze({
       ...this.stateValue,
       revision: this.stateValue.revision + 1,
       phase: advance.phase,
-      providerRequests: advance.providerRequests ?? this.stateValue.providerRequests,
-      toolBatches: advance.toolBatches ?? this.stateValue.toolBatches,
+      providerRequests: Object.freeze(
+        releaseCompleted
+          ? requests.filter(
+              (request) =>
+                request.stage !== 'consumed' ||
+                !this.stateValue.providerRequests.some(
+                  (previous) =>
+                    previous.stage === 'consumed' &&
+                    previous.identity.turnId === request.identity.turnId &&
+                    previous.identity.requestAttempt === request.identity.requestAttempt
+                )
+            )
+          : [...requests]
+      ),
+      toolBatches: Object.freeze(
+        releaseCompleted
+          ? batches.filter(
+              (batch) =>
+                !toolWorkResolved(batch) ||
+                !this.stateValue.toolBatches.some(
+                  (previous) =>
+                    previous.toolBatchId === batch.toolBatchId && toolWorkResolved(previous)
+                )
+            )
+          : [...batches]
+      ),
       ...(advance.budget === undefined
         ? this.stateValue.budget === undefined
           ? {}
           : { budget: this.stateValue.budget }
         : { budget: advance.budget })
     });
-    const event = transitionEvent(this.stateValue, state);
-    const result = await this.events.appendConditional(
-      state.runId,
-      event,
-      {
-        idempotencyKey: transitionKey(state, event.transition),
-        expectedTail: this.tailValue,
-        driverGeneration: state.driverGeneration
-      }
+    assertAgentRunStateInvariants(state);
+    const event = await transitionEvent(
+      this.stateValue,
+      state,
+      new AgentRunRecords(this.artifacts)
     );
-    if (result.kind === 'rejected' && (result.reason === 'stale_tail' || result.reason === 'stale_driver'))
+    const ownedState = await applyAgentRunStateTransition(
+      this.stateValue,
+      event.transition,
+      new AgentRunRecords(this.artifacts)
+    );
+    const result = await this.events.appendConditional(state.runId, event, {
+      idempotencyKey: transitionKey(state, event.transition),
+      expectedTail: this.tailValue,
+      driverGeneration: state.driverGeneration
+    });
+    if (
+      result.kind === 'rejected' &&
+      (result.reason === 'stale_tail' || result.reason === 'stale_driver')
+    )
       await this.refresh();
     const committed = acceptConditionalResult(state.runId, result);
-    this.stateValue = state;
+    this.stateValue = ownedState;
     this.tailValue = committed.tail;
     this.transitionValue = committed.receipt;
     return this.inspection();
@@ -699,10 +971,39 @@ export class AgentRunDriver {
   }
 
   private async refresh(): Promise<void> {
-    const current = await new AgentRunCoordinator(this.events).inspect(this.stateValue.runId);
-    this.stateValue = current.state;
-    this.tailValue = current.tail;
-    this.transitionValue = current.transition;
+    const tail = await this.events.tail(this.stateValue.runId);
+    if (
+      tail.sequence === this.tailValue.sequence &&
+      tail.hash === this.tailValue.hash &&
+      tail.driverGeneration === this.tailValue.driverGeneration
+    )
+      return;
+    let cursor = this.tailValue.sequence;
+    const records = new AgentRunRecords(this.artifacts);
+    for (;;) {
+      const page = await this.events.readRange(this.stateValue.runId, {
+        afterSequence: cursor,
+        through: tail,
+        types: ['run.state.transitioned']
+      });
+      if (page.oversized)
+        throw new Error('Run transition exceeds its independently bounded record size.');
+      for (const record of page.records) {
+        if (record.event.type !== 'run.state.transitioned') continue;
+        this.stateValue = await applyAgentRunStateTransition(
+          this.stateValue,
+          record.event.transition,
+          records
+        );
+        if (this.stateValue.driverGeneration !== record.driverGeneration)
+          throw new Error('Run transition changed driver fencing.');
+        this.transitionValue = record;
+      }
+      if (page.complete) break;
+      if (page.nextSequence <= cursor) throw new Error('Run transition reader made no progress.');
+      cursor = page.nextSequence;
+    }
+    this.tailValue = tail;
   }
 
   private assertEventAuthority(event: AgentAuditEvent): void {
@@ -796,13 +1097,14 @@ function acceptConditionalResult(
   );
 }
 
-function transitionEvent(
+async function transitionEvent(
   previous: AgentRunState | undefined,
-  state: AgentRunState
-): Extract<AgentEvent, { readonly type: 'run.state.transitioned' }> {
+  state: AgentRunState,
+  records: AgentRunRecords
+): Promise<Extract<AgentEvent, { readonly type: 'run.state.transitioned' }>> {
   return Object.freeze({
     type: 'run.state.transitioned',
-    transition: createAgentRunStateTransition(previous, state)
+    transition: await createAgentRunStateTransition(previous, state, records)
   });
 }
 
@@ -814,7 +1116,12 @@ function toolSettlementDigest(settlement: AgentToolSettlementRecord): string {
   return hashJson(
     Object.freeze({
       observationId: settlement.observationId,
-      observation: encodeToolObservation(settlement.observation),
+      ...(settlement.observation
+        ? { observation: encodeToolObservation(settlement.observation) }
+        : {}),
+      original: settlement.original,
+      modelContent: settlement.modelContent,
+      ...(settlement.modelContentRef ? { modelContentRef: settlement.modelContentRef } : {}),
       createdAt: settlement.createdAt
     })
   );
@@ -823,7 +1130,7 @@ function toolSettlementDigest(settlement: AgentToolSettlementRecord): string {
 function abortAdministrativeEvent(event: AgentAuditEvent): boolean {
   return (
     event.type === 'context.transition.requested' ||
-    event.type === 'context.transition.admitted' ||
+    event.type === 'context.transition.bound' ||
     event.type === 'context.transition.completed' ||
     event.type === 'context.transition.rejected' ||
     event.type === 'run.finalization.staged' ||
@@ -834,12 +1141,20 @@ function abortAdministrativeEvent(event: AgentAuditEvent): boolean {
   );
 }
 
-function advanceMatchesProcedure(procedure: AgentRunProcedure, phase: AgentRunControlPhase): boolean {
+function advanceMatchesProcedure(
+  procedure: AgentRunProcedure,
+  phase: AgentRunControlPhase
+): boolean {
   switch (procedure) {
     case 'initialize_run':
       return phase.kind === 'initializing' || phase.kind === 'finalization';
     case 'assemble_turn':
-      return phase.kind === 'active' || phase.kind === 'finalization' || phase.kind === 'cancelling';
+      return (
+        phase.kind === 'active' ||
+        phase.kind === 'finalization' ||
+        phase.kind === 'cancelling' ||
+        (phase.kind === 'suspended' && phase.reason === 'context_admission')
+      );
     case 'authorize_provider_request':
     case 'start_provider_request':
     case 'reconcile_provider_request':
@@ -862,7 +1177,9 @@ function advanceMatchesProcedure(procedure: AgentRunProcedure, phase: AgentRunCo
     case 'reconcile_finalization':
       return phase.kind === 'finalization' || phase.kind === 'terminal';
     case 'finalize_abort':
-      return phase.kind === 'cancelling' || phase.kind === 'finalization' || phase.kind === 'terminal';
+      return (
+        phase.kind === 'cancelling' || phase.kind === 'finalization' || phase.kind === 'terminal'
+      );
   }
 }
 
@@ -896,7 +1213,9 @@ function assertWorkAdvance(
       if (
         procedure === 'plan_tool_call' &&
         (state.phase.kind !== 'active' ||
-          state.toolBatches.some((item) => item.callStates.some((entry) => entry.stage === 'approval')))
+          state.toolBatches.some((item) =>
+            item.callStates.some((entry) => entry.stage === 'approval')
+          ))
       ) {
         throw new TypeError('Tool admission is quiesced for this run.');
       }
@@ -905,7 +1224,9 @@ function assertWorkAdvance(
         if (
           state.phase.kind !== 'active' ||
           state.control.status !== 'owned' ||
-          state.toolBatches.some((item) => item.callStates.some((entry) => entry.stage === 'approval')) ||
+          state.toolBatches.some((item) =>
+            item.callStates.some((entry) => entry.stage === 'approval')
+          ) ||
           !isToolCallStartable(batch, callIndex, state.driverGeneration, state.toolBatches)
         ) {
           throw new AgentToolStartBlockedError();
@@ -963,8 +1284,14 @@ function assertToolAdvance(
                     ['cancelled', 'outcome_unknown', 'settled', 'recorded'].includes(next.stage)
                   : false;
   if (!valid)
-    throw new TypeError(`Procedure ${procedure} cannot change tool ${previous.stage} to ${next.stage}.`);
-  if (procedure === 'record_tool_delivery' && previous.stage === 'recorded' && next.stage === 'recorded') {
+    throw new TypeError(
+      `Procedure ${procedure} cannot change tool ${previous.stage} to ${next.stage}.`
+    );
+  if (
+    procedure === 'record_tool_delivery' &&
+    previous.stage === 'recorded' &&
+    next.stage === 'recorded'
+  ) {
     const { delivery: oldDelivery, ...oldRecord } = previous;
     const { delivery: newDelivery, ...newRecord } = next;
     if (!newDelivery || hashJson(oldRecord) !== hashJson(newRecord)) {
@@ -1033,12 +1360,14 @@ function assertProviderAdvance(
     procedure === 'authorize_provider_request'
       ? previous.stage === 'ready' && next.stage === 'effect_ready'
       : procedure === 'start_provider_request'
-        ? previous.stage === 'effect_ready' && ['effect_pending', 'outcome_unknown'].includes(next.stage)
+        ? previous.stage === 'effect_ready' &&
+          ['effect_pending', 'outcome_unknown'].includes(next.stage)
         : procedure === 'reconcile_provider_request'
           ? ['effect_pending', 'effect_ready'].includes(previous.stage) &&
-            ['settled', 'outcome_unknown', 'effect_ready'].includes(next.stage)
+            ['settled', 'rejected', 'outcome_unknown', 'effect_ready'].includes(next.stage)
           : procedure === 'consume_provider_settlement'
-            ? previous.stage === 'settled' && next.stage === 'consumed'
+            ? (previous.stage === 'settled' || previous.stage === 'rejected') &&
+              next.stage === 'consumed'
             : procedure === 'finalize_abort'
               ? next.stage === 'outcome_unknown'
               : false;
@@ -1064,4 +1393,14 @@ function replaceAt<T>(values: readonly T[], index: number, value: T): readonly T
   const next = [...values];
   next[index] = value;
   return Object.freeze(next);
+}
+
+function toolWorkResolved(batch: AgentToolPhase): boolean {
+  return batch.callStates.every(
+    (call) =>
+      call.stage === 'resolved' ||
+      call.stage === 'cancelled' ||
+      (call.stage === 'recorded' &&
+        (!batch.source.nativeCatalogIdentity || call.delivery?.status === 'applied'))
+  );
 }
