@@ -7,6 +7,7 @@ import {
   readFile,
   readdir,
   rename,
+  rm,
   symlink,
   writeFile
 } from 'node:fs/promises';
@@ -114,6 +115,44 @@ test('command execution is admitted by behavior and has a stable recovery identi
   assert.match(first.descriptor.recoveryIdentity, /^local-command:sha256:[a-f0-9]{64}$/u);
   await first.close();
   await second.close();
+});
+
+test('local process inspection and settlement notification report the owned command', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-core-process-inspection-'));
+  const files = testRootedFileAuthority(root);
+  const settled = [];
+  const execution = new LocalCommandExecution({
+    artifactRepository: new InMemoryArtifactRepository(),
+    rootedFileAuthority: files,
+    ledgerDirectory: path.join(root, 'processes'),
+    ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process,
+    onSettlement: (result) => settled.push(result)
+  });
+  t.after(async () => {
+    await execution.close();
+    files.close();
+    await rm(root, { recursive: true, force: true });
+  });
+  const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('done')")}`;
+  let result = await startCommand(execution, {
+    command,
+    rootedDirectory: '.',
+    pty: false,
+    timeoutMs: 5_000,
+    yieldMs: 0,
+    outputTokenBudget: 100,
+    owner: invocation
+  });
+  const listed = (await execution.listProcesses()).find((item) => item.processId === result.processId);
+  assert.equal(listed?.command, command);
+  assert.deepEqual(listed?.owner, invocation);
+  assert.match(listed?.revision ?? '', /^[a-f0-9]{64}$/u);
+  while (result.status === 'running')
+    result = await execution.query(result.processId, 100, 50, result.cursorEnd, invocation);
+  await execution.unreportedTerminalProcesses(invocation.ownerId);
+  assert.equal(settled.length, 1);
+  assert.equal(settled[0].processId, result.processId);
+  assert.equal(settled[0].status, 'exited');
 });
 
 test('command execution keeps the admitted physical working directory across a path swap', async () => {

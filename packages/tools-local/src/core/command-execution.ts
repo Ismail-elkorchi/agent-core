@@ -58,6 +58,7 @@ export interface LocalCommandExecutionOptions {
   readonly completedRetentionMs?: number;
   readonly maxPendingOutputBytes?: number;
   readonly ptyFactory?: PtyProcessFactory;
+  readonly onSettlement?: (result: CommandExecutionResult) => void | Promise<void>;
   readonly supervisorReleaseTimeoutMs?: number;
   readonly onSupervisorCheckpoint?: (
     checkpoint: 'supervisor_ready' | 'ledger_persisted' | 'released',
@@ -84,6 +85,7 @@ interface QueuedProgress {
 }
 interface ManagedProcess {
   readonly id: string;
+  readonly command: string;
   readonly owner: CommandExecutionOwner;
   readonly rootPath: string;
   readonly tree: SupervisedProcessTree;
@@ -320,6 +322,7 @@ export class LocalCommandExecution implements CommandExecution {
     });
     const record: ManagedProcess = {
       id,
+      command: request.command,
       owner: Object.freeze({ ...request.owner }),
       rootPath: this.options.rootedFileAuthority.identity.canonicalPath,
       tree,
@@ -643,6 +646,33 @@ export class LocalCommandExecution implements CommandExecution {
     await this.ready;
     for (const record of [...this.active.values()]) await this.terminate(record.id);
   }
+  async listProcesses(): Promise<readonly {
+    readonly processId: string;
+    readonly command: string;
+    readonly revision: string;
+    readonly owner: CommandExecutionOwner;
+    readonly status: CommandExecutionStatus;
+    readonly diagnostic?: string;
+  }[]> {
+    await this.ready;
+    return Object.freeze([...this.active.values(), ...this.completed.values()].map((record) =>
+      Object.freeze({
+        processId: record.id,
+        command: record.command,
+        revision: createHash('sha256').update(JSON.stringify([
+          record.id,
+          record.status,
+          record.cursor,
+          record.exitCode,
+          record.signal,
+          record.diagnostic
+        ])).digest('hex'),
+        owner: record.owner,
+        status: record.status,
+        ...(record.diagnostic === undefined ? {} : { diagnostic: record.diagnostic })
+      })
+    ));
+  }
   has(processId: string): boolean {
     this.pruneExpired();
     return (
@@ -850,6 +880,14 @@ export class LocalCommandExecution implements CommandExecution {
       terminal: result,
       ...(artifacts.protectedArtifact ? { protectedArtifact: artifacts.protectedArtifact } : {})
     });
+    try {
+      await this.options.onSettlement?.(result);
+    } catch (error) {
+      record.diagnostic = appendDiagnostic(
+        record.diagnostic,
+        `Settlement notification failed: ${errorMessage(error)}`
+      );
+    }
     record.retention ??= setTimeout(() => {
       void this.expire(record.id).catch((error: unknown) => {
         record.diagnostic = appendDiagnostic(
