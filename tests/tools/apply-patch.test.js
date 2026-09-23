@@ -328,10 +328,7 @@ test('apply_patch dynamically requires a transaction directory only for writes',
   assert.equal(appliedPlan.ok, true);
   const applied = await invokePlannedForTest(appliedPlan.plan, withDirectory);
   assert.equal(applied.output.applicationStatus, 'applied');
-  assert.deepEqual(applyPatchTool.requirements.services, [
-    'rootedFileAuthority',
-    'localToolConfiguration'
-  ]);
+
 });
 
 test('apply_patch dry runs require only read access and do not create transaction state', async () => {

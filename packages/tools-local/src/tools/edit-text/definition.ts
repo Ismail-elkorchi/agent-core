@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
-import { defineTool, isRiskAllowed, requireToolService, ToolInputError } from '@agent-core/tools';
+import { defineTool, isWorkspaceFiles, isRiskAllowed, requireToolService, ToolInputError } from '@agent-core/tools';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
 import { FILES_SCOPE, PATCH_JOURNAL_SCOPE, fileScope } from '../../core/resources.js';
 import { buildEditTextContent } from '../../core/model-content.js';
-import { requireRootedFileAuthority } from '../../core/rooted-files.js';
+import { canonicalFilePath, requireFileAuthority } from '../../core/rooted-files.js';
 import { isTextPatchJournal, type TextPatchJournal } from '../../core/text-write.js';
 import {
   editText,
@@ -19,11 +19,11 @@ export const editTextTool = defineTool({
   description:
     'Atomically replace exact half-open Unicode-scalar ranges in one or more rooted UTF-8 text files.',
   promptGuide:
-    'Ranges use one-based lines and one-based Unicode-scalar columns with an excluded end position. Supply the exact complete-file SHA-256 and exact expected text for every replacement.',
+    'Ranges use one-based lines and one-based Unicode-scalar columns with an excluded end position. Supply the exact complete-file SHA-256 and exact expected text for every replacement. Ranges must not overlap. Replacement text is inserted literally, including any explicit newline changes.',
   schema: editTextInputSchema,
   outputSchema: editTextOutputSchema,
   buildModelContent: buildEditTextContent,
-  requirements: { services: ['rootedFileAuthority', 'localToolConfiguration'] },
+  requirements: { services: ['localToolConfiguration'] },
   effectEnvelope: {
     accesses: [
       { mode: 'read', scope: FILES_SCOPE },
@@ -32,7 +32,7 @@ export const editTextTool = defineTool({
     lockScopes: [FILES_SCOPE, PATCH_JOURNAL_SCOPE]
   },
   canonicalizeInput(input, context): CanonicalEditTextInput {
-    const root = requireRootedFileAuthority(context);
+    const root = requireFileAuthority(context);
     const limits = requireLocalToolConfiguration(context).editText;
     if (input.files.length > limits.maxFiles)
       throw new ToolInputError(
@@ -45,7 +45,7 @@ export const editTextTool = defineTool({
         );
       return Object.freeze({
         ...file,
-        path: root.canonicalPath(file.path),
+        path: canonicalFilePath(root, file.path),
         edits: Object.freeze(
           file.edits.map((edit) =>
             Object.freeze({
@@ -76,7 +76,7 @@ export const editTextTool = defineTool({
         `Replacement text contains ${String(replacementBytes)} bytes; the host maximum is ${String(limits.maxTotalReplacementBytes)}.`
       );
     const dryRun = input.dryRun || context.policy.dryRunWrites === true;
-    const transactionId = dryRun ? dryRunTransactionId(files) : editTransactionId(context);
+    const transactionId = dryRun || isWorkspaceFiles(root) ? editPlanId(files) : editTransactionId(context);
     return Object.freeze({ files: Object.freeze(files), dryRun, transactionId, limits });
   },
   snapshotInput(input) {
@@ -96,6 +96,8 @@ export const editTextTool = defineTool({
           ]
     );
     if (input.dryRun) return { accesses, lockScopes: [], recovery: { kind: 'unknown' as const } };
+    if (isWorkspaceFiles(requireFileAuthority(context)))
+      return { accesses, lockScopes: [FILES_SCOPE], recovery: { kind: 'unknown' as const } };
     const journal = requireToolService<TextPatchJournal>(
       context,
       'patchJournal',
@@ -129,6 +131,6 @@ function duplicatePaths(paths: readonly string[]): string[] {
   }
   return [...duplicates].sort();
 }
-function dryRunTransactionId(files: CanonicalEditTextInput['files']): string {
-  return `edit-dry-${createHash('sha256').update(JSON.stringify(files)).digest('hex')}`;
+function editPlanId(files: CanonicalEditTextInput['files']): string {
+  return `edit-plan-${createHash('sha256').update(JSON.stringify(files)).digest('hex')}`;
 }

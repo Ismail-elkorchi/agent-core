@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
-import { splitLogicalLines, ToolInputError } from '@agent-core/tools';
-import { rootedFileIdentitiesEqual, type RootedFileIdentity, type RootedFileAuthority } from './rooted-file-authority.js';
+import { ToolInputError } from '@agent-core/tools';
+import { canonicalFilePath, type FileAuthority } from './rooted-files.js';
+import { openFileRead } from './file-read.js';
+import type { FileRevision } from './file-transaction.js';
 
 export type TextFileFailureReason = 'not_found' | 'not_file' | 'binary' | 'invalid_utf8' | 'too_large' | 'symlink' | 'path_outside_root' | 'unsafe_link';
 
@@ -11,31 +13,28 @@ export interface TextFileFailure {
   readonly bytes?: number;
 }
 
-export interface TextFileData {
+export interface TextFileData extends FileRevision {
   readonly path: string;
-  readonly bytes: number;
   readonly mode: number;
-  readonly identity: RootedFileIdentity;
-  readonly sha256: string;
   readonly content: string;
-  readonly lines: readonly string[];
 }
 
-export async function inspectTextFile(root: RootedFileAuthority, requestedPath: string, maxBytes: number): Promise<
+export async function inspectTextFile(root: FileAuthority, requestedPath: string, maxBytes: number): Promise<
   | { readonly ok: true; readonly file: TextFileData }
   | { readonly ok: false; readonly failure: TextFileFailure }
 > {
   let displayPath: string;
-  try { displayPath = root.canonicalPath(requestedPath); }
+  try { displayPath = canonicalFilePath(root, requestedPath); }
   catch (error) {
     if (error instanceof ToolInputError) return { ok: false, failure: { path: requestedPath, reason: 'path_outside_root', message: error.message } };
     throw error;
   }
   let handle;
-  try { handle = await root.openFile(displayPath); }
+  try { handle = await openFileRead(root, displayPath); }
   catch (error) {
     const code = nodeCode(error);
     const message = error instanceof Error ? error.message : String(error);
+    if (code === 'ENOENT') return { ok: false, failure: { path: displayPath, reason: 'not_found', message } };
     if (/symbolic-link/iu.test(message)) return { ok: false, failure: { path: displayPath, reason: 'symlink', message } };
     if (/multiply linked/iu.test(message)) return { ok: false, failure: { path: displayPath, reason: 'unsafe_link', message } };
     if (/not a regular file/iu.test(message)) return { ok: false, failure: { path: displayPath, reason: 'not_file', message } };
@@ -46,28 +45,30 @@ export async function inspectTextFile(root: RootedFileAuthority, requestedPath: 
       return { ok: false, failure: { path: displayPath, reason: 'too_large', message: `File is too large to read inline (${String(handle.size)} bytes, max ${String(maxBytes)}): ${requestedPath}`, bytes: handle.size } };
     }
     const identity = handle.identity;
-    const buffer = await handle.readAll(maxBytes);
-    if (!rootedFileIdentitiesEqual(await handle.identityNow(), identity)) {
-      return { ok: false, failure: { path: displayPath, reason: 'not_file', message: `File changed while it was being read: ${requestedPath}` } };
+    const buffer = Buffer.alloc(handle.size);
+    let position = 0;
+    while (position < buffer.length) {
+      const count = await handle.read(buffer, position, Math.min(64 * 1024, buffer.length - position), position);
+      if (count === 0) throw new Error(`File ended while reading: ${requestedPath}`);
+      position += count;
     }
-    try {
-      if (!rootedFileIdentitiesEqual(await root.fileIdentity(displayPath), identity)) return { ok: false, failure: { path: displayPath, reason: 'not_file', message: `File was replaced while it was being read: ${requestedPath}` } };
-    } catch { return { ok: false, failure: { path: displayPath, reason: 'not_file', message: `File was replaced while it was being read: ${requestedPath}` } }; }
+    const sha256 = createHash('sha256').update(buffer).digest('hex');
+    if (!await handle.verify(sha256))
+      return { ok: false, failure: { path: displayPath, reason: 'not_file', message: `File changed while reading: ${requestedPath}` } };
     if (isProbablyBinary(buffer)) return { ok: false, failure: { path: displayPath, reason: 'binary', message: `Refusing probable binary file: ${requestedPath}`, bytes: handle.size } };
     let content: string;
-    try { content = new TextDecoder('utf-8', { fatal: true }).decode(buffer); }
+    try { content = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buffer); }
     catch { return { ok: false, failure: { path: displayPath, reason: 'invalid_utf8', message: `File is not valid UTF-8 text: ${requestedPath}`, bytes: handle.size } }; }
     return { ok: true, file: Object.freeze({
       path: displayPath, bytes: handle.size, mode: handle.mode, identity,
-      sha256: createHash('sha256').update(buffer).digest('hex'),
-      content, lines: Object.freeze(splitTextLines(content))
+      sha256,
+      content
     }) };
   } finally { await handle.close(); }
 }
 
 export function byteLengthUtf8(content: string): number { return Buffer.byteLength(content, 'utf8'); }
 export function sha256Text(content: string): string { return createHash('sha256').update(content).digest('hex'); }
-export function splitTextLines(content: string): string[] { return splitLogicalLines(content).lines; }
 
 export function isProbablyBinary(buffer: Buffer): boolean {
   const sample = buffer.subarray(0, Math.min(buffer.length, 8_000));

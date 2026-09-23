@@ -52,6 +52,11 @@ export interface WorkspaceFiles {
   normalize(path: string): string;
   stat(path: string): Promise<WorkspacePathStatus>;
   list(path: string): AsyncIterable<WorkspaceDirectoryEntry>;
+  /** Read at most length bytes from offset, identifying the complete source revision. */
+  readRange(
+    path: string,
+    range: { readonly offset: number; readonly length: number }
+  ): Promise<{ readonly bytes: Uint8Array; readonly revision: WorkspaceFileRevision }>;
   readFile(
     path: string,
     options?: { readonly maximumBytes?: number }
@@ -94,6 +99,7 @@ export function adoptWorkspaceFiles(value: unknown): WorkspaceFiles {
     'normalize',
     'stat',
     'list',
+    'readRange',
     'readFile',
     'transaction',
     'mkdir',

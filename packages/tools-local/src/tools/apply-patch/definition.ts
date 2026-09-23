@@ -1,8 +1,8 @@
 import { normalizePatchPath, operationAccesses, uniqueAccesses } from './effects.js';
-import { defineTool, isRiskAllowed, ToolInputError } from '@agent-core/tools';
+import { defineTool, isWorkspaceFiles, isRiskAllowed, ToolInputError } from '@agent-core/tools';
 import { PATCH_JOURNAL_SCOPE, FILES_SCOPE } from '../../core/resources.js';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
-import { requireRootedFileAuthority } from '../../core/rooted-files.js';
+import { canonicalFilePath, requireFileAuthority } from '../../core/rooted-files.js';
 import { buildApplyPatchContent } from '../../core/model-content.js';
 import { APPLY_PATCH_LARK_GRAMMAR } from './grammar.js';
 import { parseApplyPatch, type ParsedApplyPatch } from './patch-parser.js';
@@ -18,7 +18,7 @@ export const applyPatchTool = defineTool({
   schema: applyPatchInputSchema,
   outputSchema: applyPatchOutputSchema,
   buildModelContent: buildApplyPatchContent,
-  requirements: { services: ['rootedFileAuthority', 'localToolConfiguration'] },
+  requirements: { services: ['localToolConfiguration'] },
   textInput: {
     description:
       'Pass the patch document directly, starting with *** Begin Patch and ending with *** End Patch.',
@@ -35,7 +35,7 @@ export const applyPatchTool = defineTool({
     lockScopes: [FILES_SCOPE, PATCH_JOURNAL_SCOPE]
   },
   async canonicalizeInput(input, context): Promise<CanonicalApplyPatchInput> {
-    const root = requireRootedFileAuthority(context);
+    const root = requireFileAuthority(context);
     const limits = requireLocalToolConfiguration(context).applyPatch;
     let tree: ParsedApplyPatch;
     await context.emitProgress?.({
@@ -63,22 +63,28 @@ export const applyPatchTool = defineTool({
     });
     const requested = patchPaths(tree);
     for (const item of [...requested, ...Object.keys(input.expectedOldSha256 ?? {})]) {
-      const canonical = root.canonicalPath(item);
+      const canonical = canonicalFilePath(root, item);
       if (canonical !== normalizePatchPath(item))
         throw new ToolInputError(`Patch path is not canonical inside the rootPath: ${item}`, {
           path: item,
           canonical
         });
     }
+    for (const pathname of Object.keys(input.expectedOldSha256 ?? {})) {
+      if (!tree.operations.some((operation) => operation.kind !== 'add'
+        && normalizePatchPath(operation.path) === normalizePatchPath(pathname)))
+        throw new ToolInputError(`Patch precondition has no source operation: ${pathname}`);
+    }
     return { ...input, dryRun: input.dryRun || context.policy.dryRunWrites === true, tree, limits };
   },
-  deriveEffects(input) {
+  deriveEffects(input, context) {
     const accesses = uniqueAccesses(
       input.tree.operations.flatMap((operation) => operationAccesses(operation, input.dryRun))
     );
+    const workspace = isWorkspaceFiles(requireFileAuthority(context));
     const lockScopes = input.dryRun
       ? []
-      : [
+      : workspace ? [FILES_SCOPE] : [
           ...new Set([
             ...accesses.filter((access) => access.mode !== 'read').map((access) => access.scope),
             PATCH_JOURNAL_SCOPE

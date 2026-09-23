@@ -6,6 +6,12 @@ import {
 } from '@agent-core/tools';
 import { isRootedFileAuthority, type RootedFileAuthority } from './rooted-file-authority.js';
 
+export type FileAuthority = RootedFileAuthority | WorkspaceFiles;
+
+export function canonicalFilePath(root: FileAuthority, pathname: string): string {
+  return isWorkspaceFiles(root) ? root.normalize(pathname) : root.canonicalPath(pathname);
+}
+
 export function requireRootedFileAuthority(context: ToolExecutionContext): RootedFileAuthority {
   return requireToolService(
     context,
@@ -18,7 +24,7 @@ export function requireRootedFileAuthority(context: ToolExecutionContext): Roote
 /** A tool composition has exactly one filesystem authority. */
 export function requireFileAuthority(
   context: ToolExecutionContext
-): RootedFileAuthority | WorkspaceFiles {
+): FileAuthority {
   const workspace = context.services?.workspaceFiles;
   if (workspace === undefined) return requireRootedFileAuthority(context);
   if (context.services?.rootedFileAuthority !== undefined)
@@ -28,5 +34,5 @@ export function requireFileAuthority(
 }
 export function normalizeFilePath(context: ToolExecutionContext, pathname: string): string {
   const root = requireFileAuthority(context);
-  return isWorkspaceFiles(root) ? root.normalize(pathname) : root.canonicalPath(pathname);
+  return canonicalFilePath(root, pathname);
 }

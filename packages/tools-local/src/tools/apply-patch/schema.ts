@@ -1,4 +1,5 @@
 import * as z from 'zod';
+import { fileTransactionResultSchema, type FileTransactionResult } from '../../core/file-transaction.js';
 
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 
@@ -100,7 +101,7 @@ export interface ApplyPatchOutput {
   movedPaths: ApplyPatchPathPair[];
   wouldMovePaths: ApplyPatchPathPair[];
   potentiallyAffectedPaths: string[];
-  transaction?: import('../../core/text-write.js').TextTransactionResult;
+  transaction?: FileTransactionResult;
   totalOperationCount: number;
   totalHunkCount: number;
   totalAdditions: number;
@@ -141,21 +142,9 @@ export const applyPatchOutputSchema = z.strictObject({
   movedPaths: z.array(pathPairSchema),
   wouldMovePaths: z.array(pathPairSchema),
   potentiallyAffectedPaths: z.array(z.string()),
-  transaction: z.union([
-    z.strictObject({ outcome: z.literal('committed'), cleanup: recoverySchema() }),
-    z.strictObject({ outcome: z.literal('committed_with_residue'), cleanup: recoverySchema() }),
-    z.strictObject({ outcome: z.literal('rolled_back'), failure: transactionDiagnosticSchema(), rollback: recoverySchema() }),
-    z.strictObject({ outcome: z.literal('rollback_failed'), failure: transactionDiagnosticSchema(), rollback: recoverySchema() })
-  ]).optional(),
+  transaction: fileTransactionResultSchema.optional(),
   totalOperationCount: z.int().nonnegative(),
   totalHunkCount: z.int().nonnegative(),
   totalAdditions: z.int().nonnegative(),
   totalDeletions: z.int().nonnegative()
 });
-
-function transactionDiagnosticSchema() {
-  return z.strictObject({ action: z.string(), path: z.string(), message: z.string(), code: z.string().optional() });
-}
-function recoverySchema() {
-  return z.strictObject({ status: z.enum(['succeeded', 'failed', 'uncertain']), diagnostics: z.array(transactionDiagnosticSchema()), strandedPaths: z.array(z.string()) });
-}

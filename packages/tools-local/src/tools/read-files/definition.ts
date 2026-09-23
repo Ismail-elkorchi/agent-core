@@ -2,7 +2,7 @@ import { defineTool } from '@agent-core/tools';
 import { fileScope } from '../../core/resources.js';
 import { readFiles } from './run.js';
 import { buildReadFilesContent } from '../../core/model-content.js';
-import { requireRootedFileAuthority } from '../../core/rooted-files.js';
+import { canonicalFilePath, requireFileAuthority } from '../../core/rooted-files.js';
 import { readFilesInputSchema, readFilesOutputSchema } from './schema.js';
 
 export const readFilesTool = defineTool({
@@ -13,13 +13,13 @@ export const readFilesTool = defineTool({
   schema: readFilesInputSchema,
   outputSchema: readFilesOutputSchema,
   buildModelContent: buildReadFilesContent,
-  requirements: { services: ['rootedFileAuthority', 'localToolConfiguration'] },
+  requirements: { services: ['localToolConfiguration'] },
   effectEnvelope: { accesses: [{ mode: 'read', scope: 'files' }], lockScopes: [] },
   canonicalizeInput(input, context) {
-    const root = requireRootedFileAuthority(context);
+    const root = requireFileAuthority(context);
     return {
       ...input,
-      files: input.files.map((file) => ({ ...file, path: root.canonicalPath(file.path) }))
+      files: input.files.map((file) => ({ ...file, path: canonicalFilePath(root, file.path) }))
     };
   },
   deriveEffects(input) {

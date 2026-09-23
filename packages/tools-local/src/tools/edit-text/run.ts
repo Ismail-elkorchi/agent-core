@@ -5,20 +5,20 @@ import { parseJsonObject } from '@agent-core/json';
 import {
   invalidToolInputObservation,
   requireToolService,
+  isWorkspaceFiles,
   throwIfAborted,
   type ToolExecutionContext,
   type ToolObservationInput
 } from '@agent-core/tools';
 import { inspectTextFile, sha256Text, type TextFileData } from '../../core/filesystem.js';
 import { PATCH_JOURNAL_SCOPE, fileScope, rootedFileResource } from '../../core/resources.js';
-import { requireRootedFileAuthority } from '../../core/rooted-files.js';
+import { requireFileAuthority, requireRootedFileAuthority, type FileAuthority } from '../../core/rooted-files.js';
 import {
   isTextPatchJournal,
   withTextFilePatchJournal,
-  type TextPatchWritePlan,
-  type TextPatchJournal,
-  type TextTransactionResult
+  type TextPatchJournal
 } from '../../core/text-write.js';
+import { commitFileTransaction, type FileTransactionResult, type FileWritePlan } from '../../core/file-transaction.js';
 import {
   editTextRecoveryPayloadSchema,
   type EditTextFileOutput,
@@ -51,7 +51,7 @@ export interface CanonicalEditTextInput {
 
 interface PlannedFileEdit {
   readonly output: EditTextFileOutput;
-  readonly write?: TextPatchWritePlan;
+  readonly write?: FileWritePlan;
   readonly diffLines: readonly string[];
 }
 
@@ -60,7 +60,7 @@ export async function editText(
   context: ToolExecutionContext
 ): Promise<ToolObservationInput<EditTextOutput>> {
   throwIfAborted(context.signal);
-  const root = requireRootedFileAuthority(context);
+  const root = requireFileAuthority(context);
   const planned: PlannedFileEdit[] = [];
   const failures: { path: string; reason: string; message: string; editIndex?: number }[] = [];
   for (const file of input.files) {
@@ -92,14 +92,9 @@ export async function editText(
     wouldChangePaths: planned.filter((file) => file.output.changed).map((file) => file.output.path),
     diffSummary: summary
   };
-  if (input.dryRun) return observationFromPlan(recoveryPayload, true);
+  if (input.dryRun || recoveryPayload.wouldChangePaths.length === 0)
+    return observationFromPlan(recoveryPayload, input.dryRun);
 
-  const journal = requireToolService<TextPatchJournal>(
-    context,
-    'patchJournal',
-    isTextPatchJournal,
-    'adopted TextPatchJournal'
-  );
   await checkpoint(context, {
     type: 'status',
     stage: 'text_edit_planned',
@@ -108,23 +103,23 @@ export async function editText(
     total: planned.length
   });
   throwIfAborted(context.signal);
-  const transaction = await withTextFilePatchJournal(
-    root,
-    journal,
-    (authority) =>
-      authority.commit(
-        {
-          writes: planned.flatMap((file) => (file.write ? [file.write] : [])),
-          removes: []
-        },
-        {
-          transactionId: input.transactionId,
-          recoveryPayload: parseJsonObject(recoveryPayload),
-          ...(context.signal ? { signal: context.signal } : {})
-        }
-      ),
-    context.signal
-  );
+  const plan = {
+    writes: planned.flatMap((file) => file.write ? [file.write] : []),
+    removes: []
+  };
+  const options = {
+    transactionId: input.transactionId,
+    recoveryPayload: parseJsonObject(recoveryPayload),
+    ...(context.signal ? { signal: context.signal } : {})
+  };
+  const transaction = isWorkspaceFiles(root)
+    ? await commitFileTransaction(root, plan, options)
+    : await withTextFilePatchJournal(
+        root,
+        requireToolService<TextPatchJournal>(context, 'patchJournal', isTextPatchJournal, 'adopted TextPatchJournal'),
+        (authority) => commitFileTransaction(root, plan, options, authority),
+        context.signal
+      );
   await checkpoint(context, {
     type: 'status',
     stage: 'text_edit_transaction_finished',
@@ -199,7 +194,7 @@ export async function recoverEditText(
 }
 
 async function planFile(
-  root: import('../../core/rooted-file-authority.js').RootedFileAuthority,
+  root: FileAuthority,
   request: CanonicalEditTextInput['files'][number],
   limits: CanonicalEditTextInput['limits']
 ): Promise<
@@ -238,7 +233,10 @@ async function planFile(
   let previousStart = -1;
   let previousEnd = -1;
   const convention = newlineConvention(file.content);
-  for (const [editIndex, edit] of request.edits.entries()) {
+  const edits = request.edits.map((edit, editIndex) => ({ edit, editIndex })).sort((left, right) =>
+    left.edit.range.start.line - right.edit.range.start.line
+    || left.edit.range.start.column - right.edit.range.start.column);
+  for (const { editIndex, edit } of edits) {
     let start: number;
     let end: number;
     try {
@@ -262,12 +260,12 @@ async function planFile(
       });
       continue;
     }
-    if (start < previousStart || start < previousEnd) {
+    if (start <= previousStart || start < previousEnd) {
       failures.push({
         path: file.path,
         editIndex,
-        reason: 'overlapping_or_unordered_range',
-        message: 'Edit ranges must be ordered and non-overlapping.'
+        reason: 'overlapping_range',
+        message: 'Edit ranges must not overlap or share an insertion point.'
       });
       continue;
     }
@@ -278,20 +276,6 @@ async function planFile(
         editIndex,
         reason: 'expected_text_mismatch',
         message: `Expected text does not match range ${formatRange(edit.range)} in ${file.path}.`
-      });
-      continue;
-    }
-    const newlineFailure = validateReplacementNewlines(
-      convention,
-      edit.expectedText,
-      edit.replacementText
-    );
-    if (newlineFailure) {
-      failures.push({
-        path: file.path,
-        editIndex,
-        reason: 'newline_convention_mismatch',
-        message: newlineFailure
       });
       continue;
     }
@@ -347,21 +331,19 @@ async function planFile(
   };
 }
 
-function plannedWrite(file: TextFileData, content: string): TextPatchWritePlan {
+function plannedWrite(file: TextFileData, content: string): FileWritePlan {
   return {
     path: file.path,
     content,
     mode: file.mode,
-    overwrite: true,
-    expectedCurrentSha256: file.sha256,
-    expectedCurrentIdentity: file.identity
+    expected: file
   };
 }
 
 function observationFromPlan(
   payload: EditTextRecoveryPayload,
   dryRun: boolean,
-  transaction?: TextTransactionResult
+  transaction?: FileTransactionResult
 ): ToolObservationInput<EditTextOutput> {
   const wouldChangePaths = [...payload.wouldChangePaths];
   const transactionOutcome = transaction?.outcome;
@@ -430,8 +412,10 @@ function observationFromPlan(
 }
 
 function mutableTransaction(
-  transaction: TextTransactionResult
+  transaction: FileTransactionResult
 ): NonNullable<EditTextOutput['transaction']> {
+  if (transaction.outcome === 'committed' && !('cleanup' in transaction))
+    return { outcome: 'committed' };
   if (transaction.outcome === 'committed' || transaction.outcome === 'committed_with_residue') {
     return {
       outcome: transaction.outcome,
@@ -504,42 +488,6 @@ function newlineConvention(content: string): EditTextFileOutput['newlineConventi
     else lf += 1;
   }
   return lf > 0 && crlf > 0 ? 'mixed' : crlf > 0 ? 'crlf' : lf > 0 ? 'lf' : 'none';
-}
-
-function validateReplacementNewlines(
-  convention: EditTextFileOutput['newlineConvention'],
-  expected: string,
-  replacement: string
-): string | undefined {
-  const replacementTokens = newlineTokens(replacement);
-  if (replacementTokens.includes('cr'))
-    return 'Replacement text contains an unsupported lone carriage return.';
-  if (convention === 'none' && replacementTokens.length > 0)
-    return 'A file without a newline convention cannot receive new line breaks implicitly.';
-  if (convention === 'lf' && replacementTokens.includes('crlf'))
-    return 'Replacement text must preserve the file LF newline convention.';
-  if (convention === 'crlf' && replacementTokens.includes('lf'))
-    return 'Replacement text must preserve the file CRLF newline convention.';
-  if (
-    convention === 'mixed' &&
-    JSON.stringify(replacementTokens) !== JSON.stringify(newlineTokens(expected))
-  ) {
-    return 'Replacement text in a mixed-newline file must preserve the exact newline sequence of the replaced text.';
-  }
-  return undefined;
-}
-function newlineTokens(value: string): ('lf' | 'crlf' | 'cr')[] {
-  const tokens: ('lf' | 'crlf' | 'cr')[] = [];
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code === 0x0d) {
-      if (value.charCodeAt(index + 1) === 0x0a) {
-        tokens.push('crlf');
-        index += 1;
-      } else tokens.push('cr');
-    } else if (code === 0x0a) tokens.push('lf');
-  }
-  return tokens;
 }
 
 function preview(value: string): string {

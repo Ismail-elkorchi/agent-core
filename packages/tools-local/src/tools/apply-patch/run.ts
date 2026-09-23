@@ -1,14 +1,15 @@
 import type { ObservationAction, ToolResultFact } from '@agent-core/tools';
 import {
   requireToolService,
+  isWorkspaceFiles,
   throwIfAborted,
   ToolInputError,
   type ToolExecutionContext
 } from '@agent-core/tools';
 import { PATCH_JOURNAL_SCOPE, fileScope, rootedFileResource } from '../../core/resources.js';
 import type { ToolObservationInput } from '@agent-core/tools';
-import { requireRootedFileAuthority } from '../../core/rooted-files.js';
-import type { RootedFileAuthority } from '../../core/rooted-file-authority.js';
+import { canonicalFilePath, requireFileAuthority, type FileAuthority } from '../../core/rooted-files.js';
+import { commitFileTransaction, type FileTransactionResult, type FileWritePlan, type FileRemovePlan } from '../../core/file-transaction.js';
 import {
   byteLengthUtf8,
   inspectTextFile,
@@ -19,8 +20,6 @@ import { invalidToolInputObservation } from '@agent-core/tools';
 import {
   isTextPatchJournal,
   withTextFilePatchJournal,
-  type TextPatchRemovePlan,
-  type TextPatchWritePlan,
   type TextPatchJournal,
   type TextPatchJournalAuthority,
   type TextTransactionResult
@@ -53,8 +52,8 @@ export interface CanonicalApplyPatchInput extends ApplyPatchInput {
 
 interface PlannedPatchOperation {
   output: ApplyPatchFileOutput;
-  write?: TextPatchWritePlan;
-  remove?: TextPatchRemovePlan;
+  write?: FileWritePlan;
+  remove?: FileRemovePlan;
   parentDirsToCreate: readonly string[];
   createdPath?: string;
   deletedPath?: string;
@@ -67,9 +66,9 @@ export async function applyPatch(
   context: ToolExecutionContext
 ): Promise<ToolObservationInput<ApplyPatchOutput>> {
   throwIfAborted(context.signal);
-  const root = requireRootedFileAuthority(context);
+  const root = requireFileAuthority(context);
   const dryRun = input.dryRun;
-  const journal = dryRun
+  const journal = dryRun || isWorkspaceFiles(root)
     ? undefined
     : requireToolService<TextPatchJournal>(
         context,
@@ -77,7 +76,7 @@ export async function applyPatch(
         isTextPatchJournal,
         'adopted TextPatchJournal'
       );
-  if (journal)
+  if (journal && !isWorkspaceFiles(root))
     return withTextFilePatchJournal(
       root,
       journal,
@@ -92,7 +91,7 @@ export async function applyPatchWithAuthority(
   context: ToolExecutionContext,
   authority?: TextPatchJournalAuthority
 ): Promise<ToolObservationInput<ApplyPatchOutput>> {
-  const root = requireRootedFileAuthority(context);
+  const root = requireFileAuthority(context);
   const dryRun = input.dryRun;
   await context.emitProgress?.({
     type: 'status',
@@ -104,9 +103,10 @@ export async function applyPatchWithAuthority(
   const { planned, failures } = await planPatch(root, input);
 
   if (failures.length > 0) {
-    return invalidToolInputObservation('apply_patch', summarizePatchFailures(failures), {
-      failures
-    });
+    return {
+      ...invalidToolInputObservation('apply_patch', summarizePatchFailures(failures), { failures }),
+      execution: { state: 'not_started' }
+    };
   }
   await emitCheckpoint(context, {
     type: 'status',
@@ -118,10 +118,8 @@ export async function applyPatchWithAuthority(
 
   const changed = planned.filter((operation) => operation.output.plannedChange);
   let transactionOutcome: ApplyPatchOutput['transactionOutcome'];
-  let transaction: TextTransactionResult | undefined;
+  let transaction: FileTransactionResult | undefined;
   if (!dryRun && changed.length > 0) {
-    if (!authority)
-      throw new Error('Patch journal authority is unavailable for a write transaction.');
     throwIfAborted(context.signal);
     await context.emitProgress?.({
       type: 'status',
@@ -131,7 +129,7 @@ export async function applyPatchWithAuthority(
       total: changed.length
     });
     const transactionId = patchTransactionId(context);
-    transaction = await authority.commit(
+    transaction = await commitFileTransaction(root,
       {
         writes: changed.flatMap((operation) => (operation.write ? [operation.write] : [])),
         removes: changed.flatMap((operation) => (operation.remove ? [operation.remove] : [])),
@@ -140,7 +138,8 @@ export async function applyPatchWithAuthority(
       {
         ...(context.signal ? { signal: context.signal } : {}),
         ...(transactionId ? { transactionId } : {})
-      }
+      },
+      authority
     );
     transactionOutcome = transaction.outcome;
     if (transaction.outcome === 'rolled_back' || transaction.outcome === 'rollback_failed') {
@@ -273,7 +272,7 @@ export async function applyPatchWithAuthority(
 
 /** Builds the one transaction plan used by both dry-run and commit execution. */
 export async function planPatch(
-  root: RootedFileAuthority,
+  root: FileAuthority,
   input: CanonicalApplyPatchInput
 ): Promise<{
   readonly planned: PlannedPatchOperation[];
@@ -377,7 +376,7 @@ function observationActionForPatch(
 }
 
 async function planOperation(
-  root: RootedFileAuthority,
+  root: FileAuthority,
   operation: ParsedPatchOperation,
   input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
@@ -401,7 +400,7 @@ async function planOperation(
 }
 
 async function planAdd(
-  root: RootedFileAuthority,
+  root: FileAuthority,
   requestedPath: string,
   content: string,
   additions: number,
@@ -462,8 +461,7 @@ async function planAdd(
       write: {
         path: target.path,
         content,
-        overwrite: false,
-        expectedAbsent: true
+        expected: 'absent'
       },
       parentDirsToCreate: target.parentDirsToCreate,
       createdPath: target.path,
@@ -473,7 +471,7 @@ async function planAdd(
 }
 
 async function planDelete(
-  root: RootedFileAuthority,
+  root: FileAuthority,
   requestedPath: string,
   input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
@@ -525,8 +523,7 @@ async function planDelete(
       },
       remove: {
         path: inspected.file.path,
-        expectedCurrentSha256: oldSha256,
-        expectedCurrentIdentity: inspected.file.identity
+        expected: inspected.file
       },
       parentDirsToCreate: [],
       deletedPath: inspected.file.path,
@@ -536,7 +533,7 @@ async function planDelete(
 }
 
 async function planUpdate(
-  root: RootedFileAuthority,
+  root: FileAuthority,
   operation: Extract<ParsedPatchOperation, { kind: 'update' }>,
   input: CanonicalApplyPatchInput,
   reservedPaths: Set<string>
@@ -635,13 +632,11 @@ async function planUpdate(
           path: target.path,
           content: patched.content,
           mode: inspected.file.mode,
-          overwrite: false,
-          expectedAbsent: true
+          expected: 'absent'
         },
         remove: {
           path: inspected.file.path,
-          expectedCurrentSha256: oldSha256,
-          expectedCurrentIdentity: inspected.file.identity
+          expected: inspected.file
         },
         parentDirsToCreate: target.parentDirsToCreate,
         move: { sourcePath: inspected.file.path, destinationPath: target.path },
@@ -674,9 +669,7 @@ async function planUpdate(
               path: inspected.file.path,
               content: patched.content,
               mode: inspected.file.mode,
-              overwrite: true,
-              expectedCurrentSha256: oldSha256,
-              expectedCurrentIdentity: inspected.file.identity
+              expected: inspected.file
             }
           }
         : {}),
@@ -687,7 +680,7 @@ async function planUpdate(
 }
 
 async function inspectNewTarget(
-  root: RootedFileAuthority,
+  root: FileAuthority,
   requestedPath: string,
   existsReason: 'already_exists' | 'destination_exists'
 ): Promise<
@@ -696,7 +689,7 @@ async function inspectNewTarget(
 > {
   let normalizedPath: string;
   try {
-    normalizedPath = root.canonicalPath(requestedPath);
+    normalizedPath = canonicalFilePath(root, requestedPath);
   } catch (error) {
     if (error instanceof ToolInputError) {
       return {
@@ -707,7 +700,7 @@ async function inspectNewTarget(
     throw error;
   }
   try {
-    const status = await root.inspectPath(normalizedPath);
+    const status = await (isWorkspaceFiles(root) ? root.stat(normalizedPath) : root.inspectPath(normalizedPath));
     if (status.kind === 'symlink') {
       return {
         ok: false,
@@ -730,7 +723,20 @@ async function inspectNewTarget(
               : `Destination already exists: ${requestedPath}`
         }
       };
-    const parentDirsToCreate = await root.missingParentDirectories(normalizedPath);
+    let parentDirsToCreate: readonly string[];
+    if (isWorkspaceFiles(root)) {
+      const parts = normalizedPath.split('/');
+      for (let index = 1; index < parts.length; index++) {
+        const parent = await root.stat(parts.slice(0, index).join('/'));
+        if (parent.kind !== 'directory')
+          return { ok: false, failure: {
+            path: normalizedPath,
+            reason: parent.kind === 'absent' ? 'parent_missing' : 'parent_not_directory',
+            message: `Patch parent ${parts.slice(0, index).join('/')} must be an existing directory; this authority cannot create directories within a file transaction.`
+          } };
+      }
+      parentDirsToCreate = [];
+    } else parentDirsToCreate = await root.missingParentDirectories(normalizedPath);
     return {
       ok: true,
       path: normalizedPath,

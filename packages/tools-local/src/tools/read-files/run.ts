@@ -7,18 +7,19 @@ import {
 } from '@agent-core/tools';
 import { fileScope, rootedFileResource } from '../../core/resources.js';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
-import { requireRootedFileAuthority } from '../../core/rooted-files.js';
-import type { RootedFileIdentity, RootedFileAuthority } from '../../core/rooted-file-authority.js';
+import { canonicalFilePath, requireFileAuthority, type FileAuthority } from '../../core/rooted-files.js';
+import { openFileRead, FileChangedError } from '../../core/file-read.js';
 import type { ReadFileFailure, ReadFileResult, ReadFilesInput, ReadFilesOutput } from './schema.js';
 
 export async function readFiles(
   input: ReadFilesInput,
   context: ToolExecutionContext
 ): Promise<ToolObservationInput<ReadFilesOutput>> {
-  const root = requireRootedFileAuthority(context);
+  const root = requireFileAuthority(context);
   const limits = requireLocalToolConfiguration(context).readFiles;
   const files: ReadFileResult[] = [];
   const failures: ReadFileFailure[] = [];
+  const limitedRanges = new Set<ReadFileResult>();
   let remainingBytes = limits.maxTotalBytes;
   for (const [index, request] of input.files.entries()) {
     throwIfAborted(context.signal);
@@ -50,11 +51,13 @@ export async function readFiles(
     );
     if (result.ok) {
       files.push(result.value);
+      if (request.lineCount !== undefined && request.lineCount > lineCount && !result.value.eof)
+        limitedRanges.add(result.value);
       remainingBytes -= result.value.bytes;
     } else failures.push(result.failure);
   }
   const returnedBytes = files.reduce((sum, file) => sum + file.bytes, 0);
-  const coverage = failures.length === 0 ? ('complete' as const) : ('partial' as const);
+  const coverage = failures.length === 0 && limitedRanges.size === 0 ? ('complete' as const) : ('partial' as const);
   const output: ReadFilesOutput = {
     files,
     failures,
@@ -74,8 +77,8 @@ export async function readFiles(
     },
     ...(coverage === 'partial'
       ? {
-          causes: [...new Set(failures.map((failure) => failure.reason))],
-          omitted: { files: failures.length }
+          causes: [...new Set(failures.map((failure) => failure.reason)), ...(limitedRanges.size ? ['line_limit'] : [])],
+          omitted: { files: failures.length, ranges: limitedRanges.size }
         }
       : {})
   } as const;
@@ -89,7 +92,7 @@ export async function readFiles(
       ' requested files' +
       (coverage === 'partial' ? ' with partial coverage.' : '.'),
     scope,
-    observedFacts: { items: readFileObservedFacts(files, failures, scope) },
+    observedFacts: { items: readFileObservedFacts(files, failures, scope, limitedRanges) },
     output
   };
 }
@@ -100,7 +103,8 @@ function readFileObservedFacts(
   scope: {
     readonly filters?: import('@agent-core/json').JsonObject;
     readonly limits?: import('@agent-core/json').JsonObject;
-  }
+  },
+  limitedRanges: ReadonlySet<ReadFileResult>
 ): ToolResultFact[] {
   return [
     ...files.map((file): ToolResultFact => ({
@@ -124,8 +128,8 @@ function readFileObservedFacts(
       ],
       scope: {
         ...(scope.filters ? { filters: scope.filters } : {}),
-        coverage: 'complete',
-        truncated: false,
+        coverage: limitedRanges.has(file) ? 'partial' : 'complete',
+        truncated: limitedRanges.has(file),
         actuality: 'observed',
         limits: {
           ...(scope.limits ?? {}),
@@ -155,7 +159,7 @@ function readFileObservedFacts(
 
 type RangeRead = { ok: true; value: ReadFileResult } | { ok: false; failure: ReadFileFailure };
 async function readRange(
-  root: RootedFileAuthority,
+  root: FileAuthority,
   requestedPath: string,
   startLine: number,
   lineCount: number,
@@ -165,13 +169,13 @@ async function readRange(
 ): Promise<RangeRead> {
   let displayPath: string;
   try {
-    displayPath = root.canonicalPath(requestedPath);
+    displayPath = canonicalFilePath(root, requestedPath);
   } catch (error) {
     return failure(requestedPath, 'path_outside_root', errorMessage(error));
   }
   let handle;
   try {
-    handle = await root.openFile(displayPath);
+    handle = await openFileRead(root, displayPath);
   } catch (error) {
     return failure(
       displayPath,
@@ -180,7 +184,6 @@ async function readRange(
     );
   }
   try {
-    const initialIdentity = handle.identity;
     const fileBytes = handle.size;
     await context.emitProgress?.({
       type: 'status',
@@ -209,7 +212,7 @@ async function readRange(
         Math.min(chunk.length, fileBytes - position),
         position
       );
-      if (bytesRead === 0) break;
+      if (bytesRead === 0) throw new FileChangedError(displayPath);
       const bytes = chunk.subarray(0, bytesRead);
       fullHash.update(bytes);
       if (bytes.includes(0)) binary = true;
@@ -266,26 +269,9 @@ async function readRange(
         : previousByte === 0x0a && position >= fileBytes
           ? currentLine - 1
           : currentLine;
-    if (!sameIdentity(await handle.identityNow(), initialIdentity))
-      return failure(
-        displayPath,
-        'file_changed',
-        'File changed while it was being read: ' + requestedPath
-      );
-    try {
-      if (!sameIdentity(await root.fileIdentity(displayPath), initialIdentity))
-        return failure(
-          displayPath,
-          'file_changed',
-          'File was replaced while it was being read: ' + requestedPath
-        );
-    } catch {
-      return failure(
-        displayPath,
-        'file_changed',
-        'File was replaced while it was being read: ' + requestedPath
-      );
-    }
+    const fullFileSha256 = fullHash.digest('hex');
+    if (!await handle.verify(fullFileSha256))
+      return failure(displayPath, 'file_changed', `File changed while reading: ${requestedPath}`);
     if (fileBytes === 0 && startLine === 1) {
       const emptySha256 = createHash('sha256').update(Buffer.alloc(0)).digest('hex');
       return {
@@ -321,7 +307,7 @@ async function readRange(
     if (!validUtf8)
       return failure(displayPath, 'invalid_utf8', 'File is not valid UTF-8 text: ' + requestedPath);
     const raw = Buffer.concat(selected, selectedBytes);
-    const content = new TextDecoder('utf-8', { fatal: true }).decode(raw);
+    const content = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(raw);
     const eof = selectionEnd >= fileBytes;
     const rangeSha256 = createHash('sha256').update(raw).digest('hex');
     return {
@@ -337,11 +323,14 @@ async function readRange(
         truncated: !eof,
         ...(!eof ? { nextStartLine: startLine + selectedLines } : {}),
         rangeSha256,
-        fullFileSha256: fullHash.digest('hex'),
+        fullFileSha256,
         newlineConvention: lineEnding(lf, crlf),
         utf8Validation: 'valid'
       }
     };
+  } catch (error) {
+    throwIfAborted(context.signal);
+    return failure(displayPath, error instanceof FileChangedError ? 'file_changed' : 'unreadable', errorMessage(error));
   } finally {
     await handle.close();
   }
@@ -362,15 +351,4 @@ function nodeCode(error: unknown): string | undefined {
     typeof error.code === 'string'
     ? error.code
     : undefined;
-}
-function sameIdentity(left: RootedFileIdentity, right: RootedFileIdentity): boolean {
-  return (
-    left.device === right.device &&
-    left.inode === right.inode &&
-    left.mode === right.mode &&
-    left.links === right.links &&
-    left.size === right.size &&
-    left.modifiedNanoseconds === right.modifiedNanoseconds &&
-    left.changedNanoseconds === right.changedNanoseconds
-  );
 }

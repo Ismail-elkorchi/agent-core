@@ -1,4 +1,5 @@
 import * as z from 'zod';
+import { fileTransactionResultSchema } from '../../core/file-transaction.js';
 
 const unicodeTextSchema = z
   .string()
@@ -57,32 +58,6 @@ export const editTextFileOutputSchema = z.strictObject({
   newlineConvention: z.enum(['lf', 'crlf', 'mixed', 'none']),
   changedRanges: z.array(changedRangeSchema)
 });
-const transactionDiagnosticSchema = z.strictObject({
-  action: z.string(),
-  path: z.string(),
-  message: z.string(),
-  code: z.string().optional()
-});
-const recoverySchema = z.strictObject({
-  status: z.enum(['succeeded', 'failed', 'uncertain']),
-  diagnostics: z.array(transactionDiagnosticSchema),
-  strandedPaths: z.array(z.string())
-});
-const transactionSchema = z.union([
-  z.strictObject({ outcome: z.literal('committed'), cleanup: recoverySchema }),
-  z.strictObject({ outcome: z.literal('committed_with_residue'), cleanup: recoverySchema }),
-  z.strictObject({
-    outcome: z.literal('rolled_back'),
-    failure: transactionDiagnosticSchema,
-    rollback: recoverySchema
-  }),
-  z.strictObject({
-    outcome: z.literal('rollback_failed'),
-    failure: transactionDiagnosticSchema,
-    rollback: recoverySchema
-  })
-]);
-
 export const editTextOutputSchema = z.strictObject({
   applicationStatus: z.enum(['dry_run', 'no_change', 'applied', 'not_applied', 'uncertain']),
   transactionOutcome: z
@@ -100,7 +75,7 @@ export const editTextOutputSchema = z.strictObject({
     truncated: z.boolean(),
     totalChangedRanges: z.int().nonnegative()
   }),
-  transaction: transactionSchema.optional()
+  transaction: fileTransactionResultSchema.optional()
 });
 
 export const editTextRecoveryPayloadSchema = z.strictObject({
