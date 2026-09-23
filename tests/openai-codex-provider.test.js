@@ -17,6 +17,7 @@ test('Codex catalog efforts do not prevent low or high requests for Astra or oth
     auth: bearerProvider(codexJwt()),
     fetch: async (url, init) => {
       if (new URL(url).pathname.endsWith('/models')) {
+        assert.equal(new URL(url).searchParams.get('client_version'), '0.156.0');
         catalogRequests++;
         return jsonResponse({ models: ['gpt-6-astra', 'another-model'].map((slug) => ({
           slug,

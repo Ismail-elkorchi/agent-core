@@ -194,7 +194,7 @@ export class OpenAICodexProvider implements ModelProvider {
     if (this.catalog !== undefined && !options.refresh) return this.catalog;
     const token = await this.tokenForRequest(options.signal);
     const url = new URL(this.baseUrl.replace(/\/responses$/u, '/models'));
-    url.searchParams.set('client_version', '0.154.0');
+    url.searchParams.set('client_version', '0.156.0');
     const response = await this.fetchImpl(url, {
       headers: this.headersForRequest(token.token, this.codexAccountId(token), false),
       ...(options.signal === undefined ? {} : { signal: options.signal })
