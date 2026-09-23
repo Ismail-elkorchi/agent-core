@@ -1,25 +1,41 @@
 import * as z from 'zod';
 
+const unicodeTextSchema = z
+  .string()
+  .refine(
+    (value) => !/\p{Surrogate}/u.test(value),
+    'Text must contain well-formed Unicode scalar values.'
+  );
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/u);
 const positionSchema = z.strictObject({
   line: z.int().min(1).meta({ description: 'One-based line number.' }),
   column: z.int().min(1).meta({ description: 'One-based Unicode-scalar column.' })
 });
-const rangeSchema = z.strictObject({
-  start: positionSchema,
-  end: positionSchema
-}).meta({ description: 'Half-open range [start, end).' });
+const rangeSchema = z
+  .strictObject({
+    start: positionSchema,
+    end: positionSchema
+  })
+  .meta({ description: 'Half-open range [start, end).' });
 
 export const editTextInputSchema = z.strictObject({
-  files: z.array(z.strictObject({
-    path: z.string().trim().min(1),
-    expectedSha256: sha256Schema,
-    edits: z.array(z.strictObject({
-      range: rangeSchema,
-      expectedText: z.string(),
-      replacementText: z.string()
-    })).min(1)
-  })).min(1),
+  files: z
+    .array(
+      z.strictObject({
+        path: z.string().trim().min(1),
+        expectedSha256: sha256Schema,
+        edits: z
+          .array(
+            z.strictObject({
+              range: rangeSchema,
+              expectedText: unicodeTextSchema,
+              replacementText: unicodeTextSchema
+            })
+          )
+          .min(1)
+      })
+    )
+    .min(1),
   dryRun: z.boolean().default(false)
 });
 
@@ -42,7 +58,10 @@ export const editTextFileOutputSchema = z.strictObject({
   changedRanges: z.array(changedRangeSchema)
 });
 const transactionDiagnosticSchema = z.strictObject({
-  action: z.string(), path: z.string(), message: z.string(), code: z.string().optional()
+  action: z.string(),
+  path: z.string(),
+  message: z.string(),
+  code: z.string().optional()
 });
 const recoverySchema = z.strictObject({
   status: z.enum(['succeeded', 'failed', 'uncertain']),
@@ -52,20 +71,35 @@ const recoverySchema = z.strictObject({
 const transactionSchema = z.union([
   z.strictObject({ outcome: z.literal('committed'), cleanup: recoverySchema }),
   z.strictObject({ outcome: z.literal('committed_with_residue'), cleanup: recoverySchema }),
-  z.strictObject({ outcome: z.literal('rolled_back'), failure: transactionDiagnosticSchema, rollback: recoverySchema }),
-  z.strictObject({ outcome: z.literal('rollback_failed'), failure: transactionDiagnosticSchema, rollback: recoverySchema })
+  z.strictObject({
+    outcome: z.literal('rolled_back'),
+    failure: transactionDiagnosticSchema,
+    rollback: recoverySchema
+  }),
+  z.strictObject({
+    outcome: z.literal('rollback_failed'),
+    failure: transactionDiagnosticSchema,
+    rollback: recoverySchema
+  })
 ]);
 
 export const editTextOutputSchema = z.strictObject({
   applicationStatus: z.enum(['dry_run', 'no_change', 'applied', 'not_applied', 'uncertain']),
-  transactionOutcome: z.enum(['committed', 'committed_with_residue', 'rolled_back', 'rollback_failed']).optional(),
+  transactionOutcome: z
+    .enum(['committed', 'committed_with_residue', 'rolled_back', 'rollback_failed'])
+    .optional(),
   rootState: z.enum(['known', 'uncertain']),
   dryRun: z.boolean(),
   files: z.array(editTextFileOutputSchema),
   changedPaths: z.array(z.string()),
   wouldChangePaths: z.array(z.string()),
   potentiallyAffectedPaths: z.array(z.string()),
-  diffSummary: z.strictObject({ text: z.string(), bytes: z.int().nonnegative(), truncated: z.boolean(), totalChangedRanges: z.int().nonnegative() }),
+  diffSummary: z.strictObject({
+    text: z.string(),
+    bytes: z.int().nonnegative(),
+    truncated: z.boolean(),
+    totalChangedRanges: z.int().nonnegative()
+  }),
   transaction: transactionSchema.optional()
 });
 
@@ -75,7 +109,12 @@ export const editTextRecoveryPayloadSchema = z.strictObject({
   transactionId: z.string().min(1),
   files: z.array(editTextFileOutputSchema),
   wouldChangePaths: z.array(z.string()),
-  diffSummary: z.strictObject({ text: z.string(), bytes: z.int().nonnegative(), truncated: z.boolean(), totalChangedRanges: z.int().nonnegative() })
+  diffSummary: z.strictObject({
+    text: z.string(),
+    bytes: z.int().nonnegative(),
+    truncated: z.boolean(),
+    totalChangedRanges: z.int().nonnegative()
+  })
 });
 
 export type EditTextInput = z.output<typeof editTextInputSchema>;

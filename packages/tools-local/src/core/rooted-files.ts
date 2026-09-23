@@ -1,4 +1,9 @@
-import { requireToolService, type ToolExecutionContext } from '@agent-core/tools';
+import {
+  isWorkspaceFiles,
+  type WorkspaceFiles,
+  requireToolService,
+  type ToolExecutionContext
+} from '@agent-core/tools';
 import { isRootedFileAuthority, type RootedFileAuthority } from './rooted-file-authority.js';
 
 export function requireRootedFileAuthority(context: ToolExecutionContext): RootedFileAuthority {
@@ -8,4 +13,20 @@ export function requireRootedFileAuthority(context: ToolExecutionContext): Roote
     isRootedFileAuthority,
     'adopted RootedFileAuthority'
   );
+}
+
+/** A tool composition has exactly one filesystem authority. */
+export function requireFileAuthority(
+  context: ToolExecutionContext
+): RootedFileAuthority | WorkspaceFiles {
+  const workspace = context.services?.workspaceFiles;
+  if (workspace === undefined) return requireRootedFileAuthority(context);
+  if (context.services?.rootedFileAuthority !== undefined)
+    throw new TypeError('Tool composition supplies competing file authorities.');
+  if (!isWorkspaceFiles(workspace)) throw new TypeError('Workspace file authority is invalid.');
+  return workspace;
+}
+export function normalizeFilePath(context: ToolExecutionContext, pathname: string): string {
+  const root = requireFileAuthority(context);
+  return isWorkspaceFiles(root) ? root.normalize(pathname) : root.canonicalPath(pathname);
 }

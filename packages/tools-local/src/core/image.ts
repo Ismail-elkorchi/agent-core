@@ -1,9 +1,9 @@
-import { ToolInputError } from '@agent-core/tools';
+import { ToolInputError, isWorkspaceFiles, type WorkspaceFiles } from '@agent-core/tools';
 import type { LocalToolConfiguration } from './configuration.js';
 import { rootedFileIdentitiesEqual, type RootedFileAuthority } from './rooted-file-authority.js';
 
 export async function readRootedImage(
-  root: RootedFileAuthority,
+  root: RootedFileAuthority | WorkspaceFiles,
   filePath: string,
   limits: LocalToolConfiguration['artifact'],
   options: {
@@ -12,6 +12,11 @@ export async function readRootedImage(
   } = {}
 ) {
   options.signal?.throwIfAborted();
+  if (isWorkspaceFiles(root)) {
+    const { bytes } = await root.readFile(filePath, { maximumBytes: limits.maxImageEncodedBytes });
+    options.signal?.throwIfAborted();
+    return { ...inspectImageBytes(bytes, filePath, limits), bytes };
+  }
   const handle = await root.openFile(filePath);
   try {
     if (handle.size > limits.maxImageEncodedBytes)
@@ -25,16 +30,19 @@ export async function readRootedImage(
     try {
       pathIdentity = await root.fileIdentity(filePath);
     } catch {
-      throw new ToolInputError(`Image file changed or was replaced while it was being read: ${filePath}`);
+      throw new ToolInputError(
+        `Image file changed or was replaced while it was being read: ${filePath}`
+      );
     }
     if (
       bytes.byteLength !== handle.size ||
       !rootedFileIdentitiesEqual(await handle.identityNow(), handle.identity) ||
       !rootedFileIdentitiesEqual(pathIdentity, handle.identity)
     )
-      throw new ToolInputError(`Image file changed or was replaced while it was being read: ${filePath}`);
-    const image = inspectImage(bytes, filePath);
-    validateDimensions(image, limits, filePath);
+      throw new ToolInputError(
+        `Image file changed or was replaced while it was being read: ${filePath}`
+      );
+    const image = inspectImageBytes(bytes, filePath, limits);
     return { ...image, bytes };
   } finally {
     await handle.close();
@@ -46,7 +54,10 @@ function inspectImage(
   filePath: string
 ): { mediaType: `image/${string}`; width?: number; height?: number } {
   const buffer = Buffer.from(bytes);
-  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+  if (
+    buffer.length >= 8 &&
+    buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+  ) {
     if (
       buffer.length < 33 ||
       buffer.readUInt32BE(8) !== 13 ||
@@ -116,7 +127,12 @@ function inspectWebp(
   const chunkLength = buffer.readUInt32LE(16);
   if (20 + chunkLength > buffer.length) throw invalidImage(filePath, 'truncated WebP image chunk');
   if (kind === 'VP8X' && chunkLength >= 10)
-    return dimensions('image/webp', readUInt24LE(buffer, 24) + 1, readUInt24LE(buffer, 27) + 1, filePath);
+    return dimensions(
+      'image/webp',
+      readUInt24LE(buffer, 24) + 1,
+      readUInt24LE(buffer, 27) + 1,
+      filePath
+    );
   if (
     kind === 'VP8 ' &&
     chunkLength >= 10 &&
@@ -170,4 +186,14 @@ function readUInt24LE(buffer: Buffer, offset: number): number {
 }
 function invalidImage(filePath: string, reason: string): ToolInputError {
   return new ToolInputError(`Unsupported or invalid image file (${reason}): ${filePath}`);
+}
+
+export function inspectImageBytes(
+  bytes: Uint8Array,
+  filePath: string,
+  limits: LocalToolConfiguration['artifact']
+) {
+  const image = inspectImage(bytes, filePath);
+  validateDimensions(image, limits, filePath);
+  return image;
 }

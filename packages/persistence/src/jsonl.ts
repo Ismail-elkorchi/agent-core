@@ -35,7 +35,11 @@ export async function readJsonlCommittedFile(filePath: string): Promise<JsonlCom
   const storageBytes = (await fs.stat(filePath)).size;
   const completeBytes = await jsonlCommittedBytes(filePath, storageBytes);
   const bytes = await readJsonlBytes(filePath, 0, completeBytes);
-  return Object.freeze({ completeBytes, storageBytes, lines: Object.freeze(splitJsonlLines(bytes)) });
+  return Object.freeze({
+    completeBytes,
+    storageBytes,
+    lines: Object.freeze(splitJsonlLines(bytes))
+  });
 }
 
 /** Finds the final newline by scanning backwards in bounded chunks without a distance cutoff. */
@@ -54,24 +58,43 @@ export async function jsonlCommittedBytes(filePath: string, knownSize?: number):
 }
 
 export async function appendJsonlRecord(filePath: string, record: JsonValue): Promise<number> {
-  const serialized = `${canonicalJsonString(record)}\n`;
+  const serialized = Buffer.from(`${canonicalJsonString(record)}\n`, 'utf8');
   const handle = await fs.open(filePath, 'a');
   try {
-    await handle.write(serialized, null, 'utf8');
+    let offset = 0;
+    while (offset < serialized.length) {
+      const { bytesWritten } = await handle.write(
+        serialized,
+        offset,
+        serialized.length - offset,
+        null
+      );
+      if (bytesWritten === 0) throw new Error('JSONL append made no write progress.');
+      offset += bytesWritten;
+    }
     await handle.sync();
   } finally {
     await handle.close();
   }
-  return Buffer.byteLength(serialized, 'utf8');
+  return serialized.length;
 }
 
-export async function readJsonlBytes(filePath: string, offset: number, length: number): Promise<Uint8Array> {
+export async function readJsonlBytes(
+  filePath: string,
+  offset: number,
+  length: number
+): Promise<Uint8Array> {
   if (length === 0) return new Uint8Array();
   const handle = await fs.open(filePath, 'r');
   try {
     const buffer = Buffer.alloc(length);
-    const { bytesRead } = await handle.read(buffer, 0, length, offset);
-    return buffer.subarray(0, bytesRead);
+    let total = 0;
+    while (total < length) {
+      const { bytesRead } = await handle.read(buffer, total, length - total, offset + total);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+    }
+    return buffer.subarray(0, total);
   } finally {
     await handle.close();
   }
@@ -111,7 +134,8 @@ export async function* readJsonlLines(
       const length = Math.min(SCAN_CHUNK_BYTES, endOffset - cursor);
       const chunk = Buffer.allocUnsafe(length);
       const { bytesRead } = await handle.read(chunk, 0, length, cursor);
-      if (bytesRead === 0) throw new Error(`JSONL file ended before committed offset ${String(endOffset)}.`);
+      if (bytesRead === 0)
+        throw new Error(`JSONL file ended before committed offset ${String(endOffset)}.`);
       cursor += bytesRead;
       pending =
         pending.length === 0
@@ -136,9 +160,11 @@ export async function* readJsonlLines(
         start = newline + 1;
       }
       pending = pending.subarray(start);
-      if (pending.length > maxLineBytes) throw new Error(`JSONL line exceeds ${String(maxLineBytes)} bytes.`);
+      if (pending.length > maxLineBytes)
+        throw new Error(`JSONL line exceeds ${String(maxLineBytes)} bytes.`);
     }
-    if (pending.length !== 0) throw new Error('JSONL committed range did not end at a line boundary.');
+    if (pending.length !== 0)
+      throw new Error('JSONL committed range did not end at a line boundary.');
   } finally {
     await handle.close();
   }
@@ -173,5 +199,7 @@ export async function jsonlStorageStamp(filePath: string): Promise<JsonlStorageS
 }
 
 export function sameJsonlStorageStamp(left: JsonlStorageStamp, right: JsonlStorageStamp): boolean {
-  return left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+  return (
+    left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs
+  );
 }

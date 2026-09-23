@@ -1,3 +1,4 @@
+import { indexLines, positionOffset, boundedDiffSummary } from './text.js';
 import { createHash } from 'node:crypto';
 import type { ToolResultFact } from '@agent-core/tools';
 import { parseJsonObject } from '@agent-core/json';
@@ -238,15 +239,6 @@ async function planFile(
   let previousEnd = -1;
   const convention = newlineConvention(file.content);
   for (const [editIndex, edit] of request.edits.entries()) {
-    if (!wellFormedUnicode(edit.expectedText) || !wellFormedUnicode(edit.replacementText)) {
-      failures.push({
-        path: file.path,
-        editIndex,
-        reason: 'invalid_unicode',
-        message: 'Expected and replacement text must contain well-formed Unicode scalar values.'
-      });
-      continue;
-    }
     let start: number;
     let end: number;
     try {
@@ -490,42 +482,6 @@ function editObservedFacts(output: EditTextOutput): ToolResultFact[] {
     }));
 }
 
-interface IndexedLine {
-  readonly start: number;
-  readonly contentEnd: number;
-}
-function indexLines(content: string): IndexedLine[] {
-  const lines: IndexedLine[] = [];
-  let start = 0;
-  for (let index = 0; index < content.length; index += 1) {
-    if (content.charCodeAt(index) !== 0x0a) continue;
-    const contentEnd = index > start && content.charCodeAt(index - 1) === 0x0d ? index - 1 : index;
-    lines.push({ start, contentEnd });
-    start = index + 1;
-  }
-  lines.push({ start, contentEnd: content.length });
-  return lines;
-}
-
-function positionOffset(
-  content: string,
-  lines: readonly IndexedLine[],
-  lineNumber: number,
-  column: number
-): number {
-  const line = lines[lineNumber - 1];
-  if (!line) throw new Error(`Line ${String(lineNumber)} is outside the file.`);
-  const text = content.slice(line.start, line.contentEnd);
-  const scalars = Array.from(text);
-  if (column > scalars.length + 1)
-    throw new Error(
-      `Column ${String(column)} is outside line ${String(lineNumber)}; maximum is ${String(scalars.length + 1)}.`
-    );
-  let width = 0;
-  for (let index = 0; index < column - 1; index += 1) width += scalars[index]?.length ?? 0;
-  return line.start + width;
-}
-
 function compose(
   source: string,
   replacements: readonly { start: number; end: number; replacement: string }[]
@@ -586,42 +542,6 @@ function newlineTokens(value: string): ('lf' | 'crlf' | 'cr')[] {
   return tokens;
 }
 
-function wellFormedUnicode(value: string): boolean {
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
-      if (next < 0xdc00 || next > 0xdfff) return false;
-      index += 1;
-    } else if (code >= 0xdc00 && code <= 0xdfff) return false;
-  }
-  return true;
-}
-
-function boundedDiffSummary(
-  lines: readonly string[],
-  maxBytes: number
-): EditTextOutput['diffSummary'] {
-  const source = lines.join('\n');
-  if (Buffer.byteLength(source, 'utf8') <= maxBytes)
-    return {
-      text: source,
-      bytes: Buffer.byteLength(source, 'utf8'),
-      truncated: false,
-      totalChangedRanges: lines.length
-    };
-  let text = '';
-  for (const scalar of source) {
-    if (Buffer.byteLength(text + scalar, 'utf8') > maxBytes) break;
-    text += scalar;
-  }
-  return {
-    text,
-    bytes: Buffer.byteLength(text, 'utf8'),
-    truncated: true,
-    totalChangedRanges: lines.length
-  };
-}
 function preview(value: string): string {
   const scalars = Array.from(value);
   return JSON.stringify(scalars.length <= 80 ? value : scalars.slice(0, 80).join('') + '…');

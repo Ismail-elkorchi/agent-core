@@ -869,7 +869,9 @@ test('reconciliation never signals a PID without authenticated supervisor identi
     /unresolved supervised process/u
   );
 
-  const resolved = await host.resolveReconciliation({ acknowledgeProcessIds: [processId] });
+  const resolved = await host.resolveReconciliation({
+    acknowledge: (await host.reconciliation()).unresolved
+  });
   assert.equal(resolved.unresolved.length, 0);
   assert.equal(host.commandExecution.resourceLeases.activeCount(), 0);
   await host.close();

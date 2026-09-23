@@ -201,7 +201,7 @@ test('terminal-state recovery rejects missing, malformed, stale, unauthenticated
         true
       );
       assert.deepEqual(await manager.disposeOwner('recovered-run'), []);
-      await manager.acknowledgeUnresolved([fixture.processId]);
+      await manager.acknowledgeUnresolved(reconciliation.unresolved);
     });
   }
 });

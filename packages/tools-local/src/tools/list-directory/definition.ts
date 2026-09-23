@@ -2,7 +2,7 @@ import { defineTool } from '@agent-core/tools';
 import { fileScope } from '../../core/resources.js';
 import { rootedFileSelector } from '../../core/rooted-file-selection.js';
 import { builtInObservedFacts } from '../../core/read-observed-facts.js';
-import { requireRootedFileAuthority } from '../../core/rooted-files.js';
+import { normalizeFilePath } from '../../core/rooted-files.js';
 import {
   listDirectoryInputSchema,
   listDirectoryOutputSchema,
@@ -20,13 +20,13 @@ export const listDirectoryTool = defineTool({
   schema: listDirectoryInputSchema,
   outputSchema: listDirectoryOutputSchema,
   requirements: {
-    services: ['rootedFileAuthority', 'localToolConfiguration', 'rootedFileSelector']
+    services: ['localToolConfiguration']
   },
   effectEnvelope: { accesses: [{ mode: 'read', scope: 'files' }], lockScopes: [] },
   canonicalizeInput(input, context): CanonicalListDirectoryInput {
     return {
       ...input,
-      path: requireRootedFileAuthority(context).canonicalPath(input.path),
+      path: normalizeFilePath(context, input.path),
       depth: input.depth
     };
   },

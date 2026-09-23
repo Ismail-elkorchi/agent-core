@@ -2,7 +2,7 @@ import { defineTool } from '@agent-core/tools';
 import { fileScope } from '../../core/resources.js';
 import { rootedFileSelector } from '../../core/rooted-file-selection.js';
 import { builtInObservedFacts } from '../../core/read-observed-facts.js';
-import { requireRootedFileAuthority } from '../../core/rooted-files.js';
+import { normalizeFilePath } from '../../core/rooted-files.js';
 import { findFilesInputSchema, findFilesOutputSchema, type FindFilesInput } from './schema.js';
 
 interface CanonicalFindFilesInput extends FindFilesInput {
@@ -15,10 +15,10 @@ export const findFilesTool = defineTool({
   description: 'Find rooted files or directories using the common glob and ignore semantics.',
   schema: findFilesInputSchema,
   outputSchema: findFilesOutputSchema,
-  requirements: { services: ['rootedFileAuthority', 'rootedFileSelector'] },
+  requirements: { services: ['localToolConfiguration'] },
   effectEnvelope: { accesses: [{ mode: 'read', scope: 'files' }], lockScopes: [] },
   canonicalizeInput(input, context): CanonicalFindFilesInput {
-    return { ...input, path: requireRootedFileAuthority(context).canonicalPath(input.path) };
+    return { ...input, path: normalizeFilePath(context, input.path) };
   },
   deriveEffects(input) {
     return {

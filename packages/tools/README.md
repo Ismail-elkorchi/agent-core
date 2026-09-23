@@ -8,7 +8,10 @@ The runtime boundary is decode → canonicalize → derive call-specific effects
 
 Tool calls cross `createToolCall()` for typed construction or `decodeToolCall()` for external data. Planning accepts only that owned call and does not decode it again.
 
-`CommandExecution` is the behavior boundary for starting, querying, controlling, recovering, and cleaning command executions. The runtime and tools do not require a concrete process manager. An application supplies an implementation with a versioned implementation identity and a stable recovery-store identity; unsupported recovery remains explicit rather than authorizing replay.
+`CommandExecution` is the behavior boundary for starting, querying, controlling, recovering, and cleaning command executions. The runtime and tools do not require a concrete process manager. An application supplies an implementation with a versioned implementation identity and a stable recovery-store identity; unsupported recovery remains explicit rather than authorizing replay. Uncertainty acceptance binds process identity and the exact observation revision, so a stale decision cannot acknowledge new evidence.
+
+
+`WorkspaceFiles` describes an adopted file authority independently of any host path or environment provider: normalized relative paths, incremental directory entries, bounded exact reads with revisions, and conditional transactions. Applications supply confinement, concurrency, epoch fencing, and lifetime ownership. Core does not select or initialize an environment.
 
 
 Observations use `kind: 'result' | 'failure'` for invocation disposition. Their structured `output` owns domain outcomes; a nonzero process exit, a partial read, and a failed application check can each be a returned result. Effectful tools report executor facts with `execution.state`: `not_started`, `settled`, `active`, or `unknown`. An active process retains its own owner and lease after its invocation returns. Missing executor facts for an effectful call cannot establish settlement. Failures carry a precise `reason` and relevant details; there is no generic success flag or required retry prose.

@@ -1904,7 +1904,11 @@ function decodeToolProgress(value: JsonValue | undefined): ToolProgress {
     exact(object, ['type', 'stream', 'sequence', 'text', 'observedBytes']);
     return Object.freeze({
       type: 'output',
-      stream: requiredEnum(object.stream, ['stdout', 'stderr'] as const, 'progress.stream'),
+      stream: requiredEnum(
+        object.stream,
+        ['stdout', 'stderr', 'terminal'] as const,
+        'progress.stream'
+      ),
       sequence: nonnegativeInteger(object.sequence, 'progress.sequence'),
       text: requiredStringValue(object.text, 'progress.text'),
       observedBytes: nonnegativeInteger(object.observedBytes, 'progress.observedBytes')

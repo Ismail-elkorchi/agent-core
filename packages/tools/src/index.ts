@@ -18,3 +18,4 @@ export * from './core/registry.js';
 export * from './core/resource-leases.js';
 export * from './core/resources.js';
 export * from './core/text.js';
+export * from './core/workspace-files.js';

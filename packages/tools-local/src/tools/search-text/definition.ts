@@ -2,7 +2,7 @@ import { defineTool } from '@agent-core/tools';
 import { fileScope } from '../../core/resources.js';
 import { searchText } from './run.js';
 import { buildSearchTextContent } from '../../core/model-content.js';
-import { requireRootedFileAuthority } from '../../core/rooted-files.js';
+import { normalizeFilePath } from '../../core/rooted-files.js';
 import { searchTextInputSchema, searchTextOutputSchema } from './schema.js';
 
 export const searchTextTool = defineTool({
@@ -13,11 +13,11 @@ export const searchTextTool = defineTool({
   outputSchema: searchTextOutputSchema,
   buildModelContent: buildSearchTextContent,
   requirements: {
-    services: ['rootedFileAuthority', 'localToolConfiguration', 'rootedFileSelector']
+    services: ['localToolConfiguration']
   },
   effectEnvelope: { accesses: [{ mode: 'read', scope: 'files' }], lockScopes: [] },
   canonicalizeInput(input, context) {
-    return { ...input, path: requireRootedFileAuthority(context).canonicalPath(input.path) };
+    return { ...input, path: normalizeFilePath(context, input.path) };
   },
   deriveEffects(input) {
     return {

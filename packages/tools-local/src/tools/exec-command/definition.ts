@@ -1,6 +1,7 @@
 import {
   defineTool,
   isCommandExecution,
+  isWorkspaceFiles,
   planCommandExecution,
   releaseCommandExecutionPlan,
   requireToolService,
@@ -9,7 +10,8 @@ import {
   type CommandExecutionOwner,
   type CommandExecutionPlan,
   type CommandExecutionPlanRequest,
-  type ToolExecutionContext
+  type ToolExecutionContext,
+  type WorkspaceFiles
 } from '@agent-core/tools';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
 import { buildProcessContent } from '../../core/model-content.js';
@@ -17,28 +19,38 @@ import { fileScope, processScope } from '../../core/resources.js';
 import { requireRootedFileAuthority } from '../../core/rooted-files.js';
 import { execCommandOutputSchema, execCommandSchema } from './schema.js';
 
-export function createExecCommandTool(options: { readonly ptySupported?: boolean } = {}) {
+export function createExecCommandTool(
+  options: { readonly ptySupported?: boolean; readonly environmentLifetimeSupported?: boolean } = {}
+) {
   const ptySupported = options.ptySupported === true;
   return defineTool({
     name: 'exec_command',
     implementationId: 'agent-core.exec-command.v1',
     description:
       'Start a persistent command through the application-supplied command execution authority.',
-    schema: execCommandSchema(ptySupported),
+    schema: execCommandSchema(ptySupported, options.environmentLifetimeSupported),
     outputSchema: execCommandOutputSchema,
     buildModelContent: buildProcessContent,
     requirements: {
-      services: ['rootedFileAuthority', 'localToolConfiguration', 'commandExecution']
+      services: ['localToolConfiguration', 'commandExecution']
     },
     effectEnvelope: {
       accesses: [{ mode: 'execute', scope: processScope() }],
       lockScopes: [fileScope()]
     },
     async canonicalizeInput(input, context) {
-      const root = requireRootedFileAuthority(context);
-      const workdir = root.canonicalPath(input.workdir);
-      const directory = await root.openDirectory(workdir);
-      await directory.close();
+      const workspace = workspaceFiles(context);
+      const workdir = workspace
+        ? workspace.normalize(input.workdir)
+        : requireRootedFileAuthority(context).canonicalPath(input.workdir);
+      if (workspace) {
+        const status = await workspace.stat(workdir);
+        if (status.kind !== 'directory')
+          throw new Error(`Command workdir is not a directory: ${workdir}`);
+      } else {
+        const directory = await requireRootedFileAuthority(context).openDirectory(workdir);
+        await directory.close();
+      }
       const limits = requireLocalToolConfiguration(context).process;
       const executor = requireToolService<CommandExecution>(
         context,
@@ -50,6 +62,7 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
       const request = Object.freeze({
         ...input,
         pty: 'pty' in input && input.pty === true,
+        lifetime: 'lifetime' in input ? input.lifetime : 'job',
         workdir,
         yieldMs: clampRequestedLimit(input.yieldMs, limits.maxYieldMs),
         timeoutMs: clampRequestedLimit(input.timeoutMs, limits.maxTimeoutMs),
@@ -74,6 +87,7 @@ export function createExecCommandTool(options: { readonly ptySupported?: boolean
         command: request.command,
         rootedDirectory: request.workdir,
         pty: request.pty,
+        lifetime: request.lifetime,
         timeoutMs: request.timeoutMs,
         yieldMs: request.yieldMs,
         outputTokenBudget: request.outputTokenBudget,
@@ -164,8 +178,17 @@ function commandSnapshot(input: CommandInput) {
     command: input.command,
     workdir: input.workdir,
     pty: input.pty,
+    lifetime: input.lifetime ?? 'job',
     timeoutMs: input.timeoutMs,
     yieldMs: input.yieldMs,
     outputTokenBudget: input.outputTokenBudget
   };
+}
+
+function workspaceFiles(context: ToolExecutionContext): WorkspaceFiles | undefined {
+  const candidate = context.services?.workspaceFiles;
+  if (candidate === undefined) return undefined;
+  if (!isWorkspaceFiles(candidate))
+    throw new TypeError('workspaceFiles must be an adopted file authority.');
+  return candidate;
 }

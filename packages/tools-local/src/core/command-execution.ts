@@ -22,6 +22,7 @@ import {
   type CommandOutputStream,
   type CommandOutputView,
   type CommandReconciliationResult,
+  type CommandUncertaintyAcceptance,
   type StartCommandExecutionOptions,
   type ToolProgress,
   type ToolResourceLease
@@ -67,9 +68,10 @@ export interface LocalCommandExecutionOptions {
 export interface PtyProcessFactory {
   start(command: string, workingDirectory: string, env: NodeJS.ProcessEnv): OwnedProcessTree;
 }
+type LocalOutputStream = Exclude<CommandOutputStream, 'terminal'>;
 interface CapturedChunk {
   readonly sequence: number;
-  readonly stream: CommandOutputStream;
+  readonly stream: LocalOutputStream;
   readonly text: string;
   readonly start: number;
   readonly end: number;
@@ -196,9 +198,11 @@ export class LocalCommandExecution implements CommandExecution {
     >
   >;
   private readonly ready: Promise<CommandReconciliationResult>;
-  private reconciliationState: CommandReconciliationResult | undefined;
   private reservedCapturedBytes = 0;
-  private readonly reservations = new WeakMap<CommandExecutionReservation, LocalCommandReservationState>();
+  private readonly reservations = new WeakMap<
+    CommandExecutionReservation,
+    LocalCommandReservationState
+  >();
 
   constructor(private readonly options: LocalCommandExecutionOptions) {
     if (!isRootedFileAuthority(options.rootedFileAuthority))
@@ -216,29 +220,39 @@ export class LocalCommandExecution implements CommandExecution {
       ),
       maxActiveProcesses: positive(options.maxActiveProcesses ?? 32, 'maxActiveProcesses'),
       maxTotalCapturedBytes: positive(
-        options.maxTotalCapturedBytes ?? Math.max(options.maxCapturedBytes, options.maxCapturedBytes * 8),
+        options.maxTotalCapturedBytes ??
+          Math.max(options.maxCapturedBytes, options.maxCapturedBytes * 8),
         'maxTotalCapturedBytes'
       ),
-      maxProcessLifetimeMs: positive(options.maxProcessLifetimeMs ?? 3_600_000, 'maxProcessLifetimeMs'),
-      completedRetentionMs: positive(options.completedRetentionMs ?? 60_000, 'completedRetentionMs'),
+      maxProcessLifetimeMs: positive(
+        options.maxProcessLifetimeMs ?? 3_600_000,
+        'maxProcessLifetimeMs'
+      ),
+      completedRetentionMs: positive(
+        options.completedRetentionMs ?? 60_000,
+        'completedRetentionMs'
+      ),
       maxPendingOutputBytes: positive(
         options.maxPendingOutputBytes ?? Math.min(options.maxCapturedBytes, 2_000_000),
         'maxPendingOutputBytes'
       )
     };
-    this.ready = this.reconcileLedger().then((result) => {
-      this.reconciliationState = result;
-      return result;
-    });
+    this.ready = this.reconcileLedger();
     adoptCommandExecution(this);
   }
 
   async plan(request: CommandExecutionPlanRequest): Promise<CommandExecutionReservation> {
+    if (request.lifetime === 'environment')
+      throw new Error(
+        'Local command execution cannot retain environment services independently of its owner.'
+      );
     const commandDirectory = await this.options.rootedFileAuthority.commandDirectory(
       request.rootedDirectory
     );
     const owned = new LocalCommandReservationState(this, request, commandDirectory);
-    const reservation = createCommandExecutionReservation(owned.authorization, () => owned.release());
+    const reservation = createCommandExecutionReservation(owned.authorization, () =>
+      owned.release()
+    );
     this.reservations.set(reservation, owned);
     return reservation;
   }
@@ -273,11 +287,14 @@ export class LocalCommandExecution implements CommandExecution {
     if (this.active.size >= this.limits.maxActiveProcesses)
       throw new Error('Maximum active process count reached.');
     if (
-      [...this.active.values()].filter((item) => item.owner.ownerId === request.owner.ownerId).length >=
-      this.limits.maxActiveProcessesPerOwner
+      [...this.active.values()].filter((item) => item.owner.ownerId === request.owner.ownerId)
+        .length >= this.limits.maxActiveProcessesPerOwner
     )
       throw new Error('Maximum active process count for this resource owner reached.');
-    if (this.reservedCapturedBytes + this.options.maxCapturedBytes > this.limits.maxTotalCapturedBytes)
+    if (
+      this.reservedCapturedBytes + this.options.maxCapturedBytes >
+      this.limits.maxTotalCapturedBytes
+    )
       throw new Error('Maximum total captured process bytes reached.');
     if (request.pty)
       throw new Error(
@@ -482,14 +499,20 @@ export class LocalCommandExecution implements CommandExecution {
       ...(record.exitCode === undefined ? {} : { exitCode: record.exitCode }),
       ...(record.signal === undefined ? {} : { signal: record.signal }),
       ...(record.diagnostic === undefined ? {} : { diagnostic: record.diagnostic }),
-      ...(record.progressDroppedEvents > 0 ? { progressDroppedEvents: record.progressDroppedEvents } : {}),
+      ...(record.progressDroppedEvents > 0
+        ? { progressDroppedEvents: record.progressDroppedEvents }
+        : {}),
       ...(record.progressDeliveryErrors > 0
         ? { progressDeliveryErrors: record.progressDeliveryErrors }
         : {})
     });
   }
 
-  async writeInput(processId: string, text: string, requester?: CommandExecutionOwner): Promise<void> {
+  async writeInput(
+    processId: string,
+    text: string,
+    requester?: CommandExecutionOwner
+  ): Promise<void> {
     await this.ready;
     const record = this.requireRunningProcess(processId);
     this.assertOwner(record, requester);
@@ -514,7 +537,10 @@ export class LocalCommandExecution implements CommandExecution {
     );
   }
 
-  async terminate(processId: string, requester?: CommandExecutionOwner): Promise<CommandExecutionResult> {
+  async terminate(
+    processId: string,
+    requester?: CommandExecutionOwner
+  ): Promise<CommandExecutionResult> {
     await this.ready;
     if (this.tombstones.has(processId)) return this.query(processId, 4_000, 0, 0, requester);
     const record = this.requireProcess(processId);
@@ -600,16 +626,16 @@ export class LocalCommandExecution implements CommandExecution {
   }
   async retryReconciliation(): Promise<CommandReconciliationResult> {
     await this.ready;
-    const result = await this.reconcileLedger();
-    this.reconciliationState = result;
-    return result;
+    return this.reconcileLedger();
   }
-  async acknowledgeUnresolved(processIds: readonly string[]): Promise<void> {
-    await this.ready;
-    const unresolved = new Set(this.reconciliationState?.unresolved.map((item) => item.processId) ?? []);
-    for (const processId of processIds) {
-      if (!unresolved.has(processId))
-        throw new Error(`Process is not an unresolved reconciliation record: ${processId}`);
+  async acknowledgeUnresolved(acceptances: readonly CommandUncertaintyAcceptance[]): Promise<void> {
+    const current = await this.retryReconciliation();
+    for (const { processId, revision } of acceptances) {
+      const unresolved = current.unresolved.find((item) => item.processId === processId);
+      if (unresolved?.revision !== revision)
+        throw new Error(
+          `Command evidence changed; refresh before accepting uncertainty: ${processId}`
+        );
       await this.removeLedger(processId);
     }
   }
@@ -619,7 +645,9 @@ export class LocalCommandExecution implements CommandExecution {
   }
   has(processId: string): boolean {
     this.pruneExpired();
-    return this.active.has(processId) || this.completed.has(processId) || this.tombstones.has(processId);
+    return (
+      this.active.has(processId) || this.completed.has(processId) || this.tombstones.has(processId)
+    );
   }
   activeCount(ownerId?: string): number {
     return ownerId === undefined
@@ -632,7 +660,7 @@ export class LocalCommandExecution implements CommandExecution {
 
   private decodeAndAppend(
     record: ManagedProcess,
-    stream: CommandOutputStream,
+    stream: LocalOutputStream,
     value: Buffer | string
   ): void {
     const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value);
@@ -670,7 +698,7 @@ export class LocalCommandExecution implements CommandExecution {
     }
   }
 
-  private append(record: ManagedProcess, stream: CommandOutputStream, text: string): void {
+  private append(record: ManagedProcess, stream: LocalOutputStream, text: string): void {
     const bytes = Buffer.byteLength(text, 'utf8');
     record.observed[stream] += bytes;
     const chunk: CapturedChunk = {
@@ -710,7 +738,10 @@ export class LocalCommandExecution implements CommandExecution {
       return Promise.resolve();
     }
     const bytes = Buffer.byteLength(JSON.stringify(progress), 'utf8');
-    if (progress.type === 'output' && record.progressBytes + bytes > this.limits.maxPendingOutputBytes) {
+    if (
+      progress.type === 'output' &&
+      record.progressBytes + bytes > this.limits.maxPendingOutputBytes
+    ) {
       record.progressDroppedEvents += 1;
       return Promise.resolve();
     }
@@ -893,7 +924,10 @@ export class LocalCommandExecution implements CommandExecution {
       this.tombstones.set(processId, { report, owner: record.owner, terminalReported: false });
     }
     this.completed.delete(processId);
-    this.reservedCapturedBytes = Math.max(0, this.reservedCapturedBytes - this.options.maxCapturedBytes);
+    this.reservedCapturedBytes = Math.max(
+      0,
+      this.reservedCapturedBytes - this.options.maxCapturedBytes
+    );
     if (record.retention) clearTimeout(record.retention);
   }
 
@@ -915,7 +949,11 @@ export class LocalCommandExecution implements CommandExecution {
       throw new Error('Process belongs to another resource owner: ' + record.id);
   }
 
-  private waitForActivity(record: ManagedProcess, yieldMs: number, afterCursor: number): Promise<void> {
+  private waitForActivity(
+    record: ManagedProcess,
+    yieldMs: number,
+    afterCursor: number
+  ): Promise<void> {
     if (yieldMs <= 0 || record.status !== 'running' || record.cursor > afterCursor)
       return Promise.resolve();
     return new Promise((resolve) => {
@@ -952,14 +990,19 @@ export class LocalCommandExecution implements CommandExecution {
     if (!this.options.ledgerDirectory) return Object.freeze({ resolved: [], unresolved: [] });
     await mkdir(this.options.ledgerDirectory, { recursive: true, mode: 0o700 });
     const resolved: string[] = [];
-    const unresolved: { processId: string; rootPath: string; diagnostic: string }[] = [];
+    const unresolved: {
+      processId: string;
+      revision: string;
+      rootPath: string;
+      diagnostic: string;
+    }[] = [];
     for (const name of await readdir(this.options.ledgerDirectory)) {
       if (!/^proc_[a-f0-9-]+\.json$/u.test(name)) continue;
       let rootPath = '*';
+      let source: string | undefined;
       try {
-        const entry = parseLedgerEntry(
-          JSON.parse(await readFile(path.join(this.options.ledgerDirectory, name), 'utf8'))
-        );
+        source = await readFile(path.join(this.options.ledgerDirectory, name), 'utf8');
+        const entry = parseLedgerEntry(JSON.parse(source));
         rootPath = entry.rootPath;
         if (entry.state === 'terminal' && entry.terminalReported) {
           await this.removeLedger(entry.processId);
@@ -995,10 +1038,20 @@ export class LocalCommandExecution implements CommandExecution {
         this.recovered.set(entry.processId, Object.freeze({ result }));
         resolved.push(entry.processId);
       } catch (error) {
-        unresolved.push({ processId: name.slice(0, -5), rootPath, diagnostic: errorMessage(error) });
+        unresolved.push({
+          processId: name.slice(0, -5),
+          revision: createHash('sha256')
+            .update(JSON.stringify([source, errorMessage(error)]))
+            .digest('hex'),
+          rootPath,
+          diagnostic: errorMessage(error)
+        });
       }
     }
-    return Object.freeze({ resolved: Object.freeze(resolved), unresolved: Object.freeze(unresolved) });
+    return Object.freeze({
+      resolved: Object.freeze(resolved),
+      unresolved: Object.freeze(unresolved)
+    });
   }
 
   private async persistLedger(entry: ProcessLedgerEntry): Promise<void> {
@@ -1041,7 +1094,8 @@ export class LocalCommandExecution implements CommandExecution {
     const handle = await open(temporary, 'wx', 0o600);
     try {
       await handle.writeFile(
-        JSON.stringify({ identity: supervision.identity, token: supervision.authenticationToken }) + '\n',
+        JSON.stringify({ identity: supervision.identity, token: supervision.authenticationToken }) +
+          '\n',
         'utf8'
       );
       await handle.sync();
@@ -1115,7 +1169,9 @@ export class LocalCommandExecution implements CommandExecution {
       }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    throw new Error(`Authenticated supervisor did not produce terminal state: ${errorMessage(lastError)}`);
+    throw new Error(
+      `Authenticated supervisor did not produce terminal state: ${errorMessage(lastError)}`
+    );
   }
 
   private supervisorAuthenticationPath(processId: string): string {
@@ -1154,7 +1210,9 @@ function publicProcessOutput(record: ManagedProcess): Uint8Array {
     retainedBytes: record.capture.retainedBytes,
     omittedBytes: Math.max(0, record.cursor - record.capture.retainedBytes)
   };
-  const parts: Buffer[] = [Buffer.from(`${JSON.stringify(metadata).slice(0, -1)},"chunks":[`, 'utf8')];
+  const parts: Buffer[] = [
+    Buffer.from(`${JSON.stringify(metadata).slice(0, -1)},"chunks":[`, 'utf8')
+  ];
   const pending: CapturedChunk[] = [];
   let pendingCharacters = 0;
   let first = true;
@@ -1241,7 +1299,10 @@ class BoundedCapture {
       while (this.tailBytes > this.tailLimit && this.tail.length > 0) {
         const first = this.tail[0];
         if (!first) break;
-        const keep = takeUtf8End(first.text, Math.max(0, first.bytes - (this.tailBytes - this.tailLimit)));
+        const keep = takeUtf8End(
+          first.text,
+          Math.max(0, first.bytes - (this.tailBytes - this.tailLimit))
+        );
         if (keep.length === 0) {
           this.tail.shift();
           this.tailBytes -= first.bytes;
@@ -1404,7 +1465,8 @@ function parseLedgerEntry(value: unknown): ProcessLedgerEntry {
   )
     throw new Error('Invalid process ledger record.');
   const owner = decodeProcessOwner(owned.owner);
-  const terminal = owned.terminal === undefined ? undefined : decodeProcessPollResult(owned.terminal);
+  const terminal =
+    owned.terminal === undefined ? undefined : decodeProcessPollResult(owned.terminal);
   let protectedArtifact: ProtectedArtifactRef | undefined;
   if (owned.protectedArtifact !== undefined) {
     validateArtifactRef(owned.protectedArtifact);
@@ -1471,7 +1533,9 @@ function decodeProcessOutputView(
     endsAtOutputEnd: record.endsAtOutputEnd
   });
 }
-function decodeProcessPollResult(value: import('@agent-core/json').JsonValue): CommandExecutionResult {
+function decodeProcessPollResult(
+  value: import('@agent-core/json').JsonValue
+): CommandExecutionResult {
   const record = jsonRecord(value, 'process terminal result');
   if (
     typeof record.processId !== 'string' ||
@@ -1484,8 +1548,10 @@ function decodeProcessPollResult(value: import('@agent-core/json').JsonValue): C
       (typeof record.exitCode !== 'number' || !Number.isInteger(record.exitCode))) ||
     (record.signal !== undefined && record.signal !== null && typeof record.signal !== 'string') ||
     (record.diagnostic !== undefined && typeof record.diagnostic !== 'string') ||
-    (record.progressDroppedEvents !== undefined && !nonnegativeInteger(record.progressDroppedEvents)) ||
-    (record.progressDeliveryErrors !== undefined && !nonnegativeInteger(record.progressDeliveryErrors))
+    (record.progressDroppedEvents !== undefined &&
+      !nonnegativeInteger(record.progressDroppedEvents)) ||
+    (record.progressDeliveryErrors !== undefined &&
+      !nonnegativeInteger(record.progressDeliveryErrors))
   )
     throw new Error('Invalid process terminal result.');
   let artifact: PublicArtifactRef | undefined;
@@ -1562,7 +1628,10 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 function nodeCode(error: unknown): string | undefined {
-  return typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string'
+  return typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    typeof error.code === 'string'
     ? error.code
     : undefined;
 }

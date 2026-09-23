@@ -1,14 +1,22 @@
+import { isWorkspaceFiles, type WorkspaceFiles } from '@agent-core/tools';
 import { createHash } from 'node:crypto';
 import { rootedFileIdentitiesEqual, type RootedFileAuthority } from './rooted-file-authority.js';
 
 /** Read an exact UTF-8 snapshot through the caller's adopted file authority. */
 export async function readRootedText(
-  root: RootedFileAuthority,
+  root: RootedFileAuthority | WorkspaceFiles,
   requestedPath: string,
   maxBytes: number,
   signal?: AbortSignal
 ) {
   signal?.throwIfAborted();
+  if (isWorkspaceFiles(root)) {
+    const path = root.normalize(requestedPath);
+    const { bytes, revision } = await root.readFile(path, { maximumBytes: maxBytes });
+    signal?.throwIfAborted();
+    const content = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+    return { path, content, sha256: revision.digest };
+  }
   const file = await root.openFile(requestedPath);
   try {
     const bytes = await file.readAll(maxBytes);

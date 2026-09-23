@@ -4,8 +4,14 @@ import type { ToolProgress, ToolResourceLease } from './context.js';
 import type { ResourceLeaseCoordinator } from './resource-leases.js';
 import { isResourceLeaseCoordinator } from './resource-leases.js';
 
-export type CommandOutputStream = 'stdout' | 'stderr';
+export type CommandOutputStream = 'stdout' | 'stderr' | 'terminal';
 export type CommandExecutionStatus = 'running' | 'exited' | 'stopped' | 'timed_out' | 'failed';
+export interface CommandTerminalSize {
+  readonly columns: number;
+  readonly rows: number;
+  readonly pixelWidth?: number;
+  readonly pixelHeight?: number;
+}
 
 export interface CommandExecutionOwner {
   readonly ownerId: string;
@@ -29,6 +35,8 @@ export interface CommandExecutionPlanRequest {
   /** Canonical path relative to the command authority's adopted root. */
   readonly rootedDirectory: string;
   readonly pty: boolean;
+  /** Transient jobs are released with their owner; environment services are not. */
+  readonly lifetime?: 'job' | 'environment';
   readonly timeoutMs: number;
   readonly yieldMs: number;
   readonly outputTokenBudget: number;
@@ -90,6 +98,15 @@ export interface CommandOutputView {
   readonly endsAtOutputEnd: boolean;
 }
 
+/**
+ * Opaque replay position in the execution provider's durable event stream.
+ * It is an observation/recovery hint, never an authorization capability.
+ */
+export interface CommandEventCursor {
+  readonly source: string;
+  readonly position: string;
+}
+
 export interface CommandExecutionResult {
   readonly processId: string;
   readonly owner: CommandExecutionOwner;
@@ -97,8 +114,11 @@ export interface CommandExecutionResult {
   readonly cursorStart: number;
   readonly cursorEnd: number;
   readonly cursorExpired?: boolean;
+  readonly eventCursor?: CommandEventCursor;
   readonly stdout: CommandOutputView;
   readonly stderr: CommandOutputView;
+  /** PTY output is one merged stream and is never relabelled as stdout/stderr. */
+  readonly terminal?: CommandOutputView;
   readonly combined: CommandOutputView;
   readonly artifact?: PublicArtifactRef;
   /** Original output coverage is independent of this result's presentation window. */
@@ -117,10 +137,16 @@ export interface CommandExecutionReport {
   readonly protectedArtifact?: ProtectedArtifactRef;
 }
 
+export interface CommandUncertaintyAcceptance {
+  readonly processId: string;
+  readonly revision: string;
+}
+
 export interface CommandReconciliationResult {
   readonly resolved: readonly string[];
   readonly unresolved: readonly {
     readonly processId: string;
+    readonly revision: string;
     readonly rootPath: string;
     readonly diagnostic: string;
   }[];
@@ -148,13 +174,18 @@ export interface CommandExecution {
   ): Promise<CommandExecutionResult>;
   writeInput(processId: string, text: string, requester?: CommandExecutionOwner): Promise<void>;
   closeInput(processId: string, requester?: CommandExecutionOwner): Promise<void>;
+  resize?(
+    processId: string,
+    size: CommandTerminalSize,
+    requester?: CommandExecutionOwner
+  ): Promise<void>;
   terminate(processId: string, requester?: CommandExecutionOwner): Promise<CommandExecutionResult>;
   disposeOwner(ownerId: string): Promise<readonly CommandExecutionReport[]>;
   recoveredTerminalReports(): readonly CommandExecutionReport[];
   acknowledgeTerminalReport(processId: string): Promise<void>;
   reconcile(): Promise<CommandReconciliationResult>;
   retryReconciliation(): Promise<CommandReconciliationResult>;
-  acknowledgeUnresolved(processIds: readonly string[]): Promise<void>;
+  acknowledgeUnresolved(acceptances: readonly CommandUncertaintyAcceptance[]): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -276,6 +307,11 @@ function validateCommandExecutionPlanRequest(request: CommandExecutionPlanReques
     throw new TypeError('Command rooted directory must be a string.');
   if (typeof request.pty !== 'boolean')
     throw new TypeError('Command PTY selection must be boolean.');
+  if (
+    request.lifetime !== undefined &&
+    !(['job', 'environment'] as const).includes(request.lifetime)
+  )
+    throw new TypeError('Command lifetime must be job or environment.');
   for (const [name, value] of [
     ['timeoutMs', request.timeoutMs],
     ['yieldMs', request.yieldMs],

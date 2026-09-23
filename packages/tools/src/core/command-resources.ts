@@ -1,6 +1,14 @@
 import { parseJsonObject } from '@agent-core/json';
-import type { CommandExecution, CommandExecutionReport, CommandOutputView } from './command-execution.js';
-import type { ExecutionResources, ResourceLifetime, ResourceReleaseReport } from './execution-resources.js';
+import type {
+  CommandExecution,
+  CommandExecutionReport,
+  CommandOutputView
+} from './command-execution.js';
+import type {
+  ExecutionResources,
+  ResourceLifetime,
+  ResourceReleaseReport
+} from './execution-resources.js';
 
 /** Keep process termination and output handling in the command integration. */
 export function commandExecutionResources(
@@ -27,15 +35,19 @@ export function commandReleaseReport(report: CommandExecutionReport): ResourceRe
       status: result.status,
       owner: result.owner,
       cursorEnd: result.cursorEnd,
+      ...(result.eventCursor === undefined ? {} : { eventCursor: result.eventCursor }),
       stdout: outputCounts(result.stdout),
       stderr: outputCounts(result.stderr),
+      ...(result.terminal === undefined ? {} : { terminal: outputCounts(result.terminal) }),
       combined: outputCounts(result.combined),
       ...(result.artifact === undefined ? {} : { artifact: result.artifact }),
       ...(result.originalOutput === undefined ? {} : { originalOutput: result.originalOutput }),
       ...(result.diagnostic === undefined ? {} : { diagnostic: result.diagnostic }),
       ...(result.exitCode === undefined ? {} : { exitCode: result.exitCode }),
       ...(result.signal === undefined ? {} : { signal: result.signal }),
-      ...(report.protectedArtifact === undefined ? {} : { protectedArtifact: report.protectedArtifact })
+      ...(report.protectedArtifact === undefined
+        ? {}
+        : { protectedArtifact: report.protectedArtifact })
     })
   });
 }

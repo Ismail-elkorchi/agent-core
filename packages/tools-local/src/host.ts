@@ -58,7 +58,7 @@ export interface LocalToolHost {
   ready(): Promise<void>;
   reconciliation(): Promise<CommandReconciliationResult>;
   resolveReconciliation(input?: {
-    readonly acknowledgeProcessIds?: readonly string[];
+    readonly acknowledge?: readonly { readonly processId: string; readonly revision: string }[];
   }): Promise<CommandReconciliationResult>;
   close(): Promise<void>;
 }
@@ -190,11 +190,13 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
     },
     reconciliation: () => reconciliation,
     async resolveReconciliation(
-      input: { readonly acknowledgeProcessIds?: readonly string[] } = {}
+      input: {
+        readonly acknowledge?: readonly { readonly processId: string; readonly revision: string }[];
+      } = {}
     ) {
       if (!ownsCommands || !commandExecution) return noProcesses;
-      if (input.acknowledgeProcessIds?.length)
-        await commandExecution.acknowledgeUnresolved(input.acknowledgeProcessIds);
+      if (input.acknowledge?.length)
+        await commandExecution.acknowledgeUnresolved(input.acknowledge);
       reconciliation = commandExecution.retryReconciliation();
       const result = await reconciliation;
       await ensureBlocker(result);

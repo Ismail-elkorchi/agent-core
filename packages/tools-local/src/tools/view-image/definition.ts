@@ -5,7 +5,7 @@ import { requireLocalToolConfiguration } from '../../core/configuration.js';
 import { readRootedImage } from '../../core/image.js';
 import { builtInObservedFacts } from '../../core/read-observed-facts.js';
 import { fileScope } from '../../core/resources.js';
-import { requireRootedFileAuthority } from '../../core/rooted-files.js';
+import { normalizeFilePath, requireFileAuthority } from '../../core/rooted-files.js';
 import { viewImageInputSchema, viewImageOutputSchema } from './schema.js';
 
 export const viewImageTool = defineTool({
@@ -16,12 +16,12 @@ export const viewImageTool = defineTool({
   schema: viewImageInputSchema,
   outputSchema: viewImageOutputSchema,
   requirements: {
-    services: ['rootedFileAuthority', 'artifactRepository', 'localToolConfiguration'],
+    services: ['artifactRepository', 'localToolConfiguration'],
     modelInputModalities: ['image']
   },
   effectEnvelope: { accesses: [{ mode: 'read', scope: 'files' }], lockScopes: [] },
   canonicalizeInput(input, context) {
-    return { ...input, path: requireRootedFileAuthority(context).canonicalPath(input.path) };
+    return { ...input, path: normalizeFilePath(context, input.path) };
   },
   deriveEffects(input) {
     return {
@@ -31,7 +31,7 @@ export const viewImageTool = defineTool({
     };
   },
   async invoke(input, context) {
-    const root = requireRootedFileAuthority(context);
+    const root = requireFileAuthority(context);
     const limits = requireLocalToolConfiguration(context).artifact;
     const { bytes, ...image } = await readRootedImage(root, input.path, limits, {
       signal: context.signal,

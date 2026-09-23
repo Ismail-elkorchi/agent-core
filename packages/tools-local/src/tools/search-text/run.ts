@@ -1,5 +1,10 @@
 import { spawn } from 'node:child_process';
-import { type ToolExecutionContext, type ToolObservationInput } from '@agent-core/tools';
+import {
+  type ToolExecutionContext,
+  type ToolObservationInput,
+  isWorkspaceFiles,
+  type WorkspaceFiles
+} from '@agent-core/tools';
 import { fileScope } from '../../core/resources.js';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
 import { builtInObservedFacts } from '../../core/read-observed-facts.js';
@@ -47,7 +52,10 @@ export async function searchText(
   input: SearchTextInput,
   context: ToolExecutionContext
 ): Promise<ToolObservationInput<SearchTextOutput>> {
-  const root = requireRootedFileAuthority(context);
+  const supplied = context.services?.workspaceFiles;
+  if (supplied !== undefined && !isWorkspaceFiles(supplied))
+    throw new TypeError('Workspace file authority is invalid.');
+  const root = supplied ?? requireRootedFileAuthority(context);
   const limits = requireLocalToolConfiguration(context).searchText;
   const resultLimit = clampRequestedLimit(input.resultLimit, limits.maxResults);
   const perFileLimit = clampRequestedLimit(input.perFileLimit, limits.maxResults);
@@ -253,7 +261,7 @@ export async function searchText(
 }
 
 async function runRipgrep(
-  root: RootedFileAuthority,
+  root: RootedFileAuthority | WorkspaceFiles,
   files: readonly string[],
   args: readonly string[],
   maxOutputBytes: number,
@@ -275,6 +283,31 @@ async function runRipgrep(
     outputTruncated: false
   };
   let observedBytes = 0;
+  if (isWorkspaceFiles(root)) {
+    for (const pathname of files) {
+      signal?.throwIfAborted();
+      if (aggregate.status !== 'completed') break;
+      try {
+        const loaded = await root.readFile(pathname, { maximumBytes: maxFileBytes });
+        observedBytes = await runRipgrepBatch(
+          [],
+          args,
+          maxOutputBytes,
+          observedBytes,
+          aggregate,
+          mode,
+          perFileLimit,
+          signal,
+          { path: pathname, bytes: loaded.bytes }
+        );
+        aggregate.examinedFileCount += 1;
+      } catch (error) {
+        aggregate.status = signal?.aborted ? 'aborted' : 'io_error';
+        aggregate.diagnostic = message(error);
+      }
+    }
+    return aggregate;
+  }
   const batches = files.length === 0 ? [Object.freeze([] as string[])] : batchesOf(files, 64);
   for (const batch of batches) {
     if (aggregate.status !== 'completed') break;
@@ -340,7 +373,8 @@ async function runRipgrepBatch(
   aggregate: SearchAggregate,
   mode: SearchTextInput['mode'],
   perFileLimit?: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  input?: { readonly path: string; readonly bytes: Uint8Array }
 ): Promise<number> {
   let child;
   const pathMap = new Map<string, string>();
@@ -350,8 +384,17 @@ async function runRipgrepBatch(
     return inheritedPath;
   });
   try {
-    child = spawn('rg', [...args, ...inheritedPaths], {
-      stdio: ['ignore', 'pipe', 'pipe', ...opened.map(({ handle }) => handle.descriptor)],
+    if (input) {
+      pathMap.set('<stdin>', input.path);
+      pathMap.set('-', input.path);
+    }
+    child = spawn('rg', [...args, ...(input ? ['-'] : inheritedPaths)], {
+      stdio: [
+        input ? 'pipe' : 'ignore',
+        'pipe',
+        'pipe',
+        ...opened.map(({ handle }) => handle.descriptor)
+      ],
       ...(signal ? { signal } : {})
     });
   } catch (error) {
@@ -387,6 +430,12 @@ async function runRipgrepBatch(
   stderrStream.on('data', (chunk: string) => {
     stderr += bounded(chunk);
   });
+  if (input) {
+    child.stdin?.on('error', (error: NodeJS.ErrnoException) => {
+      if (error.code !== 'EPIPE') spawnError = error;
+    });
+    child.stdin?.end(input.bytes);
+  }
   child.once('error', (error) => {
     spawnError = error;
   });

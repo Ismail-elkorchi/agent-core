@@ -53,12 +53,17 @@ export type ToolProgress =
     }
   | {
       readonly type: 'output';
-      readonly stream: 'stdout' | 'stderr';
+      readonly stream: 'stdout' | 'stderr' | 'terminal';
       readonly sequence: number;
       readonly text: string;
       readonly observedBytes: number;
     }
-  | { readonly type: 'metric'; readonly name: string; readonly value: number; readonly unit?: string };
+  | {
+      readonly type: 'metric';
+      readonly name: string;
+      readonly value: number;
+      readonly unit?: string;
+    };
 
 export interface ToolResourceLease {
   readonly transferred: boolean;
@@ -119,10 +124,14 @@ export function requireToolService<T>(
     });
   }
   if (!validate(value)) {
-    throw new MissingToolServiceError(name, `Tool service ${name} is invalid; expected ${expected}.`, {
-      expected,
-      actualType: valueType(value)
-    });
+    throw new MissingToolServiceError(
+      name,
+      `Tool service ${name} is invalid; expected ${expected}.`,
+      {
+        expected,
+        actualType: valueType(value)
+      }
+    );
   }
   return value;
 }
