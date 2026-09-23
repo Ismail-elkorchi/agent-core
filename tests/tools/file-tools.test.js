@@ -427,6 +427,36 @@ test('search_text delegates regex validation to ripgrep and separates line and o
   assert.equal(invalidWithoutFiles.output.status, 'invalid_pattern');
 });
 
+test('search_text accepts an exact file path and settles an invalid selection', async () => {
+  const { root, context } = await rootedFiles();
+  await mkdir(path.join(root, 'src'));
+  await writeFile(path.join(root, 'src', 'session.ts'), 'contextRenewal\n');
+  await writeFile(path.join(root, 'src', 'other.ts'), 'contextRenewal\n');
+
+  const exact = await invokeToolCall(
+    jsonToolCall('search_text', {
+      path: 'src/session.ts',
+      patterns: ['*.ts'],
+      query: 'contextRenewal'
+    }),
+    tools,
+    context
+  );
+  assert.equal(exact.kind, 'result', exact.summary);
+  assert.equal(exact.output.status, 'completed');
+  assert.deepEqual(exact.output.results.map((match) => match.path), ['src/session.ts']);
+  assert.equal(exact.output.examinedFileCount, 1);
+
+  const invalid = await invokeToolCall(
+    jsonToolCall('search_text', { path: 'src/missing.ts', query: 'contextRenewal' }),
+    tools,
+    context
+  );
+  assert.equal(invalid.kind, 'failure');
+  assert.equal(invalid.output.reason, 'invalid_arguments');
+  assert.equal(invalid.execution.state, 'settled');
+});
+
 test('nested gitignore negation, ignore limits, and visit limits are deterministic', async () => {
   const { root, context } = await rootedFiles();
   await mkdir(path.join(root, 'nested'));

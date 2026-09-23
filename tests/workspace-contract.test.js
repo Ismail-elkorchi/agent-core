@@ -126,6 +126,12 @@ test('workspace search uses bounded shared ripgrep semantics and reports incompl
   assert.equal(result.output.status, 'completed');
   assert.equal(result.output.occurrenceCount, 3);
   assert.equal(result.output.matchingFileCount, 2);
+  const exact = await fixture.invoke('search_text', {
+    path: 'one.ts', query: 'needle', patterns: ['*.ts'], mode: 'count'
+  });
+  assert.equal(exact.kind, 'result', exact.summary);
+  assert.equal(exact.output.occurrenceCount, 2);
+  assert.deepEqual(exact.output.results.map((entry) => entry.path), ['one.ts']);
   fixture.files.readFile = async () => {
     throw new Error('source unavailable');
   };

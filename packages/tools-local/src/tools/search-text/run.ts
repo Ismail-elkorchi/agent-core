@@ -2,6 +2,8 @@ import { spawn } from 'node:child_process';
 import {
   type ToolExecutionContext,
   type ToolObservationInput,
+  ToolInputError,
+  invalidToolInputObservation,
   isWorkspaceFiles,
   type WorkspaceFiles
 } from '@agent-core/tools';
@@ -61,7 +63,6 @@ export async function searchText(
   const perFileLimit = clampRequestedLimit(input.perFileLimit, limits.maxResults);
   const args = [
     '--json',
-    '--stats',
     '--line-number',
     '--color',
     'never',
@@ -101,6 +102,11 @@ export async function searchText(
       aggregate.diagnostic = `File discovery was partial: ${selection.causes.join(', ')}.`;
     }
   } catch (error) {
+    if (!context.signal?.aborted && error instanceof ToolInputError)
+      return {
+        ...invalidToolInputObservation('search_text', error.message, error.details),
+        execution: { state: 'settled' }
+      };
     if (!context.signal?.aborted) throw error;
     aggregate = {
       files: new Set(),
@@ -493,12 +499,6 @@ function consume(
     return false;
   }
   if (!record(event) || typeof event.type !== 'string' || !record(event.data)) return true;
-  if (event.type === 'summary' && record(event.data.stats)) {
-    const searches = event.data.stats.searches;
-    if (typeof searches === 'number' && Number.isSafeInteger(searches) && searches >= 0)
-      aggregate.examinedFileCount = searches;
-    return true;
-  }
   if (event.type !== 'match' && event.type !== 'context') return true;
   const data = event.data as RipgrepData;
   const rawFile = data.path?.text;

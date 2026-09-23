@@ -86,13 +86,15 @@ export class RootedFileSelector {
     const startPath = isWorkspaceFiles(this.root)
       ? this.root.normalize(request.startPath)
       : this.root.canonicalPath(request.startPath);
-    if (isWorkspaceFiles(this.root)) {
-      if ((await this.root.stat(startPath)).kind !== 'directory')
-        throw new ToolInputError('Selection root must be a directory.');
-    } else {
-      const startHandle = await this.root.openDirectory(startPath);
-      await startHandle.close();
-    }
+    const rootKind = isWorkspaceFiles(this.root)
+      ? (await this.root.stat(startPath)).kind
+      : (await this.root.inspectPath(startPath)).kind;
+    if (rootKind !== 'directory' && !(rootKind === 'file' && request.type === 'file'))
+      throw new ToolInputError(
+        rootKind === 'absent'
+          ? `Selection path does not exist: ${startPath}`
+          : `Selection path is not a ${request.type === 'file' ? 'file or directory' : 'directory'}: ${startPath}`
+      );
     const patterns =
       request.patterns.length > 0 ? request.patterns.map(normalizePattern) : ['**/*'];
     const exclusions = request.exclude.map(normalizePattern);
@@ -263,7 +265,21 @@ export class RootedFileSelector {
         }
       }
     };
-    await walk(startPath, 1, []);
+    if (rootKind === 'file') {
+      const scopedPath = path.posix.basename(startPath);
+      if (!request.includeHidden && hidden(startPath)) {
+        omit('hidden');
+        sample(samples, { path: startPath, reason: 'hidden' });
+      } else if (matchesAny(scopedPath, exclusions, false)) {
+        omit('excluded');
+        sample(samples, { path: startPath, reason: 'excluded' });
+      } else if (matchesAny(scopedPath, patterns, false)) {
+        entries.push(await makeEntry(this.root, startPath, 'file', request.includeMetadata === true));
+      }
+      visitedEntries = 1;
+    } else {
+      await walk(startPath, 1, []);
+    }
     if (omittedIgnoreFiles > 0) causes.add('ignore_file_limit');
     const lowerBound = [...omissionCounts.values()].some((item) => item.relation === 'at_least');
     return Object.freeze({
