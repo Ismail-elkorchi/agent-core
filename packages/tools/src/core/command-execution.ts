@@ -47,6 +47,8 @@ export interface StartCommandExecutionOptions {
   readonly signal?: AbortSignal;
   readonly lease?: ToolResourceLease;
   readonly onProgress?: (progress: ToolProgress) => void | Promise<void>;
+  /** Return the terminal command result, while the authority owns its process lifetime. */
+  readonly awaitTerminal?: boolean;
 }
 
 /** Authority-owned command planning. It may reserve resources but must not execute the target. */

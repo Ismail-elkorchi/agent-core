@@ -89,7 +89,7 @@ class Provider {
           id: 'secret-process',
           type: 'function',
           name: 'exec_command',
-          input: { kind: 'json', value: { command, yieldMs: 1_000 } }
+          input: { kind: 'json', value: { command } }
         }
       ]
     };

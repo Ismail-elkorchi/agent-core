@@ -27,7 +27,7 @@ export function createExecCommandTool(
     name: 'exec_command',
     implementationId: 'agent-core.exec-command.v1',
     description:
-      'Start a persistent command through the application-supplied command execution authority.',
+      'Run a command to exit or timeout while streaming progress. Background commands return a process handle for later interaction.',
     schema: execCommandSchema(ptySupported, options.environmentLifetimeSupported),
     outputSchema: execCommandOutputSchema,
     buildModelContent: buildProcessContent,
@@ -59,12 +59,14 @@ export function createExecCommandTool(
         'CommandExecution'
       );
       const owner = processOwner(context);
+      const background = input.background || input.lifetime === 'environment';
       const request = Object.freeze({
         ...input,
+        background,
         pty: 'pty' in input && input.pty === true,
         lifetime: 'lifetime' in input ? input.lifetime : 'job',
         workdir,
-        yieldMs: clampRequestedLimit(input.yieldMs, limits.maxYieldMs),
+        yieldMs: background ? Math.min(1_000, limits.maxYieldMs) : 0,
         timeoutMs: clampRequestedLimit(input.timeoutMs, limits.maxTimeoutMs),
         outputTokenBudget: clampRequestedLimit(input.outputTokenBudget, limits.maxOutputTokens),
         owner
@@ -118,6 +120,7 @@ async function executeCommand(
     result = await startCommandExecutionPlan(input.executor, input.reservation, {
       ...(context.signal ? { signal: context.signal } : {}),
       ...(context.resourceLease ? { lease: context.resourceLease } : {}),
+      awaitTerminal: !input.background,
       onProgress: (progress) => context.emitProgress?.(progress)
     });
   } catch (error) {
@@ -170,6 +173,7 @@ function processOwner(context: ToolExecutionContext): CommandExecutionOwner {
 
 interface CommandInput extends Omit<CommandExecutionPlanRequest, 'rootedDirectory'> {
   readonly workdir: string;
+  readonly background: boolean;
   readonly executor: CommandExecution;
 }
 
@@ -180,7 +184,7 @@ function commandSnapshot(input: CommandInput) {
     pty: input.pty,
     lifetime: input.lifetime ?? 'job',
     timeoutMs: input.timeoutMs,
-    yieldMs: input.yieldMs,
+    background: input.background,
     outputTokenBudget: input.outputTokenBudget
   };
 }

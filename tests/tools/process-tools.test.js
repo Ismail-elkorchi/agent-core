@@ -198,7 +198,7 @@ test('persistent processes support polling and stdin without replaying prior out
   const { context, manager } = await processContext();
   const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('ready\\n'); process.stdin.setEncoding('utf8'); process.stdin.on('data', d => process.stdout.write('echo:' + d)); process.stdin.on('end', () => process.exit(0));")}`;
   const started = await invokeToolCall(
-    jsonToolCall('exec_command', { command, yieldMs: 500 }),
+    jsonToolCall('exec_command', { command, background: true }),
     tools,
     context
   );
@@ -236,7 +236,7 @@ test('stop_process terminates an owned process tree without a shell stop command
   const { context } = await processContext();
   const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("console.log('started'); setInterval(() => {}, 1000)")}`;
   const started = await invokeToolCall(
-    jsonToolCall('exec_command', { command, yieldMs: 500, timeoutMs: 60_000 }),
+    jsonToolCall('exec_command', { command, background: true, timeoutMs: 60_000 }),
     tools,
     context
   );
@@ -250,19 +250,43 @@ test('stop_process terminates an owned process tree without a shell stop command
 
 test('a nonzero command exit is a negative tool result, not a tool failure', async () => {
   const { context } = await processContext();
-  let result = await invokeToolCall(
+  const result = await invokeToolCall(
     jsonToolCall('exec_command', {
-      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify('process.exit(7)')}`,
-      yieldMs: 1_000
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify('process.exit(7)')}`
     }),
     tools,
     context
   );
-  if (result.output.status === 'running')
-    result = await pollUntilSettled(result.output.processId, context, result.output.cursorEnd);
+  assert.equal(result.output.status, 'exited');
   assert.equal(result.kind, 'result');
   assert.equal(result.execution.state, 'settled');
   assert.equal(result.output.exitCode, 7);
+});
+
+test('foreground commands deliver their terminal output and enforce their deadline without process controls', async () => {
+  const { context } = await processContext();
+  const completed = await invokeToolCall(
+    jsonToolCall('exec_command', {
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('first\\n'); setTimeout(() => { process.stdout.write('last\\n'); process.exit(0); }, 150)")}`,
+      timeoutMs: 5_000
+    }),
+    tools,
+    context
+  );
+  assert.equal(completed.output.status, 'exited');
+  assert.match(completed.output.combined.text, /first\nlast\n/u);
+  assert.equal(completed.execution.state, 'settled');
+
+  const timedOut = await invokeToolCall(
+    jsonToolCall('exec_command', {
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify('setInterval(() => {}, 1000)')}`,
+      timeoutMs: 500
+    }),
+    tools,
+    context
+  );
+  assert.equal(timedOut.output.status, 'timed_out');
+  assert.equal(timedOut.execution.state, 'settled');
 });
 
 test('stop_process force-kills descendants that ignore graceful termination', async () => {
@@ -271,7 +295,7 @@ test('stop_process force-kills descendants that ignore graceful termination', as
     "console.log(process.pid); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)";
   const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`;
   const started = await invokeToolCall(
-    jsonToolCall('exec_command', { command, yieldMs: 500, timeoutMs: 60_000 }),
+    jsonToolCall('exec_command', { command, background: true, timeoutMs: 60_000 }),
     tools,
     context
   );
@@ -289,20 +313,18 @@ test('stop_process force-kills descendants that ignore graceful termination', as
 test('bounded output retains the true start and true tail and stores an artifact', async () => {
   const { context, artifacts } = await processContext({ maxCapturedBytes: 160, tailBytes: 64 });
   const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('START-' + 'x'.repeat(5000) + '-END')")}`;
-  let result = await invokeToolCall(
-    jsonToolCall('exec_command', { command, yieldMs: 1_000, outputTokenBudget: 64 }),
+  const result = await invokeToolCall(
+    jsonToolCall('exec_command', { command, outputTokenBudget: 64 }),
     tools,
     context
   );
-  const first = result;
-  if (result.output.status === 'running')
-    result = await pollUntilSettled(result.output.processId, context, result.output.cursorEnd);
-  const output = `${first.output.combined.text}${result === first ? '' : result.output.combined.text}`;
+  assert.equal(result.output.status, 'exited');
+  const output = result.output.combined.text;
   assert.match(output, /START-/u);
   assert.match(output, /-END/u);
-  assert.equal(first.output.combined.omittedBytes > 0, true);
-  assert.equal(first.output.combined.startsAtOutputStart, true);
-  assert.equal(first.output.combined.endsAtOutputEnd, true);
+  assert.equal(result.output.combined.omittedBytes > 0, true);
+  assert.equal(result.output.combined.startsAtOutputStart, true);
+  assert.equal(result.output.combined.endsAtOutputEnd, true);
   assert.equal((await artifacts.readVerified(result.output.artifact)).byteLength > 0, true);
 });
 
@@ -326,7 +348,7 @@ test('process polls use stable cursors, preserve split UTF-8, and retain a compl
   let started = await invokeToolCall(
     jsonToolCall('exec_command', {
       command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
-      yieldMs: 500
+      background: true
     }),
     tools,
     context
@@ -366,7 +388,7 @@ test(
     });
     const noisy = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('x'.repeat(5000)); setInterval(()=>{},1000)")}`;
     let first = await invokeToolCall(
-      jsonToolCall('exec_command', { command: noisy, yieldMs: 200 }),
+      jsonToolCall('exec_command', { command: noisy, background: true }),
       tools,
       context
     );
@@ -389,7 +411,7 @@ test(
     );
     assert.equal(expired.output.cursorExpired, true);
     const limited = await invokeToolCall(
-      jsonToolCall('exec_command', { command: noisy, yieldMs: 10 }),
+      jsonToolCall('exec_command', { command: noisy, background: true }),
       tools,
       context
     );
@@ -412,7 +434,7 @@ test('process ownership and run cleanup cannot affect another run', async () => 
   const { context, manager } = await processContext({}, ownerA);
   const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify('setInterval(()=>{},1000)')}`;
   const started = await invokeToolCall(
-    jsonToolCall('exec_command', { command, yieldMs: 50 }),
+    jsonToolCall('exec_command', { command, background: true }),
     tools,
     context
   );

@@ -53,8 +53,7 @@ test(
         patch: '*** Begin Patch\n*** Update File: note.txt\n@@\n-alpha\n+beta\n*** End Patch'
       }),
       call('exec', 'exec_command', {
-        command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("require('node:fs').accessSync('note.txt'); process.stdout.write('command-ok')")}`,
-        yieldMs: 1_000
+        command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("require('node:fs').accessSync('note.txt'); process.stdout.write('command-ok')")}`
       })
     ];
     const provider = new ScriptedProvider([

@@ -16,8 +16,10 @@ export function execCommandSchema(ptySupported: boolean, environmentLifetimeSupp
     lifetime: (environmentLifetimeSupported
       ? z.enum(['job', 'environment'])
       : z.literal('job')
-    ).default('job'),
-    yieldMs: z.int().min(0).default(10_000),
+    ).default('job').describe('Environment lifetime keeps a service across jobs and implies background execution.'),
+    background: z.boolean().default(false).describe(
+      'Return a process handle only when the task requires interactive input or work while this command remains active. Otherwise wait for exit or timeout.'
+    ),
     timeoutMs: z.int().min(1).default(60_000),
     outputTokenBudget: z.int().min(64).default(4_000)
   });

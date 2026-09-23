@@ -140,7 +140,7 @@ const approvalTool = defineTool({
 test('a run stops and persists its active process before durable approval suspension', async () => {
   const state = await setup();
   const provider = new Provider([
-    toolResponse('exec_command', { command: longCommand, yieldMs: 100 }),
+    toolResponse('exec_command', { command: longCommand, background: true }),
     toolResponse('approval_write', {})
   ]);
   const agent = createRuntime({
@@ -166,7 +166,7 @@ test('abort and unknown provider outcome both clean active run processes before 
   for (const mode of ['abort', 'failure']) {
     const state = await setup();
     const provider = new Provider([
-      toolResponse('exec_command', { command: longCommand, yieldMs: 100 }),
+      toolResponse('exec_command', { command: longCommand, background: true }),
       ...(mode === 'failure' ? [new Error('provider failed')] : [done])
     ]);
     let control;
@@ -239,7 +239,7 @@ test('natural process exit is persisted exactly once even when the model never p
   const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify('process.exit(0)')}`;
   const agent = createRuntime({
     ...state,
-    provider: new Provider([toolResponse('exec_command', { command, yieldMs: 1_000 }), done]),
+    provider: new Provider([toolResponse('exec_command', { command }), done]),
     tools: [execCommandTool]
   });
   const result = await agent.run({ runId: 'natural-exit-run', task: 'let process exit' }).result;
@@ -373,7 +373,7 @@ test('an explicitly admitted work owner keeps a process across runs with its ori
   const first = await new AgentRuntime({ maxOutputTokens: 64,
     ...options,
     provider: new Provider([
-      toolResponse('exec_command', { command: longCommand, yieldMs: 100 }),
+      toolResponse('exec_command', { command: longCommand, background: true }),
       done
     ]),
     tools: [execCommandTool]

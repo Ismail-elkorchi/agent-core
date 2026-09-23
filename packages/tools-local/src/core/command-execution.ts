@@ -428,6 +428,11 @@ export class LocalCommandExecution implements CommandExecution {
       options.signal.addEventListener('abort', record.abortListener, { once: true });
       if (options.signal.aborted) record.abortListener();
     }
+    if (options.awaitTerminal) {
+      await tree.settle();
+      await this.finish(record);
+      return this.query(id, request.outputTokenBudget, 0, 0, request.owner);
+    }
     await this.waitForActivity(record, request.yieldMs, 0);
     if (record.status === 'running' && options.lease)
       options.lease.transferToResource(id, processScope(id));
