@@ -27,7 +27,7 @@ import {
 } from '@agent-core/tools-local';
 import { invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
 import { testRootedFileAuthority } from '../rooted-file-authority-helper.js';
-import { isCommandExecution } from '@agent-core/tools';
+import { isCommandExecution, planToolCall, releaseToolCallPlan } from '@agent-core/tools';
 
 const tools = [execCommandTool, writeStdinTool, stopProcessTool];
 const policy = { allowedRisks: ['read', 'execute'] };
@@ -115,6 +115,49 @@ test('command execution is admitted by behavior and has a stable recovery identi
   assert.match(first.descriptor.recoveryIdentity, /^local-command:sha256:[a-f0-9]{64}$/u);
   await first.close();
   await second.close();
+});
+
+test('command plans bind the physical directory without fingerprinting live descriptors', async (t) => {
+  const { root, manager, context } = await processContext();
+  t.after(async () => {
+    await manager.close();
+    context.services.rootedFileAuthority.close();
+    await rm(root, { recursive: true, force: true });
+  });
+  const work = path.join(root, 'work');
+  await mkdir(work);
+  const call = jsonToolCall('exec_command', { command: 'pwd', workdir: 'work' });
+  const planningContext = {
+    ...context,
+    signal: new AbortController().signal,
+    boundary: {
+      authorizationPolicyId: 'tests/command-plan@1',
+      executionTargetId: manager.descriptor.recoveryIdentity
+    }
+  };
+  const plan = async () => {
+    const result = await planToolCall(call, tools, planningContext);
+    assert.equal(result.ok, true, result.ok ? '' : result.observation.summary);
+    return result.plan;
+  };
+
+  const first = await plan();
+  const second = await plan();
+  assert.deepEqual(first.canonicalSnapshot, second.canonicalSnapshot);
+  assert.equal(first.fingerprint, second.fingerprint);
+  await releaseToolCallPlan(first);
+  await releaseToolCallPlan(second);
+
+  await writeFile(path.join(work, 'note.txt'), 'changed contents');
+  const changedContents = await plan();
+  assert.equal(changedContents.fingerprint, first.fingerprint);
+  await releaseToolCallPlan(changedContents);
+
+  await rename(work, path.join(root, 'moved'));
+  await mkdir(work);
+  const replaced = await plan();
+  assert.notEqual(replaced.fingerprint, second.fingerprint);
+  await releaseToolCallPlan(replaced);
 });
 
 test('local process inspection and settlement notification report the owned command', async (t) => {

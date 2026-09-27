@@ -418,33 +418,48 @@ export class RootedFileAuthority {
     return authority;
   }
 
-  /** Stable procfs path used only to hand a held directory to a child process. */
+  /** Hold the resolved directory for child execution and identify its physical target. */
   async commandDirectory(
     requestedPath: string
-  ): Promise<{ readonly path: string; close(): Promise<void> }> {
+  ): Promise<{
+    readonly path: string;
+    readonly identity: Readonly<Pick<RootIdentity, 'device' | 'inode' | 'mountId'>>;
+    close(): Promise<void>;
+  }> {
     const rootedDirectory = this.canonicalPath(requestedPath);
     const directory = await this.#openDirectorySegments(
       rootedDirectory === '.' ? [] : rootedDirectory.split('/'),
       requestedPath
     );
-    const commandPath = `/proc/${String(process.pid)}/fd/${String(directory.handle.fd)}`;
-    let closed = false;
-    const assertOpen = () => {
-      this.#assertOpen();
-      if (closed) throw new Error(`Rooted command directory is closed: ${rootedDirectory}`);
-    };
-    const authority: { readonly path: string; close(): Promise<void> } = Object.freeze({
-      get path() {
-        assertOpen();
-        return commandPath;
-      },
-      async close() {
-        if (closed) return;
-        closed = true;
-        await directory.close();
-      }
-    });
-    return authority;
+    try {
+      const stat = await directory.handle.stat({ bigint: true });
+      const identity = Object.freeze({
+        device: String(stat.dev),
+        inode: String(stat.ino),
+        mountId: this.#rootMountId
+      });
+      const commandPath = `/proc/${String(process.pid)}/fd/${String(directory.handle.fd)}`;
+      let closed = false;
+      const assertOpen = () => {
+        this.#assertOpen();
+        if (closed) throw new Error(`Rooted command directory is closed: ${rootedDirectory}`);
+      };
+      return Object.freeze({
+        identity,
+        get path() {
+          assertOpen();
+          return commandPath;
+        },
+        async close() {
+          if (closed) return;
+          closed = true;
+          await directory.close();
+        }
+      });
+    } catch (error) {
+      await directory.close();
+      throw error;
+    }
   }
 
   async [openMutationDirectory](requestedPath: string): Promise<RootedMutationDirectory> {

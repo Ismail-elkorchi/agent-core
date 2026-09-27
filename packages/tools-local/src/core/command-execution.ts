@@ -156,14 +156,14 @@ class LocalCommandReservationState {
   constructor(
     readonly authority: LocalCommandExecution,
     readonly request: CommandExecutionPlanRequest,
-    private readonly directory: { readonly path: string; close(): Promise<void> }
+    private readonly directory: Awaited<ReturnType<RootedFileAuthority['commandDirectory']>>
   ) {
     this.authorization = Object.freeze({
       authority: authority.descriptor.implementationId,
       recoveryIdentity: authority.descriptor.recoveryIdentity,
       executionTarget: 'host',
       isolation: 'none',
-      workingDirectory: directory.path
+      directoryIdentity: directory.identity
     });
   }
 
