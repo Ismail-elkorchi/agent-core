@@ -1,11 +1,10 @@
-import { responsesInput, responsesToolCall } from '@agent-core/provider-openai-responses';
+import { responsesInput, responsesTool, responsesToolCall } from '@agent-core/provider-openai-responses';
 import type { CompiledModelRequest } from '@agent-core/model';
 import {
   ModelProviderError,
   type ModelReasoningRequest,
   type ModelRequest,
   type ModelResponseFormat,
-  type ModelTool,
   type ModelToolCall
 } from '@agent-core/model';
 import { OPENAI_CODEX_PROVIDER_ID } from './constants.js';
@@ -33,7 +32,7 @@ export function toCodexResponsesRequest(request: ModelRequest): Record<string, u
   };
   if (instructions.length > 0) body.instructions = instructions;
   body.text = toCodexTextConfig(request.responseFormat);
-  if (request.tools && request.tools.length > 0) body.tools = request.tools.map(toCodexTool);
+  if (request.tools && request.tools.length > 0) body.tools = request.tools.map(responsesTool);
   const reasoning = toCodexReasoning(request.reasoning);
   if (reasoning) body.reasoning = reasoning;
   if (request.metadata && Object.keys(request.metadata).length > 0) body.metadata = request.metadata;
@@ -107,23 +106,6 @@ function applyCodexProviderOptions(body: Record<string, unknown>, request: Model
 
 export function toCodexFunctionCallInput(toolCall: ModelToolCall): Record<string, unknown> {
   return responsesToolCall(toolCall, OPENAI_CODEX_PROVIDER_ID);
-}
-
-function toCodexTool(tool: ModelTool): Record<string, unknown> {
-  if (tool.type === 'custom') {
-    return {
-      type: 'custom',
-      name: tool.name,
-      ...(tool.description ? { description: tool.description } : {}),
-      format: tool.format
-    };
-  }
-  return {
-    type: 'function',
-    name: tool.function.name,
-    ...(tool.function.description ? { description: tool.function.description } : {}),
-    ...(tool.function.parameters ? { parameters: tool.function.parameters } : {})
-  };
 }
 
 function toCodexTextConfig(format: ModelResponseFormat | undefined): Record<string, unknown> {

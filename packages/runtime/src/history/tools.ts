@@ -76,8 +76,11 @@ export function createHistoryTools(options: {
         if (result.status !== 'available') return defaultToolModelContent(observation);
         const item = parseJsonObject(result.item);
         const { text, ...source } = item;
+        const facts = Object.fromEntries(Object.entries(result).filter(([key]) =>
+          key !== 'cut' && key !== 'item'
+        ));
         return [
-          { type: 'text', text: JSON.stringify({ ...result, item: source }, null, 2) },
+          { type: 'text', text: JSON.stringify({ ...facts, item: source }) },
           { type: 'text', text: typeof text === 'string' ? text : JSON.stringify(text) }
         ];
       },
@@ -99,6 +102,16 @@ export function createHistoryTools(options: {
       schema: search,
       mode: 'read',
       root: 'history',
+      buildModelContent({ observation }) {
+        if (observation.kind !== 'result') return defaultToolModelContent(observation);
+        const result = parseJsonObject(observation.output);
+        // Cuts remain in the authoritative result and cursor. Exact item identities,
+        // scan coverage, unavailable sources and continuation stay model-visible.
+        const facts = Object.fromEntries(Object.entries(result).filter(([key]) =>
+          key !== 'cut' && key !== 'indexWatermark'
+        ));
+        return [{ type: 'text', text: JSON.stringify(facts) }];
+      },
       async canonicalize(value) {
         const cut = await options.history.capture();
         return {

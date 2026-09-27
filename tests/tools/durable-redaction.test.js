@@ -112,7 +112,7 @@ const secretResult = defineTool({
     summary: 'secret output',
     scope: { resources: ['memory/secrets'], coverage: 'complete' },
     output: {
-      token: secrets[0],
+      accessToken: secrets[0],
       authorization: `Bearer ${secrets[1]}`,
       password: secrets[2],
       environment: `APP_SECRET=${secrets[3]}`
@@ -138,7 +138,7 @@ const secretFailure = defineTool({
     output: {
       reason: 'runtime_error',
       error: `Authorization: Bearer ${secrets[1]}`,
-      details: { password: secrets[2], token: secrets[0] }
+      details: { password: secrets[2], accessToken: secrets[0] }
     }
   })
 });

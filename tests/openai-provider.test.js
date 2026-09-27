@@ -210,6 +210,7 @@ test('OpenAIProvider sends Responses API requests with bearer auth, tools, text.
   assert.deepEqual(body.tools[0], {
     type: 'function',
     name: 'read_files',
+    strict: false,
     description: 'Read text files',
     parameters: {
       type: 'object',

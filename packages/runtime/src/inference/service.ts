@@ -31,6 +31,7 @@ import {
 import { randomUUID } from 'node:crypto';
 import { requestWindowForModel } from '../orchestration/model-request.js';
 import { InferenceGateway, type InferenceInvocation } from './gateway.js';
+import { ContextAdmissionError } from './request-admission.js';
 import {
   invokeNativeInference,
   type NativeGenerationContext,
@@ -52,9 +53,12 @@ export interface InferenceServiceOptions {
   readonly repository: InferenceRepository;
   readonly artifacts: ArtifactRepository;
   readonly budget?: InferenceBudget;
+  /** Side-effect-free application policy, checked before any provider dispatch authority. */
+  readonly admitRequest?: (request: CompiledModelRequest) => void | Promise<void>;
 }
 export interface GovernedInferenceInput extends InferenceIdentity, ModelCompilationOptions {
   readonly request: ModelRequest;
+  readonly compiled?: CompiledModelRequest;
   readonly profile?: ModelProfile;
   readonly signal?: AbortSignal;
   readonly onStreamEvent?: (
@@ -69,7 +73,6 @@ export interface GovernedContextTransformInput extends Omit<
 }
 interface DurableInferenceInput extends GovernedInferenceInput {
   readonly session?: ModelProviderSession;
-  readonly compiled?: CompiledModelRequest;
 }
 export interface InferenceCharges {
   readonly usage: ModelUsage;
@@ -190,6 +193,21 @@ export class InferenceService {
   }
   async compile(request: ModelRequest, profile: ModelProfile, options?: ModelCompilationOptions) {
     return this.gateway.compile(request, profile, options);
+  }
+
+  async admit(compiled: CompiledModelRequest, profile: ModelProfile): Promise<void> {
+    assertCompiledProfile(compiled, profile);
+    const identity = await modelInputIdentity(compiled.retainedBody === undefined
+      ? compiled.body
+      : { body: compiled.body, retainedBody: compiled.retainedBody });
+    if (identity !== compiled.inputIdentity)
+      throw new Error('Compiled provider input identity changed.');
+    try {
+      assertRequestAccountingFits(compiled.accounting);
+    } catch (cause) {
+      throw new ContextAdmissionError(compiled, cause);
+    }
+    await this.options.admitRequest?.(compiled);
   }
   async invokeWithLifecycle<TResult>(
     input: InferenceInvocation,
@@ -341,8 +359,7 @@ export class InferenceService {
     compiled: CompiledModelRequest
   ): Promise<void> {
     const { repository, artifacts } = this.options;
-    assertCompiledProfile(compiled, context.profile);
-    assertRequestAccountingFits(compiled.accounting);
+    await this.admit(compiled, context.profile);
     const promptTokens = requestAccountingInputTokens(compiled.accounting);
     const completionTokens =
       compiled.accounting.outputReservation +
@@ -841,6 +858,7 @@ export class InferenceService {
     const authorize = async (): Promise<void> => {
       try {
         signal?.throwIfAborted();
+        await this.admit(compiled, profile);
         await input.startAuthority?.();
         signal?.throwIfAborted();
       } catch (cause) {
@@ -922,6 +940,7 @@ function chargesAndIdentity(result: DurableResult<unknown>): InferenceIdentity &
 }
 function assertCompiledProfile(compiled: CompiledModelRequest, profile: ModelProfile): void {
   if (
+    compiled.logicalRequest.model !== profile.id ||
     compiled.provider !== profile.provider ||
     compiled.model !== profile.id ||
     compiled.capabilityRevision !== (profile.capabilities.protocol?.revision ?? 'conservative-v1')

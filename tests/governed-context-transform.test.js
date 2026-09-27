@@ -48,7 +48,7 @@ const profile = {
   supportedParameters: ['maxOutputTokens'],
   pricing: { currency: 'USD', rates: { input: 1, output: 2 } }
 };
-async function fixture({ tokenCount = 32, gate, budget } = {}) {
+async function fixture({ tokenCount = 32, gate, budget, admitRequest } = {}) {
   const artifacts = new InMemoryArtifactRepository();
   const repository = new InMemoryInferenceRepository();
   const inferenceAudit = recordInferenceEvents(repository);
@@ -107,6 +107,7 @@ async function fixture({ tokenCount = 32, gate, budget } = {}) {
     provider,
     repository,
     artifacts,
+    ...(admitRequest ? { admitRequest } : {}),
     ...(budget ? { budget } : {})
   });
   const sessions = new InMemorySessionRepository();
@@ -160,6 +161,21 @@ async function transitionInput(state) {
     }
   };
 }
+
+test('context transform admission rejects the exact compiled input before provider execution', async () => {
+  const state = await fixture({ admitRequest(compiled) {
+    assert.equal(compiled.endpoint, 'fixture/compact');
+    throw new Error('Transform denied');
+  } });
+  await assert.rejects(state.inference.transformContext({
+    ownerId: 'context-owner', invocationId: 'rejected-transform', purpose: 'context', transformId: 'transform',
+    request: { model: 'native', messages: [{ role: 'user', content: 'Original context' }], maxOutputTokens: 64 }
+  }), /Transform denied/);
+  assert.equal(state.transforms(), 0);
+  const invocation = (await state.repository.load('context-owner', { invocationId: 'rejected-transform' })).invocation;
+  assert.equal(invocation.notSent.type, 'inference.not_sent');
+  assert.equal(invocation.uncertain, undefined);
+});
 async function applyTransition(state, transition) {
   let runtime;
   let scheduled = false;

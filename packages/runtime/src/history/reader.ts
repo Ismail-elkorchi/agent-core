@@ -1027,21 +1027,30 @@ interface SearchCursor {
   readonly queryFingerprint: string;
 }
 function encodeCursor(cursor: SearchCursor): string {
-  return Buffer.from(JSON.stringify({ format: 'agent-core.history-cursor/1', ...cursor })).toString(
-    'base64url'
-  );
+  const position = cursor.position ? decodeEntryCursor(cursor.position) : undefined;
+  return Buffer.from(JSON.stringify({
+    format: 'agent-core.history-cursor/1',
+    cut: cursor.cut,
+    queryFingerprint: cursor.queryFingerprint,
+    ...(position ? { position: {
+      at: position.at, sequence: position.sequence, fingerprint: position.fingerprint
+    } } : {})
+  })).toString('base64url');
 }
 function decodeCursor(value: string): SearchCursor {
   if (value.length > 256 * 1024) throw new Error('History cursor too large.');
   const parsed = parseJsonObject(JSON.parse(Buffer.from(value, 'base64url').toString('utf8')));
   if (
     parsed.format !== 'agent-core.history-cursor/1' ||
-    typeof parsed.queryFingerprint !== 'string' ||
-    (parsed.position !== undefined && typeof parsed.position !== 'string')
+    typeof parsed.queryFingerprint !== 'string'
   )
     throw new Error('Invalid history cursor.');
   return {
-    ...(typeof parsed.position === 'string' ? { position: parsed.position } : {}),
+    ...(parsed.position !== undefined ? {
+      position: encodeEntryCursor(parseEntryCursor({
+        ...parseJsonObject(parsed.position), cut: parseJsonObject(parsed.cut), format: 'agent-core.history-sources/1'
+      }))
+    } : {}),
     queryFingerprint: parsed.queryFingerprint,
     cut: historyCutSchema.parse(parsed.cut)
   };
@@ -1134,7 +1143,9 @@ function encodeEntryCursor(cursor: EntryCursor): string {
 }
 function decodeEntryCursor(value: string): EntryCursor {
   if (value.length > 256 * 1024) throw new Error('History source cursor is too large.');
-  const record = parseJsonObject(JSON.parse(Buffer.from(value, 'base64url').toString('utf8')));
+  return parseEntryCursor(parseJsonObject(JSON.parse(Buffer.from(value, 'base64url').toString('utf8'))));
+}
+function parseEntryCursor(record: import('@agent-core/json').JsonObject): EntryCursor {
   if (
     record.format !== 'agent-core.history-sources/1' ||
     typeof record.at !== 'number' ||

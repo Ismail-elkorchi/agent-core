@@ -206,7 +206,7 @@ test(
   }
 );
 
-async function deliveryFixture({ maxInvocations = 3, disconnect = false } = {}) {
+async function deliveryFixture({ maxInvocations = 3, disconnect = false, admitRequest } = {}) {
   let effects = 0;
   let socket;
   const provider = new OpenAIProvider({
@@ -248,7 +248,8 @@ async function deliveryFixture({ maxInvocations = 3, disconnect = false } = {}) 
       provider,
       repository: inference,
       artifacts,
-      budget: { maxInvocations }
+      budget: { maxInvocations },
+      ...(admitRequest ? { admitRequest } : {})
     }),
     tools: [
       tool('read', async () => {
@@ -263,6 +264,19 @@ async function deliveryFixture({ maxInvocations = 3, disconnect = false } = {}) 
   const result = await control.result;
   return { result, runtime, options, events, inference, socket, effects };
 }
+
+test('application admission rejects a native successor before any result frame is sent', async () => {
+  const fixture = await deliveryFixture({ admitRequest(compiled) {
+    if (compiled.body.previous_response_id) throw new Error('Successor denied');
+  } });
+  assert.equal(fixture.socket.sent.length, 1);
+  assert.equal(fixture.effects, 1);
+  assert.equal(fixture.result.state, 'ended', JSON.stringify(fixture.result));
+  assert.equal(fixture.result.terminal.executionStatus, 'failed');
+  const state = (await fixture.runtime.inspectRun('delivery-boundary')).state;
+  assert.equal(state.toolBatches[0].callStates[0].stage, 'recorded');
+  assert.equal(state.toolBatches[0].callStates[0].delivery, undefined);
+});
 
 test('native successor spends the shared owner allowance before any result frame is sent', async () => {
   const fixture = await deliveryFixture({ maxInvocations: 1 });

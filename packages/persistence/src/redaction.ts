@@ -5,67 +5,74 @@ export interface RedactedJson {
   readonly redactions: number;
 }
 
-/** Apply the shared durable/model-visible secret redaction policy to owned JSON. */
+const marker = '[REDACTED]';
+const credentialFields = new Set([
+  'authorization', 'credential', 'credentials', 'password', 'apikey',
+  'accesstoken', 'refreshtoken', 'authtoken', 'clientsecret', 'privatekey'
+]);
+
+/** Each expression captures only the credential, at the end of its match. */
+function credentialPatterns(): RegExp[] {
+  return [
+    /\bAuthorization:[ \t]*Bearer[ \t]+([A-Za-z0-9._~+/=-]+)/giu,
+    /\bAuthorization:[ \t]*Basic[ \t]+([A-Za-z0-9+/=]+)/giu,
+    /\b(sk-(?:or-v1-)?[A-Za-z0-9_-]{16,})\b/gu,
+    /\b(gh[pousr]_[A-Za-z0-9_]{20,})\b/gu,
+    /\b((?:AKIA|ASIA)[A-Z0-9]{16})\b/gu,
+    /(-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z ]+ )?PRIVATE KEY-----)/gu,
+    // Environment dumps have a line-oriented grammar. Source-language identifiers do not.
+    /^(?:[A-Z][A-Z0-9_]*_)?(?:TOKEN|SECRET|PASSWORD|KEY|API_KEY)=(\S+)/gmu
+  ];
+}
+
+function masked(value: string): boolean {
+  return /^(?:\[REDACTED\]\**|\*+)$/u.test(value);
+}
+
+function redactText(value: string, preserveLength: boolean): { text: string; redactions: number } {
+  let redactions = 0;
+  let text = value;
+  for (const pattern of credentialPatterns()) {
+    text = text.replace(pattern, (match: string, credential: string) => {
+      if (masked(credential)) return match;
+      redactions++;
+      const replacement = preserveLength
+        ? credential.length < marker.length
+          ? '*'.repeat(credential.length)
+          : marker.padEnd(credential.length, '*')
+        : marker;
+      return match.slice(0, match.length - credential.length) + replacement;
+    });
+  }
+  return { text, redactions };
+}
+
+/** Redact explicit credential fields and recognizable credential syntax, not arbitrary source code. */
 export function redactJson(value: string): RedactedJson & { readonly value: string };
 export function redactJson(value: JsonObject): RedactedJson & { readonly value: JsonObject };
 export function redactJson(value: JsonValue): RedactedJson;
 export function redactJson(value: JsonValue): RedactedJson {
-  const state = { redactions: 0 };
-  const redacted = redactValue(value, [], state);
-  return Object.freeze({ value: redacted, redactions: state.redactions });
-}
-
-function redactValue(value: JsonValue, pathParts: readonly string[], state: { redactions: number }): JsonValue {
-  if (typeof value === 'string') return redactString(value, pathParts, state);
-  if (jsonArray(value)) return Object.freeze(value.map((item, index) => redactValue(item, [...pathParts, String(index)], state)));
-  if (typeof value !== 'object' || value === null) return value;
-  return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactValue(item, [...pathParts, key], state)])));
-}
-function jsonArray(value: JsonValue): value is readonly JsonValue[] { return Array.isArray(value); }
-
-function redactString(value: string, pathParts: readonly string[], state: { redactions: number }): string {
-  const key = pathParts.at(-1) ?? '';
-  if (/(authorization|credential|password|secret|token|api[-_]?key)/iu.test(key) && value.length > 0) {
-    state.redactions += 1;
-    return '[REDACTED]';
-  }
-  const patterns = [
-    /(Bearer\s+)[A-Za-z0-9._~+/=-]+/giu,
-    /(Basic\s+)[A-Za-z0-9+/=]+/giu,
-    /(sk-(?:or-v1-)?[A-Za-z0-9_-]{16,})/gu,
-    /(\b[A-Za-z_][A-Za-z0-9_]{0,127}(?:TOKEN|SECRET|PASSWORD|KEY)[A-Za-z0-9_]{0,127}=)[^\s]+/giu,
-    /((?:password|secret|token|api[-_]?key)\s*[:=]\s*)[^\s,;]+/giu
-  ];
-  let result = value;
-  for (const pattern of patterns) {
-    result = result.replace(pattern, (_match: string, prefix?: string) => {
-      state.redactions += 1;
-      return prefix ? `${prefix}[REDACTED]` : '[REDACTED]';
-    });
-  }
-  return result;
-}
-
-/** Redact process-stream text while preserving UTF-16 length for deterministic chunk re-splitting. */
-export function redactTextPreservingLength(value: string): { readonly text: string; readonly redactions: number } {
-  let text = value;
   let redactions = 0;
-  for (const pattern of secretPatterns()) {
-    text = text.replace(pattern, (match: string) => {
-      redactions += 1;
-      const marker = '[REDACTED]';
-      return marker.length >= match.length ? marker.slice(0, match.length) : marker + '*'.repeat(match.length - marker.length);
-    });
-  }
-  return Object.freeze({ text, redactions });
+  const visit = (item: JsonValue, key = ''): JsonValue => {
+    if (typeof item === 'string') {
+      if (credentialFields.has(key.replace(/[-_]/gu, '').toLowerCase()) && item.length > 0 && !masked(item)) {
+        redactions++;
+        return marker;
+      }
+      const result = redactText(item, false);
+      redactions += result.redactions;
+      return result.text;
+    }
+    if (Array.isArray(item)) return Object.freeze(item.map((entry: JsonValue) => visit(entry)));
+    if (item === null || typeof item !== 'object') return item;
+    return Object.freeze(
+      Object.fromEntries(Object.entries(item).map(([name, entry]) => [name, visit(entry, name)]))
+    );
+  };
+  return Object.freeze({ value: visit(value), redactions });
 }
 
-function secretPatterns(): RegExp[] {
-  return [
-    /Bearer\s+[A-Za-z0-9._~+/=-]+/giu,
-    /Basic\s+[A-Za-z0-9+/=]+/giu,
-    /sk-(?:or-v1-)?[A-Za-z0-9_-]{16,}/gu,
-    /\b[A-Za-z_][A-Za-z0-9_]{0,127}(?:TOKEN|SECRET|PASSWORD|KEY)[A-Za-z0-9_]{0,127}=[^\s]+/giu,
-    /(?:password|secret|token|api[-_]?key)\s*[:=]\s*[^\s,;]+/giu
-  ];
+/** Keep UTF-16 offsets stable when splitting a redacted process stream back into chunks. */
+export function redactTextPreservingLength(value: string): { readonly text: string; readonly redactions: number } {
+  return Object.freeze(redactText(value, true));
 }

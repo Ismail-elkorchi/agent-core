@@ -69,6 +69,37 @@ function input(invocationId = 'one', ownerId = 'work') {
   };
 }
 
+test('local admission failure records not-sent without provider execution or unknown exposure', async () => {
+  let calls = 0;
+  const provider = fixture(async request => { calls++; return response(request); });
+  const repository = new InMemoryInferenceRepository();
+  const service = new InferenceService({ provider, repository, artifacts: new InMemoryArtifactRepository(),
+    admitRequest() { throw new Error('Application admission denied'); }
+  });
+  await assert.rejects(service.invoke(input()), /Application admission denied/);
+  const state = await repository.load('work', { invocationId: 'one' });
+  assert.equal(state.invocation.notSent.type, 'inference.not_sent');
+  assert.equal(state.invocation.uncertain, undefined);
+  assert.equal(state.committed.usage.promptTokens, 0);
+  assert.equal(calls, 0);
+});
+
+test('runtime admission failure ends before any provider effect starts', async () => {
+  let calls = 0;
+  const provider = fixture(async request => { calls++; return response(request); });
+  const service = InferenceService.inMemory({ provider,
+    admitRequest() { throw new Error('Application admission denied'); }
+  });
+  const events = new InMemoryEventRepository(agentEventCodec);
+  const result = await new AgentRuntime({ provider, model: 'classifier', maxOutputTokens: 100,
+    toolBoundary: { authorizationPolicyId: 'test', executionTargetId: 'test' },
+    inferenceService: service, repositories: { events }, tools: []
+  }).run({ task: 'Inspect a file' }).result;
+  assert.equal(result.state, 'ended');
+  assert.equal(result.terminal.executionStatus, 'failed');
+  assert.equal(calls, 0);
+});
+
 test('classification uses durable invocation without a session, workflow, checks, or final-text contract', async () => {
   let calls = 0;
   const repository = new InMemoryInferenceRepository();

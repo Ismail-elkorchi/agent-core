@@ -1,8 +1,9 @@
 import { defineTool } from '@agent-core/tools';
-import { fileScope } from '../../core/resources.js';
+import { fileScope, fileSelectionScopes } from '../../core/resources.js';
 import { rootedFileSelector } from '../../core/rooted-file-selection.js';
 import { builtInObservedFacts } from '../../core/read-observed-facts.js';
 import { normalizeFilePath } from '../../core/rooted-files.js';
+import { buildPathSelectionContent } from '../../core/model-content.js';
 import {
   listDirectoryInputSchema,
   listDirectoryOutputSchema,
@@ -19,6 +20,7 @@ export const listDirectoryTool = defineTool({
   description: 'List a rooted directory as a sorted flat collection with explicit coverage.',
   schema: listDirectoryInputSchema,
   outputSchema: listDirectoryOutputSchema,
+  buildModelContent: buildPathSelectionContent,
   requirements: {
     services: ['localToolConfiguration']
   },
@@ -32,7 +34,9 @@ export const listDirectoryTool = defineTool({
   },
   deriveEffects(input) {
     return {
-      accesses: [{ mode: 'read', scope: fileScope(input.path) }],
+      accesses: fileSelectionScopes(input.path, input.respectGitIgnore).map((scope) => ({
+        mode: 'read' as const, scope
+      })),
       lockScopes: [],
       recovery: { kind: 'unknown' }
     };

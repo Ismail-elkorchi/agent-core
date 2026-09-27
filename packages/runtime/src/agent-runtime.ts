@@ -1,3 +1,4 @@
+import { writeContinuationNote } from './context/continuation-note.js';
 import { providerSettlementKey } from './inference/run-lifecycle.js';
 import { ContextSourceCapacityError } from './run/context-admission.js';
 import { agentRunActivity } from './run/control/contracts.js';
@@ -2891,133 +2892,87 @@ export class AgentRuntime {
       if (!(error instanceof ContextSourceCapacityError)) throw error;
       sourceConflict = error;
     }
-    if (sourceConflict && !selected) {
-      if (!this.options.context || !this.options.contextRenewal?.automatic) throw sourceConflict;
-      const context = await this.options.context.inspect();
-      const renewal = await this.retainPendingSources(
-        {
-          expectedWindowId: context.window?.windowId ?? null,
-          expectedSourceRevision: context.cut.sourceRevision,
-          idempotencyKey: `source-renewal:${request.runId}:${hashJson(sourceConflict.conflict)}`,
-          reason: 'Source materialization capacity requires a smaller selection.',
-          selection: { strategy: 'sources', retained: [], notes: [] }
-        },
-        request.runId
-      );
-      const entry = await this.options.context.transition(renewal, {
-        signal: request.signal,
-        admit: validate
-      });
-      await this.activateCommittedContext(request.modelWindow, request.runId);
-      await emit({
-        type: 'context.transitioned',
-        window: entry.window,
-        transition: entry.transition
-      });
-    }
+    if (sourceConflict && !selected) throw sourceConflict;
     if (sourceConflict) selectedNotes = await this.selectedNoteContext();
     let result = selected ?? (await assemble(request.modelWindow, selectedNotes));
-    let pressureReminderKey: string | undefined;
     const capacity = requestCapacity(result.compiled.accounting);
-    if (!selected && this.options.context && capacity.pressure === 'continuity') {
-      const window = await this.options.context.history.selectedContext();
-      const key = `${request.runId}:context-pressure:${window?.windowId ?? 'initial'}`;
-      if (!(await this.options.repositories.events.referenceByKey(request.runId, key))) {
-        capturedContext.push({
-          id: key,
-          sourceUri: 'runtime://context-capacity',
-          sourceKind: 'generated',
-          representation: 'full',
-          mediaType: 'text/plain',
-          title: 'Working context capacity',
-          purpose: 'Available capacity and continuity operations',
-          content: `The current request has about ${String(capacity.remainingTokens ?? 'unknown')} input tokens remaining after output and reasoning reservations. It has reached the ${String(capacity.continuityHeadroomTokens)}-token continuity allowance. Use available retrieval, note, and context-selection operations when useful. Notes are optional. Original history remains available after renewal; this does not complete the task.`
-        });
-        const withReminder = await assemble(request.modelWindow, selectedNotes);
-        try {
-          await this.requestAdmission.admit(withReminder.compiled, request.snapshot.profile);
-          result = withReminder;
-          pressureReminderKey = key;
-        } catch (cause) {
-          if (!(cause instanceof ContextAdmissionError)) throw cause;
-          capturedContext.pop();
-        }
-      }
-    }
+    let admissionFailure: ContextAdmissionError | undefined;
     try {
       await this.requestAdmission.admit(result.compiled, request.snapshot.profile);
       if (rejected)
         throw new ContextAdmissionError(rejected, new Error('Provider rejected context capacity.'));
     } catch (cause) {
       if (!(cause instanceof ContextAdmissionError)) throw cause;
-      if (!this.options.context || !this.options.contextRenewal?.automatic) {
-        this.options.context?.recordAdmission({
-          status: 'blocked',
-          inputIdentity: result.compiled.inputIdentity,
-          accounting: result.compiled.accounting,
-          message: cause.message
-        });
-        throw cause;
-      }
-      // One bounded candidate, with no generated summary or optional note requirement.
+      admissionFailure = cause;
+    }
+    const hasWorkingHistory = selectedNotes.length > 0 || result.request.messages.some(
+      (message) => message.role === 'assistant' || message.role === 'tool' || message.role === 'protocol'
+    );
+    if (!selected && hasWorkingHistory && this.options.context && this.options.contextRenewal?.automatic &&
+        (admissionFailure || capacity.pressure === 'continuity') && this.options.notes) {
       const context = await this.options.context.inspect();
-      const renewal = await this.retainPendingSources(
-        {
+      try {
+        const note = await writeContinuationNote({
+          inference: this.inferenceService,
+          notes: this.options.notes,
+          request: result.request,
+          profile: request.snapshot.profile,
+          cut: context.cut,
+          ownerId: this.options.inferenceOwnerId ?? request.runId,
+          runId: request.runId,
+          outputReservation: request.snapshot.requestWindow.maxOutputTokens
+        }).finally(async () => {
+          await request.controller.recordUsage(await this.inferenceService.settledRunUsage(
+            this.options.inferenceOwnerId ?? request.runId, request.runId
+          ));
+        });
+        const renewal = await this.retainPendingSources({
           expectedWindowId: context.window?.windowId ?? null,
           expectedSourceRevision: context.cut.sourceRevision,
-          idempotencyKey: `policy-renewal:${request.runId}:${identity.turnId}:${result.compiled.inputIdentity}`,
-          reason: 'policy-triggered working-window renewal',
-          selection: {
-            strategy: 'sources',
-            retained: [],
-            notes: context.window?.selection.notes ?? []
+          idempotencyKey: `continuation:${note.revisionId}`,
+          reason: 'Automatic working-context renewal with model-authored continuation notes.',
+          selection: { strategy: 'sources', retained: [], notes: [note] }
+        }, request.runId);
+        let renewed: typeof result | undefined;
+        const entry = await this.options.context.transition(renewal, {
+          signal: request.signal,
+          admit: async (input) => {
+            const admitted = await validate(input);
+            renewed = selected;
+            if (!renewed || requestAccountingInputTokens(renewed.compiled.accounting) >=
+                requestAccountingInputTokens(result.compiled.accounting))
+              throw new ContextAdmissionError(result.compiled, new Error('Continuation notes did not reduce the working context. The preceding window remains active.'));
+            return admitted;
           }
-        },
-        request.runId
-      );
-      if (pressureReminderKey) {
-        const index = capturedContext.findIndex((item) => item.id === pressureReminderKey);
-        if (index >= 0) capturedContext.splice(index, 1);
-        pressureReminderKey = undefined;
-      }
-      try {
-        let entry;
-        try {
-          entry = await this.options.context.transition(renewal, {
-            signal: request.signal,
-            admit: validate
-          });
-        } catch (cause) {
-          if (!(cause instanceof ContextAdmissionError) || renewal.selection.notes.length === 0)
-            throw cause;
-          entry = await this.options.context.transition(
-            {
-              ...renewal,
-              reason:
-                'policy-triggered working-window renewal; optional notes exceed admitted capacity',
-              selection: { ...renewal.selection, notes: [] }
-            },
-            { signal: request.signal, admit: validate }
-          );
-        }
+        });
         await this.activateCommittedContext(request.modelWindow, request.runId);
-        await emit({
-          type: 'context.transitioned',
-          window: entry.window,
-          transition: entry.transition
-        });
-        if (!selected) throw new Error('Renewal did not admit a captured request.', { cause });
-        result = selected;
+        await emit({ type: 'context.transitioned', window: entry.window, transition: entry.transition });
+        if (!renewed) throw new Error('Renewal did not admit a captured request.');
+        result = renewed;
+        admissionFailure = undefined;
       } catch (error) {
-        this.options.context.recordAdmission({
-          status: 'blocked',
-          inputIdentity: result.compiled.inputIdentity,
-          accounting: result.compiled.accounting,
-          message: error instanceof Error ? error.message : String(error)
-        });
-        throw error;
+        // A speculative renewal cannot block work that already fits. Its window was not committed.
+        if (admissionFailure || !(error instanceof ContextAdmissionError)) {
+          this.options.context.recordAdmission({
+            status: 'blocked',
+            inputIdentity: result.compiled.inputIdentity,
+            accounting: result.compiled.accounting,
+            message: error instanceof Error ? error.message : String(error)
+          });
+          throw error;
+        }
       }
     }
+    if (admissionFailure) {
+      this.options.context?.recordAdmission({
+        status: 'blocked',
+        inputIdentity: result.compiled.inputIdentity,
+        accounting: result.compiled.accounting,
+        message: admissionFailure.message
+      });
+      throw admissionFailure;
+    }
+
     const { assembly, compiled } = result;
     const estimate = request.snapshot.budgetAccountant.estimateRequest({
       accounting: compiled.accounting,
@@ -3037,12 +2992,7 @@ export class AgentRuntime {
       modelToolSchemasHash: hashJson(result.request.tools ?? []),
       modelWindowHash: hashJson(assembly.messages)
     });
-    if (pressureReminderKey)
-      await request.run.append(
-        { type: 'prompt.context.delivered', delivery: assembly.context },
-        pressureReminderKey
-      );
-    else await append({ type: 'prompt.context.delivered', delivery: assembly.context });
+    await append({ type: 'prompt.context.delivered', delivery: assembly.context });
     await append({ type: 'prompt.material.selected', material: assembly.material });
     await append({
       type: 'budget.estimate.created',

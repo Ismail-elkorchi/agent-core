@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import * as z from 'zod';
+import { defineTool } from '@agent-core/tools';
+import { ModelProviderError } from '@agent-core/model';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import {
   AgentRuntime,
@@ -69,6 +72,7 @@ async function fixture() {
     provider,
     model: 'context',
     context,
+    notes,
     maxOutputTokens: 128,
     tools: [...createHistoryTools({ history }), ...createContextTools({ context })],
     repositories: { events, artifacts, session: { repository: sessions, descriptor: session } },
@@ -100,12 +104,12 @@ test('idle source selection records intent without invoking or claiming request 
   assert.equal(inspected.admission, undefined);
 });
 
-test('bounded automatic renewal continues without notes and preserves current input and settings', async () => {
+test('automatic renewal generates a continuation note and preserves current input and settings', async () => {
   const state = await fixture();
   const original = 'Old detail. '.repeat(9000);
   const first = await new AgentRuntime(state.options).run({ task: original }).result;
   assert.equal(first.terminal?.executionStatus, 'completed', JSON.stringify(first));
-  state.setCapacity(6000);
+  state.setCapacity(44000);
   let captures = 0;
   const runtime = new AgentRuntime({
     ...state.options,
@@ -139,8 +143,11 @@ test('bounded automatic renewal continues without notes and preserves current in
   assert.ok(request.messages.some((item) => item.content.includes('Exact captured guidance')));
   assert.ok(!request.messages.some((item) => item.content === original));
   const inspected = await state.context.inspect();
-  assert.equal(inspected.window.selection.notes.length, 0);
-  assert.match(inspected.window.reason, /policy-triggered/);
+  assert.equal(inspected.window.selection.notes.length, 1);
+  assert.match(inspected.window.reason, /continuation notes/);
+  assert.equal(state.requests.length, 3);
+  assert.equal(state.requests[1].tools, undefined);
+  assert.ok(JSON.stringify(state.requests[1].messages).includes(original));
   assert.equal(inspected.admission.status, 'admitted');
 });
 
@@ -236,7 +243,7 @@ test('definitive provider overflow retries only a reduced admitted selection and
       provider,
       contextRenewal: { automatic: true }
     }).run({ task: 'Current work' }).result;
-    assert.equal(seen.length, 2, JSON.stringify(result));
+    assert.equal(seen.length, rejectTwice ? 2 : 3, JSON.stringify(result));
     assert.ok(JSON.stringify(seen[1]).length < JSON.stringify(seen[0]).length);
     if (rejectTwice) assert.equal(result.reason, 'context_admission', JSON.stringify(result));
     else assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
@@ -260,11 +267,8 @@ test('unchanged admission stays suspended; an admissible changed capacity resume
   assert.equal(resumed.terminal.runId, 'suspended-capacity');
 });
 
-for (const [length, retainedNotes] of [
-  [80, 1],
-  [18000, 0]
-]) {
-  test(`automatic renewal retains ${retainedNotes} admissible optional notes without deleting their originals`, async () => {
+for (const length of [80, 18000]) {
+  test(`automatic renewal summarizes a ${length}-character selected note without deleting its original`, async () => {
     const state = await fixture();
     const old = await new AgentRuntime(state.options).run({
       task: 'Optional earlier detail. '.repeat(3000)
@@ -293,13 +297,23 @@ for (const [length, retainedNotes] of [
         notes: [{ scope, noteId: written.revision.noteId, revisionId: written.revision.revisionId }]
       }
     });
-    state.setCapacity(6000);
+    const complete = state.provider.complete;
+    let rejected = false;
+    state.provider.complete = async request => {
+      if (!rejected) {
+        rejected = true;
+        const { ModelProviderError } = await import('@agent-core/model');
+        throw new ModelProviderError({ provider: 'fixture', code: 'context_overflow', message: 'Context full', retryable: false });
+      }
+      if (!request.tools) assert.ok(JSON.stringify(request.messages).includes('x'.repeat(length)));
+      return complete(request);
+    };
     const result = await new AgentRuntime({
     ...state.options,
       contextRenewal: { automatic: true }
     }).run({ task: 'Continue the same task.' }).result;
     assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
-    assert.equal((await state.context.inspect()).window.selection.notes.length, retainedNotes);
+    assert.equal((await state.context.inspect()).window.selection.notes.length, 1);
     assert.equal(
       (
         await state.notes.read({
@@ -410,7 +424,7 @@ test('retained source membership cannot reorder original user and assistant turn
   assert.deepEqual(messages.map((item) => item.content), ['First original request.', 'Recorded answer.', 'Second original correction.', 'Recorded answer.', 'Follow up.']);
 });
 
-test('source byte exhaustion automatically selects a bounded window before provider dispatch', { timeout: 120000 }, async () => {
+test('source byte exhaustion preserves the window until an explicit bounded selection is supplied', { timeout: 120000 }, async () => {
   const state = await fixture();
   state.setCapacity(10000000);
   const runtime = new AgentRuntime(state.options);
@@ -431,9 +445,122 @@ test('source byte exhaustion automatically selects a bounded window before provi
   assert.equal(blocked.reason, 'context_admission', JSON.stringify(blocked));
   assert.equal(state.requests.length, before);
   const result = await new AgentRuntime({ ...state.options, contextRenewal: { automatic: true } }).resume('source-overflow').result;
-  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.equal(result.reason, 'context_admission', JSON.stringify(result));
+  assert.equal(state.requests.length, before);
+  assert.equal((await state.context.inspect()).window, null);
+  await state.context.transition({ expectedWindowId: null, idempotencyKey: 'explicit-selection', reason: 'Explicit user selection',
+    selection: { strategy: 'sources', retained: await state.context.protectedSources(), notes: [] } });
+  const resumed = await new AgentRuntime(state.options).resume('source-overflow').result;
+  assert.equal(resumed.terminal?.executionStatus, 'completed', JSON.stringify(resumed));
   assert.equal(state.requests.length, before + 1);
   assert.equal(state.requests.at(-1).messages.filter((item) => item.content === task).length, 1);
   assert.ok(JSON.stringify(state.requests.at(-1)).length < 500000);
   assert.equal((await state.context.inspect()).window.selection.strategy, 'sources');
+});
+
+
+test('renewal carries completed effects and remaining work forward without executing the effect again', async () => {
+  const state = await fixture();
+  let effects = 0;
+  const envelope = { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'] };
+  const save = defineTool({
+    name: 'save', implementationId: 'test/save', description: 'Save the requested change',
+    schema: z.strictObject({}), outputSchema: z.strictObject({ revision: z.string(), details: z.string() }),
+    effectEnvelope: envelope, canonicalizeInput: input => input,
+    deriveEffects: () => ({ ...envelope, recovery: { kind: 'unknown' } }),
+    invoke: async () => { effects++; return { kind: 'result', output: { revision: 'saved-revision-17', details: 'Original execution details. '.repeat(300) },
+      summary: 'Saved change at revision 17', scope: { resources: ['memory'], coverage: 'complete' } }; }
+  });
+  let generations = 0;
+  let summaries = 0;
+  const provider = { ...state.provider, complete: async request => {
+    if (!request.tools) {
+      summaries++;
+      assert.ok(JSON.stringify(request.messages).includes('saved-revision-17'));
+      assert.ok(JSON.stringify(request.messages).includes('Preserve unrelated content'));
+      return { provider: 'fixture', model: 'context', terminationReason: 'stop',
+        content: 'The change is already saved at saved-revision-17. Preserve unrelated content. Remaining work: verify the saved change.',
+        usage: { promptTokens: 30, completionTokens: 10, totalTokens: 40 } };
+    }
+    generations++;
+    if (generations === 1) return { provider: 'fixture', model: 'context', content: 'Saving the change.',
+      terminationReason: 'tool_calls', toolCalls: [{ type: 'function', id: 'save-call', name: 'save', input: { kind: 'json', value: {} } }] };
+    if (generations === 2) throw new ModelProviderError({ provider: 'fixture', code: 'context_overflow', message: 'Context full', retryable: false });
+    assert.ok(request.messages.some(message => message.content.includes('already saved at saved-revision-17')));
+    return { provider: 'fixture', model: 'context', content: 'Verified the saved change.', terminationReason: 'stop' };
+  } };
+  const result = await new AgentRuntime({ ...state.options, provider,
+    tools: [...state.options.tools, save], contextRenewal: { automatic: true }
+  }).run({ task: 'Save the change and verify it. Preserve unrelated content.' }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.equal(effects, 1);
+  assert.equal(summaries, 1);
+  const selected = (await state.context.inspect()).window.selection.notes[0];
+  const note = await state.notes.read(selected);
+  assert.equal(note.status, 'available');
+  assert.match(note.text, /saved-revision-17/);
+  assert.ok(result.terminal.budget.promptTokens >= 30);
+});
+
+test('an incomplete continuation never replaces the working context', async () => {
+  const state = await fixture();
+  await new AgentRuntime(state.options).run({ task: 'Earlier requirements' }).result;
+  const provider = { ...state.provider, complete: async request => {
+    if (request.tools) throw new ModelProviderError({ provider: 'fixture', code: 'context_overflow', message: 'Context full', retryable: false });
+    return { provider: 'fixture', model: 'context', content: 'Unfinished notes', terminationReason: 'output_limit',
+      usage: { promptTokens: 30, completionTokens: 10, totalTokens: 40 } };
+  } };
+  const result = await new AgentRuntime({ ...state.options, provider, contextRenewal: { automatic: true } })
+    .run({ task: 'Continue the work' }).result;
+  assert.equal(result.reason, 'context_admission', JSON.stringify(result));
+  assert.equal((await state.context.inspect()).window, null);
+  assert.equal(result.budget.promptTokens, 30);
+});
+
+test('large output reservations do not trigger renewal of a short conversation', async () => {
+  const state = await fixture();
+  await new AgentRuntime(state.options).run({ task: 'Original requirements.' }).result;
+  const provider = {
+    ...state.provider,
+    describeModel: async () => ({ ...profile(32768), limits: { contextTokens: 32768, outputTokens: 16384 } })
+  };
+  const result = await new AgentRuntime({
+    ...state.options, provider, maxOutputTokens: 16384, contextRenewal: { automatic: true }
+  }).run({ task: 'Continue.' }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.equal(state.requests.length, 2);
+  assert.ok(state.requests[1].messages.some(message => message.content === 'Original requirements.'));
+  assert.equal((await state.context.inspect()).window, null);
+});
+
+test('a failed proactive continuation cannot block an admitted working context', async () => {
+  const state = await fixture();
+  const original = 'Preserve the original requirements. '.repeat(700);
+  await new AgentRuntime(state.options).run({ task: original }).result;
+  let summaries = 0;
+  let generations = 0;
+  const provider = {
+    ...state.provider,
+    describeModel: async () => ({ ...profile(32768), limits: { contextTokens: 32768, outputTokens: 16384 } }),
+    complete: async request => {
+      if (!request.tools) {
+        summaries++;
+        return { provider: 'fixture', model: 'context', content: 'Incomplete continuation', terminationReason: 'output_limit',
+          usage: { promptTokens: 30, completionTokens: 10, totalTokens: 40 } };
+      }
+      generations++;
+      assert.ok(request.messages.some(message => message.content === original));
+      assert.ok(request.messages.some(message => message.content === 'Recorded answer.'));
+      return { provider: 'fixture', model: 'context', content: 'Continued using the original context.', terminationReason: 'stop',
+        usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 } };
+    }
+  };
+  const result = await new AgentRuntime({
+    ...state.options, provider, maxOutputTokens: 16384, contextRenewal: { automatic: true }
+  }).run({ task: 'Continue.' }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.equal(summaries, 1);
+  assert.equal(generations, 1);
+  assert.equal((await state.context.inspect()).window, null);
+  assert.equal(result.terminal.budget.promptTokens, 50);
 });

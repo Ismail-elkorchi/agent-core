@@ -1,5 +1,5 @@
 import { defineTool } from '@agent-core/tools';
-import { fileScope } from '../../core/resources.js';
+import { fileSelectionScopes } from '../../core/resources.js';
 import { searchText } from './run.js';
 import { buildSearchTextContent } from '../../core/model-content.js';
 import { normalizeFilePath } from '../../core/rooted-files.js';
@@ -21,7 +21,9 @@ export const searchTextTool = defineTool({
   },
   deriveEffects(input) {
     return {
-      accesses: [{ mode: 'read', scope: fileScope(input.path) }],
+      accesses: fileSelectionScopes(input.path, input.respectGitIgnore).map((scope) => ({
+        mode: 'read' as const, scope
+      })),
       lockScopes: [],
       recovery: { kind: 'unknown' }
     };

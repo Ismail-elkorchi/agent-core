@@ -504,3 +504,4 @@ export {
   responsesPayloadPaths,
   validatedResponsesReplayItems
 } from './model-items.js';
+export { responsesTool } from './tools.js';

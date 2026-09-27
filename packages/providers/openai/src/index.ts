@@ -42,7 +42,6 @@ import {
   type ModelResponse,
   type ModelResponseFormat,
   type ModelStreamEvent,
-  type ModelTool,
   type ModelToolCall,
   type ModelTransportOptions,
   type ModelUsage
@@ -56,6 +55,7 @@ import {
   responsesInput,
   responsesOutput,
   responsesPayloadPaths,
+  responsesTool,
   validatedResponsesReplayItems,
   waitForResponseOrStatus,
   type JsonSseEvent,
@@ -1089,7 +1089,7 @@ function toOpenAIResponsesRequest(request: ModelRequest, stream: boolean): Recor
   if (request.maxOutputTokens !== undefined) body.max_output_tokens = request.maxOutputTokens;
   const text = toOpenAITextConfig(request.responseFormat);
   if (text) body.text = text;
-  if (request.tools && request.tools.length > 0) body.tools = request.tools.map(toOpenAITool);
+  if (request.tools && request.tools.length > 0) body.tools = request.tools.map(responsesTool);
   const reasoning = toOpenAIReasoning(request.reasoning);
   if (reasoning) body.reasoning = reasoning;
   if (request.logprobs !== undefined || request.topLogprobs !== undefined) {
@@ -1202,25 +1202,6 @@ function rejectUnknownProviderOptions(
 function onlyOpenAIOptionKeys(value: Record<string, unknown>, allowed: string[]): boolean {
   const keys = new Set(allowed);
   return Object.keys(value).every((key) => keys.has(key));
-}
-
-function toOpenAITool(tool: ModelTool): Record<string, unknown> {
-  if (tool.type === 'custom') {
-    return {
-      type: 'custom',
-      ...(tool.async === undefined ? {} : { async: tool.async }),
-      name: tool.name,
-      ...(tool.description ? { description: tool.description } : {}),
-      format: tool.format
-    };
-  }
-  return {
-    type: 'function',
-    ...(tool.async === undefined ? {} : { async: tool.async }),
-    name: tool.function.name,
-    ...(tool.function.description ? { description: tool.function.description } : {}),
-    ...(tool.function.parameters ? { parameters: tool.function.parameters } : {})
-  };
 }
 
 function toOpenAITextConfig(

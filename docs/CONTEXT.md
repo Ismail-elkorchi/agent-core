@@ -105,10 +105,24 @@ at the next lawful request boundary. Provider transforms are explicit governed
 invocations; their result must pass next-generation admission before activation.
 Idle source selection records intent without pretending to admit a future task.
 
-Core hosts opt into `contextRenewal: { automatic: true }`; both applications enable
-it by default. One bounded fallback candidate retains active and protected input
-and may omit optional conversation and notes. It creates no summary and requires
-no note. Irreducible input/catalog/reservation conflicts suspend the owning driver
+Core hosts with a note repository opt into `contextRenewal: { automatic: true }`;
+both applications enable it by default. At context pressure, governed inference
+generates a continuation note from the current working context. This uses the same
+owner budget, admission policy, and immutable inference records as ordinary work.
+Note generation appends an auxiliary task in the user channel to the unchanged
+conversation. It preserves authority roles, exact protocol prefixes, and provider
+settings, while removing executable tools and the original answer format. This
+task belongs only to its inference invocation; it is not recorded as user input.
+Capacity stays in request accounting and context inspection; the runtime does not
+insert capacity reminders into an established conversation prefix.
+Only a complete note and an admitted, smaller replacement can activate a new
+window. Active and protected user input remains exact; model-authored notes are
+fallible reference material, never instructions or verification. Originals remain
+retrievable. The soft continuity allowance occupies at most half of the available
+input capacity, so a large output reservation cannot trigger renewal on every
+turn. Failed summarization preserves the preceding window; proactive renewal
+failure does not block an ordinary request that still fits.
+Irreducible input/catalog/reservation conflicts suspend the owning driver
 with actionable context diagnostics. Changing selection or model can resolve a
 conflict; retrying an unchanged request cannot. Session, work, accounting and live
 resources retain their identities across renewal. `/context` inspects the selection
@@ -128,6 +142,11 @@ that crossed its start boundary without a known result remains uncertain rather
 than being dispatched again automatically. Cancellation releases the caller while
 a late response can still settle its original permit.
 
+Application egress policy is supplied as `InferenceService.admitRequest`. It checks
+the exact compiled input before dispatch authority, including context transforms
+and native successors. A local admission rejection cannot become an uncertain
+provider outcome. Provider wrappers must not hide admission inside transport.
+
 Adapters compile immutable input before admission. Accounting covers the compiled
 body, actual tool arguments and results, schemas, media, and protocol state. Exact
 counts, estimates, and unknown components remain distinct. Configure an explicit
@@ -139,8 +158,9 @@ that reject a cap still reserve the host allowance and settle actual usage.
 Selected sources are membership: admission and replay restore branch input order
 and each run's event sequence. Source byte/entry capacity conflicts suspend at the
 same admission boundary as compiled token conflicts, with source references and
-bounds instead of fabricated compiled accounting. Authorized automatic renewal
-can select a smaller window while retaining accepted inputs and native obligations.
+bounds instead of fabricated compiled accounting. If the working sources cannot
+be materialized or summarized within their bounds, the window remains unchanged;
+an explicit source selection or model change is required.
 
 Inference repositories advance from verified ledger tails. `load(ownerId)` returns
 committed liabilities and settled totals; optional `invocationId` and `runId` queries

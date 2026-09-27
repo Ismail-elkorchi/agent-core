@@ -1,6 +1,4 @@
 import {
-  assertRequestAccountingFits,
-  modelInputIdentity,
   requestAccountingInputTokens,
   type CompiledModelRequest,
   type ModelProfile,
@@ -35,25 +33,7 @@ export class RequestAdmission {
 
   /** Also admits adapter-compiled native successors without inventing an initial-request identity. */
   async admit(compiled: CompiledModelRequest, profile: ModelProfile): Promise<void> {
-    if (
-      compiled.logicalRequest.model !== profile.id ||
-      compiled.model !== profile.id ||
-      compiled.provider !== profile.provider ||
-      compiled.capabilityRevision !== (profile.capabilities.protocol?.revision ?? 'conservative-v1')
-    )
-      throw new Error('Compiled request model/capability does not match its captured profile.');
-    const identity = await modelInputIdentity(
-      compiled.retainedBody
-        ? { body: compiled.body, retainedBody: compiled.retainedBody }
-        : compiled.body
-    );
-    if (identity !== compiled.inputIdentity)
-      throw new Error('Compiled provider input identity changed.');
-    try {
-      assertRequestAccountingFits(compiled.accounting);
-    } catch (cause) {
-      throw new ContextAdmissionError(compiled, cause);
-    }
+    await this.inference.admit(compiled, profile);
   }
 }
 
@@ -96,7 +76,12 @@ export function requestCapacity(accounting: RequestAccounting, headroom?: number
   const requestedHeadroom = headroom ?? accounting.outputReservation + reasoningReservation;
   if (!Number.isSafeInteger(requestedHeadroom) || requestedHeadroom < 0)
     throw new Error('Continuity headroom must be a nonnegative token count.');
-  const continuityHeadroomTokens = Math.min(requestedHeadroom, inputCapacity ?? requestedHeadroom);
+  // Continuity is a soft reserve, not another output reservation. Leave at least
+  // half the admitted input capacity for ordinary work, even with large outputs.
+  const continuityHeadroomTokens = Math.min(
+    requestedHeadroom,
+    inputCapacity === undefined ? requestedHeadroom : Math.floor(inputCapacity / 2)
+  );
   return Object.freeze({
     ...(inputTokens === undefined ? {} : { inputTokens }),
     ...(remainingTokens === undefined ? {} : { remainingTokens }),

@@ -9,9 +9,28 @@ import type { ReadFilesOutput } from '../tools/read-files/schema.js';
 import type { ProcessOutput } from '../tools/process-output.js';
 import type { ReadArtifactOutput } from '../tools/read-artifact/schema.js';
 import type { SearchTextOutput } from '../tools/search-text/schema.js';
+import type * as z from 'zod';
+import type { findFilesOutputSchema } from '../tools/find-files/schema.js';
+import type { listDirectoryOutputSchema } from '../tools/list-directory/schema.js';
+
+type PathSelectionOutput = z.output<typeof findFilesOutputSchema> | z.output<typeof listDirectoryOutputSchema>;
 
 const text = (value: string): ToolContent => ({ type: 'text', text: value });
-const json = (value: unknown): string => JSON.stringify(value, null, 2);
+const json = (value: unknown): string => JSON.stringify(value);
+
+export function buildPathSelectionContent({
+  observation
+}: ToolModelContentRequest<unknown, PathSelectionOutput>): readonly ToolContent[] {
+  if (observation.kind === 'failure') return defaultToolModelContent(observation);
+  const output: PathSelectionOutput = observation.output;
+  const { entries, ...facts } = output;
+  return [
+    text(json(facts)),
+    text(entries.map(({ path, type, ...metadata }) =>
+      `${json(path)} (${type})${Object.keys(metadata).length ? ` ${json(metadata)}` : ''}`
+    ).join('\n'))
+  ];
+}
 
 export function buildReadFilesContent({
   observation
@@ -30,22 +49,22 @@ export function buildProcessContent({
 }: ToolModelContentRequest<unknown, ProcessOutput>): readonly ToolContent[] {
   if (observation.kind === 'failure') return defaultToolModelContent(observation);
   const output: ProcessOutput = observation.output;
-  const modelFacts = Object.fromEntries(
-    Object.entries(output).filter(
-      ([key]) =>
-        ![
-          'owner',
-          'stdout',
-          'stderr',
-          'combined',
-          'progressDroppedEvents',
-          'progressDeliveryErrors'
-        ].includes(key)
-    )
-  );
+  const { processId, status, artifact, ...details } = output;
+  const modelFacts = Object.fromEntries(Object.entries(details).filter(([key]) =>
+    !['owner', 'stdout', 'stderr', 'combined', 'terminal', 'progressDroppedEvents', 'progressDeliveryErrors'].includes(key)
+  ));
   const { combined } = output;
   const { text: log, ...coverage } = combined;
-  return [text(json({ ...modelFacts, ...coverage })), text(log)];
+  return [
+    text(json({
+      status, processId, ...modelFacts, ...coverage,
+      ...(artifact ? { artifact: {
+        artifactId: artifact.artifactId, sha256: artifact.sha256,
+        size: artifact.size, mediaType: artifact.mediaType, visibility: artifact.visibility
+      } } : {})
+    })),
+    text(log)
+  ];
 }
 
 export function buildReadArtifactContent({
@@ -69,9 +88,17 @@ export function buildSearchTextContent({
   if (output.mode !== 'matches') return [text(json(facts)), text(json(output.results))];
   return [
     text(json(facts)),
-    ...output.results.flatMap(({ text: source, ...location }) => [
-      text(json(location)),
-      text(source)
+    ...output.results.flatMap((match) => [
+      ...(match.context?.before.flatMap((line) => [
+        text(`${json(match.path)}:${String(line.lineNumber)} (context)`), text(line.text)
+      ]) ?? []),
+      text(`${json(match.path)}:${String(match.lineNumber)} (match; byte ranges: ${
+        match.occurrences.map(({ startByte, endByte }) => `${String(startByte)}-${String(endByte)}`).join(', ')
+      })`),
+      text(match.text),
+      ...(match.context?.after.flatMap((line) => [
+        text(`${json(match.path)}:${String(line.lineNumber)} (context)`), text(line.text)
+      ]) ?? [])
     ])
   ];
 }

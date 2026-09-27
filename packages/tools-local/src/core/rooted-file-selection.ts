@@ -113,7 +113,7 @@ export class RootedFileSelector {
     const causes = new Set<string>();
     let visitedEntries = 0;
     let omittedEntries = 0;
-    let loadedIgnoreFiles = 0;
+    let attemptedIgnoreFiles = 0;
     let omittedIgnoreFiles = 0;
     const omissionCounts = new Map<string, { count: number; relation: 'exact' | 'at_least' }>();
     let stopped = false;
@@ -124,6 +124,52 @@ export class RootedFileSelector {
         count: prior.count + count,
         relation: prior.relation === 'at_least' || relation === 'at_least' ? 'at_least' : 'exact'
       });
+    };
+
+    const loadIgnore = async (
+      directory: string,
+      inherited: readonly IgnoreRules[]
+    ): Promise<readonly IgnoreRules[]> => {
+      if (!request.respectGitIgnore) return inherited;
+      throwIfAborted(request.signal);
+      const ignorePath = joinRootedPath(directory, '.gitignore');
+      try {
+        const status = isWorkspaceFiles(this.root)
+          ? await this.root.stat(ignorePath)
+          : await this.root.inspectPath(ignorePath);
+        if (status.kind === 'absent') return inherited;
+        if (status.kind !== 'file') throw new Error('Ignore rules must be a regular file.');
+        if (attemptedIgnoreFiles >= this.limits.maxIgnoreFiles) {
+          omittedIgnoreFiles += 1;
+          causes.add('ignore_file_limit');
+          omit('ignore_file_limit');
+          return inherited;
+        }
+        attemptedIgnoreFiles += 1;
+        let bytes: Uint8Array;
+        if (isWorkspaceFiles(this.root)) {
+          bytes = (await this.root.readFile(ignorePath, { maximumBytes: 1_000_000 })).bytes;
+        } else {
+          const file = await this.root.openFile(ignorePath);
+          try {
+            bytes = await file.readAll(1_000_000);
+          } finally {
+            await file.close();
+          }
+        }
+        return [
+          ...inherited,
+          {
+            base: directory === '.' ? '' : directory,
+            matcher: createIgnore().add(new TextDecoder('utf-8', { fatal: true }).decode(bytes))
+          }
+        ];
+      } catch (error) {
+        throwIfAborted(request.signal);
+        causes.add('unreadable_ignore_file');
+        sample(samples, { path: ignorePath, reason: 'unreadable', message: message(error) });
+        return inherited;
+      }
     };
 
     const walk = async (
@@ -147,47 +193,7 @@ export class RootedFileSelector {
         return;
       }
       directoryEntries = [...directoryEntries].sort((a, b) => a.name.localeCompare(b.name, 'en'));
-      let rules = inherited;
-      const ignoreEntry = request.respectGitIgnore
-        ? directoryEntries.find((entry) => entry.name === '.gitignore' && entry.type === 'file')
-        : undefined;
-      if (ignoreEntry) {
-        if (loadedIgnoreFiles < this.limits.maxIgnoreFiles) {
-          try {
-            const base = directory;
-            const ignorePath = joinRootedPath(directory, ignoreEntry.name);
-            let content: string;
-            if (isWorkspaceFiles(this.root)) {
-              content = new TextDecoder('utf-8', { fatal: true }).decode(
-                (await this.root.readFile(ignorePath, { maximumBytes: 1_000_000 })).bytes
-              );
-            } else {
-              const file = await this.root.openFile(ignorePath);
-              try {
-                content = (await file.readAll(1_000_000)).toString('utf8');
-              } finally {
-                await file.close();
-              }
-            }
-            rules = Object.freeze([
-              ...inherited,
-              { base: base === '.' ? '' : base, matcher: createIgnore().add(content) }
-            ]);
-            loadedIgnoreFiles += 1;
-          } catch (error) {
-            causes.add('unreadable_ignore_file');
-            sample(samples, {
-              path: joinRootedPath(directory, ignoreEntry.name),
-              reason: 'unreadable',
-              message: message(error)
-            });
-          }
-        } else {
-          omittedIgnoreFiles += 1;
-          causes.add('ignore_file_limit');
-          omit('ignore_file_limit');
-        }
-      }
+      const rules = await loadIgnore(directory, inherited);
 
       for (const dirent of directoryEntries) {
         throwIfAborted(request.signal);
@@ -265,7 +271,31 @@ export class RootedFileSelector {
         }
       }
     };
-    if (rootKind === 'file') {
+    let inherited: readonly IgnoreRules[] = [];
+    let startIgnored = false;
+    if (request.respectGitIgnore && startPath !== '.') {
+      let directory = '.';
+      const segments = startPath.split('/');
+      for (const [index, segment] of segments.entries()) {
+        throwIfAborted(request.signal);
+        if (visitedEntries >= this.limits.maxVisitedEntries) {
+          causes.add('visit_limit');
+          omit('visit_limit', 1, 'at_least');
+          stopped = true;
+          break;
+        }
+        visitedEntries += 1;
+        inherited = await loadIgnore(directory, inherited);
+        directory = joinRootedPath(directory, segment);
+        if (ignored(directory, index < segments.length - 1 || rootKind === 'directory', inherited)) {
+          omit('gitignored');
+          sample(samples, { path: directory, reason: 'gitignored' });
+          startIgnored = true;
+          break;
+        }
+      }
+    }
+    if (!stopped && !startIgnored && rootKind === 'file') {
       const scopedPath = path.posix.basename(startPath);
       if (!request.includeHidden && hidden(startPath)) {
         omit('hidden');
@@ -276,9 +306,9 @@ export class RootedFileSelector {
       } else if (matchesAny(scopedPath, patterns, false)) {
         entries.push(await makeEntry(this.root, startPath, 'file', request.includeMetadata === true));
       }
-      visitedEntries = 1;
-    } else {
-      await walk(startPath, 1, []);
+      if (visitedEntries === 0) visitedEntries = 1;
+    } else if (!stopped && !startIgnored) {
+      await walk(startPath, 1, inherited);
     }
     if (omittedIgnoreFiles > 0) causes.add('ignore_file_limit');
     const lowerBound = [...omissionCounts.values()].some((item) => item.relation === 'at_least');

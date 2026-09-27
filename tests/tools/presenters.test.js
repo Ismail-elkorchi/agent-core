@@ -101,7 +101,7 @@ test('process content retains beginning, middle and end of selected logs without
   const parts = content(execCommandTool, output);
   assert.ok(parts.some((part) => part.text === log));
   const serialized = serializeToolModelContent(parts);
-  assert.match(serialized, /"exitCode": 7/);
+  assert.match(serialized, /"exitCode":7/);
   assert.doesNotMatch(serialized, /progressDroppedEvents|progressDeliveryErrors|internal/);
   assert.equal(
     renderLocalToolObservation('exec_command', { kind: 'result', output }).status,
@@ -122,8 +122,16 @@ test('search matches retain exact source bytes and omission facts', () => {
     mode: 'matches',
     resultCoverage: 'partial',
     omittedResultCount: 2,
-    results: [{ path: 'a', lineNumber: 30, text: source }]
+    results: [{ path: 'a', lineNumber: 30, text: source, occurrences: [
+      { startByte: 0, endByte: 6, text: 'needle' }
+    ], context: {
+      before: [{ lineNumber: 29, text: 'before\tα' }],
+      after: [{ lineNumber: 31, text: 'after\r' }]
+    } }]
   });
   assert.ok(parts.some((part) => part.text === source));
   assert.match(serializeToolModelContent(parts), /omittedResultCount/);
+  assert.ok(parts.some((part) => part.text === 'before\tα'));
+  assert.ok(parts.some((part) => part.text === 'after\r'));
+  assert.match(serializeToolModelContent(parts), /"a":30 \(match; byte ranges: 0-6\)/);
 });
