@@ -15,7 +15,7 @@ const diagnosticSchema = z.strictObject({
 });
 const recoverySchema = z.strictObject({
   status: z.enum(['succeeded', 'failed', 'uncertain']),
-  diagnostics: z.array(diagnosticSchema), strandedPaths: z.array(z.string())
+  diagnostics: z.array(diagnosticSchema).readonly(), strandedPaths: z.array(z.string()).readonly()
 });
 export const fileTransactionResultSchema = z.discriminatedUnion('outcome', [
   z.strictObject({ outcome: z.literal('committed'), cleanup: recoverySchema.optional() }),

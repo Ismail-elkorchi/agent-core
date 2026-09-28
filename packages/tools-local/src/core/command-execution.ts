@@ -11,6 +11,8 @@ import {
   ResourceLeaseCoordinator,
   adoptCommandExecution,
   createCommandExecutionReservation,
+  createCommandOutputView,
+  ownCommandExecutionRequest,
   type CommandExecution,
   type CommandExecutionDescriptor,
   type CommandExecutionOwner,
@@ -42,6 +44,7 @@ import {
   type SupervisorTerminalState
 } from './process-supervision.js';
 import type { OwnedProcessTree } from './process-tree.js';
+import { processOutputSchema } from '../tools/process-output.js';
 import { processScope } from './resources.js';
 import { isRootedFileAuthority, type RootedFileAuthority } from './rooted-file-authority.js';
 
@@ -77,6 +80,7 @@ interface CapturedChunk {
   readonly start: number;
   readonly end: number;
   readonly bytes: number;
+  readonly streamStart: number;
 }
 interface QueuedProgress {
   readonly progress: ToolProgress;
@@ -244,6 +248,7 @@ export class LocalCommandExecution implements CommandExecution {
   }
 
   async plan(request: CommandExecutionPlanRequest): Promise<CommandExecutionReservation> {
+    request = ownCommandExecutionRequest(request);
     if (request.lifetime === 'environment')
       throw new Error(
         'Local command execution cannot retain environment services independently of its owner.'
@@ -285,7 +290,6 @@ export class LocalCommandExecution implements CommandExecution {
         'An unresolved supervised process blocks new local command starts for this rooted authority.'
       );
     }
-    this.pruneExpired();
     if (this.active.size >= this.limits.maxActiveProcesses)
       throw new Error('Maximum active process count reached.');
     if (
@@ -323,7 +327,7 @@ export class LocalCommandExecution implements CommandExecution {
     const record: ManagedProcess = {
       id,
       command: request.command,
-      owner: Object.freeze({ ...request.owner }),
+      owner: request.owner,
       rootPath: this.options.rootedFileAuthority.identity.canonicalPath,
       tree,
       startedAt: Date.now(),
@@ -446,8 +450,9 @@ export class LocalCommandExecution implements CommandExecution {
     afterCursor = 0,
     requester?: CommandExecutionOwner
   ): Promise<CommandExecutionResult> {
+    if (!Number.isSafeInteger(outputTokenBudget) || outputTokenBudget < 0)
+      throw new RangeError('Output budget must be a nonnegative safe integer.');
     await this.ready;
-    this.pruneExpired();
     const tombstone = this.tombstones.get(processId);
     if (tombstone) {
       if (requester && requester.ownerId !== tombstone.owner.ownerId)
@@ -464,34 +469,16 @@ export class LocalCommandExecution implements CommandExecution {
     const cursorExpired = afterCursor < record.oldestCursor;
     const useCapture = cursorExpired && afterCursor === 0;
     const effectiveCursor = useCapture ? 0 : cursorExpired ? record.oldestCursor : afterCursor;
-    const budgetBytes = Math.max(256, outputTokenBudget * 4);
+    const budgetBytes = outputTokenBudget * 4;
     const available = useCapture
       ? record.capture.chunks()
       : record.history.filter((chunk) => chunk.end > effectiveCursor);
-    const stdout = view(
-      available.filter((chunk) => chunk.stream === 'stdout'),
-      Math.max(64, Math.floor(budgetBytes / 4)),
-      effectiveCursor,
-      record.cursor,
-      useCapture ? 0 : record.oldestCursor,
-      useCapture ? record.observed.stdout : undefined
-    );
-    const stderr = view(
-      available.filter((chunk) => chunk.stream === 'stderr'),
-      Math.max(64, Math.floor(budgetBytes / 4)),
-      effectiveCursor,
-      record.cursor,
-      useCapture ? 0 : record.oldestCursor,
-      useCapture ? record.observed.stderr : undefined
-    );
-    const combined = view(
-      available,
-      Math.max(128, Math.floor(budgetBytes / 2)),
-      effectiveCursor,
-      record.cursor,
-      useCapture ? 0 : record.oldestCursor,
-      useCapture ? record.cursor : undefined
-    );
+    const stdout = view(available, Math.floor(budgetBytes / 4), effectiveCursor,
+      record.observed.stdout, 'stdout');
+    const stderr = view(available, Math.floor(budgetBytes / 4), effectiveCursor,
+      record.observed.stderr, 'stderr');
+    const combined = view(available, Math.floor(budgetBytes / 2), effectiveCursor,
+      record.cursor);
     const artifacts = record.status === 'running' ? undefined : await this.finalArtifacts(record);
     return Object.freeze({
       processId,
@@ -679,7 +666,6 @@ export class LocalCommandExecution implements CommandExecution {
     ));
   }
   has(processId: string): boolean {
-    this.pruneExpired();
     return (
       this.active.has(processId) || this.completed.has(processId) || this.tombstones.has(processId)
     );
@@ -735,10 +721,12 @@ export class LocalCommandExecution implements CommandExecution {
 
   private append(record: ManagedProcess, stream: LocalOutputStream, text: string): void {
     const bytes = Buffer.byteLength(text, 'utf8');
+    const streamStart = record.observed[stream];
     record.observed[stream] += bytes;
     const chunk: CapturedChunk = {
       sequence: record.sequence++,
       stream,
+      streamStart,
       text,
       start: record.cursor,
       end: record.cursor + bytes,
@@ -906,19 +894,7 @@ export class LocalCommandExecution implements CommandExecution {
 
   private finalArtifacts(record: ManagedProcess): Promise<ProcessArtifacts> {
     record.artifactPromise ??= (async () => {
-      const payload = {
-        processId: record.id,
-        owner: record.owner,
-        status: record.status,
-        startedAt: new Date(record.startedAt).toISOString(),
-        observedBytes: record.cursor,
-        retainedBytes: record.capture.retainedBytes,
-        omittedBytes: Math.max(0, record.cursor - record.capture.retainedBytes),
-        chunks: record.capture
-          .chunks()
-          .map((chunk) => ({ sequence: chunk.sequence, stream: chunk.stream, text: chunk.text }))
-      };
-      const raw = new TextEncoder().encode(JSON.stringify(payload, null, 2) + '\n');
+      const raw = encodeProcessOutput(record, false);
       let protectedArtifact: ProtectedArtifactRef | undefined;
       let publicArtifact: PublicArtifactRef | undefined;
       try {
@@ -937,7 +913,7 @@ export class LocalCommandExecution implements CommandExecution {
       try {
         publicArtifact = await this.options.artifactRepository.store({
           label: record.id + '-output',
-          content: publicProcessOutput(record),
+          content: encodeProcessOutput(record, true),
           mediaType: 'application/json; charset=utf-8',
           description: 'Public redacted bounded process output.'
         });
@@ -974,9 +950,6 @@ export class LocalCommandExecution implements CommandExecution {
     if (record.retention) clearTimeout(record.retention);
   }
 
-  private pruneExpired(): void {
-    /* retention timers own expiry */
-  }
   private requireProcess(id: string): ManagedProcess {
     const record = this.active.get(id) ?? this.completed.get(id);
     if (!record) throw new Error('Unknown process: ' + id);
@@ -1243,74 +1216,35 @@ export class LocalCommandExecution implements CommandExecution {
   }
 }
 
-function publicProcessOutput(record: ManagedProcess): Uint8Array {
-  const metadata = {
+function encodeProcessOutput(record: ManagedProcess, redact: boolean): Uint8Array {
+  const chunks = record.capture.chunks();
+  const text = chunks.map((chunk) => chunk.text);
+  const selected = redact ? redactPassages(text) : text;
+  return Buffer.from(JSON.stringify({
     processId: record.id,
     owner: record.owner,
     status: record.status,
     startedAt: new Date(record.startedAt).toISOString(),
     observedBytes: record.cursor,
     retainedBytes: record.capture.retainedBytes,
-    omittedBytes: Math.max(0, record.cursor - record.capture.retainedBytes)
-  };
-  const parts: Buffer[] = [
-    Buffer.from(`${JSON.stringify(metadata).slice(0, -1)},"chunks":[`, 'utf8')
-  ];
-  const pending: CapturedChunk[] = [];
-  let pendingCharacters = 0;
-  let first = true;
-  const emit = (records: readonly CapturedChunk[]) => {
-    if (records.length === 0) return;
-    const combined = records.map((chunk) => chunk.text).join('');
-    const redacted = redactTextPreservingLength(combined).text;
-    let offset = 0;
-    for (const chunk of records) {
-      const text = redacted.slice(offset, offset + chunk.text.length);
-      offset += chunk.text.length;
-      parts.push(
-        Buffer.from(
-          `${first ? '' : ','}${JSON.stringify({ sequence: chunk.sequence, stream: chunk.stream, text })}`,
-          'utf8'
-        )
-      );
-      first = false;
-    }
-  };
-  const overlapCharacters = 4_096;
-  for (const chunk of record.capture.chunks()) {
-    pending.push(chunk);
-    pendingCharacters += chunk.text.length;
-    const safeCharacters = Math.max(0, pendingCharacters - overlapCharacters);
-    let selectedCharacters = 0;
-    let selectedCount = 0;
-    while (selectedCount < pending.length) {
-      const candidate = pending[selectedCount];
-      if (!candidate || selectedCharacters + candidate.text.length > safeCharacters) break;
-      selectedCharacters += candidate.text.length;
-      selectedCount += 1;
-    }
-    if (selectedCount > 0) {
-      const combined = pending.map((item) => item.text).join('');
-      const redacted = redactTextPreservingLength(combined).text;
-      let offset = 0;
-      for (const selected of pending.slice(0, selectedCount)) {
-        const text = redacted.slice(offset, offset + selected.text.length);
-        offset += selected.text.length;
-        parts.push(
-          Buffer.from(
-            `${first ? '' : ','}${JSON.stringify({ sequence: selected.sequence, stream: selected.stream, text })}`,
-            'utf8'
-          )
-        );
-        first = false;
-      }
-      pending.splice(0, selectedCount);
-      pendingCharacters -= selectedCharacters;
-    }
-  }
-  emit(pending);
-  parts.push(Buffer.from(']}\n', 'utf8'));
-  return new Uint8Array(Buffer.concat(parts));
+    omittedBytes: Math.max(0, record.cursor - record.capture.retainedBytes),
+    chunks: chunks.map(({ sequence, stream, streamStart, start, end }, index) => ({
+      sequence, stream, streamStart, start, end, text: selected[index]
+    }))
+  }) + '\n', 'utf8');
+}
+
+/** Redact before selection so slicing cannot detach a credential from its identifying prefix. */
+function redactPassages(passages: readonly string[]): string[] {
+  const source = Buffer.from(passages.join(''), 'utf8');
+  const redacted = Buffer.from(redactTextPreservingLength(source.toString('latin1')).text, 'latin1');
+  let offset = 0;
+  return passages.map((text) => {
+    const end = offset + Buffer.byteLength(text, 'utf8');
+    const selected = redacted.subarray(offset, end).toString('utf8');
+    offset = end;
+    return selected;
+  });
 }
 
 class BoundedCapture {
@@ -1337,7 +1271,7 @@ class BoundedCapture {
     }
     if (text.length > 0 && this.tailLimit > 0) {
       const bytes = Buffer.byteLength(text, 'utf8');
-      this.tail.push({ ...chunk, text, bytes, start: chunk.end - bytes });
+      this.tail.push({ ...chunk, text, bytes, start: chunk.end - bytes, streamStart: chunk.streamStart + chunk.bytes - bytes });
       this.tailBytes += bytes;
       while (this.tailBytes > this.tailLimit && this.tail.length > 0) {
         const first = this.tail[0];
@@ -1351,7 +1285,7 @@ class BoundedCapture {
           this.tailBytes -= first.bytes;
         } else {
           const keptBytes = Buffer.byteLength(keep, 'utf8');
-          this.tail[0] = { ...first, text: keep, bytes: keptBytes, start: first.end - keptBytes };
+          this.tail[0] = { ...first, text: keep, bytes: keptBytes, start: first.end - keptBytes, streamStart: first.streamStart + first.bytes - keptBytes };
           this.tailBytes -= first.bytes - keptBytes;
         }
       }
@@ -1369,34 +1303,53 @@ function view(
   chunks: readonly CapturedChunk[],
   maxBytes: number,
   afterCursor: number,
-  cursorEnd: number,
-  oldestCursor: number,
-  observedOverride?: number
+  observedBytes: number,
+  stream?: LocalOutputStream
 ): CommandOutputView {
-  const sliced = chunks.flatMap((chunk) => {
-    if (chunk.start >= afterCursor) return [chunk];
-    const skip = Math.max(0, afterCursor - chunk.start);
-    const text = dropUtf8Bytes(chunk.text, skip);
+  const passages: string[] = [];
+  let end: number | undefined;
+  let start: number | undefined;
+  for (const chunk of chunks) {
+    if (chunk.end <= afterCursor || (stream !== undefined && chunk.stream !== stream)) continue;
+    const text = dropUtf8Bytes(chunk.text, Math.max(0, afterCursor - chunk.start));
     const bytes = Buffer.byteLength(text, 'utf8');
-    return text.length > 0 ? [{ ...chunk, text, bytes, start: chunk.end - bytes }] : [];
-  });
-  const observedBytes = observedOverride ?? sliced.reduce((sum, chunk) => sum + chunk.bytes, 0);
-  const joined = sliced.map((chunk) => chunk.text).join('');
-  const headBytes = Math.max(0, maxBytes - Math.floor(maxBytes / 3));
-  const head = takeUtf8Start(joined, headBytes);
-  const headSize = Buffer.byteLength(head, 'utf8');
-  const text =
-    observedBytes <= maxBytes
-      ? joined
-      : head + takeUtf8End(joined.slice(head.length), Math.max(0, maxBytes - headSize));
-  const capturedBytes = Buffer.byteLength(text, 'utf8');
-  return Object.freeze({
-    text,
+    const chunkStart = (stream === undefined ? chunk.start : chunk.streamStart) + chunk.bytes - bytes;
+    start ??= chunkStart;
+    if (end !== chunkStart || passages.length === 0) passages.push('');
+    end = chunkStart + bytes;
+    passages[passages.length - 1] = (passages[passages.length - 1] ?? '') + text;
+  }
+  let segments = redactPassages(passages.filter((text) => text.length > 0));
+  const retained = segments.reduce((bytes, text) => bytes + Buffer.byteLength(text, 'utf8'), 0);
+  let startsAtOutputStart = observedBytes === 0 || start === 0;
+  let endsAtOutputEnd = observedBytes === 0 || end === observedBytes;
+  if (retained > maxBytes) {
+    const head: string[] = [];
+    const tail: string[] = [];
+    let remaining = maxBytes - Math.floor(maxBytes / 3);
+    for (const text of segments) {
+      const selected = takeUtf8Start(text, remaining);
+      if (selected) head.push(selected);
+      remaining -= Buffer.byteLength(selected, 'utf8');
+      if (selected.length !== text.length) break;
+    }
+    remaining = maxBytes - head.reduce((bytes, text) => bytes + Buffer.byteLength(text, 'utf8'), 0);
+    for (const text of [...segments].reverse()) {
+      const selected = takeUtf8End(text, remaining);
+      if (selected) tail.unshift(selected);
+      remaining -= Buffer.byteLength(selected, 'utf8');
+      if (selected.length !== text.length) break;
+    }
+    startsAtOutputStart &&= head.length > 0;
+    endsAtOutputEnd &&= tail.length > 0;
+    segments = [...head, ...tail];
+  }
+  return createCommandOutputView({
+    segments,
     observedBytes,
-    capturedBytes,
-    omittedBytes: Math.max(0, observedBytes - capturedBytes),
-    startsAtOutputStart: afterCursor === 0 && oldestCursor === 0,
-    endsAtOutputEnd: (sliced.at(-1)?.end ?? afterCursor) === cursorEnd
+    capturedBytes: segments.reduce((bytes, text) => bytes + Buffer.byteLength(text, 'utf8'), 0),
+    startsAtOutputStart,
+    endsAtOutputEnd
   });
 }
 
@@ -1460,12 +1413,12 @@ function orphanTerminalResult(
   stopped: boolean
 ): CommandExecutionResult {
   const stream = Object.freeze({
-    text: '',
+    segments: [],
     observedBytes: 0,
     capturedBytes: 0,
     omittedBytes: 0,
     startsAtOutputStart: true,
-    endsAtOutputEnd: true
+    endsAtOutputEnd: false
   });
   return Object.freeze({
     processId: entry.processId,
@@ -1478,6 +1431,7 @@ function orphanTerminalResult(
           : 'failed',
     cursorStart: 0,
     cursorEnd: 0,
+    originalOutput: { kind: 'unavailable' as const, cursorEnd: 0, diagnostic: 'Original process output was not retained across restart.' },
     stdout: stream,
     stderr: stream,
     combined: stream,
@@ -1532,117 +1486,15 @@ function parseLedgerEntry(value: unknown): ProcessLedgerEntry {
     ...(protectedArtifact ? { protectedArtifact } : {})
   });
 }
-function decodeProcessOwner(
-  value: import('@agent-core/json').JsonValue | undefined
-): CommandExecutionOwner {
-  const record = jsonRecord(value, 'process ledger owner');
-  if (
-    typeof record.ownerId !== 'string' ||
-    typeof record.runId !== 'string' ||
-    typeof record.turnId !== 'string' ||
-    typeof record.toolBatchId !== 'string' ||
-    typeof record.callIndex !== 'number' ||
-    !Number.isSafeInteger(record.callIndex) ||
-    record.callIndex < 0
-  )
-    throw new Error('Invalid process ledger owner.');
-  return Object.freeze({
-    ownerId: record.ownerId,
-    runId: record.runId,
-    turnId: record.turnId,
-    toolBatchId: record.toolBatchId,
-    callIndex: record.callIndex
-  });
+function decodeProcessOwner(value: import('@agent-core/json').JsonValue | undefined): CommandExecutionOwner {
+  return Object.freeze(processOutputSchema.shape.owner.parse(value));
 }
-function decodeProcessOutputView(
-  value: import('@agent-core/json').JsonValue | undefined
-): CommandOutputView {
-  const record = jsonRecord(value, 'process output view');
-  if (
-    typeof record.text !== 'string' ||
-    !nonnegativeInteger(record.observedBytes) ||
-    !nonnegativeInteger(record.capturedBytes) ||
-    !nonnegativeInteger(record.omittedBytes) ||
-    typeof record.startsAtOutputStart !== 'boolean' ||
-    typeof record.endsAtOutputEnd !== 'boolean'
-  )
-    throw new Error('Invalid process output view.');
-  return Object.freeze({
-    text: record.text,
-    observedBytes: record.observedBytes,
-    capturedBytes: record.capturedBytes,
-    omittedBytes: record.omittedBytes,
-    startsAtOutputStart: record.startsAtOutputStart,
-    endsAtOutputEnd: record.endsAtOutputEnd
-  });
-}
-function decodeProcessPollResult(
-  value: import('@agent-core/json').JsonValue
-): CommandExecutionResult {
-  const record = jsonRecord(value, 'process terminal result');
-  if (
-    typeof record.processId !== 'string' ||
-    !processStatus(record.status) ||
-    !nonnegativeInteger(record.cursorStart) ||
-    !nonnegativeInteger(record.cursorEnd) ||
-    (record.cursorExpired !== undefined && typeof record.cursorExpired !== 'boolean') ||
-    (record.exitCode !== undefined &&
-      record.exitCode !== null &&
-      (typeof record.exitCode !== 'number' || !Number.isInteger(record.exitCode))) ||
-    (record.signal !== undefined && record.signal !== null && typeof record.signal !== 'string') ||
-    (record.diagnostic !== undefined && typeof record.diagnostic !== 'string') ||
-    (record.progressDroppedEvents !== undefined &&
-      !nonnegativeInteger(record.progressDroppedEvents)) ||
-    (record.progressDeliveryErrors !== undefined &&
-      !nonnegativeInteger(record.progressDeliveryErrors))
-  )
-    throw new Error('Invalid process terminal result.');
-  let artifact: PublicArtifactRef | undefined;
-  if (record.artifact !== undefined) {
-    validatePublicArtifactRef(record.artifact);
-    artifact = record.artifact;
-  }
-  return Object.freeze({
-    processId: record.processId,
-    owner: decodeProcessOwner(record.owner),
-    status: record.status,
-    cursorStart: record.cursorStart,
-    cursorEnd: record.cursorEnd,
-    stdout: decodeProcessOutputView(record.stdout),
-    stderr: decodeProcessOutputView(record.stderr),
-    combined: decodeProcessOutputView(record.combined),
-    ...(record.cursorExpired !== undefined ? { cursorExpired: record.cursorExpired } : {}),
-    ...(artifact ? { artifact } : {}),
-    ...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}),
-    ...(record.signal !== undefined ? { signal: record.signal as NodeJS.Signals | null } : {}),
-    ...(typeof record.diagnostic === 'string' ? { diagnostic: record.diagnostic } : {}),
-    ...(typeof record.progressDroppedEvents === 'number'
-      ? { progressDroppedEvents: record.progressDroppedEvents }
-      : {}),
-    ...(typeof record.progressDeliveryErrors === 'number'
-      ? { progressDeliveryErrors: record.progressDeliveryErrors }
-      : {})
-  });
-}
-function jsonRecord(
-  value: import('@agent-core/json').JsonValue | undefined,
-  label: string
-): import('@agent-core/json').JsonObject {
-  if (typeof value !== 'object' || value === null || Array.isArray(value))
-    throw new Error(`Invalid ${label}.`);
-  return value as import('@agent-core/json').JsonObject;
-}
-function nonnegativeInteger(value: unknown): value is number {
-  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
-}
-function processStatus(value: unknown): value is CommandExecutionStatus {
-  return (
-    value === 'running' ||
-    value === 'exited' ||
-    value === 'stopped' ||
-    value === 'timed_out' ||
-    value === 'failed'
-  );
+
+function decodeProcessPollResult(value: import('@agent-core/json').JsonValue): CommandExecutionResult {
+  const result = processOutputSchema.parse(value);
+  if (result.artifact) validatePublicArtifactRef(result.artifact);
+  // Persisted JSON cannot contain the explicit undefined values allowed by Zod's optional types.
+  return Object.freeze(result) as CommandExecutionResult;
 }
 
 function recoveryIdentity(

@@ -4,6 +4,7 @@ import {
   InMemorySessionRepository, HistoryReader, ContextService, createHistoryTools, createContextTools
 } from '@agent-core/runtime';
 import { continuityProvider, model, providerIds } from './continuity-provider-fixtures.js';
+import { serializeToolModelContent } from '@agent-core/tools';
 import { invokeToolCall, jsonToolCall } from './tool-call-helpers.js';
 
 test('all adapters preserve optional history references through search, read and context selection', async () => {
@@ -23,6 +24,9 @@ test('all adapters preserve optional history references through search, read and
   const read = await invokeToolCall(jsonToolCall('history_read', { source }), tools, { policy });
   assert.equal(read.output.status, 'available');
   assert.equal(read.output.item.text, 'original request');
+  assert.equal(Object.hasOwn(read.output, 'text'), false);
+  const readContent = tools.find(t => t.name === 'history_read').buildModelContent({ observation: read });
+  assert.equal(serializeToolModelContent(readContent).split('original request').length - 1, 1);
   const transition = tools.find(t => t.name === 'context_transition');
   const selection = { strategy: 'sources', retained: [source], notes: [] };
   assert.equal(transition.decodeInput({ kind: 'json', value: { reason: 'retain', selection } }).ok, true);
@@ -50,7 +54,10 @@ test('all adapters preserve optional history references through search, read and
   const presented = JSON.parse(tools.find(t => t.name === 'history_search').buildModelContent({
     observation: search, input: {}, call: jsonToolCall('history_search')
   })[0].text);
-  assert.deepEqual(presented.items, search.output.items);
+  assert.equal(presented.items, undefined);
+  const searchContent = tools.find(t => t.name === 'history_search').buildModelContent({ observation: search });
+  assert.deepEqual(JSON.parse(searchContent[1].text).source, source);
+  assert.equal(searchContent[2].text, search.output.items[0].text);
   assert.equal(presented.coverage, search.output.coverage);
   assert.equal(presented.cut, undefined);
   assert.equal(presented.indexWatermark, undefined);
@@ -84,4 +91,38 @@ test('search cursors carry one cut and retain pagination, query and scope fencin
   await assert.rejects(history.search({ query: 'input', cursor: Buffer.from(JSON.stringify({
     ...encoded, position: 'superseded-nested-cursor'
   })).toString('base64url') }), /object/i);
+});
+
+test('a bounded empty history search does not imply absence from unscanned history', async () => {
+  const sessions = new InMemorySessionRepository();
+  const session = await sessions.create({ id: 'bounded-empty', binding: { schemaId: 'test', schemaVersion: 1, subject: {} } });
+  for (const [i, task] of ['needle', 'unrelated', 'unrelated'].entries()) await sessions.appendInput(session, { runId: `r-${i}`, task });
+  const history = new HistoryReader({ repository: sessions, session });
+  const tools = createHistoryTools({ history });
+  const result = await invokeToolCall(jsonToolCall('history_search', { query: 'absent', maxScanned: 1 }), tools, { policy: { allowedRisks: ['read'] } });
+  assert.equal(result.output.coverage, 'partial');
+  assert.equal(result.output.items.length, 0);
+  const parts = tools.find(t => t.name === 'history_search').buildModelContent({ observation: result });
+  assert.match(serializeToolModelContent(parts), /No match in the scanned portion/);
+  assert.equal(JSON.parse(parts[0].text).cursor, result.output.cursor);
+});
+
+test('context inspection explains adjusted capacity and does not expose the accounting component ledger', async () => {
+  const sessions = new InMemorySessionRepository();
+  const session = await sessions.create({ id: 'inspect-capacity', binding: { schemaId: 'test', schemaVersion: 1, subject: {} } });
+  const history = new HistoryReader({ repository: sessions, session });
+  const context = new ContextService({ repository: sessions, session, history, policy: { maxSourceBytes: 8192 } });
+  const provider = continuityProvider('openai');
+  const compiled = await provider.compileRequest({ model, messages: [{ role: 'user', content: 'Inspect capacity.' }], maxOutputTokens: 100 });
+  context.recordAdmission({ status: 'admitted', inputIdentity: compiled.inputIdentity, accounting: compiled.accounting });
+  const tools = createContextTools({ context });
+  const result = await invokeToolCall(jsonToolCall('context_inspect'), tools, { policy: { allowedRisks: ['read'] } });
+  const presented = JSON.parse(tools[0].buildModelContent({ observation: result })[0].text);
+  assert.equal(presented.admission.status, 'admitted');
+  assert.equal(presented.capacity.inputTokens, Math.ceil(compiled.accounting.estimatedInputTokens * (1 + compiled.accounting.uncertainty.headroomRatio)));
+  assert.equal(presented.accounting.uncertainty.calibrated, false);
+  assert.match(presented.accounting.inputTokensMeaning, /uncertainty.headroomRatio/);
+  assert.equal(presented.accounting.components, undefined);
+  assert.equal(presented.admission.inputIdentity, undefined);
+  assert.match(tools[1].description, /removes all optional history and notes/);
 });

@@ -1,5 +1,5 @@
 import { parseJsonObject } from '@agent-core/json';
-import type { CompiledToolDefinition } from '@agent-core/tools';
+import { defaultToolModelContent, type CompiledToolDefinition } from '@agent-core/tools';
 import * as z from 'zod';
 import { historyCutSchema } from '../history/schema.js';
 import { scopedTool, scopePath, invocationIdentity } from '../history/tool-support.js';
@@ -30,6 +30,39 @@ export function createContextTools(options: {
       schema: z.strictObject({}),
       mode: 'read',
       root: 'context',
+      buildModelContent({ observation }) {
+        if (observation.kind !== 'result') return defaultToolModelContent(observation);
+        const result = parseJsonObject(observation.output);
+        const admission = result.admission ? parseJsonObject(result.admission) : undefined;
+        const accounting = admission ? parseJsonObject(admission.accounting) : undefined;
+        const window = result.window ? parseJsonObject(result.window) : undefined;
+        const capacity = result.capacity ? parseJsonObject(result.capacity) : undefined;
+        const capacitySummary = capacity ? Object.fromEntries(Object.entries(capacity).filter(([key]) =>
+          !['method', 'unknownComponents', 'outputReservation'].includes(key)
+        )) : undefined;
+        return [{ type: 'text', text: JSON.stringify({
+          admission: admission ? { status: admission.status, message: admission.message } : 'not_yet_recorded',
+          capacity: capacitySummary,
+          ...(accounting ? { accounting: {
+            method: accounting.method,
+            estimatedInputTokens: accounting.estimatedInputTokens,
+            uncertainty: accounting.uncertainty,
+            unknownComponents: accounting.unknownComponents,
+            unknownTokenAllowance: accounting.unknownTokenAllowance,
+            outputReservation: accounting.outputReservation,
+            outputReservationSource: accounting.outputReservationSource,
+            reasoningReservation: accounting.reasoningReservation,
+            reasoningIncludedInOutput: parseJsonObject(accounting.pricingSemantics).reasoningIncludedInOutput,
+            limits: accounting.limits,
+            inputTokensMeaning: 'Capacity inputTokens = ceil(estimatedInputTokens × (1 + uncertainty.headroomRatio)) + unknownTokenAllowance (zero when absent). Unknown components without an allowance block admission.'
+          } } : {}),
+          selection: window?.selection ?? null,
+          protectedSources: result.protectedSources,
+          pendingWork: result.pendingWork,
+          legalTransitions: result.legalTransitions,
+          sourceBudget: result.budget
+        }) }];
+      },
       async canonicalize(value) {
         const cut = await options.context.history.capture();
         return {
@@ -44,10 +77,14 @@ export function createContextTools(options: {
     scopedTool({
       name: `${prefix}_transition`,
       description:
-        'Request a fresh working window, optionally selecting original sources and note revisions. Active input and required tool exchanges are retained automatically. Original history remains retrievable.',
+        'Schedule a replacement context window from selected original sources and note revisions. Omitted selection removes all optional history and notes; this tool does not summarize them. Active input and required tool exchanges are retained automatically. Original history remains retrievable.',
       schema: transition,
       mode: 'write',
       root: 'context',
+      buildModelContent({ observation }) {
+        if (observation.kind !== 'result') return defaultToolModelContent(observation);
+        return [{ type: 'text', text: `Context replacement scheduled; activation still requires admission. ${JSON.stringify(observation.output)}` }];
+      },
       async canonicalize(value) {
         const cut = await options.context.history.capture();
         return {

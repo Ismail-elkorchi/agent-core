@@ -92,7 +92,8 @@ export interface CommandExecutionPlan {
 }
 
 export interface CommandOutputView {
-  readonly text: string;
+  /** Each segment is contiguous source text; successive segments are separated by omitted output. */
+  readonly segments: readonly string[];
   readonly observedBytes: number;
   readonly capturedBytes: number;
   readonly omittedBytes: number;
@@ -201,20 +202,36 @@ const commandExecutionPlans = new WeakMap<
   }
 >();
 
+/** Capture only execution-domain fields before asynchronous planning or persistence. */
+export function ownCommandExecutionRequest(request: CommandExecutionPlanRequest): CommandExecutionPlanRequest {
+  validateCommandExecutionPlanRequest(request);
+  const { ownerId, runId, turnId, toolBatchId, callIndex } = request.owner;
+  return Object.freeze({
+    command: request.command,
+    rootedDirectory: request.rootedDirectory,
+    pty: request.pty,
+    ...(request.lifetime === undefined ? {} : { lifetime: request.lifetime }),
+    timeoutMs: request.timeoutMs,
+    yieldMs: request.yieldMs,
+    outputTokenBudget: request.outputTokenBudget,
+    owner: Object.freeze({ ownerId, runId, turnId, toolBatchId, callIndex })
+  });
+}
+
 export async function planCommandExecution(
   authority: CommandExecution,
   request: CommandExecutionPlanRequest
 ): Promise<CommandExecutionPlan> {
   if (!isCommandExecution(authority))
     throw new TypeError('Command execution authority was not adopted.');
-  validateCommandExecutionPlanRequest(request);
-  const source = await authority.plan(request);
+  const owned = ownCommandExecutionRequest(request);
+  const source = await authority.plan(owned);
   if (!isCommandExecutionReservation(source)) {
     throw new TypeError('Command execution planning is invalid.');
   }
   const plan = Object.freeze({
     [COMMAND_EXECUTION_PLAN]: true as const,
-    request: Object.freeze({ ...request, owner: Object.freeze({ ...request.owner }) }),
+    request: owned,
     authorization: source.authorization
   });
   commandExecutionPlans.set(plan, { state: 'plan', authority, source });

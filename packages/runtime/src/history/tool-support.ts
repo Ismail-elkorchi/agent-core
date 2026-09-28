@@ -53,25 +53,21 @@ export function scopedTool(input: {
     },
     async canonicalizeInput(value: unknown) {
       const canonical = await input.canonicalize(parseJsonObject(value));
-      return parseJsonObject(canonical);
+      return canonical;
     },
-    deriveEffects(value: unknown) {
-      const canonical = parseJsonObject(value);
-      if (typeof canonical.scope !== 'string') throw new Error('Missing tool scope.');
+    deriveEffects(canonical) {
       return {
         accesses: [{ mode: input.mode, scope: canonical.scope }],
         lockScopes: input.mode === 'write' ? [canonical.scope] : [],
         recovery: { kind: 'unknown' as const }
       };
     },
-    async invoke(value: unknown, context) {
+    async invoke(canonical, context) {
       if (context.signal?.aborted)
         throw context.signal.reason instanceof Error
           ? context.signal.reason
           : new Error('Tool aborted.');
-      const canonical = parseJsonObject(value);
-      if (typeof canonical.scope !== 'string') throw new Error('Missing tool scope.');
-      const output = parseJsonValue(await input.invoke(parseJsonObject(canonical.value), context), {
+      const output = parseJsonValue(await input.invoke(canonical.value, context), {
         maxDepth: 64,
         maxCollectionEntries: 50_000,
         maxStringBytes: 1024 * 1024,

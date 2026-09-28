@@ -11,7 +11,7 @@ export const artifactRefSchema = z.strictObject({
 });
 
 const streamOutputSchema = z.strictObject({
-  text: z.string(),
+  segments: z.array(z.string()).readonly(),
   observedBytes: z.int().nonnegative(),
   capturedBytes: z.int().nonnegative(),
   omittedBytes: z.int().nonnegative(),
@@ -20,12 +20,12 @@ const streamOutputSchema = z.strictObject({
 });
 
 export const processOutputSchema = z.strictObject({
-  processId: z.string(),
+  processId: z.string().min(1),
   owner: z.strictObject({
-    ownerId: z.string(),
-    runId: z.string(),
-    turnId: z.string(),
-    toolBatchId: z.string(),
+    ownerId: z.string().min(1),
+    runId: z.string().min(1),
+    turnId: z.string().min(1),
+    toolBatchId: z.string().min(1),
     callIndex: z.int().nonnegative()
   }),
   status: z.enum(['running', 'exited', 'stopped', 'timed_out', 'failed']),

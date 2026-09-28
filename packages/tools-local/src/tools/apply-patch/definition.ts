@@ -3,7 +3,7 @@ import { defineTool, isWorkspaceFiles, isRiskAllowed, ToolInputError } from '@ag
 import { PATCH_JOURNAL_SCOPE, FILES_SCOPE } from '../../core/resources.js';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
 import { canonicalFilePath, requireFileAuthority } from '../../core/rooted-files.js';
-import { buildApplyPatchContent } from '../../core/model-content.js';
+import { buildMutationContent } from '../../core/model-content.js';
 import { APPLY_PATCH_LARK_GRAMMAR } from './grammar.js';
 import { parseApplyPatch, type ParsedApplyPatch } from './patch-parser.js';
 import { APPLY_PATCH_PROMPT_GUIDE } from './prompt-guide.js';
@@ -17,7 +17,7 @@ export const applyPatchTool = defineTool({
     'Apply one Codex-style text patch transactionally, including add, update, delete, and move operations.',
   schema: applyPatchInputSchema,
   outputSchema: applyPatchOutputSchema,
-  buildModelContent: buildApplyPatchContent,
+  buildModelContent: buildMutationContent,
   requirements: { services: ['localToolConfiguration'] },
   textInput: {
     description:

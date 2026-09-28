@@ -1,15 +1,17 @@
 import {
   defaultToolModelContent,
+  renderCommandOutput,
   type ToolContent,
-  type ToolDefinition,
-  type ToolModelContentRequest,
-  type ToolObservation
+  type ToolModelContentRequest
 } from '@agent-core/tools';
 import type { ReadFilesOutput } from '../tools/read-files/schema.js';
 import type { ProcessOutput } from '../tools/process-output.js';
 import type { ReadArtifactOutput } from '../tools/read-artifact/schema.js';
 import type { SearchTextOutput } from '../tools/search-text/schema.js';
 import type * as z from 'zod';
+import type { ApplyPatchOutput } from '../tools/apply-patch/schema.js';
+import type { EditTextOutput } from '../tools/edit-text/schema.js';
+import { searchPassages } from './search-passages.js';
 import type { findFilesOutputSchema } from '../tools/find-files/schema.js';
 import type { listDirectoryOutputSchema } from '../tools/list-directory/schema.js';
 
@@ -37,10 +39,13 @@ export function buildReadFilesContent({
 }: ToolModelContentRequest<unknown, ReadFilesOutput>): readonly ToolContent[] {
   if (observation.kind === 'failure') return defaultToolModelContent(observation);
   const output: ReadFilesOutput = observation.output;
-  const { files, ...facts } = output;
   return [
-    text(json(facts)),
-    ...files.flatMap(({ content, ...source }) => [text(json(source)), text(content)])
+    text(`Requested file ranges: ${output.coverage}. Returned ${String(output.returnedFiles)} of ${String(output.requestedFiles)}.`),
+    ...(output.failures.length ? [text(json({ failures: output.failures }))] : []),
+    ...output.files.flatMap(({ content, eof, truncated, ...source }) => [
+      text(`${json(source)}\n${eof ? 'Range reaches end of file.' : 'More file content follows.'}${truncated ? ' File content is partial.' : ''}`),
+      text(content)
+    ])
   ];
 }
 
@@ -49,21 +54,24 @@ export function buildProcessContent({
 }: ToolModelContentRequest<unknown, ProcessOutput>): readonly ToolContent[] {
   if (observation.kind === 'failure') return defaultToolModelContent(observation);
   const output: ProcessOutput = observation.output;
-  const { processId, status, artifact, ...details } = output;
-  const modelFacts = Object.fromEntries(Object.entries(details).filter(([key]) =>
-    !['owner', 'stdout', 'stderr', 'combined', 'terminal', 'progressDroppedEvents', 'progressDeliveryErrors'].includes(key)
-  ));
-  const { combined } = output;
-  const { text: log, ...coverage } = combined;
+  const { combined, artifact, originalOutput } = output;
+  const partial = !combined.startsAtOutputStart || !combined.endsAtOutputEnd || combined.omittedBytes > 0;
   return [
     text(json({
-      status, processId, ...modelFacts, ...coverage,
-      ...(artifact ? { artifact: {
-        artifactId: artifact.artifactId, sha256: artifact.sha256,
-        size: artifact.size, mediaType: artifact.mediaType, visibility: artifact.visibility
-      } } : {})
+      status: output.status,
+      ...(output.exitCode === undefined ? {} : { exitCode: output.exitCode }),
+      ...(output.signal ? { signal: output.signal } : {}),
+      ...(output.diagnostic ? { diagnostic: output.diagnostic } : {}),
+      outputCoverage: partial ? 'partial' : 'complete',
+      ...(output.status === 'running' || partial ? {
+        processId: output.processId, cursorStart: output.cursorStart, cursorEnd: output.cursorEnd
+      } : {}),
+      ...(output.cursorExpired ? { cursorExpired: true } : {}),
+      ...(partial ? { observedBytes: combined.observedBytes, capturedBytes: combined.capturedBytes, omittedBytes: combined.omittedBytes } : {}),
+      ...(originalOutput?.kind === 'unavailable' || (originalOutput?.kind === 'captured' && originalOutput.omittedBytes > 0) ? { originalOutput } : {}),
+      ...(partial && artifact ? { artifact } : {})
     })),
-    text(log)
+    ...(combined.segments.length || combined.observedBytes ? [text(renderCommandOutput(combined))] : [])
   ];
 }
 
@@ -84,45 +92,46 @@ export function buildSearchTextContent({
 }: ToolModelContentRequest<unknown, SearchTextOutput>): readonly ToolContent[] {
   if (observation.kind === 'failure') return defaultToolModelContent(observation);
   const output: SearchTextOutput = observation.output;
-  const facts = Object.fromEntries(Object.entries(output).filter(([key]) => key !== 'results'));
-  if (output.mode !== 'matches') return [text(json(facts)), text(json(output.results))];
-  return [
-    text(json(facts)),
-    ...output.results.flatMap((match) => [
-      ...(match.context?.before.flatMap((line) => [
-        text(`${json(match.path)}:${String(line.lineNumber)} (context)`), text(line.text)
-      ]) ?? []),
-      text(`${json(match.path)}:${String(match.lineNumber)} (match; byte ranges: ${
-        match.occurrences.map(({ startByte, endByte }) => `${String(startByte)}-${String(endByte)}`).join(', ')
-      })`),
-      text(match.text),
-      ...(match.context?.after.flatMap((line) => [
-        text(`${json(match.path)}:${String(line.lineNumber)} (context)`), text(line.text)
-      ]) ?? [])
-    ])
-  ];
+  const { mode, results, query, status, resultCoverage, countCoverage, diagnostic,
+    examinedFileCount, matchingFileCount, matchingLineCount, occurrenceCount,
+    omittedResultCount, countsCapped, omittedResultCountIsLowerBound, outputTruncated, perFileOmissions } = output;
+  const facts = text(json({
+    query, status, resultCoverage, countCoverage,
+    examinedFileCount, matchingFileCount, matchingLineCount, occurrenceCount,
+    ...(diagnostic ? { diagnostic } : {}),
+    ...(omittedResultCount > 0 ? { omittedResultCount, omittedResultCountIsLowerBound } : {}),
+    ...(countsCapped ? { countsCapped } : {}),
+    ...(outputTruncated ? { outputTruncated } : {}),
+    ...(perFileOmissions.length ? { perFileOmissions } : {})
+  }));
+  if (mode !== 'matches') return [facts, text(json(results))];
+  return [facts, ...searchPassages(output.results).flatMap((passage) => [text(passage.header), text(passage.text)])];
 }
 
-export const buildApplyPatchContent: NonNullable<ToolDefinition['buildModelContent']> = ({
-  observation
-}) => mutationContent(observation);
-export const buildEditTextContent: NonNullable<ToolDefinition['buildModelContent']> = ({
-  observation
-}) => mutationContent(observation);
-
-function mutationContent(observation: ToolObservation): readonly ToolContent[] {
+export function buildMutationContent<Output extends ApplyPatchOutput | EditTextOutput>({ observation }: ToolModelContentRequest<unknown, Output>): readonly ToolContent[] {
+  if (observation.kind === 'failure') return defaultToolModelContent(observation);
+  const output = observation.output;
   return [
-    ...defaultToolModelContent(observation),
-    ...(observation.scope.coverage === 'partial'
-      ? [
-          text(
-            json({
-              coverage: observation.scope.coverage,
-              omitted: observation.scope.omitted,
-              causes: observation.scope.causes
-            })
-          )
-        ]
-      : [])
+    text(`${output.applicationStatus}; workspace state ${output.rootState}.`),
+    ...output.files.map((file) => text(json('operation' in file ? {
+      path: file.path, operation: file.operation, finalState: file.finalState,
+      ...(file.destinationPath ? { destinationPath: file.destinationPath } : {}),
+      ...(output.dryRun ? { plannedChange: file.plannedChange } : {}),
+      oldSha256: file.oldSha256, newSha256: file.newSha256,
+      additions: file.additions, deletions: file.deletions,
+      ...(file.exact === false ? { exact: false, matchModes: file.matchModes } : {})
+    } : {
+      path: file.path, finalState: file.finalState,
+      ...(output.dryRun ? { plannedChange: file.changed } : {}),
+      oldSha256: file.oldSha256, newSha256: file.newSha256,
+      changedRanges: file.changedRanges
+    }))),
+    ...(output.transaction && output.transaction.outcome !== 'committed' ? [text(json({ transaction: output.transaction }))] : []),
+    ...(output.potentiallyAffectedPaths.length ? [text(json({ potentiallyAffectedPaths: output.potentiallyAffectedPaths }))] : []),
+    ...(observation.scope.coverage === 'partial' ? [text(json({
+      coverage: observation.scope.coverage,
+      omitted: observation.scope.omitted,
+      causes: observation.scope.causes
+    }))] : [])
   ];
 }

@@ -1,5 +1,5 @@
 import * as z from 'zod';
-import { fileTransactionResultSchema, type FileTransactionResult } from '../../core/file-transaction.js';
+import { fileTransactionResultSchema } from '../../core/file-transaction.js';
 
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 
@@ -69,44 +69,8 @@ export interface ApplyPatchPathPair {
   destinationPath: string;
 }
 
-export interface ApplyPatchFileOutput {
-  path: string;
-  operation: ApplyPatchOperation;
-  destinationPath?: string;
-  hunkCount: number;
-  additions: number;
-  deletions: number;
-  oldSha256?: string;
-  newSha256?: string;
-  oldBytes: number;
-  newBytes: number;
-  plannedChange: boolean;
-  finalState: 'unchanged' | 'changed' | 'uncertain';
-  matchModes?: PatchMatchMode[];
-  exact?: boolean;
-}
-
-export interface ApplyPatchOutput {
-  applicationStatus: ApplyPatchApplicationStatus;
-  transactionOutcome?: ApplyPatchTransactionOutcome;
-  rootState: 'known' | 'uncertain';
-  dryRun: boolean;
-  files: ApplyPatchFileOutput[];
-  changedPaths: string[];
-  wouldChangePaths: string[];
-  createdPaths: string[];
-  wouldCreatePaths: string[];
-  deletedPaths: string[];
-  wouldDeletePaths: string[];
-  movedPaths: ApplyPatchPathPair[];
-  wouldMovePaths: ApplyPatchPathPair[];
-  potentiallyAffectedPaths: string[];
-  transaction?: FileTransactionResult;
-  totalOperationCount: number;
-  totalHunkCount: number;
-  totalAdditions: number;
-  totalDeletions: number;
-}
+export type ApplyPatchFileOutput = z.output<typeof patchFileOutputSchema>;
+export type ApplyPatchOutput = z.output<typeof applyPatchOutputSchema>;
 
 const patchFileOutputSchema = z.strictObject({
   path: z.string(),

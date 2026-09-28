@@ -1,6 +1,7 @@
 export * from './core/authorization.js';
 export { createToolCall, decodeOwnedToolCall, decodeToolCall } from './core/call.js';
 export * from './core/command-execution.js';
+export * from './core/command-output.js';
 export * from './core/command-resources.js';
 export type { CompiledToolDefinition } from './core/compiled.js';
 export * from './core/context.js';

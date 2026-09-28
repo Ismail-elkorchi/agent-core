@@ -1,5 +1,5 @@
 import * as z from 'zod';
-import { parseJsonObject } from '@agent-core/json';
+import { parseJsonObject, type JsonValue } from '@agent-core/json';
 import { defaultToolModelContent, type CompiledToolDefinition } from '@agent-core/tools';
 import type { HistoryReader } from './reader.js';
 import { historyCutSchema } from './schema.js';
@@ -74,14 +74,15 @@ export function createHistoryTools(options: {
         if (observation.kind !== 'result') return defaultToolModelContent(observation);
         const result = parseJsonObject(observation.output);
         if (result.status !== 'available') return defaultToolModelContent(observation);
-        const item = parseJsonObject(result.item);
-        const { text, ...source } = item;
-        const facts = Object.fromEntries(Object.entries(result).filter(([key]) =>
-          key !== 'cut' && key !== 'item'
-        ));
+        const { item, neighbors } = result;
+        const range = { status: result.status, offset: result.offset, nextOffset: result.nextOffset, totalBytes: result.totalBytes };
         return [
-          { type: 'text', text: JSON.stringify({ ...facts, item: source }) },
-          { type: 'text', text: typeof text === 'string' ? text : JSON.stringify(text) }
+          { type: 'text', text: JSON.stringify(range) },
+          ...historyItemContent(item),
+          ...(Array.isArray(neighbors) && neighbors.length ? [
+            { type: 'text' as const, text: 'Neighboring history:' },
+            ...neighbors.flatMap(historyItemContent)
+          ] : [])
         ];
       },
       async canonicalize(value) {
@@ -105,12 +106,18 @@ export function createHistoryTools(options: {
       buildModelContent({ observation }) {
         if (observation.kind !== 'result') return defaultToolModelContent(observation);
         const result = parseJsonObject(observation.output);
-        // Cuts remain in the authoritative result and cursor. Exact item identities,
-        // scan coverage, unavailable sources and continuation stay model-visible.
-        const facts = Object.fromEntries(Object.entries(result).filter(([key]) =>
-          key !== 'cut' && key !== 'indexWatermark'
+        const { items } = result;
+        const coverage = Object.fromEntries(Object.entries(result).filter(([key]) =>
+          !['items', 'cut', 'indexWatermark', 'index'].includes(key)
         ));
-        return [{ type: 'text', text: JSON.stringify(facts) }];
+        return [
+          { type: 'text', text: JSON.stringify(coverage) },
+          ...(Array.isArray(items) && items.length
+            ? items.flatMap(historyItemContent)
+            : [{ type: 'text' as const, text: result.coverage === 'partial'
+              ? 'No match in the scanned portion. Search coverage is partial; use cursor to continue.'
+              : 'No matching history.' }])
+        ];
       },
       async canonicalize(value) {
         const cut = await options.history.capture();
@@ -129,4 +136,12 @@ export function createHistoryTools(options: {
       }
     })
   ]);
+}
+
+function historyItemContent(value: JsonValue | undefined) {
+  const { text, ...source } = parseJsonObject(value);
+  return [
+    { type: 'text' as const, text: JSON.stringify(source) },
+    { type: 'text' as const, text: typeof text === 'string' ? text : JSON.stringify(text) }
+  ];
 }

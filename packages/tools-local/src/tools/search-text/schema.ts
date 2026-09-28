@@ -1,14 +1,14 @@
 import * as z from 'zod';
+import { searchScopeShape } from '../../core/search-scope-schema.js';
 export const searchTextInputSchema = z.strictObject({
+  ...searchScopeShape,
+  patterns: searchScopeShape.patterns.default(['**/*']),
   query: z.string().min(1).meta({ description: 'Regular expression, or literal text when fixedStrings is true.' }),
-  path: z.string().trim().min(1).default('.'),
-  patterns: z.array(z.string().trim().min(1)).min(1).default(['**/*']),
   mode: z.enum(['files', 'matches', 'count']).default('matches'),
   fixedStrings: z.boolean().default(false),
   caseSensitive: z.boolean().default(true),
   respectGitIgnore: z.boolean().default(true),
   includeHidden: z.boolean().default(false),
-  exclude: z.array(z.string().trim().min(1)).default([]),
   contextLines: z.int().nonnegative().default(0),
   perFileLimit: z.int().positive().optional(),
   resultLimit: z.int().min(1).optional()

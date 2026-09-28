@@ -27,3 +27,13 @@ test('all shared credential patterns remove values, including bare keys, without
   }
   assert.equal(redactTextPreservingLength(text).text.length, text.length);
 });
+
+test('environment credentials include spaces and Unicode without changing byte-oriented output boundaries', () => {
+  const source = 'API_TOKEN=Рassword with spaces\nordinary output';
+  assert.equal(redactJson(source).value, 'API_TOKEN=[REDACTED]\nordinary output');
+  const bytes = Buffer.from(source);
+  const masked = Buffer.from(redactTextPreservingLength(bytes.toString('latin1')).text, 'latin1');
+  assert.equal(masked.length, bytes.length);
+  assert.doesNotMatch(masked.toString('utf8'), /assword|with spaces/);
+  assert.match(masked.toString('utf8'), /ordinary output$/);
+});

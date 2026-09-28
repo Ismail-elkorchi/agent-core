@@ -21,7 +21,7 @@ function credentialPatterns(): RegExp[] {
     /\b((?:AKIA|ASIA)[A-Z0-9]{16})\b/gu,
     /(-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z ]+ )?PRIVATE KEY-----)/gu,
     // Environment dumps have a line-oriented grammar. Source-language identifiers do not.
-    /^(?:[A-Z][A-Z0-9_]*_)?(?:TOKEN|SECRET|PASSWORD|KEY|API_KEY)=(\S+)/gmu
+    /^(?:[A-Z][A-Z0-9_]*_)?(?:TOKEN|SECRET|PASSWORD|KEY|API_KEY)=([^\r\n]+)/gmu
   ];
 }
 

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { defineTool, isWorkspaceFiles, isRiskAllowed, requireToolService, ToolInputError } from '@agent-core/tools';
 import { requireLocalToolConfiguration } from '../../core/configuration.js';
 import { FILES_SCOPE, PATCH_JOURNAL_SCOPE, fileScope } from '../../core/resources.js';
-import { buildEditTextContent } from '../../core/model-content.js';
+import { buildMutationContent } from '../../core/model-content.js';
 import { canonicalFilePath, requireFileAuthority } from '../../core/rooted-files.js';
 import { isTextPatchJournal, type TextPatchJournal } from '../../core/text-write.js';
 import {
@@ -22,7 +22,7 @@ export const editTextTool = defineTool({
     'Ranges use one-based lines and one-based Unicode-scalar columns with an excluded end position. Supply the exact complete-file SHA-256 and exact expected text for every replacement. Ranges must not overlap. Replacement text is inserted literally, including any explicit newline changes.',
   schema: editTextInputSchema,
   outputSchema: editTextOutputSchema,
-  buildModelContent: buildEditTextContent,
+  buildModelContent: buildMutationContent,
   requirements: { services: ['localToolConfiguration'] },
   effectEnvelope: {
     accesses: [

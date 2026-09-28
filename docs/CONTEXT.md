@@ -98,7 +98,7 @@ catalog and generation settings, then compiles the provider request.
 `assertRequestAccountingFits` alone decides fit, including separate reasoning and
 output reservations. Counts, estimates, and unknown components stay distinguishable.
 
-`context_transition` requests a fresh window with an optional source/note selection.
+`context_transition` schedules a replacement window with an optional source/note selection. Omitting selection removes optional history and notes; the tool does not generate a summary. Activation still requires admission.
 The runtime binds the operation to its tool invocation, protects active accepted
 input and steering, preserves complete protocol exchanges, and schedules admission
 at the next lawful request boundary. Provider transforms are explicit governed

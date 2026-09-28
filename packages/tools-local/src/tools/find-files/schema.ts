@@ -1,12 +1,11 @@
 import * as z from 'zod';
+import { searchScopeShape } from '../../core/search-scope-schema.js';
 
 export const findFilesInputSchema = z.strictObject({
-  patterns: z.array(z.string().trim().min(1)).min(1).meta({ description: 'One or more rooted file glob patterns.' }),
-  path: z.string().trim().min(1).default('.').meta({ description: 'Root-relative start directory.' }),
+  ...searchScopeShape,
   type: z.enum(['file', 'directory', 'any']).default('file'),
   respectGitIgnore: z.boolean().default(true),
   includeHidden: z.boolean().default(false),
-  exclude: z.array(z.string().trim().min(1)).default([]),
   resultLimit: z.int().min(1).optional().meta({ description: 'Optional smaller result limit.' })
 });
 

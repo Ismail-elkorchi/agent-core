@@ -27,7 +27,7 @@ import {
 } from '@agent-core/tools-local';
 import { invokeToolCall, jsonToolCall } from '../tool-call-helpers.js';
 import { testRootedFileAuthority } from '../rooted-file-authority-helper.js';
-import { isCommandExecution, planToolCall, releaseToolCallPlan } from '@agent-core/tools';
+import { isCommandExecution, planToolCall, releaseToolCallPlan, renderCommandOutput } from '@agent-core/tools';
 
 const tools = [execCommandTool, writeStdinTool, stopProcessTool];
 const policy = { allowedRisks: ['read', 'execute'] };
@@ -188,7 +188,10 @@ test('local process inspection and settlement notification report the owned comm
   });
   const listed = (await execution.listProcesses()).find((item) => item.processId === result.processId);
   assert.equal(listed?.command, command);
-  assert.deepEqual(listed?.owner, invocation);
+  assert.deepEqual(listed?.owner, {
+    ownerId: invocation.ownerId, runId: invocation.runId, turnId: invocation.turnId,
+    toolBatchId: invocation.toolBatchId, callIndex: invocation.callIndex
+  });
   assert.match(listed?.revision ?? '', /^[a-f0-9]{64}$/u);
   while (result.status === 'running')
     result = await execution.query(result.processId, 100, 50, result.cursorEnd, invocation);
@@ -246,7 +249,7 @@ test('persistent processes support polling and stdin without replaying prior out
     context
   );
   assert.equal(started.output.status, 'running');
-  assert.match(started.output.stdout.text, /ready/u);
+  assert.match(started.output.stdout.segments.join(''), /ready/u);
   assert.equal(started.output.combined.startsAtOutputStart, true);
   assert.equal(started.output.combined.endsAtOutputEnd, true);
   const completed = await invokeToolCall(
@@ -264,9 +267,9 @@ test('persistent processes support polling and stdin without replaying prior out
     completed.output.status === 'running'
       ? await pollUntilSettled(started.output.processId, context, completed.output.cursorEnd)
       : completed;
-  assert.match(`${completed.output.stdout.text}${settled.output.stdout.text}`, /echo:hello/u);
+  assert.match(`${completed.output.stdout.segments.join('')}${settled.output.stdout.segments.join('')}`, /echo:hello/u);
   assert.doesNotMatch(
-    completed.output.stdout.text,
+    completed.output.stdout.segments.join(''),
     /^ready$/mu,
     'polling returns only output after the prior cursor'
   );
@@ -317,7 +320,7 @@ test('foreground commands deliver their terminal output and enforce their deadli
     context
   );
   assert.equal(completed.output.status, 'exited');
-  assert.match(completed.output.combined.text, /first\nlast\n/u);
+  assert.match(completed.output.combined.segments.join(''), /first\nlast\n/u);
   assert.equal(completed.execution.state, 'settled');
 
   const timedOut = await invokeToolCall(
@@ -342,7 +345,7 @@ test('stop_process force-kills descendants that ignore graceful termination', as
     tools,
     context
   );
-  const operatingSystemPid = Number(started.output.stdout.text.trim().split(/\s+/u)[0]);
+  const operatingSystemPid = Number(started.output.stdout.segments.join('').trim().split(/\s+/u)[0]);
   assert.equal(Number.isSafeInteger(operatingSystemPid), true);
   const stopped = await invokeToolCall(
     jsonToolCall('stop_process', { processId: started.output.processId }),
@@ -354,7 +357,7 @@ test('stop_process force-kills descendants that ignore graceful termination', as
 });
 
 test('bounded output retains the true start and true tail and stores an artifact', async () => {
-  const { context, artifacts } = await processContext({ maxCapturedBytes: 160, tailBytes: 64 });
+  const { context, artifacts } = await processContext({ maxCapturedBytes: 160, tailBytes: 64, maxPendingOutputBytes: 160 });
   const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('START-' + 'x'.repeat(5000) + '-END')")}`;
   const result = await invokeToolCall(
     jsonToolCall('exec_command', { command, outputTokenBudget: 64 }),
@@ -362,13 +365,17 @@ test('bounded output retains the true start and true tail and stores an artifact
     context
   );
   assert.equal(result.output.status, 'exited');
-  const output = result.output.combined.text;
+  const output = result.output.combined.segments.join('');
   assert.match(output, /START-/u);
   assert.match(output, /-END/u);
   assert.equal(result.output.combined.omittedBytes > 0, true);
   assert.equal(result.output.combined.startsAtOutputStart, true);
   assert.equal(result.output.combined.endsAtOutputEnd, true);
-  assert.equal((await artifacts.readVerified(result.output.artifact)).byteLength > 0, true);
+  assert.match(renderCommandOutput(result.output.combined), /START-[\s\S]*output omitted[\s\S]*-END/);
+  const stored = JSON.parse(Buffer.from(await artifacts.readVerified(result.output.artifact)).toString());
+  assert.equal(stored.chunks[0].start, 0);
+  assert.equal(stored.chunks.at(-1).end, stored.observedBytes);
+  assert.ok(stored.chunks.some((chunk, index) => index > 0 && chunk.start > stored.chunks[index - 1].end));
 });
 
 async function waitForMissingProcess(pid) {
@@ -408,7 +415,7 @@ test('process polls use stable cursors, preserve split UTF-8, and retain a compl
     tools,
     context
   );
-  assert.equal(first.output.stdout.text, '🙂 café');
+  assert.equal(first.output.stdout.segments.join(''), '🙂 café');
   assert.deepEqual(repeated.output, first.output);
   const stoppedAgain = await invokeToolCall(
     jsonToolCall('stop_process', { processId: started.output.processId, afterCursor: 0 }),
@@ -1061,4 +1068,71 @@ test('local host durably hands recovered terminal reports to old runs during sta
   assert.equal(delivered[0].result.owner.runId, 'orphan-run');
   assert.deepEqual(await readdir(path.join(root, 'processes')), []);
   await host.close();
+});
+
+test('output budgets preserve gaps, UTF-8 and empty-view coverage independently of retained capture', async (t) => {
+  const { context, manager, root } = await processContext({ maxCapturedBytes: 160, tailBytes: 64, maxPendingOutputBytes: 160 });
+  t.after(async () => { await manager.close(); await rm(root, { recursive: true, force: true }); });
+  const result = await invokeToolCall(jsonToolCall('exec_command', {
+    command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdout.write('START-' + '🙂'.repeat(4000) + '-END')")}`,
+    outputTokenBudget: 64
+  }), tools, context);
+  assert.equal(result.kind, 'result', result.summary);
+  for (const budget of [64, 4000]) {
+    const view = (await manager.query(result.output.processId, budget)).combined;
+    assert.ok(view.segments.length >= 2);
+    assert.equal(view.segments.reduce((bytes, text) => bytes + Buffer.byteLength(text), 0), view.capturedBytes);
+    assert.doesNotMatch(renderCommandOutput(view), /\uFFFD/);
+    assert.match(renderCommandOutput(view), /START-[\s\S]*output omitted[\s\S]*-END/);
+  }
+  const empty = await manager.query(result.output.processId, 0);
+  assert.deepEqual(empty.combined.segments, []);
+  assert.equal(empty.combined.capturedBytes, 0);
+  assert.equal(empty.combined.omittedBytes, 16010);
+});
+
+test('planning owns an immutable execution request before callers can mutate it', async (t) => {
+  const { manager, root } = await processContext();
+  t.after(async () => { await manager.close(); await rm(root, { recursive: true, force: true }); });
+  const owner = { ...invocation };
+  const request = { command: 'printf original', rootedDirectory: '.', pty: false,
+    timeoutMs: 5000, yieldMs: 0, outputTokenBudget: 1000, owner };
+  const planning = manager.plan(request);
+  request.command = 'printf changed';
+  owner.ownerId = 'changed-owner';
+  const result = await manager.start(await planning, { awaitTerminal: true });
+  assert.equal(result.combined.segments.join(''), 'original');
+  assert.equal(result.owner.ownerId, invocation.ownerId);
+  assert.equal(Object.hasOwn(result.owner, 'requestAttempt'), false);
+});
+
+test('stream completeness is measured against its own offsets when capture keeps another stream at the end', async (t) => {
+  const { context, manager, root } = await processContext({ maxCapturedBytes: 160, tailBytes: 64, maxPendingOutputBytes: 160 });
+  t.after(async () => { await manager.close(); await rm(root, { recursive: true, force: true }); });
+  const script = "process.stdout.write('A'.repeat(4000)); setTimeout(() => process.stderr.write('B'.repeat(4000)), 100)";
+  const result = await invokeToolCall(jsonToolCall('exec_command', {
+    command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+    outputTokenBudget: 4000
+  }), tools, context);
+  assert.equal(result.kind, 'result', result.summary);
+  assert.equal(result.output.stdout.startsAtOutputStart, true);
+  assert.equal(result.output.stdout.endsAtOutputEnd, false);
+  assert.match(renderCommandOutput(result.output.stdout), /Later output not included/);
+  assert.equal(result.output.stderr.startsAtOutputStart, false);
+  assert.equal(result.output.stderr.endsAtOutputEnd, true);
+  assert.match(renderCommandOutput(result.output.stderr), /Earlier output not included/);
+});
+
+test('redaction precedes output selection and cannot expose a detached credential suffix', async (t) => {
+  const { context, manager, artifacts, root } = await processContext({ maxCapturedBytes: 160, tailBytes: 64, maxPendingOutputBytes: 160 });
+  t.after(async () => { await manager.close(); await rm(root, { recursive: true, force: true }); });
+  const script = "process.stdout.write('API_TOKEN=' + 'a'.repeat(4000) + 'sensitive-suffix')";
+  const result = await invokeToolCall(jsonToolCall('exec_command', {
+    command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`, outputTokenBudget: 64
+  }), tools, context);
+  assert.equal(result.kind, 'result', result.summary);
+  assert.doesNotMatch(renderCommandOutput(result.output.combined), /sensitive-suffix|a{16}/);
+  assert.match(renderCommandOutput(result.output.combined), /output omitted/);
+  const artifact = JSON.parse(Buffer.from(await artifacts.readVerified(result.output.artifact)).toString());
+  assert.doesNotMatch(artifact.chunks.map(chunk => chunk.text).join(''), /sensitive-suffix|a{16}/);
 });

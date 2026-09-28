@@ -59,12 +59,13 @@ export function createExecCommandTool(
         'CommandExecution'
       );
       const owner = processOwner(context);
-      const background = input.background || input.lifetime === 'environment';
+      const lifetime = 'lifetime' in input && input.lifetime === 'environment' ? 'environment' : 'job';
+      const background = input.background || lifetime === 'environment';
       const request = Object.freeze({
         ...input,
         background,
         pty: 'pty' in input && input.pty === true,
-        lifetime: 'lifetime' in input ? input.lifetime : 'job',
+        lifetime,
         workdir,
         yieldMs: background ? Math.min(1_000, limits.maxYieldMs) : 0,
         timeoutMs: clampRequestedLimit(input.timeoutMs, limits.maxTimeoutMs),

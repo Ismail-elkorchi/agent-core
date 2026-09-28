@@ -1,3 +1,5 @@
+import { renderCommandOutput } from '@agent-core/tools';
+import { searchPassages } from './search-passages.js';
 import { processOutputSchema } from '../tools/process-output.js';
 import { readFilesOutputSchema } from '../tools/read-files/schema.js';
 import { searchTextOutputSchema } from '../tools/search-text/schema.js';
@@ -35,7 +37,7 @@ export function renderLocalToolObservation(
         `Output cursor ${String(output.cursorStart)}–${String(output.cursorEnd)}`,
         ...(combined.omittedBytes ? [`${String(combined.omittedBytes)} output bytes omitted`] : []),
         ...(typeof output.diagnostic === 'string' ? [output.diagnostic] : []),
-        combined.text
+        renderCommandOutput(combined)
       ].join('\n');
       status =
         output.status === 'running'
@@ -69,7 +71,7 @@ export function renderLocalToolObservation(
       const output = searchTextOutputSchema.parse(observation.output);
       content = (
         output.mode === 'matches'
-          ? output.results.map((item) => `${item.path}:${String(item.lineNumber)}\n${item.text}`)
+          ? searchPassages(output.results).map((passage) => `${passage.header}\n${passage.text}`)
           : output.results.map((item) => JSON.stringify(item))
       ).join('\n');
       content += `\nResult coverage: ${output.resultCoverage}`;

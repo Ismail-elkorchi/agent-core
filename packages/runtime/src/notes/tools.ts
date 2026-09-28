@@ -1,5 +1,5 @@
 import * as z from 'zod';
-import { parseJsonObject } from '@agent-core/json';
+import { parseJsonObject, type JsonValue } from '@agent-core/json';
 import { defaultToolModelContent, type CompiledToolDefinition } from '@agent-core/tools';
 import {
   invocationIdentity,
@@ -55,14 +55,19 @@ export function createNotesTools(options: {
         mode: definition.mode,
         root: 'notes',
         buildModelContent({ observation }) {
-          if (observation.kind !== 'result' || definition.name !== 'read')
-            return defaultToolModelContent(observation);
+          if (observation.kind !== 'result') return defaultToolModelContent(observation);
           const output = parseJsonObject(observation.output);
-          if (typeof output.text !== 'string') return defaultToolModelContent(observation);
-          const { text, ...source } = output;
+          const { text, revision, items } = output;
+          const facts = Object.fromEntries(Object.entries(output).filter(([key]) =>
+            !['text', 'revision', 'items', 'watermark', 'index'].includes(key)
+          ));
           return [
-            { type: 'text', text: JSON.stringify(source, null, 2) },
-            { type: 'text', text }
+            { type: 'text', text: JSON.stringify({
+              ...facts,
+              ...(revision ? { revision: noteIdentity(revision) } : {}),
+              ...(Array.isArray(items) ? { items: items.map(noteIdentity) } : {})
+            }) },
+            ...(typeof text === 'string' ? [{ type: 'text' as const, text }] : [])
           ];
         },
         async canonicalize(value) {
@@ -107,4 +112,14 @@ export function createNotesTools(options: {
       })
     )
   );
+}
+
+function noteIdentity(value: JsonValue) {
+  const revision = parseJsonObject(value);
+  return {
+    scope: revision.scope, noteId: revision.noteId, revisionId: revision.revisionId,
+    title: revision.title, mediaType: revision.mediaType, schemaId: revision.schemaId,
+    authorId: revision.authorId, createdAt: revision.createdAt, parentRevision: revision.parentRevision,
+    sources: revision.sources, tombstone: revision.tombstone
+  };
 }

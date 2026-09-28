@@ -739,7 +739,9 @@ export class HistoryReader {
         text: range.text,
         truncated: range.offset > 0 || range.nextOffset < range.totalBytes
       }),
-      ...range,
+      offset: range.offset,
+      nextOffset: range.nextOffset,
+      totalBytes: range.totalBytes,
       neighbors: Object.freeze(neighbors),
       cut
     });
