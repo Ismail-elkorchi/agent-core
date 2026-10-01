@@ -152,7 +152,7 @@ function configurationState(
 
 function updateConfiguration(
   state: ConfigurationState,
-  message: ConfigurationMessage,
+  message: Exclude<ConfigurationMessage, { readonly type: 'configuration.close' | 'configuration.saved' }>,
   operations: ConfigurationOperations
 ) {
   let current = state;
@@ -176,7 +176,7 @@ function updateConfiguration(
 
 function reduceConfiguration(
   state: ConfigurationState,
-  message: ConfigurationMessage,
+  message: Exclude<ConfigurationMessage, { readonly type: 'configuration.close' | 'configuration.saved' }>,
   operations: ConfigurationOperations
 ): {
   readonly state: ConfigurationState;
@@ -186,8 +186,6 @@ function reduceConfiguration(
   if ('id' in message && message.id !== state.id) return { state };
   if ('request' in message && message.request !== state.pending) return { state };
   switch (message.type) {
-    case 'configuration.close':
-      return { state };
     case 'configuration.scroll':
       return { state: { ...state, offset: message.offset } };
     case 'configuration.notice':
@@ -564,8 +562,6 @@ function reduceConfiguration(
         return { type: 'configuration.saved', id: state.id };
       });
     }
-    case 'configuration.saved':
-      return { state };
   }
 }
 
@@ -938,12 +934,12 @@ export function configurationPanel(
 ): TuiChildDefinition<ConfigurationState, ConfigurationMessage, 'close' | 'saved'> {
   return {
     init: () => ({ state: configurationState(selection(), operations.providers) }),
-    update: (state, message) =>
-      message.type === 'configuration.close'
-        ? { state, outputs: ['close'] }
-        : message.type === 'configuration.saved' && message.id === state.id
-          ? { state, outputs: ['saved'] }
-          : updateConfiguration(state, message, operations),
+    update: (state, message) => {
+      if (message.type === 'configuration.close') return { state, outputs: ['close'] };
+      if (message.type === 'configuration.saved')
+        return message.id === state.id ? { state, outputs: ['saved'] } : { state };
+      return updateConfiguration(state, message, operations);
+    },
     view: (state, context) =>
       configurationView(
         state,

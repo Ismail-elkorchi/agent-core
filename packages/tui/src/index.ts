@@ -9,6 +9,7 @@ export {
   type MarkdownSegment
 } from './markdown.js';
 export { panel } from './panel.js';
+export { applyPanelResult, mountPanel, cancelRemovedPanels } from './panel-lifecycle.js';
 export { providerFailureText, suspensionPresentation } from './recovery.js';
 
 export { copySource, selectedSource } from './copy.js';

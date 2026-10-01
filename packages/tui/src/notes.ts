@@ -46,12 +46,10 @@ export interface NotesState {
 
 function updateNotes(
   state: NotesState,
-  message: NotesMessage,
+  message: Exclude<NotesMessage, { readonly type: 'notes.close' }>,
   reader: NoteReader
 ): { readonly state: NotesState; readonly effects?: readonly TuiEffect<NotesMessage>[] } {
   switch (message.type) {
-    case 'notes.close':
-      return { state };
     case 'notes.open':
     case 'notes.read': {
       const requestId = crypto.randomUUID();

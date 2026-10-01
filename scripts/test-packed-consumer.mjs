@@ -131,6 +131,17 @@ try {
   await writeFile(
     path.join(consumer, 'consumer.ts'),
     [
+      "import { applyPanelResult, mountPanel, cancelRemovedPanels } from '@agent-core/tui';",
+      "import { createTuiChild, type TuiContext } from '@ismail-elkorchi/terminal-ui/tui';",
+      "import { text } from '@ismail-elkorchi/terminal-ui/components';",
+      'declare const tuiContext: TuiContext;',
+      "const child = createTuiChild({ init: () => ({ state: 0 }), update: (state: number, message: number) => ({ state: state + message }), view: () => text({ content: 'child' }) }, (child) => ({ type: 'child' as const, child }));",
+      "const mounted = mountPanel({ panelGeneration: 0 as const, overlay: { kind: 'none' as const }, owned: true }, 'notes', child, tuiContext);",
+      "if (mounted.state.overlay.kind === 'notes') {",
+      '  const value: number = mounted.state.overlay.state.state;',
+      "  const applied = applyPanelResult(mounted.state, 'notes', child.update(mounted.state.overlay.state, { id: 'notes', generation: mounted.state.panelGeneration, message: value }, tuiContext));",
+      '  cancelRemovedPanels(applied, [mounted.state.overlay.state], []);',
+      '}',
       "import type { JsonObject } from '@agent-core/json';",
       "import { renderDiagnostic } from '@agent-core/json/diagnostics';",
       "const diagnostic = renderDiagnostic(new Error('example'));",
