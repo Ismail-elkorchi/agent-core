@@ -11,8 +11,7 @@ import {
   rememberPrompt,
   navigatePromptHistory,
   emptyPromptHistory,
-  createQueue,
-  updateQueue
+  queuePanel
 } from '@agent-core/tui';
 import { FileDraftStorage } from '@agent-core/tui/node';
 import { textAreaReducer } from '@ismail-elkorchi/terminal-ui/behavior';
@@ -85,23 +84,22 @@ test('queue revision preserves native input, and a claimed input cannot be retur
       changes.push({ id, change });
     }
   };
-  let state = createQueue(operations, 'session').state;
-  state = updateQueue(
+  const queue = queuePanel(operations, 'session');
+  let state = queue.init().state;
+  state = queue.update(
     state,
     { type: 'queue.loaded', id: state.id, submissions: [submission] },
-    operations
   ).state;
-  state = updateQueue(
+  state = queue.update(
     state,
     { type: 'queue.select', submissionId: submission.submissionId },
-    operations
   ).state;
-  const result = updateQueue(state, { type: 'queue.save' }, operations);
+  const result = queue.update(state, { type: 'queue.save' });
   await result.effects[0].run({ signal: new AbortController().signal });
   assert.deepEqual(changes[0].change.input.images, [attachment.image]);
   assert.deepEqual(changes[0].change.expectedInput, input);
   claimed = true;
-  const withdraw = updateQueue(state, { type: 'queue.withdraw' }, operations);
+  const withdraw = queue.update(state, { type: 'queue.withdraw' });
   await assert.rejects(
     withdraw.effects[0].run({ signal: new AbortController().signal }),
     /no longer queued/

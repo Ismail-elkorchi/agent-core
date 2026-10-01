@@ -16,7 +16,6 @@ import {
   searchPickerView,
   textAreaReducer,
   textInputReducer,
-  textInputState,
   type SearchPickerControlTransition,
   type TextAreaState,
   type TextAreaTransition,
@@ -33,7 +32,7 @@ import {
 } from '@ismail-elkorchi/terminal-ui/components';
 import { column, flow, viewport } from '@ismail-elkorchi/terminal-ui/layout';
 import { textDocumentText, type TextEditBuffer } from '@ismail-elkorchi/terminal-ui/text';
-import type { TuiEffect } from '@ismail-elkorchi/terminal-ui/tui';
+import type { TuiChildDefinition, TuiEffect } from '@ismail-elkorchi/terminal-ui/tui';
 import { copySource } from './copy.js';
 import { diagnosticMessage } from './diagnostics.js';
 import { panel } from './panel.js';
@@ -79,6 +78,7 @@ export interface ConfigurationState {
 }
 
 export type ConfigurationMessage =
+  | { readonly type: 'configuration.close' }
   | { readonly type: 'configuration.open-browser' }
   | { readonly type: 'configuration.scroll'; readonly offset: number }
   | { readonly type: 'configuration.copy'; readonly target: 'url' | 'code' }
@@ -131,7 +131,7 @@ export type ConfigurationMessage =
       readonly freshContinuationAvailable?: boolean;
     };
 
-export function configurationState(
+function configurationState(
   selection: ModelSelection | undefined,
   providers: ConfigurationOperations['providers']
 ): ConfigurationState {
@@ -150,7 +150,7 @@ export function configurationState(
   };
 }
 
-export function updateConfiguration(
+function updateConfiguration(
   state: ConfigurationState,
   message: ConfigurationMessage,
   operations: ConfigurationOperations
@@ -186,6 +186,8 @@ function reduceConfiguration(
   if ('id' in message && message.id !== state.id) return { state };
   if ('request' in message && message.request !== state.pending) return { state };
   switch (message.type) {
+    case 'configuration.close':
+      return { state };
     case 'configuration.scroll':
       return { state: { ...state, offset: message.offset } };
     case 'configuration.notice':
@@ -671,13 +673,13 @@ function configurationIndex(state: ConfigurationState, operations: Configuration
   return createSearchPickerIndex(items.map((item) => ({ ...item, value: item.id })));
 }
 
-export function configurationView(
+function configurationView(
   state: ConfigurationState,
   operations: ConfigurationOperations,
   width: number,
   height: number
-): Element<ConfigurationMessage | { readonly type: 'overlay.close' }> {
-  type Message = ConfigurationMessage | { readonly type: 'overlay.close' };
+): Element<ConfigurationMessage> {
+  type Message = ConfigurationMessage;
   const action = (id: string, label: string, message: Message) =>
     button({ id, label, onPress: () => message });
   const editing =
@@ -709,7 +711,7 @@ export function configurationView(
             ? [
                 passwordInput<Message>({
                   id: 'configuration-secret',
-                  state: textInputState(state.secret),
+                  state: state.secret,
                   onTransition: (transition) => ({ type: 'configuration.secret', transition })
                 })
               ]
@@ -810,23 +812,19 @@ export function configurationView(
                         button({
                           id: 'configuration-fresh',
                           label: 'Continue fresh in this session',
-                          ...(state.pending === undefined
-                            ? {
-                                onPress: (): Message => ({
-                                  type: 'configuration.save',
-                                  continuation: 'fresh'
-                                })
-                              }
-                            : { disabled: true })
+                          disabled: state.pending !== undefined,
+                          onPress: (): Message => ({
+                            type: 'configuration.save',
+                            continuation: 'fresh'
+                          })
                         })
                       ]
                     : []),
                   button({
                     id: 'configuration-save',
                     label: 'Save',
-                    ...(state.pending === undefined
-                      ? { onPress: (): Message => ({ type: 'configuration.save' }) }
-                      : { disabled: true })
+                    disabled: state.pending !== undefined,
+                    onPress: (): Message => ({ type: 'configuration.save' })
                   })
                 ],
                 { direction: 'horizontal' }
@@ -866,7 +864,7 @@ export function configurationView(
           : choices
             ? 'configuration-picker'
             : 'configuration-save',
-    onClose: (): Message => ({ type: 'overlay.close' }),
+    onClose: (): Message => ({ type: 'configuration.close' }),
     slots: {
       content: column(
         [
@@ -931,5 +929,27 @@ function retainReasoningOptions(
     ...(next.strategy === 'effort' && previous.strategy === 'effort' && previous.mode !== undefined
       ? { mode: previous.mode }
       : {})
+  };
+}
+
+export function configurationPanel(
+  selection: () => ModelSelection | undefined,
+  operations: ConfigurationOperations
+): TuiChildDefinition<ConfigurationState, ConfigurationMessage, 'close' | 'saved'> {
+  return {
+    init: () => ({ state: configurationState(selection(), operations.providers) }),
+    update: (state, message) =>
+      message.type === 'configuration.close'
+        ? { state, outputs: ['close'] }
+        : message.type === 'configuration.saved' && message.id === state.id
+          ? { state, outputs: ['saved'] }
+          : updateConfiguration(state, message, operations),
+    view: (state, context) =>
+      configurationView(
+        state,
+        operations,
+        Math.max(5, Math.min(84, context.terminalSize.columns - 4)),
+        Math.max(4, Math.min(24, context.terminalSize.rows - 4))
+      )
   };
 }

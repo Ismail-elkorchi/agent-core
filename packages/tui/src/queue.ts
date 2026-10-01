@@ -12,7 +12,11 @@ import {
 import { button, text, textArea, type Element } from '@ismail-elkorchi/terminal-ui/components';
 import { column, flow, viewport } from '@ismail-elkorchi/terminal-ui/layout';
 import { textCaretAt, textDocumentText } from '@ismail-elkorchi/terminal-ui/text';
-import type { TuiEffect, TuiUpdateResult } from '@ismail-elkorchi/terminal-ui/tui';
+import type {
+  TuiChildDefinition,
+  TuiChildResult,
+  TuiEffect
+} from '@ismail-elkorchi/terminal-ui/tui';
 import { diagnosticMessage } from './diagnostics.js';
 import { panel } from './panel.js';
 
@@ -20,7 +24,11 @@ export interface QueueOperations {
   readPendingSubmissions(): Promise<readonly SessionPendingSubmission[]>;
   updateQueuedSubmission(id: string, change: SessionQueuedSubmissionChange): Promise<void>;
 }
-export type QueueState = { readonly id: string; readonly sessionId: string; readonly offset: number } & (
+export type QueueState = {
+  readonly id: string;
+  readonly sessionId: string;
+  readonly offset: number;
+} & (
   | { readonly stage: 'loading' }
   | { readonly stage: 'list'; readonly submissions: readonly SessionPendingSubmission[] }
   | {
@@ -32,6 +40,7 @@ export type QueueState = { readonly id: string; readonly sessionId: string; read
   | { readonly stage: 'failed'; readonly error: string }
 );
 export type QueueMessage =
+  | { readonly type: 'queue.close' }
   | { readonly type: 'queue.refresh' }
   | {
       readonly type: 'queue.loaded';
@@ -54,20 +63,22 @@ export type QueueMessage =
       readonly input: SessionSubmissionInput;
     }
   | { readonly type: 'queue.scroll'; readonly offset: number };
-export function createQueue(
+function createQueue(
   operations: QueueOperations,
   sessionId: string
-): TuiUpdateResult<QueueState, QueueMessage> {
+): TuiChildResult<QueueState, QueueMessage> {
   const state: QueueState = { id: crypto.randomUUID(), sessionId, offset: 0, stage: 'loading' };
   return { state, effects: [load(state.id, operations)] };
 }
-export function updateQueue(
+function updateQueue(
   state: QueueState,
   message: QueueMessage,
   operations: QueueOperations
-): TuiUpdateResult<QueueState, QueueMessage> {
+): TuiChildResult<QueueState, QueueMessage> {
   if ('id' in message && message.id !== state.id) return { state };
   switch (message.type) {
+    case 'queue.close':
+      return { state };
     case 'queue.refresh':
       if (state.stage === 'saving') return { state };
       return {
@@ -89,13 +100,21 @@ export function updateQueue(
         state:
           state.stage === 'saving'
             ? { ...state, stage: 'editing', error: message.error }
-            : { id: state.id, sessionId: state.sessionId, stage: 'failed', error: message.error, offset: 0 }
+            : {
+                id: state.id,
+                sessionId: state.sessionId,
+                stage: 'failed',
+                error: message.error,
+                offset: 0
+              }
       };
     case 'queue.scroll':
       return { state: { ...state, offset: message.offset } };
     case 'queue.select': {
       if (state.stage !== 'list') return { state };
-      const submission = state.submissions.find((entry) => entry.submissionId === message.submissionId);
+      const submission = state.submissions.find(
+        (entry) => entry.submissionId === message.submissionId
+      );
       if (submission?.state !== 'queued') return { state };
       return {
         state: {
@@ -172,15 +191,19 @@ export function updateQueue(
       };
     }
     case 'queue.withdrawn':
-      return { state };
+      return {
+        state: {
+          id: state.id,
+          sessionId: state.sessionId,
+          offset: 0,
+          stage: 'list',
+          submissions: []
+        }
+      };
   }
 }
-export function queueView(
-  state: QueueState,
-  width: number,
-  height: number
-): Element<QueueMessage | { readonly type: 'overlay.close' }> {
-  type Message = QueueMessage | { readonly type: 'overlay.close' };
+function queueView(state: QueueState, width: number, height: number): Element<QueueMessage> {
+  type Message = QueueMessage;
   let content: Element<Message>;
   if (state.stage === 'loading') content = text({ content: 'Loading accepted inputs…' });
   else if (state.stage === 'failed') content = text({ content: state.error });
@@ -196,9 +219,8 @@ export function queueView(
         button<Message>({
           id: `queued:${submission.submissionId}`,
           label: `${submission.state} · ${submission.input.task}`,
-          ...(submission.state !== 'queued'
-            ? { disabled: true }
-            : { onPress: (): Message => ({ type: 'queue.select', submissionId: submission.submissionId }) })
+          disabled: submission.state !== 'queued',
+          onPress: (): Message => ({ type: 'queue.select', submissionId: submission.submissionId })
         })
       )
     ]);
@@ -215,30 +237,30 @@ export function queueView(
           meta: { accessibleName: 'Queued input text' },
           state: state.input,
           readOnly: state.stage === 'saving',
-          onTransition: (transition: TextAreaTransition): Message => ({ type: 'queue.edit', transition })
+          onTransition: (transition: TextAreaTransition): Message => ({
+            type: 'queue.edit',
+            transition
+          })
         }),
         flow(
           [
             button<Message>({
               id: 'queue-save',
               label: 'Save',
-              ...(state.stage === 'saving'
-                ? { disabled: true }
-                : { onPress: (): Message => ({ type: 'queue.save' }) })
+              disabled: state.stage === 'saving',
+              onPress: (): Message => ({ type: 'queue.save' })
             }),
             button<Message>({
               id: 'queue-cancel',
               label: 'Cancel input',
-              ...(state.stage === 'saving'
-                ? { disabled: true }
-                : { onPress: (): Message => ({ type: 'queue.cancel' }) })
+              disabled: state.stage === 'saving',
+              onPress: (): Message => ({ type: 'queue.cancel' })
             }),
             button<Message>({
               id: 'queue-withdraw',
               label: 'Return to draft',
-              ...(state.stage === 'saving'
-                ? { disabled: true }
-                : { onPress: (): Message => ({ type: 'queue.withdraw' }) })
+              disabled: state.stage === 'saving',
+              onPress: (): Message => ({ type: 'queue.withdraw' })
             })
           ],
           { direction: 'horizontal' }
@@ -251,7 +273,7 @@ export function queueView(
     title: 'Pending inputs',
     width,
     height,
-    onClose: () => ({ type: 'overlay.close' }),
+    onClose: () => ({ type: 'queue.close' }),
     slots: {
       content: viewport(content, {
         id: 'queue-viewport',
@@ -262,9 +284,8 @@ export function queueView(
       actions: button({
         id: 'queue-refresh',
         label: 'Refresh',
-        ...(state.stage === 'saving'
-          ? { disabled: true }
-          : { onPress: (): Message => ({ type: 'queue.refresh' }) })
+        disabled: state.stage === 'saving',
+        onPress: (): Message => ({ type: 'queue.refresh' })
       })
     }
   });
@@ -282,5 +303,41 @@ function load(id: string, operations: QueueOperations): TuiEffect<QueueMessage> 
       kind: 'message',
       message: { type: 'queue.failed', operation: 'read', id, error: diagnosticMessage(diagnostic) }
     })
+  };
+}
+
+export type QueueOutput =
+  | { readonly kind: 'close' }
+  | {
+      readonly kind: 'withdrawn';
+      readonly message: Extract<QueueMessage, { readonly type: 'queue.withdrawn' }>;
+    }
+  | { readonly kind: 'failed'; readonly error: string };
+
+export function queuePanel(
+  operations: QueueOperations,
+  sessionId: string
+): TuiChildDefinition<QueueState, QueueMessage, QueueOutput> {
+  return {
+    init: () => createQueue(operations, sessionId),
+    update: (state, message) => {
+      if ('id' in message && message.id !== state.id) return { state };
+      const result = updateQueue(state, message, operations);
+      const outputs: readonly QueueOutput[] =
+        message.type === 'queue.close'
+          ? [{ kind: 'close' }]
+          : message.type === 'queue.withdrawn'
+            ? [{ kind: 'withdrawn', message }]
+            : message.type === 'queue.failed' && message.operation === 'change'
+              ? [{ kind: 'failed', error: message.error }]
+              : [];
+      return { ...result, outputs };
+    },
+    view: (state, context) =>
+      queueView(
+        state,
+        Math.max(5, Math.min(84, context.terminalSize.columns - 4)),
+        Math.max(4, Math.min(24, context.terminalSize.rows - 4))
+      )
   };
 }

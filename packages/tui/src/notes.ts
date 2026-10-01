@@ -7,7 +7,7 @@ import {
 } from '@ismail-elkorchi/terminal-ui/behavior';
 import { button, text, textArea, type Element } from '@ismail-elkorchi/terminal-ui/components';
 import { column, row, viewport } from '@ismail-elkorchi/terminal-ui/layout';
-import type { TuiEffect } from '@ismail-elkorchi/terminal-ui/tui';
+import type { TuiChildDefinition, TuiEffect } from '@ismail-elkorchi/terminal-ui/tui';
 import { diagnosticMessage } from './diagnostics.js';
 import { panel } from './panel.js';
 
@@ -20,6 +20,7 @@ export interface NoteReader {
   }): Promise<NoteReadResult>;
 }
 export type NotesMessage =
+  | { readonly type: 'notes.close' }
   | { readonly type: 'notes.open'; readonly cursor?: string }
   | { readonly type: 'notes.listed'; readonly requestId: string; readonly page: NoteQueryResult }
   | {
@@ -43,12 +44,14 @@ export interface NotesState {
   readonly offset: number;
 }
 
-export function updateNotes(
+function updateNotes(
   state: NotesState,
   message: NotesMessage,
   reader: NoteReader
 ): { readonly state: NotesState; readonly effects?: readonly TuiEffect<NotesMessage>[] } {
   switch (message.type) {
+    case 'notes.close':
+      return { state };
     case 'notes.open':
     case 'notes.read': {
       const requestId = crypto.randomUUID();
@@ -63,7 +66,11 @@ export function updateNotes(
                 kind: 'message',
                 message:
                   message.type === 'notes.open'
-                    ? { type: 'notes.listed', requestId, page: await reader.listNotes(message.cursor) }
+                    ? {
+                        type: 'notes.listed',
+                        requestId,
+                        page: await reader.listNotes(message.cursor)
+                      }
                     : { type: 'notes.loaded', requestId, result: await reader.readNote(message) }
               };
             },
@@ -92,7 +99,10 @@ export function updateNotes(
                     },
                     offset: 0
                   }
-                : { error: `Note content ${message.result.status.replaceAll('_', ' ')}.`, offset: 0 }
+                : {
+                    error: `Note content ${message.result.status.replaceAll('_', ' ')}.`,
+                    offset: 0
+                  }
           };
     case 'notes.failed':
       return message.requestId !== state.requestId
@@ -115,16 +125,13 @@ export function updateNotes(
   }
 }
 
-export function notesView<Message extends NotesMessage | { readonly type: 'overlay.close' }>(
-  state: NotesState,
-  width: number,
-  height: number,
-  map: (message: NotesMessage | { readonly type: 'overlay.close' }) => Message
-): Element<Message> {
+function notesView(state: NotesState, width: number, height: number): Element<NotesMessage> {
   const source = state.source;
-  const children: Element<Message>[] = [];
-  if (state.requestId !== undefined) children.push(text({ content: 'Reading model-authored notes…' }));
-  if (state.error !== undefined && source === undefined) children.push(text({ content: state.error }));
+  const children: Element<NotesMessage>[] = [];
+  if (state.requestId !== undefined)
+    children.push(text({ content: 'Reading model-authored notes…' }));
+  if (state.error !== undefined && source === undefined)
+    children.push(text({ content: state.error }));
   if (source !== undefined) {
     const { revision, offset, nextOffset, totalBytes, truncated } = source.result;
     children.push(
@@ -133,31 +140,33 @@ export function notesView<Message extends NotesMessage | { readonly type: 'overl
       })
     );
     children.push(
-      textArea<Message>({
+      textArea<NotesMessage>({
         id: 'model-note-source',
         meta: { accessibleName: 'Exact model note content' },
         state: source.input,
         readOnly: true,
         wrap: true,
         scrollbar: { axis: 'vertical', visible: 'auto' },
-        onTransition: (transition: TextAreaTransition) => map({ type: 'notes.edit', transition })
+        onTransition: (transition: TextAreaTransition): NotesMessage => ({
+          type: 'notes.edit',
+          transition
+        })
       })
     );
     children.push(
       row([
-        button({ id: 'notes-back', label: 'Note list', onPress: () => map({ type: 'notes.open' }) }),
+        button({ id: 'notes-back', label: 'Note list', onPress: () => ({ type: 'notes.open' }) }),
         ...(truncated
           ? [
               button({
                 id: 'notes-next-content',
                 label: 'Next content chunk',
-                onPress: () =>
-                  map({
-                    type: 'notes.read',
-                    noteId: revision.noteId,
-                    revisionId: revision.revisionId,
-                    offset: nextOffset
-                  })
+                onPress: () => ({
+                  type: 'notes.read',
+                  noteId: revision.noteId,
+                  revisionId: revision.revisionId,
+                  offset: nextOffset
+                })
               })
             ]
           : [])
@@ -169,8 +178,11 @@ export function notesView<Message extends NotesMessage | { readonly type: 'overl
         button({
           id: `note:${revision.noteId}`,
           label: `${revision.title} · ${revision.authorId} · ${revision.revisionId}`,
-          onPress: () =>
-            map({ type: 'notes.read', noteId: revision.noteId, revisionId: revision.revisionId })
+          onPress: () => ({
+            type: 'notes.read',
+            noteId: revision.noteId,
+            revisionId: revision.revisionId
+          })
         })
       );
     const cursor = state.page?.cursor;
@@ -179,7 +191,7 @@ export function notesView<Message extends NotesMessage | { readonly type: 'overl
         button({
           id: 'notes-next-page',
           label: 'Next notes page',
-          onPress: () => map({ type: 'notes.open', cursor })
+          onPress: () => ({ type: 'notes.open', cursor })
         })
       );
     children.push(
@@ -215,16 +227,35 @@ export function notesView<Message extends NotesMessage | { readonly type: 'overl
         ? {}
         : { focusId: `note:${state.page.items[0].noteId}` }
       : { focusId: 'model-note-source' }),
-    onClose: () => map({ type: 'overlay.close' }),
+    onClose: () => ({ type: 'notes.close' }),
     slots: {
       content:
         source === undefined
           ? viewport(content, {
               id: 'model-notes-list',
               offset: { row: state.offset },
-              onScroll: (request) => map({ type: 'notes.scroll', offset: request.nextState.offsetRow })
+              onScroll: (request) => ({ type: 'notes.scroll', offset: request.nextState.offsetRow })
             })
           : content
     }
   });
+}
+
+/** Local note inspection, including read ownership and close intent. */
+export function notesPanel(
+  reader: NoteReader
+): TuiChildDefinition<NotesState, NotesMessage, 'close'> {
+  return {
+    init: () => updateNotes({ offset: 0 }, { type: 'notes.open' }, reader),
+    update: (state, message) =>
+      message.type === 'notes.close'
+        ? { state, outputs: ['close'] }
+        : updateNotes(state, message, reader),
+    view: (state, context) =>
+      notesView(
+        state,
+        Math.max(5, Math.min(84, context.terminalSize.columns - 4)),
+        Math.max(4, Math.min(20, context.terminalSize.rows - 4))
+      )
+  };
 }

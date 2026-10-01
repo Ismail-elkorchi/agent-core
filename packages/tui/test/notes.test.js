@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createMemoryTerminalHost } from '@ismail-elkorchi/terminal-ui/host';
-import { createTuiRuntime, defineTui } from '@ismail-elkorchi/terminal-ui/tui';
+import { createTuiChild, createTuiRuntime, defineTui } from '@ismail-elkorchi/terminal-ui/tui';
 import { textDocumentText } from '@ismail-elkorchi/terminal-ui/text';
-import { notesView, updateNotes } from '@agent-core/tui';
+import { notesPanel } from '@agent-core/tui';
 
 async function waitFor(predicate) {
   for (let i = 0; i < 500; i++) {
@@ -45,33 +45,34 @@ for (const columns of [48, 120])
         };
       }
     };
+    const notes = createTuiChild(notesPanel(reader), (child) => ({ type: 'notes', child }));
     const app = defineTui({
       id: 'notes-consumer',
-      init: () => ({ state: { offset: 0 } }),
-      update: (state, message) =>
-        message.type === 'overlay.close' ? { state } : updateNotes(state, message, reader),
-      view: (state, context) => notesView(state, context.terminalSize.columns - 4, 20, (message) => message)
+      init: (context) => notes.init({ id: 'notes', generation: 1 }, context),
+      update: (state, message, context) => notes.update(state, message.child, context),
+      view: notes.view
     });
     const host = createMemoryTerminalHost({ terminalSize: { columns, rows: 24 } });
     const runtime = createTuiRuntime({ host, app });
     t.after(() => runtime.dispose());
     await runtime.start();
-    await runtime.dispatch({ type: 'notes.open' });
-    await waitFor(() => runtime.state().page !== undefined);
-    assert.equal(runtime.state().page.coverage, 'partial');
-    await runtime.dispatch({ type: 'notes.open', cursor: runtime.state().page.cursor });
-    await waitFor(() => runtime.state().page?.coverage === 'complete');
-    await runtime.dispatch({ type: 'notes.read', noteId: 'note', revisionId: 'revision' });
-    await waitFor(() => runtime.state().source !== undefined);
-    assert.equal(textDocumentText(runtime.state().source.input.document), source);
-    assert.equal(runtime.state().source.result.revision.authorId, 'model');
-    await runtime.dispatch({
+    const dispatch = (message) =>
+      runtime.dispatch({ type: 'notes', child: { id: 'notes', generation: 1, message } });
+    await waitFor(() => runtime.state().state.page !== undefined);
+    assert.equal(runtime.state().state.page.coverage, 'partial');
+    await dispatch({ type: 'notes.open', cursor: runtime.state().state.page.cursor });
+    await waitFor(() => runtime.state().state.page?.coverage === 'complete');
+    await dispatch({ type: 'notes.read', noteId: 'note', revisionId: 'revision' });
+    await waitFor(() => runtime.state().state.source !== undefined);
+    assert.equal(textDocumentText(runtime.state().state.source.input.document), source);
+    assert.equal(runtime.state().state.source.result.revision.authorId, 'model');
+    await dispatch({
       type: 'notes.read',
       noteId: 'note',
       revisionId: 'revision',
-      offset: runtime.state().source.result.nextOffset
+      offset: runtime.state().state.source.result.nextOffset
     });
-    await waitFor(() => runtime.state().source?.result.truncated === false);
+    await waitFor(() => runtime.state().state.source?.result.truncated === false);
     assert.equal(requests[1].offset, 10);
   });
 
@@ -81,7 +82,10 @@ test('exact-copy requests preserve source through clipboard transport', async ()
   const original = 'a\t文\r\nb';
   const encoded = createClipboardWriteSequence(original, { allowed: true });
   assert.equal(encoded.status, 'encoded');
-  assert.equal(Buffer.from(encoded.sequence.split(';')[2].slice(0, -1), 'base64').toString(), original);
+  assert.equal(
+    Buffer.from(encoded.sequence.split(';')[2].slice(0, -1), 'base64').toString(),
+    original
+  );
   const effect = copySource(original, (message) => ({ type: 'notice', message }));
   const result = await effect.run({
     async copySelectedText({ selection }) {
@@ -90,4 +94,62 @@ test('exact-copy requests preserve source through clipboard transport', async ()
     }
   });
   assert.equal(result.message.message, 'Source sent to clipboard.');
+});
+
+test('two notes instances own independent reads, identities and removal', async (t) => {
+  const { column } = await import('@ismail-elkorchi/terminal-ui/layout');
+  const pending = [];
+  const child = createTuiChild(
+    notesPanel({
+      listNotes: () => new Promise((resolve) => pending.push(resolve)),
+      readNote: async () => {
+        throw new Error('Unexpected read');
+      }
+    }),
+    (child) => ({ type: 'child', child })
+  );
+  const runtime = createTuiRuntime({
+    host: createMemoryTerminalHost({ terminalSize: { columns: 100, rows: 30 } }),
+    app: defineTui({
+      id: 'two-notes',
+      init(context) {
+        const left = child.init({ id: 'left', generation: 1 }, context);
+        const right = child.init({ id: 'right', generation: 1 }, context);
+        return {
+          state: { left: left.state, right: right.state },
+          effects: [...left.effects, ...right.effects]
+        };
+      },
+      update(state, message, context) {
+        const current = state[message.child.id];
+        if (current === undefined) return { state };
+        const result = child.update(current, message.child, context);
+        if (result.outputs?.includes('close')) {
+          const next = { ...state };
+          delete next[message.child.id];
+          return { state: next, cancelEffects: child.remove(current) };
+        }
+        return { ...result, state: { ...state, [message.child.id]: result.state } };
+      },
+      view: (state, context) =>
+        column(Object.values(state).map((state) => child.view(state, context)))
+    })
+  });
+  t.after(() => runtime.dispose());
+  await runtime.start();
+  await waitFor(() => pending.length === 2);
+  assert.notEqual(
+    child.elementId(runtime.state().left, 'model-notes'),
+    child.elementId(runtime.state().right, 'model-notes')
+  );
+  assert.notDeepEqual(runtime.state().left.effectIds, runtime.state().right.effectIds);
+  await runtime.dispatch({
+    type: 'child',
+    child: { id: 'left', generation: 1, message: { type: 'notes.close' } }
+  });
+  pending[0]({ items: [revision], coverage: 'complete' });
+  pending[1]({ items: [], coverage: 'complete' });
+  await waitFor(() => runtime.state().right.state.page !== undefined);
+  assert.equal(runtime.state().left, undefined);
+  assert.deepEqual(runtime.state().right.state.page.items, []);
 });

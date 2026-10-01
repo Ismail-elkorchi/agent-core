@@ -1,7 +1,7 @@
 export { compareText } from './comparison.js';
 export { composerRows } from './composer.js';
 export { diagnosticMessage } from './diagnostics.js';
-export { TuiEventChannel } from './event-channel.js';
+export { applicationEventSource } from './event-source.js';
 export {
   MarkdownDocument,
   markdownInlineContent,
@@ -13,19 +13,11 @@ export { providerFailureText, suspensionPresentation } from './recovery.js';
 
 export { copySource, selectedSource } from './copy.js';
 export { historyBookmark, type HistoryBookmark } from './history-bookmark.js';
-export {
-  notesView,
-  updateNotes,
-  type NoteReader,
-  type NotesMessage,
-  type NotesState
-} from './notes.js';
+export { notesPanel, type NoteReader, type NotesMessage, type NotesState } from './notes.js';
 export { RetainedListPresentation } from './retained-list.js';
 
 export {
-  configurationState,
-  configurationView,
-  updateConfiguration,
+  configurationPanel,
   type ConfigurationMessage,
   type ConfigurationOperations,
   type ConfigurationState
@@ -113,9 +105,8 @@ export {
   type PromptRecallState
 } from './prompt-history.js';
 export {
-  createQueue,
-  queueView,
-  updateQueue,
+  queuePanel,
+  type QueueOutput,
   type QueueMessage,
   type QueueOperations,
   type QueueState
@@ -133,10 +124,7 @@ export {
   type ResourceSuggestion
 } from './resource-completion.js';
 export {
-  createSourceInspector,
-  inspectedSource,
-  sourceInspectorView,
-  updateSourceInspector,
+  sourceInspectorPanel,
   type SourceInspector,
   type SourceInspectorMessage
 } from './source-inspector.js';
@@ -174,7 +162,6 @@ export { insertCommand } from './commands.js';
 export { oversizedHistoryEntry } from './conversation.js';
 export type { ConversationReferenceEntry } from './conversation.js';
 
-export { readSourceEntry } from './source-inspector.js';
 export type { HistoryEntryReader } from './source-inspector.js';
 
 export { transitionCommandPicker } from './commands.js';

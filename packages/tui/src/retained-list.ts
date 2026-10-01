@@ -1,6 +1,11 @@
 import type { Element } from '@ismail-elkorchi/terminal-ui/components';
 import type { MeasuredViewportLayout } from '@ismail-elkorchi/terminal-ui/layout';
 import type { MeasuredViewportAnchor } from '@ismail-elkorchi/terminal-ui/interaction';
+import {
+  createMeasuredCollection,
+  measuredAnchorAt
+} from '@ismail-elkorchi/terminal-ui/collection';
+import { adjacentItemId } from '@ismail-elkorchi/terminal-ui/interaction';
 import { MarkdownDocument } from './markdown.js';
 
 interface RetainedElement<Entry, Message> {
@@ -15,19 +20,28 @@ export class RetainedListPresentation<Entry extends { readonly id: string }, Mes
   private readonly documents = new Map<string, MarkdownDocument>();
   private elements = new Map<string, RetainedElement<Entry, Message>>();
   private entries: readonly Entry[] = [];
-  layout: MeasuredViewportLayout = {
+  private measured = createMeasuredCollection<undefined>([]);
+  private currentLayout: MeasuredViewportLayout = {
     entries: [],
     geometry: { contentRows: 0, contentColumns: 0, viewportRows: 0, viewportColumns: 0 },
     scroll: { offsetRow: 0, offsetColumn: 0, followTail: true }
   };
 
-  anchor(offsetRow: number) {
-    const entry = this.layout.entries.find(
-      (item) => item.rowOffset <= offsetRow && item.rowOffset + item.rows > offsetRow
+  get layout(): MeasuredViewportLayout {
+    return this.currentLayout;
+  }
+
+  set layout(layout: MeasuredViewportLayout) {
+    this.currentLayout = layout;
+    this.measured = createMeasuredCollection(
+      layout.entries
+        .filter((entry) => entry.rows > 0)
+        .map((entry) => ({ id: entry.id, value: undefined, rows: entry.rows }))
     );
-    return entry === undefined
-      ? undefined
-      : { itemId: entry.id, rowWithinItem: offsetRow - entry.rowOffset, viewportRow: 0 };
+  }
+
+  anchor(offsetRow: number) {
+    return measuredAnchorAt(this.measured, { offsetRow });
   }
 
   adjacentMessage(
@@ -37,15 +51,21 @@ export class RetainedListPresentation<Entry extends { readonly id: string }, Mes
     const anchor =
       typeof offsetRow === 'object'
         ? offsetRow
-        : this.anchor(offsetRow === 'end' ? Math.max(0, this.layout.geometry.contentRows - 1) : offsetRow);
+        : this.anchor(
+            offsetRow === 'end' ? Math.max(0, this.layout.geometry.contentRows - 1) : offsetRow
+          );
     if (anchor === undefined) return undefined;
-    const index = this.entries.findIndex((entry) => entry.id === anchor.itemId);
-    const destination =
-      direction === 'previous' && anchor.rowWithinItem > 0
-        ? index
-        : index + (direction === 'previous' ? -1 : 1);
-    const entry = this.entries[destination];
-    return entry === undefined ? undefined : { itemId: entry.id, rowWithinItem: 0, viewportRow: 0 };
+    if (direction === 'previous' && anchor.rowWithinItem > 0)
+      return { itemId: anchor.itemId, rowWithinItem: 0, viewportRow: 0 };
+    const id = adjacentItemId(
+      this.entries.map((entry) => entry.id),
+      anchor.itemId,
+      direction === 'previous' ? -1 : 1
+    );
+    // Reaching an edge asks the application to load another history page.
+    return id === undefined || id === anchor.itemId
+      ? undefined
+      : { itemId: id, rowWithinItem: 0, viewportRow: 0 };
   }
 
   markdown(id: string, source: string): MarkdownDocument {

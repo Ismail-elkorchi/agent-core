@@ -26,6 +26,8 @@ import {
   type ConversationEntry,
   type ConversationReferenceEntry
 } from './conversation.js';
+import type { TuiChildDefinition } from '@ismail-elkorchi/terminal-ui/tui';
+import { copySource } from './copy.js';
 import { MarkdownDocument } from './markdown.js';
 import { panel } from './panel.js';
 
@@ -42,7 +44,7 @@ export interface SourceInspector {
   readonly notice?: string;
 }
 export type SourceInspectorMessage =
-  | { readonly type: 'inspector.open' }
+  | { readonly type: 'inspector.close' }
   | { readonly type: 'inspector.read' }
   | {
       readonly type: 'inspector.loaded';
@@ -76,20 +78,22 @@ const label = (entry: ConversationEntry) =>
       ?.slice(0, 90) ?? '(empty)'
   }`;
 const index = (entries: readonly ConversationEntry[]) =>
-  createSearchPickerIndex(entries.map((entry) => ({ id: entry.id, label: label(entry), value: entry })));
-export function createSourceInspector(entries: readonly ConversationEntry[]): SourceInspector {
+  createSearchPickerIndex(
+    entries.map((entry) => ({ id: entry.id, label: label(entry), value: entry }))
+  );
+function createSourceInspector(entries: readonly ConversationEntry[]): SourceInspector {
   return {
     id: crypto.randomUUID(),
     entries,
     picker: createSearchPickerState({ query: { text: '', mode: 'fuzzy' } }, index(entries))
   };
 }
-export function updateSourceInspector(
+function updateSourceInspector(
   state: SourceInspector,
   message: SourceInspectorMessage
 ): SourceInspector {
   switch (message.type) {
-    case 'inspector.open':
+    case 'inspector.close':
     case 'inspector.copy':
     case 'inspector.read':
       return state;
@@ -145,7 +149,8 @@ export function updateSourceInspector(
       const selected = state.selected;
       if (selected === undefined) return state;
       const { document } = selected;
-      const block = typeof message.format === 'number' ? document.codeBlocks()[message.format] : undefined;
+      const block =
+        typeof message.format === 'number' ? document.codeBlocks()[message.format] : undefined;
       const value =
         message.format === 'original'
           ? document.source
@@ -163,15 +168,15 @@ export function updateSourceInspector(
     }
   }
 }
-export function inspectedSource(state: SourceInspector): string | undefined {
+function inspectedSource(state: SourceInspector): string | undefined {
   return state.selected === undefined ? undefined : textDocumentText(state.selected.input.document);
 }
-export function sourceInspectorView(
+function sourceInspectorView(
   state: SourceInspector,
   width: number,
   height: number
-): Element<SourceInspectorMessage | { readonly type: 'overlay.close' }> {
-  type Message = SourceInspectorMessage | { readonly type: 'overlay.close' };
+): Element<SourceInspectorMessage> {
+  type Message = SourceInspectorMessage;
   const selected = state.selected;
   const blocks = selected?.document.codeBlocks() ?? [];
   const codeIndex = typeof selected?.format === 'number' ? selected.format : -1;
@@ -196,7 +201,7 @@ export function sourceInspectorView(
     width,
     height,
     focusId: selected === undefined ? 'source-entries' : 'source-inspector-text',
-    onClose: () => ({ type: 'overlay.close' }),
+    onClose: () => ({ type: 'inspector.close' }),
     slots: {
       content:
         selected === undefined
@@ -288,7 +293,7 @@ export type HistoryEntryReader = (
   boundary: import('@agent-core/runtime').SessionBranchBoundary,
   entryId: string
 ) => Promise<import('@agent-core/runtime').SessionBranchEntry>;
-export function readSourceEntry(
+function readSourceEntry(
   inspector: SourceInspector,
   reference: ConversationReferenceEntry,
   read: HistoryEntryReader
@@ -318,5 +323,52 @@ export function readSourceEntry(
         message: diagnostic.message
       }
     })
+  };
+}
+
+export function sourceInspectorPanel(
+  entries: readonly ConversationEntry[],
+  reader?: HistoryEntryReader,
+  selectedId?: string
+): TuiChildDefinition<SourceInspector, SourceInspectorMessage, 'close'> {
+  return {
+    init: () => {
+      const state = createSourceInspector(entries);
+      return {
+        state:
+          selectedId === undefined
+            ? state
+            : updateSourceInspector(state, { type: 'inspector.pick', id: selectedId })
+      };
+    },
+    update: (state, message) => {
+      if (message.type === 'inspector.close') return { state, outputs: ['close'] };
+      if (message.type === 'inspector.copy') {
+        const source = inspectedSource(state);
+        return source === undefined
+          ? { state }
+          : {
+              state,
+              effects: [
+                copySource(source, (message): SourceInspectorMessage => ({
+                  type: 'inspector.notice',
+                  message
+                }))
+              ]
+            };
+      }
+      if (message.type === 'inspector.read' && state.selected?.entry.kind === 'reference') {
+        return reader === undefined
+          ? { state: { ...state, notice: 'Explicit history reads are unavailable.' } }
+          : { state, effects: [readSourceEntry(state, state.selected.entry, reader)] };
+      }
+      return { state: updateSourceInspector(state, message) };
+    },
+    view: (state, context) =>
+      sourceInspectorView(
+        state,
+        Math.max(5, Math.min(84, context.terminalSize.columns - 4)),
+        Math.max(4, Math.min(24, context.terminalSize.rows - 4))
+      )
   };
 }

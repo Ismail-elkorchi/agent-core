@@ -13,9 +13,7 @@ import {
   completeCommand,
   insertCommand,
   reconcileConversationEntries,
-  createSourceInspector,
-  updateSourceInspector,
-  inspectedSource,
+  sourceInspectorPanel,
   createDraft,
   draftSubmission,
   sameDraft
@@ -229,16 +227,16 @@ test('recorded tool calls anchor uncommitted reasoning and completed output wins
 
 test('source inspection addresses old messages and individual code blocks without altering literal source', () => {
   const source = '```ts\r\n\tconst value = 1;\r\n```\r\n\n```sh\nexit 0\n```\n';
-  let inspector = createSourceInspector([
+  const panel = sourceInspectorPanel([
     { id: 'old', kind: 'assistant', turnId: 'turn', text: source, status: 'complete' },
     { id: 'new', kind: 'user', text: 'Later request' }
   ]);
-  inspector = updateSourceInspector(inspector, { type: 'inspector.pick', id: 'old' });
-  assert.equal(inspectedSource(inspector), source);
-  inspector = updateSourceInspector(inspector, { type: 'inspector.format', format: 0, width: 48 });
-  assert.equal(inspectedSource(inspector), '\tconst value = 1;\r\n');
-  inspector = updateSourceInspector(inspector, { type: 'inspector.format', format: 1, width: 48 });
-  assert.equal(inspectedSource(inspector), 'exit 0\n');
+  let inspector = panel.update(panel.init().state, { type: 'inspector.pick', id: 'old' }).state;
+  assert.equal(textDocumentText(inspector.selected.input.document), source);
+  inspector = panel.update(inspector, { type: 'inspector.format', format: 0, width: 48 }).state;
+  assert.equal(textDocumentText(inspector.selected.input.document), '\tconst value = 1;\r\n');
+  inspector = panel.update(inspector, { type: 'inspector.format', format: 1, width: 48 }).state;
+  assert.equal(textDocumentText(inspector.selected.input.document), 'exit 0\n');
 });
 
 test('current and recovered drafts retain metadata across restart and session names stay separate', async (t) => {

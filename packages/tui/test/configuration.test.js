@@ -4,8 +4,12 @@ import { createMemoryTerminalHost } from '@ismail-elkorchi/terminal-ui/host';
 import { createTuiRuntime, defineTui } from '@ismail-elkorchi/terminal-ui/tui';
 import { text } from '@ismail-elkorchi/terminal-ui/components';
 import { renderFramePlain } from '@ismail-elkorchi/terminal-ui/renderer';
-import { configurationState, configurationView, updateConfiguration } from '@agent-core/tui';
+import { configurationPanel } from '@agent-core/tui';
 import { parseModelProfile } from '@agent-core/model';
+
+const configurationState = (selection, providers) => configurationPanel(() => selection, { providers }).init().state;
+const updateConfiguration = (state, message, operations) => configurationPanel(() => undefined, operations).update(state, message);
+const configurationView = (state, operations, width, height) => configurationPanel(() => undefined, operations).view(state, { terminalSize: { columns: width + 4, rows: height + 4 } });
 
 const profile = parseModelProfile({
   id: 'available-model',
@@ -101,7 +105,7 @@ test('a neutral consumer discovers, reviews and saves a model without typing its
       id: 'neutral-configuration',
       init: () => ({ state: configurationState(undefined, operations.providers) }),
       update: (state, message) =>
-        message.type === 'overlay.close'
+        message.type === 'configuration.close'
           ? { state, exit: { reason: 'closed' } }
           : updateConfiguration(state, message, operations),
       view: (state) => configurationView(state, operations, 76, 20)
