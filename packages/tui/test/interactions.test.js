@@ -28,6 +28,7 @@ import {
 } from '@agent-core/tui';
 import {
   createSearchPickerIndex,
+  querySearchPickerIndex,
   createSearchPickerState,
   searchPickerView
 } from '@ismail-elkorchi/terminal-ui/behavior';
@@ -154,7 +155,7 @@ test('exact command names win over prefixes without resetting a deliberate highl
     value: command.name
   }));
   let picker = transitionCommandPicker(
-    createSearchPickerState({}, index),
+    createSearchPickerState({ queryResult: querySearchPickerIndex(index) }, index),
     { kind: 'setQuery', query: { text: 'status', mode: 'fuzzy' } },
     index,
     commands

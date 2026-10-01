@@ -3,6 +3,9 @@ import {
   createSearchPickerState,
   createTextAreaState,
   searchPickerReducer,
+  prepareSearchPickerQuery,
+  type SearchPickerIndex,
+  type SearchPickerQueryResult,
   searchPickerView,
   textAreaReducer,
   type SearchPickerControlTransition,
@@ -26,15 +29,24 @@ import {
   type ConversationEntry,
   type ConversationReferenceEntry
 } from './conversation.js';
-import type { TuiChildDefinition } from '@ismail-elkorchi/terminal-ui/tui';
+import {
+  createTuiPreparedQuery,
+  type TuiChildDefinition,
+  type TuiChildResult,
+  type TuiPreparedQueryMessage,
+  type TuiPreparedQueryState
+} from '@ismail-elkorchi/terminal-ui/tui';
 import { copySource } from './copy.js';
 import { MarkdownDocument } from './markdown.js';
 import { panel } from './panel.js';
+import { diagnosticMessage } from './diagnostics.js';
 
 export interface SourceInspector {
   readonly id: string;
   readonly entries: readonly ConversationEntry[];
   readonly picker: UnscrolledSearchPickerState;
+  readonly searchPickerIndex: SearchPickerIndex<ConversationEntry>;
+  readonly query: TuiPreparedQueryState<SearchPickerQueryResult<ConversationEntry>>;
   readonly selected?: {
     readonly entry: ConversationEntry;
     readonly document: MarkdownDocument;
@@ -45,6 +57,10 @@ export interface SourceInspector {
 }
 export type SourceInspectorMessage =
   | { readonly type: 'inspector.close' }
+  | {
+      readonly type: 'inspector.query';
+      readonly message: TuiPreparedQueryMessage<SearchPickerQueryResult<ConversationEntry>>;
+    }
   | { readonly type: 'inspector.read' }
   | {
       readonly type: 'inspector.loaded';
@@ -82,10 +98,16 @@ const index = (entries: readonly ConversationEntry[]) =>
     entries.map((entry) => ({ id: entry.id, label: label(entry), value: entry }))
   );
 function createSourceInspector(entries: readonly ConversationEntry[]): SourceInspector {
+  const searchPickerIndex = index(entries);
   return {
     id: crypto.randomUUID(),
     entries,
-    picker: createSearchPickerState({ query: { text: '', mode: 'fuzzy' } }, index(entries))
+    searchPickerIndex,
+    query: sourceQuery.init(),
+    picker: createSearchPickerState(
+      { query: { text: '', mode: 'fuzzy' }, queryResult: null },
+      searchPickerIndex
+    )
   };
 }
 function updateSourceInspector(
@@ -93,13 +115,14 @@ function updateSourceInspector(
   message: SourceInspectorMessage
 ): SourceInspector {
   switch (message.type) {
+    case 'inspector.query':
     case 'inspector.close':
     case 'inspector.copy':
     case 'inspector.read':
       return state;
     case 'inspector.loaded': {
       if (message.id !== state.id || state.selected?.entry.id !== message.entryId) return state;
-      const next = { ...createSourceInspector(message.entries), id: state.id };
+      const next = { ...createSourceInspector(message.entries), id: state.id, query: state.query };
       return message.entries[0] === undefined
         ? { ...next, notice: 'This recorded entry has no public conversation source.' }
         : updateSourceInspector(next, { type: 'inspector.pick', id: message.entries[0].id });
@@ -114,7 +137,8 @@ function updateSourceInspector(
       return {
         ...state,
         picker: searchPickerReducer(state.picker, message.transition, {
-          searchPickerIndex: index(state.entries)
+          searchPickerIndex: state.searchPickerIndex,
+          queryResult: state.query.result
         })
       };
     case 'inspector.pick': {
@@ -209,8 +233,9 @@ function sourceInspectorView(
               id: 'source-entries',
               title: 'Messages and tool observations',
               view: searchPickerView(state.picker),
-              searchPickerIndex: index(state.entries),
-              maxVisible: Math.max(1, height - 5),
+              searchPickerIndex: state.searchPickerIndex,
+              queryResult: state.query.result,
+              maxVisible: Math.max(1, height - 5 - (state.query.error === null ? 0 : 1)),
               emptyText: 'No loaded source. Close and load history first.',
               onTransition: (transition): Message => ({ type: 'inspector.transition', transition }),
               onAccept: (event): Message => ({ type: 'inspector.pick', id: event.id })
@@ -253,7 +278,13 @@ function sourceInspectorView(
               }
             ),
       ...(selected === undefined
-        ? {}
+        ? state.query.error === null
+          ? {}
+          : {
+              actions: text({
+                content: `Search failed. Edit the query to retry: ${diagnosticMessage(state.query.error)}`
+              })
+            }
         : {
             actions: column([
               flow(
@@ -326,6 +357,41 @@ function readSourceEntry(
   };
 }
 
+const sourceQuery = createTuiPreparedQuery({
+  id: 'source-query',
+  prepare: (
+    input: {
+      readonly index: SearchPickerIndex<ConversationEntry>;
+      readonly picker: UnscrolledSearchPickerState;
+    },
+    context
+  ) =>
+    prepareSearchPickerQuery(
+      input.index,
+      {
+        text: input.picker.editor.input.text,
+        mode: input.picker.mode,
+        caseSensitive: input.picker.caseSensitive
+      },
+      {
+        signal: context.signal,
+        yield: async () => {
+          await context.clock.sleep(0, context.signal);
+        }
+      }
+    ),
+  toMessage: (message): SourceInspectorMessage => ({ type: 'inspector.query', message })
+});
+function requestSourceQuery(
+  state: SourceInspector
+): TuiChildResult<SourceInspector, SourceInspectorMessage> {
+  const result = sourceQuery.request(state.query, {
+    index: state.searchPickerIndex,
+    picker: state.picker
+  });
+  return { ...result, state: { ...state, query: result.state } };
+}
+
 export function sourceInspectorPanel(
   entries: readonly ConversationEntry[],
   reader?: HistoryEntryReader,
@@ -334,15 +400,34 @@ export function sourceInspectorPanel(
   return {
     init: () => {
       const state = createSourceInspector(entries);
-      return {
-        state:
-          selectedId === undefined
-            ? state
-            : updateSourceInspector(state, { type: 'inspector.pick', id: selectedId })
-      };
+      return requestSourceQuery(
+        selectedId === undefined
+          ? state
+          : updateSourceInspector(state, { type: 'inspector.pick', id: selectedId })
+      );
     },
     update: (state, message) => {
-      if (message.type === 'inspector.close') return { state, outputs: ['close'] };
+      if (message.type === 'inspector.close')
+        return { state, cancelEffects: ['source-query'], outputs: ['close'] };
+      if (message.type === 'inspector.query') {
+        const result = sourceQuery.update(state.query, message.message);
+        if (result.state === state.query) return { state };
+        const activeId = searchPickerView(state.picker).activeId;
+        return {
+          ...result,
+          state: {
+            ...state,
+            query: result.state,
+            picker: searchPickerReducer(
+              state.picker,
+              activeId === undefined
+                ? { kind: 'firstActive' }
+                : { kind: 'setActive', id: activeId },
+              { searchPickerIndex: state.searchPickerIndex, queryResult: result.state.result }
+            )
+          }
+        };
+      }
       if (message.type === 'inspector.copy') {
         const source = inspectedSource(state);
         return source === undefined
@@ -362,7 +447,13 @@ export function sourceInspectorPanel(
           ? { state: { ...state, notice: 'Explicit history reads are unavailable.' } }
           : { state, effects: [readSourceEntry(state, state.selected.entry, reader)] };
       }
-      return { state: updateSourceInspector(state, message) };
+      const next = updateSourceInspector(state, message);
+      return next.searchPickerIndex !== state.searchPickerIndex ||
+        next.picker.editor.input.text !== state.picker.editor.input.text ||
+        next.picker.mode !== state.picker.mode ||
+        next.picker.caseSensitive !== state.picker.caseSensitive
+        ? requestSourceQuery(next)
+        : { state: next };
     },
     view: (state, context) =>
       sourceInspectorView(

@@ -12,11 +12,14 @@ import {
   createSearchPickerIndex,
   createSearchPickerState,
   createTextAreaState,
+  querySearchPickerIndex,
   searchPickerReducer,
   searchPickerView,
   textAreaReducer,
   textInputReducer,
   type SearchPickerControlTransition,
+  type SearchPickerIndex,
+  type SearchPickerQueryResult,
   type TextAreaState,
   type TextAreaTransition,
   type TextInputTransition,
@@ -65,6 +68,8 @@ export interface ConfigurationState {
     | 'reasoning-summary'
     | 'temperature';
   readonly picker: UnscrolledSearchPickerState;
+  readonly pickerIndex: SearchPickerIndex;
+  readonly pickerQueryResult: SearchPickerQueryResult;
   readonly input: TextAreaState;
   readonly secret: TextEditBuffer;
   readonly challenge?: DeviceAuthenticationChallenge;
@@ -135,14 +140,17 @@ function configurationState(
   selection: ModelSelection | undefined,
   providers: ConfigurationOperations['providers']
 ): ConfigurationState {
+  const pickerIndex = createSearchPickerIndex(providers.map((item) => ({ ...item, value: item.id })));
+  const pickerQueryResult = querySearchPickerIndex(pickerIndex, { text: '', mode: 'fuzzy' });
   return {
     id: crypto.randomUUID(),
     offset: 0,
     selection: selection ?? { provider: '', model: '' },
     stage: 'provider',
+    pickerIndex,
+    pickerQueryResult,
     picker: createSearchPickerState(
-      { query: { text: '', mode: 'fuzzy' } },
-      createSearchPickerIndex(providers.map((item) => ({ ...item, value: item.id })))
+      { query: { text: '', mode: 'fuzzy' }, queryResult: pickerQueryResult }, pickerIndex
     ),
     input: createTextAreaState({ value: '' }),
     secret: { text: '', cursor: 0 },
@@ -169,9 +177,14 @@ function updateConfiguration(
     current = editing;
   }
   const result = reduceConfiguration(current, message, operations);
-  return result.state.stage === state.stage
-    ? result
-    : { ...result, state: { ...result.state, offset: 0 } };
+  const next = result.state;
+  const catalogChanged = next.stage !== state.stage || next.models !== state.models
+    || next.profile !== state.profile || next.selection.model !== state.selection.model;
+  const owned = next.pickerIndex === state.pickerIndex && catalogChanged
+    ? replaceConfigurationPicker(next, operations)
+    : next;
+  if (owned.stage !== state.stage) return { ...result, state: { ...owned, offset: 0 } };
+  return owned === result.state ? result : { ...result, state: owned };
 }
 
 function reduceConfiguration(
@@ -285,11 +298,7 @@ function reduceConfiguration(
       const next = { ...state, stage: message.stage, pending: undefined };
       return {
         state: {
-          ...next,
-          picker: createSearchPickerState(
-            { query: { text: '', mode: 'fuzzy' } },
-            configurationIndex(next, operations)
-          ),
+          ...replaceConfigurationPicker(next, operations, true),
           input: createTextAreaState({
             value:
               message.stage === 'temperature'
@@ -308,15 +317,19 @@ function reduceConfiguration(
         cancelEffects: ['model-configuration']
       };
     }
-    case 'configuration.transition':
-      return {
-        state: {
-          ...state,
-          picker: searchPickerReducer(state.picker, message.transition, {
-            searchPickerIndex: configurationIndex(state, operations)
-          })
-        }
-      };
+    case 'configuration.transition': {
+      const picker = searchPickerReducer(state.picker, message.transition, {
+        searchPickerIndex: state.pickerIndex, queryResult: state.pickerQueryResult
+      });
+      const query = { text: picker.editor.input.text, mode: picker.mode, caseSensitive: picker.caseSensitive };
+      const pickerQueryResult = querySearchPickerIndex(state.pickerIndex, query);
+      return { state: {
+        ...state,
+        pickerQueryResult,
+        picker: pickerQueryResult === state.pickerQueryResult ? picker
+          : searchPickerReducer(picker, { kind: 'firstActive' }, { searchPickerIndex: state.pickerIndex, queryResult: pickerQueryResult })
+      } };
+    }
     case 'configuration.edit':
       return { state: { ...state, input: textAreaReducer(state.input, message.transition).state } };
     case 'configuration.refresh':
@@ -325,16 +338,12 @@ function reduceConfiguration(
       if (state.stage === 'provider') {
         const same = state.selection.provider === message.value;
         return discover(
-          {
+          replaceConfigurationPicker({
             ...state,
             selection: same ? state.selection : { provider: message.value, model: '' },
             models: [],
-            stage: 'model',
-            picker: createSearchPickerState(
-              { query: { text: '', mode: 'fuzzy' } },
-              createSearchPickerIndex([])
-            )
-          },
+            stage: 'model'
+          }, operations, true),
           operations
         );
       }
@@ -458,36 +467,12 @@ function reduceConfiguration(
       return describe({ ...state, selection: { ...state.selection, model: value } });
     }
     case 'configuration.catalog':
-      return {
-        state: {
-          ...state,
-          pending: undefined,
-          adapter: message.adapter,
-          models: message.models,
-          picker: searchPickerReducer(
-            state.picker,
-            {
-              kind: 'setActive',
-              ...(message.models[0] === undefined
-                ? {}
-                : {
-                    id:
-                      message.models.find(
-                        (model) => model.id === searchPickerView(state.picker).activeId
-                      )?.id ??
-                      message.models.find((model) => model.id === state.selection.model)?.id ??
-                      message.models[0].id
-                  })
-            },
-            {
-              searchPickerIndex: configurationIndex(
-                { ...state, models: message.models },
-                operations
-              )
-            }
-          )
-        }
-      };
+      return { state: replaceConfigurationPicker({
+        ...state,
+        pending: undefined,
+        adapter: message.adapter,
+        models: message.models
+      }, operations) };
     case 'configuration.profile': {
       const next = {
         ...state,
@@ -646,6 +631,25 @@ function reasoningChoices(profile?: ModelProfile): readonly {
   ];
 }
 
+/** Catalog ownership changes only with a stage/source replacement, never while rendering. */
+function replaceConfigurationPicker(
+  state: ConfigurationState,
+  operations: ConfigurationOperations,
+  reset = false
+): ConfigurationState {
+  const pickerIndex = configurationIndex(state, operations);
+  const query = reset ? { text: '', mode: 'fuzzy' as const }
+    : { text: state.picker.editor.input.text, mode: state.picker.mode, caseSensitive: state.picker.caseSensitive };
+  const pickerQueryResult = querySearchPickerIndex(pickerIndex, query);
+  const current = reset ? createSearchPickerState({ query, queryResult: pickerQueryResult }, pickerIndex) : state.picker;
+  const desired = pickerQueryResult.entries.find((entry) => !entry.disabled && entry.id === current.editor.activeId)
+    ?? pickerQueryResult.entries.find((entry) => !entry.disabled && entry.id === state.selection.model)
+    ?? pickerQueryResult.entries.find((entry) => !entry.disabled);
+  const picker = searchPickerReducer(current, { kind: 'setActive', ...(desired === undefined ? {} : { id: desired.id }) },
+    { searchPickerIndex: pickerIndex, queryResult: pickerQueryResult });
+  return { ...state, picker, pickerIndex, pickerQueryResult };
+}
+
 function configurationIndex(state: ConfigurationState, operations: ConfigurationOperations) {
   const items =
     state.stage === 'provider'
@@ -769,7 +773,8 @@ function configurationView(
               id: 'configuration-picker',
               title: `Choose ${state.stage}`,
               view: searchPickerView(state.picker),
-              searchPickerIndex: configurationIndex(state, operations),
+              searchPickerIndex: state.pickerIndex,
+              queryResult: state.pickerQueryResult,
               maxVisible: Math.max(1, height - 7),
               emptyText:
                 state.pending === undefined

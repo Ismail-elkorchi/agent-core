@@ -3,14 +3,24 @@ import {
   createSearchPickerState,
   createTextAreaState,
   searchPickerReducer,
+  prepareSearchPickerQuery,
+  type SearchPickerIndex,
+  type SearchPickerQueryResult,
   searchPickerView,
   type SearchPickerControlTransition,
   type UnscrolledSearchPickerState
 } from '@ismail-elkorchi/terminal-ui/behavior';
-import { searchPicker } from '@ismail-elkorchi/terminal-ui/components';
+import {
+  createTuiPreparedQuery,
+  type TuiChildResult,
+  type TuiPreparedQueryMessage,
+  type TuiPreparedQueryState
+} from '@ismail-elkorchi/terminal-ui/tui';
+import { searchPicker, text } from '@ismail-elkorchi/terminal-ui/components';
 import { textDocumentText } from '@ismail-elkorchi/terminal-ui/text';
 import { draftFromSubmission, type ComposerDraft } from './draft.js';
 import { panel } from './panel.js';
+import { diagnosticMessage } from './diagnostics.js';
 
 export interface PromptHistory {
   readonly entries: readonly ComposerDraft[];
@@ -32,9 +42,12 @@ export function navigatePromptHistory(
   direction: 'previous' | 'next'
 ): { readonly history: PromptHistory; readonly draft: ComposerDraft } {
   const index = history.index;
-  if (history.entries.length === 0 || (direction === 'next' && index === null)) return { history, draft };
+  if (history.entries.length === 0 || (direction === 'next' && index === null))
+    return { history, draft };
   const next =
-    direction === 'previous' ? Math.max(0, (index ?? history.entries.length) - 1) : (index ?? 0) + 1;
+    direction === 'previous'
+      ? Math.max(0, (index ?? history.entries.length) - 1)
+      : (index ?? 0) + 1;
   if (next >= history.entries.length)
     return { history: { entries: history.entries, index: null }, draft: history.unsent ?? draft };
   const selected = history.entries[next];
@@ -49,10 +62,21 @@ export interface PromptRecallState {
   readonly id: string;
   readonly entries: readonly ComposerDraft[];
   readonly picker: UnscrolledSearchPickerState;
+  readonly searchPickerIndex: SearchPickerIndex<ComposerDraft>;
+  readonly query: TuiPreparedQueryState<SearchPickerQueryResult<ComposerDraft>>;
 }
 export type PromptRecallMessage =
   | { readonly type: 'recall.open' }
-  | { readonly type: 'recall.loaded'; readonly id: string; readonly drafts: readonly ComposerDraft[] }
+  | {
+      readonly type: 'recall.query';
+      readonly id: string;
+      readonly message: TuiPreparedQueryMessage<SearchPickerQueryResult<ComposerDraft>>;
+    }
+  | {
+      readonly type: 'recall.loaded';
+      readonly id: string;
+      readonly drafts: readonly ComposerDraft[];
+    }
   | { readonly type: 'recall.transition'; readonly transition: SearchPickerControlTransition }
   | { readonly type: 'recall.accept'; readonly id: string };
 const index = (entries: readonly ComposerDraft[]) =>
@@ -67,21 +91,93 @@ const index = (entries: readonly ComposerDraft[]) =>
           : `${String(draft.attachments.length)} attachments · restore as an editable draft`
     }))
   );
-export function createPromptRecall(history: PromptHistory): PromptRecallState {
+function recallQuery(id: string) {
+  return createTuiPreparedQuery({
+    id: 'prompt-recall-query',
+    prepare: (
+      input: {
+        readonly index: SearchPickerIndex<ComposerDraft>;
+        readonly picker: UnscrolledSearchPickerState;
+      },
+      context
+    ) =>
+      prepareSearchPickerQuery(
+        input.index,
+        {
+          text: input.picker.editor.input.text,
+          mode: input.picker.mode,
+          caseSensitive: input.picker.caseSensitive
+        },
+        {
+          signal: context.signal,
+          yield: async () => {
+            await context.clock.sleep(0, context.signal);
+          }
+        }
+      ),
+    toMessage: (message): PromptRecallMessage => ({ type: 'recall.query', id, message })
+  });
+}
+type RecallUpdate = TuiChildResult<PromptRecallState, PromptRecallMessage>;
+function requestRecallQuery(state: PromptRecallState): RecallUpdate {
+  const result = recallQuery(state.id).request(state.query, {
+    index: state.searchPickerIndex,
+    picker: state.picker
+  });
+  return { ...result, state: { ...state, query: result.state } };
+}
+export function createPromptRecall(history: PromptHistory): RecallUpdate {
   const entries = [...history.entries].reverse();
-  return {
-    id: crypto.randomUUID(),
+  const searchPickerIndex = index(entries);
+  const id = crypto.randomUUID();
+  return requestRecallQuery({
+    id,
     entries,
-    picker: createSearchPickerState({ query: { text: '', mode: 'fuzzy' } }, index(entries))
-  };
+    searchPickerIndex,
+    query: recallQuery(id).init(),
+    picker: createSearchPickerState(
+      { query: { text: '', mode: 'fuzzy' }, queryResult: null },
+      searchPickerIndex
+    )
+  });
 }
 export function updatePromptRecall(
   state: PromptRecallState,
   transition: SearchPickerControlTransition
-): PromptRecallState {
+): RecallUpdate {
+  const picker = searchPickerReducer(state.picker, transition, {
+    searchPickerIndex: state.searchPickerIndex,
+    queryResult: state.query.result
+  });
+  const next = { ...state, picker };
+  return picker.editor.input.text === state.picker.editor.input.text &&
+    picker.mode === state.picker.mode &&
+    picker.caseSensitive === state.picker.caseSensitive
+    ? { state: next }
+    : requestRecallQuery(next);
+}
+export function receivePromptRecallQuery(
+  state: PromptRecallState,
+  message: Extract<PromptRecallMessage, { readonly type: 'recall.query' }>
+): RecallUpdate {
+  if (message.id !== state.id) return { state };
+  const result = recallQuery(state.id).update(state.query, message.message);
+  if (result.state === state.query) return { state };
+  const activeId = searchPickerView(state.picker).activeId;
   return {
-    ...state,
-    picker: searchPickerReducer(state.picker, transition, { searchPickerIndex: index(state.entries) })
+    ...result,
+    state: {
+      ...state,
+      query: result.state,
+      picker: searchPickerReducer(
+        state.picker,
+        activeId === undefined ? { kind: 'firstActive' } : { kind: 'setActive', id: activeId },
+        {
+          searchPickerIndex: state.searchPickerIndex,
+          queryResult: result.state.result
+        }
+      )
+    }
   };
 }
 export function promptRecallView(state: PromptRecallState, width: number, height: number) {
@@ -98,12 +194,20 @@ export function promptRecallView(state: PromptRecallState, width: number, height
         id: 'prompt-recall-picker',
         title: 'Loaded prompts and recovered drafts',
         view: searchPickerView(state.picker),
-        searchPickerIndex: index(state.entries),
-        maxVisible: Math.max(1, height - 5),
+        searchPickerIndex: state.searchPickerIndex,
+        queryResult: state.query.result,
+        maxVisible: Math.max(1, height - 5 - (state.query.error === null ? 0 : 1)),
         emptyText: 'No matching prompts. Close to return to your unchanged draft.',
         onTransition: (transition): Message => ({ type: 'recall.transition', transition }),
         onAccept: (event): Message => ({ type: 'recall.accept', id: event.id })
-      })
+      }),
+      ...(state.query.error === null
+        ? {}
+        : {
+            actions: text({
+              content: `Search failed. Edit the query to retry: ${diagnosticMessage(state.query.error)}`
+            })
+          })
     }
   });
 }
@@ -150,18 +254,9 @@ export function recoverDraft<Message>(
 export function appendRecalledDrafts(
   state: PromptRecallState,
   drafts: readonly ComposerDraft[]
-): PromptRecallState {
+): RecallUpdate {
   const entries = [...state.entries, ...drafts];
-  const activeId = searchPickerView(state.picker).activeId;
-  return {
-    ...state,
-    entries,
-    picker: searchPickerReducer(
-      state.picker,
-      { kind: 'setActive', ...(activeId === undefined ? {} : { id: activeId }) },
-      { searchPickerIndex: index(entries) }
-    )
-  };
+  return requestRecallQuery({ ...state, entries, searchPickerIndex: index(entries) });
 }
 export function promptsFromHistory(
   entries: readonly import('@agent-core/runtime').SessionBranchEntry[]

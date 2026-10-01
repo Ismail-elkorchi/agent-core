@@ -1,4 +1,5 @@
 import {
+  querySearchPickerIndex,
   searchPickerReducer,
   searchPickerView,
   textAreaReducer,
@@ -62,13 +63,22 @@ export function transitionCommandPicker(
   index: SearchPickerIndex,
   commands: readonly Command[]
 ): UnscrolledSearchPickerState {
-  const next = searchPickerReducer(state, transition, { searchPickerIndex: index });
+  const currentResult = querySearchPickerIndex(index, {
+    text: state.editor.input.text, mode: state.mode, caseSensitive: state.caseSensitive
+  });
+  const next = searchPickerReducer(state, transition, { searchPickerIndex: index, queryResult: currentResult });
   const query = searchPickerView(next).input.text;
-  if (query === searchPickerView(state).input.text) return next;
+  if (query === searchPickerView(state).input.text && next.mode === state.mode
+    && next.caseSensitive === state.caseSensitive) return next;
   const name = query.startsWith('/') ? query : `/${query}`;
-  return commands.some((command) => command.name === name)
-    ? searchPickerReducer(next, { kind: 'setActive', id: name }, { searchPickerIndex: index })
-    : next;
+  const queryResult = querySearchPickerIndex(index, {
+    text: query, mode: next.mode, caseSensitive: next.caseSensitive
+  });
+  return searchPickerReducer(next,
+    commands.some((command) => command.name === name)
+      ? { kind: 'setActive', id: name }
+      : { kind: 'firstActive' },
+    { searchPickerIndex: index, queryResult });
 }
 
 export function moveCommand(completion: CommandCompletion, delta: number): CommandCompletion {

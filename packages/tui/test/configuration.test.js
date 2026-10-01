@@ -266,3 +266,41 @@ test('native incompatibility offers a separate explicit fresh-continuation actio
     undefined
   );
 });
+
+test('configuration owns a stable index and matching result across redraws and query transitions', () => {
+  const operations = { providers: [{ id: 'neutral', label: 'Neutral service' }, { id: 'other', label: 'Other service' }] };
+  let state = configurationState(undefined, operations.providers);
+  const index = state.pickerIndex;
+  const initialResult = state.pickerQueryResult;
+  assert.equal(initialResult.entries.length, 2);
+  configurationView(state, operations, 76, 20);
+  configurationView(state, operations, 48, 12);
+  assert.equal(state.pickerIndex, index);
+  assert.equal(state.pickerQueryResult, initialResult);
+  state = updateConfiguration(state, { type: 'configuration.transition', transition: { kind: 'setQuery', query: { text: 'neutral', mode: 'fuzzy' } } }, operations).state;
+  assert.equal(state.pickerIndex, index, 'editing never rebuilds the catalog');
+  assert.equal(state.pickerQueryResult.query.text, 'neutral');
+  assert.deepEqual(state.pickerQueryResult.entries.map((entry) => entry.id), ['neutral']);
+  assert.equal(state.picker.editor.activeId, 'neutral');
+  const accepted = state.pickerQueryResult;
+  state = updateConfiguration(state, { type: 'configuration.scroll', offset: 1 }, operations).state;
+  assert.equal(state.pickerIndex, index);
+  assert.equal(state.pickerQueryResult, accepted);
+  const model = updateConfiguration(state, { type: 'configuration.stage', stage: 'model' }, operations).state;
+  assert.notEqual(model.pickerIndex, index);
+  assert.equal(model.pickerQueryResult.entries.length, 0);
+  assert.equal(model.picker.editor.activeId, undefined);
+});
+
+test('configuration catalog replacement cannot retain a result from the previous source', () => {
+  const operations = { providers: [] };
+  const initial = configurationState({ provider: 'neutral', model: 'new' }, []);
+  const model = updateConfiguration(initial, { type: 'configuration.stage', stage: 'model' }, operations).state;
+  const pending = { ...model, pending: 'catalog-request' };
+  const next = updateConfiguration(pending, { type: 'configuration.catalog', id: pending.id, request: pending.pending, adapter: {}, models: [{ id: 'disabled', unavailableReason: 'No access' }, { id: 'new' }] }, operations).state;
+  assert.notEqual(next.pickerIndex, pending.pickerIndex);
+  assert.notEqual(next.pickerQueryResult, pending.pickerQueryResult);
+  assert.equal(next.picker.editor.activeId, 'new');
+  assert.deepEqual(next.pickerQueryResult.entries.map((entry) => entry.id), ['disabled', 'new']);
+  assert.equal(next.pickerQueryResult.entries[0].disabled, true);
+});

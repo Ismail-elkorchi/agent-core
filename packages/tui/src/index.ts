@@ -132,7 +132,7 @@ export {
 
 export { loadRecoveredPrompts, recoverDraft } from './prompt-history.js';
 
-export { appendRecalledDrafts, promptsFromHistory } from './prompt-history.js';
+export { appendRecalledDrafts, promptsFromHistory, receivePromptRecallQuery } from './prompt-history.js';
 
 export { activityDetails, type ActivityDetail } from './conversation.js';
 export { presentProgress, progressStatusFields, type ProgressPresentation } from './progress.js';
