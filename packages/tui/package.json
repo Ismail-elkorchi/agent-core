@@ -28,9 +28,9 @@
   },
   "devDependencies": {
     "@types/prismjs": "1.26.6",
-    "@ismail-elkorchi/terminal-ui": "github:Ismail-elkorchi/terminal-ui#b94f2b67fe6097f144781485c69f928651de0270"
+    "@ismail-elkorchi/terminal-ui": "git+https://github.com/Ismail-elkorchi/terminal-ui.git#2f881c856b2bb5e0fefee1a7f0ab336d4d8f7f30"
   },
   "peerDependencies": {
-    "@ismail-elkorchi/terminal-ui": "github:Ismail-elkorchi/terminal-ui#b94f2b67fe6097f144781485c69f928651de0270"
+    "@ismail-elkorchi/terminal-ui": "git+https://github.com/Ismail-elkorchi/terminal-ui.git#2f881c856b2bb5e0fefee1a7f0ab336d4d8f7f30"
   }
 }

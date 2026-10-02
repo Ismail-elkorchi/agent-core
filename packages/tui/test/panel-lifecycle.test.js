@@ -24,7 +24,7 @@ test('panel mounting and result grafting retain parent state and explicit child 
       effects: [{ id: 'load', concurrency: 'replace', run: async () => ({ kind: 'none' }) }],
       focus: { kind: 'element', elementId: 'value' }
     }),
-    update: () => ({ state: 1, outputs: ['saved'], cancelEffects: ['load'] }),
+    update: () => ({ state: 1, outputs: ['saved'], cancel: [{ kind: 'effect', id: 'load' }] }),
     view: () => text({ id: 'value', content: 'value' })
   }, (child) => ({ type: 'child', child }));
   const left = mountPanel(initial(), 'notes', child, context);
@@ -33,7 +33,8 @@ test('panel mounting and result grafting retain parent state and explicit child 
   assert.equal(right.state.panelGeneration, 1, 'independent parents do not share a generation counter');
   assert.equal(left.state.value, 'parent');
   assert.equal(left.focus.elementId, child.elementId(left.state.overlay.state, 'value'));
-  assert.deepEqual(left.effects.map(({ id }) => id), left.state.overlay.state.effectIds);
+  assert.equal('effectIds' in left.state.overlay.state, false);
+  assert.equal(left.effects.length, 1);
   const result = child.update(left.state.overlay.state, {
     id: 'notes', generation: 1, message: 'save'
   }, context);
@@ -41,7 +42,7 @@ test('panel mounting and result grafting retain parent state and explicit child 
   assert.deepEqual(applied.outputs, ['saved'], 'the parent decides how to consume outputs');
   assert.equal(applied.state.overlay.state.state, 1);
   assert.equal(right.state.overlay.state.state, 0);
-  assert.deepEqual(applied.cancelEffects, left.state.overlay.state.effectIds);
+  assert.deepEqual(applied.cancel, [{ kind: 'effect', id: left.effects[0].id }]);
   const closed = applyPanelResult(applied.state, 'notes', result, true);
   assert.equal(closed.state.overlay.kind, 'none');
   const reopened = mountPanel(closed.state, 'notes', child, context);
@@ -50,16 +51,16 @@ test('panel mounting and result grafting retain parent state and explicit child 
 });
 
 test('panel lifetime reconciliation keeps unrelated cancellations and retained hidden children', () => {
-  const first = { id: 'notes', generation: 1, state: 0, effectIds: ['first-load'] };
-  const queue = { id: 'queue', generation: 2, state: 0, effectIds: ['queue-save'] };
-  const second = { ...first, generation: 3, effectIds: ['second-load'] };
-  const result = { state: { value: 'parent' }, cancelEffects: ['parent-search'] };
+  const first = { id: 'notes', generation: 1, state: 0 };
+  const queue = { id: 'queue', generation: 2, state: 0 };
+  const second = { ...first, generation: 3 };
+  const result = { state: { value: 'parent' }, cancel: [{ kind: 'effect', id: 'parent-search' }] };
   assert.equal(cancelRemovedPanels(result, [first, queue], [first, queue]), result);
   assert.deepEqual(cancelRemovedPanels(result, [first, queue], [second, queue]), {
-    ...result, cancelEffects: ['parent-search', 'first-load']
+    ...result, cancel: [{ kind: 'effect', id: 'parent-search' }, { kind: 'child', id: 'notes', generation: 1 }]
   });
-  assert.deepEqual(cancelRemovedPanels(result, [first, queue], []).cancelEffects,
-    ['parent-search', 'first-load', 'queue-save']);
+  assert.deepEqual(cancelRemovedPanels(result, [first, queue], []).cancel,
+    [{ kind: 'effect', id: 'parent-search' }, { kind: 'child', id: 'notes', generation: 1 }, { kind: 'child', id: 'queue', generation: 2 }]);
 });
 
 test('mounted panel hide, removal and replacement preserve subscription ownership and reject stale work', { timeout: 5000 }, async (t) => {

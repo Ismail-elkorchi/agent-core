@@ -35,7 +35,7 @@ import {
 } from '@ismail-elkorchi/terminal-ui/components';
 import { column, flow, viewport } from '@ismail-elkorchi/terminal-ui/layout';
 import { textDocumentText, type TextEditBuffer } from '@ismail-elkorchi/terminal-ui/text';
-import type { TuiChildDefinition, TuiEffect } from '@ismail-elkorchi/terminal-ui/tui';
+import type { TuiChildDefinition, TuiChildResult, TuiEffect } from '@ismail-elkorchi/terminal-ui/tui';
 import { copySource } from './copy.js';
 import { diagnosticMessage } from './diagnostics.js';
 import { panel } from './panel.js';
@@ -191,11 +191,7 @@ function reduceConfiguration(
   state: ConfigurationState,
   message: Exclude<ConfigurationMessage, { readonly type: 'configuration.close' | 'configuration.saved' }>,
   operations: ConfigurationOperations
-): {
-  readonly state: ConfigurationState;
-  readonly effects?: readonly TuiEffect<ConfigurationMessage>[];
-  readonly cancelEffects?: readonly string[];
-} {
+): TuiChildResult<ConfigurationState, ConfigurationMessage> {
   if ('id' in message && message.id !== state.id) return { state };
   if ('request' in message && message.request !== state.pending) return { state };
   switch (message.type) {
@@ -314,7 +310,7 @@ function reduceConfiguration(
                     : state.selection.model
           })
         },
-        cancelEffects: ['model-configuration']
+        cancel: [{ kind: 'effect', id: 'model-configuration' }]
       };
     }
     case 'configuration.transition': {

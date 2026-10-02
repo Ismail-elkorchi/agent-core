@@ -127,7 +127,7 @@ test('two notes instances own independent reads, identities and removal', async 
         if (result.outputs?.includes('close')) {
           const next = { ...state };
           delete next[message.child.id];
-          return { state: next, cancelEffects: child.remove(current) };
+          return { state: next, cancel: [child.remove(current)] };
         }
         return { ...result, state: { ...state, [message.child.id]: result.state } };
       },
@@ -142,7 +142,7 @@ test('two notes instances own independent reads, identities and removal', async 
     child.elementId(runtime.state().left, 'model-notes'),
     child.elementId(runtime.state().right, 'model-notes')
   );
-  assert.notDeepEqual(runtime.state().left.effectIds, runtime.state().right.effectIds);
+  assert.equal('effectIds' in runtime.state().left, false);
   await runtime.dispatch({
     type: 'child',
     child: { id: 'left', generation: 1, message: { type: 'notes.close' } }

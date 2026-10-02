@@ -12,6 +12,7 @@ import {
 } from '@ismail-elkorchi/terminal-ui/behavior';
 import {
   createTuiPreparedQuery,
+  liftTuiResult,
   type TuiChildResult,
   type TuiPreparedQueryMessage,
   type TuiPreparedQueryState
@@ -124,7 +125,7 @@ function requestRecallQuery(state: PromptRecallState): RecallUpdate {
     index: state.searchPickerIndex,
     picker: state.picker
   });
-  return { ...result, state: { ...state, query: result.state } };
+  return liftTuiResult(state, 'query', result);
 }
 export function createPromptRecall(history: PromptHistory): RecallUpdate {
   const entries = [...history.entries].reverse();

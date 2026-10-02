@@ -63,9 +63,9 @@ export function cancelRemovedPanels<State, Message>(
     ? result
     : {
         ...result,
-        cancelEffects: [
-          ...(result.cancelEffects ?? []),
-          ...removed.flatMap((child) => child.effectIds)
+        cancel: [
+          ...(result.cancel ?? []),
+          ...removed.map(({ id, generation }) => ({ kind: 'child' as const, id, generation }))
         ]
       };
 }

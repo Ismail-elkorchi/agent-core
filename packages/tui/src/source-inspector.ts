@@ -32,6 +32,7 @@ import {
 import {
   createTuiPreparedQuery,
   type TuiChildDefinition,
+  liftTuiResult,
   type TuiChildResult,
   type TuiPreparedQueryMessage,
   type TuiPreparedQueryState
@@ -389,7 +390,7 @@ function requestSourceQuery(
     index: state.searchPickerIndex,
     picker: state.picker
   });
-  return { ...result, state: { ...state, query: result.state } };
+  return liftTuiResult(state, 'query', result);
 }
 
 export function sourceInspectorPanel(
@@ -408,7 +409,7 @@ export function sourceInspectorPanel(
     },
     update: (state, message) => {
       if (message.type === 'inspector.close')
-        return { state, cancelEffects: ['source-query'], outputs: ['close'] };
+        return { state, cancel: [{ kind: 'effect', id: 'source-query' }], outputs: ['close'] };
       if (message.type === 'inspector.query') {
         const result = sourceQuery.update(state.query, message.message);
         if (result.state === state.query) return { state };

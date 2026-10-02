@@ -113,8 +113,8 @@ test('source inspector prepares owned queries and close cancels pending work', a
   const ready = panel.update(second.state, await runQuery(second, ctx)).state;
   assert.equal(ready.query.result.query.text, 'Recorded 4');
   assert.equal(ready.query.result.searchPickerIndex, ready.searchPickerIndex);
-  assert.deepEqual(panel.update(ready, { type: 'inspector.close' }).cancelEffects, [
-    'source-query'
+  assert.deepEqual(panel.update(ready, { type: 'inspector.close' }).cancel, [
+    { kind: 'effect', id: 'source-query' }
   ]);
 });
 
