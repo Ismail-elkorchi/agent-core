@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { applyPanelResult, cancelRemovedPanels, mountPanel } from '@agent-core/tui';
-import { text } from '@ismail-elkorchi/terminal-ui/components';
+import { applyPanelResult, mountPanel } from '@agent-core/tui';
+import { button, text } from '@ismail-elkorchi/terminal-ui/components';
 import { createMemoryTerminalHost } from '@ismail-elkorchi/terminal-ui/host';
-import { createTuiChild, createTuiRuntime, defineTui } from '@ismail-elkorchi/terminal-ui/tui';
+import { combineTuiResults, createTuiChild, createTuiRuntime, defineTui, reconcileTuiChildren } from '@ismail-elkorchi/terminal-ui/tui';
 
 const context = { terminalSize: { columns: 80, rows: 24 } };
 const initial = () => ({ panelGeneration: 0, overlay: { kind: 'none' }, value: 'parent' });
@@ -17,24 +17,30 @@ async function waitFor(predicate) {
   throw new Error('Panel lifecycle did not settle.');
 }
 
-test('panel mounting and result grafting retain parent state and explicit child work and outputs', () => {
+test('panel mounting and result grafting retain parent state and opaque child work and outputs', async (t) => {
+  let pending;
+  const started = [];
   const child = createTuiChild({
     init: () => ({
       state: 0,
-      effects: [{ id: 'load', concurrency: 'replace', run: async () => ({ kind: 'none' }) }],
+      effects: [{ id: 'load', concurrency: 'replace', run: ({ signal }) => {
+        started.push(signal);
+        return new Promise((resolve) => { pending = resolve; });
+      } }],
       focus: { kind: 'element', elementId: 'value' }
     }),
     update: () => ({ state: 1, outputs: ['saved'], cancel: [{ kind: 'effect', id: 'load' }] }),
-    view: () => text({ id: 'value', content: 'value' })
+    view: () => button({ id: 'value', label: 'value', onPress: () => ({ type: 'save' }) })
   }, (child) => ({ type: 'child', child }));
   const left = mountPanel(initial(), 'notes', child, context);
   const right = mountPanel(initial(), 'notes', child, context);
   assert.equal(left.state.panelGeneration, 1);
   assert.equal(right.state.panelGeneration, 1, 'independent parents do not share a generation counter');
   assert.equal(left.state.value, 'parent');
-  assert.equal(left.focus.elementId, child.elementId(left.state.overlay.state, 'value'));
+  assert.ok(left.contribution);
+  assert.equal('effects' in left, false);
+  assert.equal('focus' in left, false);
   assert.equal('effectIds' in left.state.overlay.state, false);
-  assert.equal(left.effects.length, 1);
   const result = child.update(left.state.overlay.state, {
     id: 'notes', generation: 1, message: 'save'
   }, context);
@@ -42,25 +48,33 @@ test('panel mounting and result grafting retain parent state and explicit child 
   assert.deepEqual(applied.outputs, ['saved'], 'the parent decides how to consume outputs');
   assert.equal(applied.state.overlay.state.state, 1);
   assert.equal(right.state.overlay.state.state, 0);
-  assert.deepEqual(applied.cancel, [{ kind: 'effect', id: left.effects[0].id }]);
+  assert.ok(applied.contribution);
+  assert.equal('cancel' in applied, false);
   const closed = applyPanelResult(applied.state, 'notes', result, true);
   assert.equal(closed.state.overlay.kind, 'none');
   const reopened = mountPanel(closed.state, 'notes', child, context);
   assert.equal(reopened.state.panelGeneration, 2);
   assert.equal(reopened.state.overlay.state.generation, 2);
-});
-
-test('panel lifetime reconciliation keeps unrelated cancellations and retained hidden children', () => {
-  const first = { id: 'notes', generation: 1, state: 0 };
-  const queue = { id: 'queue', generation: 2, state: 0 };
-  const second = { ...first, generation: 3 };
-  const result = { state: { value: 'parent' }, cancel: [{ kind: 'effect', id: 'parent-search' }] };
-  assert.equal(cancelRemovedPanels(result, [first, queue], [first, queue]), result);
-  assert.deepEqual(cancelRemovedPanels(result, [first, queue], [second, queue]), {
-    ...result, cancel: [{ kind: 'effect', id: 'parent-search' }, { kind: 'child', id: 'notes', generation: 1 }]
+  const runtime = createTuiRuntime({
+    host: createMemoryTerminalHost(),
+    app: defineTui({
+      init: () => left,
+      update: (state, message, context) => applyPanelResult(
+        state, 'notes', child.update(state.overlay.state, message.child, context)
+      ),
+      view: (state, context) => child.view(state.overlay.state, context)
+    })
   });
-  assert.deepEqual(cancelRemovedPanels(result, [first, queue], []).cancel,
-    [{ kind: 'effect', id: 'parent-search' }, { kind: 'child', id: 'notes', generation: 1 }, { kind: 'child', id: 'queue', generation: 2 }]);
+  t.after(async () => {
+    pending?.({ kind: 'none' });
+    await runtime.dispose();
+  });
+  await runtime.start();
+  await waitFor(() => started.length === 1);
+  assert.ok(runtime.frame().focusPath.includes(child.elementId(left.state.overlay.state, 'value')));
+  await runtime.dispatch({ type: 'child', child: { id: 'notes', generation: 1, message: 'save' } });
+  assert.equal(started[0].aborted, true, 'grafted cancellation reaches the owned child effect');
+  assert.equal(runtime.state().overlay.state.state, 1);
 });
 
 test('mounted panel hide, removal and replacement preserve subscription ownership and reject stale work', { timeout: 5000 }, async (t) => {
@@ -98,7 +112,7 @@ test('mounted panel hide, removal and replacement preserve subscription ownershi
         else result = state.overlay.kind === 'none' ? { state } : applyPanelResult(
           state, 'notes', child.update(state.overlay.state, message.child, context)
         );
-        return cancelRemovedPanels(result, mounted(state), mounted(result.state));
+        return combineTuiResults(result.state, result, reconcileTuiChildren(mounted(state), mounted(result.state), (child) => child));
       },
       view: (state, context) => state.hidden || state.overlay.kind === 'none'
         ? text({ content: 'hidden' }) : child.view(state.overlay.state, context),

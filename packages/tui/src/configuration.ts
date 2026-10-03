@@ -14,6 +14,7 @@ import {
   createTextAreaState,
   querySearchPickerIndex,
   searchPickerReducer,
+  searchPickerQueryPosition,
   searchPickerView,
   textAreaReducer,
   textInputReducer,
@@ -638,10 +639,15 @@ function replaceConfigurationPicker(
     : { text: state.picker.editor.input.text, mode: state.picker.mode, caseSensitive: state.picker.caseSensitive };
   const pickerQueryResult = querySearchPickerIndex(pickerIndex, query);
   const current = reset ? createSearchPickerState({ query, queryResult: pickerQueryResult }, pickerIndex) : state.picker;
-  const desired = pickerQueryResult.entries.find((entry) => !entry.disabled && entry.id === current.editor.activeId)
-    ?? pickerQueryResult.entries.find((entry) => !entry.disabled && entry.id === state.selection.model)
-    ?? pickerQueryResult.entries.find((entry) => !entry.disabled);
-  const picker = searchPickerReducer(current, { kind: 'setActive', ...(desired === undefined ? {} : { id: desired.id }) },
+  const enabledId = (id: string | undefined) => {
+    const position = id === undefined ? undefined : searchPickerQueryPosition(pickerQueryResult, id);
+    const entry = position === undefined ? undefined : pickerQueryResult.entryAt(position);
+    return entry?.disabled === true ? undefined : entry?.id;
+  };
+  const desiredId = enabledId(current.editor.activeId)
+    ?? enabledId(state.selection.model)
+    ?? createSearchPickerState({ query, queryResult: pickerQueryResult }, pickerIndex).editor.activeId;
+  const picker = searchPickerReducer(current, { kind: 'setActive', ...(desiredId === undefined ? {} : { id: desiredId }) },
     { searchPickerIndex: pickerIndex, queryResult: pickerQueryResult });
   return { ...state, picker, pickerIndex, pickerQueryResult };
 }

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createMemoryTerminalHost } from '@ismail-elkorchi/terminal-ui/host';
-import { createTuiChild, createTuiRuntime, defineTui } from '@ismail-elkorchi/terminal-ui/tui';
+import { combineTuiResults, createTuiChild, createTuiRuntime, defineTui } from '@ismail-elkorchi/terminal-ui/tui';
 import { textDocumentText } from '@ismail-elkorchi/terminal-ui/text';
 import { notesPanel } from '@agent-core/tui';
 
@@ -115,10 +115,7 @@ test('two notes instances own independent reads, identities and removal', async 
       init(context) {
         const left = child.init({ id: 'left', generation: 1 }, context);
         const right = child.init({ id: 'right', generation: 1 }, context);
-        return {
-          state: { left: left.state, right: right.state },
-          effects: [...left.effects, ...right.effects]
-        };
+        return combineTuiResults({ left: left.state, right: right.state }, left, right);
       },
       update(state, message, context) {
         const current = state[message.child.id];
@@ -127,7 +124,7 @@ test('two notes instances own independent reads, identities and removal', async 
         if (result.outputs?.includes('close')) {
           const next = { ...state };
           delete next[message.child.id];
-          return { state: next, cancel: [child.remove(current)] };
+          return combineTuiResults(next, result, child.remove(current));
         }
         return { ...result, state: { ...state, [message.child.id]: result.state } };
       },

@@ -85,3 +85,18 @@ test('an already removed source never attaches or starts its application', async
   await f.source.dispose?.();
   assert.deepEqual(f.observations, []);
 });
+
+test('sink rejection remains an awaited delivery failure without retrying or swallowing it', async () => {
+  const expected = new Error('Source admission is full');
+  let admissions = 0;
+  const f = fixture();
+  assert.equal(f.source.channel.capacity, 64);
+  const running = f.source.run({ signal: new AbortController().signal }, {
+    async emit() { admissions++; throw expected; }
+  });
+  const rejected = assert.rejects(running, (error) => error === expected);
+  await f.emit({ type: 'result' }).catch(f.fail);
+  await rejected;
+  assert.equal(admissions, 1);
+  assert.deepEqual(f.observations, ['subscribe', 'unsubscribe']);
+});

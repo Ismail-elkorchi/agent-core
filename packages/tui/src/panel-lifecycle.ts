@@ -1,10 +1,10 @@
 import type {
   TuiChild,
-  TuiChildResult,
+  TuiScopedResult,
   TuiChildState,
-  TuiContext,
-  TuiUpdateResult
+  TuiContext
 } from '@ismail-elkorchi/terminal-ui/tui';
+import { combineTuiResults } from '@ismail-elkorchi/terminal-ui/tui';
 
 type PanelState<ParentState, State, Kind extends string> = Omit<ParentState, 'overlay'> & {
   readonly overlay:
@@ -16,16 +16,13 @@ type PanelState<ParentState, State, Kind extends string> = Omit<ParentState, 'ov
 export function applyPanelResult<ParentState, State, Message, Output, Kind extends string>(
   parent: ParentState,
   kind: Kind,
-  result: TuiChildResult<TuiChildState<State>, Message, Output>,
+  result: TuiScopedResult<TuiChildState<State>, Message, Output>,
   close = false
-): TuiChildResult<PanelState<ParentState, State, Kind>, Message, Output> {
-  return {
-    ...result,
-    state: {
-      ...parent,
-      overlay: close ? { kind: 'none' as const } : { kind, state: result.state }
-    }
-  };
+): TuiScopedResult<PanelState<ParentState, State, Kind>, Message, Output> {
+  return combineTuiResults<PanelState<ParentState, State, Kind>, Message, Output>(
+    { ...parent, overlay: close ? { kind: 'none' } : { kind, state: result.state } },
+    result
+  );
 }
 
 /** Allocate a new lifetime in the parent, without retaining a second store or registry. */
@@ -48,24 +45,4 @@ export function mountPanel<
     panelGeneration: generation
   };
   return applyPanelResult(next, kind, child.init({ id: kind, generation }, context));
-}
-
-/** Cancel removed lifetimes; a retained but hidden child continues to own its work. */
-export function cancelRemovedPanels<State, Message>(
-  result: TuiUpdateResult<State, Message>,
-  previous: readonly TuiChildState<unknown>[],
-  current: readonly TuiChildState<unknown>[]
-): TuiUpdateResult<State, Message> {
-  const removed = previous.filter(
-    (child) => !current.some((next) => child.id === next.id && child.generation === next.generation)
-  );
-  return removed.length === 0
-    ? result
-    : {
-        ...result,
-        cancel: [
-          ...(result.cancel ?? []),
-          ...removed.map(({ id, generation }) => ({ kind: 'child' as const, id, generation }))
-        ]
-      };
 }

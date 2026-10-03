@@ -54,15 +54,16 @@ test('prompt recall owns its index, prepares cooperatively and fences query/sour
     yields += 1;
   });
   const initial = await runQuery(opened, ctx);
-  assert.ok(yields > 0);
+  assert.equal(yields, 0, 'empty queries reuse source order without scanning');
   const ready = receivePromptRecallQuery(opened.state, initial).state;
   assert.equal(ready.query.result.searchPickerIndex, index);
   assert.equal(ready.query.pending, false);
-  assert.equal(ready.picker.editor.activeId, ready.query.result.entries[0].id);
+  assert.equal(ready.picker.editor.activeId, ready.query.result.entryAt(0).id);
   const first = updatePromptRecall(ready, { kind: 'setQuery', query: { text: 'Prompt 1' } });
   const second = updatePromptRecall(first.state, { kind: 'setQuery', query: { text: 'Prompt 2' } });
   assert.equal(second.state.searchPickerIndex, index);
   const obsolete = await runQuery(first, ctx);
+  assert.ok(yields > 0, 'nonempty queries still cooperate while scanning the source');
   assert.equal(receivePromptRecallQuery(second.state, obsolete).state, second.state);
   const changed = appendRecalledDrafts(second.state, [createDraft('Prompt 2 recovered')]);
   assert.notEqual(changed.state.searchPickerIndex, index);
@@ -73,7 +74,7 @@ test('prompt recall owns its index, prepares cooperatively and fences query/sour
   const final = receivePromptRecallQuery(changed.state, await runQuery(changed, ctx)).state;
   assert.equal(final.query.result.searchPickerIndex, final.searchPickerIndex);
   assert.equal(final.query.result.query.text, 'Prompt 2');
-  assert.ok(final.query.result.entries.some((entry) => entry.label === 'Prompt 2 recovered'));
+  assert.ok(final.query.result.window(0, final.query.result.count).some((entry) => entry.label === 'Prompt 2 recovered'));
   assert.equal(receivePromptRecallQuery(final, obsolete).state, final);
   assert.doesNotThrow(() => promptRecallView(final, 70, 20));
   assert.equal(final.searchPickerIndex, changed.state.searchPickerIndex);
@@ -136,5 +137,5 @@ test('failed prompt preparation remains editable and shows retry feedback', asyn
   assert.equal(retry.state.query.pending, true);
   assert.equal(retry.state.query.error, null);
   const ready = receivePromptRecallQuery(retry.state, await runQuery(retry, await context())).state;
-  assert.equal(ready.picker.editor.activeId, ready.query.result.entries[0].id);
+  assert.equal(ready.picker.editor.activeId, ready.query.result.entryAt(0).id);
 });
