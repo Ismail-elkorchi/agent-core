@@ -51,8 +51,6 @@ export function createWorkspaceToolHost(options: {
       ? [
           createExecCommandTool({
             ptySupported: commandExecution.descriptor.supportsPty,
-            environmentLifetimeSupported:
-              commandExecution.descriptor.capabilities.includes('environment-lifetime')
           })
         ]
       : []),

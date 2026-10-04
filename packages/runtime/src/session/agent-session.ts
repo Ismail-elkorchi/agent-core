@@ -196,7 +196,10 @@ export class AgentSession {
           .filter((submission) => submission.state !== 'queued')
           .map((submission) => this.options.runs.inspect(submission.runId))
       );
-      return { session: this.state(), pendingSubmissions, runs };
+      const toolDiagnostics = (await Promise.all(
+        runs.map(({ state }) => this.options.runs.readToolDiagnostics(state))
+      )).flat();
+      return { session: this.state(), pendingSubmissions, runs, toolDiagnostics };
     });
   }
 

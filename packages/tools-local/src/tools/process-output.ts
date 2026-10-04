@@ -27,12 +27,6 @@ export const processOutputSchema = z.strictObject({
   cursorStart: z.int().nonnegative(),
   cursorEnd: z.int().nonnegative(),
   cursorExpired: z.boolean().optional(),
-  eventCursor: z
-    .strictObject({
-      source: z.string().min(1),
-      position: z.string().min(1)
-    })
-    .optional(),
   stdout: streamOutputSchema,
   stderr: streamOutputSchema,
   terminal: streamOutputSchema.optional(),

@@ -21,6 +21,25 @@ export interface CommandExecutionOwner {
   readonly callIndex: number;
 }
 
+/** A process operation was rejected before it changed the process or its input. */
+export class CommandProcessOperationRejectedError extends Error {
+  constructor(
+    readonly processId: string,
+    readonly reason: 'not_found' | 'not_running' | 'wrong_owner' | 'evidence_unavailable' | 'invalid_cursor',
+    options?: ErrorOptions
+  ) {
+    const messages = {
+      not_found: 'Unknown process',
+      not_running: 'Process is not running',
+      wrong_owner: 'Process belongs to another resource owner',
+      evidence_unavailable: 'Process terminal evidence is unavailable or incompatible',
+      invalid_cursor: 'Invalid process output cursor'
+    };
+    super(`${messages[reason]}: ${processId}`, options);
+    this.name = 'CommandProcessOperationRejectedError';
+  }
+}
+
 export interface CommandExecutionDescriptor {
   /** Versioned implementation identity captured with durable effect intent. */
   readonly implementationId: string;
@@ -35,8 +54,6 @@ export interface CommandExecutionPlanRequest {
   /** Canonical path relative to the command authority's adopted root. */
   readonly rootedDirectory: string;
   readonly pty: boolean;
-  /** Transient jobs are released with their owner; environment services are not. */
-  readonly lifetime?: 'job' | 'environment';
   readonly timeoutMs: number;
   readonly yieldMs: number;
   readonly outputTokenBudget: number;
@@ -101,15 +118,6 @@ export interface CommandOutputView {
   readonly endsAtOutputEnd: boolean;
 }
 
-/**
- * Opaque replay position in the execution provider's durable event stream.
- * It is an observation/recovery hint, never an authorization capability.
- */
-export interface CommandEventCursor {
-  readonly source: string;
-  readonly position: string;
-}
-
 export interface CommandExecutionResult {
   readonly processId: string;
   readonly owner: CommandExecutionOwner;
@@ -117,7 +125,6 @@ export interface CommandExecutionResult {
   readonly cursorStart: number;
   readonly cursorEnd: number;
   readonly cursorExpired?: boolean;
-  readonly eventCursor?: CommandEventCursor;
   readonly stdout: CommandOutputView;
   readonly stderr: CommandOutputView;
   /** PTY output is one merged stream and is never relabelled as stdout/stderr. */
@@ -233,7 +240,6 @@ export function ownCommandExecutionRequest(request: CommandExecutionPlanRequest)
     command: request.command,
     rootedDirectory: request.rootedDirectory,
     pty: request.pty,
-    ...(request.lifetime === undefined ? {} : { lifetime: request.lifetime }),
     timeoutMs: request.timeoutMs,
     yieldMs: request.yieldMs,
     outputTokenBudget: request.outputTokenBudget,
@@ -350,11 +356,6 @@ function validateCommandExecutionPlanRequest(request: CommandExecutionPlanReques
     throw new TypeError('Command rooted directory must be a string.');
   if (typeof request.pty !== 'boolean')
     throw new TypeError('Command PTY selection must be boolean.');
-  if (
-    request.lifetime !== undefined &&
-    !(['job', 'environment'] as const).includes(request.lifetime)
-  )
-    throw new TypeError('Command lifetime must be job or environment.');
   for (const [name, value] of [
     ['timeoutMs', request.timeoutMs],
     ['yieldMs', request.yieldMs],

@@ -393,7 +393,7 @@ async function waitForMissingProcess(pid) {
   assert.fail(`Process ${String(pid)} remained alive after stop_process.`);
 }
 
-test('process polls use stable cursors, preserve split UTF-8, and retain a completed tombstone', async () => {
+test('process polls use stable cursors, preserve split UTF-8, and retain terminal evidence', async () => {
   const { context, manager } = await processContext({ completedRetentionMs: 1_000 });
   const script =
     "const b=Buffer.from('🙂 café'); process.stdout.write(b.subarray(0,2)); setTimeout(()=>process.stdout.write(b.subarray(2)),10)";
@@ -425,7 +425,7 @@ test('process polls use stable cursors, preserve split UTF-8, and retain a compl
     context
   );
   assert.equal(stoppedAgain.output.status, 'exited');
-  assert.equal(manager.has(started.output.processId), true);
+  assert.equal((await manager.query(started.output.processId, 100)).processId, started.output.processId);
 });
 
 test(
@@ -499,7 +499,7 @@ test('process ownership and run cleanup cannot affect another run', async () => 
   assert.equal(foreignStop.kind, 'failure');
   assert.match(foreignStop.summary, /another resource owner/u);
   await manager.disposeOwner(ownerB.runId);
-  assert.equal(manager.has(started.output.processId), true);
+  assert.equal((await manager.query(started.output.processId, 100)).processId, started.output.processId);
   const stopped = await invokeToolCall(
     jsonToolCall('stop_process', { processId: started.output.processId }),
     tools,
@@ -543,7 +543,7 @@ test('natural termination is reported once whether or not the process was polled
   }
 });
 
-test('terminal tombstones release capture budgets before late acknowledgment', async () => {
+test('terminal records release capture budgets before late acknowledgment', async () => {
   const { root, manager } = await processContext({
     maxCapturedBytes: 1_024,
     maxTotalCapturedBytes: 1_024,
@@ -576,7 +576,7 @@ test('terminal tombstones release capture budgets before late acknowledgment', a
     await manager.acknowledgeTerminalReport(processId);
     await manager.acknowledgeTerminalReport(processId);
     assert.equal(before.status, 'exited');
-    assert.equal(manager.has(processId), false);
+    assert.equal((await manager.query(processId, 100)).status, 'exited');
   }
 });
 
@@ -620,7 +620,7 @@ test('ledger cleanup residue does not change a terminal result and is retried on
   const reconciliation = await retry.reconcile();
   assert.equal(reconciliation.unresolved.length, 0);
   assert.equal(reconciliation.resolved.includes(result.processId), true);
-  assert.deepEqual(await readdir(ledgerDirectory), []);
+  assert((await readdir(ledgerDirectory)).every(name => name.endsWith('.terminal.json')));
 });
 
 test('public process redaction detects a secret split across output chunks', async () => {
@@ -876,7 +876,7 @@ test('process ledger restores unreported terminal records across manager restart
   assert.equal(reports.length, 1);
   assert.equal(reports[0].result.processId, started.processId);
   await second.acknowledgeTerminalReport(started.processId);
-  assert.deepEqual(await readdir(ledgerDirectory), []);
+  assert((await readdir(ledgerDirectory)).every(name => name.endsWith('.terminal.json')));
 });
 
 test('startup reconciliation stops an orphaned child process tree and resolves its atomic ledger', async () => {
@@ -910,7 +910,7 @@ test('startup reconciliation stops an orphaned child process tree and resolves i
   assert.equal(reports.length, 1);
   assert.equal(reports[0].result.status, 'stopped');
   await manager.acknowledgeTerminalReport(processId);
-  assert.deepEqual(await readdir(ledgerDirectory), []);
+  assert((await readdir(ledgerDirectory)).every(name => name.endsWith('.terminal.json')));
 });
 
 test('reconciliation never signals a PID without authenticated supervisor identity and blocks the rooted authority', async () => {
@@ -938,7 +938,6 @@ test('reconciliation never signals a PID without authenticated supervisor identi
       },
       startedAt: new Date().toISOString(),
       rootPath: root,
-      state: 'running',
       terminalReported: false
     }) + '\n'
   );
@@ -1076,7 +1075,7 @@ test('local host durably hands recovered terminal reports to old runs during sta
   assert.equal(delivered.length, 1, JSON.stringify(await host.reconciliation()));
   assert.equal(delivered[0].result.processId, processId);
   assert.equal(delivered[0].result.owner.runId, 'orphan-run');
-  assert.deepEqual(await readdir(path.join(root, 'processes')), []);
+  assert((await readdir(path.join(root, 'processes'))).every(name => name.endsWith('.terminal.json')));
   await host.close();
 });
 
@@ -1163,7 +1162,7 @@ test('authenticated process settlement is independent of incompatible output met
       timeoutMs: 5_000, yieldMs: 0, outputTokenBudget: 100, owner: invocation };
     const result = await startCommand(first, request, { awaitTerminal: true });
     await first.unreportedTerminalProcesses(invocation.ownerId);
-    const outputPath = path.join(ledgerDirectory, `${result.processId}.output.json`);
+    const outputPath = path.join(ledgerDirectory, `${result.processId}.terminal.json`);
     if (output === 'missing') await rm(outputPath);
     else if (output === 'malformed') await writeFile(outputPath, '{');
     else {
@@ -1171,10 +1170,6 @@ test('authenticated process settlement is independent of incompatible output met
       receipt.combined.capturedBytes = receipt.combined.observedBytes + 1;
       await writeFile(outputPath, JSON.stringify(receipt));
     }
-    const ledgerPath = path.join(ledgerDirectory, `${result.processId}.json`);
-    const ledger = JSON.parse(await readFile(ledgerPath, 'utf8'));
-    ledger.terminal = { status: 'invalid presentation', stdout: { text: null } };
-    await writeFile(ledgerPath, JSON.stringify(ledger));
     second = new LocalCommandExecution(options);
     assert.deepEqual((await second.reconcile()).unresolved, []);
     const [report] = second.recoveredTerminalReports();
@@ -1232,7 +1227,7 @@ test('terminal handoff retries use stable evidence and retain it until durable a
   assert.deepEqual(deliveries.at(-1), recovered);
   accepted = true;
   await second.retryReconciliation();
-  assert.deepEqual(await readdir(ledgerDirectory), []);
+  assert((await readdir(ledgerDirectory)).every(name => name.endsWith('.terminal.json')));
   assert.deepEqual(second.recoveredTerminalReports(), []);
 });
 
@@ -1245,7 +1240,7 @@ test('an output receipt write failure cannot erase a known terminal outcome', as
     rootedFileAuthority: files, ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process,
     async onSupervisorCheckpoint(checkpoint, processId) {
       if (checkpoint !== 'ledger_persisted' || blockedPath) return;
-      blockedPath = path.join(ledgerDirectory, `${processId}.output.json`);
+      blockedPath = path.join(ledgerDirectory, `${processId}.terminal.json`);
       await mkdir(blockedPath);
     } });
   t.after(async () => { await manager.close(); files.close(); await rm(root, { recursive: true, force: true }); });
@@ -1254,7 +1249,7 @@ test('an output receipt write failure cannot erase a known terminal outcome', as
   const result = await startCommand(manager, request, { awaitTerminal: true });
   assert.equal(result.status, 'exited');
   assert.equal(result.exitCode, 0);
-  assert.match(result.diagnostic, /output receipt storage failed/);
+  assert.match(result.diagnostic, /terminal record storage failed/);
   const [report] = await manager.disposeOwner(invocation.ownerId);
   assert.equal(report.result.status, 'exited');
   const next = await startCommand(manager, request, { awaitTerminal: true });
@@ -1262,4 +1257,53 @@ test('an output receipt write failure cannot erase a known terminal outcome', as
   await rm(blockedPath, { recursive: true });
   await manager.acknowledgeTerminalReport(result.processId);
   await manager.acknowledgeTerminalReport(next.processId);
+});
+
+test('acknowledged terminal processes survive buffer expiration and restart with their original owner and artifacts', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'process-terminal-retention-'));
+  const files = testRootedFileAuthority(root);
+  const artifacts = new InMemoryArtifactRepository();
+  const reports = [];
+  const options = { artifactRepository: artifacts, rootedFileAuthority: files,
+    ledgerDirectory: path.join(root, 'processes'), ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process,
+    maxCapturedBytes: 256, maxTotalCapturedBytes: 256, completedRetentionMs: 20,
+    async commitTerminalReport(report) { reports.push(report); } };
+  const manager = new LocalCommandExecution(options);
+  let reopened;
+  t.after(async () => { await manager.close(); await reopened?.close(); files.close(); await rm(root, { recursive: true, force: true }); });
+  const request = { command: 'printf original', rootedDirectory: '.', pty: false,
+    timeoutMs: 5_000, yieldMs: 0, outputTokenBudget: 100, owner: invocation };
+  const original = await startCommand(manager, request, { awaitTerminal: true });
+  await new Promise(resolve => setTimeout(resolve, 80));
+  assert.deepEqual(await manager.unreportedTerminalProcesses(invocation.ownerId), []);
+  const terminal = await manager.query(original.processId, 100, 0, original.cursorEnd, invocation);
+  assert.equal(terminal.status, 'exited');
+  assert.equal(terminal.exitCode, 0);
+  assert.equal(terminal.cursorEnd, original.cursorEnd);
+  assert.deepEqual(terminal.owner, original.owner);
+  assert.deepEqual(terminal.artifact, original.artifact);
+  assert.deepEqual(terminal.combined.segments, []);
+  assert.equal((await manager.terminate(original.processId, invocation)).status, 'exited');
+  await assert.rejects(manager.terminate(original.processId, { ...invocation, ownerId: 'foreign' }), /another resource owner/);
+  const next = await startCommand(manager, request, { awaitTerminal: true });
+  assert.equal(next.status, 'exited', 'expired buffers release capture reservations');
+  assert.equal(reports.length, 2);
+  reopened = new LocalCommandExecution(options);
+  assert.deepEqual((await reopened.reconcile()).unresolved, []);
+  const recovered = await reopened.terminate(original.processId, invocation);
+  assert.equal(recovered.status, 'exited');
+  assert.deepEqual(recovered.artifact, original.artifact);
+  assert.equal(reports.length, 2, 'querying terminal truth does not republish completion');
+  assert((await readdir(options.ledgerDirectory)).every(name => name.endsWith('.terminal.json')));
+});
+
+test('unavailable process controls return known failures rather than uncertain effects', async (t) => {
+  const { manager, context, root } = await processContext();
+  t.after(async () => { await manager.close(); await rm(root, { recursive: true, force: true }); });
+  for (const name of ['stop_process', 'write_stdin']) {
+    const observation = await invokeToolCall(jsonToolCall(name, { processId: 'missing-process' }), tools, context);
+    assert.equal(observation.kind, 'failure');
+    assert.equal(observation.execution.state, 'not_started');
+    assert.equal(observation.output.details.cause, 'not_found');
+  }
 });

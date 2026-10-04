@@ -1,5 +1,5 @@
 import type { ToolActivityRenderer } from './tools.js';
-import type { AgentProgressEvent, SessionBranchEntry } from '@agent-core/runtime';
+import type { AgentProgressEvent, AgentToolDiagnostic, SessionBranchEntry } from '@agent-core/runtime';
 import { decodeToolCall, type ToolCall } from '@agent-core/tools';
 import {
   completedSessionToolActivity,
@@ -359,6 +359,25 @@ export function projectProgress(
     ...entry,
     runId: input.runId
   }));
+}
+
+/** Restore diagnostic presentation independently of whether external execution settled. */
+export function projectToolDiagnostics(
+  diagnostics: readonly AgentToolDiagnostic[],
+  entries: readonly ConversationEntry[]
+): readonly ConversationActivityEntry[] {
+  return diagnostics.map((diagnostic) => {
+    const id = toolActivityId(diagnostic);
+    const current = entries.find((entry) => entry.id === id && entry.kind === 'activity');
+    return {
+      id, runId: diagnostic.runId, kind: 'activity', activity: 'tool',
+      label: current?.kind === 'activity' ? current.label : diagnostic.toolName,
+      status: diagnostic.observation.kind === 'failure' ? 'failed' : 'warning',
+      summary: diagnostic.observation.summary,
+      details: [{ id: 'execution', content:
+        `Invocation ${diagnostic.observation.kind}; external execution ${diagnostic.observation.execution?.state ?? 'not established'}.` }]
+    };
+  });
 }
 /** Acceptance can arrive after progress. Place the input before output from its own run. */
 export function insertAcceptedInput(

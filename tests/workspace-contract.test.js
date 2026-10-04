@@ -35,20 +35,6 @@ test('workspace adoption rejects a null descriptor at the boundary', () => {
   assert.throws(() => adoptWorkspaceFiles({ descriptor: null }), /descriptor is invalid/);
 });
 
-test('command tools expose environment lifetimes only for a capable composition', () => {
-  const local = createExecCommandTool();
-  const environment = createExecCommandTool({ environmentLifetimeSupported: true });
-  assert.equal(
-    local.decodeInput({ kind: 'json', value: { command: 'server', lifetime: 'environment' } }).ok,
-    false
-  );
-  assert.equal(
-    environment.decodeInput({ kind: 'json', value: { command: 'server', lifetime: 'environment' } })
-      .ok,
-    true
-  );
-});
-
 test('workspace reads preserve original BOM, CRLF, UTF-8 bytes and range hashes', async () => {
   const source = '\ufefffirst\r\nλ🙂second\r\nlast';
   const fixture = workspaceTools({ 'source.txt': source });

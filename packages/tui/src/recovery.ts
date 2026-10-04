@@ -27,11 +27,11 @@ export function suspensionPresentation(reason: AgentSessionSuspensionDescriptor[
       };
     case 'tool_outcome_unknown':
       return {
-        title: 'Tool result unavailable',
+        title: 'Tool execution uncertain',
         resumeLabel: 'Check for a recorded result',
-        waitingMessage: 'No recorded tool result is available yet. Checking does not execute the tool again.',
+        waitingMessage: 'Execution remains uncertain. Checking only queries existing evidence.',
         explanation:
-          'A tool may have executed, but its result is not recorded. Check for a recorded result before deciding what to do next. Stopping this run does not undo its effects.'
+          'Tool execution could not be confirmed. Inspect its diagnostic and recorded evidence before deciding what to do next. Checking does not execute the tool again; stopping this run does not undo its effects.'
       };
     case 'missing_implementation':
       return {

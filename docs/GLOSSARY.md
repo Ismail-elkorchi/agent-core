@@ -41,10 +41,7 @@ Do not introduce persisted or public names using:
   normalized, admitted, or assembled;
 - `evaluation` for production verification.
 
-An adapter may retain an upstream protocol name only at that boundary. Coding
-Agent therefore mirrors Sandbox `prepare`, `preparing`, and `prepared` wire
-states in its Sandbox adapters, then exposes application-owned authorization
-terminology everywhere else.
+An adapter may retain an upstream protocol name only at that boundary.
 
 Local variables may use ordinary English where there is no domain ambiguity, but
 persisted fields and exported APIs must name the exact state transition.

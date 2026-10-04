@@ -7,6 +7,8 @@ import * as z from 'zod';
 import {
   AgentRuntime,
   AgentRunRecords,
+  AgentRunCoordinator,
+  InferenceService,
   resolveToolObservation,
   agentEventCodec,
   applyAgentRunStateTransition
@@ -16,7 +18,8 @@ import { adoptCommandExecution, commandExecutionResources, defineTool, ResourceL
 import {
   DEFAULT_LOCAL_TOOL_CONFIGURATION,
   LocalCommandExecution,
-  execCommandTool
+  execCommandTool,
+  stopProcessTool
 } from '@agent-core/tools-local';
 import { testRootedFileAuthority } from '../rooted-file-authority-helper.js';
 
@@ -62,6 +65,7 @@ class Provider {
   async complete(request) {
     const item = this.script.shift();
     if (item instanceof Error) throw item;
+    if (typeof item === 'function') return item(request);
     return { ...item, model: request.model };
   }
 }
@@ -94,6 +98,7 @@ async function setup() {
 function createRuntime(input) {
   return new AgentRuntime({ maxOutputTokens: 64,
     provider: input.provider,
+    ...(input.inferenceService ? { inferenceService: input.inferenceService } : {}),
     model: 'scripted',
     toolBoundary: boundary,
     repositories: { events: input.events, artifacts: input.artifacts },
@@ -462,4 +467,45 @@ test('an executor settlement reference is reused rather than duplicated during r
   assert.equal(result.terminal.executionStatus, 'completed');
   assert.equal(acknowledged, 'process');
   assert.equal((await records(events, 'already-settled-run')).filter((event) => event.type === 'resource.released').length, 1);
+});
+
+test('an uncertain stop reports its diagnostic immediately and recovers by querying terminal evidence', async () => {
+  const state = await setup();
+  const terminate = state.manager.terminate.bind(state.manager);
+  let stopAttempts = 0;
+  state.manager.terminate = async (...args) => {
+    const result = await terminate(...args);
+    if (++stopAttempts === 1) throw new Error('Stop response interrupted after termination');
+    return result;
+  };
+  const provider = new Provider([
+    toolResponse('exec_command', { command: 'printf done' }),
+    async () => {
+      const [result] = await state.manager.listProcesses();
+      return toolResponse('stop_process', { processId: result.processId });
+    },
+    done
+  ]);
+  const progress = [];
+  const input = { ...state, provider, inferenceService: InferenceService.inMemory({ provider }),
+    tools: [execCommandTool, stopProcessTool],
+    onProgress(event) { progress.push(event); } };
+  const agent = createRuntime(input);
+  const paused = await agent.run({ runId: 'stop-recovery-run', task: 'Run and stop the process.' }).result;
+  assert.equal(paused.state, 'suspended');
+  assert.equal(paused.reason, 'tool_outcome_unknown');
+  const failure = progress.find(event => event.type === 'tool.ended' && event.toolName === 'stop_process');
+  assert.equal(failure.observation.kind, 'failure');
+  assert.equal(failure.observation.execution.state, 'unknown');
+  assert.match(failure.observation.summary, /Stop response interrupted/);
+  const coordinator = new AgentRunCoordinator(state.events, state.artifacts);
+  const inspection = await coordinator.inspect(paused.runId);
+  const diagnostics = await coordinator.readToolDiagnostics(inspection.state);
+  assert.equal(diagnostics.length, 1);
+  assert.equal(diagnostics[0].observation.summary, failure.observation.summary);
+  const result = await createRuntime(input).resume(paused.runId).result;
+  assert.equal(result.state, 'ended');
+  assert.equal(result.terminal.executionStatus, 'completed', JSON.stringify(result.terminal));
+  assert.equal(stopAttempts, 1, 'recovery must not repeat the stop effect');
+  await state.manager.close();
 });

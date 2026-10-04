@@ -18,6 +18,8 @@ import {
 import { encodeToolObservation } from '@agent-core/tools';
 import type { AgentAuditEvent, AgentEvent } from '../../events.js';
 import type { AgentRunBudgetState } from '../contracts.js';
+import { toolEventKey, type AgentToolCallAttemptIdentity } from '../contracts.js';
+import type { StoredToolObservation } from '../../orchestration/observation-source.js';
 import {
   decodeAgentRunState,
   nextAgentRunInstruction,
@@ -66,6 +68,12 @@ export interface AgentRunInspection {
   readonly tail: EventLedgerTail;
   readonly instruction: AgentRunInstruction;
 }
+
+export type AgentToolDiagnostic = AgentToolCallAttemptIdentity & Readonly<{
+  runId: string;
+  toolName: string;
+  observation: Pick<StoredToolObservation, 'kind' | 'summary' | 'execution'>;
+}>;
 
 export interface AgentRunAdvance {
   readonly phase: AgentRunControlPhase;
@@ -214,6 +222,30 @@ export class AgentRunCoordinator {
       });
       return this.lastInspection;
     }
+  }
+
+  /** Read reported diagnostics for uncertain calls by identity, without replaying history. */
+  async readToolDiagnostics(state: AgentRunState): Promise<readonly AgentToolDiagnostic[]> {
+    const diagnostics: AgentToolDiagnostic[] = [];
+    for (const batch of state.toolBatches) {
+      for (const [callIndex, call] of batch.callStates.entries()) {
+        if (call.stage !== 'outcome_unknown') continue;
+        const identity = { ...batch.identity, toolBatchId: batch.toolBatchId,
+          callIndex, toolAttempt: call.toolAttempt };
+        const reference = await this.events.referenceByKey(state.runId, toolEventKey(state.runId, identity, 'ended'));
+        if (!reference) continue;
+        const { event } = await this.events.readReference(reference);
+        if (event.type !== 'tool.ended' || event.turnId !== identity.turnId ||
+            event.toolBatchId !== identity.toolBatchId || event.callIndex !== callIndex ||
+            event.toolAttempt !== call.toolAttempt || event.toolName !== batch.calls[callIndex]?.name)
+          throw new Error('Tool diagnostic does not match its run and invocation identity.');
+        diagnostics.push(Object.freeze({ ...identity, runId: state.runId,
+          ...(event.callId ? { callId: event.callId } : {}), toolName: event.toolName,
+          observation: Object.freeze({ kind: event.observation.kind, summary: event.observation.summary,
+            ...(event.observation.execution ? { execution: event.observation.execution } : {}) }) }));
+      }
+    }
+    return Object.freeze(diagnostics);
   }
 
   async listUnfinished(): Promise<readonly AgentRunInspection[]> {

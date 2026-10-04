@@ -197,6 +197,5 @@ test('tool schemas describe search-relative globs and expose only supported life
   assert.match(findFilesTool.jsonSchema.properties.patterns.description, /relative to path/);
   assert.match(searchTextTool.jsonSchema.properties.path.description, /do not bound traversal/);
   assert.equal(execCommandTool.jsonSchema.properties.lifetime, undefined);
-  assert.ok(createExecCommandTool({ environmentLifetimeSupported: true }).jsonSchema.properties.lifetime);
   assert.match(execCommandTool.jsonSchema.properties.outputTokenBudget.description, /excerpts or pages/);
 });

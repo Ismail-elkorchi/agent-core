@@ -26,7 +26,7 @@ const request = (startPath, extra = {}) => ({
   includeHidden: false, exclude: [], ...extra
 });
 
-test('subtree, ignored-directory and exact-file selection inherit only authorized ancestor rules', async (t) => {
+test('subtree, ignored-directory and exact-file selection inherit only authorized ancestor rules', { skip: process.platform !== 'linux' }, async (t) => {
   const { root } = await fixture(t);
   const selector = new RootedFileSelector(root, DEFAULT_LOCAL_TOOL_CONFIGURATION.fileSelection);
   const result = await selector.select(request('packages'));
@@ -40,7 +40,7 @@ test('subtree, ignored-directory and exact-file selection inherit only authorize
   assert.deepEqual(accesses.map(a => a.scope), ['files/packages/src', 'files/packages/.gitignore', 'files/.gitignore']);
 });
 
-test('ancestor reads share ignore and traversal bounds, report unsafe rules, and observe cancellation', async (t) => {
+test('ancestor reads share ignore and traversal bounds, report unsafe rules, and observe cancellation', { skip: process.platform !== 'linux' }, async (t) => {
   const { root, rootPath } = await fixture(t);
   const limits = DEFAULT_LOCAL_TOOL_CONFIGURATION.fileSelection;
   const limited = await new RootedFileSelector(root, { ...limits, maxIgnoreFiles: 1 }).select(request('packages/src'));

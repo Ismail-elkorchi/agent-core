@@ -1,7 +1,7 @@
 import * as z from 'zod';
 import { processOutputSchema } from '../process-output.js';
 
-export function execCommandSchema(ptySupported: boolean, environmentLifetimeSupported = false) {
+export function execCommandSchema(ptySupported: boolean) {
   return z.strictObject({
     command: z.string().trim().min(1),
     workdir: z
@@ -13,11 +13,6 @@ export function execCommandSchema(ptySupported: boolean, environmentLifetimeSupp
         'Directory relative to the workspace root. Use "." for the root; absolute paths are not accepted.'
       ),
     ...(ptySupported ? { pty: z.boolean().default(false) } : {}),
-    ...(environmentLifetimeSupported ? {
-      lifetime: z.enum(['job', 'environment']).default('job').describe(
-        'Job processes end with their owner. Environment services persist across jobs and imply background execution.'
-      )
-    } : {}),
     background: z.boolean().default(false).describe(
       'Return a process handle only when the task requires interactive input or work while this command remains active. Otherwise wait for exit or timeout.'
     ),

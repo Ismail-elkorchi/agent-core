@@ -1701,6 +1701,7 @@ export class AgentRuntime {
     signal: AbortSignal
   ): ToolCallExecutor {
     return new ToolCallExecutor({
+      events: this.options.repositories.events,
       runId: runtime.runId,
       driverGeneration: runtime.run.state().driverGeneration,
       resolveTools: (catalog) => this.catalogTools.get(catalog.revision) ?? this.tools,

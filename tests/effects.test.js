@@ -39,8 +39,8 @@ function issue(currentDriverGeneration = 3, driverGeneration = 3) {
 test('effect recovery admission owns exact capability facts and rejects incomplete proof', () => {
   const queryable = decodeEffectRecoveryCapability({
     kind: 'queryable',
-    service: 'sandbox',
-    reconcilerId: 'sandbox.execution-query.v1',
+    service: 'execution-service',
+    reconcilerId: 'execution-query.v1',
     externalExecutionId: 'execution-1',
     expiresAt: '2027-01-01T00:00:00.000Z'
   });

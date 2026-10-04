@@ -7,6 +7,7 @@ import {
 } from '@agent-core/persistence';
 import {
   ResourceLeaseCoordinator,
+  CommandProcessOperationRejectedError,
   adoptCommandExecution,
   createCommandExecutionReservation,
   createCommandOutputView,
@@ -46,9 +47,10 @@ import {
 import type { OwnedProcessTree } from './process-tree.js';
 import {
   parseLedgerEntry,
-  parseOutputReceipt,
+  parseTerminalRecord,
+  terminalRecordReport,
   type ProcessLedgerEntry,
-  type ProcessOutputReceipt
+  type ProcessTerminalRecord
 } from './process-records.js';
 import { processScope } from './resources.js';
 import { isRootedFileAuthority, type RootedFileAuthority } from './rooted-file-authority.js';
@@ -135,11 +137,6 @@ interface ProcessArtifacts {
   readonly publicArtifact?: PublicArtifactRef;
   readonly protectedArtifact?: ProtectedArtifactRef;
 }
-interface ProcessTerminalTombstone {
-  readonly report: CommandExecutionReport;
-  readonly owner: CommandExecutionOwner;
-  terminalReported: boolean;
-}
 class LocalCommandReservationState {
   readonly authorization;
   #state: 'plan' | 'started' | 'released' = 'plan';
@@ -176,7 +173,7 @@ export class LocalCommandExecution implements CommandExecution {
   readonly resourceLeases = new ResourceLeaseCoordinator();
   private readonly active = new Map<string, ManagedProcess>();
   private readonly completed = new Map<string, ManagedProcess>();
-  private readonly tombstones = new Map<string, ProcessTerminalTombstone>();
+  private readonly terminalRecords = new Map<string, ProcessTerminalRecord>();
   private readonly recovered = new Map<string, CommandExecutionReport>();
   private readonly recoveredEntries = new Map<string, ProcessLedgerEntry>();
   private readonly cleanupResidues = new Map<string, string>();
@@ -239,10 +236,6 @@ export class LocalCommandExecution implements CommandExecution {
 
   async plan(request: CommandExecutionPlanRequest): Promise<CommandExecutionReservation> {
     request = ownCommandExecutionRequest(request);
-    if (request.lifetime === 'environment')
-      throw new Error(
-        'Local command execution cannot retain environment services independently of its owner.'
-      );
     const commandDirectory = await this.options.rootedFileAuthority.commandDirectory(
       request.rootedDirectory
     );
@@ -438,23 +431,24 @@ export class LocalCommandExecution implements CommandExecution {
     if (!Number.isSafeInteger(outputTokenBudget) || outputTokenBudget < 0)
       throw new RangeError('Output budget must be a nonnegative safe integer.');
     await this.ready;
-    const recovered = this.recovered.get(processId);
-    if (recovered) {
-      if (requester && requester.ownerId !== recovered.result.owner.ownerId)
-        throw new Error('Process belongs to another resource owner: ' + processId);
-      return recovered.result;
-    }
-    const tombstone = this.tombstones.get(processId);
-    if (tombstone) {
-      if (requester && requester.ownerId !== tombstone.owner.ownerId)
-        throw new Error('Process belongs to another resource owner: ' + processId);
-      return tombstone.report.result;
+    const managed = this.active.get(processId) ?? this.completed.get(processId);
+    if (!managed) {
+      const terminal = await this.readTerminalRecord(processId);
+      if (terminal) {
+        this.assertOwner(terminal, requester);
+        return terminalRecordReport(terminal, afterCursor).result;
+      }
+      const recovered = this.recovered.get(processId);
+      if (recovered) {
+        this.assertOwner(recovered.result, requester);
+        return recovered.result;
+      }
     }
     const record = this.requireProcess(processId);
     this.assertOwner(record, requester);
     if (record.status !== 'running' && record.progressClosed) await record.progressDrainPromise;
     if (!Number.isSafeInteger(afterCursor) || afterCursor < 0 || afterCursor > record.cursor)
-      throw new Error('Invalid process output cursor.');
+      throw new CommandProcessOperationRejectedError(processId, 'invalid_cursor');
     if (record.status === 'running' && record.cursor === afterCursor && yieldMs > 0)
       await this.waitForActivity(record, yieldMs, afterCursor);
     const cursorExpired = afterCursor < record.oldestCursor;
@@ -500,8 +494,7 @@ export class LocalCommandExecution implements CommandExecution {
     requester?: CommandExecutionOwner
   ): Promise<void> {
     await this.ready;
-    const record = this.requireRunningProcess(processId);
-    this.assertOwner(record, requester);
+    const record = await this.requireRunningProcess(processId, requester);
     await new Promise<void>((resolve, reject) =>
       record.tree.child.stdin.write(text, (error) => {
         if (error) reject(error);
@@ -512,6 +505,10 @@ export class LocalCommandExecution implements CommandExecution {
 
   async closeInput(processId: string, requester?: CommandExecutionOwner): Promise<void> {
     await this.ready;
+    if (!this.active.has(processId) && !this.completed.has(processId)) {
+      await this.query(processId, 0, 0, 0, requester);
+      return;
+    }
     const record = this.requireProcess(processId);
     this.assertOwner(record, requester);
     if (record.status !== 'running' || record.tree.child.stdin.writableEnded) return;
@@ -528,8 +525,8 @@ export class LocalCommandExecution implements CommandExecution {
     requester?: CommandExecutionOwner
   ): Promise<CommandExecutionResult> {
     await this.ready;
-    if (this.recovered.has(processId)) return this.query(processId, 4_000, 0, 0, requester);
-    if (this.tombstones.has(processId)) return this.query(processId, 4_000, 0, 0, requester);
+    if (!this.active.has(processId) && !this.completed.has(processId))
+      return this.query(processId, 4_000, 0, 0, requester);
     const record = this.requireProcess(processId);
     this.assertOwner(record, requester);
     if (record.status === 'running') {
@@ -561,10 +558,6 @@ export class LocalCommandExecution implements CommandExecution {
       if (record.owner.ownerId !== ownerId || record.terminalReported) continue;
       reports.push(await this.finish(record));
     }
-    for (const tombstone of this.tombstones.values()) {
-      if (tombstone.owner.ownerId !== ownerId || tombstone.terminalReported) continue;
-      reports.push(tombstone.report);
-    }
     for (const report of this.recovered.values())
       if (report.result.owner.ownerId === ownerId) reports.push(report);
     return Object.freeze(
@@ -584,16 +577,15 @@ export class LocalCommandExecution implements CommandExecution {
   async acknowledgeTerminalReport(processId: string): Promise<void> {
     await this.ready;
     const record = this.completed.get(processId);
+    if (record && !(await this.readTerminalRecord(processId)))
+      await this.persistTerminalRecord(record, await this.finalArtifacts(record));
     if (record) record.terminalReported = true;
-    const tombstone = this.tombstones.get(processId);
-    if (tombstone) tombstone.terminalReported = true;
     try {
       await this.markLedgerTerminalReported(processId);
       await this.removeLedger(processId);
       this.recovered.delete(processId);
       this.recoveredEntries.delete(processId);
       this.cleanupResidues.delete(processId);
-      if (tombstone) this.tombstones.delete(processId);
     } catch (error) {
       this.cleanupResidues.set(
         processId,
@@ -637,6 +629,7 @@ export class LocalCommandExecution implements CommandExecution {
   async close(): Promise<void> {
     await this.ready;
     for (const record of [...this.active.values()]) await this.terminate(record.id);
+    for (const processId of [...this.completed.keys()]) await this.expire(processId);
   }
   async listProcesses(): Promise<readonly CommandProcess[]> {
     await this.ready;
@@ -670,11 +663,6 @@ export class LocalCommandExecution implements CommandExecution {
       });
     }
     return Object.freeze([...known, ...this.reconciliation.unresolved.map((item) => ({ ...item, status: 'unknown' as const }))]);
-  }
-  has(processId: string): boolean {
-    return (
-      this.active.has(processId) || this.completed.has(processId) || this.tombstones.has(processId)
-    );
   }
   activeCount(ownerId?: string): number {
     return ownerId === undefined
@@ -872,9 +860,9 @@ export class LocalCommandExecution implements CommandExecution {
     this.signalActivity(record);
     const artifacts = await this.finalArtifacts(record);
     try {
-      await this.persistOutputReceipt(record, artifacts);
+      await this.persistTerminalRecord(record, artifacts);
     } catch (error) {
-      record.diagnostic = appendDiagnostic(record.diagnostic, `Process output receipt storage failed: ${errorMessage(error)}`);
+      record.diagnostic = appendDiagnostic(record.diagnostic, `Process terminal record storage failed: ${errorMessage(error)}`);
     }
     try {
       await this.persistLedger(this.runningLedgerEntry(record, requirePid(record.tree)));
@@ -954,31 +942,34 @@ export class LocalCommandExecution implements CommandExecution {
   private async expire(processId: string): Promise<void> {
     const record = this.completed.get(processId);
     if (!record) return;
-    if (!record.terminalReported) {
-      const report = await this.finish(record);
-      this.tombstones.set(processId, { report, owner: record.owner, terminalReported: false });
-    }
-    this.completed.delete(processId);
-    this.reservedCapturedBytes = Math.max(
-      0,
-      this.reservedCapturedBytes - this.options.maxCapturedBytes
-    );
+    if (!(await this.readTerminalRecord(processId)))
+      await this.persistTerminalRecord(record, await this.finalArtifacts(record));
+    const report = record.terminalReported ? undefined : await this.finish(record);
+    if (!this.completed.delete(processId)) return;
+    if (!record.terminalReported && report)
+      this.recovered.set(processId, compactTerminalReport(report));
+    this.reservedCapturedBytes -= this.options.maxCapturedBytes;
     if (record.retention) clearTimeout(record.retention);
   }
 
   private requireProcess(id: string): ManagedProcess {
     const record = this.active.get(id) ?? this.completed.get(id);
-    if (!record) throw new Error('Unknown process: ' + id);
+    if (!record) throw new CommandProcessOperationRejectedError(id, 'not_found');
     return record;
   }
-  private requireRunningProcess(id: string): ManagedProcess {
+  private async requireRunningProcess(id: string, requester?: CommandExecutionOwner): Promise<ManagedProcess> {
+    if (!this.active.has(id) && !this.completed.has(id)) {
+      await this.query(id, 0, 0, 0, requester);
+      throw new CommandProcessOperationRejectedError(id, 'not_running');
+    }
     const record = this.requireProcess(id);
-    if (record.status !== 'running') throw new Error('Process is not running: ' + id);
+    this.assertOwner(record, requester);
+    if (record.status !== 'running') throw new CommandProcessOperationRejectedError(id, 'not_running');
     return record;
   }
-  private assertOwner(record: ManagedProcess, requester?: CommandExecutionOwner): void {
+  private assertOwner(record: { readonly owner: CommandExecutionOwner } & ({ readonly id: string } | { readonly processId: string }), requester?: CommandExecutionOwner): void {
     if (requester && requester.ownerId !== record.owner.ownerId)
-      throw new Error('Process belongs to another resource owner: ' + record.id);
+      throw new CommandProcessOperationRejectedError('processId' in record ? record.processId : record.id, 'wrong_owner');
   }
 
   private waitForActivity(
@@ -1040,7 +1031,7 @@ export class LocalCommandExecution implements CommandExecution {
     for (const name of names) {
       const processId = name.slice(0, -5);
       // A retry must never take over an effect already managed by this executor.
-      if (this.active.has(processId) || this.completed.has(processId) || this.tombstones.has(processId)) continue;
+      if (this.active.has(processId) || this.completed.has(processId) || this.recovered.has(processId)) continue;
       let source: string | undefined;
       let entry: ProcessLedgerEntry | undefined;
       try {
@@ -1101,31 +1092,76 @@ export class LocalCommandExecution implements CommandExecution {
     terminal: SupervisorTerminalState,
     stopped: boolean
   ): Promise<CommandExecutionReport> {
-    let receipt: ProcessOutputReceipt | undefined;
+    let receipt: ProcessTerminalRecord | undefined;
     let outputDiagnostic: string | undefined;
     try {
-      receipt = parseOutputReceipt(JSON.parse(await readFile(this.outputReceiptPath(entry.processId), 'utf8')));
+      receipt = await this.readTerminalRecord(entry.processId);
+      if (!receipt) outputDiagnostic = 'Original process output has no retained terminal record.';
     } catch (error) {
       outputDiagnostic = nodeCode(error) === 'ENOENT'
         ? 'Original process output has no retained receipt.'
         : `Original process output receipt is incompatible or unreadable: ${errorMessage(error)}`;
     }
-    return Object.freeze({
+    if (receipt && (
+      receipt.processId !== entry.processId || receipt.rootPath !== entry.rootPath ||
+      JSON.stringify(receipt.owner) !== JSON.stringify(entry.owner) ||
+      receipt.exitCode !== terminal.exitCode || receipt.signal !== terminal.signal
+    )) throw new Error('Process terminal record does not match its authenticated supervisor.');
+    const report = Object.freeze({
       result: recoveredTerminalResult(entry, terminal, stopped, receipt, outputDiagnostic),
       ...(receipt?.protectedArtifact === undefined ? {} : { protectedArtifact: receipt.protectedArtifact })
     });
+    if (!receipt) await this.storeTerminalRecord(
+      terminalRecordFromReport(report, entry.rootPath, this.descriptor.recoveryIdentity)
+    );
+    return report;
   }
 
-  private outputReceiptPath(processId: string): string {
-    return this.ledgerPath(processId).replace(/\.json$/u, '.output.json');
+  private terminalRecordPath(processId: string): string {
+    return this.ledgerPath(processId).replace(/\.json$/u, '.terminal.json');
   }
 
-  private async persistOutputReceipt(record: ManagedProcess, artifacts: ProcessArtifacts): Promise<void> {
-    if (!this.options.ledgerDirectory) return;
+  private async readTerminalRecord(processId: string): Promise<ProcessTerminalRecord | undefined> {
+    if (!/^proc_[a-f0-9-]+$/u.test(processId))
+      throw new CommandProcessOperationRejectedError(processId, 'not_found');
+    if (!this.options.ledgerDirectory) return this.terminalRecords.get(processId);
+    let source: string;
+    try {
+      source = await readFile(this.terminalRecordPath(processId), 'utf8');
+    } catch (error) {
+      if (nodeCode(error) === 'ENOENT') return undefined;
+      throw new CommandProcessOperationRejectedError(processId, 'evidence_unavailable', { cause: error });
+    }
+    try {
+      const terminal = parseTerminalRecord(JSON.parse(source));
+      if (terminal.processId !== processId ||
+          terminal.rootPath !== this.options.rootedFileAuthority.identity.canonicalPath ||
+          terminal.executionTargetId !== this.descriptor.recoveryIdentity)
+        throw new Error('Process terminal record belongs to another execution authority.');
+      return terminal;
+    } catch (cause) {
+      throw new CommandProcessOperationRejectedError(processId, 'evidence_unavailable', { cause });
+    }
+  }
+
+  private async storeTerminalRecord(record: ProcessTerminalRecord): Promise<void> {
+    if (this.options.ledgerDirectory)
+      await this.persistJsonRecord(this.terminalRecordPath(record.processId), record);
+    else this.terminalRecords.set(record.processId, record);
+  }
+
+  private async persistTerminalRecord(record: ManagedProcess, artifacts: ProcessArtifacts): Promise<void> {
     const chunks = record.capture.chunks();
     const captured = (stream: LocalOutputStream) => chunks.filter((chunk) => chunk.stream === stream).reduce((sum, chunk) => sum + chunk.bytes, 0);
-    const receipt: ProcessOutputReceipt = {
+    const receipt: ProcessTerminalRecord = {
       schemaVersion: 1,
+      processId: record.id,
+      rootPath: record.rootPath,
+      executionTargetId: this.descriptor.recoveryIdentity,
+      owner: record.owner,
+      status: record.terminalStatus ?? 'failed',
+      exitCode: record.exitCode ?? null,
+      signal: record.signal ?? null,
       cursorEnd: record.cursor,
       stdout: { observedBytes: record.observed.stdout, capturedBytes: captured('stdout') },
       stderr: { observedBytes: record.observed.stderr, capturedBytes: captured('stderr') },
@@ -1134,7 +1170,7 @@ export class LocalCommandExecution implements CommandExecution {
       ...(artifacts.protectedArtifact === undefined ? {} : { protectedArtifact: artifacts.protectedArtifact }),
       ...(record.diagnostic === undefined ? {} : { diagnostic: record.diagnostic })
     };
-    await this.persistJsonRecord(this.outputReceiptPath(record.id), receipt);
+    await this.storeTerminalRecord(receipt);
   }
 
   private async persistJsonRecord(target: string, value: unknown): Promise<void> {
@@ -1159,7 +1195,6 @@ export class LocalCommandExecution implements CommandExecution {
     const ledgerPath = this.ledgerPath(processId);
     if (this.options.removeLedgerRecord) await this.options.removeLedgerRecord(ledgerPath);
     else await rm(ledgerPath, { force: true });
-    await rm(this.outputReceiptPath(processId), { force: true });
     await this.removeSupervisorFiles(processId);
   }
 
@@ -1470,7 +1505,7 @@ function recoveredTerminalResult(
   entry: ProcessLedgerEntry,
   terminal: SupervisorTerminalState,
   stopped: boolean,
-  receipt: ProcessOutputReceipt | undefined,
+  receipt: ProcessTerminalRecord | undefined,
   outputDiagnostic: string | undefined
 ): CommandExecutionResult {
   const stream = (observedBytes: number) => createCommandOutputView({
@@ -1485,7 +1520,7 @@ function recoveredTerminalResult(
     processId: entry.processId,
     owner: entry.owner,
     status:
-      entry.terminationReason ?? (terminal.state === 'exited'
+      receipt?.status ?? entry.terminationReason ?? (terminal.state === 'exited'
         ? 'exited'
         : terminal.state === 'stopped' || stopped
           ? 'stopped'
@@ -1507,6 +1542,48 @@ function recoveredTerminalResult(
       outputDiagnostic, receipt?.diagnostic].filter((part) => part !== undefined).join(' ')
   });
 }
+function terminalRecordFromReport(
+  report: CommandExecutionReport,
+  rootPath: string,
+  executionTargetId: string
+): ProcessTerminalRecord {
+  const { result, protectedArtifact } = report;
+  if (result.status === 'running') throw new Error('A running process has no terminal record.');
+  const counts = (stream: CommandOutputView) => ({
+    observedBytes: stream.observedBytes,
+    capturedBytes: stream.capturedBytes
+  });
+  return Object.freeze({
+    schemaVersion: 1,
+    processId: result.processId,
+    rootPath,
+    executionTargetId,
+    owner: result.owner,
+    status: result.status,
+    exitCode: result.exitCode ?? null,
+    signal: result.signal ?? null,
+    cursorEnd: result.cursorEnd,
+    stdout: counts(result.stdout),
+    stderr: counts(result.stderr),
+    combined: counts(result.combined),
+    ...(result.artifact ? { artifact: result.artifact } : {}),
+    ...(protectedArtifact ? { protectedArtifact } : {}),
+    ...(result.diagnostic === undefined ? {} : { diagnostic: result.diagnostic })
+  });
+}
+
+function compactTerminalReport(report: CommandExecutionReport): CommandExecutionReport {
+  const empty = (output: CommandOutputView) => createCommandOutputView({
+    segments: [], observedBytes: output.observedBytes, capturedBytes: 0,
+    startsAtOutputStart: output.observedBytes === 0, endsAtOutputEnd: output.observedBytes === 0
+  });
+  return Object.freeze({ ...report, result: Object.freeze({
+    ...report.result, cursorStart: report.result.cursorEnd,
+    stdout: empty(report.result.stdout), stderr: empty(report.result.stderr),
+    combined: empty(report.result.combined)
+  }) });
+}
+
 function recoveryIdentity(
   ledgerDirectory: string | undefined,
   rootedFileAuthority: RootedFileAuthority

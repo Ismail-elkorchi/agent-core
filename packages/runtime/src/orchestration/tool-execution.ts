@@ -1,6 +1,6 @@
 import { serializeToolModelContent } from '@agent-core/tools';
 import { issueEffectStartTicket, startExternalEffect } from '@agent-core/effects';
-import { hashJson } from '@agent-core/persistence';
+import { hashJson, type EventRepository } from '@agent-core/persistence';
 import {
   POLICY_TOOL_AUTHORIZER,
   abortableToolBoundary,
@@ -27,7 +27,7 @@ import {
   type ToolPlanningContext,
   type ToolProgress
 } from '@agent-core/tools';
-import type { AgentAuditEvent, AgentProgressEvent } from '../events.js';
+import type { AgentAuditEvent, AgentEvent, AgentProgressEvent } from '../events.js';
 import { toolEventKey } from '../run/contracts.js';
 import type { ModelWindow } from '../inference/model-window.js';
 import type { PromptContextItemInput } from '../inference/prompt-material.js';
@@ -65,6 +65,7 @@ export type ToolContextPrerequisite = (request: ToolInputInspection) => Promise<
 
 export interface ToolExecutionInput {
   readonly runId: string;
+  readonly events: Pick<EventRepository<AgentEvent>, 'referenceByKey' | 'readReference'>;
   readonly driverGeneration: number;
   readonly resolveTools: (source: ToolCatalogSnapshot) => readonly CompiledToolDefinition[];
   readonly currentTools: () =>
@@ -692,7 +693,7 @@ async function finishObservationRecording(
   retained: CommittedToolObservation | undefined
 ): Promise<void> {
   const call = requireCall(phase, callIndex);
-  await appendToolEnded(input, phase, callIndex, call, state);
+  if (!retained) await appendToolEnded(input, phase, callIndex, call, state);
   await recordObservation(
     input,
     phase,
@@ -832,15 +833,37 @@ async function appendToolEnded(
   state: Extract<AgentToolCallState, { readonly stage: 'settled' | 'recording' | 'recorded' }>
 ): Promise<void> {
   const identity = attemptIdentity(phase, callIndex, call, state.toolAttempt);
-  await input.append(
+  const key = toolEventKey(input.runId, identity, 'ended');
+  const previous = await input.events.referenceByKey(input.runId, key);
+  if (previous) {
+    const { event } = await input.events.readReference(previous);
+    if (event.type !== 'tool.ended' || event.toolName !== call.name ||
+        (event.observation.digest !== state.settlement.original.digest &&
+         event.observation.execution?.state !== 'unknown'))
+      throw new Error('A recorded tool outcome cannot be replaced by another result.');
+  } else await input.append(
     {
       type: 'tool.ended',
       ...identity,
       toolName: call.name,
       observation: state.settlement.original
     },
-    toolEventKey(input.runId, identity, 'ended')
+    key
   );
+  if (state.settlement.observation)
+    await input.emit({
+      type: 'tool.ended',
+      ...identity,
+      toolName: call.name,
+      observation: state.settlement.observation
+    });
+  else if (state.settlement.original.storage === 'unavailable')
+    await input.emit({
+      type: 'tool.observation.unavailable',
+      ...identity,
+      toolName: call.name,
+      original: state.settlement.original
+    });
 }
 
 async function recordObservation(
@@ -914,20 +937,7 @@ async function recordObservation(
       immediateContent: fallback
     });
   }
-  if (state.settlement.observation)
-    await input.emit({
-      type: 'tool.ended',
-      ...identity,
-      toolName: call.name,
-      observation: state.settlement.observation
-    });
-  else if (state.settlement.original.storage === 'unavailable')
-    await input.emit({
-      type: 'tool.observation.unavailable',
-      ...identity,
-      toolName: call.name,
-      original: state.settlement.original
-    });
+
 }
 
 function committedFromState(

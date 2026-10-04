@@ -1,10 +1,12 @@
+import { CommandProcessOperationRejectedError, defineTool } from '@agent-core/tools';
 import {
-  defineTool,
-  isCommandExecution,
-  requireToolService,
-  type CommandExecution,
-  type CommandExecutionOwner
-} from '@agent-core/tools';
+  commandExecutor,
+  processObservation,
+  processOwner,
+  processQueryRecovery,
+  processOperationRejectedObservation,
+  recoverProcessObservation
+} from '../../core/process-control.js';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
 import { buildProcessContent } from '../../core/model-content.js';
 import { processScope } from '../../core/resources.js';
@@ -31,68 +33,35 @@ export const writeStdinTool = defineTool({
       outputTokenBudget: clampRequestedLimit(input.outputTokenBudget, limits.maxOutputTokens)
     };
   },
-  deriveEffects(input) {
+  deriveEffects(input, context) {
     return {
       accesses: [{ mode: 'execute' as const, scope: processScope(input.processId) }],
       lockScopes: [processScope(input.processId)],
-      recovery: { kind: 'unknown' as const }
+      recovery: input.text || input.closeStdin ? { kind: 'unknown' as const } : processQueryRecovery(input.processId, 'agent-core.write-stdin@1', context)
     };
   },
+  recover: (input, _effect, context) => recoverProcessObservation(input, context, false),
   async invoke(input, context) {
-    const executor = requireToolService<CommandExecution>(
-      context,
-      'commandExecution',
-      isCommandExecution,
-      'CommandExecution'
-    );
+    const executor = commandExecutor(context);
     const owner = processOwner(context);
-    if (input.text !== undefined && input.text.length > 0)
-      await executor.writeInput(input.processId, input.text, owner);
-    if (input.closeStdin) await executor.closeInput(input.processId, owner);
-    const result = await executor.query(
-      input.processId,
-      input.outputTokenBudget,
-      input.yieldMs,
-      input.afterCursor,
-      owner
-    );
-    return {
-      kind: 'result' as const,
-      execution: {
-        state: result.status === 'running' ? ('active' as const) : ('settled' as const)
-      },
-      summary:
-        result.status === 'running'
-          ? 'Process ' + result.processId + ' is still running.'
-          : 'Process ' + result.processId + ' is ' + result.status + '.',
-      scope: {
-        resources: [processScope(result.processId)],
-        coverage: result.combined.omittedBytes > 0 || result.cursorExpired ? 'partial' : 'complete',
-        ...(result.combined.omittedBytes > 0 || result.cursorExpired
-          ? {
-              truncated: true,
-              causes: [result.cursorExpired ? 'cursor_expired' : 'output_budget'],
-              omitted: { bytes: result.combined.omittedBytes }
-            }
-          : {})
-      },
-      ...(result.artifact
-        ? { content: [{ type: 'artifact' as const, artifact: result.artifact }] }
-        : {}),
-      output: result
-    };
+    let inputChanged = false;
+    try {
+      if (input.text !== undefined && input.text.length > 0) {
+        await executor.writeInput(input.processId, input.text, owner);
+        inputChanged = true;
+      }
+      if (input.closeStdin) {
+        await executor.closeInput(input.processId, owner);
+        inputChanged = true;
+      }
+      const result = await executor.query(
+        input.processId, input.outputTokenBudget, input.yieldMs, input.afterCursor, owner
+      );
+      return processObservation(result);
+    } catch (error) {
+      if (error instanceof CommandProcessOperationRejectedError)
+        return processOperationRejectedObservation(error, inputChanged ? 'settled' : 'not_started');
+      throw error;
+    }
   }
 });
-function processOwner(
-  context: import('@agent-core/tools').ToolExecutionContext
-): CommandExecutionOwner {
-  const invocation = context.invocation;
-  if (!invocation) throw new Error('Process tools require a runtime invocation owner.');
-  return Object.freeze({
-    ownerId: context.resourceOwnerId ?? invocation.runId,
-    runId: invocation.runId,
-    turnId: invocation.turnId,
-    toolBatchId: invocation.toolBatchId,
-    callIndex: invocation.callIndex
-  });
-}

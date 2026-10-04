@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createToolCall } from '@agent-core/tools';
-import { projectProgress, projectSessionEntry, mergeConversationEntries } from '@agent-core/tui';
+import { projectProgress, projectToolDiagnostics, projectSessionEntry, mergeConversationEntries } from '@agent-core/tui';
 
 const turn = { turnId: 'turn', turnIndex: 1, requestAttempt: 1 };
 test('reasoning channels, assistant text and concurrent tools retain causal identities', () => {
@@ -150,4 +150,17 @@ test('live output previews are bounded and presentation cannot hide execution un
   );
   assert.equal(stored.status, 'warning');
   assert.match(stored.summary, /Original observation unavailable/);
+});
+
+
+test('restored uncertain tool diagnostics replace running presentation without claiming settlement', () => {
+  const diagnostic = { ...turn, runId: 'run', toolBatchId: 'batch', callIndex: 0,
+    toolAttempt: 1, toolName: 'stop_process',
+    observation: { kind: 'failure', execution: { state: 'unknown' }, summary: 'Stop response interrupted.' } };
+  const running = { id: 'tool:run:turn:batch:0', kind: 'activity', activity: 'tool',
+    label: 'Stop owned process', status: 'running' };
+  const [activity] = projectToolDiagnostics([diagnostic], [running]);
+  assert.equal(activity.status, 'failed');
+  assert.equal(activity.summary, diagnostic.observation.summary);
+  assert.match(activity.details[0].content, /external execution unknown/);
 });

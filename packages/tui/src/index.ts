@@ -74,6 +74,7 @@ export {
   conversationText,
   mergeConversationEntries,
   projectProgress,
+  projectToolDiagnostics,
   projectSessionEntry,
   sessionConversationId,
   type ConversationActivityEntry,

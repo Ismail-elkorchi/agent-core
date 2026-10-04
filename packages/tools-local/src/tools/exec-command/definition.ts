@@ -7,7 +7,6 @@ import {
   requireToolService,
   startCommandExecutionPlan,
   type CommandExecution,
-  type CommandExecutionOwner,
   type CommandExecutionPlan,
   type CommandExecutionPlanRequest,
   type ToolExecutionContext,
@@ -15,12 +14,13 @@ import {
 } from '@agent-core/tools';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
 import { buildProcessContent } from '../../core/model-content.js';
+import { processOwner } from '../../core/process-control.js';
 import { fileScope, processScope } from '../../core/resources.js';
 import { requireRootedFileAuthority } from '../../core/rooted-files.js';
 import { execCommandOutputSchema, execCommandSchema } from './schema.js';
 
 export function createExecCommandTool(
-  options: { readonly ptySupported?: boolean; readonly environmentLifetimeSupported?: boolean } = {}
+  options: { readonly ptySupported?: boolean } = {}
 ) {
   const ptySupported = options.ptySupported === true;
   return defineTool({
@@ -28,7 +28,7 @@ export function createExecCommandTool(
     implementationId: 'agent-core.exec-command.v1',
     description:
       'Run a command to exit or timeout while streaming progress. Background commands return a process handle for later interaction.',
-    schema: execCommandSchema(ptySupported, options.environmentLifetimeSupported),
+    schema: execCommandSchema(ptySupported),
     outputSchema: execCommandOutputSchema,
     buildModelContent: buildProcessContent,
     requirements: {
@@ -59,13 +59,11 @@ export function createExecCommandTool(
         'CommandExecution'
       );
       const owner = processOwner(context);
-      const lifetime = 'lifetime' in input && input.lifetime === 'environment' ? 'environment' : 'job';
-      const background = input.background || lifetime === 'environment';
+      const background = input.background;
       const request = Object.freeze({
         ...input,
         background,
         pty: 'pty' in input && input.pty === true,
-        lifetime,
         workdir,
         yieldMs: background ? Math.min(1_000, limits.maxYieldMs) : 0,
         timeoutMs: clampRequestedLimit(input.timeoutMs, limits.maxTimeoutMs),
@@ -90,7 +88,6 @@ export function createExecCommandTool(
         command: request.command,
         rootedDirectory: request.workdir,
         pty: request.pty,
-        lifetime: request.lifetime,
         timeoutMs: request.timeoutMs,
         yieldMs: request.yieldMs,
         outputTokenBudget: request.outputTokenBudget,
@@ -168,18 +165,6 @@ async function executeCommand(
   };
 }
 export const execCommandTool = createExecCommandTool();
-function processOwner(context: ToolExecutionContext): CommandExecutionOwner {
-  const invocation = context.invocation;
-  if (!invocation) throw new Error('Process tools require a runtime invocation owner.');
-  return Object.freeze({
-    ownerId: context.resourceOwnerId ?? invocation.runId,
-    runId: invocation.runId,
-    turnId: invocation.turnId,
-    toolBatchId: invocation.toolBatchId,
-    callIndex: invocation.callIndex
-  });
-}
-
 interface CommandInput extends Omit<CommandExecutionPlanRequest, 'rootedDirectory'> {
   readonly workdir: string;
   readonly background: boolean;
@@ -191,7 +176,6 @@ function commandSnapshot(input: CommandInput) {
     command: input.command,
     workdir: input.workdir,
     pty: input.pty,
-    lifetime: input.lifetime ?? 'job',
     timeoutMs: input.timeoutMs,
     background: input.background,
     outputTokenBudget: input.outputTokenBudget

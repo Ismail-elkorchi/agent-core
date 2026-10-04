@@ -36,7 +36,6 @@ export function commandReleaseReport(report: CommandExecutionReport): ResourceRe
       status: result.status,
       owner: result.owner,
       cursorEnd: result.cursorEnd,
-      ...(result.eventCursor === undefined ? {} : { eventCursor: result.eventCursor }),
       stdout: outputCounts(result.stdout),
       stderr: outputCounts(result.stderr),
       ...(result.terminal === undefined ? {} : { terminal: outputCounts(result.terminal) }),

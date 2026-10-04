@@ -1,10 +1,12 @@
+import { CommandProcessOperationRejectedError, defineTool } from '@agent-core/tools';
 import {
-  defineTool,
-  isCommandExecution,
-  requireToolService,
-  type CommandExecution,
-  type CommandExecutionOwner
-} from '@agent-core/tools';
+  commandExecutor,
+  processObservation,
+  processOwner,
+  processQueryRecovery,
+  processOperationRejectedObservation,
+  recoverProcessObservation
+} from '../../core/process-control.js';
 import { clampRequestedLimit, requireLocalToolConfiguration } from '../../core/configuration.js';
 import { buildProcessContent } from '../../core/model-content.js';
 import { processScope } from '../../core/resources.js';
@@ -31,63 +33,28 @@ export const stopProcessTool = defineTool({
       )
     };
   },
-  deriveEffects(input) {
+  deriveEffects(input, context) {
     return {
       accesses: [{ mode: 'execute' as const, scope: processScope(input.processId) }],
       lockScopes: [processScope(input.processId)],
-      recovery: { kind: 'unknown' as const }
+      recovery:  processQueryRecovery(input.processId, 'agent-core.stop-process@1', context)
     };
   },
+  recover: (input, _effect, context) => recoverProcessObservation(input, context, true),
   async invoke(input, context) {
-    const executor = requireToolService<CommandExecution>(
-      context,
-      'commandExecution',
-      isCommandExecution,
-      'CommandExecution'
-    );
+    const executor = commandExecutor(context);
     const owner = processOwner(context);
-    await executor.terminate(input.processId, owner);
-    const result = await executor.query(
-      input.processId,
-      input.outputTokenBudget,
-      0,
-      input.afterCursor,
-      owner
-    );
-    return {
-      kind: 'result' as const,
-      execution: {
-        state: result.status === 'running' ? ('active' as const) : ('settled' as const)
-      },
-      summary: 'Process ' + result.processId + ' is ' + result.status + '.',
-      scope: {
-        resources: [processScope(result.processId)],
-        coverage: result.combined.omittedBytes > 0 || result.cursorExpired ? 'partial' : 'complete',
-        ...(result.combined.omittedBytes > 0 || result.cursorExpired
-          ? {
-              truncated: true,
-              causes: [result.cursorExpired ? 'cursor_expired' : 'output_budget'],
-              omitted: { bytes: result.combined.omittedBytes }
-            }
-          : {})
-      },
-      ...(result.artifact
-        ? { content: [{ type: 'artifact' as const, artifact: result.artifact }] }
-        : {}),
-      output: result
-    };
+    let terminationConfirmed = false;
+    try {
+      await executor.terminate(input.processId, owner);
+      terminationConfirmed = true;
+      return processObservation(await executor.query(
+        input.processId, input.outputTokenBudget, 0, input.afterCursor, owner
+      ));
+    } catch (error) {
+      if (error instanceof CommandProcessOperationRejectedError)
+        return processOperationRejectedObservation(error, terminationConfirmed ? 'settled' : 'not_started');
+      throw error;
+    }
   }
 });
-function processOwner(
-  context: import('@agent-core/tools').ToolExecutionContext
-): CommandExecutionOwner {
-  const invocation = context.invocation;
-  if (!invocation) throw new Error('Process tools require a runtime invocation owner.');
-  return Object.freeze({
-    ownerId: context.resourceOwnerId ?? invocation.runId,
-    runId: invocation.runId,
-    turnId: invocation.turnId,
-    toolBatchId: invocation.toolBatchId,
-    callIndex: invocation.callIndex
-  });
-}
