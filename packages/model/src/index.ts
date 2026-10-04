@@ -559,7 +559,6 @@ export class ModelProviderError extends Error {
   readonly code: ModelProviderErrorCode;
   readonly retryable: boolean;
   readonly provider: string;
-  readonly causeValue: unknown;
   readonly diagnostic: ModelProviderErrorDiagnostic;
 
   constructor(options: {
@@ -574,21 +573,41 @@ export class ModelProviderError extends Error {
       causeSummary?: Record<string, ModelProviderErrorDiagnosticValue>;
     };
   }) {
-    super(options.message);
+    super(options.message, { cause: options.cause });
     this.name = 'ModelProviderError';
     this.provider = options.provider;
     this.code = options.code;
     this.retryable = options.retryable ?? false;
-    this.causeValue = options.cause;
+    const causeSummary = { ...errorCauseSummary(options.cause), ...options.diagnostic?.causeSummary };
     this.diagnostic = {
       provider: options.provider,
       code: options.code,
       retryable: this.retryable,
       ...(options.diagnostic?.transport ? { transport: options.diagnostic.transport } : {}),
       ...(options.diagnostic?.eventType ? { eventType: options.diagnostic.eventType } : {}),
-      ...(options.diagnostic?.causeSummary ? { causeSummary: options.diagnostic.causeSummary } : {})
+      ...(Object.keys(causeSummary).length > 0 ? { causeSummary: Object.freeze(causeSummary) } : {})
     };
   }
+}
+
+function errorCauseSummary(cause: unknown): Record<string, ModelProviderErrorDiagnosticValue> {
+  if (!(cause instanceof Error)) return {};
+  let root = cause;
+  const seen = new Set<Error>();
+  while (root.cause instanceof Error && !seen.has(root.cause) && seen.size < 8) {
+    seen.add(root);
+    root = root.cause;
+  }
+  const describe = (error: Error, prefix: string) => ({
+    [`${prefix}Name`]: error.name,
+    [`${prefix}Message`]: error.message.slice(0, 500),
+    ...('code' in error &&
+    (typeof error.code === 'string' ||
+      (typeof error.code === 'number' && Number.isFinite(error.code)))
+      ? { [`${prefix}Code`]: error.code }
+      : {})
+  });
+  return { ...describe(cause, 'cause'), ...(root === cause ? {} : describe(root, 'rootCause')) };
 }
 
 export * from './accounting.js';

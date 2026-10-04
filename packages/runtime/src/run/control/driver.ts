@@ -1393,9 +1393,9 @@ function assertProviderAdvance(
           ['effect_pending', 'outcome_unknown'].includes(next.stage)
         : procedure === 'reconcile_provider_request'
           ? ['effect_pending', 'effect_ready'].includes(previous.stage) &&
-            ['settled', 'rejected', 'outcome_unknown', 'effect_ready'].includes(next.stage)
+            ['settled', 'failed', 'outcome_unknown', 'effect_ready'].includes(next.stage)
           : procedure === 'consume_provider_settlement'
-            ? (previous.stage === 'settled' || previous.stage === 'rejected') &&
+            ? (previous.stage === 'settled' || previous.stage === 'failed') &&
               next.stage === 'consumed'
             : procedure === 'finalize_abort'
               ? next.stage === 'outcome_unknown'

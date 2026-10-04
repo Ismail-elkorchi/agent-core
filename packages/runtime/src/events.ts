@@ -332,7 +332,7 @@ export type AgentEvent =
       readonly request: AgentModelRequestSummary;
     } & AgentTurnIdentity)
   | ({
-      readonly type: 'provider.attempt.rejected';
+      readonly type: 'provider.attempt.failed';
       readonly effectId: string;
       readonly responseId: string;
       readonly inputIdentity: string;
@@ -907,13 +907,11 @@ const AGENT_EVENT_DECODERS = {
       request: decodeModelRequestSummary(value.request)
     });
   },
-  'provider.attempt.rejected': (value) => {
+  'provider.attempt.failed': (value) => {
     exact(value, ['type', ...TURN_KEYS, 'effectId', 'responseId', 'inputIdentity', 'diagnostic']);
     const diagnostic = decodeDiagnostic(value.diagnostic);
-    if (diagnostic.code !== 'context_overflow')
-      throw malformed('unsupported definitive provider rejection');
     return Object.freeze({
-      type: 'provider.attempt.rejected',
+      type: 'provider.attempt.failed',
       ...decodeTurnIdentity(value),
       effectId: requiredString(value.effectId, 'effectId'),
       responseId: requiredString(value.responseId, 'responseId'),

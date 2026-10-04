@@ -1174,7 +1174,9 @@ test('stream interruption preserves an unknown provider outcome without treating
     },
     async *stream() {
       yield { type: 'content', content: 'part', accumulated: 'part' };
-      throw new Error('socket closed');
+      throw new ModelProviderError({
+        provider: 'scripted', code: 'provider_unavailable', message: 'socket closed', retryable: true
+      });
     }
   });
   const { agent, events, sessions, session } = await harness({ provider });
@@ -1486,47 +1488,88 @@ test('model-turn limits terminate deterministically', async () => {
   assert.equal(exhausted.exhaustedLimit, 'model_turns');
 });
 
-test('provider failure preserves one durable unknown outcome without a second request', async () => {
+test('ordinary generation retries absent output and retains every uncertain charge', async () => {
   const provider = new ScriptedProvider([
     new ModelProviderError({
       provider: 'scripted',
       code: 'provider_unavailable',
-      message: 'unknown outcome',
-      retryable: true
+      message: 'fetch failed',
+      retryable: true,
+      cause: new TypeError('fetch failed', {
+        cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' })
+      })
     }),
     response()
   ]);
   const fixture = await harness({ provider, withoutSession: true });
-  const result = await fixture.agent.run({ task: 'one provider attempt' }).result;
-  assert.equal(result.state, 'suspended');
-  assert.equal(result.reason, 'provider_outcome_unknown');
-  assert.equal(provider.calls.length, 1);
+  const result = ended(await fixture.agent.run({ task: 'Complete this generation.' }).result);
+  assert.equal(result.executionStatus, 'completed');
+  assert.equal(provider.calls.length, 2);
+  assert.deepEqual(provider.calls[1].messages, provider.calls[0].messages);
   const records = await eventsFor(fixture.events, result.runId);
-  assert.equal(records.filter((event) => event.type === 'model.requested').length, 1);
-  assert.equal(records.filter((event) => event.type === 'provider.attempt.settled').length, 0);
+  assert.equal(records.filter((event) => event.type === 'model.requested').length, 2);
+  assert.equal(records.filter((event) => event.type === 'provider.attempt.settled').length, 1);
+  const failed = records.find((event) => event.type === 'provider.attempt.failed');
+  assert.equal(failed.diagnostic.causeSummary.rootCauseCode, 'UND_ERR_SOCKET');
+  assert.equal(failed.diagnostic.causeSummary.rootCauseMessage, 'other side closed');
   const inspection = await new AgentRunCoordinator(fixture.events, fixture.artifacts).inspect(
     result.runId
   );
-  assert.equal(inspection.state.phase.kind, 'active');
-  assert.equal(inspection.state.providerRequests.at(-1).stage, 'outcome_unknown');
-  assert.equal(
-    inspection.state.providerRequests.at(-1).effect.intent.implementationId,
-    provider.implementationId
-  );
-  assert.deepEqual(inspection.state.providerRequests.at(-1).effect.intent.recovery, {
-    kind: 'unknown'
+  assert.equal(inspection.state.phase.kind, 'terminal');
+  const { inference } = runtimeRepositories.get(fixture.events);
+  const owner = await inference.load(result.runId);
+  assert.equal(owner.committed.invocations, 2);
+  assert.equal(owner.settledUsage.invocations, 1);
+  assert(owner.committed.usage.promptTokens > owner.settledUsage.usage.promptTokens);
+  const fingerprint = records.find((event) => event.type === 'inference.request.fingerprinted').fingerprint;
+  const first = (await inference.load(result.runId, { invocationId: fingerprint.requestId })).invocation;
+  assert(first.uncertain);
+  assert.equal(first.settlement, undefined);
+});
+
+test('generation retries require a fresh admission within the original owner budget', async () => {
+  const provider = new ScriptedProvider([
+    new ModelProviderError({ provider: 'scripted', code: 'provider_unavailable', message: 'connection lost', retryable: true }),
+    response()
+  ]);
+  const events = new InMemoryEventRepository(agentEventCodec);
+  const artifacts = new InMemoryArtifactRepository();
+  const inference = new InMemoryInferenceRepository();
+  const agent = new AgentRuntime({
+    provider, model: 'scripted', maxOutputTokens: 64,
+    inferenceService: new InferenceService({ provider, repository: inference, artifacts, budget: { maxInvocations: 1 } }),
+    repositories: { events, artifacts }, toolBoundary
   });
-  assert.deepEqual(
-    inspection.state.providerRequests
-      .at(-1)
-      .effect.intent.exposure.quantities.map((quantity) => quantity.unit),
-    ['prompt_tokens', 'completion_tokens']
-  );
-  assert.ok(
-    inspection.state.providerRequests
-      .at(-1)
-      .effect.intent.exposure.quantities.every((quantity) => quantity.amount > 0)
-  );
+  const result = ended(await agent.run({ task: 'Inspect.' }).result);
+  assert.equal(result.executionStatus, 'failed');
+  assert.equal(provider.calls.length, 1);
+  assert.equal((await inference.load(result.runId)).committed.invocations, 1);
+});
+
+test('ordinary generation stops cleanly after bounded failures or a permanent provider rejection', async () => {
+  for (const retryable of [true, false]) {
+    const failure = () => new ModelProviderError({
+      provider: 'scripted', code: retryable ? 'provider_unavailable' : 'invalid_request',
+      message: retryable ? 'connection lost' : 'Invalid credentials.', retryable
+    });
+    const provider = new ScriptedProvider([failure(), failure(), failure(), response()]);
+    const fixture = await harness({ provider, withoutSession: true });
+    const result = ended(await fixture.agent.run({ task: 'Complete this generation.' }).result);
+    assert.equal(result.executionStatus, 'failed');
+    assert.equal(provider.calls.length, retryable ? 3 : 1);
+    const state = (await new AgentRunCoordinator(fixture.events, fixture.artifacts).inspect(result.runId)).state;
+    assert.equal(state.phase.kind, 'terminal');
+    assert.equal((await runtimeRepositories.get(fixture.events).inference.load(result.runId)).committed.invocations, provider.calls.length);
+  }
+});
+
+test('an unclassified provider failure preserves its unresolved outcome without another request', async () => {
+  const provider = new ScriptedProvider([new Error('unknown execution outcome'), response()]);
+  const fixture = await harness({ provider, withoutSession: true });
+  const result = await fixture.agent.run({ task: 'Inspect.' }).result;
+  assert.equal(result.state, 'suspended');
+  assert.equal(result.reason, 'provider_outcome_unknown');
+  assert.equal(provider.calls.length, 1);
 });
 
 test('a provider start ticket stranded by process loss becomes an exact durable abort decision', async () => {
@@ -1624,6 +1667,56 @@ test('a persisted provider settlement resumes without issuing a duplicate reques
   const records = await eventsFor(events, control.runId);
   assert.equal(records.filter((event) => event.type === 'provider.attempt.settled').length, 1);
   assert.equal(records.filter((event) => event.type === 'assistant.ended').length, 1);
+});
+
+test('recorded generation failures survive process loss without unresolved recovery or another request', async () => {
+  for (const boundary of ['receipt', 'phase', 'retry_prepared', 'terminal_staged']) {
+    class InterruptedFailureRepository extends InMemoryEventRepository {
+      stopped = false;
+      interrupt = true;
+      async appendConditional(runId, event, options) {
+        if (this.stopped) throw new Error('simulated process stop after generation failure');
+        const receipt = await super.appendConditional(runId, event, options);
+        if (this.interrupt && (
+          (boundary === 'receipt' && event.type === 'provider.attempt.failed') ||
+          (boundary === 'phase' && event.type === 'run.state.transitioned' &&
+            event.transition.kind === 'updated' &&
+            event.transition.providerRequests?.some((entry) => entry.value.stage === 'failed')) ||
+          (boundary === 'retry_prepared' && event.type === 'run.state.transitioned' &&
+            event.transition.kind === 'updated' &&
+            event.transition.providerRequests?.some((entry) =>
+              entry.value.stage === 'ready' && entry.value.identity.requestAttempt === 2)) ||
+          (boundary === 'terminal_staged' && event.type === 'run.finalization.staged')
+        )) {
+          this.interrupt = false;
+          this.stopped = true;
+          throw new Error('simulated process stop after generation failure');
+        }
+        return receipt;
+      }
+    }
+    const events = new InterruptedFailureRepository(agentEventCodec);
+    const provider = new ScriptedProvider([
+      new ModelProviderError({
+        provider: 'scripted', code: 'provider_unavailable', message: 'connection lost',
+        retryable: boundary !== 'terminal_staged'
+      }),
+      response('stop', 'must not be requested after process loss')
+    ]);
+    const first = await harness({ events, provider, withoutSession: true });
+    const control = first.agent.run({ task: 'Recover the recorded failure.' });
+    await assert.rejects(control.result, /simulated process stop|unresolved started provider effect/);
+    events.stopped = false;
+    const resumed = createRuntime({ provider, model: 'scripted', toolBoundary, repositories: { events } });
+    const result = ended(await resumed.resume(control.runId).result);
+    assert.equal(result.executionStatus, 'failed');
+    assert.equal(result.terminationReason, 'provider_error');
+    assert.equal(result.errorMessage, 'connection lost');
+    assert.equal(provider.calls.length, 1);
+    const owner = await runtimeRepositories.get(events).inference.load(control.runId);
+    assert.equal(owner.committed.invocations, 1);
+    assert.equal(owner.settledUsage.invocations, 0);
+  }
 });
 
 test('provider takeover never starts a second request while the previous owner may still be live', async () => {

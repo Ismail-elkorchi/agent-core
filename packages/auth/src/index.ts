@@ -76,7 +76,6 @@ export class AuthError extends Error {
   readonly code: AuthErrorCode;
   readonly retryable: boolean;
   readonly source?: AuthSourceInfo;
-  readonly causeValue: unknown;
 
   constructor(options: {
     code: AuthErrorCode;
@@ -85,14 +84,13 @@ export class AuthError extends Error {
     source?: AuthSourceInfo;
     cause?: unknown;
   }) {
-    super(options.message);
+    super(options.message, { cause: options.cause });
     this.name = 'AuthError';
     this.code = options.code;
     this.retryable = options.retryable ?? false;
     if (options.source) {
       this.source = options.source;
     }
-    this.causeValue = options.cause;
   }
 }
 

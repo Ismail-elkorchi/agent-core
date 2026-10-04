@@ -24,7 +24,6 @@ export class AgentFinalizationError extends Error {
   readonly runId: string;
   readonly finalizationId: string;
   readonly progress: AgentFinalizationProgress;
-  readonly causeValue: unknown;
 
   constructor(input: {
     runId: string;
@@ -33,13 +32,13 @@ export class AgentFinalizationError extends Error {
     cause: unknown;
   }) {
     super(
-      `Finalization ${input.finalizationId} for run ${input.runId} failed: staged=${String(input.progress.staged)}, sessionRecorded=${String(input.progress.sessionRecorded)}, committed=${String(input.progress.committed)}, reconciliation=${input.progress.reconciliation}. ${errorMessage(input.cause)}`
+      `Finalization ${input.finalizationId} for run ${input.runId} failed: staged=${String(input.progress.staged)}, sessionRecorded=${String(input.progress.sessionRecorded)}, committed=${String(input.progress.committed)}, reconciliation=${input.progress.reconciliation}. ${errorMessage(input.cause)}`,
+      { cause: input.cause }
     );
     this.name = 'AgentFinalizationError';
     this.runId = input.runId;
     this.finalizationId = input.finalizationId;
     this.progress = Object.freeze({ ...input.progress });
-    this.causeValue = input.cause;
   }
 }
 

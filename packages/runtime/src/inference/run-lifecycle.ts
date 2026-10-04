@@ -14,10 +14,12 @@ import {
 import type { ModelStreamEvent } from '@agent-core/model';
 import {
   createModelRequest,
+  ModelProviderError,
   parseModelResponse,
   type CompiledModelRequest,
   type ModelProfile,
   type ModelProvider,
+  type ModelProviderErrorDiagnostic,
   type ModelProviderSession,
   type ModelRequest,
   type ModelResponse,
@@ -62,10 +64,9 @@ export type RunInferenceResult =
       readonly identity: AgentTurnIdentity;
     }
   | {
-      readonly kind: 'context_rejected';
+      readonly kind: 'failed';
       readonly identity: AgentTurnIdentity;
-      readonly inputIdentity: string;
-      readonly diagnostic: import('@agent-core/model').ModelProviderErrorDiagnostic;
+      readonly diagnostic: ModelProviderErrorDiagnostic;
     }
   | { readonly kind: 'outcome_unknown'; readonly effectId: string };
 export interface RunInferenceInput {
@@ -102,7 +103,9 @@ export interface RunInferenceInput {
     advance: AgentRunAdvance
   ) => Promise<void>;
 }
-export function createRunInferenceLifecycle(input: RunInferenceInput): {
+export function createRunInferenceLifecycle(
+  input: RunInferenceInput & { readonly operation: 'generation' | 'native_generation' }
+): {
   readonly lifecycle: EffectLifecycle<RunInferenceResult, ModelResponse>;
   readonly onStreamEvent: (
     event: Exclude<ModelStreamEvent, { readonly type: 'done' }>
@@ -330,36 +333,63 @@ export function createRunInferenceLifecycle(input: RunInferenceInput): {
       const pending = providerWork(turnRequest.run.state(), identity);
       if (pending.stage !== 'effect_pending' || pending.effect.intent.effectId !== effectId)
         throw error;
-      if (
+      const failure =
+        error instanceof InferenceOutcomeUnknownError ? (error.cause ?? error) : error;
+      const cause = failure instanceof ModelStreamInterruptedError ? failure.cause : failure;
+      const rejected =
         error instanceof InferenceContextRejectedError &&
         !sawUpdate &&
-        error.inputIdentity === input.compiled.inputIdentity
-      ) {
+        error.inputIdentity === input.compiled.inputIdentity;
+      // Ordinary generation produces candidate output, not execution effects. Losing
+      // an empty response leaves its charge uncertain, but no client tool to reconcile.
+      // Native execution and partially delivered output retain their recovery boundary.
+      const failedGeneration =
+        input.operation === 'generation' &&
+        !sawUpdate &&
+        !(failure instanceof ModelStreamInterruptedError && failure.finalResponseReceived) &&
+        cause instanceof ModelProviderError &&
+        cause.provider === input.options.provider.id &&
+        !request.signal?.aborted;
+      const generationError = rejected
+        ? new ModelProviderError({
+            provider: input.options.provider.id,
+            code: 'context_overflow',
+            message: error.message,
+            cause: error
+          })
+        : failedGeneration
+          ? cause
+          : undefined;
+      if (generationError) {
         const diagnostic = Object.freeze({
-          provider: input.options.provider.id,
-          code: 'context_overflow' as const,
-          retryable: false,
-          causeSummary: Object.freeze({ message: error.message })
+          ...generationError.diagnostic,
+          causeSummary: Object.freeze({
+            ...generationError.diagnostic.causeSummary,
+            message: generationError.message
+          })
         });
-        const rejection = {
-          type: 'provider.attempt.rejected' as const,
+        const failed = {
+          type: 'provider.attempt.failed' as const,
           ...identity,
           effectId,
           responseId,
-          inputIdentity: error.inputIdentity,
+          inputIdentity: input.compiled.inputIdentity,
           diagnostic
         };
-        const receipt = await append(rejection);
+        const receipt = await turnRequest.run.append(
+          failed,
+          providerSettlementKey(effectId, responseId)
+        );
         const settled = settleExternalEffect(pending.effect, pending.effect.settlementPermit, {
           outcome: 'failed',
-          resultDigest: hashJson(rejection),
+          resultDigest: hashJson(failed),
           exposure: unknownEffectExposure(pending.effect.intent.exposure)
         });
         if (settled.status !== 'settled' && settled.status !== 'already_settled')
-          throw new Error('Rejected provider dispatch could not settle its original effect.');
+          throw new Error('Failed provider attempt could not settle its original effect.');
         await turnRequest.run.transitionProvider('reconcile_provider_request', identity, () => ({
           ...pending,
-          stage: 'rejected',
+          stage: 'failed',
           effect: settled.state,
           settlementReference: {
             runId: turnRequest.runId,
@@ -370,9 +400,8 @@ export function createRunInferenceLifecycle(input: RunInferenceInput): {
         }));
         await emit({ type: 'model.failed', ...identity, diagnostic });
         return Object.freeze({
-          kind: 'context_rejected',
+          kind: 'failed',
           identity: Object.freeze(identity),
-          inputIdentity: error.inputIdentity,
           diagnostic
         });
       }
@@ -382,9 +411,6 @@ export function createRunInferenceLifecycle(input: RunInferenceInput): {
         stage: 'outcome_unknown',
         effect: closed
       }));
-      const failure =
-        error instanceof InferenceOutcomeUnknownError ? (error.cause ?? error) : error;
-      const cause = failure instanceof ModelStreamInterruptedError ? failure.cause : failure;
       const providerDiagnostic = providerFailureDiagnostic(cause);
       const diagnostic = {
         provider: input.options.provider.id,
@@ -433,7 +459,7 @@ export function createRunInferenceLifecycle(input: RunInferenceInput): {
   return { lifecycle, onStreamEvent };
 }
 export async function invokeRunInference(input: RunInferenceInput): Promise<RunInferenceResult> {
-  const governed = createRunInferenceLifecycle(input);
+  const governed = createRunInferenceLifecycle({ ...input, operation: 'generation' });
   return input.service.invokeWithLifecycle(
     {
       workingStateRevisionId: input.requestFingerprint.workingStateRevisionId,

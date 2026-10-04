@@ -321,7 +321,7 @@ function assertRetainedWork(previous: AgentRunState, next: AgentRunState): void 
         item.identity.requestAttempt === request.identity.requestAttempt
     );
     const reprepare =
-      (request.stage === 'ready' || request.stage === 'rejected') &&
+      (request.stage === 'ready' || request.stage === 'failed') &&
       previous.phase.kind === 'suspended' &&
       previous.phase.reason === 'context_admission' &&
       next.phase.kind === 'initializing' &&

@@ -68,7 +68,18 @@ export function providerFailureText(
   diagnostic: Extract<AgentProgressEvent, { readonly type: 'model.failed' }>['diagnostic']
 ): string {
   const message = diagnostic.causeSummary?.message;
-  return typeof message === 'string'
+  const description = typeof message === 'string'
     ? message
     : `${diagnostic.provider}: ${diagnostic.code.replaceAll('_', ' ')}`;
+  const cause = diagnostic.causeSummary?.rootCauseMessage ?? diagnostic.causeSummary?.causeMessage;
+  const code = typeof diagnostic.causeSummary?.rootCauseMessage === 'string'
+    ? diagnostic.causeSummary.rootCauseCode
+    : diagnostic.causeSummary?.causeCode;
+  const detail = [
+    typeof code === 'string' || typeof code === 'number' ? String(code) : '',
+    typeof cause === 'string' ? cause : ''
+  ]
+    .filter((value) => value.length > 0 && !description.includes(value))
+    .join(': ');
+  return detail ? `${description}\nCause: ${detail}` : description;
 }

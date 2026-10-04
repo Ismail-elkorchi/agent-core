@@ -87,7 +87,7 @@ export type AgentProviderPhase =
     >
   | Readonly<
       AgentProviderPhaseBase & {
-        readonly stage: 'rejected';
+        readonly stage: 'failed';
         readonly requestEventId: string;
         readonly responseId: string;
         readonly effect: Extract<EffectExecutionState, { readonly phase: 'settled' }>;
@@ -330,7 +330,7 @@ function activeInstructions(state: AgentRunState): readonly AgentRunInstruction[
       turnId: request.identity.turnId,
       requestAttempt: request.identity.requestAttempt
     });
-    if (request.stage === 'settled' || request.stage === 'rejected')
+    if (request.stage === 'settled' || request.stage === 'failed')
       execute('consume_provider_settlement', target);
     else if (request.stage === 'effect_pending') execute('reconcile_provider_request', target);
     else if (!approval && request.stage === 'ready') execute('authorize_provider_request', target);
@@ -683,7 +683,7 @@ export function decodeProviderPhase(value: unknown): AgentProviderPhase {
       'effect_ready',
       'effect_pending',
       'settled',
-      'rejected',
+      'failed',
       'consumed',
       'outcome_unknown'
     ] as const,
@@ -718,11 +718,11 @@ export function decodeProviderPhase(value: unknown): AgentProviderPhase {
       throw new TypeError('An effect-pending provider phase requires a started effect.');
     return Object.freeze({ ...base, stage, requestEventId, responseId, effect });
   }
-  if (stage === 'settled' || stage === 'rejected' || stage === 'consumed') {
+  if (stage === 'settled' || stage === 'failed' || stage === 'consumed') {
     if (effect.phase !== 'settled' || !settlementReference)
       throw new TypeError('A settled provider phase requires effect and response settlement.');
-    if (stage === 'rejected' && effect.settlement.outcome !== 'failed')
-      throw new TypeError('Rejected provider input requires a recorded failed dispatch.');
+    if (stage === 'failed' && effect.settlement.outcome !== 'failed')
+      throw new TypeError('Failed provider generation requires its recorded failure.');
     return Object.freeze({
       ...base,
       stage,

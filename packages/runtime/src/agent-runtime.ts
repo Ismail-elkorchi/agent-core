@@ -52,6 +52,7 @@ import {
   type ToolPolicy
 } from '@agent-core/tools';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { ContextTransitionRequest } from './context/contracts.js';
 import type { ContextAdmissionInput, ContextService } from './context/service.js';
 import {
@@ -298,7 +299,7 @@ type AssistantTurnResult =
       readonly native: boolean;
     }
   | { readonly kind: 'renew_context' }
-  | { readonly kind: 'waiting'; readonly decision: ExecutionDecision }
+  | { readonly kind: 'decision'; readonly decision: ExecutionDecision }
   | { readonly kind: 'outcome_unknown'; readonly effectId: string };
 interface RequestAssemblyResult {
   readonly request: ModelRequest;
@@ -836,10 +837,12 @@ export class AgentRuntime {
           phase.responseId
         );
         if (settlement) {
+          const failed = settlement.event.type === 'provider.attempt.failed';
           const settled = settleExternalEffect(phase.effect, phase.effect.settlementPermit, {
-            outcome: 'succeeded',
+            outcome: failed ? 'failed' : 'succeeded',
             resultDigest: hashJson(settlement.event),
-            exposure: settlement.event.response.usage
+            exposure: settlement.event.type === 'provider.attempt.settled' &&
+              settlement.event.response.usage
               ? knownEffectExposure(providerUsageQuantities(settlement.event.response.usage))
               : unknownEffectExposure(phase.effect.intent.exposure)
           });
@@ -852,7 +855,7 @@ export class AgentRuntime {
             phase.identity,
             () => ({
               ...phase,
-              stage: 'settled',
+              stage: failed ? 'failed' : 'settled',
               effect: settled.state,
               settlementReference: settlement.reference
             }),
@@ -1161,6 +1164,30 @@ export class AgentRuntime {
 
   private async executeRun(runtime: RunExecutionRuntime): Promise<ExecutionDecision> {
     throwIfAborted(runtime.signal);
+    const providerPhase = currentProviderRequest(runtime.run.state());
+    const failedAttempt =
+      providerPhase?.stage === 'failed'
+        ? providerPhase
+        : providerPhase?.stage === 'ready'
+          ? runtime.run.state().providerRequests.find(
+              (request): request is Extract<AgentProviderPhase, { readonly stage: 'consumed' }> =>
+                request.stage === 'consumed' &&
+                request.effect.settlement.outcome === 'failed' &&
+                request.identity.turnId === providerPhase.identity.turnId &&
+                request.identity.requestAttempt + 1 === providerPhase.identity.requestAttempt
+            )
+          : undefined;
+    if (failedAttempt) {
+      const settlement = await this.readProviderSettlement(
+        runtime.runId,
+        failedAttempt.effect.intent.effectId,
+        failedAttempt.responseId,
+        failedAttempt.settlementReference
+      );
+      if (settlement?.event.type !== 'provider.attempt.failed')
+        throw new Error('Failed provider attempt has no matching failure record.');
+      return failedGenerationDecision(settlement.event.diagnostic, failedAttempt.identity.turnIndex);
+    }
     this.steeringReceipts.clear();
     this.nativeSteering = new NativeSteeringCoordinator({
       runId: runtime.runId,
@@ -1544,7 +1571,7 @@ export class AgentRuntime {
             { runtime, observationStore }
           );
         }
-        if (assistant.kind === 'waiting') return assistant.decision;
+        if (assistant.kind === 'decision') return assistant.decision;
         if (assistant.kind === 'renew_context') {
           await modelSession?.close?.();
           modelSession = undefined;
@@ -2211,6 +2238,7 @@ export class AgentRuntime {
       await runtime.append(started);
       await runtime.emit(started);
       const governed = createRunInferenceLifecycle({
+        operation: 'native_generation',
         service: this.inferenceService,
         options: this.options,
         request,
@@ -2448,7 +2476,7 @@ export class AgentRuntime {
         throw new Error('Native execution ended with unresolved model work.');
       return final;
     } catch (error) {
-      if (paused) return { kind: 'waiting', decision: paused };
+      if (paused) return { kind: 'decision', decision: paused };
       if (unknownEffect) return { kind: 'outcome_unknown', effectId: unknownEffect };
       throw error;
     } finally {
@@ -2469,7 +2497,9 @@ export class AgentRuntime {
     request = { ...request, signal: deadline.signal };
     try {
       let rejected: CompiledModelRequest | undefined;
-      for (let retry = 0; retry < 2; retry++) {
+      let contextRetries = 0;
+      let generationRetries = 0;
+      for (;;) {
         const identity = turnIdentity(request.snapshot.record);
         const assembly = await this.assembleModelRequest(request, append, emit, rejected);
         await request.controller.recordUsage(
@@ -2510,8 +2540,12 @@ export class AgentRuntime {
           advanceRun: (driver, procedure, advance) => this.advanceRun(driver, procedure, advance)
         });
         if (completedAttempt.kind === 'outcome_unknown') return completedAttempt;
-        if (completedAttempt.kind === 'context_rejected') {
-          if (retry === 1 || !this.options.contextRenewal?.automatic || !this.options.context)
+        if (completedAttempt.kind === 'failed') {
+          const capacityFailure = completedAttempt.diagnostic.code === 'context_overflow';
+          if (
+            capacityFailure &&
+            (contextRetries === 1 || !this.options.contextRenewal?.automatic || !this.options.context)
+          )
             throw new ContextAdmissionError(
               assembly.compiled,
               new Error(
@@ -2520,16 +2554,25 @@ export class AgentRuntime {
               true
             );
           const phase = providerWork(request.run.state(), completedAttempt.identity);
-          if (phase.stage !== 'rejected')
-            throw new Error('Capacity rejection has no durable settlement.');
-          await request.run.transitionProvider(
-            'consume_provider_settlement',
-            completedAttempt.identity,
-            () => ({ ...phase, stage: 'consumed' })
-          );
-          await this.advanceRun(request.run, 'advance_after_tools', {
-            phase: { kind: 'initializing', step: 'assemble_turn', turnIndex: request.turnIndex }
-          });
+          if (phase.stage !== 'failed')
+            throw new Error('Provider failure has no durable settlement.');
+          if (capacityFailure) {
+            contextRetries++;
+            rejected = assembly.compiled;
+          } else {
+            if (!completedAttempt.diagnostic.retryable || generationRetries === 2)
+              return {
+                kind: 'decision',
+                decision: failedGenerationDecision(completedAttempt.diagnostic, request.turnIndex)
+              };
+            generationRetries++;
+            await emit({
+              type: 'assistant.status',
+              ...identity,
+              message: `Generation interrupted. Retrying (${String(generationRetries)}/2).`
+            });
+            await delay(500 * generationRetries, undefined, { signal: request.signal });
+          }
           const snapshot = {
             ...request.snapshot,
             record: {
@@ -2538,9 +2581,14 @@ export class AgentRuntime {
             }
           };
           request = { ...request, snapshot };
-          await this.advanceRun(request.run, 'assemble_turn', {
+          await this.advanceRun(request.run, 'consume_provider_settlement', {
             phase: { kind: 'active' },
             providerRequests: [
+              ...request.run.state().providerRequests.map((previous) =>
+                sameTurnIdentity(previous.identity, phase.identity)
+                  ? { ...phase, stage: 'consumed' as const }
+                  : previous
+              ),
               {
                 kind: 'provider',
                 stage: 'ready',
@@ -2549,7 +2597,6 @@ export class AgentRuntime {
               }
             ]
           });
-          rejected = assembly.compiled;
           continue;
         }
 
@@ -2563,7 +2610,6 @@ export class AgentRuntime {
         });
         return settled;
       }
-      throw new Error('Bounded context admission attempts exhausted.');
     } finally {
       deadline.dispose();
     }
@@ -2590,7 +2636,7 @@ export class AgentRuntime {
       providerPhase.responseId,
       providerPhase.settlementReference
     );
-    if (settlementRecord === undefined)
+    if (settlementRecord?.event.type !== 'provider.attempt.settled')
       throw new Error('Provider response settlement is missing or contradictory.');
     const providerState = settlementRecord.event.providerState;
     await append({
@@ -3331,7 +3377,8 @@ export class AgentRuntime {
     if (source.runId !== runId) throw new Error('Provider settlement belongs to another run.');
     const record = await this.options.repositories.events.readReference(source);
     if (
-      record.event.type !== 'provider.attempt.settled' ||
+      (record.event.type !== 'provider.attempt.settled' &&
+        record.event.type !== 'provider.attempt.failed') ||
       record.event.effectId !== effectId ||
       record.event.responseId !== responseId
     )
@@ -3600,7 +3647,7 @@ export class AgentRuntime {
       phase.responseId,
       phase.settlementReference
     );
-    if (settlement === undefined)
+    if (settlement?.event.type !== 'provider.attempt.settled')
       throw new Error(
         `Run ${state.runId} is missing its exact provider settlement ${phase.settlementReference.eventId}.`
       );
@@ -3673,8 +3720,8 @@ export class AgentRuntime {
       switch (instruction) {
         case 'consume_provider_settlement': {
           const settled = currentProviderRequest(state);
-          if (settled?.stage !== 'settled')
-            throw new Error('Finalization requires its settled provider response.');
+          if (settled?.stage !== 'settled' && settled?.stage !== 'failed')
+            throw new Error('Finalization requires its settled provider attempt.');
           await this.advanceRun(run, instruction, {
             phase: { kind: 'finalization', stage: 'ready' },
             providerRequests: state.providerRequests.map((request) =>
@@ -4096,6 +4143,23 @@ function completedDecision(
       : {})
   };
 }
+function failedGenerationDecision(
+  diagnostic: import('@agent-core/model').ModelProviderErrorDiagnostic,
+  turnIndex: number
+): TerminalDecision {
+  return {
+    executionStatus: 'failed',
+    terminationReason: 'provider_error',
+    modelOutput: { status: 'absent' },
+    errorMessage:
+      typeof diagnostic.causeSummary?.message === 'string'
+        ? diagnostic.causeSummary.message
+        : 'Provider generation failed.',
+    turnCount: turnIndex,
+    diagnostic: { ...diagnostic, turnIndex }
+  };
+}
+
 function failedDecision(
   reason: Extract<TerminalDecision, { executionStatus: 'failed' }>['terminationReason'],
   modelOutput: AgentModelOutput,

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ModelContractError,
+  ModelProviderError,
   RequestTokenEstimator,
   assertProviderContextCompatible,
   assertModelRequestSupported,
@@ -12,6 +13,21 @@ import {
   parseModelResponse,
   parseModelStreamEvent
 } from '@agent-core/model';
+
+test('provider diagnostics preserve standard causal errors without capturing request payloads', () => {
+  const cause = Object.assign(new Error('other side closed'), {
+    code: 'UND_ERR_SOCKET', headers: { Authorization: 'must not be captured' }
+  });
+  const failure = new ModelProviderError({
+    provider: 'fixture', code: 'provider_unavailable', message: 'Request failed: fetch failed',
+    retryable: true, cause: new TypeError('fetch failed', { cause })
+  });
+  assert.equal(failure.cause.cause, cause);
+  assert.equal(failure.diagnostic.causeSummary.causeName, 'TypeError');
+  assert.equal(failure.diagnostic.causeSummary.rootCauseCode, 'UND_ERR_SOCKET');
+  assert.equal(failure.diagnostic.causeSummary.rootCauseMessage, 'other side closed');
+  assert.equal(JSON.stringify(failure.diagnostic).includes('must not be captured'), false);
+});
 
 test('provider replay constraints are explicit and independent of payload preservation', async () => {
   const request = { model: 'model', messages: [{ role: 'user', content: 'Original input.' }] };
