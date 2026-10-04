@@ -26,6 +26,7 @@ export interface NativeGenerationSettlement {
   readonly result: InferenceResult;
 }
 export interface NativeInferenceInput extends InferenceIdentity {
+  readonly workingStateRevisionId?: () => string | null;
   readonly request: ModelRequest;
   readonly compiled: CompiledModelRequest;
   readonly profile: ModelProfile;

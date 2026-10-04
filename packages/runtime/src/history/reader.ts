@@ -692,7 +692,15 @@ export class HistoryReader {
       throw error;
     }
     if (!entry) return unavailable(request.source, 'missing');
-    const range = textRange(publicText(entry), request.offset ?? 0, maxBytes);
+    const stateRef =
+      entry.type === 'working_state'
+        ? entry.contentRef
+        : entry.type === 'context_transition'
+          ? entry.workingState?.contentRef
+          : undefined;
+    const range = stateRef
+      ? await this.workingStateRange(stateRef, request.offset ?? 0, maxBytes)
+      : textRange(publicText(entry), request.offset ?? 0, maxBytes);
     const neighbors: HistoryItem[] = [];
     let remaining = maxBytes - Buffer.byteLength(range.text);
     if (count && remaining > 0) {
@@ -747,6 +755,27 @@ export class HistoryReader {
     });
   }
 
+  private async workingStateRange(
+    ref: import('@agent-core/persistence').ProtectedArtifactRef,
+    offset: number,
+    length: number
+  ) {
+    if (!this.options.artifacts)
+      throw new Error('Working-state history requires authorized artifact access.');
+    const range = await this.options.artifacts.readVerifiedRange(ref, { offset, length });
+    const bounded = textRange(
+      new TextDecoder('utf-8', { fatal: true }).decode(range.bytes),
+      offset - range.offset,
+      length
+    );
+    return {
+      text: bounded.text,
+      offset: range.offset + bounded.offset,
+      nextOffset: range.offset + bounded.nextOffset,
+      totalBytes: range.fullSize
+    };
+  }
+
   async search(request: HistorySearchRequest = {}): Promise<HistorySearchResult> {
     const limit = bound(request.limit, 20, MAX_RESULTS, 'limit');
     const maxBytes = bound(request.maxBytes, 32 * 1024, MAX_BYTES, 'maxBytes');
@@ -791,7 +820,22 @@ export class HistoryReader {
       for (const entry of page.entries) {
         const source = sourceRef(cut.sessionId, entry);
         const key = `${source.entryId}:${source.sha256}`;
-        const fullText = this.lexicalIndex.text(key) ?? publicText(entry);
+        const stateRef =
+          entry.type === 'working_state'
+            ? entry.contentRef
+            : entry.type === 'context_transition'
+              ? entry.workingState?.contentRef
+              : undefined;
+        if (stateRef && stateRef.size > maxScannedBytes - scannedBytes) {
+          unavailableSources.push({ source, bytes: stateRef.size });
+          continue;
+        }
+        const fullText =
+          this.lexicalIndex.text(key) ??
+          (stateRef
+            ? (await this.workingStateRange(stateRef, 0, Math.max(1, stateRef.size))).text
+            : publicText(entry));
+        if (stateRef) scannedBytes += stateRef.size;
         this.lexicalIndex.add(key, fullText);
         const match = request.query ? fullText.indexOf(request.query) : 0;
         if (match < 0) continue;
@@ -900,6 +944,10 @@ function historyItem(sessionId: string, entry: SessionBranchEntry, maxBytes: num
     source: sourceRef(sessionId, entry),
     type: entry.type,
     role: historyRole(entry),
+    ...(entry.type === 'working_state' ||
+    (entry.type === 'context_transition' && entry.workingState)
+      ? { generated: true as const }
+      : {}),
     ...('runId' in entry ? { runId: entry.runId } : {}),
     text: range.text,
     truncated: range.nextOffset < range.totalBytes,
@@ -941,6 +989,12 @@ function publicText(entry: SessionBranchEntry): string {
       });
     case 'branch':
       return JSON.stringify({ fromEntryId: entry.fromEntryId, label: entry.label });
+    case 'working_state':
+      return JSON.stringify({
+        interpretation: 'generated working state',
+        revisionId: entry.id,
+        previousRevisionId: entry.previousRevisionId
+      });
     case 'context_transition':
       return JSON.stringify({
         windowId: entry.window.windowId,
@@ -1030,14 +1084,22 @@ interface SearchCursor {
 }
 function encodeCursor(cursor: SearchCursor): string {
   const position = cursor.position ? decodeEntryCursor(cursor.position) : undefined;
-  return Buffer.from(JSON.stringify({
-    format: 'agent-core.history-cursor/1',
-    cut: cursor.cut,
-    queryFingerprint: cursor.queryFingerprint,
-    ...(position ? { position: {
-      at: position.at, sequence: position.sequence, fingerprint: position.fingerprint
-    } } : {})
-  })).toString('base64url');
+  return Buffer.from(
+    JSON.stringify({
+      format: 'agent-core.history-cursor/1',
+      cut: cursor.cut,
+      queryFingerprint: cursor.queryFingerprint,
+      ...(position
+        ? {
+            position: {
+              at: position.at,
+              sequence: position.sequence,
+              fingerprint: position.fingerprint
+            }
+          }
+        : {})
+    })
+  ).toString('base64url');
 }
 function decodeCursor(value: string): SearchCursor {
   if (value.length > 256 * 1024) throw new Error('History cursor too large.');
@@ -1048,11 +1110,17 @@ function decodeCursor(value: string): SearchCursor {
   )
     throw new Error('Invalid history cursor.');
   return {
-    ...(parsed.position !== undefined ? {
-      position: encodeEntryCursor(parseEntryCursor({
-        ...parseJsonObject(parsed.position), cut: parseJsonObject(parsed.cut), format: 'agent-core.history-sources/1'
-      }))
-    } : {}),
+    ...(parsed.position !== undefined
+      ? {
+          position: encodeEntryCursor(
+            parseEntryCursor({
+              ...parseJsonObject(parsed.position),
+              cut: parseJsonObject(parsed.cut),
+              format: 'agent-core.history-sources/1'
+            })
+          )
+        }
+      : {}),
     queryFingerprint: parsed.queryFingerprint,
     cut: historyCutSchema.parse(parsed.cut)
   };
@@ -1145,7 +1213,9 @@ function encodeEntryCursor(cursor: EntryCursor): string {
 }
 function decodeEntryCursor(value: string): EntryCursor {
   if (value.length > 256 * 1024) throw new Error('History source cursor is too large.');
-  return parseEntryCursor(parseJsonObject(JSON.parse(Buffer.from(value, 'base64url').toString('utf8'))));
+  return parseEntryCursor(
+    parseJsonObject(JSON.parse(Buffer.from(value, 'base64url').toString('utf8')))
+  );
 }
 function parseEntryCursor(record: import('@agent-core/json').JsonObject): EntryCursor {
   if (

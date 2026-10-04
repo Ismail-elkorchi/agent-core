@@ -3,9 +3,7 @@ import type {
   ContextService,
   HistorySearchRequest,
   HistorySearchResult,
-  HistorySourceRef,
-  NoteQueryResult,
-  NoteReference
+  HistorySourceRef
 } from '@agent-core/runtime';
 import { button, checkbox, text, type Element } from '@ismail-elkorchi/terminal-ui/components';
 import { column, flow, viewport } from '@ismail-elkorchi/terminal-ui/layout';
@@ -16,44 +14,35 @@ export type ContextInspection = Awaited<ReturnType<ContextService['inspect']>>;
 export interface ContextOperations {
   inspectContext(): Promise<ContextInspection>;
   contextSources(request: HistorySearchRequest): Promise<HistorySearchResult>;
-  listNotes(cursor?: string): Promise<NoteQueryResult>;
   renewContext(selection?: ContextSelection): Promise<unknown>;
 }
 export interface ContextState {
   readonly requestId?: string | undefined;
   readonly inspection?: ContextInspection;
   readonly history?: HistorySearchResult;
-  readonly notes?: NoteQueryResult;
   readonly selection: ContextSelection;
   readonly offset: number;
   readonly notice?: string;
 }
 export type ContextMessage =
   | { readonly type: 'context.open' | 'context.renew' | 'context.apply' }
-  | { readonly type: 'context.page'; readonly source: 'history' | 'notes' }
+  | { readonly type: 'context.page'; readonly source: 'history' }
   | { readonly type: 'context.source'; readonly source: HistorySourceRef }
-  | { readonly type: 'context.note'; readonly note: NoteReference }
   | { readonly type: 'context.scroll'; readonly offset: number }
   | {
       readonly type: 'context.loaded';
       readonly requestId: string;
       readonly inspection: ContextInspection;
       readonly history: HistorySearchResult;
-      readonly notes: NoteQueryResult;
       readonly reset: boolean;
     }
   | { readonly type: 'context.failed'; readonly requestId: string; readonly message: string };
 
 export function createContextState(): ContextState {
-  return { selection: { strategy: 'sources', retained: [], notes: [] }, offset: 0 };
+  return { selection: { strategy: 'sources', retained: [] }, offset: 0 };
 }
 const sameSource = (a: HistorySourceRef, b: HistorySourceRef) =>
   a.sessionId === b.sessionId && a.entryId === b.entryId && a.sha256 === b.sha256;
-const sameNote = (a: NoteReference, b: NoteReference) =>
-  a.scope.sessionId === b.scope.sessionId &&
-  a.scope.branchId === b.scope.branchId &&
-  a.noteId === b.noteId &&
-  a.revisionId === b.revisionId;
 
 export function updateContext(
   state: ContextState,
@@ -62,18 +51,18 @@ export function updateContext(
 ): { readonly state: ContextState; readonly effects?: readonly TuiEffect<ContextMessage>[] } {
   switch (message.type) {
     case 'context.source': {
+      if (
+        state.history?.items.some(
+          (item) => item.generated && sameSource(item.source, message.source)
+        )
+      )
+        return { state };
       if (state.inspection?.protectedSources.some((source) => sameSource(source, message.source)))
         return { state };
       const retained = state.selection.retained.some((source) => sameSource(source, message.source))
         ? state.selection.retained.filter((source) => !sameSource(source, message.source))
         : [...state.selection.retained, message.source];
       return { state: { ...state, selection: { ...state.selection, retained } } };
-    }
-    case 'context.note': {
-      const notes = state.selection.notes.some((note) => sameNote(note, message.note))
-        ? state.selection.notes.filter((note) => !sameNote(note, message.note))
-        : [...state.selection.notes, message.note];
-      return { state: { ...state, selection: { ...state.selection, notes } } };
     }
     case 'context.scroll':
       return { state: { ...state, offset: message.offset } };
@@ -87,15 +76,13 @@ export function updateContext(
         ? {
             strategy: 'sources' as const,
             retained:
-              message.inspection.window?.selection.retained ?? message.inspection.protectedSources,
-            notes: message.inspection.window?.selection.notes ?? []
+              message.inspection.window?.selection.retained ?? message.inspection.protectedSources
           }
         : state.selection;
       return {
         state: {
           inspection: message.inspection,
           history: message.history,
-          notes: message.notes,
           selection,
           offset: 0
         }
@@ -117,33 +104,20 @@ export function updateContext(
               const inspection = reset
                 ? await operations.inspectContext()
                 : (state.inspection ?? (await operations.inspectContext()));
-              const [history, notes] = await Promise.all([
-                message.type === 'context.page' && message.source === 'notes' && state.history
-                  ? state.history
-                  : operations.contextSources({
-                      cut: inspection.cut,
-                      limit: 30,
-                      maxBytes: 32 * 1024,
-                      maxScanned: 100,
-                      maxScannedBytes: 128 * 1024,
-                      ...(message.type === 'context.page' &&
-                      message.source === 'history' &&
-                      state.history?.cursor
-                        ? { cursor: state.history.cursor }
-                        : {})
-                    }),
-                message.type === 'context.page' && message.source === 'history' && state.notes
-                  ? state.notes
-                  : operations.listNotes(
-                      message.type === 'context.page' && message.source === 'notes'
-                        ? state.notes?.cursor
-                        : undefined
-                    )
-              ]);
+              const history = await operations.contextSources({
+                cut: inspection.cut,
+                limit: 30,
+                maxBytes: 32 * 1024,
+                maxScanned: 100,
+                maxScannedBytes: 128 * 1024,
+                ...(message.type === 'context.page' && state.history?.cursor
+                  ? { cursor: state.history.cursor }
+                  : {})
+              });
               signal.throwIfAborted();
               return {
                 kind: 'message',
-                message: { type: 'context.loaded', requestId, inspection, history, notes, reset }
+                message: { type: 'context.loaded', requestId, inspection, history, reset }
               };
             },
             onError: ({ diagnostic }) => ({
@@ -178,9 +152,6 @@ export function contextView(
       onTransition: () => ({ type: 'context.source', source })
     });
   };
-  const selectedNotes = state.selection.notes.filter(
-    (note) => !state.notes?.items.some((item) => sameNote(item, note))
-  );
   return panel<Message>({
     id: 'context-controls',
     title: 'Working context',
@@ -195,7 +166,7 @@ export function contextView(
               ? 'Loading context…'
               : (state.notice ??
                 state.inspection?.admission?.message ??
-                'Choose original sources and optional note revisions for the next window. History remains available.')
+                'Choose original sources for the next window. Current working state is included automatically; history remains available.')
           }),
           ...(capacity
             ? [
@@ -205,14 +176,18 @@ export function contextView(
               ]
             : []),
           text({
-            content: `Draft selection: ${String(state.selection.retained.length)} sources · ${String(state.selection.notes.length)} notes selected. Required inputs are retained automatically.`
+            content: `Draft selection: ${String(state.selection.retained.length)} sources. Required inputs are retained automatically.`
           }),
           ...selectedOutsidePage.map((source) => sourceChoice(source, source.entryId)),
           ...visible.map((item) =>
-            sourceChoice(
-              item.source,
-              `${item.role} · ${item.text.replaceAll(/\s+/gu, ' ').slice(0, 140)}${item.truncated ? '…' : ''}`
-            )
+            item.generated
+              ? text({
+                  content: `Generated interpretation · ${item.text.replaceAll(/\s+/gu, ' ').slice(0, 140)}${item.truncated ? '…' : ''}`
+                })
+              : sourceChoice(
+                  item.source,
+                  `${item.role} · ${item.text.replaceAll(/\s+/gu, ' ').slice(0, 140)}${item.truncated ? '…' : ''}`
+                )
           ),
           ...(state.history?.cursor
             ? [
@@ -223,24 +198,22 @@ export function contextView(
                 })
               ]
             : []),
-          ...[...selectedNotes, ...(state.notes?.items ?? [])].map((note) =>
-            checkbox<Message>({
-              id: `context-note:${note.noteId}:${note.revisionId}`,
-              label: `Note · ${'title' in note && typeof note.title === 'string' ? note.title : note.noteId} · ${note.revisionId}`,
-              checked: state.selection.notes.some((item) => sameNote(item, note)),
-              onTransition: () => ({
-                type: 'context.note',
-                note: { scope: note.scope, noteId: note.noteId, revisionId: note.revisionId }
-              })
-            })
-          ),
-          ...(state.notes?.cursor
+          ...(state.inspection?.workingState
             ? [
-                button<Message>({
-                  id: 'context-notes-next',
-                  label: 'Next notes page',
-                  onPress: () => ({ type: 'context.page', source: 'notes' })
-                })
+                text({
+                  content: `Current working state · generated interpretation · ${state.inspection.workingState.revisionId ?? 'empty'}`
+                }),
+                text({
+                  content: state.inspection.workingState.text || 'No working-state content.'
+                }),
+                ...(!state.inspection.workingState.complete
+                  ? [
+                      text({
+                        content:
+                          'Partial state preview. Retrieve its original through session history for the remaining content.'
+                      })
+                    ]
+                  : [])
               ]
             : [])
         ]),

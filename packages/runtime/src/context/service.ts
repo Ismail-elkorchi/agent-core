@@ -2,11 +2,23 @@ import { ContextSourceCapacityError } from '../run/context-admission.js';
 import { HistorySourceTooLargeError } from '../history/reader.js';
 import { requestCapacity } from '../inference/request-admission.js';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
-import { hashJson, PersistenceConflictError } from '@agent-core/persistence';
+import {
+  hashArtifactBytes,
+  hashJson,
+  PersistenceConflictError,
+  type ArtifactRepository
+} from '@agent-core/persistence';
 import { randomUUID } from 'node:crypto';
 import type { HistorySourceCut, HistorySourceRef } from '../history/contracts.js';
-import { HistoryReader, sameHistorySource } from '../history/reader.js';
-import type { NoteReadResult, NoteRepository } from '../notes/contracts.js';
+import { HistoryReader, sameHistorySource, textRange } from '../history/reader.js';
+import { applyTextEdits, type TextEdit, type ToolInvocationContext } from '@agent-core/tools';
+import {
+  assertWorkingStateRevision,
+  workingStateAtEntry,
+  type WorkingStateChange,
+  type WorkingStateSnapshot,
+  type WorkingStateInference
+} from '../session/working-state.js';
 import type {
   SessionBranchEntry,
   SessionContextTransitionEntry,
@@ -25,14 +37,15 @@ export interface ContextPolicy {
   };
   readonly selfContained?: boolean;
   readonly protectedSources?: () =>
-    readonly HistorySourceRef[] | Promise<readonly HistorySourceRef[]>;
+    | readonly HistorySourceRef[]
+    | Promise<readonly HistorySourceRef[]>;
 }
 export interface ContextAdmissionInput {
   readonly cut: HistorySourceCut;
   readonly entries: readonly SessionBranchEntry[];
   readonly window?: import('./contracts.js').ContextWindowRecord | undefined;
   readonly selection: ContextSelection;
-  readonly notes: readonly NoteReadResult[];
+  readonly workingState: WorkingStateSnapshot;
   readonly signal?: AbortSignal;
 }
 export type ContextAdmission = (input: ContextAdmissionInput) => Promise<{
@@ -44,7 +57,7 @@ export interface ContextServiceOptions {
   readonly repository: SessionRepository;
   readonly session: SessionDescriptor;
   readonly history?: HistoryReader;
-  readonly notes?: NoteRepository;
+  readonly artifacts: ArtifactRepository;
   readonly policy: ContextPolicy;
 }
 
@@ -53,7 +66,11 @@ export class ContextService {
   constructor(private readonly options: ContextServiceOptions) {
     this.history =
       options.history ??
-      new HistoryReader({ repository: options.repository, session: options.session });
+      new HistoryReader({
+        repository: options.repository,
+        session: options.session,
+        artifacts: options.artifacts
+      });
     if (!Number.isSafeInteger(options.policy.maxSourceBytes) || options.policy.maxSourceBytes < 1)
       throw new Error('Context source selection maxSourceBytes must be positive.');
   }
@@ -65,7 +82,6 @@ export class ContextService {
     const selection = window
       ? {
           retained: window.selection.retained,
-          notes: window.selection.notes,
           strategy: window.selection.strategy,
           ...(window.selection.protected ? { protected: window.selection.protected } : {}),
           ...(window.selection.continuity ? { continuity: window.selection.continuity } : {})
@@ -81,6 +97,7 @@ export class ContextService {
         maxSourceBytes: this.options.policy.maxSourceBytes,
         quality: 'byte_bound' as const
       }),
+      workingState: await this.inspectWorkingState(cut),
       pendingWork: Object.freeze(
         pending.map((item) =>
           Object.freeze({ runId: item.runId, submissionId: item.submissionId, state: item.state })
@@ -97,6 +114,10 @@ export class ContextService {
   }
   private runtime:
     | {
+        origin: (invocation: ToolInvocationContext) => Promise<{
+          readonly revisionId: string | null;
+          readonly inference: WorkingStateInference;
+        }>;
         schedule: (request: ContextTransitionRequest) => Promise<{ readonly requestId: string }>;
         providerTransform: boolean;
       }
@@ -136,8 +157,7 @@ export class ContextService {
       expectedSourceRevision: current.cut.sourceRevision,
       selection: input.selection ?? {
         strategy: 'sources',
-        retained: await this.protectedSources(),
-        notes: []
+        retained: await this.protectedSources()
       },
       reason: input.reason,
       idempotencyKey: input.idempotencyKey
@@ -148,7 +168,12 @@ export class ContextService {
   /** Network work belongs outside session serialization; the final repository append alone commits the window. */
   async transition(
     requestInput: ContextTransitionRequest,
-    options: { readonly signal?: AbortSignal; readonly admit?: ContextAdmission } = {}
+    options: {
+      readonly signal?: AbortSignal;
+      readonly admit?: ContextAdmission;
+      readonly workingState?: WorkingStateChange;
+      readonly expectedWorkingStateRevisionId?: string | null;
+    } = {}
   ): Promise<SessionContextTransitionEntry> {
     let request = ownRequest(requestInput);
     throwIfAborted(options.signal);
@@ -236,6 +261,10 @@ export class ContextService {
           limit: this.options.policy.maxSourceBytes,
           observedAtLeast: sourceBytes
         });
+      if (entry.type === 'working_state' || entry.type === 'context_transition')
+        throw new Error(
+          'context_admission_failed: working state and window records are not selectable conversational contributions.'
+        );
       selected.push(entry);
     }
     for (const source of await this.protectedSources(cut, false)) {
@@ -283,43 +312,29 @@ export class ContextService {
       if (
         snapshot.entries.some(
           (entry) =>
-            !['branch', 'model_settings', 'context_transition'].includes(entry.type) &&
-            !retained.has(entry.entryId)
+            !['branch', 'model_settings', 'context_transition', 'working_state'].includes(
+              entry.type
+            ) && !retained.has(entry.entryId)
         )
       )
         throw new Error(
           'context_admission_failed: omitted history has no authorized available read capability.'
         );
     }
-    const notes: NoteReadResult[] = [];
-    for (const ref of request.selection.notes) {
-      if (!this.options.notes || ref.scope.sessionId !== cut.sessionId)
-        throw new Error('context_admission_failed: note scope is unavailable.');
-      const note = await this.options.notes.read({
-        scope: { sessionId: cut.sessionId, branchId: cut.branchId },
-        noteId: ref.noteId,
-        revisionId: ref.revisionId,
-        maxBytes: Math.min(this.options.policy.maxSourceBytes, 256 * 1024)
-      });
-      if (
-        note.status !== 'available' ||
-        note.revision.scope.sessionId !== ref.scope.sessionId ||
-        note.revision.scope.branchId !== ref.scope.branchId
-      )
-        throw new Error('context_admission_failed: note revision or artifact is unavailable.');
-      if (note.truncated)
-        throw new ContextSourceCapacityError(cut, {
-          unit: 'bytes',
-          limit: Math.min(this.options.policy.maxSourceBytes, 256 * 1024),
-          observedAtLeast: Math.min(this.options.policy.maxSourceBytes, 256 * 1024) + 1
-        });
-      notes.push(note);
-    }
+    const captured = await this.workingState(cut);
+    const expectedWorkingStateRevisionId =
+      options.expectedWorkingStateRevisionId === undefined
+        ? (captured.revision?.id ?? null)
+        : options.expectedWorkingStateRevisionId;
+    assertWorkingStateRevision(captured.revision, expectedWorkingStateRevisionId);
+    const workingState = options.workingState
+      ? await this.snapshotForChange(options.workingState, cut.throughEntryId)
+      : captured;
     const pending = await this.options.repository.loadPendingSubmissions(this.options.session);
     const bytes = Buffer.byteLength(
       JSON.stringify({
         selected: request.selection.strategy === 'provider' ? [] : selected,
-        notes,
+        workingState,
         acceptedInput: pending.map((item) => item.input)
       })
     );
@@ -334,7 +349,7 @@ export class ContextService {
       entries: selected,
       window,
       selection: request.selection,
-      notes,
+      workingState,
       ...(options.signal ? { signal: options.signal } : {})
     });
     if (request.selection.strategy === 'provider' && !validation?.providerState)
@@ -350,18 +365,8 @@ export class ContextService {
         : {})
     });
     throwIfAborted(options.signal);
-    // Exact note reads repeat after host work; staged/missing artifacts cannot become an active source selection.
-    for (const note of notes) {
-      if (note.status !== 'available') continue;
-      const verified = await this.options.notes?.read({
-        scope: { sessionId: cut.sessionId, branchId: cut.branchId },
-        noteId: note.revision.noteId,
-        revisionId: note.revision.revisionId,
-        maxBytes: Math.max(1, note.totalBytes)
-      });
-      if (verified?.status !== 'available')
-        throw new Error('context_admission_failed: selected note became unavailable.');
-    }
+    if (workingState.revision)
+      await this.options.artifacts.readVerified(workingState.revision.contentRef);
     if (hashJson(await this.history.capture()) !== hashJson(cut))
       throw new PersistenceConflictError(
         'Context source boundary changed during request admission.'
@@ -369,6 +374,8 @@ export class ContextService {
     const timestamp = new Date().toISOString();
     const windowId = randomUUID();
     return this.options.repository.commitContextTransition(this.options.session, {
+      expectedWorkingStateRevisionId,
+      ...(options.workingState ? { workingState: options.workingState } : {}),
       expectedLeafId: cut.throughEntryId,
       expectedSourceRevision: cut.sourceRevision,
       expectedWindowId: request.expectedWindowId,
@@ -400,6 +407,202 @@ export class ContextService {
       }
     });
   }
+  async workingState(cut?: HistorySourceCut): Promise<WorkingStateSnapshot> {
+    const revision = await this.options.repository.currentWorkingState(
+      this.options.session,
+      cut?.throughEntryId
+    );
+    if (!revision) return { revision: null, text: '' };
+    if (revision.contentRef.size > this.options.policy.maxSourceBytes)
+      throw new ContextSourceCapacityError(cut ?? (await this.history.capture()), {
+        unit: 'bytes',
+        limit: this.options.policy.maxSourceBytes,
+        observedAtLeast: revision.contentRef.size
+      });
+    return {
+      revision,
+      text: new TextDecoder('utf-8', { fatal: true }).decode(
+        await this.options.artifacts.readVerified(revision.contentRef)
+      )
+    };
+  }
+
+  async inspectWorkingState(cut?: HistorySourceCut, maxBytes = 32 * 1024) {
+    cut ??= await this.history.capture();
+    const revision = await this.options.repository.currentWorkingState(
+      this.options.session,
+      cut.throughEntryId
+    );
+    if (!revision) return { revisionId: null, text: '', complete: true };
+    const range = await this.options.artifacts.readVerifiedRange(revision.contentRef, {
+      offset: 0,
+      length: maxBytes
+    });
+    const preview = textRange(
+      new TextDecoder('utf-8', { fatal: true }).decode(range.bytes),
+      0,
+      maxBytes
+    );
+    // State remains generated material. The history reference authorizes recovering the exact original body.
+    const snapshot = await this.options.repository.sourceSnapshot(
+      this.options.session,
+      cut.throughEntryId
+    );
+    const entry = snapshot.entries.find((entry) => entry.entryId === revision.id);
+    if (!entry) throw new Error('Working-state index points outside the captured session branch.');
+    return {
+      revisionId: revision.id,
+      text: preview.text,
+      complete: preview.nextOffset === range.fullSize,
+      totalBytes: range.fullSize,
+      source: { sessionId: cut.sessionId, entryId: entry.entryId, sha256: entry.sha256 }
+    };
+  }
+
+  async workingStateOrigin(invocation: ToolInvocationContext) {
+    if (!this.runtime)
+      throw new Error('Working-state updates require an originating admitted inference.');
+    const cut = await this.history.capture();
+    return {
+      ...(await this.runtime.origin(invocation)),
+      sessionId: cut.sessionId,
+      branchId: cut.branchId
+    };
+  }
+
+  async stageWorkingState(input: {
+    readonly id: string;
+    readonly revisionId: string | null;
+    readonly inference: WorkingStateInference;
+    readonly edits: readonly TextEdit[];
+  }): Promise<
+    | WorkingStateChange
+    | { readonly status: 'unchanged' }
+    | {
+        readonly status: 'conflict';
+        readonly current: Awaited<ReturnType<ContextService['inspectWorkingState']>>;
+      }
+    | {
+        readonly status: 'invalid';
+        readonly failures: readonly {
+          readonly reason: string;
+          readonly message: string;
+          readonly editIndex?: number;
+        }[];
+      }
+  > {
+    const current = await this.workingState();
+    if ((current.revision?.id ?? null) !== input.revisionId)
+      return { status: 'conflict', current: await this.inspectWorkingState() };
+    const result = applyTextEdits(current.text, input.edits);
+    if (result.status === 'invalid') return result;
+    if (result.content === current.text) return { status: 'unchanged' };
+    const bytes = new TextEncoder().encode(result.content);
+    if (bytes.byteLength > this.options.policy.maxSourceBytes)
+      return {
+        status: 'invalid',
+        failures: [
+          {
+            reason: 'result_too_large',
+            message:
+              'Working state exceeds the available source byte capacity; no revision was published.'
+          }
+        ]
+      };
+    const contentRef = await this.options.artifacts.storeProtected({
+      label: 'working-state',
+      mediaType: 'text/plain; charset=utf-8',
+      content: bytes
+    });
+    return {
+      id: input.id,
+      previousRevisionId: input.revisionId,
+      contentRef,
+      inference: input.inference
+    };
+  }
+
+  async updateWorkingState(
+    input: Parameters<ContextService['stageWorkingState']>[0] & {
+      readonly sessionId: string;
+      readonly branchId: string;
+    }
+  ) {
+    const cut = await this.history.capture();
+    if (input.sessionId !== cut.sessionId || input.branchId !== cut.branchId)
+      throw new Error('Working-state branch changed after authorization.');
+    const snapshot = await this.options.repository.sourceSnapshot(
+      this.options.session,
+      cut.throughEntryId
+    );
+    const published = snapshot.entries.find((entry) => entry.entryId === input.id);
+    if (published) {
+      const entry = await this.history.resolve(
+        { sessionId: cut.sessionId, entryId: published.entryId, sha256: published.sha256 },
+        cut
+      );
+      if (
+        entry?.type !== 'working_state' ||
+        hashJson(entry.inference) !== hashJson(input.inference) ||
+        entry.previousRevisionId !== input.revisionId
+      )
+        throw new PersistenceConflictError('Working-state retry does not match its publication.');
+      let original = '';
+      if (entry.previousRevisionId !== null) {
+        const metadata = snapshot.entries.find(
+          (source) => source.entryId === entry.previousRevisionId
+        );
+        if (!metadata)
+          throw new PersistenceConflictError('Working-state predecessor is outside this branch.');
+        const previous = await this.history.resolve(
+          { sessionId: cut.sessionId, entryId: metadata.entryId, sha256: metadata.sha256 },
+          cut
+        );
+        const revision = previous && workingStateAtEntry(previous);
+        if (!revision)
+          throw new PersistenceConflictError('Working-state predecessor is unavailable.');
+        original = new TextDecoder('utf-8', { fatal: true }).decode(
+          await this.options.artifacts.readVerified(revision.contentRef)
+        );
+      }
+      const replay = applyTextEdits(original, input.edits);
+      if (
+        replay.status !== 'applied' ||
+        hashArtifactBytes(new TextEncoder().encode(replay.content)) !== entry.contentRef.sha256
+      )
+        throw new PersistenceConflictError('Working-state retry has different substantive edits.');
+      // Reconcile the receipt before looking at today's head: later revisions do not invalidate a committed update.
+      return { status: 'committed' as const, revisionId: entry.id };
+    }
+    const prepared = await this.stageWorkingState(input);
+    if ('status' in prepared) return prepared;
+    try {
+      const revision = await this.options.repository.commitWorkingState(
+        this.options.session,
+        prepared,
+        input.branchId
+      );
+      return { status: 'committed' as const, revisionId: revision.id };
+    } catch (error) {
+      if (!(error instanceof PersistenceConflictError)) throw error;
+      return { status: 'conflict' as const, current: await this.inspectWorkingState() };
+    }
+  }
+
+  private async snapshotForChange(
+    change: WorkingStateChange,
+    parentId: string | null
+  ): Promise<WorkingStateSnapshot> {
+    if (change.contentRef.size > this.options.policy.maxSourceBytes)
+      throw new Error('Proposed working state exceeds the context source byte bound.');
+    return {
+      revision: { ...change, type: 'working_state', parentId, timestamp: new Date().toISOString() },
+      text: new TextDecoder('utf-8', { fatal: true }).decode(
+        await this.options.artifacts.readVerified(change.contentRef)
+      )
+    };
+  }
+
   private capacity() {
     return this.admission ? requestCapacity(this.admission.accounting) : undefined;
   }
@@ -469,8 +672,7 @@ function ownRequest(input: ContextTransitionRequest): ContextTransitionRequest {
     ...value,
     selection: Object.freeze({
       ...value.selection,
-      retained: unique(value.selection.retained),
-      notes: unique(value.selection.notes)
+      retained: unique(value.selection.retained)
     })
   });
 }

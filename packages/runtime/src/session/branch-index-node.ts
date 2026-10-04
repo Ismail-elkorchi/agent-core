@@ -1,3 +1,4 @@
+import { workingStateAtEntry } from './working-state.js';
 import { hashJson } from '@agent-core/persistence';
 import {
   jsonlBoundaryMarker,
@@ -225,6 +226,13 @@ export class JsonlBranchIndex {
       )
         throw new Error(`Missing session history parent: ${entry.parentId}`);
       additions.set(entry.id, {
+        workingState: workingStateAtEntry(
+          entry,
+          entry.parentId === null
+            ? null
+            : ((additions.get(entry.parentId) ?? this.positions.get(entry.parentId))
+                ?.workingState ?? null)
+        ),
         ...branchEntryMetadata(entry),
         offset: line.byteOffset,
         bytes,

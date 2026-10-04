@@ -121,8 +121,7 @@ for (const strategy of ['sources', 'provider']) {
             reason: 'Completed exchange is no longer needed.',
             selection: {
               strategy,
-              retained: retained.map((entry) => sourceRef(session.id, entry)),
-              notes: []
+              retained: retained.map((entry) => sourceRef(session.id, entry))
             }
           });
           return result({ scheduled: true });
@@ -138,7 +137,8 @@ for (const strategy of ['sources', 'provider']) {
         historyRead: { history, isAvailable: () => true }
       }
     });
-    runtime = new AgentRuntime({ maxOutputTokens: 64,
+    runtime = new AgentRuntime({
+      maxOutputTokens: 64,
       provider,
       model: simulationProfile.id,
       inferenceService: inference,
@@ -218,7 +218,8 @@ test(
       const provider = new Provider((_request, turn) =>
         turn <= 7 ? call('inspect_item', `inspect-${turn}`) : { content: 'Finished.' }
       );
-      const runtime = new AgentRuntime({ maxOutputTokens: 64,
+      const runtime = new AgentRuntime({
+        maxOutputTokens: 64,
         provider,
         model: simulationProfile.id,
         tools: [tool],

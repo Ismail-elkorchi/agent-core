@@ -53,70 +53,66 @@ Applications can associate a contribution with a continuation, correction, side
 question, or task replacement. Those relationships remain distinct from whether
 delivery is immediate, steering, or queued.
 
-## Notes
+## Working state
 
-Use `InMemoryNoteRepository`, `EventNoteRepository`, or the explicitly located
-`JsonlNoteRepository` from `@agent-core/runtime/node`. Bind a note scope to a session
-and branch. A write names its expected revision, idempotency key, author, and
-invocation. A conflicting revision produces a conflict instead of overwriting a
-concurrent edit. A retry must identify the same operation and content.
+A session branch owns one current freeform working-state revision. Its protected
+text artifact is referenced from the existing session journal alongside the
+previous revision and the exact recorded inference input that produced it.
+Branching inherits the revision at the selected branch point. Later revisions
+on either branch are independent.
 
-Notes accept plain text, Markdown, and JSON. Read results identify the exact
-revision delivered. Forks inherit a pinned revision boundary; later parent edits
-do not silently change a child branch. Quotas include staged storage so failed or
-contending writes cannot evade resource limits.
+Compose `createWorkingStateTool(context)` with history and context tools. The
+model supplies exact text edits only; the runtime supplies session and branch
+scope, invocation attribution, and the revision presented in its inference.
+Ranges use the same one-based Unicode-scalar, half-open semantics as `edit_text`.
+All edits address the original text and publish atomically. A stale update returns
+an explicit conflict with the current state and its history reference. Publication
+is conditional and idempotent; a failed append leaves the previous head intact.
 
-Note repositories index committed revisions, reservations and branch inheritance
-incrementally from the last sequence/hash. A mutation preserves earlier index
-work; exact revision reads never replay the note log. Lists and searches pin a
-watermark, and deletions leave earlier selected revisions readable with their
-original authorship. `maxScannedBytes` limits search content reads independently
-of returned bytes; inaccessible or oversized sources produce explicit coverage
-limits. Metadata indexes obey `maxIndexBytes` (32 MiB by default) and storage
-quotas, with at most four session indexes cached. `rebuildIndex()` is an explicit
-cancellable scan with progress, available on `EventNoteRepository` and its memory
-and JSONL implementations.
+Every admitted request binds to the current revision at its captured boundary.
+Present the generated interpretation once; do not accumulate historical revisions
+in the prompt. State cannot grant authority, establish verification, or replace
+original user contributions and observations. It has no mandatory sections or
+maintenance schedule. Unchanged understanding requires no update.
 
-`createNotesTools` exposes a host-bound repository scope. Storing a note does not
-automatically add it to a prompt. Selected note revisions remain attributed model
-data and cannot grant tool permissions or change application acceptance state.
-For deliberate sharing, the application can grant a separately named tool bound
-to another scope and restrict its allowed operations through the tool policy.
-The model cannot obtain that grant by supplying another session or branch ID.
+`ContextService.inspect()` exposes a bounded preview and an authorized history
+reference. Historical reads and searches use `HistoryReader` and disclose their
+byte bounds and coverage. There is no independent note repository or browser.
 
 ## Context transitions
 
-Compose `createHistoryTools`, optional `createNotesTools`, and `createContextTools`
+Compose `createHistoryTools`, `createWorkingStateTool`, and `createContextTools`
 with the ordinary tool registry and authorization policy. `ContextService` records
-selected original sources and exact note revisions at an immutable history cut.
+selected original sources and the current working-state revision at an immutable history cut.
 Unselected material remains retrievable; no exhaustive omission partition is needed.
 
 Configure `policy.maxSourceBytes` and authorized original-history retrieval on the
 service. Byte bounds govern source access. `RequestAdmission` assembles the actual
-task, attachments, instructions, dynamic context, selected notes, tool guides,
+task, attachments, instructions, dynamic context, working state, tool guides,
 catalog and generation settings, then compiles the provider request.
 `assertRequestAccountingFits` alone decides fit, including separate reasoning and
 output reservations. Counts, estimates, and unknown components stay distinguishable.
 
-`context_transition` schedules a replacement window with an optional source/note selection. Omitting selection removes optional history and notes; the tool does not generate a summary. Activation still requires admission.
+`context_transition` schedules a replacement window with an optional source selection. Omitting selection removes optional history while keeping current working state; the tool does not generate a summary. Activation still requires admission.
 The runtime binds the operation to its tool invocation, protects active accepted
 input and steering, preserves complete protocol exchanges, and schedules admission
 at the next lawful request boundary. Provider transforms are explicit governed
 invocations; their result must pass next-generation admission before activation.
 Idle source selection records intent without pretending to admit a future task.
 
-Core hosts with a note repository opt into `contextRenewal: { automatic: true }`;
+Core hosts with a context service opt into `contextRenewal: { automatic: true }`;
 both applications enable it by default. At context pressure, governed inference
-generates a continuation note from the current working context. This uses the same
+revises working state from the current working context. This uses the same
 owner budget, admission policy, and immutable inference records as ordinary work.
-Note generation appends an auxiliary task in the user channel to the unchanged
+State renewal appends an auxiliary task in the user channel to the unchanged
 conversation. It preserves authority roles, exact protocol prefixes, and provider
 settings, while removing executable tools and the original answer format. This
 task belongs only to its inference invocation; it is not recorded as user input.
 Capacity stays in request accounting and context inspection; the runtime does not
 insert capacity reminders into an established conversation prefix.
-Only a complete note and an admitted, smaller replacement can activate a new
-window. Active and protected user input remains exact; model-authored notes are
+Only a complete revision proposal and an admitted replacement can activate a new
+window. State and window become current together in one session journal commit.
+An unchanged proposal can renew the window without writing a new state revision. Active and protected user input remains exact; model-authored working state is
 fallible reference material, never instructions or verification. Originals remain
 retrievable. The soft continuity allowance occupies at most half of the available
 input capacity, so a large output reservation cannot trigger renewal on every
@@ -132,7 +128,7 @@ and compiled capacity; `/renew-context` and RPC `context.renew` submit renewal c
 
 Pass one `InferenceService` to the primary runtime and auxiliary consumers. Supply
 an explicit invocation repository and artifact repository for durable auxiliary
-work. A common `ownerId` binds primary work, note generation, and verification to
+work. A common `ownerId` binds primary work, state renewal, and verification to
 one resource policy. `invocationId` identifies a particular admitted request;
 `purpose` explains its application role without imposing a workflow.
 
@@ -198,42 +194,18 @@ sample count, and predeclared quality gates.
 
 Simulation proves the composition can execute and account for each policy. It
 does not estimate real model recall quality. Live trials compare retained input,
-original-history retrieval, notes with retrieval, and native transforms where the
+original-history retrieval, and native transforms where the
 exact adapter and endpoint support them. Unavailable capabilities and unknown
 pricing remain visible. No model-policy default follows from a single successful
 trial or a smaller prompt.
 
-### Recorded release measurements: 2026-09-08
+### Historical measurements
 
-Core's `npm run verify:release` passed its clean build, lint, 511 unit/fault tests,
-179 focused recovery/provider tests, and packed consumers under both settings of
-`exactOptionalPropertyTypes`. The long-session suite completes 1,000 real runtime
-inputs and verifies original requirements and later corrections across context
-transitions. Native execution fixtures run the actual runtime and WebSocket
-adapter against controlled protocol streams.
-
-The [simulation report](validation/policy-simulation-2026-09-08.json) contains
-16 completed trials: four policies, two delayed-recall workloads, and two
-deterministic repetitions per combination. All 424 invocations settled. The
-32 recall checkpoints passed; observed input loss, unauthorized scope expansion,
-orphan results and duplicate settlements were zero. The run exercised 60 context
-transitions, 20 governed note writes, 16 history retrievals and 20 native
-transforms. Notes were delivered 76 times through context selection; explicit
-note-read tool calls were zero. Native state was delivered 76 times.
-
-These numbers establish integration behavior on authored fixtures. Token usage
-includes estimates, pricing is unknown, and the repeated trials do not measure
-stochastic model quality. The report records the original source commit with a
-dirty working tree and the runner/workload digests because it was generated
-before the coordinated implementation commit.
-
-The [live availability report](validation/policy-live-availability-2026-09-08.json)
-records zero generations. The configured Codex subscription alias had no pinned
-deployment version, so the runner refused to treat it as a reproducible quality
-trial. The adapter also declares no native transform for that endpoint. Other
-live provider accounts were not configured. No model-specific policy default is
-promoted: retained history remains the baseline, and notes/retrieval/native
-transitions are explicit composition choices.
+The [archived reports](validation/README.md) describe the earlier notebook
+architecture and authored workloads. They do not validate working-state behavior
+or establish a model-quality improvement for this implementation. Current
+structural tests cover publication, concurrent updates, historical forks,
+request attribution, bounded recovery, admission, and provider continuity.
 
 The predeclared quality gates require at least ten trials per comparison, at
 most a five-percentage-point success regression within the reported uncertainty,

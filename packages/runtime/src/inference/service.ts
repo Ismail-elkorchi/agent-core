@@ -1,3 +1,5 @@
+import * as z from 'zod';
+import type { WorkingStateInference } from '../session/working-state.js';
 import { ModelStreamInterruptedError } from '../orchestration/model-stream.js';
 import { executeEffectLifecycle, type EffectLifecycle } from '@agent-core/effects';
 import { parseJsonObject } from '@agent-core/json';
@@ -60,6 +62,7 @@ export interface InferenceServiceOptions {
   readonly admitRequest?: (request: CompiledModelRequest) => void | Promise<void>;
 }
 export interface GovernedInferenceInput extends InferenceIdentity, ModelCompilationOptions {
+  readonly workingStateRevisionId?: string | null;
   readonly request: ModelRequest;
   readonly compiled?: CompiledModelRequest;
   readonly profile?: ModelProfile;
@@ -68,10 +71,8 @@ export interface GovernedInferenceInput extends InferenceIdentity, ModelCompilat
     event: Exclude<ModelStreamEvent, { readonly type: 'done' }>
   ) => void | Promise<void>;
 }
-export interface GovernedContextTransformInput extends Omit<
-  GovernedInferenceInput,
-  'onStreamEvent'
-> {
+export interface GovernedContextTransformInput
+  extends Omit<GovernedInferenceInput, 'onStreamEvent'> {
   readonly transformId: string;
 }
 interface DurableInferenceInput extends GovernedInferenceInput {
@@ -139,6 +140,7 @@ export class InferenceBudgetExceededError extends Error {
 }
 interface DurableOperation<T extends { readonly usage?: ModelUsage }> {
   readonly identity: InferenceIdentity;
+  readonly workingStateRevisionId?: string | null;
   readonly operation: 'generation' | 'context_transform' | 'native_generation';
   readonly profile: ModelProfile;
   readonly compiled: CompiledModelRequest;
@@ -204,9 +206,11 @@ export class InferenceService {
 
   async admit(compiled: CompiledModelRequest, profile: ModelProfile): Promise<void> {
     assertCompiledProfile(compiled, profile);
-    const identity = await modelInputIdentity(compiled.retainedBody === undefined
-      ? compiled.body
-      : { body: compiled.body, retainedBody: compiled.retainedBody });
+    const identity = await modelInputIdentity(
+      compiled.retainedBody === undefined
+        ? compiled.body
+        : { body: compiled.body, retainedBody: compiled.retainedBody }
+    );
     if (identity !== compiled.inputIdentity)
       throw new Error('Compiled provider input identity changed.');
     try {
@@ -216,6 +220,35 @@ export class InferenceService {
     }
     await this.options.admitRequest?.(compiled);
   }
+  async workingStateOrigin(
+    ownerId: string,
+    invocationId: string
+  ): Promise<{
+    readonly revisionId: string | null;
+    readonly inference: WorkingStateInference;
+  }> {
+    const { invocation } = await this.options.repository.load(ownerId, { invocationId });
+    if (!invocation) throw new Error('Working-state update has no recorded originating inference.');
+    const ref = invocation.extension?.requestRef ?? invocation.start.requestRef;
+    if (ref.visibility !== 'protected')
+      throw new Error('Recorded inference input is not protected.');
+    // Only the captured binding is needed here. The protected, already-accounted
+    // request body is not a model-tool JSON payload with collection quotas.
+    const record = z
+      .object({ workingStateRevisionId: z.string().min(1).nullable() })
+      .parse(
+        JSON.parse(
+          new TextDecoder('utf-8', { fatal: true }).decode(
+            await this.options.artifacts.readVerified(ref)
+          )
+        ) as unknown
+      );
+    return {
+      revisionId: record.workingStateRevisionId,
+      inference: { ownerId, invocationId, requestRef: ref }
+    };
+  }
+
   async invokeWithLifecycle<TResult>(
     input: InferenceInvocation,
     lifecycle: EffectLifecycle<TResult, ModelResponse>,
@@ -227,6 +260,7 @@ export class InferenceService {
       result = await this.invokeDurably(
         {
           ...identity,
+          workingStateRevisionId: input.workingStateRevisionId ?? null,
           request: input.request,
           profile: input.profile,
           session: input.session,
@@ -299,6 +333,7 @@ export class InferenceService {
     );
     const result = await this.executeDurably({
       identity: ownIdentity(input),
+      workingStateRevisionId: input.workingStateRevisionId ?? null,
       operation: 'context_transform',
       sourceRequest: request,
       ...(input.outputReservation === undefined
@@ -336,6 +371,7 @@ export class InferenceService {
         start: async ({ context, signal, authorize, dispatch }) => {
           const result = await this.executeDurably({
             identity: ownIdentity(context),
+            workingStateRevisionId: input.workingStateRevisionId?.() ?? null,
             operation: 'native_generation',
             profile: context.profile,
             compiled: context.compiled,
@@ -356,13 +392,15 @@ export class InferenceService {
             replayed: false
           });
         },
-        extend: (context, compiled) => this.extendNativeInvocation(context, compiled)
+        extend: (context, compiled) =>
+          this.extendNativeInvocation(context, compiled, input.workingStateRevisionId?.() ?? null)
       },
       {
         ...input,
         settled: async (settlement) => {
           this.tokenObservation = observeModelRequest(
-            settlement.context.compiled, settlement.result.response
+            settlement.context.compiled,
+            settlement.result.response
           );
           await input.settled(settlement);
         }
@@ -372,7 +410,8 @@ export class InferenceService {
 
   private async extendNativeInvocation(
     context: NativeGenerationContext,
-    compiled: CompiledModelRequest
+    compiled: CompiledModelRequest,
+    workingStateRevisionId: string | null
   ): Promise<void> {
     const { repository, artifacts } = this.options;
     await this.admit(compiled, context.profile);
@@ -408,6 +447,7 @@ export class InferenceService {
         mediaType: 'application/json',
         content: new TextEncoder().encode(
           JSON.stringify({
+            workingStateRevisionId,
             logical: recordableSourceRequest(compiled.logicalRequest),
             profile: context.profile,
             body: compiled.body,
@@ -444,7 +484,8 @@ export class InferenceService {
   ): Promise<InferenceResult> {
     const replayed = await this.replayExisting(input, 'generation', parseModelResponse);
     if (replayed) {
-      if (input.compiled) this.tokenObservation = observeModelRequest(input.compiled, replayed.value);
+      if (input.compiled)
+        this.tokenObservation = observeModelRequest(input.compiled, replayed.value);
       return Object.freeze({
         ...chargesAndIdentity(replayed),
         status: 'settled',
@@ -468,6 +509,7 @@ export class InferenceService {
     try {
       const result = await this.executeDurably({
         identity: ownIdentity(input),
+        workingStateRevisionId: input.workingStateRevisionId ?? null,
         operation: 'generation',
         sourceRequest: request,
         ...(input.outputReservation === undefined
@@ -574,9 +616,10 @@ export class InferenceService {
       );
       if (input.compiled && record.inputIdentity !== input.compiled.inputIdentity)
         throw new Error('Inference input differs from its captured admission.');
-      if (input.profile &&
+      if (
+        input.profile &&
         (await modelInputIdentity(parseModelProfile(record.profile))) !==
-        (await modelInputIdentity(parseModelProfile(input.profile)))
+          (await modelInputIdentity(parseModelProfile(input.profile)))
       )
         throw new Error('Inference profile differs from its captured admission.');
     }
@@ -693,6 +736,7 @@ export class InferenceService {
         mediaType: 'application/json',
         content: new TextEncoder().encode(
           JSON.stringify({
+            workingStateRevisionId: input.workingStateRevisionId ?? null,
             logical,
             sourceRequest: recordableSourceRequest(input.sourceRequest),
             profile,
@@ -944,9 +988,11 @@ function inferenceReservation(
   budget: InferenceBudget
 ): InferenceReservation {
   const accounting = compiled.accounting;
-  const needsInputBound = accounting.unknownComponents.length > 0 &&
+  const needsInputBound =
+    accounting.unknownComponents.length > 0 &&
     (budget.maxPromptTokens !== undefined ||
-      (budget.maxKnownCost !== undefined && profile.pricing?.currency === budget.maxKnownCost.currency));
+      (budget.maxKnownCost !== undefined &&
+        profile.pricing?.currency === budget.maxKnownCost.currency));
   const promptTokens = needsInputBound
     ? requestAccountingInputBound(accounting)
     : requestAccountingInputTokens(accounting);
@@ -954,13 +1000,17 @@ function inferenceReservation(
     throw new Error(
       'Unquantified input under an explicit token or cost budget requires provider counting or a finite model input bound.'
     );
-  const completionTokens = accounting.outputReservation +
-    (accounting.pricingSemantics.reasoningIncludedInOutput === false ? accounting.reasoningReservation : 0);
+  const completionTokens =
+    accounting.outputReservation +
+    (accounting.pricingSemantics.reasoningIncludedInOutput === false
+      ? accounting.reasoningReservation
+      : 0);
   return {
     promptTokens,
     completionTokens,
     cost: calculateInferenceCost(
-      { promptTokens, completionTokens, totalTokens: promptTokens + completionTokens }, profile.pricing
+      { promptTokens, completionTokens, totalTokens: promptTokens + completionTokens },
+      profile.pricing
     )
   };
 }

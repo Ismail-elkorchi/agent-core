@@ -2,30 +2,14 @@ import * as z from 'zod';
 import { parseJsonObject, type JsonValue } from '@agent-core/json';
 import { defaultToolModelContent, type CompiledToolDefinition } from '@agent-core/tools';
 import type { HistoryReader } from './reader.js';
-import { historyCutSchema } from './schema.js';
-import { queryShape, rangeShape, scopedTool, scopePath, sourceSchema } from './tool-support.js';
+import { historyCutSchema, historyReadRequestSchema } from './schema.js';
+import { queryShape, scopedTool, scopePath, sourceSchema } from './tool-support.js';
 export function createHistoryTools(options: {
   readonly history: HistoryReader;
   readonly prefix?: string;
 }): readonly CompiledToolDefinition[] {
   const prefix = options.prefix ?? 'history';
-  const read = z.strictObject({
-    source: sourceSchema,
-    ...rangeShape,
-    maxSourceBytes: z
-      .number()
-      .int()
-      .min(1)
-      .max(8 * 1024 * 1024)
-      .optional(),
-    maxBytes: z
-      .number()
-      .int()
-      .min(1)
-      .max(1024 * 1024)
-      .optional(),
-    neighbors: z.number().int().min(0).max(32).optional()
-  });
+  const read = historyReadRequestSchema.omit({ cut: true });
   const search = z.strictObject({
     query: z.string().max(4096).optional(),
     ...queryShape,
@@ -52,7 +36,8 @@ export function createHistoryTools(options: {
             'observation',
             'branch',
             'model_settings',
-            'context_transition'
+            'context_transition',
+            'working_state'
           ])
           .optional(),
         role: z.enum(['user', 'assistant', 'tool', 'control']).optional(),
@@ -75,14 +60,21 @@ export function createHistoryTools(options: {
         const result = parseJsonObject(observation.output);
         if (result.status !== 'available') return defaultToolModelContent(observation);
         const { item, neighbors } = result;
-        const range = { status: result.status, offset: result.offset, nextOffset: result.nextOffset, totalBytes: result.totalBytes };
+        const range = {
+          status: result.status,
+          offset: result.offset,
+          nextOffset: result.nextOffset,
+          totalBytes: result.totalBytes
+        };
         return [
           { type: 'text', text: JSON.stringify(range) },
           ...historyItemContent(item),
-          ...(Array.isArray(neighbors) && neighbors.length ? [
-            { type: 'text' as const, text: 'Neighboring history:' },
-            ...neighbors.flatMap(historyItemContent)
-          ] : [])
+          ...(Array.isArray(neighbors) && neighbors.length
+            ? [
+                { type: 'text' as const, text: 'Neighboring history:' },
+                ...neighbors.flatMap(historyItemContent)
+              ]
+            : [])
         ];
       },
       async canonicalize(value) {
@@ -93,7 +85,7 @@ export function createHistoryTools(options: {
         };
       },
       invoke(value) {
-        return options.history.read(read.extend({ cut: historyCutSchema.optional() }).parse(value));
+        return options.history.read(historyReadRequestSchema.parse(value));
       }
     }),
     scopedTool({
@@ -107,16 +99,24 @@ export function createHistoryTools(options: {
         if (observation.kind !== 'result') return defaultToolModelContent(observation);
         const result = parseJsonObject(observation.output);
         const { items } = result;
-        const coverage = Object.fromEntries(Object.entries(result).filter(([key]) =>
-          !['items', 'cut', 'indexWatermark', 'index'].includes(key)
-        ));
+        const coverage = Object.fromEntries(
+          Object.entries(result).filter(
+            ([key]) => !['items', 'cut', 'indexWatermark', 'index'].includes(key)
+          )
+        );
         return [
           { type: 'text', text: JSON.stringify(coverage) },
           ...(Array.isArray(items) && items.length
             ? items.flatMap(historyItemContent)
-            : [{ type: 'text' as const, text: result.coverage === 'partial'
-              ? 'No match in the scanned portion. Search coverage is partial; use cursor to continue.'
-              : 'No matching history.' }])
+            : [
+                {
+                  type: 'text' as const,
+                  text:
+                    result.coverage === 'partial'
+                      ? 'No match in the scanned portion. Search coverage is partial; use cursor to continue.'
+                      : 'No matching history.'
+                }
+              ])
         ];
       },
       async canonicalize(value) {

@@ -1,14 +1,13 @@
+import { historyReadRequestSchema } from '@agent-core/runtime';
 import type {
-  NoteQueryResult,
-  NoteReadResult,
+  HistoryReadRequest,
+  HistoryReadResult,
   SessionBranchBoundary,
   SessionBranchPageRequest,
-  SessionBranchSearchRequest,
-  SessionNoteRead
+  SessionBranchSearchRequest
 } from '@agent-core/runtime';
 import * as z from 'zod';
 import { rpcMethod } from './index.js';
-import { noteListParameters, noteReadParameters } from './note-parameters.js';
 import {
   sessionBranchBoundary,
   sessionBranchPageParameters,
@@ -16,6 +15,7 @@ import {
 } from './session-parameters.js';
 
 export interface HistoryRpcOperations {
+  readHistorySource(request: HistoryReadRequest): Promise<HistoryReadResult>;
   readHistory(request: SessionBranchPageRequest): Promise<unknown>;
   searchHistory(request: SessionBranchSearchRequest): Promise<unknown>;
   readHistoryEntry(boundary: SessionBranchBoundary, entryId: string): Promise<unknown>;
@@ -23,7 +23,12 @@ export interface HistoryRpcOperations {
 
 export function historyRpcMethods(operations: HistoryRpcOperations) {
   return {
-    'history.read': rpcMethod(sessionBranchPageParameters, (request) => operations.readHistory(request)),
+    'history.source': rpcMethod(historyReadRequestSchema, (request) =>
+      operations.readHistorySource(request)
+    ),
+    'history.read': rpcMethod(sessionBranchPageParameters, (request) =>
+      operations.readHistory(request)
+    ),
     'history.search': rpcMethod(sessionBranchSearchParameters, (request) =>
       operations.searchHistory(request)
     ),
@@ -31,18 +36,6 @@ export function historyRpcMethods(operations: HistoryRpcOperations) {
       z.strictObject({ boundary: sessionBranchBoundary, entryId: z.string().min(1) }),
       ({ boundary, entryId }) => operations.readHistoryEntry(boundary, entryId)
     )
-  };
-}
-
-export interface NoteRpcOperations {
-  listNotes(cursor?: string): Promise<NoteQueryResult>;
-  readNote(request: SessionNoteRead): Promise<NoteReadResult>;
-}
-
-export function noteRpcMethods(operations: NoteRpcOperations) {
-  return {
-    'notes.list': rpcMethod(noteListParameters, ({ cursor }) => operations.listNotes(cursor)),
-    'notes.read': rpcMethod(noteReadParameters, (request) => operations.readNote(request))
   };
 }
 

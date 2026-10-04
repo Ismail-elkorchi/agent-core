@@ -17,6 +17,7 @@ import { requestWindowForModel } from '../orchestration/model-request.js';
 import { ModelStreamInterruptedError } from '../orchestration/model-stream.js';
 
 export interface InferenceInvocation {
+  readonly workingStateRevisionId?: string | null;
   readonly transport?: ModelTransportOptions;
   readonly request: ModelRequest;
   readonly compiled?: CompiledModelRequest;
@@ -73,7 +74,9 @@ export class InferenceGateway {
             ...(message.parts?.flatMap((part, partIndex) =>
               part.type === 'image'
                 ? [['messages', messageIndex, 'parts', partIndex, 'image', 'data']]
-                : part.type === 'text' ? [] : [['messages', messageIndex, 'parts', partIndex, 'source', 'value']]
+                : part.type === 'text'
+                  ? []
+                  : [['messages', messageIndex, 'parts', partIndex, 'source', 'value']]
             ) ?? [])
           ]),
           endpoint: profile.capabilities.protocol?.endpoint ?? this.provider.id
@@ -163,7 +166,9 @@ function directProviderSession(provider: ModelProvider): ModelProviderSession {
   return Object.freeze({
     complete: (request: ModelRequest) => provider.complete(request),
     ...(stream ? { stream: (request: ModelRequest) => stream(request) } : {}),
-    ...(provider.completeCompiled ? { completeCompiled: provider.completeCompiled.bind(provider) } : {}),
+    ...(provider.completeCompiled
+      ? { completeCompiled: provider.completeCompiled.bind(provider) }
+      : {}),
     ...(provider.streamCompiled ? { streamCompiled: provider.streamCompiled.bind(provider) } : {})
   });
 }

@@ -12,19 +12,28 @@ if (!npmCli) throw new Error('npm_execpath is required to verify packed consumer
 const tscCli = path.join(root, 'node_modules', 'typescript', 'bin', 'tsc');
 const workspaceManifest = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
 const packageDirs = [];
-for await (const file of glob(workspaceManifest.workspaces.map((workspace) => `${workspace}/package.json`), { cwd: root })) {
+for await (const file of glob(
+  workspaceManifest.workspaces.map((workspace) => `${workspace}/package.json`),
+  { cwd: root }
+)) {
   const manifest = JSON.parse(await readFile(path.join(root, file), 'utf8'));
   if (!manifest.private) packageDirs.push(path.dirname(file));
 }
 packageDirs.sort();
 
 function assertCleanArchivePaths(paths) {
-  const forbidden = paths.filter((name) => /(^|\/)node_modules(\/|$)|(^|\/)\.agent-core(\/|$)|\.tsbuildinfo$|(^|\/)\.env($|\.)|(^|\/)(credentials?|secrets?)\.(json|ya?ml|txt)$/iu.test(name.replaceAll('\\', '/')));
-  if (forbidden.length > 0) throw new Error(`Archive contains forbidden paths:\n${forbidden.join('\n')}`);
+  const forbidden = paths.filter((name) =>
+    /(^|\/)node_modules(\/|$)|(^|\/)\.agent-core(\/|$)|\.tsbuildinfo$|(^|\/)\.env($|\.)|(^|\/)(credentials?|secrets?)\.(json|ya?ml|txt)$/iu.test(
+      name.replaceAll('\\', '/')
+    )
+  );
+  if (forbidden.length > 0)
+    throw new Error(`Archive contains forbidden paths:\n${forbidden.join('\n')}`);
 }
 
 function assertNoDistImports(source, file) {
-  if (/from\s+['"][^'"]*\/dist\/|import\(['"][^'"]*\/dist\//u.test(source)) throw new Error(`${file} imports generated package internals.`);
+  if (/from\s+['"][^'"]*\/dist\/|import\(['"][^'"]*\/dist\//u.test(source))
+    throw new Error(`${file} imports generated package internals.`);
 }
 
 const temporary = await mkdtemp(path.join(tmpdir(), 'agent-core-packed-consumer-'));
@@ -52,7 +61,8 @@ try {
         /\b(?:ModelMessage|ModelProviderState|CompleteRequestEstimator|SimpleTokenEstimator|TokenEstimator|SessionCompactionEntry|AgentSessionCompactionRequest|appendCompaction|summarizeConversation|executeAssistantToolCalls|nextObservationIndex|normalizeJsonSafe|JsonNormalizationDiagnostic|JsonNormalizationResult|outputNormalization|toObservationJsonObject|toJsonValue)\b/u.exec(
           declaration
         );
-      if (retired) throw new Error(`${relative}/${file} still exports retired contract ${retired[0]}.`);
+      if (retired)
+        throw new Error(`${relative}/${file} still exports retired contract ${retired[0]}.`);
     }
     dependencies[manifest.name] = `file:${path.join(packs, packed.filename)}`;
   }
@@ -102,7 +112,7 @@ try {
       "import * as local from '@agent-core/tools-local';",
       "import * as nodePersistence from '@agent-core/persistence/node';",
       "if (!runtime.decodeAgentTerminalSnapshot || !runtime.AgentRuntime || !runtime.AgentSession || !runtime.InMemorySessionRepository || !nodeRuntime.JsonlSessionRepository || !model.parseModelResponse || !json.parseJsonObject || !effects.decodeExternalEffectIntent || !persistence.InMemoryEventRepository || !nodePersistence.JsonlEventRepository || !tools.planToolCall || !tools.invokeToolCallPlan || !tools.isCommandExecution || !local.LocalCommandExecution) throw new Error('public runtime exports missing');",
-      "if (!runtime.HistoryReader || !runtime.ContextService || !runtime.InferenceService || !runtime.InMemoryNoteRepository || !runtime.InMemoryInferenceRepository || !nodeRuntime.JsonlNoteRepository || !nodeRuntime.JsonlInferenceRepository || !runtime.createHistoryTools || !runtime.createNotesTools || !runtime.createContextTools || !runtime.EffectExecutor || !runtime.createObservationAccess || !tools.commandExecutionResources || !tools.contextRequiredObservation || !model.accountModelRequest || !model.compileModelRequest) throw new Error('persistent context exports missing');"
+      "if (!runtime.HistoryReader || !runtime.ContextService || !runtime.InferenceService || !runtime.InMemoryInferenceRepository || !nodeRuntime.JsonlInferenceRepository || !runtime.createHistoryTools || !runtime.createWorkingStateTool || !runtime.createContextTools || !runtime.EffectExecutor || !runtime.createObservationAccess || !tools.commandExecutionResources || !tools.contextRequiredObservation || !model.accountModelRequest || !model.compileModelRequest) throw new Error('persistent context exports missing');"
     ].join('\n')
   );
   await exec(process.execPath, ['runtime.mjs'], { cwd: consumer });
@@ -136,14 +146,14 @@ try {
       "import { text } from '@ismail-elkorchi/terminal-ui/components';",
       'declare const tuiContext: TuiContext;',
       "const child = createTuiChild({ init: () => ({ state: 0 }), update: (state: number, message: number) => ({ state: state + message }), view: () => text({ content: 'child' }) }, (child) => ({ type: 'child' as const, child }));",
-      "const mounted = mountPanel({ panelGeneration: 0 as const, overlay: { kind: 'none' as const }, owned: true }, 'notes', child, tuiContext);",
+      "const mounted = mountPanel({ panelGeneration: 0 as const, overlay: { kind: 'none' as const }, owned: true }, 'example', child, tuiContext);",
       '// @ts-expect-error scoped panel work is opaque, not an effect descriptor array',
       'mounted.effects;',
       '// @ts-expect-error scoped panel focus is forwarded as owned work',
       'mounted.focus;',
-      "if (mounted.state.overlay.kind === 'notes') {",
+      "if (mounted.state.overlay.kind === 'example') {",
       '  const value: number = mounted.state.overlay.state.state;',
-      "  const applied = applyPanelResult(mounted.state, 'notes', child.update(mounted.state.overlay.state, { id: 'notes', generation: mounted.state.panelGeneration, message: value }, tuiContext));",
+      "  const applied = applyPanelResult(mounted.state, 'example', child.update(mounted.state.overlay.state, { id: 'example', generation: mounted.state.panelGeneration, message: value }, tuiContext));",
       '  combineTuiResults(applied.state, applied, reconcileTuiChildren([mounted.state.overlay.state], [], (child) => child));',
       '}',
       "import type { JsonObject } from '@agent-core/json';",
@@ -153,7 +163,7 @@ try {
       'diagnostic.value;',
       "import type { ModelInputItem, ModelOutputItem, ProviderContextState, CompiledModelRequest, RequestAccounting } from '@agent-core/model';",
       "import { settleExternalEffect, type EffectExecutionState, type EffectRecoveryCapability } from '@agent-core/effects';",
-      "import type { AgentModelOutput, AgentRunControl, AgentSessionState, AgentTerminalSnapshot, AgentRuntimeOptions, ContextWindowRecord, EffectExecutionEvent, HistorySourceRef, NoteRepository } from '@agent-core/runtime';",
+      "import type { AgentModelOutput, AgentRunControl, AgentSessionState, AgentTerminalSnapshot, AgentRuntimeOptions, ContextWindowRecord, EffectExecutionEvent, HistorySourceRef } from '@agent-core/runtime';",
       "import type { ExecutionResources, ToolEffects, ToolObservation, ToolObservationInput } from '@agent-core/tools';",
       "const json: JsonObject = { nested: { ok: true }, values: [1, 'two'] };",
       "declare const unsettledState: Exclude<EffectExecutionState, { phase: 'settled' }>;",
@@ -188,7 +198,6 @@ try {
       'declare const accounting: RequestAccounting;',
       'declare const window: ContextWindowRecord;',
       'declare const source: HistorySourceRef;',
-      'declare const notes: NoteRepository;',
       "const modelOutput: AgentModelOutput = { status: 'complete', message: 'done', source: 'content', turnIndex: 1 };",
       "const recovery: EffectRecoveryCapability = { kind: 'unknown' };",
       "const effects: ToolEffects = { accesses: [{ mode: 'read', scope: 'workspace' }], lockScopes: [], recovery };",
@@ -210,7 +219,7 @@ try {
       'const lifetime = resources.lifetime;',
       'declare const run: AgentRunControl;',
       'declare const sessionState: AgentSessionState;',
-      'void [json, providerState, developerInput, outputItem, compiled, accounting, window, source, notes, modelOutput, recovery, effects, rawObservation, ownedObservation, immutableObservation, terminal, options, lifetime, run, sessionState];'
+      'void [json, providerState, developerInput, outputItem, compiled, accounting, window, source, modelOutput, recovery, effects, rawObservation, ownedObservation, immutableObservation, terminal, options, lifetime, run, sessionState];'
     ].join('\n')
   );
   for (const exactOptionalPropertyTypes of [true, false]) {
@@ -228,7 +237,8 @@ try {
     .trim()
     .split('\n')
     .filter(Boolean);
-  for (const file of testFiles) assertNoDistImports(await readFile(path.join(root, file), 'utf8'), file);
+  for (const file of testFiles)
+    assertNoDistImports(await readFile(path.join(root, file), 'utf8'), file);
   console.log(
     'Packed consumer runtime and exactOptionalPropertyTypes=true/false declaration checks passed.'
   );

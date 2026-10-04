@@ -1,7 +1,8 @@
+import { workingStateChangeSchema } from '../session/working-state.js';
 import { parseModelSelection } from '@agent-core/model';
 import { parseJsonObject } from '@agent-core/json';
 import * as z from 'zod';
-import { historyCutSchema, noteRefSchema, sourceSchema } from '../history/schema.js';
+import { historyCutSchema, sourceSchema } from '../history/schema.js';
 export const contextSelectionSchema = z
   .strictObject({
     protected: z.array(sourceSchema).max(10000).readonly().optional(),
@@ -15,7 +16,6 @@ export const contextSelectionSchema = z
       .readonly()
       .optional(),
     retained: z.array(sourceSchema).max(10_000).readonly(),
-    notes: z.array(noteRefSchema).max(256).readonly(),
     strategy: z.enum(['sources', 'provider']),
     providerState: z
       .unknown()
@@ -80,6 +80,7 @@ export const contextTransitionSchema = z
 export const contextEntrySchema = z
   .strictObject({
     type: z.literal('context_transition'),
+    workingState: workingStateChangeSchema.omit({ id: true }).optional(),
     id: z.string().min(1),
     parentId: z.string().min(1).nullable(),
     timestamp: z.string().min(1),

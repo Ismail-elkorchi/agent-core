@@ -156,23 +156,36 @@ async function transitionInput(state) {
     reason: 'Native transformation',
     selection: {
       strategy: 'provider',
-      retained: page.entries.map((entry) => sourceRef(cut.sessionId, entry)),
-      notes: []
+      retained: page.entries.map((entry) => sourceRef(cut.sessionId, entry))
     }
   };
 }
 
 test('context transform admission rejects the exact compiled input before provider execution', async () => {
-  const state = await fixture({ admitRequest(compiled) {
-    assert.equal(compiled.endpoint, 'fixture/compact');
-    throw new Error('Transform denied');
-  } });
-  await assert.rejects(state.inference.transformContext({
-    ownerId: 'context-owner', invocationId: 'rejected-transform', purpose: 'context', transformId: 'transform',
-    request: { model: 'native', messages: [{ role: 'user', content: 'Original context' }], maxOutputTokens: 64 }
-  }), /Transform denied/);
+  const state = await fixture({
+    admitRequest(compiled) {
+      assert.equal(compiled.endpoint, 'fixture/compact');
+      throw new Error('Transform denied');
+    }
+  });
+  await assert.rejects(
+    state.inference.transformContext({
+      ownerId: 'context-owner',
+      invocationId: 'rejected-transform',
+      purpose: 'context',
+      transformId: 'transform',
+      request: {
+        model: 'native',
+        messages: [{ role: 'user', content: 'Original context' }],
+        maxOutputTokens: 64
+      }
+    }),
+    /Transform denied/
+  );
   assert.equal(state.transforms(), 0);
-  const invocation = (await state.repository.load('context-owner', { invocationId: 'rejected-transform' })).invocation;
+  const invocation = (
+    await state.repository.load('context-owner', { invocationId: 'rejected-transform' })
+  ).invocation;
   assert.equal(invocation.notSent.type, 'inference.not_sent');
   assert.equal(invocation.uncertain, undefined);
 });
@@ -210,7 +223,11 @@ test('provider transform settlement is followed by actual next-generation admiss
   );
   const owner = await state.repository.load('transform-run');
   assert.deepEqual(
-    state.inferenceAudit.filter(({ ownerId, event }) => ownerId === 'transform-run' && event.type === 'inference.started').map(({ event }) => event.operation),
+    state.inferenceAudit
+      .filter(
+        ({ ownerId, event }) => ownerId === 'transform-run' && event.type === 'inference.started'
+      )
+      .map(({ event }) => event.operation),
     ['context_transform', 'generation']
   );
 });
@@ -250,7 +267,9 @@ test('canceled native transforms remain uncertain and late results settle the or
   await assert.rejects(state.inference.transformContext(request), InferenceOutcomeUnknownError);
   assert.equal(state.transforms(), 1);
   release();
-  while (!(await state.repository.load('owner', { invocationId: 'transform-one' })).invocation.settlement)
+  while (
+    !(await state.repository.load('owner', { invocationId: 'transform-one' })).invocation.settlement
+  )
     await new Promise((resolve) => setTimeout(resolve, 1));
   const replay = await state.inference.transformContext(request);
   assert.equal(replay.replayed, true);

@@ -1,4 +1,9 @@
-import type { ModelProviderSession, ModelSteeringDelivery, ModelStreamEvent } from '@agent-core/model';
+import type {
+  ModelInputItem,
+  ModelProviderSession,
+  ModelSteeringDelivery,
+  ModelStreamEvent
+} from '@agent-core/model';
 import type { AgentAuditEvent, AgentEvent } from '../events.js';
 import { hashJson, type EventRepository } from '@agent-core/persistence';
 
@@ -21,6 +26,7 @@ export class NativeSteeringCoordinator {
   private session: ModelProviderSession | undefined;
   private responseId: string | undefined;
   private native = false;
+  private additionalInput: (() => Promise<readonly ModelInputItem[]>) | undefined;
   private pending: Promise<void> = Promise.resolve();
 
   constructor(
@@ -63,13 +69,21 @@ export class NativeSteeringCoordinator {
       `steering:${deliveryId}:accepted`
     );
     this.inputs.set(deliveryId, { deliveryId, content, localApplied: false });
-    if (this.native && this.responseId) this.pending = this.pending.then(() => this.submit(deliveryId));
+    if (this.native && this.responseId)
+      this.pending = this.pending.then(() => this.submit(deliveryId));
   }
 
-  bind(session: ModelProviderSession, native: boolean): void {
+  bind(
+    session: ModelProviderSession,
+    native: boolean,
+    additionalInput?: () => Promise<readonly ModelInputItem[]>
+  ): void {
     if (native && (!session.steer || !session.steeringStatus))
-      throw new Error('Native steering requires submission and delivery-reconciliation capabilities.');
+      throw new Error(
+        'Native steering requires submission and delivery-reconciliation capabilities.'
+      );
     this.session = session;
+    this.additionalInput = additionalInput;
     this.native = native;
     this.responseId = undefined;
   }
@@ -113,15 +127,23 @@ export class NativeSteeringCoordinator {
     const input = this.inputs.get(deliveryId);
     const session = this.session;
     const responseId = this.responseId;
-    if (!input || input.localApplied || input.delivery || !this.native || !responseId || !session?.steer)
+    if (
+      !input ||
+      input.localApplied ||
+      input.delivery ||
+      !this.native ||
+      !responseId ||
+      !session?.steer
+    )
       return;
+    const additionalInput = (await this.additionalInput?.()) ?? [];
     await this.record({ deliveryId, responseId, status: 'submitted' });
     try {
       await this.record(
         await session.steer({
           deliveryId,
           responseId,
-          input: [{ role: 'user', content: input.content }]
+          input: [{ role: 'user', content: input.content }, ...additionalInput]
         })
       );
     } catch {
@@ -148,7 +170,11 @@ export class NativeSteeringCoordinator {
 
   private async record(delivery: ModelSteeringDelivery): Promise<void> {
     const input = this.inputs.get(delivery.deliveryId);
-    if (!input || input.localApplied || (input.delivery && input.delivery.responseId !== delivery.responseId))
+    if (
+      !input ||
+      input.localApplied ||
+      (input.delivery && input.delivery.responseId !== delivery.responseId)
+    )
       throw new Error('Native steering receipt does not match its original input and response.');
     if (input.delivery?.status === 'applied') {
       if (delivery.status !== 'applied')

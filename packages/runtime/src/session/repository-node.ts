@@ -1,3 +1,12 @@
+import {
+  workingStateEntrySchema,
+  workingStateRetry,
+  assertWorkingStateRevision,
+  assertWorkingStateBranch,
+  latestWorkingState,
+  type WorkingStateChange,
+  type SessionWorkingStateEntry
+} from './working-state.js';
 import { decodeToolContent } from '@agent-core/tools';
 import { parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import { parseModelSelection, type ModelOutputItem, type ModelSelection } from '@agent-core/model';
@@ -39,11 +48,15 @@ import {
   type SessionBindingInput
 } from './binding.js';
 import { JsonlBranchIndex } from './branch-index-node.js';
-import { assertBranchEntry, readBranchPage, searchBranch } from './branch-page.js';
+import {
+  assertBranchEntry,
+  readBranchPage,
+  searchBranch,
+  currentWorkingState
+} from './branch-page.js';
 import {
   contextCommitRetry,
   decodeContextTransitionEntry,
-  ownBranchNoteSource,
   sessionReplayState,
   validateContextCommit
 } from './context-records.js';
@@ -138,6 +151,7 @@ export class JsonlSessionRepository implements SessionRepository {
           type: 'session',
           version: 1,
           format: 'agent-core.session/2',
+          workingStateStorage: 'session',
           id,
           timestamp: new Date().toISOString(),
           binding,
@@ -161,6 +175,43 @@ export class JsonlSessionRepository implements SessionRepository {
         this.indexes.set(id, state);
         return sessionFromState(state);
       })
+    );
+  }
+
+  async currentWorkingState(
+    session: SessionDescriptor,
+    leafId?: string | null
+  ): Promise<SessionWorkingStateEntry | null> {
+    return currentWorkingState(await this.branchIndex(session.id).source(session), leafId);
+  }
+  commitWorkingState(
+    session: SessionDescriptor,
+    change: WorkingStateChange,
+    expectedBranchId: string
+  ): Promise<SessionWorkingStateEntry> {
+    return this.enqueue(session.id, () =>
+      withPersistenceFileLock(
+        this.filePath(session.id),
+        this.lockTimeoutMs,
+        this.staleLockMs,
+        async () => {
+          const state = await this.refreshIndex(session.id, true);
+          assertDescriptor(session, state);
+          const branch = activeBranch(state.branchEntries, branchLeaf(state.branchEntries));
+          assertWorkingStateBranch(branch, session.id, expectedBranchId);
+          const existing = workingStateRetry(branch, change);
+          if (existing) return existing;
+          assertWorkingStateRevision(latestWorkingState(branch), change.previousRevisionId);
+          const entry = workingStateEntrySchema.parse({
+            ...baseEntry(branchLeaf(state.branchEntries)),
+            type: 'working_state',
+            ...change
+          });
+          await this.appendRecord(session.id, state, entry);
+          state.branchEntries.push(entry);
+          return entry;
+        }
+      )
     );
   }
 
@@ -219,7 +270,8 @@ export class JsonlSessionRepository implements SessionRepository {
         (entry): entry is SessionConversationItem =>
           entry.type !== 'branch' &&
           entry.type !== 'model_settings' &&
-          entry.type !== 'context_transition'
+          entry.type !== 'context_transition' &&
+          entry.type !== 'working_state'
       )
     );
   }
@@ -549,7 +601,10 @@ export class JsonlSessionRepository implements SessionRepository {
             type: 'observation',
             ...normalized
           });
-          const writtenBytes = await appendJsonlRecord(this.filePath(sessionId), parseJsonValue(entry));
+          const writtenBytes = await appendJsonlRecord(
+            this.filePath(sessionId),
+            parseJsonValue(entry)
+          );
           state.branchEntries.push(entry);
           state.completeBytes += writtenBytes;
           state.boundaryMarker = await jsonlBoundaryMarker(
@@ -598,9 +653,11 @@ export class JsonlSessionRepository implements SessionRepository {
             input,
             state.finalizations
           );
+          const { id: revisionId, ...workingState } = input.workingState ?? {};
           const entry = decodeContextTransitionEntry({
             ...baseEntry(branchLeaf(state.branchEntries)),
             type: 'context_transition',
+            ...(revisionId ? { id: revisionId, workingState } : {}),
             window: input.window,
             transition: input.transition
           });
@@ -614,8 +671,7 @@ export class JsonlSessionRepository implements SessionRepository {
   branchFrom(
     session: SessionDescriptor,
     entryId: string,
-    label?: string,
-    noteSource?: SessionBranchMarkerEntry['noteSource']
+    label?: string
   ): Promise<SessionBranchMarkerEntry> {
     const sessionId = session.id;
     return this.enqueue(sessionId, () =>
@@ -640,10 +696,12 @@ export class JsonlSessionRepository implements SessionRepository {
             ...baseEntry(entryId),
             type: 'branch',
             fromEntryId: entryId,
-            ...(label ? { label } : {}),
-            ...(noteSource ? { noteSource: ownBranchNoteSource(noteSource) } : {})
+            ...(label ? { label } : {})
           });
-          const writtenBytes = await appendJsonlRecord(this.filePath(sessionId), parseJsonValue(entry));
+          const writtenBytes = await appendJsonlRecord(
+            this.filePath(sessionId),
+            parseJsonValue(entry)
+          );
           state.branchEntries.push(entry);
           state.completeBytes += writtenBytes;
           state.boundaryMarker = await jsonlBoundaryMarker(
@@ -848,7 +906,10 @@ export class JsonlSessionRepository implements SessionRepository {
           const state = await this.refreshIndex(sessionId, true);
           assertDescriptor(session, state);
           const entry = create(branchLeaf(state.branchEntries));
-          const writtenBytes = await appendJsonlRecord(this.filePath(sessionId), parseJsonValue(entry));
+          const writtenBytes = await appendJsonlRecord(
+            this.filePath(sessionId),
+            parseJsonValue(entry)
+          );
           state.branchEntries.push(entry);
           state.completeBytes += writtenBytes;
           state.boundaryMarker = await jsonlBoundaryMarker(
@@ -1095,13 +1156,10 @@ function parseBranchEntry(value: JsonValue): SessionBranchEntry {
       ...(modelContent === undefined ? {} : { modelContent: decodeToolContent(modelContent) })
     });
   }
-  if (isSessionBranchMarkerEntry(value))
-    return Object.freeze({
-      ...value,
-      ...(value.noteSource === undefined
-        ? {}
-        : { noteSource: ownBranchNoteSource(value.noteSource) })
-    });
+  if (isSessionBranchMarkerEntry(value)) {
+    return Object.freeze(value);
+  }
+  if (value.type === 'working_state') return workingStateEntrySchema.parse(value);
   if (value.type === 'model_settings') {
     const { type, id, parentId, timestamp, source, ...settings } = value;
     return Object.freeze({
@@ -1182,6 +1240,7 @@ const SESSION_HEADER_FIELDS = new Set([
   'type',
   'version',
   'format',
+  'workingStateStorage',
   'id',
   'timestamp',
   'binding',
@@ -1191,7 +1250,11 @@ const SESSION_HEADER_FIELDS = new Set([
 ]);
 
 function parseSessionHeader(value: JsonValue, sessionId: string): SessionHeader {
-  if (!isJsonObject(value) || value.format !== 'agent-core.session/2')
+  if (
+    !isJsonObject(value) ||
+    value.format !== 'agent-core.session/2' ||
+    value.workingStateStorage !== 'session'
+  )
     throw new Error(
       'Incompatible session format. Start a new session; existing data has not been changed.'
     );
@@ -1212,6 +1275,7 @@ function parseSessionHeader(value: JsonValue, sessionId: string): SessionHeader 
     type: 'session',
     version: 1,
     format: 'agent-core.session/2',
+    workingStateStorage: 'session',
     id: value.id,
     timestamp: value.timestamp,
     binding,
@@ -1658,7 +1722,8 @@ function encodeSuspension(
     reason: suspension.reason,
     ...(suspension.effectId === undefined ? {} : { effectId: suspension.effectId }),
     ...(suspension.contextAdmission === undefined
-      ? {} : { contextAdmission: parseJsonValue(suspension.contextAdmission) }),
+      ? {}
+      : { contextAdmission: parseJsonValue(suspension.contextAdmission) }),
     actions: Object.freeze([...suspension.actions]),
     ...(suspension.decisionRequest === undefined
       ? {}

@@ -1,39 +1,15 @@
 import * as z from 'zod';
 import { fileTransactionResultSchema } from '../../core/file-transaction.js';
 
-const unicodeTextSchema = z
-  .string()
-  .refine(
-    (value) => !/\p{Surrogate}/u.test(value),
-    'Text must contain well-formed Unicode scalar values.'
-  );
+import { textEditSchema, textRangeSchema } from '@agent-core/tools';
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/u);
-const positionSchema = z.strictObject({
-  line: z.int().min(1).meta({ description: 'One-based line number.' }),
-  column: z.int().min(1).meta({ description: 'One-based Unicode-scalar column.' })
-});
-const rangeSchema = z
-  .strictObject({
-    start: positionSchema,
-    end: positionSchema
-  })
-  .meta({ description: 'Half-open range [start, end).' });
-
 export const editTextInputSchema = z.strictObject({
   files: z
     .array(
       z.strictObject({
         path: z.string().trim().min(1),
         expectedSha256: sha256Schema,
-        edits: z
-          .array(
-            z.strictObject({
-              range: rangeSchema,
-              expectedText: unicodeTextSchema,
-              replacementText: unicodeTextSchema
-            })
-          )
-          .min(1)
+        edits: z.array(textEditSchema).min(1)
       })
     )
     .min(1),
@@ -41,7 +17,7 @@ export const editTextInputSchema = z.strictObject({
 });
 
 const changedRangeSchema = z.strictObject({
-  range: rangeSchema,
+  range: textRangeSchema,
   expectedTextSha256: sha256Schema,
   replacementTextSha256: sha256Schema,
   expectedScalars: z.int().nonnegative(),

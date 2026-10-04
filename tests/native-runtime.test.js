@@ -10,6 +10,10 @@ import {
   AgentRunCoordinator,
   InferenceService,
   InMemoryInferenceRepository,
+  InMemorySessionRepository,
+  HistoryReader,
+  ContextService,
+  createWorkingStateTool,
   agentEventCodec
 } from '@agent-core/runtime';
 import { adoptToolDefinition } from '@agent-core/tools';
@@ -239,7 +243,7 @@ async function deliveryFixture({ maxInvocations = 3, disconnect = false, admitRe
   const events = new InMemoryEventRepository(agentEventCodec);
   const artifacts = new InMemoryArtifactRepository();
   const inference = new InMemoryInferenceRepository();
-    const inferenceAudit = recordInferenceEvents(inference);
+  const inferenceAudit = recordInferenceEvents(inference);
   const options = {
     provider,
     model: 'gpt-6-astra',
@@ -266,9 +270,11 @@ async function deliveryFixture({ maxInvocations = 3, disconnect = false, admitRe
 }
 
 test('application admission rejects a native successor before any result frame is sent', async () => {
-  const fixture = await deliveryFixture({ admitRequest(compiled) {
-    if (compiled.body.previous_response_id) throw new Error('Successor denied');
-  } });
+  const fixture = await deliveryFixture({
+    admitRequest(compiled) {
+      if (compiled.body.previous_response_id) throw new Error('Successor denied');
+    }
+  });
   assert.equal(fixture.socket.sent.length, 1);
   assert.equal(fixture.effects, 1);
   assert.equal(fixture.result.state, 'ended', JSON.stringify(fixture.result));
@@ -469,3 +475,103 @@ for (const [requiresResult, reportsUsage] of [
     );
   });
 }
+
+test(
+  'native working-state updates bind each successor to its exact admitted input',
+  { timeout: 10000 },
+  async () => {
+    const sessions = new InMemorySessionRepository();
+    const descriptor = await sessions.create({
+      binding: { schemaId: 'native-state', schemaVersion: 1, subject: {} }
+    });
+    const artifacts = new InMemoryArtifactRepository();
+    const events = new InMemoryEventRepository(agentEventCodec);
+    const history = new HistoryReader({
+      repository: sessions,
+      session: descriptor,
+      events,
+      artifacts
+    });
+    const context = new ContextService({
+      repository: sessions,
+      session: descriptor,
+      history,
+      artifacts,
+      policy: { maxSourceBytes: 1024 * 1024, historyRead: { history, isAvailable: () => true } }
+    });
+    let socket;
+    const body1 = 'Retain the rationale.';
+    const body2 = 'Retain the corrected rationale.';
+    const edit = (before, after) => ({
+      edits: [
+        {
+          range: { start: { line: 1, column: 1 }, end: { line: 1, column: before.length + 1 } },
+          expectedText: before,
+          replacementText: after
+        }
+      ]
+    });
+    const provider = new OpenAIProvider({
+      apiKey: 'fixture',
+      transport: 'websocket',
+      webSocketFactory: () =>
+        (socket = new Socket((body, ws) => {
+          const id = !body.previous_response_id
+            ? 'r1'
+            : body.previous_response_id === 'r1'
+              ? 'r2'
+              : 'r3';
+          const output =
+            id === 'r3'
+              ? message('Finished.')
+              : [
+                  {
+                    ...call(id + '-state', 'update_working_state'),
+                    arguments: JSON.stringify(id === 'r1' ? edit('', body1) : edit(body1, body2))
+                  }
+                ];
+          ws.feed(
+            { type: 'response.created', response: { id } },
+            { type: 'response.completed', response: response(id, output) }
+          );
+        }))
+    });
+    const inference = new InferenceService({
+      provider,
+      repository: new InMemoryInferenceRepository(),
+      artifacts
+    });
+    const result = await new AgentRuntime({
+      provider,
+      model: 'gpt-6-astra',
+      maxOutputTokens: 512,
+      context,
+      inferenceService: inference,
+      tools: [createWorkingStateTool(context)],
+      toolPolicy: { allowedRisks: ['write'] },
+      toolBoundary: { authorizationPolicyId: 'native-state', executionTargetId: 'native-state' },
+      repositories: { events, artifacts, session: { repository: sessions, descriptor } }
+    }).run({ task: 'Correct the understanding and finish.' }).result;
+    assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+    const { branch } = await sessions.loadReplayState(descriptor);
+    const revisions = branch.filter((entry) => entry.type === 'working_state');
+    assert.equal(revisions.length, 2, JSON.stringify(branch));
+    assert.equal((await context.workingState()).text, body2);
+    assert.equal(socket.sent.length, 3);
+    for (const [index, text] of [body1, body2].entries()) {
+      const wire = socket.sent[index + 1];
+      assert.equal(wire.input[0].type, 'function_call_output');
+      assert.equal(wire.input[1].role, 'user');
+      assert.ok(JSON.stringify(wire.input[1]).includes(text));
+    }
+    const originatingInput = JSON.parse(
+      new TextDecoder().decode(await artifacts.readVerified(revisions[1].inference.requestRef))
+    );
+    assert.equal(originatingInput.workingStateRevisionId, revisions[0].id);
+    assert.ok(JSON.stringify(originatingInput.logical).includes(body1));
+    assert.notEqual(
+      revisions[0].inference.requestRef.sha256,
+      revisions[1].inference.requestRef.sha256
+    );
+  }
+);

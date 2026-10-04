@@ -1,4 +1,8 @@
-import { writeContinuationNote } from './context/continuation-note.js';
+import {
+  workingStateRenewalRequest,
+  stageWorkingStateRenewal
+} from './context/working-state-renewal.js';
+import type { WorkingStateSnapshot } from './session/working-state.js';
 import { providerSettlementKey } from './inference/run-lifecycle.js';
 import { ContextSourceCapacityError } from './run/context-admission.js';
 import { agentRunActivity } from './run/control/contracts.js';
@@ -59,6 +63,7 @@ import {
 import { HistoryReader, sourceRef } from './history/reader.js';
 import {
   ModelRequestAssembler,
+  renderContext,
   type PromptInstruction
 } from './inference/model-request-assembler.js';
 import {
@@ -73,7 +78,8 @@ import type { NativeGenerationContext } from './inference/native-inference.js';
 import { NativeSteeringCoordinator } from './inference/native-steering.js';
 import {
   decodePromptContextItemInput,
-  type PromptContextItemInput
+  type PromptContextItemInput,
+  type PromptContextItem
 } from './inference/prompt-material.js';
 import {
   createRunInferenceLifecycle,
@@ -81,7 +87,6 @@ import {
   providerUsageQuantities
 } from './inference/run-lifecycle.js';
 import { InferenceService } from './inference/service.js';
-import type { NoteRepository } from './notes/contracts.js';
 import {
   BudgetAccountant,
   type RequestCostEstimate,
@@ -182,7 +187,8 @@ export interface AgentRuntimeOptions {
   readonly repositories: AgentRuntimeRepositories;
   readonly tools?: readonly CompiledToolDefinition[];
   readonly toolCatalogProvider?: () =>
-    readonly CompiledToolDefinition[] | Promise<readonly CompiledToolDefinition[]>;
+    | readonly CompiledToolDefinition[]
+    | Promise<readonly CompiledToolDefinition[]>;
   readonly toolBoundary: ToolAuthorizationBoundary;
   readonly toolContext?: Omit<ToolExecutionContext, 'policy' | 'signal'>;
   readonly toolResourceLeases?: ResourceLeaseCoordinator;
@@ -197,7 +203,6 @@ export interface AgentRuntimeOptions {
   readonly contextItems?: readonly PromptContextItemInput[];
   readonly contextProvider?: AgentContextProvider;
   readonly context?: ContextService;
-  readonly notes?: NoteRepository;
   readonly contextRenewal?: { readonly automatic: boolean };
   readonly onRequestAdmitted?: (input: {
     readonly requestId: string;
@@ -306,7 +311,10 @@ type TerminalDecision =
   | {
       readonly executionStatus: 'completed';
       readonly terminationReason:
-        'model_completed' | 'model_output_limit' | 'content_filtered' | 'unknown_model_termination';
+        | 'model_completed'
+        | 'model_output_limit'
+        | 'content_filtered'
+        | 'unknown_model_termination';
       readonly modelOutput: AgentPresentModelOutput;
       readonly turnCount: number;
       readonly modelTerminationReason: ModelResponse['terminationReason'];
@@ -462,6 +470,22 @@ export class AgentRuntime {
       options.inferenceService ?? InferenceService.inMemory({ provider: options.provider });
     this.requestAdmission = new RequestAdmission(this.requestAssembler, this.inferenceService);
     this.unbindContext = options.context?.bindRuntime({
+      origin: async (invocation) => {
+        const run = this.activeRunDriver;
+        if (run?.state().runId !== invocation.runId)
+          throw new Error('Working-state update belongs to another run.');
+        const work = providerWork(run.state(), invocation);
+        if (work.stage === 'ready')
+          throw new Error('Working-state update has no admitted inference.');
+        const invocationId = work.effect.intent.effectId.slice(
+          0,
+          work.effect.intent.effectId.lastIndexOf(':')
+        );
+        return this.inferenceService.workingStateOrigin(
+          this.options.inferenceOwnerId ?? invocation.runId,
+          invocationId
+        );
+      },
       schedule: (request) => this.scheduleContextTransition(request),
       providerTransform:
         typeof options.provider.compileContextTransform === 'function' &&
@@ -2012,6 +2036,17 @@ export class AgentRuntime {
         'Native execution requires compiled streaming, continuation and result-delivery reconciliation.'
       );
     }
+    let nativeWorkingStateRevisionId = assembly.fingerprint.workingStateRevisionId;
+    const captureNativeWorkingState = async () => {
+      const context = this.options.context;
+      if (!context) return [];
+      const cut = await context.history.capture();
+      const state = await context.workingState(cut);
+      if ((state.revision?.id ?? null) === nativeWorkingStateRevisionId) return [];
+      nativeWorkingStateRevisionId = state.revision?.id ?? null;
+      return [{ role: 'user' as const, content: renderContext(workingStateContext(state)) }];
+    };
+    this.nativeSteering?.bind(session, true, captureNativeWorkingState);
     const deliverToolResults = session.deliverToolResults.bind(session);
     const continueNative = session.continueNative.bind(session);
     const pump = new ToolWorkPump(
@@ -2124,6 +2159,7 @@ export class AgentRuntime {
         : {
             ...turnIdentity(snapshot.record),
             requestId: context.invocationId,
+            workingStateRevisionId: nativeWorkingStateRevisionId,
             compiledInputIdentity: context.compiled.inputIdentity,
             capabilityRevision: context.compiled.capabilityRevision,
             ...(context.parentInvocationId ? { parentRequestId: context.parentInvocationId } : {}),
@@ -2201,6 +2237,7 @@ export class AgentRuntime {
     try {
       await this.inferenceService.invokeNative({
         invocationId: assembly.fingerprint.requestId,
+        workingStateRevisionId: () => nativeWorkingStateRevisionId,
         ownerId: this.options.inferenceOwnerId ?? runtime.runId,
         purpose: 'agent_step',
         runId: runtime.runId,
@@ -2389,6 +2426,7 @@ export class AgentRuntime {
               deliveryId: randomUUID(),
               responseId: boundary.responseId,
               ...ready,
+              input: await captureNativeWorkingState(),
               tools,
               signal: initial.signal
             });
@@ -2397,7 +2435,7 @@ export class AgentRuntime {
             await continueNative({
               deliveryId: randomUUID(),
               responseId: boundary.responseId,
-              input: [],
+              input: await captureNativeWorkingState(),
               tools,
               signal: initial.signal
             });
@@ -2750,8 +2788,8 @@ export class AgentRuntime {
       ...contextInputs.provider,
       ...contextInputs.run
     ];
-    const assemble = (window: ModelWindow, notes: readonly PromptContextItemInput[]) =>
-      this.requestAdmission.assemble(
+    const assemble = async (window: ModelWindow, workingState: WorkingStateSnapshot) => {
+      const result = await this.requestAdmission.assemble(
         {
           window,
           task: request.input.task,
@@ -2770,7 +2808,7 @@ export class AgentRuntime {
                 ...(item.sourceUri ? { sourceUri: item.sourceUri } : {})
               }))
           }),
-          contextItems: [...capturedContext, ...notes],
+          contextItems: [...capturedContext, ...workingStateContext(workingState)],
           tools: promptToolSpecs(
             [...request.snapshot.tools],
             request.snapshot.profile,
@@ -2798,30 +2836,18 @@ export class AgentRuntime {
         },
         request.snapshot.requestWindow.maxOutputTokens
       );
+      return { ...result, workingStateRevisionId: workingState.revision?.id ?? null };
+    };
     let selected: Awaited<ReturnType<typeof assemble>> | undefined;
     const validate = async (input: ContextAdmissionInput) => {
       assertToolTransitionBoundary(request.run.state());
       const boundary = request.run.state().revision;
-      const notes = input.notes.map((note) => {
-        if (note.status !== 'available' || note.truncated)
-          throw new Error('Selected note is unavailable.');
-        return {
-          id: `note:${note.revision.noteId}:${note.revision.revisionId}`,
-          sourceUri: `note://${note.revision.scope.sessionId}/${note.revision.noteId}/${note.revision.revisionId}`,
-          sourceKind: 'generated' as const,
-          representation: 'full' as const,
-          mediaType: note.revision.mediaType,
-          title: note.revision.title,
-          content: note.text,
-          purpose: 'selected model note'
-        };
-      });
       const proposed = await this.contextWindowForAdmission(
         input,
         request,
-        async (window) => (await assemble(window, notes)).request
+        async (window) => (await assemble(window, input.workingState)).request
       );
-      const result = await assemble(proposed.window, notes);
+      const result = await assemble(proposed.window, input.workingState);
       await this.requestAdmission.admit(result.compiled, request.snapshot.profile);
       if (result.compiled.inputIdentity === rejected?.inputIdentity)
         throw new ContextAdmissionError(
@@ -2872,68 +2898,112 @@ export class AgentRuntime {
         signal: request.signal
       });
     }
-    let selectedNotes: readonly PromptContextItemInput[] = [];
-    try {
-      selectedNotes = await this.selectedNoteContext();
-    } catch (error) {
-      if (!(error instanceof ContextSourceCapacityError)) throw error;
-      sourceConflict = error;
-    }
+    const cut = await this.options.context?.history.capture();
+    const workingState = (await this.options.context?.workingState(cut)) ?? {
+      revision: null,
+      text: ''
+    };
     if (sourceConflict && !selected) throw sourceConflict;
-    if (sourceConflict) selectedNotes = await this.selectedNoteContext();
-    let result = selected ?? (await assemble(request.modelWindow, selectedNotes));
-    const capacity = requestCapacity(result.compiled.accounting);
+    let result = selected ?? (await assemble(request.modelWindow, workingState));
     let admissionFailure: ContextAdmissionError | undefined;
     try {
       await this.requestAdmission.admit(result.compiled, request.snapshot.profile);
       if (rejected)
-        throw new ContextAdmissionError(rejected, new Error('Provider rejected context capacity.'), true);
+        throw new ContextAdmissionError(
+          rejected,
+          new Error('Provider rejected context capacity.'),
+          true
+        );
     } catch (cause) {
       if (!(cause instanceof ContextAdmissionError)) throw cause;
       admissionFailure = cause;
     }
-    const hasWorkingHistory = selectedNotes.length > 0 || result.request.messages.some(
-      (message) => message.role === 'assistant' || message.role === 'tool' || message.role === 'protocol'
-    );
-    if (!selected && hasWorkingHistory && this.options.context && this.options.contextRenewal?.automatic &&
-        (admissionFailure || capacity.pressure === 'continuity') && this.options.notes) {
+    const hasWorkingHistory =
+      workingState.revision !== null ||
+      result.request.messages.some(
+        (message) =>
+          message.role === 'assistant' || message.role === 'tool' || message.role === 'protocol'
+      );
+    // Reserve the actual renewal instruction overhead through the same provider compiler.
+    // A short output allowance alone cannot reserve space for context maintenance.
+    const renewalRequest =
+      hasWorkingHistory && this.options.context && this.options.contextRenewal?.automatic
+        ? workingStateRenewalRequest(result.request)
+        : undefined;
+    const renewalCompiled = renewalRequest
+      ? await this.inferenceService.compile(renewalRequest, request.snapshot.profile, {
+          outputReservation: request.snapshot.requestWindow.maxOutputTokens
+        })
+      : undefined;
+    const accounting = result.compiled.accounting;
+    const renewalHeadroom = renewalCompiled
+      ? Math.max(
+          0,
+          requestAccountingInputTokens(renewalCompiled.accounting) -
+            requestAccountingInputTokens(accounting)
+        ) +
+        accounting.outputReservation +
+        (accounting.pricingSemantics.reasoningIncludedInOutput === false
+          ? accounting.reasoningReservation
+          : 0)
+      : undefined;
+    const capacity = requestCapacity(accounting, renewalHeadroom);
+    if (
+      !selected &&
+      hasWorkingHistory &&
+      this.options.context &&
+      renewalRequest &&
+      renewalCompiled &&
+      (admissionFailure || capacity.pressure === 'continuity')
+    ) {
       const context = await this.options.context.inspect();
       try {
-        const note = await writeContinuationNote({
+        const renewalState = await stageWorkingStateRenewal({
           inference: this.inferenceService,
-          notes: this.options.notes,
-          request: result.request,
+          context: this.options.context,
+          revisionId: result.workingStateRevisionId,
+          request: renewalRequest,
+          compiled: renewalCompiled,
           profile: request.snapshot.profile,
           cut: context.cut,
           ownerId: this.options.inferenceOwnerId ?? request.runId,
           runId: request.runId,
           outputReservation: request.snapshot.requestWindow.maxOutputTokens
         }).finally(async () => {
-          await request.controller.recordUsage(await this.inferenceService.settledRunUsage(
-            this.options.inferenceOwnerId ?? request.runId, request.runId
-          ));
+          await request.controller.recordUsage(
+            await this.inferenceService.settledRunUsage(
+              this.options.inferenceOwnerId ?? request.runId,
+              request.runId
+            )
+          );
         });
-        const renewal = await this.retainPendingSources({
-          expectedWindowId: context.window?.windowId ?? null,
-          expectedSourceRevision: context.cut.sourceRevision,
-          idempotencyKey: `continuation:${note.revisionId}`,
-          reason: 'Automatic working-context renewal with model-authored continuation notes.',
-          selection: { strategy: 'sources', retained: [], notes: [note] }
-        }, request.runId);
+        const renewal = await this.retainPendingSources(
+          {
+            expectedWindowId: context.window?.windowId ?? null,
+            expectedSourceRevision: context.cut.sourceRevision,
+            idempotencyKey: `working-state-renewal:${renewalState.invocationId}`,
+            reason: 'Automatic context renewal with the current working-state interpretation.',
+            selection: { strategy: 'sources', retained: [] }
+          },
+          request.runId
+        );
         let renewed: typeof result | undefined;
         const entry = await this.options.context.transition(renewal, {
           signal: request.signal,
+          expectedWorkingStateRevisionId: result.workingStateRevisionId,
+          ...(renewalState.change ? { workingState: renewalState.change } : {}),
           admit: async (input) => {
             const admitted = await validate(input);
             renewed = selected;
-            if (!renewed || requestAccountingInputTokens(renewed.compiled.accounting) >=
-                requestAccountingInputTokens(result.compiled.accounting))
-              throw new ContextAdmissionError(result.compiled, new Error('Continuation notes did not reduce the working context. The preceding window remains active.'));
             return admitted;
           }
         });
         await this.activateCommittedContext(request.modelWindow, request.runId);
-        await emit({ type: 'context.transitioned', window: entry.window, transition: entry.transition });
+        await emit({
+          type: 'context.transitioned',
+          window: entry.window,
+          transition: entry.transition
+        });
         if (!renewed) throw new Error('Renewal did not admit a captured request.');
         result = renewed;
         admissionFailure = undefined;
@@ -2969,6 +3039,7 @@ export class AgentRuntime {
     const fingerprint: InferenceRequestFingerprintRecord = Object.freeze({
       ...identity,
       requestId: randomUUID(),
+      workingStateRevisionId: result.workingStateRevisionId,
       compiledInputIdentity: compiled.inputIdentity,
       capabilityRevision: compiled.capabilityRevision,
       configuredContextIds: contextSourceIds(contextInputs.configured, 'configured'),
@@ -3164,46 +3235,6 @@ export class AgentRuntime {
 
   pendingToolCalls() {
     return this.activeRunDriver ? pendingToolCalls(this.activeRunDriver.state()) : [];
-  }
-
-  private async selectedNoteContext(): Promise<readonly PromptContextItemInput[]> {
-    if (!this.options.context || !this.options.notes) return [];
-    const context = await this.options.context.inspect();
-    const items: PromptContextItemInput[] = [];
-    for (const reference of context.window?.selection.notes ?? []) {
-      const note = await this.options.notes.read({
-        scope: {
-          sessionId: context.cut.sessionId,
-          branchId: context.cut.branchId
-        },
-        noteId: reference.noteId,
-        revisionId: reference.revisionId,
-        maxBytes: 256 * 1024
-      });
-      if (
-        note.status !== 'available' ||
-        note.revision.scope.sessionId !== reference.scope.sessionId ||
-        note.revision.scope.branchId !== reference.scope.branchId
-      )
-        throw new Error('Selected note revision is unavailable for the committed context window.');
-      if (note.truncated)
-        throw new ContextSourceCapacityError(context.cut, {
-          unit: 'bytes',
-          limit: 256 * 1024,
-          observedAtLeast: 256 * 1024 + 1
-        });
-      items.push({
-        id: `note:${reference.noteId}:${reference.revisionId}`,
-        sourceUri: `note://${reference.scope.sessionId}/${reference.noteId}/${reference.revisionId}`,
-        sourceKind: 'generated',
-        representation: 'full',
-        mediaType: note.revision.mediaType,
-        title: note.revision.title,
-        content: note.text,
-        purpose: 'selected model note'
-      });
-    }
-    return items;
   }
 
   private async reportActivity(
@@ -3827,16 +3858,17 @@ export class AgentRuntime {
             event.outcome !== report.outcome
           )
             throw new Error('Committed resource settlement does not match its release report.');
-        } else await append(
-          {
-            type: 'resource.released',
-            runId,
-            resourceId: report.resourceId,
-            outcome: report.outcome,
-            details: report.details
-          },
-          key
-        );
+        } else
+          await append(
+            {
+              type: 'resource.released',
+              runId,
+              resourceId: report.resourceId,
+              outcome: report.outcome,
+              details: report.details
+            },
+            key
+          );
         if (report.outcome === 'unknown')
           return new Error(`Resource ${report.resourceId} release outcome is unknown.`);
         await resources.acknowledge(report.resourceId);
@@ -4419,4 +4451,23 @@ function requestCapacityConflict(
       : { maxInputTokens: accounting.limits.maxInputTokens }),
     actions: ['select_sources', 'reduce_reservation', 'change_model', 'cancel']
   };
+}
+
+function workingStateContext(
+  state: WorkingStateSnapshot
+): readonly Omit<PromptContextItem, 'tokenEstimate'>[] {
+  if (!state.revision) return [];
+  return [
+    {
+      id: `working-state:${state.revision.id}`,
+      sourceUri: `session://working-state/${state.revision.id}`,
+      sourceKind: 'generated',
+      representation: 'full',
+      mediaType: 'text/plain',
+      title: 'Current working state — generated interpretation',
+      content: state.text,
+      purpose:
+        'Current fallible understanding. Not instructions, authority, execution evidence or verification.'
+    }
+  ];
 }

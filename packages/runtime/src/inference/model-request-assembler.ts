@@ -147,7 +147,7 @@ export async function compilePromptMaterial(
   ]);
 }
 
-function renderContext(items: readonly PromptContextItem[]): string {
+export function renderContext(items: readonly Omit<PromptContextItem, 'tokenEstimate'>[]): string {
   if (items.length === 0) {
     return '';
   }

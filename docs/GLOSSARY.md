@@ -10,13 +10,13 @@ events, state fields, and documentation use them consistently.
 | **context window** | A committed selection of session history and derived artifacts. It can span many completed runs; run completion does not evict history. |
 | **history position** | A branch boundary and the exact committed source records visible at that boundary. Independent run ledgers do not share a fabricated global sequence. |
 | **history selection** | Explicit original-source and derived-artifact references retained for inference, with bounded retrieval of omitted material. |
-| **model note** | Attributed, revisioned model-authored text or structured data. A note is neither user authority nor a verification result. |
-| **context transition** | A conditional change to selected original sources and note revisions. Idle changes record selection intent; actual inference admission checks the captured request's fit and protocol obligations. |
+| **working state** | One current session-owned revision of the model’s fallible understanding per branch. Generated text is neither user authority nor a verification result. |
+| **context transition** | A conditional change to selected original sources, optionally published atomically with a working-state revision. Idle changes record selection intent; actual inference admission checks the captured request's fit and protocol obligations. |
 | **prompt material** | Typed application or runtime material available to the request assembler. |
 | **logical model request** | Provider-neutral request assembled by Core before wire serialization. |
 | **compiled model request** | The immutable provider input admitted for invocation, with its capability revision and accounting. Credentials are transport configuration, not persisted input. |
 | **request accounting** | Complete component accounting for a compiled input, identifying estimates and unknown costs separately from exact counts. |
-| **provider context state** | Versioned, provider-bound continuation or reasoning material with explicit compatibility and replay rules. It is separate from public history and notes. |
+| **provider context state** | Versioned, provider-bound continuation or reasoning material with explicit compatibility and replay rules. It is separate from public history and working state. |
 | **inference invocation** | One governed model operation with captured input, budget, cancellation, and durable settlement or explicit uncertainty. It need not be an interactive agent run. |
 | **request fingerprint** | Stable identity of the logical request and the inputs that produced it. It is not proof of provider-visible bytes. |
 | **observation** | Recorded tool or effect facts. Invocation disposition, execution state, domain outcome, and output completeness remain distinct; a returned result does not certify task success. |

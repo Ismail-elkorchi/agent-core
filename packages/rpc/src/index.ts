@@ -32,7 +32,6 @@ export function rpcMethod<Schema extends z.ZodType, Result>(
 }
 export type RpcParameters<Method extends RpcMethod> = z.input<Method['params']>;
 
-export * from './note-parameters.js';
 export * from './session-methods.js';
 export * from './session-parameters.js';
 

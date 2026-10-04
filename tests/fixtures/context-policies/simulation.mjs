@@ -133,7 +133,7 @@ export class MemorySimulationProvider {
         }
       ];
       content = '';
-    } else if (lastUser.includes('REPORT:') || lastUser.includes('WRITE_SESSION_NOTE:')) {
+    } else if (lastUser.includes('REPORT:')) {
       const facts = texts
         .flatMap((value) => [...value.matchAll(/STATE\[(\d+)\]\s*(\{[^\n]*?\})/gu)])
         .sort((a, b) => Number(a[1]) - Number(b[1]));
@@ -145,9 +145,7 @@ export class MemorySimulationProvider {
           /* Bounded excerpts can end mid-record. */
         }
       }
-      content = lastUser.includes('WRITE_SESSION_NOTE:')
-        ? `Derived memory; consult original history for authority.\nSTATE[${facts.at(-1)?.[1] ?? '000'}] ${JSON.stringify(state)}`
-        : JSON.stringify(state);
+      content = JSON.stringify(state);
     }
     return {
       provider: this.id,

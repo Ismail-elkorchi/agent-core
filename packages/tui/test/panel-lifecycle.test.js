@@ -32,8 +32,8 @@ test('panel mounting and result grafting retain parent state and opaque child wo
     update: () => ({ state: 1, outputs: ['saved'], cancel: [{ kind: 'effect', id: 'load' }] }),
     view: () => button({ id: 'value', label: 'value', onPress: () => ({ type: 'save' }) })
   }, (child) => ({ type: 'child', child }));
-  const left = mountPanel(initial(), 'notes', child, context);
-  const right = mountPanel(initial(), 'notes', child, context);
+  const left = mountPanel(initial(), 'example', child, context);
+  const right = mountPanel(initial(), 'example', child, context);
   assert.equal(left.state.panelGeneration, 1);
   assert.equal(right.state.panelGeneration, 1, 'independent parents do not share a generation counter');
   assert.equal(left.state.value, 'parent');
@@ -42,17 +42,17 @@ test('panel mounting and result grafting retain parent state and opaque child wo
   assert.equal('focus' in left, false);
   assert.equal('effectIds' in left.state.overlay.state, false);
   const result = child.update(left.state.overlay.state, {
-    id: 'notes', generation: 1, message: 'save'
+    id: 'example', generation: 1, message: 'save'
   }, context);
-  const applied = applyPanelResult(left.state, 'notes', result);
+  const applied = applyPanelResult(left.state, 'example', result);
   assert.deepEqual(applied.outputs, ['saved'], 'the parent decides how to consume outputs');
   assert.equal(applied.state.overlay.state.state, 1);
   assert.equal(right.state.overlay.state.state, 0);
   assert.ok(applied.contribution);
   assert.equal('cancel' in applied, false);
-  const closed = applyPanelResult(applied.state, 'notes', result, true);
+  const closed = applyPanelResult(applied.state, 'example', result, true);
   assert.equal(closed.state.overlay.kind, 'none');
-  const reopened = mountPanel(closed.state, 'notes', child, context);
+  const reopened = mountPanel(closed.state, 'example', child, context);
   assert.equal(reopened.state.panelGeneration, 2);
   assert.equal(reopened.state.overlay.state.generation, 2);
   const runtime = createTuiRuntime({
@@ -60,7 +60,7 @@ test('panel mounting and result grafting retain parent state and opaque child wo
     app: defineTui({
       init: () => left,
       update: (state, message, context) => applyPanelResult(
-        state, 'notes', child.update(state.overlay.state, message.child, context)
+        state, 'example', child.update(state.overlay.state, message.child, context)
       ),
       view: (state, context) => child.view(state.overlay.state, context)
     })
@@ -72,7 +72,7 @@ test('panel mounting and result grafting retain parent state and opaque child wo
   await runtime.start();
   await waitFor(() => started.length === 1);
   assert.ok(runtime.frame().focusPath.includes(child.elementId(left.state.overlay.state, 'value')));
-  await runtime.dispatch({ type: 'child', child: { id: 'notes', generation: 1, message: 'save' } });
+  await runtime.dispatch({ type: 'child', child: { id: 'example', generation: 1, message: 'save' } });
   assert.equal(started[0].aborted, true, 'grafted cancellation reaches the owned child effect');
   assert.equal(runtime.state().overlay.state.state, 1);
 });
@@ -103,14 +103,14 @@ test('mounted panel hide, removal and replacement preserve subscription ownershi
   const runtime = createTuiRuntime({
     host: createMemoryTerminalHost(),
     app: defineTui({
-      init: (context) => mountPanel({ ...initial(), hidden: false }, 'notes', child, context),
+      init: (context) => mountPanel({ ...initial(), hidden: false }, 'example', child, context),
       update(state, message, context) {
         let result;
         if (message.type === 'hide') result = { state: { ...state, hidden: true } };
         else if (message.type === 'remove') result = { state: { ...state, overlay: { kind: 'none' } } };
-        else if (message.type === 'open') result = mountPanel({ ...state, hidden: false }, 'notes', child, context);
+        else if (message.type === 'open') result = mountPanel({ ...state, hidden: false }, 'example', child, context);
         else result = state.overlay.kind === 'none' ? { state } : applyPanelResult(
-          state, 'notes', child.update(state.overlay.state, message.child, context)
+          state, 'example', child.update(state.overlay.state, message.child, context)
         );
         return combineTuiResults(result.state, result, reconcileTuiChildren(mounted(state), mounted(result.state), (child) => child));
       },
@@ -139,7 +139,7 @@ test('mounted panel hide, removal and replacement preserve subscription ownershi
   await waitFor(() => reads.length === 2 && sources.length === 2);
   reads[0].resolve({ kind: 'message', message: 100 });
   await sources[0].sink.emit({ kind: 'reliable', message: 100 });
-  await runtime.dispatch({ type: 'child', child: { id: 'notes', generation: 1, message: 100 } });
+  await runtime.dispatch({ type: 'child', child: { id: 'example', generation: 1, message: 100 } });
   assert.equal(runtime.state().overlay.state.state, 0);
   await sources[1].sink.emit({ kind: 'reliable', message: 2 });
   await waitFor(() => runtime.state().overlay.state.state === 2);

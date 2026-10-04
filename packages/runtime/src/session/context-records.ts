@@ -1,8 +1,7 @@
-import { parseJsonObject } from '@agent-core/json';
+import { latestWorkingState, assertWorkingStateRevision } from './working-state.js';
 import { hashJson, PersistenceConflictError } from '@agent-core/persistence';
 import type { ContextTransitionCommit, ContextWindowRecord } from '../context/contracts.js';
 import { contextEntrySchema } from '../context/schema.js';
-import { scopeSchema } from '../history/schema.js';
 import type {
   SessionBranchEntry,
   SessionContextTransitionEntry,
@@ -32,6 +31,7 @@ export function sessionReplayState(
     branch: Object.freeze([...branch]),
     runFinalizations,
     sourceRevision,
+    workingState: latestWorkingState(branch),
     ledgerRunIds: Object.freeze([...new Set([...unfinished, ...(latest ? [latest] : [])])]),
     ...(contextWindow ? { contextWindow } : {})
   });
@@ -52,6 +52,9 @@ export function validateContextCommit(
   input: ContextTransitionCommit,
   finalizations: readonly SessionRunFinalization[] = []
 ): void {
+  assertWorkingStateRevision(latestWorkingState(branch), input.expectedWorkingStateRevisionId);
+  if (input.workingState)
+    assertWorkingStateRevision(latestWorkingState(branch), input.workingState.previousRevisionId);
   const leaf = branch.at(-1)?.id ?? null;
   const currentWindowId = latestContextWindow(branch)?.windowId ?? null;
   if (
@@ -105,7 +108,9 @@ export function contextCommitRetry(
     existing &&
     (existing.transition.requestFingerprint !== input.transition.requestFingerprint ||
       hashJson(existing.window.selection) !== hashJson(input.window.selection) ||
-      existing.window.reason !== input.window.reason)
+      existing.window.reason !== input.window.reason ||
+      hashJson(existing.workingState ? { ...existing.workingState, id: existing.id } : null) !==
+        hashJson(input.workingState ?? null))
   )
     throw new PersistenceConflictError(
       'Context transition idempotency key has conflicting content.'
@@ -127,7 +132,6 @@ export function decodeContextTransitionEntry(value: unknown): SessionContextTran
     idempotencyKey: entry.transition.idempotencyKey,
     selection: {
       retained: entry.window.selection.retained,
-      notes: entry.window.selection.notes,
       strategy: entry.window.selection.strategy,
       ...(entry.window.selection.protected ? { protected: entry.window.selection.protected } : {}),
       ...(entry.window.selection.continuity
@@ -148,18 +152,4 @@ export function decodeContextTransitionEntry(value: unknown): SessionContextTran
       'Context transition request fingerprint does not match its committed selection.'
     );
   return entry;
-}
-
-export function ownBranchNoteSource(
-  value: unknown
-): NonNullable<import('./contracts.js').SessionBranchMarkerEntry['noteSource']> {
-  const source = parseJsonObject(value);
-  const scope = scopeSchema.parse(source.scope);
-  if (
-    typeof source.watermark !== 'number' ||
-    !Number.isSafeInteger(source.watermark) ||
-    source.watermark < -1
-  )
-    throw new Error('Invalid branch note source revision.');
-  return Object.freeze({ scope, watermark: source.watermark });
 }

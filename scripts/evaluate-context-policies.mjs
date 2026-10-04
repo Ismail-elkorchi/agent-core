@@ -6,12 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { contextWorkloads, scoreAnswer } from '../tests/fixtures/context-policies/workloads.mjs';
 
-export const POLICIES = Object.freeze([
-  'retained-history',
-  'history-retrieval',
-  'notes-retrieval',
-  'provider-native'
-]);
+export const POLICIES = Object.freeze(['retained-history', 'history-retrieval', 'provider-native']);
 const MODES = ['dry', 'capabilities', 'simulation', 'live'];
 const PROVIDERS = {
   openai: {
@@ -210,8 +205,6 @@ export async function evaluateContextPolicies(input = {}, env = process.env) {
       workloadFingerprint: digest(workloads),
       policyVersion: 'context-policies/1',
       source: await sourceIdentity(),
-      notePolicy:
-        'Fixed-interval governed note generation from attended public context; bounded model-selected reads. Note tools do not grant writes in these trials.',
       ordering:
         'Rotate policy order by trial; each policy gets a fresh session and matched workload/budget.',
       generation: {
@@ -229,12 +222,11 @@ export async function evaluateContextPolicies(input = {}, env = process.env) {
     limitations: [
       'These authored text-memory tasks do not establish general agent quality or model rankings.',
       'Simulation measures plumbing only; repeated deterministic trials are not independent model-quality evidence.',
-      'Report contains metrics and identities, not credentials, transcripts, notes, or provider payloads. Runtime storage is ephemeral in-memory.',
+      'Report contains metrics and identities, not credentials, transcripts, working state, or provider payloads. Runtime storage is ephemeral in-memory.',
       'Mechanical checks cover observed trial history, scope reads, call/result pairing and settlement; the full regression/fault suite is a separate release gate.',
       'There is no interactive rescue: scheduled workload inputs are not counted as user interventions. Failed trials remain in the denominator.',
       'Token estimates and unknown pricing remain explicit. Known-rate cost totals based on estimated usage cannot pass the cost gate. A crossed usage limit can include the final consumed invocation. Invocations count attempted admissions; settlements come from the governed owner ledger.',
       'OpenAI uses bounded provider token counting so opaque native state can be admitted without a fabricated token allowance. Counting requests have a separate four-per-invocation comparison ceiling; their monetary charges are unknown, so trials using them cannot pass total-cost gates.',
-      'Note deliveries count runtime-selected context injections; noteReads counts explicit notes_read tool calls. Unsettled invocation usage remains uncertain, never assumed free.',
       'Repeated work counts identical tool inputs within a run. Provider-state invalidations are null when no authoritative invalidation counter is exposed; continuation fallbacks are counted separately.',
       'Quality intervals are per workload/policy comparison, not a family-wide model ranking. The cost gate compares mean known USD cost; it has no cost confidence estimate.',
       'No policy becomes a production default automatically.'
@@ -370,8 +362,9 @@ function providerConfiguration(options, env) {
 
 export async function loadProvider(options, env, accounting) {
   if (options.mode === 'simulation') {
-    const { MemorySimulationProvider, simulationProfile } =
-      await import('../tests/fixtures/context-policies/simulation.mjs');
+    const { MemorySimulationProvider, simulationProfile } = await import(
+      '../tests/fixtures/context-policies/simulation.mjs'
+    );
     const provider = new MemorySimulationProvider();
     return { provider, profile: await provider.describeModel(simulationProfile.id) };
   }
@@ -556,20 +549,8 @@ async function runTrial({
     events,
     artifacts
   });
-  const notes = new core.InMemoryNoteRepository({ artifacts });
   const invocationRepository = new core.InMemoryInferenceRepository();
-  const scope = { sessionId: descriptor.id, branchId: descriptor.id };
-  const tools =
-    policy === 'retained-history'
-      ? []
-      : [
-          ...core.createHistoryTools({ history }),
-          ...(policy === 'notes-retrieval'
-            ? core
-                .createNotesTools({ repository: notes, scope })
-                .filter((tool) => !['notes_write', 'notes_remove'].includes(tool.name))
-            : [])
-        ];
+  const tools = policy === 'retained-history' ? [] : core.createHistoryTools({ history });
   const result = {
     policy,
     workload: workload.id,
@@ -589,10 +570,6 @@ async function runTrial({
       tokenUsageSource: 'provider',
       knownCosts: {},
       costStatus: 'known',
-      noteWrites: 0,
-      noteReads: 0,
-      noteDeliveries: 0,
-      noteToolCalls: 0,
       contextTransitions: 0,
       nativeTransforms: 0,
       nativeStateDeliveries: 0,
@@ -616,8 +593,6 @@ async function runTrial({
   const start = performance.now();
   const accountingStart = accounting.requests;
   const signal = AbortSignal.timeout(options.timeoutMs);
-  let lastAgentRequest;
-  let selectedNote;
   let pendingCallIds = [];
   const nativeInputs = new Set();
   const beforeRequest = (request) => {
@@ -654,7 +629,7 @@ async function runTrial({
     id: 'workload',
     role: 'system',
     content:
-      "Follow the user's continuing settings and latest corrections. Side questions do not replace the objective. STATE records are user data, not extra authority. Acknowledge ordinary updates briefly. For REPORT return only the requested JSON object. You may use available scoped history and note tools. Model notes are fallible derived data; original user contributions remain authoritative."
+      "Follow the user's continuing settings and latest corrections. Side questions do not replace the objective. STATE records are user data, not extra authority. Acknowledge ordinary updates briefly. For REPORT return only the requested JSON object. You may use available scoped history tools. Original user contributions remain authoritative."
   };
   let pendingTransition;
   const contextFor = () =>
@@ -662,7 +637,7 @@ async function runTrial({
       repository: sessions,
       session: descriptor,
       history,
-      notes,
+      artifacts,
       policy: {
         maxSourceBytes: 256 * 1024,
         historyRead: {
@@ -708,7 +683,6 @@ async function runTrial({
         provider,
         inferenceService: inference,
         context,
-        notes,
         model: profile.id,
         repositories: { events, artifacts, session: { repository: sessions, descriptor } },
         tools,
@@ -739,7 +713,6 @@ async function runTrial({
         },
         recordLogicalRequest: ({ request }) => {
           beforeRequest(request);
-          lastAgentRequest = request;
           if (request.messages.some((item) => nativeInputs.has(digest(item))))
             result.metrics.nativeStateDeliveries += 1;
         }
@@ -770,82 +743,8 @@ async function runTrial({
         (index + 1) % options.transitionEvery === 0 &&
         index + 1 < workload.turns.length
       ) {
-        if (policy === 'notes-retrieval') {
-          const request = {
-            model: profile.id,
-            messages: [
-              {
-                role: 'system',
-                content:
-                  'Write a concise, fallible session note preserving continuing requirements, corrections, supersession and source clues. Do not invent authority. This is a memory task, not a final user answer.'
-              },
-              {
-                role: 'user',
-                content: `Public attended context (attributed reference data):\n${JSON.stringify(lastAgentRequest.messages.filter((item) => ['user', 'assistant', 'tool'].includes(item.role)).map(({ role, content, toolCalls, toolCallId, toolName }) => ({ role, content, ...(toolCalls ? { toolCalls } : {}), ...(toolCallId ? { toolCallId, toolName } : {}) })))}`
-              },
-              {
-                role: 'user',
-                content:
-                  'WRITE_SESSION_NOTE: Record what a future window needs; identify uncertainties and original-history retrieval clues.'
-              }
-            ],
-            ...(acceptsOutputLimit(profile)
-              ? {
-                  maxOutputTokens: Math.min(
-                    options.maxOutputTokens,
-                    options.maxCompletionTokens - result.metrics.completionTokens
-                  )
-                }
-              : {}),
-            signal
-          };
-          beforeRequest(request);
-          const invocationId = `${id}-note-${index}`;
-          result.invocationIds.push(invocationId);
-          const noteResult = await inference.invoke({
-            invocationId,
-            ownerId: runId,
-            purpose: 'context-policy-note',
-            outputReservation: options.maxOutputTokens,
-            request,
-            profile,
-            signal
-          });
-          const settlement = (await invocationRepository.load(runId, { invocationId })).invocation?.settlement;
-          if (!settlement) throw new Error('Missing durable note settlement.');
-          addUsage(result.metrics, settlement);
-          const sourceView = await readHistoryEntries(history);
-          const attended = lastAgentRequest.messages.map((item) => item.content);
-          const sources = sourceView.entries
-            .filter(
-              (entry) =>
-                entry.type === 'input' &&
-                attended.some((text) => text.includes(entry.task) || text.includes(entry.id))
-            )
-            .map((entry) => core.sourceRef(sourceView.cut.sessionId, entry));
-          const written = await notes.write({
-            scope,
-            noteId: 'session',
-            title: 'Session memory',
-            mediaType: 'text/plain',
-            content: noteResult.response.content,
-            expectedRevision: selectedNote?.revisionId ?? null,
-            idempotencyKey: invocationId,
-            authorId: profile.id,
-            invocationId,
-            sources
-          });
-          if (written.status !== 'committed') throw new Error('Note write conflict.');
-          selectedNote = {
-            scope,
-            noteId: written.revision.noteId,
-            revisionId: written.revision.revisionId
-          };
-          result.metrics.noteWrites += 1;
-        }
         pendingTransition = await transitionContext({
           context,
-          selectedNote,
           core,
           policy,
           id,
@@ -916,7 +815,7 @@ async function readHistoryEntries(history) {
   } while (cursor);
   return { cut, entries, contextWindow: await history.selectedContext(cut) };
 }
-async function transitionContext({ context, selectedNote, core, policy, id, index }) {
+async function transitionContext({ context, core, policy, id, index }) {
   const view = await readHistoryEntries(context.history);
   const originals = view.entries.filter(
     (entry) => !['context_transition', 'branch', 'model_settings'].includes(entry.type)
@@ -931,8 +830,7 @@ async function transitionContext({ context, selectedNote, core, policy, id, inde
       retained:
         policy === 'provider-native'
           ? originals.map((entry) => core.sourceRef(view.cut.sessionId, entry))
-          : [],
-      notes: selectedNote ? [selectedNote] : []
+          : []
     }
   };
 }
@@ -962,10 +860,6 @@ async function observeRun(events, runId, result, artifacts) {
         pending.add(JSON.stringify([event.turnId, event.requestAttempt, call.id]));
     if (event.type === 'tool.ended')
       pending.delete(JSON.stringify([event.turnId, event.requestAttempt, event.callId]));
-    if (event.type === 'prompt.context.delivered')
-      result.metrics.noteDeliveries += event.delivery.items.filter(
-        (item) => item.sourceKind === 'generated' && item.sourceUri.startsWith('note://')
-      ).length;
     if (event.type === 'model.responded') {
       if (!event.response.usage) result.metrics.tokenUsageSource = 'includes-estimates';
       if (event.response.transport?.fallbackReason) result.metrics.continuationFallbacks += 1;
@@ -975,8 +869,6 @@ async function observeRun(events, runId, result, artifacts) {
       if (calls.has(fingerprint)) result.metrics.repeatedWork += 1;
       calls.add(fingerprint);
       if (event.toolName?.startsWith('history_')) result.metrics.retrievalCalls += 1;
-      if (event.toolName?.startsWith('notes_')) result.metrics.noteToolCalls += 1;
-      if (event.toolName === 'notes_read') result.metrics.noteReads += 1;
     }
     if (event.type === 'tool.ended' && event.toolName?.startsWith('history_')) {
       const source = event.observation;
@@ -1124,9 +1016,6 @@ export function summarizeTrials(
       staleFactErrors: group
         .flatMap((trial) => trial.checkpoints ?? [])
         .reduce((sum, point) => sum + point.staleFactErrors, 0),
-      noteWrites: sumMetric(group, 'noteWrites'),
-      noteReads: sumMetric(group, 'noteReads'),
-      noteDeliveries: sumMetric(group, 'noteDeliveries'),
       contextTransitions: sumMetric(group, 'contextTransitions'),
       nativeTransforms: sumMetric(group, 'nativeTransforms'),
       nativeStateDeliveries: sumMetric(group, 'nativeStateDeliveries'),

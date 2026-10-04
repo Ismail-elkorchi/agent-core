@@ -1,3 +1,12 @@
+import {
+  workingStateEntrySchema,
+  workingStateRetry,
+  assertWorkingStateRevision,
+  assertWorkingStateBranch,
+  latestWorkingState,
+  type WorkingStateChange,
+  type SessionWorkingStateEntry
+} from './working-state.js';
 import { parseJsonValue } from '@agent-core/json';
 import { parseModelSelection, type ModelOutputItem, type ModelSelection } from '@agent-core/model';
 import { hashJson, PersistenceConflictError } from '@agent-core/persistence';
@@ -23,13 +32,13 @@ import {
   sourceSnapshot,
   assertBranchEntry,
   memoryBranchSource,
+  currentWorkingState,
   readBranchPage,
   searchBranch
 } from './branch-page.js';
 import {
   contextCommitRetry,
   decodeContextTransitionEntry,
-  ownBranchNoteSource,
   sessionReplayState,
   validateContextCommit
 } from './context-records.js';
@@ -89,6 +98,7 @@ export class InMemorySessionRepository implements SessionRepository {
         type: 'session',
         version: 1,
         format: 'agent-core.session/2',
+        workingStateStorage: 'session',
         id,
         timestamp: new Date().toISOString(),
         binding,
@@ -151,6 +161,39 @@ export class InMemorySessionRepository implements SessionRepository {
     });
   }
 
+  currentWorkingState(
+    session: SessionDescriptor,
+    leafId?: string | null
+  ): Promise<SessionWorkingStateEntry | null> {
+    return this.serial(() =>
+      currentWorkingState(
+        memoryBranchSource(session.id, this.requireDescriptor(session).branchEntries),
+        leafId
+      )
+    );
+  }
+  commitWorkingState(
+    session: SessionDescriptor,
+    change: WorkingStateChange,
+    expectedBranchId: string
+  ): Promise<SessionWorkingStateEntry> {
+    return this.serial(() => {
+      const state = this.requireDescriptor(session);
+      const branch = activeBranch(state.branchEntries, branchLeaf(state.branchEntries));
+      assertWorkingStateBranch(branch, session.id, expectedBranchId);
+      const existing = workingStateRetry(branch, change);
+      if (existing) return existing;
+      assertWorkingStateRevision(latestWorkingState(branch), change.previousRevisionId);
+      const entry = workingStateEntrySchema.parse({
+        ...baseEntry(branchLeaf(state.branchEntries)),
+        type: 'working_state',
+        ...change
+      });
+      state.branchEntries.push(entry);
+      return entry;
+    });
+  }
+
   sourceSnapshot(session: SessionDescriptor, leafId?: string | null) {
     return this.serial(() => {
       const state = this.requireDescriptor(session);
@@ -174,7 +217,8 @@ export class InMemorySessionRepository implements SessionRepository {
         (entry): entry is SessionConversationItem =>
           entry.type !== 'branch' &&
           entry.type !== 'model_settings' &&
-          entry.type !== 'context_transition'
+          entry.type !== 'context_transition' &&
+          entry.type !== 'working_state'
       )
     );
   }
@@ -465,9 +509,11 @@ export class InMemorySessionRepository implements SessionRepository {
         input,
         state.finalizations
       );
+      const { id: revisionId, ...workingState } = input.workingState ?? {};
       const entry = decodeContextTransitionEntry({
         ...baseEntry(branchLeaf(state.branchEntries)),
         type: 'context_transition',
+        ...(revisionId ? { id: revisionId, workingState } : {}),
         window: input.window,
         transition: input.transition
       });
@@ -478,8 +524,7 @@ export class InMemorySessionRepository implements SessionRepository {
   branchFrom(
     session: SessionDescriptor,
     entryId: string,
-    label?: string,
-    noteSource?: SessionBranchMarkerEntry['noteSource']
+    label?: string
   ): Promise<SessionBranchMarkerEntry> {
     return this.serial(() => {
       const state = this.requireDescriptor(session);
@@ -497,8 +542,7 @@ export class InMemorySessionRepository implements SessionRepository {
         ...baseEntry(entryId),
         type: 'branch',
         fromEntryId: entryId,
-        ...(label ? { label } : {}),
-        ...(noteSource ? { noteSource: ownBranchNoteSource(noteSource) } : {})
+        ...(label ? { label } : {})
       });
       state.branchEntries.push(entry);
       return entry;

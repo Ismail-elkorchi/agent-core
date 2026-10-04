@@ -73,7 +73,9 @@ test('Codex flags are explicit, dry mode does not read auth, and subscription en
     assert.equal(new URL(url).pathname.endsWith('/models'), true);
     assert.equal(init?.method ?? 'GET', 'GET');
     return Promise.resolve(
-      new Response(JSON.stringify({ models: [] }), { headers: { 'content-type': 'application/json' } })
+      new Response(JSON.stringify({ models: [] }), {
+        headers: { 'content-type': 'application/json' }
+      })
     );
   });
   const argv = [
@@ -107,7 +109,10 @@ test('Codex flags are explicit, dry mode does not read auth, and subscription en
   assert.equal(report.provider.credentialsPresent, true);
   assert.equal(report.provider.endpoint, `${codexEndpoint}/responses`);
   assert.equal(report.configuration.generation.outputLimit, 'admission-reservation-only');
-  assert.equal(report.availability.find((item) => item.policy === 'provider-native').status, 'unavailable');
+  assert.equal(
+    report.availability.find((item) => item.policy === 'provider-native').status,
+    'unavailable'
+  );
   fixture.assertPrivate(JSON.stringify(report));
   await fixture.assertUnchanged();
   for (const endpoint of [
@@ -149,7 +154,9 @@ test(
       const response = {
         id: `fixture-response-${requests.length}`,
         status: 'completed',
-        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ACK' }] }],
+        output: [
+          { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ACK' }] }
+        ],
         usage: { input_tokens: 20, output_tokens: 4, total_tokens: 24 }
       };
       return Promise.resolve(
@@ -177,27 +184,7 @@ test(
     assert.equal(report.trials[0].metrics.costStatus, 'unknown-or-partial');
     assert.equal(requests[0].body.max_output_tokens, undefined);
     fixture.assertPrivate(JSON.stringify(report));
-    const notes = await evaluateContextPolicies(
-      {
-        ...fixture.options,
-        mode: 'live',
-        trials: 1,
-        delay: 1,
-        transitionEvery: 2,
-        policies: ['notes-retrieval'],
-        maxTotalInvocations: 4
-      },
-      {}
-    );
-    assert.equal(notes.totalInvocations, 4);
-    assert.equal(notes.trials[0].metrics.noteWrites, 1, JSON.stringify(notes.trials[0]));
-    assert.equal(notes.trials[0].metrics.contextTransitions, 1);
-    assert.equal(notes.trials[0].metrics.settledInvocations, 4);
-    assert.equal(notes.trials[0].metrics.promptTokens, 80);
-    assert.equal(notes.trials[0].metrics.completionTokens, 16);
-    assert.equal(notes.trials[0].metrics.costStatus, 'unknown-or-partial');
-    fixture.assertPrivate(JSON.stringify(notes));
-    assert.equal(requests.length, 5);
+    assert.equal(requests.length, 1);
     assert.ok(requests.every(({ body }) => body.max_output_tokens === undefined));
     fixture.assertPrivate(JSON.stringify(requests));
     fixture.assertPrivate(logs.join('\n'));
@@ -322,7 +309,7 @@ test('runner rejects unbounded/ambiguous inputs and credential-bearing endpoints
     ['--trials', '0'],
     ['--max-total-invocations', '501'],
     ['--timeout-ms', '0'],
-    ['--policies', 'notes-retrieval,notes-retrieval'],
+    ['--policies', 'history-retrieval,history-retrieval'],
     ['--mode', 'unknown'],
     ['--policies', 'mystery'],
     ['--trials'],
@@ -383,14 +370,14 @@ test('comparison gates cannot turn low prompt usage or missing costs into qualit
   });
   const trials = Array.from({ length: 20 }, (_, index) => [
     row('retained-history', index, true, 1000),
-    row('notes-retrieval', index, false, 10)
+    row('history-retrieval', index, false, 10)
   ]).flat();
   const summary = summarizeTrials(trials, gates);
-  const notes = summary.find((item) => item.policy === 'notes-retrieval');
-  assert.equal(notes.sampleSize, 20);
-  assert.equal(notes.successRate, 0);
-  assert.equal(notes.qualityGate, 'failed');
-  assert.ok(notes.successInterval95[1] > 0); // A finite sample is not certainty.
+  const retrieval = summary.find((item) => item.policy === 'history-retrieval');
+  assert.equal(retrieval.sampleSize, 20);
+  assert.equal(retrieval.successRate, 0);
+  assert.equal(retrieval.qualityGate, 'failed');
+  assert.ok(retrieval.successInterval95[1] > 0); // A finite sample is not certainty.
   assert.ok(
     summarizeTrials(trials, gates, 'deterministic-simulation').every(
       (item) => item.qualityGate === 'not-measured'
@@ -408,7 +395,8 @@ test('comparison gates cannot turn low prompt usage or missing costs into qualit
   );
   unknownCosts[0].mechanical = { ...unknownCosts[0].mechanical, duplicateSettlements: 1 };
   assert.equal(
-    summarizeTrials(unknownCosts, gates).find((item) => item.policy === 'retained-history').qualityGate,
+    summarizeTrials(unknownCosts, gates).find((item) => item.policy === 'retained-history')
+      .qualityGate,
     'failed-mechanical'
   );
   const estimatedCosts = trials.map((trial) => ({
@@ -441,7 +429,7 @@ test('CLI writes a caller-selected report and preserves an existing output file'
 });
 
 test(
-  'deterministic policy trials execute Core inference, context transitions, notes and authorized retrieval',
+  'deterministic policy trials execute Core inference, context transitions and authorized retrieval',
   { timeout: 120_000 },
   async () => {
     const report = await evaluateContextPolicies({
@@ -453,17 +441,24 @@ test(
     });
     assert.equal(report.measurement, 'deterministic-simulation');
     assert.equal(report.defaultRecommendation, null);
-    assert.equal(report.configuration.gates.maximumSuccessRegression, gates.maximumSuccessRegression);
+    assert.equal(
+      report.configuration.gates.maximumSuccessRegression,
+      gates.maximumSuccessRegression
+    );
     assert.match(report.configuration.source.runnerSha256, /^[a-f0-9]{64}$/u);
     assert.ok(
-      report.configuration.source.dirty === null || typeof report.configuration.source.dirty === 'boolean'
+      report.configuration.source.dirty === null ||
+        typeof report.configuration.source.dirty === 'boolean'
     );
-    assert.equal(report.trials.length, 16);
+    assert.equal(report.trials.length, 12);
     assert.deepEqual(
       report.availability.map((item) => item.policy),
       POLICIES
     );
-    assert.equal(report.availability.find((item) => item.policy === 'provider-native').status, 'available');
+    assert.equal(
+      report.availability.find((item) => item.policy === 'provider-native').status,
+      'available'
+    );
     for (const trial of report.trials) {
       assert.equal(trial.status, 'completed', JSON.stringify(trial));
       assert.equal(trial.success, true, JSON.stringify(trial));
@@ -477,20 +472,12 @@ test(
       assert.ok(Object.values(trial.mechanical).every((count) => count === 0));
       assert.equal(trial.checkpoints.length, 2);
       assert.equal(trial.requestFingerprints.length, trial.metrics.invocations);
-      if (trial.policy === 'notes-retrieval') {
-        assert.ok(trial.metrics.noteWrites > 0);
-        assert.ok(trial.metrics.noteDeliveries > 0);
-        assert.equal(trial.invocationIds.length, trial.metrics.noteWrites);
-      } else assert.equal(trial.metrics.noteWrites, 0);
       if (trial.policy === 'provider-native') {
         assert.ok(trial.metrics.nativeTransforms > 0);
         assert.equal(trial.metrics.nativeTransforms, trial.metrics.contextTransitions);
         assert.ok(trial.metrics.nativeStateDeliveries > 0);
       } else assert.equal(trial.metrics.nativeTransforms, 0);
-      assert.equal(
-        trial.metrics.retrievalCalls > 0,
-        ['history-retrieval', 'notes-retrieval'].includes(trial.policy)
-      );
+      assert.equal(trial.metrics.retrievalCalls > 0, trial.policy === 'history-retrieval');
       assert.equal(trial.metrics.retrievalFailures, 0);
     }
     assert.equal(
@@ -499,7 +486,8 @@ test(
     );
     assert.ok(
       report.summary.every(
-        (item) => item.sampleSize === 2 && item.qualityGate === 'not-measured' && item.meanCostUSD === null
+        (item) =>
+          item.sampleSize === 2 && item.qualityGate === 'not-measured' && item.meanCostUSD === null
       )
     );
   }
@@ -517,7 +505,9 @@ test(
       maxTotalInvocations: 1
     });
     assert.equal(report.totalInvocations, 1);
-    assert.ok(report.trials.every((trial) => trial.status === 'budget-exhausted' && !trial.success));
+    assert.ok(
+      report.trials.every((trial) => trial.status === 'budget-exhausted' && !trial.success)
+    );
     assert.ok(
       report.trials.every(
         (trial) =>
@@ -550,40 +540,51 @@ test(
         usage: { promptTokens: 100, completionTokens: 10, totalTokens: 110, cacheReadTokens: 40 }
       };
     });
-    t.mock.method(InMemoryInferenceRepository.prototype, 'append', async function (ownerId, event, tail) {
-      const committed = await append.call(this, ownerId, event, tail);
-      if (committed) records.push({ ownerId, event });
-      return committed;
-    });
+    t.mock.method(
+      InMemoryInferenceRepository.prototype,
+      'append',
+      async function (ownerId, event, tail) {
+        const committed = await append.call(this, ownerId, event, tail);
+        if (committed) records.push({ ownerId, event });
+        return committed;
+      }
+    );
     for (const known of [true, false]) {
-      pricing = { currency: 'USD', rates: { input: 2, output: 8, ...(known ? { cacheRead: 0.5 } : {}) } };
+      pricing = {
+        currency: 'USD',
+        rates: { input: 2, output: 8, ...(known ? { cacheRead: 0.5 } : {}) }
+      };
       const report = await evaluateContextPolicies({
         mode: 'simulation',
         trials: 1,
         delay: 1,
         transitionEvery: 2,
-        policies: ['notes-retrieval'],
+        policies: ['history-retrieval'],
         maxTotalInvocations: 100
       });
       for (const trial of report.trials) {
         assert.equal(trial.status, 'completed', trial.failure);
-        assert.ok(trial.metrics.noteWrites > 0);
         const settlements = records
           .filter(
-            ({ ownerId, event }) => trial.runIds.includes(ownerId) && event.type === 'inference.settled'
+            ({ ownerId, event }) =>
+              trial.runIds.includes(ownerId) && event.type === 'inference.settled'
           )
           .map(({ event }) => event);
-        const notes = settlements.filter((event) => trial.invocationIds.includes(event.invocationId));
-        assert.equal(notes.length, trial.metrics.noteWrites);
         assert.equal(settlements.length, trial.metrics.settledInvocations);
         // Fixture prices: 60 uncached input * $2/M + 40 cached * $0.50/M + 10 output * $8/M.
         const pricePerInvocation = known ? 0.00022 : 0.0002;
-        assert.ok(settlements.every((event) => Math.abs(event.cost.amount - pricePerInvocation) < 1e-12));
-        assert.ok(Math.abs(trial.metrics.knownCosts.USD - settlements.length * pricePerInvocation) < 1e-12);
+        assert.ok(
+          settlements.every((event) => Math.abs(event.cost.amount - pricePerInvocation) < 1e-12)
+        );
+        assert.ok(
+          Math.abs(trial.metrics.knownCosts.USD - settlements.length * pricePerInvocation) < 1e-12
+        );
         assert.equal(trial.metrics.costStatus, known ? 'known' : 'unknown-or-partial');
         assert.equal(trial.metrics.tokenUsageSource, 'provider');
       }
-      assert.ok(report.summary.every((item) => (known ? item.meanCostUSD > 0 : item.meanCostUSD === null)));
+      assert.ok(
+        report.summary.every((item) => (known ? item.meanCostUSD > 0 : item.meanCostUSD === null))
+      );
     }
   }
 );
@@ -592,9 +593,8 @@ test('deterministic native transform settles and replays through the shared infe
   const { MemorySimulationProvider, simulationProfile } = await import(
     './fixtures/context-policies/simulation.mjs'
   );
-  const { InferenceService, InMemoryInferenceRepository, InferenceBudgetExceededError } = await import(
-    '@agent-core/runtime'
-  );
+  const { InferenceService, InMemoryInferenceRepository, InferenceBudgetExceededError } =
+    await import('@agent-core/runtime');
   const { InMemoryArtifactRepository } = await import('@agent-core/persistence');
   const provider = new MemorySimulationProvider();
   const repository = new InMemoryInferenceRepository();
@@ -637,10 +637,22 @@ test('deterministic native transform settles and replays through the shared infe
   assert.equal(provider.transforms.length, 1);
   const owner = await repository.load('native-owner');
   assert.equal(owner.settledUsage.invocations, 2);
-  assert.equal((await repository.load('native-owner', { invocationId: 'primary' })).invocation.start.operation, 'generation');
-  assert.equal((await repository.load('native-owner', { invocationId: 'native-transform' })).invocation.start.operation, 'context_transform');
+  assert.equal(
+    (await repository.load('native-owner', { invocationId: 'primary' })).invocation.start.operation,
+    'generation'
+  );
+  assert.equal(
+    (await repository.load('native-owner', { invocationId: 'native-transform' })).invocation.start
+      .operation,
+    'context_transform'
+  );
   await assert.rejects(
-    service.invoke({ invocationId: 'too-many', ownerId: 'native-owner', purpose: 'agent-step', request }),
+    service.invoke({
+      invocationId: 'too-many',
+      ownerId: 'native-owner',
+      purpose: 'agent-step',
+      request
+    }),
     InferenceBudgetExceededError
   );
   assert.equal(provider.calls.length, 1);
@@ -651,7 +663,9 @@ test(
   { timeout: 60_000 },
   async (t) => {
     const { MemorySimulationProvider } = await import('./fixtures/context-policies/simulation.mjs');
-    const { InMemorySessionRepository, InMemoryInferenceRepository } = await import('@agent-core/runtime');
+    const { InMemorySessionRepository, InMemoryInferenceRepository } = await import(
+      '@agent-core/runtime'
+    );
     const complete = MemorySimulationProvider.prototype.complete;
     const transform = MemorySimulationProvider.prototype.transformContextCompiled;
     const commit = InMemorySessionRepository.prototype.commitContextTransition;
@@ -681,11 +695,15 @@ test(
         return committed;
       }
     );
-    t.mock.method(InMemoryInferenceRepository.prototype, 'append', async function (ownerId, event, tail) {
-      const committed = await append.call(this, ownerId, event, tail);
-      if (committed && event.type === 'inference.started') invocations.push(event);
-      return committed;
-    });
+    t.mock.method(
+      InMemoryInferenceRepository.prototype,
+      'append',
+      async function (ownerId, event, tail) {
+        const committed = await append.call(this, ownerId, event, tail);
+        if (committed && event.type === 'inference.started') invocations.push(event);
+        return committed;
+      }
+    );
     const report = await evaluateContextPolicies({
       mode: 'simulation',
       trials: 1,
@@ -737,7 +755,8 @@ test('comparison ceiling prevents auxiliary native dispatch and leaves the previ
   assert.equal(report.totalInvocations, 1);
   assert.ok(
     report.trials.every(
-      (trial) => trial.status === 'budget-exhausted' && trial.budgetStop === 'comparison_invocations'
+      (trial) =>
+        trial.status === 'budget-exhausted' && trial.budgetStop === 'comparison_invocations'
     )
   );
   assert.equal(report.trials[0].metrics.settledInvocations, 1);
@@ -767,10 +786,14 @@ test(
         throw error;
       }
     });
-    t.mock.method(InMemoryInferenceRepository.prototype, 'append', async function (ownerId, event, tail) {
-      if (event.type === 'inference.uncertain') failures.push(event.message);
-      return append.call(this, ownerId, event, tail);
-    });
+    t.mock.method(
+      InMemoryInferenceRepository.prototype,
+      'append',
+      async function (ownerId, event, tail) {
+        if (event.type === 'inference.uncertain') failures.push(event.message);
+        return append.call(this, ownerId, event, tail);
+      }
+    );
     const requests = [];
     const opaque = 'private-fixture-compaction-state';
     t.mock.method(globalThis, 'fetch', async (url, init) => {
@@ -792,7 +815,9 @@ test(
       const response = {
         id: `response-fixture-${requests.length}`,
         status: 'completed',
-        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ACK' }] }],
+        output: [
+          { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ACK' }] }
+        ],
         usage: { input_tokens: 60, output_tokens: 4, total_tokens: 64 }
       };
       return new Response(`data: ${JSON.stringify({ type: 'response.completed', response })}\n\n`, {
@@ -842,7 +867,8 @@ test(
     );
     assert.ok(
       requests.some(
-        (item) => item.pathname.endsWith('/input_tokens') && JSON.stringify(item.body).includes(opaque)
+        (item) =>
+          item.pathname.endsWith('/input_tokens') && JSON.stringify(item.body).includes(opaque)
       )
     );
     assert.ok(!JSON.stringify(report).includes(opaque));

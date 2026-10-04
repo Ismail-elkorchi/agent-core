@@ -99,7 +99,6 @@ async function assembleWindow(window, input) {
     window,
     task: input.task,
     instructions: input.instructions,
-    notes: input.notes,
     contextItems: input.contextItems,
     tools: input.tools,
     modelProfile: input.modelProfile
@@ -278,7 +277,6 @@ test('ModelWindow preserves native tool call/result pairs in model-window histor
   const assembly = await assembleWindow(manager, {
     task: 'summarize',
     instructions: [],
-    notes: [],
     contextItems: [],
     tools: [],
     modelTools: [],

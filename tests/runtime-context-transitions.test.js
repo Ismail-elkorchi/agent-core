@@ -7,7 +7,6 @@ import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core
 import {
   AgentRuntime,
   InMemorySessionRepository,
-  InMemoryNoteRepository,
   HistoryReader,
   ContextService,
   createContextTools,
@@ -41,13 +40,13 @@ async function fixture() {
   });
   const events = new InMemoryEventRepository(agentEventCodec);
   const artifacts = new InMemoryArtifactRepository();
-  const notes = new InMemoryNoteRepository({ artifacts });
   const history = new HistoryReader({ repository: sessions, session, events, artifacts });
   const context = new ContextService({
+    artifacts,
     repository: sessions,
     session,
     history,
-    notes,
+
     policy: { maxSourceBytes: 4 * 1024 * 1024, historyRead: { history, isAvailable: () => true } }
   });
   const requests = [];
@@ -62,7 +61,17 @@ async function fixture() {
       return {
         provider: 'fixture',
         model: 'context',
-        content: 'Recorded answer.',
+        content: request.tools
+          ? 'Recorded answer.'
+          : JSON.stringify({
+              edits: [
+                {
+                  range: { start: { line: 1, column: 1 }, end: { line: 1, column: 1 } },
+                  expectedText: '',
+                  replacementText: 'Recorded answer.'
+                }
+              ]
+            }),
         terminationReason: 'stop',
         usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 }
       };
@@ -72,7 +81,7 @@ async function fixture() {
     provider,
     model: 'context',
     context,
-    notes,
+
     maxOutputTokens: 128,
     tools: [...createHistoryTools({ history }), ...createContextTools({ context })],
     repositories: { events, artifacts, session: { repository: sessions, descriptor: session } },
@@ -86,7 +95,7 @@ async function fixture() {
     history,
     context,
     requests,
-    notes,
+
     provider,
     options,
     setCapacity(value) {
@@ -104,12 +113,12 @@ test('idle source selection records intent without invoking or claiming request 
   assert.equal(inspected.admission, undefined);
 });
 
-test('automatic renewal generates a continuation note and preserves current input and settings', async () => {
+test('automatic renewal revises working state and preserves current input and settings', async () => {
   const state = await fixture();
   const original = 'Old detail. '.repeat(9000);
   const first = await new AgentRuntime(state.options).run({ task: original }).result;
   assert.equal(first.terminal?.executionStatus, 'completed', JSON.stringify(first));
-  state.setCapacity(44000);
+  state.setCapacity(45000);
   let captures = 0;
   const runtime = new AgentRuntime({
     ...state.options,
@@ -143,8 +152,8 @@ test('automatic renewal generates a continuation note and preserves current inpu
   assert.ok(request.messages.some((item) => item.content.includes('Exact captured guidance')));
   assert.ok(!request.messages.some((item) => item.content === original));
   const inspected = await state.context.inspect();
-  assert.equal(inspected.window.selection.notes.length, 1);
-  assert.match(inspected.window.reason, /continuation notes/);
+  assert.ok(inspected.workingState.revisionId);
+  assert.match(inspected.window.reason, /working-state/);
   assert.equal(state.requests.length, 3);
   assert.equal(state.requests[1].tools, undefined);
   assert.ok(JSON.stringify(state.requests[1].messages).includes(original));
@@ -184,7 +193,9 @@ test('model renewal uses invocation identity and retains its own complete tool e
     }
   };
   const result = await new AgentRuntime({
-    ...state.options, provider }).run({
+    ...state.options,
+    provider
+  }).run({
     task: 'Current accepted task'
   }).result;
   assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
@@ -233,13 +244,15 @@ test('definitive provider overflow retries only a reduced admitted selection and
         return {
           provider: 'fixture',
           model: 'context',
-          content: 'Continued after reduction.',
+          content: request.tools?.length
+            ? 'Continued after reduction.'
+            : JSON.stringify({ edits: [] }),
           terminationReason: 'stop'
         };
       }
     };
     const result = await new AgentRuntime({
-    ...state.options,
+      ...state.options,
       provider,
       contextRenewal: { automatic: true }
     }).run({ task: 'Current work' }).result;
@@ -268,64 +281,6 @@ test('unchanged admission stays suspended; an admissible changed capacity resume
 });
 
 for (const length of [80, 18000]) {
-  test(`automatic renewal summarizes a ${length}-character selected note without deleting its original`, async () => {
-    const state = await fixture();
-    const old = await new AgentRuntime(state.options).run({
-      task: 'Optional earlier detail. '.repeat(3000)
-    }).result;
-    assert.equal(old.terminal?.executionStatus, 'completed', JSON.stringify(old));
-    const scope = { sessionId: state.session.id, branchId: state.session.id };
-    const written = await state.notes.write({
-      scope,
-      noteId: 'working-note',
-      title: 'Model hypothesis',
-      mediaType: 'text/plain',
-      content: 'x'.repeat(length),
-      expectedRevision: null,
-      idempotencyKey: 'write',
-      authorId: 'model',
-      invocationId: 'note-write'
-    });
-    assert.equal(written.status, 'committed');
-    const originals = await state.history.search({ filter: { sourceType: 'input' }, limit: 30 });
-    await state.context.request({
-      idempotencyKey: 'select-note',
-      reason: 'Keep a fallible working note',
-      selection: {
-        strategy: 'sources',
-        retained: originals.items.map((item) => item.source),
-        notes: [{ scope, noteId: written.revision.noteId, revisionId: written.revision.revisionId }]
-      }
-    });
-    const complete = state.provider.complete;
-    let rejected = false;
-    state.provider.complete = async request => {
-      if (!rejected) {
-        rejected = true;
-        const { ModelProviderError } = await import('@agent-core/model');
-        throw new ModelProviderError({ provider: 'fixture', code: 'context_overflow', message: 'Context full', retryable: false });
-      }
-      if (!request.tools) assert.ok(JSON.stringify(request.messages).includes('x'.repeat(length)));
-      return complete(request);
-    };
-    const result = await new AgentRuntime({
-    ...state.options,
-      contextRenewal: { automatic: true }
-    }).run({ task: 'Continue the same task.' }).result;
-    assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
-    assert.equal((await state.context.inspect()).window.selection.notes.length, 1);
-    assert.equal(
-      (
-        await state.notes.read({
-          scope,
-          noteId: 'working-note',
-          revisionId: written.revision.revisionId,
-          maxBytes: 32768
-        })
-      ).text,
-      'x'.repeat(length)
-    );
-  });
 }
 
 test('application instructions refresh for each new admitted inference during one run', async () => {
@@ -399,7 +354,9 @@ test('definitive provider rejection cannot be retried by resuming the same input
     }
   };
   const runtime = new AgentRuntime({
-    ...state.options, provider });
+    ...state.options,
+    provider
+  });
   const result = await runtime.run({ task: 'Keep this original instruction.' }).result;
   assert.equal(result.reason, 'context_admission', JSON.stringify(result));
   const resumed = await runtime.resume(result.runId).result;
@@ -416,102 +373,115 @@ test('retained source membership cannot reorder original user and assistant turn
   const originals = await state.history.search({ query: '', limit: 100 });
   const retained = originals.items.map((item) => item.source).reverse();
   const cut = await state.history.capture();
-  await state.context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
-    idempotencyKey: 'reversed-membership', reason: 'Retain all originals.', selection: { strategy: 'sources', retained, notes: [] } });
+  await state.context.transition({
+    expectedWindowId: null,
+    expectedSourceRevision: cut.sourceRevision,
+    idempotencyKey: 'reversed-membership',
+    reason: 'Retain all originals.',
+    selection: { strategy: 'sources', retained }
+  });
   const result = await new AgentRuntime(state.options).run({ task: 'Follow up.' }).result;
   assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
-  const messages = state.requests.at(-1).messages.filter((item) => item.role === 'user' || item.role === 'assistant');
-  assert.deepEqual(messages.map((item) => item.content), ['First original request.', 'Recorded answer.', 'Second original correction.', 'Recorded answer.', 'Follow up.']);
+  const messages = state.requests
+    .at(-1)
+    .messages.filter((item) => item.role === 'user' || item.role === 'assistant');
+  assert.deepEqual(
+    messages.map((item) => item.content),
+    [
+      'First original request.',
+      'Recorded answer.',
+      'Second original correction.',
+      'Recorded answer.',
+      'Follow up.'
+    ]
+  );
 });
 
-test('source byte exhaustion preserves the window until an explicit bounded selection is supplied', { timeout: 120000 }, async () => {
-  const state = await fixture();
-  state.setCapacity(10000000);
-  const runtime = new AgentRuntime(state.options);
-  for (let index = 0; index < 11; index++) {
-    const result = await runtime.run({ task: `Original ${index}: ${'x'.repeat(750000)}` }).result;
-    assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
-  }
-  const before = state.requests.length;
-  const task = `Current accepted input: ${'y'.repeat(200000)}`;
-  const suspended = await new AgentRuntime(state.options).run({ runId: 'source-overflow', task }).result;
-  assert.equal(suspended.reason, 'context_admission', JSON.stringify(suspended));
-  assert.equal(suspended.contextAdmission.kind, 'source_capacity');
-  assert.equal(suspended.contextAdmission.inputIdentity, undefined);
-  assert.equal(state.requests.length, before);
-  const tiny = new ContextService({ repository: state.sessions, session: state.session, history: state.history,
-    notes: state.notes, policy: { maxSourceBytes: 1, historyRead: { history: state.history, isAvailable: () => true } } });
-  const blocked = await new AgentRuntime({ ...state.options, context: tiny, contextRenewal: { automatic: true } }).resume('source-overflow').result;
-  assert.equal(blocked.reason, 'context_admission', JSON.stringify(blocked));
-  assert.equal(state.requests.length, before);
-  const result = await new AgentRuntime({ ...state.options, contextRenewal: { automatic: true } }).resume('source-overflow').result;
-  assert.equal(result.reason, 'context_admission', JSON.stringify(result));
-  assert.equal(state.requests.length, before);
-  assert.equal((await state.context.inspect()).window, null);
-  await state.context.transition({ expectedWindowId: null, idempotencyKey: 'explicit-selection', reason: 'Explicit user selection',
-    selection: { strategy: 'sources', retained: await state.context.protectedSources(), notes: [] } });
-  const resumed = await new AgentRuntime(state.options).resume('source-overflow').result;
-  assert.equal(resumed.terminal?.executionStatus, 'completed', JSON.stringify(resumed));
-  assert.equal(state.requests.length, before + 1);
-  assert.equal(state.requests.at(-1).messages.filter((item) => item.content === task).length, 1);
-  assert.ok(JSON.stringify(state.requests.at(-1)).length < 500000);
-  assert.equal((await state.context.inspect()).window.selection.strategy, 'sources');
-});
-
-
-test('renewal carries completed effects and remaining work forward without executing the effect again', async () => {
-  const state = await fixture();
-  let effects = 0;
-  const envelope = { accesses: [{ mode: 'write', scope: 'memory' }], lockScopes: ['memory'] };
-  const save = defineTool({
-    name: 'save', implementationId: 'test/save', description: 'Save the requested change',
-    schema: z.strictObject({}), outputSchema: z.strictObject({ revision: z.string(), details: z.string() }),
-    effectEnvelope: envelope, canonicalizeInput: input => input,
-    deriveEffects: () => ({ ...envelope, recovery: { kind: 'unknown' } }),
-    invoke: async () => { effects++; return { kind: 'result', output: { revision: 'saved-revision-17', details: 'Original execution details. '.repeat(300) },
-      summary: 'Saved change at revision 17', scope: { resources: ['memory'], coverage: 'complete' } }; }
-  });
-  let generations = 0;
-  let summaries = 0;
-  const provider = { ...state.provider, complete: async request => {
-    if (!request.tools) {
-      summaries++;
-      assert.ok(JSON.stringify(request.messages).includes('saved-revision-17'));
-      assert.ok(JSON.stringify(request.messages).includes('Preserve unrelated content'));
-      return { provider: 'fixture', model: 'context', terminationReason: 'stop',
-        content: 'The change is already saved at saved-revision-17. Preserve unrelated content. Remaining work: verify the saved change.',
-        usage: { promptTokens: 30, completionTokens: 10, totalTokens: 40 } };
+test(
+  'source byte exhaustion preserves the window until an explicit bounded selection is supplied',
+  { timeout: 120000 },
+  async () => {
+    const state = await fixture();
+    state.setCapacity(10000000);
+    const runtime = new AgentRuntime(state.options);
+    for (let index = 0; index < 11; index++) {
+      const result = await runtime.run({ task: `Original ${index}: ${'x'.repeat(750000)}` }).result;
+      assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
     }
-    generations++;
-    if (generations === 1) return { provider: 'fixture', model: 'context', content: 'Saving the change.',
-      terminationReason: 'tool_calls', toolCalls: [{ type: 'function', id: 'save-call', name: 'save', input: { kind: 'json', value: {} } }] };
-    if (generations === 2) throw new ModelProviderError({ provider: 'fixture', code: 'context_overflow', message: 'Context full', retryable: false });
-    assert.ok(request.messages.some(message => message.content.includes('already saved at saved-revision-17')));
-    return { provider: 'fixture', model: 'context', content: 'Verified the saved change.', terminationReason: 'stop' };
-  } };
-  const result = await new AgentRuntime({ ...state.options, provider,
-    tools: [...state.options.tools, save], contextRenewal: { automatic: true }
-  }).run({ task: 'Save the change and verify it. Preserve unrelated content.' }).result;
-  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
-  assert.equal(effects, 1);
-  assert.equal(summaries, 1);
-  const selected = (await state.context.inspect()).window.selection.notes[0];
-  const note = await state.notes.read(selected);
-  assert.equal(note.status, 'available');
-  assert.match(note.text, /saved-revision-17/);
-  assert.ok(result.terminal.budget.promptTokens >= 30);
-});
+    const before = state.requests.length;
+    const task = `Current accepted input: ${'y'.repeat(200000)}`;
+    const suspended = await new AgentRuntime(state.options).run({ runId: 'source-overflow', task })
+      .result;
+    assert.equal(suspended.reason, 'context_admission', JSON.stringify(suspended));
+    assert.equal(suspended.contextAdmission.kind, 'source_capacity');
+    assert.equal(suspended.contextAdmission.inputIdentity, undefined);
+    assert.equal(state.requests.length, before);
+    const tiny = new ContextService({
+      repository: state.sessions,
+      session: state.session,
+      history: state.history,
+      artifacts: state.options.repositories.artifacts,
+      policy: {
+        maxSourceBytes: 1,
+        historyRead: { history: state.history, isAvailable: () => true }
+      }
+    });
+    const blocked = await new AgentRuntime({
+      ...state.options,
+      context: tiny,
+      contextRenewal: { automatic: true }
+    }).resume('source-overflow').result;
+    assert.equal(blocked.reason, 'context_admission', JSON.stringify(blocked));
+    assert.equal(state.requests.length, before);
+    const result = await new AgentRuntime({
+      ...state.options,
+      contextRenewal: { automatic: true }
+    }).resume('source-overflow').result;
+    assert.equal(result.reason, 'context_admission', JSON.stringify(result));
+    assert.equal(state.requests.length, before);
+    assert.equal((await state.context.inspect()).window, null);
+    await state.context.transition({
+      expectedWindowId: null,
+      idempotencyKey: 'explicit-selection',
+      reason: 'Explicit user selection',
+      selection: { strategy: 'sources', retained: await state.context.protectedSources() }
+    });
+    const resumed = await new AgentRuntime(state.options).resume('source-overflow').result;
+    assert.equal(resumed.terminal?.executionStatus, 'completed', JSON.stringify(resumed));
+    assert.equal(state.requests.length, before + 1);
+    assert.equal(state.requests.at(-1).messages.filter((item) => item.content === task).length, 1);
+    assert.ok(JSON.stringify(state.requests.at(-1)).length < 500000);
+    assert.equal((await state.context.inspect()).window.selection.strategy, 'sources');
+  }
+);
 
 test('an incomplete continuation never replaces the working context', async () => {
   const state = await fixture();
   await new AgentRuntime(state.options).run({ task: 'Earlier requirements' }).result;
-  const provider = { ...state.provider, complete: async request => {
-    if (request.tools) throw new ModelProviderError({ provider: 'fixture', code: 'context_overflow', message: 'Context full', retryable: false });
-    return { provider: 'fixture', model: 'context', content: 'Unfinished notes', terminationReason: 'output_limit',
-      usage: { promptTokens: 30, completionTokens: 10, totalTokens: 40 } };
-  } };
-  const result = await new AgentRuntime({ ...state.options, provider, contextRenewal: { automatic: true } })
-    .run({ task: 'Continue the work' }).result;
+  const provider = {
+    ...state.provider,
+    complete: async (request) => {
+      if (request.tools)
+        throw new ModelProviderError({
+          provider: 'fixture',
+          code: 'context_overflow',
+          message: 'Context full',
+          retryable: false
+        });
+      return {
+        provider: 'fixture',
+        model: 'context',
+        content: 'Unfinished notes',
+        terminationReason: 'output_limit',
+        usage: { promptTokens: 30, completionTokens: 10, totalTokens: 40 }
+      };
+    }
+  };
+  const result = await new AgentRuntime({
+    ...state.options,
+    provider,
+    contextRenewal: { automatic: true }
+  }).run({ task: 'Continue the work' }).result;
   assert.equal(result.reason, 'context_admission', JSON.stringify(result));
   assert.equal((await state.context.inspect()).window, null);
   assert.equal(result.budget.promptTokens, 30);
@@ -522,14 +492,22 @@ test('large output reservations do not trigger renewal of a short conversation',
   await new AgentRuntime(state.options).run({ task: 'Original requirements.' }).result;
   const provider = {
     ...state.provider,
-    describeModel: async () => ({ ...profile(32768), limits: { contextTokens: 32768, outputTokens: 16384 } })
+    describeModel: async () => ({
+      ...profile(32768),
+      limits: { contextTokens: 32768, outputTokens: 16384 }
+    })
   };
   const result = await new AgentRuntime({
-    ...state.options, provider, maxOutputTokens: 16384, contextRenewal: { automatic: true }
+    ...state.options,
+    provider,
+    maxOutputTokens: 16384,
+    contextRenewal: { automatic: true }
   }).run({ task: 'Continue.' }).result;
   assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
   assert.equal(state.requests.length, 2);
-  assert.ok(state.requests[1].messages.some(message => message.content === 'Original requirements.'));
+  assert.ok(
+    state.requests[1].messages.some((message) => message.content === 'Original requirements.')
+  );
   assert.equal((await state.context.inspect()).window, null);
 });
 
@@ -541,22 +519,38 @@ test('a failed proactive continuation cannot block an admitted working context',
   let generations = 0;
   const provider = {
     ...state.provider,
-    describeModel: async () => ({ ...profile(32768), limits: { contextTokens: 32768, outputTokens: 16384 } }),
-    complete: async request => {
+    describeModel: async () => ({
+      ...profile(32768),
+      limits: { contextTokens: 32768, outputTokens: 16384 }
+    }),
+    complete: async (request) => {
       if (!request.tools) {
         summaries++;
-        return { provider: 'fixture', model: 'context', content: 'Incomplete continuation', terminationReason: 'output_limit',
-          usage: { promptTokens: 30, completionTokens: 10, totalTokens: 40 } };
+        return {
+          provider: 'fixture',
+          model: 'context',
+          content: 'Incomplete continuation',
+          terminationReason: 'output_limit',
+          usage: { promptTokens: 30, completionTokens: 10, totalTokens: 40 }
+        };
       }
       generations++;
-      assert.ok(request.messages.some(message => message.content === original));
-      assert.ok(request.messages.some(message => message.content === 'Recorded answer.'));
-      return { provider: 'fixture', model: 'context', content: 'Continued using the original context.', terminationReason: 'stop',
-        usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 } };
+      assert.ok(request.messages.some((message) => message.content === original));
+      assert.ok(request.messages.some((message) => message.content === 'Recorded answer.'));
+      return {
+        provider: 'fixture',
+        model: 'context',
+        content: 'Continued using the original context.',
+        terminationReason: 'stop',
+        usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 }
+      };
     }
   };
   const result = await new AgentRuntime({
-    ...state.options, provider, maxOutputTokens: 16384, contextRenewal: { automatic: true }
+    ...state.options,
+    provider,
+    maxOutputTokens: 16384,
+    contextRenewal: { automatic: true }
   }).run({ task: 'Continue.' }).result;
   assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
   assert.equal(summaries, 1);
@@ -565,20 +559,43 @@ test('a failed proactive continuation cannot block an admitted working context',
   assert.equal(result.terminal.budget.promptTokens, 50);
 });
 
-
 test('a changed admitted request resumes a definitively rejected provider request without unresolved-outcome recovery', async () => {
   const state = await fixture();
   let extra = 'Optional captured context before the rejection.';
   let calls = 0;
-  const provider = { ...state.provider, complete: async request => {
-    calls++;
-    if (calls === 1) throw new ModelProviderError({ provider: 'fixture', code: 'context_overflow',
-      message: 'Provider rejected the initial input.', retryable: false });
-    return state.provider.complete(request);
-  } };
-  const runtime = new AgentRuntime({ ...state.options, provider, contextProvider: () => extra
-    ? [{ id: 'capture', sourceKind: 'external', sourceUri: 'test://optional-context', representation: 'full',
-      mediaType: 'text/plain', title: 'Captured context', purpose: 'Optional evidence', content: extra }] : [] });
+  const provider = {
+    ...state.provider,
+    complete: async (request) => {
+      calls++;
+      if (calls === 1)
+        throw new ModelProviderError({
+          provider: 'fixture',
+          code: 'context_overflow',
+          message: 'Provider rejected the initial input.',
+          retryable: false
+        });
+      return state.provider.complete(request);
+    }
+  };
+  const runtime = new AgentRuntime({
+    ...state.options,
+    provider,
+    contextProvider: () =>
+      extra
+        ? [
+            {
+              id: 'capture',
+              sourceKind: 'external',
+              sourceUri: 'test://optional-context',
+              representation: 'full',
+              mediaType: 'text/plain',
+              title: 'Captured context',
+              purpose: 'Optional evidence',
+              content: extra
+            }
+          ]
+        : []
+  });
   const suspended = await runtime.run({ task: 'Keep the original work.' }).result;
   assert.equal(suspended.reason, 'context_admission');
   assert.equal(suspended.contextAdmission.kind, 'provider_capacity');
@@ -586,5 +603,8 @@ test('a changed admitted request resumes a definitively rejected provider reques
   const result = await runtime.resume(suspended.runId).result;
   assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
   assert.equal(calls, 2);
-  assert.equal(state.requests[0].messages.filter(item => item.content === 'Keep the original work.').length, 1);
+  assert.equal(
+    state.requests[0].messages.filter((item) => item.content === 'Keep the original work.').length,
+    1
+  );
 });

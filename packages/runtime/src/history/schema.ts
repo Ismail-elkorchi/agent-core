@@ -40,9 +40,21 @@ export const historyCutSchema = z
       .optional()
   })
   .readonly();
-export const scopeSchema = z
-  .strictObject({ sessionId: z.string().min(1), branchId: z.string().min(1) })
-  .readonly();
-export const noteRefSchema = z
-  .strictObject({ scope: scopeSchema, noteId: z.string().min(1), revisionId: z.string().min(1) })
-  .readonly();
+export const historyReadRequestSchema = z.strictObject({
+  source: sourceSchema,
+  cut: historyCutSchema.optional(),
+  offset: z.number().int().min(0).optional(),
+  maxSourceBytes: z
+    .number()
+    .int()
+    .min(1)
+    .max(8 * 1024 * 1024)
+    .optional(),
+  maxBytes: z
+    .number()
+    .int()
+    .min(1)
+    .max(1024 * 1024)
+    .optional(),
+  neighbors: z.number().int().min(0).max(32).optional()
+});

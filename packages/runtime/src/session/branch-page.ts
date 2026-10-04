@@ -1,3 +1,4 @@
+import { workingStateAtEntry, type SessionWorkingStateEntry } from './working-state.js';
 import { hashJson } from '@agent-core/persistence';
 import { entryIdentity } from '../history/ledger.js';
 import type {
@@ -13,6 +14,7 @@ import type {
 } from './contracts.js';
 
 export interface BranchEntryPosition {
+  readonly workingState?: SessionWorkingStateEntry | null;
   readonly identity: string;
   readonly type: SessionBranchEntry['type'];
   readonly runId?: string;
@@ -158,6 +160,10 @@ export function memoryBranchSource(
   for (const entry of entries.slice(index.count)) {
     index.byId.set(entry.id, entry);
     index.positions.set(entry.id, {
+      workingState: workingStateAtEntry(
+        entry,
+        entry.parentId === null ? null : (index.positions.get(entry.parentId)?.workingState ?? null)
+      ),
       ...branchEntryMetadata(entry),
       parentId: entry.parentId,
       hash: hashJson(entry),
@@ -234,6 +240,8 @@ function branchEntryText(entry: SessionBranchEntry): string {
       return `${entry.provider}/${entry.model}`;
     case 'context_transition':
       return entry.window.reason;
+    case 'working_state':
+      return 'Generated working-state interpretation';
   }
 }
 
@@ -295,4 +303,11 @@ export function sourceSnapshot(
   });
   sourceSnapshots.set(path, snapshot);
   return snapshot;
+}
+
+export function currentWorkingState(
+  source: BranchPageSource,
+  leafId = source.leafId
+): SessionWorkingStateEntry | null {
+  return leafId === null ? null : (position(source, leafId).workingState ?? null);
 }

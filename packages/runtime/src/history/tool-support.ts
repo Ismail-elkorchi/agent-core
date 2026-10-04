@@ -6,7 +6,7 @@ import {
 } from '@agent-core/tools';
 import { parseJsonObject, parseJsonValue, type JsonObject } from '@agent-core/json';
 
-export { sourceSchema, scopeSchema, noteRefSchema } from './schema.js';
+export { sourceSchema } from './schema.js';
 export const queryShape = {
   cursor: z.string().max(4096).optional(),
   limit: z.number().int().min(1).max(100).optional(),
@@ -17,15 +17,6 @@ export const queryShape = {
     .max(256 * 1024)
     .optional(),
   maxScanned: z.number().int().min(1).max(1000).optional()
-};
-export const rangeShape = {
-  offset: z.number().int().min(0).optional(),
-  maxBytes: z
-    .number()
-    .int()
-    .min(1)
-    .max(256 * 1024)
-    .optional()
 };
 
 export function scopedTool(input: {
@@ -100,6 +91,6 @@ export function scopePath(root: string, sessionId: string, branchId: string): st
 }
 export function invocationIdentity(context: ToolExecutionContext): string {
   const call = context.invocation;
-  if (!call) throw new Error('Note mutation requires a host tool invocation identity.');
+  if (!call) throw new Error('Session mutation requires a host tool invocation identity.');
   return `${call.runId}:${call.turnId}:${String(call.requestAttempt)}:${call.toolBatchId}:${String(call.callIndex)}`;
 }

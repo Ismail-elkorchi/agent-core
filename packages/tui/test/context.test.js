@@ -5,14 +5,8 @@ import { createTuiRuntime, defineTui } from '@ismail-elkorchi/terminal-ui/tui';
 import { contextView, createContextState, updateContext } from '@agent-core/tui';
 
 for (const columns of [48, 120])
-  test(`context selection at ${columns} columns preserves protected sources and exact note revisions`, async (t) => {
+  test(`context selection at ${columns} columns preserves protected sources and current working-state interpretation`, async (t) => {
     const source = { sessionId: 'session', entryId: 'input', sha256: 'a'.repeat(64) };
-    const note = {
-      scope: { sessionId: 'session', branchId: 'session' },
-      noteId: 'note',
-      revisionId: 'revision',
-      title: 'A model hypothesis'
-    };
     const cut = {
       format: 'agent-core.history/1',
       sessionId: 'session',
@@ -24,6 +18,7 @@ for (const columns of [48, 120])
     const inspection = {
       cut,
       window: null,
+      workingState: { revisionId: 'revision', text: 'A model hypothesis', complete: true },
       protectedSources: [source],
       pendingWork: [],
       legalTransitions: ['sources'],
@@ -46,7 +41,6 @@ for (const columns of [48, 120])
           coverage: 'complete'
         };
       },
-      listNotes: async () => ({ items: [note], coverage: 'complete' }),
       renewContext: async (selection) => selections.push(selection)
     };
     const app = defineTui({
@@ -68,11 +62,10 @@ for (const columns of [48, 120])
     assert.equal(runtime.state().inspection.cut, cut);
     await runtime.dispatch({ type: 'context.source', source });
     assert.deepEqual(runtime.state().selection.retained, [source]);
-    const { title: _title, ...reference } = note;
-    await runtime.dispatch({ type: 'context.note', note: reference });
     await runtime.dispatch({ type: 'context.apply' });
     for (let i = 0; i < 300 && selections.length === 0; i++)
       await new Promise((resolve) => setTimeout(resolve, 5));
-    assert.deepEqual(selections[0].notes, [reference]);
+    assert.equal(runtime.state().inspection.workingState.text, 'A model hypothesis');
+    assert.ok(!('notes' in selections[0]));
     assert.deepEqual(selections[0].retained, [source]);
   });

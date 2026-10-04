@@ -16,7 +16,6 @@ import { AgentRuntime, type AgentRunHandle, type AgentRunInput } from '../agent-
 import type { ContextTransitionRequest } from '../context/contracts.js';
 import type { ContextService } from '../context/service.js';
 import type { AgentProgressEvent } from '../events.js';
-import type { NoteRepository } from '../notes/contracts.js';
 import type { AgentRunResult } from '../run/contracts.js';
 import { AgentRunCoordinator } from '../run/control/driver.js';
 import { assertSessionBinding, decodeSessionBinding, type SessionBindingInput } from './binding.js';
@@ -119,7 +118,6 @@ export interface AgentSessionOptions {
     context: AgentSessionRuntimeContext
   ) => AgentRuntime | Promise<AgentRuntime>;
   readonly context?: ContextService;
-  readonly notes?: NoteRepository;
   readonly maximumQueuedInputs?: number;
   /** Manual scheduling leaves admitted input durable until its application starts it. */
   readonly scheduling?: 'automatic' | 'manual';
@@ -196,9 +194,9 @@ export class AgentSession {
           .filter((submission) => submission.state !== 'queued')
           .map((submission) => this.options.runs.inspect(submission.runId))
       );
-      const toolDiagnostics = (await Promise.all(
-        runs.map(({ state }) => this.options.runs.readToolDiagnostics(state))
-      )).flat();
+      const toolDiagnostics = (
+        await Promise.all(runs.map(({ state }) => this.options.runs.readToolDiagnostics(state)))
+      ).flat();
       return { session: this.state(), pendingSubmissions, runs, toolDiagnostics };
     });
   }
@@ -375,7 +373,6 @@ export class AgentSession {
           selection: {
             strategy: 'sources',
             retained,
-            notes: view.contextWindow?.selection.notes ?? [],
             ...(view.contextWindow?.selection.protected === undefined
               ? {}
               : { protected: view.contextWindow.selection.protected }),
@@ -486,29 +483,11 @@ export class AgentSession {
       await this.restorePending();
       if (this.active || this.suspended || this.queued.length > 0)
         throw new Error('Session branching requires an idle session with no queued work.');
-      const replay = await this.options.repository.loadReplayState(
-        this.options.descriptor,
-        entryId
-      );
-      const parentBranchId =
-        [...replay.branch].reverse().find((entry) => entry.type === 'branch')?.id ??
-        this.options.descriptor.id;
-      const parentScope = { sessionId: this.options.descriptor.id, branchId: parentBranchId };
-      const parentNotes = await this.options.notes?.list({ scope: parentScope, limit: 1 });
-      const noteSource = parentNotes
-        ? { scope: parentScope, watermark: parentNotes.watermark }
-        : undefined;
       const branch = await this.options.repository.branchFrom(
         this.options.descriptor,
         entryId,
-        label,
-        noteSource
+        label
       );
-      await this.options.notes?.fork({
-        scope: { sessionId: this.options.descriptor.id, branchId: branch.id },
-        parentScope,
-        ...(noteSource ? { throughRevision: noteSource.watermark } : {})
-      });
       return branch;
     });
   }
@@ -784,17 +763,6 @@ export class AgentSession {
   private async restorePending(): Promise<void> {
     this.assertOpen();
     if (this.restored) return;
-    if (this.options.notes) {
-      const replay = await this.options.repository.loadReplayState(this.options.descriptor);
-      for (const entry of replay.branch) {
-        if (entry.type !== 'branch' || !entry.noteSource) continue;
-        await this.options.notes.fork({
-          scope: { sessionId: this.options.descriptor.id, branchId: entry.id },
-          parentScope: entry.noteSource.scope,
-          throughRevision: entry.noteSource.watermark
-        });
-      }
-    }
     const pending = await this.options.repository.loadPendingSubmissions(this.options.descriptor);
     for (const submission of pending) {
       if (submission.state === 'claimed') {

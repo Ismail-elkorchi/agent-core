@@ -615,7 +615,12 @@ async function acceptApprovalRun(runs, runId) {
         toolBatchId: 'batch',
         requestEventId: 'request',
         responseId: 'response',
-        settlementReference: { runId, eventId: 'response-event', sequence: 1, hash: 'a'.repeat(64) },
+        settlementReference: {
+          runId,
+          eventId: 'response-event',
+          sequence: 1,
+          hash: 'a'.repeat(64)
+        },
         effect: settled.state
       }
     ]
@@ -1142,8 +1147,7 @@ test('context transitions commit once without evicting original session records'
     reason: 'Explicit attention boundary',
     selection: {
       strategy: 'sources',
-      retained: view.entries.map((entry) => sourceRef(descriptor.id, entry)),
-      notes: []
+      retained: view.entries.map((entry) => sourceRef(descriptor.id, entry))
     }
   };
   const agent = new AgentSession({
@@ -1723,21 +1727,39 @@ test('closing a session stops its active run without dispatching or discarding q
   await reopened.close();
 });
 
-
-test('context suspension persists its exact conflict and append indexes follow encoded bytes', async t => {
+test('context suspension persists its exact conflict and append indexes follow encoded bytes', async (t) => {
   const rootDir = await mkdtemp(path.join(tmpdir(), 'context-suspension-record-'));
   t.after(() => rm(rootDir, { recursive: true, force: true }));
   const repository = new JsonlSessionRepository({ rootDir });
-  const session = await repository.create({ id: 'context-conflict', binding: TEST_SESSION_BINDING });
-  const conflict = { kind: 'provider_capacity', inputIdentity: 'sha256:original-request',
-    message: 'The provider rejected this input. Preserve résumé and 原文.', estimatedInputTokens: 12000,
-    contextTokens: 10000, outputReservation: 2000, reasoningReservation: 0,
-    actions: ['select_sources', 'reduce_reservation', 'change_model', 'cancel'] };
-  await repository.enqueueSubmission(session, { submissionId: 'input', runId: 'run',
-    input: { task: 'Continue the original work.' }, configuration: { provider: 'test', model: 'model' } });
+  const session = await repository.create({
+    id: 'context-conflict',
+    binding: TEST_SESSION_BINDING
+  });
+  const conflict = {
+    kind: 'provider_capacity',
+    inputIdentity: 'sha256:original-request',
+    message: 'The provider rejected this input. Preserve résumé and 原文.',
+    estimatedInputTokens: 12000,
+    contextTokens: 10000,
+    outputReservation: 2000,
+    reasoningReservation: 0,
+    actions: ['select_sources', 'reduce_reservation', 'change_model', 'cancel']
+  };
+  await repository.enqueueSubmission(session, {
+    submissionId: 'input',
+    runId: 'run',
+    input: { task: 'Continue the original work.' },
+    configuration: { provider: 'test', model: 'model' }
+  });
   await repository.transitionSubmission(session, 'input', { state: 'claimed' });
-  const suspension = { runId: 'run', submissionId: 'input', category: 'context_admission',
-    reason: 'context_admission', actions: ['context', 'abort'], contextAdmission: conflict };
+  const suspension = {
+    runId: 'run',
+    submissionId: 'input',
+    category: 'context_admission',
+    reason: 'context_admission',
+    actions: ['context', 'abort'],
+    contextAdmission: conflict
+  };
   await repository.transitionSubmission(session, 'input', { state: 'suspended', suspension });
   for (const reader of [repository, new JsonlSessionRepository({ rootDir })]) {
     const pending = await reader.loadPendingSubmissions(session);
@@ -1746,5 +1768,8 @@ test('context suspension persists its exact conflict and append indexes follow e
   await repository.transitionSubmission(session, 'input', { state: 'claimed' });
   await repository.transitionSubmission(session, 'input', { state: 'completed' });
   assert.deepEqual(await repository.loadPendingSubmissions(session), []);
-  assert.deepEqual(await new JsonlSessionRepository({ rootDir }).loadPendingSubmissions(session), []);
+  assert.deepEqual(
+    await new JsonlSessionRepository({ rootDir }).loadPendingSubmissions(session),
+    []
+  );
 });

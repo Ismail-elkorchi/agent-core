@@ -14,7 +14,6 @@ export { providerFailureText, suspensionMessage, suspensionPresentation } from '
 
 export { copySource, selectedSource } from './copy.js';
 export { historyBookmark, type HistoryBookmark } from './history-bookmark.js';
-export { notesPanel, type NoteReader, type NotesMessage, type NotesState } from './notes.js';
 export { RetainedListPresentation } from './retained-list.js';
 
 export {
@@ -133,7 +132,11 @@ export {
 
 export { loadRecoveredPrompts, recoverDraft } from './prompt-history.js';
 
-export { appendRecalledDrafts, promptsFromHistory, receivePromptRecallQuery } from './prompt-history.js';
+export {
+  appendRecalledDrafts,
+  promptsFromHistory,
+  receivePromptRecallQuery
+} from './prompt-history.js';
 
 export { activityDetails, type ActivityDetail } from './conversation.js';
 export { presentProgress, progressStatusFields, type ProgressPresentation } from './progress.js';

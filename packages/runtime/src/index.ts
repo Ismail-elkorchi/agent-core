@@ -25,7 +25,12 @@ export * from './inference/native-steering.js';
 export * from './inference/repository.js';
 export * from './inference/service.js';
 export * from './inference/usage-cost.js';
-export * from './notes/index.js';
+export type {
+  WorkingStateChange,
+  WorkingStateInference,
+  WorkingStateSnapshot,
+  SessionWorkingStateEntry
+} from './session/working-state.js';
 export {
   ToolCallExecutor,
   type ToolCallStepResult,
@@ -50,7 +55,6 @@ export {
 } from './session/submission-lifecycle.js';
 
 export * from './history/history-search.js';
-export * from './notes/session-notes.js';
 export * from './session/event-delivery.js';
 export * from './session/progress.js';
 

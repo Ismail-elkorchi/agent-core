@@ -33,6 +33,8 @@ export interface HistorySearchRequest {
   readonly maxScanned?: number | undefined;
 }
 export interface HistoryItem {
+  /** Generated interpretations remain distinct from original contributions and evidence. */
+  readonly generated?: true;
   readonly source: HistorySourceRef;
   readonly type: SessionBranchEntry['type'];
   readonly role: 'user' | 'assistant' | 'tool' | 'control';

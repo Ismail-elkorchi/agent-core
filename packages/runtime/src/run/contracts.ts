@@ -252,6 +252,7 @@ export interface AgentTurnSnapshotRecord {
 
 /** The immutable request truth created only after every dynamic input has resolved. */
 export interface InferenceRequestFingerprintRecord extends AgentTurnIdentity {
+  readonly workingStateRevisionId: string | null;
   readonly parentRequestId?: string;
   readonly compiledInputIdentity: string;
   readonly capabilityRevision: string;
@@ -271,7 +272,10 @@ export interface LogicalModelRequestRecord extends AgentTurnIdentity {
 }
 
 export type AgentCompletedTerminationReason =
-  'model_completed' | 'model_output_limit' | 'content_filtered' | 'unknown_model_termination';
+  | 'model_completed'
+  | 'model_output_limit'
+  | 'content_filtered'
+  | 'unknown_model_termination';
 export type AgentFailureTerminationReason =
   | Exclude<AgentCompletedTerminationReason, 'model_completed'>
   | 'empty_response'
@@ -313,12 +317,15 @@ export type AgentAbortedTerminalSnapshot = AgentTerminalBase &
   Readonly<{
     readonly executionStatus: 'aborted';
     readonly modelOutput:
-      AgentAbsentModelOutput | (AgentPresentModelOutput & { readonly status: 'partial' });
+      | AgentAbsentModelOutput
+      | (AgentPresentModelOutput & { readonly status: 'partial' });
     readonly terminationReason: 'aborted';
     readonly errorMessage: string;
   }>;
 export type AgentTerminalSnapshot =
-  AgentCompletedTerminalSnapshot | AgentFailedTerminalSnapshot | AgentAbortedTerminalSnapshot;
+  | AgentCompletedTerminalSnapshot
+  | AgentFailedTerminalSnapshot
+  | AgentAbortedTerminalSnapshot;
 export interface AgentDeliveryDiagnostic {
   readonly eventType: string;
   readonly message: string;

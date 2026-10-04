@@ -18,9 +18,9 @@
 ## Context and observations
 
 - Committed observations and authorized artifacts are independent of model presentations. Shortening cannot alter authoritative values or conceal incomplete coverage. Preserve integrity, redaction, and access boundaries.
-- Preserve original history subject to explicit retention rules. Notes are attributed, revisioned model-authored material; they cannot grant authority, supersede user requirements, or establish verification.
+- Preserve original history subject to explicit retention rules. Working state is attributed, revisioned model-authored material; it cannot grant authority, supersede user requirements, or establish verification.
 - Context changes bind selected sources and representations to compiled request admission. Preserve accepted contributions, source revisions, complete accounting, and outstanding protocol obligations; reject invalid or oversized requests explicitly.
-- Preserve required provider reasoning, continuation state, call identities, and configuration changes. Enforce compatibility when switching models; do not flatten native state into notes or silently discard it.
+- Preserve required provider reasoning, continuation state, call identities, and configuration changes. Enforce compatibility when switching models; do not flatten native state into working state or silently discard it.
 
 ## Authority and type trust
 

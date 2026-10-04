@@ -33,7 +33,10 @@ import {
   responsesOutput
 } from '@agent-core/provider-openai-responses';
 import { isDeepStrictEqual } from 'node:util';
-import { NativeResponsesConnection, type OpenAIResponsesWebSocketFactory } from './native-connection.js';
+import {
+  NativeResponsesConnection,
+  type OpenAIResponsesWebSocketFactory
+} from './native-connection.js';
 import { aggregateResponses, nativeFailure as failure } from './native-output.js';
 export {
   defaultOpenAIResponsesWebSocketFactory,
@@ -123,7 +126,11 @@ export class NativeResponsesSession implements ModelProviderSession {
   }
   async deliverToolResults(input: ModelToolResultSubmission): Promise<ModelToolResultDelivery> {
     const sourceCalls = Object.freeze(input.sourceCalls.map(parseModelNativeToolCallIdentity));
-    const delivery = await this.submit('tool_results', { ...input, input: input.results }, sourceCalls);
+    const delivery = await this.submit(
+      'tool_results',
+      { ...input, input: [...input.results, ...(input.input ?? [])] },
+      sourceCalls
+    );
     return Object.freeze({ ...delivery, sourceCalls });
   }
   async continueNative(input: ModelNativeContinuation): Promise<ModelNativeDelivery> {
@@ -194,8 +201,12 @@ export class NativeResponsesSession implements ModelProviderSession {
         'Native delivery requires the exact current response on its original connection.'
       );
     if (!this.options?.native)
-      throw failure('invalid_request', 'Native continuation requires host admission before transmission.');
-    if (this.admitting) throw failure('invalid_request', 'A native admission is already in progress.');
+      throw failure(
+        'invalid_request',
+        'Native continuation requires host admission before transmission.'
+      );
+    if (this.admitting)
+      throw failure('invalid_request', 'A native admission is already in progress.');
     if (this.submissions.size >= 4096)
       throw failure('invalid_request', 'Native delivery retention limit reached.');
     if (kind === 'steering') {
@@ -214,9 +225,25 @@ export class NativeResponsesSession implements ModelProviderSession {
         );
       if (this.pendingDeliveries().some((entry) => entry.kind !== 'steering'))
         throw failure('invalid_request', 'A native successor has already been submitted.');
-      if (kind === 'tool_results') this.validateResults(owned.messages, sourceCalls);
-      else if (owned.messages.some((item) => item.role !== 'user' && item.role !== 'control'))
-        throw failure('invalid_request', 'Independent continuation accepts user and configuration inputs.');
+      if (kind === 'tool_results') {
+        this.validateResults(
+          owned.messages.filter((item) => item.role === 'tool'),
+          sourceCalls
+        );
+        if (
+          owned.messages.some(
+            (item) => item.role !== 'tool' && item.role !== 'user' && item.role !== 'control'
+          )
+        )
+          throw failure(
+            'invalid_request',
+            'Additional tool-delivery input accepts background and configuration inputs.'
+          );
+      } else if (owned.messages.some((item) => item.role !== 'user' && item.role !== 'control'))
+        throw failure(
+          'invalid_request',
+          'Independent continuation accepts user and configuration inputs.'
+        );
       const delivered = new Set(sourceCalls.map((call) => call.toolCallId));
       for (const [id, tool] of this.pendingTools) {
         if (!tool.call.async && !tool.deliveryId && !delivered.has(id))
@@ -247,7 +274,10 @@ export class NativeResponsesSession implements ModelProviderSession {
     this.submissions.set(input.deliveryId, entry);
     try {
       if (!(await this.host.nativeSupported(model)))
-        throw failure('invalid_request', 'Native continuation is unsupported by this model/endpoint.');
+        throw failure(
+          'invalid_request',
+          'Native continuation is unsupported by this model/endpoint.'
+        );
       const steering = this.pendingDeliveries().filter(
         (item) => item !== entry && item.kind === 'steering'
       );
@@ -283,7 +313,12 @@ export class NativeResponsesSession implements ModelProviderSession {
       );
       const pendingOutputTokens =
         kind === 'steering' && !active.terminal ? effective.accounting.outputReservation : 0;
-      const compiled = await this.host.compileNativeFrame(logical, body, retainedBody, pendingOutputTokens);
+      const compiled = await this.host.compileNativeFrame(
+        logical,
+        body,
+        retainedBody,
+        pendingOutputTokens
+      );
       entry.compiled = compiled;
       entry.delivery = Object.freeze({ ...entry.delivery, inputIdentity: compiled.inputIdentity });
       assertRequestAccountingFits(compiled.accounting);
@@ -312,7 +347,9 @@ export class NativeResponsesSession implements ModelProviderSession {
       try {
         this.connection.send(compiled.body);
       } catch {
-        this.disconnect(failure('provider_unavailable', 'Connection failed during native transmission.'));
+        this.disconnect(
+          failure('provider_unavailable', 'Connection failed during native transmission.')
+        );
       }
       return entry.delivery;
     } catch (error) {
@@ -335,14 +372,17 @@ export class NativeResponsesSession implements ModelProviderSession {
     input: readonly ModelInputItem[],
     sources: readonly ModelNativeToolCallIdentity[]
   ): void {
-    if (!input.length) throw failure('invalid_request', 'Native tool result delivery cannot be empty.');
+    if (!input.length)
+      throw failure('invalid_request', 'Native tool result delivery cannot be empty.');
     if (sources.length !== input.length)
       throw failure('invalid_request', 'Each result requires its original source call binding.');
     const ids = new Set<string>();
     for (const [index, item] of input.entries()) {
       const source = sources[index];
       const tool =
-        item.role === 'tool' && item.toolCallId ? this.pendingTools.get(item.toolCallId) : undefined;
+        item.role === 'tool' && item.toolCallId
+          ? this.pendingTools.get(item.toolCallId)
+          : undefined;
       if (
         item.role !== 'tool' ||
         !item.toolCallId ||
@@ -353,7 +393,10 @@ export class NativeResponsesSession implements ModelProviderSession {
         item.toolName !== tool.call.name ||
         item.toolCallType !== tool.call.type
       )
-        throw failure('invalid_request', 'Missing or unmatched original native tool result identity.');
+        throw failure(
+          'invalid_request',
+          'Missing or unmatched original native tool result identity.'
+        );
       if (tool.deliveryId || ids.has(item.toolCallId))
         throw failure('invalid_request', 'Native tool result already delivered or reserved.');
       ids.add(item.toolCallId);
@@ -381,7 +424,11 @@ export class NativeResponsesSession implements ModelProviderSession {
         ? withoutDetail
         : delivery
     );
-    if (delivery.status === 'applied' || delivery.status === 'failed' || delivery.status === 'uncertain')
+    if (
+      delivery.status === 'applied' ||
+      delivery.status === 'failed' ||
+      delivery.status === 'uncertain'
+    )
       entry.stage = 'settled';
     this.deliveryEvents.push(this.deliveryEvent(entry));
     this.connection.notify();
@@ -392,7 +439,9 @@ export class NativeResponsesSession implements ModelProviderSession {
   ): AsyncIterable<ModelStreamEvent> {
     this.host.assertCompiled(compiled);
     if (this.busy) throw failure('invalid_request', 'A native response is already active.');
-    if (Array.from(this.submissions.values()).some((entry) => entry.delivery.status === 'uncertain'))
+    if (
+      Array.from(this.submissions.values()).some((entry) => entry.delivery.status === 'uncertain')
+    )
       throw failure(
         'invalid_request',
         'Uncertain native delivery must be reconciled before starting another stream.'
@@ -452,7 +501,10 @@ export class NativeResponsesSession implements ModelProviderSession {
               (response.previous_response_id !== undefined &&
                 response.previous_response_id !== previous.boundary.responseId)
             )
-              throw failure('malformed_response', 'Native successor has no exact completed parent.');
+              throw failure(
+                'malformed_response',
+                'Native successor has no exact completed parent.'
+              );
             const entries = Array.from(this.submissions.values()).filter(
               (entry) =>
                 entry.delivery.responseId === previous.boundary.responseId &&
@@ -525,7 +577,8 @@ export class NativeResponsesSession implements ModelProviderSession {
               (item) => item.kind === 'steering' && item.delivery.providerEventId === steer.id
             ) ??
             this.pendingDeliveries().find(
-              (item) => item.kind === 'steering' && item.delivery.responseId === steer.previous_response_id
+              (item) =>
+                item.kind === 'steering' && item.delivery.responseId === steer.previous_response_id
             );
           if (
             !entry ||
@@ -552,7 +605,10 @@ export class NativeResponsesSession implements ModelProviderSession {
                 );
               return stub.call_id;
             });
-            entry.delivery = Object.freeze({ ...entry.delivery, requiredToolCallIds: Object.freeze(ids) });
+            entry.delivery = Object.freeze({
+              ...entry.delivery,
+              requiredToolCallIds: Object.freeze(ids)
+            });
           }
           this.update(entry, {
             ...entry.delivery,
@@ -562,10 +618,18 @@ export class NativeResponsesSession implements ModelProviderSession {
           });
           continue;
         }
-        if (!this.active) throw failure('malformed_response', 'Native output preceded response.created.');
-        if (event.response_id !== undefined && event.response_id !== this.active.boundary.responseId)
+        if (!this.active)
+          throw failure('malformed_response', 'Native output preceded response.created.');
+        if (
+          event.response_id !== undefined &&
+          event.response_id !== this.active.boundary.responseId
+        )
           throw failure('malformed_response', 'Native event belongs to a different response.');
-        if (event.type === 'response.output_text.delta' && typeof event.delta === 'string' && event.delta) {
+        if (
+          event.type === 'response.output_text.delta' &&
+          typeof event.delta === 'string' &&
+          event.delta
+        ) {
           content += event.delta;
           yield { type: 'content', content: event.delta, accumulated: content };
           continue;
@@ -663,7 +727,9 @@ export class NativeResponsesSession implements ModelProviderSession {
           .filter((tool) => !tool.call.async)
           .map((tool) => tool.source.toolCallId)
       ),
-      pendingToolCalls: Object.freeze(Array.from(this.pendingTools.values()).map((tool) => tool.source)),
+      pendingToolCalls: Object.freeze(
+        Array.from(this.pendingTools.values()).map((tool) => tool.source)
+      ),
       continuation: this.pendingDeliveries().some((entry) => entry.kind === 'steering')
         ? 'automatic'
         : 'client'

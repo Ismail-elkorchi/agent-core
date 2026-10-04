@@ -1,6 +1,6 @@
 # JSON-RPC over stdio
 
-`@agent-core/rpc` exports method contracts, boundary schemas and shared history/notes/session method mappings. `@agent-core/rpc/node` owns the JSONL stream connection. Applications provide authorized operations and their domain methods; neither package requires a particular agent or a daemon.
+`@agent-core/rpc` exports method contracts, boundary schemas and shared history/context/session method mappings. `@agent-core/rpc/node` owns the JSONL stream connection. Applications provide authorized operations and their domain methods; neither package requires a particular agent or a daemon.
 
 JSON-RPC 2.0 objects and nonempty batches are framed as one UTF-8 JSON value followed by LF. CRLF is accepted. Unicode U+2028/U+2029 inside strings are not delimiters. Stdout contains protocol frames only; diagnostics use stderr. Requests and outbound frames are bounded. EOF closes the connection and its application lifetime; it does not promise background execution.
 

@@ -9,3 +9,5 @@ export type {
 export { createContextTools } from './tools.js';
 
 export { contextSelectionSchema, contextTransitionRequestSchema } from './schema.js';
+
+export { createWorkingStateTool } from './working-state-tool.js';

@@ -12,17 +12,14 @@ import {
   ContextService,
   HistoryReader,
   InMemorySessionRepository,
-  InMemoryNoteRepository,
   agentEventCodec,
   createHistoryTools,
-  createNotesTools,
   createContextTools,
   sourceRef
 } from '@agent-core/runtime';
-import { JsonlSessionRepository, JsonlNoteRepository } from '@agent-core/runtime/node';
+import { JsonlSessionRepository } from '@agent-core/runtime/node';
 
 const binding = { schemaId: 'tests/history', schemaVersion: 1, subject: { app: 'neutral' } };
-const scope = { sessionId: 'session', branchId: 'session' };
 const identity = { turnId: 'turn', turnIndex: 1, requestAttempt: 1 };
 function terminal(runId) {
   return {
@@ -49,25 +46,11 @@ function terminal(runId) {
     }
   };
 }
-function writeRequest(overrides = {}) {
-  return {
-    scope,
-    noteId: 'entry',
-    title: 'Working note',
-    mediaType: 'text/markdown',
-    content: 'Hypothesis, not authority.',
-    expectedRevision: null,
-    idempotencyKey: 'write-1',
-    authorId: 'model',
-    invocationId: 'invocation-1',
-    ...overrides
-  };
-}
 async function backend(kind) {
   if (kind === 'memory')
     return {
       sessions: new InMemorySessionRepository(),
-      notes: new InMemoryNoteRepository(),
+      artifacts: new InMemoryArtifactRepository(),
       events: new InMemoryEventRepository(agentEventCodec)
     };
   const root = await mkdtemp(path.join(tmpdir(), 'agent-history-'));
@@ -75,7 +58,6 @@ async function backend(kind) {
   return {
     root,
     sessions: new JsonlSessionRepository(path.join(root, 'sessions')),
-    notes: new JsonlNoteRepository({ rootDir: path.join(root, 'notes'), artifacts }),
     events: new JsonlEventRepository({
       rootDir: path.join(root, 'events'),
       codec: agentEventCodec
@@ -196,143 +178,6 @@ for (const kind of ['memory', 'jsonl']) {
       'outside_scope'
     );
   });
-
-  test(`${kind}: note CAS, idempotency, pinned inheritance, tombstones and exact historical reads`, async () => {
-    const { notes } = await backend(kind);
-    const initial = await notes.write(writeRequest());
-    assert.equal(initial.status, 'committed');
-    const retry = await notes.write(writeRequest());
-    assert.equal(retry.revision.revisionId, initial.revision.revisionId);
-    await assert.rejects(
-      notes.write(writeRequest({ content: 'conflicting retry' })),
-      /idempotency/u
-    );
-    const concurrent = await Promise.all([
-      notes.write(
-        writeRequest({
-          expectedRevision: initial.revision.revisionId,
-          idempotencyKey: 'left',
-          content: 'left'
-        })
-      ),
-      notes.write(
-        writeRequest({
-          expectedRevision: initial.revision.revisionId,
-          idempotencyKey: 'right',
-          content: 'right'
-        })
-      )
-    ]);
-    assert.equal(concurrent.filter((result) => result.status === 'committed').length, 1);
-    assert.equal(concurrent.filter((result) => result.status === 'conflict').length, 1);
-    const parent = (await notes.read({ scope, noteId: 'entry' })).revision;
-    const child = { sessionId: scope.sessionId, branchId: 'child' };
-    await notes.fork({ scope: child, parentScope: scope });
-    const next = await notes.write(
-      writeRequest({
-        expectedRevision: parent.revisionId,
-        idempotencyKey: 'parent-next',
-        content: 'parent only'
-      })
-    );
-    assert.equal(
-      (await notes.read({ scope: child, noteId: 'entry' })).revision.revisionId,
-      parent.revisionId
-    );
-    assert.equal(
-      (await notes.read({ scope: child, noteId: 'entry', revisionId: next.revision.revisionId }))
-        .status,
-      'missing'
-    );
-    const removed = await notes.remove({
-      scope: child,
-      noteId: 'entry',
-      expectedRevision: parent.revisionId,
-      idempotencyKey: 'remove',
-      authorId: 'model',
-      invocationId: 'invocation-2'
-    });
-    assert.equal(removed.status, 'committed');
-    assert.equal((await notes.read({ scope: child, noteId: 'entry' })).status, 'tombstone');
-    assert.equal(
-      (await notes.read({ scope: child, noteId: 'entry', revisionId: parent.revisionId })).status,
-      'available'
-    );
-    assert.equal((await notes.read({ scope, noteId: 'entry' })).text, 'parent only');
-    assert.equal((await notes.list({ scope: child })).items.length, 0);
-    const duplicate = writeRequest({ noteId: 'parallel', idempotencyKey: 'parallel' });
-    const same = await Promise.all([notes.write(duplicate), notes.write(duplicate)]);
-    assert.deepEqual(
-      same.map((result) => result.status),
-      ['committed', 'committed']
-    );
-    assert.equal(same[0].revision.revisionId, same[1].revision.revisionId);
-  });
-
-  test(`${kind}: context commit retains the post-boundary tail and rejects stale input/oversized source selection`, async () => {
-    const { sessions, notes } = await backend(kind);
-    const session = await sessions.create({ id: 'session', binding });
-    const first = await sessions.appendInput(session, {
-      runId: 'one',
-      task: 'original requirement'
-    });
-    await sessions.recordRunFinalization(session, terminal('one'));
-    const history = new HistoryReader({ repository: sessions, session });
-    const note = await notes.write(writeRequest());
-    const service = new ContextService({
-      repository: sessions,
-      session,
-      history,
-      notes,
-      policy: {
-        maxSourceBytes: 16 * 1024,
-        historyRead: { history, isAvailable: () => true }
-      }
-    });
-    const request = {
-      expectedWindowId: null,
-      idempotencyKey: 'transition',
-      reason: 'Use note and retrieve originals',
-      selection: {
-        strategy: 'sources',
-        retained: [],
-        notes: [{ scope, noteId: 'entry', revisionId: note.revision.revisionId }]
-      }
-    };
-    const transition = await service.transition(request);
-    assert.equal((await service.transition(request)).id, transition.id);
-    const later = await sessions.appendInput(session, {
-      runId: 'two',
-      task: 'later correction must survive'
-    });
-    const view = await history.page();
-    assert.equal((await history.selectedContext()).windowId, transition.window.windowId);
-    assert.ok(view.entries.some((entry) => entry.id === later.id));
-    assert.equal(
-      (await history.read({ source: sourceRef(session.id, first) })).status,
-      'available'
-    );
-    await assert.rejects(service.transition({ ...request, idempotencyKey: 'stale' }), /stale/u);
-    const tiny = new ContextService({
-      repository: sessions,
-      session,
-      policy: { maxSourceBytes: 1 }
-    });
-    await assert.rejects(
-      tiny.transition({
-        expectedWindowId: transition.window.windowId,
-        idempotencyKey: 'oversized',
-        reason: 'test',
-        selection: {
-          strategy: 'sources',
-          retained: view.entries.map((entry) => sourceRef(session.id, entry)),
-          notes: []
-        }
-      }),
-      /source bound/u
-    );
-    assert.equal((await history.selectedContext()).windowId, transition.window.windowId);
-  });
 }
 
 for (const kind of ['memory', 'jsonl']) {
@@ -409,6 +254,7 @@ test('context validation releases the session queue and accepted queued input ma
     release = resolve;
   });
   const context = new ContextService({
+    artifacts: new InMemoryArtifactRepository(),
     repository: sessions,
     session,
     policy: { maxSourceBytes: 8192 }
@@ -432,7 +278,7 @@ test('context validation releases the session queue and accepted queued input ma
       expectedWindowId: null,
       idempotencyKey: 'pending',
       reason: 'capture',
-      selection: { strategy: 'sources', retained: [sourceRef(session.id, first)], notes: [] }
+      selection: { strategy: 'sources', retained: [sourceRef(session.id, first)] }
     },
     {
       admit: async () => {
@@ -459,103 +305,6 @@ test('context validation releases the session queue and accepted queued input ma
   assert.equal((await sessions.loadReplayState(session)).contextWindow, undefined);
 });
 
-test('context requires available scoped retrieval before omissions and checks exact note artifact availability', async () => {
-  const sessions = new InMemorySessionRepository();
-  const artifacts = new InMemoryArtifactRepository();
-  const notes = new InMemoryNoteRepository({ artifacts });
-  const session = await sessions.create({ id: scope.sessionId, binding });
-  const first = await sessions.appendInput(session, { runId: 'one', task: 'Original authority' });
-  await sessions.recordRunFinalization(session, terminal('one'));
-  const history = new HistoryReader({ repository: sessions, session });
-  const selection = {
-    strategy: 'sources',
-    retained: [],
-    notes: []
-  };
-  const unavailable = new ContextService({
-    repository: sessions,
-    session,
-    history,
-    policy: {
-      maxSourceBytes: 8192,
-      historyRead: { history, isAvailable: () => false }
-    }
-  });
-  await assert.rejects(
-    unavailable.transition({
-      expectedWindowId: null,
-      idempotencyKey: 'no-tools',
-      reason: 'test',
-      selection
-    }),
-    /read capability/u
-  );
-  const written = await notes.write(writeRequest());
-  artifacts.readVerified = async () => {
-    throw new Error('Artifact lost');
-  };
-  assert.equal((await notes.read({ scope, noteId: 'entry' })).status, 'artifact_unavailable');
-  const context = new ContextService({
-    repository: sessions,
-    session,
-    history,
-    notes,
-    policy: {
-      maxSourceBytes: 8192,
-      historyRead: { history, isAvailable: () => true }
-    }
-  });
-  await assert.rejects(
-    context.transition({
-      expectedWindowId: null,
-      idempotencyKey: 'missing-artifact',
-      reason: 'test',
-      selection: {
-        ...selection,
-        notes: [{ scope, noteId: 'entry', revisionId: written.revision.revisionId }]
-      }
-    }),
-    /artifact is unavailable/u
-  );
-});
-
-test('note quotas include all revisions; bounded search cursors pin revisions and reject a different scope', async () => {
-  const notes = new InMemoryNoteRepository({
-    quotas: { maxNoteBytes: 32, maxTotalBytes: 48, maxRevisions: 3 }
-  });
-  await notes.write(writeRequest({ noteId: 'a', content: 'abc', idempotencyKey: 'a' }));
-  await notes.write(writeRequest({ noteId: 'b', content: 'def', idempotencyKey: 'b' }));
-  const page = await notes.list({ scope, limit: 1 });
-  assert.equal(page.coverage, 'partial');
-  await notes.write(writeRequest({ noteId: 'c', content: 'ghi', idempotencyKey: 'c' }));
-  const next = await notes.list({ scope, limit: 10, cursor: page.cursor });
-  assert.deepEqual(
-    next.items.map((item) => item.noteId),
-    ['b']
-  );
-  await assert.rejects(
-    notes.list({ scope: { ...scope, branchId: 'other' }, cursor: page.cursor }),
-    /scope/u
-  );
-  await assert.rejects(
-    notes.write(writeRequest({ noteId: 'd', content: 'too many', idempotencyKey: 'd' })),
-    /quota/u
-  );
-  const json = new InMemoryNoteRepository();
-  const committed = await json.write(
-    writeRequest({
-      mediaType: 'application/json',
-      content: { hypothesis: false, details: ['not instructions'] }
-    })
-  );
-  assert.deepEqual(
-    JSON.parse(
-      (await json.read({ scope, noteId: 'entry', revisionId: committed.revision.revisionId })).text
-    ),
-    { hypothesis: false, details: ['not instructions'] }
-  );
-});
-
 test('small UTF-8 ranges fail explicitly instead of returning an endless empty cursor', async () => {
   const sessions = new InMemorySessionRepository();
   const session = await sessions.create({ binding });
@@ -568,231 +317,6 @@ test('small UTF-8 ranges fail explicitly instead of returning an endless empty c
   const range = await history.read({ source: sourceRef(session.id, entry), maxBytes: 4 });
   assert.equal(range.item.text, '改');
   assert.equal(range.nextOffset, 3);
-});
-
-test('JSONL restart observes committed notes/windows and rejects incompatible session format without rewriting data', async () => {
-  const { root, sessions, notes, artifacts } = await backend('jsonl');
-  const session = await sessions.create({ id: scope.sessionId, binding });
-  const entry = await sessions.appendInput(session, {
-    runId: 'run',
-    task: 'retained across restart'
-  });
-  const written = await notes.write(writeRequest());
-  const context = new ContextService({
-    repository: sessions,
-    session,
-    policy: { maxSourceBytes: 8192 }
-  });
-  const committed = await context.transition({
-    expectedWindowId: null,
-    idempotencyKey: 'restart',
-    reason: 'restart',
-    selection: { strategy: 'sources', retained: [sourceRef(session.id, entry)], notes: [] }
-  });
-  const reopened = new JsonlSessionRepository(path.join(root, 'sessions'));
-  assert.equal(
-    (await reopened.loadReplayState(await reopened.open(session.id, binding))).contextWindow
-      .windowId,
-    committed.window.windowId
-  );
-  const reopenedNotes = new JsonlNoteRepository({ rootDir: path.join(root, 'notes'), artifacts });
-  assert.equal(
-    (await reopenedNotes.read({ scope, noteId: 'entry' })).revision.revisionId,
-    written.revision.revisionId
-  );
-  const original = await readFile(sessions.location(session.id), 'utf8');
-  const old = original.replace('"format":"agent-core.session/2",', '');
-  await writeFile(sessions.location(session.id), old);
-  await assert.rejects(
-    new JsonlSessionRepository(path.join(root, 'sessions')).open(session.id, binding),
-    /Incompatible session format/u
-  );
-  assert.equal(await readFile(sessions.location(session.id), 'utf8'), old);
-});
-
-test('tool factories bind effects to host scope and context handlers schedule without committing a window', async () => {
-  const sessions = new InMemorySessionRepository();
-  const session = await sessions.create({ id: scope.sessionId, binding });
-  const history = new HistoryReader({ repository: sessions, session });
-  const notes = new InMemoryNoteRepository();
-  const scheduled = [];
-  const context = new ContextService({
-    repository: sessions,
-    session,
-    history,
-    policy: { maxSourceBytes: 8192 }
-  });
-  context.bindRuntime({
-    providerTransform: false,
-    async schedule(request) {
-      scheduled.push(request);
-      return { requestId: request.idempotencyKey };
-    }
-  });
-  assert.deepEqual(
-    createHistoryTools({ history }).map((tool) => tool.name),
-    ['history_read', 'history_search']
-  );
-  const writes = createNotesTools({ repository: notes, scope });
-  const write = writes.find((tool) => tool.name === 'notes_write');
-  const decoded = write.decodeInput({
-    kind: 'json',
-    value: {
-      noteId: 'tool-note',
-      title: 'note',
-      mediaType: 'text/plain',
-      content: 'model hypothesis',
-      expectedRevision: null
-    }
-  });
-  assert.equal(decoded.ok, true);
-  const canonical = await write.canonicalizeInput(decoded.input, {});
-  const effects = await write.deriveEffects(canonical, {});
-  assert.deepEqual(effects.accesses, [{ mode: 'write', scope: 'notes/session/session/tool-note' }]);
-  const toolContext = {
-    policy: {},
-    invocation: { runId: 'run', ...identity, toolBatchId: 'batch', callIndex: 0, toolAttempt: 1 }
-  };
-  const result = await (await write.bindExecution(canonical, {})).invoke(toolContext);
-  assert.equal(result.output.status, 'committed');
-  assert.equal(
-    (await (await write.bindExecution(canonical, {})).invoke(toolContext)).output.revision
-      .revisionId,
-    result.output.revision.revisionId
-  );
-  assert.equal(
-    write.decodeInput({
-      kind: 'json',
-      value: { ...decoded.input, scope: { sessionId: 'other', branchId: 'other' } }
-    }).ok,
-    false
-  );
-  const tool = createContextTools({ context }).find((item) => item.name === 'context_transition');
-  const decodedTransition = tool.decodeInput({
-    kind: 'json',
-    value: {
-      reason: 'test',
-      selection: { strategy: 'sources', retained: [], notes: [] }
-    }
-  });
-  await (
-    await tool.bindExecution(await tool.canonicalizeInput(decodedTransition.input, {}), {})
-  ).invoke(toolContext);
-  assert.equal(scheduled.length, 1);
-  assert.equal(await history.selectedContext(), undefined);
-});
-
-test('note artifact reservations survive a failed store and prevent quota bypass on restart', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'note-reservation-'));
-  const artifacts = new InMemoryArtifactRepository();
-  const store = artifacts.storeProtected.bind(artifacts);
-  artifacts.storeProtected = async () => {
-    throw new Error('crash before artifact commit');
-  };
-  const options = {
-    rootDir: root,
-    artifacts,
-    quotas: { maxTotalBytes: 10, maxNoteBytes: 10, maxRevisions: 2 }
-  };
-  const notes = new JsonlNoteRepository(options);
-  await assert.rejects(notes.write(writeRequest({ content: '12345678' })), /crash/u);
-  artifacts.storeProtected = store;
-  const recovered = new JsonlNoteRepository(options);
-  await assert.rejects(
-    recovered.write(writeRequest({ noteId: 'other', content: '345', idempotencyKey: 'different' })),
-    /quota/u
-  );
-  const committed = await recovered.write(writeRequest({ content: '12345678' }));
-  assert.equal(committed.status, 'committed');
-  assert.equal(
-    (await recovered.write(writeRequest({ content: '12345678' }))).revision.revisionId,
-    committed.revision.revisionId
-  );
-});
-
-test('a crash between session fork and note fork restores the pinned parent revision', async () => {
-  const { root, sessions, notes, artifacts } = await backend('jsonl');
-  const session = await sessions.create({ id: scope.sessionId, binding });
-  const source = await sessions.appendInput(session, { runId: 'run', task: 'branch boundary' });
-  await sessions.recordRunFinalization(session, terminal('run'));
-  const first = await notes.write(writeRequest());
-  const watermark = (await notes.list({ scope })).watermark;
-  const branch = await sessions.branchFrom(session, source.id, 'crash-gap', { scope, watermark });
-  await notes.write(
-    writeRequest({
-      content: 'parent change after fork',
-      expectedRevision: first.revision.revisionId,
-      idempotencyKey: 'later'
-    })
-  );
-  const restartedSessions = new JsonlSessionRepository(path.join(root, 'sessions'));
-  const restartedNotes = new JsonlNoteRepository({ rootDir: path.join(root, 'notes'), artifacts });
-  const agent = new AgentSession({
-    descriptor: await restartedSessions.open(session.id, binding),
-    expectedBinding: binding,
-    repository: restartedSessions,
-    notes: restartedNotes,
-    runs: new AgentRunCoordinator(
-      new InMemoryEventRepository(agentEventCodec),
-      new InMemoryArtifactRepository()
-    ),
-    configuration: { provider: 'test', model: 'test' },
-    createRuntime() {
-      throw new Error('No run');
-    }
-  });
-  await agent.restore();
-  const inherited = await restartedNotes.read({
-    scope: { sessionId: scope.sessionId, branchId: branch.id },
-    noteId: 'entry'
-  });
-  assert.equal(inherited.revision.revisionId, first.revision.revisionId);
-  assert.equal(inherited.text, 'Hypothesis, not authority.');
-});
-
-test('schema-bound JSON notes validate before artifact writes and remain generated material', async () => {
-  const artifacts = new InMemoryArtifactRepository();
-  let stores = 0;
-  const store = artifacts.store.bind(artifacts);
-  artifacts.store = (value) => {
-    stores++;
-    return store(value);
-  };
-  const notes = new InMemoryNoteRepository({
-    artifacts,
-    jsonSchemas: {
-      'working-state/1': (value) => {
-        if (
-          typeof value !== 'object' ||
-          value === null ||
-          Array.isArray(value) ||
-          typeof value.hypothesis !== 'string'
-        )
-          throw new Error('hypothesis required');
-        return value;
-      }
-    }
-  });
-  await assert.rejects(
-    notes.write(
-      writeRequest({
-        mediaType: 'application/json',
-        schemaId: 'working-state/1',
-        content: { approval: true }
-      })
-    ),
-    /hypothesis/u
-  );
-  assert.equal(stores, 0);
-  const result = await notes.write(
-    writeRequest({
-      mediaType: 'application/json',
-      schemaId: 'working-state/1',
-      content: { hypothesis: 'inspect the original result' }
-    })
-  );
-  assert.equal(result.revision.schemaId, 'working-state/1');
-  assert.equal(result.revision.authorId, 'model');
 });
 
 test('rebuildable lexical index reports partial coverage and scans new source identities', async () => {
@@ -901,6 +425,7 @@ test('active accepted input and tool-result dependencies cannot be omitted', asy
     observation: { kind: 'result', summary: 'result', output: {} }
   });
   const context = new ContextService({
+    artifacts: new InMemoryArtifactRepository(),
     repository: sessions,
     session,
     policy: { maxSourceBytes: 8192 }
@@ -912,8 +437,7 @@ test('active accepted input and tool-result dependencies cannot be omitted', asy
       reason: 'test',
       selection: {
         strategy: 'sources',
-        retained: [sourceRef(session.id, input), sourceRef(session.id, observation)],
-        notes: []
+        retained: [sourceRef(session.id, input), sourceRef(session.id, observation)]
       }
     }),
     /no matching original call/u
@@ -925,8 +449,7 @@ test('active accepted input and tool-result dependencies cannot be omitted', asy
       reason: 'test',
       selection: {
         strategy: 'sources',
-        retained: [],
-        notes: []
+        retained: []
       }
     }),
     /active accepted or protected input is mandatory/u
@@ -946,14 +469,14 @@ test('native context selection binds only validated host state and rejects calle
     invocationId: 'native-invocation'
   };
   const context = new ContextService({
+    artifacts: new InMemoryArtifactRepository(),
     repository: sessions,
     session,
     policy: { maxSourceBytes: 8192 }
   });
   const selection = {
     strategy: 'provider',
-    retained: [sourceRef(session.id, input)],
-    notes: []
+    retained: [sourceRef(session.id, input)]
   };
   await assert.rejects(
     context.transition({
@@ -1154,6 +677,7 @@ test('context discovery advertises provider transformation only while a capable 
   const sessions = new InMemorySessionRepository();
   const session = await sessions.create({ binding });
   const context = new ContextService({
+    artifacts: new InMemoryArtifactRepository(),
     repository: sessions,
     session,
     policy: { maxSourceBytes: 8192 }
@@ -1183,91 +707,6 @@ async function sourceAfter(reader, source, cut) {
 }
 
 for (const kind of ['memory', 'jsonl']) {
-  test(`${kind}: warm notes refresh only new records and old revision dependencies remain exact`, async (t) => {
-    const { EventNoteRepository, noteEventCodec } = await import('@agent-core/runtime');
-    const root = await mkdtemp(path.join(tmpdir(), 'incremental-notes-'));
-    t.after(async () => {
-      const { rm } = await import('node:fs/promises');
-      await rm(root, { recursive: true, force: true });
-    });
-    let decoded = 0;
-    const codec = {
-      encode: noteEventCodec.encode,
-      decode(value) {
-        decoded++;
-        return noteEventCodec.decode(value);
-      }
-    };
-    const events =
-      kind === 'memory'
-        ? new InMemoryEventRepository(codec)
-        : new JsonlEventRepository({ rootDir: root, codec });
-    events.read = () => {
-      throw new Error('Notes must not replay their stream.');
-    };
-    const notes = new EventNoteRepository({ events, artifacts: new InMemoryArtifactRepository() });
-    let revision;
-    for (let at = 0; at < 80; at++) {
-      const result = await notes.write(
-        writeRequest({
-          noteId: `note-${at}`,
-          content: `original ${at}`,
-          idempotencyKey: `create-${at}`
-        })
-      );
-      if (at === 0) revision = result.revision;
-    }
-    await notes.list({ scope });
-    const before = decoded;
-    const changed = await notes.write(
-      writeRequest({
-        noteId: revision.noteId,
-        expectedRevision: revision.revisionId,
-        content: 'new text',
-        idempotencyKey: 'update'
-      })
-    );
-    await notes.list({ scope });
-    assert.equal(decoded - before, 2, 'only reservation and commit are decoded after one write');
-    await notes.remove({
-      scope,
-      noteId: revision.noteId,
-      expectedRevision: changed.revision.revisionId,
-      authorId: 'model',
-      invocationId: 'delete',
-      idempotencyKey: 'delete'
-    });
-    const original = await notes.read({
-      scope,
-      noteId: revision.noteId,
-      revisionId: revision.revisionId
-    });
-    assert.equal(original.status, 'available');
-    assert.equal(original.text, 'original 0');
-    assert.deepEqual(original.revision, revision);
-    assert.equal((await notes.read({ scope, noteId: revision.noteId })).status, 'tombstone');
-    const first = await notes.search({
-      scope,
-      query: 'original',
-      limit: 2,
-      maxScanned: 3,
-      maxScannedBytes: 4096
-    });
-    assert(first.scannedBytes <= 4096);
-    await notes.write(
-      writeRequest({ noteId: 'ahead', content: 'original after cut', idempotencyKey: 'late' })
-    );
-    const continuation = await notes.search({
-      scope,
-      query: 'original',
-      cursor: first.cursor,
-      limit: 2,
-      maxScanned: 3,
-      maxScannedBytes: 4096
-    });
-    assert.equal(continuation.watermark, first.watermark);
-    assert(!continuation.items.some((note) => note.noteId === 'ahead'));
-  });
 }
 
 test('history direct lookup, cut capture and bounded search do not call replay', async (t) => {

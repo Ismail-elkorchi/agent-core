@@ -1,4 +1,5 @@
-import { indexLines, positionOffset, boundedDiffSummary } from './text.js';
+import { applyTextEdits, formatTextRange } from '@agent-core/tools';
+import { boundedDiffSummary } from './text.js';
 import { createHash } from 'node:crypto';
 import type { ToolResultFact } from '@agent-core/tools';
 import { parseJsonObject } from '@agent-core/json';
@@ -12,13 +13,21 @@ import {
 } from '@agent-core/tools';
 import { inspectTextFile, sha256Text, type TextFileData } from '../../core/filesystem.js';
 import { PATCH_JOURNAL_SCOPE, fileScope, rootedFileResource } from '../../core/resources.js';
-import { requireFileAuthority, requireRootedFileAuthority, type FileAuthority } from '../../core/rooted-files.js';
+import {
+  requireFileAuthority,
+  requireRootedFileAuthority,
+  type FileAuthority
+} from '../../core/rooted-files.js';
 import {
   isTextPatchJournal,
   withTextFilePatchJournal,
   type TextPatchJournal
 } from '../../core/text-write.js';
-import { commitFileTransaction, type FileTransactionResult, type FileWritePlan } from '../../core/file-transaction.js';
+import {
+  commitFileTransaction,
+  type FileTransactionResult,
+  type FileWritePlan
+} from '../../core/file-transaction.js';
 import {
   editTextRecoveryPayloadSchema,
   type EditTextFileOutput,
@@ -104,7 +113,7 @@ export async function editText(
   });
   throwIfAborted(context.signal);
   const plan = {
-    writes: planned.flatMap((file) => file.write ? [file.write] : []),
+    writes: planned.flatMap((file) => (file.write ? [file.write] : [])),
     removes: []
   };
   const options = {
@@ -116,7 +125,12 @@ export async function editText(
     ? await commitFileTransaction(root, plan, options)
     : await withTextFilePatchJournal(
         root,
-        requireToolService<TextPatchJournal>(context, 'patchJournal', isTextPatchJournal, 'adopted TextPatchJournal'),
+        requireToolService<TextPatchJournal>(
+          context,
+          'patchJournal',
+          isTextPatchJournal,
+          'adopted TextPatchJournal'
+        ),
         (authority) => commitFileTransaction(root, plan, options, authority),
         context.signal
       );
@@ -225,78 +239,25 @@ async function planFile(
         }
       ]
     };
-  const lines = indexLines(file.content);
-  const replacements: { start: number; end: number; replacement: string }[] = [];
-  const changedRanges: EditTextFileOutput['changedRanges'] = [];
-  const diffLines: string[] = [];
-  const failures: { path: string; reason: string; message: string; editIndex?: number }[] = [];
-  let previousStart = -1;
-  let previousEnd = -1;
+  const result = applyTextEdits(file.content, request.edits);
+  if (result.status === 'invalid')
+    return {
+      ok: false,
+      failures: result.failures.map((failure) => ({ path: file.path, ...failure }))
+    };
+  const content = result.content;
   const convention = newlineConvention(file.content);
-  const edits = request.edits.map((edit, editIndex) => ({ edit, editIndex })).sort((left, right) =>
-    left.edit.range.start.line - right.edit.range.start.line
-    || left.edit.range.start.column - right.edit.range.start.column);
-  for (const { editIndex, edit } of edits) {
-    let start: number;
-    let end: number;
-    try {
-      start = positionOffset(file.content, lines, edit.range.start.line, edit.range.start.column);
-      end = positionOffset(file.content, lines, edit.range.end.line, edit.range.end.column);
-    } catch (error) {
-      failures.push({
-        path: file.path,
-        editIndex,
-        reason: 'range_out_of_bounds',
-        message: error instanceof Error ? error.message : String(error)
-      });
-      continue;
-    }
-    if (end < start) {
-      failures.push({
-        path: file.path,
-        editIndex,
-        reason: 'reversed_range',
-        message: 'The half-open range end precedes its start.'
-      });
-      continue;
-    }
-    if (start <= previousStart || start < previousEnd) {
-      failures.push({
-        path: file.path,
-        editIndex,
-        reason: 'overlapping_range',
-        message: 'Edit ranges must not overlap or share an insertion point.'
-      });
-      continue;
-    }
-    const actual = file.content.slice(start, end);
-    if (actual !== edit.expectedText) {
-      failures.push({
-        path: file.path,
-        editIndex,
-        reason: 'expected_text_mismatch',
-        message: `Expected text does not match range ${formatRange(edit.range)} in ${file.path}.`
-      });
-      continue;
-    }
-    previousStart = start;
-    previousEnd = end;
-    replacements.push({ start, end, replacement: edit.replacementText });
-    if (edit.expectedText !== edit.replacementText) {
-      changedRanges.push({
-        range: edit.range,
-        expectedTextSha256: sha256Text(edit.expectedText),
-        replacementTextSha256: sha256Text(edit.replacementText),
-        expectedScalars: Array.from(edit.expectedText).length,
-        replacementScalars: Array.from(edit.replacementText).length
-      });
-      diffLines.push(
-        `${file.path} ${formatRange(edit.range)} ${preview(edit.expectedText)} -> ${preview(edit.replacementText)}`
-      );
-    }
-  }
-  if (failures.length > 0) return { ok: false, failures };
-  const content = compose(file.content, replacements);
+  const changedRanges = result.changedEdits.map((edit) => ({
+    range: edit.range,
+    expectedTextSha256: sha256Text(edit.expectedText),
+    replacementTextSha256: sha256Text(edit.replacementText),
+    expectedScalars: Array.from(edit.expectedText).length,
+    replacementScalars: Array.from(edit.replacementText).length
+  }));
+  const diffLines = result.changedEdits.map(
+    (edit) =>
+      `${file.path} ${formatTextRange(edit.range)} ${preview(edit.expectedText)} -> ${preview(edit.replacementText)}`
+  );
   const newBytes = Buffer.byteLength(content, 'utf8');
   if (newBytes > limits.maxNewBytesPerFile)
     return {
@@ -466,19 +427,6 @@ function editObservedFacts(output: EditTextOutput): ToolResultFact[] {
     }));
 }
 
-function compose(
-  source: string,
-  replacements: readonly { start: number; end: number; replacement: string }[]
-): string {
-  let output = '';
-  let cursor = 0;
-  for (const replacement of replacements) {
-    output += source.slice(cursor, replacement.start) + replacement.replacement;
-    cursor = replacement.end;
-  }
-  return output + source.slice(cursor);
-}
-
 function newlineConvention(content: string): EditTextFileOutput['newlineConvention'] {
   let lf = 0;
   let crlf = 0;
@@ -494,9 +442,7 @@ function preview(value: string): string {
   const scalars = Array.from(value);
   return JSON.stringify(scalars.length <= 80 ? value : scalars.slice(0, 80).join('') + '…');
 }
-function formatRange(range: EditTextRange): string {
-  return `L${String(range.start.line)}:C${String(range.start.column)}-L${String(range.end.line)}:C${String(range.end.column)}`;
-}
+
 function summarize(output: EditTextOutput): string {
   if (output.applicationStatus === 'dry_run')
     return `Validated ${String(output.diffSummary.totalChangedRanges)} localized text replacement${output.diffSummary.totalChangedRanges === 1 ? '' : 's'}; ${String(output.wouldChangePaths.length)} file${output.wouldChangePaths.length === 1 ? '' : 's'} would change.`;

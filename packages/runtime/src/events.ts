@@ -1401,6 +1401,7 @@ function decodeInferenceRequestFingerprint(
   exact(object, [
     ...TURN_KEYS,
     'compiledInputIdentity',
+    'workingStateRevisionId',
     'capabilityRevision',
     'requestId',
     'parentRequestId',
@@ -1413,6 +1414,10 @@ function decodeInferenceRequestFingerprint(
     'modelWindowHash'
   ]);
   return Object.freeze({
+    workingStateRevisionId:
+      object.workingStateRevisionId === null
+        ? null
+        : requiredString(object.workingStateRevisionId, 'workingStateRevisionId'),
     ...decodeTurnIdentity(object),
     compiledInputIdentity: requiredString(
       object.compiledInputIdentity,

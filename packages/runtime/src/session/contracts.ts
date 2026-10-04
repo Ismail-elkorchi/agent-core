@@ -1,3 +1,4 @@
+import type { SessionWorkingStateEntry, WorkingStateChange } from './working-state.js';
 import type { JsonObject, JsonValue } from '@agent-core/json';
 import type {
   ModelOutputItem,
@@ -26,6 +27,7 @@ export type SessionHeader = Readonly<{
   readonly type: 'session';
   readonly version: 1;
   readonly format: 'agent-core.session/2';
+  readonly workingStateStorage: 'session';
   readonly id: string;
   readonly timestamp: string;
   readonly binding: SessionBinding;
@@ -166,10 +168,6 @@ export type SessionBranchMarkerEntry = BaseSessionEntry &
   Readonly<{
     readonly type: 'branch';
     readonly fromEntryId: string;
-    readonly noteSource?: {
-      readonly scope: import('../notes/contracts.js').NoteScope;
-      readonly watermark: number;
-    };
     readonly label?: string;
   }>;
 
@@ -186,6 +184,7 @@ export type SessionModelSettingsEntry = BaseSessionEntry &
 export type SessionContextTransitionEntry = BaseSessionEntry &
   Readonly<{
     readonly type: 'context_transition';
+    readonly workingState?: Omit<WorkingStateChange, 'id'> | undefined;
     readonly window: ContextWindowRecord;
     readonly transition: ContextTransitionRecord;
   }>;
@@ -208,7 +207,8 @@ export type SessionBranchEntry =
   | SessionObservationEntry
   | SessionBranchMarkerEntry
   | SessionModelSettingsEntry
-  | SessionContextTransitionEntry;
+  | SessionContextTransitionEntry
+  | SessionWorkingStateEntry;
 
 export type SessionConversationItem =
   | SessionInputEntry
@@ -228,7 +228,8 @@ export interface SessionBranchPoint {
 export interface SessionInputRelationship {
   readonly kind: 'continue' | 'correct' | 'side_question' | 'replace';
   readonly relatedSources?:
-    readonly import('../history/contracts.js').HistorySourceRef[] | undefined;
+    | readonly import('../history/contracts.js').HistorySourceRef[]
+    | undefined;
 }
 
 export interface SessionSubmissionInput {
@@ -259,9 +260,18 @@ export type SessionQueuedSubmission = Readonly<{
 export type SessionSubmissionState = 'claimed' | 'suspended' | 'completed' | 'failed' | 'cancelled';
 
 export type SessionSuspensionCategory =
-  'approval' | 'external_recovery' | 'implementation' | 'context_admission' | 'user_decision';
+  | 'approval'
+  | 'external_recovery'
+  | 'implementation'
+  | 'context_admission'
+  | 'user_decision';
 export type SessionSuspensionAction =
-  'approval' | 'reconcile' | 'resume' | 'decide' | 'context' | 'abort';
+  | 'approval'
+  | 'reconcile'
+  | 'resume'
+  | 'decide'
+  | 'context'
+  | 'abort';
 export interface SessionSuspensionDescriptor {
   readonly contextAdmission?: import('../run/context-admission.js').ContextAdmissionConflict;
   readonly runId: string;
@@ -303,11 +313,14 @@ export type SessionSubmissionUpdate = SessionSubmissionTransitionBase &
   );
 
 export type SessionQueuedSubmissionChange = { readonly expectedInput: SessionSubmissionInput } & (
-  { readonly kind: 'replace'; readonly input: SessionSubmissionInput } | { readonly kind: 'cancel' }
+  | { readonly kind: 'replace'; readonly input: SessionSubmissionInput }
+  | { readonly kind: 'cancel' }
 );
 
 export type SessionSubmissionRecord =
-  SessionQueuedSubmission | SessionSubmissionTransition | SessionSubmissionUpdate;
+  | SessionQueuedSubmission
+  | SessionSubmissionTransition
+  | SessionSubmissionUpdate;
 
 export interface SessionPendingSubmission {
   readonly submissionId: string;
@@ -359,6 +372,7 @@ export interface SessionReplayState {
   readonly branch: readonly SessionBranchEntry[];
   readonly runFinalizations: readonly SessionRunFinalization[];
   readonly contextWindow?: ContextWindowRecord;
+  readonly workingState: SessionWorkingStateEntry | null;
   readonly sourceRevision: number;
   readonly ledgerRunIds: readonly string[];
 }
@@ -392,6 +406,15 @@ export interface SessionRepository {
   open(sessionId: string, expectedBinding: SessionBindingInput): Promise<SessionDescriptor>;
   list(): Promise<readonly SessionSummary[]>;
   loadReplayState(session: SessionDescriptor, leafId?: string | null): Promise<SessionReplayState>;
+  currentWorkingState(
+    session: SessionDescriptor,
+    leafId?: string | null
+  ): Promise<SessionWorkingStateEntry | null>;
+  commitWorkingState(
+    session: SessionDescriptor,
+    change: WorkingStateChange,
+    expectedBranchId: string
+  ): Promise<SessionWorkingStateEntry>;
   sourceSnapshot(
     session: SessionDescriptor,
     leafId?: string | null
@@ -457,8 +480,7 @@ export interface SessionRepository {
   branchFrom(
     session: SessionDescriptor,
     entryId: string,
-    label?: string,
-    noteSource?: SessionBranchMarkerEntry['noteSource']
+    label?: string
   ): Promise<SessionBranchMarkerEntry>;
   recordRunFinalization(
     session: SessionDescriptor,

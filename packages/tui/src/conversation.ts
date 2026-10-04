@@ -1,5 +1,9 @@
 import type { ToolActivityRenderer } from './tools.js';
-import type { AgentProgressEvent, AgentToolDiagnostic, SessionBranchEntry } from '@agent-core/runtime';
+import type {
+  AgentProgressEvent,
+  AgentToolDiagnostic,
+  SessionBranchEntry
+} from '@agent-core/runtime';
 import { decodeToolCall, type ToolCall } from '@agent-core/tools';
 import {
   completedSessionToolActivity,
@@ -75,6 +79,8 @@ export function sessionConversationId(entry: SessionBranchEntry): string {
       return entry.deliveryId === undefined
         ? `session:${entry.id}`
         : `steering:${entry.deliveryId}`;
+    case 'working_state':
+      return `working-state:${entry.id}`;
     case 'context_transition':
       return `session:${entry.window.windowId}`;
     default:
@@ -119,6 +125,8 @@ function sessionEntries(
     }
     case 'observation':
       return [completedSessionToolActivity(current, entry, renderTool)];
+    case 'working_state':
+      return [];
     case 'context_transition':
       return [
         { id, kind: 'notice', tone: 'info', text: `Context changed · ${entry.window.reason}` }
@@ -370,12 +378,19 @@ export function projectToolDiagnostics(
     const id = toolActivityId(diagnostic);
     const current = entries.find((entry) => entry.id === id && entry.kind === 'activity');
     return {
-      id, runId: diagnostic.runId, kind: 'activity', activity: 'tool',
+      id,
+      runId: diagnostic.runId,
+      kind: 'activity',
+      activity: 'tool',
       label: current?.kind === 'activity' ? current.label : diagnostic.toolName,
       status: diagnostic.observation.kind === 'failure' ? 'failed' : 'warning',
       summary: diagnostic.observation.summary,
-      details: [{ id: 'execution', content:
-        `Invocation ${diagnostic.observation.kind}; external execution ${diagnostic.observation.execution?.state ?? 'not established'}.` }]
+      details: [
+        {
+          id: 'execution',
+          content: `Invocation ${diagnostic.observation.kind}; external execution ${diagnostic.observation.execution?.state ?? 'not established'}.`
+        }
+      ]
     };
   });
 }

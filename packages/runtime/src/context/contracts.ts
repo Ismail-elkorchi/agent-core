@@ -1,6 +1,6 @@
 import type { JsonObject } from '@agent-core/json';
 import type { HistorySourceCut, HistorySourceRef } from '../history/contracts.js';
-import type { NoteReference } from '../notes/contracts.js';
+import type { WorkingStateChange } from '../session/working-state.js';
 
 export interface ContextSelection {
   /** Explicit host/user retention across subsequent renewals. */
@@ -15,7 +15,6 @@ export interface ContextSelection {
     | undefined;
 
   readonly retained: readonly HistorySourceRef[];
-  readonly notes: readonly NoteReference[];
   readonly strategy: 'sources' | 'provider';
   readonly providerState?: JsonObject | undefined;
 }
@@ -40,6 +39,8 @@ export interface ContextTransitionRecord {
   readonly committedAt: string;
 }
 export interface ContextTransitionCommit {
+  readonly expectedWorkingStateRevisionId: string | null;
+  readonly workingState?: WorkingStateChange;
   readonly expectedLeafId: string | null;
   readonly expectedSourceRevision: number;
   readonly expectedWindowId: string | null;
