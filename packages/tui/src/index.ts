@@ -10,7 +10,7 @@ export {
 } from './markdown.js';
 export { panel } from './panel.js';
 export { applyPanelResult, mountPanel } from './panel-lifecycle.js';
-export { providerFailureText, suspensionPresentation } from './recovery.js';
+export { providerFailureText, suspensionMessage, suspensionPresentation } from './recovery.js';
 
 export { copySource, selectedSource } from './copy.js';
 export { historyBookmark, type HistoryBookmark } from './history-bookmark.js';

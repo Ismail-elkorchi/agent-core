@@ -2,15 +2,17 @@ import { ModelStreamInterruptedError } from '../orchestration/model-stream.js';
 import { executeEffectLifecycle, type EffectLifecycle } from '@agent-core/effects';
 import { parseJsonObject } from '@agent-core/json';
 import {
-  CompleteRequestEstimator,
+  RequestTokenEstimator,
   ModelProviderError,
   assertRequestAccountingFits,
   createModelRequest,
   modelInputIdentity,
+  observeModelRequest,
   parseModelContextTransformResult,
   parseModelProfile,
   parseModelResponse,
   requestAccountingInputTokens,
+  requestAccountingInputBound,
   type CompiledModelRequest,
   type ModelCompilationOptions,
   type ModelContextTransformResult,
@@ -20,7 +22,8 @@ import {
   type ModelRequest,
   type ModelResponse,
   type ModelStreamEvent,
-  type ModelUsage
+  type ModelUsage,
+  type RequestTokenObservation
 } from '@agent-core/model';
 import {
   InMemoryArtifactRepository,
@@ -152,6 +155,7 @@ interface DurableOperation<T extends { readonly usage?: ModelUsage }> {
 /** One admission ledger, reservation policy, cancellation path, and settlement lifecycle for all inference. */
 export class InferenceService {
   private readonly gateway: InferenceGateway;
+  private tokenObservation: RequestTokenObservation | undefined;
   readonly options: InferenceServiceOptions;
   constructor(options: InferenceServiceOptions);
   constructor(
@@ -192,7 +196,10 @@ export class InferenceService {
     return this.gateway.createSession();
   }
   async compile(request: ModelRequest, profile: ModelProfile, options?: ModelCompilationOptions) {
-    return this.gateway.compile(request, profile, options);
+    return this.gateway.compile(request, profile, {
+      ...(this.tokenObservation ? { tokenObservation: this.tokenObservation } : {}),
+      ...options
+    });
   }
 
   async admit(compiled: CompiledModelRequest, profile: ModelProfile): Promise<void> {
@@ -283,6 +290,7 @@ export class InferenceService {
     const compiled = await provider.compileContextTransform(
       { transformId: input.transformId, request, ...(signal ? { signal } : {}) },
       {
+        ...(this.tokenObservation ? { tokenObservation: this.tokenObservation } : {}),
         outputReservation: requestWindowForModel(
           profile,
           request.maxOutputTokens ?? input.outputReservation
@@ -350,7 +358,15 @@ export class InferenceService {
         },
         extend: (context, compiled) => this.extendNativeInvocation(context, compiled)
       },
-      input
+      {
+        ...input,
+        settled: async (settlement) => {
+          this.tokenObservation = observeModelRequest(
+            settlement.context.compiled, settlement.result.response
+          );
+          await input.settled(settlement);
+        }
+      }
     );
   }
 
@@ -360,20 +376,7 @@ export class InferenceService {
   ): Promise<void> {
     const { repository, artifacts } = this.options;
     await this.admit(compiled, context.profile);
-    const promptTokens = requestAccountingInputTokens(compiled.accounting);
-    const completionTokens =
-      compiled.accounting.outputReservation +
-      (compiled.accounting.pricingSemantics.reasoningIncludedInOutput === false
-        ? compiled.accounting.reasoningReservation
-        : 0);
-    const reservation: InferenceReservation = {
-      promptTokens,
-      completionTokens,
-      cost: calculateInferenceCost(
-        { promptTokens, completionTokens, totalTokens: promptTokens + completionTokens },
-        context.profile.pricing
-      )
-    };
+    const reservation = inferenceReservation(compiled, context.profile, this.options.budget ?? {});
     const fingerprint = (
       await modelInputIdentity({
         identity: ownIdentity(context),
@@ -440,13 +443,15 @@ export class InferenceService {
     startAuthority?: () => Promise<void>
   ): Promise<InferenceResult> {
     const replayed = await this.replayExisting(input, 'generation', parseModelResponse);
-    if (replayed)
+    if (replayed) {
+      if (input.compiled) this.tokenObservation = observeModelRequest(input.compiled, replayed.value);
       return Object.freeze({
         ...chargesAndIdentity(replayed),
         status: 'settled',
         response: replayed.value,
         replayed: true
       });
+    }
     const signal = input.signal ?? input.request.signal;
     signal?.throwIfAborted();
     const profile = parseModelProfile(
@@ -456,7 +461,7 @@ export class InferenceService {
       ...input.request,
       ...(signal ? { signal } : {})
     });
-    const compiled = input.compiled ?? (await this.gateway.compile(request, profile, input));
+    const compiled = input.compiled ?? (await this.compile(request, profile, input));
     const session = input.session ?? this.gateway.createSession();
     let dispatchPromise: Promise<ModelResponse> | undefined;
     let sawOutput = false;
@@ -489,6 +494,7 @@ export class InferenceService {
         },
         decode: parseModelResponse
       });
+      this.tokenObservation = observeModelRequest(compiled, result.value);
       return Object.freeze({
         ...chargesAndIdentity(result),
         status: 'settled',
@@ -554,7 +560,7 @@ export class InferenceService {
       );
     if (hashJson(existing.start.limits) !== hashJson(this.options.budget ?? {}))
       throw new Error('Inference owner budget policy changed after admission.');
-    if (input.profile) {
+    if (input.profile || input.compiled) {
       const record = parseJsonObject(
         JSON.parse(
           new TextDecoder().decode(await artifacts.readVerified(existing.start.requestRef))
@@ -566,7 +572,9 @@ export class InferenceService {
           maxTotalBytes: 64 * 1024 * 1024
         }
       );
-      if (
+      if (input.compiled && record.inputIdentity !== input.compiled.inputIdentity)
+        throw new Error('Inference input differs from its captured admission.');
+      if (input.profile &&
         (await modelInputIdentity(parseModelProfile(record.profile))) !==
         (await modelInputIdentity(parseModelProfile(input.profile)))
       )
@@ -634,24 +642,7 @@ export class InferenceService {
         sourceFingerprint
       })
     ).slice(7);
-    const promptTokens = requestAccountingInputTokens(compiled.accounting);
-    const completionTokens =
-      compiled.accounting.outputReservation +
-      (compiled.accounting.pricingSemantics.reasoningIncludedInOutput === false
-        ? compiled.accounting.reasoningReservation
-        : 0);
-    const reservation: InferenceReservation = {
-      promptTokens,
-      completionTokens,
-      cost: calculateInferenceCost(
-        {
-          promptTokens,
-          completionTokens,
-          totalTokens: promptTokens + completionTokens
-        },
-        profile.pricing
-      )
-    };
+    const reservation = inferenceReservation(compiled, profile, this.options.budget ?? {});
     let start: Extract<InferenceEvent, { type: 'inference.started' }>;
     for (;;) {
       signal?.throwIfAborted();
@@ -740,7 +731,7 @@ export class InferenceService {
       });
       const estimatedOutput = value.usage
         ? 0
-        : new CompleteRequestEstimator().estimateText(JSON.stringify(value));
+        : new RequestTokenEstimator().estimateText(JSON.stringify(value));
       let settlement: Extract<InferenceEvent, { type: 'inference.settled' }>;
       for (;;) {
         const state = await repository.load(identity.ownerId, {
@@ -947,6 +938,33 @@ function assertCompiledProfile(compiled: CompiledModelRequest, profile: ModelPro
   )
     throw new Error('Compiled inference changed the admitted model or capability revision.');
 }
+function inferenceReservation(
+  compiled: CompiledModelRequest,
+  profile: ModelProfile,
+  budget: InferenceBudget
+): InferenceReservation {
+  const accounting = compiled.accounting;
+  const needsInputBound = accounting.unknownComponents.length > 0 &&
+    (budget.maxPromptTokens !== undefined ||
+      (budget.maxKnownCost !== undefined && profile.pricing?.currency === budget.maxKnownCost.currency));
+  const promptTokens = needsInputBound
+    ? requestAccountingInputBound(accounting)
+    : requestAccountingInputTokens(accounting);
+  if (promptTokens === undefined)
+    throw new Error(
+      'Unquantified input under an explicit token or cost budget requires provider counting or a finite model input bound.'
+    );
+  const completionTokens = accounting.outputReservation +
+    (accounting.pricingSemantics.reasoningIncludedInOutput === false ? accounting.reasoningReservation : 0);
+  return {
+    promptTokens,
+    completionTokens,
+    cost: calculateInferenceCost(
+      { promptTokens, completionTokens, totalTokens: promptTokens + completionTokens }, profile.pricing
+    )
+  };
+}
+
 function assertBudget(
   state: InferenceOwnerState,
   next: InferenceReservation,

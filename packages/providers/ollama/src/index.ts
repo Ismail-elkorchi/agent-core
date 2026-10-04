@@ -4,7 +4,7 @@ import {
   assertProviderContextCompatible,
   type CompiledModelRequest,
   compileModelRequest,
-  CompleteRequestEstimator,
+  RequestTokenEstimator,
   conservativeProtocolCapabilities,
   createProviderContextState,
   type ModelCapabilities,
@@ -252,6 +252,7 @@ export class OllamaProvider implements ModelProvider {
     const cached = this.compiledRequests.get(request);
     if (
       cached &&
+      (options?.tokenObservation === undefined || cached.accounting.method.name === 'provider-count') &&
       (options === undefined || options.outputReservation === cached.accounting.outputReservation)
     )
       return cached;
@@ -502,7 +503,7 @@ export class OllamaProvider implements ModelProvider {
           requestId: 'ollama-response',
           kind: 'ollama.thinking',
           data: { thinking: responseReasoning },
-          tokenEstimate: new CompleteRequestEstimator().estimateText(responseReasoning)
+          tokenEstimate: new RequestTokenEstimator().estimateText(responseReasoning)
         })
       });
     if (content || fallbackContent) output.push({ type: 'text', text: content || fallbackContent });

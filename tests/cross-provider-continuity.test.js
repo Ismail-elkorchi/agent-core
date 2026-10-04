@@ -86,7 +86,7 @@ for (const id of providerIds) {
 }
 
 for (const id of ['openai', 'openai-codex', 'openrouter']) {
-  test(`${id} keeps the window when opaque replay state cannot be accounted`, async () => {
+  test(`${id} continues with original opaque replay state after runtime recreation`, async () => {
     const sessions = new InMemorySessionRepository();
     const session = await sessions.create({ binding: { schemaId: 'tests/continuity', schemaVersion: 1, subject: {} } });
     const artifacts = new InMemoryArtifactRepository();
@@ -105,12 +105,13 @@ for (const id of ['openai', 'openai-codex', 'openrouter']) {
     const first = await new AgentRuntime(options).run({ task: 'Inspect the problem.' }).result;
     assert.equal(first.terminal?.executionStatus, 'completed', JSON.stringify(first));
     const next = await new AgentRuntime(options).run({ task: 'Continue the repair.' }).result;
-    assert.equal(next.state, 'suspended', JSON.stringify(next));
-    assert.equal(next.reason, 'context_admission');
-    assert.equal(bodies.length, 1, 'unknown replay cost is not bypassed by a continuation request');
+    assert.equal(next.terminal?.executionStatus, 'completed', JSON.stringify(next));
+    assert.equal(bodies.length, 2, 'uncertain component costs do not create an auxiliary inference');
+    assert.ok(JSON.stringify(bodies[1]).includes('original-opaque+/='), 'original encrypted state is replayed');
     const inspected = await context.inspect();
     assert.equal(inspected.window, null);
-    assert.match(inspected.admission.message, /unknown token costs/);
+    assert.equal(inspected.admission.status, 'admitted');
+    assert.ok(inspected.admission.accounting.unknownComponents.length > 0, 'uncertainty remains explicit');
     assert.equal((await notes.list({ scope: { sessionId: inspected.cut.sessionId, branchId: inspected.cut.branchId } })).items.length, 0);
   });
 }

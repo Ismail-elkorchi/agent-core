@@ -4,9 +4,12 @@ import {
   accountModelRequest,
   assertRequestAccountingFits,
   compileModelRequest,
-  CompleteRequestEstimator,
+  RequestTokenEstimator,
   createProviderContextState,
   modelInputIdentity,
+  modelOutputToInput,
+  observeModelRequest,
+  requestAccountingInputBound,
   parseModelRequest,
   parseProviderContextState,
   requestAccountingInputTokens
@@ -54,7 +57,7 @@ test('complete accounting includes large empty-text tool arguments and UTF-8 con
   const large = accountModelRequest(request('a'.repeat(100000)), profile);
   assert.ok(large.estimatedInputTokens - short.estimatedInputTokens > 60000);
   assert.ok(large.components.some((item) => item.kind === 'tool_arguments' && item.tokens > 60000));
-  const estimator = new CompleteRequestEstimator();
+  const estimator = new RequestTokenEstimator();
   assert.ok(estimator.estimateItems(request('a'.repeat(100000)).messages) > 60000);
   assert.ok(estimator.estimateText('مرحبا世界') > estimator.estimateText('abcdefg'));
 });
@@ -68,7 +71,7 @@ test('compiled accounting counts its representation once and does not erase user
     body: { model: 'model', messages: input.messages },
     headroomRatio: 0
   });
-  const wire = new CompleteRequestEstimator().estimateText(JSON.stringify(compiled.body));
+  const wire = new RequestTokenEstimator().estimateText(JSON.stringify(compiled.body));
   assert.ok(compiled.accounting.estimatedInputTokens >= wire - 5);
   assert.ok(compiled.accounting.estimatedInputTokens <= wire + 20);
   assert.ok(compiled.accounting.estimatedInputTokens > 8000);
@@ -92,7 +95,7 @@ test('provider input identities validate without invoking accessors and are inde
   await assert.rejects(() => modelInputIdentity({ missing: undefined }), /non-JSON/u);
 });
 
-test('opaque state never becomes zero or ciphertext-byte token accounting', async () => {
+test('opaque state stays explicitly unquantified without blocking ordinary inference', async () => {
   const base = { model: 'model', messages: [{ role: 'user', content: 'hello' }] };
   const state = await createProviderContextState({
     protocolRevision: 'fixture-v1',
@@ -110,11 +113,10 @@ test('opaque state never becomes zero or ciphertext-byte token accounting', asyn
   };
   const accounting = accountModelRequest(logical, profile);
   assert.equal(accounting.unknownComponents.length, 1);
-  assert.throws(() => assertRequestAccountingFits(accounting), /unknown token/u);
-  const allowed = accountModelRequest(logical, profile, { unknownTokenAllowance: 5000 });
-  assert.equal(requestAccountingInputTokens(allowed) - Math.ceil(allowed.estimatedInputTokens * 1.2), 5000);
-  assert.doesNotThrow(() => assertRequestAccountingFits(allowed));
-  assert.throws(() => new CompleteRequestEstimator().estimateItems(logical.messages), /unknown/u);
+  assert.doesNotThrow(() => assertRequestAccountingFits(accounting));
+  assert.equal(requestAccountingInputBound(accounting), 196000);
+  assert.ok(accounting.estimatedInputTokens < 1000, 'ciphertext is not a tokenizer');
+  assert.ok(new RequestTokenEstimator().estimateItems(logical.messages) > 0);
   assert.throws(
     () => parseProviderContextState({ provider: 'test', model: 'model', kind: 'old', data: {} }),
     /format/u
@@ -144,9 +146,7 @@ test('schemas, control updates, media and reasoning reservations participate in 
     reasoning: { strategy: 'budget', maxTokens: 200 },
     maxOutputTokens: 100
   };
-  const accounting = accountModelRequest(parseModelRequest(logical), profile, {
-    unknownTokenAllowance: 1000
-  });
+  const accounting = accountModelRequest(parseModelRequest(logical), profile);
   for (const kind of ['tool_schema', 'response_schema', 'media', 'control'])
     assert.ok(accounting.components.some((item) => item.kind === kind));
   assert.throws(() => assertRequestAccountingFits(accounting), /Reasoning reservation/u);
@@ -300,4 +300,52 @@ test('Responses provider counting resolves preserved encrypted reasoning cost wi
   assert.deepEqual(compiled.body.input[1], native);
   assert.ok(calls[1][1].include.includes('reasoning.encrypted_content'));
   assert.doesNotThrow(() => assertRequestAccountingFits(compiled.accounting));
+});
+
+
+test('observed request usage covers an exact prefix and only estimates additions', async () => {
+  const initial = { model: 'model', messages: [{ role: 'user', content: 'question' }], maxOutputTokens: 100 };
+  const compile = (request, options = {}) => compileModelRequest({ request, profile,
+    endpoint: 'https://test', body: { model: request.model, messages: request.messages },
+    payloadPaths: request.messages.flatMap((item, index) => item.role === 'protocol' ? [['messages', index, 'state', 'data']] : []),
+    ...options });
+  const first = await compile(initial);
+  const state = await createProviderContextState({ provider: 'test', endpoint: first.endpoint,
+    protocolRevision: 'fixture-v1', request: initial, requestId: 'first', kind: 'signed',
+    data: { encrypted: 'x'.repeat(100000) } });
+  const output = [{ type: 'protocol', state }, { type: 'text', text: 'answer' }];
+  const response = { provider: 'test', model: 'model', terminationReason: 'stop', content: 'answer', output,
+    usage: { promptTokens: 100, completionTokens: 20, totalTokens: 120, cacheReadTokens: 50 } };
+  const tokenObservation = observeModelRequest(first, response);
+  const next = { ...initial, messages: [...initial.messages, ...modelOutputToInput(output),
+    { role: 'user', content: 'continue' }] };
+  const compiled = await compile(next, { tokenObservation });
+  assert.equal(compiled.accounting.method.name, 'provider-usage-prefix');
+  assert.equal(compiled.accounting.uncertainty.calibrated, true);
+  assert.equal(compiled.accounting.unknownComponents.length, 0);
+  assert.equal(compiled.accounting.components[0].tokens, 120, 'cache remains in context');
+  assert.ok(compiled.accounting.estimatedInputTokens > 120);
+  assert.deepEqual(compiled.body.messages[1].state, state);
+  assert.equal(requestAccountingInputBound(compiled.accounting), 196000, 'observed usage is not an exact count of the new request');
+  for (const changed of [
+    { ...next, messages: [{ role: 'system', content: 'new guidance' }, ...next.messages] },
+    { ...next, messages: next.messages.slice(1) },
+    { ...next, maxOutputTokens: 200 },
+    { ...next, tools: [{ type: 'function', function: { name: 'new_tool', parameters: {} } }] }
+  ]) {
+    const invalidated = await compile(changed, { tokenObservation });
+    assert.equal(invalidated.accounting.method.name, 'serialized-request-estimate');
+    assert.equal(invalidated.accounting.unknownComponents.length, 1);
+  }
+  const otherEndpoint = await compile(next, { tokenObservation, endpoint: 'https://other' });
+  assert.equal(otherEndpoint.accounting.method.name, 'serialized-request-estimate');
+  assert.equal(otherEndpoint.accounting.unknownComponents.length, 1);
+  const retained = await compile(next, { tokenObservation, retainedBody: { previous_response_id: 'original' } });
+  assert.equal(retained.accounting.method.name, 'serialized-request-estimate');
+  assert.equal(retained.accounting.unknownComponents.length, 1);
+  const counted = await compile(next, { tokenObservation, providerInputTokens: 42 });
+  assert.equal(counted.accounting.method.name, 'provider-count');
+  assert.equal(requestAccountingInputBound(counted.accounting), 42);
+  assert.equal(observeModelRequest(first, { ...response, usage: undefined }), undefined);
+  assert.equal(observeModelRequest(first, { ...response, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } }), undefined);
 });

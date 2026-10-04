@@ -5,7 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
-import { ModelProviderError } from '@agent-core/model';
+import { ModelProviderError, createProviderContextState, compileModelRequest } from '@agent-core/model';
 import {
   AgentRuntime,
   agentEventCodec,
@@ -758,4 +758,33 @@ test('generation allowance is required even when provider output capacity is unk
   const unknown = { ...profile, limits: { contextTokens: 20000 } };
   const result = await service.invoke({ ...input(), profile: unknown, request: { ...request, maxOutputTokens } });
   assert.equal(result.status, 'settled');
+});
+
+
+test('unquantified input stays usable without a budget and reserves its input bound under explicit budgets', async () => {
+  const initial = input().request;
+  const state = await createProviderContextState({ provider: 'fixture', endpoint: 'fixture',
+    protocolRevision: 'test', request: initial, requestId: 'previous', kind: 'opaque',
+    data: { encrypted: 'original-state' } });
+  const request = { ...initial, messages: [...initial.messages, { role: 'protocol', content: '', state }] };
+  let calls = 0;
+  const provider = fixture(async request => { calls++; return response(request); });
+  const service = InferenceService.inMemory({ provider });
+  await service.invoke({ ...input(), request });
+  assert.equal(calls, 1);
+  const repository = new InMemoryInferenceRepository();
+  const bounded = new InferenceService({ provider, repository, artifacts: new InMemoryArtifactRepository(),
+    budget: { maxPromptTokens: 20000 } });
+  await bounded.invoke({ ...input(), request });
+  assert.equal((await repository.load('work', { invocationId: 'one' })).invocation.start.reservation.promptTokens, 19900);
+  const tooSmall = InferenceService.inMemory({ provider, budget: { maxPromptTokens: 100 } });
+  await assert.rejects(tooSmall.invoke({ ...input(), request }), InferenceBudgetExceededError);
+  assert.equal(calls, 2, 'budget rejection grants no dispatch');
+  const noBound = { ...provider, describeModel: async () => ({ ...profile, limits: { outputTokens: 1000 } }) };
+  const unboundedProfile = await noBound.describeModel();
+  const compiled = await compileModelRequest({ request, profile: unboundedProfile, endpoint: 'fixture',
+    body: { messages: request.messages }, payloadPaths: [['messages', 2, 'state']] });
+  await assert.rejects(InferenceService.inMemory({ provider: noBound, budget: { maxPromptTokens: 100 } })
+    .invoke({ ...input(), request, compiled, profile: unboundedProfile }), /finite model input bound/);
+  assert.equal(calls, 2);
 });

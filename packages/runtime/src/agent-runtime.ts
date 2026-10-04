@@ -11,7 +11,7 @@ import {
   unknownEffectExposure
 } from '@agent-core/effects';
 import {
-  CompleteRequestEstimator,
+  RequestTokenEstimator,
   requestAccountingInputTokens,
   ModelContractError,
   parseModelProfile,
@@ -443,7 +443,7 @@ export class AgentRuntime {
   constructor(private readonly options: AgentRuntimeOptions) {
     this.metadata =
       options.metadata === undefined ? undefined : Object.freeze({ ...options.metadata });
-    this.estimator = options.estimator ?? new CompleteRequestEstimator();
+    this.estimator = options.estimator ?? new RequestTokenEstimator();
     this.history =
       options.context?.history ??
       (options.repositories.session
@@ -2477,7 +2477,8 @@ export class AgentRuntime {
               assembly.compiled,
               new Error(
                 'Provider rejected context capacity; adjust selected sources, reservations, or model capacity.'
-              )
+              ),
+              true
             );
           const phase = providerWork(request.run.state(), completedAttempt.identity);
           if (phase.stage !== 'rejected')
@@ -2703,28 +2704,19 @@ export class AgentRuntime {
     const revision = run.state().revision;
     try {
       const assembly = await this.prepareContextAdmission(run, signal, phase.turnIndex);
-      const { accounting, inputIdentity } = assembly.compiled;
-      const previous = phase.conflict;
-      if (
-        inputIdentity === previous.inputIdentity &&
-        accounting.estimatedInputTokens === previous.estimatedInputTokens &&
-        accounting.outputReservation === previous.outputReservation &&
-        accounting.reasoningReservation === previous.reasoningReservation &&
-        accounting.limits.contextTokens === previous.contextTokens &&
-        accounting.limits.maxInputTokens === previous.maxInputTokens
-      ) {
-        this.options.context?.recordAdmission({
-          status: 'blocked',
-          inputIdentity,
-          accounting,
-          message: previous.message
-        });
-        return false;
-      }
-      await run.resumeContextAdmission({
+      const resumed = await run.resumeContextAdmission({
         expectedRevision: revision,
         inputIdentity: assembly.compiled.inputIdentity
       });
+      if (resumed.state.phase.kind === 'suspended') {
+        this.options.context?.recordAdmission({
+          status: 'blocked',
+          inputIdentity: assembly.compiled.inputIdentity,
+          accounting: assembly.compiled.accounting,
+          message: phase.conflict.message
+        });
+        return false;
+      }
       return true;
     } catch (cause) {
       if (cause instanceof ContextAdmissionError || cause instanceof ContextSourceCapacityError)
@@ -2830,17 +2822,11 @@ export class AgentRuntime {
       );
       const result = await assemble(proposed.window, notes);
       await this.requestAdmission.admit(result.compiled, request.snapshot.profile);
-      if (
-        rejected &&
-        (result.compiled.inputIdentity === rejected.inputIdentity ||
-          Buffer.byteLength(JSON.stringify(result.compiled.body)) >=
-            Buffer.byteLength(JSON.stringify(rejected.body)) ||
-          requestAccountingInputTokens(result.compiled.accounting) >
-            requestAccountingInputTokens(rejected.accounting))
-      )
+      if (result.compiled.inputIdentity === rejected?.inputIdentity)
         throw new ContextAdmissionError(
           result.compiled,
-          new Error('Renewal did not reduce the rejected provider input.')
+          new Error('Renewal retained the provider-rejected input.'),
+          true
         );
       const tail = await this.options.repositories.events.tail(request.runId);
       if (
@@ -2900,7 +2886,7 @@ export class AgentRuntime {
     try {
       await this.requestAdmission.admit(result.compiled, request.snapshot.profile);
       if (rejected)
-        throw new ContextAdmissionError(rejected, new Error('Provider rejected context capacity.'));
+        throw new ContextAdmissionError(rejected, new Error('Provider rejected context capacity.'), true);
     } catch (cause) {
       if (!(cause instanceof ContextAdmissionError)) throw cause;
       admissionFailure = cause;
@@ -4418,7 +4404,7 @@ function requestCapacityConflict(
 ): import('./run/context-admission.js').ContextAdmissionConflict {
   const { inputIdentity, accounting } = error.compiled;
   return {
-    kind: 'request_capacity',
+    kind: error.providerRejected ? 'provider_capacity' : 'request_capacity',
     message: error.message,
     inputIdentity,
     estimatedInputTokens: accounting.estimatedInputTokens,

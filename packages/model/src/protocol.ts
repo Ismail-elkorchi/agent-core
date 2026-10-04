@@ -215,7 +215,9 @@ export async function createProviderContextState(options: {
   });
 }
 /** Display and protocol outputs are separate. No hidden state is recovered from raw. */
-export function modelResponseOutput(response: ModelResponse): readonly ModelOutputItem[] {
+export function modelResponseOutput(
+  response: Pick<ModelResponse, 'output' | 'providerState' | 'content' | 'toolCalls'>
+): readonly ModelOutputItem[] {
   if (response.output?.length) return response.output;
   return Object.freeze([
     ...(response.providerState ? [{ type: 'protocol' as const, state: response.providerState }] : []),

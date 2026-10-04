@@ -129,6 +129,7 @@ export class ClaudeProvider implements ModelProvider {
       const cached = this.compiledRequests.get(request);
       if (
         cached &&
+        (options?.tokenObservation === undefined || cached.accounting.method.name === 'provider-count') &&
         (options?.outputReservation === undefined ||
           options.outputReservation === cached.accounting.outputReservation)
       )
@@ -158,6 +159,7 @@ export class ClaudeProvider implements ModelProvider {
         ? await this.countInput(body, request.signal)
         : undefined;
       const compiled = await compileModelRequest({
+        ...options,
         request,
         profile,
         body,

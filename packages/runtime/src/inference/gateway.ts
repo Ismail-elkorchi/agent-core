@@ -48,6 +48,7 @@ export class InferenceGateway {
     const body = { ...request };
     delete body.signal;
     const policy = {
+      ...options,
       outputReservation: requestWindowForModel(
         profile,
         request.maxOutputTokens ?? options?.outputReservation
@@ -61,6 +62,7 @@ export class InferenceGateway {
           ...policy,
           body,
           payloadPaths: request.messages.flatMap((message, messageIndex) => [
+            ...(message.role === 'protocol' ? [['messages', messageIndex, 'state']] : []),
             ...(message.images?.map((_image, imageIndex) => [
               'messages',
               messageIndex,
@@ -69,7 +71,9 @@ export class InferenceGateway {
               'data'
             ]) ?? []),
             ...(message.parts?.flatMap((part, partIndex) =>
-              part.type === 'image' ? [['messages', messageIndex, 'parts', partIndex, 'image', 'data']] : []
+              part.type === 'image'
+                ? [['messages', messageIndex, 'parts', partIndex, 'image', 'data']]
+                : part.type === 'text' ? [] : [['messages', messageIndex, 'parts', partIndex, 'source', 'value']]
             ) ?? [])
           ]),
           endpoint: profile.capabilities.protocol?.endpoint ?? this.provider.id

@@ -42,6 +42,7 @@ import {
 import {
   decodeToolResultDelivery,
   isToolCallStartable,
+  toolWorkResolved,
   type AgentToolCallState,
   type AgentToolPhase,
   type AgentToolResultDelivery,
@@ -647,18 +648,11 @@ export class AgentRunDriver {
           'Context suspension changed during admission.'
         );
       if (
-        state.providerRequests.some(
-          (request) => request.stage !== 'ready' && request.stage !== 'consumed'
-        ) ||
-        state.toolBatches.some(
-          (batch) =>
-            !batch.callStates.every(
-              (call) =>
-                call.stage === 'resolved' || call.stage === 'cancelled' || call.stage === 'recorded'
-            )
-        )
-      )
-        throw new Error('Context admission cannot bypass unresolved provider or tool obligations.');
+        state.phase.conflict.kind === 'provider_capacity' &&
+        state.phase.conflict.inputIdentity === input.inputIdentity
+      ) return this.inspection();
+      if (state.toolBatches.some((batch) => !toolWorkResolved(batch)))
+        throw new Error('Context admission cannot bypass unresolved tool or delivery obligations.');
       this.assertTransitionAuthority({
         kind: 'initializing',
         step: 'assemble_turn',
@@ -1396,14 +1390,4 @@ function replaceAt<T>(values: readonly T[], index: number, value: T): readonly T
   const next = [...values];
   next[index] = value;
   return Object.freeze(next);
-}
-
-function toolWorkResolved(batch: AgentToolPhase): boolean {
-  return batch.callStates.every(
-    (call) =>
-      call.stage === 'resolved' ||
-      call.stage === 'cancelled' ||
-      (call.stage === 'recorded' &&
-        (!batch.source.nativeCatalogIdentity || call.delivery?.status === 'applied'))
-  );
 }

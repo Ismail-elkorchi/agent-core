@@ -46,7 +46,8 @@ export class ContextAdmissionError extends Error {
   ] as const);
   constructor(
     readonly compiled: CompiledModelRequest,
-    cause: unknown
+    cause: unknown,
+    readonly providerRejected = false
   ) {
     super(cause instanceof Error ? cause.message : String(cause), { cause });
     this.name = 'ContextAdmissionError';
@@ -55,9 +56,7 @@ export class ContextAdmissionError extends Error {
 
 /** Capacity is a view of compiled accounting; continuity headroom is a soft reserve. */
 export function requestCapacity(accounting: RequestAccounting, headroom?: number) {
-  let inputTokens: number | undefined;
-  if (!accounting.unknownComponents.length || accounting.unknownTokenAllowance !== undefined)
-    inputTokens = requestAccountingInputTokens(accounting);
+  const inputTokens = requestAccountingInputTokens(accounting);
   const reasoningReservation =
     accounting.pricingSemantics.reasoningIncludedInOutput === false
       ? accounting.reasoningReservation
@@ -70,7 +69,7 @@ export function requestCapacity(accounting: RequestAccounting, headroom?: number
   ].filter((value): value is number => value !== undefined);
   const inputCapacity = inputLimits.length ? Math.max(0, Math.min(...inputLimits)) : undefined;
   const remainingTokens =
-    inputTokens === undefined || inputCapacity === undefined
+    inputCapacity === undefined
       ? undefined
       : Math.max(0, inputCapacity - inputTokens);
   const requestedHeadroom = headroom ?? accounting.outputReservation + reasoningReservation;
@@ -83,7 +82,7 @@ export function requestCapacity(accounting: RequestAccounting, headroom?: number
     inputCapacity === undefined ? requestedHeadroom : Math.floor(inputCapacity / 2)
   );
   return Object.freeze({
-    ...(inputTokens === undefined ? {} : { inputTokens }),
+    inputTokens,
     ...(remainingTokens === undefined ? {} : { remainingTokens }),
     outputReservation: accounting.outputReservation,
     reasoningReservation,

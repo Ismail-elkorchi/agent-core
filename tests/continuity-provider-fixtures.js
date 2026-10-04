@@ -10,7 +10,7 @@ export const continuation = 'Inspection completed; the observed failure is in va
 export const thinking = { type: 'thinking', thinking: 'Private protocol reasoning.', signature: 'original-signature+/=' };
 
 /** Real adapter compilers and decoders, with deterministic local transports. */
-export function continuityProvider(id, { contextTokens = 128_000, respond = () => 'Recorded answer.', bodies = [], opaqueReasoning = false, firstTool } = {}) {
+export function continuityProvider(id, { contextTokens = 128_000, respond = () => 'Recorded answer.', bodies = [], opaqueReasoning = false, countTokens = true, firstTool } = {}) {
   const definition = {
     displayName: 'Continuity fixture',
     capabilities: {
@@ -88,7 +88,7 @@ export function continuityProvider(id, { contextTokens = 128_000, respond = () =
     },
     abort() {}
   }) });
-  if (id === 'claude') return new ClaudeProvider({ apiKey: 'test', modelProfiles, countTokens: true, fetch: async (url, init) => {
+  if (id === 'claude') return new ClaudeProvider({ apiKey: 'test', modelProfiles, countTokens, fetch: async (url, init) => {
     const body = JSON.parse(init.body);
     if (String(url).endsWith('/count_tokens'))
       return Response.json({ input_tokens: Math.ceil(JSON.stringify(body).length / 3) });

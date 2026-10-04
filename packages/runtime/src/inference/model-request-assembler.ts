@@ -1,6 +1,6 @@
 import {
   accountModelRequest,
-  CompleteRequestEstimator,
+  RequestTokenEstimator,
   type ModelInputItem,
   type ModelProfile,
   type RequestEstimator
@@ -52,7 +52,7 @@ export interface ModelRequestAssembly {
 
 export class ModelRequestAssembler {
   constructor(
-    private readonly estimator: RequestEstimator = new CompleteRequestEstimator(),
+    private readonly estimator: RequestEstimator = new RequestTokenEstimator(),
     private readonly artifacts?: ArtifactRepository
   ) {}
 

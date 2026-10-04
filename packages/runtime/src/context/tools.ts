@@ -48,13 +48,12 @@ export function createContextTools(options: {
             estimatedInputTokens: accounting.estimatedInputTokens,
             uncertainty: accounting.uncertainty,
             unknownComponents: accounting.unknownComponents,
-            unknownTokenAllowance: accounting.unknownTokenAllowance,
             outputReservation: accounting.outputReservation,
             outputReservationSource: accounting.outputReservationSource,
             reasoningReservation: accounting.reasoningReservation,
             reasoningIncludedInOutput: parseJsonObject(accounting.pricingSemantics).reasoningIncludedInOutput,
             limits: accounting.limits,
-            inputTokensMeaning: 'Capacity inputTokens = ceil(estimatedInputTokens × (1 + uncertainty.headroomRatio)) + unknownTokenAllowance (zero when absent). Unknown components without an allowance block admission.'
+            inputTokensMeaning: 'Capacity inputTokens = ceil(estimatedInputTokens × (1 + uncertainty.headroomRatio)). Provider counting is exact; compatible provider usage calibrates an unchanged prefix plus estimated additions. Unknown components remain unquantified and do not establish overflow. Unquantified components under an explicit token or cost budget require a finite model input bound. Reservations otherwise use the count or estimate; actual usage settles the invocation.'
           } } : {}),
           selection: window?.selection ?? null,
           protectedSources: result.protectedSources,

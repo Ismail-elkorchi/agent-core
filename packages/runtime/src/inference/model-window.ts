@@ -1,7 +1,8 @@
-import { canonicalJsonString, parseJsonObject } from '@agent-core/json';
+import { canonicalJsonString } from '@agent-core/json';
 import {
-  CompleteRequestEstimator,
+  RequestTokenEstimator,
   modelOutputToInput,
+  modelResponseOutput,
   parseModelInputItem,
   providerContextIncompatibility,
   type ModelImage,
@@ -72,7 +73,7 @@ export class ModelWindow {
   readonly imageLimits: ModelWindowImageLimits;
 
   constructor(
-    estimator: RequestEstimator = new CompleteRequestEstimator(),
+    estimator: RequestEstimator = new RequestTokenEstimator(),
     imageLimits: ModelWindowImageLimits = DEFAULT_MODEL_WINDOW_IMAGE_LIMITS
   ) {
     this.estimator = estimator;
@@ -105,22 +106,8 @@ export class ModelWindow {
   }
 
   recordModelOutput(input: RecordModelOutputInput): void {
-    if (input.output?.length) {
-      for (const item of modelOutputToInput(input.output))
-        this.recordInput(`output_${randomUUID()}`, item, input.turnIndex);
-      return;
-    }
-
-    this.activeItems.push({
-      kind: 'message',
-      id: `hist_${randomUUID()}`,
-      turnIndex: input.turnIndex,
-      message: Object.freeze({
-        role: 'assistant',
-        content: input.content,
-        toolCalls: Object.freeze(input.toolCalls.map(snapshotModelToolCall))
-      })
-    });
+    for (const item of modelOutputToInput(modelResponseOutput(input)))
+      this.recordInput(`output_${randomUUID()}`, item, input.turnIndex);
   }
 
   recordToolResult(input: RecordToolResultInput): void {
@@ -351,21 +338,6 @@ function toolResultMessage(input: RecordToolResultInput): ModelInputItem {
     ...(input.immediateImages && input.immediateImages.length > 0
       ? { images: Object.freeze(input.immediateImages.map(snapshotModelImage)) }
       : {})
-  });
-}
-
-function snapshotModelToolCall(call: ModelToolCall): ModelToolCall {
-  if (call.type === 'function')
-    return Object.freeze({
-      ...call,
-      input: Object.freeze({
-        kind: 'json',
-        value: parseJsonObject(call.input.value)
-      })
-    });
-  return Object.freeze({
-    ...call,
-    input: Object.freeze({ kind: 'text', value: call.input.value })
   });
 }
 

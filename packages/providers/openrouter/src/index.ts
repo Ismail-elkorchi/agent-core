@@ -196,6 +196,7 @@ export class OpenRouterProvider implements ModelProvider {
     const cached = this.compiledRequests.get(request);
     if (
       cached &&
+      (options?.tokenObservation === undefined || cached.accounting.method.name === 'provider-count') &&
       (options === undefined || options.outputReservation === cached.accounting.outputReservation)
     )
       return cached;

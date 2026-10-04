@@ -16,7 +16,9 @@ import {
   type AgentTurnIdentity
 } from '../contracts.js';
 import { assertAgentRunStateInvariants } from './state-invariants.js';
-import { decodeToolPhase, isToolCallStartable, type AgentToolPhase } from './tool-state.js';
+import {
+  decodeToolPhase, isToolCallStartable, toolCallObligationResolved, type AgentToolPhase
+} from './tool-state.js';
 
 export type {
   AgentToolCallPlanRecord,
@@ -401,12 +403,7 @@ export function outstandingToolObligations(state: AgentRunState): readonly Reado
   return Object.freeze(
     state.toolBatches.flatMap((batch) =>
       batch.callStates.flatMap((call, callIndex) => {
-        if (
-          call.stage === 'resolved' ||
-          call.stage === 'cancelled' ||
-          (call.stage === 'recorded' &&
-            (!batch.source.nativeCatalogIdentity || call.delivery?.status === 'applied'))
-        )
+        if (toolCallObligationResolved(call, batch.source.nativeCatalogIdentity))
           return [];
         const modelCall = batch.modelCalls[callIndex];
         return [

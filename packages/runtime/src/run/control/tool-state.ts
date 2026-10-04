@@ -140,6 +140,20 @@ export type AgentToolCallState =
 
 export type AgentToolPhase = Readonly<AgentToolBatchBase>;
 
+export function toolCallObligationResolved(
+  call: AgentToolCallState,
+  nativeCatalogIdentity?: string
+): boolean {
+  return call.stage === 'resolved' || call.stage === 'cancelled' ||
+    (call.stage === 'recorded' && (!nativeCatalogIdentity || call.delivery?.status === 'applied'));
+}
+
+export function toolWorkResolved(batch: AgentToolPhase): boolean {
+  return batch.callStates.every((call) =>
+    toolCallObligationResolved(call, batch.source.nativeCatalogIdentity)
+  );
+}
+
 export function decodeToolPhase(value: unknown): AgentToolPhase {
   const phase = parseJsonObject(value);
   return decodeOwnedToolPhase(phase);

@@ -80,9 +80,7 @@ export class BudgetAccountant {
       outputReserveTokens,
       totalPromptTokens,
       totalRequestTokens: totalPromptTokens + outputReserveTokens,
-      warnings: input.accounting.unknownComponents.map(
-        (part) => part.reason ?? 'Unknown request cost'
-      )
+      warnings: input.accounting.unknownComponents.map((part) => part.reason)
     };
   }
 

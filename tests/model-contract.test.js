@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ModelContractError,
-  CompleteRequestEstimator,
+  RequestTokenEstimator,
   assertModelRequestSupported,
   parseModelProfile,
   parseModelReasoningRequest,
@@ -117,7 +117,7 @@ test('tool-result images validate, require image input support, and consume esti
     modalities: { input: ['text', 'image'], output: ['text'] }
   });
   assert.doesNotThrow(() => assertModelRequestSupported(imageProfile, request));
-  const estimator = new CompleteRequestEstimator();
+  const estimator = new RequestTokenEstimator();
   assert.ok(
     estimator.estimateItems(request.messages) >= estimator.estimateImage(request.messages[0].images[0])
   );

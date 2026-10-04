@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { deliverPromptContext, ModelRequestAssembler, ModelWindow } from '@agent-core/runtime';
-import { CompleteRequestEstimator } from '@agent-core/model';
+import { RequestTokenEstimator } from '@agent-core/model';
 
 const modelProfile = {
   id: 'scripted',
@@ -150,7 +150,7 @@ test('image limits reject the selection instead of silently removing older attac
     { maxCount: 10, maxBytes: 5, maxEstimatedTokens: 10000 },
     { maxCount: 10, maxBytes: 100, maxEstimatedTokens: 2000 }
   ]) {
-    const manager = new ModelWindow(new CompleteRequestEstimator(), limits);
+    const manager = new ModelWindow(new RequestTokenEstimator(), limits);
     for (let i = 1; i <= 3; i++)
       recordImageResult(manager, i, [
         { type: 'bytes', data: new Uint8Array([i, i, i]), mediaType: 'image/png' }

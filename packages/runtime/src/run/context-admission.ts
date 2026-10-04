@@ -20,6 +20,7 @@ interface ContextAdmissionMeasurements {
 export type ContextAdmissionConflict = ContextAdmissionMeasurements &
   (
     | Readonly<{ kind: 'request_capacity' }>
+    | Readonly<{ kind: 'provider_capacity'; inputIdentity: string }>
     | Readonly<{
         kind: 'source_capacity';
         cut: HistorySourceCut;
@@ -153,17 +154,22 @@ export function decodeContextAdmissionConflict(value: unknown): ContextAdmission
     });
   }
   if (
-    object.kind !== 'request_capacity' ||
+    (object.kind !== 'request_capacity' && object.kind !== 'provider_capacity') ||
     object.cut !== undefined ||
     object.bound !== undefined ||
     object.source !== undefined
   )
     throw new TypeError('Incompatible context capacity conflict.');
-  return Object.freeze({
-    kind: 'request_capacity',
+  const requestConflict = {
     message: object.message,
     ...(object.inputIdentity === undefined ? {} : { inputIdentity: object.inputIdentity }),
     ...counts,
     actions: Object.freeze(actions)
-  });
+  };
+  if (object.kind === 'provider_capacity') {
+    if (object.inputIdentity === undefined)
+      throw new TypeError('Provider capacity rejection requires its compiled input identity.');
+    return Object.freeze({ ...requestConflict, kind: 'provider_capacity', inputIdentity: object.inputIdentity });
+  }
+  return Object.freeze({ ...requestConflict, kind: 'request_capacity' });
 }

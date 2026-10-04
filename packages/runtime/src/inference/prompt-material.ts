@@ -1,4 +1,4 @@
-import { CompleteRequestEstimator, type RequestEstimator } from '@agent-core/model';
+import { RequestTokenEstimator, type RequestEstimator } from '@agent-core/model';
 import { randomUUID } from 'node:crypto';
 import { parseSessionImages } from '../session/images.js';
 
@@ -123,7 +123,7 @@ export function decodePromptContextItemInput(value: unknown): PromptContextItemI
 /** Preserve application order; Core does not rerank or silently select a second context set. */
 export function deliverPromptContext(
   inputs: readonly PromptContextItemInput[],
-  estimator: RequestEstimator = new CompleteRequestEstimator()
+  estimator: RequestEstimator = new RequestTokenEstimator()
 ): PromptContextDelivery {
   const ids = new Set<string>();
   const items = inputs.map((input) => materializePromptContextItem(input, estimator));

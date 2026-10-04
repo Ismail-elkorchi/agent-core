@@ -267,6 +267,7 @@ export class OpenAICodexProvider implements ModelProvider {
     if (
       cached &&
       this.compiledRequests.has(cached) &&
+      (options?.tokenObservation === undefined || cached.accounting.method.name === 'provider-count') &&
       (options === undefined || options.outputReservation === cached.accounting.outputReservation)
     )
       return cached;

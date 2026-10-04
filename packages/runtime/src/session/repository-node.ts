@@ -549,9 +549,9 @@ export class JsonlSessionRepository implements SessionRepository {
             type: 'observation',
             ...normalized
           });
-          await appendJsonlRecord(this.filePath(sessionId), parseJsonValue(entry));
+          const writtenBytes = await appendJsonlRecord(this.filePath(sessionId), parseJsonValue(entry));
           state.branchEntries.push(entry);
-          state.completeBytes += recordBytes(entry);
+          state.completeBytes += writtenBytes;
           state.boundaryMarker = await jsonlBoundaryMarker(
             this.filePath(sessionId),
             state.completeBytes
@@ -643,9 +643,9 @@ export class JsonlSessionRepository implements SessionRepository {
             ...(label ? { label } : {}),
             ...(noteSource ? { noteSource: ownBranchNoteSource(noteSource) } : {})
           });
-          await appendJsonlRecord(this.filePath(sessionId), parseJsonValue(entry));
+          const writtenBytes = await appendJsonlRecord(this.filePath(sessionId), parseJsonValue(entry));
           state.branchEntries.push(entry);
-          state.completeBytes += recordBytes(entry);
+          state.completeBytes += writtenBytes;
           state.boundaryMarker = await jsonlBoundaryMarker(
             this.filePath(sessionId),
             state.completeBytes
@@ -704,9 +704,9 @@ export class JsonlSessionRepository implements SessionRepository {
             finalizationId: terminal.finalizationId,
             terminal
           });
-          await appendJsonlRecord(this.filePath(sessionId), finalization);
+          const writtenBytes = await appendJsonlRecord(this.filePath(sessionId), finalization);
           state.finalizations.push(finalization);
-          state.completeBytes += recordBytes(finalization);
+          state.completeBytes += writtenBytes;
           state.boundaryMarker = await jsonlBoundaryMarker(
             this.filePath(sessionId),
             state.completeBytes
@@ -825,11 +825,11 @@ export class JsonlSessionRepository implements SessionRepository {
     state: SessionAppendIndex,
     record: SessionBranchEntry | SessionSubmissionRecord
   ): Promise<void> {
-    await appendJsonlRecord(
+    const writtenBytes = await appendJsonlRecord(
       this.filePath(sessionId),
       'submissionId' in record ? encodeSubmissionRecord(record) : parseJsonValue(record)
     );
-    state.completeBytes += recordBytes(record);
+    state.completeBytes += writtenBytes;
     state.boundaryMarker = await jsonlBoundaryMarker(this.filePath(sessionId), state.completeBytes);
     state.storageStamp = await jsonlStorageStamp(this.filePath(sessionId));
   }
@@ -848,9 +848,9 @@ export class JsonlSessionRepository implements SessionRepository {
           const state = await this.refreshIndex(sessionId, true);
           assertDescriptor(session, state);
           const entry = create(branchLeaf(state.branchEntries));
-          await appendJsonlRecord(this.filePath(sessionId), parseJsonValue(entry));
+          const writtenBytes = await appendJsonlRecord(this.filePath(sessionId), parseJsonValue(entry));
           state.branchEntries.push(entry);
-          state.completeBytes += recordBytes(entry);
+          state.completeBytes += writtenBytes;
           state.boundaryMarker = await jsonlBoundaryMarker(
             this.filePath(sessionId),
             state.completeBytes
@@ -1224,9 +1224,6 @@ function assertDescriptor(session: SessionDescriptor, state: SessionFileState): 
   if (session.id !== state.header.id)
     throw new Error(`Session descriptor identity mismatch for ${session.id}.`);
   assertSessionBinding(decodeSessionBinding(session.header.binding), state.header.binding);
-}
-function recordBytes(record: unknown): number {
-  return Buffer.byteLength(`${JSON.stringify(record)}\n`, 'utf8');
 }
 function validArtifactRefs(value: unknown): value is readonly ArtifactRef[] | undefined {
   if (value === undefined) return true;
@@ -1660,6 +1657,8 @@ function encodeSuspension(
     category: suspension.category,
     reason: suspension.reason,
     ...(suspension.effectId === undefined ? {} : { effectId: suspension.effectId }),
+    ...(suspension.contextAdmission === undefined
+      ? {} : { contextAdmission: parseJsonValue(suspension.contextAdmission) }),
     actions: Object.freeze([...suspension.actions]),
     ...(suspension.decisionRequest === undefined
       ? {}

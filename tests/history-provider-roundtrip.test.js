@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  InMemorySessionRepository, HistoryReader, ContextService, createHistoryTools, createContextTools
+  InMemorySessionRepository, HistoryReader, ContextService, createHistoryTools, createContextTools, InferenceService, InMemoryInferenceRepository
 } from '@agent-core/runtime';
 import { continuityProvider, model, providerIds } from './continuity-provider-fixtures.js';
+import { modelOutputToInput } from '@agent-core/model';
+import { InMemoryArtifactRepository } from '@agent-core/persistence';
 import { serializeToolModelContent } from '@agent-core/tools';
 import { invokeToolCall, jsonToolCall } from './tool-call-helpers.js';
 
@@ -125,4 +127,37 @@ test('context inspection explains adjusted capacity and does not expose the acco
   assert.equal(presented.accounting.components, undefined);
   assert.equal(presented.admission.inputIdentity, undefined);
   assert.match(tools[1].description, /removes all optional history and notes/);
+});
+
+
+test('all provider adapters continue with original reasoning using observed request-level usage', async () => {
+  for (const id of providerIds) {
+    const bodies = [];
+    const provider = continuityProvider(id, { bodies, opaqueReasoning: true, countTokens: false });
+    const repositories = { provider, repository: new InMemoryInferenceRepository(), artifacts: new InMemoryArtifactRepository() };
+    let service = new InferenceService(repositories);
+    const profile = await provider.describeModel(model);
+    const initial = { model, messages: [{ role: 'user', content: 'Investigate the failure.' }],
+      ...(id === 'openai-codex' ? {} : { maxOutputTokens: 100 }) };
+    const firstCompiled = await service.compile(initial, profile, { outputReservation: 100 });
+    const firstInput = { ownerId: id, invocationId: 'first', purpose: 'test',
+      request: initial, compiled: firstCompiled, profile, outputReservation: 100 };
+    const first = await service.invoke(firstInput);
+    service = new InferenceService(repositories);
+    assert.equal((await service.invoke(firstInput)).replayed, true, id);
+    const next = { ...initial, messages: [...initial.messages,
+      ...modelOutputToInput(first.response.output), { role: 'user', content: 'Continue.' }] };
+    const compiled = await service.compile(next, profile, { outputReservation: 100 });
+    assert.equal(compiled.accounting.method.name, 'provider-usage-prefix', id);
+    assert.equal(compiled.accounting.components[0].tokens, 30, id);
+    assert.equal(compiled.accounting.unknownComponents.length, 0, id);
+    const original = first.response.output.find(item => item.type === 'protocol').state;
+    assert.deepEqual(compiled.logicalRequest.messages[1].state, original, id);
+    await service.invoke({ ownerId: id, invocationId: 'second', purpose: 'test',
+      request: next, compiled, profile, outputReservation: 100 });
+    assert.equal(bodies.length, 2, id);
+    const invalidated = await service.compile({ ...next,
+      messages: [{ role: 'user', content: 'A different selected window.' }] }, profile, { outputReservation: 100 });
+    assert.equal(invalidated.accounting.method.name, 'serialized-request-estimate', id);
+  }
 });

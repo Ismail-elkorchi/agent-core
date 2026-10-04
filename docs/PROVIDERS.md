@@ -12,8 +12,16 @@ is never a substitute for required signed or opaque state.
 First-party adapters compile an owned wire body and dispatch that same admitted
 body. Request accounting distinguishes provider counts, estimates, and unknown
 components. OpenAI Platform and Claude offer opt-in bounded counting endpoints;
-other adapters use declared complete estimates and explicit allowances for unknown
-state. Cached input still occupies context. Codex uses an application-supplied
+other adapters estimate the serialized request. Compatible provider usage covers
+an unchanged request prefix and its original response; only appended items are
+estimated. Changed settings, tools, selected input, model, endpoint, or protocol
+invalidate that observation. Opaque state without a count remains unquantified,
+not evidence of overflow, and is preserved independently of accounting. Explicit
+prompt-token and known-cost budgets reserve the finite model input bound when
+components remain unquantified. Otherwise reservations use the request count or
+estimate and declared output allowance. Transactional reservations govern
+overlapping invocations; settlement records actual usage when supplied.
+Cached input still occupies context. Codex uses an application-supplied
 output reservation because its subscription endpoint rejects the Platform output
 cap parameter.
 

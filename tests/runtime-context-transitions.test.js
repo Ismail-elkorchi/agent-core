@@ -564,3 +564,27 @@ test('a failed proactive continuation cannot block an admitted working context',
   assert.equal((await state.context.inspect()).window, null);
   assert.equal(result.terminal.budget.promptTokens, 50);
 });
+
+
+test('a changed admitted request resumes a definitively rejected provider request without unresolved-outcome recovery', async () => {
+  const state = await fixture();
+  let extra = 'Optional captured context before the rejection.';
+  let calls = 0;
+  const provider = { ...state.provider, complete: async request => {
+    calls++;
+    if (calls === 1) throw new ModelProviderError({ provider: 'fixture', code: 'context_overflow',
+      message: 'Provider rejected the initial input.', retryable: false });
+    return state.provider.complete(request);
+  } };
+  const runtime = new AgentRuntime({ ...state.options, provider, contextProvider: () => extra
+    ? [{ id: 'capture', sourceKind: 'external', sourceUri: 'test://optional-context', representation: 'full',
+      mediaType: 'text/plain', title: 'Captured context', purpose: 'Optional evidence', content: extra }] : [] });
+  const suspended = await runtime.run({ task: 'Keep the original work.' }).result;
+  assert.equal(suspended.reason, 'context_admission');
+  assert.equal(suspended.contextAdmission.kind, 'provider_capacity');
+  extra = '';
+  const result = await runtime.resume(suspended.runId).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.equal(calls, 2);
+  assert.equal(state.requests[0].messages.filter(item => item.content === 'Keep the original work.').length, 1);
+});

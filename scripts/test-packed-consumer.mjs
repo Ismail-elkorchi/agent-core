@@ -49,7 +49,7 @@ try {
     for (const file of files.filter((name) => name.endsWith('.d.ts'))) {
       const declaration = await readFile(path.join(directory, file), 'utf8');
       const retired =
-        /\b(?:ModelMessage|ModelProviderState|SimpleTokenEstimator|TokenEstimator|SessionCompactionEntry|AgentSessionCompactionRequest|appendCompaction|summarizeConversation|executeAssistantToolCalls|nextObservationIndex|normalizeJsonSafe|JsonNormalizationDiagnostic|JsonNormalizationResult|outputNormalization|toObservationJsonObject|toJsonValue)\b/u.exec(
+        /\b(?:ModelMessage|ModelProviderState|CompleteRequestEstimator|SimpleTokenEstimator|TokenEstimator|SessionCompactionEntry|AgentSessionCompactionRequest|appendCompaction|summarizeConversation|executeAssistantToolCalls|nextObservationIndex|normalizeJsonSafe|JsonNormalizationDiagnostic|JsonNormalizationResult|outputNormalization|toObservationJsonObject|toJsonValue)\b/u.exec(
           declaration
         );
       if (retired) throw new Error(`${relative}/${file} still exports retired contract ${retired[0]}.`);

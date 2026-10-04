@@ -1,6 +1,7 @@
 import { canonicalJsonString, parseJsonObject, parseJsonValue, type JsonObject } from '@agent-core/json';
 import { MODEL_REQUEST_JSON_LIMITS } from './json-limits.js';
 import { parseModelRequest, ModelContractError } from './validation.js';
+import { modelOutputToInput, modelResponseOutput } from './protocol.js';
 import type {
   ModelContentPart,
   ModelImage,
@@ -8,7 +9,8 @@ import type {
   ModelLimits,
   ModelPricing,
   ModelProfile,
-  ModelRequest
+  ModelRequest,
+  ModelResponse
 } from './index.js';
 
 export interface RequestEstimator {
@@ -16,8 +18,8 @@ export interface RequestEstimator {
   estimateImage(image: ModelImage): number;
   estimateItems(items: readonly ModelInputItem[]): number;
 }
-/** Diagnostic heuristic, never a tokenizer or an exact admission guarantee. */
-export class CompleteRequestEstimator implements RequestEstimator {
+/** UTF-8 heuristic for quantifiable input, never an exact tokenizer or a payload allowance. */
+export class RequestTokenEstimator implements RequestEstimator {
   static readonly DEFAULT_IMAGE_TOKENS = 2_000;
   private readonly encoder = new TextEncoder();
   estimateText(text: string): number {
@@ -25,15 +27,10 @@ export class CompleteRequestEstimator implements RequestEstimator {
   }
   estimateImage(image: ModelImage): number {
     void image;
-    return CompleteRequestEstimator.DEFAULT_IMAGE_TOKENS;
+    return RequestTokenEstimator.DEFAULT_IMAGE_TOKENS;
   }
   estimateItems(items: readonly ModelInputItem[]): number {
-    const accounting = accountItems(items, this);
-    if (accounting.some((part) => part.status === 'unknown'))
-      throw new ModelContractError('Cannot estimate unknown protocol/media token cost.', [
-        'Use RequestAccounting with a declared unknown-token admission policy.'
-      ]);
-    return accounting.reduce((total, part) => total + (part.tokens ?? 0), 0);
+    return accountItems(items, this).reduce((total, part) => total + (part.tokens ?? 0), 0);
   }
 }
 export type RequestAccountingKind =
@@ -67,8 +64,7 @@ export interface RequestAccounting {
   readonly method: { readonly name: string; readonly version: string };
   readonly components: readonly RequestAccountingComponent[];
   readonly estimatedInputTokens: number;
-  readonly unknownComponents: readonly RequestAccountingComponent[];
-  readonly unknownTokenAllowance?: number;
+  readonly unknownComponents: readonly Extract<RequestAccountingComponent, { status: 'unknown' }>[];
   readonly outputReservation: number;
   readonly outputReservationSource: 'request' | 'policy' | 'unknown';
   readonly reasoningReservation: number;
@@ -78,18 +74,26 @@ export interface RequestAccounting {
     readonly cachedTokensOccupyContext: true;
     readonly reasoningIncludedInOutput: boolean | 'unknown';
   };
-  readonly uncertainty: { readonly calibrated: false; readonly headroomRatio: number };
+  readonly uncertainty: { readonly calibrated: boolean; readonly headroomRatio: number };
+}
+/** Provider usage for an unchanged request prefix followed by its original response. */
+export interface RequestTokenObservation {
+  readonly provider: string;
+  readonly endpoint: string;
+  readonly capabilityRevision: string;
+  readonly request: ModelRequest;
+  readonly inputTokens: number;
 }
 /** Admission policy, independent of provider generation controls. */
 export interface ModelCompilationOptions {
   /** Reservation when the logical request has no explicit output cap. A cap remains authoritative. */
   readonly outputReservation?: number;
+  readonly tokenObservation?: RequestTokenObservation;
 }
 export interface RequestAccountingOptions extends ModelCompilationOptions {
   readonly estimator?: RequestEstimator;
   /** Bounded parent output that can enter a preauthorized native successor. */
   readonly retainedInputTokenReservation?: number;
-  readonly unknownTokenAllowance?: number;
   readonly headroomRatio?: number;
   readonly providerInputTokens?: number;
   /** Adapter-known encoded media or opaque protocol locations, never arbitrary field-name filtering. */
@@ -113,7 +117,7 @@ export function accountModelRequest(
   profile: ModelProfile,
   options: RequestAccountingOptions = {}
 ): RequestAccounting {
-  const estimator = options.estimator ?? new CompleteRequestEstimator();
+  const estimator = options.estimator ?? new RequestTokenEstimator();
   const components = accountItems(request.messages, estimator);
   const add = (kind: RequestAccountingKind, path: string, value: unknown) => {
     if (value !== undefined)
@@ -142,17 +146,25 @@ function assembleAccounting(
   options: RequestAccountingOptions
 ): RequestAccounting {
   const providerCount = options.providerInputTokens;
-  const components: readonly RequestAccountingComponent[] =
-    providerCount === undefined
-      ? parts
-      : [
-          {
-            kind: 'provider_input',
-            path: 'body',
-            status: 'counted',
-            tokens: checked(providerCount, 'providerInputTokens')
-          }
-        ];
+  const observation = providerCount === undefined
+    ? compatibleObservation(request, profile, options) : undefined;
+  let components = parts;
+  if (providerCount !== undefined)
+    components = [{
+      kind: 'provider_input', path: 'body', status: 'counted',
+      tokens: checked(providerCount, 'providerInputTokens')
+    }];
+  else if (observation)
+    components = [
+      {
+        kind: 'provider_input', path: 'observedPrefix', status: 'estimated',
+        tokens: observation.inputTokens
+      },
+      ...accountItems(
+        request.messages.slice(observation.request.messages.length),
+        options.estimator ?? new RequestTokenEstimator()
+      )
+    ];
   const headroomRatio = options.headroomRatio ?? 0.2;
   if (!Number.isFinite(headroomRatio) || headroomRatio < 0)
     throw new RangeError('headroomRatio must be finite and nonnegative.');
@@ -162,20 +174,17 @@ function assembleAccounting(
     'outputReservation',
     request.maxOutputTokens !== undefined || options.outputReservation !== undefined
   );
-  const unknownTokenAllowance =
-    options.unknownTokenAllowance === undefined
-      ? undefined
-      : checked(options.unknownTokenAllowance, 'unknownTokenAllowance');
   return Object.freeze({
     version: 1,
     method: Object.freeze({
-      name: providerCount === undefined ? 'complete-utf8-estimate' : 'provider-count',
+      name: providerCount !== undefined
+        ? 'provider-count'
+        : observation ? 'provider-usage-prefix' : 'serialized-request-estimate',
       version: '1'
     }),
     components: Object.freeze(components.map((part) => Object.freeze(part))),
     unknownComponents: Object.freeze(unknown),
     estimatedInputTokens: components.reduce((sum, part) => sum + (part.tokens ?? 0), 0),
-    ...(unknownTokenAllowance === undefined ? {} : { unknownTokenAllowance }),
     outputReservation,
     outputReservationSource:
       request.maxOutputTokens !== undefined
@@ -196,21 +205,75 @@ function assembleAccounting(
             : 'unknown'
     }),
     uncertainty: Object.freeze({
-      calibrated: false,
+      calibrated: providerCount !== undefined || observation !== undefined,
       headroomRatio: providerCount === undefined ? headroomRatio : 0
     })
   });
 }
 export function requestAccountingInputTokens(accounting: RequestAccounting): number {
-  if (accounting.unknownComponents.length && accounting.unknownTokenAllowance === undefined)
-    throw new ModelContractError(
-      'Request accounting has unknown token costs.',
-      accounting.unknownComponents.map((part) => `${part.path}: ${part.reason ?? 'unknown'}`)
-    );
-  return (
-    Math.ceil(accounting.estimatedInputTokens * (1 + accounting.uncertainty.headroomRatio)) +
-    (accounting.unknownTokenAllowance ?? 0)
-  );
+  return Math.ceil(accounting.estimatedInputTokens * (1 + accounting.uncertainty.headroomRatio));
+}
+/** A reservation bound for explicit budgets, independent of the capacity estimate. */
+export function requestAccountingInputBound(accounting: RequestAccounting): number | undefined {
+  if (accounting.method.name === 'provider-count') return accounting.estimatedInputTokens;
+  const separateReasoning = accounting.pricingSemantics.reasoningIncludedInOutput === false
+    ? accounting.reasoningReservation : 0;
+  const limits = [
+    accounting.limits.maxInputTokens,
+    accounting.limits.contextTokens === undefined
+      ? undefined
+      : accounting.limits.contextTokens - accounting.outputReservation - separateReasoning
+  ].filter((value): value is number => value !== undefined);
+  return limits.length ? Math.max(0, Math.min(...limits)) : undefined;
+}
+
+export function observeModelRequest(
+  compiled: CompiledModelRequest,
+  response: ModelResponse
+): RequestTokenObservation | undefined {
+  const usage = response.usage;
+  if (
+    !usage || usage.promptTokens <= 0 || compiled.retainedBody ||
+    response.provider !== compiled.provider || response.model !== compiled.model
+  ) return undefined;
+  const inputTokens = usage.promptTokens + usage.completionTokens +
+    (compiled.accounting.pricingSemantics.reasoningIncludedInOutput === false
+      ? usage.reasoningTokens ?? 0 : 0);
+  const logical = { ...compiled.logicalRequest };
+  delete logical.signal;
+  return Object.freeze({
+    provider: compiled.provider,
+    endpoint: compiled.endpoint,
+    capabilityRevision: compiled.capabilityRevision,
+    request: parseModelRequest({
+      ...logical,
+      messages: [...logical.messages, ...modelOutputToInput(modelResponseOutput(response))]
+    }),
+    inputTokens: checked(inputTokens, 'observedInputTokens')
+  });
+}
+
+function compatibleObservation(
+  request: ModelRequest,
+  profile: ModelProfile,
+  options: RequestAccountingOptions
+): RequestTokenObservation | undefined {
+  const observation = options.tokenObservation;
+  if (
+    observation?.provider !== profile.provider || observation.request.model !== request.model ||
+    observation.capabilityRevision !== (profile.capabilities.protocol?.revision ?? 'conservative-v1') ||
+    observation.request.messages.length > request.messages.length
+  ) return undefined;
+  const controls = (value: ModelRequest) => {
+    const rest: Record<string, unknown> = { ...value };
+    delete rest.signal;
+    delete rest.messages;
+    return canonicalJsonString(parseJsonObject(rest, MODEL_REQUEST_JSON_LIMITS));
+  };
+  if (controls(request) !== controls(observation.request)) return undefined;
+  return observation.request.messages.every((message, index) =>
+    canonicalJsonString(message) === canonicalJsonString(request.messages[index])
+  ) ? observation : undefined;
 }
 export function assertRequestAccountingFits(accounting: RequestAccounting): void {
   const input = requestAccountingInputTokens(accounting);
@@ -256,11 +319,10 @@ export async function compileModelRequest(
 ): Promise<CompiledModelRequest> {
   const request = parseModelRequest(options.request);
   const body = parseJsonObject(options.body, MODEL_REQUEST_JSON_LIMITS);
-  const estimator = options.estimator ?? new CompleteRequestEstimator();
+  const estimator = options.estimator ?? new RequestTokenEstimator();
   // Count the provider representation once. Native payloads use semantic accounting separately.
-  const semantic = accountModelRequest(request, options.profile, options);
   const accountingBody = omitPayloads(body, options.payloadPaths ?? []);
-  const components: RequestAccountingComponent[] = semantic.components.filter(
+  const components: RequestAccountingComponent[] = accountItems(request.messages, estimator).filter(
     (part) => part.kind === 'media' || part.kind === 'reasoning'
   );
   for (const [key, value] of Object.entries(accountingBody)) {
@@ -299,12 +361,15 @@ export async function compileModelRequest(
       status: 'estimated',
       tokens: checked(retainedInputTokenReservation, 'retainedInputTokenReservation')
     });
+  const accountingOptions = { ...options };
+  if (retainedBody || options.tokenObservation?.endpoint !== options.endpoint)
+    delete accountingOptions.tokenObservation;
   const accounting = assembleAccounting(
     components,
     request,
     options.profile,
     options.providerInputTokens === undefined
-      ? options
+      ? accountingOptions
       : {
           ...options,
           providerInputTokens: options.providerInputTokens + (retainedInputTokenReservation ?? 0)
@@ -410,7 +475,7 @@ function accountItems(
           kind: 'reasoning',
           path,
           status: 'unknown',
-          reason: 'Opaque provider state requires provider counting or an explicit unknown-token allowance.'
+          reason: 'Opaque provider state has no independent token count; request-level usage or provider counting can cover it.'
         });
     }
   });
@@ -443,7 +508,7 @@ function accountPart(
       kind: 'media',
       path,
       status: 'unknown',
-      reason: `${part.type} requires provider counting or declared admission allowance.`
+      reason: `${part.type} has no independent token count.`
     });
 }
 function checked(value: number, label: string, positive = false): number {

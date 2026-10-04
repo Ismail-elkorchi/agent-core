@@ -2,7 +2,7 @@ import { resolveToolModelContent } from './observation-source.js';
 import { ModelContinuationRequiredError } from './model-change.js';
 import {
   modelOutputToInput,
-  CompleteRequestEstimator,
+  RequestTokenEstimator,
   assertModelRequestSupported,
   providerContextIncompatibility,
   type ModelInputItem,
@@ -620,7 +620,7 @@ export async function assertPortableHistoryCompatibility(input: {
   readonly artifacts: ArtifactRepository;
 }): Promise<void> {
   assertPortableHistorySources(input.entries, input.profile);
-  const window = new ModelWindow(new CompleteRequestEstimator());
+  const window = new ModelWindow(new RequestTokenEstimator());
   await replaySourceEntries(
     window,
     input.sessionId,

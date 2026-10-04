@@ -13,6 +13,7 @@ import {
   type AgentRunState
 } from './contracts.js';
 import { AgentRunRecords, decodeAgentToolWorkRecord, type AgentToolWorkRecord } from './records.js';
+import { toolWorkResolved } from './tool-state.js';
 
 export type AgentRunStateTransition =
   | Readonly<{ readonly kind: 'accepted'; readonly state: AgentRunState }>
@@ -320,7 +321,7 @@ function assertRetainedWork(previous: AgentRunState, next: AgentRunState): void 
         item.identity.requestAttempt === request.identity.requestAttempt
     );
     const reprepare =
-      request.stage === 'ready' &&
+      (request.stage === 'ready' || request.stage === 'rejected') &&
       previous.phase.kind === 'suspended' &&
       previous.phase.reason === 'context_admission' &&
       next.phase.kind === 'initializing' &&
@@ -337,15 +338,7 @@ function assertRetainedWork(previous: AgentRunState, next: AgentRunState): void 
   for (const batch of previous.toolBatches) {
     const retained = next.toolBatches.find((item) => item.toolBatchId === batch.toolBatchId);
     if (!retained) {
-      if (
-        !batch.callStates.every(
-          (call) =>
-            call.stage === 'resolved' ||
-            call.stage === 'cancelled' ||
-            (call.stage === 'recorded' &&
-              (!batch.source.nativeCatalogIdentity || call.delivery?.status === 'applied'))
-        )
-      )
+      if (!toolWorkResolved(batch))
         throw new Error('Unresolved tool or delivery work cannot be removed.');
     } else {
       const { callStates: oldCalls, ...oldSource } = batch;
