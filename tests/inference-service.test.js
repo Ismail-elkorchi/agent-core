@@ -765,6 +765,7 @@ test('unquantified input stays usable without a budget and reserves its input bo
   const initial = input().request;
   const state = await createProviderContextState({ provider: 'fixture', endpoint: 'fixture',
     protocolRevision: 'test', request: initial, requestId: 'previous', kind: 'opaque',
+    requiresExactPrefix: false,
     data: { encrypted: 'original-state' } });
   const request = { ...initial, messages: [...initial.messages, { role: 'protocol', content: '', state }] };
   let calls = 0;

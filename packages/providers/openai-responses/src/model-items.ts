@@ -145,6 +145,7 @@ export async function responsesOutput(options: {
         request: { ...options.request, messages: prefix },
         requestId: options.requestId,
         kind: item.type === 'reasoning' ? 'responses.reasoning' : 'responses.compaction',
+        requiresExactPrefix: false,
         data: { items: [item] }
       });
       output.push({ type: 'protocol', state });

@@ -396,6 +396,7 @@ export class ClaudeProvider implements ModelProvider {
             request: { ...request, messages: [...request.messages, ...modelOutputToInput(output)] },
             requestId: payload.id,
             kind: 'claude.thinking',
+            requiresExactPrefix: true,
             data: { block }
           })
         });

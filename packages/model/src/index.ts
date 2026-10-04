@@ -363,6 +363,7 @@ export interface ProviderContextState {
     readonly model: string;
     readonly endpoint: string;
     readonly protocolRevision: string;
+    /** An adapter-declared protocol constraint, independent of exact payload replay. */
     readonly requiresExactPrefix: boolean;
   };
   readonly replay: 'required' | 'optional' | 'handle';

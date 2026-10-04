@@ -102,6 +102,7 @@ async function nativeAnswer(f) {
     request: { model: 'model', messages: [{ role: 'user', content: 'Original input' }] },
     requestId: 'native-request',
     kind: 'signed',
+    requiresExactPrefix: true,
     data: { opaque: 'NOT ANSWER TEXT' }
   });
   const answer = await f.sessions.appendAssistant(f.session, {

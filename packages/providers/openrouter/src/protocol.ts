@@ -82,6 +82,7 @@ export async function chatOutput(
         requestId,
         provider: 'openrouter',
         kind: 'chat.reasoning',
+        requiresExactPrefix: true,
         data: { fields }
       })
     });

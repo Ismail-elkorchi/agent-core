@@ -190,7 +190,7 @@ export async function createProviderContextState(options: {
   readonly kind: string;
   readonly data: unknown;
   readonly replay?: ProviderContextState['replay'];
-  readonly requiresExactPrefix?: boolean;
+  readonly requiresExactPrefix: boolean;
   readonly tokenCount?: number;
   readonly tokenEstimate?: number;
 }): Promise<ProviderContextState> {
@@ -208,7 +208,7 @@ export async function createProviderContextState(options: {
       model: request.model,
       endpoint: options.endpoint,
       protocolRevision: options.protocolRevision,
-      requiresExactPrefix: options.requiresExactPrefix ?? true
+      requiresExactPrefix: options.requiresExactPrefix
     },
     ...(options.tokenCount === undefined ? {} : { tokenCount: options.tokenCount }),
     ...(options.tokenEstimate === undefined ? {} : { tokenEstimate: options.tokenEstimate })

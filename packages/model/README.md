@@ -8,6 +8,8 @@ Provider-neutral typed input/output, capability revisions, immutable compiled re
 
 `ModelCapabilities.protocol` declares the resolved endpoint, revision, roles/kinds, continuation, reasoning accounting, async calls, steering, transforms, tool choice and counting support. A missing declaration is conservative and cannot establish modern capability support. Provider-native response boundaries and steering delivery updates have typed stream events and exact identities.
 
+Exact protocol payload replay does not imply an immutable earlier prompt. `createProviderContextState` requires the adapter to declare `requiresExactPrefix` explicitly. OpenAI Responses reasoning and compaction items and Ollama thinking can accompany updated instructions and background; prefix-bound providers retain their original-prefix check. Provider, endpoint, model, protocol revision, payload integrity and tool-call identities remain independent requirements.
+
 `parseModelRequest`, `parseModelInputItem`, `parseModelResponse`, `parseProviderContextState`, `parseModelStreamEvent` and `parseModelProfile` validate and own boundary values. `assertModelRequestSupported` applies the resolved model capability contract.
 
 Reasoning efforts are non-empty provider-defined strings, preserved exactly. Model profiles declare their supported efforts; request validation checks membership in that profile instead of a global enumeration. Use `{ strategy: 'disabled' }` to request disabled reasoning, subject to the profile's `canDisable` capability.

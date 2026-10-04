@@ -3,13 +3,37 @@ import assert from 'node:assert/strict';
 import {
   ModelContractError,
   RequestTokenEstimator,
+  assertProviderContextCompatible,
   assertModelRequestSupported,
+  createProviderContextState,
   parseModelProfile,
   parseModelReasoningRequest,
   parseModelRequest,
   parseModelResponse,
   parseModelStreamEvent
 } from '@agent-core/model';
+
+test('provider replay constraints are explicit and independent of payload preservation', async () => {
+  const request = { model: 'model', messages: [{ role: 'user', content: 'Original input.' }] };
+  const options = {
+    provider: 'fixture', endpoint: 'https://fixture.test', protocolRevision: 'fixture-v1',
+    request, requestId: 'origin', kind: 'reasoning', data: { encrypted: 'original-opaque+/=' }
+  };
+  await assert.rejects(createProviderContextState(options), TypeError);
+  const updated = { ...request, messages: [{ role: 'developer', content: 'Current guidance.' }, ...request.messages] };
+  for (const requiresExactPrefix of [false, true]) {
+    const state = await createProviderContextState({ ...options, requiresExactPrefix });
+    const compatible = (target = updated, endpoint = options.endpoint, provider = options.provider, revision = options.protocolRevision) =>
+      assertProviderContextCompatible(state, target, endpoint, target.messages, provider, revision);
+    if (requiresExactPrefix) await assert.rejects(compatible(), /Earlier input/);
+    else await compatible();
+    assert.deepEqual(state.data, options.data);
+    await assert.rejects(compatible({ ...updated, model: 'another-model' }), /model/);
+    await assert.rejects(compatible(updated, 'https://another.test'), /endpoint/);
+    await assert.rejects(compatible(updated, options.endpoint, 'another-provider'), /Provider/);
+    await assert.rejects(compatible(updated, options.endpoint, options.provider, 'another-revision'), /revision/);
+  }
+});
 
 const profile = {
   id: 'test',

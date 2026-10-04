@@ -280,9 +280,6 @@ test('unchanged admission stays suspended; an admissible changed capacity resume
   assert.equal(resumed.terminal.runId, 'suspended-capacity');
 });
 
-for (const length of [80, 18000]) {
-}
-
 test('application instructions refresh for each new admitted inference during one run', async () => {
   const state = await fixture();
   const requests = [];

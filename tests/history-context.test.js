@@ -372,6 +372,7 @@ test('assistant media bytes persist losslessly and protocol payloads stay out of
     request: { model: 'model', messages: [{ role: 'user', content: 'render image' }] },
     requestId: 'request',
     kind: 'signed',
+    requiresExactPrefix: true,
     data: { opaque: 'hidden-provider-payload' }
   });
   const entry = await sessions.appendAssistant(session, {

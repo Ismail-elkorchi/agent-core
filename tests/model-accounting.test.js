@@ -104,6 +104,7 @@ test('opaque state stays explicitly unquantified without blocking ordinary infer
     request: base,
     requestId: 'r',
     kind: 'signed',
+    requiresExactPrefix: true,
     data: { encrypted: 'x'.repeat(100000) }
   });
   const logical = {
@@ -206,6 +207,7 @@ test('binary model input is normalized to immutable JSON-safe media for durable 
     request: original,
     requestId: 'binary-origin',
     kind: 'test-state',
+    requiresExactPrefix: false,
     data: {}
   });
   source.fill(99);
@@ -312,6 +314,7 @@ test('observed request usage covers an exact prefix and only estimates additions
   const first = await compile(initial);
   const state = await createProviderContextState({ provider: 'test', endpoint: first.endpoint,
     protocolRevision: 'fixture-v1', request: initial, requestId: 'first', kind: 'signed',
+    requiresExactPrefix: true,
     data: { encrypted: 'x'.repeat(100000) } });
   const output = [{ type: 'protocol', state }, { type: 'text', text: 'answer' }];
   const response = { provider: 'test', model: 'model', terminationReason: 'stop', content: 'answer', output,

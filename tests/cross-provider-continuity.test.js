@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
 import { defineTool } from '@agent-core/tools';
-import { requestAccountingInputTokens } from '@agent-core/model';
+import { modelOutputToInput, requestAccountingInputTokens } from '@agent-core/model';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import {
   AgentRuntime,
@@ -20,6 +20,44 @@ import {
   providerIds,
   thinking
 } from './continuity-provider-fixtures.js';
+
+for (const id of ['openai', 'openai-codex']) {
+  test(`${id} replays original reasoning with current instructions and background`, async () => {
+    const provider = continuityProvider(id, { opaqueReasoning: true });
+    const initial = {
+      model,
+      messages: [
+        { role: 'developer', content: 'Original repository guidance.' },
+        { role: 'user', content: 'Original workspace context.' },
+        { role: 'user', content: 'Inspect the repository.' }
+      ],
+      ...(id === 'openai-codex' ? { reasoning: { strategy: 'effort', effort: 'low' } } : {})
+    };
+    const response = await provider.complete(initial);
+    const output = modelOutputToInput(response.output);
+    const compiled = await provider.compileRequest({
+      ...initial,
+      messages: [
+        { role: 'developer', content: 'Current scoped repository guidance.' },
+        { role: 'user', content: 'Current working state and workspace context.' },
+        initial.messages[2],
+        ...output,
+        { role: 'user', content: 'Continue the inspection.' }
+      ]
+    }, { outputReservation: 4096 });
+    assert.deepEqual(
+      compiled.body.input.filter((item) => item.type === 'reasoning'),
+      [{ type: 'reasoning', id: 'reasoning-1', encrypted_content: 'original-opaque+/=', summary: [] }]
+    );
+    assert.deepEqual(
+      compiled.logicalRequest.messages.filter((item) => item.role === 'protocol'),
+      output.filter((item) => item.role === 'protocol')
+    );
+    assert.ok(JSON.stringify(compiled.body).includes('Current scoped repository guidance.'));
+    assert.ok(!JSON.stringify(compiled.body).includes('Original repository guidance.'));
+    assert.equal((await provider.completeCompiled(compiled)).terminationReason, 'stop');
+  });
+}
 
 for (const id of providerIds) {
   test(`${id} renews context without changing instruction authority or the conversation prefix`, async () => {

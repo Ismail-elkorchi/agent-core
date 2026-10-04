@@ -502,6 +502,7 @@ export class OllamaProvider implements ModelProvider {
           endpoint: this.endpoint,
           requestId: 'ollama-response',
           kind: 'ollama.thinking',
+          requiresExactPrefix: false,
           data: { thinking: responseReasoning },
           tokenEstimate: new RequestTokenEstimator().estimateText(responseReasoning)
         })

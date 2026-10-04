@@ -251,7 +251,7 @@ export class OpenAICodexProvider implements ModelProvider {
             inputKinds: ['text', 'image', 'tool_call', 'tool_result', 'protocol'],
             outputKinds: ['text', 'tool_call', 'protocol', 'refusal'],
             state: 'exact',
-            continuation: 'exact_prefix'
+            continuation: 'replay'
           })
         }
       })
