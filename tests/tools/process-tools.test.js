@@ -43,7 +43,9 @@ const invocation = {
 
 async function startCommand(execution, request, options = {}) {
   const plan = await execution.plan(request);
-  return execution.start(plan, options);
+  const started = await execution.start(plan, options);
+  assert.equal(started.kind, 'started', started.diagnostic);
+  return started.result;
 }
 
 async function processContext(options = {}, owner = invocation) {
@@ -160,7 +162,7 @@ test('command plans bind the physical directory without fingerprinting live desc
   await releaseToolCallPlan(replaced);
 });
 
-test('local process inspection and settlement notification report the owned command', async (t) => {
+test('local process inspection and durable terminal handoff report the owned command', async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-process-inspection-'));
   const files = testRootedFileAuthority(root);
   const settled = [];
@@ -169,7 +171,7 @@ test('local process inspection and settlement notification report the owned comm
     rootedFileAuthority: files,
     ledgerDirectory: path.join(root, 'processes'),
     ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process,
-    onSettlement: (result) => settled.push(result)
+    commitTerminalReport: async ({ result }) => { settled.push(result); }
   });
   t.after(async () => {
     await execution.close();
@@ -961,8 +963,7 @@ test('reconciliation never signals a PID without authenticated supervisor identi
     true
   );
   assert.doesNotThrow(() => process.kill(process.pid, 0), 'the reused PID remains untouched');
-  await assert.rejects(
-    startCommand(host.commandExecution, {
+  const refused = await host.commandExecution.start(await host.commandExecution.plan({
       command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify('process.exit(0)')}`,
       rootedDirectory: '.',
       pty: false,
@@ -976,15 +977,25 @@ test('reconciliation never signals a PID without authenticated supervisor identi
         toolBatchId: 'batch',
         callIndex: 0
       }
-    }),
-    /unresolved supervised process/u
-  );
+    }));
+  assert.equal(refused.kind, 'not_started');
+  assert.match(refused.diagnostic, /lifetime is unresolved/u);
 
-  const resolved = await host.resolveReconciliation({
-    acknowledge: (await host.reconciliation()).unresolved
-  });
+  await rm(path.join(ledgerDirectory, `${processId}.json`));
+  const changed = await host.commandExecution.retryReconciliation();
+  assert.equal(changed.unresolved.length, 1, 'missing evidence cannot prove release');
+  assert.equal((await host.commandExecution.listProcesses())[0].status, 'unknown');
+  await assert.rejects(host.commandExecution.acknowledgeUnresolved(reconciliation.unresolved), /evidence changed/);
+  const resolved = await host.resolveReconciliation({ acknowledge: changed.unresolved });
   assert.equal(resolved.unresolved.length, 0);
   assert.equal(host.commandExecution.resourceLeases.activeCount(), 0);
+  assert.deepEqual((await host.commandExecution.reconcile()).unresolved, []);
+  const next = await startCommand(host.commandExecution, {
+    command: 'printf recovered', rootedDirectory: '.', pty: false,
+    timeoutMs: 5_000, yieldMs: 0, outputTokenBudget: 100, owner: invocation
+  }, { awaitTerminal: true });
+  assert.equal(next.status, 'exited');
+  await host.commandExecution.acknowledgeTerminalReport(next.processId);
   await host.close();
 });
 
@@ -1057,9 +1068,8 @@ test('local host durably hands recovered terminal reports to old runs during sta
     artifactRepository: new LocalArtifactRepository({ rootDir: path.join(root, 'host-artifacts') }),
     processLedgerDirectory: path.join(root, 'processes'),
     enabledTools: ['exec_command', 'write_stdin', 'stop_process'],
-    async deliverRecoveredTerminalReport(report) {
+    async commitTerminalReport(report) {
       delivered.push(report);
-      return true;
     }
   });
   await host.ready();
@@ -1100,7 +1110,9 @@ test('planning owns an immutable execution request before callers can mutate it'
   const planning = manager.plan(request);
   request.command = 'printf changed';
   owner.ownerId = 'changed-owner';
-  const result = await manager.start(await planning, { awaitTerminal: true });
+  const started = await manager.start(await planning, { awaitTerminal: true });
+  assert.equal(started.kind, 'started');
+  const result = started.result;
   assert.equal(result.combined.segments.join(''), 'original');
   assert.equal(result.owner.ownerId, invocation.ownerId);
   assert.equal(Object.hasOwn(result.owner, 'requestAttempt'), false);
@@ -1135,4 +1147,119 @@ test('redaction precedes output selection and cannot expose a detached credentia
   assert.match(renderCommandOutput(result.output.combined), /output omitted/);
   const artifact = JSON.parse(Buffer.from(await artifacts.readVerified(result.output.artifact)).toString());
   assert.doesNotMatch(artifact.chunks.map(chunk => chunk.text).join(''), /sensitive-suffix|a{16}/);
+});
+
+test('authenticated process settlement is independent of incompatible output metadata', async (t) => {
+  for (const output of ['missing', 'malformed', 'invalid-counts']) await t.test(output, async (t) => {
+    const root = await mkdtemp(path.join(tmpdir(), 'process-evidence-'));
+    const ledgerDirectory = path.join(root, 'processes');
+    const files = testRootedFileAuthority(root);
+    const options = { artifactRepository: new InMemoryArtifactRepository(), rootedFileAuthority: files,
+      ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process };
+    const first = new LocalCommandExecution(options);
+    let second;
+    t.after(async () => { await first.close(); await second?.close(); files.close(); await rm(root, { recursive: true, force: true }); });
+    const request = { command: 'printf original', rootedDirectory: '.', pty: false,
+      timeoutMs: 5_000, yieldMs: 0, outputTokenBudget: 100, owner: invocation };
+    const result = await startCommand(first, request, { awaitTerminal: true });
+    await first.unreportedTerminalProcesses(invocation.ownerId);
+    const outputPath = path.join(ledgerDirectory, `${result.processId}.output.json`);
+    if (output === 'missing') await rm(outputPath);
+    else if (output === 'malformed') await writeFile(outputPath, '{');
+    else {
+      const receipt = JSON.parse(await readFile(outputPath, 'utf8'));
+      receipt.combined.capturedBytes = receipt.combined.observedBytes + 1;
+      await writeFile(outputPath, JSON.stringify(receipt));
+    }
+    const ledgerPath = path.join(ledgerDirectory, `${result.processId}.json`);
+    const ledger = JSON.parse(await readFile(ledgerPath, 'utf8'));
+    ledger.terminal = { status: 'invalid presentation', stdout: { text: null } };
+    await writeFile(ledgerPath, JSON.stringify(ledger));
+    second = new LocalCommandExecution(options);
+    assert.deepEqual((await second.reconcile()).unresolved, []);
+    const [report] = second.recoveredTerminalReports();
+    assert.equal(report.result.status, 'exited');
+    assert.equal(report.result.originalOutput.kind, 'unavailable');
+    assert.match(report.result.originalOutput.diagnostic, /output/);
+    assert.equal(second.resourceLeases.activeCount(), 0);
+    const next = await startCommand(second, { ...request, command: 'printf next' }, { awaitTerminal: true });
+    assert.equal(next.combined.segments.join(''), 'next');
+    await second.acknowledgeTerminalReport(report.result.processId);
+    await second.acknowledgeTerminalReport(next.processId);
+  });
+});
+
+test('retrying recovery leaves a currently managed process running', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'process-retry-'));
+  const files = testRootedFileAuthority(root);
+  const manager = new LocalCommandExecution({ artifactRepository: new InMemoryArtifactRepository(),
+    rootedFileAuthority: files, ledgerDirectory: path.join(root, 'processes'),
+    ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+  t.after(async () => { await manager.close(); files.close(); await rm(root, { recursive: true, force: true }); });
+  const running = await startCommand(manager, { command: 'sleep 30', rootedDirectory: '.', pty: false,
+    timeoutMs: 60_000, yieldMs: 0, outputTokenBudget: 100, owner: invocation });
+  assert.equal(running.status, 'running');
+  assert.deepEqual((await manager.retryReconciliation()).unresolved, []);
+  assert.equal((await manager.query(running.processId, 100)).status, 'running');
+  await manager.disposeOwner(invocation.ownerId);
+});
+
+test('terminal handoff retries use stable evidence and retain it until durable acceptance', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'process-handoff-'));
+  const files = testRootedFileAuthority(root);
+  const ledgerDirectory = path.join(root, 'processes');
+  let accepted = false;
+  const deliveries = [];
+  const options = { artifactRepository: new InMemoryArtifactRepository(), rootedFileAuthority: files,
+    ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process,
+    async commitTerminalReport(report) {
+      deliveries.push(report);
+      if (!accepted) throw new Error('Ledger unavailable');
+    } };
+  const first = new LocalCommandExecution(options);
+  let second;
+  t.after(async () => { await first.close(); await second?.close(); files.close(); await rm(root, { recursive: true, force: true }); });
+  const result = await startCommand(first, { command: 'printf evidence', rootedDirectory: '.', pty: false,
+    timeoutMs: 5_000, yieldMs: 0, outputTokenBudget: 100, owner: invocation }, { awaitTerminal: true });
+  const [original] = await first.unreportedTerminalProcesses(invocation.ownerId);
+  assert.deepEqual(await first.unreportedTerminalProcesses(invocation.ownerId), [original]);
+  assert.equal(deliveries.length, 1);
+  await access(path.join(ledgerDirectory, `${result.processId}.json`));
+  second = new LocalCommandExecution(options);
+  assert.deepEqual((await second.reconcile()).unresolved, []);
+  const recovered = deliveries.at(-1);
+  await second.retryReconciliation();
+  assert.deepEqual(deliveries.at(-1), recovered);
+  accepted = true;
+  await second.retryReconciliation();
+  assert.deepEqual(await readdir(ledgerDirectory), []);
+  assert.deepEqual(second.recoveredTerminalReports(), []);
+});
+
+test('an output receipt write failure cannot erase a known terminal outcome', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'process-receipt-failure-'));
+  const files = testRootedFileAuthority(root);
+  const ledgerDirectory = path.join(root, 'processes');
+  let blockedPath;
+  const manager = new LocalCommandExecution({ artifactRepository: new InMemoryArtifactRepository(),
+    rootedFileAuthority: files, ledgerDirectory, ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process,
+    async onSupervisorCheckpoint(checkpoint, processId) {
+      if (checkpoint !== 'ledger_persisted' || blockedPath) return;
+      blockedPath = path.join(ledgerDirectory, `${processId}.output.json`);
+      await mkdir(blockedPath);
+    } });
+  t.after(async () => { await manager.close(); files.close(); await rm(root, { recursive: true, force: true }); });
+  const request = { command: 'printf result', rootedDirectory: '.', pty: false,
+    timeoutMs: 5_000, yieldMs: 0, outputTokenBudget: 100, owner: invocation };
+  const result = await startCommand(manager, request, { awaitTerminal: true });
+  assert.equal(result.status, 'exited');
+  assert.equal(result.exitCode, 0);
+  assert.match(result.diagnostic, /output receipt storage failed/);
+  const [report] = await manager.disposeOwner(invocation.ownerId);
+  assert.equal(report.result.status, 'exited');
+  const next = await startCommand(manager, request, { awaitTerminal: true });
+  assert.equal(next.status, 'exited');
+  await rm(blockedPath, { recursive: true });
+  await manager.acknowledgeTerminalReport(result.processId);
+  await manager.acknowledgeTerminalReport(next.processId);
 });

@@ -1,4 +1,5 @@
 import * as z from 'zod';
+import { commandOwnerSchema } from '../core/process-records.js';
 
 export const artifactRefSchema = z.strictObject({
   artifactId: z.string(),
@@ -21,13 +22,7 @@ const streamOutputSchema = z.strictObject({
 
 export const processOutputSchema = z.strictObject({
   processId: z.string().min(1),
-  owner: z.strictObject({
-    ownerId: z.string().min(1),
-    runId: z.string().min(1),
-    turnId: z.string().min(1),
-    toolBatchId: z.string().min(1),
-    callIndex: z.int().nonnegative()
-  }),
+  owner: commandOwnerSchema,
   status: z.enum(['running', 'exited', 'stopped', 'timed_out', 'failed']),
   cursorStart: z.int().nonnegative(),
   cursorEnd: z.int().nonnegative(),

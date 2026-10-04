@@ -10,6 +10,8 @@ Tool calls cross `createToolCall()` for typed construction or `decodeToolCall()`
 
 `CommandExecution` is the behavior boundary for starting, querying, controlling, recovering, and cleaning command executions. The runtime and tools do not require a concrete process manager. An application supplies an implementation with a versioned implementation identity and a stable recovery-store identity; unsupported recovery remains explicit rather than authorizing replay. Uncertainty acceptance binds process identity and the exact observation revision, so a stale decision cannot acknowledge new evidence.
 
+`start()` distinguishes a dispatched command from a proven `not_started` refusal. Exceptions after dispatch can remain uncertain. `listProcesses()` includes authority-wide unresolved records, whose owner may be unavailable. A terminal report remains retained until its original owner durably records and acknowledges it. Reports already committed by an executor carry `settlementReference`; consumers reuse that event. Run-owned resources are released by the runtime; applications explicitly release resources with a longer owner lifetime.
+
 
 `WorkspaceFiles` describes an adopted file authority independently of any host path or environment provider: normalized relative paths, incremental directory entries, bounded exact reads with revisions, and conditional transactions. Applications supply confinement, concurrency, epoch fencing, and lifetime ownership. Core does not select or initialize an environment.
 

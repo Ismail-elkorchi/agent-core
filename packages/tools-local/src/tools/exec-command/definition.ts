@@ -118,12 +118,20 @@ async function executeCommand(
   });
   let result;
   try {
-    result = await startCommandExecutionPlan(input.executor, input.reservation, {
+    const started = await startCommandExecutionPlan(input.executor, input.reservation, {
       ...(context.signal ? { signal: context.signal } : {}),
       ...(context.resourceLease ? { lease: context.resourceLease } : {}),
       awaitTerminal: !input.background,
       onProgress: (progress) => context.emitProgress?.(progress)
     });
+    if (started.kind === 'not_started') return {
+      kind: 'failure' as const,
+      execution: { state: 'not_started' as const },
+      summary: started.diagnostic,
+      scope: { resources: [], coverage: 'complete' as const },
+      output: { reason: 'runtime_error' as const, error: started.diagnostic }
+    };
+    result = started.result;
   } catch (error) {
     await context.emitProgress?.({
       type: 'status',

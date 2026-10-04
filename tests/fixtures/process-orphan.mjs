@@ -24,6 +24,8 @@ const plan = await manager.plan({
   outputTokenBudget: 1_000,
   owner: { ownerId: 'orphan-run', runId: 'orphan-run', turnId: 'turn', toolBatchId: 'batch', callIndex: 0 }
 });
-const result = await manager.start(plan);
+const started = await manager.start(plan);
+if (started.kind !== 'started') throw new Error(started.diagnostic);
+const result = started.result;
 process.stdout.write(JSON.stringify({ processId: result.processId }) + '\n');
 process.exit(44);

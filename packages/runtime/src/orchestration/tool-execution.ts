@@ -12,6 +12,8 @@ import {
   policyBlockedObservation,
   releaseToolCallPlan,
   releaseToolInvocation,
+  runtimeErrorObservation,
+  updateToolObservation,
   startToolCallPlan,
   type CompiledToolDefinition,
   type ResourceLeaseCoordinator,
@@ -452,7 +454,24 @@ async function startCall(
   let lease: Awaited<ReturnType<ResourceLeaseCoordinator['acquire']>> | undefined;
   let invocation: ToolInvocation | undefined;
   try {
-    lease = await acquireLease(input, phase, callIndex, call, callState);
+    try {
+      lease = await acquireLease(input, phase, callIndex, call, callState);
+    } catch (error) {
+      if (input.toolContext.signal.aborted) throw error;
+      // No invocation has started: a failed resource admission cannot have executed the tool.
+      const observation = updateToolObservation(runtimeErrorObservation(call.name, error), {
+        execution: { state: 'not_started' }
+      });
+      const committed = await commitObservation(input, phase, call, plan, observation);
+      const settled: AgentToolCallState = Object.freeze({
+        stage: 'settled', plan: callState.plan, toolAttempt: callState.toolAttempt,
+        settlement: settlementRecord(committed)
+      });
+      await replaceCall(input, phase, 'start_tool_call', callIndex, settled, callState.effect.intent.effectId);
+      await appendToolEnded(input, phase, callIndex, call, settled);
+      await releaseToolCallPlan(plan);
+      return { completion: Promise.resolve({ outcome: 'owned', committed }) };
+    }
     if (!(await callAvailable(input, phase, call))) {
       const committed = await commitObservation(
         input,

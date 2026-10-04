@@ -31,6 +31,7 @@ export function commandReleaseReport(report: CommandExecutionReport): ResourceRe
   return Object.freeze({
     resourceId: result.processId,
     outcome: result.status === 'running' ? 'unknown' : 'released',
+    ...(report.settlementReference ? { settlementReference: report.settlementReference } : {}),
     details: parseJsonObject({
       status: result.status,
       owner: result.owner,

@@ -12,7 +12,7 @@ import {
   applyAgentRunStateTransition
 } from '@agent-core/runtime';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
-import { adoptCommandExecution, commandExecutionResources, defineTool } from '@agent-core/tools';
+import { adoptCommandExecution, commandExecutionResources, defineTool, ResourceLeaseCoordinator } from '@agent-core/tools';
 import {
   DEFAULT_LOCAL_TOOL_CONFIGURATION,
   LocalCommandExecution,
@@ -346,7 +346,9 @@ test('two runtimes sharing one manager clean only their own processes', async ()
     outputTokenBudget: 1_000,
     owner: ownerB
   });
-  const running = await state.manager.start(plan);
+  const started = await state.manager.start(plan);
+  assert.equal(started.kind, 'started');
+  const running = started.result;
   assert.equal(running.status, 'running');
   const agentA = createRuntime({ ...state, provider: new Provider([done]) });
   const result = await agentA.run({ runId: 'run-a', task: 'finish a' }).result;
@@ -419,4 +421,45 @@ test('an explicitly admitted work owner keeps a process across runs with its ori
   assert.equal(released.length, 1);
   assert.equal(released[0].outcome, 'released');
   assert.equal(state.manager.activeCount('coding-work'), 0);
+});
+
+test('failed resource admission records not_started and permits the run to continue', async (t) => {
+  const state = await setup();
+  t.after(() => state.manager.close());
+  const leases = state.manager.resourceLeases;
+  leases.restoreResource('uncertain-process', {
+    accesses: [{ mode: 'execute', scope: 'processes' }], lockScopes: ['files'], recovery: { kind: 'unknown' }
+  }, 'processes/uncertain-process');
+  leases.failResource('uncertain-process', new Error('Authenticated process evidence is unavailable.'));
+  const provider = new Provider([toolResponse('exec_command', { command: 'printf must-not-run' }), done]);
+  const result = await createRuntime({ ...state, provider, tools: [execCommandTool] })
+    .run({ runId: 'refused-run', task: 'run a command' }).result;
+  assert.equal(result.state, 'ended');
+  assert.equal(result.terminal.executionStatus, 'completed');
+  const ended = (await records(state.events, 'refused-run')).find((event) => event.type === 'tool.ended');
+  const observation = await resolveToolObservation(ended.observation, state.artifacts);
+  assert.equal(observation.execution.state, 'not_started');
+  assert.equal(observation.kind, 'failure');
+  assert.equal(state.manager.activeCount(), 0);
+  assert.equal(leases.activeCount(), 1, 'uncertainty remains protected');
+});
+
+
+test('an executor settlement reference is reused rather than duplicated during release', async () => {
+  const events = new InMemoryEventRepository(agentEventCodec);
+  let acknowledged;
+  const resources = { lifetime: { kind: 'run' }, capabilities: [], resourceLeases: new ResourceLeaseCoordinator(),
+    async release() {
+      const committed = await events.append('already-settled-run', { type: 'resource.released',
+        runId: 'already-settled-run', resourceId: 'process', outcome: 'released', details: { status: 'exited' } });
+      return [{ resourceId: 'process', outcome: 'released', details: { status: 'exited' },
+        settlementReference: { runId: committed.runId, eventId: committed.eventId, sequence: committed.sequence, hash: committed.hash } }];
+    },
+    async acknowledge(id) { acknowledged = id; } };
+  const agent = new AgentRuntime({ provider: new Provider([done]), model: 'scripted', maxOutputTokens: 64, toolBoundary: boundary,
+    repositories: { events, artifacts: new InMemoryArtifactRepository() }, resources });
+  const result = await agent.run({ runId: 'already-settled-run', task: 'finish' }).result;
+  assert.equal(result.terminal.executionStatus, 'completed');
+  assert.equal(acknowledged, 'process');
+  assert.equal((await records(events, 'already-settled-run')).filter((event) => event.type === 'resource.released').length, 1);
 });

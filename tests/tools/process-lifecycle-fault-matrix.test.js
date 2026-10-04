@@ -221,7 +221,9 @@ function request(rootedDirectory, source, overrides = {}) {
 async function startCommand(manager, input) {
   const { onProgress, ...request } = input;
   const plan = await manager.plan(request);
-  return manager.start(plan, onProgress ? { onProgress } : {});
+  const started = await manager.start(plan, onProgress ? { onProgress } : {});
+  assert.equal(started.kind, 'started', started.diagnostic);
+  return started.result;
 }
 async function context() {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-core-process-faults-'));

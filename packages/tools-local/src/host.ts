@@ -2,10 +2,8 @@ import path from 'node:path';
 import type { ArtifactRepository } from '@agent-core/persistence';
 import type {
   CommandExecution,
-  CommandExecutionReport,
   CommandReconciliationResult,
-  CompiledToolDefinition,
-  ToolResourceLease
+  CompiledToolDefinition
 } from '@agent-core/tools';
 import { adoptCommandExecution } from '@agent-core/tools';
 import {
@@ -13,7 +11,7 @@ import {
   DEFAULT_LOCAL_TOOL_CONFIGURATION,
   type LocalToolConfiguration
 } from './core/configuration.js';
-import { LocalCommandExecution, type PtyProcessFactory } from './core/command-execution.js';
+import { LocalCommandExecution, type LocalCommandExecutionOptions } from './core/command-execution.js';
 import { RootedFileSelector } from './core/rooted-file-selection.js';
 import { isRootedFileAuthority, type RootedFileAuthority } from './core/rooted-file-authority.js';
 import { TextPatchJournal } from './core/text-write.js';
@@ -38,8 +36,7 @@ export interface LocalToolHostOptions {
   readonly patchJournal?: TextPatchJournal;
   readonly configuration?: LocalToolConfiguration;
   readonly enabledTools: readonly string[];
-  readonly ptyFactory?: PtyProcessFactory;
-  readonly deliverRecoveredTerminalReport?: (report: CommandExecutionReport) => Promise<boolean>;
+  readonly commitTerminalReport?: LocalCommandExecutionOptions['commitTerminalReport'];
 }
 
 export interface LocalToolHost {
@@ -75,6 +72,8 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
       'Local tool host accepts either a process ledger or an application command authority, not both.'
     );
   }
+  if (options.commandExecution && options.commitTerminalReport)
+    throw new Error('A borrowed command authority owns its terminal handoff.');
   if (
     processToolsEnabled &&
     options.processLedgerDirectory === undefined &&
@@ -114,7 +113,7 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
               rootedFileAuthority: adoptedRoot,
               ledgerDirectory: path.resolve(options.processLedgerDirectory),
               ...configuration.process,
-              ...(options.ptyFactory ? { ptyFactory: options.ptyFactory } : {})
+              ...(options.commitTerminalReport ? { commitTerminalReport: options.commitTerminalReport } : {})
             })
         : adoptCommandExecution(options.commandExecution);
   } catch (error) {
@@ -151,33 +150,6 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
     unresolved: Object.freeze([])
   });
   const ownsCommands = options.commandExecution === undefined;
-  let reconciliation =
-    ownsCommands && commandExecution ? commandExecution.reconcile() : Promise.resolve(noProcesses);
-  let blocker: ToolResourceLease | undefined;
-  const ensureBlocker = async (result: CommandReconciliationResult): Promise<void> => {
-    if (!commandExecution) return;
-    if (result.unresolved.length > 0 && !blocker) {
-      blocker = await commandExecution.resourceLeases.acquire(
-        {
-          accesses: [{ mode: 'execute', scope: 'processes' }],
-          lockScopes: ['files'],
-          recovery: { kind: 'unknown' }
-        },
-        'unresolved-process-reconciliation'
-      );
-    }
-    if (result.unresolved.length === 0 && blocker) {
-      blocker.release();
-      blocker = undefined;
-    }
-  };
-  const deliverRecovered = async (): Promise<void> => {
-    if (!ownsCommands || !commandExecution || !options.deliverRecoveredTerminalReport) return;
-    for (const report of commandExecution.recoveredTerminalReports()) {
-      if (await options.deliverRecoveredTerminalReport(report))
-        await commandExecution.acknowledgeTerminalReport(report.result.processId);
-    }
-  };
   return Object.freeze({
     tools,
     services,
@@ -185,27 +157,20 @@ export function createLocalToolHost(options: LocalToolHostOptions): LocalToolHos
     artifactRepository,
     ...(commandExecution ? { commandExecution } : {}),
     async ready() {
-      await ensureBlocker(await reconciliation);
-      await deliverRecovered();
+      await commandExecution?.reconcile();
     },
-    reconciliation: () => reconciliation,
+    reconciliation: async () => commandExecution ? commandExecution.reconcile() : noProcesses,
     async resolveReconciliation(
       input: {
         readonly acknowledge?: readonly { readonly processId: string; readonly revision: string }[];
       } = {}
     ) {
-      if (!ownsCommands || !commandExecution) return noProcesses;
+      if (!commandExecution) return noProcesses;
       if (input.acknowledge?.length)
         await commandExecution.acknowledgeUnresolved(input.acknowledge);
-      reconciliation = commandExecution.retryReconciliation();
-      const result = await reconciliation;
-      await ensureBlocker(result);
-      await deliverRecovered();
-      return result;
+      return commandExecution.retryReconciliation();
     },
     async close() {
-      blocker?.release();
-      blocker = undefined;
       try {
         if (ownsCommands) await commandExecution?.close();
       } finally {

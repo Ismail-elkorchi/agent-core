@@ -1,5 +1,5 @@
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
-import type { ProtectedArtifactRef, PublicArtifactRef } from '@agent-core/persistence';
+import type { EventReference, ProtectedArtifactRef, PublicArtifactRef } from '@agent-core/persistence';
 import type { ToolProgress, ToolResourceLease } from './context.js';
 import type { ResourceLeaseCoordinator } from './resource-leases.js';
 import { isResourceLeaseCoordinator } from './resource-leases.js';
@@ -138,7 +138,27 @@ export interface CommandExecutionResult {
 export interface CommandExecutionReport {
   readonly result: CommandExecutionResult;
   readonly protectedArtifact?: ProtectedArtifactRef;
+  /** Existing durable settlement; consumers acknowledge it without recording it again. */
+  readonly settlementReference?: EventReference;
 }
+
+/** A refusal establishes that the target command was never dispatched. */
+export type CommandStartResult =
+  | Readonly<{ kind: 'not_started'; diagnostic: string }>
+  | Readonly<{ kind: 'started'; result: CommandExecutionResult }>;
+
+interface CommandProcessIdentity {
+  readonly processId: string;
+  readonly revision: string;
+  readonly command?: string;
+  readonly rootPath?: string;
+  readonly diagnostic?: string;
+}
+
+export type CommandProcess = CommandProcessIdentity & (
+  | Readonly<{ status: CommandExecutionStatus | 'acknowledged-unknown'; owner: CommandExecutionOwner }>
+  | Readonly<{ status: 'unknown'; owner?: CommandExecutionOwner }>
+);
 
 export interface CommandUncertaintyAcceptance {
   readonly processId: string;
@@ -152,6 +172,8 @@ export interface CommandReconciliationResult {
     readonly revision: string;
     readonly rootPath: string;
     readonly diagnostic: string;
+    readonly owner?: CommandExecutionOwner;
+    readonly command?: string;
   }[];
 }
 
@@ -167,7 +189,8 @@ export interface CommandExecution {
   start(
     plan: CommandExecutionReservation,
     options?: StartCommandExecutionOptions
-  ): Promise<CommandExecutionResult>;
+  ): Promise<CommandStartResult>;
+  listProcesses(): Promise<readonly CommandProcess[]>;
   query(
     processId: string,
     outputTokenBudget: number,
@@ -252,7 +275,7 @@ export async function startCommandExecutionPlan(
   authority: CommandExecution,
   plan: CommandExecutionPlan,
   options: StartCommandExecutionOptions = {}
-): Promise<CommandExecutionResult> {
+): Promise<CommandStartResult> {
   const record = requireCommandExecutionPlan(plan, authority);
   if (record.state !== 'plan') throw new Error('Command execution planning is single-use.');
   record.state = 'started';
@@ -295,6 +318,7 @@ export function adoptCommandExecution(value: unknown): CommandExecution {
   const complete = [
     'plan',
     'start',
+    'listProcesses',
     'query',
     'writeInput',
     'closeInput',

@@ -3828,7 +3828,19 @@ export class AgentRuntime {
     if (!resources || resources.lifetime.kind === 'owner') return undefined;
     try {
       for (const report of await resources.release(runId)) {
-        await append(
+        const key = `${runId}:resource:${report.resourceId}:released`;
+        const previous =
+          report.settlementReference ??
+          (await this.options.repositories.events.referenceByKey(runId, key));
+        if (previous) {
+          const { event } = await this.options.repositories.events.readReference(previous);
+          if (
+            event.type !== 'resource.released' ||
+            event.resourceId !== report.resourceId ||
+            event.outcome !== report.outcome
+          )
+            throw new Error('Committed resource settlement does not match its release report.');
+        } else await append(
           {
             type: 'resource.released',
             runId,
@@ -3836,7 +3848,7 @@ export class AgentRuntime {
             outcome: report.outcome,
             details: report.details
           },
-          `${runId}:resource:${report.resourceId}:released`
+          key
         );
         if (report.outcome === 'unknown')
           return new Error(`Resource ${report.resourceId} release outcome is unknown.`);
