@@ -11,7 +11,6 @@ import {
   type CompiledModelRequest,
   type ModelCompilationOptions,
   type ModelDiscoveryOptions,
-  type ModelProfile,
   type ModelProvider,
   ModelProviderError,
   type ModelProviderInfo,
@@ -35,6 +34,7 @@ import { type CodexCatalogModel, decodeCodexCatalog } from './catalog.js';
 
 import {
   OPENAI_CODEX_BASE_URL,
+  OPENAI_CODEX_CATALOG_CLIENT_VERSION,
   OPENAI_CODEX_DEFAULT_MODEL,
   OPENAI_CODEX_PROVIDER_ID
 } from './constants.js';
@@ -194,7 +194,7 @@ export class OpenAICodexProvider implements ModelProvider {
     if (this.catalog !== undefined && !options.refresh) return this.catalog;
     const token = await this.tokenForRequest(options.signal);
     const url = new URL(this.baseUrl.replace(/\/responses$/u, '/models'));
-    url.searchParams.set('client_version', '0.156.0');
+    url.searchParams.set('client_version', OPENAI_CODEX_CATALOG_CLIENT_VERSION);
     const response = await this.fetchImpl(url, {
       headers: this.headersForRequest(token.token, this.codexAccountId(token), false),
       ...(options.signal === undefined ? {} : { signal: options.signal })
@@ -213,49 +213,41 @@ export class OpenAICodexProvider implements ModelProvider {
 
   async describeModel(model: string) {
     const selectedModel = model || this.defaultModel;
-    let discovered = this.catalog?.find((entry) => entry.id === selectedModel);
-    let profile: ModelProfile;
-    if (this.modelProfiles[selectedModel] !== undefined)
-      profile = describeOpenAICodexModel(selectedModel, this.modelProfiles);
-    else if (discovered !== undefined) profile = discovered.profile;
-    else if (this.catalog !== undefined)
+    let profile = this.modelProfiles[selectedModel] !== undefined
+      ? describeOpenAICodexModel(selectedModel, this.modelProfiles)
+      : this.catalog?.find((entry) => entry.id === selectedModel)?.profile;
+    if (profile === undefined && this.catalog === undefined) {
+      try {
+        profile = describeOpenAICodexModel(selectedModel, this.modelProfiles);
+      } catch (error) {
+        if (!(error instanceof ModelProviderError) || error.code !== 'model_unavailable') throw error;
+        profile = (await this.listModels()).find((entry) => entry.id === selectedModel)?.profile;
+      }
+    } else {
+      profile ??= (await this.listModels({ refresh: true }))
+        .find((entry) => entry.id === selectedModel)?.profile;
+    }
+    if (profile === undefined)
       throw new ModelProviderError({
         provider: this.id,
         code: 'model_unavailable',
         message: `Model is unavailable in this account: ${selectedModel}`
       });
-    else {
-      try {
-        profile = describeOpenAICodexModel(selectedModel, this.modelProfiles);
-      } catch (error) {
-        if (!(error instanceof ModelProviderError) || error.code !== 'model_unavailable') throw error;
-        discovered = (await this.listModels()).find((entry) => entry.id === selectedModel);
-        if (discovered === undefined)
-          throw new ModelProviderError({
-            provider: this.id,
-            code: 'model_unavailable',
-            message: `Model is unavailable in this account: ${selectedModel}`
-          });
-        profile = discovered.profile;
+    return parseModelProfile({
+      ...profile,
+      capabilities: {
+        ...profile.capabilities,
+        protocol: conservativeProtocolCapabilities(this.baseUrl, {
+          reasoningAccounting: 'included_output',
+          revision: 'codex-responses-2026-09-07-v1',
+          roles: ['system', 'developer', 'user', 'assistant'],
+          inputKinds: ['text', 'image', 'tool_call', 'tool_result', 'protocol'],
+          outputKinds: ['text', 'tool_call', 'protocol', 'refusal'],
+          state: 'exact',
+          continuation: 'replay'
+        })
       }
-    }
-    return Promise.resolve(
-      parseModelProfile({
-        ...profile,
-        capabilities: {
-          ...profile.capabilities,
-          protocol: conservativeProtocolCapabilities(this.baseUrl, {
-            reasoningAccounting: 'included_output',
-            revision: 'codex-responses-2026-09-07-v1',
-            roles: ['system', 'developer', 'user', 'assistant'],
-            inputKinds: ['text', 'image', 'tool_call', 'tool_result', 'protocol'],
-            outputKinds: ['text', 'tool_call', 'protocol', 'refusal'],
-            state: 'exact',
-            continuation: 'replay'
-          })
-        }
-      })
-    );
+    });
   }
 
   async compileRequest(

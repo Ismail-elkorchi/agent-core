@@ -66,6 +66,47 @@ async function backend(kind) {
   };
 }
 for (const kind of ['memory', 'jsonl']) {
+  test(`${kind}: history excerpts budget JSON escaping and preserve exact retrievable sources`, async () => {
+    const { sessions } = await backend(kind);
+    const session = await sessions.create({ binding });
+    const output = { text: `needle ${'"\\\n\t改正😀'.repeat(700)}` };
+    for (let i = 0; i < 3; i++) {
+      await sessions.appendObservation(session, {
+        runId: 'run',
+        identity: { ...identity, toolBatchId: 'batch', callIndex: i, toolAttempt: 1 },
+        toolName: 'read',
+        observation: { kind: 'result', summary: 'original read', output }
+      });
+    }
+    const history = new HistoryReader({ repository: sessions, session });
+    const sources = [];
+    let cursor;
+    do {
+      const page = await history.search({
+        query: 'needle', filter: { sourceType: 'observation' }, limit: 2, maxBytes: 2200, cursor
+      });
+      assert(page.items.length > 0);
+      assert(page.bytes <= 2200);
+      assert.equal(page.bytes, page.items.reduce(
+        (sum, item) => sum + Buffer.byteLength(JSON.stringify(item)), 0
+      ));
+      for (const item of page.items) {
+        assert.equal(item.truncated, true);
+        assert.match(item.text, /needle/);
+        assert(!item.text.includes('\uFFFD'));
+        const original = await history.read({ source: item.source, maxBytes: 32768 });
+        assert.equal(original.status, 'available');
+        assert.equal(original.item.truncated, false);
+        assert.equal(JSON.parse(original.item.text).output.text, output.text);
+        assert(original.item.text.startsWith(item.text));
+        sources.push(item.source.entryId);
+      }
+      cursor = page.cursor;
+    } while (cursor);
+    assert.equal(sources.length, 3);
+    assert.equal(new Set(sources).size, 3);
+  });
+
   test(`${kind}: 1000 completed original inputs remain searchable with bounded pages and stable cuts`, async () => {
     const { sessions } = await backend(kind);
     const session = await sessions.create({ id: 'session', binding });

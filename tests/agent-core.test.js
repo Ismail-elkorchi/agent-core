@@ -2849,6 +2849,56 @@ test('tool planning and authorization are abortable and elapsed-deadline bounded
   assert.equal(deadlineResult.exhaustedLimit, 'elapsed_time');
 });
 
+test('thrown read failures reach the model, while possibly executed mutations require recovery', async () => {
+  for (const mode of ['read', 'write', 'execute', 'network', 'delete']) {
+    let invocations = 0;
+    const provider = new ScriptedProvider([
+      response('tool_calls', '', { toolCalls: [
+        { id: 'call', type: 'function', name: 'operation', input: { kind: 'json', value: {} } }
+      ] }),
+      (request) => {
+        assert.match(request.messages.find((message) => message.role === 'tool').content, /source unavailable/);
+        return response('stop', 'Read failure handled.');
+      }
+    ]);
+    const effects = { accesses: [{ mode, scope: 'resource' }], lockScopes: [], recovery: { kind: 'unknown' } };
+    const tool = {
+      name: 'operation', implementationId: `tests.failure-${mode}@1`, description: 'operation',
+      jsonSchema: { type: 'object' }, outputSchema: emptyOutputSchema,
+      effectEnvelope: { accesses: effects.accesses, lockScopes: [] },
+      decodeInput() { return { ok: true, input: {} }; },
+      canonicalizeInput(input) { return input; },
+      snapshotInput(input) { return input; },
+      deriveEffects() { return effects; },
+      bindExecution(input) {
+        return { snapshot: input, async invoke() {
+          invocations++;
+          throw new Error('source unavailable');
+        } };
+      }
+    };
+    const { agent, events, artifacts } = await harness({
+      provider, tools: [tool], toolPolicy: { allowedRisks: ['read', 'write', 'execute', 'network', 'destructive'] }
+    });
+    const run = agent.run({ task: 'Use the operation.' });
+    const result = await run.result;
+    assert.equal(invocations, 1, mode);
+    const record = (await eventsFor(events, run.runId)).find((event) => event.type === 'tool.ended');
+    const observation = await resolveToolObservation(record.observation, artifacts);
+    assert.equal(observation.kind, 'failure');
+    assert.equal(observation.output.reason, 'runtime_error');
+    assert.equal(observation.execution.state, mode === 'read' ? 'settled' : 'unknown');
+    if (mode === 'read') {
+      assert.equal(ended(result).executionStatus, 'completed');
+      assert.equal(provider.calls.length, 2);
+    } else {
+      assert.equal(result.state, 'suspended');
+      assert.equal(result.reason, 'tool_outcome_unknown');
+      assert.equal(provider.calls.length, 1);
+    }
+  }
+});
+
 test('completed tool failures with unknown recovery are not replayed automatically', async () => {
   const call = { id: '1', type: 'function', name: 'effect', input: { kind: 'json', value: {} } };
   const provider = new ScriptedProvider([

@@ -6,6 +6,8 @@ The default is `gpt-5.6`, with built-in Sol, Terra, and Luna profiles. `listMode
 
 Bounded Responses framing is shared with the Platform adapter; credentials, headers, model policy, and continuation behavior are not.
 
+Catalog requests declare the adapter's supported Codex client compatibility version; the backend uses it to gate model visibility. Model identities and capabilities come from the account catalog rather than a release-specific allowlist. A selected model absent from a cached catalog triggers fresh discovery before it is reported unavailable; discovery failures remain distinct from account availability.
+
 Typed protocol replay preserves native reasoning items and developer authority, with explicit endpoint/model/prefix compatibility. Compiled session methods reuse the admitted full body before applying the existing conservative exact-prefix WebSocket optimization. Changed instructions, catalogs or input prefixes retain full-replay fallback. Platform Astra steering/async/context-transform support is not inferred for the subscription endpoint.
 
 This transport rejects a requested generation cap. `compileRequest(request, { outputReservation })` therefore receives an explicit host reservation policy, not a server-enforced cap. Core supplies its selected request-window reservation for both primary and auxiliary inference. Standalone compilation without a policy marks output reservation unknown; it cannot pass governed admission. Never reserve zero by default or equate encrypted state bytes with logical tokens.

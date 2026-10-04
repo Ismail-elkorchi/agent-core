@@ -17,7 +17,7 @@ test('Codex catalog efforts do not prevent low or high requests for Astra or oth
     auth: bearerProvider(codexJwt()),
     fetch: async (url, init) => {
       if (new URL(url).pathname.endsWith('/models')) {
-        assert.equal(new URL(url).searchParams.get('client_version'), '0.156.0');
+        assert.equal(new URL(url).searchParams.get('client_version'), '0.160.0');
         catalogRequests++;
         return jsonResponse({ models: ['gpt-6-astra', 'another-model'].map((slug) => ({
           slug,
@@ -53,6 +53,49 @@ test('Codex catalog efforts do not prevent low or high requests for Astra or oth
   }), /reasoning effort unadvertised is not supported/u);
   assert.equal(catalogRequests, 1);
   assert.equal(calls.length, 6);
+});
+
+test('Codex discovers newly released models and refreshes a missing cached identity', async () => {
+  let requests = 0;
+  let available = ['gpt-6-astra'];
+  const efforts = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+  const provider = new OpenAICodexProvider({
+    auth: bearerProvider(codexJwt()),
+    fetch: async (input) => {
+      const url = new URL(input);
+      assert.equal(url.pathname, '/backend-api/codex/models');
+      assert.equal(url.searchParams.get('client_version'), '0.160.0');
+      requests++;
+      return jsonResponse({ models: available.map((slug) => ({
+        slug, display_name: slug, input_modalities: ['text', 'image'], context_window: 272_000,
+        default_reasoning_level: 'low', supports_reasoning_summary_parameter: true,
+        supported_reasoning_levels: efforts.map((effort) => ({ effort, description: effort }))
+      })) });
+    }
+  });
+  assert.deepEqual((await provider.listModels()).map((entry) => entry.id), ['gpt-6-astra']);
+  available = ['gpt-6.1-sol', 'gpt-6-astra', 'new-catalog-model'];
+  const profile = await provider.describeModel('gpt-6.1-sol');
+  assert.equal(requests, 2);
+  assert.equal(profile.id, 'gpt-6.1-sol');
+  assert.equal(profile.limits.contextTokens, 272_000);
+  assert.deepEqual(profile.capabilities.reasoning.efforts, efforts);
+  assert.equal(profile.capabilities.reasoning.canDisable, false);
+  assert.equal(profile.metadata.defaultReasoningEffort, 'low');
+  assert.deepEqual((await provider.listModels()).map((entry) => entry.id), available);
+  assert.equal((await provider.describeModel('new-catalog-model')).id, 'new-catalog-model');
+  const compiled = await provider.compileRequest({
+    model: 'gpt-6.1-sol', messages: [{ role: 'user', content: 'Inspect this code.' }],
+    reasoning: { strategy: 'effort', effort: 'ultra' }
+  }, { outputReservation: 100 });
+  assert.equal(compiled.body.model, 'gpt-6.1-sol');
+  assert.equal(compiled.body.reasoning.effort, 'ultra');
+  assert.equal(requests, 2, 'known profiles reuse the account catalog');
+  await assert.rejects(provider.describeModel('unavailable-model'), (error) => {
+    assert.equal(error.code, 'model_unavailable');
+    return true;
+  });
+  assert.equal(requests, 3, 'a cached miss is confirmed through fresh discovery');
 });
 
 test('OpenAICodexProvider describes the ChatGPT subscription Responses profile', async () => {

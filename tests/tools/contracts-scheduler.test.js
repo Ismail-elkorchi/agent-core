@@ -133,6 +133,7 @@ test('derived effects cannot exceed their envelope and output is validated befor
   const observation = await invokePlannedForTest(validPlan.plan, context);
   assert.equal(observation.kind, 'failure');
   assert.equal(observation.output.reason, 'invalid_output');
+  assert.equal(observation.execution.state, 'settled');
 });
 
 test('tool planning authority transfers once and releases every owned resource', async () => {

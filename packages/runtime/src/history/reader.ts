@@ -1,5 +1,5 @@
 import { parseJsonObject } from '@agent-core/json';
-import { encodeToolFailureOutput } from '@agent-core/tools';
+import { encodeToolFailureOutput, ToolInputError } from '@agent-core/tools';
 import {
   hashJson,
   type ArtifactRepository,
@@ -844,17 +844,24 @@ export class HistoryReader {
         const excerpt = textRange(
           fullText,
           Buffer.byteLength(fullText.slice(0, Math.max(0, match - 128))),
-          Math.min(Math.max(0, room - Buffer.byteLength(JSON.stringify(metadata)) - 32), 16 * 1024)
+          16 * 1024
+        );
+        const text = jsonStringPrefix(
+          excerpt.text,
+          room - Buffer.byteLength(JSON.stringify({ ...metadata, truncated: false }))
         );
         const item = Object.freeze({
           ...metadata,
-          text: excerpt.text,
-          truncated: excerpt.offset > 0 || excerpt.nextOffset < excerpt.totalBytes
+          text,
+          truncated: excerpt.offset > 0 || text.length < fullText.length
         });
         const size = Buffer.byteLength(JSON.stringify(item));
         if (size > room) {
           if (!items.length)
-            throw new Error('History result byte budget cannot fit one source reference.');
+            throw new ToolInputError('History result byte budget cannot fit one source reference.', {
+              maxBytes,
+              requiredBytes: size
+            });
           position = prior;
           break;
         }
@@ -955,6 +962,19 @@ function historyItem(sessionId: string, entry: SessionBranchEntry, maxBytes: num
       ? { completeness: entry.completeness }
       : {})
   });
+}
+
+/** Bound encoded JSON bytes while retaining original text and whole Unicode code points. */
+function jsonStringPrefix(text: string, maxBytes: number): string {
+  let bytes = 0;
+  let end = 0;
+  for (const character of text) {
+    const size = Buffer.byteLength(JSON.stringify(character)) - 2;
+    if (bytes + size > maxBytes) break;
+    bytes += size;
+    end += character.length;
+  }
+  return text.slice(0, end);
 }
 function publicText(entry: SessionBranchEntry): string {
   switch (entry.type) {

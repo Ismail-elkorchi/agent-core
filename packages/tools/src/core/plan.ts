@@ -51,6 +51,7 @@ export interface ToolCallPlan {
 export interface ToolInvocation {
   readonly [TOOL_INVOCATION]: true;
   readonly call: ToolCall;
+  readonly effects: ToolEffects;
   readonly effectId: string;
   readonly driverGeneration: number;
 }
@@ -285,6 +286,7 @@ export async function startToolCallPlan(
   const invocation = Object.freeze({
     [TOOL_INVOCATION]: true as const,
     call: plan.call,
+    effects: plan.effects,
     effectId: effect.intent.effectId,
     driverGeneration: effect.ticket.driverGeneration
   });

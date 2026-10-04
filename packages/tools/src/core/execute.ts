@@ -18,10 +18,17 @@ export async function invokeToolCallPlan(
   context: ToolExecutionContext
 ): Promise<ToolObservation> {
   throwIfAborted(context.signal);
+  // A failed read cannot leave an unconfirmed mutation. Settlement describes the
+  // invocation boundary; the failure still describes unavailable or invalid evidence.
+  const failureExecution = {
+    state: invocation.effects.accesses.every((access) => access.mode === 'read')
+      ? 'settled' as const
+      : 'unknown' as const
+  };
   try {
     const observation = await beginToolInvocation(invocation, context);
     return observation.kind === 'failure' && !observation.execution
-      ? updateToolObservation(observation, { execution: { state: 'unknown' } })
+      ? updateToolObservation(observation, { execution: failureExecution })
       : observation;
   } catch (error) {
     if (error instanceof ToolInvocationAuthorityError) throw error;
@@ -29,15 +36,15 @@ export async function invokeToolCallPlan(
     if (error instanceof MissingToolServiceError)
       return updateToolObservation(
         missingServiceObservation(invocation.call.name, error.serviceName, error.details),
-        { execution: { state: 'unknown' } }
+        { execution: failureExecution }
       );
     if (error instanceof ToolInputError)
       return updateToolObservation(
         invalidToolInputObservation(invocation.call.name, error.message, error.details),
-        { execution: { state: 'unknown' } }
+        { execution: failureExecution }
       );
     return updateToolObservation(runtimeErrorObservation(invocation.call.name, error), {
-      execution: { state: 'unknown' }
+      execution: failureExecution
     });
   }
 }

@@ -171,6 +171,25 @@ test('a bounded empty history search does not imply absence from unscanned histo
   assert.equal(JSON.parse(parts[0].text).cursor, result.output.cursor);
 });
 
+test('an insufficient history result budget is an actionable settled read failure', async () => {
+  const sessions = new InMemorySessionRepository();
+  const session = await sessions.create({
+    binding: { schemaId: 'test', schemaVersion: 1, subject: {} }
+  });
+  await sessions.appendInput(session, { runId: 'run', task: 'needle' });
+  const history = new HistoryReader({ repository: sessions, session });
+  const result = await invokeToolCall(
+    jsonToolCall('history_search', { query: 'needle', maxBytes: 1 }),
+    createHistoryTools({ history }),
+    { policy: { allowedRisks: ['read'] } }
+  );
+  assert.equal(result.kind, 'failure');
+  assert.equal(result.execution.state, 'settled');
+  assert.equal(result.output.reason, 'invalid_arguments');
+  assert.equal(result.output.details.maxBytes, 1);
+  assert(result.output.details.requiredBytes > 1);
+});
+
 test('context inspection explains adjusted capacity and does not expose the accounting component ledger', async () => {
   const sessions = new InMemorySessionRepository();
   const session = await sessions.create({

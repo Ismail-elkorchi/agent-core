@@ -1,6 +1,8 @@
 export const OPENAI_CODEX_PROVIDER_ID = 'openai-codex';
 export const OPENAI_CODEX_DEFAULT_MODEL = 'gpt-5.6';
 export const OPENAI_CODEX_BASE_URL = 'https://chatgpt.com/backend-api';
+// The catalog requires a Codex compatibility version and gates model visibility on it.
+export const OPENAI_CODEX_CATALOG_CLIENT_VERSION = '0.160.0';
 export const OPENAI_CODEX_CREDENTIAL_KEY = 'openai-codex';
 
 export const OPENAI_CODEX_AUTH_BASE_URL = 'https://auth.openai.com';
