@@ -1,4 +1,4 @@
-import { textEditSchema, unicodeTextSchema, type TextEdit } from '@agent-core/tools';
+import { unicodeTextSchema } from '@agent-core/tools';
 import type { CompiledModelRequest, ModelProfile, ModelRequest } from '@agent-core/model';
 import { hashJson } from '@agent-core/persistence';
 import * as z from 'zod';
@@ -8,7 +8,7 @@ import { ContextAdmissionError } from '../inference/request-admission.js';
 import type { ContextService } from './service.js';
 import { WORKING_STATE_GUIDANCE } from '../session/working-state.js';
 
-const proposalSchema = z.strictObject({ edits: z.array(textEditSchema) });
+const proposalSchema = z.strictObject({ text: unicodeTextSchema });
 
 export function workingStateRenewalRequest(request: ModelRequest): ModelRequest {
   const renewal = {
@@ -17,7 +17,7 @@ export function workingStateRenewalRequest(request: ModelRequest): ModelRequest 
       ...request.messages,
       {
         role: 'user' as const,
-        content: `Runtime context-maintenance task. ${WORKING_STATE_GUIDANCE} Return only a JSON object {"edits":[...]} using exact nonoverlapping text edits against the current working state. Line and Unicode-scalar column numbers are one-based; ranges are half-open and all address the original text. Preserve newline characters. Creation inserts at 1:1 in empty text. Schema: ${JSON.stringify(z.toJSONSchema(proposalSchema))}. Return {"edits":[]} when unchanged. Preserve understanding useful for the next inference; do not execute the original task or answer the user. This auxiliary request is not a new user contribution.`
+        content: `Runtime context-maintenance task. ${WORKING_STATE_GUIDANCE} Return only a JSON object {"text":"..."} containing the complete current working state. Consolidate current understanding and remove superseded claims; original history already preserves earlier interpretations. Schema: ${JSON.stringify(z.toJSONSchema(proposalSchema))}. Return the current text unchanged when no revision is useful. Preserve understanding useful for the next inference; do not execute the original task or answer the user. This auxiliary request is not a new user contribution.`
       }
     ]
   };
@@ -26,7 +26,7 @@ export function workingStateRenewalRequest(request: ModelRequest): ModelRequest 
   return renewal;
 }
 
-/** Renewal proposes edits; only admitted context publication makes them current. */
+/** Renewal proposes current understanding; admitted publication activates state and window together. */
 export async function stageWorkingStateRenewal(input: {
   readonly inference: InferenceService;
   readonly context: ContextService;
@@ -64,11 +64,11 @@ export async function stageWorkingStateRenewal(input: {
       compiled,
       new Error('Working-state renewal was incomplete; no state or window was published.')
     );
-  let edits: readonly TextEdit[];
+  let text: string;
   try {
-    edits = proposalSchema.parse(
+    text = proposalSchema.parse(
       JSON.parse(unicodeTextSchema.parse(result.response.content)) as unknown
-    ).edits;
+    ).text;
   } catch (cause) {
     throw new ContextAdmissionError(compiled, cause);
   }
@@ -77,7 +77,7 @@ export async function stageWorkingStateRenewal(input: {
     id: invocationId,
     revisionId: origin.revisionId,
     inference: origin.inference,
-    edits
+    text
   });
   if ('status' in change && change.status !== 'unchanged')
     throw new ContextAdmissionError(

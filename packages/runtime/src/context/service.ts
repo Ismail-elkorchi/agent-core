@@ -11,10 +11,9 @@ import {
 import { randomUUID } from 'node:crypto';
 import type { HistorySourceCut, HistorySourceRef } from '../history/contracts.js';
 import { HistoryReader, sameHistorySource, textRange } from '../history/reader.js';
-import { applyTextEdits, type TextEdit, type ToolInvocationContext } from '@agent-core/tools';
+import type { ToolInvocationContext } from '@agent-core/tools';
 import {
   assertWorkingStateRevision,
-  workingStateAtEntry,
   type WorkingStateChange,
   type WorkingStateSnapshot,
   type WorkingStateInference
@@ -474,7 +473,7 @@ export class ContextService {
     readonly id: string;
     readonly revisionId: string | null;
     readonly inference: WorkingStateInference;
-    readonly edits: readonly TextEdit[];
+    readonly text: string;
   }): Promise<
     | WorkingStateChange
     | { readonly status: 'unchanged' }
@@ -494,10 +493,8 @@ export class ContextService {
     const current = await this.workingState();
     if ((current.revision?.id ?? null) !== input.revisionId)
       return { status: 'conflict', current: await this.inspectWorkingState() };
-    const result = applyTextEdits(current.text, input.edits);
-    if (result.status === 'invalid') return result;
-    if (result.content === current.text) return { status: 'unchanged' };
-    const bytes = new TextEncoder().encode(result.content);
+    if (input.text === current.text) return { status: 'unchanged' };
+    const bytes = new TextEncoder().encode(input.text);
     if (bytes.byteLength > this.options.policy.maxSourceBytes)
       return {
         status: 'invalid',
@@ -547,30 +544,8 @@ export class ContextService {
         entry.previousRevisionId !== input.revisionId
       )
         throw new PersistenceConflictError('Working-state retry does not match its publication.');
-      let original = '';
-      if (entry.previousRevisionId !== null) {
-        const metadata = snapshot.entries.find(
-          (source) => source.entryId === entry.previousRevisionId
-        );
-        if (!metadata)
-          throw new PersistenceConflictError('Working-state predecessor is outside this branch.');
-        const previous = await this.history.resolve(
-          { sessionId: cut.sessionId, entryId: metadata.entryId, sha256: metadata.sha256 },
-          cut
-        );
-        const revision = previous && workingStateAtEntry(previous);
-        if (!revision)
-          throw new PersistenceConflictError('Working-state predecessor is unavailable.');
-        original = new TextDecoder('utf-8', { fatal: true }).decode(
-          await this.options.artifacts.readVerified(revision.contentRef)
-        );
-      }
-      const replay = applyTextEdits(original, input.edits);
-      if (
-        replay.status !== 'applied' ||
-        hashArtifactBytes(new TextEncoder().encode(replay.content)) !== entry.contentRef.sha256
-      )
-        throw new PersistenceConflictError('Working-state retry has different substantive edits.');
+      if (hashArtifactBytes(new TextEncoder().encode(input.text)) !== entry.contentRef.sha256)
+        throw new PersistenceConflictError('Working-state retry has different content.');
       // Reconcile the receipt before looking at today's head: later revisions do not invalidate a committed update.
       return { status: 'committed' as const, revisionId: entry.id };
     }

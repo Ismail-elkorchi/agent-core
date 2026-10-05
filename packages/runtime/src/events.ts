@@ -1750,6 +1750,7 @@ function decodePromptMaterial(value: JsonValue | undefined): PromptMaterial {
     'images',
     'instructions',
     'context',
+    'workingState',
     'tools',
     'outputContract',
     'metadata'
@@ -1767,6 +1768,9 @@ function decodePromptMaterial(value: JsonValue | undefined): PromptMaterial {
     context: requiredArray(object.context, 'material.context').map((item, index) =>
       decodePromptContextItem(item, `material.context[${String(index)}]`)
     ),
+    ...(object.workingState === undefined
+      ? {}
+      : { workingState: decodePromptContextItem(object.workingState, 'material.workingState') }),
     tools: requiredArray(object.tools, 'material.tools').map((item, index) =>
       decodePromptTool(item, `material.tools[${String(index)}]`)
     ),

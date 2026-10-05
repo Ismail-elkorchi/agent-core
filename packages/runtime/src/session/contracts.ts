@@ -262,7 +262,7 @@ export type SessionSubmissionState = 'claimed' | 'suspended' | 'completed' | 'fa
 export type SessionSuspensionCategory =
   | 'approval'
   | 'external_recovery'
-  | 'implementation'
+  | 'runtime'
   | 'context_admission'
   | 'user_decision';
 export type SessionSuspensionAction =
@@ -272,22 +272,27 @@ export type SessionSuspensionAction =
   | 'decide'
   | 'context'
   | 'abort';
-export interface SessionSuspensionDescriptor {
+interface SessionSuspensionScope {
   readonly contextAdmission?: import('../run/context-admission.js').ContextAdmissionConflict;
   readonly runId: string;
   readonly submissionId: string;
   readonly category: SessionSuspensionCategory;
-  readonly reason:
-    | 'approval_required'
-    | 'provider_outcome_unknown'
-    | 'tool_outcome_unknown'
-    | 'missing_implementation'
-    | 'context_admission'
-    | 'user_decision';
   readonly effectId?: string;
   readonly actions: readonly SessionSuspensionAction[];
   readonly decisionRequest?: AgentDecisionRequest;
 }
+
+export type SessionSuspensionDescriptor = SessionSuspensionScope & (
+  | Readonly<{
+      reason: 'runtime_failed';
+      diagnostic: string;
+    }>
+  | Readonly<{
+      reason: 'approval_required' | 'provider_outcome_unknown' | 'tool_outcome_unknown' |
+        'missing_implementation' | 'context_admission' | 'user_decision';
+      diagnostic?: never;
+    }>
+);
 
 type SessionSubmissionTransitionBase = Readonly<{
   readonly submissionId: string;

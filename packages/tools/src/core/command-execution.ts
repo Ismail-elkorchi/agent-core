@@ -125,6 +125,8 @@ export interface CommandExecutionResult {
   readonly cursorStart: number;
   readonly cursorEnd: number;
   readonly cursorExpired?: boolean;
+  /** Effective automatic termination deadline while the process is running. */
+  readonly deadline?: string;
   readonly stdout: CommandOutputView;
   readonly stderr: CommandOutputView;
   /** PTY output is one merged stream and is never relabelled as stdout/stderr. */

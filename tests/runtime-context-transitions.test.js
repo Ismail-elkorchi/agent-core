@@ -64,13 +64,7 @@ async function fixture() {
         content: request.tools
           ? 'Recorded answer.'
           : JSON.stringify({
-              edits: [
-                {
-                  range: { start: { line: 1, column: 1 }, end: { line: 1, column: 1 } },
-                  expectedText: '',
-                  replacementText: 'Recorded answer.'
-                }
-              ]
+              text: 'Recorded answer.'
             }),
         terminationReason: 'stop',
         usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 }
@@ -246,7 +240,7 @@ test('definitive provider overflow retries only a reduced admitted selection and
           model: 'context',
           content: request.tools?.length
             ? 'Continued after reduction.'
-            : JSON.stringify({ edits: [] }),
+            : JSON.stringify({ text: '' }),
           terminationReason: 'stop'
         };
       }

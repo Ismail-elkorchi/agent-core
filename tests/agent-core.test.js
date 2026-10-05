@@ -3173,3 +3173,45 @@ test('runtime terminal diagnostics preserve the underlying preparation release e
   const terminal = await readCommittedTerminal(run.events, result.terminal.runId);
   assert.equal(terminal.errorMessage, result.terminal.errorMessage);
 });
+
+for (const resuming of [false, true]) {
+  test(`abort waits for driver attachment ${resuming ? 'during recovery' : 'at startup'}`, async () => {
+    const attaching = deferred();
+    const release = deferred();
+    class GatedEvents extends InMemoryEventRepository {
+      failAttachment = resuming;
+      async appendConditional(runId, event, options) {
+        if (options.idempotencyKey === `${runId}:driver:1`) {
+          if (this.failAttachment) {
+            this.failAttachment = false;
+            throw new Error('Attachment unavailable');
+          }
+          attaching.resolve();
+          await release.promise;
+        }
+        return super.appendConditional(runId, event, options);
+      }
+    }
+    const events = new GatedEvents(agentEventCodec);
+    const first = await harness({ events });
+    const runId = 'attachment-abort';
+    let handle;
+    if (resuming) {
+      await assert.rejects(first.agent.run({ runId, task: 'Stop before inference.' }).result,
+        /Attachment unavailable/);
+      const reopened = await harness({ events, sessions: first.sessions, artifacts: first.artifacts });
+      handle = reopened.agent.resume(runId);
+    } else handle = first.agent.run({ runId, task: 'Stop before inference.' });
+    await attaching.promise;
+    const abort = handle.abort('Cancelled during attachment.');
+    await Promise.resolve();
+    const coordinator = new AgentRunCoordinator(events, first.artifacts);
+    assert.equal((await coordinator.inspect(runId)).state.control.status, 'detached');
+    release.resolve();
+    await abort;
+    const result = ended(await handle.result);
+    assert.equal(result.executionStatus, 'aborted');
+    assert.deepEqual(await coordinator.listUnfinished(), []);
+    assert.equal((await eventsFor(events, runId)).filter(e => e.type === 'run.ended').length, 1);
+  });
+}

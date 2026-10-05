@@ -60,7 +60,8 @@ export const writeStdinTool = defineTool({
       return processObservation(result);
     } catch (error) {
       if (error instanceof CommandProcessOperationRejectedError)
-        return processOperationRejectedObservation(error, inputChanged ? 'settled' : 'not_started');
+        return processOperationRejectedObservation(error, executor, owner, input.outputTokenBudget,
+          inputChanged ? 'settled' : 'not_started');
       throw error;
     }
   }

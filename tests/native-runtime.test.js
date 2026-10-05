@@ -502,15 +502,6 @@ test(
     let socket;
     const body1 = 'Retain the rationale.';
     const body2 = 'Retain the corrected rationale.';
-    const edit = (before, after) => ({
-      edits: [
-        {
-          range: { start: { line: 1, column: 1 }, end: { line: 1, column: before.length + 1 } },
-          expectedText: before,
-          replacementText: after
-        }
-      ]
-    });
     const provider = new OpenAIProvider({
       apiKey: 'fixture',
       transport: 'websocket',
@@ -527,7 +518,7 @@ test(
               : [
                   {
                     ...call(id + '-state', 'update_working_state'),
-                    arguments: JSON.stringify(id === 'r1' ? edit('', body1) : edit(body1, body2))
+                    arguments: JSON.stringify({ text: id === 'r1' ? body1 : body2 })
                   }
                 ];
           ws.feed(

@@ -17,7 +17,7 @@ import {
 } from '@agent-core/persistence';
 import { encodeToolObservation } from '@agent-core/tools';
 import type { AgentAuditEvent, AgentEvent } from '../../events.js';
-import type { AgentRunBudgetState } from '../contracts.js';
+import type { AgentRunBudgetState, AgentTerminalSnapshot } from '../contracts.js';
 import { toolEventKey, type AgentToolCallAttemptIdentity } from '../contracts.js';
 import type { StoredToolObservation } from '../../orchestration/observation-source.js';
 import {
@@ -171,8 +171,15 @@ export class AgentRunCoordinator {
   }
 
   async inspect(runId: string): Promise<AgentRunInspection> {
+    const inspection = await this.find(runId);
+    if (!inspection) throw new Error(`Run ${runId} has no durable run.`);
+    return inspection;
+  }
+
+  async find(runId: string): Promise<AgentRunInspection | undefined> {
     for (;;) {
       const before = await this.events.tail(runId);
+      if (before.sequence === -1) return undefined;
       const cached = this.lastInspection?.state.runId === runId ? this.lastInspection : undefined;
       if (
         cached?.tail.sequence === before.sequence &&
@@ -222,6 +229,17 @@ export class AgentRunCoordinator {
       });
       return this.lastInspection;
     }
+  }
+
+  async readTerminal(inspection: AgentRunInspection): Promise<AgentTerminalSnapshot> {
+    const record = await this.events.latestOfType(inspection.state.runId, 'run.ended');
+    if (
+      inspection.state.phase.kind !== 'terminal' ||
+      record?.event.type !== 'run.ended' ||
+      record.eventId !== inspection.state.phase.resultEventId
+    )
+      throw new Error(`Run ${inspection.state.runId} has no matching committed terminal result.`);
+    return record.event.terminal;
   }
 
   /** Read reported diagnostics for uncertain calls by identity, without replaying history. */

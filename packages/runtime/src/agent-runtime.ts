@@ -395,6 +395,7 @@ interface RunExecutionRuntime {
   readonly controller: AgentRunBudget;
   readonly providerContinuation?: ProviderExecutionContinuation;
   readonly restoring?: boolean;
+  readonly sessionInput?: import('./session/contracts.js').SessionInputEntry;
   readonly run: AgentRunDriver;
   readonly append: (event: AgentAuditEvent, idempotencyKey?: string) => Promise<EventAppendReceipt>;
   readonly emit: (event: AgentProgressEvent) => Promise<void>;
@@ -442,9 +443,8 @@ export class AgentRuntime {
   })[] = [];
   private activeAbortController: AbortController | undefined;
   private activeRunId: string | undefined;
-  private activeRuns: AgentRunCoordinator | undefined;
   private activeRunDriver: AgentRunDriver | undefined;
-  private activeRunReady: Promise<void> | undefined;
+  private activeRunReady: Promise<AgentRunDriver | undefined> | undefined;
   private activeAbortRequest: Promise<void> | undefined;
   private releasePromise: Promise<void> | undefined;
   private static readonly MAX_STEERING_ITEMS = 1024;
@@ -524,12 +524,13 @@ export class AgentRuntime {
       this.options.repositories.artifacts ?? this.inferenceService.options.artifacts
     );
     const abortController = new AbortController();
-    const runReady = Promise.resolve();
+    const runReady = runs.inspect(runId).then((inspection) =>
+      inspection.state.phase.kind === 'terminal' ? undefined : runs.attach(runId)
+    );
     this.activeAbortController = abortController;
     this.activeRunId = runId;
-    this.activeRuns = runs;
     this.activeRunReady = runReady;
-    const result = this.resumeActive(runId, signal, runs, abortController, runReady);
+    const result = this.resumeActive(runId, signal, abortController, runReady);
     return Object.freeze({
       runId,
       injectSteering: (steering: AgentSteeringInput) => this.injectSteering(runId, steering),
@@ -696,16 +697,14 @@ export class AgentRuntime {
       this.options.repositories.artifacts ?? this.inferenceService.options.artifacts
     );
     const runReady = attachedRun
-      ? Promise.resolve()
-      : runs.accept(this.runAcceptance(input)).then(() => undefined);
+      ? Promise.resolve(attachedRun)
+      : runs.accept(this.runAcceptance(input)).then(() => runs.attach(runId));
     this.activeAbortController = abortController;
     this.activeRunId = runId;
-    this.activeRuns = runs;
     this.activeRunReady = runReady;
     let cleanupExternalAbort: () => void = () => undefined;
     try {
-      await runReady;
-      const run = attachedRun ?? (await runs.attach(runId));
+      const run = await runReady;
       this.activeRunDriver = run;
       this.assertRuntimeMatchesRun(run);
       if (input.signal?.aborted)
@@ -728,11 +727,10 @@ export class AgentRuntime {
       removeRunItems(this.steerQueue, runId);
       if (this.activeAbortController === abortController) this.activeAbortController = undefined;
       if (this.activeRunId === runId) this.activeRunId = undefined;
-      if (this.activeRuns === runs) {
-        this.activeRuns = undefined;
+      if (this.activeRunReady === runReady) {
         this.activeRunDriver = undefined;
+        this.activeRunReady = undefined;
       }
-      if (this.activeRunReady === runReady) this.activeRunReady = undefined;
       await this.releaseResources();
     }
   }
@@ -740,15 +738,14 @@ export class AgentRuntime {
   private async resumeActive(
     runId: string,
     signal: AbortSignal | undefined,
-    runs: AgentRunCoordinator,
     abortController: AbortController,
-    runReady: Promise<void>
+    runReady: Promise<AgentRunDriver | undefined>
   ): Promise<AgentRunResult> {
     let cleanupExternalAbort: () => void = () => undefined;
     try {
-      const inspection = await runs.inspect(runId);
+      const run = await runReady;
       const terminal =
-        inspection.state.phase.kind === 'terminal'
+        run === undefined
           ? await this.options.repositories.events.latestOfType(runId, 'run.ended')
           : undefined;
       if (terminal?.event.type === 'run.ended') {
@@ -758,7 +755,7 @@ export class AgentRuntime {
           deliveryDiagnostics: Object.freeze([])
         });
       }
-      const run = await runs.attach(runId);
+      if (!run) throw new Error(`Terminal run ${runId} has no committed result.`);
       this.activeRunDriver = run;
       if (this.hasToolImplementationMismatch(run))
         return missingImplementationSuspension(run.state());
@@ -920,11 +917,10 @@ export class AgentRuntime {
       removeRunItems(this.steerQueue, runId);
       if (this.activeAbortController === abortController) this.activeAbortController = undefined;
       if (this.activeRunId === runId) this.activeRunId = undefined;
-      if (this.activeRuns === runs) {
-        this.activeRuns = undefined;
+      if (this.activeRunReady === runReady) {
         this.activeRunDriver = undefined;
+        this.activeRunReady = undefined;
       }
-      if (this.activeRunReady === runReady) this.activeRunReady = undefined;
       await this.releaseResources();
     }
   }
@@ -975,6 +971,10 @@ export class AgentRuntime {
     });
     let decision: ExecutionDecision;
     try {
+      const sessionInput = await this.recordSessionInput(
+        input, restoring || providerContinuation !== undefined
+      );
+      throwIfAborted(signal);
       if (run.state().phase.kind === 'accepted' && run.state().control.status === 'owned') {
         await this.advanceRun(run, 'initialize_run', {
           phase: {
@@ -994,7 +994,8 @@ export class AgentRuntime {
         append,
         emit,
         ...(providerContinuation ? { providerContinuation } : {}),
-        ...(restoring ? { restoring: true } : {})
+        ...(restoring ? { restoring: true } : {}),
+        ...(sessionInput ? { sessionInput } : {})
       });
     } catch (error) {
       if (error instanceof AgentRunOwnershipLostError) throw error;
@@ -1162,8 +1163,27 @@ export class AgentRuntime {
     return result;
   }
 
+  /** Record accepted input before cancellation or execution can produce a terminal outcome. */
+  private async recordSessionInput(input: ResolvedAgentRunInput, restoring: boolean) {
+    const session = this.options.repositories.session;
+    if (!session) return undefined;
+    const { repository, descriptor } = session;
+    const original = restoring
+      ? (await repository.loadReplayState(descriptor)).branch.find(
+          (entry) => entry.type === 'input' && entry.runId === input.runId
+        )
+      : undefined;
+    return repository.appendInput(descriptor, {
+      runId: input.runId,
+      task: input.task,
+      ...(input.images === undefined ? {} : { images: input.images }),
+      instructions: original?.type === 'input'
+        ? original.instructions
+        : [...(await this.currentApplicationInstructions()), ...runInstructions(input.instructions)]
+    });
+  }
+
   private async executeRun(runtime: RunExecutionRuntime): Promise<ExecutionDecision> {
-    throwIfAborted(runtime.signal);
     const providerPhase = currentProviderRequest(runtime.run.state());
     const failedAttempt =
       providerPhase?.stage === 'failed'
@@ -1204,16 +1224,7 @@ export class AgentRuntime {
     const initialPhase = runtime.run.state().phase;
     const initialToolPhase = currentToolBatch(runtime.run.state());
     const durableInstructions = initialToolPhase?.instructions;
-    const recordedInput =
-      this.options.repositories.session && (runtime.restoring || runtime.providerContinuation)
-        ? (
-            await this.options.repositories.session.repository.loadReplayState(
-              this.options.repositories.session.descriptor
-            )
-          ).branch.find((entry) => entry.type === 'input' && entry.runId === runtime.runId)
-        : undefined;
-    const originalInstructions =
-      recordedInput?.type === 'input' ? recordedInput.instructions : undefined;
+    const originalInstructions = runtime.sessionInput?.instructions;
     const effectiveInstructions = durableInstructions
       ? [...durableInstructions]
       : runtime.providerContinuation
@@ -1250,20 +1261,7 @@ export class AgentRuntime {
         task: runtime.input.task,
         ...(runtime.input.images === undefined ? {} : { images: runtime.input.images })
       });
-    let sessionEntryId: string | undefined;
-    if (this.options.repositories.session) {
-      const { repository, descriptor } = this.options.repositories.session;
-      const inputEntry = await repository.appendInput(descriptor, {
-        runId: runtime.runId,
-        task: runtime.input.task,
-        ...(runtime.input.images === undefined ? {} : { images: runtime.input.images }),
-        instructions: originalInstructions ?? [
-          ...(await this.currentApplicationInstructions()),
-          ...runInstructions(runtime.input.instructions)
-        ]
-      });
-      sessionEntryId = inputEntry.id;
-    }
+    const sessionEntryId = runtime.sessionInput?.id;
     const rebuild = async () =>
       rebuildModelWindowFromRepositories({
         ...(this.history ? { history: this.history } : {}),
@@ -2835,6 +2833,7 @@ export class AgentRuntime {
       ...contextInputs.run
     ];
     const assemble = async (window: ModelWindow, workingState: WorkingStateSnapshot) => {
+      const stateContext = workingStateContext(workingState)[0];
       const result = await this.requestAdmission.assemble(
         {
           window,
@@ -2854,7 +2853,8 @@ export class AgentRuntime {
                 ...(item.sourceUri ? { sourceUri: item.sourceUri } : {})
               }))
           }),
-          contextItems: [...capturedContext, ...workingStateContext(workingState)],
+          contextItems: capturedContext,
+          ...(stateContext ? { workingState: stateContext } : {}),
           tools: promptToolSpecs(
             [...request.snapshot.tools],
             request.snapshot.profile,
@@ -3961,19 +3961,11 @@ export class AgentRuntime {
     return receipt;
   }
   private async abortRun(runId: string, reason = 'Agent run aborted.'): Promise<void> {
-    const runs = this.activeRuns;
     const runReady = this.activeRunReady;
-    if (this.activeRunId !== runId || !runs || !runReady) return;
-    const driver = this.activeRunDriver;
-    if (driver?.state().runId === runId) {
-      await driver.requestAbort(reason);
-    } else {
-      await runReady;
-      if (this.activeRunId !== runId || this.activeRuns !== runs) return;
-      const attachedDriver = this.activeRunDriver;
-      if (attachedDriver?.state().runId === runId) await attachedDriver.requestAbort(reason);
-      else await runs.requestAbort(runId, reason);
-    }
+    if (this.activeRunId !== runId || !runReady) return;
+    const driver = await runReady;
+    if (this.activeRunId !== runId || this.activeRunReady !== runReady || !driver) return;
+    await driver.requestAbort(reason);
     if (this.activeRunId === runId) this.activeAbortController?.abort(reason);
   }
   private scheduleAbortRun(runId: string, reason = 'Agent run aborted.'): Promise<void> {

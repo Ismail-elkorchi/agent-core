@@ -8,6 +8,7 @@ import {
   type ToolExecutionContext
 } from '@agent-core/tools';
 import { processScope } from './resources.js';
+import { parseJsonObject } from '@agent-core/json';
 
 export function commandExecutor(context: ToolExecutionContext): CommandExecution {
   return requireToolService(context, 'commandExecution', isCommandExecution, 'CommandExecution');
@@ -45,17 +46,25 @@ export function processObservation(result: CommandExecutionResult) {
   };
 }
 
-export function processOperationRejectedObservation(
+export async function processOperationRejectedObservation(
   error: CommandProcessOperationRejectedError,
+  executor: CommandExecution,
+  owner: CommandExecutionOwner,
+  outputTokenBudget: number,
   execution: 'not_started' | 'settled' = 'not_started'
 ) {
+  // Only not_running establishes a known, authorized process with a terminal outcome.
+  const process = error.reason === 'not_running'
+    ? await executor.query(error.processId, outputTokenBudget, 0, 0, owner)
+    : undefined;
   return {
     kind: 'failure' as const,
     execution: { state: execution },
     summary: error.message,
     scope: { resources: [processScope(error.processId)], coverage: 'complete' as const },
     output: { reason: 'runtime_error' as const, error: error.message,
-      details: { processId: error.processId, cause: error.reason } }
+      details: { processId: error.processId, cause: error.reason,
+        ...(process ? { process: parseJsonObject(process) } : {}) } }
   };
 }
 

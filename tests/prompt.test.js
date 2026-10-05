@@ -111,3 +111,29 @@ test('current application context preserves the provider-native compacted window
   assert.match(input[2].content, /Current environment/);
   assert.deepEqual(input[3], { role: 'user', content: 'Continue the work.' });
 });
+
+test('stable references retain their prefix while current working state changes at the suffix', async () => {
+  const item = (id, sourceKind, content) => ({ id, sourceUri: `history://${id}`, sourceKind,
+    representation: 'full', mediaType: 'text/plain', title: id,
+    content, tokenEstimate: 8, purpose: 'context' });
+  const material = { id: 'state-placement', task: 'Complete the repair', tools: [],
+    instructions: [{ id: 'system', role: 'system', content: 'Current authority', priority: 1 }],
+    context: [item('repository', 'external', 'Stable repository guidance')],
+    workingState: item('state-1', 'generated', 'Superseded understanding') };
+  const prior = [{ role: 'user', content: 'Original requirement' }, { role: 'assistant', content: 'Earlier answer' }];
+  const current = [{ role: 'assistant', content: 'Current answer' }];
+  const first = await compilePromptMaterial(material, { prior, current });
+  const second = await compilePromptMaterial({ ...material,
+    workingState: item('state-2', 'generated', 'Corrected understanding') }, { prior, current });
+  assert.deepEqual(first.slice(0, -1), second.slice(0, -1));
+  assert.match(second.at(-1).content, /Corrected understanding/);
+  assert.match(second.at(-1).content, /sourceKind="generated"/);
+  assert.doesNotMatch(JSON.stringify(second), /Superseded understanding/);
+  assert.equal(second.filter(m => m.content.includes('Corrected understanding')).length, 1);
+  const next = await compilePromptMaterial({ ...material, task: 'New question' },
+    { prior: [...prior, { role: 'user', content: material.task }, ...current], current: [] });
+  assert.deepEqual(first.slice(0, 2), next.slice(0, 2));
+  const changedAuthority = await compilePromptMaterial({ ...material,
+    instructions: [{ ...material.instructions[0], content: 'Updated authority' }] });
+  assert.equal(changedAuthority[0].content, 'Updated authority');
+});

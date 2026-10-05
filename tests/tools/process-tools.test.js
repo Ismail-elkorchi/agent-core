@@ -1307,3 +1307,40 @@ test('unavailable process controls return known failures rather than uncertain e
     assert.equal(observation.output.details.cause, 'not_found');
   }
 });
+
+test('active commands expose their effective deadline and rejected writes return bounded terminal evidence', async t => {
+  const { context, manager, root } = await processContext({ maxProcessLifetimeMs: 500 });
+  t.after(async () => { await manager.close(); await rm(root, { recursive: true, force: true }); });
+  const script = "process.stdout.write('ready'); setInterval(()=>{},1000)";
+  const before = Date.now();
+  const started = await invokeToolCall(jsonToolCall('exec_command', {
+    command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+    background: true, timeoutMs: 5_000
+  }), tools, context);
+  assert.equal(started.kind, 'result');
+  assert.equal(started.output.status, 'running');
+  const deadline = Date.parse(started.output.deadline);
+  assert.ok(deadline >= before && deadline <= Date.now() + 500);
+  const terminal = await pollUntilSettled(started.output.processId, context);
+  assert.equal(terminal.output.status, 'timed_out');
+  const rejected = await invokeToolCall(jsonToolCall('write_stdin', {
+    processId: started.output.processId, text: 'Too late', outputTokenBudget: 64
+  }), tools, context);
+  assert.equal(rejected.kind, 'failure');
+  assert.equal(rejected.execution.state, 'not_started');
+  assert.equal(rejected.output.details.cause, 'not_running');
+  const outcome = rejected.output.details.process;
+  assert.equal(outcome.status, 'timed_out');
+  assert.match(outcome.combined.segments.join(''), /ready/);
+  assert.equal(outcome.cursorEnd, terminal.output.cursorEnd);
+  assert.ok(outcome.combined.capturedBytes <= 64 * 4);
+  const presentation = writeStdinTool.buildModelContent({ observation: rejected });
+  assert.match(JSON.stringify(presentation), /timed_out/);
+  assert.match(JSON.stringify(presentation), /ready/);
+  assert.doesNotMatch(JSON.stringify(presentation), /ownerId/);
+  const foreign = await invokeToolCall(jsonToolCall('write_stdin', {
+    processId: started.output.processId, text: 'Unauthorized'
+  }), tools, { ...context, invocation: { ...invocation, runId: 'foreign', ownerId: 'foreign' } });
+  assert.equal(foreign.output.details.cause, 'wrong_owner');
+  assert.equal(foreign.output.details.process, undefined);
+});

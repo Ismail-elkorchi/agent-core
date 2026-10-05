@@ -53,7 +53,8 @@ export const stopProcessTool = defineTool({
       ));
     } catch (error) {
       if (error instanceof CommandProcessOperationRejectedError)
-        return processOperationRejectedObservation(error, terminationConfirmed ? 'settled' : 'not_started');
+        return processOperationRejectedObservation(error, executor, owner, input.outputTokenBudget,
+          terminationConfirmed ? 'settled' : 'not_started');
       throw error;
     }
   }

@@ -32,6 +32,7 @@ export interface ModelRequestAssemblyInput {
   readonly images?: readonly import('../session/images.js').SessionImageInput[];
   readonly instructions: readonly PromptInstructionBlock[];
   readonly contextItems?: readonly PromptContextItemInput[];
+  readonly workingState?: PromptContextItemInput;
   readonly tools: readonly PromptToolSummary[];
   readonly modelProfile: ModelProfile;
   readonly metadata?: Readonly<Record<string, string>>;
@@ -60,11 +61,13 @@ export class ModelRequestAssembler {
     const history = input.window.messagesFor(input.modelProfile);
     const prior = input.window.priorMessagesFor(input.modelProfile);
     const context = deliverPromptContext(input.contextItems ?? [], this.estimator);
+    const state = deliverPromptContext(input.workingState ? [input.workingState] : [], this.estimator);
     const material = createPromptMaterial({
       task: input.task,
       ...(input.images === undefined ? {} : { images: input.images }),
       instructions: input.instructions,
       context: context.items,
+      ...(state.items[0] ? { workingState: state.items[0] } : {}),
       tools: input.tools,
       ...(input.metadata ? { metadata: input.metadata } : {})
     });
@@ -78,20 +81,23 @@ export class ModelRequestAssembler {
       material,
       messages,
       historyMessages: history.messages,
-      context,
+      context: Object.freeze({
+        items: Object.freeze([...context.items, ...state.items]),
+        totalTokens: context.totalTokens + state.totalTokens
+      }),
       estimate: Object.freeze({
         modelWindowTokens: accountModelRequest(
           { model: input.modelProfile.id, messages },
           input.modelProfile,
           { estimator: this.estimator }
         ).estimatedInputTokens,
-        contextTokens: context.totalTokens
+        contextTokens: context.totalTokens + state.totalTokens
       })
     });
   }
 }
 
-/** Keep current background material before the new request, after any retained native window. */
+/** Stable reference material precedes conversation; current understanding is a request suffix. */
 export async function compilePromptMaterial(
   material: PromptMaterial,
   conversation: {
@@ -137,13 +143,20 @@ export async function compilePromptMaterial(
   const contextMessage: ModelInputItem | undefined = contextText
     ? Object.freeze({ role: 'user', content: contextText })
     : undefined;
+  const workingState: ModelInputItem | undefined = material.workingState
+    ? Object.freeze({ role: 'user', content: renderContext([material.workingState]) })
+    : undefined;
+  // Keep provider-owned replay contiguous and ahead of current host reference material.
+  const nativeReplay = conversation.prior.some((item) => item.role === 'protocol');
   return Object.freeze([
     ...instructionMessages.filter((item) => item.role !== 'user'),
-    ...conversation.prior,
+    ...(nativeReplay ? conversation.prior : []),
     ...(contextMessage ? [contextMessage] : []),
+    ...(nativeReplay ? [] : conversation.prior),
     ...instructionMessages.filter((item) => item.role === 'user'),
     taskMessage,
-    ...conversation.current
+    ...conversation.current,
+    ...(workingState ? [workingState] : [])
   ]);
 }
 

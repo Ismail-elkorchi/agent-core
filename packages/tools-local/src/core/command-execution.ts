@@ -98,6 +98,7 @@ interface ManagedProcess {
   readonly rootPath: string;
   readonly tree: SupervisedProcessTree;
   readonly startedAt: number;
+  readonly deadline: number;
   readonly capture: BoundedCapture;
   readonly history: CapturedChunk[];
   readonly decoder: { readonly stdout: StringDecoder; readonly stderr: StringDecoder };
@@ -302,13 +303,15 @@ export class LocalCommandExecution implements CommandExecution {
           }
         : {})
     });
+    const startedAt = Date.now();
     const record: ManagedProcess = {
       id,
       command: request.command,
       owner: request.owner,
       rootPath: this.options.rootedFileAuthority.identity.canonicalPath,
       tree,
-      startedAt: Date.now(),
+      startedAt,
+      deadline: startedAt + Math.min(request.timeoutMs, this.limits.maxProcessLifetimeMs),
       capture: new BoundedCapture(this.options.maxCapturedBytes, this.options.tailBytes),
       history: [],
       decoder: { stdout: new StringDecoder('utf8'), stderr: new StringDecoder('utf8') },
@@ -395,7 +398,7 @@ export class LocalCommandExecution implements CommandExecution {
           if (record.status !== 'running') return;
           this.requestTermination(record, 'timed_out');
         },
-        Math.min(request.timeoutMs, this.limits.maxProcessLifetimeMs)
+        Math.max(0, record.deadline - Date.now())
       );
       record.timeout.unref();
     }
@@ -469,6 +472,7 @@ export class LocalCommandExecution implements CommandExecution {
       processId,
       owner: record.owner,
       status: record.status,
+      ...(record.status === 'running' ? { deadline: new Date(record.deadline).toISOString() } : {}),
       cursorStart: effectiveCursor,
       cursorEnd: record.cursor,
       ...(cursorExpired ? { cursorExpired: true } : {}),

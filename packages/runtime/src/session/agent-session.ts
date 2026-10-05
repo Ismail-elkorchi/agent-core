@@ -207,14 +207,7 @@ export class AgentSession {
       if (this.active || this.suspended) return undefined;
       const next = this.queued.shift();
       if (!next) return undefined;
-      try {
-        return await this.launch(next);
-      } catch (error) {
-        const failure = error instanceof Error ? error : new Error(String(error));
-        next.reject(failure);
-        await this.emit({ type: 'run.failed', runId: next.runId, error: failure });
-        throw error;
-      }
+      return this.launch(next);
     });
   }
 
@@ -504,8 +497,8 @@ export class AgentSession {
     return this.continueSuspension('context_admission', expectedRunId);
   }
 
-  async resumeImplementation(expectedRunId: string): Promise<AgentRunResult> {
-    return this.continueSuspension('implementation', expectedRunId);
+  async resumeRuntime(expectedRunId: string): Promise<AgentRunResult> {
+    return this.continueSuspension('runtime', expectedRunId);
   }
 
   async resolveDecision(input: {
@@ -661,6 +654,7 @@ export class AgentSession {
     }).then(async ({ completion }) => {
       // Settlement runs on the serial queue; await it outside the close transaction.
       await completion?.catch(() => undefined);
+    }).finally(() => {
       this.listeners.clear();
     });
     return this.closeCompletion;
@@ -671,7 +665,7 @@ export class AgentSession {
   }
 
   private async continueSuspension(
-    category: 'external_recovery' | 'implementation' | 'context_admission',
+    category: 'external_recovery' | 'runtime' | 'context_admission',
     expectedRunId: string
   ): Promise<AgentRunResult> {
     const started = await this.serial(async () => {
@@ -783,13 +777,34 @@ export class AgentSession {
         const current = runSuspensionDescriptor(submission.submissionId, run.state);
         if (
           submission.suspension.reason !== 'missing_implementation' &&
+          submission.suspension.reason !== 'runtime_failed' &&
           (!current || !sameSuspension(submission.suspension, current))
         ) {
           throw new Error(
             `Suspended submission ${submission.submissionId} contradicts its run suspension.`
           );
         }
-        this.suspended = suspendedSubmission(submission, submission.suspension);
+        if (
+          submission.suspension.reason === 'runtime_failed' &&
+          run.state.phase.kind === 'terminal'
+        ) {
+          await this.options.repository.transitionSubmission(
+            this.options.descriptor, submission.submissionId, { state: 'claimed' }
+          );
+          this.queued.push(pendingFromRecord(submission, true));
+          continue;
+        }
+        const descriptor = current ?? submission.suspension;
+        if (current && !sameSuspension(submission.suspension, current)) {
+          await this.options.repository.transitionSubmission(
+            this.options.descriptor, submission.submissionId, { state: 'claimed' }
+          );
+          await this.options.repository.transitionSubmission(
+            this.options.descriptor, submission.submissionId,
+            { state: 'suspended', suspension: current }
+          );
+        }
+        this.suspended = suspendedSubmission(submission, descriptor);
       } else {
         this.queued.push(pendingFromRecord(submission, false));
       }
@@ -800,11 +815,11 @@ export class AgentSession {
   private async launch(
     pending: PendingSubmission
   ): Promise<Extract<AgentSessionSubmissionResult, { kind: 'started' }>> {
-    if (!pending.resumeExisting)
-      await this.options.repository.transitionSubmission(this.options.descriptor, pending.id, {
-        state: 'claimed'
-      });
     try {
+      if (!pending.resumeExisting)
+        await this.options.repository.transitionSubmission(this.options.descriptor, pending.id, {
+          state: 'claimed'
+        });
       const configuration = pending.configuration;
       const runtime = await this.createRuntime(
         pending.id,
@@ -824,10 +839,7 @@ export class AgentSession {
         completion: pending.completion
       };
     } catch (error) {
-      await this.options.repository.transitionSubmission(this.options.descriptor, pending.id, {
-        state: 'failed',
-        errorMessage: errorMessage(error)
-      });
+      await this.failSubmission(pending, pending.configuration, error);
       throw error;
     }
   }
@@ -911,31 +923,72 @@ export class AgentSession {
 
   private async fail(active: ActiveSubmission, error: unknown): Promise<void> {
     if (this.active !== active) return;
+    this.active = undefined;
+    await this.failSubmission(active.pending, active.configuration, error);
+    if (!this.suspended) await this.launchNext();
+  }
+
+  private async failSubmission(
+    pending: PendingSubmission,
+    configuration: AgentSessionConfiguration,
+    error: unknown
+  ): Promise<void> {
     const cause = error instanceof Error ? error : new Error(String(error));
     let failure = cause;
-    let persisted = true;
     try {
+      const run = await this.options.runs.find(pending.runId);
+      if (run?.state.phase.kind === 'terminal') {
+        const result: AgentRunResult = Object.freeze({
+          state: 'ended',
+          terminal: await this.options.runs.readTerminal(run),
+          deliveryDiagnostics: Object.freeze([Object.freeze({
+            eventType: 'run.result', message: cause.message, persisted: false
+          })])
+        });
+        await this.options.repository.transitionSubmission(this.options.descriptor, pending.id, {
+          state: 'completed'
+        });
+        pending.resolve(result);
+        await this.emit({ type: 'run.completed', runId: pending.runId, result });
+        return;
+      }
+      if (run) {
+        const descriptor: AgentSessionSuspensionDescriptor =
+          runSuspensionDescriptor(pending.id, run.state) ?? Object.freeze({
+            runId: pending.runId,
+            submissionId: pending.id,
+            category: 'runtime',
+            reason: 'runtime_failed',
+            diagnostic: cause.message || cause.name,
+            actions: suspensionActions('resume', 'abort')
+          });
+        this.suspended = {
+          runId: pending.runId,
+          submissionId: pending.id,
+          input: pending.input,
+          configuration,
+          descriptor
+        };
+      }
       await this.options.repository.transitionSubmission(
         this.options.descriptor,
-        active.pending.id,
-        {
-          state: 'failed',
-          errorMessage: cause.message
-        }
+        pending.id,
+        this.suspended
+          ? { state: 'suspended', suspension: this.suspended.descriptor }
+          : { state: 'failed', errorMessage: cause.message || cause.name }
       );
     } catch (persistenceError) {
-      persisted = false;
       failure = new AggregateError(
         [cause, persistenceError],
-        'The run and its durable session admission both failed.',
+        'Run dispatch failed and its session state could not be recorded.',
         { cause }
       );
+      // A failed persistence boundary cannot authorize dispatch of another submission.
+      this.closed = true;
+      for (const queued of this.queued.splice(0)) queued.reject(failure);
     }
-    this.active = undefined;
-    active.pending.reject(failure);
-    await this.emit({ type: 'run.failed', runId: active.pending.runId, error: failure });
-    if (persisted) await this.launchNext();
-    else for (const queued of this.queued.splice(0)) queued.reject(failure);
+    pending.reject(failure);
+    await this.emit({ type: 'run.failed', runId: pending.runId, error: failure });
   }
 
   private async launchNext(): Promise<void> {
@@ -945,10 +998,8 @@ export class AgentSession {
       if (!next) return;
       try {
         await this.launch(next);
-      } catch (error) {
-        const failure = error instanceof Error ? error : new Error(String(error));
-        next.reject(failure);
-        await this.emit({ type: 'run.failed', runId: next.runId, error: failure });
+      } catch {
+        // launch records the admission or recovery obligation and delivers the failure once.
       }
     }
   }
@@ -1097,9 +1148,6 @@ function ownConfiguration(configuration: AgentSessionConfiguration): AgentSessio
   return ownSessionSubmissionConfiguration(configuration);
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
 function requireRunSuspensionDescriptor(
   submissionId: string,
   state: import('../run/control/contracts.js').AgentRunState
@@ -1167,7 +1215,7 @@ function runSuspensionDescriptor(
     return Object.freeze({
       runId: state.runId,
       submissionId,
-      category: 'implementation',
+      category: 'runtime',
       reason: phase.reason,
       ...(phase.effectId ? { effectId: phase.effectId } : {}),
       actions: suspensionActions('resume', 'abort')
@@ -1194,7 +1242,7 @@ function suspensionFromResult(
   return Object.freeze({
     runId: result.runId,
     submissionId,
-    category: 'implementation',
+    category: 'runtime',
     reason: result.reason,
     ...(result.effectId ? { effectId: result.effectId } : {}),
     actions: suspensionActions('resume', 'abort')

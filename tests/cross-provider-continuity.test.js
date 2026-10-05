@@ -115,13 +115,7 @@ for (const id of providerIds) {
         body.tools?.length
           ? 'Repair and checks completed.'
           : JSON.stringify({
-              edits: [
-                {
-                  range: { start: { line: 1, column: 1 }, end: { line: 1, column: 1 } },
-                  expectedText: '',
-                  replacementText: continuation
-                }
-              ]
+              text: continuation
             })
     });
     const service = inference(provider);
@@ -283,13 +277,7 @@ test('mid-run renewal preserves signed reasoning and the completed tool exchange
       body.tools?.length
         ? 'Inspected evidence.'
         : JSON.stringify({
-            edits: [
-              {
-                range: { start: { line: 1, column: 1 }, end: { line: 1, column: 1 } },
-                expectedText: '',
-                replacementText: continuation
-              }
-            ]
+            text: continuation
           })
   });
   const result = await new AgentRuntime({

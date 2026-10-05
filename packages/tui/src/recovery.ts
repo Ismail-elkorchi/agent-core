@@ -41,6 +41,13 @@ export function suspensionPresentation(reason: AgentSessionSuspensionDescriptor[
         explanation:
           'This run needs a capability that is unavailable in the current configuration. Restore that capability and continue, or stop this run.'
       };
+    case 'runtime_failed':
+      return {
+        title: 'Run needs recovery',
+        resumeLabel: 'Resume recorded work',
+        waitingMessage: 'The run could not resume. Its recorded work remains available for recovery.',
+        explanation: 'Run dispatch failed. Resume from recorded execution state, or stop this run; uncertain effects are not replayed.'
+      };
     case 'user_decision':
       return {
         title: 'Decision required',
@@ -57,10 +64,10 @@ export function suspensionPresentation(reason: AgentSessionSuspensionDescriptor[
 }
 
 export function suspensionMessage(
-  suspension: Pick<AgentSessionSuspensionDescriptor, 'reason' | 'contextAdmission' | 'decisionRequest'> &
+  suspension: Pick<AgentSessionSuspensionDescriptor, 'reason' | 'contextAdmission' | 'decisionRequest' | 'diagnostic'> &
     Pick<AgentRunSuspension, 'cleanupDiagnostic'>
 ): string {
-  return suspension.contextAdmission?.message ?? suspension.decisionRequest?.reason ??
+  return suspension.contextAdmission?.message ?? suspension.decisionRequest?.reason ?? suspension.diagnostic ??
     suspension.cleanupDiagnostic?.message ?? suspensionPresentation(suspension.reason).explanation;
 }
 

@@ -17,6 +17,7 @@ import {
 } from '@agent-core/effects';
 import {
   AgentRunCoordinator,
+  AgentRuntime,
   AgentSession,
   ContextService,
   HistoryReader,
@@ -461,7 +462,7 @@ test('session JSONL owns queued configuration and validates submission lifecycle
   const suspension = {
     runId: 'run',
     submissionId: 'submission',
-    category: 'implementation',
+    category: 'runtime',
     reason: 'missing_implementation',
     actions: ['resume', 'abort']
   };
@@ -1376,7 +1377,7 @@ test('external recovery suspension remains explicit and unresolved reconciliatio
     effectId: 'provider-effect',
     actions: ['reconcile', 'abort']
   });
-  await assert.rejects(session.resumeImplementation(submission.runId), /does not permit/u);
+  await assert.rejects(session.resumeRuntime(submission.runId), /does not permit/u);
   const unresolved = await session.reconcileExternal(submission.runId);
   assert.equal(unresolved.state, 'suspended');
   assert.equal(session.state().phase, 'suspended');
@@ -1444,10 +1445,10 @@ test('missing implementation suspension resumes only through its category-specif
     budget: testBudget()
   });
   await submission.completion;
-  assert.equal(session.inspectSuspension().category, 'implementation');
+  assert.equal(session.inspectSuspension().category, 'runtime');
   assert.deepEqual(session.inspectSuspension().actions, ['resume', 'abort']);
   await assert.rejects(session.reconcileExternal(submission.runId), /does not permit/u);
-  const result = await session.resumeImplementation(submission.runId);
+  const result = await session.resumeRuntime(submission.runId);
   assert.equal(result.state, 'ended');
   assert.equal(resumes, 1);
   assert.equal(session.state().phase, 'idle');
@@ -1772,4 +1773,107 @@ test('context suspension persists its exact conflict and append indexes follow e
     await new JsonlSessionRepository({ rootDir }).loadPendingSubmissions(session),
     []
   );
+});
+
+test('accepted driver failure remains inspectable, blocks new work, and survives reopen', async () => {
+  const repository = new InMemorySessionRepository();
+  const descriptor = await repository.create({ binding: TEST_SESSION_BINDING });
+  const runs = runCoordinator();
+  const options = {
+    descriptor, repository, runs, expectedBinding: TEST_SESSION_BINDING,
+    configuration: { provider: 'test', model: 'model' },
+    createRuntime() {
+      return {
+        run(input) {
+          return { runId: input.runId,
+            result: acceptTestRun(runs, input.runId).then(() => { throw new Error('Driver dispatch failed'); }),
+            injectSteering() {}, abort() {} };
+        }
+      };
+    }
+  };
+  const first = new AgentSession(options);
+  const failed = await first.submit({ task: 'Accepted unfinished work' });
+  await assert.rejects(failed.completion, /Driver dispatch failed/);
+  const inspect = await first.inspect();
+  assert.equal(inspect.session.phase, 'suspended');
+  assert.equal(inspect.runs[0].state.runId, failed.runId);
+  assert.equal(inspect.pendingSubmissions[0].state, 'suspended');
+  assert.equal(inspect.session.suspension.reason, 'runtime_failed');
+  assert.deepEqual(inspect.session.suspension.actions, ['resume', 'abort']);
+  assert.equal((await first.submit({ task: 'Must not bypass unfinished work' })).kind, 'rejected');
+  const reopened = new AgentSession(options);
+  await reopened.restore();
+  assert.deepEqual((await reopened.inspect()).session.suspension, inspect.session.suspension);
+  assert.equal((await runs.listUnfinished()).length, 1);
+  assert.equal(await runs.find('never-accepted'), undefined);
+  await reopened.close();
+  await first.close();
+});
+
+test('a committed terminal result survives later runtime release failure', async () => {
+  const repository = new InMemorySessionRepository();
+  const descriptor = await repository.create({ binding: TEST_SESSION_BINDING });
+  const events = new InMemoryEventRepository(agentEventCodec);
+  const artifacts = new InMemoryArtifactRepository();
+  const runs = new AgentRunCoordinator(events, artifacts);
+  const provider = {
+    id: 'fixture', implementationId: 'fixture@1',
+    describe: () => ({ id: 'fixture', displayName: 'Fixture', defaultModel: 'model' }),
+    describeModel: async () => ({ id: 'model', provider: 'fixture',
+      capabilities: { streaming: false, toolCalling: false, supportedToolInputs: [],
+        jsonMode: false, jsonSchema: false, logprobs: false, temperature: false, topP: false },
+      modalities: { input: ['text'], output: ['text'] },
+      limits: { contextTokens: 16_000, outputTokens: 2_000 },
+      supportedParameters: ['maxOutputTokens'] }),
+    complete: async () => ({ provider: 'fixture', model: 'model', content: 'Completed answer', terminationReason: 'stop' })
+  };
+  const session = new AgentSession({ descriptor, repository, runs, expectedBinding: TEST_SESSION_BINDING,
+    configuration: { provider: 'fixture', model: 'model' },
+    createRuntime: () => new AgentRuntime({ provider, model: 'model', maxOutputTokens: 64,
+      toolBoundary: { authorizationPolicyId: 'test', executionTargetId: 'test' },
+      repositories: { events, artifacts, session: { repository, descriptor } },
+      release() { throw new Error('Release failed after terminal commit'); }
+    }) });
+  const accepted = await session.submit({ task: 'Answer this question' });
+  const result = await accepted.completion;
+  assert.equal(result.state, 'ended');
+  assert.equal(result.terminal.executionStatus, 'completed', JSON.stringify(result.terminal));
+  assert.equal(result.terminal.modelOutput.message, 'Completed answer');
+  assert.match(result.deliveryDiagnostics[0].message, /Release failed/);
+  assert.equal(session.state().phase, 'idle');
+  assert.equal((await session.inspect()).runs.length, 0);
+  assert.equal((await runs.listUnfinished()).length, 0);
+  await session.close();
+});
+
+test('failed durable claiming rejects the waiting caller and preserves queued input for reopen', { timeout: 5000 }, async () => {
+  class FailingClaimRepository extends InMemorySessionRepository {
+    failClaims = true;
+    transitionSubmission(descriptor, id, outcome) {
+      if (this.failClaims && outcome.state === 'claimed') throw new Error('Claim persistence failed');
+      return super.transitionSubmission(descriptor, id, outcome);
+    }
+  }
+  const repository = new FailingClaimRepository();
+  const descriptor = await repository.create({ binding: TEST_SESSION_BINDING });
+  const options = { repository, descriptor, expectedBinding: TEST_SESSION_BINDING,
+    runs: runCoordinator(), scheduling: 'manual', configuration: { provider: 'test', model: 'model' },
+    createRuntime() { assert.fail('No run may execute without its durable claim'); } };
+  const session = new AgentSession(options);
+  const accepted = await session.submit({ task: 'Keep this original request' });
+  const rejection = assert.rejects(accepted.completion, error => {
+    assert.equal(error.cause.message, 'Claim persistence failed');
+    return true;
+  });
+  await assert.rejects(session.startNextSubmission(), /Claim persistence failed/);
+  await rejection;
+  assert.equal((await repository.loadPendingSubmissions(descriptor))[0].state, 'queued');
+  assert.deepEqual(await options.runs.listUnfinished(), []);
+  repository.failClaims = false;
+  const reopened = new AgentSession(options);
+  await reopened.restore();
+  assert.equal(reopened.state().queuedInputs, 1);
+  await reopened.close();
+  await session.close();
 });

@@ -5,7 +5,7 @@ import {
   type ToolModelContentRequest
 } from '@agent-core/tools';
 import type { ReadFilesOutput } from '../tools/read-files/schema.js';
-import type { ProcessOutput } from '../tools/process-output.js';
+import { processOutputSchema, type ProcessOutput } from '../tools/process-output.js';
 import type { ReadArtifactOutput } from '../tools/read-artifact/schema.js';
 import type { SearchTextOutput } from '../tools/search-text/schema.js';
 import type * as z from 'zod';
@@ -52,13 +52,27 @@ export function buildReadFilesContent({
 export function buildProcessContent({
   observation
 }: ToolModelContentRequest<unknown, ProcessOutput>): readonly ToolContent[] {
-  if (observation.kind === 'failure') return defaultToolModelContent(observation);
+  if (observation.kind === 'failure') {
+    const process = observation.output.reason === 'runtime_error'
+      ? observation.output.details?.process : undefined;
+    if (process === undefined) return defaultToolModelContent(observation);
+    // Failure details cross the generic observation boundary; establish process facts here.
+    const result = processOutputSchema.parse(process);
+    return [text(observation.summary),
+      ...(observation.execution ? [text(`Execution state: ${observation.execution.state}.`)] : []),
+      ...processResultContent(result)];
+  }
   const output: ProcessOutput = observation.output;
+  return processResultContent(output);
+}
+
+function processResultContent(output: ProcessOutput): readonly ToolContent[] {
   const { combined, artifact, originalOutput } = output;
   const partial = !combined.startsAtOutputStart || !combined.endsAtOutputEnd || combined.omittedBytes > 0;
   return [
     text(json({
       status: output.status,
+      ...(output.deadline ? { deadline: output.deadline } : {}),
       ...(output.exitCode === undefined ? {} : { exitCode: output.exitCode }),
       ...(output.signal ? { signal: output.signal } : {}),
       ...(output.diagnostic ? { diagnostic: output.diagnostic } : {}),

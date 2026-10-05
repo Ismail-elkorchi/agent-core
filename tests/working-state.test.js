@@ -18,24 +18,6 @@ import {
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 
 const binding = { schemaId: 'tests/working-state', schemaVersion: 1, subject: {} };
-const insert = (text) => [
-  {
-    range: { start: { line: 1, column: 1 }, end: { line: 1, column: 1 } },
-    expectedText: '',
-    replacementText: text
-  }
-];
-const replace = (before, after) => [
-  {
-    range: {
-      start: { line: 1, column: 1 },
-      end: { line: 1, column: Array.from(before).length + 1 }
-    },
-    expectedText: before,
-    replacementText: after
-  }
-];
-
 async function fixture(t, kind = 'memory', maxSourceBytes = 1024 * 1024) {
   const root = await mkdtemp(path.join(tmpdir(), 'working-state-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -64,12 +46,12 @@ async function fixture(t, kind = 'memory', maxSourceBytes = 1024 * 1024) {
     )
   });
   const inference = { ownerId: 'owner', invocationId: 'inference', requestRef };
-  const update = async (id, revisionId, edits) => {
+  const update = async (id, revisionId, text) => {
     const cut = await history.capture();
     return context.updateWorkingState({
       id,
       revisionId,
-      edits,
+      text,
       inference,
       sessionId: session.id,
       branchId: cut.branchId
@@ -79,13 +61,13 @@ async function fixture(t, kind = 'memory', maxSourceBytes = 1024 * 1024) {
 }
 
 for (const kind of ['memory', 'jsonl']) {
-  test(`${kind}: one head, exact edits, publication conflict and durable retry`, async (t) => {
+  test(`${kind}: one head, full replacement, publication conflict and durable retry`, async (t) => {
     const f = await fixture(t, kind);
-    const first = await f.update('first', null, insert('Purpose 文😀'));
+    const first = await f.update('first', null, 'Purpose 文😀');
     assert.equal(first.status, 'committed');
     const concurrent = await Promise.all([
-      f.update('left', 'first', replace('Purpose 文😀', 'Left interpretation')),
-      f.update('right', 'first', replace('Purpose 文😀', 'Right interpretation'))
+      f.update('left', 'first', 'Left interpretation'),
+      f.update('right', 'first', 'Right interpretation')
     ]);
     assert.deepEqual(concurrent.map((x) => x.status).sort(), ['committed', 'conflict']);
     const head = await f.sessions.currentWorkingState(f.session);
@@ -94,10 +76,10 @@ for (const kind of ['memory', 'jsonl']) {
       (await f.context.workingState()).text,
       head.id === 'left' ? 'Left interpretation' : 'Right interpretation'
     );
-    assert.deepEqual(await f.update('first', null, insert('Purpose 文😀')), first);
+    assert.deepEqual(await f.update('first', null, 'Purpose 文😀'), first);
     await assert.rejects(
-      f.update('first', null, insert('Changed retry')),
-      /different substantive edits/
+      f.update('first', null, 'Changed retry'),
+      /different content/
     );
     const snapshot = await f.sessions.sourceSnapshot(f.session);
     assert.equal(snapshot.entries.filter((x) => x.type === 'working_state').length, 2);
@@ -112,20 +94,20 @@ for (const kind of ['memory', 'jsonl']) {
     const source = (await f.context.inspect()).workingState.source;
     assert.equal((await outsider.read({ source })).reason, 'outside_scope');
 
-    assert.equal((await f.update('stale', null, insert('Lost constraints'))).status, 'conflict');
+    assert.equal((await f.update('stale', null, 'Lost constraints')).status, 'conflict');
   });
 
   test(`${kind}: forks inherit understanding at the selected historical point`, async (t) => {
     const f = await fixture(t, kind);
-    await f.update('old', null, insert('Original constraints'));
+    await f.update('old', null, 'Original constraints');
     const point = await f.context.request({
       idempotencyKey: 'point',
       reason: 'Historical boundary'
     });
-    await f.update('later', 'old', replace('Original constraints', 'Later interpretation'));
+    await f.update('later', 'old', 'Later interpretation');
     await f.sessions.branchFrom(f.session, point.entry.id, 'Historical fork');
     assert.equal((await f.context.workingState()).text, 'Original constraints');
-    await f.update('child', 'old', replace('Original constraints', 'Independent child'));
+    await f.update('child', 'old', 'Independent child');
     assert.equal((await f.sessions.currentWorkingState(f.session, 'later')).id, 'later');
     assert.equal((await f.context.workingState()).text, 'Independent child');
     const replay = await f.sessions.loadReplayState(f.session);
@@ -135,7 +117,7 @@ for (const kind of ['memory', 'jsonl']) {
 
   test(`${kind}: state and renewed window publish together only after admission`, async (t) => {
     const f = await fixture(t, kind);
-    await f.update('old', null, insert('Keep constraints'));
+    await f.update('old', null, 'Keep constraints');
     const previous = await f.context.request({
       idempotencyKey: 'old-window',
       reason: 'Initial window'
@@ -144,7 +126,7 @@ for (const kind of ['memory', 'jsonl']) {
       id: 'renewed',
       revisionId: 'old',
       inference: f.inference,
-      edits: replace('Keep constraints', 'Keep constraints; correction confirmed')
+      text: 'Keep constraints; correction confirmed'
     });
     const request = {
       expectedWindowId: previous.entry.window.windowId,
@@ -189,7 +171,7 @@ for (const kind of ['memory', 'jsonl']) {
       id: 'no-change',
       revisionId: 'renewed',
       inference: f.inference,
-      edits: []
+      text: 'Keep constraints; correction confirmed'
     });
     assert.equal(unchanged.status, 'unchanged');
     await f.context.request({
@@ -202,7 +184,7 @@ for (const kind of ['memory', 'jsonl']) {
   test(`${kind}: bounded original history recovers generated revisions without a notebook`, async (t) => {
     const f = await fixture(t, kind);
     const body = 'Useful rationale 文😀. '.repeat(500);
-    await f.update('revision', null, insert(body));
+    await f.update('revision', null, body);
     const source = (await f.context.inspect()).workingState.source;
     let offset = 0;
     let text = '';
@@ -285,7 +267,7 @@ test('normal inference supplies expected revision and exact request attribution 
                 type: 'function',
                 id: 'update',
                 name: 'update_working_state',
-                input: { kind: 'json', value: { edits: insert('Purpose and scoped feedback') } }
+                input: { kind: 'json', value: { text: 'Purpose and scoped feedback' } }
               }
             ]
           }
@@ -342,13 +324,13 @@ test('normal inference supplies expected revision and exact request attribution 
 for (const kind of ['memory', 'jsonl']) {
   test(`${kind}: failed content storage or publication preserves the preceding usable state`, async (t) => {
     const f = await fixture(t, kind);
-    await f.update('old', null, insert('Useful understanding'));
+    await f.update('old', null, 'Useful understanding');
     const store = f.artifacts.storeProtected.bind(f.artifacts);
     f.artifacts.storeProtected = async () => {
       throw new Error('Artifact unavailable');
     };
     await assert.rejects(
-      f.update('new', 'old', replace('Useful understanding', 'Correction')),
+      f.update('new', 'old', 'Correction'),
       /Artifact unavailable/
     );
     f.artifacts.storeProtected = store;
@@ -357,13 +339,13 @@ for (const kind of ['memory', 'jsonl']) {
       throw new Error('Journal append failed');
     };
     await assert.rejects(
-      f.update('new', 'old', replace('Useful understanding', 'Correction')),
+      f.update('new', 'old', 'Correction'),
       /Journal append failed/
     );
     assert.equal((await f.context.workingState()).text, 'Useful understanding');
     f.sessions.commitWorkingState = commit;
     assert.equal(
-      (await f.update('new', 'old', replace('Useful understanding', 'Correction'))).status,
+      (await f.update('new', 'old', 'Correction')).status,
       'committed'
     );
     assert.equal((await f.context.workingState()).text, 'Correction');
@@ -373,7 +355,7 @@ for (const kind of ['memory', 'jsonl']) {
 for (const kind of ['memory', 'jsonl']) {
   test(`${kind}: a fork during artifact storage cannot publish an authorized parent update on the child`, async (t) => {
     const f = await fixture(t, kind);
-    await f.update('parent', null, insert('Parent understanding'));
+    await f.update('parent', null, 'Parent understanding');
     const branchPoint = await f.context.request({
       idempotencyKey: 'stable-branch-point',
       reason: 'Stable boundary'
@@ -390,7 +372,7 @@ for (const kind of ['memory', 'jsonl']) {
     const update = f.update(
       'late-parent',
       'parent',
-      replace('Parent understanding', 'Unauthorized child understanding')
+      'Unauthorized child understanding'
     );
     await stored.promise;
     await f.sessions.branchFrom(f.session, branchPoint.entry.id, 'New child');
@@ -422,3 +404,21 @@ test('captured state attribution validates its binding without imposing tool-JSO
   assert.equal(origin.revisionId, null);
   assert.equal(origin.inference.requestRef, requestRef);
 });
+
+for (const kind of ['memory', 'jsonl']) {
+  test(`${kind}: replacement removes obsolete claims, permits clearing, and leaves history intact`, async t => {
+    const f = await fixture(t, kind);
+    const obsolete = 'Earlier assumption\nUnverified guess';
+    const corrected = 'Purpose 文😀\nConfirmed correction\nUnresolved question';
+    await f.update('obsolete', null, obsolete);
+    await f.update('corrected', 'obsolete', corrected);
+    assert.equal((await f.context.workingState()).text, corrected);
+    assert.equal((await f.update('unchanged', 'corrected', corrected)).status, 'unchanged');
+    assert.equal((await f.update('cleared', 'corrected', '')).status, 'committed');
+    assert.equal((await f.context.workingState()).text, '');
+    const original = await f.sessions.currentWorkingState(f.session, 'obsolete');
+    assert.equal(new TextDecoder().decode(await f.artifacts.readVerified(original.contentRef)), obsolete);
+    const tool = createWorkingStateTool(f.context);
+    assert.deepEqual(Object.keys(tool.jsonSchema.properties), ['text']);
+  });
+}

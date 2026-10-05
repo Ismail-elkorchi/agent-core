@@ -324,7 +324,8 @@ export function ownSessionSuspensionDescriptor(value: unknown): SessionSuspensio
     'effectId',
     'actions',
     'decisionRequest',
-    'contextAdmission'
+    'contextAdmission',
+    'diagnostic'
   ]);
   if (Object.keys(object).some((field) => !allowed.has(field)))
     throw new TypeError('Session suspension has unsupported fields.');
@@ -334,6 +335,8 @@ export function ownSessionSuspensionDescriptor(value: unknown): SessionSuspensio
   const reason = suspensionReason(object.reason);
   const effectId =
     object.effectId === undefined ? undefined : suspensionString(object.effectId, 'effectId');
+  if (reason !== 'runtime_failed' && object.diagnostic !== undefined)
+    throw new TypeError('Only a runtime failure may contain its diagnostic.');
   if (!Array.isArray(object.actions) || object.actions.length === 0)
     throw new TypeError('Session suspension actions are invalid.');
   const actions = object.actions.map(suspensionAction);
@@ -346,7 +349,7 @@ export function ownSessionSuspensionDescriptor(value: unknown): SessionSuspensio
         ? ['reconcile', 'abort']
         : category === 'context_admission'
           ? ['context', 'abort']
-          : category === 'implementation'
+          : category === 'runtime'
             ? ['resume', 'abort']
             : ['decide', 'abort'];
   if (
@@ -356,7 +359,7 @@ export function ownSessionSuspensionDescriptor(value: unknown): SessionSuspensio
     throw new TypeError('Session suspension actions do not match its category.');
   if (
     (category === 'approval') !== (reason === 'approval_required') ||
-    (category === 'implementation') !== (reason === 'missing_implementation') ||
+    (category === 'runtime') !== (reason === 'missing_implementation' || reason === 'runtime_failed') ||
     (category === 'user_decision') !== (reason === 'user_decision') ||
     (category === 'context_admission') !== (reason === 'context_admission')
   )
@@ -378,11 +381,10 @@ export function ownSessionSuspensionDescriptor(value: unknown): SessionSuspensio
     throw new TypeError('Session user-decision suspension requires a decision request.');
   if (category !== 'user_decision' && request !== undefined)
     throw new TypeError('Only user-decision suspensions may contain a decision request.');
-  return Object.freeze({
+  const descriptor = {
     runId,
     submissionId,
     category,
-    reason,
     ...(effectId === undefined ? {} : { effectId }),
     actions: Object.freeze(actions),
     ...(contextAdmission === undefined ? {} : { contextAdmission }),
@@ -394,7 +396,10 @@ export function ownSessionSuspensionDescriptor(value: unknown): SessionSuspensio
             choices: Object.freeze([...request.choices])
           })
         })
-  });
+  };
+  return reason === 'runtime_failed'
+    ? Object.freeze({ ...descriptor, reason, diagnostic: suspensionString(object.diagnostic, 'diagnostic') })
+    : Object.freeze({ ...descriptor, reason });
 }
 
 function suspensionString(value: unknown, field: string): string {
@@ -407,7 +412,7 @@ function suspensionCategory(value: unknown): SessionSuspensionCategory {
   if (
     value !== 'approval' &&
     value !== 'external_recovery' &&
-    value !== 'implementation' &&
+    value !== 'runtime' &&
     value !== 'user_decision' &&
     value !== 'context_admission'
   )
@@ -421,6 +426,7 @@ function suspensionReason(value: unknown): SessionSuspensionDescriptor['reason']
     value !== 'provider_outcome_unknown' &&
     value !== 'tool_outcome_unknown' &&
     value !== 'missing_implementation' &&
+    value !== 'runtime_failed' &&
     value !== 'user_decision' &&
     value !== 'context_admission'
   )
