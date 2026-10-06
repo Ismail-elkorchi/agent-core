@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import * as z from 'zod';
@@ -18,10 +18,12 @@ import { adoptCommandExecution, commandExecutionResources, defineTool, ResourceL
 import {
   DEFAULT_LOCAL_TOOL_CONFIGURATION,
   LocalCommandExecution,
+  applyPatchTool,
   execCommandTool,
+  readFilesTool,
   stopProcessTool
 } from '@agent-core/tools-local';
-import { testRootedFileAuthority } from '../rooted-file-authority-helper.js';
+import { testPatchJournal, testRootedFileAuthority } from '../rooted-file-authority-helper.js';
 
 const boundary = {
   authorizationPolicyId: 'tests/process-cleanup@1',
@@ -116,6 +118,53 @@ async function records(events, runId) {
   return values;
 }
 const longCommand = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("console.log('started'); setInterval(()=>{},1000)")}`;
+
+test('an admitted background process allows subsequent reads, edits and foreground commands', async (t) => {
+  const state = await setup();
+  t.after(async () => { await state.manager.close(); await rm(state.root, { recursive: true, force: true }); });
+  await writeFile(path.join(state.root, 'source.txt'), 'Original source\n');
+  let processId;
+  const assertRunning = () => {
+    assert.equal(state.manager.activeCount(), 1);
+    assert.equal(state.manager.resourceLeases.wouldWait({
+      accesses: [{ mode: 'write', scope: 'files/added.txt' }], lockScopes: ['files/added.txt']
+    }), false);
+  };
+  const provider = new Provider([
+    toolResponse('exec_command', { command: longCommand, background: true }),
+    async () => {
+      assertRunning();
+      processId = (await state.manager.listProcesses())[0].processId;
+      return toolResponse('read_files', { files: [{ path: 'source.txt' }] });
+    },
+    () => {
+      assertRunning();
+      return toolResponse('apply_patch', {
+        patch: '*** Begin Patch\n*** Add File: added.txt\n+Independent edit\n*** End Patch'
+      });
+    },
+    async () => {
+      assertRunning();
+      assert.equal(await readFile(path.join(state.root, 'added.txt'), 'utf8'), 'Independent edit\n');
+      return toolResponse('exec_command', { command: 'printf independent' });
+    },
+    () => {
+      assertRunning();
+      return toolResponse('stop_process', { processId });
+    },
+    done
+  ]);
+  const result = await createRuntime({ ...state, provider,
+    services: { ...state.services, patchJournal: testPatchJournal(state.services.rootedFileAuthority) },
+    tools: [execCommandTool, readFilesTool, applyPatchTool, stopProcessTool]
+  }).run({ task: 'Keep the server running while reading, editing and checking.',
+    signal: AbortSignal.timeout(10_000)
+  }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.equal(state.manager.activeCount(), 0);
+  const journal = await records(state.events, result.terminal.runId);
+  assert.equal(journal.filter((event) => event.type === 'tool.started').length, 5);
+});
 
 const approvalTool = defineTool({
   name: 'approval_write',
@@ -344,6 +393,7 @@ test('two runtimes sharing one manager clean only their own processes', async ()
   };
   const plan = await state.manager.plan({
     command: longCommand,
+    mode: 'background',
     rootedDirectory: '.',
     pty: false,
     timeoutMs: 60_000,

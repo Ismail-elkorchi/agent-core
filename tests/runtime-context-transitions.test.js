@@ -7,6 +7,7 @@ import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core
 import {
   AgentRuntime,
   InMemorySessionRepository,
+  InferenceService,
   HistoryReader,
   ContextService,
   createContextTools,
@@ -502,53 +503,134 @@ test('large output reservations do not trigger renewal of a short conversation',
   assert.equal((await state.context.inspect()).window, null);
 });
 
-test('a failed proactive continuation cannot block an admitted working context', async () => {
-  const state = await fixture();
-  const original = 'Preserve the original requirements. '.repeat(700);
-  await new AgentRuntime(state.options).run({ task: original }).result;
-  let summaries = 0;
-  let generations = 0;
-  const provider = {
-    ...state.provider,
-    describeModel: async () => ({
-      ...profile(32768),
-      limits: { contextTokens: 32768, outputTokens: 16384 }
-    }),
-    complete: async (request) => {
-      if (!request.tools) {
-        summaries++;
+for (const failure of ['incomplete', 'transport', 'stream']) {
+  test(`a failed proactive renewal (${failure}) preserves an admitted working context`, async () => {
+    const state = await fixture();
+    const original = 'Preserve the original requirements. '.repeat(700);
+    await new AgentRuntime(state.options).run({ task: original }).result;
+    const before = await state.context.inspect();
+    let renewals = 0;
+    let generations = 0;
+    const provider = {
+      ...state.provider,
+      describeModel: async () => ({
+        ...profile(32768),
+        capabilities: { ...profile(32768).capabilities, streaming: failure === 'stream' },
+        limits: { contextTokens: 32768, outputTokens: 16384 }
+      }),
+      complete: async (request) => {
+        if (!request.tools) {
+          renewals++;
+          if (failure !== 'incomplete') throw new ModelProviderError({
+            provider: 'fixture', code: 'provider_unavailable',
+            message: 'Renewal transport failed', retryable: true
+          });
+          return {
+            provider: 'fixture', model: 'context', content: 'Incomplete renewal',
+            terminationReason: 'output_limit',
+            usage: { promptTokens: 30, completionTokens: 10, totalTokens: 40 }
+          };
+        }
+        generations++;
+        assert.ok(request.messages.some((message) => message.content === original));
+        assert.ok(request.messages.some((message) => message.content === 'Recorded answer.'));
         return {
-          provider: 'fixture',
-          model: 'context',
-          content: 'Incomplete continuation',
-          terminationReason: 'output_limit',
-          usage: { promptTokens: 30, completionTokens: 10, totalTokens: 40 }
+          provider: 'fixture', model: 'context',
+          content: 'Continued using the original context.', terminationReason: 'stop',
+          usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 }
         };
+      },
+      async *stream(request) {
+        if (!request.tools) yield {
+          type: 'content', content: '{"text":"Partial', accumulated: '{"text":"Partial'
+        };
+        yield { type: 'done', response: await this.complete(request) };
       }
-      generations++;
-      assert.ok(request.messages.some((message) => message.content === original));
-      assert.ok(request.messages.some((message) => message.content === 'Recorded answer.'));
-      return {
-        provider: 'fixture',
-        model: 'context',
-        content: 'Continued using the original context.',
-        terminationReason: 'stop',
-        usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 }
-      };
+    };
+    const inference = InferenceService.inMemory({ provider });
+    const result = await new AgentRuntime({
+      ...state.options, provider, inferenceService: inference,
+      maxOutputTokens: 16384, contextRenewal: { automatic: true }
+    }).run({ task: 'Continue.' }).result;
+    assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+    assert.equal(renewals, 1);
+    assert.equal(generations, 1);
+    const after = await state.context.inspect();
+    assert.deepEqual(after.window, before.window);
+    assert.deepEqual(after.workingState, before.workingState);
+    assert.equal(after.admission.status, 'admitted');
+    assert.equal(result.terminal.budget.promptTokens, failure === 'incomplete' ? 50 : 20);
+    if (failure !== 'incomplete') {
+      const owner = await inference.options.repository.load(result.terminal.runId);
+      assert.equal(owner.committed.invocations, 2);
+      assert.equal(owner.settledUsage.invocations, 1);
     }
-  };
-  const result = await new AgentRuntime({
-    ...state.options,
-    provider,
-    maxOutputTokens: 16384,
-    contextRenewal: { automatic: true }
-  }).run({ task: 'Continue.' }).result;
-  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
-  assert.equal(summaries, 1);
-  assert.equal(generations, 1);
-  assert.equal((await state.context.inspect()).window, null);
-  assert.equal(result.terminal.budget.promptTokens, 50);
-});
+  });
+}
+
+for (const failure of ['required-transport', 'persistence', 'cancellation']) {
+  test(`renewal (${failure}) cannot bypass admission, storage integrity or cancellation`, async () => {
+    const state = await fixture();
+    await new AgentRuntime(state.options).run({
+      task: 'Preserve the original requirements. '.repeat(700)
+    }).result;
+    const before = await state.context.inspect();
+    const abort = new AbortController();
+    let renewals = 0;
+    let generations = 0;
+    const provider = {
+      ...state.provider,
+      describeModel: async () => ({
+        ...profile(32768),
+        limits: {
+          contextTokens: 32768,
+          outputTokens: 16384
+        }
+      }),
+      complete: async (request) => {
+        if (request.tools) {
+          generations++;
+          if (failure === 'required-transport') throw new ModelProviderError({
+            provider: 'fixture', code: 'context_overflow',
+            message: 'Ordinary context rejected', retryable: false
+          });
+          return state.provider.complete(request);
+        }
+        renewals++;
+        if (failure === 'required-transport') throw new ModelProviderError({
+          provider: 'fixture', code: 'provider_unavailable',
+          message: 'Renewal transport failed', retryable: true
+        });
+        if (failure === 'cancellation') {
+          abort.abort(new Error('User cancelled renewal'));
+          request.signal?.throwIfAborted();
+        }
+        return { provider: 'fixture', model: 'context', content: '{"text":"Useful state"}',
+          terminationReason: 'stop' };
+      }
+    };
+    if (failure === 'persistence') state.context.stageWorkingState = async () => {
+      throw new Error('Working-state storage failed');
+    };
+    const result = await new AgentRuntime({
+      ...state.options, provider,
+      maxOutputTokens: failure === 'required-transport' ? 4096 : 16384,
+      contextRenewal: { automatic: true }
+    }).run({ task: 'Continue.', signal: abort.signal }).result;
+    assert.equal(renewals, 1, JSON.stringify(result));
+    assert.equal(generations, failure === 'required-transport' ? 1 : 0);
+    if (failure === 'required-transport') {
+      assert.equal(result.state, 'suspended');
+      assert.equal(result.reason, 'context_admission');
+    } else if (failure === 'persistence') {
+      assert.equal(result.terminal?.terminationReason, 'runtime_error');
+      assert.match(result.terminal.errorMessage, /Working-state storage failed/);
+    } else assert.equal(result.terminal?.executionStatus, 'aborted');
+    const after = await state.context.inspect();
+    assert.deepEqual(after.window, before.window);
+    assert.deepEqual(after.workingState, before.workingState);
+  });
+}
 
 test('a changed admitted request resumes a definitively rejected provider request without unresolved-outcome recovery', async () => {
   const state = await fixture();

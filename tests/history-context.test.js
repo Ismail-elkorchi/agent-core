@@ -68,6 +68,39 @@ async function backend(kind) {
   };
 }
 for (const kind of ['memory', 'jsonl']) {
+  test(`${kind}: inherited cuts cannot expose a parent's ledger beyond the fork boundary`, async () => {
+    const { sessions, artifacts, events } = await backend(kind);
+    const session = await sessions.create({ binding });
+    await sessions.appendInput(session, { runId: 'open-run', task: 'Original requirement' });
+    const answer = (content, turnIndex) => ({
+      type: 'assistant.ended', ...identity, turnId: `turn-${turnIndex}`, turnIndex, content,
+      modelOutput: { status: 'complete', message: content, source: 'content', turnIndex }
+    });
+    await events.append('open-run', answer('Before the fork', 1));
+    const history = new HistoryReader({ repository: sessions, session, events, artifacts });
+    const ancestor = await history.capture();
+    const context = new ContextService({ repository: sessions, session, artifacts, history,
+      policy: { maxSourceBytes: 1024 * 1024, historyRead: { history, isAvailable: () => true } }
+    });
+    const point = await context.request({ idempotencyKey: 'fork-point', reason: 'Historical point' });
+    await events.append('open-run', answer('Later parent answer', 2));
+    const later = await history.capture();
+    await sessions.branchFrom(session, point.entry.id, 'Independent child');
+    const child = await history.capture();
+    assert.equal(await history.extendsCut(ancestor, child), true);
+    assert.deepEqual(child.ledgerHeads, ancestor.ledgerHeads);
+    await assert.rejects(history.validateCut(later), /exceeds the inherited fork boundary/);
+    await assert.rejects(
+      history.validateCut({ ...ancestor, ledgerHeads: later.ledgerHeads }),
+      /exceeds the inherited fork boundary/
+    );
+    const old = await history.page({ cut: ancestor });
+    assert.deepEqual(old.entries.filter((entry) => entry.type === 'assistant')
+      .map((entry) => entry.content), ['Before the fork']);
+    const incremental = await history.page({ after: point.entry.window.historyPosition, cut: child });
+    assert.deepEqual(incremental.entries.map((entry) => entry.type), ['context_transition', 'branch']);
+  });
+
   test(`${kind}: history excerpts budget the complete model presentation and preserve exact retrievable sources`, async () => {
     const { sessions } = await backend(kind);
     const session = await sessions.create({ binding });

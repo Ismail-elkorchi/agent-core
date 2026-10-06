@@ -87,6 +87,7 @@ interface QueuedProgress {
 interface ManagedProcess {
   readonly id: string;
   readonly command: string;
+  readonly mode: CommandExecutionPlanRequest['mode'];
   readonly owner: CommandExecutionOwner;
   readonly rootPath: string;
   readonly tree: SupervisedProcessTree;
@@ -300,6 +301,7 @@ export class LocalCommandExecution implements CommandExecution {
     const record: ManagedProcess = {
       id,
       command: request.command,
+      mode: request.mode,
       owner: request.owner,
       rootPath: this.options.rootedFileAuthority.identity.canonicalPath,
       tree,
@@ -326,7 +328,7 @@ export class LocalCommandExecution implements CommandExecution {
       startupComplete: false,
       startupFailed: false,
       ...(options.onProgress ? { onProgress: options.onProgress } : {}),
-      ...(options.lease ? { lease: options.lease } : {})
+      ...(options.lease && request.mode === 'foreground' ? { lease: options.lease } : {})
     };
     this.active.set(id, record);
     this.reservedCapturedBytes += this.options.maxCapturedBytes;
@@ -406,14 +408,14 @@ export class LocalCommandExecution implements CommandExecution {
       options.signal.addEventListener('abort', record.abortListener, { once: true });
       if (options.signal.aborted) record.abortListener();
     }
-    if (options.awaitTerminal) {
+    if (request.mode === 'foreground') {
       await tree.settle();
       await this.finish(record);
       return { kind: 'started', result: await this.query(id, request.outputTokenBudget, 0, 0, request.owner) };
     }
     await this.waitForActivity(record, request.yieldMs, 0);
-    if (record.status === 'running' && options.lease)
-      options.lease.transferToResource(id, processScope(id));
+    // Supervision owns the admitted background lifetime; its startup lease is finished.
+    options.lease?.release();
     return { kind: 'started', result: await this.query(id, request.outputTokenBudget, 0, 0, request.owner) };
   }
 
@@ -1015,6 +1017,7 @@ export class LocalCommandExecution implements CommandExecution {
     return {
       schemaVersion: 1,
       processId: record.id,
+      mode: record.mode,
       supervisorPid: osPid,
       supervisorIdentity: record.tree.supervision.identity,
       supervisorEndpoint: record.tree.supervision.endpoint,
@@ -1093,12 +1096,16 @@ export class LocalCommandExecution implements CommandExecution {
         }));
         this.recovered.delete(processId);
         this.recoveredEntries.delete(processId);
-        this.resourceLeases.restoreResource(processId, {
-          accesses: [{ mode: 'execute', scope: processScope() }],
-          lockScopes: ['files'],
-          recovery: { kind: 'unknown' }
-        }, processScope(processId));
-        this.resourceLeases.failResource(processId, new Error(`Process lifetime needs reconciliation: ${diagnostic}`));
+        if (entry?.mode === 'background') {
+          this.resourceLeases.releaseResource(processId);
+        } else {
+          this.resourceLeases.restoreResource(processId, {
+            accesses: [{ mode: 'execute', scope: processScope() }],
+            lockScopes: ['files'],
+            recovery: { kind: 'unknown' }
+          }, processScope(processId));
+          this.resourceLeases.failResource(processId, new Error(`Process lifetime needs reconciliation: ${diagnostic}`));
+        }
       }
     }
     return Object.freeze({ resolved: Object.freeze(resolved), unresolved: Object.freeze(unresolved) });

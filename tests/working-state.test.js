@@ -105,7 +105,24 @@ for (const kind of ['memory', 'jsonl']) {
       reason: 'Historical boundary'
     });
     await f.update('later', 'old', 'Later interpretation');
+    const laterCut = await f.history.capture();
     await f.sessions.branchFrom(f.session, point.entry.id, 'Historical fork');
+    const childCut = await f.history.capture();
+    const inheritedCut = point.entry.window.historyPosition;
+    assert.notEqual(childCut.branchId, inheritedCut.branchId);
+    assert.equal(await f.history.extendsCut(inheritedCut, childCut), true);
+    const page = await f.history.page({ after: inheritedCut, cut: childCut, limit: 10 });
+    assert.ok(page.entries.some((entry) => entry.type === 'branch'));
+    assert.ok(!page.entries.some((entry) => entry.id === 'later'));
+    await assert.rejects(f.history.validateCut(laterCut), /outside the authorized branch/);
+    await assert.rejects(
+      f.history.validateCut({ ...inheritedCut, branchId: childCut.branchId }),
+      /branch at its captured boundary/
+    );
+    await assert.rejects(
+      f.history.page({ cut: inheritedCut, after: childCut }),
+      /not an ancestor/
+    );
     assert.equal((await f.context.workingState()).text, 'Original constraints');
     await f.update('child', 'old', 'Independent child');
     assert.equal((await f.sessions.currentWorkingState(f.session, 'later')).id, 'later');
@@ -113,6 +130,17 @@ for (const kind of ['memory', 'jsonl']) {
     const replay = await f.sessions.loadReplayState(f.session);
     assert.equal(replay.workingState.id, 'child');
     assert.ok(!replay.branch.some((x) => x.id === 'later'));
+    const nestedPoint = await f.context.request({
+      idempotencyKey: 'nested-point', reason: 'Nested historical boundary'
+    });
+    await f.sessions.branchFrom(f.session, nestedPoint.entry.id, 'Nested fork');
+    const repository = kind === 'jsonl'
+      ? new JsonlSessionRepository(path.join(f.root, 'sessions')) : f.sessions;
+    const reopened = new HistoryReader({ repository, session: f.session, artifacts: f.artifacts });
+    assert.equal(await reopened.extendsCut(inheritedCut, await reopened.capture()), true);
+    assert.ok((await reopened.page({ after: inheritedCut })).entries.length > 0);
+    assert.equal((await reopened.selectedContext(await reopened.capture())).windowId,
+      nestedPoint.entry.window.windowId);
   });
 
   test(`${kind}: state and renewed window publish together only after admission`, async (t) => {

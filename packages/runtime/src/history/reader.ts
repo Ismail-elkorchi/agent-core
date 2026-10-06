@@ -104,7 +104,6 @@ export class HistoryReader {
   async extendsCut(previous: HistorySourceCut, next: HistorySourceCut): Promise<boolean> {
     if (
       previous.sessionId !== next.sessionId ||
-      previous.branchId !== next.branchId ||
       previous.sourceRevision > next.sourceRevision ||
       previous.ledgerCoverage !== next.ledgerCoverage
     )
@@ -115,6 +114,7 @@ export class HistoryReader {
       !metadataIndex(snapshot).byId.has(previous.throughEntryId)
     )
       return false;
+    await this.snapshot(previous);
     for (const head of previous.ledgerHeads ?? []) {
       const current = await this.head(head.runId, next, snapshot);
       if (
@@ -185,7 +185,6 @@ export class HistoryReader {
     const current = await this.options.repository.sourceSnapshot(this.options.session);
     if (
       cut.sessionId !== this.options.session.id ||
-      cut.branchId !== current.branchId ||
       cut.sourceRevision > current.sourceRevision ||
       (cut.throughEntryId !== null && !metadataIndex(current).byId.has(cut.throughEntryId))
     )
@@ -197,6 +196,8 @@ export class HistoryReader {
             this.options.session,
             cut.throughEntryId
           );
+    if (cut.branchId !== snapshot.branchId)
+      throw new Error('History cut does not identify the branch at its captured boundary.');
     const runs = metadataIndex(snapshot).runs;
     const seen = new Set<string>();
     for (const head of cut.ledgerHeads ?? []) {
@@ -207,7 +208,7 @@ export class HistoryReader {
       )
         throw new Error('History cut has an invalid or unauthorized run boundary.');
       seen.add(head.runId);
-      const inherited = inheritedHeads(snapshot).get(head.runId);
+      const inherited = inheritedHeads(current).get(head.runId);
       if (
         inherited &&
         (head.sequence > inherited.sequence ||
@@ -500,12 +501,14 @@ export class HistoryReader {
       throw new Error('History source cursor cut mismatch.');
     const cut = cursor?.cut ?? request.cut ?? (await this.capture());
     const snapshot = await this.snapshot(cut);
+    if (request.after && !(await this.extendsCut(request.after, cut)))
+      throw new Error('History page boundary is not an ancestor of its cut.');
     const afterSnapshot = request.after ? await this.snapshot(request.after) : undefined;
     const oldIds = afterSnapshot
       ? metadataIndex(afterSnapshot).byId
       : new Map<string, SessionSourceMetadata>();
     let at = cursor?.at ?? 0;
-    if (!cursor && request.after?.branchId === cut.branchId) {
+    if (!cursor && request.after) {
       const positions = metadataIndex(snapshot);
       const boundary =
         request.after.throughEntryId === null

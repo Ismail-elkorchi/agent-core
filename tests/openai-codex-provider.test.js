@@ -8,6 +8,7 @@ import { WebSocketServer } from 'ws';
 import { FileCredentialStore } from '@agent-core/auth';
 import { ModelProviderError } from '@agent-core/model';
 import { OpenAICodexProvider, loginOpenAICodexDeviceCode } from '@agent-core/provider-openai-codex';
+import { InferenceService, ModelRequestAssembler, ModelWindow, RequestAdmission } from '@agent-core/runtime';
 
 test('Codex catalog efforts do not prevent low or high requests for Astra or other models', async () => {
   const efforts = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'provider-defined-effort'];
@@ -816,6 +817,103 @@ test('OpenAICodexProvider WebSocket session continues with only incremental inpu
   );
   assert.equal(thirdEvents.at(-1).response.transport.strategy, 'websocket_full_replay');
 });
+
+for (const change of ['no state', 'unchanged state', 'revised state', 'new user', 'guidance', 'window replacement']) {
+  test(`admitted Codex requests preserve exact input across ${change}`, async t => {
+    const sockets = [];
+    const provider = new OpenAICodexProvider({
+      auth: bearerProvider(codexJwt()),
+      transport: 'websocket',
+      webSocketFactory: () => {
+        const socket = new FakeCodexWebSocket();
+        socket.send = function(data) {
+          this.sent.push(data);
+          const first = this.sent.length === 1;
+          const output = first && change !== 'window replacement'
+            ? [{ type: 'function_call', call_id: 'inspect-1', name: 'exec_command', arguments: '{"command":"pwd"}' }]
+            : [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Inspected.' }] }];
+          queueMicrotask(() => {
+            for (const item of output) this.emitJson({ type: 'response.output_item.done', item });
+            this.emitJson({ type: 'response.completed', response: {
+              id: `response-${this.sent.length}`, model: 'gpt-5.6', status: 'completed', output
+            } });
+          });
+        };
+        sockets.push(socket);
+        return socket;
+      }
+    });
+    const profile = await provider.describeModel('gpt-5.6');
+    const inference = InferenceService.inMemory({ provider });
+    const session = inference.createSession();
+    t.after(() => session.close());
+    const admission = new RequestAdmission(new ModelRequestAssembler(), inference);
+    const state = {
+      id: 'state-1', sourceUri: 'session://working-state', sourceKind: 'generated',
+      integrity: 'unverified', representation: 'summary', mediaType: 'text/plain',
+      title: 'Working state', content: 'Current understanding.', purpose: 'Generated interpretation.'
+    };
+    const initial = {
+      window: new ModelWindow(), task: 'Inspect the directory.', modelProfile: profile,
+      instructions: [{ id: 'guidance-1', role: 'developer', priority: 0, content: 'Preserve unrelated work.' }],
+      tools: [{ name: 'exec_command', description: 'Inspect the directory.', inputFormat: 'JSON', accessModes: ['execute'] }],
+      ...(change === 'no state' ? {} : { workingState: state })
+    };
+    const settings = { model: profile.id, tools: [{ type: 'function', function: {
+      name: 'exec_command', description: 'Inspect the directory.',
+      parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'], additionalProperties: false }
+    } }] };
+    const dispatch = async (input, invocationId) => {
+      const admitted = await admission.assemble(input, settings, 100);
+      const result = await inference.invoke({
+        ownerId: 'continuity-session', invocationId, purpose: 'generation', session,
+        request: admitted.request, compiled: admitted.compiled, profile,
+        workingStateRevisionId: input.workingState?.id ?? null, outputReservation: 100
+      });
+      return { ...admitted, response: result.response };
+    };
+    const first = await dispatch(initial, 'first');
+    initial.window.recordModelOutput({
+      turnIndex: 1, output: first.response.output, content: first.response.content,
+      toolCalls: first.response.toolCalls ?? []
+    });
+    for (const call of first.response.toolCalls ?? []) initial.window.recordToolResult({
+      turnIndex: 1, toolName: call.name, toolCallType: call.type, callId: call.id, immediateContent: '/workspace'
+    });
+    const next = { ...initial };
+    if (change === 'revised state') next.workingState = { ...state, id: 'state-2', content: 'Revised understanding.' };
+    if (change === 'guidance') next.instructions = [{ ...initial.instructions[0], id: 'guidance-2', content: 'Preserve unrelated work. Review changed files.' }];
+    if (change === 'new user') {
+      next.window = new ModelWindow();
+      next.window.recordSourceItem('original-task', { role: 'user', content: initial.task });
+      for (const [index, item] of initial.window.messagesFor(profile).messages.entries())
+        next.window.recordSourceItem(`prior-${index}`, item);
+      next.task = 'Explain the inspection.';
+    }
+    if (change === 'window replacement') {
+      next.window = new ModelWindow();
+      next.workingState = { ...state, id: 'state-2', content: 'Revised understanding.' };
+    }
+    const second = await dispatch(next, 'second');
+    const wire = JSON.parse(sockets[0].sent[1]);
+    assert.equal(second.response.transport.strategy, change === 'no state' ? 'websocket_delta' : 'websocket_full_replay');
+    if (change === 'no state') {
+      assert.equal(wire.previous_response_id, 'response-1');
+      assert.deepEqual(wire.input.map(item => item.type), ['function_call_output']);
+      assert.equal(wire.input[0].call_id, 'inspect-1');
+      assert.equal(wire.input[0].output, '/workspace');
+    } else {
+      assert.equal(wire.previous_response_id, undefined);
+      const { type, stream, ...body } = wire;
+      assert.equal(type, 'response.create');
+      assert.equal(stream, true);
+      assert.deepEqual(body, second.compiled.body);
+      const interpretations = body.input.filter(item => /(?:Current|Revised) understanding\./u.test(JSON.stringify(item)));
+      assert.equal(interpretations.length, 1);
+      assert.ok(JSON.stringify(interpretations[0]).includes(next.workingState.content));
+    }
+  });
+}
 
 test('OpenAICodexProvider WebSocket continuation rejection reports previous response state', async () => {
   const sockets = [];

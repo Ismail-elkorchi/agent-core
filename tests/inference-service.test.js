@@ -69,6 +69,45 @@ function input(invocationId = 'one', ownerId = 'work') {
   };
 }
 
+for (const method of ['complete', 'stream', 'completeCompiled', 'streamCompiled']) {
+  test(`direct provider ${method} retains its receiver and every transport option`, async () => {
+    const streaming = method.startsWith('stream');
+    const compiled = method.endsWith('Compiled');
+    const modelProfile = { ...profile, capabilities: { ...profile.capabilities, streaming } };
+    const calls = [];
+    const provider = fixture(async () => { throw new Error('Wrong provider method selected.'); });
+    provider.describeModel = async () => modelProfile;
+    const receive = function(request, options) {
+      assert.equal(this, provider);
+      const logical = compiled ? request.logicalRequest : request;
+      calls.push({ request, options });
+      return response(logical);
+    };
+    provider[method] = streaming
+      ? async function*(request, options) {
+          yield { type: 'done', response: receive.call(this, request, options) };
+        }
+      : receive;
+    const service = InferenceService.inMemory({ provider });
+    const session = service.createSession();
+    const request = input().request;
+    const transport = { affinityKey: 'session-scope', signal: new AbortController().signal };
+    const value = compiled
+      ? await service.compile(request, modelProfile, { outputReservation: 100 })
+      : request;
+    if (streaming) {
+      for await (const event of session[method](value, transport)) void event;
+    } else await session[method](value, transport);
+    assert.equal(calls[0].request, value);
+    assert.equal(calls[0].options, transport);
+
+    const result = await service.invoke({ ...input(), profile: modelProfile });
+    assert.equal(result.response.content, '{"category":"inquiry"}');
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1].options.affinityKey, 'work');
+  });
+}
+
 test('local admission failure records not-sent without provider execution or unknown exposure', async () => {
   let calls = 0;
   const provider = fixture(async request => { calls++; return response(request); });

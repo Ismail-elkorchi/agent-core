@@ -25,6 +25,7 @@ const manager = new LocalCommandExecution({
 });
 const plan = await manager.plan({
   command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'started'); setInterval(()=>{},1000)`)}`,
+  mode: 'background',
   rootedDirectory: '.',
   pty: false,
   timeoutMs: 60_000,

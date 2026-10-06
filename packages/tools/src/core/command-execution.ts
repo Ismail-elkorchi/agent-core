@@ -51,6 +51,7 @@ export interface CommandExecutionDescriptor {
 
 export interface CommandExecutionPlanRequest {
   readonly command: string;
+  readonly mode: 'foreground' | 'background';
   /** Canonical path relative to the command authority's adopted root. */
   readonly rootedDirectory: string;
   readonly pty: boolean;
@@ -64,8 +65,6 @@ export interface StartCommandExecutionOptions {
   readonly signal?: AbortSignal;
   readonly lease?: ToolResourceLease;
   readonly onProgress?: (progress: ToolProgress) => void | Promise<void>;
-  /** Return the terminal command result, while the authority owns its process lifetime. */
-  readonly awaitTerminal?: boolean;
 }
 
 /** Authority-owned command planning. It may reserve resources but must not execute the target. */
@@ -240,6 +239,7 @@ export function ownCommandExecutionRequest(request: CommandExecutionPlanRequest)
   const { ownerId, runId, turnId, toolBatchId, callIndex } = request.owner;
   return Object.freeze({
     command: request.command,
+    mode: request.mode,
     rootedDirectory: request.rootedDirectory,
     pty: request.pty,
     timeoutMs: request.timeoutMs,
@@ -354,6 +354,8 @@ function requireCommandExecutionPlan(plan: CommandExecutionPlan, authority: Comm
 function validateCommandExecutionPlanRequest(request: CommandExecutionPlanRequest): void {
   if (typeof request.command !== 'string' || request.command.length === 0)
     throw new TypeError('Command must be non-empty.');
+  if (!['foreground', 'background'].includes(request.mode))
+    throw new TypeError('Command mode must be foreground or background.');
   if (typeof request.rootedDirectory !== 'string')
     throw new TypeError('Command rooted directory must be a string.');
   if (typeof request.pty !== 'boolean')

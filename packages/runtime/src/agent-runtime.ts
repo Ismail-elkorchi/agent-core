@@ -18,6 +18,7 @@ import {
   RequestTokenEstimator,
   requestAccountingInputTokens,
   ModelContractError,
+  ModelProviderError,
   parseModelProfile,
   type CompiledModelRequest,
   type ModelOutputItem,
@@ -87,7 +88,7 @@ import {
   invokeRunInference,
   providerUsageQuantities
 } from './inference/run-lifecycle.js';
-import { InferenceService } from './inference/service.js';
+import { InferenceOutcomeUnknownError, InferenceService } from './inference/service.js';
 import {
   BudgetAccountant,
   type RequestCostEstimate,
@@ -3054,15 +3055,27 @@ export class AgentRuntime {
         result = renewed;
         admissionFailure = undefined;
       } catch (error) {
+        request.signal.throwIfAborted();
+        const invocationFailure =
+          error instanceof InferenceOutcomeUnknownError ? error.cause : undefined;
+        const providerFailure =
+          invocationFailure instanceof ModelStreamInterruptedError
+            ? invocationFailure.cause
+            : invocationFailure;
+        const renewalUnavailable =
+          providerFailure instanceof ModelProviderError &&
+          providerFailure.retryable &&
+          providerFailure.code !== 'aborted';
         // A speculative renewal cannot block work that already fits. Its window was not committed.
-        if (admissionFailure || !(error instanceof ContextAdmissionError)) {
+        const renewalFailed = error instanceof ContextAdmissionError || renewalUnavailable;
+        if (admissionFailure || !renewalFailed) {
           this.options.context.recordAdmission({
             status: 'blocked',
             inputIdentity: result.compiled.inputIdentity,
             accounting: result.compiled.accounting,
             message: error instanceof Error ? error.message : String(error)
           });
-          throw error;
+          throw renewalFailed ? (admissionFailure ?? error) : error;
         }
       }
     }

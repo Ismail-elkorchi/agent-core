@@ -267,7 +267,7 @@ function effectFor(plan, generation) {
   return issued.state;
 }
 
-test('runtime resource leases span batches until a running process exits', async () => {
+test('transferred resource leases retain their admitted scopes until explicit release', async () => {
   const coordinator = new ResourceLeaseCoordinator();
   const command = await coordinator.acquire(
     {

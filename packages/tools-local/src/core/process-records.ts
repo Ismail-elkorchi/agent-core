@@ -19,6 +19,7 @@ export const commandOwnerSchema = z.strictObject({
 const processLedgerSchema = z.strictObject({
   schemaVersion: z.literal(1),
   processId: z.string().regex(/^proc_[a-f0-9-]+$/u),
+  mode: z.enum(['foreground', 'background']),
   supervisorPid: z.int().positive(),
   supervisorIdentity: z.string().regex(/^supervisor_[a-f0-9-]+$/u),
   supervisorEndpoint: z.string().min(1),

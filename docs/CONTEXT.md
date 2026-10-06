@@ -73,6 +73,12 @@ in the prompt. State cannot grant authority, establish verification, or replace
 original user contributions and observations. It has no mandatory sections or
 maintenance schedule. Unchanged understanding requires no update.
 
+Working state is a request suffix. Adding conversation before that suffix changes
+the preceding wire input even when the state text is unchanged. Providers that
+require an exact append-only prefix for incremental continuation use full replay
+in that case. Incremental transport reuse and provider-reported prompt cache usage
+are separate facts; shared prefixes alone do not establish cache hits.
+
 `ContextService.inspect()` exposes a bounded preview and an authorized history
 reference. Historical reads and searches use `HistoryReader` and disclose their
 byte bounds and coverage. There is no independent note repository or browser.

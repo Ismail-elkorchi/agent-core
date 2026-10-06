@@ -164,8 +164,8 @@ export class InferenceGateway {
 function directProviderSession(provider: ModelProvider): ModelProviderSession {
   const stream = provider.stream?.bind(provider);
   return Object.freeze({
-    complete: (request: ModelRequest) => provider.complete(request),
-    ...(stream ? { stream: (request: ModelRequest) => stream(request) } : {}),
+    complete: provider.complete.bind(provider),
+    ...(stream ? { stream } : {}),
     ...(provider.completeCompiled
       ? { completeCompiled: provider.completeCompiled.bind(provider) }
       : {}),

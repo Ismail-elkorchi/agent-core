@@ -86,6 +86,7 @@ export function createExecCommandTool(
       const { executor, ...request } = input;
       const reservation = await planCommandExecution(executor, {
         command: request.command,
+        mode: request.background ? 'background' : 'foreground',
         rootedDirectory: request.workdir,
         pty: request.pty,
         timeoutMs: request.timeoutMs,
@@ -118,7 +119,6 @@ async function executeCommand(
     const started = await startCommandExecutionPlan(input.executor, input.reservation, {
       ...(context.signal ? { signal: context.signal } : {}),
       ...(context.resourceLease ? { lease: context.resourceLease } : {}),
-      awaitTerminal: !input.background,
       onProgress: (progress) => context.emitProgress?.(progress)
     });
     if (started.kind === 'not_started') return {
@@ -165,7 +165,7 @@ async function executeCommand(
   };
 }
 export const execCommandTool = createExecCommandTool();
-interface CommandInput extends Omit<CommandExecutionPlanRequest, 'rootedDirectory'> {
+interface CommandInput extends Omit<CommandExecutionPlanRequest, 'rootedDirectory' | 'mode'> {
   readonly workdir: string;
   readonly background: boolean;
   readonly executor: CommandExecution;
