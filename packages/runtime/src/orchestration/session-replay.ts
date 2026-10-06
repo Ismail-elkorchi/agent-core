@@ -77,11 +77,7 @@ export async function rebuildModelWindowFromRepositories(input: {
     model: input.model,
     ...(input.protocol ? { protocol: input.protocol } : {})
   };
-  for (const [index, item] of (transformed?.input ?? []).entries())
-    modelWindow.recordSourceItem(
-      `context-transform:${view?.contextWindow?.windowId ?? ''}:${String(index)}`,
-      item
-    );
+  modelWindow.setTransformedInput(transformed?.input ?? []);
   const prior = selected.filter(
     (entry) =>
       (!('runId' in entry) || entry.runId !== input.currentRunId) &&

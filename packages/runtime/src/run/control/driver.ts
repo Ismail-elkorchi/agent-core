@@ -720,7 +720,8 @@ export class AgentRunDriver {
   ): Promise<AgentRunInspection> {
     return this.serial(async () => {
       await this.refresh();
-      this.assertTransitionAuthority(this.stateValue.phase);
+      // Cancellation fences new work, not accounting for already-started work.
+      this.assertTransitionAuthority(this.stateValue.phase, true);
       return this.commitState({
         phase: this.stateValue.phase,
         budget: update(this.stateValue.budget)
@@ -909,7 +910,12 @@ export class AgentRunDriver {
     advance: AgentRunAdvance,
     target?: AgentRunTarget
   ): Promise<AgentRunInspection> {
-    this.assertTransitionAuthority(advance.phase);
+    this.assertTransitionAuthority(
+      advance.phase,
+      this.stateValue.control.status === 'abort_requested' &&
+        procedure === 'reconcile_provider_request' &&
+        isProviderOutcomeReconciliation(this.stateValue, advance, target)
+    );
     if (!advanceMatchesProcedure(procedure, advance.phase)) {
       throw new TypeError(`Procedure ${procedure} cannot advance to ${advance.phase.kind}.`);
     }
@@ -1058,7 +1064,7 @@ export class AgentRunDriver {
       control.status === 'detached' ||
       control.driverId !== this.driverId ||
       this.stateValue.driverGeneration !== this.generation ||
-      (control.status === 'abort_requested' && !abortAdministrativeEvent(event))
+      (control.status === 'abort_requested' && !abortAdministrativeEvent(event, this.stateValue))
     ) {
       throw new AgentRunConflictError(
         this.stateValue.runId,
@@ -1068,7 +1074,10 @@ export class AgentRunDriver {
     }
   }
 
-  private assertTransitionAuthority(nextPhase: AgentRunControlPhase): void {
+  private assertTransitionAuthority(
+    nextPhase: AgentRunControlPhase,
+    recordsExistingWork = false
+  ): void {
     if (this.stateValue.phase.kind === 'terminal')
       throw new AgentRunConflictError(
         this.stateValue.runId,
@@ -1089,6 +1098,7 @@ export class AgentRunDriver {
     }
     if (
       this.stateValue.control.status === 'abort_requested' &&
+      !recordsExistingWork &&
       nextPhase.kind !== 'cancelling' &&
       nextPhase.kind !== 'finalization' &&
       nextPhase.kind !== 'terminal'
@@ -1173,7 +1183,53 @@ function toolSettlementDigest(settlement: AgentToolSettlementRecord): string {
   );
 }
 
-function abortAdministrativeEvent(event: AgentAuditEvent): boolean {
+function isProviderOutcomeReconciliation(
+  state: AgentRunState,
+  advance: AgentRunAdvance,
+  target: AgentRunTarget | undefined
+): boolean {
+  if (
+    target?.kind !== 'provider' ||
+    hashJson(advance.phase) !== hashJson(state.phase) ||
+    hashJson(advance.toolBatches ?? state.toolBatches) !== hashJson(state.toolBatches) ||
+    advance.providerRequests?.length !== state.providerRequests.length
+  )
+    return false;
+  const previous = providerWork(state, target);
+  const next = advance.providerRequests.find(
+    (request) =>
+      request.identity.turnId === target.turnId &&
+      request.identity.requestAttempt === target.requestAttempt
+  );
+  return (
+    previous.stage === 'effect_pending' &&
+    (next?.stage === 'settled' || next?.stage === 'failed' || next?.stage === 'outcome_unknown')
+  );
+}
+
+function abortAdministrativeEvent(event: AgentAuditEvent, state: AgentRunState): boolean {
+  if (
+    event.type === 'provider.attempt.settled' ||
+    event.type === 'provider.attempt.failed' ||
+    event.type === 'model.failed' ||
+    event.type === 'assistant.interrupted'
+  ) {
+    const request = state.providerRequests.find(
+      (entry) =>
+        entry.identity.turnId === event.turnId &&
+        entry.identity.turnIndex === event.turnIndex &&
+        entry.identity.requestAttempt === event.requestAttempt
+    );
+    if (!request || request.stage === 'ready' || request.stage === 'effect_ready') return false;
+    if (event.type === 'provider.attempt.settled' || event.type === 'provider.attempt.failed') {
+      return (
+        request.stage === 'effect_pending' &&
+        request.effect.intent.effectId === event.effectId &&
+        request.responseId === event.responseId
+      );
+    }
+    return true;
+  }
   return (
     event.type === 'context.transition.requested' ||
     event.type === 'context.transition.bound' ||
@@ -1302,6 +1358,12 @@ function assertWorkAdvance(
         target.requestAttempt !== request.identity.requestAttempt)
     )
       throw new TypeError('Targeted transition changed unrelated provider work.');
+    if (
+      (procedure === 'authorize_provider_request' || procedure === 'start_provider_request') &&
+      next.stage !== 'outcome_unknown' &&
+      (state.phase.kind !== 'active' || state.control.status !== 'owned')
+    )
+      throw new TypeError('Provider admission is quiesced for this run.');
     assertProviderAdvance(procedure, request, next, state.driverGeneration);
   }
 }

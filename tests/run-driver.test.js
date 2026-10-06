@@ -17,6 +17,7 @@ import {
   nextAgentRunInstruction
 } from '@agent-core/runtime';
 import { createToolCall, parseToolObservation } from '@agent-core/tools';
+import { issueEffectStartTicket, startExternalEffect } from '@agent-core/effects';
 
 const acceptance = (runId = 'run-run') => ({
   runId,
@@ -428,6 +429,53 @@ test('abort retries a lost tail race and becomes the durable control state', asy
   assert.ok(results[0].status === 'fulfilled' || results[0].status === 'rejected');
   const current = await runs.inspect('abort-race');
   assert.equal(current.state.control.status, 'abort_requested');
+});
+
+test('cancellation fences provider authorization and start even in a finalizing phase', async () => {
+  for (const boundary of ['authorize', 'start']) {
+    const events = new InMemoryEventRepository(agentEventCodec);
+    const runs = new AgentRunCoordinator(events, new InMemoryArtifactRepository());
+    const runId = `cancel-provider-${boundary}`;
+    await runs.accept(acceptance(runId));
+    const driver = await runs.attach(runId, 'driver');
+    await driver.transition('initialize_run', {
+      phase: { kind: 'initializing', step: 'assemble_turn', turnIndex: 1 }
+    });
+    const identity = { turnIndex: 1, turnId: 'turn-1', requestAttempt: 1 };
+    const ready = { kind: 'provider', stage: 'ready', identity, toolBatchId: 'batch-1' };
+    await driver.transition('assemble_turn', { phase: { kind: 'active' }, providerRequests: [ready] });
+    const issued = issueEffectStartTicket({
+      intent: {
+        effectId: `${runId}:provider:1`, ownerId: runId,
+        implementationId: 'agent-core.tests.run-provider@1', parametersDigest: 'a'.repeat(64),
+        recovery: { kind: 'unknown' }, exposure: { quantities: [] }
+      },
+      ticketId: 'ticket-1', settlementPermitId: 'permit-1',
+      driverGeneration: 1, currentDriverGeneration: 1
+    });
+    assert.equal(issued.status, 'issued');
+    const authorized = {
+      ...ready, stage: 'effect_ready', requestEventId: 'request-1', responseId: 'response-1',
+      effect: issued.state
+    };
+    if (boundary === 'start') {
+      await driver.transitionProvider('authorize_provider_request', identity, () => authorized);
+    }
+    await driver.requestAbort('Stop provider admission.');
+    await driver.transition('finalize_abort', { phase: { kind: 'cancelling', stage: 'requested' } });
+    const started = startExternalEffect(issued.state, issued.state.ticket, 1);
+    assert.equal(started.status, 'started');
+    await assert.rejects(
+      driver.transitionProvider(
+        boundary === 'start' ? 'start_provider_request' : 'authorize_provider_request',
+        identity,
+        () => boundary === 'start' ? { ...authorized, stage: 'effect_pending', effect: started.state } : authorized
+      ),
+      /Provider admission is quiesced/
+    );
+    assert.equal(driver.state().control.status, 'abort_requested');
+    assert.equal(driver.state().providerRequests[0].stage, boundary === 'start' ? 'effect_ready' : 'ready');
+  }
 });
 
 test('total run states select one explicit procedure, wait, or completion', () => {

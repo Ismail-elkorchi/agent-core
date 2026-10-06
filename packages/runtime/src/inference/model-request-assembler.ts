@@ -73,7 +73,11 @@ export class ModelRequestAssembler {
     });
     const messages = await compilePromptMaterial(
       material,
-      { prior: prior.messages, current: history.messages },
+      {
+        transformed: input.window.transformedMessagesFor(input.modelProfile),
+        prior: prior.messages,
+        current: history.messages
+      },
       { artifacts: this.artifacts, maxImageBytes: input.window.imageLimits.maxBytes }
     );
     input.window.assertImagesAdmitted(messages, input.modelProfile);
@@ -101,6 +105,7 @@ export class ModelRequestAssembler {
 export async function compilePromptMaterial(
   material: PromptMaterial,
   conversation: {
+    readonly transformed?: readonly ModelInputItem[];
     readonly prior: readonly ModelInputItem[];
     readonly current: readonly ModelInputItem[];
   } = { prior: [], current: [] },
@@ -146,13 +151,11 @@ export async function compilePromptMaterial(
   const workingState: ModelInputItem | undefined = material.workingState
     ? Object.freeze({ role: 'user', content: renderContext([material.workingState]) })
     : undefined;
-  // Keep provider-owned replay contiguous and ahead of current host reference material.
-  const nativeReplay = conversation.prior.some((item) => item.role === 'protocol');
   return Object.freeze([
     ...instructionMessages.filter((item) => item.role !== 'user'),
-    ...(nativeReplay ? conversation.prior : []),
+    ...(conversation.transformed ?? []),
     ...(contextMessage ? [contextMessage] : []),
-    ...(nativeReplay ? [] : conversation.prior),
+    ...conversation.prior,
     ...instructionMessages.filter((item) => item.role === 'user'),
     taskMessage,
     ...conversation.current,

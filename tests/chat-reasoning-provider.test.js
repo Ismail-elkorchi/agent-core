@@ -25,7 +25,10 @@ for (const fixture of [
     for (const [key, value] of Object.entries(fixture.fields)) assert.deepEqual(calls[1].messages[2][key], value);
     assert.equal(calls[1].messages[0].role, 'developer');
     assert.equal(calls[1].messages[2].tool_calls[0].id, 'call-original');
-    await assert.rejects(() => provider.complete({ ...replay, messages: [{ role: 'developer', content: 'edited policy' }, ...replay.messages.slice(1)] }), /Earlier input/u);
+    await provider.complete({ ...replay, messages: [{ role: 'developer', content: 'current policy' }, ...replay.messages.slice(1)] });
+    assert.equal(first.output[0].state.compatibility.requiresExactPrefix, false);
+    for (const [key, value] of Object.entries(fixture.fields)) assert.deepEqual(calls[2].messages[2][key], value);
+    assert.equal(calls[2].messages[0].content, 'current policy');
   });
 }
 
@@ -48,4 +51,26 @@ test('streamed Chat signatures concatenate only payload deltas and retain stable
   for await (const event of provider.stream(request)) if (event.type === 'done') response = event.response;
   await provider.complete({ ...request, messages: [...request.messages, ...modelOutputToInput(response.output), { role: 'user', content: 'next' }] });
   assert.deepEqual(sent.messages[1].reasoning_details, [{ type: 'reasoning.text', id: 'reasoning1', index: 0, text: 'AB', signature: 'sig+/=' }]);
+});
+
+
+test('OpenRouter binding follows the serving model, not the routing alias or reasoning field', async () => {
+  for (const [model, bound] of [['anthropic/claude-sonnet-4.6', false], ['anthropic/claude-fable-5.1', true]]) {
+    const bodies = [];
+    const alias = 'openrouter/auto';
+    const provider = new OpenRouterProvider({ apiKey: 'fixture', fetch: async (_url, init) => {
+      if (!init?.body) return Response.json({ data: [{ id: alias, architecture: { input_modalities: ['text'], output_modalities: ['text'] }, supported_parameters: ['tools', 'max_tokens'] }] });
+      bodies.push(JSON.parse(init.body));
+      return Response.json({ id: 'response', model, choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'answer', reasoning_details: [{ type: 'reasoning.encrypted', data: 'opaque-original', index: 0 }] } }] });
+    } });
+    const request = { model: alias, messages: [{ role: 'system', content: 'authority' }, { role: 'user', content: 'question' }], maxOutputTokens: 100 };
+    const first = await provider.complete(request);
+    assert.equal(first.output[0].state.compatibility.requiresExactPrefix, bound);
+    const replay = { ...request, messages: [...request.messages, ...modelOutputToInput(first.output), { role: 'user', content: 'next' }] };
+    await provider.complete(replay);
+    const changed = { ...replay, tools: [{ type: 'function', function: { name: 'read', description: 'Read a source', parameters: { type: 'object', properties: {} } } }] };
+    if (bound) await assert.rejects(provider.compileRequest(changed), /Tool declarations/);
+    else await provider.complete(changed);
+    assert.equal(bodies[1].messages[2].reasoning_details[0].data, 'opaque-original');
+  }
 });

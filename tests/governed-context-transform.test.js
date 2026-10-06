@@ -128,6 +128,11 @@ async function fixture({ tokenCount = 32, gate, budget, admitRequest } = {}) {
     maxOutputTokens: 64,
     inferenceService: inference,
     context,
+    contextItems: [{
+      id: 'environment', sourceUri: 'application://environment', sourceKind: 'external',
+      representation: 'full', mediaType: 'text/plain', title: 'Environment',
+      content: 'Unchanged environment.', purpose: 'Execution context.'
+    }],
     repositories: { events, artifacts, session: { repository: sessions, descriptor: session } },
     toolBoundary: { authorizationPolicyId: 'none', executionTargetId: 'none' }
   };
@@ -217,6 +222,11 @@ test('provider transform settlement is followed by actual next-generation admiss
   assert.equal(context.admission.status, 'admitted');
   const request = state.requests.at(-1);
   assert.ok(request.messages.some((item) => item.role === 'protocol'));
+  assert.ok(
+    request.messages.findIndex((item) => item.role === 'protocol') <
+      request.messages.findIndex((item) => item.content.includes('Unchanged environment.')),
+    'transformed input precedes current reference material'
+  );
   assert.equal(
     request.messages.filter((item) => item.content === 'Continue with exact native state.').length,
     1
@@ -230,6 +240,19 @@ test('provider transform settlement is followed by actual next-generation admiss
       .map(({ event }) => event.operation),
     ['context_transform', 'generation']
   );
+  const reopened = await new AgentRuntime(state.options).run({ task: 'Continue after reopening.' }).result;
+  assert.equal(reopened.terminal?.executionStatus, 'completed', JSON.stringify(reopened));
+  const replayed = state.requests.at(-1).messages;
+  assert.deepEqual(
+    replayed.filter((item) => item.role === 'protocol'),
+    request.messages.filter((item) => item.role === 'protocol')
+  );
+  assert.ok(
+    replayed.findIndex((item) => item.role === 'protocol') <
+      replayed.findIndex((item) => item.content.includes('Unchanged environment.')),
+    'reopening preserves the committed transformed input placement'
+  );
+  assert.equal(state.transforms(), 1, 'reopening does not repeat the transform');
 });
 test('oversized transformed context is charged but never activated', async () => {
   const state = await fixture({ tokenCount: 30000 });

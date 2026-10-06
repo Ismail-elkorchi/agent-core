@@ -50,6 +50,7 @@ async function fixture(sessions = new InMemorySessionRepository(), descriptor) {
     repository: sessions,
     session,
     history,
+    artifacts,
     policy: { maxSourceBytes: 1000000, historyRead: { history, isAvailable: () => true } }
   });
   const requests = [];
@@ -449,4 +450,26 @@ test('incompatible persisted reset state is rejected in place without migration 
     /resetId|context|incompatible/u
   );
   assert.equal(await readFile(location, 'utf8'), incompatible);
+});
+
+
+test('fresh continuation keeps the current working state separate from selected originals', async () => {
+  const f = await fixture();
+  await nativeAnswer(f);
+  const requestRef = await f.artifacts.storeProtected({ label: 'original-inference', mediaType: 'application/json', content: new TextEncoder().encode(JSON.stringify({ workingStateRevisionId: null, logical: { model: 'model', messages: [] } })) });
+  const cut = await f.history.capture();
+  await f.context.updateWorkingState({ id: 'current-understanding', revisionId: null, text: 'Keep the original Unicode constraint; understanding does not authorize edits.', inference: { ownerId: 'owner', invocationId: 'original', requestRef }, sessionId: f.session.id, branchId: cut.branchId });
+  await f.agent.changeModel({ selection: { provider: 'portable', model: 'model' }, profile: profile(), artifacts: f.artifacts, continuation: 'fresh' });
+  const context = await f.context.inspect();
+  assert.equal(context.workingState.revisionId, 'current-understanding');
+  assert.equal(context.window.selection.retained.some(source => source.entryId === 'current-understanding'), false);
+  assert.equal(context.window.selection.continuity.sources.some(source => source.entryId === 'current-understanding'), false);
+  const accepted = await f.agent.submit({ task: 'Explain the preserved constraint without editing.' });
+  const result = await accepted.completion;
+  assert.equal(result.terminal.executionStatus, 'completed', JSON.stringify(result));
+  const rendered = JSON.stringify(f.requests[0].messages);
+  assert.equal(rendered.match(/Keep the original Unicode constraint/gu).length, 1);
+  assert.ok(rendered.includes('café العربية'));
+  assert.equal(f.requests[0].messages.some(item => item.role === 'protocol'), false);
+  await f.agent.close();
 });

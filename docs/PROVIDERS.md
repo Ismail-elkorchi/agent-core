@@ -9,6 +9,14 @@ preserves instruction authority, media, tool calls/results, and required protoco
 state. Adapters reject unsupported combinations before dispatch; display reasoning
 is never a substitute for required signed or opaque state.
 
+Exact payload replay does not by itself bind earlier input. Verified prefix-bound
+profiles declare `reasoningPrefix: "messages_and_tools"`; their preserved states
+bind the original instruction/message prefix and tool declarations. Updated
+authority, working state or catalogs must satisfy those rules or use a supported
+context transition. Unsupported combinations fail before dispatch. OpenRouter
+uses the serving model's requirements; unverified Anthropic routes remain
+conservative. See the [model contract](../packages/model/README.md).
+
 First-party adapters compile an owned wire body and dispatch that same admitted
 body. Request accounting distinguishes provider counts, estimates, and unknown
 components. OpenAI Platform and Claude offer opt-in bounded counting endpoints;
@@ -48,7 +56,7 @@ References: [model catalog](https://developers.openai.com/api/docs/models), [Sol
 
 ## OpenAI Codex
 
-`@agent-core/provider-openai-codex` is a distinct ChatGPT-subscription transport and defaults to the documented `gpt-5.6` alias. It also trusts Sol, Terra, and Luna identities. Unknown subscription models require a complete replacement profile. It deliberately does not copy Platform pricing, claim `standard|pro` mode support, or claim that reasoning can be disabled on the Codex product surface. It supports effort through `max`; namespaced service tier is `default|priority`, with the obsolete `fast` alias rejected. Failed continuation resets conservatively, and HTTP full replay remains separate from WebSocket incremental continuation.
+`@agent-core/provider-openai-codex` is a distinct ChatGPT-subscription transport. Its authenticated account catalog supplies model identities, reasoning settings and capabilities, replacing built-in profiles after discovery; complete explicit profiles take precedence. A selected identity missing from a cached catalog triggers fresh discovery before an account-availability error. Discovery failure is distinct from model unavailability. Platform pricing and `standard|pro` mode support are not inferred. Namespaced service tier is `default|priority`, with obsolete aliases rejected. HTTP full replay remains separate from conservative exact-prefix WebSocket continuation. Working-state suffix changes can require full replay while still receiving provider-reported cache hits. The [adapter contract](../packages/providers/openai-codex/README.md) documents defaults and endpoint limits.
 
 OpenAI Platform and Codex share only bounded Responses SSE/JSON primitives in `@agent-core/provider-openai-responses`; authentication, headers, storage behavior, model policy, continuation, and product-channel claims remain separate. Reference: [Codex model selection](https://developers.openai.com/codex/models).
 

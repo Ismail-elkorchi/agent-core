@@ -363,9 +363,14 @@ export interface ProviderContextState {
     readonly model: string;
     readonly endpoint: string;
     readonly protocolRevision: string;
-    /** An adapter-declared protocol constraint, independent of exact payload replay. */
-    readonly requiresExactPrefix: boolean;
-  };
+  } & (
+    | { readonly requiresExactPrefix: false }
+    | {
+        readonly requiresExactPrefix: true;
+        /** Tool declarations participate in native prefix binding. */
+        readonly toolsIdentity: string;
+      }
+  );
   readonly replay: 'required' | 'optional' | 'handle';
   readonly tokenCount?: number;
   readonly tokenEstimate?: number;
@@ -399,6 +404,8 @@ export interface ModelProtocolCapabilities {
   readonly toolChoice: readonly ('auto' | 'none' | 'required' | 'named')[];
   readonly counting: 'estimate' | 'provider';
   readonly reasoningAccounting?: 'included_output' | 'separate' | 'unknown';
+  /** Native reasoning binds preceding instruction/messages and the declared tools. */
+  readonly reasoningPrefix?: 'messages_and_tools';
 }
 export interface ModelSteeringSubmission {
   readonly deliveryId: string;

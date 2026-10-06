@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
 import { defineTool } from '@agent-core/tools';
-import { ModelProviderError } from '@agent-core/model';
+import { ModelProviderError, requestAccountingInputTokens } from '@agent-core/model';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import {
   AgentRuntime,
@@ -155,6 +155,65 @@ test('automatic renewal revises working state and preserves current input and se
   assert.equal(inspected.admission.status, 'admitted');
 });
 
+test('automatic renewal retains original evidence and complete parallel exchanges without rerunning tools', async () => {
+  const state = await fixture();
+  let reads = 0;
+  const lookup = defineTool({
+    name: 'lookup', implementationId: 'lookup@1', description: 'Read original evidence.',
+    schema: z.strictObject({ source: z.string() }),
+    outputSchema: z.strictObject({ source: z.string(), revision: z.number() }),
+    canonicalizeInput: input => input,
+    effectEnvelope: { accesses: [{ mode: 'read', scope: 'facts' }], lockScopes: [] },
+    deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'facts' }], lockScopes: [], recovery: { kind: 'unknown' } }),
+    invoke: async ({ source }) => {
+      reads++;
+      return { kind: 'result', output: { source, revision: 2 }, summary: 'Original evidence.',
+        scope: { resources: ['facts'], coverage: 'complete' } };
+    }
+  });
+  let generations = 0;
+  let renewals = 0;
+  state.provider.complete = async (request) => {
+    state.requests.push(request);
+    if (!request.tools) {
+      renewals++;
+      return { provider: 'fixture', model: 'context', content: JSON.stringify({ text: 'Use original evidence for the next answer.' }),
+        terminationReason: 'stop' };
+    }
+    generations++;
+    return { provider: 'fixture', model: 'context',
+      content: generations === 1 ? '' : 'Revision two is supported by both original sources.',
+      terminationReason: generations === 1 ? 'tool_calls' : 'stop',
+      ...(generations === 1 ? { toolCalls: ['left', 'right'].map(source => ({
+        id: source, name: 'lookup', type: 'function', input: { kind: 'json', value: { source } }
+      })) } : {}) };
+  };
+  const options = { ...state.options, tools: [...state.options.tools, lookup] };
+  const original = 'Old detail. '.repeat(9000);
+  const first = await new AgentRuntime(options).run({ task: original }).result;
+  assert.equal(first.terminal?.executionStatus, 'completed', JSON.stringify(first));
+  assert.equal(reads, 2);
+  const before = await state.context.inspect();
+  state.setCapacity(requestAccountingInputTokens(before.admission.accounting) + 64);
+  const task = 'Answer from the original evidence. Do not read it again.';
+  const result = await new AgentRuntime({ ...options, contextRenewal: { automatic: true } })
+    .run({ task }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.equal(renewals, 1);
+  assert.equal(reads, 2, 'Renewal must not require the completed observations to be reconstructed.');
+  const admitted = state.requests.at(-1);
+  assert.equal(admitted.messages.filter(item => item.content === task).length, 1);
+  assert.ok(!admitted.messages.some(item => item.content === original));
+  const calls = admitted.messages.flatMap(item => item.role === 'assistant' ? item.toolCalls ?? [] : []);
+  assert.deepEqual(calls.map(call => call.id), ['left', 'right']);
+  const observations = admitted.messages.filter(item => item.role === 'tool');
+  assert.deepEqual(observations.map(item => item.toolCallId), ['left', 'right']);
+  assert.ok(observations.every(item => /"revision"\s*:\s*2/u.test(item.content)), JSON.stringify(observations));
+  const after = await state.context.inspect();
+  assert.ok(after.window.selection.retained.length > 1);
+  assert.ok(after.workingState.revisionId);
+});
+
 test('model renewal uses invocation identity and retains its own complete tool exchange', async () => {
   const state = await fixture();
   let calls = 0;
@@ -203,6 +262,55 @@ test('model renewal uses invocation identity and retains its own complete tool e
     renewedRequest.messages.some((item) => item.role === 'tool' && item.toolCallId === 'renew-call')
   );
   assert.ok((await state.context.inspect()).window);
+});
+
+test('automatic renewal credits the capacity released by its smaller compiled request', async () => {
+  const state = await fixture();
+  state.provider.complete = async (request) => {
+    state.requests.push(request);
+    return {
+      provider: 'fixture', model: 'context', terminationReason: 'stop',
+      content: request.tools ? 'Recorded answer.' : '{"text":"Useful state"}'
+    };
+  };
+  await new AgentRuntime(state.options).run({ task: 'Original detail. '.repeat(1000) }).result;
+  await new AgentRuntime(state.options).run({ task: 'Continue.' }).result;
+  const before = await state.context.inspect();
+  state.setCapacity(requestAccountingInputTokens(before.admission.accounting) + 228);
+  const result = await new AgentRuntime({ ...state.options, contextRenewal: { automatic: true } })
+    .run({ task: 'Continue.' }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.equal(state.requests.length, 3, 'A smaller maintenance request needs no redundant reserve.');
+  assert.ok(state.requests.every((request) => request.tools));
+  assert.deepEqual((await state.context.inspect()).window, before.window);
+});
+
+test('a later contribution cannot rebase an automatic renewal onto an unseen source boundary', async () => {
+  const state = await fixture();
+  const complete = state.provider.complete;
+  state.provider.complete = async (request) => {
+    const { usage, ...response } = await complete(request);
+    return response;
+  };
+  await new AgentRuntime(state.options).run({ task: 'Old detail. '.repeat(9000) }).result;
+  const before = await state.context.inspect();
+  state.setCapacity(requestAccountingInputTokens(before.admission.accounting) + 64);
+  const generation = state.provider.complete;
+  state.provider.complete = async (request) => {
+    if (!request.tools)
+      await state.sessions.appendInput(state.session, {
+        runId: 'later', task: 'Later correction outside the captured inference.'
+      });
+    return generation(request);
+  };
+  const result = await new AgentRuntime({ ...state.options, contextRenewal: { automatic: true } })
+    .run({ task: 'Continue.' }).result;
+  assert.match(result.terminal?.errorMessage, /expected boundary is stale/u);
+  const after = await state.context.inspect();
+  assert.deepEqual(after.window, before.window);
+  assert.deepEqual(after.workingState, before.workingState);
+  const retrieved = await state.history.search({ query: 'Later correction', filter: { sourceType: 'input' } });
+  assert.equal(retrieved.items.length, 1);
 });
 
 test('irreducible protected input suspends without provider invocation or a fake tool identity', async () => {

@@ -1,5 +1,6 @@
 import {
   workingStateRenewalRequest,
+  workingStateRenewalSources,
   stageWorkingStateRenewal
 } from './context/working-state-renewal.js';
 import type { WorkingStateSnapshot } from './session/working-state.js';
@@ -55,6 +56,7 @@ import {
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { ContextTransitionRequest } from './context/contracts.js';
+import type { SessionContextTransitionEntry } from './session/contracts.js';
 import type { ContextAdmissionInput, ContextService } from './context/service.js';
 import {
   encodeAgentEvent,
@@ -73,7 +75,11 @@ import {
   ContextAdmissionError,
   requestCapacity
 } from './inference/request-admission.js';
-import { replaySourceEntries } from './orchestration/session-replay.js';
+import {
+  readSelectedHistorySources,
+  rebuildModelWindowFromRepositories,
+  replaySourceEntries
+} from './orchestration/session-replay.js';
 import { encodeContextTransformReference } from './inference/context-transform.js';
 import { ModelWindow } from './inference/model-window.js';
 import type { NativeGenerationContext } from './inference/native-inference.js';
@@ -118,7 +124,6 @@ import { NativeToolDelivery } from './orchestration/native-tool-delivery.js';
 import { ObservationStore } from './orchestration/observation-store.js';
 import { readProviderStateArtifact } from './orchestration/provider-state-artifacts.js';
 import { AgentLimitExceededError, AgentRunBudget } from './run/budget.js';
-import { rebuildModelWindowFromRepositories } from './orchestration/session-replay.js';
 import { ToolCallExecutor } from './orchestration/tool-execution.js';
 import {
   ToolWorkPump,
@@ -1386,6 +1391,7 @@ export class AgentRuntime {
             replayRestored = true;
           }
           assistant = await this.consumeProviderSettlement({
+            signal: runtime.signal,
             request: {
               runId: runtime.runId,
               turnIndex,
@@ -2333,6 +2339,7 @@ export class AgentRuntime {
           if (settled.kind !== 'settled') throw new Error('Native response did not settle.');
           const response = settled.response;
           const assistant = await this.consumeProviderSettlement({
+            signal: runtime.signal,
             request: item.request,
             requestEstimate: item.estimate,
             response,
@@ -2600,6 +2607,7 @@ export class AgentRuntime {
         }
 
         const settled = await this.consumeProviderSettlement({
+          signal: request.signal,
           request,
           requestEstimate: assembly.estimate,
           response: completedAttempt.response,
@@ -2615,6 +2623,7 @@ export class AgentRuntime {
   }
 
   private async consumeProviderSettlement(input: {
+    readonly signal: AbortSignal;
     readonly request: Pick<
       AssistantTurnRequest,
       'runId' | 'turnIndex' | 'snapshot' | 'controller' | 'run' | 'toolBatchId'
@@ -2638,6 +2647,13 @@ export class AgentRuntime {
     if (settlementRecord?.event.type !== 'provider.attempt.settled')
       throw new Error('Provider response settlement is missing or contradictory.');
     const providerState = settlementRecord.event.providerState;
+    await request.controller.recordUsage(
+      await this.inferenceService.settledRunUsage(
+        this.options.inferenceOwnerId ?? request.runId,
+        request.runId
+      )
+    );
+    throwIfAborted(input.signal);
     await append({
       type: 'model.responded',
       ...responseIdentity,
@@ -2650,12 +2666,6 @@ export class AgentRuntime {
         state: providerState.summary,
         stateRef: providerState.artifact
       });
-    await request.controller.recordUsage(
-      await this.inferenceService.settledRunUsage(
-        this.options.inferenceOwnerId ?? request.runId,
-        request.runId
-      )
-    );
     const toolCalls = Object.freeze((response.toolCalls ?? []).map(normalizeModelToolCall));
     const modelOutput = modelOutputFromResponse(response, request.turnIndex, toolCalls.length > 0);
     const assistantEnded = {
@@ -2971,8 +2981,8 @@ export class AgentRuntime {
         (message) =>
           message.role === 'assistant' || message.role === 'tool' || message.role === 'protocol'
       );
-    // Reserve the actual renewal instruction overhead through the same provider compiler.
-    // A short output allowance alone cannot reserve space for context maintenance.
+    // Reserve the next response and net renewal overhead through the same compiler.
+    // Removed tool declarations release capacity; count that saving before clamping.
     const renewalRequest =
       hasWorkingHistory && this.options.context && this.options.contextRenewal?.automatic
         ? workingStateRenewalRequest(result.request)
@@ -2987,12 +2997,12 @@ export class AgentRuntime {
       ? Math.max(
           0,
           requestAccountingInputTokens(renewalCompiled.accounting) -
-            requestAccountingInputTokens(accounting)
-        ) +
-        accounting.outputReservation +
-        (accounting.pricingSemantics.reasoningIncludedInOutput === false
-          ? accounting.reasoningReservation
-          : 0)
+            requestAccountingInputTokens(accounting) +
+            accounting.outputReservation +
+            (accounting.pricingSemantics.reasoningIncludedInOutput === false
+              ? accounting.reasoningReservation
+              : 0)
+        )
       : undefined;
     const capacity = requestCapacity(accounting, renewalHeadroom);
     if (
@@ -3024,27 +3034,55 @@ export class AgentRuntime {
             )
           );
         });
-        const renewal = await this.retainPendingSources(
-          {
+        const sources = workingStateRenewalSources(
+          (await readSelectedHistorySources(this.options.context.history, context.cut)).entries
+        );
+        let renewed: typeof result | undefined;
+        let entry: SessionContextTransitionEntry;
+        for (;;) {
+          const retained = new Map(
+            [...context.protectedSources, ...sources.flatMap((group) =>
+              group.map((source) => sourceRef(context.cut.sessionId, source))
+            )].map((source) => [source.entryId, source])
+          );
+          const renewal: ContextTransitionRequest = {
             expectedWindowId: context.window?.windowId ?? null,
             expectedSourceRevision: context.cut.sourceRevision,
             idempotencyKey: `working-state-renewal:${renewalState.invocationId}`,
             reason: 'Automatic context renewal with the current working-state interpretation.',
-            selection: { strategy: 'sources', retained: [] }
-          },
-          request.runId
-        );
-        let renewed: typeof result | undefined;
-        const entry = await this.options.context.transition(renewal, {
-          signal: request.signal,
-          expectedWorkingStateRevisionId: result.workingStateRevisionId,
-          ...(renewalState.change ? { workingState: renewalState.change } : {}),
-          admit: async (input) => {
-            const admitted = await validate(input);
-            renewed = selected;
-            return admitted;
+            selection: { strategy: 'sources', retained: [...retained.values()] }
+          };
+          try {
+            entry = await this.options.context.transition(renewal, {
+              signal: request.signal,
+              expectedWorkingStateRevisionId: result.workingStateRevisionId,
+              ...(renewalState.change ? { workingState: renewalState.change } : {}),
+              admit: async (input) => {
+                const admitted = await validate(input);
+                if (
+                  sources.length > 0 && selected &&
+                  requestCapacity(selected.compiled.accounting, renewalHeadroom).pressure === 'continuity'
+                )
+                  throw new ContextAdmissionError(
+                    selected.compiled,
+                    new Error('Retained originals leave no continuity reserve.')
+                  );
+                renewed = selected;
+                return admitted;
+              }
+            });
+            break;
+          } catch (error) {
+            if (
+              !(error instanceof ContextAdmissionError || error instanceof ContextSourceCapacityError) ||
+              sources.length === 0
+            )
+              throw error;
+            // Only source selection changes. The same staged state and exact admission path
+            // determine fit; accepted input and explicit protection remain mandatory.
+            sources.shift();
           }
-        });
+        }
         await this.activateCommittedContext(request.modelWindow, request.runId);
         await emit({
           type: 'context.transitioned',
@@ -3171,8 +3209,7 @@ export class AgentRuntime {
         profile: request.snapshot.profile,
         signal: request.signal
       });
-      for (const [index, item] of transformed.result.input.entries())
-        window.recordSourceItem(`${invocationId}:${String(index)}`, item);
+      window.setTransformedInput(transformed.result.input);
       await replaySourceEntries(
         window,
         input.cut.sessionId,

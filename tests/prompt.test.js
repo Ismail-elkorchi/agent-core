@@ -102,7 +102,7 @@ test('current application context preserves the provider-native compacted window
         }
       ]
     },
-    { prior: [{ role: 'protocol', content: '', state }], current: [] }
+    { transformed: [{ role: 'protocol', content: '', state }], prior: [], current: [] }
   );
   const { input } = responsesInput({ model: 'fixture', messages }, 'openai');
   assert.deepEqual(input[0], compacted);

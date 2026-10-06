@@ -396,7 +396,8 @@ export class OpenRouterProvider implements ModelProvider {
             responseId ?? 'stream-response',
             fields,
             content,
-            responseToolCalls
+            responseToolCalls,
+            actualModel
           ),
           content,
           model: actualModel,
@@ -788,7 +789,8 @@ async function toModelResponse(
       payload.id ?? 'response-without-id',
       fields,
       content,
-      toolCalls
+      toolCalls,
+      payload.model ?? request.model
     ),
     content,
     model: payload.model ?? request.model,

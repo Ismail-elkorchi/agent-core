@@ -726,14 +726,19 @@ export function parseProviderContextState(value: unknown): ProviderContextState 
   const inputIdentity = stateString(origin, 'inputIdentity');
   if (
     !onlyKeys(origin, ['requestId', 'inputIdentity']) ||
-    !onlyKeys(compatibility, ['model', 'endpoint', 'protocolRevision', 'requiresExactPrefix']) ||
+    !onlyKeys(compatibility, [
+      'model', 'endpoint', 'protocolRevision', 'requiresExactPrefix', 'toolsIdentity'
+    ]) ||
     compatibility.model !== model ||
     compatibility.endpoint !== endpoint ||
     typeof compatibility.requiresExactPrefix !== 'boolean' ||
+    (compatibility.requiresExactPrefix
+      ? typeof compatibility.toolsIdentity !== 'string' || !compatibility.toolsIdentity
+      : compatibility.toolsIdentity !== undefined) ||
     (record.replay !== 'required' && record.replay !== 'optional' && record.replay !== 'handle')
   )
     throw contract('Invalid provider context compatibility.', [
-      'Exact origin, endpoint, model and replay rules are required.'
+      'Exact origin, endpoint, model and replay rules are required; prefix-bound records require the original tool identity.'
     ]);
   let artifact: ProviderContextState['artifact'];
   if (record.artifact !== undefined) {
@@ -769,7 +774,12 @@ export function parseProviderContextState(value: unknown): ProviderContextState 
         model,
         endpoint,
         protocolRevision: stateString(compatibility, 'protocolRevision'),
-        requiresExactPrefix: compatibility.requiresExactPrefix
+        ...(compatibility.requiresExactPrefix
+          ? {
+              requiresExactPrefix: true as const,
+              toolsIdentity: stateString(compatibility, 'toolsIdentity')
+            }
+          : { requiresExactPrefix: false as const })
       }),
       replay: record.replay,
       ...(tokenCount === undefined ? {} : { tokenCount }),

@@ -7,8 +7,54 @@ import { InferenceContextRejectedError, type InferenceService } from '../inferen
 import { ContextAdmissionError } from '../inference/request-admission.js';
 import type { ContextService } from './service.js';
 import { WORKING_STATE_GUIDANCE } from '../session/working-state.js';
+import type { SessionBranchEntry } from '../session/contracts.js';
+import { assistantResponseKey } from '../run/contracts.js';
 
 const proposalSchema = z.strictObject({ text: unicodeTextSchema });
+
+/** Recent originals are removable in whole contributions or complete response/tool exchanges. */
+export function workingStateRenewalSources(
+  entries: readonly SessionBranchEntry[]
+): SessionBranchEntry[][] {
+  const groups: SessionBranchEntry[][] = [];
+  const responses = new Map<string, SessionBranchEntry[]>();
+  for (const entry of entries) {
+    if (entry.type === 'input' || entry.type === 'steering') groups.push([entry]);
+    else if (
+      entry.type === 'assistant' || entry.type === 'tool_call' || entry.type === 'observation'
+    ) {
+      const key = assistantResponseKey(entry.runId, entry);
+      let group = responses.get(key);
+      if (!group) {
+        group = [];
+        responses.set(key, group);
+        groups.push(group);
+      }
+      group.push(entry);
+    }
+  }
+  const complete = groups.filter((group) => {
+    if (group[0]?.type === 'input' || group[0]?.type === 'steering') return true;
+    if (!group.some((entry) => entry.type === 'assistant')) return false;
+    return group.every((entry) => entry.type !== 'tool_call' || group.some((result) =>
+      result.type === 'observation' && result.toolBatchId === entry.toolBatchId &&
+      result.callIndex === entry.callIndex && result.callId === entry.callId
+    ));
+  });
+  const retained: SessionBranchEntry[][] = [];
+  for (const group of complete) {
+    const requiresPrefix = group.some((entry) => entry.type === 'assistant' &&
+      entry.output?.some((item) => item.type === 'protocol' &&
+        item.state.compatibility.requiresExactPrefix
+      )
+    );
+    // Required native replay binds a response to its preceding originals. Remove
+    // that prefix and its dependent exchanges together, never orphan the state.
+    if (requiresPrefix) retained.splice(0, retained.length, [...retained.flat(), ...group]);
+    else retained.push(group);
+  }
+  return retained;
+}
 
 export function workingStateRenewalRequest(request: ModelRequest): ModelRequest {
   const renewal = {

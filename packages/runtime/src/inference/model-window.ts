@@ -70,6 +70,7 @@ export class ModelWindow {
   private readonly estimator: RequestEstimator;
   private readonly activeItems: ActiveWindowItem[] = [];
   private readonly priorItems = new Map<string, ModelInputItem>();
+  private transformedInput: readonly ModelInputItem[] = Object.freeze([]);
   readonly imageLimits: ModelWindowImageLimits;
 
   constructor(
@@ -138,6 +139,7 @@ export class ModelWindow {
       return true;
     };
     for (const [id, message] of this.priorItems) if (invalid(message)) this.priorItems.delete(id);
+    this.transformedInput = Object.freeze(this.transformedInput.filter((message) => !invalid(message)));
     for (let index = this.activeItems.length - 1; index >= 0; index--) {
       const item = this.activeItems[index];
       if (item?.kind === 'message' && invalid(item.message)) this.activeItems.splice(index, 1);
@@ -163,10 +165,21 @@ export class ModelWindow {
     this.priorItems.set(sourceId, owned);
   }
 
+  /** A provider-transformed window precedes ordinary reference material and conversation. */
+  setTransformedInput(input: readonly ModelInputItem[]): void {
+    this.transformedInput = Object.freeze(input.map(parseModelInputItem));
+  }
+
+  transformedMessagesFor(modelProfile: ModelProfile): readonly ModelInputItem[] {
+    assertImagesAdmitted(this.transformedInput, modelProfile, this.imageLimits, this.estimator);
+    return this.transformedInput;
+  }
+
   replaceWith(window: ModelWindow): void {
     this.activeItems.splice(0, this.activeItems.length, ...window.activeItems);
     this.priorItems.clear();
     for (const [source, item] of window.priorItems) this.priorItems.set(source, item);
+    this.transformedInput = window.transformedInput;
   }
 
   assertImagesAdmitted(messages: readonly ModelInputItem[], profile: ModelProfile): void {
@@ -198,7 +211,7 @@ export class ModelWindow {
   }
 
   itemCount(): number {
-    return this.activeItems.length + this.priorItems.size;
+    return this.activeItems.length + this.priorItems.size + this.transformedInput.length;
   }
 
   private contextHistoryEntries(): WindowMessageEntry[] {

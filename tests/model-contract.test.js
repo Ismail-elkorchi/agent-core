@@ -41,7 +41,7 @@ test('provider replay constraints are explicit and independent of payload preser
     const state = await createProviderContextState({ ...options, requiresExactPrefix });
     const compatible = (target = updated, endpoint = options.endpoint, provider = options.provider, revision = options.protocolRevision) =>
       assertProviderContextCompatible(state, target, endpoint, target.messages, provider, revision);
-    if (requiresExactPrefix) await assert.rejects(compatible(), /Earlier input/);
+    if (requiresExactPrefix) await assert.rejects(compatible(), /Earlier instructions/);
     else await compatible();
     assert.deepEqual(state.data, options.data);
     await assert.rejects(compatible({ ...updated, model: 'another-model' }), /model/);
@@ -289,7 +289,8 @@ test('model responses and terminal stream events own every nested provider value
         protocolRevision: 'fixture-v1',
         model: 'test',
         endpoint: 'https://provider.test/messages',
-        requiresExactPrefix: true
+        requiresExactPrefix: true,
+        toolsIdentity: 'sha256:original-tools'
       },
       replay: 'required',
       data: { responseId: 'one' }
@@ -320,4 +321,42 @@ test('model responses and terminal stream events own every nested provider value
     assert.equal(Object.isFrozen(owned.timings), true);
     assert.equal(Object.isFrozen(owned.raw.nested), true);
   }
+});
+test('prefix binding includes declarations but excludes generation settings', async () => {
+  const request = {
+    model: 'model',
+    messages: [{ role: 'system', content: 'authority' }, { role: 'user', content: 'query' }],
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'read', description: 'Read a source',
+        parameters: { type: 'object', properties: {} }
+      }
+    }]
+  };
+  const options = {
+    provider: 'fixture', endpoint: 'https://fixture.test', protocolRevision: 'fixture-v1',
+    request, requestId: 'first', kind: 'signed', data: { signature: 'unchanged' },
+    requiresExactPrefix: true
+  };
+  const state = await createProviderContextState(options);
+  const check = (target) => assertProviderContextCompatible(
+    state, target, options.endpoint, target.messages, options.provider, options.protocolRevision
+  );
+  await check({ ...request, maxOutputTokens: 500 });
+  await assert.rejects(check({ ...request, tools: [] }), /Tool declarations/);
+  await assert.rejects(check({
+    ...request,
+    tools: [{
+      ...request.tools[0],
+      function: { ...request.tools[0].function, description: 'Changed semantics' }
+    }]
+  }), /Tool declarations/);
+  await assert.rejects(check({
+    ...request,
+    messages: [{ role: 'system', content: 'new authority' }, ...request.messages.slice(1)]
+  }), /Earlier instructions/);
+  const { toolsIdentity, ...incomplete } = state.compatibility;
+  const { parseProviderContextState } = await import('@agent-core/model');
+  assert.throws(() => parseProviderContextState({ ...state, compatibility: incomplete }), /original tool identity/);
 });

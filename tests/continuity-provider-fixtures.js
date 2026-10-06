@@ -1,3 +1,4 @@
+import { conservativeProtocolCapabilities } from '@agent-core/model';
 import { ClaudeProvider } from '@agent-core/provider-claude';
 import { OllamaProvider } from '@agent-core/provider-ollama';
 import { OpenAIProvider } from '@agent-core/provider-openai';
@@ -17,6 +18,14 @@ export function continuityProvider(id, { contextTokens = 128_000, respond = () =
       streaming: false, toolCalling: true, supportedToolInputs: [{ kind: 'json' }],
       jsonMode: id !== 'claude', jsonSchema: id !== 'claude', logprobs: false,
       temperature: id !== 'openai-codex', topP: id !== 'openai-codex',
+      ...(id === 'claude' ? {
+        protocol: conservativeProtocolCapabilities('https://api.anthropic.com/v1/messages', {
+          revision: 'claude-messages-2026-09-07-v1', roles: ['system', 'user', 'assistant'],
+          inputKinds: ['text', 'tool_call', 'tool_result', 'protocol'],
+          outputKinds: ['text', 'tool_call', 'protocol'], state: 'exact',
+          counting: countTokens ? 'provider' : 'estimate'
+        })
+      } : {}),
       ...(id === 'openai-codex' ? { reasoning: { strategies: ['effort'], efforts: ['low', 'high'], canDisable: false, separateOutput: true } } : {})
     },
     modalities: { input: ['text'], output: ['text'] },

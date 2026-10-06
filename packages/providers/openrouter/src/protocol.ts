@@ -69,7 +69,8 @@ export async function chatOutput(
   requestId: string,
   fields: JsonObject,
   content: string,
-  toolCalls: readonly ModelToolCall[]
+  toolCalls: readonly ModelToolCall[],
+  actualModel: string
 ): Promise<readonly ModelOutputItem[]> {
   const output: ModelOutputItem[] = [];
   if (Object.keys(fields).length)
@@ -82,7 +83,7 @@ export async function chatOutput(
         requestId,
         provider: 'openrouter',
         kind: 'chat.reasoning',
-        requiresExactPrefix: true,
+        requiresExactPrefix: chatReasoningPrefixBound(actualModel),
         data: { fields }
       })
     });
@@ -121,4 +122,15 @@ export function mergeReasoningDetails(current: Map<number, JsonObject>, value: u
     }
     current.set(index, parseJsonObject(merged));
   }
+}
+
+/** Routing preserves the serving model's binding; plain reasoning is not universally prefix-bound. */
+function chatReasoningPrefixBound(model: string): boolean {
+  if (model === 'openrouter/auto') return true;
+  if (!model.startsWith('anthropic/')) return false;
+  // These verified models predate conversation binding. Unknown Anthropic routes stay conservative.
+  return ![
+    'anthropic/claude-sonnet-4.6',
+    'anthropic/claude-mythos-5.1'
+  ].includes(model.replace(/:(?:thinking|extended|exacto|nitro|floor|batch)$/u, ''));
 }

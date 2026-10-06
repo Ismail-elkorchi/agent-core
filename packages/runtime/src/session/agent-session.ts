@@ -347,9 +347,11 @@ export class AgentSession {
         const view = await readSelectedHistorySources(context.history);
         const entries = view.entries.filter(
           (entry) =>
-            entry.type !== 'context_transition' &&
-            entry.type !== 'model_settings' &&
-            entry.type !== 'branch'
+            entry.type === 'input' ||
+            entry.type === 'steering' ||
+            entry.type === 'assistant' ||
+            entry.type === 'tool_call' ||
+            entry.type === 'observation'
         );
         await assertPortableHistoryCompatibility({
           sessionId: view.cut.sessionId,

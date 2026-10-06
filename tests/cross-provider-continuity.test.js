@@ -10,6 +10,8 @@ import {
   HistoryReader,
   InferenceService,
   InMemorySessionRepository,
+  ModelRequestAssembler,
+  ModelWindow,
   agentEventCodec,
   createHistoryTools
 } from '@agent-core/runtime';
@@ -181,8 +183,8 @@ for (const id of providerIds) {
   });
 }
 
-for (const id of ['openai', 'openai-codex', 'openrouter']) {
-  test(`${id} continues with original opaque replay state after runtime recreation`, async () => {
+for (const id of ['openai', 'openai-codex', 'openrouter', 'claude']) {
+  test(`${id} preserves background and original reasoning after runtime recreation`, async () => {
     const sessions = new InMemorySessionRepository();
     const session = await sessions.create({
       binding: { schemaId: 'tests/continuity', schemaVersion: 1, subject: {} }
@@ -205,6 +207,16 @@ for (const id of ['openai', 'openai-codex', 'openrouter']) {
       context,
       maxOutputTokens: 4096,
       contextRenewal: { automatic: true },
+      contextItems: [{
+        id: 'workspace',
+        sourceUri: 'application://workspace',
+        sourceKind: 'external',
+        representation: 'full',
+        mediaType: 'text/plain',
+        title: 'Workspace',
+        content: 'Unchanged repository facts.',
+        purpose: 'Current execution context.'
+      }],
       repositories: { events, artifacts, session: { repository: sessions, descriptor: session } },
       toolBoundary: { authorizationPolicyId: 'test', executionTargetId: 'test' }
     };
@@ -218,16 +230,19 @@ for (const id of ['openai', 'openai-codex', 'openrouter']) {
       'uncertain component costs do not create an auxiliary inference'
     );
     assert.ok(
-      JSON.stringify(bodies[1]).includes('original-opaque+/='),
-      'original encrypted state is replayed'
+      JSON.stringify(bodies[1]).includes(id === 'claude' ? thinking.signature : 'original-opaque+/='),
+      'original provider reasoning is replayed'
     );
     const inspected = await context.inspect();
     assert.equal(inspected.window, null);
     assert.equal(inspected.admission.status, 'admitted');
-    assert.ok(
-      inspected.admission.accounting.unknownComponents.length > 0,
-      'uncertainty remains explicit'
-    );
+    if (id === 'claude')
+      assert.equal(inspected.admission.accounting.unknownComponents.length, 0, 'provider count covers replay');
+    else
+      assert.ok(
+        inspected.admission.accounting.unknownComponents.length > 0,
+        'uncertainty remains explicit'
+      );
     assert.equal(inspected.workingState.revisionId, null);
   });
 }
@@ -307,3 +322,67 @@ test('mid-run renewal preserves signed reasoning and the completed tool exchange
   assert.ok(JSON.stringify(bodies[1]).includes('inspection-call'));
   assert.ok(JSON.stringify(bodies[2]).includes(continuation));
 });
+for (const id of providerIds) {
+  test(`${id} preserves native blocks with one revised working state and current authority/catalog`, async () => {
+    const bodies = [];
+    const provider = continuityProvider(id, { bodies, opaqueReasoning: true });
+    const profile = await provider.describeModel(model);
+    const assembler = new ModelRequestAssembler();
+    const window = new ModelWindow();
+    const state = (text) => ({
+      id: 'current-state',
+      sourceUri: 'session://working-state',
+      sourceKind: 'generated',
+      representation: 'full',
+      mediaType: 'text/plain',
+      title: 'Current interpretation',
+      content: text,
+      purpose: 'Generated understanding'
+    });
+    const assemble = async (task, text, guidance, tools = []) => {
+      const result = await assembler.assemble({
+        window,
+        task,
+        instructions: [{ id: 'authority', role: 'system', content: guidance }],
+        workingState: state(text),
+        tools: [],
+        modelProfile: profile
+      });
+      return provider.compileRequest({
+        model,
+        messages: result.messages,
+        tools,
+        ...(id === 'openai-codex' ? { reasoning: { strategy: 'effort', effort: 'low' } } : {})
+      }, { outputReservation: 4096 });
+    };
+    const first = await assemble('Inspect the original source.', 'Original interpretation.', 'Original authority.');
+    const response = await provider.completeCompiled(first);
+    window.recordSourceItem('first-input', { role: 'user', content: 'Inspect the original source.' });
+    const native = modelOutputToInput(response.output);
+    native.forEach((item, index) => window.recordSourceItem(`output-${index}`, item));
+    const unchanged = await assemble('Explain the result.', 'Original interpretation.', 'Original authority.');
+    const changed = await assemble(
+      'Follow the correction.', 'Corrected interpretation.', 'Current authority.',
+      [{
+        type: 'function',
+        function: {
+          name: 'lookup',
+          description: 'Read current evidence',
+          parameters: { type: 'object', properties: {} }
+        }
+      }]
+    );
+    for (const compiled of [unchanged, changed]) {
+      assert.deepEqual(
+        compiled.logicalRequest.messages.filter(item => item.role === 'protocol'),
+        native.filter(item => item.role === 'protocol')
+      );
+    }
+    const rendered = JSON.stringify(changed.body);
+    assert.ok(rendered.includes('Current authority.'));
+    assert.ok(!rendered.includes('Original authority.'));
+    assert.ok(!rendered.includes('Original interpretation.'));
+    assert.equal(rendered.match(/Corrected interpretation\./gu).length, 1);
+    assert.equal((await provider.completeCompiled(changed)).terminationReason, 'stop');
+  });
+}

@@ -79,6 +79,19 @@ require an exact append-only prefix for incremental continuation use full replay
 in that case. Incremental transport reuse and provider-reported prompt cache usage
 are separate facts; shared prefixes alone do not establish cache hits.
 
+Ordinary provider reasoning retains its recorded conversation position; its presence
+does not move application references. Provider-transformed windows are distinct:
+their admitted input precedes current references, including after reopening. A
+provider's required reasoning prefix is a protocol constraint, not an incremental
+transport optimization. Full replay cannot repair an edited or reordered required
+prefix; such an input is rejected rather than discarding signed reasoning.
+Binding is model-specific: immutable signed blocks do not universally bind earlier
+messages. Prefix-bound records also bind the declared catalog. Changed working
+state, references or authority cannot be replayed under a different bound prefix;
+unsupported combinations fail explicitly. Fresh continuation is an explicit
+native reset using portable original contributions, with working state carried
+separately rather than selected as another conversational source.
+
 `ContextService.inspect()` exposes a bounded preview and an authorized history
 reference. Historical reads and searches use `HistoryReader` and disclose their
 byte bounds and coverage. There is no independent note repository or browser.
@@ -109,13 +122,26 @@ both applications enable it by default. At context pressure, governed inference
 revises working state from the current working context. This uses the same
 owner budget, admission policy, and immutable inference records as ordinary work.
 State renewal appends an auxiliary task in the user channel to the unchanged
-conversation. It preserves authority roles, exact protocol prefixes, and provider
-settings, while removing executable tools and the original answer format. This
+conversation. It preserves authority roles and provider settings, while removing executable
+tools and the original answer format. This is supported only when native state
+permits the catalog change; bound state rejects it before dispatch. A provider
+requiring bound catalogs needs a lawful native transition or explicit fresh
+continuation, not silent block removal. This
 task belongs only to its inference invocation; it is not recorded as user input.
 Capacity stays in request accounting and context inspection; the runtime does not
 insert capacity reminders into an established conversation prefix.
 Only a complete revision proposal and an admitted replacement can activate a new
 window. State and window become current together in one session journal commit.
+Automatic renewal retains the admitted recent originals, including complete
+assistant/tool exchanges. If the candidate exceeds compiled capacity, the source
+byte allowance or the existing continuity reserve, it removes the oldest whole
+contribution or exchange. Exact-prefix native responses remain grouped with
+their preceding originals. Mandatory sources must still pass request admission
+even when no further continuity reserve can be recovered. The same staged state
+proposal is used for each smaller candidate. Accepted input, steering and explicitly protected sources
+remain mandatory; the captured source boundary cannot change during selection.
+The reserve uses the net compiled cost of renewal, including capacity released
+by its smaller tool catalog, rather than adding overhead while ignoring savings.
 An unchanged proposal can renew the window without writing a new state revision. Active and protected user input remains exact; model-authored working state is
 fallible reference material, never instructions or verification. Originals remain
 retrievable. The soft continuity allowance occupies at most half of the available

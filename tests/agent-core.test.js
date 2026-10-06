@@ -2753,6 +2753,69 @@ test('an immediate abort is durably accepted before local execution is cancelled
   assert.equal(inspection.state.control.status, 'abort_requested');
 });
 
+test('abort reconciles a started inference without replacing its cancellation reason', async () => {
+  const started = deferred();
+  const fixture = await harness({
+    script: [(request) => {
+      started.resolve();
+      return new Promise((_resolve, reject) => {
+        request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true });
+      });
+    }],
+    withoutSession: true
+  });
+  const control = fixture.agent.run({ task: 'Cancel an already-started inference.' });
+  await started.promise;
+  await control.abort('Stop this request.');
+  const result = await control.result;
+  assert.equal(result.state, 'suspended');
+  assert.equal(result.reason, 'provider_outcome_unknown');
+  const current = await new AgentRunCoordinator(fixture.events, fixture.artifacts).inspect(control.runId);
+  assert.equal(current.state.control.reason, 'Stop this request.');
+  assert.equal(current.state.providerRequests[0].stage, 'outcome_unknown');
+  const failure = await fixture.events.latestOfType(control.runId, 'model.failed');
+  assert.equal(failure.event.diagnostic.causeSummary.message, 'Stop this request.');
+  const owner = await runtimeRepositories.get(fixture.events).inference.load(control.runId);
+  assert.equal(owner.committed.invocations, 1);
+  assert.equal(owner.settledUsage.invocations, 0);
+  assert.equal(fixture.provider.calls.length, 1);
+});
+
+test('abort during provider settlement preserves the known response without starting more work', async () => {
+  let control;
+  let aborted;
+  class AbortAtSettlement extends InMemoryEventRepository {
+    async appendConditional(runId, event, options) {
+      const receipt = await super.appendConditional(runId, event, options);
+      if (event.type === 'provider.attempt.settled') {
+        aborted = control.abort('Stop after this response.');
+      }
+      return receipt;
+    }
+  }
+  const fixture = await harness({
+    events: new AbortAtSettlement(agentEventCodec),
+    script: [response('stop', 'known response', {
+      usage: { promptTokens: 10, completionTokens: 2, totalTokens: 12 }
+    })],
+    withoutSession: true
+  });
+  control = fixture.agent.run({ task: 'Cancel as the known response is committed.' });
+  const result = ended(await control.result);
+  await aborted;
+  assert.equal(result.executionStatus, 'aborted');
+  assert.doesNotMatch(result.errorMessage ?? '', /cannot advance|cannot append/);
+  assert.equal(result.errorMessage, 'Stop after this response.');
+  const current = await new AgentRunCoordinator(fixture.events, fixture.artifacts).inspect(control.runId);
+  assert.equal(current.state.providerRequests[0].stage, 'settled');
+  assert.equal(current.state.providerRequests[0].effect.settlement.outcome, 'succeeded');
+  const owner = await runtimeRepositories.get(fixture.events).inference.load(control.runId);
+  assert.equal(owner.settledUsage.invocations, 1);
+  assert.equal(owner.settledUsage.usage.promptTokens, 10);
+  assert.equal(result.budget.promptTokens, 10);
+  assert.equal(fixture.provider.calls.length, 1);
+});
+
 test('tool planning and authorization are abortable and elapsed-deadline bounded', async () => {
   const callResponse = () =>
     response('tool_calls', '', {

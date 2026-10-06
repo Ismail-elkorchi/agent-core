@@ -81,6 +81,9 @@ export class ClaudeProvider implements ModelProvider {
       );
     const protocol = conservativeProtocolCapabilities(`${this.baseUrl}/messages`, {
       reasoningAccounting: 'included_output',
+      // Sonnet 4.6 preserves signed blocks without binding the preceding input.
+      // An explicit profile for another model must declare its verified native rules.
+      ...(model === 'claude-sonnet-4-6' ? {} : { reasoningPrefix: 'messages_and_tools' }),
       revision: 'claude-messages-2026-09-07-v1',
       roles: ['system', 'user', 'assistant'],
       inputKinds: ['text', 'image', 'document', 'tool_call', 'tool_result', 'protocol'],
@@ -360,6 +363,7 @@ export class ClaudeProvider implements ModelProvider {
       typeof payload.stop_reason !== 'string'
     )
       throw this.error('malformed_response', 'Claude returned a malformed or nonterminal message.');
+    const profile = await this.describeModel(request.model);
     const output: ModelOutputItem[] = [];
     const calls: ModelToolCall[] = [];
     let content = '';
@@ -390,13 +394,15 @@ export class ClaudeProvider implements ModelProvider {
         output.push({
           type: 'protocol',
           state: await createProviderContextState({
-            protocolRevision: requiredProtocolRevision(await this.describeModel(request.model)),
+            protocolRevision: requiredProtocolRevision(profile),
             provider: this.id,
             endpoint: `${this.baseUrl}/messages`,
             request: { ...request, messages: [...request.messages, ...modelOutputToInput(output)] },
             requestId: payload.id,
             kind: 'claude.thinking',
-            requiresExactPrefix: true,
+            requiresExactPrefix:
+              profile.capabilities.protocol?.reasoningPrefix ===
+              'messages_and_tools',
             data: { block }
           })
         });

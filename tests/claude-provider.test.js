@@ -18,7 +18,10 @@ test('Claude preserves exact signed/redacted thinking order and tool identity ac
   assert.deepEqual(sent[1].messages[1].content, blocks);
   assert.equal(sent[1].messages[2].content[0].tool_use_id, 'tool-exact-1');
   assert.equal(sent[1].system[0].text, 'system authority');
-  await assert.rejects(() => provider.complete({ ...replay, messages: [{ role: 'system', content: 'edited earlier instruction' }, ...replay.messages.slice(1)] }), /Earlier input/u);
+  await provider.complete({ ...replay, messages: [{ role: 'system', content: 'current instruction' }, ...replay.messages.slice(1)] });
+  assert.deepEqual(sent[2].messages[1].content, blocks);
+  assert.equal(sent[2].system[0].text, 'current instruction');
+  assert.equal(response.output[0].state.compatibility.requiresExactPrefix, false);
   const other = new ClaudeProvider({ apiKey: 'fixture', baseUrl: 'https://another.test/v1', fetch: async () => { throw new Error('must not dispatch'); } });
   await assert.rejects(() => other.complete(replay), /endpoint/u);
 });
@@ -78,4 +81,25 @@ test('Claude requires a host allowance and compiles an explicit reservation into
   assert.equal(compiled.body.max_tokens, 900);
   assert.equal(compiled.logicalRequest.maxOutputTokens, 900);
   assert.equal(compiled.accounting.outputReservation, 900);
+});
+
+
+test('verified prefix-bound profiles reject changed authority and catalogs before dispatch', async () => {
+  const sent = [];
+  const base = new ClaudeProvider();
+  const profile = await base.describeModel(initial.model);
+  const { id, provider: providerId, ...definition } = profile;
+  const model = 'fixture/prefix-bound';
+  const provider = new ClaudeProvider({ apiKey: 'fixture', modelProfiles: {
+    [model]: { ...definition, capabilities: { ...definition.capabilities, protocol: { ...definition.capabilities.protocol, reasoningPrefix: 'messages_and_tools' } } }
+  }, fetch: async (_url, init) => { sent.push(JSON.parse(init.body)); return Response.json({ ...payload, model }); } });
+  const request = { ...initial, model, tools: [{ type: 'function', function: { name: 'lookup', description: 'Lookup evidence', parameters: { type: 'object', properties: {} } } }] };
+  const first = await provider.complete(request);
+  assert.equal(first.output[0].state.compatibility.requiresExactPrefix, true);
+  const replay = { ...request, messages: [...request.messages, ...modelOutputToInput(first.output), { role: 'tool', content: 'result', toolName: 'lookup', toolCallId: 'tool-exact-1', toolCallType: 'function' }] };
+  await provider.complete(replay);
+  assert.deepEqual(sent[1].messages[1].content, blocks);
+  await assert.rejects(provider.compileRequest({ ...replay, tools: [] }), /Tool declarations/);
+  await assert.rejects(provider.compileRequest({ ...replay, messages: [{ role: 'system', content: 'Changed authority' }, ...replay.messages.slice(1)] }), /Earlier instructions/);
+  assert.equal(sent.length, 2);
 });

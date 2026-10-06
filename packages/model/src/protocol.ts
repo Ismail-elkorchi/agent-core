@@ -76,6 +76,7 @@ export function parseModelProtocolCapabilities(value: unknown): ModelProtocolCap
       record.developerRole !== 'native' &&
       record.developerRole !== 'system_if_no_system' &&
       record.developerRole !== 'unsupported') ||
+    (record.reasoningPrefix !== undefined && record.reasoningPrefix !== 'messages_and_tools') ||
     (record.reasoningAccounting !== undefined &&
       record.reasoningAccounting !== 'included_output' &&
       record.reasoningAccounting !== 'separate' &&
@@ -84,9 +85,10 @@ export function parseModelProtocolCapabilities(value: unknown): ModelProtocolCap
     throw new ModelContractError('Invalid protocol capabilities.', [
       'An explicit version, endpoint, revision and legal capability combination are required.'
     ]);
-  if (record.state === 'none' && (inputKinds.includes('protocol') || record.contextTransforms.length))
+  if (record.state === 'none' &&
+    (inputKinds.includes('protocol') || record.contextTransforms.length || record.reasoningPrefix))
     throw new ModelContractError('Invalid protocol capabilities.', [
-      'Protocol input and context transforms require exact state support.'
+      'Protocol input, reasoning binding and context transforms require exact state support.'
     ]);
   if (
     (record.developerRole === 'unsupported' && roles.includes('developer')) ||
@@ -113,7 +115,8 @@ export function parseModelProtocolCapabilities(value: unknown): ModelProtocolCap
       record.contextTransforms.filter((item): item is string => typeof item === 'string')
     ),
     counting: record.counting,
-    reasoningAccounting: record.reasoningAccounting ?? 'unknown'
+    reasoningAccounting: record.reasoningAccounting ?? 'unknown',
+    ...(record.reasoningPrefix === undefined ? {} : { reasoningPrefix: record.reasoningPrefix })
   });
 }
 export function parseModelContextTransformResult(value: unknown): ModelContextTransformResult {
@@ -178,7 +181,14 @@ export async function assertProviderContextCompatible(
     state.origin.inputIdentity !== (await modelInputIdentity(prefix))
   )
     throw new ModelContractError('Incompatible provider context state.', [
-      'Earlier input was edited or reordered; required reasoning cannot be replayed.'
+      'Earlier instructions or messages were edited or reordered; prefix-bound reasoning cannot be replayed. Preserve its original admitted prefix or use a supported context transition.'
+    ]);
+  if (
+    state.compatibility.requiresExactPrefix &&
+    state.compatibility.toolsIdentity !== (await modelInputIdentity(request.tools ?? []))
+  )
+    throw new ModelContractError('Incompatible provider context state.', [
+      'Tool declarations changed; prefix-bound reasoning cannot be replayed with a different catalog.'
     ]);
 }
 export async function createProviderContextState(options: {
@@ -208,7 +218,10 @@ export async function createProviderContextState(options: {
       model: request.model,
       endpoint: options.endpoint,
       protocolRevision: options.protocolRevision,
-      requiresExactPrefix: options.requiresExactPrefix
+      requiresExactPrefix: options.requiresExactPrefix,
+      ...(options.requiresExactPrefix
+        ? { toolsIdentity: await modelInputIdentity(request.tools ?? []) }
+        : {})
     },
     ...(options.tokenCount === undefined ? {} : { tokenCount: options.tokenCount }),
     ...(options.tokenEstimate === undefined ? {} : { tokenEstimate: options.tokenEstimate })
