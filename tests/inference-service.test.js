@@ -5,7 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
-import { ModelProviderError, createProviderContextState, compileModelRequest } from '@agent-core/model';
+import { ModelProviderError, createProviderContextState, compileModelRequest, requestAccountingInputTokens } from '@agent-core/model';
 import {
   AgentRuntime,
   agentEventCodec,
@@ -193,19 +193,89 @@ test('concurrent auxiliary invocations reserve one shared owner budget transacti
   const services = [0, 1].map(
     () => new InferenceService({ provider, repository, artifacts, budget: { maxInvocations: 1 } })
   );
-  const results = Promise.allSettled(
-    services.map((service, index) => service.invoke(input(`call${index}`)))
-  );
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  release();
+  const attempts = services.map((service, index) => service.invoke(input(`call${index}`)));
+  const results = Promise.allSettled(attempts);
+  try {
+    // The admitted call remains at the gate until its competitor has been rejected.
+    await Promise.race(attempts.map(attempt => attempt.catch(() => undefined)));
+  } finally {
+    release();
+  }
   const settled = await results;
   assert.equal(calls, 1);
   assert.equal(settled.filter((item) => item.status === 'fulfilled').length, 1);
-  assert.ok(
-    settled.some(
-      (item) => item.status === 'rejected' && item.reason instanceof InferenceBudgetExceededError
-    )
-  );
+  const failure = settled.find(item => item.status === 'rejected').reason;
+  assert.ok(failure instanceof InferenceBudgetExceededError);
+  const diagnostic = failure.diagnostic;
+  assert.equal(diagnostic.ownerId, 'work');
+  assert.equal(diagnostic.resource, 'invocations');
+  assert.equal(diagnostic.limit, 1);
+  assert.equal(diagnostic.settled, 0);
+  assert.equal(diagnostic.outstanding, 1);
+  assert.equal(diagnostic.candidate, 1);
+  assert.equal(diagnostic.replacing, 0);
+  assert.equal(diagnostic.projected, 2);
+  assert.ok(['call0', 'call1'].includes(diagnostic.invocationId));
+  assert.ok(Object.isFrozen(diagnostic));
+  assert.ok(Object.isFrozen(diagnostic.ledgerTail));
+  assert.ok(Object.isFrozen(diagnostic.inputAccounting));
+  assert.ok(Object.isFrozen(diagnostic.inputAccounting.unknownKinds));
+  const owner = await repository.load('work');
+  assert.equal(owner.settledUsage.invocations, 1);
+  assert.ok(owner.tail.sequence > diagnostic.ledgerTail.sequence);
+  assert.equal(diagnostic.settled, 0, 'Later settlement cannot rewrite the admission snapshot.');
+});
+
+test('prompt allowance diagnostics separate settled usage, uncertain exposure and the rejected candidate', async () => {
+  let calls = 0;
+  const provider = fixture(async request => {
+    if (++calls === 2) throw new Error('Connection lost after dispatch');
+    return response(request);
+  });
+  const repository = new InMemoryInferenceRepository();
+  const service = new InferenceService({ provider, repository, artifacts: new InMemoryArtifactRepository(),
+    budget: { maxPromptTokens: 1000 } });
+  await service.invoke(input('settled'));
+  await assert.rejects(service.invoke(input('uncertain')), InferenceOutcomeUnknownError);
+  const before = await repository.load('work', { invocationId: 'uncertain' });
+  const candidate = { ...input('candidate'), request: { ...input().request,
+    messages: [{ role: 'user', content: 'Additional evidence. '.repeat(1000) }] } };
+  const compiled = await service.compile(candidate.request, profile, { outputReservation: 100 });
+  assert.ok(requestAccountingInputTokens(compiled.accounting) > 1000);
+  await assert.rejects(service.invoke({ ...candidate, compiled }), error => {
+    assert.ok(error instanceof InferenceBudgetExceededError);
+    const diagnostic = error.diagnostic;
+    assert.equal(diagnostic.resource, 'prompt_tokens');
+    assert.equal(diagnostic.invocationId, 'candidate');
+    assert.equal(diagnostic.inputIdentity, compiled.inputIdentity);
+    assert.deepEqual(diagnostic.ledgerTail, before.tail);
+    assert.equal(diagnostic.limit, 1000);
+    assert.equal(diagnostic.settled, 40);
+    assert.equal(diagnostic.outstanding, before.invocation.start.reservation.promptTokens);
+    assert.equal(diagnostic.candidate, requestAccountingInputTokens(compiled.accounting));
+    assert.equal(diagnostic.projected, diagnostic.settled + diagnostic.outstanding + diagnostic.candidate);
+    assert.equal(diagnostic.inputAccounting.basis, 'compiled_accounting');
+    assert.match(error.message, /40 settled.*outstanding reservations.*candidate.*limit 1000/);
+    return true;
+  });
+  assert.deepEqual((await repository.load('work')).tail, before.tail);
+  assert.equal(calls, 2, 'Rejection neither dispatches nor releases uncertain exposure.');
+});
+
+test('runtime termination retains the completion allowance explanation without dispatch', async () => {
+  let calls = 0;
+  const provider = fixture(async request => { calls++; return response(request); });
+  const service = InferenceService.inMemory({ provider, budget: { maxCompletionTokens: 50 } });
+  const events = new InMemoryEventRepository(agentEventCodec);
+  const result = await new AgentRuntime({ provider, model: 'classifier', maxOutputTokens: 100,
+    inferenceService: service, repositories: { events },
+    toolBoundary: { authorizationPolicyId: 'test', executionTargetId: 'test' }
+  }).run({ task: 'Answer.' }).result;
+  assert.equal(result.terminal?.executionStatus, 'failed', JSON.stringify(result));
+  assert.match(result.terminal.errorMessage, /completion_tokens.*0 settled.*0 outstanding reservations.*100 candidate.*limit 50/);
+  assert.equal(calls, 0);
+  const ended = await events.latestOfType(result.terminal.runId, 'run.ended');
+  assert.equal(ended.event.terminal.errorMessage, result.terminal.errorMessage);
 });
 
 test('aborted dispatch remains uncertain, does not replay spend, and a late result settles its original identity', async () => {
@@ -391,7 +461,16 @@ test('known monetary spend persists before later admission rejects and unknown p
   );
   await assert.rejects(
     service.invoke(input('after')),
-    (error) => error instanceof InferenceBudgetExceededError && error.resource === 'known_cost'
+    (error) => {
+      assert.ok(error instanceof InferenceBudgetExceededError);
+      assert.equal(error.resource, 'known_cost');
+      assert.equal(error.diagnostic.currency, 'USD');
+      assert.equal(error.diagnostic.settled, settled.cost.amount);
+      assert.equal(error.diagnostic.outstanding, 0);
+      assert.equal(error.diagnostic.limit, 0.0003);
+      assert.match(error.message, /limit 0.0003 USD/);
+      return true;
+    }
   );
   assert.equal(calls, 1);
   const unknown = await new InferenceService({
@@ -818,7 +897,17 @@ test('unquantified input stays usable without a budget and reserves its input bo
   await bounded.invoke({ ...input(), request });
   assert.equal((await repository.load('work', { invocationId: 'one' })).invocation.start.reservation.promptTokens, 19900);
   const tooSmall = InferenceService.inMemory({ provider, budget: { maxPromptTokens: 100 } });
-  await assert.rejects(tooSmall.invoke({ ...input(), request }), InferenceBudgetExceededError);
+  await assert.rejects(tooSmall.invoke({ ...input(), request }), error => {
+    assert.ok(error instanceof InferenceBudgetExceededError);
+    assert.equal(error.diagnostic.resource, 'prompt_tokens');
+    assert.equal(error.diagnostic.candidate, 19900);
+    assert.equal(error.diagnostic.inputAccounting.reservation, 19900);
+    assert.equal(error.diagnostic.inputAccounting.basis, 'model_input_bound');
+    assert.ok(error.diagnostic.inputAccounting.tokens < error.diagnostic.candidate);
+    assert.deepEqual(error.diagnostic.inputAccounting.unknownKinds, ['reasoning']);
+    assert.match(error.message, /finite model input bound.*uncounted.*compiled accounting/);
+    return true;
+  });
   assert.equal(calls, 2, 'budget rejection grants no dispatch');
   const noBound = { ...provider, describeModel: async () => ({ ...profile, limits: { outputTokens: 1000 } }) };
   const unboundedProfile = await noBound.describeModel();

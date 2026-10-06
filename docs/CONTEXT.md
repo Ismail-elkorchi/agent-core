@@ -147,7 +147,10 @@ fallible reference material, never instructions or verification. Originals remai
 retrievable. The soft continuity allowance occupies at most half of the available
 input capacity, so a large output reservation cannot trigger renewal on every
 turn. Failed summarization preserves the preceding window; proactive renewal
-failure does not block an ordinary request that still fits.
+preparation or generation failure does not block an ordinary request that still fits.
+Transient preparation failures and unsupported renewal requests remain visible in
+the admitted context diagnostic. Cancellation, ordinary-request incompatibility,
+and persistence or compiled-input integrity failures still stop execution.
 Irreducible input/catalog/reservation conflicts suspend the owning driver
 with actionable context diagnostics. Changing selection or model can resolve a
 conflict; retrying an unchanged request cannot. Session, work, accounting and live

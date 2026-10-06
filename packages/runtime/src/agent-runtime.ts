@@ -1039,6 +1039,7 @@ export class AgentRuntime {
         error,
         signal,
         runId,
+        run,
         controller,
         append,
         emit
@@ -1860,10 +1861,12 @@ export class AgentRuntime {
     readonly error: unknown;
     readonly signal: AbortSignal;
     readonly runId: string;
+    readonly run: AgentRunDriver;
     readonly controller: AgentRunBudget;
     readonly append: (event: AgentAuditEvent) => Promise<EventAppendReceipt>;
     readonly emit: (event: AgentProgressEvent) => Promise<void>;
   }): Promise<TerminalDecision> {
+    await this.waitForAbortRequest(runtime.runId);
     const executionError = runtime.error instanceof AgentExecutionError ? runtime.error : undefined;
     const cause = executionError?.cause ?? runtime.error;
     const attached = executionError?.context;
@@ -1908,7 +1911,15 @@ export class AgentRuntime {
       await runtime.append(interrupted);
       await runtime.emit(interrupted);
     }
-    if (diagnostic && turnCount > 0) {
+    const failedRequest = runtime.run.state().providerRequests.find((request) =>
+      sameTurnIdentity(request.identity, attachedIdentity)
+    );
+    if (
+      diagnostic &&
+      turnCount > 0 &&
+      failedRequest &&
+      failedRequest.stage !== 'ready' && failedRequest.stage !== 'effect_ready'
+    ) {
       const failed = {
         type: 'model.failed' as const,
         ...attachedIdentity,
@@ -2981,20 +2992,26 @@ export class AgentRuntime {
         (message) =>
           message.role === 'assistant' || message.role === 'tool' || message.role === 'protocol'
       );
-    // Reserve the next response and net renewal overhead through the same compiler.
-    // Removed tool declarations release capacity; count that saving before clamping.
-    const renewalRequest =
-      hasWorkingHistory && this.options.context && this.options.contextRenewal?.automatic
-        ? workingStateRenewalRequest(result.request)
-        : undefined;
-    const renewalCompiled = renewalRequest
-      ? await this.inferenceService.compile(renewalRequest, request.snapshot.profile, {
-          outputReservation: request.snapshot.requestWindow.maxOutputTokens
-        })
-      : undefined;
     const accounting = result.compiled.accounting;
-    const renewalHeadroom = renewalCompiled
-      ? Math.max(
+    let renewalNotice: string | undefined;
+    if (
+      !selected &&
+      hasWorkingHistory &&
+      this.options.context &&
+      this.options.contextRenewal?.automatic
+    ) {
+      let renewalCompiled: CompiledModelRequest | undefined;
+      try {
+        const renewalRequest = workingStateRenewalRequest(result.request);
+        renewalCompiled = await this.inferenceService.compile(
+          renewalRequest,
+          request.snapshot.profile,
+          { outputReservation: request.snapshot.requestWindow.maxOutputTokens }
+        );
+        request.signal.throwIfAborted();
+        // The reserve credits removed declarations before clamping. Preparing it is
+        // speculative; it does not change the ordinary request's admission.
+        const renewalHeadroom = Math.max(
           0,
           requestAccountingInputTokens(renewalCompiled.accounting) -
             requestAccountingInputTokens(accounting) +
@@ -3002,100 +3019,95 @@ export class AgentRuntime {
             (accounting.pricingSemantics.reasoningIncludedInOutput === false
               ? accounting.reasoningReservation
               : 0)
-        )
-      : undefined;
-    const capacity = requestCapacity(accounting, renewalHeadroom);
-    if (
-      !selected &&
-      hasWorkingHistory &&
-      this.options.context &&
-      renewalRequest &&
-      renewalCompiled &&
-      (admissionFailure || capacity.pressure === 'continuity')
-    ) {
-      const context = await this.options.context.inspect();
-      try {
-        const renewalState = await stageWorkingStateRenewal({
-          inference: this.inferenceService,
-          context: this.options.context,
-          revisionId: result.workingStateRevisionId,
-          request: renewalRequest,
-          compiled: renewalCompiled,
-          profile: request.snapshot.profile,
-          cut: context.cut,
-          ownerId: this.options.inferenceOwnerId ?? request.runId,
-          runId: request.runId,
-          outputReservation: request.snapshot.requestWindow.maxOutputTokens
-        }).finally(async () => {
-          await request.controller.recordUsage(
-            await this.inferenceService.settledRunUsage(
-              this.options.inferenceOwnerId ?? request.runId,
-              request.runId
-            )
-          );
-        });
-        const sources = workingStateRenewalSources(
-          (await readSelectedHistorySources(this.options.context.history, context.cut)).entries
         );
-        let renewed: typeof result | undefined;
-        let entry: SessionContextTransitionEntry;
-        for (;;) {
-          const retained = new Map(
-            [...context.protectedSources, ...sources.flatMap((group) =>
-              group.map((source) => sourceRef(context.cut.sessionId, source))
-            )].map((source) => [source.entryId, source])
+        if (
+          admissionFailure ||
+          requestCapacity(accounting, renewalHeadroom).pressure === 'continuity'
+        ) {
+          const context = await this.options.context.inspect();
+          const renewalState = await stageWorkingStateRenewal({
+            inference: this.inferenceService,
+            context: this.options.context,
+            revisionId: result.workingStateRevisionId,
+            request: renewalRequest,
+            compiled: renewalCompiled,
+            profile: request.snapshot.profile,
+            cut: context.cut,
+            ownerId: this.options.inferenceOwnerId ?? request.runId,
+            runId: request.runId,
+            outputReservation: request.snapshot.requestWindow.maxOutputTokens
+          }).finally(async () => {
+            await request.controller.recordUsage(
+              await this.inferenceService.settledRunUsage(
+                this.options.inferenceOwnerId ?? request.runId,
+                request.runId
+              )
+            );
+          });
+          const sources = workingStateRenewalSources(
+            (await readSelectedHistorySources(this.options.context.history, context.cut)).entries
           );
-          const renewal: ContextTransitionRequest = {
-            expectedWindowId: context.window?.windowId ?? null,
-            expectedSourceRevision: context.cut.sourceRevision,
-            idempotencyKey: `working-state-renewal:${renewalState.invocationId}`,
-            reason: 'Automatic context renewal with the current working-state interpretation.',
-            selection: { strategy: 'sources', retained: [...retained.values()] }
-          };
-          try {
-            entry = await this.options.context.transition(renewal, {
-              signal: request.signal,
-              expectedWorkingStateRevisionId: result.workingStateRevisionId,
-              ...(renewalState.change ? { workingState: renewalState.change } : {}),
-              admit: async (input) => {
-                const admitted = await validate(input);
-                if (
-                  sources.length > 0 && selected &&
-                  requestCapacity(selected.compiled.accounting, renewalHeadroom).pressure === 'continuity'
-                )
-                  throw new ContextAdmissionError(
-                    selected.compiled,
-                    new Error('Retained originals leave no continuity reserve.')
-                  );
-                renewed = selected;
-                return admitted;
-              }
-            });
-            break;
-          } catch (error) {
-            if (
-              !(error instanceof ContextAdmissionError || error instanceof ContextSourceCapacityError) ||
-              sources.length === 0
-            )
-              throw error;
-            // Only source selection changes. The same staged state and exact admission path
-            // determine fit; accepted input and explicit protection remain mandatory.
-            sources.shift();
+          let renewed: typeof result | undefined;
+          let entry: SessionContextTransitionEntry;
+          for (;;) {
+            const retained = new Map(
+              [...context.protectedSources, ...sources.flatMap((group) =>
+                group.map((source) => sourceRef(context.cut.sessionId, source))
+              )].map((source) => [source.entryId, source])
+            );
+            const renewal: ContextTransitionRequest = {
+              expectedWindowId: context.window?.windowId ?? null,
+              expectedSourceRevision: context.cut.sourceRevision,
+              idempotencyKey: `working-state-renewal:${renewalState.invocationId}`,
+              reason: 'Automatic context renewal with the current working-state interpretation.',
+              selection: { strategy: 'sources', retained: [...retained.values()] }
+            };
+            try {
+              entry = await this.options.context.transition(renewal, {
+                signal: request.signal,
+                expectedWorkingStateRevisionId: result.workingStateRevisionId,
+                ...(renewalState.change ? { workingState: renewalState.change } : {}),
+                admit: async (input) => {
+                  const admitted = await validate(input);
+                  if (
+                    sources.length > 0 &&
+                    selected &&
+                    requestCapacity(selected.compiled.accounting, renewalHeadroom).pressure === 'continuity'
+                  )
+                    throw new ContextAdmissionError(
+                      selected.compiled,
+                      new Error('Retained originals leave no continuity reserve.')
+                    );
+                  renewed = selected;
+                  return admitted;
+                }
+              });
+              break;
+            } catch (error) {
+              if (
+                !(error instanceof ContextAdmissionError || error instanceof ContextSourceCapacityError) ||
+                sources.length === 0
+              )
+                throw error;
+              // Only source selection changes. The same staged state and exact admission path
+              // determine fit; accepted input and explicit protection remain mandatory.
+              sources.shift();
+            }
           }
+          await this.activateCommittedContext(request.modelWindow, request.runId);
+          await emit({
+            type: 'context.transitioned',
+            window: entry.window,
+            transition: entry.transition
+          });
+          if (!renewed) throw new Error('Renewal did not admit a captured request.');
+          result = renewed;
+          admissionFailure = undefined;
         }
-        await this.activateCommittedContext(request.modelWindow, request.runId);
-        await emit({
-          type: 'context.transitioned',
-          window: entry.window,
-          transition: entry.transition
-        });
-        if (!renewed) throw new Error('Renewal did not admit a captured request.');
-        result = renewed;
-        admissionFailure = undefined;
       } catch (error) {
         request.signal.throwIfAborted();
         const invocationFailure =
-          error instanceof InferenceOutcomeUnknownError ? error.cause : undefined;
+          error instanceof InferenceOutcomeUnknownError ? error.cause : error;
         const providerFailure =
           invocationFailure instanceof ModelStreamInterruptedError
             ? invocationFailure.cause
@@ -3104,17 +3116,33 @@ export class AgentRuntime {
           providerFailure instanceof ModelProviderError &&
           providerFailure.retryable &&
           providerFailure.code !== 'aborted';
-        // A speculative renewal cannot block work that already fits. Its window was not committed.
-        const renewalFailed = error instanceof ContextAdmissionError || renewalUnavailable;
+        const preparationUnavailable =
+          renewalCompiled === undefined &&
+          (error instanceof ModelContractError ||
+            (providerFailure instanceof ModelProviderError && providerFailure.code === 'invalid_request'));
+        // Only the optional candidate failed. Ordinary incompatibility, cancellation
+        // and failures of storage or compiled-input integrity remain fatal.
+        const renewalFailed =
+          error instanceof ContextAdmissionError || renewalUnavailable || preparationUnavailable;
+        const message = `Automatic context renewal unavailable: ${errorMessage(error)}`;
         if (admissionFailure || !renewalFailed) {
+          const failure =
+            admissionFailure && renewalFailed
+              ? new ContextAdmissionError(
+                  admissionFailure.compiled,
+                  new Error(`${admissionFailure.message} ${message}`, { cause: error }),
+                  admissionFailure.providerRejected
+                )
+              : error;
           this.options.context.recordAdmission({
             status: 'blocked',
             inputIdentity: result.compiled.inputIdentity,
             accounting: result.compiled.accounting,
-            message: error instanceof Error ? error.message : String(error)
+            message: errorMessage(failure)
           });
-          throw renewalFailed ? (admissionFailure ?? error) : error;
+          throw failure;
         }
+        renewalNotice = `${message} The ordinary request still fits its context allowance.`;
       }
     }
     if (admissionFailure) {
@@ -3159,7 +3187,8 @@ export class AgentRuntime {
     this.options.context?.recordAdmission({
       status: 'admitted',
       inputIdentity: compiled.inputIdentity,
-      accounting: compiled.accounting
+      accounting: compiled.accounting,
+      ...(renewalNotice === undefined ? {} : { message: renewalNotice })
     });
     await this.options.onRequestAdmitted?.({
       requestId: fingerprint.requestId,

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
 import { defineTool } from '@agent-core/tools';
-import { ModelProviderError, requestAccountingInputTokens } from '@agent-core/model';
+import { compileModelRequest, ModelContractError, ModelProviderError, requestAccountingInputTokens } from '@agent-core/model';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import {
   AgentRuntime,
@@ -609,6 +609,94 @@ test('large output reservations do not trigger renewal of a short conversation',
     state.requests[1].messages.some((message) => message.content === 'Original requirements.')
   );
   assert.equal((await state.context.inspect()).window, null);
+});
+
+for (const failure of ['transient', 'unsupported', 'invalid_request', 'integrity', 'cancellation', 'ordinary']) {
+  test(`renewal preparation (${failure}) preserves only a lawful ordinary request`, async () => {
+    const state = await fixture();
+    await new AgentRuntime(state.options).run({ task: 'Preserve these original requirements.' }).result;
+    const before = await state.context.inspect();
+    const abort = new AbortController();
+    let preparations = 0;
+    const provider = {
+      ...state.provider,
+      compileRequest: async (request, options) => {
+        const renewal = request.messages.some(message =>
+          message.content?.startsWith('Runtime context-maintenance task.')
+        );
+        if (renewal) {
+          preparations++;
+          if (failure === 'cancellation') {
+            abort.abort(new Error('User cancelled preparation'));
+            request.signal?.throwIfAborted();
+          }
+          if (failure === 'integrity') throw new Error('Compiled input integrity failed');
+          if (failure === 'unsupported') throw new ModelContractError(
+            'Renewal cannot change the preserved tool catalog.', ['Native prefix is bound.']
+          );
+          throw new ModelProviderError({ provider: 'fixture',
+            code: failure === 'invalid_request' ? 'invalid_request' : 'provider_unavailable',
+            message: 'Renewal preparation unavailable', retryable: failure === 'transient'
+          });
+        }
+        if (failure === 'ordinary') throw new ModelContractError('Ordinary native input is incompatible.', []);
+        const { signal, ...body } = request;
+        return compileModelRequest({ ...options, request, profile: profile(60000), body, endpoint: 'fixture' });
+      }
+    };
+    const result = await new AgentRuntime({ ...state.options, provider,
+      contextRenewal: { automatic: true }
+    }).run({ task: 'Continue.', signal: abort.signal }).result;
+    assert.equal(preparations, failure === 'ordinary' ? 0 : 1);
+    const canContinue = ['transient', 'unsupported', 'invalid_request'].includes(failure);
+    assert.equal(state.requests.length, canContinue ? 2 : 1, JSON.stringify(result));
+    const after = await state.context.inspect();
+    assert.deepEqual(after.window, before.window);
+    assert.deepEqual(after.workingState, before.workingState);
+    if (canContinue) {
+      assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+      assert.equal(after.admission.status, 'admitted');
+      assert.match(after.admission.message, /renewal unavailable.*ordinary request still fits/i);
+      assert.ok(state.requests[1].messages.some(message => message.content === 'Preserve these original requirements.'));
+    } else if (failure === 'cancellation') {
+      assert.equal(result.terminal?.executionStatus, 'aborted', JSON.stringify(result));
+    } else {
+      assert.equal(result.terminal?.executionStatus, 'failed', JSON.stringify(result));
+      assert.match(result.terminal.errorMessage, failure === 'ordinary' ? /Ordinary native input/ : /integrity failed/);
+    }
+  });
+}
+
+test('unavailable renewal preparation cannot authorize an oversized ordinary request', async () => {
+  const state = await fixture();
+  await new AgentRuntime(state.options).run({ task: 'Original evidence. '.repeat(1000) }).result;
+  state.setCapacity(1024);
+  const before = await state.context.inspect();
+  let preparations = 0;
+  const provider = {
+    ...state.provider,
+    compileRequest: async (request, options) => {
+      if (request.messages.some(message => message.content?.startsWith('Runtime context-maintenance task.'))) {
+        preparations++;
+        throw new ModelProviderError({ provider: 'fixture', code: 'provider_unavailable',
+          message: 'Renewal token counting unavailable', retryable: true });
+      }
+      const { signal, ...body } = request;
+      return compileModelRequest({ ...options, request, profile: profile(1024), body, endpoint: 'fixture' });
+    }
+  };
+  const result = await new AgentRuntime({ ...state.options, provider,
+    contextRenewal: { automatic: true }
+  }).run({ task: 'Continue.' }).result;
+  assert.equal(preparations, 1);
+  assert.equal(state.requests.length, 1);
+  assert.equal(result.state, 'suspended', JSON.stringify(result));
+  assert.equal(result.reason, 'context_admission');
+  const after = await state.context.inspect();
+  assert.equal(after.admission.status, 'blocked');
+  assert.match(after.admission.message, /Renewal token counting unavailable/);
+  assert.deepEqual(after.window, before.window);
+  assert.deepEqual(after.workingState, before.workingState);
 });
 
 for (const failure of ['incomplete', 'transport', 'stream']) {

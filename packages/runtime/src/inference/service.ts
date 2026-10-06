@@ -25,13 +25,15 @@ import {
   type ModelResponse,
   type ModelStreamEvent,
   type ModelUsage,
+  type RequestAccountingKind,
   type RequestTokenObservation
 } from '@agent-core/model';
 import {
   InMemoryArtifactRepository,
   hashJson,
   type ArtifactRef,
-  type ArtifactRepository
+  type ArtifactRepository,
+  type EventLedgerTail
 } from '@agent-core/persistence';
 import { randomUUID } from 'node:crypto';
 import { requestWindowForModel } from '../orchestration/model-request.js';
@@ -130,12 +132,54 @@ export class InferenceOutcomeUnknownError extends Error {
     this.name = 'InferenceOutcomeUnknownError';
   }
 }
+export interface InferenceBudgetDiagnostic {
+  readonly resource: 'invocations' | 'prompt_tokens' | 'completion_tokens' | 'known_cost';
+  readonly ownerId: string;
+  readonly invocationId: string;
+  readonly inputIdentity: string;
+  readonly ledgerTail: EventLedgerTail;
+  readonly limit: number;
+  readonly settled: number;
+  readonly outstanding: number;
+  readonly candidate: number;
+  readonly replacing: number;
+  readonly projected: number;
+  readonly currency?: string;
+  readonly inputAccounting: {
+    readonly tokens: number;
+    readonly reservation: number;
+    readonly basis: 'compiled_accounting' | 'model_input_bound';
+    readonly unknownKinds: readonly RequestAccountingKind[];
+  };
+}
 export class InferenceBudgetExceededError extends Error {
-  constructor(
-    readonly resource: 'invocations' | 'prompt_tokens' | 'completion_tokens' | 'known_cost'
-  ) {
-    super(`Inference owner budget exhausted: ${resource}.`);
+  readonly diagnostic: InferenceBudgetDiagnostic;
+
+  constructor(diagnostic: InferenceBudgetDiagnostic) {
+    const replaced = diagnostic.replacing === 0 ? '' : ` - ${String(diagnostic.replacing)} replaced`;
+    const currency = diagnostic.currency === undefined ? '' : ` ${diagnostic.currency}`;
+    const bound = diagnostic.inputAccounting.basis === 'model_input_bound' &&
+      (diagnostic.resource === 'prompt_tokens' || diagnostic.resource === 'known_cost')
+        ? ` Candidate input reserves ${String(diagnostic.inputAccounting.reservation)} tokens from the finite model input bound because ${diagnostic.inputAccounting.unknownKinds.join(', ')} is uncounted; compiled accounting is ${String(diagnostic.inputAccounting.tokens)} tokens.`
+        : '';
+    super(
+      `Inference owner allowance exceeded (${diagnostic.resource}): ` +
+      `${String(diagnostic.settled)} settled + ${String(diagnostic.outstanding)} outstanding reservations + ` +
+      `${String(diagnostic.candidate)} candidate${replaced} = ${String(diagnostic.projected)}; ` +
+      `limit ${String(diagnostic.limit)}${currency}.${bound}`
+    );
+    this.diagnostic = Object.freeze({
+      ...diagnostic,
+      ledgerTail: Object.freeze({ ...diagnostic.ledgerTail }),
+      inputAccounting: Object.freeze({
+        ...diagnostic.inputAccounting,
+        unknownKinds: Object.freeze([...diagnostic.inputAccounting.unknownKinds])
+      })
+    });
     this.name = 'InferenceBudgetExceededError';
+  }
+  get resource(): InferenceBudgetDiagnostic['resource'] {
+    return this.diagnostic.resource;
   }
 }
 interface DurableOperation<T extends { readonly usage?: ModelUsage }> {
@@ -436,12 +480,15 @@ export class InferenceService {
       )
         throw new Error('Native input extension requires an unresolved admitted generation.');
       if (current.extension?.fingerprint === fingerprint) return;
-      assertBudget(
+      assertBudget({
         state,
         reservation,
-        this.options.budget ?? {},
-        current.extension?.reservation ?? current.start.reservation
-      );
+        identity: context,
+        compiled,
+        profile: context.profile,
+        limits: this.options.budget ?? {},
+        replacing: current.extension?.reservation ?? current.start.reservation
+      });
       const requestRef = await artifacts.storeProtected({
         label: 'native-inference-input-extension',
         mediaType: 'application/json',
@@ -731,7 +778,7 @@ export class InferenceService {
         );
       }
       const limits = this.options.budget ?? {};
-      assertBudget(state, reservation, limits);
+      assertBudget({ state, reservation, limits, identity, compiled, profile });
       const requestRef = await artifacts.storeProtected({
         label: `inference-${input.operation}-request`,
         mediaType: 'application/json',
@@ -989,11 +1036,7 @@ function inferenceReservation(
   budget: InferenceBudget
 ): InferenceReservation {
   const accounting = compiled.accounting;
-  const needsInputBound =
-    accounting.unknownComponents.length > 0 &&
-    (budget.maxPromptTokens !== undefined ||
-      (budget.maxKnownCost !== undefined &&
-        profile.pricing?.currency === budget.maxKnownCost.currency));
+  const needsInputBound = requiresInputBound(compiled, profile, budget);
   const promptTokens = needsInputBound
     ? requestAccountingInputBound(accounting)
     : requestAccountingInputTokens(accounting);
@@ -1016,34 +1059,90 @@ function inferenceReservation(
   };
 }
 
-function assertBudget(
-  state: InferenceOwnerState,
-  next: InferenceReservation,
-  limits: InferenceBudget,
-  replacing?: InferenceReservation
-): void {
+function requiresInputBound(
+  compiled: CompiledModelRequest,
+  profile: ModelProfile,
+  budget: InferenceBudget
+): boolean {
+  return (
+    compiled.accounting.unknownComponents.length > 0 &&
+    (budget.maxPromptTokens !== undefined ||
+      (budget.maxKnownCost !== undefined && profile.pricing?.currency === budget.maxKnownCost.currency))
+  );
+}
+
+function assertBudget(input: {
+  readonly state: InferenceOwnerState;
+  readonly reservation: InferenceReservation;
+  readonly limits: InferenceBudget;
+  readonly identity: InferenceIdentity;
+  readonly compiled: CompiledModelRequest;
+  readonly profile: ModelProfile;
+  readonly replacing?: InferenceReservation;
+}): void {
+  const { state, reservation: next, limits, identity, compiled, profile, replacing } = input;
   if (state.policyFingerprint !== undefined && state.policyFingerprint !== hashJson(limits))
     throw new Error('Inference owner budget policy changed after admission.');
-  const prompt =
-    state.committed.usage.promptTokens + next.promptTokens - (replacing?.promptTokens ?? 0);
-  const completion =
-    state.committed.usage.completionTokens +
-    next.completionTokens -
-    (replacing?.completionTokens ?? 0);
   const currency = limits.maxKnownCost?.currency;
-  const knownCost =
-    (currency === undefined ? 0 : (state.committed.knownCosts[currency] ?? 0)) +
-    (next.cost.currency === currency ? (next.cost.amount ?? 0) : 0) -
-    (replacing?.cost.currency === currency ? (replacing?.cost.amount ?? 0) : 0);
-  const invocations = state.committed.invocations + (replacing === undefined ? 1 : 0);
-  if (limits.maxInvocations !== undefined && invocations > limits.maxInvocations)
-    throw new InferenceBudgetExceededError('invocations');
-  if (limits.maxPromptTokens !== undefined && prompt > limits.maxPromptTokens)
-    throw new InferenceBudgetExceededError('prompt_tokens');
-  if (limits.maxCompletionTokens !== undefined && completion > limits.maxCompletionTokens)
-    throw new InferenceBudgetExceededError('completion_tokens');
-  if (limits.maxKnownCost && knownCost > limits.maxKnownCost.amount)
-    throw new InferenceBudgetExceededError('known_cost');
+  const checks: readonly {
+    resource: InferenceBudgetDiagnostic['resource'];
+    limit: number | undefined;
+    settled: number;
+    committed: number;
+    candidate: number;
+    replacing: number;
+    currency?: string;
+  }[] = [
+    {
+      resource: 'invocations', limit: limits.maxInvocations,
+      settled: state.settledUsage.invocations, committed: state.committed.invocations,
+      candidate: 1, replacing: replacing === undefined ? 0 : 1
+    },
+    {
+      resource: 'prompt_tokens', limit: limits.maxPromptTokens,
+      settled: state.settledUsage.usage.promptTokens, committed: state.committed.usage.promptTokens,
+      candidate: next.promptTokens, replacing: replacing?.promptTokens ?? 0
+    },
+    {
+      resource: 'completion_tokens', limit: limits.maxCompletionTokens,
+      settled: state.settledUsage.usage.completionTokens, committed: state.committed.usage.completionTokens,
+      candidate: next.completionTokens, replacing: replacing?.completionTokens ?? 0
+    },
+    {
+      resource: 'known_cost', limit: limits.maxKnownCost?.amount,
+      settled: currency === undefined ? 0 : state.settledUsage.knownCosts[currency] ?? 0,
+      committed: currency === undefined ? 0 : state.committed.knownCosts[currency] ?? 0,
+      candidate: next.cost.currency === currency ? next.cost.amount ?? 0 : 0,
+      replacing: replacing?.cost.currency === currency ? replacing?.cost.amount ?? 0 : 0,
+      ...(currency === undefined ? {} : { currency })
+    }
+  ];
+  for (const check of checks) {
+    const projected = check.committed + check.candidate - check.replacing;
+    if (check.limit === undefined || projected <= check.limit) continue;
+    throw new InferenceBudgetExceededError({
+      resource: check.resource,
+      ownerId: identity.ownerId,
+      invocationId: identity.invocationId,
+      inputIdentity: compiled.inputIdentity,
+      ledgerTail: state.tail,
+      limit: check.limit,
+      settled: check.settled,
+      outstanding: check.committed - check.settled,
+      candidate: check.candidate,
+      replacing: check.replacing,
+      projected,
+      ...(check.currency === undefined ? {} : { currency: check.currency }),
+      inputAccounting: {
+        tokens: requestAccountingInputTokens(compiled.accounting),
+        reservation: next.promptTokens,
+        basis: requiresInputBound(compiled, profile, limits)
+          ? 'model_input_bound'
+          : 'compiled_accounting',
+        unknownKinds: [...new Set(compiled.accounting.unknownComponents.map(part => part.kind))]
+      }
+    });
+  }
 }
 
 function recordableSourceRequest(request: ModelRequest): Omit<ModelRequest, 'signal'> {

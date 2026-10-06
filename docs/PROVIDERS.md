@@ -29,6 +29,12 @@ prompt-token and known-cost budgets reserve the finite model input bound when
 components remain unquantified. Otherwise reservations use the request count or
 estimate and declared output allowance. Transactional reservations govern
 overlapping invocations; settlement records actual usage when supplied.
+Owner-allowance rejections capture the limiting resource, settled usage,
+outstanding reservations, candidate reservation, and any replaced reservation at
+the exact ledger boundary. `InferenceBudgetExceededError.diagnostic` also identifies
+the invocation and compiled input, and explains when uncounted input requires the
+finite model input bound. Its message carries those quantities through the
+existing run errors without releasing uncertain exposure or changing allowances.
 Cached input still occupies context. Codex uses an application-supplied
 output reservation because its subscription endpoint rejects the Platform output
 cap parameter.

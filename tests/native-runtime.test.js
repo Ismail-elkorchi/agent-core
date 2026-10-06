@@ -290,6 +290,7 @@ test('native successor spends the shared owner allowance before any result frame
   assert.equal(fixture.effects, 1);
   assert.equal(fixture.result.state, 'ended');
   assert.equal(fixture.result.terminal.executionStatus, 'failed');
+  assert.match(fixture.result.terminal.errorMessage, /invocations.*1 settled.*0 outstanding reservations.*1 candidate.*limit 1/);
   const state = (await fixture.runtime.inspectRun('delivery-boundary')).state;
   assert.equal(state.providerRequests.length, 0, 'Ended runs discard settled provider payloads.');
   assert.equal(state.toolBatches[0].callStates[0].stage, 'recorded');
