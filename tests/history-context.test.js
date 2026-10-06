@@ -1,10 +1,12 @@
+import * as z from 'zod';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
+import { parseToolObservation, encodeToolObservation, serializeToolModelContent } from '@agent-core/tools';
 import { createProviderContextState } from '@agent-core/model';
-import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
+import { hashJson, InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import { LocalArtifactRepository, JsonlEventRepository } from '@agent-core/persistence/node';
 import {
   AgentSession,
@@ -66,7 +68,7 @@ async function backend(kind) {
   };
 }
 for (const kind of ['memory', 'jsonl']) {
-  test(`${kind}: history excerpts budget JSON escaping and preserve exact retrievable sources`, async () => {
+  test(`${kind}: history excerpts budget the complete model presentation and preserve exact retrievable sources`, async () => {
     const { sessions } = await backend(kind);
     const session = await sessions.create({ binding });
     const output = { text: `needle ${'"\\\n\t改正😀'.repeat(700)}` };
@@ -87,9 +89,9 @@ for (const kind of ['memory', 'jsonl']) {
       });
       assert(page.items.length > 0);
       assert(page.bytes <= 2200);
-      assert.equal(page.bytes, page.items.reduce(
-        (sum, item) => sum + Buffer.byteLength(JSON.stringify(item)), 0
-      ));
+      const search = createHistoryTools({ history }).find((tool) => tool.name === 'history_search');
+      const content = await search.buildModelContent({ observation: { kind: 'result', output: page } });
+      assert.equal(page.bytes, Buffer.byteLength(serializeToolModelContent(content)));
       for (const item of page.items) {
         assert.equal(item.truncated, true);
         assert.match(item.text, /needle/);
@@ -105,6 +107,43 @@ for (const kind of ['memory', 'jsonl']) {
     } while (cursor);
     assert.equal(sources.length, 3);
     assert.equal(new Set(sources).size, 3);
+  });
+
+  test(`${kind}: history filters precede original hydration and unread sources retain exact identities`, async () => {
+    const { sessions, events, artifacts } = await backend(kind);
+    const session = await sessions.create({ binding });
+    await sessions.appendInput(session, { runId: 'run', task: 'history' });
+    const original = parseToolObservation({ outputSchema: z.json() }, { kind: 'result', summary: 'large original', scope: { resources: [], coverage: 'complete' },
+      output: { text: 'x'.repeat(50000) + 'needle' } });
+    const artifact = await artifacts.store({ label: 'history-original', content: Buffer.from(JSON.stringify(encodeToolObservation(original))),
+      mediaType: 'application/json' });
+    for (const [callIndex, toolName] of ['other_tool', 'wanted_tool'].entries()) {
+      await events.append('run', { type: 'tool.ended', ...identity, toolBatchId: 'batch', callIndex,
+        toolAttempt: 1, toolName,
+        observation: { storage: 'artifact', kind: original.kind, summary: original.summary,
+          digest: hashJson(encodeToolObservation(original)), coverage: 'complete', artifact } });
+    }
+    await events.append('run', { type: 'tool.ended', ...identity, toolBatchId: 'batch', callIndex: 2,
+      toolAttempt: 1, toolName: 'small_tool',
+      observation: { storage: 'inline', kind: 'result', summary: 'small', coverage: 'complete',
+        digest: hashJson(encodeToolObservation(parseToolObservation({ outputSchema: z.json() }, { ...original, summary: 'small', output: { text: 'needle' } }))),
+        observation: parseToolObservation({ outputSchema: z.json() }, { ...original, summary: 'small', output: { text: 'needle' } }) } });
+    const history = new HistoryReader({ repository: sessions, session, events, artifacts });
+    const small = await history.search({ query: 'needle', filter: { toolName: 'small_tool' }, maxScannedBytes: 10000 });
+    assert.equal(small.items.length, 1);
+    assert.equal(small.unread, undefined, 'unrelated originals cannot exhaust hydration or produce diagnostics');
+    const limited = await history.search({ query: 'needle', filter: { toolName: 'wanted_tool' }, maxScannedBytes: 10000, maxBytes: 2200 });
+    assert.equal(limited.coverage, 'partial');
+    assert.equal(limited.unread.length, 1);
+    assert.equal(limited.unread[0].reason, 'source_byte_limit');
+    assert(limited.bytes <= 2200, 'coverage and cursor share the presentation budget');
+    const exact = await history.read({ source: limited.unread[0].source, maxSourceBytes: 100000, maxBytes: 100000 });
+    assert.equal(exact.status, 'available');
+    assert.match(exact.item.text, /needle/);
+    const next = await history.search({ query: 'needle', filter: { toolName: 'wanted_tool' }, cursor: limited.cursor,
+      maxScannedBytes: 10000, maxBytes: 2200 });
+    assert.equal(next.unread, undefined);
+    assert.equal(next.coverage, 'complete');
   });
 
   test(`${kind}: 1000 completed original inputs remain searchable with bounded pages and stable cuts`, async () => {
@@ -360,19 +399,18 @@ test('small UTF-8 ranges fail explicitly instead of returning an endless empty c
   assert.equal(range.nextOffset, 3);
 });
 
-test('rebuildable lexical index reports partial coverage and scans new source identities', async () => {
+test('bounded search reports partial coverage and scans new source identities', async () => {
   const sessions = new InMemorySessionRepository();
   const session = await sessions.create({ binding });
   await sessions.appendInput(session, { runId: 'one', task: 'old alpha constraint' });
   await sessions.appendInput(session, { runId: 'two', task: 'beta constraint' });
   const history = new HistoryReader({ repository: sessions, session });
-  assert.equal((await history.rebuildIndex({ maxScanned: 1 })).coverage, 'partial');
+  assert.equal((await history.search({ maxScanned: 1 })).coverage, 'partial');
   assert.equal((await history.search({ query: 'beta' })).items.length, 1);
-  assert.equal((await history.rebuildIndex()).coverage, 'complete');
+  assert.equal((await history.search()).coverage, 'complete');
   await sessions.appendInput(session, { runId: 'three', task: 'new gamma correction' });
   const fresh = await history.search({ query: 'gamma' });
   assert.equal(fresh.items.length, 1);
-  assert.equal(fresh.index.coverage, 'complete');
   assert.equal(fresh.coverage, 'complete', 'incremental refresh includes the new source');
 });
 

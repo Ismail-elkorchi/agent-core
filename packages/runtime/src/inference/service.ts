@@ -525,6 +525,7 @@ export class InferenceService {
             request,
             profile,
             session,
+            transport: { affinityKey: input.ownerId },
             turnIndex: 0,
             compiled,
             onStreamEvent: async (event) => {

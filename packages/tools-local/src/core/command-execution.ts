@@ -1,6 +1,5 @@
 import { parseJsonObject } from '@agent-core/json';
 import {
-  redactTextPreservingLength,
   type ArtifactRepository,
   type ProtectedArtifactRef,
   type PublicArtifactRef
@@ -12,6 +11,7 @@ import {
   createCommandExecutionReservation,
   createCommandOutputView,
   ownCommandExecutionRequest,
+  renderCommandOutput,
   type CommandExecution,
   type CommandExecutionDescriptor,
   type CommandExecutionOwner,
@@ -22,7 +22,6 @@ import {
   type CommandExecutionStatus,
   type CommandProcess,
   type CommandStartResult,
-  type CommandOutputStream,
   type CommandOutputView,
   type CommandReconciliationResult,
   type CommandUncertaintyAcceptance,
@@ -44,6 +43,10 @@ import {
   type SupervisedProcessTree,
   type SupervisorTerminalState
 } from './process-supervision.js';
+import {
+  decodeProcessOutput, encodeProcessOutputArtifact, processOutputView, takeUtf8Start, takeUtf8End,
+  type CapturedChunk, type LocalOutputStream
+} from './process-output-artifact.js';
 import type { OwnedProcessTree } from './process-tree.js';
 import {
   parseLedgerEntry,
@@ -75,16 +78,6 @@ export interface LocalCommandExecutionOptions {
     processId: string
   ) => void | Promise<void>;
   readonly removeLedgerRecord?: (filePath: string) => Promise<void>;
-}
-type LocalOutputStream = Exclude<CommandOutputStream, 'terminal'>;
-interface CapturedChunk {
-  readonly sequence: number;
-  readonly stream: LocalOutputStream;
-  readonly text: string;
-  readonly start: number;
-  readonly end: number;
-  readonly bytes: number;
-  readonly streamStart: number;
 }
 interface QueuedProgress {
   readonly progress: ToolProgress;
@@ -439,7 +432,7 @@ export class LocalCommandExecution implements CommandExecution {
       const terminal = await this.readTerminalRecord(processId);
       if (terminal) {
         this.assertOwner(terminal, requester);
-        return terminalRecordReport(terminal, afterCursor).result;
+        return this.queryTerminalOutput(terminal, afterCursor, outputTokenBudget * 4);
       }
       const recovered = this.recovered.get(processId);
       if (recovered) {
@@ -460,12 +453,12 @@ export class LocalCommandExecution implements CommandExecution {
     const budgetBytes = outputTokenBudget * 4;
     const available = useCapture
       ? record.capture.chunks()
-      : record.history.filter((chunk) => chunk.end > effectiveCursor);
-    const stdout = view(available, Math.floor(budgetBytes / 4), effectiveCursor,
+      : record.history;
+    const stdout = processOutputView(available, Math.floor(budgetBytes / 4), effectiveCursor,
       record.observed.stdout, 'stdout');
-    const stderr = view(available, Math.floor(budgetBytes / 4), effectiveCursor,
+    const stderr = processOutputView(available, Math.floor(budgetBytes / 4), effectiveCursor,
       record.observed.stderr, 'stderr');
-    const combined = view(available, Math.floor(budgetBytes / 2), effectiveCursor,
+    const combined = processOutputView(available, Math.floor(budgetBytes / 2), effectiveCursor,
       record.cursor);
     const artifacts = record.status === 'running' ? undefined : await this.finalArtifacts(record);
     return Object.freeze({
@@ -490,6 +483,26 @@ export class LocalCommandExecution implements CommandExecution {
         ? { progressDeliveryErrors: record.progressDeliveryErrors }
         : {})
     });
+  }
+
+  private async queryTerminalOutput(
+    terminal: ProcessTerminalRecord, afterCursor: number, budgetBytes: number
+  ): Promise<CommandExecutionResult> {
+    const result = terminalRecordReport(terminal, afterCursor).result;
+    if (afterCursor === terminal.cursorEnd || !terminal.protectedArtifact) return result;
+    try {
+      const output = await decodeProcessOutput(this.options.artifactRepository, terminal);
+      const chunks = output.chunks.map((chunk): CapturedChunk => ({ ...chunk, bytes: chunk.end - chunk.start }));
+      return Object.freeze({
+        ...result, cursorStart: afterCursor, cursorExpired: false,
+        stdout: processOutputView(chunks, Math.floor(budgetBytes / 4), afterCursor, terminal.stdout.observedBytes, 'stdout'),
+        stderr: processOutputView(chunks, Math.floor(budgetBytes / 4), afterCursor, terminal.stderr.observedBytes, 'stderr'),
+        combined: processOutputView(chunks, Math.floor(budgetBytes / 2), afterCursor, terminal.cursorEnd)
+      });
+    } catch (error) {
+      return Object.freeze({ ...result, diagnostic: appendDiagnostic(result.diagnostic,
+        `Retained process output could not be read: ${errorMessage(error)}`) });
+    }
   }
 
   async writeInput(
@@ -906,13 +919,12 @@ export class LocalCommandExecution implements CommandExecution {
 
   private finalArtifacts(record: ManagedProcess): Promise<ProcessArtifacts> {
     record.artifactPromise ??= (async () => {
-      const raw = encodeProcessOutput(record, false);
       let protectedArtifact: ProtectedArtifactRef | undefined;
       let publicArtifact: PublicArtifactRef | undefined;
       try {
         protectedArtifact = await this.options.artifactRepository.storeProtected({
           label: record.id + '-raw-output',
-          content: raw,
+          content: encodeProcessOutput(record),
           mediaType: 'application/json; charset=utf-8',
           description: 'Protected bounded raw process output preserving stdout/stderr order.'
         });
@@ -925,9 +937,10 @@ export class LocalCommandExecution implements CommandExecution {
       try {
         publicArtifact = await this.options.artifactRepository.store({
           label: record.id + '-output',
-          content: encodeProcessOutput(record, true),
-          mediaType: 'application/json; charset=utf-8',
-          description: 'Public redacted bounded process output.'
+          content: Buffer.from(renderCommandOutput(processOutputView(record.capture.chunks(),
+            record.capture.retainedBytes, 0, record.cursor)), 'utf8'),
+          mediaType: 'text/plain; charset=utf-8',
+          description: 'Public redacted bounded process log; omitted source ranges are marked.'
         });
       } catch (error) {
         record.diagnostic = appendDiagnostic(
@@ -1314,34 +1327,15 @@ export class LocalCommandExecution implements CommandExecution {
   }
 }
 
-function encodeProcessOutput(record: ManagedProcess, redact: boolean): Uint8Array {
-  const chunks = record.capture.chunks();
-  const text = chunks.map((chunk) => chunk.text);
-  const selected = redact ? redactPassages(text) : text;
-  return Buffer.from(JSON.stringify({
-    processId: record.id,
-    owner: record.owner,
-    status: record.status,
-    startedAt: new Date(record.startedAt).toISOString(),
-    observedBytes: record.cursor,
-    retainedBytes: record.capture.retainedBytes,
-    omittedBytes: Math.max(0, record.cursor - record.capture.retainedBytes),
-    chunks: chunks.map(({ sequence, stream, streamStart, start, end }, index) => ({
-      sequence, stream, streamStart, start, end, text: selected[index]
+function encodeProcessOutput(record: ManagedProcess): Uint8Array {
+  return encodeProcessOutputArtifact({
+    format: 'agent-core.process-output/1', processId: record.id, owner: record.owner,
+    status: record.terminalStatus ?? 'failed', startedAt: new Date(record.startedAt).toISOString(),
+    observedBytes: record.cursor, retainedBytes: record.capture.retainedBytes,
+    omittedBytes: record.cursor - record.capture.retainedBytes,
+    chunks: record.capture.chunks().map(({ sequence, stream, streamStart, start, end, text }) => ({
+      sequence, stream, streamStart, start, end, text
     }))
-  }) + '\n', 'utf8');
-}
-
-/** Redact before selection so slicing cannot detach a credential from its identifying prefix. */
-function redactPassages(passages: readonly string[]): string[] {
-  const source = Buffer.from(passages.join(''), 'utf8');
-  const redacted = Buffer.from(redactTextPreservingLength(source.toString('latin1')).text, 'latin1');
-  let offset = 0;
-  return passages.map((text) => {
-    const end = offset + Buffer.byteLength(text, 'utf8');
-    const selected = redacted.subarray(offset, end).toString('utf8');
-    offset = end;
-    return selected;
   });
 }
 
@@ -1395,100 +1389,6 @@ class BoundedCapture {
   chunks(): readonly CapturedChunk[] {
     return [...this.head, ...this.tail];
   }
-}
-
-function view(
-  chunks: readonly CapturedChunk[],
-  maxBytes: number,
-  afterCursor: number,
-  observedBytes: number,
-  stream?: LocalOutputStream
-): CommandOutputView {
-  const passages: string[] = [];
-  let end: number | undefined;
-  let start: number | undefined;
-  for (const chunk of chunks) {
-    if (chunk.end <= afterCursor || (stream !== undefined && chunk.stream !== stream)) continue;
-    const text = dropUtf8Bytes(chunk.text, Math.max(0, afterCursor - chunk.start));
-    const bytes = Buffer.byteLength(text, 'utf8');
-    const chunkStart = (stream === undefined ? chunk.start : chunk.streamStart) + chunk.bytes - bytes;
-    start ??= chunkStart;
-    if (end !== chunkStart || passages.length === 0) passages.push('');
-    end = chunkStart + bytes;
-    passages[passages.length - 1] = (passages[passages.length - 1] ?? '') + text;
-  }
-  let segments = redactPassages(passages.filter((text) => text.length > 0));
-  const retained = segments.reduce((bytes, text) => bytes + Buffer.byteLength(text, 'utf8'), 0);
-  let startsAtOutputStart = observedBytes === 0 || start === 0;
-  let endsAtOutputEnd = observedBytes === 0 || end === observedBytes;
-  if (retained > maxBytes) {
-    const head: string[] = [];
-    const tail: string[] = [];
-    let remaining = maxBytes - Math.floor(maxBytes / 3);
-    for (const text of segments) {
-      const selected = takeUtf8Start(text, remaining);
-      if (selected) head.push(selected);
-      remaining -= Buffer.byteLength(selected, 'utf8');
-      if (selected.length !== text.length) break;
-    }
-    remaining = maxBytes - head.reduce((bytes, text) => bytes + Buffer.byteLength(text, 'utf8'), 0);
-    for (const text of [...segments].reverse()) {
-      const selected = takeUtf8End(text, remaining);
-      if (selected) tail.unshift(selected);
-      remaining -= Buffer.byteLength(selected, 'utf8');
-      if (selected.length !== text.length) break;
-    }
-    startsAtOutputStart &&= head.length > 0;
-    endsAtOutputEnd &&= tail.length > 0;
-    segments = [...head, ...tail];
-  }
-  return createCommandOutputView({
-    segments,
-    observedBytes,
-    capturedBytes: segments.reduce((bytes, text) => bytes + Buffer.byteLength(text, 'utf8'), 0),
-    startsAtOutputStart,
-    endsAtOutputEnd
-  });
-}
-
-function takeUtf8Start(value: string, maxBytes: number): string {
-  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
-  let low = 0;
-  let high = value.length;
-  while (low < high) {
-    const middle = Math.ceil((low + high) / 2);
-    if (Buffer.byteLength(value.slice(0, middle), 'utf8') <= maxBytes) low = middle;
-    else high = middle - 1;
-  }
-  if (low > 0 && /[\uD800-\uDBFF]/u.test(value[low - 1] ?? '')) low -= 1;
-  return value.slice(0, low);
-}
-function takeUtf8End(value: string, maxBytes: number): string {
-  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
-  let low = 0;
-  let high = value.length;
-  while (low < high) {
-    const middle = Math.floor((low + high) / 2);
-    if (Buffer.byteLength(value.slice(middle), 'utf8') <= maxBytes) high = middle;
-    else low = middle + 1;
-  }
-  if (/[\uDC00-\uDFFF]/u.test(value[low] ?? '')) low += 1;
-  return value.slice(low);
-}
-function dropUtf8Bytes(value: string, bytes: number): string {
-  if (bytes <= 0) return value;
-  let consumed = 0;
-  for (let index = 0; index < value.length; ) {
-    const code = value.codePointAt(index);
-    if (code === undefined) return '';
-    const character = String.fromCodePoint(code);
-    const size = Buffer.byteLength(character, 'utf8');
-    if (consumed + size > bytes) return value.slice(index);
-    consumed += size;
-    index += character.length;
-    if (consumed === bytes) return value.slice(index);
-  }
-  return '';
 }
 
 function terminalProgress(

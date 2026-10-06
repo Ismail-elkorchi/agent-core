@@ -311,18 +311,18 @@ export async function readSelectedHistorySources(
       limit: 1000,
       maxBytes: 8 * 1024 * 1024 - bytes
     });
-    const unavailable = page.unavailable?.[0];
-    if (unavailable)
+    const unread = page.unread?.[0];
+    if (unread)
       throw new ContextSourceCapacityError(
         cut,
-        unavailable.records
-          ? { unit: 'records', limit: 1000, observedAtLeast: unavailable.records }
+        unread.records
+          ? { unit: 'records', limit: 1000, observedAtLeast: unread.records }
           : {
               unit: 'bytes',
               limit: 8 * 1024 * 1024,
-              observedAtLeast: Math.max(8 * 1024 * 1024 + 1, bytes + unavailable.bytes)
+              observedAtLeast: Math.max(8 * 1024 * 1024 + 1, bytes + unread.bytes)
             },
-        unavailable.source
+        unread.source
       );
     for (const entry of page.entries) append(entry);
     cursor = page.cursor;

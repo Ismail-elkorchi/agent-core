@@ -47,6 +47,7 @@ export interface CodexHttpTransportConfig {
   originator: string;
   statusIntervalMs: number;
   streamIdleTimeoutMs: number;
+  affinityKey: string;
   onResponsePayload?: (payload: OpenAICodexResponsesPayload) => void;
 }
 
@@ -60,7 +61,8 @@ async function fetchCodexResponse(
     const accountId = accountIdFromToken(token);
     const init: RequestInit = {
       method: 'POST',
-      headers: requestHeaders(token.token, accountId, true, config.originator),
+      headers: { ...requestHeaders(token.token, accountId, true, config.originator),
+        'session-id': config.affinityKey },
       body: JSON.stringify(toCodexResponsesRequest(request))
     };
     if (signal) {

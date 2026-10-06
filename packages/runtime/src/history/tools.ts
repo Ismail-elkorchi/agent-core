@@ -1,6 +1,7 @@
 import * as z from 'zod';
-import { parseJsonObject, type JsonValue } from '@agent-core/json';
+import { parseJsonObject } from '@agent-core/json';
 import { defaultToolModelContent, type CompiledToolDefinition } from '@agent-core/tools';
+import { historyItemContent, historySearchContent } from './model-content.js';
 import type { HistoryReader } from './reader.js';
 import { historyCutSchema, historyReadRequestSchema } from './schema.js';
 import { queryShape, scopedTool, scopePath, sourceSchema } from './tool-support.js';
@@ -97,27 +98,7 @@ export function createHistoryTools(options: {
       root: 'history',
       buildModelContent({ observation }) {
         if (observation.kind !== 'result') return defaultToolModelContent(observation);
-        const result = parseJsonObject(observation.output);
-        const { items } = result;
-        const coverage = Object.fromEntries(
-          Object.entries(result).filter(
-            ([key]) => !['items', 'cut', 'indexWatermark', 'index'].includes(key)
-          )
-        );
-        return [
-          { type: 'text', text: JSON.stringify(coverage) },
-          ...(Array.isArray(items) && items.length
-            ? items.flatMap(historyItemContent)
-            : [
-                {
-                  type: 'text' as const,
-                  text:
-                    result.coverage === 'partial'
-                      ? 'No match in the scanned portion. Search coverage is partial; use cursor to continue.'
-                      : 'No matching history.'
-                }
-              ])
-        ];
+        return historySearchContent(parseJsonObject(observation.output));
       },
       async canonicalize(value) {
         const cut = await options.history.capture();
@@ -136,12 +117,4 @@ export function createHistoryTools(options: {
       }
     })
   ]);
-}
-
-function historyItemContent(value: JsonValue | undefined) {
-  const { text, ...source } = parseJsonObject(value);
-  return [
-    { type: 'text' as const, text: JSON.stringify(source) },
-    { type: 'text' as const, text: typeof text === 'string' ? text : JSON.stringify(text) }
-  ];
 }

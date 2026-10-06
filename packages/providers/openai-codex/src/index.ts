@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'node:crypto';
 import {
   type BearerToken,
   type BearerTokenProvider,
@@ -339,12 +340,13 @@ export class OpenAICodexProvider implements ModelProvider {
 
   async *streamHttp(
     request: ModelRequest,
+    affinityKey: string,
     onResponsePayload?: (payload: OpenAICodexResponsesPayload) => void,
     options?: ModelTransportOptions
   ): AsyncIterable<ModelStreamEvent> {
     const compiled = await this.compileRequest(request);
     yield* streamCodexHttp(
-      { ...this.httpTransportConfig(), ...(onResponsePayload ? { onResponsePayload } : {}) },
+      { ...this.httpTransportConfig(affinityKey), ...(onResponsePayload ? { onResponsePayload } : {}) },
       compiled.logicalRequest,
       modelTransportSignal(compiled.logicalRequest, options)
     );
@@ -402,9 +404,10 @@ export class OpenAICodexProvider implements ModelProvider {
     return websocketHeaders(token, accountId, this.originator);
   }
 
-  private httpTransportConfig(): CodexHttpTransportConfig {
+  private httpTransportConfig(affinityKey: string): CodexHttpTransportConfig {
     return {
       providerId: this.id,
+      affinityKey,
       baseUrl: this.baseUrl,
       fetchImpl: this.fetchImpl,
       tokenProvider: this.tokenProvider,
@@ -417,6 +420,8 @@ export class OpenAICodexProvider implements ModelProvider {
 
 class OpenAICodexProviderSession implements ModelProviderSession {
   private webSocket: CodexWebSocket | undefined;
+  private webSocketAffinityKey: string | undefined;
+  private readonly defaultAffinityKey = randomUUID();
   private webSocketFallbackReported = false;
   private lastRequest: Record<string, unknown> | undefined;
   private lastResponse: CodexContinuationResponse | undefined;
@@ -503,6 +508,7 @@ class OpenAICodexProviderSession implements ModelProviderSession {
     let payload: OpenAICodexResponsesPayload | undefined;
     for await (const event of this.provider.streamHttp(
       request,
+      this.affinityKey(options),
       (value) => {
         payload = value;
       },
@@ -525,7 +531,7 @@ class OpenAICodexProviderSession implements ModelProviderSession {
     throwIfAborted(signal);
     const token = await this.provider.tokenForRequest(signal);
     const accountId = this.provider.codexAccountId(token);
-    const socket = await this.ensureWebSocket(token.token, accountId, signal);
+    const socket = await this.ensureWebSocket(token.token, accountId, this.affinityKey(options), signal);
     await this.provider.compileRequest(request);
     const fullRequest = toCodexResponsesRequest(request);
     const assembly = assembleCodexWebSocketRequest(fullRequest, this.lastRequest, this.lastResponse);
@@ -664,12 +670,17 @@ class OpenAICodexProviderSession implements ModelProviderSession {
     };
   }
 
+  private affinityKey(options?: ModelTransportOptions): string {
+    return createHash('sha256').update(options?.affinityKey ?? this.defaultAffinityKey).digest('hex');
+  }
+
   private async ensureWebSocket(
     token: string,
     accountId: string,
+    affinityKey: string,
     signal: AbortSignal | undefined
   ): Promise<CodexWebSocket> {
-    if (this.webSocket?.readyState === 1) {
+    if (this.webSocket?.readyState === 1 && this.webSocketAffinityKey === affinityKey) {
       return this.webSocket;
     }
     const hadSocket = this.webSocket !== undefined;
@@ -678,13 +689,14 @@ class OpenAICodexProviderSession implements ModelProviderSession {
     if (hadSocket) {
       this.resetContinuation('websocket_reconnect');
     }
-    const headers = this.provider.headersForWebSocket(token, accountId);
+    const headers = { ...this.provider.headersForWebSocket(token, accountId), 'session-id': affinityKey };
     const socket = this.provider.createWebSocket(this.provider.websocketUrl(), {
       headers,
       ...(signal ? { signal } : {})
     });
     await waitForWebSocketOpen(socket, signal);
     this.webSocket = socket;
+    this.webSocketAffinityKey = affinityKey;
     return socket;
   }
 

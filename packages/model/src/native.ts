@@ -70,6 +70,8 @@ export interface ModelNativeResponseBoundary {
 }
 export interface ModelTransportOptions {
   readonly signal?: AbortSignal;
+  /** Stable host-owned scope for provider cache routing; never model-visible context. */
+  readonly affinityKey?: string;
   readonly native?: {
     /** Persist and reserve before returning. Throwing prevents transport submission. */
     readonly admit: (dispatch: ModelNativeDispatch) => Promise<void>;

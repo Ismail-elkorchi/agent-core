@@ -374,10 +374,9 @@ test('bounded output retains the true start and true tail and stores an artifact
   assert.equal(result.output.combined.startsAtOutputStart, true);
   assert.equal(result.output.combined.endsAtOutputEnd, true);
   assert.match(renderCommandOutput(result.output.combined), /START-[\s\S]*output omitted[\s\S]*-END/);
-  const stored = JSON.parse(Buffer.from(await artifacts.readVerified(result.output.artifact)).toString());
-  assert.equal(stored.chunks[0].start, 0);
-  assert.equal(stored.chunks.at(-1).end, stored.observedBytes);
-  assert.ok(stored.chunks.some((chunk, index) => index > 0 && chunk.start > stored.chunks[index - 1].end));
+  const stored = Buffer.from(await artifacts.readVerified(result.output.artifact)).toString();
+  assert.match(stored, /START-[\s\S]*output omitted[\s\S]*-END/);
+  assert.equal(result.output.artifact.mediaType, 'text/plain; charset=utf-8');
 });
 
 async function waitForMissingProcess(pid) {
@@ -639,16 +638,13 @@ test('public process redaction detects a secret split across output chunks', asy
   });
   while (result.status === 'running')
     result = await manager.query(result.processId, 100, 50, result.cursorEnd, owner);
-  const publicPayload = JSON.parse(
-    new TextDecoder().decode(await artifacts.readVerified(result.artifact))
-  );
-  const publicOutput = publicPayload.chunks.map((chunk) => chunk.text).join('');
+  const publicOutput = new TextDecoder().decode(await artifacts.readVerified(result.artifact));
   assert.doesNotMatch(publicOutput, new RegExp(secret, 'u'));
   assert.match(publicOutput, /REDACTED/u);
   await manager.acknowledgeTerminalReport(result.processId);
 });
 
-test('public process artifacts preserve output larger than the strict JSON string boundary', async () => {
+test('public process logs preserve large original output without serialization metadata', async () => {
   const { root, artifacts, manager } = await processContext({
     maxCapturedBytes: 5_000_000,
     maxTotalCapturedBytes: 5_000_000
@@ -672,13 +668,7 @@ test('public process artifacts preserve output larger than the strict JSON strin
     result = await manager.query(result.processId, 100, 100, result.cursorEnd, owner);
   assert.equal(result.artifact.visibility, 'public');
   assert.ok(result.artifact.size > 4_000_000);
-  const publicPayload = JSON.parse(
-    new TextDecoder().decode(await artifacts.readVerified(result.artifact))
-  );
-  assert.equal(
-    publicPayload.chunks.reduce((total, chunk) => total + Buffer.byteLength(chunk.text, 'utf8'), 0),
-    outputBytes
-  );
+  assert.equal((await artifacts.readVerified(result.artifact)).byteLength, outputBytes);
   await manager.acknowledgeTerminalReport(result.processId);
 });
 
@@ -1144,8 +1134,8 @@ test('redaction precedes output selection and cannot expose a detached credentia
   assert.equal(result.kind, 'result', result.summary);
   assert.doesNotMatch(renderCommandOutput(result.output.combined), /sensitive-suffix|a{16}/);
   assert.match(renderCommandOutput(result.output.combined), /output omitted/);
-  const artifact = JSON.parse(Buffer.from(await artifacts.readVerified(result.output.artifact)).toString());
-  assert.doesNotMatch(artifact.chunks.map(chunk => chunk.text).join(''), /sensitive-suffix|a{16}/);
+  const artifact = Buffer.from(await artifacts.readVerified(result.output.artifact)).toString();
+  assert.doesNotMatch(artifact, /sensitive-suffix|a{16}/);
 });
 
 test('authenticated process settlement is independent of incompatible output metadata', async (t) => {
@@ -1283,6 +1273,13 @@ test('acknowledged terminal processes survive buffer expiration and restart with
   assert.deepEqual(terminal.owner, original.owner);
   assert.deepEqual(terminal.artifact, original.artifact);
   assert.deepEqual(terminal.combined.segments, []);
+  const retained = await manager.query(original.processId, 100, 0, 0, invocation);
+  assert.equal(retained.status, 'exited');
+  assert.equal(retained.exitCode, 0);
+  assert.equal(retained.combined.segments.join(''), 'original');
+  assert.equal(retained.cursorExpired, false);
+  await assert.rejects(manager.query(original.processId, 100, 0, 0, { ...invocation, ownerId: 'foreign' }), /another resource owner/);
+  await assert.rejects(manager.query(original.processId, 100, 0, 999, invocation), /Invalid process output cursor/);
   assert.equal((await manager.terminate(original.processId, invocation)).status, 'exited');
   await assert.rejects(manager.terminate(original.processId, { ...invocation, ownerId: 'foreign' }), /another resource owner/);
   const next = await startCommand(manager, request, { awaitTerminal: true });
@@ -1293,8 +1290,54 @@ test('acknowledged terminal processes survive buffer expiration and restart with
   const recovered = await reopened.terminate(original.processId, invocation);
   assert.equal(recovered.status, 'exited');
   assert.deepEqual(recovered.artifact, original.artifact);
+  const readAfterRestart = await reopened.query(original.processId, 100, 0, 3, invocation);
+  assert.equal(readAfterRestart.combined.segments.join(''), 'ginal');
+  const bounded = await reopened.query(original.processId, 1, 0, 0, invocation);
+  assert(bounded.combined.capturedBytes <= 2);
+  assert(bounded.stdout.capturedBytes + bounded.stderr.capturedBytes + bounded.combined.capturedBytes <= 4);
   assert.equal(reports.length, 2, 'querying terminal truth does not republish completion');
   assert((await readdir(options.ledgerDirectory)).every(name => name.endsWith('.terminal.json')));
+});
+
+test('late output recovery preserves redaction, UTF-8 ranges and terminal truth when storage fails', async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'process-late-output-'));
+  const files = testRootedFileAuthority(root);
+  const artifacts = new InMemoryArtifactRepository();
+  const manager = new LocalCommandExecution({ artifactRepository: artifacts, rootedFileAuthority: files,
+    ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process, completedRetentionMs: 10,
+    maxCapturedBytes: 512, tailBytes: 128 });
+  t.after(async () => { await manager.close(); files.close(); await rm(root, { recursive: true, force: true }); });
+  const source = 'API_TOKEN=private-secret\n' + '改😀'.repeat(400) + '-TAIL';
+  const result = await startCommand(manager, {
+    command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`process.stdout.write(${JSON.stringify(source)})`)}`,
+    rootedDirectory: '.', pty: false, timeoutMs: 5_000, yieldMs: 0, outputTokenBudget: 100, owner: invocation
+  }, { awaitTerminal: true });
+  const suffixCursor = Buffer.byteLength('API_TOKEN=');
+  const liveSuffix = await manager.query(result.processId, 1000, 0, suffixCursor, invocation);
+  assert.doesNotMatch(renderCommandOutput(liveSuffix.stdout), /private-secret/);
+  assert.doesNotMatch(renderCommandOutput(liveSuffix.combined), /private-secret/);
+  await manager.acknowledgeTerminalReport(result.processId);
+  await new Promise(resolve => setTimeout(resolve, 50));
+  const retainedSuffix = await manager.query(result.processId, 1000, 0, suffixCursor, invocation);
+  assert.doesNotMatch(renderCommandOutput(retainedSuffix.stdout), /private-secret/);
+  assert.doesNotMatch(renderCommandOutput(retainedSuffix.combined), /private-secret/);
+  const retained = await manager.query(result.processId, 1000, 0, 0, invocation);
+  assert.equal(retained.status, 'exited');
+  assert.equal(retained.exitCode, 0);
+  const output = renderCommandOutput(retained.combined);
+  assert.doesNotMatch(output, /private-secret|\uFFFD/);
+  assert.match(output, /REDACTED[\s\S]*output omitted[\s\S]*-TAIL/);
+  assert(retained.combined.omittedBytes > 0);
+  const verifiedRead = artifacts.readVerified.bind(artifacts);
+  artifacts.readVerified = async ref => {
+    if (ref.visibility === 'protected') throw new Error('storage unavailable');
+    return verifiedRead(ref);
+  };
+  const unavailable = await manager.query(result.processId, 100, 0, 0, invocation);
+  assert.equal(unavailable.status, 'exited');
+  assert.equal(unavailable.exitCode, 0);
+  assert.deepEqual(unavailable.artifact, retained.artifact);
+  assert.match(unavailable.diagnostic, /Retained process output.*storage unavailable/);
 });
 
 test('unavailable process controls return known failures rather than uncertain effects', async (t) => {

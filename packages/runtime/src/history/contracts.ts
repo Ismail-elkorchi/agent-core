@@ -45,24 +45,20 @@ export interface HistoryItem {
 }
 export interface HistorySearchResult {
   readonly scannedBytes: number;
-  readonly unavailable?: readonly {
-    readonly source: HistorySourceRef;
-    readonly bytes: number;
-    readonly records?: number;
-  }[];
+  readonly unread?: readonly HistoryUnreadSource[];
   readonly items: readonly HistoryItem[];
   readonly cut: HistorySourceCut;
-  readonly indexWatermark: HistorySourceCut;
-  readonly index?: {
-    readonly sources: number;
-    readonly bytes: number;
-    readonly terms: number;
-    readonly coverage: 'complete' | 'partial';
-  };
   readonly coverage: 'complete' | 'partial';
   readonly scanned: number;
   readonly bytes: number;
   readonly cursor?: string | undefined;
+}
+/** A source was not inspected within this scan's allowance; it is not missing. */
+export interface HistoryUnreadSource {
+  readonly source: HistorySourceRef;
+  readonly reason: 'source_byte_limit' | 'source_record_limit';
+  readonly bytes: number;
+  readonly records?: number;
 }
 export interface HistoryReadRequest {
   readonly maxSourceBytes?: number | undefined;
@@ -120,9 +116,5 @@ export interface HistoryEntryPage {
   readonly scanned: number;
   readonly bytes: number;
   readonly cursor?: string;
-  readonly unavailable?: readonly {
-    readonly source: HistorySourceRef;
-    readonly bytes: number;
-    readonly records?: number;
-  }[];
+  readonly unread?: readonly HistoryUnreadSource[];
 }

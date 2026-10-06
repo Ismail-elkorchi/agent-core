@@ -1,5 +1,9 @@
 import { parseJsonObject } from '@agent-core/json';
-import { encodeToolFailureOutput, ToolInputError } from '@agent-core/tools';
+import {
+  encodeToolFailureOutput,
+  serializeToolModelContent,
+  ToolInputError
+} from '@agent-core/tools';
 import {
   hashJson,
   type ArtifactRepository,
@@ -26,7 +30,7 @@ import type {
   HistoryLedgerHead
 } from './contracts.js';
 import { publicEventEntry, mergeMirror, entryIdentity } from './ledger.js';
-import { LiteralHistoryIndex } from './literal-index.js';
+import { historySearchContent } from './model-content.js';
 import { historyCutSchema, sourceSchema } from './schema.js';
 import { resolveToolObservation } from '../orchestration/observation-source.js';
 import { assistantResponseKey, toolEventKey } from '../run/contracts.js';
@@ -40,7 +44,6 @@ const MAX_RESULTS = 100;
 
 /** Host-bound source access. Routing metadata and immutable ledger boundaries precede body reads. */
 export class HistoryReader {
-  private readonly lexicalIndex = new LiteralHistoryIndex();
   constructor(
     private readonly options: {
       readonly repository: SessionRepository;
@@ -52,6 +55,14 @@ export class HistoryReader {
 
   async capture(): Promise<HistorySourceCut> {
     const snapshot = await this.options.repository.sourceSnapshot(this.options.session);
+    const boundary = {
+      format: 'agent-core.history/1' as const,
+      sessionId: this.options.session.id,
+      branchId: snapshot.branchId,
+      throughEntryId: snapshot.boundary.leafId,
+      sourceRevision: snapshot.sourceRevision
+    };
+    if (!this.options.events) return Object.freeze({ ...boundary, ledgerCoverage: 'session' });
     const finalized = finalizedRuns(snapshot);
     const inherited = inheritedHeads(snapshot);
     const heads: HistoryLedgerHead[] = [];
@@ -63,39 +74,24 @@ export class HistoryReader {
         heads.push(pinned);
         continue;
       }
-      if (this.options.events) {
-        if (
-          finalized.has(runId) &&
-          (await this.options.events.latestReferenceOfType(runId, 'run.ended'))
-        )
-          continue;
-        const tail = await this.options.events.tail(runId);
-        heads.push(
-          Object.freeze({
-            runId,
-            sequence: tail.sequence,
-            ...(tail.hash ? { hash: tail.hash } : {})
-          })
-        );
-      } else {
-        const sources = snapshot.entries.filter((entry) => entry.source?.runId === runId);
-        const last = sources.at(-1)?.source;
-        heads.push(
-          Object.freeze({
-            runId,
-            sequence: last?.sequence ?? -1,
-            ...(last ? { hash: last.hash } : {})
-          })
-        );
-      }
+      if (
+        finalized.has(runId) &&
+        (await this.options.events.latestReferenceOfType(runId, 'run.ended'))
+      )
+        continue;
+      const tail = await this.options.events.tail(runId);
+      heads.push(
+        Object.freeze({
+          runId,
+          sequence: tail.sequence,
+          ...(tail.hash ? { hash: tail.hash } : {})
+        })
+      );
     }
+
     return Object.freeze({
-      format: 'agent-core.history/1',
-      sessionId: this.options.session.id,
-      branchId: snapshot.branchId,
-      throughEntryId: snapshot.boundary.leafId,
-      sourceRevision: snapshot.sourceRevision,
-      ledgerCoverage: this.options.events ? 'authoritative' : 'session',
+      ...boundary,
+      ledgerCoverage: 'authoritative',
       ledgerHeads: Object.freeze(heads)
     });
   }
@@ -144,7 +140,9 @@ export class HistoryReader {
       const events = this.options.events;
       const keys = [
         assistantResponseKey(invocation.runId, invocation),
-        ...['started', 'ended'].map((stage) => toolEventKey(invocation.runId, invocation, stage))
+        ...['started', 'ended'].map((stage) =>
+          toolEventKey(invocation.runId, invocation, stage)
+        )
       ];
       return Promise.all(
         keys.map(async (key) => {
@@ -195,7 +193,10 @@ export class HistoryReader {
     const snapshot =
       cut.throughEntryId === current.boundary.leafId
         ? current
-        : await this.options.repository.sourceSnapshot(this.options.session, cut.throughEntryId);
+        : await this.options.repository.sourceSnapshot(
+            this.options.session,
+            cut.throughEntryId
+          );
     const runs = metadataIndex(snapshot).runs;
     const seen = new Set<string>();
     for (const head of cut.ledgerHeads ?? []) {
@@ -223,7 +224,8 @@ export class HistoryReader {
     snapshot: SessionSourceSnapshot
   ): Promise<HistoryLedgerHead> {
     const explicit =
-      cut.ledgerHeads?.find((head) => head.runId === runId) ?? inheritedHeads(snapshot).get(runId);
+      cut.ledgerHeads?.find((head) => head.runId === runId) ??
+      inheritedHeads(snapshot).get(runId);
     if (explicit) return explicit;
     if (finalizedRuns(snapshot).has(runId) && this.options.events) {
       const ended = await this.options.events.latestReferenceOfType(runId, 'run.ended');
@@ -318,7 +320,10 @@ export class HistoryReader {
     cut ??= await this.capture();
     const snapshot = await this.snapshot(cut);
     if (source.event && this.options.events && cut.ledgerCoverage === 'authoritative') {
-      if (source.entryId !== `event:${source.event.eventId}` || source.sha256 !== source.event.hash)
+      if (
+        source.entryId !== `event:${source.event.eventId}` ||
+        source.sha256 !== source.event.hash
+      )
         throw new Error('History source identity mismatch.');
       if (!metadataIndex(snapshot).runs.has(source.event.runId)) return undefined;
       const head = await this.head(source.event.runId, cut, snapshot);
@@ -452,7 +457,10 @@ export class HistoryReader {
             page.oversized.bytes + bytes
           );
         const content = page.records[0];
-        if (content?.event.type !== 'observation.record.created' || content.hash !== reference.hash)
+        if (
+          content?.event.type !== 'observation.record.created' ||
+          content.hash !== reference.hash
+        )
           throw new Error('Observation content reference has an incompatible source.');
         const representation = publicEventEntry(content, null, new Map());
         if (!representation || entryIdentity(representation) !== entryIdentity(entry))
@@ -481,7 +489,10 @@ export class HistoryReader {
   async page(request: HistoryEntryPageRequest = {}): Promise<HistoryEntryPage> {
     const limit = bound(request.limit, 100, MAX_SCANNED, 'limit');
     const maxBytes = bound(request.maxBytes, MAX_SOURCE_BYTES, MAX_SOURCE_BYTES, 'maxBytes');
-    const fingerprint = hashJson({ after: request.after ?? null, filter: request.filter ?? null });
+    const fingerprint = hashJson({
+      after: request.after ?? null,
+      filter: request.filter ?? null
+    });
     const cursor = request.cursor ? decodeEntryCursor(request.cursor) : undefined;
     if (cursor && cursor.fingerprint !== fingerprint)
       throw new Error('History source cursor filter mismatch.');
@@ -516,7 +527,7 @@ export class HistoryReader {
     let scanned = 0,
       bytes = 0;
     const entries: SessionBranchEntry[] = [];
-    const unavailable: NonNullable<HistoryEntryPage['unavailable']>[number][] = [];
+    const unread: NonNullable<HistoryEntryPage['unread']>[number][] = [];
     while (at < snapshot.entries.length && scanned < limit && bytes < maxBytes) {
       const metadata = snapshot.entries[at];
       if (!metadata) break;
@@ -529,7 +540,8 @@ export class HistoryReader {
         scanned++;
         continue;
       }
-      const authoritative = this.options.events && cut.ledgerCoverage === 'authoritative' && runId;
+      const authoritative =
+        this.options.events && cut.ledgerCoverage === 'authoritative' && runId;
       if (authoritative && metadata.type === 'input' && sequence !== undefined) {
         const head = await this.head(runId, cut, snapshot);
         const afterHead =
@@ -556,8 +568,9 @@ export class HistoryReader {
           if (record.event.type === 'observation.record.created') continue;
           try {
             const raw = publicEventEntry(record, null, new Map());
+            if (!raw || !matchesMetadata(raw, request.filter)) continue;
             const original =
-              request.enrich === false && request.originals && raw
+              request.enrich === false && request.originals
                 ? await this.originalEntry(raw, maxBytes - bytes)
                 : undefined;
             const joined =
@@ -573,18 +586,28 @@ export class HistoryReader {
                   );
             bytes += joined.bytes;
             scanned += joined.scanned;
-            if (joined.entry && matches(joined.entry, request.filter)) entries.push(joined.entry);
+            if (joined.entry && matches(joined.entry, request.filter))
+              entries.push(joined.entry);
           } catch (error) {
             if (error instanceof HistorySourceWorkLimitError) {
               bytes += error.bytes;
               scanned += error.scanned;
               if (entries.length) pausedSequence = record.sequence - 1;
               else
-                unavailable.push({ source: error.source, bytes: error.bytes, records: limit + 1 });
+                unread.push({
+                  source: error.source,
+                  reason: 'source_record_limit',
+                  bytes: error.bytes,
+                  records: limit + 1
+                });
               break;
             }
             if (!(error instanceof HistorySourceTooLargeError)) throw error;
-            unavailable.push({ source: error.source, bytes: error.bytes });
+            unread.push({
+              source: error.source,
+              reason: 'source_byte_limit',
+              bytes: error.bytes
+            });
           }
         }
         sequence = pausedSequence ?? page.nextSequence;
@@ -595,7 +618,7 @@ export class HistoryReader {
             sha256: page.oversized.reference.hash,
             event: page.oversized.reference
           };
-          unavailable.push({ source, bytes: page.oversized.bytes });
+          unread.push({ source, reason: 'source_byte_limit', bytes: page.oversized.bytes });
           sequence = page.oversized.reference.sequence;
           scanned++;
         }
@@ -605,7 +628,7 @@ export class HistoryReader {
         }
         if (
           pausedSequence !== undefined ||
-          unavailable.length ||
+          unread.length ||
           (page.scanned === 0 && !page.complete)
         )
           break;
@@ -626,8 +649,9 @@ export class HistoryReader {
       if (oldIds.has(metadata.entryId) || !metadataMatches(metadata, request.filter)) continue;
       if (metadata.bytes > maxBytes - bytes) {
         if (metadata.bytes > maxBytes)
-          unavailable.push({
+          unread.push({
             source: metadataSource(cut.sessionId, metadata),
+            reason: 'source_byte_limit',
             bytes: metadata.bytes
           });
         else {
@@ -647,8 +671,8 @@ export class HistoryReader {
       cut,
       scanned,
       bytes,
-      coverage: complete && unavailable.length === 0 ? 'complete' : 'partial',
-      ...(unavailable.length ? { unavailable: Object.freeze(unavailable) } : {}),
+      coverage: complete && unread.length === 0 ? 'complete' : 'partial',
+      ...(unread.length ? { unread: Object.freeze(unread) } : {}),
       ...(!complete
         ? {
             cursor: encodeEntryCursor({
@@ -788,7 +812,10 @@ export class HistoryReader {
     );
     if ((request.query?.length ?? 0) > 4096)
       throw new Error('History query exceeds 4096 characters.');
-    const queryFingerprint = hashJson({ query: request.query ?? '', filter: request.filter ?? {} });
+    const queryFingerprint = hashJson({
+      query: request.query ?? '',
+      filter: request.filter ?? {}
+    });
     const cursor = request.cursor ? decodeCursor(request.cursor) : undefined;
     if (cursor && cursor.queryFingerprint !== queryFingerprint)
       throw new Error('History cursor query mismatch.');
@@ -797,11 +824,36 @@ export class HistoryReader {
     const cut = cursor?.cut ?? request.cut ?? (await this.capture());
     let position = cursor?.position;
     let scanned = 0,
-      scannedBytes = 0,
-      bytes = 0;
+      scannedBytes = 0;
     const items: HistoryItem[] = [];
-    const unavailableSources: NonNullable<HistorySearchResult['unavailable']>[number][] = [];
+    const unread: NonNullable<HistorySearchResult['unread']>[number][] = [];
     let complete = false;
+    const result = (): HistorySearchResult => ({
+      items,
+      cut,
+      scanned,
+      scannedBytes,
+      bytes: 0,
+      coverage: complete && !unread.length ? 'complete' : 'partial',
+      ...(unread.length ? { unread } : {}),
+      ...(!complete
+        ? { cursor: encodeCursor({ cut, ...(position ? { position } : {}), queryFingerprint }) }
+        : {})
+    });
+    const presentationBytes = () =>
+      Buffer.byteLength(
+        serializeToolModelContent(historySearchContent(parseJsonObject(result())))
+      );
+    const fit = (): boolean => {
+      const excess = presentationBytes() - maxBytes;
+      if (excess <= 0) return true;
+      const last = items.at(-1);
+      if (!last || Buffer.byteLength(last.text) < excess) return false;
+      const remaining = Buffer.byteLength(last.text) - excess;
+      const text = remaining < 4 ? '' : textRange(last.text, 0, remaining).text;
+      items[items.length - 1] = Object.freeze({ ...last, text, truncated: true });
+      return presentationBytes() <= maxBytes;
+    };
     while (scanned < maxScanned && scannedBytes < maxScannedBytes && items.length < limit) {
       const prior = position;
       const page = await this.page({
@@ -816,10 +868,11 @@ export class HistoryReader {
       scanned += page.scanned;
       scannedBytes += page.bytes;
       position = page.cursor;
-      if (page.unavailable) unavailableSources.push(...page.unavailable);
+      complete = !page.cursor;
+      if (page.unread) unread.push(...page.unread);
+      const priorCount = items.length;
       for (const entry of page.entries) {
         const source = sourceRef(cut.sessionId, entry);
-        const key = `${source.entryId}:${source.sha256}`;
         const stateRef =
           entry.type === 'working_state'
             ? entry.contentRef
@@ -827,91 +880,55 @@ export class HistoryReader {
               ? entry.workingState?.contentRef
               : undefined;
         if (stateRef && stateRef.size > maxScannedBytes - scannedBytes) {
-          unavailableSources.push({ source, bytes: stateRef.size });
-          continue;
+          unread.push({ source, reason: 'source_byte_limit', bytes: stateRef.size });
+          break;
         }
-        const fullText =
-          this.lexicalIndex.text(key) ??
-          (stateRef
-            ? (await this.workingStateRange(stateRef, 0, Math.max(1, stateRef.size))).text
-            : publicText(entry));
+        const fullText = stateRef
+          ? (await this.workingStateRange(stateRef, 0, Math.max(1, stateRef.size))).text
+          : publicText(entry);
         if (stateRef) scannedBytes += stateRef.size;
-        this.lexicalIndex.add(key, fullText);
         const match = request.query ? fullText.indexOf(request.query) : 0;
         if (match < 0) continue;
-        const room = maxBytes - bytes;
-        const metadata = historyItem(cut.sessionId, entry, 0);
         const excerpt = textRange(
           fullText,
           Buffer.byteLength(fullText.slice(0, Math.max(0, match - 128))),
           16 * 1024
         );
-        const text = jsonStringPrefix(
-          excerpt.text,
-          room - Buffer.byteLength(JSON.stringify({ ...metadata, truncated: false }))
+        items.push(
+          Object.freeze({
+            ...historyItem(cut.sessionId, entry, 0),
+            text: excerpt.text,
+            truncated: excerpt.offset > 0 || excerpt.nextOffset < excerpt.totalBytes
+          })
         );
-        const item = Object.freeze({
-          ...metadata,
-          text,
-          truncated: excerpt.offset > 0 || text.length < fullText.length
-        });
-        const size = Buffer.byteLength(JSON.stringify(item));
-        if (size > room) {
-          if (!items.length)
-            throw new ToolInputError('History result byte budget cannot fit one source reference.', {
-              maxBytes,
-              requiredBytes: size
-            });
+      }
+      if (!fit()) {
+        if (items.length > priorCount && priorCount > 0) {
+          items.pop();
           position = prior;
-          break;
+          complete = false;
+          if (fit()) break;
         }
-        items.push(item);
-        bytes += size;
+        throw new ToolInputError(
+          'History result byte budget cannot fit source references and coverage.',
+          {
+            maxBytes,
+            requiredBytes: presentationBytes()
+          }
+        );
       }
-      if (position === prior && page.entries.length > 0) break;
-      if (!page.cursor) {
-        complete = true;
-        break;
-      }
+      if (unread.length || complete || position === prior) break;
     }
+    if (!fit())
+      throw new ToolInputError('History result byte budget cannot fit coverage.', {
+        maxBytes,
+        requiredBytes: presentationBytes()
+      });
     return Object.freeze({
+      ...result(),
       items: Object.freeze(items),
-      cut,
-      indexWatermark: cut,
-      scanned,
-      scannedBytes,
-      bytes,
-      coverage: complete && unavailableSources.length === 0 ? 'complete' : 'partial',
-      index: Object.freeze({
-        ...this.lexicalIndex.inspect(),
-        coverage: complete ? 'complete' : 'partial'
-      }),
-      ...(unavailableSources.length ? { unavailable: Object.freeze(unavailableSources) } : {}),
-      ...(!complete
-        ? { cursor: encodeCursor({ cut, ...(position ? { position } : {}), queryFingerprint }) }
-        : {})
-    });
-  }
-
-  async rebuildIndex(
-    options: {
-      readonly maxScanned?: number;
-      readonly cursor?: string;
-      readonly signal?: AbortSignal;
-    } = {}
-  ) {
-    options.signal?.throwIfAborted();
-    const result = await this.search({
-      maxScanned: options.maxScanned,
-      cursor: options.cursor,
-      limit: MAX_RESULTS
-    });
-    options.signal?.throwIfAborted();
-    return Object.freeze({
-      ...this.lexicalIndex.inspect(),
-      cut: result.cut,
-      coverage: result.coverage,
-      ...(result.cursor ? { cursor: result.cursor } : {})
+      ...(unread.length ? { unread: Object.freeze(unread) } : {}),
+      bytes: presentationBytes()
     });
   }
 }
@@ -927,7 +944,10 @@ export function sourceRef(sessionId: string, entry: SessionBranchEntry): History
     sha256:
       entry.source?.hash ??
       hashJson(
-        parseJsonObject(entry, { maxStringBytes: 8 * 1024 * 1024, maxTotalBytes: 16 * 1024 * 1024 })
+        parseJsonObject(entry, {
+          maxStringBytes: 8 * 1024 * 1024,
+          maxTotalBytes: 16 * 1024 * 1024
+        })
       )
   });
   const cache = sourceReferences.get(entry) ?? new Map<string, HistorySourceRef>();
@@ -944,7 +964,11 @@ export function historyRole(entry: SessionBranchEntry): HistoryItem['role'] {
         ? 'tool'
         : 'control';
 }
-function historyItem(sessionId: string, entry: SessionBranchEntry, maxBytes: number): HistoryItem {
+function historyItem(
+  sessionId: string,
+  entry: SessionBranchEntry,
+  maxBytes: number
+): HistoryItem {
   const text = publicText(entry);
   const range = textRange(text, 0, maxBytes);
   return Object.freeze({
@@ -964,18 +988,6 @@ function historyItem(sessionId: string, entry: SessionBranchEntry, maxBytes: num
   });
 }
 
-/** Bound encoded JSON bytes while retaining original text and whole Unicode code points. */
-function jsonStringPrefix(text: string, maxBytes: number): string {
-  let bytes = 0;
-  let end = 0;
-  for (const character of text) {
-    const size = Buffer.byteLength(JSON.stringify(character)) - 2;
-    if (bytes + size > maxBytes) break;
-    bytes += size;
-    end += character.length;
-  }
-  return text.slice(0, end);
-}
 function publicText(entry: SessionBranchEntry): string {
   switch (entry.type) {
     case 'input':
@@ -993,7 +1005,9 @@ function publicText(entry: SessionBranchEntry): string {
     case 'observation':
       return JSON.stringify({
         kind: entry.kind,
-        ...(entry.originalUnavailable ? { originalUnavailable: entry.originalUnavailable } : {}),
+        ...(entry.originalUnavailable
+          ? { originalUnavailable: entry.originalUnavailable }
+          : {}),
         summary: entry.summary,
         output: entry.output,
         ...(entry.originalArtifact ? { originalArtifact: entry.originalArtifact } : {}),
@@ -1023,7 +1037,7 @@ function publicText(entry: SessionBranchEntry): string {
       });
   }
 }
-function matches(entry: SessionBranchEntry, filter?: HistoryFilter): boolean {
+function matchesMetadata(entry: SessionBranchEntry, filter?: HistoryFilter): boolean {
   if (!filter) return true;
   if (filter.sourceType && entry.type !== filter.sourceType) return false;
   if (filter.role && historyRole(entry) !== filter.role) return false;
@@ -1039,8 +1053,12 @@ function matches(entry: SessionBranchEntry, filter?: HistoryFilter): boolean {
       entry.call.name !== filter.toolName)
   )
     return false;
+  return true;
+}
+function matches(entry: SessionBranchEntry, filter?: HistoryFilter): boolean {
+  if (!matchesMetadata(entry, filter)) return false;
   if (
-    filter.resource &&
+    filter?.resource &&
     (entry.type !== 'observation' ||
       !entry.artifacts?.some(
         (ref) => ref.visibility === 'public' && ref.artifactId === filter.resource
@@ -1178,7 +1196,9 @@ const inheritedCache = new WeakMap<
   readonly SessionSourceMetadata[],
   ReadonlyMap<string, HistoryLedgerHead>
 >();
-function inheritedHeads(snapshot: SessionSourceSnapshot): ReadonlyMap<string, HistoryLedgerHead> {
+function inheritedHeads(
+  snapshot: SessionSourceSnapshot
+): ReadonlyMap<string, HistoryLedgerHead> {
   const cached = inheritedCache.get(snapshot.entries);
   if (cached) return cached;
   const heads = new Map<string, HistoryLedgerHead>();

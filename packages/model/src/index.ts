@@ -506,8 +506,8 @@ export interface ModelProvider {
   listModels?(options?: ModelDiscoveryOptions): Promise<readonly ModelCatalogEntry[]>;
   describeModel(model: string): Promise<ModelProfile>;
   createSession?(): ModelProviderSession;
-  complete(request: ModelRequest): Promise<ModelResponse>;
-  stream?(request: ModelRequest): AsyncIterable<ModelStreamEvent>;
+  complete(request: ModelRequest, options?: ModelTransportOptions): Promise<ModelResponse>;
+  stream?(request: ModelRequest, options?: ModelTransportOptions): AsyncIterable<ModelStreamEvent>;
   /** Recovery facts the provider can prove for this exact request. Absence means unknown. */
   requestRecovery?(request: ModelRequest): EffectRecoveryCapability;
 }
@@ -527,8 +527,8 @@ export interface ModelProviderSession {
   ): AsyncIterable<ModelStreamEvent>;
   steer?(submission: ModelSteeringSubmission): Promise<ModelSteeringDelivery>;
   steeringStatus?(deliveryId: string): Promise<ModelSteeringDelivery>;
-  complete(request: ModelRequest): Promise<ModelResponse>;
-  stream?(request: ModelRequest): AsyncIterable<ModelStreamEvent>;
+  complete(request: ModelRequest, options?: ModelTransportOptions): Promise<ModelResponse>;
+  stream?(request: ModelRequest, options?: ModelTransportOptions): AsyncIterable<ModelStreamEvent>;
   restoreProviderState?(state: ProviderContextState): void;
   resetContinuation?(reason: string): void;
   close?(): Promise<void>;

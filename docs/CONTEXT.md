@@ -1,7 +1,7 @@
 # Composing persistent context
 
 Applications choose the instructions, provider, tools, repositories, and resource
-policy. Core supplies the history, note, transition, and inference contracts. None
+policy. Core supplies the history, working-state, transition, and inference contracts. None
 of these services requires a workspace, a document, a planner, or a verification
 pass. The minimal compositions in `tests/context-neutrality.test.js` exercise
 conversation, structured classification, and read-only monitoring.
@@ -18,13 +18,13 @@ never loads transcript bodies. `resolve(source, cut)` validates an exact source'
 identity and branch membership. `read()` returns its bounded UTF-8 range, requested
 neighbors, and explicit unavailable/oversized results. `search()` binds its cursor
 to the branch, cut, query and filters. `maxScanned` and `maxScannedBytes` bound work
-before unrelated bodies are decoded; `maxBytes` separately bounds returned text.
-An oversized source stays identifiable in `unavailable` and can be requested with
+before unrelated bodies are decoded; `maxBytes` bounds the complete search presentation, including source references, coverage, and cursors.
+A source not inspected within the scan allowance stays identifiable in `unread` with the limiting reason and can be requested with
 a larger source allowance. Later appends cannot enter an existing cursor.
 
 For request assembly, `selectedContext(cut)` reads only the selected window record;
 `page({cut, after, cursor, limit, maxBytes})` and `entriesAfter(after, through, bounds)`
-enumerate bounded original sources. Follow the cursor and check `unavailable`
+enumerate bounded original sources. Follow the cursor and check `unread`
 before claiming complete coverage. There is no full-view gateway or exhaustive
 omission list. Session repositories expose `sourceSnapshot()` for cached branch
 membership, source digests, sizes and finalization pointers without source bodies.
@@ -45,8 +45,7 @@ run-tail indexes. No history cache retains completed run bodies. Cold constructi
 and explicit integrity verification still scan authoritative storage; first-ever
 unindexed access is not constant cost. `JsonlEventRepository.rebuild()` and
 `JsonlSessionRepository.rebuildHistoryIndex()` accept cancellation and progress
-callbacks. Interrupted rebuilds leave original ledgers intact. The bounded lexical
-index is optional and rebuildable; a cursor cannot broaden host-granted scope.
+callbacks. Interrupted rebuilds leave original ledgers intact. Search reads bounded original sources; a cursor cannot broaden host-granted scope.
 
 Keep original user contributions in history even after a context transition.
 Applications can associate a contribution with a continuation, correction, side
@@ -62,10 +61,9 @@ Branching inherits the revision at the selected branch point. Later revisions
 on either branch are independent.
 
 Compose `createWorkingStateTool(context)` with history and context tools. The
-model supplies exact text edits only; the runtime supplies session and branch
+model supplies the complete replacement text only; the runtime supplies session and branch
 scope, invocation attribution, and the revision presented in its inference.
-Ranges use the same one-based Unicode-scalar, half-open semantics as `edit_text`.
-All edits address the original text and publish atomically. A stale update returns
+The replacement publishes atomically against that revision. A stale update returns
 an explicit conflict with the current state and its history reference. Publication
 is conditional and idempotent; a failed append leaves the previous head intact.
 

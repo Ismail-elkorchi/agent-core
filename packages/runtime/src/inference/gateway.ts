@@ -100,13 +100,13 @@ export class InferenceGateway {
     const stream = compiledStream
       ? () => compiledStream(compiled, input.transport)
       : logicalStream
-        ? () => logicalStream(compiled.logicalRequest)
+        ? () => logicalStream(compiled.logicalRequest, input.transport)
         : undefined;
     if (!input.profile.capabilities.streaming || !stream) {
       return parseModelResponse(
         await (input.session.completeCompiled
           ? input.session.completeCompiled(compiled, input.transport)
-          : input.session.complete(compiled.logicalRequest))
+          : input.session.complete(compiled.logicalRequest, input.transport))
       );
     }
 

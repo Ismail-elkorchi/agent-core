@@ -96,7 +96,6 @@ test('all adapters preserve optional history references through search, read and
   assert.equal(searchContent[2].text, search.output.items[0].text);
   assert.equal(presented.coverage, search.output.coverage);
   assert.equal(presented.cut, undefined);
-  assert.equal(presented.indexWatermark, undefined);
 });
 
 test('search cursors carry one cut and retain pagination, query and scope fencing', async () => {

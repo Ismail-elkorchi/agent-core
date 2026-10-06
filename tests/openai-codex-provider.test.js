@@ -55,6 +55,34 @@ test('Codex catalog efforts do not prevent low or high requests for Astra or oth
   assert.equal(calls.length, 6);
 });
 
+test('Codex cache affinity belongs to the host inference owner across transport sessions', async () => {
+  const calls = [];
+  const provider = new OpenAICodexProvider({ auth: bearerProvider(codexJwt()),
+    fetch: async (url, init) => {
+      if (new URL(url).pathname.endsWith('/models')) return jsonResponse({ models: [{
+        slug: 'cache-model', display_name: 'cache-model', input_modalities: ['text'],
+        context_window: 100000, default_reasoning_level: 'low',
+        supported_reasoning_levels: [{ effort: 'low', description: 'low' }]
+      }] });
+      calls.push({ body: JSON.parse(init.body), headers: init.headers });
+      return completionResponse({ id: `response-${calls.length}`, model: 'cache-model', status: 'completed', output_text: 'done' });
+    }
+  });
+  const compiled = await provider.compileRequest({ model: 'cache-model', messages: [{ role: 'user', content: 'hello' }] });
+  for (const affinityKey of ['owner-一', 'owner-一', 'other-owner']) {
+    const session = provider.createSession();
+    await session.completeCompiled(compiled, { affinityKey });
+    await session.close();
+  }
+  assert.match(calls[0].headers['session-id'], /^[a-f0-9]{64}$/);
+  assert.equal(calls[0].headers['session-id'], calls[1].headers['session-id']);
+  assert.notEqual(calls[0].headers['session-id'], calls[2].headers['session-id']);
+  for (const call of calls) {
+    assert.deepEqual(call.body, { ...compiled.body, stream: true });
+    assert(!JSON.stringify(call.body).includes('owner-'));
+  }
+});
+
 test('Codex discovers newly released models and refreshes a missing cached identity', async () => {
   let requests = 0;
   let available = ['gpt-6-astra'];
@@ -307,6 +335,7 @@ test('OpenAICodexProvider defaults to HTTP full replay transport', async () => {
   assert.equal(requests[0].headers['chatgpt-account-id'], 'acct-http');
   assert.equal(requests[0].headers['openai-beta'], 'responses=experimental');
   assert.equal(requests[0].headers.originator, 'agent-core');
+  assert.match(requests[0].headers['session-id'], /^[a-f0-9]{64}$/);
 });
 
 test('OpenAICodexProvider accepts nullable response fields in HTTP stream events', async () => {
@@ -536,6 +565,7 @@ test('OpenAICodexProvider default WebSocket factory sends Codex headers', async 
   assert.equal(requests[0].headers['chatgpt-account-id'], 'acct-ws');
   assert.equal(requests[0].headers['openai-beta'], 'responses_websockets=2026-02-06');
   assert.equal(requests[0].headers.originator, 'agent-core');
+  assert.match(requests[0].headers['session-id'], /^[a-f0-9]{64}$/);
   assert.equal(messages[0].type, 'response.create');
   assert.equal(events.at(-1).type, 'done');
   assert.equal(events.at(-1).response.content, 'ws ok');
