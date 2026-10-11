@@ -102,9 +102,7 @@ export class NativeResponsesSession implements ModelProviderSession {
     factory: OpenAIResponsesWebSocketFactory,
     idleTimeoutMs: number
   ) {
-    this.connection = new NativeResponsesConnection(host, factory, idleTimeoutMs, (error) => {
-      this.disconnect(error);
-    });
+    this.connection = new NativeResponsesConnection(host, factory, idleTimeoutMs);
   }
 
   async complete(request: ModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {

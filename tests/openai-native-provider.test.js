@@ -19,6 +19,167 @@ const streamNative = async function* (provider, session, input, admit = async ()
 };
 const request = { model: 'gpt-6-astra', messages: [{ role: 'user', content: 'initial' }], maxOutputTokens: 100 };
 
+for (const terminal of ['completed', 'incomplete'])
+  test(`native ${terminal} response survives an immediate disconnect with exact usage`, async () => {
+    let sends = 0;
+    const provider = new OpenAIProvider({
+      apiKey: 'fixture',
+      transport: 'websocket',
+      webSocketFactory: () =>
+        new FixtureSocket((_body, socket) => {
+          sends++;
+          socket.feed(
+            { type: 'response.created', response: { id: 'known-response' } },
+            {
+              type: `response.${terminal}`,
+              response: response('known-response', 'Known answer.', {
+                status: terminal,
+                ...(terminal === 'incomplete'
+                  ? { incomplete_details: { reason: 'max_output_tokens' } }
+                  : {})
+              })
+            }
+          );
+          socket.emit('close');
+        })
+    });
+    const session = provider.createSession();
+    try {
+      const events = [];
+      for await (const event of streamNative(provider, session, request)) events.push(event);
+      assert.deepEqual(
+        events.map((event) => event.type),
+        ['response_started', 'response_boundary', 'done']
+      );
+      assert.equal(events.at(-1).response.content, 'Known answer.');
+      assert.deepEqual(events.at(-1).response.usage, {
+        promptTokens: 4,
+        completionTokens: 2,
+        totalTokens: 6
+      });
+      assert.equal(sends, 1);
+    } finally {
+      await session.close();
+    }
+  });
+
+test('native steering consumes received acknowledgment and completion before classifying disconnect', async () => {
+  const provider = new OpenAIProvider({
+    apiKey: 'fixture',
+    transport: 'websocket',
+    webSocketFactory: () =>
+      new FixtureSocket((body, socket) => {
+        if (body.type === 'response.create') {
+          socket.feed({ type: 'response.created', response: { id: 'r1' } });
+          return;
+        }
+        socket.feed(
+          { type: 'response.steer.accepted', steer: { id: 'steer1', previous_response_id: 'r1' } },
+          {
+            type: 'response.incomplete',
+            response: response('r1', 'first', {
+              status: 'incomplete',
+              incomplete_details: { reason: 'steered' }
+            })
+          },
+          { type: 'response.created', response: { id: 'r2', previous_response_id: 'r1' } },
+          { type: 'response.completed', response: response('r2', 'second') }
+        );
+        socket.emit('close');
+      })
+  });
+  const session = provider.createSession();
+  const statuses = [];
+  let final;
+  try {
+    for await (const event of streamNative(provider, session, request)) {
+      if (event.type === 'response_started' && event.responseId === 'r1')
+        await session.steer({
+          deliveryId: 'correction',
+          responseId: 'r1',
+          input: [{ role: 'user', content: 'correction' }]
+        });
+      if (event.type === 'steering') statuses.push(event.delivery.status);
+      if (event.type === 'done') final = event.response;
+    }
+    assert.deepEqual(statuses, ['submitted', 'acknowledged', 'applied']);
+    assert.equal((await session.steeringStatus('correction')).status, 'applied');
+    assert.equal(final.content, 'firstsecond');
+    assert.equal(final.usage.totalTokens, 12);
+  } finally {
+    await session.close();
+  }
+});
+
+const reportedUsage = { input_tokens: 4, output_tokens: 2, total_tokens: 6 };
+const detailedUsage = {
+  ...reportedUsage,
+  input_tokens_details: { cached_tokens: 2, cache_write_tokens: 1 },
+  output_tokens_details: { reasoning_tokens: 1 }
+};
+const aggregateUsage = { promptTokens: 8, completionTokens: 4, totalTokens: 12 };
+for (const [name, first, second, expected] of [
+  ['first usage absent', undefined, reportedUsage, undefined],
+  ['last usage absent', reportedUsage, undefined, undefined],
+  ['first details absent', reportedUsage, detailedUsage, aggregateUsage],
+  ['last details absent', detailedUsage, reportedUsage, aggregateUsage],
+  [
+    'all details reported',
+    detailedUsage,
+    detailedUsage,
+    { ...aggregateUsage, cacheReadTokens: 4, cacheWriteTokens: 2, reasoningTokens: 2 }
+  ]
+])
+  test(`native aggregate usage preserves uncertainty: ${name}`, async () => {
+    const provider = new OpenAIProvider({
+      apiKey: 'fixture',
+      transport: 'websocket',
+      webSocketFactory: () =>
+        new FixtureSocket((body, socket) => {
+          if (body.type === 'response.create') {
+            socket.feed({ type: 'response.created', response: { id: 'r1' } });
+            return;
+          }
+          socket.feed(
+            {
+              type: 'response.steer.accepted',
+              steer: { id: 'steer1', previous_response_id: 'r1' }
+            },
+            {
+              type: 'response.incomplete',
+              response: response('r1', 'first', {
+                status: 'incomplete',
+                incomplete_details: { reason: 'steered' },
+                usage: first
+              })
+            },
+            { type: 'response.created', response: { id: 'r2', previous_response_id: 'r1' } },
+            { type: 'response.completed', response: response('r2', 'second', { usage: second }) }
+          );
+        })
+    });
+    const session = provider.createSession();
+    const boundaries = [];
+    let final;
+    try {
+      for await (const event of streamNative(provider, session, request)) {
+        if (event.type === 'response_started' && event.responseId === 'r1')
+          await session.steer({
+            deliveryId: 'correction',
+            responseId: 'r1',
+            input: [{ role: 'user', content: 'correction' }]
+          });
+        if (event.type === 'response_boundary') boundaries.push(event.response);
+        if (event.type === 'done') final = event.response;
+      }
+      for (const [index, raw] of [first, second].entries())
+        assert.equal(boundaries[index].usage?.totalTokens, raw?.total_tokens);
+      assert.deepEqual(final.usage, expected, 'unreported usage must not become an assumed zero');
+    } finally {
+      await session.close();
+    }
+  });
+
 test('native steering traces submitted, acknowledged and applied with original response IDs and aggregate usage', async () => {
   let socket;
   const provider = new OpenAIProvider({ apiKey: 'fixture', transport: 'websocket', webSocketFactory: () => socket = new FixtureSocket((body, ws) => {
@@ -290,7 +451,7 @@ test('result send disconnect keeps uncertainty and original saved result without
     for await (const event of streamNative(provider, session, { ...request, tools: [asyncTool] })) {
       if (event.type === 'response_boundary') {
         submission = { deliveryId: 'saved-delivery', responseId: 'r1', results: [resultInput('late')], sourceCalls: event.native.pendingToolCalls };
-        assert.equal((await session.deliverToolResults(submission)).status, 'uncertain');
+        assert.equal((await session.deliverToolResults(submission)).status, 'submitted');
       }
     }
   }, /disconnected/u);

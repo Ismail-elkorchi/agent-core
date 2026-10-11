@@ -14,10 +14,19 @@ export function nativeFailure(
 }
 function addUsage(responses: readonly ModelResponse[]): ModelUsage | undefined {
   if (responses.some((item) => !item.usage)) return undefined;
-  const sum: Record<string, number> = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
-  for (const response of responses)
-    for (const [key, value] of Object.entries(response.usage ?? {}))
-      if (typeof value === 'number') sum[key] = (sum[key] ?? 0) + value;
+  const sum: Record<string, number> = {};
+  for (const key of [
+    'promptTokens',
+    'completionTokens',
+    'totalTokens',
+    'cacheReadTokens',
+    'cacheWriteTokens',
+    'reasoningTokens'
+  ] as const) {
+    const values = responses.map((response) => response.usage?.[key]);
+    if (values.every((value) => value !== undefined))
+      sum[key] = values.reduce((total, value) => total + value, 0);
+  }
   return parseModelUsage(sum);
 }
 
@@ -30,7 +39,7 @@ export function aggregateResponses(responses: readonly ModelResponse[]): ModelRe
     content: responses.map((item) => item.content).join(''),
     output: responses.flatMap((item) => item.output ?? []),
     toolCalls: responses.flatMap((item) => item.toolCalls ?? []),
-    ...(usage ? { usage } : {}),
+    usage,
     transport: {
       provider: 'openai',
       strategy: 'websocket_native',

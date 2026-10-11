@@ -30,8 +30,7 @@ export class NativeResponsesConnection {
       nativeHeaders(signal?: AbortSignal): Promise<Readonly<Record<string, string>>>;
     },
     private readonly factory: OpenAIResponsesWebSocketFactory,
-    private readonly idleTimeoutMs: number,
-    private readonly onFailure: (error: Error) => void
+    private readonly idleTimeoutMs: number
   ) {}
   get available(): boolean {
     return this.socket?.readyState === 1;
@@ -75,22 +74,22 @@ export class NativeResponsesConnection {
         this.queue.push(parseJsonObject(JSON.parse(text) as unknown));
         this.wake?.();
       } catch (error) {
-        this.onFailure(
+        this.close(
           error instanceof Error ? error : failure('malformed_response', 'Malformed native event.')
         );
       }
     });
     socket.on('error', (error) => {
-      this.onFailure(error);
+      this.close(error);
     });
     socket.on('close', () => {
-      this.onFailure(failure('provider_unavailable', 'Native connection disconnected.'));
+      this.close(failure('provider_unavailable', 'Native connection disconnected.'));
     });
     if (socket.readyState === 1) return;
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(
         () => {
-          reject(failure('provider_unavailable', 'Native connection timed out.'));
+          finish(failure('provider_unavailable', 'Native connection timed out.'));
         },
         Math.min(this.idleTimeoutMs, 30_000)
       );
@@ -112,11 +111,14 @@ export class NativeResponsesConnection {
       socket.on('close', () => {
         finish(failure('provider_unavailable', 'Native connection closed before opening.'));
       });
-      signal?.addEventListener('abort', cancel, { once: true });
+      if (signal?.aborted) cancel();
+      else signal?.addEventListener('abort', cancel, { once: true });
     });
   }
   async next(signal?: AbortSignal): Promise<JsonObject> {
     for (;;) {
+      // Received evidence precedes transport failure. The session reconciles
+      // it before deciding which responses or deliveries remain unresolved.
       const event = this.queue.shift();
       if (event) return event;
       signal?.throwIfAborted();
