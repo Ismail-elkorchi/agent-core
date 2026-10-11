@@ -511,7 +511,7 @@ async function directoryPage(
   }
   const handle = await root.openDirectory(directory);
   try {
-    return await handle.entries();
+    return await handle.entries(maximum);
   } finally {
     await handle.close();
   }

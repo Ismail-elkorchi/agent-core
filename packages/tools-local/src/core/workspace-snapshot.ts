@@ -37,7 +37,12 @@ export async function captureWorkspaceSnapshot(root: RootedFileAuthority, signal
     if (depth > MAX_DEPTH) { causes.add('depth_limit'); return; }
     const directory = await root.openDirectory(directoryPath);
     let children;
-    try { children = [...await directory.entries()].sort((left, right) => compareCodeUnits(left.name, right.name)); }
+    try {
+      const remaining = MAX_ENTRIES - entries.length;
+      children = [...await directory.entries(remaining + 1)]
+        .sort((left, right) => compareCodeUnits(left.name, right.name));
+      if (children.length > remaining) causes.add('entry_limit');
+    }
     finally { await directory.close(); }
     for (const child of children) {
       throwIfAborted(signal);

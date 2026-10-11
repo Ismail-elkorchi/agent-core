@@ -8,7 +8,7 @@ import {
   readlinkSync,
   type BigIntStats
 } from 'node:fs';
-import { link, lstat, mkdir, open, rename, rmdir, unlink, type FileHandle } from 'node:fs/promises';
+import { link, lstat, mkdir, open, opendir, rename, rmdir, unlink, type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 
@@ -50,7 +50,8 @@ export interface RootedDirectoryHandle {
   readonly identity: RootedFileIdentity;
   readonly size: number;
   readonly mode: number;
-  entries(): Promise<readonly RootedDirectoryEntry[]>;
+  /** Read at most maximum entries, or the complete directory when it is omitted. */
+  entries(maximum?: number): Promise<readonly RootedDirectoryEntry[]>;
   close(): Promise<void>;
 }
 
@@ -389,25 +390,31 @@ export class RootedFileAuthority {
       identity: identity(stat),
       size: numberFromBigInt(stat.size, 'directory size'),
       mode: Number(stat.mode),
-      async entries() {
+      async entries(maximum = Number.MAX_SAFE_INTEGER) {
         assertOpen();
-        const dirents = await import('node:fs/promises').then(({ readdir }) =>
-          readdir(fdPath(opened.handle.fd), { withFileTypes: true })
-        );
-        return Object.freeze(
-          dirents.map((entry) =>
-            Object.freeze({
-              name: entry.name,
-              type: entry.isFile()
-                ? ('file' as const)
-                : entry.isDirectory()
-                  ? ('directory' as const)
-                  : entry.isSymbolicLink()
-                    ? ('symlink' as const)
-                    : ('other' as const)
-            })
-          )
-        );
+        if (!Number.isSafeInteger(maximum) || maximum < 0)
+          throw new TypeError('Directory entry maximum must be a non-negative safe integer.');
+        const entries: RootedDirectoryEntry[] = [];
+        if (maximum === 0) return Object.freeze(entries);
+        const directory = await opendir(fdPath(opened.handle.fd), {
+          bufferSize: Math.min(maximum, 32)
+        });
+        for await (const entry of directory) {
+          assertOpen();
+          entries.push(Object.freeze({
+            name: entry.name,
+            type: entry.isFile()
+              ? 'file'
+              : entry.isDirectory()
+                ? 'directory'
+                : entry.isSymbolicLink()
+                  ? 'symlink'
+                  : 'other'
+          }));
+          if (entries.length >= maximum) break;
+        }
+        assertOpen();
+        return Object.freeze(entries);
       },
       async close() {
         if (closed) return;

@@ -6,6 +6,29 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { RootedFileAuthority } from '@agent-core/tools-local';
 
+test('bounded directory reads release their iterator after stopping early', {
+  skip: process.platform !== 'linux'
+}, async (t) => {
+  const location = await mkdtemp(path.join(tmpdir(), 'agent-core-directory-limit-'));
+  t.after(() => rm(location, { recursive: true, force: true }));
+  await Promise.all(Array.from({ length: 64 }, (_, index) =>
+    writeFile(path.join(location, `file-${index}.txt`), '')));
+  const root = RootedFileAuthority.adopt(location);
+  const directory = await root.openDirectory('.');
+  t.after(async () => { await directory.close(); root.close(); });
+  const before = (await readdir('/proc/self/fd')).length;
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const entries = await directory.entries(3);
+    assert.equal(entries.length, 3);
+    assert(entries.every(entry => entry.type === 'file'));
+  }
+  assert.equal((await readdir('/proc/self/fd')).length, before);
+  assert.equal((await directory.entries()).length, 64);
+  assert.deepEqual(await directory.entries(0), []);
+  for (const maximum of [NaN, -1, 0.5, Infinity])
+    await assert.rejects(directory.entries(maximum), /maximum/);
+});
+
 test(
   'derived roots inherit restrictions and own independent handles across generations',
   { skip: process.platform !== 'linux' },
