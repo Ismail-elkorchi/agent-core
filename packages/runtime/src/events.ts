@@ -55,10 +55,7 @@ import type {
 } from './context/contracts.js';
 import { contextTransitionRequestSchema } from './context/schema.js';
 import type { PromptContextDelivery, PromptMaterial } from './inference/prompt-material.js';
-import type {
-  BudgetAccountantSnapshot,
-  RequestCostEstimate
-} from './orchestration/budget-accountant.js';
+import type { RequestTokenEstimate } from './orchestration/model-request.js';
 import {
   decodeAgentRunBudgetState,
   decodeOwnedAgentModelOutput,
@@ -352,8 +349,7 @@ export type AgentEvent =
   | ({
       readonly type: 'budget.estimate.created';
       readonly attempt: number;
-      readonly estimate: RequestCostEstimate;
-      readonly snapshot: BudgetAccountantSnapshot;
+      readonly estimate: RequestTokenEstimate;
     } & AgentTurnIdentity)
   | ({
       readonly type: 'observation.record.created';
@@ -431,7 +427,7 @@ export type AgentProgressEvent =
   | ({
       readonly type: 'model.requested';
       readonly request: AgentModelRequestSummary;
-      readonly estimate: RequestCostEstimate;
+      readonly estimate: RequestTokenEstimate;
       readonly contextWindowTokens?: number;
     } & AgentTurnIdentity)
   | {
@@ -948,13 +944,12 @@ const AGENT_EVENT_DECODERS = {
     });
   },
   'budget.estimate.created': (value) => {
-    exact(value, ['type', ...TURN_KEYS, 'attempt', 'estimate', 'snapshot']);
+    exact(value, ['type', ...TURN_KEYS, 'attempt', 'estimate']);
     return Object.freeze({
       type: 'budget.estimate.created',
       ...decodeTurnIdentity(value),
       attempt: positiveInteger(value.attempt, 'attempt'),
-      estimate: decodeRequestCostEstimate(value.estimate),
-      snapshot: decodeBudgetSnapshot(value.snapshot)
+      estimate: decodeRequestTokenEstimate(value.estimate)
     });
   },
   'observation.record.created': (value) => {
@@ -1131,7 +1126,6 @@ const RUN_PHASES = [
 const TOOL_CALL_TYPES = ['function', 'custom'] as const;
 const AUTHORIZATION_DECISIONS = ['allow', 'deny', 'require_approval'] as const;
 const APPROVAL_DECISIONS = ['allow', 'deny'] as const;
-const BUDGET_PRESSURES = ['normal', 'constrained', 'critical', 'exhausted'] as const;
 const TERMINATION_REASONS = [
   'stop',
   'tool_calls',
@@ -1565,7 +1559,7 @@ function decodeModelResponseSummary(value: JsonValue | undefined): AgentModelRes
     ...(providerStateRef ? { providerStateRef } : {})
   });
 }
-function decodeRequestCostEstimate(value: JsonValue | undefined): RequestCostEstimate {
+function decodeRequestTokenEstimate(value: JsonValue | undefined): RequestTokenEstimate {
   const object = requiredObject(value, 'estimate');
   exact(object, [
     'messageTokens',
@@ -1592,85 +1586,6 @@ function decodeRequestCostEstimate(value: JsonValue | undefined): RequestCostEst
       'estimate.totalRequestTokens'
     ),
     warnings: stringArray(object.warnings, 'estimate.warnings')
-  });
-}
-function decodeBudgetSnapshot(value: JsonValue | undefined): BudgetAccountantSnapshot {
-  const object = requiredObject(value, 'snapshot');
-  exact(object, [
-    'estimatedPromptTokens',
-    'providerPromptTokens',
-    'completionTokens',
-    'cacheReadTokens',
-    'cacheWriteTokens',
-    'reasoningTokens',
-    'totalTokens',
-    'remainingPromptTokens',
-    'pressure',
-    'lastEstimate',
-    'lastProviderUsage',
-    'estimateToActualRatio'
-  ]);
-  const lastEstimate =
-    object.lastEstimate === undefined ? undefined : decodeRequestCostEstimate(object.lastEstimate);
-  const lastProviderUsage =
-    object.lastProviderUsage === undefined
-      ? undefined
-      : decodeProviderUsage(object.lastProviderUsage);
-  const estimateToActualRatio = optionalNonnegativeNumber(
-    object.estimateToActualRatio,
-    'snapshot.estimateToActualRatio'
-  );
-  return Object.freeze({
-    estimatedPromptTokens: nonnegativeInteger(
-      object.estimatedPromptTokens,
-      'snapshot.estimatedPromptTokens'
-    ),
-    providerPromptTokens: nonnegativeInteger(
-      object.providerPromptTokens,
-      'snapshot.providerPromptTokens'
-    ),
-    completionTokens: nonnegativeInteger(object.completionTokens, 'snapshot.completionTokens'),
-    cacheReadTokens: nonnegativeInteger(object.cacheReadTokens, 'snapshot.cacheReadTokens'),
-    cacheWriteTokens: nonnegativeInteger(object.cacheWriteTokens, 'snapshot.cacheWriteTokens'),
-    reasoningTokens: nonnegativeInteger(object.reasoningTokens, 'snapshot.reasoningTokens'),
-    totalTokens: nonnegativeInteger(object.totalTokens, 'snapshot.totalTokens'),
-    remainingPromptTokens: nonnegativeInteger(
-      object.remainingPromptTokens,
-      'snapshot.remainingPromptTokens'
-    ),
-    pressure: requiredEnum(object.pressure, BUDGET_PRESSURES, 'snapshot.pressure'),
-    ...(lastEstimate ? { lastEstimate } : {}),
-    ...(lastProviderUsage ? { lastProviderUsage } : {}),
-    ...(estimateToActualRatio !== undefined ? { estimateToActualRatio } : {})
-  });
-}
-function decodeProviderUsage(
-  value: JsonValue
-): NonNullable<BudgetAccountantSnapshot['lastProviderUsage']> {
-  const object = requiredObject(value, 'lastProviderUsage');
-  exact(object, [
-    'promptTokens',
-    'completionTokens',
-    'totalTokens',
-    'cacheReadTokens',
-    'cacheWriteTokens',
-    'reasoningTokens',
-    'source'
-  ]);
-  if (object.source !== 'provider') throw malformed('lastProviderUsage.source is invalid');
-  const usage = parseModelUsage(object);
-  if (
-    usage.cacheReadTokens === undefined ||
-    usage.cacheWriteTokens === undefined ||
-    usage.reasoningTokens === undefined
-  )
-    throw malformed('lastProviderUsage must include all provider token counters');
-  return Object.freeze({
-    ...usage,
-    cacheReadTokens: usage.cacheReadTokens,
-    cacheWriteTokens: usage.cacheWriteTokens,
-    reasoningTokens: usage.reasoningTokens,
-    source: 'provider'
   });
 }
 function decodePromptContextDelivery(value: JsonValue | undefined): PromptContextDelivery {

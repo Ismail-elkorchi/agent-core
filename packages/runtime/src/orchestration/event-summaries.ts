@@ -13,7 +13,7 @@ import type {
   AgentProviderStateSummary,
   AgentRunConfiguration
 } from '../events.js';
-import type { RequestWindow } from './budget-accountant.js';
+import type { RequestWindow } from './model-request.js';
 
 export function summarizeRunConfiguration(input: {
   provider: ModelProviderInfo;

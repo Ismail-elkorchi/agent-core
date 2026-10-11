@@ -32,11 +32,11 @@ import {
 } from '@agent-core/persistence';
 import { randomUUID } from 'node:crypto';
 import type { AgentAuditEvent, AgentEvent, AgentProgressEvent } from '../events.js';
-import type { RequestCostEstimate } from '../orchestration/budget-accountant.js';
 import type { summarizeModelRequest } from '../orchestration/event-summaries.js';
 import {
   normalizeModelToolCall,
-  providerFailureDiagnostic
+  providerFailureDiagnostic,
+  type RequestTokenEstimate
 } from '../orchestration/model-request.js';
 import { ModelStreamInterruptedError } from '../orchestration/model-stream.js';
 import { storeProviderStateArtifact } from '../orchestration/provider-state-artifacts.js';
@@ -80,7 +80,7 @@ export interface RunInferenceInput {
   };
   readonly request: ModelRequest;
   readonly compiled: CompiledModelRequest;
-  readonly requestEstimate: RequestCostEstimate;
+  readonly requestEstimate: RequestTokenEstimate;
   readonly requestFingerprint: InferenceRequestFingerprintRecord;
   readonly requestSummary: ReturnType<typeof summarizeModelRequest>;
   readonly turnRequest: {
@@ -499,7 +499,7 @@ function recordableModelRequest(request: ModelRequest): Omit<ModelRequest, 'sign
   });
 }
 
-function providerExposureReservation(estimate: RequestCostEstimate): EffectExposureReservation {
+function providerExposureReservation(estimate: RequestTokenEstimate): EffectExposureReservation {
   return Object.freeze({
     quantities: Object.freeze([
       Object.freeze({

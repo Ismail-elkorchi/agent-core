@@ -92,11 +92,6 @@ import {
 } from './inference/run-lifecycle.js';
 import { InferenceService } from './inference/service.js';
 import {
-  BudgetAccountant,
-  type RequestCostEstimate,
-  type RequestWindow
-} from './orchestration/budget-accountant.js';
-import {
   summarizeModelRequest,
   summarizeModelResponse,
   summarizeProviderState,
@@ -111,6 +106,9 @@ import {
   promptToolSpecs,
   providerFailureDiagnostic,
   requestWindowForModel,
+  requestTokenEstimate,
+  type RequestTokenEstimate,
+  type RequestWindow,
   supportsParameter,
   toolsForModel,
   validateModelRun
@@ -266,7 +264,6 @@ interface TurnSnapshot {
   readonly record: AgentTurnSnapshotRecord;
   readonly profile: ModelProfile;
   readonly requestWindow: RequestWindow;
-  readonly budgetAccountant: BudgetAccountant;
   readonly tools: readonly CompiledToolDefinition[];
   readonly configuration: RuntimeModelConfiguration;
   readonly instructions: readonly AgentEffectiveInstruction[];
@@ -306,7 +303,7 @@ type AssistantTurnResult =
 interface RequestAssemblyResult {
   readonly request: ModelRequest;
   readonly compiled: CompiledModelRequest;
-  readonly estimate: RequestCostEstimate;
+  readonly estimate: RequestTokenEstimate;
   readonly fingerprint: InferenceRequestFingerprintRecord;
 }
 
@@ -386,7 +383,7 @@ interface ProviderExecutionContinuation {
   readonly response: ModelResponse;
   readonly providerState?: import('./events.js').AgentProviderStateReference;
   readonly turnSnapshot: AgentTurnSnapshotRecord;
-  readonly requestEstimate: RequestCostEstimate;
+  readonly requestEstimate: RequestTokenEstimate;
   readonly instructions: readonly AgentEffectiveInstruction[];
   readonly budget: import('./run/contracts.js').AgentRunBudgetState;
 }
@@ -1368,10 +1365,7 @@ export class AgentRuntime {
         let toolBatchId: string;
         let assistant: AssistantTurnResult;
         if (providerResume) {
-          snapshot = await this.restoreTurnSnapshot(
-            providerResume.turnSnapshot,
-            providerResume.requestEstimate
-          );
+          snapshot = await this.restoreTurnSnapshot(providerResume.turnSnapshot);
           toolBatchId = providerResume.toolBatchId;
           activeTurnIdentity = providerResume.identity;
           lastStartedTurnIndex = turnIndex;
@@ -2017,17 +2011,13 @@ export class AgentRuntime {
       record,
       profile: input.profile,
       requestWindow: Object.freeze({ ...input.requestWindow }),
-      budgetAccountant: new BudgetAccountant(input.requestWindow),
       tools: Object.freeze([...input.tools]),
       configuration: input.configuration,
       instructions: Object.freeze([...input.instructions])
     });
   }
 
-  private async restoreTurnSnapshot(
-    record: AgentTurnSnapshotRecord,
-    requestEstimate: RequestCostEstimate
-  ): Promise<TurnSnapshot> {
+  private async restoreTurnSnapshot(record: AgentTurnSnapshotRecord): Promise<TurnSnapshot> {
     if (record.provider !== this.options.provider.id || record.model !== this.options.model)
       throw new Error(
         `Persisted turn ${record.turnId} does not match the configured provider and model.`
@@ -2046,8 +2036,6 @@ export class AgentRuntime {
     });
     assertToolCatalogCurrent(record.toolCatalog, tools);
     const requestWindow = requestWindowForModel(profile, this.maxOutputTokens);
-    const budgetAccountant = new BudgetAccountant(requestWindow);
-    budgetAccountant.recordSent(requestEstimate);
     const configuration: RuntimeModelConfiguration = Object.freeze({
       model: record.model,
       ...(record.temperature === undefined ? {} : { temperature: record.temperature }),
@@ -2058,7 +2046,6 @@ export class AgentRuntime {
       record,
       profile,
       requestWindow,
-      budgetAccountant,
       tools: Object.freeze(tools),
       configuration,
       instructions: record.instructions
@@ -2104,7 +2091,7 @@ export class AgentRuntime {
     interface Generation {
       readonly generationDeliveryId: string;
       readonly request: AssistantTurnRequest;
-      estimate: RequestCostEstimate;
+      estimate: RequestTokenEstimate;
       readonly governed: ReturnType<typeof createRunInferenceLifecycle>;
     }
     const generations = new Map<string, Generation>();
@@ -2194,12 +2181,11 @@ export class AgentRuntime {
         await runtime.append(started);
         await runtime.emit(started);
       }
-      const estimate = snapshot.budgetAccountant.estimateRequest({
+      const estimate = requestTokenEstimate({
         accounting: context.compiled.accounting,
         modelWindowTokens: 0,
         contextTokens: 0
       });
-      snapshot.budgetAccountant.recordSent(estimate);
       const fingerprint: InferenceRequestFingerprintRecord = first
         ? assembly.fingerprint
         : {
@@ -2223,8 +2209,7 @@ export class AgentRuntime {
         type: 'budget.estimate.created',
         ...turnIdentity(snapshot.record),
         attempt: 1,
-        estimate,
-        snapshot: snapshot.budgetAccountant.snapshot()
+        estimate
       });
       if (!first && context.dispatch) {
         const deliveredIds = new Set(context.dispatch.sourceCalls.map((call) => call.toolCallId));
@@ -2299,19 +2284,17 @@ export class AgentRuntime {
         extended: async (context, dispatch) => {
           await this.requestAdmission.admit(dispatch.compiled, context.profile);
           const item = generation(context);
-          const estimate = item.request.snapshot.budgetAccountant.estimateRequest({
+          const estimate = requestTokenEstimate({
             accounting: dispatch.compiled.accounting,
             modelWindowTokens: 0,
             contextTokens: 0
           });
-          item.request.snapshot.budgetAccountant.recordSent(estimate);
           item.estimate = estimate;
           await runtime.append({
             type: 'budget.estimate.created',
             ...turnIdentity(item.request.snapshot.record),
             attempt: 1,
-            estimate,
-            snapshot: item.request.snapshot.budgetAccountant.snapshot()
+            estimate
           });
           await deliveries.admit(dispatch);
         },
@@ -2540,7 +2523,6 @@ export class AgentRuntime {
             nativeWork.observationStore
           );
         }
-        request.snapshot.budgetAccountant.recordSent(assembly.estimate);
         const ledgerModelRequest = { ...assembly.request };
         delete ledgerModelRequest.signal;
         await append({ type: 'assistant.started', ...identity });
@@ -2646,7 +2628,7 @@ export class AgentRuntime {
       AssistantTurnRequest,
       'runId' | 'turnIndex' | 'snapshot' | 'controller' | 'run' | 'toolBatchId'
     >;
-    readonly requestEstimate: RequestCostEstimate;
+    readonly requestEstimate: RequestTokenEstimate;
     readonly response: ModelResponse;
     readonly identity: AgentTurnIdentity;
     readonly append: (event: AgentAuditEvent) => Promise<EventAppendReceipt>;
@@ -3131,7 +3113,7 @@ export class AgentRuntime {
     }
 
     const { assembly, compiled } = result;
-    const estimate = request.snapshot.budgetAccountant.estimateRequest({
+    const estimate = requestTokenEstimate({
       accounting: compiled.accounting,
       modelWindowTokens: assembly.estimate.modelWindowTokens,
       contextTokens: assembly.estimate.contextTokens
@@ -3156,8 +3138,7 @@ export class AgentRuntime {
       type: 'budget.estimate.created',
       ...identity,
       attempt: 1,
-      estimate,
-      snapshot: request.snapshot.budgetAccountant.snapshot()
+      estimate
     });
     this.options.context?.recordAdmission({
       status: 'admitted',
@@ -3788,7 +3769,7 @@ export class AgentRuntime {
         `Run ${state.runId} is missing its exact provider settlement ${phase.settlementReference.eventId}.`
       );
     let turnSnapshot: AgentTurnSnapshotRecord | undefined;
-    let requestEstimate: RequestCostEstimate | undefined;
+    let requestEstimate: RequestTokenEstimate | undefined;
     for await (const record of this.options.repositories.events.read(state.runId)) {
       const event = record.event;
       if (

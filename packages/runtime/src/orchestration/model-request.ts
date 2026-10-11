@@ -2,6 +2,8 @@ import { type PromptInstructionBlock } from '../inference/prompt-material.js';
 import { type PromptInstruction } from '../inference/model-request-assembler.js';
 import {
   type ModelProfile,
+  type RequestAccounting,
+  requestAccountingInputTokens,
   type ModelParameter,
   ModelProviderError,
   type ModelProviderErrorDiagnostic,
@@ -17,7 +19,46 @@ import {
   type ToolDefinition,
   type ToolExecutionContext
 } from '@agent-core/tools';
-import { type RequestWindow } from './budget-accountant.js';
+
+export interface RequestTokenEstimate {
+  readonly messageTokens: number;
+  readonly modelWindowTokens: number;
+  readonly contextTokens: number;
+  readonly toolSchemaTokens: number;
+  readonly outputReserveTokens: number;
+  readonly totalPromptTokens: number;
+  readonly totalRequestTokens: number;
+  readonly warnings: readonly string[];
+}
+
+export interface RequestWindow {
+  readonly contextWindowTokens: number;
+  readonly maxPromptTokens: number;
+  readonly maxOutputTokens: number;
+}
+
+/** Project the compiled accounting for inspection and durable exposure binding. */
+export function requestTokenEstimate(input: {
+  readonly accounting: RequestAccounting;
+  readonly modelWindowTokens: number;
+  readonly contextTokens: number;
+}): RequestTokenEstimate {
+  const totalPromptTokens = requestAccountingInputTokens(input.accounting);
+  const toolSchemaTokens = input.accounting.components
+    .filter((part) => part.kind === 'tool_schema')
+    .reduce((sum, part) => sum + (part.tokens ?? 0), 0);
+  const outputReserveTokens = input.accounting.outputReservation;
+  return {
+    messageTokens: totalPromptTokens - toolSchemaTokens,
+    modelWindowTokens: input.modelWindowTokens,
+    contextTokens: input.contextTokens,
+    toolSchemaTokens,
+    outputReserveTokens,
+    totalPromptTokens,
+    totalRequestTokens: totalPromptTokens + outputReserveTokens,
+    warnings: input.accounting.unknownComponents.map((part) => part.reason)
+  };
+}
 
 export interface AgentInstructionInput {
   id: string;
