@@ -89,6 +89,7 @@ export {
   draftFromSubmission,
   draftSubmission,
   loadDraft,
+  saveDrafts,
   sameDraft,
   type ComposerDraft,
   type DraftAttachment,

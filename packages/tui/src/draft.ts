@@ -69,6 +69,23 @@ export interface DraftStorage {
   write(sessionId: string, draft: ComposerDraft): Promise<void>;
 }
 
+/** A failed write must not prevent other sessions' unsent work from being saved. */
+export async function saveDrafts(
+  storage: Pick<DraftStorage, 'write'>,
+  drafts: ReadonlyMap<string, ComposerDraft>
+): Promise<void> {
+  const failures: Error[] = [];
+  for (const [sessionId, draft] of drafts) {
+    try {
+      await storage.write(sessionId, draft);
+    } catch (cause) {
+      failures.push(new Error(`Could not save draft for session ${sessionId}.`, { cause }));
+    }
+  }
+  if (failures.length > 0)
+    throw new AggregateError(failures, `Could not save ${String(failures.length)} session drafts.`);
+}
+
 export type DraftMessage =
   | {
       readonly type: 'draft.loaded';

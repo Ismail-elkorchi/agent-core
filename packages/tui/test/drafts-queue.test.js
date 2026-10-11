@@ -8,6 +8,7 @@ import {
   draftFromSubmission,
   draftSubmission,
   sameDraft,
+  saveDrafts,
   rememberPrompt,
   navigatePromptHistory,
   emptyPromptHistory,
@@ -31,6 +32,37 @@ const attachment = {
     }
   }
 };
+test('draft saving attempts every session and preserves every failure with its identity', async () => {
+  const first = new Error('Storage unavailable');
+  const second = new Error('Invalid attachment');
+  const drafts = new Map(['first', 'saved', 'second'].map(id => [id, createDraft(id)]));
+  const attempts = [];
+  await assert.rejects(saveDrafts({
+    write(id, draft) {
+      attempts.push([id, draft]);
+      if (id === 'first') return Promise.reject(first);
+      if (id === 'second') throw second;
+      return Promise.resolve();
+    }
+  }, drafts), error => {
+    assert(error instanceof AggregateError);
+    assert.deepEqual(error.errors.map(failure => failure.cause), [first, second]);
+    assert.match(error.errors[0].message, /first/);
+    assert.match(error.errors[1].message, /second/);
+    return true;
+  });
+  assert.deepEqual(attempts, [...drafts]);
+});
+
+test('successful and empty draft batches finish without a failure', async () => {
+  const drafts = new Map([['session', createDraft('Unsent', [attachment])]]);
+  const attempts = [];
+  const storage = { write: async (...entry) => { attempts.push(entry); } };
+  await saveDrafts(storage, drafts);
+  await saveDrafts(storage, new Map());
+  assert.deepEqual(attempts, [...drafts]);
+});
+
 test('native drafts retain source, caret, selection and images across a private-store restart', async (t) => {
   const directory = await mkdtemp(path.join(tmpdir(), 'agent-drafts-'));
   t.after(() => rm(directory, { recursive: true, force: true }));

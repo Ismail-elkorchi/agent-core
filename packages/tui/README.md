@@ -10,6 +10,8 @@ Shared components also provide source-selection copying, working-state inspectio
 
 Configuration can open directly at provider, model, reasoning, or authentication. Components consume provider discovery/authentication capabilities and a single validated save operation. Conversation projections preserve run/turn/call identity; draft, queue, recall, source, context, and settings components remain caller-controlled. Applications supply optional attachment readers, resource search, session names, export, and notifications. Node integrations keep private presentation preferences and unsent drafts separate from accepted history.
 
+On shutdown, `saveDrafts` attempts every supplied session draft before reporting any failed writes together. Applications select the drafts, with the active composer replacing its cached session entry.
+
 
 Tool activities distinguish invocation completion from domain outcome. `projectProgress` and `projectSessionEntry` accept an optional tool renderer after the call-presentation callback; renderers receive structured observations. Generic results use a neutral completed state, failures retain invocation-failure state, and executor uncertainty remains visible. A renderer exception produces a display diagnostic and bounded raw inspection without changing execution truth or model input. The optional `localToolCallPresentation` and `renderLocalToolObservation` adapters from `@agent-core/tools-local` render local source, search, process, and mutation results.
 
