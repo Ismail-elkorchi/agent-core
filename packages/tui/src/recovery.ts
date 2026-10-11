@@ -48,12 +48,6 @@ export function suspensionPresentation(reason: AgentSessionSuspensionDescriptor[
         waitingMessage: 'The run could not resume. Its recorded work remains available for recovery.',
         explanation: 'Run dispatch failed. Resume from recorded execution state, or stop this run; uncertain effects are not replayed.'
       };
-    case 'user_decision':
-      return {
-        title: 'Decision required',
-        explanation: 'This run is paused for your decision.',
-        waitingMessage: 'Choose one of the requested decisions.'
-      };
     case 'approval_required':
       return {
         title: 'Approval required',
@@ -64,10 +58,10 @@ export function suspensionPresentation(reason: AgentSessionSuspensionDescriptor[
 }
 
 export function suspensionMessage(
-  suspension: Pick<AgentSessionSuspensionDescriptor, 'reason' | 'contextAdmission' | 'decisionRequest' | 'diagnostic'> &
+  suspension: Pick<AgentSessionSuspensionDescriptor, 'reason' | 'contextAdmission' | 'diagnostic'> &
     Pick<AgentRunSuspension, 'cleanupDiagnostic'>
 ): string {
-  return suspension.contextAdmission?.message ?? suspension.decisionRequest?.reason ?? suspension.diagnostic ??
+  return suspension.contextAdmission?.message ?? suspension.diagnostic ??
     suspension.cleanupDiagnostic?.message ?? suspensionPresentation(suspension.reason).explanation;
 }
 

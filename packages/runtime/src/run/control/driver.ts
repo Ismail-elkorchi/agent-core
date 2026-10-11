@@ -1470,7 +1470,7 @@ function assertProviderAdvance(
       ? previous.stage === 'ready' && next.stage === 'effect_ready'
       : procedure === 'start_provider_request'
         ? previous.stage === 'effect_ready' &&
-          ['effect_pending', 'outcome_unknown'].includes(next.stage)
+          ['effect_pending', 'outcome_unknown', 'cancelled'].includes(next.stage)
         : procedure === 'reconcile_provider_request'
           ? ['effect_pending', 'effect_ready'].includes(previous.stage) &&
             ['settled', 'failed', 'outcome_unknown', 'effect_ready'].includes(next.stage)
@@ -1478,7 +1478,7 @@ function assertProviderAdvance(
             ? (previous.stage === 'settled' || previous.stage === 'failed') &&
               next.stage === 'consumed'
             : procedure === 'finalize_abort'
-              ? next.stage === 'outcome_unknown'
+              ? next.stage === 'outcome_unknown' || (previous.stage === 'effect_ready' && next.stage === 'cancelled')
               : false;
   if (!valid)
     throw new TypeError(
@@ -1489,7 +1489,8 @@ function assertProviderAdvance(
   if (
     previous.stage !== 'ready' &&
     next.stage !== 'ready' &&
-    (previous.requestEventId !== next.requestEventId ||
+    (previous.invocationId !== next.invocationId ||
+      previous.requestEventId !== next.requestEventId ||
       previous.responseId !== next.responseId ||
       hashJson(previous.effect.intent) !== hashJson(next.effect.intent))
   )

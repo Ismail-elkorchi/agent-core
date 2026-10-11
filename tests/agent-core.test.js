@@ -1572,7 +1572,7 @@ test('an unclassified provider failure preserves its unresolved outcome without 
   assert.equal(provider.calls.length, 1);
 });
 
-test('a provider start ticket stranded by process loss becomes an exact durable abort decision', async () => {
+test('a provider start ticket stranded by process loss cancels mechanically without dispatch', async () => {
   class InterruptedProviderStartRepository extends InMemoryEventRepository {
     interrupt = true;
     stopped = false;
@@ -1595,6 +1595,12 @@ test('a provider start ticket stranded by process loss becomes an exact durable 
   const events = new InterruptedProviderStartRepository(agentEventCodec);
   const provider = new ScriptedProvider([response('stop', 'must not be requested')]);
   const first = await harness({ events, provider, withoutSession: true });
+  const inference = runtimeRepositories.get(events).inference;
+  const appendInference = inference.append.bind(inference);
+  inference.append = (ownerId, event, tail) => {
+    if (events.stopped) throw new Error('simulated process stop before provider start');
+    return appendInference(ownerId, event, tail);
+  };
   const control = first.agent.run({ task: 'strand the issued provider ticket' });
   await assert.rejects(
     control.result,
@@ -1602,6 +1608,7 @@ test('a provider start ticket stranded by process loss becomes an exact durable 
   );
   assert.equal(provider.calls.length, 0);
 
+  assert.equal((await inference.load(control.runId)).committed.invocations, 1);
   events.stopped = false;
   const resumed = createRuntime({
     provider,
@@ -1610,20 +1617,19 @@ test('a provider start ticket stranded by process loss becomes an exact durable 
     repositories: { events }
   });
   const result = await resumed.resume(control.runId).result;
-  assert.equal(result.state, 'suspended');
-  assert.equal(result.reason, 'user_decision');
-  assert.deepEqual(result.decisionRequest.choices, ['abort']);
-  assert.equal(
-    result.decisionRequest.runRevision,
-    (await resumed.inspectRun(control.runId)).state.revision
-  );
-  assert.match(result.decisionRequest.fingerprint, /^[a-f0-9]{64}$/u);
+  assert.equal(result.state, 'ended');
+  assert.equal(result.terminal.executionStatus, 'aborted');
+  assert.match(result.terminal.errorMessage, /interrupted before its provider request started/);
+  assert.equal(provider.calls.length, 0);
+  const restored = await new AgentRunCoordinator(events, first.artifacts).inspect(control.runId);
+  assert.equal(restored.state.phase.kind, 'terminal');
+  assert.equal(restored.state.providerRequests[0].stage, 'cancelled');
+  assert.equal(restored.state.providerRequests[0].effect.closure.reason, 'cancelled_before_start');
+  assert.equal((await inference.load(control.runId)).committed.invocations, 0);
+  const repeated = await resumed.resume(control.runId).result;
+  assert.deepEqual(repeated.terminal, result.terminal);
   assert.equal(provider.calls.length, 0);
 
-  const restored = await new AgentRunCoordinator(events, first.artifacts).inspect(control.runId);
-  assert.equal(restored.state.phase.kind, 'suspended');
-  assert.equal(restored.state.phase.reason, 'user_decision');
-  assert.deepEqual(restored.state.phase.decisionRequest, result.decisionRequest);
 });
 
 test('a persisted provider settlement resumes without issuing a duplicate request', async () => {

@@ -12,7 +12,7 @@ A run records execution from admitted input to suspension or finalization. A ses
 
 History reads resolve original source identities within a captured branch boundary. Generated working state records its originating inference input; they do not replace the authoritative record. Search results are bounded and report coverage and a stable continuation cursor. A missing or inaccessible source is explicit. A source identifier supplied by a model cannot grant access to another branch or session.
 
-Context changes are conditional commits. Before activation, the host checks the proposed selection against current input, mandatory application material, available retrieval, note revisions, request fit, and provider protocol obligations. If the captured state has changed, the transition must be revalidated. Network inference does not run while holding session command serialization. Failure before commit leaves the previous window active.
+Context changes are conditional commits. Before activation, the host checks the proposed selection against current input, mandatory application material, available retrieval, working-state revisions, request fit, and provider protocol obligations. If the captured state has changed, the transition must be revalidated. Network inference does not run while holding session command serialization. Failure before commit leaves the previous window active.
 
 ## Four kinds of continuity
 
@@ -40,7 +40,7 @@ Applications sequence verification, acceptance and publication through the share
 
 Execution resources have an explicitly granted lifetime owner independent of their originating call. A resource may span runs; adapters implement acquisition, control and release without changing its causal identity. Commands and filesystem resources are optional integrations.
 
-Selected original sources, tool model content, and optional note revisions are admitted context choices. Core preserves selected images or explicitly rejects a modality or resource-limit mismatch; it does not remove older attachments during assembly. Native-state invalidation retains portable original history and protected artifacts.
+Selected original sources, tool model content, and optional working-state revisions are admitted context choices. Core preserves selected images or explicitly rejects a modality or resource-limit mismatch; it does not remove older attachments during assembly. Native-state invalidation retains portable original history and protected artifacts.
 
 ## Breaking formats and release evidence
 

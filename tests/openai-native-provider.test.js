@@ -417,3 +417,56 @@ test('native compaction keeps its full canonical prefix and appends current auth
   assert.deepEqual(compiled.logicalRequest.messages.slice(0, 2), authority);
   await assert.rejects(() => provider.compileRequest({ ...request, messages: [...request.messages, ...transformed.input] }), /must precede ordinary/u);
 });
+
+for (const method of ['complete', 'stream', 'completeCompiled', 'streamCompiled']) {
+  test(`native ${method} preserves transport cancellation`, async () => {
+    let connections = 0;
+    let counts = 0;
+    const provider = new OpenAIProvider({ apiKey: 'fixture', transport: 'websocket', countTokens: true,
+      fetch: async () => { counts++; return Response.json({ input_tokens: 25 }); },
+      webSocketFactory: () => {
+        connections++;
+        return new FixtureSocket((_body, ws) => ws.feed({ type: 'response.completed', response: response('r1', 'unexpected') }));
+      }
+    });
+    const session = provider.createSession();
+    const input = method.endsWith('Compiled') ? await provider.compileRequest(request) : request;
+    counts = 0;
+    try {
+      await assert.rejects(async () => {
+        const result = session[method](input, { signal: AbortSignal.abort(new Error('cancelled')) });
+        if (method.startsWith('stream')) for await (const event of result) void event;
+        else await result;
+      }, /cancelled|aborted/);
+      assert.equal(connections, 0);
+      assert.equal(counts, 0, 'cancelled preparation does not call the token-counting endpoint');
+    } finally {
+      await session.close();
+    }
+  });
+}
+
+test('native logical streaming retains host admission for steering', async () => {
+  let admissions = 0;
+  const provider = new OpenAIProvider({ apiKey: 'fixture', transport: 'websocket',
+    webSocketFactory: () => new FixtureSocket((body, ws) => {
+      if (body.type === 'response.create') ws.feed({ type: 'response.created', response: { id: 'r1' } });
+      if (body.type === 'response.steer') ws.feed(
+        { type: 'response.steer.accepted', steer: { id: 's1', previous_response_id: 'r1' } },
+        { type: 'response.incomplete', response: response('r1', '', { status: 'incomplete', incomplete_details: { reason: 'steered' } }) },
+        { type: 'response.created', response: { id: 'r2' } },
+        { type: 'response.completed', response: response('r2', 'corrected') }
+      );
+    })
+  });
+  const session = provider.createSession();
+  try {
+    for await (const event of session.stream(request, { native: { admit: async () => { admissions++; } } })) {
+      if (event.type === 'response_started' && event.responseId === 'r1')
+        await session.steer({ deliveryId: 'correction', responseId: 'r1', input: [{ role: 'user', content: 'correction' }] });
+    }
+    assert.equal(admissions, 1);
+  } finally {
+    await session.close();
+  }
+});

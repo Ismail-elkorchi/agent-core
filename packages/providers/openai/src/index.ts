@@ -320,7 +320,7 @@ export class OpenAIProvider implements ModelProvider {
   }
 
   private protocolFor(model: string) {
-    const modern = model === 'gpt-6-astra' && this.baseUrl === 'https://api.openai.com/v1';
+    const modern = GPT6_MODELS.has(model) && this.baseUrl === OPENAI_BASE_URL;
     return conservativeProtocolCapabilities(this.endpoint(), {
       reasoningAccounting: 'included_output',
       revision: modern ? 'responses-astra-2026-09-07-v1' : 'responses-2026-09-07-v1',
@@ -863,6 +863,17 @@ export class OpenAIProvider implements ModelProvider {
     const owned = parseModelRequest(request);
     throwIfAborted(owned.signal);
     assertModelRequestSupported(await this.describeModel(owned.model), owned);
+    if (
+      !this.modelProfiles[owned.model] && GPT6_MODELS.has(owned.model) &&
+      (owned.temperature !== undefined || owned.topP !== undefined ||
+        owned.logprobs !== undefined || owned.topLogprobs !== undefined) &&
+      (owned.reasoning?.strategy !== 'disabled' || owned.messages.some((item) => item.role === 'control'))
+    )
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'invalid_request',
+        message: 'GPT-6 sampling and logprob parameters require disabled reasoning without reasoning configuration updates.'
+      });
     for (const [index, item] of owned.messages.entries())
       if (item.role === 'protocol')
         await assertProviderContextCompatible(
@@ -903,32 +914,8 @@ export class OpenAIProvider implements ModelProvider {
 }
 
 function openAIBuiltInProfile(model: string): OpenAIBuiltInProfile | undefined {
-  if (model === 'gpt-6-astra')
-    return {
-      displayName: 'GPT-6 Astra',
-      limits: { contextTokens: 1_050_000, maxInputTokens: 922_000, outputTokens: 128_000 },
-      pricing: tieredOpenAIPricing(10, 50),
-      capabilities: {
-        temperature: false,
-        topP: false,
-        logprobs: false,
-        reasoning: {
-          strategies: ['effort'],
-          canDisable: false,
-          efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
-          modes: ['standard', 'pro'],
-          summaries: ['auto', 'concise', 'detailed'],
-          separateOutput: true
-        }
-      },
-      supportedParameters: DEFAULT_SUPPORTED_PARAMETERS.filter(
-        (parameter) => !['temperature', 'topP', 'logprobs', 'topLogprobs'].includes(parameter)
-      ),
-      metadata: {
-        profileSource: 'https://developers.openai.com/api/docs/models/gpt-6-astra',
-        verifiedAt: '2026-09-07'
-      }
-    };
+  const current = gpt6Profile(model);
+  if (current) return current;
   if (model === 'gpt-5.6-sol' || model === 'gpt-5.6')
     return gpt56Profile('GPT-5.6 Sol', 'sol', 5, 30);
   if (model === 'gpt-5.6-terra') return gpt56Profile('GPT-5.6 Terra', 'terra', 2.5, 15);
@@ -969,6 +956,47 @@ function openAIBuiltInProfile(model: string): OpenAIBuiltInProfile | undefined {
   return undefined;
 }
 
+// Verified profiles share the same Responses protocol; unknown model names do not inherit it.
+const GPT6_MODELS = new Map([
+  ['gpt-6-astra', { displayName: 'GPT-6 Astra', canDisable: false, input: 10, output: 50, cacheRead: 1 }],
+  ['gpt-6.1-sol', { displayName: 'GPT-6.1 Sol', canDisable: false, input: 2, output: 10, cacheRead: 0.1 }],
+  ['gpt-6-sol', { displayName: 'GPT-6 Sol', canDisable: true, input: 2, output: 10, cacheRead: 0.2 }],
+  ['gpt-6-luna', { displayName: 'GPT-6 Luna', canDisable: true, input: 0.1, output: 0.5, cacheRead: 0.01 }]
+]);
+
+function gpt6Profile(model: string): OpenAIBuiltInProfile | undefined {
+  const definition = GPT6_MODELS.get(model);
+  if (!definition) return undefined;
+  return {
+    displayName: definition.displayName,
+    limits: OPENAI_DEFAULT_LIMITS,
+    pricing: tieredOpenAIPricing(definition.input, definition.output, definition.cacheRead),
+    capabilities: {
+      temperature: definition.canDisable,
+      topP: definition.canDisable,
+      logprobs: definition.canDisable,
+      reasoning: {
+        strategies: ['effort'],
+        canDisable: definition.canDisable,
+        efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+        modes: ['standard', 'pro'],
+        summaries: ['auto', 'concise', 'detailed'],
+        separateOutput: true
+      }
+    },
+    supportedParameters: definition.canDisable ? DEFAULT_SUPPORTED_PARAMETERS :
+      DEFAULT_SUPPORTED_PARAMETERS.filter(
+        (parameter) => !['temperature', 'topP', 'logprobs', 'topLogprobs'].includes(parameter)
+      ),
+    metadata: {
+      profileSource: `https://developers.openai.com/api/docs/models/${model}`,
+      verifiedAt: '2026-10-10',
+      defaultReasoningEffort: 'medium',
+      defaultReasoningMode: 'standard'
+    }
+  };
+}
+
 function gpt56Profile(
   displayName: string,
   modelTier: string,
@@ -985,13 +1013,14 @@ function gpt56Profile(
 
 function tieredOpenAIPricing(
   inputRate: number,
-  outputRate: number
+  outputRate: number,
+  cacheReadRate = inputRate / 10
 ): NonNullable<ModelProfile['pricing']> {
   return {
     currency: 'USD',
     rates: {
       input: inputRate,
-      cacheRead: inputRate / 10,
+      cacheRead: cacheReadRate,
       cacheWrite: inputRate * 1.25,
       output: outputRate
     },

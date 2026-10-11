@@ -4,7 +4,7 @@ Run orchestration, governed inference, original history, session-owned working s
 
 The root exports contracts and in-memory repositories. Import `@agent-core/runtime/node` for `JsonlSessionRepository` and `JsonlInferenceRepository`. Applications supply storage locations explicitly.
 
-Application-owned working copies and publication policy do not belong to this package. Core records effect truth and finalizes runs; Coding Agent owns repository isolation, checks, diffs, and publication.
+Application-owned working copies and publication policy do not belong to this package. Core records effect truth and finalizes runs; Coding Agent owns repository guidance and host-access policy, checks, diffs, and publication.
 
 `EffectExecutionEvent` requires an observation for a settled state with a known outcome and forbids observations on other states. The event decoder verifies the observation's digest against the settlement before repository consumers use it.
 

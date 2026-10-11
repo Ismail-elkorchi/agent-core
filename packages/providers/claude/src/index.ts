@@ -179,14 +179,17 @@ export class ClaudeProvider implements ModelProvider {
   }
   createSession(): ModelProviderSession {
     return {
-      complete: (request) => this.complete(request),
-      stream: (request) => this.stream(request),
+      complete: (request, options) => this.complete(request, options),
+      stream: (request, options) => this.stream(request, options),
       completeCompiled: (request, options) => this.completeCompiled(request, options),
       streamCompiled: (request, options) => this.streamCompiled(request, options)
     };
   }
-  async complete(request: ModelRequest): Promise<ModelResponse> {
-    return this.completeCompiled(await this.compileRequest(request));
+  async complete(request: ModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
+    const signal = modelTransportSignal(request, options);
+    return this.completeCompiled(
+      await this.compileRequest({ ...request, ...(signal ? { signal } : {}) }), options
+    );
   }
   async completeCompiled(
     compiled: CompiledModelRequest,
@@ -204,8 +207,14 @@ export class ClaudeProvider implements ModelProvider {
       throw this.normalize(error, signal);
     }
   }
-  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
-    yield* this.streamCompiled(await this.compileRequest(request));
+  async *stream(
+    request: ModelRequest,
+    options?: ModelTransportOptions
+  ): AsyncIterable<ModelStreamEvent> {
+    const signal = modelTransportSignal(request, options);
+    yield* this.streamCompiled(
+      await this.compileRequest({ ...request, ...(signal ? { signal } : {}) }), options
+    );
   }
   async *streamCompiled(
     compiled: CompiledModelRequest,

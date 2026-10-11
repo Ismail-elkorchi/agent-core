@@ -4,7 +4,7 @@ import {
 } from '../context-admission.js';
 import { decodeEffectExecutionState, type EffectExecutionState } from '@agent-core/effects';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
-import { hashJson, type EventReference } from '@agent-core/persistence';
+import type { EventReference } from '@agent-core/persistence';
 import {
   decodePromptContextItemInput,
   type PromptContextItemInput
@@ -58,78 +58,38 @@ interface AgentProviderPhaseBase {
   readonly toolBatchId: string;
 }
 
+interface AgentAdmittedProviderPhase extends AgentProviderPhaseBase {
+  readonly invocationId: string;
+  readonly requestEventId: string;
+  readonly responseId: string;
+}
+
+interface AgentSettledProviderPhase extends AgentAdmittedProviderPhase {
+  readonly effect: Extract<EffectExecutionState, { readonly phase: 'settled' }>;
+  readonly settlementReference: EventReference;
+}
+
 export type AgentProviderPhase =
   | Readonly<AgentProviderPhaseBase & { readonly stage: 'ready' }>
-  | Readonly<
-      AgentProviderPhaseBase & {
-        readonly stage: 'effect_ready';
-        readonly requestEventId: string;
-        readonly responseId: string;
-        readonly effect: Extract<EffectExecutionState, { readonly phase: 'ticket_issued' }>;
-      }
-    >
-  | Readonly<
-      AgentProviderPhaseBase & {
-        readonly stage: 'effect_pending';
-        readonly requestEventId: string;
-        readonly responseId: string;
-        readonly effect: Extract<EffectExecutionState, { readonly phase: 'started' }>;
-      }
-    >
-  | Readonly<
-      AgentProviderPhaseBase & {
-        readonly stage: 'settled';
-        readonly requestEventId: string;
-        readonly responseId: string;
-        readonly effect: Extract<EffectExecutionState, { readonly phase: 'settled' }>;
-        readonly settlementReference: EventReference;
-      }
-    >
-  | Readonly<
-      AgentProviderPhaseBase & {
-        readonly stage: 'failed';
-        readonly requestEventId: string;
-        readonly responseId: string;
-        readonly effect: Extract<EffectExecutionState, { readonly phase: 'settled' }>;
-        readonly settlementReference: EventReference;
-      }
-    >
-  | Readonly<
-      AgentProviderPhaseBase & {
-        readonly stage: 'consumed';
-        readonly requestEventId: string;
-        readonly responseId: string;
-        readonly effect: Extract<EffectExecutionState, { readonly phase: 'settled' }>;
-        readonly settlementReference: EventReference;
-      }
-    >
-  | Readonly<
-      AgentProviderPhaseBase & {
-        readonly stage: 'outcome_unknown';
-        readonly requestEventId: string;
-        readonly responseId: string;
-        readonly effect: Extract<EffectExecutionState, { readonly phase: 'closed' }>;
-      }
-    >;
-
-export interface AgentDecisionRequest {
-  readonly id: string;
-  readonly reason: string;
-  readonly choices: readonly string[];
-  readonly fingerprint: string;
-  readonly runRevision: number;
-}
-
-export interface AgentDecisionContinuation {
-  readonly kind: 'cancelled_provider_start';
-  readonly blockedProvider: Readonly<
-    AgentProviderPhaseBase & {
-      readonly requestEventId: string;
-      readonly responseId: string;
+  | Readonly<AgentAdmittedProviderPhase & {
+      readonly stage: 'effect_ready';
+      readonly effect: Extract<EffectExecutionState, { readonly phase: 'ticket_issued' }>;
+    }>
+  | Readonly<AgentAdmittedProviderPhase & {
+      readonly stage: 'effect_pending';
+      readonly effect: Extract<EffectExecutionState, { readonly phase: 'started' }>;
+    }>
+  | Readonly<AgentSettledProviderPhase & { readonly stage: 'settled' }>
+  | Readonly<AgentSettledProviderPhase & { readonly stage: 'failed' }>
+  | Readonly<AgentSettledProviderPhase & { readonly stage: 'consumed' }>
+  | Readonly<AgentAdmittedProviderPhase & {
+      readonly stage: 'outcome_unknown';
       readonly effect: Extract<EffectExecutionState, { readonly phase: 'closed' }>;
-    }
-  >;
-}
+    }>
+  | Readonly<AgentAdmittedProviderPhase & {
+      readonly stage: 'cancelled';
+      readonly effect: Extract<EffectExecutionState, { readonly phase: 'closed' }>;
+    }>;
 
 export type AgentRunControlPhase =
   | Readonly<{ readonly kind: 'accepted' }>
@@ -149,13 +109,6 @@ export type AgentRunControlPhase =
       readonly reason:
         'provider_outcome_unknown' | 'tool_outcome_unknown' | 'missing_implementation';
       readonly effectId?: string;
-    }>
-  | Readonly<{
-      readonly kind: 'suspended';
-      readonly reason: 'user_decision';
-      readonly effectId: string;
-      readonly decisionRequest: AgentDecisionRequest;
-      readonly continuation: AgentDecisionContinuation;
     }>
   | Readonly<{
       readonly kind: 'suspended';
@@ -223,7 +176,7 @@ export type AgentRunInstruction =
   | Readonly<{
       readonly kind: 'wait';
       readonly reason:
-        'approval' | 'external_outcome' | 'user_decision' | 'context_admission' | 'driver';
+        'approval' | 'external_outcome' | 'missing_implementation' | 'context_admission' | 'driver';
     }>
   | Readonly<{ readonly kind: 'complete' }>;
 
@@ -257,9 +210,8 @@ export function nextAgentRunInstruction(state: AgentRunState): AgentRunInstructi
             ? 'context_admission'
             : state.phase.reason === 'approval'
               ? 'approval'
-              : state.phase.reason === 'user_decision' ||
-                  state.phase.reason === 'missing_implementation'
-                ? 'user_decision'
+              : state.phase.reason === 'missing_implementation'
+                ? 'missing_implementation'
                 : 'external_outcome'
       });
     case 'cancelling':
@@ -346,7 +298,7 @@ function activeInstructions(state: AgentRunState): readonly AgentRunInstruction[
             call.stage === 'recorded' || call.stage === 'resolved' || call.stage === 'cancelled'
         )
       ) &&
-      state.providerRequests.every((request) => request.stage === 'consumed')
+      state.providerRequests.every((request) => request.stage === 'consumed' || request.stage === 'cancelled')
     )
       execute('advance_after_tools');
     else if (
@@ -595,8 +547,7 @@ export function decodeAgentRunControlPhase(value: unknown): AgentRunControlPhase
           'provider_outcome_unknown',
           'tool_outcome_unknown',
           'missing_implementation',
-          'context_admission',
-          'user_decision'
+          'context_admission'
         ] as const,
         'phase.reason'
       );
@@ -617,34 +568,8 @@ export function decodeAgentRunControlPhase(value: unknown): AgentRunControlPhase
           approvalId: identifier(phase.approvalId, 'approvalId')
         });
       }
-      exact(
-        phase,
-        reason === 'user_decision'
-          ? ['kind', 'reason', 'effectId', 'decisionRequest', 'continuation']
-          : ['kind', 'reason', 'effectId']
-      );
+      exact(phase, ['kind', 'reason', 'effectId']);
       const effectId = optionalIdentifier(phase.effectId, 'phase.effectId');
-      if (reason === 'user_decision') {
-        if (!effectId) throw new TypeError('A user decision requires its blocked effect identity.');
-        const decisionRequest = decodeDecisionRequest(phase.decisionRequest);
-        const continuation = decodeDecisionContinuation(phase.continuation);
-        if (continuation.blockedProvider.effect.intent.effectId !== effectId)
-          throw new TypeError(
-            'Decision continuation effect identity does not match its suspension.'
-          );
-        const expectedFingerprint = hashJson({
-          id: decisionRequest.id,
-          reason: decisionRequest.reason,
-          choices: decisionRequest.choices,
-          runRevision: decisionRequest.runRevision,
-          effectId
-        });
-        if (decisionRequest.fingerprint !== expectedFingerprint)
-          throw new TypeError('Decision request fingerprint is inconsistent.');
-        if (decisionRequest.choices.length !== 1 || decisionRequest.choices[0] !== 'abort')
-          throw new TypeError('A cancelled provider start permits only abort.');
-        return Object.freeze({ kind, reason, effectId, decisionRequest, continuation });
-      }
       return Object.freeze({ kind, reason, ...(effectId ? { effectId } : {}) });
     }
     case 'cancelling':
@@ -671,6 +596,7 @@ export function decodeProviderPhase(value: unknown): AgentProviderPhase {
     'stage',
     'identity',
     'toolBatchId',
+    'invocationId',
     'requestEventId',
     'responseId',
     'effect',
@@ -685,10 +611,12 @@ export function decodeProviderPhase(value: unknown): AgentProviderPhase {
       'settled',
       'failed',
       'consumed',
-      'outcome_unknown'
+      'outcome_unknown',
+      'cancelled'
     ] as const,
     'phase.stage'
   );
+  const invocationId = optionalIdentifier(phase.invocationId, 'phase.invocationId');
   const requestEventId = optionalIdentifier(phase.requestEventId, 'phase.requestEventId');
   const responseId = optionalIdentifier(phase.responseId, 'phase.responseId');
   const settlementReference =
@@ -696,27 +624,27 @@ export function decodeProviderPhase(value: unknown): AgentProviderPhase {
       ? undefined
       : providerSettlementReference(phase.settlementReference);
   const effect = phase.effect === undefined ? undefined : decodeEffectExecutionState(phase.effect);
-  if (stage === 'ready' && (requestEventId || responseId || effect || settlementReference))
+  if (stage === 'ready' && (invocationId || requestEventId || responseId || effect || settlementReference))
     throw new TypeError('A ready provider phase cannot retain effect state.');
-  if (stage !== 'ready' && (!requestEventId || !responseId || !effect))
-    throw new TypeError(`Provider stage ${stage} requires request, response, and effect identity.`);
+  if (stage !== 'ready' && (!invocationId || !requestEventId || !responseId || !effect))
+    throw new TypeError(`Provider stage ${stage} requires invocation, request, response, and effect identity.`);
   const base = {
     kind,
     identity: decodeTurnIdentity(phase.identity),
     toolBatchId: identifier(phase.toolBatchId, 'phase.toolBatchId')
   } as const;
   if (stage === 'ready') return Object.freeze({ ...base, stage });
-  if (!requestEventId || !responseId || !effect)
+  if (!invocationId || !requestEventId || !responseId || !effect)
     throw new TypeError(`Provider stage ${stage} is incomplete.`);
   if (stage === 'effect_ready') {
     if (effect.phase !== 'ticket_issued')
       throw new TypeError('An effect-ready provider phase requires an issued ticket.');
-    return Object.freeze({ ...base, stage, requestEventId, responseId, effect });
+    return Object.freeze({ ...base, stage, invocationId, requestEventId, responseId, effect });
   }
   if (stage === 'effect_pending') {
     if (effect.phase !== 'started')
       throw new TypeError('An effect-pending provider phase requires a started effect.');
-    return Object.freeze({ ...base, stage, requestEventId, responseId, effect });
+    return Object.freeze({ ...base, stage, invocationId, requestEventId, responseId, effect });
   }
   if (stage === 'settled' || stage === 'failed' || stage === 'consumed') {
     if (effect.phase !== 'settled' || !settlementReference)
@@ -726,6 +654,7 @@ export function decodeProviderPhase(value: unknown): AgentProviderPhase {
     return Object.freeze({
       ...base,
       stage,
+      invocationId,
       requestEventId,
       responseId,
       effect,
@@ -734,56 +663,9 @@ export function decodeProviderPhase(value: unknown): AgentProviderPhase {
   }
   if (effect.phase !== 'closed')
     throw new TypeError('An unknown provider outcome requires a closed effect.');
-  return Object.freeze({ ...base, stage, requestEventId, responseId, effect });
-}
-
-function decodeDecisionRequest(value: unknown): AgentDecisionRequest {
-  const request = object(value, 'decision request');
-  exact(request, ['id', 'reason', 'choices', 'fingerprint', 'runRevision']);
-  const choices = uniqueIdentifiers(request.choices, 'decisionRequest.choices');
-  if (choices.length === 0) throw new TypeError('decisionRequest.choices must not be empty.');
-  return Object.freeze({
-    id: identifier(request.id, 'decisionRequest.id'),
-    reason: nonempty(request.reason, 'decisionRequest.reason'),
-    choices,
-    fingerprint: digest(request.fingerprint, 'decisionRequest.fingerprint'),
-    runRevision: nonnegativeInteger(request.runRevision, 'decisionRequest.runRevision')
-  });
-}
-
-function decodeDecisionContinuation(value: unknown): AgentDecisionContinuation {
-  const continuation = object(value, 'decision continuation');
-  exact(continuation, ['kind', 'blockedProvider']);
-  if (continuation.kind !== 'cancelled_provider_start')
-    throw new TypeError('Unknown decision continuation.');
-  const blockedProvider = object(continuation.blockedProvider, 'blocked provider continuation');
-  exact(blockedProvider, [
-    'kind',
-    'identity',
-    'toolBatchId',
-    'requestEventId',
-    'responseId',
-    'effect'
-  ]);
-  if (blockedProvider.kind !== 'provider')
-    throw new TypeError('Decision continuation must retain a blocked provider phase.');
-  const effect = decodeEffectExecutionState(blockedProvider.effect);
-  if (effect.phase !== 'closed' || effect.closure.reason !== 'cancelled_before_start')
-    throw new TypeError('Decision continuation must retain a provider effect closed before start.');
-  return Object.freeze({
-    kind: continuation.kind,
-    blockedProvider: Object.freeze({
-      kind: blockedProvider.kind,
-      identity: decodeTurnIdentity(blockedProvider.identity),
-      toolBatchId: identifier(blockedProvider.toolBatchId, 'decision continuation toolBatchId'),
-      requestEventId: identifier(
-        blockedProvider.requestEventId,
-        'decision continuation requestEventId'
-      ),
-      responseId: identifier(blockedProvider.responseId, 'decision continuation responseId'),
-      effect
-    })
-  });
+  if ((stage === 'cancelled') !== (effect.closure.reason === 'cancelled_before_start'))
+    throw new TypeError('Provider cancellation requires proof that execution never started.');
+  return Object.freeze({ ...base, stage, invocationId, requestEventId, responseId, effect });
 }
 
 function decodeTurnIdentity(value: unknown): AgentTurnIdentity {
@@ -824,11 +706,6 @@ function identifier(value: unknown, name: string): string {
   if (hasControlCharacter(result) || Buffer.byteLength(result, 'utf8') > 512)
     throw new TypeError(`${name} is invalid.`);
   return result;
-}
-function digest(value: unknown, name: string): string {
-  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/u.test(value))
-    throw new TypeError(`${name} must be a SHA-256 digest.`);
-  return value;
 }
 function hasControlCharacter(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {

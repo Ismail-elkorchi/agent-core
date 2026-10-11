@@ -126,7 +126,7 @@ function provider(runId) {
     stage: 'effect_pending',
     identity: { turnIndex: 2, turnId: 'r2:turn', requestAttempt: 1 },
     toolBatchId: 'r2',
-    requestEventId: 'request-r2',
+    invocationId: 'invocation-r2', requestEventId: 'request-r2',
     responseId: 'r2',
     effect: effect(runId, 'provider:r2')
   };

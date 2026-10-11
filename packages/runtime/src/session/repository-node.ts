@@ -1724,18 +1724,7 @@ function encodeSuspension(
     ...(suspension.contextAdmission === undefined
       ? {}
       : { contextAdmission: parseJsonValue(suspension.contextAdmission) }),
-    actions: Object.freeze([...suspension.actions]),
-    ...(suspension.decisionRequest === undefined
-      ? {}
-      : {
-          decisionRequest: Object.freeze({
-            id: suspension.decisionRequest.id,
-            reason: suspension.decisionRequest.reason,
-            choices: Object.freeze([...suspension.decisionRequest.choices]),
-            fingerprint: suspension.decisionRequest.fingerprint,
-            runRevision: suspension.decisionRequest.runRevision
-          })
-        })
+    actions: Object.freeze([...suspension.actions])
   });
 }
 

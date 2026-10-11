@@ -574,7 +574,7 @@ async function acceptApprovalRun(runs, runId) {
         stage: 'effect_ready',
         identity,
         toolBatchId: 'batch',
-        requestEventId: 'request',
+        invocationId: 'invocation', requestEventId: 'request',
         responseId: 'response',
         effect: issued.state
       }
@@ -594,7 +594,7 @@ async function acceptApprovalRun(runs, runId) {
         stage: 'effect_pending',
         identity,
         toolBatchId: 'batch',
-        requestEventId: 'request',
+        invocationId: 'invocation', requestEventId: 'request',
         responseId: 'response',
         effect: started.state
       }
@@ -614,7 +614,7 @@ async function acceptApprovalRun(runs, runId) {
         stage: 'settled',
         identity,
         toolBatchId: 'batch',
-        requestEventId: 'request',
+        invocationId: 'invocation', requestEventId: 'request',
         responseId: 'response',
         settlementReference: {
           runId,
@@ -731,7 +731,7 @@ async function acceptExternalRecoveryRun(runs, runId) {
     kind: 'provider',
     identity,
     toolBatchId: 'batch',
-    requestEventId: 'request',
+    invocationId: 'invocation', requestEventId: 'request',
     responseId: 'response'
   };
   await advance('authorize_provider_request', {
@@ -758,80 +758,6 @@ async function acceptExternalRecoveryRun(runs, runId) {
       }
     ]
   });
-}
-
-async function acceptUserDecisionRun(runs, runId) {
-  await acceptTestRun(runs, runId);
-  const driver = await runs.attach(runId, 'user-decision-driver');
-  const identity = { turnIndex: 1, turnId: 'turn', requestAttempt: 1 };
-  const advance = async (procedure, update) => {
-    const result = await driver.drive(({ instruction }) => {
-      assert.equal(instruction.procedure, procedure);
-      return { ...update, budget: testBudget() };
-    });
-    assert.equal(result.kind, 'advanced');
-  };
-  await advance('initialize_run', {
-    phase: { kind: 'initializing', step: 'assemble_turn', turnIndex: 1 }
-  });
-  await advance('assemble_turn', {
-    phase: { kind: 'active' },
-    providerRequests: [{ kind: 'provider', stage: 'ready', identity, toolBatchId: 'batch' }]
-  });
-  const issued = issueEffectStartTicket({
-    intent: {
-      effectId: 'provider-effect',
-      ownerId: runId,
-      implementationId: 'agent-core.tests.session-provider@1',
-      parametersDigest: '0'.repeat(64),
-      recovery: { kind: 'unknown' },
-      exposure: { quantities: [] }
-    },
-    ticketId: 'provider-ticket',
-    settlementPermitId: 'provider-permit',
-    driverGeneration: driver.state().driverGeneration,
-    currentDriverGeneration: driver.state().driverGeneration
-  });
-  assert.equal(issued.status, 'issued');
-  const blockedProvider = {
-    kind: 'provider',
-    identity,
-    toolBatchId: 'batch',
-    requestEventId: 'request',
-    responseId: 'response'
-  };
-  await advance('authorize_provider_request', {
-    phase: { kind: 'active' },
-    providerRequests: [{ ...blockedProvider, stage: 'effect_ready', effect: issued.state }]
-  });
-  const effect = closeExternalEffect(issued.state, 'cancelled_before_start');
-  const runRevision = driver.state().revision + 1;
-  const id = `${runId}:decision:${effect.intent.effectId}`;
-  const reason =
-    'The provider start was cancelled before execution; abort is the only safe continuation.';
-  const choices = ['abort'];
-  const fingerprint = hashJson({
-    id,
-    reason,
-    choices,
-    runRevision,
-    effectId: effect.intent.effectId
-  });
-  const decisionRequest = { id, reason, choices, fingerprint, runRevision };
-  await advance('start_provider_request', {
-    phase: {
-      kind: 'suspended',
-      reason: 'user_decision',
-      effectId: effect.intent.effectId,
-      decisionRequest,
-      continuation: {
-        kind: 'cancelled_provider_start',
-        blockedProvider: { ...blockedProvider, effect }
-      }
-    },
-    providerRequests: [{ ...blockedProvider, stage: 'outcome_unknown', effect }]
-  });
-  return Object.freeze({ ...decisionRequest, choices: Object.freeze(choices) });
 }
 
 test('AgentSession rejects a mismatched binding before restoration or runtime construction', async () => {
@@ -1452,98 +1378,6 @@ test('missing implementation suspension resumes only through its category-specif
   assert.equal(result.state, 'ended');
   assert.equal(resumes, 1);
   assert.equal(session.state().phase, 'idle');
-});
-
-test('durable user decisions enforce every identity and revision guard before abort continuation', async () => {
-  const repository = new InMemorySessionRepository();
-  const descriptor = await repository.create({
-    id: 'decision-suspension',
-    binding: TEST_SESSION_BINDING
-  });
-  const events = new InMemoryEventRepository(agentEventCodec);
-  const runs = new AgentRunCoordinator(events, new InMemoryArtifactRepository());
-  const runId = 'decision-run';
-  const request = await acceptUserDecisionRun(runs, runId);
-  await repository.enqueueSubmission(descriptor, {
-    submissionId: 'decision-submission',
-    runId,
-    input: { task: 'requires a decision' },
-    configuration: { provider: 'test', model: 'model' }
-  });
-  await repository.transitionSubmission(descriptor, 'decision-submission', { state: 'claimed' });
-  await repository.transitionSubmission(descriptor, 'decision-submission', {
-    state: 'suspended',
-    suspension: {
-      runId,
-      submissionId: 'decision-submission',
-      category: 'user_decision',
-      reason: 'user_decision',
-      effectId: 'provider-effect',
-      actions: ['decide', 'abort'],
-      decisionRequest: request
-    }
-  });
-  let resumes = 0;
-  const session = new AgentSession({
-    descriptor,
-    expectedBinding: TEST_SESSION_BINDING,
-    repository,
-    runs,
-    configuration: { provider: 'test', model: 'model' },
-    createRuntime() {
-      return {
-        resume(resumedRunId) {
-          resumes += 1;
-          const result = runs.inspect(resumedRunId).then((run) => {
-            assert.equal(run.state.control.status, 'abort_requested');
-            return { state: 'ended', terminal: { runId: resumedRunId }, deliveryDiagnostics: [] };
-          });
-          return {
-            runId: resumedRunId,
-            result,
-            injectSteering() {
-              throw new Error('unused');
-            },
-            abort() {}
-          };
-        }
-      };
-    }
-  });
-  await session.restore();
-  const suspension = session.inspectSuspension();
-  assert.equal(suspension.category, 'user_decision');
-  assert.deepEqual(suspension.actions, ['decide', 'abort']);
-  const exact = {
-    runId,
-    decisionRequestId: request.id,
-    choice: 'abort',
-    fingerprint: request.fingerprint,
-    expectedRunRevision: request.runRevision
-  };
-  await assert.rejects(
-    session.resolveDecision({ ...exact, runId: 'stale-run' }),
-    /suspended on run/u
-  );
-  await assert.rejects(
-    session.resolveDecision({ ...exact, decisionRequestId: 'stale-decision' }),
-    /stale/u
-  );
-  await assert.rejects(
-    session.resolveDecision({ ...exact, fingerprint: '0'.repeat(64) }),
-    /stale/u
-  );
-  await assert.rejects(
-    session.resolveDecision({ ...exact, expectedRunRevision: request.runRevision - 1 }),
-    /stale/u
-  );
-  await assert.rejects(session.resolveDecision({ ...exact, choice: 'retry' }), /not permitted/u);
-  await runs.requestAbort(runId, request.reason);
-  const result = await session.resolveDecision(exact);
-  assert.equal(result.state, 'ended');
-  assert.equal(resumes, 1);
-  await assert.rejects(session.resolveDecision(exact), /not suspended/u);
-  assert.equal(resumes, 1);
 });
 
 test('aborting a suspended submission commits cancellation before starting finalization', async () => {

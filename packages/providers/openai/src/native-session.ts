@@ -107,8 +107,11 @@ export class NativeResponsesSession implements ModelProviderSession {
     });
   }
 
-  async complete(request: ModelRequest): Promise<ModelResponse> {
-    return this.completeCompiled(await this.host.compileRequest(request));
+  async complete(request: ModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
+    const signal = modelTransportSignal(request, options);
+    return this.completeCompiled(
+      await this.host.compileRequest({ ...request, ...(signal ? { signal } : {}) }), options
+    );
   }
   async completeCompiled(
     compiled: CompiledModelRequest,
@@ -118,8 +121,14 @@ export class NativeResponsesSession implements ModelProviderSession {
       if (event.type === 'done') return event.response;
     throw failure('malformed_response', 'Native Responses ended without settlement.');
   }
-  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
-    yield* this.streamCompiled(await this.host.compileRequest(request));
+  async *stream(
+    request: ModelRequest,
+    options?: ModelTransportOptions
+  ): AsyncIterable<ModelStreamEvent> {
+    const signal = modelTransportSignal(request, options);
+    yield* this.streamCompiled(
+      await this.host.compileRequest({ ...request, ...(signal ? { signal } : {}) }), options
+    );
   }
   async steer(input: ModelSteeringSubmission): Promise<ModelSteeringDelivery> {
     return this.submit('steering', input, []);

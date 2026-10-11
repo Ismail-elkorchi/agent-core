@@ -806,32 +806,12 @@ export class AgentRuntime {
       const phase = currentProviderRequest(runState);
       if (phase?.stage === 'outcome_unknown') return runSuspension(run.state());
       if (phase?.stage === 'effect_ready') {
-        const closed = closeExternalEffect(phase.effect, 'cancelled_before_start');
-        const decisionRequest = cancelledProviderStartDecisionRequest(
-          run.state(),
-          closed.intent.effectId
+        await this.scheduleAbortRun(
+          runId, 'The run was interrupted before its provider request started.'
         );
-        await this.advanceRun(run, 'start_provider_request', {
-          phase: {
-            kind: 'suspended',
-            reason: 'user_decision',
-            effectId: closed.intent.effectId,
-            decisionRequest,
-            continuation: {
-              kind: 'cancelled_provider_start',
-              blockedProvider: {
-                kind: 'provider',
-                identity: phase.identity,
-                toolBatchId: phase.toolBatchId,
-                requestEventId: phase.requestEventId,
-                responseId: phase.responseId,
-                effect: closed
-              }
-            }
-          },
-          ...(run.state().budget ? { budget: run.state().budget } : {})
-        });
-        return runSuspension(run.state());
+        return await this.runInternal(
+          runInput(run.state()), abortController.signal, run, undefined, true
+        );
       }
       if (phase?.stage === 'effect_pending') {
         const settlement = await this.readProviderSettlement(
@@ -3820,19 +3800,29 @@ export class AgentRuntime {
         case 'begin_observation_recording':
         case 'record_tool_observation':
         case 'advance_after_tools':
-        case 'finalize_abort':
           await this.advanceRun(run, instruction, {
             phase: { kind: 'finalization', stage: 'ready' },
             budget
           });
           continue;
+        case 'finalize_abort':
         case 'start_provider_request': {
-          const provider = currentProviderRequest(state);
-          if (provider?.stage !== 'effect_ready')
-            throw new Error(`Run ${state.runId} has contradictory provider start state.`);
-          closeExternalEffect(provider.effect, 'cancelled_before_start');
+          const providerRequests = await Promise.all(state.providerRequests.map(async (request) => {
+            if (request.stage !== 'effect_ready') return request;
+            await this.inferenceService.cancelBeforeDispatch({
+              ownerId: this.options.inferenceOwnerId ?? state.runId,
+              invocationId: request.invocationId,
+              runId: state.runId
+            }, 'Run ended before provider dispatch.');
+            return {
+              ...request,
+              stage: 'cancelled' as const,
+              effect: closeExternalEffect(request.effect, 'cancelled_before_start')
+            };
+          }));
           await this.advanceRun(run, instruction, {
             phase: { kind: 'finalization', stage: 'ready' },
+            providerRequests,
             budget
           });
           continue;
@@ -4423,21 +4413,8 @@ function runSuspension(state: AgentRunState): AgentRunResult {
     reason: phase.reason,
     ...shared,
     ...('effectId' in phase && phase.effectId ? { effectId: phase.effectId } : {}),
-    ...(phase.reason === 'context_admission' ? { contextAdmission: phase.conflict } : {}),
-    ...(phase.reason === 'user_decision' ? { decisionRequest: phase.decisionRequest } : {})
+    ...(phase.reason === 'context_admission' ? { contextAdmission: phase.conflict } : {})
   };
-}
-function cancelledProviderStartDecisionRequest(
-  state: import('./run/control/contracts.js').AgentRunState,
-  effectId: string
-): import('./run/control/contracts.js').AgentDecisionRequest {
-  const runRevision = state.revision + 1;
-  const id = `${state.runId}:decision:${effectId}`;
-  const reason =
-    'The provider effect was durably plan but cannot be started after restoration. Aborting is the only safe continuation.';
-  const choices = Object.freeze(['abort']);
-  const fingerprint = hashJson({ id, reason, choices, runRevision, effectId });
-  return Object.freeze({ id, reason, choices, fingerprint, runRevision });
 }
 function toolRecoveryDecision(
   state: import('./run/control/contracts.js').AgentRunState
@@ -4535,7 +4512,7 @@ function promptInstructionRole(role: string | undefined): PromptInstruction['rol
 }
 
 function currentProviderRequest(state: AgentRunState): AgentProviderPhase | undefined {
-  return state.providerRequests.find((request) => request.stage !== 'consumed');
+  return state.providerRequests.find((request) => request.stage !== 'consumed' && request.stage !== 'cancelled');
 }
 function currentToolBatch(state: AgentRunState): AgentToolPhase | undefined {
   return state.toolBatches.find((batch) =>

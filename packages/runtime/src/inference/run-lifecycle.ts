@@ -236,6 +236,7 @@ export function createRunInferenceLifecycle(
       await turnRequest.run.transitionProvider('authorize_provider_request', identity, () => ({
         kind: 'provider',
         stage: 'effect_ready',
+        invocationId: requestFingerprint.requestId,
         identity,
         toolBatchId: turnRequest.toolBatchId,
         requestEventId: requestReceipt.eventId,

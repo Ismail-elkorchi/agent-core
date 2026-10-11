@@ -58,9 +58,6 @@ export interface AgentSessionState {
 
 export type AgentSessionSuspensionCategory = SessionSuspensionCategory;
 export type AgentSessionSuspensionAction = SessionSuspensionAction;
-export type AgentSessionDecisionRequest = NonNullable<
-  SessionSuspensionDescriptor['decisionRequest']
->;
 export type AgentSessionSuspensionDescriptor = SessionSuspensionDescriptor;
 
 export type AgentSessionEvent =
@@ -501,42 +498,6 @@ export class AgentSession {
 
   async resumeRuntime(expectedRunId: string): Promise<AgentRunResult> {
     return this.continueSuspension('runtime', expectedRunId);
-  }
-
-  async resolveDecision(input: {
-    readonly runId: string;
-    readonly decisionRequestId: string;
-    readonly choice: string;
-    readonly fingerprint: string;
-    readonly expectedRunRevision: number;
-  }): Promise<AgentRunResult> {
-    const started = await this.serial(async () => {
-      await this.restorePending();
-      if (this.active)
-        throw new Error(`Session ${this.options.descriptor.id} already has an active run.`);
-      const suspended = this.requireSuspension('user_decision', input.runId);
-      const run = await this.options.runs.inspect(input.runId);
-      const phase = run.state.phase;
-      if (phase.kind !== 'suspended' || phase.reason !== 'user_decision')
-        throw new Error(`Run ${input.runId} is not waiting for a user decision.`);
-      const request = phase.decisionRequest;
-      if (
-        request.id !== input.decisionRequestId ||
-        request.fingerprint !== input.fingerprint ||
-        request.runRevision !== input.expectedRunRevision ||
-        (run.state.control.status !== 'abort_requested' &&
-          run.state.revision !== input.expectedRunRevision)
-      ) {
-        throw new Error(`Decision request for run ${input.runId} is stale.`);
-      }
-      if (!request.choices.includes(input.choice))
-        throw new Error(`Decision choice ${input.choice} is not permitted for ${request.id}.`);
-      if (input.choice !== 'abort')
-        throw new Error(`Decision choice ${input.choice} has no implemented continuation.`);
-      await this.options.runs.requestAbort(input.runId, request.reason);
-      return this.startSuspendedSubmission(suspended);
-    });
-    return started.completion;
   }
 
   async resolveApproval(input: {
@@ -1221,16 +1182,6 @@ function runSuspensionDescriptor(
       reason: phase.reason,
       ...(phase.effectId ? { effectId: phase.effectId } : {}),
       actions: suspensionActions('resume', 'abort')
-    });
-  if (phase.reason === 'user_decision')
-    return Object.freeze({
-      runId: state.runId,
-      submissionId,
-      category: 'user_decision',
-      reason: phase.reason,
-      ...(phase.effectId ? { effectId: phase.effectId } : {}),
-      actions: suspensionActions('decide', 'abort'),
-      decisionRequest: phase.decisionRequest
     });
   return externalSuspension(submissionId, state.runId, phase.reason, phase.effectId);
 }

@@ -85,6 +85,9 @@ for (const kind of ['memory', 'jsonl']) {
     const point = await context.request({ idempotencyKey: 'fork-point', reason: 'Historical point' });
     await events.append('open-run', answer('Later parent answer', 2));
     const later = await history.capture();
+    await sessions.recordRunFinalization(session, terminal('open-run'));
+    await events.append('open-run', { type: 'run.ended', terminal: terminal('open-run') });
+    assert.deepEqual((await history.capture()).ledgerHeads, []);
     await sessions.branchFrom(session, point.entry.id, 'Independent child');
     const child = await history.capture();
     assert.equal(await history.extendsCut(ancestor, child), true);
@@ -871,3 +874,59 @@ test('history direct lookup, cut capture and bounded search do not call replay',
     afterSearch.bodyRecordsRead
   );
 });
+
+for (const kind of ['memory', 'jsonl']) {
+  test(`${kind}: repeated captures refresh unfinished runs, not the finalized archive`, async () => {
+    const { sessions, events } = await backend(kind);
+    const session = await sessions.create({ binding });
+    const history = new HistoryReader({ repository: sessions, session, events });
+    const lookups = [];
+    const tails = [];
+    const latest = events.latestReferenceOfType.bind(events);
+    const tail = events.tail.bind(events);
+    events.latestReferenceOfType = async (runId, type) => {
+      lookups.push(runId);
+      return latest(runId, type);
+    };
+    events.tail = async runId => {
+      tails.push(runId);
+      return tail(runId);
+    };
+    for (let at = 0; at < 140; at++) {
+      const runId = `completed-${at}`;
+      await sessions.appendInput(session, { runId, task: 'done' });
+      await sessions.recordRunFinalization(session, terminal(runId));
+      await events.append(runId, { type: 'run.ended', terminal: terminal(runId) });
+    }
+    assert.deepEqual((await history.capture()).ledgerHeads, []);
+    assert.equal(lookups.length, 140);
+    lookups.length = 0;
+    tails.length = 0;
+    await history.capture();
+    assert.deepEqual(lookups, []);
+    assert.deepEqual(tails, []);
+
+    await sessions.appendInput(session, { runId: 'active', task: 'new work' });
+    assert.deepEqual((await history.capture()).ledgerHeads.map(head => head.runId), ['active']);
+    assert.deepEqual(lookups, []);
+    assert.deepEqual(tails, ['active']);
+    await sessions.recordRunFinalization(session, terminal('active'));
+    // Session recording precedes the authoritative terminal event.
+    assert.equal((await history.capture()).ledgerHeads.length, 1);
+    assert.deepEqual(lookups, ['active']);
+    await events.append('active', { type: 'run.ended', terminal: terminal('active') });
+    assert.deepEqual((await history.capture()).ledgerHeads, []);
+    assert.deepEqual(lookups, ['active', 'active']);
+    lookups.length = 0;
+    tails.length = 0;
+    await history.capture();
+    await sessions.appendInput(session, { runId: 'next', task: 'next work' });
+    await history.capture();
+    assert.deepEqual(lookups, []);
+    assert.deepEqual(tails, ['next']);
+
+    const reopened = new HistoryReader({ repository: sessions, session, events });
+    assert.deepEqual((await reopened.capture()).ledgerHeads.map(head => head.runId), ['next']);
+    assert.equal(lookups.length, 141, 'reopening rebuilds terminal proofs from the owning ledgers');
+  });
+}

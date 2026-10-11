@@ -103,3 +103,24 @@ test('verified prefix-bound profiles reject changed authority and catalogs befor
   await assert.rejects(provider.compileRequest({ ...replay, messages: [{ role: 'system', content: 'Changed authority' }, ...replay.messages.slice(1)] }), /Earlier instructions/);
   assert.equal(sent.length, 2);
 });
+
+for (const target of ['provider', 'session']) {
+  for (const method of ['complete', 'stream', 'completeCompiled', 'streamCompiled']) {
+    test(`Claude ${target}.${method} preserves transport cancellation`, async () => {
+      let calls = 0;
+      const provider = new ClaudeProvider({ apiKey: 'fixture', countTokens: true, fetch: async (url) => {
+        calls++;
+        return Response.json(url.endsWith('count_tokens') ? { input_tokens: 25 } : payload);
+      } });
+      const receiver = target === 'provider' ? provider : provider.createSession();
+      const input = method.endsWith('Compiled') ? await provider.compileRequest(initial) : initial;
+      calls = 0;
+      await assert.rejects(async () => {
+        const result = receiver[method](input, { signal: AbortSignal.abort(new Error('cancelled')) });
+        if (method.startsWith('stream')) for await (const event of result) void event;
+        else await result;
+      }, error => error.code === 'aborted');
+      assert.equal(calls, 0, 'cancelled requests never dispatch');
+    });
+  }
+}

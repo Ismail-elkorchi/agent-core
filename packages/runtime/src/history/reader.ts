@@ -44,6 +44,63 @@ const MAX_RESULTS = 100;
 
 /** Host-bound source access. Routing metadata and immutable ledger boundaries precede body reads. */
 export class HistoryReader {
+  private captureIndex: {
+    snapshot: SessionSourceSnapshot;
+    /** Whether each unconfirmed run has been recorded in the session. */
+    readonly pending: Map<string, boolean>;
+    readonly ended: Set<string>;
+    readonly inherited: ReadonlyMap<string, HistoryLedgerHead>;
+  } | undefined;
+
+  /** Refresh only new branch metadata. Confirmed terminal commits are immutable. */
+  private captureRuns(snapshot: SessionSourceSnapshot) {
+    let index = this.captureIndex;
+    const previous = index?.snapshot;
+    const last = previous?.entries.at(-1);
+    const extendsPrevious =
+      previous?.branchId === snapshot.branchId &&
+      previous.sourceRevision <= snapshot.sourceRevision &&
+      previous.entries.length <= snapshot.entries.length &&
+      previous.finalizations.length <= snapshot.finalizations.length &&
+      (last === undefined ||
+        (snapshot.entries[previous.entries.length - 1]?.entryId === last.entryId &&
+          snapshot.entries[previous.entries.length - 1]?.sha256 === last.sha256));
+    if (!index || !extendsPrevious) {
+      index = {
+        snapshot,
+        pending: new Map(),
+        ended: new Set(),
+        inherited: inheritedHeads(snapshot)
+      };
+      this.captureIndex = index;
+    }
+    if (previous !== snapshot) {
+      for (
+        let at = extendsPrevious ? previous.entries.length : 0;
+        at < snapshot.entries.length;
+        at++
+      ) {
+        const runId = snapshot.entries[at]?.runId;
+        if (
+          runId && !index.ended.has(runId) &&
+          !index.inherited.has(runId) && !index.pending.has(runId)
+        )
+          index.pending.set(runId, false);
+      }
+      for (
+        let at = extendsPrevious ? previous.finalizations.length : 0;
+        at < snapshot.finalizations.length;
+        at++
+      ) {
+        const finalization = snapshot.finalizations[at];
+        if (finalization && index.pending.has(finalization.runId))
+          index.pending.set(finalization.runId, true);
+      }
+      index.snapshot = snapshot;
+    }
+    return index;
+  }
+
   constructor(
     private readonly options: {
       readonly repository: SessionRepository;
@@ -63,30 +120,22 @@ export class HistoryReader {
       sourceRevision: snapshot.sourceRevision
     };
     if (!this.options.events) return Object.freeze({ ...boundary, ledgerCoverage: 'session' });
-    const finalized = finalizedRuns(snapshot);
-    const inherited = inheritedHeads(snapshot);
-    const heads: HistoryLedgerHead[] = [];
-    for (const runId of new Set(
-      snapshot.entries.flatMap((entry) => (entry.runId ? [entry.runId] : []))
-    )) {
-      const pinned = inherited.get(runId);
-      if (pinned) {
-        heads.push(pinned);
+    const index = this.captureRuns(snapshot);
+    const heads: HistoryLedgerHead[] = [...index.inherited.values()];
+    // Own this capture's work before awaiting: another capture may observe a later boundary.
+    const pending = [...index.pending];
+    for (const [runId, finalized] of pending) {
+      if (finalized && (await this.options.events.latestReferenceOfType(runId, 'run.ended'))) {
+        index.ended.add(runId);
+        index.pending.delete(runId);
         continue;
       }
-      if (
-        finalized.has(runId) &&
-        (await this.options.events.latestReferenceOfType(runId, 'run.ended'))
-      )
-        continue;
       const tail = await this.options.events.tail(runId);
-      heads.push(
-        Object.freeze({
-          runId,
-          sequence: tail.sequence,
-          ...(tail.hash ? { hash: tail.hash } : {})
-        })
-      );
+      heads.push(Object.freeze({
+        runId,
+        sequence: tail.sequence,
+        ...(tail.hash ? { hash: tail.hash } : {})
+      }));
     }
 
     return Object.freeze({

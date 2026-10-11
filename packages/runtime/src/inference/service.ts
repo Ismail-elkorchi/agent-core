@@ -234,6 +234,29 @@ export class InferenceService {
     return (await this.options.repository.load(ownerId, { runId })).settledUsage;
   }
 
+  /** The caller must durably fence dispatch and prove this invocation has never started. */
+  async cancelBeforeDispatch(
+    identity: Pick<InferenceIdentity, 'ownerId' | 'invocationId' | 'runId'>,
+    message: string
+  ): Promise<void> {
+    const { repository } = this.options;
+    for (;;) {
+      const state = await repository.load(identity.ownerId, { invocationId: identity.invocationId });
+      const prior = state.invocation;
+      if (prior?.start.runId !== (identity.runId ?? null))
+        throw new Error('Inference cancellation does not match its admitted invocation.');
+      if (prior.notSent) return;
+      if (prior.settlement || prior.uncertain || prior.rejected || prior.extension)
+        throw new Error('Inference admission cannot be released after dispatch evidence.');
+      if (await repository.append(identity.ownerId, {
+        type: 'inference.not_sent',
+        invocationId: identity.invocationId,
+        permit: prior.start.permit,
+        message
+      }, state.tail)) return;
+    }
+  }
+
   async contextRejection(ownerId: string, invocationId: string) {
     return (await this.options.repository.load(ownerId, { invocationId })).invocation?.rejected;
   }
@@ -946,35 +969,7 @@ export class InferenceService {
         signal?.throwIfAborted();
       } catch (cause) {
         const message = cause instanceof Error ? cause.message : String(cause);
-        for (;;) {
-          const state = await repository.load(identity.ownerId, {
-            invocationId: identity.invocationId
-          });
-          const prior = state.invocation;
-          if (
-            prior?.start.permit !== permit ||
-            prior.settlement ||
-            prior.uncertain ||
-            prior.rejected
-          )
-            throw new Error('Inference admission cannot be released after dispatch evidence.', {
-              cause
-            });
-          if (
-            prior.notSent ||
-            (await repository.append(
-              identity.ownerId,
-              {
-                type: 'inference.not_sent',
-                invocationId: identity.invocationId,
-                permit,
-                message
-              },
-              state.tail
-            ))
-          )
-            break;
-        }
+        await this.cancelBeforeDispatch(identity, message);
         throw new InferenceNotSentError(identity.invocationId, message);
       }
     };

@@ -323,7 +323,6 @@ export function ownSessionSuspensionDescriptor(value: unknown): SessionSuspensio
     'reason',
     'effectId',
     'actions',
-    'decisionRequest',
     'contextAdmission',
     'diagnostic'
   ]);
@@ -349,9 +348,7 @@ export function ownSessionSuspensionDescriptor(value: unknown): SessionSuspensio
         ? ['reconcile', 'abort']
         : category === 'context_admission'
           ? ['context', 'abort']
-          : category === 'runtime'
-            ? ['resume', 'abort']
-            : ['decide', 'abort'];
+          : ['resume', 'abort'];
   if (
     actions.length !== expected.length ||
     !actions.every((action, index) => action === expected[index])
@@ -360,7 +357,6 @@ export function ownSessionSuspensionDescriptor(value: unknown): SessionSuspensio
   if (
     (category === 'approval') !== (reason === 'approval_required') ||
     (category === 'runtime') !== (reason === 'missing_implementation' || reason === 'runtime_failed') ||
-    (category === 'user_decision') !== (reason === 'user_decision') ||
     (category === 'context_admission') !== (reason === 'context_admission')
   )
     throw new TypeError('Session suspension category does not match its reason.');
@@ -375,27 +371,13 @@ export function ownSessionSuspensionDescriptor(value: unknown): SessionSuspensio
     throw new TypeError(
       'Context admission suspension requires its conflict and cannot identify an effect.'
     );
-  const request =
-    object.decisionRequest === undefined ? undefined : ownDecisionRequest(object.decisionRequest);
-  if (category === 'user_decision' && request === undefined)
-    throw new TypeError('Session user-decision suspension requires a decision request.');
-  if (category !== 'user_decision' && request !== undefined)
-    throw new TypeError('Only user-decision suspensions may contain a decision request.');
   const descriptor = {
     runId,
     submissionId,
     category,
     ...(effectId === undefined ? {} : { effectId }),
     actions: Object.freeze(actions),
-    ...(contextAdmission === undefined ? {} : { contextAdmission }),
-    ...(request === undefined
-      ? {}
-      : {
-          decisionRequest: Object.freeze({
-            ...request,
-            choices: Object.freeze([...request.choices])
-          })
-        })
+    ...(contextAdmission === undefined ? {} : { contextAdmission })
   };
   return reason === 'runtime_failed'
     ? Object.freeze({ ...descriptor, reason, diagnostic: suspensionString(object.diagnostic, 'diagnostic') })
@@ -413,7 +395,6 @@ function suspensionCategory(value: unknown): SessionSuspensionCategory {
     value !== 'approval' &&
     value !== 'external_recovery' &&
     value !== 'runtime' &&
-    value !== 'user_decision' &&
     value !== 'context_admission'
   )
     throw new TypeError('Session suspension category is invalid.');
@@ -427,7 +408,6 @@ function suspensionReason(value: unknown): SessionSuspensionDescriptor['reason']
     value !== 'tool_outcome_unknown' &&
     value !== 'missing_implementation' &&
     value !== 'runtime_failed' &&
-    value !== 'user_decision' &&
     value !== 'context_admission'
   )
     throw new TypeError('Session suspension reason is invalid.');
@@ -439,55 +419,11 @@ function suspensionAction(value: unknown): SessionSuspensionAction {
     value !== 'approval' &&
     value !== 'reconcile' &&
     value !== 'resume' &&
-    value !== 'decide' &&
     value !== 'context' &&
     value !== 'abort'
   )
     throw new TypeError('Session suspension action is invalid.');
   return value;
-}
-
-function ownDecisionRequest(
-  value: unknown
-): NonNullable<SessionSuspensionDescriptor['decisionRequest']> {
-  const object = parseJsonObject(value);
-  if (
-    Object.keys(object).length !== 5 ||
-    !Object.keys(object).every(
-      (field) =>
-        field === 'id' ||
-        field === 'reason' ||
-        field === 'choices' ||
-        field === 'fingerprint' ||
-        field === 'runRevision'
-    )
-  ) {
-    throw new TypeError('Session decision request has unsupported or missing fields.');
-  }
-  const id = suspensionString(object.id, 'decision request id');
-  const reason = suspensionString(object.reason, 'decision request reason');
-  if (
-    !Array.isArray(object.choices) ||
-    object.choices.length === 0 ||
-    !object.choices.every((choice) => typeof choice === 'string' && choice.length > 0)
-  )
-    throw new TypeError('Session decision request choices are invalid.');
-  const choices = Object.freeze(object.choices.map((choice) => String(choice)));
-  if (typeof object.fingerprint !== 'string' || !/^[a-f0-9]{64}$/u.test(object.fingerprint))
-    throw new TypeError('Session decision request fingerprint is invalid.');
-  if (
-    typeof object.runRevision !== 'number' ||
-    !Number.isSafeInteger(object.runRevision) ||
-    object.runRevision < 0
-  )
-    throw new TypeError('Session decision request revision is invalid.');
-  return Object.freeze({
-    id,
-    reason,
-    choices,
-    fingerprint: object.fingerprint,
-    runRevision: object.runRevision
-  });
 }
 
 function submissionTransitionState(

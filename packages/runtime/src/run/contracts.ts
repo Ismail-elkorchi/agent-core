@@ -105,10 +105,8 @@ export interface AgentRunSuspension extends AgentRunIdentity {
     | 'provider_outcome_unknown'
     | 'tool_outcome_unknown'
     | 'missing_implementation'
-    | 'context_admission'
-    | 'user_decision';
+    | 'context_admission';
   readonly effectId?: string;
-  readonly decisionRequest?: import('./control/contracts.js').AgentDecisionRequest;
   readonly cleanupDiagnostic?: {
     readonly kind: 'resource_cleanup';
     readonly message: string;

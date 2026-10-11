@@ -20,7 +20,6 @@ import type {
   AgentToolCallIdentity,
   AgentTurnIdentity
 } from '../run/contracts.js';
-import type { AgentDecisionRequest } from '../run/control/contracts.js';
 import type { SessionBinding, SessionBindingInput } from './binding.js';
 
 export type SessionHeader = Readonly<{
@@ -263,13 +262,11 @@ export type SessionSuspensionCategory =
   | 'approval'
   | 'external_recovery'
   | 'runtime'
-  | 'context_admission'
-  | 'user_decision';
+  | 'context_admission';
 export type SessionSuspensionAction =
   | 'approval'
   | 'reconcile'
   | 'resume'
-  | 'decide'
   | 'context'
   | 'abort';
 interface SessionSuspensionScope {
@@ -279,7 +276,6 @@ interface SessionSuspensionScope {
   readonly category: SessionSuspensionCategory;
   readonly effectId?: string;
   readonly actions: readonly SessionSuspensionAction[];
-  readonly decisionRequest?: AgentDecisionRequest;
 }
 
 export type SessionSuspensionDescriptor = SessionSuspensionScope & (
@@ -289,7 +285,7 @@ export type SessionSuspensionDescriptor = SessionSuspensionScope & (
     }>
   | Readonly<{
       reason: 'approval_required' | 'provider_outcome_unknown' | 'tool_outcome_unknown' |
-        'missing_implementation' | 'context_admission' | 'user_decision';
+        'missing_implementation' | 'context_admission';
       diagnostic?: never;
     }>
 );

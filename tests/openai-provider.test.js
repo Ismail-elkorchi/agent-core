@@ -810,3 +810,45 @@ test('OpenAI compilation uses an explicit reservation without an adapter output 
   assert.equal(governed.body.max_output_tokens, 900);
   assert.equal(governed.accounting.outputReservation, 900);
 });
+
+for (const [model, canDisable, input, cacheRead, output] of [
+  ['gpt-6-luna', true, 0.1, 0.01, 0.5],
+  ['gpt-6-sol', true, 2, 0.2, 10],
+  ['gpt-6.1-sol', false, 2, 0.1, 10]
+]) {
+  test(`OpenAI verifies ${model} with its reasoning, pricing and native contract`, async () => {
+    const provider = new OpenAIProvider({ apiKey: 'fixture', transport: 'websocket' });
+    const profile = await provider.describeModel(model);
+    assert.equal(profile.capabilities.reasoning.canDisable, canDisable);
+    assert.ok(profile.capabilities.reasoning.efforts.includes('max'));
+    assert.deepEqual(profile.pricing.rates, { input, cacheRead, cacheWrite: input * 1.25, output });
+    assert.equal(profile.capabilities.protocol.asyncTools, true);
+    assert.equal(profile.capabilities.protocol.steering, 'native');
+    assert.deepEqual(profile.capabilities.protocol.contextTransforms, ['responses.compact']);
+    const compiled = await provider.compileRequest({
+      model, messages: [{ role: 'user', content: 'Inspect' }], maxOutputTokens: 100,
+      reasoning: { strategy: 'effort', effort: 'max' },
+      tools: [{ type: 'function', async: true, function: { name: 'lookup', parameters: { type: 'object', properties: {} } } }]
+    });
+    assert.equal(compiled.body.model, model);
+    assert.equal(compiled.body.tools[0].async, true);
+    assert.equal(compiled.body.reasoning.effort, 'max');
+    const disabled = { model, messages: [{ role: 'user', content: 'Inspect' }], reasoning: { strategy: 'disabled' } };
+    if (canDisable) {
+      assert.equal((await provider.compileRequest(disabled)).body.reasoning.effort, 'none');
+      for (const parameters of [{ temperature: 0.5 }, { topP: 0.9 }, { logprobs: true }, { logprobs: true, topLogprobs: 1 }]) {
+        await assert.rejects(provider.compileRequest({ ...disabled, reasoning: undefined, ...parameters }), /require disabled reasoning/);
+        await provider.compileRequest({ ...disabled, ...parameters });
+      }
+      await assert.rejects(provider.compileRequest({
+        ...disabled, temperature: 0.5,
+        messages: [...disabled.messages, { role: 'control', content: '', update: {
+          type: 'configuration', id: 'effort-change', reasoning: { strategy: 'effort', effort: 'low' }
+        } }]
+      }), /require disabled reasoning/);
+    }
+    else await assert.rejects(provider.compileRequest(disabled), /disable|reasoning/);
+    const proxy = new OpenAIProvider({ baseUrl: 'https://proxy.test/v1' });
+    assert.equal((await proxy.describeModel(model)).capabilities.protocol.asyncTools, false);
+  });
+}

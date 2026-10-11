@@ -455,7 +455,7 @@ test('cancellation fences provider authorization and start even in a finalizing 
     });
     assert.equal(issued.status, 'issued');
     const authorized = {
-      ...ready, stage: 'effect_ready', requestEventId: 'request-1', responseId: 'response-1',
+      ...ready, stage: 'effect_ready', invocationId: 'invocation-1', requestEventId: 'request-1', responseId: 'response-1',
       effect: issued.state
     };
     if (boundary === 'start') {
