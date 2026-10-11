@@ -169,12 +169,12 @@ export async function* readJsonSseEvents<T>(
         break;
       }
       idleStartedAt = Date.now();
-      pendingRead = reader.read();
       buffer += decoder.decode(value, { stream: true });
       assertBounded(buffer, maximum, options);
       const drained = drainJsonSseBuffer(buffer, options);
       buffer = drained.remainder;
       yield* drained.events;
+      pendingRead = reader.read();
     }
     buffer += decoder.decode();
     assertBounded(buffer, maximum, options);
