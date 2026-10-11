@@ -11,7 +11,10 @@ import type { TuiEffect } from '@ismail-elkorchi/terminal-ui/tui';
 export interface ResourceSuggestion {
   readonly id: string;
   readonly label: string;
-  readonly insertion: string;
+  /** Literal reference; the composer owns quoting and insertion. */
+  readonly reference: string;
+  /** Continue searching within this reference, for example after choosing a directory. */
+  readonly continueSearch?: boolean;
 }
 export interface ResourceSearch {
   search(query: string, signal: AbortSignal): Promise<readonly ResourceSuggestion[]>;
@@ -55,21 +58,39 @@ export function completeResource(
     input.selection.anchor.offset !== input.selection.focus.offset
   )
     return undefined;
-  const end = input.caret.position.offset;
-  const before = textDocumentText(input.document).slice(0, end);
-  const query = /(?:^|\s)@([^\s@]*)$/u.exec(before)?.[1];
-  if (query === undefined) return undefined;
+  const reference = referenceAt(textDocumentText(input.document), input.caret.position.offset);
+  if (reference === undefined) return undefined;
   return {
     id: crypto.randomUUID(),
     input,
-    start: end - query.length - 1,
-    end,
-    query,
+    ...reference,
     phase: 'loading',
     items: previous?.items ?? [],
     selected: previous?.selected ?? 0
   };
 }
+
+function referenceAt(source: string, caret: number) {
+  // Match complete references so an edit in the middle also replaces the old suffix.
+  for (const match of source.matchAll(/(?:^|\s)@(?:"(?:\\[^\r\n]|[^"\\\r\n])*"?|[^\s@"]*)/gu)) {
+    const start = match.index + match[0].indexOf('@');
+    const end = match.index + match[0].length;
+    if (start >= caret) break;
+    if (caret > end) continue;
+    const prefix = source.slice(start + 1, caret);
+    if (!prefix.startsWith('"')) return { start, end, query: prefix };
+    const closed = prefix.length > 1 && /(?:^|[^\\])(?:\\\\)*"$/u.test(prefix);
+    try {
+      const query: unknown = JSON.parse(closed ? prefix : `${prefix}"`);
+      return typeof query === 'string' ? { start, end, query } : undefined;
+    } catch {
+      // An unfinished escape is ordinary editor input until it can identify a resource.
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
 export function searchResources(
   state: ResourceCompletion,
   operations: ResourceSearch
@@ -129,20 +150,30 @@ export function acceptResource(
   state: ResourceCompletion,
   input: TextAreaState,
   id?: string
-): TextAreaState {
-  if (state.phase !== 'ready' || input !== state.input) return input;
+): { readonly input: TextAreaState; readonly completion?: ResourceCompletion } {
+  if (input !== state.input) return { input };
+  if (state.phase !== 'ready') return { input, completion: state };
   const item =
     id === undefined ? state.items[state.selected] : state.items.find((item) => item.id === id);
-  return item === undefined
-    ? input
-    : textAreaReducer(input, {
-        kind: 'edit',
-        operation: {
-          kind: 'replaceRange',
-          range: { startOffset: state.start, endOffsetExclusive: state.end },
-          text: item.insertion
-        }
-      }).state;
+  if (item === undefined) return { input, completion: state };
+  const quoted = /[\s"\\@]/u.test(item.reference);
+  const reference = `@${quoted ? JSON.stringify(item.reference) : item.reference}`;
+  const following = textDocumentText(input.document).slice(state.end, state.end + 1);
+  const separator = item.continueSearch || /\s/u.test(following) ? '' : ' ';
+  const next = textAreaReducer(input, {
+    kind: 'applyChanges',
+    changeSet: {
+      changes: [{
+        startOffset: state.start,
+        endOffsetExclusive: state.end,
+        insertedText: reference + separator
+      }]
+    },
+    caretOffset:
+      state.start + reference.length + separator.length - (item.continueSearch && quoted ? 1 : 0)
+  }).state;
+  const completion = item.continueSearch ? completeResource(next) : undefined;
+  return { input: next, ...(completion === undefined ? {} : { completion }) };
 }
 export function resourceCompletionRows(state?: ResourceCompletion, limit = 5): number {
   return state === undefined ? 0 : Math.max(1, Math.min(limit, state.items.length)) + 1;
