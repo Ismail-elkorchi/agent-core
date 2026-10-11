@@ -36,6 +36,12 @@ function assertNoDistImports(source, file) {
     throw new Error(`${file} imports generated package internals.`);
 }
 
+function exportedFiles(value) {
+  return typeof value === 'string'
+    ? [value.replace(/^\.\//u, '')]
+    : Object.values(value ?? {}).flatMap(exportedFiles);
+}
+
 const temporary = await mkdtemp(path.join(tmpdir(), 'agent-core-packed-consumer-'));
 try {
   const packs = path.join(temporary, 'packs');
@@ -53,8 +59,9 @@ try {
     const packed = JSON.parse(stdout)[0];
     const files = packed.files.map((file) => file.path);
     assertCleanArchivePaths(files);
-    if (!files.some((file) => file.startsWith('dist/')))
-      throw new Error(`${relative} is missing compiled output.`);
+    for (const entry of exportedFiles([manifest.main, manifest.types, manifest.exports]))
+      if (!files.includes(entry))
+        throw new Error(`${relative} is missing exported file ${entry}.`);
     for (const file of files.filter((name) => name.endsWith('.d.ts'))) {
       const declaration = await readFile(path.join(directory, file), 'utf8');
       const retired =
