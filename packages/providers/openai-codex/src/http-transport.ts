@@ -8,6 +8,7 @@ import {
 } from '@agent-core/model';
 import {
   decodeHttpFailure,
+  retryAfterDeadline,
   decodeResponsesStreamData,
   readBoundedResponseText,
   readJsonSseEvents,
@@ -262,6 +263,7 @@ async function throwIfBadResponse(config: CodexHttpTransportConfig, response: Re
   if (response.ok) {
     return;
   }
+  const retryNotBefore = retryAfterDeadline(response.headers.get('retry-after'));
   const { text: body, truncated } = await readBoundedResponseText(response);
   if (response.status === 401) {
     await config.tokenProvider.invalidate?.('unauthorized');
@@ -273,6 +275,7 @@ async function throwIfBadResponse(config: CodexHttpTransportConfig, response: Re
     code: failure.code,
     message: `OpenAI Codex request failed with HTTP ${String(response.status)}: ${extractedMessage}`,
     retryable: failure.retryable,
+    ...(retryNotBefore === undefined ? {} : { retryNotBefore }),
     diagnostic: {
       transport: 'http_sse',
       causeSummary: {

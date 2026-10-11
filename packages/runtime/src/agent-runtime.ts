@@ -2570,12 +2570,19 @@ export class AgentRuntime {
                 decision: failedGenerationDecision(completedAttempt.diagnostic, request.turnIndex)
               };
             generationRetries++;
+            const retryAt = Math.max(
+              Date.now() + 500 * generationRetries,
+              completedAttempt.diagnostic.retryNotBefore ?? 0
+            );
             await emit({
               type: 'assistant.status',
               ...identity,
-              message: `Generation interrupted. Retrying (${String(generationRetries)}/2).`
+              message: `Generation failed. Retrying in ${String(Math.max(0, Math.ceil((retryAt - Date.now()) / 1000)))}s (${String(generationRetries)}/2).`
             });
-            await delay(500 * generationRetries, undefined, { signal: request.signal });
+            for (let remaining = retryAt - Date.now(); remaining > 0; remaining = retryAt - Date.now())
+              await delay(Math.min(remaining, 2_147_483_647), undefined, {
+                signal: request.signal
+              });
           }
           const snapshot = {
             ...request.snapshot,

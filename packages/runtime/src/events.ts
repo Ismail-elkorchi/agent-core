@@ -1743,6 +1743,7 @@ function decodeDiagnostic(
     'provider',
     'code',
     'retryable',
+    'retryNotBefore',
     'transport',
     'eventType',
     'causeSummary',
@@ -1750,6 +1751,9 @@ function decodeDiagnostic(
   ]);
   const transport = optionalStringValue(object.transport, 'diagnostic.transport');
   const eventType = optionalStringValue(object.eventType, 'diagnostic.eventType');
+  const retryNotBefore = optionalNonnegativeNumber(object.retryNotBefore, 'diagnostic.retryNotBefore');
+  if (retryNotBefore !== undefined && !Number.isSafeInteger(retryNotBefore))
+    throw malformed('diagnostic.retryNotBefore must be safe UTC epoch milliseconds');
   const causeSummary =
     object.causeSummary === undefined
       ? undefined
@@ -1774,6 +1778,7 @@ function decodeDiagnostic(
       'diagnostic.code'
     ),
     retryable: requiredBoolean(object.retryable, 'diagnostic.retryable'),
+    ...(retryNotBefore === undefined ? {} : { retryNotBefore }),
     ...(transport !== undefined ? { transport } : {}),
     ...(eventType !== undefined ? { eventType } : {}),
     ...(causeSummary ? { causeSummary } : {}),

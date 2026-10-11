@@ -48,6 +48,7 @@ import {
 } from '@agent-core/model';
 import {
   decodeHttpFailure,
+  retryAfterDeadline,
   decodeResponsesPayload,
   decodeResponsesStreamData,
   readBoundedJsonResponse,
@@ -899,6 +900,7 @@ export class OpenAIProvider implements ModelProvider {
     if (response.ok) {
       return;
     }
+    const retryNotBefore = retryAfterDeadline(response.headers.get('retry-after'));
     const { text: body, truncated } = await readBoundedResponseText(response);
     if (response.status === 401) {
       await this.tokenProvider.invalidate?.('unauthorized');
@@ -910,6 +912,7 @@ export class OpenAIProvider implements ModelProvider {
       code: failure.code,
       message: `OpenAI request failed with HTTP ${String(response.status)}: ${extractedMessage}`,
       retryable: failure.retryable,
+      ...(retryNotBefore === undefined ? {} : { retryNotBefore }),
       diagnostic: {
         transport: 'http',
         causeSummary: {

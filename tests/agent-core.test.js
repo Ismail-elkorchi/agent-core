@@ -1546,6 +1546,68 @@ test('generation retries require a fresh admission within the original owner bud
   assert.equal((await inference.load(result.runId)).committed.invocations, 1);
 });
 
+test('generation retries honor and durably preserve the provider retry deadline', async () => {
+  let retryNotBefore;
+  let retriedAt;
+  const provider = new ScriptedProvider([
+    () => {
+      retryNotBefore = Date.now() + 1100;
+      throw new ModelProviderError({
+        provider: 'scripted',
+        code: 'rate_limited',
+        message: 'Wait for capacity',
+        retryable: true,
+        retryNotBefore
+      });
+    },
+    () => {
+      retriedAt = Date.now();
+      return response();
+    }
+  ]);
+  const fixture = await harness({ provider, withoutSession: true });
+  const result = ended(await fixture.agent.run({ task: 'Wait for provider capacity.' }).result);
+  assert.equal(result.executionStatus, 'completed');
+  assert.equal(provider.calls.length, 2);
+  assert(retriedAt >= retryNotBefore, 'automatic retry must not precede the provider deadline');
+  const records = await eventsFor(fixture.events, result.runId);
+  const failed = records.find((event) => event.type === 'provider.attempt.failed');
+  assert.equal(failed.diagnostic.retryNotBefore, retryNotBefore);
+});
+
+test('a long provider retry delay remains cancellable without overflowing the host timer', async (t) => {
+  const warnings = [];
+  t.mock.method(process, 'emitWarning', (...args) => warnings.push(args));
+  const controller = new AbortController();
+  let timer;
+  t.after(() => clearTimeout(timer));
+  const provider = new ScriptedProvider([
+    new ModelProviderError({
+      provider: 'scripted',
+      code: 'rate_limited',
+      message: 'Wait for capacity',
+      retryable: true,
+      retryNotBefore: Date.now() + 3_000_000_000
+    }),
+    response()
+  ]);
+  const fixture = await harness({
+    provider,
+    withoutSession: true,
+    onProgress(event) {
+      if (event.type === 'assistant.status' && event.message.includes('Retrying'))
+        timer = setTimeout(() => controller.abort('Cancel the wait'), 50);
+    }
+  });
+  const result = ended(
+    await fixture.agent.run({ task: 'Wait for provider capacity.', signal: controller.signal })
+      .result
+  );
+  assert.equal(result.executionStatus, 'aborted');
+  assert.equal(provider.calls.length, 1);
+  assert.equal(warnings.length, 0);
+});
+
 test('ordinary generation stops cleanly after bounded failures or a permanent provider rejection', async () => {
   for (const retryable of [true, false]) {
     const failure = () => new ModelProviderError({

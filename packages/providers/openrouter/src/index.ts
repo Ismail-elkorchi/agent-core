@@ -36,6 +36,7 @@ import {
 } from '@agent-core/model';
 import {
   decodeHttpFailure,
+  retryAfterDeadline,
   readBoundedJsonResponse,
   readBoundedResponseText,
   readJsonSseEvents,
@@ -1234,8 +1235,8 @@ async function throwIfBadResponse(provider: string, response: Response): Promise
   if (response.ok) {
     return;
   }
+  const retryNotBefore = retryAfterDeadline(response.headers.get('retry-after'));
   const { text: body, truncated } = await readBoundedResponseText(response);
-  const retryAfterMs = retryAfterMilliseconds(response.headers.get('retry-after'));
   const failure = decodeHttpFailure(response.status, body);
   const extractedMessage = failure.message;
   throw new ModelProviderError({
@@ -1243,24 +1244,16 @@ async function throwIfBadResponse(provider: string, response: Response): Promise
     code: failure.code,
     message: `OpenRouter request failed with HTTP ${String(response.status)}: ${extractedMessage}`,
     retryable: failure.retryable,
+    ...(retryNotBefore === undefined ? {} : { retryNotBefore }),
     diagnostic: {
       transport: 'http',
       causeSummary: {
         status: response.status,
         errorMessage: extractedMessage,
-        ...(truncated ? { bodyTruncated: true } : {}),
-        ...(retryAfterMs === undefined ? {} : { retryAfterMs })
+        ...(truncated ? { bodyTruncated: true } : {})
       }
     }
   });
-}
-
-function retryAfterMilliseconds(value: string | null): number | undefined {
-  if (!value) return undefined;
-  const seconds = Number(value);
-  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1_000);
-  const timestamp = Date.parse(value);
-  return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : undefined;
 }
 
 function normalizeError(provider: string, error: unknown, signal?: AbortSignal): ModelProviderError {

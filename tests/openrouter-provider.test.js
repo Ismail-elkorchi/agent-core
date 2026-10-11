@@ -487,17 +487,6 @@ test('OpenRouterProvider does not retry a stream error after visible content', a
   );
 });
 
-test('OpenRouterProvider preserves Retry-After as a structured diagnostic', async () => {
-  const provider = new OpenRouterProvider({
-    apiKey: 'test-key',
-    fetch: withModelCatalog('openai/test', async () => new Response(JSON.stringify({ error: { message: 'slow down' } }), { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '2' } }))
-  });
-  await assert.rejects(
-    () => provider.complete({ model: 'openai/test', messages: [{ role: 'user', content: 'hi' }] }),
-    error => error instanceof ModelProviderError && error.code === 'rate_limited' && error.diagnostic.causeSummary.retryAfterMs === 2000
-  );
-});
-
 function fakeFetch(responses) {
   let index = 0;
   return async () => {

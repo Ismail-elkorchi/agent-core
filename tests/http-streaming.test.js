@@ -2,9 +2,27 @@ import test from 'node:test';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import assert from 'node:assert/strict';
-import { readJsonSseEvents, waitForResponseOrStatus } from '@agent-core/provider-openai-responses';
+import {
+  readJsonSseEvents,
+  waitForResponseOrStatus,
+  retryAfterDeadline
+} from '@agent-core/provider-openai-responses';
 
 const exec = promisify(execFile);
+
+test('HTTP retry guidance preserves absolute dates and rejects unusable delay values', () => {
+  const receivedAt = Date.UTC(2026, 9, 11);
+  assert.equal(retryAfterDeadline('2', receivedAt), receivedAt + 2000);
+  assert.equal(retryAfterDeadline('0.25', receivedAt), receivedAt + 250);
+  const absolute = receivedAt + 60000;
+  assert.equal(retryAfterDeadline(new Date(absolute).toUTCString(), receivedAt), absolute);
+  assert.equal(
+    retryAfterDeadline(new Date(receivedAt - 60000).toUTCString(), receivedAt),
+    receivedAt - 60000
+  );
+  for (const value of [null, '', ' ', '-1', 'invalid', 'Infinity', '9'.repeat(310)])
+    assert.equal(retryAfterDeadline(value, receivedAt), undefined);
+});
 
 for (const when of ['before reading', 'while reading'])
   test(`SSE cancellation ${when} works without status or idle timers`, async (t) => {

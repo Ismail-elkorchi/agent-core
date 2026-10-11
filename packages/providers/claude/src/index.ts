@@ -35,6 +35,7 @@ import {
 import {
   readBoundedJsonResponse,
   decodeHttpFailure,
+  retryAfterDeadline,
   readBoundedResponseText,
   readJsonSseEvents
 } from '@agent-core/provider-openai-responses';
@@ -605,11 +606,13 @@ export class ClaudeProvider implements ModelProvider {
         message: 'Claude transport failed.', retryable: true, cause });
     });
     if (!response.ok) {
+      const retryNotBefore = retryAfterDeadline(response.headers.get('retry-after'));
       const { text: body, truncated } = await readBoundedResponseText(response);
       const failure = decodeHttpFailure(response.status, body);
       throw new ModelProviderError({
         provider: this.id,
         ...failure,
+        ...(retryNotBefore === undefined ? {} : { retryNotBefore }),
         message: `Claude HTTP ${String(response.status)}: ${failure.message}`,
         diagnostic: {
           transport: 'http',

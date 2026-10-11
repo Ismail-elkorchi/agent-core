@@ -7,7 +7,7 @@ import { OpenRouterProvider } from '@agent-core/provider-openrouter';
 import { ClaudeProvider } from '@agent-core/provider-claude';
 import { OllamaProvider } from '@agent-core/provider-ollama';
 
-function fixture(name, { status, error, stream = false, fail }) {
+function fixture(name, { status, error, stream = false, fail, headers }) {
   const model =
     name === 'claude' ? 'claude-sonnet-4-6' : name === 'openrouter' ? 'fixture/model' : 'gpt-5.6';
   const fetch = async (url) => {
@@ -28,7 +28,7 @@ function fixture(name, { status, error, stream = false, fail }) {
       ? new Response(`data: ${JSON.stringify({ error })}\n\n`, {
           headers: { 'content-type': 'text/event-stream' }
         })
-      : Response.json({ error }, { status });
+      : Response.json({ error }, { status, headers });
   };
   const providers = {
     openai: () => new OpenAIProvider({ apiKey: 'fixture', fetch }),
@@ -161,6 +161,37 @@ for (const name of ['openai', 'openai-codex', 'openrouter', 'ollama'])
       (error) => error.code === 'invalid_request'
     );
   });
+
+for (const name of ['openai', 'openai-codex', 'openrouter', 'claude'])
+  test(`${name}: HTTP retry guidance becomes a concrete retry deadline`, async () => {
+    const { provider, request } = fixture(name, {
+      status: 429,
+      error: { message: 'Slow down' },
+      headers: { 'retry-after': '2' }
+    });
+    const before = Date.now();
+    await assert.rejects(provider.complete(request), (error) => {
+      assert.equal(error.retryable, true);
+      assert(error.diagnostic.retryNotBefore >= before + 2000);
+      assert(error.diagnostic.retryNotBefore <= Date.now() + 2000);
+      return true;
+    });
+  });
+
+test('Claude distinguishes its explicit spending-cap rejection from throttling', async () => {
+  const { provider, request } = fixture('claude', {
+    status: 429,
+    error: {
+      type: 'rate_limit_error',
+      message: 'Limit reached',
+      details: { error_code: 'enforced_spend_limit_reached' }
+    }
+  });
+  await assert.rejects(
+    provider.complete(request),
+    (error) => error.code === 'invalid_request' && !error.retryable
+  );
+});
 
 for (const name of ['openai', 'openai-codex', 'openrouter', 'claude', 'ollama'])
   for (const method of ['complete', 'stream'])

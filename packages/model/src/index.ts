@@ -577,6 +577,8 @@ export interface ModelProviderErrorDiagnostic {
   readonly provider: string;
   readonly code: ModelProviderErrorCode;
   readonly retryable: boolean;
+  /** Earliest permitted retry, as UTC epoch milliseconds. */
+  readonly retryNotBefore?: number;
   readonly transport?: string;
   readonly eventType?: string;
   readonly causeSummary?: Readonly<Record<string, ModelProviderErrorDiagnosticValue>>;
@@ -593,6 +595,7 @@ export class ModelProviderError extends Error {
     code: ModelProviderErrorCode;
     message: string;
     retryable?: boolean;
+    retryNotBefore?: number;
     cause?: unknown;
     diagnostic?: {
       transport?: string;
@@ -605,11 +608,17 @@ export class ModelProviderError extends Error {
     this.provider = options.provider;
     this.code = options.code;
     this.retryable = options.retryable ?? false;
+    if (
+      options.retryNotBefore !== undefined &&
+      (!Number.isSafeInteger(options.retryNotBefore) || options.retryNotBefore < 0)
+    )
+      throw new RangeError('retryNotBefore must be nonnegative safe UTC epoch milliseconds.');
     const causeSummary = { ...errorCauseSummary(options.cause), ...options.diagnostic?.causeSummary };
     this.diagnostic = {
       provider: options.provider,
       code: options.code,
       retryable: this.retryable,
+      ...(options.retryNotBefore === undefined ? {} : { retryNotBefore: options.retryNotBefore }),
       ...(options.diagnostic?.transport ? { transport: options.diagnostic.transport } : {}),
       ...(options.diagnostic?.eventType ? { eventType: options.diagnostic.eventType } : {}),
       ...(Object.keys(causeSummary).length > 0 ? { causeSummary: Object.freeze(causeSummary) } : {})

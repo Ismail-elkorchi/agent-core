@@ -242,6 +242,17 @@ export async function readBoundedJsonResponse(
   return JSON.parse(result.text) as unknown;
 }
 
+/** Resolve HTTP retry guidance when the response arrives, not when a later retry starts. */
+export function retryAfterDeadline(value: string | null, receivedAt = Date.now()): number | undefined {
+  if (value === null || value.trim().length === 0) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds < 0) return undefined;
+  const deadline = Number.isFinite(seconds)
+    ? Math.ceil(receivedAt + seconds * 1000)
+    : Date.parse(value);
+  return Number.isSafeInteger(deadline) && deadline >= 0 ? deadline : undefined;
+}
+
 /** Decode the shared JSON error envelope without inferring control state from its prose. */
 export function decodeHttpFailure(
   status: number,
@@ -257,6 +268,7 @@ export function decodeHttpFailure(
   const envelope = isRecord(body) ? body : undefined;
   const error = isRecord(envelope?.error) ? envelope.error : envelope;
   const metadata = isRecord(error?.metadata) ? error.metadata : undefined;
+  const details = isRecord(error?.details) ? error.details : undefined;
   const message =
     typeof error?.message === 'string'
       ? error.message
@@ -271,7 +283,8 @@ export function decodeHttpFailure(
       error?.code === 'credit_balance_exhausted' ||
       error?.code === 'organization_spend_limit_exceeded' ||
       error?.code === 'project_spend_limit_exceeded' ||
-      error?.code === 'organization_usage_limit_exceeded')
+      error?.code === 'organization_usage_limit_exceeded' ||
+      details?.error_code === 'enforced_spend_limit_reached')
   ) {
     return { code: 'invalid_request', retryable: false, message };
   }
