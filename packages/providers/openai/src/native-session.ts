@@ -722,6 +722,7 @@ export class NativeResponsesSession implements ModelProviderSession {
       this.active = undefined;
       if (!completed)
         this.disconnect(failure('aborted', 'Native response consumer stopped before settlement.'));
+      this.failure = undefined;
     }
   }
   private obligations(): Pick<
@@ -776,11 +777,12 @@ export class NativeResponsesSession implements ModelProviderSession {
     this.disconnect(failure('invalid_request', `Native continuation explicitly reset: ${reason}`));
   }
   private disconnect(error: Error): void {
-    this.failure =
+    const reason =
       error instanceof ModelProviderError
         ? error
         : failure('provider_unavailable', 'Native transport disconnected with uncertain delivery.');
-    this.connection.close(this.failure);
+    if (this.busy) this.failure = reason;
+    this.connection.close(reason);
     for (const entry of this.submissions.values()) {
       if (entry.stage === 'sent')
         this.update(entry, {

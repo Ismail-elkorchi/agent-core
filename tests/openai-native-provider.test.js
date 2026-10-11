@@ -19,6 +19,51 @@ const streamNative = async function* (provider, session, input, admit = async ()
 };
 const request = { model: 'gpt-6-astra', messages: [{ role: 'user', content: 'initial' }], maxOutputTokens: 100 };
 
+for (const interruption of ['reset', 'cancel before dispatch'])
+  test(`native sessions accept a new request after ${interruption} without repeating the original dispatch`, async () => {
+    let sockets = 0;
+    let sends = 0;
+    const provider = new OpenAIProvider({
+      apiKey: 'fixture',
+      transport: 'websocket',
+      streamIdleTimeoutMs: 100,
+      webSocketFactory: () => {
+        const index = ++sockets;
+        return new FixtureSocket((_body, socket) => {
+          sends++;
+          socket.feed(
+            { type: 'response.created', response: { id: `response-${index}` } },
+            {
+              type: 'response.completed',
+              response: response(`response-${index}`, `Answer ${index}`)
+            }
+          );
+        });
+      }
+    });
+    const session = provider.createSession();
+    try {
+      if (interruption === 'reset') {
+        assert.equal((await session.complete(request)).content, 'Answer 1');
+        session.resetContinuation('New continuation boundary');
+      } else {
+        const controller = new AbortController();
+        controller.abort();
+        const compiled = await provider.compileRequest(request);
+        await assert.rejects(
+          () => session.completeCompiled(compiled, { signal: controller.signal }),
+          (error) => error.code === 'aborted'
+        );
+        assert.equal(sends, 0, 'a cancelled request must remain unsent');
+      }
+      const next = await session.complete(request);
+      assert.equal(next.content, `Answer ${sockets}`);
+      assert.equal(sends, interruption === 'reset' ? 2 : 1);
+    } finally {
+      await session.close();
+    }
+  });
+
 for (const terminal of ['completed', 'incomplete'])
   test(`native ${terminal} response survives an immediate disconnect with exact usage`, async () => {
     let sends = 0;
@@ -462,6 +507,10 @@ test('result send disconnect keeps uncertainty and original saved result without
   await assert.rejects(() => session.deliverToolResults({ ...submission, deliveryId: 'new-id' }), /original connection/u);
   const next = await provider.compileRequest(request);
   await assert.rejects(() => session.completeCompiled(next), /Uncertain native delivery/u);
+  session.resetContinuation('Reset cannot erase unresolved delivery');
+  await assert.rejects(() => session.completeCompiled(next), /Uncertain native delivery/u);
+  assert.equal((await session.toolResultStatus('saved-delivery')).status, 'uncertain');
+  assert.equal(socket.sent.length, 2);
 });
 
 test('native continuation requires admission and compiled transport cancellation preserves per-instance ownership', async () => {
