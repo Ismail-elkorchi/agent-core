@@ -237,7 +237,7 @@ export type ModelReasoningRequest =
     }
   | {
       readonly strategy: 'effort';
-      /** Use the disabled strategy for the reserved value `none`. */
+      /** Exact provider-defined effort name; disabling uses its own strategy. */
       readonly effort: ModelReasoningEffort;
       /** A provider-declared execution mode, serialized only by adapters that support it. */
       readonly mode?: ModelReasoningMode;

@@ -661,11 +661,11 @@ function reasoningChoices(profile?: ModelProfile): readonly {
       ? [{ id: 'disabled', label: 'Disabled', value: { strategy: 'disabled' as const } }]
       : []),
     ...(reasoning?.strategies.includes('effort')
-      ? (reasoning.efforts ?? []).flatMap((effort) =>
-          effort === 'none'
-            ? []
-            : [{ id: effort, label: effort, value: { strategy: 'effort' as const, effort } }]
-        )
+      ? (reasoning.efforts ?? []).map((effort) => ({
+          id: `effort:${effort}`,
+          label: effort,
+          value: { strategy: 'effort' as const, effort }
+        }))
       : []),
     ...(reasoning?.strategies.includes('budget')
       ? [{ id: 'budget', label: 'Reasoning token budget…' }]
@@ -719,7 +719,7 @@ function selectedConfigurationChoice(state: ConfigurationState): string {
     case 'reasoning': {
       const reasoning = state.selection.reasoning;
       return reasoning?.strategy === 'effort'
-        ? reasoning.effort
+        ? `effort:${reasoning.effort}`
         : (reasoning?.strategy ?? 'default');
     }
     case 'reasoning-mode':

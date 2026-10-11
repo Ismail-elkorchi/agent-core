@@ -21,7 +21,7 @@ export interface OllamaChatRequest {
   format?: string | object;
   keep_alive?: string | number;
   tools?: OllamaTool[];
-  think?: boolean | 'high' | 'medium' | 'low';
+  think?: boolean | string;
   logprobs?: boolean;
   top_logprobs?: number;
   options?: OllamaGenerationOptions;
@@ -51,7 +51,12 @@ export interface OllamaWireResponse {
   readonly logprobs?: JsonValue;
   readonly error?: string;
 }
+interface OllamaThinkingControls {
+  readonly values: readonly (boolean | string)[];
+  readonly default: boolean | string;
+}
 export interface OllamaShowResponse {
+  readonly thinking?: OllamaThinkingControls;
   readonly parameters?: string;
   readonly capabilities?: readonly string[];
   readonly model_info?: JsonObject;
@@ -90,8 +95,10 @@ export function decodeOllamaShowResponse(value: unknown): OllamaShowResponse {
     throw new Error('Ollama show response.capabilities must be an array of strings.');
   const modelInfo = ownedObject(raw.model_info, 'Ollama show response.model_info');
   const details = ownedObject(raw.details, 'Ollama show response.details');
+  const thinking = raw.thinking === undefined ? undefined : decodeThinking(raw.thinking);
   return Object.freeze({
     ...stringField(raw, 'parameters', 'Ollama show response'),
+    ...(thinking === undefined ? {} : { thinking }),
     ...(capabilities === undefined
       ? {}
       : { capabilities: Object.freeze(capabilities.map((item) => item)) }),
@@ -99,6 +106,27 @@ export function decodeOllamaShowResponse(value: unknown): OllamaShowResponse {
     ...(details === undefined ? {} : { details }),
     ...stringField(raw, 'modified_at', 'Ollama show response')
   });
+}
+
+function decodeThinking(value: JsonValue): OllamaThinkingControls {
+  const record = ownedObject(value, 'Ollama show response.thinking');
+  const values = record?.values;
+  const defaultValue = record?.default;
+  if (
+    !Array.isArray(values) ||
+    values.length === 0 ||
+    !values.every(isThinkingValue) ||
+    new Set(values).size !== values.length ||
+    !isThinkingValue(defaultValue) ||
+    !values.includes(defaultValue)
+  )
+    throw new Error(
+      'Ollama thinking metadata must declare distinct boolean or named values and a supported default.'
+    );
+  return Object.freeze({ values: Object.freeze([...values]), default: defaultValue });
+}
+function isThinkingValue(value: JsonValue | undefined): value is boolean | string {
+  return typeof value === 'boolean' || (typeof value === 'string' && value.trim().length > 0);
 }
 
 function decodeMessage(value: JsonValue): OllamaWireMessage {

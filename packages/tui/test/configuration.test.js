@@ -326,7 +326,55 @@ for (const target of ['model', 'reasoning', 'authentication']) {
     assert.equal(result.state.stage, target);
     assert.equal(result.state.adapter, adapter);
     assert.equal(result.state.pending, undefined);
-    if (target === 'reasoning') assert.equal(result.state.picker.editor.activeId, 'high');
+    if (target === 'reasoning') assert.equal(result.state.picker.editor.activeId, 'effort:high');
     assert.deepEqual(calls, target === 'model' ? [['list']] : target === 'reasoning' ? [['describe', profile.id]] : []);
   });
 }
+
+for (const effort of ['none', 'default', 'budget', 'enabled', 'disabled'])
+  test(`reasoning picker retains the provider-defined level ${effort} separately from built-in actions`, () => {
+    const operations = { providers: [{ id: 'neutral', label: 'Neutral' }] };
+    const selection = {
+      provider: 'neutral',
+      model: profile.id,
+      reasoning: { strategy: 'effort', effort }
+    };
+    const initial = {
+      ...configurationState(selection, operations.providers),
+      profile: {
+        ...profile,
+        capabilities: {
+          ...profile.capabilities,
+          reasoning: {
+            strategies: ['effort', 'toggle', 'budget'],
+            efforts: [effort],
+            canDisable: true,
+            separateOutput: true
+          }
+        }
+      }
+    };
+    const state = updateConfiguration(
+      initial,
+      { type: 'configuration.stage', stage: 'reasoning' },
+      operations
+    ).state;
+    const entries = state.pickerQueryResult.window(0, state.pickerQueryResult.count);
+    const selected = entries.find((entry) => entry.label === effort);
+    assert(selected, 'the advertised level must remain visible');
+    assert.equal(state.picker.editor.activeId, selected.id);
+    const accepted = updateConfiguration(
+      state,
+      { type: 'configuration.pick', value: selected.id },
+      operations
+    ).state;
+    assert.equal(accepted.stage, 'review');
+    assert.deepEqual(accepted.selection.reasoning, { strategy: 'effort', effort });
+    const disabled = entries.find((entry) => entry.label === 'Disabled');
+    assert.notEqual(disabled.id, selected.id);
+    assert.deepEqual(
+      updateConfiguration(state, { type: 'configuration.pick', value: disabled.id }, operations)
+        .state.selection.reasoning,
+      { strategy: 'disabled' }
+    );
+  });

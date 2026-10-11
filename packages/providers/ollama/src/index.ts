@@ -20,6 +20,7 @@ import {
   ModelProviderError,
   type ModelProviderInfo,
   type ModelReasoningRequest,
+  type ModelReasoningCapabilities,
   type ModelRequest,
   type ModelResponse,
   type ModelResponseFormat,
@@ -480,7 +481,18 @@ export class OllamaProvider implements ModelProvider {
 
   private async discoverModel(model: string): Promise<ModelProfile> {
     try {
-      const details = decodeOllamaShowResponse(await this.readJson('show', { model, verbose: false }));
+      const raw = await this.readJson('show', { model, verbose: false });
+      let details: OllamaShowResponse;
+      try {
+        details = decodeOllamaShowResponse(raw);
+      } catch (cause) {
+        throw new ModelProviderError({
+          provider: this.id,
+          code: 'malformed_response',
+          message: 'Ollama model discovery returned invalid metadata.',
+          cause
+        });
+      }
       const profile = profileFromShow(model, details, this.generationOptions, this.deployment);
       return parseModelProfile({
         ...profile,
@@ -594,7 +606,7 @@ function toOllamaMessage(message: ModelInputItem, lowerDeveloper: boolean): Olla
 
 function toOllamaThink(
   reasoning: ModelReasoningRequest | undefined
-): boolean | 'high' | 'medium' | 'low' | undefined {
+): boolean | string | undefined {
   if (!reasoning) {
     return undefined;
   }
@@ -616,17 +628,23 @@ function toOllamaThink(
       code: 'invalid_request',
       message: 'Ollama does not expose a thinking token budget.'
     });
-  if (reasoning.effort === 'low' || reasoning.effort === 'medium' || reasoning.effort === 'high')
-    return reasoning.effort;
-  throw new ModelProviderError({
-    provider: 'ollama',
-    code: 'invalid_request',
-    message: `Ollama reasoning effort is not supported: ${reasoning.effort}`
-  });
+  return reasoning.effort;
 }
 
-// Exact documented names only. Custom model names require a profile override for effort control.
-const EFFORT_MODELS = new Set(['gpt-oss', 'gpt-oss:20b', 'gpt-oss:120b', 'gpt-oss:120b-cloud']);
+function reasoningFromShow(response: OllamaShowResponse): ModelReasoningCapabilities | undefined {
+  const values = response.thinking?.values;
+  if (values === undefined || values.every((value) => value === false)) return undefined;
+  const efforts = values.filter((value): value is string => typeof value === 'string');
+  return {
+    strategies: [
+      ...(values.includes(true) ? ['toggle' as const] : []),
+      ...(efforts.length ? ['effort' as const] : [])
+    ],
+    canDisable: values.includes(false),
+    ...(efforts.length ? { efforts } : {}),
+    separateOutput: true
+  };
+}
 
 function profileFromShow(
   model: string,
@@ -654,8 +672,7 @@ function profileFromShow(
   const outputTokens =
     positiveIntegerOrUndefined(generationOptions.num_predict) ??
     positiveIntegerOrUndefined(parameterValue(response.parameters, 'num_predict'));
-  const supportsThinking = declared.has('thinking');
-  const gptOss = EFFORT_MODELS.has(model);
+  const reasoning = reasoningFromShow(response);
   const capabilities: ModelCapabilities = {
     streaming: true,
     toolCalling: declared.has('tools'),
@@ -665,18 +682,7 @@ function profileFromShow(
     logprobs: true,
     temperature: true,
     topP: true,
-    ...(supportsThinking
-      ? {
-          reasoning: gptOss
-            ? {
-                strategies: ['effort'],
-                canDisable: false,
-                efforts: ['low', 'medium', 'high'],
-                separateOutput: true
-              }
-            : { strategies: ['toggle'], canDisable: true, separateOutput: true }
-        }
-      : {})
+    ...(reasoning === undefined ? {} : { reasoning })
   };
   const supportedParameters: ModelProfile['supportedParameters'] = [
     'temperature',
@@ -701,6 +707,7 @@ function profileFromShow(
       discovery: 'ollama.show',
       deployment,
       declaredCapabilities: [...declared],
+      ...(response.thinking === undefined ? {} : { thinking: response.thinking }),
       ...(response.details ? { details: response.details } : {}),
       ...(response.modified_at ? { modifiedAt: response.modified_at } : {})
     })

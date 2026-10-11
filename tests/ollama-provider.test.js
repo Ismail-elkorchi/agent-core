@@ -8,6 +8,7 @@ class FakeOllamaTransport {
     this.partsOrError = partsOrError;
     this.showResponse = showResponse ?? {
       capabilities: ['completion', 'tools', 'thinking'],
+      thinking: { values: [true, false], default: true },
       model_info: { 'test.context_length': 32768 },
       details: { family: 'test' }
     };
@@ -144,6 +145,7 @@ test('OllamaProvider maps the full chat surface and normalizes streamed response
 test('OllamaProvider discovers selected model capabilities through show()', async () => {
   const client = new FakeOllamaTransport([], {
     capabilities: ['completion', 'tools', 'thinking', 'vision'],
+    thinking: { values: [true, false], default: true },
     model_info: { 'qwen.context_length': 131072 },
     parameters: 'num_predict 4096'
   });
@@ -437,11 +439,12 @@ test('OllamaProvider distinguishes cloud structured-output availability', async 
   assert.equal(client.requests.length, 0);
 });
 
-test('OllamaProvider declares GPT-OSS effort semantics without a disable path', async () => {
+test('OllamaProvider discovers effort semantics without inventing a disable path', async () => {
   const client = new FakeOllamaTransport(
     [{ model: 'gpt-oss:20b', message: { content: 'ok' }, done: true }],
     {
       capabilities: ['completion', 'thinking'],
+      thinking: { values: ['low', 'medium', 'high'], default: 'medium' },
       model_info: { 'gptoss.context_length': 131072 }
     }
   );
@@ -482,7 +485,7 @@ test('OllamaProvider validates configured reasoning against the discovered exact
 test('OllamaProvider sends the admitted default reasoning and body unchanged', async () => {
   const client = new FakeOllamaTransport([
     { model: 'gpt-oss:20b', message: { content: 'ok' }, done: true }
-  ]);
+  ], { capabilities: ['completion', 'thinking'], thinking: { values: ['low', 'medium', 'high'], default: 'medium' }, model_info: { 'test.context_length': 32768 } });
   const reasoning = { strategy: 'effort', effort: 'low' };
   const provider = new OllamaProvider({ fetch: client.fetch, reasoning });
   const original = {

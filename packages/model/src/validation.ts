@@ -1305,7 +1305,6 @@ function validReasoningRequest(value: unknown): value is ModelReasoningRequest {
   if (value.strategy === 'effort')
     return (
       isReasoningEffort(value.effort) &&
-      value.effort !== 'none' &&
       (value.mode === undefined || value.mode === 'standard' || value.mode === 'pro') &&
       validSummary(value.summary) &&
       onlyKeys(value, ['strategy', 'effort', 'mode', 'summary'])

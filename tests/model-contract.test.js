@@ -112,7 +112,7 @@ test('reasoning efforts belong to model profiles rather than a global vocabulary
       }
     }), /capabilities.reasoning.efforts/u);
   }
-  assert.throws(() => parseModelReasoningRequest({ strategy: 'effort', effort: 'none' }), ModelContractError);
+  assert.deepEqual(parseModelReasoningRequest({ strategy: 'effort', effort: 'none' }), { strategy: 'effort', effort: 'none' });
   assert.deepEqual(parseModelReasoningRequest({ strategy: 'disabled' }), { strategy: 'disabled' });
 });
 
