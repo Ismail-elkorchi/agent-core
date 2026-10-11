@@ -9,7 +9,7 @@ import { text } from '@ismail-elkorchi/terminal-ui/components';
 import { textAreaReducer, createTextAreaState } from '@ismail-elkorchi/terminal-ui/behavior';
 import { textDocumentText, textCaretAt } from '@ismail-elkorchi/terminal-ui/text';
 import {
-  shortcutBindings,
+  createShortcuts,
   completeCommand,
   insertCommand,
   reconcileConversationEntries,
@@ -44,7 +44,7 @@ const key = (key, modifiers = {}) => ({
 });
 
 test('shortcut capture consumes local cancellation and conflicts, then dispatches the new action', async (t) => {
-  const bindings = shortcutBindings(
+  const shortcuts = createShortcuts(
     [
       {
         id: 'tools',
@@ -64,7 +64,9 @@ test('shortcut capture consumes local cancellation and conflicts, then dispatche
     {
       actions: [{ id: 'tools', label: 'Tools', bindings: ['tools'] }],
       overrides: (state) => state.overrides,
-      capturing: (state) => state.capture,
+      capturing: (state) => state.capture === undefined ? undefined : {
+        action: state.capture, overrides: state.overrides
+      },
       captured: (action, shortcut) => ({ type: 'captured', action, shortcut }),
       cancelled: () => ({ type: 'cancel' }),
       failed: (error) => ({ type: 'failed', error })
@@ -75,7 +77,7 @@ test('shortcut capture consumes local cancellation and conflicts, then dispatche
     app: defineTui({
       id: 'neutral-shortcuts',
       init: () => ({ state: { capture: 'tools', overrides: {}, invoked: 0 } }),
-      inputBindings: bindings,
+      inputBindings: shortcuts.inputBindings,
       update: (state, message) => ({
         state:
           message.type === 'captured'
@@ -96,7 +98,7 @@ test('shortcut capture consumes local cancellation and conflicts, then dispatche
   t.after(() => runtime.dispose());
   await runtime.start();
   await runtime.handleInput(key('d', { ctrl: true }));
-  assert.match(runtime.state().error, /belongs to Exit/);
+  assert.match(runtime.state().error, /conflicts with Exit/);
   assert.equal(runtime.state().exited, undefined);
   await runtime.handleInput(key('c', { ctrl: true }));
   assert.equal(runtime.state().capture, undefined);

@@ -144,7 +144,7 @@ export { presentProgress, progressStatusFields, type ProgressPresentation } from
 
 export {
   parseShortcut,
-  shortcutBindings,
+  createShortcuts,
   shortcutHelp,
   type Shortcut,
   type ShortcutAction,
