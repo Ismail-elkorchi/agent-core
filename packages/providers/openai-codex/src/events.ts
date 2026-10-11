@@ -3,18 +3,16 @@ import {
   ModelProviderError,
   type ModelRequest,
   type ModelResponse,
-  type ModelToolCall,
-  type ModelUsage
+  type ModelToolCall
 } from '@agent-core/model';
 import type {
   ResponsesContentPart,
   ResponsesErrorBody,
   ResponsesOutputItem,
   ResponsesPayload,
-  ResponsesStreamData,
-  ResponsesUsage
+  ResponsesStreamData
 } from '@agent-core/provider-openai-responses';
-import { responsesOutput } from '@agent-core/provider-openai-responses';
+import { responsesOutput, responsesUsage } from '@agent-core/provider-openai-responses';
 
 import { parseCodexModelResponse, summarizeCodexFailure } from './errors.js';
 import { errorMessage, isJsonObject, stringValue } from './utils.js';
@@ -22,7 +20,6 @@ import { errorMessage, isJsonObject, stringValue } from './utils.js';
 export type OpenAICodexResponsesPayload = ResponsesPayload;
 export type OpenAICodexOutputItem = ResponsesOutputItem;
 export type OpenAICodexContentPart = ResponsesContentPart;
-export type OpenAICodexUsage = ResponsesUsage;
 export type OpenAICodexErrorBody = ResponsesErrorBody;
 export type OpenAICodexStreamData = ResponsesStreamData;
 
@@ -80,7 +77,7 @@ export async function toModelResponse(
     typeof payload.output_text === 'string' ? payload.output_text : contentFromOutput(payload.output ?? []);
   const toolCalls = normalizeToolCalls(provider, payload.output ?? []);
   const reasoningSummary = reasoningSummaryFromOutput(payload.output ?? []);
-  const usage = normalizeUsage(payload.usage);
+  const usage = responsesUsage(payload.usage);
   const providerTerminationReason = payload.incomplete_details?.reason ?? payload.status;
   return parseCodexModelResponse({
     content,
@@ -375,27 +372,5 @@ function tryCustomAccumulatorToToolCall(
     type: 'custom',
     name: item.name,
     input: { kind: 'text', value: item.inputText }
-  };
-}
-
-function normalizeUsage(usage: OpenAICodexUsage | undefined): ModelUsage | undefined {
-  if (!usage) {
-    return undefined;
-  }
-  const promptTokens = usage.input_tokens ?? 0;
-  const completionTokens = usage.output_tokens ?? 0;
-  return {
-    promptTokens,
-    completionTokens,
-    totalTokens: usage.total_tokens ?? promptTokens + completionTokens,
-    ...(usage.input_tokens_details?.cached_tokens === undefined
-      ? {}
-      : { cacheReadTokens: usage.input_tokens_details.cached_tokens }),
-    ...(usage.input_tokens_details?.cache_write_tokens === undefined
-      ? {}
-      : { cacheWriteTokens: usage.input_tokens_details.cache_write_tokens }),
-    ...(usage.output_tokens_details?.reasoning_tokens === undefined
-      ? {}
-      : { reasoningTokens: usage.output_tokens_details.reasoning_tokens })
   };
 }

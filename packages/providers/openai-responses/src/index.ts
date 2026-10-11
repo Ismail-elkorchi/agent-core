@@ -1,4 +1,4 @@
-import { classifyModelHttpFailure, type ModelProviderError } from '@agent-core/model';
+import { classifyModelHttpFailure, type ModelProviderError, type ModelUsage } from '@agent-core/model';
 
 export const DEFAULT_SSE_BUFFER_BYTES = 1_048_576;
 export const DEFAULT_DIAGNOSTIC_BODY_BYTES = 65_536;
@@ -60,6 +60,26 @@ export interface ResponsesUsage extends Readonly<Record<string, unknown>> {
   };
   readonly output_tokens_details?: Readonly<Record<string, unknown>> & {
     readonly reasoning_tokens?: number;
+  };
+}
+
+export function responsesUsage(usage: ResponsesUsage | undefined): ModelUsage | undefined {
+  if (usage?.input_tokens === undefined || usage.output_tokens === undefined) return undefined;
+  const promptTokens = usage.input_tokens;
+  const completionTokens = usage.output_tokens;
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens: usage.total_tokens ?? promptTokens + completionTokens,
+    ...(usage.input_tokens_details?.cached_tokens === undefined
+      ? {}
+      : { cacheReadTokens: usage.input_tokens_details.cached_tokens }),
+    ...(usage.input_tokens_details?.cache_write_tokens === undefined
+      ? {}
+      : { cacheWriteTokens: usage.input_tokens_details.cache_write_tokens }),
+    ...(usage.output_tokens_details?.reasoning_tokens === undefined
+      ? {}
+      : { reasoningTokens: usage.output_tokens_details.reasoning_tokens })
   };
 }
 

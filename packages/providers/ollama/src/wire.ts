@@ -42,6 +42,7 @@ export interface OllamaWireResponse {
   readonly done_reason?: string;
   readonly message?: OllamaWireMessage;
   readonly prompt_eval_count?: number;
+  readonly prompt_eval_cached_count?: number;
   readonly eval_count?: number;
   readonly total_duration?: number;
   readonly load_duration?: number;
@@ -68,6 +69,7 @@ export function decodeOllamaWireResponse(value: unknown): OllamaWireResponse {
     ...stringField(raw, 'done_reason', 'Ollama response'),
     ...(message === undefined ? {} : { message }),
     ...numberField(raw, 'prompt_eval_count', 'Ollama response'),
+    ...numberField(raw, 'prompt_eval_cached_count', 'Ollama response'),
     ...numberField(raw, 'eval_count', 'Ollama response'),
     ...numberField(raw, 'total_duration', 'Ollama response'),
     ...numberField(raw, 'load_duration', 'Ollama response'),

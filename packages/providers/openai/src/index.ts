@@ -43,8 +43,7 @@ import {
   type ModelResponseFormat,
   type ModelStreamEvent,
   type ModelToolCall,
-  type ModelTransportOptions,
-  type ModelUsage
+  type ModelTransportOptions
 } from '@agent-core/model';
 import {
   decodeHttpFailure,
@@ -56,6 +55,7 @@ import {
   readJsonSseEvents,
   responsesInput,
   responsesOutput,
+  responsesUsage,
   responsesPayloadPaths,
   responsesTool,
   validatedResponsesReplayItems,
@@ -63,8 +63,7 @@ import {
   type JsonSseEvent,
   type ResponsesOutputItem as OpenAIOutputItem,
   type ResponsesPayload as OpenAIResponsesPayload,
-  type ResponsesStreamData as OpenAIStreamData,
-  type ResponsesUsage as OpenAIUsage
+  type ResponsesStreamData as OpenAIStreamData
 } from '@agent-core/provider-openai-responses';
 import {
   defaultOpenAIResponsesWebSocketFactory,
@@ -466,7 +465,7 @@ export class OpenAIProvider implements ModelProvider {
       requiresExactPrefix: false,
       data: { items: validatedResponsesReplayItems(payload.output, this.id) }
     });
-    const usage = normalizeUsage(payload.usage);
+    const usage = responsesUsage(payload.usage);
     return parseModelContextTransformResult({
       transformId,
       state,
@@ -1326,7 +1325,7 @@ async function toModelResponse(
   const toolCalls = normalizeToolCalls(provider, payload.output ?? []);
   const reasoningSummary = reasoningSummaryFromOutput(payload.output ?? []);
   const providerTerminationReason = payload.incomplete_details?.reason ?? payload.status;
-  const usage = normalizeUsage(payload.usage);
+  const usage = responsesUsage(payload.usage);
   return parseOpenAIModelResponse({
     content,
     output: await responsesOutput({
@@ -1624,28 +1623,6 @@ function dedupeToolCalls(toolCalls: ModelToolCall[]): ModelToolCall[] {
 
 function toolCallIdentity(toolCall: ModelToolCall): string {
   return JSON.stringify([toolCall.id, toolCall.type, toolCall.name, toolCall.input]);
-}
-
-function normalizeUsage(usage: OpenAIUsage | undefined): ModelUsage | undefined {
-  if (!usage) {
-    return undefined;
-  }
-  const promptTokens = usage.input_tokens ?? 0;
-  const completionTokens = usage.output_tokens ?? 0;
-  return {
-    promptTokens,
-    completionTokens,
-    totalTokens: usage.total_tokens ?? promptTokens + completionTokens,
-    ...(usage.input_tokens_details?.cached_tokens === undefined
-      ? {}
-      : { cacheReadTokens: usage.input_tokens_details.cached_tokens }),
-    ...(usage.input_tokens_details?.cache_write_tokens === undefined
-      ? {}
-      : { cacheWriteTokens: usage.input_tokens_details.cache_write_tokens }),
-    ...(usage.output_tokens_details?.reasoning_tokens === undefined
-      ? {}
-      : { reasoningTokens: usage.output_tokens_details.reasoning_tokens })
-  };
 }
 
 function readSseEvents(

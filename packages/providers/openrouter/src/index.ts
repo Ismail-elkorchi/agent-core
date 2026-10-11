@@ -325,7 +325,7 @@ export class OpenRouterProvider implements ModelProvider {
         lastRaw = part;
         responseId = part.id ?? responseId;
         actualModel = part.model ?? actualModel;
-        usage = normalizeUsage(part.usage) ?? usage;
+        if (part.usage !== undefined) usage = normalizeUsage(part.usage);
 
         const choice = part.choices?.[0];
         const delta = choice?.delta ?? choice?.message;
@@ -1163,11 +1163,9 @@ function pricePerMillion(value: string | number | null | undefined): number | un
 }
 
 function normalizeUsage(usage: OpenRouterUsage | undefined): ModelUsage | undefined {
-  if (!usage) {
-    return undefined;
-  }
-  const promptTokens = usage.prompt_tokens ?? 0;
-  const completionTokens = usage.completion_tokens ?? 0;
+  if (usage?.prompt_tokens === undefined || usage.completion_tokens === undefined) return undefined;
+  const promptTokens = usage.prompt_tokens;
+  const completionTokens = usage.completion_tokens;
   return {
     promptTokens,
     completionTokens,

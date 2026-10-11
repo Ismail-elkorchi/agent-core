@@ -858,15 +858,18 @@ function normalizeToolCalls(toolCalls: readonly OllamaWireToolCall[]): ModelTool
 }
 
 function normalizeUsage(response: OllamaWireResponse): ModelUsage | undefined {
-  if (response.prompt_eval_count === undefined && response.eval_count === undefined) {
+  if (response.prompt_eval_count === undefined || response.eval_count === undefined) {
     return undefined;
   }
-  const promptTokens = response.prompt_eval_count ?? 0;
-  const completionTokens = response.eval_count ?? 0;
+  const promptTokens = response.prompt_eval_count;
+  const completionTokens = response.eval_count;
   return {
     promptTokens,
     completionTokens,
-    totalTokens: promptTokens + completionTokens
+    totalTokens: promptTokens + completionTokens,
+    ...(response.prompt_eval_cached_count === undefined
+      ? {}
+      : { cacheReadTokens: response.prompt_eval_cached_count })
   };
 }
 
