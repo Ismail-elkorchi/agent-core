@@ -23,12 +23,17 @@ function fixture(name, { status, error, stream = false, fail, headers }) {
           }
         ]
       });
+    if (String(url).endsWith('/api/show'))
+      return Response.json({
+        capabilities: ['completion'],
+        model_info: { 'fixture.context_length': 32768 }
+      });
     fail?.();
     return stream
       ? new Response(`data: ${JSON.stringify({ error })}\n\n`, {
           headers: { 'content-type': 'text/event-stream' }
         })
-      : Response.json({ error }, { status, headers });
+      : Response.json({ error: name === 'ollama' ? error.message : error }, { status, headers });
   };
   const providers = {
     openai: () => new OpenAIProvider({ apiKey: 'fixture', fetch }),
@@ -45,19 +50,7 @@ function fixture(name, { status, error, stream = false, fail, headers }) {
       }),
     openrouter: () => new OpenRouterProvider({ apiKey: 'fixture', fetch }),
     claude: () => new ClaudeProvider({ apiKey: 'fixture', fetch }),
-    ollama: () =>
-      new OllamaProvider({
-        clientFactory: () => ({
-          show: async () => ({
-            capabilities: ['completion'],
-            model_info: { 'fixture.context_length': 32768 }
-          }),
-          chat: async () => {
-            fail?.();
-            throw Object.assign(new Error(error.message), { status_code: status });
-          }
-        })
-      })
+    ollama: () => new OllamaProvider({ fetch })
   };
   return {
     provider: providers[name](),
@@ -162,7 +155,7 @@ for (const name of ['openai', 'openai-codex', 'openrouter', 'ollama'])
     );
   });
 
-for (const name of ['openai', 'openai-codex', 'openrouter', 'claude'])
+for (const name of ['openai', 'openai-codex', 'openrouter', 'claude', 'ollama'])
   test(`${name}: HTTP retry guidance becomes a concrete retry deadline`, async () => {
     const { provider, request } = fixture(name, {
       status: 429,

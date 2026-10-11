@@ -1,7 +1,6 @@
 import { parseJsonObject } from '@agent-core/json';
 import {
   assertModelRequestSupported,
-  classifyModelHttpFailure,
   assertProviderContextCompatible,
   type CompiledModelRequest,
   compileModelRequest,
@@ -35,8 +34,12 @@ import {
   parseModelResponse,
   requiredProtocolRevision
 } from '@agent-core/model';
-import { type ChatRequest, type Message, Ollama, type Tool } from 'ollama';
+import { readBoundedJsonResponse } from '@agent-core/provider-openai-responses';
+import { readOllamaStream, requestOllama } from './transport.js';
 import {
+  type OllamaChatRequest,
+  type OllamaInputMessage,
+  type OllamaTool,
   decodeOllamaShowResponse,
   decodeOllamaWireResponse,
   type OllamaShowResponse,
@@ -45,13 +48,6 @@ import {
 } from './wire.js';
 
 export type { OllamaShowResponse } from './wire.js';
-
-export interface OllamaClient {
-  chat(request: ChatRequest & { stream: true }): Promise<AsyncIterable<unknown>>;
-  list?(): Promise<unknown>;
-  show?(request: { model: string; verbose?: boolean }): Promise<unknown>;
-  abort?(): void;
-}
 
 export interface OllamaGenerationOptions {
   num_ctx?: number;
@@ -72,7 +68,6 @@ export interface OllamaProviderOptions {
   host?: string;
   model?: string;
   fetch?: typeof fetch;
-  clientFactory?: () => OllamaClient;
   keepAlive?: string | number;
   reasoning?: ModelReasoningRequest;
   generationOptions?: OllamaGenerationOptions;
@@ -86,10 +81,10 @@ export type OllamaModelProfileOverride = Omit<ModelProfile, 'id' | 'provider'>;
 export class OllamaProvider implements ModelProvider {
   readonly id = 'ollama';
   readonly implementationId = 'agent-core.provider.ollama@1';
-  private readonly compiledWire = new WeakMap<CompiledModelRequest, ChatRequest & { stream: true }>();
   private readonly endpoint: string;
   private readonly compiledRequests = new WeakMap<ModelRequest, CompiledModelRequest>();
-  private readonly clientFactory: () => OllamaClient;
+  private readonly fetch: typeof globalThis.fetch;
+  private readonly baseUrl: string;
   private readonly defaultModel: string;
   private readonly keepAlive: string | number | undefined;
   private readonly reasoning: ModelReasoningRequest | undefined;
@@ -99,45 +94,15 @@ export class OllamaProvider implements ModelProvider {
   private readonly discoveredProfiles = new Map<string, Promise<ModelProfile>>();
 
   constructor(options: OllamaProviderOptions = {}) {
-    this.endpoint = `${(options.host ?? 'http://127.0.0.1:11434').replace(/\/+$/u, '')}/api/chat`;
+    const host = new URL(options.host ?? 'http://127.0.0.1:11434');
+    if (host.protocol !== 'http:' && host.protocol !== 'https:')
+      throw new TypeError('Ollama host must be an HTTP or HTTPS URL.');
+    if (host.username || host.password || host.search || host.hash)
+      throw new TypeError('Ollama host must be a base URL without credentials, query, or fragment.');
+    this.baseUrl = host.href.replace(/\/+$/u, '');
+    this.endpoint = `${this.baseUrl}/api/chat`;
     this.defaultModel = options.model ?? 'llama3.1';
-    const fetch = options.fetch ?? globalThis.fetch;
-    this.clientFactory =
-      options.clientFactory ??
-      (() => {
-        const transport = new AbortController();
-        const client = new Ollama({
-          ...(options.host ? { host: options.host } : {}),
-          fetch: (input, init) =>
-            fetch(input, {
-              ...init,
-              signal:
-                init?.signal == null ? transport.signal : AbortSignal.any([transport.signal, init.signal])
-            })
-        });
-        return {
-          chat: (request) => client.chat(request),
-          list: () => client.list(),
-          show: async (request) => {
-            const response = await client.show(request);
-            const modelInfo = toRecord(response.model_info);
-            return {
-              ...(response.parameters ? { parameters: response.parameters } : {}),
-              capabilities: response.capabilities,
-              ...(modelInfo ? { model_info: modelInfo } : {}),
-              details: toRecord(response.details) ?? {},
-              modified_at:
-                response.modified_at instanceof Date
-                  ? response.modified_at.toISOString()
-                  : String(response.modified_at)
-            };
-          },
-          abort: () => {
-            transport.abort();
-            client.abort();
-          }
-        };
-      });
+    this.fetch = options.fetch ?? globalThis.fetch;
     this.keepAlive = options.keepAlive;
     this.reasoning = options.reasoning;
     this.generationOptions = validateGenerationOptions({ ...(options.generationOptions ?? {}) });
@@ -155,18 +120,8 @@ export class OllamaProvider implements ModelProvider {
 
   async listModels(options: ModelDiscoveryOptions = {}): Promise<readonly ModelCatalogEntry[]> {
     options.signal?.throwIfAborted();
-    const client = this.clientFactory();
-    if (client.list === undefined)
-      throw new ModelProviderError({
-        provider: this.id,
-        code: 'provider_unavailable',
-        message: 'This Ollama client does not support model discovery.'
-      });
-    const abort = () => client.abort?.();
-    options.signal?.addEventListener('abort', abort, { once: true });
     try {
-      const response = await client.list();
-      // The SDK includes Date objects; only the documented identity fields enter the catalog.
+      const response = await this.readJson('tags', undefined, options.signal);
       if (
         typeof response !== 'object' ||
         response === null ||
@@ -196,8 +151,8 @@ export class OllamaProvider implements ModelProvider {
       });
       options.signal?.throwIfAborted();
       return result;
-    } finally {
-      options.signal?.removeEventListener('abort', abort);
+    } catch (error) {
+      throw this.normalizeError(error, options.signal);
     }
   }
 
@@ -274,7 +229,6 @@ export class OllamaProvider implements ModelProvider {
         );
     const wire = this.toChatRequest(
       request,
-      true,
       profile.capabilities.protocol?.developerRole === 'system_if_no_system'
     );
     const body: Record<string, unknown> = { ...wire };
@@ -291,7 +245,6 @@ export class OllamaProvider implements ModelProvider {
       endpoint: this.endpoint
     });
     this.compiledRequests.set(compiled.logicalRequest, compiled);
-    this.compiledWire.set(compiled, wire);
     return compiled;
   }
   private assertCompiled(compiled: CompiledModelRequest): void {
@@ -344,22 +297,18 @@ export class OllamaProvider implements ModelProvider {
     }
     const signal = modelTransportSignal(request, options);
     throwIfAborted(signal);
-    const client = this.clientFactory();
-    const chatRequest = this.compiledWire.get(compiled);
-    if (!chatRequest)
-      throw new ModelProviderError({
-        provider: this.id,
-        code: 'invalid_request',
-        message: 'Missing compiled Ollama request.'
-      });
-    const cleanupAbort = this.bindAbort(signal, client);
-    throwIfAborted(signal);
     let content = '';
     let reasoning = '';
     const toolCalls: ModelToolCall[] = [];
 
     try {
-      const stream = await client.chat(chatRequest);
+      const response = await requestOllama(
+        this.fetch,
+        this.endpoint,
+        { ...compiled.body, stream: true },
+        signal
+      );
+      const stream = readOllamaStream(response, signal);
       for await (const part of stream) {
         let wirePart: OllamaWireResponse;
         try {
@@ -377,7 +326,7 @@ export class OllamaProvider implements ModelProvider {
             provider: this.id,
             code: 'provider_unavailable',
             message: `Ollama stream error: ${wirePart.error}`,
-            retryable: content.length === 0,
+            retryable: content.length === 0 && reasoning.length === 0 && toolCalls.length === 0,
             cause: wirePart
           });
         throwIfAborted(signal);
@@ -416,22 +365,19 @@ export class OllamaProvider implements ModelProvider {
         message: 'Ollama stream ended before a done response.'
       });
     } catch (error) {
-      throw this.normalizeError(error, signal);
-    } finally {
-      cleanupAbort();
+      throw this.normalizeError(error, signal, content.length > 0 || reasoning.length > 0 || toolCalls.length > 0);
     }
   }
 
   private toChatRequest(
     request: ModelRequest,
-    stream: true,
     lowerDeveloper: boolean
-  ): ChatRequest & { stream: true } {
+  ): OllamaChatRequest {
     const options = this.toRuntimeOptions(request);
-    const chatRequest: ChatRequest & { stream: true } = {
+    const chatRequest: OllamaChatRequest = {
       model: request.model || this.defaultModel,
       messages: toOllamaMessages(request.messages, lowerDeveloper),
-      stream
+      stream: true
     };
     if (request.responseFormat !== undefined && this.deployment === 'cloud')
       throw new ModelProviderError({
@@ -471,24 +417,12 @@ export class OllamaProvider implements ModelProvider {
     request: ModelRequest,
     content: string,
     reasoning: string,
-    streamedToolCalls: ModelToolCall[]
+    toolCalls: readonly ModelToolCall[]
   ): Promise<ModelResponse> {
-    const fallbackContentValue: unknown = response.message?.content;
-    if (fallbackContentValue !== undefined && typeof fallbackContentValue !== 'string') {
-      throw new ModelProviderError({
-        provider: this.id,
-        code: 'malformed_response',
-        message: 'Ollama response did not contain message.content.'
-      });
-    }
-    const fallbackContent = fallbackContentValue ?? '';
-    const responseToolCalls = normalizeToolCalls(response.message?.tool_calls ?? []);
-    const toolCalls = dedupeToolCalls([...streamedToolCalls, ...responseToolCalls]);
     const usage = normalizeUsage(response);
     const timings = normalizeTimings(response);
-    const responseReasoning = reasoning || response.message?.thinking;
     const output: ModelOutputItem[] = [];
-    if (responseReasoning)
+    if (reasoning)
       output.push({
         type: 'protocol',
         state: await createProviderContextState({
@@ -499,15 +433,15 @@ export class OllamaProvider implements ModelProvider {
           requestId: 'ollama-response',
           kind: 'ollama.thinking',
           requiresExactPrefix: false,
-          data: { thinking: responseReasoning },
-          tokenEstimate: new RequestTokenEstimator().estimateText(responseReasoning)
+          data: { thinking: reasoning },
+          tokenEstimate: new RequestTokenEstimator().estimateText(reasoning)
         })
       });
-    if (content || fallbackContent) output.push({ type: 'text', text: content || fallbackContent });
+    if (content) output.push({ type: 'text', text: content });
     output.push(...toolCalls.map((toolCall) => ({ type: 'tool_call' as const, toolCall })));
     return parseOllamaModelResponse({
       output,
-      content: content || fallbackContent,
+      content,
       model:
         typeof response.model === 'string' && response.model.length > 0 ? response.model : request.model,
       provider: this.id,
@@ -521,7 +455,7 @@ export class OllamaProvider implements ModelProvider {
               : 'unknown',
       ...(response.done_reason ? { providerTerminationReason: response.done_reason } : {}),
       ...(usage ? { usage } : {}),
-      ...(responseReasoning ? { reasoning: responseReasoning } : {}),
+      ...(reasoning ? { reasoning } : {}),
       ...(toolCalls.length > 0 ? { toolCalls } : {}),
       ...(Object.keys(timings).length > 0 ? { timings } : {}),
       ...(response.logprobs ? { logprobs: response.logprobs } : {}),
@@ -545,15 +479,8 @@ export class OllamaProvider implements ModelProvider {
   }
 
   private async discoverModel(model: string): Promise<ModelProfile> {
-    const client = this.clientFactory();
-    if (!client.show)
-      throw new ModelProviderError({
-        provider: this.id,
-        code: 'model_unavailable',
-        message: `Ollama model ${model} cannot be profiled because the client does not implement show(). Supply a complete modelProfiles override for offline or custom clients.`
-      });
     try {
-      const details = decodeOllamaShowResponse(await client.show({ model, verbose: false }));
+      const details = decodeOllamaShowResponse(await this.readJson('show', { model, verbose: false }));
       const profile = profileFromShow(model, details, this.generationOptions, this.deployment);
       return parseModelProfile({
         ...profile,
@@ -564,22 +491,21 @@ export class OllamaProvider implements ModelProvider {
     }
   }
 
-  private bindAbort(signal: AbortSignal | undefined, client: OllamaClient): () => void {
-    if (!signal) {
-      return () => undefined;
+  private async readJson(path: 'show' | 'tags', body?: object, signal?: AbortSignal): Promise<unknown> {
+    const response = await requestOllama(this.fetch, `${this.baseUrl}/api/${path}`, body, signal);
+    try {
+      return await readBoundedJsonResponse(response);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'malformed_response',
+        message: `Ollama /api/${path} did not return a bounded JSON response.`
+      });
     }
-    if (signal.aborted) {
-      client.abort?.();
-      return () => undefined;
-    }
-    const abort = () => client.abort?.();
-    signal.addEventListener('abort', abort, { once: true });
-    return () => {
-      signal.removeEventListener('abort', abort);
-    };
   }
 
-  private normalizeError(error: unknown, signal?: AbortSignal): ModelProviderError {
+  private normalizeError(error: unknown, signal?: AbortSignal, delivered = false): ModelProviderError {
     if (error instanceof ModelProviderError) {
       return error;
     }
@@ -602,35 +528,17 @@ export class OllamaProvider implements ModelProvider {
         cause: error
       });
     }
-    const statusCode = statusCodeFromError(error);
-    const unsupportedTools =
-      /does not support tools|tools?.*not supported|tool calling.*not supported/iu.test(message);
-    const classification =
-      statusCode === undefined
-        ? unsupportedTools
-          ? { code: 'invalid_request' as const, retryable: false }
-          : { code: 'provider_unavailable' as const, retryable: true }
-        : classifyModelHttpFailure(statusCode);
     return new ModelProviderError({
       provider: this.id,
-      ...classification,
+      code: 'provider_unavailable',
+      retryable: !delivered,
       message: `Ollama request failed: ${message}`,
       cause: error
     });
   }
 }
 
-function toRecord(value: unknown): Record<string, unknown> | undefined {
-  if (value instanceof Map) {
-    const map: ReadonlyMap<unknown, unknown> = value;
-    const output: Record<string, unknown> = {};
-    for (const [key, item] of map) if (typeof key === 'string') output[key] = item;
-    return output;
-  }
-  return isJsonObject(value) ? { ...value } : undefined;
-}
-
-function toOllamaMessage(message: ModelInputItem, lowerDeveloper: boolean): Message {
+function toOllamaMessage(message: ModelInputItem, lowerDeveloper: boolean): OllamaInputMessage {
   if (message.role === 'control' || message.role === 'protocol')
     throw new ModelProviderError({
       provider: 'ollama',
@@ -666,7 +574,7 @@ function toOllamaMessage(message: ModelInputItem, lowerDeveloper: boolean): Mess
       lowerDeveloper
     );
   }
-  const ollamaMessage: Message = {
+  const ollamaMessage: OllamaInputMessage = {
     role: message.role === 'developer' && lowerDeveloper ? 'system' : message.role,
     content: message.content
   };
@@ -884,7 +792,7 @@ function positiveIntegerOrUndefined(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined;
 }
 
-function toOllamaImages(images: readonly ModelImage[] | undefined): Message['images'] | undefined {
+function toOllamaImages(images: readonly ModelImage[] | undefined): OllamaInputMessage['images'] | undefined {
   return images?.length ? images.map(toBase64Image) : undefined;
 }
 
@@ -892,7 +800,7 @@ function toBase64Image(image: ModelImage): string {
   return image.type === 'base64' ? image.data : Buffer.from(image.data).toString('base64');
 }
 
-function toOllamaTool(tool: ModelTool): Tool {
+function toOllamaTool(tool: ModelTool): OllamaTool {
   if (tool.type !== 'function') {
     throw new ModelProviderError({
       provider: 'ollama',
@@ -900,7 +808,7 @@ function toOllamaTool(tool: ModelTool): Tool {
       message: `Ollama provider only supports JSON function tools: ${tool.name}`
     });
   }
-  const fn: Tool['function'] = { name: tool.function.name };
+  const fn: OllamaTool['function'] = { name: tool.function.name };
   if (tool.function.description) {
     fn.description = tool.function.description;
   }
@@ -913,7 +821,7 @@ function toOllamaTool(tool: ModelTool): Tool {
   };
 }
 
-function toOllamaToolCall(toolCall: ModelToolCall): NonNullable<Message['tool_calls']>[number] {
+function toOllamaToolCall(toolCall: ModelToolCall): NonNullable<OllamaInputMessage['tool_calls']>[number] {
   if (toolCall.input.kind !== 'json') {
     throw new ModelProviderError({
       provider: 'ollama',
@@ -947,20 +855,6 @@ function normalizeToolCalls(toolCalls: readonly OllamaWireToolCall[]): ModelTool
       input: { kind: 'json', value: toolCall.function.arguments }
     };
   });
-}
-
-function dedupeToolCalls(toolCalls: ModelToolCall[]): ModelToolCall[] {
-  const seen = new Set<string>();
-  const deduped: ModelToolCall[] = [];
-  for (const toolCall of toolCalls) {
-    const key = JSON.stringify(toolCall);
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
-    deduped.push(toolCall);
-  }
-  return deduped;
 }
 
 function normalizeUsage(response: OllamaWireResponse): ModelUsage | undefined {
@@ -999,18 +893,8 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   });
 }
 
-function statusCodeFromError(error: unknown): number | undefined {
-  if (!isJsonObject(error)) return undefined;
-  const statusCode = error.status_code ?? error.status;
-  return typeof statusCode === 'number' ? statusCode : undefined;
-}
-
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError';
-}
-
-function isJsonObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function parseOllamaModelResponse(value: unknown): ModelResponse {
@@ -1029,8 +913,8 @@ function parseOllamaModelResponse(value: unknown): ModelResponse {
   }
 }
 
-function toOllamaMessages(items: readonly ModelInputItem[], lowerDeveloper: boolean): Message[] {
-  const messages: Message[] = [];
+function toOllamaMessages(items: readonly ModelInputItem[], lowerDeveloper: boolean): OllamaInputMessage[] {
+  const messages: OllamaInputMessage[] = [];
   let thinking: string | undefined;
   for (const item of items) {
     if (item.role === 'protocol') {

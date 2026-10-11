@@ -5,9 +5,18 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "include": ["src"],
+  "include": [
+    "src"
+  ],
   "references": [
-    { "path": "../../json" },
-    { "path": "../../model" }
+    {
+      "path": "../../json"
+    },
+    {
+      "path": "../../model"
+    },
+    {
+      "path": "../openai-responses"
+    }
   ]
 }

@@ -1,7 +1,40 @@
 import { parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
 
-export interface OllamaWireToolCall { readonly function: { readonly name: string; readonly arguments: JsonObject } }
-export interface OllamaWireMessage { readonly content?: string; readonly thinking?: string; readonly tool_calls?: readonly OllamaWireToolCall[] }
+import type { OllamaGenerationOptions } from './index.js';
+
+export interface OllamaInputMessage {
+  role: string;
+  content: string;
+  thinking?: string;
+  images?: string[];
+  tool_calls?: OllamaWireToolCall[];
+  tool_name?: string;
+}
+export interface OllamaTool {
+  type: 'function';
+  function: { name: string; description?: string; parameters?: JsonObject };
+}
+export interface OllamaChatRequest {
+  model: string;
+  messages: OllamaInputMessage[];
+  stream: true;
+  format?: string | object;
+  keep_alive?: string | number;
+  tools?: OllamaTool[];
+  think?: boolean | 'high' | 'medium' | 'low';
+  logprobs?: boolean;
+  top_logprobs?: number;
+  options?: OllamaGenerationOptions;
+}
+
+export interface OllamaWireToolCall {
+  readonly function: { readonly name: string; readonly arguments: JsonObject };
+}
+export interface OllamaWireMessage {
+  readonly content?: string;
+  readonly thinking?: string;
+  readonly tool_calls?: readonly OllamaWireToolCall[];
+}
 export interface OllamaWireResponse {
   readonly raw: JsonObject;
   readonly model?: string;
@@ -48,12 +81,18 @@ export function decodeOllamaWireResponse(value: unknown): OllamaWireResponse {
 export function decodeOllamaShowResponse(value: unknown): OllamaShowResponse {
   const raw = parseJsonObject(value);
   const capabilities = raw.capabilities;
-  if (capabilities !== undefined && (!Array.isArray(capabilities) || !capabilities.every((item) => typeof item === 'string'))) throw new Error('Ollama show response.capabilities must be an array of strings.');
+  if (
+    capabilities !== undefined &&
+    (!Array.isArray(capabilities) || !capabilities.every((item) => typeof item === 'string'))
+  )
+    throw new Error('Ollama show response.capabilities must be an array of strings.');
   const modelInfo = ownedObject(raw.model_info, 'Ollama show response.model_info');
   const details = ownedObject(raw.details, 'Ollama show response.details');
   return Object.freeze({
     ...stringField(raw, 'parameters', 'Ollama show response'),
-    ...(capabilities === undefined ? {} : { capabilities: Object.freeze(capabilities.map((item) => item)) }),
+    ...(capabilities === undefined
+      ? {}
+      : { capabilities: Object.freeze(capabilities.map((item) => item)) }),
     ...(modelInfo === undefined ? {} : { model_info: modelInfo }),
     ...(details === undefined ? {} : { details }),
     ...stringField(raw, 'modified_at', 'Ollama show response')
@@ -64,7 +103,8 @@ function decodeMessage(value: JsonValue): OllamaWireMessage {
   const record = ownedObject(value, 'Ollama response.message');
   if (!record) throw new Error('Ollama response.message must be an object.');
   const toolCalls = record.tool_calls;
-  if (toolCalls !== undefined && !Array.isArray(toolCalls)) throw new Error('Ollama response.message.tool_calls must be an array.');
+  if (toolCalls !== undefined && !Array.isArray(toolCalls))
+    throw new Error('Ollama response.message.tool_calls must be an array.');
   return Object.freeze({
     ...stringField(record, 'content', 'Ollama response.message'),
     ...stringField(record, 'thinking', 'Ollama response.message'),
@@ -74,10 +114,22 @@ function decodeMessage(value: JsonValue): OllamaWireMessage {
 
 function decodeToolCall(value: JsonValue, index: number): OllamaWireToolCall {
   const record = ownedObject(value, `Ollama response.message.tool_calls[${String(index)}]`);
-  const fn = ownedObject(record?.function, `Ollama response.message.tool_calls[${String(index)}].function`);
-  if (!fn || typeof fn.name !== 'string' || fn.name.trim().length === 0) throw new Error(`Ollama response.message.tool_calls[${String(index)}].function.name must be a non-empty string.`);
-  const argumentsValue = ownedObject(fn.arguments, `Ollama response.message.tool_calls[${String(index)}].function.arguments`);
-  if (!argumentsValue) throw new Error(`Ollama response.message.tool_calls[${String(index)}].function.arguments must be an object.`);
+  const fn = ownedObject(
+    record?.function,
+    `Ollama response.message.tool_calls[${String(index)}].function`
+  );
+  if (!fn || typeof fn.name !== 'string' || fn.name.trim().length === 0)
+    throw new Error(
+      `Ollama response.message.tool_calls[${String(index)}].function.name must be a non-empty string.`
+    );
+  const argumentsValue = ownedObject(
+    fn.arguments,
+    `Ollama response.message.tool_calls[${String(index)}].function.arguments`
+  );
+  if (!argumentsValue)
+    throw new Error(
+      `Ollama response.message.tool_calls[${String(index)}].function.arguments must be an object.`
+    );
   return Object.freeze({ function: Object.freeze({ name: fn.name, arguments: argumentsValue }) });
 }
 
@@ -86,7 +138,25 @@ function ownedObject(value: JsonValue | undefined, label: string): JsonObject | 
   if (!isOwnedObject(value)) throw new Error(`${label} must be an object.`);
   return value;
 }
-function isOwnedObject(value: JsonValue): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }
-function stringField(record: JsonObject, key: string, label: string): Record<string, string> { const value = record[key]; if (value === undefined) return {}; if (typeof value !== 'string') throw new Error(`${label}.${key} must be a string.`); return { [key]: value }; }
-function booleanField(record: JsonObject, key: string, label: string): Record<string, boolean> { const value = record[key]; if (value === undefined) return {}; if (typeof value !== 'boolean') throw new Error(`${label}.${key} must be boolean.`); return { [key]: value }; }
-function numberField(record: JsonObject, key: string, label: string): Record<string, number> { const value = record[key]; if (value === undefined) return {}; if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) throw new Error(`${label}.${key} must be a non-negative finite number.`); return { [key]: value }; }
+function isOwnedObject(value: JsonValue): value is JsonObject {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+function stringField(record: JsonObject, key: string, label: string): Record<string, string> {
+  const value = record[key];
+  if (value === undefined) return {};
+  if (typeof value !== 'string') throw new Error(`${label}.${key} must be a string.`);
+  return { [key]: value };
+}
+function booleanField(record: JsonObject, key: string, label: string): Record<string, boolean> {
+  const value = record[key];
+  if (value === undefined) return {};
+  if (typeof value !== 'boolean') throw new Error(`${label}.${key} must be boolean.`);
+  return { [key]: value };
+}
+function numberField(record: JsonObject, key: string, label: string): Record<string, number> {
+  const value = record[key];
+  if (value === undefined) return {};
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0)
+    throw new Error(`${label}.${key} must be a non-negative finite number.`);
+  return { [key]: value };
+}

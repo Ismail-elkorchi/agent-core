@@ -95,35 +95,17 @@ test('provider request decoding owns input before asynchronous profile validatio
 });
 
 function ollamaAdapter() {
+  const provider = parts => new OllamaProvider({ fetch: async url => String(url).endsWith('/api/show')
+    ? Response.json({ capabilities: ['completion', 'tools', 'vision'], model_info: { 'test.context_length': 16000 } })
+    : new Response(parts.map(part => JSON.stringify({ model: 'llama-test', ...part })).join('\n') + '\n') });
   return {
     name: 'OllamaProvider', model: 'llama-test',
-    create() {
-      return new OllamaProvider({ clientFactory: () => ({
-        async chat(input) {
-          if (input.signal?.aborted) throw new Error('aborted');
-          return (async function* () {
-            yield { model: input.model, message: { role: 'assistant', content: 'hel' }, done: false };
-            yield { model: input.model, message: { role: 'assistant', content: 'lo' }, done: true, done_reason: 'stop', prompt_eval_count: 2, eval_count: 1 };
-          })();
-        },
-        async show() { return { capabilities: ['completion', 'tools', 'vision'], model_info: { 'test.context_length': 16000 } }; },
-        abort() {}
-      }) });
-    },
-    createMalformed() {
-      return new OllamaProvider({ clientFactory: () => ({
-        async chat() { return (async function* () { yield { model: 'llama-test', message: { content: '', tool_calls: [{ function: { name: 'bad', arguments: 'not-an-object' } }] }, done: true }; })(); },
-        async show() { return { capabilities: ['completion', 'tools'], model_info: { 'test.context_length': 16000 } }; },
-        abort() {}
-      }) });
-    },
-    createMalformedUsage() {
-      return new OllamaProvider({ clientFactory: () => ({
-        async chat() { return (async function* () { yield { model: 'llama-test', message: { content: 'hello' }, done: true, done_reason: 'stop', prompt_eval_count: -1, eval_count: 1 }; })(); },
-        async show() { return { capabilities: ['completion'], model_info: { 'test.context_length': 16000 } }; },
-        abort() {}
-      }) });
-    }
+    create: () => provider([
+      { message: { role: 'assistant', content: 'hel' }, done: false },
+      { message: { role: 'assistant', content: 'lo' }, done: true, done_reason: 'stop', prompt_eval_count: 2, eval_count: 1 }
+    ]),
+    createMalformed: () => provider([{ message: { content: '', tool_calls: [{ function: { name: 'bad', arguments: 'not-an-object' } }] }, done: true }]),
+    createMalformedUsage: () => provider([{ message: { content: 'hello' }, done: true, done_reason: 'stop', prompt_eval_count: -1, eval_count: 1 }])
   };
 }
 

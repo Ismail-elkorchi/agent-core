@@ -90,16 +90,11 @@ export function continuityProvider(id, { contextTokens = 128_000, respond = () =
       { id: response.id, model, choices: [{ finish_reason: 'stop', delta: {} }], usage: response.usage }
     ]) : Response.json(response);
   } });
-  if (id === 'ollama') return new OllamaProvider({ modelProfiles, clientFactory: () => ({
-    async chat(body) {
-      const content = reply(body);
-      return (async function* () {
-        yield { model, message: { role: 'assistant', content, thinking: 'Original thinking.' },
-          done: true, done_reason: 'stop', prompt_eval_count: 20, eval_count: 10 };
-      })();
-    },
-    abort() {}
-  }) });
+  if (id === 'ollama') return new OllamaProvider({ modelProfiles, fetch: async (_url, init) => {
+    const content = reply(JSON.parse(init.body));
+    return new Response(JSON.stringify({ model, message: { role: 'assistant', content, thinking: 'Original thinking.' },
+      done: true, done_reason: 'stop', prompt_eval_count: 20, eval_count: 10 }) + '\n');
+  } });
   if (id === 'claude') return new ClaudeProvider({ apiKey: 'test', modelProfiles, countTokens, fetch: async (url, init) => {
     const body = JSON.parse(init.body);
     if (String(url).endsWith('/count_tokens'))
