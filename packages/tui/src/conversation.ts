@@ -1,10 +1,10 @@
-import type { ToolActivityRenderer } from './tools.js';
+import type { ToolActivityRenderer, ToolCallRenderer } from './tools.js';
 import type {
   AgentProgressEvent,
   AgentToolDiagnostic,
   SessionBranchEntry
 } from '@agent-core/runtime';
-import { decodeToolCall, type ToolCall } from '@agent-core/tools';
+import { decodeToolCall } from '@agent-core/tools';
 import {
   completedSessionToolActivity,
   completedToolActivity,
@@ -48,6 +48,7 @@ export interface ConversationReasoningEntry extends ConversationIdentity {
 export interface ActivityDetail {
   readonly id: string;
   readonly content: string;
+  readonly format?: 'diff';
 }
 export interface ConversationActivityEntry extends ConversationIdentity {
   readonly id: string;
@@ -92,7 +93,7 @@ export function sessionConversationId(entry: SessionBranchEntry): string {
 function sessionEntries(
   entry: SessionBranchEntry,
   current?: ConversationActivityEntry,
-  label?: (call: ToolCall) => string,
+  renderCall?: ToolCallRenderer,
   renderTool?: ToolActivityRenderer
 ): readonly ConversationEntry[] {
   const id = sessionConversationId(entry);
@@ -121,7 +122,7 @@ function sessionEntries(
       ];
     case 'tool_call': {
       const call = decodeToolCall(entry.call);
-      return [pendingToolActivity(id, call, label?.(call))];
+      return [pendingToolActivity(id, call, renderCall?.(call))];
     }
     case 'observation':
       return [completedSessionToolActivity(current, entry, renderTool)];
@@ -148,7 +149,7 @@ function sessionEntries(
 function progressEntries(
   input: { readonly runId: string; readonly event: AgentProgressEvent },
   entries: readonly ConversationEntry[],
-  label?: (call: ToolCall) => string,
+  renderCall?: ToolCallRenderer,
   renderTool?: ToolActivityRenderer
 ): readonly ConversationEntry[] {
   const { event, runId } = input;
@@ -198,7 +199,7 @@ function progressEntries(
         pendingToolActivity(
           toolActivityId({ ...event, runId }),
           event.toolCall,
-          label?.(event.toolCall)
+          renderCall?.(event.toolCall)
         )
       ];
     case 'tool.started':
@@ -207,7 +208,7 @@ function progressEntries(
           toolActivityId({ ...event, runId }),
           event.input,
           event.effects,
-          label?.(event.input)
+          renderCall?.(event.input)
         )
       ];
     case 'tool.updated':
@@ -351,19 +352,19 @@ export function oversizedHistoryEntry(
 export function projectSessionEntry(
   entry: SessionBranchEntry,
   current?: ConversationActivityEntry,
-  label?: (call: ToolCall) => string,
+  renderCall?: ToolCallRenderer,
   renderTool?: ToolActivityRenderer
 ): readonly ConversationEntry[] {
-  const entries = sessionEntries(entry, current, label, renderTool);
+  const entries = sessionEntries(entry, current, renderCall, renderTool);
   return 'runId' in entry ? entries.map((item) => ({ ...item, runId: entry.runId })) : entries;
 }
 export function projectProgress(
   input: { readonly runId: string; readonly event: AgentProgressEvent },
   entries: readonly ConversationEntry[],
-  label?: (call: ToolCall) => string,
+  renderCall?: ToolCallRenderer,
   renderTool?: ToolActivityRenderer
 ): readonly ConversationEntry[] {
-  return progressEntries(input, entries, label, renderTool).map((entry) => ({
+  return progressEntries(input, entries, renderCall, renderTool).map((entry) => ({
     ...entry,
     runId: input.runId
   }));

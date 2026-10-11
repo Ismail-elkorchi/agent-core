@@ -1,5 +1,5 @@
 export { compareText } from './comparison.js';
-export { composerRows } from './composer.js';
+export { composerRows, suggestionLimit } from './composer.js';
 export { diagnosticMessage } from './diagnostics.js';
 export { applicationEventSource } from './event-source.js';
 export {
@@ -20,7 +20,8 @@ export {
   configurationPanel,
   type ConfigurationMessage,
   type ConfigurationOperations,
-  type ConfigurationState
+  type ConfigurationState,
+  type ConfigurationTarget
 } from './configuration.js';
 
 export {
@@ -175,7 +176,7 @@ export { adjacentHistoryMatch, selectHistoryMatch } from './history-matches.js';
 export type { HistoryMatchPosition } from './history-matches.js';
 export { reasoningLabel } from './progress.js';
 
-export type { ToolActivityRenderer } from './tools.js';
+export type { ToolActivityRenderer, ToolCallRenderer } from './tools.js';
 export { createContextState, updateContext, contextView } from './context.js';
 export type {
   ContextInspection,
@@ -183,3 +184,7 @@ export type {
   ContextState,
   ContextMessage
 } from './context.js';
+
+export * from './conversation-view.js';
+
+export * from './chrome.js';

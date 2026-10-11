@@ -36,7 +36,11 @@ import {
 } from '@ismail-elkorchi/terminal-ui/components';
 import { column, flow, viewport } from '@ismail-elkorchi/terminal-ui/layout';
 import { textDocumentText, type TextEditBuffer } from '@ismail-elkorchi/terminal-ui/text';
-import type { TuiChildDefinition, TuiChildResult, TuiEffect } from '@ismail-elkorchi/terminal-ui/tui';
+import type {
+  TuiChildDefinition,
+  TuiChildResult,
+  TuiEffect
+} from '@ismail-elkorchi/terminal-ui/tui';
 import { copySource } from './copy.js';
 import { diagnosticMessage } from './diagnostics.js';
 import { panel } from './panel.js';
@@ -51,6 +55,8 @@ export interface ConfigurationOperations {
     options?: ModelChangeOptions
   ): Promise<void>;
 }
+
+export type ConfigurationTarget = 'provider' | 'model' | 'reasoning' | 'authentication';
 
 export interface ConfigurationState {
   readonly offset: number;
@@ -141,7 +147,9 @@ function configurationState(
   selection: ModelSelection | undefined,
   providers: ConfigurationOperations['providers']
 ): ConfigurationState {
-  const pickerIndex = createSearchPickerIndex(providers.map((item) => ({ ...item, value: item.id })));
+  const pickerIndex = createSearchPickerIndex(
+    providers.map((item) => ({ ...item, value: item.id }))
+  );
   const pickerQueryResult = querySearchPickerIndex(pickerIndex, { text: '', mode: 'fuzzy' });
   return {
     id: crypto.randomUUID(),
@@ -151,7 +159,8 @@ function configurationState(
     pickerIndex,
     pickerQueryResult,
     picker: createSearchPickerState(
-      { query: { text: '', mode: 'fuzzy' }, queryResult: pickerQueryResult }, pickerIndex
+      { query: { text: '', mode: 'fuzzy' }, queryResult: pickerQueryResult },
+      pickerIndex
     ),
     input: createTextAreaState({ value: '' }),
     secret: { text: '', cursor: 0 },
@@ -161,7 +170,10 @@ function configurationState(
 
 function updateConfiguration(
   state: ConfigurationState,
-  message: Exclude<ConfigurationMessage, { readonly type: 'configuration.close' | 'configuration.saved' }>,
+  message: Exclude<
+    ConfigurationMessage,
+    { readonly type: 'configuration.close' | 'configuration.saved' }
+  >,
   operations: ConfigurationOperations
 ) {
   let current = state;
@@ -179,18 +191,29 @@ function updateConfiguration(
   }
   const result = reduceConfiguration(current, message, operations);
   const next = result.state;
-  const catalogChanged = next.stage !== state.stage || next.models !== state.models
-    || next.profile !== state.profile || next.selection.model !== state.selection.model;
-  const owned = next.pickerIndex === state.pickerIndex && catalogChanged
-    ? replaceConfigurationPicker(next, operations)
-    : next;
+  const catalogChanged =
+    next.stage !== state.stage ||
+    next.models !== state.models ||
+    next.profile !== state.profile ||
+    next.selection.model !== state.selection.model;
+  const owned =
+    next.pickerIndex === state.pickerIndex && catalogChanged
+      ? replaceConfigurationPicker(
+          next,
+          operations,
+          next.stage !== state.stage || next.profile !== state.profile
+        )
+      : next;
   if (owned.stage !== state.stage) return { ...result, state: { ...owned, offset: 0 } };
   return owned === result.state ? result : { ...result, state: owned };
 }
 
 function reduceConfiguration(
   state: ConfigurationState,
-  message: Exclude<ConfigurationMessage, { readonly type: 'configuration.close' | 'configuration.saved' }>,
+  message: Exclude<
+    ConfigurationMessage,
+    { readonly type: 'configuration.close' | 'configuration.saved' }
+  >,
   operations: ConfigurationOperations
 ): TuiChildResult<ConfigurationState, ConfigurationMessage> {
   if ('id' in message && message.id !== state.id) return { state };
@@ -284,6 +307,9 @@ function reduceConfiguration(
       return discover(next, operations, true);
     }
     case 'configuration.connected':
+      if (state.stage === 'authentication')
+        return { state: { ...state, adapter: message.adapter, pending: undefined } };
+      if (state.stage === 'reasoning') return describe({ ...state, adapter: message.adapter });
       return operation({ ...state, adapter: message.adapter }, async (request, signal) => ({
         type: 'configuration.catalog',
         id: state.id,
@@ -316,16 +342,29 @@ function reduceConfiguration(
     }
     case 'configuration.transition': {
       const picker = searchPickerReducer(state.picker, message.transition, {
-        searchPickerIndex: state.pickerIndex, queryResult: state.pickerQueryResult
+        searchPickerIndex: state.pickerIndex,
+        queryResult: state.pickerQueryResult
       });
-      const query = { text: picker.editor.input.text, mode: picker.mode, caseSensitive: picker.caseSensitive };
+      const query = {
+        text: picker.editor.input.text,
+        mode: picker.mode,
+        caseSensitive: picker.caseSensitive
+      };
       const pickerQueryResult = querySearchPickerIndex(state.pickerIndex, query);
-      return { state: {
-        ...state,
-        pickerQueryResult,
-        picker: pickerQueryResult === state.pickerQueryResult ? picker
-          : searchPickerReducer(picker, { kind: 'firstActive' }, { searchPickerIndex: state.pickerIndex, queryResult: pickerQueryResult })
-      } };
+      return {
+        state: {
+          ...state,
+          pickerQueryResult,
+          picker:
+            pickerQueryResult === state.pickerQueryResult
+              ? picker
+              : searchPickerReducer(
+                  picker,
+                  { kind: 'firstActive' },
+                  { searchPickerIndex: state.pickerIndex, queryResult: pickerQueryResult }
+                )
+        }
+      };
     }
     case 'configuration.edit':
       return { state: { ...state, input: textAreaReducer(state.input, message.transition).state } };
@@ -335,12 +374,16 @@ function reduceConfiguration(
       if (state.stage === 'provider') {
         const same = state.selection.provider === message.value;
         return discover(
-          replaceConfigurationPicker({
-            ...state,
-            selection: same ? state.selection : { provider: message.value, model: '' },
-            models: [],
-            stage: 'model'
-          }, operations, true),
+          replaceConfigurationPicker(
+            {
+              ...state,
+              selection: same ? state.selection : { provider: message.value, model: '' },
+              models: [],
+              stage: 'model'
+            },
+            operations,
+            true
+          ),
           operations
         );
       }
@@ -464,18 +507,23 @@ function reduceConfiguration(
       return describe({ ...state, selection: { ...state.selection, model: value } });
     }
     case 'configuration.catalog':
-      return { state: replaceConfigurationPicker({
-        ...state,
-        pending: undefined,
-        adapter: message.adapter,
-        models: message.models
-      }, operations) };
+      return {
+        state: replaceConfigurationPicker(
+          {
+            ...state,
+            pending: undefined,
+            adapter: message.adapter,
+            models: message.models
+          },
+          operations
+        )
+      };
     case 'configuration.profile': {
       const next = {
         ...state,
         pending: undefined,
         profile: message.profile,
-        stage: 'review' as const
+        stage: state.stage === 'reasoning' ? ('reasoning' as const) : ('review' as const)
       };
       try {
         assertModelRequestSupported(message.profile, {
@@ -635,21 +683,56 @@ function replaceConfigurationPicker(
   reset = false
 ): ConfigurationState {
   const pickerIndex = configurationIndex(state, operations);
-  const query = reset ? { text: '', mode: 'fuzzy' as const }
-    : { text: state.picker.editor.input.text, mode: state.picker.mode, caseSensitive: state.picker.caseSensitive };
+  const query = reset
+    ? { text: '', mode: 'fuzzy' as const }
+    : {
+        text: state.picker.editor.input.text,
+        mode: state.picker.mode,
+        caseSensitive: state.picker.caseSensitive
+      };
   const pickerQueryResult = querySearchPickerIndex(pickerIndex, query);
-  const current = reset ? createSearchPickerState({ query, queryResult: pickerQueryResult }, pickerIndex) : state.picker;
+  const current = reset
+    ? createSearchPickerState({ query, queryResult: pickerQueryResult }, pickerIndex)
+    : state.picker;
   const enabledId = (id: string | undefined) => {
-    const position = id === undefined ? undefined : searchPickerQueryPosition(pickerQueryResult, id);
+    const position =
+      id === undefined ? undefined : searchPickerQueryPosition(pickerQueryResult, id);
     const entry = position === undefined ? undefined : pickerQueryResult.entryAt(position);
     return entry?.disabled === true ? undefined : entry?.id;
   };
-  const desiredId = enabledId(current.editor.activeId)
-    ?? enabledId(state.selection.model)
-    ?? createSearchPickerState({ query, queryResult: pickerQueryResult }, pickerIndex).editor.activeId;
-  const picker = searchPickerReducer(current, { kind: 'setActive', ...(desiredId === undefined ? {} : { id: desiredId }) },
-    { searchPickerIndex: pickerIndex, queryResult: pickerQueryResult });
+  const desiredId =
+    (reset ? undefined : enabledId(current.editor.activeId)) ??
+    enabledId(selectedConfigurationChoice(state)) ??
+    createSearchPickerState({ query, queryResult: pickerQueryResult }, pickerIndex).editor.activeId;
+  const picker = searchPickerReducer(
+    current,
+    { kind: 'setActive', ...(desiredId === undefined ? {} : { id: desiredId }) },
+    { searchPickerIndex: pickerIndex, queryResult: pickerQueryResult }
+  );
   return { ...state, picker, pickerIndex, pickerQueryResult };
+}
+
+function selectedConfigurationChoice(state: ConfigurationState): string {
+  switch (state.stage) {
+    case 'provider':
+      return state.selection.provider;
+    case 'reasoning': {
+      const reasoning = state.selection.reasoning;
+      return reasoning?.strategy === 'effort'
+        ? reasoning.effort
+        : (reasoning?.strategy ?? 'default');
+    }
+    case 'reasoning-mode':
+      return state.selection.reasoning?.strategy === 'effort'
+        ? (state.selection.reasoning.mode ?? 'default')
+        : 'default';
+    case 'reasoning-summary':
+      return state.selection.reasoning?.strategy !== 'disabled'
+        ? (state.selection.reasoning?.summary ?? 'default')
+        : 'default';
+    default:
+      return state.selection.model;
+  }
 }
 
 function configurationIndex(state: ConfigurationState, operations: ConfigurationOperations) {
@@ -937,10 +1020,20 @@ function retainReasoningOptions(
 
 export function configurationPanel(
   selection: () => ModelSelection | undefined,
-  operations: ConfigurationOperations
+  operations: ConfigurationOperations,
+  target: ConfigurationTarget = 'provider'
 ): TuiChildDefinition<ConfigurationState, ConfigurationMessage, 'close' | 'saved'> {
   return {
-    init: () => ({ state: configurationState(selection(), operations.providers) }),
+    init: () => {
+      const current = selection();
+      const state = configurationState(current, operations.providers);
+      if (target === 'provider' || !current?.provider) return { state };
+      const stage = target === 'reasoning' && !current.model ? 'model' : target;
+      return discover(
+        replaceConfigurationPicker({ ...state, stage }, operations, true),
+        operations
+      );
+    },
     update: (state, message) => {
       if (message.type === 'configuration.close') return { state, outputs: ['close'] };
       if (message.type === 'configuration.saved')

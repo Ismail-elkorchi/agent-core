@@ -46,3 +46,5 @@ export { readRootedText } from './core/text.js';
 export { renderLocalToolObservation } from './core/human-output.js';
 
 export { createWorkspaceToolHost, type WorkspaceToolHost } from './core/workspace-tool-host.js';
+
+export { localToolCallPresentation } from './core/call-presentation.js';

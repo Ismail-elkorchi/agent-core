@@ -399,7 +399,12 @@ test(
     }).resume('source-overflow').result;
     assert.equal(result.reason, 'context_admission', JSON.stringify(result));
     assert.equal(state.requests.length, before);
-    assert.equal((await state.context.inspect()).window, null);
+    const inspection = await state.context.inspect();
+    assert.equal(inspection.window, null);
+    assert.equal(inspection.activeSelection.status, 'unavailable');
+    assert.equal(inspection.activeSelection.conflict.kind, 'source_capacity');
+    const replacement = await state.context.selectSources(inspection.cut, { retain: [] });
+    assert.deepEqual(replacement.retained, await state.context.protectedSources());
     await state.context.transition({
       expectedWindowId: null,
       idempotencyKey: 'explicit-selection',

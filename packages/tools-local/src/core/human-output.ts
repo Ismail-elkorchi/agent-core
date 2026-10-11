@@ -19,7 +19,10 @@ export function renderLocalToolObservation(
 ):
   | {
       readonly status?: 'running' | 'complete' | 'failed' | 'warning';
-      readonly details: readonly { readonly id: string; readonly content: string }[];
+      readonly details: readonly {
+        readonly id: string;
+        readonly content: string;
+      }[];
     }
   | undefined {
   if (observation.kind !== 'result') return undefined;
@@ -63,7 +66,8 @@ export function renderLocalToolObservation(
             .join('\n')}`;
         })
         .join('\n\n');
-      if (output.failures.length) content += `\n${JSON.stringify(output.failures, null, 2)}`;
+      if (output.failures.length)
+        content += `\n${output.failures.map((failure) => `${failure.path}: ${failure.message}`).join('\n')}`;
       if (output.coverage === 'partial') content += '\nCoverage: partial';
       break;
     }
@@ -72,7 +76,12 @@ export function renderLocalToolObservation(
       content = (
         output.mode === 'matches'
           ? searchPassages(output.results).map((passage) => `${passage.header}\n${passage.text}`)
-          : output.results.map((item) => JSON.stringify(item))
+          : output.mode === 'files'
+            ? output.results
+            : output.results.map(
+                (item) =>
+                  `${item.path}: ${String(item.matchingLineCount)} matching lines · ${String(item.occurrenceCount)} occurrences`
+              )
       ).join('\n');
       content += `\nResult coverage: ${output.resultCoverage}`;
       break;
@@ -83,9 +92,34 @@ export function renderLocalToolObservation(
         toolName === 'apply_patch'
           ? applyPatchOutputSchema.parse(observation.output)
           : editTextOutputSchema.parse(observation.output);
-      content = `${output.applicationStatus} · root ${output.rootState}\n${JSON.stringify(output.files, null, 2)}`;
-      if (output.transaction !== undefined)
-        content += `\n${JSON.stringify(output.transaction, null, 2)}`;
+      content = [
+        `${output.applicationStatus.replaceAll('_', ' ')} · filesystem state ${output.rootState}`,
+        ...output.files.map((file) =>
+          'operation' in file
+            ? `${file.operation} ${file.path}${file.destinationPath ? ` → ${file.destinationPath}` : ''} · +${String(file.additions)} −${String(file.deletions)} · ${file.finalState}`
+            : `${file.path} · ${String(file.changedRanges.length)} edited ranges · ${file.finalState}`
+        ),
+        ...('diffSummary' in output
+          ? [
+              output.diffSummary.text,
+              ...(output.diffSummary.truncated
+                ? ['Comparison excerpt; inspect original sources for the complete change.']
+                : [])
+            ]
+          : [])
+      ].join('\n');
+      const transaction = output.transaction;
+      if (transaction !== undefined) {
+        content += `\nTransaction: ${transaction.outcome.replaceAll('_', ' ')}`;
+        if ('failure' in transaction)
+          content += `\n${transaction.failure.path}: ${transaction.failure.message}`;
+        const recovery = 'rollback' in transaction ? transaction.rollback : transaction.cleanup;
+        if (recovery !== undefined)
+          content += `\n${[
+            ...recovery.diagnostics.map((item) => `${item.action} ${item.path}: ${item.message}`),
+            ...recovery.strandedPaths.map((path) => `Requires recovery: ${path}`)
+          ].join('\n')}`;
+      }
       status =
         output.rootState === 'uncertain' || output.applicationStatus === 'not_applied'
           ? 'warning'

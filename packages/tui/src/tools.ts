@@ -9,6 +9,11 @@ interface ExistingActivity {
   readonly details?: readonly ActivityDetail[];
 }
 
+export type ToolCallRenderer = (call: ToolCall) => {
+  readonly label: string;
+  readonly details?: readonly ActivityDetail[];
+};
+
 export type ToolActivityRenderer = (
   toolName: string,
   observation: { readonly kind: 'result' | 'failure'; readonly output?: unknown }
@@ -68,7 +73,7 @@ export function completedSessionToolActivity(
         : entry.summary
     ),
     ...(details.length === 0 ? {} : { details: details }),
-    ...renderObservation(render, entry.toolName, entry),
+    ...renderObservation(render, entry.toolName, entry, details),
     ...(entry.originalUnavailable
       ? {
           status: 'warning' as const,
@@ -97,16 +102,16 @@ export function sessionObservationActivityId(
 export function pendingToolActivity(
   id: string,
   call: ToolCall,
-  label = humanize(call.name)
+  presentation?: ReturnType<ToolCallRenderer>
 ): ToolActivity {
   return {
     id,
     kind: 'activity',
     activity: 'tool',
-    label,
+    label: presentation?.label ?? humanize(call.name),
     status: 'running',
     summary: 'Waiting to run',
-    details: [{ id: 'input', content: formatToolInput(call) }]
+    details: callDetails(call, presentation)
   };
 }
 
@@ -114,17 +119,17 @@ export function runningToolActivity(
   id: string,
   call: ToolCall,
   effects: ToolEffects,
-  label = humanize(call.name)
+  presentation?: ReturnType<ToolCallRenderer>
 ): ToolActivity {
   return {
     id,
     kind: 'activity',
     activity: 'tool',
-    label,
+    label: presentation?.label ?? humanize(call.name),
     status: 'running',
     summary: 'Running',
     details: [
-      { id: 'input', content: formatToolInput(call) },
+      ...callDetails(call, presentation),
       { id: 'effects', content: formatEffects(effects) }
     ]
   };
@@ -192,7 +197,7 @@ export function completedToolActivity(
             : 'complete',
     ...(summary.length === 0 ? {} : { summary }),
     ...(details.length === 0 ? {} : { details: details }),
-    ...renderObservation(render, toolName, observation),
+    ...renderObservation(render, toolName, observation, details),
     ...(observation.execution?.state === 'unknown'
       ? { status: 'warning' as const }
       : observation.execution?.state === 'active'
@@ -203,6 +208,17 @@ export function completedToolActivity(
 
 export function formatApprovalInput(call: ToolCall): string {
   return formatToolInput(call);
+}
+
+function callDetails(
+  call: ToolCall,
+  presentation: ReturnType<ToolCallRenderer> | undefined
+): readonly ActivityDetail[] {
+  return (
+    presentation?.details?.map((item) => ({ ...item, content: preview(item.content) })) ?? [
+      { id: 'input', content: formatToolInput(call) }
+    ]
+  );
 }
 
 function formatToolInput(call: ToolCall): string {
@@ -247,8 +263,17 @@ function formatObservedFacts(observation: ToolObservation): string | undefined {
 }
 
 function formatValue(value: ToolDisplayValue): string {
-  if (typeof value === 'string') return value;
-  return bounded(JSON.stringify(value, null, 2), 32768);
+  return preview(typeof value === 'string' ? value : JSON.stringify(value, null, 2));
+}
+
+function preview(value: string): string {
+  const maximum = 32768;
+  if (value.length <= maximum) return value;
+  const notice = '\n[Preview shortened; original retained in session history.]';
+  let end = maximum - notice.length;
+  const unit = value.charCodeAt(end - 1);
+  if (unit >= 0xd800 && unit <= 0xdbff) end--;
+  return value.slice(0, end) + notice;
 }
 
 function compact(value: string): string {
@@ -292,7 +317,8 @@ function settleDetails(
 function renderObservation(
   render: ToolActivityRenderer | undefined,
   toolName: string,
-  observation: { readonly kind: 'result' | 'failure'; readonly output?: unknown }
+  observation: { readonly kind: 'result' | 'failure'; readonly output?: unknown },
+  existing: readonly ActivityDetail[]
 ): ReturnType<ToolActivityRenderer> {
   if (!render) return undefined;
   try {
@@ -315,10 +341,15 @@ function renderObservation(
       ...rendered,
       ...(rendered.details
         ? {
-            details: rendered.details.map((item) => ({
-              ...item,
-              content: bounded(item.content, 32768)
-            }))
+            details: [
+              ...existing.filter(
+                (item) => !rendered.details?.some((replacement) => replacement.id === item.id)
+              ),
+              ...rendered.details.map((item) => ({
+                ...item,
+                content: preview(item.content)
+              }))
+            ]
           }
         : {}),
       ...(observation.kind === 'failure' ? { status: 'failed' as const } : {})
@@ -326,15 +357,7 @@ function renderObservation(
   } catch (error) {
     return {
       details: [
-        {
-          id: 'output',
-          content: bounded(
-            typeof observation.output === 'string'
-              ? observation.output
-              : JSON.stringify(observation.output),
-            32768
-          )
-        },
+        ...existing,
         {
           id: 'presentation-diagnostic',
           content: `Tool display unavailable: ${error instanceof Error ? error.message : String(error)}`

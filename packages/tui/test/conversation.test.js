@@ -164,3 +164,33 @@ test('restored uncertain tool diagnostics replace running presentation without c
   assert.equal(activity.summary, diagnostic.observation.summary);
   assert.match(activity.details[0].content, /external execution unknown/);
 });
+
+test('human output rendering retains the call and authoritative execution details', async () => {
+  const { completedToolActivity } = await import('@agent-core/tui');
+  const activity = completedToolActivity({ label: 'Apply change', details: [
+    { id: 'input', content: '+new\n-old', format: 'diff' }, { id: 'effects', content: 'Write authorized file' }
+  ] }, 'call', 'edit', {
+    kind: 'result', summary: 'Applied', output: {},
+    execution: { state: 'settled' }, scope: { resources: ['file'], coverage: 'complete' }
+  }, () => ({ details: [{ id: 'output', content: 'Edited file · +1 −1' }] }));
+  assert.equal(activity.details.find((item) => item.id === 'input').format, 'diff');
+  assert.match(activity.details.find((item) => item.id === 'effects').content, /authorized/);
+  assert.equal(activity.details.find((item) => item.id === 'output').content, 'Edited file · +1 −1');
+});
+
+test('tool presentation bounds previews without modifying original input or losing diagnostic evidence', async () => {
+  const { pendingToolActivity, completedToolActivity } = await import('@agent-core/tui');
+  const patch = '+😀'.repeat(20000);
+  const call = createToolCall({ id: 'patch', name: 'apply_patch', input: { kind: 'text', value: patch }, type: 'custom' });
+  const pending = pendingToolActivity('call', call, { label: 'Apply patch', details: [{ id: 'input', format: 'diff', content: patch }] });
+  assert.ok(pending.details[0].content.length <= 32768);
+  assert.match(pending.details[0].content, /Preview shortened/);
+  assert.equal(pending.details[0].content.isWellFormed(), true);
+  assert.equal(call.input.value, patch);
+  const completed = completedToolActivity(pending, 'call', 'apply_patch', {
+    kind: 'result', summary: 'Recorded', output: { status: 'applied' }
+  }, () => { throw new Error('display failed'); });
+  assert.equal(completed.details.find(item => item.id === 'input').content, pending.details[0].content);
+  assert.match(completed.details.find(item => item.id === 'output').content, /applied/);
+  assert.match(completed.details.find(item => item.id === 'presentation-diagnostic').content, /display failed/);
+});

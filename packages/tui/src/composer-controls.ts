@@ -5,20 +5,22 @@ import type { DraftAttachment } from './draft.js';
 export function composerControls<Message extends { readonly type: string }>(options: {
   readonly attachments: readonly DraftAttachment[];
   readonly queued: number;
-  readonly delivery: 'input' | 'follow_up';
+  readonly hint: string;
   readonly onAttachments: () => Message;
   readonly onQueue: () => Message;
 }): Element<Message> {
   return row(
     [
       text({
-        content: options.delivery === 'follow_up' ? 'Enter: queue follow-up' : 'Enter: send',
+        content: options.hint,
         textRole: 'caption'
       }),
       button({
         id: 'draft-attachments',
         label:
-          options.attachments.length === 0 ? 'Attach' : `${String(options.attachments.length)} attached`,
+          options.attachments.length === 0
+            ? 'Attach'
+            : `${String(options.attachments.length)} attached`,
         onPress: options.onAttachments
       }),
       ...(options.queued === 0

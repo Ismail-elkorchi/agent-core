@@ -28,7 +28,11 @@ export interface ResourceCompletion {
   readonly error?: string;
 }
 export type ResourceCompletionMessage =
-  | { readonly type: 'resource.loaded'; readonly id: string; readonly items: readonly ResourceSuggestion[] }
+  | {
+      readonly type: 'resource.loaded';
+      readonly id: string;
+      readonly items: readonly ResourceSuggestion[];
+    }
   | { readonly type: 'resource.failed'; readonly id: string; readonly error: string }
   | { readonly type: 'resource.move'; readonly delta: number }
   | { readonly type: 'resource.accept'; readonly id?: string }
@@ -46,7 +50,10 @@ export function completeResource(
       ('text' in transition.operation && transition.operation.text.length !== 1))
   )
     return undefined;
-  if (input.selection !== undefined && input.selection.anchor.offset !== input.selection.focus.offset)
+  if (
+    input.selection !== undefined &&
+    input.selection.anchor.offset !== input.selection.focus.offset
+  )
     return undefined;
   const end = input.caret.position.offset;
   const before = textDocumentText(input.document).slice(0, end);
@@ -85,7 +92,10 @@ export function updateResourceCompletion(
   state: ResourceCompletion,
   message: ResourceCompletionMessage
 ): ResourceCompletion | undefined {
-  if ((message.type === 'resource.loaded' || message.type === 'resource.failed') && message.id !== state.id)
+  if (
+    (message.type === 'resource.loaded' || message.type === 'resource.failed') &&
+    message.id !== state.id
+  )
     return state;
   switch (message.type) {
     case 'resource.loaded': {
@@ -121,7 +131,8 @@ export function acceptResource(
   id?: string
 ): TextAreaState {
   if (state.phase !== 'ready' || input !== state.input) return input;
-  const item = id === undefined ? state.items[state.selected] : state.items.find((item) => item.id === id);
+  const item =
+    id === undefined ? state.items[state.selected] : state.items.find((item) => item.id === id);
   return item === undefined
     ? input
     : textAreaReducer(input, {
@@ -133,11 +144,11 @@ export function acceptResource(
         }
       }).state;
 }
-export function resourceCompletionRows(state?: ResourceCompletion): number {
-  return state === undefined ? 0 : Math.max(1, Math.min(5, state.items.length)) + 1;
+export function resourceCompletionRows(state?: ResourceCompletion, limit = 5): number {
+  return state === undefined ? 0 : Math.max(1, Math.min(limit, state.items.length)) + 1;
 }
-export function resourceSuggestions(state: ResourceCompletion) {
-  const start = Math.max(0, state.selected - 4);
+export function resourceSuggestions(state: ResourceCompletion, limit = 5) {
+  const start = Math.max(0, state.selected - limit + 1);
   return column([
     ...(state.phase !== 'ready' || state.items.length === 0
       ? [
@@ -150,7 +161,7 @@ export function resourceSuggestions(state: ResourceCompletion) {
                   : 'No matching resources.'
           })
         ]
-      : state.items.slice(start, start + 5).map((item, index) =>
+      : state.items.slice(start, start + limit).map((item, index) =>
           button<ResourceCompletionMessage>({
             id: `resource:${item.id}`,
             label: `${start + index === state.selected ? '› ' : ''}${item.label}`,

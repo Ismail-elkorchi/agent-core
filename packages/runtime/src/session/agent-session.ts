@@ -367,13 +367,20 @@ export class AgentSession {
   }
 
   /** Explicitly restart model reasoning in this session without resetting effects or budgets. */
-  freshContinuation(input: { readonly profile: ModelProfile }): Promise<AgentSessionState> {
+  freshContinuation(input: {
+    readonly profile: ModelProfile;
+    readonly retained?: readonly import('../history/contracts.js').HistorySourceRef[];
+  }): Promise<AgentSessionState> {
     return this.serial(async () => {
       this.assertOpen();
       await this.restorePending();
       if (this.active || this.suspended || this.queued.length > 0)
         throw new Error('Settle or reconcile pending work before a fresh continuation.');
-      const entry = await this.selectFreshContinuation(this.configuration, input.profile);
+      const entry = await this.selectFreshContinuation(
+        this.configuration,
+        input.profile,
+        input.retained
+      );
       await this.emit({
         type: 'context.transitioned',
         window: entry.window,
@@ -383,7 +390,11 @@ export class AgentSession {
     });
   }
 
-  private async selectFreshContinuation(model: ModelSelection, profile: ModelProfile) {
+  private async selectFreshContinuation(
+    model: ModelSelection,
+    profile: ModelProfile,
+    retained?: readonly import('../history/contracts.js').HistorySourceRef[]
+  ) {
     const context = this.options.context;
     if (!context) throw new Error('Fresh continuation requires a session context service.');
     if (model.provider !== profile.provider || model.model !== profile.id)
@@ -391,7 +402,7 @@ export class AgentSession {
     const cut = await context.history.capture();
     const window = await context.history.selectedContext(cut);
     const selection = await context.freshSelection({
-      selection: await context.selectSources(cut, {}),
+      selection: await context.selectSources(cut, { retain: retained }),
       model,
       profile,
       cut,

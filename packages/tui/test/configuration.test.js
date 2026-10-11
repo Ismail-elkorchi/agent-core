@@ -304,3 +304,29 @@ test('configuration catalog replacement cannot retain a result from the previous
   assert.deepEqual(next.pickerQueryResult.window(0, next.pickerQueryResult.count).map((entry) => entry.id), ['disabled', 'new']);
   assert.equal(next.pickerQueryResult.entryAt(0).disabled, true);
 });
+
+for (const target of ['model', 'reasoning', 'authentication']) {
+  test(`configured ${target} opens directly and retains the current choice`, async () => {
+    const selection = { provider: 'neutral', model: profile.id, reasoning: { strategy: 'effort', effort: 'high' } };
+    const calls = [];
+    const adapter = {
+      describeModel: async (model) => { calls.push(['describe', model]); return profile; },
+      listModels: async () => { calls.push(['list']); return [{ id: profile.id }]; }
+    };
+    const operations = { providers: [{ id: 'neutral', label: 'Neutral' }],
+      connect: (provider) => { assert.equal(provider, 'neutral'); return adapter; }
+    };
+    const panel = configurationPanel(() => selection, operations, target);
+    let result = panel.init();
+    const signal = new AbortController().signal;
+    while (result.effects?.length) {
+      const output = await result.effects[0].run({ signal });
+      result = panel.update(result.state, output.message);
+    }
+    assert.equal(result.state.stage, target);
+    assert.equal(result.state.adapter, adapter);
+    assert.equal(result.state.pending, undefined);
+    if (target === 'reasoning') assert.equal(result.state.picker.editor.activeId, 'high');
+    assert.deepEqual(calls, target === 'model' ? [['list']] : target === 'reasoning' ? [['describe', profile.id]] : []);
+  });
+}

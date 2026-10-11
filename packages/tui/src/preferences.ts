@@ -27,6 +27,7 @@ export interface StatusField {
   readonly id: string;
   readonly label: string;
   readonly value?: string;
+  readonly compactValue?: string;
 }
 
 export type PreferencesMessage =
@@ -95,7 +96,11 @@ export function updatePreferences(
       const from = statusline.indexOf(message.id);
       if (from < 0) return preferences;
       statusline.splice(from, 1);
-      statusline.splice(Math.max(0, Math.min(statusline.length, from + message.delta)), 0, message.id);
+      statusline.splice(
+        Math.max(0, Math.min(statusline.length, from + message.delta)),
+        0,
+        message.id
+      );
       return { ...preferences, statusline };
     }
     case 'preferences.theme':
@@ -144,8 +149,13 @@ export function preferencesView(
   } = { actions: [] }
 ): Element<PreferencesMessage | { readonly type: 'overlay.close' }> {
   type Message = PreferencesMessage | { readonly type: 'overlay.close' };
-  const selected = preferences.statusline.flatMap((id) => fields.filter((field) => field.id === id));
-  const ordered = [...selected, ...fields.filter((field) => !preferences.statusline.includes(field.id))];
+  const selected = preferences.statusline.flatMap((id) =>
+    fields.filter((field) => field.id === id)
+  );
+  const ordered = [
+    ...selected,
+    ...fields.filter((field) => !preferences.statusline.includes(field.id))
+  ];
   return panel({
     id: 'preferences',
     title: 'Status line and appearance',
@@ -233,7 +243,10 @@ export function preferencesView(
           id: 'preferences-fields',
           offset: { row: offset },
           scrollbar: { axis: 'vertical', visible: 'auto' },
-          onScroll: (event): Message => ({ type: 'preferences.scroll', offset: event.nextState.offsetRow })
+          onScroll: (event): Message => ({
+            type: 'preferences.scroll',
+            offset: event.nextState.offsetRow
+          })
         }
       ),
       actions: button({

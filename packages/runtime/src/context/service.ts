@@ -95,6 +95,7 @@ export class ContextService {
       : undefined;
     return Object.freeze({
       cut,
+      activeSelection: await this.inspectSelection(cut),
       window:
         window && selection
           ? Object.freeze({ ...window, selection: Object.freeze(selection) })
@@ -117,6 +118,17 @@ export class ContextService {
       protectedSources: await this.protectedSources(cut),
       ...(capacity ? { capacity } : {})
     });
+  }
+  private async inspectSelection(cut: HistorySourceCut): Promise<
+    | { readonly status: 'available'; readonly selection: ContextSelection }
+    | { readonly status: 'unavailable'; readonly conflict: ContextSourceCapacityError['conflict'] }
+  > {
+    try {
+      return { status: 'available' as const, selection: await this.selectSources(cut, {}) };
+    } catch (error) {
+      if (!(error instanceof ContextSourceCapacityError)) throw error;
+      return { status: 'unavailable' as const, conflict: error.conflict };
+    }
   }
   private runtime:
     | {
@@ -161,7 +173,12 @@ export class ContextService {
       readonly release?: readonly HistorySourceRef[] | undefined;
     }
   ): Promise<ContextSelection> {
-    const view = await readSelectedHistorySources(this.history, cut);
+    // An explicit replacement must not read the originals it is discarding.
+    // Complete exchanges and transition admission still validate the chosen sources.
+    const view =
+      change.retain === undefined || change.release?.length
+        ? await readSelectedHistorySources(this.history, cut)
+        : { entries: [], contextWindow: await this.history.selectedContext(cut) };
     const groups = contextSourceGroups(view.entries);
     const released = new Set(change.release?.map((source) => source.entryId));
     for (const source of change.release ?? []) {

@@ -15,13 +15,13 @@ export interface ContextOperations {
   inspectContext(): Promise<ContextInspection>;
   contextSources(request: HistorySearchRequest): Promise<HistorySearchResult>;
   renewContext(selection?: ContextSelection): Promise<unknown>;
-  freshContext(): Promise<unknown>;
+  freshContext(retained?: readonly HistorySourceRef[]): Promise<unknown>;
 }
 export interface ContextState {
   readonly requestId?: string | undefined;
   readonly inspection?: ContextInspection;
   readonly history?: HistorySearchResult;
-  readonly selection: ContextSelection;
+  readonly selection?: ContextSelection | undefined;
   readonly offset: number;
   readonly notice?: string;
 }
@@ -40,7 +40,7 @@ export type ContextMessage =
   | { readonly type: 'context.failed'; readonly requestId: string; readonly message: string };
 
 export function createContextState(): ContextState {
-  return { selection: { strategy: 'sources', retained: [] }, offset: 0 };
+  return { offset: 0 };
 }
 const sameSource = (a: HistorySourceRef, b: HistorySourceRef) =>
   a.sessionId === b.sessionId && a.entryId === b.entryId && a.sha256 === b.sha256;
@@ -54,16 +54,19 @@ export function updateContext(
     case 'context.source': {
       if (
         state.history?.items.some(
-          (item) => item.generated && sameSource(item.source, message.source)
+          (item) =>
+            (item.generated === true || item.role === 'control') &&
+            sameSource(item.source, message.source)
         )
       )
         return { state };
       if (state.inspection?.protectedSources.some((source) => sameSource(source, message.source)))
         return { state };
-      const retained = state.selection.retained.some((source) => sameSource(source, message.source))
-        ? state.selection.retained.filter((source) => !sameSource(source, message.source))
-        : [...state.selection.retained, message.source];
-      return { state: { ...state, selection: { ...state.selection, retained } } };
+      const previous = state.selection?.retained ?? state.inspection?.protectedSources ?? [];
+      const retained = previous.some((source) => sameSource(source, message.source))
+        ? previous.filter((source) => !sameSource(source, message.source))
+        : [...previous, message.source];
+      return { state: { ...state, selection: { strategy: 'sources', retained } } };
     }
     case 'context.scroll':
       return { state: { ...state, offset: message.offset } };
@@ -73,23 +76,33 @@ export function updateContext(
         : { state: { ...state, requestId: undefined, notice: message.message } };
     case 'context.loaded': {
       if (message.requestId !== state.requestId) return { state };
+      const active = message.inspection.activeSelection;
       const selection = message.reset
-        ? {
-            strategy: 'sources' as const,
-            retained:
-              message.inspection.window?.selection.retained ?? message.inspection.protectedSources
-          }
+        ? active.status === 'available'
+          ? active.selection
+          : undefined
         : state.selection;
       return {
         state: {
           inspection: message.inspection,
           history: message.history,
           selection,
+          ...(active.status === 'unavailable'
+            ? {
+                notice:
+                  active.conflict.message + ' Choose a new selection or release optional history.'
+              }
+            : {}),
           offset: 0
         }
       };
     }
     default: {
+      if (
+        (message.type === 'context.apply' || message.type === 'context.fresh') &&
+        state.selection === undefined
+      )
+        return { state };
       const requestId = crypto.randomUUID();
       const reset = message.type !== 'context.page';
       return {
@@ -101,7 +114,8 @@ export function updateContext(
             async run({ signal }) {
               if (message.type === 'context.apply') await operations.renewContext(state.selection);
               if (message.type === 'context.renew') await operations.renewContext();
-              if (message.type === 'context.fresh') await operations.freshContext();
+              if (message.type === 'context.fresh')
+                await operations.freshContext(state.selection?.retained);
               signal.throwIfAborted();
               const inspection = reset
                 ? await operations.inspectContext()
@@ -142,7 +156,7 @@ export function contextView(
   const protectedSources = state.inspection?.protectedSources ?? [];
   const capacity = state.inspection?.capacity;
   const visible = state.history?.items ?? [];
-  const selectedOutsidePage = state.selection.retained.filter(
+  const selectedOutsidePage = (state.selection?.retained ?? []).filter(
     (source) => !visible.some((item) => sameSource(item.source, source))
   );
   const sourceChoice = (source: HistorySourceRef, label: string): Element<Message> => {
@@ -150,7 +164,9 @@ export function contextView(
     return checkbox<Message>({
       id: `context-source:${source.entryId}`,
       label: `${protectedInput ? 'Required · ' : ''}${label}`,
-      checked: protectedInput || state.selection.retained.some((item) => sameSource(item, source)),
+      checked:
+        protectedInput ||
+        (state.selection?.retained ?? []).some((item) => sameSource(item, source)),
       onTransition: () => ({ type: 'context.source', source })
     });
   };
@@ -178,13 +194,16 @@ export function contextView(
               ]
             : []),
           text({
-            content: `Draft selection: ${String(state.selection.retained.length)} sources. Required inputs are retained automatically.`
+            content:
+              state.selection === undefined
+                ? 'Select originals to build a replacement window.'
+                : `Draft selection: ${String(state.selection.retained.length)} sources. Required inputs are retained automatically.`
           }),
           ...selectedOutsidePage.map((source) => sourceChoice(source, source.entryId)),
           ...visible.map((item) =>
-            item.generated
+            item.generated === true || item.role === 'control'
               ? text({
-                  content: `Generated interpretation · ${item.text.replaceAll(/\s+/gu, ' ').slice(0, 140)}${item.truncated ? '…' : ''}`
+                  content: `${item.generated ? 'Generated interpretation' : 'Session configuration'} · ${item.text.replaceAll(/\s+/gu, ' ').slice(0, 140)}${item.truncated ? '…' : ''}`
                 })
               : sourceChoice(
                   item.source,
@@ -231,7 +250,9 @@ export function contextView(
           button<Message>({
             id: 'context-apply',
             label: 'Apply selection',
-            ...(state.requestId !== undefined || state.inspection === undefined
+            ...(state.requestId !== undefined ||
+            state.inspection === undefined ||
+            state.selection === undefined
               ? { disabled: true }
               : { onPress: (): Message => ({ type: 'context.apply' }) })
           }),
@@ -245,7 +266,10 @@ export function contextView(
           button<Message>({
             id: 'context-fresh',
             label: 'Fresh reasoning; keep selected originals',
-            ...(state.requestId !== undefined || state.inspection?.pendingWork.length
+            ...(state.requestId !== undefined ||
+            state.inspection === undefined ||
+            state.selection === undefined ||
+            state.inspection.pendingWork.length
               ? { disabled: true }
               : { onPress: (): Message => ({ type: 'context.fresh' }) })
           }),

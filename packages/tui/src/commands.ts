@@ -64,21 +64,34 @@ export function transitionCommandPicker(
   commands: readonly Command[]
 ): UnscrolledSearchPickerState {
   const currentResult = querySearchPickerIndex(index, {
-    text: state.editor.input.text, mode: state.mode, caseSensitive: state.caseSensitive
+    text: state.editor.input.text,
+    mode: state.mode,
+    caseSensitive: state.caseSensitive
   });
-  const next = searchPickerReducer(state, transition, { searchPickerIndex: index, queryResult: currentResult });
+  const next = searchPickerReducer(state, transition, {
+    searchPickerIndex: index,
+    queryResult: currentResult
+  });
   const query = searchPickerView(next).input.text;
-  if (query === searchPickerView(state).input.text && next.mode === state.mode
-    && next.caseSensitive === state.caseSensitive) return next;
+  if (
+    query === searchPickerView(state).input.text &&
+    next.mode === state.mode &&
+    next.caseSensitive === state.caseSensitive
+  )
+    return next;
   const name = query.startsWith('/') ? query : `/${query}`;
   const queryResult = querySearchPickerIndex(index, {
-    text: query, mode: next.mode, caseSensitive: next.caseSensitive
+    text: query,
+    mode: next.mode,
+    caseSensitive: next.caseSensitive
   });
-  return searchPickerReducer(next,
+  return searchPickerReducer(
+    next,
     commands.some((command) => command.name === name)
       ? { kind: 'setActive', id: name }
       : { kind: 'firstActive' },
-    { searchPickerIndex: index, queryResult });
+    { searchPickerIndex: index, queryResult }
+  );
 }
 
 export function moveCommand(completion: CommandCompletion, delta: number): CommandCompletion {
@@ -91,11 +104,12 @@ export function moveCommand(completion: CommandCompletion, delta: number): Comma
 export function commandSuggestions<Message extends { readonly type: string }>(
   completion: CommandCompletion,
   commands: readonly Command[],
-  choose: (name: string) => Message
+  choose: (name: string) => Message,
+  limit = 5
 ): Element<Message> {
-  const start = Math.max(0, completion.selected - 4);
+  const start = Math.max(0, completion.selected - limit + 1);
   return column([
-    ...completion.names.slice(start, start + 5).map((name, index) =>
+    ...completion.names.slice(start, start + limit).map((name, index) =>
       button({
         id: `completion:${name}`,
         label: `${start + index === completion.selected ? '› ' : '  '}${name}  ${commands.find((command) => command.name === name)?.description ?? ''}`,

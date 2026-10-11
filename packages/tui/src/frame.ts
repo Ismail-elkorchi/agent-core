@@ -10,6 +10,8 @@ export function conversationFrame<Message extends ComponentMessage>(options: {
   readonly slots: {
     readonly status: Element<Message>;
     readonly conversation: Element<Message>;
+    readonly activity?: Element<Message>;
+    readonly feedback?: Element<Message>;
     readonly composer: Element<Message>;
     readonly footer: readonly Element<Message>[];
   };
@@ -19,7 +21,8 @@ export function conversationFrame<Message extends ComponentMessage>(options: {
     [
       options.slots.status,
       options.slots.conversation,
-      divider({ id: `${options.id}:divider` }),
+      options.slots.activity ?? divider({ id: `${options.id}:divider` }),
+      ...(options.slots.feedback === undefined ? [] : [options.slots.feedback]),
       options.slots.composer,
       row(options.slots.footer, { sizes: options.slots.footer.map(() => ({ kind: 'content' })) })
     ],
@@ -29,6 +32,9 @@ export function conversationFrame<Message extends ComponentMessage>(options: {
         { kind: 'fixed', cells: 1 },
         { kind: 'fill' },
         { kind: 'fixed', cells: 1 },
+        ...(options.slots.feedback === undefined
+          ? []
+          : [{ kind: 'fixed' as const, cells: options.terminalRows < 16 ? 2 : 3 }]),
         { kind: 'fixed', cells: options.composerRows },
         { kind: 'fixed', cells: 1 }
       ],

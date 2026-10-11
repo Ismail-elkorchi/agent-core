@@ -18,6 +18,7 @@ for (const columns of [48, 120])
     const inspection = {
       cut,
       window: null,
+      activeSelection: { status: 'available', selection: { strategy: 'sources', retained: [source] } },
       workingState: { revisionId: 'revision', text: 'A model hypothesis', complete: true },
       protectedSources: [source],
       pendingWork: [],
@@ -69,3 +70,47 @@ for (const columns of [48, 120])
     assert.ok(!('notes' in selections[0]));
     assert.deepEqual(selections[0].retained, [source]);
   });
+
+test('context controls preserve the effective selection and forward the edited set to fresh context', async () => {
+  const source = (entryId) => ({ sessionId: 'session', entryId, sha256: 'a'.repeat(64) });
+  const first = source('first'), recent = source('recent'), config = source('config');
+  let state = { ...createContextState(), requestId: 'load' };
+  state = updateContext(state, {
+    type: 'context.loaded', requestId: 'load', reset: true,
+    inspection: {
+      activeSelection: { status: 'available', selection: { strategy: 'sources', retained: [first, recent] } },
+      window: { selection: { strategy: 'sources', retained: [first] } },
+      protectedSources: []
+    },
+    history: { items: [{ source: config, role: 'control', type: 'model_settings' }] }
+  }, {}).state;
+  assert.deepEqual(state.selection.retained, [first, recent], 'recent originals are not dropped by stale window metadata');
+  state = updateContext(state, { type: 'context.source', source: config }, {}).state;
+  assert.deepEqual(state.selection.retained, [first, recent], 'configuration records are not selectable messages');
+  state = updateContext(state, { type: 'context.source', source: first }, {}).state;
+  const calls = [];
+  const result = updateContext(state, { type: 'context.fresh' }, {
+    freshContext: async (retained) => calls.push(retained),
+    inspectContext: async () => ({ cut: {} }),
+    contextSources: async () => ({ items: [] })
+  });
+  await result.effects[0].run({ signal: new AbortController().signal });
+  assert.deepEqual(calls, [[recent]]);
+});
+
+test('an oversized active context stays inspectable without presenting an empty set as the active selection', () => {
+  const source = { sessionId: 'session', entryId: 'selected', sha256: 'a'.repeat(64) };
+  const loaded = updateContext({ ...createContextState(), requestId: 'load' }, {
+    type: 'context.loaded', requestId: 'load', reset: true,
+    inspection: {
+      activeSelection: { status: 'unavailable', conflict: { kind: 'source_capacity', message: 'Selected originals exceed the source bound.' } },
+      protectedSources: []
+    }, history: { items: [] }
+  }, {}).state;
+  assert.equal(loaded.selection, undefined);
+  assert.match(loaded.notice, /source bound/);
+  for (const type of ['context.apply', 'context.fresh'])
+    assert.equal(updateContext(loaded, { type }, {}).effects, undefined);
+  const selected = updateContext(loaded, { type: 'context.source', source }, {}).state;
+  assert.deepEqual(selected.selection, { strategy: 'sources', retained: [source] });
+});
