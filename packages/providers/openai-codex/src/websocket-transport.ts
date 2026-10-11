@@ -137,6 +137,7 @@ export function resolveCodexWebSocketUrl(httpUrl: string): string {
 }
 
 export async function waitForWebSocketOpen(socket: CodexWebSocket, signal: AbortSignal | undefined): Promise<void> {
+  throwIfAborted(signal);
   if (socket.readyState === 1) {
     return;
   }
@@ -181,65 +182,99 @@ export async function waitForWebSocketOpen(socket: CodexWebSocket, signal: Abort
   });
 }
 
-export function sendWebSocketJson(socket: CodexWebSocket, value: unknown, signal: AbortSignal | undefined): Promise<void> {
+/** Own the listeners before transmission and release them even when sending fails. */
+export async function* streamCodexWebSocketRequest(
+  socket: CodexWebSocket,
+  request: unknown,
+  signal: AbortSignal | undefined
+): AsyncIterable<OpenAICodexStreamData> {
   throwIfAborted(signal);
-  if (socket.readyState !== 1) {
-    throw new CodexWebSocketTransportError('OpenAI Codex WebSocket is not open.', {
-      phase: 'send',
-      kind: 'not_open',
-      detail: `readyState=${String(socket.readyState)}`
-    });
-  }
-  socket.send(JSON.stringify(value));
-  return Promise.resolve();
-}
-
-export function readCodexWebSocketEvents(socket: CodexWebSocket, signal: AbortSignal | undefined): AsyncIterable<OpenAICodexStreamData> {
   const queue: (OpenAICodexStreamData | Error)[] = [];
   let decoding = Promise.resolve();
+  let pendingFrames = 0;
   let overflowed = false;
+  let active = true;
+  let terminal = false;
   let wake: (() => void) | undefined;
-  const push = (item: OpenAICodexStreamData | Error) => {
-    if (queue.length >= MAX_QUEUED_EVENTS && !overflowed) {
-      overflowed = true;
-      queue.length = 0;
-      queue.push(malformedStreamEvent(OPENAI_CODEX_PROVIDER_ID, `OpenAI Codex WebSocket exceeded the ${String(MAX_QUEUED_EVENTS)} event queue limit.`, undefined));
-      socket.close();
-      wake?.();
-      wake = undefined;
-      return;
-    }
-    if (overflowed) return;
-    queue.push(item);
+  const notify = () => {
     wake?.();
     wake = undefined;
   };
+  const overflow = () => {
+    overflowed = true;
+    queue.length = 0;
+    queue.push(
+      malformedStreamEvent(
+        OPENAI_CODEX_PROVIDER_ID,
+        `OpenAI Codex WebSocket exceeded the ${String(MAX_QUEUED_EVENTS)} event queue limit.`,
+        undefined
+      )
+    );
+    socket.close();
+    notify();
+  };
+  const push = (item: OpenAICodexStreamData | Error) => {
+    if (!active || overflowed) return;
+    if (queue.length >= MAX_QUEUED_EVENTS) {
+      overflow();
+      return;
+    }
+    queue.push(item);
+    notify();
+  };
   const onMessage = (event: { data: unknown }) => {
-    decoding = decoding.then(() => textFromWebSocketData(event.data))
-      .then((text) => {
-        if (new TextEncoder().encode(text).byteLength > MAX_INBOUND_FRAME_BYTES) throw malformedStreamEvent(OPENAI_CODEX_PROVIDER_ID, `OpenAI Codex WebSocket frame exceeded the ${String(MAX_INBOUND_FRAME_BYTES)} byte limit.`, undefined);
+    if (!active || overflowed) return;
+    // Include frames awaiting asynchronous decoding in the receive bound.
+    if (pendingFrames + queue.length >= MAX_QUEUED_EVENTS) {
+      overflow();
+      return;
+    }
+    pendingFrames++;
+    decoding = decoding.then(async () => {
+      try {
+        if (!active || overflowed) return;
+        const text = await textFromWebSocketData(event.data);
+        if (new TextEncoder().encode(text).byteLength > MAX_INBOUND_FRAME_BYTES)
+          throw malformedStreamEvent(
+            OPENAI_CODEX_PROVIDER_ID,
+            `OpenAI Codex WebSocket frame exceeded the ${String(MAX_INBOUND_FRAME_BYTES)} byte limit.`,
+            undefined
+          );
         parseCodexWebSocketText(text).forEach(push);
-      })
-      .catch((error: unknown) => {
+      } catch (error) {
         push(error instanceof Error ? error : new Error(String(error)));
-      });
+      } finally {
+        pendingFrames--;
+      }
+    });
+  };
+  // A transport event cannot overtake frames that arrived before it, including
+  // a terminal response whose Blob data has not finished decoding yet.
+  const transportFailure = (error: Error) => {
+    decoding = decoding.then(() => {
+      push(error);
+    });
   };
   const onError = (event: unknown) => {
     const detail = webSocketEventMessage(event);
-    push(new CodexWebSocketTransportError(`WebSocket error: ${detail}`, {
-      phase: 'stream',
-      kind: 'error',
-      detail,
-      cause: event
-    }));
+    transportFailure(
+      new CodexWebSocketTransportError(`WebSocket error: ${detail}`, {
+        phase: 'stream',
+        kind: 'error',
+        detail,
+        cause: event
+      })
+    );
   };
   const onClose = (event: { code?: number; reason?: string }) => {
-    push(new CodexWebSocketTransportError(`WebSocket closed: ${webSocketCloseMessage(event)}`, {
-      phase: 'stream',
-      kind: 'close',
-      ...(event.code !== undefined ? { closeCode: event.code } : {}),
-      ...(event.reason ? { closeReason: event.reason } : {})
-    }));
+    transportFailure(
+      new CodexWebSocketTransportError(`WebSocket closed: ${webSocketCloseMessage(event)}`, {
+        phase: 'stream',
+        kind: 'close',
+        ...(event.code !== undefined ? { closeCode: event.code } : {}),
+        ...(event.reason ? { closeReason: event.reason } : {})
+      })
+    );
   };
   const onAbort = () => {
     push(abortError());
@@ -248,36 +283,42 @@ export function readCodexWebSocketEvents(socket: CodexWebSocket, signal: AbortSi
   socket.addEventListener('error', onError);
   socket.addEventListener('close', onClose);
   signal?.addEventListener('abort', onAbort, { once: true });
-
-  return {
-    async *[Symbol.asyncIterator]() {
-      try {
-        for (;;) {
-          while (queue.length === 0) {
-            await new Promise<void>((resolve) => {
-              wake = resolve;
-            });
-          }
-          const item = queue.shift();
-          if (!item) {
-            continue;
-          }
-          if (item instanceof Error) {
-            throw item;
-          }
-          yield item;
-          if (item.type === 'response.completed' || item.type === 'response.incomplete' || item.type === 'response.failed' || item.type === 'error') {
-            return;
-          }
-        }
-      } finally {
-        socket.removeEventListener('message', onMessage);
-        socket.removeEventListener('error', onError);
-        socket.removeEventListener('close', onClose);
-        signal?.removeEventListener('abort', onAbort);
-      }
+  try {
+    throwIfAborted(signal);
+    if (socket.readyState !== 1) {
+      throw new CodexWebSocketTransportError('OpenAI Codex WebSocket is not open.', {
+        phase: 'send',
+        kind: 'not_open',
+        detail: `readyState=${String(socket.readyState)}`
+      });
     }
-  };
+    socket.send(JSON.stringify(request));
+    for (;;) {
+      while (queue.length === 0) {
+        await new Promise<void>((resolve) => {
+          wake = resolve;
+        });
+      }
+      const item = queue.shift();
+      if (!item) continue;
+      if (item instanceof Error) throw item;
+      terminal =
+        item.type === 'response.completed' ||
+        item.type === 'response.incomplete' ||
+        item.type === 'response.failed' ||
+        item.type === 'error';
+      yield item;
+      if (terminal) return;
+    }
+  } finally {
+    active = false;
+    queue.length = 0;
+    socket.removeEventListener('message', onMessage);
+    socket.removeEventListener('error', onError);
+    socket.removeEventListener('close', onClose);
+    signal?.removeEventListener('abort', onAbort);
+    if (!terminal) socket.close();
+  }
 }
 
 function parseCodexWebSocketText(text: string): OpenAICodexStreamData[] {

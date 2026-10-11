@@ -1467,6 +1467,235 @@ function bearerProvider(token) {
   };
 }
 
+for (const terminal of ['completed', 'incomplete'])
+  test(`Codex WebSocket preserves a ${terminal} response received before socket closure`, async () => {
+    let fallbacks = 0;
+    const socket = new FakeCodexWebSocket();
+    socket.send = () => {
+      socket.emit('message', {
+        data: new Blob([
+          JSON.stringify({
+            type: `response.${terminal}`,
+            response: {
+              id: 'received-before-close',
+              model: 'gpt-5.6',
+              status: terminal,
+              output_text: 'Original answer.',
+              usage: { input_tokens: 17, output_tokens: 5, total_tokens: 22 },
+              ...(terminal === 'incomplete'
+                ? { incomplete_details: { reason: 'max_output_tokens' } }
+                : {})
+            }
+          })
+        ])
+      });
+      socket.close();
+    };
+    const provider = new OpenAICodexProvider({
+      auth: bearerProvider(codexJwt()),
+      transport: 'websocket',
+      webSocketFactory: () => socket,
+      fetch: async () => {
+        fallbacks++;
+        return completionResponse({
+          id: 'unnecessary-retry',
+          model: 'gpt-5.6',
+          status: 'completed',
+          output_text: 'New answer.'
+        });
+      }
+    });
+    const session = provider.createSession();
+    try {
+      const response = await session.complete({
+        model: 'gpt-5.6',
+        messages: [{ role: 'user', content: 'hello' }]
+      });
+      assert.equal(fallbacks, 0);
+      assert.equal(response.raw.id, 'received-before-close');
+      assert.equal(response.content, 'Original answer.');
+      assert.equal(response.usage.totalTokens, 22);
+    } finally {
+      await session.close();
+    }
+  });
+
+test('Codex WebSocket delivers received partial output before reporting a disconnect without replay', async () => {
+  let fallbacks = 0;
+  const socket = new FakeCodexWebSocket();
+  socket.send = () => {
+    socket.emitJson({ type: 'response.output_text.delta', delta: 'Original partial answer.' });
+    socket.close();
+  };
+  const provider = new OpenAICodexProvider({
+    auth: bearerProvider(codexJwt()),
+    transport: 'websocket',
+    webSocketFactory: () => socket,
+    fetch: async () => {
+      fallbacks++;
+      return completionResponse({
+        id: 'unnecessary-retry',
+        model: 'gpt-5.6',
+        status: 'completed',
+        output_text: 'New answer.'
+      });
+    }
+  });
+  const session = provider.createSession();
+  const events = [];
+  try {
+    await assert.rejects(async () => {
+      for await (const event of session.stream({
+        model: 'gpt-5.6',
+        messages: [{ role: 'user', content: 'hello' }]
+      }))
+        events.push(event);
+    }, /WebSocket closed/);
+    assert.equal(fallbacks, 0);
+    assert.deepEqual(
+      events.map((event) => event.type),
+      ['content']
+    );
+    assert.equal(events[0].content, 'Original partial answer.');
+  } finally {
+    await session.close();
+  }
+});
+
+test('Codex WebSocket releases its receive listeners when sending fails', async () => {
+  const socket = new FakeCodexWebSocket();
+  socket.send = () => {
+    throw new Error('Send failed.');
+  };
+  const provider = new OpenAICodexProvider({
+    auth: bearerProvider(codexJwt()),
+    transport: 'websocket',
+    webSocketFactory: () => socket,
+    fetch: async () =>
+      completionResponse({
+        id: 'fallback',
+        model: 'gpt-5.6',
+        status: 'completed',
+        output_text: 'done'
+      })
+  });
+  const session = provider.createSession();
+  try {
+    await session.complete({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hello' }] });
+    for (const type of ['message', 'error', 'close'])
+      assert.equal(
+        socket.listeners.get(type)?.size ?? 0,
+        0,
+        `${type} listener survived a failed send`
+      );
+  } finally {
+    await session.close();
+  }
+});
+
+test(
+  'Codex WebSocket bounds frames waiting for decoding, not only decoded events',
+  { timeout: 5000 },
+  async () => {
+    const decoding = Promise.withResolvers();
+    const socket = new FakeCodexWebSocket();
+    socket.send = () => {
+      for (let index = 0; index < 1025; index++)
+        socket.emit('message', { data: { text: () => decoding.promise } });
+    };
+    const provider = new OpenAICodexProvider({
+      auth: bearerProvider(codexJwt()),
+      transport: 'websocket',
+      webSocketFactory: () => socket,
+      fetch: async () =>
+        completionResponse({
+          id: 'fallback',
+          model: 'gpt-5.6',
+          status: 'completed',
+          output_text: 'done'
+        })
+    });
+    const session = provider.createSession();
+    const events = [];
+    try {
+      for await (const event of session.stream({
+        model: 'gpt-5.6',
+        messages: [{ role: 'user', content: 'hello' }],
+        signal: AbortSignal.timeout(2000)
+      }))
+        events.push(event);
+      assert.match(events.find((event) => event.type === 'status').message, /event queue limit/);
+      assert.equal(socket.readyState, 3);
+      assert.equal(events.at(-1).response.content, 'done');
+    } finally {
+      decoding.resolve('{}');
+      await session.close();
+    }
+  }
+);
+
+test(
+  'Codex WebSocket cancellation during connection setup closes the unadopted socket',
+  { timeout: 5000 },
+  async () => {
+    const controller = new AbortController();
+    const socket = new FakeCodexWebSocket();
+    // Finish the fake's opening task before returning it in a connecting state.
+    await Promise.resolve();
+    socket.readyState = 0;
+    const provider = new OpenAICodexProvider({
+      auth: bearerProvider(codexJwt()),
+      transport: 'websocket',
+      webSocketFactory: () => {
+        controller.abort();
+        return socket;
+      },
+      fetch: async () => {
+        throw new Error('Cancelled requests must not use HTTP fallback.');
+      }
+    });
+    const session = provider.createSession();
+    try {
+      await assert.rejects(
+        session.complete({
+          model: 'gpt-5.6',
+          messages: [{ role: 'user', content: 'hello' }],
+          signal: controller.signal
+        }),
+        (error) => error.code === 'aborted'
+      );
+      assert.equal(socket.readyState, 3);
+    } finally {
+      await session.close();
+    }
+  }
+);
+
+test('Codex WebSocket closes an unfinished response when its consumer stops reading', async () => {
+  const socket = new FakeCodexWebSocket();
+  socket.send = () =>
+    socket.emitJson({ type: 'response.output_text.delta', delta: 'Partial answer.' });
+  const provider = new OpenAICodexProvider({
+    auth: bearerProvider(codexJwt()),
+    transport: 'websocket',
+    webSocketFactory: () => socket
+  });
+  const session = provider.createSession();
+  try {
+    for await (const event of session.stream({
+      model: 'gpt-5.6',
+      messages: [{ role: 'user', content: 'hello' }]
+    })) {
+      assert.equal(event.type, 'content');
+      break;
+    }
+    assert.equal(socket.readyState, 3, 'unfinished response must not leak into the next request');
+    assert.equal(socket.listeners.get('message').size, 0);
+  } finally {
+    await session.close();
+  }
+});
+
 function listening(server) {
   return new Promise((resolve, reject) => {
     server.once('listening', resolve);

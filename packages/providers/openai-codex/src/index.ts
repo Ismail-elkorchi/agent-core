@@ -91,10 +91,9 @@ import {
   type CodexWebSocketOptions,
   CodexWebSocketTransportError,
   defaultCodexWebSocketFactory,
-  readCodexWebSocketEvents,
+  streamCodexWebSocketRequest,
   resolveCodexUrl,
   resolveCodexWebSocketUrl,
-  sendWebSocketJson,
   waitForWebSocketOpen,
   websocketHeaders
 } from './websocket-transport.js';
@@ -643,8 +642,7 @@ class OpenAICodexProviderSession implements ModelProviderSession {
       type: 'response.create',
       ...assembly.request
     };
-    const streamEvents = readCodexWebSocketEvents(socket, signal);
-    await sendWebSocketJson(socket, wireRequest, signal);
+    const streamEvents = streamCodexWebSocketRequest(socket, wireRequest, signal);
 
     let content = '';
     let reasoning = '';
@@ -798,7 +796,12 @@ class OpenAICodexProviderSession implements ModelProviderSession {
       headers,
       ...(signal ? { signal } : {})
     });
-    await waitForWebSocketOpen(socket, signal);
+    try {
+      await waitForWebSocketOpen(socket, signal);
+    } catch (error) {
+      socket.close();
+      throw error;
+    }
     this.webSocket = socket;
     this.webSocketAffinityKey = affinityKey;
     return socket;
