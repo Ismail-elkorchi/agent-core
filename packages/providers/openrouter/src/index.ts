@@ -238,9 +238,10 @@ export class OpenRouterProvider implements ModelProvider {
   }
 
   async complete(request: ModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
+    let signal = options?.signal;
     try {
       request = await this.validateRequest(request);
-      const signal = modelTransportSignal(request, options);
+      signal = modelTransportSignal(request, options);
       signal?.throwIfAborted();
       const response = await this.fetchChatCompletion(request, false, options);
       const payload = await decodeJsonResponse(
@@ -251,14 +252,15 @@ export class OpenRouterProvider implements ModelProvider {
       );
       return await toModelResponse(this.id, request, payload, `${this.baseUrl}/chat/completions`);
     } catch (error) {
-      throw normalizeError(this.id, error);
+      throw normalizeError(this.id, error, signal);
     }
   }
 
   async *stream(request: ModelRequest, options?: ModelTransportOptions): AsyncIterable<ModelStreamEvent> {
+    let signal = options?.signal;
     try {
       request = await this.validateRequest(request);
-      const signal = modelTransportSignal(request, options);
+      signal = modelTransportSignal(request, options);
       signal?.throwIfAborted();
       const responsePromise = this.fetchChatCompletion(request, true, options);
       const startedAt = Date.now();
@@ -416,7 +418,7 @@ export class OpenRouterProvider implements ModelProvider {
         })
       };
     } catch (error) {
-      throw normalizeError(this.id, error);
+      throw normalizeError(this.id, error, signal);
     }
   }
 
@@ -484,7 +486,7 @@ export class OpenRouterProvider implements ModelProvider {
       }
       return payload.data;
     } catch (error) {
-      throw normalizeError(this.id, error);
+      throw normalizeError(this.id, error, signal);
     }
   }
 
@@ -509,7 +511,7 @@ export class OpenRouterProvider implements ModelProvider {
       await throwIfBadResponse(this.id, response);
       return response;
     } catch (error) {
-      throw normalizeError(this.id, error);
+      throw normalizeError(this.id, error, signal);
     }
   }
 
@@ -1261,7 +1263,7 @@ function retryAfterMilliseconds(value: string | null): number | undefined {
   return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : undefined;
 }
 
-function normalizeError(provider: string, error: unknown): ModelProviderError {
+function normalizeError(provider: string, error: unknown, signal?: AbortSignal): ModelProviderError {
   if (error instanceof ModelProviderError) {
     return error;
   }
@@ -1275,7 +1277,7 @@ function normalizeError(provider: string, error: unknown): ModelProviderError {
     });
   }
   const message = error instanceof Error ? error.message : String(error);
-  if (isAbortError(error) || /abort/i.test(message)) {
+  if (signal?.aborted || isAbortError(error)) {
     return new ModelProviderError({
       provider,
       code: 'aborted',

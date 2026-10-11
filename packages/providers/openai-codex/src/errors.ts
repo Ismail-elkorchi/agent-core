@@ -16,7 +16,7 @@ import type {
 } from './events.js';
 import { errorMessage, isAbortError, isJsonObject } from './utils.js';
 
-export function normalizeError(provider: string, error: unknown): ModelProviderError {
+export function normalizeError(provider: string, error: unknown, signal?: AbortSignal): ModelProviderError {
   if (error instanceof ModelProviderError) {
     return error;
   }
@@ -33,7 +33,7 @@ export function normalizeError(provider: string, error: unknown): ModelProviderE
     });
   }
   const message = errorMessage(error);
-  if (isAbortError(error) || /abort/i.test(message)) {
+  if (signal?.aborted || isAbortError(error)) {
     return new ModelProviderError({ provider, code: 'aborted', message: `OpenAI Codex request aborted: ${message}`, cause: error });
   }
   return new ModelProviderError({

@@ -87,13 +87,13 @@ export interface ResponsesStreamData extends ResponsesPayload {
   readonly input?: string;
 }
 
-/** Races response headers against a status tick without leaking the losing timer. */
+/** Wait for a response or cancellation, with an optional status tick. */
 export function waitForResponseOrStatus<T>(
   response: Promise<T>,
-  intervalMs: number,
+  intervalMs: number | undefined,
   signal?: AbortSignal
 ): Promise<ResponseHeaderWait<T>> {
-  const interval = positiveLimit(intervalMs, 'intervalMs');
+  const interval = intervalMs === undefined ? undefined : positiveLimit(intervalMs, 'intervalMs');
   return new Promise((resolve, reject) => {
     let settled = false;
     const finish = (result: ResponseHeaderWait<T>) => {
@@ -113,9 +113,12 @@ export function waitForResponseOrStatus<T>(
     const onAbort = () => {
       fail(abortError(signal?.reason));
     };
-    const timer = setTimeout(() => {
-      finish({ type: 'status' });
-    }, interval);
+    const timer =
+      interval === undefined
+        ? undefined
+        : setTimeout(() => {
+            finish({ type: 'status' });
+          }, interval);
     response.then((value) => {
       finish({ type: 'response', response: value });
     }, fail);
@@ -143,17 +146,16 @@ export async function* readJsonSseEvents<T>(
   let idleStartedAt = Date.now();
   try {
     for (;;) {
-      const result =
+      const result = await waitForResponseOrStatus(
+        pendingRead,
         statusInterval === undefined && idleTimeout === undefined
-          ? { type: 'response' as const, response: await pendingRead }
-          : await waitForResponseOrStatus(
-              pendingRead,
-              Math.min(
-                statusInterval ?? idleTimeout ?? 1,
-                Math.max(1, (idleTimeout ?? Number.MAX_SAFE_INTEGER) - (Date.now() - idleStartedAt))
-              ),
-              options.signal
-            );
+          ? undefined
+          : Math.min(
+              statusInterval ?? idleTimeout ?? 1,
+              Math.max(1, (idleTimeout ?? Number.MAX_SAFE_INTEGER) - (Date.now() - idleStartedAt))
+            ),
+        options.signal
+      );
       if (result.type === 'status') {
         const idleMs = Date.now() - idleStartedAt;
         if (idleTimeout !== undefined && idleMs >= idleTimeout) {
@@ -536,8 +538,8 @@ function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 function abortError(reason: unknown): Error {
-  const error =
-    reason instanceof Error ? reason : new Error(typeof reason === 'string' ? reason : 'Request aborted.');
+  if (reason instanceof Error) return reason;
+  const error = new Error(typeof reason === 'string' ? reason : 'Request aborted.');
   error.name = 'AbortError';
   return error;
 }

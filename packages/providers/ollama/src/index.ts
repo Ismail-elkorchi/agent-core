@@ -319,23 +319,19 @@ export class OllamaProvider implements ModelProvider {
 
   async complete(request: ModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
     let finalResponse: ModelResponse | undefined;
-    try {
-      for await (const event of this.stream(request, options)) {
-        if (event.type === 'done') {
-          finalResponse = event.response;
-        }
+    for await (const event of this.stream(request, options)) {
+      if (event.type === 'done') {
+        finalResponse = event.response;
       }
-      if (!finalResponse) {
-        throw new ModelProviderError({
-          provider: this.id,
-          code: 'malformed_response',
-          message: 'Ollama stream ended without a final response.'
-        });
-      }
-      return finalResponse;
-    } catch (error) {
-      throw this.normalizeError(error);
     }
+    if (!finalResponse) {
+      throw new ModelProviderError({
+        provider: this.id,
+        code: 'malformed_response',
+        message: 'Ollama stream ended without a final response.'
+      });
+    }
+    return finalResponse;
   }
 
   async *stream(request: ModelRequest, options?: ModelTransportOptions): AsyncIterable<ModelStreamEvent> {
@@ -344,7 +340,7 @@ export class OllamaProvider implements ModelProvider {
       compiled = await this.compileRequest(request);
       request = compiled.logicalRequest;
     } catch (error) {
-      throw this.normalizeError(error);
+      throw this.normalizeError(error, options?.signal);
     }
     const signal = modelTransportSignal(request, options);
     throwIfAborted(signal);
@@ -420,7 +416,7 @@ export class OllamaProvider implements ModelProvider {
         message: 'Ollama stream ended before a done response.'
       });
     } catch (error) {
-      throw this.normalizeError(error);
+      throw this.normalizeError(error, signal);
     } finally {
       cleanupAbort();
     }
@@ -583,7 +579,7 @@ export class OllamaProvider implements ModelProvider {
     };
   }
 
-  private normalizeError(error: unknown): ModelProviderError {
+  private normalizeError(error: unknown, signal?: AbortSignal): ModelProviderError {
     if (error instanceof ModelProviderError) {
       return error;
     }
@@ -597,7 +593,7 @@ export class OllamaProvider implements ModelProvider {
       });
     }
     const message = error instanceof Error ? error.message : String(error);
-    if (isAbortError(error) || /abort/i.test(message)) {
+    if (signal?.aborted || isAbortError(error)) {
       return new ModelProviderError({
         provider: this.id,
         code: 'aborted',

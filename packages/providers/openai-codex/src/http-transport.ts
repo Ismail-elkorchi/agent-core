@@ -72,7 +72,7 @@ async function fetchCodexResponse(
     await throwIfBadResponse(config, response);
     return response;
   } catch (error) {
-    throw normalizeError(config.providerId, error);
+    throw normalizeError(config.providerId, error, signal);
   }
 }
 
@@ -238,7 +238,7 @@ export async function* streamCodexHttp(
     });
     yield { type: 'done', response: recoveredResponse };
   } catch (error) {
-    throw normalizeError(config.providerId, error);
+    throw normalizeError(config.providerId, error, signal);
   }
 }
 

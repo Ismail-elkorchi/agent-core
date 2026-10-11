@@ -624,10 +624,13 @@ export class OpenAIProvider implements ModelProvider {
         code: 'invalid_request',
         message: 'Session has no compiled completion transport.'
       });
+    let signal = options?.signal;
     try {
-      return await session.completeCompiled(await this.compileRequest(request), options);
+      const compiled = await this.compileRequest(request);
+      signal = modelTransportSignal(compiled.logicalRequest, options);
+      return await session.completeCompiled(compiled, options);
     } catch (error) {
-      throw normalizeError(this.id, error);
+      throw normalizeError(this.id, error, signal);
     }
   }
 
@@ -643,10 +646,13 @@ export class OpenAIProvider implements ModelProvider {
         message: 'OpenAI provider session does not support streaming.'
       });
     }
+    let signal = options?.signal;
     try {
-      yield* session.streamCompiled(await this.compileRequest(request), options);
+      const compiled = await this.compileRequest(request);
+      signal = modelTransportSignal(compiled.logicalRequest, options);
+      yield* session.streamCompiled(compiled, options);
     } catch (error) {
-      throw normalizeError(this.id, error);
+      throw normalizeError(this.id, error, signal);
     }
   }
 
@@ -654,9 +660,10 @@ export class OpenAIProvider implements ModelProvider {
     request: ModelRequest,
     options?: ModelTransportOptions
   ): AsyncIterable<ModelStreamEvent> {
+    let signal = options?.signal;
     try {
       request = await this.validateRequest(request);
-      const signal = modelTransportSignal(request, options);
+      signal = modelTransportSignal(request, options);
       signal?.throwIfAborted();
       const responsePromise = this.fetchResponse(request, true, options);
       const startedAt = Date.now();
@@ -828,7 +835,7 @@ export class OpenAIProvider implements ModelProvider {
       });
       yield { type: 'done', response: recoveredResponse };
     } catch (error) {
-      throw normalizeError(this.id, error);
+      throw normalizeError(this.id, error, signal);
     }
   }
 
@@ -856,7 +863,7 @@ export class OpenAIProvider implements ModelProvider {
       await this.throwIfBadResponse(response);
       return response;
     } catch (error) {
-      throw normalizeError(this.id, error);
+      throw normalizeError(this.id, error, signal);
     }
   }
 
@@ -1048,8 +1055,10 @@ class OpenAIProviderSession implements ModelProviderSession {
   }
 
   async complete(request: ModelRequest, options?: ModelTransportOptions): Promise<ModelResponse> {
+    let signal = options?.signal;
     try {
       request = await this.provider.validateRequest(request);
+      signal = modelTransportSignal(request, options);
       const response = await this.provider.fetchResponse(request, false, options);
       const payload = await parseJsonResponse(this.provider.id, response);
       return await toModelResponse(
@@ -1060,7 +1069,7 @@ class OpenAIProviderSession implements ModelProviderSession {
         requiredProtocolRevision(await this.provider.describeModel(request.model))
       );
     } catch (error) {
-      throw normalizeError(this.provider.id, error);
+      throw normalizeError(this.provider.id, error, signal);
     }
   }
 
@@ -1068,11 +1077,7 @@ class OpenAIProviderSession implements ModelProviderSession {
     request: ModelRequest,
     options?: ModelTransportOptions
   ): AsyncIterable<ModelStreamEvent> {
-    try {
-      yield* this.provider.streamResponse(request, options);
-    } catch (error) {
-      throw normalizeError(this.provider.id, error);
-    }
+    yield* this.provider.streamResponse(request, options);
   }
 }
 
@@ -1685,7 +1690,7 @@ async function parseJsonResponse(
   }
 }
 
-function normalizeError(provider: string, error: unknown): ModelProviderError {
+function normalizeError(provider: string, error: unknown, signal?: AbortSignal): ModelProviderError {
   if (error instanceof ModelProviderError) {
     return error;
   }
@@ -1708,7 +1713,7 @@ function normalizeError(provider: string, error: unknown): ModelProviderError {
     });
   }
   const message = errorMessage(error);
-  if (isAbortError(error) || /abort/i.test(message)) {
+  if (signal?.aborted || isAbortError(error)) {
     return new ModelProviderError({
       provider,
       code: 'aborted',

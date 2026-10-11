@@ -7,7 +7,7 @@ import { OpenRouterProvider } from '@agent-core/provider-openrouter';
 import { ClaudeProvider } from '@agent-core/provider-claude';
 import { OllamaProvider } from '@agent-core/provider-ollama';
 
-function fixture(name, status, error, stream = false) {
+function fixture(name, { status, error, stream = false, fail }) {
   const model =
     name === 'claude' ? 'claude-sonnet-4-6' : name === 'openrouter' ? 'fixture/model' : 'gpt-5.6';
   const fetch = async (url) => {
@@ -23,6 +23,7 @@ function fixture(name, status, error, stream = false) {
           }
         ]
       });
+    fail?.();
     return stream
       ? new Response(`data: ${JSON.stringify({ error })}\n\n`, {
           headers: { 'content-type': 'text/event-stream' }
@@ -52,6 +53,7 @@ function fixture(name, status, error, stream = false) {
             model_info: { 'fixture.context_length': 32768 }
           }),
           chat: async () => {
+            fail?.();
             throw Object.assign(new Error(error.message), { status_code: status });
           }
         })
@@ -78,7 +80,7 @@ for (const name of ['openai', 'openai-codex', 'openrouter', 'claude', 'ollama'])
     [400, 'Invalid max_tokens parameter', 'invalid_request', false]
   ])
     test(`${name}: HTTP ${status} is classified from protocol evidence`, async () => {
-      const { provider, request } = fixture(name, status, { message });
+      const { provider, request } = fixture(name, { status, error: { message } });
       await assert.rejects(provider.complete(request), (error) => {
         assert(error instanceof ModelProviderError);
         assert.equal(error.code, code);
@@ -90,11 +92,14 @@ for (const name of ['openai', 'openai-codex', 'openrouter', 'claude', 'ollama'])
 
 for (const name of ['openai', 'openai-codex', 'openrouter'])
   test(`${name}: explicit context overflow is independent of message wording`, async () => {
-    const { provider, request } = fixture(name, 400, {
-      message: 'Request rejected',
-      ...(name === 'openrouter'
-        ? { metadata: { error_type: 'context_length_exceeded' } }
-        : { code: 'context_length_exceeded' })
+    const { provider, request } = fixture(name, {
+      status: 400,
+      error: {
+        message: 'Request rejected',
+        ...(name === 'openrouter'
+          ? { metadata: { error_type: 'context_length_exceeded' } }
+          : { code: 'context_length_exceeded' })
+      }
     });
     await assert.rejects(
       provider.complete(request),
@@ -107,12 +112,11 @@ for (const [status, message, metadata, code, retryable] of [
   [400, 'Request rejected', { error_type: 'context_length_exceeded' }, 'context_overflow', false]
 ])
   test(`OpenRouter stream error preserves ${code}`, async () => {
-    const { provider, request } = fixture(
-      'openrouter',
+    const { provider, request } = fixture('openrouter', {
       status,
-      { code: status, message, metadata },
-      true
-    );
+      error: { code: status, message, metadata },
+      stream: true
+    });
     await assert.rejects(
       async () => {
         for await (const event of provider.stream(request)) void event;
@@ -129,12 +133,61 @@ for (const diagnostic of [
   { code: 'organization_usage_limit_exceeded' }
 ])
   test(`OpenAI HTTP 429 does not retry ${diagnostic.code ?? diagnostic.type}`, async () => {
-    const { provider, request } = fixture('openai', 429, {
-      message: 'Account limit reached',
-      ...diagnostic
+    const { provider, request } = fixture('openai', {
+      status: 429,
+      error: {
+        message: 'Account limit reached',
+        ...diagnostic
+      }
     });
     await assert.rejects(
       provider.complete(request),
       (error) => error.code === 'invalid_request' && !error.retryable
     );
   });
+
+for (const name of ['openai', 'openai-codex', 'openrouter', 'ollama'])
+  test(`${name}: malformed request rejection does not read transport fields from the invalid value`, async () => {
+    const { provider } = fixture(name, {
+      fail() {
+        throw new Error('Must not dispatch');
+      }
+    });
+    await assert.rejects(provider.complete(null), (error) => error.code === 'invalid_request');
+    await assert.rejects(
+      async () => {
+        for await (const event of provider.stream(null)) void event;
+      },
+      (error) => error.code === 'invalid_request'
+    );
+  });
+
+for (const name of ['openai', 'openai-codex', 'openrouter', 'claude', 'ollama'])
+  for (const method of ['complete', 'stream'])
+    for (const cancelled of [false, true])
+      test(`${name} ${method}: ${cancelled ? 'requested cancellation preserves an arbitrary reason' : 'upstream abort prose is a transport failure'}`, async () => {
+        const controller = new AbortController();
+        const reason = Object.freeze(
+          new Error(cancelled ? 'Stop requested' : 'Network transfer aborted by upstream')
+        );
+        const { provider, request } = fixture(name, {
+          fail() {
+            if (cancelled) controller.abort(reason);
+            throw reason;
+          }
+        });
+        await assert.rejects(
+          async () => {
+            const options = { signal: controller.signal };
+            if (method === 'complete') await provider.complete(request, options);
+            else for await (const event of provider.stream(request, options)) void event;
+          },
+          (error) => {
+            assert(error instanceof ModelProviderError);
+            assert.equal(error.code, cancelled ? 'aborted' : 'provider_unavailable');
+            assert.equal(error.retryable, !cancelled);
+            return true;
+          }
+        );
+        assert.equal(reason.name, 'Error', 'cancellation must not mutate caller-owned errors');
+      });

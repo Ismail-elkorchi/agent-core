@@ -4,4 +4,6 @@ Shared, dependency-light protocol primitives used by the provider adapters. It o
 
 HTTP failures retain the provider's explanation. Status and explicit protocol diagnostics determine classification and retry disposition: words such as “token” or “context” do not establish context overflow. Request timeouts remain transient transport failures, and exhausted account credits or spending limits are not retried as throttling.
 
+Cancellation applies even when stream status ticks and idle timeouts are disabled. The reader releases its response body and preserves caller-owned abort reasons without modifying them. Provider adapters distinguish a requested cancellation from an upstream failure using the transport signal and error type, not diagnostic wording.
+
 This is not a model provider and does not blur OpenAI Platform credentials with ChatGPT subscription credentials.
