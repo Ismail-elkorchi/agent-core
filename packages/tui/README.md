@@ -14,6 +14,8 @@ On shutdown, `saveDrafts` attempts every supplied session draft before reporting
 
 Resource suggestions supply literal `reference` values. Shared completion owns quoting, complete reference replacement, caret placement, and undo. Set `continueSearch` for a selectable scope such as a directory; `acceptResource` then returns the next completion to pass to `searchResources` along with the updated input.
 
+Resource search returns `items` and explicit `coverage`. The picker labels partial results and does not describe an empty partial search as exhaustive absence.
+
 
 Tool activities distinguish invocation completion from domain outcome. `projectProgress` and `projectSessionEntry` accept an optional tool renderer after the call-presentation callback; renderers receive structured observations. Generic results use a neutral completed state, failures retain invocation-failure state, and executor uncertainty remains visible. A renderer exception produces a display diagnostic and bounded raw inspection without changing execution truth or model input. The optional `localToolCallPresentation` and `renderLocalToolObservation` adapters from `@agent-core/tools-local` render local source, search, process, and mutation results.
 

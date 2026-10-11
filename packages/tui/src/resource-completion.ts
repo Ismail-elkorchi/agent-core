@@ -17,24 +17,31 @@ export interface ResourceSuggestion {
   readonly continueSearch?: boolean;
 }
 export interface ResourceSearch {
-  search(query: string, signal: AbortSignal): Promise<readonly ResourceSuggestion[]>;
+  search(query: string, signal: AbortSignal): Promise<ResourceSearchResult>;
 }
-export interface ResourceCompletion {
+export interface ResourceSearchResult {
+  readonly items: readonly ResourceSuggestion[];
+  readonly coverage: 'complete' | 'partial';
+}
+interface ResourceCompletionBase {
   readonly id: string;
   readonly input: TextAreaState;
   readonly start: number;
   readonly end: number;
   readonly query: string;
-  readonly phase: 'loading' | 'ready' | 'failed';
   readonly items: readonly ResourceSuggestion[];
   readonly selected: number;
-  readonly error?: string;
 }
+export type ResourceCompletion = ResourceCompletionBase & (
+  | { readonly phase: 'loading' }
+  | { readonly phase: 'ready'; readonly coverage: ResourceSearchResult['coverage'] }
+  | { readonly phase: 'failed'; readonly error: string }
+);
 export type ResourceCompletionMessage =
   | {
       readonly type: 'resource.loaded';
       readonly id: string;
-      readonly items: readonly ResourceSuggestion[];
+      readonly result: ResourceSearchResult;
     }
   | { readonly type: 'resource.failed'; readonly id: string; readonly error: string }
   | { readonly type: 'resource.move'; readonly delta: number }
@@ -99,9 +106,9 @@ export function searchResources(
     id: 'resource-search',
     concurrency: 'replace',
     async run({ signal }) {
-      const items = await operations.search(state.query, signal);
+      const result = await operations.search(state.query, signal);
       signal.throwIfAborted();
-      return { kind: 'message', message: { type: 'resource.loaded', id: state.id, items } };
+      return { kind: 'message', message: { type: 'resource.loaded', id: state.id, result } };
     },
     onError: ({ diagnostic }) => ({
       kind: 'message',
@@ -124,10 +131,11 @@ export function updateResourceCompletion(
       return {
         ...state,
         phase: 'ready',
-        items: message.items,
+        items: message.result.items,
+        coverage: message.result.coverage,
         selected: Math.max(
           0,
-          message.items.findIndex((item) => item.id === selectedId)
+          message.result.items.findIndex((item) => item.id === selectedId)
         )
       };
     }
@@ -186,10 +194,12 @@ export function resourceSuggestions(state: ResourceCompletion, limit = 5) {
           text({
             content:
               state.phase === 'failed'
-                ? (state.error ?? 'Resource search failed.')
+                ? state.error
                 : state.phase === 'loading'
                   ? 'Searching resources…'
-                  : 'No matching resources.'
+                  : state.coverage === 'partial'
+                    ? 'No match in the searched entries.'
+                    : 'No matching resources.'
           })
         ]
       : state.items.slice(start, start + limit).map((item, index) =>
@@ -199,6 +209,9 @@ export function resourceSuggestions(state: ResourceCompletion, limit = 5) {
             onPress: () => ({ type: 'resource.accept', id: item.id })
           })
         )),
-    text({ content: '↑↓ choose · Tab / Enter insert · Esc dismiss', textRole: 'caption' })
+    text({
+      content: `${state.phase === 'ready' && state.coverage === 'partial' ? 'Partial results · ' : ''}↑↓ choose · Tab / Enter insert · Esc dismiss`,
+      textRole: 'caption'
+    })
   ]);
 }

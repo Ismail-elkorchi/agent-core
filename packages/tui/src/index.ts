@@ -124,6 +124,7 @@ export {
   type ResourceCompletion,
   type ResourceCompletionMessage,
   type ResourceSearch,
+  type ResourceSearchResult,
   type ResourceSuggestion
 } from './resource-completion.js';
 export {

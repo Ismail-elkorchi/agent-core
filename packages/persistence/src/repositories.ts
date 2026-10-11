@@ -154,12 +154,14 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       assertConditionalOptions(options);
       assertIdentifier(options.idempotencyKey, 'idempotencyKey');
       const encodedEvent = this.codec.encode(event);
+      const acquisition = { completed: false };
       try {
         return await withPersistenceFileLock(
           this.filePath(runId),
           this.lockTimeoutMs,
           this.staleLockMs,
           async (assertOwned) => {
+            acquisition.completed = true;
             await this.ensureHeader(runId);
             const index = await this.refreshIndex(runId, true);
             const currentTail = tailFromEncoded(index.tail);
@@ -232,7 +234,9 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
           }
         );
       } catch (error) {
-        if (error instanceof PersistenceCorruptionError) throw error;
+        // Only acquisition failure proves the operation never started. Once the
+        // lock was acquired, a release error cannot negate a committed record.
+        if (acquisition.completed || error instanceof PersistenceCorruptionError) throw error;
         return Object.freeze({ kind: 'not_committed', failure: persistenceFailure(error) });
       }
     });
@@ -1593,7 +1597,29 @@ async function syncDirectoryEntry(directory: string): Promise<void> {
   }
 }
 
-export async function withPersistenceFileLock<T>(
+const persistenceFileQueues = new Map<string, Promise<void>>();
+
+export function withPersistenceFileLock<T>(
+  filePath: string,
+  timeoutMs: number,
+  staleMs: number,
+  operation: (assertOwned: () => Promise<void>) => Promise<T>
+): Promise<T> {
+  const resolvedPath = path.resolve(filePath);
+  const previous = persistenceFileQueues.get(resolvedPath) ?? Promise.resolve();
+  // Repository instances share this queue. Only contention with another process
+  // spends the acquisition timeout; local writers cannot starve each other.
+  const result = previous.then(() =>
+    withAcquiredPersistenceFileLock(resolvedPath, timeoutMs, staleMs, operation)
+  );
+  const tail = result.then(() => undefined, () => undefined);
+  persistenceFileQueues.set(resolvedPath, tail);
+  return result.finally(() => {
+    if (persistenceFileQueues.get(resolvedPath) === tail) persistenceFileQueues.delete(resolvedPath);
+  });
+}
+
+async function withAcquiredPersistenceFileLock<T>(
   filePath: string,
   timeoutMs: number,
   staleMs: number,
@@ -1633,16 +1659,26 @@ export async function withPersistenceFileLock<T>(
     if (!isRecord(owner) || owner.token !== token || owner.pid !== process.pid)
       throw new PersistenceConflictError('Persistence lock ownership was lost.');
   };
+  const release = async (): Promise<void> => {
+    // Never remove a replacement lock, or mistake a removal failure for release.
+    await assertOwned();
+    await fs.rm(lockPath, { recursive: true, force: true });
+  };
+  let result: T;
   try {
-    return await operation(assertOwned);
-  } finally {
+    result = await operation(assertOwned);
+  } catch (error) {
     try {
-      await assertOwned();
-      await fs.rm(lockPath, { recursive: true, force: true });
-    } catch {
-      // A replaced lock belongs to another writer and must not be removed.
+      await release();
+    } catch (releaseError) {
+      throw new AggregateError([error, releaseError], 'Persistence operation and lock release failed.', {
+        cause: releaseError
+      });
     }
+    throw error;
   }
+  await release();
+  return result;
 }
 
 async function staleLock(lockPath: string, staleMs: number): Promise<boolean> {

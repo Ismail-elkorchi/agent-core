@@ -1,10 +1,39 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createDraft, completeResource, acceptResource, updateResourceCompletion } from '@agent-core/tui';
+import { createDraft, completeResource, acceptResource, updateResourceCompletion, resourceSuggestions } from '@agent-core/tui';
 import { createTextAreaState, textAreaReducer } from '@ismail-elkorchi/terminal-ui/behavior';
 import { textCaretAt, textDocumentText } from '@ismail-elkorchi/terminal-ui/text';
+import { createMemoryTerminalHost } from '@ismail-elkorchi/terminal-ui/host';
+import { createTuiRuntime, defineTui } from '@ismail-elkorchi/terminal-ui/tui';
+import { renderFramePlain } from '@ismail-elkorchi/terminal-ui/renderer';
 
-test('resource completion replaces only its caret range and remains one undo operation', () => {
+for (const [coverage, items] of [
+  ['partial', []],
+  ['partial', [{ id: 'one', label: 'Visible file', reference: 'one' }]],
+  ['complete', []]
+]) test(`resource suggestions disclose ${coverage} coverage with ${items.length} matches`, async (t) => {
+  const initial = completeResource(createDraft('@').input);
+  const state = updateResourceCompletion(initial, {
+    type: 'resource.loaded', id: initial.id, result: { coverage, items }
+  });
+  const runtime = createTuiRuntime({
+    host: createMemoryTerminalHost({ terminalSize: { columns: 90, rows: 8 } }),
+    app: defineTui({ init: () => ({ state }), update: state => ({ state }), view: state => resourceSuggestions(state) })
+  });
+  t.after(() => runtime.dispose());
+  await runtime.start();
+  const rendered = renderFramePlain(runtime.frame());
+  if (coverage === 'partial') {
+    assert.match(rendered, /Partial results/);
+    assert.doesNotMatch(rendered, /No matching resources/);
+    if (items.length === 0) assert.match(rendered, /No match in the searched entries/);
+  } else {
+    assert.match(rendered, /No matching resources/);
+    assert.doesNotMatch(rendered, /Partial results/);
+  }
+});
+
+test('resource completion replaces its complete reference and remains one undo operation', () => {
   const source = 'Inspect @src/ma then continue 文';
   const input = createTextAreaState({ value: source, caret: textCaretAt(15) });
   const loading = completeResource(input);
@@ -12,7 +41,7 @@ test('resource completion replaces only its caret range and remains one undo ope
   const ready = updateResourceCompletion(loading, {
     type: 'resource.loaded',
     id: loading.id,
-    items: [{ id: 'main', label: 'main', reference: 'src/main.ts' }]
+    result: { coverage: 'complete', items: [{ id: 'main', label: 'main', reference: 'src/main.ts' }] }
   });
   const { input: inserted, completion } = acceptResource(ready, input);
   assert.equal(completion, undefined);
@@ -30,7 +59,7 @@ test('stale resource responses cannot replace newer results, and paste does not 
   );
   const completion = completeResource(input);
   assert.equal(
-    updateResourceCompletion(completion, { type: 'resource.loaded', id: 'replaced', items: [] }),
+    updateResourceCompletion(completion, { type: 'resource.loaded', id: 'replaced', result: { coverage: 'complete', items: [] } }),
     completion
   );
   assert.equal(updateResourceCompletion(completion, { type: 'resource.close' }), undefined);
@@ -67,7 +96,7 @@ test('a directory selection keeps the caret inside its quoted reference and cont
   const loading = completeResource(input);
   const ready = updateResourceCompletion(loading, {
     type: 'resource.loaded', id: loading.id,
-    items: [{ id: 'directory', label: 'Draft notes', reference: 'draft notes/', continueSearch: true }]
+    result: { coverage: 'complete', items: [{ id: 'directory', label: 'Draft notes', reference: 'draft notes/', continueSearch: true }] }
   });
   const accepted = acceptResource(ready, input);
   assert.equal(textDocumentText(accepted.input.document), 'Read @"draft notes/"');
@@ -79,7 +108,7 @@ test('a directory selection keeps the caret inside its quoted reference and cont
   assert.equal(next.query, 'draft notes/c');
   const found = updateResourceCompletion(next, {
     type: 'resource.loaded', id: next.id,
-    items: [{ id: 'file', label: 'Chapter', reference: 'draft notes/chapter"one.md' }]
+    result: { coverage: 'complete', items: [{ id: 'file', label: 'Chapter', reference: 'draft notes/chapter"one.md' }] }
   });
   const final = acceptResource(found, edited);
   assert.equal(textDocumentText(final.input.document), 'Read @"draft notes/chapter\\"one.md" ');
@@ -100,7 +129,7 @@ test('resource insertion replaces an old quoted suffix without duplicating its s
   const loading = completeResource(input);
   const ready = updateResourceCompletion(loading, {
     type: 'resource.loaded', id: loading.id,
-    items: [{ id: 'file', label: 'New', reference: 'new notes/new.md' }]
+    result: { coverage: 'complete', items: [{ id: 'file', label: 'New', reference: 'new notes/new.md' }] }
   });
   assert.equal(textDocumentText(acceptResource(ready, input).input.document),
     'Read @"new notes/new.md" then review');
