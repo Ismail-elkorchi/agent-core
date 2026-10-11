@@ -250,7 +250,10 @@ export async function rebuildModelWindowFromRepositories(input: {
   };
 }
 
+export const SELECTED_SOURCE_LIMITS = Object.freeze({ bytes: 8 * 1024 * 1024, entries: 10000 });
+
 export interface SelectedHistorySources {
+  readonly sourceBytes: number;
   readonly cut: HistorySourceCut;
   readonly entries: readonly SessionBranchEntry[];
   readonly contextWindow?: ContextWindowRecord | undefined;
@@ -283,12 +286,12 @@ export async function readSelectedHistorySources(
     const id = sourceRef(cut.sessionId, entry).entryId;
     if (ids.has(id)) return;
     bytes += new TextEncoder().encode(JSON.stringify(entry)).byteLength;
-    if (bytes > 8 * 1024 * 1024 || entries.length >= 10000)
+    if (bytes > SELECTED_SOURCE_LIMITS.bytes || entries.length >= SELECTED_SOURCE_LIMITS.entries)
       throw new ContextSourceCapacityError(
         cut,
-        bytes > 8 * 1024 * 1024
-          ? { unit: 'bytes', limit: 8 * 1024 * 1024, observedAtLeast: bytes }
-          : { unit: 'entries', limit: 10000, observedAtLeast: entries.length + 1 }
+        bytes > SELECTED_SOURCE_LIMITS.bytes
+          ? { unit: 'bytes', limit: SELECTED_SOURCE_LIMITS.bytes, observedAtLeast: bytes }
+          : { unit: 'entries', limit: SELECTED_SOURCE_LIMITS.entries, observedAtLeast: entries.length + 1 }
       );
     entries.push(entry);
     ids.add(id);
@@ -296,15 +299,15 @@ export async function readSelectedHistorySources(
   for (const source of previous ? [] : (contextWindow?.selection.retained ?? [])) {
     let entry;
     try {
-      entry = await history.resolve(source, cut, Math.max(1, 8 * 1024 * 1024 - bytes));
+      entry = await history.resolve(source, cut, Math.max(1, SELECTED_SOURCE_LIMITS.bytes - bytes));
     } catch (error) {
       if (!(error instanceof HistorySourceTooLargeError)) throw error;
       throw new ContextSourceCapacityError(
         cut,
         {
           unit: 'bytes',
-          limit: 8 * 1024 * 1024,
-          observedAtLeast: Math.max(8 * 1024 * 1024 + 1, bytes + error.bytes)
+          limit: SELECTED_SOURCE_LIMITS.bytes,
+          observedAtLeast: Math.max(SELECTED_SOURCE_LIMITS.bytes + 1, bytes + error.bytes)
         },
         source
       );
@@ -314,10 +317,10 @@ export async function readSelectedHistorySources(
   }
   let cursor: string | undefined;
   do {
-    if (bytes >= 8 * 1024 * 1024)
+    if (bytes >= SELECTED_SOURCE_LIMITS.bytes)
       throw new ContextSourceCapacityError(cut, {
         unit: 'bytes',
-        limit: 8 * 1024 * 1024,
+        limit: SELECTED_SOURCE_LIMITS.bytes,
         observedAtLeast: bytes + 1
       });
     const page = await history.page({
@@ -329,7 +332,7 @@ export async function readSelectedHistorySources(
           : {}),
       ...(cursor ? { cursor } : {}),
       limit: 1000,
-      maxBytes: 8 * 1024 * 1024 - bytes
+      maxBytes: SELECTED_SOURCE_LIMITS.bytes - bytes
     });
     const unread = page.unread?.[0];
     if (unread)
@@ -339,8 +342,8 @@ export async function readSelectedHistorySources(
           ? { unit: 'records', limit: 1000, observedAtLeast: unread.records }
           : {
               unit: 'bytes',
-              limit: 8 * 1024 * 1024,
-              observedAtLeast: Math.max(8 * 1024 * 1024 + 1, bytes + unread.bytes)
+              limit: SELECTED_SOURCE_LIMITS.bytes,
+              observedAtLeast: Math.max(SELECTED_SOURCE_LIMITS.bytes + 1, bytes + unread.bytes)
             },
         unread.source
       );
@@ -349,6 +352,7 @@ export async function readSelectedHistorySources(
   } while (cursor);
   const result = Object.freeze({
     cut,
+    sourceBytes: bytes,
     entries: await history.orderEntries(entries, cut),
     ...(contextWindow ? { contextWindow } : {})
   });

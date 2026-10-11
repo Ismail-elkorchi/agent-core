@@ -1,5 +1,6 @@
 import { workingStateAtEntry, type SessionWorkingStateEntry } from './working-state.js';
 import { hashJson } from '@agent-core/persistence';
+import { historyToolName } from '../history/metadata.js';
 import { entryIdentity } from '../history/ledger.js';
 import type {
   SessionSourceMetadata,
@@ -14,6 +15,8 @@ import type {
 } from './contracts.js';
 
 export interface BranchEntryPosition {
+  readonly timestamp: string;
+  readonly toolName?: string;
   readonly workingState?: SessionWorkingStateEntry | null;
   readonly identity: string;
   readonly type: SessionBranchEntry['type'];
@@ -286,6 +289,8 @@ class BranchSourceIndex {
 
 function branchMetadata(record: BranchEntryPosition) {
   return {
+    timestamp: record.timestamp,
+    ...(record.toolName ? { toolName: record.toolName } : {}),
     identity: record.identity,
     type: record.type,
     ...(record.runId ? { runId: record.runId } : {}),
@@ -363,7 +368,10 @@ function branchEntryText(entry: SessionBranchEntry): string {
 }
 
 export function branchEntryMetadata(entry: SessionBranchEntry) {
+  const toolName = historyToolName(entry);
   return {
+    timestamp: entry.timestamp,
+    ...(toolName ? { toolName } : {}),
     identity: entryIdentity(entry),
     type: entry.type,
     ...('runId' in entry ? { runId: entry.runId } : {}),

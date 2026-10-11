@@ -36,7 +36,10 @@ and digest. `readRange()` scans strictly after `afterSequence`, through a pinned
 sequence/hash, with record and byte limits applied before domain decoding. Its
 `nextSequence` is the last scanned sequence, suitable for the next request's
 `afterSequence`; `oversized` leaves that record unconsumed. Type filters use derived
-metadata. `latestReferenceOfType()` and `referenceByKey()` return exact pointers
+metadata. Domain event codecs provide small routing facts (for example, a tool name);
+time and routing filters run before inline payload byte admission, just as session
+branch metadata filters do. Relevant oversized originals retain exact unread references.
+`latestReferenceOfType()` and `referenceByKey()` return exact pointers
 without decoding their payloads. Both memory and JSONL repositories have the same
 query and conflict semantics. Tool history joins original results and recorded
 model content through the existing idempotency index, at the selected cut.
@@ -144,9 +147,27 @@ It is never an automatic response to incompatible native state.
 There is no automatic portable summarization or oldest-source eviction. The model
 chooses relevant sources and updates understanding when useful. History is the
 recoverable original; working state is generated interpretation, not evidence.
-Capacity inspection exposes limits without inserting maintenance tasks into the
-conversation. Providers without native compaction use source selection or an
-explicit fresh continuation.
+`context_inspect` exposes the live selection, including the tail after the last
+committed window. Its source manifest uses bounded `limit`/`maxBytes` pages and a
+cursor pinned to the captured branch and ledger heads. Each item carries an exact
+source reference, a short description, stored byte size, and its whole-exchange
+group, including prefix binding and protected or unfinished dependencies. These
+byte sizes do not promise compiled token savings. An unavailable selection exposes
+its source-capacity conflict rather than reporting an empty window. Inspection
+labels the last compiled admission by input identity, separately from the live cut.
+
+Near compiled continuity capacity or 80% of selected-source bounds, the runtime
+adds factual capacity feedback at the end of the request. It reuses unchanged
+status, counts and admits the request including the notice, and preserves native
+prefixes. Feedback distinguishes source-read bounds and compiled reservations
+from settled usage and owner allowances. It does not demand working-state upkeep
+or trigger compaction. Optional notice preparation cannot block an already valid
+ordinary request; cancellation still stops dispatch. A single large new input or
+result can still cross a bound before the model gets another decision point.
+Providers without native compaction use source selection or an explicit fresh
+continuation. These are structural guarantees; long-session task quality and the
+usefulness of pressure feedback still need controlled live evaluation of this
+source-selection policy, not the superseded automatic-summary policy.
 
 Hosts may enable `contextRenewal: { automatic: true }` for native fallback; both
 applications do. Only a declared, governed native operation can resolve a rejected

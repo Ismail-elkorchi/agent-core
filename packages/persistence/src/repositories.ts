@@ -15,7 +15,9 @@ import {
   type EventAppendOptions,
   type EventLedgerTail,
   type EventRepository,
-  type RuntimeCodec
+  matchesEventMetadata,
+  parseEventMetadata,
+  type EventCodec
 } from './event-repository.js';
 import {
   appendJsonlRecord,
@@ -46,14 +48,15 @@ export interface EventStreamHeader {
 
 export interface JsonlEventRepositoryOptions<TEvent extends TypedEvent> {
   readonly rootDir: string;
-  readonly codec: RuntimeCodec<TEvent>;
+  readonly codec: EventCodec<TEvent>;
   readonly lockTimeoutMs?: number;
   readonly staleLockMs?: number;
 }
 
 export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRepository<TEvent> {
   private readonly rootDir: string;
-  private readonly codec: RuntimeCodec<TEvent>;
+  private readonly codec: EventCodec<TEvent>;
+  private readonly decoded = new WeakMap<EncodedEnvelope, TEvent>();
   private readonly lockTimeoutMs: number;
   private readonly staleLockMs: number;
   private readonly queues = new Map<string, Promise<void>>();
@@ -292,7 +295,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
           message: `Event-type index for ${type} resolves to ${actualType}.`
         });
       }
-      return domainEnvelope(encoded, this.codec.decode(encoded.event));
+      return domainEnvelope(encoded, this.domainEvent(encoded));
     });
   }
 
@@ -351,12 +354,12 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       if (pointer.eventId !== reference.eventId || pointer.hash !== reference.hash)
         throw new PersistenceConflictError('Event reference identity changed.');
       const encoded = await this.readSequenceEnvelope(reference.runId, pointer);
-      return domainEnvelope(encoded, this.codec.decode(encoded.event));
+      return domainEnvelope(encoded, this.domainEvent(encoded));
     });
   }
 
   async readRange(runId: string, request: EventRangeRequest = {}): Promise<EventRangePage<TEvent>> {
-    const { after, limit, maxBytes, through, types } = eventRangeBounds(request);
+    const { after, limit, maxBytes, through, types, metadata, afterTime, beforeTime } = eventRangeBounds(request);
     return this.enqueue(runId, async () => {
       let index: EventAppendIndex;
       try {
@@ -398,7 +401,12 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       let oversized: EventRangePage<TEvent>['oversized'];
       while (nextSequence < tail.sequence && scanned < limit) {
         const pointer = await this.sequencePointer(runId, nextSequence + 1, index);
-        if (!types || types.includes(pointer.type)) {
+        if (
+          (!types || types.includes(pointer.type)) &&
+          (!afterTime || Date.parse(pointer.timestamp) >= Date.parse(afterTime)) &&
+          (!beforeTime || Date.parse(pointer.timestamp) < Date.parse(beforeTime)) &&
+          matchesEventMetadata(pointer.metadata, metadata)
+        ) {
           if (bytes + pointer.bytes > maxBytes) {
             if (pointer.bytes > maxBytes)
               oversized = {
@@ -413,7 +421,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
             break;
           }
           const encoded = await this.readSequenceEnvelope(runId, pointer);
-          records.push(domainEnvelope(encoded, this.codec.decode(encoded.event)));
+          records.push(domainEnvelope(encoded, this.domainEvent(encoded)));
           bytes += pointer.bytes;
         }
         nextSequence++;
@@ -441,7 +449,12 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     byteOffset: number,
     bytes: number
   ): Promise<void> {
-    const content = { ...tailRecord(envelope, byteOffset), type: eventType(envelope), bytes };
+    const content = {
+      ...tailRecord(envelope, byteOffset),
+      type: eventType(envelope),
+      bytes,
+      metadata: this.codec.metadata?.(this.domainEvent(envelope)) ?? {}
+    };
     await atomicWritePrivateJson(this.sequencePath(runId, envelope.sequence), {
       ...content,
       contentHash: hashJson(content)
@@ -469,7 +482,12 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
         pointer.byteOffset + content.bytes > index.completeBytes
       )
         throw new TypeError('Event sequence index is invalid.');
-      return { ...pointer, type: content.type, bytes: content.bytes };
+      return {
+        ...pointer,
+        type: content.type,
+        bytes: content.bytes,
+        metadata: parseEventMetadata(content.metadata)
+      };
     } catch (error) {
       if (
         nodeCode(error) !== 'ENOENT' &&
@@ -486,8 +504,21 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       const pointer = parseEventTailRecord(raw, 'Rebuilt event sequence index');
       if (typeof raw.type !== 'string' || typeof raw.bytes !== 'number')
         throw new TypeError('Invalid rebuilt event index.', { cause: error });
-      return { ...pointer, type: raw.type, bytes: raw.bytes };
+      return {
+        ...pointer,
+        type: raw.type,
+        bytes: raw.bytes,
+        metadata: parseEventMetadata(raw.metadata)
+      };
     }
+  }
+
+  private domainEvent(encoded: EncodedEnvelope): TEvent {
+    const cached = this.decoded.get(encoded);
+    if (cached) return cached;
+    const event = this.codec.decode(encoded.event);
+    this.decoded.set(encoded, event);
+    return event;
   }
 
   private async readSequenceEnvelope(
@@ -512,7 +543,8 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       hash !== pointer.hash ||
       encoded.eventId !== pointer.eventId ||
       encoded.sequence !== pointer.sequence ||
-      eventType(encoded) !== pointer.type
+      eventType(encoded) !== pointer.type ||
+      hashJson(this.codec.metadata?.(this.domainEvent(encoded)) ?? {}) !== hashJson(pointer.metadata)
     )
       throw corruption(
         'integrity',
@@ -1738,6 +1770,7 @@ function inferActor(type: string): EventActor {
 }
 
 interface EventSequencePointer extends EventTailRecord {
+  readonly metadata: Readonly<Record<string, string>>;
   readonly type: string;
   readonly bytes: number;
 }

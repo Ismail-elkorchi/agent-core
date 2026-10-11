@@ -12,6 +12,7 @@ export const requestPresentationSchema = z.strictObject({
   authority: z.string(),
   context: z.string(),
   workingState: z.string(),
+  capacityNotice: z.string().optional(),
   runInstructions: z.string()
 });
 export type RequestPresentation = z.infer<typeof requestPresentationSchema>;

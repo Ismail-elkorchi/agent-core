@@ -228,7 +228,7 @@ test('context inspection explains adjusted capacity and does not expose the acco
   assert.equal(presented.accounting.uncertainty.calibrated, false);
   assert.match(presented.accounting.inputTokensMeaning, /uncertainty.headroomRatio/);
   assert.equal(presented.accounting.components, undefined);
-  assert.equal(presented.admission.inputIdentity, undefined);
+  assert.equal(presented.admission.inputIdentity, compiled.inputIdentity);
   assert.match(tools[1].description, /empty array releases it all/);
 });
 

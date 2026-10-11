@@ -65,6 +65,7 @@ export interface PromptMaterial {
   readonly instructions: readonly PromptInstructionBlock[];
   readonly context: readonly PromptContextItem[];
   readonly workingState?: PromptContextItem;
+  readonly capacityNotice?: PromptContextItem;
   readonly tools: readonly PromptToolSummary[];
   readonly outputContract?: PromptOutputContract;
   readonly metadata?: Readonly<Record<string, string>>;

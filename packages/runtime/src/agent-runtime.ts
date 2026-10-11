@@ -2865,6 +2865,7 @@ export class AgentRuntime {
       ...contextInputs.provider,
       ...contextInputs.run
     ];
+    let capacityNotice: PromptContextItemInput | undefined;
     const assemble = async (
       window: ModelWindow,
       workingState: WorkingStateSnapshot,
@@ -2894,6 +2895,7 @@ export class AgentRuntime {
           }),
           contextItems: capturedContext,
           ...(stateContext ? { workingState: stateContext } : {}),
+          ...(capacityNotice ? { capacityNotice } : {}),
           tools: promptToolSpecs(
             [...request.snapshot.tools],
             request.snapshot.profile,
@@ -3119,6 +3121,29 @@ export class AgentRuntime {
       throw admissionFailure;
     }
 
+    // A warning is optional request material. Compile and admit its exact request;
+    // failure to prepare it must not invalidate an already admitted ordinary candidate.
+    let feedback: Awaited<ReturnType<ContextService['capacityFeedback']>>;
+    let feedbackFailure: string | undefined;
+    if (this.options.context) {
+      try {
+        feedback = await this.options.context.capacityFeedback(result.compiled);
+        if (feedback) {
+          capacityNotice = feedback.notice;
+          const withFeedback = await assemble(
+            request.modelWindow,
+            await this.options.context.workingState()
+          );
+          await this.requestAdmission.admit(withFeedback.compiled, request.snapshot.profile);
+          result = withFeedback;
+        }
+      } catch (error) {
+        request.signal.throwIfAborted();
+        feedback = undefined;
+        feedbackFailure = `Capacity notice was not delivered: ${errorMessage(error)}`;
+      }
+    }
+
     const { assembly, compiled } = result;
     const estimate = requestTokenEstimate({
       accounting: compiled.accounting,
@@ -3151,7 +3176,9 @@ export class AgentRuntime {
       status: 'admitted',
       inputIdentity: compiled.inputIdentity,
       accounting: compiled.accounting,
-      ...(requestCapacity(result.compiled.accounting).pressure === 'continuity'
+      ...(feedback ? { feedback } : {}),
+      ...(feedbackFailure ? { message: feedbackFailure } : {}),
+      ...(!feedbackFailure && requestCapacity(result.compiled.accounting).pressure === 'continuity'
         ? {
             message:
               'Context is near capacity. Select sources or explicitly renew native continuity; working-state maintenance is not required.'

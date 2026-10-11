@@ -1,7 +1,7 @@
 import * as z from 'zod';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { parseToolObservation, encodeToolObservation, serializeToolModelContent } from '@agent-core/tools';
@@ -990,3 +990,68 @@ test('indexed history sees newly settled output before later runs and honors sou
   const after = await history.search({ query: 'match', filter: { afterTime: input.timestamp } });
   assert.equal(after.items.length, 3);
 });
+
+for (const kind of ['memory', 'jsonl']) {
+  for (const authoritative of [false, true]) {
+    for (const storage of ['inline', 'artifact']) {
+      test(`${kind}/${authoritative ? 'ledger' : 'session'}/${storage}: metadata rejects irrelevant payloads before byte admission`, async () => {
+        const f = await backend(kind);
+        const session = await f.sessions.create({ binding });
+        await f.sessions.appendInput(session, { runId: 'run', task: 'history' });
+        let relevant;
+        for (const [callIndex, toolName, text] of [[0, 'other', 'x'.repeat(50000)], [1, 'wanted', 'needle'], [2, 'large', 'needle' + 'y'.repeat(50000)]]) {
+          const observation = parseToolObservation({ outputSchema: z.json() }, {
+            kind: 'result', summary: toolName, output: { text }, scope: { resources: [], coverage: 'complete' }
+          });
+          const artifact = storage === 'artifact' ? await f.artifacts.store({ label: toolName,
+            content: Buffer.from(JSON.stringify(encodeToolObservation(observation))), mediaType: 'application/json' }) : undefined;
+          const stored = { kind: 'result', summary: toolName, digest: hashJson(encodeToolObservation(observation)), coverage: 'complete',
+            ...(artifact ? { storage: 'artifact', artifact } : { storage: 'inline', observation }) };
+          if (authoritative) {
+            const receipt = await f.events.append('run', { type: 'tool.ended', ...identity,
+              toolBatchId: 'batch', callIndex, toolAttempt: 1, toolName, observation: stored });
+            if (toolName === 'large') relevant = receipt.eventId;
+          } else {
+            const entry = await f.sessions.appendObservation(session, { runId: 'run',
+              identity: { ...identity, toolBatchId: 'batch', callIndex, toolAttempt: 1 }, toolName,
+              observation: artifact ? { kind: 'result', summary: toolName, originalArtifact: artifact } : observation });
+            if (toolName === 'large') relevant = entry.id;
+          }
+        }
+        for (const cold of [false, true]) {
+          let events = f.events, repository = f.sessions;
+          if (kind === 'jsonl' && cold) {
+            await rm(path.join(f.root, 'events', 'run-run.index'), { recursive: true, force: true });
+            events = new JsonlEventRepository({ rootDir: path.join(f.root, 'events'), codec: agentEventCodec });
+            repository = new JsonlSessionRepository(path.join(f.root, 'sessions'));
+          }
+          const history = new HistoryReader({ repository, session, artifacts: f.artifacts,
+            ...(authoritative ? { events } : {}) });
+          const request = { query: 'needle', filter: { toolName: 'wanted' }, maxScannedBytes: 10000, maxScanned: 1000, maxBytes: 5000 };
+          const page = await history.search(request);
+          assert.equal(page.items.length, 1, JSON.stringify(page));
+          assert.equal(page.coverage, 'complete');
+          assert.equal(page.unread, undefined);
+          assert(page.scannedBytes < 10000);
+          const bounded = await history.search({ ...request, filter: { toolName: 'large' } });
+          assert.equal(bounded.coverage, 'partial');
+          assert.equal(bounded.unread.length, 1);
+          assert(bounded.unread[0].source.entryId.includes(relevant));
+          assert.equal((await history.read({ source: bounded.unread[0].source, maxSourceBytes: 200000 })).status, 'available');
+          // Record limits still count filtered records and the cursor retains its exact capture.
+          const sources = [];
+          let cursor;
+          do {
+            const next = await history.search({ ...request, maxScanned: 1, ...(cursor ? { cursor } : {}) });
+            sources.push(...next.items);
+            assert.equal(next.unread, undefined);
+            assert(next.scanned <= 1);
+            cursor = next.cursor;
+          } while (cursor);
+          assert.equal(sources.length, 1);
+        }
+        if (f.root) await rm(f.root, { recursive: true, force: true });
+      });
+    }
+  }
+}

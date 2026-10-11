@@ -31,7 +31,7 @@ import {
 import {
   decodeOwnedArtifactRef,
   type ArtifactRef,
-  type RuntimeCodec
+  type EventCodec
 } from '@agent-core/persistence';
 import {
   decodeOwnedObservedFactRecord,
@@ -521,7 +521,15 @@ export type AgentProgressEvent =
       readonly deliveryDiagnostics: readonly AgentDeliveryDiagnostic[];
     };
 
-export const agentEventCodec: RuntimeCodec<AgentEvent> = {
+export const agentEventCodec: EventCodec<AgentEvent> = {
+  metadata: (event) => {
+    switch (event.type) {
+      case 'tool.started': return { toolName: event.input.name };
+      case 'tool.ended':
+      case 'observation.record.created': return { toolName: event.toolName };
+      default: return {};
+    }
+  },
   encode: encodeAgentEvent,
   decode: decodeAgentEvent
 };
@@ -1666,6 +1674,7 @@ function decodePromptMaterial(value: JsonValue | undefined): PromptMaterial {
     'instructions',
     'context',
     'workingState',
+    'capacityNotice',
     'tools',
     'outputContract',
     'metadata'
@@ -1683,6 +1692,9 @@ function decodePromptMaterial(value: JsonValue | undefined): PromptMaterial {
     context: requiredArray(object.context, 'material.context').map((item, index) =>
       decodePromptContextItem(item, `material.context[${String(index)}]`)
     ),
+    ...(object.capacityNotice === undefined
+      ? {}
+      : { capacityNotice: decodePromptContextItem(object.capacityNotice, 'material.capacityNotice') }),
     ...(object.workingState === undefined
       ? {}
       : { workingState: decodePromptContextItem(object.workingState, 'material.workingState') }),

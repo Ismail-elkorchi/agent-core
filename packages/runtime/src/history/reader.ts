@@ -1,3 +1,4 @@
+import { historyToolName, matchesHistoryMetadata } from './metadata.js';
 import {
   HistorySearchIndex,
   type IndexedHistorySource,
@@ -642,13 +643,15 @@ export class HistoryReader {
           through: head,
           limit: 1,
           maxBytes: maxBytes - bytes,
-          types: eventTypes(request.filter)
+          types: eventTypes(request.filter),
+          ...(request.filter?.toolName ? { metadata: { toolName: request.filter.toolName } } : {}),
+          ...(request.filter?.afterTime ? { afterTime: request.filter.afterTime } : {}),
+          ...(request.filter?.beforeTime ? { beforeTime: request.filter.beforeTime } : {})
         });
         scanned += page.scanned;
         bytes += page.bytes;
         let pausedSequence: number | undefined;
         for (const record of page.records) {
-          if (record.event.type === 'observation.record.created') continue;
           try {
             const raw = publicEventEntry(record, null, new Map());
             if (!raw || !matchesMetadata(raw, request.filter)) continue;
@@ -724,7 +727,7 @@ export class HistoryReader {
       if (metadata.type === 'input' && authoritative) sequence = -1;
       else at++;
       scanned++;
-      if (oldIds.has(metadata.entryId) || !metadataMatches(metadata, request.filter)) continue;
+      if (oldIds.has(metadata.entryId) || !matchesHistoryMetadata(metadata, request.filter)) continue;
       if (metadata.bytes > maxBytes - bytes) {
         if (metadata.bytes > maxBytes)
           unread.push({
@@ -1302,25 +1305,8 @@ function publicText(entry: SessionBranchEntry): string {
   }
 }
 function matchesMetadata(entry: SessionBranchEntry, filter?: HistoryFilter): boolean {
-  if (!filter) return true;
-  const time = Date.parse(entry.timestamp);
-  if (filter.afterTime && time < Date.parse(filter.afterTime)) return false;
-  if (filter.beforeTime && time >= Date.parse(filter.beforeTime)) return false;
-  if (filter.sourceType && entry.type !== filter.sourceType) return false;
-  if (filter.role && historyRole(entry) !== filter.role) return false;
-  if (filter.runId && (!('runId' in entry) || entry.runId !== filter.runId)) return false;
-  if (
-    filter.toolName &&
-    (entry.type !== 'observation' || entry.toolName !== filter.toolName) &&
-    (entry.type !== 'tool_call' ||
-      typeof entry.call !== 'object' ||
-      entry.call === null ||
-      Array.isArray(entry.call) ||
-      !('name' in entry.call) ||
-      entry.call.name !== filter.toolName)
-  )
-    return false;
-  return true;
+  const toolName = historyToolName(entry);
+  return matchesHistoryMetadata({ ...entry, ...(toolName ? { toolName } : {}) }, filter);
 }
 function matches(entry: SessionBranchEntry, filter?: HistoryFilter): boolean {
   if (!matchesMetadata(entry, filter)) return false;
@@ -1475,27 +1461,13 @@ function metadataSource(sessionId: string, metadata: SessionSourceMetadata): His
     ...(metadata.source ? { event: metadata.source } : {})
   });
 }
-function metadataMatches(metadata: SessionSourceMetadata, filter?: HistoryFilter): boolean {
-  if (filter?.sourceType && filter.sourceType !== metadata.type) return false;
-  if (filter?.runId && metadata.runId !== filter.runId) return false;
-  const role =
-    metadata.type === 'input' || metadata.type === 'steering'
-      ? 'user'
-      : metadata.type === 'assistant' || metadata.type === 'tool_call'
-        ? 'assistant'
-        : metadata.type === 'observation'
-          ? 'tool'
-          : 'control';
-  return !filter?.role || filter.role === role;
-}
 function eventTypes(filter?: HistoryFilter): readonly string[] {
   const mapping = [
     ['input.steering.accepted', 'steering', 'user'],
     ['assistant.ended', 'assistant', 'assistant'],
     ['assistant.interrupted', 'assistant', 'assistant'],
     ['tool.started', 'tool_call', 'assistant'],
-    ['tool.ended', 'observation', 'tool'],
-    ['observation.record.created', 'observation', 'tool']
+    ['tool.ended', 'observation', 'tool']
   ] as const;
   return mapping
     .filter(

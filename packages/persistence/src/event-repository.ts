@@ -16,6 +16,30 @@ export interface RuntimeCodec<T> {
   decode(value: unknown): T;
 }
 
+/** Small, rebuildable routing facts derived from validated domain events. */
+export interface EventCodec<T extends TypedEvent> extends RuntimeCodec<T> {
+  metadata?(value: T): Readonly<Record<string, string>>;
+}
+
+export function parseEventMetadata(value: unknown): Readonly<Record<string, string>> {
+  const object = parseJsonObject(value, {
+    maxCollectionEntries: 64,
+    maxStringBytes: 4096,
+    maxTotalBytes: 16384
+  });
+  return Object.freeze(Object.fromEntries(Object.entries(object).map(([key, value]) => {
+    if (typeof value !== 'string') throw new TypeError('Event metadata values must be strings.');
+    return [key, value];
+  })));
+}
+
+export function matchesEventMetadata(
+  actual: Readonly<Record<string, string>>,
+  expected?: Readonly<Record<string, string>>
+): boolean {
+  return !expected || Object.entries(expected).every(([key, value]) => actual[key] === value);
+}
+
 export interface EventAppendOptions extends AppendEventOptions {
   readonly idempotencyKey?: string;
 }
@@ -86,6 +110,9 @@ export interface EventRangeRequest {
   readonly limit?: number;
   readonly maxBytes?: number;
   readonly types?: readonly string[];
+  readonly metadata?: Readonly<Record<string, string>>;
+  readonly afterTime?: string;
+  readonly beforeTime?: string;
 }
 export interface EventRangePage<TEvent extends TypedEvent> {
   readonly records: readonly EventEnvelope<TEvent>[];
@@ -104,6 +131,9 @@ export function eventRangeBounds(request: EventRangeRequest): {
   maxBytes: number;
   through?: NonNullable<EventRangeRequest['through']>;
   types?: readonly string[];
+  metadata?: Readonly<Record<string, string>>;
+  afterTime?: string;
+  beforeTime?: string;
 } {
   const after = request.afterSequence ?? -1;
   const limit = request.limit ?? 256;
@@ -137,7 +167,13 @@ export function eventRangeBounds(request: EventRangeRequest): {
       request.types.some((type) => typeof type !== 'string' || !type.length))
   )
     throw new TypeError('Invalid event range type filter.');
+  for (const time of [request.afterTime, request.beforeTime])
+    if (time !== undefined && !Number.isFinite(Date.parse(time)))
+      throw new TypeError('Invalid event time filter.');
   return Object.freeze({
+    ...(request.metadata ? { metadata: parseEventMetadata(request.metadata) } : {}),
+    ...(request.afterTime ? { afterTime: request.afterTime } : {}),
+    ...(request.beforeTime ? { beforeTime: request.beforeTime } : {}),
     after,
     limit,
     maxBytes,
@@ -211,9 +247,10 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
   private readonly records = new Map<string, EncodedEnvelope[]>();
   private readonly byKey = new Map<string, Map<string, EncodedEnvelope>>();
   private readonly latestByType = new Map<string, Map<string, EncodedEnvelope>>();
+  private readonly routing = new WeakMap<EncodedEnvelope, Readonly<Record<string, string>>>();
   private readonly decoded = new WeakMap<EncodedEnvelope, TEvent>();
   private queue: Promise<void> = Promise.resolve();
-  constructor(private readonly codec: RuntimeCodec<TEvent>) {}
+  constructor(private readonly codec: EventCodec<TEvent>) {}
 
   append(
     runId: string,
@@ -426,7 +463,7 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
 
   async readRange(runId: string, request: EventRangeRequest = {}): Promise<EventRangePage<TEvent>> {
     assertIdentifier(runId, 'runId');
-    const { after, limit, maxBytes, through, types } = eventRangeBounds(request);
+    const { after, limit, maxBytes, through, types, metadata, afterTime, beforeTime } = eventRangeBounds(request);
     await this.queue;
     const stored = this.records.get(runId) ?? [];
     const tail = through
@@ -451,7 +488,12 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
     while (nextSequence < tail.sequence && scanned < limit) {
       const record = stored[nextSequence + 1];
       if (!record) throw new PersistenceConflictError('Event sequence is missing.');
-      if (!types || types.some((type) => type === record.event.type)) {
+      if (
+        (!types || types.some(type => type === record.event.type)) &&
+        (!afterTime || Date.parse(record.timestamp) >= Date.parse(afterTime)) &&
+        (!beforeTime || Date.parse(record.timestamp) < Date.parse(beforeTime)) &&
+        matchesEventMetadata(this.routing.get(record) ?? {}, metadata)
+      ) {
         const size = Buffer.byteLength(canonicalJsonString(record)) + 1;
         if (bytes + size > maxBytes) {
           if (size > maxBytes)
@@ -523,6 +565,7 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
   }
 
   private rememberType(runId: string, encoded: EncodedEnvelope): void {
+    this.routing.set(encoded, this.codec.metadata?.(this.domainEvent(encoded)) ?? {});
     if (encoded.idempotencyKey) {
       const keys = this.byKey.get(runId) ?? new Map<string, EncodedEnvelope>();
       keys.set(encoded.idempotencyKey, encoded);

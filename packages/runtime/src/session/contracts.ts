@@ -381,6 +381,8 @@ export interface SessionReplayState {
 
 /** Rebuildable branch membership and source pointers; no historical bodies. */
 export interface SessionSourceMetadata {
+  readonly timestamp: string;
+  readonly toolName?: string;
   readonly identity: string;
   readonly entryId: string;
   readonly parentId: string | null;

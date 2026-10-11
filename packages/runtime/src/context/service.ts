@@ -1,10 +1,13 @@
+import type { PromptContextItemInput } from '../inference/prompt-material.js';
+import { contextSourceManifest, type ContextInspectionPage } from './inspection.js';
 import {
   readSelectedHistorySources,
+  SELECTED_SOURCE_LIMITS,
   assertPortableHistoryCompatibility
 } from '../orchestration/session-replay.js';
 import { sourceRef } from '../history/reader.js';
 import { contextSourceGroups } from './selection.js';
-import type { ModelProfile, ModelSelection } from '@agent-core/model';
+import type { CompiledModelRequest, ModelProfile, ModelSelection } from '@agent-core/model';
 import { ContextSourceCapacityError } from '../run/context-admission.js';
 import { HistorySourceTooLargeError } from '../history/reader.js';
 import { requestCapacity } from '../inference/request-admission.js';
@@ -80,7 +83,7 @@ export class ContextService {
     if (!Number.isSafeInteger(options.policy.maxSourceBytes) || options.policy.maxSourceBytes < 1)
       throw new Error('Context source selection maxSourceBytes must be positive.');
   }
-  async inspect(cut?: HistorySourceCut) {
+  async inspect(cut?: HistorySourceCut, page?: ContextInspectionPage) {
     cut ??= await this.history.capture();
     const pending = await this.options.repository.loadPendingSubmissions(this.options.session);
     const window = await this.history.selectedContext(cut);
@@ -95,7 +98,7 @@ export class ContextService {
       : undefined;
     return Object.freeze({
       cut,
-      activeSelection: await this.inspectSelection(cut),
+      activeSelection: await this.inspectSelection(cut, page),
       window:
         window && selection
           ? Object.freeze({ ...window, selection: Object.freeze(selection) })
@@ -119,12 +122,30 @@ export class ContextService {
       ...(capacity ? { capacity } : {})
     });
   }
-  private async inspectSelection(cut: HistorySourceCut): Promise<
-    | { readonly status: 'available'; readonly selection: ContextSelection }
+  private async inspectSelection(cut: HistorySourceCut, page?: ContextInspectionPage): Promise<
+    | {
+        readonly status: 'available';
+        readonly selection: ContextSelection;
+        readonly manifest?: ReturnType<typeof contextSourceManifest>;
+      }
     | { readonly status: 'unavailable'; readonly conflict: ContextSourceCapacityError['conflict'] }
   > {
     try {
-      return { status: 'available' as const, selection: await this.selectSources(cut, {}) };
+      const selection = await this.selectSources(cut, {});
+      return {
+        status: 'available',
+        selection,
+        ...(page
+          ? {
+              manifest: contextSourceManifest(
+                cut,
+                (await readSelectedHistorySources(this.history, cut)).entries,
+                await this.protectedSources(cut),
+                page
+              )
+            }
+          : {})
+      };
     } catch (error) {
       if (!(error instanceof ContextSourceCapacityError)) throw error;
       return { status: 'unavailable' as const, conflict: error.conflict };
@@ -147,6 +168,10 @@ export class ContextService {
         readonly inputIdentity: string;
         readonly accounting: import('@agent-core/model').RequestAccounting;
         readonly message?: string;
+        readonly feedback?: {
+          readonly key: string;
+          readonly notice: PromptContextItemInput;
+        };
       }
     | undefined;
   bindRuntime(runtime: NonNullable<ContextService['runtime']>): () => void {
@@ -158,6 +183,55 @@ export class ContextService {
   recordAdmission(value: NonNullable<ContextService['admission']>): void {
     this.admission = Object.freeze(value);
   }
+  /** Reuse unchanged facts; pressure does not create a recurring maintenance instruction. */
+  async capacityFeedback(compiled: CompiledModelRequest) {
+    const view = await readSelectedHistorySources(this.history);
+    const capacity = requestCapacity(compiled.accounting);
+    const sourcePressure =
+      view.sourceBytes >= SELECTED_SOURCE_LIMITS.bytes * 0.8 ||
+      view.entries.length >= SELECTED_SOURCE_LIMITS.entries * 0.8;
+    if (capacity.pressure !== 'continuity' && !sourcePressure) return undefined;
+    const key = hashJson({
+      pressure: capacity.pressure,
+      sourcePressure,
+      branch: view.cut.branchId,
+      window: view.contextWindow?.windowId ?? null,
+      provider: compiled.provider,
+      model: compiled.model,
+      capabilities: compiled.capabilityRevision,
+      limits: compiled.accounting.limits,
+      output: compiled.accounting.outputReservation,
+      reasoning: compiled.accounting.reasoningReservation
+    });
+    if (this.admission?.feedback?.key === key) return this.admission.feedback;
+    const boundary = { inputIdentity: compiled.inputIdentity };
+    return {
+      key,
+      notice: {
+        id: `context-capacity-${hashJson(boundary)}`,
+        sourceUri: `runtime://context-capacity/${compiled.inputIdentity}`,
+        sourceKind: 'generated' as const,
+        representation: 'full' as const,
+        mediaType: 'text/plain',
+        title: 'Context capacity notice',
+        purpose: 'Factual capacity at a captured request boundary, not a user instruction or maintenance requirement.',
+        content: JSON.stringify({
+          ...boundary,
+          capacity,
+          sourceRead: {
+            cut: view.cut,
+            bytes: view.sourceBytes,
+            entries: view.entries.length,
+            limits: SELECTED_SOURCE_LIMITS,
+            pressure: sourcePressure ? 'near_bound' : 'normal'
+          },
+          meaning: 'These measurements describe the compiled candidate before this notice. They are not settled token usage or the session allowance, and do not establish that later results fit. The final request including this notice must pass admission.',
+          options: 'Inspect the live source selection and available operations with context inspection. Release unneeded complete exchanges or explicitly choose a supported context transition when useful. Working-state updates are optional; no summary or history eviction has occurred.'
+        })
+      }
+    };
+  }
+
   currentModel(): ModelSelection {
     const selection = this.runtime?.modelSelection?.();
     if (!selection) throw new Error('Fresh continuation requires the active model selection.');

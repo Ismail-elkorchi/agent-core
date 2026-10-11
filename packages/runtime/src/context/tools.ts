@@ -1,3 +1,4 @@
+import { contextInspectionCursor, contextInspectionSchema } from './inspection.js';
 import { parseJsonObject, parseJsonValue } from '@agent-core/json';
 import {
   defaultToolModelContent,
@@ -39,8 +40,8 @@ export function createContextTools(options: {
     scopedTool({
       name: `${prefix}_inspect`,
       description:
-        'Inspect selected history and current working state, compiled request capacity, admission conflicts, and available context operations.',
-      schema: z.strictObject({}),
+        'Inspect the live selected sources at a captured boundary, including recent exchanges, protected input and native prefix dependencies. Source references can be passed unchanged to context_transition add/release. Continue with cursor for more sources. Capacity describes the last admitted request, not later tool results. No periodic inspection is required.',
+      schema: contextInspectionSchema,
       mode: 'read',
       root: 'context',
       buildModelContent({ observation }) {
@@ -48,7 +49,6 @@ export function createContextTools(options: {
         const result = parseJsonObject(observation.output);
         const admission = result.admission ? parseJsonObject(result.admission) : undefined;
         const accounting = admission ? parseJsonObject(admission.accounting) : undefined;
-        const window = result.window ? parseJsonObject(result.window) : undefined;
         const capacity = result.capacity ? parseJsonObject(result.capacity) : undefined;
         const capacitySummary = capacity
           ? Object.fromEntries(
@@ -62,7 +62,7 @@ export function createContextTools(options: {
             type: 'text',
             text: JSON.stringify({
               admission: admission
-                ? { status: admission.status, message: admission.message }
+                ? { status: admission.status, inputIdentity: admission.inputIdentity, message: admission.message }
                 : 'not_yet_recorded',
               capacity: capacitySummary,
               ...(accounting
@@ -83,7 +83,8 @@ export function createContextTools(options: {
                     }
                   }
                 : {}),
-              selection: window?.selection ?? null,
+              selection: result.activeSelection,
+              committedWindow: result.window,
               workingState: result.workingState,
               protectedSources: result.protectedSources,
               pendingWork: result.pendingWork,
@@ -100,8 +101,31 @@ export function createContextTools(options: {
           scope: scopePath('context', cut.sessionId, cut.branchId)
         };
       },
-      invoke(value) {
-        return options.context.inspect(historyCutSchema.parse(value.authorizedCut));
+      async invoke(value) {
+        const authorized = historyCutSchema.parse(value.authorizedCut);
+        await options.context.history.validateCut(authorized);
+        const page = contextInspectionSchema.parse({
+          cursor: value.cursor,
+          limit: value.limit,
+          maxBytes: value.maxBytes
+        });
+        const cut = page.cursor ? contextInspectionCursor(page.cursor).cut : authorized;
+        if (cut.sessionId !== authorized.sessionId || cut.branchId !== authorized.branchId)
+          throw new Error('Context inspection cursor belongs to another branch.');
+        await options.context.history.validateCut(cut);
+        const inspection = await options.context.inspect(cut, page);
+        const active = inspection.activeSelection;
+        return {
+          ...inspection,
+          activeSelection: active.status === 'available' ? active.manifest : active,
+          window: inspection.window
+            ? {
+                windowId: inspection.window.windowId,
+                historyPosition: inspection.window.historyPosition,
+                strategy: inspection.window.selection.strategy
+              }
+            : null
+        };
       }
     }),
     defineTool({

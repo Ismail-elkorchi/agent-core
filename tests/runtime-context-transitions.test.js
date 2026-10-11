@@ -403,6 +403,7 @@ test(
     assert.equal(inspection.window, null);
     assert.equal(inspection.activeSelection.status, 'unavailable');
     assert.equal(inspection.activeSelection.conflict.kind, 'source_capacity');
+    assert.equal((await inspectTool(state.context)).selection.conflict.kind, 'source_capacity');
     const replacement = await state.context.selectSources(inspection.cut, { retain: [] });
     assert.deepEqual(replacement.retained, await state.context.protectedSources());
     await state.context.transition({
@@ -531,4 +532,170 @@ test('a model-selected fresh context keeps parallel observations and commits sta
   assert.deepEqual(messages.filter(item => item.role === 'tool').map(item => item.toolCallId).sort(), ['context-call', 'fact-call']);
   assert(messages.some(item => item.content?.includes('Original exact evidence.')));
   assert.equal((await f.context.workingState()).text, 'Use original evidence.');
+});
+
+async function inspectTool(context, input = {}) {
+  const tool = createContextTools({ context }).find(tool => tool.name === 'context_inspect');
+  const canonical = await tool.canonicalizeInput(input, {});
+  const execution = await tool.bindExecution(canonical, {});
+  const observation = await execution.invoke({});
+  const content = await tool.buildModelContent({ observation });
+  return JSON.parse(content[0].text);
+}
+
+test('model inspection pages the live selection before a window and includes its later tail', async () => {
+  const f = await fixture();
+  await new AgentRuntime(f.options).run({ task: 'First original' }).result;
+  const initial = await inspectTool(f.context, { limit: 1, maxBytes: 4096 });
+  assert.equal(initial.committedWindow, null);
+  assert.equal(initial.selection.status, 'available');
+  assert.equal(initial.selection.coverage, 'partial');
+  assert.equal(initial.selection.items[0].type, 'input');
+  const captured = initial.selection.cut;
+  await new AgentRuntime(f.options).run({ task: 'Later original' }).result;
+  const second = await inspectTool(f.context, { cursor: initial.selection.cursor, limit: 10, maxBytes: 4096 });
+  assert.deepEqual(second.selection.cut, captured);
+  assert.equal(second.selection.total, initial.selection.total);
+  const full = await inspectTool(f.context);
+  assert(full.selection.items.some(item => item.description.includes('Later original')));
+  const candidate = full.selection.items.find(item => item.type === 'assistant');
+  assert.equal(candidate.group.release, 'available');
+  const reduced = await f.context.selectSources(full.selection.cut, { release: [candidate.source] });
+  assert(!reduced.retained.some(source => source.entryId === candidate.source.entryId));
+  await f.context.request({ idempotencyKey: 'selection', reason: 'Release completed answer', selection: reduced });
+  await new AgentRuntime(f.options).run({ task: 'Tail after committed window' }).result;
+  const current = await inspectTool(f.context, { maxBytes: 16384 });
+  assert(current.committedWindow.windowId);
+  assert(current.selection.items.some(item => item.description.includes('Tail after committed window')));
+  assert(Buffer.byteLength(JSON.stringify(current.selection)) <= 16384);
+  await assert.rejects(inspectTool(f.context, { maxBytes: 1 }), /cannot fit maxBytes/);
+});
+
+test('inspection advertises complete exchange groups and protects the active contribution', async () => {
+  const f = await fixture();
+  const resultTool = defineTool({ name: 'lookup', implementationId: 'lookup@1', description: 'Evidence', schema: z.strictObject({}),
+    outputSchema: z.json(), canonicalizeInput: input => input,
+    deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'facts' }], lockScopes: [], recovery: { kind: 'unknown' } }),
+    effectEnvelope: { accesses: [{ mode: 'read', scope: 'facts' }], lockScopes: [] },
+    invoke: async () => ({ kind: 'result', summary: 'Evidence', output: { fact: 1 }, scope: { resources: [], coverage: 'complete' } }) });
+  let calls = 0;
+  f.provider.complete = async () => ++calls === 1 ? {
+    provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
+    toolCalls: ['left', 'right'].map(id => ({ type: 'function', id, name: 'lookup', input: { kind: 'json', value: {} } }))
+  } : { provider: 'fixture', model: 'context', content: 'done', terminationReason: 'stop' };
+  await new AgentRuntime({ ...f.options, tools: [...f.options.tools, resultTool] }).run({ task: 'Original evidence' }).result;
+  await f.sessions.appendInput(f.session, { runId: 'pending', task: 'Protected latest obligation' });
+  const current = await inspectTool(f.context);
+  const observation = current.selection.items.find(item => item.type === 'observation');
+  const exchange = current.selection.items.filter(item => item.group.id === observation.group.id);
+  assert.equal(exchange.filter(item => item.type === 'observation').length, 2);
+  assert.equal(observation.group.sources, 5);
+  const selection = await f.context.selectSources(current.selection.cut, { release: [observation.source] });
+  assert(exchange.every(item => !selection.retained.some(source => source.entryId === item.source.entryId)));
+  const protectedInput = current.selection.items.find(item => item.description.includes('Protected latest obligation'));
+  assert.equal(protectedInput.group.release, 'protected');
+  assert(selection.retained.some(source => source.entryId === protectedInput.source.entryId));
+});
+
+for (const failNotice of [false, true]) {
+  test(`capacity feedback is admitted before dispatch; optional preparation failure=${failNotice} preserves ordinary admission`, async () => {
+    const f = await fixture();
+    f.setCapacity(10000);
+    let count = 0;
+    const compiled = [];
+    f.provider.compileRequest = async request => {
+      const hasNotice = request.messages.some(item => item.content.includes('Context capacity notice'));
+      if (failNotice && hasNotice) throw new Error('Optional count unavailable');
+      const { signal, ...body } = request;
+      const result = await compileModelRequest({ request, body, profile: await f.provider.describeModel(),
+        endpoint: 'fixture://capacity', providerInputTokens: 9800 + (hasNotice ? 20 : 0) });
+      compiled.push(result);
+      return result;
+    };
+    f.provider.complete = async request => {
+      f.requests.push(request);
+      return ++count < 3 ? { provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
+        toolCalls: [{ type: 'function', id: `inspect-${count}`, name: 'context_inspect', input: { kind: 'json', value: {} } }] }
+        : { provider: 'fixture', model: 'context', content: 'done', terminationReason: 'stop' };
+    };
+    const result = await new AgentRuntime(f.options).run({ task: 'Continue useful work.' }).result;
+    assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+    assert.equal(f.requests.length, 3);
+    const notices = f.requests.map(request => request.messages.filter(item => item.role === 'user' && item.content.includes('Context capacity notice')));
+    assert(notices.every(items => items.length === (failNotice ? 0 : 1)));
+    if (!failNotice) {
+      assert.equal(notices[0][0].content, notices[1][0].content, 'unchanged pressure must not rewrite the notice');
+      assert.match(notices[0][0].content, /not settled token usage/);
+      const final = await f.context.inspect();
+      assert(compiled.some(item => item.inputIdentity === final.admission.inputIdentity));
+      assert.equal(final.capacity.inputTokens, 9820);
+    }
+  });
+}
+
+test('cancelling optional capacity preparation cannot dispatch an ordinary request afterward', async () => {
+  const f = await fixture();
+  const abort = new AbortController();
+  f.setCapacity(10000);
+  f.provider.compileRequest = async request => {
+    if (request.messages.some(item => item.content.includes('Context capacity notice'))) {
+      abort.abort(new Error('User cancelled.'));
+      request.signal.throwIfAborted();
+    }
+    const { signal, ...body } = request;
+    return compileModelRequest({ request, body, profile: await f.provider.describeModel(),
+      endpoint: 'fixture://capacity', providerInputTokens: 9800 });
+  };
+  const result = await new AgentRuntime(f.options).run({ task: 'Continue.', signal: abort.signal }).result;
+  assert.notEqual(result.terminal?.executionStatus, 'completed');
+  assert.equal(f.requests.length, 0);
+});
+
+test('source-bound feedback is independent of compiled token pressure', async () => {
+  const f = await fixture();
+  for (let i = 0; i < 8; i++)
+    await f.sessions.appendInput(f.session, { runId: `source-${i}`, task: 'x'.repeat(850000) });
+  const compiled = await compileModelRequest({ request: { model: 'context', messages: [{ role: 'user', content: 'small' }] },
+    body: { input: 'small' }, profile: await f.provider.describeModel(), endpoint: 'fixture://capacity', providerInputTokens: 100 });
+  const feedback = await f.context.capacityFeedback(compiled);
+  const notice = JSON.parse(feedback.notice.content);
+  assert.equal(notice.capacity.pressure, 'normal');
+  assert.equal(notice.sourceRead.pressure, 'near_bound');
+  assert(notice.sourceRead.bytes >= 6800000);
+  assert.deepEqual(notice.sourceRead.cut, await f.history.capture());
+});
+
+test('inspection discloses native prefix dependencies and calls announced before execution starts', async () => {
+  const { createProviderContextState } = await import('@agent-core/model');
+  const f = await fixture();
+  await f.sessions.appendInput(f.session, { runId: 'bound', task: 'Protected obligation' });
+  const native = await createProviderContextState({ protocolRevision: 'fixture-v1', provider: 'fixture',
+    endpoint: 'fixture://native', request: { model: 'context', messages: [{ role: 'user', content: 'Protected obligation' }] },
+    requestId: 'native-request', kind: 'signed', requiresExactPrefix: true, data: { opaque: 'provider-only' } });
+  await f.sessions.appendAssistant(f.session, { runId: 'bound',
+    identity: { turnId: 'turn', turnIndex: 1, requestAttempt: 1 }, content: '',
+    output: [{ type: 'protocol', state: native }, { type: 'tool_call', toolCall: {
+      id: 'pending', type: 'function', name: 'lookup', input: { kind: 'json', value: {} }
+    } }] });
+  const presented = await inspectTool(f.context);
+  assert.equal(presented.selection.items.length, 2);
+  assert(presented.selection.items.every(item => item.group.prefixBound && item.group.release === 'unfinished_exchange'));
+  assert.equal(new Set(presented.selection.items.map(item => item.group.id)).size, 1);
+  assert.doesNotMatch(JSON.stringify(presented.selection), /provider-only/);
+});
+
+
+test('every returned manifest cursor is accepted as tool input, including large captured boundaries', async () => {
+  const f = await fixture();
+  for (let i = 0; i < 200; i++)
+    await f.sessions.appendInput(f.session, { runId: `pending-${i}-${'x'.repeat(180)}`, task: `Original ${i}` });
+  const first = await inspectTool(f.context, { limit: 1, maxBytes: 256 * 1024 });
+  assert(first.selection.cursor.length > 32768);
+  const nextInput = { cursor: first.selection.cursor, limit: 1, maxBytes: 256 * 1024 };
+  const tool = createContextTools({ context: f.context }).find(tool => tool.name === 'context_inspect');
+  assert.equal(tool.decodeInput({ kind: 'json', value: nextInput }).ok, true);
+  const next = await inspectTool(f.context, nextInput);
+  assert.deepEqual(next.selection.cut, first.selection.cut);
+  assert.equal(next.selection.offset, 1);
+  assert.notEqual(next.selection.items[0].source.entryId, first.selection.items[0].source.entryId);
 });

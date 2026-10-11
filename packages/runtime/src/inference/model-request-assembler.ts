@@ -37,6 +37,7 @@ export interface ModelRequestAssemblyInput {
   readonly instructions: readonly PromptInstructionBlock[];
   readonly contextItems?: readonly PromptContextItemInput[];
   readonly workingState?: PromptContextItemInput;
+  readonly capacityNotice?: PromptContextItemInput;
   readonly tools: readonly PromptToolSummary[];
   readonly modelProfile: ModelProfile;
   readonly metadata?: Readonly<Record<string, string>>;
@@ -68,12 +69,14 @@ export class ModelRequestAssembler {
     const prior = input.window.priorMessagesFor(input.modelProfile);
     const context = deliverPromptContext(input.contextItems ?? [], this.estimator);
     const state = deliverPromptContext(input.workingState ? [input.workingState] : [], this.estimator);
+    const notices = deliverPromptContext(input.capacityNotice ? [input.capacityNotice] : [], this.estimator);
     const material = createPromptMaterial({
       task: input.task,
       ...(input.images === undefined ? {} : { images: input.images }),
       instructions: input.instructions,
       context: context.items,
       ...(state.items[0] ? { workingState: state.items[0] } : {}),
+      ...(notices.items[0] ? { capacityNotice: notices.items[0] } : {}),
       tools: input.tools,
       ...(input.metadata ? { metadata: input.metadata } : {})
     });
@@ -91,6 +94,7 @@ export class ModelRequestAssembler {
       }
     );
     const presentation: RequestPresentation = {
+      ...(material.capacityNotice ? { capacityNotice: hashJson(renderContext([material.capacityNotice])) } : {}),
       authority: hashJson(
         messages.filter((item) => item.role === 'system' || item.role === 'developer')
       ),
@@ -152,6 +156,11 @@ export class ModelRequestAssembler {
         presentation.workingState !== bound.input.presentation.workingState &&
         material.workingState
           ? [{ role: 'user' as const, content: renderContext([material.workingState]) }]
+          : []),
+        ...(!input.conversationOnly &&
+        presentation.capacityNotice !== bound.input.presentation.capacityNotice &&
+        material.capacityNotice
+          ? [{ role: 'user' as const, content: renderContext([material.capacityNotice]) }]
           : [])
       ];
     }
@@ -163,8 +172,8 @@ export class ModelRequestAssembler {
       messages,
       historyMessages: history.messages,
       context: Object.freeze({
-        items: Object.freeze([...context.items, ...state.items]),
-        totalTokens: context.totalTokens + state.totalTokens
+        items: Object.freeze([...context.items, ...state.items, ...notices.items]),
+        totalTokens: context.totalTokens + state.totalTokens + notices.totalTokens
       }),
       estimate: Object.freeze({
         modelWindowTokens: accountModelRequest(
@@ -172,7 +181,7 @@ export class ModelRequestAssembler {
           input.modelProfile,
           { estimator: this.estimator }
         ).estimatedInputTokens,
-        contextTokens: context.totalTokens + state.totalTokens
+        contextTokens: context.totalTokens + state.totalTokens + notices.totalTokens
       })
     });
   }
@@ -237,7 +246,10 @@ export async function compilePromptMaterial(
     ...instructionMessages.filter((item) => item.role === 'user' && !options.conversationOnly),
     ...(taskMessage ? [taskMessage] : []),
     ...conversation.current,
-    ...(workingState && !options.conversationOnly ? [workingState] : [])
+    ...(workingState && !options.conversationOnly ? [workingState] : []),
+    ...(material.capacityNotice && !options.conversationOnly
+      ? [{ role: 'user' as const, content: renderContext([material.capacityNotice]) }]
+      : [])
   ]);
 }
 
