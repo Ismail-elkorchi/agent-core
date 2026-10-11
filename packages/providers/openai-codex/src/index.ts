@@ -526,6 +526,7 @@ class OpenAICodexProviderSession implements ModelProviderSession {
   private webSocketAffinityKey: string | undefined;
   private readonly defaultAffinityKey = randomUUID();
   private webSocketFallbackReported = false;
+  private webSocketRequestActive = false;
   private lastRequest: Record<string, unknown> | undefined;
   private lastResponse: CodexContinuationResponse | undefined;
 
@@ -557,38 +558,50 @@ class OpenAICodexProviderSession implements ModelProviderSession {
   }
 
   async *stream(request: ModelRequest, options?: ModelTransportOptions): AsyncIterable<ModelStreamEvent> {
-    request = (await this.provider.compileRequest(request)).logicalRequest;
-    if (!this.provider.shouldUseWebSocket()) {
-      yield* this.streamHttp(request, options);
-      return;
-    }
-
-    let emittedModelEvent = false;
+    const websocket = this.provider.shouldUseWebSocket();
+    if (websocket && this.webSocketRequestActive)
+      throw new ModelProviderError({
+        provider: this.provider.id,
+        code: 'invalid_request',
+        message: 'A Codex WebSocket request is already active in this session. Use separate sessions for parallel requests.'
+      });
+    if (websocket) this.webSocketRequestActive = true;
     try {
-      for await (const event of this.streamWebSocket(request, options)) {
-        if (event.type === 'content' || event.type === 'reasoning' || event.type === 'tool_call') {
-          emittedModelEvent = true;
+      request = (await this.provider.compileRequest(request)).logicalRequest;
+      if (!websocket) {
+        yield* this.streamHttp(request, options);
+        return;
+      }
+
+      let emittedModelEvent = false;
+      try {
+        for await (const event of this.streamWebSocket(request, options)) {
+          if (event.type === 'content' || event.type === 'reasoning' || event.type === 'tool_call') {
+            emittedModelEvent = true;
+          }
+          yield event;
         }
-        yield event;
+      } catch (error) {
+        this.resetContinuation('websocket_error');
+        const webSocketError = websocketFailureError(
+          this.provider.id,
+          error,
+          emittedModelEvent ? 'after_model_event' : 'before_model_event'
+        );
+        if (emittedModelEvent || isWebSocketProviderResponseFailure(webSocketError)) {
+          throw webSocketError;
+        }
+        if (!this.webSocketFallbackReported) {
+          this.webSocketFallbackReported = true;
+          yield {
+            type: 'status',
+            message: `OpenAI Codex WebSocket unavailable; transport=websocket; phase=before_model_event; falling back to transport=http_sse: ${errorMessage(error)}`
+          };
+        }
+        yield* this.streamHttp(request, options);
       }
-    } catch (error) {
-      this.resetContinuation('websocket_error');
-      const webSocketError = websocketFailureError(
-        this.provider.id,
-        error,
-        emittedModelEvent ? 'after_model_event' : 'before_model_event'
-      );
-      if (emittedModelEvent || isWebSocketProviderResponseFailure(webSocketError)) {
-        throw webSocketError;
-      }
-      if (!this.webSocketFallbackReported) {
-        this.webSocketFallbackReported = true;
-        yield {
-          type: 'status',
-          message: `OpenAI Codex WebSocket unavailable; transport=websocket; phase=before_model_event; falling back to transport=http_sse: ${errorMessage(error)}`
-        };
-      }
-      yield* this.streamHttp(request, options);
+    } finally {
+      if (websocket) this.webSocketRequestActive = false;
     }
   }
 

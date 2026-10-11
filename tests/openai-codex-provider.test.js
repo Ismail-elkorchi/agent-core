@@ -1467,6 +1467,110 @@ function bearerProvider(token) {
   };
 }
 
+test(
+  'Codex WebSocket sessions reject overlapping requests before dispatch and remain reusable',
+  { timeout: 10000 },
+  async () => {
+    const firstSent = Promise.withResolvers();
+    const overlap = Promise.withResolvers();
+    const socket = new FakeCodexWebSocket();
+    socket.send = function (value) {
+      this.sent.push(value);
+      if (this.sent.length === 1) firstSent.resolve();
+      else overlap.resolve({ kind: 'sent' });
+    };
+    const provider = new OpenAICodexProvider({
+      auth: bearerProvider(codexJwt()),
+      transport: 'websocket',
+      webSocketFactory: () => socket
+    });
+    const session = provider.createSession();
+    const request = (text) => ({ model: 'gpt-5.6', messages: [{ role: 'user', content: text }] });
+    const first = session.complete(request('First task'));
+    await firstSent.promise;
+    const second = session.complete(request('Different task'));
+    const result = second.then(
+      (value) => ({ kind: 'response', value }),
+      (error) => ({ kind: 'error', error })
+    );
+    const complete = (text) =>
+      socket.emitJson({
+        type: 'response.completed',
+        response: { id: text, model: 'gpt-5.6', status: 'completed', output_text: text }
+      });
+    try {
+      const outcome = await Promise.race([result, overlap.promise]);
+      assert.equal(
+        outcome.kind,
+        'error',
+        "overlap must not share another request's response reader"
+      );
+      assert.equal(outcome.error.code, 'invalid_request');
+      assert.match(outcome.error.message, /already active/);
+      assert.equal(socket.sent.length, 1);
+      complete('First answer');
+      assert.equal((await first).content, 'First answer');
+      socket.send = () => complete('Following answer');
+      assert.equal((await session.complete(request('Following task'))).content, 'Following answer');
+    } finally {
+      complete('cleanup');
+      await Promise.allSettled([first, second]);
+      await session.close();
+    }
+  }
+);
+
+test(
+  'separate Codex WebSocket sessions execute concurrently without sharing responses',
+  { timeout: 10000 },
+  async () => {
+    const sent = [Promise.withResolvers(), Promise.withResolvers()];
+    const sockets = [];
+    const provider = new OpenAICodexProvider({
+      auth: bearerProvider(codexJwt()),
+      transport: 'websocket',
+      webSocketFactory: () => {
+        const socket = new FakeCodexWebSocket();
+        const index = sockets.length;
+        sockets.push(socket);
+        socket.send = () => sent[index].resolve();
+        return socket;
+      }
+    });
+    const first = provider.createSession();
+    const second = provider.createSession();
+    const firstAnswer = first.complete({
+      model: 'gpt-5.6',
+      messages: [{ role: 'user', content: 'First task' }]
+    });
+    await sent[0].promise;
+    const secondAnswer = second.complete({
+      model: 'gpt-5.6',
+      messages: [{ role: 'user', content: 'Second task' }]
+    });
+    await sent[1].promise;
+    try {
+      for (const index of [1, 0])
+        sockets[index].emitJson({
+          type: 'response.completed',
+          response: {
+            id: `response-${index}`,
+            model: 'gpt-5.6',
+            status: 'completed',
+            output_text: `Answer ${index}`
+          }
+        });
+      assert.deepEqual(
+        (await Promise.all([firstAnswer, secondAnswer])).map((response) => response.content),
+        ['Answer 0', 'Answer 1']
+      );
+    } finally {
+      await first.close();
+      await second.close();
+    }
+  }
+);
+
 for (const terminal of ['completed', 'incomplete'])
   test(`Codex WebSocket preserves a ${terminal} response received before socket closure`, async () => {
     let fallbacks = 0;
