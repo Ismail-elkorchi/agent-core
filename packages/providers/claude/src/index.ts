@@ -34,6 +34,7 @@ import {
 } from '@agent-core/model';
 import {
   readBoundedJsonResponse,
+  decodeHttpFailure,
   readBoundedResponseText,
   readJsonSseEvents
 } from '@agent-core/provider-openai-responses';
@@ -604,15 +605,21 @@ export class ClaudeProvider implements ModelProvider {
         message: 'Claude transport failed.', retryable: true, cause });
     });
     if (!response.ok) {
-      await readBoundedResponseText(response);
-      throw this.error(
-        response.status === 429
-          ? 'rate_limited'
-          : response.status >= 500
-            ? 'provider_unavailable'
-            : 'invalid_request',
-        `Claude HTTP ${String(response.status)}.`
-      );
+      const { text: body, truncated } = await readBoundedResponseText(response);
+      const failure = decodeHttpFailure(response.status, body);
+      throw new ModelProviderError({
+        provider: this.id,
+        ...failure,
+        message: `Claude HTTP ${String(response.status)}: ${failure.message}`,
+        diagnostic: {
+          transport: 'http',
+          causeSummary: {
+            status: response.status,
+            errorMessage: failure.message,
+            ...(truncated ? { bodyTruncated: true } : {})
+          }
+        }
+      });
     }
     return response;
   }

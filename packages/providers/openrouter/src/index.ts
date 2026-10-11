@@ -23,7 +23,6 @@ import {
   type ModelPricing,
   type ModelProfile,
   type ModelProvider,
-  type ModelProviderErrorCode,
   type ModelProviderInfo,
   type ModelReasoningRequest,
   type ModelRequest,
@@ -36,6 +35,7 @@ import {
   type ModelUsage
 } from '@agent-core/model';
 import {
+  decodeHttpFailure,
   readBoundedJsonResponse,
   readBoundedResponseText,
   readJsonSseEvents,
@@ -1021,13 +1021,14 @@ function throwIfOpenRouterError(
   afterVisibleContent: boolean
 ): void {
   if (!payload.error) return;
-  const message = payload.error.message ?? 'OpenRouter returned an error payload.';
   const code = typeof payload.error.code === 'number' ? payload.error.code : Number(payload.error.code);
+  const failure = decodeHttpFailure(code, payload);
+  const message = failure.message;
   throw new ModelProviderError({
     provider,
-    code: Number.isFinite(code) ? classifyStatus(code, message) : 'provider_unavailable',
+    code: Number.isFinite(code) ? failure.code : 'provider_unavailable',
     message: `OpenRouter response error: ${message}`,
-    retryable: !afterVisibleContent && (code === 429 || code >= 500),
+    retryable: !afterVisibleContent && failure.retryable,
     cause: payload,
     diagnostic: {
       transport: 'http_sse',
@@ -1233,12 +1234,13 @@ async function throwIfBadResponse(provider: string, response: Response): Promise
   }
   const { text: body, truncated } = await readBoundedResponseText(response);
   const retryAfterMs = retryAfterMilliseconds(response.headers.get('retry-after'));
-  const extractedMessage = extractErrorMessage(body);
+  const failure = decodeHttpFailure(response.status, body);
+  const extractedMessage = failure.message;
   throw new ModelProviderError({
     provider,
-    code: classifyStatus(response.status, body),
+    code: failure.code,
     message: `OpenRouter request failed with HTTP ${String(response.status)}: ${extractedMessage}`,
-    retryable: response.status === 429 || response.status >= 500,
+    retryable: failure.retryable,
     diagnostic: {
       transport: 'http',
       causeSummary: {
@@ -1303,34 +1305,6 @@ function parseOpenRouterModelResponse(value: unknown): ModelResponse {
       });
     }
     throw error;
-  }
-}
-
-function classifyStatus(status: number, body: string): ModelProviderErrorCode {
-  if (status === 404) return 'model_unavailable';
-  if (status === 408 || status === 413 || /context|token|too large/i.test(body)) return 'context_overflow';
-  if (status === 429) return 'rate_limited';
-  if (status === 400 || status === 401 || status === 402 || status === 403 || status === 422)
-    return 'invalid_request';
-  if (status >= 500) return 'provider_unavailable';
-  return 'unknown';
-}
-
-function extractErrorMessage(body: string): string {
-  if (body.length === 0) {
-    return 'empty response body';
-  }
-  try {
-    const parsed: unknown = JSON.parse(body);
-    if (!isJsonObject(parsed)) return body;
-    const error = isJsonObject(parsed.error) ? parsed.error : undefined;
-    return typeof error?.message === 'string'
-      ? error.message
-      : typeof parsed.message === 'string'
-        ? parsed.message
-        : body;
-  } catch {
-    return body;
   }
 }
 

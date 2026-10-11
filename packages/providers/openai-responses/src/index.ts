@@ -1,3 +1,5 @@
+import { classifyModelHttpFailure, type ModelProviderError } from '@agent-core/model';
+
 export const DEFAULT_SSE_BUFFER_BYTES = 1_048_576;
 export const DEFAULT_DIAGNOSTIC_BODY_BYTES = 65_536;
 export const DEFAULT_JSON_BODY_BYTES = 33_554_432;
@@ -236,6 +238,49 @@ export async function readBoundedJsonResponse(
   const result = await readBoundedResponseText(response, maximumBytes);
   if (result.truncated) throw new Error(`JSON response exceeded the ${String(maximumBytes)} byte limit.`);
   return JSON.parse(result.text) as unknown;
+}
+
+/** Decode the shared JSON error envelope without inferring control state from its prose. */
+export function decodeHttpFailure(
+  status: number,
+  body: unknown
+): Pick<ModelProviderError, 'message' | 'code' | 'retryable'> {
+  const text = typeof body === 'string' ? body : undefined;
+  if (text !== undefined)
+    try {
+      body = JSON.parse(text) as unknown;
+    } catch {
+      // Gateways may return plain text or HTML; retain the bounded original diagnostic.
+    }
+  const envelope = isRecord(body) ? body : undefined;
+  const error = isRecord(envelope?.error) ? envelope.error : envelope;
+  const metadata = isRecord(error?.metadata) ? error.metadata : undefined;
+  const message =
+    typeof error?.message === 'string'
+      ? error.message
+      : typeof envelope?.error === 'string'
+        ? envelope.error
+        : text !== undefined && text.length > 0
+          ? text
+          : 'Provider request failed.';
+  if (
+    status === 429 &&
+    (error?.type === 'insufficient_quota' ||
+      error?.code === 'credit_balance_exhausted' ||
+      error?.code === 'organization_spend_limit_exceeded' ||
+      error?.code === 'project_spend_limit_exceeded' ||
+      error?.code === 'organization_usage_limit_exceeded')
+  ) {
+    return { code: 'invalid_request', retryable: false, message };
+  }
+  return {
+    ...classifyModelHttpFailure(
+      status,
+      error?.code === 'context_length_exceeded' ||
+        metadata?.error_type === 'context_length_exceeded'
+    ),
+    message
+  };
 }
 
 export function decodeResponsesPayload(value: unknown, label = 'Responses response'): ResponsesPayload {

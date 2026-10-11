@@ -47,6 +47,7 @@ import {
   type ModelUsage
 } from '@agent-core/model';
 import {
+  decodeHttpFailure,
   decodeResponsesPayload,
   decodeResponsesStreamData,
   readBoundedJsonResponse,
@@ -895,12 +896,13 @@ export class OpenAIProvider implements ModelProvider {
     if (response.status === 401) {
       await this.tokenProvider.invalidate?.('unauthorized');
     }
-    const extractedMessage = extractErrorMessage(body);
+    const failure = decodeHttpFailure(response.status, body);
+    const extractedMessage = failure.message;
     throw new ModelProviderError({
       provider: this.id,
-      code: classifyStatus(response.status, body),
+      code: failure.code,
       message: `OpenAI request failed with HTTP ${String(response.status)}: ${extractedMessage}`,
-      retryable: response.status === 429 || response.status >= 500,
+      retryable: failure.retryable,
       diagnostic: {
         transport: 'http',
         causeSummary: {
@@ -1747,38 +1749,6 @@ function authErrorCodeToModelCode(error: AuthError): ModelProviderErrorCode {
     return 'provider_unavailable';
   }
   return 'invalid_request';
-}
-
-function classifyStatus(status: number, body: string): ModelProviderErrorCode {
-  if (status === 404) return 'model_unavailable';
-  if (status === 408 || status === 413 || /context|token|too large/i.test(body))
-    return 'context_overflow';
-  if (status === 429) return 'rate_limited';
-  if (status === 400 || status === 401 || status === 402 || status === 403 || status === 422)
-    return 'invalid_request';
-  if (status >= 500) return 'provider_unavailable';
-  return 'unknown';
-}
-
-function extractErrorMessage(body: string): string {
-  if (body.length === 0) {
-    return 'empty response body';
-  }
-  try {
-    const parsed: unknown = JSON.parse(body);
-    if (isJsonObject(parsed)) {
-      const error = parsed.error;
-      if (isJsonObject(error) && typeof error.message === 'string') {
-        return error.message;
-      }
-      if (typeof parsed.message === 'string') {
-        return parsed.message;
-      }
-    }
-    return body;
-  } catch {
-    return body;
-  }
 }
 
 function summarizeOpenAIFailure(payload: OpenAIStreamData | OpenAIResponsesPayload): {

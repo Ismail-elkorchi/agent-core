@@ -7,6 +7,7 @@ import {
   type ModelToolCall
 } from '@agent-core/model';
 import {
+  decodeHttpFailure,
   decodeResponsesStreamData,
   readBoundedResponseText,
   readJsonSseEvents,
@@ -15,8 +16,6 @@ import {
 
 import { CONTENT_TYPE_JSON } from './constants.js';
 import {
-  classifyStatus,
-  extractErrorMessage,
   normalizeError,
   parseCodexModelResponse,
   summarizeCodexFailure
@@ -267,12 +266,13 @@ async function throwIfBadResponse(config: CodexHttpTransportConfig, response: Re
   if (response.status === 401) {
     await config.tokenProvider.invalidate?.('unauthorized');
   }
-  const extractedMessage = extractErrorMessage(body);
+  const failure = decodeHttpFailure(response.status, body);
+  const extractedMessage = failure.message;
   throw new ModelProviderError({
     provider: config.providerId,
-    code: classifyStatus(response.status, body),
+    code: failure.code,
     message: `OpenAI Codex request failed with HTTP ${String(response.status)}: ${extractedMessage}`,
-    retryable: response.status === 429 || response.status >= 500,
+    retryable: failure.retryable,
     diagnostic: {
       transport: 'http_sse',
       causeSummary: {

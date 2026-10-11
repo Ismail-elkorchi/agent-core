@@ -551,6 +551,26 @@ export type ModelProviderErrorCode =
   | 'aborted'
   | 'unknown';
 
+/** HTTP transport evidence; only an explicit provider diagnostic proves context overflow. */
+export function classifyModelHttpFailure(
+  status: number,
+  contextOverflow = false
+): Pick<ModelProviderError, 'code' | 'retryable'> {
+  if (status === 429) return { code: 'rate_limited', retryable: true };
+  if (status === 408 || status >= 500)
+    return { code: 'provider_unavailable', retryable: true };
+  if (status === 404) return { code: 'model_unavailable', retryable: false };
+  if (status >= 400 && status < 500)
+    return {
+      code:
+        contextOverflow && [400, 413, 422].includes(status)
+          ? 'context_overflow'
+          : 'invalid_request',
+      retryable: false
+    };
+  return { code: 'unknown', retryable: false };
+}
+
 export type ModelProviderErrorDiagnosticValue = string | number | boolean | null;
 
 export interface ModelProviderErrorDiagnostic {

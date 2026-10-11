@@ -56,36 +56,6 @@ export function parseCodexModelResponse(value: unknown): ModelResponse {
   }
 }
 
-export function classifyStatus(status: number, body: string): ModelProviderErrorCode {
-  if (status === 404) return 'model_unavailable';
-  if (status === 408 || status === 413 || /context|token|too large/i.test(body)) return 'context_overflow';
-  if (status === 429) return 'rate_limited';
-  if (status === 400 || status === 401 || status === 402 || status === 403 || status === 422) return 'invalid_request';
-  if (status >= 500) return 'provider_unavailable';
-  return 'unknown';
-}
-
-export function extractErrorMessage(body: string): string {
-  if (body.length === 0) {
-    return 'empty response body';
-  }
-  try {
-    const parsed: unknown = JSON.parse(body);
-    if (isJsonObject(parsed)) {
-      const error = parsed.error;
-      if (isJsonObject(error) && typeof error.message === 'string') {
-        return error.message;
-      }
-      if (typeof parsed.message === 'string') {
-        return parsed.message;
-      }
-    }
-    return body;
-  } catch {
-    return body;
-  }
-}
-
 export function summarizeCodexFailure(payload: OpenAICodexStreamData | OpenAICodexResponsesPayload): {
   message: string;
   eventType?: string;

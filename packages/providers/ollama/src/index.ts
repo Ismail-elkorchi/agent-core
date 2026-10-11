@@ -1,6 +1,7 @@
 import { parseJsonObject } from '@agent-core/json';
 import {
   assertModelRequestSupported,
+  classifyModelHttpFailure,
   assertProviderContextCompatible,
   type CompiledModelRequest,
   compileModelRequest,
@@ -18,7 +19,6 @@ import {
   type ModelProfile,
   type ModelProvider,
   ModelProviderError,
-  type ModelProviderErrorCode,
   type ModelProviderInfo,
   type ModelReasoningRequest,
   type ModelRequest,
@@ -607,12 +607,18 @@ export class OllamaProvider implements ModelProvider {
       });
     }
     const statusCode = statusCodeFromError(error);
-    const code = classifyError(message, statusCode);
+    const unsupportedTools =
+      /does not support tools|tools?.*not supported|tool calling.*not supported/iu.test(message);
+    const classification =
+      statusCode === undefined
+        ? unsupportedTools
+          ? { code: 'invalid_request' as const, retryable: false }
+          : { code: 'provider_unavailable' as const, retryable: true }
+        : classifyModelHttpFailure(statusCode);
     return new ModelProviderError({
       provider: this.id,
-      code,
+      ...classification,
       message: `Ollama request failed: ${message}`,
-      retryable: code === 'provider_unavailable' || code === 'rate_limited',
       cause: error
     });
   }
@@ -995,30 +1001,6 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
     retryable: false,
     cause: signal.reason
   });
-}
-
-function classifyError(message: string, statusCode: number | undefined): ModelProviderErrorCode {
-  if (statusCode === 404 || /not found|model .* not found/i.test(message)) {
-    return 'model_unavailable';
-  }
-  if (
-    statusCode === 400 ||
-    /invalid|bad request|schema|format|does not support tools|tools?.*not supported|tool calling.*not supported/i.test(
-      message
-    )
-  ) {
-    return 'invalid_request';
-  }
-  if (statusCode === 408 || /context|token|too large|maximum context/i.test(message)) {
-    return 'context_overflow';
-  }
-  if (statusCode === 429 || /rate.?limit|too many requests/i.test(message)) {
-    return 'rate_limited';
-  }
-  if (/malformed|invalid json/i.test(message)) {
-    return 'malformed_response';
-  }
-  return 'provider_unavailable';
 }
 
 function statusCodeFromError(error: unknown): number | undefined {
