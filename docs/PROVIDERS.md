@@ -42,10 +42,10 @@ cap parameter.
 | Protocol family | Preserved state | Native execution boundary |
 | --- | --- | --- |
 | OpenAI Responses | Required reasoning items and exact continuation identities | Native steering requires the supported model profile and WebSocket transport; async tools and compaction require their explicit capability declarations. |
-| Codex Responses | Subscription-compatible reasoning and conservative continuation | Platform native steering is not inferred from the shared Responses format. |
+| Codex Responses | Subscription-compatible reasoning and conservative continuation | Explicit subscription compaction trigger; Platform native steering is not inferred from the shared Responses format. |
 | OpenRouter Chat Completions | Original reasoning content/details and tool-call associations | Ordinary response/tool-result boundaries; routed capabilities come from the declared profile. |
 | Ollama Chat | Declared thinking output and native tool-call associations | Ordinary request/response execution with explicit unsupported-control errors. |
-| Claude Messages | Thinking signatures and redacted-thinking blocks in original order | Ordinary Messages execution; no advertised native steering, async tools, or context editing. |
+| Claude Messages | Thinking and compaction signatures and redacted-thinking blocks in original order | Declared on-demand native compaction through governed Messages; no advertised steering, async tools, or inline context editing. |
 
 These are adapter conformance claims. They do not establish model quality or live
 account availability. Qwen/Kimi/GLM-compatible Chat fixtures exercise routed wire

@@ -14,6 +14,7 @@ import {
   type RequestEstimator
 } from '@agent-core/model';
 import { randomUUID } from 'node:crypto';
+import type { AdmittedModelInput } from './input.js';
 
 export interface ModelWindowMessages {
   readonly messages: readonly ModelInputItem[];
@@ -67,6 +68,30 @@ export interface RecordToolResultInput {
 }
 
 export class ModelWindow {
+  private admittedInput: AdmittedModelInput | undefined;
+  private boundInput:
+    | {
+        readonly input: AdmittedModelInput;
+        readonly prior: ModelInputItem[];
+        readonly current: ModelInputItem[];
+      }
+    | undefined;
+
+  recordAdmission(input: AdmittedModelInput): void {
+    this.admittedInput = input;
+  }
+
+  bindContinuation(input: AdmittedModelInput): void {
+    this.boundInput = { input, prior: [], current: [] };
+  }
+
+  continuation(): {
+    readonly input: AdmittedModelInput;
+    readonly prior: readonly ModelInputItem[];
+    readonly current: readonly ModelInputItem[];
+  } | undefined {
+    return this.boundInput;
+  }
   private readonly estimator: RequestEstimator;
   private readonly activeItems: ActiveWindowItem[] = [];
   private readonly priorItems = new Map<string, ModelInputItem>();
@@ -104,9 +129,19 @@ export class ModelWindow {
       turnIndex,
       message: owned
     });
+    this.boundInput?.current.push(owned);
   }
 
   recordModelOutput(input: RecordModelOutputInput): void {
+    if (
+      input.output?.some(
+        (item) => item.type === 'protocol' && item.state.compatibility.requiresExactPrefix
+      )
+    ) {
+      if (!this.admittedInput)
+        throw new Error('Prefix-bound reasoning is missing its admitted inference input.');
+      this.bindContinuation(this.admittedInput);
+    }
     for (const item of modelOutputToInput(modelResponseOutput(input)))
       this.recordInput(`output_${randomUUID()}`, item, input.turnIndex);
   }
@@ -124,6 +159,7 @@ export class ModelWindow {
       item.callId = input.callId;
     }
     this.activeItems.push(item);
+    this.boundInput?.current.push(item.immediateMessage);
   }
 
   /** Removes incompatible native material from attention; immutable history remains unchanged. */
@@ -138,11 +174,18 @@ export class ModelWindow {
       invalidated.push({ state: message.state, reason });
       return true;
     };
-    for (const [id, message] of this.priorItems) if (invalid(message)) this.priorItems.delete(id);
-    this.transformedInput = Object.freeze(this.transformedInput.filter((message) => !invalid(message)));
+    for (const [id, message] of this.priorItems)
+      if (invalid(message)) this.priorItems.delete(id);
+    this.transformedInput = Object.freeze(
+      this.transformedInput.filter((message) => !invalid(message))
+    );
     for (let index = this.activeItems.length - 1; index >= 0; index--) {
       const item = this.activeItems[index];
       if (item?.kind === 'message' && invalid(item.message)) this.activeItems.splice(index, 1);
+    }
+    if (invalidated.length) {
+      this.admittedInput = undefined;
+      this.boundInput = undefined;
     }
     return Object.freeze(invalidated);
   }
@@ -163,6 +206,7 @@ export class ModelWindow {
     if (prior && canonicalJsonString(prior) !== canonicalJsonString(owned))
       throw new Error(`History source ${sourceId} changed its immutable content.`);
     this.priorItems.set(sourceId, owned);
+    if (!prior) this.boundInput?.prior.push(owned);
   }
 
   /** A provider-transformed window precedes ordinary reference material and conversation. */
@@ -180,6 +224,8 @@ export class ModelWindow {
     this.priorItems.clear();
     for (const [source, item] of window.priorItems) this.priorItems.set(source, item);
     this.transformedInput = window.transformedInput;
+    this.admittedInput = window.admittedInput;
+    this.boundInput = window.boundInput;
   }
 
   assertImagesAdmitted(messages: readonly ModelInputItem[], profile: ModelProfile): void {

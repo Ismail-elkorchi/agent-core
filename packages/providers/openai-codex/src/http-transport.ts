@@ -2,7 +2,7 @@ import { type BearerTokenProvider } from '@agent-core/auth';
 import { parseJsonValue } from '@agent-core/json';
 import {
   ModelProviderError,
-  type ModelRequest,
+  type CompiledModelRequest,
   type ModelStreamEvent,
   type ModelToolCall
 } from '@agent-core/model';
@@ -36,7 +36,6 @@ import {
   toolCallFromOutputItem
 } from './events.js';
 import { accountIdFromToken } from './oauth.js';
-import { toCodexResponsesRequest } from './request.js';
 import { stringValue, throwIfAborted } from './utils.js';
 
 export interface CodexHttpTransportConfig {
@@ -53,17 +52,19 @@ export interface CodexHttpTransportConfig {
 
 async function fetchCodexResponse(
   config: CodexHttpTransportConfig,
-  request: ModelRequest,
-  signal: AbortSignal | undefined = request.signal
+  compiled: CompiledModelRequest,
+  signal: AbortSignal | undefined
 ): Promise<Response> {
   try {
     const token = await config.tokenProvider.getBearerToken(signal);
     const accountId = accountIdFromToken(token);
     const init: RequestInit = {
       method: 'POST',
-      headers: { ...requestHeaders(token.token, accountId, true, config.originator),
-        'session-id': config.affinityKey },
-      body: JSON.stringify(toCodexResponsesRequest(request))
+      headers: {
+        ...requestHeaders(token.token, accountId, true, config.originator),
+        'session-id': config.affinityKey
+      },
+      body: JSON.stringify({ ...compiled.body, stream: true })
     };
     if (signal) {
       init.signal = signal;
@@ -78,16 +79,21 @@ async function fetchCodexResponse(
 
 export async function* streamCodexHttp(
   config: CodexHttpTransportConfig,
-  request: ModelRequest,
-  signal: AbortSignal | undefined = request.signal
+  compiled: CompiledModelRequest,
+  signal: AbortSignal | undefined = compiled.logicalRequest.signal
 ): AsyncIterable<ModelStreamEvent> {
+  const request = compiled.logicalRequest;
   throwIfAborted(signal);
   try {
-    const responsePromise = fetchCodexResponse(config, request, signal);
+    const responsePromise = fetchCodexResponse(config, compiled, signal);
     const startedAt = Date.now();
     let response: Response | undefined;
     while (!response) {
-      const result = await waitForResponseOrStatus(responsePromise, config.statusIntervalMs, signal);
+      const result = await waitForResponseOrStatus(
+        responsePromise,
+        config.statusIntervalMs,
+        signal
+      );
       if (result.type === 'response') {
         response = result.response;
       } else {

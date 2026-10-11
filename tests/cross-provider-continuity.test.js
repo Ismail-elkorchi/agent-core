@@ -62,7 +62,7 @@ for (const id of ['openai', 'openai-codex']) {
 }
 
 for (const id of providerIds) {
-  test(`${id} renews context without changing instruction authority or the conversation prefix`, async () => {
+  test(`${id} continues without auxiliary summaries or changing instruction authority`, async () => {
     const sessions = new InMemorySessionRepository();
     const session = await sessions.create({
       binding: { schemaId: 'tests/continuity', schemaVersion: 1, subject: {} }
@@ -129,47 +129,22 @@ for (const id of providerIds) {
       contextRenewal: { automatic: true }
     }).run({ runId: 'continue', task: current }).result;
     assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
-    assert.equal(bodies.length, 3, 'one original answer, one note, one resumed answer');
-    const summary = compiled.find((request) => !request.logicalRequest.tools);
-    assert.ok(summary, 'continuation passes through normal admission');
-    const messages = summary.logicalRequest.messages;
-    assert.deepEqual(
-      messages.slice(0, firstRequest.logicalRequest.messages.length),
-      firstRequest.logicalRequest.messages
-    );
-    assert.equal(messages.at(-1).role, 'user');
-    assert.match(messages.at(-1).content, /working state/);
-    assert.deepEqual(
-      messages.filter((message) => ['system', 'developer'].includes(message.role)),
-      firstRequest.logicalRequest.messages.filter((message) => message.role === 'system')
-    );
-    assert.ok(messages.some((message) => message.content === original));
-    assert.ok(messages.some((message) => message.content === current));
-    assert.equal(summary.logicalRequest.temperature, firstRequest.logicalRequest.temperature);
-    assert.deepEqual(summary.logicalRequest.reasoning, firstRequest.logicalRequest.reasoning);
-    assert.equal(
-      summary.logicalRequest.maxOutputTokens,
-      firstRequest.logicalRequest.maxOutputTokens
-    );
-    assert.equal(summary.logicalRequest.responseFormat, undefined);
+    assert.equal(bodies.length, 2, 'one original answer and one continuation; no upkeep call');
     const resumed = compiled.at(-1).logicalRequest;
-    assert.ok(resumed.tools.length > 0);
+    assert.deepEqual(resumed.messages.slice(0, firstRequest.logicalRequest.messages.length),
+      firstRequest.logicalRequest.messages);
+    assert.deepEqual(resumed.messages.filter(message => ['system', 'developer'].includes(message.role)),
+      firstRequest.logicalRequest.messages.filter(message => ['system', 'developer'].includes(message.role)));
+    assert.ok(resumed.messages.some(message => message.content === original));
+    assert.equal(resumed.messages.filter(message => message.content === current).length, 1);
+    assert.deepEqual(resumed.reasoning, firstRequest.logicalRequest.reasoning);
+    assert.equal(resumed.temperature, firstRequest.logicalRequest.temperature);
     assert.equal(resumed.responseFormat, options.responseFormat);
-    assert.ok(resumed.messages.some((message) => message.content?.includes(continuation)));
-    assert.ok(!resumed.messages.some((message) => message.content === original));
-    assert.equal(resumed.messages.filter((message) => message.content === current).length, 1);
-    const inspected = await context.inspect();
-    assert.ok(inspected.workingState.revisionId);
-    assert.equal((await context.workingState()).text, continuation);
+    assert.equal((await context.workingState()).revision, null);
     const usage = await service.settledRunUsage('continue', 'continue');
-    assert.equal(usage.invocations, 2);
-    assert.equal(usage.usage.promptTokens, 40);
-    assert.equal(usage.usage.completionTokens, 20);
-    const auxiliaryHistory = await history.search({
-      query: 'Runtime context-maintenance task',
-      filter: { sourceType: 'input' }
-    });
-    assert.equal(auxiliaryHistory.items.length, 0, 'auxiliary task is not a user contribution');
+    assert.equal(usage.invocations, 1);
+    assert.equal(usage.usage.promptTokens, 20);
+    assert.equal(usage.usage.completionTokens, 10);
     if (id === 'claude')
       assert.deepEqual(
         bodies[1].messages.find((message) => message.role === 'assistant').content[0],
@@ -247,7 +222,7 @@ for (const id of ['openai', 'openai-codex', 'openrouter', 'claude']) {
   });
 }
 
-test('mid-run renewal preserves signed reasoning and the completed tool exchange', async () => {
+test('mid-run continuation preserves signed reasoning and the completed tool exchange without maintenance', async () => {
   const sessions = new InMemorySessionRepository();
   const session = await sessions.create({
     binding: { schemaId: 'tests/continuity', schemaVersion: 1, subject: {} }
@@ -310,7 +285,7 @@ test('mid-run renewal preserves signed reasoning and the completed tool exchange
   assert.equal(inspections, 1);
   assert.equal(
     bodies.length,
-    3,
+    2,
     JSON.stringify(
       bodies.map((body) => ({ bytes: JSON.stringify(body).length, tools: body.tools?.length }))
     )
@@ -320,7 +295,7 @@ test('mid-run renewal preserves signed reasoning and the completed tool exchange
     thinking
   );
   assert.ok(JSON.stringify(bodies[1]).includes('inspection-call'));
-  assert.ok(JSON.stringify(bodies[2]).includes(continuation));
+  assert.ok(JSON.stringify(bodies[1]).includes('Observation. Observation.'));
 });
 for (const id of providerIds) {
   test(`${id} preserves native blocks with one revised working state and current authority/catalog`, async () => {

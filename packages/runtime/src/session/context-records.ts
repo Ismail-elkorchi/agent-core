@@ -128,6 +128,12 @@ export function decodeContextTransitionEntry(value: unknown): SessionContextTran
     throw new Error('Context transition record identities disagree.');
   }
   const fingerprint = hashJson({
+    ...(entry.workingState ? { workingState: { id: entry.id, ...entry.workingState } } : {}),
+    ...(entry.transition.requestedWorkingStateRevisionId === undefined
+      ? {}
+      : {
+          expectedWorkingStateRevisionId: entry.transition.requestedWorkingStateRevisionId
+        }),
     expectedWindowId: entry.transition.previousWindowId,
     idempotencyKey: entry.transition.idempotencyKey,
     selection: {

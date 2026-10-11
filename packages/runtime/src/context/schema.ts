@@ -35,6 +35,8 @@ export const contextSelectionSchema = z
   .readonly();
 export const contextTransitionRequestSchema = z
   .strictObject({
+    workingState: workingStateChangeSchema.optional(),
+    expectedWorkingStateRevisionId: z.string().min(1).nullable().optional(),
     toolInvocation: z
       .strictObject({
         runId: z.string().min(1),
@@ -74,6 +76,7 @@ export const contextTransitionSchema = z
     requestFingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
     selectionFingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
     requestedSourceRevision: z.number().int().min(0).optional(),
+    requestedWorkingStateRevisionId: z.string().min(1).nullable().optional(),
     committedAt: z.string().min(1)
   })
   .readonly();

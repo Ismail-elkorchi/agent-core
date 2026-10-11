@@ -1,4 +1,8 @@
-import { historyReadRequestSchema } from '@agent-core/runtime';
+import {
+  historyReadRequestSchema,
+  contextSelectionSchema,
+  type ContextSelection
+} from '@agent-core/runtime';
 import type {
   HistoryReadRequest,
   HistoryReadResult,
@@ -54,5 +58,23 @@ export function sessionRpcMethods(operations: SessionRpcOperations) {
     'session.select': rpcMethod(z.strictObject({ sessionId: z.string().min(1) }), ({ sessionId }) =>
       operations.selectSession(sessionId)
     )
+  };
+}
+
+export interface ContextRpcOperations {
+  inspectContext(): Promise<unknown>;
+  renewContext(selection?: ContextSelection): Promise<unknown>;
+  freshContext(): Promise<unknown>;
+}
+
+export function contextRpcMethods(operations: ContextRpcOperations) {
+  const empty = z.strictObject({});
+  return {
+    'context.read': rpcMethod(empty, () => operations.inspectContext()),
+    'context.renew': rpcMethod(
+      z.strictObject({ selection: contextSelectionSchema.optional() }),
+      ({ selection }) => operations.renewContext(selection)
+    ),
+    'context.fresh': rpcMethod(empty, () => operations.freshContext())
   };
 }

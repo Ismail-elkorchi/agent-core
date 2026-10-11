@@ -1,3 +1,10 @@
+import {
+  readSelectedHistorySources,
+  assertPortableHistoryCompatibility
+} from '../orchestration/session-replay.js';
+import { sourceRef } from '../history/reader.js';
+import { contextSourceGroups } from './selection.js';
+import type { ModelProfile, ModelSelection } from '@agent-core/model';
 import { ContextSourceCapacityError } from '../run/context-admission.js';
 import { HistorySourceTooLargeError } from '../history/reader.js';
 import { requestCapacity } from '../inference/request-admission.js';
@@ -104,7 +111,7 @@ export class ContextService {
       ),
       legalTransitions: Object.freeze([
         'sources',
-        ...(this.runtime?.providerTransform ? ['provider'] : [])
+        ...((await this.runtime?.providerTransform()) ? ['provider'] : [])
       ]),
       ...(this.admission ? { admission: this.admission } : {}),
       protectedSources: await this.protectedSources(cut),
@@ -118,7 +125,8 @@ export class ContextService {
           readonly inference: WorkingStateInference;
         }>;
         schedule: (request: ContextTransitionRequest) => Promise<{ readonly requestId: string }>;
-        providerTransform: boolean;
+        providerTransform: () => Promise<boolean>;
+        modelSelection?: () => ModelSelection;
       }
     | undefined;
   private admission:
@@ -138,6 +146,92 @@ export class ContextService {
   recordAdmission(value: NonNullable<ContextService['admission']>): void {
     this.admission = Object.freeze(value);
   }
+  currentModel(): ModelSelection {
+    const selection = this.runtime?.modelSelection?.();
+    if (!selection) throw new Error('Fresh continuation requires the active model selection.');
+    return selection;
+  }
+
+  /** Resolve a model's source choices once against the authorized boundary. */
+  async selectSources(
+    cut: HistorySourceCut,
+    change: {
+      readonly retain?: readonly HistorySourceRef[] | undefined;
+      readonly add?: readonly HistorySourceRef[] | undefined;
+      readonly release?: readonly HistorySourceRef[] | undefined;
+    }
+  ): Promise<ContextSelection> {
+    const view = await readSelectedHistorySources(this.history, cut);
+    const groups = contextSourceGroups(view.entries);
+    const released = new Set(change.release?.map((source) => source.entryId));
+    for (const source of change.release ?? []) {
+      const entry = view.entries.find(
+        (item) => sourceRef(cut.sessionId, item).entryId === source.entryId
+      );
+      if (!entry || !sameHistorySource(sourceRef(cut.sessionId, entry), source))
+        throw new Error('Released source is not in the active context.');
+    }
+    const retained = new Map<string, HistorySourceRef>();
+    if (change.retain === undefined)
+      for (const group of groups)
+        if (!group.some((entry) => released.has(sourceRef(cut.sessionId, entry).entryId)))
+          for (const entry of group) {
+            const source = sourceRef(cut.sessionId, entry);
+            retained.set(source.entryId, source);
+          }
+    for (const source of [...(change.retain ?? []), ...(change.add ?? [])]) {
+      const group = groups.find((items) =>
+        items.some((entry) => sameHistorySource(sourceRef(cut.sessionId, entry), source))
+      );
+      const entries = group ?? (await this.history.exchange(source, cut));
+      for (const entry of entries) {
+        const ref = sourceRef(cut.sessionId, entry);
+        retained.set(ref.entryId, ref);
+      }
+    }
+    for (const source of await this.protectedSources(cut)) retained.set(source.entryId, source);
+    return {
+      strategy: 'sources',
+      retained: await this.history.orderSources([...retained.values()], cut),
+      ...(view.contextWindow?.selection.protected
+        ? { protected: view.contextWindow.selection.protected }
+        : {})
+    };
+  }
+
+  /** A fresh inference continuation ends native reasoning, while preserving selected originals. */
+  async freshSelection(input: {
+    readonly selection: ContextSelection;
+    readonly model: ModelSelection;
+    readonly profile: ModelProfile;
+    readonly cut: HistorySourceCut;
+    readonly resetId: string;
+  }): Promise<ContextSelection> {
+    const entries: SessionBranchEntry[] = [];
+    for (const source of input.selection.retained) {
+      const entry = await this.history.resolve(source, input.cut);
+      if (!entry) throw new Error('Fresh continuation source is unavailable.');
+      entries.push(entry);
+    }
+    await assertPortableHistoryCompatibility({
+      sessionId: input.cut.sessionId,
+      entries,
+      profile: input.profile,
+      artifacts: this.options.artifacts
+    });
+    return {
+      strategy: 'sources',
+      retained: input.selection.retained,
+      ...(input.selection.protected ? { protected: input.selection.protected } : {}),
+      continuity: {
+        kind: 'fresh',
+        resetId: input.resetId,
+        model: input.model,
+        sources: input.selection.retained
+      }
+    };
+  }
+
   async schedule(request: ContextTransitionRequest): Promise<{ readonly requestId: string }> {
     if (!this.runtime)
       throw new Error(
@@ -170,8 +264,6 @@ export class ContextService {
     options: {
       readonly signal?: AbortSignal;
       readonly admit?: ContextAdmission;
-      readonly workingState?: WorkingStateChange;
-      readonly expectedWorkingStateRevisionId?: string | null;
     } = {}
   ): Promise<SessionContextTransitionEntry> {
     let request = ownRequest(requestInput);
@@ -309,7 +401,7 @@ export class ContextService {
         cut.throughEntryId
       );
       if (
-        snapshot.entries.some(
+        [...snapshot.entries].some(
           (entry) =>
             !['branch', 'model_settings', 'context_transition', 'working_state'].includes(
               entry.type
@@ -322,12 +414,12 @@ export class ContextService {
     }
     const captured = await this.workingState(cut);
     const expectedWorkingStateRevisionId =
-      options.expectedWorkingStateRevisionId === undefined
+      request.expectedWorkingStateRevisionId === undefined
         ? (captured.revision?.id ?? null)
-        : options.expectedWorkingStateRevisionId;
+        : request.expectedWorkingStateRevisionId;
     assertWorkingStateRevision(captured.revision, expectedWorkingStateRevisionId);
-    const workingState = options.workingState
-      ? await this.snapshotForChange(options.workingState, cut.throughEntryId)
+    const workingState = request.workingState
+      ? await this.snapshotForChange(request.workingState, cut.throughEntryId)
       : captured;
     const pending = await this.options.repository.loadPendingSubmissions(this.options.session);
     const bytes = Buffer.byteLength(
@@ -374,7 +466,7 @@ export class ContextService {
     const windowId = randomUUID();
     return this.options.repository.commitContextTransition(this.options.session, {
       expectedWorkingStateRevisionId,
-      ...(options.workingState ? { workingState: options.workingState } : {}),
+      ...(request.workingState ? { workingState: request.workingState } : {}),
       expectedLeafId: cut.throughEntryId,
       expectedSourceRevision: cut.sourceRevision,
       expectedWindowId: request.expectedWindowId,
@@ -398,6 +490,11 @@ export class ContextService {
         previousWindowId: request.expectedWindowId,
         windowId,
         requestFingerprint: fingerprint,
+        ...(request.expectedWorkingStateRevisionId === undefined
+          ? {}
+          : {
+              requestedWorkingStateRevisionId: request.expectedWorkingStateRevisionId
+            }),
         selectionFingerprint: hashJson(selection),
         ...(request.expectedSourceRevision === undefined
           ? {}
@@ -447,7 +544,7 @@ export class ContextService {
       this.options.session,
       cut.throughEntryId
     );
-    const entry = snapshot.entries.find((entry) => entry.entryId === revision.id);
+    const entry = snapshot.index.byId.get(revision.id);
     if (!entry) throw new Error('Working-state index points outside the captured session branch.');
     return {
       revisionId: revision.id,
@@ -532,7 +629,7 @@ export class ContextService {
       this.options.session,
       cut.throughEntryId
     );
-    const published = snapshot.entries.find((entry) => entry.entryId === input.id);
+    const published = snapshot.index.byId.get(input.id);
     if (published) {
       const entry = await this.history.resolve(
         { sessionId: cut.sessionId, entryId: published.entryId, sha256: published.sha256 },
@@ -590,13 +687,7 @@ export class ContextService {
       this.options.session,
       cut.throughEntryId
     );
-    const finalized = new Set(snapshot.finalizations.map((item) => item.runId));
-    const active = snapshot.entries.filter(
-      (entry) =>
-        (entry.type === 'input' || entry.type === 'steering') &&
-        entry.runId &&
-        !finalized.has(entry.runId)
-    );
+    const active = [...snapshot.activeInputs()];
     return Object.freeze([
       ...active.map((entry) => ({
         sessionId: cut.sessionId,
@@ -616,9 +707,7 @@ export class ContextService {
       this.options.session,
       cut.throughEntryId
     );
-    const item = snapshot.entries.find(
-      (entry) => entry.identity === `context_transition:${idempotencyKey}`
-    );
+    const item = snapshot.index.byIdentity.get(`context_transition:${idempotencyKey}`);
     if (!item) return undefined;
     const entry = await this.history.resolve(
       { sessionId: cut.sessionId, entryId: item.entryId, sha256: item.sha256 },

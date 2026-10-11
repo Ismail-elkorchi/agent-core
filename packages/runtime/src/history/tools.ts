@@ -44,7 +44,9 @@ export function createHistoryTools(options: {
         role: z.enum(['user', 'assistant', 'tool', 'control']).optional(),
         runId: z.string().optional(),
         toolName: z.string().optional(),
-        resource: z.string().optional()
+        resource: z.string().optional(),
+        afterTime: z.iso.datetime({ offset: true }).optional(),
+        beforeTime: z.iso.datetime({ offset: true }).optional()
       })
       .optional()
   });
@@ -92,7 +94,7 @@ export function createHistoryTools(options: {
     scopedTool({
       name: `${prefix}_search`,
       description:
-        'Literal search of original branch-visible history with source filters, bounded scan and stable cursor. No semantic ranking.',
+        'Find original branch-visible history by literal text, source, time, run or tool. A rebuildable index narrows candidates; results are verified against originals. Reads and output are bounded; continue with the returned cursor when coverage is partial. No semantic ranking.',
       schema: search,
       mode: 'read',
       root: 'history',

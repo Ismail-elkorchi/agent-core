@@ -56,7 +56,7 @@ export function assertBranchEntry(
       : position(source, boundary.leafId).hash !== boundary.leafHash)
   )
     throw new Error('History boundary does not match its source.');
-  if (!branchPath(source, boundary).byId.has(entryId))
+  if (!branchView(source, boundary).contains(entryId))
     throw new Error(`History entry is outside the selected branch: ${entryId}`);
 }
 
@@ -76,15 +76,15 @@ export async function readBranchPage(
   else if (boundary.sessionId !== source.sessionId || boundary.leafHash !== null)
     throw new Error('Invalid empty history boundary.');
   const entries: SessionBranchEntry[] = [];
-  const path = branchPath(source, boundary);
+  const path = branchView(source, boundary);
   const step = request.direction === 'newer' ? 1 : -1;
-  let index = next === null ? -1 : (path.byId.get(next) ?? -1);
+  let index = next === null ? -1 : (path.position(next) ?? -1);
   let first = index;
   let last = index;
   let bytes = 0;
   let oversizedEntry: SessionBranchPage['oversizedEntry'];
-  while (index >= 0 && index < path.ids.length && entries.length < limit) {
-    const entryId = path.ids[index];
+  while (index >= 0 && index < path.length && entries.length < limit) {
+    const entryId = path.at(index)?.metadata.entryId;
     if (entryId === undefined) break;
     const metadata = position(source, entryId);
     if (metadata.bytes > maxBytes && entries.length === 0) {
@@ -98,8 +98,8 @@ export async function readBranchPage(
     last = Math.max(last, index);
     index += step;
   }
-  const older = path.ids[first - 1];
-  const newer = path.ids[last + 1];
+  const older = path.at(first - 1)?.metadata.entryId;
+  const newer = path.at(last + 1)?.metadata.entryId;
   return Object.freeze({
     boundary,
     entries: Object.freeze(step < 0 ? entries.reverse() : entries),
@@ -190,31 +190,148 @@ function position(source: BranchPageSource, entryId: string): BranchEntryPositio
   return entry;
 }
 
-interface BranchPath {
-  readonly ids: readonly string[];
-  readonly byId: ReadonlyMap<string, number>;
+interface SourceNode {
+  readonly metadata: SessionSourceMetadata;
+  readonly depth: number;
+  readonly ancestors: readonly SourceNode[];
+  readonly branchId: string;
+  readonly latestContext: SessionSourceMetadata | undefined;
+  readonly inheritedHeads: SessionSourceSnapshot['inheritedHeads'];
 }
-const paths = new WeakMap<BranchPageSource['positions'], Map<string | null, BranchPath>>();
 
-function branchPath(source: BranchPageSource, boundary: SessionBranchBoundary): BranchPath {
-  let retained = paths.get(source.positions);
-  if (retained === undefined) {
-    retained = new Map();
-    paths.set(source.positions, retained);
+/** Jump pointers share ancestry across captured windows and forks without copying their prefixes. */
+class BranchSourceIndex {
+  readonly nodes = new Map<string, SourceNode>();
+  readonly identities = new Map<string, SourceNode[]>();
+  readonly sources = new Map<string, SourceNode[]>();
+  readonly runs = new Map<string, SourceNode[]>();
+  readonly inputs = new Map<string, SourceNode[]>();
+  readonly pending = new Map<string, SourceNode[]>();
+  readonly finalizations: Pick<SessionRunFinalization, 'runId' | 'throughEntryId'>[] = [];
+  readonly finalized = new Map<string, { at: number; throughEntryId: string }>();
+  private consumed = 0;
+  constructor(private readonly positions: BranchPageSource['positions']) {}
+
+  refresh(source: BranchPageSource): void {
+    if (this.consumed === this.positions.size) return;
+    // Walk only the new tail. Other fork tails are indexed on demand.
+    const additions: string[] = [];
+    let id = source.leafId;
+    while (id !== null && !this.nodes.has(id)) {
+      additions.push(id);
+      id = position(source, id).parentId;
+    }
+    for (const entryId of additions.reverse()) {
+      const record = position(source, entryId);
+      const parent = record.parentId === null ? undefined : this.nodes.get(record.parentId);
+      const ancestors: SourceNode[] = parent ? [parent] : [];
+      for (let level = 0; ; level++) {
+        const ancestor = ancestors[level]?.ancestors[level];
+        if (!ancestor) break;
+        ancestors.push(ancestor);
+      }
+      const metadata: SessionSourceMetadata = Object.freeze({
+        ...branchMetadata(record),
+        entryId,
+        sha256: record.hash,
+        bytes: record.bytes,
+        parentId: record.parentId
+      });
+      let inheritedHeads = parent?.inheritedHeads ?? new Map();
+      if (record.type === 'branch') {
+        const heads = new Map(inheritedHeads);
+        const origin = record.fromEntryId ? this.nodes.get(record.fromEntryId) : undefined;
+        for (const head of origin?.metadata.historyPosition?.ledgerHeads ?? [])
+          heads.set(head.runId, head);
+        inheritedHeads = heads;
+      }
+      const node: SourceNode = {
+        metadata,
+        depth: (parent?.depth ?? -1) + 1,
+        ancestors,
+        branchId: record.type === 'branch' ? entryId : (parent?.branchId ?? source.sessionId),
+        latestContext: record.type === 'context_transition' ? metadata : parent?.latestContext,
+        inheritedHeads
+      };
+      this.nodes.set(entryId, node);
+      this.add(this.identities, record.identity, node);
+      this.add(this.sources, record.source ? `event:${record.source.eventId}` : entryId, node);
+      if (record.runId) {
+        this.add(this.runs, record.runId, node);
+        if (record.type === 'input') this.add(this.inputs, record.runId, node);
+        if (
+          (record.type === 'input' || record.type === 'steering') &&
+          !this.finalized.has(record.runId)
+        )
+          this.add(this.pending, record.runId, node);
+      }
+    }
+    this.consumed = this.nodes.size;
   }
-  const cached = retained.get(boundary.leafId);
-  if (cached !== undefined) return cached;
-  const ids: string[] = [];
-  let id = boundary.leafId;
-  while (id !== null) {
-    ids.push(id);
-    id = position(source, id).parentId;
+
+  settle(finalizations: readonly Pick<SessionRunFinalization, 'runId' | 'throughEntryId'>[]): void {
+    for (const value of finalizations.slice(this.finalizations.length)) {
+      const at = this.finalizations.length;
+      this.finalizations.push(value);
+      this.finalized.set(value.runId, { at, throughEntryId: value.throughEntryId });
+      this.pending.delete(value.runId);
+    }
   }
-  ids.reverse();
-  const path = { ids, byId: new Map(ids.map((id, index) => [id, index])) };
-  if (retained.size === 2) retained.clear();
-  retained.set(boundary.leafId, path);
-  return path;
+  private add(index: Map<string, SourceNode[]>, key: string, node: SourceNode): void {
+    const entries = index.get(key);
+    if (entries) entries.push(node);
+    else index.set(key, [node]);
+  }
+}
+
+function branchMetadata(record: BranchEntryPosition) {
+  return {
+    identity: record.identity,
+    type: record.type,
+    ...(record.runId ? { runId: record.runId } : {}),
+    ...(record.source ? { source: record.source } : {}),
+    ...(record.fromEntryId === undefined ? {} : { fromEntryId: record.fromEntryId }),
+    ...(record.historyPosition ? { historyPosition: record.historyPosition } : {})
+  };
+}
+const sourceIndexes = new WeakMap<BranchPageSource['positions'], BranchSourceIndex>();
+function branchView(source: BranchPageSource, boundary: SessionBranchBoundary) {
+  let index = sourceIndexes.get(source.positions);
+  if (!index) {
+    index = new BranchSourceIndex(source.positions);
+    sourceIndexes.set(source.positions, index);
+  }
+  index.refresh({ ...source, leafId: boundary.leafId });
+  const leaf = boundary.leafId === null ? undefined : index.nodes.get(boundary.leafId);
+  const length = (leaf?.depth ?? -1) + 1;
+  const at = (depth: number): SourceNode | undefined => {
+    if (depth < 0 || depth >= length) return undefined;
+    let node = leaf;
+    let distance = length - depth - 1;
+    for (let bit = 0; distance > 0 && node; bit++, distance = Math.floor(distance / 2))
+      if (distance % 2 === 1) node = node.ancestors[bit];
+    return node;
+  };
+  const contains = (id: string): boolean => {
+    const node = index.nodes.get(id);
+    return node !== undefined && at(node.depth) === node;
+  };
+  const lookup = (values: readonly SourceNode[] | undefined) => {
+    for (let at = (values?.length ?? 0) - 1; at >= 0; at--) {
+      const node = values?.[at];
+      if (node && contains(node.metadata.entryId)) return node;
+    }
+    return undefined;
+  };
+  return {
+    index,
+    leaf,
+    length,
+    at,
+    contains,
+    lookup,
+    position: (id: string) => (contains(id) ? index.nodes.get(id)?.depth : undefined)
+  };
 }
 
 function boundedInteger(value: number, maximum: number, label: string): number {
@@ -257,52 +374,73 @@ export function branchEntryMetadata(entry: SessionBranchEntry) {
       : {})
   };
 }
-const snapshots = new WeakMap<BranchPath, readonly SessionSourceMetadata[]>();
-const sourceSnapshots = new WeakMap<BranchPath, SessionSourceSnapshot>();
 export function sourceSnapshot(
   source: BranchPageSource,
   sourceRevision: number,
-  finalizations: readonly Pick<
-    SessionRunFinalization,
-    'runId' | 'finalizationId' | 'throughEntryId'
-  >[],
+  finalizations: readonly Pick<SessionRunFinalization, 'runId' | 'throughEntryId'>[],
   leafId = source.leafId
 ): SessionSourceSnapshot {
-  const boundary = branchBoundary(source, leafId);
-  const path = branchPath(source, boundary);
-  const cached = sourceSnapshots.get(path);
-  if (cached?.sourceRevision === sourceRevision) return cached;
-  let entries = snapshots.get(path);
-  if (!entries) {
-    entries = Object.freeze(
-      path.ids.map((entryId) => {
-        const metadata = position(source, entryId);
-        return Object.freeze({
-          entryId,
-          parentId: metadata.parentId,
-          sha256: metadata.hash,
-          bytes: metadata.bytes,
-          identity: metadata.identity,
-          type: metadata.type,
-          ...(metadata.runId ? { runId: metadata.runId } : {}),
-          ...(metadata.source ? { source: metadata.source } : {}),
-          ...(metadata.fromEntryId === undefined ? {} : { fromEntryId: metadata.fromEntryId }),
-          ...(metadata.historyPosition ? { historyPosition: metadata.historyPosition } : {})
-        });
-      })
-    );
-    snapshots.set(path, entries);
+  let index = sourceIndexes.get(source.positions);
+  if (!index) {
+    index = new BranchSourceIndex(source.positions);
+    sourceIndexes.set(source.positions, index);
   }
-  const snapshot = Object.freeze({
+  index.settle(finalizations);
+  const boundary = branchBoundary(source, leafId);
+  const view = branchView(source, boundary);
+  view.index.settle(finalizations);
+  const finalizedCount = view.index.finalizations.length;
+  const byId = (id: string) => (view.contains(id) ? view.index.nodes.get(id)?.metadata : undefined);
+  const isFinalized = (runId: string) => {
+    const item = view.index.finalized.get(runId);
+    return item !== undefined && item.at < finalizedCount && view.contains(item.throughEntryId);
+  };
+  return Object.freeze({
     boundary,
     sourceRevision,
-    entries,
-    branchId:
-      [...entries].reverse().find((entry) => entry.type === 'branch')?.entryId ?? source.sessionId,
-    finalizations: Object.freeze(finalizations.filter((item) => path.byId.has(item.throughEntryId)))
+    branchId: view.leaf?.branchId ?? source.sessionId,
+    entries: Object.freeze({
+      length: view.length,
+      at: (at: number) => view.at(at < 0 ? view.length + at : at)?.metadata,
+      *[Symbol.iterator]() {
+        for (let at = 0; at < view.length; at++) {
+          const node = view.at(at);
+          if (node) yield node.metadata;
+        }
+      }
+    }),
+    index: Object.freeze({
+      byId: { get: byId, has: view.contains },
+      bySource: { get: (id: string) => view.lookup(view.index.sources.get(id))?.metadata },
+      byIdentity: { get: (id: string) => view.lookup(view.index.identities.get(id))?.metadata },
+      runs: {
+        has: (id: string) => view.lookup(view.index.runs.get(id)) !== undefined,
+        lastPosition: (id: string) => view.lookup(view.index.runs.get(id))?.depth
+      },
+      positions: { get: view.position },
+      inputs: { get: (id: string) => view.lookup(view.index.inputs.get(id))?.depth }
+    }),
+    inheritedHeads: view.leaf?.inheritedHeads ?? new Map(),
+    finalizedRuns: { has: isFinalized },
+    latestContext: view.leaf?.latestContext,
+    *activeInputs() {
+      const candidates = new Map(view.index.pending);
+      for (const run of view.leaf?.inheritedHeads.keys() ?? [])
+        if (!isFinalized(run)) candidates.set(run, view.index.runs.get(run) ?? []);
+      for (const { runId: run } of view.index.finalizations.slice(finalizedCount)) {
+        candidates.set(run, view.index.runs.get(run) ?? []);
+      }
+      for (const [run, nodes] of candidates) {
+        if (isFinalized(run)) continue;
+        for (const node of nodes)
+          if (
+            (node.metadata.type === 'input' || node.metadata.type === 'steering') &&
+            view.contains(node.metadata.entryId)
+          )
+            yield node.metadata;
+      }
+    }
   });
-  sourceSnapshots.set(path, snapshot);
-  return snapshot;
 }
 
 export function currentWorkingState(

@@ -16,6 +16,9 @@ export interface HistorySourceRef {
   readonly event?: HistoryEventSource | undefined;
 }
 export interface HistoryFilter {
+  /** Inclusive lower and exclusive upper timestamp bounds. */
+  readonly afterTime?: string | undefined;
+  readonly beforeTime?: string | undefined;
   readonly sourceType?: SessionBranchEntry['type'] | undefined;
   readonly role?: 'user' | 'assistant' | 'tool' | 'control' | undefined;
   readonly runId?: string | undefined;

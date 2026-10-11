@@ -1,4 +1,8 @@
 import * as z from 'zod';
+import {
+  readAdmittedModelInput,
+  type RequestPresentation
+} from './input.js';
 import type { WorkingStateInference } from '../session/working-state.js';
 import { ModelStreamInterruptedError } from '../orchestration/model-stream.js';
 import { executeEffectLifecycle, type EffectLifecycle } from '@agent-core/effects';
@@ -200,6 +204,7 @@ interface DurableOperation<T extends { readonly usage?: ModelUsage }> {
 
 /** One admission ledger, reservation policy, cancellation path, and settlement lifecycle for all inference. */
 export class InferenceService {
+  private readonly presentations = new WeakMap<CompiledModelRequest, RequestPresentation>();
   private readonly gateway: InferenceGateway;
   private tokenObservation: RequestTokenObservation | undefined;
   readonly options: InferenceServiceOptions;
@@ -264,11 +269,33 @@ export class InferenceService {
   createSession(): ModelProviderSession {
     return this.gateway.createSession();
   }
-  async compile(request: ModelRequest, profile: ModelProfile, options?: ModelCompilationOptions) {
-    return this.gateway.compile(request, profile, {
+  async compile(
+    request: ModelRequest,
+    profile: ModelProfile,
+    options?: ModelCompilationOptions,
+    presentation?: RequestPresentation
+  ) {
+    const compiled = await this.gateway.compile(request, profile, {
       ...(this.tokenObservation ? { tokenObservation: this.tokenObservation } : {}),
       ...options
     });
+    if (presentation) this.presentations.set(compiled, presentation);
+    return compiled;
+  }
+
+  async inputReference(ownerId: string, invocationId: string) {
+    const { invocation } = await this.options.repository.load(ownerId, { invocationId });
+    if (!invocation) throw new Error('No recorded originating inference.');
+    const ref = invocation.extension?.requestRef ?? invocation.start.requestRef;
+    if (ref.visibility !== 'protected') throw new Error('Recorded inference input is not protected.');
+    return ref;
+  }
+
+  async admittedInput(ownerId: string, invocationId: string) {
+    return readAdmittedModelInput(
+      this.options.artifacts,
+      await this.inputReference(ownerId, invocationId)
+    );
   }
 
   async admit(compiled: CompiledModelRequest, profile: ModelProfile): Promise<void> {
@@ -294,11 +321,7 @@ export class InferenceService {
     readonly revisionId: string | null;
     readonly inference: WorkingStateInference;
   }> {
-    const { invocation } = await this.options.repository.load(ownerId, { invocationId });
-    if (!invocation) throw new Error('Working-state update has no recorded originating inference.');
-    const ref = invocation.extension?.requestRef ?? invocation.start.requestRef;
-    if (ref.visibility !== 'protected')
-      throw new Error('Recorded inference input is not protected.');
+    const ref = await this.inputReference(ownerId, invocationId);
     // Only the captured binding is needed here. The protected, already-accounted
     // request body is not a model-tool JSON payload with collection quotas.
     const record = z
@@ -410,7 +433,11 @@ export class InferenceService {
       compiled,
       discriminator: input.transformId,
       ...(signal ? { signal } : {}),
-      dispatch: () => transform(input.transformId, compiled),
+      dispatch: () =>
+        transform(input.transformId, compiled, {
+          affinityKey: input.ownerId,
+          ...(signal ? { signal } : {})
+        }),
       decode: (value) => {
         const owned = parseModelContextTransformResult(value);
         if (
@@ -807,6 +834,10 @@ export class InferenceService {
         mediaType: 'application/json',
         content: new TextEncoder().encode(
           JSON.stringify({
+            runId: identity.runId ?? null,
+            ...(this.presentations.has(compiled)
+              ? { presentation: this.presentations.get(compiled) }
+              : {}),
             workingStateRevisionId: input.workingStateRevisionId ?? null,
             logical,
             sourceRequest: recordableSourceRequest(input.sourceRequest),

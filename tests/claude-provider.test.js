@@ -124,3 +124,60 @@ for (const target of ['provider', 'session']) {
     });
   }
 }
+
+test('Claude compaction preserves signed state, catalog and iteration usage across the next request', async () => {
+  const sent = [];
+  const block = { type: 'compaction', content: 'Observed evidence and constraints.', signature: 'COMPACT+/=exact' };
+  const provider = new ClaudeProvider({ apiKey: 'fixture', countTokens: true, fetch: async (url, init) => {
+    const body = JSON.parse(init.body);
+    sent.push({ url, body, headers: init.headers });
+    if (url.endsWith('count_tokens')) return Response.json({ input_tokens: 35 });
+    if (!body.compaction) return Response.json(payload);
+    return Response.json({ ...payload, content: [block], stop_reason: 'compaction',
+      usage: { input_tokens: 0, output_tokens: 0, iterations: [
+        { type: 'compaction', input_tokens: 20, output_tokens: 8, cache_read_input_tokens: 7, cache_creation_input_tokens: 3 },
+        { type: 'compaction', input_tokens: 5, output_tokens: 2 }
+      ] } });
+  } });
+  const request = { ...initial, tools: [{ type: 'function', function: { name: 'lookup', parameters: { type: 'object', properties: {} } } }] };
+  const compiled = await provider.compileContextTransform({ transformId: 'compact', request });
+  assert.deepEqual(compiled.body.compaction, { type: 'summarize' });
+  assert.equal(compiled.accounting.method.name, 'provider-count');
+  assert.equal(compiled.accounting.estimatedInputTokens, 35);
+  await assert.rejects(provider.completeCompiled(compiled), /Unrecognized/);
+  await assert.rejects(provider.transformContextCompiled('wrong', compiled), /Unrecognized/);
+  const result = await provider.transformContextCompiled('compact', compiled);
+  assert.deepEqual(result.state.data.block, block);
+  assert.deepEqual(result.usage, { promptTokens: 35, completionTokens: 10, totalTokens: 45, cacheReadTokens: 7, cacheWriteTokens: 3 });
+  assert.equal(sent.at(-1).headers['anthropic-beta'], 'compact-2026-09-04');
+  assert.deepEqual(sent.at(-1).body.tools, compiled.body.tools);
+  assert.deepEqual(sent.at(-1).body.system, compiled.body.system);
+  const next = await provider.compileRequest({ ...request, messages: [initial.messages[0], ...result.input, { role: 'user', content: 'Continue.' }] });
+  assert.deepEqual(next.body.messages[0], { role: 'assistant', content: [block] });
+  await provider.completeCompiled(next);
+  assert.equal(sent.at(-1).headers['anthropic-beta'], 'compact-2026-09-04');
+  assert.equal(sent.at(-2).headers['anthropic-beta'], 'compact-2026-09-04');
+  await assert.rejects(provider.transformContextCompiled('compact', compiled, { signal: AbortSignal.abort(new Error('cancelled')) }), /cancelled/);
+});
+
+for (const content of [[], [{ type: 'compaction', content: 'unsigned' }]]) {
+  test('Claude rejects unusable compaction output without fabricating a summary', async () => {
+    const provider = new ClaudeProvider({ apiKey: 'fixture', fetch: async () => Response.json({ ...payload, content, stop_reason: 'compaction' }) });
+    await assert.rejects(provider.transformContext({ transformId: 'invalid', request: initial }), /compaction/i);
+  });
+}
+
+test('Claude native compaction classifies a disconnected transport as unavailable', async () => {
+  const provider = new ClaudeProvider({ apiKey: 'fixture', fetch: async () => { throw new TypeError('Socket closed.'); } });
+  await assert.rejects(provider.transformContext({ transformId: 'disconnected', request: initial }), error => {
+    assert.equal(error.code, 'provider_unavailable');
+    assert.equal(error.retryable, true);
+    return true;
+  });
+});
+
+test('Claude native compaction availability belongs to the selected endpoint and exact profile', async () => {
+  const custom = new ClaudeProvider({ apiKey: 'fixture', baseUrl: 'https://messages.test/v1' });
+  assert.deepEqual((await custom.describeModel(initial.model)).capabilities.protocol.contextTransforms, []);
+  await assert.rejects(custom.compileContextTransform({ transformId: 'unsupported', request: initial }), /not declared/);
+});

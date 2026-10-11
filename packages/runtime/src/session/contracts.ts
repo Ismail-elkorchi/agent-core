@@ -6,7 +6,7 @@ import type {
   ModelResponseFormat,
   ModelSelection
 } from '@agent-core/model';
-import type { ArtifactRef } from '@agent-core/persistence';
+import type { ArtifactRef, ProtectedArtifactRef } from '@agent-core/persistence';
 import type {
   ContextTransitionCommit,
   ContextTransitionRecord,
@@ -122,6 +122,7 @@ export type SessionAssistantEntry = BaseSessionEntry &
   AgentTurnIdentity &
   Readonly<{
     readonly type: 'assistant';
+    readonly inferenceInput?: ProtectedArtifactRef;
     readonly reasoning?: string;
     readonly reasoningSummary?: string;
     readonly runId: string;
@@ -263,12 +264,7 @@ export type SessionSuspensionCategory =
   | 'external_recovery'
   | 'runtime'
   | 'context_admission';
-export type SessionSuspensionAction =
-  | 'approval'
-  | 'reconcile'
-  | 'resume'
-  | 'context'
-  | 'abort';
+export type SessionSuspensionAction = 'approval' | 'reconcile' | 'resume' | 'context' | 'abort';
 interface SessionSuspensionScope {
   readonly contextAdmission?: import('../run/context-admission.js').ContextAdmissionConflict;
   readonly runId: string;
@@ -278,17 +274,22 @@ interface SessionSuspensionScope {
   readonly actions: readonly SessionSuspensionAction[];
 }
 
-export type SessionSuspensionDescriptor = SessionSuspensionScope & (
-  | Readonly<{
-      reason: 'runtime_failed';
-      diagnostic: string;
-    }>
-  | Readonly<{
-      reason: 'approval_required' | 'provider_outcome_unknown' | 'tool_outcome_unknown' |
-        'missing_implementation' | 'context_admission';
-      diagnostic?: never;
-    }>
-);
+export type SessionSuspensionDescriptor = SessionSuspensionScope &
+  (
+    | Readonly<{
+        reason: 'runtime_failed';
+        diagnostic: string;
+      }>
+    | Readonly<{
+        reason:
+          | 'approval_required'
+          | 'provider_outcome_unknown'
+          | 'tool_outcome_unknown'
+          | 'missing_implementation'
+          | 'context_admission';
+        diagnostic?: never;
+      }>
+  );
 
 type SessionSubmissionTransitionBase = Readonly<{
   readonly submissionId: string;
@@ -391,15 +392,29 @@ export interface SessionSourceMetadata {
   readonly fromEntryId?: string | null;
   readonly historyPosition?: import('../history/contracts.js').HistorySourceCut;
 }
+/** Immutable branch view over incrementally maintained source positions. */
 export interface SessionSourceSnapshot {
   readonly boundary: SessionBranchBoundary;
   readonly branchId: string;
   readonly sourceRevision: number;
-  readonly entries: readonly SessionSourceMetadata[];
-  readonly finalizations: readonly Pick<
-    SessionRunFinalization,
-    'runId' | 'finalizationId' | 'throughEntryId'
-  >[];
+  readonly entries: Iterable<SessionSourceMetadata> & {
+    readonly length: number;
+    at(index: number): SessionSourceMetadata | undefined;
+  };
+  readonly index: {
+    readonly byId: Pick<ReadonlyMap<string, SessionSourceMetadata>, 'get' | 'has'>;
+    readonly bySource: Pick<ReadonlyMap<string, SessionSourceMetadata>, 'get'>;
+    readonly byIdentity: Pick<ReadonlyMap<string, SessionSourceMetadata>, 'get'>;
+    readonly runs: Pick<ReadonlySet<string>, 'has'> & {
+      lastPosition(runId: string): number | undefined;
+    };
+    readonly positions: Pick<ReadonlyMap<string, number>, 'get'>;
+    readonly inputs: Pick<ReadonlyMap<string, number>, 'get'>;
+  };
+  readonly inheritedHeads: ReadonlyMap<string, import('../history/contracts.js').HistoryLedgerHead>;
+  readonly finalizedRuns: Pick<ReadonlySet<string>, 'has'>;
+  readonly latestContext: SessionSourceMetadata | undefined;
+  activeInputs(): Iterable<SessionSourceMetadata>;
 }
 
 export interface SessionRepository {
@@ -451,6 +466,7 @@ export interface SessionRepository {
       reasoningSummary?: string;
       output?: readonly ModelOutputItem[];
       completeness?: SessionAssistantEntry['completeness'];
+      inferenceInput?: ProtectedArtifactRef;
       source?: import('../history/contracts.js').HistoryEventSource;
     }
   ): Promise<SessionAssistantEntry>;

@@ -26,7 +26,10 @@ export function continuityProvider(id, { contextTokens = 128_000, respond = () =
           counting: countTokens ? 'provider' : 'estimate'
         })
       } : {}),
-      ...(id === 'openai-codex' ? { reasoning: { strategies: ['effort'], efforts: ['low', 'high'], canDisable: false, separateOutput: true } } : {})
+      ...(id === 'openai-codex' ? { protocol: conservativeProtocolCapabilities('https://chatgpt.com/backend-api/codex/responses', {
+        revision: 'codex-responses-2026-09-07-v1', roles: ['system', 'developer', 'user', 'assistant'],
+        inputKinds: ['text', 'tool_call', 'tool_result', 'protocol'], outputKinds: ['text', 'tool_call', 'protocol'], state: 'exact'
+      }), reasoning: { strategies: ['effort'], efforts: ['low', 'high'], canDisable: false, separateOutput: true } } : {})
     },
     modalities: { input: ['text'], output: ['text'] },
     limits: { contextTokens, outputTokens: 4096 },

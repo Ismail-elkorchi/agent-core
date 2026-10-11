@@ -48,9 +48,9 @@ test('all adapters preserve optional history references through search, read and
     .buildModelContent({ observation: read });
   assert.equal(serializeToolModelContent(readContent).split('original request').length - 1, 1);
   const transition = tools.find((t) => t.name === 'context_transition');
-  const selection = { strategy: 'sources', retained: [source] };
+  const retain = [source];
   assert.equal(
-    transition.decodeInput({ kind: 'json', value: { reason: 'retain', selection } }).ok,
+    transition.decodeInput({ kind: 'json', value: { reason: 'retain', retain } }).ok,
     true
   );
   const input = {
@@ -229,7 +229,7 @@ test('context inspection explains adjusted capacity and does not expose the acco
   assert.match(presented.accounting.inputTokensMeaning, /uncertainty.headroomRatio/);
   assert.equal(presented.accounting.components, undefined);
   assert.equal(presented.admission.inputIdentity, undefined);
-  assert.match(tools[1].description, /removes all optional history/);
+  assert.match(tools[1].description, /empty array releases it all/);
 });
 
 test('all provider adapters continue with original reasoning using observed request-level usage', async () => {

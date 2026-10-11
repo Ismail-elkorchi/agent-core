@@ -5,7 +5,8 @@ import {
   type ModelProfile,
   type RequestEstimator
 } from '@agent-core/model';
-import type { ArtifactRepository } from '@agent-core/persistence';
+import { hashJson, type ArtifactRepository } from '@agent-core/persistence';
+import { NativeContextTransitionRequired, type RequestPresentation } from './input.js';
 import { resolveSessionImages } from '../session/images.js';
 import { DEFAULT_MODEL_WINDOW_IMAGE_LIMITS, ModelWindow } from './model-window.js';
 import {
@@ -27,6 +28,9 @@ export type {
 } from './prompt-material.js';
 
 export interface ModelRequestAssemblyInput {
+  readonly runId?: string;
+  /** Compile selected conversation for a native transform, without adding the current task or context again. */
+  readonly conversationOnly?: boolean;
   readonly window: ModelWindow;
   readonly task: string;
   readonly images?: readonly import('../session/images.js').SessionImageInput[];
@@ -44,6 +48,8 @@ export interface ModelRequestAssemblyEstimate {
 }
 
 export interface ModelRequestAssembly {
+  readonly presentation: RequestPresentation;
+  readonly continuationSource?: import('@agent-core/model').ModelRequest;
   readonly material: PromptMaterial;
   readonly messages: readonly ModelInputItem[];
   readonly historyMessages: readonly ModelInputItem[];
@@ -71,17 +77,88 @@ export class ModelRequestAssembler {
       tools: input.tools,
       ...(input.metadata ? { metadata: input.metadata } : {})
     });
-    const messages = await compilePromptMaterial(
+    let messages = await compilePromptMaterial(
       material,
       {
         transformed: input.window.transformedMessagesFor(input.modelProfile),
         prior: prior.messages,
         current: history.messages
       },
-      { artifacts: this.artifacts, maxImageBytes: input.window.imageLimits.maxBytes }
+      {
+        artifacts: this.artifacts,
+        maxImageBytes: input.window.imageLimits.maxBytes,
+        conversationOnly: input.conversationOnly ?? false
+      }
     );
+    const presentation: RequestPresentation = {
+      authority: hashJson(
+        messages.filter((item) => item.role === 'system' || item.role === 'developer')
+      ),
+      runInstructions: hashJson(
+        material.instructions
+          .filter((item) => item.role === 'user')
+          .map(({ role, content }) => ({ role, content }))
+      ),
+      context: hashJson(renderContext(material.context)),
+      workingState: hashJson(
+        material.workingState ? renderContext([material.workingState]) : null
+      )
+    };
+    const bound = input.window.continuation();
+    const continuationSource = bound
+      ? {
+          ...bound.input.request,
+          messages: [...bound.input.request.messages, ...bound.prior, ...bound.current]
+        }
+      : undefined;
+    if (bound && continuationSource) {
+      if (presentation.authority !== bound.input.presentation.authority)
+        throw new NativeContextTransitionRequired(
+          continuationSource,
+          'Current instructions differ from the authority bound to earlier reasoning.'
+        );
+      const newRun = input.runId !== bound.input.runId;
+      const inputMessages =
+        newRun && !input.conversationOnly
+          ? await compilePromptMaterial(
+              {
+                id: material.id,
+                task: material.task,
+                ...(material.images ? { images: material.images } : {}),
+                instructions: material.instructions.filter((item) => item.role === 'user'),
+                context: [],
+                tools: []
+              },
+              undefined,
+              { artifacts: this.artifacts, maxImageBytes: input.window.imageLimits.maxBytes }
+            )
+          : !input.conversationOnly &&
+              presentation.runInstructions !== bound.input.presentation.runInstructions
+            ? material.instructions
+                .filter((item) => item.role === 'user')
+                .map(({ content }) => ({ role: 'user' as const, content }))
+            : [];
+      messages = [
+        ...bound.input.request.messages,
+        ...bound.prior,
+        ...inputMessages,
+        ...bound.current,
+        ...(!input.conversationOnly &&
+        presentation.context !== bound.input.presentation.context &&
+        material.context.length
+          ? [{ role: 'user' as const, content: renderContext(material.context) }]
+          : []),
+        ...(!input.conversationOnly &&
+        presentation.workingState !== bound.input.presentation.workingState &&
+        material.workingState
+          ? [{ role: 'user' as const, content: renderContext([material.workingState]) }]
+          : [])
+      ];
+    }
     input.window.assertImagesAdmitted(messages, input.modelProfile);
     return Object.freeze({
+      presentation,
+      ...(continuationSource ? { continuationSource } : {}),
       material,
       messages,
       historyMessages: history.messages,
@@ -112,6 +189,7 @@ export async function compilePromptMaterial(
   options: {
     readonly artifacts?: ArtifactRepository | undefined;
     readonly maxImageBytes?: number;
+    readonly conversationOnly?: boolean;
   } = {}
 ): Promise<readonly ModelInputItem[]> {
   const instructionMessages: ModelInputItem[] = material.instructions.map((instruction) =>
@@ -131,7 +209,7 @@ export async function compilePromptMaterial(
   const guides = material.tools.flatMap((tool) => (tool.promptGuide ? [tool.promptGuide] : []));
   if (guides.length > 0)
     instructionMessages.push(Object.freeze({ role: 'developer', content: guides.join('\n\n') }));
-  const taskMessage: ModelInputItem = Object.freeze({
+  const taskMessage: ModelInputItem | undefined = options.conversationOnly ? undefined : Object.freeze({
     role: 'user',
     content: material.task,
     ...(material.images === undefined
@@ -154,16 +232,18 @@ export async function compilePromptMaterial(
   return Object.freeze([
     ...instructionMessages.filter((item) => item.role !== 'user'),
     ...(conversation.transformed ?? []),
-    ...(contextMessage ? [contextMessage] : []),
+    ...(contextMessage && !options.conversationOnly ? [contextMessage] : []),
     ...conversation.prior,
-    ...instructionMessages.filter((item) => item.role === 'user'),
-    taskMessage,
+    ...instructionMessages.filter((item) => item.role === 'user' && !options.conversationOnly),
+    ...(taskMessage ? [taskMessage] : []),
     ...conversation.current,
-    ...(workingState ? [workingState] : [])
+    ...(workingState && !options.conversationOnly ? [workingState] : [])
   ]);
 }
 
-export function renderContext(items: readonly Omit<PromptContextItem, 'tokenEstimate'>[]): string {
+export function renderContext(
+  items: readonly Omit<PromptContextItem, 'tokenEstimate'>[]
+): string {
   if (items.length === 0) {
     return '';
   }

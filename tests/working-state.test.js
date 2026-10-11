@@ -82,7 +82,7 @@ for (const kind of ['memory', 'jsonl']) {
       /different content/
     );
     const snapshot = await f.sessions.sourceSnapshot(f.session);
-    assert.equal(snapshot.entries.filter((x) => x.type === 'working_state').length, 2);
+    assert.equal([...snapshot.entries].filter((x) => x.type === 'working_state').length, 2);
     assert.equal((await f.sessions.readConversation(f.session)).length, 0);
     assert.equal(await f.artifacts.resolve(head.contentRef.artifactId), undefined);
     const unrelated = await f.sessions.create({ binding });
@@ -163,8 +163,7 @@ for (const kind of ['memory', 'jsonl']) {
       reason: 'Renewal'
     };
     await assert.rejects(
-      f.context.transition(request, {
-        workingState: candidate,
+      f.context.transition({ ...request, workingState: candidate }, {
         admit: async () => {
           throw new Error('Rejected next request');
         }
@@ -173,8 +172,7 @@ for (const kind of ['memory', 'jsonl']) {
     );
     assert.equal((await f.context.workingState()).revision.id, 'old');
     assert.equal((await f.context.inspect()).window.windowId, previous.entry.window.windowId);
-    const committed = await f.context.transition(request, {
-      workingState: candidate,
+    const committed = await f.context.transition({ ...request, workingState: candidate }, {
       admit: async (input) => {
         assert.equal(input.workingState.text, 'Keep constraints; correction confirmed');
         return { compiledInputIdentity: 'new-input', capabilityRevision: 'test' };

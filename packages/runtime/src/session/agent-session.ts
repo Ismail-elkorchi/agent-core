@@ -5,12 +5,7 @@ import {
   type ModelSelection
 } from '@agent-core/model';
 import { parseModelChangeRequest, type ModelChangeOptions } from '../orchestration/model-change.js';
-import {
-  assertHistoryModelCompatibility,
-  assertPortableHistoryCompatibility,
-  readSelectedHistorySources
-} from '../orchestration/session-replay.js';
-import { sourceRef } from '../history/reader.js';
+import { assertHistoryModelCompatibility } from '../orchestration/session-replay.js';
 import { randomUUID } from 'node:crypto';
 import { AgentRuntime, type AgentRunHandle, type AgentRunInput } from '../agent-runtime.js';
 import type { ContextTransitionRequest } from '../context/contracts.js';
@@ -341,41 +336,7 @@ export class AgentSession {
       const context = this.options.context;
       if (!context) throw new Error('Model changes require the session context service.');
       if (options.continuation === 'fresh') {
-        const view = await readSelectedHistorySources(context.history);
-        const entries = view.entries.filter(
-          (entry) =>
-            entry.type === 'input' ||
-            entry.type === 'steering' ||
-            entry.type === 'assistant' ||
-            entry.type === 'tool_call' ||
-            entry.type === 'observation'
-        );
-        await assertPortableHistoryCompatibility({
-          sessionId: view.cut.sessionId,
-          entries,
-          profile: input.profile,
-          artifacts: input.artifacts
-        });
-        const retained = entries.map((entry) => sourceRef(view.cut.sessionId, entry));
-        const entry = await context.transition({
-          expectedWindowId: view.contextWindow?.windowId ?? null,
-          expectedSourceRevision: view.cut.sourceRevision,
-          idempotencyKey: randomUUID(),
-          reason: 'User explicitly selected fresh inference continuation.',
-          selection: {
-            strategy: 'sources',
-            retained,
-            ...(view.contextWindow?.selection.protected === undefined
-              ? {}
-              : { protected: view.contextWindow.selection.protected }),
-            continuity: {
-              kind: 'fresh',
-              resetId: randomUUID(),
-              model: selection,
-              sources: retained
-            }
-          }
-        });
+        const entry = await this.selectFreshContinuation(selection, input.profile);
         await this.emit({
           type: 'context.transitioned',
           window: entry.window,
@@ -402,6 +363,46 @@ export class AgentSession {
       });
       await this.emit({ type: 'configuration.changed', configuration: this.configuration });
       return this.state();
+    });
+  }
+
+  /** Explicitly restart model reasoning in this session without resetting effects or budgets. */
+  freshContinuation(input: { readonly profile: ModelProfile }): Promise<AgentSessionState> {
+    return this.serial(async () => {
+      this.assertOpen();
+      await this.restorePending();
+      if (this.active || this.suspended || this.queued.length > 0)
+        throw new Error('Settle or reconcile pending work before a fresh continuation.');
+      const entry = await this.selectFreshContinuation(this.configuration, input.profile);
+      await this.emit({
+        type: 'context.transitioned',
+        window: entry.window,
+        transition: entry.transition
+      });
+      return this.state();
+    });
+  }
+
+  private async selectFreshContinuation(model: ModelSelection, profile: ModelProfile) {
+    const context = this.options.context;
+    if (!context) throw new Error('Fresh continuation requires a session context service.');
+    if (model.provider !== profile.provider || model.model !== profile.id)
+      throw new Error('Fresh continuation model does not match its profile.');
+    const cut = await context.history.capture();
+    const window = await context.history.selectedContext(cut);
+    const selection = await context.freshSelection({
+      selection: await context.selectSources(cut, {}),
+      model,
+      profile,
+      cut,
+      resetId: randomUUID()
+    });
+    return context.transition({
+      expectedWindowId: window?.windowId ?? null,
+      expectedSourceRevision: cut.sourceRevision,
+      idempotencyKey: randomUUID(),
+      reason: 'Explicit fresh inference continuation.',
+      selection
     });
   }
 
@@ -614,12 +615,14 @@ export class AgentSession {
       const completion = this.active?.pending.completion;
       await this.active?.control.abort('Session instance closed.');
       return { completion };
-    }).then(async ({ completion }) => {
-      // Settlement runs on the serial queue; await it outside the close transaction.
-      await completion?.catch(() => undefined);
-    }).finally(() => {
-      this.listeners.clear();
-    });
+    })
+      .then(async ({ completion }) => {
+        // Settlement runs on the serial queue; await it outside the close transaction.
+        await completion?.catch(() => undefined);
+      })
+      .finally(() => {
+        this.listeners.clear();
+      });
     return this.closeCompletion;
   }
 
@@ -752,7 +755,9 @@ export class AgentSession {
           run.state.phase.kind === 'terminal'
         ) {
           await this.options.repository.transitionSubmission(
-            this.options.descriptor, submission.submissionId, { state: 'claimed' }
+            this.options.descriptor,
+            submission.submissionId,
+            { state: 'claimed' }
           );
           this.queued.push(pendingFromRecord(submission, true));
           continue;
@@ -760,10 +765,13 @@ export class AgentSession {
         const descriptor = current ?? submission.suspension;
         if (current && !sameSuspension(submission.suspension, current)) {
           await this.options.repository.transitionSubmission(
-            this.options.descriptor, submission.submissionId, { state: 'claimed' }
+            this.options.descriptor,
+            submission.submissionId,
+            { state: 'claimed' }
           );
           await this.options.repository.transitionSubmission(
-            this.options.descriptor, submission.submissionId,
+            this.options.descriptor,
+            submission.submissionId,
             { state: 'suspended', suspension: current }
           );
         }
@@ -904,9 +912,13 @@ export class AgentSession {
         const result: AgentRunResult = Object.freeze({
           state: 'ended',
           terminal: await this.options.runs.readTerminal(run),
-          deliveryDiagnostics: Object.freeze([Object.freeze({
-            eventType: 'run.result', message: cause.message, persisted: false
-          })])
+          deliveryDiagnostics: Object.freeze([
+            Object.freeze({
+              eventType: 'run.result',
+              message: cause.message,
+              persisted: false
+            })
+          ])
         });
         await this.options.repository.transitionSubmission(this.options.descriptor, pending.id, {
           state: 'completed'
@@ -917,7 +929,8 @@ export class AgentSession {
       }
       if (run) {
         const descriptor: AgentSessionSuspensionDescriptor =
-          runSuspensionDescriptor(pending.id, run.state) ?? Object.freeze({
+          runSuspensionDescriptor(pending.id, run.state) ??
+          Object.freeze({
             runId: pending.runId,
             submissionId: pending.id,
             category: 'runtime',

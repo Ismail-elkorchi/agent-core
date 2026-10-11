@@ -2,12 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
 import { defineTool } from '@agent-core/tools';
-import { compileModelRequest, ModelContractError, ModelProviderError, requestAccountingInputTokens } from '@agent-core/model';
+import { compileModelRequest, ModelProviderError } from '@agent-core/model';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import {
   AgentRuntime,
   InMemorySessionRepository,
-  InferenceService,
   HistoryReader,
   ContextService,
   createContextTools,
@@ -108,54 +107,7 @@ test('idle source selection records intent without invoking or claiming request 
   assert.equal(inspected.admission, undefined);
 });
 
-test('automatic renewal revises working state and preserves current input and settings', async () => {
-  const state = await fixture();
-  const original = 'Old detail. '.repeat(9000);
-  const first = await new AgentRuntime(state.options).run({ task: original }).result;
-  assert.equal(first.terminal?.executionStatus, 'completed', JSON.stringify(first));
-  state.setCapacity(45000);
-  let captures = 0;
-  const runtime = new AgentRuntime({
-    ...state.options,
-    contextRenewal: { automatic: true },
-    temperature: 0.3,
-    contextProvider: () => {
-      captures++;
-      return [
-        {
-          id: 'guidance-revision',
-          sourceUri: 'app://guidance',
-          sourceKind: 'external',
-          representation: 'full',
-          mediaType: 'text/plain',
-          title: 'Guidance',
-          content: 'Exact captured guidance',
-          purpose: 'Applicable guidance'
-        }
-      ];
-    }
-  });
-  const result = await runtime.run({ task: 'Continue the same work.' }).result;
-  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
-  assert.equal(captures, 1);
-  const request = state.requests.at(-1);
-  assert.equal(request.temperature, 0.3);
-  assert.equal(
-    request.messages.filter((item) => item.content === 'Continue the same work.').length,
-    1
-  );
-  assert.ok(request.messages.some((item) => item.content.includes('Exact captured guidance')));
-  assert.ok(!request.messages.some((item) => item.content === original));
-  const inspected = await state.context.inspect();
-  assert.ok(inspected.workingState.revisionId);
-  assert.match(inspected.window.reason, /working-state/);
-  assert.equal(state.requests.length, 3);
-  assert.equal(state.requests[1].tools, undefined);
-  assert.ok(JSON.stringify(state.requests[1].messages).includes(original));
-  assert.equal(inspected.admission.status, 'admitted');
-});
-
-test('automatic renewal retains original evidence and complete parallel exchanges without rerunning tools', async () => {
+test('explicit selection retains original evidence and complete parallel exchanges without rerunning tools', async () => {
   const state = await fixture();
   let reads = 0;
   const lookup = defineTool({
@@ -172,14 +124,8 @@ test('automatic renewal retains original evidence and complete parallel exchange
     }
   });
   let generations = 0;
-  let renewals = 0;
   state.provider.complete = async (request) => {
     state.requests.push(request);
-    if (!request.tools) {
-      renewals++;
-      return { provider: 'fixture', model: 'context', content: JSON.stringify({ text: 'Use original evidence for the next answer.' }),
-        terminationReason: 'stop' };
-    }
     generations++;
     return { provider: 'fixture', model: 'context',
       content: generations === 1 ? '' : 'Revision two is supported by both original sources.',
@@ -193,14 +139,15 @@ test('automatic renewal retains original evidence and complete parallel exchange
   const first = await new AgentRuntime(options).run({ task: original }).result;
   assert.equal(first.terminal?.executionStatus, 'completed', JSON.stringify(first));
   assert.equal(reads, 2);
-  const before = await state.context.inspect();
-  state.setCapacity(requestAccountingInputTokens(before.admission.accounting) + 64);
+  const cut = await state.history.capture();
+  const evidence = await state.history.search({ query: 'Original evidence.', filter: { sourceType: 'observation' }, cut });
+  const selection = await state.context.selectSources(cut, { retain: [evidence.items[0].source] });
+  await state.context.request({ idempotencyKey: 'evidence-only', reason: 'Use original evidence', selection });
   const task = 'Answer from the original evidence. Do not read it again.';
   const result = await new AgentRuntime({ ...options, contextRenewal: { automatic: true } })
     .run({ task }).result;
   assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
-  assert.equal(renewals, 1);
-  assert.equal(reads, 2, 'Renewal must not require the completed observations to be reconstructed.');
+  assert.equal(reads, 2, 'Selection must not require the completed observations to be reconstructed.');
   const admitted = state.requests.at(-1);
   assert.equal(admitted.messages.filter(item => item.content === task).length, 1);
   assert.ok(!admitted.messages.some(item => item.content === original));
@@ -211,10 +158,10 @@ test('automatic renewal retains original evidence and complete parallel exchange
   assert.ok(observations.every(item => /"revision"\s*:\s*2/u.test(item.content)), JSON.stringify(observations));
   const after = await state.context.inspect();
   assert.ok(after.window.selection.retained.length > 1);
-  assert.ok(after.workingState.revisionId);
+  assert.equal(after.workingState.revisionId, null);
 });
 
-test('model renewal uses invocation identity and retains its own complete tool exchange', async () => {
+test('model selection uses invocation identity and retains its own complete tool exchange', async () => {
   const state = await fixture();
   let calls = 0;
   let renewedRequest;
@@ -233,7 +180,7 @@ test('model renewal uses invocation identity and retains its own complete tool e
               type: 'function',
               id: 'renew-call',
               name: 'context_transition',
-              input: { kind: 'json', value: { reason: 'Model-requested fresh window' } }
+              input: { kind: 'json', value: { reason: 'Keep the current purpose', workingState: 'Current accepted task remains active.' } }
             }
           ]
         };
@@ -250,7 +197,7 @@ test('model renewal uses invocation identity and retains its own complete tool e
     ...state.options,
     provider
   }).run({
-    task: 'Current accepted task'
+    task: 'Current accepted task', runId: 'model-context-test'
   }).result;
   assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
   assert.equal(calls, 2);
@@ -261,56 +208,9 @@ test('model renewal uses invocation identity and retains its own complete tool e
   assert.ok(
     renewedRequest.messages.some((item) => item.role === 'tool' && item.toolCallId === 'renew-call')
   );
-  assert.ok((await state.context.inspect()).window);
-});
-
-test('automatic renewal credits the capacity released by its smaller compiled request', async () => {
-  const state = await fixture();
-  state.provider.complete = async (request) => {
-    state.requests.push(request);
-    return {
-      provider: 'fixture', model: 'context', terminationReason: 'stop',
-      content: request.tools ? 'Recorded answer.' : '{"text":"Useful state"}'
-    };
-  };
-  await new AgentRuntime(state.options).run({ task: 'Original detail. '.repeat(1000) }).result;
-  await new AgentRuntime(state.options).run({ task: 'Continue.' }).result;
-  const before = await state.context.inspect();
-  state.setCapacity(requestAccountingInputTokens(before.admission.accounting) + 228);
-  const result = await new AgentRuntime({ ...state.options, contextRenewal: { automatic: true } })
-    .run({ task: 'Continue.' }).result;
-  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
-  assert.equal(state.requests.length, 3, 'A smaller maintenance request needs no redundant reserve.');
-  assert.ok(state.requests.every((request) => request.tools));
-  assert.deepEqual((await state.context.inspect()).window, before.window);
-});
-
-test('a later contribution cannot rebase an automatic renewal onto an unseen source boundary', async () => {
-  const state = await fixture();
-  const complete = state.provider.complete;
-  state.provider.complete = async (request) => {
-    const { usage, ...response } = await complete(request);
-    return response;
-  };
-  await new AgentRuntime(state.options).run({ task: 'Old detail. '.repeat(9000) }).result;
-  const before = await state.context.inspect();
-  state.setCapacity(requestAccountingInputTokens(before.admission.accounting) + 64);
-  const generation = state.provider.complete;
-  state.provider.complete = async (request) => {
-    if (!request.tools)
-      await state.sessions.appendInput(state.session, {
-        runId: 'later', task: 'Later correction outside the captured inference.'
-      });
-    return generation(request);
-  };
-  const result = await new AgentRuntime({ ...state.options, contextRenewal: { automatic: true } })
-    .run({ task: 'Continue.' }).result;
-  assert.match(result.terminal?.errorMessage, /expected boundary is stale/u);
-  const after = await state.context.inspect();
-  assert.deepEqual(after.window, before.window);
-  assert.deepEqual(after.workingState, before.workingState);
-  const retrieved = await state.history.search({ query: 'Later correction', filter: { sourceType: 'input' } });
-  assert.equal(retrieved.items.length, 1);
+  const inspection = await state.context.inspect();
+  assert.ok(inspection.window);
+  assert.equal((await state.context.workingState()).text, 'Current accepted task remains active.');
 });
 
 test('irreducible protected input suspends without provider invocation or a fake tool identity', async () => {
@@ -324,46 +224,6 @@ test('irreducible protected input suspends without provider invocation or a fake
   assert.equal(result.reason, 'context_admission');
   assert.equal(state.requests.length, 0);
   assert.equal(result.effectId, undefined);
-});
-
-test('definitive provider overflow retries only a reduced admitted selection and bounds a second rejection', async () => {
-  const { ModelProviderError } = await import('@agent-core/model');
-  for (const rejectTwice of [false, true]) {
-    const state = await fixture();
-    await new AgentRuntime(state.options).run({ task: 'Optional old detail. '.repeat(1500) })
-      .result;
-    const seen = [];
-    const provider = {
-      ...state.provider,
-      complete: async (request) => {
-        seen.push(request);
-        if (seen.length === 1 || rejectTwice)
-          throw new ModelProviderError({
-            provider: 'fixture',
-            code: 'context_overflow',
-            message: 'Provider reports context capacity.',
-            retryable: false
-          });
-        return {
-          provider: 'fixture',
-          model: 'context',
-          content: request.tools?.length
-            ? 'Continued after reduction.'
-            : JSON.stringify({ text: '' }),
-          terminationReason: 'stop'
-        };
-      }
-    };
-    const result = await new AgentRuntime({
-      ...state.options,
-      provider,
-      contextRenewal: { automatic: true }
-    }).run({ task: 'Current work' }).result;
-    assert.equal(seen.length, rejectTwice ? 2 : 3, JSON.stringify(result));
-    assert.ok(JSON.stringify(seen[1]).length < JSON.stringify(seen[0]).length);
-    if (rejectTwice) assert.equal(result.reason, 'context_admission', JSON.stringify(result));
-    else assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
-  }
 });
 
 test('unchanged admission stays suspended; an admissible changed capacity resumes the same run', async () => {
@@ -555,38 +415,6 @@ test(
   }
 );
 
-test('an incomplete continuation never replaces the working context', async () => {
-  const state = await fixture();
-  await new AgentRuntime(state.options).run({ task: 'Earlier requirements' }).result;
-  const provider = {
-    ...state.provider,
-    complete: async (request) => {
-      if (request.tools)
-        throw new ModelProviderError({
-          provider: 'fixture',
-          code: 'context_overflow',
-          message: 'Context full',
-          retryable: false
-        });
-      return {
-        provider: 'fixture',
-        model: 'context',
-        content: 'Unfinished notes',
-        terminationReason: 'output_limit',
-        usage: { promptTokens: 30, completionTokens: 10, totalTokens: 40 }
-      };
-    }
-  };
-  const result = await new AgentRuntime({
-    ...state.options,
-    provider,
-    contextRenewal: { automatic: true }
-  }).run({ task: 'Continue the work' }).result;
-  assert.equal(result.reason, 'context_admission', JSON.stringify(result));
-  assert.equal((await state.context.inspect()).window, null);
-  assert.equal(result.budget.promptTokens, 30);
-});
-
 test('large output reservations do not trigger renewal of a short conversation', async () => {
   const state = await fixture();
   await new AgentRuntime(state.options).run({ task: 'Original requirements.' }).result;
@@ -610,223 +438,6 @@ test('large output reservations do not trigger renewal of a short conversation',
   );
   assert.equal((await state.context.inspect()).window, null);
 });
-
-for (const failure of ['transient', 'unsupported', 'invalid_request', 'integrity', 'cancellation', 'ordinary']) {
-  test(`renewal preparation (${failure}) preserves only a lawful ordinary request`, async () => {
-    const state = await fixture();
-    await new AgentRuntime(state.options).run({ task: 'Preserve these original requirements.' }).result;
-    const before = await state.context.inspect();
-    const abort = new AbortController();
-    let preparations = 0;
-    const provider = {
-      ...state.provider,
-      compileRequest: async (request, options) => {
-        const renewal = request.messages.some(message =>
-          message.content?.startsWith('Runtime context-maintenance task.')
-        );
-        if (renewal) {
-          preparations++;
-          if (failure === 'cancellation') {
-            abort.abort(new Error('User cancelled preparation'));
-            request.signal?.throwIfAborted();
-          }
-          if (failure === 'integrity') throw new Error('Compiled input integrity failed');
-          if (failure === 'unsupported') throw new ModelContractError(
-            'Renewal cannot change the preserved tool catalog.', ['Native prefix is bound.']
-          );
-          throw new ModelProviderError({ provider: 'fixture',
-            code: failure === 'invalid_request' ? 'invalid_request' : 'provider_unavailable',
-            message: 'Renewal preparation unavailable', retryable: failure === 'transient'
-          });
-        }
-        if (failure === 'ordinary') throw new ModelContractError('Ordinary native input is incompatible.', []);
-        const { signal, ...body } = request;
-        return compileModelRequest({ ...options, request, profile: profile(60000), body, endpoint: 'fixture' });
-      }
-    };
-    const result = await new AgentRuntime({ ...state.options, provider,
-      contextRenewal: { automatic: true }
-    }).run({ task: 'Continue.', signal: abort.signal }).result;
-    assert.equal(preparations, failure === 'ordinary' ? 0 : 1);
-    const canContinue = ['transient', 'unsupported', 'invalid_request'].includes(failure);
-    assert.equal(state.requests.length, canContinue ? 2 : 1, JSON.stringify(result));
-    const after = await state.context.inspect();
-    assert.deepEqual(after.window, before.window);
-    assert.deepEqual(after.workingState, before.workingState);
-    if (canContinue) {
-      assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
-      assert.equal(after.admission.status, 'admitted');
-      assert.match(after.admission.message, /renewal unavailable.*ordinary request still fits/i);
-      assert.ok(state.requests[1].messages.some(message => message.content === 'Preserve these original requirements.'));
-    } else if (failure === 'cancellation') {
-      assert.equal(result.terminal?.executionStatus, 'aborted', JSON.stringify(result));
-    } else {
-      assert.equal(result.terminal?.executionStatus, 'failed', JSON.stringify(result));
-      assert.match(result.terminal.errorMessage, failure === 'ordinary' ? /Ordinary native input/ : /integrity failed/);
-    }
-  });
-}
-
-test('unavailable renewal preparation cannot authorize an oversized ordinary request', async () => {
-  const state = await fixture();
-  await new AgentRuntime(state.options).run({ task: 'Original evidence. '.repeat(1000) }).result;
-  state.setCapacity(1024);
-  const before = await state.context.inspect();
-  let preparations = 0;
-  const provider = {
-    ...state.provider,
-    compileRequest: async (request, options) => {
-      if (request.messages.some(message => message.content?.startsWith('Runtime context-maintenance task.'))) {
-        preparations++;
-        throw new ModelProviderError({ provider: 'fixture', code: 'provider_unavailable',
-          message: 'Renewal token counting unavailable', retryable: true });
-      }
-      const { signal, ...body } = request;
-      return compileModelRequest({ ...options, request, profile: profile(1024), body, endpoint: 'fixture' });
-    }
-  };
-  const result = await new AgentRuntime({ ...state.options, provider,
-    contextRenewal: { automatic: true }
-  }).run({ task: 'Continue.' }).result;
-  assert.equal(preparations, 1);
-  assert.equal(state.requests.length, 1);
-  assert.equal(result.state, 'suspended', JSON.stringify(result));
-  assert.equal(result.reason, 'context_admission');
-  const after = await state.context.inspect();
-  assert.equal(after.admission.status, 'blocked');
-  assert.match(after.admission.message, /Renewal token counting unavailable/);
-  assert.deepEqual(after.window, before.window);
-  assert.deepEqual(after.workingState, before.workingState);
-});
-
-for (const failure of ['incomplete', 'transport', 'stream']) {
-  test(`a failed proactive renewal (${failure}) preserves an admitted working context`, async () => {
-    const state = await fixture();
-    const original = 'Preserve the original requirements. '.repeat(700);
-    await new AgentRuntime(state.options).run({ task: original }).result;
-    const before = await state.context.inspect();
-    let renewals = 0;
-    let generations = 0;
-    const provider = {
-      ...state.provider,
-      describeModel: async () => ({
-        ...profile(32768),
-        capabilities: { ...profile(32768).capabilities, streaming: failure === 'stream' },
-        limits: { contextTokens: 32768, outputTokens: 16384 }
-      }),
-      complete: async (request) => {
-        if (!request.tools) {
-          renewals++;
-          if (failure !== 'incomplete') throw new ModelProviderError({
-            provider: 'fixture', code: 'provider_unavailable',
-            message: 'Renewal transport failed', retryable: true
-          });
-          return {
-            provider: 'fixture', model: 'context', content: 'Incomplete renewal',
-            terminationReason: 'output_limit',
-            usage: { promptTokens: 30, completionTokens: 10, totalTokens: 40 }
-          };
-        }
-        generations++;
-        assert.ok(request.messages.some((message) => message.content === original));
-        assert.ok(request.messages.some((message) => message.content === 'Recorded answer.'));
-        return {
-          provider: 'fixture', model: 'context',
-          content: 'Continued using the original context.', terminationReason: 'stop',
-          usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 }
-        };
-      },
-      async *stream(request) {
-        if (!request.tools) yield {
-          type: 'content', content: '{"text":"Partial', accumulated: '{"text":"Partial'
-        };
-        yield { type: 'done', response: await this.complete(request) };
-      }
-    };
-    const inference = InferenceService.inMemory({ provider });
-    const result = await new AgentRuntime({
-      ...state.options, provider, inferenceService: inference,
-      maxOutputTokens: 16384, contextRenewal: { automatic: true }
-    }).run({ task: 'Continue.' }).result;
-    assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
-    assert.equal(renewals, 1);
-    assert.equal(generations, 1);
-    const after = await state.context.inspect();
-    assert.deepEqual(after.window, before.window);
-    assert.deepEqual(after.workingState, before.workingState);
-    assert.equal(after.admission.status, 'admitted');
-    assert.equal(result.terminal.budget.promptTokens, failure === 'incomplete' ? 50 : 20);
-    if (failure !== 'incomplete') {
-      const owner = await inference.options.repository.load(result.terminal.runId);
-      assert.equal(owner.committed.invocations, 2);
-      assert.equal(owner.settledUsage.invocations, 1);
-    }
-  });
-}
-
-for (const failure of ['required-transport', 'persistence', 'cancellation']) {
-  test(`renewal (${failure}) cannot bypass admission, storage integrity or cancellation`, async () => {
-    const state = await fixture();
-    await new AgentRuntime(state.options).run({
-      task: 'Preserve the original requirements. '.repeat(700)
-    }).result;
-    const before = await state.context.inspect();
-    const abort = new AbortController();
-    let renewals = 0;
-    let generations = 0;
-    const provider = {
-      ...state.provider,
-      describeModel: async () => ({
-        ...profile(32768),
-        limits: {
-          contextTokens: 32768,
-          outputTokens: 16384
-        }
-      }),
-      complete: async (request) => {
-        if (request.tools) {
-          generations++;
-          if (failure === 'required-transport') throw new ModelProviderError({
-            provider: 'fixture', code: 'context_overflow',
-            message: 'Ordinary context rejected', retryable: false
-          });
-          return state.provider.complete(request);
-        }
-        renewals++;
-        if (failure === 'required-transport') throw new ModelProviderError({
-          provider: 'fixture', code: 'provider_unavailable',
-          message: 'Renewal transport failed', retryable: true
-        });
-        if (failure === 'cancellation') {
-          abort.abort(new Error('User cancelled renewal'));
-          request.signal?.throwIfAborted();
-        }
-        return { provider: 'fixture', model: 'context', content: '{"text":"Useful state"}',
-          terminationReason: 'stop' };
-      }
-    };
-    if (failure === 'persistence') state.context.stageWorkingState = async () => {
-      throw new Error('Working-state storage failed');
-    };
-    const result = await new AgentRuntime({
-      ...state.options, provider,
-      maxOutputTokens: failure === 'required-transport' ? 4096 : 16384,
-      contextRenewal: { automatic: true }
-    }).run({ task: 'Continue.', signal: abort.signal }).result;
-    assert.equal(renewals, 1, JSON.stringify(result));
-    assert.equal(generations, failure === 'required-transport' ? 1 : 0);
-    if (failure === 'required-transport') {
-      assert.equal(result.state, 'suspended');
-      assert.equal(result.reason, 'context_admission');
-    } else if (failure === 'persistence') {
-      assert.equal(result.terminal?.terminationReason, 'runtime_error');
-      assert.match(result.terminal.errorMessage, /Working-state storage failed/);
-    } else assert.equal(result.terminal?.executionStatus, 'aborted');
-    const after = await state.context.inspect();
-    assert.deepEqual(after.window, before.window);
-    assert.deepEqual(after.workingState, before.workingState);
-  });
-}
 
 test('a changed admitted request resumes a definitively rejected provider request without unresolved-outcome recovery', async () => {
   const state = await fixture();
@@ -876,4 +487,43 @@ test('a changed admitted request resumes a definitively rejected provider reques
     state.requests[0].messages.filter((item) => item.content === 'Keep the original work.').length,
     1
   );
+});
+
+test('a model-selected fresh context keeps parallel observations and commits state once', async () => {
+  const f = await fixture();
+  let effects = 0;
+  const read = defineTool({
+    name: 'read_fact', implementationId: 'test/read-fact', description: 'Read a fact.',
+    schema: z.strictObject({}), outputSchema: z.string(), canonicalizeInput: input => input,
+    effectEnvelope: { accesses: [{ mode: 'read', scope: 'fact' }], lockScopes: [] },
+    deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'fact' }], lockScopes: [], recovery: { kind: 'unknown' } }),
+    invoke: async () => {
+      effects++;
+      return { kind: 'result', output: 'Original exact evidence.', summary: 'Fact read',
+        scope: { resources: ['fact'], coverage: 'complete' } };
+    }
+  });
+  let turn = 0;
+  f.provider.complete = async request => {
+    f.requests.push(request);
+    return ++turn === 1 ? {
+      provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
+      toolCalls: [
+        { id: 'context-call', name: 'context_transition', type: 'function', input: { kind: 'json', value: {
+          reason: 'Continue with selected originals', retain: [], continuation: 'fresh', workingState: 'Use original evidence.'
+        } } },
+        { id: 'fact-call', name: 'read_fact', type: 'function', input: { kind: 'json', value: {} } }
+      ]
+    } : { provider: 'fixture', model: 'context', content: 'Completed.', terminationReason: 'stop' };
+  };
+  const result = await new AgentRuntime({ ...f.options, tools: [...f.options.tools, read] })
+    .run({ task: 'Current task' }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.equal(effects, 1);
+  const window = (await f.context.inspect()).window;
+  assert.equal(window.selection.continuity.kind, 'fresh');
+  const messages = f.requests[1].messages;
+  assert.deepEqual(messages.filter(item => item.role === 'tool').map(item => item.toolCallId).sort(), ['context-call', 'fact-call']);
+  assert(messages.some(item => item.content?.includes('Original exact evidence.')));
+  assert.equal((await f.context.workingState()).text, 'Use original evidence.');
 });

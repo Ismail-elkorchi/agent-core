@@ -189,9 +189,9 @@ test('source snapshots advance membership metadata without historical body reads
   const before = repository.historyReadMetrics(session.id);
   assert.equal(first.sourceRevision, 9);
   assert.equal(first.entries.length, 8);
-  assert.equal(first.finalizations.length, 1);
+  assert.equal(first.finalizedRuns.has('run-0'), true);
   assert(
-    first.entries.every(
+    [...first.entries].every(
       (entry) => !('task' in entry) && typeof entry.sha256 === 'string' && entry.bytes > 0
     )
   );

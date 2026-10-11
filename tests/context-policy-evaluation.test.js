@@ -111,7 +111,7 @@ test('Codex flags are explicit, dry mode does not read auth, and subscription en
   assert.equal(report.configuration.generation.outputLimit, 'admission-reservation-only');
   assert.equal(
     report.availability.find((item) => item.policy === 'provider-native').status,
-    'unavailable'
+    'available'
   );
   fixture.assertPrivate(JSON.stringify(report));
   await fixture.assertUnchanged();

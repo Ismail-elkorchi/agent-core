@@ -21,6 +21,7 @@ import type { ContextWindowRecord } from '../context/contracts.js';
 import { ContextSourceCapacityError } from '../run/context-admission.js';
 import { HistorySourceTooLargeError, HistoryReader, sourceRef } from '../history/reader.js';
 import { readTransformedContext } from '../inference/context-transform.js';
+import { readAdmittedModelInput, type AdmittedModelInput } from '../inference/input.js';
 import { ModelWindow, type ModelWindowImageLimits } from '../inference/model-window.js';
 import type { SessionBranchEntry } from '../session/contracts.js';
 import { resolveSessionImages } from '../session/images.js';
@@ -55,6 +56,10 @@ export async function rebuildModelWindowFromRepositories(input: {
   readonly protocol?: ModelProtocolCapabilities;
   readonly runIds?: readonly string[];
   readonly currentRunId?: string;
+  readonly readInferenceInput?: (
+    runId: string,
+    invocationId: string
+  ) => Promise<AdmittedModelInput>;
 }): Promise<ModelWindowReplayResult> {
   const modelWindow = new ModelWindow(input.estimator, input.modelWindowImageLimits);
   const view = input.history ? await readSelectedHistorySources(input.history) : undefined;
@@ -120,12 +125,19 @@ export async function rebuildModelWindowFromRepositories(input: {
   let providerStateSummary: AgentProviderStateSummary | undefined;
   let providerStateRef: ArtifactRef | undefined;
   const outputByTurn = new Map<string, readonly ModelOutputItem[]>();
+  const inferenceByTurn = new Map<string, string>();
   const steering = new Map<string, string>();
   for (const runId of [...new Set(input.runIds ?? [])]) {
     replayedLedgers++;
     for await (const record of input.events.read(runId)) {
       const event = record.event;
-      if (event.type === 'input.steering.accepted') steering.set(event.deliveryId, event.content);
+      if (event.type === 'inference.request.fingerprinted')
+        inferenceByTurn.set(
+          `${event.fingerprint.turnId}:${String(event.fingerprint.requestAttempt)}`,
+          event.fingerprint.requestId
+        );
+      if (event.type === 'input.steering.accepted')
+        steering.set(event.deliveryId, event.content);
       if (
         event.type === 'input.steering.local_applied' ||
         (event.type === 'input.steering.delivery' && event.delivery.status === 'applied')
@@ -150,14 +162,26 @@ export async function rebuildModelWindowFromRepositories(input: {
       if (
         event.type === 'assistant.ended' &&
         (!selectedWindow || retainedAssistantEvents.has(record.eventId))
-      )
+      ) {
+        if (
+          output?.some(
+            (item) => item.type === 'protocol' && item.state.compatibility.requiresExactPrefix
+          )
+        ) {
+          const invocationId = inferenceByTurn.get(
+            `${event.turnId}:${String(event.requestAttempt)}`
+          );
+          if (!input.readInferenceInput || !invocationId)
+            throw new Error('Prefix-bound reasoning is missing its admitted inference input.');
+          modelWindow.recordAdmission(await input.readInferenceInput(runId, invocationId));
+        }
         modelWindow.recordModelOutput({
           turnIndex: event.turnIndex,
           content: event.content,
           toolCalls: (event.toolCalls ?? []).map(modelToolCallFromToolCall),
           ...(output ? { output } : {})
         });
-      else if (
+      } else if (
         event.type === 'observation.record.created' &&
         (!selectedWindow ||
           retainedObservations.has(
@@ -341,6 +365,16 @@ export async function replaySourceEntries(
   currentRunId?: string
 ): Promise<number> {
   let toolResults = 0;
+  const boundResponse = [...prior]
+    .reverse()
+    .find(
+      (entry) =>
+        entry.type === 'assistant' &&
+        !portableSources.has(sourceRef(sessionId, entry).entryId) &&
+        entry.output?.some(
+          (item) => item.type === 'protocol' && item.state.compatibility.requiresExactPrefix
+        )
+    );
   const callGroups = new Map<string, Extract<SessionBranchEntry, { type: 'tool_call' }>[]>();
   const callsById = new Map<string, Extract<SessionBranchEntry, { type: 'tool_call' }>>();
   for (const entry of prior)
@@ -416,6 +450,13 @@ export async function replaySourceEntries(
           content: JSON.stringify(context)
         });
     } else if (entry.type === 'assistant') {
+      if (entry === boundResponse) {
+        if (!artifacts || !entry.inferenceInput)
+          throw new Error('Prefix-bound reasoning is missing its protected inference input.');
+        modelWindow.bindContinuation(
+          await readAdmittedModelInput(artifacts, entry.inferenceInput)
+        );
+      }
       const calls = (
         callGroups.get(`${entry.runId}:${entry.turnId}:${String(entry.requestAttempt)}`) ?? []
       ).map((item) => modelToolCallFromToolCall(decodeToolCall(item.call)));

@@ -800,7 +800,7 @@ test('context discovery advertises provider transformation only while a capable 
   });
   assert.deepEqual((await context.inspect()).legalTransitions, ['sources']);
   const unbind = context.bindRuntime({
-    providerTransform: true,
+    providerTransform: async () => true,
     schedule: async () => ({ requestId: 'request' })
   });
   assert.deepEqual((await context.inspect()).legalTransitions, ['sources', 'provider']);
@@ -930,3 +930,63 @@ for (const kind of ['memory', 'jsonl']) {
     assert.equal(lookups.length, 141, 'reopening rebuilds terminal proofs from the owning ledgers');
   });
 }
+
+for (const kind of ['memory', 'jsonl']) {
+  test(`${kind}: indexed lookup verifies only matching originals and extends to new history`, async () => {
+    const { sessions } = await backend(kind);
+    const session = await sessions.create({ binding });
+    for (let i = 0; i < 150; i++) {
+      await sessions.appendInput(session, { runId: `indexed-${i}`, task: i === 74 ? 'unique original needle' : `irrelevant original ${i}` });
+      await sessions.recordRunFinalization(session, terminal(`indexed-${i}`));
+    }
+    let reads = 0;
+    const read = sessions.readBranchEntry.bind(sessions);
+    sessions.readBranchEntry = (...args) => { reads++; return read(...args); };
+    const history = new HistoryReader({ repository: sessions, session });
+    const populated = await history.search({ query: 'absent term' });
+    assert.equal(populated.coverage, 'complete');
+    const baseline = reads;
+    const found = await history.search({ query: 'unique original needle' });
+    assert.equal(found.coverage, 'complete');
+    assert.equal(found.items.length, 1);
+    assert.equal(reads - baseline, 1, 'warm search verifies a candidate without reading unrelated source bodies');
+    const old = found.cut;
+    await sessions.appendInput(session, { runId: 'new', task: 'later unique addition' });
+    const added = await history.search({ query: 'later unique addition' });
+    assert.equal(added.items.length, 1);
+    assert.equal((await history.search({ query: 'later unique addition', cut: old })).items.length, 0);
+    const restarted = new HistoryReader({ repository: sessions, session });
+    let page = await restarted.search({ query: 'irrelevant original', limit: 11, maxScanned: 40 });
+    const ids = new Set();
+    while (true) {
+      for (const item of page.items) { assert(!ids.has(item.source.entryId)); ids.add(item.source.entryId); }
+      if (!page.cursor) break;
+      page = await new HistoryReader({ repository: sessions, session }).search({
+        query: 'irrelevant original', cursor: page.cursor, limit: 11, maxScanned: 40
+      });
+    }
+    assert.equal(ids.size, 149);
+  });
+
+
+}
+
+test('indexed history sees newly settled output before later runs and honors source timestamps', async () => {
+  const { sessions, artifacts, events } = await backend('memory');
+  const session = await sessions.create({ binding });
+  const input = await sessions.appendInput(session, { runId: 'older-open', task: 'match original' });
+  await sessions.appendInput(session, { runId: 'later', task: 'match later input' });
+  const history = new HistoryReader({ repository: sessions, session, artifacts, events });
+  assert.equal((await history.search({ query: 'match' })).items.length, 2);
+  await events.append('older-open', {
+    type: 'assistant.ended', ...identity, content: 'match late-arriving result',
+    modelOutput: { status: 'complete', message: 'match late-arriving result', source: 'content', turnIndex: 1 }
+  });
+  const extended = await history.search({ query: 'match' });
+  assert.equal(extended.coverage, 'complete');
+  assert.deepEqual(extended.items.map(item => item.text), ['match original', 'match late-arriving result', 'match later input']);
+  const before = await history.search({ query: 'match', filter: { beforeTime: input.timestamp } });
+  assert.equal(before.items.length, 0);
+  const after = await history.search({ query: 'match', filter: { afterTime: input.timestamp } });
+  assert.equal(after.items.length, 3);
+});

@@ -766,7 +766,7 @@ async function runTrial({
       'Trial failed; no automatic retry or interactive rescue.'
     );
   }
-  result.metrics.contextTransitions = (await sessions.sourceSnapshot(descriptor)).entries.filter(
+  result.metrics.contextTransitions = [...(await sessions.sourceSnapshot(descriptor)).entries].filter(
     (entry) => entry.type === 'context_transition'
   ).length;
   for (const runId of result.runIds) {

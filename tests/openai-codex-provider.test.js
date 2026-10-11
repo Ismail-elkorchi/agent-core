@@ -1888,3 +1888,36 @@ function stalledSseResponse() {
     { headers: { 'content-type': 'text/event-stream' } }
   );
 }
+
+test('Codex compaction uses the authenticated Responses trigger and exact governed body', async () => {
+  const calls = [];
+  const item = { type: 'compaction', id: 'opaque-1', encrypted_content: 'SIGNED+/=opaque' };
+  let output = [item];
+  const provider = new OpenAICodexProvider({ auth: bearerProvider(codexJwt()), fetch: async (url, init) => {
+    if (new URL(url).pathname.endsWith('/models')) return jsonResponse({ models: [{ slug: 'gpt-6.1-sol', display_name: 'Sol', context_window: 100000, input_modalities: ['text'], supported_reasoning_levels: [{ effort: 'low', description: 'low' }] }] });
+    calls.push({ url, body: JSON.parse(init.body), headers: init.headers });
+    return completionResponse({ id: 'compact-1', model: 'gpt-6.1-sol', status: 'completed', output,
+      usage: { input_tokens: 24, output_tokens: 8, total_tokens: 32 } });
+  } });
+  const request = { model: 'gpt-6.1-sol', messages: [{ role: 'developer', content: 'Policy' }, { role: 'user', content: 'Task' }],
+    tools: [{ type: 'function', function: { name: 'read', parameters: { type: 'object', properties: {} } } }], reasoning: { strategy: 'effort', effort: 'low' } };
+  const compiled = await provider.compileContextTransform({ transformId: 'compact', request }, { outputReservation: 1024 });
+  assert.deepEqual(compiled.body.input.at(-1), { type: 'compaction_trigger' });
+  assert.equal(compiled.body.tools[0].name, 'read');
+  assert.throws(() => provider.completeCompiled(compiled), /Compiled request/);
+  await assert.rejects(provider.transformContextCompiled('wrong', compiled), /context transform/);
+  const result = await provider.transformContextCompiled('compact', compiled, { affinityKey: 'owner' });
+  assert.deepEqual(calls.at(-1).body, { ...compiled.body, stream: true });
+  assert(calls.at(-1).headers['chatgpt-account-id']);
+  assert.match(calls.at(-1).headers['session-id'], /^[a-f0-9]{64}$/);
+  assert.deepEqual(result.state.data.items, [item]);
+  assert.equal(result.usage.totalTokens, 32);
+  const next = await provider.compileRequest({ ...request, messages: [request.messages[0], ...result.input, request.messages[1]] }, { outputReservation: 1024 });
+  assert.deepEqual(next.body.input.find(value => value.type === 'compaction'), item);
+  for (output of [[], [item, item]]) {
+    await assert.rejects(provider.transformContextCompiled('compact', compiled), /compaction/);
+  }
+  const beforeCancel = calls.length;
+  await assert.rejects(provider.transformContextCompiled('compact', compiled, { signal: AbortSignal.abort(new Error('cancelled')) }));
+  assert.equal(calls.length, beforeCancel);
+});

@@ -15,6 +15,7 @@ export interface ContextOperations {
   inspectContext(): Promise<ContextInspection>;
   contextSources(request: HistorySearchRequest): Promise<HistorySearchResult>;
   renewContext(selection?: ContextSelection): Promise<unknown>;
+  freshContext(): Promise<unknown>;
 }
 export interface ContextState {
   readonly requestId?: string | undefined;
@@ -25,7 +26,7 @@ export interface ContextState {
   readonly notice?: string;
 }
 export type ContextMessage =
-  | { readonly type: 'context.open' | 'context.renew' | 'context.apply' }
+  | { readonly type: 'context.open' | 'context.renew' | 'context.apply' | 'context.fresh' }
   | { readonly type: 'context.page'; readonly source: 'history' }
   | { readonly type: 'context.source'; readonly source: HistorySourceRef }
   | { readonly type: 'context.scroll'; readonly offset: number }
@@ -100,6 +101,7 @@ export function updateContext(
             async run({ signal }) {
               if (message.type === 'context.apply') await operations.renewContext(state.selection);
               if (message.type === 'context.renew') await operations.renewContext();
+              if (message.type === 'context.fresh') await operations.freshContext();
               signal.throwIfAborted();
               const inspection = reset
                 ? await operations.inspectContext()
@@ -235,10 +237,17 @@ export function contextView(
           }),
           button<Message>({
             id: 'context-renew',
-            label: 'Renew window',
+            label: 'Release optional history',
             ...(state.requestId !== undefined
               ? { disabled: true }
               : { onPress: (): Message => ({ type: 'context.renew' }) })
+          }),
+          button<Message>({
+            id: 'context-fresh',
+            label: 'Fresh reasoning; keep selected originals',
+            ...(state.requestId !== undefined || state.inspection?.pendingWork.length
+              ? { disabled: true }
+              : { onPress: (): Message => ({ type: 'context.fresh' }) })
           }),
           button<Message>({
             id: 'context-refresh',

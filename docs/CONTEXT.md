@@ -28,6 +28,8 @@ enumerate bounded original sources. Follow the cursor and check `unread`
 before claiming complete coverage. There is no full-view gateway or exhaustive
 omission list. Session repositories expose `sourceSnapshot()` for cached branch
 membership, source digests, sizes and finalization pointers without source bodies.
+Snapshots share incremental ancestry indexes and capture immutable boundaries;
+ordinary appends do not rebuild a full ancestor array or source lookup maps.
 
 `EventRepository.readReference()` verifies a committed event's run, sequence, ID
 and digest. `readRange()` scans strictly after `afterSequence`, through a pinned
@@ -45,7 +47,14 @@ run-tail indexes. No history cache retains completed run bodies. Cold constructi
 and explicit integrity verification still scan authoritative storage; first-ever
 unindexed access is not constant cost. `JsonlEventRepository.rebuild()` and
 `JsonlSessionRepository.rebuildHistoryIndex()` accept cancellation and progress
-callbacks. Interrupted rebuilds leave original ledgers intact. Search reads bounded original sources; a cursor cannot broaden host-granted scope.
+callbacks. Interrupted rebuilds leave original ledgers intact. Search incrementally builds an in-memory substring index of hashed trigrams and
+source identities, not retained source text. Warm queries verify matching candidates
+against authoritative originals. New cuts extend or replace only the affected tail;
+forks and unavailable sources cannot reuse unauthorized candidates. Cold readers
+rebuild within the requested scan allowance, including after cursor restart.
+Queries support source, run, tool, resource and inclusive `afterTime`/exclusive
+`beforeTime` filters. Index coverage and unread sources remain explicit. This is
+literal retrieval, not semantic ranking. A cursor cannot broaden host-granted scope.
 
 Keep original user contributions in history even after a context transition.
 Applications can associate a contribution with a continuation, correction, side
@@ -110,58 +119,54 @@ catalog and generation settings, then compiles the provider request.
 `assertRequestAccountingFits` alone decides fit, including separate reasoning and
 output reservations. Counts, estimates, and unknown components stay distinguishable.
 
-`context_transition` schedules a replacement window with an optional source selection. Omitting selection removes optional history while keeping current working state; the tool does not generate a summary. Activation still requires admission.
-The runtime binds the operation to its tool invocation, protects active accepted
-input and steering, preserves complete protocol exchanges, and schedules admission
-at the next lawful request boundary. Provider transforms are explicit governed
-invocations; their result must pass next-generation admission before activation.
-Idle source selection records intent without pretending to admit a future task.
+`context_transition` edits the selected original sources. `add` and `release`
+change the current selection; `retain` replaces optional history. Omitting these
+fields keeps the current sources. An empty `retain` explicitly releases optional
+history. Releasing or retaining part of a response selects the whole exchange,
+including its parallel calls and observations. Bound native responses retain their
+prefix dependencies. Active accepted input and explicit protection remain mandatory.
 
-Core hosts with a context service opt into `contextRenewal: { automatic: true }`;
-both applications enable it by default. At context pressure, governed inference
-revises working state from the current working context. This uses the same
-owner budget, admission policy, and immutable inference records as ordinary work.
-State renewal appends an auxiliary task in the user channel to the unchanged
-conversation. It preserves authority roles and provider settings, while removing executable
-tools and the original answer format. This is supported only when native state
-permits the catalog change; bound state rejects it before dispatch. A provider
-requiring bound catalogs needs a lawful native transition or explicit fresh
-continuation, not silent block removal. This
-task belongs only to its inference invocation; it is not recorded as user input.
-Capacity stays in request accounting and context inspection; the runtime does not
-insert capacity reminders into an established conversation prefix.
-Only a complete revision proposal and an admitted replacement can activate a new
-window. State and window become current together in one session journal commit.
-Automatic renewal retains the admitted recent originals, including complete
-assistant/tool exchanges. If the candidate exceeds compiled capacity, the source
-byte allowance or the existing continuity reserve, it removes the oldest whole
-contribution or exchange. Exact-prefix native responses remain grouped with
-their preceding originals. Mandatory sources must still pass request admission
-even when no further continuity reserve can be recovered. The same staged state
-proposal is used for each smaller candidate. Accepted input, steering and explicitly protected sources
-remain mandatory; the captured source boundary cannot change during selection.
-The reserve uses the net compiled cost of renewal, including capacity released
-by its smaller tool catalog, rather than adding overhead while ignoring savings.
-An unchanged proposal can renew the window without writing a new state revision. Active and protected user input remains exact; model-authored working state is
-fallible reference material, never instructions or verification. Originals remain
-retrievable. The soft continuity allowance occupies at most half of the available
-input capacity, so a large output reservation cannot trigger renewal on every
-turn. Failed summarization preserves the preceding window; proactive renewal
-preparation or generation failure does not block an ordinary request that still fits.
-Transient preparation failures and unsupported renewal requests remain visible in
-the admitted context diagnostic. Cancellation, ordinary-request incompatibility,
-and persistence or compiled-input integrity failures still stop execution.
-Irreducible input/catalog/reservation conflicts suspend the owning driver
-with actionable context diagnostics. Changing selection or model can resolve a
-conflict; retrying an unchanged request cannot. Session, work, accounting and live
-resources retain their identities across renewal. `/context` inspects the selection
-and compiled capacity; `/renew-context` and RPC `context.renew` submit renewal choices.
+The operation may also supply `workingState`, using the same full-text replacement
+as `update_working_state`. The runtime binds it to the revision presented in the
+originating inference. Staged content and the new window publish together only
+after ordinary request admission, with no implicit rebase of stale state. Without
+a state change, source selection requires no auxiliary generation. Source changes
+take effect at a settled tool boundary, including the transition's own exchange.
+
+`continuation: 'fresh'` explicitly starts new model reasoning over the selected
+originals in the same session. It preserves working state, authority, accounting,
+effects and resource lifetimes. Native reasoning remains in original storage but
+is not replayed. Idle applications can call `AgentSession.freshContinuation({profile})`;
+model switching shares that path. Outstanding effects and deliveries must be
+resolved first. The TUI context controls and RPC `context.fresh` expose this choice.
+It is never an automatic response to incompatible native state.
+
+There is no automatic portable summarization or oldest-source eviction. The model
+chooses relevant sources and updates understanding when useful. History is the
+recoverable original; working state is generated interpretation, not evidence.
+Capacity inspection exposes limits without inserting maintenance tasks into the
+conversation. Providers without native compaction use source selection or an
+explicit fresh continuation.
+
+Hosts may enable `contextRenewal: { automatic: true }` for native fallback; both
+applications do. Only a declared, governed native operation can resolve a rejected
+request or a required bound-prefix configuration change. Fitting ordinary requests
+do not trigger compaction. `strategy: 'provider'` explicitly requests native
+compaction at a legal boundary. The transform itself and its successor must pass
+admission. A source already too large for the transform still requires selection,
+a different reservation, or another model. Failure preserves the old window and
+records the reason; settled usage and unresolved exposure stay with their owner.
+
+Session identity and resources survive every context transition. `/context`
+inspects capacity and selected sources. `/renew-context` and `context.renew` release
+optional sources or submit an explicit selection; they do not summarize the archive.
+Retrying an unchanged, rejected request cannot resolve an admission conflict.
 
 ## Governed inference
 
 Pass one `InferenceService` to the primary runtime and auxiliary consumers. Supply
 an explicit invocation repository and artifact repository for durable auxiliary
-work. A common `ownerId` binds primary work, state renewal, and verification to
+work. A common `ownerId` binds primary work, native transforms, and verification to
 one resource policy. `invocationId` identifies a particular admitted request;
 `purpose` explains its application role without imposing a workflow.
 

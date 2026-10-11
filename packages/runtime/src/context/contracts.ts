@@ -36,11 +36,12 @@ export interface ContextTransitionRecord {
   readonly requestFingerprint: string;
   readonly selectionFingerprint: string;
   readonly requestedSourceRevision?: number | undefined;
+  readonly requestedWorkingStateRevisionId?: string | null | undefined;
   readonly committedAt: string;
 }
 export interface ContextTransitionCommit {
   readonly expectedWorkingStateRevisionId: string | null;
-  readonly workingState?: WorkingStateChange;
+  readonly workingState?: WorkingStateChange | undefined;
   readonly expectedLeafId: string | null;
   readonly expectedSourceRevision: number;
   readonly expectedWindowId: string | null;
@@ -48,6 +49,8 @@ export interface ContextTransitionCommit {
   readonly transition: ContextTransitionRecord;
 }
 export interface ContextTransitionRequest {
+  readonly workingState?: WorkingStateChange | undefined;
+  readonly expectedWorkingStateRevisionId?: string | null | undefined;
   readonly toolInvocation?:
     | Pick<
         import('@agent-core/tools').ToolInvocationContext,

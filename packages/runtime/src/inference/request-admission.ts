@@ -6,6 +6,8 @@ import {
   type RequestAccounting
 } from '@agent-core/model';
 import type { InferenceService } from './service.js';
+import { hashJson } from '@agent-core/persistence';
+import { NativeContextTransitionRequired } from './input.js';
 import {
   ModelRequestAssembler,
   type ModelRequestAssemblyInput
@@ -24,10 +26,23 @@ export class RequestAdmission {
     outputReservation: number
   ) {
     const assembly = await this.assembler.assemble(input);
+    if (
+      assembly.continuationSource &&
+      hashJson(settings.tools ?? []) !== hashJson(assembly.continuationSource.tools ?? [])
+    )
+      throw new NativeContextTransitionRequired(
+        assembly.continuationSource,
+        'The current tool catalog differs from the catalog bound to earlier reasoning.'
+      );
     const request: ModelRequest = { ...settings, messages: assembly.messages };
-    const compiled = await this.inference.compile(request, input.modelProfile, {
-      outputReservation
-    });
+    const compiled = await this.inference.compile(
+      request,
+      input.modelProfile,
+      {
+        outputReservation
+      },
+      assembly.presentation
+    );
     return Object.freeze({ assembly, request, compiled });
   }
 

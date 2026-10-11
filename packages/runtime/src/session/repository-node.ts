@@ -1,3 +1,5 @@
+import { protectedInferenceInput } from '../inference/input.js';
+import type { ProtectedArtifactRef } from '@agent-core/persistence';
 import {
   workingStateEntrySchema,
   workingStateRetry,
@@ -450,6 +452,7 @@ export class JsonlSessionRepository implements SessionRepository {
       reasoningSummary?: string;
       output?: readonly ModelOutputItem[];
       completeness?: SessionAssistantEntry['completeness'];
+      inferenceInput?: ProtectedArtifactRef;
       source?: import('../history/contracts.js').HistoryEventSource;
     }
   ): Promise<SessionAssistantEntry> {
@@ -478,6 +481,8 @@ export class JsonlSessionRepository implements SessionRepository {
               existing.reasoningSummary !== input.reasoningSummary ||
               hashJson(existing.output ?? null) !== hashJson(input.output ?? null) ||
               existing.completeness !== input.completeness ||
+              hashJson(existing.inferenceInput ?? null) !==
+                hashJson(input.inferenceInput ?? null) ||
               hashJson(existing.source ?? null) !== hashJson(input.source ?? null)
             )
               throw new PersistenceConflictError(
@@ -497,6 +502,9 @@ export class JsonlSessionRepository implements SessionRepository {
               : { reasoningSummary: input.reasoningSummary }),
             ...(input.source ? { source: historyEventSourceSchema.parse(input.source) } : {}),
             ...(input.output ? { output: ownSessionAssistantOutput(input.output) } : {}),
+            ...(input.inferenceInput
+              ? { inferenceInput: protectedInferenceInput(input.inferenceInput) }
+              : {}),
             ...(input.completeness ? { completeness: input.completeness } : {})
           });
           await this.appendRecord(sessionId, state, entry);
@@ -1067,7 +1075,9 @@ interface SessionAppendIndex extends SessionFileState {
   storageStamp: JsonlStorageStamp;
 }
 function sessionRecordCount(state: SessionFileState): number {
-  return state.branchEntries.length + state.finalizations.length + state.submissionRecords.length;
+  return (
+    state.branchEntries.length + state.finalizations.length + state.submissionRecords.length
+  );
 }
 
 async function readSessionFile(
@@ -1146,7 +1156,12 @@ function parseBranchEntry(value: JsonValue): SessionBranchEntry {
     return Object.freeze({
       ...value,
       ...(value.source ? { source: historyEventSourceSchema.parse(value.source) } : {}),
-      ...(value.output === undefined ? {} : { output: ownSessionAssistantOutput(value.output) })
+      ...(value.output === undefined
+        ? {}
+        : { output: ownSessionAssistantOutput(value.output) }),
+      ...(value.inferenceInput === undefined
+        ? {}
+        : { inferenceInput: protectedInferenceInput(value.inferenceInput) })
     });
   if (isSessionToolCallEntry(value)) return value;
   if (isSessionObservationEntry(value)) {

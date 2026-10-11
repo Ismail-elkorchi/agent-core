@@ -1,8 +1,4 @@
-import {
-  workingStateRenewalRequest,
-  workingStateRenewalSources,
-  stageWorkingStateRenewal
-} from './context/working-state-renewal.js';
+import { NativeContextTransitionRequired } from './inference/input.js';
 import type { WorkingStateSnapshot } from './session/working-state.js';
 import { providerSettlementKey } from './inference/run-lifecycle.js';
 import { ContextSourceCapacityError } from './run/context-admission.js';
@@ -17,9 +13,7 @@ import {
 } from '@agent-core/effects';
 import {
   RequestTokenEstimator,
-  requestAccountingInputTokens,
   ModelContractError,
-  ModelProviderError,
   parseModelProfile,
   type CompiledModelRequest,
   type ModelOutputItem,
@@ -56,7 +50,6 @@ import {
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { ContextTransitionRequest } from './context/contracts.js';
-import type { SessionContextTransitionEntry } from './session/contracts.js';
 import type { ContextAdmissionInput, ContextService } from './context/service.js';
 import {
   encodeAgentEvent,
@@ -80,7 +73,10 @@ import {
   rebuildModelWindowFromRepositories,
   replaySourceEntries
 } from './orchestration/session-replay.js';
-import { encodeContextTransformReference } from './inference/context-transform.js';
+import {
+  encodeContextTransformReference,
+  readTransformedContext
+} from './inference/context-transform.js';
 import { ModelWindow } from './inference/model-window.js';
 import type { NativeGenerationContext } from './inference/native-inference.js';
 import { NativeSteeringCoordinator } from './inference/native-steering.js';
@@ -94,7 +90,7 @@ import {
   invokeRunInference,
   providerUsageQuantities
 } from './inference/run-lifecycle.js';
-import { InferenceOutcomeUnknownError, InferenceService } from './inference/service.js';
+import { InferenceService } from './inference/service.js';
 import {
   BudgetAccountant,
   type RequestCostEstimate,
@@ -484,19 +480,25 @@ export class AgentRuntime {
         const work = providerWork(run.state(), invocation);
         if (work.stage === 'ready')
           throw new Error('Working-state update has no admitted inference.');
-        const invocationId = work.effect.intent.effectId.slice(
-          0,
-          work.effect.intent.effectId.lastIndexOf(':')
-        );
         return this.inferenceService.workingStateOrigin(
           this.options.inferenceOwnerId ?? invocation.runId,
-          invocationId
+          work.invocationId
         );
       },
       schedule: (request) => this.scheduleContextTransition(request),
-      providerTransform:
+      modelSelection: () => ({
+        provider: this.options.provider.id,
+        model: this.options.model,
+        ...(this.options.reasoning ? { reasoning: this.options.reasoning } : {}),
+        ...(this.options.temperature === undefined ? {} : { temperature: this.options.temperature })
+      }),
+      providerTransform: async () =>
         typeof options.provider.compileContextTransform === 'function' &&
-        typeof options.provider.transformContextCompiled === 'function'
+        typeof options.provider.transformContextCompiled === 'function' &&
+        Boolean(
+          (await options.provider.describeModel(this.options.model)).capabilities.protocol
+            ?.contextTransforms.length
+        )
     });
     if (!Number.isSafeInteger(options.maxOutputTokens) || options.maxOutputTokens < 1)
       throw new TypeError('AgentRuntime requires an explicit positive maxOutputTokens allowance.');
@@ -530,9 +532,11 @@ export class AgentRuntime {
       this.options.repositories.artifacts ?? this.inferenceService.options.artifacts
     );
     const abortController = new AbortController();
-    const runReady = runs.inspect(runId).then((inspection) =>
-      inspection.state.phase.kind === 'terminal' ? undefined : runs.attach(runId)
-    );
+    const runReady = runs
+      .inspect(runId)
+      .then((inspection) =>
+        inspection.state.phase.kind === 'terminal' ? undefined : runs.attach(runId)
+      );
     this.activeAbortController = abortController;
     this.activeRunId = runId;
     this.activeRunReady = runReady;
@@ -807,10 +811,15 @@ export class AgentRuntime {
       if (phase?.stage === 'outcome_unknown') return runSuspension(run.state());
       if (phase?.stage === 'effect_ready') {
         await this.scheduleAbortRun(
-          runId, 'The run was interrupted before its provider request started.'
+          runId,
+          'The run was interrupted before its provider request started.'
         );
         return await this.runInternal(
-          runInput(run.state()), abortController.signal, run, undefined, true
+          runInput(run.state()),
+          abortController.signal,
+          run,
+          undefined,
+          true
         );
       }
       if (phase?.stage === 'effect_pending') {
@@ -824,10 +833,11 @@ export class AgentRuntime {
           const settled = settleExternalEffect(phase.effect, phase.effect.settlementPermit, {
             outcome: failed ? 'failed' : 'succeeded',
             resultDigest: hashJson(settlement.event),
-            exposure: settlement.event.type === 'provider.attempt.settled' &&
+            exposure:
+              settlement.event.type === 'provider.attempt.settled' &&
               settlement.event.response.usage
-              ? knownEffectExposure(providerUsageQuantities(settlement.event.response.usage))
-              : unknownEffectExposure(phase.effect.intent.exposure)
+                ? knownEffectExposure(providerUsageQuantities(settlement.event.response.usage))
+                : unknownEffectExposure(phase.effect.intent.exposure)
           });
           if (settled.status !== 'settled' && settled.status !== 'already_settled')
             throw new Error(
@@ -958,7 +968,8 @@ export class AgentRuntime {
     let decision: ExecutionDecision;
     try {
       const sessionInput = await this.recordSessionInput(
-        input, restoring || providerContinuation !== undefined
+        input,
+        restoring || providerContinuation !== undefined
       );
       throwIfAborted(signal);
       if (run.state().phase.kind === 'accepted' && run.state().control.status === 'owned') {
@@ -1164,9 +1175,13 @@ export class AgentRuntime {
       runId: input.runId,
       task: input.task,
       ...(input.images === undefined ? {} : { images: input.images }),
-      instructions: original?.type === 'input'
-        ? original.instructions
-        : [...(await this.currentApplicationInstructions()), ...runInstructions(input.instructions)]
+      instructions:
+        original?.type === 'input'
+          ? original.instructions
+          : [
+              ...(await this.currentApplicationInstructions()),
+              ...runInstructions(input.instructions)
+            ]
     });
   }
 
@@ -1176,13 +1191,15 @@ export class AgentRuntime {
       providerPhase?.stage === 'failed'
         ? providerPhase
         : providerPhase?.stage === 'ready'
-          ? runtime.run.state().providerRequests.find(
-              (request): request is Extract<AgentProviderPhase, { readonly stage: 'consumed' }> =>
-                request.stage === 'consumed' &&
-                request.effect.settlement.outcome === 'failed' &&
-                request.identity.turnId === providerPhase.identity.turnId &&
-                request.identity.requestAttempt + 1 === providerPhase.identity.requestAttempt
-            )
+          ? runtime.run
+              .state()
+              .providerRequests.find(
+                (request): request is Extract<AgentProviderPhase, { readonly stage: 'consumed' }> =>
+                  request.stage === 'consumed' &&
+                  request.effect.settlement.outcome === 'failed' &&
+                  request.identity.turnId === providerPhase.identity.turnId &&
+                  request.identity.requestAttempt + 1 === providerPhase.identity.requestAttempt
+              )
           : undefined;
     if (failedAttempt) {
       const settlement = await this.readProviderSettlement(
@@ -1193,7 +1210,10 @@ export class AgentRuntime {
       );
       if (settlement?.event.type !== 'provider.attempt.failed')
         throw new Error('Failed provider attempt has no matching failure record.');
-      return failedGenerationDecision(settlement.event.diagnostic, failedAttempt.identity.turnIndex);
+      return failedGenerationDecision(
+        settlement.event.diagnostic,
+        failedAttempt.identity.turnIndex
+      );
     }
     this.steeringReceipts.clear();
     this.nativeSteering = new NativeSteeringCoordinator({
@@ -1251,6 +1271,8 @@ export class AgentRuntime {
     const sessionEntryId = runtime.sessionInput?.id;
     const rebuild = async () =>
       rebuildModelWindowFromRepositories({
+        readInferenceInput: (runId, invocationId) =>
+          this.inferenceService.admittedInput(this.options.inferenceOwnerId ?? runId, invocationId),
         ...(this.history ? { history: this.history } : {}),
         events: this.options.repositories.events,
         ...(this.options.repositories.artifacts
@@ -1891,14 +1913,15 @@ export class AgentRuntime {
       await runtime.append(interrupted);
       await runtime.emit(interrupted);
     }
-    const failedRequest = runtime.run.state().providerRequests.find((request) =>
-      sameTurnIdentity(request.identity, attachedIdentity)
-    );
+    const failedRequest = runtime.run
+      .state()
+      .providerRequests.find((request) => sameTurnIdentity(request.identity, attachedIdentity));
     if (
       diagnostic &&
       turnCount > 0 &&
       failedRequest &&
-      failedRequest.stage !== 'ready' && failedRequest.stage !== 'effect_ready'
+      failedRequest.stage !== 'ready' &&
+      failedRequest.stage !== 'effect_ready'
     ) {
       const failed = {
         type: 'model.failed' as const,
@@ -2541,7 +2564,9 @@ export class AgentRuntime {
           const capacityFailure = completedAttempt.diagnostic.code === 'context_overflow';
           if (
             capacityFailure &&
-            (contextRetries === 1 || !this.options.contextRenewal?.automatic || !this.options.context)
+            (contextRetries === 1 ||
+              !this.options.contextRenewal?.automatic ||
+              !this.options.context)
           )
             throw new ContextAdmissionError(
               assembly.compiled,
@@ -2581,11 +2606,13 @@ export class AgentRuntime {
           await this.advanceRun(request.run, 'consume_provider_settlement', {
             phase: { kind: 'active' },
             providerRequests: [
-              ...request.run.state().providerRequests.map((previous) =>
-                sameTurnIdentity(previous.identity, phase.identity)
-                  ? { ...phase, stage: 'consumed' as const }
-                  : previous
-              ),
+              ...request.run
+                .state()
+                .providerRequests.map((previous) =>
+                  sameTurnIdentity(previous.identity, phase.identity)
+                    ? { ...phase, stage: 'consumed' as const }
+                    : previous
+                ),
               {
                 kind: 'provider',
                 stage: 'ready',
@@ -2698,6 +2725,20 @@ export class AgentRuntime {
     output?: readonly ModelOutputItem[]
   ): Promise<void> {
     if (this.options.repositories.session) {
+      const bound = output?.some(
+        (item) => item.type === 'protocol' && item.state.compatibility.requiresExactPrefix
+      );
+      const source =
+        bound && this.activeRunDriver
+          ? providerWork(this.activeRunDriver.state(), event)
+          : undefined;
+      const inferenceInput =
+        source && source.stage !== 'ready'
+          ? await this.inferenceService.inputReference(
+              this.options.inferenceOwnerId ?? runId,
+              source.invocationId
+            )
+          : undefined;
       await this.options.repositories.session.repository.appendAssistant(
         this.options.repositories.session.descriptor,
         {
@@ -2714,6 +2755,7 @@ export class AgentRuntime {
             hash: receipt.hash
           },
           content: event.content,
+          ...(inferenceInput ? { inferenceInput } : {}),
           ...(event.reasoning === undefined ? {} : { reasoning: event.reasoning }),
           ...(event.reasoningSummary === undefined
             ? {}
@@ -2834,11 +2876,17 @@ export class AgentRuntime {
       ...contextInputs.provider,
       ...contextInputs.run
     ];
-    const assemble = async (window: ModelWindow, workingState: WorkingStateSnapshot) => {
+    const assemble = async (
+      window: ModelWindow,
+      workingState: WorkingStateSnapshot,
+      conversationOnly = false
+    ) => {
       const stateContext = workingStateContext(workingState)[0];
       const result = await this.requestAdmission.assemble(
         {
           window,
+          runId: request.runId,
+          conversationOnly,
           task: request.input.task,
           ...(request.input.images === undefined ? {} : { images: request.input.images }),
           instructions: promptInstructionsForRequest({
@@ -2887,13 +2935,26 @@ export class AgentRuntime {
       return { ...result, workingStateRevisionId: workingState.revision?.id ?? null };
     };
     let selected: Awaited<ReturnType<typeof assemble>> | undefined;
+    let nativeSource: ModelRequest | undefined;
+    let nativeUsagePending = false;
+    const recordNativeUsage = async () => {
+      if (!nativeUsagePending) return;
+      await request.controller.recordUsage(
+        await this.inferenceService.settledRunUsage(
+          this.options.inferenceOwnerId ?? request.runId,
+          request.runId
+        )
+      );
+      nativeUsagePending = false;
+    };
     const validate = async (input: ContextAdmissionInput) => {
       assertToolTransitionBoundary(request.run.state());
       const boundary = request.run.state().revision;
+      if (input.selection.strategy === 'provider') nativeUsagePending = true;
       const proposed = await this.contextWindowForAdmission(
         input,
         request,
-        async (window) => (await assemble(window, input.workingState)).request
+        async (window) => nativeSource ?? (await assemble(window, input.workingState, true)).request
       );
       const result = await assemble(proposed.window, input.workingState);
       await this.requestAdmission.admit(result.compiled, request.snapshot.profile);
@@ -2919,32 +2980,36 @@ export class AgentRuntime {
       };
     };
     if (this.options.context) {
-      await this.contextTransitions?.drain({
-        context: this.options.context,
-        admit: (transition) => this.retainPendingSources(transition, request.runId),
-        validate,
-        committed: async (entry) => {
-          await this.activateCommittedContext(request.modelWindow, request.runId);
-          await emit({
-            type: 'context.transitioned',
-            window: entry.window,
-            transition: entry.transition
-          });
-        },
-        rejected: (requestId, message) =>
-          capturedContext.push({
-            id: requestId,
-            sourceUri: `runtime://context-selection/${requestId}`,
-            sourceKind: 'generated',
-            representation: 'full',
-            mediaType: 'text/plain',
-            title: 'Context selection rejected',
-            content: message,
-            purpose:
-              'The requested selection was not committed; the preceding window remains active.'
-          }),
-        signal: request.signal
-      });
+      try {
+        await this.contextTransitions?.drain({
+          context: this.options.context,
+          admit: (transition) => this.retainPendingSources(transition, request.runId),
+          validate,
+          committed: async (entry) => {
+            await this.activateCommittedContext(request.modelWindow, request.runId);
+            await emit({
+              type: 'context.transitioned',
+              window: entry.window,
+              transition: entry.transition
+            });
+          },
+          rejected: (requestId, message) =>
+            capturedContext.push({
+              id: requestId,
+              sourceUri: `runtime://context-selection/${requestId}`,
+              sourceKind: 'generated',
+              representation: 'full',
+              mediaType: 'text/plain',
+              title: 'Context selection rejected',
+              content: message,
+              purpose:
+                'The requested selection was not committed; the preceding window remains active.'
+            }),
+          signal: request.signal
+        });
+      } finally {
+        await recordNativeUsage();
+      }
     }
     const cut = await this.options.context?.history.capture();
     const workingState = (await this.options.context?.workingState(cut)) ?? {
@@ -2952,7 +3017,73 @@ export class AgentRuntime {
       text: ''
     };
     if (sourceConflict && !selected) throw sourceConflict;
-    let result = selected ?? (await assemble(request.modelWindow, workingState));
+    const nativeSupported =
+      Boolean(request.snapshot.profile.capabilities.protocol?.contextTransforms.length) &&
+      typeof this.options.provider.compileContextTransform === 'function' &&
+      typeof this.options.provider.transformContextCompiled === 'function';
+    const nativeTransition = async (reason: string, source?: ModelRequest) => {
+      const context = this.options.context;
+      if (!context || !nativeSupported)
+        throw new Error('No native transition is supported for the selected provider/model.');
+      const current = await context.inspect();
+      const view = await readSelectedHistorySources(context.history, current.cut);
+      const transformed = await this.readCurrentTransform(view, request.snapshot.profile);
+      const protectedIds = new Set(current.protectedSources.map((source) => source.entryId));
+      const sources = view.entries.filter((entry) => {
+        const id = sourceRef(current.cut.sessionId, entry).entryId;
+        return (
+          ['input', 'steering', 'assistant', 'tool_call', 'observation'].includes(entry.type) &&
+          (!transformed?.represented.has(id) || protectedIds.has(id))
+        );
+      });
+      nativeSource = source && { ...source, signal: request.signal };
+      try {
+        const entry = await context.transition(
+          {
+            expectedWindowId: current.window?.windowId ?? null,
+            expectedSourceRevision: current.cut.sourceRevision,
+            expectedWorkingStateRevisionId: workingState.revision?.id ?? null,
+            idempotencyKey: `native-renewal:${request.snapshot.record.turnId}:${String(current.cut.sourceRevision)}`,
+            reason,
+            selection: {
+              strategy: 'provider',
+              retained: sources.map((entry) => sourceRef(current.cut.sessionId, entry)),
+              ...(current.window?.selection.protected
+                ? { protected: current.window.selection.protected }
+                : {})
+            }
+          },
+          {
+            signal: request.signal,
+            admit: validate
+          }
+        );
+        await this.activateCommittedContext(request.modelWindow, request.runId);
+        await emit({
+          type: 'context.transitioned',
+          window: entry.window,
+          transition: entry.transition
+        });
+        if (!selected) throw new Error('Native context transition did not admit the next request.');
+        return selected;
+      } finally {
+        nativeSource = undefined;
+        await recordNativeUsage();
+      }
+    };
+    let result: Awaited<ReturnType<typeof assemble>>;
+    try {
+      result = selected ?? (await assemble(request.modelWindow, workingState));
+    } catch (error) {
+      if (
+        !(error instanceof NativeContextTransitionRequired) ||
+        !nativeSupported ||
+        !this.options.context ||
+        !this.options.contextRenewal?.automatic
+      )
+        throw error;
+      result = await nativeTransition(error.message, error.request);
+    }
     let admissionFailure: ContextAdmissionError | undefined;
     try {
       await this.requestAdmission.admit(result.compiled, request.snapshot.profile);
@@ -2966,163 +3097,27 @@ export class AgentRuntime {
       if (!(cause instanceof ContextAdmissionError)) throw cause;
       admissionFailure = cause;
     }
-    const hasWorkingHistory =
-      workingState.revision !== null ||
-      result.request.messages.some(
-        (message) =>
-          message.role === 'assistant' || message.role === 'tool' || message.role === 'protocol'
-      );
-    const accounting = result.compiled.accounting;
-    let renewalNotice: string | undefined;
     if (
-      !selected &&
-      hasWorkingHistory &&
+      admissionFailure &&
+      nativeSupported &&
       this.options.context &&
       this.options.contextRenewal?.automatic
     ) {
-      let renewalCompiled: CompiledModelRequest | undefined;
+      // Source choices have already been applied by the same admission path. Native
+      // transformation is a last resort for a request that cannot fit, not routine upkeep.
+      const rejectedRequest = admissionFailure;
       try {
-        const renewalRequest = workingStateRenewalRequest(result.request);
-        renewalCompiled = await this.inferenceService.compile(
-          renewalRequest,
-          request.snapshot.profile,
-          { outputReservation: request.snapshot.requestWindow.maxOutputTokens }
-        );
+        result = await nativeTransition('Required native context renewal.');
+        admissionFailure = undefined;
+      } catch (cause) {
         request.signal.throwIfAborted();
-        // The reserve credits removed declarations before clamping. Preparing it is
-        // speculative; it does not change the ordinary request's admission.
-        const renewalHeadroom = Math.max(
-          0,
-          requestAccountingInputTokens(renewalCompiled.accounting) -
-            requestAccountingInputTokens(accounting) +
-            accounting.outputReservation +
-            (accounting.pricingSemantics.reasoningIncludedInOutput === false
-              ? accounting.reasoningReservation
-              : 0)
+        admissionFailure = new ContextAdmissionError(
+          rejectedRequest.compiled,
+          new Error(`${rejectedRequest.message} Native renewal failed: ${errorMessage(cause)}`, {
+            cause
+          }),
+          rejectedRequest.providerRejected
         );
-        if (
-          admissionFailure ||
-          requestCapacity(accounting, renewalHeadroom).pressure === 'continuity'
-        ) {
-          const context = await this.options.context.inspect();
-          const renewalState = await stageWorkingStateRenewal({
-            inference: this.inferenceService,
-            context: this.options.context,
-            revisionId: result.workingStateRevisionId,
-            request: renewalRequest,
-            compiled: renewalCompiled,
-            profile: request.snapshot.profile,
-            cut: context.cut,
-            ownerId: this.options.inferenceOwnerId ?? request.runId,
-            runId: request.runId,
-            outputReservation: request.snapshot.requestWindow.maxOutputTokens
-          }).finally(async () => {
-            await request.controller.recordUsage(
-              await this.inferenceService.settledRunUsage(
-                this.options.inferenceOwnerId ?? request.runId,
-                request.runId
-              )
-            );
-          });
-          const sources = workingStateRenewalSources(
-            (await readSelectedHistorySources(this.options.context.history, context.cut)).entries
-          );
-          let renewed: typeof result | undefined;
-          let entry: SessionContextTransitionEntry;
-          for (;;) {
-            const retained = new Map(
-              [...context.protectedSources, ...sources.flatMap((group) =>
-                group.map((source) => sourceRef(context.cut.sessionId, source))
-              )].map((source) => [source.entryId, source])
-            );
-            const renewal: ContextTransitionRequest = {
-              expectedWindowId: context.window?.windowId ?? null,
-              expectedSourceRevision: context.cut.sourceRevision,
-              idempotencyKey: `working-state-renewal:${renewalState.invocationId}`,
-              reason: 'Automatic context renewal with the current working-state interpretation.',
-              selection: { strategy: 'sources', retained: [...retained.values()] }
-            };
-            try {
-              entry = await this.options.context.transition(renewal, {
-                signal: request.signal,
-                expectedWorkingStateRevisionId: result.workingStateRevisionId,
-                ...(renewalState.change ? { workingState: renewalState.change } : {}),
-                admit: async (input) => {
-                  const admitted = await validate(input);
-                  if (
-                    sources.length > 0 &&
-                    selected &&
-                    requestCapacity(selected.compiled.accounting, renewalHeadroom).pressure === 'continuity'
-                  )
-                    throw new ContextAdmissionError(
-                      selected.compiled,
-                      new Error('Retained originals leave no continuity reserve.')
-                    );
-                  renewed = selected;
-                  return admitted;
-                }
-              });
-              break;
-            } catch (error) {
-              if (
-                !(error instanceof ContextAdmissionError || error instanceof ContextSourceCapacityError) ||
-                sources.length === 0
-              )
-                throw error;
-              // Only source selection changes. The same staged state and exact admission path
-              // determine fit; accepted input and explicit protection remain mandatory.
-              sources.shift();
-            }
-          }
-          await this.activateCommittedContext(request.modelWindow, request.runId);
-          await emit({
-            type: 'context.transitioned',
-            window: entry.window,
-            transition: entry.transition
-          });
-          if (!renewed) throw new Error('Renewal did not admit a captured request.');
-          result = renewed;
-          admissionFailure = undefined;
-        }
-      } catch (error) {
-        request.signal.throwIfAborted();
-        const invocationFailure =
-          error instanceof InferenceOutcomeUnknownError ? error.cause : error;
-        const providerFailure =
-          invocationFailure instanceof ModelStreamInterruptedError
-            ? invocationFailure.cause
-            : invocationFailure;
-        const renewalUnavailable =
-          providerFailure instanceof ModelProviderError &&
-          providerFailure.retryable &&
-          providerFailure.code !== 'aborted';
-        const preparationUnavailable =
-          renewalCompiled === undefined &&
-          (error instanceof ModelContractError ||
-            (providerFailure instanceof ModelProviderError && providerFailure.code === 'invalid_request'));
-        // Only the optional candidate failed. Ordinary incompatibility, cancellation
-        // and failures of storage or compiled-input integrity remain fatal.
-        const renewalFailed =
-          error instanceof ContextAdmissionError || renewalUnavailable || preparationUnavailable;
-        const message = `Automatic context renewal unavailable: ${errorMessage(error)}`;
-        if (admissionFailure || !renewalFailed) {
-          const failure =
-            admissionFailure && renewalFailed
-              ? new ContextAdmissionError(
-                  admissionFailure.compiled,
-                  new Error(`${admissionFailure.message} ${message}`, { cause: error }),
-                  admissionFailure.providerRejected
-                )
-              : error;
-          this.options.context.recordAdmission({
-            status: 'blocked',
-            inputIdentity: result.compiled.inputIdentity,
-            accounting: result.compiled.accounting,
-            message: errorMessage(failure)
-          });
-          throw failure;
-        }
-        renewalNotice = `${message} The ordinary request still fits its context allowance.`;
       }
     }
     if (admissionFailure) {
@@ -3168,7 +3163,12 @@ export class AgentRuntime {
       status: 'admitted',
       inputIdentity: compiled.inputIdentity,
       accounting: compiled.accounting,
-      ...(renewalNotice === undefined ? {} : { message: renewalNotice })
+      ...(requestCapacity(result.compiled.accounting).pressure === 'continuity'
+        ? {
+            message:
+              'Context is near capacity. Select sources or explicitly renew native continuity; working-state maintenance is not required.'
+          }
+        : {})
     });
     await this.options.onRequestAdmitted?.({
       requestId: fingerprint.requestId,
@@ -3177,12 +3177,32 @@ export class AgentRuntime {
         ...assembly.context.items.map((item) => item.id)
       ]
     });
+    request.modelWindow.recordAdmission({
+      runId: request.runId,
+      request: compiled.logicalRequest,
+      presentation: assembly.presentation
+    });
     return { request: result.request, compiled, estimate, fingerprint };
   }
 
   private async currentApplicationInstructions(): Promise<AgentEffectiveInstruction[]> {
     const source = this.options.instructions;
     return applicationInstructions(typeof source === 'function' ? await source() : source);
+  }
+
+  private async readCurrentTransform(
+    view: Awaited<ReturnType<typeof readSelectedHistorySources>>,
+    profile: ModelProfile
+  ) {
+    const artifacts = this.options.repositories.artifacts;
+    if (!artifacts) return undefined;
+    return readTransformedContext({
+      view,
+      artifacts,
+      provider: this.options.provider.id,
+      model: profile.id,
+      ...protocolTarget(profile)
+    });
   }
 
   private async contextWindowForAdmission(
@@ -3195,13 +3215,49 @@ export class AgentRuntime {
     let providerState: ReturnType<typeof encodeContextTransformReference> | undefined;
     if (input.selection.strategy === 'provider') {
       const transformedWindow = new ModelWindow(this.estimator);
+      const current = this.options.context
+        ? await this.readCurrentTransform(
+            await readSelectedHistorySources(this.options.context.history, input.cut),
+            request.snapshot.profile
+          )
+        : undefined;
+      transformedWindow.setTransformedInput(current?.input ?? []);
+      const protectedIds = new Set(
+        (
+          (await this.options.context?.protectedSources(input.cut)) ??
+          input.selection.protected ??
+          []
+        ).map((source) => source.entryId)
+      );
+      const protectedExchanges = new Set(
+        selected.flatMap((entry) =>
+          (entry.type === 'assistant' ||
+            entry.type === 'tool_call' ||
+            entry.type === 'observation') &&
+          protectedIds.has(sourceRef(input.cut.sessionId, entry).entryId)
+            ? [assistantResponseKey(entry.runId, entry)]
+            : []
+        )
+      );
+      for (const entry of selected)
+        if (
+          (entry.type === 'assistant' ||
+            entry.type === 'tool_call' ||
+            entry.type === 'observation') &&
+          protectedExchanges.has(assistantResponseKey(entry.runId, entry))
+        )
+          protectedIds.add(sourceRef(input.cut.sessionId, entry).entryId);
       const represented = selected.filter(
-        (entry) => entry.type !== 'input' || entry.runId !== request.runId
+        (entry) =>
+          (entry.type !== 'input' || entry.runId !== request.runId) &&
+          !protectedIds.has(sourceRef(input.cut.sessionId, entry).entryId)
       );
       await replaySourceEntries(
         transformedWindow,
         input.cut.sessionId,
-        represented,
+        represented.filter(
+          (entry) => !current?.represented.has(sourceRef(input.cut.sessionId, entry).entryId)
+        ),
         this.options.repositories.artifacts,
         new Set(input.selection.continuity?.sources.map((source) => source.entryId)),
         request.runId
@@ -3216,6 +3272,7 @@ export class AgentRuntime {
         transformId: invocationId,
         request: await prepare(transformedWindow),
         profile: request.snapshot.profile,
+        outputReservation: request.snapshot.requestWindow.maxOutputTokens,
         signal: request.signal
       });
       window.setTransformedInput(transformed.result.input);
@@ -3261,6 +3318,8 @@ export class AgentRuntime {
     });
     if (this.activeContextIdentity === identity) return;
     const replay = await rebuildModelWindowFromRepositories({
+      readInferenceInput: (runId, invocationId) =>
+        this.inferenceService.admittedInput(this.options.inferenceOwnerId ?? runId, invocationId),
       ...(this.history ? { history: this.history } : {}),
       events: this.options.repositories.events,
       ...(this.options.repositories.artifacts
@@ -3319,18 +3378,36 @@ export class AgentRuntime {
       ))
         retained.set(source.entryId, source);
     }
+    const completed = await this.options.context.selectSources(cut, {
+      retain: [...retained.values()]
+    });
+    for (const source of completed.retained) retained.set(source.entryId, source);
     const continuity = transition.selection.continuity ?? window?.selection.continuity;
+    const fresh =
+      transition.selection.continuity &&
+      transition.selection.continuity.resetId !== window?.selection.continuity?.resetId;
+    const selection = fresh
+      ? await this.options.context.freshSelection({
+          selection: { ...transition.selection, retained: [...retained.values()] },
+          model: transition.selection.continuity.model,
+          profile: await this.options.provider.describeModel(this.options.model),
+          cut,
+          resetId: transition.selection.continuity.resetId
+        })
+      : transition.selection;
     return {
       ...transition,
       expectedSourceRevision: cut.sourceRevision,
       selection: {
-        ...transition.selection,
+        ...selection,
         retained: [...retained.values()],
         ...(continuity
           ? {
               continuity: {
                 ...continuity,
-                sources: continuity.sources.filter((source) => retained.has(source.entryId))
+                sources: fresh
+                  ? [...retained.values()]
+                  : continuity.sources.filter((source) => retained.has(source.entryId))
               }
             }
           : {})
@@ -3807,19 +3884,24 @@ export class AgentRuntime {
           continue;
         case 'finalize_abort':
         case 'start_provider_request': {
-          const providerRequests = await Promise.all(state.providerRequests.map(async (request) => {
-            if (request.stage !== 'effect_ready') return request;
-            await this.inferenceService.cancelBeforeDispatch({
-              ownerId: this.options.inferenceOwnerId ?? state.runId,
-              invocationId: request.invocationId,
-              runId: state.runId
-            }, 'Run ended before provider dispatch.');
-            return {
-              ...request,
-              stage: 'cancelled' as const,
-              effect: closeExternalEffect(request.effect, 'cancelled_before_start')
-            };
-          }));
+          const providerRequests = await Promise.all(
+            state.providerRequests.map(async (request) => {
+              if (request.stage !== 'effect_ready') return request;
+              await this.inferenceService.cancelBeforeDispatch(
+                {
+                  ownerId: this.options.inferenceOwnerId ?? state.runId,
+                  invocationId: request.invocationId,
+                  runId: state.runId
+                },
+                'Run ended before provider dispatch.'
+              );
+              return {
+                ...request,
+                stage: 'cancelled' as const,
+                effect: closeExternalEffect(request.effect, 'cancelled_before_start')
+              };
+            })
+          );
           await this.advanceRun(run, instruction, {
             phase: { kind: 'finalization', stage: 'ready' },
             providerRequests,
@@ -4512,7 +4594,9 @@ function promptInstructionRole(role: string | undefined): PromptInstruction['rol
 }
 
 function currentProviderRequest(state: AgentRunState): AgentProviderPhase | undefined {
-  return state.providerRequests.find((request) => request.stage !== 'consumed' && request.stage !== 'cancelled');
+  return state.providerRequests.find(
+    (request) => request.stage !== 'consumed' && request.stage !== 'cancelled'
+  );
 }
 function currentToolBatch(state: AgentRunState): AgentToolPhase | undefined {
   return state.toolBatches.find((batch) =>

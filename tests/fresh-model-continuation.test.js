@@ -473,3 +473,19 @@ test('fresh continuation keeps the current working state separate from selected 
   assert.equal(f.requests[0].messages.some(item => item.role === 'protocol'), false);
   await f.agent.close();
 });
+
+test('same-model fresh continuation uses the existing session boundary without configuration changes', async () => {
+  const f = await fixture();
+  await nativeAnswer(f);
+  const before = f.agent.state().configuration;
+  await f.agent.freshContinuation({ profile: profile() });
+  assert.deepEqual(f.agent.state().configuration, before);
+  const window = (await f.context.inspect()).window;
+  assert.equal(window.selection.continuity.model.model, before.model);
+  const accepted = await f.agent.submit({ task: 'Continue with original evidence.' });
+  const result = await accepted.completion;
+  assert.equal(result.terminal.executionStatus, 'completed');
+  assert(!JSON.stringify(f.requests[0]).includes('PRIVATE REASONING'));
+  assert(f.requests[0].messages.some(message => message.content.includes('café العربية')));
+  await f.agent.close();
+});
