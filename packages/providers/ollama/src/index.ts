@@ -35,7 +35,7 @@ import {
   parseModelResponse,
   requiredProtocolRevision
 } from '@agent-core/model';
-import { readBoundedJsonResponse } from '@agent-core/provider-openai-responses';
+import { decodeHttpFailure, readBoundedJsonResponse } from '@agent-core/provider-openai-responses';
 import { readOllamaStream, requestOllama } from './transport.js';
 import {
   type OllamaChatRequest,
@@ -322,14 +322,23 @@ export class OllamaProvider implements ModelProvider {
             cause: error
           });
         }
-        if (wirePart.error)
+        if (wirePart.error) {
+          const failure =
+            wirePart.status === undefined
+              ? { code: 'provider_unavailable' as const, retryable: true }
+              : decodeHttpFailure(wirePart.status, JSON.stringify({ error: wirePart.error }));
           throw new ModelProviderError({
             provider: this.id,
-            code: 'provider_unavailable',
+            ...failure,
             message: `Ollama stream error: ${wirePart.error}`,
-            retryable: content.length === 0 && reasoning.length === 0 && toolCalls.length === 0,
+            retryable:
+              failure.retryable &&
+              content.length === 0 &&
+              reasoning.length === 0 &&
+              toolCalls.length === 0,
             cause: wirePart
           });
+        }
         throwIfAborted(signal);
         const delta = typeof wirePart.message?.content === 'string' ? wirePart.message.content : '';
         if (delta.length > 0) {
@@ -378,7 +387,9 @@ export class OllamaProvider implements ModelProvider {
     const chatRequest: OllamaChatRequest = {
       model: request.model || this.defaultModel,
       messages: toOllamaMessages(request.messages, lowerDeveloper),
-      stream: true
+      stream: true,
+      truncate: false,
+      shift: false
     };
     if (request.responseFormat !== undefined && this.deployment === 'cloud')
       throw new ModelProviderError({
@@ -598,6 +609,7 @@ function toOllamaMessage(message: ModelInputItem, lowerDeveloper: boolean): Olla
   if (message.toolCalls && message.toolCalls.length > 0) {
     ollamaMessage.tool_calls = message.toolCalls.map(toOllamaToolCall);
   }
+  if (message.toolCallId !== undefined) ollamaMessage.tool_call_id = message.toolCallId;
   if (message.toolName) {
     ollamaMessage.tool_name = message.toolName;
   }
@@ -837,6 +849,7 @@ function toOllamaToolCall(toolCall: ModelToolCall): NonNullable<OllamaInputMessa
     });
   }
   return {
+    ...(toolCall.id === undefined ? {} : { id: toolCall.id }),
     function: {
       name: toolCall.name,
       arguments: toolCall.input.value
@@ -858,6 +871,7 @@ function normalizeToolCalls(toolCalls: readonly OllamaWireToolCall[]): ModelTool
   return toolCalls.map((toolCall) => {
     return {
       type: 'function',
+      ...(toolCall.id === undefined ? {} : { id: toolCall.id }),
       name: toolCall.function.name,
       input: { kind: 'json', value: toolCall.function.arguments }
     };

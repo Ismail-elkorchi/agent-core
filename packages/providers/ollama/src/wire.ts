@@ -9,6 +9,7 @@ export interface OllamaInputMessage {
   images?: string[];
   tool_calls?: OllamaWireToolCall[];
   tool_name?: string;
+  tool_call_id?: string;
 }
 export interface OllamaTool {
   type: 'function';
@@ -18,6 +19,8 @@ export interface OllamaChatRequest {
   model: string;
   messages: OllamaInputMessage[];
   stream: true;
+  truncate: false;
+  shift: false;
   format?: string | object;
   keep_alive?: string | number;
   tools?: OllamaTool[];
@@ -28,6 +31,7 @@ export interface OllamaChatRequest {
 }
 
 export interface OllamaWireToolCall {
+  readonly id?: string;
   readonly function: { readonly name: string; readonly arguments: JsonObject };
 }
 export interface OllamaWireMessage {
@@ -50,6 +54,7 @@ export interface OllamaWireResponse {
   readonly eval_duration?: number;
   readonly logprobs?: JsonValue;
   readonly error?: string;
+  readonly status?: number;
 }
 interface OllamaThinkingControls {
   readonly values: readonly (boolean | string)[];
@@ -67,6 +72,12 @@ export interface OllamaShowResponse {
 export function decodeOllamaWireResponse(value: unknown): OllamaWireResponse {
   const raw = parseJsonObject(value);
   const message = raw.message === undefined ? undefined : decodeMessage(raw.message);
+  const status = raw.status;
+  if (
+    status !== undefined &&
+    (typeof status !== 'number' || !Number.isInteger(status) || status < 100 || status > 599)
+  )
+    throw new Error('Ollama response.status must be an HTTP status code.');
   return Object.freeze({
     raw,
     ...stringField(raw, 'model', 'Ollama response'),
@@ -81,7 +92,8 @@ export function decodeOllamaWireResponse(value: unknown): OllamaWireResponse {
     ...numberField(raw, 'prompt_eval_duration', 'Ollama response'),
     ...numberField(raw, 'eval_duration', 'Ollama response'),
     ...(raw.logprobs === undefined ? {} : { logprobs: raw.logprobs }),
-    ...stringField(raw, 'error', 'Ollama response')
+    ...stringField(raw, 'error', 'Ollama response'),
+    ...(status === undefined ? {} : { status })
   });
 }
 
@@ -160,7 +172,10 @@ function decodeToolCall(value: JsonValue, index: number): OllamaWireToolCall {
     throw new Error(
       `Ollama response.message.tool_calls[${String(index)}].function.arguments must be an object.`
     );
-  return Object.freeze({ function: Object.freeze({ name: fn.name, arguments: argumentsValue }) });
+  return Object.freeze({
+    ...(record?.id === undefined ? {} : stringField(record, 'id', 'Ollama tool call')),
+    function: Object.freeze({ name: fn.name, arguments: argumentsValue })
+  });
 }
 
 function ownedObject(value: JsonValue | undefined, label: string): JsonObject | undefined {
