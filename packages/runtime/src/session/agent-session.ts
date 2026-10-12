@@ -12,7 +12,7 @@ import type { ContextTransitionRequest } from '../context/contracts.js';
 import type { ContextService } from '../context/service.js';
 import type { AgentProgressEvent } from '../events.js';
 import type { AgentRunResult } from '../run/contracts.js';
-import { AgentRunCoordinator } from '../run/control/driver.js';
+import { AgentRunConflictError, AgentRunCoordinator } from '../run/control/driver.js';
 import { assertSessionBinding, decodeSessionBinding, type SessionBindingInput } from './binding.js';
 import type {
   SessionBranchMarkerEntry,
@@ -29,6 +29,7 @@ import type {
 } from './contracts.js';
 import { parseSessionImages } from './images.js';
 import {
+  SessionSubmissionOwnershipError,
   ownSessionSubmissionConfiguration,
   ownSessionSubmissionInput
 } from './submission-lifecycle.js';
@@ -182,11 +183,12 @@ export class AgentSession {
       const pendingSubmissions = await this.options.repository.loadPendingSubmissions(
         this.options.descriptor
       );
-      const runs = await Promise.all(
+      const inspections = await Promise.all(
         pendingSubmissions
           .filter((submission) => submission.state !== 'queued')
-          .map((submission) => this.options.runs.inspect(submission.runId))
+          .map((submission) => this.options.runs.find(submission.runId))
       );
+      const runs = inspections.filter((run) => run !== undefined);
       const toolDiagnostics = (
         await Promise.all(runs.map(({ state }) => this.options.runs.readToolDiagnostics(state)))
       ).flat();
@@ -516,37 +518,7 @@ export class AgentSession {
         throw new Error(`Session ${this.options.descriptor.id} is not waiting for approval.`);
       if (this.suspended.runId !== input.runId)
         throw new Error(`Session is suspended on run ${this.suspended.runId}, not ${input.runId}.`);
-      const suspended = this.suspended;
-      const configuration = suspended.configuration;
-      await this.options.repository.transitionSubmission(
-        this.options.descriptor,
-        suspended.submissionId,
-        {
-          state: 'claimed'
-        }
-      );
-      try {
-        const runtime = await this.createRuntime(
-          suspended.submissionId,
-          input.runId,
-          suspended.input,
-          configuration,
-          true
-        );
-        const control = await runtime.resolveApproval(input);
-        const pending = pendingSubmission(
-          suspended.submissionId,
-          input.runId,
-          suspended.input,
-          configuration
-        );
-        this.suspended = undefined;
-        this.observe({ control, pending, configuration });
-        return { completion: pending.completion };
-      } catch (error) {
-        await this.restoreContinuation(suspended);
-        throw error;
-      }
+      return this.startSuspendedSubmission(this.suspended, (runtime) => runtime.resolveApproval(input));
     });
     return started.completion;
   }
@@ -563,30 +535,10 @@ export class AgentSession {
       const suspended = this.suspended;
       if (!suspended || (expectedRunId !== undefined && suspended.runId !== expectedRunId))
         return false;
-      await this.options.runs.requestAbort(suspended.runId, reason);
-      await this.options.repository.transitionSubmission(
-        this.options.descriptor,
-        suspended.submissionId,
-        {
-          state: 'claimed'
-        }
-      );
-      const runtime = await this.createRuntime(
-        suspended.submissionId,
-        suspended.runId,
-        suspended.input,
-        suspended.configuration,
-        true
-      );
-      const control = runtime.resume(suspended.runId);
-      const pending = pendingSubmission(
-        suspended.submissionId,
-        suspended.runId,
-        suspended.input,
-        suspended.configuration
-      );
-      this.suspended = undefined;
-      this.observe({ control, pending, configuration: suspended.configuration });
+      await this.startSuspendedSubmission(suspended, async (runtime) => {
+        await this.options.runs.requestAbort(suspended.runId, reason);
+        return runtime.resume(suspended.runId);
+      });
       return true;
     });
   }
@@ -659,15 +611,20 @@ export class AgentSession {
   }
 
   private async startSuspendedSubmission(
-    suspended: SuspendedSubmission
+    suspended: SuspendedSubmission,
+    start: (runtime: AgentRuntime) => AgentRunHandle | Promise<AgentRunHandle> =
+      (runtime) => runtime.resume(suspended.runId)
   ): Promise<{ readonly completion: Promise<AgentRunResult> }> {
-    await this.options.repository.transitionSubmission(
-      this.options.descriptor,
-      suspended.submissionId,
-      {
-        state: 'claimed'
-      }
+    const pending = pendingSubmission(
+      suspended.submissionId, suspended.runId, suspended.input, suspended.configuration,
+      true, suspended.claimId
     );
+    try {
+      await this.claim(pending);
+    } catch (error) {
+      this.rejectDispatch(pending, error);
+      throw error;
+    }
     try {
       const runtime = await this.createRuntime(
         suspended.submissionId,
@@ -676,36 +633,41 @@ export class AgentSession {
         suspended.configuration,
         true
       );
-      const control = runtime.resume(suspended.runId);
-      const pending = pendingSubmission(
-        suspended.submissionId,
-        suspended.runId,
-        suspended.input,
-        suspended.configuration
-      );
+      await this.assertRuntimeClaim(pending, runtime);
+      const control = await start(runtime);
       this.suspended = undefined;
       this.observe({ control, pending, configuration: suspended.configuration });
       return { completion: pending.completion };
     } catch (error) {
-      await this.restoreContinuation(suspended);
+      pending.reject(error);
+      try {
+        await this.restoreContinuation(suspended, pending);
+      } catch (restoreError) {
+        this.rejectDispatch(pending, restoreError);
+      }
       throw error;
     }
   }
 
   /** A rejected continuation is not a failed submission; the run still owns its durable outcome. */
-  private async restoreContinuation(previous: SuspendedSubmission): Promise<void> {
+  private async restoreContinuation(previous: SuspendedSubmission, pending: PendingSubmission): Promise<void> {
+    await this.assertClaim(pending);
     const run = await this.options.runs.inspect(previous.runId);
-    const descriptor = runSuspensionDescriptor(previous.submissionId, run.state);
+    const descriptor = runSuspensionDescriptor(previous.submissionId, run.state) ??
+      (run.state.phase.kind !== 'terminal' &&
+        (previous.descriptor.reason === 'missing_implementation' || previous.descriptor.reason === 'runtime_failed')
+        ? previous.descriptor : undefined);
     if (descriptor !== undefined) {
       await this.options.repository.transitionSubmission(
         this.options.descriptor,
         previous.submissionId,
         {
           state: 'suspended',
+          claimId: pending.claimId,
           suspension: descriptor
         }
       );
-      this.suspended = { ...previous, descriptor };
+      this.suspended = { ...previous, claimId: pending.claimId, descriptor };
     } else {
       this.suspended = undefined;
       this.queued.unshift(
@@ -714,7 +676,8 @@ export class AgentSession {
           previous.runId,
           previous.input,
           previous.configuration,
-          true
+          true,
+          pending.claimId
         )
       );
     }
@@ -726,10 +689,10 @@ export class AgentSession {
     const pending = await this.options.repository.loadPendingSubmissions(this.options.descriptor);
     for (const submission of pending) {
       if (submission.state === 'claimed') {
-        const run = await this.options.runs.inspect(submission.runId);
-        const descriptor = runSuspensionDescriptor(submission.submissionId, run.state);
+        const run = await this.options.runs.find(submission.runId);
+        const descriptor = run && runSuspensionDescriptor(submission.submissionId, run.state);
         if (descriptor) this.suspended = suspendedSubmission(submission, descriptor);
-        else this.queued.push(pendingFromRecord(submission, true));
+        else this.queued.push(pendingFromRecord(submission, run !== undefined));
       } else if (submission.state === 'suspended') {
         if (this.suspended)
           throw new Error(
@@ -754,27 +717,10 @@ export class AgentSession {
           submission.suspension.reason === 'runtime_failed' &&
           run.state.phase.kind === 'terminal'
         ) {
-          await this.options.repository.transitionSubmission(
-            this.options.descriptor,
-            submission.submissionId,
-            { state: 'claimed' }
-          );
           this.queued.push(pendingFromRecord(submission, true));
           continue;
         }
         const descriptor = current ?? submission.suspension;
-        if (current && !sameSuspension(submission.suspension, current)) {
-          await this.options.repository.transitionSubmission(
-            this.options.descriptor,
-            submission.submissionId,
-            { state: 'claimed' }
-          );
-          await this.options.repository.transitionSubmission(
-            this.options.descriptor,
-            submission.submissionId,
-            { state: 'suspended', suspension: current }
-          );
-        }
         this.suspended = suspendedSubmission(submission, descriptor);
       } else {
         this.queued.push(pendingFromRecord(submission, false));
@@ -783,14 +729,47 @@ export class AgentSession {
     this.restored = true;
   }
 
+  private claim(pending: PendingSubmission): Promise<void> {
+    return this.options.repository.transitionSubmission(this.options.descriptor, pending.id, {
+      state: 'claimed',
+      claimId: pending.claimId,
+      ...(pending.expectedClaimId === undefined ? {} : { expectedClaimId: pending.expectedClaimId })
+    });
+  }
+
+  private async assertClaim(pending: PendingSubmission): Promise<void> {
+    const current = (await this.options.repository.loadPendingSubmissions(this.options.descriptor))
+      .find((submission) => submission.submissionId === pending.id);
+    if (current?.state !== 'claimed' || current.claimId !== pending.claimId)
+      throw new SessionSubmissionOwnershipError(pending.id);
+  }
+
+  private async assertRuntimeClaim(pending: PendingSubmission, runtime: AgentRuntime): Promise<void> {
+    try {
+      await this.assertClaim(pending);
+    } catch (error) {
+      try {
+        await runtime.close();
+      } catch (releaseError) {
+        throw new AggregateError([error, releaseError], 'Dispatch lost ownership and its runtime could not be released.', { cause: releaseError });
+      }
+      throw error;
+    }
+  }
+
+  /** A dispatcher that never acquired, or lost, ownership cannot settle another dispatcher. */
+  private rejectDispatch(pending: PendingSubmission, error: unknown): void {
+    const failure = error instanceof Error ? error : new Error(String(error));
+    this.closed = true;
+    pending.reject(failure);
+    for (const queued of this.queued.splice(0)) queued.reject(failure);
+  }
+
   private async launch(
     pending: PendingSubmission
   ): Promise<Extract<AgentSessionSubmissionResult, { kind: 'started' }>> {
     try {
-      if (!pending.resumeExisting)
-        await this.options.repository.transitionSubmission(this.options.descriptor, pending.id, {
-          state: 'claimed'
-        });
+      await this.claim(pending);
       const configuration = pending.configuration;
       const runtime = await this.createRuntime(
         pending.id,
@@ -799,6 +778,7 @@ export class AgentSession {
         configuration,
         pending.resumeExisting
       );
+      await this.assertRuntimeClaim(pending, runtime);
       const control = pending.resumeExisting
         ? runtime.resume(pending.runId)
         : runtime.run({ ...pending.input, runId: pending.runId });
@@ -810,7 +790,9 @@ export class AgentSession {
         completion: pending.completion
       };
     } catch (error) {
-      await this.failSubmission(pending, pending.configuration, error);
+      // No run control was obtained. A prior admission can still be in flight in
+      // another dispatcher, so keep the durable claim recoverable.
+      this.rejectDispatch(pending, error);
       throw error;
     }
   }
@@ -867,6 +849,7 @@ export class AgentSession {
         active.pending.id,
         {
           state: 'suspended',
+          claimId: active.pending.claimId,
           suspension
         }
       );
@@ -875,12 +858,14 @@ export class AgentSession {
         this.options.descriptor,
         active.pending.id,
         {
-          state: 'completed'
+          state: 'completed',
+          claimId: active.pending.claimId
         }
       );
     this.active = undefined;
     this.suspended = suspension
       ? {
+          claimId: active.pending.claimId,
           runId: suspension.runId,
           submissionId: active.pending.id,
           input: active.pending.input,
@@ -906,8 +891,13 @@ export class AgentSession {
     error: unknown
   ): Promise<void> {
     const cause = error instanceof Error ? error : new Error(String(error));
+    if (cause instanceof AgentRunConflictError || cause instanceof SessionSubmissionOwnershipError) {
+      this.rejectDispatch(pending, cause);
+      return;
+    }
     let failure = cause;
     try {
+      await this.assertClaim(pending);
       const run = await this.options.runs.find(pending.runId);
       if (run?.state.phase.kind === 'terminal') {
         const result: AgentRunResult = Object.freeze({
@@ -922,7 +912,8 @@ export class AgentSession {
           ])
         });
         await this.options.repository.transitionSubmission(this.options.descriptor, pending.id, {
-          state: 'completed'
+          state: 'completed',
+          claimId: pending.claimId
         });
         pending.resolve(result);
         await this.emit({ type: 'run.completed', runId: pending.runId, result });
@@ -940,6 +931,7 @@ export class AgentSession {
             actions: suspensionActions('resume', 'abort')
           });
         this.suspended = {
+          claimId: pending.claimId,
           runId: pending.runId,
           submissionId: pending.id,
           input: pending.input,
@@ -951,10 +943,15 @@ export class AgentSession {
         this.options.descriptor,
         pending.id,
         this.suspended
-          ? { state: 'suspended', suspension: this.suspended.descriptor }
-          : { state: 'failed', errorMessage: cause.message || cause.name }
+          ? { state: 'suspended', claimId: pending.claimId, suspension: this.suspended.descriptor }
+          : { state: 'failed', claimId: pending.claimId, errorMessage: cause.message || cause.name }
       );
     } catch (persistenceError) {
+      this.suspended = undefined;
+      if (persistenceError instanceof SessionSubmissionOwnershipError) {
+        this.rejectDispatch(pending, persistenceError);
+        return;
+      }
       failure = new AggregateError(
         [cause, persistenceError],
         'Run dispatch failed and its session state could not be recorded.',
@@ -1016,6 +1013,8 @@ export class AgentSession {
 }
 
 interface PendingSubmission {
+  readonly claimId: string;
+  readonly expectedClaimId?: string;
   readonly id: string;
   readonly runId: string;
   readonly input: AgentRunInput;
@@ -1033,6 +1032,7 @@ interface ActiveSubmission {
 }
 
 interface SuspendedSubmission {
+  readonly claimId: string;
   readonly runId: string;
   readonly submissionId: string;
   readonly input: AgentRunInput;
@@ -1045,6 +1045,7 @@ function suspendedSubmission(
   descriptor: AgentSessionSuspensionDescriptor
 ): SuspendedSubmission {
   return Object.freeze({
+    claimId: requireSubmissionClaim(record),
     runId: record.runId,
     submissionId: record.submissionId,
     input: record.input,
@@ -1062,7 +1063,8 @@ function pendingFromRecord(
     record.runId,
     record.input,
     record.configuration,
-    resumeExisting
+    resumeExisting,
+    record.claimId
   );
 }
 
@@ -1071,7 +1073,8 @@ function pendingSubmission(
   runId: string,
   input: SessionSubmissionInput | AgentRunInput,
   configuration: AgentSessionConfiguration,
-  resumeExisting = false
+  resumeExisting = false,
+  expectedClaimId?: string
 ): PendingSubmission {
   let resolve!: (result: AgentRunResult) => void;
   let reject!: (error: unknown) => void;
@@ -1101,6 +1104,8 @@ function pendingSubmission(
         })
   });
   return {
+    claimId: randomUUID(),
+    ...(expectedClaimId === undefined ? {} : { expectedClaimId }),
     id,
     runId,
     input: ownedInput,
@@ -1253,4 +1258,9 @@ export class AgentSubmissionCancelledError extends Error {
     super(`Queued submission cancelled: ${submissionId}`);
     this.name = 'AgentSubmissionCancelledError';
   }
+}
+
+function requireSubmissionClaim(record: SessionPendingSubmission): string {
+  if (!record.claimId) throw new Error(`Session submission has no durable claim: ${record.submissionId}`);
+  return record.claimId;
 }

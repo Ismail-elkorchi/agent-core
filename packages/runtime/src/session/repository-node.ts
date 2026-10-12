@@ -50,6 +50,7 @@ import {
   type SessionBindingInput
 } from './binding.js';
 import { JsonlBranchIndex } from './branch-index-node.js';
+import { SessionHistoryIndexError, SessionHistorySourceError, type HistoryIndexRebuildOptions, type HistoryIndexRecoveryOptions } from './history-index.js';
 import {
   assertBranchEntry,
   readBranchPage,
@@ -176,7 +177,7 @@ export class JsonlSessionRepository implements SessionRepository {
         };
         this.indexes.set(id, state);
         const session = sessionFromState(state);
-        await this.branchIndex(id).rebuild(session);
+        await this.branchIndex(id).rebuild(binding);
         return session;
       })
     );
@@ -226,6 +227,49 @@ export class JsonlSessionRepository implements SessionRepository {
   }
 
   async list(): Promise<readonly SessionSummary[]> {
+    const summaries: SessionSummary[] = [];
+    for (const id of await this.sessionIds())
+      summaries.push(await this.enqueue(id, () => this.branchIndex(id).summary()));
+    return Object.freeze(summaries.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)));
+  }
+
+  /** Explicit application preflight: metadata-only when healthy, at most one recovery per ID. */
+  async recoverHistoryIndexes(
+    expectedBinding: SessionBindingInput,
+    options: HistoryIndexRecoveryOptions = {}
+  ): Promise<readonly SessionSummary[]> {
+    const binding = createSessionBinding(expectedBinding);
+    options.signal?.throwIfAborted();
+    // Snapshot the directory once. Newly created sessions belong to the next preflight.
+    const ids = options.sessionId === undefined ? await this.sessionIds() : [options.sessionId];
+    const summaries: SessionSummary[] = [];
+    for (const id of ids) {
+      options.signal?.throwIfAborted();
+      try {
+        try {
+          summaries.push(await this.enqueue(id, () => this.branchIndex(id).summary(binding, options.signal)));
+        } catch (error) {
+          if (!(error instanceof SessionHistoryIndexError)) throw error;
+          options.signal?.throwIfAborted();
+          options.onProgress?.({ phase: 'started', sessionId: id });
+          await this.repairHistoryIndex(id, binding, {
+            ...(options.signal === undefined ? {} : { signal: options.signal }),
+            onProgress: progress => options.onProgress?.({ phase: 'progress', sessionId: id, ...progress })
+          }, true);
+          summaries.push(await this.enqueue(id, () => this.branchIndex(id).summary(binding, options.signal)));
+          options.onProgress?.({ phase: 'completed', sessionId: id });
+        }
+      } catch (error) {
+        // An unavailable original belongs to this one session. All-session views
+        // keep independent sessions usable, while selecting this ID fails closed.
+        if (options.sessionId !== undefined || !(error instanceof SessionHistorySourceError)) throw error;
+        options.onProgress?.({ phase: 'failed', sessionId: id, message: error.message });
+      }
+    }
+    return Object.freeze(summaries.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)));
+  }
+
+  private async sessionIds(): Promise<readonly string[]> {
     let names: string[];
     try {
       names = await fs.readdir(this.rootDir);
@@ -233,15 +277,7 @@ export class JsonlSessionRepository implements SessionRepository {
       if (nodeCode(error) === 'ENOENT') return [];
       throw error;
     }
-    const summaries: SessionSummary[] = [];
-    for (const name of names.sort()) {
-      const id = /^session-(.+)\.jsonl$/u.exec(name)?.[1];
-      if (!id) continue;
-      summaries.push(await this.enqueue(id, () => this.branchIndex(id).summary()));
-    }
-    return Object.freeze(
-      summaries.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
-    );
+    return names.sort().flatMap(name => /^session-(.+)\.jsonl$/u.exec(name)?.[1] ?? []);
   }
 
   async loadReplayState(
@@ -310,18 +346,35 @@ export class JsonlSessionRepository implements SessionRepository {
     });
   }
 
+  /** Repair metadata without opening a session, selecting a provider, or trusting its index. */
   rebuildHistoryIndex(
-    session: SessionDescriptor,
-    options: {
-      readonly signal?: AbortSignal;
-      readonly onProgress?: (progress: {
-        records: number;
-        bytes: number;
-        totalBytes: number;
-      }) => void;
-    } = {}
-  ) {
-    return this.enqueue(session.id, () => this.branchIndex(session.id).rebuild(session, options));
+    sessionId: string,
+    expectedBinding: SessionBindingInput,
+    options: HistoryIndexRebuildOptions = {}
+  ): Promise<void> {
+    return this.repairHistoryIndex(sessionId, createSessionBinding(expectedBinding), options, false);
+  }
+
+  private repairHistoryIndex(
+    sessionId: string,
+    binding: SessionBindingInput,
+    options: HistoryIndexRebuildOptions,
+    incremental: boolean
+  ): Promise<void> {
+    return this.enqueue(sessionId, () =>
+      withPersistenceFileLock(
+        this.filePath(sessionId),
+        this.lockTimeoutMs,
+        this.staleLockMs,
+        async () => {
+          options.signal?.throwIfAborted();
+          if (incremental) await this.branchIndex(sessionId).recover(binding, options);
+          else await this.branchIndex(sessionId).rebuild(binding, options);
+          this.indexes.delete(sessionId);
+        },
+        options.signal === undefined ? {} : { signal: options.signal }
+      )
+    );
   }
 
   historyReadMetrics(sessionId: string) {
@@ -333,6 +386,7 @@ export class JsonlSessionRepository implements SessionRepository {
     if (index === undefined) {
       const filePath = this.filePath(sessionId);
       index = new JsonlBranchIndex(
+        sessionId,
         filePath,
         (line) => parseSessionHeader(parseJson(line, filePath), sessionId),
         (line) => {
@@ -830,13 +884,7 @@ export class JsonlSessionRepository implements SessionRepository {
   transitionSubmission(
     session: SessionDescriptor,
     submissionId: string,
-    outcome:
-      | { readonly state: 'claimed' | 'completed' }
-      | {
-          readonly state: 'suspended';
-          readonly suspension: import('./contracts.js').SessionSuspensionDescriptor;
-        }
-      | { readonly state: 'failed'; readonly errorMessage: string }
+    outcome: import('./contracts.js').SessionSubmissionOutcome
   ): Promise<void> {
     const sessionId = session.id;
     return this.enqueue(sessionId, () =>
@@ -1616,20 +1664,33 @@ function parseSubmissionRecord(value: JsonObject): SessionSubmissionRecord {
       input: ownSessionSubmissionInput(value.input)
     });
   }
+  if (value.type === 'submission.cancelled') return Object.freeze({ ...base, type: value.type });
+  if (typeof value.claimId !== 'string' || value.claimId.length === 0)
+    throw new Error('Session submission claim identity is invalid.');
+  const owned = { ...base, claimId: value.claimId };
+  if (value.type === 'submission.claimed') {
+    if (value.previousClaimId !== undefined &&
+        (typeof value.previousClaimId !== 'string' || value.previousClaimId.length === 0))
+      throw new Error('Session submission previous claim identity is invalid.');
+    return Object.freeze({ ...owned, type: value.type,
+      ...(value.previousClaimId === undefined ? {} : { previousClaimId: value.previousClaimId }) });
+  }
+  if (value.previousClaimId !== undefined)
+    throw new Error('Only a submission claim may replace previous ownership.');
   if (value.type === 'submission.suspended')
     return Object.freeze({
-      ...base,
+      ...owned,
       type: value.type,
       suspension: parseSuspension(value.suspension, value.submissionId, value.runId)
     });
   if (value.type === 'submission.failed') {
     if (typeof value.errorMessage !== 'string' || value.errorMessage.length === 0)
       throw new Error('Session submission error is invalid.');
-    return Object.freeze({ ...base, type: value.type, errorMessage: value.errorMessage });
+    return Object.freeze({ ...owned, type: value.type, errorMessage: value.errorMessage });
   }
   if (value.errorMessage !== undefined || value.suspension !== undefined)
     throw new Error('Session submission transition has unsupported state data.');
-  return Object.freeze({ ...base, type: value.type });
+  return Object.freeze({ ...owned, type: value.type });
 }
 
 function parseSuspension(
@@ -1742,6 +1803,7 @@ function encodeSubmissionRecord(record: SessionSubmissionRecord): JsonObject {
       submissionId: record.submissionId,
       runId: record.runId,
       timestamp: record.timestamp,
+      claimId: record.claimId,
       suspension: encodeSuspension(record.suspension)
     });
   return Object.freeze({
@@ -1749,6 +1811,9 @@ function encodeSubmissionRecord(record: SessionSubmissionRecord): JsonObject {
     submissionId: record.submissionId,
     runId: record.runId,
     timestamp: record.timestamp,
+    ...(record.type === 'submission.cancelled' ? {} : { claimId: record.claimId }),
+    ...(record.type === 'submission.claimed' && record.previousClaimId !== undefined
+      ? { previousClaimId: record.previousClaimId } : {}),
     ...(record.type === 'submission.failed' ? { errorMessage: record.errorMessage } : {})
   });
 }

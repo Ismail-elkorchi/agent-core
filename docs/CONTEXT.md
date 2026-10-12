@@ -48,9 +48,9 @@ JSONL uses rebuildable sequence offsets alongside its existing tail/type indexes
 Warm append refresh reads only newly committed records, and caches at most 128
 run-tail indexes. No history cache retains completed run bodies. Cold construction
 and explicit integrity verification still scan authoritative storage; first-ever
-unindexed access is not constant cost. `JsonlEventRepository.rebuild()` and
-`JsonlSessionRepository.rebuildHistoryIndex()` accept cancellation and progress
-callbacks. Interrupted rebuilds leave original ledgers intact. Search incrementally builds an in-memory substring index of hashed trigrams and
+unindexed access is not constant cost. `JsonlEventRepository.rebuild()` accepts cancellation and progress callbacks, as does
+`JsonlSessionRepository.rebuildHistoryIndex(sessionId, expectedBinding, options)`. Session repair validates the original header against the requested identity and
+workspace binding under the source lock, without requiring session activation or a model provider. Interrupted rebuilds leave original ledgers intact. Search incrementally builds an in-memory substring index of hashed trigrams and
 source identities, not retained source text. Warm queries verify matching candidates
 against authoritative originals. New cuts extend or replace only the affected tail;
 forks and unavailable sources cannot reuse unauthorized candidates. Cold readers

@@ -857,3 +857,59 @@ test('warm original reads idempotently ingest routing memberships published by a
   assert.equal(last.records[0].reference.sequence, 256);
   assert.equal((await reader.verifyIntegrity('shared')).ok, true);
 });
+
+for (const count of [1, 80]) {
+  test(`dynamic JSONL routing proves unseen values empty with ${count} known routes`, async t => {
+    const { promises: fs } = await import('node:fs');
+    const { PersistenceIndexRecoveryRequiredError } = await import('@agent-core/persistence');
+    const directory = await mkdtemp(path.join(tmpdir(), 'event-route-absence-'));
+    t.after(() => fs.rm(directory, { recursive: true, force: true }));
+    const codec = { ...typedEventCodec, metadataIndexes: [{ field: 'boundary' }], metadata: event => ({ boundary: event.boundary }) };
+    const writer = new JsonlEventRepository({ rootDir: directory, codec });
+    for (let at = 0; at < count; at++) await writer.append('routed', { type: 'item', boundary: `known-${at}` });
+    const reader = new JsonlEventRepository({ rootDir: directory, codec });
+    const empty = await reader.readMetadataRange('routed', { metadata: { boundary: 'never-recorded' } });
+    assert.deepEqual(empty.records, []);
+    assert.equal(empty.complete, true);
+    assert.equal(empty.scanned, 0);
+    assert.equal(reader.indexMetrics().bodyRecordsRead, 0);
+    assert.equal(reader.indexMetrics().indexedBytes, 0);
+    const routeKey = JSON.stringify({ index: { field: 'boundary' }, value: 'known-0' });
+    const { createHash } = await import('node:crypto');
+    const routeDirectory = path.join(directory, 'run-routed.index', 'routing', createHash('sha256').update(routeKey).digest('hex'));
+    await fs.rm(path.join(routeDirectory, 'head.json'));
+    await assert.rejects(reader.readMetadataRange('routed', { metadata: { boundary: 'known-0' } }), PersistenceIndexRecoveryRequiredError);
+    await assert.rejects(new JsonlEventRepository({ rootDir: directory, codec }).readMetadataRange('routed', { metadata: { boundary: 'known-0' } }), PersistenceIndexRecoveryRequiredError);
+    const tail = JSON.parse(await fs.readFile(path.join(directory, 'run-routed.index', 'tail.json'), 'utf8'));
+    await fs.writeFile(path.join(directory, 'run-routed.index', 'routing', 'catalog', tail.routingRootHash + '.json'), '{broken');
+    await assert.rejects(reader.readMetadataRange('routed', { metadata: { boundary: 'never-recorded' } }), PersistenceIndexRecoveryRequiredError);
+  });
+}
+
+for (const stage of ['catalog', 'tail']) test(`routing ${stage} publication failure cannot expose a new value as absent after reopen`, async t => {
+  const { promises: fs } = await import('node:fs');
+  const { PersistenceIndexRecoveryRequiredError } = await import('@agent-core/persistence');
+  const directory = await mkdtemp(path.join(tmpdir(), 'event-route-catalog-publication-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const codec = { ...typedEventCodec, metadataIndexes: [{ field: 'boundary' }], metadata: event => ({ boundary: event.boundary }) };
+  const writer = new JsonlEventRepository({ rootDir: directory, codec });
+  await writer.append('routed', { type: 'item', boundary: 'old' });
+  const rename = fs.rename.bind(fs);
+  const failing = t.mock.method(fs, 'rename', async (from, to) => {
+    if (stage === 'catalog' ? String(to).split(path.sep).includes('catalog') : path.basename(String(to)) === 'tail.json')
+      throw new Error('injected catalog publication failure');
+    return rename(from, to);
+  });
+  await assert.rejects(writer.append('routed', { type: 'item', boundary: 'new' }), /injected catalog/);
+  failing.mock.restore();
+  for (const reader of [writer, new JsonlEventRepository({ rootDir: directory, codec })]) {
+    await assert.rejects(reader.readMetadataRange('routed', { metadata: { boundary: 'new' } }), PersistenceIndexRecoveryRequiredError);
+    await assert.rejects(reader.readMetadataRange('routed', { metadata: { boundary: 'unseen' } }), PersistenceIndexRecoveryRequiredError);
+  }
+  const sourceBeforeRepair = await fs.readFile(writer.location('routed'));
+  assert.equal((await writer.tail('routed')).sequence, 1, 'An ordinary owned read repairs interrupted derived publication.');
+  assert.ok((await fs.readFile(writer.location('routed'))).equals(sourceBeforeRepair));
+  const repaired = new JsonlEventRepository({ rootDir: directory, codec });
+  assert.equal((await repaired.readMetadataRange('routed', { metadata: { boundary: 'new' } })).records.length, 1);
+  assert.equal((await repaired.readMetadataRange('routed', { metadata: { boundary: 'unseen' } })).scanned, 0);
+});

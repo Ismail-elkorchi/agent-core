@@ -627,13 +627,7 @@ export class InMemorySessionRepository implements SessionRepository {
   transitionSubmission(
     session: SessionDescriptor,
     submissionId: string,
-    outcome:
-      | { readonly state: 'claimed' | 'completed' }
-      | {
-          readonly state: 'suspended';
-          readonly suspension: import('./contracts.js').SessionSuspensionDescriptor;
-        }
-      | { readonly state: 'failed'; readonly errorMessage: string }
+    outcome: import('./contracts.js').SessionSubmissionOutcome
   ): Promise<void> {
     return this.serial(() => {
       const state = this.requireDescriptor(session);

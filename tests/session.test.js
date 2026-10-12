@@ -415,7 +415,7 @@ test('session JSONL indexes only newline-committed records and repairs arbitrari
 
   repository = new JsonlSessionRepository({ rootDir });
   session = await repository.open(session.id, TEST_SESSION_BINDING);
-  await repository.rebuildHistoryIndex(session);
+  await repository.rebuildHistoryIndex(session.id, session.header.binding);
   await repository.appendInput(session, { runId: 'replacement', task: 'replacement' });
   let replay = await new JsonlSessionRepository({ rootDir }).loadReplayState(session);
   assert.deepEqual(
@@ -459,7 +459,7 @@ test('session JSONL owns queued configuration and validates submission lifecycle
   let pending = await repository.loadPendingSubmissions(session);
   assert.equal(pending[0].configuration.model, 'captured-model');
   assert.equal(Object.isFrozen(pending[0].configuration.responseFormat.schema), true);
-  await repository.transitionSubmission(session, 'submission', { state: 'claimed' });
+  await repository.transitionSubmission(session, 'submission', { state: 'claimed', claimId: 'claim' });
   const suspension = {
     runId: 'run',
     submissionId: 'submission',
@@ -467,7 +467,7 @@ test('session JSONL owns queued configuration and validates submission lifecycle
     reason: 'missing_implementation',
     actions: ['resume', 'abort']
   };
-  await repository.transitionSubmission(session, 'submission', { state: 'suspended', suspension });
+  await repository.transitionSubmission(session, 'submission', { state: 'suspended', claimId: 'claim', suspension });
   pending = await new JsonlSessionRepository({ rootDir }).loadPendingSubmissions(session);
   assert.equal(pending[0].state, 'suspended');
 
@@ -1417,12 +1417,12 @@ test('aborting a suspended submission commits cancellation before starting final
     input: { task: 'suspended task' },
     configuration: { provider: 'test', model: 'model' }
   });
-  await repository.transitionSubmission(descriptor, 'submission', { state: 'claimed' });
+  await repository.transitionSubmission(descriptor, 'submission', { state: 'claimed', claimId: 'claim' });
   const events = new InMemoryEventRepository(agentEventCodec);
   const runs = new AgentRunCoordinator(events, new InMemoryArtifactRepository());
   await acceptApprovalRun(runs, runId);
   await repository.transitionSubmission(descriptor, 'submission', {
-    state: 'suspended',
+    state: 'suspended', claimId: 'claim', claimId: 'claim',
     suspension: {
       runId,
       submissionId: 'submission',
@@ -1610,7 +1610,7 @@ test('context suspension persists its exact conflict and append indexes follow e
     input: { task: 'Continue the original work.' },
     configuration: { provider: 'test', model: 'model' }
   });
-  await repository.transitionSubmission(session, 'input', { state: 'claimed' });
+  await repository.transitionSubmission(session, 'input', { state: 'claimed', claimId: 'claim' });
   const suspension = {
     runId: 'run',
     submissionId: 'input',
@@ -1619,13 +1619,13 @@ test('context suspension persists its exact conflict and append indexes follow e
     actions: ['context', 'abort'],
     contextAdmission: conflict
   };
-  await repository.transitionSubmission(session, 'input', { state: 'suspended', suspension });
+  await repository.transitionSubmission(session, 'input', { state: 'suspended', claimId: 'claim', suspension });
   for (const reader of [repository, new JsonlSessionRepository({ rootDir })]) {
     const pending = await reader.loadPendingSubmissions(session);
     assert.deepEqual(pending[0].suspension, suspension);
   }
-  await repository.transitionSubmission(session, 'input', { state: 'claimed' });
-  await repository.transitionSubmission(session, 'input', { state: 'completed' });
+  await repository.transitionSubmission(session, 'input', { state: 'claimed', claimId: 'claim-2', expectedClaimId: 'claim' });
+  await repository.transitionSubmission(session, 'input', { state: 'completed', claimId: 'claim-2' });
   assert.deepEqual(await repository.loadPendingSubmissions(session), []);
   assert.deepEqual(
     await new JsonlSessionRepository({ rootDir }).loadPendingSubmissions(session),
@@ -1721,7 +1721,7 @@ test('failed durable claiming rejects the waiting caller and preserves queued in
   const session = new AgentSession(options);
   const accepted = await session.submit({ task: 'Keep this original request' });
   const rejection = assert.rejects(accepted.completion, error => {
-    assert.equal(error.cause.message, 'Claim persistence failed');
+    assert.equal(error.message, 'Claim persistence failed');
     return true;
   });
   await assert.rejects(session.startNextSubmission(), /Claim persistence failed/);
@@ -1733,5 +1733,47 @@ test('failed durable claiming rejects the waiting caller and preserves queued in
   await reopened.restore();
   assert.equal(reopened.state().queuedInputs, 1);
   await reopened.close();
+  await session.close();
+});
+
+test('a rejected suspended runtime factory preserves the descriptor under its replacement claim', async () => {
+  const repository = new InMemorySessionRepository();
+  const descriptor = await repository.create({ binding: TEST_SESSION_BINDING });
+  const runs = runCoordinator();
+  let creations = 0;
+  const session = new AgentSession({ descriptor, expectedBinding: TEST_SESSION_BINDING,
+    repository, runs, configuration: { provider: 'test', model: 'model' },
+    createRuntime() {
+      creations += 1;
+      if (creations === 2) throw new Error('Continuation factory unavailable');
+      return {
+        run(input) {
+          return {
+            runId: input.runId,
+            result: acceptTestRun(runs, input.runId).then(() => ({ state: 'suspended',
+              reason: 'missing_implementation', runId: input.runId,
+              finalizationId: `${input.runId}:final`, budget: testBudget() })),
+            injectSteering() { throw new Error('unused'); }, abort() {}
+          };
+        },
+        resume(runId) {
+          return { runId,
+            result: Promise.resolve({ state: 'ended', terminal: { runId }, deliveryDiagnostics: [] }),
+            injectSteering() { throw new Error('unused'); }, abort() {} };
+        }
+      };
+    }
+  });
+  const started = await session.submit({ task: 'Retain suspension until its runtime is available' });
+  await started.completion;
+  const before = (await repository.loadPendingSubmissions(descriptor))[0];
+  await assert.rejects(session.resumeRuntime(started.runId), /Continuation factory unavailable/);
+  const after = (await repository.loadPendingSubmissions(descriptor))[0];
+  assert.equal(after.state, 'suspended');
+  assert.notEqual(after.claimId, before.claimId);
+  assert.deepEqual(after.suspension, before.suspension);
+  assert.deepEqual(session.inspectSuspension(), before.suspension);
+  assert.equal((await session.resumeRuntime(started.runId)).state, 'ended');
+  assert.deepEqual(await repository.loadPendingSubmissions(descriptor), []);
   await session.close();
 });

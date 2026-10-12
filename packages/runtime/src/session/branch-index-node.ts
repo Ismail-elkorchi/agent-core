@@ -1,6 +1,9 @@
-import { assertSubmissionTransition } from './submission-lifecycle.js';
+import { assertSubmissionOwnership, assertSubmissionTransition } from './submission-lifecycle.js';
 import * as z from 'zod';
-import { parseJsonObject } from '@agent-core/json';
+import { canonicalJsonString, parseJsonObject, type JsonObject } from '@agent-core/json';
+import { randomUUID } from 'node:crypto';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import { historyCutSchema, historyEventSourceSchema } from '../history/schema.js';
 import { workingStateEntrySchema, workingStateAtEntry } from './working-state.js';
 import { hashJson } from '@agent-core/persistence';
@@ -17,7 +20,8 @@ import {
   type JsonlLine,
   type JsonlStorageStamp
 } from '@agent-core/persistence/node';
-import { assertSessionBinding } from './binding.js';
+import { assertSessionBinding, type SessionBindingInput } from './binding.js';
+import { SessionHistoryIndexError, SessionHistorySourceError, SessionHistoryIndexPublicationError, type HistoryIndexRebuildOptions } from './history-index.js';
 import {
   branchEntryMetadata,
   sourceSnapshot,
@@ -63,13 +67,14 @@ const positionSchema = z.strictObject({
   })
 });
 const submissionMetadataSchema = z.strictObject({
-  submissionId: idSchema, runId: idSchema,
+  submissionId: idSchema, runId: idSchema, claimId: idSchema.optional(), previousClaimId: idSchema.optional(),
   type: z.enum(['submission.queued', 'submission.claimed', 'submission.suspended',
     'submission.completed', 'submission.failed', 'submission.revised', 'submission.cancelled'])
 });
 type SubmissionMetadata = z.infer<typeof submissionMetadataSchema>;
 type SubmissionSummary = Pick<SessionPendingSubmission, 'runId' | 'submissionId'> & {
   readonly state: 'queued' | SessionSubmissionState;
+  readonly claimId?: string;
 };
 const metadataSchema = z.strictObject({
   format: z.literal('agent-core.session-branch-index/1'), previousSha256: hashSchema.nullable(), header: z.unknown(),
@@ -118,11 +123,13 @@ export class JsonlBranchIndex {
   private bodyRecordsRead = 0;
 
   constructor(
+    private readonly sessionId: string,
     private readonly filePath: string,
     private readonly decodeHeader: (line: JsonlLine) => SessionHeader,
     private readonly decodeRecord: (
       line: JsonlLine
-    ) => SessionBranchEntry | SessionRunFinalization | SessionSubmissionRecord
+    ) => SessionBranchEntry | SessionRunFinalization | SessionSubmissionRecord,
+    private readonly writeCheckpoint?: (record: JsonObject) => Promise<void>
   ) {}
 
   metrics() {
@@ -140,8 +147,11 @@ export class JsonlBranchIndex {
     await this.refresh({ allowSourceAppend: true });
   }
 
-  async summary(): Promise<SessionSummary> {
-    await this.refresh();
+  async summary(expectedBinding?: SessionBindingInput, signal?: AbortSignal): Promise<SessionSummary> {
+    await this.refresh({
+      ...(expectedBinding === undefined ? {} : { expectedBinding }),
+      ...(signal === undefined ? {} : { signal })
+    });
     if (this.summaryValue === undefined)
       throw new Error('Session history has no committed header.');
     return this.summaryValue;
@@ -180,172 +190,281 @@ export class JsonlBranchIndex {
   }
 
   async rebuild(
-    session: SessionDescriptor,
-    options: {
-      readonly signal?: AbortSignal;
-      readonly onProgress?: (progress: {
-        records: number;
-        bytes: number;
-        totalBytes: number;
-      }) => void;
-    } = {}
+    expectedBinding: SessionBindingInput,
+    options: HistoryIndexRebuildOptions = {}
   ): Promise<void> {
-    options.signal?.throwIfAborted();
-    const candidate = new JsonlBranchIndex(this.filePath, this.decodeHeader, this.decodeRecord);
-    candidate.loaded = true;
-    await candidate.refresh({ ...options, allowSourceAppend: true, session });
-    await candidate.source(session);
-    this.scannedBytes += candidate.scannedBytes;
-    await this.restore();
+    await this.replaceIndex(expectedBinding, options, false);
   }
 
-  private async refresh(options?: {
-    readonly allowSourceAppend?: boolean;
-    readonly session?: SessionDescriptor;
-    readonly signal?: AbortSignal;
-    readonly onProgress?: (progress: {
-      records: number;
-      bytes: number;
-      totalBytes: number;
-    }) => void;
-  }): Promise<void> {
+  async recover(expectedBinding: SessionBindingInput, options: HistoryIndexRebuildOptions): Promise<void> {
+    await this.replaceIndex(expectedBinding, options, true);
+  }
+
+  private async replaceIndex(
+    expectedBinding: SessionBindingInput,
+    options: HistoryIndexRebuildOptions,
+    incremental: boolean
+  ): Promise<void> {
     return withPersistenceFileLock(`${this.filePath}.index`, 5_000, 30_000, async () => {
-      if (this.loaded && this.metadataStamp !== undefined &&
-          !sameJsonlStorageStamp(await jsonlStorageStamp(`${this.filePath}.index`), this.metadataStamp))
-        this.loaded = false;
-      if (!this.loaded) await this.restore();
-      const stamp = await jsonlStorageStamp(this.filePath);
-      if (this.stamp !== undefined && sameJsonlStorageStamp(stamp, this.stamp)) return;
-      if (!options?.allowSourceAppend)
-        throw new Error('Session history does not match its index; explicitly rebuildHistoryIndex to recover.');
-      if (stamp.size < this.completeBytes)
-        throw new Error('Session history was truncated after indexing.');
-      if (
-        this.completeBytes > 0 &&
-        (stamp.size === this.completeBytes ||
-          (await jsonlBoundaryMarker(this.filePath, this.completeBytes)) !== this.marker)
-      ) {
-        throw new Error('Session history does not match its index; explicitly rebuildHistoryIndex to recover.');
-      }
-      const endOffset = await jsonlCommittedBytes(this.filePath, stamp.size);
-      if (endOffset === this.completeBytes) { this.stamp = stamp; return; }
-      const additions = new Map<string, RecordPosition>();
-      const points: SessionBranchPoint[] = [];
-      const submissions: SubmissionMetadata[] = [];
-      let header = this.header;
-      let summary = this.summaryValue;
-      let leafId = this.leafId;
-      let lineCount = this.lineCount;
-      let revision = this.sourceRevision;
-      const finalizations: FinalizationMetadata[] = [];
-      for await (const line of readJsonlLines(this.filePath, {
-        startOffset: this.completeBytes,
-        firstLine: this.lineCount + 1,
-        endOffset,
-        maxLineBytes: 64 * 1024 * 1024
-      })) {
+      options.signal?.throwIfAborted();
+      const destination = `${this.filePath}.index`;
+      const stagedPath = path.join(path.dirname(destination), `.${path.basename(destination)}.${randomUUID()}.tmp`);
+      const staged = await fs.open(stagedPath, 'wx', 0o600);
+      let published = false;
+      let offset = 0;
+      const writeLine = async (text: string): Promise<void> => {
+        const bytes = Buffer.from(`${text}\n`);
+        let consumed = 0;
+        while (consumed < bytes.length) {
+          const { bytesWritten } = await staged.write(bytes, consumed, bytes.length - consumed, offset);
+          if (bytesWritten === 0) throw new Error('Staged history index write made no progress.');
+          consumed += bytesWritten;
+          offset += bytesWritten;
+        }
+      };
+      const createCandidate = () => new JsonlBranchIndex(
+        this.sessionId, this.filePath, this.decodeHeader, this.decodeRecord,
+        async (record) => { await writeLine(canonicalJsonString(record)); }
+      );
+      try {
+        let candidate = createCandidate();
+        // Only admission of the prior checkpoint/source prefix may fall back to a
+        // full rebuild. No exception after publication retries the operation.
+        if (incremental) {
+          try {
+            await candidate.restore(async (line) => {
+              options.signal?.throwIfAborted();
+              await writeLine(line.text);
+            }, options.signal);
+            await candidate.validateOriginalHeader(expectedBinding, options.signal);
+            await candidate.refreshLocked({ ...options, allowSourceAppend: true, expectedBinding });
+          } catch (error) {
+            if (!(error instanceof SessionHistoryIndexError)) throw error;
+            options.signal?.throwIfAborted();
+            await staged.truncate(0);
+            offset = 0;
+            candidate = createCandidate();
+            candidate.loaded = true;
+            await candidate.refreshLocked({ ...options, allowSourceAppend: true, expectedBinding });
+          }
+        } else {
+          candidate.loaded = true;
+          await candidate.refreshLocked({ ...options, allowSourceAppend: true, expectedBinding });
+        }
+        await staged.sync();
+        await staged.close();
         options.signal?.throwIfAborted();
-        options.onProgress?.({ records: revision, bytes: line.byteOffset, totalBytes: endOffset });
-        lineCount = line.line;
-        const bytes = Buffer.byteLength(line.text) + 1;
-        this.scannedBytes += bytes;
-        if (line.line === 1) {
-          header = this.decodeHeader(line);
-          summary = {
-            id: header.id,
-            timestamp: header.timestamp,
-            updatedAt: header.timestamp,
-            ...(header.provider === undefined ? {} : { provider: header.provider }),
-            ...(header.model === undefined ? {} : { model: header.model }),
-            bindingSchemaId: header.binding.schemaId,
-            bindingSchemaVersion: header.binding.schemaVersion,
-            bindingSha256: header.binding.bindingSha256
-          };
-          continue;
+        await fs.rename(stagedPath, destination);
+        published = true;
+        if (process.platform !== 'win32') {
+          const directory = await fs.open(path.dirname(destination), 'r');
+          try { await directory.sync(); } finally { await directory.close(); }
         }
-        if (line.text.trim().length === 0) continue;
-        const entry = this.decodeRecord(line);
-        revision++;
-        if (summary === undefined) throw new Error('Session record precedes its header.');
+        this.scannedBytes += candidate.scannedBytes;
+        await this.restore();
+      } catch (cause) {
+        if (published) throw new SessionHistoryIndexPublicationError(this.sessionId, cause);
+        throw cause;
+      } finally {
+        await staged.close();
+        await fs.rm(stagedPath, { force: true });
+      }
+    }, options.signal === undefined ? {} : { signal: options.signal });
+  }
+
+  private validatedOriginalHeader(line: JsonlLine, expectedBinding?: SessionBindingInput): SessionHeader {
+    try {
+      const header = this.decodeHeader(line);
+      if (expectedBinding !== undefined) assertSessionBinding(expectedBinding, header.binding);
+      return header;
+    } catch (cause) {
+      throw new SessionHistorySourceError(this.sessionId, `Original header validation failed: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    }
+  }
+
+  private async validateOriginalHeader(expectedBinding: SessionBindingInput, signal?: AbortSignal): Promise<void> {
+    for await (const line of readJsonlLines(this.filePath, { maxLineBytes: 64 * 1024 * 1024 })) {
+      signal?.throwIfAborted();
+      this.validatedOriginalHeader(line, expectedBinding);
+      this.scannedBytes += Buffer.byteLength(line.text) + 1;
+      return;
+    }
+    throw new SessionHistorySourceError(this.sessionId, 'No committed session header.');
+  }
+
+  private async refresh(options?: HistoryIndexRebuildOptions & {
+    readonly allowSourceAppend?: boolean;
+    readonly expectedBinding?: SessionBindingInput;
+  }): Promise<void> {
+    return withPersistenceFileLock(
+      `${this.filePath}.index`, 5_000, 30_000,
+      () => this.refreshLocked(options),
+      options?.signal === undefined ? {} : { signal: options.signal }
+    );
+  }
+
+  private async refreshLocked(options?: HistoryIndexRebuildOptions & {
+    readonly allowSourceAppend?: boolean;
+    readonly expectedBinding?: SessionBindingInput;
+  }): Promise<void> {
+    options?.signal?.throwIfAborted();
+    if (this.loaded && this.metadataStamp !== undefined) {
+      try {
+        if (!sameJsonlStorageStamp(await jsonlStorageStamp(`${this.filePath}.index`), this.metadataStamp))
+          this.loaded = false;
+      } catch (cause) {
+        throw new SessionHistoryIndexError(this.sessionId, 'is unavailable', { cause });
+      }
+    }
+    if (!this.loaded) await this.restore(undefined, options?.signal);
+    if (options?.expectedBinding !== undefined && this.header !== undefined) {
+      try {
+        assertSessionBinding(options.expectedBinding, this.header.binding);
+      } catch (cause) {
+        throw new SessionHistoryIndexError(this.sessionId, 'has a different workspace binding', { cause });
+      }
+    }
+    const stamp = await jsonlStorageStamp(this.filePath);
+    if (this.stamp !== undefined && sameJsonlStorageStamp(stamp, this.stamp)) return;
+    if (!options?.allowSourceAppend)
+      throw new SessionHistoryIndexError(this.sessionId, 'does not match its original history');
+    if (stamp.size < this.completeBytes)
+      throw new SessionHistorySourceError(this.sessionId, 'Original history was truncated after indexing.');
+    if (
+      this.completeBytes > 0 &&
+      (stamp.size === this.completeBytes ||
+        (await jsonlBoundaryMarker(this.filePath, this.completeBytes)) !== this.marker)
+    ) {
+      throw new SessionHistoryIndexError(this.sessionId, 'does not match its original history');
+    }
+    const endOffset = await jsonlCommittedBytes(this.filePath, stamp.size);
+    if (endOffset === this.completeBytes) {
+      if (this.header === undefined)
+        throw new SessionHistorySourceError(this.sessionId, 'No committed session header.');
+      this.stamp = stamp;
+      return;
+    }
+    const additions = new Map<string, RecordPosition>();
+    const points: SessionBranchPoint[] = [];
+    const submissions: SubmissionMetadata[] = [];
+    let header = this.header;
+    let summary = this.summaryValue;
+    let leafId = this.leafId;
+    let lineCount = this.lineCount;
+    let revision = this.sourceRevision;
+    const finalizations: FinalizationMetadata[] = [];
+    const consume = (line: JsonlLine): void => {
+      lineCount = line.line;
+      const bytes = Buffer.byteLength(line.text) + 1;
+      this.scannedBytes += bytes;
+      if (line.line === 1) {
+        header = this.validatedOriginalHeader(line, options.expectedBinding);
         summary = {
-          ...summary,
-          updatedAt: entry.timestamp > summary.updatedAt ? entry.timestamp : summary.updatedAt,
-          ...(summary.preview === undefined && entry.type === 'input'
-            ? { preview: entry.task.replace(/\s+/gu, ' ').slice(0, 160) }
-            : {})
+          id: header.id,
+          timestamp: header.timestamp,
+          updatedAt: header.timestamp,
+          ...(header.provider === undefined ? {} : { provider: header.provider }),
+          ...(header.model === undefined ? {} : { model: header.model }),
+          bindingSchemaId: header.binding.schemaId,
+          bindingSchemaVersion: header.binding.schemaVersion,
+          bindingSha256: header.binding.bindingSha256
         };
-        if ('submissionId' in entry) {
-          submissions.push({type: entry.type, submissionId: entry.submissionId, runId: entry.runId});
-          continue;
-        }
-        if (entry.type === 'run_finalization') {
-          finalizations.push({
-            runId: entry.runId,
-            finalizationId: entry.finalizationId,
-            throughEntryId: entry.throughEntryId
-          });
-          points.push(
-            Object.freeze({
-              entryId: entry.throughEntryId,
-              timestamp: entry.timestamp,
-              kind: 'run_finalization',
-              finalizationId: entry.finalizationId,
-              runId: entry.runId
-            })
-          );
-          continue;
-        }
-        if (this.positions.has(entry.id) || additions.has(entry.id))
-          throw new Error(`Duplicate session history entry: ${entry.id}`);
-        if (
-          entry.parentId !== null &&
-          !this.positions.has(entry.parentId) &&
-          !additions.has(entry.parentId)
-        )
-          throw new Error(`Missing session history parent: ${entry.parentId}`);
-        additions.set(entry.id, {
-          workingState: workingStateAtEntry(
-            entry,
-            entry.parentId === null
-              ? null
-              : ((additions.get(entry.parentId) ?? this.positions.get(entry.parentId))
-                  ?.workingState ?? null)
-          ),
-          ...branchEntryMetadata(entry),
-          offset: line.byteOffset,
-          bytes,
-          line: line.line,
-          parentId: entry.parentId,
-          hash: hashJson(entry)
+        return;
+      }
+      if (line.text.trim().length === 0) return;
+      let entry: SessionBranchEntry | SessionRunFinalization | SessionSubmissionRecord;
+      try {
+        entry = this.decodeRecord(line);
+      } catch (cause) {
+        throw new SessionHistorySourceError(this.sessionId, `Invalid record at line ${String(line.line)}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+      }
+      revision++;
+      if (summary === undefined) throw new SessionHistorySourceError(this.sessionId, 'Session record precedes its header.');
+      summary = {
+        ...summary,
+        updatedAt: entry.timestamp > summary.updatedAt ? entry.timestamp : summary.updatedAt,
+        ...(summary.preview === undefined && entry.type === 'input'
+          ? { preview: entry.task.replace(/\s+/gu, ' ').slice(0, 160) }
+          : {})
+      };
+      if ('submissionId' in entry) {
+        submissions.push({type: entry.type, submissionId: entry.submissionId, runId: entry.runId,
+          ...('claimId' in entry ? { claimId: entry.claimId } : {}),
+          ...(entry.type === 'submission.claimed' && entry.previousClaimId !== undefined
+            ? { previousClaimId: entry.previousClaimId } : {})});
+        return;
+      }
+      if (entry.type === 'run_finalization') {
+        finalizations.push({
+          runId: entry.runId,
+          finalizationId: entry.finalizationId,
+          throughEntryId: entry.throughEntryId
         });
-        if (entry.type === 'context_transition')
-          points.push(
-            Object.freeze({
-              entryId: entry.id,
-              timestamp: entry.timestamp,
-              kind: 'context_transition'
-            })
-          );
-        leafId = entry.id;
+        points.push(
+          Object.freeze({
+            entryId: entry.throughEntryId,
+            timestamp: entry.timestamp,
+            kind: 'run_finalization',
+            finalizationId: entry.finalizationId,
+            runId: entry.runId
+          })
+        );
+        return;
       }
-      if (options.session !== undefined) {
-        if (header?.id !== options.session.id)
-          throw new Error('Session history descriptor does not match its header.');
-        assertSessionBinding(options.session.header.binding, header.binding);
+      if (this.positions.has(entry.id) || additions.has(entry.id))
+        throw new SessionHistorySourceError(this.sessionId, `Duplicate entry: ${entry.id}.`);
+      if (
+        entry.parentId !== null &&
+        !this.positions.has(entry.parentId) &&
+        !additions.has(entry.parentId)
+      )
+        throw new SessionHistorySourceError(this.sessionId, `Missing parent: ${entry.parentId}.`);
+      additions.set(entry.id, {
+        workingState: workingStateAtEntry(
+          entry,
+          entry.parentId === null
+            ? null
+            : ((additions.get(entry.parentId) ?? this.positions.get(entry.parentId))
+                ?.workingState ?? null)
+        ),
+        ...branchEntryMetadata(entry),
+        offset: line.byteOffset,
+        bytes,
+        line: line.line,
+        parentId: entry.parentId,
+        hash: hashJson(entry)
+      });
+      if (entry.type === 'context_transition')
+        points.push(
+          Object.freeze({
+            entryId: entry.id,
+            timestamp: entry.timestamp,
+            kind: 'context_transition'
+          })
+        );
+      leafId = entry.id;
+    };
+    const checkpoint = async (checkpointBytes: number): Promise<void> => {
+      if (header === undefined)
+        throw new SessionHistorySourceError(this.sessionId, 'No committed session header.');
+      if (finalizations.some(item => !this.positions.has(item.throughEntryId) && !additions.has(item.throughEntryId)))
+        throw new SessionHistorySourceError(this.sessionId, 'Finalization refers to an unknown history entry.');
+      const marker = await jsonlBoundaryMarker(this.filePath, checkpointBytes);
+      try {
+        for (const submission of submissions) applySubmissionMetadata(this.submissions, this.pendingSubmissions, submission);
+      } catch (cause) {
+        throw new SessionHistorySourceError(this.sessionId, `Invalid submission lifecycle: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
       }
-      const marker = await jsonlBoundaryMarker(this.filePath, endOffset);
-      for (const submission of submissions) applySubmissionMetadata(this.submissions, this.pendingSubmissions, submission);
       for (const [id, entry] of additions) this.positions.set(id, entry);
       this.branchPoints.push(...points);
       this.finalizations.push(...finalizations);
       this.sourceRevision = revision;
-      options.onProgress?.({ records: revision, bytes: endOffset, totalBytes: endOffset });
       options.signal?.throwIfAborted();
       this.header = header;
       this.summaryValue = summary === undefined ? undefined : Object.freeze(summary);
       this.leafId = leafId;
       this.lineCount = lineCount;
-      this.completeBytes = endOffset;
+      this.completeBytes = checkpointBytes;
       this.marker = marker;
       this.stamp = stamp;
       try {
@@ -354,7 +473,26 @@ export class JsonlBranchIndex {
         this.loaded = false;
         throw error;
       }
-    });
+      additions.clear();
+      points.length = 0;
+      finalizations.length = 0;
+      submissions.length = 0;
+    };
+    for await (const line of readJsonlLines(this.filePath, {
+      startOffset: this.completeBytes,
+      firstLine: this.lineCount + 1,
+      endOffset,
+      maxLineBytes: 64 * 1024 * 1024
+    })) {
+      options.signal?.throwIfAborted();
+      options.onProgress?.({ records: revision, bytes: line.byteOffset, totalBytes: endOffset });
+      consume(line);
+      if (this.writeCheckpoint !== undefined)
+        await checkpoint(line.byteOffset + Buffer.byteLength(line.text) + 1);
+    }
+    options.onProgress?.({ records: revision, bytes: endOffset, totalBytes: endOffset });
+    options.signal?.throwIfAborted();
+    if (this.completeBytes < endOffset) await checkpoint(endOffset);
   }
 
   private async persist(
@@ -370,15 +508,25 @@ export class JsonlBranchIndex {
       leafId: this.leafId, sourceRevision: this.sourceRevision, completeBytes: this.completeBytes,
       lineCount: this.lineCount, marker: this.marker, stamp: this.stamp
     });
+    if (this.writeCheckpoint !== undefined) {
+      try {
+        metadataSchema.parse(metadata);
+      } catch (cause) {
+        throw new SessionHistorySourceError(this.sessionId, `An original record cannot produce valid history metadata: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+      }
+    }
     const sha256 = hashJson(metadata);
     const record = { metadata, sha256 };
-    if (this.metadataHash === null) await atomicWritePrivateJson(`${this.filePath}.index`, record);
-    else await appendJsonlRecord(`${this.filePath}.index`, record);
+    if (this.writeCheckpoint !== undefined) await this.writeCheckpoint(record);
+    else {
+      if (this.metadataHash === null) await atomicWritePrivateJson(`${this.filePath}.index`, record);
+      else await appendJsonlRecord(`${this.filePath}.index`, record);
+      this.metadataStamp = await jsonlStorageStamp(`${this.filePath}.index`);
+    }
     this.metadataHash = sha256;
-    this.metadataStamp = await jsonlStorageStamp(`${this.filePath}.index`);
   }
 
-  private async restore(): Promise<void> {
+  private async restore(copyLine?: (line: JsonlLine) => Promise<void>, signal?: AbortSignal): Promise<void> {
     try {
       const file = `${this.filePath}.index`;
       const stamp = await jsonlStorageStamp(file);
@@ -396,6 +544,7 @@ export class JsonlBranchIndex {
       const points: SessionBranchPoint[] = [];
       const finalizations: FinalizationMetadata[] = [];
       for await (const line of readJsonlLines(file, {maxLineBytes: 64 * 1024 * 1024})) {
+        signal?.throwIfAborted();
         this.metadataBytesRead += Buffer.byteLength(line.text) + 1;
         this.metadataRecordsRead++;
         const envelope = z.strictObject({ metadata: z.unknown(), sha256: hashSchema }).parse(JSON.parse(line.text));
@@ -431,6 +580,7 @@ export class JsonlBranchIndex {
           throw new Error('Invalid index boundary.');
         latest = data;
         metadataHash = envelope.sha256;
+        await copyLine?.(line);
       }
       if (!latest || !header) throw new Error('Index contains no checkpoint.');
       const data = latest;
@@ -460,7 +610,8 @@ export class JsonlBranchIndex {
       this.metadataHash = metadataHash;
       this.loaded = true;
     } catch (cause) {
-      throw new Error('Session history index is corrupt or incompatible; explicitly rebuildHistoryIndex to recover.', { cause });
+      if (signal?.aborted && cause === signal.reason) throw cause;
+      throw new SessionHistoryIndexError(this.sessionId, 'is missing, corrupt, or incompatible', { cause });
     }
   }
 
@@ -537,6 +688,9 @@ function applySubmissionMetadata(
   const state = record.type === 'submission.claimed' ? 'claimed'
     : record.type === 'submission.suspended' ? 'suspended'
     : record.type === 'submission.completed' ? 'completed' : 'failed';
+  if (!record.claimId) throw new Error('Submission metadata has no claim identity.');
+  assertSubmissionOwnership(current, { type: record.type, claimId: record.claimId,
+    ...(record.previousClaimId === undefined ? {} : { previousClaimId: record.previousClaimId }) });
   assertSubmissionTransition(current.state, state, record.submissionId);
-  save({...current, state});
+  save({...current, state, claimId: record.claimId});
 }

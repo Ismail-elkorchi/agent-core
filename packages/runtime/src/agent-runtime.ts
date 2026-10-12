@@ -304,6 +304,7 @@ type AssistantTurnResult =
   | { readonly kind: 'decision'; readonly decision: ExecutionDecision }
   | { readonly kind: 'outcome_unknown'; readonly effectId: string };
 interface RequestAssemblyResult {
+  readonly recoveryAttempt?: number;
   readonly request: ModelRequest;
   readonly compiled: CompiledModelRequest;
   readonly estimate: RequestTokenEstimate;
@@ -434,6 +435,8 @@ export class AgentRuntime {
   private readonly catalogTools = new Map<string, readonly CompiledToolDefinition[]>();
   private contextTransitions: RunContextTransitions | undefined;
   private readonly recoveryActions = new Set<string>();
+  private recoveryActionBoundary: string | undefined;
+  private contextControlReserve: { readonly identity: string; readonly tokens: number } | undefined;
   private activeContextIdentity: string | null | undefined;
   private nativeSteering: NativeSteeringCoordinator | undefined;
   private steeringWrites: Promise<void> = Promise.resolve();
@@ -450,6 +453,8 @@ export class AgentRuntime {
   private activeRunReady: Promise<AgentRunDriver | undefined> | undefined;
   private activeAbortRequest: Promise<void> | undefined;
   private releasePromise: Promise<void> | undefined;
+  private resolvingApproval = false;
+  private closed = false;
   private static readonly MAX_STEERING_ITEMS = 1024;
 
   constructor(private readonly options: AgentRuntimeOptions) {
@@ -514,9 +519,22 @@ export class AgentRuntime {
   }
 
   run(input: AgentRunInput): AgentRunHandle {
+    this.assertOpen();
     const runId = input.runId ?? randomUUID();
     const finalizationId = input.finalizationId ?? randomUUID();
     return this.startRun({ ...input, runId, finalizationId });
+  }
+
+  /** Release an idle runtime, including one whose session dispatch was superseded. */
+  close(): Promise<void> {
+    if (this.activeAbortController || this.resolvingApproval)
+      return Promise.reject(new Error('Cannot close an active AgentRuntime; settle its run first.'));
+    this.closed = true;
+    return this.releaseResources();
+  }
+
+  private assertOpen(): void {
+    if (this.closed) throw new Error('AgentRuntime has been closed.');
   }
 
   inspectRun(runId: string) {
@@ -527,6 +545,7 @@ export class AgentRuntime {
   }
 
   resume(runId: string, signal?: AbortSignal): AgentRunHandle {
+    this.assertOpen();
     if (this.activeAbortController) throw new Error('AgentRuntime already has an active run.');
     const runs = new AgentRunCoordinator(
       this.options.repositories.events,
@@ -557,6 +576,9 @@ export class AgentRuntime {
     readonly decision: 'allow' | 'deny';
     readonly signal?: AbortSignal;
   }): Promise<AgentRunHandle> {
+    this.assertOpen();
+    if (this.resolvingApproval) throw new Error('AgentRuntime already has an active approval resolution.');
+    this.resolvingApproval = true;
     try {
       return await this.resolveApprovalActive(input);
     } catch (error) {
@@ -571,6 +593,8 @@ export class AgentRuntime {
         );
       }
       throw error;
+    } finally {
+      this.resolvingApproval = false;
     }
   }
 
@@ -923,8 +947,10 @@ export class AgentRuntime {
   }
 
   private releaseResources(): Promise<void> {
-    this.unbindContext?.();
-    this.releasePromise ??= Promise.resolve(this.options.release?.()).then(() => undefined);
+    this.releasePromise ??= Promise.resolve().then(async () => {
+      this.unbindContext?.();
+      await this.options.release?.();
+    });
     return this.releasePromise;
   }
 
@@ -2574,17 +2600,21 @@ export class AgentRuntime {
       let rejected: CompiledModelRequest | undefined;
       let contextRetries = 0;
       let generationRetries = 0;
+      let recoveryAssembly: RequestAssemblyResult | undefined;
       for (;;) {
         const identity = turnIdentity(request.snapshot.record);
         let assembly: RequestAssemblyResult;
         try {
-          assembly = await this.assembleModelRequest(request, append, emit, rejected);
+          // A generation retry owns the same captured candidate. In particular, a
+          // restricted control snapshot must never enter ordinary task assembly.
+          assembly = recoveryAssembly ?? await this.assembleModelRequest(request, append, emit, rejected);
         } catch (error) {
           if (!(error instanceof ContextAdmissionError || error instanceof ContextSourceCapacityError) ||
               !this.options.contextRenewal?.automatic || !this.options.context) throw error;
           const recovery = await this.assembleContextRecovery(request, error, append);
           request = recovery.request;
           assembly = recovery.assembly;
+          recoveryAssembly = assembly;
         }
         await request.controller.recordUsage(
           await this.inferenceService.settledRunUsage(
@@ -2627,6 +2657,9 @@ export class AgentRuntime {
         if (completedAttempt.kind === 'outcome_unknown') return completedAttempt;
         if (completedAttempt.kind === 'failed') {
           const capacityFailure = completedAttempt.diagnostic.code === 'context_overflow';
+          if (capacityFailure && request.snapshot.record.contextRecovery)
+            throw new ContextRecoveryStoppedError(request.snapshot.record.contextRecovery,
+              'Provider rejected the bounded context-management request; change capacity or select sources explicitly.');
           if (
             capacityFailure &&
             (contextRetries === 1 ||
@@ -2652,6 +2685,10 @@ export class AgentRuntime {
                 kind: 'decision',
                 decision: failedGenerationDecision(completedAttempt.diagnostic, request.turnIndex)
               };
+            if (recoveryAssembly?.recoveryAttempt !== undefined &&
+                recoveryAssembly.recoveryAttempt >= CONTEXT_RECOVERY_LIMITS.requestsPerBoundary && request.snapshot.record.contextRecovery)
+              throw new ContextRecoveryStoppedError(request.snapshot.record.contextRecovery,
+                'Bounded context recovery exhausted four requests without progress.', 'attempt_limit');
             generationRetries++;
             const retryAt = Math.max(
               Date.now() + 500 * generationRetries,
@@ -2675,6 +2712,15 @@ export class AgentRuntime {
             }
           };
           request = { ...request, snapshot };
+          if (recoveryAssembly) {
+            recoveryAssembly = {
+              ...recoveryAssembly,
+              ...(recoveryAssembly.recoveryAttempt === undefined ? {} : { recoveryAttempt: recoveryAssembly.recoveryAttempt + 1 }),
+              fingerprint: { ...recoveryAssembly.fingerprint, ...turnIdentity(snapshot.record), requestId: randomUUID() }
+            };
+            await append({ type: 'budget.estimate.created', ...turnIdentity(snapshot.record),
+              attempt: 1, estimate: recoveryAssembly.estimate });
+          }
           await this.advanceRun(request.run, 'consume_provider_settlement', {
             phase: { kind: 'active' },
             providerRequests: [
@@ -2942,20 +2988,27 @@ export class AgentRuntime {
     ordinary: AssistantTurnRequest,
     failure: ContextAdmissionError | ContextSourceCapacityError,
     append: (event: AgentAuditEvent) => Promise<EventAppendReceipt>,
-    probe = false
+    probe = false,
+    cut?: import('./history/contracts.js').HistorySourceCut
   ): Promise<{ request: AssistantTurnRequest; assembly: RequestAssemblyResult }> {
     const context = this.options.context;
     if (!context || !ordinary.snapshot.profile.capabilities.toolCalling) throw failure;
     const originalConflict = failure instanceof ContextSourceCapacityError ? failure.conflict : requestCapacityConflict(failure);
-    const window = await context.history.selectedContext();
-    const conflict: ContextAdmissionConflict = {
+    const inspection = await context.inspect(cut, { limit: CONTEXT_RECOVERY_LIMITS.inventoryItems, maxBytes: CONTEXT_RECOVERY_LIMITS.inventoryBytes });
+    const conflict = {
       ...originalConflict,
+      // Audit writes, inspections, and rejection notices are not progress. A new
+      // committed window has already admitted the original work and starts its
+      // own no-progress allowance, under the unchanged owner/run budgets.
       recoveryBoundary: hashJson({
-        windowId: window?.windowId ?? null, kind: originalConflict.kind,
-        inputIdentity: originalConflict.inputIdentity ?? null,
-        source: originalConflict.kind === 'source_capacity' ? originalConflict.source ?? null : null
+        windowId: inspection.window?.windowId ?? null,
+        workingStateRevisionId: inspection.workingState.revisionId,
+        task: ordinary.input.task, images: ordinary.input.images ?? null,
+        configuration: ordinary.snapshot.configuration, profile: ordinary.snapshot.profile,
+        instructions: ordinary.snapshot.instructions, catalog: ordinary.snapshot.record.toolCatalog.revision,
+        outputReservation: ordinary.snapshot.requestWindow.maxOutputTokens
       })
-    };
+    } satisfies ContextAdmissionConflict;
     const tools = ordinary.snapshot.tools.filter((tool) =>
       tool.implementationId === 'agent-core.context-transition.v1' ||
       (tool.implementationId === `agent-core.${tool.name}.v1` &&
@@ -2964,63 +3017,70 @@ export class AgentRuntime {
         (tool.name.endsWith('_inspect') || tool.name.endsWith('_read')))
     );
     if (!tools.some((tool) => tool.implementationId === 'agent-core.context-transition.v1')) throw failure;
-    // Count durable snapshots, including unsettled invocations. Restarting cannot
-    // turn a blocked request into an unbounded sequence of paid recovery calls.
+    // Probes compile bounded material only. Durable no-progress accounting is
+    // read exactly when entering recovery, indexed to this unchanged boundary.
     const events = this.options.repositories.events;
-    const tail = await events.tail(ordinary.runId, { metadataOnly: true });
-    const snapshots = await events.readMetadataRange(ordinary.runId, {
-      through: tail, types: ['turn.snapshot.created'], metadata: { contextRecovery: 'true' },
-      limit: 5, maxBytes: 2 * CONTEXT_RECOVERY_LIMITS.resultBytes
-    });
-    if (snapshots.oversized || !snapshots.complete)
-      throw new ContextRecoveryStoppedError(conflict, 'Context recovery exhausted its bounded durable request inventory.');
-    const attempts = snapshots.records.length;
+    let attempts = 0;
     const recoveryResults: { tool: string; content: string; original: string; coverage: 'complete' | 'partial' }[] = [];
-    for (const snapshot of probe ? [] : snapshots.records.filter((snapshot) => snapshot.metadata.recoveryBoundary === conflict.recoveryBoundary)) {
-      const exchangeId = snapshot.metadata.exchangeId;
-      if (!exchangeId) throw new Error('Recovery snapshot is missing its exchange identity.');
-      const records = await events.readMetadataRange(ordinary.runId, {
-        through: tail, types: ['assistant.ended', 'observation.record.created'],
-        metadata: { exchangeId }, limit: 16, maxBytes: 2 * CONTEXT_RECOVERY_LIMITS.resultBytes
-      });
-      if (!records.complete || records.oversized)
-        throw new ContextRecoveryStoppedError(conflict, 'Recovery exchange exceeds its bounded control protocol.');
-      for (const metadata of records.records) {
-        if (metadata.bytes > 32768) {
-          recoveryResults.push({ tool: metadata.metadata.toolName ?? 'context', content: 'Recorded recovery result exceeds the bounded presentation read. Use its original history source.', original: metadata.reference.eventId, coverage: 'partial' });
-        } else {
-          const event = (await events.readReference(metadata.reference)).event;
-          if (event.type === 'assistant.ended' && event.contextRecovery && snapshot.metadata.recoveryBoundary === conflict.recoveryBoundary)
-            for (const call of event.toolCalls ?? []) this.recoveryActions.add(`${ordinary.runId}:${conflict.recoveryBoundary ?? "unbound"}:${hashJson({name: call.name, input: call.input})}`);
-          if (event.type === 'observation.record.created') {
-            const sourceBytes = event.modelContentRef?.size ?? Buffer.byteLength(JSON.stringify(event.modelContent));
-            const content = sourceBytes <= 32768
-              ? serializeToolModelContent(await resolveToolModelContent(event, this.options.repositories.artifacts))
-              : 'Recovery presentation exceeds its byte bound; the original remains recorded.';
-            const bounded = textRange(content, 0, CONTEXT_RECOVERY_LIMITS.resultBytes);
-            recoveryResults.push({tool: event.toolName, content: bounded.text, original: metadata.reference.eventId,
-              coverage: sourceBytes <= 32768 && bounded.nextOffset >= Buffer.byteLength(content) ? 'complete' : 'partial'});
-          }
-        }
-        if (recoveryResults.length > CONTEXT_RECOVERY_LIMITS.recentResults) recoveryResults.shift();
-      }
-    }
-    const rejection = await events.latestReferenceOfType(ordinary.runId, 'context.transition.rejected', { metadataOnly: true });
     const rejectionMessages: string[] = [];
-    if (rejection) {
-      const metadata = await events.readMetadataRange(ordinary.runId, { afterSequence: rejection.sequence - 1, through: tail, limit: 1 });
-      if (metadata.records[0] && metadata.records[0].bytes <= 8192) {
-        const event = (await events.readReference(rejection)).event;
-        if (event.type === 'context.transition.rejected') rejectionMessages.push(textRange(event.message, 0, 2048).text);
+    if (!probe) {
+      const actionBoundary = `${ordinary.runId}:${conflict.recoveryBoundary}`;
+      if (this.recoveryActionBoundary !== actionBoundary) {
+        this.recoveryActions.clear();
+        this.recoveryActionBoundary = actionBoundary;
+      }
+      const tail = await events.tail(ordinary.runId, { metadataOnly: true });
+      const snapshots = await events.readMetadataRange(ordinary.runId, {
+        through: tail, types: ['turn.snapshot.created'], metadata: { recoveryBoundary: conflict.recoveryBoundary },
+        limit: CONTEXT_RECOVERY_LIMITS.requestsPerBoundary + 1, maxBytes: 2 * CONTEXT_RECOVERY_LIMITS.resultBytes
+      });
+      if (snapshots.oversized || !snapshots.complete)
+        throw new ContextRecoveryStoppedError(conflict, 'Context recovery exhausted its bounded durable request inventory.', 'attempt_limit');
+      attempts = snapshots.records.length;
+      if (attempts >= CONTEXT_RECOVERY_LIMITS.requestsPerBoundary)
+        throw new ContextRecoveryStoppedError(conflict, 'Bounded context recovery exhausted four requests without progress. Select sources, change capacity, or cancel; the original history remains intact.', 'attempt_limit');
+      for (const snapshot of snapshots.records) {
+        const exchangeId = snapshot.metadata.exchangeId;
+        if (!exchangeId) throw new Error('Recovery snapshot is missing its exchange identity.');
+        const records = await events.readMetadataRange(ordinary.runId, {
+          through: tail, types: ['assistant.ended', 'observation.record.created'],
+          metadata: { exchangeId }, limit: 16, maxBytes: 2 * CONTEXT_RECOVERY_LIMITS.resultBytes
+        });
+        if (!records.complete || records.oversized)
+          throw new ContextRecoveryStoppedError(conflict, 'Recovery exchange exceeds its bounded control protocol.');
+        for (const metadata of records.records) {
+          if (metadata.bytes > 32768) {
+            recoveryResults.push({ tool: metadata.metadata.toolName ?? 'context', content: 'Recorded recovery result exceeds the bounded presentation read. Use its original history source.', original: metadata.reference.eventId, coverage: 'partial' });
+          } else {
+            const event = (await events.readReference(metadata.reference)).event;
+            if (event.type === 'assistant.ended' && event.contextRecovery && snapshot.metadata.recoveryBoundary === conflict.recoveryBoundary)
+              for (const call of event.toolCalls ?? []) this.recoveryActions.add(`${ordinary.runId}:${conflict.recoveryBoundary}:${hashJson({name: call.name, input: call.input})}`);
+            if (event.type === 'observation.record.created') {
+              const sourceBytes = event.modelContentRef?.size ?? Buffer.byteLength(JSON.stringify(event.modelContent));
+              const content = sourceBytes <= 32768
+                ? serializeToolModelContent(await resolveToolModelContent(event, this.options.repositories.artifacts))
+                : 'Recovery presentation exceeds its byte bound; the original remains recorded.';
+              const bounded = textRange(content, 0, CONTEXT_RECOVERY_LIMITS.resultBytes);
+              recoveryResults.push({tool: event.toolName, content: bounded.text, original: metadata.reference.eventId,
+                coverage: sourceBytes <= 32768 && bounded.nextOffset >= Buffer.byteLength(content) ? 'complete' : 'partial'});
+            }
+          }
+          if (recoveryResults.length > CONTEXT_RECOVERY_LIMITS.recentResults) recoveryResults.shift();
+        }
+      }
+      const rejection = await events.latestReferenceOfType(ordinary.runId, 'context.transition.rejected', { metadataOnly: true });
+      if (rejection) {
+        const metadata = await events.readMetadataRange(ordinary.runId, { afterSequence: rejection.sequence - 1, through: tail, limit: 1 });
+        if (metadata.records[0] && metadata.records[0].bytes <= 8192) {
+          const event = (await events.readReference(rejection)).event;
+          if (event.type === 'context.transition.rejected') rejectionMessages.push(textRange(event.message, 0, 2048).text);
+        }
       }
     }
-    if (!probe && attempts >= CONTEXT_RECOVERY_LIMITS.requests)
-      throw new ContextRecoveryStoppedError(conflict, 'Bounded context recovery exhausted four requests. Select sources, change capacity, or cancel; the original history remains intact.', 'attempt_limit');
-    const inspection = await context.inspect(undefined, { limit: CONTEXT_RECOVERY_LIMITS.inventoryItems, maxBytes: CONTEXT_RECOVERY_LIMITS.inventoryBytes });
     const manifest = inspection.activeSelection.status === 'available'
       ? inspection.activeSelection.manifest : inspection.activeSelection;
     const content = JSON.stringify({
-      conflict, attempt: attempts + 1, maximumAttempts: CONTEXT_RECOVERY_LIMITS.requests, inventory: manifest,
+      conflict, attempt: attempts + 1, maximumAttempts: CONTEXT_RECOVERY_LIMITS.requestsPerBoundary, inventory: manifest,
       workingState: { revisionId: inspection.workingState.revisionId },
       legalTransitions: inspection.legalTransitions,
       sourceBudget: inspection.budget,
@@ -3035,7 +3095,8 @@ export class AgentRuntime {
     const snapshot: TurnSnapshot = {
       ...ordinary.snapshot,
       record: {
-        ...ordinary.snapshot.record, contextRecovery: conflict, continuationEligible: false,
+        ...ordinary.snapshot.record, contextRecovery: conflict,
+        resumeInstructions: ordinary.snapshot.instructions, continuationEligible: false,
         toolCatalog: captureToolCatalog(tools), toolNames: tools.map((tool) => tool.name),
         instructions: [instruction], configuredContextSourceIds: []
       },
@@ -3057,7 +3118,9 @@ export class AgentRuntime {
       throw new ContextRecoveryStoppedError(conflict, error.message);
     }
     try {
-      await this.requestAdmission.admit(assembled.compiled, snapshot.profile);
+      // A probe measures the explicit reserve, including when that reserve
+      // cannot fit. Only a dispatched control candidate needs its own admission.
+      if (!probe) await this.requestAdmission.admit(assembled.compiled, snapshot.profile);
     } catch (error) {
       this.preserveRecoveryFailure(error, ordinary);
       if (!(error instanceof ContextAdmissionError)) throw error;
@@ -3083,7 +3146,7 @@ export class AgentRuntime {
       await append({ type: 'prompt.material.selected', material: assembled.assembly.material });
       await append({ type: 'budget.estimate.created', ...turnIdentity(snapshot.record), attempt: 1, estimate });
     }
-    return { request, assembly: { request: assembled.request, compiled: assembled.compiled, estimate, fingerprint } };
+    return { request, assembly: { request: assembled.request, compiled: assembled.compiled, estimate, fingerprint, recoveryAttempt: attempts + 1 } };
   }
 
   private async assembleModelRequest(
@@ -3184,7 +3247,11 @@ export class AgentRuntime {
       );
       nativeUsagePending = false;
     };
-    const admitOrdinary = (compiled: CompiledModelRequest) => this.admitContextRequest(compiled, request, append);
+    const controlReserves = new Map<string, number>();
+    const admitOrdinary = async (compiled: CompiledModelRequest) => {
+      const reserve = await this.admitContextRequest(compiled, request, append);
+      if (reserve !== undefined) controlReserves.set(compiled.inputIdentity, reserve);
+    };
     const validate = async (input: ContextAdmissionInput) => {
       assertToolTransitionBoundary(request.run.state());
       const boundary = request.run.state().revision;
@@ -3360,7 +3427,8 @@ export class AgentRuntime {
           new Error(`${rejectedRequest.message} Native renewal failed: ${errorMessage(cause)}`, {
             cause
           }),
-          rejectedRequest.providerRejected
+          rejectedRequest.providerRejected,
+          rejectedRequest.continuityHeadroomTokens
         );
       }
     }
@@ -3369,7 +3437,9 @@ export class AgentRuntime {
         status: 'blocked',
         inputIdentity: result.compiled.inputIdentity,
         accounting: result.compiled.accounting,
-        message: admissionFailure.message
+        message: admissionFailure.message,
+        ...(admissionFailure.continuityHeadroomTokens === undefined ? {} :
+          { continuityHeadroomTokens: admissionFailure.continuityHeadroomTokens })
       });
       throw admissionFailure;
     }
@@ -3380,7 +3450,7 @@ export class AgentRuntime {
     let feedbackFailure: string | undefined;
     if (this.options.context) {
       try {
-        feedback = await this.options.context.capacityFeedback(result.compiled);
+        feedback = await this.options.context.capacityFeedback(result.compiled, controlReserves.get(result.compiled.inputIdentity));
         if (feedback) {
           capacityNotice = feedback.notice;
           const withFeedback = await assemble(
@@ -3398,6 +3468,7 @@ export class AgentRuntime {
     }
 
     const { assembly, compiled } = result;
+    const continuityHeadroomTokens = controlReserves.get(compiled.inputIdentity);
     const estimate = requestTokenEstimate({
       accounting: compiled.accounting,
       modelWindowTokens: assembly.estimate.modelWindowTokens,
@@ -3429,9 +3500,10 @@ export class AgentRuntime {
       status: 'admitted',
       inputIdentity: compiled.inputIdentity,
       accounting: compiled.accounting,
+      ...(continuityHeadroomTokens === undefined ? {} : { continuityHeadroomTokens }),
       ...(feedback ? { feedback } : {}),
       ...(feedbackFailure ? { message: feedbackFailure } : {}),
-      ...(!feedbackFailure && requestCapacity(result.compiled.accounting).pressure === 'continuity'
+      ...(!feedbackFailure && requestCapacity(result.compiled.accounting, controlReserves.get(result.compiled.inputIdentity)).pressure === 'continuity'
         ? {
             message:
               'Context is near capacity. Select sources or explicitly renew native continuity; working-state maintenance is not required.'
@@ -3457,18 +3529,35 @@ export class AgentRuntime {
     compiled: CompiledModelRequest,
     request: AssistantTurnRequest,
     append: (event: AgentAuditEvent) => Promise<EventAppendReceipt>
-  ): Promise<void> {
+  ): Promise<number | undefined> {
     await this.requestAdmission.admit(compiled, request.snapshot.profile);
-    if (!this.options.contextRenewal?.automatic || !this.options.context ||
+    const context = this.options.context;
+    if (!this.options.contextRenewal?.automatic || !context ||
         !request.snapshot.tools.some((tool) => tool.implementationId === 'agent-core.context-transition.v1')) return;
-    const probe = await this.assembleContextRecovery(request,
-      new ContextAdmissionError(compiled, new Error('Compiled capacity must leave room for the current bounded context-management request.')),
-      append, true);
-    const reserve = contextControlHeadroom(probe.assembly.compiled);
-    const remaining = requestCapacity(compiled.accounting).remainingTokens;
+    const cut = await context.history.capture();
+    const identity = hashJson({
+      cut, inputIdentity: compiled.inputIdentity, accounting: compiled.accounting,
+      capabilityRevision: compiled.capabilityRevision, provider: compiled.provider,
+      profile: request.snapshot.profile,
+      configuration: request.snapshot.configuration,
+      tools: promptToolSpecs([...request.snapshot.tools], request.snapshot.profile, this.options.toolContext),
+      outputReservation: request.snapshot.requestWindow.maxOutputTokens,
+      protectedSources: await context.protectedSources(cut)
+    });
+    let reserve = this.contextControlReserve?.identity === identity ? this.contextControlReserve.tokens : undefined;
+    if (reserve === undefined) {
+      const probe = await this.assembleContextRecovery(request,
+        new ContextAdmissionError(compiled, new Error('Compiled capacity must leave room for the current bounded context-management request.')),
+        append, true, cut);
+      reserve = contextControlHeadroom(probe.assembly.compiled);
+      this.contextControlReserve = { identity, tokens: reserve };
+    }
+    const remaining = requestCapacity(compiled.accounting, reserve).remainingTokens;
     if (remaining !== undefined && remaining < reserve)
       throw new ContextAdmissionError(compiled,
-        new Error(`Compiled request leaves ${String(remaining)} input tokens; the current bounded context-management request requires ${String(reserve)} tokens of continuity room.`));
+        new Error(`Compiled request leaves ${String(remaining)} input tokens; the current bounded context-management request requires ${String(reserve)} tokens of continuity room.`),
+        false, reserve);
+    return reserve;
   }
 
   private preserveRecoveryFailure(error: unknown, request: AssistantTurnRequest): void {
@@ -3601,8 +3690,9 @@ export class AgentRuntime {
   private async activateCommittedContext(window: ModelWindow, runId: string): Promise<void> {
     if (!this.options.context || !this.options.repositories.session) return;
     if (this.activeRunDriver) assertToolTransitionBoundary(this.activeRunDriver.state());
-    const context = await this.options.context.inspect();
-    const windowId = context.window?.windowId ?? null;
+    // An unchanged committed window needs no source planning or working-state read.
+    const contextWindow = await this.options.context.history.selectedContext();
+    const windowId = contextWindow?.windowId ?? null;
     const profile = await this.options.provider.describeModel(this.options.model);
     const identity = hashJson({
       windowId,
@@ -4132,7 +4222,7 @@ export class AgentRuntime {
       ...(settlement.event.providerState ? { providerState: settlement.event.providerState } : {}),
       turnSnapshot,
       requestEstimate,
-      instructions: turnSnapshot.instructions,
+      instructions: turnSnapshot.resumeInstructions ?? turnSnapshot.instructions,
       budget: state.budget
     });
   }

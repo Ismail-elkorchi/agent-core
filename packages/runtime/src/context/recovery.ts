@@ -3,9 +3,9 @@ import { ModelWindow } from '../inference/model-window.js';
 import type { RequestAdmission } from '../inference/request-admission.js';
 import type { PromptToolSummary } from '../inference/prompt-material.js';
 
-/** Bounds belong to the one control request, not an independently scheduled agent. */
+/** Control presentation bounds and the durable unchanged-boundary request allowance. */
 export const CONTEXT_RECOVERY_LIMITS = Object.freeze({
-  requests: 4,
+  requestsPerBoundary: 4,
   inventoryBytes: 4096,
   inventoryItems: 12,
   resultBytes: 8192,

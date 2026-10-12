@@ -60,7 +60,7 @@ async function fixture({ allowedRisks = ['read', 'write'], budget, sourceBytes =
   const seed = await new AgentRuntime(options(100000)).run({ runId: 'seed', task: 'Old optional evidence: ' + 'x'.repeat(sourceBytes) }).result;
   assert.equal(seed.terminal?.executionStatus, 'completed');
   capacity = targetCapacity;
-  return { options: () => options(sourceBound), requests, events, artifacts, history, sessions, descriptor, inferenceRepository,
+  return { options: () => options(sourceBound), provider, requests, events, artifacts, history, sessions, descriptor, inferenceRepository,
     effects: () => effects, recover: value => { recover = value; },
     recoveryRequests: () => requests.filter(request => request.messages.some(item => item.role === 'system' && item.content.includes(marker))) };
 }
@@ -313,4 +313,104 @@ test('paged inspection of large working state reads only metadata and retains an
   const unpaged = await context.inspect();
   assert.ok(unpaged.workingState.text.includes('GENERATED-STATE'));
   assert.equal(unpaged.workingState.complete, false);
+});
+
+test('admission, feedback, and inspection disclose the same compiled control reserve', async () => {
+  const f = await fixture({ sourceBytes: 12000, sourceBound: 100000, targetCapacity: 12000 });
+  const options = f.options();
+  let blocked;
+  let conflict;
+  f.recover(async request => {
+    conflict = JSON.parse(request.messages.findLast(item => item.role === 'user').content).conflict;
+    blocked = await options.context.inspect(undefined, { limit: 12, maxBytes: 4096 });
+    return select();
+  });
+  const result = await new AgentRuntime(options).run({ runId: 'visible-reserve', task: 'ACTUAL TASK' }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.equal(blocked.admission.status, 'blocked');
+  assert.equal(blocked.capacity.continuityHeadroomPolicy, 'required');
+  assert.equal(blocked.capacity.pressure, 'continuity');
+  assert.equal(blocked.capacity.ordinaryRemainingTokens, 0);
+  assert.ok(blocked.capacity.continuityHeadroomTokens > blocked.capacity.outputReservation);
+  assert.equal(blocked.capacity.continuityHeadroomTokens, Number(conflict.message.match(/requires (\d+) tokens/)[1]));
+  const candidate = f.requests.find(request => request.messages.some(item => item.content.includes('ACTUAL TASK')));
+  assert.ok(candidate);
+  const final = await options.context.inspect(undefined, { limit: 12, maxBytes: 4096 });
+  assert.equal(final.admission.status, 'admitted');
+  assert.equal(final.capacity.continuityHeadroomPolicy, 'required');
+  assert.ok(final.capacity.remainingTokens >= final.capacity.continuityHeadroomTokens);
+});
+
+test('small-model required reserve remains visible when mandatory input cannot be released', async () => {
+  const { compileModelRequest } = await import('@agent-core/model');
+  const f = await fixture({ sourceBytes: 64, sourceBound: 100000, targetCapacity: 6000 });
+  let ordinaryCompiled;
+  const ordinaryIdentities = new Set();
+  let rejectedSelections = 0;
+  f.recover(() => call('context_transition', { reason: `Distinct unsuccessful selection ${++rejectedSelections}`, retain: [] }));
+  f.provider.compileRequest = async request => {
+    const { signal: _signal, ...body } = request;
+    const control = request.messages.some(item => item.content.includes(marker));
+    const compiled = await compileModelRequest({ request, body, profile: await f.provider.describeModel(),
+      endpoint: 'fixture://mandatory-capacity', providerInputTokens: control ? 2300 : 4500 });
+    if (!control) { ordinaryCompiled = compiled; ordinaryIdentities.add(compiled.inputIdentity); }
+    return compiled;
+  };
+  const options = f.options();
+  const before = f.requests.length;
+  const task = 'MANDATORY ORIGINAL INPUT: this requirement cannot be released.';
+  const result = await new AgentRuntime(options).run({ runId: 'mandatory-reserve', task }).result;
+  assert.equal(result.state, 'suspended', JSON.stringify(result));
+  assert.equal(result.reason, 'context_admission');
+  assert.equal(result.contextAdmission.recovery, 'attempt_limit');
+  assert.equal(rejectedSelections, 4);
+  assert.ok(ordinaryIdentities.size > 1, 'Rejected selections may change candidate material without resetting the no-progress boundary.');
+  assert.equal(new Set(f.recoveryRequests().map(request => JSON.parse(request.messages.findLast(item => item.role === 'user').content).conflict.recoveryBoundary)).size, 1);
+  assert.ok(f.requests.slice(before).every(request => request.messages.some(item => item.content.includes(marker))));
+  const current = await options.context.inspect(undefined, { limit: 12, maxBytes: 4096 });
+  assert.equal(current.admission.status, 'blocked');
+  assert.equal(current.capacity.continuityHeadroomPolicy, 'required');
+  assert.equal(current.capacity.continuityHeadroomTokens, 2812);
+  assert.equal(current.capacity.inputTokens, 4500);
+  assert.equal(current.capacity.remainingTokens, 988);
+  assert.equal(current.capacity.pressure, 'continuity');
+  const feedback = await options.context.capacityFeedback(ordinaryCompiled, current.capacity.continuityHeadroomTokens);
+  assert.deepEqual(JSON.parse(feedback.notice.content).capacity, current.capacity);
+  const input = current.activeSelection.manifest.items.find(item => item.description.includes('MANDATORY ORIGINAL INPUT'));
+  assert.equal(input.group.release, 'protected');
+  assert.equal((await f.history.read({ source: input.source })).item.text, task);
+  assert.equal((await f.sessions.sourceSnapshot(f.descriptor)).latestContext, undefined);
+});
+
+test('ordinary turns compile one current control probe without scanning durable recovery attempts', async t => {
+  const { compileModelRequest } = await import('@agent-core/model');
+  const f = await fixture({ sourceBytes: 64, sourceBound: 100000, targetCapacity: 64000 });
+  const options = f.options();
+  const counts = { ordinaryCompilations: 0, controlCompilations: 0, recoveryQueries: 0, boundedInspections: 0, unpagedInspections: 0 };
+  f.provider.compileRequest = async request => {
+    const control = request.messages.some(item => item.content.includes(marker));
+    counts[control ? 'controlCompilations' : 'ordinaryCompilations']++;
+    const { signal: _signal, ...body } = request;
+    return compileModelRequest({ request, body, profile: await f.provider.describeModel(),
+      endpoint: 'fixture://probe-work', providerInputTokens: 100 });
+  };
+  let ordinaryTurns = 0;
+  f.provider.complete = async request => {
+    assert.ok(!request.messages.some(item => item.content.includes(marker)));
+    return ++ordinaryTurns < 3 ? call('domain_write') : response();
+  };
+  const readMetadata = f.events.readMetadataRange.bind(f.events);
+  t.mock.method(f.events, 'readMetadataRange', async (runId, query) => {
+    if (query?.types?.includes('turn.snapshot.created')) counts.recoveryQueries++;
+    return readMetadata(runId, query);
+  });
+  const inspect = options.context.inspect.bind(options.context);
+  t.mock.method(options.context, 'inspect', async (cut, page) => {
+    counts[page ? 'boundedInspections' : 'unpagedInspections']++;
+    return inspect(cut, page);
+  });
+  const result = await new AgentRuntime(options).run({ runId: 'ordinary-probe-work', task: 'Complete the ordinary work.' }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.deepEqual(counts, { ordinaryCompilations: 3, controlCompilations: 3, recoveryQueries: 0, boundedInspections: 3, unpagedInspections: 0 });
+  t.diagnostic(JSON.stringify({ measurement: 'three ordinary turns', counts }));
 });

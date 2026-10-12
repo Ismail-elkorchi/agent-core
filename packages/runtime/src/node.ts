@@ -4,3 +4,6 @@ export type { JsonlSessionRepositoryOptions } from './session/repository-node.js
 
 export { JsonlInferenceRepository } from './inference/repository-node.js';
 export type { JsonlInferenceRepositoryOptions } from './inference/repository-node.js';
+
+export { SessionHistoryIndexError, SessionHistorySourceError, SessionHistoryIndexPublicationError } from './session/history-index.js';
+export type { HistoryIndexRebuildOptions, HistoryIndexRecoveryOptions, HistoryIndexRecoveryProgress } from './session/history-index.js';

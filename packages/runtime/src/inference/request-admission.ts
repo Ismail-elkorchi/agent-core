@@ -62,14 +62,15 @@ export class ContextAdmissionError extends Error {
   constructor(
     readonly compiled: CompiledModelRequest,
     cause: unknown,
-    readonly providerRejected = false
+    readonly providerRejected = false,
+    readonly continuityHeadroomTokens?: number
   ) {
     super(cause instanceof Error ? cause.message : String(cause), { cause });
     this.name = 'ContextAdmissionError';
   }
 }
 
-/** Capacity is a view of compiled accounting; continuity headroom is a soft reserve. */
+/** Capacity and headroom describe the same compiled admission boundary. */
 export function requestCapacity(accounting: RequestAccounting, headroom?: number) {
   const inputTokens = requestAccountingInputTokens(accounting);
   const reasoningReservation =
@@ -90,9 +91,9 @@ export function requestCapacity(accounting: RequestAccounting, headroom?: number
   const requestedHeadroom = headroom ?? accounting.outputReservation + reasoningReservation;
   if (!Number.isSafeInteger(requestedHeadroom) || requestedHeadroom < 0)
     throw new Error('Continuity headroom must be a nonnegative token count.');
-  // Continuity is a soft reserve, not another output reservation. Leave at least
-  // half the admitted input capacity for ordinary work, even with large outputs.
-  const continuityHeadroomTokens = Math.min(
+  // Without automatic control recovery, output-sized headroom is advisory. An
+  // explicit reserve is the actual compiled control allowance enforced by Core.
+  const continuityHeadroomTokens = headroom ?? Math.min(
     requestedHeadroom,
     inputCapacity === undefined ? requestedHeadroom : Math.floor(inputCapacity / 2)
   );
@@ -102,6 +103,7 @@ export function requestCapacity(accounting: RequestAccounting, headroom?: number
     outputReservation: accounting.outputReservation,
     reasoningReservation,
     continuityHeadroomTokens,
+    continuityHeadroomPolicy: headroom === undefined ? 'advisory' as const : 'required' as const,
     ...(remainingTokens === undefined
       ? {}
       : { ordinaryRemainingTokens: Math.max(0, remainingTokens - continuityHeadroomTokens) }),

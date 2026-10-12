@@ -12,6 +12,7 @@ import type {
   SessionSubmissionConfiguration,
   SessionSubmissionInput,
   SessionSubmissionRecord,
+  SessionSubmissionOutcome,
   SessionSubmissionState,
   SessionSubmissionTransition,
   SessionSubmissionUpdate,
@@ -171,6 +172,7 @@ export function pendingSessionSubmissions(
               state: submission.state,
               input: submission.input,
               configuration: submission.configuration,
+              ...(submission.claimId === undefined ? {} : { claimId: submission.claimId }),
               ...(submission.suspension === undefined ? {} : { suspension: submission.suspension })
             })
           ]
@@ -181,15 +183,21 @@ export function pendingSessionSubmissions(
 export function createSessionSubmissionTransition(
   records: readonly SessionSubmissionRecord[],
   submissionId: string,
-  outcome:
-    | { readonly state: 'claimed' | 'completed' }
-    | { readonly state: 'suspended'; readonly suspension: SessionSuspensionDescriptor }
-    | { readonly state: 'failed'; readonly errorMessage: string }
+  outcome: SessionSubmissionOutcome
 ): SessionSubmissionTransition | undefined {
   const current = foldSubmissions(records).get(submissionId);
   if (current === undefined) throw new Error(`Unknown session submission: ${submissionId}`);
   const state = outcome.state;
+  const claimId = outcome.claimId;
+  if (typeof claimId !== 'string' || claimId.length === 0)
+    throw new Error('Session submission claim identity is invalid.');
+  assertSubmissionOwnership(current, {
+    type: `submission.${state}`, claimId,
+    ...(outcome.state === 'claimed' && outcome.expectedClaimId !== undefined
+      ? { previousClaimId: outcome.expectedClaimId } : {})
+  });
   const base = {
+    claimId,
     type: `submission.${state}`,
     submissionId,
     runId: current.runId,
@@ -219,15 +227,13 @@ export function createSessionSubmissionTransition(
     assertSubmissionTransition(current.state, state, submissionId);
     return Object.freeze({ ...base, type: 'submission.failed', errorMessage });
   }
-  if (current.state === state) {
-    if (state === 'claimed')
-      throw new Error(`Session submission is already claimed: ${submissionId}`);
-    return undefined;
-  }
+  if (current.state === state && state !== 'claimed') return undefined;
   assertSubmissionTransition(current.state, state, submissionId);
   return Object.freeze({
     ...base,
-    type: state === 'claimed' ? 'submission.claimed' : 'submission.completed'
+    type: state === 'claimed' ? 'submission.claimed' : 'submission.completed',
+    ...(outcome.state === 'claimed' && outcome.expectedClaimId !== undefined
+      ? { previousClaimId: outcome.expectedClaimId } : {})
   });
 }
 
@@ -267,6 +273,7 @@ function foldSubmissions(
       );
       continue;
     }
+    assertSubmissionOwnership(current, record);
     const state = submissionTransitionState(record);
     assertSubmissionTransition(current.state, state, record.submissionId);
     const suspension =
@@ -278,6 +285,7 @@ function foldSubmissions(
       Object.freeze({
         ...current,
         state,
+        claimId: record.claimId,
         ...(record.type === 'submission.failed' ? { errorMessage: record.errorMessage } : {}),
         ...(suspension === undefined ? {} : { suspension })
       })
@@ -441,6 +449,25 @@ function submissionTransitionState(
   }
 }
 
+export class SessionSubmissionOwnershipError extends Error {
+  constructor(readonly submissionId: string) {
+    super(`Session submission claim is no longer owned: ${submissionId}`);
+    this.name = 'SessionSubmissionOwnershipError';
+  }
+}
+
+export function assertSubmissionOwnership(
+  current: { readonly submissionId: string; readonly claimId?: string },
+  record: { readonly type: string; readonly claimId: string; readonly previousClaimId?: string }
+): void {
+  if (record.type === 'submission.claimed') {
+    if (current.claimId !== record.previousClaimId || current.claimId === record.claimId)
+      throw new SessionSubmissionOwnershipError(current.submissionId);
+  } else if (current.claimId !== record.claimId) {
+    throw new SessionSubmissionOwnershipError(current.submissionId);
+  }
+}
+
 export function assertSubmissionTransition(
   current: SubmissionState,
   next: Exclude<SubmissionState, 'queued'>,
@@ -450,7 +477,7 @@ export function assertSubmissionTransition(
     current === 'queued'
       ? next === 'claimed'
       : current === 'claimed'
-        ? next === 'suspended' || next === 'completed' || next === 'failed'
+        ? next === 'claimed' || next === 'suspended' || next === 'completed' || next === 'failed'
         : current === 'suspended'
           ? next === 'claimed' || next === 'failed'
           : false;

@@ -99,7 +99,7 @@ for (const kind of ['memory', 'jsonl']) {
       expectedInput: { task: 'Original' },
       input: { task: 'Revised' }
     });
-    await repository.transitionSubmission(descriptor, 'submission', { state: 'claimed' });
+    await repository.transitionSubmission(descriptor, 'submission', { state: 'claimed', claimId: 'claim' });
     await assert.rejects(
       repository.updateQueuedSubmission(descriptor, 'submission', {
         kind: 'replace',

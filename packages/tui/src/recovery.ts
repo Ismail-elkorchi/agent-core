@@ -1,3 +1,4 @@
+import type { HistoryIndexRecoveryProgress } from '@agent-core/runtime/node';
 import type {
   AgentProgressEvent, AgentRunSuspension, AgentSessionSuspensionDescriptor
 } from '@agent-core/runtime';
@@ -83,4 +84,46 @@ export function providerFailureText(
     .filter((value) => value.length > 0 && !description.includes(value))
     .join(': ');
   return detail ? `${description}\nCause: ${detail}` : description;
+}
+
+/** Shared wording for the app's normal terminal and protocol presentation. */
+export function historyRecoveryMessage(progress: HistoryIndexRecoveryProgress): string {
+  const session = JSON.stringify(progress.sessionId);
+  switch (progress.phase) {
+    case 'started':
+      return `Restoring history index for session ${session}…`;
+    case 'progress':
+      return `Restoring history index for session ${session}: ${String(progress.records)} records, ${String(progress.bytes)}/${String(progress.totalBytes)} bytes…`;
+    case 'completed':
+      return `History index restored for session ${session}. Original history is unchanged.`;
+    case 'cancelled':
+    case 'failed':
+      return progress.message;
+  }
+}
+
+/** Keeps line-oriented recovery output readable without delaying recovery or cancellation. */
+export class HistoryRecoveryProgressRenderer {
+  private last: { readonly sessionId: string; readonly time: number; readonly records: number; readonly bytes: number } | undefined;
+
+  constructor(
+    private readonly write: (message: string) => void,
+    private readonly now: () => number = () => performance.now()
+  ) {}
+
+  handle(progress: HistoryIndexRecoveryProgress): void {
+    const time = this.now();
+    if (progress.phase === 'progress') {
+      const previous = this.last?.sessionId === progress.sessionId ? this.last : undefined;
+      if (previous !== undefined &&
+          (progress.records === previous.records && progress.bytes === previous.bytes ||
+            progress.bytes < progress.totalBytes && time - previous.time < 1000)) return;
+      this.last = { sessionId: progress.sessionId, time, records: progress.records, bytes: progress.bytes };
+    } else {
+      this.last = progress.phase === 'started'
+        ? { sessionId: progress.sessionId, time, records: 0, bytes: 0 }
+        : undefined;
+    }
+    this.write(historyRecoveryMessage(progress));
+  }
 }

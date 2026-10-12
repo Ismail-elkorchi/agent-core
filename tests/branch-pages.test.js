@@ -67,7 +67,7 @@ async function fixture(t, count = 700) {
     .map((record) => JSON.stringify(record) + '\n')
     .join('');
   await writeFile(file, source);
-  await repository.rebuildHistoryIndex(session);
+  await repository.rebuildHistoryIndex(session.id, session.header.binding);
   return { memory, session, entries, file, source, repository };
 }
 
@@ -139,7 +139,7 @@ test('snapshot cursors remain stable after append and reject another branch, ses
   const branch = await memory.branchFrom(session, entries[0].id, 'Alternative');
   const next = await memory.appendInput(session, { runId: 'branch-run', task: 'Different branch' });
   await appendFile(file, JSON.stringify(branch) + '\n' + JSON.stringify(next) + '\n');
-  await repository.rebuildHistoryIndex(session);
+  await repository.rebuildHistoryIndex(session.id, session.header.binding);
   const older = await repository.readBranchPage(session, { cursor: first.older });
   assert.deepEqual(
     older.entries.map((entry) => entry.id),
@@ -200,9 +200,9 @@ test('source snapshots advance membership metadata without historical body reads
   const appended = await memory.appendInput(session, { runId: 'append', task: 'new source' });
   const encoded = JSON.stringify(appended) + '\n';
   await appendFile(file, encoded);
-  await assert.rejects(repository.sourceSnapshot(session), /rebuildHistoryIndex/);
+  await assert.rejects(repository.sourceSnapshot(session), /needs recovery/);
   assert.equal(repository.historyReadMetrics(session.id).scannedBytes, before.scannedBytes);
-  await repository.rebuildHistoryIndex(session);
+  await repository.rebuildHistoryIndex(session.id, session.header.binding);
   const latest = await repository.sourceSnapshot(session);
   assert.equal(latest.sourceRevision, first.sourceRevision + 1);
   assert.equal(
@@ -213,7 +213,7 @@ test('source snapshots advance membership metadata without historical body reads
   assert.equal(first.entries.length, 8, 'captured metadata is immutable');
   const controller = new AbortController();
   await assert.rejects(
-    repository.rebuildHistoryIndex(session, {
+    repository.rebuildHistoryIndex(session.id, session.header.binding, {
       signal: controller.signal,
       onProgress(progress) {
         if (progress.records >= 3) controller.abort();

@@ -13,6 +13,7 @@ import {
   encodeToolObservation,
   updateToolObservation,
   defaultToolModelContent,
+  toolModelContentFacts,
   decodeToolContent,
   serializeToolModelContent,
   recordObservedFacts,
@@ -113,7 +114,7 @@ export class ObservationStore {
     );
     const unsupported =
       selected.some((part) => part.type === 'image') && !modelInputModalities.includes('image');
-    let modelContent = decodeToolContent(
+    const selectedContent = decodeToolContent(
       redactJson(
         parseJsonValue(
           [
@@ -148,6 +149,13 @@ export class ObservationStore {
         )
       ).value
     );
+    const presentationCauses = unsupported ? ['unsupported_modality'] : [];
+    let modelContent = decodeToolContent([
+      ...toolModelContentFacts(durableObservation, presentationCauses.length
+        ? { coverage: 'partial', causes: presentationCauses }
+        : { coverage: 'complete' }),
+      ...selectedContent
+    ]);
     // Only derived presentation changes. The original result, execution state,
     // coverage and selected full presentation remain independently retrievable.
     if (this.maxPresentationBytes !== undefined &&
@@ -156,7 +164,7 @@ export class ObservationStore {
         if (!this.artifacts) throw new Error('Bounded presentation requires original artifact storage.');
         const fullPresentation = await this.artifacts.store({
           label: `${input.call.name}-full-model-content`,
-          content: new TextEncoder().encode(JSON.stringify(modelContent)),
+          content: new TextEncoder().encode(JSON.stringify(selectedContent)),
           mediaType: 'application/json',
           description: 'Complete redacted selected presentation before the explicit delivery excerpt.'
         });
@@ -164,11 +172,13 @@ export class ObservationStore {
           ...modelContent.filter(part => part.type === 'image'),
           { type: 'artifact', artifact: fullPresentation }
         ];
-        const notice = `Presentation coverage: partial. Original result coverage: ${durableObservation.scope.coverage}. Invocation disposition: ${durableObservation.kind}; execution state: ${durableObservation.execution?.state ?? 'not established'}. Full selected text and artifact references are preserved in the attached presentation artifact.${durableStorageDegraded ? ' Original observation storage is unavailable; the presentation artifact does not replace the original structured observation.' : ''}\n`;
+        const notice = `${serializeToolModelContent(toolModelContentFacts(durableObservation, {
+          coverage: 'partial', causes: [...presentationCauses, 'presentation_limit']
+        }))}\nFull selected text and artifact references are preserved in the attached presentation artifact.${durableStorageDegraded ? ' Original observation storage is unavailable; the presentation artifact does not replace the original structured observation.' : ''}\n`;
         const reserved = Buffer.byteLength(notice) + Buffer.byteLength(serializeToolModelContent(retained)) + 2;
         if (reserved > this.maxPresentationBytes)
           throw new Error('Presentation metadata alone exceeds the delivery allowance.');
-        const excerpt = textRange(serializeToolModelContent(modelContent), 0, this.maxPresentationBytes - reserved).text;
+        const excerpt = textRange(serializeToolModelContent(selectedContent), 0, this.maxPresentationBytes - reserved).text;
         modelContent = decodeToolContent([{ type: 'text', text: notice + excerpt }, ...retained]);
       } catch (error) {
         // Failure to preserve the selected original is not permission to discard it.
@@ -192,9 +202,12 @@ export class ObservationStore {
           message: error instanceof Error ? error.message : String(error)
         };
         modelContent = decodeToolContent([
+          ...toolModelContentFacts(durableObservation, {
+            coverage: 'partial', causes: [...presentationCauses, 'storage_failure']
+          }),
           {
             type: 'text',
-            text: `${durableObservation.summary}\nInvocation disposition: ${durableObservation.kind}; execution state: ${durableObservation.execution?.state ?? 'not established'}. Detailed model content is unavailable because storage failed: ${durableStorageDegraded.message.slice(0, 1000)}. Original result coverage is unavailable in this representation.`
+            text: `${durableObservation.summary}\nDetailed model content is unavailable because storage failed: ${durableStorageDegraded.message.slice(0, 1000)}.`
           }
         ]);
       }

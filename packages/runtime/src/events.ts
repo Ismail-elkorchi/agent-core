@@ -537,7 +537,7 @@ export type AgentProgressEvent =
 export const agentEventCodec: EventCodec<AgentEvent> = {
   metadataIndexes: [
     { field: 'exchangeId' },
-    { type: 'turn.snapshot.created', metadata: { contextRecovery: 'true' } }
+    { type: 'turn.snapshot.created', field: 'recoveryBoundary' }
   ],
   metadata: (event) => {
     const exchange = 'turnId' in event && 'requestAttempt' in event
@@ -1325,6 +1325,7 @@ function decodeTurnSnapshot(value: JsonValue | undefined): AgentTurnSnapshotReco
   const object = requiredObject(value, 'snapshot');
   exact(object, [
     'contextRecovery',
+    'resumeInstructions',
     'turnIndex',
     'turnId',
     'requestAttempt',
@@ -1343,6 +1344,8 @@ function decodeTurnSnapshot(value: JsonValue | undefined): AgentTurnSnapshotReco
     'limits',
     'budget'
   ]);
+  if ((object.contextRecovery === undefined) !== (object.resumeInstructions === undefined))
+    throw malformed('Context recovery snapshots require their original resume instructions.');
   const temperature = optionalFiniteNumber(object.temperature, 'snapshot.temperature');
   const reasoning =
     object.reasoning === undefined ? undefined : parseModelReasoningRequest(object.reasoning);
@@ -1355,7 +1358,11 @@ function decodeTurnSnapshot(value: JsonValue | undefined): AgentTurnSnapshotReco
     provider: requiredString(object.provider, 'snapshot.provider'),
     model: requiredString(object.model, 'snapshot.model'),
     profileHash: requiredString(object.profileHash, 'snapshot.profileHash'),
-    ...(object.contextRecovery === undefined ? {} : { contextRecovery: decodeContextAdmissionConflict(object.contextRecovery) }),
+    ...(object.contextRecovery === undefined ? {} : {
+      contextRecovery: decodeContextAdmissionConflict(object.contextRecovery),
+      resumeInstructions: Object.freeze(requiredArray(object.resumeInstructions, 'snapshot.resumeInstructions')
+        .map((item, index) => decodeInstruction(item, `snapshot.resumeInstructions[${String(index)}]`)))
+    }),
     continuationEligible: requiredBoolean(
       object.continuationEligible,
       'snapshot.continuationEligible'

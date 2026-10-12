@@ -9,7 +9,7 @@ export interface ToolModelContentRequest<TInput = unknown, TOutput = unknown> {
   readonly observation: ToolObservation<TOutput>;
 }
 
-/** Plain tools need no formatter. Structured output remains useful original information. */
+/** Select payload content. The delivery boundary adds authoritative observation facts. */
 export function defaultToolModelContent(observation: ToolObservation): readonly ToolContent[] {
   return Object.freeze([
     Object.freeze({
@@ -21,16 +21,40 @@ export function defaultToolModelContent(observation: ToolObservation): readonly 
             ? observation.output
             : JSON.stringify(observation.output, null, 2)
     }),
-    ...(observation.execution
-      ? [
-          Object.freeze({
-            type: 'text' as const,
-            text: `Execution state: ${observation.execution.state}.`
-          })
-        ]
-      : []),
     ...(observation.content ?? [])
   ]);
+}
+
+/** Coverage of delivery relative to the selected presentation, not the tool's scope. */
+export type ToolModelPresentationCoverage =
+  | { readonly coverage: 'complete' }
+  | { readonly coverage: 'partial'; readonly causes: readonly string[] };
+
+/**
+ * These facts belong to the shared delivery boundary, outside replaceable formatters.
+ * Complete settled results preserve the selected payload contract without a notice.
+ * Incomplete scope, delivery, and unsettled execution cannot be hidden by a formatter.
+ */
+export function toolModelContentFacts(
+  observation: ToolObservation,
+  presentation: ToolModelPresentationCoverage
+): readonly ToolContent[] {
+  const discloseCoverage = observation.scope.coverage === 'partial' ||
+    presentation.coverage === 'partial' || observation.kind === 'failure';
+  if (!discloseCoverage && (!observation.execution || observation.execution.state === 'settled'))
+    return Object.freeze([]);
+  const { coverage, ...scope } = observation.scope;
+  return Object.freeze([Object.freeze({
+    type: 'text' as const,
+    text: [
+      ...(discloseCoverage ? [
+        `Original result coverage: ${coverage}. Original scope: ${JSON.stringify(scope)}.`,
+        `Presentation coverage: ${presentation.coverage}.${presentation.coverage === 'partial'
+          ? ` Presentation omission causes: ${JSON.stringify(presentation.causes)}.` : ''}`
+      ] : []),
+      `Invocation disposition: ${observation.kind}; execution state: ${observation.execution?.state ?? 'not established'}.`
+    ].join('\n')
+  })]);
 }
 
 export function serializeToolModelContent(content: readonly ToolContent[]): string {

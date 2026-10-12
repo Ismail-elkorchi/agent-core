@@ -50,6 +50,7 @@ export {
 export type { ToolContextPrerequisite } from './orchestration/tool-execution.js';
 
 export {
+  SessionSubmissionOwnershipError,
   decodeSessionInputRelationship,
   ownSessionSubmissionInput
 } from './session/submission-lifecycle.js';

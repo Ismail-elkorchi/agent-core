@@ -58,9 +58,7 @@ export function buildProcessContent({
     if (process === undefined) return defaultToolModelContent(observation);
     // Failure details cross the generic observation boundary; establish process facts here.
     const result = processOutputSchema.parse(process);
-    return [text(observation.summary),
-      ...(observation.execution ? [text(`Execution state: ${observation.execution.state}.`)] : []),
-      ...processResultContent(result)];
+    return [text(observation.summary), ...processResultContent(result)];
   }
   const output: ProcessOutput = observation.output;
   return processResultContent(output);
@@ -141,11 +139,6 @@ export function buildMutationContent<Output extends ApplyPatchOutput | EditTextO
       changedRanges: file.changedRanges
     }))),
     ...(output.transaction && output.transaction.outcome !== 'committed' ? [text(json({ transaction: output.transaction }))] : []),
-    ...(output.potentiallyAffectedPaths.length ? [text(json({ potentiallyAffectedPaths: output.potentiallyAffectedPaths }))] : []),
-    ...(observation.scope.coverage === 'partial' ? [text(json({
-      coverage: observation.scope.coverage,
-      omitted: observation.scope.omitted,
-      causes: observation.scope.causes
-    }))] : [])
+    ...(output.potentiallyAffectedPaths.length ? [text(json({ potentiallyAffectedPaths: output.potentiallyAffectedPaths }))] : [])
   ];
 }

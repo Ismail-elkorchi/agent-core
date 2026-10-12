@@ -71,6 +71,22 @@ export interface ContextServiceOptions {
 
 export class ContextService {
   readonly history: HistoryReader;
+  private selectedMetadataCache: {
+    readonly identity: string;
+    readonly view: ReturnType<typeof readSelectedHistoryMetadata>;
+  } | undefined;
+
+  /** Cache only immutable source facts at one exact authorized cut, never policy decisions. */
+  private selectedMetadata(cut: HistorySourceCut) {
+    const identity = hashJson(cut);
+    if (this.selectedMetadataCache?.identity === identity) return this.selectedMetadataCache.view;
+    const view = readSelectedHistoryMetadata(this.history, cut);
+    this.selectedMetadataCache = { identity, view };
+    void view.catch(() => {
+      if (this.selectedMetadataCache?.view === view) this.selectedMetadataCache = undefined;
+    });
+    return view;
+  }
   constructor(private readonly options: ContextServiceOptions) {
     this.history =
       options.history ??
@@ -156,6 +172,7 @@ export class ContextService {
         readonly status: 'admitted' | 'blocked';
         readonly inputIdentity: string;
         readonly accounting: import('@agent-core/model').RequestAccounting;
+        readonly continuityHeadroomTokens?: number;
         readonly message?: string;
         readonly feedback?: {
           readonly key: string;
@@ -174,7 +191,7 @@ export class ContextService {
   }
   async assertSourceCapacity(cut?: HistorySourceCut): Promise<void> {
     cut ??= await this.history.capture();
-    const view = await readSelectedHistoryMetadata(this.history, cut);
+    const view = await this.selectedMetadata(cut);
     let bytes = 0;
     for (const item of contextMetadataGroups(view.items).filter((group) => !group.some((item) => item.contextRecovery)).flat()) {
       bytes += item.sourceBytes;
@@ -186,16 +203,18 @@ export class ContextService {
   }
 
   /** Reuse unchanged facts; pressure does not create a recurring maintenance instruction. */
-  async capacityFeedback(compiled: CompiledModelRequest) {
-    const view = await readSelectedHistoryMetadata(this.history, await this.history.capture());
+  async capacityFeedback(compiled: CompiledModelRequest, continuityHeadroomTokens?: number) {
+    const view = await this.selectedMetadata(await this.history.capture());
     const sourceBytes = view.items.reduce((sum, item) => sum + item.sourceBytes, 0);
-    const capacity = requestCapacity(compiled.accounting);
+    const capacity = requestCapacity(compiled.accounting, continuityHeadroomTokens);
     const sourcePressure =
       sourceBytes >= SELECTED_SOURCE_LIMITS.bytes * 0.8 ||
       view.items.length >= SELECTED_SOURCE_LIMITS.entries * 0.8;
     if (capacity.pressure !== 'continuity' && !sourcePressure) return undefined;
     const key = hashJson({
       pressure: capacity.pressure,
+      continuityHeadroomTokens: capacity.continuityHeadroomTokens,
+      continuityHeadroomPolicy: capacity.continuityHeadroomPolicy,
       sourcePressure,
       branch: view.cut.branchId,
       window: view.contextWindow?.windowId ?? null,
@@ -254,7 +273,7 @@ export class ContextService {
     // Complete exchanges and transition admission still validate the chosen sources.
     const view =
       change.retain === undefined || change.release?.length
-        ? await readSelectedHistoryMetadata(this.history, cut)
+        ? await this.selectedMetadata(cut)
         : { items: [], contextWindow: await this.history.selectedContext(cut) };
     const groups = contextMetadataGroups(view.items);
     const released = new Set(change.release?.map((source) => source.entryId));
@@ -774,7 +793,7 @@ export class ContextService {
   }
 
   private capacity() {
-    return this.admission ? requestCapacity(this.admission.accounting) : undefined;
+    return this.admission ? requestCapacity(this.admission.accounting, this.admission.continuityHeadroomTokens) : undefined;
   }
   async protectedSources(
     cut?: HistorySourceCut,

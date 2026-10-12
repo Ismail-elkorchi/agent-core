@@ -429,7 +429,9 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
         bytes = 0;
       const routeKey = metadataOnly ? eventMetadataRouteKey(this.metadataIndexes, types, metadata) : undefined;
       const candidates = routeKey
-        ? await this.routingSequences(runId, routeKey, after, tail.sequence, limit)
+        ? await this.routingCatalogContains(runId, index.routingRootHash, routingDigest(routeKey))
+          ? await this.routingSequences(runId, routeKey, after, tail.sequence, limit)
+          : []
         : undefined;
       let candidateAt = 0;
       let oversized: EventRangePage<TEvent>['oversized'];
@@ -492,7 +494,8 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     runId: string,
     envelope: EncodedEnvelope,
     byteOffset: number,
-    bytes: number
+    bytes: number,
+    index: EventAppendIndex
   ): Promise<void> {
     const content = {
       ...tailRecord(envelope, byteOffset),
@@ -505,12 +508,96 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       ...content,
       contentHash: hashJson(content)
     });
-    for (const routeKey of eventMetadataRouteKeys(this.metadataIndexes, content.type, content.metadata))
-      await this.appendRoutingSequence(runId, routeKey, envelope.sequence);
+    for (const routeKey of eventMetadataRouteKeys(this.metadataIndexes, content.type, content.metadata)) {
+      const digest = routingDigest(routeKey);
+      const known = await this.routingCatalogContains(runId, index.routingRootHash, digest);
+      await this.appendRoutingSequence(runId, routeKey, envelope.sequence, known);
+      if (!known) index.routingRootHash = await this.addRoutingCatalogKey(runId, index.routingRootHash, digest);
+    }
+  }
+
+  /** Immutable bounded nodes let the accepted tail authenticate both membership and absence. */
+  private async readRoutingCatalogNode(runId: string, hash: string, prefix: string): Promise<RoutingCatalogNode> {
+    try {
+      const raw = parseJsonObject(JSON.parse(await fs.readFile(
+        path.join(this.indexDirectory(runId), 'routing', 'catalog', `${hash}.json`), 'utf8'
+      )), { maxDepth: 3, maxCollectionEntries: 160, maxStringBytes: 65536, maxTotalBytes: 128 * 1024 });
+      if (hashJson(raw) !== hash || raw.runId !== runId || raw.prefix !== prefix ||
+          Object.keys(raw).some(key => !['runId', 'prefix', 'keys', 'children'].includes(key)))
+        throw new TypeError('Routing catalog identity changed.');
+      if (Array.isArray(raw.keys) && raw.children === undefined) {
+        const keys = raw.keys;
+        if (keys.length > ROUTING_CATALOG_LEAF_SIZE || keys.some((key, at) =>
+          typeof key !== 'string' || !/^[a-f0-9]{64}$/u.test(key) || !key.startsWith(prefix) ||
+          (at > 0 && String(keys[at - 1]) >= key))) throw new TypeError('Invalid routing catalog leaf.');
+        return { keys: keys as string[] };
+      }
+      if (raw.keys !== undefined || prefix.length >= 64) throw new TypeError('Invalid routing catalog branch.');
+      const children = parseJsonObject(raw.children, { maxCollectionEntries: 32, maxTotalBytes: 2048 });
+      if (Object.keys(children).length === 0 || Object.entries(children).some(([key, value]) =>
+        !/^[a-f0-9]$/u.test(key) || typeof value !== 'string' || !/^[a-f0-9]{64}$/u.test(value)))
+        throw new TypeError('Invalid routing catalog children.');
+      return { children: children as Record<string, string> };
+    } catch {
+      throw new PersistenceIndexRecoveryRequiredError(runId);
+    }
+  }
+
+  private async writeRoutingCatalogNode(runId: string, prefix: string, node: RoutingCatalogNode): Promise<string> {
+    const content = { runId, prefix, ...node };
+    const hash = hashJson(content);
+    await atomicWritePrivateJson(path.join(this.indexDirectory(runId), 'routing', 'catalog', `${hash}.json`), content);
+    return hash;
+  }
+
+  private async routingCatalogContains(runId: string, root: string, digest: string): Promise<boolean> {
+    let hash = root, prefix = '';
+    for (;;) {
+      const node = await this.readRoutingCatalogNode(runId, hash, prefix);
+      if ('keys' in node) return node.keys.includes(digest);
+      const nibble = digest.charAt(prefix.length);
+      const child = node.children[nibble];
+      if (child === undefined) return false;
+      hash = child;
+      prefix += nibble;
+    }
+  }
+
+  private async addRoutingCatalogKey(runId: string, root: string, digest: string): Promise<string> {
+    const writeLeaves = async (prefix: string, keys: readonly string[]): Promise<string> => {
+      if (keys.length <= ROUTING_CATALOG_LEAF_SIZE) return this.writeRoutingCatalogNode(runId, prefix, { keys });
+      const groups = new Map<string, string[]>();
+      for (const key of keys) {
+        const nibble = key.charAt(prefix.length);
+        if (!nibble) throw new Error('Routing catalog digest collision.');
+        const group = groups.get(nibble) ?? [];
+        group.push(key);
+        groups.set(nibble, group);
+      }
+      const children: Record<string, string> = {};
+      for (const [nibble, group] of groups) children[nibble] = await writeLeaves(prefix + nibble, group);
+      return this.writeRoutingCatalogNode(runId, prefix, { children });
+    };
+    const insert = async (hash: string, prefix: string): Promise<string> => {
+      const node = await this.readRoutingCatalogNode(runId, hash, prefix);
+      if ('keys' in node) {
+        if (node.keys.includes(digest)) return hash;
+        return writeLeaves(prefix, [...node.keys, digest].sort());
+      }
+      const nibble = digest.charAt(prefix.length);
+      const previous = node.children[nibble];
+      const child = previous === undefined
+        ? await this.writeRoutingCatalogNode(runId, prefix + nibble, { keys: [digest] })
+        : await insert(previous, prefix + nibble);
+      return child === previous ? hash : this.writeRoutingCatalogNode(runId, prefix, {
+        children: { ...node.children, [nibble]: child }
+      });
+    };
+    return insert(root, '');
   }
 
   private routingDirectory(runId: string, routeKey: string): string {
-    return path.join(this.indexDirectory(runId), 'routing', createHash('sha256').update(routeKey).digest('hex'));
+    return path.join(this.indexDirectory(runId), 'routing', routingDigest(routeKey));
   }
 
   private async routingIndexRecord(runId: string, routeKey: string, name: string): Promise<JsonObject> {
@@ -532,7 +619,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     });
   }
 
-  private async appendRoutingSequence(runId: string, routeKey: string, sequence: number): Promise<void> {
+  private async appendRoutingSequence(runId: string, routeKey: string, sequence: number, known: boolean): Promise<void> {
     const directory = this.routingDirectory(runId, routeKey);
     let count = 0;
     try {
@@ -542,6 +629,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       count = head.count;
     } catch (error) {
       if (nodeCode(error) !== 'ENOENT') throw error;
+      if (known) throw new PersistenceIndexRecoveryRequiredError(runId);
     }
     const lastPage = count === 0 ? [] : await this.routingSequencePage(runId, routeKey, Math.floor((count - 1) / ROUTING_PAGE_SIZE));
     if ((lastPage.at(-1) ?? -1) >= sequence) {
@@ -919,14 +1007,18 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     const filePath = this.filePath(runId);
     await fs.rm(this.indexDirectory(runId), { recursive: true, force: true });
     await ensurePrivateDirectory(this.keyDirectory(runId));
-    for (const routeKey of fixedEventMetadataRouteKeys(this.metadataIndexes))
+    let routingRootHash = await this.writeRoutingCatalogNode(runId, '', { keys: [] });
+    for (const routeKey of fixedEventMetadataRouteKeys(this.metadataIndexes)) {
       await this.writeRoutingIndexRecord(runId, routeKey, 'head', { count: 0 });
+      routingRootHash = await this.addRoutingCatalogKey(runId, routingRootHash, routingDigest(routeKey));
+    }
     let first = true;
     const index: EventAppendIndex = {
       recordCount: 0,
       completeBytes: 0,
       boundaryMarker: '',
       latestByType: new Map(),
+      routingRootHash,
       storageStamp
     };
     for await (const line of readJsonlLines(filePath, { endOffset: completeBytes })) {
@@ -952,7 +1044,8 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
         runId,
         envelope,
         line.byteOffset,
-        Buffer.byteLength(line.text) + 1
+        Buffer.byteLength(line.text) + 1,
+        index
       );
       index.tail = tailRecord(envelope, line.byteOffset);
       index.latestByType.set(eventType(envelope), index.tail);
@@ -991,7 +1084,8 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
         runId,
         envelope,
         line.byteOffset,
-        Buffer.byteLength(line.text) + 1
+        Buffer.byteLength(line.text) + 1,
+        index
       );
       index.tail = tailRecord(envelope, line.byteOffset);
       index.latestByType.set(eventType(envelope), index.tail);
@@ -1004,16 +1098,23 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     index: EventAppendIndex,
     envelope: EncodedEnvelope
   ): Promise<void> {
-    const serializedBytes = Buffer.byteLength(`${canonicalJsonString(envelope)}\n`, 'utf8');
-    await this.writeIdempotencyEntry(runId, envelope);
-    await this.writeSequencePointer(runId, envelope, index.completeBytes, serializedBytes);
-    index.tail = tailRecord(envelope, index.completeBytes);
-    index.latestByType.set(eventType(envelope), index.tail);
-    index.recordCount += 1;
-    index.completeBytes += serializedBytes;
-    index.boundaryMarker = await jsonlBoundaryMarker(this.filePath(runId), index.completeBytes);
-    index.storageStamp = await jsonlStorageStamp(this.filePath(runId));
-    await this.writeTailIndex(runId, index);
+    try {
+      const serializedBytes = Buffer.byteLength(`${canonicalJsonString(envelope)}\n`, 'utf8');
+      await this.writeIdempotencyEntry(runId, envelope);
+      await this.writeSequencePointer(runId, envelope, index.completeBytes, serializedBytes, index);
+      index.tail = tailRecord(envelope, index.completeBytes);
+      index.latestByType.set(eventType(envelope), index.tail);
+      index.recordCount += 1;
+      index.completeBytes += serializedBytes;
+      index.boundaryMarker = await jsonlBoundaryMarker(this.filePath(runId), index.completeBytes);
+      index.storageStamp = await jsonlStorageStamp(this.filePath(runId));
+      await this.writeTailIndex(runId, index);
+    } catch (error) {
+      // A derived-root publication failure must not remain authoritative only
+      // in this writer's warm cache while reopened readers see an older tail.
+      this.indexes.delete(runId);
+      throw error;
+    }
   }
 
   private indexDirectory(runId: string): string {
@@ -1076,8 +1177,9 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
 
   private async writeTailIndex(runId: string, index: EventAppendIndex): Promise<void> {
     const content = {
-      version: 1,
+      version: 2,
       runId,
+      routingRootHash: index.routingRootHash,
       metadataIndexesHash: hashJson(this.metadataIndexes),
       recordCount: index.recordCount,
       completeBytes: index.completeBytes,
@@ -1280,11 +1382,20 @@ interface EventTailRecord extends JsonObject {
   readonly previousHash?: string;
 }
 
+const ROUTING_CATALOG_LEAF_SIZE = 64;
+type RoutingCatalogNode =
+  | { readonly keys: readonly string[] }
+  | { readonly children: Readonly<Record<string, string>> };
+function routingDigest(routeKey: string): string {
+  return createHash('sha256').update(routeKey).digest('hex');
+}
+
 interface EventAppendIndex {
   tail?: EventTailRecord;
   recordCount: number;
   completeBytes: number;
   boundaryMarker: string;
+  routingRootHash: string;
   latestByType: Map<string, EventTailRecord>;
   storageStamp: JsonlStorageStamp;
 }
@@ -1438,6 +1549,7 @@ function parseTailIndex(value: unknown, runId: string, metadataIndexesHash: stri
     'runId',
     'recordCount',
     'metadataIndexesHash',
+    'routingRootHash',
     'completeBytes',
     'boundaryMarker',
     'latestByType',
@@ -1450,8 +1562,9 @@ function parseTailIndex(value: unknown, runId: string, metadataIndexesHash: stri
     unsupported.length > 0 ||
     typeof contentHash !== 'string' ||
     contentHash !== hashJson(content) ||
-    record.version !== 1 ||
+    record.version !== 2 ||
     record.runId !== runId ||
+    typeof record.routingRootHash !== 'string' || !/^[a-f0-9]{64}$/u.test(record.routingRootHash) ||
     record.metadataIndexesHash !== metadataIndexesHash ||
     !nonnegativeInteger(record.recordCount) ||
     !nonnegativeInteger(record.completeBytes) ||
@@ -1486,6 +1599,7 @@ function parseTailIndex(value: unknown, runId: string, metadataIndexesHash: stri
     recordCount: record.recordCount,
     completeBytes: record.completeBytes,
     boundaryMarker: record.boundaryMarker,
+    routingRootHash: record.routingRootHash,
     latestByType,
     storageStamp: Object.freeze({ size: 0, mtimeMs: 0, ctimeMs: 0 })
   };
@@ -1778,33 +1892,42 @@ export function withPersistenceFileLock<T>(
   filePath: string,
   timeoutMs: number,
   staleMs: number,
-  operation: (assertOwned: () => Promise<void>) => Promise<T>
+  operation: (assertOwned: () => Promise<void>) => Promise<T>,
+  options: { readonly signal?: AbortSignal } = {}
 ): Promise<T> {
   const resolvedPath = path.resolve(filePath);
   const previous = persistenceFileQueues.get(resolvedPath) ?? Promise.resolve();
   // Repository instances share this queue. Only contention with another process
   // spends the acquisition timeout; local writers cannot starve each other.
   const result = previous.then(() =>
-    withAcquiredPersistenceFileLock(resolvedPath, timeoutMs, staleMs, operation)
+    withAcquiredPersistenceFileLock(resolvedPath, timeoutMs, staleMs, operation, options)
   );
   const tail = result.then(() => undefined, () => undefined);
   persistenceFileQueues.set(resolvedPath, tail);
-  return result.finally(() => {
+  void tail.then(() => {
     if (persistenceFileQueues.get(resolvedPath) === tail) persistenceFileQueues.delete(resolvedPath);
   });
+  // A cancelled caller can leave promptly without letting later local writers pass
+  // the still-active predecessor. The queued operation checks its signal before I/O.
+  return options.signal === undefined
+    ? result
+    : abortableLockWait(previous, options.signal).then(() => result);
 }
 
 async function withAcquiredPersistenceFileLock<T>(
   filePath: string,
   timeoutMs: number,
   staleMs: number,
-  operation: (assertOwned: () => Promise<void>) => Promise<T>
+  operation: (assertOwned: () => Promise<void>) => Promise<T>,
+  options: { readonly signal?: AbortSignal } = {}
 ): Promise<T> {
+  options.signal?.throwIfAborted();
   await ensurePrivateDirectory(path.dirname(filePath));
   const lockPath = `${filePath}.lock`;
   const token = randomUUID();
   const started = Date.now();
   for (;;) {
+    options.signal?.throwIfAborted();
     try {
       await fs.mkdir(lockPath, { mode: 0o700 });
       await fs.writeFile(
@@ -1821,7 +1944,7 @@ async function withAcquiredPersistenceFileLock<T>(
       }
       if (Date.now() - started >= timeoutMs)
         throw new Error(`Timed out acquiring persistence lock: ${lockPath}`, { cause: error });
-      await delay(10);
+      await (options.signal === undefined ? delay(10) : abortableLockWait(delay(10), options.signal));
     }
   }
   const assertOwned = async (): Promise<void> => {
@@ -1841,6 +1964,7 @@ async function withAcquiredPersistenceFileLock<T>(
   };
   let result: T;
   try {
+    options.signal?.throwIfAborted();
     result = await operation(assertOwned);
   } catch (error) {
     try {
@@ -1854,6 +1978,20 @@ async function withAcquiredPersistenceFileLock<T>(
   }
   await release();
   return result;
+}
+
+async function abortableLockWait(waiting: Promise<void>, signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted();
+  await Promise.race([
+    waiting,
+    new Promise<void>((resolve) => {
+      const abort = () => { resolve(); };
+      signal.addEventListener('abort', abort, { once: true });
+      const cleanup = () => { signal.removeEventListener('abort', abort); };
+      void waiting.then(cleanup, cleanup);
+    })
+  ]);
+  signal.throwIfAborted();
 }
 
 async function staleLock(lockPath: string, staleMs: number): Promise<boolean> {

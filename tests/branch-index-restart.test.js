@@ -58,14 +58,14 @@ test('corrupt or incomplete persisted metadata fails closed until explicit recov
   const index = await readFile(indexFile, 'utf8');
   await writeFile(indexFile, index.replace('run-0', 'run-X'));
   const reader = new JsonlSessionRepository(root);
-  await assert.rejects(reader.sourceSnapshot(session), /index is corrupt.*rebuildHistoryIndex/);
+  await assert.rejects(reader.sourceSnapshot(session), /index is missing, corrupt.*needs recovery/);
   assert.equal(reader.historyReadMetrics(session.id).scannedBytes, 0);
   assert((await readFile(file)).equals(original));
-  await reader.rebuildHistoryIndex(session);
+  await reader.rebuildHistoryIndex(session.id, session.header.binding);
   assert.equal((await new JsonlSessionRepository(root).sourceSnapshot(session)).entries.length, 2);
   await appendFile(indexFile, '{"metadata":');
-  await assert.rejects(new JsonlSessionRepository(root).sourceSnapshot(session), /index is corrupt/);
-  await writer.rebuildHistoryIndex(session);
+  await assert.rejects(new JsonlSessionRepository(root).sourceSnapshot(session), /index is missing, corrupt/);
+  await writer.rebuildHistoryIndex(session.id, session.header.binding);
   assert((await readFile(file)).equals(original));
 });
 
@@ -73,7 +73,7 @@ test('missing index requires explicit rebuild and cancelled recovery preserves t
   const {root, writer, session, indexFile} = await fixture(t, 2);
   const before = await readFile(indexFile);
   const controller = new AbortController();
-  await assert.rejects(writer.rebuildHistoryIndex(session, {
+  await assert.rejects(writer.rebuildHistoryIndex(session.id, session.header.binding, {
     signal: controller.signal,
     onProgress: ({records}) => {if (records >= 1) controller.abort();}
   }), /abort/i);
@@ -81,9 +81,9 @@ test('missing index requires explicit rebuild and cancelled recovery preserves t
   assert.equal((await writer.sourceSnapshot(session)).entries.length, 2);
   await rm(indexFile);
   const reader = new JsonlSessionRepository(root);
-  await assert.rejects(reader.sourceSnapshot(session), /rebuildHistoryIndex/);
+  await assert.rejects(reader.sourceSnapshot(session), /needs recovery/);
   assert.equal(reader.historyReadMetrics(session.id).scannedBytes, 0);
-  await reader.rebuildHistoryIndex(session);
+  await reader.rebuildHistoryIndex(session.id, session.header.binding);
   assert.equal((await reader.sourceSnapshot(session)).entries.length, 2);
 });
 
@@ -106,14 +106,14 @@ test('metadata write failure preserves committed source identity across retry', 
   }
   assert(failed);
   const failedRead = new JsonlSessionRepository(root);
-  await assert.rejects(failedRead.sourceSnapshot(session), /rebuildHistoryIndex/);
+  await assert.rejects(failedRead.sourceSnapshot(session), /needs recovery/);
   assert.equal(failedRead.historyReadMetrics(session.id).scannedBytes, 0);
-  await assert.rejects(writer.sourceSnapshot(session), /rebuildHistoryIndex/);
+  await assert.rejects(writer.sourceSnapshot(session), /needs recovery/);
   const entry = await writer.appendInput(session, {runId: 'retry', task: 'accepted once'});
   const originals = (await readFile(file, 'utf8')).trim().split('\n').map(JSON.parse);
   assert.equal(originals.filter(item => item.runId === 'retry').length, 1);
   assert.equal(originals.at(-1).id, entry.id);
-  await writer.rebuildHistoryIndex(session);
+  await writer.rebuildHistoryIndex(session.id, session.header.binding);
   assert.equal((await new JsonlSessionRepository(root).sourceSnapshot(session)).entries.length, 2);
 });
 
@@ -123,7 +123,7 @@ test('cold pending submission summaries never hydrate accepted inputs or configu
     submissionId: 'pending', runId: 'pending-run', input: {task: 'q'.repeat(850000)},
     configuration: {provider: 'test', model: 'test'}
   });
-  await writer.transitionSubmission(session, 'pending', {state: 'claimed'});
+  await writer.transitionSubmission(session, 'pending', {state: 'claimed', claimId: 'claim'});
   const reader = new JsonlSessionRepository(root);
   const fs = (await import('node:fs')).promises;
   const open = fs.open;
@@ -138,7 +138,7 @@ test('cold pending submission summaries never hydrate accepted inputs or configu
   } finally { fs.open = open; }
   assert.equal(reader.indexMetrics().fullScans, 0);
   assert.equal(reader.historyReadMetrics(session.id).scannedBytes, 0);
-  await writer.transitionSubmission(session, 'pending', {state: 'completed'});
+  await writer.transitionSubmission(session, 'pending', {state: 'completed', claimId: 'claim'});
   assert.deepEqual(await reader.pendingSubmissionSummaries(session), []);
   assert.equal(reader.indexMetrics().fullScans, 0);
 });

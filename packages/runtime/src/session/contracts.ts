@@ -300,14 +300,24 @@ type SessionSubmissionTransitionBase = Readonly<{
 
 export type SessionSubmissionTransition =
   | (SessionSubmissionTransitionBase &
-      Readonly<{ readonly type: 'submission.claimed' | 'submission.completed' }>)
+      Readonly<{ readonly type: 'submission.claimed'; readonly claimId: string; readonly previousClaimId?: string }>)
+  | (SessionSubmissionTransitionBase &
+      Readonly<{ readonly type: 'submission.completed'; readonly claimId: string }>)
   | (SessionSubmissionTransitionBase &
       Readonly<{
         readonly type: 'submission.suspended';
+        readonly claimId: string;
         readonly suspension: SessionSuspensionDescriptor;
       }>)
   | (SessionSubmissionTransitionBase &
-      Readonly<{ readonly type: 'submission.failed'; readonly errorMessage: string }>);
+      Readonly<{ readonly type: 'submission.failed'; readonly claimId: string; readonly errorMessage: string }>);
+
+/** Every write is fenced by the durable claim that authorized this dispatch. */
+export type SessionSubmissionOutcome =
+  | { readonly state: 'claimed'; readonly claimId: string; readonly expectedClaimId?: string }
+  | { readonly state: 'completed'; readonly claimId: string }
+  | { readonly state: 'suspended'; readonly claimId: string; readonly suspension: SessionSuspensionDescriptor }
+  | { readonly state: 'failed'; readonly claimId: string; readonly errorMessage: string };
 
 export type SessionSubmissionUpdate = SessionSubmissionTransitionBase &
   (
@@ -332,6 +342,7 @@ export interface SessionPendingSubmission {
   readonly input: SessionSubmissionInput;
   readonly configuration: SessionSubmissionConfiguration;
   readonly suspension?: SessionSuspensionDescriptor;
+  readonly claimId?: string;
 }
 
 export interface CreateSessionOptions {
@@ -521,10 +532,7 @@ export interface SessionRepository {
   transitionSubmission(
     session: SessionDescriptor,
     submissionId: string,
-    outcome:
-      | { readonly state: 'claimed' | 'completed' }
-      | { readonly state: 'suspended'; readonly suspension: SessionSuspensionDescriptor }
-      | { readonly state: 'failed'; readonly errorMessage: string }
+    outcome: SessionSubmissionOutcome
   ): Promise<void>;
   loadPendingSubmissions(session: SessionDescriptor): Promise<readonly SessionPendingSubmission[]>;
   pendingSubmissionSummaries(session: SessionDescriptor): Promise<readonly Pick<SessionPendingSubmission, 'runId' | 'submissionId' | 'state'>[]>;
