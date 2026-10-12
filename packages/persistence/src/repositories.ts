@@ -255,7 +255,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   }
 
   tail(runId: string, options: EventIndexReadOptions = {}): Promise<EventLedgerTail> {
-    return this.enqueue(runId, async () => {
+    return this.withIndexRead(runId, async () => {
       try {
         return tailFromEncoded((await this.refreshIndex(runId, false, options.metadataOnly)).tail);
       } catch (error) {
@@ -266,7 +266,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   }
 
   latest(runId: string): Promise<EventEnvelope<TEvent> | undefined> {
-    return this.enqueue(runId, async () => {
+    return this.withIndexRead(runId, async () => {
       let index: EventAppendIndex;
       try {
         index = await this.refreshIndex(runId, false);
@@ -281,7 +281,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   }
 
   latestOfType(runId: string, type: TEvent['type']): Promise<EventEnvelope<TEvent> | undefined> {
-    return this.enqueue(runId, async () => {
+    return this.withIndexRead(runId, async () => {
       assertIdentifier(type, 'type');
       let index: EventAppendIndex;
       try {
@@ -309,7 +309,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   }
 
   latestReferenceOfType(runId: string, type: TEvent['type'], options: EventIndexReadOptions = {}): Promise<EventReference | undefined> {
-    return this.enqueue(runId, async () => {
+    return this.withIndexRead(runId, async () => {
       assertIdentifier(type, 'type');
       let index: EventAppendIndex;
       try {
@@ -331,7 +331,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   }
 
   referenceByKey(runId: string, idempotencyKey: string, options: EventIndexReadOptions = {}): Promise<EventReference | undefined> {
-    return this.enqueue(runId, async () => {
+    return this.withIndexRead(runId, async () => {
       assertIdentifier(idempotencyKey, 'idempotencyKey');
       try {
         await this.refreshIndex(runId, false, options.metadataOnly);
@@ -355,7 +355,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   async readReference(reference: EventReference): Promise<EventEnvelope<TEvent>> {
     assertEventReference(reference);
     reference = Object.freeze({ ...reference });
-    return this.enqueue(reference.runId, async () => {
+    return this.withIndexRead(reference.runId, async () => {
       const index = await this.refreshIndex(reference.runId, false);
       if (reference.sequence >= index.recordCount)
         throw new PersistenceConflictError('Event reference is missing.');
@@ -385,7 +385,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     project: (pointer: EventSequencePointer, source: EventSourceMetadata) => Promise<T>
   ): Promise<EventPage<T>> {
     const { after, limit, maxBytes, through, types, metadata, afterTime, beforeTime } = eventRangeBounds(request);
-    return this.enqueue(runId, async () => {
+    return this.withIndexRead(runId, async () => {
       let index: EventAppendIndex;
       try {
         index = await this.refreshIndex(runId, false, metadataOnly);
@@ -773,7 +773,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   async *read(runId: string): AsyncIterable<EventEnvelope<TEvent>> {
     let completeBytes: number;
     try {
-      completeBytes = (await this.enqueue(runId, () => this.refreshIndex(runId, false)))
+      completeBytes = (await this.withIndexRead(runId, () => this.refreshIndex(runId, false)))
         .completeBytes;
     } catch (error) {
       if (nodeCode(error) === 'ENOENT') return;
@@ -841,53 +841,61 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   }
 
   async verifyIntegrity(runId: string): Promise<LedgerIntegrityReport> {
-    const errors: string[] = [];
-    let records = 0;
-    let previousHash: string | undefined;
-    let corruption: PersistenceCorruptionError | undefined;
     try {
-      const index = await this.refreshIndex(runId, false);
-      let first = true;
-      for await (const line of readJsonlLines(this.filePath(runId), {
-        endOffset: index.completeBytes
-      })) {
-        if (first) {
-          first = false;
-          continue;
+      return await this.withIndexRead(runId, async () => {
+        const errors: string[] = [];
+        let records = 0;
+        let previousHash: string | undefined;
+        let corruption: PersistenceCorruptionError | undefined;
+        try {
+          const index = await this.refreshIndex(runId, false);
+          let first = true;
+          for await (const line of readJsonlLines(this.filePath(runId), {
+            endOffset: index.completeBytes
+          })) {
+            if (first) {
+              first = false;
+              continue;
+            }
+            const record = parseEnvelopeLine(line, this.filePath(runId), runId);
+            this.codec.decode(record.event);
+            if (record.sequence !== records)
+              errors.push(
+                `sequence mismatch at index ${String(records)}: got ${String(record.sequence)}`
+              );
+            if (record.previousHash !== previousHash)
+              errors.push(`previousHash mismatch at sequence ${String(record.sequence)}`);
+            const { hash, ...base } = record;
+            if (hash !== hashJson(base))
+              errors.push(`hash mismatch at sequence ${String(record.sequence)}`);
+            previousHash = record.hash;
+            records += 1;
+          }
+        } catch (error) {
+          errors.push(error instanceof Error ? error.message : String(error));
+          if (error instanceof PersistenceCorruptionError) corruption = error;
         }
-        const record = parseEnvelopeLine(line, this.filePath(runId), runId);
-        this.codec.decode(record.event);
-        if (record.sequence !== records)
-          errors.push(
-            `sequence mismatch at index ${String(records)}: got ${String(record.sequence)}`
+        if (errors.length > 0) {
+          await this.quarantine(
+            runId,
+            corruption ??
+              new PersistenceCorruptionError({
+                code: 'integrity',
+                storage: this.filePath(runId),
+                line: 1,
+                byteOffset: 0,
+                message: `Event stream failed integrity verification: ${errors.join('; ')}`
+              })
           );
-        if (record.previousHash !== previousHash)
-          errors.push(`previousHash mismatch at sequence ${String(record.sequence)}`);
-        const { hash, ...base } = record;
-        if (hash !== hashJson(base))
-          errors.push(`hash mismatch at sequence ${String(record.sequence)}`);
-        previousHash = record.hash;
-        records += 1;
-      }
+        }
+        return { ok: errors.length === 0, records, errors };
+      });
     } catch (error) {
-      errors.push(error instanceof Error ? error.message : String(error));
-      if (error instanceof PersistenceCorruptionError) corruption = error;
+      if (!(error instanceof PersistenceCorruptionError)) throw error;
+      return { ok: false, records: 0, errors: [error.message] };
     }
-    if (errors.length > 0) {
-      await this.quarantine(
-        runId,
-        corruption ??
-          new PersistenceCorruptionError({
-            code: 'integrity',
-            storage: this.filePath(runId),
-            line: 1,
-            byteOffset: 0,
-            message: `Event stream failed integrity verification: ${errors.join('; ')}`
-          })
-      );
-    }
-    return { ok: errors.length === 0, records, errors };
   }
+
 
   private filePath(runId: string): string {
     assertIdentifier(runId, 'runId');
@@ -1269,6 +1277,13 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       return;
     }
     await atomicWritePrivateJson(target, entry);
+  }
+
+  /** Reads may repair shared derived indexes, so they share append's stream ownership. */
+  private withIndexRead<T>(runId: string, operation: () => Promise<T>): Promise<T> {
+    return this.enqueue(runId, () => withPersistenceFileLock(
+      this.filePath(runId), this.lockTimeoutMs, operation
+    ));
   }
 
   private enqueue<T>(runId: string, operation: () => Promise<T>): Promise<T> {

@@ -912,3 +912,97 @@ for (const stage of ['catalog', 'tail']) test(`routing ${stage} publication fail
   assert.equal((await repaired.readMetadataRange('routed', { metadata: { boundary: 'new' } })).records.length, 1);
   assert.equal((await repaired.readMetadataRange('routed', { metadata: { boundary: 'unseen' } })).scanned, 0);
 });
+
+for (const operation of ['tail', 'latest', 'latestOfType', 'referenceByKey', 'readReference', 'readRange', 'read', 'verifyIntegrity']) {
+  test(`event ${operation} acquires stream ownership before repairing another client's index`, async t => {
+    const { promises: fs } = await import('node:fs');
+    const { tryAcquirePersistenceFileLock } = await import('@agent-core/persistence/node');
+    const directory = await mkdtemp(path.join(tmpdir(), 'event-read-ownership-'));
+    t.after(() => fs.rm(directory, { recursive: true, force: true }));
+    const writer = new JsonlEventRepository({ rootDir: directory, codec: typedEventCodec });
+    const receipt = await writer.append('shared', { type: 'item', value: 'committed' }, { idempotencyKey: 'item' });
+    const reference = { runId: 'shared', eventId: receipt.eventId, sequence: receipt.sequence, hash: receipt.hash };
+    const source = writer.location('shared');
+    const index = path.join(directory, 'run-shared.index');
+    await fs.rm(index, { recursive: true, force: true });
+    const ownership = await tryAcquirePersistenceFileLock(source);
+    assert.ok(ownership);
+    const boundary = Promise.withResolvers();
+    const proceed = Promise.withResolvers();
+    const readdir = fs.readdir.bind(fs);
+    const stat = fs.stat.bind(fs);
+    let awaitingReader = true;
+    t.mock.method(fs, 'readdir', async (file, ...args) => {
+      if (awaitingReader && file === `${source}.lock`) {
+        awaitingReader = false;
+        boundary.resolve('stream-lock');
+        await proceed.promise;
+      }
+      return readdir(file, ...args);
+    });
+    t.mock.method(fs, 'stat', async (file, ...args) => {
+      if (file === source) boundary.resolve('unowned-source-read');
+      return stat(file, ...args);
+    });
+    const reader = new JsonlEventRepository({ rootDir: directory, codec: typedEventCodec });
+    const reading = operation === 'read'
+      ? Array.fromAsync(reader.read('shared'))
+      : operation === 'readReference' ? reader.readReference(reference)
+      : operation === 'latestOfType' ? reader.latestOfType('shared', 'item')
+      : operation === 'referenceByKey' ? reader.referenceByKey('shared', 'item')
+      : reader[operation]('shared');
+    void reading.catch(boundary.reject);
+    try {
+      assert.equal(await boundary.promise, 'stream-lock', 'A cold reader must not rebuild alongside an owning writer');
+      await ownership.assertOwned();
+      await assert.rejects(fs.stat(index), { code: 'ENOENT' });
+    } finally {
+      awaitingReader = false;
+      await ownership.release();
+      proceed.resolve();
+      await reading;
+    }
+    assert.equal((await reader.tail('shared')).sequence, 0);
+    assert.equal((await reader.verifyIntegrity('shared')).ok, true);
+  });
+}
+
+test('repeated event integrity verification reports an already quarantined stream', async t => {
+  const { promises: fs } = await import('node:fs');
+  const directory = await mkdtemp(path.join(tmpdir(), 'event-integrity-quarantine-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const repository = new JsonlEventRepository({ rootDir: directory, codec: typedEventCodec });
+  await repository.append('corrupt', { type: 'item' });
+  const lines = (await readFile(repository.location('corrupt'), 'utf8')).trimEnd().split('\n');
+  const record = JSON.parse(lines[1]);
+  record.hash = '0'.repeat(64);
+  lines[1] = JSON.stringify(record);
+  await writeFile(repository.location('corrupt'), `${lines.join('\n')}\n`);
+  const first = await repository.verifyIntegrity('corrupt');
+  assert.equal(first.ok, false);
+  assert.ok(first.errors.length > 0);
+  for (const reader of [repository, new JsonlEventRepository({ rootDir: directory, codec: typedEventCodec })]) {
+    const again = await reader.verifyIntegrity('corrupt');
+    assert.equal(again.ok, false);
+    assert.ok(again.errors.length > 0);
+    await assert.rejects(reader.tail('corrupt'), PersistenceCorruptionError);
+  }
+});
+
+test('event integrity verification does not label ownership I/O failure as source corruption', async t => {
+  const { promises: fs } = await import('node:fs');
+  const directory = await mkdtemp(path.join(tmpdir(), 'event-integrity-lock-error-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const repository = new JsonlEventRepository({ rootDir: directory, codec: typedEventCodec });
+  await repository.append('healthy', { type: 'item' });
+  const readdir = fs.readdir.bind(fs);
+  const failure = Object.assign(new Error('Ownership storage unavailable'), { code: 'EIO' });
+  const injected = t.mock.method(fs, 'readdir', async (file, ...args) => {
+    if (file === `${repository.location('healthy')}.lock`) throw failure;
+    return readdir(file, ...args);
+  });
+  await assert.rejects(repository.verifyIntegrity('healthy'), error => error === failure);
+  injected.mock.restore();
+  assert.equal((await repository.verifyIntegrity('healthy')).ok, true);
+  assert.equal((await repository.tail('healthy')).sequence, 0);
+});

@@ -310,14 +310,23 @@ test('two restored automatic clients serialize distinct submissions and settle b
 test('an idle automatic client discovers durable input admitted by another client', { timeout: 10000 }, async t => {
   const f = await fixture(t);
   const automatic = f.dispatcher(undefined, undefined, 'automatic');
-  await automatic.session.restore();
   const origin = f.dispatcher();
-  const submission = await origin.session.submit({ task: 'discover without another user action' });
-  await Promise.race([f.providerStarted.promise, submission.completion.then(result => assert.fail(`Run ended before provider start: ${JSON.stringify(result)}`))]);
-  assert.equal(f.calls(), 1);
-  f.providerResult.resolve();
-  assert.equal((await submission.completion).terminal.runId, submission.runId);
-  await Promise.all([automatic.session.close(), origin.session.close()]);
+  const failure = deferred();
+  automatic.session.subscribe(() => {}, failure.reject);
+  origin.session.subscribe(() => {}, failure.reject);
+  try {
+    await automatic.session.restore();
+    const submission = await origin.session.submit({ task: 'discover without another user action' });
+    await Promise.race([f.providerStarted.promise, failure.promise,
+      submission.completion.then(result => assert.fail(`Run ended before provider start: ${JSON.stringify(result)}`))]);
+    assert.equal(f.calls(), 1);
+    f.providerResult.resolve();
+    const result = await Promise.race([submission.completion, failure.promise]);
+    assert.equal(result.terminal.runId, submission.runId);
+  } finally {
+    f.providerResult.resolve();
+    await Promise.all([automatic.session.close(), origin.session.close()]);
+  }
 });
 
 

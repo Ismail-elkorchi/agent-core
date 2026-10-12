@@ -119,9 +119,8 @@ test('release failure cannot label a committed conditional append as not committ
     driverGeneration: 1
   };
   await assert.rejects(repository.appendConditional('run', event, options), error => error === failure);
-  assert.equal((await repository.latest('run')).event.type, 'committed');
   removal.mock.restore();
-  await remove(lockPath, { recursive: true, force: true });
+  assert.equal((await repository.latest('run')).event.type, 'committed');
   const retried = await repository.appendConditional('run', event, options);
   assert.equal(retried.kind, 'already_committed');
   assert.equal(retried.tail.sequence, 0);
