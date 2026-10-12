@@ -283,29 +283,56 @@ test('factory failure releases execution ownership for automatic same-submission
   await Promise.all([failed.session.close(), recovery.session.close()]);
 });
 
-test('two restored automatic clients serialize distinct submissions and settle both original completion handles', { timeout: 10000 }, async t => {
+// Two durable executions share this watchdog; it is not a latency requirement.
+test('two restored automatic clients serialize distinct submissions and settle both original completion handles', { timeout: 20000 }, async t => {
+  const began = performance.now();
   const f = await fixture(t);
   const first = f.dispatcher(undefined, undefined, 'automatic');
   const second = f.dispatcher(undefined, undefined, 'automatic');
-  await Promise.all([first.session.restore(), second.session.restore()]);
-  const a = await first.session.submit({ task: 'first distinct input' });
-  await Promise.race([f.providerStarted.promise, a.completion.then(result => assert.fail(`Run ended before provider start: ${JSON.stringify(result)}`))]);
-  const b = await second.session.submit({ task: 'second distinct input' });
-  assert.equal(a.kind, 'started');
-  assert.equal(b.kind, 'queued');
-  const inspected = await second.session.inspect();
-  assert.equal(inspected.session.phase, 'running');
-  assert.equal(inspected.session.activeRunId, a.runId);
-  assert.equal(inspected.session.queuedInputs, 1);
-  await new Promise(resolve => setTimeout(resolve, 250));
-  assert.equal(f.calls(), 1);
-  f.providerResult.resolve();
-  const results = await Promise.all([a.completion, b.completion]);
-  assert.deepEqual(results.map(result => result.terminal.runId), [a.runId, b.runId]);
-  assert.equal(f.calls(), 2);
-  assert.deepEqual(await f.repository.loadPendingSubmissions(f.descriptor), []);
-  await Promise.all([first.session.close(), second.session.close()]);
+  const failure = deferred();
+  first.session.subscribe(() => {}, failure.reject);
+  second.session.subscribe(() => {}, failure.reject);
+  let stage = 'restore';
+  const completed = [];
+  const report = () => t.diagnostic(JSON.stringify({ stage, elapsedMs: performance.now() - began, completed, providerCalls: f.calls(),
+    first: first.session.state(), second: second.session.state() }));
+  t.signal.addEventListener('abort', () => { if (stage !== 'closed') report(); });
+  try {
+    await Promise.all([first.session.restore(), second.session.restore()]);
+    stage = 'first admission';
+    const a = await first.session.submit({ task: 'first distinct input' });
+    stage = 'first provider';
+    void a.completion.then(() => completed.push(a.runId), failure.reject);
+    await Promise.race([f.providerStarted.promise, failure.promise, a.completion.then(result => assert.fail(`Run ended before provider start: ${JSON.stringify(result)}`))]);
+    stage = 'second admission';
+    const b = await second.session.submit({ task: 'second distinct input' });
+    void b.completion.then(() => completed.push(b.runId), failure.reject);
+    stage = 'inspect';
+    assert.equal(a.kind, 'started');
+    assert.equal(b.kind, 'queued');
+    const inspected = await second.session.inspect();
+    assert.equal(inspected.session.phase, 'running');
+    assert.equal(inspected.session.activeRunId, a.runId);
+    assert.equal(inspected.session.queuedInputs, 1);
+    await new Promise(resolve => setTimeout(resolve, 250));
+    assert.equal(f.calls(), 1);
+    f.providerResult.resolve();
+    stage = 'both completions';
+    const results = await Promise.race([Promise.all([a.completion, b.completion]), failure.promise]);
+    assert.deepEqual(results.map(result => result.terminal.runId), [a.runId, b.runId]);
+    assert.equal(f.calls(), 2);
+    assert.deepEqual(await f.repository.loadPendingSubmissions(f.descriptor), []);
+  } catch (error) {
+    report();
+    throw error;
+  } finally {
+    stage = 'close';
+    f.providerResult.resolve();
+    await Promise.all([first.session.close(), second.session.close()]);
+    stage = 'closed';
+  }
 });
+
 
 test('an idle automatic client discovers durable input admitted by another client', { timeout: 10000 }, async t => {
   const f = await fixture(t);
