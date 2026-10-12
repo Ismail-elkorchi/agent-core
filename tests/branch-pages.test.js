@@ -4,7 +4,7 @@ import { appendFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { InMemorySessionRepository } from '@agent-core/runtime';
-import { JsonlSessionRepository } from '@agent-core/runtime/node';
+import { JsonlSessionRepository, SessionHistoryIndexError } from '@agent-core/runtime/node';
 
 const binding = { schemaId: 'tests/branch-pages', schemaVersion: 1, subject: {} };
 
@@ -164,7 +164,11 @@ test('snapshot cursors remain stable after append and reject another branch, ses
   await writeFile(file, rewritten + JSON.stringify(branch) + '\n' + JSON.stringify(next) + '\n');
   await assert.rejects(
     repository.readBranchPage(session, { cursor: first.older }),
-    /does not match/
+    error => {
+      assert(error instanceof SessionHistoryIndexError);
+      assert.match(error.cause.message, /does not match its original history/u);
+      return true;
+    }
   );
 });
 
@@ -200,7 +204,7 @@ test('source snapshots advance membership metadata without historical body reads
   const appended = await memory.appendInput(session, { runId: 'append', task: 'new source' });
   const encoded = JSON.stringify(appended) + '\n';
   await appendFile(file, encoded);
-  await assert.rejects(repository.sourceSnapshot(session), /needs recovery/);
+  await assert.rejects(repository.sourceSnapshot(session), SessionHistoryIndexError);
   assert.equal(repository.historyReadMetrics(session.id).scannedBytes, before.scannedBytes);
   await repository.rebuildHistoryIndex(session.id, session.header.binding);
   const latest = await repository.sourceSnapshot(session);

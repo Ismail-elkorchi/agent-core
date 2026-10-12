@@ -3,7 +3,7 @@ import test from 'node:test';
 import { appendFile, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { JsonlSessionRepository } from '@agent-core/runtime/node';
+import { JsonlSessionRepository, SessionHistoryIndexError } from '@agent-core/runtime/node';
 
 async function fixture(t, count = 4) {
   const root = await mkdtemp(path.join(tmpdir(), 'branch-index-restart-'));
@@ -58,13 +58,13 @@ test('corrupt or incomplete persisted metadata fails closed until explicit recov
   const index = await readFile(indexFile, 'utf8');
   await writeFile(indexFile, index.replace('run-0', 'run-X'));
   const reader = new JsonlSessionRepository(root);
-  await assert.rejects(reader.sourceSnapshot(session), /index is missing, corrupt.*needs recovery/);
+  await assert.rejects(reader.sourceSnapshot(session), SessionHistoryIndexError);
   assert.equal(reader.historyReadMetrics(session.id).scannedBytes, 0);
   assert((await readFile(file)).equals(original));
   await reader.rebuildHistoryIndex(session.id, session.header.binding);
   assert.equal((await new JsonlSessionRepository(root).sourceSnapshot(session)).entries.length, 2);
   await appendFile(indexFile, '{"metadata":');
-  await assert.rejects(new JsonlSessionRepository(root).sourceSnapshot(session), /index is missing, corrupt/);
+  await assert.rejects(new JsonlSessionRepository(root).sourceSnapshot(session), SessionHistoryIndexError);
   await writer.rebuildHistoryIndex(session.id, session.header.binding);
   assert((await readFile(file)).equals(original));
 });
@@ -81,7 +81,7 @@ test('missing index requires explicit rebuild and cancelled recovery preserves t
   assert.equal((await writer.sourceSnapshot(session)).entries.length, 2);
   await rm(indexFile);
   const reader = new JsonlSessionRepository(root);
-  await assert.rejects(reader.sourceSnapshot(session), /needs recovery/);
+  await assert.rejects(reader.sourceSnapshot(session), SessionHistoryIndexError);
   assert.equal(reader.historyReadMetrics(session.id).scannedBytes, 0);
   await reader.rebuildHistoryIndex(session.id, session.header.binding);
   assert.equal((await reader.sourceSnapshot(session)).entries.length, 2);
@@ -106,9 +106,9 @@ test('metadata write failure preserves committed source identity across retry', 
   }
   assert(failed);
   const failedRead = new JsonlSessionRepository(root);
-  await assert.rejects(failedRead.sourceSnapshot(session), /needs recovery/);
+  await assert.rejects(failedRead.sourceSnapshot(session), SessionHistoryIndexError);
   assert.equal(failedRead.historyReadMetrics(session.id).scannedBytes, 0);
-  await assert.rejects(writer.sourceSnapshot(session), /needs recovery/);
+  await assert.rejects(writer.sourceSnapshot(session), SessionHistoryIndexError);
   const entry = await writer.appendInput(session, {runId: 'retry', task: 'accepted once'});
   const originals = (await readFile(file, 'utf8')).trim().split('\n').map(JSON.parse);
   assert.equal(originals.filter(item => item.runId === 'retry').length, 1);

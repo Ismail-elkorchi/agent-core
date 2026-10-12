@@ -36,35 +36,56 @@ test('a wrapper error code is not attributed to its nested cause', () => {
 });
 
 
-test('history recovery presentation distinguishes rebuilding, completion and terminal failures', () => {
-  assert.match(historyRecoveryMessage({ phase: 'started', sessionId: 'selected' }), /Restoring history index.*selected/u);
-  assert.match(historyRecoveryMessage({ phase: 'progress', sessionId: 'selected', records: 20, bytes: 512, totalBytes: 1024 }), /20 records, 512\/1024 bytes/u);
-  assert.match(historyRecoveryMessage({ phase: 'completed', sessionId: 'selected' }), /Original history is unchanged/u);
-  for (const phase of ['cancelled', 'failed']) {
-    const message = phase === 'cancelled' ? 'Cancelled before publication.' : 'Original history is corrupt.';
-    assert.equal(historyRecoveryMessage({ phase, sessionId: 'selected', message }), message);
-  }
+test('conversation loading presentation keeps automatic maintenance invisible', () => {
+  for (const phase of ['started', 'progress'])
+    assert.equal(historyRecoveryMessage({ phase, sessionId: 'selected', records: 20, bytes: 512, totalBytes: 1024 }), 'Opening conversation…');
+  for (const phase of ['completed', 'cancelled', 'failed'])
+    assert.equal(historyRecoveryMessage({ phase, sessionId: 'selected', message: 'Private diagnostic.' }), '');
 });
 
-
-test('history recovery CLI presentation samples large scans while always showing terminal outcomes', () => {
+test('quick conversation opening and completed housekeeping are silent', () => {
   let now = 0;
   const messages = [];
   const renderer = new HistoryRecoveryProgressRenderer(message => messages.push(message), () => now);
-  renderer.handle({ phase: 'started', sessionId: 'large' });
-  for (let records = 1; records <= 10_000; records++) {
-    now++;
-    renderer.handle({ phase: 'progress', sessionId: 'large', records, bytes: records * 100, totalBytes: 1_000_000 });
+  renderer.handle({ phase: 'started', sessionId: 'quick' });
+  now = 500;
+  renderer.handle({ phase: 'progress', sessionId: 'quick', records: 1000, bytes: 100_000, totalBytes: 100_000 });
+  renderer.handle({ phase: 'completed', sessionId: 'quick' });
+  renderer.handle({ phase: 'failed', sessionId: 'unrelated', message: 'Private diagnostic.' });
+  renderer.handle({ phase: 'cancelled', sessionId: 'cancelled', message: 'Private diagnostic.' });
+  assert.deepEqual(messages, []);
+});
+
+test('slow opening emits one generic line across arbitrarily many progress events and sessions', () => {
+  let now = 0;
+  const messages = [];
+  const renderer = new HistoryRecoveryProgressRenderer(message => messages.push(message), () => now);
+  for (let session = 0; session < 20; session++) {
+    const sessionId = `session-${session}`;
+    renderer.handle({ phase: 'started', sessionId });
+    for (let records = 1; records <= 1000; records++) {
+      now++;
+      renderer.handle({ phase: 'progress', sessionId, records, bytes: records * 100, totalBytes: 100_000 });
+    }
+    renderer.handle({ phase: 'completed', sessionId });
   }
-  renderer.handle({ phase: 'completed', sessionId: 'large' });
-  assert.equal(messages.length, 12);
-  assert.match(messages[0], /Restoring history index/u);
-  assert.match(messages.at(-2), /10000 records, 1000000\/1000000 bytes/u);
-  assert.match(messages.at(-1), /History index restored/u);
-  for (const phase of ['cancelled', 'failed']) {
-    renderer.handle({ phase: 'started', sessionId: phase });
-    renderer.handle({ phase: 'progress', sessionId: phase, records: 1, bytes: 1, totalBytes: 100 });
-    renderer.handle({ phase, sessionId: phase, message: phase });
-    assert.equal(messages.at(-1), phase);
-  }
+  assert.deepEqual(messages, ['Opening conversation…']);
+});
+
+
+test('a finished opening does not lend elapsed time to a later conversation', () => {
+  let now = 0;
+  const messages = [];
+  const renderer = new HistoryRecoveryProgressRenderer(message => messages.push(message), () => now);
+  renderer.handle({ phase: 'started', sessionId: 'first' });
+  now = 50;
+  renderer.handle({ phase: 'completed', sessionId: 'first' });
+  now = 20_000;
+  renderer.handle({ phase: 'started', sessionId: 'later' });
+  now += 500;
+  renderer.handle({ phase: 'progress', sessionId: 'later', records: 10, bytes: 100, totalBytes: 200 });
+  assert.deepEqual(messages, []);
+  now += 500;
+  renderer.handle({ phase: 'progress', sessionId: 'later', records: 20, bytes: 200, totalBytes: 200 });
+  assert.deepEqual(messages, ['Opening conversation…']);
 });

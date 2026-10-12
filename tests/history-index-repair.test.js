@@ -35,7 +35,8 @@ test('by-ID repair is available after a failed list without opening the damaged 
   await assert.rejects(reader.list(), error => {
     assert(error instanceof SessionHistoryIndexError);
     assert.equal(error.sessionId, session.id);
-    assert.match(error.message, /damaged.*needs recovery/u);
+    assert.match(error.message, /conversation couldn’t be opened/u);
+    assert.match(error.cause.message, /missing, corrupt, or incompatible/u);
     return true;
   });
   assert.equal(reader.historyReadMetrics(session.id).scannedBytes, 0);
@@ -53,7 +54,11 @@ test('repair validates original header identity and workspace binding before pub
   const previousIndex = await fs.readFile(index);
   const source = await fs.readFile(file, 'utf8');
   const reader = new JsonlSessionRepository(root);
-  await assert.rejects(reader.rebuildHistoryIndex(session.id, { ...binding, subject: { workspace: 'other' } }), /binding/iu);
+  await assert.rejects(reader.rebuildHistoryIndex(session.id, { ...binding, subject: { workspace: 'other' } }), error => {
+    assert(error instanceof SessionHistorySourceError);
+    assert.match(error.cause.message, /binding/iu);
+    return true;
+  });
   assert.deepEqual(await fs.readFile(index), previousIndex);
   assert.equal(await fs.readFile(file, 'utf8'), source);
   const lines = source.trimEnd().split('\n');
@@ -63,7 +68,8 @@ test('repair validates original header identity and workspace binding before pub
   await assert.rejects(reader.rebuildHistoryIndex(session.id, binding), error => {
     assert(error instanceof SessionHistorySourceError);
     assert.equal(error.sessionId, session.id);
-    assert.match(error.message, /original history.*header validation failed/iu);
+    assert.match(error.message, /saved messages couldn’t be read/u);
+    assert.match(error.cause.message, /header validation failed/u);
     return true;
   });
   assert.equal(await fs.readFile(file, 'utf8'), wrongIdentity);
@@ -77,7 +83,8 @@ test('invalid original records remain distinct from damaged metadata and preserv
   const invalidSource = await fs.readFile(file);
   await assert.rejects(new JsonlSessionRepository(root).rebuildHistoryIndex(session.id, binding), error => {
     assert(error instanceof SessionHistorySourceError);
-    assert.match(error.message, /damaged.*original history.*line 3/iu);
+    assert.match(error.message, /saved messages couldn’t be read/u);
+    assert.match(error.cause.message, /line 3/iu);
     assert.doesNotMatch(error.message, /explicitly rebuildHistoryIndex/u);
     return true;
   });
@@ -147,7 +154,7 @@ test('corrupt original submission lifecycles fail before replacing the old index
   const invalidSource = await fs.readFile(file);
   await assert.rejects(new JsonlSessionRepository(root).rebuildHistoryIndex(session.id, binding), error => {
     assert(error instanceof SessionHistorySourceError);
-    assert.match(error.message, /damaged.*Invalid submission lifecycle/iu);
+    assert.match(error.cause.message, /Invalid submission lifecycle/iu);
     return true;
   });
   assert.deepEqual(await fs.readFile(file), invalidSource);
@@ -294,7 +301,7 @@ test('original workspace binding is enforced and isolated for both catch-up and 
     const reader = new JsonlSessionRepository(root);
     await assert.rejects(reader.recoverHistoryIndexes(binding, { sessionId: session.id }), error => {
       assert(error instanceof SessionHistorySourceError);
-      assert.match(error.message, /binding/iu);
+      assert.match(error.cause.message, /binding/iu);
       return true;
     });
     const events = [];
@@ -359,7 +366,10 @@ test('post-publication verification failure is reported truthfully and never tri
       assert(error instanceof SessionHistoryIndexPublicationError);
       assert.equal(error.indexPublished, true);
       assert.equal(error.sessionId, session.id);
-      assert.match(error.message, /was published.*could not be confirmed/u);
+      assert.match(error.message, /save couldn’t be confirmed/u);
+      assert(error.cause instanceof SessionHistoryIndexError);
+      assert.match(error.cause.cause.message, /missing, corrupt, or incompatible/u);
+      assert.match(error.cause.cause.cause.message, /Injected post-publication/u);
       return true;
     });
   } finally { fs.rename = rename; fs.open = open; }
@@ -384,11 +394,27 @@ test('all-session preflight reports invalid original history without blocking he
   const failures = events.filter(event => event.phase === 'failed');
   assert.equal(failures.length, 1);
   assert.equal(failures[0].sessionId, session.id);
-  assert.match(failures[0].message, /original history could not be decoded or validated/u);
+  assert.match(failures[0].message, /saved messages couldn’t be read/u);
   assert.equal(events.some(event => event.phase === 'completed' && event.sessionId === session.id), false);
   await assert.rejects(reader.recoverHistoryIndexes(binding, { sessionId: session.id }), SessionHistorySourceError);
   assert.deepEqual(await fs.readFile(file), badSource);
   assert.deepEqual(await fs.readFile(index), badIndex);
   assert.deepEqual(await fs.readFile(repository.location(healthy.id)), healthySource);
   assert.deepEqual(await fs.readFile(`${repository.location(healthy.id)}.index`), healthyIndex);
+});
+
+
+test('conversation opening errors use ordinary wording while preserving typed technical causes', () => {
+  const cause = Object.assign(new Error('underlying storage failure'), { code: 'EIO' });
+  for (const Constructor of [SessionHistoryIndexError, SessionHistorySourceError]) {
+    const error = new Constructor('selected', 'header validation failed at line 3', { cause });
+    assert.equal(error.sessionId, 'selected');
+    assert.equal(error.cause.message, 'header validation failed at line 3');
+    assert.equal(error.cause.cause, cause);
+    assert.doesNotMatch(error.message, /index|recover|header|line 3|selected/iu);
+  }
+  const published = new SessionHistoryIndexPublicationError('selected', cause);
+  assert.equal(published.indexPublished, true);
+  assert.equal(published.cause, cause);
+  assert.doesNotMatch(published.message, /index|recover|unchanged|hasn’t been changed/iu);
 });

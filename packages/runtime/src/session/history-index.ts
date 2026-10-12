@@ -10,10 +10,10 @@ export interface HistoryIndexRebuildOptions {
 
 /** Metadata is unavailable; the original ledger must be validated by explicit repair. */
 export class SessionHistoryIndexError extends Error {
-  constructor(readonly sessionId: string, detail: string, options?: ErrorOptions) {
+  constructor(readonly sessionId: string | undefined, detail: string, options?: ErrorOptions) {
     super(
-      `Session ${JSON.stringify(sessionId)} history index ${detail}. Its derived metadata needs recovery; original history has not been changed.`,
-      options
+      'This conversation couldn’t be opened. Please try again.',
+      { cause: new Error(detail, options) }
     );
     this.name = 'SessionHistoryIndexError';
   }
@@ -23,8 +23,8 @@ export class SessionHistoryIndexError extends Error {
 export class SessionHistorySourceError extends Error {
   constructor(readonly sessionId: string, detail: string, options?: ErrorOptions) {
     super(
-      `Session ${JSON.stringify(sessionId)} original history could not be decoded or validated: ${detail} History-index recovery stopped; original data has not been changed.`,
-      options
+      'This conversation couldn’t be opened because its saved messages couldn’t be read. Its data hasn’t been changed.',
+      { cause: new Error(detail, options) }
     );
     this.name = 'SessionHistorySourceError';
   }
@@ -49,7 +49,7 @@ export class SessionHistoryIndexPublicationError extends Error {
 
   constructor(readonly sessionId: string, cause: unknown) {
     super(
-      `Session ${JSON.stringify(sessionId)} recovered history index was published, but durability or verification could not be confirmed. Original history is unchanged.`,
+      'This conversation couldn’t finish opening because a save couldn’t be confirmed.',
       { cause }
     );
     this.name = 'SessionHistoryIndexPublicationError';

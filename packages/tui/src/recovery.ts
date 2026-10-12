@@ -86,25 +86,15 @@ export function providerFailureText(
   return detail ? `${description}\nCause: ${detail}` : description;
 }
 
-/** Shared wording for the app's normal terminal and protocol presentation. */
+/** Ordinary loading presentation; typed diagnostics stay on the application event stream. */
 export function historyRecoveryMessage(progress: HistoryIndexRecoveryProgress): string {
-  const session = JSON.stringify(progress.sessionId);
-  switch (progress.phase) {
-    case 'started':
-      return `Restoring history index for session ${session}…`;
-    case 'progress':
-      return `Restoring history index for session ${session}: ${String(progress.records)} records, ${String(progress.bytes)}/${String(progress.totalBytes)} bytes…`;
-    case 'completed':
-      return `History index restored for session ${session}. Original history is unchanged.`;
-    case 'cancelled':
-    case 'failed':
-      return progress.message;
-  }
+  return progress.phase === 'started' || progress.phase === 'progress' ? 'Opening conversation…' : '';
 }
 
-/** Keeps line-oriented recovery output readable without delaying recovery or cancellation. */
+/** One delayed loading line per command, regardless of how many conversations are inspected. */
 export class HistoryRecoveryProgressRenderer {
-  private last: { readonly sessionId: string; readonly time: number; readonly records: number; readonly bytes: number } | undefined;
+  private startedAt: number | undefined;
+  private announced = false;
 
   constructor(
     private readonly write: (message: string) => void,
@@ -112,18 +102,14 @@ export class HistoryRecoveryProgressRenderer {
   ) {}
 
   handle(progress: HistoryIndexRecoveryProgress): void {
-    const time = this.now();
-    if (progress.phase === 'progress') {
-      const previous = this.last?.sessionId === progress.sessionId ? this.last : undefined;
-      if (previous !== undefined &&
-          (progress.records === previous.records && progress.bytes === previous.bytes ||
-            progress.bytes < progress.totalBytes && time - previous.time < 1000)) return;
-      this.last = { sessionId: progress.sessionId, time, records: progress.records, bytes: progress.bytes };
-    } else {
-      this.last = progress.phase === 'started'
-        ? { sessionId: progress.sessionId, time, records: 0, bytes: 0 }
-        : undefined;
+    if (progress.phase !== 'started' && progress.phase !== 'progress') {
+      this.startedAt = undefined;
+      return;
     }
+    const time = this.now();
+    this.startedAt ??= time;
+    if (this.announced || time - this.startedAt < 1000) return;
+    this.announced = true;
     this.write(historyRecoveryMessage(progress));
   }
 }
