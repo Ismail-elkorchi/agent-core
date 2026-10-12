@@ -12,7 +12,8 @@ import {
   defineTool,
   parseToolObservation,
   decodeOwnedToolObservationForPersistence,
-  createToolCall
+  createToolCall,
+  serializeToolModelContent
 } from '@agent-core/tools';
 
 const tool = defineTool({
@@ -195,4 +196,73 @@ test('image selection discloses unavailable modality and retains original artifa
   assert.equal(record.modelImages.length, 0);
   assert.ok(record.modelContent.some((part) => part.type === 'artifact'));
   assert.match(record.modelText, /image|Image/);
+});
+
+
+test('bounded delivery preserves the complete selected presentation and authoritative observation', async () => {
+  const artifacts = new InMemoryArtifactRepository();
+  const artifact = await artifacts.store({ label: 'image', content: new Uint8Array([1, 2, 3]), mediaType: 'image/png' });
+  const full = 'Arabic العربية emoji 👩🏽‍💻\n'.repeat(2000);
+  const selected = [{ type: 'text', text: full }, { type: 'image', artifact, detail: 'original' }];
+  const value = observation({ full }, { execution: { state: 'unknown' } });
+  const committed = await new ObservationStore({ artifacts, maxPresentationBytes: 2048 }).commitToolObservation({
+    turnIndex: 1, call, tool: { ...tool, buildModelContent: () => selected },
+    observation: value, modelInputModalities: ['text', 'image']
+  });
+  const delivered = serializeToolModelContent(committed.modelContent);
+  assert.ok(Buffer.byteLength(delivered) <= 2048);
+  assert.equal(delivered.isWellFormed(), true);
+  assert.match(delivered, /Presentation coverage: partial/);
+  assert.match(delivered, /Original result coverage: complete/);
+  assert.match(delivered, /execution state: unknown/);
+  assert.deepEqual(committed.modelContent.filter(part => part.type === 'image'), [selected[1]]);
+  const presentation = committed.modelContent.find(part => part.type === 'artifact').artifact;
+  assert.deepEqual(JSON.parse(new TextDecoder().decode(await artifacts.readVerified(presentation))), selected);
+  const original = await resolveToolObservation(committed.original, artifacts);
+  assert.deepEqual(original.output, value.output);
+  assert.equal(original.scope.coverage, 'complete');
+  assert.equal(original.execution.state, 'unknown');
+});
+
+test('failed presentation preservation never silently discards original selected content', async () => {
+  class Unavailable extends InMemoryArtifactRepository {
+    async store() { throw new Error('presentation disk unavailable'); }
+  }
+  const full = 'original '.repeat(1000);
+  const committed = await new ObservationStore({ artifacts: new Unavailable(), maxPresentationBytes: 1024 }).commitToolObservation({
+    turnIndex: 1, call, tool: { ...tool, buildModelContent: () => [{ type: 'text', text: full }] },
+    observation: observation(full)
+  });
+  assert.equal(serializeToolModelContent(committed.modelContent), full);
+  assert.match(committed.durableStorageDegraded.message, /presentation disk unavailable/);
+  assert.equal((await resolveToolObservation(committed.original)).output, full);
+});
+
+test('small selected content needs no projection artifact or replacement', async () => {
+  const selected = [{ type: 'text', text: 'complete answer' }];
+  const committed = await new ObservationStore({ maxPresentationBytes: 1024 }).commitToolObservation({
+    turnIndex: 1, call, tool: { ...tool, buildModelContent: () => selected }, observation: observation('small')
+  });
+  assert.deepEqual(committed.modelContent, selected);
+  assert.equal(committed.durableStorageDegraded, undefined);
+});
+
+
+test('partial presentation cannot conceal failed authoritative original storage', async () => {
+  class PartialStorage extends InMemoryArtifactRepository {
+    async store(input) {
+      if (input.label.endsWith('-observation')) throw new Error('original disk unavailable');
+      return super.store(input);
+    }
+  }
+  const artifacts = new PartialStorage();
+  const committed = await new ObservationStore({ artifacts, maxPresentationBytes: 2048 }).commitToolObservation({
+    turnIndex: 1, call, tool, observation: observation('x'.repeat(300000))
+  });
+  assert.equal(committed.original.storage, 'unavailable');
+  const delivered = serializeToolModelContent(committed.modelContent);
+  assert.ok(Buffer.byteLength(delivered) <= 2048);
+  assert.match(delivered, /Original observation storage is unavailable/);
+  assert.match(delivered, /does not replace the original structured observation/);
+  assert.match(committed.durableStorageDegraded.message, /original disk unavailable/);
 });

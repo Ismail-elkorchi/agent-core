@@ -1,7 +1,8 @@
 import { contextInspectionCursor, contextInspectionSchema } from './inspection.js';
-import { parseJsonObject, parseJsonValue } from '@agent-core/json';
+import { parseJsonObject, parseJsonValue, type JsonObject } from '@agent-core/json';
 import {
   defaultToolModelContent,
+  ToolInputError,
   defineTool,
   unicodeTextSchema,
   type CompiledToolDefinition
@@ -40,59 +41,14 @@ export function createContextTools(options: {
     scopedTool({
       name: `${prefix}_inspect`,
       description:
-        'Inspect the live selected sources at a captured boundary, including recent exchanges, protected input and native prefix dependencies. Source references can be passed unchanged to context_transition add/release. Continue with cursor for more sources. Capacity describes the last admitted request, not later tool results. No periodic inspection is required.',
+        'Inspect the live selected sources at a captured boundary, including recent exchanges, protected input and native prefix dependencies. Source references can be passed unchanged to context_transition add/release. maxBytes bounds the complete delivered JSON, including bookkeeping and cursor. Continue with cursor for more sources. Capacity describes the last admitted request, not later tool results. No periodic inspection is required.',
       schema: contextInspectionSchema,
       mode: 'read',
       root: 'context',
       buildModelContent({ observation }) {
         if (observation.kind !== 'result') return defaultToolModelContent(observation);
         const result = parseJsonObject(observation.output);
-        const admission = result.admission ? parseJsonObject(result.admission) : undefined;
-        const accounting = admission ? parseJsonObject(admission.accounting) : undefined;
-        const capacity = result.capacity ? parseJsonObject(result.capacity) : undefined;
-        const capacitySummary = capacity
-          ? Object.fromEntries(
-              Object.entries(capacity).filter(
-                ([key]) => !['method', 'unknownComponents', 'outputReservation'].includes(key)
-              )
-            )
-          : undefined;
-        return [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              admission: admission
-                ? { status: admission.status, inputIdentity: admission.inputIdentity, message: admission.message }
-                : 'not_yet_recorded',
-              capacity: capacitySummary,
-              ...(accounting
-                ? {
-                    accounting: {
-                      method: accounting.method,
-                      estimatedInputTokens: accounting.estimatedInputTokens,
-                      uncertainty: accounting.uncertainty,
-                      unknownComponents: accounting.unknownComponents,
-                      outputReservation: accounting.outputReservation,
-                      outputReservationSource: accounting.outputReservationSource,
-                      reasoningReservation: accounting.reasoningReservation,
-                      reasoningIncludedInOutput: parseJsonObject(accounting.pricingSemantics)
-                        .reasoningIncludedInOutput,
-                      limits: accounting.limits,
-                      inputTokensMeaning:
-                        'Capacity inputTokens = ceil(estimatedInputTokens × (1 + uncertainty.headroomRatio)). Provider counting is exact; compatible provider usage calibrates an unchanged prefix plus estimated additions. Unknown components remain unquantified and do not establish overflow. Unquantified components under an explicit token or cost budget require a finite model input bound. Reservations otherwise use the count or estimate; actual usage settles the invocation.'
-                    }
-                  }
-                : {}),
-              selection: result.activeSelection,
-              committedWindow: result.window,
-              workingState: result.workingState,
-              protectedSources: result.protectedSources,
-              pendingWork: result.pendingWork,
-              legalTransitions: result.legalTransitions,
-              sourceBudget: result.budget
-            })
-          }
-        ];
+        return [{ type: 'text', text: inspectionPresentation(result) }];
       },
       async canonicalize(value) {
         const cut = await options.context.history.capture();
@@ -113,19 +69,28 @@ export function createContextTools(options: {
         if (cut.sessionId !== authorized.sessionId || cut.branchId !== authorized.branchId)
           throw new Error('Context inspection cursor belongs to another branch.');
         await options.context.history.validateCut(cut);
-        const inspection = await options.context.inspect(cut, page);
-        const active = inspection.activeSelection;
-        return {
-          ...inspection,
-          activeSelection: active.status === 'available' ? active.manifest : active,
-          window: inspection.window
-            ? {
-                windowId: inspection.window.windowId,
-                historyPosition: inspection.window.historyPosition,
-                strategy: inspection.window.selection.strategy
-              }
-            : null
-        };
+        // maxBytes bounds the complete model-facing JSON, not just its source list.
+        // Re-page at the same cut so shrinking preserves exact cursor/coverage semantics.
+        let manifestBytes = page.maxBytes;
+        while (manifestBytes > 0) {
+          const inspection = await options.context.inspect(cut, { ...page, maxBytes: manifestBytes });
+          const active = inspection.activeSelection;
+          const result = parseJsonObject({
+            ...inspection,
+            activeSelection: active.status === 'available' ? active.manifest : active,
+            window: inspection.window
+              ? { windowId: inspection.window.windowId, historyPosition: inspection.window.historyPosition,
+                  strategy: inspection.window.selection.strategy }
+              : null
+          });
+          const bytes = Buffer.byteLength(inspectionPresentation(result));
+          if (bytes <= page.maxBytes) return result;
+          const manifestSize = Buffer.byteLength(JSON.stringify(result.activeSelection));
+          // Account for actual page size, not unused requested space: oversized fixed
+          // bookkeeping must fail immediately instead of shrinking one byte per pass.
+          manifestBytes = Math.min(manifestBytes - 1, page.maxBytes - (bytes - manifestSize));
+        }
+        throw new ToolInputError('Context inspection cannot fit maxBytes including required metadata and pagination. Increase maxBytes.');
       }
     }),
     defineTool({
@@ -220,6 +185,7 @@ export function createContextTools(options: {
         const result = await options.context.schedule(
           contextTransitionRequestSchema.parse({
             toolInvocation: { runId, turnId, requestAttempt, toolBatchId, callIndex, toolAttempt },
+            expectedCut: value.cut,
             expectedWindowId: value.expectedWindowId,
             expectedSourceRevision: value.cut.sourceRevision,
             expectedWorkingStateRevisionId: value.origin.revisionId,
@@ -242,4 +208,42 @@ export function createContextTools(options: {
       }
     })
   ]);
+}
+
+function inspectionPresentation(result: JsonObject): string {
+  const admission = result.admission ? parseJsonObject(result.admission) : undefined;
+  const accounting = admission ? parseJsonObject(admission.accounting) : undefined;
+  const capacity = result.capacity ? parseJsonObject(result.capacity) : undefined;
+  const capacitySummary = capacity
+    ? Object.fromEntries(Object.entries(capacity).filter(
+        ([key]) => !['method', 'unknownComponents', 'outputReservation'].includes(key)))
+    : undefined;
+  return JSON.stringify({
+    admission: admission
+      ? { status: admission.status, inputIdentity: admission.inputIdentity, message: admission.message }
+      : 'not_yet_recorded',
+    capacity: capacitySummary,
+    ...(accounting ? {
+      accounting: {
+        method: accounting.method,
+        estimatedInputTokens: accounting.estimatedInputTokens,
+        uncertainty: accounting.uncertainty,
+        unknownComponents: accounting.unknownComponents,
+        outputReservation: accounting.outputReservation,
+        outputReservationSource: accounting.outputReservationSource,
+        reasoningReservation: accounting.reasoningReservation,
+        reasoningIncludedInOutput: parseJsonObject(accounting.pricingSemantics).reasoningIncludedInOutput,
+        limits: accounting.limits,
+        inputTokensMeaning:
+          'Capacity inputTokens = ceil(estimatedInputTokens × (1 + uncertainty.headroomRatio)). Provider counting is exact; compatible provider usage calibrates an unchanged prefix plus estimated additions. Unknown components remain unquantified and do not establish overflow. Unquantified components under an explicit token or cost budget require a finite model input bound. Reservations otherwise use the count or estimate; actual usage settles the invocation.'
+      }
+    } : {}),
+    selection: result.activeSelection,
+    committedWindow: result.window,
+    workingState: result.workingState,
+    protectedSources: result.protectedSources,
+    pendingWork: result.pendingWork,
+    legalTransitions: result.legalTransitions,
+    sourceBudget: result.budget
+  });
 }

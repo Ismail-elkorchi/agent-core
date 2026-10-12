@@ -1,12 +1,11 @@
+import { contextTransformSources } from '../inference/context-transform.js';
 import type { PromptContextItemInput } from '../inference/prompt-material.js';
-import { contextSourceManifest, type ContextInspectionPage } from './inspection.js';
+import { contextSourceManifest, readSelectedHistoryMetadata, type ContextInspectionPage } from './inspection.js';
 import {
-  readSelectedHistorySources,
   SELECTED_SOURCE_LIMITS,
   assertPortableHistoryCompatibility
 } from '../orchestration/session-replay.js';
-import { sourceRef } from '../history/reader.js';
-import { contextSourceGroups } from './selection.js';
+import { contextMetadataGroups, assertContextProtocolClosure } from './selection.js';
 import type { CompiledModelRequest, ModelProfile, ModelSelection } from '@agent-core/model';
 import { ContextSourceCapacityError } from '../run/context-admission.js';
 import { HistorySourceTooLargeError } from '../history/reader.js';
@@ -85,7 +84,7 @@ export class ContextService {
   }
   async inspect(cut?: HistorySourceCut, page?: ContextInspectionPage) {
     cut ??= await this.history.capture();
-    const pending = await this.options.repository.loadPendingSubmissions(this.options.session);
+    const pending = await this.options.repository.pendingSubmissionSummaries(this.options.session);
     const window = await this.history.selectedContext(cut);
     const capacity = this.capacity();
     const selection = window
@@ -107,7 +106,7 @@ export class ContextService {
         maxSourceBytes: this.options.policy.maxSourceBytes,
         quality: 'byte_bound' as const
       }),
-      workingState: await this.inspectWorkingState(cut),
+      workingState: await this.inspectWorkingState(cut, page ? 0 : undefined),
       pendingWork: Object.freeze(
         pending.map((item) =>
           Object.freeze({ runId: item.runId, submissionId: item.submissionId, state: item.state })
@@ -125,27 +124,17 @@ export class ContextService {
   private async inspectSelection(cut: HistorySourceCut, page?: ContextInspectionPage): Promise<
     | {
         readonly status: 'available';
-        readonly selection: ContextSelection;
-        readonly manifest?: ReturnType<typeof contextSourceManifest>;
+        readonly selection?: ContextSelection;
+        readonly manifest?: Awaited<ReturnType<typeof contextSourceManifest>>;
       }
     | { readonly status: 'unavailable'; readonly conflict: ContextSourceCapacityError['conflict'] }
   > {
     try {
-      const selection = await this.selectSources(cut, {});
-      return {
+      if (page) return {
         status: 'available',
-        selection,
-        ...(page
-          ? {
-              manifest: contextSourceManifest(
-                cut,
-                (await readSelectedHistorySources(this.history, cut)).entries,
-                await this.protectedSources(cut),
-                page
-              )
-            }
-          : {})
+        manifest: await contextSourceManifest(this.history, cut, await this.protectedSources(cut), page)
       };
+      return { status: 'available', selection: await this.selectSources(cut, {}) };
     } catch (error) {
       if (!(error instanceof ContextSourceCapacityError)) throw error;
       return { status: 'unavailable' as const, conflict: error.conflict };
@@ -183,13 +172,27 @@ export class ContextService {
   recordAdmission(value: NonNullable<ContextService['admission']>): void {
     this.admission = Object.freeze(value);
   }
+  async assertSourceCapacity(cut?: HistorySourceCut): Promise<void> {
+    cut ??= await this.history.capture();
+    const view = await readSelectedHistoryMetadata(this.history, cut);
+    let bytes = 0;
+    for (const item of contextMetadataGroups(view.items).filter((group) => !group.some((item) => item.contextRecovery)).flat()) {
+      bytes += item.sourceBytes;
+      if (bytes > this.options.policy.maxSourceBytes)
+        throw new ContextSourceCapacityError(cut, {
+          unit: 'bytes', limit: this.options.policy.maxSourceBytes, observedAtLeast: bytes
+        }, item.source);
+    }
+  }
+
   /** Reuse unchanged facts; pressure does not create a recurring maintenance instruction. */
   async capacityFeedback(compiled: CompiledModelRequest) {
-    const view = await readSelectedHistorySources(this.history);
+    const view = await readSelectedHistoryMetadata(this.history, await this.history.capture());
+    const sourceBytes = view.items.reduce((sum, item) => sum + item.sourceBytes, 0);
     const capacity = requestCapacity(compiled.accounting);
     const sourcePressure =
-      view.sourceBytes >= SELECTED_SOURCE_LIMITS.bytes * 0.8 ||
-      view.entries.length >= SELECTED_SOURCE_LIMITS.entries * 0.8;
+      sourceBytes >= SELECTED_SOURCE_LIMITS.bytes * 0.8 ||
+      view.items.length >= SELECTED_SOURCE_LIMITS.entries * 0.8;
     if (capacity.pressure !== 'continuity' && !sourcePressure) return undefined;
     const key = hashJson({
       pressure: capacity.pressure,
@@ -220,8 +223,8 @@ export class ContextService {
           capacity,
           sourceRead: {
             cut: view.cut,
-            bytes: view.sourceBytes,
-            entries: view.entries.length,
+            bytes: sourceBytes,
+            entries: view.items.length,
             limits: SELECTED_SOURCE_LIMITS,
             pressure: sourcePressure ? 'near_bound' : 'normal'
           },
@@ -251,34 +254,26 @@ export class ContextService {
     // Complete exchanges and transition admission still validate the chosen sources.
     const view =
       change.retain === undefined || change.release?.length
-        ? await readSelectedHistorySources(this.history, cut)
-        : { entries: [], contextWindow: await this.history.selectedContext(cut) };
-    const groups = contextSourceGroups(view.entries);
+        ? await readSelectedHistoryMetadata(this.history, cut)
+        : { items: [], contextWindow: await this.history.selectedContext(cut) };
+    const groups = contextMetadataGroups(view.items);
     const released = new Set(change.release?.map((source) => source.entryId));
     for (const source of change.release ?? []) {
-      const entry = view.entries.find(
-        (item) => sourceRef(cut.sessionId, item).entryId === source.entryId
-      );
-      if (!entry || !sameHistorySource(sourceRef(cut.sessionId, entry), source))
+      const item = view.items.find((item) => item.source.entryId === source.entryId);
+      if (!item || !sameHistorySource(item.source, source))
         throw new Error('Released source is not in the active context.');
     }
     const retained = new Map<string, HistorySourceRef>();
     if (change.retain === undefined)
       for (const group of groups)
-        if (!group.some((entry) => released.has(sourceRef(cut.sessionId, entry).entryId)))
-          for (const entry of group) {
-            const source = sourceRef(cut.sessionId, entry);
-            retained.set(source.entryId, source);
-          }
+        if (!group.some((item) => released.has(item.source.entryId)))
+          for (const item of group) retained.set(item.source.entryId, item.source);
     for (const source of [...(change.retain ?? []), ...(change.add ?? [])]) {
       const group = groups.find((items) =>
-        items.some((entry) => sameHistorySource(sourceRef(cut.sessionId, entry), source))
+        items.some((item) => sameHistorySource(item.source, source))
       );
-      const entries = group ?? (await this.history.exchange(source, cut));
-      for (const entry of entries) {
-        const ref = sourceRef(cut.sessionId, entry);
-        retained.set(ref.entryId, ref);
-      }
+      const items = group ?? (await this.history.exchangeSources(source, cut));
+      for (const item of items) retained.set(item.source.entryId, item.source);
     }
     for (const source of await this.protectedSources(cut)) retained.set(source.entryId, source);
     return {
@@ -326,28 +321,17 @@ export class ContextService {
   async schedule(request: ContextTransitionRequest): Promise<{ readonly requestId: string }> {
     if (!this.runtime)
       throw new Error(
-        'Context renewal requires an active run; use session selection controls while idle.'
+        'Context transition scheduling requires an active run; use session selection controls while idle.'
       );
     return this.runtime.schedule(ownRequest(request));
   }
-  async request(input: {
-    readonly selection?: ContextSelection;
-    readonly reason: string;
-    readonly idempotencyKey: string;
-  }) {
-    const current = await this.inspect();
-    const request: ContextTransitionRequest = {
-      expectedWindowId: current.window?.windowId ?? null,
-      expectedSourceRevision: current.cut.sourceRevision,
-      selection: input.selection ?? {
-        strategy: 'sources',
-        retained: await this.protectedSources()
-      },
-      reason: input.reason,
-      idempotencyKey: input.idempotencyKey
-    };
+  async dispatch(
+    request: ContextTransitionRequest,
+    options: Parameters<ContextService['transition']>[1] = {}
+  ) {
+    throwIfAborted(options.signal);
     if (this.runtime) return { kind: 'scheduled' as const, ...(await this.schedule(request)) };
-    return { kind: 'selected' as const, entry: await this.transition(request) };
+    return { kind: 'selected' as const, entry: await this.transition(request, options) };
   }
   /** Network work belongs outside session serialization; the final repository append alone commits the window. */
   async transition(
@@ -394,6 +378,7 @@ export class ContextService {
     });
     const selectionRequest = { ...request };
     delete selectionRequest.toolInvocation;
+    delete selectionRequest.expectedCut;
     const fingerprint = hashJson(selectionRequest);
     const previous = await this.findTransition(request.idempotencyKey);
     if (previous) {
@@ -409,6 +394,24 @@ export class ContextService {
         request.expectedSourceRevision !== cut.sourceRevision)
     )
       throw new PersistenceConflictError('Context transition expected boundary is stale.');
+    const freshReset = request.selection.continuity !== undefined &&
+      request.selection.continuity.resetId !== window?.selection.continuity?.resetId;
+    if (request.selection.continuity && !freshReset) {
+      const previous = window?.selection.continuity;
+      if (!previous || hashJson(previous.model) !== hashJson(request.selection.continuity.model) ||
+          request.selection.continuity.sources.some((source) => !previous.sources.some((prior) => sameHistorySource(prior, source))))
+        throw new Error('Preserved fresh-continuation provenance cannot be expanded to new native sources.');
+    }
+    if (window?.selection.strategy === 'provider' && request.selection.strategy === 'sources' && !freshReset)
+      throw new Error('Replacing transformed native continuity requires an explicit fresh continuation.');
+    const portableSources = new Set([
+      ...(window?.selection.continuity?.sources ?? []),
+      ...(request.selection.continuity?.sources ?? []),
+      ...(window && request.selection.strategy === 'provider' && options.admit
+        ? contextTransformSources(window) : [])
+    ].map((source) => source.entryId));
+    await assertContextProtocolClosure(this.history, cut, request.selection.retained,
+      portableSources, options.signal, freshReset);
     const retained = new Map(request.selection.retained.map((ref) => [ref.entryId, ref]));
     const selected: SessionBranchEntry[] = [];
     let sourceBytes = 0;
@@ -621,6 +624,17 @@ export class ContextService {
       cut.throughEntryId
     );
     if (!revision) return { revisionId: null, text: '', complete: true };
+    // State remains generated material. The history reference authorizes recovering the exact original body.
+    const snapshot = await this.options.repository.sourceSnapshot(
+      this.options.session,
+      cut.throughEntryId
+    );
+    const entry = snapshot.index.byId.get(revision.id);
+    if (!entry) throw new Error('Working-state index points outside the captured session branch.');
+    const source = { sessionId: cut.sessionId, entryId: entry.entryId, sha256: entry.sha256 };
+    if (maxBytes === 0)
+      return { revisionId: revision.id, text: '', complete: revision.contentRef.size === 0,
+        totalBytes: revision.contentRef.size, source };
     const range = await this.options.artifacts.readVerifiedRange(revision.contentRef, {
       offset: 0,
       length: maxBytes
@@ -630,19 +644,12 @@ export class ContextService {
       0,
       maxBytes
     );
-    // State remains generated material. The history reference authorizes recovering the exact original body.
-    const snapshot = await this.options.repository.sourceSnapshot(
-      this.options.session,
-      cut.throughEntryId
-    );
-    const entry = snapshot.index.byId.get(revision.id);
-    if (!entry) throw new Error('Working-state index points outside the captured session branch.');
     return {
       revisionId: revision.id,
       text: preview.text,
       complete: preview.nextOffset === range.fullSize,
       totalBytes: range.fullSize,
-      source: { sessionId: cut.sessionId, entryId: entry.entryId, sha256: entry.sha256 }
+      source
     };
   }
 

@@ -181,8 +181,8 @@ class OneShotConditionalFault {
     }
     return result;
   }
-  tail(runId) {
-    return this.repository.tail(runId);
+  tail(runId, options) {
+    return this.repository.tail(runId, options);
   }
   latest(runId) {
     return this.repository.latest(runId);
@@ -196,11 +196,14 @@ class OneShotConditionalFault {
   readRange(runId, request) {
     return this.repository.readRange(runId, request);
   }
-  referenceByKey(runId, key) {
-    return this.repository.referenceByKey(runId, key);
+  readMetadataRange(runId, request) {
+    return this.repository.readMetadataRange(runId, request);
   }
-  latestReferenceOfType(runId, type) {
-    return this.repository.latestReferenceOfType(runId, type);
+  referenceByKey(runId, key, options) {
+    return this.repository.referenceByKey(runId, key, options);
+  }
+  latestReferenceOfType(runId, type, options) {
+    return this.repository.latestReferenceOfType(runId, type, options);
   }
   readReference(reference) {
     return this.repository.readReference(reference);

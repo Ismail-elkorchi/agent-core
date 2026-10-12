@@ -415,6 +415,7 @@ test('session JSONL indexes only newline-committed records and repairs arbitrari
 
   repository = new JsonlSessionRepository({ rootDir });
   session = await repository.open(session.id, TEST_SESSION_BINDING);
+  await repository.rebuildHistoryIndex(session);
   await repository.appendInput(session, { runId: 'replacement', task: 'replacement' });
   let replay = await new JsonlSessionRepository({ rootDir }).loadReplayState(session);
   assert.deepEqual(
@@ -1070,6 +1071,7 @@ test('context transitions commit once without evicting original session records'
   const view = await history.page({ limit: 1000, maxBytes: 1024 * 1024 });
   const request = {
     expectedWindowId: null,
+    expectedSourceRevision: (await history.capture()).sourceRevision,
     idempotencyKey: 'retain-once',
     reason: 'Explicit attention boundary',
     selection: {
@@ -1088,9 +1090,11 @@ test('context transitions commit once without evicting original session records'
       throw new Error('No inference required by this transition');
     }
   });
-  const first = await agent.transitionContext(request);
+  const result = await agent.transitionContext(request);
+  assert.equal(result.kind, 'selected');
+  const first = result.entry;
   assert.equal(Object.isFrozen(first.window.selection), true);
-  assert.equal((await agent.transitionContext(request)).id, first.id);
+  assert.equal((await agent.transitionContext(request)).entry.id, first.id);
   const replay = await repository.loadReplayState(descriptor);
   assert.equal(replay.contextWindow.windowId, first.window.windowId);
   assert.deepEqual(replay.ledgerRunIds, ['run']);
@@ -1099,6 +1103,26 @@ test('context transitions commit once without evicting original session records'
     agent.transitionContext({ ...request, reason: 'Changed content' }),
     /idempotency/u
   );
+  const scheduled = [];
+  const unbind = context.bindRuntime({
+    schedule: async (request) => { scheduled.push(request); return { requestId: 'scheduled-selection' }; },
+    providerTransform: async () => false
+  });
+  const activeRequest = {
+    ...request,
+    expectedWindowId: first.window.windowId,
+    expectedSourceRevision: (await history.capture()).sourceRevision,
+    idempotencyKey: 'active-selection'
+  };
+  assert.deepEqual(await agent.transitionContext(activeRequest), {
+    kind: 'scheduled', requestId: 'scheduled-selection'
+  });
+  assert.deepEqual(scheduled, [activeRequest]);
+  assert.equal((await history.selectedContext()).windowId, first.window.windowId);
+  unbind();
+  await repository.appendInput(descriptor, { runId: 'new-run', task: 'A newer source.' });
+  await assert.rejects(agent.transitionContext(activeRequest), /source revision|stale/i);
+  assert.equal((await history.selectedContext()).windowId, first.window.windowId);
 });
 
 test('approval suspension remains durable and blocks queued follow-ups until resolution', async () => {

@@ -82,13 +82,18 @@ for (const kind of ['memory', 'jsonl']) {
     const context = new ContextService({ repository: sessions, session, artifacts, history,
       policy: { maxSourceBytes: 1024 * 1024, historyRead: { history, isAvailable: () => true } }
     });
-    const point = await context.request({ idempotencyKey: 'fork-point', reason: 'Historical point' });
+    const point = await context.transition({
+      expectedWindowId: (await context.inspect()).window?.windowId ?? null,
+      expectedSourceRevision: (await context.history.capture()).sourceRevision,
+      selection: { strategy: 'sources', retained: await context.protectedSources() },
+ idempotencyKey: 'fork-point', reason: 'Historical point'
+    });
     await events.append('open-run', answer('Later parent answer', 2));
     const later = await history.capture();
     await sessions.recordRunFinalization(session, terminal('open-run'));
     await events.append('open-run', { type: 'run.ended', terminal: terminal('open-run') });
     assert.deepEqual((await history.capture()).ledgerHeads, []);
-    await sessions.branchFrom(session, point.entry.id, 'Independent child');
+    await sessions.branchFrom(session, point.id, 'Independent child');
     const child = await history.capture();
     assert.equal(await history.extendsCut(ancestor, child), true);
     assert.deepEqual(child.ledgerHeads, ancestor.ledgerHeads);
@@ -100,7 +105,7 @@ for (const kind of ['memory', 'jsonl']) {
     const old = await history.page({ cut: ancestor });
     assert.deepEqual(old.entries.filter((entry) => entry.type === 'assistant')
       .map((entry) => entry.content), ['Before the fork']);
-    const incremental = await history.page({ after: point.entry.window.historyPosition, cut: child });
+    const incremental = await history.page({ after: point.window.historyPosition, cut: child });
     assert.deepEqual(incremental.entries.map((entry) => entry.type), ['context_transition', 'branch']);
   });
 
@@ -1023,6 +1028,10 @@ for (const kind of ['memory', 'jsonl']) {
           if (kind === 'jsonl' && cold) {
             await rm(path.join(f.root, 'events', 'run-run.index'), { recursive: true, force: true });
             events = new JsonlEventRepository({ rootDir: path.join(f.root, 'events'), codec: agentEventCodec });
+            if (authoritative) {
+              await assert.rejects(events.tail('run', { metadataOnly: true }), error => error.code === 'index_recovery_required');
+              await events.rebuild('run');
+            }
             repository = new JsonlSessionRepository(path.join(f.root, 'sessions'));
           }
           const history = new HistoryReader({ repository, session, artifacts: f.artifacts,
@@ -1055,3 +1064,302 @@ for (const kind of ['memory', 'jsonl']) {
     }
   }
 }
+
+for (const kind of ['memory', 'jsonl']) {
+  test(`${kind}: metadata pages preserve source identity without hydrating oversized originals`, async () => {
+    const { sessions, events, artifacts, root } = await backend(kind);
+    try {
+      const session = await sessions.create({ binding });
+      const input = await sessions.appendInput(session, { runId: 'inventory', task: 'x'.repeat(850000) });
+      const receipt = await events.append('inventory', {
+        type: 'assistant.ended', ...identity, content: 'y'.repeat(850000),
+        modelOutput: { status: 'complete', message: 'done', source: 'content', turnIndex: 1 }
+      });
+      const history = new HistoryReader({ repository: sessions, session, events, artifacts });
+      const cut = await history.capture();
+      const readBranchEntry = sessions.readBranchEntry;
+      const readRange = events.readRange;
+      const readReference = events.readReference;
+      sessions.readBranchEntry = async () => { throw new Error('Metadata must not hydrate session bodies'); };
+      events.readRange = async () => { throw new Error('Metadata must not hydrate event bodies'); };
+      events.readReference = async () => { throw new Error('Metadata must not read event references'); };
+      let cursor;
+      const items = [];
+      do {
+        const page = await history.metadataPage({ cut, cursor, limit: 1, maxBytes: 4096 });
+        assert(page.bytes <= 4096);
+        items.push(...page.items);
+        cursor = page.cursor;
+      } while (cursor);
+      assert.equal(items.length, 2);
+      assert.deepEqual(items[0].source, sourceRef(session.id, input));
+      assert.equal(items[1].source.sha256, receipt.hash);
+      assert.equal(items[1].source.event.sequence, receipt.sequence);
+      assert(items.every(item => item.sourceBytes > 850000 && item.description.length <= 200));
+      assert.deepEqual(await history.metadata(items[1].source, cut), items[1]);
+      await assert.rejects(history.metadata({ ...items[1].source, sha256: '0'.repeat(64) }, cut), /identity mismatch/);
+      const outside = { ...items[1].source, sessionId: 'another-session' };
+      assert.equal(await history.metadata(outside, cut), undefined);
+      sessions.readBranchEntry = readBranchEntry;
+      events.readRange = readRange;
+      events.readReference = readReference;
+    } finally {
+      if (root) await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test('direct exchange reads hydrate only matching sources after a large run history', async () => {
+  const { sessions, events, artifacts } = await backend('memory');
+  const session = await sessions.create({ binding });
+  await sessions.appendInput(session, { runId: 'long-run', task: 'Original' });
+  for (let i = 0; i < 12; i++) {
+    await events.append('long-run', {
+      type: 'assistant.ended', ...identity, turnId: `past-${i}`, content: 'x'.repeat(800000),
+      modelOutput: { status: 'complete', message: 'done', source: 'content', turnIndex: 1 }
+    });
+  }
+  const receipt = await events.append('long-run', {
+    type: 'assistant.ended', ...identity, turnId: 'wanted', content: 'Selected answer',
+    modelOutput: { status: 'complete', message: 'done', source: 'content', turnIndex: 1 }
+  });
+  const history = new HistoryReader({ repository: sessions, session, events, artifacts });
+  const cut = await history.capture();
+  const source = { sessionId: session.id, entryId: `event:${receipt.eventId}`, sha256: receipt.hash,
+    event: { runId: 'long-run', eventId: receipt.eventId, sequence: receipt.sequence, hash: receipt.hash } };
+  const readRange = events.readRange.bind(events);
+  const readSequences = [];
+  events.readRange = async (runId, request) => {
+    readSequences.push(request.afterSequence + 1);
+    return readRange(runId, request);
+  };
+  const exchange = await history.exchange(source, cut);
+  assert.equal(exchange.length, 1);
+  assert.equal(exchange[0].content, 'Selected answer');
+  assert.deepEqual(readSequences, [receipt.sequence]);
+});
+
+test('a one-item context inventory page visits only its next metadata source', async () => {
+  const sessions = new InMemorySessionRepository();
+  const artifacts = new InMemoryArtifactRepository();
+  const session = await sessions.create({ binding });
+  for (let i = 0; i < 200; i++) {
+    const runId = `inventory-${i}`;
+    await sessions.appendInput(session, { runId, task: `Original ${i}` });
+    await sessions.recordRunFinalization(session, terminal(runId));
+  }
+  const history = new HistoryReader({ repository: sessions, session, artifacts });
+  const context = new ContextService({ repository: sessions, session, artifacts, history,
+    policy: { maxSourceBytes: 1024, historyRead: { history, isAvailable: () => true } } });
+  const cut = await history.capture();
+  sessions.readBranchEntry = async () => { throw new Error('Inventory must not hydrate originals'); };
+  const metadataPage = history.metadataPage.bind(history);
+  let scanned = 0;
+  history.metadataPage = async request => {
+    const page = await metadataPage(request);
+    scanned += page.scanned;
+    return page;
+  };
+  const first = await context.inspect(cut, { limit: 1, maxBytes: 4096 });
+  assert.equal(first.activeSelection.manifest.items.length, 1);
+  assert.equal(scanned, 1);
+  assert.equal(first.activeSelection.manifest.coverage, 'partial');
+  const next = await context.inspect(cut, { limit: 1, maxBytes: 4096, cursor: first.activeSelection.manifest.cursor });
+  assert.equal(scanned, 2);
+  assert.equal(next.activeSelection.manifest.items[0].description, 'Original 1');
+});
+
+for (const contextRecovery of [false, true]) {
+  test(`canonical source transition ${contextRecovery ? 'can omit recovery control output' : 'rejects omitted unfinished ordinary calls'}`, async () => {
+    const sessions = new InMemorySessionRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const session = await sessions.create({ binding });
+    const input = await sessions.appendInput(session, { runId: 'pending', task: 'Keep the original requirement' });
+    await sessions.appendAssistant(session, {
+      runId: 'pending', identity, content: '', ...(contextRecovery ? { contextRecovery: true } : {}),
+      output: [{ type: 'tool_call', toolCall: {
+        id: 'unexecuted', type: 'function', name: 'lookup', input: { kind: 'json', value: {} }
+      } }]
+    });
+    const history = new HistoryReader({ repository: sessions, session, artifacts });
+    const context = new ContextService({ repository: sessions, session, artifacts, history,
+      policy: { maxSourceBytes: 65536, historyRead: { history, isAvailable: () => true } } });
+    const cut = await history.capture();
+    const transition = context.transition({
+      expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
+      idempotencyKey: 'omit-unexecuted', reason: 'Explicit selection',
+      selection: { strategy: 'sources', retained: [sourceRef(session.id, input)] }
+    });
+    if (contextRecovery) {
+      const result = await transition;
+      assert.equal(result.type, 'context_transition');
+    } else {
+      await assert.rejects(transition, /unfinished tool exchange cannot be released/);
+      await assert.rejects(context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
+        idempotencyKey: 'fresh-cannot-drop-pending', reason: 'Explicit fresh continuation still owes its result',
+        selection: { strategy: 'sources', retained: [sourceRef(session.id, input)], continuity: {
+          kind: 'fresh', resetId: 'fresh-pending', model: { provider: 'fixture', model: 'context' }, sources: [sourceRef(session.id, input)]
+        } } }), /unfinished tool exchange cannot be released/);
+      assert.equal(await history.selectedContext(), undefined);
+    }
+  });
+}
+
+test('raw transition cannot reintroduce a partial historical exchange outside the active window', async () => {
+  const sessions = new InMemorySessionRepository();
+  const artifacts = new InMemoryArtifactRepository();
+  const session = await sessions.create({ binding });
+  const input = await sessions.appendInput(session, { runId: 'historical', task: 'Original obligation' });
+  const assistant = await sessions.appendAssistant(session, { runId: 'historical', identity, content: '',
+    output: [{ type: 'tool_call', toolCall: { id: 'call', type: 'function', name: 'lookup', input: { kind: 'json', value: {} } } }] });
+  await sessions.appendToolCall(session, { runId: 'historical', identity: { ...identity, toolBatchId: 'batch', callIndex: 0, callId: 'call' }, call: {} });
+  await sessions.appendObservation(session, { runId: 'historical', identity: { ...identity, toolBatchId: 'batch', callIndex: 0, callId: 'call', toolAttempt: 1 },
+    toolName: 'lookup', observation: { kind: 'result', summary: 'Done', output: {} } });
+  const history = new HistoryReader({ repository: sessions, session, artifacts });
+  const context = new ContextService({ repository: sessions, session, artifacts, history,
+    policy: { maxSourceBytes: 65536, historyRead: { history, isAvailable: () => true } } });
+  const first = await context.transition({ expectedWindowId: null, expectedSourceRevision: (await history.capture()).sourceRevision,
+    idempotencyKey: 'remove-complete', reason: 'Remove complete exchange', selection: { strategy: 'sources', retained: [sourceRef(session.id, input)] } });
+  await assert.rejects(context.transition({ expectedWindowId: first.window.windowId, expectedSourceRevision: (await history.capture()).sourceRevision,
+    idempotencyKey: 'partial-add', reason: 'Partial historical add', selection: { strategy: 'sources', retained: [sourceRef(session.id, input), sourceRef(session.id, assistant)] } }), /complete tool exchange/);
+});
+
+test('explicit replacement can release more than ten thousand completed exchanges', async () => {
+  const sessions = new InMemorySessionRepository();
+  const artifacts = new InMemoryArtifactRepository();
+  const session = await sessions.create({ binding });
+  const input = await sessions.appendInput(session, { runId: 'many-exchanges', task: 'Keep the obligation' });
+  for (let i = 0; i < 10001; i++)
+    await sessions.appendAssistant(session, { runId: 'many-exchanges', identity: { ...identity, turnId: `turn-${i}` }, content: 'Completed answer' });
+  const history = new HistoryReader({ repository: sessions, session, artifacts });
+  const context = new ContextService({ repository: sessions, session, artifacts, history,
+    policy: { maxSourceBytes: 65536, historyRead: { history, isAvailable: () => true } } });
+  const cut = await history.capture();
+  const read = sessions.readBranchEntry.bind(sessions);
+  sessions.readBranchEntry = async (descriptor, boundary, id) => {
+    assert.equal(id, input.id, 'replacement must not hydrate discarded exchange bodies');
+    return read(descriptor, boundary, id);
+  };
+  const result = await context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
+    idempotencyKey: 'bounded-replacement', reason: 'Replace the oversized source plan',
+    selection: { strategy: 'sources', retained: [sourceRef(session.id, input)] } });
+  assert.equal(result.type, 'context_transition');
+  assert.deepEqual(result.window.selection.retained, [sourceRef(session.id, input)]);
+});
+
+test('ledger-only native prefix and pending call facts remain visible before a session mirror exists', async () => {
+  const { sessions, events, artifacts } = await backend('memory');
+  const session = await sessions.create({ binding });
+  await sessions.appendInput(session, { runId: 'native-pending', task: 'Keep original prefix' });
+  await events.append('native-pending', { type: 'assistant.ended', ...identity, nativePrefixBound: true, content: '',
+    modelOutput: { status: 'complete', message: 'Tool request', source: 'content', turnIndex: 1 },
+    toolCalls: [{ id: 'pending', name: 'lookup', input: { kind: 'json', value: {} } }] });
+  const history = new HistoryReader({ repository: sessions, session, events, artifacts });
+  const context = new ContextService({ repository: sessions, session, artifacts, history,
+    policy: { maxSourceBytes: 65536, historyRead: { history, isAvailable: () => true } } });
+  events.readRange = async () => { throw new Error('Inventory must not read ledger payloads'); };
+  const inspected = await context.inspect(await history.capture(), { limit: 10, maxBytes: 8192 });
+  const assistant = inspected.activeSelection.manifest.items.find(item => item.type === 'assistant');
+  assert.equal(assistant.group.prefixBound, true);
+  assert.equal(assistant.group.release, 'unfinished_exchange');
+});
+
+test('whole native prefix release requires a new explicit fresh continuation', async () => {
+  const sessions = new InMemorySessionRepository();
+  const artifacts = new InMemoryArtifactRepository();
+  const session = await sessions.create({ binding });
+  const input = await sessions.appendInput(session, { runId: 'native-release', task: 'Preserve this requirement' });
+  const native = await createProviderContextState({ protocolRevision: 'fixture-v1', provider: 'fixture',
+    endpoint: 'fixture://native', request: { model: 'context', messages: [{ role: 'user', content: input.task }] },
+    requestId: 'native-release-request', kind: 'signed', requiresExactPrefix: true, data: { opaque: 'preserved-native-state' } });
+  const response = await sessions.appendAssistant(session, { runId: 'native-release', identity, content: 'Native answer', output: [{ type: 'protocol', state: native }] });
+  const history = new HistoryReader({ repository: sessions, session, artifacts });
+  const context = new ContextService({ repository: sessions, session, artifacts, history,
+    policy: { maxSourceBytes: 65536, historyRead: { history, isAvailable: () => true } } });
+  const inputRef = sourceRef(session.id, input);
+  const cut = await history.capture();
+  await assert.rejects(context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
+    idempotencyKey: 'silent-native-drop', reason: 'Release all native sources', selection: { strategy: 'sources', retained: [inputRef] } }), /explicit fresh continuation/);
+  assert.equal(await history.selectedContext(), undefined);
+  await assert.rejects(context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
+    idempotencyKey: 'fresh-cannot-drop-input', reason: 'Fresh continuity still owes the accepted input',
+    selection: { strategy: 'sources', retained: [], continuity: { kind: 'fresh', resetId: 'fresh-without-input', model: { provider: 'fixture', model: 'context' }, sources: [] } } }), /active accepted or protected input is mandatory/);
+  const preserved = await context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
+    idempotencyKey: 'preserve-native', reason: 'Preserve native prefix',
+    selection: { strategy: 'sources', retained: [inputRef, sourceRef(session.id, response)] } });
+  const fresh = await context.transition({ expectedWindowId: preserved.window.windowId, expectedSourceRevision: (await history.capture()).sourceRevision,
+    idempotencyKey: 'explicit-native-reset', reason: 'Explicit fresh continuation',
+    selection: { strategy: 'sources', retained: [inputRef], continuity: { kind: 'fresh', resetId: 'new-explicit-reset', model: { provider: 'fixture', model: 'context' }, sources: [inputRef] } } });
+  assert.deepEqual(fresh.window.selection.retained, [inputRef]);
+  assert.equal(fresh.window.selection.continuity.resetId, 'new-explicit-reset');
+});
+
+test('native prefix validation orders an older open run tail before a later retained response', async () => {
+  const { sessions, events, artifacts } = await backend('memory');
+  const session = await sessions.create({ binding });
+  const earlierInput = await sessions.appendInput(session, { runId: 'earlier-open', task: 'Earlier obligation' });
+  await events.append('earlier-open', { type: 'assistant.ended', ...identity, content: 'Earlier answer',
+    modelOutput: { status: 'complete', message: 'Earlier answer', source: 'content', turnIndex: 1 } });
+  await sessions.appendInput(session, { runId: 'later-native', task: 'Later obligation' });
+  await events.append('later-native', { type: 'assistant.ended', ...identity, nativePrefixBound: true, content: 'Native answer',
+    modelOutput: { status: 'complete', message: 'Native answer', source: 'content', turnIndex: 1 } });
+  const history = new HistoryReader({ repository: sessions, session, events, artifacts });
+  const context = new ContextService({ repository: sessions, session, artifacts, history,
+    policy: { maxSourceBytes: 65536, historyRead: { history, isAvailable: () => true } } });
+  const cut = await history.capture();
+  const selection = await context.selectSources(cut, {});
+  assert(selection.retained.some(source => source.entryId === earlierInput.id));
+  const prior = await context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
+    idempotencyKey: 'native-order-initial', reason: 'Preserve current prefix', selection });
+  await events.append('earlier-open', { type: 'assistant.ended', ...identity, turnId: 'late-earlier-response', content: 'Earlier run acquired a tail',
+    modelOutput: { status: 'complete', message: 'Earlier run acquired a tail', source: 'content', turnIndex: 1 } });
+  await assert.rejects(context.transition({ expectedWindowId: prior.window.windowId, expectedSourceRevision: (await history.capture()).sourceRevision,
+    idempotencyKey: 'omit-earlier-tail', reason: 'Omit the new earlier-run tail', selection }), /complete preceding source prefix/);
+});
+
+test('metadata continuation carries only a cut fingerprint and resumes across readers', async () => {
+  const { sessions, events, artifacts } = await backend('memory');
+  const session = await sessions.create({ binding });
+  for (let i = 0; i < 50; i++)
+    await sessions.appendInput(session, { runId: `open-${i}`, task: `Original ${i}` });
+  const history = new HistoryReader({ repository: sessions, session, events, artifacts });
+  const cut = await history.capture();
+  const page = await history.metadataPage({ cut, limit: 1 });
+  assert(page.cursor.length < 512);
+  const position = JSON.parse(Buffer.from(page.cursor, 'base64url').toString('utf8'));
+  assert.equal('cut' in position, false);
+  assert.equal(position.cutHash, hashJson(cut));
+  const reopened = new HistoryReader({ repository: sessions, session, events, artifacts });
+  const next = await reopened.metadataPage({ cut, cursor: page.cursor, limit: 2 });
+  assert.equal(next.items[0].description, 'Original 1');
+  await assert.rejects(reopened.metadataPage({ cursor: page.cursor }), /requires its captured cut/);
+  await assert.rejects(reopened.metadataPage({ cut: { ...cut, sourceRevision: cut.sourceRevision + 1 }, cursor: page.cursor }), /cursor cut mismatch/);
+});
+
+test('manifest byte backtracking preserves the last fitting page across skipped tail records', async () => {
+  const sessions = new InMemorySessionRepository();
+  const artifacts = new InMemoryArtifactRepository();
+  const session = await sessions.create({ binding });
+  const retained = [];
+  for (let i = 0; i < 6; i++) {
+    const input = await sessions.appendInput(session, { runId: `retained-${i}`, task: `Original ${i} ${'detail '.repeat(40)}` });
+    retained.push(sourceRef(session.id, input));
+  }
+  const history = new HistoryReader({ repository: sessions, session, artifacts });
+  const context = new ContextService({ repository: sessions, session, artifacts, history,
+    policy: { maxSourceBytes: 65536, historyRead: { history, isAvailable: () => true } } });
+  await context.transition({ expectedWindowId: null, expectedSourceRevision: (await history.capture()).sourceRevision,
+    idempotencyKey: 'retained-tail-boundary', reason: 'Keep the retained inputs', selection: { strategy: 'sources', retained } });
+  await sessions.appendInput(session, { runId: 'new-tail', task: 'A new tail original' });
+  const cut = await history.capture();
+  const six = (await context.inspect(cut, { limit: 6, maxBytes: 8192 })).activeSelection.manifest;
+  assert.equal(six.items.length, 6);
+  const maxBytes = Buffer.byteLength(JSON.stringify(six)) + 32;
+  const bounded = (await context.inspect(cut, { limit: 100, maxBytes })).activeSelection.manifest;
+  assert.equal(bounded.items.length, 6);
+  assert(Buffer.byteLength(JSON.stringify(bounded)) <= maxBytes);
+  assert.equal(bounded.coverage, 'partial');
+  const next = (await context.inspect(cut, { limit: 100, maxBytes: 8192, cursor: bounded.cursor })).activeSelection.manifest;
+  assert.deepEqual(next.items.map(item => item.description), ['A new tail original']);
+  assert.equal(next.coverage, 'complete');
+});

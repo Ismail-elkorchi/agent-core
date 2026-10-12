@@ -120,9 +120,10 @@ export class InferenceContextRejectedError extends Error {
 export class InferenceNotSentError extends Error {
   constructor(
     readonly invocationId: string,
-    message: string
+    message: string,
+    options?: ErrorOptions
   ) {
-    super(message);
+    super(message, options);
     this.name = 'InferenceNotSentError';
   }
 }
@@ -760,7 +761,11 @@ export class InferenceService {
     const { identity, profile, compiled, signal } = input;
     signal?.throwIfAborted();
     assertCompiledProfile(compiled, profile);
-    assertRequestAccountingFits(compiled.accounting);
+    try {
+      assertRequestAccountingFits(compiled.accounting);
+    } catch (cause) {
+      throw new ContextAdmissionError(compiled, cause);
+    }
     const logical = { ...compiled.logicalRequest };
     delete logical.signal;
     const sourceFingerprint = await this.sourceFingerprint(
@@ -1001,7 +1006,7 @@ export class InferenceService {
       } catch (cause) {
         const message = cause instanceof Error ? cause.message : String(cause);
         await this.cancelBeforeDispatch(identity, message);
-        throw new InferenceNotSentError(identity.invocationId, message);
+        throw new InferenceNotSentError(identity.invocationId, message, { cause });
       }
     };
     const operation = executeEffectLifecycle({ start: authorize, settle, uncertain }, () => {

@@ -35,6 +35,7 @@ export const contextSelectionSchema = z
   .readonly();
 export const contextTransitionRequestSchema = z
   .strictObject({
+    expectedCut: historyCutSchema.optional(),
     workingState: workingStateChangeSchema.optional(),
     expectedWorkingStateRevisionId: z.string().min(1).nullable().optional(),
     toolInvocation: z

@@ -63,7 +63,7 @@ export async function rebuildModelWindowFromRepositories(input: {
 }): Promise<ModelWindowReplayResult> {
   const modelWindow = new ModelWindow(input.estimator, input.modelWindowImageLimits);
   const view = input.history ? await readSelectedHistorySources(input.history) : undefined;
-  const selected = view?.entries ?? [];
+  const selected = applicationHistory(view?.entries ?? []);
   if (view?.contextWindow?.selection.strategy === 'provider' && !input.artifacts)
     throw new Error('Committed native context requires its protected artifact repository.');
   const transformed =
@@ -127,10 +127,14 @@ export async function rebuildModelWindowFromRepositories(input: {
   const outputByTurn = new Map<string, readonly ModelOutputItem[]>();
   const inferenceByTurn = new Map<string, string>();
   const steering = new Map<string, string>();
+  const recoveryTurns = new Set<string>();
   for (const runId of [...new Set(input.runIds ?? [])]) {
     replayedLedgers++;
     for await (const record of input.events.read(runId)) {
       const event = record.event;
+      if (event.type === 'turn.snapshot.created' && event.snapshot.contextRecovery)
+        recoveryTurns.add(`${event.snapshot.turnId}:${String(event.snapshot.requestAttempt)}`);
+      if ('turnId' in event && 'requestAttempt' in event && recoveryTurns.has(`${event.turnId}:${String(event.requestAttempt)}`)) continue;
       if (event.type === 'inference.request.fingerprinted')
         inferenceByTurn.set(
           `${event.fingerprint.turnId}:${String(event.fingerprint.requestAttempt)}`,
@@ -296,58 +300,48 @@ export async function readSelectedHistorySources(
     entries.push(entry);
     ids.add(id);
   };
-  for (const source of previous ? [] : (contextWindow?.selection.retained ?? [])) {
+  const recoveryGroups = new Map<string, boolean>();
+  const appendSource = async (source: import('../history/contracts.js').HistorySourceRef, metadata?: import('../history/contracts.js').HistorySourceMetadata) => {
+    metadata ??= await history.metadata(source, cut);
+    if (!metadata) throw new Error('Committed context source is unavailable at its history cut.');
+    if (metadata.exchangeId) {
+      let recovery = recoveryGroups.get(metadata.exchangeId);
+      if (recovery === undefined) {
+        const exchange = await history.exchangeMetadata(source, cut);
+        recovery = exchange.items.some(item => item.contextRecovery);
+        if (exchange.coverage !== 'complete' && !recovery)
+          throw new ContextSourceCapacityError(cut, { unit: 'records', limit: 1000, observedAtLeast: 1001 }, source);
+        if (recoveryGroups.size >= 1000) {
+          const first = recoveryGroups.keys().next().value;
+          if (first !== undefined) recoveryGroups.delete(first);
+        }
+        recoveryGroups.set(metadata.exchangeId, recovery);
+      }
+      if (recovery) return;
+    }
     let entry;
     try {
       entry = await history.resolve(source, cut, Math.max(1, SELECTED_SOURCE_LIMITS.bytes - bytes));
     } catch (error) {
       if (!(error instanceof HistorySourceTooLargeError)) throw error;
-      throw new ContextSourceCapacityError(
-        cut,
-        {
-          unit: 'bytes',
-          limit: SELECTED_SOURCE_LIMITS.bytes,
-          observedAtLeast: Math.max(SELECTED_SOURCE_LIMITS.bytes + 1, bytes + error.bytes)
-        },
-        source
-      );
+      throw new ContextSourceCapacityError(cut, {
+        unit: 'bytes', limit: SELECTED_SOURCE_LIMITS.bytes,
+        observedAtLeast: Math.max(SELECTED_SOURCE_LIMITS.bytes + 1, bytes + error.bytes)
+      }, source);
     }
     if (!entry) throw new Error('Committed context source is unavailable at its history cut.');
     append(entry);
-  }
+  };
+  for (const source of previous ? [] : (contextWindow?.selection.retained ?? []))
+    await appendSource(source);
   let cursor: string | undefined;
   do {
-    if (bytes >= SELECTED_SOURCE_LIMITS.bytes)
-      throw new ContextSourceCapacityError(cut, {
-        unit: 'bytes',
-        limit: SELECTED_SOURCE_LIMITS.bytes,
-        observedAtLeast: bytes + 1
-      });
-    const page = await history.page({
+    const page = await history.metadataPage({
       cut,
-      ...(previous
-        ? { after: previous.value.cut }
-        : contextWindow
-          ? { after: contextWindow.historyPosition }
-          : {}),
-      ...(cursor ? { cursor } : {}),
-      limit: 1000,
-      maxBytes: SELECTED_SOURCE_LIMITS.bytes - bytes
+      ...(previous ? { after: previous.value.cut } : contextWindow ? { after: contextWindow.historyPosition } : {}),
+      ...(cursor ? { cursor } : {}), limit: 1000
     });
-    const unread = page.unread?.[0];
-    if (unread)
-      throw new ContextSourceCapacityError(
-        cut,
-        unread.records
-          ? { unit: 'records', limit: 1000, observedAtLeast: unread.records }
-          : {
-              unit: 'bytes',
-              limit: SELECTED_SOURCE_LIMITS.bytes,
-              observedAtLeast: Math.max(SELECTED_SOURCE_LIMITS.bytes + 1, bytes + unread.bytes)
-            },
-        unread.source
-      );
-    for (const entry of page.entries) append(entry);
+    for (const item of page.items) await appendSource(item.source, item);
     cursor = page.cursor;
   } while (cursor);
   const result = Object.freeze({
@@ -368,6 +362,7 @@ export async function replaySourceEntries(
   portableSources: ReadonlySet<string> = new Set(),
   currentRunId?: string
 ): Promise<number> {
+  prior = applicationHistory(prior);
   let toolResults = 0;
   const boundResponse = [...prior]
     .reverse()
@@ -673,4 +668,12 @@ export async function assertPortableHistoryCompatibility(input: {
     model: input.profile.id,
     messages: window.priorMessagesFor(input.profile).messages
   });
+}
+
+/** Recovery control exchanges remain recorded originals, but are never domain continuation. */
+function applicationHistory(entries: readonly SessionBranchEntry[]): readonly SessionBranchEntry[] {
+  const recovery = new Set(entries.flatMap((entry) => entry.type === 'assistant' && entry.contextRecovery
+    ? [`${entry.runId}:${entry.turnId}:${String(entry.requestAttempt)}`] : []));
+  return entries.filter((entry) => !('runId' in entry && 'turnId' in entry && 'requestAttempt' in entry &&
+    recovery.has(`${entry.runId}:${entry.turnId}:${String(entry.requestAttempt)}`)));
 }

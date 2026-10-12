@@ -122,6 +122,7 @@ export type SessionAssistantEntry = BaseSessionEntry &
   AgentTurnIdentity &
   Readonly<{
     readonly type: 'assistant';
+    readonly contextRecovery?: true;
     readonly inferenceInput?: ProtectedArtifactRef;
     readonly reasoning?: string;
     readonly reasoningSummary?: string;
@@ -381,6 +382,7 @@ export interface SessionReplayState {
 
 /** Rebuildable branch membership and source pointers; no historical bodies. */
 export interface SessionSourceMetadata {
+  readonly context: Omit<import('../history/contracts.js').HistorySourceMetadata, 'source' | 'sourceBytes'>;
   readonly timestamp: string;
   readonly toolName?: string;
   readonly identity: string;
@@ -404,6 +406,7 @@ export interface SessionSourceSnapshot {
     at(index: number): SessionSourceMetadata | undefined;
   };
   readonly index: {
+    exchange(exchangeId: string): Iterable<SessionSourceMetadata>;
     readonly byId: Pick<ReadonlyMap<string, SessionSourceMetadata>, 'get' | 'has'>;
     readonly bySource: Pick<ReadonlyMap<string, SessionSourceMetadata>, 'get'>;
     readonly byIdentity: Pick<ReadonlyMap<string, SessionSourceMetadata>, 'get'>;
@@ -468,6 +471,7 @@ export interface SessionRepository {
       reasoningSummary?: string;
       output?: readonly ModelOutputItem[];
       completeness?: SessionAssistantEntry['completeness'];
+      contextRecovery?: true;
       inferenceInput?: ProtectedArtifactRef;
       source?: import('../history/contracts.js').HistoryEventSource;
     }
@@ -523,6 +527,7 @@ export interface SessionRepository {
       | { readonly state: 'failed'; readonly errorMessage: string }
   ): Promise<void>;
   loadPendingSubmissions(session: SessionDescriptor): Promise<readonly SessionPendingSubmission[]>;
+  pendingSubmissionSummaries(session: SessionDescriptor): Promise<readonly Pick<SessionPendingSubmission, 'runId' | 'submissionId' | 'state'>[]>;
   updateQueuedSubmission(
     session: SessionDescriptor,
     submissionId: string,

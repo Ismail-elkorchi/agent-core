@@ -1,5 +1,5 @@
 import type { JsonObject } from '@agent-core/json';
-import type { HistorySourceCut, HistorySourceRef } from '../history/contracts.js';
+import type { HistorySourceCut, HistorySourceRef, HistorySourceMetadata } from '../history/contracts.js';
 import type { WorkingStateChange } from '../session/working-state.js';
 
 export interface ContextSelection {
@@ -49,6 +49,7 @@ export interface ContextTransitionCommit {
   readonly transition: ContextTransitionRecord;
 }
 export interface ContextTransitionRequest {
+  readonly expectedCut?: HistorySourceCut | undefined;
   readonly workingState?: WorkingStateChange | undefined;
   readonly expectedWorkingStateRevisionId?: string | null | undefined;
   readonly toolInvocation?:
@@ -62,4 +63,25 @@ export interface ContextTransitionRequest {
   readonly idempotencyKey: string;
   readonly selection: ContextSelection;
   readonly reason: string;
+}
+
+/** One bounded inventory page; group facts never replace transition validation. */
+export interface ContextSourceManifest {
+  readonly status: 'available';
+  readonly cut: HistorySourceCut;
+  readonly offset: number;
+  readonly items: readonly {
+    readonly source: HistorySourceRef;
+    readonly type: HistorySourceMetadata['type'];
+    readonly description: string;
+    readonly sourceBytes: number;
+    readonly group: {
+      readonly id: string;
+      readonly prefixBound: boolean | 'unknown';
+      readonly release: 'requires_validation' | 'protected' | 'unfinished_exchange';
+    };
+  }[];
+  readonly coverage: 'complete' | 'partial';
+  readonly cursor?: string;
+  readonly releaseMeaning: string;
 }

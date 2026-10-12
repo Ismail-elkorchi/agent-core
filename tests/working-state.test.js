@@ -100,15 +100,20 @@ for (const kind of ['memory', 'jsonl']) {
   test(`${kind}: forks inherit understanding at the selected historical point`, async (t) => {
     const f = await fixture(t, kind);
     await f.update('old', null, 'Original constraints');
-    const point = await f.context.request({
+    const point = await f.context.transition({
+      expectedWindowId: (await f.context.inspect()).window?.windowId ?? null,
+      expectedSourceRevision: (await f.context.history.capture()).sourceRevision,
+      selection: { strategy: 'sources', retained: await f.context.protectedSources() },
+
       idempotencyKey: 'point',
       reason: 'Historical boundary'
+
     });
     await f.update('later', 'old', 'Later interpretation');
     const laterCut = await f.history.capture();
-    await f.sessions.branchFrom(f.session, point.entry.id, 'Historical fork');
+    await f.sessions.branchFrom(f.session, point.id, 'Historical fork');
     const childCut = await f.history.capture();
-    const inheritedCut = point.entry.window.historyPosition;
+    const inheritedCut = point.window.historyPosition;
     assert.notEqual(childCut.branchId, inheritedCut.branchId);
     assert.equal(await f.history.extendsCut(inheritedCut, childCut), true);
     const page = await f.history.page({ after: inheritedCut, cut: childCut, limit: 10 });
@@ -130,25 +135,35 @@ for (const kind of ['memory', 'jsonl']) {
     const replay = await f.sessions.loadReplayState(f.session);
     assert.equal(replay.workingState.id, 'child');
     assert.ok(!replay.branch.some((x) => x.id === 'later'));
-    const nestedPoint = await f.context.request({
+    const nestedPoint = await f.context.transition({
+      expectedWindowId: (await f.context.inspect()).window?.windowId ?? null,
+      expectedSourceRevision: (await f.context.history.capture()).sourceRevision,
+      selection: { strategy: 'sources', retained: await f.context.protectedSources() },
+
       idempotencyKey: 'nested-point', reason: 'Nested historical boundary'
+
     });
-    await f.sessions.branchFrom(f.session, nestedPoint.entry.id, 'Nested fork');
+    await f.sessions.branchFrom(f.session, nestedPoint.id, 'Nested fork');
     const repository = kind === 'jsonl'
       ? new JsonlSessionRepository(path.join(f.root, 'sessions')) : f.sessions;
     const reopened = new HistoryReader({ repository, session: f.session, artifacts: f.artifacts });
     assert.equal(await reopened.extendsCut(inheritedCut, await reopened.capture()), true);
     assert.ok((await reopened.page({ after: inheritedCut })).entries.length > 0);
     assert.equal((await reopened.selectedContext(await reopened.capture())).windowId,
-      nestedPoint.entry.window.windowId);
+      nestedPoint.window.windowId);
   });
 
   test(`${kind}: state and renewed window publish together only after admission`, async (t) => {
     const f = await fixture(t, kind);
     await f.update('old', null, 'Keep constraints');
-    const previous = await f.context.request({
+    const previous = await f.context.transition({
+      expectedWindowId: (await f.context.inspect()).window?.windowId ?? null,
+      expectedSourceRevision: (await f.context.history.capture()).sourceRevision,
+      selection: { strategy: 'sources', retained: await f.context.protectedSources() },
+
       idempotencyKey: 'old-window',
       reason: 'Initial window'
+
     });
     const candidate = await f.context.stageWorkingState({
       id: 'renewed',
@@ -157,7 +172,7 @@ for (const kind of ['memory', 'jsonl']) {
       text: 'Keep constraints; correction confirmed'
     });
     const request = {
-      expectedWindowId: previous.entry.window.windowId,
+      expectedWindowId: previous.window.windowId,
       idempotencyKey: 'renew',
       selection: { strategy: 'sources', retained: [] },
       reason: 'Renewal'
@@ -171,7 +186,7 @@ for (const kind of ['memory', 'jsonl']) {
       /Rejected next request/
     );
     assert.equal((await f.context.workingState()).revision.id, 'old');
-    assert.equal((await f.context.inspect()).window.windowId, previous.entry.window.windowId);
+    assert.equal((await f.context.inspect()).window.windowId, previous.window.windowId);
     const committed = await f.context.transition({ ...request, workingState: candidate }, {
       admit: async (input) => {
         assert.equal(input.workingState.text, 'Keep constraints; correction confirmed');
@@ -200,9 +215,14 @@ for (const kind of ['memory', 'jsonl']) {
       text: 'Keep constraints; correction confirmed'
     });
     assert.equal(unchanged.status, 'unchanged');
-    await f.context.request({
+    await f.context.transition({
+      expectedWindowId: (await f.context.inspect()).window?.windowId ?? null,
+      expectedSourceRevision: (await f.context.history.capture()).sourceRevision,
+      selection: { strategy: 'sources', retained: await f.context.protectedSources() },
+
       idempotencyKey: 'unchanged-window',
       reason: 'Drop unnecessary originals'
+
     });
     assert.equal((await f.context.workingState()).revision.id, 'renewed');
   });
@@ -382,9 +402,14 @@ for (const kind of ['memory', 'jsonl']) {
   test(`${kind}: a fork during artifact storage cannot publish an authorized parent update on the child`, async (t) => {
     const f = await fixture(t, kind);
     await f.update('parent', null, 'Parent understanding');
-    const branchPoint = await f.context.request({
+    const branchPoint = await f.context.transition({
+      expectedWindowId: (await f.context.inspect()).window?.windowId ?? null,
+      expectedSourceRevision: (await f.context.history.capture()).sourceRevision,
+      selection: { strategy: 'sources', retained: await f.context.protectedSources() },
+
       idempotencyKey: 'stable-branch-point',
       reason: 'Stable boundary'
+
     });
     const stored = Promise.withResolvers();
     const release = Promise.withResolvers();
@@ -401,7 +426,7 @@ for (const kind of ['memory', 'jsonl']) {
       'Unauthorized child understanding'
     );
     await stored.promise;
-    await f.sessions.branchFrom(f.session, branchPoint.entry.id, 'New child');
+    await f.sessions.branchFrom(f.session, branchPoint.id, 'New child');
     release.resolve();
     assert.equal((await update).status, 'conflict');
     assert.equal((await f.context.workingState()).revision.id, 'parent');

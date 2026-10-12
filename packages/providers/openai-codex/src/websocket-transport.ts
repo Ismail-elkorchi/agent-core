@@ -87,11 +87,17 @@ export function defaultCodexWebSocketFactory(url: string, options: CodexWebSocke
     };
     const cleanup = () => {
       options.signal?.removeEventListener('abort', abort);
+      socket.removeEventListener('open', cleanup);
+      socket.removeEventListener('close', cleanup);
+      socket.removeEventListener('error', cleanup);
     };
     if (options.signal.aborted) {
       abort();
     } else {
       options.signal.addEventListener('abort', abort, { once: true });
+      // The signal owns connection establishment only. Once open, the active
+      // request reader owns cancellation; a completed request cannot close a reused socket.
+      socket.addEventListener('open', cleanup, { once: true });
       socket.addEventListener('close', cleanup, { once: true });
       socket.addEventListener('error', cleanup, { once: true });
     }

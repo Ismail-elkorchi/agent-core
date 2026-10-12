@@ -1,3 +1,4 @@
+import { decodeContextAdmissionConflict } from './run/context-admission.js';
 import { validatePublicArtifactRef } from '@agent-core/persistence';
 import {
   decodeStoredToolObservation,
@@ -305,6 +306,8 @@ export type AgentEvent =
   | ({ readonly type: 'assistant.started' } & AgentTurnIdentity)
   | ({
       readonly type: 'assistant.ended';
+      readonly contextRecovery?: true;
+      readonly nativePrefixBound?: true;
       readonly content: string;
       readonly reasoning?: string;
       readonly reasoningSummary?: string;
@@ -313,6 +316,7 @@ export type AgentEvent =
     } & AgentTurnIdentity)
   | ({
       readonly type: 'assistant.interrupted';
+      readonly contextRecovery?: true;
       readonly content: string;
       readonly modelOutput: AgentModelOutput;
       readonly reasoningSummary?: string;
@@ -419,6 +423,12 @@ export type AgentEvent =
 export type AgentAuditEvent = Exclude<AgentEvent, { readonly type: 'run.state.transitioned' }>;
 
 export type AgentProgressEvent =
+  | {
+      readonly type: 'context.transition.rejected';
+      readonly requestId: string;
+      readonly idempotencyKey: string;
+      readonly message: string;
+    }
   | ({
       readonly type: 'tool.observation.unavailable';
       readonly toolName: string;
@@ -479,6 +489,8 @@ export type AgentProgressEvent =
     } & AgentToolCallIdentity)
   | ({
       readonly type: 'assistant.ended';
+      readonly contextRecovery?: true;
+      readonly nativePrefixBound?: true;
       readonly content: string;
       readonly reasoning?: string;
       readonly reasoningSummary?: string;
@@ -487,6 +499,7 @@ export type AgentProgressEvent =
     } & AgentTurnIdentity)
   | ({
       readonly type: 'assistant.interrupted';
+      readonly contextRecovery?: true;
       readonly content: string;
       readonly modelOutput: AgentModelOutput;
       readonly reasoningSummary?: string;
@@ -522,11 +535,37 @@ export type AgentProgressEvent =
     };
 
 export const agentEventCodec: EventCodec<AgentEvent> = {
+  metadataIndexes: [
+    { field: 'exchangeId' },
+    { type: 'turn.snapshot.created', metadata: { contextRecovery: 'true' } }
+  ],
   metadata: (event) => {
+    const exchange = 'turnId' in event && 'requestAttempt' in event
+      ? { exchangeId: `assistant:${event.turnId}:${String(event.requestAttempt)}:ended` }
+      : {};
     switch (event.type) {
-      case 'tool.started': return { toolName: event.input.name };
-      case 'tool.ended':
-      case 'observation.record.created': return { toolName: event.toolName };
+      case 'assistant.ended':
+      case 'assistant.interrupted': return {
+        ...exchange, ...('nativePrefixBound' in event ? { prefixBound: 'true' } : {}), ...('contextRecovery' in event ? { contextRecovery: 'true' } : {}), sourceType: 'assistant', expectedCalls: String('toolCalls' in event ? event.toolCalls.length : 0), description: event.content.slice(0, 200),
+        identity: `assistant:${event.turnId}:${String(event.requestAttempt)}:${event.modelOutput.status}`
+      };
+      case 'input.steering.accepted': return {
+        sourceType: 'steering', description: event.content.slice(0, 200),
+        identity: `steering:${event.deliveryId}`
+      };
+      case 'tool.started': return {
+        ...exchange, sourceType: 'tool_call', toolName: event.input.name,
+        description: event.input.name, callIndex: String(event.callIndex), toolBatchId: event.toolBatchId,
+        identity: `tool_call:${event.toolBatchId}:${String(event.callIndex)}`
+      };
+      case 'tool.ended': return {
+        ...exchange, sourceType: 'observation', toolName: event.toolName,
+        description: `${event.toolName}: ${event.observation.summary}`.slice(0, 200),
+        callIndex: String(event.callIndex), toolBatchId: event.toolBatchId,
+        identity: `observation:${event.turnId}:${String(event.requestAttempt)}:${event.toolBatchId}:${String(event.callIndex)}:${String(event.toolAttempt)}`
+      };
+      case 'observation.record.created': return { ...exchange, toolName: event.toolName };
+      case 'turn.snapshot.created': return event.snapshot.contextRecovery ? { contextRecovery: 'true', ...(event.snapshot.contextRecovery.recoveryBoundary ? { recoveryBoundary: event.snapshot.contextRecovery.recoveryBoundary } : {}), exchangeId: `assistant:${event.snapshot.turnId}:${String(event.snapshot.requestAttempt)}:ended` } : {};
       default: return {};
     }
   },
@@ -840,7 +879,11 @@ const AGENT_EVENT_DECODERS = {
     });
   },
   'assistant.ended': (value) => {
+    if ((value.contextRecovery !== undefined && value.contextRecovery !== true) || (value.nativePrefixBound !== undefined && value.nativePrefixBound !== true))
+      throw malformed('Invalid assistant recovery marker');
     exact(value, [
+      'contextRecovery',
+      'nativePrefixBound',
       'type',
       ...TURN_KEYS,
       'content',
@@ -860,6 +903,8 @@ const AGENT_EVENT_DECODERS = {
     );
     return Object.freeze({
       type: 'assistant.ended',
+      ...(value.contextRecovery === true ? { contextRecovery: true as const } : {}),
+      ...(value.nativePrefixBound === true ? { nativePrefixBound: true as const } : {}),
       ...identity,
       content: requiredStringValue(value.content, 'content'),
       ...decodeReasoningOutput(value),
@@ -868,7 +913,9 @@ const AGENT_EVENT_DECODERS = {
     });
   },
   'assistant.interrupted': (value) => {
+    if (value.contextRecovery !== undefined && value.contextRecovery !== true) throw malformed('Invalid assistant recovery marker');
     exact(value, [
+      'contextRecovery',
       'type',
       ...TURN_KEYS,
       'content',
@@ -887,6 +934,7 @@ const AGENT_EVENT_DECODERS = {
     const diagnostic = optionalDiagnostic(value.diagnostic);
     return Object.freeze({
       type: 'assistant.interrupted',
+      ...(value.contextRecovery === true ? { contextRecovery: true as const } : {}),
       ...identity,
       content: requiredStringValue(value.content, 'content'),
       ...decodeReasoningOutput(value),
@@ -1276,6 +1324,7 @@ function decodeRunConfiguration(value: JsonValue | undefined): AgentRunConfigura
 function decodeTurnSnapshot(value: JsonValue | undefined): AgentTurnSnapshotRecord {
   const object = requiredObject(value, 'snapshot');
   exact(object, [
+    'contextRecovery',
     'turnIndex',
     'turnId',
     'requestAttempt',
@@ -1306,6 +1355,7 @@ function decodeTurnSnapshot(value: JsonValue | undefined): AgentTurnSnapshotReco
     provider: requiredString(object.provider, 'snapshot.provider'),
     model: requiredString(object.model, 'snapshot.model'),
     profileHash: requiredString(object.profileHash, 'snapshot.profileHash'),
+    ...(object.contextRecovery === undefined ? {} : { contextRecovery: decodeContextAdmissionConflict(object.contextRecovery) }),
     continuationEligible: requiredBoolean(
       object.continuationEligible,
       'snapshot.continuationEligible'

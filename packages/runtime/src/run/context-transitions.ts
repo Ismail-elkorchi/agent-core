@@ -14,6 +14,7 @@ interface PendingTransition {
 export class RunContextTransitions {
   private readonly requests = new Map<string, PendingTransition>();
   private writes: Promise<void> = Promise.resolve();
+  private closed = false;
   constructor(
     private readonly options: {
       readonly runId: string;
@@ -63,6 +64,7 @@ export class RunContextTransitions {
     const request = contextTransitionRequestSchema.parse(input);
     const requestId = `context-${hashJson(request.idempotencyKey)}`;
     const action = this.writes.then(async () => {
+      if (this.closed) throw new Error('The run has ended; refresh context before applying a selection.');
       const recorded = await this.options.events.referenceByKey(
         this.options.runId,
         `${this.options.runId}:${requestId}:requested`
@@ -93,13 +95,32 @@ export class RunContextTransitions {
     await action;
     return Object.freeze({ requestId });
   }
+  async closePending(
+    message: string,
+    rejected?: (requestId: string, message: string, idempotencyKey: string) => void | Promise<void>
+  ): Promise<void> {
+    const action = this.writes.then(async () => {
+      this.closed = true;
+      for (const pending of this.requests.values()) {
+        await this.options.append(
+          { type: 'context.transition.rejected', requestId: pending.requestId, message },
+          `${this.options.runId}:${pending.requestId}:rejected`
+        );
+        this.requests.delete(pending.requestId);
+        await rejected?.(pending.requestId, message, pending.requested.idempotencyKey);
+      }
+    });
+    this.writes = action.catch(() => undefined);
+    await action;
+  }
   async drain(input: {
     readonly context: ContextService;
     readonly admit: (request: ContextTransitionRequest) => Promise<ContextTransitionRequest>;
     readonly validate?: ContextAdmission;
     readonly committed: (entry: SessionContextTransitionEntry) => Promise<void>;
-    readonly rejected?: (requestId: string, message: string) => void;
+    readonly rejected?: (requestId: string, message: string, idempotencyKey: string) => void | Promise<void>;
     readonly signal: AbortSignal;
+    readonly preserveFailure?: (error: unknown) => void;
   }): Promise<void> {
     await this.writes;
     for (const pending of this.requests.values()) {
@@ -126,6 +147,7 @@ export class RunContextTransitions {
         });
       } catch (cause) {
         input.signal.throwIfAborted();
+        input.preserveFailure?.(cause);
         // A committed session window wins even when its original receipt was lost.
         const known = await input.context.findTransition(pending.requested.idempotencyKey);
         if (known) entry = known;
@@ -139,9 +161,10 @@ export class RunContextTransitions {
             `${this.options.runId}:${pending.requestId}:rejected`
           );
           this.requests.delete(pending.requestId);
-          input.rejected?.(
+          await input.rejected?.(
             pending.requestId,
-            cause instanceof Error ? cause.message : String(cause)
+            cause instanceof Error ? cause.message : String(cause),
+            pending.requested.idempotencyKey
           );
           continue;
         }

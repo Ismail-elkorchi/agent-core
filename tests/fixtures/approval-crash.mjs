@@ -48,6 +48,7 @@ const events =
           return result;
         },
         readRange: (...args) => storedEvents.readRange(...args),
+        readMetadataRange: (...args) => storedEvents.readMetadataRange(...args),
         readReference: (...args) => storedEvents.readReference(...args),
         referenceByKey: (...args) => storedEvents.referenceByKey(...args),
         latestReferenceOfType: (...args) => storedEvents.latestReferenceOfType(...args),

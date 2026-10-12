@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { InferenceService } from '@agent-core/runtime';
+import { InferenceService, ContextAdmissionError } from '@agent-core/runtime';
 import { accountModelRequest, assertRequestAccountingFits, ModelContractError } from '@agent-core/model';
 
 const profile = Object.freeze({
@@ -53,7 +53,7 @@ test('inference admission rejects an oversized logical request before provider i
   const service = InferenceService.inMemory({ provider });
   await assert.rejects(
     service.invoke({ ownerId: 'test', invocationId: 'oversized', purpose: 'admission', request: { maxOutputTokens: 10, model: profile.id, messages: [{ role: 'user', content: 'x'.repeat(400) }] }, profile }),
-    error => error instanceof ModelContractError
+    error => error instanceof ContextAdmissionError && error.cause instanceof ModelContractError
   );
   assert.equal(calls, 0);
 });

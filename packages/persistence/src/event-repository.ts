@@ -17,7 +17,14 @@ export interface RuntimeCodec<T> {
 }
 
 /** Small, rebuildable routing facts derived from validated domain events. */
+export type EventMetadataIndex = Readonly<{ type?: string }> & (
+  | Readonly<{ field: string }>
+  | Readonly<{ metadata: Readonly<Record<string, string>> }>
+);
+
 export interface EventCodec<T extends TypedEvent> extends RuntimeCodec<T> {
+  /** Small, declared equality indexes over routing facts, never event bodies. */
+  readonly metadataIndexes?: readonly EventMetadataIndex[];
   metadata?(value: T): Readonly<Record<string, string>>;
 }
 
@@ -100,6 +107,10 @@ export interface EventReference {
   readonly sequence: number;
   readonly hash: string;
 }
+export interface EventIndexReadOptions {
+  /** Never hydrate ledger bodies to validate or recover a derived index. */
+  readonly metadataOnly?: boolean;
+}
 export interface EventRangeRequest {
   readonly afterSequence?: number;
   readonly through?: {
@@ -114,8 +125,16 @@ export interface EventRangeRequest {
   readonly afterTime?: string;
   readonly beforeTime?: string;
 }
-export interface EventRangePage<TEvent extends TypedEvent> {
-  readonly records: readonly EventEnvelope<TEvent>[];
+export interface EventSourceMetadata {
+  readonly reference: EventReference;
+  readonly type: string;
+  readonly timestamp: string;
+  /** Bytes in the original stored source, including its record delimiter. */
+  readonly bytes: number;
+  readonly metadata: Readonly<Record<string, string>>;
+}
+export interface EventPage<T> {
+  readonly records: readonly T[];
   readonly tail: EventLedgerTail;
   /** Last scanned sequence; use as the next request's afterSequence. */
   readonly nextSequence: number;
@@ -124,6 +143,10 @@ export interface EventRangePage<TEvent extends TypedEvent> {
   readonly bytes: number;
   readonly oversized?: Readonly<{ reference: EventReference; bytes: number }>;
 }
+
+export type EventRangePage<TEvent extends TypedEvent> = EventPage<EventEnvelope<TEvent>>;
+/** Page bytes count serialized metadata records, never original event payloads. */
+export type EventMetadataPage = EventPage<EventSourceMetadata>;
 
 export function eventRangeBounds(request: EventRangeRequest): {
   after: number;
@@ -201,13 +224,14 @@ export interface EventRepository<TEvent extends TypedEvent> {
     event: TEvent,
     options: ConditionalEventAppendOptions
   ): Promise<ConditionalEventAppendResult>;
-  tail(runId: string): Promise<EventLedgerTail>;
+  tail(runId: string, options?: EventIndexReadOptions): Promise<EventLedgerTail>;
   latest(runId: string): Promise<EventEnvelope<TEvent> | undefined>;
   latestOfType(runId: string, type: TEvent['type']): Promise<EventEnvelope<TEvent> | undefined>;
-  latestReferenceOfType(runId: string, type: TEvent['type']): Promise<EventReference | undefined>;
-  referenceByKey(runId: string, idempotencyKey: string): Promise<EventReference | undefined>;
+  latestReferenceOfType(runId: string, type: TEvent['type'], options?: EventIndexReadOptions): Promise<EventReference | undefined>;
+  referenceByKey(runId: string, idempotencyKey: string, options?: EventIndexReadOptions): Promise<EventReference | undefined>;
   readReference(reference: EventReference): Promise<EventEnvelope<TEvent>>;
   readRange(runId: string, request?: EventRangeRequest): Promise<EventRangePage<TEvent>>;
+  readMetadataRange(runId: string, request?: EventRangeRequest): Promise<EventMetadataPage>;
   read(runId: string): AsyncIterable<EventEnvelope<TEvent>>;
   listRunIds(): Promise<readonly string[]>;
   verifyIntegrity(runId: string): Promise<LedgerIntegrityReport>;
@@ -243,14 +267,27 @@ export class PersistenceConflictError extends Error {
   }
 }
 
+/** Metadata-only reads cannot repair derived indexes by hydrating event bodies. */
+export class PersistenceIndexRecoveryRequiredError extends PersistenceConflictError {
+  readonly code = 'index_recovery_required';
+  constructor(readonly runId: string) {
+    super(`Event metadata index for ${runId} is unavailable; explicit index recovery is required.`);
+    this.name = 'PersistenceIndexRecoveryRequiredError';
+  }
+}
+
 export class InMemoryEventRepository<TEvent extends TypedEvent> implements EventRepository<TEvent> {
   private readonly records = new Map<string, EncodedEnvelope[]>();
   private readonly byKey = new Map<string, Map<string, EncodedEnvelope>>();
   private readonly latestByType = new Map<string, Map<string, EncodedEnvelope>>();
-  private readonly routing = new WeakMap<EncodedEnvelope, Readonly<Record<string, string>>>();
+  private readonly routing = new WeakMap<EncodedEnvelope, EventSourceMetadata>();
+  private readonly metadataRoutes = new Map<string, Map<string, number[]>>();
   private readonly decoded = new WeakMap<EncodedEnvelope, TEvent>();
   private queue: Promise<void> = Promise.resolve();
-  constructor(private readonly codec: EventCodec<TEvent>) {}
+  private readonly metadataIndexes: readonly EventMetadataIndex[];
+  constructor(private readonly codec: EventCodec<TEvent>) {
+    this.metadataIndexes = ownEventMetadataIndexes(codec.metadataIndexes);
+  }
 
   append(
     runId: string,
@@ -375,7 +412,8 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
     return operation;
   }
 
-  tail(runId: string): Promise<EventLedgerTail> {
+  tail(runId: string, _options?: EventIndexReadOptions): Promise<EventLedgerTail> {
+    void _options;
     const operation = this.queue.then(() => {
       assertIdentifier(runId, 'runId');
       return tailFromEncoded(this.records.get(runId)?.at(-1));
@@ -420,8 +458,10 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
 
   async latestReferenceOfType(
     runId: string,
-    type: TEvent['type']
+    type: TEvent['type'],
+    _options?: EventIndexReadOptions
   ): Promise<EventReference | undefined> {
+    void _options;
     assertIdentifier(runId, 'runId');
     assertIdentifier(type, 'type');
     await this.queue;
@@ -436,7 +476,8 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
       : undefined;
   }
 
-  async referenceByKey(runId: string, idempotencyKey: string): Promise<EventReference | undefined> {
+  async referenceByKey(runId: string, idempotencyKey: string, _options?: EventIndexReadOptions): Promise<EventReference | undefined> {
+    void _options;
     assertIdentifier(runId, 'runId');
     assertIdentifier(idempotencyKey, 'idempotencyKey');
     await this.queue;
@@ -461,7 +502,21 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
     return envelopeFromEncoded(record, this.domainEvent(record));
   }
 
-  async readRange(runId: string, request: EventRangeRequest = {}): Promise<EventRangePage<TEvent>> {
+  readRange(runId: string, request: EventRangeRequest = {}): Promise<EventRangePage<TEvent>> {
+    return this.readRangePage(runId, request, false, (record) =>
+      envelopeFromEncoded(record, this.domainEvent(record)));
+  }
+
+  readMetadataRange(runId: string, request: EventRangeRequest = {}): Promise<EventMetadataPage> {
+    return this.readRangePage(runId, request, true, (_record, source) => source);
+  }
+
+  private async readRangePage<T>(
+    runId: string,
+    request: EventRangeRequest,
+    metadataOnly: boolean,
+    project: (record: EncodedEnvelope, source: EventSourceMetadata) => T
+  ): Promise<EventPage<T>> {
     assertIdentifier(runId, 'runId');
     const { after, limit, maxBytes, through, types, metadata, afterTime, beforeTime } = eventRangeBounds(request);
     await this.queue;
@@ -480,21 +535,28 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
         'Event range boundary is missing or its identity changed.'
       );
     if (after > tail.sequence) throw new RangeError('Event range starts beyond its boundary.');
-    const records: EventEnvelope<TEvent>[] = [];
+    const records: T[] = [];
     let nextSequence = after,
       scanned = 0,
       bytes = 0;
+    const routeKey = metadataOnly ? eventMetadataRouteKey(this.metadataIndexes, types, metadata) : undefined;
+    const candidates = routeKey ? this.metadataRoutes.get(runId)?.get(routeKey) ?? [] : undefined;
+    let candidateAt = candidates ? firstSequenceAfter(candidates, after) : 0;
     let oversized: EventRangePage<TEvent>['oversized'];
     while (nextSequence < tail.sequence && scanned < limit) {
-      const record = stored[nextSequence + 1];
+      const sequence = candidates ? candidates[candidateAt++] : nextSequence + 1;
+      if (sequence === undefined || sequence > tail.sequence) { nextSequence = tail.sequence; break; }
+      const record = stored[sequence];
       if (!record) throw new PersistenceConflictError('Event sequence is missing.');
+      const source = this.routing.get(record);
+      if (!source) throw new PersistenceConflictError('Event routing metadata is missing.');
       if (
         (!types || types.some(type => type === record.event.type)) &&
         (!afterTime || Date.parse(record.timestamp) >= Date.parse(afterTime)) &&
         (!beforeTime || Date.parse(record.timestamp) < Date.parse(beforeTime)) &&
-        matchesEventMetadata(this.routing.get(record) ?? {}, metadata)
+        matchesEventMetadata(source.metadata, metadata)
       ) {
-        const size = Buffer.byteLength(canonicalJsonString(record)) + 1;
+        const size = metadataOnly ? Buffer.byteLength(canonicalJsonString(source)) : source.bytes;
         if (bytes + size > maxBytes) {
           if (size > maxBytes)
             oversized = {
@@ -508,10 +570,10 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
             };
           break;
         }
-        records.push(envelopeFromEncoded(record, this.domainEvent(record)));
+        records.push(project(record, source));
         bytes += size;
       }
-      nextSequence++;
+      nextSequence = sequence;
       scanned++;
     }
     return Object.freeze({
@@ -565,14 +627,27 @@ export class InMemoryEventRepository<TEvent extends TypedEvent> implements Event
   }
 
   private rememberType(runId: string, encoded: EncodedEnvelope): void {
-    this.routing.set(encoded, this.codec.metadata?.(this.domainEvent(encoded)) ?? {});
+    const type = encoded.event.type;
+    if (typeof type !== 'string') throw new TypeError('Encoded event type is invalid.');
+    this.routing.set(encoded, Object.freeze({
+      reference: Object.freeze({ runId, eventId: encoded.eventId, sequence: encoded.sequence, hash: encoded.hash }),
+      type,
+      timestamp: encoded.timestamp,
+      bytes: Buffer.byteLength(canonicalJsonString(encoded)) + 1,
+      metadata: parseEventMetadata(this.codec.metadata?.(this.domainEvent(encoded)) ?? {})
+    }));
+    for (const routeKey of eventMetadataRouteKeys(this.metadataIndexes, type, this.routing.get(encoded)?.metadata ?? {})) {
+      const routes = this.metadataRoutes.get(runId) ?? new Map<string, number[]>();
+      const sequences = routes.get(routeKey) ?? [];
+      sequences.push(encoded.sequence);
+      routes.set(routeKey, sequences);
+      this.metadataRoutes.set(runId, routes);
+    }
     if (encoded.idempotencyKey) {
       const keys = this.byKey.get(runId) ?? new Map<string, EncodedEnvelope>();
       keys.set(encoded.idempotencyKey, encoded);
       this.byKey.set(runId, keys);
     }
-    const type = encoded.event.type;
-    if (typeof type !== 'string') throw new TypeError('Encoded event type is invalid.');
     const index = this.latestByType.get(runId) ?? new Map<string, EncodedEnvelope>();
     index.set(type, encoded);
     this.latestByType.set(runId, index);
@@ -712,4 +787,68 @@ function inferActor(type: string): EventActor {
   if (type.startsWith('check.')) return 'check';
   if (type.startsWith('input.')) return 'user';
   return 'runtime';
+}
+
+/** Lower bound in an ordered derived sequence index. */
+export function firstSequenceAfter(sequences: readonly number[], after: number): number {
+  let low = 0, high = sequences.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if ((sequences[middle] ?? Infinity) <= after) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+/** Capture a small immutable index declaration at the codec boundary. */
+export function ownEventMetadataIndexes(indexes: readonly EventMetadataIndex[] = []): readonly EventMetadataIndex[] {
+  if (!Array.isArray(indexes) || indexes.length > 16) throw new TypeError('Invalid event metadata indexes.');
+  const seen = new Set<string>();
+  return Object.freeze(indexes.map((value) => {
+    const index = parseJsonObject(value, { maxTotalBytes: 16384, maxCollectionEntries: 64, maxStringBytes: 4096 });
+    if (Object.keys(index).some(key => !['type', 'field', 'metadata'].includes(key)) ||
+        (index.type !== undefined && (typeof index.type !== 'string' || !index.type.length)) ||
+        (index.field === undefined) === (index.metadata === undefined))
+      throw new TypeError('Invalid event metadata index.');
+    const key = canonicalJsonString(index);
+    if (seen.has(key)) throw new TypeError('Duplicate event metadata index.');
+    seen.add(key);
+    const type = typeof index.type === 'string' ? { type: index.type } : {};
+    if (index.field !== undefined) {
+      if (typeof index.field !== 'string' || !index.field.length) throw new TypeError('Invalid indexed metadata field.');
+      return Object.freeze({ ...type, field: index.field });
+    }
+    const metadata = parseEventMetadata(index.metadata);
+    if (!Object.keys(metadata).length) throw new TypeError('An indexed metadata predicate cannot be empty.');
+    return Object.freeze({ ...type, metadata });
+  }));
+}
+
+function metadataIndexKey(index: EventMetadataIndex, metadata: Readonly<Record<string, string>>): string | undefined {
+  if ('field' in index) {
+    const value = metadata[index.field];
+    return value === undefined ? undefined : canonicalJsonString({ index, value });
+  }
+  return matchesEventMetadata(metadata, index.metadata) ? canonicalJsonString({ index }) : undefined;
+}
+
+export function eventMetadataRouteKey(indexes: readonly EventMetadataIndex[], types?: readonly string[], metadata?: Readonly<Record<string, string>>): string | undefined {
+  for (const index of indexes) {
+    if (index.type && (types?.length !== 1 || types[0] !== index.type)) continue;
+    const key = metadataIndexKey(index, metadata ?? {});
+    if (key !== undefined) return key;
+  }
+  return undefined;
+}
+
+export function eventMetadataRouteKeys(indexes: readonly EventMetadataIndex[], type: string, metadata: Readonly<Record<string, string>>): readonly string[] {
+  return indexes.flatMap(index => {
+    if (index.type && index.type !== type) return [];
+    const key = metadataIndexKey(index, metadata);
+    return key === undefined ? [] : [key];
+  });
+}
+
+export function fixedEventMetadataRouteKeys(indexes: readonly EventMetadataIndex[]): readonly string[] {
+  return indexes.flatMap(index => 'metadata' in index ? [canonicalJsonString({ index })] : []);
 }

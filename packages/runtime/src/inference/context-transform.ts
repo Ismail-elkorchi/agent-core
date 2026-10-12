@@ -52,6 +52,11 @@ function decodeReference(value: unknown): ContextTransformReference {
     sources: Object.freeze(object.sources.map((item) => sourceSchema.parse(item)))
   });
 }
+/** Source identities represented by a committed transform; admission still verifies its artifact. */
+export function contextTransformSources(window: import('../context/contracts.js').ContextWindowRecord): readonly HistorySourceRef[] {
+  return window.selection.strategy === 'provider' ? decodeReference(window.selection.providerState).sources : [];
+}
+
 /** The committed window contains a protected artifact reference, never model-readable opaque payloads. */
 export async function readTransformedContext(input: {
   readonly view: import('../orchestration/session-replay.js').SelectedHistorySources;

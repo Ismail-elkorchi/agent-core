@@ -745,6 +745,7 @@ export class OpenAIProvider implements ModelProvider {
           part.response
         ) {
           completedResponse = part.response;
+          break;
         }
 
         const contentDelta = stringValue(part.delta);

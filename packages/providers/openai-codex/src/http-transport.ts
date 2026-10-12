@@ -157,6 +157,7 @@ export async function* streamCodexHttp(
 
       if ((eventType === 'response.completed' || eventType === 'response.incomplete') && part.response) {
         completedResponse = part.response;
+        break;
       }
 
       const contentDelta = stringValue(part.delta);

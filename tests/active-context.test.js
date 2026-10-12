@@ -116,6 +116,8 @@ for (const strategy of ['sources', 'provider']) {
                 (key) => [key, execution.invocation[key]]
               )
             ),
+            expectedCut: view.cut,
+            expectedSourceRevision: view.cut.sourceRevision,
             expectedWindowId: null,
             idempotencyKey: 'select',
             reason: 'Completed exchange is no longer needed.',

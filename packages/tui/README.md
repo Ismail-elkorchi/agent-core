@@ -26,3 +26,11 @@ Tool activities distinguish invocation completion from domain outcome. `projectP
 Prompt recall owns one search index per entry snapshot and prepares queries through the parent's replaceable effect lifecycle. `createPromptRecall`, `appendRecalledDrafts`, `updatePromptRecall`, and `receivePromptRecallQuery` return state-and-effect results: retain `result.state`, forward `result.effects` and `result.cancel`, and route `recall.query` messages back to `receivePromptRecallQuery`. Retain the recall instance ID so a closed or reopened overlay rejects late completions, and cancel `prompt-recall-query` and `recovered-drafts` when removing it. The editor remains available during preparation and after an error; query results only apply to their exact owned index and query.
 
 `conversationEntryView` shares role labels, reasoning disclosure, interrupted-output labels and tool details across applications. `responsiveStatusline` fits complete configured fields, prioritizing authority and activity. The activity clock measures display elapsed time only; runtime events remain authoritative for execution and accounting. Context inspection exposes the effective source selection, including exchanges after the last explicit transition; a fresh context uses the selected originals.
+
+External editor commands (`VISUAL`, then `EDITOR`) must remain running until all
+of their editor children have finished; use a GUI editor's `--wait` option where
+needed. Wrappers that wait for their editor are supported, but daemonizing or
+explicitly disowning processes is not. Editors inherit the real foreground
+terminal without starting a detached session. Cancellation waits for the owned
+wrapper/editor tree to exit before releasing the terminal or deleting its draft.
+POSIX cancellation requires standard `ps`; Windows uses `taskkill /T /F`.

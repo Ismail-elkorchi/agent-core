@@ -19,7 +19,7 @@ import { JsonlSessionRepository } from '@agent-core/runtime/node';
 
 async function fixture(
   t,
-  { native = true, bound = true, capacity = 100000, transformFailure, onTransform } = {}
+  { native = true, bound = true, capacity = 100000, transformFailure, onTransform, automatic = true } = {}
 ) {
   const root = await mkdtemp(path.join(tmpdir(), 'native-context-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -135,7 +135,7 @@ async function fixture(
       provider,
       model: profile.id,
       context,
-      contextRenewal: { automatic: true },
+      contextRenewal: { automatic },
       inferenceService: service,
       inferenceOwnerId: 'owner',
       maxOutputTokens: 1000,
@@ -168,6 +168,31 @@ async function fixture(
     },
     addTools() {
       extraTools = true;
+    },
+    async freshContinuation() {
+      const cut = await context.history.capture();
+      const window = await context.history.selectedContext(cut);
+      const selection = await context.freshSelection({
+        selection: await context.selectSources(cut, { retain: await context.protectedSources() }),
+        model: { provider: profile.provider, model: profile.id },
+        profile: definition,
+        cut,
+        resetId: 'explicit-test-fresh-continuation'
+      });
+      await context.transition({
+        expectedWindowId: window?.windowId ?? null,
+        expectedSourceRevision: cut.sourceRevision,
+        idempotencyKey: 'explicit-test-fresh-continuation',
+        reason: 'Explicitly choose fresh continuation while preserving accepted input.',
+        selection
+      });
+    },
+    restoreConfiguration() {
+      instructions = 'Initial authority.';
+      extraTools = false;
+    },
+    allowTransform() {
+      transformFailure = false;
     },
     noUpdates() {
       updateState = false;
@@ -524,4 +549,42 @@ for (const kind of ['openai', 'openai-codex']) {
     if (kind === 'openai') assert(JSON.stringify(successor).includes('Inspect the project.'));
     assert.equal((await service.settledRunUsage('work', 'renewed')).invocations, 2);
   });
+}
+
+for (const change of ['authority', 'tools']) {
+  for (const failure of ['automatic_disabled', 'unsupported', 'transform_failed']) {
+    test(`native ${change} conflict ${failure} preserves a resumable run`, async (t) => {
+      const f = await fixture(t, {
+        automatic: failure !== 'automatic_disabled',
+        native: failure !== 'unsupported',
+        transformFailure: failure === 'transform_failed'
+      });
+      f.noUpdates();
+      await completed(f.runtime(), 'before-conflict', 'Keep the original evidence.');
+      const originalWindow = (await f.context().inspect()).window;
+      if (change === 'authority') f.changeInstructions('Changed required authority.');
+      else f.addTools();
+      const runtime = f.runtime();
+      const blocked = await runtime.run({ runId: 'continuity-conflict', task: 'Continue accepted work.' }).result;
+      assert.equal(blocked.state, 'suspended', JSON.stringify(blocked));
+      assert.equal(blocked.reason, 'context_admission');
+      assert.equal(blocked.contextAdmission.kind, 'native_continuity');
+      assert.equal(blocked.contextAdmission.reason, failure);
+      assert.equal(blocked.terminal, undefined);
+      assert.equal(blocked.contextAdmission.inputIdentity, undefined);
+      assert.deepEqual((await f.context().inspect()).window, originalWindow);
+      const repeated = await f.runtime().resume('continuity-conflict').result;
+      assert.equal(repeated.state, 'suspended', JSON.stringify(repeated));
+      assert.equal(repeated.contextAdmission.kind, 'native_continuity');
+      if (failure === 'transform_failed') f.allowTransform();
+      else if (change === 'tools') await f.freshContinuation();
+      else f.restoreConfiguration();
+      f.reopen();
+      const resumed = await f.runtime().resume('continuity-conflict').result;
+      assert.equal(resumed.terminal?.executionStatus, 'completed', JSON.stringify(resumed));
+      const successor = f.calls.at(-1);
+      assert.equal(JSON.stringify(successor).split('Continue accepted work.').length - 1, 1);
+      assert.equal((await f.context().workingState()).revision, null);
+    });
+  }
 }

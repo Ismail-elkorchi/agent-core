@@ -100,7 +100,12 @@ async function fixture() {
 
 test('idle source selection records intent without invoking or claiming request admission', async () => {
   const state = await fixture();
-  await state.context.request({ reason: 'User selection', idempotencyKey: 'idle' });
+  await state.context.transition({
+      expectedWindowId: (await state.context.inspect()).window?.windowId ?? null,
+      expectedSourceRevision: (await state.context.history.capture()).sourceRevision,
+ selection: await state.context.selectSources(await state.history.capture(), {}),
+ reason: 'User selection', idempotencyKey: 'idle'
+    });
   assert.equal(state.requests.length, 0);
   const inspected = await state.context.inspect();
   assert.equal(inspected.window.selection.strategy, 'sources');
@@ -142,7 +147,11 @@ test('explicit selection retains original evidence and complete parallel exchang
   const cut = await state.history.capture();
   const evidence = await state.history.search({ query: 'Original evidence.', filter: { sourceType: 'observation' }, cut });
   const selection = await state.context.selectSources(cut, { retain: [evidence.items[0].source] });
-  await state.context.request({ idempotencyKey: 'evidence-only', reason: 'Use original evidence', selection });
+  await state.context.transition({
+      expectedWindowId: (await state.context.inspect()).window?.windowId ?? null,
+      expectedSourceRevision: (await state.context.history.capture()).sourceRevision,
+ idempotencyKey: 'evidence-only', reason: 'Use original evidence', selection
+    });
   const task = 'Answer from the original evidence. Do not read it again.';
   const result = await new AgentRuntime({ ...options, contextRenewal: { automatic: true } })
     .run({ task }).result;
@@ -365,7 +374,7 @@ test(
     state.setCapacity(10000000);
     const runtime = new AgentRuntime(state.options);
     for (let index = 0; index < 11; index++) {
-      const result = await runtime.run({ task: `Original ${index}: ${'x'.repeat(750000)}` }).result;
+      const result = await runtime.run({ task: `Original ${index}: ${'x'.repeat(370000)}` }).result;
       assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
     }
     const before = state.requests.length;
@@ -389,21 +398,22 @@ test(
     const blocked = await new AgentRuntime({
       ...state.options,
       context: tiny,
-      contextRenewal: { automatic: true }
+      contextRenewal: { automatic: false }
     }).resume('source-overflow').result;
     assert.equal(blocked.reason, 'context_admission', JSON.stringify(blocked));
     assert.equal(state.requests.length, before);
     const result = await new AgentRuntime({
       ...state.options,
-      contextRenewal: { automatic: true }
+      contextRenewal: { automatic: false }
     }).resume('source-overflow').result;
     assert.equal(result.reason, 'context_admission', JSON.stringify(result));
     assert.equal(state.requests.length, before);
     const inspection = await state.context.inspect();
     assert.equal(inspection.window, null);
-    assert.equal(inspection.activeSelection.status, 'unavailable');
-    assert.equal(inspection.activeSelection.conflict.kind, 'source_capacity');
-    assert.equal((await inspectTool(state.context)).selection.conflict.kind, 'source_capacity');
+    assert.equal(inspection.activeSelection.status, 'available');
+    const inventory = (await inspectTool(state.context)).selection;
+    assert.equal(inventory.status, 'available');
+    assert.ok(inventory.items.length > 0, 'Metadata remains available without hydrating oversized originals.');
     const replacement = await state.context.selectSources(inspection.cut, { retain: [] });
     assert.deepEqual(replacement.retained, await state.context.protectedSources());
     await state.context.transition({
@@ -555,14 +565,18 @@ test('model inspection pages the live selection before a window and includes its
   await new AgentRuntime(f.options).run({ task: 'Later original' }).result;
   const second = await inspectTool(f.context, { cursor: initial.selection.cursor, limit: 10, maxBytes: 4096 });
   assert.deepEqual(second.selection.cut, captured);
-  assert.equal(second.selection.total, initial.selection.total);
+  assert.equal('total' in second.selection, false);
   const full = await inspectTool(f.context);
   assert(full.selection.items.some(item => item.description.includes('Later original')));
   const candidate = full.selection.items.find(item => item.type === 'assistant');
-  assert.equal(candidate.group.release, 'available');
+  assert.equal(candidate.group.release, 'requires_validation');
   const reduced = await f.context.selectSources(full.selection.cut, { release: [candidate.source] });
   assert(!reduced.retained.some(source => source.entryId === candidate.source.entryId));
-  await f.context.request({ idempotencyKey: 'selection', reason: 'Release completed answer', selection: reduced });
+  await f.context.transition({
+      expectedWindowId: (await f.context.inspect()).window?.windowId ?? null,
+      expectedSourceRevision: (await f.context.history.capture()).sourceRevision,
+ idempotencyKey: 'selection', reason: 'Release completed answer', selection: reduced
+    });
   await new AgentRuntime(f.options).run({ task: 'Tail after committed window' }).result;
   const current = await inspectTool(f.context, { maxBytes: 16384 });
   assert(current.committedWindow.windowId);
@@ -589,7 +603,8 @@ test('inspection advertises complete exchange groups and protects the active con
   const observation = current.selection.items.find(item => item.type === 'observation');
   const exchange = current.selection.items.filter(item => item.group.id === observation.group.id);
   assert.equal(exchange.filter(item => item.type === 'observation').length, 2);
-  assert.equal(observation.group.sources, 5);
+  assert.equal(exchange.length, 5);
+  assert.equal('sources' in observation.group, false);
   const selection = await f.context.selectSources(current.selection.cut, { release: [observation.source] });
   assert(exchange.every(item => !selection.retained.some(source => source.entryId === item.source.entryId)));
   const protectedInput = current.selection.items.find(item => item.description.includes('Protected latest obligation'));
@@ -679,8 +694,10 @@ test('inspection discloses native prefix dependencies and calls announced before
     } }] });
   const presented = await inspectTool(f.context);
   assert.equal(presented.selection.items.length, 2);
-  assert(presented.selection.items.every(item => item.group.prefixBound && item.group.release === 'unfinished_exchange'));
-  assert.equal(new Set(presented.selection.items.map(item => item.group.id)).size, 1);
+  const response = presented.selection.items.find(item => item.type === 'assistant');
+  assert.equal(response.group.prefixBound, true);
+  assert.equal(response.group.release, 'unfinished_exchange');
+  assert.equal(presented.selection.items.find(item => item.type === 'input').group.release, 'protected');
   assert.doesNotMatch(JSON.stringify(presented.selection), /provider-only/);
 });
 
@@ -698,4 +715,25 @@ test('every returned manifest cursor is accepted as tool input, including large 
   assert.deepEqual(next.selection.cut, first.selection.cut);
   assert.equal(next.selection.offset, 1);
   assert.notEqual(next.selection.items[0].source.entryId, first.selection.items[0].source.entryId);
+});
+
+test('ordinary replay never hydrates a large independent recovery exchange', async () => {
+  const f = await fixture();
+  await f.sessions.appendInput(f.session, { runId: 'prior', task: 'Ordinary original requirement' });
+  const control = await f.sessions.appendAssistant(f.session, {
+    runId: 'prior', identity: { turnId: 'control', turnIndex: 1, requestAttempt: 1 },
+    contextRecovery: true, content: 'Recovery control data '.repeat(30000)
+  });
+  const originalRead = f.sessions.readBranchEntry.bind(f.sessions);
+  f.sessions.readBranchEntry = async (session, boundary, entryId) => {
+    assert.notEqual(entryId, control.id, 'ordinary replay must skip control bodies before hydration');
+    return originalRead(session, boundary, entryId);
+  };
+  const context = new ContextService({ repository: f.sessions, session: f.session,
+    artifacts: new InMemoryArtifactRepository(), history: f.history,
+    policy: { maxSourceBytes: 65536, historyRead: { history: f.history, isAvailable: () => true } } });
+  const result = await new AgentRuntime({ ...f.options, context }).run({ task: 'Continue ordinary work' }).result;
+  assert.equal(result.terminal.executionStatus, 'completed');
+  assert(f.requests.length > 0);
+  assert.doesNotMatch(JSON.stringify(f.requests), /Recovery control data/);
 });

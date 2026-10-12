@@ -194,16 +194,11 @@ export async function* readJsonSseEvents<T>(
       }
       idleStartedAt = Date.now();
       buffer += decoder.decode(value, { stream: true });
-      assertBounded(buffer, maximum, options);
-      const drained = drainJsonSseBuffer(buffer, options);
-      buffer = drained.remainder;
-      yield* drained.events;
+      buffer = yield* drainJsonSseBuffer(buffer, maximum, options);
       pendingRead = reader.read();
     }
     buffer += decoder.decode();
-    assertBounded(buffer, maximum, options);
-    const drained = drainJsonSseBuffer(`${buffer}\n\n`, options);
-    yield* drained.events;
+    yield* drainJsonSseBuffer(`${buffer}\n\n`, maximum, options);
   } finally {
     if (!finished) {
       try {
@@ -355,6 +350,9 @@ export function decodeResponsesStreamData(
     payload.response === undefined
       ? undefined
       : decodeResponsesPayload(payload.response, `${label}.response`);
+  if ((type === 'response.completed' || type === 'response.incomplete') && response === undefined) {
+    throw new Error(`${label}.response is required for a terminal response event.`);
+  }
   const item =
     payload.item === undefined ? undefined : decodeResponsesOutputItem(payload.item, `${label}.item`);
   const outputIndex = optionalNonNegativeInteger(payload.output_index, `${label}.output_index`);
@@ -471,34 +469,39 @@ function decodeIncompleteDetails(
   return Object.freeze({ ...record, ...optionalStringProperty(record, 'reason', label) });
 }
 
-function drainJsonSseBuffer<T>(
+// Decode on demand so a terminal event can stop consumption before later frames.
+function* drainJsonSseBuffer<T>(
   input: string,
+  maximum: number,
   options: JsonSseReaderOptions<T>
-): { readonly events: JsonSseEvent<T>[]; readonly remainder: string } {
+): Generator<JsonSseEvent<T>, string> {
   let buffer = input;
-  const events: JsonSseEvent<T>[] = [];
   for (;;) {
     const boundary = /\r?\n\r?\n/.exec(buffer);
-    if (!boundary) return { events, remainder: buffer };
+    if (!boundary) {
+      assertBounded(buffer, maximum, options);
+      return buffer;
+    }
     const rawEvent = buffer.slice(0, boundary.index);
+    assertBounded(rawEvent, maximum, options);
     buffer = buffer.slice(boundary.index + boundary[0].length);
     const lines = rawEvent.split(/\r?\n/).map((line) => line.trim());
     for (const comment of lines
       .filter((line) => line.startsWith(':'))
       .map((line) => line.slice(1).trim())
       .filter(Boolean))
-      events.push({ type: 'comment', comment });
+      yield { type: 'comment', comment };
     const data = lines
       .filter((line) => line.startsWith('data:'))
       .map((line) => line.slice(5).trim())
       .join('\n');
     if (!data) continue;
     if (data === '[DONE]') {
-      events.push({ type: 'data', data });
+      yield { type: 'data', data };
       continue;
     }
     try {
-      events.push({ type: 'data', data: options.decodeData(JSON.parse(data) as unknown) });
+      yield { type: 'data', data: options.decodeData(JSON.parse(data) as unknown) };
     } catch (error) {
       throw options.createMalformedError(`SSE event was malformed: ${errorMessage(error)}`, error);
     }

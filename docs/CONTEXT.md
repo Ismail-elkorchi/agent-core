@@ -150,27 +150,55 @@ recoverable original; working state is generated interpretation, not evidence.
 `context_inspect` exposes the live selection, including the tail after the last
 committed window. Its source manifest uses bounded `limit`/`maxBytes` pages and a
 cursor pinned to the captured branch and ledger heads. Each item carries an exact
-source reference, a short description, stored byte size, and its whole-exchange
-group, including prefix binding and protected or unfinished dependencies. These
-byte sizes do not promise compiled token savings. An unavailable selection exposes
-its source-capacity conflict rather than reporting an empty window. Inspection
-labels the last compiled admission by input identity, separately from the live cut.
+source reference, a short description, stored byte size, and its exchange identity.
+Routing metadata is read before original bodies, so source overflow does not prevent
+inspection. Pages have no global source count: discovering a page does not enumerate
+the complete selection. Group facts disclose known prefix binding, protection and
+unfinished calls; `requires_validation` means release must still validate the complete
+dependency closure at the transition boundary. An oversized exchange can leave prefix
+binding `unknown`; inspection never declares that release safe. Stored bytes do not
+promise compiled token savings. Inspection labels the last compiled admission by input
+identity, separately from the live cut.
 
-Near compiled continuity capacity or 80% of selected-source bounds, the runtime
-adds factual capacity feedback at the end of the request. It reuses unchanged
-status, counts and admits the request including the notice, and preserves native
-prefixes. Feedback distinguishes source-read bounds and compiled reservations
-from settled usage and owner allowances. It does not demand working-state upkeep
-or trigger compaction. Optional notice preparation cannot block an already valid
-ordinary request; cancellation still stops dispatch. A single large new input or
-result can still cross a bound before the model gets another decision point.
-Providers without native compaction use source selection or an explicit fresh
-continuation. These are structural guarantees; long-session task quality and the
-usefulness of pressure feedback still need controlled live evaluation of this
-source-selection policy, not the superseded automatic-summary policy.
+With automatic recovery and an available context-transition tool, admission reserves
+continuity room from compilation of the current bounded context-management request,
+including its actual tool schemas, metadata presentation, output reservation, and
+independently charged reasoning. This can trigger recovery before ordinary overflow.
+The same check applies before committing a selected successor. It is not a guarantee
+about unknown future contributions: each actual request is compiled and admitted again.
+Mandatory native result delivery admits its exact compiled capacity and may consume
+discretionary continuity room. Pending synchronous results must be delivered before
+a context transition is legal; the next discretionary boundary enforces the reserve
+again. This does not grant permission to exceed actual request capacity.
 
-Hosts may enable `contextRenewal: { automatic: true }` for native fallback; both
-applications do. Only a declared, governed native operation can resolve a rejected
+Near capacity, factual feedback can still be added when its exact candidate preserves
+admission. Unchanged facts are reused; this is not a periodic summary instruction.
+
+Recovery is a restricted turn of the same runtime and inference owner, using ordinary
+tool canonicalization, authorization, durable execution, and usage settlement. Its
+catalog contains context inspection, bounded history reads, and explicit context
+transitions. It cannot execute domain tools, answer the user, replace working state,
+or implicitly reset native reasoning. Four durable requests per run, at most 1,024
+reserved output tokens per request, two tool calls per response, and 8 KiB read results
+bound the control work. Unchanged actions stop across restart; a new source window or
+compiled-input boundary is distinguished from an unchanged retry. Last control results
+are bounded, labeled presentations of recorded originals, not new authority.
+
+Automatic-context tool results use an explicit 8 KiB text presentation bound with a
+partial-coverage marker and a persisted full-presentation reference. Original observation
+values and coverage are unchanged, and complete call/result pairing remains intact.
+Independent recovery exchanges are preserved in original history but excluded from
+ordinary replay before their bodies are read. Source overflow can therefore reach
+metadata inspection without hydrating the overflowing original.
+
+An impossible protected input, denied operation, unsupported native transition, exhausted
+recovery allowance, or inadmissible successor leaves a durable context-admission
+suspension. Abort, ownership loss, and budget exhaustion retain their own semantics.
+Native compaction still requires the existing capability and permission; no automatic
+fresh-prefix reset is introduced.
+
+Hosts may enable `contextRenewal: { automatic: true }` for bounded recovery and
+native fallback; both applications do. Only a declared, governed native operation can resolve a rejected
 request or a required bound-prefix configuration change. Fitting ordinary requests
 do not trigger compaction. `strategy: 'provider'` explicitly requests native
 compaction at a legal boundary. The transform itself and its successor must pass
@@ -179,8 +207,9 @@ a different reservation, or another model. Failure preserves the old window and
 records the reason; settled usage and unresolved exposure stay with their owner.
 
 Session identity and resources survive every context transition. `/context`
-inspects capacity and selected sources. `/renew-context` and `context.renew` release
-optional sources or submit an explicit selection; they do not summarize the archive.
+inspects capacity and selected sources. Apply selection and `context.transition`
+submit an explicit selection bound to the inspected window and source revision.
+Active runs schedule it at a legal boundary; idle sessions commit after admission.
 Retrying an unchanged, rejected request cannot resolve an admission conflict.
 
 ## Governed inference
@@ -213,9 +242,9 @@ that reject a cap still reserve the host allowance and settle actual usage.
 Selected sources are membership: admission and replay restore branch input order
 and each run's event sequence. Source byte/entry capacity conflicts suspend at the
 same admission boundary as compiled token conflicts, with source references and
-bounds instead of fabricated compiled accounting. If the working sources cannot
-be materialized or summarized within their bounds, the window remains unchanged;
-an explicit source selection or model change is required.
+bounds instead of fabricated compiled accounting. If a candidate cannot be materialized and admitted within its bounds, the window
+remains unchanged. Permitted bounded recovery may propose another explicit selection;
+otherwise the run waits for a source, capacity, or model change.
 
 Inference repositories advance from verified ledger tails. `load(ownerId)` returns
 committed liabilities and settled totals; optional `invocationId` and `runId` queries
@@ -283,3 +312,8 @@ identified deployment and resource limits to collect empirical evidence.
 This pre-alpha cutover rejects incompatible persisted state explicitly. Starting
 a new session is separate from deleting old records. There are no migration
 readers, compaction callback aliases, or automatic directory cleanup.
+
+When a mandatory native result itself exceeds actual capacity, the recorded result and
+its delivery obligation remain intact in a clear context conflict. Source selection
+cannot bypass that obligation; cancellation may be necessary when no lawful
+continuation fits. This is not a promise of universal automatic resumability.

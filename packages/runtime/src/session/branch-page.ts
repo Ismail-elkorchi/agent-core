@@ -1,5 +1,6 @@
 import { workingStateAtEntry, type SessionWorkingStateEntry } from './working-state.js';
 import { hashJson } from '@agent-core/persistence';
+import { historySourceFacts } from '../history/source-metadata.js';
 import { historyToolName } from '../history/metadata.js';
 import { entryIdentity } from '../history/ledger.js';
 import type {
@@ -15,6 +16,7 @@ import type {
 } from './contracts.js';
 
 export interface BranchEntryPosition {
+  readonly context: SessionSourceMetadata['context'];
   readonly timestamp: string;
   readonly toolName?: string;
   readonly workingState?: SessionWorkingStateEntry | null;
@@ -206,6 +208,7 @@ interface SourceNode {
 class BranchSourceIndex {
   readonly nodes = new Map<string, SourceNode>();
   readonly identities = new Map<string, SourceNode[]>();
+  readonly exchanges = new Map<string, SourceNode[]>();
   readonly sources = new Map<string, SourceNode[]>();
   readonly runs = new Map<string, SourceNode[]>();
   readonly inputs = new Map<string, SourceNode[]>();
@@ -258,6 +261,7 @@ class BranchSourceIndex {
       };
       this.nodes.set(entryId, node);
       this.add(this.identities, record.identity, node);
+      if (record.context.exchangeId) this.add(this.exchanges, record.context.exchangeId, node);
       this.add(this.sources, record.source ? `event:${record.source.eventId}` : entryId, node);
       if (record.runId) {
         this.add(this.runs, record.runId, node);
@@ -289,6 +293,7 @@ class BranchSourceIndex {
 
 function branchMetadata(record: BranchEntryPosition) {
   return {
+    context: record.context,
     timestamp: record.timestamp,
     ...(record.toolName ? { toolName: record.toolName } : {}),
     identity: record.identity,
@@ -370,6 +375,7 @@ function branchEntryText(entry: SessionBranchEntry): string {
 export function branchEntryMetadata(entry: SessionBranchEntry) {
   const toolName = historyToolName(entry);
   return {
+    context: historySourceFacts(entry),
     timestamp: entry.timestamp,
     ...(toolName ? { toolName } : {}),
     identity: entryIdentity(entry),
@@ -418,6 +424,10 @@ export function sourceSnapshot(
       }
     }),
     index: Object.freeze({
+      *exchange(exchangeId: string) {
+        for (const node of view.index.exchanges.get(exchangeId) ?? [])
+          if (view.contains(node.metadata.entryId)) yield node.metadata;
+      },
       byId: { get: byId, has: view.contains },
       bySource: { get: (id: string) => view.lookup(view.index.sources.get(id))?.metadata },
       byIdentity: { get: (id: string) => view.lookup(view.index.identities.get(id))?.metadata },

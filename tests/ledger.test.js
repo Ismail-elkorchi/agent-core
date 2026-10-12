@@ -597,3 +597,263 @@ test('JSONL range refresh decodes only appended bodies; explicit rebuild can be 
   assert.equal((await rebuilt.readReference(appended)).event.text, 'new');
   assert.equal((await rebuilt.verifyIntegrity('warm')).ok, true);
 });
+
+for (const kind of ['memory', 'jsonl']) {
+  test(`${kind}: metadata inventory bounds descriptors independently of source payloads`, async (t) => {
+    const { rm } = await import('node:fs/promises');
+    const directory = await mkdtemp(path.join(tmpdir(), 'event-metadata-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    let decoded = 0;
+    const codec = {
+      encode: typedEventCodec.encode,
+      decode(value) { decoded++; return typedEventCodec.decode(value); },
+      metadata(value) { return { group: value.group }; }
+    };
+    const writer = kind === 'memory'
+      ? new InMemoryEventRepository(codec)
+      : new JsonlEventRepository({ rootDir: directory, codec });
+    for (let at = 0; at < 5; at++)
+      await writer.append('metadata', { type: at === 1 ? 'other' : 'wanted', group: at === 2 ? 'excluded' : 'selected', body: 'x'.repeat(100_000) },
+        { timestamp: `2026-01-01T00:00:0${at}.000Z` });
+    const cut = await writer.tail('metadata');
+    const reader = kind === 'memory' ? writer : new JsonlEventRepository({ rootDir: directory, codec });
+    const before = decoded;
+    const page = await reader.readMetadataRange('metadata', {
+      through: cut, limit: 4, maxBytes: 4096, types: ['wanted'], metadata: { group: 'selected' },
+      afterTime: '2026-01-01T00:00:01.000Z', beforeTime: '2026-01-01T00:00:04.000Z'
+    });
+    assert.equal(decoded, before, 'cold metadata inventory never decodes event bodies');
+    assert.equal(page.scanned, 4);
+    assert.equal(page.nextSequence, 3);
+    assert.equal(page.complete, false);
+    assert.deepEqual(page.records.map(record => record.reference.sequence), [3]);
+    assert.equal(page.records[0].metadata.group, 'selected');
+    assert.equal(page.records[0].type, 'wanted');
+    assert.ok(page.records[0].bytes > 100_000);
+    assert.equal(page.bytes, Buffer.byteLength(JSON.stringify(page.records[0])));
+    assert.ok(Object.isFrozen(page.records[0].metadata));
+    assert.ok(Object.isFrozen(page.records[0].reference));
+    const oversized = await reader.readMetadataRange('metadata', { maxBytes: 1 });
+    assert.equal(oversized.scanned, 0);
+    assert.equal(oversized.oversized.reference.sequence, 0);
+    assert.ok(oversized.oversized.bytes < 4096);
+    await writer.append('metadata', { type: 'wanted', group: 'selected', body: 'later' });
+    const remainder = await reader.readMetadataRange('metadata', { afterSequence: page.nextSequence, through: cut });
+    assert.deepEqual(remainder.records.map(record => record.reference.sequence), [4]);
+    assert.equal(remainder.complete, true);
+    const refreshed = await reader.readMetadataRange('metadata', { afterSequence: cut.sequence });
+    assert.deepEqual(refreshed.records.map(record => record.reference.sequence), [5]);
+    await assert.rejects(reader.readMetadataRange('metadata', { through: { ...cut, hash: 'changed' } }), /boundary/);
+    await assert.rejects(reader.readMetadataRange('metadata', { limit: 0 }), /bounds/);
+    if (kind === 'jsonl') {
+      assert.equal(reader.indexMetrics().bodyRecordsRead, 0);
+      assert.equal(reader.indexMetrics().fullScans, 0);
+      assert.equal(reader.indexMetrics().indexedBytes, 0);
+    }
+  });
+}
+
+test('JSONL metadata index failures require explicit recovery without hydrating original bodies', async (t) => {
+  const { PersistenceIndexRecoveryRequiredError } = await import('@agent-core/persistence');
+  const { rm } = await import('node:fs/promises');
+  const directory = await mkdtemp(path.join(tmpdir(), 'event-metadata-repair-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  let decoded = 0;
+  const codec = { ...typedEventCodec, decode(value) { decoded++; return typedEventCodec.decode(value); } };
+  const writer = new JsonlEventRepository({ rootDir: directory, codec });
+  await writer.append('metadata', { type: 'wanted', body: 'original' });
+  const original = await readFile(writer.location('metadata'));
+  const pointerPath = path.join(directory, 'run-metadata.index', 'sequences', '0.json');
+  const pointer = JSON.parse(await readFile(pointerPath, 'utf8'));
+  await writeFile(pointerPath, JSON.stringify({ ...pointer, metadata: { protected: 'false' } }));
+  const reader = new JsonlEventRepository({ rootDir: directory, codec });
+  const before = decoded;
+  await assert.rejects(reader.readMetadataRange('metadata'), PersistenceIndexRecoveryRequiredError);
+  assert.equal(decoded, before);
+  assert.equal(reader.indexMetrics().fullScans, 0);
+  assert.equal(reader.indexMetrics().bodyRecordsRead, 0);
+  await reader.rebuild('metadata');
+  assert.equal((await reader.readMetadataRange('metadata')).records.length, 1);
+  assert.deepEqual(await readFile(writer.location('metadata')), original);
+});
+
+for (const kind of ['memory', 'jsonl']) {
+  test(`${kind}: exchange metadata seeks directly across bounded membership pages`, async (t) => {
+    const { promises: fs } = await import('node:fs');
+    const directory = await mkdtemp(path.join(tmpdir(), 'event-exchange-index-'));
+    t.after(() => fs.rm(directory, { recursive: true, force: true }));
+    const codec = { ...typedEventCodec, metadataIndexes: [{ field: 'exchangeId' }], metadata: event => ({ exchangeId: event.exchangeId }) };
+    const writer = kind === 'memory' ? new InMemoryEventRepository(codec)
+      : new JsonlEventRepository({ rootDir: directory, codec });
+    for (let at = 0; at < 520; at++)
+      await writer.append('exchanges', { type: 'item', exchangeId: at % 2 ? 'selected' : 'other', body: 'x'.repeat(1000) }, { idempotencyKey: `event:${at}` });
+    const reader = kind === 'memory' ? writer : new JsonlEventRepository({ rootDir: directory, codec });
+    let ledgerBytes = 0;
+    let sequenceReads = 0;
+    if (kind === 'jsonl') {
+      const open = fs.open.bind(fs), readFile = fs.readFile.bind(fs);
+      t.mock.method(fs, 'open', async (file, ...args) => {
+        const handle = await open(file, ...args);
+        if (file === reader.location('exchanges')) {
+          const read = handle.read.bind(handle);
+          handle.read = async (...input) => {
+            const result = await read(...input);
+            ledgerBytes += result.bytesRead;
+            return result;
+          };
+        }
+        return handle;
+      });
+      t.mock.method(fs, 'readFile', async (file, ...args) => {
+        if (String(file).includes('/sequences/')) sequenceReads++;
+        return readFile(file, ...args);
+      });
+    }
+    const head = await reader.tail('exchanges', { metadataOnly: true });
+    assert.equal((await reader.latestReferenceOfType('exchanges', 'item', { metadataOnly: true })).sequence, 519);
+    assert.equal((await reader.referenceByKey('exchanges', 'event:519', { metadataOnly: true })).sequence, 519);
+    const page = await reader.readMetadataRange('exchanges', {
+      through: head, afterSequence: 507, limit: 4, metadata: { exchangeId: 'selected' }
+    });
+    assert.deepEqual(page.records.map(record => record.reference.sequence), [509, 511, 513, 515]);
+    assert.equal(page.scanned, 4);
+    assert.equal(page.complete, false);
+    const last = await reader.readMetadataRange('exchanges', {
+      through: head, afterSequence: page.nextSequence, limit: 4, metadata: { exchangeId: 'selected' }
+    });
+    assert.deepEqual(last.records.map(record => record.reference.sequence), [517, 519]);
+    assert.equal(last.complete, true);
+    if (kind === 'jsonl') {
+      assert.ok(ledgerBytes <= 256, `cold metadata boundary reads only its fixed probe, read ${ledgerBytes} bytes`);
+      assert.ok(sequenceReads <= 8, 'unrelated sequence pointers are never read');
+      assert.equal(reader.indexMetrics().bodyRecordsRead, 0);
+      assert.equal(reader.indexMetrics().indexedBytes, 0);
+    }
+  });
+}
+
+test('metadata boundaries refuse missing indexes and arbitrarily large torn tails without ledger scans', async (t) => {
+  const { PersistenceIndexRecoveryRequiredError } = await import('@agent-core/persistence');
+  const { promises: fs } = await import('node:fs');
+  const directory = await mkdtemp(path.join(tmpdir(), 'event-metadata-boundary-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const writer = new JsonlEventRepository({ rootDir: directory, codec: typedEventCodec });
+  await writer.append('boundary', { type: 'item', body: 'x'.repeat(100_000) });
+  await appendFile(writer.location('boundary'), 'x'.repeat(500_000));
+  const open = fs.open.bind(fs);
+  let bytes = 0;
+  t.mock.method(fs, 'open', async (file, ...args) => {
+    const handle = await open(file, ...args);
+    if (file === writer.location('boundary')) {
+      const read = handle.read.bind(handle);
+      handle.read = async (...input) => { const result = await read(...input); bytes += result.bytesRead; return result; };
+    }
+    return handle;
+  });
+  const reader = new JsonlEventRepository({ rootDir: directory, codec: typedEventCodec });
+  await assert.rejects(reader.tail('boundary', { metadataOnly: true }), PersistenceIndexRecoveryRequiredError);
+  assert.ok(bytes <= 256, `torn tail must not trigger a backwards scan, read ${bytes}`);
+  await fs.rm(path.join(directory, 'run-boundary.index'), { recursive: true, force: true });
+  bytes = 0;
+  await assert.rejects(reader.latestReferenceOfType('boundary', 'item', { metadataOnly: true }), PersistenceIndexRecoveryRequiredError);
+  assert.equal(bytes, 0, 'missing derived index does not trigger original history scan');
+});
+
+for (const kind of ['memory', 'jsonl']) {
+  test(`${kind}: sparse recovery snapshots do not spend scan allowance on unrelated history`, async (t) => {
+    const { promises: fs } = await import('node:fs');
+    const directory = await mkdtemp(path.join(tmpdir(), 'event-recovery-routing-'));
+    t.after(() => fs.rm(directory, { recursive: true, force: true }));
+    const codec = { ...typedEventCodec, metadataIndexes: [{ type: 'turn.snapshot.created', metadata: { contextRecovery: 'true' } }], metadata: event => event.recovery ? { contextRecovery: 'true' } : {} };
+    const writer = kind === 'memory' ? new InMemoryEventRepository(codec)
+      : new JsonlEventRepository({ rootDir: directory, codec });
+    for (let at = 0; at < 60; at++)
+      await writer.append('recovery', { type: at % 2 ? 'ordinary' : 'assistant.ended', recovery: at % 2 === 0, body: 'x'.repeat(1000) });
+    const reader = kind === 'memory' ? writer : new JsonlEventRepository({ rootDir: directory, codec });
+    const query = { types: ['turn.snapshot.created'], metadata: { contextRecovery: 'true' }, limit: 5 };
+    const fresh = await reader.readMetadataRange('recovery', query);
+    assert.equal(fresh.complete, true);
+    assert.equal(fresh.scanned, 0);
+    assert.deepEqual(fresh.records, []);
+    const first = await writer.append('recovery', { type: 'turn.snapshot.created', recovery: true });
+    await writer.append('recovery', { type: 'turn.snapshot.created', recovery: false });
+    const second = await writer.append('recovery', { type: 'turn.snapshot.created', recovery: true });
+    const page = await reader.readMetadataRange('recovery', query);
+    assert.equal(page.complete, true);
+    assert.equal(page.scanned, 2);
+    assert.deepEqual(page.records.map(record => record.reference.sequence), [first.sequence, second.sequence]);
+    if (kind === 'jsonl') {
+      assert.equal(reader.indexMetrics().bodyRecordsRead, 0);
+      assert.equal(reader.indexMetrics().indexedBytes, 0);
+      const cold = new JsonlEventRepository({ rootDir: directory, codec });
+      assert.deepEqual((await cold.readMetadataRange('recovery', query)).records, page.records);
+    }
+  });
+}
+
+test('failed routing publication cannot expose incomplete exchange membership through a warm index', async (t) => {
+  const { PersistenceIndexRecoveryRequiredError } = await import('@agent-core/persistence');
+  const { promises: fs } = await import('node:fs');
+  const directory = await mkdtemp(path.join(tmpdir(), 'event-routing-publication-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const codec = { ...typedEventCodec, metadataIndexes: [{ field: 'exchangeId' }], metadata: event => ({ exchangeId: event.exchangeId }) };
+  const writer = new JsonlEventRepository({ rootDir: directory, codec });
+  await writer.append('publication', { type: 'item', exchangeId: 'exchange' });
+  const rename = fs.rename.bind(fs);
+  const mocked = t.mock.method(fs, 'rename', async (from, to) => {
+    if (String(to).includes('/routing/') && String(to).endsWith('/head.json')) throw new Error('injected routing publication failure');
+    return rename(from, to);
+  });
+  await assert.rejects(writer.append('publication', { type: 'item', exchangeId: 'exchange' }), /injected/);
+  mocked.mock.restore();
+  await assert.rejects(writer.readMetadataRange('publication', { metadata: { exchangeId: 'exchange' } }), PersistenceIndexRecoveryRequiredError);
+  const cold = new JsonlEventRepository({ rootDir: directory, codec });
+  await assert.rejects(cold.readMetadataRange('publication', { metadata: { exchangeId: 'exchange' } }), PersistenceIndexRecoveryRequiredError);
+  await writer.rebuild('publication');
+  const recovered = await writer.readMetadataRange('publication', { metadata: { exchangeId: 'exchange' } });
+  assert.equal(recovered.complete, true);
+  assert.equal(recovered.records.length, 2);
+});
+
+test('codec-owned metadata index declarations are immutable and persisted index compatibility is explicit', async (t) => {
+  const { PersistenceIndexRecoveryRequiredError } = await import('@agent-core/persistence');
+  const { promises: fs } = await import('node:fs');
+  const directory = await mkdtemp(path.join(tmpdir(), 'event-declared-index-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const declaration = { type: 'checkpoint', metadata: { status: 'pending' } };
+  const codec = { ...typedEventCodec, metadataIndexes: [declaration], metadata: event => ({ status: event.status }) };
+  const repository = new JsonlEventRepository({ rootDir: directory, codec });
+  declaration.metadata.status = 'done';
+  for (let at = 0; at < 10; at++) await repository.append('declared', { type: 'ordinary', status: 'pending' });
+  await repository.append('declared', { type: 'checkpoint', status: 'pending' });
+  const page = await repository.readMetadataRange('declared', { types: ['checkpoint'], metadata: { status: 'pending' }, limit: 2 });
+  assert.equal(page.complete, true);
+  assert.equal(page.scanned, 1);
+  assert.equal(page.records[0].reference.sequence, 10);
+  const changed = new JsonlEventRepository({ rootDir: directory, codec });
+  await assert.rejects(changed.readMetadataRange('declared'), PersistenceIndexRecoveryRequiredError);
+  await changed.rebuild('declared');
+  const empty = await changed.readMetadataRange('declared', { types: ['checkpoint'], metadata: { status: 'done' }, limit: 2 });
+  assert.equal(empty.complete, true);
+  assert.equal(empty.scanned, 0);
+  assert.throws(() => new InMemoryEventRepository({ ...typedEventCodec, metadataIndexes: [{ field: 'group' }, { field: 'group' }] }), /Duplicate/);
+});
+
+test('warm original reads idempotently ingest routing memberships published by another writer', async (t) => {
+  const { promises: fs } = await import('node:fs');
+  const directory = await mkdtemp(path.join(tmpdir(), 'event-routing-two-writers-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const codec = { ...typedEventCodec, metadataIndexes: [{ field: 'group' }], metadata: event => ({ group: event.group }) };
+  const writer = new JsonlEventRepository({ rootDir: directory, codec });
+  await writer.append('shared', { type: 'item', group: 'same' });
+  const reader = new JsonlEventRepository({ rootDir: directory, codec });
+  await reader.tail('shared');
+  for (let at = 1; at < 257; at++) await writer.append('shared', { type: 'item', group: 'same' });
+  assert.equal((await reader.tail('shared')).sequence, 256);
+  const indexed = await reader.readMetadataRange('shared', { metadata: { group: 'same' } });
+  assert.equal(indexed.records.length, 256);
+  const last = await reader.readMetadataRange('shared', { afterSequence: indexed.nextSequence, metadata: { group: 'same' } });
+  assert.equal(last.records.length, 1);
+  assert.equal(last.records[0].reference.sequence, 256);
+  assert.equal((await reader.verifyIntegrity('shared')).ok, true);
+});

@@ -1,7 +1,9 @@
+import { CONTEXT_RECOVERY_LIMITS, CONTEXT_RECOVERY_INSTRUCTION, assembleContextControlRequest, contextControlHeadroom } from './context/recovery.js';
+import { resolveToolModelContent } from './orchestration/observation-source.js';
 import { NativeContextTransitionRequired } from './inference/input.js';
 import type { WorkingStateSnapshot } from './session/working-state.js';
 import { providerSettlementKey } from './inference/run-lifecycle.js';
-import { ContextSourceCapacityError } from './run/context-admission.js';
+import { ContextSourceCapacityError, ContextContinuityError, type ContextAdmissionConflict } from './run/context-admission.js';
 import { agentRunActivity } from './run/control/contracts.js';
 import { describeError as errorMessage } from '@agent-core/tools';
 import {
@@ -30,6 +32,7 @@ import {
 import { hashJson, type EventAppendReceipt } from '@agent-core/persistence';
 import {
   READ_ONLY_TOOL_POLICY,
+  serializeToolModelContent,
   ResourceLeaseCoordinator,
   ToolRegistry,
   isToolAvailable,
@@ -57,7 +60,7 @@ import {
   type AgentEvent,
   type AgentProgressEvent
 } from './events.js';
-import { HistoryReader, sourceRef } from './history/reader.js';
+import { HistoryReader, sourceRef, textRange } from './history/reader.js';
 import {
   ModelRequestAssembler,
   renderContext,
@@ -90,7 +93,7 @@ import {
   invokeRunInference,
   providerUsageQuantities
 } from './inference/run-lifecycle.js';
-import { InferenceService } from './inference/service.js';
+import { InferenceService, InferenceBudgetExceededError, InferenceNotSentError } from './inference/service.js';
 import {
   summarizeModelRequest,
   summarizeModelResponse,
@@ -430,6 +433,7 @@ export class AgentRuntime {
   private readonly inferenceService: InferenceService;
   private readonly catalogTools = new Map<string, readonly CompiledToolDefinition[]>();
   private contextTransitions: RunContextTransitions | undefined;
+  private readonly recoveryActions = new Set<string>();
   private activeContextIdentity: string | null | undefined;
   private nativeSteering: NativeSteeringCoordinator | undefined;
   private steeringWrites: Promise<void> = Promise.resolve();
@@ -996,13 +1000,14 @@ export class AgentRuntime {
       const admissionError = error instanceof AgentExecutionError ? error.cause : error;
       if (
         (admissionError instanceof ContextAdmissionError ||
-          admissionError instanceof ContextSourceCapacityError) &&
+          admissionError instanceof ContextSourceCapacityError ||
+          admissionError instanceof ContextContinuityError || admissionError instanceof ContextRecoveryStoppedError) &&
         !signal.aborted
       ) {
         const instruction = nextAgentRunInstruction(run.state());
         if (instruction.kind !== 'execute') throw admissionError;
         const conflict =
-          admissionError instanceof ContextSourceCapacityError
+          (admissionError instanceof ContextSourceCapacityError || admissionError instanceof ContextContinuityError || admissionError instanceof ContextRecoveryStoppedError)
             ? admissionError.conflict
             : requestCapacityConflict(admissionError);
         await this.advanceRun(run, instruction.procedure, {
@@ -1089,6 +1094,12 @@ export class AgentRuntime {
       throw new Error(
         'An unresolved started provider effect must be reconciled before terminal staging.'
       );
+    await this.contextTransitions?.closePending(
+      'Run ended before the requested context selection reached an admissible boundary; inspect and retry while idle.',
+      async (requestId, message, idempotencyKey) => {
+        await emit({ type: 'context.transition.rejected', requestId, idempotencyKey, message });
+      }
+    );
     const terminal = terminalSnapshot(runId, finalizationId, decision, controller);
     await finalizer.stage(terminal, 'diagnostic' in decision ? decision.diagnostic : undefined);
     await this.enterRunFinalization(run, controller.snapshot());
@@ -1132,6 +1143,14 @@ export class AgentRuntime {
       append
     });
     await this.contextTransitions.restore();
+    await this.contextTransitions.closePending(
+      'Run ended before the requested context selection reached an admissible boundary; inspect and retry while idle.',
+      async (requestId, message, idempotencyKey) => {
+        await this.emitProgress(staged.terminal.finalizationId,
+          { type: 'context.transition.rejected', requestId, idempotencyKey, message },
+          deliveryDiagnostics, append);
+      }
+    );
     const finalizer = new AgentRunFinalizer({
       runId,
       finalizationId: staged.terminal.finalizationId,
@@ -1289,15 +1308,23 @@ export class AgentRuntime {
       });
     let replay;
     try {
+      await this.options.context?.assertSourceCapacity();
       replay = await rebuild();
     } catch (error) {
       if (!(error instanceof ContextSourceCapacityError) || !this.options.contextRenewal?.automatic)
         throw error;
-      await this.prepareContextAdmission(runtime.run, runtime.signal, 1);
-      replay = await rebuild();
+      // This empty staging window is never dispatched as application context.
+      // assembleModelRequest still verifies the selected originals and the bounded
+      // recovery path below is the only request admitted while they overflow.
+      replay = {
+        modelWindow: new ModelWindow(this.estimator), invalidatedProviderStates: [],
+        replayedLedgers: 0, replayedTurns: 0, replayedSessionEntries: 0, replayedToolResults: 0
+      };
     }
     const modelWindow = replay.modelWindow;
     const observationStore = new ObservationStore({
+      ...(this.options.context && this.options.contextRenewal?.automatic
+        ? { maxPresentationBytes: CONTEXT_RECOVERY_LIMITS.resultBytes } : {}),
       ...(this.options.repositories.artifacts
         ? { artifacts: this.options.repositories.artifacts }
         : {})
@@ -1401,9 +1428,15 @@ export class AgentRuntime {
             response: providerResume.response,
             identity: providerResume.identity,
             append: runtime.append,
-            emit: runtime.emit
+            emit: snapshotRecoveryEmitter(snapshot, runtime.emit)
           });
           providerResume = undefined;
+          if (snapshot.record.contextRecovery) {
+            await modelSession.close?.();
+            modelSession = undefined;
+            sessionModel = undefined;
+            replayRestored = false;
+          }
         } else {
           runtime.controller.reserveModelTurn();
           const configuration = this.captureRuntimeConfiguration();
@@ -1595,8 +1628,27 @@ export class AgentRuntime {
             reason: 'provider_outcome_unknown',
             effectId: assistant.effectId
           };
-        activeModelOutput = assistant.modelOutput;
+        if (!snapshot.record.contextRecovery) activeModelOutput = assistant.modelOutput;
         const { response, toolCalls } = assistant;
+        if (snapshot.record.contextRecovery) {
+          const repeated = toolCalls.some((call) => this.recoveryActions.has(`${runtime.runId}:${snapshot.record.contextRecovery?.recoveryBoundary ?? "unbound"}:${hashJson({name: call.name, input: call.input})}`));
+          const unsupported = response.terminationReason !== 'tool_calls' || toolCalls.length === 0 || toolCalls.length > CONTEXT_RECOVERY_LIMITS.toolCalls ||
+            toolCalls.some((call) => !snapshot.tools.some((tool) => tool.name === call.name)) ||
+            toolCalls.some((call) => call.input.kind === 'json' &&
+              (call.input.value.continuation === 'fresh' || call.input.value.workingState !== undefined ||
+                (snapshot.tools.find((tool) => tool.name === call.name)?.implementationId !== 'agent-core.context-transition.v1' &&
+                  (typeof call.input.value.maxBytes !== 'number' || call.input.value.maxBytes > CONTEXT_RECOVERY_LIMITS.resultBytes))));
+          if (repeated || unsupported) {
+            const settled = providerWork(runtime.run.state(), snapshot.record);
+            if (settled.stage !== 'settled') throw new Error('Recovery response has no durable settlement.');
+            await runtime.run.transitionProvider('consume_provider_settlement', settled.identity,
+              () => ({ ...settled, stage: 'consumed' }), runtime.controller.snapshot());
+            throw new ContextRecoveryStoppedError(snapshot.record.contextRecovery,
+              repeated ? 'Context recovery repeated an unchanged action; no source selection was committed.'
+                : 'Context recovery returned an unsupported action or final answer; application work remains suspended.',
+              repeated ? 'unchanged_action' : 'unsupported_action');
+          }
+        }
 
         if (response.terminationReason === 'tool_calls') {
           if (toolCalls.length === 0) {
@@ -1648,7 +1700,7 @@ export class AgentRuntime {
         }
 
         runtime.controller.reserveToolCalls(toolCalls);
-        modelWindow.recordModelOutput({
+        if (!snapshot.record.contextRecovery) modelWindow.recordModelOutput({
           turnIndex,
           content: response.content,
           toolCalls: toolCalls.map(modelToolCallFromToolCall),
@@ -1724,6 +1776,7 @@ export class AgentRuntime {
           throw new AgentRunOwnershipLostError(runtime.runId);
         if (toolResult.outcome === 'waiting_for_recovery')
           return toolRecoveryDecision(runtime.run.state());
+        if (snapshot.record.contextRecovery) this.activeContextIdentity = undefined;
         await this.advanceRun(runtime.run, 'advance_after_tools', {
           phase: {
             kind: 'initializing',
@@ -2117,7 +2170,6 @@ export class AgentRuntime {
       return value;
     };
     const createGeneration = async (context: NativeGenerationContext): Promise<Generation> => {
-      await this.requestAdmission.admit(context.compiled, context.profile);
       const first = context.generationDeliveryId === 'initial';
       if (!first) runtime.controller.reserveModelTurn();
       const request = context.compiled.logicalRequest;
@@ -2157,6 +2209,11 @@ export class AgentRuntime {
             snapshot,
             toolBatchId: randomUUID()
           };
+      // Exact result delivery is mandatory while synchronous native obligations remain.
+      // It admits real capacity, but discretionary control room waits for a legal boundary.
+      if (context.dispatch?.sourceCalls.length)
+        await this.requestAdmission.admit(context.compiled, context.profile);
+      else await this.admitContextRequest(context.compiled, turn, runtime.append);
       this.catalogTools.set(snapshot.record.toolCatalog.revision, snapshot.tools);
       if (!first) {
         await this.advanceRun(runtime.run, 'assemble_turn', (state) => ({
@@ -2282,8 +2339,10 @@ export class AgentRuntime {
           await createGeneration(context);
         },
         extended: async (context, dispatch) => {
-          await this.requestAdmission.admit(dispatch.compiled, context.profile);
           const item = generation(context);
+          if (dispatch.sourceCalls.length)
+            await this.requestAdmission.admit(dispatch.compiled, item.request.snapshot.profile);
+          else await this.admitContextRequest(dispatch.compiled, item.request, runtime.append);
           const estimate = requestTokenEstimate({
             accounting: dispatch.compiled.accounting,
             modelWindowTokens: 0,
@@ -2481,6 +2540,19 @@ export class AgentRuntime {
     } catch (error) {
       if (paused) return { kind: 'decision', decision: paused };
       if (unknownEffect) return { kind: 'outcome_unknown', effectId: unknownEffect };
+      // A rejected dispatch was never sent. Preserve its typed admission conflict
+      // after prior provider effects settle; mandatory tool results remain owned.
+      const boundaryFailure = error instanceof ModelStreamInterruptedError ? error.cause : error;
+      const admissionFailure = boundaryFailure instanceof InferenceNotSentError
+        ? boundaryFailure.cause : boundaryFailure;
+      if (admissionFailure instanceof ContextAdmissionError &&
+          !runtime.run.state().providerRequests.some((request) =>
+            request.stage === 'effect_pending' || request.stage === 'outcome_unknown')) {
+        if (pendingToolCalls(runtime.run.state()).some((call) => call.protocol === 'synchronous'))
+          throw new ContextAdmissionError(admissionFailure.compiled,
+            new Error(`${admissionFailure.message} Mandatory native results remain recorded and undelivered; context selection cannot bypass them. Cancel if no lawful continuation can fit.`));
+        throw admissionFailure;
+      }
       throw error;
     } finally {
       await pump.close();
@@ -2504,7 +2576,16 @@ export class AgentRuntime {
       let generationRetries = 0;
       for (;;) {
         const identity = turnIdentity(request.snapshot.record);
-        const assembly = await this.assembleModelRequest(request, append, emit, rejected);
+        let assembly: RequestAssemblyResult;
+        try {
+          assembly = await this.assembleModelRequest(request, append, emit, rejected);
+        } catch (error) {
+          if (!(error instanceof ContextAdmissionError || error instanceof ContextSourceCapacityError) ||
+              !this.options.contextRenewal?.automatic || !this.options.context) throw error;
+          const recovery = await this.assembleContextRecovery(request, error, append);
+          request = recovery.request;
+          assembly = recovery.assembly;
+        }
         await request.controller.recordUsage(
           await this.inferenceService.settledRunUsage(
             this.options.inferenceOwnerId ?? request.runId,
@@ -2513,7 +2594,7 @@ export class AgentRuntime {
         );
         const protocol = request.snapshot.profile.capabilities.protocol;
         if (
-          request.modelSession.continueNative &&
+          !request.snapshot.record.contextRecovery && request.modelSession.continueNative &&
           (protocol?.asyncTools || protocol?.steering === 'native')
         ) {
           return await this.requestNativeTurns(
@@ -2527,7 +2608,9 @@ export class AgentRuntime {
         delete ledgerModelRequest.signal;
         await append({ type: 'assistant.started', ...identity });
         await emit({ type: 'assistant.started', ...identity });
-        const completedAttempt = await invokeRunInference({
+        const recoverySession = request.snapshot.record.contextRecovery ? this.inferenceService.createSession() : undefined;
+        let completedAttempt;
+        try { completedAttempt = await invokeRunInference({
           service: this.inferenceService,
           ...(this.nativeSteering ? { steering: this.nativeSteering } : {}),
           options: this.options,
@@ -2536,11 +2619,11 @@ export class AgentRuntime {
           requestEstimate: assembly.estimate,
           requestFingerprint: assembly.fingerprint,
           requestSummary: summarizeModelRequest(ledgerModelRequest),
-          turnRequest: request,
+          turnRequest: recoverySession ? { ...request, modelSession: recoverySession } : request,
           append,
-          emit,
+          emit: snapshotRecoveryEmitter(request.snapshot, emit),
           advanceRun: (driver, procedure, advance) => this.advanceRun(driver, procedure, advance)
-        });
+        }); } finally { await recoverySession?.close?.(); }
         if (completedAttempt.kind === 'outcome_unknown') return completedAttempt;
         if (completedAttempt.kind === 'failed') {
           const capacityFailure = completedAttempt.diagnostic.code === 'context_overflow';
@@ -2620,7 +2703,7 @@ export class AgentRuntime {
           response: completedAttempt.response,
           identity: completedAttempt.identity,
           append,
-          emit
+          emit: snapshotRecoveryEmitter(request.snapshot, emit)
         });
         return settled;
       }
@@ -2677,6 +2760,8 @@ export class AgentRuntime {
     const modelOutput = modelOutputFromResponse(response, request.turnIndex, toolCalls.length > 0);
     const assistantEnded = {
       type: 'assistant.ended' as const,
+      ...(request.snapshot.record.contextRecovery ? { contextRecovery: true as const } : {}),
+      ...(response.output?.some((item) => item.type === 'protocol' && item.state.compatibility.requiresExactPrefix) ? { nativePrefixBound: true as const } : {}),
       ...responseIdentity,
       content: response.content,
       ...(response.reasoning === undefined ? {} : { reasoning: response.reasoning }),
@@ -2744,6 +2829,7 @@ export class AgentRuntime {
             hash: receipt.hash
           },
           content: event.content,
+          ...(event.contextRecovery ? { contextRecovery: true as const } : {}),
           ...(inferenceInput ? { inferenceInput } : {}),
           ...(event.reasoning === undefined ? {} : { reasoning: event.reasoning }),
           ...(event.reasoningSummary === undefined
@@ -2803,12 +2889,18 @@ export class AgentRuntime {
         controller,
         run
       };
-      return await this.assembleModelRequest(
-        request,
-        (event) =>
-          run.append(event, `${input.runId}:context-resume:${hashJson(encodeAgentEvent(event))}`),
-        () => Promise.resolve(undefined)
-      );
+      const append = (event: AgentAuditEvent) =>
+        run.append(event, `${input.runId}:context-resume:${hashJson(encodeAgentEvent(event))}`);
+      try {
+        return await this.assembleModelRequest(request, append, () => Promise.resolve(undefined));
+      } catch (error) {
+        if (!(error instanceof ContextAdmissionError || error instanceof ContextSourceCapacityError) ||
+            !this.options.contextRenewal?.automatic || !this.options.context) throw error;
+        const phase = run.state().phase;
+        if (phase.kind === 'suspended' && phase.reason === 'context_admission' &&
+            phase.conflict.recovery === 'unchanged_action') throw error;
+        return (await this.assembleContextRecovery(request, error, append)).assembly;
+      }
     } finally {
       await session.close?.();
     }
@@ -2817,11 +2909,15 @@ export class AgentRuntime {
   private async admitContextResumption(run: AgentRunDriver, signal: AbortSignal): Promise<boolean> {
     const phase = run.state().phase;
     if (phase.kind !== 'suspended' || phase.reason !== 'context_admission') return false;
-    const revision = run.state().revision;
+    if (pendingToolCalls(run.state()).some((call) => call.protocol === 'synchronous')) return false;
     try {
       const assembly = await this.prepareContextAdmission(run, signal, phase.turnIndex);
+      // Admission records its own audit events. Fence against the current owned tail,
+      // while preserving the exact suspension that authorized this resumption.
+      if (hashJson(run.state().phase) !== hashJson(phase))
+        throw new Error('Context suspension changed during request admission.');
       const resumed = await run.resumeContextAdmission({
-        expectedRevision: revision,
+        expectedRevision: run.state().revision,
         inputIdentity: assembly.compiled.inputIdentity
       });
       if (resumed.state.phase.kind === 'suspended') {
@@ -2835,10 +2931,159 @@ export class AgentRuntime {
       }
       return true;
     } catch (cause) {
-      if (cause instanceof ContextAdmissionError || cause instanceof ContextSourceCapacityError)
+      if (cause instanceof ContextAdmissionError || cause instanceof ContextSourceCapacityError || cause instanceof ContextContinuityError || cause instanceof ContextRecoveryStoppedError)
         return false;
       throw cause;
     }
+  }
+
+  /** Recovery is an ordinary governed turn with a narrower catalog and no domain output. */
+  private async assembleContextRecovery(
+    ordinary: AssistantTurnRequest,
+    failure: ContextAdmissionError | ContextSourceCapacityError,
+    append: (event: AgentAuditEvent) => Promise<EventAppendReceipt>,
+    probe = false
+  ): Promise<{ request: AssistantTurnRequest; assembly: RequestAssemblyResult }> {
+    const context = this.options.context;
+    if (!context || !ordinary.snapshot.profile.capabilities.toolCalling) throw failure;
+    const originalConflict = failure instanceof ContextSourceCapacityError ? failure.conflict : requestCapacityConflict(failure);
+    const window = await context.history.selectedContext();
+    const conflict: ContextAdmissionConflict = {
+      ...originalConflict,
+      recoveryBoundary: hashJson({
+        windowId: window?.windowId ?? null, kind: originalConflict.kind,
+        inputIdentity: originalConflict.inputIdentity ?? null,
+        source: originalConflict.kind === 'source_capacity' ? originalConflict.source ?? null : null
+      })
+    };
+    const tools = ordinary.snapshot.tools.filter((tool) =>
+      tool.implementationId === 'agent-core.context-transition.v1' ||
+      (tool.implementationId === `agent-core.${tool.name}.v1` &&
+        tool.effectEnvelope.accesses.every((access) => access.mode === 'read' &&
+          (access.scope === 'context' || access.scope === 'history')) &&
+        (tool.name.endsWith('_inspect') || tool.name.endsWith('_read')))
+    );
+    if (!tools.some((tool) => tool.implementationId === 'agent-core.context-transition.v1')) throw failure;
+    // Count durable snapshots, including unsettled invocations. Restarting cannot
+    // turn a blocked request into an unbounded sequence of paid recovery calls.
+    const events = this.options.repositories.events;
+    const tail = await events.tail(ordinary.runId, { metadataOnly: true });
+    const snapshots = await events.readMetadataRange(ordinary.runId, {
+      through: tail, types: ['turn.snapshot.created'], metadata: { contextRecovery: 'true' },
+      limit: 5, maxBytes: 2 * CONTEXT_RECOVERY_LIMITS.resultBytes
+    });
+    if (snapshots.oversized || !snapshots.complete)
+      throw new ContextRecoveryStoppedError(conflict, 'Context recovery exhausted its bounded durable request inventory.');
+    const attempts = snapshots.records.length;
+    const recoveryResults: { tool: string; content: string; original: string; coverage: 'complete' | 'partial' }[] = [];
+    for (const snapshot of probe ? [] : snapshots.records.filter((snapshot) => snapshot.metadata.recoveryBoundary === conflict.recoveryBoundary)) {
+      const exchangeId = snapshot.metadata.exchangeId;
+      if (!exchangeId) throw new Error('Recovery snapshot is missing its exchange identity.');
+      const records = await events.readMetadataRange(ordinary.runId, {
+        through: tail, types: ['assistant.ended', 'observation.record.created'],
+        metadata: { exchangeId }, limit: 16, maxBytes: 2 * CONTEXT_RECOVERY_LIMITS.resultBytes
+      });
+      if (!records.complete || records.oversized)
+        throw new ContextRecoveryStoppedError(conflict, 'Recovery exchange exceeds its bounded control protocol.');
+      for (const metadata of records.records) {
+        if (metadata.bytes > 32768) {
+          recoveryResults.push({ tool: metadata.metadata.toolName ?? 'context', content: 'Recorded recovery result exceeds the bounded presentation read. Use its original history source.', original: metadata.reference.eventId, coverage: 'partial' });
+        } else {
+          const event = (await events.readReference(metadata.reference)).event;
+          if (event.type === 'assistant.ended' && event.contextRecovery && snapshot.metadata.recoveryBoundary === conflict.recoveryBoundary)
+            for (const call of event.toolCalls ?? []) this.recoveryActions.add(`${ordinary.runId}:${conflict.recoveryBoundary ?? "unbound"}:${hashJson({name: call.name, input: call.input})}`);
+          if (event.type === 'observation.record.created') {
+            const sourceBytes = event.modelContentRef?.size ?? Buffer.byteLength(JSON.stringify(event.modelContent));
+            const content = sourceBytes <= 32768
+              ? serializeToolModelContent(await resolveToolModelContent(event, this.options.repositories.artifacts))
+              : 'Recovery presentation exceeds its byte bound; the original remains recorded.';
+            const bounded = textRange(content, 0, CONTEXT_RECOVERY_LIMITS.resultBytes);
+            recoveryResults.push({tool: event.toolName, content: bounded.text, original: metadata.reference.eventId,
+              coverage: sourceBytes <= 32768 && bounded.nextOffset >= Buffer.byteLength(content) ? 'complete' : 'partial'});
+          }
+        }
+        if (recoveryResults.length > CONTEXT_RECOVERY_LIMITS.recentResults) recoveryResults.shift();
+      }
+    }
+    const rejection = await events.latestReferenceOfType(ordinary.runId, 'context.transition.rejected', { metadataOnly: true });
+    const rejectionMessages: string[] = [];
+    if (rejection) {
+      const metadata = await events.readMetadataRange(ordinary.runId, { afterSequence: rejection.sequence - 1, through: tail, limit: 1 });
+      if (metadata.records[0] && metadata.records[0].bytes <= 8192) {
+        const event = (await events.readReference(rejection)).event;
+        if (event.type === 'context.transition.rejected') rejectionMessages.push(textRange(event.message, 0, 2048).text);
+      }
+    }
+    if (!probe && attempts >= CONTEXT_RECOVERY_LIMITS.requests)
+      throw new ContextRecoveryStoppedError(conflict, 'Bounded context recovery exhausted four requests. Select sources, change capacity, or cancel; the original history remains intact.', 'attempt_limit');
+    const inspection = await context.inspect(undefined, { limit: CONTEXT_RECOVERY_LIMITS.inventoryItems, maxBytes: CONTEXT_RECOVERY_LIMITS.inventoryBytes });
+    const manifest = inspection.activeSelection.status === 'available'
+      ? inspection.activeSelection.manifest : inspection.activeSelection;
+    const content = JSON.stringify({
+      conflict, attempt: attempts + 1, maximumAttempts: CONTEXT_RECOVERY_LIMITS.requests, inventory: manifest,
+      workingState: { revisionId: inspection.workingState.revisionId },
+      legalTransitions: inspection.legalTransitions,
+      sourceBudget: inspection.budget,
+      recentRecoveryResults: probe ? [] : recoveryResults,
+      rejectedTransitions: rejectionMessages.slice(-2)
+    });
+    const instruction: AgentEffectiveInstruction = {
+      id: 'runtime-context-recovery', provenance: 'application', role: 'system',
+      content: CONTEXT_RECOVERY_INSTRUCTION
+    };
+    const outputReservation = Math.min(CONTEXT_RECOVERY_LIMITS.outputTokens, ordinary.snapshot.requestWindow.maxOutputTokens);
+    const snapshot: TurnSnapshot = {
+      ...ordinary.snapshot,
+      record: {
+        ...ordinary.snapshot.record, contextRecovery: conflict, continuationEligible: false,
+        toolCatalog: captureToolCatalog(tools), toolNames: tools.map((tool) => tool.name),
+        instructions: [instruction], configuredContextSourceIds: []
+      },
+      tools, instructions: [instruction],
+      requestWindow: requestWindowForModel(ordinary.snapshot.profile, outputReservation)
+    };
+    const request = { ...ordinary, snapshot };
+    let assembled: Awaited<ReturnType<typeof assembleContextControlRequest>>;
+    try {
+      assembled = await assembleContextControlRequest(this.requestAdmission, this.estimator, {
+        model: snapshot.configuration.model, profile: snapshot.profile,
+        tools: toolsForModel([...tools], snapshot.profile),
+        summaries: promptToolSpecs([...tools], snapshot.profile, this.options.toolContext),
+        task: content, maxOutputTokens: outputReservation, signal: request.signal
+      });
+    } catch (error) {
+      this.preserveRecoveryFailure(error, ordinary);
+      if (!(error instanceof RangeError)) throw error;
+      throw new ContextRecoveryStoppedError(conflict, error.message);
+    }
+    try {
+      await this.requestAdmission.admit(assembled.compiled, snapshot.profile);
+    } catch (error) {
+      this.preserveRecoveryFailure(error, ordinary);
+      if (!(error instanceof ContextAdmissionError)) throw error;
+      throw new ContextRecoveryStoppedError(conflict,
+        `Even the bounded context-management request cannot be admitted: ${error.message}`);
+    }
+    const estimate = requestTokenEstimate({
+      accounting: assembled.compiled.accounting,
+      modelWindowTokens: 0, contextTokens: assembled.assembly.estimate.contextTokens
+    });
+    const fingerprint: InferenceRequestFingerprintRecord = {
+      ...turnIdentity(snapshot.record), requestId: randomUUID(),
+      workingStateRevisionId: inspection.workingState.revisionId,
+      compiledInputIdentity: assembled.compiled.inputIdentity,
+      capabilityRevision: assembled.compiled.capabilityRevision,
+      configuredContextIds: [], providerContextIds: [], runContextIds: [],
+      effectiveInstructionHash: hashJson([instruction]), modelWindowHistoryHash: hashJson([]),
+      modelToolSchemasHash: hashJson(assembled.request.tools ?? []),
+      modelWindowHash: hashJson(assembled.assembly.messages)
+    };
+    if (!probe) {
+      await append({ type: 'prompt.context.delivered', delivery: assembled.assembly.context });
+      await append({ type: 'prompt.material.selected', material: assembled.assembly.material });
+      await append({ type: 'budget.estimate.created', ...turnIdentity(snapshot.record), attempt: 1, estimate });
+    }
+    return { request, assembly: { request: assembled.request, compiled: assembled.compiled, estimate, fingerprint } };
   }
 
   private async assembleModelRequest(
@@ -2850,6 +3095,7 @@ export class AgentRuntime {
     const identity = turnIdentity(request.snapshot.record);
     let sourceConflict: ContextSourceCapacityError | undefined;
     try {
+      await this.options.context?.assertSourceCapacity();
       await this.activateCommittedContext(request.modelWindow, request.runId);
     } catch (error) {
       if (!(error instanceof ContextSourceCapacityError)) throw error;
@@ -2938,6 +3184,7 @@ export class AgentRuntime {
       );
       nativeUsagePending = false;
     };
+    const admitOrdinary = (compiled: CompiledModelRequest) => this.admitContextRequest(compiled, request, append);
     const validate = async (input: ContextAdmissionInput) => {
       assertToolTransitionBoundary(request.run.state());
       const boundary = request.run.state().revision;
@@ -2948,7 +3195,7 @@ export class AgentRuntime {
         async (window) => nativeSource ?? (await assemble(window, input.workingState, true)).request
       );
       const result = await assemble(proposed.window, input.workingState);
-      await this.requestAdmission.admit(result.compiled, request.snapshot.profile);
+      await admitOrdinary(result.compiled);
       if (result.compiled.inputIdentity === rejected?.inputIdentity)
         throw new ContextAdmissionError(
           result.compiled,
@@ -2956,11 +3203,10 @@ export class AgentRuntime {
           true
         );
       const tail = await this.options.repositories.events.tail(request.runId);
-      if (
-        tail.driverGeneration !== request.run.state().driverGeneration ||
-        request.run.state().revision !== boundary ||
-        request.run.state().control.status !== 'owned'
-      )
+      if (tail.driverGeneration !== request.run.state().driverGeneration ||
+          request.run.state().control.status !== 'owned')
+        throw new AgentRunOwnershipLostError(request.runId);
+      if (request.run.state().revision !== boundary)
         throw new Error('Context admission boundary changed during compilation.');
       request.signal.throwIfAborted();
       selected = result;
@@ -2974,6 +3220,7 @@ export class AgentRuntime {
       try {
         await this.contextTransitions?.drain({
           context: this.options.context,
+          preserveFailure: (error) => { this.preserveRecoveryFailure(error, request); },
           admit: (transition) => this.retainPendingSources(transition, request.runId),
           validate,
           committed: async (entry) => {
@@ -2984,7 +3231,7 @@ export class AgentRuntime {
               transition: entry.transition
             });
           },
-          rejected: (requestId, message) =>
+          rejected: async (requestId, message, idempotencyKey) => {
             capturedContext.push({
               id: requestId,
               sourceUri: `runtime://context-selection/${requestId}`,
@@ -2995,19 +3242,21 @@ export class AgentRuntime {
               content: message,
               purpose:
                 'The requested selection was not committed; the preceding window remains active.'
-            }),
+            });
+            await emit({ type: 'context.transition.rejected', requestId, idempotencyKey, message });
+          },
           signal: request.signal
         });
       } finally {
         await recordNativeUsage();
       }
     }
+    if (sourceConflict && !selected) throw sourceConflict;
     const cut = await this.options.context?.history.capture();
     const workingState = (await this.options.context?.workingState(cut)) ?? {
       revision: null,
       text: ''
     };
-    if (sourceConflict && !selected) throw sourceConflict;
     const nativeSupported =
       Boolean(request.snapshot.profile.capabilities.protocol?.contextTransforms.length) &&
       typeof this.options.provider.compileContextTransform === 'function' &&
@@ -3066,18 +3315,22 @@ export class AgentRuntime {
     try {
       result = selected ?? (await assemble(request.modelWindow, workingState));
     } catch (error) {
-      if (
-        !(error instanceof NativeContextTransitionRequired) ||
-        !nativeSupported ||
-        !this.options.context ||
-        !this.options.contextRenewal?.automatic
-      )
-        throw error;
-      result = await nativeTransition(error.message, error.request);
+      if (!(error instanceof NativeContextTransitionRequired)) throw error;
+      if (!this.options.contextRenewal?.automatic)
+        throw new ContextContinuityError('automatic_disabled', error.message);
+      if (!nativeSupported || !this.options.context)
+        throw new ContextContinuityError('unsupported', error.message);
+      try {
+        result = await nativeTransition(error.message, error.request);
+      } catch (cause) {
+        this.preserveRecoveryFailure(cause, request);
+        throw new ContextContinuityError('transform_failed',
+          `${error.message} Native transformation failed: ${errorMessage(cause)}`, { cause });
+      }
     }
     let admissionFailure: ContextAdmissionError | undefined;
     try {
-      await this.requestAdmission.admit(result.compiled, request.snapshot.profile);
+      await admitOrdinary(result.compiled);
       if (rejected)
         throw new ContextAdmissionError(
           rejected,
@@ -3101,7 +3354,7 @@ export class AgentRuntime {
         result = await nativeTransition('Required native context renewal.');
         admissionFailure = undefined;
       } catch (cause) {
-        request.signal.throwIfAborted();
+        this.preserveRecoveryFailure(cause, request);
         admissionFailure = new ContextAdmissionError(
           rejectedRequest.compiled,
           new Error(`${rejectedRequest.message} Native renewal failed: ${errorMessage(cause)}`, {
@@ -3134,11 +3387,11 @@ export class AgentRuntime {
             request.modelWindow,
             await this.options.context.workingState()
           );
-          await this.requestAdmission.admit(withFeedback.compiled, request.snapshot.profile);
+          await admitOrdinary(withFeedback.compiled);
           result = withFeedback;
         }
       } catch (error) {
-        request.signal.throwIfAborted();
+        this.preserveRecoveryFailure(error, request);
         feedback = undefined;
         feedbackFailure = `Capacity notice was not delivered: ${errorMessage(error)}`;
       }
@@ -3198,6 +3451,32 @@ export class AgentRuntime {
       presentation: assembly.presentation
     });
     return { request: result.request, compiled, estimate, fingerprint };
+  }
+
+  private async admitContextRequest(
+    compiled: CompiledModelRequest,
+    request: AssistantTurnRequest,
+    append: (event: AgentAuditEvent) => Promise<EventAppendReceipt>
+  ): Promise<void> {
+    await this.requestAdmission.admit(compiled, request.snapshot.profile);
+    if (!this.options.contextRenewal?.automatic || !this.options.context ||
+        !request.snapshot.tools.some((tool) => tool.implementationId === 'agent-core.context-transition.v1')) return;
+    const probe = await this.assembleContextRecovery(request,
+      new ContextAdmissionError(compiled, new Error('Compiled capacity must leave room for the current bounded context-management request.')),
+      append, true);
+    const reserve = contextControlHeadroom(probe.assembly.compiled);
+    const remaining = requestCapacity(compiled.accounting).remainingTokens;
+    if (remaining !== undefined && remaining < reserve)
+      throw new ContextAdmissionError(compiled,
+        new Error(`Compiled request leaves ${String(remaining)} input tokens; the current bounded context-management request requires ${String(reserve)} tokens of continuity room.`));
+  }
+
+  private preserveRecoveryFailure(error: unknown, request: AssistantTurnRequest): void {
+    request.signal.throwIfAborted();
+    if (error instanceof AgentRunOwnershipLostError || error instanceof AgentLimitExceededError ||
+        error instanceof InferenceBudgetExceededError) throw error;
+    if (request.run.state().control.status !== 'owned')
+      throw new AgentRunOwnershipLostError(request.runId);
   }
 
   private async currentApplicationInstructions(): Promise<AgentEffectiveInstruction[]> {
@@ -3379,6 +3658,9 @@ export class AgentRuntime {
     const window = await this.options.context.history.selectedContext(cut);
     if ((window?.windowId ?? null) !== transition.expectedWindowId)
       throw new Error('Context selection window is stale.');
+    if (!transition.toolInvocation && transition.expectedSourceRevision !== undefined &&
+        transition.expectedSourceRevision !== cut.sourceRevision)
+      throw new Error('Context selection source revision is stale.');
     const retained = new Map(
       transition.selection.retained.map((reference) => [reference.entryId, reference])
     );
@@ -3387,6 +3669,24 @@ export class AgentRuntime {
     if (transition.toolInvocation) {
       if (transition.toolInvocation.runId !== runId)
         throw new Error('Context operation belongs to another run.');
+      if (!transition.expectedCut || transition.expectedCut.sourceRevision !== transition.expectedSourceRevision)
+        throw new Error('Context tool operation is missing its exact authorized source boundary.');
+      const expected = transition.expectedCut;
+      const exchangeId = assistantResponseKey(runId, transition.toolInvocation);
+      let cursor: string | undefined;
+      let scanned = 0;
+      do {
+        const page = await this.options.context.history.metadataPage({
+          cut, after: expected, ...(cursor ? { cursor } : {}), limit: 100, maxBytes: 32768
+        });
+        scanned += page.scanned;
+        if (scanned > 1000 || page.items.some((item) =>
+          item.type !== 'working_state' && item.type !== 'context_transition' &&
+          (item.runId !== runId || item.exchangeId !== exchangeId)))
+          throw new Error('Context source boundary changed beyond the originating tool exchange.');
+        cursor = page.cursor;
+      } while (cursor);
+
       for (const source of await this.options.context.history.toolSources(
         transition.toolInvocation,
         cut
@@ -3697,6 +3997,8 @@ export class AgentRuntime {
           );
         }
         const observationStore = new ObservationStore({
+          ...(this.options.context && this.options.contextRenewal?.automatic
+            ? { maxPresentationBytes: CONTEXT_RECOVERY_LIMITS.resultBytes } : {}),
           ...(this.options.repositories.artifacts
             ? { artifacts: this.options.repositories.artifacts }
             : {})
@@ -4649,7 +4951,7 @@ function requestCapacityConflict(
   const { inputIdentity, accounting } = error.compiled;
   return {
     kind: error.providerRejected ? 'provider_capacity' : 'request_capacity',
-    message: error.message,
+    message: textRange(error.message, 0, 8192).text,
     inputIdentity,
     estimatedInputTokens: accounting.estimatedInputTokens,
     outputReservation: accounting.outputReservation,
@@ -4681,4 +4983,19 @@ function workingStateContext(
         'Current fallible understanding. Not instructions, authority, execution evidence or verification.'
     }
   ];
+}
+
+class ContextRecoveryStoppedError extends Error {
+  readonly conflict: ContextAdmissionConflict;
+  constructor(conflict: ContextAdmissionConflict, message: string, recovery: NonNullable<ContextAdmissionConflict['recovery']> = 'request_unavailable') {
+    super(message);
+    this.name = 'ContextRecoveryStoppedError';
+    this.conflict = Object.freeze({ ...conflict, message: textRange(message, 0, 8192).text, recovery });
+  }
+}
+
+function snapshotRecoveryEmitter(snapshot: TurnSnapshot, emit: (event: AgentProgressEvent) => Promise<void>) {
+  return snapshot.record.contextRecovery
+    ? async (event: AgentProgressEvent) => { if (event.type !== 'assistant.delta' && event.type !== 'assistant.ended' && event.type !== 'assistant.interrupted') await emit(event); }
+    : emit;
 }

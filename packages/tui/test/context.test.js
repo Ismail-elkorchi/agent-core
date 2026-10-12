@@ -42,7 +42,10 @@ for (const columns of [48, 120])
           coverage: 'complete'
         };
       },
-      renewContext: async (selection) => selections.push(selection)
+      transitionContext: async (request) => {
+        selections.push(request);
+        return { selection: { kind: 'selected' } };
+      }
     };
     const app = defineTui({
       id: 'context-test',
@@ -67,8 +70,11 @@ for (const columns of [48, 120])
     for (let i = 0; i < 300 && selections.length === 0; i++)
       await new Promise((resolve) => setTimeout(resolve, 5));
     assert.equal(runtime.state().inspection.workingState.text, 'A model hypothesis');
-    assert.ok(!('notes' in selections[0]));
-    assert.deepEqual(selections[0].retained, [source]);
+    assert.ok(!('notes' in selections[0].selection));
+    assert.deepEqual(selections[0].selection.retained, [source]);
+    assert.equal(selections[0].expectedWindowId, null);
+    assert.equal(selections[0].expectedSourceRevision, cut.sourceRevision);
+    assert.ok(selections[0].idempotencyKey);
   });
 
 test('context controls preserve the effective selection and forward the edited set to fresh context', async () => {
@@ -113,4 +119,69 @@ test('an oversized active context stays inspectable without presenting an empty 
     assert.equal(updateContext(loaded, { type }, {}).effects, undefined);
   const selected = updateContext(loaded, { type: 'context.source', source }, {}).state;
   assert.deepEqual(selected.selection, { strategy: 'sources', retained: [source] });
+});
+
+function selectionDraft() {
+  const source = { sessionId: 'session', entryId: 'chosen', sha256: 'a'.repeat(64) };
+  return {
+    ...createContextState(),
+    inspection: { window: null, cut: { sourceRevision: 5 }, protectedSources: [] },
+    selection: { strategy: 'sources', retained: [source] }
+  };
+}
+
+test('scheduled Apply preserves its inspected draft and reports only its correlated rejection', async () => {
+  const draft = selectionDraft();
+  let inspections = 0;
+  const operations = {
+    transitionContext: async () => ({ selection: { kind: 'scheduled', requestId: 'scheduled-1' } }),
+    inspectContext: async () => { inspections++; throw new Error('Must not reload a pending draft'); }
+  };
+  const applying = updateContext(draft, { type: 'context.apply' }, operations);
+  const message = await applying.effects[0].run({ signal: new AbortController().signal });
+  const queued = updateContext(applying.state, message.message, operations).state;
+  assert.equal(queued.selection, draft.selection);
+  assert.equal(queued.inspection, draft.inspection);
+  assert.equal(queued.requestId, undefined);
+  assert.equal(queued.pendingTransition.requestId, 'scheduled-1');
+  assert.equal(inspections, 0);
+  for (const type of ['context.apply', 'context.fresh', 'context.open'])
+    assert.equal(updateContext(queued, { type }, operations).effects, undefined);
+  const unrelated = updateContext(queued, { type: 'context.rejected', idempotencyKey: 'another', message: 'Unrelated failure' }, operations);
+  assert.equal(unrelated.state, queued);
+  const rejected = updateContext(queued, { type: 'context.rejected', idempotencyKey: queued.pendingTransition.idempotencyKey, message: 'Context selection source revision is stale.' }, operations).state;
+  assert.equal(rejected.pendingTransition, undefined);
+  assert.equal(rejected.selection, draft.selection);
+  assert.equal(rejected.inspection, draft.inspection);
+  assert.match(rejected.notice, /source revision is stale/);
+});
+
+test('committed Apply refreshes after its terminal event, including an event before scheduling returns', async () => {
+  const draft = selectionDraft();
+  const operations = {
+    transitionContext: async () => ({ selection: { kind: 'scheduled', requestId: 'scheduled-early' } }),
+    inspectContext: async () => ({ ...draft.inspection, activeSelection: { status: 'available', selection: draft.selection } }),
+    contextSources: async () => ({ items: [] })
+  };
+  const applying = updateContext(draft, { type: 'context.apply' }, operations);
+  const committed = updateContext(applying.state, { type: 'context.applied', idempotencyKey: applying.state.pendingTransition.idempotencyKey }, operations);
+  assert.equal(committed.state.pendingTransition, undefined);
+  assert.match(committed.state.notice, /applied/);
+  const late = await applying.effects[0].run({ signal: new AbortController().signal });
+  assert.equal(updateContext(committed.state, late.message, operations).state, committed.state);
+  const loaded = await committed.effects[0].run({ signal: new AbortController().signal });
+  const completed = updateContext(committed.state, loaded.message, operations).state;
+  assert.equal(completed.requestId, undefined);
+  assert.equal(completed.pendingTransition, undefined);
+  assert.match(completed.notice, /applied/);
+});
+
+test('a rejected Apply before scheduling returns cannot be returned to pending by its late receipt', async () => {
+  const operations = { transitionContext: async () => ({ selection: { kind: 'scheduled', requestId: 'late' } }) };
+  const applying = updateContext(selectionDraft(), { type: 'context.apply' }, operations);
+  const rejected = updateContext(applying.state, { type: 'context.rejected', idempotencyKey: applying.state.pendingTransition.idempotencyKey, message: 'Run ended before applying the selection.' }, operations);
+  const late = await applying.effects[0].run({ signal: new AbortController().signal });
+  assert.equal(updateContext(rejected.state, late.message, operations).state, rejected.state);
+  assert.equal(rejected.state.pendingTransition, undefined);
+  assert.match(rejected.state.notice, /Run ended/);
 });

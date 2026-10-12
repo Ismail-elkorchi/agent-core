@@ -519,3 +519,43 @@ test('total run states select one explicit procedure, wait, or completion', () =
     /phase.kind/u
   );
 });
+
+test('persisted native continuity conflicts retain recovery choices and reject malformed state', () => {
+  const base = {
+    ...acceptance('native-conflict-decoding'),
+    revision: 1,
+    driverGeneration: 1,
+    control: { status: 'owned', driverId: 'conflict-driver' },
+    providerRequests: [],
+    toolBatches: []
+  };
+  const conflict = {
+    kind: 'native_continuity',
+    reason: 'unsupported',
+    message: 'Changed tool catalog needs an explicit compatible continuation.',
+    actions: ['transition_context', 'change_model', 'cancel']
+  };
+  const decode = (value) => decodeAgentRunState({
+    ...base,
+    phase: { kind: 'suspended', reason: 'context_admission', turnIndex: 1, conflict: value }
+  });
+  for (const reason of ['unsupported', 'automatic_disabled', 'transform_failed']) {
+    const state = decode({ ...conflict, reason });
+    assert.deepEqual(state.phase.conflict, { ...conflict, reason });
+    assert.equal(state.phase.conflict.inputIdentity, undefined);
+    assert.deepEqual(nextAgentRunInstruction(state), { kind: 'wait', reason: 'context_admission' });
+    assert(Object.isFrozen(state.phase.conflict));
+  }
+  for (const invalid of [
+    { ...conflict, reason: 'ignore_prefix' },
+    { ...conflict, reason: undefined },
+    { ...conflict, actions: ['silently_drop_reasoning'] },
+    { ...conflict, actions: ['cancel', 'cancel'] },
+    { ...conflict, source: {} },
+    { ...conflict, cut: {} },
+    { ...conflict, bound: {} },
+    { ...conflict, message: '' },
+    { ...conflict, outputReservation: -1 },
+    { ...conflict, unknown: true }
+  ]) assert.throws(() => decode(invalid));
+});

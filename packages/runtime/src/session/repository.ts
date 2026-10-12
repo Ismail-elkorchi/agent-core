@@ -355,6 +355,7 @@ export class InMemorySessionRepository implements SessionRepository {
       reasoningSummary?: string;
       output?: readonly ModelOutputItem[];
       completeness?: SessionAssistantEntry['completeness'];
+      contextRecovery?: true;
       inferenceInput?: ProtectedArtifactRef;
       source?: import('../history/contracts.js').HistoryEventSource;
     }
@@ -377,6 +378,7 @@ export class InMemorySessionRepository implements SessionRepository {
           existing.reasoningSummary !== input.reasoningSummary ||
           hashJson(existing.output ?? null) !== hashJson(input.output ?? null) ||
           existing.completeness !== input.completeness ||
+          existing.contextRecovery !== input.contextRecovery ||
           hashJson(existing.inferenceInput ?? null) !==
             hashJson(input.inferenceInput ?? null) ||
           hashJson(existing.source ?? null) !== hashJson(input.source ?? null)
@@ -401,7 +403,8 @@ export class InMemorySessionRepository implements SessionRepository {
         ...(input.inferenceInput
           ? { inferenceInput: protectedInferenceInput(input.inferenceInput) }
           : {}),
-        ...(input.completeness ? { completeness: input.completeness } : {})
+        ...(input.completeness ? { completeness: input.completeness } : {}),
+        ...(input.contextRecovery ? { contextRecovery: true as const } : {})
       });
       state.branchEntries.push(entry);
       return entry;
@@ -642,6 +645,11 @@ export class InMemorySessionRepository implements SessionRepository {
       if (record) state.submissionRecords.push(record);
     });
   }
+  async pendingSubmissionSummaries(session: SessionDescriptor) {
+    const pending = await this.loadPendingSubmissions(session);
+    return Object.freeze(pending.map(({runId, submissionId, state}) => Object.freeze({runId, submissionId, state})));
+  }
+
   loadPendingSubmissions(session: SessionDescriptor): Promise<readonly SessionPendingSubmission[]> {
     return this.serial(() =>
       pendingSessionSubmissions(this.requireDescriptor(session).submissionRecords)

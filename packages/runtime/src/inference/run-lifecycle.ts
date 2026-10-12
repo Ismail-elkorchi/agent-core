@@ -427,6 +427,7 @@ export function createRunInferenceLifecycle(
         const visible = failure.content.trim();
         const event = {
           type: 'assistant.interrupted' as const,
+          ...(turnRequest.snapshot.record.contextRecovery ? { contextRecovery: true as const } : {}),
           ...identity,
           content: failure.content,
           modelOutput: visible
@@ -475,7 +476,7 @@ export async function invokeRunInference(input: RunInferenceInput): Promise<RunI
     {
       invocationId: input.requestFingerprint.requestId,
       ownerId: input.options.inferenceOwnerId ?? input.turnRequest.runId,
-      purpose: 'agent_step',
+      purpose: input.turnRequest.snapshot.record.contextRecovery ? 'context_recovery' : 'agent_step',
       runId: input.turnRequest.runId
     }
   );

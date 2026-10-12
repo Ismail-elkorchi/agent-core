@@ -204,7 +204,7 @@ export function createSessionSubmissionTransition(
         throw new Error(`Conflicting suspension for session submission: ${submissionId}`);
       return undefined;
     }
-    assertTransition(current.state, state, submissionId);
+    assertSubmissionTransition(current.state, state, submissionId);
     return Object.freeze({ ...base, type: 'submission.suspended', suspension });
   }
   if (outcome.state === 'failed') {
@@ -216,7 +216,7 @@ export function createSessionSubmissionTransition(
         throw new Error(`Conflicting failure for session submission: ${submissionId}`);
       return undefined;
     }
-    assertTransition(current.state, state, submissionId);
+    assertSubmissionTransition(current.state, state, submissionId);
     return Object.freeze({ ...base, type: 'submission.failed', errorMessage });
   }
   if (current.state === state) {
@@ -224,7 +224,7 @@ export function createSessionSubmissionTransition(
       throw new Error(`Session submission is already claimed: ${submissionId}`);
     return undefined;
   }
-  assertTransition(current.state, state, submissionId);
+  assertSubmissionTransition(current.state, state, submissionId);
   return Object.freeze({
     ...base,
     type: state === 'claimed' ? 'submission.claimed' : 'submission.completed'
@@ -268,7 +268,7 @@ function foldSubmissions(
       continue;
     }
     const state = submissionTransitionState(record);
-    assertTransition(current.state, state, record.submissionId);
+    assertSubmissionTransition(current.state, state, record.submissionId);
     const suspension =
       record.type === 'submission.suspended'
         ? ownSessionSuspensionDescriptor(record.suspension)
@@ -441,7 +441,7 @@ function submissionTransitionState(
   }
 }
 
-function assertTransition(
+export function assertSubmissionTransition(
   current: SubmissionState,
   next: Exclude<SubmissionState, 'queued'>,
   submissionId: string

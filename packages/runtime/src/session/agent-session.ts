@@ -56,6 +56,7 @@ export type AgentSessionSuspensionAction = SessionSuspensionAction;
 export type AgentSessionSuspensionDescriptor = SessionSuspensionDescriptor;
 
 export type AgentSessionEvent =
+  | Extract<AgentProgressEvent, { readonly type: 'context.transition.rejected' }>
   | { readonly type: 'run.progress'; readonly runId: string; readonly event: AgentProgressEvent }
   | { readonly type: 'run.completed'; readonly runId: string; readonly result: AgentRunResult }
   | { readonly type: 'run.failed'; readonly runId: string; readonly error: Error }
@@ -417,14 +418,17 @@ export class AgentSession {
     });
   }
 
-  async renewContext(selection?: import('../context/contracts.js').ContextSelection) {
-    if (!this.options.context) throw new Error('This session has no context service.');
+  async transitionContext(
+    request: Omit<ContextTransitionRequest, 'toolInvocation' | 'expectedCut'>,
+    options: { readonly signal?: AbortSignal } = {}
+  ) {
+    if ('toolInvocation' in request || 'expectedCut' in request)
+      throw new Error('Session context transitions cannot supply internal tool provenance.');
+    if (request.expectedSourceRevision === undefined)
+      throw new Error('Session context transitions require the inspected source revision.');
+    if (!this.options.context) throw new Error('This session has no context transition service.');
     await this.restore();
-    const result = await this.options.context.request({
-      ...(selection ? { selection } : {}),
-      reason: 'User-requested working-window renewal',
-      idempotencyKey: randomUUID()
-    });
+    const result = await this.options.context.dispatch(request, options);
     if (result.kind === 'selected')
       await this.emit({
         type: 'context.transitioned',
@@ -432,21 +436,6 @@ export class AgentSession {
         transition: result.entry.transition
       });
     return result;
-  }
-
-  async transitionContext(
-    request: ContextTransitionRequest,
-    options: { readonly signal?: AbortSignal } = {}
-  ): Promise<SessionContextTransitionEntry> {
-    if (!this.options.context) throw new Error('This session has no context transition service.');
-    await this.restore();
-    const entry = await this.options.context.transition(request, options);
-    await this.emit({
-      type: 'context.transitioned',
-      window: entry.window,
-      transition: entry.transition
-    });
-    return entry;
   }
 
   updateQueuedSubmission(
@@ -851,6 +840,7 @@ export class AgentSession {
         configuration,
         async (event) => {
           await this.emit({ type: 'run.progress', runId, event });
+          if (event.type === 'context.transition.rejected') await this.emit(event);
           if (event.type === 'context.transitioned')
             await this.emit({
               type: 'context.transitioned',

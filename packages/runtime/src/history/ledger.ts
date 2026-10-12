@@ -42,6 +42,7 @@ export function publicEventEntry(
       ...(event.reasoning === undefined ? {} : { reasoning: event.reasoning }),
       ...(event.reasoningSummary === undefined ? {} : { reasoningSummary: event.reasoningSummary }),
       completeness: event.modelOutput.status,
+      ...('contextRecovery' in event ? { contextRecovery: true as const } : {}),
       ...(output ? { output } : {})
     });
     return entry;

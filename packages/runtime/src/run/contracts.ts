@@ -229,6 +229,8 @@ export function decodeAgentRunBudgetState(value: unknown): AgentRunBudgetState {
 }
 
 export interface AgentTurnSnapshotRecord {
+  /** A bounded control-only request; its output cannot complete application work. */
+  readonly contextRecovery?: import('./context-admission.js').ContextAdmissionConflict;
   readonly toolCatalog: import('./tool-catalog.js').ToolCatalogSnapshot;
   readonly turnIndex: number;
   readonly turnId: string;

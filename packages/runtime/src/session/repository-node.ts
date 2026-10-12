@@ -175,7 +175,9 @@ export class JsonlSessionRepository implements SessionRepository {
           storageStamp: await jsonlStorageStamp(this.filePath(id))
         };
         this.indexes.set(id, state);
-        return sessionFromState(state);
+        const session = sessionFromState(state);
+        await this.branchIndex(id).rebuild(session);
+        return session;
       })
     );
   }
@@ -452,6 +454,7 @@ export class JsonlSessionRepository implements SessionRepository {
       reasoningSummary?: string;
       output?: readonly ModelOutputItem[];
       completeness?: SessionAssistantEntry['completeness'];
+      contextRecovery?: true;
       inferenceInput?: ProtectedArtifactRef;
       source?: import('../history/contracts.js').HistoryEventSource;
     }
@@ -481,6 +484,7 @@ export class JsonlSessionRepository implements SessionRepository {
               existing.reasoningSummary !== input.reasoningSummary ||
               hashJson(existing.output ?? null) !== hashJson(input.output ?? null) ||
               existing.completeness !== input.completeness ||
+          existing.contextRecovery !== input.contextRecovery ||
               hashJson(existing.inferenceInput ?? null) !==
                 hashJson(input.inferenceInput ?? null) ||
               hashJson(existing.source ?? null) !== hashJson(input.source ?? null)
@@ -505,7 +509,8 @@ export class JsonlSessionRepository implements SessionRepository {
             ...(input.inferenceInput
               ? { inferenceInput: protectedInferenceInput(input.inferenceInput) }
               : {}),
-            ...(input.completeness ? { completeness: input.completeness } : {})
+            ...(input.completeness ? { completeness: input.completeness } : {}),
+        ...(input.contextRecovery ? { contextRecovery: true as const } : {})
           });
           await this.appendRecord(sessionId, state, entry);
           state.branchEntries.push(entry);
@@ -620,6 +625,7 @@ export class JsonlSessionRepository implements SessionRepository {
             state.completeBytes
           );
           state.storageStamp = await jsonlStorageStamp(this.filePath(sessionId));
+          await this.refreshHistoryIndex(sessionId);
           return entry;
         }
       )
@@ -717,6 +723,7 @@ export class JsonlSessionRepository implements SessionRepository {
             state.completeBytes
           );
           state.storageStamp = await jsonlStorageStamp(this.filePath(sessionId));
+          await this.refreshHistoryIndex(sessionId);
           return entry;
         }
       )
@@ -778,6 +785,7 @@ export class JsonlSessionRepository implements SessionRepository {
             state.completeBytes
           );
           state.storageStamp = await jsonlStorageStamp(this.filePath(sessionId));
+          await this.refreshHistoryIndex(sessionId);
           return finalization;
         }
       )
@@ -852,6 +860,10 @@ export class JsonlSessionRepository implements SessionRepository {
     );
   }
 
+  pendingSubmissionSummaries(session: SessionDescriptor) {
+    return this.enqueue(session.id, () => this.branchIndex(session.id).pending(session));
+  }
+
   async loadPendingSubmissions(
     session: SessionDescriptor
   ): Promise<readonly SessionPendingSubmission[]> {
@@ -886,6 +898,17 @@ export class JsonlSessionRepository implements SessionRepository {
     );
   }
 
+  private async refreshHistoryIndex(sessionId: string): Promise<void> {
+    try {
+      await this.branchIndex(sessionId).advance();
+    } catch (error) {
+      // The source append may already be committed. Never retain an append cursor
+      // whose domain state has not yet incorporated that record.
+      this.indexes.delete(sessionId);
+      throw error;
+    }
+  }
+
   private async appendRecord(
     sessionId: string,
     state: SessionAppendIndex,
@@ -898,6 +921,7 @@ export class JsonlSessionRepository implements SessionRepository {
     state.completeBytes += writtenBytes;
     state.boundaryMarker = await jsonlBoundaryMarker(this.filePath(sessionId), state.completeBytes);
     state.storageStamp = await jsonlStorageStamp(this.filePath(sessionId));
+    await this.refreshHistoryIndex(sessionId);
   }
 
   private appendBranchEntry<T extends SessionBranchEntry>(
@@ -925,6 +949,7 @@ export class JsonlSessionRepository implements SessionRepository {
             state.completeBytes
           );
           state.storageStamp = await jsonlStorageStamp(this.filePath(sessionId));
+          await this.refreshHistoryIndex(sessionId);
           return entry;
         }
       )
@@ -1476,6 +1501,7 @@ function isSessionAssistantEntry(
     typeof value.runId === 'string' &&
     value.runId.length > 0 &&
     typeof value.content === 'string' &&
+    (value.contextRecovery === undefined || value.contextRecovery === true) &&
     (value.reasoning === undefined || typeof value.reasoning === 'string') &&
     (value.reasoningSummary === undefined || typeof value.reasoningSummary === 'string') &&
     (value.completeness === undefined ||

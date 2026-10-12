@@ -121,3 +121,28 @@ export interface HistoryEntryPage {
   readonly cursor?: string;
   readonly unread?: readonly HistoryUnreadSource[];
 }
+
+/** Small routing facts captured from originals, never a substitute for their bodies. */
+export interface HistorySourceMetadata {
+  readonly source: HistorySourceRef;
+  readonly type: SessionBranchEntry['type'];
+  readonly description: string;
+  readonly sourceBytes: number;
+  readonly runId?: string;
+  readonly exchangeId?: string;
+  readonly callIndex?: number;
+  readonly toolBatchId?: string;
+  readonly expectedCalls?: number;
+  readonly prefixBound?: boolean;
+  readonly contextRecovery?: true;
+}
+/** A continuation cursor requires the cut returned by its preceding metadata page. */
+export type HistoryMetadataPageRequest = Omit<HistoryEntryPageRequest, 'originals' | 'enrich'>;
+export interface HistoryMetadataPage {
+  readonly items: readonly HistorySourceMetadata[];
+  readonly cut: HistorySourceCut;
+  readonly coverage: 'complete' | 'partial';
+  readonly scanned: number;
+  readonly bytes: number;
+  readonly cursor?: string;
+}

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { appendFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { InMemorySessionRepository } from '@agent-core/runtime';
@@ -67,6 +67,7 @@ async function fixture(t, count = 700) {
     .map((record) => JSON.stringify(record) + '\n')
     .join('');
   await writeFile(file, source);
+  await repository.rebuildHistoryIndex(session);
   return { memory, session, entries, file, source, repository };
 }
 
@@ -138,6 +139,7 @@ test('snapshot cursors remain stable after append and reject another branch, ses
   const branch = await memory.branchFrom(session, entries[0].id, 'Alternative');
   const next = await memory.appendInput(session, { runId: 'branch-run', task: 'Different branch' });
   await appendFile(file, JSON.stringify(branch) + '\n' + JSON.stringify(next) + '\n');
+  await repository.rebuildHistoryIndex(session);
   const older = await repository.readBranchPage(session, { cursor: first.older });
   assert.deepEqual(
     older.entries.map((entry) => entry.id),
@@ -198,11 +200,14 @@ test('source snapshots advance membership metadata without historical body reads
   const appended = await memory.appendInput(session, { runId: 'append', task: 'new source' });
   const encoded = JSON.stringify(appended) + '\n';
   await appendFile(file, encoded);
+  await assert.rejects(repository.sourceSnapshot(session), /rebuildHistoryIndex/);
+  assert.equal(repository.historyReadMetrics(session.id).scannedBytes, before.scannedBytes);
+  await repository.rebuildHistoryIndex(session);
   const latest = await repository.sourceSnapshot(session);
   assert.equal(latest.sourceRevision, first.sourceRevision + 1);
   assert.equal(
     repository.historyReadMetrics(session.id).scannedBytes - before.scannedBytes,
-    Buffer.byteLength(encoded)
+    (await readFile(file)).length
   );
   assert.equal(repository.historyReadMetrics(session.id).bodyRecordsRead, before.bodyRecordsRead);
   assert.equal(first.entries.length, 8, 'captured metadata is immutable');

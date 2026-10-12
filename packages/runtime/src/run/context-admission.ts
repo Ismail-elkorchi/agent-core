@@ -3,10 +3,12 @@ import { historyCutSchema, sourceSchema } from '../history/schema.js';
 import { parseJsonObject } from '@agent-core/json';
 
 export type ContextAdmissionAction =
-  'select_sources' | 'change_model' | 'reduce_reservation' | 'cancel';
+  'select_sources' | 'transition_context' | 'change_model' | 'reduce_reservation' | 'cancel';
 
 /** A fit conflict at an inference boundary; it grants no effect or retry authority. */
 interface ContextAdmissionMeasurements {
+  readonly recoveryBoundary?: string;
+  readonly recovery?: 'unsupported_action' | 'unchanged_action' | 'attempt_limit' | 'request_unavailable';
   readonly message: string;
   readonly inputIdentity?: string;
   readonly estimatedInputTokens?: number;
@@ -20,6 +22,7 @@ interface ContextAdmissionMeasurements {
 export type ContextAdmissionConflict = ContextAdmissionMeasurements &
   (
     | Readonly<{ kind: 'request_capacity' }>
+    | Readonly<{ kind: 'native_continuity'; reason: 'automatic_disabled' | 'unsupported' | 'transform_failed' }>
     | Readonly<{ kind: 'provider_capacity'; inputIdentity: string }>
     | Readonly<{
         kind: 'source_capacity';
@@ -38,6 +41,19 @@ export type ContextAdmissionConflict = ContextAdmissionMeasurements &
         maxInputTokens?: never;
       }>
   );
+
+/** Native prefix changes are recoverable conflicts, never permission to discard reasoning. */
+export class ContextContinuityError extends Error {
+  readonly conflict: ContextAdmissionConflict & { kind: 'native_continuity' };
+  constructor(reason: 'automatic_disabled' | 'unsupported' | 'transform_failed', message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'ContextContinuityError';
+    this.conflict = Object.freeze({
+      kind: 'native_continuity', reason, message,
+      actions: Object.freeze(['transition_context', 'change_model', 'cancel'] as const)
+    });
+  }
+}
 
 export class ContextSourceCapacityError extends Error {
   readonly conflict: ContextAdmissionConflict & { kind: 'source_capacity' };
@@ -70,6 +86,9 @@ export function decodeContextAdmissionConflict(value: unknown): ContextAdmission
   });
   const fields = [
     'kind',
+    'reason',
+    'recovery',
+    'recoveryBoundary',
     'cut',
     'bound',
     'source',
@@ -84,6 +103,12 @@ export function decodeContextAdmissionConflict(value: unknown): ContextAdmission
   ];
   if (Object.keys(object).some((key) => !fields.includes(key)))
     throw new TypeError('Incompatible context admission conflict fields.');
+  if (object.recovery !== undefined && (typeof object.recovery !== 'string' || !['unsupported_action', 'unchanged_action', 'attempt_limit', 'request_unavailable'].includes(object.recovery)))
+    throw new TypeError('Invalid context recovery status.');
+  if (object.recoveryBoundary !== undefined && (typeof object.recoveryBoundary !== 'string' || !/^[a-f0-9]{64}$/u.test(object.recoveryBoundary)))
+    throw new TypeError('Invalid context recovery boundary.');
+  const recoveryBoundary = object.recoveryBoundary;
+  const recovery = object.recovery as ContextAdmissionConflict['recovery'];
   if (typeof object.message !== 'string' || object.message.trim().length === 0)
     throw new TypeError('Context admission conflict requires a message.');
   if (
@@ -116,6 +141,7 @@ export function decodeContextAdmissionConflict(value: unknown): ContextAdmission
   const actions = object.actions.map((action: unknown): ContextAdmissionAction => {
     if (
       action !== 'select_sources' &&
+      action !== 'transition_context' &&
       action !== 'change_model' &&
       action !== 'reduce_reservation' &&
       action !== 'cancel'
@@ -125,6 +151,22 @@ export function decodeContextAdmissionConflict(value: unknown): ContextAdmission
   });
   if (new Set(actions).size !== actions.length)
     throw new TypeError('Context admission actions must be unique.');
+  if (object.kind === 'native_continuity') {
+    if (typeof object.reason !== 'string' || !['automatic_disabled', 'unsupported', 'transform_failed'].includes(object.reason) ||
+        object.cut !== undefined || object.bound !== undefined || object.source !== undefined)
+      throw new TypeError('Invalid native continuity conflict.');
+    return Object.freeze({
+      kind: 'native_continuity',
+      reason: object.reason as 'automatic_disabled' | 'unsupported' | 'transform_failed',
+      message: object.message,
+      ...(recovery ? { recovery } : {}),
+      ...(recoveryBoundary ? { recoveryBoundary } : {}),
+      ...(object.inputIdentity === undefined ? {} : { inputIdentity: object.inputIdentity }),
+      ...counts,
+      actions: Object.freeze(actions)
+    });
+  }
+  if (object.reason !== undefined) throw new TypeError('Unexpected context conflict reason.');
   if (object.kind === 'source_capacity') {
     if (Object.keys(counts).length || object.inputIdentity !== undefined)
       throw new TypeError('Source capacity must not claim compiled request accounting.');
@@ -143,6 +185,8 @@ export function decodeContextAdmissionConflict(value: unknown): ContextAdmission
     return Object.freeze({
       kind: 'source_capacity',
       message: object.message,
+      ...(recovery ? { recovery } : {}),
+      ...(recoveryBoundary ? { recoveryBoundary } : {}),
       cut: historyCutSchema.parse(object.cut),
       bound: Object.freeze({
         unit: bound.unit,
@@ -162,6 +206,8 @@ export function decodeContextAdmissionConflict(value: unknown): ContextAdmission
     throw new TypeError('Incompatible context capacity conflict.');
   const requestConflict = {
     message: object.message,
+    ...(recovery ? { recovery } : {}),
+      ...(recoveryBoundary ? { recoveryBoundary } : {}),
     ...(object.inputIdentity === undefined ? {} : { inputIdentity: object.inputIdentity }),
     ...counts,
     actions: Object.freeze(actions)

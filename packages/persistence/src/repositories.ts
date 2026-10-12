@@ -4,11 +4,22 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import {
   assertEventReference,
+  firstSequenceAfter,
+  eventMetadataRouteKey,
+  eventMetadataRouteKeys,
+  fixedEventMetadataRouteKeys,
+  ownEventMetadataIndexes,
+  type EventMetadataIndex,
   eventRangeBounds,
   type EventReference,
   type EventRangeRequest,
   type EventRangePage,
+  type EventIndexReadOptions,
+  type EventMetadataPage,
+  type EventSourceMetadata,
+  type EventPage,
   PersistenceConflictError,
+  PersistenceIndexRecoveryRequiredError,
   PersistenceCorruptionError,
   type ConditionalEventAppendOptions,
   type ConditionalEventAppendResult,
@@ -56,6 +67,7 @@ export interface JsonlEventRepositoryOptions<TEvent extends TypedEvent> {
 export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRepository<TEvent> {
   private readonly rootDir: string;
   private readonly codec: EventCodec<TEvent>;
+  private readonly metadataIndexes: readonly EventMetadataIndex[];
   private readonly decoded = new WeakMap<EncodedEnvelope, TEvent>();
   private readonly lockTimeoutMs: number;
   private readonly staleLockMs: number;
@@ -71,6 +83,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   constructor(options: JsonlEventRepositoryOptions<TEvent>) {
     this.rootDir = path.resolve(options.rootDir);
     this.codec = options.codec;
+    this.metadataIndexes = ownEventMetadataIndexes(options.codec.metadataIndexes);
     this.lockTimeoutMs = positiveInteger(options.lockTimeoutMs ?? 5_000, 'lockTimeoutMs');
     this.staleLockMs = positiveInteger(options.staleLockMs ?? 30_000, 'staleLockMs');
   }
@@ -245,10 +258,10 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     });
   }
 
-  tail(runId: string): Promise<EventLedgerTail> {
+  tail(runId: string, options: EventIndexReadOptions = {}): Promise<EventLedgerTail> {
     return this.enqueue(runId, async () => {
       try {
-        return tailFromEncoded((await this.refreshIndex(runId, false)).tail);
+        return tailFromEncoded((await this.refreshIndex(runId, false, options.metadataOnly)).tail);
       } catch (error) {
         if (nodeCode(error) === 'ENOENT') return tailFromEncoded(undefined);
         throw error;
@@ -299,12 +312,12 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     });
   }
 
-  latestReferenceOfType(runId: string, type: TEvent['type']): Promise<EventReference | undefined> {
+  latestReferenceOfType(runId: string, type: TEvent['type'], options: EventIndexReadOptions = {}): Promise<EventReference | undefined> {
     return this.enqueue(runId, async () => {
       assertIdentifier(type, 'type');
       let index: EventAppendIndex;
       try {
-        index = await this.refreshIndex(runId, false);
+        index = await this.refreshIndex(runId, false, options.metadataOnly);
       } catch (error) {
         if (nodeCode(error) === 'ENOENT') return undefined;
         throw error;
@@ -321,16 +334,16 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     });
   }
 
-  referenceByKey(runId: string, idempotencyKey: string): Promise<EventReference | undefined> {
+  referenceByKey(runId: string, idempotencyKey: string, options: EventIndexReadOptions = {}): Promise<EventReference | undefined> {
     return this.enqueue(runId, async () => {
       assertIdentifier(idempotencyKey, 'idempotencyKey');
       try {
-        await this.refreshIndex(runId, false);
+        await this.refreshIndex(runId, false, options.metadataOnly);
       } catch (error) {
         if (nodeCode(error) === 'ENOENT') return undefined;
         throw error;
       }
-      const entry = await this.idempotencyEntry(runId, idempotencyKey);
+      const entry = await this.idempotencyEntry(runId, idempotencyKey, !options.metadataOnly);
       const receipt = entry?.receipt;
       return receipt
         ? Object.freeze({
@@ -358,12 +371,28 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     });
   }
 
-  async readRange(runId: string, request: EventRangeRequest = {}): Promise<EventRangePage<TEvent>> {
+  readRange(runId: string, request: EventRangeRequest = {}): Promise<EventRangePage<TEvent>> {
+    return this.readRangePage(runId, request, false, async (pointer) => {
+      const encoded = await this.readSequenceEnvelope(runId, pointer);
+      return domainEnvelope(encoded, this.domainEvent(encoded));
+    });
+  }
+
+  readMetadataRange(runId: string, request: EventRangeRequest = {}): Promise<EventMetadataPage> {
+    return this.readRangePage(runId, request, true, (_pointer, source) => Promise.resolve(source));
+  }
+
+  private async readRangePage<T>(
+    runId: string,
+    request: EventRangeRequest,
+    metadataOnly: boolean,
+    project: (pointer: EventSequencePointer, source: EventSourceMetadata) => Promise<T>
+  ): Promise<EventPage<T>> {
     const { after, limit, maxBytes, through, types, metadata, afterTime, beforeTime } = eventRangeBounds(request);
     return this.enqueue(runId, async () => {
       let index: EventAppendIndex;
       try {
-        index = await this.refreshIndex(runId, false);
+        index = await this.refreshIndex(runId, false, metadataOnly);
       } catch (error) {
         if (nodeCode(error) !== 'ENOENT') throw error;
         if ((through?.sequence ?? -1) !== -1 || after !== -1)
@@ -383,7 +412,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       const tail =
         requested.sequence < 0
           ? tailFromEncoded(undefined)
-          : tailFromEncoded(await this.sequencePointer(runId, requested.sequence, index));
+          : tailFromEncoded(await this.sequencePointer(runId, requested.sequence, index, !metadataOnly));
       if (
         tail.sequence !== requested.sequence ||
         tail.hash !== requested.hash ||
@@ -394,21 +423,38 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
           'Event range boundary is missing or its identity changed.'
         );
       if (after > tail.sequence) throw new RangeError('Event range starts beyond its boundary.');
-      const records: EventEnvelope<TEvent>[] = [];
+      const records: T[] = [];
       let nextSequence = after,
         scanned = 0,
         bytes = 0;
+      const routeKey = metadataOnly ? eventMetadataRouteKey(this.metadataIndexes, types, metadata) : undefined;
+      const candidates = routeKey
+        ? await this.routingSequences(runId, routeKey, after, tail.sequence, limit)
+        : undefined;
+      let candidateAt = 0;
       let oversized: EventRangePage<TEvent>['oversized'];
       while (nextSequence < tail.sequence && scanned < limit) {
-        const pointer = await this.sequencePointer(runId, nextSequence + 1, index);
+        const sequence = candidates ? candidates[candidateAt++] : nextSequence + 1;
+        if (sequence === undefined || sequence > tail.sequence) { nextSequence = tail.sequence; break; }
+        const pointer = await this.sequencePointer(runId, sequence, index, !metadataOnly);
+        if (routeKey && !eventMetadataRouteKeys(this.metadataIndexes, pointer.type, pointer.metadata).includes(routeKey))
+          throw new PersistenceIndexRecoveryRequiredError(runId);
         if (
           (!types || types.includes(pointer.type)) &&
           (!afterTime || Date.parse(pointer.timestamp) >= Date.parse(afterTime)) &&
           (!beforeTime || Date.parse(pointer.timestamp) < Date.parse(beforeTime)) &&
           matchesEventMetadata(pointer.metadata, metadata)
         ) {
-          if (bytes + pointer.bytes > maxBytes) {
-            if (pointer.bytes > maxBytes)
+          const source: EventSourceMetadata = Object.freeze({
+            reference: Object.freeze({ runId, eventId: pointer.eventId, sequence: pointer.sequence, hash: pointer.hash }),
+            type: pointer.type,
+            timestamp: pointer.timestamp,
+            bytes: pointer.bytes,
+            metadata: pointer.metadata
+          });
+          const size = metadataOnly ? Buffer.byteLength(canonicalJsonString(source)) : pointer.bytes;
+          if (bytes + size > maxBytes) {
+            if (size > maxBytes)
               oversized = {
                 reference: {
                   runId,
@@ -416,15 +462,14 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
                   sequence: pointer.sequence,
                   hash: pointer.hash
                 },
-                bytes: pointer.bytes
+                bytes: size
               };
             break;
           }
-          const encoded = await this.readSequenceEnvelope(runId, pointer);
-          records.push(domainEnvelope(encoded, this.domainEvent(encoded)));
-          bytes += pointer.bytes;
+          records.push(await project(pointer, source));
+          bytes += size;
         }
-        nextSequence++;
+        nextSequence = sequence;
         scanned++;
       }
       return Object.freeze({
@@ -451,20 +496,107 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   ): Promise<void> {
     const content = {
       ...tailRecord(envelope, byteOffset),
+      runId,
       type: eventType(envelope),
       bytes,
-      metadata: this.codec.metadata?.(this.domainEvent(envelope)) ?? {}
+      metadata: parseEventMetadata(this.codec.metadata?.(this.domainEvent(envelope)) ?? {})
     };
     await atomicWritePrivateJson(this.sequencePath(runId, envelope.sequence), {
       ...content,
       contentHash: hashJson(content)
     });
+    for (const routeKey of eventMetadataRouteKeys(this.metadataIndexes, content.type, content.metadata))
+      await this.appendRoutingSequence(runId, routeKey, envelope.sequence);
+  }
+
+  private routingDirectory(runId: string, routeKey: string): string {
+    return path.join(this.indexDirectory(runId), 'routing', createHash('sha256').update(routeKey).digest('hex'));
+  }
+
+  private async routingIndexRecord(runId: string, routeKey: string, name: string): Promise<JsonObject> {
+    try {
+      const raw = parseJsonObject(JSON.parse(await fs.readFile(path.join(this.routingDirectory(runId, routeKey), `${name}.json`), 'utf8')));
+      const { contentHash, ...content } = raw;
+      if (contentHash !== hashJson(content) || content.runId !== runId || content.routeKey !== routeKey || content.name !== name)
+        throw new TypeError('Routing index identity changed.');
+      return content;
+    } catch {
+      throw new PersistenceIndexRecoveryRequiredError(runId);
+    }
+  }
+
+  private async writeRoutingIndexRecord(runId: string, routeKey: string, name: string, value: JsonObject): Promise<void> {
+    const content = { ...value, runId, routeKey, name };
+    await atomicWritePrivateJson(path.join(this.routingDirectory(runId, routeKey), `${name}.json`), {
+      ...content, contentHash: hashJson(content)
+    });
+  }
+
+  private async appendRoutingSequence(runId: string, routeKey: string, sequence: number): Promise<void> {
+    const directory = this.routingDirectory(runId, routeKey);
+    let count = 0;
+    try {
+      await fs.access(path.join(directory, 'head.json'));
+      const head = await this.routingIndexRecord(runId, routeKey, 'head');
+      if (!nonnegativeInteger(head.count)) throw new PersistenceIndexRecoveryRequiredError(runId);
+      count = head.count;
+    } catch (error) {
+      if (nodeCode(error) !== 'ENOENT') throw error;
+    }
+    const lastPage = count === 0 ? [] : await this.routingSequencePage(runId, routeKey, Math.floor((count - 1) / ROUTING_PAGE_SIZE));
+    if ((lastPage.at(-1) ?? -1) >= sequence) {
+      // Another writer may already have published this derived membership.
+      const existing = await this.routingSequences(runId, routeKey, sequence - 1, sequence, 1);
+      if (existing[0] === sequence) return;
+      throw new PersistenceIndexRecoveryRequiredError(runId);
+    }
+    const page = Math.floor(count / ROUTING_PAGE_SIZE);
+    const sequences = count % ROUTING_PAGE_SIZE === 0 ? [] : lastPage;
+    await this.writeRoutingIndexRecord(runId, routeKey, String(page), { sequences: [...sequences, sequence] });
+    await this.writeRoutingIndexRecord(runId, routeKey, 'head', { count: count + 1 });
+  }
+
+  private async routingSequencePage(runId: string, routeKey: string, page: number): Promise<readonly number[]> {
+    const record = await this.routingIndexRecord(runId, routeKey, String(page));
+    const sequences = record.sequences;
+    if (!Array.isArray(sequences) || sequences.length < 1 || sequences.length > ROUTING_PAGE_SIZE ||
+        sequences.some((value, at) => !nonnegativeInteger(value) || (at > 0 && Number(sequences[at - 1]) >= value)))
+      throw new PersistenceIndexRecoveryRequiredError(runId);
+    return sequences as number[];
+  }
+
+  private async routingSequences(runId: string, routeKey: string, after: number, through: number, limit: number): Promise<readonly number[]> {
+    const head = await this.routingIndexRecord(runId, routeKey, 'head');
+    if (!nonnegativeInteger(head.count)) throw new PersistenceIndexRecoveryRequiredError(runId);
+    if (head.count === 0) return [];
+    const pages = Math.ceil(head.count / ROUTING_PAGE_SIZE);
+    let low = 0, high = pages;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      const sequences = await this.routingSequencePage(runId, routeKey, middle);
+      if ((sequences.at(-1) ?? -1) <= after) low = middle + 1;
+      else high = middle;
+    }
+    const result: number[] = [];
+    for (let page = low; page < pages && result.length < limit; page++) {
+      const sequences = await this.routingSequencePage(runId, routeKey, page);
+      const expected = Math.min(ROUTING_PAGE_SIZE, head.count - page * ROUTING_PAGE_SIZE);
+      if (sequences.length !== expected) throw new PersistenceIndexRecoveryRequiredError(runId);
+      for (let at = firstSequenceAfter(sequences, after); at < sequences.length && result.length < limit; at++) {
+        const sequence = sequences[at];
+        if (sequence === undefined) throw new PersistenceIndexRecoveryRequiredError(runId);
+        if (sequence > through) return result;
+        result.push(sequence);
+      }
+    }
+    return result;
   }
 
   private async sequencePointer(
     runId: string,
     sequence: number,
-    index: EventAppendIndex
+    index: EventAppendIndex,
+    rebuild = true
   ): Promise<EventSequencePointer> {
     try {
       const raw = parseJsonObject(
@@ -474,6 +606,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       const pointer = parseEventTailRecord(content, 'Event sequence index');
       if (
         contentHash !== hashJson(content) ||
+        content.runId !== runId ||
         pointer.sequence !== sequence ||
         typeof content.type !== 'string' ||
         !Number.isSafeInteger(content.bytes) ||
@@ -495,6 +628,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
         !(error instanceof TypeError)
       )
         throw error;
+      if (!rebuild) throw new PersistenceIndexRecoveryRequiredError(runId);
       // Derived offsets can be rebuilt; authoritative records are never rewritten.
       const rebuilt = await this.rebuildIndex(runId, index.completeBytes, index.storageStamp);
       this.indexes.set(runId, rebuilt);
@@ -701,7 +835,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     await fs.chmod(filePath, 0o600);
   }
 
-  private async refreshIndex(runId: string, repairTornTail: boolean): Promise<EventAppendIndex> {
+  private async refreshIndex(runId: string, repairTornTail: boolean, metadataOnly = false): Promise<EventAppendIndex> {
     const filePath = this.filePath(runId);
     const stamp = await jsonlStorageStamp(filePath);
     const cached = this.indexes.get(runId);
@@ -711,13 +845,13 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       (!repairTornTail || stamp.size === cached.completeBytes)
     )
       return cached;
-    const committedBytes = await jsonlCommittedBytes(filePath, stamp.size);
-    let index = cached ?? (await this.readPersistedTailIndex(runId));
+    const committedBytes = metadataOnly ? stamp.size : await jsonlCommittedBytes(filePath, stamp.size);
+    let index = (metadataOnly ? undefined : cached) ?? (await this.readPersistedTailIndex(runId));
     if (
       index !== undefined &&
       (index.completeBytes > committedBytes ||
         (await jsonlBoundaryMarker(filePath, index.completeBytes)) !== index.boundaryMarker ||
-        (cached === undefined && !(await this.persistedTailMatches(runId, index))))
+        (!metadataOnly && cached === undefined && !(await this.persistedTailMatches(runId, index))))
     ) {
       if (index.completeBytes > committedBytes) {
         throw new PersistenceCorruptionError({
@@ -730,6 +864,8 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       }
       index = undefined;
     }
+    if (metadataOnly && (committedBytes !== index?.completeBytes))
+      throw new PersistenceIndexRecoveryRequiredError(runId);
     if (index === undefined) {
       index = await this.rebuildIndex(runId, committedBytes, stamp);
     } else if (committedBytes > index.completeBytes) {
@@ -783,6 +919,8 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     const filePath = this.filePath(runId);
     await fs.rm(this.indexDirectory(runId), { recursive: true, force: true });
     await ensurePrivateDirectory(this.keyDirectory(runId));
+    for (const routeKey of fixedEventMetadataRouteKeys(this.metadataIndexes))
+      await this.writeRoutingIndexRecord(runId, routeKey, 'head', { count: 0 });
     let first = true;
     const index: EventAppendIndex = {
       recordCount: 0,
@@ -902,7 +1040,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   private async readPersistedTailIndex(runId: string): Promise<EventAppendIndex | undefined> {
     try {
       const raw: unknown = JSON.parse(await fs.readFile(this.tailIndexPath(runId), 'utf8'));
-      return parseTailIndex(raw, runId);
+      return parseTailIndex(raw, runId, hashJson(this.metadataIndexes));
     } catch (error) {
       if (
         nodeCode(error) === 'ENOENT' ||
@@ -940,6 +1078,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     const content = {
       version: 1,
       runId,
+      metadataIndexesHash: hashJson(this.metadataIndexes),
       recordCount: index.recordCount,
       completeBytes: index.completeBytes,
       boundaryMarker: index.boundaryMarker,
@@ -979,13 +1118,15 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
 
   private async idempotencyEntry(
     runId: string,
-    key: string
+    key: string,
+    rebuild = true
   ): Promise<IdempotencyIndexEntry | undefined> {
     try {
       const raw: unknown = JSON.parse(await fs.readFile(this.idempotencyPath(runId, key), 'utf8'));
       return parseIdempotencyEntry(raw, runId, key);
     } catch (error) {
       if (nodeCode(error) === 'ENOENT') return undefined;
+      if (!rebuild) throw new PersistenceIndexRecoveryRequiredError(runId);
       this.indexes.delete(runId);
       await fs.rm(this.indexDirectory(runId), { recursive: true, force: true });
       await this.refreshIndex(runId, false);
@@ -1285,7 +1426,7 @@ function tailRecord(envelope: EncodedEnvelope, byteOffset: number): EventTailRec
   });
 }
 
-function parseTailIndex(value: unknown, runId: string): EventAppendIndex {
+function parseTailIndex(value: unknown, runId: string, metadataIndexesHash: string): EventAppendIndex {
   const record = parseJsonObject(value, {
     maxDepth: 5,
     maxCollectionEntries: 1_024,
@@ -1296,6 +1437,7 @@ function parseTailIndex(value: unknown, runId: string): EventAppendIndex {
     'version',
     'runId',
     'recordCount',
+    'metadataIndexesHash',
     'completeBytes',
     'boundaryMarker',
     'latestByType',
@@ -1310,6 +1452,7 @@ function parseTailIndex(value: unknown, runId: string): EventAppendIndex {
     contentHash !== hashJson(content) ||
     record.version !== 1 ||
     record.runId !== runId ||
+    record.metadataIndexesHash !== metadataIndexesHash ||
     !nonnegativeInteger(record.recordCount) ||
     !nonnegativeInteger(record.completeBytes) ||
     typeof record.boundaryMarker !== 'string'
@@ -1774,3 +1917,5 @@ interface EventSequencePointer extends EventTailRecord {
   readonly type: string;
   readonly bytes: number;
 }
+
+const ROUTING_PAGE_SIZE = 256;

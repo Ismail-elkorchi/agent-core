@@ -14,6 +14,7 @@ import {
   HistoryReader,
   ContextService,
   createWorkingStateTool,
+  createContextTools,
   agentEventCodec
 } from '@agent-core/runtime';
 import { adoptToolDefinition } from '@agent-core/tools';
@@ -567,3 +568,156 @@ test(
     );
   }
 );
+
+
+async function nativeControlRoomFixture(resultTokens = 850) {
+  const sessions = new InMemorySessionRepository();
+  const descriptor = await sessions.create({ binding: { schemaId: 'native-control-room', schemaVersion: 1, subject: {} } });
+  const events = new InMemoryEventRepository(agentEventCodec);
+  const artifacts = new InMemoryArtifactRepository();
+  const inference = new InMemoryInferenceRepository();
+  const inferenceAudit = recordInferenceEvents(inference);
+  const history = new HistoryReader({ repository: sessions, session: descriptor, events, artifacts });
+  const context = new ContextService({ repository: sessions, session: descriptor, history, artifacts,
+    policy: { maxSourceBytes: 1024 * 1024, historyRead: { history, isAvailable: () => true } } });
+  const capacity = 1200;
+  let effects = 0;
+  const frames = [];
+  const counted = [];
+  const provider = new OpenAIProvider({
+    apiKey: 'fixture', transport: 'websocket', countTokens: true,
+    fetch: async (url, init) => {
+      assert.ok(url.endsWith('/input_tokens'), `Unexpected network operation: ${url}`);
+      const body = JSON.parse(init.body);
+      const control = JSON.stringify(body).includes('bounded context-management turn');
+      const result = body.input?.some(item => item.type === 'function_call_output');
+      // Exact fixture counts isolate the reserve from hard overflow: the 850-token
+      // successor fits 1200 tokens, but cannot also leave the 600+128 control room.
+      const inputTokens = control ? 600 : result ? resultTokens : 100;
+      counted.push({ control, result, inputTokens });
+      return Response.json({ input_tokens: inputTokens });
+    },
+    webSocketFactory: () => new Socket((body, ws) => {
+      frames.push(body);
+      const first = frames.length === 1;
+      const control = JSON.stringify(body).includes('bounded context-management turn');
+      const id = first ? 'source-control-room' : `control-room-${frames.length}`;
+      ws.feed({ type: 'response.created', response: { id,
+        ...(body.previous_response_id ? { previous_response_id: body.previous_response_id } : {}) } },
+      { type: 'response.completed', response: response(id,
+        first ? [call('preserved-result', 'read')]
+          : message(control ? 'Source selection needs user input.' : 'Finished from the recorded result.')) });
+    })
+  });
+  const describe = provider.describeModel.bind(provider);
+  provider.describeModel = async model => {
+    const profile = await describe(model);
+    return { ...profile,
+      capabilities: { ...profile.capabilities, protocol: { ...profile.capabilities.protocol, contextTransforms: [] } },
+      limits: { ...profile.limits, contextTokens: capacity, maxInputTokens: capacity - 128, outputTokens: 128 } };
+  };
+  const options = {
+    provider, model: 'gpt-6-astra', maxOutputTokens: 128, context,
+    contextRenewal: { automatic: true },
+    inferenceService: new InferenceService({ provider, repository: inference, artifacts }),
+    tools: [tool('read', async () => { effects++; }), ...createContextTools({ context })],
+    toolPolicy: { allowedRisks: ['read', 'write'] },
+    toolBoundary: { authorizationPolicyId: 'native-control-room', executionTargetId: 'native-control-room' },
+    repositories: { events, artifacts, session: { repository: sessions, descriptor } }
+  };
+  return { options, events, artifacts, inferenceAudit, inference, history, context, frames, counted, capacity, effects: () => effects };
+}
+
+test('required native delivery preserves effects before control-room recovery at the next legal boundary',
+  { timeout: 10000 }, async () => {
+    const { options, events, artifacts, inferenceAudit, inference, history, context, frames, counted, capacity, effects } = await nativeControlRoomFixture();
+    const first = await new AgentRuntime(options).run({ runId: 'native-control-room', task: 'Read once and report.' }).result;
+    assert.equal(first.terminal?.executionStatus, 'completed', JSON.stringify({ first, counted }));
+    assert.equal(effects(), 1);
+    assert.equal(frames.length, 2, 'mandatory result delivery must not deadlock on a soft reserve');
+    assert.equal(frames[1].previous_response_id, 'source-control-room');
+    assert.equal(frames[1].input.filter(item => item.type === 'function_call_output').length, 1);
+    assert.equal(frames[1].input.find(item => item.type === 'function_call_output').call_id, 'preserved-result');
+    assert.ok(counted.some(item => item.control && item.inputTokens === 600));
+    assert.ok(counted.some(item => item.result && item.inputTokens === 850));
+    assert.ok(850 + 128 < capacity && capacity - 850 - 128 < 600 + 128,
+      'the required successor fits actual capacity while leaving less than the compiled control reserve');
+    const firstAudit = await Array.fromAsync(events.read('native-control-room'));
+    assert.equal(firstAudit.filter(({ event }) => event.type === 'tool.ended').length, 1);
+    const completed = (await new AgentRunCoordinator(events, artifacts).inspect('native-control-room')).state;
+    assert.deepEqual(completed.toolBatches, [], 'successful completion resolves the native delivery obligation');
+    assert.equal((await inference.load('native-control-room')).committed.invocations, 2);
+
+    const blocked = await new AgentRuntime(options).run({ runId: 'next-legal-boundary', task: 'Start the next task.' }).result;
+    assert.equal(blocked.state, 'suspended', JSON.stringify(blocked));
+    assert.equal(blocked.reason, 'context_admission');
+    assert.equal(blocked.contextAdmission.kind, 'request_capacity');
+    assert.equal(blocked.contextAdmission.estimatedInputTokens, 850);
+    assert.equal(blocked.contextAdmission.contextTokens, capacity);
+    assert.equal(frames.length, 3, 'only the admitted control request may be sent at this boundary');
+    assert.match(JSON.stringify(frames[2]), /bounded context-management turn/);
+    assert.equal(effects(), 1);
+    assert.ok(!(await Array.fromAsync(events.read('next-legal-boundary'))).some(({ event }) => event.type === 'run.ended'));
+
+    // Explicit source selection makes room without changing the persisted model
+    // profile or retrying any of the completed native effects.
+    const cut = await history.capture();
+    const window = await history.selectedContext(cut);
+    await context.transition({ expectedWindowId: window?.windowId ?? null,
+      expectedSourceRevision: cut.sourceRevision, idempotencyKey: 'release-completed-native-history',
+      reason: 'Release completed optional history for the next task.',
+      selection: await context.selectSources(cut, { retain: [] }) });
+    const resumed = await new AgentRuntime(options).resume('next-legal-boundary').result;
+    assert.equal(resumed.terminal?.executionStatus, 'completed', JSON.stringify(resumed));
+    assert.equal(effects(), 1, 'resuming capacity admission must never repeat the settled effect');
+    assert.equal(frames.length, 4);
+    assert.doesNotMatch(JSON.stringify(frames[3]), /bounded context-management turn/);
+    const audit = await Array.fromAsync(events.read('next-legal-boundary'));
+    assert.equal(audit.filter(({ event }) => event.type === 'tool.ended').length, 0);
+    assert.equal(audit.filter(({ event }) => event.type === 'run.ended').length, 1);
+    const budget = await inference.load('next-legal-boundary');
+    assert.equal(budget.settledUsage.invocations, 2);
+    assert.equal(budget.committed.invocations, budget.settledUsage.invocations);
+    assert.deepEqual(budget.committed.usage, budget.settledUsage.usage,
+      'no rejected unsent generation leaves outstanding token reservations');
+    assert.equal(budget.committed.unknownPricedTokens, budget.settledUsage.unknownPricedTokens);
+    assert.ok(Math.abs(budget.committed.knownCosts.USD - budget.settledUsage.knownCosts.USD) < 1e-12);
+    assert.ok(!inferenceAudit.some(({ event }) => event.type === 'inference.uncertain'));
+  });
+
+
+test('hard native capacity conflict preserves an unsent settled result without repeating it',
+  { timeout: 10000 }, async () => {
+    const { options, events, artifacts, inference, frames, effects, capacity } = await nativeControlRoomFixture(1100);
+    const result = await new AgentRuntime(options).run({ runId: 'native-hard-capacity', task: 'Read once and report.' }).result;
+    assert.equal(result.state, 'suspended', JSON.stringify(result));
+    assert.equal(result.reason, 'context_admission');
+    assert.equal(result.contextAdmission.kind, 'request_capacity');
+    assert.equal(result.contextAdmission.estimatedInputTokens, 1100);
+    assert.ok(result.contextAdmission.estimatedInputTokens + result.contextAdmission.outputReservation > capacity);
+    assert.equal(frames.length, 1, 'an over-capacity result frame must never be transmitted');
+    assert.equal(effects(), 1);
+    const state = (await new AgentRunCoordinator(events, artifacts).inspect('native-hard-capacity')).state;
+    const saved = state.toolBatches[0].callStates[0];
+    assert.equal(saved.stage, 'recorded');
+    assert.equal(saved.effect.phase, 'settled');
+    assert.equal(saved.delivery, undefined);
+    const audit = await Array.fromAsync(events.read('native-hard-capacity'));
+    assert.equal(audit.filter(({event}) => event.type === 'tool.ended').length, 1);
+    assert.ok(!audit.some(({event}) => event.type === 'run.ended'));
+    assert.equal((await inference.load('native-hard-capacity')).committed.invocations, 1);
+    const stillBlocked = await new AgentRuntime(options).resume('native-hard-capacity').result;
+    assert.equal(stillBlocked.state, 'suspended', JSON.stringify(stillBlocked));
+    assert.equal(stillBlocked.reason, 'context_admission');
+    assert.equal(frames.length, 1);
+    assert.equal(effects(), 1);
+    const cancelled = await new AgentRuntime(options).resume('native-hard-capacity',
+      AbortSignal.abort('Cancel while native delivery has no lawful capacity.')).result;
+    assert.equal(cancelled.terminal?.executionStatus, 'aborted', JSON.stringify(cancelled));
+    assert.equal(frames.length, 1);
+    assert.equal(effects(), 1);
+    assert.equal((await inference.load('native-hard-capacity')).committed.invocations, 1);
+    const finalAudit = await Array.fromAsync(events.read('native-hard-capacity'));
+    assert.equal(finalAudit.filter(({event}) => event.type === 'tool.ended').length, 1);
+    assert.equal(finalAudit.filter(({event}) => event.type === 'run.ended').length, 1);
+  });

@@ -1,7 +1,8 @@
 import {
   historyReadRequestSchema,
   contextSelectionSchema,
-  type ContextSelection
+  contextTransitionRequestSchema,
+  type ContextTransitionRequest
 } from '@agent-core/runtime';
 import type {
   HistoryReadRequest,
@@ -63,7 +64,7 @@ export function sessionRpcMethods(operations: SessionRpcOperations) {
 
 export interface ContextRpcOperations {
   inspectContext(): Promise<unknown>;
-  renewContext(selection?: ContextSelection): Promise<unknown>;
+  transitionContext(request: ContextTransitionRequest): Promise<unknown>;
   freshContext(
     retained?: readonly import('@agent-core/runtime').HistorySourceRef[]
   ): Promise<unknown>;
@@ -73,9 +74,9 @@ export function contextRpcMethods(operations: ContextRpcOperations) {
   const empty = z.strictObject({});
   return {
     'context.read': rpcMethod(empty, () => operations.inspectContext()),
-    'context.renew': rpcMethod(
-      z.strictObject({ selection: contextSelectionSchema.optional() }),
-      ({ selection }) => operations.renewContext(selection)
+    'context.transition': rpcMethod(
+      contextTransitionRequestSchema.unwrap().omit({ toolInvocation: true, expectedCut: true }).extend({ expectedSourceRevision: z.int().nonnegative() }),
+      (request) => operations.transitionContext(request)
     ),
     'context.fresh': rpcMethod(
       z.strictObject({ retained: contextSelectionSchema.unwrap().shape.retained.optional() }),

@@ -328,7 +328,6 @@ export class NativeResponsesSession implements ModelProviderSession {
       );
       entry.compiled = compiled;
       entry.delivery = Object.freeze({ ...entry.delivery, inputIdentity: compiled.inputIdentity });
-      assertRequestAccountingFits(compiled.accounting);
       const dispatch: ModelNativeDispatch = Object.freeze({
         kind,
         deliveryId: input.deliveryId,
@@ -338,6 +337,9 @@ export class NativeResponsesSession implements ModelProviderSession {
         generationDeliveryId: steering[0]?.delivery.deliveryId ?? input.deliveryId
       });
       await this.options.native.admit(dispatch);
+      // Let the owner record a typed unsent admission conflict before the adapter's
+      // final accounting guard. Both must succeed before any frame is transmitted.
+      assertRequestAccountingFits(compiled.accounting);
       input.signal?.throwIfAborted();
       this.signal?.throwIfAborted();
       if (!this.canTransmit(active))

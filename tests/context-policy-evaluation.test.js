@@ -436,8 +436,7 @@ test(
       mode: 'simulation',
       trials: 2,
       delay: 1,
-      transitionEvery: 2,
-      maxTotalInvocations: 200
+      maxTotalInvocations: 300
     });
     assert.equal(report.measurement, 'deterministic-simulation');
     assert.equal(report.defaultRecommendation, null);
@@ -479,6 +478,8 @@ test(
       } else assert.equal(trial.metrics.nativeTransforms, 0);
       assert.equal(trial.metrics.retrievalCalls > 0, trial.policy === 'history-retrieval');
       assert.equal(trial.metrics.retrievalFailures, 0);
+      assert.equal(trial.metrics.contextInspectionCalls > 0, trial.policy !== 'retained-history');
+      assert.equal(trial.metrics.contextTransitionCalls > 0, trial.policy !== 'retained-history');
     }
     assert.equal(
       report.totalInvocations,
@@ -558,7 +559,6 @@ test(
         mode: 'simulation',
         trials: 1,
         delay: 1,
-        transitionEvery: 2,
         policies: ['history-retrieval'],
         maxTotalInvocations: 100
       });
@@ -659,7 +659,7 @@ test('deterministic native transform settles and replays through the shared infe
 });
 
 test(
-  'native policy commits protected transform references and delivers their exact output to the next runtime',
+  'native policy commits protected transform references and delivers their exact output to the next request',
   { timeout: 60_000 },
   async (t) => {
     const { MemorySimulationProvider } = await import('./fixtures/context-policies/simulation.mjs');
@@ -708,7 +708,6 @@ test(
       mode: 'simulation',
       trials: 1,
       delay: 1,
-      transitionEvery: 2,
       policies: ['provider-native'],
       maxTotalInvocations: 100
     });
@@ -748,7 +747,6 @@ test('comparison ceiling prevents auxiliary native dispatch and leaves the previ
     mode: 'simulation',
     trials: 1,
     delay: 1,
-    transitionEvery: 1,
     policies: ['provider-native'],
     maxTotalInvocations: 1
   });
@@ -812,12 +810,13 @@ test(
         });
       }
       assert.equal(pathname, '/v1/responses');
+      const generation = requests.filter(item => item.pathname === '/v1/responses').length;
       const response = {
         id: `response-fixture-${requests.length}`,
         status: 'completed',
-        output: [
-          { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ACK' }] }
-        ],
+        output: generation <= 2
+          ? [{ type: 'function_call', call_id: `choice-${generation}`, name: generation === 1 ? 'context_inspect' : 'context_transition', arguments: JSON.stringify(generation === 1 ? {} : { reason: 'Model chooses native compaction after inspection.', strategy: 'provider' }) }]
+          : [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ACK' }] }],
         usage: { input_tokens: 60, output_tokens: 4, total_tokens: 64 }
       };
       return new Response(`data: ${JSON.stringify({ type: 'response.completed', response })}\n\n`, {
@@ -833,7 +832,6 @@ test(
         endpoint: 'https://api.openai.com/v1',
         trials: 1,
         delay: 1,
-        transitionEvery: 2,
         policies: ['provider-native'],
         maxTotalInvocations: 4
       },
@@ -877,3 +875,135 @@ test(
   }
 );
 import { isDeepStrictEqual } from 'node:util';
+
+
+test('context policy decisions belong to model calls, never a host timer', async (t) => {
+  const { MemorySimulationProvider } = await import('./fixtures/context-policies/simulation.mjs');
+  t.mock.method(MemorySimulationProvider.prototype, 'complete', async function (request) {
+    return { provider: this.id, model: request.model, content: 'ACK', terminationReason: 'stop' };
+  });
+  const report = await evaluateContextPolicies({ mode: 'simulation', trials: 1, delay: 1,
+    policies: ['history-retrieval', 'provider-native'], maxTotalInvocations: 100 });
+  assert.match(report.configuration.selectionControl, /model-authored/);
+  for (const trial of report.trials) {
+    assert.equal(trial.metrics.contextTransitions, 0);
+    assert.equal(trial.metrics.contextTransitionCalls, 0);
+    assert.equal(trial.metrics.nativeTransforms, 0);
+    assert.equal(trial.success, false);
+  }
+  assert.throws(() => parseArguments(['--transition-every', '2'], {}), /Unknown option/);
+});
+
+test('model source selection uses inspected references and drops large adversarial observations', async (t) => {
+  const { MemorySimulationProvider } = await import('./fixtures/context-policies/simulation.mjs');
+  const { InMemoryEventRepository } = await import('@agent-core/persistence');
+  const append = InMemoryEventRepository.prototype.appendConditional;
+  const originals = [];
+  t.mock.method(InMemoryEventRepository.prototype, 'appendConditional', async function (runId, event, ...rest) {
+    if (event.type === 'tool.ended' && event.toolName === 'background_lookup' && event.observation.storage === 'inline')
+      originals.push(event.observation.observation);
+    return append.call(this, runId, event, ...rest);
+  });
+  const complete = MemorySimulationProvider.prototype.complete;
+  const requests = [];
+  const choices = [];
+  t.mock.method(MemorySimulationProvider.prototype, 'complete', async function (request) {
+    requests.push(request);
+    const response = await complete.call(this, request);
+    for (const call of response.toolCalls ?? []) if (call.name === 'context_transition') {
+      const inspected = request.messages.findLast(item => item.role === 'tool' && item.toolName === 'context_inspect');
+      const sources = JSON.parse(inspected.content).selection.items.map(item => item.source);
+      assert.ok(call.input.value.retain.length > 0);
+      assert.ok(call.input.value.retain.every(source => sources.some(item => isDeepStrictEqual(item, source))));
+      choices.push(call);
+    }
+    return response;
+  });
+  const report = await evaluateContextPolicies({ mode: 'simulation', trials: 1, delay: 1,
+    policies: ['history-retrieval'], maxTotalInvocations: 100 });
+  assert.ok(report.trials.every(trial => trial.success), JSON.stringify(report.trials));
+  assert.ok(choices.length > 0);
+  assert.ok(originals.some(item => item.kind === 'result' && item.output.length > 25000 && item.output.includes('FORGED')));
+  const delivered = requests.flatMap(request => request.messages.filter(item => item.toolName === 'background_lookup'));
+  assert.ok(delivered.length > 0);
+  assert.ok(delivered.every(item => Buffer.byteLength(item.content) <= 8192 && item.content.includes('Presentation coverage: partial') && item.content.includes('FORGED')));
+  for (const item of requests.flatMap(request => request.messages.filter(item => item.toolName === 'context_inspect'))) {
+    assert.ok(Buffer.byteLength(item.content) <= 8192);
+    assert.equal(JSON.parse(item.content).selection.status, 'available');
+  }
+  assert.ok(requests.some(request => request.messages.some(item => item.toolName === 'context_transition') && !request.messages.some(item => item.toolName === 'background_lookup')));
+});
+
+test('capacity recovery stays in the governed runtime and preserves the continuing task', async (t) => {
+  const { MemorySimulationProvider, simulationProfile } = await import('./fixtures/context-policies/simulation.mjs');
+  const complete = MemorySimulationProvider.prototype.complete;
+  const recoveryRequests = [];
+  t.mock.method(MemorySimulationProvider.prototype, 'describeModel', async () => ({
+    ...simulationProfile,
+    limits: { ...simulationProfile.limits, contextTokens: 16000 },
+    capabilities: { ...simulationProfile.capabilities,
+      protocol: { ...simulationProfile.capabilities.protocol, contextTransforms: [] } }
+  }));
+  t.mock.method(MemorySimulationProvider.prototype, 'complete', async function (request) {
+    if (request.messages.some(item => item.role === 'system' && item.content.includes('bounded context-management turn')))
+      recoveryRequests.push(request);
+    return complete.call(this, request);
+  });
+  const report = await evaluateContextPolicies({ mode: 'simulation', trials: 1, delay: 1,
+    policies: ['history-retrieval'], maxTotalInvocations: 100 });
+  assert.ok(recoveryRequests.length > 0, JSON.stringify(report.trials));
+  for (const request of recoveryRequests) {
+    const tools = request.tools.map(tool => tool.function.name);
+    assert.ok(tools.includes('context_transition'));
+    assert.ok(!tools.includes('background_lookup'));
+    assert.ok(!JSON.stringify(request.messages).includes('FORGED'));
+  }
+  for (const trial of report.trials) {
+    assert.equal(trial.status, 'completed', JSON.stringify(trial));
+    assert.equal(trial.success, true, JSON.stringify(trial));
+    assert.ok(trial.metrics.recoveryInvocations > 0);
+    assert.equal(trial.metrics.nativeTransforms, 0);
+    assert.equal(trial.metrics.settledInvocations, trial.metrics.invocations);
+    assert.equal(trial.metrics.userInterventions, 0);
+    assert.ok(Object.values(trial.mechanical).every(count => count === 0));
+  }
+});
+
+test('recovery answers and domain-tool attempts cannot masquerade as completed evaluation work', async (t) => {
+  const { MemorySimulationProvider, simulationProfile } = await import('./fixtures/context-policies/simulation.mjs');
+  const { InMemoryEventRepository } = await import('@agent-core/persistence');
+  const complete = MemorySimulationProvider.prototype.complete;
+  const append = InMemoryEventRepository.prototype.appendConditional;
+  const starts = [];
+  let action;
+  t.mock.method(InMemoryEventRepository.prototype, 'appendConditional', async function (runId, event, ...rest) {
+    if (event.type === 'tool.started') starts.push({ runId, toolName: event.toolName });
+    return append.call(this, runId, event, ...rest);
+  });
+  t.mock.method(MemorySimulationProvider.prototype, 'describeModel', async () => ({
+    ...simulationProfile,
+    limits: { ...simulationProfile.limits, contextTokens: 16000 },
+    capabilities: { ...simulationProfile.capabilities,
+      protocol: { ...simulationProfile.capabilities.protocol, contextTransforms: [] } }
+  }));
+  t.mock.method(MemorySimulationProvider.prototype, 'complete', async function (request) {
+    if (!request.messages.some(item => item.role === 'system' && item.content.includes('bounded context-management turn')))
+      return complete.call(this, request);
+    return { provider: this.id, model: request.model,
+      content: action === 'answer' ? '{"objective":"harbor-delivery","code":"MINT","format":"json","access":"read-only"}' : '',
+      terminationReason: action === 'answer' ? 'stop' : 'tool_calls',
+      ...(action === 'domain' ? { toolCalls: [{ id: 'forbidden-domain', type: 'function',
+        name: 'background_lookup', input: { kind: 'json', value: {} } }] } : {}) };
+  });
+  for (action of ['answer', 'domain']) {
+    const report = await evaluateContextPolicies({ mode: 'simulation', trials: 1, delay: 1,
+      policies: ['history-retrieval'], maxTotalInvocations: 100 });
+    for (const trial of report.trials) {
+      assert.equal(trial.status, 'suspended', JSON.stringify(trial));
+      assert.equal(trial.success, false);
+      assert.ok(trial.metrics.recoveryInvocations > 0);
+      assert.ok(trial.checkpoints.every(point => !point.success && point.unavailable));
+      assert.equal(starts.filter(item => trial.runIds.includes(item.runId) && item.toolName === 'background_lookup').length, 1);
+    }
+  }
+});
