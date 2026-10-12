@@ -801,7 +801,7 @@ test('failed routing publication cannot expose incomplete exchange membership th
   await writer.append('publication', { type: 'item', exchangeId: 'exchange' });
   const rename = fs.rename.bind(fs);
   const mocked = t.mock.method(fs, 'rename', async (from, to) => {
-    if (String(to).includes('/routing/') && String(to).endsWith('/head.json')) throw new Error('injected routing publication failure');
+    if (String(to).split(path.sep).includes('routing') && path.basename(String(to)) === 'head.json') throw new Error('injected routing publication failure');
     return rename(from, to);
   });
   await assert.rejects(writer.append('publication', { type: 'item', exchangeId: 'exchange' }), /injected/);
