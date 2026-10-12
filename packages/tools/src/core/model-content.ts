@@ -32,6 +32,7 @@ export type ToolModelPresentationCoverage =
 
 /**
  * These facts belong to the shared delivery boundary, outside replaceable formatters.
+ * Append them after selected payload content and reserve them when bounding delivery.
  * Complete settled results preserve the selected payload contract without a notice.
  * Incomplete scope, delivery, and unsettled execution cannot be hidden by a formatter.
  */

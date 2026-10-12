@@ -151,10 +151,10 @@ export class ObservationStore {
     );
     const presentationCauses = unsupported ? ['unsupported_modality'] : [];
     let modelContent = decodeToolContent([
+      ...selectedContent,
       ...toolModelContentFacts(durableObservation, presentationCauses.length
         ? { coverage: 'partial', causes: presentationCauses }
-        : { coverage: 'complete' }),
-      ...selectedContent
+        : { coverage: 'complete' })
     ]);
     // Only derived presentation changes. The original result, execution state,
     // coverage and selected full presentation remain independently retrievable.
@@ -174,12 +174,14 @@ export class ObservationStore {
         ];
         const notice = `${serializeToolModelContent(toolModelContentFacts(durableObservation, {
           coverage: 'partial', causes: [...presentationCauses, 'presentation_limit']
-        }))}\nFull selected text and artifact references are preserved in the attached presentation artifact.${durableStorageDegraded ? ' Original observation storage is unavailable; the presentation artifact does not replace the original structured observation.' : ''}\n`;
-        const reserved = Buffer.byteLength(notice) + Buffer.byteLength(serializeToolModelContent(retained)) + 2;
+        }))}\nFull selected text and artifact references are preserved in the attached presentation artifact.${durableStorageDegraded ? ' Original observation storage is unavailable; the presentation artifact does not replace the original structured observation.' : ''}`;
+        const suffix: readonly ToolContent[] = [{ type: 'text', text: notice }, ...retained];
+        // Reserve the entire authoritative suffix before excerpting only selected content.
+        const reserved = Buffer.byteLength(serializeToolModelContent(suffix)) + 2;
         if (reserved > this.maxPresentationBytes)
           throw new Error('Presentation metadata alone exceeds the delivery allowance.');
         const excerpt = textRange(serializeToolModelContent(selectedContent), 0, this.maxPresentationBytes - reserved).text;
-        modelContent = decodeToolContent([{ type: 'text', text: notice + excerpt }, ...retained]);
+        modelContent = decodeToolContent([{ type: 'text', text: excerpt }, ...suffix]);
       } catch (error) {
         // Failure to preserve the selected original is not permission to discard it.
         // Keep its full delivery; context admission can then report the real blocker.
@@ -202,13 +204,13 @@ export class ObservationStore {
           message: error instanceof Error ? error.message : String(error)
         };
         modelContent = decodeToolContent([
-          ...toolModelContentFacts(durableObservation, {
-            coverage: 'partial', causes: [...presentationCauses, 'storage_failure']
-          }),
           {
             type: 'text',
             text: `${durableObservation.summary}\nDetailed model content is unavailable because storage failed: ${durableStorageDegraded.message.slice(0, 1000)}.`
-          }
+          },
+          ...toolModelContentFacts(durableObservation, {
+            coverage: 'partial', causes: [...presentationCauses, 'storage_failure']
+          })
         ]);
       }
     }

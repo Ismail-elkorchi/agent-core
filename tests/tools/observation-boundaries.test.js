@@ -12,6 +12,7 @@ import {
   resolveToolModelContent,
   agentEventCodec
 } from '@agent-core/runtime';
+import { execCommandTool } from '@agent-core/tools-local';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 import {
   defineTool,
@@ -95,20 +96,70 @@ test('complete settled results preserve the exact selected JSON payload contract
   }
 });
 
-test('complete result scope cannot hide non-settled execution behind a custom formatter', async (t) => {
-  for (const state of ['active', 'unknown', 'not_started']) {
-    await t.test(state, async () => {
-      const committed = await new ObservationStore().commitToolObservation({
-        turnIndex: 1, call,
-        tool: { ...tool, buildModelContent: () => [{ type: 'text', text: 'Selected result' }] },
-        observation: observation('Selected result', { execution: { state } })
-      });
-      const delivered = serializeToolModelContent(committed.modelContent);
-      assert.ok(delivered.includes(`Invocation disposition: result; execution state: ${state}.`));
-      assert.match(delivered, /Selected result/);
-      assert.doesNotMatch(delivered, /Presentation coverage: partial/);
-    });
+test('selected JSON stays first while shared facts survive every formatter and execution state', async (t) => {
+  const output = { processId: 'process-1', status: 'running' };
+  for (const scope of [{ resources: ['source'], coverage: 'complete' }, partialScope]) {
+    for (const state of ['active', 'unknown', 'not_started', 'settled']) {
+      for (const [name, formatter] of [
+        ['default', undefined],
+        ['custom', () => [{ type: 'text', text: JSON.stringify(output) }]],
+        ['fallback', () => { throw new Error('formatter failed'); }],
+        ['invalid fallback', () => [{ type: 'unknown' }]]
+      ]) {
+        await t.test(`${scope.coverage}/${state}/${name}`, async () => {
+          const store = new ObservationStore();
+          const committed = await store.commitToolObservation({
+            turnIndex: 1, call,
+            tool: formatter ? { ...tool, buildModelContent: formatter } : tool,
+            observation: observation(output, { scope, execution: { state } })
+          });
+          const delivered = (await store.projectToolObservation(committed)).modelText;
+          assert.deepEqual(JSON.parse(delivered.split('\n\n', 1)[0]), output);
+          if (scope.coverage === 'partial') assertPartialFacts(delivered, { execution: state });
+          else if (state !== 'settled') {
+            assert.ok(delivered.includes(`Invocation disposition: result; execution state: ${state}.`));
+            assert.doesNotMatch(delivered, /Presentation coverage: partial/);
+          }
+          assert.equal((await resolveToolObservation(committed.original)).execution.state, state);
+        });
+      }
+    }
   }
+});
+
+test('running process presentation keeps control JSON first and discloses active execution', async () => {
+  const combined = {
+    segments: ['ready'], observedBytes: 5, capturedBytes: 5, omittedBytes: 0,
+    startsAtOutputStart: true, endsAtOutputEnd: true
+  };
+  const output = execCommandTool.outputSchema.parse({
+    processId: 'process-1', status: 'running', cursorStart: 0, cursorEnd: 5,
+    owner: { ownerId: 'owner-1', runId: 'run-1', turnId: 'turn-1', toolBatchId: 'batch-1', callIndex: 0 },
+    stdout: combined,
+    stderr: { ...combined, segments: [], observedBytes: 0, capturedBytes: 0 },
+    combined, originalOutput: { kind: 'captured', cursorEnd: 5, omittedBytes: 0 }
+  });
+  let formatted = false;
+  const store = new ObservationStore();
+  const committed = await store.commitToolObservation({
+    turnIndex: 1, call: createToolCall({ name: execCommandTool.name, input: { kind: 'json', value: {} } }),
+    tool: { ...execCommandTool, buildModelContent: request => {
+      const selected = execCommandTool.buildModelContent(request);
+      formatted = true;
+      return selected;
+    } },
+    observation: parseToolObservation(execCommandTool, {
+      kind: 'result', summary: 'Process remains running',
+      scope: { resources: ['process-1'], coverage: 'complete' }, execution: { state: 'active' }, output
+    })
+  });
+  assert.equal(formatted, true, 'the actual process formatter must succeed without fallback');
+  const delivered = (await store.projectToolObservation(committed)).modelText;
+  assert.deepEqual(JSON.parse(delivered.split('\n\n', 1)[0]), {
+    status: 'running', outputCoverage: 'complete', processId: 'process-1', cursorStart: 0, cursorEnd: 5
+  });
+  assert.match(delivered, /\n\nready\n\nInvocation disposition: result; execution state: active\./);
+  assert.deepEqual((await resolveToolObservation(committed.original)).output, output);
 });
 
 test('small partial observations retain authoritative scope across every formatter path', async (t) => {
@@ -255,6 +306,7 @@ test('storage and formatter failures preserve the actual observation and known l
   const delivered = serializeToolModelContent(committed.modelContent);
   assertPartialFacts(delivered, { presentation: 'partial', execution: 'unknown' });
   assert.match(delivered, /Presentation omission causes: \["storage_failure"\]/);
+  assert.ok(delivered.startsWith('Original source\nDetailed model content is unavailable'));
   assert.doesNotMatch(delivered, /Original result coverage is unavailable/);
 });
 
@@ -316,6 +368,7 @@ test('image selection discloses unavailable modality and retains original artifa
     )
   });
   const record = await store.projectToolObservation(committed);
+  assert.deepEqual(JSON.parse(record.modelText.split('\n\n', 1)[0]), { description: 'image' });
   assert.equal(record.modelImages.length, 0);
   assert.ok(record.modelContent.some((part) => part.type === 'artifact'));
   assert.match(record.modelText, /image|Image/);
@@ -329,7 +382,8 @@ test('bounded delivery preserves the complete selected presentation and authorit
   const artifacts = new InMemoryArtifactRepository();
   const artifact = await artifacts.store({ label: 'image', content: new Uint8Array([1, 2, 3]), mediaType: 'image/png' });
   const full = 'Arabic العربية emoji 👩🏽‍💻\n'.repeat(2000);
-  const selected = [{ type: 'text', text: full }, { type: 'image', artifact, detail: 'original' }];
+  const payload = { processId: 'process-1', status: 'running' };
+  const selected = [{ type: 'text', text: JSON.stringify(payload) }, { type: 'text', text: full }, { type: 'image', artifact, detail: 'original' }];
   const value = observation({ full }, { execution: { state: 'unknown' } });
   const committed = await new ObservationStore({ artifacts, maxPresentationBytes: 2048 }).commitToolObservation({
     turnIndex: 1, call, tool: { ...tool, buildModelContent: () => selected },
@@ -338,10 +392,11 @@ test('bounded delivery preserves the complete selected presentation and authorit
   const delivered = serializeToolModelContent(committed.modelContent);
   assert.ok(Buffer.byteLength(delivered) <= 2048);
   assert.equal(delivered.isWellFormed(), true);
+  assert.deepEqual(JSON.parse(delivered.split('\n\n', 1)[0]), payload);
   assert.match(delivered, /Presentation coverage: partial/);
   assert.match(delivered, /Original result coverage: complete/);
   assert.match(delivered, /execution state: unknown/);
-  assert.deepEqual(committed.modelContent.filter(part => part.type === 'image'), [selected[1]]);
+  assert.deepEqual(committed.modelContent.filter(part => part.type === 'image'), [selected[2]]);
   const presentation = committed.modelContent.find(part => part.type === 'artifact').artifact;
   assert.deepEqual(JSON.parse(new TextDecoder().decode(await artifacts.readVerified(presentation))), selected);
   const original = await resolveToolObservation(committed.original, artifacts);
@@ -409,79 +464,82 @@ test('partial presentation cannot conceal failed authoritative original storage'
   assert.match(committed.durableStorageDegraded.message, /original disk unavailable/);
 });
 
-test('captured model requests and JSONL replay retain exact coverage facts without rerunning formatters', async (t) => {
-  const root = await mkdtemp(path.join(tmpdir(), 'observation-coverage-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const binding = { schemaId: 'tests/observation-coverage', schemaVersion: 1, subject: {} };
-  const sessions = new JsonlSessionRepository({ rootDir: root });
-  const session = await sessions.create({ binding });
-  const artifacts = new InMemoryArtifactRepository();
-  const events = new InMemoryEventRepository(agentEventCodec);
-  const requests = [];
-  let formatCount = 0;
-  let invocationCount = 0;
-  const partialTool = defineTool({
-    name: 'partial_search', implementationId: 'tests/partial-search@1', description: 'Search a bounded source',
-    schema: z.strictObject({}), outputSchema: z.string(),
-    effectEnvelope: { accesses: [{ mode: 'read', scope: 'source' }], lockScopes: [] },
-    canonicalizeInput: input => input,
-    deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'source' }], lockScopes: [], recovery: { kind: 'unknown' } }),
-    invoke: async () => {
-      invocationCount++;
-      return { kind: 'result', summary: 'Search stopped at file limit', scope: partialScope,
-        execution: { state: 'settled' }, output: 'No matches' };
-    },
-    buildModelContent: () => {
-      assert.equal(++formatCount, 1, 'replay must not call the formatter again');
-      return [{ type: 'text', text: 'No matches' }];
-    }
-  });
-  const provider = {
-    id: 'coverage-fixture', implementationId: 'tests/coverage-fixture@1',
-    describe: () => ({ id: 'coverage-fixture', displayName: 'Coverage fixture', defaultModel: 'fixture' }),
-    describeModel: async () => ({
-      id: 'fixture', provider: 'coverage-fixture',
-      modalities: { input: ['text'], output: ['text'] },
-      capabilities: {
-        streaming: false, toolCalling: true, supportedToolInputs: [{ kind: 'json' }],
-        jsonMode: false, jsonSchema: false, logprobs: false, temperature: false, topP: false
+for (const executionState of ['settled', 'active']) {
+  test(`captured JSON-first requests and JSONL replay retain ${executionState} execution and coverage facts`, async (t) => {
+    const root = await mkdtemp(path.join(tmpdir(), 'observation-coverage-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const binding = { schemaId: 'tests/observation-coverage', schemaVersion: 1, subject: {} };
+    const sessions = new JsonlSessionRepository({ rootDir: root });
+    const session = await sessions.create({ binding });
+    const artifacts = new InMemoryArtifactRepository();
+    const events = new InMemoryEventRepository(agentEventCodec);
+    const requests = [];
+    let formatCount = 0;
+    let invocationCount = 0;
+    const partialTool = defineTool({
+      name: 'partial_search', implementationId: 'tests/partial-search@1', description: 'Search a bounded source',
+      schema: z.strictObject({}), outputSchema: z.string(),
+      effectEnvelope: { accesses: [{ mode: 'read', scope: 'source' }], lockScopes: [] },
+      canonicalizeInput: input => input,
+      deriveEffects: () => ({ accesses: [{ mode: 'read', scope: 'source' }], lockScopes: [], recovery: { kind: 'unknown' } }),
+      invoke: async () => {
+        invocationCount++;
+        return { kind: 'result', summary: 'Search stopped at file limit', scope: partialScope,
+          execution: { state: executionState }, output: 'No matches' };
       },
-      limits: { contextTokens: 16000, outputTokens: 1000 }, supportedParameters: ['maxOutputTokens']
-    }),
-    complete: async request => {
-      requests.push(request);
-      return {
-        provider: 'coverage-fixture', model: request.model,
-        content: requests.length === 1 ? '' : 'Only the covered portion had no matches.',
-        terminationReason: requests.length === 1 ? 'tool_calls' : 'stop',
-        ...(requests.length === 1 ? { toolCalls: [{
-          id: 'partial-1', name: 'partial_search', type: 'function', input: { kind: 'json', value: {} }
-        }] } : {})
-      };
-    }
-  };
-  const createRuntime = (repository, descriptor) => new AgentRuntime({
-    provider, model: 'fixture', maxOutputTokens: 64, tools: [partialTool],
-    repositories: { events, artifacts, session: { repository, descriptor } },
-    toolBoundary: { authorizationPolicyId: 'tests/coverage@1', executionTargetId: 'source' },
-    toolPolicy: { allowedRisks: ['read'] }
+      buildModelContent: () => {
+        assert.equal(++formatCount, 1, 'replay must not call the formatter again');
+        return [{ type: 'text', text: JSON.stringify({ matches: [] }) }];
+      }
+    });
+    const provider = {
+      id: 'coverage-fixture', implementationId: 'tests/coverage-fixture@1',
+      describe: () => ({ id: 'coverage-fixture', displayName: 'Coverage fixture', defaultModel: 'fixture' }),
+      describeModel: async () => ({
+        id: 'fixture', provider: 'coverage-fixture',
+        modalities: { input: ['text'], output: ['text'] },
+        capabilities: {
+          streaming: false, toolCalling: true, supportedToolInputs: [{ kind: 'json' }],
+          jsonMode: false, jsonSchema: false, logprobs: false, temperature: false, topP: false
+        },
+        limits: { contextTokens: 16000, outputTokens: 1000 }, supportedParameters: ['maxOutputTokens']
+      }),
+      complete: async request => {
+        requests.push(request);
+        return {
+          provider: 'coverage-fixture', model: request.model,
+          content: requests.length === 1 ? '' : 'Only the covered portion had no matches.',
+          terminationReason: requests.length === 1 ? 'tool_calls' : 'stop',
+          ...(requests.length === 1 ? { toolCalls: [{
+            id: 'partial-1', name: 'partial_search', type: 'function', input: { kind: 'json', value: {} }
+          }] } : {})
+        };
+      }
+    };
+    const createRuntime = (repository, descriptor) => new AgentRuntime({
+      provider, model: 'fixture', maxOutputTokens: 64, tools: [partialTool],
+      repositories: { events, artifacts, session: { repository, descriptor } },
+      toolBoundary: { authorizationPolicyId: 'tests/coverage@1', executionTargetId: 'source' },
+      toolPolicy: { allowedRisks: ['read'] }
+    });
+    const first = await createRuntime(sessions, session).run({ task: 'Search the source' }).result;
+    assert.equal(first.state, 'ended', JSON.stringify(first));
+    assert.equal(first.terminal.executionStatus, 'completed', JSON.stringify(first));
+    const firstToolMessage = requests[1].messages.find(message => message.role === 'tool' && message.toolName === partialTool.name);
+    assert.deepEqual(JSON.parse(firstToolMessage.content.split('\n\n', 1)[0]), { matches: [] });
+    assertPartialFacts(firstToolMessage.content, { execution: executionState });
+    const restartedSessions = new JsonlSessionRepository({ rootDir: root });
+    const reopened = await restartedSessions.open(session.id, binding);
+    const replay = await restartedSessions.loadReplayState(reopened);
+    const recorded = replay.branch.find(entry => entry.type === 'observation' && entry.toolName === partialTool.name);
+    assert.equal(serializeToolModelContent(await resolveToolModelContent(recorded, artifacts)), firstToolMessage.content);
+    const second = await createRuntime(restartedSessions, reopened).run({ task: 'What portion was covered?' }).result;
+    assert.equal(second.state, 'ended', JSON.stringify(second));
+    assert.equal(second.terminal.executionStatus, 'completed', JSON.stringify(second));
+    const replayedToolMessage = requests[2].messages.find(message => message.role === 'tool' && message.toolName === partialTool.name);
+    for (const field of ['content', 'role', 'toolCallId', 'toolCallType', 'toolName'])
+      assert.equal(replayedToolMessage[field], firstToolMessage[field], field);
+    assert.equal(formatCount, 1);
+    assert.equal(invocationCount, 1);
   });
-  const first = await createRuntime(sessions, session).run({ task: 'Search the source' }).result;
-  assert.equal(first.state, 'ended', JSON.stringify(first));
-  assert.equal(first.terminal.executionStatus, 'completed', JSON.stringify(first));
-  const firstToolMessage = requests[1].messages.find(message => message.role === 'tool' && message.toolName === partialTool.name);
-  assertPartialFacts(firstToolMessage.content);
-  const restartedSessions = new JsonlSessionRepository({ rootDir: root });
-  const reopened = await restartedSessions.open(session.id, binding);
-  const replay = await restartedSessions.loadReplayState(reopened);
-  const recorded = replay.branch.find(entry => entry.type === 'observation' && entry.toolName === partialTool.name);
-  assert.equal(serializeToolModelContent(await resolveToolModelContent(recorded, artifacts)), firstToolMessage.content);
-  const second = await createRuntime(restartedSessions, reopened).run({ task: 'What portion was covered?' }).result;
-  assert.equal(second.state, 'ended', JSON.stringify(second));
-  assert.equal(second.terminal.executionStatus, 'completed', JSON.stringify(second));
-  const replayedToolMessage = requests[2].messages.find(message => message.role === 'tool' && message.toolName === partialTool.name);
-  for (const field of ['content', 'role', 'toolCallId', 'toolCallType', 'toolName'])
-    assert.equal(replayedToolMessage[field], firstToolMessage[field], field);
-  assert.equal(formatCount, 1);
-  assert.equal(invocationCount, 1);
-});
+}
