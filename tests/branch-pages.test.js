@@ -3,8 +3,8 @@ import test from 'node:test';
 import { appendFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { InMemorySessionRepository } from '@agent-core/runtime';
-import { JsonlSessionRepository, SessionHistoryIndexError } from '@agent-core/runtime/node';
+import { HistoryReader, InMemorySessionRepository } from '@agent-core/runtime';
+import { JsonlSessionRepository } from '@agent-core/runtime/node';
 
 const binding = { schemaId: 'tests/branch-pages', schemaVersion: 1, subject: {} };
 
@@ -164,12 +164,9 @@ test('snapshot cursors remain stable after append and reject another branch, ses
   await writeFile(file, rewritten + JSON.stringify(branch) + '\n' + JSON.stringify(next) + '\n');
   await assert.rejects(
     repository.readBranchPage(session, { cursor: first.older }),
-    error => {
-      assert(error instanceof SessionHistoryIndexError);
-      assert.match(error.cause.message, /does not match its original history/u);
-      return true;
-    }
+    /History boundary does not match its source/u
   );
+  assert.equal(await readFile(file, 'utf8'), rewritten + JSON.stringify(branch) + '\n' + JSON.stringify(next) + '\n');
 });
 
 test('oversized page entries stay available through explicit source reads', async (t) => {
@@ -195,18 +192,16 @@ test('source snapshots advance membership metadata without historical body reads
   const before = repository.historyReadMetrics(session.id);
   assert.equal(first.sourceRevision, 9);
   assert.equal(first.entries.length, 8);
-  assert.equal(first.finalizedRuns.has('run-0'), true);
+  assert.equal(await first.finalizedRuns.has('run-0'), true);
   assert(
-    [...first.entries].every(
+    (await Array.fromAsync(first.entries)).every(
       (entry) => !('task' in entry) && typeof entry.sha256 === 'string' && entry.bytes > 0
     )
   );
   const appended = await memory.appendInput(session, { runId: 'append', task: 'new source' });
   const encoded = JSON.stringify(appended) + '\n';
   await appendFile(file, encoded);
-  await assert.rejects(repository.sourceSnapshot(session), SessionHistoryIndexError);
-  assert.equal(repository.historyReadMetrics(session.id).scannedBytes, before.scannedBytes);
-  await repository.rebuildHistoryIndex(session.id, session.header.binding);
+  // An externally changed original is fully validated before its projection is recovered.
   const latest = await repository.sourceSnapshot(session);
   assert.equal(latest.sourceRevision, first.sourceRevision + 1);
   assert.equal(
@@ -226,4 +221,48 @@ test('source snapshots advance membership metadata without historical body reads
     /abort/i
   );
   assert.equal((await repository.sourceSnapshot(session)).entries.length, 9);
+});
+
+test('1000-input indexed UI misses perform no body reads after bounded population', async (t) => {
+  const { repository, session } = await fixture(t, 1000);
+  const before = repository.historyReadMetrics(session.id);
+  let result = await repository.searchBranch(session, { query: 'not-in-the-originals', maxIndexEntries: 16, maxMetadataVisits: 128 });
+  assert(result.metadataVisited <= 128);
+  assert(repository.historyReadMetrics(session.id).metadataRecordsRead - before.metadataRecordsRead < 512, 'cold UI setup reads bounded projection paths, not the whole metadata tree');
+  assert.equal(result.coverage, 'partial');
+  assert.equal(result.matches.length, 0);
+  while (result.older) {
+    result = await repository.searchBranch(session, { query: 'not-in-the-originals', cursor: result.older, maxIndexEntries: 16 });
+    assert(result.indexed <= 16);
+  }
+  const baseline = repository.historyReadMetrics(session.id).bodyRecordsRead;
+  assert.equal(baseline, 1000);
+  for (let at = 0; at < 3; at++) {
+    const miss = await repository.searchBranch(session, { query: 'not-in-the-originals' });
+    assert.equal(miss.coverage, 'complete');
+    assert.equal(miss.scannedBytes, 0);
+  }
+  assert.equal(repository.historyReadMetrics(session.id).bodyRecordsRead, baseline);
+  const cold = new JsonlSessionRepository({ rootDir: path.dirname(repository.location(session.id)) });
+  const coldReader = new HistoryReader({ repository: cold, session });
+  const bounded = await coldReader.search({ query: 'missing model text', maxIndexEntries: 1, maxScanned: 1 });
+  assert.equal(bounded.coverage, 'partial');
+  assert.equal(cold.historyReadMetrics(session.id).bodyRecordsRead, 1);
+  assert(cold.historyReadMetrics(session.id).metadataRecordsRead < 512, 'cold model setup reads bounded projection paths, not the whole metadata tree');
+});
+
+test('UI search continuation progresses after projection loss and repository restart', async (t) => {
+  const { repository, session, entries } = await fixture(t, 6);
+  let page = await repository.searchBranch(session, { query: 'NEEDLE', maxIndexEntries: 1 });
+  const hits = [...page.matches];
+  let restarted = repository;
+  for (let step = 0; page.older; step++) {
+    assert(step < 10, 'a cold continuation must start at its cursor, never the original leaf');
+    restarted = new JsonlSessionRepository({ rootDir: path.dirname(repository.location(session.id)) });
+    page = await restarted.searchBranch(session, { query: 'NEEDLE', cursor: page.older, maxIndexEntries: 1 });
+    hits.push(...page.matches);
+  }
+  assert.deepEqual(hits.map(hit => hit.entryId), [entries[0].id]);
+  const fresh = await restarted.searchBranch(session, { query: 'Input 5' });
+  assert.deepEqual(fresh.matches.map(hit => hit.entryId), [entries[5].id]);
 });

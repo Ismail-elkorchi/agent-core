@@ -5,7 +5,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { LocalArtifactRepository, JsonlEventRepository } from '@agent-core/persistence/node';
-import { AgentRunConflictError, AgentRunCoordinator, AgentRuntime, AgentSession, SessionSubmissionOwnershipError,
+import { AgentRunCoordinator, AgentRuntime, AgentSession, SessionSubmissionOwnershipError,
   agentEventCodec } from '@agent-core/runtime';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 
@@ -42,7 +42,7 @@ async function fixture(t) {
       return { provider: 'fixture', model: 'fixture', content: 'Done', terminationReason: 'stop' };
     }
   };
-  function dispatcher(createRuntime, configureEvents) {
+  function dispatcher(createRuntime, configureEvents, scheduling = 'manual') {
     const repository = new JsonlSessionRepository({ rootDir: path.join(root, 'sessions') });
     const events = new JsonlEventRepository({ rootDir: path.join(root, 'events'), codec: agentEventCodec });
     configureEvents?.(events);
@@ -54,7 +54,7 @@ async function fixture(t) {
       repositories: { events, artifacts, session: { repository, descriptor } },
       release() { releases += 1; } });
     const session = new AgentSession({ descriptor, expectedBinding: binding, repository, runs,
-      configuration, scheduling: 'manual', createRuntime: createRuntime ? () => createRuntime(runtime) : runtime });
+      configuration, scheduling, createRuntime: createRuntime ? () => createRuntime(runtime) : runtime });
     return { session, repository, runs, releases: () => releases };
   }
   return { root, descriptor, repository: firstRepository, dispatcher, providerStarted,
@@ -72,7 +72,7 @@ test('two JSONL dispatchers cannot let the rejected claimant settle the active w
   const started = await first.session.startNextSubmission();
   await f.providerStarted.promise;
   const [winner] = await f.repository.loadPendingSubmissions(f.descriptor);
-  await assert.rejects(second.session.startNextSubmission(), SessionSubmissionOwnershipError);
+  assert.equal(await second.session.startNextSubmission(), undefined);
   assert.deepEqual(await f.repository.loadPendingSubmissions(f.descriptor), [winner]);
   assert.equal(winner.state, 'claimed');
   assert.equal(f.calls(), 1);
@@ -107,8 +107,9 @@ for (const factoryOutcome of ['returns', 'throws']) {
     const inspection = await second.session.inspect();
     assert.equal(inspection.pendingSubmissions[0].state, 'claimed');
     assert.deepEqual(inspection.runs, []);
-    const recovered = await second.session.startNextSubmission();
-    await f.providerStarted.promise;
+    assert.equal(await second.session.startNextSubmission(), undefined, 'A live factory retains execution ownership');
+    const [previous] = await f.repository.loadPendingSubmissions(f.descriptor);
+    await f.repository.transitionSubmission(f.descriptor, previous.submissionId, { state: 'claimed', claimId: 'replacement', expectedClaimId: previous.claimId });
     const [winner] = await f.repository.loadPendingSubmissions(f.descriptor);
     if (factoryOutcome === 'throws') factoryResult.reject(new Error('Factory failed'));
     else factoryResult.resolve();
@@ -116,12 +117,14 @@ for (const factoryOutcome of ['returns', 'throws']) {
     await assert.rejects(queued.completion, factoryOutcome === 'throws' ? /Factory failed/ : SessionSubmissionOwnershipError);
     assert.deepEqual(await f.repository.loadPendingSubmissions(f.descriptor), [winner]);
     assert.equal(first.releases(), factoryOutcome === 'returns' ? 1 : 0);
-    assert.equal(second.releases(), 0, 'The new owner keeps its execution resources');
+    assert.equal(second.releases(), 0, 'The competing dispatcher has not constructed a runtime');
     if (supersededRuntime) {
       await supersededRuntime.close();
       assert.equal(first.releases(), 1, 'Closing a discarded runtime releases exactly once');
       assert.throws(() => supersededRuntime.run({ task: 'Cannot reuse discarded resources' }), /has been closed/);
     }
+    const recovered = await second.session.startNextSubmission();
+    await f.providerStarted.promise;
     assert.equal(f.calls(), 1);
     f.providerResult.resolve();
     const result = await recovered.completion;
@@ -143,7 +146,7 @@ for (const factoryOutcome of ['returns', 'throws']) {
 for (const settlement of ['completed', 'failed', 'suspended']) {
   test(`JSONL submission ownership fences a stale ${settlement} settlement`, async t => {
     const f = await fixture(t);
-    await f.repository.enqueueSubmission(f.descriptor, { submissionId: 'input', runId: 'run',
+    await f.repository.admitSubmission(f.descriptor, { submissionId: 'input', runId: 'run',
       input: { task: 'Do work' }, configuration });
     await f.repository.transitionSubmission(f.descriptor, 'input', { state: 'claimed', claimId: 'old' });
     const next = f.dispatcher().repository;
@@ -206,7 +209,7 @@ for (const [boundary, exitCode, expectedState, accepted] of [
   });
 }
 
-test('run admission fencing rejects the original dispatcher after its last ownership read races recovery', { timeout: 10000 }, async t => {
+test('execution ownership spans the run.accepted boundary without live takeover', { timeout: 10000 }, async t => {
   const f = await fixture(t);
   const admissionStarted = deferred();
   const admissionReleased = deferred();
@@ -221,25 +224,19 @@ test('run admission fencing rejects the original dispatcher after its last owner
     };
   });
   await original.session.submit({ task: 'Fence delayed acceptance' });
-  const originalAttempt = await original.session.startNextSubmission();
-  const rejected = assert.rejects(originalAttempt.completion, AgentRunConflictError);
+  const attempt = await original.session.startNextSubmission();
   await admissionStarted.promise;
-  const recovered = f.dispatcher();
-  await recovered.session.restore();
-  const recoveredAttempt = await recovered.session.startNextSubmission();
-  await f.providerStarted.promise;
-  const [winner] = await f.repository.loadPendingSubmissions(f.descriptor);
+  const observer = f.dispatcher(() => assert.fail('Live admission cannot be recovered'));
+  await observer.session.restore();
+  const before = (await f.repository.loadPendingSubmissions(f.descriptor))[0];
+  assert.equal(await observer.session.startNextSubmission(), undefined);
+  assert.deepEqual((await f.repository.loadPendingSubmissions(f.descriptor))[0], before);
   admissionReleased.resolve();
-  await rejected;
-  assert.deepEqual(await f.repository.loadPendingSubmissions(f.descriptor), [winner]);
-  assert.equal(f.calls(), 1);
-  assert.equal(original.releases(), 1);
-  assert.equal(recovered.releases(), 0);
+  await f.providerStarted.promise;
   f.providerResult.resolve();
-  assert.equal((await recoveredAttempt.completion).terminal.executionStatus, 'completed');
-  assert.deepEqual(await f.repository.loadPendingSubmissions(f.descriptor), []);
-  await original.session.close();
-  await recovered.session.close();
+  assert.equal((await attempt.completion).terminal.executionStatus, 'completed');
+  assert.equal(f.calls(), 1);
+  await Promise.all([original.session.close(), observer.session.close()]);
 });
 
 test('an active runtime cannot be closed and explicit idle close is final and idempotent', { timeout: 10000 }, async t => {
@@ -266,42 +263,97 @@ test('an active runtime cannot be closed and explicit idle close is final and id
   await owner.session.close();
 });
 
-test('failed recovery admission cannot fail an original dispatcher whose run acceptance is in flight', { timeout: 10000 }, async t => {
+test('factory failure releases execution ownership for automatic same-submission recovery', { timeout: 10000 }, async t => {
   const f = await fixture(t);
-  const admissionStarted = deferred();
-  const admissionReleased = deferred();
-  const original = f.dispatcher(undefined, events => {
-    const append = events.appendConditional.bind(events);
-    events.appendConditional = async (runId, event, options) => {
-      if (options.idempotencyKey === `${runId}:run:accepted`) {
-        admissionStarted.resolve();
-        await admissionReleased.promise;
-      }
-      return append(runId, event, options);
-    };
-  });
-  await original.session.submit({ task: 'Keep uncertain admission recoverable' });
-  const attempt = await original.session.startNextSubmission();
-  const staleCompletion = assert.rejects(attempt.completion, SessionSubmissionOwnershipError);
-  await admissionStarted.promise;
-  const recovery = f.dispatcher(() => { throw new Error('Recovery runtime unavailable'); });
+  const failed = f.dispatcher(() => { throw new Error('Factory unavailable'); });
+  const submitted = await failed.session.submit({ task: 'Recover without a new submission' });
+  const rejection = assert.rejects(submitted.completion, /Factory unavailable/);
+  await assert.rejects(failed.session.startNextSubmission(), /Factory unavailable/);
+  await rejection;
+  const [before] = await f.repository.loadPendingSubmissions(f.descriptor);
+  assert.equal(before.state, 'claimed');
+  const recovery = f.dispatcher(undefined, undefined, 'automatic');
   await recovery.session.restore();
-  await assert.rejects(recovery.session.startNextSubmission(), /Recovery runtime unavailable/);
-  const [pending] = await f.repository.loadPendingSubmissions(f.descriptor);
-  assert.equal(pending.state, 'claimed');
-  admissionReleased.resolve();
   await f.providerStarted.promise;
   f.providerResult.resolve();
-  await staleCompletion;
+  await recovery.session.waitForIdle();
   assert.equal(f.calls(), 1);
-  assert.deepEqual(await f.repository.loadPendingSubmissions(f.descriptor), [pending]);
-  const final = f.dispatcher();
-  await final.session.restore();
-  const settled = await final.session.startNextSubmission();
-  assert.equal((await settled.completion).terminal.executionStatus, 'completed');
-  assert.equal(f.calls(), 1, 'Terminal recovery cannot rerun the provider');
   assert.deepEqual(await f.repository.loadPendingSubmissions(f.descriptor), []);
-  await original.session.close();
-  await recovery.session.close();
-  await final.session.close();
+  assert.equal((await recovery.runs.inspect(submitted.runId)).state.phase.kind, 'terminal');
+  await Promise.all([failed.session.close(), recovery.session.close()]);
+});
+
+test('two restored automatic clients serialize distinct submissions and settle both original completion handles', { timeout: 10000 }, async t => {
+  const f = await fixture(t);
+  const first = f.dispatcher(undefined, undefined, 'automatic');
+  const second = f.dispatcher(undefined, undefined, 'automatic');
+  await Promise.all([first.session.restore(), second.session.restore()]);
+  const a = await first.session.submit({ task: 'first distinct input' });
+  await Promise.race([f.providerStarted.promise, a.completion.then(result => assert.fail(`Run ended before provider start: ${JSON.stringify(result)}`))]);
+  const b = await second.session.submit({ task: 'second distinct input' });
+  assert.equal(a.kind, 'started');
+  assert.equal(b.kind, 'queued');
+  const inspected = await second.session.inspect();
+  assert.equal(inspected.session.phase, 'running');
+  assert.equal(inspected.session.activeRunId, a.runId);
+  assert.equal(inspected.session.queuedInputs, 1);
+  await new Promise(resolve => setTimeout(resolve, 250));
+  assert.equal(f.calls(), 1);
+  f.providerResult.resolve();
+  const results = await Promise.all([a.completion, b.completion]);
+  assert.deepEqual(results.map(result => result.terminal.runId), [a.runId, b.runId]);
+  assert.equal(f.calls(), 2);
+  assert.deepEqual(await f.repository.loadPendingSubmissions(f.descriptor), []);
+  await Promise.all([first.session.close(), second.session.close()]);
+});
+
+test('an idle automatic client discovers durable input admitted by another client', { timeout: 10000 }, async t => {
+  const f = await fixture(t);
+  const automatic = f.dispatcher(undefined, undefined, 'automatic');
+  await automatic.session.restore();
+  const origin = f.dispatcher();
+  const submission = await origin.session.submit({ task: 'discover without another user action' });
+  await Promise.race([f.providerStarted.promise, submission.completion.then(result => assert.fail(`Run ended before provider start: ${JSON.stringify(result)}`))]);
+  assert.equal(f.calls(), 1);
+  f.providerResult.resolve();
+  assert.equal((await submission.completion).terminal.runId, submission.runId);
+  await Promise.all([automatic.session.close(), origin.session.close()]);
+});
+
+
+test("a restored observer never reexecutes its owner's completed submission", { timeout: 10000 }, async t => {
+  const f = await fixture(t);
+  const owner = f.dispatcher(undefined, undefined, 'automatic');
+  const submission = await owner.session.submit({ task: 'Complete with the original owner' });
+  await Promise.race([f.providerStarted.promise, submission.completion.then(result => assert.fail(JSON.stringify(result)))]);
+  const observer = f.dispatcher(() => assert.fail('Completed work cannot be recovered again'));
+  await observer.session.restore();
+  assert.equal((await observer.session.inspect()).session.activeRunId, submission.runId);
+  f.providerResult.resolve();
+  await submission.completion;
+  assert.equal((await observer.session.inspect()).session.phase, 'idle');
+  assert.equal(await observer.session.startNextSubmission(), undefined);
+  assert.equal(f.calls(), 1);
+  await Promise.all([owner.session.close(), observer.session.close()]);
+});
+
+test('waiting for idle on a restored observer never reclaims a healthy occupying run', { timeout: 10000 }, async t => {
+  const f = await fixture(t);
+  const owner = f.dispatcher(undefined, undefined, 'automatic');
+  const submission = await owner.session.submit({ task: 'Keep the executing owner while another client waits' });
+  await Promise.race([f.providerStarted.promise, submission.completion.then(result => assert.fail(JSON.stringify(result)))]);
+  const observer = f.dispatcher(() => assert.fail('Waiting cannot construct a recovery runtime'), undefined, 'automatic');
+  await observer.session.restore();
+  const before = (await f.repository.loadPendingSubmissions(f.descriptor))[0];
+  let idle = false;
+  const waiting = observer.session.waitForIdle().then(() => { idle = true; });
+  await new Promise(resolve => setTimeout(resolve, 250));
+  assert.equal(idle, false);
+  assert.equal((await f.repository.loadPendingSubmissions(f.descriptor))[0].claimId, before.claimId);
+  assert.equal(f.calls(), 1);
+  f.providerResult.resolve();
+  assert.equal((await submission.completion).terminal.executionStatus, 'completed');
+  await waiting;
+  assert.equal((await observer.session.inspect()).session.phase, 'idle');
+  await Promise.all([owner.session.close(), observer.session.close()]);
 });

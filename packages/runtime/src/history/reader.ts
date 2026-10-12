@@ -1,8 +1,8 @@
+import { confirmCommittedSessionFinalization } from '../orchestration/finalization.js';
 import { historyToolName, matchesHistoryMetadata } from './metadata.js';
 import {
   HistorySearchIndex,
-  type IndexedHistorySource,
-  type HistorySearchPosition
+  type IndexedHistorySource
 } from './search-index.js';
 import { parseJsonObject } from '@agent-core/json';
 import {
@@ -25,6 +25,7 @@ import type {
 } from '../session/contracts.js';
 import type {
   HistorySourceMetadata,
+  HistorySearchPosition,
   HistoryMetadataPage,
   HistoryMetadataPageRequest,
   HistoryFilter,
@@ -64,6 +65,7 @@ export class HistoryReader {
         complete: boolean;
         unread: HistoryUnreadSource[];
         partialStart: boolean;
+        invalidAt?: number | undefined;
       }
     | undefined;
   private captureIndex:
@@ -77,43 +79,36 @@ export class HistoryReader {
     | undefined;
 
   /** Refresh only new branch metadata. Confirmed terminal commits are immutable. */
-  private captureRuns(snapshot: SessionSourceSnapshot) {
+  private async captureRuns(snapshot: SessionSourceSnapshot) {
     let index = this.captureIndex;
     const previous = index?.snapshot;
-    const last = previous?.entries.at(-1);
+    const last = (await previous?.entries.at(-1));
     const extendsPrevious =
       previous?.branchId === snapshot.branchId &&
       previous.sourceRevision <= snapshot.sourceRevision &&
       previous.entries.length <= snapshot.entries.length &&
       (last === undefined ||
-        (snapshot.entries.at(previous.entries.length - 1)?.entryId === last.entryId &&
-          snapshot.entries.at(previous.entries.length - 1)?.sha256 === last.sha256));
+        ((await snapshot.entries.at(previous.entries.length - 1))?.entryId === last.entryId &&
+          (await snapshot.entries.at(previous.entries.length - 1))?.sha256 === last.sha256));
     if (!index || !extendsPrevious) {
       index = {
         snapshot,
         pending: new Map(),
         ended: new Set(),
-        inherited: snapshot.inheritedHeads
+        inherited: await snapshot.inheritedHeads
       };
       this.captureIndex = index;
     }
     if (previous !== snapshot) {
-      for (
-        let at = extendsPrevious ? previous.entries.length : 0;
-        at < snapshot.entries.length;
-        at++
-      ) {
-        const runId = snapshot.entries.at(at)?.runId;
-        if (
-          runId &&
-          !index.ended.has(runId) &&
-          !index.inherited.has(runId) &&
-          !index.pending.has(runId)
-        )
-          index.pending.set(runId, false);
+      for await (const { runId, finalized } of snapshot.unconfirmedRuns()) {
+        if (!index.ended.has(runId) && !index.inherited.has(runId))
+          index.pending.set(runId, finalized);
       }
-      for (const runId of index.pending.keys())
-        if (snapshot.finalizedRuns.has(runId)) index.pending.set(runId, true);
+      // A durable confirmation removes a formerly outstanding run without querying its archive.
+      for (const runId of index.pending.keys()) {
+        if (await snapshot.confirmedHead(runId)) { index.pending.delete(runId); index.ended.add(runId); }
+        else if (await snapshot.finalizedRuns.has(runId)) index.pending.set(runId, true);
+      }
       index.snapshot = snapshot;
     }
     return index;
@@ -138,15 +133,32 @@ export class HistoryReader {
       sourceRevision: snapshot.sourceRevision
     };
     if (!this.options.events) return Object.freeze({ ...boundary, ledgerCoverage: 'session' });
-    const index = this.captureRuns(snapshot);
+    const index = await this.captureRuns(snapshot);
     const heads: HistoryLedgerHead[] = [...index.inherited.values()];
     // Own this capture's work before awaiting: another capture may observe a later boundary.
     const pending = [...index.pending];
+    let repaired = false;
     for (const [runId, finalized] of pending) {
-      if (finalized && (await this.options.events.latestReferenceOfType(runId, 'run.ended', { metadataOnly: true }))) {
-        index.ended.add(runId);
-        index.pending.delete(runId);
-        continue;
+      if (finalized) {
+        const committed = await this.options.events.latestOfType(runId, 'run.ended');
+        if (committed?.event.type === 'run.ended') {
+          const terminal = committed.event.terminal;
+          if (terminal.runId !== runId) throw new Error('Authoritative terminal run identity mismatch.');
+          const source = { runId, eventId: committed.eventId, sequence: committed.sequence, hash: committed.hash };
+          const diagnostic = await confirmCommittedSessionFinalization({
+            events: this.options.events,
+            session: { repository: this.options.repository, descriptor: this.options.session },
+            terminal, source, rejectConflicts: true
+          });
+          if (diagnostic) {
+            heads.push({ runId, sequence: source.sequence, hash: source.hash });
+            continue;
+          }
+          repaired = true;
+          index.ended.add(runId);
+          index.pending.delete(runId);
+          continue;
+        }
       }
       const tail = await this.options.events.tail(runId, { metadataOnly: true });
       heads.push(
@@ -158,6 +170,11 @@ export class HistoryReader {
       );
     }
 
+    if (repaired) {
+      const refreshed = await this.options.repository.sourceSnapshot(this.options.session);
+      if (refreshed.boundary.leafId === snapshot.boundary.leafId && refreshed.boundary.leafHash === snapshot.boundary.leafHash)
+        boundary.sourceRevision = refreshed.sourceRevision;
+    }
     return Object.freeze({
       ...boundary,
       ledgerCoverage: 'authoritative',
@@ -178,7 +195,7 @@ export class HistoryReader {
     )
       return false;
     const snapshot = await this.snapshot(next);
-    if (previous.throughEntryId !== null && !snapshot.index.byId.has(previous.throughEntryId))
+    if (previous.throughEntryId !== null && !(await snapshot.index.byId.has(previous.throughEntryId)))
       return false;
     await this.snapshot(previous);
     for (const head of previous.ledgerHeads ?? []) {
@@ -199,7 +216,7 @@ export class HistoryReader {
     cut: HistorySourceCut
   ): Promise<readonly HistorySourceRef[]> {
     const snapshot = await this.snapshot(cut);
-    if (!snapshot.index.runs.has(invocation.runId))
+    if (!(await snapshot.index.runs.has(invocation.runId)))
       throw new Error('Tool invocation is outside the authorized branch.');
     if (this.options.events && cut.ledgerCoverage === 'authoritative') {
       const head = await this.head(invocation.runId, cut, snapshot);
@@ -226,21 +243,21 @@ export class HistoryReader {
       `tool_call:${invocation.runId}:${invocation.toolBatchId}:${String(invocation.callIndex)}`,
       `observation:${invocation.runId}:${invocation.turnId}:${String(invocation.requestAttempt)}:${invocation.toolBatchId}:${String(invocation.callIndex)}:${String(invocation.toolAttempt)}`
     ];
-    const assistant = ['complete', 'partial', 'indeterminate', 'absent']
-      .map((status) =>
-        snapshot.index.byIdentity.get(
+    const assistant = (await Promise.all(['complete', 'partial', 'indeterminate', 'absent']
+      .map(async (status) =>
+        (await snapshot.index.byIdentity.get(
           `assistant:${invocation.runId}:${invocation.turnId}:${String(invocation.requestAttempt)}:${status}`
-        )
-      )
+        ))
+      )))
       .find((entry) => entry !== undefined);
     if (!assistant) throw new Error('Context operation has an unresolved assistant source.');
     return [
       metadataSource(cut.sessionId, assistant),
-      ...identities.map((identity) => {
-        const metadata = snapshot.index.byIdentity.get(identity);
+      ...await Promise.all(identities.map(async (identity) => {
+        const metadata = (await snapshot.index.byIdentity.get(identity));
         if (!metadata) throw new Error('Context operation has an unresolved tool exchange.');
         return metadataSource(cut.sessionId, metadata);
-      })
+      }))
     ];
   }
 
@@ -250,7 +267,7 @@ export class HistoryReader {
     if (
       cut.sessionId !== this.options.session.id ||
       cut.sourceRevision > current.sourceRevision ||
-      (cut.throughEntryId !== null && !current.index.byId.has(cut.throughEntryId))
+      (cut.throughEntryId !== null && !(await current.index.byId.has(cut.throughEntryId)))
     )
       throw new Error('History cut is outside the authorized branch or incompatible.');
     const snapshot =
@@ -263,13 +280,13 @@ export class HistoryReader {
     const seen = new Set<string>();
     for (const head of cut.ledgerHeads ?? []) {
       if (
-        !runs.has(head.runId) ||
+        !(await runs.has(head.runId)) ||
         seen.has(head.runId) ||
         (head.sequence < 0 ? head.hash !== undefined : head.hash === undefined)
       )
         throw new Error('History cut has an invalid or unauthorized run boundary.');
       seen.add(head.runId);
-      const inherited = current.inheritedHeads.get(head.runId);
+      const inherited = (await current.inheritedHeads).get(head.runId);
       if (
         inherited &&
         (head.sequence > inherited.sequence ||
@@ -286,9 +303,11 @@ export class HistoryReader {
     snapshot: SessionSourceSnapshot
   ): Promise<HistoryLedgerHead> {
     const explicit =
-      cut.ledgerHeads?.find((head) => head.runId === runId) ?? snapshot.inheritedHeads.get(runId);
+      cut.ledgerHeads?.find((head) => head.runId === runId) ?? (await snapshot.inheritedHeads).get(runId);
     if (explicit) return explicit;
-    if (snapshot.finalizedRuns.has(runId) && this.options.events) {
+    const confirmed = await snapshot.confirmedHead(runId);
+    if (confirmed) return confirmed;
+    if ((await snapshot.finalizedRuns.has(runId)) && this.options.events) {
       const ended = await this.options.events.latestReferenceOfType(runId, 'run.ended', { metadataOnly: true });
       if (ended) return { runId, sequence: ended.sequence, hash: ended.hash };
     }
@@ -298,7 +317,7 @@ export class HistoryReader {
   async selectedContext(cut?: HistorySourceCut): Promise<ContextWindowRecord | undefined> {
     cut ??= await this.capture();
     const snapshot = await this.snapshot(cut);
-    const metadata = snapshot.latestContext;
+    const metadata = await snapshot.latestContext;
     if (!metadata) return undefined;
     const entry = await this.sessionEntry(metadata, snapshot, MAX_SOURCE_BYTES);
     return entry.type === 'context_transition' ? entry.window : undefined;
@@ -347,12 +366,12 @@ export class HistoryReader {
           source.event.sequence > head.sequence
         )
           throw new Error('Selected event is outside its authorized history boundary.');
-        position = index.inputs.get(source.event.runId);
+        position = (await index.inputs.get(source.event.runId));
         sequence = source.event.sequence;
       } else {
-        const metadata = index.bySource.get(source.entryId);
+        const metadata = (await index.bySource.get(source.entryId));
         if (metadata && sameHistorySource(metadataSource(cut.sessionId, metadata), source))
-          position = index.positions.get(metadata.entryId);
+          position = (await index.positions.get(metadata.entryId));
       }
       if (position === undefined)
         throw new Error('Selected source is outside the authorized branch.');
@@ -381,7 +400,8 @@ export class HistoryReader {
     cut?: HistorySourceCut,
     maxSourceBytes = MAX_SOURCE_BYTES,
     maxRecords = Number.POSITIVE_INFINITY,
-    enrich = true
+    enrich = true,
+    captured?: SessionSourceSnapshot
   ): Promise<
     { entry: SessionBranchEntry | undefined; bytes: number; scanned: number } | undefined
   > {
@@ -389,11 +409,11 @@ export class HistoryReader {
     bound(maxSourceBytes, MAX_SOURCE_BYTES, MAX_SOURCE_BYTES, 'maxSourceBytes');
     if (source.sessionId !== this.options.session.id) return undefined;
     cut ??= await this.capture();
-    const snapshot = await this.snapshot(cut);
+    const snapshot = captured ?? await this.snapshot(cut);
     if (source.event && this.options.events && cut.ledgerCoverage === 'authoritative') {
       if (source.entryId !== `event:${source.event.eventId}` || source.sha256 !== source.event.hash)
         throw new Error('History source identity mismatch.');
-      if (!snapshot.index.runs.has(source.event.runId)) return undefined;
+      if (!(await snapshot.index.runs.has(source.event.runId))) return undefined;
       const head = await this.head(source.event.runId, cut, snapshot);
       if (source.event.sequence > head.sequence) return undefined;
       const page = await this.options.events.readRange(source.event.runId, {
@@ -431,7 +451,7 @@ export class HistoryReader {
         scanned: page.scanned + resolved.scanned
       };
     }
-    const metadata = snapshot.index.bySource.get(source.entryId);
+    const metadata = (await snapshot.index.bySource.get(source.entryId));
     if (!metadata) return undefined;
     const entry = await this.sessionEntry(metadata, snapshot, maxSourceBytes);
     if (!sameHistorySource(sourceRef(source.sessionId, entry), source))
@@ -476,16 +496,15 @@ export class HistoryReader {
       },
       this.options.artifacts
     );
-    return {
-      entry: Object.freeze({
-        ...entry,
-        output:
-          observation.kind === 'result'
-            ? observation.output
-            : encodeToolFailureOutput(observation.output)
-      }),
-      bytes: entry.originalArtifact.size
-    };
+    const hydrated = Object.freeze({
+      ...entry,
+      output: observation.kind === 'result' ? observation.output : encodeToolFailureOutput(observation.output)
+    });
+    // Hydration is a representation of the persisted original, never a new source identity.
+    sourceReferences.set(hydrated, new Map([
+      [this.options.session.id, sourceRef(this.options.session.id, entry)]
+    ]));
+    return { entry: hydrated, bytes: entry.originalArtifact.size };
   }
 
   private async eventEntry(
@@ -501,8 +520,8 @@ export class HistoryReader {
     let bytes = 0,
       scanned = 0;
     const mirror =
-      snapshot.index.bySource.get(`event:${record.eventId}`) ??
-      snapshot.index.byIdentity.get(entryIdentity(entry));
+      (await snapshot.index.bySource.get(`event:${record.eventId}`)) ??
+      (await snapshot.index.byIdentity.get(entryIdentity(entry)));
     if (mirror) {
       if (scanned >= maxRecords)
         throw new HistorySourceWorkLimitError(
@@ -568,7 +587,11 @@ export class HistoryReader {
   }
 
   /** Bounded original-source enumeration, suitable for selected-context tail admission. */
-  async page(request: HistoryEntryPageRequest = {}): Promise<HistoryEntryPage> {
+  page(request: HistoryEntryPageRequest = {}): Promise<HistoryEntryPage> {
+    return this.entryPage(request);
+  }
+
+  private async entryPage(request: HistoryEntryPageRequest, captured?: SessionSourceSnapshot): Promise<HistoryEntryPage> {
     const limit = bound(request.limit, 100, MAX_SCANNED, 'limit');
     const maxBytes = bound(request.maxBytes, MAX_SOURCE_BYTES, MAX_SOURCE_BYTES, 'maxBytes');
     const fingerprint = hashJson({
@@ -581,7 +604,7 @@ export class HistoryReader {
     if (cursor && request.cut && hashJson(cursor.cut) !== hashJson(request.cut))
       throw new Error('History source cursor cut mismatch.');
     const cut = cursor?.cut ?? request.cut ?? (await this.capture());
-    const snapshot = await this.snapshot(cut);
+    const snapshot = captured ?? await this.snapshot(cut);
     if (request.after && !(await this.extendsCut(request.after, cut)))
       throw new Error('History page boundary is not an ancestor of its cut.');
     const afterSnapshot = request.after ? await this.snapshot(request.after) : undefined;
@@ -590,25 +613,25 @@ export class HistoryReader {
       : new Map<string, SessionSourceMetadata>();
     let at =
       cursor?.at ??
-      (request.filter?.runId ? (snapshot.index.inputs.get(request.filter.runId) ?? 0) : 0);
+      (request.filter?.runId ? ((await snapshot.index.inputs.get(request.filter.runId)) ?? 0) : 0);
     if (!cursor && request.after) {
       const positions = snapshot.index;
       const boundary =
         request.after.throughEntryId === null
           ? -1
-          : positions.positions.get(request.after.throughEntryId);
+          : (await positions.positions.get(request.after.throughEntryId));
       if (boundary !== undefined) {
         at = boundary + 1;
         // Previously open runs can acquire new records behind the session-entry boundary.
         for (const head of request.after.ledgerHeads ?? []) {
-          const input = positions.inputs.get(head.runId);
+          const input = (await positions.inputs.get(head.runId));
           if (input !== undefined) at = Math.min(at, input);
         }
       }
     }
 
     const end = request.filter?.runId
-      ? (snapshot.index.runs.lastPosition(request.filter.runId) ?? -1) + 1
+      ? ((await snapshot.index.runs.lastPosition(request.filter.runId)) ?? -1) + 1
       : snapshot.entries.length;
     let sequence = cursor?.sequence;
     if (at > snapshot.entries.length)
@@ -618,7 +641,7 @@ export class HistoryReader {
     const entries: SessionBranchEntry[] = [];
     const unread: NonNullable<HistoryEntryPage['unread']>[number][] = [];
     while (at < end && scanned < limit && bytes < maxBytes) {
-      const metadata = snapshot.entries.at(at);
+      const metadata = (await snapshot.entries.at(at));
       if (!metadata) break;
       const runId = metadata.runId;
       if (sequence !== undefined && metadata.type !== 'input')
@@ -633,7 +656,7 @@ export class HistoryReader {
       if (authoritative && metadata.type === 'input' && sequence !== undefined) {
         const head = await this.head(runId, cut, snapshot);
         const afterHead =
-          request.after && afterSnapshot?.index.runs.has(runId)
+          request.after && afterSnapshot && (await afterSnapshot.index.runs.has(runId))
             ? await this.head(runId, request.after, afterSnapshot)
             : undefined;
         sequence = Math.max(sequence, afterHead?.sequence ?? -1);
@@ -731,7 +754,7 @@ export class HistoryReader {
       if (metadata.type === 'input' && authoritative) sequence = -1;
       else at++;
       scanned++;
-      if (oldIds.has(metadata.entryId) || !matchesHistoryMetadata(metadata, request.filter)) continue;
+      if (await oldIds.has(metadata.entryId) || !matchesHistoryMetadata(metadata, request.filter)) continue;
       if (metadata.bytes > maxBytes - bytes) {
         if (metadata.bytes > maxBytes)
           unread.push({
@@ -802,12 +825,12 @@ export class HistoryReader {
     const snapshot = await this.snapshot(cut);
     if (request.after && !(await this.extendsCut(request.after, cut))) throw new Error('History metadata boundary is not an ancestor of its cut.');
     const previous = request.after ? await this.snapshot(request.after) : undefined;
-    let at = cursor?.at ?? (request.filter?.runId ? snapshot.index.inputs.get(request.filter.runId) ?? 0 : 0);
+    let at = cursor?.at ?? (request.filter?.runId ? (await snapshot.index.inputs.get(request.filter.runId)) ?? 0 : 0);
     if (!cursor && request.after) {
-      at = request.after.throughEntryId === null ? 0 : (snapshot.index.positions.get(request.after.throughEntryId) ?? -1) + 1;
-      for (const head of request.after.ledgerHeads ?? []) at = Math.min(at, snapshot.index.inputs.get(head.runId) ?? at);
+      at = request.after.throughEntryId === null ? 0 : ((await snapshot.index.positions.get(request.after.throughEntryId)) ?? -1) + 1;
+      for (const head of request.after.ledgerHeads ?? []) at = Math.min(at, (await snapshot.index.inputs.get(head.runId)) ?? at);
     }
-    const end = request.filter?.runId ? (snapshot.index.runs.lastPosition(request.filter.runId) ?? -1) + 1 : snapshot.entries.length;
+    const end = request.filter?.runId ? ((await snapshot.index.runs.lastPosition(request.filter.runId)) ?? -1) + 1 : snapshot.entries.length;
     if (at > snapshot.entries.length) throw new Error('History metadata cursor is beyond its boundary.');
     let sequence = cursor?.sequence;
     let scanned = 0, bytes = 0;
@@ -818,7 +841,7 @@ export class HistoryReader {
       items.push(item); bytes += size; return true;
     };
     while (at < end && scanned < limit) {
-      const metadata = snapshot.entries.at(at);
+      const metadata = (await snapshot.entries.at(at));
       if (!metadata) break;
       const runId = metadata.runId;
       if (sequence !== undefined && metadata.type !== 'input') throw new Error('History metadata cursor has an invalid run position.');
@@ -827,7 +850,7 @@ export class HistoryReader {
       const authoritative = events && cut.ledgerCoverage === 'authoritative' && runId;
       if (authoritative && metadata.type === 'input' && sequence !== undefined) {
         const head = await this.head(runId, cut, snapshot);
-        if (request.after && previous?.index.runs.has(runId)) sequence = Math.max(sequence, (await this.head(runId, request.after, previous)).sequence);
+        if (request.after && previous && (await previous.index.runs.has(runId))) sequence = Math.max(sequence, (await this.head(runId, request.after, previous)).sequence);
         if (sequence >= head.sequence) { at++; sequence = undefined; continue; }
         const page = await events.readMetadataRange(runId, {
           afterSequence: sequence, through: head, limit: 1, maxBytes: MAX_SOURCE_BYTES,
@@ -837,7 +860,7 @@ export class HistoryReader {
           ...(request.filter?.beforeTime ? { beforeTime: request.filter.beforeTime } : {})
         });
         const record = page.records[0];
-        const item = record ? this.eventMetadata(record, snapshot) : undefined;
+        const item = record ? await this.eventMetadata(record, snapshot) : undefined;
         if (item && !append(item)) break;
         scanned += page.scanned;
         sequence = page.nextSequence;
@@ -846,7 +869,7 @@ export class HistoryReader {
         continue;
       }
       if (authoritative && metadata.type !== 'input' && (await this.head(runId, cut, snapshot)).sequence >= 0) { at++; scanned++; continue; }
-      if (!previous?.index.byId.has(metadata.entryId) && matchesHistoryMetadata(metadata, request.filter)) {
+      if (!(await previous?.index.byId.has(metadata.entryId)) && matchesHistoryMetadata(metadata, request.filter)) {
         if (!append({ ...metadata.context, source: metadataSource(cut.sessionId, metadata), sourceBytes: metadata.bytes })) break;
       }
       scanned++;
@@ -860,13 +883,13 @@ export class HistoryReader {
     };
   }
 
-  private eventMetadata(record: EventSourceMetadata, snapshot: SessionSourceSnapshot): HistorySourceMetadata | undefined {
+  private async eventMetadata(record: EventSourceMetadata, snapshot: SessionSourceSnapshot): Promise<HistorySourceMetadata | undefined> {
     const facts = record.metadata;
     const type = facts.sourceType;
     if (type !== 'assistant' && type !== 'tool_call' && type !== 'observation' && type !== 'steering') return undefined;
     const runId = record.reference.runId;
     const identity = facts.identity?.replace(':', `:${runId}:`);
-    const mirror = snapshot.index.bySource.get(`event:${record.reference.eventId}`) ?? (identity ? snapshot.index.byIdentity.get(identity) : undefined);
+    const mirror = (await snapshot.index.bySource.get(`event:${record.reference.eventId}`)) ?? (identity ? (await snapshot.index.byIdentity.get(identity)) : undefined);
     return {
       ...mirror?.context,
       type, runId,
@@ -888,7 +911,7 @@ export class HistoryReader {
     const snapshot = await this.snapshot(cut);
     if (source.event && this.options.events && cut.ledgerCoverage === 'authoritative') {
       if (source.entryId !== `event:${source.event.eventId}` || source.sha256 !== source.event.hash) throw new Error('History source identity mismatch.');
-      if (!snapshot.index.runs.has(source.event.runId)) return undefined;
+      if (!(await snapshot.index.runs.has(source.event.runId))) return undefined;
       const head = await this.head(source.event.runId, cut, snapshot);
       if (source.event.sequence > head.sequence) return undefined;
       const page = await this.options.events.readMetadataRange(source.event.runId, { afterSequence: source.event.sequence - 1, through: head, limit: 1 });
@@ -896,7 +919,7 @@ export class HistoryReader {
       if (record?.reference.eventId !== source.event.eventId || record.reference.hash !== source.sha256) throw new Error('History source identity mismatch.');
       return this.eventMetadata(record, snapshot);
     }
-    const metadata = snapshot.index.bySource.get(source.entryId);
+    const metadata = (await snapshot.index.bySource.get(source.entryId));
     if (!metadata) return undefined;
     if (!sameHistorySource(metadataSource(source.sessionId, metadata), source)) throw new Error('History source identity mismatch.');
     return { ...metadata.context, source: metadataSource(source.sessionId, metadata), sourceBytes: metadata.bytes };
@@ -916,13 +939,13 @@ export class HistoryReader {
         metadata: { exchangeId: selected.exchangeId.slice(selected.runId.length + 1) }, types: eventTypes()
       });
       for (const record of page.records) {
-        const item = this.eventMetadata(record, snapshot);
+        const item = await this.eventMetadata(record, snapshot);
         if (item) items.push(item);
       }
       return { items, coverage: page.complete ? 'complete' as const : 'partial' as const };
     }
     let bytes = 0;
-    for (const metadata of snapshot.index.exchange(selected.exchangeId)) {
+    for await (const metadata of snapshot.index.exchange(selected.exchangeId)) {
       const item = { ...metadata.context, source: metadataSource(cut.sessionId, metadata), sourceBytes: metadata.bytes };
       bytes += Buffer.byteLength(JSON.stringify(item));
       if (items.length >= MAX_SCANNED || bytes > MAX_SOURCE_BYTES) return { items, coverage: 'partial' as const };
@@ -973,9 +996,7 @@ export class HistoryReader {
     }
     if (!entry) return unavailable(request.source, 'missing');
     const stateRef =
-      entry.type === 'working_state'
-        ? entry.contentRef
-        : entry.type === 'context_transition'
+      entry.type === 'context_transition'
           ? entry.workingState?.contentRef
           : undefined;
     const range = stateRef
@@ -1003,14 +1024,14 @@ export class HistoryReader {
           remaining -= Buffer.byteLength(item.text);
         }
       } else {
-        const at = snapshot.index.positions.get(entry.id) ?? -1;
+        const at = (await snapshot.index.positions.get(entry.id)) ?? -1;
         for (
           let i = Math.max(0, at - count);
           i <= Math.min(snapshot.entries.length - 1, at + count) && remaining > 0;
           i++
         ) {
           if (i === at) continue;
-          const metadata = snapshot.entries.at(i);
+          const metadata = (await snapshot.entries.at(i));
           if (!metadata) break;
           if (metadata.bytes > remaining) break;
           const neighbor = await this.sessionEntry(metadata, snapshot, remaining);
@@ -1057,6 +1078,14 @@ export class HistoryReader {
   }
 
   async search(request: HistorySearchRequest = {}): Promise<HistorySearchResult> {
+    request.signal?.throwIfAborted();
+    const work = { postings: 0, candidates: 0,
+      maxPostings: bound(request.maxPostings, 1000, 10000, 'maxPostings'),
+      maxCandidates: bound(request.maxCandidates, 1000, 10000, 'maxCandidates') };
+    const maxIndexEntries = bound(request.maxIndexEntries, 1000, 1000, 'maxIndexEntries');
+    const maxIndexBytes = bound(request.maxIndexBytes, MAX_SOURCE_BYTES, MAX_SOURCE_BYTES, 'maxIndexBytes');
+    let indexed = 0, indexBytes = 0;
+    let exhausted = false;
     const limit = bound(request.limit, 20, MAX_RESULTS, 'limit');
     const maxBytes = bound(request.maxBytes, 32 * 1024, MAX_BYTES, 'maxBytes');
     const maxScanned = bound(request.maxScanned, MAX_SCANNED, MAX_SCANNED, 'maxScanned');
@@ -1098,12 +1127,12 @@ export class HistoryReader {
       let at =
         state.cut.throughEntryId === null
           ? 0
-          : (snapshot.index.positions.get(state.cut.throughEntryId) ?? -1) + 1;
+          : ((await snapshot.index.positions.get(state.cut.throughEntryId)) ?? -1) + 1;
       for (const head of state.cut.ledgerHeads ?? [])
-        at = Math.min(at, snapshot.index.inputs.get(head.runId) ?? at);
+        at = Math.min(at, (await snapshot.index.inputs.get(head.runId)) ?? at);
       const previous = state.next ? decodeEntryCursor(state.next) : undefined;
       if (previous) at = Math.min(at, previous.at);
-      state.index.truncate(at);
+      state.invalidAt = Math.min(state.invalidAt ?? at, at);
       state.cut = cut;
       state.next = encodeEntryCursor({
         cut,
@@ -1127,7 +1156,8 @@ export class HistoryReader {
             cut,
             maxScannedBytes - scannedBytes,
             maxScanned - scanned,
-            false
+            false,
+            snapshot
           );
         } catch (error) {
           if (!(error instanceof HistorySourceTooLargeError)) throw error;
@@ -1144,9 +1174,7 @@ export class HistoryReader {
         scannedBytes += resolved.bytes;
         const entry = resolved.entry;
         const stateRef =
-          entry.type === 'working_state'
-            ? entry.contentRef
-            : entry.type === 'context_transition'
+          entry.type === 'context_transition'
               ? entry.workingState?.contentRef
               : undefined;
         if (stateRef && stateRef.size > maxScannedBytes - scannedBytes) {
@@ -1166,39 +1194,28 @@ export class HistoryReader {
       }
       return material;
     };
-    // Verify cached candidates before spending the remaining allowance on new index entries.
-    for (const candidate of state.index
-      .candidates(request.query ?? '', cursor?.after)
-      .slice(0, limit))
-      if (!(await materialFor(candidate))) break;
-
-    // Index only newly encountered originals. Population itself has the caller's read bounds.
-    while (
-      state.index.candidates(request.query ?? '', cursor?.after).length < limit &&
-      !state.complete &&
-      scanned < maxScanned &&
-      scannedBytes < maxScannedBytes
-    ) {
-      const page = await this.page({
+    const populate = async () => {
+      request.signal?.throwIfAborted();
+      indexed++;
+      const page = await this.entryPage({
         cut,
         ...(state.next ? { cursor: state.next } : {}),
         filter: request.filter,
         limit: 1,
-        maxBytes: maxScannedBytes - scannedBytes,
+        maxBytes: Math.min(maxScannedBytes - scannedBytes, maxIndexBytes - indexBytes),
         enrich: false,
         originals: true
-      });
+      }, snapshot);
       scanned += page.scanned;
       scannedBytes += page.bytes;
+      indexBytes += page.bytes;
       for (const entry of page.entries) {
         const source = sourceRef(cut.sessionId, entry);
         const stateRef =
-          entry.type === 'working_state'
-            ? entry.contentRef
-            : entry.type === 'context_transition'
+          entry.type === 'context_transition'
               ? entry.workingState?.contentRef
               : undefined;
-        if (stateRef && stateRef.size > maxScannedBytes - scannedBytes) {
+        if (stateRef && stateRef.size > Math.min(maxScannedBytes - scannedBytes, maxIndexBytes - indexBytes)) {
           const gap = { source, reason: 'source_byte_limit' as const, bytes: stateRef.size };
           state.unread.push(gap);
           unread.push(gap);
@@ -1207,10 +1224,10 @@ export class HistoryReader {
         const text = stateRef
           ? (await this.workingStateRange(stateRef, 0, Math.max(1, stateRef.size))).text
           : publicText(entry);
-        if (stateRef) scannedBytes += stateRef.size;
+        if (stateRef) { scannedBytes += stateRef.size; indexBytes += stateRef.size; }
         const at = source.event
-          ? snapshot.index.inputs.get(source.event.runId)
-          : snapshot.index.positions.get(entry.id);
+          ? (await snapshot.index.inputs.get(source.event.runId))
+          : (await snapshot.index.positions.get(entry.id));
         if (at === undefined) throw new Error('Indexed history source has no branch position.');
         loaded.set(source.entryId, { entry, text });
         state.index.add(
@@ -1228,14 +1245,8 @@ export class HistoryReader {
         state.unread.push(...page.unread);
         unread.push(...page.unread);
       }
-      if (
-        page.unread?.length ||
-        previous === page.cursor ||
-        state.index.candidates(request.query ?? '', cursor?.after).length >= limit
-      )
-        break;
-    }
-    const candidates = state.index.candidates(request.query ?? '', cursor?.after);
+      return !page.unread?.length && (page.entries.length > 0 || state.complete || previous !== page.cursor);
+    };
     const items: HistoryItem[] = [];
     let after = cursor?.after;
     let remaining = false;
@@ -1246,9 +1257,10 @@ export class HistoryReader {
       scanned,
       scannedBytes,
       bytes: 0,
-      coverage: state.complete && !remaining && !unread.length ? 'complete' : 'partial',
+      postings: work.postings, candidates: work.candidates, indexed, indexBytes,
+      coverage: exhausted && !unread.length ? 'complete' : 'partial',
       ...(unread.length ? { unread } : {}),
-      ...(!state.complete || remaining
+      ...(!exhausted
         ? {
             cursor: encodeCursor({
               cut,
@@ -1274,7 +1286,38 @@ export class HistoryReader {
       });
       return presentationBytes() <= maxBytes;
     };
-    for (const candidate of candidates) {
+    for (;;) {
+      request.signal?.throwIfAborted();
+      if (state.invalidAt !== undefined) {
+        const cleared = state.index.truncate(state.invalidAt, maxIndexEntries - indexed, maxIndexBytes - indexBytes);
+        indexed += cleared.entries;
+        indexBytes += cleared.bytes;
+        if (!cleared.complete) {
+          // No retained-prefix result has been returned yet. A cache-free continuation must
+          // reconstruct that prefix too, rather than start at the invalidated tail frontier.
+          remaining = true;
+          resume = encodeEntryCursor({ cut, at: after?.at ?? 0,
+            ...(after && after.sequence >= 0 ? { sequence: after.sequence } : {}),
+            fingerprint: hashJson({ after: null, filter: request.filter ?? null }) });
+          break;
+        }
+        state.invalidAt = undefined;
+      }
+      const traversal = state.index.traversal(request.query ?? '', after);
+      if (traversal.complete) {
+        if (state.complete) { exhausted = true; break; }
+        if (indexed >= maxIndexEntries || indexBytes >= maxIndexBytes || scanned >= maxScanned || scannedBytes >= maxScannedBytes) break;
+        if (!(await populate())) break;
+        continue;
+      }
+      const candidate = traversal.next(work);
+      if (!candidate) {
+        remaining = true;
+        if (after) resume = encodeEntryCursor({ cut, at: after.at,
+          ...(after.sequence >= 0 ? { sequence: after.sequence } : {}),
+          fingerprint: hashJson({ after: null, filter: request.filter ?? null }) });
+        break;
+      }
       // On restart this position rereads the unreturned candidate and nothing before it.
       const position = candidate.position;
       resume = encodeEntryCursor({
@@ -1322,6 +1365,7 @@ export class HistoryReader {
       remaining = false;
     }
     if (!remaining) resume = state.next;
+    request.signal?.throwIfAborted();
     if (!fit())
       throw new ToolInputError('History result byte budget cannot fit coverage.', {
         maxBytes,
@@ -1369,8 +1413,7 @@ function historyItem(sessionId: string, entry: SessionBranchEntry, maxBytes: num
     source: sourceRef(sessionId, entry),
     type: entry.type,
     role: historyRole(entry),
-    ...(entry.type === 'working_state' ||
-    (entry.type === 'context_transition' && entry.workingState)
+    ...(entry.type === 'context_transition' && entry.workingState
       ? { generated: true as const }
       : {}),
     ...('runId' in entry ? { runId: entry.runId } : {}),
@@ -1415,12 +1458,6 @@ function publicText(entry: SessionBranchEntry): string {
       });
     case 'branch':
       return JSON.stringify({ fromEntryId: entry.fromEntryId, label: entry.label });
-    case 'working_state':
-      return JSON.stringify({
-        interpretation: 'generated working state',
-        revisionId: entry.id,
-        previousRevisionId: entry.previousRevisionId
-      });
     case 'context_transition':
       return JSON.stringify({
         windowId: entry.window.windowId,

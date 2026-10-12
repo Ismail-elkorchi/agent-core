@@ -35,6 +35,7 @@ export const contextSelectionSchema = z
   .readonly();
 export const contextTransitionRequestSchema = z
   .strictObject({
+    preserveSelection: z.literal(true).optional(),
     expectedCut: historyCutSchema.optional(),
     workingState: workingStateChangeSchema.optional(),
     expectedWorkingStateRevisionId: z.string().min(1).nullable().optional(),
@@ -69,8 +70,11 @@ export const contextWindowSchema = z
 export const contextTransitionSchema = z
   .strictObject({
     transitionId: z.string().min(1),
-    compiledInputIdentity: z.string().min(1).optional(),
-    capabilityRevision: z.string().min(1).optional(),
+    preservedSelection: z.literal(true).optional(),
+    admission: z.discriminatedUnion('status', [
+      z.strictObject({ status: z.literal('admitted'), compiledInputIdentity: z.string().min(1), capabilityRevision: z.string().min(1) }).readonly(),
+      z.strictObject({ status: z.literal('pending'), reason: z.literal('idle_source_selection') }).readonly()
+    ]),
     idempotencyKey: z.string().min(1),
     previousWindowId: z.string().min(1).nullable(),
     windowId: z.string().min(1),

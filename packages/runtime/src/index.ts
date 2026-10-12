@@ -4,7 +4,7 @@ export type { InferenceInvocation } from './inference/gateway.js';
 export * from './inference/model-request-assembler.js';
 export * from './inference/model-window.js';
 export * from './inference/prompt-material.js';
-export * from './orchestration/finalization.js';
+export { AgentRunFinalizer, readCommittedTerminal } from './orchestration/finalization.js';
 export * from './orchestration/observation-facts.js';
 export * from './orchestration/observation-store.js';
 export * from './run/budget.js';
@@ -29,7 +29,7 @@ export type {
   WorkingStateChange,
   WorkingStateInference,
   WorkingStateSnapshot,
-  SessionWorkingStateEntry
+  WorkingStateRevision
 } from './session/working-state.js';
 export {
   ToolCallExecutor,
@@ -55,7 +55,6 @@ export {
   ownSessionSubmissionInput
 } from './session/submission-lifecycle.js';
 
-export * from './history/history-search.js';
 export * from './session/event-delivery.js';
 export * from './session/progress.js';
 

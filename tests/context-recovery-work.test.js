@@ -82,8 +82,8 @@ test('one selected-metadata scan per captured cut is independent of released arc
   t.diagnostic(JSON.stringify({ measurement: 'selected source metadata operations', evidence }));
 });
 
-test('JSONL cold reopen reads the archive index once while active metadata work stays bounded', async t => {
-  const { mkdtemp, writeFile, rm, stat } = await import('node:fs/promises');
+test('JSONL cold reopen reads bounded projection paths while active metadata work stays bounded', async t => {
+  const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');
   const path = await import('node:path');
   const { JsonlSessionRepository } = await import('@agent-core/runtime/node');
@@ -136,10 +136,26 @@ test('JSONL cold reopen reads the archive index once while active metadata work 
     assert.equal(cold.scanned, 3);
     assert.equal(cold.archivedBodyReads, 0);
     assert.equal(cold.scannedBytes, 0, 'Cold reopen restores the persisted index without scanning source bodies.');
-    assert.equal(cold.metadataRecordsRead, records.length + 1, 'Cold reopen reads one checkpoint per source plus its header.');
-    assert.equal(cold.metadataBytesRead, (await stat(file + '.index')).size);
+    // The projection restores a bounded root and point/navigation paths, rather
+    // than materializing one checkpoint per archived source. These fixed budgets
+    // apply to every archive size in this test, including the 10,000-source case.
+    assert.ok(cold.metadataRecordsRead > 0 && cold.metadataRecordsRead <= 256,
+      `Cold metadata reads must stay bounded: ${cold.metadataRecordsRead}`);
+    assert.ok(cold.metadataBytesRead > 0 && cold.metadataBytesRead <= 512 * 1024,
+      `Cold metadata bytes must stay bounded: ${cold.metadataBytesRead}`);
     assert.ok(cold.bodyRecordsRead <= 2, 'Only the selected context record is read, not archived source bodies.');
-    assert.ok(Object.values(warm).every(count => count === 0));
+    assert.equal(warm.pages, 0);
+    assert.equal(warm.scanned, 0);
+    assert.equal(warm.archivedBodyReads, 0);
+    assert.equal(warm.indexedRecords, 0);
+    assert.equal(warm.scannedBytes, 0);
+    assert.equal(warm.headerBytesRead, 0);
+    assert.equal(warm.bodyBytesRead, 0);
+    assert.equal(warm.bodyRecordsRead, 0);
+    // Current-root point paths are rechecked; immutable historical metadata and
+    // selected-source facts are reused without scanning the released archive.
+    assert.ok(warm.metadataRecordsRead <= 32, JSON.stringify(warm));
+    assert.ok(warm.metadataBytesRead <= 128 * 1024, JSON.stringify(warm));
     evidence.push({ archiveSize, activeSources: 2, indexedEntries: records.length, cold, warm });
   }
   t.diagnostic(JSON.stringify({ measurement: 'JSONL cold reopen and warm source checks', evidence }));

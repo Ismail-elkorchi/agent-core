@@ -3,7 +3,7 @@ import test from 'node:test';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import {
   AgentRunCoordinator, AgentRuntime, AgentSession, ContextService, HistoryReader,
-  InMemorySessionRepository, agentEventCodec, createContextTools, createHistoryTools
+  InMemorySessionRepository, agentEventCodec, createHistoryTools
 } from '@agent-core/runtime';
 
 for (const nextResponse of ['tool', 'stop'])
@@ -45,7 +45,7 @@ for (const nextResponse of ['tool', 'stop'])
     };
     const runtimeOptions = {
       provider, model: 'fixture', context, maxOutputTokens: 128,
-      tools: [...createHistoryTools({ history }), ...createContextTools({ context })],
+      tools: [...createHistoryTools({ history }), ...context.toolDefinitions()],
       repositories: { events, artifacts, session: { repository, descriptor } },
       toolBoundary: { authorizationPolicyId: 'test', executionTargetId: 'test' },
       toolPolicy: { allowedRisks: ['read', 'write'] }

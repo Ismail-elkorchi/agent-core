@@ -18,6 +18,7 @@ import type {
   SessionBranchMarkerEntry,
   SessionContextTransitionEntry,
   SessionDescriptor,
+  SessionExecutionOwnership,
   SessionInputRelationship,
   SessionPendingSubmission,
   SessionRepository,
@@ -28,6 +29,7 @@ import type {
   SessionSuspensionDescriptor
 } from './contracts.js';
 import { parseSessionImages } from './images.js';
+import { ApplicationEvents, type ApplicationDeliveryEvent } from './event-delivery.js';
 import {
   SessionSubmissionOwnershipError,
   ownSessionSubmissionConfiguration,
@@ -57,6 +59,7 @@ export type AgentSessionSuspensionAction = SessionSuspensionAction;
 export type AgentSessionSuspensionDescriptor = SessionSuspensionDescriptor;
 
 export type AgentSessionEvent =
+  | ApplicationDeliveryEvent
   | Extract<AgentProgressEvent, { readonly type: 'context.transition.rejected' }>
   | { readonly type: 'run.progress'; readonly runId: string; readonly event: AgentProgressEvent }
   | { readonly type: 'run.completed'; readonly runId: string; readonly result: AgentRunResult }
@@ -120,18 +123,16 @@ export interface AgentSessionOptions {
 export class AgentSession {
   private configuration: AgentSessionConfiguration;
   private readonly maximumQueuedInputs: number;
-  private readonly queued: PendingSubmission[] = [];
-  private readonly listeners = new Set<
-    Readonly<{
-      listener: (event: AgentSessionEvent) => void | Promise<void>;
-      onFailure: (error: Error) => void | Promise<void>;
-    }>
-  >();
+  private readonly handles = new Map<string, PendingSubmission>();
+  private pendingSnapshot: readonly SessionPendingSubmission[] = [];
+  private refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly events = new ApplicationEvents<AgentSessionEvent>();
   private active: ActiveSubmission | undefined;
   private suspended: SuspendedSubmission | undefined;
   private serialQueue: Promise<void> = Promise.resolve();
-  private restored = false;
   private closed = false;
+  private execution: SessionExecutionOwnership | undefined;
+  private observedRevision: number | undefined;
   private closeCompletion: Promise<void> | undefined;
 
   constructor(private readonly options: AgentSessionOptions) {
@@ -146,18 +147,18 @@ export class AgentSession {
     this.configuration = ownConfiguration(options.configuration);
   }
 
+  /** Last observed durable scheduling state; inspect() refreshes it. */
   state(): AgentSessionState {
+    const occupying = this.pendingSnapshot.find((submission) => submission.state !== 'queued');
+    const suspension = occupying?.state === 'suspended' ? occupying.suspension
+      : this.suspended?.submissionId === occupying?.submissionId ? this.suspended?.descriptor : undefined;
     return Object.freeze({
       sessionId: this.options.descriptor.id,
-      phase: this.active ? 'running' : this.suspended ? 'suspended' : 'idle',
+      phase: occupying ? suspension ? 'suspended' : 'running' : 'idle',
       configuration: this.configuration,
-      ...(this.active
-        ? { activeRunId: this.active.control.runId }
-        : this.suspended
-          ? { activeRunId: this.suspended.runId }
-          : {}),
-      queuedInputs: this.queued.length,
-      ...(this.suspended ? { suspension: this.suspended.descriptor } : {})
+      ...(occupying ? { activeRunId: occupying.runId } : {}),
+      queuedInputs: this.pendingSnapshot.filter((submission) => submission.state === 'queued').length,
+      ...(suspension ? { suspension } : {})
     });
   }
 
@@ -165,11 +166,7 @@ export class AgentSession {
     listener: (event: AgentSessionEvent) => void | Promise<void>,
     onFailure: (error: Error) => void | Promise<void>
   ): () => void {
-    const subscription = Object.freeze({ listener, onFailure });
-    this.listeners.add(subscription);
-    return () => {
-      this.listeners.delete(subscription);
-    };
+    return this.events.subscribe(listener, onFailure);
   }
 
   restore(): Promise<void> {
@@ -180,9 +177,7 @@ export class AgentSession {
   inspect() {
     return this.serial(async () => {
       await this.restorePending();
-      const pendingSubmissions = await this.options.repository.loadPendingSubmissions(
-        this.options.descriptor
-      );
+      const pendingSubmissions = this.pendingSnapshot;
       const inspections = await Promise.all(
         pendingSubmissions
           .filter((submission) => submission.state !== 'queued')
@@ -200,9 +195,7 @@ export class AgentSession {
     return this.serial(async () => {
       await this.restorePending();
       if (this.active || this.suspended) return undefined;
-      const next = this.queued.shift();
-      if (!next) return undefined;
-      return this.launch(next);
+      return this.claimAndLaunchNext();
     });
   }
 
@@ -213,11 +206,14 @@ export class AgentSession {
     });
   }
 
-  configure(settings: Partial<AgentSessionConfiguration>): Promise<AgentSessionState> {
-    return this.serial(async () => {
+  /** Per-client defaults for future response formatting; model changes use changeModel(). */
+  configure(settings: Partial<Pick<AgentSessionConfiguration, 'responseFormat'>>): Promise<AgentSessionState> {
+    return this.serial(() => {
       this.assertOpen();
+      if (Object.keys(settings).some((key) => key !== 'responseFormat'))
+        throw new Error('Model settings must be changed through changeModel().');
       this.configuration = ownConfiguration({ ...this.configuration, ...settings });
-      await this.emit({ type: 'configuration.changed', configuration: this.configuration });
+      this.emit({ type: 'configuration.changed', configuration: this.configuration });
       return this.state();
     });
   }
@@ -272,40 +268,33 @@ export class AgentSession {
           reason: 'session_suspended',
           suspension: this.suspended.descriptor
         };
-      const pending = pendingSubmission(
+      const immediate = this.options.scheduling !== 'manual' && !this.active
+        ? await this.acquireExecution() : false;
+      const claimId = randomUUID();
+      let admitted: SessionPendingSubmission;
+      try {
+        admitted = await this.options.repository.admitSubmission(this.options.descriptor, {
         submissionId,
-        input.runId ?? randomUUID(),
-        { ...input, task },
-        this.configuration
-      );
-      if (
-        (this.active || this.options.scheduling === 'manual') &&
-        this.queued.length >= this.maximumQueuedInputs
-      ) {
-        throw new Error(
-          `Session input queue limit of ${String(this.maximumQueuedInputs)} was reached.`
-        );
+        runId: input.runId ?? randomUUID(),
+        input: { ...submissionInput(input), ...(options.relationship ? { relationship: options.relationship } : {}) },
+        configuration: this.configuration,
+        maximumQueuedInputs: this.maximumQueuedInputs,
+        ...(immediate ? { claimId } : {})
+        });
+      } catch (error) {
+        if (immediate) await this.releaseExecution();
+        throw error;
       }
-      await this.options.repository.enqueueSubmission(this.options.descriptor, {
-        submissionId,
-        runId: pending.runId,
-        input: {
-          ...submissionInput(pending.input),
-          ...(options.relationship ? { relationship: options.relationship } : {})
-        },
-        configuration: pending.configuration
-      });
-      if (this.options.scheduling === 'manual' || this.active || this.queued.length > 0) {
-        this.enqueue(pending);
-        if (!this.active) await this.launchNext();
-        return {
-          kind: 'queued',
-          submissionId,
-          runId: pending.runId,
-          completion: pending.completion
-        };
-      }
-      return this.launch(pending);
+      if (immediate && admitted.state !== 'claimed') await this.releaseExecution();
+      this.configuration = ownConfiguration(admitted.configuration);
+      const pending = pendingFromRecord(admitted, false, admitted.claimId);
+      this.handles.set(submissionId, pending);
+      this.pendingSnapshot = [...this.pendingSnapshot, admitted];
+      this.scheduleRefresh();
+      if (admitted.state === 'claimed') return this.launch(pending, true);
+      this.emit({ type: 'input.queued', submissionId, queuedInputs: this.state().queuedInputs });
+      if (this.options.scheduling !== 'manual') await this.launchNext();
+      return { kind: 'queued', submissionId, runId: pending.runId, completion: pending.completion };
     });
   }
 
@@ -324,7 +313,7 @@ export class AgentSession {
     return this.serial(async () => {
       this.assertOpen();
       await this.restorePending();
-      if (this.active || this.suspended || this.queued.length > 0)
+      if (this.active || this.suspended || this.pendingSnapshot.length > 0)
         throw new Error(
           'Settle or reconcile pending work and native result deliveries before changing models. Unknown effects remain unresolved.'
         );
@@ -340,7 +329,7 @@ export class AgentSession {
       if (!context) throw new Error('Model changes require the session context service.');
       if (options.continuation === 'fresh') {
         const entry = await this.selectFreshContinuation(selection, input.profile);
-        await this.emit({
+        this.emit({
           type: 'context.transitioned',
           window: entry.window,
           transition: entry.transition
@@ -364,7 +353,7 @@ export class AgentSession {
           ? {}
           : { responseFormat: this.configuration.responseFormat })
       });
-      await this.emit({ type: 'configuration.changed', configuration: this.configuration });
+      this.emit({ type: 'configuration.changed', configuration: this.configuration });
       return this.state();
     });
   }
@@ -377,14 +366,14 @@ export class AgentSession {
     return this.serial(async () => {
       this.assertOpen();
       await this.restorePending();
-      if (this.active || this.suspended || this.queued.length > 0)
+      if (this.active || this.suspended || this.pendingSnapshot.length > 0)
         throw new Error('Settle or reconcile pending work before a fresh continuation.');
       const entry = await this.selectFreshContinuation(
         this.configuration,
         input.profile,
         input.retained
       );
-      await this.emit({
+      this.emit({
         type: 'context.transitioned',
         window: entry.window,
         transition: entry.transition
@@ -432,7 +421,7 @@ export class AgentSession {
     await this.restore();
     const result = await this.options.context.dispatch(request, options);
     if (result.kind === 'selected')
-      await this.emit({
+      this.emit({
         type: 'context.transitioned',
         window: result.entry.window,
         transition: result.entry.transition
@@ -446,11 +435,9 @@ export class AgentSession {
   ): Promise<void> {
     return this.serial(async () => {
       await this.restorePending();
-      const index = this.queued.findIndex(
-        (pending) => pending.id === submissionId && !pending.resumeExisting
-      );
-      const pending = this.queued[index];
-      if (pending === undefined) throw new Error(`Submission is no longer queued: ${submissionId}`);
+      const record = this.pendingSnapshot.find((submission) => submission.submissionId === submissionId && submission.state === 'queued');
+      if (!record) throw new Error(`Submission is no longer queued: ${submissionId}`);
+      const pending = this.handles.get(submissionId);
       const owned =
         change.kind === 'replace'
           ? { ...change, input: ownSessionSubmissionInput(change.input) }
@@ -460,15 +447,16 @@ export class AgentSession {
         submissionId,
         owned
       );
-      if (owned.kind === 'replace') this.queued[index] = { ...pending, input: owned.input };
-      else {
-        this.queued.splice(index, 1);
-        pending.reject(new AgentSubmissionCancelledError(submissionId, pending.runId));
+      if (owned.kind === 'replace' && pending) this.handles.set(submissionId, { ...pending, input: owned.input });
+      else if (owned.kind === 'cancel') {
+        this.handles.delete(submissionId);
+        pending?.reject(new AgentSubmissionCancelledError(submissionId, record.runId));
       }
-      await this.emit({
+      await this.restorePending();
+      this.emit({
         type: owned.kind === 'replace' ? 'input.revised' : 'input.cancelled',
         submissionId,
-        runId: pending.runId
+        runId: record.runId
       });
     });
   }
@@ -476,7 +464,7 @@ export class AgentSession {
   branchFrom(entryId: string, label?: string): Promise<SessionBranchMarkerEntry> {
     return this.serial(async () => {
       await this.restorePending();
-      if (this.active || this.suspended || this.queued.length > 0)
+      if (this.active || this.suspended || this.pendingSnapshot.length > 0)
         throw new Error('Session branching requires an idle session with no queued work.');
       const branch = await this.options.repository.branchFrom(
         this.options.descriptor,
@@ -488,7 +476,7 @@ export class AgentSession {
   }
 
   inspectSuspension(): AgentSessionSuspensionDescriptor | undefined {
-    return this.suspended?.descriptor;
+    return this.state().suspension;
   }
 
   async reconcileExternal(expectedRunId: string): Promise<AgentRunResult> {
@@ -545,15 +533,12 @@ export class AgentSession {
 
   async waitForIdle(): Promise<void> {
     if (!this.closed && this.options.scheduling !== 'manual') await this.startReadyWork();
-    while (
-      this.active ||
-      (!this.closed &&
-        this.options.scheduling !== 'manual' &&
-        !this.suspended &&
-        this.queued.length > 0)
-    ) {
+    while (!this.closed) {
+      await this.serial(() => this.restorePending());
+      if (this.suspended || (this.options.scheduling === 'manual' && !this.active) || this.pendingSnapshot.length === 0) return;
       if (this.active) await this.active.pending.completion.catch(() => undefined);
-      await this.serialQueue;
+      else await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      if (this.options.scheduling !== 'manual') await this.startReadyWork();
     }
   }
 
@@ -561,9 +546,12 @@ export class AgentSession {
   close(): Promise<void> {
     if (this.closeCompletion) return this.closeCompletion;
     this.closed = true;
+    clearTimeout(this.refreshTimer);
+    this.refreshTimer = undefined;
     this.closeCompletion = this.serial(async () => {
-      for (const pending of this.queued.splice(0))
-        pending.reject(new Error('Session instance closed; queued input remains recorded.'));
+      for (const pending of this.handles.values())
+        if (pending !== this.active?.pending) pending.reject(new Error('Session instance closed; input remains recorded.'));
+      this.handles.clear();
       const completion = this.active?.pending.completion;
       await this.active?.control.abort('Session instance closed.');
       return { completion };
@@ -571,9 +559,15 @@ export class AgentSession {
       .then(async ({ completion }) => {
         // Settlement runs on the serial queue; await it outside the close transaction.
         await completion?.catch(() => undefined);
+        await this.serial(() => this.releaseExecution());
       })
       .finally(() => {
-        this.listeners.clear();
+        this.events.close();
+      })
+      .catch((error: unknown) => {
+        // Retained execution ownership must remain releasable after a failed close.
+        if (this.execution) this.closeCompletion = undefined;
+        throw error;
       });
     return this.closeCompletion;
   }
@@ -615,14 +609,19 @@ export class AgentSession {
     start: (runtime: AgentRuntime) => AgentRunHandle | Promise<AgentRunHandle> =
       (runtime) => runtime.resume(suspended.runId)
   ): Promise<{ readonly completion: Promise<AgentRunResult> }> {
+    if (!await this.acquireExecution()) throw new Error('Session execution is owned by another client.');
     const pending = pendingSubmission(
       suspended.submissionId, suspended.runId, suspended.input, suspended.configuration,
       true, suspended.claimId
     );
     try {
       await this.claim(pending);
+      this.pendingSnapshot = this.pendingSnapshot.map((entry) => entry.submissionId === pending.id
+        ? { ...entry, state: 'claimed' as const, claimId: pending.claimId } : entry);
+      this.suspended = undefined;
     } catch (error) {
       this.rejectDispatch(pending, error);
+      await this.releaseExecution();
       throw error;
     }
     try {
@@ -635,7 +634,6 @@ export class AgentSession {
       );
       await this.assertRuntimeClaim(pending, runtime);
       const control = await start(runtime);
-      this.suspended = undefined;
       this.observe({ control, pending, configuration: suspended.configuration });
       return { completion: pending.completion };
     } catch (error) {
@@ -645,6 +643,7 @@ export class AgentSession {
       } catch (restoreError) {
         this.rejectDispatch(pending, restoreError);
       }
+      await this.releaseExecution();
       throw error;
     }
   }
@@ -668,68 +667,105 @@ export class AgentSession {
         }
       );
       this.suspended = { ...previous, claimId: pending.claimId, descriptor };
+      this.pendingSnapshot = this.pendingSnapshot.map((entry) => entry.submissionId === pending.id
+        ? { ...entry, state: 'suspended' as const, claimId: pending.claimId, suspension: descriptor } : entry);
     } else {
       this.suspended = undefined;
-      this.queued.unshift(
-        pendingSubmission(
-          previous.submissionId,
-          previous.runId,
-          previous.input,
-          previous.configuration,
-          true,
-          pending.claimId
-        )
-      );
+      this.handles.delete(previous.submissionId);
+      await this.restorePending();
+
     }
   }
 
   private async restorePending(): Promise<void> {
     this.assertOpen();
-    if (this.restored) return;
-    const pending = await this.options.repository.loadPendingSubmissions(this.options.descriptor);
-    for (const submission of pending) {
-      if (submission.state === 'claimed') {
-        const run = await this.options.runs.find(submission.runId);
-        const descriptor = run && runSuspensionDescriptor(submission.submissionId, run.state);
-        if (descriptor) this.suspended = suspendedSubmission(submission, descriptor);
-        else this.queued.push(pendingFromRecord(submission, run !== undefined));
-      } else if (submission.state === 'suspended') {
-        if (this.suspended)
-          throw new Error(
-            `Session has multiple suspended submissions: ${this.suspended.submissionId} and ${submission.submissionId}.`
-          );
-        if (!submission.suspension)
-          throw new Error(
-            `Suspended submission ${submission.submissionId} has no durable suspension descriptor.`
-          );
-        const run = await this.options.runs.inspect(submission.runId);
-        const current = runSuspensionDescriptor(submission.submissionId, run.state);
-        if (
-          submission.suspension.reason !== 'missing_implementation' &&
-          submission.suspension.reason !== 'runtime_failed' &&
-          (!current || !sameSuspension(submission.suspension, current))
-        ) {
-          throw new Error(
-            `Suspended submission ${submission.submissionId} contradicts its run suspension.`
-          );
-        }
-        if (
-          submission.suspension.reason === 'runtime_failed' &&
-          run.state.phase.kind === 'terminal'
-        ) {
-          this.queued.push(pendingFromRecord(submission, true));
-          continue;
-        }
-        const descriptor = current ?? submission.suspension;
-        this.suspended = suspendedSubmission(submission, descriptor);
-      } else {
-        this.queued.push(pendingFromRecord(submission, false));
+    const revision = await this.options.repository.revision(this.options.descriptor);
+    if (revision === this.observedRevision) {
+      this.scheduleRefresh();
+      return;
+    }
+    this.pendingSnapshot = await this.options.repository.loadPendingSubmissions(this.options.descriptor);
+    const selection = await this.options.repository.currentModelSettings(this.options.descriptor);
+    if (selection) this.configuration = ownConfiguration({
+      provider: selection.provider, model: selection.model,
+      ...(selection.reasoning === undefined ? {} : { reasoning: selection.reasoning }),
+      ...(selection.temperature === undefined ? {} : { temperature: selection.temperature }),
+      ...(this.configuration.responseFormat === undefined ? {} : { responseFormat: this.configuration.responseFormat })
+    });
+    const occupying = this.pendingSnapshot.find((submission) => submission.state !== 'queued');
+    if (!this.active) {
+      this.suspended = undefined;
+      if (occupying) {
+        const run = await this.options.runs.find(occupying.runId);
+        const current = run && runSuspensionDescriptor(occupying.submissionId, run.state);
+        if (occupying.state === 'suspended') {
+          if (!occupying.suspension) throw new Error(`Suspended submission ${occupying.submissionId} has no durable suspension descriptor.`);
+          if (occupying.suspension.reason !== 'missing_implementation' && occupying.suspension.reason !== 'runtime_failed' &&
+              (!current || !sameSuspension(occupying.suspension, current)))
+            throw new Error(`Suspended submission ${occupying.submissionId} contradicts its run suspension.`);
+          if (run?.state.phase.kind !== 'terminal')
+            this.suspended = suspendedSubmission(occupying, current ?? occupying.suspension);
+
+        } else if (current) this.suspended = suspendedSubmission(occupying, current);
       }
     }
-    this.restored = true;
+    for (const [id, pending] of this.handles) {
+      if (this.active?.pending === pending) continue;
+      const record = this.pendingSnapshot.find((submission) => submission.submissionId === id)
+        ?? await this.options.repository.readSubmission(this.options.descriptor, id);
+      if (!record) throw new Error(`Accepted submission disappeared: ${id}`);
+      if (record.state === 'queued' || record.state === 'claimed') continue;
+      if (record.state === 'cancelled') pending.reject(new AgentSubmissionCancelledError(id, pending.runId));
+      else if (record.state === 'failed' || (record.state === 'suspended' && record.suspension?.reason === 'runtime_failed')) {
+        const error = new Error(record.state === 'failed' ? record.errorMessage : record.suspension?.diagnostic);
+        pending.reject(error);
+        this.emit({ type: 'run.failed', runId: record.runId, error });
+      }
+      else {
+        const run = await this.options.runs.inspect(record.runId);
+        const result: AgentRunResult = record.state === 'completed'
+          ? { state: 'ended', terminal: await this.options.runs.readTerminal(run), deliveryDiagnostics: [] }
+          : suspendedRunResult(run.state, record.suspension);
+        pending.resolve(result);
+        this.emit({ type: 'run.completed', runId: record.runId, result });
+      }
+      this.handles.delete(id);
+    }
+    this.observedRevision = revision;
+    this.scheduleRefresh();
   }
 
-  private claim(pending: PendingSubmission): Promise<void> {
+  /** One non-overlapping durable refresh per open client; no queued polling work. */
+  private scheduleRefresh(): void {
+    if (this.closed) return;
+    const waitingOnOtherClient = this.handles.size > 0 && !this.active;
+    if (this.refreshTimer) {
+      if (waitingOnOtherClient) this.refreshTimer.ref();
+      else this.refreshTimer.unref();
+      return;
+    }
+    if (this.options.scheduling === 'manual' && this.handles.size === 0) return;
+    this.refreshTimer = setTimeout(() => {
+      void this.serial(async () => {
+        if (this.closed) return;
+        await this.restorePending();
+        if (this.options.scheduling !== 'manual') await this.launchNext();
+      }).catch((cause: unknown) => {
+        this.closed = true;
+        const error = cause instanceof Error ? cause : new Error(String(cause));
+        for (const pending of this.handles.values()) if (pending !== this.active?.pending) pending.reject(error);
+        this.events.fail(error);
+      }).finally(() => {
+        this.refreshTimer = undefined;
+        this.scheduleRefresh();
+      });
+    }, 100);
+    if (!waitingOnOtherClient) this.refreshTimer.unref();
+  }
+
+  private async claim(pending: PendingSubmission): Promise<void> {
+    if (!this.execution) throw new Error('Session execution ownership is required.');
+    await this.execution.assertOwned();
     return this.options.repository.transitionSubmission(this.options.descriptor, pending.id, {
       state: 'claimed',
       claimId: pending.claimId,
@@ -738,6 +774,8 @@ export class AgentSession {
   }
 
   private async assertClaim(pending: PendingSubmission): Promise<void> {
+    if (!this.execution) throw new Error('Session execution ownership is required.');
+    await this.execution.assertOwned();
     const current = (await this.options.repository.loadPendingSubmissions(this.options.descriptor))
       .find((submission) => submission.submissionId === pending.id);
     if (current?.state !== 'claimed' || current.claimId !== pending.claimId)
@@ -762,14 +800,18 @@ export class AgentSession {
     const failure = error instanceof Error ? error : new Error(String(error));
     this.closed = true;
     pending.reject(failure);
-    for (const queued of this.queued.splice(0)) queued.reject(failure);
+    for (const pending of this.handles.values()) pending.reject(failure);
+    this.handles.clear();
   }
 
   private async launch(
-    pending: PendingSubmission
+    pending: PendingSubmission,
+    alreadyClaimed = false
   ): Promise<Extract<AgentSessionSubmissionResult, { kind: 'started' }>> {
     try {
-      await this.claim(pending);
+      if (!alreadyClaimed) await this.claim(pending);
+      this.handles.set(pending.id, pending);
+      this.pendingSnapshot = await this.options.repository.loadPendingSubmissions(this.options.descriptor);
       const configuration = pending.configuration;
       const runtime = await this.createRuntime(
         pending.id,
@@ -793,12 +835,14 @@ export class AgentSession {
       // No run control was obtained. A prior admission can still be in flight in
       // another dispatcher, so keep the durable claim recoverable.
       this.rejectDispatch(pending, error);
+      await this.releaseExecution();
       throw error;
     }
   }
 
   private observe(active: ActiveSubmission): void {
     this.active = active;
+    this.scheduleRefresh();
     void active.control.result
       .then(
         (result) =>
@@ -820,11 +864,11 @@ export class AgentSession {
     return Promise.resolve(
       this.options.createRuntime(
         configuration,
-        async (event) => {
-          await this.emit({ type: 'run.progress', runId, event });
-          if (event.type === 'context.transition.rejected') await this.emit(event);
+        (event) => {
+          this.emit({ type: 'run.progress', runId, event });
+          if (event.type === 'context.transition.rejected') this.emit(event);
           if (event.type === 'context.transitioned')
-            await this.emit({
+            this.emit({
               type: 'context.transitioned',
               window: event.window,
               transition: event.transition
@@ -837,6 +881,7 @@ export class AgentSession {
 
   private async settle(active: ActiveSubmission, result: AgentRunResult): Promise<void> {
     if (this.active !== active) return;
+    await this.assertClaim(active.pending);
     let suspension: AgentSessionSuspensionDescriptor | undefined;
     if (result.state === 'suspended') {
       const run = await this.options.runs.inspect(result.runId);
@@ -873,8 +918,12 @@ export class AgentSession {
           descriptor: suspension
         }
       : undefined;
-    await this.emit({ type: 'run.completed', runId: active.control.runId, result });
+    this.pendingSnapshot = this.pendingSnapshot.flatMap((entry) => entry.submissionId !== active.pending.id ? [entry]
+      : suspension ? [{ ...entry, state: 'suspended' as const, suspension }] : []);
+    this.handles.delete(active.pending.id);
+    this.emit({ type: 'run.completed', runId: active.control.runId, result });
     active.pending.resolve(result);
+    await this.releaseExecution();
     if (!this.suspended) await this.launchNext();
   }
 
@@ -882,6 +931,7 @@ export class AgentSession {
     if (this.active !== active) return;
     this.active = undefined;
     await this.failSubmission(active.pending, active.configuration, error);
+    await this.releaseExecution();
     if (!this.suspended) await this.launchNext();
   }
 
@@ -915,8 +965,10 @@ export class AgentSession {
           state: 'completed',
           claimId: pending.claimId
         });
+        this.pendingSnapshot = this.pendingSnapshot.filter((entry) => entry.submissionId !== pending.id);
+        this.handles.delete(pending.id);
         pending.resolve(result);
-        await this.emit({ type: 'run.completed', runId: pending.runId, result });
+        this.emit({ type: 'run.completed', runId: pending.runId, result });
         return;
       }
       if (run) {
@@ -959,47 +1011,78 @@ export class AgentSession {
       );
       // A failed persistence boundary cannot authorize dispatch of another submission.
       this.closed = true;
-      for (const queued of this.queued.splice(0)) queued.reject(failure);
+      for (const pending of this.handles.values()) pending.reject(failure);
+    this.handles.clear();
     }
+    if (!this.closed) this.pendingSnapshot = this.pendingSnapshot.flatMap((entry) => entry.submissionId !== pending.id ? [entry]
+      : this.suspended ? [{ ...entry, state: 'suspended' as const, suspension: this.suspended.descriptor }] : []);
     pending.reject(failure);
-    await this.emit({ type: 'run.failed', runId: pending.runId, error: failure });
+    this.handles.delete(pending.id);
+    this.emit({ type: 'run.failed', runId: pending.runId, error: failure });
+  }
+
+  private async acquireExecution(): Promise<boolean> {
+    if (this.execution) {
+      await this.execution.assertOwned();
+      return true;
+    }
+    this.execution = await this.options.repository.tryAcquireExecution(this.options.descriptor);
+    return this.execution !== undefined;
+  }
+
+  private async releaseExecution(): Promise<void> {
+    const ownership = this.execution;
+    if (!ownership) return;
+    try {
+      await ownership.release();
+      this.execution = undefined;
+    } catch (cause) {
+      this.closed = true;
+      const error = cause instanceof Error ? cause : new Error(String(cause));
+      for (const pending of this.handles.values()) pending.reject(error);
+      this.handles.clear();
+      this.events.fail(error);
+      throw error;
+    }
+  }
+
+  private async claimAndLaunchNext(): Promise<Extract<AgentSessionSubmissionResult, { kind: 'started' }> | undefined> {
+    if (this.closed || this.active || this.suspended || this.pendingSnapshot.length === 0 || !await this.acquireExecution()) return undefined;
+    try {
+      const pending = await this.options.repository.loadPendingSubmissions(this.options.descriptor);
+      const occupying = pending.find(entry => entry.state !== 'queued');
+      const run = occupying && await this.options.runs.find(occupying.runId);
+      if (occupying?.state === 'claimed' || (occupying && run?.state.phase.kind === 'terminal')) {
+        const recovered = pendingFromRecord(occupying, run !== undefined);
+        const local = this.handles.get(occupying.submissionId);
+        return await this.launch(local ? { ...recovered, completion: local.completion, resolve: local.resolve, reject: local.reject } : recovered);
+      }
+      const claimed = occupying ? undefined : await this.options.repository.claimNextSubmission(this.options.descriptor, randomUUID());
+      if (!claimed) {
+        await this.releaseExecution();
+        return undefined;
+      }
+      const local = this.handles.get(claimed.submissionId);
+      const next = local
+        ? { ...local, input: claimed.input, configuration: claimed.configuration, claimId: requireSubmissionClaim(claimed) }
+        : pendingFromRecord(claimed, false, requireSubmissionClaim(claimed));
+      return await this.launch(next, true);
+    } catch (error) {
+      this.closed = true;
+      for (const pending of this.handles.values()) pending.reject(error);
+      this.handles.clear();
+      await this.releaseExecution();
+      throw error;
+    }
   }
 
   private async launchNext(): Promise<void> {
-    if (this.options.scheduling === 'manual') return;
-    while (!this.closed && !this.active && !this.suspended) {
-      const next = this.queued.shift();
-      if (!next) return;
-      try {
-        await this.launch(next);
-      } catch {
-        // launch records the admission or recovery obligation and delivers the failure once.
-      }
-    }
+    if (this.options.scheduling === 'manual' || this.closed || this.active) return;
+    await this.claimAndLaunchNext();
   }
 
-  private enqueue(pending: PendingSubmission): void {
-    this.queued.push(pending);
-    void this.emit({
-      type: 'input.queued',
-      submissionId: pending.id,
-      queuedInputs: this.queued.length
-    });
-  }
-
-  private async emit(event: AgentSessionEvent): Promise<void> {
-    for (const subscription of this.listeners) {
-      try {
-        await subscription.listener(event);
-      } catch (cause) {
-        this.listeners.delete(subscription);
-        try {
-          await subscription.onFailure(cause instanceof Error ? cause : new Error(String(cause)));
-        } catch {
-          /* The detached owner has no remaining delivery authority. */
-        }
-      }
-    }
+  private emit(event: AgentSessionEvent): void {
+    this.events.publish(event);
   }
 
   private serial<T>(operation: () => T | Promise<T>): Promise<T> {
@@ -1056,7 +1139,8 @@ function suspendedSubmission(
 
 function pendingFromRecord(
   record: SessionPendingSubmission,
-  resumeExisting: boolean
+  resumeExisting: boolean,
+  claimId?: string
 ): PendingSubmission {
   return pendingSubmission(
     record.submissionId,
@@ -1064,7 +1148,8 @@ function pendingFromRecord(
     record.input,
     record.configuration,
     resumeExisting,
-    record.claimId
+    record.claimId,
+    claimId
   );
 }
 
@@ -1074,7 +1159,8 @@ function pendingSubmission(
   input: SessionSubmissionInput | AgentRunInput,
   configuration: AgentSessionConfiguration,
   resumeExisting = false,
-  expectedClaimId?: string
+  expectedClaimId?: string,
+  claimId: string = randomUUID()
 ): PendingSubmission {
   let resolve!: (result: AgentRunResult) => void;
   let reject!: (error: unknown) => void;
@@ -1104,7 +1190,7 @@ function pendingSubmission(
         })
   });
   return {
-    claimId: randomUUID(),
+    claimId,
     ...(expectedClaimId === undefined ? {} : { expectedClaimId }),
     id,
     runId,
@@ -1263,4 +1349,21 @@ export class AgentSubmissionCancelledError extends Error {
 function requireSubmissionClaim(record: SessionPendingSubmission): string {
   if (!record.claimId) throw new Error(`Session submission has no durable claim: ${record.submissionId}`);
   return record.claimId;
+}
+
+function suspendedRunResult(
+  state: import('../run/control/contracts.js').AgentRunState,
+  suspension: SessionSuspensionDescriptor | undefined
+): AgentRunResult {
+  if (!suspension || suspension.reason === 'runtime_failed' || !state.budget)
+    throw new Error(`Run ${state.runId} has no recoverable suspension result.`);
+  const base = { state: 'suspended' as const, runId: state.runId, finalizationId: state.finalizationId, budget: state.budget };
+  if (suspension.reason === 'approval_required') {
+    const pendingApprovals = state.toolBatches.flatMap((batch) => batch.callStates.flatMap((call) => call.stage === 'approval' ? [call.approval] : []));
+    if (pendingApprovals.length === 0) throw new Error(`Run ${state.runId} has no pending approval.`);
+    return Object.freeze({ ...base, reason: suspension.reason, pendingApprovals: Object.freeze(pendingApprovals) });
+  }
+  return Object.freeze({ ...base, reason: suspension.reason,
+    ...(suspension.effectId === undefined ? {} : { effectId: suspension.effectId }),
+    ...(suspension.contextAdmission === undefined ? {} : { contextAdmission: suspension.contextAdmission }) });
 }

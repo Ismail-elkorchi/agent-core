@@ -26,10 +26,14 @@ For request assembly, `selectedContext(cut)` reads only the selected window reco
 `page({cut, after, cursor, limit, maxBytes})` and `entriesAfter(after, through, bounds)`
 enumerate bounded original sources. Follow the cursor and check `unread`
 before claiming complete coverage. There is no full-view gateway or exhaustive
-omission list. Session repositories expose `sourceSnapshot()` for cached branch
+omission list. Session repositories expose `sourceSnapshot()` as a lazy, asynchronous view of branch
 membership, source digests, sizes and finalization pointers without source bodies.
-Snapshots share incremental ancestry indexes and capture immutable boundaries;
+Point lookups and indexed ancestry navigation preserve immutable boundaries;
 ordinary appends do not rebuild a full ancestor array or source lookup maps.
+Terminal confirmation records bind the owning ledger’s committed finalization to
+the session. Cold capture does not revisit confirmed completed runs; its separate
+open-ledger capture cost depends on genuinely outstanding runs. A failed confirmation
+delivery preserves terminal truth and is retried during normal access.
 
 `EventRepository.readReference()` verifies a committed event's run, sequence, ID
 and digest. `readRange()` scans strictly after `afterSequence`, through a pinned
@@ -72,12 +76,13 @@ previous revision and the exact recorded inference input that produced it.
 Branching inherits the revision at the selected branch point. Later revisions
 on either branch are independent.
 
-Compose `createWorkingStateTool(context)` with history and context tools. The
-model supplies the complete replacement text only; the runtime supplies session and branch
-scope, invocation attribution, and the revision presented in its inference.
-The replacement publishes atomically against that revision. A stale update returns
-an explicit conflict with the current state and its history reference. Publication
-is conditional and idempotent; a failed append leaves the previous head intact.
+Compose `context.toolDefinitions()` with history tools. The model supplies
+complete replacement text through `context_transition.workingState`; the runtime
+binds scope, attribution, and the revision presented in its inference. The tool
+receipt means scheduled. After completing the exchange, the runtime admits the
+actual next request and atomically publishes state and selection. A rejected or
+stale proposal preserves the previous revision and produces explicit feedback.
+Publication is conditional and idempotent; a lost receipt does not duplicate it.
 
 Every admitted request binds to the current revision at its captured boundary.
 Present the generated interpretation once; do not accumulate historical revisions
@@ -110,7 +115,7 @@ byte bounds and coverage. There is no independent note repository or browser.
 
 ## Context transitions
 
-Compose `createHistoryTools`, `createWorkingStateTool`, and `createContextTools`
+Compose `createHistoryTools` and `context.toolDefinitions()`
 with the ordinary tool registry and authorization policy. `ContextService` records
 selected original sources and the current working-state revision at an immutable history cut.
 Unselected material remains retrievable; no exhaustive omission partition is needed.
@@ -129,8 +134,8 @@ history. Releasing or retaining part of a response selects the whole exchange,
 including its parallel calls and observations. Bound native responses retain their
 prefix dependencies. Active accepted input and explicit protection remain mandatory.
 
-The operation may also supply `workingState`, using the same full-text replacement
-as `update_working_state`. The runtime binds it to the revision presented in the
+The operation may supply `workingState` alone or with source edits as the complete
+replacement text. The runtime binds it to the revision presented in the
 originating inference. Staged content and the new window publish together only
 after ordinary request admission, with no implicit rebase of stale state. Without
 a state change, source selection requires no auxiliary generation. Source changes

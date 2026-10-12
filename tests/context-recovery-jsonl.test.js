@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { JsonlEventRepository, LocalArtifactRepository, hashJson } from '@agent-core/persistence/node';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
-import { AgentRuntime, ContextService, HistoryReader, agentEventCodec, createContextTools, createHistoryTools } from '@agent-core/runtime';
+import { AgentRuntime, ContextService, HistoryReader, agentEventCodec, createHistoryTools } from '@agent-core/runtime';
 
 test('the first JSONL context-recovery boundary suspends for capacity without requiring index repair', async t => {
   const root = await mkdtemp(path.join(tmpdir(), 'first-context-boundary-'));
@@ -32,7 +32,7 @@ test('the first JSONL context-recovery boundary suspends for capacity without re
     const context = new ContextService({ repository, session: descriptor, history, artifacts,
       policy: { maxSourceBytes: 1024 * 1024, historyRead: { history, isAvailable: () => true } } });
     return new AgentRuntime({ provider, model: 'small', context, contextRenewal: { automatic: true },
-      maxOutputTokens: 512, tools: [...createContextTools({ context }), ...createHistoryTools({ history })],
+      maxOutputTokens: 512, tools: [...context.toolDefinitions(), ...createHistoryTools({ history })],
       repositories: { events: eventRepository, artifacts, session: { repository, descriptor } },
       toolPolicy: { allowedRisks: ['read', 'write'] },
       toolBoundary: { authorizationPolicyId: 'test', executionTargetId: 'test' } });

@@ -1,20 +1,28 @@
+import { stageWorkingState } from './working-state.js';
 import { contextInspectionCursor, contextInspectionSchema } from './inspection.js';
-import { parseJsonObject, parseJsonValue, type JsonObject } from '@agent-core/json';
+import { parseJsonObject, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import {
   defaultToolModelContent,
   ToolInputError,
   defineTool,
   unicodeTextSchema,
+  type ToolCanonicalizationContext,
+  type ToolExecutionContext,
+  type ToolObservationInput,
   type CompiledToolDefinition
 } from '@agent-core/tools';
 import * as z from 'zod';
 import { historyCutSchema, sourceSchema } from '../history/schema.js';
 import { scopedTool, scopePath, invocationIdentity } from '../history/tool-support.js';
 import { contextTransitionRequestSchema } from './schema.js';
-import { hashJson } from '@agent-core/persistence';
+import { hashJson, type ArtifactRepository } from '@agent-core/persistence';
+import { WORKING_STATE_GUIDANCE } from '../session/working-state.js';
 import type { ContextService } from './service.js';
-export function createContextTools(options: {
+/** Internal construction receives explicit owned storage, never a public staging capability. */
+export function contextToolDefinitions(options: {
   readonly context: ContextService;
+  readonly artifacts: ArtifactRepository;
+  readonly maxSourceBytes: number;
   readonly prefix?: string;
 }): readonly CompiledToolDefinition[] {
   const prefix = options.prefix ?? 'context';
@@ -27,16 +35,118 @@ export function createContextTools(options: {
       release: sources.optional(),
       workingState: unicodeTextSchema.optional(),
       continuation: z.enum(['preserve', 'fresh']).default('preserve'),
-      strategy: z.enum(['sources', 'provider']).default('sources')
+      strategy: z.enum(['sources', 'provider']).optional()
     })
     .refine(
       (input) => input.retain === undefined || input.release === undefined,
       'Use retain for a replacement or add/release to edit the current selection.'
     )
     .refine(
-      (input) => input.continuation !== 'fresh' || input.strategy === 'sources',
+      (input) => input.continuation !== 'fresh' || input.strategy !== 'provider',
       'A fresh continuation uses original sources, not native compaction.'
     );
+  const canonicalize = async (value: z.output<typeof transition>, planning: ToolCanonicalizationContext) => {
+    if (!planning.invocation) throw new Error('Context operation requires an invocation.');
+    const origin = await options.context.workingStateOrigin(planning.invocation);
+    const cut = await options.context.history.capture();
+    if (cut.sessionId !== origin.sessionId || cut.branchId !== origin.branchId)
+      throw new Error('Context branch changed after the originating inference.');
+    const window = await options.context.history.selectedContext(cut);
+    const selection = await options.context.selectSources(cut, value);
+    const identity = invocationIdentity(planning);
+    const preserveSelection = value.retain === undefined && value.add === undefined && value.release === undefined &&
+      value.strategy === undefined && value.continuation === 'preserve';
+    return {
+      ...value,
+      preserveSelection,
+      origin,
+      cut,
+      expectedWindowId: window?.windowId ?? null,
+      selection: {
+        ...selection,
+        strategy: value.strategy ?? (preserveSelection ? window?.selection.strategy : undefined) ?? 'sources',
+        ...(value.continuation === 'fresh'
+          ? {
+              continuity: {
+                kind: 'fresh' as const,
+                resetId: identity,
+                model: options.context.currentModel(),
+                sources: selection.retained
+              }
+            }
+          : {})
+      },
+      identity,
+      stateId: `working-state-${hashJson({ invocation: identity, text: value.workingState ?? null })}`
+    };
+  };
+  const observe = async (value: Awaited<ReturnType<typeof canonicalize>>, execution: ToolExecutionContext): Promise<ToolObservationInput<JsonValue>> => {
+    const current = await options.context.history.capture();
+    if (current.sessionId !== value.cut.sessionId || current.branchId !== value.cut.branchId)
+      throw new Error('Context branch changed after authorization.');
+    const committed = await options.context.findTransition(value.identity);
+    if (committed) return {
+      kind: 'result', execution: { state: 'settled' },
+      summary: 'Context transition committed after admission.',
+      output: { status: 'committed', windowId: committed.window.windowId },
+      scope: { resources: [scopePath('context', value.cut.sessionId, value.cut.branchId)], coverage: 'complete' }
+    };
+    let workingState;
+    if (value.workingState !== undefined) {
+      const staged = await stageWorkingState(options.context, options, {
+        id: value.stateId,
+        revisionId: value.origin.revisionId,
+        inference: value.origin.inference,
+        text: value.workingState
+      });
+      if ('status' in staged && staged.status !== 'unchanged')
+        return {
+          kind: 'result',
+          execution: { state: 'settled' },
+          summary: `Context update: ${staged.status}.`,
+          output: parseJsonValue(staged),
+          scope: {
+            resources: [scopePath('context', value.cut.sessionId, value.cut.branchId)],
+            coverage: 'complete'
+          }
+        };
+      if ('status' in staged && value.retain === undefined &&
+          value.add === undefined && value.release === undefined && value.continuation === 'preserve' &&
+          value.preserveSelection) return {
+        kind: 'result', execution: { state: 'settled' }, summary: 'Working state is unchanged.',
+        output: { status: 'unchanged' },
+        scope: { resources: [scopePath('context', value.cut.sessionId, value.cut.branchId)], coverage: 'complete' }
+      };
+      if (!('status' in staged)) workingState = staged;
+    }
+    const invocation = execution.invocation;
+    if (!invocation) throw new Error('Context operation requires an invocation.');
+    const { runId, turnId, requestAttempt, toolBatchId, callIndex, toolAttempt } = invocation;
+    const result = await options.context.schedule(
+      contextTransitionRequestSchema.parse({
+        ...(value.preserveSelection ? { preserveSelection: true } : {}),
+        toolInvocation: { runId, turnId, requestAttempt, toolBatchId, callIndex, toolAttempt },
+        expectedCut: value.cut,
+        expectedWindowId: value.expectedWindowId,
+        expectedSourceRevision: value.cut.sourceRevision,
+        expectedWorkingStateRevisionId: value.origin.revisionId,
+        ...(workingState ? { workingState } : {}),
+        idempotencyKey: value.identity,
+        reason: value.reason,
+        selection: value.selection
+      })
+    );
+    return {
+      kind: 'result',
+      execution: { state: 'settled' },
+      summary: 'Context selection scheduled; activation requires admission.',
+      output: { status: 'scheduled', ...result },
+      scope: {
+        resources: [scopePath('context', value.cut.sessionId, value.cut.branchId)],
+        coverage: 'complete'
+      }
+    };
+  };
   return Object.freeze([
     scopedTool({
       name: `${prefix}_inspect`,
@@ -97,7 +207,7 @@ export function createContextTools(options: {
       name: `${prefix}_transition`,
       implementationId: 'agent-core.context-transition.v1',
       description:
-        'Change the active context without summarizing history. Add or release source references; release applies to the complete exchange. Supply retain to replace optional history (an empty array releases it all). Active input and required exchanges remain protected. Optionally replace workingState in the same atomic transition. Fresh continuation explicitly ends native reasoning while keeping the session and selected originals. Use provider strategy only to request native compaction. No change requires no call.',
+        `${WORKING_STATE_GUIDANCE} Change the active context without summarizing history. Add or release source references; release applies to the complete exchange. Supply retain to replace optional history (an empty array releases it all). Active input and required exchanges remain protected. Optionally replace workingState in the same atomic transition. Fresh continuation explicitly ends native reasoning while keeping the session and selected originals. Use provider strategy only to request native compaction. No change requires no call. A successful scheduled receipt is pending: the runtime first completes this exchange and admits the actual next request before atomically publishing state and selection.`,
       schema: transition,
       outputSchema: z.json().transform((value) => parseJsonValue(value)),
       effectEnvelope: {
@@ -107,38 +217,8 @@ export function createContextTools(options: {
         ],
         lockScopes: ['context', 'working_state']
       },
-      async canonicalizeInput(value, planning) {
-        if (!planning.invocation) throw new Error('Context operation requires an invocation.');
-        const origin = await options.context.workingStateOrigin(planning.invocation);
-        const cut = await options.context.history.capture();
-        if (cut.sessionId !== origin.sessionId || cut.branchId !== origin.branchId)
-          throw new Error('Context branch changed after the originating inference.');
-        const window = await options.context.history.selectedContext(cut);
-        const selection = await options.context.selectSources(cut, value);
-        const identity = invocationIdentity(planning);
-        return {
-          ...value,
-          origin,
-          cut,
-          expectedWindowId: window?.windowId ?? null,
-          selection: {
-            ...selection,
-            strategy: value.strategy,
-            ...(value.continuation === 'fresh'
-              ? {
-                  continuity: {
-                    kind: 'fresh' as const,
-                    resetId: identity,
-                    model: options.context.currentModel(),
-                    sources: selection.retained
-                  }
-                }
-              : {})
-          },
-          identity,
-          stateId: `working-state-${hashJson({ invocation: identity, text: value.workingState ?? null })}`
-        };
-      },
+      canonicalizeInput: canonicalize,
+
       deriveEffects(value) {
         const contextScope = scopePath('context', value.cut.sessionId, value.cut.branchId);
         const stateScope = scopePath('working_state', value.cut.sessionId, value.cut.branchId);
@@ -147,64 +227,21 @@ export function createContextTools(options: {
         return {
           accesses: scopes.map((scope) => ({ mode: 'write' as const, scope })),
           lockScopes: scopes,
-          recovery: { kind: 'unknown' as const }
+          recovery: {
+            kind: 'buffered_mutation' as const,
+            transactionId: value.identity,
+            reconcilerId: 'agent-core.context-transition.v1',
+            authority: contextScope
+          }
         };
       },
       buildModelContent({ observation }) {
         if (observation.kind !== 'result') return defaultToolModelContent(observation);
         return [{ type: 'text', text: JSON.stringify(observation.output) }];
       },
-      async invoke(value, execution) {
-        const current = await options.context.history.capture();
-        if (current.sessionId !== value.cut.sessionId || current.branchId !== value.cut.branchId)
-          throw new Error('Context branch changed after authorization.');
-        let workingState;
-        if (value.workingState !== undefined) {
-          const staged = await options.context.stageWorkingState({
-            id: value.stateId,
-            revisionId: value.origin.revisionId,
-            inference: value.origin.inference,
-            text: value.workingState
-          });
-          if ('status' in staged && staged.status !== 'unchanged')
-            return {
-              kind: 'result',
-              execution: { state: 'settled' },
-              summary: `Context update: ${staged.status}.`,
-              output: parseJsonValue(staged),
-              scope: {
-                resources: [scopePath('context', value.cut.sessionId, value.cut.branchId)],
-                coverage: 'complete'
-              }
-            };
-          if (!('status' in staged)) workingState = staged;
-        }
-        const invocation = execution.invocation;
-        if (!invocation) throw new Error('Context operation requires an invocation.');
-        const { runId, turnId, requestAttempt, toolBatchId, callIndex, toolAttempt } = invocation;
-        const result = await options.context.schedule(
-          contextTransitionRequestSchema.parse({
-            toolInvocation: { runId, turnId, requestAttempt, toolBatchId, callIndex, toolAttempt },
-            expectedCut: value.cut,
-            expectedWindowId: value.expectedWindowId,
-            expectedSourceRevision: value.cut.sourceRevision,
-            expectedWorkingStateRevisionId: value.origin.revisionId,
-            ...(workingState ? { workingState } : {}),
-            idempotencyKey: value.identity,
-            reason: value.reason,
-            selection: value.selection
-          })
-        );
-        return {
-          kind: 'result',
-          execution: { state: 'settled' },
-          summary: 'Context selection scheduled; activation requires admission.',
-          output: { status: 'scheduled', ...result },
-          scope: {
-            resources: [scopePath('context', value.cut.sessionId, value.cut.branchId)],
-            coverage: 'complete'
-          }
-        };
+      invoke: observe,
+      async recover(value, _effect, execution) {
+        return { status: 'settled', observation: await observe(value, execution) };
       }
     })
   ]);

@@ -10,11 +10,11 @@ export function historyItemContent(value: JsonValue | undefined) {
 
 /** The reader budgets exactly this presentation, including coverage and its cursor. */
 export function historySearchContent(result: JsonObject) {
-  const { coverage, scanned, scannedBytes, unread, cursor, items } = result;
+  const { coverage, scanned, scannedBytes, postings, candidates, indexed, indexBytes, unread, cursor, items } = result;
   return [
     {
       type: 'text' as const,
-      text: JSON.stringify({ coverage, scanned, scannedBytes, unread, cursor })
+      text: JSON.stringify({ coverage, scanned, scannedBytes, postings, candidates, indexed, indexBytes, unread, cursor })
     },
     ...(Array.isArray(items) && items.length
       ? items.flatMap(historyItemContent)

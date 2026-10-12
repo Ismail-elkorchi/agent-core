@@ -1,5 +1,10 @@
 import type { SessionBranchEntry } from '../session/contracts.js';
 
+export interface HistorySearchPosition {
+  readonly at: number;
+  readonly sequence: number;
+  readonly entryId: string;
+}
 export interface HistorySourceCut {
   readonly format: 'agent-core.history/1';
   readonly sessionId: string;
@@ -25,7 +30,15 @@ export interface HistoryFilter {
   readonly toolName?: string | undefined;
   readonly resource?: string | undefined;
 }
+/** Every allowance is per call. An empty partial batch is resumable, never a proved miss. */
 export interface HistorySearchRequest {
+  readonly signal?: AbortSignal;
+  /** Posting visits, including false-positive candidates. */
+  readonly maxPostings?: number | undefined;
+  readonly maxCandidates?: number | undefined;
+  /** Source population and stale-tail removal share this rebuild allowance. */
+  readonly maxIndexEntries?: number | undefined;
+  readonly maxIndexBytes?: number | undefined;
   readonly maxScannedBytes?: number | undefined;
   readonly query?: string | undefined;
   readonly filter?: HistoryFilter | undefined;
@@ -47,6 +60,10 @@ export interface HistoryItem {
   readonly completeness?: 'complete' | 'partial' | 'indeterminate' | 'absent' | undefined;
 }
 export interface HistorySearchResult {
+  readonly postings: number;
+  readonly candidates: number;
+  readonly indexed: number;
+  readonly indexBytes: number;
   readonly scannedBytes: number;
   readonly unread?: readonly HistoryUnreadSource[];
   readonly items: readonly HistoryItem[];

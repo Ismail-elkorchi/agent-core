@@ -27,8 +27,10 @@ export interface ContextWindowRecord {
   readonly createdAt: string;
 }
 export interface ContextTransitionRecord {
-  readonly compiledInputIdentity?: string | undefined;
-  readonly capabilityRevision?: string | undefined;
+  readonly preservedSelection?: true | undefined;
+  readonly admission:
+    | { readonly status: 'admitted'; readonly compiledInputIdentity: string; readonly capabilityRevision: string }
+    | { readonly status: 'pending'; readonly reason: 'idle_source_selection' };
   readonly transitionId: string;
   readonly idempotencyKey: string;
   readonly previousWindowId: string | null;
@@ -49,6 +51,8 @@ export interface ContextTransitionCommit {
   readonly transition: ContextTransitionRecord;
 }
 export interface ContextTransitionRequest {
+  /** Preserve the captured sources and native continuity; no transform is requested. */
+  readonly preserveSelection?: true | undefined;
   readonly expectedCut?: HistorySourceCut | undefined;
   readonly workingState?: WorkingStateChange | undefined;
   readonly expectedWorkingStateRevisionId?: string | null | undefined;

@@ -1,3 +1,4 @@
+import { hashJson } from '@agent-core/persistence';
 import { RequestTokenEstimator, type RequestEstimator } from '@agent-core/model';
 import { randomUUID } from 'node:crypto';
 import { parseSessionImages } from '../session/images.js';
@@ -122,17 +123,31 @@ export function decodePromptContextItemInput(value: unknown): PromptContextItemI
   });
 }
 
+/** Own inputs before run acceptance; repeated identical IDs retain their first position. */
+export function ownPromptContextInputs(inputs: readonly unknown[]): readonly PromptContextItemInput[] {
+  const byIdentity = new Map<string, string>();
+  const output: PromptContextItemInput[] = [];
+  for (const value of inputs) {
+    const item = decodePromptContextItemInput(value);
+    const fingerprint = hashJson(item);
+    const identity = item.id === undefined ? `value:${fingerprint}` : `id:${item.id}`;
+    const previous = byIdentity.get(identity);
+    if (previous !== undefined) {
+      if (previous !== fingerprint) throw new TypeError(`Prompt context contains conflicting duplicate id ${String(item.id)}.`);
+      continue;
+    }
+    byIdentity.set(identity, fingerprint);
+    output.push(item);
+  }
+  return Object.freeze(output);
+}
+
 /** Preserve application order; Core does not rerank or silently select a second context set. */
 export function deliverPromptContext(
   inputs: readonly PromptContextItemInput[],
   estimator: RequestEstimator = new RequestTokenEstimator()
 ): PromptContextDelivery {
-  const ids = new Set<string>();
-  const items = inputs.map((input) => materializePromptContextItem(input, estimator));
-  for (const item of items) {
-    if (ids.has(item.id)) throw new TypeError(`Prompt context contains duplicate id ${item.id}.`);
-    ids.add(item.id);
-  }
+  const items = ownPromptContextInputs(inputs).map((input) => materializePromptContextItem(input, estimator));
   return Object.freeze({
     items: Object.freeze(items),
     totalTokens: items.reduce((total, item) => total + item.tokenEstimate, 0)

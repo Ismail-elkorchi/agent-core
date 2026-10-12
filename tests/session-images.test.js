@@ -56,7 +56,7 @@ test('native images survive queued revision, restart, provider encoding material
   };
   const sessions = new JsonlSessionRepository(path.join(directory, 'sessions'));
   const descriptor = await sessions.create({ binding });
-  await sessions.enqueueSubmission(descriptor, {
+  await sessions.admitSubmission(descriptor, {
     submissionId: 'submission',
     runId: 'run-image',
     input: { task: 'Inspect the attachment.', images: [image] },

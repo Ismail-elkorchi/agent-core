@@ -1,4 +1,4 @@
-import type { SessionWorkingStateEntry, WorkingStateChange } from './working-state.js';
+import type { WorkingStateRevision, WorkingStateChange } from './working-state.js';
 import type { JsonObject, JsonValue } from '@agent-core/json';
 import type {
   ModelOutputItem,
@@ -78,17 +78,32 @@ export interface SessionBranchPage {
 
 export type SessionBranchSearchRequest = SessionBranchReadLimits &
   SessionBranchReadPosition & {
+    readonly signal?: AbortSignal;
+    readonly maxPostings?: number;
+    readonly maxCandidates?: number;
+    readonly maxIndexEntries?: number;
+    readonly maxMetadataVisits?: number;
+    readonly maxIndexBytes?: number;
+    readonly maxScannedBytes?: number;
     /** Literal, case-sensitive text. Search cursors retain the exact query. */
     readonly query: string;
-    readonly cursor?: SessionBranchCursor & { readonly query: string };
+    readonly cursor?: SessionBranchCursor & { readonly query: string; readonly after?: import('../history/contracts.js').HistorySearchPosition };
   };
 
 export interface SessionBranchSearchResult {
+  readonly metadataVisited: number;
+  readonly bytes: number;
+  readonly indexBytes: number;
+  readonly coverage: 'complete' | 'partial';
+  readonly scannedBytes: number;
+  readonly indexed: number;
+  readonly postings: number;
+  readonly candidates: number;
   /** This entry was not searched because it exceeds the bounded page size. */
   readonly oversizedEntry?: SessionBranchPage['oversizedEntry'];
   readonly boundary: SessionBranchBoundary;
   readonly matches: readonly { readonly entryId: string; readonly excerpt: string }[];
-  readonly older?: SessionBranchCursor & { readonly query: string };
+  readonly older?: SessionBranchCursor & { readonly query: string; readonly after?: import('../history/contracts.js').HistorySearchPosition };
 }
 
 export type BaseSessionEntry = Readonly<{
@@ -200,6 +215,19 @@ export type SessionRunFinalization = Readonly<{
   readonly terminal: AgentTerminalSnapshot;
 }>;
 
+/** Consistency reference to the authoritative run.ended commit, never a replacement terminal decision. */
+export interface SessionRunFinalizationConfirmationInput {
+  readonly runId: string;
+  readonly finalizationId: string;
+  readonly terminalSha256: string;
+  readonly source: import('../history/contracts.js').HistoryEventSource;
+}
+export interface SessionRunFinalizationConfirmation extends SessionRunFinalizationConfirmationInput {
+  readonly type: 'run_finalization_confirmed';
+  readonly id: string;
+  readonly timestamp: string;
+}
+
 export type SessionBranchEntry =
   | SessionInputEntry
   | SessionSteeringEntry
@@ -208,8 +236,7 @@ export type SessionBranchEntry =
   | SessionObservationEntry
   | SessionBranchMarkerEntry
   | SessionModelSettingsEntry
-  | SessionContextTransitionEntry
-  | SessionWorkingStateEntry;
+  | SessionContextTransitionEntry;
 
 export type SessionConversationItem =
   | SessionInputEntry
@@ -249,8 +276,10 @@ export interface SessionSubmissionConfiguration {
   readonly responseFormat?: ModelResponseFormat;
 }
 
-export type SessionQueuedSubmission = Readonly<{
-  readonly type: 'submission.queued';
+export type SessionAdmittedSubmission = Readonly<{
+  readonly type: 'submission.admitted';
+  readonly maximumQueuedInputs: number;
+  readonly claimId?: string;
   readonly submissionId: string;
   readonly runId: string;
   readonly timestamp: string;
@@ -331,9 +360,14 @@ export type SessionQueuedSubmissionChange = { readonly expectedInput: SessionSub
 );
 
 export type SessionSubmissionRecord =
-  | SessionQueuedSubmission
+  | SessionAdmittedSubmission
   | SessionSubmissionTransition
   | SessionSubmissionUpdate;
+
+export type SessionSubmissionSnapshot = Omit<SessionPendingSubmission, 'state'> & {
+  readonly state: SessionPendingSubmission['state'] | 'completed' | 'failed' | 'cancelled';
+  readonly errorMessage?: string;
+};
 
 export interface SessionPendingSubmission {
   readonly submissionId: string;
@@ -386,7 +420,7 @@ export interface SessionReplayState {
   readonly branch: readonly SessionBranchEntry[];
   readonly runFinalizations: readonly SessionRunFinalization[];
   readonly contextWindow?: ContextWindowRecord;
-  readonly workingState: SessionWorkingStateEntry | null;
+  readonly workingState: WorkingStateRevision | null;
   readonly sourceRevision: number;
   readonly ledgerRunIds: readonly string[];
 }
@@ -412,41 +446,45 @@ export interface SessionSourceSnapshot {
   readonly boundary: SessionBranchBoundary;
   readonly branchId: string;
   readonly sourceRevision: number;
-  readonly entries: Iterable<SessionSourceMetadata> & {
+  readonly entries: AsyncIterable<SessionSourceMetadata> & {
     readonly length: number;
-    at(index: number): SessionSourceMetadata | undefined;
+    at(index: number): Promise<SessionSourceMetadata | undefined>;
   };
   readonly index: {
-    exchange(exchangeId: string): Iterable<SessionSourceMetadata>;
-    readonly byId: Pick<ReadonlyMap<string, SessionSourceMetadata>, 'get' | 'has'>;
-    readonly bySource: Pick<ReadonlyMap<string, SessionSourceMetadata>, 'get'>;
-    readonly byIdentity: Pick<ReadonlyMap<string, SessionSourceMetadata>, 'get'>;
-    readonly runs: Pick<ReadonlySet<string>, 'has'> & {
-      lastPosition(runId: string): number | undefined;
-    };
-    readonly positions: Pick<ReadonlyMap<string, number>, 'get'>;
-    readonly inputs: Pick<ReadonlyMap<string, number>, 'get'>;
+    exchange(exchangeId: string): AsyncIterable<SessionSourceMetadata>;
+    readonly byId: { get(id: string): Promise<SessionSourceMetadata | undefined>; has(id: string): Promise<boolean> };
+    readonly bySource: { get(id: string): Promise<SessionSourceMetadata | undefined> };
+    readonly byIdentity: { get(id: string): Promise<SessionSourceMetadata | undefined> };
+    readonly runs: { has(runId: string): Promise<boolean>; lastPosition(runId: string): Promise<number | undefined> };
+    readonly positions: { get(id: string): Promise<number | undefined> };
+    readonly inputs: { get(id: string): Promise<number | undefined> };
   };
-  readonly inheritedHeads: ReadonlyMap<string, import('../history/contracts.js').HistoryLedgerHead>;
-  readonly finalizedRuns: Pick<ReadonlySet<string>, 'has'>;
-  readonly latestContext: SessionSourceMetadata | undefined;
-  activeInputs(): Iterable<SessionSourceMetadata>;
+  readonly inheritedHeads: Promise<ReadonlyMap<string, import('../history/contracts.js').HistoryLedgerHead>>;
+  readonly finalizedRuns: { has(id: string): Promise<boolean> };
+  readonly latestContext: Promise<SessionSourceMetadata | undefined>;
+  activeInputs(): AsyncIterable<SessionSourceMetadata>;
+  unconfirmedRuns(): AsyncIterable<{ readonly runId: string; readonly finalized: boolean }>;
+  confirmedHead(runId: string): Promise<import('../history/contracts.js').HistoryLedgerHead | undefined>;
+}
+
+/** Live execution exclusion; durable submission records remain scheduling authority. */
+export interface SessionExecutionOwnership {
+  assertOwned(): Promise<void>;
+  release(): Promise<void>;
 }
 
 export interface SessionRepository {
+  tryAcquireExecution(session: SessionDescriptor): Promise<SessionExecutionOwnership | undefined>;
   create(options: CreateSessionOptions): Promise<SessionDescriptor>;
   open(sessionId: string, expectedBinding: SessionBindingInput): Promise<SessionDescriptor>;
   list(): Promise<readonly SessionSummary[]>;
   loadReplayState(session: SessionDescriptor, leafId?: string | null): Promise<SessionReplayState>;
+  revision(session: SessionDescriptor): Promise<number>;
+  currentModelSettings(session: SessionDescriptor): Promise<ModelSelection | undefined>;
   currentWorkingState(
     session: SessionDescriptor,
     leafId?: string | null
-  ): Promise<SessionWorkingStateEntry | null>;
-  commitWorkingState(
-    session: SessionDescriptor,
-    change: WorkingStateChange,
-    expectedBranchId: string
-  ): Promise<SessionWorkingStateEntry>;
+  ): Promise<WorkingStateRevision | null>;
   sourceSnapshot(
     session: SessionDescriptor,
     leafId?: string | null
@@ -505,7 +543,8 @@ export interface SessionRepository {
   ): Promise<SessionObservationEntry>;
   appendModelSettings(
     session: SessionDescriptor,
-    settings: ModelSelection
+    settings: ModelSelection,
+    recording?: { readonly runId: string }
   ): Promise<SessionModelSettingsEntry>;
   commitContextTransition(
     session: SessionDescriptor,
@@ -520,20 +559,31 @@ export interface SessionRepository {
     session: SessionDescriptor,
     terminal: AgentTerminalSnapshot
   ): Promise<SessionRunFinalization>;
-  enqueueSubmission(
+  /** Caller must verify the committed run.ended envelope before recording its reference. */
+  confirmRunFinalization(
+    session: SessionDescriptor,
+    input: SessionRunFinalizationConfirmationInput
+  ): Promise<SessionRunFinalizationConfirmation>;
+  /** Atomically admits input, enforces the session capacity, and optionally occupies its free slot. */
+  admitSubmission(
     session: SessionDescriptor,
     input: {
       submissionId: string;
       runId: string;
       input: SessionSubmissionInput;
       configuration: SessionSubmissionConfiguration;
+      maximumQueuedInputs?: number;
+      claimId?: string;
     }
-  ): Promise<void>;
+  ): Promise<SessionPendingSubmission>;
+  /** Claims the oldest durable queued input only when no submission occupies the slot. */
+  claimNextSubmission(session: SessionDescriptor, claimId: string): Promise<SessionPendingSubmission | undefined>;
   transitionSubmission(
     session: SessionDescriptor,
     submissionId: string,
     outcome: SessionSubmissionOutcome
   ): Promise<void>;
+  readSubmission(session: SessionDescriptor, submissionId: string): Promise<SessionSubmissionSnapshot | undefined>;
   loadPendingSubmissions(session: SessionDescriptor): Promise<readonly SessionPendingSubmission[]>;
   pendingSubmissionSummaries(session: SessionDescriptor): Promise<readonly Pick<SessionPendingSubmission, 'runId' | 'submissionId' | 'state'>[]>;
   updateQueuedSubmission(

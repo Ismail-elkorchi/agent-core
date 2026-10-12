@@ -12,14 +12,13 @@ import {
   InferenceService,
   InMemoryInferenceRepository,
   agentEventCodec,
-  createWorkingStateTool,
   createHistoryTools
 } from '@agent-core/runtime';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 
 async function fixture(
   t,
-  { native = true, bound = true, capacity = 100000, transformFailure, onTransform, automatic = true } = {}
+  { native = true, bound = true, capacity = 100000, transformFailure, onTransform, automatic = true, countInputTokens } = {}
 ) {
   const root = await mkdtemp(path.join(tmpdir(), 'native-context-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -56,7 +55,7 @@ async function fixture(
     fetch: async (url, init) => {
       const body = JSON.parse(init.body);
       if (url.endsWith('count_tokens'))
-        return Response.json({ input_tokens: Math.ceil(JSON.stringify(body).length / 4) });
+        return Response.json({ input_tokens: countInputTokens?.(body) ?? Math.ceil(JSON.stringify(body).length / 4) });
       calls.push(body);
       if (body.compaction) {
         await onTransform?.();
@@ -99,9 +98,10 @@ async function fixture(
                 {
                   type: 'tool_use',
                   id: `state-${generation}`,
-                  name: 'update_working_state',
+                  name: 'context_transition',
                   input: {
-                    text: generation === 1 ? 'Initial understanding.' : 'Revised understanding.'
+                    reason: 'Revise useful understanding.',
+                    workingState: generation === 1 ? 'Initial understanding.' : 'Revised understanding.'
                   }
                 }
               ]
@@ -141,7 +141,7 @@ async function fixture(
       maxOutputTokens: 1000,
       instructions: () => [{ id: 'authority', role: 'system', content: instructions }],
       tools: [
-        createWorkingStateTool(context),
+        ...context.toolDefinitions(),
         ...(extraTools ? createHistoryTools({ history }) : [])
       ],
       repositories: {
@@ -196,6 +196,10 @@ async function fixture(
     },
     noUpdates() {
       updateState = false;
+    },
+    updateAgain() {
+      generation = 0;
+      updateState = true;
     },
     reopen() {
       sessions = new JsonlSessionRepository(root);
@@ -262,9 +266,22 @@ for (const change of ['authority', 'tools']) {
   });
 }
 
+// Exact provider counts make these boundary fixtures independent of control-tool schema text.
+// Other tests retain byte-derived provider counts and assert actual compiled-request accounting.
+function isRestrictedRecovery(body) {
+  return JSON.stringify(body).includes('bounded context-management turn');
+}
+function capacityFixtureTokens(body) {
+  if (isRestrictedRecovery(body)) return 100;
+  const text = JSON.stringify(body);
+  if (text.includes('Original detailed evidence.') || text.includes('Original evidence.'))
+    return text.includes('Explain the result.') || text.includes('New input.') ? 8400 : 8000;
+  return 2000;
+}
+
 for (const transformFailure of [false, true]) {
   test(`native capacity fallback ${transformFailure ? 'does not run while ordinary inference fits' : 'preserves protected input and records cost without working-state maintenance'}`, async (t) => {
-    const f = await fixture(t, { bound: false, transformFailure });
+    const f = await fixture(t, { bound: false, transformFailure, countInputTokens: capacityFixtureTokens });
     f.noUpdates();
     await completed(
       f.runtime(),
@@ -272,10 +289,16 @@ for (const transformFailure of [false, true]) {
       `Original detailed evidence. ${'repository evidence '.repeat(700)}`
     );
     const accounting = (await f.context().inspect()).admission.accounting;
-    f.capacity(accounting.estimatedInputTokens + (transformFailure ? 2500 : 1300));
+    assert.equal(accounting.estimatedInputTokens, 8000);
+    const capacity = accounting.estimatedInputTokens + (transformFailure ? 2500 : 1300);
+    f.capacity(capacity);
     await completed(f.runtime(), 'renewed', `Explain the result. ${'New relevant input. '.repeat(100)}`);
     const transforms = f.calls.filter((call) => call.compaction);
     assert.equal(transforms.length, transformFailure ? 0 : 1);
+    assert.equal(f.calls.filter(isRestrictedRecovery).length, 0);
+    assert.ok(f.calls.filter(call => !call.compaction).every(call =>
+      capacityFixtureTokens(call) + call.max_tokens <= capacity), 'No oversized ordinary request may be transported');
+    assert.equal((await f.context().inspect()).admission.accounting.estimatedInputTokens, transformFailure ? 8400 : 2000);
     const last = f.calls.at(-1);
     assert(JSON.stringify(last).includes('Explain the result.'));
     assert.equal(JSON.stringify(last).split('Explain the result.').length - 1, 1);
@@ -333,7 +356,7 @@ test('cancellation after native compaction settles records its cost without publ
 });
 
 test('unavailable required compaction preserves the old window and does not dispatch an oversized request', async (t) => {
-  const f = await fixture(t, { bound: false, transformFailure: true });
+  const f = await fixture(t, { bound: false, transformFailure: true, countInputTokens: capacityFixtureTokens });
   f.noUpdates();
   await completed(
     f.runtime(),
@@ -345,11 +368,11 @@ test('unavailable required compaction preserves the old window and does not disp
     .runtime()
     .run({ runId: 'blocked-renewal', task: `New input. ${'details '.repeat(250)}` }).result;
   assert.notEqual(result.terminal?.executionStatus, 'completed');
-  assert.equal(
-    f.calls.length,
-    2,
-    'only original generation and attempted native compaction dispatch'
-  );
+  const ordinary = f.calls.filter(call => !call.compaction && !isRestrictedRecovery(call));
+  assert.equal(ordinary.length, 1, 'No oversized ordinary successor may be transported');
+  assert.equal(f.calls.filter(call => call.compaction).length, 1);
+  assert.equal(f.calls.filter(isRestrictedRecovery).length, 1, 'A fitting bounded recovery request may follow failed compaction');
+  assert.ok(!ordinary.some(call => JSON.stringify(call).includes('New input.')));
   assert.equal((await f.context().inspect()).window, null);
   assert.equal((await f.context().inspect()).admission.status, 'blocked');
 });
@@ -588,3 +611,28 @@ for (const change of ['authority', 'tools']) {
     });
   }
 }
+
+
+test('state-only updates preserve an admitted provider selection without requesting another compaction', { timeout: 90000 }, async t => {
+  const f = await fixture(t);
+  await completed(f.runtime(), 'state-before-transform', 'Inspect the original requirements.');
+  f.changeInstructions('New required authority.');
+  await completed(f.runtime(), 'state-transform', 'Continue under the changed instructions.');
+  const before = await f.context().inspect();
+  assert.equal(before.window.selection.strategy, 'provider');
+  const transformCount = f.calls.filter(call => call.compaction).length;
+  assert.equal(transformCount, 1);
+  const providerState = (await f.context().history.selectedContext()).selection.providerState;
+  f.updateAgain();
+  await completed(f.runtime(), 'state-after-transform', 'Revise only the fallible interpretation.');
+  assert.equal((await f.context().workingState()).text, 'Revised understanding.');
+  const after = await f.context().history.selectedContext();
+  assert.equal(after.selection.strategy, 'provider');
+  assert.deepEqual(after.selection.providerState, providerState);
+  assert.equal(f.calls.filter(call => call.compaction).length, transformCount);
+  const transitions = (await f.sessions().loadReplayState(f.session)).branch.filter(entry =>
+    entry.type === 'context_transition' && entry.workingState);
+  assert.equal(transitions.length, 4);
+  assert.ok(transitions.slice(-2).every(entry => entry.transition.preservedSelection === true &&
+    entry.transition.admission.status === 'admitted'));
+});

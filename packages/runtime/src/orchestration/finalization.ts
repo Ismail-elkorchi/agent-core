@@ -1,4 +1,11 @@
-import type { EventAppendReceipt, EventRepository } from '@agent-core/persistence';
+import {
+  hashJson,
+  PersistenceConflictError,
+  PersistenceCorruptionError,
+  type EventAppendReceipt,
+  type EventRepository
+} from '@agent-core/persistence';
+import type { HistoryEventSource } from '../history/contracts.js';
 import type { AgentAuditEvent, AgentEvent, AgentProgressEvent } from '../events.js';
 import { AgentFinalizationError, type AgentFinalizationProgress } from '../ports.js';
 import {
@@ -74,6 +81,7 @@ export class AgentRunFinalizer {
       sessionRecorded: false,
       committed: false
     };
+    let committed: EventAppendReceipt;
     try {
       await this.stage(terminal, diagnostic);
       progress.staged = true;
@@ -81,7 +89,7 @@ export class AgentRunFinalizer {
         await this.input.session.repository.recordRunFinalization(this.input.session.descriptor, terminal);
       }
       progress.sessionRecorded = true;
-      await this.input.append(
+      committed = await this.input.append(
         { type: 'run.ended', terminal, ...(diagnostic ? { diagnostic } : {}) },
         `${this.input.finalizationId}:committed`
       );
@@ -102,6 +110,16 @@ export class AgentRunFinalizer {
     }
 
     const deliveryDiagnostics = this.input.deliveryDiagnostics ?? [];
+    if (this.input.session) {
+      const confirmationDiagnostic = await confirmCommittedSessionFinalization({
+        events: this.input.events,
+        session: this.input.session,
+        terminal,
+        source: committed,
+        append: this.input.append
+      });
+      if (confirmationDiagnostic) deliveryDiagnostics.push(confirmationDiagnostic);
+    }
     if (this.input.deliver) {
       try {
         await this.input.deliver({
@@ -165,6 +183,64 @@ export class AgentRunFinalizer {
       }
     }
     return Object.freeze({ staged, sessionRecorded, committed, reconciliation: 'verified' });
+  }
+}
+
+/** Confirm only an exact authoritative terminal envelope; failed proof delivery cannot change truth. */
+export async function confirmCommittedSessionFinalization(input: {
+  readonly events: EventRepository<AgentEvent>;
+  readonly session: { readonly repository: SessionRepository; readonly descriptor: SessionDescriptor };
+  readonly terminal: AgentTerminalSnapshot;
+  readonly source: HistoryEventSource;
+  readonly rejectConflicts?: true;
+  readonly append?: (event: AgentAuditEvent, idempotencyKey: string) => Promise<EventAppendReceipt>;
+}): Promise<AgentDeliveryDiagnostic | undefined> {
+  try {
+    const source: HistoryEventSource = {
+      runId: input.source.runId,
+      eventId: input.source.eventId,
+      sequence: input.source.sequence,
+      hash: input.source.hash
+    };
+    const envelope = await input.events.readReference(source);
+    const terminalSha256 = hashJson(input.terminal);
+    if (
+      envelope.event.type !== 'run.ended' ||
+      envelope.runId !== input.terminal.runId ||
+      envelope.event.terminal.finalizationId !== input.terminal.finalizationId ||
+      hashJson(envelope.event.terminal) !== terminalSha256
+    )
+      throw new AgentContractError('Terminal confirmation identity mismatch.', [
+        'The referenced event does not contain the recorded immutable terminal decision.'
+      ]);
+    await input.session.repository.confirmRunFinalization(input.session.descriptor, {
+      runId: input.terminal.runId,
+      finalizationId: input.terminal.finalizationId,
+      terminalSha256,
+      source
+    });
+    return undefined;
+  } catch (error) {
+    if (
+      input.rejectConflicts &&
+      (error instanceof AgentContractError ||
+        error instanceof PersistenceConflictError ||
+        error instanceof PersistenceCorruptionError)
+    ) throw error;
+    const base = { eventType: 'session.run_finalization_confirmed', message: errorMessage(error) };
+    if (input.append) {
+      try {
+        const diagnostic = { ...base, persisted: true };
+        await input.append(
+          { type: 'delivery.failed', finalizationId: input.terminal.finalizationId, diagnostic },
+          `${input.terminal.finalizationId}:delivery:session-finalization-confirmation`
+        );
+        return diagnostic;
+      } catch {
+        // The terminal is already authoritative, even if both proof and diagnostic delivery fail.
+      }
+    }
+    return { ...base, persisted: false };
   }
 }
 

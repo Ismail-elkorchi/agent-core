@@ -18,7 +18,7 @@ import {
   sourceRef,
   agentEventCodec
 } from '@agent-core/runtime';
-import { JsonlSessionRepository } from '@agent-core/runtime/node';
+import { JsonlSessionRepository, SessionHistorySourceError } from '@agent-core/runtime/node';
 
 const binding = { schemaId: 'test/fresh-continuation', schemaVersion: 1, subject: {} };
 const identity = { turnId: 'turn', turnIndex: 1, requestAttempt: 1 };
@@ -272,7 +272,7 @@ test('fresh continuation rejects accepted image loss separately from native inco
 
 test('durable queued work blocks a fresh reset without dispatching or discarding it', async () => {
   const f = await fixture();
-  await f.sessions.enqueueSubmission(f.session, {
+  await f.sessions.admitSubmission(f.session, {
     submissionId: 'pending',
     runId: 'pending-run',
     input: { task: 'Accepted work retains its configuration.' },
@@ -447,7 +447,13 @@ test('incompatible persisted reset state is rejected in place without migration 
   const reopened = new JsonlSessionRepository({ rootDir: root });
   await assert.rejects(
     async () => reopened.loadReplayState(await reopened.open(f.session.id, binding)),
-    /resetId|context|incompatible/u
+    error => {
+      assert(error instanceof SessionHistorySourceError);
+      const details = [];
+      for (let cause = error.cause; cause instanceof Error; cause = cause.cause) details.push(cause.message);
+      assert.match(details.join('\n'), /resetId|context|incompatible/u);
+      return true;
+    }
   );
   assert.equal(await readFile(location, 'utf8'), incompatible);
 });
@@ -458,12 +464,25 @@ test('fresh continuation keeps the current working state separate from selected 
   await nativeAnswer(f);
   const requestRef = await f.artifacts.storeProtected({ label: 'original-inference', mediaType: 'application/json', content: new TextEncoder().encode(JSON.stringify({ workingStateRevisionId: null, logical: { model: 'model', messages: [] } })) });
   const cut = await f.history.capture();
-  await f.context.updateWorkingState({ id: 'current-understanding', revisionId: null, text: 'Keep the original Unicode constraint; understanding does not authorize edits.', inference: { ownerId: 'owner', invocationId: 'original', requestRef }, sessionId: f.session.id, branchId: cut.branchId });
+  const workingState = {
+    id: 'current-understanding', previousRevisionId: null,
+    contentRef: await f.artifacts.storeProtected({
+      label: 'working-state', mediaType: 'text/plain; charset=utf-8',
+      content: new TextEncoder().encode('Keep the original Unicode constraint; understanding does not authorize edits.')
+    }),
+    inference: { ownerId: 'owner', invocationId: 'original', requestRef }
+  };
+  const stateEntry = await f.context.transition({
+    expectedWindowId: (await f.history.selectedContext(cut))?.windowId ?? null,
+    expectedSourceRevision: cut.sourceRevision, expectedWorkingStateRevisionId: null,
+    workingState, idempotencyKey: 'current-understanding', reason: 'Seed admitted fixture understanding.',
+    selection: await f.context.selectSources(cut, {})
+  }, { admit: async () => ({ compiledInputIdentity: 'fixture-input', capabilityRevision: 'fixture' }) });
   await f.agent.changeModel({ selection: { provider: 'portable', model: 'model' }, profile: profile(), artifacts: f.artifacts, continuation: 'fresh' });
   const context = await f.context.inspect();
-  assert.equal(context.workingState.revisionId, 'current-understanding');
-  assert.equal(context.window.selection.retained.some(source => source.entryId === 'current-understanding'), false);
-  assert.equal(context.window.selection.continuity.sources.some(source => source.entryId === 'current-understanding'), false);
+  assert.equal(context.workingState.revisionId, stateEntry.id);
+  assert.equal(context.window.selection.retained.some(source => source.entryId === stateEntry.id), false);
+  assert.equal(context.window.selection.continuity.sources.some(source => source.entryId === stateEntry.id), false);
   const accepted = await f.agent.submit({ task: 'Explain the preserved constraint without editing.' });
   const result = await accepted.completion;
   assert.equal(result.terminal.executionStatus, 'completed', JSON.stringify(result));

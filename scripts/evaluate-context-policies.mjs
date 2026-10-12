@@ -697,7 +697,7 @@ async function runTrial({
         }
       });
       const context = contextFor();
-      const tools = [backgroundLookup, ...historyTools, ...(policy === 'retained-history' ? [] : core.createContextTools({ context }))];
+      const tools = [backgroundLookup, ...historyTools, ...(policy === 'retained-history' ? [] : context.toolDefinitions())];
       const runtime = new core.AgentRuntime({
         provider,
         inferenceService: inference,
@@ -767,9 +767,8 @@ async function runTrial({
       'Trial failed; no automatic retry or interactive rescue.'
     );
   }
-  result.metrics.contextTransitions = [...(await sessions.sourceSnapshot(descriptor)).entries].filter(
-    (entry) => entry.type === 'context_transition'
-  ).length;
+  for await (const entry of (await sessions.sourceSnapshot(descriptor)).entries)
+    if (entry.type === 'context_transition') result.metrics.contextTransitions += 1;
   for (const runId of result.runIds) {
     const state = await invocationRepository.load(runId);
     result.metrics.settledInvocations += state.settledUsage.invocations;

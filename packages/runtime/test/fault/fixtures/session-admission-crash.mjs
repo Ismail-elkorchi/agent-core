@@ -8,10 +8,11 @@ if (!root || !sessionId || !['before-claim', 'after-claim', 'after-accept'].incl
   throw new Error('Expected storage root, session identity, and admission crash boundary.');
 const binding = { schemaId: 'test.session-ownership', schemaVersion: 1, subject: {} };
 class CrashSessionRepository extends JsonlSessionRepository {
-  async transitionSubmission(descriptor, submissionId, outcome) {
-    if (outcome.state === 'claimed' && boundary === 'before-claim') process.exit(70);
-    await super.transitionSubmission(descriptor, submissionId, outcome);
-    if (outcome.state === 'claimed' && boundary === 'after-claim') process.exit(71);
+  async claimNextSubmission(descriptor, claimId) {
+    if (boundary === 'before-claim') process.exit(70);
+    const result = await super.claimNextSubmission(descriptor, claimId);
+    if (boundary === 'after-claim') process.exit(71);
+    return result;
   }
 }
 class CrashEventRepository extends JsonlEventRepository {

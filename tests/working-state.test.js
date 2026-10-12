@@ -13,11 +13,18 @@ import {
   InferenceService,
   agentEventCodec,
   createHistoryTools,
-  createWorkingStateTool
 } from '@agent-core/runtime';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 
 const binding = { schemaId: 'tests/working-state', schemaVersion: 1, subject: {} };
+async function stageState(f, { id, revisionId, inference, text }) {
+  const current = await f.context.workingState();
+  if ((current.revision?.id ?? null) !== revisionId) return { status: 'conflict' };
+  if (current.text === text) return { status: 'unchanged' };
+  return { id, previousRevisionId: revisionId, inference,
+    contentRef: await f.artifacts.storeProtected({ label: 'working-state', mediaType: 'text/plain; charset=utf-8',
+      content: new TextEncoder().encode(text) }) };
+}
 async function fixture(t, kind = 'memory', maxSourceBytes = 1024 * 1024) {
   const root = await mkdtemp(path.join(tmpdir(), 'working-state-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -30,7 +37,8 @@ async function fixture(t, kind = 'memory', maxSourceBytes = 1024 * 1024) {
       ? new InMemorySessionRepository()
       : new JsonlSessionRepository(path.join(root, 'sessions'));
   const session = await sessions.create({ binding });
-  const history = new HistoryReader({ repository: sessions, session, artifacts });
+  const events = new InMemoryEventRepository(agentEventCodec);
+  const history = new HistoryReader({ repository: sessions, session, artifacts, events });
   const context = new ContextService({
     repository: sessions,
     session,
@@ -46,18 +54,34 @@ async function fixture(t, kind = 'memory', maxSourceBytes = 1024 * 1024) {
     )
   });
   const inference = { ownerId: 'owner', invocationId: 'inference', requestRef };
+  const requests = new Map();
   const update = async (id, revisionId, text) => {
     const cut = await history.capture();
-    return context.updateWorkingState({
-      id,
-      revisionId,
-      text,
-      inference,
-      sessionId: session.id,
-      branchId: cut.branchId
-    });
+    let request = requests.get(id);
+    if (request && request.text !== text) throw new Error('Working-state retry has different content');
+    if (!request) {
+      const workingState = await stageState({ context, artifacts }, { id, revisionId, text, inference });
+      if ('status' in workingState) return workingState;
+      request = { text, transition: {
+        expectedCut: cut, expectedSourceRevision: cut.sourceRevision,
+        expectedWindowId: (await history.selectedContext(cut))?.windowId ?? null,
+        expectedWorkingStateRevisionId: revisionId, workingState,
+        idempotencyKey: id, reason: 'Update interpretation',
+        selection: { strategy: 'sources', retained: [] }
+      } };
+      requests.set(id, request);
+    }
+    try {
+      const entry = await context.transition(request.transition, {
+        admit: async () => ({ compiledInputIdentity: `test-${id}`, capabilityRevision: 'fixture' })
+      });
+      return { status: 'committed', revisionId: entry.id };
+    } catch (error) {
+      if (error.name !== 'PersistenceConflictError') throw error;
+      return { status: 'conflict' };
+    }
   };
-  return { root, artifacts, sessions, session, context, history, inference, update };
+  return { root, artifacts, sessions, session, context, history, inference, update, events };
 }
 
 for (const kind of ['memory', 'jsonl']) {
@@ -82,7 +106,7 @@ for (const kind of ['memory', 'jsonl']) {
       /different content/
     );
     const snapshot = await f.sessions.sourceSnapshot(f.session);
-    assert.equal([...snapshot.entries].filter((x) => x.type === 'working_state').length, 2);
+    assert.equal((await Array.fromAsync(snapshot.entries)).filter((x) => x.type === 'context_transition').length, 2);
     assert.equal((await f.sessions.readConversation(f.session)).length, 0);
     assert.equal(await f.artifacts.resolve(head.contentRef.artifactId), undefined);
     const unrelated = await f.sessions.create({ binding });
@@ -146,7 +170,7 @@ for (const kind of ['memory', 'jsonl']) {
     await f.sessions.branchFrom(f.session, nestedPoint.id, 'Nested fork');
     const repository = kind === 'jsonl'
       ? new JsonlSessionRepository(path.join(f.root, 'sessions')) : f.sessions;
-    const reopened = new HistoryReader({ repository, session: f.session, artifacts: f.artifacts });
+    const reopened = new HistoryReader({ repository, session: f.session, artifacts: f.artifacts, events: f.events });
     assert.equal(await reopened.extendsCut(inheritedCut, await reopened.capture()), true);
     assert.ok((await reopened.page({ after: inheritedCut })).entries.length > 0);
     assert.equal((await reopened.selectedContext(await reopened.capture())).windowId,
@@ -165,7 +189,7 @@ for (const kind of ['memory', 'jsonl']) {
       reason: 'Initial window'
 
     });
-    const candidate = await f.context.stageWorkingState({
+    const candidate = await stageState(f, {
       id: 'renewed',
       revisionId: 'old',
       inference: f.inference,
@@ -208,7 +232,7 @@ for (const kind of ['memory', 'jsonl']) {
       assert.equal((await reopened.currentWorkingState(f.session)).id, committed.id);
     }
 
-    const unchanged = await f.context.stageWorkingState({
+    const unchanged = await stageState(f, {
       id: 'no-change',
       revisionId: 'renewed',
       inference: f.inference,
@@ -246,7 +270,7 @@ for (const kind of ['memory', 'jsonl']) {
     assert.equal(text, body);
     const search = await f.history.search({
       query: 'rationale',
-      filter: { sourceType: 'working_state' },
+      filter: { sourceType: 'context_transition' },
       maxScannedBytes: 64 * 1024
     });
     assert.equal(search.items.length, 1);
@@ -270,15 +294,15 @@ test('incompatible notes-backed sessions are rejected without a version bump or 
   await writeFile(file, old);
   await assert.rejects(
     new JsonlSessionRepository(path.join(f.root, 'sessions')).open(f.session.id, binding),
-    /Incompatible session format/
+    /Incompatible session format|saved messages/
   );
   assert.equal(await readFile(file, 'utf8'), old);
 });
 
-test('normal inference supplies expected revision and exact request attribution to the single update tool', async (t) => {
+test('normal inference supplies expected revision and exact request attribution to the admitted context transition', async (t) => {
   const f = await fixture(t);
   const requests = [];
-  const events = new InMemoryEventRepository(agentEventCodec);
+  const events = f.events;
   const provider = {
     id: 'fixture',
     implementationId: 'fixture@1',
@@ -312,8 +336,8 @@ test('normal inference supplies expected revision and exact request attribution 
               {
                 type: 'function',
                 id: 'update',
-                name: 'update_working_state',
-                input: { kind: 'json', value: { text: 'Purpose and scoped feedback' } }
+                name: 'context_transition',
+                input: { kind: 'json', value: { workingState: 'Purpose and scoped feedback', reason: 'Useful understanding' } }
               }
             ]
           }
@@ -331,7 +355,7 @@ test('normal inference supplies expected revision and exact request attribution 
     model: 'fixture',
     context: f.context,
     inferenceService: inference,
-    tools: [createWorkingStateTool(f.context), ...createHistoryTools({ history: f.history })],
+    tools: [...f.context.toolDefinitions(), ...createHistoryTools({ history: f.history })],
     maxOutputTokens: 512,
     repositories: {
       events,
@@ -380,8 +404,8 @@ for (const kind of ['memory', 'jsonl']) {
       /Artifact unavailable/
     );
     f.artifacts.storeProtected = store;
-    const commit = f.sessions.commitWorkingState.bind(f.sessions);
-    f.sessions.commitWorkingState = async () => {
+    const commit = f.sessions.commitContextTransition.bind(f.sessions);
+    f.sessions.commitContextTransition = async () => {
       throw new Error('Journal append failed');
     };
     await assert.rejects(
@@ -389,7 +413,7 @@ for (const kind of ['memory', 'jsonl']) {
       /Journal append failed/
     );
     assert.equal((await f.context.workingState()).text, 'Useful understanding');
-    f.sessions.commitWorkingState = commit;
+    f.sessions.commitContextTransition = commit;
     assert.equal(
       (await f.update('new', 'old', 'Correction')).status,
       'committed'
@@ -469,7 +493,37 @@ for (const kind of ['memory', 'jsonl']) {
     assert.equal((await f.context.workingState()).text, '');
     const original = await f.sessions.currentWorkingState(f.session, 'obsolete');
     assert.equal(new TextDecoder().decode(await f.artifacts.readVerified(original.contentRef)), obsolete);
-    const tool = createWorkingStateTool(f.context);
-    assert.deepEqual(Object.keys(tool.jsonSchema.properties), ['text']);
+    const tools = f.context.toolDefinitions();
+    assert.ok(tools.some(tool => tool.name === 'context_transition'));
+    assert.ok(!tools.some(tool => tool.name === 'update_working_state'));
   });
 }
+
+for (const kind of ['memory', 'jsonl']) {
+  test(`${kind}: idle selection cannot publish attributed working state without admission`, async t => {
+    const f = await fixture(t, kind);
+    const workingState = await stageState(f, { id: 'unadmitted', revisionId: null,
+      inference: f.inference, text: 'Not yet admitted' });
+    const request = { expectedWindowId: null, idempotencyKey: 'unadmitted', reason: 'Attempt idle publication',
+      selection: { strategy: 'sources', retained: [] }, workingState };
+    await assert.rejects(f.context.transition(request), /requires compiled next-request admission/);
+    assert.equal((await f.context.workingState()).revision, null);
+    const { workingState: _unadmitted, ...sourceOnly } = request;
+    const selected = await f.context.transition(sourceOnly);
+    assert.deepEqual(selected.transition.admission, { status: 'pending', reason: 'idle_source_selection' });
+    assert.equal(selected.workingState, undefined);
+  });
+}
+
+test('standalone persisted working_state records are rejected without rewriting original data', async t => {
+  const f = await fixture(t, 'jsonl');
+  const file = f.sessions.location(f.session.id);
+  const source = await readFile(file, 'utf8');
+  const old = { type: 'working_state', id: 'retired-state', parentId: null, timestamp: new Date().toISOString(),
+    previousRevisionId: null, inference: f.inference,
+    contentRef: await f.artifacts.storeProtected({ label: 'old-state', mediaType: 'text/plain', content: new TextEncoder().encode('Original bytes') }) };
+  const incompatible = source + JSON.stringify(old) + '\n';
+  await writeFile(file, incompatible);
+  await assert.rejects(new JsonlSessionRepository(path.join(f.root, 'sessions')).open(f.session.id, binding));
+  assert.equal(await readFile(file, 'utf8'), incompatible);
+});

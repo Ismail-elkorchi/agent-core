@@ -6,7 +6,7 @@ import { defineTool } from '@agent-core/tools';
 import { hashJson, InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import {
   AgentRuntime, ContextService, HistoryReader, InMemorySessionRepository,
-  InMemoryInferenceRepository, InferenceService, agentEventCodec, createContextTools, createHistoryTools
+  InMemoryInferenceRepository, InferenceService, agentEventCodec, createHistoryTools
 } from '@agent-core/runtime';
 
 const marker = 'bounded context-management turn';
@@ -75,7 +75,7 @@ async function fixture({ budget, sourceBound = 12000, targetCapacity = 12000,
       contextProvider: request => { contextCollections.push(request); return []; },
       recordLogicalRequest: request => { logicalRequests.push(request); },
       repositories: { events, artifacts, session: { repository: sessions, descriptor } },
-      tools: [domain, ...createContextTools({ context }), ...createHistoryTools({ history })],
+      tools: [domain, ...context.toolDefinitions(), ...createHistoryTools({ history })],
       toolPolicy: { allowedRisks: ['read', 'write'] },
       toolBoundary: { authorizationPolicyId: 'recovery-accounting-test', executionTargetId: 'recovery-accounting-test' },
       maxOutputTokens: 512,

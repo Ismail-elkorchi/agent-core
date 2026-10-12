@@ -88,7 +88,7 @@ for (const kind of ['memory', 'jsonl']) {
         ? new InMemorySessionRepository()
         : new JsonlSessionRepository({ rootDir: root });
     const descriptor = await repository.create({ binding });
-    await repository.enqueueSubmission(descriptor, {
+    await repository.admitSubmission(descriptor, {
       submissionId: 'submission',
       runId: 'run',
       input: { task: 'Original' },

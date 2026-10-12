@@ -65,7 +65,9 @@ for (const [timing, exitStatus, expectedResumes] of [
       });
       await restored.restore();
       assert.equal(resumes, 0, 'restore is read-only');
+      await restored.startNextSubmission();
       await restored.waitForIdle();
+      await restored.close();
       assert.equal(resumes, expectedResumes);
       assert.deepEqual(await repository.loadPendingSubmissions(descriptor), []);
 

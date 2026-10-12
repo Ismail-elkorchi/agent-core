@@ -1,3 +1,4 @@
+import { readContentAddressedJsonNode, writeContentAddressedJsonNode } from './content-addressed-node.js';
 import { canonicalJsonString, parseJsonObject, type JsonObject } from '@agent-core/json';
 import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
@@ -61,7 +62,6 @@ export interface JsonlEventRepositoryOptions<TEvent extends TypedEvent> {
   readonly rootDir: string;
   readonly codec: EventCodec<TEvent>;
   readonly lockTimeoutMs?: number;
-  readonly staleLockMs?: number;
 }
 
 export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRepository<TEvent> {
@@ -70,7 +70,6 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   private readonly metadataIndexes: readonly EventMetadataIndex[];
   private readonly decoded = new WeakMap<EncodedEnvelope, TEvent>();
   private readonly lockTimeoutMs: number;
-  private readonly staleLockMs: number;
   private readonly queues = new Map<string, Promise<void>>();
   private readonly indexes = new Map<string, EventAppendIndex>();
   private readonly quarantined = new Map<string, PersistenceCorruptionError>();
@@ -85,7 +84,6 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
     this.codec = options.codec;
     this.metadataIndexes = ownEventMetadataIndexes(options.codec.metadataIndexes);
     this.lockTimeoutMs = positiveInteger(options.lockTimeoutMs ?? 5_000, 'lockTimeoutMs');
-    this.staleLockMs = positiveInteger(options.staleLockMs ?? 30_000, 'staleLockMs');
   }
 
   location(runId: string): string {
@@ -120,7 +118,6 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       withPersistenceFileLock(
         this.filePath(runId),
         this.lockTimeoutMs,
-        this.staleLockMs,
         async (assertOwned) => {
           const encodedEvent = this.codec.encode(event);
           await this.ensureHeader(runId);
@@ -175,7 +172,6 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
         return await withPersistenceFileLock(
           this.filePath(runId),
           this.lockTimeoutMs,
-          this.staleLockMs,
           async (assertOwned) => {
             acquisition.completed = true;
             await this.ensureHeader(runId);
@@ -519,9 +515,8 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
   /** Immutable bounded nodes let the accepted tail authenticate both membership and absence. */
   private async readRoutingCatalogNode(runId: string, hash: string, prefix: string): Promise<RoutingCatalogNode> {
     try {
-      const raw = parseJsonObject(JSON.parse(await fs.readFile(
-        path.join(this.indexDirectory(runId), 'routing', 'catalog', `${hash}.json`), 'utf8'
-      )), { maxDepth: 3, maxCollectionEntries: 160, maxStringBytes: 65536, maxTotalBytes: 128 * 1024 });
+      const node = await readContentAddressedJsonNode(path.join(this.indexDirectory(runId), 'routing', 'catalog'), hash, 128 * 1024);
+      const raw = parseJsonObject(node.value, { maxDepth: 3, maxCollectionEntries: 160, maxStringBytes: 65536, maxTotalBytes: 128 * 1024 });
       if (hashJson(raw) !== hash || raw.runId !== runId || raw.prefix !== prefix ||
           Object.keys(raw).some(key => !['runId', 'prefix', 'keys', 'children'].includes(key)))
         throw new TypeError('Routing catalog identity changed.');
@@ -545,9 +540,7 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
 
   private async writeRoutingCatalogNode(runId: string, prefix: string, node: RoutingCatalogNode): Promise<string> {
     const content = { runId, prefix, ...node };
-    const hash = hashJson(content);
-    await atomicWritePrivateJson(path.join(this.indexDirectory(runId), 'routing', 'catalog', `${hash}.json`), content);
-    return hash;
+    return writeContentAddressedJsonNode(path.join(this.indexDirectory(runId), 'routing', 'catalog'), content);
   }
 
   private async routingCatalogContains(runId: string, root: string, digest: string): Promise<boolean> {
@@ -830,7 +823,6 @@ export class JsonlEventRepository<TEvent extends TypedEvent> implements EventRep
       withPersistenceFileLock(
         this.filePath(runId),
         this.lockTimeoutMs,
-        this.staleLockMs,
         async () => {
           options.signal?.throwIfAborted();
           const stamp = await jsonlStorageStamp(this.filePath(runId));
@@ -1855,21 +1847,16 @@ export async function atomicWritePrivateJson(filePath: string, value: JsonObject
   const temporary = path.join(directory, `.${path.basename(filePath)}.${randomUUID()}.tmp`);
   const handle = await fs.open(temporary, 'wx', 0o600);
   try {
-    await handle.writeFile(`${canonicalJsonString(value)}\n`, 'utf8');
-    await handle.sync();
-  } catch (error) {
-    await handle.close();
-    await fs.rm(temporary, { force: true });
-    throw error;
-  }
-  await handle.close();
-  try {
-    await fs.rename(temporary, filePath);
-    await syncDirectoryEntry(directory);
-  } catch (error) {
-    await fs.rm(temporary, { force: true });
-    throw error;
-  }
+    try {await handle.writeFile(`${canonicalJsonString(value)}\n`, 'utf8'); await handle.sync();}
+    finally {await handle.close();}
+    await publishPrivateFile(temporary, filePath);
+  } catch (error) {await fs.rm(temporary, {force: true}); throw error;}
+}
+
+/** Publish an already durable private file; errors after rename have an uncertain outcome. */
+export async function publishPrivateFile(temporary: string, destination: string): Promise<void> {
+  await fs.rename(temporary, destination);
+  await syncDirectoryEntry(path.dirname(destination));
 }
 
 async function syncDirectoryEntry(directory: string): Promise<void> {
@@ -1888,19 +1875,86 @@ async function syncDirectoryEntry(directory: string): Promise<void> {
 
 const persistenceFileQueues = new Map<string, Promise<void>>();
 
+export interface PersistenceFileLockOwnership {
+  readonly assertOwned: () => Promise<void>;
+  readonly release: () => Promise<void>;
+}
+
+interface PersistenceFileLockOwner {
+  readonly pid: number;
+  readonly token: string;
+}
+
+interface PersistenceFileLockState {
+  readonly occupied: boolean;
+  readonly owner?: PersistenceFileLockOwner;
+}
+
+/** Attempts one acquisition without joining the transaction waiter queue. */
+export async function tryAcquirePersistenceFileLock(
+  filePath: string,
+  options: { readonly signal?: AbortSignal } = {}
+): Promise<PersistenceFileLockOwnership | undefined> {
+  options.signal?.throwIfAborted();
+  const lockPath = `${path.resolve(filePath)}.lock`;
+  const observed = await readPersistenceLockState(lockPath);
+  options.signal?.throwIfAborted();
+  // Busy lifetime owners are often checked by passive clients. Read-only early
+  // rejection avoids candidate-directory churn; publication still decides every
+  // acquisition, and a stale busy observation can only delay a subsequent retry.
+  if (observed.occupied && (observed.owner === undefined || processAlive(observed.owner.pid)))
+    return undefined;
+  await ensurePrivateDirectory(path.dirname(lockPath));
+  options.signal?.throwIfAborted();
+  const preparedPath = await fs.mkdtemp(`${lockPath}.pending-`);
+  const token = randomUUID();
+  const owner: PersistenceFileLockOwner = { pid: process.pid, token };
+  let published = false;
+  try {
+    await fs.writeFile(path.join(preparedPath, `${token}.json`), JSON.stringify(owner), {
+      encoding: 'utf8', mode: 0o600, flag: 'wx'
+    });
+    // Publish a complete, nonempty owner directory atomically. An interrupted
+    // preparer never leaves an ownerless canonical lock that could be stolen
+    // from a paused live process. Nonempty existing directories reject rename.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      options.signal?.throwIfAborted();
+      try {
+        await fs.rename(preparedPath, lockPath);
+        published = true;
+      } catch (error) {
+        if (!await persistenceLockExists(error, lockPath)) throw error;
+        if (attempt !== 0 || !await reclaimDeadPersistenceLock(lockPath)) return undefined;
+        continue;
+      }
+      const ownership = persistenceFileLockOwnership(lockPath, owner);
+      try {
+        options.signal?.throwIfAborted();
+      } catch (error) {
+        await releaseAfterFailedOperation(ownership, error);
+      }
+      return ownership;
+    }
+    return undefined;
+  } finally {
+    // Only this unique, unpublished preparation directory may be recursively
+    // removed. The canonical lock is never recursively removed or renamed away.
+    if (!published) await fs.rm(preparedPath, { recursive: true, force: true });
+  }
+}
+
 export function withPersistenceFileLock<T>(
   filePath: string,
   timeoutMs: number,
-  staleMs: number,
   operation: (assertOwned: () => Promise<void>) => Promise<T>,
   options: { readonly signal?: AbortSignal } = {}
 ): Promise<T> {
   const resolvedPath = path.resolve(filePath);
   const previous = persistenceFileQueues.get(resolvedPath) ?? Promise.resolve();
   // Repository instances share this queue. Only contention with another process
-  // spends the acquisition timeout; local writers cannot starve each other.
+  // or a lifetime ownership handle spends the acquisition timeout.
   const result = previous.then(() =>
-    withAcquiredPersistenceFileLock(resolvedPath, timeoutMs, staleMs, operation, options)
+    withAcquiredPersistenceFileLock(resolvedPath, timeoutMs, operation, options)
   );
   const tail = result.then(() => undefined, () => undefined);
   persistenceFileQueues.set(resolvedPath, tail);
@@ -1917,67 +1971,155 @@ export function withPersistenceFileLock<T>(
 async function withAcquiredPersistenceFileLock<T>(
   filePath: string,
   timeoutMs: number,
-  staleMs: number,
   operation: (assertOwned: () => Promise<void>) => Promise<T>,
-  options: { readonly signal?: AbortSignal } = {}
+  options: { readonly signal?: AbortSignal }
 ): Promise<T> {
   options.signal?.throwIfAborted();
-  await ensurePrivateDirectory(path.dirname(filePath));
-  const lockPath = `${filePath}.lock`;
-  const token = randomUUID();
   const started = Date.now();
-  for (;;) {
-    options.signal?.throwIfAborted();
-    try {
-      await fs.mkdir(lockPath, { mode: 0o700 });
-      await fs.writeFile(
-        path.join(lockPath, 'owner.json'),
-        JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }),
-        { encoding: 'utf8', mode: 0o600, flag: 'wx' }
-      );
-      break;
-    } catch (error) {
-      if (nodeCode(error) !== 'EEXIST') throw error;
-      if (await staleLock(lockPath, staleMs)) {
-        await fs.rm(lockPath, { recursive: true, force: true });
-        continue;
-      }
-      if (Date.now() - started >= timeoutMs)
-        throw new Error(`Timed out acquiring persistence lock: ${lockPath}`, { cause: error });
-      await (options.signal === undefined ? delay(10) : abortableLockWait(delay(10), options.signal));
-    }
+  let ownership: PersistenceFileLockOwnership | undefined;
+  while (ownership === undefined) {
+    ownership = await tryAcquirePersistenceFileLock(filePath, options);
+    if (ownership !== undefined) break;
+    if (Date.now() - started >= timeoutMs)
+      throw new Error(`Timed out acquiring persistence lock: ${filePath}.lock`);
+    await (options.signal === undefined ? delay(10) : abortableLockWait(delay(10), options.signal));
   }
-  const assertOwned = async (): Promise<void> => {
-    let owner: unknown;
-    try {
-      owner = JSON.parse(await fs.readFile(path.join(lockPath, 'owner.json'), 'utf8'));
-    } catch {
-      throw new PersistenceConflictError('Persistence lock ownership was lost.');
-    }
-    if (!isRecord(owner) || owner.token !== token || owner.pid !== process.pid)
-      throw new PersistenceConflictError('Persistence lock ownership was lost.');
-  };
-  const release = async (): Promise<void> => {
-    // Never remove a replacement lock, or mistake a removal failure for release.
-    await assertOwned();
-    await fs.rm(lockPath, { recursive: true, force: true });
-  };
   let result: T;
   try {
     options.signal?.throwIfAborted();
-    result = await operation(assertOwned);
+    result = await operation(ownership.assertOwned);
   } catch (error) {
-    try {
-      await release();
-    } catch (releaseError) {
-      throw new AggregateError([error, releaseError], 'Persistence operation and lock release failed.', {
-        cause: releaseError
+    return releaseAfterFailedOperation(ownership, error);
+  }
+  await ownership.release();
+  return result;
+}
+
+async function releaseAfterFailedOperation(
+  ownership: PersistenceFileLockOwnership,
+  error: unknown
+): Promise<never> {
+  try {
+    await ownership.release();
+  } catch (releaseError) {
+    throw new AggregateError([error, releaseError], 'Persistence operation and lock release failed.', {
+      cause: releaseError
+    });
+  }
+  throw error;
+}
+
+function persistenceFileLockOwnership(
+  lockPath: string,
+  owner: PersistenceFileLockOwner
+): PersistenceFileLockOwnership {
+  let released = false;
+  let releasing: Promise<void> | undefined;
+  const assertOwned = async (): Promise<void> => {
+    const current = released ? undefined : (await readPersistenceLockState(lockPath)).owner;
+    if (released || current?.token !== owner.token || current.pid !== owner.pid)
+      throw new PersistenceConflictError('Persistence lock ownership was lost.');
+  };
+  return Object.freeze({
+    assertOwned,
+    release: (): Promise<void> => {
+      if (releasing !== undefined) return releasing;
+      const attempt = (async () => {
+        if (!released) {
+          await assertOwned();
+          try {
+            await fs.unlink(path.join(lockPath, `${owner.token}.json`));
+          } catch (error) {
+            if (nodeCode(error) === 'ENOENT')
+              throw new PersistenceConflictError('Persistence lock ownership was lost.');
+            throw error;
+          }
+          released = true;
+        }
+        // Removing our unique owner file relinquishes ownership. Another owner
+        // can already have replaced the empty directory before this cleanup.
+        await removeEmptyPersistenceLockDirectory(lockPath);
+      })();
+      releasing = attempt;
+      void attempt.catch(() => {
+        // Concurrent callers share this attempt. A later explicit retry may
+        // finish a failed unlink, or only safe empty-directory cleanup if the
+        // token was already removed. Never inspect or unlink a replacement.
+        if (releasing === attempt) releasing = undefined;
       });
+      return attempt;
     }
+  });
+}
+
+async function persistenceLockExists(error: unknown, lockPath: string): Promise<boolean> {
+  const code = nodeCode(error);
+  if (code === 'EEXIST' || code === 'ENOTEMPTY') return true;
+  // Windows can report access errors instead of ENOTEMPTY when the destination
+  // directory exists. Do not turn an unrelated permission failure into busy.
+  if (process.platform !== 'win32' || (code !== 'EACCES' && code !== 'EPERM')) return false;
+  try {
+    return (await fs.stat(lockPath)).isDirectory();
+  } catch (statError) {
+    if (nodeCode(statError) === 'ENOENT') return false;
+    throw statError;
+  }
+}
+
+async function readPersistenceLockState(lockPath: string): Promise<PersistenceFileLockState> {
+  try {
+    const entries = await fs.readdir(lockPath, { withFileTypes: true });
+    if (entries.length === 0) return { occupied: false };
+    if (entries.length !== 1) return { occupied: true };
+    const entry = entries[0];
+    if (!entry?.isFile() || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\.json$/u.test(entry.name))
+      return { occupied: true };
+    const value: unknown = JSON.parse(await fs.readFile(path.join(lockPath, entry.name), 'utf8'));
+    if (!isRecord(value) || Object.keys(value).length !== 2 ||
+        !Number.isSafeInteger(value.pid) || typeof value.pid !== 'number' ||
+        value.pid < 1 || typeof value.token !== 'string' || `${value.token}.json` !== entry.name)
+      return { occupied: true };
+    return { occupied: true, owner: { pid: value.pid, token: value.token } };
+  } catch (error) {
+    if (nodeCode(error) === 'ENOENT') return { occupied: false };
+    if (error instanceof SyntaxError) return { occupied: true };
     throw error;
   }
-  await release();
-  return result;
+}
+
+async function reclaimDeadPersistenceLock(lockPath: string): Promise<boolean> {
+  const observed = await readPersistenceLockState(lockPath);
+  if (!observed.occupied) {
+    // Empty directories are safe to remove: canonical publication is always
+    // nonempty. A concurrently published replacement makes rmdir fail safely.
+    return removeEmptyPersistenceLockDirectory(lockPath);
+  }
+  const owner = observed.owner;
+  if (owner === undefined) return false;
+  // Age says nothing about a paused owner. Only a positively dead PID can be
+  // reclaimed; permission errors and other unknown liveness remain occupied.
+  if (processAlive(owner.pid)) return false;
+  try {
+    await fs.unlink(path.join(lockPath, `${owner.token}.json`));
+  } catch (error) {
+    if (nodeCode(error) !== 'ENOENT') throw error;
+  }
+  // Another stale observer can unlink only this same old token, never a newly
+  // published token. Nonrecursive rmdir cannot erase a replacement live owner.
+  await removeEmptyPersistenceLockDirectory(lockPath);
+  return true;
+}
+
+async function removeEmptyPersistenceLockDirectory(lockPath: string): Promise<boolean> {
+  try {
+    await fs.rmdir(lockPath);
+    return true;
+  } catch (error) {
+    const code = nodeCode(error);
+    if (code === 'ENOENT') return true;
+    if (code === 'ENOTEMPTY' || code === 'EEXIST') return false;
+    throw error;
+  }
 }
 
 async function abortableLockWait(waiting: Promise<void>, signal: AbortSignal): Promise<void> {
@@ -1994,24 +2136,6 @@ async function abortableLockWait(waiting: Promise<void>, signal: AbortSignal): P
   signal.throwIfAborted();
 }
 
-async function staleLock(lockPath: string, staleMs: number): Promise<boolean> {
-  let stat;
-  try {
-    stat = await fs.stat(lockPath);
-  } catch {
-    return false;
-  }
-  if (Date.now() - stat.mtimeMs < staleMs) return false;
-  try {
-    const owner = JSON.parse(await fs.readFile(path.join(lockPath, 'owner.json'), 'utf8')) as {
-      pid?: unknown;
-    };
-    if (typeof owner.pid === 'number' && processAlive(owner.pid)) return false;
-  } catch {
-    /* stale incomplete owner */
-  }
-  return true;
-}
 function processAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);

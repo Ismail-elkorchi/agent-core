@@ -4,9 +4,11 @@ import { type ModelReasoningRequest } from '@agent-core/model';
 import { hashJson } from '@agent-core/persistence';
 import * as z from 'zod';
 import { sourceSchema } from '../history/schema.js';
-import { decodePromptContextItemInput } from '../inference/prompt-material.js';
+import { ownPromptContextInputs } from '../inference/prompt-material.js';
 import type {
   SessionInputRelationship,
+  SessionAdmittedSubmission,
+  SessionRepository,
   SessionPendingSubmission,
   SessionQueuedSubmissionChange,
   SessionSubmissionConfiguration,
@@ -23,10 +25,7 @@ import type {
 import { parseSessionImages } from './images.js';
 
 type SubmissionState = SessionPendingSubmission['state'] | 'completed' | 'failed' | 'cancelled';
-type FoldedSubmission = Omit<SessionPendingSubmission, 'state'> & {
-  readonly state: SubmissionState;
-  readonly errorMessage?: string;
-};
+type FoldedSubmission = import('./contracts.js').SessionSubmissionSnapshot;
 
 const ownedConfigurations = new WeakSet();
 
@@ -73,7 +72,7 @@ export function ownSessionSubmissionInput(value: unknown): SessionSubmissionInpu
         }),
     ...(contextItems === undefined
       ? {}
-      : { contextItems: Object.freeze(contextItems.map(decodePromptContextItemInput)) })
+      : { contextItems: ownPromptContextInputs(contextItems) })
   });
 }
 
@@ -185,7 +184,15 @@ export function createSessionSubmissionTransition(
   submissionId: string,
   outcome: SessionSubmissionOutcome
 ): SessionSubmissionTransition | undefined {
+  const pending = pendingSessionSubmissions(records);
   const current = foldSubmissions(records).get(submissionId);
+  if (outcome.state === 'claimed') {
+    const occupying = pending.find((entry) => entry.state !== 'queued');
+    if (occupying && occupying.submissionId !== submissionId)
+      throw new Error(`Session is occupied by submission ${occupying.submissionId}.`);
+    if (!occupying && pending[0]?.submissionId !== submissionId)
+      throw new Error('Session submissions must be claimed in durable admission order.');
+  }
   if (current === undefined) throw new Error(`Unknown session submission: ${submissionId}`);
   const state = outcome.state;
   const claimId = outcome.claimId;
@@ -241,8 +248,20 @@ function foldSubmissions(
   records: readonly SessionSubmissionRecord[]
 ): Map<string, FoldedSubmission> {
   const submissions = new Map<string, FoldedSubmission>();
+  let capacity: number | undefined;
   for (const record of records) {
-    if (record.type === 'submission.queued') {
+    if (record.type === 'submission.admitted') {
+      if (!Number.isSafeInteger(record.maximumQueuedInputs) || record.maximumQueuedInputs < 0 ||
+          (capacity !== undefined && capacity !== record.maximumQueuedInputs))
+        throw new Error('Session submission capacity policy is invalid.');
+      capacity = record.maximumQueuedInputs;
+      const pending = [...submissions.values()].filter((entry) => entry.state === 'queued' || entry.state === 'claimed' || entry.state === 'suspended');
+      if (record.claimId !== undefined && pending.length > 0)
+        throw new Error('Session admission cannot overtake pending work.');
+      if (record.claimId === undefined && pending.filter((entry) => entry.state === 'queued').length >= capacity)
+        throw new Error('Session submission capacity was exceeded.');
+      if ([...submissions.values()].some((entry) => entry.runId === record.runId))
+        throw new Error(`Duplicate submission run: ${record.runId}`);
       if (submissions.has(record.submissionId))
         throw new Error(`Duplicate queued session submission: ${record.submissionId}`);
       submissions.set(
@@ -250,7 +269,8 @@ function foldSubmissions(
         Object.freeze({
           submissionId: record.submissionId,
           runId: record.runId,
-          state: 'queued',
+          state: record.claimId === undefined ? 'queued' : 'claimed',
+          ...(record.claimId === undefined ? {} : { claimId: record.claimId }),
           input: record.input,
           configuration: record.configuration
         })
@@ -272,6 +292,12 @@ function foldSubmissions(
           : Object.freeze({ ...current, state: 'cancelled' })
       );
       continue;
+    }
+    if (record.type === 'submission.claimed') {
+      const pending = [...submissions.values()].filter((entry) => entry.state === 'queued' || entry.state === 'claimed' || entry.state === 'suspended');
+      const occupying = pending.find((entry) => entry.state !== 'queued');
+      if ((occupying && occupying.submissionId !== record.submissionId) || (!occupying && pending[0]?.submissionId !== record.submissionId))
+        throw new Error('Session claim contradicts its durable execution slot or queue order.');
     }
     assertSubmissionOwnership(current, record);
     const state = submissionTransitionState(record);
@@ -493,4 +519,77 @@ const relationshipSchema = z
   .readonly();
 export function decodeSessionInputRelationship(value: unknown): SessionInputRelationship {
   return relationshipSchema.parse(value);
+}
+
+/** The submission journal is the sole scheduling authority. */
+export function assertSessionIdle(records: readonly SessionSubmissionRecord[]): void {
+  if (pendingSessionSubmissions(records).length > 0)
+    throw new Error('Session mutation requires an idle session with no pending submissions.');
+}
+
+export function createSessionAdmission(
+  records: readonly SessionSubmissionRecord[],
+  input: Parameters<SessionRepository['admitSubmission']>[1]
+): SessionAdmittedSubmission {
+  if (typeof input.submissionId !== 'string' || input.submissionId.length === 0 ||
+      typeof input.runId !== 'string' || input.runId.length === 0)
+    throw new Error('Session submission identity is invalid.');
+  const maximumQueuedInputs = input.maximumQueuedInputs ?? 1024;
+  if (!Number.isSafeInteger(maximumQueuedInputs) || maximumQueuedInputs < 0)
+    throw new Error('maximumQueuedInputs must be a non-negative safe integer.');
+  const policy = records.find((record) => record.type === 'submission.admitted');
+  if (policy && policy.maximumQueuedInputs !== maximumQueuedInputs)
+    throw new Error('Session queue capacity differs from its durable admission policy.');
+  if (records.some((record) => record.submissionId === input.submissionId))
+    throw new Error(`Duplicate session submission: ${input.submissionId}`);
+  if (records.some((record) => record.runId === input.runId))
+    throw new Error(`Duplicate session submission run: ${input.runId}`);
+  if (input.claimId !== undefined && (typeof input.claimId !== 'string' || input.claimId.length === 0))
+    throw new Error('Session submission claim identity is invalid.');
+  const pending = pendingSessionSubmissions(records);
+  const claimId = pending.length === 0 ? input.claimId : undefined;
+  if (claimId === undefined && pending.filter((entry) => entry.state === 'queued').length >= maximumQueuedInputs)
+    throw new Error(`Session input queue limit of ${String(maximumQueuedInputs)} was reached.`);
+  return Object.freeze({
+    type: 'submission.admitted', submissionId: input.submissionId, runId: input.runId,
+    timestamp: new Date().toISOString(), maximumQueuedInputs,
+    ...(claimId === undefined ? {} : { claimId }),
+    input: ownSessionSubmissionInput(input.input),
+    configuration: ownSessionSubmissionConfiguration(input.configuration)
+  });
+}
+
+export function sessionSubmission(records: readonly SessionSubmissionRecord[], submissionId: string): FoldedSubmission | undefined {
+  return foldSubmissions(records).get(submissionId);
+}
+
+/** Recording an admitted run cannot change the model choice that admission already fixed. */
+export function assertSessionModelSettings(
+  pending: readonly SessionPendingSubmission[],
+  settings: import('@agent-core/model').ModelSelection,
+  recording?: { readonly runId: string }
+): void {
+  if (pending.length === 0) return;
+  const active = pending.find((submission) => submission.state === 'claimed');
+  if (!recording || active?.runId !== recording.runId)
+    throw new Error('Session mutation requires an idle session with no pending submissions.');
+  const configuration = active.configuration;
+  if (configuration.provider !== settings.provider || configuration.model !== settings.model ||
+      configuration.temperature !== settings.temperature || hashJson(configuration.reasoning ?? null) !== hashJson(settings.reasoning ?? null))
+    throw new Error('A run model record must match its admitted configuration.');
+}
+
+/** The first admission fixes the initial model until an explicit branch-local selection replaces it. */
+export function initialSessionModelSelection(
+  records: readonly SessionSubmissionRecord[]
+): import('@agent-core/model').ModelSelection | undefined {
+  const admitted = records.find((record) => record.type === 'submission.admitted');
+  if (!admitted) return undefined;
+  const configuration = admitted.configuration;
+  return Object.freeze({
+    provider: configuration.provider,
+    model: configuration.model,
+    ...(configuration.temperature === undefined ? {} : { temperature: configuration.temperature }),
+    ...(configuration.reasoning === undefined ? {} : { reasoning: configuration.reasoning })
+  });
 }

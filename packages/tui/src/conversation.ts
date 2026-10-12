@@ -80,8 +80,6 @@ export function sessionConversationId(entry: SessionBranchEntry): string {
       return entry.deliveryId === undefined
         ? `session:${entry.id}`
         : `steering:${entry.deliveryId}`;
-    case 'working_state':
-      return `working-state:${entry.id}`;
     case 'context_transition':
       return `session:${entry.window.windowId}`;
     default:
@@ -126,8 +124,6 @@ function sessionEntries(
     }
     case 'observation':
       return [completedSessionToolActivity(current, entry, renderTool)];
-    case 'working_state':
-      return [];
     case 'context_transition':
       return [
         { id, kind: 'notice', tone: 'info', text: `Context changed · ${entry.window.reason}` }

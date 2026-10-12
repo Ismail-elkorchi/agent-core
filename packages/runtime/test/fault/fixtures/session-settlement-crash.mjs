@@ -10,67 +10,16 @@ const binding = Object.freeze({
   subject: Object.freeze({ fixture: 'fault-session' })
 });
 
-class CrashOnCompletionRepository {
-  constructor(repository, crashTiming) {
-    this.repository = repository;
+class CrashOnCompletionRepository extends JsonlSessionRepository {
+  constructor(options, crashTiming) {
+    super(options);
     this.crashTiming = crashTiming;
-  }
-  create(input) {
-    return this.repository.create(input);
-  }
-  open(id, expectedBinding) {
-    return this.repository.open(id, expectedBinding);
-  }
-  list() {
-    return this.repository.list();
-  }
-  loadReplayState(id, leaf) {
-    return this.repository.loadReplayState(id, leaf);
-  }
-  appendInput(id, input) {
-    return this.repository.appendInput(id, input);
-  }
-  appendSteering(id, input) {
-    return this.repository.appendSteering(id, input);
-  }
-  appendAssistant(id, input) {
-    return this.repository.appendAssistant(id, input);
-  }
-  appendToolCall(id, input) {
-    return this.repository.appendToolCall(id, input);
-  }
-  appendObservation(id, input) {
-    return this.repository.appendObservation(id, input);
-  }
-  appendModelSettings(id, input) {
-    return this.repository.appendModelSettings(id, input);
-  }
-  appendCompaction(id, input) {
-    return this.repository.appendCompaction(id, input);
-  }
-  recordRunFinalization(id, input) {
-    return this.repository.recordRunFinalization(id, input);
-  }
-  listBranchPoints(id) {
-    return this.repository.listBranchPoints(id);
-  }
-  branchFrom(id, entryId, label) {
-    return this.repository.branchFrom(id, entryId, label);
-  }
-  readConversation(id, leaf) {
-    return this.repository.readConversation(id, leaf);
-  }
-  enqueueSubmission(id, input) {
-    return this.repository.enqueueSubmission(id, input);
   }
   async transitionSubmission(id, submissionId, transition) {
     if (transition.state === 'completed' && this.crashTiming === 'before') process.exit(64);
-    const result = await this.repository.transitionSubmission(id, submissionId, transition);
+    const result = await super.transitionSubmission(id, submissionId, transition);
     if (transition.state === 'completed' && this.crashTiming === 'after') process.exit(65);
     return result;
-  }
-  loadPendingSubmissions(id) {
-    return this.repository.loadPendingSubmissions(id);
   }
 }
 
@@ -85,7 +34,7 @@ const descriptor = await storedSessions.create({
   model: 'fixture',
   binding
 });
-const repository = new CrashOnCompletionRepository(storedSessions, timing);
+const repository = new CrashOnCompletionRepository({ rootDir: path.join(root, 'sessions') }, timing);
 const events = new JsonlEventRepository({
   rootDir: path.join(root, 'events'),
   codec: agentEventCodec

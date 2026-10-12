@@ -1,7 +1,7 @@
 import { JsonlEventRepository, typedEventCodec } from '@agent-core/persistence/node';
 
 const [rootDir, runId, key, expectedJson] = process.argv.slice(2);
-const repository = new JsonlEventRepository({ rootDir, codec: typedEventCodec, lockTimeoutMs: 5_000, staleLockMs: 10 });
+const repository = new JsonlEventRepository({ rootDir, codec: typedEventCodec, lockTimeoutMs: 5_000 });
 const result = await repository.appendConditional(runId, { type: 'writer', key }, {
   idempotencyKey: key,
   expectedTail: JSON.parse(expectedJson),

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { promises as fs } from 'node:fs';
+import { promises as fs, statSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { withPersistenceFileLock } from '@agent-core/persistence/node';
@@ -14,6 +15,27 @@ import {
 
 const binding = { schemaId: 'test/history-repair', schemaVersion: 1, subject: { workspace: 'one' } };
 
+// Inject at the canonical database boundary, never through a parallel metadata file.
+function interceptProjectionSql(intercept) {
+  const prepare = DatabaseSync.prototype.prepare;
+  const exec = DatabaseSync.prototype.exec;
+  DatabaseSync.prototype.prepare = function (sql) {
+    const statement = prepare.call(this, sql);
+    for (const method of ['run', 'get', 'all']) {
+      const execute = statement[method].bind(statement);
+      statement[method] = (...args) => intercept({ sql, method, execute: () => execute(...args) });
+    }
+    return statement;
+  };
+  DatabaseSync.prototype.exec = function (sql) {
+    return intercept({ sql, method: 'exec', execute: () => exec.call(this, sql) });
+  };
+  return () => { DatabaseSync.prototype.prepare = prepare; DatabaseSync.prototype.exec = exec; };
+}
+const rootWrite = sql => /INSERT\s+(?:OR\s+REPLACE\s+)?INTO\s+projection_root\b/iu.test(sql);
+const rootRead = sql => /SELECT\b[\s\S]*\bFROM\s+projection_root\b/iu.test(sql);
+const commit = sql => /^\s*COMMIT\b/iu.test(sql);
+
 async function fixture(t) {
   const root = await fs.mkdtemp(path.join(tmpdir(), 'history-repair-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -26,20 +48,14 @@ async function fixture(t) {
   return { root, repository, session, healthy, file, index: `${file}.index` };
 }
 
-test('by-ID repair is available after a failed list without opening the damaged session', async t => {
+test('ordinary list repairs a damaged root without activating the session', async t => {
   const { root, repository, session, healthy, file, index } = await fixture(t);
   const source = await fs.readFile(file);
   const healthyIndex = await fs.readFile(`${repository.location(healthy.id)}.index`);
   await fs.writeFile(index, '{broken metadata}\n');
   const reader = new JsonlSessionRepository(root);
-  await assert.rejects(reader.list(), error => {
-    assert(error instanceof SessionHistoryIndexError);
-    assert.equal(error.sessionId, session.id);
-    assert.match(error.message, /conversation couldn’t be opened/u);
-    assert.match(error.cause.message, /missing, corrupt, or incompatible/u);
-    return true;
-  });
-  assert.equal(reader.historyReadMetrics(session.id).scannedBytes, 0);
+  assert.equal((await reader.list()).length, 2);
+  assert(reader.historyReadMetrics(session.id).scannedBytes > 0);
   assert.equal((await reader.readBranchPage(healthy)).entries.length, 1);
   await reader.rebuildHistoryIndex(session.id, binding);
   assert.equal((await reader.list()).length, 2);
@@ -104,18 +120,24 @@ test('cancelled or failed repair leaves original history and previous index inta
   }), /abort/iu);
   assert.deepEqual(await fs.readFile(file), source);
   assert.deepEqual(await fs.readFile(index), previousIndex);
-  const rename = fs.rename;
-  fs.rename = async function (from, to) {
-    if (to === index) throw new Error('Injected index replacement failure');
-    return rename.call(this, from, to);
-  };
-  try {
-    await assert.rejects(reader.rebuildHistoryIndex(session.id, binding), /Injected index replacement failure/u);
-  } finally {
-    fs.rename = rename;
+  for (const phase of ['root', 'commit']) {
+    let preparedRoot = false;
+    let injected = false;
+    const restore = interceptProjectionSql(({ sql, execute }) => {
+      if (rootWrite(sql)) preparedRoot = true;
+      if ((phase === 'root' && rootWrite(sql)) || (phase === 'commit' && preparedRoot && commit(sql))) {
+        injected = true;
+        throw new Error(`Injected index ${phase} failure`);
+      }
+      return execute();
+    });
+    try {
+      await assert.rejects(reader.rebuildHistoryIndex(session.id, binding), /Injected index (root|commit) failure/u);
+    } finally { restore(); }
+    assert(injected, `${phase} fault reached the canonical SQLite publication`);
+    assert.deepEqual(await fs.readFile(file), source);
+    assert.deepEqual(await fs.readFile(index), previousIndex);
   }
-  assert.deepEqual(await fs.readFile(file), source);
-  assert.deepEqual(await fs.readFile(index), previousIndex);
   await reader.rebuildHistoryIndex(session.id, binding);
   assert.equal((await reader.list()).length, 2);
 });
@@ -126,7 +148,7 @@ test('explicit repair joins the same source lock as active session writers', asy
   let acquired;
   const entered = new Promise(resolve => { acquired = resolve; });
   const blocked = new Promise(resolve => { release = resolve; });
-  const writing = withPersistenceFileLock(file, 5000, 30000, async () => {
+  const writing = withPersistenceFileLock(file, 5000, async () => {
     acquired();
     await blocked;
   });
@@ -144,7 +166,7 @@ test('explicit repair joins the same source lock as active session writers', asy
 
 test('corrupt original submission lifecycles fail before replacing the old index', async t => {
   const { root, repository, session, file, index } = await fixture(t);
-  await repository.enqueueSubmission(session, {
+  await repository.admitSubmission(session, {
     submissionId: 'duplicate', runId: 'queued-run', input: { task: 'queued once' },
     configuration: { provider: 'unavailable', model: 'unavailable' }
   });
@@ -154,20 +176,21 @@ test('corrupt original submission lifecycles fail before replacing the old index
   const invalidSource = await fs.readFile(file);
   await assert.rejects(new JsonlSessionRepository(root).rebuildHistoryIndex(session.id, binding), error => {
     assert(error instanceof SessionHistorySourceError);
-    assert.match(error.cause.message, /Invalid submission lifecycle/iu);
+    assert.match(error.cause.message, /Invalid source record/iu);
+    assert.match(error.cause.cause.message, /Duplicate submission/iu);
     return true;
   });
   assert.deepEqual(await fs.readFile(file), invalidSource);
   assert.deepEqual(await fs.readFile(index), previousIndex);
 });
 
-test('a disappeared warm index reports the affected session without rescanning originals', async t => {
+test('a disappeared warm root rebuilds its original automatically', async t => {
   const { repository, session, index } = await fixture(t);
   await repository.sourceSnapshot(session);
   const before = repository.historyReadMetrics(session.id);
   await fs.rm(index);
-  await assert.rejects(repository.sourceSnapshot(session), error => error instanceof SessionHistoryIndexError && error.sessionId === session.id);
-  assert.equal(repository.historyReadMetrics(session.id).scannedBytes, before.scannedBytes);
+  assert.equal((await repository.sourceSnapshot(session)).entries.length, 1);
+  assert(repository.historyReadMetrics(session.id).scannedBytes > before.scannedBytes);
 });
 
 test('application preflight recovers only selected damaged indexes and returns verified summaries', async t => {
@@ -181,7 +204,6 @@ test('application preflight recovers only selected damaged indexes and returns v
   assert.equal(untouched.length, 1);
   assert.deepEqual(progress, []);
   assert.equal(reader.historyReadMetrics(healthy.id).scannedBytes, 0);
-  await assert.rejects(reader.list(), SessionHistoryIndexError);
   const summaries = await reader.recoverHistoryIndexes(binding, { onProgress: event => progress.push(event) });
   assert.equal(summaries.length, 2);
   assert.deepEqual(progress.filter(event => event.phase !== 'progress'), [
@@ -195,9 +217,8 @@ test('application preflight recovers only selected damaged indexes and returns v
   assert.deepEqual(progress, [], 'Healthy metadata never triggers a recovery scan or notice.');
 });
 
-test('preflight catches up a valid stale index using only the committed original tail', async t => {
+test('a stale source boundary is fully revalidated before replacement', async t => {
   const { root, repository, session, file, index } = await fixture(t);
-  const beforeSource = await fs.readFile(file);
   const beforeIndex = await fs.readFile(index);
   await repository.appendInput(session, { runId: 'tail', task: 'The committed tail must be indexed once.' });
   const source = await fs.readFile(file);
@@ -205,7 +226,7 @@ test('preflight catches up a valid stale index using only the committed original
   const reader = new JsonlSessionRepository(root);
   const progress = [];
   await reader.recoverHistoryIndexes(binding, { sessionId: session.id, onProgress: event => progress.push(event) });
-  assert.equal(reader.historyReadMetrics(session.id).scannedBytes, source.length - beforeSource.length + beforeSource.indexOf(10) + 1);
+  assert.equal(reader.historyReadMetrics(session.id).scannedBytes, source.length);
   assert.equal((await reader.readBranchPage(session)).entries.length, 2);
   assert.deepEqual(await fs.readFile(file), source);
   assert.equal(progress.filter(event => event.phase === 'started').length, 1);
@@ -220,18 +241,15 @@ test('preflight cancellation while waiting for a source lock preserves the prior
   let acquired;
   const entered = new Promise(resolve => { acquired = resolve; });
   const blocked = new Promise(resolve => { release = resolve; });
-  const owner = withPersistenceFileLock(file, 5000, 30000, async () => { acquired(); await blocked; });
+  const owner = withPersistenceFileLock(file, 5000, async () => { acquired(); await blocked; });
   await entered;
   const controller = new AbortController();
-  let started;
-  const recovering = new Promise(resolve => { started = resolve; });
   const reader = new JsonlSessionRepository(root);
   const pending = reader.recoverHistoryIndexes(binding, {
     sessionId: session.id, signal: controller.signal,
-    onProgress: event => { if (event.phase === 'started') started(); }
   });
   try {
-    await recovering;
+    await new Promise(resolve => setImmediate(resolve));
     controller.abort();
     await assert.rejects(Promise.race([
       pending,
@@ -271,19 +289,19 @@ test('automatic recovery cancellation discards staged checkpoints and leaves met
 
 test('automatic recovery handles a source/index commit gap after an index-only write failure', async t => {
   const { root, repository, session, file, index } = await fixture(t);
-  const before = await fs.readFile(file);
-  const open = fs.open;
-  fs.open = async function (target, flags, ...args) {
-    if (target === index && flags === 'a') throw new Error('Injected derived-index append failure');
-    return open.call(this, target, flags, ...args);
-  };
+  const previousIndex = await fs.readFile(index);
+  const restore = interceptProjectionSql(({ sql, execute }) => {
+    if (rootWrite(sql)) throw new Error('Injected derived-index publication failure');
+    return execute();
+  });
   try {
     await assert.rejects(repository.appendInput(session, { runId: 'accepted', task: 'Accepted source survives index write failure.' }), /Injected derived-index/u);
-  } finally { fs.open = open; }
+  } finally { restore(); }
+  assert.deepEqual(await fs.readFile(index), previousIndex, 'failed projection transaction retains the prior database bytes');
   const committed = await fs.readFile(file);
   const reader = new JsonlSessionRepository(root);
   await reader.recoverHistoryIndexes(binding, { sessionId: session.id });
-  assert.equal(reader.historyReadMetrics(session.id).scannedBytes, committed.length - before.length + before.indexOf(10) + 1);
+  assert.equal(reader.historyReadMetrics(session.id).scannedBytes, committed.length);
   const page = await reader.readBranchPage(session);
   assert.equal(page.entries.filter(entry => entry.runId === 'accepted').length, 1);
   assert.deepEqual(await fs.readFile(file), committed);
@@ -315,27 +333,29 @@ test('original workspace binding is enforced and isolated for both catch-up and 
 
 test('index publication and final verification retain the same index lock as metadata readers', async t => {
   const { root, session, index } = await fixture(t);
-  const rename = fs.rename;
-  const open = fs.open;
+  let preparedRoot = false;
   let published = false;
   let checkedFinalRead = false;
-  fs.rename = async function (from, to) {
-    if (to === index) {
-      assert((await fs.stat(`${index}.lock`)).isDirectory());
-      published = true;
+  const restore = interceptProjectionSql(({ sql, execute }) => {
+    if (rootWrite(sql)) {
+      assert(statSync(`${index}.lock`).isDirectory());
+      preparedRoot = true;
     }
-    return rename.call(this, from, to);
-  };
-  fs.open = async function (target, flags, ...args) {
-    if (published && target === index && flags === 'r') {
-      assert((await fs.stat(`${index}.lock`)).isDirectory());
+    if (preparedRoot && commit(sql)) {
+      assert(statSync(`${index}.lock`).isDirectory());
+      const result = execute();
+      published = true;
+      return result;
+    }
+    if (published && rootRead(sql)) {
+      assert(statSync(`${index}.lock`).isDirectory());
       checkedFinalRead = true;
     }
-    return open.call(this, target, flags, ...args);
-  };
+    return execute();
+  });
   try {
     await new JsonlSessionRepository(root).rebuildHistoryIndex(session.id, binding);
-  } finally { fs.rename = rename; fs.open = open; }
+  } finally { restore(); }
   assert(published);
   assert(checkedFinalRead);
 });
@@ -345,34 +365,32 @@ test('post-publication verification failure is reported truthfully and never tri
   const original = await fs.readFile(file);
   await fs.writeFile(index, 'invalid prior checkpoint\n');
   const previousIndex = await fs.readFile(index);
-  const rename = fs.rename;
-  const open = fs.open;
+  let preparedRoot = false;
   let publications = 0;
   let failed = false;
-  fs.rename = async function (from, to) {
-    const result = await rename.call(this, from, to);
-    if (to === index) publications++;
-    return result;
-  };
-  fs.open = async function (target, flags, ...args) {
-    if (publications > 0 && !failed && target === index && flags === 'r') {
+  const restore = interceptProjectionSql(({ sql, execute }) => {
+    if (rootWrite(sql)) preparedRoot = true;
+    if (preparedRoot && commit(sql)) {
+      const result = execute();
+      publications++;
+      return result;
+    }
+    if (publications > 0 && !failed && rootRead(sql)) {
       failed = true;
       throw new Error('Injected post-publication verification failure');
     }
-    return open.call(this, target, flags, ...args);
-  };
+    return execute();
+  });
   try {
     await assert.rejects(new JsonlSessionRepository(root).recoverHistoryIndexes(binding, { sessionId: session.id }), error => {
       assert(error instanceof SessionHistoryIndexPublicationError);
       assert.equal(error.indexPublished, true);
       assert.equal(error.sessionId, session.id);
       assert.match(error.message, /save couldn’t be confirmed/u);
-      assert(error.cause instanceof SessionHistoryIndexError);
-      assert.match(error.cause.cause.message, /missing, corrupt, or incompatible/u);
-      assert.match(error.cause.cause.cause.message, /Injected post-publication/u);
+      assert.match(error.cause.message, /Injected post-publication/u);
       return true;
     });
-  } finally { fs.rename = rename; fs.open = open; }
+  } finally { restore(); }
   assert(failed);
   assert.equal(publications, 1);
   assert.notDeepEqual(await fs.readFile(index), previousIndex);
@@ -417,4 +435,23 @@ test('conversation opening errors use ordinary wording while preserving typed te
   assert.equal(published.indexPublished, true);
   assert.equal(published.cause, cause);
   assert.doesNotMatch(published.message, /index|recover|unchanged|hasn’t been changed/iu);
+});
+
+test('deliberate full replay uses the same source validator and preserves a duplicate finalization journal', async t => {
+  const {repository, session, file, index} = await fixture(t);
+  await repository.recordRunFinalization(session, {
+    runId: 'one', finalizationId: 'one-final', phase: 'ended', executionStatus: 'completed',
+    terminationReason: 'model_completed', modelTerminationReason: 'stop',
+    modelOutput: {status: 'complete', message: 'done', source: 'content', turnIndex: 1}, turnCount: 1,
+    budget: {modelTurns: 1, totalToolCalls: 0, elapsedMs: 1, promptTokens: 0, completionTokens: 0,
+      cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, knownCosts: {}, pricingStatus: 'unknown', unknownPricedTokens: 0}
+  });
+  const previousIndex = await fs.readFile(index);
+  const original = await fs.readFile(file, 'utf8');
+  const duplicate = `${original}${original.trimEnd().split('\n').at(-1)}\n`;
+  await fs.writeFile(file, duplicate);
+  await assert.rejects(repository.loadReplayState(session), error =>
+    error instanceof SessionHistorySourceError && /Duplicate finalization/u.test(error.cause.cause.message));
+  assert.equal(await fs.readFile(file, 'utf8'), duplicate);
+  assert.deepEqual(await fs.readFile(index), previousIndex);
 });

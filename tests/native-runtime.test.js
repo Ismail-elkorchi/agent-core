@@ -13,8 +13,6 @@ import {
   InMemorySessionRepository,
   HistoryReader,
   ContextService,
-  createWorkingStateTool,
-  createContextTools,
   agentEventCodec
 } from '@agent-core/runtime';
 import { adoptToolDefinition } from '@agent-core/tools';
@@ -478,8 +476,8 @@ for (const [requiresResult, reportsUsage] of [
   });
 }
 
-test(
-  'native working-state updates bind each successor to its exact admitted input',
+for (const publication of ['normal', 'lost_receipt', 'rejected']) test(
+  `native working-state ${publication} binds each successor to its exact admitted input`,
   { timeout: 10000 },
   async () => {
     const sessions = new InMemorySessionRepository();
@@ -519,8 +517,8 @@ test(
               ? message('Finished.')
               : [
                   {
-                    ...call(id + '-state', 'update_working_state'),
-                    arguments: JSON.stringify({ text: id === 'r1' ? body1 : body2 })
+                    ...call(id + '-state', 'context_transition'),
+                    arguments: JSON.stringify({ reason: 'Revise useful understanding.', workingState: id === 'r1' ? body1 : body2 })
                   }
                 ];
           ws.feed(
@@ -529,8 +527,25 @@ test(
           );
         }))
     });
+    let receiptLost = false;
+    const commit = sessions.commitContextTransition.bind(sessions);
+    sessions.commitContextTransition = async (...args) => {
+      const before = socket.sent.length;
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(socket.sent.length, before, 'A native successor cannot be sent while state publication is pending');
+      const entry = await commit(...args);
+      if (publication === 'lost_receipt' && !receiptLost) {
+        receiptLost = true;
+        throw new Error('Lost admitted state receipt');
+      }
+      return entry;
+    };
     const inference = new InferenceService({
       provider,
+      ...(publication === 'rejected' ? { admitRequest: compiled => {
+        if (compiled.logicalRequest.messages.some(item => item.role === 'user' && item.content.includes(body1)))
+          throw new Error('Reject the exact native state successor');
+      } } : {}),
       repository: new InMemoryInferenceRepository(),
       artifacts
     });
@@ -540,14 +555,22 @@ test(
       maxOutputTokens: 512,
       context,
       inferenceService: inference,
-      tools: [createWorkingStateTool(context)],
+      tools: context.toolDefinitions(),
       toolPolicy: { allowedRisks: ['write'] },
       toolBoundary: { authorizationPolicyId: 'native-state', executionTargetId: 'native-state' },
       repositories: { events, artifacts, session: { repository: sessions, descriptor } }
     }).run({ task: 'Correct the understanding and finish.' }).result;
+    if (publication === 'rejected') {
+      assert.notEqual(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+      assert.equal((await context.workingState()).revision, null);
+      assert.equal(socket.sent.length, 1, 'A rejected successor is never sent');
+      assert.equal((await sessions.loadReplayState(descriptor)).branch.filter(entry => entry.type === 'context_transition').length, 0);
+      return;
+    }
+    assert.equal(receiptLost, publication === 'lost_receipt');
     assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
     const { branch } = await sessions.loadReplayState(descriptor);
-    const revisions = branch.filter((entry) => entry.type === 'working_state');
+    const revisions = branch.filter((entry) => entry.type === 'context_transition' && entry.workingState);
     assert.equal(revisions.length, 2, JSON.stringify(branch));
     assert.equal((await context.workingState()).text, body2);
     assert.equal(socket.sent.length, 3);
@@ -558,13 +581,13 @@ test(
       assert.ok(JSON.stringify(wire.input[1]).includes(text));
     }
     const originatingInput = JSON.parse(
-      new TextDecoder().decode(await artifacts.readVerified(revisions[1].inference.requestRef))
+      new TextDecoder().decode(await artifacts.readVerified(revisions[1].workingState.inference.requestRef))
     );
     assert.equal(originatingInput.workingStateRevisionId, revisions[0].id);
     assert.ok(JSON.stringify(originatingInput.logical).includes(body1));
     assert.notEqual(
-      revisions[0].inference.requestRef.sha256,
-      revisions[1].inference.requestRef.sha256
+      revisions[0].workingState.inference.requestRef.sha256,
+      revisions[1].workingState.inference.requestRef.sha256
     );
   }
 );
@@ -620,7 +643,7 @@ async function nativeControlRoomFixture(resultTokens = 850) {
     provider, model: 'gpt-6-astra', maxOutputTokens: 128, context,
     contextRenewal: { automatic: true },
     inferenceService: new InferenceService({ provider, repository: inference, artifacts }),
-    tools: [tool('read', async () => { effects++; }), ...createContextTools({ context })],
+    tools: [tool('read', async () => { effects++; }), ...context.toolDefinitions()],
     toolPolicy: { allowedRisks: ['read', 'write'] },
     toolBoundary: { authorizationPolicyId: 'native-control-room', executionTargetId: 'native-control-room' },
     repositories: { events, artifacts, session: { repository: sessions, descriptor } }
@@ -721,3 +744,90 @@ test('hard native capacity conflict preserves an unsent settled result without r
     assert.equal(finalAudit.filter(({event}) => event.type === 'tool.ended').length, 1);
     assert.equal(finalAudit.filter(({event}) => event.type === 'run.ended').length, 1);
   });
+
+for (const publication of ['normal', 'lost_receipt', 'rejected']) {
+  test(`native steering extension ${publication} publishes staged state before transmission`, { timeout: 10000 }, async () => {
+    const sessions = new InMemorySessionRepository();
+    const descriptor = await sessions.create({ binding: { schemaId: 'native-extension-state', schemaVersion: 1, subject: {} } });
+    const events = new InMemoryEventRepository(agentEventCodec);
+    const artifacts = new InMemoryArtifactRepository();
+    const history = new HistoryReader({ repository: sessions, session: descriptor, events, artifacts });
+    const context = new ContextService({ repository: sessions, session: descriptor, history, artifacts,
+      policy: { maxSourceBytes: 1024 * 1024, historyRead: { history, isAvailable: () => true } } });
+    const text = 'The steering successor must contain the committed understanding.';
+    let socket;
+    let handle;
+    let steered = false;
+    let commits = 0;
+    let lost = false;
+    const commit = sessions.commitContextTransition.bind(sessions);
+    sessions.commitContextTransition = async (...args) => {
+      const sent = socket.sent.length;
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(socket.sent.length, sent, 'Publication must complete before extension transport');
+      if (publication === 'rejected') throw new Error('Reject staged native extension');
+      const value = await commit(...args);
+      commits++;
+      if (publication === 'lost_receipt' && !lost) {
+        lost = true;
+        throw new Error('Lost native extension publication receipt');
+      }
+      return value;
+    };
+    const provider = new OpenAIProvider({ apiKey: 'fixture', transport: 'websocket',
+      webSocketFactory: () => (socket = new Socket((body, ws) => {
+        if (body.type === 'response.steer') {
+          ws.feed({ type: 'response.steer.accepted', steer: { id: 'state-steer', previous_response_id: 'r1' } },
+            { type: 'response.completed', response: response('r1', [{ ...call('state-call', 'context_transition'),
+              arguments: JSON.stringify({ reason: 'Remember the corrected understanding.', workingState: text }) }]) });
+        } else if (!body.previous_response_id) {
+          ws.feed({ type: 'response.created', response: { id: 'r1' } },
+            { type: 'response.output_text.delta', response_id: 'r1', delta: 'Working.' });
+        } else {
+          assert.equal(commits, 1, 'The extension cannot transmit an uncommitted state');
+          assert.ok(JSON.stringify(body.input).includes(text));
+          assert.equal(body.input[0].call_id, 'state-call');
+          ws.feed({ type: 'response.created', response: { id: 'r2', previous_response_id: 'r1' } },
+            { type: 'response.completed', response: response('r2', message('Correction remembered.')) });
+        }
+      })) });
+    const repository = new InMemoryInferenceRepository();
+    const audit = recordInferenceEvents(repository);
+    const inference = new InferenceService({ provider, repository, artifacts, budget: { maxInvocations: 2 } });
+    const runId = `native-state-extension-${publication}`;
+    const runtime = new AgentRuntime({ provider, model: 'gpt-6-astra', maxOutputTokens: 512,
+      context, inferenceService: inference, tools: context.toolDefinitions(),
+      toolPolicy: { allowedRisks: ['write'] },
+      toolBoundary: { authorizationPolicyId: 'native-extension-state', executionTargetId: 'native-extension-state' },
+      repositories: { events, artifacts, session: { repository: sessions, descriptor } },
+      onProgress(event) {
+        if (!steered && event.type === 'assistant.delta') {
+          steered = true;
+          handle.injectSteering({ instruction: 'Use the corrected understanding.', deliveryId: 'state-steering' });
+        }
+      } });
+    handle = runtime.run({ runId, task: 'Remember the understanding and finish.' });
+    const result = await handle.result;
+    const transitions = (await sessions.loadReplayState(descriptor)).branch.filter(entry => entry.type === 'context_transition');
+    if (publication === 'rejected') {
+      assert.notEqual(result.terminal?.executionStatus, 'completed');
+      assert.equal(commits, 0);
+      assert.equal(transitions.length, 0);
+      assert.equal((await context.workingState()).revision, null);
+      assert.equal(socket.sent.length, 2, 'Rejected state must not be sent after the initial request and steering');
+      return;
+    }
+    assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+    assert.equal(transitions.length, 1);
+    assert.equal(commits, 1);
+    assert.equal(lost, publication === 'lost_receipt');
+    assert.equal(socket.sent.length, 3);
+    assert.equal((await context.workingState()).text, text);
+    const extension = audit.find(({ event }) => event.type === 'inference.extended').event;
+    const origin = await inference.workingStateOrigin(runId, extension.invocationId);
+    assert.equal(origin.revisionId, transitions[0].id);
+    const input = JSON.parse(new TextDecoder().decode(await artifacts.readVerified(origin.inference.requestRef)));
+    assert.equal(input.inputIdentity, transitions[0].transition.admission.compiledInputIdentity);
+    assert.ok(JSON.stringify(input.logical).includes(text));
+  });
+}

@@ -1,3 +1,4 @@
+/** Pending delivery overflowed. Reload authoritative state before applying later events. */
 export interface ApplicationDeliveryEvent {
   readonly type: 'delivery.gap';
 }
@@ -5,7 +6,7 @@ export interface ApplicationDeliveryEvent {
 type Listener<Event> = (event: Event | ApplicationDeliveryEvent) => void | Promise<void>;
 interface Subscription<Event> {
   readonly listener: Listener<Event>;
-  readonly onFailure: (error: Error) => void;
+  readonly onFailure: (error: Error) => void | Promise<void>;
   readonly queue: (Event | ApplicationDeliveryEvent)[];
   active: boolean;
   delivering: boolean;
@@ -21,7 +22,7 @@ export class ApplicationEvents<Event> {
       undefined
   ) {}
 
-  subscribe(listener: Listener<Event>, onFailure: (error: Error) => void): () => void {
+  subscribe(listener: Listener<Event>, onFailure: (error: Error) => void | Promise<void>): () => void {
     const subscription: Subscription<Event> = {
       listener,
       onFailure,
@@ -62,7 +63,12 @@ export class ApplicationEvents<Event> {
       } else {
         subscription.queue.push(event);
       }
-      if (!subscription.delivering) void this.deliver(subscription);
+      if (!subscription.delivering) {
+        subscription.delivering = true;
+        // Queue every observer independently before invoking application code. Reentrant
+        // publication preserves each observer's order and cannot enter the publisher.
+        queueMicrotask(() => void this.deliver(subscription));
+      }
     }
   }
 
@@ -73,7 +79,7 @@ export class ApplicationEvents<Event> {
   fail(error: Error): void {
     for (const subscription of [...this.subscriptions]) {
       this.detach(subscription);
-      subscription.onFailure(error);
+      this.reportFailure(subscription, error);
     }
   }
 
@@ -81,6 +87,14 @@ export class ApplicationEvents<Event> {
     subscription.active = false;
     subscription.queue.length = 0;
     this.subscriptions.delete(subscription);
+  }
+
+  private reportFailure(subscription: Subscription<Event>, error: Error): void {
+    try {
+      void Promise.resolve(subscription.onFailure(error)).catch(() => undefined);
+    } catch {
+      // A detached observer's failure handler has no delivery authority.
+    }
   }
 
   private async deliver(subscription: Subscription<Event>): Promise<void> {
@@ -94,9 +108,10 @@ export class ApplicationEvents<Event> {
         }
       }
     } catch (cause) {
+      if (!subscription.active) return;
       const error = cause instanceof Error ? cause : new Error(String(cause));
       this.detach(subscription);
-      subscription.onFailure(error);
+      this.reportFailure(subscription, error);
     } finally {
       subscription.delivering = false;
     }

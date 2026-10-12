@@ -22,6 +22,12 @@ export class RunContextTransitions {
       readonly append: (event: AgentAuditEvent, key: string) => Promise<unknown>;
     }
   ) {}
+  /** State-only native successors can preview the first queued immutable proposal. */
+  async pendingState(): Promise<ContextTransitionRequest | undefined> {
+    await this.writes;
+    const first = this.requests.values().next().value;
+    return first?.requested.preserveSelection && first.requested.workingState ? first.requested : undefined;
+  }
   hasPending(): boolean {
     return this.requests.size > 0;
   }
@@ -76,6 +82,17 @@ export class RunContextTransitions {
           hashJson(event.request) !== hashJson(request)
         )
           throw new Error('Context transition command identity has conflicting content.');
+        const terminal = await Promise.all(['completed', 'rejected'].map((status) =>
+          this.options.events.referenceByKey(this.options.runId, `${this.options.runId}:${requestId}:${status}`)));
+        const rejection = terminal[1];
+        if (rejection) {
+          const rejected = (await this.options.events.readReference(rejection)).event;
+          if (rejected.type !== 'context.transition.rejected')
+            throw new Error('Context transition rejection receipt contradicts its command.');
+          throw new Error(`Context transition already rejected: ${rejected.message}`);
+        }
+        if (!terminal.some(Boolean) && !this.requests.has(requestId))
+          this.requests.set(requestId, { requestId, requested: event.request });
         return;
       }
       const prior = this.requests.get(requestId);
@@ -85,10 +102,21 @@ export class RunContextTransitions {
         return;
       }
       if (this.requests.size >= 1024) throw new Error('Too many pending context transitions.');
-      await this.options.append(
-        { type: 'context.transition.requested', requestId, request },
-        `${this.options.runId}:${requestId}:requested`
-      );
+      try {
+        await this.options.append(
+          { type: 'context.transition.requested', requestId, request },
+          `${this.options.runId}:${requestId}:requested`
+        );
+      } catch (cause) {
+        // The durable command is the authority when only the append receipt was lost.
+        // Do not turn a known scheduled buffered mutation into an unknown tool effect.
+        const receipt = await this.options.events.referenceByKey(
+          this.options.runId, `${this.options.runId}:${requestId}:requested`);
+        if (!receipt) throw cause;
+        const recorded = (await this.options.events.readReference(receipt)).event;
+        if (recorded.type !== 'context.transition.requested' || hashJson(recorded.request) !== hashJson(request))
+          throw new Error('Context transition command identity has conflicting content.', { cause });
+      }
       this.requests.set(requestId, { requestId, requested: request });
     });
     this.writes = action.catch(() => undefined);
@@ -96,12 +124,18 @@ export class RunContextTransitions {
     return Object.freeze({ requestId });
   }
   async closePending(
+    context: ContextService | undefined,
     message: string,
     rejected?: (requestId: string, message: string, idempotencyKey: string) => void | Promise<void>
   ): Promise<void> {
     const action = this.writes.then(async () => {
       this.closed = true;
       for (const pending of this.requests.values()) {
+        const committed = await context?.findTransition(pending.requested.idempotencyKey);
+        if (committed) {
+          await this.complete(pending, committed);
+          continue;
+        }
         await this.options.append(
           { type: 'context.transition.rejected', requestId: pending.requestId, message },
           `${this.options.runId}:${pending.requestId}:rejected`
@@ -115,6 +149,7 @@ export class RunContextTransitions {
   }
   async drain(input: {
     readonly context: ContextService;
+    readonly onlyIdempotencyKey?: string;
     readonly admit: (request: ContextTransitionRequest) => Promise<ContextTransitionRequest>;
     readonly validate?: ContextAdmission;
     readonly committed: (entry: SessionContextTransitionEntry) => Promise<void>;
@@ -124,6 +159,7 @@ export class RunContextTransitions {
   }): Promise<void> {
     await this.writes;
     for (const pending of this.requests.values()) {
+      if (input.onlyIdempotencyKey && pending.requested.idempotencyKey !== input.onlyIdempotencyKey) continue;
       input.signal.throwIfAborted();
       let entry: SessionContextTransitionEntry;
       try {
@@ -146,12 +182,12 @@ export class RunContextTransitions {
           ...(input.validate ? { admit: input.validate } : {})
         });
       } catch (cause) {
-        input.signal.throwIfAborted();
-        input.preserveFailure?.(cause);
-        // A committed session window wins even when its original receipt was lost.
+        // Resolve publication before cancellation or failure classification: its receipt may be lost.
         const known = await input.context.findTransition(pending.requested.idempotencyKey);
         if (known) entry = known;
         else {
+          input.signal.throwIfAborted();
+          input.preserveFailure?.(cause);
           await this.options.append(
             {
               type: 'context.transition.rejected',
@@ -169,17 +205,32 @@ export class RunContextTransitions {
           continue;
         }
       }
-      await this.options.append(
-        {
-          type: 'context.transition.completed',
-          requestId: pending.requestId,
-          windowId: entry.window.windowId
-        },
-        `${this.options.runId}:${pending.requestId}:completed`
-      );
-      this.requests.delete(pending.requestId);
+      await this.complete(pending, entry);
       await input.committed(entry);
     }
+  }
+  /** Completion delivery is idempotent; session publication remains the authority. */
+  private async complete(pending: PendingTransition, entry: SessionContextTransitionEntry): Promise<void> {
+    const event = {
+      type: 'context.transition.completed' as const,
+      requestId: pending.requestId,
+      windowId: entry.window.windowId
+    };
+    const key = `${this.options.runId}:${pending.requestId}:completed`;
+    try {
+      await this.options.append(event, key);
+    } catch (cause) {
+      const reference = await this.options.events.referenceByKey(this.options.runId, key);
+      if (reference) {
+        const recorded = (await this.options.events.readReference(reference)).event;
+        if (hashJson(recorded) !== hashJson(event))
+          throw new Error('Context completion receipt conflicts with its committed publication.', { cause });
+      } else {
+        // One bounded retry covers a failed prewrite without risking duplicate completion.
+        await this.options.append(event, key);
+      }
+    }
+    this.requests.delete(pending.requestId);
   }
   private require(id: string): PendingTransition {
     const item = this.requests.get(id);

@@ -5,7 +5,6 @@ import {
   HistoryReader,
   ContextService,
   createHistoryTools,
-  createContextTools,
   InferenceService,
   InMemoryInferenceRepository
 } from '@agent-core/runtime';
@@ -29,7 +28,7 @@ test('all adapters preserve optional history references through search, read and
     history,
     policy: { maxSourceBytes: 8192 }
   });
-  const tools = [...createHistoryTools({ history }), ...createContextTools({ context })];
+  const tools = [...createHistoryTools({ history }), ...context.toolDefinitions()];
   const policy = { allowedRisks: ['read', 'write'] };
   const search = await invokeToolCall(
     jsonToolCall('history_search', { query: 'original' }),
@@ -213,7 +212,7 @@ test('context inspection explains adjusted capacity and does not expose the acco
     inputIdentity: compiled.inputIdentity,
     accounting: compiled.accounting
   });
-  const tools = createContextTools({ context });
+  const tools = context.toolDefinitions();
   const result = await invokeToolCall(jsonToolCall('context_inspect'), tools, {
     policy: { allowedRisks: ['read'] }
   });

@@ -16,7 +16,6 @@ import {
   InMemorySessionRepository,
   agentEventCodec,
   createHistoryTools,
-  createContextTools,
   sourceRef
 } from '@agent-core/runtime';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
@@ -266,8 +265,9 @@ for (const kind of ['memory', 'jsonl']) {
         }
       ]
     };
-    await sessions.enqueueSubmission(session, {
+    await sessions.admitSubmission(session, {
       submissionId: 'submission',
+      claimId: 'claim',
       runId: 'run',
       input,
       configuration: { provider: 'test', model: 'test' }
@@ -279,6 +279,7 @@ for (const kind of ['memory', 'jsonl']) {
       task: 'runtime transformed task'
     });
     await sessions.recordRunFinalization(session, terminal('run'));
+    await sessions.transitionSubmission(session, 'submission', { state: 'completed', claimId: 'claim' });
     assert.equal(first.originalInput.task, 'Original input');
     assert.equal(first.originalInput.contextItems[0].content, 'unmodified attachment');
     const secret = await sessions.appendInput(session, {
@@ -415,7 +416,7 @@ test('context validation releases the session queue and accepted queued input ma
     false,
     'abort uses the serial queue while validation awaits external work'
   );
-  await sessions.enqueueSubmission(session, {
+  await sessions.admitSubmission(session, {
     submissionId: 'queued',
     runId: 'queued',
     input: { task: 'accepted during validation' },
@@ -458,7 +459,7 @@ test('bounded search reports partial coverage and scans new source identities', 
 test('original accepted whitespace and relationship survive JSONL restart independently of scheduling', async () => {
   const { root, sessions } = await backend('jsonl');
   const session = await sessions.create({ id: 'relationship', binding });
-  await sessions.enqueueSubmission(session, {
+  await sessions.admitSubmission(session, {
     submissionId: 'original',
     runId: 'run',
     input: { task: '  original\n\n', relationship: { kind: 'side_question' } },
@@ -470,7 +471,7 @@ test('original accepted whitespace and relationship survive JSONL restart indepe
   assert.equal(read.branch[0].originalInput.task, '  original\n\n');
   assert.equal(read.branch[0].originalInput.relationship.kind, 'side_question');
   await assert.rejects(
-    sessions.enqueueSubmission(session, {
+    sessions.admitSubmission(session, {
       submissionId: 'invalid',
       runId: 'invalid',
       input: { task: 'valid', contextItems: [{ unexpected: true }] },
@@ -887,9 +888,9 @@ for (const kind of ['memory', 'jsonl']) {
     const history = new HistoryReader({ repository: sessions, session, events });
     const lookups = [];
     const tails = [];
-    const latest = events.latestReferenceOfType.bind(events);
+    const latest = events.latestOfType.bind(events);
     const tail = events.tail.bind(events);
-    events.latestReferenceOfType = async (runId, type) => {
+    events.latestOfType = async (runId, type) => {
       lookups.push(runId);
       return latest(runId, type);
     };
@@ -932,7 +933,7 @@ for (const kind of ['memory', 'jsonl']) {
 
     const reopened = new HistoryReader({ repository: sessions, session, events });
     assert.deepEqual((await reopened.capture()).ledgerHeads.map(head => head.runId), ['next']);
-    assert.equal(lookups.length, 141, 'reopening rebuilds terminal proofs from the owning ledgers');
+    assert.equal(lookups.length, 0, 'reopening reuses confirmed terminal proofs without walking the finalized archive');
   });
 }
 

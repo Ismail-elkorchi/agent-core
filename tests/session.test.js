@@ -28,7 +28,7 @@ import {
   createSessionBinding,
   decodeAgentTerminalSnapshot
 } from '@agent-core/runtime';
-import { JsonlSessionRepository } from '@agent-core/runtime/node';
+import { JsonlSessionRepository, SessionHistorySourceError } from '@agent-core/runtime/node';
 import { createToolCall } from '@agent-core/tools';
 
 const TEST_SESSION_BINDING = Object.freeze({
@@ -136,7 +136,7 @@ test('JSONL session headers reject missing or tampered bindings before replay', 
   await writeFile(file, `${lines.join('\n')}\n`, 'utf8');
   await assert.rejects(
     new JsonlSessionRepository({ rootDir }).open(descriptor.id, TEST_SESSION_BINDING),
-    (error) => error instanceof PersistenceCorruptionError && error.line === 1
+    (error) => sourceCorruption(error).line === 1
   );
 
   const missing = await repository.create({ id: 'binding-missing', binding: TEST_SESSION_BINDING });
@@ -146,7 +146,7 @@ test('JSONL session headers reject missing or tampered bindings before replay', 
   await writeFile(missingFile, `${JSON.stringify(missingHeader)}\n`, 'utf8');
   await assert.rejects(
     new JsonlSessionRepository({ rootDir }).open(missing.id, TEST_SESSION_BINDING),
-    (error) => error instanceof PersistenceCorruptionError && error.line === 1
+    (error) => sourceCorruption(error).line === 1
   );
 });
 
@@ -208,7 +208,7 @@ test('session repositories scan once and incrementally preserve a cross-instance
   for (let index = 1; index < replay.branch.length; index += 1)
     assert.equal(replay.branch[index].parentId, replay.branch[index - 1].id);
   assert.ok(first.indexMetrics().incrementalRefreshes > 0);
-  assert.equal(second.indexMetrics().fullScans, 1);
+  assert.equal(second.indexMetrics().fullScans, 0);
   assert.ok(second.indexMetrics().incrementalRefreshes > 0);
 });
 
@@ -356,7 +356,7 @@ test('session run finalizations are idempotent and validate the complete termina
   );
   await assert.rejects(
     repository.open(session.id, TEST_SESSION_BINDING),
-    (error) => error instanceof PersistenceCorruptionError && error.code === 'invalid_record'
+    (error) => sourceCorruption(error).code === 'invalid_record'
   );
 });
 
@@ -399,7 +399,7 @@ test('session JSONL tolerates a torn tail and identifies middle corruption', asy
   await assert.rejects(
     repository.open(session.id, TEST_SESSION_BINDING),
     (error) =>
-      error instanceof PersistenceCorruptionError && error.line === 2 && error.byteOffset > 0
+      sourceCorruption(error).line === 2 && sourceCorruption(error).byteOffset > 0
   );
 });
 
@@ -443,7 +443,7 @@ test('session JSONL owns queued configuration and validates submission lifecycle
   const rootDir = await mkdtemp(path.join(tmpdir(), 'agent-session-submissions-'));
   let repository = new JsonlSessionRepository({ rootDir });
   let session = await repository.create({ id: 'submissions', binding: TEST_SESSION_BINDING });
-  await repository.enqueueSubmission(session, {
+  await repository.admitSubmission(session, {
     submissionId: 'submission',
     runId: 'run',
     input: { task: 'persisted task' },
@@ -477,7 +477,7 @@ test('session JSONL owns queued configuration and validates submission lifecycle
   );
   await assert.rejects(
     new JsonlSessionRepository({ rootDir }).open(session.id, TEST_SESSION_BINDING),
-    (error) => error instanceof PersistenceCorruptionError && error.code === 'invalid_record'
+    (error) => sourceCorruption(error).code === 'invalid_record'
   );
 });
 
@@ -804,7 +804,7 @@ test('AgentSession serializes admission, preserves steering identity, and snapsh
     createRuntime(configuration, _onProgress, context) {
       configurations.push(configuration);
       runtimeContexts.push(context);
-      if (configuration.model === 'broken') throw new Error('unsupported model');
+      if (configuration.responseFormat?.type === 'json_schema') throw new Error('unsupported model');
       return {
         run(input) {
           let resolve;
@@ -842,7 +842,7 @@ test('AgentSession serializes admission, preserves steering identity, and snapsh
   );
   assert.equal(steered.kind, 'steered');
   assert.deepEqual(controls[0].steering, ['focus']);
-  await session.configure({ model: 'second' });
+  await session.configure({ responseFormat: 'json' });
   const second = await session.submit({ task: 'second' });
   assert.equal(second.kind, 'queued');
   controls[0].resolve({
@@ -852,8 +852,8 @@ test('AgentSession serializes admission, preserves steering identity, and snapsh
   });
   await first.completion;
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(configurations[0].model, 'first');
-  assert.equal(configurations[1].model, 'second');
+  assert.equal(configurations[0].responseFormat, undefined);
+  assert.equal(configurations[1].responseFormat, 'json');
   assert.equal(runtimeContexts[0].runId, first.runId);
   assert.equal(runtimeContexts[0].submissionId, first.submissionId);
   assert.equal(runtimeContexts[0].input.task, 'first');
@@ -867,7 +867,7 @@ test('AgentSession serializes admission, preserves steering identity, and snapsh
   assert.equal(session.state().phase, 'idle');
 
   const third = await session.submit({ task: 'third' });
-  await session.configure({ model: 'broken' });
+  await session.configure({ responseFormat: { type: 'json_schema', schema: { type: 'object' } } });
   const fourth = await session.submit({ task: 'fourth' });
   controls[2].resolve({
     state: 'ended',
@@ -876,7 +876,9 @@ test('AgentSession serializes admission, preserves steering identity, and snapsh
   });
   await third.completion;
   await assert.rejects(fourth.completion, /unsupported model/u);
-  assert.equal(session.state().phase, 'idle');
+  assert.equal(session.state().phase, 'running');
+  assert.equal((await repository.loadPendingSubmissions(descriptor))[0].state, 'claimed');
+  await session.close();
 });
 
 for (const storage of ['memory', 'jsonl'])
@@ -970,30 +972,14 @@ test('AgentSession restores claimed and queued work without starting execution d
     id: 'durable-admission',
     binding: TEST_SESSION_BINDING
   });
-  const blocked = new AgentSession({
-    descriptor,
-    expectedBinding: TEST_SESSION_BINDING,
-    repository,
-    runs: runCoordinator(),
-    configuration: { provider: 'test', model: 'model' },
-    createRuntime() {
-      return {
-        run(input) {
-          return {
-            runId: input.runId,
-            result: new Promise(() => {}),
-            injectSteering() {
-              throw new Error('unused');
-            },
-            abort() {}
-          };
-        }
-      };
-    }
+  const claimed = await repository.admitSubmission(descriptor, {
+    submissionId: 'lost-owner', runId: 'claimed-run', claimId: 'lost-claim',
+    input: { task: 'claimed' }, configuration: { provider: 'test', model: 'model' }
   });
-  const claimed = await blocked.submit({ task: 'claimed' });
-  const queued = await blocked.submit({ task: 'recover me' });
-  assert.equal(queued.kind, 'queued');
+  await repository.admitSubmission(descriptor, {
+    submissionId: 'queued-input', runId: 'queued-run', input: { task: 'recover me' },
+    configuration: { provider: 'test', model: 'model' }
+  });
 
   const events = new InMemoryEventRepository(agentEventCodec);
   const runs = new AgentRunCoordinator(events, new InMemoryArtifactRepository());
@@ -1036,6 +1022,7 @@ test('AgentSession restores claimed and queued work without starting execution d
   }, assert.fail);
   await recovered.restore();
   assert.deepEqual(executed, []);
+  await recovered.startNextSubmission();
   await recovered.waitForIdle();
   assert.deepEqual(executed, [
     { task: 'claimed', model: 'model', resuming: true },
@@ -1043,6 +1030,7 @@ test('AgentSession restores claimed and queued work without starting execution d
   ]);
   assert.equal(failures.length, 0);
   assert.deepEqual(await repository.loadPendingSubmissions(descriptor), []);
+  await recovered.close();
 });
 
 test('context transitions commit once without evicting original session records', async () => {
@@ -1411,7 +1399,7 @@ test('aborting a suspended submission commits cancellation before starting final
     binding: TEST_SESSION_BINDING
   });
   const runId = 'suspended-run';
-  await repository.enqueueSubmission(descriptor, {
+  await repository.admitSubmission(descriptor, {
     submissionId: 'submission',
     runId,
     input: { task: 'suspended task' },
@@ -1604,7 +1592,7 @@ test('context suspension persists its exact conflict and append indexes follow e
     reasoningReservation: 0,
     actions: ['select_sources', 'reduce_reservation', 'change_model', 'cancel']
   };
-  await repository.enqueueSubmission(session, {
+  await repository.admitSubmission(session, {
     submissionId: 'input',
     runId: 'run',
     input: { task: 'Continue the original work.' },
@@ -1708,9 +1696,9 @@ test('a committed terminal result survives later runtime release failure', async
 test('failed durable claiming rejects the waiting caller and preserves queued input for reopen', { timeout: 5000 }, async () => {
   class FailingClaimRepository extends InMemorySessionRepository {
     failClaims = true;
-    transitionSubmission(descriptor, id, outcome) {
-      if (this.failClaims && outcome.state === 'claimed') throw new Error('Claim persistence failed');
-      return super.transitionSubmission(descriptor, id, outcome);
+    claimNextSubmission(descriptor, claimId) {
+      if (this.failClaims) throw new Error('Claim persistence failed');
+      return super.claimNextSubmission(descriptor, claimId);
     }
   }
   const repository = new FailingClaimRepository();
@@ -1777,3 +1765,52 @@ test('a rejected suspended runtime factory preserves the descriptor under its re
   assert.deepEqual(await repository.loadPendingSubmissions(descriptor), []);
   await session.close();
 });
+
+
+function sourceCorruption(error) {
+  assert.ok(error instanceof SessionHistorySourceError);
+  for (let cause = error.cause; cause; cause = cause.cause)
+    if (cause instanceof PersistenceCorruptionError) return cause;
+  assert.fail('Source corruption must preserve its exact record diagnostic');
+}
+
+
+for (const storage of ['memory', 'jsonl']) {
+  test(`${storage}: terminal confirmation binds one existing finalization and remains idempotent`, async (t) => {
+    const rootDir = await mkdtemp(path.join(tmpdir(), 'terminal-confirmation-'));
+    t.after(() => rm(rootDir, { recursive: true, force: true }));
+    const repository = storage === 'memory' ? new InMemorySessionRepository() : new JsonlSessionRepository({ rootDir });
+    const descriptor = await repository.create({ binding: TEST_SESSION_BINDING });
+    const terminal = completedTerminal('confirmed-run', 'confirmed-finalization', 'Result');
+    const input = {
+      runId: terminal.runId,
+      finalizationId: terminal.finalizationId,
+      terminalSha256: hashJson(terminal),
+      source: { runId: terminal.runId, eventId: 'terminal-envelope', sequence: 7, hash: 'a'.repeat(64) }
+    };
+    await assert.rejects(repository.confirmRunFinalization(descriptor, input), /does not match/);
+    await repository.appendInput(descriptor, { runId: terminal.runId, task: 'Confirm this terminal' });
+    await repository.recordRunFinalization(descriptor, terminal);
+    const unconfirmed = await repository.sourceSnapshot(descriptor);
+    assert.deepEqual(await Array.fromAsync(unconfirmed.unconfirmedRuns()), [{ runId: terminal.runId, finalized: true }]);
+    const revision = await repository.revision(descriptor);
+    for (const invalid of [
+      { ...input, terminalSha256: 'b'.repeat(64) },
+      { ...input, source: { ...input.source, runId: 'wrong-run' } },
+      { ...input, finalizationId: 'wrong-finalization' }
+    ]) await assert.rejects(repository.confirmRunFinalization(descriptor, invalid), /does not match/);
+    assert.equal(await repository.revision(descriptor), revision);
+    const first = await repository.confirmRunFinalization(descriptor, input);
+    const reopened = storage === 'memory' ? repository : new JsonlSessionRepository({ rootDir });
+    assert.equal((await reopened.confirmRunFinalization(descriptor, input)).id, first.id);
+    assert.equal(await reopened.revision(descriptor), revision + 1);
+    await assert.rejects(reopened.confirmRunFinalization(descriptor, { ...input, source: { ...input.source, hash: 'c'.repeat(64) } }), /Conflicting terminal confirmation/);
+    assert.equal(await reopened.revision(descriptor), revision + 1);
+    const confirmed = await reopened.sourceSnapshot(descriptor);
+    assert.deepEqual(await Array.fromAsync(confirmed.unconfirmedRuns()), []);
+    assert.deepEqual(await confirmed.confirmedHead(terminal.runId), { runId: terminal.runId, sequence: input.source.sequence, hash: input.source.hash });
+    const replay = await reopened.loadReplayState(descriptor);
+    assert.equal(replay.branch.length, 1);
+    assert.equal(replay.runFinalizations.length, 1);
+  });
+}

@@ -363,13 +363,12 @@ test('separate processes cannot commit against the same event tail', async () =>
   assert.equal((await repository.tail('race')).sequence, 0);
 });
 
-test('a live writer lock is not stolen after its stale interval', async () => {
+test('a live writer lock cannot be stolen by a competing process', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'agent-events-live-lock-'));
   const repository = new JsonlEventRepository({
     rootDir: dir,
     codec: typedEventCodec,
-    lockTimeoutMs: 50,
-    staleLockMs: 10
+    lockTimeoutMs: 50
   });
   const fixture = path.resolve('tests/fixtures/event-lock-holder.mjs');
   const filePath = repository.location('held');

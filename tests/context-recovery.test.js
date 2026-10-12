@@ -5,7 +5,7 @@ import { defineTool, ToolInputError } from '@agent-core/tools';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import {
   AgentRuntime, ContextService, HistoryReader, InMemorySessionRepository,
-  InMemoryInferenceRepository, InferenceService, agentEventCodec, createContextTools, createHistoryTools
+  InMemoryInferenceRepository, InferenceService, agentEventCodec, createHistoryTools
 } from '@agent-core/runtime';
 
 const marker = 'bounded context-management turn';
@@ -52,7 +52,7 @@ async function fixture({ allowedRisks = ['read', 'write'], budget, sourceBytes =
       policy: { maxSourceBytes, historyRead: { history, isAvailable: () => true } } });
     return { provider, model: 'fixture', context, contextRenewal: { automatic: true },
       repositories: { events, artifacts, session: { repository: sessions, descriptor } },
-      tools: [domain, ...createContextTools({ context }), ...createHistoryTools({ history })],
+      tools: [domain, ...context.toolDefinitions(), ...createHistoryTools({ history })],
       toolPolicy: { allowedRisks }, toolBoundary: { authorizationPolicyId: 'recovery-test', executionTargetId: 'recovery-test' },
       maxOutputTokens: 512,
       inferenceService: new InferenceService({ provider, artifacts, repository: inferenceRepository, ...(budget ? { budget } : {}) }) };
@@ -128,7 +128,7 @@ test('context recovery cannot bypass ordinary tool write authorization', async (
     request.effects.accesses.some(access => access.mode === 'write' && access.scope.startsWith('context/')) &&
     typeof request.fingerprint === 'string'));
   const view = await f.sessions.sourceSnapshot(f.descriptor);
-  assert.equal([...view.entries].filter(entry => entry.type === 'context_transition').length, 0);
+  assert.equal((await Array.fromAsync(view.entries)).filter(entry => entry.type === 'context_transition').length, 0);
 });
 
 test('recovery consumes the same inference budget as ordinary work', async () => {
@@ -222,7 +222,7 @@ test('continuity room triggers model recovery before an otherwise fitting ordina
 });
 
 async function inspectPresentation(context, input = {}) {
-  const tool = createContextTools({ context }).find(item => item.name === 'context_inspect');
+  const tool = context.toolDefinitions().find(item => item.name === 'context_inspect');
   const canonical = await tool.canonicalizeInput(input, {});
   const execution = await tool.bindExecution(canonical, {});
   const observation = await execution.invoke({});
@@ -290,10 +290,14 @@ test('paged inspection of large working state reads only metadata and retains an
   const requestRef = await f.artifacts.storeProtected({ label: 'state-origin', mediaType: 'application/json',
     content: new TextEncoder().encode(JSON.stringify({ workingStateRevisionId: null, logical: { model: 'fixture', messages: [] } })) });
   const body = 'GENERATED-STATE ' + 'x'.repeat(52000);
-  const update = await context.updateWorkingState({ id: 'large-working-state', revisionId: null, text: body,
-    inference: { ownerId: 'owner', invocationId: 'state-origin', requestRef },
-    sessionId: f.descriptor.id, branchId: cut.branchId });
-  assert.equal(update.status, 'committed');
+  const workingState = { id: 'large-working-state', previousRevisionId: null,
+    contentRef: await f.artifacts.storeProtected({ label: 'working-state', mediaType: 'text/plain; charset=utf-8', content: new TextEncoder().encode(body) }),
+    inference: { ownerId: 'owner', invocationId: 'state-origin', requestRef } };
+  const update = await context.transition({ expectedWindowId: (await context.history.selectedContext(cut))?.windowId ?? null,
+    expectedSourceRevision: cut.sourceRevision, workingState, idempotencyKey: 'large-working-state', reason: 'Fixture admitted state',
+    selection: await context.selectSources(cut, {}) },
+    { admit: async () => ({ compiledInputIdentity: 'fixture-state', capabilityRevision: 'fixture' }) });
+  assert.equal(update.transition.admission.status, 'admitted');
   const reads = [];
   for (const method of ['readVerified', 'readVerifiedRange']) {
     const original = f.artifacts[method].bind(f.artifacts);
@@ -379,7 +383,7 @@ test('small-model required reserve remains visible when mandatory input cannot b
   const input = current.activeSelection.manifest.items.find(item => item.description.includes('MANDATORY ORIGINAL INPUT'));
   assert.equal(input.group.release, 'protected');
   assert.equal((await f.history.read({ source: input.source })).item.text, task);
-  assert.equal((await f.sessions.sourceSnapshot(f.descriptor)).latestContext, undefined);
+  assert.equal(await (await f.sessions.sourceSnapshot(f.descriptor)).latestContext, undefined);
 });
 
 test('ordinary turns compile one current control probe without scanning durable recovery attempts', async t => {
@@ -413,4 +417,87 @@ test('ordinary turns compile one current control probe without scanning durable 
   assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
   assert.deepEqual(counts, { ordinaryCompilations: 3, controlCompilations: 3, recoveryQueries: 0, boundedInspections: 3, unpagedInspections: 0 });
   t.diagnostic(JSON.stringify({ measurement: 'three ordinary turns', counts }));
+});
+
+test('recovery sees the current request independently of a twelve-item inventory after twenty old records', async () => {
+  const f = await fixture();
+  for (let i = 0; i < 20; i++) await f.sessions.appendAssistant(f.descriptor, {
+    runId: `old-${i}`, identity: { turnId: `old-${i}`, turnIndex: i, requestAttempt: 1, toolBatchId: `old-batch-${i}` },
+    content: `Old unrelated completed record ${i}`
+  });
+  let presented;
+  f.recover(request => {
+    presented = JSON.parse(request.messages.findLast(item => item.role === 'user').content);
+    presented.toolNames = request.tools.map(tool => tool.type === 'function' ? tool.function.name : tool.name);
+    return select();
+  });
+  const result = await new AgentRuntime(f.options()).run({ runId: 'request-after-twenty',
+    task: 'CURRENT REQUEST: inspect the unpaid invoice only.' }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.ok(presented);
+  assert.equal(presented.currentRequest.text, 'CURRENT REQUEST: inspect the unpaid invoice only.');
+  assert.equal(presented.currentRequest.coverage, 'complete');
+  assert.equal(presented.currentRequest.sourceIdentity.runId, 'request-after-twenty');
+  assert.ok(presented.inventory.items.length <= 12);
+  assert.equal(presented.inventory.coverage, 'partial');
+  assert.ok(presented.inventory.cursor);
+  assert.equal(presented.workingState.authority, 'fallible_model_interpretation');
+  assert.ok(presented.toolNames.includes('history_search'));
+
+  assert.equal(f.effects(), 0);
+});
+
+// Preview bounds are independent of state/source size and keep their original identity.
+test('recovery shows a bounded fallible state preview with source identity and honest coverage', async () => {
+  const f = await fixture({ sourceBound: 100000, targetCapacity: 12000 });
+  const options = f.options();
+  const context = options.context;
+  const cut = await f.history.capture();
+  const requestRef = await f.artifacts.storeProtected({ label: 'state-origin', mediaType: 'application/json',
+    content: new TextEncoder().encode(JSON.stringify({ workingStateRevisionId: null, logical: { model: 'fixture', messages: [] } })) });
+  const workingState = { id: 'preview-state', previousRevisionId: null,
+    contentRef: await f.artifacts.storeProtected({ label: 'working-state', mediaType: 'text/plain; charset=utf-8',
+      content: new TextEncoder().encode('Important uncertainty: verify the original. ' + '文😀'.repeat(4000)) }),
+    inference: { ownerId: 'owner', invocationId: 'state-origin', requestRef } };
+  await context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
+    idempotencyKey: 'preview-state', workingState, reason: 'Fixture admitted state', selection: await context.selectSources(cut, {}) },
+    { admit: async () => ({ compiledInputIdentity: 'fixture-state', capabilityRevision: 'fixture' }) });
+  let presented;
+  f.recover(request => {
+    presented = JSON.parse(request.messages.findLast(item => item.role === 'user').content);
+    assert.equal(presented.workingState.revisionId, 'preview-state');
+    assert.equal(presented.workingState.source.entryId, 'preview-state');
+    assert.equal(presented.workingState.coverage, 'partial');
+    assert.equal(presented.workingState.complete, false);
+    assert.ok(Buffer.byteLength(presented.workingState.text) <= 2048);
+    assert.match(presented.workingState.text, /verify the original/);
+    return response('No safe change.');
+  });
+  const result = await new AgentRuntime(options).run({ runId: 'preview-recovery', task: 'Current scoped question.' }).result;
+  assert.equal(result.state, 'suspended', JSON.stringify(result));
+  assert.ok(presented);
+  assert.equal((await context.workingState()).revision.id, 'preview-state');
+});
+
+test('bounded recovery steering retains the newest instructions with identity and original order', async () => {
+  const f = await fixture();
+  let presented;
+  f.recover(request => {
+    presented = JSON.parse(request.messages.findLast(item => item.role === 'user').content);
+    return response('No safe source change.');
+  });
+  const handle = new AgentRuntime(f.options()).run({ runId: 'recent-steering', task: 'Inspect only.' });
+  for (let i = 1; i <= 15; i++) handle.injectSteering({ deliveryId: `correction-${i}`,
+    instruction: `Steering ${i}: ${'x'.repeat(900)} End of steering ${i}` });
+  const result = await handle.result;
+  assert.equal(result.state, 'suspended', JSON.stringify(result));
+  assert.ok(presented);
+  assert.equal(presented.steering.totalItems, 15);
+  assert.equal(presented.steering.coverage, 'partial');
+  assert.ok(presented.steering.items.length <= 8);
+  assert.ok(presented.steering.items.reduce((sum, item) => sum + Buffer.byteLength(item.text), 0) <= 4096);
+  assert.match(presented.steering.items.at(-1).text, /End of steering 15/);
+  const numbers = presented.steering.items.map(item => Number(item.text.match(/Steering (\d+)/)[1]));
+  assert.deepEqual(numbers, [...numbers].sort((a, b) => a - b));
+  assert.ok(presented.steering.items.every(item => typeof item.instructionId === 'string'));
 });

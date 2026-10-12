@@ -6,10 +6,11 @@ import { compileModelRequest, ModelProviderError } from '@agent-core/model';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import {
   AgentRuntime,
+  InferenceService,
+  InMemoryInferenceRepository,
   InMemorySessionRepository,
   HistoryReader,
   ContextService,
-  createContextTools,
   createHistoryTools,
   agentEventCodec
 } from '@agent-core/runtime';
@@ -41,13 +42,14 @@ async function fixture() {
   const events = new InMemoryEventRepository(agentEventCodec);
   const artifacts = new InMemoryArtifactRepository();
   const history = new HistoryReader({ repository: sessions, session, events, artifacts });
+  const policy = { maxSourceBytes: 4 * 1024 * 1024, historyRead: { history, isAvailable: () => true } };
   const context = new ContextService({
     artifacts,
     repository: sessions,
     session,
     history,
 
-    policy: { maxSourceBytes: 4 * 1024 * 1024, historyRead: { history, isAvailable: () => true } }
+    policy
   });
   const requests = [];
   let capacity = 60000;
@@ -77,7 +79,7 @@ async function fixture() {
     context,
 
     maxOutputTokens: 128,
-    tools: [...createHistoryTools({ history }), ...createContextTools({ context })],
+    tools: [...createHistoryTools({ history }), ...context.toolDefinitions()],
     repositories: { events, artifacts, session: { repository: sessions, descriptor: session } },
     toolBoundary: { authorizationPolicyId: 'test', executionTargetId: 'test' },
     toolPolicy: { allowedRisks: ['read', 'write'] }
@@ -94,6 +96,9 @@ async function fixture() {
     options,
     setCapacity(value) {
       capacity = value;
+    },
+    setSourceCapacity(value) {
+      policy.maxSourceBytes = value;
     }
   };
 }
@@ -545,7 +550,7 @@ test('a model-selected fresh context keeps parallel observations and commits sta
 });
 
 async function inspectTool(context, input = {}) {
-  const tool = createContextTools({ context }).find(tool => tool.name === 'context_inspect');
+  const tool = context.toolDefinitions().find(tool => tool.name === 'context_inspect');
   const canonical = await tool.canonicalizeInput(input, {});
   const execution = await tool.bindExecution(canonical, {});
   const observation = await execution.invoke({});
@@ -709,7 +714,7 @@ test('every returned manifest cursor is accepted as tool input, including large 
   const first = await inspectTool(f.context, { limit: 1, maxBytes: 256 * 1024 });
   assert(first.selection.cursor.length > 32768);
   const nextInput = { cursor: first.selection.cursor, limit: 1, maxBytes: 256 * 1024 };
-  const tool = createContextTools({ context: f.context }).find(tool => tool.name === 'context_inspect');
+  const tool = f.context.toolDefinitions().find(tool => tool.name === 'context_inspect');
   assert.equal(tool.decodeInput({ kind: 'json', value: nextInput }).ok, true);
   const next = await inspectTool(f.context, nextInput);
   assert.deepEqual(next.selection.cut, first.selection.cut);
@@ -736,4 +741,266 @@ test('ordinary replay never hydrates a large independent recovery exchange', asy
   assert.equal(result.terminal.executionStatus, 'completed');
   assert(f.requests.length > 0);
   assert.doesNotMatch(JSON.stringify(f.requests), /Recovery control data/);
+});
+
+for (const capacity of [32000, 16000]) {
+  for (const combined of [false, true]) {
+    test(`${capacity} tokens: 44800-byte ${combined ? 'combined' : 'state-only'} state admits the completed exchange before publication`, async () => {
+      const f = await fixture();
+      f.setCapacity(capacity);
+      const body = 'S'.repeat(44800);
+      const candidates = [];
+      let runtime;
+      let rejectedRetry;
+      f.provider.compileRequest = async request => {
+        const { signal, ...wire } = request;
+        const compiled = await compileModelRequest({ request, body: wire,
+          profile: await f.provider.describeModel(), endpoint: 'fixture://state-admission',
+          providerInputTokens: 1000 + Math.ceil(Buffer.byteLength(JSON.stringify(wire)) / 4) });
+        candidates.push({ request, compiled });
+        return compiled;
+      };
+      f.provider.complete = async request => {
+        f.requests.push(request);
+        if (f.requests.length === 1) return {
+          provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
+          toolCalls: [{ id: 'state', type: 'function', name: 'context_transition', input: { kind: 'json',
+            value: { reason: 'Consolidate useful understanding', workingState: body, ...(combined ? { retain: [] } : {}) } } }]
+        };
+        const live = await f.context.workingState();
+        assert.equal(live.text, capacity === 32000 ? body : '', 'Rejected admission cannot publish a revision');
+        const receipt = request.messages.find(item => item.role === 'tool' && item.toolCallId === 'state');
+        assert.ok(receipt, 'The admission candidate includes the originating result');
+        assert.match(receipt.content, /scheduled/);
+        if (capacity === 16000) {
+          let command;
+          for await (const record of f.events.read(`state-capacity-${capacity}-${combined}`))
+            if (record.event.type === 'context.transition.requested') command = record.event.request;
+          try { await runtime.scheduleContextTransition(command); }
+          catch (error) { rejectedRetry = error; }
+        }
+        return { provider: 'fixture', model: 'context', content: 'Handled.', terminationReason: 'stop' };
+      };
+      runtime = new AgentRuntime(f.options);
+      const result = await runtime.run({ runId: `state-capacity-${capacity}-${combined}`, task: 'Retain useful understanding.' }).result;
+      assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+      if (capacity === 16000) assert.match(rejectedRetry?.message ?? '', /already rejected/);
+      const proposed = candidates.filter(({ request }) => request.messages.some(item =>
+        item.role === 'user' && item.content.includes(body)));
+      assert.ok(proposed.length > 0, 'The full staged state must be compiled before commit');
+      assert.ok(proposed.every(({ request }) => request.messages.some(item => item.role === 'tool' && item.toolCallId === 'state')));
+      const transitions = (await f.sessions.loadReplayState(f.session)).branch.filter(item => item.type === 'context_transition');
+      assert.equal(transitions.length, capacity === 32000 ? 1 : 0);
+      if (transitions[0]) {
+        assert.equal(transitions[0].transition.admission.status, 'admitted');
+        assert.ok(proposed.some(({ compiled }) => compiled.inputIdentity === transitions[0].transition.admission.compiledInputIdentity));
+      }
+      const logs = [];
+      for await (const record of f.events.read(`state-capacity-${capacity}-${combined}`)) logs.push(record.event);
+      assert.equal(logs.some(event => event.type === 'context.transition.rejected'), capacity === 16000, logs.map(event => event.type).join(', '));
+    });
+  }
+}
+
+for (const lostReceipt of ['request', 'publication', 'completion_prewrite', 'completion_receipt']) {
+  test(`lost ${lostReceipt} receipt reconciles one admitted state transition`, async () => {
+    const f = await fixture();
+    let lost = false;
+    if (lostReceipt === 'publication') {
+      const commit = f.sessions.commitContextTransition.bind(f.sessions);
+      f.sessions.commitContextTransition = async (...args) => {
+        const entry = await commit(...args);
+        if (!lost && args[1].workingState) { lost = true; throw new Error('Lost publication receipt'); }
+        return entry;
+      };
+    } else {
+      const append = f.events.appendConditional.bind(f.events);
+      f.events.appendConditional = async (...args) => {
+        const type = lostReceipt === 'request' ? 'context.transition.requested' : 'context.transition.completed';
+        const target = !lost && args.some(arg => arg?.type === type || arg?.event?.type === type);
+        if (target && lostReceipt === 'completion_prewrite') {
+          lost = true;
+          throw new Error('Completion audit prewrite failed');
+        }
+        const receipt = await append(...args);
+        if (target) {
+          lost = true;
+          throw new Error(`Lost ${lostReceipt} receipt`);
+        }
+        return receipt;
+      };
+    }
+    f.provider.complete = async request => {
+      f.requests.push(request);
+      return f.requests.length === 1
+        ? { provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
+            toolCalls: [{ id: 'state', name: 'context_transition', type: 'function', input: { kind: 'json',
+              value: { reason: 'Remember constraints', workingState: 'Keep exact original requirements.' } } }] }
+        : { provider: 'fixture', model: 'context', content: 'Done.', terminationReason: 'stop' };
+    };
+    const runtime = new AgentRuntime(f.options);
+    const runId = `receipt-${lostReceipt}`;
+    const first = await runtime.run({ runId, task: 'Continue.' }).result;
+    const result = first.terminal?.executionStatus === 'completed' ? first : await new AgentRuntime(f.options).resume(first.runId).result;
+    assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+    assert.equal(lost, true);
+    assert.equal((await f.context.workingState()).text, 'Keep exact original requirements.');
+    const entries = (await f.sessions.loadReplayState(f.session)).branch.filter(item => item.type === 'context_transition' && item.workingState);
+    assert.equal(entries.length, 1);
+    const records = await Array.fromAsync(f.events.read(runId));
+    assert.equal(records.filter(record => record.event.type === 'context.transition.completed').length, 1);
+    assert.equal(records.filter(record => record.event.type === 'context.transition.rejected').length, 0);
+    assert.equal(f.requests.length, 2);
+  });
+}
+
+test('state-only replacement, unchanged text, and clear share one admitted publication operation', async () => {
+  const f = await fixture();
+  const bodies = ['Scoped understanding.', 'Scoped understanding.', ''];
+  f.provider.complete = async request => {
+    const index = f.requests.push(request) - 1;
+    return index < bodies.length
+      ? { provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
+          toolCalls: [{ id: `state-${index}`, name: 'context_transition', type: 'function', input: { kind: 'json',
+            value: { reason: 'Revise interpretation only when useful', workingState: bodies[index] } } }] }
+      : { provider: 'fixture', model: 'context', content: 'Done.', terminationReason: 'stop' };
+  };
+  const result = await new AgentRuntime(f.options).run({ task: 'Keep requirements explicit.' }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  const entries = (await f.sessions.loadReplayState(f.session)).branch.filter(item => item.type === 'context_transition');
+  assert.equal(entries.length, 2, 'An unchanged state must not manufacture another window or revision');
+  assert.equal((await f.context.workingState()).text, '');
+  assert.equal(entries[1].workingState.previousRevisionId, entries[0].id);
+  assert.equal(new TextDecoder().decode(await f.options.repositories.artifacts.readVerified(entries[0].workingState.contentRef)), bodies[0]);
+  const receipt = f.requests[2].messages.find(item => item.role === 'tool' && item.toolCallId === 'state-1');
+  assert.match(receipt.content, /unchanged/);
+});
+
+for (const fault of ['before_confirmation', 'lost_confirmation_receipt']) {
+  test(`terminal confirmation ${fault} preserves outcome and repairs on resume`, async () => {
+    const f = await fixture();
+    const confirm = f.sessions.confirmRunFinalization.bind(f.sessions);
+    let fail = true;
+    f.sessions.confirmRunFinalization = async (...args) => {
+      if (fail) {
+        fail = false;
+        if (fault === 'lost_confirmation_receipt') await confirm(...args);
+        throw new Error(`Injected ${fault}`);
+      }
+      return confirm(...args);
+    };
+    const runId = `confirmation-${fault}`;
+    const first = await new AgentRuntime(f.options).run({ runId, task: 'Complete once.' }).result;
+    assert.equal(first.state, 'ended');
+    assert.equal(first.terminal.executionStatus, 'completed');
+    assert.equal(first.deliveryDiagnostics.length, 1);
+    assert.equal(first.deliveryDiagnostics[0].eventType, 'session.run_finalization_confirmed');
+    assert.match(first.deliveryDiagnostics[0].message, /Injected/);
+    const committed = await f.events.latestOfType(runId, 'run.ended');
+    assert.deepEqual(committed.event.terminal, first.terminal);
+    const recorded = (await f.sessions.loadReplayState(f.session)).runFinalizations;
+    assert.equal(recorded.length, 1);
+    assert.deepEqual(recorded[0].terminal, first.terminal);
+    const resumed = await new AgentRuntime(f.options).resume(runId).result;
+    assert.deepEqual(resumed.terminal, first.terminal);
+    assert.deepEqual(resumed.deliveryDiagnostics, []);
+    assert.equal(f.requests.length, 1);
+    const snapshot = await f.sessions.sourceSnapshot(f.session);
+    assert.ok(await snapshot.confirmedHead(runId));
+    assert.deepEqual(await Array.fromAsync(snapshot.unconfirmedRuns()), []);
+    const records = await Array.fromAsync(f.events.read(runId));
+    assert.equal(records.filter((entry) => entry.event.type === 'run.ended').length, 1);
+  });
+}
+
+test('a later rejected proposal cannot erase a committed source-capacity repair', async () => {
+  const f = await fixture();
+  const seed = await new AgentRuntime(f.options).run({ task: 'Old oversized source: ' + 'x'.repeat(100000) }).result;
+  assert.equal(seed.terminal.executionStatus, 'completed');
+  let turns = 0;
+  f.provider.complete = async request => {
+    f.requests.push(request);
+    if (++turns === 1) {
+      f.setSourceCapacity(12000);
+      return { provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
+        toolCalls: ['first-repair', 'second-stale'].map(id => ({ id, type: 'function', name: 'context_transition',
+          input: { kind: 'json', value: { reason: id, retain: [] } } })) };
+    }
+    assert.ok(!JSON.stringify(request.messages).includes('Old oversized source:'));
+    return { provider: 'fixture', model: 'context', content: 'Continued from the accepted repair.', terminationReason: 'stop' };
+  };
+  const runId = 'repair-then-reject';
+  const result = await new AgentRuntime({ ...f.options, contextRenewal: { automatic: false } })
+    .run({ runId, task: 'Keep the current task and release old sources.' }).result;
+  const transitions = (await f.sessions.loadReplayState(f.session)).branch.filter(entry => entry.type === 'context_transition');
+  assert.equal(transitions.length, 1);
+  const events = await Array.fromAsync(f.events.read(runId));
+  assert.equal(events.filter(entry => entry.event.type === 'context.transition.rejected').length, 1);
+  await f.context.assertSourceCapacity();
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.equal(turns, 2);
+});
+
+function answerWithStateThenFinish(f) {
+  f.provider.complete = async request => {
+    f.requests.push(request);
+    return f.requests.length === 1
+      ? { provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
+          toolCalls: [{ id: 'state', name: 'context_transition', type: 'function', input: { kind: 'json',
+            value: { reason: 'Preserve useful understanding', workingState: 'Accepted durable interpretation.' } } }] }
+      : { provider: 'fixture', model: 'context', content: 'Done.', terminationReason: 'stop' };
+  };
+}
+
+test('persistent completion audit failure preserves publication without rejection or transport and repairs on restart', async () => {
+  const f = await fixture();
+  answerWithStateThenFinish(f);
+  const options = { ...f.options, inferenceService: new InferenceService({
+    provider: f.provider, repository: new InMemoryInferenceRepository(), artifacts: f.options.repositories.artifacts
+  }) };
+  const append = f.events.appendConditional.bind(f.events);
+  let unavailable = true;
+  f.events.appendConditional = async (...args) => {
+    if (unavailable && args.some(arg => arg?.type === 'context.transition.completed' || arg?.event?.type === 'context.transition.completed'))
+      throw new Error('Completion audit unavailable');
+    return append(...args);
+  };
+  const runId = 'completion-audit-restart';
+  await assert.rejects(new AgentRuntime(options).run({ runId, task: 'Remember and finish.' }).result,
+    /Completion audit unavailable/);
+  assert.equal((await f.context.workingState()).text, 'Accepted durable interpretation.');
+  assert.equal(f.requests.length, 1, 'Required completion audit failure must stop successor transport');
+  let records = await Array.fromAsync(f.events.read(runId));
+  assert.equal(records.filter(record => record.event.type === 'context.transition.rejected').length, 0);
+  unavailable = false;
+  const resumed = await new AgentRuntime(options).resume(runId).result;
+  assert.equal(resumed.terminal?.executionStatus, 'completed', JSON.stringify(resumed));
+  assert.equal(f.requests.length, 2);
+  records = await Array.fromAsync(f.events.read(runId));
+  assert.equal(records.filter(record => record.event.type === 'context.transition.completed').length, 1);
+  assert.equal(records.filter(record => record.event.type === 'context.transition.rejected').length, 0);
+  assert.equal((await f.sessions.loadReplayState(f.session)).branch.filter(entry => entry.type === 'context_transition').length, 1);
+});
+
+test('abort after publication with a lost receipt preserves committed state and records truthful completion across restart', async () => {
+  const f = await fixture();
+  answerWithStateThenFinish(f);
+  const abort = new AbortController();
+  const commit = f.sessions.commitContextTransition.bind(f.sessions);
+  f.sessions.commitContextTransition = async (...args) => {
+    const entry = await commit(...args);
+    abort.abort(new Error('Stop after publication'));
+    throw new Error(`Lost committed receipt ${entry.id}`);
+  };
+  const runId = 'publication-abort';
+  const result = await new AgentRuntime(f.options).run({ runId, task: 'Remember and finish.', signal: abort.signal }).result;
+  assert.equal(result.terminal?.executionStatus, 'aborted', JSON.stringify(result));
+  assert.equal((await f.context.workingState()).text, 'Accepted durable interpretation.');
+  assert.equal(f.requests.length, 1);
+  const records = await Array.fromAsync(f.events.read(runId));
+  assert.equal(records.filter(record => record.event.type === 'context.transition.completed').length, 1);
+  assert.equal(records.filter(record => record.event.type === 'context.transition.rejected').length, 0);
+  const resumed = await new AgentRuntime(f.options).resume(runId).result;
+  assert.deepEqual(resumed.terminal, result.terminal);
+  assert.equal(f.requests.length, 1);
 });

@@ -1,4 +1,5 @@
-import { CONTEXT_RECOVERY_LIMITS, CONTEXT_RECOVERY_INSTRUCTION, assembleContextControlRequest, contextControlHeadroom } from './context/recovery.js';
+import { stagedWorkingState } from './context/working-state.js';
+import { CONTEXT_RECOVERY_LIMITS, CONTEXT_RECOVERY_INSTRUCTION, assembleContextControlRequest, contextControlHeadroom, contextControlPreview, contextControlSteering } from './context/recovery.js';
 import { resolveToolModelContent } from './orchestration/observation-source.js';
 import { NativeContextTransitionRequired } from './inference/input.js';
 import type { WorkingStateSnapshot } from './session/working-state.js';
@@ -100,7 +101,7 @@ import {
   summarizeProviderState,
   summarizeRunConfiguration
 } from './orchestration/event-summaries.js';
-import { AgentRunFinalizer } from './orchestration/finalization.js';
+import { AgentRunFinalizer, confirmCommittedSessionFinalization } from './orchestration/finalization.js';
 import {
   finalMessageFromResponse,
   modelToolCallFromToolCall,
@@ -607,13 +608,21 @@ export class AgentRuntime {
   }): Promise<AgentRunHandle> {
     const terminal = await this.options.repositories.events.latestOfType(input.runId, 'run.ended');
     if (terminal?.event.type === 'run.ended') {
+      const confirmationDiagnostic = this.options.repositories.session
+        ? await confirmCommittedSessionFinalization({
+            events: this.options.repositories.events,
+            session: this.options.repositories.session,
+            terminal: terminal.event.terminal,
+            source: terminal
+          })
+        : undefined;
       await this.releaseResources();
       return completedRunControl(
         input.runId,
         Object.freeze({
           state: 'ended',
           terminal: terminal.event.terminal,
-          deliveryDiagnostics: Object.freeze([])
+          deliveryDiagnostics: Object.freeze(confirmationDiagnostic ? [confirmationDiagnostic] : [])
         })
       );
     }
@@ -784,10 +793,18 @@ export class AgentRuntime {
           ? await this.options.repositories.events.latestOfType(runId, 'run.ended')
           : undefined;
       if (terminal?.event.type === 'run.ended') {
+        const confirmationDiagnostic = this.options.repositories.session
+          ? await confirmCommittedSessionFinalization({
+              events: this.options.repositories.events,
+              session: this.options.repositories.session,
+              terminal: terminal.event.terminal,
+              source: terminal
+            })
+          : undefined;
         return Object.freeze({
           state: 'ended',
           terminal: terminal.event.terminal,
-          deliveryDiagnostics: Object.freeze([])
+          deliveryDiagnostics: Object.freeze(confirmationDiagnostic ? [confirmationDiagnostic] : [])
         });
       }
       if (!run) throw new Error(`Terminal run ${runId} has no committed result.`);
@@ -1121,6 +1138,7 @@ export class AgentRuntime {
         'An unresolved started provider effect must be reconciled before terminal staging.'
       );
     await this.contextTransitions?.closePending(
+      this.options.context,
       'Run ended before the requested context selection reached an admissible boundary; inspect and retry while idle.',
       async (requestId, message, idempotencyKey) => {
         await emit({ type: 'context.transition.rejected', requestId, idempotencyKey, message });
@@ -1170,6 +1188,7 @@ export class AgentRuntime {
     });
     await this.contextTransitions.restore();
     await this.contextTransitions.closePending(
+      this.options.context,
       'Run ended before the requested context selection reached an admissible boundary; inspect and retry while idle.',
       async (requestId, message, idempotencyKey) => {
         await this.emitProgress(staged.terminal.finalizationId,
@@ -1562,7 +1581,8 @@ export class AgentRuntime {
                 ...(profile.capabilities.protocol === undefined
                   ? {}
                   : { endpoint: profile.capabilities.protocol.endpoint })
-              }
+              },
+              { runId: runtime.runId }
             );
           }
           if (turnIndex === 1) {
@@ -2149,11 +2169,15 @@ export class AgentRuntime {
       );
     }
     let nativeWorkingStateRevisionId = assembly.fingerprint.workingStateRevisionId;
+    let nativeStateProposal: ContextTransitionRequest | undefined;
     const captureNativeWorkingState = async () => {
       const context = this.options.context;
       if (!context) return [];
       const cut = await context.history.capture();
-      const state = await context.workingState(cut);
+      nativeStateProposal = await this.contextTransitions?.pendingState();
+      const state = nativeStateProposal?.workingState
+        ? await stagedWorkingState(this.options.repositories.artifacts ?? this.inferenceService.options.artifacts, nativeStateProposal.workingState.contentRef.size, nativeStateProposal.workingState, cut.throughEntryId)
+        : await context.workingState(cut);
       if ((state.revision?.id ?? null) === nativeWorkingStateRevisionId) return [];
       nativeWorkingStateRevisionId = state.revision?.id ?? null;
       return [{ role: 'user' as const, content: renderContext(workingStateContext(state)) }];
@@ -2195,6 +2219,55 @@ export class AgentRuntime {
       if (!value) throw new Error('Native response has no original run authority.');
       return value;
     };
+    const admitNativeSuccessor = async (
+      context: NativeGenerationContext,
+      turn: AssistantTurnRequest
+    ): Promise<void> => {
+      // Exact result delivery is mandatory while synchronous native obligations remain.
+      // It admits real capacity, but discretionary control room waits for a legal boundary.
+      if (context.generationDeliveryId !== 'initial' && nativeStateProposal && this.options.context && this.contextTransitions) {
+        const proposal = nativeStateProposal;
+        const publication: { committed: boolean; failure?: Error } = { committed: false };
+        await this.contextTransitions.drain({
+          context: this.options.context,
+          onlyIdempotencyKey: proposal.idempotencyKey,
+          admit: transition => this.retainPendingSources(transition, runtime.runId),
+          validate: async input => {
+            if (!input.preserveSelection || input.workingState.revision?.id !== proposal.workingState?.id)
+              throw new Error('Native successor must preserve the exact staged state and source selection.');
+            const delivered = new Set(context.dispatch?.sourceCalls.map(call => call.toolCallId) ?? []);
+            if (pendingToolCalls(runtime.run.state()).some(call => call.protocol === 'synchronous' &&
+                (call.state.stage !== 'recorded' || !call.callId || !delivered.has(call.callId))))
+              throw new Error('Native successor omits a mandatory completed tool result.');
+            await this.requestAdmission.admit(context.compiled, context.profile);
+            return { compiledInputIdentity: context.compiled.inputIdentity,
+              capabilityRevision: context.compiled.capabilityRevision,
+              ...(input.window?.selection.providerState ? { providerState: input.window.selection.providerState } : {}) };
+          },
+          committed: async entry => {
+            publication.committed = true;
+            nativeWorkingStateRevisionId = entry.id;
+            await runtime.emit({ type: 'context.transitioned', window: entry.window, transition: entry.transition });
+          },
+          rejected: async (requestId, message, idempotencyKey) => {
+            publication.failure ??= new Error(message);
+            await runtime.emit({ type: 'context.transition.rejected', requestId, idempotencyKey, message });
+          },
+          preserveFailure: error => {
+            this.preserveRecoveryFailure(error, turn);
+            publication.failure = error instanceof Error ? error : new Error(String(error));
+          },
+          signal: initial.signal
+        });
+        nativeStateProposal = undefined;
+        if (!publication.committed) {
+          nativeWorkingStateRevisionId = (await this.options.context.workingState()).revision?.id ?? null;
+          throw publication.failure ?? new Error('Native state successor was not committed.');
+        }
+      } else if (context.dispatch?.sourceCalls.length)
+        await this.requestAdmission.admit(context.compiled, context.profile);
+      else await this.admitContextRequest(context.compiled, turn, runtime.append);
+    };
     const createGeneration = async (context: NativeGenerationContext): Promise<Generation> => {
       const first = context.generationDeliveryId === 'initial';
       if (!first) runtime.controller.reserveModelTurn();
@@ -2235,11 +2308,7 @@ export class AgentRuntime {
             snapshot,
             toolBatchId: randomUUID()
           };
-      // Exact result delivery is mandatory while synchronous native obligations remain.
-      // It admits real capacity, but discretionary control room waits for a legal boundary.
-      if (context.dispatch?.sourceCalls.length)
-        await this.requestAdmission.admit(context.compiled, context.profile);
-      else await this.admitContextRequest(context.compiled, turn, runtime.append);
+      await admitNativeSuccessor(context, turn);
       this.catalogTools.set(snapshot.record.toolCatalog.revision, snapshot.tools);
       if (!first) {
         await this.advanceRun(runtime.run, 'assemble_turn', (state) => ({
@@ -2366,9 +2435,10 @@ export class AgentRuntime {
         },
         extended: async (context, dispatch) => {
           const item = generation(context);
-          if (dispatch.sourceCalls.length)
-            await this.requestAdmission.admit(dispatch.compiled, item.request.snapshot.profile);
-          else await this.admitContextRequest(dispatch.compiled, item.request, runtime.append);
+          await admitNativeSuccessor(
+            { ...context, compiled: dispatch.compiled, dispatch },
+            item.request
+          );
           const estimate = requestTokenEstimate({
             accounting: dispatch.compiled.accounting,
             modelWindowTokens: 0,
@@ -3014,7 +3084,7 @@ export class AgentRuntime {
       (tool.implementationId === `agent-core.${tool.name}.v1` &&
         tool.effectEnvelope.accesses.every((access) => access.mode === 'read' &&
           (access.scope === 'context' || access.scope === 'history')) &&
-        (tool.name.endsWith('_inspect') || tool.name.endsWith('_read')))
+        (tool.name.endsWith('_inspect') || tool.name.endsWith('_read') || tool.name.endsWith('_search')))
     );
     if (!tools.some((tool) => tool.implementationId === 'agent-core.context-transition.v1')) throw failure;
     // Probes compile bounded material only. Durable no-progress accounting is
@@ -3079,9 +3149,18 @@ export class AgentRuntime {
     }
     const manifest = inspection.activeSelection.status === 'available'
       ? inspection.activeSelection.manifest : inspection.activeSelection;
+    // The live request and steering are independent of the oldest-first inventory page.
+    // These are bounded presentations of the existing request, never additional authority.
+    const currentRequest = contextControlPreview(ordinary.input.task, CONTEXT_RECOVERY_LIMITS.currentRequestBytes);
+    const steering = contextControlSteering(ordinary.snapshot.instructions.filter(item => item.provenance === 'steering'));
+    const workingState = await context.inspectWorkingState(inspection.cut, CONTEXT_RECOVERY_LIMITS.statePreviewBytes);
     const content = JSON.stringify({
+      currentRequest: { ...currentRequest, runId: ordinary.runId,
+        sourceIdentity: { kind: 'accepted_run_input', runId: ordinary.runId } },
+      steering: { ...steering, sourceIdentity: { kind: 'effective_steering', runId: ordinary.runId, turnId: ordinary.snapshot.record.turnId } },
       conflict, attempt: attempts + 1, maximumAttempts: CONTEXT_RECOVERY_LIMITS.requestsPerBoundary, inventory: manifest,
-      workingState: { revisionId: inspection.workingState.revisionId },
+      workingState: { ...workingState, authority: 'fallible_model_interpretation',
+        coverage: workingState.complete ? 'complete' : 'partial' },
       legalTransitions: inspection.legalTransitions,
       sourceBudget: inspection.budget,
       recentRecoveryResults: probe ? [] : recoveryResults,
@@ -3235,6 +3314,7 @@ export class AgentRuntime {
       return { ...result, workingStateRevisionId: workingState.revision?.id ?? null };
     };
     let selected: Awaited<ReturnType<typeof assemble>> | undefined;
+    const contextPublication = { committed: false };
     let nativeSource: ModelRequest | undefined;
     let nativeUsagePending = false;
     const recordNativeUsage = async () => {
@@ -3255,7 +3335,7 @@ export class AgentRuntime {
     const validate = async (input: ContextAdmissionInput) => {
       assertToolTransitionBoundary(request.run.state());
       const boundary = request.run.state().revision;
-      if (input.selection.strategy === 'provider') nativeUsagePending = true;
+      if (input.selection.strategy === 'provider' && !input.preserveSelection) nativeUsagePending = true;
       const proposed = await this.contextWindowForAdmission(
         input,
         request,
@@ -3292,6 +3372,7 @@ export class AgentRuntime {
           validate,
           committed: async (entry) => {
             await this.activateCommittedContext(request.modelWindow, request.runId);
+            contextPublication.committed = true;
             await emit({
               type: 'context.transitioned',
               window: entry.window,
@@ -3299,6 +3380,8 @@ export class AgentRuntime {
             });
           },
           rejected: async (requestId, message, idempotencyKey) => {
+            // Admission alone is not publication. A failed commit must not dispatch its candidate.
+            selected = undefined;
             capturedContext.push({
               id: requestId,
               sourceUri: `runtime://context-selection/${requestId}`,
@@ -3318,7 +3401,11 @@ export class AgentRuntime {
         await recordNativeUsage();
       }
     }
-    if (sourceConflict && !selected) throw sourceConflict;
+    if (sourceConflict && !selected) {
+      if (!contextPublication.committed) throw sourceConflict;
+      // A later rejected proposal cannot invalidate the preceding committed repair.
+      await this.options.context?.assertSourceCapacity();
+    }
     const cut = await this.options.context?.history.capture();
     const workingState = (await this.options.context?.workingState(cut)) ?? {
       revision: null,
@@ -3596,7 +3683,19 @@ export class AgentRuntime {
     const window = new ModelWindow(this.estimator);
     const selected = input.entries;
     let providerState: ReturnType<typeof encodeContextTransformReference> | undefined;
-    if (input.selection.strategy === 'provider') {
+    if (input.selection.strategy === 'provider' && input.preserveSelection) {
+      if (!this.options.context || !input.window?.selection.providerState)
+        throw new Error('Preserved native context is unavailable.');
+      const current = await this.readCurrentTransform(
+        await readSelectedHistorySources(this.options.context.history, input.cut), request.snapshot.profile);
+      if (!current) throw new Error('Preserved native context has no validated transformed input.');
+      window.setTransformedInput(current.input);
+      await replaySourceEntries(window, input.cut.sessionId,
+        selected.filter(entry => !current.represented.has(sourceRef(input.cut.sessionId, entry).entryId)),
+        this.options.repositories.artifacts,
+        new Set(input.selection.continuity?.sources.map(source => source.entryId)), request.runId);
+      providerState = input.window.selection.providerState;
+    } else if (input.selection.strategy === 'provider') {
       const transformedWindow = new ModelWindow(this.estimator);
       const current = this.options.context
         ? await this.readCurrentTransform(
@@ -3771,7 +3870,7 @@ export class AgentRuntime {
         });
         scanned += page.scanned;
         if (scanned > 1000 || page.items.some((item) =>
-          item.type !== 'working_state' && item.type !== 'context_transition' &&
+          item.type !== 'context_transition' &&
           (item.runId !== runId || item.exchangeId !== exchangeId)))
           throw new Error('Context source boundary changed beyond the originating tool exchange.');
         cursor = page.cursor;

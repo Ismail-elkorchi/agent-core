@@ -65,7 +65,7 @@ try {
     for (const file of files.filter((name) => name.endsWith('.d.ts'))) {
       const declaration = await readFile(path.join(directory, file), 'utf8');
       const retired =
-        /\b(?:ModelMessage|ModelProviderState|CompleteRequestEstimator|SimpleTokenEstimator|TokenEstimator|SessionCompactionEntry|AgentSessionCompactionRequest|appendCompaction|summarizeConversation|executeAssistantToolCalls|nextObservationIndex|normalizeJsonSafe|JsonNormalizationDiagnostic|JsonNormalizationResult|outputNormalization|toObservationJsonObject|toJsonValue)\b/u.exec(
+        /\b(?:createWorkingStateTool|createContextTools|SessionWorkingStateEntry|SessionQueuedSubmission|commitWorkingState|enqueueSubmission|findBranchMatches|ModelMessage|ModelProviderState|CompleteRequestEstimator|SimpleTokenEstimator|TokenEstimator|SessionCompactionEntry|AgentSessionCompactionRequest|appendCompaction|summarizeConversation|executeAssistantToolCalls|nextObservationIndex|normalizeJsonSafe|JsonNormalizationDiagnostic|JsonNormalizationResult|outputNormalization|toObservationJsonObject|toJsonValue)\b/u.exec(
           declaration
         );
       if (retired)
@@ -119,7 +119,7 @@ try {
       "import * as local from '@agent-core/tools-local';",
       "import * as nodePersistence from '@agent-core/persistence/node';",
       "if (!runtime.decodeAgentTerminalSnapshot || !runtime.AgentRuntime || !runtime.AgentSession || !runtime.InMemorySessionRepository || !nodeRuntime.JsonlSessionRepository || !model.parseModelResponse || !json.parseJsonObject || !effects.decodeExternalEffectIntent || !persistence.InMemoryEventRepository || !nodePersistence.JsonlEventRepository || !tools.planToolCall || !tools.invokeToolCallPlan || !tools.isCommandExecution || !local.LocalCommandExecution) throw new Error('public runtime exports missing');",
-      "if (!runtime.HistoryReader || !runtime.ContextService || !runtime.InferenceService || !runtime.InMemoryInferenceRepository || !nodeRuntime.JsonlInferenceRepository || !runtime.createHistoryTools || !runtime.createWorkingStateTool || !runtime.createContextTools || !runtime.EffectExecutor || !runtime.createObservationAccess || !tools.commandExecutionResources || !tools.contextRequiredObservation || !model.accountModelRequest || !model.compileModelRequest) throw new Error('persistent context exports missing');"
+      "if (!runtime.HistoryReader || !runtime.ContextService || !runtime.InferenceService || !runtime.InMemoryInferenceRepository || !nodeRuntime.JsonlInferenceRepository || !runtime.createHistoryTools || typeof runtime.ContextService.prototype.toolDefinitions !== 'function' || !runtime.EffectExecutor || !runtime.createObservationAccess || !tools.commandExecutionResources || !tools.contextRequiredObservation || !model.accountModelRequest || !model.compileModelRequest) throw new Error('persistent context exports missing');"
     ].join('\n')
   );
   await exec(process.execPath, ['runtime.mjs'], { cwd: consumer });

@@ -1,3 +1,5 @@
+import { contextToolDefinitions } from './tools.js';
+import { stagedWorkingState } from './working-state.js';
 import { contextTransformSources } from '../inference/context-transform.js';
 import type { PromptContextItemInput } from '../inference/prompt-material.js';
 import { contextSourceManifest, readSelectedHistoryMetadata, type ContextInspectionPage } from './inspection.js';
@@ -12,7 +14,6 @@ import { HistorySourceTooLargeError } from '../history/reader.js';
 import { requestCapacity } from '../inference/request-admission.js';
 import { parseJsonObject, type JsonObject } from '@agent-core/json';
 import {
-  hashArtifactBytes,
   hashJson,
   PersistenceConflictError,
   type ArtifactRepository
@@ -23,7 +24,6 @@ import { HistoryReader, sameHistorySource, textRange } from '../history/reader.j
 import type { ToolInvocationContext } from '@agent-core/tools';
 import {
   assertWorkingStateRevision,
-  type WorkingStateChange,
   type WorkingStateSnapshot,
   type WorkingStateInference
 } from '../session/working-state.js';
@@ -49,6 +49,7 @@ export interface ContextPolicy {
     | Promise<readonly HistorySourceRef[]>;
 }
 export interface ContextAdmissionInput {
+  readonly preserveSelection: boolean;
   readonly cut: HistorySourceCut;
   readonly entries: readonly SessionBranchEntry[];
   readonly window?: import('./contracts.js').ContextWindowRecord | undefined;
@@ -97,6 +98,11 @@ export class ContextService {
       });
     if (!Number.isSafeInteger(options.policy.maxSourceBytes) || options.policy.maxSourceBytes < 1)
       throw new Error('Context source selection maxSourceBytes must be positive.');
+  }
+  /** Construct governed context capabilities with this service's owned storage. */
+  toolDefinitions(prefix?: string) {
+    return contextToolDefinitions({ context: this, artifacts: this.options.artifacts,
+      maxSourceBytes: this.options.policy.maxSourceBytes, ...(prefix ? { prefix } : {}) });
   }
   async inspect(cut?: HistorySourceCut, page?: ContextInspectionPage) {
     cut ??= await this.history.capture();
@@ -362,26 +368,33 @@ export class ContextService {
   ): Promise<SessionContextTransitionEntry> {
     let request = ownRequest(requestInput);
     throwIfAborted(options.signal);
+    if (request.workingState && !options.admit)
+      throw new Error('Working-state publication requires compiled next-request admission.');
+    if (this.runtime && !options.admit)
+      throw new Error('Active context transitions require compiled next-request admission.');
     if (request.selection.providerState !== undefined)
       throw new Error(
         'Context provider state must come from governed host validation, not the transition request.'
       );
     const cut = await this.history.capture();
     const window = await this.history.selectedContext(cut);
-    if (request.selection.protected === undefined && window?.selection.protected)
+    const previous = await this.findTransition(request.idempotencyKey);
+    // Reconcile against the original committed selection, never a later live window.
+    const normalizationWindow = previous?.window ?? window;
+    if (request.selection.protected === undefined && normalizationWindow?.selection.protected)
       request = ownRequest({
         ...request,
-        selection: { ...request.selection, protected: window.selection.protected }
+        selection: { ...request.selection, protected: normalizationWindow.selection.protected }
       });
-    if (!request.selection.continuity && window?.selection.continuity) {
+    if (!request.selection.continuity && normalizationWindow?.selection.continuity) {
       const retained = new Set(request.selection.retained.map((source) => source.entryId));
       request = ownRequest({
         ...request,
         selection: {
           ...request.selection,
           continuity: {
-            ...window.selection.continuity,
-            sources: window.selection.continuity.sources.filter((source) =>
+            ...normalizationWindow.selection.continuity,
+            sources: normalizationWindow.selection.continuity.sources.filter((source) =>
               retained.has(source.entryId)
             )
           }
@@ -399,7 +412,6 @@ export class ContextService {
     delete selectionRequest.toolInvocation;
     delete selectionRequest.expectedCut;
     const fingerprint = hashJson(selectionRequest);
-    const previous = await this.findTransition(request.idempotencyKey);
     if (previous) {
       if (previous.transition.requestFingerprint !== fingerprint)
         throw new PersistenceConflictError(
@@ -465,7 +477,7 @@ export class ContextService {
           limit: this.options.policy.maxSourceBytes,
           observedAtLeast: sourceBytes
         });
-      if (entry.type === 'working_state' || entry.type === 'context_transition')
+      if (entry.type === 'context_transition')
         throw new Error(
           'context_admission_failed: working state and window records are not selectable conversational contributions.'
         );
@@ -513,17 +525,12 @@ export class ContextService {
         this.options.session,
         cut.throughEntryId
       );
-      if (
-        [...snapshot.entries].some(
-          (entry) =>
-            !['branch', 'model_settings', 'context_transition', 'working_state'].includes(
-              entry.type
-            ) && !retained.has(entry.entryId)
-        )
-      )
-        throw new Error(
-          'context_admission_failed: omitted history has no authorized available read capability.'
-        );
+      for await (const entry of snapshot.entries)
+        if (!['branch', 'model_settings', 'context_transition'].includes(entry.type) &&
+            !retained.has(entry.entryId))
+          throw new Error(
+            'context_admission_failed: omitted history has no authorized available read capability.'
+          );
     }
     const captured = await this.workingState(cut);
     const expectedWorkingStateRevisionId =
@@ -532,7 +539,7 @@ export class ContextService {
         : request.expectedWorkingStateRevisionId;
     assertWorkingStateRevision(captured.revision, expectedWorkingStateRevisionId);
     const workingState = request.workingState
-      ? await this.snapshotForChange(request.workingState, cut.throughEntryId)
+      ? await stagedWorkingState(this.options.artifacts, this.options.policy.maxSourceBytes, request.workingState, cut.throughEntryId)
       : captured;
     const pending = await this.options.repository.loadPendingSubmissions(this.options.session);
     const bytes = Buffer.byteLength(
@@ -548,7 +555,15 @@ export class ContextService {
         limit: this.options.policy.maxSourceBytes,
         observedAtLeast: bytes
       });
+    if (request.preserveSelection) {
+      const active = await this.selectSources(cut, {});
+      if (hashJson(active.retained) !== hashJson(request.selection.retained) ||
+          request.selection.strategy !== (window?.selection.strategy ?? 'sources') ||
+          hashJson(request.selection.continuity ?? null) !== hashJson(window?.selection.continuity ?? null))
+        throw new Error('A preserved selection cannot change sources or native continuation.');
+    }
     const validation = await options.admit?.({
+      preserveSelection: request.preserveSelection === true,
       cut,
       entries: selected,
       window,
@@ -593,12 +608,11 @@ export class ContextService {
       },
       transition: {
         transitionId: randomUUID(),
-        ...(validation
-          ? {
-              compiledInputIdentity: validation.compiledInputIdentity,
-              capabilityRevision: validation.capabilityRevision
-            }
-          : {}),
+        ...(request.preserveSelection ? { preservedSelection: true } : {}),
+        admission: validation
+          ? { status: 'admitted', compiledInputIdentity: validation.compiledInputIdentity,
+              capabilityRevision: validation.capabilityRevision }
+          : { status: 'pending', reason: 'idle_source_selection' },
         idempotencyKey: request.idempotencyKey,
         previousWindowId: request.expectedWindowId,
         windowId,
@@ -648,7 +662,7 @@ export class ContextService {
       this.options.session,
       cut.throughEntryId
     );
-    const entry = snapshot.index.byId.get(revision.id);
+    const entry = await snapshot.index.byId.get(revision.id);
     if (!entry) throw new Error('Working-state index points outside the captured session branch.');
     const source = { sessionId: cut.sessionId, entryId: entry.entryId, sha256: entry.sha256 };
     if (maxBytes === 0)
@@ -659,7 +673,7 @@ export class ContextService {
       length: maxBytes
     });
     const preview = textRange(
-      new TextDecoder('utf-8', { fatal: true }).decode(range.bytes),
+      new TextDecoder('utf-8', { fatal: true }).decode(range.bytes, { stream: true }),
       0,
       maxBytes
     );
@@ -683,115 +697,6 @@ export class ContextService {
     };
   }
 
-  async stageWorkingState(input: {
-    readonly id: string;
-    readonly revisionId: string | null;
-    readonly inference: WorkingStateInference;
-    readonly text: string;
-  }): Promise<
-    | WorkingStateChange
-    | { readonly status: 'unchanged' }
-    | {
-        readonly status: 'conflict';
-        readonly current: Awaited<ReturnType<ContextService['inspectWorkingState']>>;
-      }
-    | {
-        readonly status: 'invalid';
-        readonly failures: readonly {
-          readonly reason: string;
-          readonly message: string;
-          readonly editIndex?: number;
-        }[];
-      }
-  > {
-    const current = await this.workingState();
-    if ((current.revision?.id ?? null) !== input.revisionId)
-      return { status: 'conflict', current: await this.inspectWorkingState() };
-    if (input.text === current.text) return { status: 'unchanged' };
-    const bytes = new TextEncoder().encode(input.text);
-    if (bytes.byteLength > this.options.policy.maxSourceBytes)
-      return {
-        status: 'invalid',
-        failures: [
-          {
-            reason: 'result_too_large',
-            message:
-              'Working state exceeds the available source byte capacity; no revision was published.'
-          }
-        ]
-      };
-    const contentRef = await this.options.artifacts.storeProtected({
-      label: 'working-state',
-      mediaType: 'text/plain; charset=utf-8',
-      content: bytes
-    });
-    return {
-      id: input.id,
-      previousRevisionId: input.revisionId,
-      contentRef,
-      inference: input.inference
-    };
-  }
-
-  async updateWorkingState(
-    input: Parameters<ContextService['stageWorkingState']>[0] & {
-      readonly sessionId: string;
-      readonly branchId: string;
-    }
-  ) {
-    const cut = await this.history.capture();
-    if (input.sessionId !== cut.sessionId || input.branchId !== cut.branchId)
-      throw new Error('Working-state branch changed after authorization.');
-    const snapshot = await this.options.repository.sourceSnapshot(
-      this.options.session,
-      cut.throughEntryId
-    );
-    const published = snapshot.index.byId.get(input.id);
-    if (published) {
-      const entry = await this.history.resolve(
-        { sessionId: cut.sessionId, entryId: published.entryId, sha256: published.sha256 },
-        cut
-      );
-      if (
-        entry?.type !== 'working_state' ||
-        hashJson(entry.inference) !== hashJson(input.inference) ||
-        entry.previousRevisionId !== input.revisionId
-      )
-        throw new PersistenceConflictError('Working-state retry does not match its publication.');
-      if (hashArtifactBytes(new TextEncoder().encode(input.text)) !== entry.contentRef.sha256)
-        throw new PersistenceConflictError('Working-state retry has different content.');
-      // Reconcile the receipt before looking at today's head: later revisions do not invalidate a committed update.
-      return { status: 'committed' as const, revisionId: entry.id };
-    }
-    const prepared = await this.stageWorkingState(input);
-    if ('status' in prepared) return prepared;
-    try {
-      const revision = await this.options.repository.commitWorkingState(
-        this.options.session,
-        prepared,
-        input.branchId
-      );
-      return { status: 'committed' as const, revisionId: revision.id };
-    } catch (error) {
-      if (!(error instanceof PersistenceConflictError)) throw error;
-      return { status: 'conflict' as const, current: await this.inspectWorkingState() };
-    }
-  }
-
-  private async snapshotForChange(
-    change: WorkingStateChange,
-    parentId: string | null
-  ): Promise<WorkingStateSnapshot> {
-    if (change.contentRef.size > this.options.policy.maxSourceBytes)
-      throw new Error('Proposed working state exceeds the context source byte bound.');
-    return {
-      revision: { ...change, type: 'working_state', parentId, timestamp: new Date().toISOString() },
-      text: new TextDecoder('utf-8', { fatal: true }).decode(
-        await this.options.artifacts.readVerified(change.contentRef)
-      )
-    };
-  }
-
   private capacity() {
     return this.admission ? requestCapacity(this.admission.accounting, this.admission.continuityHeadroomTokens) : undefined;
   }
@@ -804,14 +709,15 @@ export class ContextService {
       this.options.session,
       cut.throughEntryId
     );
-    const active = [...snapshot.activeInputs()];
+    const active: HistorySourceRef[] = [];
+    for await (const entry of snapshot.activeInputs()) active.push({
+      sessionId: cut.sessionId,
+      entryId: entry.entryId,
+      sha256: entry.sha256,
+      ...(entry.source ? { event: entry.source } : {})
+    });
     return Object.freeze([
-      ...active.map((entry) => ({
-        sessionId: cut.sessionId,
-        entryId: entry.entryId,
-        sha256: entry.sha256,
-        ...(entry.source ? { event: entry.source } : {})
-      })),
+      ...active,
       ...(includeSelection
         ? ((await this.history.selectedContext(cut))?.selection.protected ?? [])
         : []),
@@ -824,7 +730,7 @@ export class ContextService {
       this.options.session,
       cut.throughEntryId
     );
-    const item = snapshot.index.byIdentity.get(`context_transition:${idempotencyKey}`);
+    const item = await snapshot.index.byIdentity.get(`context_transition:${idempotencyKey}`);
     if (!item) return undefined;
     const entry = await this.history.resolve(
       { sessionId: cut.sessionId, entryId: item.entryId, sha256: item.sha256 },

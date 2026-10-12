@@ -14,6 +14,10 @@ export function createHistoryTools(options: {
   const search = z.strictObject({
     query: z.string().max(4096).optional(),
     ...queryShape,
+    maxPostings: z.number().int().min(1).max(10000).optional(),
+    maxCandidates: z.number().int().min(1).max(10000).optional(),
+    maxIndexBytes: z.number().int().min(1).max(8 * 1024 * 1024).optional(),
+    maxIndexEntries: z.number().int().min(1).max(1000).optional(),
     maxScannedBytes: z
       .number()
       .int()
@@ -37,8 +41,7 @@ export function createHistoryTools(options: {
             'observation',
             'branch',
             'model_settings',
-            'context_transition',
-            'working_state'
+            'context_transition'
           ])
           .optional(),
         role: z.enum(['user', 'assistant', 'tool', 'control']).optional(),
@@ -109,11 +112,12 @@ export function createHistoryTools(options: {
           scope: scopePath('history', cut.sessionId, cut.branchId)
         };
       },
-      async invoke(value) {
+      async invoke(value, context) {
         await options.history.validateCut(historyCutSchema.parse(value.authorizedCut));
         const request = search.parse(value.request);
         return options.history.search({
           ...request,
+          ...(context.signal ? { signal: context.signal } : {}),
           ...(request.cursor ? {} : { cut: historyCutSchema.parse(value.authorizedCut) })
         });
       }

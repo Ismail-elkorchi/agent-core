@@ -1,7 +1,6 @@
 import { parseJsonObject } from '@agent-core/json';
 import {
   decodeOwnedArtifactRef,
-  hashJson,
   PersistenceConflictError,
   type ProtectedArtifactRef
 } from '@agent-core/persistence';
@@ -20,12 +19,10 @@ export interface WorkingStateChange {
   readonly contentRef: ProtectedArtifactRef;
   readonly inference: WorkingStateInference;
 }
-export type SessionWorkingStateEntry = BaseSessionEntry &
-  WorkingStateChange & {
-    readonly type: 'working_state';
-  };
+/** Derived live revision; only the enclosing context transition is persisted. */
+export type WorkingStateRevision = BaseSessionEntry & WorkingStateChange;
 export interface WorkingStateSnapshot {
-  readonly revision: SessionWorkingStateEntry | null;
+  readonly revision: WorkingStateRevision | null;
   readonly text: string;
 }
 
@@ -46,25 +43,15 @@ export const workingStateChangeSchema = z.strictObject({
     })
     .readonly()
 });
-export const workingStateEntrySchema = workingStateChangeSchema
-  .extend({
-    type: z.literal('working_state'),
-    parentId: z.string().min(1).nullable(),
-    timestamp: z.string().min(1)
-  })
-  .readonly();
-
 /** Context renewal shares the session entry identity with its working-state publication. */
 export function workingStateAtEntry(
   entry: SessionBranchEntry,
-  inherited: SessionWorkingStateEntry | null = null
-): SessionWorkingStateEntry | null {
-  if (entry.type === 'working_state') return entry;
+  inherited: WorkingStateRevision | null = null
+): WorkingStateRevision | null {
   if (entry.type === 'context_transition' && entry.workingState)
     return Object.freeze({
       ...entry.workingState,
       id: entry.id,
-      type: 'working_state',
       parentId: entry.parentId,
       timestamp: entry.timestamp
     });
@@ -73,7 +60,7 @@ export function workingStateAtEntry(
 
 export function latestWorkingState(
   branch: readonly SessionBranchEntry[]
-): SessionWorkingStateEntry | null {
+): WorkingStateRevision | null {
   for (let index = branch.length - 1; index >= 0; index--) {
     const entry = branch[index];
     const revision = entry && workingStateAtEntry(entry);
@@ -82,48 +69,8 @@ export function latestWorkingState(
   return null;
 }
 
-/** Retry identities are session entry identities; a retry never overwrites another interpretation. */
-export function workingStateRetry(
-  branch: readonly SessionBranchEntry[],
-  change: WorkingStateChange
-): SessionWorkingStateEntry | undefined {
-  const existing = branch.find((entry) => entry.id === change.id);
-  if (!existing) return undefined;
-  const revision = workingStateAtEntry(existing);
-  if (
-    !revision ||
-    hashJson({
-      id: revision.id,
-      previousRevisionId: revision.previousRevisionId,
-      contentRef: revision.contentRef,
-      inference: revision.inference
-    }) !== hashJson(change)
-  )
-    throw new PersistenceConflictError(
-      'Working-state publication identity has conflicting content.'
-    );
-  return revision;
-}
-
-export function assertWorkingStateBranch(
-  branch: readonly SessionBranchEntry[],
-  sessionId: string,
-  expectedBranchId: string
-): void {
-  let current = sessionId;
-  for (let index = branch.length - 1; index >= 0; index--) {
-    const entry = branch[index];
-    if (entry?.type === 'branch') {
-      current = entry.id;
-      break;
-    }
-  }
-  if (current !== expectedBranchId)
-    throw new PersistenceConflictError('Session branch changed during working-state publication.');
-}
-
 export function assertWorkingStateRevision(
-  current: SessionWorkingStateEntry | null,
+  current: WorkingStateRevision | null,
   expected: string | null
 ): void {
   if ((current?.id ?? null) !== expected)
