@@ -1063,8 +1063,10 @@ test('context transitions commit once without evicting original session records'
     idempotencyKey: 'retain-once',
     reason: 'Explicit attention boundary',
     selection: {
-      strategy: 'sources',
-      retained: view.entries.map((entry) => sourceRef(descriptor.id, entry))
+      retained: view.entries.map((entry) => sourceRef(descriptor.id, entry)),
+      continuity: { kind: 'fresh', resetId: 'retain-once',
+        model: { provider: 'test', model: 'model' },
+        sources: view.entries.map((entry) => sourceRef(descriptor.id, entry)) }
     }
   };
   const agent = new AgentSession({
@@ -1078,23 +1080,22 @@ test('context transitions commit once without evicting original session records'
       throw new Error('No inference required by this transition');
     }
   });
-  const result = await agent.transitionContext(request);
-  assert.equal(result.kind, 'selected');
-  const first = result.entry;
+  await assert.rejects(agent.transitionContext(request), /compiled next-request admission/);
+  const admission = { admit: async () => ({ compiledInputIdentity: 'session-fixture', capabilityRevision: 'fixture' }) };
+  const first = await context.transition(request, admission);
   assert.equal(Object.isFrozen(first.window.selection), true);
-  assert.equal((await agent.transitionContext(request)).entry.id, first.id);
+  assert.equal((await context.transition(request, admission)).id, first.id);
   const replay = await repository.loadReplayState(descriptor);
   assert.equal(replay.contextWindow.windowId, first.window.windowId);
   assert.deepEqual(replay.ledgerRunIds, ['run']);
   assert.equal((await repository.readConversation(descriptor)).length, 2);
   await assert.rejects(
-    agent.transitionContext({ ...request, reason: 'Changed content' }),
+    context.transition({ ...request, reason: 'Changed content' }, admission),
     /idempotency/u
   );
   const scheduled = [];
   const unbind = context.bindRuntime({
-    schedule: async (request) => { scheduled.push(request); return { requestId: 'scheduled-selection' }; },
-    providerTransform: async () => false
+    schedule: async (request) => { scheduled.push(request); return { requestId: 'scheduled-selection' }; }
   });
   const activeRequest = {
     ...request,
@@ -1109,7 +1110,7 @@ test('context transitions commit once without evicting original session records'
   assert.equal((await history.selectedContext()).windowId, first.window.windowId);
   unbind();
   await repository.appendInput(descriptor, { runId: 'new-run', task: 'A newer source.' });
-  await assert.rejects(agent.transitionContext(activeRequest), /source revision|stale/i);
+  await assert.rejects(context.transition(activeRequest, admission), /source revision|stale/i);
   assert.equal((await history.selectedContext()).windowId, first.window.windowId);
 });
 
