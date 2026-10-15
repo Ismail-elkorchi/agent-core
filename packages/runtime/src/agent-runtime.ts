@@ -73,9 +73,9 @@ import {
 } from './inference/request-admission.js';
 import {
   rebuildModelWindowFromRepositories,
-  assertHistoryModelCompatibility,
   replaySourceEntries,
-  recordContextExcerpts
+  recordContextExcerpts,
+  type ModelWindowReplayResult
 } from './orchestration/session-replay.js';
 import { ModelWindow } from './inference/model-window.js';
 import type { NativeGenerationContext } from './inference/native-inference.js';
@@ -439,6 +439,7 @@ export class AgentRuntime {
   private recoveryActionBoundary: string | undefined;
   private contextControlReserve: { readonly identity: string; readonly tokens: number } | undefined;
   private activeContextIdentity: string | null | undefined;
+  private activeHistoryCut: import('./history/contracts.js').HistorySourceCut | undefined;
   private pendingCompatibilityTransition = false;
   private nativeSteering: NativeSteeringCoordinator | undefined;
   private steeringWrites: Promise<void> = Promise.resolve();
@@ -1375,19 +1376,13 @@ export class AgentRuntime {
           maxBytes: runtime.controller.limits.activeImageBytes,
           maxEstimatedTokens: runtime.controller.limits.activeImageTokens
         },
-        providerId: this.options.provider.id,
-        model: this.options.model,
-        ...protocolTarget(await this.options.provider.describeModel(this.options.model)),
+        profile: await this.options.provider.describeModel(this.options.model),
         currentRunId: runtime.runId,
         ...(runtime.restoring || runtime.providerContinuation ? { runIds: [runtime.runId] } : {})
       });
-    let replay;
+    let replay: ModelWindowReplayResult;
     try {
       await this.options.context?.assertSourceCapacity();
-      if (this.history && this.options.repositories.artifacts)
-        await assertHistoryModelCompatibility({ history: this.history,
-          artifacts: this.options.repositories.artifacts,
-          profile: await this.options.provider.describeModel(this.options.model), currentRunId: runtime.runId });
       replay = await rebuild();
     } catch (error) {
       if (error instanceof NativeContextIncompatibilityError) {
@@ -1404,6 +1399,7 @@ export class AgentRuntime {
       };
     }
     const modelWindow = replay.modelWindow;
+    this.activeHistoryCut = replay.historyCut;
     const observationStore = new ObservationStore({
       ...(this.options.context && this.options.contextRenewal?.automatic
         ? { maxPresentationBytes: CONTEXT_RECOVERY_LIMITS.resultBytes } : {}),
@@ -3367,7 +3363,10 @@ export class AgentRuntime {
       await this.options.context?.assertSourceCapacity();
     }
     if (contextPublication.committed) await this.activateCommittedContext(request.modelWindow, request.runId, true);
-    const cut = await this.options.context?.history.capture();
+    // Admission must describe the source boundary actually replayed, not a later
+    // capture that could silently claim an unseen correction. The dispatch fence
+    // refreshes the window if accepted sources advanced during validation/replay.
+    const cut = this.activeHistoryCut ?? await this.options.context?.history.capture();
     const sessionState = (await this.options.context?.sessionState(cut)) ?? {
       revision: null,
       content: {}
@@ -3564,9 +3563,6 @@ export class AgentRuntime {
     if (!refresh && this.activeContextIdentity === identity) return;
     let replay;
     try {
-      if (this.history && this.options.repositories.artifacts)
-        await assertHistoryModelCompatibility({ history: this.history,
-          artifacts: this.options.repositories.artifacts, profile, currentRunId: runId });
       replay = await rebuildModelWindowFromRepositories({
         readInferenceInput: (runId, invocationId) =>
           this.inferenceService.admittedInput(this.options.inferenceOwnerId ?? runId, invocationId),
@@ -3576,9 +3572,7 @@ export class AgentRuntime {
           ? { artifacts: this.options.repositories.artifacts }
           : {}),
         estimator: this.estimator,
-        providerId: this.options.provider.id,
-        model: this.options.model,
-        ...protocolTarget(profile),
+        profile,
         currentRunId: runId,
         runIds: [runId]
       });
@@ -3599,6 +3593,7 @@ export class AgentRuntime {
       );
     }
     window.replaceWith(replay.modelWindow);
+    this.activeHistoryCut = replay.historyCut;
     this.activeContextIdentity = identity;
     this.pendingCompatibilityTransition = false;
   }
@@ -4946,12 +4941,6 @@ function findPendingApproval(
       if (call.stage === 'approval' && (!approvalId || call.approval.approvalId === approvalId))
         return { batch, callIndex, approval: call.approval };
   return undefined;
-}
-
-function protocolTarget(profile: ModelProfile): {
-  readonly protocol?: import('@agent-core/model').ModelProtocolCapabilities;
-} {
-  return profile.capabilities.protocol ? { protocol: profile.capabilities.protocol } : {};
 }
 
 function requestCapacityConflict(

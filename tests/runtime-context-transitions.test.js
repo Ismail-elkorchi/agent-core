@@ -1050,3 +1050,26 @@ test('accepted input arriving after publication is reassembled before successor 
   assert.equal(successor.messages.filter(item => item.content === 'Remember and continue.').length, 1);
   assert.ok(JSON.stringify(successor).includes('Accepted durable interpretation.'));
 });
+
+test('input arriving after replay selection capture is included before dispatch', async t => {
+  const f = await fixture();
+  const order = f.history.orderEntries.bind(f.history);
+  let reads = 0;
+  let added = false;
+  t.mock.method(f.history, 'orderEntries', async (...args) => {
+    const entries = await order(...args);
+    reads++;
+    if (reads === 2) {
+      added = true;
+      await f.sessions.appendInput(f.session, { runId: 'during-replay-validation',
+        task: 'Late correction during replay: keep the operation read-only.' });
+    }
+    return entries;
+  });
+  const result = await new AgentRuntime(f.options).run({ runId: 'replay-capture-race', task: 'Continue.' }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.equal(added, true);
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.requests[0].messages.filter(item => item.content ===
+    'Late correction during replay: keep the operation read-only.').length, 1);
+});

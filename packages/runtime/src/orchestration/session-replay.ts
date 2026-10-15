@@ -11,7 +11,6 @@ import {
   type ModelOutputItem,
   type ModelProfile,
   type ModelToolCall,
-  type ModelProtocolCapabilities,
   type ProviderContextState,
   type RequestEstimator
 } from '@agent-core/model';
@@ -31,6 +30,7 @@ import { serializeToolModelContent } from '@agent-core/tools';
 import { readProviderStateArtifact } from './provider-state-artifacts.js';
 
 export interface ModelWindowReplayResult {
+  readonly historyCut?: HistorySourceCut;
   readonly modelWindow: ModelWindow;
   readonly invalidatedProviderStates: readonly {
     readonly state: ProviderContextState;
@@ -52,9 +52,7 @@ export async function rebuildModelWindowFromRepositories(input: {
   readonly artifacts?: ArtifactRepository;
   readonly estimator: RequestEstimator;
   readonly modelWindowImageLimits?: ModelWindowImageLimits;
-  readonly providerId: string;
-  readonly model: string;
-  readonly protocol?: ModelProtocolCapabilities;
+  readonly profile: ModelProfile;
   readonly runIds?: readonly string[];
   readonly currentRunId?: string;
   readonly readInferenceInput?: (
@@ -64,12 +62,17 @@ export async function rebuildModelWindowFromRepositories(input: {
 }): Promise<ModelWindowReplayResult> {
   const modelWindow = new ModelWindow(input.estimator, input.modelWindowImageLimits);
   const view = input.history ? await readSelectedHistorySources(input.history) : undefined;
+  if (view && input.artifacts)
+    await assertSelectedHistoryModelCompatibility(view, {
+      artifacts: input.artifacts, profile: input.profile,
+      ...(input.currentRunId === undefined ? {} : { currentRunId: input.currentRunId })
+    });
   const selected = applicationHistory(view?.entries ?? []);
   const invalidatedProviderStates: { state: ProviderContextState; reason: string }[] = [];
   const target = {
-    provider: input.providerId,
-    model: input.model,
-    ...(input.protocol ? { protocol: input.protocol } : {})
+    provider: input.profile.provider,
+    model: input.profile.id,
+    ...(input.profile.capabilities.protocol ? { protocol: input.profile.capabilities.protocol } : {})
   };
   const prior = selected.filter(
     (entry) =>
@@ -228,8 +231,8 @@ export async function rebuildModelWindowFromRepositories(input: {
       if (
         ref &&
         input.artifacts &&
-        ref.summary.provider === input.providerId &&
-        ref.summary.model === input.model
+        ref.summary.provider === input.profile.provider &&
+        ref.summary.model === input.profile.id
       ) {
         const state = await readProviderStateArtifact({
           artifacts: input.artifacts,
@@ -250,6 +253,7 @@ export async function rebuildModelWindowFromRepositories(input: {
   if (incompatibleState) throw new NativeContextIncompatibilityError(incompatibleState.reason);
   return {
     modelWindow,
+    ...(view ? { historyCut: view.cut } : {}),
     invalidatedProviderStates: Object.freeze(invalidatedProviderStates),
     replayedLedgers,
     replayedTurns: new Set(selected.flatMap((entry) => ('runId' in entry ? [entry.runId] : [])))
@@ -503,7 +507,16 @@ export async function assertHistoryModelCompatibility(input: {
   readonly representation?: 'portable';
   readonly currentRunId?: string;
 }): Promise<void> {
-  const view = await readSelectedHistorySources(input.history);
+  await assertSelectedHistoryModelCompatibility(await readSelectedHistorySources(input.history), input);
+}
+
+/** Validate exactly the immutable selection that the replay owner will consume. */
+async function assertSelectedHistoryModelCompatibility(view: SelectedHistorySources, input: {
+  readonly artifacts: ArtifactRepository;
+  readonly profile: ModelProfile;
+  readonly representation?: 'portable';
+  readonly currentRunId?: string;
+}): Promise<void> {
   if (input.representation === 'portable') assertPortableHistorySources(view.entries, input.profile);
   const target = {
     provider: input.profile.provider,
