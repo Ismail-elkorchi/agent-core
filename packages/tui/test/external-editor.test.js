@@ -23,6 +23,7 @@ async function editor(t, source) {
   return marker;
 }
 
+// Fixture writers publish complete JSON by rename, so existence is the readiness signal.
 async function readStarted(marker, signal) {
   while (true) {
     try {
@@ -41,9 +42,10 @@ test(
     const marker = await editor(
       t,
       `
-    import { readFileSync, writeFileSync } from 'node:fs';
+    import { readFileSync, renameSync, writeFileSync } from 'node:fs';
     const file = process.argv[2];
-    writeFileSync(MARKER, JSON.stringify({ file }));
+    writeFileSync(MARKER + '.tmp', JSON.stringify({ file }));
+    renameSync(MARKER + '.tmp', MARKER);
     writeFileSync(file, readFileSync(file, 'utf8') + 'Edited café 世界\\r\\n');
   `
     );
@@ -61,9 +63,10 @@ test(
     const marker = await editor(
       t,
       `
-    import { writeFileSync } from 'node:fs';
+    import { renameSync, writeFileSync } from 'node:fs';
     process.on('SIGTERM', () => {});
-    writeFileSync(MARKER, JSON.stringify({ pid: process.pid, file: process.argv[2] }));
+    writeFileSync(MARKER + '.tmp', JSON.stringify({ pid: process.pid, file: process.argv[2] }));
+    renameSync(MARKER + '.tmp', MARKER);
     setInterval(() => {}, 100);
   `
     );
@@ -92,8 +95,9 @@ test(
     const marker = await editor(
       t,
       `
-    import { writeFileSync } from 'node:fs';
-    writeFileSync(MARKER, JSON.stringify({ file: process.argv[2] }));
+    import { renameSync, writeFileSync } from 'node:fs';
+    writeFileSync(MARKER + '.tmp', JSON.stringify({ file: process.argv[2] }));
+    renameSync(MARKER + '.tmp', MARKER);
     writeFileSync(process.argv[2], 'Unaccepted changes');
     process.exitCode = 7;
   `
@@ -113,7 +117,7 @@ test(
   async (t) => {
     const marker = await editor(
       t,
-      `import { writeFileSync } from 'node:fs'; writeFileSync(MARKER, '{}');`
+      `import { renameSync, writeFileSync } from 'node:fs'; writeFileSync(MARKER + '.tmp', '{}'); renameSync(MARKER + '.tmp', MARKER);`
     );
     const controller = new AbortController();
     const reason = new Error('Cancelled before terminal handoff.');
@@ -133,11 +137,12 @@ test(
     const marker = await editor(t, `
       import { spawn } from 'node:child_process';
       const child = spawn(process.execPath, ['--input-type=module', '-e', \`
-        import { writeFileSync } from 'node:fs';
+        import { renameSync, writeFileSync } from 'node:fs';
         process.on('SIGTERM', () => {});
-        writeFileSync(\${JSON.stringify(MARKER)}, JSON.stringify({
+        writeFileSync(\${JSON.stringify(MARKER)} + '.tmp', JSON.stringify({
           pid: process.pid, wrapper: process.ppid, file: process.argv[1]
         }));
+        renameSync(\${JSON.stringify(MARKER)} + '.tmp', \${JSON.stringify(MARKER)});
         setInterval(() => {}, 100);
       \`, process.argv[2]], { stdio: 'inherit' });
       child.on('exit', (code) => { process.exitCode = code ?? 1; });
@@ -268,8 +273,9 @@ test(
       await rm(directory, { recursive: true, force: true });
     });
     const marker = await editor(t, `
-      import { writeFileSync } from 'node:fs';
-      writeFileSync(MARKER, JSON.stringify({ file: process.argv[2] }));
+      import { renameSync, writeFileSync } from 'node:fs';
+      writeFileSync(MARKER + '.tmp', JSON.stringify({ file: process.argv[2] }));
+      renameSync(MARKER + '.tmp', MARKER);
       setTimeout(() => {}, 450);
     `);
     const controller = new AbortController();
@@ -295,15 +301,17 @@ for (const nested of [false, true]) {
     async (t) => {
       const source = `
         import { spawn } from 'node:child_process';
-        import { writeFileSync } from 'node:fs';
+        import { renameSync, writeFileSync } from 'node:fs';
         process.on('SIGTERM', () => {
           setTimeout(() => {
             const cleanup = spawn(process.execPath, ['-e', 'setInterval(() => {}, 100)'], { stdio: 'inherit' });
-            writeFileSync(MARKER + '.cleanup', JSON.stringify({ pid: cleanup.pid }));
+            writeFileSync(MARKER + '.cleanup.tmp', JSON.stringify({ pid: cleanup.pid }));
+            renameSync(MARKER + '.cleanup.tmp', MARKER + '.cleanup');
             cleanup.on('exit', () => process.exit(0));
           }, ${nested ? 800 : 0});
         });
-        writeFileSync(MARKER, JSON.stringify({ pid: process.pid, file: process.argv[1] }));
+        writeFileSync(MARKER + '.tmp', JSON.stringify({ pid: process.pid, file: process.argv[1] }));
+        renameSync(MARKER + '.tmp', MARKER);
         setInterval(() => {}, 100);
       `;
       const marker = await editor(t, nested ? `
