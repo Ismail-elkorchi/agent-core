@@ -15,6 +15,7 @@ import {
 } from '@agent-core/model';
 import { randomUUID } from 'node:crypto';
 import type { AdmittedModelInput } from './input.js';
+import type { EventReference } from '@agent-core/persistence';
 
 export interface ModelWindowMessages {
   readonly messages: readonly ModelInputItem[];
@@ -52,6 +53,7 @@ interface ActiveToolResultItem {
 }
 
 export interface RecordModelOutputInput {
+  readonly source?: EventReference;
   readonly output?: readonly ModelOutputItem[];
   turnIndex: number;
   content: string;
@@ -59,6 +61,7 @@ export interface RecordModelOutputInput {
 }
 
 export interface RecordToolResultInput {
+  readonly source?: EventReference;
   readonly observationId?: string;
   turnIndex: number;
   toolName: string;
@@ -69,6 +72,21 @@ export interface RecordToolResultInput {
 }
 
 export class ModelWindow {
+  private readonly appliedSources = new Map<string, string>();
+
+  /** A durable contribution is acknowledged only after its model presentation is applied. */
+  recordAppliedSource(source: EventReference): void {
+    const key = JSON.stringify([source.runId, source.eventId, source.sequence]);
+    const previous = this.appliedSources.get(key);
+    if (previous !== undefined && previous !== source.hash)
+      throw new Error('An applied source cannot change its immutable identity.');
+    this.appliedSources.set(key, source.hash);
+  }
+
+  hasAppliedSource(source: EventReference): boolean {
+    return this.appliedSources.get(JSON.stringify([source.runId, source.eventId, source.sequence])) === source.hash;
+  }
+
   private admittedInput: AdmittedModelInput | undefined;
   private boundInput:
     | {
@@ -144,6 +162,7 @@ export class ModelWindow {
     }
     for (const item of modelOutputToInput(modelResponseOutput(input)))
       this.recordInput(`output_${randomUUID()}`, item, input.turnIndex);
+    if (input.source) this.recordAppliedSource(input.source);
   }
 
   recordToolResult(input: RecordToolResultInput): void {
@@ -152,6 +171,7 @@ export class ModelWindow {
       if (previous) {
         if (previous.kind !== 'tool_result' || canonicalJsonString(previous.immediateMessage) !== canonicalJsonString(toolResultMessage(input)))
           throw new Error('A recorded observation presentation cannot change during replay.');
+        if (input.source) this.recordAppliedSource(input.source);
         return;
       }
     }
@@ -168,6 +188,7 @@ export class ModelWindow {
     }
     this.activeItems.push(item);
     this.boundInput?.current.push(item.immediateMessage);
+    if (input.source) this.recordAppliedSource(input.source);
   }
 
   /** Removes incompatible native material from attention; immutable history remains unchanged. */
@@ -189,6 +210,7 @@ export class ModelWindow {
       if (item?.kind === 'message' && invalid(item.message)) this.activeItems.splice(index, 1);
     }
     if (invalidated.length) {
+      this.appliedSources.clear();
       this.admittedInput = undefined;
       this.boundInput = undefined;
     }
@@ -215,6 +237,8 @@ export class ModelWindow {
   }
 
   replaceWith(window: ModelWindow): void {
+    this.appliedSources.clear();
+    for (const [key, hash] of window.appliedSources) this.appliedSources.set(key, hash);
     this.activeItems.splice(0, this.activeItems.length, ...window.activeItems);
     this.priorItems.clear();
     for (const [source, item] of window.priorItems) this.priorItems.set(source, item);

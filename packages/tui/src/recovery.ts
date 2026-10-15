@@ -3,13 +3,20 @@ import type {
   AgentProgressEvent, AgentRunSuspension, AgentSessionSuspensionDescriptor
 } from '@agent-core/runtime';
 
-export function suspensionPresentation(reason: AgentSessionSuspensionDescriptor['reason']): {
+export function suspensionPresentation(suspension: Pick<AgentSessionSuspensionDescriptor, 'reason' | 'contextAdmission'>): {
   readonly title: string;
   readonly explanation: string;
   readonly resumeLabel?: string;
   readonly waitingMessage: string;
 } {
-  switch (reason) {
+  if (suspension.contextAdmission?.kind === 'request_preparation')
+    return {
+      title: 'Request preparation unavailable',
+      resumeLabel: 'Retry request',
+      waitingMessage: 'Request preparation is still unavailable. Retry after the provider recovers, or change the model.',
+      explanation: 'The request could not be prepared after bounded retries. Its work is preserved; retrying will recheck the current sources and required continuity room before generation.'
+    };
+  switch (suspension.reason) {
     case 'context_admission':
       return {
         title: 'Context needs adjustment',
@@ -63,7 +70,7 @@ export function suspensionMessage(
     Pick<AgentRunSuspension, 'cleanupDiagnostic'>
 ): string {
   return suspension.contextAdmission?.message ?? suspension.diagnostic ??
-    suspension.cleanupDiagnostic?.message ?? suspensionPresentation(suspension.reason).explanation;
+    suspension.cleanupDiagnostic?.message ?? suspensionPresentation(suspension).explanation;
 }
 
 export function providerFailureText(

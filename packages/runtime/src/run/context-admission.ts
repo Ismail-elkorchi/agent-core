@@ -3,9 +3,9 @@ import { historyCutSchema, sourceSchema } from '../history/schema.js';
 import { parseJsonObject } from '@agent-core/json';
 
 export type ContextAdmissionAction =
-  'select_sources' | 'transition_context' | 'change_model' | 'reduce_reservation' | 'cancel';
+  'select_sources' | 'transition_context' | 'change_model' | 'reduce_reservation' | 'retry' | 'cancel';
 
-/** A fit conflict at an inference boundary; it grants no effect or retry authority. */
+/** An inference-boundary admission conflict; unavailable preparation does not prove overflow. */
 interface ContextAdmissionMeasurements {
   readonly recoveryBoundary?: string;
   readonly recovery?: 'unsupported_action' | 'unchanged_action' | 'attempt_limit' | 'request_unavailable';
@@ -22,6 +22,15 @@ interface ContextAdmissionMeasurements {
 export type ContextAdmissionConflict = ContextAdmissionMeasurements &
   (
     | Readonly<{ kind: 'request_capacity' }>
+    | Readonly<{
+        kind: 'request_preparation';
+        inputIdentity?: never;
+        estimatedInputTokens?: never;
+        outputReservation?: never;
+        reasoningReservation?: never;
+        contextTokens?: never;
+        maxInputTokens?: never;
+      }>
     | Readonly<{ kind: 'native_continuity'; reason: 'automatic_disabled' | 'unsupported' | 'transform_failed' }>
     | Readonly<{ kind: 'provider_capacity'; inputIdentity: string }>
     | Readonly<{
@@ -144,6 +153,7 @@ export function decodeContextAdmissionConflict(value: unknown): ContextAdmission
       action !== 'transition_context' &&
       action !== 'change_model' &&
       action !== 'reduce_reservation' &&
+      action !== 'retry' &&
       action !== 'cancel'
     )
       throw new TypeError('Context admission action is invalid.');
@@ -151,6 +161,19 @@ export function decodeContextAdmissionConflict(value: unknown): ContextAdmission
   });
   if (new Set(actions).size !== actions.length)
     throw new TypeError('Context admission actions must be unique.');
+  if (object.kind === 'request_preparation') {
+    if (recovery !== 'request_unavailable' || object.recoveryBoundary !== undefined ||
+        object.reason !== undefined || object.cut !== undefined || object.bound !== undefined ||
+        object.source !== undefined || object.inputIdentity !== undefined || Object.keys(counts).length ||
+        !actions.includes('retry') ||
+        actions.some(action => action !== 'retry' && action !== 'change_model' && action !== 'cancel'))
+      throw new TypeError('Context admission preparation must describe unavailable preparation, not capacity or recovery authority.');
+    return Object.freeze({
+      kind: 'request_preparation', recovery, message: object.message, actions: Object.freeze(actions)
+    });
+  }
+  if (actions.includes('retry'))
+    throw new TypeError('Context admission retry requires unavailable request preparation.');
   if (object.kind === 'native_continuity') {
     if (typeof object.reason !== 'string' || !['automatic_disabled', 'unsupported', 'transform_failed'].includes(object.reason) ||
         object.cut !== undefined || object.bound !== undefined || object.source !== undefined)

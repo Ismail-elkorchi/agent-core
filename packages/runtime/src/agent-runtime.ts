@@ -300,6 +300,7 @@ type AssistantTurnResult =
       readonly modelOutput: AgentModelOutput;
       readonly turn: { readonly snapshot: TurnSnapshot; readonly toolBatchId: string };
       readonly native: boolean;
+      readonly source: import('@agent-core/persistence').EventReference;
     }
   | { readonly kind: 'renew_context' }
   | { readonly kind: 'decision'; readonly decision: ExecutionDecision }
@@ -424,6 +425,7 @@ class AgentExecutionError extends Error {
 }
 
 export class AgentRuntime {
+  private static readonly MAX_PROVIDER_RETRIES = 2;
   private readonly metadata: Readonly<Record<string, string>> | undefined;
   private readonly estimator: RequestEstimator;
   private readonly maxOutputTokens: number;
@@ -1249,7 +1251,8 @@ export class AgentRuntime {
     runtime: RunExecutionRuntime,
     identity: AgentTurnIdentity,
     toolBatchId: string,
-    calls: readonly ToolCall[]
+    calls: readonly ToolCall[],
+    modelWindow: ModelWindow
   ): Promise<void> {
     for (const [callIndex, call] of calls.entries()) {
       const received = {
@@ -1260,7 +1263,7 @@ export class AgentRuntime {
         ...(call.id ? { callId: call.id } : {}),
         toolCall: call
       };
-      await runtime.append(received, toolCallReceivedKey(runtime.runId, received));
+      const receipt = await runtime.append(received, toolCallReceivedKey(runtime.runId, received));
       await runtime.emit(received);
       if (this.options.repositories.session) {
         await this.options.repositories.session.repository.appendToolCall(
@@ -1277,6 +1280,8 @@ export class AgentRuntime {
           }
         );
       }
+      modelWindow.recordAppliedSource({ runId: runtime.runId, eventId: receipt.eventId,
+        sequence: receipt.sequence, hash: receipt.hash });
     }
   }
 
@@ -1602,25 +1607,6 @@ export class AgentRuntime {
           };
           await runtime.append(turnStarted);
           await runtime.emit(turnStarted);
-          if (this.options.repositories.session && turnIndex === 1) {
-            await this.options.repositories.session.repository.appendModelSettings(
-              this.options.repositories.session.descriptor,
-              {
-                provider: providerInfo.id,
-                model: configuration.model,
-                ...(configuration.temperature === undefined
-                  ? {}
-                  : { temperature: configuration.temperature }),
-                ...(configuration.reasoning === undefined
-                  ? {}
-                  : { reasoning: configuration.reasoning }),
-                ...(profile.capabilities.protocol === undefined
-                  ? {}
-                  : { endpoint: profile.capabilities.protocol.endpoint })
-              },
-              { runId: runtime.runId }
-            );
-          }
           if (turnIndex === 1) {
             const configuredEvent = {
               type: 'run.configured' as const,
@@ -1761,6 +1747,7 @@ export class AgentRuntime {
         if (toolCalls.length === 0) {
           if (!assistant.native)
             modelWindow.recordModelOutput({
+              source: assistant.source,
               turnIndex,
               content: response.content,
               toolCalls: [],
@@ -1789,12 +1776,13 @@ export class AgentRuntime {
 
         runtime.controller.reserveToolCalls(toolCalls);
         if (!snapshot.record.contextRecovery) modelWindow.recordModelOutput({
+          source: assistant.source,
           turnIndex,
           content: response.content,
           toolCalls: toolCalls.map(modelToolCallFromToolCall),
           ...(response.output ? { output: response.output } : {})
         });
-        await this.recordAcceptedToolCalls(runtime, activeTurnIdentity, toolBatchId, toolCalls);
+        await this.recordAcceptedToolCalls(runtime, activeTurnIdentity, toolBatchId, toolCalls, modelWindow);
         const sourceRequest = providerWork(runtime.run.state(), activeTurnIdentity);
         if (sourceRequest.stage !== 'settled')
           throw new Error('Tool calls require a known provider settlement.');
@@ -2577,6 +2565,7 @@ export class AgentRuntime {
             );
           }
           initial.modelWindow.recordModelOutput({
+            source: assistant.source,
             turnIndex: item.request.turnIndex,
             content: response.content,
             toolCalls: response.toolCalls ?? [],
@@ -2587,7 +2576,7 @@ export class AgentRuntime {
             const source = providerWork(runtime.run.state(), item.request.snapshot.record);
             if (source.stage !== 'settled')
               throw new Error('Native tool source is not durably settled.');
-            await this.recordAcceptedToolCalls(runtime, source.identity, item.request.toolBatchId, calls);
+            await this.recordAcceptedToolCalls(runtime, source.identity, item.request.toolBatchId, calls, initial.modelWindow);
             const batch: AgentToolPhase = {
               kind: 'tools',
               identity: source.identity,
@@ -2717,17 +2706,14 @@ export class AgentRuntime {
       for (;;) {
         const identity = turnIdentity(request.snapshot.record);
         let assembly: RequestAssemblyResult;
-        try {
-          // A generation retry owns the same captured candidate. In particular, a
-          // restricted control snapshot must never enter ordinary task assembly.
-          assembly = recoveryAssembly ?? await this.assembleModelRequest(request, append, emit, rejected);
-        } catch (error) {
-          if (!(error instanceof ContextAdmissionError || error instanceof ContextSourceCapacityError) ||
-              !this.options.contextRenewal?.automatic || !this.options.context) throw error;
-          const recovery = await this.assembleContextRecovery(request, error, append);
-          request = recovery.request;
-          assembly = recovery.assembly;
-          recoveryAssembly = assembly;
+        // A generation retry owns the same captured candidate. Preparation retries
+        // instead revalidate sources and admission before any provider effect exists.
+        if (recoveryAssembly) assembly = recoveryAssembly;
+        else {
+          const prepared = await this.prepareModelRequest(request, append, emit, rejected);
+          request = prepared.request;
+          assembly = prepared.assembly;
+          if (request.snapshot.record.contextRecovery) recoveryAssembly = assembly;
         }
         if (assembly.freshContext && request.replaceModelSession) {
           request = { ...request, modelSession: await request.replaceModelSession() };
@@ -2800,7 +2786,7 @@ export class AgentRuntime {
             contextRetries++;
             rejected = assembly.compiled;
           } else {
-            if (!completedAttempt.diagnostic.retryable || generationRetries === 2)
+            if (!completedAttempt.diagnostic.retryable || generationRetries === AgentRuntime.MAX_PROVIDER_RETRIES)
               return {
                 kind: 'decision',
                 decision: failedGenerationDecision(completedAttempt.diagnostic, request.turnIndex)
@@ -2810,19 +2796,8 @@ export class AgentRuntime {
               throw new ContextRecoveryStoppedError(request.snapshot.record.contextRecovery,
                 'Bounded context recovery exhausted four requests without progress.', 'attempt_limit');
             generationRetries++;
-            const retryAt = Math.max(
-              Date.now() + 500 * generationRetries,
-              completedAttempt.diagnostic.retryNotBefore ?? 0
-            );
-            await emit({
-              type: 'assistant.status',
-              ...identity,
-              message: `Generation failed. Retrying in ${String(Math.max(0, Math.ceil((retryAt - Date.now()) / 1000)))}s (${String(generationRetries)}/2).`
-            });
-            for (let remaining = retryAt - Date.now(); remaining > 0; remaining = retryAt - Date.now())
-              await delay(Math.min(remaining, 2_147_483_647), undefined, {
-                signal: request.signal
-              });
+            await this.waitForProviderRetry(request, completedAttempt.diagnostic,
+              generationRetries, 'Generation', emit);
           }
           const snapshot = {
             ...request.snapshot,
@@ -2954,6 +2929,8 @@ export class AgentRuntime {
       toolCalls,
       modelOutput,
       native: false,
+      source: { runId: request.runId, eventId: assistantReceipt.eventId,
+        sequence: assistantReceipt.sequence, hash: assistantReceipt.hash },
       turn: { snapshot: request.snapshot, toolBatchId: request.toolBatchId }
     };
   }
@@ -3002,6 +2979,75 @@ export class AgentRuntime {
         }
       );
     }
+  }
+
+  /** Pre-dispatch preparation has no provider effect to settle or replay. */
+  private async prepareModelRequest(
+    request: AssistantTurnRequest,
+    append: (event: AgentAuditEvent) => Promise<EventAppendReceipt>,
+    emit: (event: AgentProgressEvent) => Promise<void>,
+    rejected?: CompiledModelRequest
+  ): Promise<{ request: AssistantTurnRequest; assembly: RequestAssemblyResult }> {
+    for (let retries = 0; ; retries++) {
+      this.preserveRecoveryFailure(undefined, request);
+      request.controller.assertElapsed();
+      const tail = await this.options.repositories.events.tail(request.runId, { metadataOnly: true });
+      if (tail.driverGeneration !== request.run.state().driverGeneration)
+        throw new AgentRunOwnershipLostError(request.runId);
+      try {
+        try {
+          // Assembly refreshes the selected source cut. Never cache a failed probe
+          // or carry an unverified continuity reserve across a preparation retry.
+          return { request, assembly: await this.assembleModelRequest(request, append, emit, rejected) };
+        } catch (error) {
+          if (!(error instanceof ContextAdmissionError || error instanceof ContextSourceCapacityError) ||
+              !this.options.contextRenewal?.automatic || !this.options.context) throw error;
+          const phase = request.run.state().phase;
+          if (phase.kind === 'suspended' && phase.reason === 'context_admission' &&
+              phase.conflict.recovery === 'unchanged_action') throw error;
+          return await this.assembleContextRecovery(request, error, append);
+        }
+      } catch (error) {
+        this.preserveRecoveryFailure(error, request);
+        const diagnostic = providerFailureDiagnostic(error);
+        if (!diagnostic?.retryable) throw error;
+        if (retries === AgentRuntime.MAX_PROVIDER_RETRIES)
+          throw new ContextRecoveryStoppedError({
+            kind: 'request_preparation',
+            message: 'Model request preparation is temporarily unavailable.',
+            actions: ['retry', 'change_model', 'cancel']
+          }, `Model request preparation is temporarily unavailable: ${errorMessage(error)}`);
+        await this.waitForProviderRetry(request, diagnostic, retries + 1, 'Request preparation', emit);
+      }
+    }
+  }
+
+  /** Shared bounded provider retry timing; cancellation and run limits remain authoritative. */
+  private async waitForProviderRetry(
+    request: Pick<AssistantTurnRequest, 'runId' | 'signal' | 'run' | 'controller' | 'snapshot'>,
+    diagnostic: ModelProviderErrorDiagnostic,
+    retry: number,
+    stage: string,
+    emit: (event: AgentProgressEvent) => Promise<void>
+  ): Promise<void> {
+    const retryAt = Math.max(Date.now() + 500 * retry, diagnostic.retryNotBefore ?? 0);
+    await emit({
+      type: 'assistant.status',
+      ...turnIdentity(request.snapshot.record),
+      message: `${stage} failed. Retrying in ${String(Math.max(0, Math.ceil((retryAt - Date.now()) / 1000)))}s (${String(retry)}/${String(AgentRuntime.MAX_PROVIDER_RETRIES)}).`
+    });
+    const deadline = runSignalDeadline(request.controller, request.signal);
+    try {
+      for (let remaining = retryAt - Date.now(); remaining > 0; remaining = retryAt - Date.now())
+        await delay(Math.min(remaining, 2_147_483_647), undefined, { signal: deadline.signal });
+    } catch (error) {
+      deadline.signal.throwIfAborted();
+      throw error;
+    } finally {
+      deadline.dispose();
+    }
+    this.preserveRecoveryFailure(undefined, request);
+    request.controller.assertElapsed();
   }
 
   private async prepareContextAdmission(
@@ -3053,16 +3099,7 @@ export class AgentRuntime {
       };
       const append = (event: AgentAuditEvent) =>
         run.append(event, `${input.runId}:context-resume:${hashJson(encodeAgentEvent(event))}`);
-      try {
-        return await this.assembleModelRequest(request, append, () => Promise.resolve(undefined));
-      } catch (error) {
-        if (!(error instanceof ContextAdmissionError || error instanceof ContextSourceCapacityError) ||
-            !this.options.contextRenewal?.automatic || !this.options.context) throw error;
-        const phase = run.state().phase;
-        if (phase.kind === 'suspended' && phase.reason === 'context_admission' &&
-            phase.conflict.recovery === 'unchanged_action') throw error;
-        return (await this.assembleContextRecovery(request, error, append)).assembly;
-      }
+      return (await this.prepareModelRequest(request, append, () => Promise.resolve(undefined))).assembly;
     } finally {
       await session.close?.();
     }
@@ -3616,16 +3653,39 @@ export class AgentRuntime {
     return { window };
   }
 
-  /** Refresh only when the selected source boundary advanced beyond the replayed cut. */
+  /** Reconcile committed sources against the contributions already applied to this window. */
   private async refreshAdvancedHistory(
     window: ModelWindow,
     runId: string,
     captured: import('./history/contracts.js').HistorySourceCut | undefined
   ): Promise<boolean> {
     if (!captured || !this.options.context) return false;
-    const current = await this.options.context.history.capture();
-    if (current.branchId === captured.branchId && current.sourceRevision === captured.sourceRevision &&
-        current.throughEntryId === captured.throughEntryId) return false;
+    const history = this.options.context.history;
+    const current = await history.capture();
+    if (hashJson(current) === hashJson(captured)) return false;
+    if (current.branchId === captured.branchId && await history.extendsCut(captured, current) &&
+        (await history.selectedContext(current))?.windowId === (await history.selectedContext(captured))?.windowId) {
+      let cursor: string | undefined;
+      let applied = true;
+      do {
+        const page = await history.metadataPage({ cut: current, after: captured, cursor, limit: 1000 });
+        for (const item of page.items) {
+          if (item.source.event?.runId !== runId ||
+              !window.hasAppliedSource(item.source.event)) {
+            applied = false;
+            break;
+          }
+        }
+        if (!applied) break;
+        cursor = page.cursor;
+      } while (cursor);
+      if (applied) {
+        // Never acknowledge an arbitrary fresh capture: every intervening source
+        // must have an exact committed identity already delivered to the window.
+        this.activeHistoryCut = current;
+        return false;
+      }
+    }
     await this.activateCommittedContext(window, runId, true);
     return true;
   }

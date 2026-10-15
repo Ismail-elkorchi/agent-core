@@ -349,37 +349,14 @@ export class HistoryReader {
     cut: HistorySourceCut
   ): Promise<readonly T[]> {
     const snapshot = await this.snapshot(cut);
-    const index = snapshot.index;
-    const heads = new Map(cut.ledgerHeads?.map((head) => [head.runId, head]));
+    const heads = new Map<string, HistoryLedgerHead>();
     const unique = new Map<
       string,
       { source: HistorySourceRef; value: T; position: number; sequence: number }
     >();
     for (const value of values) {
       const source = sourceOf(value);
-      if (source.sessionId !== cut.sessionId)
-        throw new Error('Selected source belongs to another session.');
-      let position: number | undefined;
-      let sequence = -1;
-      if (source.event && cut.ledgerCoverage === 'authoritative') {
-        const head =
-          heads.get(source.event.runId) ?? (await this.head(source.event.runId, cut, snapshot));
-        heads.set(source.event.runId, head);
-        if (
-          source.entryId !== `event:${source.event.eventId}` ||
-          source.sha256 !== source.event.hash ||
-          source.event.sequence > head.sequence
-        )
-          throw new Error('Selected event is outside its authorized history boundary.');
-        position = (await index.inputs.get(source.event.runId));
-        sequence = source.event.sequence;
-      } else {
-        const metadata = (await index.bySource.get(source.entryId));
-        if (metadata && sameHistorySource(metadataSource(cut.sessionId, metadata), source))
-          position = (await index.positions.get(metadata.entryId));
-      }
-      if (position === undefined)
-        throw new Error('Selected source is outside the authorized branch.');
+      const { at: position, sequence } = await this.positionAt(source, cut, snapshot, heads);
       const previous = unique.get(source.entryId);
       if (previous && !sameHistorySource(previous.source, source))
         throw new Error('Selected source identities conflict.');
@@ -390,6 +367,62 @@ export class HistoryReader {
         .sort((a, b) => a.position - b.position || a.sequence - b.sequence)
         .map(({ value }) => value)
     );
+  }
+
+  /** Stable ordering facts for an immutable source at an authorized branch cut. */
+  async sourcePosition(source: HistorySourceRef, cut: HistorySourceCut): Promise<HistorySearchPosition> {
+    return this.positionAt(source, cut, await this.snapshot(cut));
+  }
+
+  private async positionAt(source: HistorySourceRef, cut: HistorySourceCut, snapshot: SessionSourceSnapshot, heads?: Map<string, HistoryLedgerHead>): Promise<HistorySearchPosition> {
+    if (source.sessionId !== cut.sessionId) throw new Error('Selected source belongs to another session.');
+    let at: number | undefined;
+    let sequence = -1;
+    if (source.event && cut.ledgerCoverage === 'authoritative') {
+      const head = heads?.get(source.event.runId) ?? await this.head(source.event.runId, cut, snapshot);
+      heads?.set(source.event.runId, head);
+      if (source.entryId !== `event:${source.event.eventId}` || source.sha256 !== source.event.hash || source.event.sequence > head.sequence)
+        throw new Error('Selected event is outside its authorized history boundary.');
+      at = await snapshot.index.inputs.get(source.event.runId);
+      sequence = source.event.sequence;
+    } else {
+      const metadata = await snapshot.index.bySource.get(source.entryId);
+      if (metadata && sameHistorySource(metadataSource(cut.sessionId, metadata), source))
+        at = await snapshot.index.positions.get(metadata.entryId);
+    }
+    if (at === undefined) throw new Error('Selected source is outside the authorized branch.');
+    return { at, sequence, entryId: source.entryId };
+  }
+
+  /** Appended session mirrors can enrich previously captured event routing facts. */
+  async *metadataUpdates(after: HistorySourceCut, cut: HistorySourceCut) {
+    if (!(await this.extendsCut(after, cut))) throw new Error('History metadata boundary is not an ancestor of its cut.');
+    if (!this.options.events || cut.ledgerCoverage !== 'authoritative') return;
+    const snapshot = await this.snapshot(cut);
+    const previous = await this.snapshot(after);
+    for (let at = previous.entries.length; at < snapshot.entries.length; at++) {
+      const mirror = await snapshot.entries.at(at);
+      if (!mirror?.runId || mirror.type === 'input' || !(await previous.index.runs.has(mirror.runId))) continue;
+      const source = metadataSource(cut.sessionId, mirror);
+      const through = await this.head(mirror.runId, after, previous);
+      if (source.event) {
+        if (source.event.sequence > through.sequence) continue;
+        const item = await this.metadata(source, cut);
+        if (item) yield item;
+      } else if (mirror.type === 'assistant' && mirror.context.exchangeId) {
+        // Session mirrors need not carry the ledger receipt, but the exchange index is causal.
+        const page = await this.options.events.readMetadataRange(mirror.runId, {
+          through, limit: MAX_SCANNED, maxBytes: MAX_SOURCE_BYTES,
+          metadata: { exchangeId: mirror.context.exchangeId.slice(mirror.runId.length + 1) },
+          types: ['assistant.ended', 'assistant.interrupted']
+        });
+        if (!page.complete) throw new Error('Assistant metadata updates exceed their access bound.');
+        for (const record of page.records) {
+          const item = await this.eventMetadata(record, snapshot);
+          if (item) yield item;
+        }
+      }
+    }
   }
 
   async resolve(
@@ -830,11 +863,20 @@ export class HistoryReader {
     const snapshot = await this.snapshot(cut);
     if (request.after && !(await this.extendsCut(request.after, cut))) throw new Error('History metadata boundary is not an ancestor of its cut.');
     const previous = request.after ? await this.snapshot(request.after) : undefined;
-    let at = cursor?.at ?? (request.filter?.runId ? (await snapshot.index.inputs.get(request.filter.runId)) ?? 0 : 0);
-    if (!cursor && request.after) {
-      at = request.after.throughEntryId === null ? 0 : ((await snapshot.index.positions.get(request.after.throughEntryId)) ?? -1) + 1;
-      for (const head of request.after.ledgerHeads ?? []) at = Math.min(at, (await snapshot.index.inputs.get(head.runId)) ?? at);
+    const appendedAt = previous?.entries.length ?? 0;
+    const changedInputs: number[] = [];
+    if (request.after) {
+      for (const head of request.after.ledgerHeads ?? []) {
+        if (request.filter?.runId && request.filter.runId !== head.runId) continue;
+        if ((await this.head(head.runId, cut, snapshot)).sequence <= head.sequence) continue;
+        const input = await snapshot.index.inputs.get(head.runId);
+        if (input !== undefined && input < appendedAt) changedInputs.push(input);
+      }
+      changedInputs.sort((a, b) => a - b);
     }
+    let at = cursor?.at ?? (request.after ? changedInputs[0] ?? appendedAt
+      : request.filter?.runId ? (await snapshot.index.inputs.get(request.filter.runId)) ?? 0 : 0);
+    let changedIndex = 0;
     const end = request.filter?.runId ? ((await snapshot.index.runs.lastPosition(request.filter.runId)) ?? -1) + 1 : snapshot.entries.length;
     if (at > snapshot.entries.length) throw new Error('History metadata cursor is beyond its boundary.');
     let sequence = cursor?.sequence;
@@ -846,6 +888,12 @@ export class HistoryReader {
       items.push(item); bytes += size; return true;
     };
     while (at < end && scanned < limit) {
+      // Earlier runs need only their ledger delta; their old session mirrors are unchanged.
+      if (request.after && at < appendedAt) {
+        while (changedIndex < changedInputs.length && (changedInputs[changedIndex] ?? appendedAt) < at) changedIndex++;
+        at = changedInputs[changedIndex] ?? appendedAt;
+        if (at >= end) break;
+      }
       const metadata = (await snapshot.entries.at(at));
       if (!metadata) break;
       const runId = metadata.runId;

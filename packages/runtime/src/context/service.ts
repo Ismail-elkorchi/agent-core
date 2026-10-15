@@ -1,7 +1,7 @@
 import { contextToolDefinitions } from './tools.js';
 import { stagedSessionState } from './session-state.js';
 import type { PromptContextItemInput } from '../inference/prompt-material.js';
-import { contextSourceManifest, readSelectedHistoryMetadata, type ContextInspectionPage } from './inspection.js';
+import { contextSourceManifest, SelectedHistoryMetadata, type ContextInspectionPage } from './inspection.js';
 import {
   SELECTED_SOURCE_LIMITS,
   assertPortableHistoryCompatibility
@@ -70,21 +70,10 @@ export interface ContextServiceOptions {
 
 export class ContextService {
   readonly history: HistoryReader;
-  private selectedMetadataCache: {
-    readonly identity: string;
-    readonly view: ReturnType<typeof readSelectedHistoryMetadata>;
-  } | undefined;
+  private readonly selectedMetadataCache: SelectedHistoryMetadata;
 
-  /** Cache only immutable source facts at one exact authorized cut, never policy decisions. */
   private selectedMetadata(cut: HistorySourceCut) {
-    const identity = hashJson(cut);
-    if (this.selectedMetadataCache?.identity === identity) return this.selectedMetadataCache.view;
-    const view = readSelectedHistoryMetadata(this.history, cut);
-    this.selectedMetadataCache = { identity, view };
-    void view.catch(() => {
-      if (this.selectedMetadataCache?.view === view) this.selectedMetadataCache = undefined;
-    });
-    return view;
+    return this.selectedMetadataCache.read(cut);
   }
   constructor(private readonly options: ContextServiceOptions) {
     this.history =
@@ -94,6 +83,7 @@ export class ContextService {
         session: options.session,
         artifacts: options.artifacts
       });
+    this.selectedMetadataCache = new SelectedHistoryMetadata(this.history);
     if (!Number.isSafeInteger(options.policy.maxSourceBytes) || options.policy.maxSourceBytes < 1)
       throw new Error('Context source selection maxSourceBytes must be positive.');
   }

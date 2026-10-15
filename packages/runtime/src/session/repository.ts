@@ -79,6 +79,7 @@ import {
   initialSessionModelSelection,
   assertSessionIdle,
   assertSessionModelSettings,
+  assertSessionAdmissionConfiguration,
   createSessionSubmissionTransition,
   originalAcceptedInput,
   pendingSessionSubmissions
@@ -505,10 +506,10 @@ export class InMemorySessionRepository implements SessionRepository {
       return entry;
     });
   }
-  appendModelSettings(session: SessionDescriptor, settings: ModelSelection, recording?: { readonly runId: string }): Promise<SessionModelSettingsEntry> {
+  appendModelSettings(session: SessionDescriptor, settings: ModelSelection): Promise<SessionModelSettingsEntry> {
     return this.serial(() => {
       const state = this.requireDescriptor(session);
-      assertSessionModelSettings(pendingSessionSubmissions(state.submissionRecords), settings, recording);
+      assertSessionModelSettings(pendingSessionSubmissions(state.submissionRecords));
       const branch = activeBranch(state.branchEntries, branchLeaf(state.branchEntries));
       let previous: SessionModelSettingsEntry | undefined;
       for (let index = branch.length - 1; index >= 0; index--) {
@@ -652,15 +653,8 @@ export class InMemorySessionRepository implements SessionRepository {
       const state = this.requireDescriptor(session);
       const selection = recordedModelSelection(activeBranch(state.branchEntries, branchLeaf(state.branchEntries)))
         ?? initialSessionModelSelection(state.submissionRecords);
-      const record = createSessionAdmission(state.submissionRecords, {
-        ...input,
-        configuration: selection ? {
-          provider: selection.provider, model: selection.model,
-          ...(selection.reasoning === undefined ? {} : { reasoning: selection.reasoning }),
-          ...(selection.temperature === undefined ? {} : { temperature: selection.temperature }),
-          ...(input.configuration.responseFormat === undefined ? {} : { responseFormat: input.configuration.responseFormat })
-        } : input.configuration
-      });
+      assertSessionAdmissionConfiguration(input.configuration, selection);
+      const record = createSessionAdmission(state.submissionRecords, input);
       state.submissionRecords.push(record);
       const admitted = sessionSubmission(state.submissionRecords, record.submissionId);
       if (!admitted || (admitted.state !== 'claimed' && admitted.state !== 'queued'))

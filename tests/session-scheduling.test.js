@@ -3,7 +3,7 @@ import test from 'node:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { AgentSession, AgentRunCoordinator, agentEventCodec, InMemorySessionRepository, SessionSubmissionOwnershipError } from '@agent-core/runtime';
+import { AgentSession, AgentRunCoordinator, agentEventCodec, InMemorySessionRepository, SessionSubmissionOwnershipError, SessionConfigurationChangedError } from '@agent-core/runtime';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 
@@ -84,7 +84,7 @@ for (const kind of ['memory', 'jsonl']) {
     assert.equal((await f.repository.admitSubmission(f.session, f.input('valid', { claimId: 'claim' }))).state, 'claimed');
   });
 
-  test(`${kind}: accepted configuration is reflected synchronously without replacing client response defaults`, async t => {
+  test(`${kind}: configuration races reject before admission and refresh without replacing client response defaults`, async t => {
     const f = await fixture(t);
     await f.repository.admitSubmission(f.session, f.input('initial', { claimId: 'initial' }));
     await f.repository.transitionSubmission(f.session, 'initial', { state: 'completed', claimId: 'initial' });
@@ -97,7 +97,10 @@ for (const kind of ['memory', 'jsonl']) {
       await f.repository.appendModelSettings(f.session, { provider: 'committed', model: 'selected' });
       return admit(descriptor, input);
     };
-    const accepted = await session.submit({ task: 'Use the durable model' });
+    await assert.rejects(session.submit({ task: 'Do not silently substitute the changed model' }), SessionConfigurationChangedError);
+    assert.deepEqual(await f.repository.loadPendingSubmissions(f.session), []);
+    f.other.admitSubmission = admit;
+    const accepted = await session.submit({ task: 'Use the refreshed durable model' });
     assert.equal(session.state().configuration.provider, 'committed');
     assert.equal(session.state().configuration.model, 'selected');
     assert.deepEqual(session.state().configuration.responseFormat, 'json');
@@ -137,30 +140,27 @@ for (const kind of ['memory', 'jsonl']) {
     assert.equal((await f.repository.claimNextSubmission(f.session, 'next')).submissionId, 'queued');
   });
 
-  test(`${kind}: only the occupying admitted run may record its unchanged model`, async t => {
+  test(`${kind}: model selection cannot be overwritten by an occupying execution`, async t => {
     const f = await fixture(t);
     await f.repository.admitSubmission(f.session, f.input('active', { claimId: 'claim' }));
     await assert.rejects(f.other.appendModelSettings(f.session, configuration), /idle/);
-    await assert.rejects(f.other.appendModelSettings(f.session, configuration, { runId: 'different-run' }), /idle/);
-    await assert.rejects(f.other.appendModelSettings(f.session, { ...configuration, model: 'changed' }, { runId: 'run-active' }), /admitted configuration/);
-    const first = await f.other.appendModelSettings(f.session, configuration, { runId: 'run-active' });
-    const retried = await f.repository.appendModelSettings(f.session, configuration, { runId: 'run-active' });
-    assert.equal(retried.id, first.id);
-    assert.equal((await f.repository.currentModelSettings(f.session)).model, configuration.model);
+    await assert.rejects(f.other.appendModelSettings(f.session, { ...configuration, endpoint: 'https://different.invalid' }), /idle/);
+    assert.deepEqual(await f.repository.currentModelSettings(f.session), configuration);
   });
 
   test(`${kind}: first admission fixes the initial model before runtime construction and explicit selection overrides it`, async t => {
     const f = await fixture(t);
     await f.repository.admitSubmission(f.session, f.input('first', { claimId: 'first', configuration: { provider: 'fixture', model: 'initial' } }));
     assert.equal((await f.other.currentModelSettings(f.session)).model, 'initial');
-    const queued = await f.other.admitSubmission(f.session, f.input('second', { configuration: { provider: 'fixture', model: 'stale', responseFormat: 'json' } }));
+    await assert.rejects(f.other.admitSubmission(f.session, f.input('stale', { configuration: { provider: 'fixture', model: 'stale' } })), SessionConfigurationChangedError);
+    const queued = await f.other.admitSubmission(f.session, f.input('second', { configuration: { provider: 'fixture', model: 'initial', responseFormat: 'json' } }));
     assert.equal(queued.configuration.model, 'initial');
     assert.equal(queued.configuration.responseFormat, 'json');
     await f.repository.transitionSubmission(f.session, 'first', { state: 'completed', claimId: 'first' });
     await f.other.claimNextSubmission(f.session, 'second');
     await f.other.transitionSubmission(f.session, 'second', { state: 'completed', claimId: 'second' });
     await f.repository.appendModelSettings(f.session, { provider: 'fixture', model: 'explicit-new-model' });
-    const next = await f.other.admitSubmission(f.session, f.input('third', { claimId: 'third' }));
+    const next = await f.other.admitSubmission(f.session, f.input('third', { claimId: 'third', configuration: { provider: 'fixture', model: 'explicit-new-model' } }));
     assert.equal(next.configuration.model, 'explicit-new-model');
   });
 
@@ -168,11 +168,62 @@ for (const kind of ['memory', 'jsonl']) {
     const f = await fixture(t);
     await f.repository.appendModelSettings(f.session, { provider: 'new-provider', model: 'new-model' });
     const item = { id: 'source', sourceUri: 'test:source', sourceKind: 'user', representation: 'full', mediaType: 'text/plain', title: 'Source', content: 'Original', purpose: 'task' };
-    await assert.rejects(f.repository.admitSubmission(f.session, f.input('bad', { input: { task: 'bad', contextItems: [item, { ...item, content: 'Changed' }] } })), /conflicting duplicate/);
+    await assert.rejects(f.repository.admitSubmission(f.session, f.input('bad', { configuration: { provider: 'new-provider', model: 'new-model' }, input: { task: 'bad', contextItems: [item, { ...item, content: 'Changed' }] } })), /conflicting duplicate/);
     assert.deepEqual(await f.repository.loadPendingSubmissions(f.session), []);
-    const accepted = await f.repository.admitSubmission(f.session, f.input('good', { input: { task: 'good', contextItems: [item, { ...item }] } }));
+    const accepted = await f.repository.admitSubmission(f.session, f.input('good', { configuration: { provider: 'new-provider', model: 'new-model' }, input: { task: 'good', contextItems: [item, { ...item }] } }));
     assert.equal(accepted.configuration.model, 'new-model');
     assert.equal(accepted.input.contextItems.length, 1);
+  });
+  test(`${kind}: full endpoint binding survives admission, persistence and runtime callbacks`, async t => {
+    const f = await fixture(t);
+    const selected = { ...configuration, endpoint: 'http://localhost:1234', temperature: 0.25, reasoning: { strategy: 'disabled' } };
+    const seen = [];
+    const session = new AgentSession({ descriptor: f.session, repository: f.other, expectedBinding: binding,
+      configuration: selected,
+      runs: new AgentRunCoordinator(new InMemoryEventRepository(agentEventCodec), new InMemoryArtifactRepository()),
+      prepareConfiguration(binding, input) { assert.equal(input.task, 'Bind endpoint before accepting input'); seen.push(binding); },
+      createRuntime(binding) {
+        assert.deepEqual(binding, selected);
+        return { run(input) { return { runId: input.runId, result: Promise.resolve({ state: 'ended', terminal: { runId: input.runId }, deliveryDiagnostics: [] }), abort() {} }; } };
+      }
+    });
+    const accepted = await session.submit({ task: 'Bind endpoint before accepting input' });
+    await accepted.completion;
+    assert.deepEqual((await f.repository.readSubmission(f.session, accepted.submissionId)).configuration, selected);
+    assert.deepEqual(await f.repository.currentModelSettings(f.session), selected);
+    assert.deepEqual(seen, [selected, selected]);
+    await session.close();
+  });
+
+  for (const changed of [
+    { provider: 'other-provider' }, { model: 'other-model' }, { endpoint: 'http://localhost:5678' },
+    { temperature: 0.5 }, { reasoning: { strategy: 'disabled' } }
+  ]) test(`${kind}: configuration binding race rejects ${Object.keys(changed)[0]} before acceptance`, async t => {
+    const f = await fixture(t);
+    const selected = { ...configuration, endpoint: 'http://localhost:1234' };
+    await f.repository.appendModelSettings(f.session, selected);
+    let race = true;
+    let dispatches = 0;
+    const session = new AgentSession({ descriptor: f.session, repository: f.other, expectedBinding: binding,
+      configuration: selected, scheduling: 'manual',
+      runs: new AgentRunCoordinator(new InMemoryEventRepository(agentEventCodec), new InMemoryArtifactRepository()),
+      async prepareConfiguration(binding) {
+        if (race) {
+          assert.deepEqual(binding, selected);
+          race = false;
+          await f.repository.appendModelSettings(f.session, { ...selected, ...changed });
+        }
+      },
+      createRuntime() { dispatches++; assert.fail('Manual admission must not dispatch'); }
+    });
+    await assert.rejects(session.submit({ task: 'Configuration changes during preparation' }), SessionConfigurationChangedError);
+    assert.deepEqual(await f.repository.loadPendingSubmissions(f.session), []);
+    assert.equal(dispatches, 0);
+    const accepted = await session.submit({ task: 'Refresh and retry' });
+    assert.deepEqual((await f.repository.readSubmission(f.session, accepted.submissionId)).configuration, { ...selected, ...changed });
+    const rejection = assert.rejects(accepted.completion, /remains recorded/);
+    await session.close();
+    await rejection;
   });
 }
 

@@ -269,6 +269,7 @@ export interface SessionSubmissionInput {
 }
 
 export interface SessionSubmissionConfiguration {
+  readonly endpoint?: string;
   readonly provider: string;
   readonly model: string;
   readonly temperature?: number;
@@ -543,8 +544,7 @@ export interface SessionRepository {
   ): Promise<SessionObservationEntry>;
   appendModelSettings(
     session: SessionDescriptor,
-    settings: ModelSelection,
-    recording?: { readonly runId: string }
+    settings: ModelSelection
   ): Promise<SessionModelSettingsEntry>;
   commitContextTransition(
     session: SessionDescriptor,

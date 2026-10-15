@@ -1,12 +1,12 @@
-import type { ContextSourceManifest } from './contracts.js';
+import type { ContextWindowRecord, ContextSourceManifest } from './contracts.js';
 import { incompleteHistoryExchange } from '../history/source-metadata.js';
 import * as z from 'zod';
 import { ContextSourceCapacityError } from '../run/context-admission.js';
 import { ToolInputError } from '@agent-core/tools';
 import { hashJson } from '@agent-core/persistence';
-import type { HistorySourceCut, HistorySourceRef, HistorySourceMetadata } from '../history/contracts.js';
+import type { HistorySourceCut, HistorySourceRef, HistorySourceMetadata, HistorySearchPosition } from '../history/contracts.js';
 import { historyCutSchema } from '../history/schema.js';
-import { type HistoryReader } from '../history/reader.js';
+import { sameHistorySource, type HistoryReader } from '../history/reader.js';
 
 const MAX_MANIFEST_BYTES = 256 * 1024;
 export const contextInspectionSchema = z.strictObject({
@@ -120,24 +120,102 @@ export async function* selectedHistoryMetadata(history: HistoryReader, cut: Hist
   } while (cursor);
 }
 
-/** A bounded source-change plan. Explicit replacement does not need to build this plan. */
-export async function readSelectedHistoryMetadata(history: HistoryReader, cut: HistorySourceCut) {
-  const contextWindow = await history.selectedContext(cut);
-  const items = new Map<string, HistorySourceMetadata>();
-  let bytes = 0;
-  for await (const item of selectedHistoryMetadata(history, cut)) {
-    if (items.has(item.source.entryId)) continue;
-    bytes += Buffer.byteLength(JSON.stringify(item));
-    if (items.size >= 10000 || bytes > 4 * 1024 * 1024)
-      throw new ContextSourceCapacityError(cut, bytes > 4 * 1024 * 1024
-        ? { unit: 'bytes', limit: 4 * 1024 * 1024, observedAtLeast: bytes }
-        : { unit: 'records', limit: 10000, observedAtLeast: items.size + 1 });
-    items.set(item.source.entryId, item);
+interface SelectedMetadataView {
+  readonly cut: HistorySourceCut;
+  readonly contextWindow: ContextWindowRecord | undefined;
+  readonly items: readonly HistorySourceMetadata[];
+}
+interface PositionedMetadata {
+  readonly item: HistorySourceMetadata;
+  readonly position: HistorySearchPosition;
+  readonly bytes: number;
+}
+
+/** One bounded immutable view, extended from source deltas rather than replayed per cut. */
+export class SelectedHistoryMetadata {
+  private state: { readonly identity: string; readonly view: SelectedMetadataView;
+    readonly records: Map<string, PositionedMetadata>; readonly bytes: number } | undefined;
+  private pending: Promise<void> = Promise.resolve();
+
+  constructor(private readonly history: HistoryReader) {}
+
+  read(cut: HistorySourceCut): Promise<SelectedMetadataView> {
+    const result = this.pending.then(() => this.readCut(cut));
+    this.pending = result.then(() => undefined, () => undefined);
+    return result;
   }
-  const ordered = await history.orderSources([...items.values()].map(item => item.source), cut);
-  return { cut, contextWindow, items: ordered.map(source => {
-    const item = items.get(source.entryId);
-    if (!item) throw new Error('Selected metadata identity changed.');
-    return item;
-  }) };
+
+  private async readCut(cut: HistorySourceCut): Promise<SelectedMetadataView> {
+    const history = this.history;
+    // Even an exact-cut cache hit must still belong to the currently authorized branch.
+    await history.validateCut(cut);
+    const identity = hashJson(cut);
+    const previous = this.state;
+    if (previous?.identity === identity) return previous.view;
+    const contextWindow = await history.selectedContext(cut);
+    const ledgerStarted = previous?.view.cut.ledgerHeads?.some(head => head.sequence < 0 &&
+      (cut.ledgerHeads?.find(current => current.runId === head.runId)?.sequence ?? 0) >= 0);
+    const extend = !ledgerStarted && previous?.view.cut.branchId === cut.branchId &&
+      previous.view.contextWindow?.windowId === contextWindow?.windowId &&
+      await history.extendsCut(previous.view.cut, cut);
+    const records = extend ? previous.records : new Map<string, PositionedMetadata>();
+    const changes = new Map<string, PositionedMetadata>();
+    let count = records.size;
+    let bytes = extend ? previous.bytes : 0;
+    const add = async (item: HistorySourceMetadata) => {
+      const old = changes.get(item.source.entryId) ?? records.get(item.source.entryId);
+      if (old && !sameHistorySource(old.item.source, item.source)) throw new Error('Selected source identities conflict.');
+      const size = Buffer.byteLength(JSON.stringify(item));
+      bytes += size - (old?.bytes ?? 0);
+      if ((!old && count >= 10000) || bytes > 4 * 1024 * 1024)
+        throw new ContextSourceCapacityError(cut, bytes > 4 * 1024 * 1024
+          ? { unit: 'bytes', limit: 4 * 1024 * 1024, observedAtLeast: bytes }
+          : { unit: 'records', limit: 10000, observedAtLeast: count + 1 });
+      const position = old?.position ?? await history.sourcePosition(item.source, cut);
+      changes.set(item.source.entryId, { item, position, bytes: size });
+      if (!old) count++;
+    };
+    if (extend) {
+      let cursor: string | undefined;
+      do {
+        const page = await history.metadataPage({ cut, after: previous.view.cut, cursor, limit: 1000 });
+        for (const item of page.items) await add(item);
+        cursor = page.cursor;
+      } while (cursor);
+      for await (const item of history.metadataUpdates(previous.view.cut, cut)) {
+        // A newly committed mirror must not reintroduce a source released by the selection.
+        if (records.has(item.source.entryId) || changes.has(item.source.entryId)) await add(item);
+      }
+    } else {
+      for await (const item of selectedHistoryMetadata(history, cut)) await add(item);
+    }
+    const orderedChanges = [...changes.values()]
+      .sort((a, b) => a.position.at - b.position.at || a.position.sequence - b.position.sequence);
+    const items: HistorySourceMetadata[] = [];
+    let next = 0;
+    // Materialize the immutable return value once; only changed facts need sorting or indexing.
+    for (const item of extend ? previous.view.items : []) {
+      if (changes.has(item.source.entryId)) continue;
+      const position = records.get(item.source.entryId)?.position;
+      if (!position) throw new Error('Selected metadata lost its ordering position.');
+      while (next < orderedChanges.length) {
+        const changed = orderedChanges[next];
+        if (!changed || changed.position.at > position.at ||
+            (changed.position.at === position.at && changed.position.sequence > position.sequence)) break;
+        items.push(changed.item);
+        next++;
+      }
+      items.push(item);
+    }
+    for (; next < orderedChanges.length; next++) {
+      const changed = orderedChanges[next];
+      if (changed) items.push(changed.item);
+    }
+    // Commit only after every bounded read and validation succeeds. No predecessor views are retained.
+    for (const [id, changed] of changes) records.set(id, changed);
+    Object.freeze(items);
+    const view = Object.freeze({ cut, contextWindow, items });
+    this.state = { identity, view, records, bytes };
+    return view;
+  }
 }

@@ -8,12 +8,11 @@ export class NativeContextIncompatibilityError extends Error {
   }
 }
 
-/** Carried source representations do not reselect an earlier target model. */
+/** Only explicit model settings select a connection; continuation snapshots record execution. */
 export function recordedModelSelection(
   entries: readonly import('../session/contracts.js').SessionBranchEntry[]
 ): ModelSelection | undefined {
   let selection: ModelSelection | undefined;
-  const resets = new Set<string>();
   for (const entry of entries) {
     if (entry.type === 'model_settings')
       selection = {
@@ -23,11 +22,6 @@ export function recordedModelSelection(
         ...(entry.reasoning === undefined ? {} : { reasoning: entry.reasoning }),
         ...(entry.temperature === undefined ? {} : { temperature: entry.temperature })
       };
-    if (entry.type !== 'context_transition') continue;
-    const continuity = entry.window.selection.continuity;
-    if (!continuity || resets.has(continuity.resetId)) continue;
-    resets.add(continuity.resetId);
-    selection = continuity.model;
   }
   return selection;
 }

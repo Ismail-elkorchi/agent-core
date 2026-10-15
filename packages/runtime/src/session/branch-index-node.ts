@@ -33,7 +33,7 @@ const locatorSchema = z.strictObject({offset: integer, bytes: z.number().int().p
 type Locator = z.infer<typeof locatorSchema>;
 const stampSchema = z.strictObject({size: integer, mtimeMs: z.number(), ctimeMs: z.number()});
 const rootSchema = z.strictObject({
-  format: z.literal('agent-core.session-projection/7'), generation: id, lineage: z.uuid(), header: z.unknown(),
+  format: z.literal('agent-core.session-projection/8'), generation: id, lineage: z.uuid(), header: z.unknown(),
   summary: z.strictObject({id, timestamp: id, updatedAt: id, preview: z.string().max(160).optional(), provider: id.optional(), model: id.optional(), bindingSchemaId: id, bindingSchemaVersion: z.number().int().positive(), bindingSha256: hash}),
   tree: hash.nullable(), confirmedRunsRoot: hash.nullable(), leafId: id.nullable(), sourceRevision: integer, indexedRecords: integer,
   headerBytes: z.number().int().positive().max(16 * 1024 * 1024), completeBytes: integer, lineCount: integer, marker: z.string(), stamp: stampSchema,
@@ -356,7 +356,7 @@ export class JsonlBranchIndex {
       const position = this.positionValue(await this.main(root).get(root.tree, `entry:${root.leafId}`));
       if (position.modelSourceId === null) return undefined;
       const entry = await this.branchRecord(await this.locate(root, `entry:${position.modelSourceId}`), position.modelSourceId, root);
-      if (entry.type !== 'model_settings' && entry.type !== 'context_transition') throw new Error('Invalid model-settings projection.');
+      if (entry.type !== 'model_settings') throw new Error('Invalid model-settings projection.');
       return entry;
     });
   }
@@ -575,7 +575,7 @@ export class JsonlBranchIndex {
     await this.store.repairStorage();
     const stamp = await jsonlStorageStamp(this.filePath);
     const lineage = randomUUID();
-    const root: Root = {format: 'agent-core.session-projection/7', generation: randomUUID(), lineage, header, summary: {
+    const root: Root = {format: 'agent-core.session-projection/8', generation: randomUUID(), lineage, header, summary: {
       id: header.id, timestamp: header.timestamp, updatedAt: header.timestamp,
       ...(header.provider ? {provider: header.provider} : {}), ...(header.model ? {model: header.model} : {}),
       bindingSchemaId: header.binding.schemaId, bindingSchemaVersion: header.binding.schemaVersion, bindingSha256: header.binding.bindingSha256
@@ -655,7 +655,7 @@ export class JsonlBranchIndex {
       if (record.type === 'submission.admitted') {
         if (await this.main(root).get(root.tree, 'initial-model') === undefined) {
           const config = record.configuration;
-          set('initial-model', parseModelSelection({provider: config.provider, model: config.model, ...(config.temperature === undefined ? {} : {temperature: config.temperature}), ...(config.reasoning === undefined ? {} : {reasoning: config.reasoning})}));
+          set('initial-model', parseModelSelection({provider: config.provider, model: config.model, ...(config.endpoint === undefined ? {} : {endpoint: config.endpoint}), ...(config.temperature === undefined ? {} : {temperature: config.temperature}), ...(config.reasoning === undefined ? {} : {reasoning: config.reasoning})}));
         }
         if (raw !== undefined || await this.main(root).get(root.tree, `submission-run:${record.runId}`) !== undefined) throw new Error('Duplicate submission identity.');
         current = {submissionId: record.submissionId, runId: record.runId, state: record.claimId ? 'claimed' : 'queued',
@@ -763,14 +763,10 @@ export class JsonlBranchIndex {
     ];
     if ('runId' in record) lookupChanges.push([`run:${record.runId}`, {entryId: record.id}]);
     if (record.type === 'input') lookupChanges.push([`input:${record.runId}`, {entryId: record.id}]);
-    let modelSourceId = record.type === 'model_settings' ? record.id : parent?.modelSourceId ?? null;
+    const modelSourceId = record.type === 'model_settings' ? record.id : parent?.modelSourceId ?? null;
     if (record.type === 'context_transition') {
       if (await this.tree.get(parent?.lookupRoot ?? null, `context:${record.transition.idempotencyKey}`) !== undefined) throw new Error('Duplicate context transition idempotency key.');
       lookupChanges.push([`context:${record.transition.idempotencyKey}`, {entryId: record.id}]);
-      const continuity = record.window.selection.continuity;
-      if (continuity && await this.tree.get(parent?.lookupRoot ?? null, `reset:${continuity.resetId}`) === undefined) {
-        modelSourceId = record.id; lookupChanges.push([`reset:${continuity.resetId}`, {entryId: record.id}]);
-      }
     }
     if (metadata.context.exchangeId) {
       const key = `exchange-count:${metadata.context.exchangeId}`;

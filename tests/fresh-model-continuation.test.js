@@ -296,6 +296,16 @@ test('compatible normal changes retain context and persist their selected target
   await f.agent.close();
 });
 
+test('fresh continuation snapshots never replace an explicitly selected connection', async () => {
+  const { recordedModelSelection } = await import('@agent-core/runtime');
+  const selected = { provider: 'portable', model: 'model', endpoint: 'https://selected.invalid/base', temperature: 0.25 };
+  const executionSnapshot = { type: 'context_transition', window: { selection: { continuity: {
+    kind: 'fresh', resetId: 'first-seen-reset', model: { provider: 'other', model: 'historical-model' }, sources: []
+  } } } };
+  assert.deepEqual(recordedModelSelection([{ type: 'model_settings', ...selected }, executionSnapshot]), selected);
+  assert.equal(recordedModelSelection([executionSnapshot]), undefined);
+});
+
 test('carried portable sources do not overwrite a later compatible model choice on restart', async () => {
   const f = await fixture();
   await nativeAnswer(f);

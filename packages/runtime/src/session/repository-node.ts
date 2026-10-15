@@ -84,7 +84,7 @@ import { captureObservationInput } from './observation.js';
 import { ownSessionSteeringInput, sameSessionSteering } from './steering-input.js';
 import {
   createQueuedSubmissionUpdate,
-  assertSessionModelSettings,
+  assertSessionAdmissionConfiguration,
   sessionSubmission,
   createSessionSubmissionTransition,
   ownSessionSubmissionInput,
@@ -584,19 +584,11 @@ export class JsonlSessionRepository implements SessionRepository {
     );
   }
 
-  appendModelSettings(session: SessionDescriptor, settings: ModelSelection, recording?: {readonly runId: string}): Promise<SessionModelSettingsEntry> {
+  appendModelSettings(session: SessionDescriptor, settings: ModelSelection): Promise<SessionModelSettingsEntry> {
     return this.enqueue(session.id, () => this.withSessionLock(session.id, async () => {
         const state = await this.branchIndex(session.id).descriptor(session.header.binding);
         assertDescriptor(session, state);
-        const pending = await this.branchIndex(session.id).pending(session);
-        if (pending.length === 0) assertSessionModelSettings([], settings, recording);
-        else {
-          const occupying = pending.find(item => item.state !== 'queued');
-          if (!occupying) throw new Error('Session mutation requires an idle session with no pending submissions.');
-          assertSessionModelSettings(pendingSessionSubmissions(await this.branchIndex(session.id).submissionRecords(session, occupying.submissionId)), settings, recording);
-        }
-        const current = await this.branchIndex(session.id).currentModelSettings(session);
-        if (recording && current?.type === 'model_settings' && hashJson(recordedModelSelection([current])) === hashJson(parseModelSelection(settings))) return current;
+        await this.branchIndex(session.id).assertIdle(session);
         const entry: SessionModelSettingsEntry = Object.freeze({ ...baseEntry(state.leafId), type: 'model_settings', ...parseModelSelection(settings) });
         await this.appendRecord(session.id, state, entry);
         return entry;
@@ -733,15 +725,8 @@ export class JsonlSessionRepository implements SessionRepository {
         const state = await this.branchIndex(session.id).descriptor(session.header.binding);
         assertDescriptor(session, state);
         const selection = await this.currentModelSettings(session);
-      const record = await this.branchIndex(session.id).admission(session, {
-        ...input,
-        configuration: selection ? {
-          provider: selection.provider, model: selection.model,
-          ...(selection.reasoning === undefined ? {} : { reasoning: selection.reasoning }),
-          ...(selection.temperature === undefined ? {} : { temperature: selection.temperature }),
-          ...(input.configuration.responseFormat === undefined ? {} : { responseFormat: input.configuration.responseFormat })
-        } : input.configuration
-      });
+      assertSessionAdmissionConfiguration(input.configuration, selection);
+      const record = await this.branchIndex(session.id).admission(session, input);
         await this.appendRecord(session.id, state, record);
         const admitted = pendingSessionSubmissions([record])[0];
         if (!admitted) throw new Error('Committed admission is absent from the session projection.');
@@ -1406,6 +1391,7 @@ function parseSubmissionConfiguration(value: JsonObject): SessionSubmissionConfi
     value.provider.length === 0 ||
     typeof value.model !== 'string' ||
     value.model.length === 0 ||
+    (value.endpoint !== undefined && (typeof value.endpoint !== 'string' || !value.endpoint.trim())) ||
     (value.temperature !== undefined &&
       (typeof value.temperature !== 'number' || !Number.isFinite(value.temperature)))
   )
@@ -1413,6 +1399,7 @@ function parseSubmissionConfiguration(value: JsonObject): SessionSubmissionConfi
   return Object.freeze({
     provider: value.provider,
     model: value.model,
+    ...(value.endpoint === undefined ? {} : { endpoint: value.endpoint }),
     ...(value.temperature === undefined ? {} : { temperature: value.temperature }),
     ...(value.reasoning === undefined
       ? {}
@@ -1537,6 +1524,7 @@ function encodeSubmissionConfiguration(configuration: SessionSubmissionConfigura
   return Object.freeze({
     provider: configuration.provider,
     model: configuration.model,
+    ...(configuration.endpoint === undefined ? {} : { endpoint: configuration.endpoint }),
     ...(configuration.temperature === undefined ? {} : { temperature: configuration.temperature }),
     ...(configuration.reasoning === undefined
       ? {}

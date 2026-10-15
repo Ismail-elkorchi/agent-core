@@ -967,7 +967,10 @@ async function recordObservation(
         toolName: call.name, message: error instanceof Error ? error.message : String(error) },
       toolEventKey(input.runId, identity, 'recording-failed'));
     }
+    const source = await input.events.referenceByKey(input.runId, toolEventKey(input.runId, identity, 'ended'), { metadataOnly: true });
+    if (!source) throw new Error('A published observation requires its authoritative tool outcome.');
     input.modelWindow.recordToolResult({
+      source,
       observationId: record.id,
       turnIndex: phase.identity.turnIndex,
       toolName: record.toolName,

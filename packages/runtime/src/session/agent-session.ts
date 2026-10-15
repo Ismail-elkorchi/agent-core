@@ -109,6 +109,8 @@ export interface AgentSessionOptions {
   readonly repository: SessionRepository;
   readonly runs: AgentRunCoordinator;
   readonly configuration: AgentSessionConfiguration;
+  /** Prepare this client to execute the complete binding before durable admission. */
+  readonly prepareConfiguration?: (configuration: AgentSessionConfiguration, input: SessionSubmissionInput) => void | Promise<void>;
   readonly createRuntime: (
     configuration: AgentSessionConfiguration,
     onProgress: (event: AgentProgressEvent) => void | Promise<void>,
@@ -268,6 +270,7 @@ export class AgentSession {
           reason: 'session_suspended',
           suspension: this.suspended.descriptor
         };
+      await this.options.prepareConfiguration?.(this.configuration, submissionInput(input));
       const immediate = this.options.scheduling !== 'manual' && !this.active
         ? await this.acquireExecution() : false;
       const claimId = randomUUID();
@@ -338,6 +341,7 @@ export class AgentSession {
       this.configuration = ownConfiguration({
         provider: selection.provider,
         model: selection.model,
+        ...(selection.endpoint === undefined ? {} : { endpoint: selection.endpoint }),
         ...(selection.reasoning === undefined ? {} : { reasoning: selection.reasoning }),
         ...(selection.temperature === undefined ? {} : { temperature: selection.temperature }),
         ...(this.configuration.responseFormat === undefined
@@ -628,6 +632,7 @@ export class AgentSession {
     const selection = await this.options.repository.currentModelSettings(this.options.descriptor);
     if (selection) this.configuration = ownConfiguration({
       provider: selection.provider, model: selection.model,
+      ...(selection.endpoint === undefined ? {} : { endpoint: selection.endpoint }),
       ...(selection.reasoning === undefined ? {} : { reasoning: selection.reasoning }),
       ...(selection.temperature === undefined ? {} : { temperature: selection.temperature }),
       ...(this.configuration.responseFormat === undefined ? {} : { responseFormat: this.configuration.responseFormat })
@@ -801,7 +806,7 @@ export class AgentSession {
     configuration: AgentSessionConfiguration,
     resuming: boolean
   ): Promise<AgentRuntime> {
-    return Promise.resolve(
+    return Promise.resolve(this.options.prepareConfiguration?.(configuration, submissionInput(input))).then(() =>
       this.options.createRuntime(
         configuration,
         (event) => {
@@ -1217,7 +1222,9 @@ function runSuspensionDescriptor(
       category: 'context_admission',
       reason: phase.reason,
       contextAdmission: phase.conflict,
-      actions: suspensionActions('context', 'abort')
+      actions: phase.conflict.kind === 'request_preparation'
+        ? suspensionActions('resume', 'context', 'abort')
+        : suspensionActions('context', 'abort')
     });
   if (phase.reason === 'missing_implementation')
     return Object.freeze({

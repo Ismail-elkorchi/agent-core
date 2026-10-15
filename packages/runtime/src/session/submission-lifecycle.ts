@@ -1,6 +1,6 @@
 import { decodeContextAdmissionConflict } from '../run/context-admission.js';
 import { parseJsonObject } from '@agent-core/json';
-import { type ModelReasoningRequest } from '@agent-core/model';
+import { parseModelSelection, type ModelSelection, type ModelReasoningRequest } from '@agent-core/model';
 import { hashJson } from '@agent-core/persistence';
 import * as z from 'zod';
 import { sourceSchema } from '../history/schema.js';
@@ -88,11 +88,14 @@ export function ownSessionSubmissionConfiguration(
   ) {
     throw new Error('Session provider and model must be non-empty strings.');
   }
+  if (configuration.endpoint !== undefined && (typeof configuration.endpoint !== 'string' || !configuration.endpoint.trim()))
+    throw new Error('Session endpoint must be a non-empty string.');
   if (configuration.temperature !== undefined && !Number.isFinite(configuration.temperature))
     throw new Error('Session temperature must be finite.');
   const owned: SessionSubmissionConfiguration = Object.freeze({
     provider: configuration.provider,
     model: configuration.model,
+    ...(configuration.endpoint === undefined ? {} : { endpoint: configuration.endpoint }),
     ...(configuration.temperature === undefined ? {} : { temperature: configuration.temperature }),
     ...(configuration.reasoning === undefined
       ? {}
@@ -375,13 +378,17 @@ export function ownSessionSuspensionDescriptor(value: unknown): SessionSuspensio
   const actions = object.actions.map(suspensionAction);
   if (new Set(actions).size !== actions.length)
     throw new TypeError('Session suspension actions are invalid.');
+  const contextAdmission =
+    object.contextAdmission === undefined
+      ? undefined
+      : decodeContextAdmissionConflict(object.contextAdmission);
   const expected: readonly SessionSuspensionAction[] =
     category === 'approval'
       ? ['approval', 'abort']
       : category === 'external_recovery'
         ? ['reconcile', 'abort']
         : category === 'context_admission'
-          ? ['context', 'abort']
+          ? contextAdmission?.kind === 'request_preparation' ? ['resume', 'context', 'abort'] : ['context', 'abort']
           : ['resume', 'abort'];
   if (
     actions.length !== expected.length ||
@@ -394,10 +401,6 @@ export function ownSessionSuspensionDescriptor(value: unknown): SessionSuspensio
     (category === 'context_admission') !== (reason === 'context_admission')
   )
     throw new TypeError('Session suspension category does not match its reason.');
-  const contextAdmission =
-    object.contextAdmission === undefined
-      ? undefined
-      : decodeContextAdmissionConflict(object.contextAdmission);
   if (
     (category === 'context_admission') !== (contextAdmission !== undefined) ||
     (category === 'context_admission' && effectId !== undefined)
@@ -563,20 +566,29 @@ export function sessionSubmission(records: readonly SessionSubmissionRecord[], s
   return foldSubmissions(records).get(submissionId);
 }
 
-/** Recording an admitted run cannot change the model choice that admission already fixed. */
-export function assertSessionModelSettings(
-  pending: readonly SessionPendingSubmission[],
-  settings: import('@agent-core/model').ModelSelection,
-  recording?: { readonly runId: string }
-): void {
-  if (pending.length === 0) return;
-  const active = pending.find((submission) => submission.state === 'claimed');
-  if (!recording || active?.runId !== recording.runId)
+/** Model selection is an idle-session mutation, never an execution observation. */
+export function assertSessionModelSettings(pending: readonly SessionPendingSubmission[]): void {
+  if (pending.length > 0)
     throw new Error('Session mutation requires an idle session with no pending submissions.');
-  const configuration = active.configuration;
-  if (configuration.provider !== settings.provider || configuration.model !== settings.model ||
-      configuration.temperature !== settings.temperature || hashJson(configuration.reasoning ?? null) !== hashJson(settings.reasoning ?? null))
-    throw new Error('A run model record must match its admitted configuration.');
+}
+
+export class SessionConfigurationChangedError extends Error {
+  constructor() {
+    super('Session model configuration changed before admission. Refresh the configuration and submit again.');
+    this.name = 'SessionConfigurationChangedError';
+  }
+}
+
+/** Compare the complete model binding under the repository admission lock. */
+export function assertSessionAdmissionConfiguration(
+  configuration: SessionSubmissionConfiguration,
+  selection: ModelSelection | undefined
+): void {
+  if (!selection) return;
+  const { responseFormat: ignored, ...binding } = ownSessionSubmissionConfiguration(configuration);
+  void ignored;
+  if (hashJson(parseModelSelection(binding)) !== hashJson(parseModelSelection(selection)))
+    throw new SessionConfigurationChangedError();
 }
 
 /** The first admission fixes the initial model until an explicit branch-local selection replaces it. */
@@ -589,6 +601,7 @@ export function initialSessionModelSelection(
   return Object.freeze({
     provider: configuration.provider,
     model: configuration.model,
+    ...(configuration.endpoint === undefined ? {} : { endpoint: configuration.endpoint }),
     ...(configuration.temperature === undefined ? {} : { temperature: configuration.temperature }),
     ...(configuration.reasoning === undefined ? {} : { reasoning: configuration.reasoning })
   });
