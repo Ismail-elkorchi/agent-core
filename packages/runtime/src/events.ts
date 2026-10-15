@@ -1458,7 +1458,7 @@ function decodeInferenceRequestFingerprint(
   exact(object, [
     ...TURN_KEYS,
     'compiledInputIdentity',
-    'workingStateRevisionId',
+    'sessionStateRevisionId',
     'capabilityRevision',
     'requestId',
     'parentRequestId',
@@ -1471,10 +1471,10 @@ function decodeInferenceRequestFingerprint(
     'modelWindowHash'
   ]);
   return Object.freeze({
-    workingStateRevisionId:
-      object.workingStateRevisionId === null
+    sessionStateRevisionId:
+      object.sessionStateRevisionId === null
         ? null
-        : requiredString(object.workingStateRevisionId, 'workingStateRevisionId'),
+        : requiredString(object.sessionStateRevisionId, 'sessionStateRevisionId'),
     ...decodeTurnIdentity(object),
     compiledInputIdentity: requiredString(
       object.compiledInputIdentity,
@@ -1730,7 +1730,7 @@ function decodePromptMaterial(value: JsonValue | undefined): PromptMaterial {
     'images',
     'instructions',
     'context',
-    'workingState',
+    'sessionState',
     'capacityNotice',
     'tools',
     'outputContract',
@@ -1752,9 +1752,9 @@ function decodePromptMaterial(value: JsonValue | undefined): PromptMaterial {
     ...(object.capacityNotice === undefined
       ? {}
       : { capacityNotice: decodePromptContextItem(object.capacityNotice, 'material.capacityNotice') }),
-    ...(object.workingState === undefined
+    ...(object.sessionState === undefined
       ? {}
-      : { workingState: decodePromptContextItem(object.workingState, 'material.workingState') }),
+      : { sessionState: decodePromptContextItem(object.sessionState, 'material.sessionState') }),
     tools: requiredArray(object.tools, 'material.tools').map((item, index) =>
       decodePromptTool(item, `material.tools[${String(index)}]`)
     ),

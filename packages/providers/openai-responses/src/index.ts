@@ -584,7 +584,6 @@ export {
   responsesInput,
   responsesOutput,
   responsesToolCall,
-  responsesPayloadPaths,
-  validatedResponsesReplayItems
+  responsesPayloadPaths
 } from './model-items.js';
 export { responsesTool } from './tools.js';

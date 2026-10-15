@@ -229,12 +229,12 @@ test('a checksummed but false derived boundary cannot authorize truncating commi
   assert.equal((await reader.sourceSnapshot(opened)).entries.length, 4);
 });
 
-function contextCommit(session, snapshot, key, retained) {
-  const selection = {strategy: 'sources', retained};
+function contextCommit(session, snapshot, key, retained, excerpts = []) {
+  const selection = {retained, ...(excerpts.length ? {excerpts} : {}), continuity: {kind: 'fresh', resetId: key, model: {provider: 'test', model: 'test'}, sources: retained}};
   const reason = 'Retain exactly the requested source';
   const timestamp = new Date().toISOString();
   return {
-    expectedWorkingStateRevisionId: null,
+    expectedSessionStateRevisionId: null,
     expectedLeafId: snapshot.boundary.leafId,
     expectedSourceRevision: snapshot.sourceRevision,
     expectedWindowId: null,
@@ -243,7 +243,7 @@ function contextCommit(session, snapshot, key, retained) {
         throughEntryId: snapshot.boundary.leafId, sourceRevision: snapshot.sourceRevision, ledgerCoverage: 'session'}},
     transition: {transitionId: key, idempotencyKey: key, previousWindowId: null, windowId: key,
       committedAt: timestamp, requestedSourceRevision: snapshot.sourceRevision,
-      admission: {status: 'pending', reason: 'idle_source_selection'}, selectionFingerprint: hashJson(selection),
+      admission: {status: 'admitted', compiledInputIdentity: key, capabilityRevision: 'test'}, selectionFingerprint: hashJson(selection),
       requestFingerprint: hashJson({expectedWindowId: null, idempotencyKey: key, selection, reason, expectedSourceRevision: snapshot.sourceRevision})}
   };
 }
@@ -258,7 +258,9 @@ test('context commit validates only requested refs and ancestor paths, without w
   await assert.rejects(writer.commitContextTransition(session, invalid), /outside the branch/u);
   assert.equal(await writer.revision(session), snapshot.sourceRevision);
   const before = writer.historyReadMetrics(session.id);
-  await writer.commitContextTransition(session, contextCommit(session, snapshot, 'bounded-selection', [ref]));
+  const excerpts = [{source: ref, offset: 0, bytes: 8}, {source: ref, offset: 9, bytes: 8}];
+  const committed = await writer.commitContextTransition(session, contextCommit(session, snapshot, 'bounded-selection', [], excerpts));
+  assert.deepEqual(committed.window.selection.excerpts, excerpts);
   const after = writer.historyReadMetrics(session.id);
   assert.equal(after.bodyBytesRead - before.bodyBytesRead, 0);
   assert.equal(after.scannedBytes - before.scannedBytes, 0);

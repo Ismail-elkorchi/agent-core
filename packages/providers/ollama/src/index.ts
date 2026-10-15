@@ -192,6 +192,7 @@ export class OllamaProvider implements ModelProvider {
   private protocol() {
     return conservativeProtocolCapabilities(this.endpoint, {
       reasoningAccounting: 'included_output',
+      contextReset: 'fresh_request',
       revision: 'ollama-chat-2026-09-07-v2',
       roles: ['system', 'developer', 'user', 'assistant'],
       developerRole: 'system_if_no_system',

@@ -224,47 +224,19 @@ test('the Node browser helper rejects non-web links and canceled launches before
   );
 });
 
-test('native incompatibility offers a separate explicit fresh-continuation action', async () => {
-  const { ModelContinuationRequiredError } = await import('@agent-core/runtime');
-  const choices = [];
+test('configuration saves model selection without a separate continuation option', async () => {
+  const calls = [];
   const adapter = { describeModel: async () => profile };
   const operations = {
     providers: [{ id: 'neutral', label: 'Neutral' }],
-    save: async (_selection, _adapter, options) => {
-      choices.push(options);
-      if (options.continuation !== 'fresh')
-        throw new ModelContinuationRequiredError('opaque state');
-    }
+    save: async (...args) => { calls.push(args); }
   };
-  let state = {
-    ...configurationState({ provider: 'neutral', model: profile.id }, operations.providers),
-    stage: 'review',
-    adapter,
-    profile
-  };
-  assert.equal(
-    updateConfiguration(state, { type: 'configuration.save', continuation: 'fresh' }, operations)
-      .effects,
-    undefined
-  );
-  let result = updateConfiguration(state, { type: 'configuration.save' }, operations);
-  let completion = await result.effects[0].run({ signal: new AbortController().signal });
-  state = updateConfiguration(result.state, completion.message, operations).state;
-  assert.equal(state.freshContinuationAvailable, true);
-  assert.deepEqual(choices, [{}]);
-  result = updateConfiguration(
-    state,
-    { type: 'configuration.save', continuation: 'fresh' },
-    operations
-  );
-  completion = await result.effects[0].run({ signal: new AbortController().signal });
+  const selection = { provider: 'neutral', model: profile.id };
+  const state = { ...configurationState(selection, operations.providers), stage: 'review', adapter, profile };
+  const result = updateConfiguration(state, { type: 'configuration.save' }, operations);
+  const completion = await result.effects[0].run({ signal: new AbortController().signal });
   assert.equal(completion.message.type, 'configuration.saved');
-  assert.deepEqual(choices, [{}, { continuation: 'fresh' }]);
-  assert.equal(
-    updateConfiguration(state, { type: 'configuration.stage', stage: 'model' }, operations).state
-      .freshContinuationAvailable,
-    undefined
-  );
+  assert.deepEqual(calls, [[selection, adapter]]);
 });
 
 test('configuration owns a stable index and matching result across redraws and query transitions', () => {

@@ -1,7 +1,7 @@
 import { ClaudeProvider } from '@agent-core/provider-claude';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ModelProviderError, parseModelProfile, parseModelResponse, parseModelStreamEvent } from '@agent-core/model';
+import { ModelProviderError, parseModelProfile, conservativeProtocolCapabilities, parseModelProtocolCapabilities, parseModelResponse, parseModelStreamEvent } from '@agent-core/model';
 import { OllamaProvider } from '@agent-core/provider-ollama';
 import { OpenAIProvider } from '@agent-core/provider-openai';
 import { OpenAICodexProvider } from '@agent-core/provider-openai-codex';
@@ -13,6 +13,9 @@ for (const adapter of [ollamaAdapter(), openAIAdapter(), openAICodexAdapter(), o
     const provider = adapter.create();
     const profile = parseModelProfile(await provider.describeModel(adapter.model));
     assert.equal(profile.provider, provider.id);
+    assert.equal(profile.capabilities.protocol.contextReset, 'fresh_request');
+    for (const obsolete of ['transformContext', 'compileContextTransform', 'transformContextCompiled'])
+      assert.equal(obsolete in provider, false);
     const allowance = profile.supportedParameters.includes('maxOutputTokens') ? { maxOutputTokens: 64 } : {};
     const request = { model: adapter.model, messages: [{ role: 'user', content: 'hello' }], ...allowance };
 
@@ -250,3 +253,12 @@ function claudeAdapter() {
     createMalformedUsage() { return new ClaudeProvider({ apiKey: 'test', fetch: async () => json({ ...message, usage: { input_tokens: -1, output_tokens: 1 } }) }); }
   };
 }
+
+test('fresh-context support is explicit and rejects undeclared protocol capabilities', () => {
+  const protocol = conservativeProtocolCapabilities('https://fixture.test/messages');
+  assert.equal(protocol.contextReset, 'unsupported');
+  const { contextReset, ...missing } = protocol;
+  assert.throws(() => parseModelProtocolCapabilities(missing), /protocol capabilities/);
+  assert.throws(() => parseModelProtocolCapabilities({ ...protocol, contextTransforms: [] }), /protocol capabilities/);
+  assert.equal(parseModelProtocolCapabilities({ ...protocol, contextReset: 'fresh_request' }).contextReset, 'fresh_request');
+});

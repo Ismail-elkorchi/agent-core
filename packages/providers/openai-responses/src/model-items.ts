@@ -18,7 +18,7 @@ export function responsesInput(
 ): { instructions: string; input: unknown[] } {
   const input: unknown[] = [];
   const instructions: string[] = [];
-  for (const [index, item] of request.messages.entries()) {
+  for (const item of request.messages) {
     if (item.role === 'system' && systemInstructions) {
       instructions.push(item.content);
       if (item.parts?.length)
@@ -27,21 +27,11 @@ export function responsesInput(
     }
     if (item.role === 'protocol') {
       if (
-        !['responses.reasoning', 'responses.compaction'].includes(item.state.kind) ||
+        item.state.kind !== 'responses.reasoning' ||
         !Array.isArray(item.state.data.items)
       )
         throw invalid(provider, 'Unsupported Responses protocol state.');
-      if (item.state.kind === 'responses.compaction') {
-        if (
-          request.messages
-            .slice(0, index)
-            .some((prefix) => prefix.role !== 'system' && prefix.role !== 'developer')
-        )
-          throw invalid(provider, 'A native compacted window must precede ordinary conversation input.');
-        // Replay the complete canonical window, then append current host authority at its original roles.
-        // Authority is current request configuration, not old transcript to insert ahead of the window.
-        input.unshift(...validatedResponsesReplayItems(item.state.data.items, provider));
-      } else input.push(...validatedResponsesReplayItems(item.state.data.items, provider));
+      input.push(...responsesReasoningItems(item.state.data.items, provider));
       continue;
     }
     if (item.role === 'control') {
@@ -136,7 +126,7 @@ export async function responsesOutput(options: {
 }): Promise<readonly ModelOutputItem[]> {
   const output: ModelOutputItem[] = [];
   for (const item of options.items) {
-    if (item.type === 'reasoning' || item.type === 'compaction') {
+    if (item.type === 'reasoning') {
       const prefix = [...options.request.messages, ...modelOutputToInput(output)];
       const state = await createProviderContextState({
         provider: options.provider,
@@ -144,7 +134,7 @@ export async function responsesOutput(options: {
         endpoint: options.endpoint,
         request: { ...options.request, messages: prefix },
         requestId: options.requestId,
-        kind: item.type === 'reasoning' ? 'responses.reasoning' : 'responses.compaction',
+        kind: 'responses.reasoning',
         requiresExactPrefix: false,
         data: { items: [item] }
       });
@@ -215,7 +205,7 @@ export function responsesPayloadPaths(
   for (const [index, raw] of (body.input as unknown[]).entries()) {
     if (!raw || typeof raw !== 'object') continue;
     const item = raw as Readonly<Record<string, unknown>>;
-    if (item.type === 'reasoning' || item.type === 'compaction') {
+    if (item.type === 'reasoning') {
       paths.push(['input', index]);
       continue;
     }
@@ -234,7 +224,7 @@ export function responsesPayloadPaths(
 }
 
 /** Provider extensions are bounded and kind-checked before exact replay. */
-export function validatedResponsesReplayItems(
+function responsesReasoningItems(
   value: unknown,
   provider: string
 ): readonly ResponsesOutputItem[] {
@@ -244,35 +234,7 @@ export function validatedResponsesReplayItems(
     if (item.type === 'reasoning') {
       if (!item.id || (item.encrypted_content === undefined && item.summary === undefined))
         throw invalid(provider, 'Malformed Responses reasoning state.');
-    } else if (item.type === 'compaction') {
-      if (!item.encrypted_content) throw invalid(provider, 'Compaction state lacks its encrypted payload.');
-    } else if (item.type === 'function_call' || item.type === 'custom_tool_call') {
-      if (
-        !item.call_id ||
-        !item.name ||
-        (item.type === 'function_call'
-          ? typeof item.arguments !== 'string'
-          : typeof item.input !== 'string')
-      )
-        throw invalid(provider, 'Malformed native call in replay window.');
-    } else if (item.type === 'function_call_output' || item.type === 'custom_tool_call_output') {
-      if (!item.call_id || (typeof item.output !== 'string' && !Array.isArray(item.output)))
-        throw invalid(provider, 'Malformed native tool result in replay window.');
-    } else if (item.type === 'message' || item.type === undefined) {
-      if (!['system', 'developer', 'user', 'assistant'].includes(item.role ?? '') || !item.content)
-        throw invalid(provider, 'Malformed native message in replay window.');
-      for (const part of item.content)
-        if (
-          !['text', 'input_text', 'output_text', 'input_image', 'input_file', 'refusal'].includes(
-            part.type ?? ''
-          )
-        )
-          throw invalid(provider, 'Unsupported native message content in replay window.');
-    } else if (item.type === 'configuration_update') {
-      const reasoning = parseJsonObject(item.reasoning);
-      if (typeof reasoning.effort !== 'string')
-        throw invalid(provider, 'Malformed native configuration update.');
-    } else throw invalid(provider, `Unsupported required native replay item: ${item.type}.`);
+    } else throw invalid(provider, `Unsupported required reasoning item: ${String(item.type)}.`);
   }
   return items;
 }

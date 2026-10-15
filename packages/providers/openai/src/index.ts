@@ -15,11 +15,9 @@ import {
   assertProviderContextCompatible,
   compileModelRequest,
   conservativeProtocolCapabilities,
-  createProviderContextState,
   ModelContractError,
   ModelProviderError,
   modelTransportSignal,
-  parseModelContextTransformResult,
   parseModelProfile,
   parseModelRequest,
   parseModelResponse,
@@ -28,8 +26,6 @@ import {
   type ModelCapabilities,
   type ModelCatalogEntry,
   type ModelCompilationOptions,
-  type ModelContextTransformRequest,
-  type ModelContextTransformResult,
   type ModelDiscoveryOptions,
   type ModelProfile,
   type ModelProvider,
@@ -58,7 +54,6 @@ import {
   responsesUsage,
   responsesPayloadPaths,
   responsesTool,
-  validatedResponsesReplayItems,
   waitForResponseOrStatus,
   type JsonSseEvent,
   type ResponsesOutputItem as OpenAIOutputItem,
@@ -175,7 +170,6 @@ export class OpenAIProvider implements ModelProvider {
   private readonly countTokens: boolean;
   private readonly maxConcurrentCounts: number;
   private activeCounts = 0;
-  private readonly compiledTransforms = new WeakMap<CompiledModelRequest, string>();
   private readonly transport: 'http_sse' | 'websocket';
   private readonly webSocketFactory: OpenAIResponsesWebSocketFactory;
   private readonly compiledRequests = new WeakMap<ModelRequest, CompiledModelRequest>();
@@ -340,7 +334,7 @@ export class OpenAIProvider implements ModelProvider {
       counting: this.countTokens ? 'provider' : 'estimate',
       asyncTools: modern,
       steering: modern && this.transport === 'websocket' ? 'native' : 'next_request',
-      contextTransforms: modern ? ['responses.compact'] : []
+      contextReset: 'fresh_request'
     });
   }
 
@@ -360,120 +354,6 @@ export class OpenAIProvider implements ModelProvider {
       requiredProtocolRevision(await this.describeModel(request.model))
     );
   }
-  async transformContext(
-    transform: ModelContextTransformRequest
-  ): Promise<ModelContextTransformResult> {
-    return this.transformContextCompiled(
-      transform.transformId,
-      await this.compileContextTransform(transform)
-    );
-  }
-  async compileContextTransform(
-    transform: ModelContextTransformRequest,
-    options?: ModelCompilationOptions
-  ): Promise<CompiledModelRequest> {
-    if (typeof transform.transformId !== 'string' || !transform.transformId)
-      throw new ModelProviderError({
-        provider: this.id,
-        code: 'invalid_request',
-        message: 'A context transform identity is required.'
-      });
-    const source = parseModelRequest({
-      ...transform.request,
-      ...(transform.signal ? { signal: transform.signal } : {})
-    });
-    // Native compaction consumes the conversation. Generation controls and tool definitions are not sent.
-    const request = await this.validateRequest({
-      model: source.model,
-      messages: source.messages,
-      ...(source.signal ? { signal: source.signal } : {})
-    });
-    const profile = await this.describeModel(request.model);
-    if (!profile.capabilities.protocol?.contextTransforms.includes('responses.compact'))
-      throw new ModelProviderError({
-        provider: this.id,
-        code: 'invalid_request',
-        message: 'Native compaction is not declared for this exact endpoint/model.'
-      });
-    const lowered = responsesInput(request, this.id);
-    const body = {
-      model: request.model,
-      input: lowered.input,
-      ...(lowered.instructions ? { instructions: lowered.instructions } : {})
-    };
-    const outputReservation = source.maxOutputTokens ?? options?.outputReservation;
-    if (outputReservation === undefined)
-      throw new ModelProviderError({
-        provider: this.id,
-        code: 'invalid_request',
-        message: 'Context transformation requires an explicit output reservation.'
-      });
-    const providerInputTokens = this.countTokens
-      ? await this.countInput(body, request.signal)
-      : undefined;
-    const compiled = await compileModelRequest({
-      request,
-      profile,
-      body,
-      endpoint: `${this.endpoint()}/compact`,
-      payloadPaths: responsesPayloadPaths(body),
-      outputReservation,
-      ...(providerInputTokens === undefined ? {} : { providerInputTokens })
-    });
-    this.compiledTransforms.set(compiled, transform.transformId);
-    return compiled;
-  }
-  async transformContextCompiled(
-    transformId: string,
-    compiled: CompiledModelRequest,
-    options?: ModelTransportOptions
-  ): Promise<ModelContextTransformResult> {
-    if (
-      this.compiledTransforms.get(compiled) !== transformId ||
-      compiled.endpoint !== `${this.endpoint()}/compact`
-    )
-      throw new ModelProviderError({
-        provider: this.id,
-        code: 'invalid_request',
-        message: 'Context transform was not admitted by this provider instance with this identity.'
-      });
-    const request = compiled.logicalRequest;
-    const signal = modelTransportSignal(request, options);
-    signal?.throwIfAborted();
-    const token = await this.tokenProvider.getBearerToken(signal);
-    const response = await this.fetchImpl(compiled.endpoint, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token.token}`, 'Content-Type': CONTENT_TYPE_JSON },
-      body: JSON.stringify(compiled.body),
-      ...(signal ? { signal: signal } : {})
-    });
-    await this.throwIfBadResponse(response);
-    const payload = decodeResponsesPayload(await readBoundedJsonResponse(response));
-    if (!payload.id || !payload.output?.some((item) => item.type === 'compaction'))
-      throw new ModelProviderError({
-        provider: this.id,
-        code: 'malformed_response',
-        message: 'Compaction did not return its canonical native window.'
-      });
-    const state = await createProviderContextState({
-      protocolRevision: requiredProtocolRevision(await this.describeModel(request.model)),
-      provider: this.id,
-      endpoint: this.endpoint(),
-      request,
-      requestId: payload.id,
-      kind: 'responses.compaction',
-      requiresExactPrefix: false,
-      data: { items: validatedResponsesReplayItems(payload.output, this.id) }
-    });
-    const usage = responsesUsage(payload.usage);
-    return parseModelContextTransformResult({
-      transformId,
-      state,
-      input: [{ role: 'protocol', content: '', state }],
-      ...(usage ? { usage } : {})
-    });
-  }
-
   async compileRequest(
     request: ModelRequest,
     options?: ModelCompilationOptions

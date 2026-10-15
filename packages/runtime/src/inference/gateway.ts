@@ -1,3 +1,4 @@
+import type { HistorySourceCut } from '../history/contracts.js';
 import {
   compileModelRequest,
   createModelRequest,
@@ -17,7 +18,8 @@ import { requestWindowForModel } from '../orchestration/model-request.js';
 import { ModelStreamInterruptedError } from '../orchestration/model-stream.js';
 
 export interface InferenceInvocation {
-  readonly workingStateRevisionId?: string | null;
+  readonly sessionStateRevisionId?: string | null;
+  readonly capturedHistoryCut?: HistorySourceCut | undefined;
   readonly transport?: ModelTransportOptions;
   readonly request: ModelRequest;
   readonly compiled?: CompiledModelRequest;

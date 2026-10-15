@@ -10,7 +10,7 @@ export function createHistoryTools(options: {
   readonly prefix?: string;
 }): readonly CompiledToolDefinition[] {
   const prefix = options.prefix ?? 'history';
-  const read = historyReadRequestSchema.omit({ cut: true });
+  const read = historyReadRequestSchema;
   const search = z.strictObject({
     query: z.string().max(4096).optional(),
     ...queryShape,
@@ -53,6 +53,7 @@ export function createHistoryTools(options: {
       })
       .optional()
   });
+  const latest = search.omit({ query: true, maxPostings: true, maxCandidates: true, maxIndexBytes: true, maxIndexEntries: true }).extend({ cursor: z.string().max(256 * 1024).optional() });
   return Object.freeze([
     scopedTool({
       name: `${prefix}_read`,
@@ -70,21 +71,23 @@ export function createHistoryTools(options: {
           status: result.status,
           offset: result.offset,
           nextOffset: result.nextOffset,
-          totalBytes: result.totalBytes
+          totalBytes: result.totalBytes,
+          neighborsCoverage: result.neighborsCoverage
         };
         return [
           { type: 'text', text: JSON.stringify(range) },
           ...historyItemContent(item),
           ...(Array.isArray(neighbors) && neighbors.length
             ? [
-                { type: 'text' as const, text: 'Neighboring history:' },
+                { type: 'text' as const, text: 'Chronological context (not asserted replies):' },
                 ...neighbors.flatMap(historyItemContent)
               ]
             : [])
         ];
       },
       async canonicalize(value) {
-        const cut = await options.history.capture();
+        const cut = value.cut ? historyCutSchema.parse(value.cut) : await options.history.capture();
+        await options.history.validateCut(cut);
         return {
           value: parseJsonObject({ ...value, cut }),
           scope: `${scopePath('history', cut.sessionId, cut.branchId)}/${encodeURIComponent(sourceSchema.parse(value.source).entryId)}`
@@ -92,6 +95,31 @@ export function createHistoryTools(options: {
       },
       invoke(value) {
         return options.history.read(historyReadRequestSchema.parse(value));
+      }
+    }),
+    scopedTool({
+      name: `${prefix}_latest`,
+      description:
+        'Read newest original contributions first; defaults to user input and steering when filter is omitted. Filter by original role, run, source or time. Continue partial coverage with the returned cursor; use history_read for exact-source chronological context, or history_search with runId for recorded same-run context. Context does not assert reply relationships.',
+      schema: latest,
+      mode: 'read',
+      root: 'history',
+      buildModelContent({ observation }) {
+        if (observation.kind !== 'result') return defaultToolModelContent(observation);
+        return historySearchContent(parseJsonObject(observation.output));
+      },
+      async canonicalize(value) {
+        const cut = await options.history.capture();
+        return { value: parseJsonObject({ request: value, authorizedCut: cut }), scope: scopePath('history', cut.sessionId, cut.branchId) };
+      },
+      async invoke(value, context) {
+        const cut = historyCutSchema.parse(value.authorizedCut);
+        await options.history.validateCut(cut);
+        const request = latest.parse(value.request);
+        return options.history.latest({ ...request,
+          ...(context.signal ? { signal: context.signal } : {}),
+          ...(request.cursor ? {} : { cut })
+        });
       }
     }),
     scopedTool({

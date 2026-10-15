@@ -1,12 +1,12 @@
-import { stagedWorkingState } from './context/working-state.js';
-import { CONTEXT_RECOVERY_LIMITS, CONTEXT_RECOVERY_INSTRUCTION, assembleContextControlRequest, contextControlHeadroom, contextControlPreview, contextControlSteering } from './context/recovery.js';
+import { NativeContextIncompatibilityError } from './orchestration/model-change.js';
+import { CONTEXT_RECOVERY_LIMITS, assembleContextControlRequest, contextControlReserve, contextControlPreview, contextControlSteering } from './context/recovery.js';
 import { resolveToolModelContent } from './orchestration/observation-source.js';
 import { NativeContextTransitionRequired } from './inference/input.js';
-import type { WorkingStateSnapshot } from './session/working-state.js';
+import type { SessionStateSnapshot } from './session/session-state.js';
 import { providerSettlementKey } from './inference/run-lifecycle.js';
 import { ContextSourceCapacityError, ContextContinuityError, type ContextAdmissionConflict } from './run/context-admission.js';
 import { agentRunActivity } from './run/control/contracts.js';
-import { describeError as errorMessage } from '@agent-core/tools';
+import { decodeToolCall, describeError as errorMessage } from '@agent-core/tools';
 import {
   closeExternalEffect,
   issueEffectStartTicket,
@@ -61,10 +61,9 @@ import {
   type AgentEvent,
   type AgentProgressEvent
 } from './events.js';
-import { HistoryReader, sourceRef, textRange } from './history/reader.js';
+import { HistoryReader, textRange } from './history/reader.js';
 import {
   ModelRequestAssembler,
-  renderContext,
   type PromptInstruction
 } from './inference/model-request-assembler.js';
 import {
@@ -73,14 +72,11 @@ import {
   requestCapacity
 } from './inference/request-admission.js';
 import {
-  readSelectedHistorySources,
   rebuildModelWindowFromRepositories,
-  replaySourceEntries
+  assertHistoryModelCompatibility,
+  replaySourceEntries,
+  recordContextEvidence
 } from './orchestration/session-replay.js';
-import {
-  encodeContextTransformReference,
-  readTransformedContext
-} from './inference/context-transform.js';
 import { ModelWindow } from './inference/model-window.js';
 import type { NativeGenerationContext } from './inference/native-inference.js';
 import { NativeSteeringCoordinator } from './inference/native-steering.js';
@@ -286,6 +282,7 @@ interface AssistantTurnRequest {
   readonly toolBatchId: string;
   readonly snapshot: TurnSnapshot;
   readonly modelSession: ModelProviderSession;
+  readonly replaceModelSession?: () => Promise<ModelProviderSession>;
   readonly signal: AbortSignal;
   readonly modelWindow: ModelWindow;
   readonly controller: AgentRunBudget;
@@ -305,6 +302,8 @@ type AssistantTurnResult =
   | { readonly kind: 'decision'; readonly decision: ExecutionDecision }
   | { readonly kind: 'outcome_unknown'; readonly effectId: string };
 interface RequestAssemblyResult {
+  readonly capturedHistoryCut?: import('./history/contracts.js').HistorySourceCut;
+  readonly freshContext?: boolean;
   readonly recoveryAttempt?: number;
   readonly request: ModelRequest;
   readonly compiled: CompiledModelRequest;
@@ -439,6 +438,7 @@ export class AgentRuntime {
   private recoveryActionBoundary: string | undefined;
   private contextControlReserve: { readonly identity: string; readonly tokens: number } | undefined;
   private activeContextIdentity: string | null | undefined;
+  private pendingCompatibilityTransition = false;
   private nativeSteering: NativeSteeringCoordinator | undefined;
   private steeringWrites: Promise<void> = Promise.resolve();
   private readonly steeringReceipts = new Map<
@@ -487,7 +487,7 @@ export class AgentRuntime {
         const work = providerWork(run.state(), invocation);
         if (work.stage === 'ready')
           throw new Error('Working-state update has no admitted inference.');
-        return this.inferenceService.workingStateOrigin(
+        return this.inferenceService.sessionStateOrigin(
           this.options.inferenceOwnerId ?? invocation.runId,
           work.invocationId
         );
@@ -499,13 +499,6 @@ export class AgentRuntime {
         ...(this.options.reasoning ? { reasoning: this.options.reasoning } : {}),
         ...(this.options.temperature === undefined ? {} : { temperature: this.options.temperature })
       }),
-      providerTransform: async () =>
-        typeof options.provider.compileContextTransform === 'function' &&
-        typeof options.provider.transformContextCompiled === 'function' &&
-        Boolean(
-          (await options.provider.describeModel(this.options.model)).capabilities.protocol
-            ?.contextTransforms.length
-        )
     });
     if (!Number.isSafeInteger(options.maxOutputTokens) || options.maxOutputTokens < 1)
       throw new TypeError('AgentRuntime requires an explicit positive maxOutputTokens allowance.');
@@ -1354,9 +1347,16 @@ export class AgentRuntime {
     let replay;
     try {
       await this.options.context?.assertSourceCapacity();
+      if (this.history && this.options.repositories.artifacts)
+        await assertHistoryModelCompatibility({ history: this.history,
+          artifacts: this.options.repositories.artifacts,
+          profile: await this.options.provider.describeModel(this.options.model), currentRunId: runtime.runId });
       replay = await rebuild();
     } catch (error) {
-      if (!(error instanceof ContextSourceCapacityError) || !this.options.contextRenewal?.automatic)
+      if (error instanceof NativeContextIncompatibilityError) {
+        await this.scheduleModelCompatibilityTransition(runtime.runId,
+          await this.options.provider.describeModel(this.options.model));
+      } else if (!(error instanceof ContextSourceCapacityError) || !this.options.contextRenewal?.automatic)
         throw error;
       // This empty staging window is never dispatched as application context.
       // assembleModelRequest still verifies the selected originals and the bounded
@@ -1642,6 +1642,13 @@ export class AgentRuntime {
               toolBatchId,
               snapshot,
               modelSession: currentModelSession,
+              replaceModelSession: async () => {
+                await modelSession?.close?.();
+                modelSession = this.inferenceService.createSession();
+                replayRestored = true;
+                this.nativeSteering?.bind(modelSession, profile.capabilities.protocol?.steering === 'native');
+                return modelSession;
+              },
               signal: runtime.signal,
               modelWindow,
               controller: runtime.controller,
@@ -1679,10 +1686,9 @@ export class AgentRuntime {
         if (snapshot.record.contextRecovery) {
           const repeated = toolCalls.some((call) => this.recoveryActions.has(`${runtime.runId}:${snapshot.record.contextRecovery?.recoveryBoundary ?? "unbound"}:${hashJson({name: call.name, input: call.input})}`));
           const unsupported = response.terminationReason !== 'tool_calls' || toolCalls.length === 0 || toolCalls.length > CONTEXT_RECOVERY_LIMITS.toolCalls ||
-            toolCalls.some((call) => !snapshot.tools.some((tool) => tool.name === call.name)) ||
+            toolCalls.some((call) => !snapshot.tools.some((tool) => tool.name === call.name && isContextCheckpointTool(tool))) ||
             toolCalls.some((call) => call.input.kind === 'json' &&
-              (call.input.value.continuation === 'fresh' || call.input.value.workingState !== undefined ||
-                (snapshot.tools.find((tool) => tool.name === call.name)?.implementationId !== 'agent-core.context-transition.v1' &&
+              ((snapshot.tools.find((tool) => tool.name === call.name)?.implementationId !== 'agent-core.context-transition.v1' &&
                   (typeof call.input.value.maxBytes !== 'number' || call.input.value.maxBytes > CONTEXT_RECOVERY_LIMITS.resultBytes))));
           if (repeated || unsupported) {
             const settled = providerWork(runtime.run.state(), snapshot.record);
@@ -2168,21 +2174,8 @@ export class AgentRuntime {
         'Native execution requires compiled streaming, continuation and result-delivery reconciliation.'
       );
     }
-    let nativeWorkingStateRevisionId = assembly.fingerprint.workingStateRevisionId;
-    let nativeStateProposal: ContextTransitionRequest | undefined;
-    const captureNativeWorkingState = async () => {
-      const context = this.options.context;
-      if (!context) return [];
-      const cut = await context.history.capture();
-      nativeStateProposal = await this.contextTransitions?.pendingState();
-      const state = nativeStateProposal?.workingState
-        ? await stagedWorkingState(this.options.repositories.artifacts ?? this.inferenceService.options.artifacts, nativeStateProposal.workingState.contentRef.size, nativeStateProposal.workingState, cut.throughEntryId)
-        : await context.workingState(cut);
-      if ((state.revision?.id ?? null) === nativeWorkingStateRevisionId) return [];
-      nativeWorkingStateRevisionId = state.revision?.id ?? null;
-      return [{ role: 'user' as const, content: renderContext(workingStateContext(state)) }];
-    };
-    this.nativeSteering?.bind(session, true, captureNativeWorkingState);
+    const nativeSessionStateRevisionId = assembly.fingerprint.sessionStateRevisionId;
+    this.nativeSteering?.bind(session, true);
     const deliverToolResults = session.deliverToolResults.bind(session);
     const continueNative = session.continueNative.bind(session);
     const pump = new ToolWorkPump(
@@ -2225,46 +2218,7 @@ export class AgentRuntime {
     ): Promise<void> => {
       // Exact result delivery is mandatory while synchronous native obligations remain.
       // It admits real capacity, but discretionary control room waits for a legal boundary.
-      if (context.generationDeliveryId !== 'initial' && nativeStateProposal && this.options.context && this.contextTransitions) {
-        const proposal = nativeStateProposal;
-        const publication: { committed: boolean; failure?: Error } = { committed: false };
-        await this.contextTransitions.drain({
-          context: this.options.context,
-          onlyIdempotencyKey: proposal.idempotencyKey,
-          admit: transition => this.retainPendingSources(transition, runtime.runId),
-          validate: async input => {
-            if (!input.preserveSelection || input.workingState.revision?.id !== proposal.workingState?.id)
-              throw new Error('Native successor must preserve the exact staged state and source selection.');
-            const delivered = new Set(context.dispatch?.sourceCalls.map(call => call.toolCallId) ?? []);
-            if (pendingToolCalls(runtime.run.state()).some(call => call.protocol === 'synchronous' &&
-                (call.state.stage !== 'recorded' || !call.callId || !delivered.has(call.callId))))
-              throw new Error('Native successor omits a mandatory completed tool result.');
-            await this.requestAdmission.admit(context.compiled, context.profile);
-            return { compiledInputIdentity: context.compiled.inputIdentity,
-              capabilityRevision: context.compiled.capabilityRevision,
-              ...(input.window?.selection.providerState ? { providerState: input.window.selection.providerState } : {}) };
-          },
-          committed: async entry => {
-            publication.committed = true;
-            nativeWorkingStateRevisionId = entry.id;
-            await runtime.emit({ type: 'context.transitioned', window: entry.window, transition: entry.transition });
-          },
-          rejected: async (requestId, message, idempotencyKey) => {
-            publication.failure ??= new Error(message);
-            await runtime.emit({ type: 'context.transition.rejected', requestId, idempotencyKey, message });
-          },
-          preserveFailure: error => {
-            this.preserveRecoveryFailure(error, turn);
-            publication.failure = error instanceof Error ? error : new Error(String(error));
-          },
-          signal: initial.signal
-        });
-        nativeStateProposal = undefined;
-        if (!publication.committed) {
-          nativeWorkingStateRevisionId = (await this.options.context.workingState()).revision?.id ?? null;
-          throw publication.failure ?? new Error('Native state successor was not committed.');
-        }
-      } else if (context.dispatch?.sourceCalls.length)
+      if (context.dispatch?.sourceCalls.length)
         await this.requestAdmission.admit(context.compiled, context.profile);
       else await this.admitContextRequest(context.compiled, turn, runtime.append);
     };
@@ -2343,7 +2297,7 @@ export class AgentRuntime {
         : {
             ...turnIdentity(snapshot.record),
             requestId: context.invocationId,
-            workingStateRevisionId: nativeWorkingStateRevisionId,
+            sessionStateRevisionId: nativeSessionStateRevisionId,
             compiledInputIdentity: context.compiled.inputIdentity,
             capabilityRevision: context.compiled.capabilityRevision,
             ...(context.parentInvocationId ? { parentRequestId: context.parentInvocationId } : {}),
@@ -2421,7 +2375,8 @@ export class AgentRuntime {
     try {
       await this.inferenceService.invokeNative({
         invocationId: assembly.fingerprint.requestId,
-        workingStateRevisionId: () => nativeWorkingStateRevisionId,
+        sessionStateRevisionId: () => nativeSessionStateRevisionId,
+        capturedHistoryCut: () => this.options.context?.history.capture(),
         ownerId: this.options.inferenceOwnerId ?? runtime.runId,
         purpose: 'agent_step',
         runId: runtime.runId,
@@ -2612,7 +2567,7 @@ export class AgentRuntime {
               deliveryId: randomUUID(),
               responseId: boundary.responseId,
               ...ready,
-              input: await captureNativeWorkingState(),
+              input: [],
               tools,
               signal: initial.signal
             });
@@ -2621,7 +2576,7 @@ export class AgentRuntime {
             await continueNative({
               deliveryId: randomUUID(),
               responseId: boundary.responseId,
-              input: await captureNativeWorkingState(),
+              input: [],
               tools,
               signal: initial.signal
             });
@@ -2686,12 +2641,24 @@ export class AgentRuntime {
           assembly = recovery.assembly;
           recoveryAssembly = assembly;
         }
+        if (assembly.freshContext && request.replaceModelSession) {
+          request = { ...request, modelSession: await request.replaceModelSession() };
+        }
         await request.controller.recordUsage(
           await this.inferenceService.settledRunUsage(
             this.options.inferenceOwnerId ?? request.runId,
             request.runId
           )
         );
+        if (assembly.capturedHistoryCut && !request.snapshot.record.contextRecovery && this.options.context) {
+          const currentCut = await this.options.context.history.capture();
+          const captured = assembly.capturedHistoryCut;
+          if (currentCut.branchId !== captured.branchId || currentCut.sourceRevision !== captured.sourceRevision ||
+              currentCut.throughEntryId !== captured.throughEntryId) {
+            await this.activateCommittedContext(request.modelWindow, request.runId, true);
+            continue;
+          }
+        }
         const protocol = request.snapshot.profile.capabilities.protocol;
         if (
           !request.snapshot.record.contextRecovery && request.modelSession.continueNative &&
@@ -2712,6 +2679,7 @@ export class AgentRuntime {
         let completedAttempt;
         try { completedAttempt = await invokeRunInference({
           service: this.inferenceService,
+          ...(assembly.capturedHistoryCut ? { capturedHistoryCut: assembly.capturedHistoryCut } : {}),
           ...(this.nativeSteering ? { steering: this.nativeSteering } : {}),
           options: this.options,
           request: assembly.request,
@@ -2729,7 +2697,7 @@ export class AgentRuntime {
           const capacityFailure = completedAttempt.diagnostic.code === 'context_overflow';
           if (capacityFailure && request.snapshot.record.contextRecovery)
             throw new ContextRecoveryStoppedError(request.snapshot.record.contextRecovery,
-              'Provider rejected the bounded context-management request; change capacity or select sources explicitly.');
+              'Provider rejected the checkpoint request. Original history and committed state remain intact.');
           if (
             capacityFailure &&
             (contextRetries === 1 ||
@@ -2915,13 +2883,9 @@ export class AgentRuntime {
     output?: readonly ModelOutputItem[]
   ): Promise<void> {
     if (this.options.repositories.session) {
-      const bound = output?.some(
-        (item) => item.type === 'protocol' && item.state.compatibility.requiresExactPrefix
-      );
-      const source =
-        bound && this.activeRunDriver
-          ? providerWork(this.activeRunDriver.state(), event)
-          : undefined;
+      const source = this.activeRunDriver
+        ? providerWork(this.activeRunDriver.state(), event)
+        : undefined;
       const inferenceInput =
         source && source.stage !== 'ready'
           ? await this.inferenceService.inputReference(
@@ -3062,8 +3026,9 @@ export class AgentRuntime {
     cut?: import('./history/contracts.js').HistorySourceCut
   ): Promise<{ request: AssistantTurnRequest; assembly: RequestAssemblyResult }> {
     const context = this.options.context;
-    if (!context || !ordinary.snapshot.profile.capabilities.toolCalling) throw failure;
-    const originalConflict = failure instanceof ContextSourceCapacityError ? failure.conflict : requestCapacityConflict(failure);
+    if (!context || !ordinary.snapshot.profile.capabilities.toolCalling || !(failure instanceof ContextAdmissionError)) throw failure;
+    cut ??= await context.history.capture();
+    const originalConflict = requestCapacityConflict(failure);
     const inspection = await context.inspect(cut, { limit: CONTEXT_RECOVERY_LIMITS.inventoryItems, maxBytes: CONTEXT_RECOVERY_LIMITS.inventoryBytes });
     const conflict = {
       ...originalConflict,
@@ -3072,21 +3037,17 @@ export class AgentRuntime {
       // own no-progress allowance, under the unchanged owner/run budgets.
       recoveryBoundary: hashJson({
         windowId: inspection.window?.windowId ?? null,
-        workingStateRevisionId: inspection.workingState.revisionId,
+        sessionStateRevisionId: inspection.sessionState.revisionId,
         task: ordinary.input.task, images: ordinary.input.images ?? null,
         configuration: ordinary.snapshot.configuration, profile: ordinary.snapshot.profile,
         instructions: ordinary.snapshot.instructions, catalog: ordinary.snapshot.record.toolCatalog.revision,
         outputReservation: ordinary.snapshot.requestWindow.maxOutputTokens
       })
     } satisfies ContextAdmissionConflict;
-    const tools = ordinary.snapshot.tools.filter((tool) =>
-      tool.implementationId === 'agent-core.context-transition.v1' ||
-      (tool.implementationId === `agent-core.${tool.name}.v1` &&
-        tool.effectEnvelope.accesses.every((access) => access.mode === 'read' &&
-          (access.scope === 'context' || access.scope === 'history')) &&
-        (tool.name.endsWith('_inspect') || tool.name.endsWith('_read') || tool.name.endsWith('_search')))
-    );
-    if (!tools.some((tool) => tool.implementationId === 'agent-core.context-transition.v1')) throw failure;
+    // Keep the original catalog/protocol binding. The execution gate permits
+    // only checkpoint capabilities; domain calls are rejected before execution.
+    const tools = ordinary.snapshot.tools;
+    if (!tools.some(tool => tool.implementationId === 'agent-core.context-transition.v1')) throw failure;
     // Probes compile bounded material only. Durable no-progress accounting is
     // read exactly when entering recovery, indexed to this unchanged boundary.
     const events = this.options.repositories.events;
@@ -3108,7 +3069,7 @@ export class AgentRuntime {
         throw new ContextRecoveryStoppedError(conflict, 'Context recovery exhausted its bounded durable request inventory.', 'attempt_limit');
       attempts = snapshots.records.length;
       if (attempts >= CONTEXT_RECOVERY_LIMITS.requestsPerBoundary)
-        throw new ContextRecoveryStoppedError(conflict, 'Bounded context recovery exhausted four requests without progress. Select sources, change capacity, or cancel; the original history remains intact.', 'attempt_limit');
+        throw new ContextRecoveryStoppedError(conflict, 'Context renewal could not prepare an admissible successor within its request allowance. Original history and committed state remain intact.', 'attempt_limit');
       for (const snapshot of snapshots.records) {
         const exchangeId = snapshot.metadata.exchangeId;
         if (!exchangeId) throw new Error('Recovery snapshot is missing its exchange identity.');
@@ -3153,23 +3114,19 @@ export class AgentRuntime {
     // These are bounded presentations of the existing request, never additional authority.
     const currentRequest = contextControlPreview(ordinary.input.task, CONTEXT_RECOVERY_LIMITS.currentRequestBytes);
     const steering = contextControlSteering(ordinary.snapshot.instructions.filter(item => item.provenance === 'steering'));
-    const workingState = await context.inspectWorkingState(inspection.cut, CONTEXT_RECOVERY_LIMITS.statePreviewBytes);
+    const sessionState = await context.inspectSessionState(inspection.cut, CONTEXT_RECOVERY_LIMITS.statePreviewBytes);
     const content = JSON.stringify({
       currentRequest: { ...currentRequest, runId: ordinary.runId,
         sourceIdentity: { kind: 'accepted_run_input', runId: ordinary.runId } },
       steering: { ...steering, sourceIdentity: { kind: 'effective_steering', runId: ordinary.runId, turnId: ordinary.snapshot.record.turnId } },
       conflict, attempt: attempts + 1, maximumAttempts: CONTEXT_RECOVERY_LIMITS.requestsPerBoundary, inventory: manifest,
-      workingState: { ...workingState, authority: 'fallible_model_interpretation',
-        coverage: workingState.complete ? 'complete' : 'partial' },
+      sessionState: { ...sessionState, authority: 'fallible_model_interpretation',
+        coverage: sessionState.complete ? 'complete' : 'partial' },
       legalTransitions: inspection.legalTransitions,
       sourceBudget: inspection.budget,
       recentRecoveryResults: probe ? [] : recoveryResults,
       rejectedTransitions: rejectionMessages.slice(-2)
     });
-    const instruction: AgentEffectiveInstruction = {
-      id: 'runtime-context-recovery', provenance: 'application', role: 'system',
-      content: CONTEXT_RECOVERY_INSTRUCTION
-    };
     const outputReservation = Math.min(CONTEXT_RECOVERY_LIMITS.outputTokens, ordinary.snapshot.requestWindow.maxOutputTokens);
     const snapshot: TurnSnapshot = {
       ...ordinary.snapshot,
@@ -3177,15 +3134,16 @@ export class AgentRuntime {
         ...ordinary.snapshot.record, contextRecovery: conflict,
         resumeInstructions: ordinary.snapshot.instructions, continuationEligible: false,
         toolCatalog: captureToolCatalog(tools), toolNames: tools.map((tool) => tool.name),
-        instructions: [instruction], configuredContextSourceIds: []
+        instructions: ordinary.snapshot.instructions
       },
-      tools, instructions: [instruction],
+      tools, instructions: ordinary.snapshot.instructions,
       requestWindow: requestWindowForModel(ordinary.snapshot.profile, outputReservation)
     };
     const request = { ...ordinary, snapshot };
     let assembled: Awaited<ReturnType<typeof assembleContextControlRequest>>;
     try {
-      assembled = await assembleContextControlRequest(this.requestAdmission, this.estimator, {
+      assembled = await assembleContextControlRequest(this.requestAdmission, {
+        original: failure.compiled.logicalRequest,
         model: snapshot.configuration.model, profile: snapshot.profile,
         tools: toolsForModel([...tools], snapshot.profile),
         summaries: promptToolSpecs([...tools], snapshot.profile, this.options.toolContext),
@@ -3212,11 +3170,12 @@ export class AgentRuntime {
     });
     const fingerprint: InferenceRequestFingerprintRecord = {
       ...turnIdentity(snapshot.record), requestId: randomUUID(),
-      workingStateRevisionId: inspection.workingState.revisionId,
+      sessionStateRevisionId: inspection.sessionState.revisionId,
       compiledInputIdentity: assembled.compiled.inputIdentity,
       capabilityRevision: assembled.compiled.capabilityRevision,
+      // No application/provider context is recollected: original compiled messages are preserved below.
       configuredContextIds: [], providerContextIds: [], runContextIds: [],
-      effectiveInstructionHash: hashJson([instruction]), modelWindowHistoryHash: hashJson([]),
+      effectiveInstructionHash: hashJson(snapshot.instructions), modelWindowHistoryHash: hashJson(failure.compiled.logicalRequest.messages),
       modelToolSchemasHash: hashJson(assembled.request.tools ?? []),
       modelWindowHash: hashJson(assembled.assembly.messages)
     };
@@ -3225,7 +3184,7 @@ export class AgentRuntime {
       await append({ type: 'prompt.material.selected', material: assembled.assembly.material });
       await append({ type: 'budget.estimate.created', ...turnIdentity(snapshot.record), attempt: 1, estimate });
     }
-    return { request, assembly: { request: assembled.request, compiled: assembled.compiled, estimate, fingerprint, recoveryAttempt: attempts + 1 } };
+    return { request, assembly: { capturedHistoryCut: cut, request: assembled.request, compiled: assembled.compiled, estimate, fingerprint, recoveryAttempt: attempts + 1 } };
   }
 
   private async assembleModelRequest(
@@ -3256,15 +3215,13 @@ export class AgentRuntime {
     let capacityNotice: PromptContextItemInput | undefined;
     const assemble = async (
       window: ModelWindow,
-      workingState: WorkingStateSnapshot,
-      conversationOnly = false
+      sessionState: SessionStateSnapshot
     ) => {
-      const stateContext = workingStateContext(workingState)[0];
+      const stateContext = sessionStateContext(sessionState)[0];
       const result = await this.requestAdmission.assemble(
         {
           window,
           runId: request.runId,
-          conversationOnly,
           task: request.input.task,
           ...(request.input.images === undefined ? {} : { images: request.input.images }),
           instructions: promptInstructionsForRequest({
@@ -3282,7 +3239,7 @@ export class AgentRuntime {
               }))
           }),
           contextItems: capturedContext,
-          ...(stateContext ? { workingState: stateContext } : {}),
+          ...(stateContext ? { sessionState: stateContext } : {}),
           ...(capacityNotice ? { capacityNotice } : {}),
           tools: promptToolSpecs(
             [...request.snapshot.tools],
@@ -3311,22 +3268,9 @@ export class AgentRuntime {
         },
         request.snapshot.requestWindow.maxOutputTokens
       );
-      return { ...result, workingStateRevisionId: workingState.revision?.id ?? null };
+      return { ...result, sessionStateRevisionId: sessionState.revision?.id ?? null };
     };
-    let selected: Awaited<ReturnType<typeof assemble>> | undefined;
-    const contextPublication = { committed: false };
-    let nativeSource: ModelRequest | undefined;
-    let nativeUsagePending = false;
-    const recordNativeUsage = async () => {
-      if (!nativeUsagePending) return;
-      await request.controller.recordUsage(
-        await this.inferenceService.settledRunUsage(
-          this.options.inferenceOwnerId ?? request.runId,
-          request.runId
-        )
-      );
-      nativeUsagePending = false;
-    };
+    const contextPublication = { committed: false, candidateAdmitted: false };
     const controlReserves = new Map<string, number>();
     const admitOrdinary = async (compiled: CompiledModelRequest) => {
       const reserve = await this.admitContextRequest(compiled, request, append);
@@ -3335,13 +3279,8 @@ export class AgentRuntime {
     const validate = async (input: ContextAdmissionInput) => {
       assertToolTransitionBoundary(request.run.state());
       const boundary = request.run.state().revision;
-      if (input.selection.strategy === 'provider' && !input.preserveSelection) nativeUsagePending = true;
-      const proposed = await this.contextWindowForAdmission(
-        input,
-        request,
-        async (window) => nativeSource ?? (await assemble(window, input.workingState, true)).request
-      );
-      const result = await assemble(proposed.window, input.workingState);
+      const proposed = await this.contextWindowForAdmission(input, request);
+      const result = await assemble(proposed.window, input.sessionState);
       await admitOrdinary(result.compiled);
       if (result.compiled.inputIdentity === rejected?.inputIdentity)
         throw new ContextAdmissionError(
@@ -3356,15 +3295,14 @@ export class AgentRuntime {
       if (request.run.state().revision !== boundary)
         throw new Error('Context admission boundary changed during compilation.');
       request.signal.throwIfAborted();
-      selected = result;
+      contextPublication.candidateAdmitted = true;
       return {
         compiledInputIdentity: result.compiled.inputIdentity,
-        capabilityRevision: result.compiled.capabilityRevision,
-        ...(proposed.providerState ? { providerState: proposed.providerState } : {})
+        capabilityRevision: result.compiled.capabilityRevision
       };
     };
     if (this.options.context) {
-      try {
+      {
         await this.contextTransitions?.drain({
           context: this.options.context,
           preserveFailure: (error) => { this.preserveRecoveryFailure(error, request); },
@@ -3381,7 +3319,7 @@ export class AgentRuntime {
           },
           rejected: async (requestId, message, idempotencyKey) => {
             // Admission alone is not publication. A failed commit must not dispatch its candidate.
-            selected = undefined;
+            contextPublication.candidateAdmitted = false;
             capturedContext.push({
               id: requestId,
               sourceUri: `runtime://context-selection/${requestId}`,
@@ -3397,90 +3335,28 @@ export class AgentRuntime {
           },
           signal: request.signal
         });
-      } finally {
-        await recordNativeUsage();
       }
     }
-    if (sourceConflict && !selected) {
+    if (this.pendingCompatibilityTransition)
+      throw new ContextContinuityError('unsupported', 'Fresh successor context could not be admitted; the prior context remains committed.');
+    if (sourceConflict && !contextPublication.candidateAdmitted) {
       if (!contextPublication.committed) throw sourceConflict;
       // A later rejected proposal cannot invalidate the preceding committed repair.
       await this.options.context?.assertSourceCapacity();
     }
+    if (contextPublication.committed) await this.activateCommittedContext(request.modelWindow, request.runId, true);
     const cut = await this.options.context?.history.capture();
-    const workingState = (await this.options.context?.workingState(cut)) ?? {
+    const sessionState = (await this.options.context?.sessionState(cut)) ?? {
       revision: null,
-      text: ''
-    };
-    const nativeSupported =
-      Boolean(request.snapshot.profile.capabilities.protocol?.contextTransforms.length) &&
-      typeof this.options.provider.compileContextTransform === 'function' &&
-      typeof this.options.provider.transformContextCompiled === 'function';
-    const nativeTransition = async (reason: string, source?: ModelRequest) => {
-      const context = this.options.context;
-      if (!context || !nativeSupported)
-        throw new Error('No native transition is supported for the selected provider/model.');
-      const current = await context.inspect();
-      const view = await readSelectedHistorySources(context.history, current.cut);
-      const transformed = await this.readCurrentTransform(view, request.snapshot.profile);
-      const protectedIds = new Set(current.protectedSources.map((source) => source.entryId));
-      const sources = view.entries.filter((entry) => {
-        const id = sourceRef(current.cut.sessionId, entry).entryId;
-        return (
-          ['input', 'steering', 'assistant', 'tool_call', 'observation'].includes(entry.type) &&
-          (!transformed?.represented.has(id) || protectedIds.has(id))
-        );
-      });
-      nativeSource = source && { ...source, signal: request.signal };
-      try {
-        const entry = await context.transition(
-          {
-            expectedWindowId: current.window?.windowId ?? null,
-            expectedSourceRevision: current.cut.sourceRevision,
-            expectedWorkingStateRevisionId: workingState.revision?.id ?? null,
-            idempotencyKey: `native-renewal:${request.snapshot.record.turnId}:${String(current.cut.sourceRevision)}`,
-            reason,
-            selection: {
-              strategy: 'provider',
-              retained: sources.map((entry) => sourceRef(current.cut.sessionId, entry)),
-              ...(current.window?.selection.protected
-                ? { protected: current.window.selection.protected }
-                : {})
-            }
-          },
-          {
-            signal: request.signal,
-            admit: validate
-          }
-        );
-        await this.activateCommittedContext(request.modelWindow, request.runId);
-        await emit({
-          type: 'context.transitioned',
-          window: entry.window,
-          transition: entry.transition
-        });
-        if (!selected) throw new Error('Native context transition did not admit the next request.');
-        return selected;
-      } finally {
-        nativeSource = undefined;
-        await recordNativeUsage();
-      }
+      content: {}
     };
     let result: Awaited<ReturnType<typeof assemble>>;
     try {
-      result = selected ?? (await assemble(request.modelWindow, workingState));
+      result = await assemble(request.modelWindow, sessionState);
     } catch (error) {
       if (!(error instanceof NativeContextTransitionRequired)) throw error;
-      if (!this.options.contextRenewal?.automatic)
-        throw new ContextContinuityError('automatic_disabled', error.message);
-      if (!nativeSupported || !this.options.context)
-        throw new ContextContinuityError('unsupported', error.message);
-      try {
-        result = await nativeTransition(error.message, error.request);
-      } catch (cause) {
-        this.preserveRecoveryFailure(cause, request);
-        throw new ContextContinuityError('transform_failed',
-          `${error.message} Native transformation failed: ${errorMessage(cause)}`, { cause });
-      }
+      await this.scheduleModelCompatibilityTransition(request.runId, request.snapshot.profile);
+      return this.assembleModelRequest(request, append, emit, rejected);
     }
     let admissionFailure: ContextAdmissionError | undefined;
     try {
@@ -3494,30 +3370,6 @@ export class AgentRuntime {
     } catch (cause) {
       if (!(cause instanceof ContextAdmissionError)) throw cause;
       admissionFailure = cause;
-    }
-    if (
-      admissionFailure &&
-      nativeSupported &&
-      this.options.context &&
-      this.options.contextRenewal?.automatic
-    ) {
-      // Source choices have already been applied by the same admission path. Native
-      // transformation is a last resort for a request that cannot fit, not routine upkeep.
-      const rejectedRequest = admissionFailure;
-      try {
-        result = await nativeTransition('Required native context renewal.');
-        admissionFailure = undefined;
-      } catch (cause) {
-        this.preserveRecoveryFailure(cause, request);
-        admissionFailure = new ContextAdmissionError(
-          rejectedRequest.compiled,
-          new Error(`${rejectedRequest.message} Native renewal failed: ${errorMessage(cause)}`, {
-            cause
-          }),
-          rejectedRequest.providerRejected,
-          rejectedRequest.continuityHeadroomTokens
-        );
-      }
     }
     if (admissionFailure) {
       this.options.context?.recordAdmission({
@@ -3542,7 +3394,7 @@ export class AgentRuntime {
           capacityNotice = feedback.notice;
           const withFeedback = await assemble(
             request.modelWindow,
-            await this.options.context.workingState()
+            await this.options.context.sessionState()
           );
           await admitOrdinary(withFeedback.compiled);
           result = withFeedback;
@@ -3564,7 +3416,7 @@ export class AgentRuntime {
     const fingerprint: InferenceRequestFingerprintRecord = Object.freeze({
       ...identity,
       requestId: randomUUID(),
-      workingStateRevisionId: result.workingStateRevisionId,
+      sessionStateRevisionId: result.sessionStateRevisionId,
       compiledInputIdentity: compiled.inputIdentity,
       capabilityRevision: compiled.capabilityRevision,
       configuredContextIds: contextSourceIds(contextInputs.configured, 'configured'),
@@ -3593,7 +3445,7 @@ export class AgentRuntime {
       ...(!feedbackFailure && requestCapacity(result.compiled.accounting, controlReserves.get(result.compiled.inputIdentity)).pressure === 'continuity'
         ? {
             message:
-              'Context is near capacity. Select sources or explicitly renew native continuity; working-state maintenance is not required.'
+              'Context is near capacity. Select sources or explicitly renew native continuity; session-state maintenance is not required.'
           }
         : {})
     });
@@ -3609,7 +3461,7 @@ export class AgentRuntime {
       request: compiled.logicalRequest,
       presentation: assembly.presentation
     });
-    return { request: result.request, compiled, estimate, fingerprint };
+    return { request: result.request, compiled, estimate, fingerprint, freshContext: contextPublication.committed, ...(cut ? { capturedHistoryCut: cut } : {}) };
   }
 
   private async admitContextRequest(
@@ -3636,7 +3488,7 @@ export class AgentRuntime {
       const probe = await this.assembleContextRecovery(request,
         new ContextAdmissionError(compiled, new Error('Compiled capacity must leave room for the current bounded context-management request.')),
         append, true, cut);
-      reserve = contextControlHeadroom(probe.assembly.compiled);
+      reserve = contextControlReserve(compiled, probe.assembly.compiled);
       this.contextControlReserve = { identity, tokens: reserve };
     }
     const remaining = requestCapacity(compiled.accounting, reserve).remainingTokens;
@@ -3660,136 +3512,24 @@ export class AgentRuntime {
     return applicationInstructions(typeof source === 'function' ? await source() : source);
   }
 
-  private async readCurrentTransform(
-    view: Awaited<ReturnType<typeof readSelectedHistorySources>>,
-    profile: ModelProfile
-  ) {
-    const artifacts = this.options.repositories.artifacts;
-    if (!artifacts) return undefined;
-    return readTransformedContext({
-      view,
-      artifacts,
-      provider: this.options.provider.id,
-      model: profile.id,
-      ...protocolTarget(profile)
-    });
-  }
-
   private async contextWindowForAdmission(
     input: ContextAdmissionInput,
-    request: AssistantTurnRequest,
-    prepare: (window: ModelWindow) => Promise<ModelRequest>
+    request: AssistantTurnRequest
   ) {
+    if (request.snapshot.profile.capabilities.protocol?.contextReset !== 'fresh_request')
+      throw new ContextContinuityError('unsupported', 'The selected provider does not support fresh context renewal.');
     const window = new ModelWindow(this.estimator);
-    const selected = input.entries;
-    let providerState: ReturnType<typeof encodeContextTransformReference> | undefined;
-    if (input.selection.strategy === 'provider' && input.preserveSelection) {
-      if (!this.options.context || !input.window?.selection.providerState)
-        throw new Error('Preserved native context is unavailable.');
-      const current = await this.readCurrentTransform(
-        await readSelectedHistorySources(this.options.context.history, input.cut), request.snapshot.profile);
-      if (!current) throw new Error('Preserved native context has no validated transformed input.');
-      window.setTransformedInput(current.input);
-      await replaySourceEntries(window, input.cut.sessionId,
-        selected.filter(entry => !current.represented.has(sourceRef(input.cut.sessionId, entry).entryId)),
-        this.options.repositories.artifacts,
-        new Set(input.selection.continuity?.sources.map(source => source.entryId)), request.runId);
-      providerState = input.window.selection.providerState;
-    } else if (input.selection.strategy === 'provider') {
-      const transformedWindow = new ModelWindow(this.estimator);
-      const current = this.options.context
-        ? await this.readCurrentTransform(
-            await readSelectedHistorySources(this.options.context.history, input.cut),
-            request.snapshot.profile
-          )
-        : undefined;
-      transformedWindow.setTransformedInput(current?.input ?? []);
-      const protectedIds = new Set(
-        (
-          (await this.options.context?.protectedSources(input.cut)) ??
-          input.selection.protected ??
-          []
-        ).map((source) => source.entryId)
-      );
-      const protectedExchanges = new Set(
-        selected.flatMap((entry) =>
-          (entry.type === 'assistant' ||
-            entry.type === 'tool_call' ||
-            entry.type === 'observation') &&
-          protectedIds.has(sourceRef(input.cut.sessionId, entry).entryId)
-            ? [assistantResponseKey(entry.runId, entry)]
-            : []
-        )
-      );
-      for (const entry of selected)
-        if (
-          (entry.type === 'assistant' ||
-            entry.type === 'tool_call' ||
-            entry.type === 'observation') &&
-          protectedExchanges.has(assistantResponseKey(entry.runId, entry))
-        )
-          protectedIds.add(sourceRef(input.cut.sessionId, entry).entryId);
-      const represented = selected.filter(
-        (entry) =>
-          (entry.type !== 'input' || entry.runId !== request.runId) &&
-          !protectedIds.has(sourceRef(input.cut.sessionId, entry).entryId)
-      );
-      await replaySourceEntries(
-        transformedWindow,
-        input.cut.sessionId,
-        represented.filter(
-          (entry) => !current?.represented.has(sourceRef(input.cut.sessionId, entry).entryId)
-        ),
-        this.options.repositories.artifacts,
-        new Set(input.selection.continuity?.sources.map((source) => source.entryId)),
-        request.runId
-      );
-      const sources = represented.map((entry) => sourceRef(input.cut.sessionId, entry));
-      const invocationId = `context-transform-${hashJson({ sources, model: request.snapshot.configuration.model, runId: request.runId, turnId: request.snapshot.record.turnId })}`;
-      const transformed = await this.inferenceService.transformContext({
-        ownerId: this.options.inferenceOwnerId ?? request.runId,
-        invocationId,
-        purpose: 'context_transformation',
-        runId: request.runId,
-        transformId: invocationId,
-        request: await prepare(transformedWindow),
-        profile: request.snapshot.profile,
-        outputReservation: request.snapshot.requestWindow.maxOutputTokens,
-        signal: request.signal
-      });
-      window.setTransformedInput(transformed.result.input);
-      await replaySourceEntries(
-        window,
-        input.cut.sessionId,
-        selected.filter((entry) => !represented.includes(entry)),
-        this.options.repositories.artifacts,
-        new Set(input.selection.continuity?.sources.map((source) => source.entryId)),
-        request.runId
-      );
-      providerState = encodeContextTransformReference({
-        format: 'agent-core.context-transform/1',
-        ownerId: transformed.ownerId,
-        invocationId,
-        transformId: transformed.result.transformId,
-        artifact: transformed.artifact,
-        sources
-      });
-    } else
-      await replaySourceEntries(
-        window,
-        input.cut.sessionId,
-        selected,
-        this.options.repositories.artifacts,
-        new Set(input.selection.continuity?.sources.map((source) => source.entryId)),
-        request.runId
-      );
-    return { window, providerState };
+    await replaySourceEntries(window, input.cut.sessionId, input.entries,
+      this.options.repositories.artifacts,
+      new Set(input.selection.continuity?.sources.map(source => source.entryId)), request.runId);
+    recordContextEvidence(window, input.excerpts);
+    return { window };
   }
 
-  private async activateCommittedContext(window: ModelWindow, runId: string): Promise<void> {
+  private async activateCommittedContext(window: ModelWindow, runId: string, refresh = false): Promise<void> {
     if (!this.options.context || !this.options.repositories.session) return;
     if (this.activeRunDriver) assertToolTransitionBoundary(this.activeRunDriver.state());
-    // An unchanged committed window needs no source planning or working-state read.
+    // An unchanged committed window needs no source planning or session-state read.
     const contextWindow = await this.options.context.history.selectedContext();
     const windowId = contextWindow?.windowId ?? null;
     const profile = await this.options.provider.describeModel(this.options.model);
@@ -3799,22 +3539,32 @@ export class AgentRuntime {
       model: this.options.model,
       protocol: profile.capabilities.protocol ?? null
     });
-    if (this.activeContextIdentity === identity) return;
-    const replay = await rebuildModelWindowFromRepositories({
-      readInferenceInput: (runId, invocationId) =>
-        this.inferenceService.admittedInput(this.options.inferenceOwnerId ?? runId, invocationId),
-      ...(this.history ? { history: this.history } : {}),
-      events: this.options.repositories.events,
-      ...(this.options.repositories.artifacts
-        ? { artifacts: this.options.repositories.artifacts }
-        : {}),
-      estimator: this.estimator,
-      providerId: this.options.provider.id,
-      model: this.options.model,
-      ...protocolTarget(profile),
-      currentRunId: runId,
-      runIds: [runId]
-    });
+    if (!refresh && this.activeContextIdentity === identity) return;
+    let replay;
+    try {
+      if (this.history && this.options.repositories.artifacts)
+        await assertHistoryModelCompatibility({ history: this.history,
+          artifacts: this.options.repositories.artifacts, profile, currentRunId: runId });
+      replay = await rebuildModelWindowFromRepositories({
+        readInferenceInput: (runId, invocationId) =>
+          this.inferenceService.admittedInput(this.options.inferenceOwnerId ?? runId, invocationId),
+        ...(this.history ? { history: this.history } : {}),
+        events: this.options.repositories.events,
+        ...(this.options.repositories.artifacts
+          ? { artifacts: this.options.repositories.artifacts }
+          : {}),
+        estimator: this.estimator,
+        providerId: this.options.provider.id,
+        model: this.options.model,
+        ...protocolTarget(profile),
+        currentRunId: runId,
+        runIds: [runId]
+      });
+    } catch (error) {
+      if (!(error instanceof NativeContextIncompatibilityError)) throw error;
+      await this.scheduleModelCompatibilityTransition(runId, profile);
+      return;
+    }
     for (const invalidated of replay.invalidatedProviderStates) {
       const event = {
         type: 'provider.state.invalidated' as const,
@@ -3828,6 +3578,32 @@ export class AgentRuntime {
     }
     window.replaceWith(replay.modelWindow);
     this.activeContextIdentity = identity;
+    this.pendingCompatibilityTransition = false;
+  }
+
+  /** A model choice requests fresh source replay; publication still requires its actual successor. */
+  private async scheduleModelCompatibilityTransition(runId: string, profile: ModelProfile): Promise<void> {
+    const context = this.options.context;
+    if (!context || !this.contextTransitions)
+      throw new Error('Incompatible native context requires source-backed successor admission.');
+    this.pendingCompatibilityTransition = true;
+    // A restored or explicit proposal is resolved before ordinary context may be dispatched.
+    if (this.contextTransitions.hasPending()) return;
+    const cut = await context.history.capture();
+    const window = await context.history.selectedContext(cut);
+    const model = { provider: this.options.provider.id, model: this.options.model,
+      ...(this.options.reasoning === undefined ? {} : { reasoning: this.options.reasoning }),
+      ...(this.options.temperature === undefined ? {} : { temperature: this.options.temperature }) };
+    const resetId = `model-${hashJson({ runId, model, windowId: window?.windowId ?? null })}`;
+    const selection = await context.freshSelection({
+      selection: await context.selectSources(cut, {}), model, profile, cut, resetId
+    });
+    await this.contextTransitions.schedule({
+      expectedWindowId: window?.windowId ?? null,
+      idempotencyKey: resetId,
+      reason: 'Admit original sources for the selected model.',
+      selection
+    });
   }
 
   async scheduleContextTransition(
@@ -3862,6 +3638,17 @@ export class AgentRuntime {
         throw new Error('Context tool operation is missing its exact authorized source boundary.');
       const expected = transition.expectedCut;
       const exchangeId = assistantResponseKey(runId, transition.toolInvocation);
+      const toolSources = await this.options.context.history.toolSources(transition.toolInvocation, cut);
+      let toolCallId: string | undefined;
+      let originInput: import('@agent-core/persistence').ProtectedArtifactRef | undefined;
+      for (const source of toolSources) {
+        retained.set(source.entryId, source);
+        const entry = await this.options.context.history.resolve(source, cut, 1024 * 1024);
+        if (entry?.type === 'tool_call' && entry.callIndex === transition.toolInvocation.callIndex &&
+            decodeToolCall(entry.call).name === 'context_transition') toolCallId = entry.callId;
+        if (entry?.type === 'assistant') originInput = entry.inferenceInput;
+      }
+      let acknowledged = false;
       let cursor: string | undefined;
       let scanned = 0;
       do {
@@ -3869,18 +3656,29 @@ export class AgentRuntime {
           cut, after: expected, ...(cursor ? { cursor } : {}), limit: 100, maxBytes: 32768
         });
         scanned += page.scanned;
-        if (scanned > 1000 || page.items.some((item) =>
-          item.type !== 'context_transition' &&
-          (item.runId !== runId || item.exchangeId !== exchangeId)))
-          throw new Error('Context source boundary changed beyond the originating tool exchange.');
+        if (scanned > 1000)
+          throw new Error('Context source boundary exceeds its bounded validation.');
+        for (const item of page.items) {
+          if (item.type === 'context_transition' || (item.runId === runId && item.exchangeId === exchangeId)) continue;
+          // A mandatory native tool receipt can settle one response before the connection
+          // reaches a fresh-request boundary. Only its exact durable causal successor is allowed.
+          const entry = item.type === 'assistant' && item.runId === runId && !acknowledged
+            ? await this.options.context.history.resolve(item.source, cut, 1024 * 1024)
+            : undefined;
+          if (entry?.type !== 'assistant' || entry.completeness !== 'complete' ||
+              entry.output?.some(output => output.type === 'tool_call' || output.type === 'media') ||
+              !toolCallId || !originInput || !entry.inferenceInput ||
+              !await this.inferenceService.isNativeAcknowledgement(
+                this.options.inferenceOwnerId ?? runId,
+                await this.inferenceService.inputInvocationId(this.options.inferenceOwnerId ?? runId, entry.inferenceInput),
+                await this.inferenceService.inputInvocationId(this.options.inferenceOwnerId ?? runId, originInput),
+                toolCallId))
+            throw new Error('Context source boundary changed beyond the originating tool exchange.');
+          retained.set(item.source.entryId, item.source);
+          acknowledged = true;
+        }
         cursor = page.cursor;
       } while (cursor);
-
-      for (const source of await this.options.context.history.toolSources(
-        transition.toolInvocation,
-        cut
-      ))
-        retained.set(source.entryId, source);
     }
     const completed = await this.options.context.selectSources(cut, {
       retain: [...retained.values()]
@@ -5155,19 +4953,19 @@ function requestCapacityConflict(
   };
 }
 
-function workingStateContext(
-  state: WorkingStateSnapshot
+function sessionStateContext(
+  state: SessionStateSnapshot
 ): readonly Omit<PromptContextItem, 'tokenEstimate'>[] {
   if (!state.revision) return [];
   return [
     {
-      id: `working-state:${state.revision.id}`,
-      sourceUri: `session://working-state/${state.revision.id}`,
+      id: `session-state:${state.revision.id}`,
+      sourceUri: `session://session-state/${state.revision.id}`,
       sourceKind: 'generated',
       representation: 'full',
-      mediaType: 'text/plain',
-      title: 'Current working state — generated interpretation',
-      content: state.text,
+      mediaType: 'application/json',
+      title: 'Current session state — generated interpretation',
+      content: JSON.stringify(state.content),
       purpose:
         'Current fallible understanding. Not instructions, authority, execution evidence or verification.'
     }
@@ -5187,4 +4985,12 @@ function snapshotRecoveryEmitter(snapshot: TurnSnapshot, emit: (event: AgentProg
   return snapshot.record.contextRecovery
     ? async (event: AgentProgressEvent) => { if (event.type !== 'assistant.delta' && event.type !== 'assistant.ended' && event.type !== 'assistant.interrupted') await emit(event); }
     : emit;
+}
+
+function isContextCheckpointTool(tool: CompiledToolDefinition): boolean {
+  return tool.implementationId === 'agent-core.context-transition.v1' ||
+    (tool.implementationId === `agent-core.${tool.name}.v1` &&
+      tool.effectEnvelope.accesses.every(access => access.mode === 'read' &&
+        (access.scope === 'context' || access.scope === 'history')) &&
+      ['_inspect', '_read', '_search', '_latest'].some(suffix => tool.name.endsWith(suffix)));
 }

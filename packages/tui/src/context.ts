@@ -18,7 +18,6 @@ export interface ContextOperations {
   transitionContext(request: ContextTransitionRequest): Promise<{
     readonly selection: { readonly kind: 'scheduled'; readonly requestId: string } | { readonly kind: 'selected' };
   }>;
-  freshContext(retained?: readonly HistorySourceRef[]): Promise<unknown>;
 }
 export interface ContextState {
   readonly requestId?: string | undefined;
@@ -30,7 +29,7 @@ export interface ContextState {
   readonly pendingTransition?: { readonly idempotencyKey: string; readonly requestId?: string } | undefined;
 }
 export type ContextMessage =
-  | { readonly type: 'context.open' | 'context.apply' | 'context.fresh' }
+  | { readonly type: 'context.open' | 'context.apply' }
   | { readonly type: 'context.page'; readonly source: 'history' }
   | { readonly type: 'context.source'; readonly source: HistorySourceRef }
   | { readonly type: 'context.scroll'; readonly offset: number }
@@ -89,7 +88,7 @@ export function updateContext(
       const retained = previous.some((source) => sameSource(source, message.source))
         ? previous.filter((source) => !sameSource(source, message.source))
         : [...previous, message.source];
-      return { state: { ...state, selection: { strategy: 'sources', retained } } };
+      return { state: { ...state, selection: { retained } } };
     }
     case 'context.scroll':
       return { state: { ...state, offset: message.offset } };
@@ -124,10 +123,12 @@ export function updateContext(
     default: {
       if (state.pendingTransition !== undefined) return { state };
       if (
-        (message.type === 'context.apply' || message.type === 'context.fresh') &&
+        message.type === 'context.apply' &&
         (state.selection === undefined || state.inspection === undefined)
       )
         return { state };
+      if (message.type === 'context.apply' && !state.inspection?.pendingWork.some((work) => work.state === 'claimed'))
+        return { state: { ...state, notice: 'Apply is available while a request is running; idle history remains inspectable.' } };
       const requestId = crypto.randomUUID();
       const reset = message.type !== 'context.page';
       return {
@@ -151,8 +152,6 @@ export function updateContext(
                   ? { type: 'context.scheduled', requestId, scheduledRequestId: result.selection.requestId }
                   : { type: 'context.applied', idempotencyKey: requestId } };
               }
-              if (message.type === 'context.fresh')
-                await operations.freshContext(state.selection?.retained);
               signal.throwIfAborted();
               const inspection = reset
                 ? await operations.inspectContext()
@@ -225,7 +224,9 @@ export function contextView(
               ? 'Loading context…'
               : (state.notice ??
                 state.inspection?.admission?.message ??
-                'Choose original sources for the next window. Current working state is included automatically; history remains available.')
+                (state.inspection && !state.inspection.pendingWork.some((work) => work.state === 'claimed')
+                  ? 'Apply is available while a request is running; idle history remains inspectable.'
+                  : 'Choose original sources for the next window. Current session state is included automatically; history remains available.'))
           }),
           ...(capacity
             ? [
@@ -262,15 +263,17 @@ export function contextView(
                 })
               ]
             : []),
-          ...(state.inspection?.workingState
+          ...(state.inspection?.sessionState
             ? [
                 text({
-                  content: `Current working state · generated interpretation · ${state.inspection.workingState.revisionId ?? 'empty'}`
+                  content: `Current session state · generated interpretation · ${state.inspection.sessionState.revisionId ?? 'empty'}`
                 }),
                 text({
-                  content: state.inspection.workingState.text || 'No working-state content.'
+                  content: ('content' in state.inspection.sessionState
+                    ? JSON.stringify(state.inspection.sessionState.content, null, 2)
+                    : 'preview' in state.inspection.sessionState ? state.inspection.sessionState.preview : undefined) ?? 'No session-state content.'
                 }),
-                ...(!state.inspection.workingState.complete
+                ...(!state.inspection.sessionState.complete
                   ? [
                       text({
                         content:
@@ -295,19 +298,10 @@ export function contextView(
             label: 'Apply selection',
             ...(state.requestId !== undefined || state.pendingTransition !== undefined ||
             state.inspection === undefined ||
-            state.selection === undefined
+            state.selection === undefined ||
+            !state.inspection.pendingWork.some((work) => work.state === 'claimed')
               ? { disabled: true }
               : { onPress: (): Message => ({ type: 'context.apply' }) })
-          }),
-          button<Message>({
-            id: 'context-fresh',
-            label: 'Fresh reasoning; keep selected originals',
-            ...(state.requestId !== undefined || state.pendingTransition !== undefined ||
-            state.inspection === undefined ||
-            state.selection === undefined ||
-            state.inspection.pendingWork.length
-              ? { disabled: true }
-              : { onPress: (): Message => ({ type: 'context.fresh' }) })
           }),
           button<Message>({
             id: 'context-refresh',

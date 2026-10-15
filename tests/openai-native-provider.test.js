@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { OpenAIProvider } from '@agent-core/provider-openai';
-import { modelOutputToInput, parseModelStreamEvent, parseModelContextTransformResult, modelInputIdentity, requestAccountingInputTokens } from '@agent-core/model';
+import { modelOutputToInput, parseModelStreamEvent, modelInputIdentity, requestAccountingInputTokens } from '@agent-core/model';
 
 class FixtureSocket extends EventEmitter {
   readyState = 1;
@@ -293,41 +293,7 @@ test('async tools and appended configuration are exact-model capabilities and pr
   assert.equal((await custom.describeModel('gpt-6-astra')).capabilities.protocol.asyncTools, false);
 });
 
-test('native compaction replays the entire returned window and records exact origin and usage', async () => {
-  const canonical = [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'retained original' }] }, { type: 'compaction', id: 'cmp-1', encrypted_content: 'opaque==' }];
-  const sent = [];
-  const provider = new OpenAIProvider({ apiKey: 'fixture', fetch: async (url, init) => { sent.push([url, JSON.parse(init.body)]); return Response.json(url.endsWith('/compact') ? { id: 'compacted', output: canonical, usage: { input_tokens: 20, output_tokens: 8, total_tokens: 28 } } : response('r-next', 'done')); } });
-  const transformed = await provider.transformContext({ transformId: 'transition-1', request });
-  assert.equal(transformed.transformId, 'transition-1');
-  assert.equal(transformed.state.origin.requestId, 'compacted');
-  assert.equal(transformed.usage.totalTokens, 28);
-  await provider.complete({ ...request, messages: [...transformed.input, { role: 'user', content: 'next' }] });
-  assert.deepEqual(sent[1][1].input.slice(0, 2), canonical);
-});
 
-test('native compaction admits its exact payload once and binds transform dispatch to the original identity', async () => {
-  const sent = [];
-  const provider = new OpenAIProvider({ apiKey: 'fixture', fetch: async (url, init) => {
-    sent.push([url, JSON.parse(init.body)]);
-    return Response.json({ id: 'compaction-exact', output: [{ type: 'compaction', encrypted_content: 'opaque==' }], usage: { input_tokens: 20, output_tokens: 8, total_tokens: 28 } });
-  } });
-  const source = { ...request, messages: request.messages.map(item => ({ ...item })), tools: [{ type: 'function', function: { name: 'unused_schema', parameters: { description: 'x'.repeat(30000) } } }], reasoning: { strategy: 'effort', effort: 'high' } };
-  const compiled = await provider.compileContextTransform({ transformId: 'transform-exact', request: source });
-  assert.equal(sent.length, 0);
-  assert.deepEqual(Object.keys(compiled.body).sort(), ['input', 'model']);
-  assert.equal(compiled.endpoint, 'https://api.openai.com/v1/responses/compact');
-  assert.equal(compiled.accounting.outputReservation, 100);
-  assert.equal(compiled.accounting.outputReservationSource, 'policy');
-  assert.ok(compiled.accounting.estimatedInputTokens < 1000, 'unused generation tool schemas do not inflate compaction accounting');
-  source.messages[0].content = 'changed after admission';
-  await assert.rejects(() => provider.transformContextCompiled('wrong-id', compiled), /not admitted/u);
-  assert.throws(() => provider.completeCompiled(compiled), /not admitted/u);
-  const transformed = await provider.transformContextCompiled('transform-exact', compiled);
-  assert.deepEqual(sent[0], [compiled.endpoint, compiled.body]);
-  assert.deepEqual(parseModelContextTransformResult(JSON.parse(JSON.stringify(transformed))), transformed);
-  assert.throws(() => parseModelContextTransformResult({ ...transformed, usage: { promptTokens: -1, completionTokens: 0, totalTokens: -1 } }), /usage/u);
-  assert.equal(sent.length, 1);
-});
 
 test('failed native steering after original completion settles without waiting for an impossible successor', async () => {
   const provider = new OpenAIProvider({ apiKey: 'fixture', transport: 'websocket', streamIdleTimeoutMs: 100, webSocketFactory: () => new FixtureSocket((body, ws) => {
@@ -617,16 +583,6 @@ test('buffered causal response evidence can reconcile result application after s
   assert.equal((await session.toolResultStatus('buffered-delivery')).status, 'applied', 'delivery application is separate from successor inference completion');
 });
 
-test('native compaction keeps its full canonical prefix and appends current authority at exact roles', async () => {
-  const canonical = [...textOutput('retained assistant'), { type: 'compaction', encrypted_content: 'opaque==' }];
-  const provider = new OpenAIProvider({ apiKey: 'fixture', countTokens: true, fetch: async url => Response.json(url.endsWith('/input_tokens') ? { input_tokens: 40 } : { id: 'compacted', output: canonical }) });
-  const transformed = await provider.transformContext({ transformId: 'host-prefix', request });
-  const authority = [{ role: 'system', content: 'Current host policy.' }, { role: 'developer', content: 'Current application instructions.' }];
-  const compiled = await provider.compileRequest({ ...request, messages: [...authority, ...transformed.input, { role: 'user', content: 'next' }] });
-  assert.deepEqual(compiled.body.input, [...canonical, ...authority, { role: 'user', content: 'next' }]);
-  assert.deepEqual(compiled.logicalRequest.messages.slice(0, 2), authority);
-  await assert.rejects(() => provider.compileRequest({ ...request, messages: [...request.messages, ...transformed.input] }), /must precede ordinary/u);
-});
 
 for (const method of ['complete', 'stream', 'completeCompiled', 'streamCompiled']) {
   test(`native ${method} preserves transport cancellation`, async () => {
@@ -679,4 +635,9 @@ test('native logical streaming retains host admission for steering', async () =>
   } finally {
     await session.close();
   }
+});
+
+test('Responses rejects unsupported opaque output instead of converting it to context', async () => {
+  const provider = new OpenAIProvider({ apiKey: 'fixture', fetch: async () => Response.json({ ...response('unsupported', 'ignored'), output: [{ type: 'compaction', encrypted_content: 'opaque==' }] }) });
+  await assert.rejects(provider.complete(request), /Unsupported required Responses output/);
 });

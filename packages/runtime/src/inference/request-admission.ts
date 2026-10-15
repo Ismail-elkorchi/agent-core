@@ -7,7 +7,7 @@ import {
 } from '@agent-core/model';
 import type { InferenceService } from './service.js';
 import { hashJson } from '@agent-core/persistence';
-import { NativeContextTransitionRequired } from './input.js';
+import { NativeContextTransitionRequired, type RequestPresentation } from './input.js';
 import {
   ModelRequestAssembler,
   type ModelRequestAssemblyInput
@@ -35,15 +35,17 @@ export class RequestAdmission {
         'The current tool catalog differs from the catalog bound to earlier reasoning.'
       );
     const request: ModelRequest = { ...settings, messages: assembly.messages };
-    const compiled = await this.inference.compile(
-      request,
-      input.modelProfile,
-      {
-        outputReservation
-      },
-      assembly.presentation
-    );
+    const compiled = await this.compile(request, input.modelProfile, outputReservation, assembly.presentation);
     return Object.freeze({ assembly, request, compiled });
+  }
+
+  compile(
+    request: ModelRequest,
+    profile: ModelProfile,
+    outputReservation: number,
+    presentation?: RequestPresentation
+  ): Promise<CompiledModelRequest> {
+    return this.inference.compile(request, profile, { outputReservation }, presentation);
   }
 
   /** Also admits adapter-compiled native successors without inventing an initial-request identity. */

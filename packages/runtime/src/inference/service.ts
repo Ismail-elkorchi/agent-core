@@ -1,9 +1,11 @@
+import { historyCutSchema } from '../history/schema.js';
+import type { HistorySourceCut } from '../history/contracts.js';
 import * as z from 'zod';
 import {
   readAdmittedModelInput,
   type RequestPresentation
 } from './input.js';
-import type { WorkingStateInference } from '../session/working-state.js';
+import type { SessionStateInference } from '../session/session-state.js';
 import { ModelStreamInterruptedError } from '../orchestration/model-stream.js';
 import { executeEffectLifecycle, type EffectLifecycle } from '@agent-core/effects';
 import { parseJsonObject } from '@agent-core/json';
@@ -14,15 +16,14 @@ import {
   createModelRequest,
   modelInputIdentity,
   observeModelRequest,
-  parseModelContextTransformResult,
   parseModelProfile,
   parseModelResponse,
   requestAccountingInputTokens,
   requestAccountingInputBound,
   type CompiledModelRequest,
   type ModelCompilationOptions,
-  type ModelContextTransformResult,
   type ModelProfile,
+  type ModelNativeDispatch,
   type ModelProvider,
   type ModelProviderSession,
   type ModelRequest,
@@ -40,7 +41,6 @@ import {
   type EventLedgerTail
 } from '@agent-core/persistence';
 import { randomUUID } from 'node:crypto';
-import { requestWindowForModel } from '../orchestration/model-request.js';
 import { InferenceGateway, type InferenceInvocation } from './gateway.js';
 import { ContextAdmissionError } from './request-admission.js';
 import {
@@ -68,7 +68,8 @@ export interface InferenceServiceOptions {
   readonly admitRequest?: (request: CompiledModelRequest) => void | Promise<void>;
 }
 export interface GovernedInferenceInput extends InferenceIdentity, ModelCompilationOptions {
-  readonly workingStateRevisionId?: string | null;
+  readonly sessionStateRevisionId?: string | null;
+  readonly capturedHistoryCut?: HistorySourceCut | undefined;
   readonly request: ModelRequest;
   readonly compiled?: CompiledModelRequest;
   readonly profile?: ModelProfile;
@@ -76,10 +77,6 @@ export interface GovernedInferenceInput extends InferenceIdentity, ModelCompilat
   readonly onStreamEvent?: (
     event: Exclude<ModelStreamEvent, { readonly type: 'done' }>
   ) => void | Promise<void>;
-}
-export interface GovernedContextTransformInput
-  extends Omit<GovernedInferenceInput, 'onStreamEvent'> {
-  readonly transformId: string;
 }
 interface DurableInferenceInput extends GovernedInferenceInput {
   readonly session?: ModelProviderSession;
@@ -98,12 +95,6 @@ interface DurableResult<T> extends InferenceIdentity, InferenceCharges {
 export interface InferenceResult extends InferenceIdentity, InferenceCharges {
   readonly status: 'settled';
   readonly response: ModelResponse;
-  readonly replayed: boolean;
-}
-export interface ContextTransformResult extends InferenceIdentity, InferenceCharges {
-  readonly status: 'settled';
-  readonly result: ModelContextTransformResult;
-  readonly artifact: ArtifactRef;
   readonly replayed: boolean;
 }
 export class InferenceContextRejectedError extends Error {
@@ -188,15 +179,16 @@ export class InferenceBudgetExceededError extends Error {
   }
 }
 interface DurableOperation<T extends { readonly usage?: ModelUsage }> {
+  readonly nativeDispatch?: ModelNativeDispatch | undefined;
   readonly identity: InferenceIdentity;
-  readonly workingStateRevisionId?: string | null;
-  readonly operation: 'generation' | 'context_transform' | 'native_generation';
+  readonly sessionStateRevisionId?: string | null;
+  readonly capturedHistoryCut?: HistorySourceCut | undefined;
+  readonly operation: 'generation' | 'native_generation';
   readonly profile: ModelProfile;
   readonly compiled: CompiledModelRequest;
   readonly sourceRequest: ModelRequest;
   readonly outputReservation?: number;
   readonly signal?: AbortSignal;
-  readonly discriminator?: string;
   readonly dispatch: () => Promise<T>;
   readonly decode: (value: unknown) => T;
   readonly startAuthority?: () => Promise<void>;
@@ -235,7 +227,7 @@ export class InferenceService {
       artifacts: new InMemoryArtifactRepository()
     });
   }
-  /** Settled invocation identities are counted once, including transforms and native generations. */
+  /** Settled invocation identities are counted once, including native generations. */
   async settledRunUsage(ownerId: string, runId: string) {
     return (await this.options.repository.load(ownerId, { runId })).settledUsage;
   }
@@ -315,18 +307,63 @@ export class InferenceService {
     }
     await this.options.admitRequest?.(compiled);
   }
-  async workingStateOrigin(
+  async inputInvocationId(ownerId: string, ref: ArtifactRef): Promise<string> {
+    if (ref.visibility !== 'protected') throw new Error('Inference input must be protected.');
+    const record = z.object({ invocationId: z.string().min(1) }).parse(
+      JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(
+        await this.options.artifacts.readVerified(ref)
+      )) as unknown
+    );
+    const current = await this.inputReference(ownerId, record.invocationId);
+    if (current.sha256 !== ref.sha256) throw new Error('Inference input does not match its durable invocation.');
+    return record.invocationId;
+  }
+
+  /** Prove a settled native result-only successor of this exact original tool call. */
+  async isNativeAcknowledgement(
+    ownerId: string,
+    invocationId: string,
+    sourceInvocationId: string,
+    toolCallId: string
+  ): Promise<boolean> {
+    const [successor, source] = await Promise.all([
+      this.options.repository.load(ownerId, { invocationId }),
+      this.options.repository.load(ownerId, { invocationId: sourceInvocationId })
+    ]);
+    const next = successor.invocation;
+    const prior = source.invocation;
+    if (!next?.settlement || !prior?.settlement ||
+        next.start.operation !== 'native_generation' ||
+        prior.start.operation !== 'native_generation' || next.start.runId !== prior.start.runId)
+      return false;
+    const record = z.object({ nativeDispatch: nativeDispatchProvenanceSchema.optional() }).parse(
+      JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(
+        await this.options.artifacts.readVerified(next.extension?.requestRef ?? next.start.requestRef)
+      )) as unknown
+    );
+    const dispatch = record.nativeDispatch;
+    if (dispatch?.kind !== 'tool_results' || dispatch.sourceCalls.length !== 1) return false;
+    const response = parseModelResponse(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(
+      await this.options.artifacts.readVerified(prior.settlement.resultRef)
+    )) as unknown);
+    return dispatch.sourceCalls[0]?.toolCallId === toolCallId &&
+      dispatch.sourceCalls[0].responseId === response.requestId &&
+      response.toolCalls?.some(call => call.id === toolCallId) === true;
+  }
+
+  async sessionStateOrigin(
     ownerId: string,
     invocationId: string
   ): Promise<{
     readonly revisionId: string | null;
-    readonly inference: WorkingStateInference;
+    readonly capturedHistoryCut: HistorySourceCut;
+    readonly inference: SessionStateInference;
   }> {
     const ref = await this.inputReference(ownerId, invocationId);
     // Only the captured binding is needed here. The protected, already-accounted
     // request body is not a model-tool JSON payload with collection quotas.
     const record = z
-      .object({ workingStateRevisionId: z.string().min(1).nullable() })
+      .object({ sessionStateRevisionId: z.string().min(1).nullable(), capturedHistoryCut: historyCutSchema })
       .parse(
         JSON.parse(
           new TextDecoder('utf-8', { fatal: true }).decode(
@@ -335,7 +372,8 @@ export class InferenceService {
         ) as unknown
       );
     return {
-      revisionId: record.workingStateRevisionId,
+      revisionId: record.sessionStateRevisionId,
+      capturedHistoryCut: record.capturedHistoryCut,
       inference: { ownerId, invocationId, requestRef: ref }
     };
   }
@@ -351,7 +389,8 @@ export class InferenceService {
       result = await this.invokeDurably(
         {
           ...identity,
-          workingStateRevisionId: input.workingStateRevisionId ?? null,
+          sessionStateRevisionId: input.sessionStateRevisionId ?? null,
+          capturedHistoryCut: input.capturedHistoryCut,
           request: input.request,
           profile: input.profile,
           session: input.session,
@@ -379,86 +418,6 @@ export class InferenceService {
     return this.invokeDurably(input);
   }
 
-  /** Native transforms are inference operations, with exactly the same owning budget and uncertainty rules. */
-  async transformContext(input: GovernedContextTransformInput): Promise<ContextTransformResult> {
-    const replayed = await this.replayExisting(
-      input,
-      'context_transform',
-      parseModelContextTransformResult,
-      input.transformId
-    );
-    if (replayed)
-      return Object.freeze({
-        ...chargesAndIdentity(replayed),
-        status: 'settled',
-        result: replayed.value,
-        artifact: replayed.artifact,
-        replayed: true
-      });
-    const signal = input.signal ?? input.request.signal;
-    signal?.throwIfAborted();
-    const profile = parseModelProfile(
-      input.profile ?? (await this.options.provider.describeModel(input.request.model))
-    );
-    const provider = this.options.provider;
-    if (
-      !profile.capabilities.protocol?.contextTransforms.length ||
-      !provider.compileContextTransform ||
-      !provider.transformContextCompiled
-    )
-      throw new Error('Provider has no governed compiled context transform capability.');
-    const request = createModelRequest({
-      ...input.request,
-      ...(signal ? { signal } : {})
-    });
-    const transform = provider.transformContextCompiled.bind(provider);
-    const compiled = await provider.compileContextTransform(
-      { transformId: input.transformId, request, ...(signal ? { signal } : {}) },
-      {
-        ...(this.tokenObservation ? { tokenObservation: this.tokenObservation } : {}),
-        outputReservation: requestWindowForModel(
-          profile,
-          request.maxOutputTokens ?? input.outputReservation
-        ).maxOutputTokens
-      }
-    );
-    const result = await this.executeDurably({
-      identity: ownIdentity(input),
-      workingStateRevisionId: input.workingStateRevisionId ?? null,
-      operation: 'context_transform',
-      sourceRequest: request,
-      ...(input.outputReservation === undefined
-        ? {}
-        : { outputReservation: input.outputReservation }),
-      profile,
-      compiled,
-      discriminator: input.transformId,
-      ...(signal ? { signal } : {}),
-      dispatch: () =>
-        transform(input.transformId, compiled, {
-          affinityKey: input.ownerId,
-          ...(signal ? { signal } : {})
-        }),
-      decode: (value) => {
-        const owned = parseModelContextTransformResult(value);
-        if (
-          owned.transformId !== input.transformId ||
-          owned.state.provider !== profile.provider ||
-          owned.state.model !== profile.id
-        )
-          throw new Error('Context transform result changed the admitted identity.');
-        return owned;
-      }
-    });
-    return Object.freeze({
-      ...chargesAndIdentity(result),
-      status: 'settled',
-      result: result.value,
-      artifact: result.artifact,
-      replayed: result.replayed
-    });
-  }
-
   async invokeNative(input: NativeInferenceInput) {
     return invokeNativeInference(
       {
@@ -466,8 +425,10 @@ export class InferenceService {
         start: async ({ context, signal, authorize, dispatch }) => {
           const result = await this.executeDurably({
             identity: ownIdentity(context),
-            workingStateRevisionId: input.workingStateRevisionId?.() ?? null,
+            sessionStateRevisionId: input.sessionStateRevisionId?.() ?? null,
+            capturedHistoryCut: await input.capturedHistoryCut?.(),
             operation: 'native_generation',
+            nativeDispatch: context.dispatch,
             profile: context.profile,
             compiled: context.compiled,
             sourceRequest: context.compiled.logicalRequest,
@@ -487,8 +448,8 @@ export class InferenceService {
             replayed: false
           });
         },
-        extend: (context, compiled) =>
-          this.extendNativeInvocation(context, compiled, input.workingStateRevisionId?.() ?? null)
+        extend: async (context, compiled, dispatch) =>
+          this.extendNativeInvocation(context, compiled, input.sessionStateRevisionId?.() ?? null, await input.capturedHistoryCut?.(), dispatch)
       },
       {
         ...input,
@@ -506,14 +467,20 @@ export class InferenceService {
   private async extendNativeInvocation(
     context: NativeGenerationContext,
     compiled: CompiledModelRequest,
-    workingStateRevisionId: string | null
+    sessionStateRevisionId: string | null,
+    capturedHistoryCut: HistorySourceCut | undefined,
+    dispatch: ModelNativeDispatch
   ): Promise<void> {
     const { repository, artifacts } = this.options;
+    capturedHistoryCut = capturedHistoryCut === undefined ? undefined : historyCutSchema.parse(capturedHistoryCut);
     await this.admit(compiled, context.profile);
     const reservation = inferenceReservation(compiled, context.profile, this.options.budget ?? {});
     const fingerprint = (
       await modelInputIdentity({
         identity: ownIdentity(context),
+        sessionStateRevisionId,
+        capturedHistoryCut: capturedHistoryCut ?? null,
+        nativeDispatch: nativeDispatchProvenance(dispatch),
         inputIdentity: compiled.inputIdentity,
         accounting: compiled.accounting,
         profile: context.profile
@@ -545,7 +512,10 @@ export class InferenceService {
         mediaType: 'application/json',
         content: new TextEncoder().encode(
           JSON.stringify({
-            workingStateRevisionId,
+            invocationId: context.invocationId,
+            sessionStateRevisionId,
+            capturedHistoryCut,
+            nativeDispatch: nativeDispatchProvenance(dispatch),
             logical: recordableSourceRequest(compiled.logicalRequest),
             profile: context.profile,
             body: compiled.body,
@@ -607,7 +577,8 @@ export class InferenceService {
     try {
       const result = await this.executeDurably({
         identity: ownIdentity(input),
-        workingStateRevisionId: input.workingStateRevisionId ?? null,
+        sessionStateRevisionId: input.sessionStateRevisionId ?? null,
+        capturedHistoryCut: input.capturedHistoryCut,
         operation: 'generation',
         sourceRequest: request,
         ...(input.outputReservation === undefined
@@ -654,16 +625,18 @@ export class InferenceService {
 
   private async sourceFingerprint(
     identity: InferenceIdentity,
-    operation: 'generation' | 'context_transform' | 'native_generation',
+    operation: 'generation' | 'native_generation',
     request: ModelRequest,
-    discriminator?: string,
+    sessionStateRevisionId: string | null,
+    capturedHistoryCut: HistorySourceCut | undefined,
     outputReservation?: number
   ): Promise<string> {
     return (
       await modelInputIdentity({
         identity,
         operation,
-        discriminator: discriminator ?? null,
+        sessionStateRevisionId,
+        capturedHistoryCut: capturedHistoryCut === undefined ? null : historyCutSchema.parse(capturedHistoryCut),
         provider: this.options.provider.id,
         implementation: this.options.provider.implementationId,
         request: recordableSourceRequest(request),
@@ -675,9 +648,8 @@ export class InferenceService {
   /** Replay owns no fresh provider I/O: the persisted admission already fixed profile and input. */
   private async replayExisting<T>(
     input: GovernedInferenceInput,
-    operation: 'generation' | 'context_transform' | 'native_generation',
-    decode: (value: unknown) => T,
-    discriminator?: string
+    operation: 'generation' | 'native_generation',
+    decode: (value: unknown) => T
   ): Promise<DurableResult<T> | undefined> {
     const { repository, artifacts } = this.options;
     (input.signal ?? input.request.signal)?.throwIfAborted();
@@ -692,7 +664,8 @@ export class InferenceService {
         identity,
         operation,
         input.request,
-        discriminator,
+        input.sessionStateRevisionId ?? null,
+        input.capturedHistoryCut,
         input.outputReservation
       ))
     )
@@ -759,6 +732,8 @@ export class InferenceService {
   ): Promise<DurableResult<T>> {
     const { repository, artifacts } = this.options;
     const { identity, profile, compiled, signal } = input;
+    const capturedHistoryCut = input.capturedHistoryCut === undefined
+      ? undefined : historyCutSchema.parse(input.capturedHistoryCut);
     signal?.throwIfAborted();
     assertCompiledProfile(compiled, profile);
     try {
@@ -772,20 +747,22 @@ export class InferenceService {
       identity,
       input.operation,
       input.sourceRequest,
-      input.discriminator,
+      input.sessionStateRevisionId ?? null,
+      capturedHistoryCut,
       input.outputReservation
     );
     const fingerprint = (
       await modelInputIdentity({
         identity,
         operation: input.operation,
-        discriminator: input.discriminator ?? null,
+        sessionStateRevisionId: input.sessionStateRevisionId ?? null,
         provider: this.options.provider.id,
         implementation: this.options.provider.implementationId,
         profile,
         inputIdentity: compiled.inputIdentity,
         accounting: compiled.accounting,
-        sourceFingerprint
+        sourceFingerprint,
+        nativeDispatch: input.nativeDispatch ? nativeDispatchProvenance(input.nativeDispatch) : null
       })
     ).slice(7);
     const reservation = inferenceReservation(compiled, profile, this.options.budget ?? {});
@@ -839,11 +816,14 @@ export class InferenceService {
         mediaType: 'application/json',
         content: new TextEncoder().encode(
           JSON.stringify({
+            invocationId: identity.invocationId,
             runId: identity.runId ?? null,
             ...(this.presentations.has(compiled)
               ? { presentation: this.presentations.get(compiled) }
               : {}),
-            workingStateRevisionId: input.workingStateRevisionId ?? null,
+            sessionStateRevisionId: input.sessionStateRevisionId ?? null,
+            capturedHistoryCut,
+            ...(input.nativeDispatch ? { nativeDispatch: nativeDispatchProvenance(input.nativeDispatch) } : {}),
             logical,
             sourceRequest: recordableSourceRequest(input.sourceRequest),
             profile,
@@ -1180,4 +1160,14 @@ function recordableSourceRequest(request: ModelRequest): Omit<ModelRequest, 'sig
   const value = { ...createModelRequest(request) };
   delete value.signal;
   return value;
+}
+
+const nativeDispatchProvenanceSchema = z.strictObject({
+  kind: z.enum(['steering', 'tool_results', 'continuation']),
+  sourceCalls: z.array(z.strictObject({
+    responseId: z.string().min(1), catalogIdentity: z.string().min(1), toolCallId: z.string().min(1)
+  }))
+});
+function nativeDispatchProvenance(dispatch: ModelNativeDispatch) {
+  return nativeDispatchProvenanceSchema.parse({ kind: dispatch.kind, sourceCalls: dispatch.sourceCalls });
 }

@@ -11,7 +11,7 @@ import * as z from 'zod';
 export const requestPresentationSchema = z.strictObject({
   authority: z.string(),
   context: z.string(),
-  workingState: z.string(),
+  sessionState: z.string(),
   capacityNotice: z.string().optional(),
   runInstructions: z.string()
 });

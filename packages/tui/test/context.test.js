@@ -5,7 +5,7 @@ import { createTuiRuntime, defineTui } from '@ismail-elkorchi/terminal-ui/tui';
 import { contextView, createContextState, updateContext } from '@agent-core/tui';
 
 for (const columns of [48, 120])
-  test(`context selection at ${columns} columns preserves protected sources and current working-state interpretation`, async (t) => {
+  test(`context selection at ${columns} columns preserves protected sources and current session-state interpretation`, async (t) => {
     const source = { sessionId: 'session', entryId: 'input', sha256: 'a'.repeat(64) };
     const cut = {
       format: 'agent-core.history/1',
@@ -18,11 +18,11 @@ for (const columns of [48, 120])
     const inspection = {
       cut,
       window: null,
-      activeSelection: { status: 'available', selection: { strategy: 'sources', retained: [source] } },
-      workingState: { revisionId: 'revision', text: 'A model hypothesis', complete: true },
+      activeSelection: { status: 'available', selection: { retained: [source] } },
+      sessionState: { revisionId: 'revision', content: { working: [{ id: 'hypothesis', text: 'A model hypothesis' }] }, complete: true },
       protectedSources: [source],
-      pendingWork: [],
-      legalTransitions: ['sources'],
+      pendingWork: [{ submissionId: 'submission', runId: 'run', state: 'claimed' }],
+      legalTransitions: ['fresh'],
       budget: { maxSourceBytes: 8192, quality: 'byte_bound' }
     };
     const selections = [];
@@ -69,7 +69,7 @@ for (const columns of [48, 120])
     await runtime.dispatch({ type: 'context.apply' });
     for (let i = 0; i < 300 && selections.length === 0; i++)
       await new Promise((resolve) => setTimeout(resolve, 5));
-    assert.equal(runtime.state().inspection.workingState.text, 'A model hypothesis');
+    assert.equal(runtime.state().inspection.sessionState.content.working[0].text, 'A model hypothesis');
     assert.ok(!('notes' in selections[0].selection));
     assert.deepEqual(selections[0].selection.retained, [source]);
     assert.equal(selections[0].expectedWindowId, null);
@@ -77,15 +77,17 @@ for (const columns of [48, 120])
     assert.ok(selections[0].idempotencyKey);
   });
 
-test('context controls preserve the effective selection and forward the edited set to fresh context', async () => {
+test('context controls preserve the effective selection and forward the edited set through one transition', async () => {
   const source = (entryId) => ({ sessionId: 'session', entryId, sha256: 'a'.repeat(64) });
   const first = source('first'), recent = source('recent'), config = source('config');
   let state = { ...createContextState(), requestId: 'load' };
   state = updateContext(state, {
     type: 'context.loaded', requestId: 'load', reset: true,
     inspection: {
-      activeSelection: { status: 'available', selection: { strategy: 'sources', retained: [first, recent] } },
-      window: { selection: { strategy: 'sources', retained: [first] } },
+      activeSelection: { status: 'available', selection: { retained: [first, recent] } },
+      pendingWork: [{ submissionId: 'submission', runId: 'run', state: 'claimed' }],
+      cut: { sourceRevision: 1 },
+      window: { selection: { retained: [first] } },
       protectedSources: []
     },
     history: { items: [{ source: config, role: 'control', type: 'model_settings' }] }
@@ -95,8 +97,8 @@ test('context controls preserve the effective selection and forward the edited s
   assert.deepEqual(state.selection.retained, [first, recent], 'configuration records are not selectable messages');
   state = updateContext(state, { type: 'context.source', source: first }, {}).state;
   const calls = [];
-  const result = updateContext(state, { type: 'context.fresh' }, {
-    freshContext: async (retained) => calls.push(retained),
+  const result = updateContext(state, { type: 'context.apply' }, {
+    transitionContext: async (request) => { calls.push(request.selection.retained); return { selection: { kind: 'selected' } }; },
     inspectContext: async () => ({ cut: {} }),
     contextSources: async () => ({ items: [] })
   });
@@ -115,18 +117,18 @@ test('an oversized active context stays inspectable without presenting an empty 
   }, {}).state;
   assert.equal(loaded.selection, undefined);
   assert.match(loaded.notice, /source bound/);
-  for (const type of ['context.apply', 'context.fresh'])
+  for (const type of ['context.apply'])
     assert.equal(updateContext(loaded, { type }, {}).effects, undefined);
   const selected = updateContext(loaded, { type: 'context.source', source }, {}).state;
-  assert.deepEqual(selected.selection, { strategy: 'sources', retained: [source] });
+  assert.deepEqual(selected.selection, { retained: [source] });
 });
 
 function selectionDraft() {
   const source = { sessionId: 'session', entryId: 'chosen', sha256: 'a'.repeat(64) };
   return {
     ...createContextState(),
-    inspection: { window: null, cut: { sourceRevision: 5 }, protectedSources: [] },
-    selection: { strategy: 'sources', retained: [source] }
+    inspection: { window: null, cut: { sourceRevision: 5 }, protectedSources: [], pendingWork: [{ submissionId: 'submission', runId: 'run', state: 'claimed' }] },
+    selection: { retained: [source] }
   };
 }
 
@@ -145,7 +147,7 @@ test('scheduled Apply preserves its inspected draft and reports only its correla
   assert.equal(queued.requestId, undefined);
   assert.equal(queued.pendingTransition.requestId, 'scheduled-1');
   assert.equal(inspections, 0);
-  for (const type of ['context.apply', 'context.fresh', 'context.open'])
+  for (const type of ['context.apply', 'context.open'])
     assert.equal(updateContext(queued, { type }, operations).effects, undefined);
   const unrelated = updateContext(queued, { type: 'context.rejected', idempotencyKey: 'another', message: 'Unrelated failure' }, operations);
   assert.equal(unrelated.state, queued);
@@ -184,4 +186,14 @@ test('a rejected Apply before scheduling returns cannot be returned to pending b
   assert.equal(updateContext(rejected.state, late.message, operations).state, rejected.state);
   assert.equal(rejected.state.pendingTransition, undefined);
   assert.match(rejected.state.notice, /Run ended/);
+});
+
+
+test('idle context remains inspectable but cannot schedule an unadmitted selection', () => {
+  const draft = selectionDraft();
+  const idle = { ...draft, inspection: { ...draft.inspection, pendingWork: [] } };
+  const result = updateContext(idle, { type: 'context.apply' }, {});
+  assert.equal(result.effects, undefined);
+  assert.equal(result.state.selection, draft.selection);
+  assert.match(result.state.notice, /while a request is running/);
 });

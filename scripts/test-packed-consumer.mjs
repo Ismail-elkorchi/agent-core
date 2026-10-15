@@ -65,7 +65,7 @@ try {
     for (const file of files.filter((name) => name.endsWith('.d.ts'))) {
       const declaration = await readFile(path.join(directory, file), 'utf8');
       const retired =
-        /\b(?:createWorkingStateTool|createContextTools|SessionWorkingStateEntry|SessionQueuedSubmission|commitWorkingState|enqueueSubmission|findBranchMatches|ModelMessage|ModelProviderState|CompleteRequestEstimator|SimpleTokenEstimator|TokenEstimator|SessionCompactionEntry|AgentSessionCompactionRequest|appendCompaction|summarizeConversation|executeAssistantToolCalls|nextObservationIndex|normalizeJsonSafe|JsonNormalizationDiagnostic|JsonNormalizationResult|outputNormalization|toObservationJsonObject|toJsonValue)\b/u.exec(
+        /\b(?:WorkingState\w*|workingState\w*|ModelChangeOptions|ModelContinuationRequiredError|parseModelChangeRequest|freshContinuation|freshContext|compactContext|createWorkingStateTool|createContextTools|SessionWorkingStateEntry|SessionQueuedSubmission|commitWorkingState|enqueueSubmission|findBranchMatches|ModelMessage|ModelProviderState|CompleteRequestEstimator|SimpleTokenEstimator|TokenEstimator|SessionCompactionEntry|AgentSessionCompactionRequest|appendCompaction|summarizeConversation|executeAssistantToolCalls|nextObservationIndex|normalizeJsonSafe|JsonNormalizationDiagnostic|JsonNormalizationResult|outputNormalization|toObservationJsonObject|toJsonValue)\b/u.exec(
           declaration
         );
       if (retired)
@@ -119,7 +119,10 @@ try {
       "import * as local from '@agent-core/tools-local';",
       "import * as nodePersistence from '@agent-core/persistence/node';",
       "if (!runtime.decodeAgentTerminalSnapshot || !runtime.AgentRuntime || !runtime.AgentSession || !runtime.InMemorySessionRepository || !nodeRuntime.JsonlSessionRepository || !model.parseModelResponse || !json.parseJsonObject || !effects.decodeExternalEffectIntent || !persistence.InMemoryEventRepository || !nodePersistence.JsonlEventRepository || !tools.planToolCall || !tools.invokeToolCallPlan || !tools.isCommandExecution || !local.LocalCommandExecution) throw new Error('public runtime exports missing');",
-      "if (!runtime.HistoryReader || !runtime.ContextService || !runtime.InferenceService || !runtime.InMemoryInferenceRepository || !nodeRuntime.JsonlInferenceRepository || !runtime.createHistoryTools || typeof runtime.ContextService.prototype.toolDefinitions !== 'function' || !runtime.EffectExecutor || !runtime.createObservationAccess || !tools.commandExecutionResources || !tools.contextRequiredObservation || !model.accountModelRequest || !model.compileModelRequest) throw new Error('persistent context exports missing');"
+      "if (!runtime.HistoryReader || !runtime.ContextService || !runtime.InferenceService || !runtime.InMemoryInferenceRepository || !nodeRuntime.JsonlInferenceRepository || !runtime.createHistoryTools || typeof runtime.ContextService.prototype.toolDefinitions !== 'function' || !runtime.EffectExecutor || !runtime.createObservationAccess || !tools.commandExecutionResources || !tools.contextRequiredObservation || !model.accountModelRequest || !model.compileModelRequest) throw new Error('persistent context exports missing');",
+      "const content = runtime.decodeSessionStateContent({ interaction: [{ id: 'request', text: 'Answer the question' }], working: [{ id: 'notes', text: 'A provisional interpretation', status: 'Unverified', scope: 'This request' }] });",
+      "if (!runtime.sessionStateContentSchema.safeParse(content).success || !Object.isFrozen(content.working[0]) || runtime.sessionStateContentSchema.safeParse('legacy text').success) throw new Error('session-state schema boundary failed');",
+      "const sessions = new runtime.InMemorySessionRepository(); const session = await sessions.create({ binding: { schemaId: 'packed/session-state', schemaVersion: 1, subject: {} } }); const context = new runtime.ContextService({ repository: sessions, session, artifacts: new persistence.InMemoryArtifactRepository(), policy: { maxSourceBytes: 8192 } }); if ((await context.sessionState()).revision !== null || Object.keys((await context.sessionState()).content).length || await sessions.currentSessionState(session) !== null) throw new Error('session-state public read failed');"
     ].join('\n')
   );
   await exec(process.execPath, ['runtime.mjs'], { cwd: consumer });
@@ -170,7 +173,7 @@ try {
       'diagnostic.value;',
       "import type { ModelInputItem, ModelOutputItem, ProviderContextState, CompiledModelRequest, RequestAccounting } from '@agent-core/model';",
       "import { settleExternalEffect, type EffectExecutionState, type EffectRecoveryCapability } from '@agent-core/effects';",
-      "import type { AgentModelOutput, AgentRunControl, AgentSessionState, AgentTerminalSnapshot, AgentRuntimeOptions, ContextWindowRecord, EffectExecutionEvent, HistorySourceRef } from '@agent-core/runtime';",
+      "import type { AgentModelOutput, AgentRunControl, AgentSessionState, AgentTerminalSnapshot, AgentRuntimeOptions, ContextWindowRecord, EffectExecutionEvent, HistorySourceRef, SessionStateContent, SessionStateItem, SessionStateSnapshot } from '@agent-core/runtime';",
       "import type { ExecutionResources, ToolEffects, ToolObservation, ToolObservationInput } from '@agent-core/tools';",
       "const json: JsonObject = { nested: { ok: true }, values: [1, 'two'] };",
       "declare const unsettledState: Exclude<EffectExecutionState, { phase: 'settled' }>;",
@@ -207,6 +210,15 @@ try {
       'declare const accounting: RequestAccounting;',
       'declare const window: ContextWindowRecord;',
       'declare const source: HistorySourceRef;',
+      "const interpretation: SessionStateItem = { id: 'stable', text: 'Useful context', sources: [source], status: 'Unverified', scope: 'Current request' };",
+      'const content: SessionStateContent = { understanding: [interpretation] };',
+      'const snapshot: SessionStateSnapshot = { revision: null, content };',
+      '// @ts-expect-error session state is structured content, never a legacy text field',
+      'snapshot.text;',
+      '// @ts-expect-error revision metadata must not duplicate the snapshot body',
+      'snapshot.revision?.content;',
+      '// @ts-expect-error interpretation items are immutable',
+      "interpretation.text = 'changed';",
       "const modelOutput: AgentModelOutput = { status: 'complete', message: 'done', source: 'content', turnIndex: 1 };",
       "const recovery: EffectRecoveryCapability = { kind: 'unknown' };",
       "const effects: ToolEffects = { accesses: [{ mode: 'read', scope: 'workspace' }], lockScopes: [], recovery };",

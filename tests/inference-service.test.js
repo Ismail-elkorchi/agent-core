@@ -917,3 +917,95 @@ test('unquantified input stays usable without a budget and reserves its input bo
     .invoke({ ...input(), request, compiled, profile: unboundedProfile }), /finite model input bound/);
   assert.equal(calls, 2);
 });
+
+
+test('durable replay binds the exact session state revision', async () => {
+  let calls = 0;
+  const service = InferenceService.inMemory({ provider: fixture(async request => {
+    calls++;
+    return response(request);
+  }) });
+  const request = { ...input('state-revision'), sessionStateRevisionId: 'state-1' };
+  await service.invoke(request);
+  assert.equal((await service.invoke(request)).replayed, true);
+  await assert.rejects(service.invoke({ ...request, sessionStateRevisionId: 'state-2' }),
+    /different input or configuration/);
+  assert.equal(calls, 1);
+});
+
+test('session-state origin retains the inference history boundary despite later corrections or branch changes', async () => {
+  const service = InferenceService.inMemory({ provider: fixture(async request => response(request)) });
+  const cut = { format: 'agent-core.history/1', sessionId: 'session', branchId: 'main',
+    throughEntryId: 'before-correction', sourceRevision: 1, ledgerCoverage: 'session' };
+  const request = { ...input('history-origin'), capturedHistoryCut: cut, sessionStateRevisionId: null };
+  await service.invoke(request);
+  const original = { ...cut };
+  cut.throughEntryId = 'later-correction';
+  cut.sourceRevision = 2;
+  const origin = await service.sessionStateOrigin('work', 'history-origin');
+  assert.deepEqual(origin.capturedHistoryCut, original);
+  await assert.rejects(service.invoke(request), /different input or configuration/);
+  await assert.rejects(service.invoke({ ...request, capturedHistoryCut: { ...original, branchId: 'fork' } }),
+    /different input or configuration/);
+  assert.deepEqual((await service.sessionStateOrigin('work', 'history-origin')).capturedHistoryCut, original);
+});
+
+test('a session-state update cannot attribute itself to an inference without a captured history boundary', async () => {
+  const service = InferenceService.inMemory({ provider: fixture(async request => response(request)) });
+  await service.invoke(input('no-history-origin'));
+  await assert.rejects(service.sessionStateOrigin('work', 'no-history-origin'), /capturedHistoryCut/);
+});
+
+test('native admission awaits history capture for initial, successor and extended input', async () => {
+  const nativeProfile = { ...profile, capabilities: { ...profile.capabilities, streaming: true } };
+  const service = InferenceService.inMemory({ provider: {
+    ...fixture(async request => response(request)), describeModel: async () => nativeProfile
+  } });
+  const request = input('native-history').request;
+  const compiled = await service.compile(request, nativeProfile);
+  let revision = 0;
+  const started = [];
+  let extensionOrigin;
+  const boundary = (responseId, deliveryIds = [], previousResponseId) => ({
+    responseId, deliveryIds, ...(previousResponseId ? { previousResponseId } : {}),
+    requiredToolCallIds: [], pendingToolCalls: [], continuation: 'client',
+    inputIdentity: compiled.inputIdentity, catalogIdentity: 'catalog', request
+  });
+  const results = await service.invokeNative({
+    invocationId: 'native-history', ownerId: 'work', purpose: 'test',
+    request, compiled, profile: nativeProfile,
+    capturedHistoryCut: async () => {
+      await Promise.resolve();
+      return { format: 'agent-core.history/1', sessionId: 'session', branchId: 'main',
+        throughEntryId: `input-${++revision}`, sourceRevision: revision, ledgerCoverage: 'session' };
+    },
+    session: {
+      complete: async () => { throw new Error('Expected streaming'); },
+      async *streamCompiled(_compiled, transport) {
+        yield { type: 'response_boundary', response: { ...response(request), content: '', requestId: 'r1', terminationReason: 'tool_calls',
+          toolCalls: [{ id: 'context-call', name: 'context_transition', type: 'function', input: { kind: 'json', value: {} } }] }, native: boundary('r1') };
+        const dispatch = { kind: 'steering', responseId: 'r1', compiled, sourceCalls: [], generationDeliveryId: 'next' };
+        await transport.native.admit({ ...dispatch, deliveryId: 'first-input' });
+        await transport.native.admit({ ...dispatch, kind: 'tool_results', deliveryId: 'corrected-input',
+          sourceCalls: [{ responseId: 'r1', catalogIdentity: 'catalog', toolCallId: 'context-call' }] });
+        yield { type: 'response_boundary', response: { ...response(request), requestId: 'r2' },
+          native: boundary('r2', ['first-input', 'corrected-input'], 'r1') };
+        yield { type: 'done', response: response(request) };
+      }
+    },
+    start: async context => {
+      started.push((await service.sessionStateOrigin('work', context.invocationId)).capturedHistoryCut.sourceRevision);
+    },
+    extended: async context => {
+      extensionOrigin = await service.sessionStateOrigin('work', context.invocationId);
+    },
+    settled: async () => {}, uncertain: async () => {}
+  });
+  assert.deepEqual(started, [1, 2]);
+  assert.equal(extensionOrigin.capturedHistoryCut.sourceRevision, 3);
+  assert.equal(results.length, 2);
+  const successorId = results[1].context.invocationId;
+  assert.equal(await service.isNativeAcknowledgement('work', successorId, 'native-history', 'context-call'), true);
+  assert.equal(await service.isNativeAcknowledgement('work', successorId, 'native-history', 'unrelated-call'), false);
+  assert.equal(await service.isNativeAcknowledgement('work', successorId, successorId, 'context-call'), false);
+});

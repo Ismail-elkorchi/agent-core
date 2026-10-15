@@ -477,7 +477,7 @@ for (const [requiresResult, reportsUsage] of [
 }
 
 for (const publication of ['normal', 'lost_receipt', 'rejected']) test(
-  `native working-state ${publication} binds each successor to its exact admitted input`,
+  `native session-state ${publication} binds each successor to its exact admitted input`,
   { timeout: 10000 },
   async () => {
     const sessions = new InMemorySessionRepository();
@@ -499,40 +499,39 @@ for (const publication of ['normal', 'lost_receipt', 'rejected']) test(
       artifacts,
       policy: { maxSourceBytes: 1024 * 1024, historyRead: { history, isAvailable: () => true } }
     });
-    let socket;
+    const frames = [];
+    const sockets = [];
+    let freshRequests = 0;
     const body1 = 'Retain the rationale.';
     const body2 = 'Retain the corrected rationale.';
     const provider = new OpenAIProvider({
-      apiKey: 'fixture',
-      transport: 'websocket',
-      webSocketFactory: () =>
-        (socket = new Socket((body, ws) => {
-          const id = !body.previous_response_id
-            ? 'r1'
-            : body.previous_response_id === 'r1'
-              ? 'r2'
-              : 'r3';
-          const output =
-            id === 'r3'
-              ? message('Finished.')
-              : [
-                  {
-                    ...call(id + '-state', 'context_transition'),
-                    arguments: JSON.stringify({ reason: 'Revise useful understanding.', workingState: id === 'r1' ? body1 : body2 })
-                  }
-                ];
-          ws.feed(
-            { type: 'response.created', response: { id } },
-            { type: 'response.completed', response: response(id, output) }
-          );
-        }))
+      apiKey: 'fixture', transport: 'websocket',
+      webSocketFactory: () => {
+        const socket = new Socket((body, ws) => {
+          frames.push(body);
+          const fresh = !body.previous_response_id;
+          if (fresh) freshRequests++;
+          const id = fresh ? `r${freshRequests}` : `ack${freshRequests}`;
+          const output = !fresh || freshRequests === 3 || (publication === 'rejected' && freshRequests > 1)
+            ? message(fresh ? 'Finished.' : 'Selection requested.')
+            : [{ ...call(id + '-state', 'context_transition'), arguments: JSON.stringify({
+              reason: 'Revise useful understanding.',
+              sessionState: { understanding: [{ id: 'rationale', text: freshRequests === 1 ? body1 : body2 }] }
+            }) }];
+          ws.feed({ type: 'response.created', response: { id,
+            ...(body.previous_response_id ? { previous_response_id: body.previous_response_id } : {}) } },
+            { type: 'response.completed', response: response(id, output) });
+        });
+        sockets.push(socket);
+        return socket;
+      }
     });
     let receiptLost = false;
     const commit = sessions.commitContextTransition.bind(sessions);
     sessions.commitContextTransition = async (...args) => {
-      const before = socket.sent.length;
+      const before = frames.length;
       await new Promise(resolve => setImmediate(resolve));
-      assert.equal(socket.sent.length, before, 'A native successor cannot be sent while state publication is pending');
+      assert.equal(frames.length, before, 'A native successor cannot be sent while state publication is pending');
       const entry = await commit(...args);
       if (publication === 'lost_receipt' && !receiptLost) {
         receiptLost = true;
@@ -561,33 +560,37 @@ for (const publication of ['normal', 'lost_receipt', 'rejected']) test(
       repositories: { events, artifacts, session: { repository: sessions, descriptor } }
     }).run({ task: 'Correct the understanding and finish.' }).result;
     if (publication === 'rejected') {
-      assert.notEqual(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
-      assert.equal((await context.workingState()).revision, null);
-      assert.equal(socket.sent.length, 1, 'A rejected successor is never sent');
+      assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+      assert.equal((await context.sessionState()).revision, null);
+      assert.equal(frames.length, 3);
+      assert.ok(!frames[2].input.some(item => item.role === 'user' && JSON.stringify(item).includes(body1)),
+        'Rejected state is never dispatched; unchanged original context may continue');
       assert.equal((await sessions.loadReplayState(descriptor)).branch.filter(entry => entry.type === 'context_transition').length, 0);
       return;
     }
     assert.equal(receiptLost, publication === 'lost_receipt');
     assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
     const { branch } = await sessions.loadReplayState(descriptor);
-    const revisions = branch.filter((entry) => entry.type === 'context_transition' && entry.workingState);
-    assert.equal(revisions.length, 2, JSON.stringify(branch));
-    assert.equal((await context.workingState()).text, body2);
-    assert.equal(socket.sent.length, 3);
+    const revisions = branch.filter((entry) => entry.type === 'context_transition' && entry.sessionState);
+    assert.equal(revisions.length, 2, JSON.stringify((await Array.fromAsync(events.read(result.terminal.runId))).filter(({event}) => event.type === 'context.transition.rejected')));
+    assert.equal((await context.sessionState()).content.understanding[0].text, body2);
+    assert.equal(frames.length, 5);
+    assert.equal(sockets.length, 3, 'Each committed state opens a fresh provider session');
     for (const [index, text] of [body1, body2].entries()) {
-      const wire = socket.sent[index + 1];
-      assert.equal(wire.input[0].type, 'function_call_output');
-      assert.equal(wire.input[1].role, 'user');
-      assert.ok(JSON.stringify(wire.input[1]).includes(text));
+      const wire = frames[(index + 1) * 2];
+      assert.equal(wire.previous_response_id, undefined);
+      assert.equal(wire.input.filter(item => item.role === 'user' && JSON.stringify(item).includes(text)).length, 1);
+      assert.ok(wire.input.findIndex(item => item.role === 'user' && JSON.stringify(item).includes(text)) <
+        wire.input.findIndex(item => item.type === 'function_call'));
     }
     const originatingInput = JSON.parse(
-      new TextDecoder().decode(await artifacts.readVerified(revisions[1].workingState.inference.requestRef))
+      new TextDecoder().decode(await artifacts.readVerified(revisions[1].sessionState.inference.requestRef))
     );
-    assert.equal(originatingInput.workingStateRevisionId, revisions[0].id);
+    assert.equal(originatingInput.sessionStateRevisionId, revisions[0].id);
     assert.ok(JSON.stringify(originatingInput.logical).includes(body1));
     assert.notEqual(
-      revisions[0].workingState.inference.requestRef.sha256,
-      revisions[1].workingState.inference.requestRef.sha256
+      revisions[0].sessionState.inference.requestRef.sha256,
+      revisions[1].sessionState.inference.requestRef.sha256
     );
   }
 );
@@ -605,6 +608,7 @@ async function nativeControlRoomFixture(resultTokens = 850) {
     policy: { maxSourceBytes: 1024 * 1024, historyRead: { history, isAvailable: () => true } } });
   const capacity = 1200;
   let effects = 0;
+  let releaseHistory = false;
   const frames = [];
   const counted = [];
   const provider = new OpenAIProvider({
@@ -612,31 +616,33 @@ async function nativeControlRoomFixture(resultTokens = 850) {
     fetch: async (url, init) => {
       assert.ok(url.endsWith('/input_tokens'), `Unexpected network operation: ${url}`);
       const body = JSON.parse(init.body);
-      const control = JSON.stringify(body).includes('bounded context-management turn');
+      const control = JSON.stringify(body).includes('Application execution is suspended');
       const result = body.input?.some(item => item.type === 'function_call_output');
       // Exact fixture counts isolate the reserve from hard overflow: the 850-token
-      // successor fits 1200 tokens, but cannot also leave the 600+128 control room.
-      const inputTokens = control ? 600 : result ? resultTokens : 100;
+      // successor fits 1200 tokens, but cannot leave the extra full-context checkpoint input and output.
+      const inputTokens = control ? (result ? resultTokens + 150 : 600) : result ? resultTokens : 100;
       counted.push({ control, result, inputTokens });
       return Response.json({ input_tokens: inputTokens });
     },
     webSocketFactory: () => new Socket((body, ws) => {
       frames.push(body);
       const first = frames.length === 1;
-      const control = JSON.stringify(body).includes('bounded context-management turn');
+      const control = JSON.stringify(body).includes('Application execution is suspended');
       const id = first ? 'source-control-room' : `control-room-${frames.length}`;
       ws.feed({ type: 'response.created', response: { id,
         ...(body.previous_response_id ? { previous_response_id: body.previous_response_id } : {}) } },
       { type: 'response.completed', response: response(id,
         first ? [call('preserved-result', 'read')]
-          : message(control ? 'Source selection needs user input.' : 'Finished from the recorded result.')) });
+          : control && releaseHistory
+            ? [{ ...call('release-context', 'context_transition'), arguments: JSON.stringify({ retain: [], reason: 'Release completed history for the next task.' }) }]
+            : message(control ? 'Source selection needs user input.' : 'Finished from the recorded result.')) });
     })
   });
   const describe = provider.describeModel.bind(provider);
   provider.describeModel = async model => {
     const profile = await describe(model);
     return { ...profile,
-      capabilities: { ...profile.capabilities, protocol: { ...profile.capabilities.protocol, contextTransforms: [] } },
+      capabilities: { ...profile.capabilities, protocol: { ...profile.capabilities.protocol, contextReset: 'fresh_request' } },
       limits: { ...profile.limits, contextTokens: capacity, maxInputTokens: capacity - 128, outputTokens: 128 } };
   };
   const options = {
@@ -648,12 +654,12 @@ async function nativeControlRoomFixture(resultTokens = 850) {
     toolBoundary: { authorizationPolicyId: 'native-control-room', executionTargetId: 'native-control-room' },
     repositories: { events, artifacts, session: { repository: sessions, descriptor } }
   };
-  return { options, events, artifacts, inferenceAudit, inference, history, context, frames, counted, capacity, effects: () => effects };
+  return { options, events, artifacts, inferenceAudit, inference, history, context, frames, counted, capacity, effects: () => effects, releaseHistory: () => { releaseHistory = true; } };
 }
 
 test('required native delivery preserves effects before control-room recovery at the next legal boundary',
   { timeout: 10000 }, async () => {
-    const { options, events, artifacts, inferenceAudit, inference, history, context, frames, counted, capacity, effects } = await nativeControlRoomFixture();
+    const { options, events, artifacts, inferenceAudit, inference, history, context, frames, counted, capacity, effects, releaseHistory } = await nativeControlRoomFixture();
     const first = await new AgentRuntime(options).run({ runId: 'native-control-room', task: 'Read once and report.' }).result;
     assert.equal(first.terminal?.executionStatus, 'completed', JSON.stringify({ first, counted }));
     assert.equal(effects(), 1);
@@ -663,7 +669,7 @@ test('required native delivery preserves effects before control-room recovery at
     assert.equal(frames[1].input.find(item => item.type === 'function_call_output').call_id, 'preserved-result');
     assert.ok(counted.some(item => item.control && item.inputTokens === 600));
     assert.ok(counted.some(item => item.result && item.inputTokens === 850));
-    assert.ok(850 + 128 < capacity && capacity - 850 - 128 < 600 + 128,
+    assert.ok(850 + 128 < capacity && capacity - 850 - 128 < 150 + 128,
       'the required successor fits actual capacity while leaving less than the compiled control reserve');
     const firstAudit = await Array.fromAsync(events.read('native-control-room'));
     assert.equal(firstAudit.filter(({ event }) => event.type === 'tool.ended').length, 1);
@@ -678,28 +684,23 @@ test('required native delivery preserves effects before control-room recovery at
     assert.equal(blocked.contextAdmission.estimatedInputTokens, 850);
     assert.equal(blocked.contextAdmission.contextTokens, capacity);
     assert.equal(frames.length, 3, 'only the admitted control request may be sent at this boundary');
-    assert.match(JSON.stringify(frames[2]), /bounded context-management turn/);
+    assert.match(JSON.stringify(frames[2]), /Application execution is suspended/);
     assert.equal(effects(), 1);
     assert.ok(!(await Array.fromAsync(events.read('next-legal-boundary'))).some(({ event }) => event.type === 'run.ended'));
 
-    // Explicit source selection makes room without changing the persisted model
-    // profile or retrying any of the completed native effects.
-    const cut = await history.capture();
-    const window = await history.selectedContext(cut);
-    await context.transition({ expectedWindowId: window?.windowId ?? null,
-      expectedSourceRevision: cut.sourceRevision, idempotencyKey: 'release-completed-native-history',
-      reason: 'Release completed optional history for the next task.',
-      selection: await context.selectSources(cut, { retain: [] }) });
+    // A new admitted checkpoint selects sources without replaying the completed domain effect.
+    releaseHistory();
     const resumed = await new AgentRuntime(options).resume('next-legal-boundary').result;
     assert.equal(resumed.terminal?.executionStatus, 'completed', JSON.stringify(resumed));
     assert.equal(effects(), 1, 'resuming capacity admission must never repeat the settled effect');
-    assert.equal(frames.length, 4);
-    assert.doesNotMatch(JSON.stringify(frames[3]), /bounded context-management turn/);
+    assert.equal(frames.length, 5);
+    assert.doesNotMatch(JSON.stringify(frames[4]), /Application execution is suspended/);
     const audit = await Array.fromAsync(events.read('next-legal-boundary'));
-    assert.equal(audit.filter(({ event }) => event.type === 'tool.ended').length, 0);
+    assert.equal(audit.filter(({ event }) => event.type === 'tool.ended').length, 1);
+    assert.ok(audit.filter(({ event }) => event.type === 'tool.ended').every(({event}) => event.toolName === 'context_transition'));
     assert.equal(audit.filter(({ event }) => event.type === 'run.ended').length, 1);
     const budget = await inference.load('next-legal-boundary');
-    assert.equal(budget.settledUsage.invocations, 2);
+    assert.equal(budget.settledUsage.invocations, 3);
     assert.equal(budget.committed.invocations, budget.settledUsage.invocations);
     assert.deepEqual(budget.committed.usage, budget.settledUsage.usage,
       'no rejected unsent generation leaves outstanding token reservations');
@@ -746,7 +747,7 @@ test('hard native capacity conflict preserves an unsent settled result without r
   });
 
 for (const publication of ['normal', 'lost_receipt', 'rejected']) {
-  test(`native steering extension ${publication} publishes staged state before transmission`, { timeout: 10000 }, async () => {
+  test(`native steering ${publication} commits state only at a fresh request boundary`, { timeout: 10000 }, async () => {
     const sessions = new InMemorySessionRepository();
     const descriptor = await sessions.create({ binding: { schemaId: 'native-extension-state', schemaVersion: 1, subject: {} } });
     const events = new InMemoryEventRepository(agentEventCodec);
@@ -755,16 +756,18 @@ for (const publication of ['normal', 'lost_receipt', 'rejected']) {
     const context = new ContextService({ repository: sessions, session: descriptor, history, artifacts,
       policy: { maxSourceBytes: 1024 * 1024, historyRead: { history, isAvailable: () => true } } });
     const text = 'The steering successor must contain the committed understanding.';
+    const frames = [];
     let socket;
+    let connections = 0;
     let handle;
     let steered = false;
     let commits = 0;
     let lost = false;
     const commit = sessions.commitContextTransition.bind(sessions);
     sessions.commitContextTransition = async (...args) => {
-      const sent = socket.sent.length;
+      const sent = frames.length;
       await new Promise(resolve => setImmediate(resolve));
-      assert.equal(socket.sent.length, sent, 'Publication must complete before extension transport');
+      assert.equal(frames.length, sent, 'Publication must complete before fresh transport');
       if (publication === 'rejected') throw new Error('Reject staged native extension');
       const value = await commit(...args);
       commits++;
@@ -775,25 +778,30 @@ for (const publication of ['normal', 'lost_receipt', 'rejected']) {
       return value;
     };
     const provider = new OpenAIProvider({ apiKey: 'fixture', transport: 'websocket',
-      webSocketFactory: () => (socket = new Socket((body, ws) => {
+      webSocketFactory: () => { connections++; return (socket = new Socket((body, ws) => {
+        frames.push(body);
         if (body.type === 'response.steer') {
           ws.feed({ type: 'response.steer.accepted', steer: { id: 'state-steer', previous_response_id: 'r1' } },
             { type: 'response.completed', response: response('r1', [{ ...call('state-call', 'context_transition'),
-              arguments: JSON.stringify({ reason: 'Remember the corrected understanding.', workingState: text }) }]) });
-        } else if (!body.previous_response_id) {
+              arguments: JSON.stringify({ reason: 'Remember the corrected understanding.', sessionState: { understanding: [{ id: 'correction', text }] } }) }]) });
+        } else if (!body.previous_response_id && connections === 1) {
           ws.feed({ type: 'response.created', response: { id: 'r1' } },
             { type: 'response.output_text.delta', response_id: 'r1', delta: 'Working.' });
-        } else {
-          assert.equal(commits, 1, 'The extension cannot transmit an uncommitted state');
-          assert.ok(JSON.stringify(body.input).includes(text));
+        } else if (body.previous_response_id) {
+          assert.equal(commits, 0, 'Old native input receives only its mandatory tool result');
           assert.equal(body.input[0].call_id, 'state-call');
           ws.feed({ type: 'response.created', response: { id: 'r2', previous_response_id: 'r1' } },
-            { type: 'response.completed', response: response('r2', message('Correction remembered.')) });
+            { type: 'response.completed', response: response('r2', message('Selection requested.')) });
+        } else {
+          assert.equal(commits, publication === 'rejected' ? 0 : 1, 'Fresh state is sent only after publication');
+          assert.equal(body.input.some(item => item.role === 'user' && JSON.stringify(item).includes(text)), publication !== 'rejected');
+          ws.feed({ type: 'response.created', response: { id: 'fresh' } },
+            { type: 'response.completed', response: response('fresh', message('Correction remembered.')) });
         }
-      })) });
+      })); } });
     const repository = new InMemoryInferenceRepository();
     const audit = recordInferenceEvents(repository);
-    const inference = new InferenceService({ provider, repository, artifacts, budget: { maxInvocations: 2 } });
+    const inference = new InferenceService({ provider, repository, artifacts, budget: { maxInvocations: 4 } });
     const runId = `native-state-extension-${publication}`;
     const runtime = new AgentRuntime({ provider, model: 'gpt-6-astra', maxOutputTokens: 512,
       context, inferenceService: inference, tools: context.toolDefinitions(),
@@ -810,24 +818,31 @@ for (const publication of ['normal', 'lost_receipt', 'rejected']) {
     const result = await handle.result;
     const transitions = (await sessions.loadReplayState(descriptor)).branch.filter(entry => entry.type === 'context_transition');
     if (publication === 'rejected') {
-      assert.notEqual(result.terminal?.executionStatus, 'completed');
+      assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
       assert.equal(commits, 0);
       assert.equal(transitions.length, 0);
-      assert.equal((await context.workingState()).revision, null);
-      assert.equal(socket.sent.length, 2, 'Rejected state must not be sent after the initial request and steering');
+      assert.equal((await context.sessionState()).revision, null);
+      assert.equal(frames.length, 4, 'Rejected state is omitted from the unchanged fresh fallback');
       return;
     }
-    assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+    assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify({ result, errors: socket.errors, transitions: (await Array.fromAsync(events.read(runId))).filter(({event}) => event.type === 'context.transition.rejected' || event.type === 'model.failed' || event.type === 'model.stream.failed') }));
     assert.equal(transitions.length, 1);
     assert.equal(commits, 1);
     assert.equal(lost, publication === 'lost_receipt');
-    assert.equal(socket.sent.length, 3);
-    assert.equal((await context.workingState()).text, text);
+    assert.equal(frames.length, 4);
+    assert.equal(connections, 2);
+    assert.equal((await context.sessionState()).content.understanding[0].text, text);
     const extension = audit.find(({ event }) => event.type === 'inference.extended').event;
-    const origin = await inference.workingStateOrigin(runId, extension.invocationId);
-    assert.equal(origin.revisionId, transitions[0].id);
-    const input = JSON.parse(new TextDecoder().decode(await artifacts.readVerified(origin.inference.requestRef)));
-    assert.equal(input.inputIdentity, transitions[0].transition.admission.compiledInputIdentity);
+    const origin = await inference.sessionStateOrigin(runId, extension.invocationId);
+    assert.equal(origin.revisionId, null, 'Steering stays bound to the old state until fresh admission');
+    assert.ok(origin.capturedHistoryCut.sourceRevision > 0);
+    const starts = audit.filter(({ event }) => event.type === 'inference.started');
+    const fresh = starts.at(-1).event;
+    const freshOrigin = await inference.sessionStateOrigin(runId, fresh.invocationId);
+    assert.equal(freshOrigin.revisionId, transitions[0].id);
+    const input = JSON.parse(new TextDecoder().decode(await artifacts.readVerified(freshOrigin.inference.requestRef)));
     assert.ok(JSON.stringify(input.logical).includes(text));
+    assert.equal(audit.filter(({ event }) => event.type === 'inference.uncertain').length, 0);
+
   });
 }

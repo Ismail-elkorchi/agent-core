@@ -1,4 +1,4 @@
-import type { WorkingStateRevision, WorkingStateChange } from './working-state.js';
+import type { SessionStateRevision, SessionStateChange } from './session-state.js';
 import type { JsonObject, JsonValue } from '@agent-core/json';
 import type {
   ModelOutputItem,
@@ -26,7 +26,7 @@ export type SessionHeader = Readonly<{
   readonly type: 'session';
   readonly version: 1;
   readonly format: 'agent-core.session/2';
-  readonly workingStateStorage: 'session';
+  readonly sessionStateStorage: 'session';
   readonly id: string;
   readonly timestamp: string;
   readonly binding: SessionBinding;
@@ -200,7 +200,7 @@ export type SessionModelSettingsEntry = BaseSessionEntry &
 export type SessionContextTransitionEntry = BaseSessionEntry &
   Readonly<{
     readonly type: 'context_transition';
-    readonly workingState?: Omit<WorkingStateChange, 'id'> | undefined;
+    readonly sessionState?: Omit<SessionStateChange, 'id'> | undefined;
     readonly window: ContextWindowRecord;
     readonly transition: ContextTransitionRecord;
   }>;
@@ -420,7 +420,7 @@ export interface SessionReplayState {
   readonly branch: readonly SessionBranchEntry[];
   readonly runFinalizations: readonly SessionRunFinalization[];
   readonly contextWindow?: ContextWindowRecord;
-  readonly workingState: WorkingStateRevision | null;
+  readonly sessionState: SessionStateRevision | null;
   readonly sourceRevision: number;
   readonly ledgerRunIds: readonly string[];
 }
@@ -481,10 +481,10 @@ export interface SessionRepository {
   loadReplayState(session: SessionDescriptor, leafId?: string | null): Promise<SessionReplayState>;
   revision(session: SessionDescriptor): Promise<number>;
   currentModelSettings(session: SessionDescriptor): Promise<ModelSelection | undefined>;
-  currentWorkingState(
+  currentSessionState(
     session: SessionDescriptor,
     leafId?: string | null
-  ): Promise<WorkingStateRevision | null>;
+  ): Promise<SessionStateRevision | null>;
   sourceSnapshot(
     session: SessionDescriptor,
     leafId?: string | null

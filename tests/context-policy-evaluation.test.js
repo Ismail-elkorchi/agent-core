@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, writeFile, stat } from 'node:fs/promises';
@@ -110,7 +111,7 @@ test('Codex flags are explicit, dry mode does not read auth, and subscription en
   assert.equal(report.provider.endpoint, `${codexEndpoint}/responses`);
   assert.equal(report.configuration.generation.outputLimit, 'admission-reservation-only');
   assert.equal(
-    report.availability.find((item) => item.policy === 'provider-native').status,
+    report.availability.find((item) => item.policy === 'history-retrieval').status,
     'available'
   );
   fixture.assertPrivate(JSON.stringify(report));
@@ -449,13 +450,13 @@ test(
       report.configuration.source.dirty === null ||
         typeof report.configuration.source.dirty === 'boolean'
     );
-    assert.equal(report.trials.length, 12);
+    assert.equal(report.trials.length, 8);
     assert.deepEqual(
       report.availability.map((item) => item.policy),
       POLICIES
     );
     assert.equal(
-      report.availability.find((item) => item.policy === 'provider-native').status,
+      report.availability.find((item) => item.policy === 'history-retrieval').status,
       'available'
     );
     for (const trial of report.trials) {
@@ -471,11 +472,6 @@ test(
       assert.ok(Object.values(trial.mechanical).every((count) => count === 0));
       assert.equal(trial.checkpoints.length, 2);
       assert.equal(trial.requestFingerprints.length, trial.metrics.invocations);
-      if (trial.policy === 'provider-native') {
-        assert.ok(trial.metrics.nativeTransforms > 0);
-        assert.equal(trial.metrics.nativeTransforms, trial.metrics.contextTransitions);
-        assert.ok(trial.metrics.nativeStateDeliveries > 0);
-      } else assert.equal(trial.metrics.nativeTransforms, 0);
       assert.equal(trial.metrics.retrievalCalls > 0, trial.policy === 'history-retrieval');
       assert.equal(trial.metrics.retrievalFailures, 0);
       assert.equal(trial.metrics.contextInspectionCalls > 0, trial.policy !== 'retained-history');
@@ -589,306 +585,17 @@ test(
   }
 );
 
-test('deterministic native transform settles and replays through the shared inference owner budget', async () => {
-  const { MemorySimulationProvider, simulationProfile } = await import(
-    './fixtures/context-policies/simulation.mjs'
-  );
-  const { InferenceService, InMemoryInferenceRepository, InferenceBudgetExceededError } =
-    await import('@agent-core/runtime');
-  const { InMemoryArtifactRepository } = await import('@agent-core/persistence');
-  const provider = new MemorySimulationProvider();
-  const repository = new InMemoryInferenceRepository();
-  const artifacts = new InMemoryArtifactRepository();
-  const options = {
-    provider,
-    repository,
-    artifacts,
-    budget: { maxInvocations: 2, maxPromptTokens: 10000, maxCompletionTokens: 256 }
-  };
-  const service = new InferenceService(options);
-  const request = {
-    model: simulationProfile.id,
-    maxOutputTokens: 64,
-    messages: [{ role: 'user', content: 'STATE[000] {"code":"HERON"}' }]
-  };
-  await service.invoke({
-    invocationId: 'primary',
-    ownerId: 'native-owner',
-    purpose: 'agent-step',
-    request
-  });
-  const input = {
-    invocationId: 'native-transform',
-    ownerId: 'native-owner',
-    purpose: 'context-transition',
-    transformId: 'simulation.compact',
-    request
-  };
-  const transformed = await service.transformContext(input);
-  assert.equal(transformed.status, 'settled');
-  assert.equal(transformed.replayed, false);
-  assert.equal(transformed.cost.status, 'unknown');
-  assert.match(transformed.result.state.data.memory, /HERON/u);
-  assert.equal(provider.transforms.length, 1);
-  const replay = await new InferenceService(options).transformContext(input);
-  assert.equal(replay.replayed, true);
-  assert.deepEqual(replay.artifact, transformed.artifact);
-  assert.deepEqual(replay.result, transformed.result);
-  assert.equal(provider.transforms.length, 1);
-  const owner = await repository.load('native-owner');
-  assert.equal(owner.settledUsage.invocations, 2);
-  assert.equal(
-    (await repository.load('native-owner', { invocationId: 'primary' })).invocation.start.operation,
-    'generation'
-  );
-  assert.equal(
-    (await repository.load('native-owner', { invocationId: 'native-transform' })).invocation.start
-      .operation,
-    'context_transform'
-  );
-  await assert.rejects(
-    service.invoke({
-      invocationId: 'too-many',
-      ownerId: 'native-owner',
-      purpose: 'agent-step',
-      request
-    }),
-    InferenceBudgetExceededError
-  );
-  assert.equal(provider.calls.length, 1);
-});
-
-test(
-  'native policy commits protected transform references and delivers their exact output to the next request',
-  { timeout: 60_000 },
-  async (t) => {
-    const { MemorySimulationProvider } = await import('./fixtures/context-policies/simulation.mjs');
-    const { InMemorySessionRepository, InMemoryInferenceRepository } = await import(
-      '@agent-core/runtime'
-    );
-    const complete = MemorySimulationProvider.prototype.complete;
-    const transform = MemorySimulationProvider.prototype.transformContextCompiled;
-    const commit = InMemorySessionRepository.prototype.commitContextTransition;
-    const append = InMemoryInferenceRepository.prototype.append;
-    const steps = [];
-    const windows = [];
-    const invocations = [];
-    t.mock.method(MemorySimulationProvider.prototype, 'complete', async function (request) {
-      steps.push({ kind: 'generation', request });
-      return complete.call(this, request);
-    });
-    t.mock.method(
-      MemorySimulationProvider.prototype,
-      'transformContextCompiled',
-      async function (transformId, compiled) {
-        const result = await transform.call(this, transformId, compiled);
-        steps.push({ kind: 'transform', compiled, result });
-        return result;
-      }
-    );
-    t.mock.method(
-      InMemorySessionRepository.prototype,
-      'commitContextTransition',
-      async function (session, input) {
-        const committed = await commit.call(this, session, input);
-        windows.push(committed.window);
-        return committed;
-      }
-    );
-    t.mock.method(
-      InMemoryInferenceRepository.prototype,
-      'append',
-      async function (ownerId, event, tail) {
-        const committed = await append.call(this, ownerId, event, tail);
-        if (committed && event.type === 'inference.started') invocations.push(event);
-        return committed;
-      }
-    );
-    const report = await evaluateContextPolicies({
-      mode: 'simulation',
-      trials: 1,
-      delay: 1,
-      policies: ['provider-native'],
-      maxTotalInvocations: 100
-    });
-    assert.ok(report.trials.every((trial) => trial.success));
-    assert.ok(!JSON.stringify(report).includes('STATE[000]'));
-    const transforms = steps.filter((step) => step.kind === 'transform');
-    assert.ok(transforms.length > 0);
-    assert.equal(windows.length, transforms.length);
-    assert.equal(
-      invocations.filter((item) => item.operation === 'context_transform').length,
-      transforms.length
-    );
-    for (const step of transforms) {
-      const window = windows.find(
-        (item) => item.selection.providerState.transformId === step.result.transformId
-      );
-      assert.equal(window.selection.strategy, 'provider');
-      assert.equal(window.selection.providerState.artifact.visibility, 'protected');
-      assert.ok(window.selection.providerState.sources.length > 0);
-      const invocation = invocations.find(
-        (item) => item.invocationId === window.selection.providerState.invocationId
-      );
-      assert.equal(invocation.ownerId, window.selection.providerState.ownerId);
-      assert.ok(report.trials.some((trial) => trial.runIds.includes(invocation.ownerId)));
-      const next = steps.slice(steps.indexOf(step) + 1).find((item) => item.kind === 'generation');
-      assert.ok(next);
-      for (const item of step.result.input)
-        assert.ok(next.request.messages.some((message) => isDeepStrictEqual(message, item)));
-      assert.ok(!next.request.messages.some((item) => item.content.includes('Background detail')));
-      assert.match(step.result.state.data.memory, /STATE\[000\]/u);
-    }
-  }
-);
-
-test('comparison ceiling prevents auxiliary native dispatch and leaves the previous window active', async () => {
-  const report = await evaluateContextPolicies({
-    mode: 'simulation',
-    trials: 1,
-    delay: 1,
-    policies: ['provider-native'],
-    maxTotalInvocations: 1
-  });
-  assert.equal(report.totalInvocations, 1);
-  assert.ok(
-    report.trials.every(
-      (trial) =>
-        trial.status === 'budget-exhausted' && trial.budgetStop === 'comparison_invocations'
-    )
-  );
-  assert.equal(report.trials[0].metrics.settledInvocations, 1);
-  assert.ok(
-    report.trials.every(
-      (trial) =>
-        trial.metrics.uncertainInvocations === 0 &&
-        trial.metrics.nativeTransforms === 0 &&
-        trial.metrics.contextTransitions === 0
-    )
-  );
-});
-
-test(
-  'OpenAI native policy counts opaque state and dispatches the committed window through the public adapter',
-  { timeout: 60_000 },
-  async (t) => {
-    const { ContextService, InMemoryInferenceRepository } = await import('@agent-core/runtime');
-    const transition = ContextService.prototype.transition;
-    const append = InMemoryInferenceRepository.prototype.append;
-    const failures = [];
-    t.mock.method(ContextService.prototype, 'transition', async function (...args) {
-      try {
-        return await transition.apply(this, args);
-      } catch (error) {
-        failures.push(error.message);
-        throw error;
-      }
-    });
-    t.mock.method(
-      InMemoryInferenceRepository.prototype,
-      'append',
-      async function (ownerId, event, tail) {
-        if (event.type === 'inference.uncertain') failures.push(event.message);
-        return append.call(this, ownerId, event, tail);
-      }
-    );
-    const requests = [];
-    const opaque = 'private-fixture-compaction-state';
-    t.mock.method(globalThis, 'fetch', async (url, init) => {
-      const pathname = new URL(url).pathname;
-      const body = JSON.parse(init.body);
-      requests.push({ pathname, body });
-      assert.ok(init.signal instanceof AbortSignal);
-      if (pathname === '/v1/responses/input_tokens') return Response.json({ input_tokens: 60 });
-      if (pathname === '/v1/responses/compact') {
-        assert.equal(body.tools, undefined);
-        assert.equal(body.max_output_tokens, undefined);
-        return Response.json({
-          id: 'compact-fixture',
-          output: [{ type: 'compaction', encrypted_content: opaque }],
-          usage: { input_tokens: 60, output_tokens: 12, total_tokens: 72 }
-        });
-      }
-      assert.equal(pathname, '/v1/responses');
-      const generation = requests.filter(item => item.pathname === '/v1/responses').length;
-      const response = {
-        id: `response-fixture-${requests.length}`,
-        status: 'completed',
-        output: generation <= 2
-          ? [{ type: 'function_call', call_id: `choice-${generation}`, name: generation === 1 ? 'context_inspect' : 'context_transition', arguments: JSON.stringify(generation === 1 ? {} : { reason: 'Model chooses native compaction after inspection.', strategy: 'provider' }) }]
-          : [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ACK' }] }],
-        usage: { input_tokens: 60, output_tokens: 4, total_tokens: 64 }
-      };
-      return new Response(`data: ${JSON.stringify({ type: 'response.completed', response })}\n\n`, {
-        headers: { 'content-type': 'text/event-stream' }
-      });
-    });
-    const report = await evaluateContextPolicies(
-      {
-        mode: 'live',
-        provider: 'openai',
-        model: 'gpt-6-astra',
-        modelVersion: 'fixture-deployment',
-        endpoint: 'https://api.openai.com/v1',
-        trials: 1,
-        delay: 1,
-        policies: ['provider-native'],
-        maxTotalInvocations: 4
-      },
-      { CONTEXT_EVAL_API_KEY: 'fake-openai-key' }
-    );
-    assert.equal(
-      report.totalInvocations,
-      4,
-      failures.join('\n') ||
-        JSON.stringify(report.trials.map(({ status, failure }) => ({ status, failure })))
-    );
-    assert.equal(report.trials[0].metrics.nativeTransforms, 1, JSON.stringify(report.trials[0]));
-    assert.equal(report.trials[0].metrics.contextTransitions, 1, failures.join('\n'));
-    assert.equal(report.trials[0].metrics.nativeStateDeliveries, 1);
-    assert.equal(report.trials[0].metrics.settledInvocations, 4);
-    assert.equal(
-      report.accounting.requests,
-      requests.filter((item) => item.pathname.endsWith('/input_tokens')).length
-    );
-    assert.ok(
-      report.accounting.requests > 0 && report.accounting.requests <= report.accounting.maxRequests
-    );
-    assert.equal(report.accounting.costStatus, 'unknown');
-    assert.equal(report.trials[0].metrics.costStatus, 'unknown-or-partial');
-    const generations = requests.filter((item) => item.pathname === '/v1/responses');
-    assert.equal(generations.length, 3);
-    assert.ok(
-      generations
-        .at(-1)
-        .body.input.some((item) => item.type === 'compaction' && item.encrypted_content === opaque)
-    );
-    assert.ok(
-      requests.some(
-        (item) =>
-          item.pathname.endsWith('/input_tokens') && JSON.stringify(item.body).includes(opaque)
-      )
-    );
-    assert.ok(!JSON.stringify(report).includes(opaque));
-    assert.ok(!JSON.stringify(report).includes('fake-openai-key'));
-    assert.ok(report.summary.every((item) => item.meanCostUSD === null));
-  }
-);
-import { isDeepStrictEqual } from 'node:util';
-
-
 test('context policy decisions belong to model calls, never a host timer', async (t) => {
   const { MemorySimulationProvider } = await import('./fixtures/context-policies/simulation.mjs');
   t.mock.method(MemorySimulationProvider.prototype, 'complete', async function (request) {
     return { provider: this.id, model: request.model, content: 'ACK', terminationReason: 'stop' };
   });
   const report = await evaluateContextPolicies({ mode: 'simulation', trials: 1, delay: 1,
-    policies: ['history-retrieval', 'provider-native'], maxTotalInvocations: 100 });
+    policies: ['history-retrieval'], maxTotalInvocations: 100 });
   assert.match(report.configuration.selectionControl, /model-authored/);
   for (const trial of report.trials) {
     assert.equal(trial.metrics.contextTransitions, 0);
     assert.equal(trial.metrics.contextTransitionCalls, 0);
-    assert.equal(trial.metrics.nativeTransforms, 0);
     assert.equal(trial.success, false);
   }
   assert.throws(() => parseArguments(['--transition-every', '2'], {}), /Unknown option/);
@@ -942,10 +649,17 @@ test('capacity recovery stays in the governed runtime and preserves the continui
     ...simulationProfile,
     limits: { ...simulationProfile.limits, contextTokens: 16000 },
     capabilities: { ...simulationProfile.capabilities,
-      protocol: { ...simulationProfile.capabilities.protocol, contextTransforms: [] } }
+      protocol: { ...simulationProfile.capabilities.protocol, contextReset: 'fresh_request' } }
   }));
+  const { compileModelRequest } = await import('@agent-core/model');
+  t.mock.method(MemorySimulationProvider.prototype, 'compileRequest', async function (request) {
+    const { signal: _signal, ...body } = request;
+    const recovery = request.messages.some(item => item.content.includes('Prepare a fresh context for the same ongoing work'));
+    return compileModelRequest({ request, profile: await this.describeModel(), body,
+      endpoint: 'simulation://local', providerInputTokens: !recovery && JSON.stringify(request.messages).includes('FORGED') ? 16000 : 1000 });
+  });
   t.mock.method(MemorySimulationProvider.prototype, 'complete', async function (request) {
-    if (request.messages.some(item => item.role === 'system' && item.content.includes('bounded context-management turn')))
+    if (request.messages.some(item => item.role === 'user' && item.content.includes('Prepare a fresh context for the same ongoing work')))
       recoveryRequests.push(request);
     return complete.call(this, request);
   });
@@ -955,14 +669,13 @@ test('capacity recovery stays in the governed runtime and preserves the continui
   for (const request of recoveryRequests) {
     const tools = request.tools.map(tool => tool.function.name);
     assert.ok(tools.includes('context_transition'));
-    assert.ok(!tools.includes('background_lookup'));
-    assert.ok(!JSON.stringify(request.messages).includes('FORGED'));
+    assert.ok(tools.includes('background_lookup'), 'Recovery preserves the original tool catalog for native prefix compatibility; execution remains restricted.');
+    assert.ok(request.messages.some(item => item.content.includes('Prepare a fresh context')));
   }
   for (const trial of report.trials) {
     assert.equal(trial.status, 'completed', JSON.stringify(trial));
     assert.equal(trial.success, true, JSON.stringify(trial));
     assert.ok(trial.metrics.recoveryInvocations > 0);
-    assert.equal(trial.metrics.nativeTransforms, 0);
     assert.equal(trial.metrics.settledInvocations, trial.metrics.invocations);
     assert.equal(trial.metrics.userInterventions, 0);
     assert.ok(Object.values(trial.mechanical).every(count => count === 0));
@@ -984,10 +697,17 @@ test('recovery answers and domain-tool attempts cannot masquerade as completed e
     ...simulationProfile,
     limits: { ...simulationProfile.limits, contextTokens: 16000 },
     capabilities: { ...simulationProfile.capabilities,
-      protocol: { ...simulationProfile.capabilities.protocol, contextTransforms: [] } }
+      protocol: { ...simulationProfile.capabilities.protocol, contextReset: 'fresh_request' } }
   }));
+  const { compileModelRequest } = await import('@agent-core/model');
+  t.mock.method(MemorySimulationProvider.prototype, 'compileRequest', async function (request) {
+    const { signal: _signal, ...body } = request;
+    const recovery = request.messages.some(item => item.content.includes('Prepare a fresh context for the same ongoing work'));
+    return compileModelRequest({ request, profile: await this.describeModel(), body,
+      endpoint: 'simulation://local', providerInputTokens: !recovery && JSON.stringify(request.messages).includes('FORGED') ? 16000 : 1000 });
+  });
   t.mock.method(MemorySimulationProvider.prototype, 'complete', async function (request) {
-    if (!request.messages.some(item => item.role === 'system' && item.content.includes('bounded context-management turn')))
+    if (!request.messages.some(item => item.role === 'user' && item.content.includes('Prepare a fresh context for the same ongoing work')))
       return complete.call(this, request);
     return { provider: this.id, model: request.model,
       content: action === 'answer' ? '{"objective":"harbor-delivery","code":"MINT","format":"json","access":"read-only"}' : '',

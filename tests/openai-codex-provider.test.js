@@ -849,15 +849,15 @@ for (const change of ['no state', 'unchanged state', 'revised state', 'new user'
     t.after(() => session.close());
     const admission = new RequestAdmission(new ModelRequestAssembler(), inference);
     const state = {
-      id: 'state-1', sourceUri: 'session://working-state', sourceKind: 'generated',
+      id: 'state-1', sourceUri: 'session://session-state', sourceKind: 'generated',
       integrity: 'unverified', representation: 'summary', mediaType: 'text/plain',
-      title: 'Working state', content: 'Current understanding.', purpose: 'Generated interpretation.'
+      title: 'Session state', content: 'Current understanding.', purpose: 'Generated interpretation.'
     };
     const initial = {
       window: new ModelWindow(), task: 'Inspect the directory.', modelProfile: profile,
       instructions: [{ id: 'guidance-1', role: 'developer', priority: 0, content: 'Preserve unrelated work.' }],
       tools: [{ name: 'exec_command', description: 'Inspect the directory.', inputFormat: 'JSON', accessModes: ['execute'] }],
-      ...(change === 'no state' ? {} : { workingState: state })
+      ...(change === 'no state' ? {} : { sessionState: state })
     };
     const settings = { model: profile.id, tools: [{ type: 'function', function: {
       name: 'exec_command', description: 'Inspect the directory.',
@@ -868,7 +868,7 @@ for (const change of ['no state', 'unchanged state', 'revised state', 'new user'
       const result = await inference.invoke({
         ownerId: 'continuity-session', invocationId, purpose: 'generation', session,
         request: admitted.request, compiled: admitted.compiled, profile,
-        workingStateRevisionId: input.workingState?.id ?? null, outputReservation: 100
+        sessionStateRevisionId: input.sessionState?.id ?? null, outputReservation: 100
       });
       return { ...admitted, response: result.response };
     };
@@ -881,7 +881,7 @@ for (const change of ['no state', 'unchanged state', 'revised state', 'new user'
       turnIndex: 1, toolName: call.name, toolCallType: call.type, callId: call.id, immediateContent: '/workspace'
     });
     const next = { ...initial };
-    if (change === 'revised state') next.workingState = { ...state, id: 'state-2', content: 'Revised understanding.' };
+    if (change === 'revised state') next.sessionState = { ...state, id: 'state-2', content: 'Revised understanding.' };
     if (change === 'guidance') next.instructions = [{ ...initial.instructions[0], id: 'guidance-2', content: 'Preserve unrelated work. Review changed files.' }];
     if (change === 'new user') {
       next.window = new ModelWindow();
@@ -892,14 +892,16 @@ for (const change of ['no state', 'unchanged state', 'revised state', 'new user'
     }
     if (change === 'window replacement') {
       next.window = new ModelWindow();
-      next.workingState = { ...state, id: 'state-2', content: 'Revised understanding.' };
+      next.sessionState = { ...state, id: 'state-2', content: 'Revised understanding.' };
     }
     const second = await dispatch(next, 'second');
     const wire = JSON.parse(sockets[0].sent[1]);
-    assert.equal(second.response.transport.strategy, change === 'no state' ? 'websocket_delta' : 'websocket_full_replay');
-    if (change === 'no state') {
+    const reusable = ['no state', 'unchanged state', 'new user'].includes(change);
+    assert.equal(second.response.transport.strategy, reusable ? 'websocket_delta' : 'websocket_full_replay');
+    if (reusable) {
       assert.equal(wire.previous_response_id, 'response-1');
-      assert.deepEqual(wire.input.map(item => item.type), ['function_call_output']);
+      assert.deepEqual(wire.input.map(item => item.type), change === 'new user' ? ['function_call_output', undefined] : ['function_call_output']);
+      if (change === 'new user') assert.deepEqual(wire.input.at(-1), { role: 'user', content: 'Explain the inspection.' });
       assert.equal(wire.input[0].call_id, 'inspect-1');
       assert.equal(wire.input[0].output, '/workspace');
     } else {
@@ -910,7 +912,7 @@ for (const change of ['no state', 'unchanged state', 'revised state', 'new user'
       assert.deepEqual(body, second.compiled.body);
       const interpretations = body.input.filter(item => /(?:Current|Revised) understanding\./u.test(JSON.stringify(item)));
       assert.equal(interpretations.length, 1);
-      assert.ok(JSON.stringify(interpretations[0]).includes(next.workingState.content));
+      assert.ok(JSON.stringify(interpretations[0]).includes(next.sessionState.content));
     }
   });
 }
@@ -2221,36 +2223,3 @@ function stalledSseResponse() {
     { headers: { 'content-type': 'text/event-stream' } }
   );
 }
-
-test('Codex compaction uses the authenticated Responses trigger and exact governed body', async () => {
-  const calls = [];
-  const item = { type: 'compaction', id: 'opaque-1', encrypted_content: 'SIGNED+/=opaque' };
-  let output = [item];
-  const provider = new OpenAICodexProvider({ auth: bearerProvider(codexJwt()), fetch: async (url, init) => {
-    if (new URL(url).pathname.endsWith('/models')) return jsonResponse({ models: [{ slug: 'gpt-6.1-sol', display_name: 'Sol', context_window: 100000, input_modalities: ['text'], supported_reasoning_levels: [{ effort: 'low', description: 'low' }] }] });
-    calls.push({ url, body: JSON.parse(init.body), headers: init.headers });
-    return completionResponse({ id: 'compact-1', model: 'gpt-6.1-sol', status: 'completed', output,
-      usage: { input_tokens: 24, output_tokens: 8, total_tokens: 32 } });
-  } });
-  const request = { model: 'gpt-6.1-sol', messages: [{ role: 'developer', content: 'Policy' }, { role: 'user', content: 'Task' }],
-    tools: [{ type: 'function', function: { name: 'read', parameters: { type: 'object', properties: {} } } }], reasoning: { strategy: 'effort', effort: 'low' } };
-  const compiled = await provider.compileContextTransform({ transformId: 'compact', request }, { outputReservation: 1024 });
-  assert.deepEqual(compiled.body.input.at(-1), { type: 'compaction_trigger' });
-  assert.equal(compiled.body.tools[0].name, 'read');
-  assert.throws(() => provider.completeCompiled(compiled), /Compiled request/);
-  await assert.rejects(provider.transformContextCompiled('wrong', compiled), /context transform/);
-  const result = await provider.transformContextCompiled('compact', compiled, { affinityKey: 'owner' });
-  assert.deepEqual(calls.at(-1).body, { ...compiled.body, stream: true });
-  assert(calls.at(-1).headers['chatgpt-account-id']);
-  assert.match(calls.at(-1).headers['session-id'], /^[a-f0-9]{64}$/);
-  assert.deepEqual(result.state.data.items, [item]);
-  assert.equal(result.usage.totalTokens, 32);
-  const next = await provider.compileRequest({ ...request, messages: [request.messages[0], ...result.input, request.messages[1]] }, { outputReservation: 1024 });
-  assert.deepEqual(next.body.input.find(value => value.type === 'compaction'), item);
-  for (output of [[], [item, item]]) {
-    await assert.rejects(provider.transformContextCompiled('compact', compiled), /compaction/);
-  }
-  const beforeCancel = calls.length;
-  await assert.rejects(provider.transformContextCompiled('compact', compiled, { signal: AbortSignal.abort(new Error('cancelled')) }));
-  assert.equal(calls.length, beforeCancel);
-});

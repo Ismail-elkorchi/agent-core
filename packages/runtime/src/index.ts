@@ -25,12 +25,15 @@ export * from './inference/native-steering.js';
 export * from './inference/repository.js';
 export * from './inference/service.js';
 export * from './inference/usage-cost.js';
+export { decodeSessionStateContent, sessionStateContentSchema } from './session/session-state.js';
 export type {
-  WorkingStateChange,
-  WorkingStateInference,
-  WorkingStateSnapshot,
-  WorkingStateRevision
-} from './session/working-state.js';
+  SessionStateContent,
+  SessionStateItem,
+  SessionStateChange,
+  SessionStateInference,
+  SessionStateSnapshot,
+  SessionStateRevision
+} from './session/session-state.js';
 export {
   ToolCallExecutor,
   type ToolCallStepResult,
@@ -58,12 +61,7 @@ export {
 export * from './session/event-delivery.js';
 export * from './session/progress.js';
 
-export {
-  ModelContinuationRequiredError,
-  parseModelChangeRequest,
-  recordedModelSelection,
-  type ModelChangeOptions
-} from './orchestration/model-change.js';
+export { recordedModelSelection } from './orchestration/model-change.js';
 export { assertHistoryModelCompatibility } from './orchestration/session-replay.js';
 export { parseSessionImages, type SessionImageInput } from './session/images.js';
 

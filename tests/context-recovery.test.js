@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
+import { conservativeProtocolCapabilities, compileModelRequest } from '@agent-core/model';
 import { defineTool, ToolInputError } from '@agent-core/tools';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import {
@@ -8,13 +9,13 @@ import {
   InMemoryInferenceRepository, InferenceService, agentEventCodec, createHistoryTools
 } from '@agent-core/runtime';
 
-const marker = 'bounded context-management turn';
+const marker = 'Prepare a fresh context for the same ongoing work';
 const response = (content = 'Done.') => ({ provider: 'recovery-fixture', model: 'fixture', content, terminationReason: 'stop' });
 const call = (name, value = {}) => ({ ...response(''), terminationReason: 'tool_calls',
   toolCalls: [{ id: `call-${crypto.randomUUID()}`, type: 'function', name, input: { kind: 'json', value } }] });
 const select = () => call('context_transition', { reason: 'Release old optional material; preserve active task.', retain: [] });
 
-async function fixture({ allowedRisks = ['read', 'write'], budget, sourceBytes = 24000, sourceBound = 12000, targetCapacity = 12000 } = {}) {
+async function fixture({ allowedRisks = ['read', 'write'], budget, sourceBytes = 24000, sourceBound = 100000, targetCapacity = 19400 } = {}) {
   const sessions = new InMemorySessionRepository();
   const descriptor = await sessions.create({ binding: { schemaId: 'recovery-tests', schemaVersion: 1, subject: {} } });
   const events = new InMemoryEventRepository(agentEventCodec);
@@ -24,20 +25,20 @@ async function fixture({ allowedRisks = ['read', 'write'], budget, sourceBytes =
   const requests = [];
   let effects = 0;
   let recover = select;
-  let capacity = 64000;
+  const capacity = targetCapacity;
   const provider = {
     id: 'recovery-fixture', implementationId: 'recovery-fixture@1',
     describe: () => ({ id: 'recovery-fixture', displayName: 'Recovery fixture', defaultModel: 'fixture' }),
     describeModel: async () => ({
       id: 'fixture', provider: 'recovery-fixture',
-      capabilities: { streaming: false, toolCalling: true, supportedToolInputs: [{ kind: 'json' }], jsonMode: false,
+      capabilities: { protocol: conservativeProtocolCapabilities('fixture://recovery', { contextReset: 'fresh_request' }), streaming: false, toolCalling: true, supportedToolInputs: [{ kind: 'json' }], jsonMode: false,
         jsonSchema: false, logprobs: false, temperature: false, topP: false },
       modalities: { input: ['text'], output: ['text'] }, limits: { contextTokens: capacity, outputTokens: 1024 },
       supportedParameters: ['tools', 'maxOutputTokens']
     }),
     complete: async request => {
       requests.push(request);
-      return request.messages.some(item => item.role === 'system' && item.content.includes(marker))
+      return request.messages.some(item => item.role === 'user' && item.content.includes(marker))
         ? recover(request) : response();
     }
   };
@@ -57,12 +58,22 @@ async function fixture({ allowedRisks = ['read', 'write'], budget, sourceBytes =
       maxOutputTokens: 512,
       inferenceService: new InferenceService({ provider, artifacts, repository: inferenceRepository, ...(budget ? { budget } : {}) }) };
   };
-  const seed = await new AgentRuntime(options(100000)).run({ runId: 'seed', task: 'Old optional evidence: ' + 'x'.repeat(sourceBytes) }).result;
+  const seed = await new AgentRuntime({ ...options(100000), tools: [], contextRenewal: { automatic: false } }).run({ runId: 'seed', task: 'Old optional evidence: ' + 'x'.repeat(sourceBytes) }).result;
   assert.equal(seed.terminal?.executionStatus, 'completed');
-  capacity = targetCapacity;
   return { options: () => options(sourceBound), provider, requests, events, artifacts, history, sessions, descriptor, inferenceRepository,
     effects: () => effects, recover: value => { recover = value; },
-    recoveryRequests: () => requests.filter(request => request.messages.some(item => item.role === 'system' && item.content.includes(marker))) };
+    recoveryRequests: () => requests.filter(request => request.messages.some(item => item.role === 'user' && item.content.includes(marker))) };
+}
+
+// These routing tests use exact fixture counts so pagination/read contents do not tune the trigger.
+function countedCheckpoint(f) {
+  f.provider.compileRequest = async request => {
+    const { signal: _signal, ...body } = request;
+    const oldHistory = request.messages.some(item => item.role === 'user' && item.content.startsWith('Old optional evidence:'));
+    const checkpoint = request.messages.some(item => item.content.includes(marker));
+    return compileModelRequest({ request, body, profile: await f.provider.describeModel(), endpoint: 'fixture://counted-recovery',
+      providerInputTokens: oldHistory ? (checkpoint ? 18800 : 16000) : (checkpoint ? 3100 : 1000) });
+  };
 }
 
 async function records(f, runId) { const result = []; for await (const { event } of f.events.read(runId)) result.push(event); return result; }
@@ -72,6 +83,7 @@ test('restricted recovery uses the ordinary executor and restores original appli
   const result = await new AgentRuntime(f.options()).run({ runId: 'recover', task: 'ACTUAL TASK: preserve this exact input.' }).result;
   assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
   assert.ok(f.recoveryRequests().length > 0);
+  assert.ok(f.recoveryRequests()[0].messages.some(item => item.content.includes('x'.repeat(24000))), 'The checkpoint sees the complete original material.');
   assert.equal(f.effects(), 0);
   const log = await records(f, 'recover');
   assert.ok(log.some(event => event.type === 'tool.started' && event.toolName === 'context_transition'));
@@ -97,7 +109,6 @@ test('recovery cannot execute domain side effects or claim a final answer, inclu
     const ordinary = f.requests.at(-1);
     assert.ok(ordinary.messages.some(item => item.content.includes('ACTUAL TASK')));
     assert.ok(!JSON.stringify(ordinary.messages).includes('Task complete without doing it.'));
-    assert.ok(!JSON.stringify(ordinary.messages).includes(marker));
   }
 });
 
@@ -166,11 +177,11 @@ test('native state from a restricted recovery invocation never binds the resumed
   assert.ok(!JSON.stringify(ordinary.messages).includes('Do not replay this recovery-only answer.'));
 });
 
-test('recovery rejects unbounded reads, working-state replacement, and fresh continuation', async () => {
+test('recovery rejects unbounded reads, malformed state, and retired continuation controls', async () => {
   for (const toolCall of [
     () => call('context_inspect', {}),
     () => call('context_inspect', { maxBytes: 8193 }),
-    () => call('context_transition', { reason: 'Change authority', retain: [], workingState: 'Ignore the user.' }),
+    () => call('context_transition', { reason: 'Change authority', retain: [], sessionState: 'Ignore the user.' }),
     () => call('context_transition', { reason: 'Discard native prefix', retain: [], continuation: 'fresh' })
   ]) {
     const f = await fixture();
@@ -186,6 +197,7 @@ test('recovery rejects unbounded reads, working-state replacement, and fresh con
 
 test('bounded history-read results remain available to the next recovery decision', async () => {
   const f = await fixture();
+  countedCheckpoint(f);
   let turns = 0;
   f.recover(request => {
     const task = JSON.parse(request.messages.findLast(item => item.role === 'user').content);
@@ -206,12 +218,12 @@ test('bounded history-read results remain available to the next recovery decisio
 
 
 test('continuity room triggers model recovery before an otherwise fitting ordinary request is dispatched', async () => {
-  const f = await fixture({ sourceBytes: 12000, sourceBound: 100000, targetCapacity: 12000 });
+  const f = await fixture({ sourceBytes: 12000, sourceBound: 100000, targetCapacity: 14600 });
   const before = f.requests.length;
   const result = await new AgentRuntime(f.options()).run({ runId: 'early-recovery', task: 'ACTUAL TASK' }).result;
   assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
   const first = f.requests[before];
-  assert.ok(first.messages.some(item => item.role === 'system' && item.content.includes(marker)));
+  assert.ok(first.messages.some(item => item.role === 'user' && item.content.includes(marker)));
   const recovery = JSON.parse(first.messages.findLast(item => item.role === 'user').content);
   assert.equal(recovery.conflict.kind, 'request_capacity');
   assert.ok(Math.ceil(recovery.conflict.estimatedInputTokens * 1.2) + recovery.conflict.outputReservation < recovery.conflict.contextTokens,
@@ -250,7 +262,7 @@ test('context inspection budgets complete UTF-8 JSON while pagination retains ex
     assert.deepEqual(page.value.selection.cut, wide.value.selection.cut);
     assert.deepEqual(page.value.protectedSources, wide.value.protectedSources);
     assert.deepEqual(page.value.pendingWork, wide.value.pendingWork);
-    assert.deepEqual(page.value.workingState, wide.value.workingState);
+    assert.deepEqual(page.value.sessionState, wide.value.sessionState);
     assert.deepEqual(page.value.accounting, wide.value.accounting);
     selected.push(...page.value.selection.items.map(item => item.source));
     cursor = page.value.selection.cursor;
@@ -283,19 +295,19 @@ test('inspection reports an impossible whole-envelope bound without dropping pro
 });
 
 
-test('paged inspection of large working state reads only metadata and retains an authorized exact-source reference', async (t) => {
+test('paged inspection of large session state reads only metadata and retains an authorized exact-source reference', async (t) => {
   const f = await fixture({ sourceBytes: 64, sourceBound: 100000, targetCapacity: 64000 });
   const context = f.options().context;
   const cut = await f.history.capture();
   const requestRef = await f.artifacts.storeProtected({ label: 'state-origin', mediaType: 'application/json',
-    content: new TextEncoder().encode(JSON.stringify({ workingStateRevisionId: null, logical: { model: 'fixture', messages: [] } })) });
-  const body = 'GENERATED-STATE ' + 'x'.repeat(52000);
-  const workingState = { id: 'large-working-state', previousRevisionId: null,
-    contentRef: await f.artifacts.storeProtected({ label: 'working-state', mediaType: 'text/plain; charset=utf-8', content: new TextEncoder().encode(body) }),
+    content: new TextEncoder().encode(JSON.stringify({ sessionStateRevisionId: null, logical: { model: 'fixture', messages: [] } })) });
+  const body = JSON.stringify({ working: [{ id: 'notes', text: 'GENERATED-STATE ' + 'x'.repeat(52000) }] });
+  const sessionState = { id: 'large-session-state', previousRevisionId: null, capturedHistoryCut: cut,
+    content: JSON.parse(body),
     inference: { ownerId: 'owner', invocationId: 'state-origin', requestRef } };
   const update = await context.transition({ expectedWindowId: (await context.history.selectedContext(cut))?.windowId ?? null,
-    expectedSourceRevision: cut.sourceRevision, workingState, idempotencyKey: 'large-working-state', reason: 'Fixture admitted state',
-    selection: await context.selectSources(cut, {}) },
+    expectedSourceRevision: cut.sourceRevision, sessionState, idempotencyKey: 'large-session-state', reason: 'Fixture admitted state',
+    selection: await context.freshSelection({ selection: await context.selectSources(cut, {}), model: { provider: f.provider.id, model: 'fixture' }, profile: await f.provider.describeModel(), cut, resetId: 'fixture-state' }) },
     { admit: async () => ({ compiledInputIdentity: 'fixture-state', capabilityRevision: 'fixture' }) });
   assert.equal(update.transition.admission.status, 'admitted');
   const reads = [];
@@ -306,21 +318,21 @@ test('paged inspection of large working state reads only metadata and retains an
   const page = await inspectPresentation(context);
   assert.ok(Buffer.byteLength(page.text) <= 8192);
   assert.deepEqual(reads, []);
-  assert.equal(page.value.workingState.revisionId, 'large-working-state');
-  assert.equal(page.value.workingState.text, '');
-  assert.equal(page.value.workingState.complete, false);
-  assert.equal(page.value.workingState.totalBytes, Buffer.byteLength(body));
-  const retrieved = await f.history.read({ source: page.value.workingState.source, maxBytes: 1024 });
+  assert.equal(page.value.sessionState.revisionId, 'large-session-state');
+  assert.equal(page.value.sessionState.content, undefined);
+  assert.equal(page.value.sessionState.complete, false);
+  assert.equal(page.value.sessionState.totalBytes, Buffer.byteLength(body));
+  const retrieved = await f.history.read({ source: page.value.sessionState.source, maxBytes: 1024 });
   assert.equal(retrieved.status, 'available');
   assert.ok(retrieved.item.text.includes('GENERATED-STATE'));
-  assert.ok(reads.length > 0);
+  assert.deepEqual(reads, [], 'Committed inline state is retrieved from its original journal record, not an artifact.');
   const unpaged = await context.inspect();
-  assert.ok(unpaged.workingState.text.includes('GENERATED-STATE'));
-  assert.equal(unpaged.workingState.complete, false);
+  assert.ok(unpaged.sessionState.preview.includes('GENERATED-STATE'));
+  assert.equal(unpaged.sessionState.complete, false);
 });
 
 test('admission, feedback, and inspection disclose the same compiled control reserve', async () => {
-  const f = await fixture({ sourceBytes: 12000, sourceBound: 100000, targetCapacity: 12000 });
+  const f = await fixture({ sourceBytes: 12000, sourceBound: 100000, targetCapacity: 14600 });
   const options = f.options();
   let blocked;
   let conflict;
@@ -345,45 +357,38 @@ test('admission, feedback, and inspection disclose the same compiled control res
   assert.ok(final.capacity.remainingTokens >= final.capacity.continuityHeadroomTokens);
 });
 
-test('small-model required reserve remains visible when mandatory input cannot be released', async () => {
+test('a cheaper compiled checkpoint does not invent excessive continuity pressure', async () => {
   const { compileModelRequest } = await import('@agent-core/model');
   const f = await fixture({ sourceBytes: 64, sourceBound: 100000, targetCapacity: 6000 });
-  let ordinaryCompiled;
-  const ordinaryIdentities = new Set();
-  let rejectedSelections = 0;
-  f.recover(() => call('context_transition', { reason: `Distinct unsuccessful selection ${++rejectedSelections}`, retain: [] }));
   f.provider.compileRequest = async request => {
     const { signal: _signal, ...body } = request;
-    const control = request.messages.some(item => item.content.includes(marker));
-    const compiled = await compileModelRequest({ request, body, profile: await f.provider.describeModel(),
-      endpoint: 'fixture://mandatory-capacity', providerInputTokens: control ? 2300 : 4500 });
-    if (!control) { ordinaryCompiled = compiled; ordinaryIdentities.add(compiled.inputIdentity); }
-    return compiled;
+    return compileModelRequest({ request, body, profile: await f.provider.describeModel(),
+      endpoint: 'fixture://mandatory-capacity',
+      providerInputTokens: request.messages.some(item => item.content.includes(marker)) ? 2300 : 4500 });
   };
   const options = f.options();
-  const before = f.requests.length;
-  const task = 'MANDATORY ORIGINAL INPUT: this requirement cannot be released.';
-  const result = await new AgentRuntime(options).run({ runId: 'mandatory-reserve', task }).result;
-  assert.equal(result.state, 'suspended', JSON.stringify(result));
-  assert.equal(result.reason, 'context_admission');
-  assert.equal(result.contextAdmission.recovery, 'attempt_limit');
-  assert.equal(rejectedSelections, 4);
-  assert.ok(ordinaryIdentities.size > 1, 'Rejected selections may change candidate material without resetting the no-progress boundary.');
-  assert.equal(new Set(f.recoveryRequests().map(request => JSON.parse(request.messages.findLast(item => item.role === 'user').content).conflict.recoveryBoundary)).size, 1);
-  assert.ok(f.requests.slice(before).every(request => request.messages.some(item => item.content.includes(marker))));
+  const result = await new AgentRuntime(options).run({ runId: 'mandatory-reserve', task: 'Mandatory initial request.' }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.equal(f.recoveryRequests().length, 0);
   const current = await options.context.inspect(undefined, { limit: 12, maxBytes: 4096 });
-  assert.equal(current.admission.status, 'blocked');
-  assert.equal(current.capacity.continuityHeadroomPolicy, 'required');
-  assert.equal(current.capacity.continuityHeadroomTokens, 2812);
+  assert.equal(current.capacity.continuityHeadroomTokens, 0);
   assert.equal(current.capacity.inputTokens, 4500);
   assert.equal(current.capacity.remainingTokens, 988);
-  assert.equal(current.capacity.pressure, 'continuity');
-  const feedback = await options.context.capacityFeedback(ordinaryCompiled, current.capacity.continuityHeadroomTokens);
-  assert.deepEqual(JSON.parse(feedback.notice.content).capacity, current.capacity);
-  const input = current.activeSelection.manifest.items.find(item => item.description.includes('MANDATORY ORIGINAL INPUT'));
-  assert.equal(input.group.release, 'protected');
-  assert.equal((await f.history.read({ source: input.source })).item.text, task);
-  assert.equal(await (await f.sessions.sourceSnapshot(f.descriptor)).latestContext, undefined);
+  assert.equal(current.capacity.pressure, 'normal');
+});
+
+test('a short request with a large ordinary output reservation does not trigger needless renewal', async () => {
+  const f = await fixture({ sourceBytes: 64, sourceBound: 100000, targetCapacity: 32768 });
+  const describe = f.provider.describeModel;
+  f.provider.describeModel = async () => {
+    const profile = await describe();
+    return { ...profile, limits: { ...profile.limits, outputTokens: 16384 } };
+  };
+  const options = { ...f.options(), maxOutputTokens: 16384 };
+  const result = await new AgentRuntime(options).run({ runId: 'large-output', task: 'Explain this small example.' }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.equal(f.recoveryRequests().length, 0);
+  assert.equal(f.requests.at(-1).maxOutputTokens, 16384);
 });
 
 test('ordinary turns compile one current control probe without scanning durable recovery attempts', async t => {
@@ -421,6 +426,7 @@ test('ordinary turns compile one current control probe without scanning durable 
 
 test('recovery sees the current request independently of a twelve-item inventory after twenty old records', async () => {
   const f = await fixture();
+  countedCheckpoint(f);
   for (let i = 0; i < 20; i++) await f.sessions.appendAssistant(f.descriptor, {
     runId: `old-${i}`, identity: { turnId: `old-${i}`, turnIndex: i, requestAttempt: 1, toolBatchId: `old-batch-${i}` },
     content: `Old unrelated completed record ${i}`
@@ -441,63 +447,44 @@ test('recovery sees the current request independently of a twelve-item inventory
   assert.ok(presented.inventory.items.length <= 12);
   assert.equal(presented.inventory.coverage, 'partial');
   assert.ok(presented.inventory.cursor);
-  assert.equal(presented.workingState.authority, 'fallible_model_interpretation');
+  assert.equal(presented.sessionState.authority, 'fallible_model_interpretation');
   assert.ok(presented.toolNames.includes('history_search'));
 
   assert.equal(f.effects(), 0);
 });
 
 // Preview bounds are independent of state/source size and keep their original identity.
-test('recovery shows a bounded fallible state preview with source identity and honest coverage', async () => {
-  const f = await fixture({ sourceBound: 100000, targetCapacity: 12000 });
+test('oversized full-context state cannot be replaced by a bounded checkpoint preview', async () => {
+  const f = await fixture({ sourceBound: 100000, targetCapacity: 14600 });
   const options = f.options();
   const context = options.context;
   const cut = await f.history.capture();
   const requestRef = await f.artifacts.storeProtected({ label: 'state-origin', mediaType: 'application/json',
-    content: new TextEncoder().encode(JSON.stringify({ workingStateRevisionId: null, logical: { model: 'fixture', messages: [] } })) });
-  const workingState = { id: 'preview-state', previousRevisionId: null,
-    contentRef: await f.artifacts.storeProtected({ label: 'working-state', mediaType: 'text/plain; charset=utf-8',
-      content: new TextEncoder().encode('Important uncertainty: verify the original. ' + '文😀'.repeat(4000)) }),
+    content: new TextEncoder().encode(JSON.stringify({ sessionStateRevisionId: null, logical: { model: 'fixture', messages: [] } })) });
+  const sessionState = { id: 'preview-state', previousRevisionId: null, capturedHistoryCut: cut,
+    content: { working: [{ id: 'notes', text: 'Important uncertainty: verify the original. ' + '文😀'.repeat(4000) }] },
     inference: { ownerId: 'owner', invocationId: 'state-origin', requestRef } };
   await context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
-    idempotencyKey: 'preview-state', workingState, reason: 'Fixture admitted state', selection: await context.selectSources(cut, {}) },
+    idempotencyKey: 'preview-state', sessionState, reason: 'Fixture admitted state', selection: await context.freshSelection({ selection: await context.selectSources(cut, {}), model: { provider: f.provider.id, model: 'fixture' }, profile: await f.provider.describeModel(), cut, resetId: 'fixture-state' }) },
     { admit: async () => ({ compiledInputIdentity: 'fixture-state', capabilityRevision: 'fixture' }) });
-  let presented;
-  f.recover(request => {
-    presented = JSON.parse(request.messages.findLast(item => item.role === 'user').content);
-    assert.equal(presented.workingState.revisionId, 'preview-state');
-    assert.equal(presented.workingState.source.entryId, 'preview-state');
-    assert.equal(presented.workingState.coverage, 'partial');
-    assert.equal(presented.workingState.complete, false);
-    assert.ok(Buffer.byteLength(presented.workingState.text) <= 2048);
-    assert.match(presented.workingState.text, /verify the original/);
-    return response('No safe change.');
-  });
   const result = await new AgentRuntime(options).run({ runId: 'preview-recovery', task: 'Current scoped question.' }).result;
   assert.equal(result.state, 'suspended', JSON.stringify(result));
-  assert.ok(presented);
-  assert.equal((await context.workingState()).revision.id, 'preview-state');
+  assert.equal(result.contextAdmission.recovery, 'request_unavailable');
+  assert.equal(f.recoveryRequests().length, 0, 'A preview cannot replace the full state in a checkpoint.');
+  const preview = await context.inspectSessionState(undefined, 2048);
+  assert.equal(preview.complete, false);
+  assert.ok(Buffer.byteLength(preview.preview) <= 2048);
+  assert.match(preview.preview, /verify the original/);
+  assert.equal((await context.sessionState()).revision.id, 'preview-state');
 });
 
-test('bounded recovery steering retains the newest instructions with identity and original order', async () => {
+test('oversized steering cannot be silently replaced by its bounded preview', async () => {
   const f = await fixture();
-  let presented;
-  f.recover(request => {
-    presented = JSON.parse(request.messages.findLast(item => item.role === 'user').content);
-    return response('No safe source change.');
-  });
   const handle = new AgentRuntime(f.options()).run({ runId: 'recent-steering', task: 'Inspect only.' });
   for (let i = 1; i <= 15; i++) handle.injectSteering({ deliveryId: `correction-${i}`,
     instruction: `Steering ${i}: ${'x'.repeat(900)} End of steering ${i}` });
   const result = await handle.result;
   assert.equal(result.state, 'suspended', JSON.stringify(result));
-  assert.ok(presented);
-  assert.equal(presented.steering.totalItems, 15);
-  assert.equal(presented.steering.coverage, 'partial');
-  assert.ok(presented.steering.items.length <= 8);
-  assert.ok(presented.steering.items.reduce((sum, item) => sum + Buffer.byteLength(item.text), 0) <= 4096);
-  assert.match(presented.steering.items.at(-1).text, /End of steering 15/);
-  const numbers = presented.steering.items.map(item => Number(item.text.match(/Steering (\d+)/)[1]));
-  assert.deepEqual(numbers, [...numbers].sort((a, b) => a - b));
-  assert.ok(presented.steering.items.every(item => typeof item.instructionId === 'string'));
+  assert.equal(f.recoveryRequests().length, 0);
+  assert.equal((await records(f, 'recent-steering')).filter(event => event.type === 'input.steering.accepted').length, 15);
 });

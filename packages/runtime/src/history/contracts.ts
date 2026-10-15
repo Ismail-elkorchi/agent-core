@@ -95,7 +95,9 @@ export type HistoryReadResult =
       readonly offset: number;
       readonly nextOffset: number;
       readonly totalBytes: number;
+      /** Chronological context only; no reply relationship is inferred. */
       readonly neighbors: readonly HistoryItem[];
+      readonly neighborsCoverage: 'complete' | 'partial';
       readonly cut: HistorySourceCut;
     }>
   | Readonly<{
@@ -162,4 +164,40 @@ export interface HistoryMetadataPage {
   readonly scanned: number;
   readonly bytes: number;
   readonly cursor?: string;
+}
+
+/** Newest-first original contributions. Defaults to user-authored input and steering when filter is omitted. */
+export interface HistoryLatestRequest {
+  readonly signal?: AbortSignal | undefined;
+  readonly cut?: HistorySourceCut | undefined;
+  readonly cursor?: string | undefined;
+  readonly filter?: HistoryFilter | undefined;
+  readonly limit?: number | undefined;
+  readonly maxBytes?: number | undefined;
+  /** Maximum journal positions inspected, including nonmatching records. */
+  readonly maxScanned?: number | undefined;
+  readonly maxScannedBytes?: number | undefined;
+}
+export interface HistoryLatestResult {
+  readonly items: readonly HistoryItem[];
+  readonly cut: HistorySourceCut;
+  readonly coverage: 'complete' | 'partial';
+  readonly scanned: number;
+  readonly scannedBytes: number;
+  readonly bytes: number;
+  readonly cursor?: string;
+  readonly unread?: readonly HistoryUnreadSource[];
+}
+
+/** Exact UTF-8 span of an original contribution's text, never provider-native state. */
+export interface HistorySourceExcerpt {
+  readonly source: HistorySourceRef;
+  readonly offset: number;
+  readonly bytes: number;
+}
+export interface HistoryExcerptItem {
+  readonly excerpt: HistorySourceExcerpt;
+  readonly text: string;
+  readonly type: SessionBranchEntry['type'];
+  readonly role: HistoryItem['role'];
 }

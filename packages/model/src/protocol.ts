@@ -1,7 +1,6 @@
 import { parseJsonObject } from '@agent-core/json';
 import { modelInputIdentity } from './accounting.js';
 import type {
-  ModelContextTransformResult,
   ModelInputItem,
   ModelOutputItem,
   ModelProtocolCapabilities,
@@ -12,7 +11,6 @@ import type {
 import {
   ModelContractError,
   parseModelRequest,
-  parseModelUsage,
   parseProviderContextState
 } from './validation.js';
 
@@ -31,7 +29,7 @@ export function conservativeProtocolCapabilities(
     continuation: 'replay',
     asyncTools: false,
     steering: 'next_request',
-    contextTransforms: [],
+    contextReset: 'unsupported',
     toolChoice: ['auto'],
     counting: 'estimate',
     ...options
@@ -69,8 +67,12 @@ export function parseModelProtocolCapabilities(value: unknown): ModelProtocolCap
     (record.continuation !== 'replay' && record.continuation !== 'exact_prefix') ||
     typeof record.asyncTools !== 'boolean' ||
     (record.steering !== 'native' && record.steering !== 'next_request') ||
-    !Array.isArray(record.contextTransforms) ||
-    !record.contextTransforms.every((item) => typeof item === 'string') ||
+    (record.contextReset !== 'fresh_request' && record.contextReset !== 'unsupported') ||
+    Object.keys(record).some((key) => ![
+      'version', 'revision', 'endpoint', 'roles', 'developerRole', 'inputKinds', 'outputKinds',
+      'state', 'continuation', 'asyncTools', 'steering', 'contextReset', 'toolChoice',
+      'counting', 'reasoningAccounting', 'reasoningPrefix'
+    ].includes(key)) ||
     (record.counting !== 'estimate' && record.counting !== 'provider') ||
     (record.developerRole !== undefined &&
       record.developerRole !== 'native' &&
@@ -86,9 +88,9 @@ export function parseModelProtocolCapabilities(value: unknown): ModelProtocolCap
       'An explicit version, endpoint, revision and legal capability combination are required.'
     ]);
   if (record.state === 'none' &&
-    (inputKinds.includes('protocol') || record.contextTransforms.length || record.reasoningPrefix))
+    (inputKinds.includes('protocol') || record.reasoningPrefix))
     throw new ModelContractError('Invalid protocol capabilities.', [
-      'Protocol input, reasoning binding and context transforms require exact state support.'
+      'Protocol input and reasoning binding require exact state support.'
     ]);
   if (
     (record.developerRole === 'unsupported' && roles.includes('developer')) ||
@@ -111,37 +113,10 @@ export function parseModelProtocolCapabilities(value: unknown): ModelProtocolCap
     continuation: record.continuation,
     asyncTools: record.asyncTools,
     steering: record.steering,
-    contextTransforms: Object.freeze(
-      record.contextTransforms.filter((item): item is string => typeof item === 'string')
-    ),
+    contextReset: record.contextReset,
     counting: record.counting,
     reasoningAccounting: record.reasoningAccounting ?? 'unknown',
     ...(record.reasoningPrefix === undefined ? {} : { reasoningPrefix: record.reasoningPrefix })
-  });
-}
-export function parseModelContextTransformResult(value: unknown): ModelContextTransformResult {
-  const record = parseJsonObject(value, {
-    maxDepth: 64,
-    maxCollectionEntries: 100_000,
-    maxStringBytes: 32 * 1024 * 1024,
-    maxTotalBytes: 64 * 1024 * 1024
-  });
-  if (
-    Object.keys(record).some((key) => !['transformId', 'input', 'state', 'usage'].includes(key)) ||
-    typeof record.transformId !== 'string' ||
-    !record.transformId
-  ) {
-    throw new ModelContractError('Invalid context transform result.', [
-      'A transform identity and declared result fields are required.'
-    ]);
-  }
-  const state = parseProviderContextState(record.state);
-  const input = parseModelRequest({ model: state.model, messages: record.input }).messages;
-  return Object.freeze({
-    transformId: record.transformId,
-    state,
-    input,
-    ...(record.usage === undefined ? {} : { usage: parseModelUsage(record.usage) })
   });
 }
 function protocolChoices<T extends string>(value: unknown, choices: readonly T[]): readonly T[] {

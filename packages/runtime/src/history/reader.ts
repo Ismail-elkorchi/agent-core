@@ -24,6 +24,10 @@ import type {
   SessionRepository
 } from '../session/contracts.js';
 import type {
+  HistorySourceExcerpt,
+  HistoryExcerptItem,
+  HistoryLatestRequest,
+  HistoryLatestResult,
   HistorySourceMetadata,
   HistorySearchPosition,
   HistoryMetadataPage,
@@ -43,7 +47,7 @@ import type {
 } from './contracts.js';
 import { publicEventEntry, mergeMirror, entryIdentity } from './ledger.js';
 import { historySearchContent } from './model-content.js';
-import { historyCutSchema, sourceSchema } from './schema.js';
+import { historyCutSchema, sourceSchema, sourceExcerptSchema } from './schema.js';
 import { resolveToolObservation } from '../orchestration/observation-source.js';
 import { assistantResponseKey, toolEventKey } from '../run/contracts.js';
 import type { ContextWindowRecord } from '../context/contracts.js';
@@ -995,15 +999,10 @@ export class HistoryReader {
       throw error;
     }
     if (!entry) return unavailable(request.source, 'missing');
-    const stateRef =
-      entry.type === 'context_transition'
-          ? entry.workingState?.contentRef
-          : undefined;
-    const range = stateRef
-      ? await this.workingStateRange(stateRef, request.offset ?? 0, maxBytes)
-      : textRange(publicText(entry), request.offset ?? 0, maxBytes);
+    const range = textRange(publicText(entry), request.offset ?? 0, maxBytes);
     const neighbors: HistoryItem[] = [];
     let remaining = maxBytes - Buffer.byteLength(range.text);
+    let neighborsCoverage: 'complete' | 'partial' = count && remaining <= 0 ? 'partial' : 'complete';
     if (count && remaining > 0) {
       const snapshot = await this.snapshot(cut);
       if (entry.source && this.options.events) {
@@ -1015,28 +1014,33 @@ export class HistoryReader {
           maxBytes: request.maxSourceBytes ?? MAX_SOURCE_BYTES,
           types: eventTypes()
         });
+        if (!page.complete || page.oversized) neighborsCoverage = 'partial';
         for (const record of page.records) {
-          if (record.eventId === entry.source.eventId || remaining <= 0) continue;
+          if (record.eventId === entry.source.eventId) continue;
+          if (remaining <= 0) { neighborsCoverage = 'partial'; break; }
           const neighbor = publicEventEntry(record, null, new Map());
           if (!neighbor) continue;
           const item = historyItem(cut.sessionId, neighbor, remaining);
           neighbors.push(item);
+          if (item.truncated) neighborsCoverage = 'partial';
           remaining -= Buffer.byteLength(item.text);
         }
       } else {
         const at = (await snapshot.index.positions.get(entry.id)) ?? -1;
         for (
           let i = Math.max(0, at - count);
-          i <= Math.min(snapshot.entries.length - 1, at + count) && remaining > 0;
+          i <= Math.min(snapshot.entries.length - 1, at + count);
           i++
         ) {
           if (i === at) continue;
+          if (remaining <= 0) { neighborsCoverage = 'partial'; break; }
           const metadata = (await snapshot.entries.at(i));
           if (!metadata) break;
-          if (metadata.bytes > remaining) break;
+          if (metadata.bytes > remaining) { neighborsCoverage = 'partial'; break; }
           const neighbor = await this.sessionEntry(metadata, snapshot, remaining);
           const item = historyItem(cut.sessionId, neighbor, remaining);
           neighbors.push(item);
+          if (item.truncated) neighborsCoverage = 'partial';
           remaining -= Buffer.byteLength(item.text);
         }
       }
@@ -1052,29 +1056,182 @@ export class HistoryReader {
       nextOffset: range.nextOffset,
       totalBytes: range.totalBytes,
       neighbors: Object.freeze(neighbors),
+      neighborsCoverage,
       cut
     });
   }
 
-  private async workingStateRange(
-    ref: import('@agent-core/persistence').ProtectedArtifactRef,
-    offset: number,
-    length: number
-  ) {
-    if (!this.options.artifacts)
-      throw new Error('Working-state history requires authorized artifact access.');
-    const range = await this.options.artifacts.readVerifiedRange(ref, { offset, length });
-    const bounded = textRange(
-      new TextDecoder('utf-8', { fatal: true }).decode(range.bytes),
-      offset - range.offset,
-      length
-    );
-    return {
-      text: bounded.text,
-      offset: range.offset + bounded.offset,
-      nextOffset: range.offset + bounded.nextOffset,
-      totalBytes: range.fullSize
-    };
+  /** Normalize exact spans, validating originals within the same bounded journal read. */
+  async canonicalizeExcerpts(
+    excerpts: readonly HistorySourceExcerpt[], cut: HistorySourceCut, maxBytes = MAX_SOURCE_BYTES
+  ): Promise<readonly HistorySourceExcerpt[]> {
+    return Object.freeze((await this.readExcerpts(excerpts, cut, maxBytes)).map(item => item.excerpt));
+  }
+
+  /** Exact original text only. Overlapping or touching ranges merge, but missing bytes never do. */
+  async readExcerpts(
+    excerpts: readonly HistorySourceExcerpt[], cut: HistorySourceCut, maxBytes = MAX_SOURCE_BYTES
+  ): Promise<readonly HistoryExcerptItem[]> {
+    bound(maxBytes, MAX_SOURCE_BYTES, Number.MAX_SAFE_INTEGER, 'maxBytes');
+    if (excerpts.length > MAX_SCANNED) throw new Error('Too many history excerpt ranges.');
+    const bySource = new Map<string, { source: HistorySourceRef; ranges: HistorySourceExcerpt[] }>();
+    for (const value of excerpts) {
+      const excerpt = sourceExcerptSchema.parse(value);
+      const prior = bySource.get(excerpt.source.entryId);
+      if (prior && !sameHistorySource(prior.source, excerpt.source))
+        throw new Error('History excerpt source identities conflict.');
+      const group = prior ?? { source: excerpt.source, ranges: [] };
+      group.ranges.push(excerpt);
+      bySource.set(excerpt.source.entryId, group);
+    }
+    const snapshot = await this.snapshot(cut);
+    const ordered = await this.orderSources([...bySource.values()].map(group => group.source), cut);
+    let sourceBytes = 0, textBytes = 0;
+    const result: HistoryExcerptItem[] = [];
+    for (const source of ordered) {
+      const group = bySource.get(source.entryId);
+      if (!group) throw new Error('History excerpt source is missing.');
+      if (sourceBytes >= maxBytes) throw new Error('History excerpts exceed their source byte allowance.');
+      const material = await this.resolveWithUsage(source, cut, Math.min(MAX_SOURCE_BYTES, maxBytes - sourceBytes), 1, false, snapshot);
+      if (!material?.entry) throw new Error('History excerpt source is unavailable.');
+      sourceBytes += material.bytes;
+      const entry = material.entry;
+      if (entry.type !== 'input' && entry.type !== 'steering' && entry.type !== 'assistant' &&
+          entry.type !== 'observation' && entry.type !== 'tool_call')
+        throw new Error('History excerpts require an original text contribution.');
+      if (entry.type === 'assistant' && !entry.content)
+        throw new Error('History excerpts require original textual content, not media or native state.');
+      const text = publicText(entry);
+      const merged: HistorySourceExcerpt[] = [];
+      for (const range of group.ranges.sort((a, b) => a.offset - b.offset || a.bytes - b.bytes)) {
+        const exact = textRange(text, range.offset, range.bytes);
+        if (exact.offset !== range.offset || exact.nextOffset !== range.offset + range.bytes)
+          throw new Error('History excerpt must be within the original text and aligned to UTF-8 boundaries.');
+        const previous = merged.at(-1);
+        if (previous && range.offset <= previous.offset + previous.bytes)
+          merged[merged.length - 1] = { source, offset: previous.offset,
+            bytes: Math.max(previous.offset + previous.bytes, range.offset + range.bytes) - previous.offset };
+        else merged.push(range);
+      }
+      for (const excerpt of merged) {
+        const range = textRange(text, excerpt.offset, excerpt.bytes);
+        if (range.offset !== excerpt.offset || range.nextOffset !== excerpt.offset + excerpt.bytes)
+          throw new Error('History excerpt must be within the original text and aligned to UTF-8 boundaries.');
+        textBytes += excerpt.bytes;
+        if (textBytes > maxBytes) throw new Error('History excerpts exceed their text byte allowance.');
+        result.push(Object.freeze({ excerpt: Object.freeze(excerpt), text: range.text,
+          type: entry.type, role: historyRole(entry) }));
+      }
+    }
+    return Object.freeze(result);
+  }
+
+  /** Walk the same immutable journal backward; no separate contribution store or inferred replies. */
+  async latest(request: HistoryLatestRequest = {}): Promise<HistoryLatestResult> {
+    request.signal?.throwIfAborted();
+    const limit = bound(request.limit, 20, MAX_RESULTS, 'limit');
+    const maxScanned = bound(request.maxScanned, MAX_SCANNED, MAX_SCANNED, 'maxScanned');
+    const maxScannedBytes = bound(request.maxScannedBytes, MAX_SOURCE_BYTES, MAX_SOURCE_BYTES, 'maxScannedBytes');
+    const maxBytes = bound(request.maxBytes, 32 * 1024, MAX_BYTES, 'maxBytes');
+    const filter = request.filter ?? { role: 'user' as const };
+    const fingerprint = hashJson(filter);
+    const cursor = request.cursor ? decodeLatestCursor(request.cursor) : undefined;
+    if (cursor && cursor.fingerprint !== fingerprint) throw new Error('History latest cursor filter mismatch.');
+    if (cursor && request.cut && hashJson(cursor.cut) !== hashJson(request.cut))
+      throw new Error('History latest cursor cut mismatch.');
+    const cut = cursor?.cut ?? request.cut ?? await this.capture();
+    const snapshot = await this.snapshot(cut);
+    let at = cursor?.at ?? snapshot.entries.length - 1;
+    let sequence = cursor?.sequence;
+    if (at >= snapshot.entries.length) throw new Error('History latest cursor is beyond its boundary.');
+    let scanned = 0, scannedBytes = 0;
+    const items: HistoryItem[] = [];
+    const unread: HistoryUnreadSource[] = [];
+    const result = (): HistoryLatestResult => ({
+      items, cut, scanned, scannedBytes, bytes: 0,
+      coverage: at < 0 && unread.length === 0 && !cursor?.incomplete ? 'complete' : 'partial',
+      ...(at >= 0 ? { cursor: Buffer.from(JSON.stringify({
+        format: 'agent-core.history-latest/1', cut, at, fingerprint,
+        ...(unread.length || cursor?.incomplete ? { incomplete: true } : {}),
+        ...(sequence === undefined ? {} : { sequence })
+      })).toString('base64url') } : {}),
+      ...(unread.length ? { unread } : {})
+    });
+    const presentationBytes = () => Buffer.byteLength(serializeToolModelContent(historySearchContent(parseJsonObject(result()))));
+    while (at >= 0 && scanned < maxScanned && scannedBytes < maxScannedBytes && items.length < limit) {
+      request.signal?.throwIfAborted();
+      const metadata = await snapshot.entries.at(at);
+      if (!metadata) throw new Error('History latest position is missing.');
+      const prior = { at, sequence };
+      const events = this.options.events;
+      const runId = metadata.runId;
+      const authoritative = events && cut.ledgerCoverage === 'authoritative' && runId;
+      if (sequence !== undefined && metadata.type !== 'input') throw new Error('History latest cursor has an invalid run position.');
+      let source: HistorySourceRef | undefined;
+      if (authoritative && metadata.type === 'input') {
+        const head = await this.head(runId, cut, snapshot);
+        sequence ??= head.sequence;
+        if (sequence > head.sequence) throw new Error('History latest cursor exceeds its run boundary.');
+        if (sequence >= 0) {
+          const page = await events.readMetadataRange(runId, {
+            afterSequence: sequence - 1, through: head, limit: 1, maxBytes: Math.min(64 * 1024, maxScannedBytes - scannedBytes)
+          });
+          scannedBytes += page.bytes;
+          const record = page.records[0];
+          if (!record && page.oversized) {
+            const event = page.oversized.reference;
+            unread.push({ source: { sessionId: cut.sessionId, entryId: `event:${event.eventId}`, sha256: event.hash, event }, reason: 'source_byte_limit', bytes: page.oversized.bytes });
+            sequence--; scanned++; continue;
+          }
+          if (record?.reference.sequence !== sequence) throw new Error('History latest event position is missing.');
+          const facts = await this.eventMetadata(record, snapshot);
+          if (facts && matchesHistoryMetadata({
+            ...facts, timestamp: record.timestamp,
+            ...(record.metadata.toolName ? { toolName: record.metadata.toolName } : {})
+          }, filter)) source = facts.source;
+          sequence--;
+        } else {
+          if (matchesHistoryMetadata(metadata, filter)) source = metadataSource(cut.sessionId, metadata);
+          at--; sequence = undefined;
+        }
+      } else {
+        if ((!authoritative || (await this.head(runId, cut, snapshot)).sequence < 0) && matchesHistoryMetadata(metadata, filter))
+          source = metadataSource(cut.sessionId, metadata);
+        at--; sequence = undefined;
+      }
+      scanned++;
+      if (!source) continue;
+      let material;
+      if (scannedBytes >= maxScannedBytes) {
+        at = prior.at; sequence = prior.sequence; break;
+      }
+      try {
+        material = await this.resolveWithUsage(source, cut, maxScannedBytes - scannedBytes, 1, false, snapshot);
+      } catch (error) {
+        if (!(error instanceof HistorySourceTooLargeError)) throw error;
+        unread.push({ source, reason: 'source_byte_limit', bytes: error.bytes });
+        continue;
+      }
+      scannedBytes += material?.bytes ?? 0;
+      if (!material?.entry || !matches(material.entry, filter)) continue;
+      items.push(historyItem(cut.sessionId, material.entry, 16 * 1024));
+      const excess = presentationBytes() - maxBytes;
+      if (excess > 0) {
+        const item = items.at(-1);
+        if (!item) throw new Error('History latest result is missing its appended item.');
+        const available = Buffer.byteLength(item.text) - excess;
+        if (available >= 0) items[items.length - 1] = { ...item, text: available < 4 ? '' : textRange(item.text, 0, available).text, truncated: true };
+        if (available < 0 || presentationBytes() > maxBytes) {
+          items.pop(); at = prior.at; sequence = prior.sequence;
+          if (!items.length) throw new ToolInputError('History latest byte budget cannot fit source references and coverage.');
+          break;
+        }
+      }
+    }
+    request.signal?.throwIfAborted();
+    const bytes = presentationBytes();
+    if (bytes > maxBytes) throw new ToolInputError('History latest byte budget cannot fit coverage.');
+    return Object.freeze({ ...result(), items: Object.freeze(items), bytes });
   }
 
   async search(request: HistorySearchRequest = {}): Promise<HistorySearchResult> {
@@ -1173,22 +1330,7 @@ export class HistoryReader {
         scanned += resolved.scanned;
         scannedBytes += resolved.bytes;
         const entry = resolved.entry;
-        const stateRef =
-          entry.type === 'context_transition'
-              ? entry.workingState?.contentRef
-              : undefined;
-        if (stateRef && stateRef.size > maxScannedBytes - scannedBytes) {
-          unread.push({
-            source: candidate.source,
-            reason: 'source_byte_limit',
-            bytes: stateRef.size
-          });
-          return undefined;
-        }
-        const text = stateRef
-          ? (await this.workingStateRange(stateRef, 0, Math.max(1, stateRef.size))).text
-          : publicText(entry);
-        if (stateRef) scannedBytes += stateRef.size;
+        const text = publicText(entry);
         material = { entry, text };
         loaded.set(candidate.source.entryId, material);
       }
@@ -1211,20 +1353,7 @@ export class HistoryReader {
       indexBytes += page.bytes;
       for (const entry of page.entries) {
         const source = sourceRef(cut.sessionId, entry);
-        const stateRef =
-          entry.type === 'context_transition'
-              ? entry.workingState?.contentRef
-              : undefined;
-        if (stateRef && stateRef.size > Math.min(maxScannedBytes - scannedBytes, maxIndexBytes - indexBytes)) {
-          const gap = { source, reason: 'source_byte_limit' as const, bytes: stateRef.size };
-          state.unread.push(gap);
-          unread.push(gap);
-          continue;
-        }
-        const text = stateRef
-          ? (await this.workingStateRange(stateRef, 0, Math.max(1, stateRef.size))).text
-          : publicText(entry);
-        if (stateRef) { scannedBytes += stateRef.size; indexBytes += stateRef.size; }
+        const text = publicText(entry);
         const at = source.event
           ? (await snapshot.index.inputs.get(source.event.runId))
           : (await snapshot.index.positions.get(entry.id));
@@ -1413,7 +1542,7 @@ function historyItem(sessionId: string, entry: SessionBranchEntry, maxBytes: num
     source: sourceRef(sessionId, entry),
     type: entry.type,
     role: historyRole(entry),
-    ...(entry.type === 'context_transition' && entry.workingState
+    ...(entry.type === 'context_transition' && entry.sessionState
       ? { generated: true as const }
       : {}),
     ...('runId' in entry ? { runId: entry.runId } : {}),
@@ -1459,6 +1588,7 @@ function publicText(entry: SessionBranchEntry): string {
     case 'branch':
       return JSON.stringify({ fromEntryId: entry.fromEntryId, label: entry.label });
     case 'context_transition':
+      if (entry.sessionState) return JSON.stringify(entry.sessionState.content);
       return JSON.stringify({
         windowId: entry.window.windowId,
         reason: entry.window.reason,
@@ -1690,4 +1820,17 @@ class HistorySourceWorkLimitError extends Error {
   ) {
     super('Related history records exceed the scanned record allowance.');
   }
+}
+
+function decodeLatestCursor(value: string): { cut: HistorySourceCut; at: number; sequence?: number; fingerprint: string; incomplete?: true } {
+  if (value.length > 256 * 1024) throw new Error('History latest cursor is too large.');
+  const record = parseJsonObject(JSON.parse(Buffer.from(value, 'base64url').toString('utf8')));
+  if (record.format !== 'agent-core.history-latest/1' || typeof record.at !== 'number' ||
+      !Number.isSafeInteger(record.at) || record.at < 0 || typeof record.fingerprint !== 'string' ||
+      (record.incomplete !== undefined && record.incomplete !== true) ||
+      (record.sequence !== undefined && (typeof record.sequence !== 'number' || !Number.isSafeInteger(record.sequence) || record.sequence < -1)))
+    throw new Error('Invalid history latest cursor.');
+  return { cut: historyCutSchema.parse(record.cut), at: record.at, fingerprint: record.fingerprint,
+    ...(record.incomplete === true ? { incomplete: true } : {}),
+    ...(typeof record.sequence === 'number' ? { sequence: record.sequence } : {}) };
 }

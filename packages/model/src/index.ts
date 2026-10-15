@@ -400,7 +400,8 @@ export interface ModelProtocolCapabilities {
   readonly continuation: 'replay' | 'exact_prefix';
   readonly asyncTools: boolean;
   readonly steering: 'next_request' | 'native';
-  readonly contextTransforms: readonly string[];
+/** Starting a fresh request may discard prior native state only after all protocol obligations settle. */
+  readonly contextReset: 'fresh_request' | 'unsupported';
   readonly toolChoice: readonly ('auto' | 'none' | 'required' | 'named')[];
   readonly counting: 'estimate' | 'provider';
   readonly reasoningAccounting?: 'included_output' | 'separate' | 'unknown';
@@ -423,18 +424,6 @@ export interface ModelSteeringDelivery {
   readonly requiredToolCallIds?: readonly string[];
   readonly detail?: string;
 }
-export interface ModelContextTransformRequest {
-  readonly transformId: string;
-  readonly request: ModelRequest;
-  readonly signal?: AbortSignal;
-}
-export interface ModelContextTransformResult {
-  readonly transformId: string;
-  readonly input: readonly ModelInputItem[];
-  readonly state: ProviderContextState;
-  readonly usage?: ModelUsage;
-}
-
 export interface ModelTransportMetadata {
   readonly provider: string;
   readonly strategy: string;
@@ -497,16 +486,6 @@ export interface ModelProvider {
     request: import('./accounting.js').CompiledModelRequest,
     options?: ModelTransportOptions
   ): AsyncIterable<ModelStreamEvent>;
-  transformContext?(request: ModelContextTransformRequest): Promise<ModelContextTransformResult>;
-  compileContextTransform?(
-    request: ModelContextTransformRequest,
-    options?: import('./accounting.js').ModelCompilationOptions
-  ): Promise<import('./accounting.js').CompiledModelRequest>;
-  transformContextCompiled?(
-    transformId: string,
-    request: import('./accounting.js').CompiledModelRequest,
-    options?: ModelTransportOptions
-  ): Promise<ModelContextTransformResult>;
   describe(): ModelProviderInfo;
   authentication?(): import('@agent-core/auth').ProviderAuthentication | undefined;
   /** Discover identities from this endpoint/account. Selection still requires describeModel. */

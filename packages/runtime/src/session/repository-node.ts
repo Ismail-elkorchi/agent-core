@@ -3,8 +3,8 @@ import { recordedModelSelection } from '../orchestration/model-change.js';
 import { protectedInferenceInput } from '../inference/input.js';
 import type { ProtectedArtifactRef } from '@agent-core/persistence';
 import {
-  type WorkingStateRevision
-} from './working-state.js';
+  type SessionStateRevision
+} from './session-state.js';
 import { decodeToolContent } from '@agent-core/tools';
 import { parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import { parseModelSelection, type ModelOutputItem, type ModelSelection } from '@agent-core/model';
@@ -136,7 +136,7 @@ export class JsonlSessionRepository implements SessionRepository {
           type: 'session',
           version: 1,
           format: 'agent-core.session/2',
-          workingStateStorage: 'session',
+          sessionStateStorage: 'session',
           id,
           timestamp: new Date().toISOString(),
           binding,
@@ -166,11 +166,11 @@ export class JsonlSessionRepository implements SessionRepository {
     const entry = await this.branchIndex(session.id).currentModelSettings(session);
     return entry === undefined ? this.branchIndex(session.id).initialModelSettings(session) : recordedModelSelection([entry]);
   }
-  async currentWorkingState(
+  async currentSessionState(
     session: SessionDescriptor,
     leafId?: string | null
-  ): Promise<WorkingStateRevision | null> {
-    return this.branchIndex(session.id).workingState(session, leafId);
+  ): Promise<SessionStateRevision | null> {
+    return this.branchIndex(session.id).sessionState(session, leafId);
   }
 
   async open(sessionId: string, expectedBinding: SessionBindingInput): Promise<SessionDescriptor> {
@@ -614,13 +614,12 @@ export class JsonlSessionRepository implements SessionRepository {
           assertDescriptor(session, state);
           const existing = await this.branchIndex(session.id).contextRetry(session, input);
           if (existing) return existing;
-          if (input.transition.admission.status === 'pending') await this.branchIndex(session.id).assertIdle(session);
           await this.branchIndex(session.id).validateContext(session, input);
-          const { id: revisionId, ...workingState } = input.workingState ?? {};
+          const { id: revisionId, ...sessionState } = input.sessionState ?? {};
           const entry = decodeContextTransitionEntry({
             ...baseEntry(state.leafId),
             type: 'context_transition',
-            ...(revisionId ? { id: revisionId, workingState } : {}),
+            ...(revisionId ? { id: revisionId, sessionState } : {}),
             window: input.window,
             transition: input.transition
           });
@@ -1021,7 +1020,7 @@ const SESSION_HEADER_FIELDS = new Set([
   'type',
   'version',
   'format',
-  'workingStateStorage',
+  'sessionStateStorage',
   'id',
   'timestamp',
   'binding',
@@ -1034,7 +1033,7 @@ function parseSessionHeader(value: JsonValue, sessionId: string): SessionHeader 
   if (
     !isJsonObject(value) ||
     value.format !== 'agent-core.session/2' ||
-    value.workingStateStorage !== 'session'
+    value.sessionStateStorage !== 'session'
   )
     throw new Error(
       'Incompatible session format. Start a new session; existing data has not been changed.'
@@ -1056,7 +1055,7 @@ function parseSessionHeader(value: JsonValue, sessionId: string): SessionHeader 
     type: 'session',
     version: 1,
     format: 'agent-core.session/2',
-    workingStateStorage: 'session',
+    sessionStateStorage: 'session',
     id: value.id,
     timestamp: value.timestamp,
     binding,

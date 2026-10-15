@@ -1,10 +1,10 @@
-import { workingStateChangeSchema } from '../session/working-state.js';
+import { sessionStateChangeSchema } from '../session/session-state.js';
 import { parseModelSelection } from '@agent-core/model';
-import { parseJsonObject } from '@agent-core/json';
 import * as z from 'zod';
-import { historyCutSchema, sourceSchema } from '../history/schema.js';
+import { historyCutSchema, sourceSchema, sourceExcerptSchema } from '../history/schema.js';
 export const contextSelectionSchema = z
   .strictObject({
+    excerpts: z.array(sourceExcerptSchema).max(10000).readonly().optional(),
     protected: z.array(sourceSchema).max(10000).readonly().optional(),
     continuity: z
       .strictObject({
@@ -15,30 +15,14 @@ export const contextSelectionSchema = z
       })
       .readonly()
       .optional(),
-    retained: z.array(sourceSchema).max(10_000).readonly(),
-    strategy: z.enum(['sources', 'provider']),
-    providerState: z
-      .unknown()
-      .transform((value, context) => {
-        try {
-          return parseJsonObject(value);
-        } catch (error) {
-          context.addIssue({
-            code: 'custom',
-            message: error instanceof Error ? error.message : 'Invalid JSON object.'
-          });
-          return z.NEVER;
-        }
-      })
-      .optional()
+    retained: z.array(sourceSchema).max(10_000).readonly()
   })
   .readonly();
 export const contextTransitionRequestSchema = z
   .strictObject({
-    preserveSelection: z.literal(true).optional(),
     expectedCut: historyCutSchema.optional(),
-    workingState: workingStateChangeSchema.optional(),
-    expectedWorkingStateRevisionId: z.string().min(1).nullable().optional(),
+    sessionState: sessionStateChangeSchema.optional(),
+    expectedSessionStateRevisionId: z.string().min(1).nullable().optional(),
     toolInvocation: z
       .strictObject({
         runId: z.string().min(1),
@@ -70,25 +54,21 @@ export const contextWindowSchema = z
 export const contextTransitionSchema = z
   .strictObject({
     transitionId: z.string().min(1),
-    preservedSelection: z.literal(true).optional(),
-    admission: z.discriminatedUnion('status', [
-      z.strictObject({ status: z.literal('admitted'), compiledInputIdentity: z.string().min(1), capabilityRevision: z.string().min(1) }).readonly(),
-      z.strictObject({ status: z.literal('pending'), reason: z.literal('idle_source_selection') }).readonly()
-    ]),
+    admission: z.strictObject({ status: z.literal('admitted'), compiledInputIdentity: z.string().min(1), capabilityRevision: z.string().min(1) }).readonly(),
     idempotencyKey: z.string().min(1),
     previousWindowId: z.string().min(1).nullable(),
     windowId: z.string().min(1),
     requestFingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
     selectionFingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
     requestedSourceRevision: z.number().int().min(0).optional(),
-    requestedWorkingStateRevisionId: z.string().min(1).nullable().optional(),
+    requestedSessionStateRevisionId: z.string().min(1).nullable().optional(),
     committedAt: z.string().min(1)
   })
   .readonly();
 export const contextEntrySchema = z
   .strictObject({
     type: z.literal('context_transition'),
-    workingState: workingStateChangeSchema.omit({ id: true }).optional(),
+    sessionState: sessionStateChangeSchema.omit({ id: true }).optional(),
     id: z.string().min(1),
     parentId: z.string().min(1).nullable(),
     timestamp: z.string().min(1),

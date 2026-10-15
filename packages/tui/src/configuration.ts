@@ -1,4 +1,3 @@
-import { ModelContinuationRequiredError, type ModelChangeOptions } from '@agent-core/runtime';
 import type { DeviceAuthenticationChallenge } from '@agent-core/auth';
 import type {
   ModelCatalogEntry,
@@ -51,8 +50,7 @@ export interface ConfigurationOperations {
   connect(provider: string, endpoint?: string): ModelProvider | Promise<ModelProvider>;
   save(
     selection: ModelSelection,
-    provider: ModelProvider,
-    options?: ModelChangeOptions
+    provider: ModelProvider
   ): Promise<void>;
 }
 
@@ -85,7 +83,6 @@ export interface ConfigurationState {
   readonly profile?: ModelProfile;
   readonly pending?: string | undefined;
   readonly error?: string;
-  readonly freshContinuationAvailable?: boolean;
   readonly notice?: string;
 }
 
@@ -120,7 +117,7 @@ export type ConfigurationMessage =
   | { readonly type: 'configuration.edit'; readonly transition: TextAreaTransition }
   | { readonly type: 'configuration.input' }
   | { readonly type: 'configuration.refresh' }
-  | { readonly type: 'configuration.save'; readonly continuation?: 'fresh' }
+  | { readonly type: 'configuration.save' }
   | { readonly type: 'configuration.saved'; readonly id: string }
   | {
       readonly type: 'configuration.catalog';
@@ -140,8 +137,7 @@ export type ConfigurationMessage =
       readonly id: string;
       readonly request: string;
       readonly error: string;
-      readonly freshContinuationAvailable?: boolean;
-    };
+        };
 
 function configurationState(
   selection: ModelSelection | undefined,
@@ -185,7 +181,6 @@ function updateConfiguration(
   ) {
     const editing = { ...state };
     delete editing.error;
-    delete editing.freshContinuationAvailable;
     delete editing.notice;
     current = editing;
   }
@@ -548,8 +543,7 @@ function reduceConfiguration(
         state: {
           ...state,
           pending: undefined,
-          error: message.error,
-          freshContinuationAvailable: message.freshContinuationAvailable ?? false
+          error: message.error
         }
       };
     case 'configuration.save': {
@@ -561,8 +555,7 @@ function reduceConfiguration(
         state.pending !== undefined
       )
         return { state };
-      if (message.continuation === 'fresh' && !state.freshContinuationAvailable) return { state };
-      return operation(state, async (request) => {
+      return operation(state, async () => {
         assertModelRequestSupported(profile, {
           model: state.selection.model,
           messages: [],
@@ -573,22 +566,7 @@ function reduceConfiguration(
             ? {}
             : { temperature: state.selection.temperature })
         });
-        try {
-          await operations.save(
-            state.selection,
-            adapter,
-            message.continuation === 'fresh' ? { continuation: 'fresh' } : {}
-          );
-        } catch (error) {
-          if (!(error instanceof ModelContinuationRequiredError)) throw error;
-          return {
-            type: 'configuration.failed',
-            id: state.id,
-            request,
-            error: error.message,
-            freshContinuationAvailable: true
-          };
-        }
+        await operations.save(state.selection, adapter);
         return { type: 'configuration.saved', id: state.id };
       });
     }
@@ -890,19 +868,6 @@ function configurationView(
                         action('configuration-temperature', 'Temperature', {
                           type: 'configuration.stage',
                           stage: 'temperature'
-                        })
-                      ]
-                    : []),
-                  ...(state.freshContinuationAvailable
-                    ? [
-                        button({
-                          id: 'configuration-fresh',
-                          label: 'Continue fresh in this session',
-                          disabled: state.pending !== undefined,
-                          onPress: (): Message => ({
-                            type: 'configuration.save',
-                            continuation: 'fresh'
-                          })
                         })
                       ]
                     : []),

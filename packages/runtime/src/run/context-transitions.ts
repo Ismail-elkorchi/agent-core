@@ -22,12 +22,6 @@ export class RunContextTransitions {
       readonly append: (event: AgentAuditEvent, key: string) => Promise<unknown>;
     }
   ) {}
-  /** State-only native successors can preview the first queued immutable proposal. */
-  async pendingState(): Promise<ContextTransitionRequest | undefined> {
-    await this.writes;
-    const first = this.requests.values().next().value;
-    return first?.requested.preserveSelection && first.requested.workingState ? first.requested : undefined;
-  }
   hasPending(): boolean {
     return this.requests.size > 0;
   }

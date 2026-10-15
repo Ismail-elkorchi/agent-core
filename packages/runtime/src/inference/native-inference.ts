@@ -1,3 +1,4 @@
+import type { HistorySourceCut } from '../history/contracts.js';
 import { hashJson } from '@agent-core/persistence';
 import {
   parseModelResponse,
@@ -26,7 +27,8 @@ export interface NativeGenerationSettlement {
   readonly result: InferenceResult;
 }
 export interface NativeInferenceInput extends InferenceIdentity {
-  readonly workingStateRevisionId?: () => string | null;
+  readonly sessionStateRevisionId?: () => string | null;
+  readonly capturedHistoryCut?: () => HistorySourceCut | undefined | Promise<HistorySourceCut | undefined>;
   readonly request: ModelRequest;
   readonly compiled: CompiledModelRequest;
   readonly profile: ModelProfile;
@@ -54,7 +56,8 @@ export interface NativeInferenceAuthority {
   }) => Promise<InferenceResult>;
   readonly extend: (
     context: NativeGenerationContext,
-    compiled: CompiledModelRequest
+    compiled: CompiledModelRequest,
+    dispatch: ModelNativeDispatch
   ) => Promise<void>;
 }
 interface Generation {
@@ -134,7 +137,7 @@ export async function invokeNativeInference(
     if (prior) {
       if (prior.responseId || prior.settlement)
         throw new Error('An executing native generation cannot change its admitted input.');
-      await authority.extend(prior.context, dispatch.compiled);
+      await authority.extend(prior.context, dispatch.compiled, dispatch);
       await input.extended?.(prior.context, dispatch);
       prior.context = { ...prior.context, compiled: dispatch.compiled, dispatch };
     } else {

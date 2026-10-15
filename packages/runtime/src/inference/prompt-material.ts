@@ -65,7 +65,7 @@ export interface PromptMaterial {
   readonly images?: readonly import('../session/images.js').SessionImageInput[];
   readonly instructions: readonly PromptInstructionBlock[];
   readonly context: readonly PromptContextItem[];
-  readonly workingState?: PromptContextItem;
+  readonly sessionState?: PromptContextItem;
   readonly capacityNotice?: PromptContextItem;
   readonly tools: readonly PromptToolSummary[];
   readonly outputContract?: PromptOutputContract;

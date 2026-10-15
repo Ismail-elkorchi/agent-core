@@ -3,8 +3,8 @@ import { recordedModelSelection } from '../orchestration/model-change.js';
 import { protectedInferenceInput } from '../inference/input.js';
 import type { ProtectedArtifactRef } from '@agent-core/persistence';
 import {
-  type WorkingStateRevision
-} from './working-state.js';
+  type SessionStateRevision
+} from './session-state.js';
 import { parseJsonValue } from '@agent-core/json';
 import { parseModelSelection, type ModelOutputItem, type ModelSelection } from '@agent-core/model';
 import { hashJson, PersistenceConflictError } from '@agent-core/persistence';
@@ -31,7 +31,7 @@ import {
   settleMemorySource,
   assertBranchEntry,
   memoryBranchSource,
-  currentWorkingState,
+  currentSessionState,
   readBranchPage,
   searchBranch
 } from './branch-page.js';
@@ -125,7 +125,7 @@ export class InMemorySessionRepository implements SessionRepository {
         type: 'session',
         version: 1,
         format: 'agent-core.session/2',
-        workingStateStorage: 'session',
+        sessionStateStorage: 'session',
         id,
         timestamp: new Date().toISOString(),
         binding,
@@ -201,12 +201,12 @@ export class InMemorySessionRepository implements SessionRepository {
         ?? initialSessionModelSelection(state.submissionRecords);
     });
   }
-  currentWorkingState(
+  currentSessionState(
     session: SessionDescriptor,
     leafId?: string | null
-  ): Promise<WorkingStateRevision | null> {
+  ): Promise<SessionStateRevision | null> {
     return this.serial(() =>
-      currentWorkingState(
+      currentSessionState(
         memoryBranchSource(session.id, this.requireDescriptor(session).branchEntries),
         leafId
       )
@@ -535,7 +535,6 @@ export class InMemorySessionRepository implements SessionRepository {
       const branch = activeBranch(state.branchEntries, branchLeaf(state.branchEntries));
       const existing = contextCommitRetry(branch, input);
       if (existing) return existing;
-      if (input.transition.admission.status === 'pending') assertSessionIdle(state.submissionRecords);
       validateContextCommit(
         session.id,
         branch,
@@ -543,11 +542,11 @@ export class InMemorySessionRepository implements SessionRepository {
         input,
         state.finalizations
       );
-      const { id: revisionId, ...workingState } = input.workingState ?? {};
+      const { id: revisionId, ...sessionState } = input.sessionState ?? {};
       const entry = decodeContextTransitionEntry({
         ...baseEntry(branchLeaf(state.branchEntries)),
         type: 'context_transition',
-        ...(revisionId ? { id: revisionId, workingState } : {}),
+        ...(revisionId ? { id: revisionId, sessionState } : {}),
         window: input.window,
         transition: input.transition
       });

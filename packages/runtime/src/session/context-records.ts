@@ -1,4 +1,4 @@
-import { latestWorkingState, assertWorkingStateRevision } from './working-state.js';
+import { latestSessionState, assertSessionStateRevision } from './session-state.js';
 import { hashJson, PersistenceConflictError } from '@agent-core/persistence';
 import type { ContextTransitionCommit, ContextWindowRecord } from '../context/contracts.js';
 import { contextEntrySchema } from '../context/schema.js';
@@ -31,7 +31,7 @@ export function sessionReplayState(
     branch: Object.freeze([...branch]),
     runFinalizations,
     sourceRevision,
-    workingState: latestWorkingState(branch),
+    sessionState: latestSessionState(branch),
     ledgerRunIds: Object.freeze([...new Set([...unfinished, ...(latest ? [latest] : [])])]),
     ...(contextWindow ? { contextWindow } : {})
   });
@@ -55,7 +55,7 @@ export function validateContextCommit(
   validateContextCommitState(sessionId, {
     leafId: branch.at(-1)?.id ?? null,
     windowId: latestContextWindow(branch)?.windowId ?? null,
-    workingState: latestWorkingState(branch),
+    sessionState: latestSessionState(branch),
     refs: new Map(branch.map(entry => [entry.id, hashJson(entry)])),
     finalizations
   }, sourceRevision, input);
@@ -66,17 +66,15 @@ export function validateContextCommitState(
   source: {
     readonly leafId: string | null;
     readonly windowId: string | null;
-    readonly workingState: import('./working-state.js').WorkingStateRevision | null;
+    readonly sessionState: import('./session-state.js').SessionStateRevision | null;
     readonly refs: ReadonlyMap<string, string>;
     readonly finalizations: readonly Pick<SessionRunFinalization, 'runId' | 'throughEntryId'>[];
   },
   sourceRevision: number,
   input: ContextTransitionCommit
 ): void {
-  if (input.workingState && input.transition.admission.status !== 'admitted')
-    throw new Error('Working-state publication requires admitted compiled input.');
-  assertWorkingStateRevision(source.workingState, input.expectedWorkingStateRevisionId);
-  if (input.workingState) assertWorkingStateRevision(source.workingState, input.workingState.previousRevisionId);
+  assertSessionStateRevision(source.sessionState, input.expectedSessionStateRevisionId);
+  if (input.sessionState) assertSessionStateRevision(source.sessionState, input.sessionState.previousRevisionId);
   const leaf = source.leafId;
   const currentWindowId = source.windowId;
   if (
@@ -99,7 +97,7 @@ export function validateContextCommitState(
   )
     throw new Error('Context transition identities do not match its captured boundary.');
   const refs = source.refs;
-  for (const ref of input.window.selection.retained) {
+  for (const ref of [...input.window.selection.retained, ...(input.window.selection.excerpts ?? []).map(excerpt => excerpt.source)]) {
     const ledger = ref.event
       ? cut.ledgerHeads?.find((head) => head.runId === ref.event?.runId)
       : undefined;
@@ -131,8 +129,8 @@ export function contextCommitRetry(
     (existing.transition.requestFingerprint !== input.transition.requestFingerprint ||
       hashJson(existing.window.selection) !== hashJson(input.window.selection) ||
       existing.window.reason !== input.window.reason ||
-      hashJson(existing.workingState ? { ...existing.workingState, id: existing.id } : null) !==
-        hashJson(input.workingState ?? null))
+      hashJson(existing.sessionState ? { ...existing.sessionState, id: existing.id } : null) !==
+        hashJson(input.sessionState ?? null))
   )
     throw new PersistenceConflictError(
       'Context transition idempotency key has conflicting content.'
@@ -143,8 +141,6 @@ export function contextCommitRetry(
 /** Decode the current format only. Committed transitions are immutable source records. */
 export function decodeContextTransitionEntry(value: unknown): SessionContextTransitionEntry {
   const entry = contextEntrySchema.parse(value);
-  if (entry.workingState && entry.transition.admission.status !== 'admitted')
-    throw new Error('Working state cannot be published by a pending source selection.');
   if (
     entry.transition.windowId !== entry.window.windowId ||
     entry.transition.previousWindowId !== entry.window.parentWindowId
@@ -152,22 +148,19 @@ export function decodeContextTransitionEntry(value: unknown): SessionContextTran
     throw new Error('Context transition record identities disagree.');
   }
   const fingerprint = hashJson({
-    ...(entry.transition.preservedSelection ? { preserveSelection: true } : {}),
-    ...(entry.workingState ? { workingState: { id: entry.id, ...entry.workingState } } : {}),
-    ...(entry.transition.requestedWorkingStateRevisionId === undefined
+    ...(entry.sessionState ? { sessionState: { id: entry.id, ...entry.sessionState } } : {}),
+    ...(entry.transition.requestedSessionStateRevisionId === undefined
       ? {}
       : {
-          expectedWorkingStateRevisionId: entry.transition.requestedWorkingStateRevisionId
+          expectedSessionStateRevisionId: entry.transition.requestedSessionStateRevisionId
         }),
     expectedWindowId: entry.transition.previousWindowId,
     idempotencyKey: entry.transition.idempotencyKey,
     selection: {
       retained: entry.window.selection.retained,
-      strategy: entry.window.selection.strategy,
+      ...(entry.window.selection.excerpts ? { excerpts: entry.window.selection.excerpts } : {}),
       ...(entry.window.selection.protected ? { protected: entry.window.selection.protected } : {}),
-      ...(entry.window.selection.continuity
-        ? { continuity: entry.window.selection.continuity }
-        : {})
+      continuity: entry.window.selection.continuity
     },
     reason: entry.window.reason,
     ...(entry.transition.requestedSourceRevision === undefined

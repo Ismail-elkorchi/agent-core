@@ -58,3 +58,9 @@ export const historyReadRequestSchema = z.strictObject({
     .optional(),
   neighbors: z.number().int().min(0).max(32).optional()
 });
+
+export const sourceExcerptSchema = z.strictObject({
+  source: sourceSchema,
+  offset: z.number().int().min(0).max(8 * 1024 * 1024),
+  bytes: z.number().int().min(1).max(8 * 1024 * 1024)
+}).readonly();

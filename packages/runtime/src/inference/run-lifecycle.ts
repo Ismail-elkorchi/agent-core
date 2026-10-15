@@ -1,3 +1,4 @@
+import type { HistorySourceCut } from '../history/contracts.js';
 import type { EffectLifecycle } from '@agent-core/effects';
 import {
   UNKNOWN_EFFECT_RECOVERY,
@@ -70,6 +71,7 @@ export type RunInferenceResult =
     }
   | { readonly kind: 'outcome_unknown'; readonly effectId: string };
 export interface RunInferenceInput {
+  readonly capturedHistoryCut?: HistorySourceCut | undefined;
   readonly service: InferenceService;
   readonly steering?: NativeSteeringCoordinator;
   readonly options: {
@@ -464,7 +466,8 @@ export async function invokeRunInference(input: RunInferenceInput): Promise<RunI
   const governed = createRunInferenceLifecycle({ ...input, operation: 'generation' });
   return input.service.invokeWithLifecycle(
     {
-      workingStateRevisionId: input.requestFingerprint.workingStateRevisionId,
+      sessionStateRevisionId: input.requestFingerprint.sessionStateRevisionId,
+      capturedHistoryCut: input.capturedHistoryCut,
       request: input.request,
       compiled: input.compiled,
       profile: input.turnRequest.snapshot.profile,

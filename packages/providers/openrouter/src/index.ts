@@ -179,6 +179,7 @@ export class OpenRouterProvider implements ModelProvider {
         ...profile.capabilities,
         protocol: conservativeProtocolCapabilities(`${this.baseUrl}/chat/completions`, {
           reasoningAccounting: 'included_output',
+          contextReset: 'fresh_request',
           revision: 'openrouter-chat-2026-09-07-v1',
           roles: ['system', 'developer', 'user', 'assistant'],
           inputKinds: ['text', 'image', 'tool_call', 'tool_result', 'protocol'],

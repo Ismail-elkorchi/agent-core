@@ -37,7 +37,7 @@ export type InferenceEvent =
       readonly runId: string | null;
       readonly type: 'inference.started';
       readonly format: 'agent-core.inference/1';
-      readonly operation: 'generation' | 'context_transform' | 'native_generation';
+      readonly operation: 'generation' | 'native_generation';
       readonly fingerprint: string;
       readonly sourceFingerprint: string;
       readonly requestRef: ArtifactRef;
@@ -119,7 +119,6 @@ function decodeInferenceEvent(value: unknown): InferenceEvent {
     exact(limits, ['maxInvocations', 'maxPromptTokens', 'maxCompletionTokens', 'maxKnownCost']);
     if (
       event.operation !== 'generation' &&
-      event.operation !== 'context_transform' &&
       event.operation !== 'native_generation'
     )
       throw new Error('Invalid inference operation.');

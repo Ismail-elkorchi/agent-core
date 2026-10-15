@@ -11,8 +11,6 @@ import { parseJsonValue } from '@agent-core/json';
 import {
   type CompiledModelRequest,
   type ModelCompilationOptions,
-  type ModelContextTransformRequest,
-  type ModelContextTransformResult,
   type ModelDiscoveryOptions,
   type ModelProvider,
   ModelProviderError,
@@ -30,7 +28,6 @@ import {
   modelTransportSignal,
   parseModelProfile,
   parseModelRequest,
-  parseModelContextTransformResult,
   requiredProtocolRevision
 } from '@agent-core/model';
 import {
@@ -129,7 +126,6 @@ export class OpenAICodexProvider implements ModelProvider {
   readonly id = OPENAI_CODEX_PROVIDER_ID;
   readonly implementationId = 'agent-core.provider.openai-codex@1';
   private readonly compiledRequests = new WeakSet<CompiledModelRequest>();
-  private readonly compiledTransforms = new WeakMap<CompiledModelRequest, string>();
   private readonly credentialStore: CredentialStore;
   private readonly credentialKey: string;
   private catalog: readonly CodexCatalogModel[] | undefined;
@@ -254,10 +250,7 @@ export class OpenAICodexProvider implements ModelProvider {
             outputKinds: ['text', 'tool_call', 'protocol', 'refusal'],
             state: 'exact',
             continuation: 'replay',
-            contextTransforms:
-              this.baseUrl === resolveCodexUrl(OPENAI_CODEX_BASE_URL)
-                ? ['codex.compaction']
-                : []
+            contextReset: 'fresh_request'
           })
       }
     });
@@ -305,93 +298,6 @@ export class OpenAICodexProvider implements ModelProvider {
       });
   }
 
-  async compileContextTransform(
-    transform: ModelContextTransformRequest,
-    options?: ModelCompilationOptions
-  ): Promise<CompiledModelRequest> {
-    if (!transform.transformId) throw new Error('A context transform identity is required.');
-    const source = {
-      ...transform.request,
-      ...(transform.signal ? { signal: transform.signal } : {})
-    };
-    delete source.responseFormat;
-    const request = await this.validateRequest(source);
-    const profile = await this.describeModel(request.model);
-    if (!profile.capabilities.protocol?.contextTransforms.includes('codex.compaction'))
-      throw new ModelProviderError({
-        provider: this.id,
-        code: 'invalid_request',
-        message: 'Native compaction is not declared for this Codex endpoint/model.'
-      });
-    const body = toCodexResponsesRequest(request);
-    body.input = [...(body.input as unknown[]), { type: 'compaction_trigger' }];
-    const compiled = await compileModelRequest({
-      ...options,
-      request,
-      profile,
-      body,
-      endpoint: this.baseUrl,
-      payloadPaths: responsesPayloadPaths(body)
-    });
-    this.compiledTransforms.set(compiled, transform.transformId);
-    return compiled;
-  }
-
-  async transformContext(
-    transform: ModelContextTransformRequest
-  ): Promise<ModelContextTransformResult> {
-    return this.transformContextCompiled(
-      transform.transformId,
-      await this.compileContextTransform(transform)
-    );
-  }
-
-  async transformContextCompiled(
-    transformId: string,
-    compiled: CompiledModelRequest,
-    options?: ModelTransportOptions
-  ): Promise<ModelContextTransformResult> {
-    if (this.compiledTransforms.get(compiled) !== transformId)
-      throw new ModelProviderError({
-        provider: this.id,
-        code: 'invalid_request',
-        message: 'Unrecognized Codex context transform.'
-      });
-    const request = compiled.logicalRequest;
-    let payload: OpenAICodexResponsesPayload | undefined;
-    let response: ModelResponse | undefined;
-    const affinity = createHash('sha256')
-      .update(options?.affinityKey ?? transformId)
-      .digest('hex');
-    for await (const event of streamCodexHttp(
-      {
-        ...this.httpTransportConfig(affinity),
-        onResponsePayload: (value) => {
-          payload = value;
-        }
-      },
-      compiled,
-      modelTransportSignal(request, options)
-    )) {
-      if (event.type === 'done') response = event.response;
-    }
-    const compactions = response?.output?.flatMap((item) =>
-      item.type === 'protocol' && item.state.kind === 'responses.compaction' ? [item.state] : []
-    ) ?? [];
-    const state = compactions[0];
-    if (!payload?.id || payload.status !== 'completed' || compactions.length !== 1 || !state || !response)
-      throw new ModelProviderError({
-        provider: this.id,
-        code: 'malformed_response',
-        message: 'Codex compaction ended without one completed native compaction item.'
-      });
-    return parseModelContextTransformResult({
-      transformId,
-      state,
-      input: [{ role: 'protocol', content: '', state }],
-      ...(response.usage ? { usage: response.usage } : {})
-    });
-  }
   completeCompiled(
     compiled: CompiledModelRequest,
     options?: ModelTransportOptions

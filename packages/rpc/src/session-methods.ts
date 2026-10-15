@@ -1,6 +1,5 @@
 import {
   historyReadRequestSchema,
-  contextSelectionSchema,
   contextTransitionRequestSchema,
   type ContextTransitionRequest
 } from '@agent-core/runtime';
@@ -65,9 +64,6 @@ export function sessionRpcMethods(operations: SessionRpcOperations) {
 export interface ContextRpcOperations {
   inspectContext(): Promise<unknown>;
   transitionContext(request: ContextTransitionRequest): Promise<unknown>;
-  freshContext(
-    retained?: readonly import('@agent-core/runtime').HistorySourceRef[]
-  ): Promise<unknown>;
 }
 
 export function contextRpcMethods(operations: ContextRpcOperations) {
@@ -77,10 +73,6 @@ export function contextRpcMethods(operations: ContextRpcOperations) {
     'context.transition': rpcMethod(
       contextTransitionRequestSchema.unwrap().omit({ toolInvocation: true, expectedCut: true }).extend({ expectedSourceRevision: z.int().nonnegative() }),
       (request) => operations.transitionContext(request)
-    ),
-    'context.fresh': rpcMethod(
-      z.strictObject({ retained: contextSelectionSchema.unwrap().shape.retained.optional() }),
-      ({ retained }) => operations.freshContext(retained)
     )
   };
 }

@@ -1,10 +1,10 @@
 import { hashJson, type ArtifactRepository } from '@agent-core/persistence';
 import {
   assertModelRequestSupported,
+  parseModelSelection,
   type ModelProfile,
   type ModelSelection
 } from '@agent-core/model';
-import { parseModelChangeRequest, type ModelChangeOptions } from '../orchestration/model-change.js';
 import { assertHistoryModelCompatibility } from '../orchestration/session-replay.js';
 import { randomUUID } from 'node:crypto';
 import { AgentRuntime, type AgentRunHandle, type AgentRunInput } from '../agent-runtime.js';
@@ -300,16 +300,15 @@ export class AgentSession {
 
   /** Changes future inference only after durable pending work has reached a lawful boundary. */
   changeModel(
-    input: ModelChangeOptions & {
+    input: {
       readonly selection: ModelSelection;
       readonly profile: ModelProfile;
       readonly artifacts: ArtifactRepository;
     }
   ): Promise<AgentSessionState> {
-    const { selection, options } = parseModelChangeRequest({
-      ...input.selection,
-      ...(input.continuation === undefined ? {} : { continuation: input.continuation })
-    });
+    if (Object.keys(input).some(key => !['selection', 'profile', 'artifacts'].includes(key)))
+      throw new TypeError('Unknown model change option.');
+    const selection = parseModelSelection(input.selection);
     return this.serial(async () => {
       this.assertOpen();
       await this.restorePending();
@@ -327,23 +326,15 @@ export class AgentSession {
       });
       const context = this.options.context;
       if (!context) throw new Error('Model changes require the session context service.');
-      if (options.continuation === 'fresh') {
-        const entry = await this.selectFreshContinuation(selection, input.profile);
-        this.emit({
-          type: 'context.transitioned',
-          window: entry.window,
-          transition: entry.transition
-        });
-      } else {
-        await assertHistoryModelCompatibility({
-          history: context.history,
-          artifacts: input.artifacts,
-          profile: input.profile
-        });
-        await this.options.repository.appendModelSettings(this.options.descriptor, selection);
-      }
-      // Fresh targets are committed with their source selection in one record. An interrupted
-      // observer/default write cannot leave a reset governed by the old target model.
+      // A model choice is not an admitted inference. Validate portable evidence now;
+      // only the actual successor request can commit its fresh source transition.
+      await assertHistoryModelCompatibility({
+        history: context.history,
+        artifacts: input.artifacts,
+        profile: input.profile,
+        representation: 'portable'
+      });
+      await this.options.repository.appendModelSettings(this.options.descriptor, selection);
       this.configuration = ownConfiguration({
         provider: selection.provider,
         model: selection.model,
@@ -355,57 +346,6 @@ export class AgentSession {
       });
       this.emit({ type: 'configuration.changed', configuration: this.configuration });
       return this.state();
-    });
-  }
-
-  /** Explicitly restart model reasoning in this session without resetting effects or budgets. */
-  freshContinuation(input: {
-    readonly profile: ModelProfile;
-    readonly retained?: readonly import('../history/contracts.js').HistorySourceRef[];
-  }): Promise<AgentSessionState> {
-    return this.serial(async () => {
-      this.assertOpen();
-      await this.restorePending();
-      if (this.active || this.suspended || this.pendingSnapshot.length > 0)
-        throw new Error('Settle or reconcile pending work before a fresh continuation.');
-      const entry = await this.selectFreshContinuation(
-        this.configuration,
-        input.profile,
-        input.retained
-      );
-      this.emit({
-        type: 'context.transitioned',
-        window: entry.window,
-        transition: entry.transition
-      });
-      return this.state();
-    });
-  }
-
-  private async selectFreshContinuation(
-    model: ModelSelection,
-    profile: ModelProfile,
-    retained?: readonly import('../history/contracts.js').HistorySourceRef[]
-  ) {
-    const context = this.options.context;
-    if (!context) throw new Error('Fresh continuation requires a session context service.');
-    if (model.provider !== profile.provider || model.model !== profile.id)
-      throw new Error('Fresh continuation model does not match its profile.');
-    const cut = await context.history.capture();
-    const window = await context.history.selectedContext(cut);
-    const selection = await context.freshSelection({
-      selection: await context.selectSources(cut, { retain: retained }),
-      model,
-      profile,
-      cut,
-      resetId: randomUUID()
-    });
-    return context.transition({
-      expectedWindowId: window?.windowId ?? null,
-      expectedSourceRevision: cut.sourceRevision,
-      idempotencyKey: randomUUID(),
-      reason: 'Explicit fresh inference continuation.',
-      selection
     });
   }
 

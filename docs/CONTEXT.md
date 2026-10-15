@@ -1,7 +1,7 @@
 # Composing persistent context
 
 Applications choose the instructions, provider, tools, repositories, and resource
-policy. Core supplies the history, working-state, transition, and inference contracts. None
+policy. Core supplies the history, session-state, transition, and inference contracts. None
 of these services requires a workspace, a document, a planner, or a verification
 pass. The minimal compositions in `tests/context-neutrality.test.js` exercise
 conversation, structured classification, and read-only monitoring.
@@ -68,257 +68,110 @@ Applications can associate a contribution with a continuation, correction, side
 question, or task replacement. Those relationships remain distinct from whether
 delivery is immediate, steering, or queued.
 
-## Working state
+## Session state
 
-A session branch owns one current freeform working-state revision. Its protected
-text artifact is referenced from the existing session journal alongside the
-previous revision and the exact recorded inference input that produced it.
-Branching inherits the revision at the selected branch point. Later revisions
-on either branch are independent.
+A branch owns one current `SessionStateSnapshot`: revision metadata and one structured
+`content` body. Revision metadata contains attribution, content digest, and byte size;
+it never duplicates that body. The optional `interaction`, `understanding`, `working`, and `trajectory`
+sections contain stable-ID items with `id`, `text`, optional exact history `sources`,
+and optional natural-language `status` and `scope`. No section, domain ontology,
+workflow, or update schedule is mandatory. Freeform working notes belong in item
+text. `decodeSessionStateContent` establishes an owned immutable value;
+`sessionStateContentSchema` exposes the same bounded contract.
 
-Compose `context.toolDefinitions()` with history tools. The model supplies
-complete replacement text through `context_transition.workingState`; the runtime
-binds scope, attribution, and the revision presented in its inference. The tool
-receipt means scheduled. After completing the exchange, the runtime admits the
-actual next request and atomically publishes state and selection. A rejected or
-stale proposal preserves the previous revision and produces explicit feedback.
-Publication is conditional and idempotent; a lost receipt does not duplicate it.
+The model sends a complete replacement through `context_transition.sessionState`.
+Keep IDs when revising the same item; remove obsolete claims and omit unnecessary
+sections. Empty content clears the snapshot. Identical content preserves revision
+identity. State is fallible interpretation, never authority, verification, or a
+replacement for original user requirements and observations.
 
-Every admitted request binds to the current revision at its captured boundary.
-Present the generated interpretation once; do not accumulate historical revisions
-in the prompt. State cannot grant authority, establish verification, or replace
-original user contributions and observations. It has no mandatory sections or
-maintenance schedule. Unchanged understanding requires no update.
+Runtime provenance is separate from model content: the revision records its
+previous revision, exact originating inference request, captured history cut, and
+an optional validated declared cut. Citations must resolve at the captured cut.
+The existing journal entry owns the exact structured snapshot, avoiding separate
+staging artifacts. Protected inference artifacts retain request attribution. The
+`context_transition` entry publishes state and selection atomically only after
+admission of the actual next request. A scheduled tool receipt is not publication.
+Rejected, stale, or oversized proposals leave the previous state intact; retries
+are idempotent. Forks inherit state at the selected historical point.
 
-Working state is a request suffix. Adding conversation before that suffix changes
-the preceding wire input even when the state text is unchanged. Providers that
-require an exact append-only prefix for incremental continuation use full replay
-in that case. Incremental transport reuse and provider-reported prompt cache usage
-are separate facts; shared prefixes alone do not establish cache hits.
+Present only the current snapshot once in each request. `ContextService.sessionState()`
+reads it without replaying the archive. `inspect()` supplies bounded content or a
+partial preview plus an exact history reference. Historical revisions stay
+retrievable through original history.
 
-Ordinary provider reasoning retains its recorded conversation position; its presence
-does not move application references. Provider-transformed windows are distinct:
-their admitted input precedes current references, including after reopening. A
-provider's required reasoning prefix is a protocol constraint, not an incremental
-transport optimization. Full replay cannot repair an edited or reordered required
-prefix; such an input is rejected rather than discarding signed reasoning.
-Binding is model-specific: immutable signed blocks do not universally bind earlier
-messages. Prefix-bound records also bind the declared catalog. Changed working
-state, references or authority cannot be replayed under a different bound prefix;
-unsupported combinations fail explicitly. Fresh continuation is an explicit
-native reset using portable original contributions, with working state carried
-separately rather than selected as another conversational source.
+## Context renewal
 
-`ContextService.inspect()` exposes a bounded preview and an authorized history
-reference. Historical reads and searches use `HistoryReader` and disclose their
-byte bounds and coverage. There is no independent note repository or browser.
+There is one context transition: select original sources and start fresh provider
+continuation in the same session. The runtime supplies the reset identity and
+model binding. Session identity, authority, effects, resources, accounting, and
+unresolved delivery obligations survive. Native reasoning stays in original
+storage; selected portable originals form the new request. Model changes use the
+same fresh-continuation rule without a separate user choice.
 
-## Context transitions
+`context_transition` accepts `add` and `release` edits, or `retain` as a complete
+replacement of optional history. `recentFrom` selects the active suffix from an
+exact source. Omitting source edits keeps the selection; empty `retain` releases
+optional history. Complete exchanges, active accepted input, explicit protections,
+and the originals cited by current interaction state remain protected. Citations
+in other state sections are retrieval references, not automatic retention.
 
-Compose `createHistoryTools` and `context.toolDefinitions()`
-with the ordinary tool registry and authorization policy. `ContextService` records
-selected original sources and the current working-state revision at an immutable history cut.
-Unselected material remains retrievable; no exhaustive omission partition is needed.
+State replacement may accompany source changes. Both are bound to the originating
+inference revision and the authoritative source cut, with no implicit stale-state
+rebase. Finish the transition tool's exchange before compiling the successor.
+Outstanding effect and result-delivery obligations cannot be dropped to make a
+request fit. Hosts use `transitionContext` at the inspected window and source
+revision. The TUI has one advanced Apply selection action while a request is running; idle history remains inspectable without publishing an unadmitted window.
 
-Configure `policy.maxSourceBytes` and authorized original-history retrieval on the
-service. Byte bounds govern source access. `RequestAdmission` assembles the actual
-task, attachments, instructions, dynamic context, working state, tool guides,
-catalog and generation settings, then compiles the provider request.
-`assertRequestAccountingFits` alone decides fit, including separate reasoning and
-output reservations. Counts, estimates, and unknown components stay distinguishable.
+`context_inspect` exposes bounded source metadata and exact references. Follow its
+cursor to inspect more of the captured selection. Original-history inspection,
+search, and reads retain exact branch/cut boundaries, attribution, byte bounds,
+and explicit partial coverage. Stored byte counts do not promise compiled token
+savings. Do not infer complete coverage from a single page or an unread source.
 
-`context_transition` edits the selected original sources. `add` and `release`
-change the current selection; `retain` replaces optional history. Omitting these
-fields keeps the current sources. An empty `retain` explicitly releases optional
-history. Releasing or retaining part of a response selects the whole exchange,
-including its parallel calls and observations. Bound native responses retain their
-prefix dependencies. Active accepted input and explicit protection remain mandatory.
+## Admission and recovery
 
-The operation may supply `workingState` alone or with source edits as the complete
-replacement text. The runtime binds it to the revision presented in the
-originating inference. Staged content and the new window publish together only
-after ordinary request admission, with no implicit rebase of stale state. Without
-a state change, source selection requires no auxiliary generation. Source changes
-take effect at a settled tool boundary, including the transition's own exchange.
+Applications set source byte bounds and explicit output reservations. Admission
+compiles the actual task, attachments, instructions, session state, selected
+originals, tools, media, and protocol requirements. Exact counts, estimates, and
+unknown components remain distinguishable. Only the compiled request's accounting
+determines fit; failed preparation or admission never publishes a candidate.
 
-`continuation: 'fresh'` explicitly starts new model reasoning over the selected
-originals in the same session. It preserves working state, authority, accounting,
-effects and resource lifetimes. Native reasoning remains in original storage but
-is not replayed. Idle applications can call `AgentSession.freshContinuation({profile})`;
-model switching shares that path. Outstanding effects and deliveries must be
-resolved first. The TUI context controls and RPC `context.fresh` expose this choice.
-It is never an automatic response to incompatible native state.
+With `contextRenewal: { automatic: true }` and context tools available, bounded
+recovery uses the same inference service, owner budgets, authorization, and
+transition path. Continuity room is derived from compilation of the bounded
+control request. Recovery can inspect metadata, retrieve history, and propose a
+fresh source selection. It cannot execute domain effects or answer the user.
+Its control requests and original results remain recorded. Repeated unchanged
+attempts and exhausted allowances produce durable, explicit suspension rather
+than resetting limits. Tool-result presentation bounds never alter authoritative
+observations or call/result pairing.
 
-There is no automatic portable summarization or oldest-source eviction. The model
-chooses relevant sources and updates understanding when useful. History is the
-recoverable original; working state is generated interpretation, not evidence.
-`context_inspect` exposes the live selection, including the tail after the last
-committed window. Its source manifest uses bounded `limit`/`maxBytes` pages and a
-cursor pinned to the captured branch and ledger heads. Each item carries an exact
-source reference, a short description, stored byte size, and its exchange identity.
-Routing metadata is read before original bodies, so source overflow does not prevent
-inspection. Pages have no global source count: discovering a page does not enumerate
-the complete selection. Group facts disclose known prefix binding, protection and
-unfinished calls; `requires_validation` means release must still validate the complete
-dependency closure at the transition boundary. An oversized exchange can leave prefix
-binding `unknown`; inspection never declares that release safe. Stored bytes do not
-promise compiled token savings. Inspection labels the last compiled admission by input
-identity, separately from the live cut.
-
-With automatic recovery and an available context-transition tool, admission reserves
-continuity room from compilation of the current bounded context-management request,
-including its actual tool schemas, metadata presentation, output reservation, and
-independently charged reasoning. This can trigger recovery before ordinary overflow.
-The same check applies before committing a selected successor. It is not a guarantee
-about unknown future contributions: each actual request is compiled and admitted again.
-Mandatory native result delivery admits its exact compiled capacity and may consume
-discretionary continuity room. Pending synchronous results must be delivered before
-a context transition is legal; the next discretionary boundary enforces the reserve
-again. This does not grant permission to exceed actual request capacity.
-
-Near capacity, factual feedback can still be added when its exact candidate preserves
-admission. Unchanged facts are reused; this is not a periodic summary instruction.
-
-Recovery is a restricted turn of the same runtime and inference owner, using ordinary
-tool canonicalization, authorization, durable execution, and usage settlement. Its
-catalog contains context inspection, bounded history reads, and explicit context
-transitions. It cannot execute domain tools, answer the user, replace working state,
-or implicitly reset native reasoning. Four durable requests per run, at most 1,024
-reserved output tokens per request, two tool calls per response, and 8 KiB read results
-bound the control work. Unchanged actions stop across restart; a new source window or
-compiled-input boundary is distinguished from an unchanged retry. Last control results
-are bounded, labeled presentations of recorded originals, not new authority.
-
-Automatic-context tool results use an explicit 8 KiB text presentation bound with a
-partial-coverage marker and a persisted full-presentation reference. Original observation
-values and coverage are unchanged, and complete call/result pairing remains intact.
-Independent recovery exchanges are preserved in original history but excluded from
-ordinary replay before their bodies are read. Source overflow can therefore reach
-metadata inspection without hydrating the overflowing original.
-
-An impossible protected input, denied operation, unsupported native transition, exhausted
-recovery allowance, or inadmissible successor leaves a durable context-admission
-suspension. Abort, ownership loss, and budget exhaustion retain their own semantics.
-Native compaction still requires the existing capability and permission; no automatic
-fresh-prefix reset is introduced.
-
-Hosts may enable `contextRenewal: { automatic: true }` for bounded recovery and
-native fallback; both applications do. Only a declared, governed native operation can resolve a rejected
-request or a required bound-prefix configuration change. Fitting ordinary requests
-do not trigger compaction. `strategy: 'provider'` explicitly requests native
-compaction at a legal boundary. The transform itself and its successor must pass
-admission. A source already too large for the transform still requires selection,
-a different reservation, or another model. Failure preserves the old window and
-records the reason; settled usage and unresolved exposure stay with their owner.
-
-Session identity and resources survive every context transition. `/context`
-inspects capacity and selected sources. Apply selection and `context.transition`
-submit an explicit selection bound to the inspected window and source revision.
-Active runs schedule it at a legal boundary; idle sessions commit after admission.
-Retrying an unchanged, rejected request cannot resolve an admission conflict.
+No automatic summary, provider compaction, alternate transform engine, or
+oldest-source eviction runs between turns. A mandatory result that cannot fit
+remains an outstanding delivery obligation and a clear admission conflict.
+Cancellation may be necessary when no lawful continuation fits.
 
 ## Governed inference
 
-Pass one `InferenceService` to the primary runtime and auxiliary consumers. Supply
-an explicit invocation repository and artifact repository for durable auxiliary
-work. A common `ownerId` binds primary work, native transforms, and verification to
-one resource policy. `invocationId` identifies a particular admitted request;
-`purpose` explains its application role without imposing a workflow.
+Share one `InferenceService` across primary work and authorized auxiliary consumers,
+with explicit invocation and artifact repositories. `ownerId` binds accounting;
+`invocationId` identifies an admitted request. Persist admission and reservations
+before dispatch and settle usage against that identity. Reusing a settled identity
+replays its result. An invocation that may have started but lacks a known outcome
+requires reconciliation, not automatic redispatch. Cancellation does not erase
+late settlement or uncertain exposure.
 
-The service persists admission and reservations before dispatch and records the
-settled result and usage. Reusing a settled identity replays its result. A request
-that crossed its start boundary without a known result remains uncertain rather
-than being dispatched again automatically. Cancellation releases the caller while
-a late response can still settle its original permit.
+`InferenceService.admitRequest` checks the exact immutable compiled input before
+transport. Every native successor is independently admitted. Result delivery has
+separate durable admission, transmission, and application receipts; an uncertain
+or acknowledged delivery cannot be resent without evidence that it failed.
 
-Application egress policy is supplied as `InferenceService.admitRequest`. It checks
-the exact compiled input before dispatch authority, including context transforms
-and native successors. A local admission rejection cannot become an uncertain
-provider outcome. Provider wrappers must not hide admission inside transport.
+## Compatibility and evidence
 
-Adapters compile immutable input before admission. Accounting covers the compiled
-body, actual tool arguments and results, schemas, media, and protocol state. Exact
-counts, estimates, and unknown components remain distinct. Configure an explicit
-output allowance for every invocation (`AgentRuntime.maxOutputTokens`, or the
-inference request's cap / explicit `outputReservation`). Core has no generation
-allowance default and does not infer unknown provider output capacity. Endpoints
-that reject a cap still reserve the host allowance and settle actual usage.
-
-Selected sources are membership: admission and replay restore branch input order
-and each run's event sequence. Source byte/entry capacity conflicts suspend at the
-same admission boundary as compiled token conflicts, with source references and
-bounds instead of fabricated compiled accounting. If a candidate cannot be materialized and admitted within its bounds, the window
-remains unchanged. Permitted bounded recovery may propose another explicit selection;
-otherwise the run waits for a source, capacity, or model change.
-
-Inference repositories advance from verified ledger tails. `load(ownerId)` returns
-committed liabilities and settled totals; optional `invocationId` and `runId` queries
-retrieve one invocation or per-run totals. `settledRunUsage()` replaces cumulative
-charge arrays. Provider settlements use exact event references and idempotency keys;
-ordinary admission and accounting do not replay historical settlement bodies.
-
-## Independent provider and tool work
-
-The run driver retains provider requests and original tool groups in one state.
-Each call keeps its source response, advertised catalog and effect permit. The
-same per-call executor handles ordinary requests and native continuations; results
-can be recorded out of order while another response streams. Conflicting effects
-and explicit dependencies still gate execution and approval.
-
-For native Responses execution, configure the supported WebSocket transport and
-pass an `InferenceService` with explicit invocation and artifact repositories.
-Every generation is admitted before its causative frame is sent. Steering plus a
-required tool result can extend one successor reservation; it does not create two
-billable invocation identities. Response boundaries settle individual usage;
-stream closure is not an additional generation.
-
-Result delivery has its own durable admission, transmission and application
-receipts. A late result keeps its original catalog binding even after a catalog
-update. An acknowledged or uncertain delivery cannot be sent again without
-provider evidence that it failed. Closing a connection does not erase known tool
-results or grant a fresh effect permit.
-
-## Policy measurements
-
-`scripts/evaluate-context-policies.mjs` provides dry, capability, simulation, and
-explicit live modes. Run `node scripts/evaluate-context-policies.mjs --help` for
-the supported options. Reports pin the workload, model, endpoint, resource limits,
-sample count, and predeclared quality gates.
-
-Simulation proves the composition can execute and account for each policy. It
-does not estimate real model recall quality. Live trials compare retained input,
-original-history retrieval, and native transforms where the
-exact adapter and endpoint support them. Unavailable capabilities and unknown
-pricing remain visible. No model-policy default follows from a single successful
-trial or a smaller prompt.
-
-### Historical measurements
-
-The [archived reports](validation/README.md) describe the earlier notebook
-architecture and authored workloads. They do not validate working-state behavior
-or establish a model-quality improvement for this implementation. Current
-structural tests cover publication, concurrent updates, historical forks,
-request attribution, bounded recovery, admission, and provider continuity.
-
-The predeclared quality gates require at least ten trials per comparison, at
-most a five-percentage-point success regression within the reported uncertainty,
-and a known-cost ratio no greater than 1.25. Simulation cannot pass those gates.
-Reproduce the mechanical comparison after building Core with:
-
-```sh
-node scripts/evaluate-context-policies.mjs --mode simulation --output /tmp/context-policy-report.json
-```
-
-The output path must be new. Use the runner's explicit live options with an
-identified deployment and resource limits to collect empirical evidence.
-
-## Breaking state formats
-
-This pre-alpha cutover rejects incompatible persisted state explicitly. Starting
-a new session is separate from deleting old records. There are no migration
-readers, compaction callback aliases, or automatic directory cleanup.
-
-When a mandatory native result itself exceeds actual capacity, the recorded result and
-its delivery obligation remain intact in a clear context conflict. Source selection
-cannot bypass that obligation; cancellation may be necessary when no lawful
-continuation fits. This is not a promise of universal automatic resumability.
+This pre-alpha replacement rejects old working-state payloads and incompatible
+session headers in place. It has no aliases, old-format readers, migrations, or
+automatic deletion. Structural tests establish publication, persistence, forks,
+source attribution, admission, and protocol boundaries. They do not establish a
+model-quality improvement; empirical claims require identified models, workloads,
+resource limits, and comparable live trials.

@@ -131,7 +131,7 @@ test('AgentRuntime delivers native steering during an active provider response',
         continuation: 'replay',
         asyncTools: false,
         steering: 'native',
-        contextTransforms: [],
+        contextReset: 'fresh_request',
         toolChoice: ['auto'],
         counting: 'estimate'
       }

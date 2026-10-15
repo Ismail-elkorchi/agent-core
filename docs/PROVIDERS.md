@@ -12,7 +12,7 @@ is never a substitute for required signed or opaque state.
 Exact payload replay does not by itself bind earlier input. Verified prefix-bound
 profiles declare `reasoningPrefix: "messages_and_tools"`; their preserved states
 bind the original instruction/message prefix and tool declarations. Updated
-authority, working state or catalogs must satisfy those rules or use a supported
+authority, session state or catalogs must satisfy those rules or use a supported
 context transition. Unsupported combinations fail before dispatch. OpenRouter
 uses the serving model's requirements; unverified Anthropic routes remain
 conservative. See the [model contract](../packages/model/README.md).
@@ -41,11 +41,13 @@ cap parameter.
 
 | Protocol family | Preserved state | Native execution boundary |
 | --- | --- | --- |
-| OpenAI Responses | Required reasoning items and exact continuation identities | Native steering requires the supported model profile and WebSocket transport; async tools and compaction require their explicit capability declarations. |
-| Codex Responses | Subscription-compatible reasoning and conservative continuation | Explicit subscription compaction trigger; Platform native steering is not inferred from the shared Responses format. |
+| OpenAI Responses | Required reasoning items and exact continuation identities | Native steering requires the supported model profile and WebSocket transport; async tools require their explicit capability declarations. |
+| Codex Responses | Subscription-compatible reasoning and conservative continuation | Conservative exact-prefix continuation; Platform native steering is not inferred from the shared Responses format. |
 | OpenRouter Chat Completions | Original reasoning content/details and tool-call associations | Ordinary response/tool-result boundaries; routed capabilities come from the declared profile. |
 | Ollama Chat | Declared thinking output and native tool-call associations | Ordinary request/response execution with explicit unsupported-control errors. |
-| Claude Messages | Thinking and compaction signatures and redacted-thinking blocks in original order | Declared on-demand native compaction through governed Messages; no advertised steering, async tools, or inline context editing. |
+| Claude Messages | Thinking signatures and redacted-thinking blocks in original order | Ordinary response/tool-result boundaries; no advertised steering, async tools, or inline context editing. |
+
+Profiles explicitly declare `protocol.contextReset` as `fresh_request` or `unsupported`. Fresh-window publication requires the supported reset, compiled request admission, and a safe boundary with no outstanding protocol obligations. The runtime replaces the provider session after publication. Adapters expose no native or server compaction operations; ordinary signed reasoning, tool-call associations, and continuation remain supported within a window.
 
 These are adapter conformance claims. They do not establish model quality or live
 account availability. Qwen/Kimi/GLM-compatible Chat fixtures exercise routed wire
@@ -62,7 +64,7 @@ References: [model catalog](https://developers.openai.com/api/docs/models), [Sol
 
 ## OpenAI Codex
 
-`@agent-core/provider-openai-codex` is a distinct ChatGPT-subscription transport. Its authenticated account catalog supplies model identities, reasoning settings and capabilities, replacing built-in profiles after discovery; complete explicit profiles take precedence. A selected identity missing from a cached catalog triggers fresh discovery before an account-availability error. Discovery failure is distinct from model unavailability. Platform pricing and `standard|pro` mode support are not inferred. Namespaced service tier is `default|priority`, with obsolete aliases rejected. HTTP full replay remains separate from conservative exact-prefix WebSocket continuation. Working-state suffix changes can require full replay while still receiving provider-reported cache hits. The [adapter contract](../packages/providers/openai-codex/README.md) documents defaults and endpoint limits.
+`@agent-core/provider-openai-codex` is a distinct ChatGPT-subscription transport. Its authenticated account catalog supplies model identities, reasoning settings and capabilities, replacing built-in profiles after discovery; complete explicit profiles take precedence. A selected identity missing from a cached catalog triggers fresh discovery before an account-availability error. Discovery failure is distinct from model unavailability. Platform pricing and `standard|pro` mode support are not inferred. Namespaced service tier is `default|priority`, with obsolete aliases rejected. HTTP full replay remains separate from conservative exact-prefix WebSocket continuation. Within a window, the immutable prefix permits ordinary append-only continuation. An admitted fresh transition replaces the provider session and starts without old response identifiers or opaque continuation state; provider-reported cache hits remain independent. The [adapter contract](../packages/providers/openai-codex/README.md) documents defaults and endpoint limits.
 
 OpenAI Platform and Codex share only bounded Responses SSE/JSON primitives in `@agent-core/provider-openai-responses`; authentication, headers, storage behavior, model policy, continuation, and product-channel claims remain separate. Reference: [Codex model selection](https://developers.openai.com/codex/models).
 

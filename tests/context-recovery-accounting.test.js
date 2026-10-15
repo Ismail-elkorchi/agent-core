@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
-import { ModelProviderError, requestAccountingInputTokens } from '@agent-core/model';
+import { ModelProviderError, requestAccountingInputTokens, conservativeProtocolCapabilities } from '@agent-core/model';
 import { defineTool } from '@agent-core/tools';
 import { hashJson, InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import {
@@ -9,9 +9,10 @@ import {
   InMemoryInferenceRepository, InferenceService, agentEventCodec, createHistoryTools
 } from '@agent-core/runtime';
 
-const marker = 'bounded context-management turn';
+const marker = 'Prepare a fresh context for the same ongoing work';
 const applicationTask = 'ACTUAL TASK: preserve this exact application request.';
 const applicationInstruction = 'APPLICATION AUTHORITY: preserve the original requirements.';
+const seedTask = 'Old optional evidence: ' + 'x'.repeat(24000);
 const response = (content = 'Done.') => ({
   provider: 'recovery-accounting-fixture', model: 'fixture', content, terminationReason: 'stop'
 });
@@ -20,12 +21,12 @@ const call = (name, value = {}) => ({
   toolCalls: [{ id: `call-${crypto.randomUUID()}`, type: 'function', name, input: { kind: 'json', value } }]
 });
 const select = () => call('context_transition', { reason: 'Release complete optional sources.', retain: [] });
-const isRecovery = request => request.messages.some(item => item.role === 'system' && item.content.includes(marker));
+const isRecovery = request => request.messages.some(item => item.role === 'user' && item.content.includes(marker));
 const controlTask = request => JSON.parse(request.messages.findLast(item => item.role === 'user').content);
 const withoutSignal = ({ signal: _signal, ...request }) => request;
 
 // Kept independent of other test modules so this file can run alone, using public contracts only.
-async function fixture({ budget, sourceBound = 12000, targetCapacity = 12000,
+async function fixture({ budget, sourceBound = 100000, targetCapacity = 25000,
   events = new InMemoryEventRepository(agentEventCodec) } = {}) {
   const sessions = new InMemorySessionRepository();
   const descriptor = await sessions.create({ binding: { schemaId: 'recovery-accounting-tests', schemaVersion: 1, subject: {} } });
@@ -38,16 +39,16 @@ async function fixture({ budget, sourceBound = 12000, targetCapacity = 12000,
   const admissions = [];
   let recovery = select;
   let application = () => response();
-  let capacity = 64000;
+  const capacity = targetCapacity;
   let reads = 0;
   const provider = {
     id: 'recovery-accounting-fixture', implementationId: 'recovery-accounting-fixture@1',
     describe: () => ({ id: 'recovery-accounting-fixture', displayName: 'Recovery accounting fixture', defaultModel: 'fixture' }),
     describeModel: async () => ({
       id: 'fixture', provider: 'recovery-accounting-fixture',
-      capabilities: { streaming: false, toolCalling: true, supportedToolInputs: [{ kind: 'json' }], jsonMode: false,
+      capabilities: { protocol: { ...conservativeProtocolCapabilities('recovery-accounting-fixture'), contextReset: 'fresh_request' }, streaming: false, toolCalling: true, supportedToolInputs: [{ kind: 'json' }], jsonMode: false,
         jsonSchema: false, logprobs: false, temperature: false, topP: false },
-      modalities: { input: ['text'], output: ['text'] }, limits: { contextTokens: capacity, outputTokens: 1024 },
+      modalities: { input: ['text'], output: ['text'] }, limits: { contextTokens: capacity, outputTokens: 4096 },
       supportedParameters: ['tools', 'maxOutputTokens']
     }),
     complete: async request => {
@@ -78,14 +79,15 @@ async function fixture({ budget, sourceBound = 12000, targetCapacity = 12000,
       tools: [domain, ...context.toolDefinitions(), ...createHistoryTools({ history })],
       toolPolicy: { allowedRisks: ['read', 'write'] },
       toolBoundary: { authorizationPolicyId: 'recovery-accounting-test', executionTargetId: 'recovery-accounting-test' },
-      maxOutputTokens: 512,
+      maxOutputTokens: 4096,
       inferenceService: new InferenceService({ provider, artifacts, repository: inferenceRepository,
         admitRequest: compiled => { admissions.push(compiled); }, ...(budget ? { budget } : {}) })
     };
   };
-  const seed = await new AgentRuntime(options(100000)).run({ runId: 'seed', task: 'Old optional evidence: ' + 'x'.repeat(24000) }).result;
+  // The same provider capacity applies throughout. Seed a fitting ordinary request;
+  // subsequent accepted input grows the conversation into the early-renewal band.
+  const seed = await new AgentRuntime({ ...options(100000), contextRenewal: { automatic: false } }).run({ runId: 'seed', task: seedTask }).result;
   assert.equal(seed.terminal?.executionStatus, 'completed', JSON.stringify(seed));
-  capacity = targetCapacity;
   requests.length = logicalRequests.length = contextCollections.length = admissions.length = 0;
   return {
     options: () => options(sourceBound), requests, logicalRequests, contextCollections, admissions,
@@ -125,8 +127,11 @@ test('a retryable recovery failure preserves the exact bounded candidate and its
   assert.deepEqual(controlTask(control[1]), controlTask(control[0]));
   assert.ok(Buffer.byteLength(control[0].messages.findLast(item => item.role === 'user').content) <= 32768);
   assert.ok(controlTask(control[0]).inventory.items.length > 0);
-  assert.ok(!JSON.stringify(control[0]).includes(applicationInstruction));
-  assert.ok(!control[0].tools.some(tool => tool.function?.name === 'domain_read'));
+  assert.ok(JSON.stringify(control[0]).includes(applicationInstruction));
+  assert.ok(control[0].messages.some(item => item.role === 'user' && item.content === seedTask),
+    'The checkpoint retains the complete original conversation rather than a metadata-only substitute.');
+  assert.ok(control[0].messages.some(item => item.role === 'user' && item.content === applicationTask));
+  assert.ok(control[0].tools.some(tool => tool.function?.name === 'domain_read'), 'Catalog remains stable; execution gate rejects domain work during checkpoint.');
 
   const log = await records(f, 'retry-control');
   const snapshots = log.filter(event => event.type === 'turn.snapshot.created' && event.snapshot.contextRecovery).map(event => event.snapshot);
@@ -215,7 +220,7 @@ test('a provider capacity rejection of recovery preserves the application confli
 });
 
 test('successful distinct recovery boundaries exceed four requests while retaining the inference owner budget', async t => {
-  for (const maxInvocations of [12, 11]) await t.test(`owner allowance ${maxInvocations}`, async () => {
+  for (const maxInvocations of [22, 21]) await t.test(`owner allowance ${maxInvocations}`, async () => {
     const f = await fixture({ budget: { maxInvocations } });
     const boundaryReads = [];
     const readMetadata = f.events.readMetadataRange.bind(f.events);
@@ -224,7 +229,9 @@ test('successful distinct recovery boundaries exceed four requests while retaini
       if (query?.types?.includes('turn.snapshot.created')) boundaryReads.push({ query, scanned: page.scanned });
       return page;
     };
-    f.application(() => f.reads() < 5 ? call('domain_read') : response('All five sources processed.'));
+    // Three bounded result presentations naturally fill each renewed window.
+    // Six successful boundaries must not reset this same owner's allowance.
+    f.application(() => f.reads() < 15 ? call('domain_read') : response('All fifteen sources processed.'));
     const runId = `many-boundaries-${maxInvocations}`;
     const result = await new AgentRuntime(f.options()).run({ runId, task: applicationTask }).result;
     const control = f.recoveryRequests();
@@ -234,20 +241,20 @@ test('successful distinct recovery boundaries exceed four requests while retaini
     assert.equal(boundaryReads.length, 6);
     assert.ok(boundaryReads.every(read => typeof read.query.metadata.recoveryBoundary === 'string' && read.scanned === 0),
       'The indexed boundary allowance never scans prior successful recoveries.');
-    assert.equal(f.reads(), 5);
+    assert.equal(f.reads(), 15);
     assert.equal(f.requests.length, maxInvocations);
     const owner = await f.inferenceRepository.load(runId);
     assert.equal(owner.committed.invocations, maxInvocations);
     assert.equal(owner.settledUsage.invocations, maxInvocations);
     const log = await records(f, runId);
     assert.equal(log.filter(event => event.type === 'tool.started' && event.toolName === 'context_transition').length, 6);
-    if (maxInvocations === 12) {
+    if (maxInvocations === 22) {
       assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
-      assert.equal(result.terminal.modelOutput.message, 'All five sources processed.');
+      assert.equal(result.terminal.modelOutput.message, 'All fifteen sources processed.');
     } else {
       assert.equal(result.terminal?.executionStatus, 'failed', JSON.stringify(result));
       assert.match(result.terminal.errorMessage, /Inference owner allowance exceeded \(invocations\)/u);
-      assert.equal(f.requests.filter(request => !isRecovery(request)).length, 5);
+      assert.equal(f.requests.filter(request => !isRecovery(request)).length, 15);
     }
   });
 });
@@ -255,7 +262,7 @@ test('successful distinct recovery boundaries exceed four requests while retaini
 test('four distinct inspection actions at an unchanged boundary remain capped after restart', async () => {
   const f = await fixture();
   let inspections = 0;
-  f.recover(() => call('context_inspect', { limit: ++inspections, maxBytes: 4096 }));
+  f.recover(() => call('context_inspect', { limit: ++inspections, maxBytes: 2048 }));
   const first = await new AgentRuntime(f.options()).run({ runId: 'bounded-inspection', task: applicationTask }).result;
   assert.equal(first.state, 'suspended', JSON.stringify(first));
   assert.equal(first.reason, 'context_admission');
@@ -280,7 +287,7 @@ test('retryable provider failures consume the durable unchanged-boundary allowan
   const f = await fixture();
   let attempts = 0;
   f.recover(() => {
-    if (++attempts === 3) return call('context_inspect', { limit: 1, maxBytes: 4096 });
+    if (++attempts === 3) return call('context_inspect', { limit: 1, maxBytes: 2048 });
     throw new ModelProviderError({ provider: 'recovery-accounting-fixture', code: 'provider_unavailable',
       message: 'Control generation has not produced output.', retryable: true });
   });

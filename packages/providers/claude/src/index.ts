@@ -13,12 +13,9 @@ import {
   parseModelProfile,
   parseModelRequest,
   parseModelResponse,
-  parseModelContextTransformResult,
   requiredProtocolRevision,
   type CompiledModelRequest,
   type ModelCompilationOptions,
-  type ModelContextTransformRequest,
-  type ModelContextTransformResult,
   type ModelContentPart,
   type ModelInputItem,
   type ModelOutputItem,
@@ -58,7 +55,6 @@ export class ClaudeProvider implements ModelProvider {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
   private readonly compiledRequests = new WeakMap<ModelRequest, CompiledModelRequest>();
-  private readonly compiledTransforms = new WeakMap<CompiledModelRequest, string>();
   private counting = 0;
   constructor(private readonly options: ClaudeProviderOptions = {}) {
     this.baseUrl = (options.baseUrl ?? 'https://api.anthropic.com/v1').replace(/\/+$/u, '');
@@ -95,10 +91,7 @@ export class ClaudeProvider implements ModelProvider {
       inputKinds: ['text', 'image', 'document', 'tool_call', 'tool_result', 'protocol'],
       outputKinds: ['text', 'tool_call', 'protocol', 'refusal'],
       state: 'exact',
-      contextTransforms:
-        model === 'claude-sonnet-4-6' && this.baseUrl === 'https://api.anthropic.com/v1'
-          ? ['claude.compaction']
-          : [],
+      contextReset: 'fresh_request',
       counting: this.options.countTokens ? 'provider' : 'estimate'
     });
     return Promise.resolve(
@@ -169,7 +162,7 @@ export class ClaudeProvider implements ModelProvider {
       request = parseModelRequest({ ...request, maxOutputTokens });
       const body = claudeRequest(request, maxOutputTokens);
       const tokens = this.options.countTokens
-        ? await this.countInput(body, request.signal, hasCompactedContext(request))
+        ? await this.countInput(body, request.signal)
         : undefined;
       const compiled = await compileModelRequest({
         ...options,
@@ -195,92 +188,6 @@ export class ClaudeProvider implements ModelProvider {
       streamCompiled: (request, options) => this.streamCompiled(request, options)
     };
   }
-  async compileContextTransform(
-    transform: ModelContextTransformRequest,
-    options?: ModelCompilationOptions
-  ): Promise<CompiledModelRequest> {
-    if (!transform.transformId)
-      throw this.error('invalid_request', 'A transform identity is required.');
-    const request = parseModelRequest({
-      ...transform.request,
-      ...(transform.signal ? { signal: transform.signal } : {})
-    });
-    const profile = await this.describeModel(request.model);
-    if (!profile.capabilities.protocol?.contextTransforms.includes('claude.compaction'))
-      throw this.error(
-        'invalid_request',
-        'Native compaction is not declared for this Claude endpoint/model.'
-      );
-    const source = await this.compileRequest(request, options);
-    const body = { ...source.body, compaction: { type: 'summarize' } };
-    const compiled = await compileModelRequest({
-      ...options,
-      request: source.logicalRequest,
-      profile,
-      body,
-      endpoint: `${this.baseUrl}/messages`,
-      payloadPaths: claudePayloadPaths(body),
-      outputReservation: source.accounting.outputReservation,
-      ...(source.accounting.method.name === 'provider-count'
-        ? { providerInputTokens: source.accounting.estimatedInputTokens }
-        : {})
-    });
-    this.compiledTransforms.set(compiled, transform.transformId);
-    return compiled;
-  }
-  async transformContext(
-    transform: ModelContextTransformRequest
-  ): Promise<ModelContextTransformResult> {
-    return this.transformContextCompiled(
-      transform.transformId,
-      await this.compileContextTransform(transform)
-    );
-  }
-  async transformContextCompiled(
-    transformId: string,
-    compiled: CompiledModelRequest,
-    options?: ModelTransportOptions
-  ): Promise<ModelContextTransformResult> {
-    if (this.compiledTransforms.get(compiled) !== transformId)
-      throw this.error('invalid_request', 'Unrecognized Claude context transform.');
-    const request = compiled.logicalRequest;
-    const response = await this.post(
-      '/messages',
-      compiled.body,
-      modelTransportSignal(request, options),
-      true
-    );
-    const payload = parseJsonObject(await readBoundedJsonResponse(response));
-    if (
-      payload.type !== 'message' ||
-      typeof payload.id !== 'string' ||
-      payload.model !== request.model ||
-      payload.stop_reason !== 'compaction' ||
-      !Array.isArray(payload.content) ||
-      payload.content.length !== 1
-    )
-      throw this.error(
-        'malformed_response',
-        'Claude compaction ended without a complete signed summary.'
-      );
-    const block = compactionBlock(payload.content[0]);
-    const state = await createProviderContextState({
-      provider: this.id,
-      endpoint: `${this.baseUrl}/messages`,
-      request,
-      requestId: payload.id,
-      protocolRevision: requiredProtocolRevision(await this.describeModel(request.model)),
-      kind: 'claude.compaction',
-      requiresExactPrefix: false,
-      data: { block }
-    });
-    return parseModelContextTransformResult({
-      transformId,
-      state,
-      input: [{ role: 'protocol', content: '', state }],
-      usage: claudeUsage(payload.usage)
-    });
-  }
   async complete(
     request: ModelRequest,
     options?: ModelTransportOptions
@@ -300,8 +207,7 @@ export class ClaudeProvider implements ModelProvider {
       const response = await this.post(
         '/messages',
         { ...compiled.body, stream: false },
-        signal,
-        hasCompactedContext(compiled.logicalRequest)
+        signal
       );
       return await this.decodeResponse(
         compiled.logicalRequest,
@@ -331,8 +237,7 @@ export class ClaudeProvider implements ModelProvider {
       const response = await this.post(
         '/messages',
         { ...compiled.body, stream: true },
-        signal,
-        hasCompactedContext(request)
+        signal
       );
       if (!response.body) throw this.error('malformed_response', 'Claude stream has no body.');
       let message: JsonObject | undefined;
@@ -555,8 +460,7 @@ export class ClaudeProvider implements ModelProvider {
   }
   private async countInput(
     body: Record<string, unknown>,
-    signal: AbortSignal | undefined,
-    compaction: boolean
+    signal: AbortSignal | undefined
   ): Promise<number> {
     if (this.counting >= (this.options.maxConcurrentCounts ?? 2))
       throw this.error('rate_limited', 'Claude token-count concurrency limit reached.');
@@ -566,7 +470,7 @@ export class ClaudeProvider implements ModelProvider {
       delete countBody.max_tokens;
       delete countBody.temperature;
       delete countBody.top_p;
-      const response = await this.post('/messages/count_tokens', countBody, signal, compaction);
+      const response = await this.post('/messages/count_tokens', countBody, signal);
       const result = parseJsonObject(await readBoundedJsonResponse(response));
       if (
         typeof result.input_tokens !== 'number' ||
@@ -582,8 +486,7 @@ export class ClaudeProvider implements ModelProvider {
   private async post(
     path: string,
     body: Record<string, unknown>,
-    signal: AbortSignal | undefined,
-    compaction: boolean
+    signal: AbortSignal | undefined
   ): Promise<Response> {
     signal?.throwIfAborted();
     const key = this.options.auth
@@ -595,8 +498,7 @@ export class ClaudeProvider implements ModelProvider {
       headers: {
         'x-api-key': key,
         'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-        ...(compaction ? { 'anthropic-beta': 'compact-2026-09-04' } : {})
+        'content-type': 'application/json'
       },
       body: JSON.stringify(body),
       ...(signal ? { signal } : {})
@@ -667,16 +569,6 @@ function claudeRequest(request: ModelRequest, maxOutputTokens: number): Record<s
         message: `Claude cannot preserve the ${item.role} authority channel.`
       });
     if (item.role === 'protocol') {
-      if (item.state.kind === 'claude.compaction') {
-        if (messages.length)
-          throw new ModelProviderError({
-            provider: 'claude',
-            code: 'invalid_request',
-            message: 'The signed compacted window must precede ordinary conversation.'
-          });
-        append('assistant', [compactionBlock(item.state.data.block)]);
-        continue;
-      }
       if (item.state.kind !== 'claude.thinking')
         throw new ModelProviderError({
           provider: 'claude',
@@ -806,22 +698,6 @@ function claudeToolCall(block: Readonly<Record<string, unknown>>): ModelToolCall
 }
 function claudeUsage(value: unknown): ModelUsage {
   const usage = parseJsonObject(value);
-  if (Array.isArray(usage.iterations)) {
-    if (usage.iterations.length === 0)
-      throw new Error('Claude compaction usage has no iterations.');
-    const iterations = usage.iterations.map(claudeIterationUsage);
-    return {
-      promptTokens: iterations.reduce((sum, item) => sum + item.promptTokens, 0),
-      completionTokens: iterations.reduce((sum, item) => sum + item.completionTokens, 0),
-      totalTokens: iterations.reduce((sum, item) => sum + item.totalTokens, 0),
-      cacheReadTokens: iterations.reduce((sum, item) => sum + (item.cacheReadTokens ?? 0), 0),
-      cacheWriteTokens: iterations.reduce((sum, item) => sum + (item.cacheWriteTokens ?? 0), 0)
-    };
-  }
-  return claudeIterationUsage(usage);
-}
-function claudeIterationUsage(value: unknown): ModelUsage {
-  const usage = parseJsonObject(value);
   for (const key of [
     'input_tokens',
     'output_tokens',
@@ -845,27 +721,6 @@ function claudeIterationUsage(value: unknown): ModelUsage {
     ...(write ? { cacheWriteTokens: write } : {})
   };
 }
-function hasCompactedContext(request: ModelRequest): boolean {
-  return request.messages.some(
-    (item) => item.role === 'protocol' && item.state.kind === 'claude.compaction'
-  );
-}
-function compactionBlock(value: unknown): JsonObject {
-  const block = parseJsonObject(value);
-  if (
-    block.type !== 'compaction' ||
-    typeof block.content !== 'string' ||
-    !block.content ||
-    typeof block.signature !== 'string' ||
-    !block.signature
-  )
-    throw new ModelProviderError({
-      provider: 'claude',
-      code: 'malformed_response',
-      message: 'Claude compaction requires the original content and signature.'
-    });
-  return block;
-}
 function blockIndex(value: unknown): number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0)
     throw new Error('Invalid Claude block index.');
@@ -883,8 +738,7 @@ function claudePayloadPaths(
       const block = parseJsonObject(raw);
       if (
         block.type === 'thinking' ||
-        block.type === 'redacted_thinking' ||
-        block.type === 'compaction'
+        block.type === 'redacted_thinking'
       )
         paths.push([...path, index]);
       else if (block.type === 'image' || block.type === 'document')

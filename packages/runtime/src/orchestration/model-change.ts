@@ -1,34 +1,11 @@
-import { parseJsonObject } from '@agent-core/json';
-import { parseModelSelection, type ModelSelection } from '@agent-core/model';
+import type { ModelSelection } from '@agent-core/model';
 
-/** A fresh continuation is a user choice, never a model-selection default. */
-export interface ModelChangeOptions {
-  readonly continuation?: 'fresh';
-}
-
-export class ModelContinuationRequiredError extends Error {
-  readonly code = 'fresh_continuation_required';
-  constructor(reason: string) {
-    super(
-      `The selected native context is incompatible (${reason}). Choose fresh continuation to use portable original sources in this session, or choose a compatible model.`
-    );
-    this.name = 'ModelContinuationRequiredError';
+/** Native state needs a fresh source-backed request admitted by the runtime. */
+export class NativeContextIncompatibilityError extends Error {
+  constructor(readonly reason: string) {
+    super(`Selected native context is incompatible: ${reason}.`);
+    this.name = 'NativeContextIncompatibilityError';
   }
-}
-
-/** The command envelope is separate from persisted provider/model settings. */
-export function parseModelChangeRequest(input: unknown): {
-  readonly selection: ModelSelection;
-  readonly options: ModelChangeOptions;
-} {
-  const value = parseJsonObject(input, { maxTotalBytes: 64 * 1024 });
-  const { continuation, ...settings } = value;
-  if (continuation !== undefined && continuation !== 'fresh')
-    throw new TypeError('Model continuation must be fresh when explicitly requested.');
-  return Object.freeze({
-    selection: parseModelSelection(settings),
-    options: Object.freeze(continuation === undefined ? {} : { continuation })
-  });
 }
 
 /** Carried source representations do not reselect an earlier target model. */

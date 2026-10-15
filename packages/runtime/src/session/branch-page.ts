@@ -1,6 +1,6 @@
 import { HistorySearchIndex } from '../history/search-index.js';
 import type { HistorySearchPosition } from '../history/contracts.js';
-import { workingStateAtEntry, type WorkingStateRevision } from './working-state.js';
+import { sessionStateAtEntry, type SessionStateRevision } from './session-state.js';
 import { hashJson } from '@agent-core/persistence';
 import { historySourceFacts } from '../history/source-metadata.js';
 import { historyToolName } from '../history/metadata.js';
@@ -24,7 +24,7 @@ export interface BranchEntryPosition {
   readonly context: SessionSourceMetadata['context'];
   readonly timestamp: string;
   readonly toolName?: string;
-  readonly workingState?: WorkingStateRevision | null;
+  readonly sessionState?: SessionStateRevision | null;
   readonly identity: string;
   readonly type: SessionBranchEntry['type'];
   readonly runId?: string;
@@ -351,9 +351,9 @@ export function memoryBranchSource(
     }
     index.positions.set(entry.id, {
       depth: (parent?.depth ?? -1) + 1, ancestors: Object.freeze(ancestors),
-      workingState: workingStateAtEntry(
+      sessionState: sessionStateAtEntry(
         entry,
-        entry.parentId === null ? null : (index.positions.get(entry.parentId)?.workingState ?? null)
+        entry.parentId === null ? null : (index.positions.get(entry.parentId)?.sessionState ?? null)
       ),
       ...branchEntryMetadata(entry),
       parentId: entry.parentId,
@@ -661,9 +661,9 @@ export async function sourceSnapshot(
   });
 }
 
-export function currentWorkingState(
+export function currentSessionState(
   source: BranchPageSource,
   leafId = source.leafId
-): WorkingStateRevision | null {
-  return leafId === null ? null : (position(source, leafId).workingState ?? null);
+): SessionStateRevision | null {
+  return leafId === null ? null : (position(source, leafId).sessionState ?? null);
 }

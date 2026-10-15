@@ -1,6 +1,6 @@
 # Agent Core
 
-Agent Core is a pre-alpha, provider-neutral runtime for persistent model sessions. It preserves original conversation, offers scoped history and model-managed working state, accounts for compiled provider input, and keeps execution, model-output completeness, and verification independent.
+Agent Core is a pre-alpha, provider-neutral runtime for persistent model sessions. It preserves original conversation, offers scoped history and model-managed session state, accounts for compiled provider input, and keeps execution, model-output completeness, and verification independent.
 
 Schema version `1` means the current schema only. The unpublished project intentionally has no compatibility readers or migrations.
 
@@ -8,7 +8,7 @@ Schema version `1` means the current schema only. The unpublished project intent
 
 | Package | Responsibility |
 | --- | --- |
-| `@agent-core/runtime` | Run orchestration, governed inference, sessions, history, working state, context transitions, optional verification, approvals, and recovery; filesystem repositories use `@agent-core/runtime/node`. |
+| `@agent-core/runtime` | Run orchestration, governed inference, sessions, history, session state, context transitions, optional verification, approvals, and recovery; filesystem repositories use `@agent-core/runtime/node`. |
 | `@agent-core/model` | Typed content and protocol contracts, provider capabilities, compilation, accounting, and validation. |
 | `@agent-core/persistence` | Hash-chain, artifact, redaction, and in-memory repository contracts; `@agent-core/persistence/node` adds filesystem persistence. |
 | `@agent-core/tools` | Generic tool contracts, effects, authorization, policy, and observations. |
@@ -22,8 +22,11 @@ Applications choose providers, prompt material, tools, checks, policies, authori
 
 Finishing a run does not evict its conversation. Context transitions change
 retained attention explicitly, while original sources remain available within
-their authorized retention scope. Working state is attributed generated material, not
-instructions or proof that work passed verification. See
+their authorized retention scope. Session state is one revisioned body of attributed
+understanding, optionally including a working section. It is not authority or proof
+that work passed verification. Fresh windows require admitted requests and an explicit
+provider reset at a safe protocol boundary; ordinary reasoning and tool continuity
+remain intact within each window. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for ownership and recovery contracts.
 The [context composition guide](docs/CONTEXT.md) describes the public services,
 their boundaries, and the policy evaluation runner.

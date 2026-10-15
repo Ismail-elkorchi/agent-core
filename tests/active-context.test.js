@@ -48,8 +48,8 @@ class Provider extends MemorySimulationProvider {
   }
 }
 
-for (const strategy of ['sources', 'provider']) {
-  test(`${strategy}: settled exchanges leave an active run's attention while history survives`, async () => {
+{
+  test(`fresh renewal: settled exchanges leave an active run's attention while history survives`, async () => {
     const sessions = new InMemorySessionRepository();
     const session = await sessions.create({
       binding: { schemaId: 'active-context', schemaVersion: 1, subject: {} }
@@ -106,10 +106,7 @@ for (const strategy of ['sources', 'provider']) {
             (entry) => 'turnIndex' in entry && entry.turnIndex === 1
           );
           original = exchange.find((entry) => entry.type === 'observation');
-          const retained =
-            strategy === 'provider'
-              ? view.entries
-              : view.entries.filter((entry) => !exchange.includes(entry));
+          const retained = view.entries.filter((entry) => !exchange.includes(entry));
           await runtime.scheduleContextTransition({
             toolInvocation: Object.fromEntries(
               ['runId', 'turnId', 'requestAttempt', 'toolBatchId', 'callIndex', 'toolAttempt'].map(
@@ -122,8 +119,9 @@ for (const strategy of ['sources', 'provider']) {
             idempotencyKey: 'select',
             reason: 'Completed exchange is no longer needed.',
             selection: {
-              strategy,
-              retained: retained.map((entry) => sourceRef(session.id, entry))
+              retained: retained.map((entry) => sourceRef(session.id, entry)),
+              continuity: { kind: 'fresh', resetId: 'select', model: { provider: provider.id, model: simulationProfile.id },
+                sources: retained.map(entry => sourceRef(session.id, entry)) }
             }
           });
           return result({ scheduled: true });
@@ -134,6 +132,7 @@ for (const strategy of ['sources', 'provider']) {
       repository: sessions,
       session,
       history,
+      artifacts,
       policy: {
         maxSourceBytes: 1_000_000,
         historyRead: { history, isAvailable: () => true }
@@ -178,12 +177,7 @@ for (const strategy of ['sources', 'provider']) {
     });
     assert.equal(archived.status, 'available');
     assert.match(archived.item.text, /ARCHIVED-DETAIL-739/);
-    if (strategy === 'provider')
-      assert.equal(next.messages.filter((message) => message.role === 'protocol').length, 1);
-    else
-      assert.ok(
-        next.messages.some((message) => message.role === 'tool' && message.toolCallId === 'select')
-      );
+    assert.ok(next.messages.some((message) => message.role === 'tool' && message.toolCallId === 'select'));
   });
 }
 

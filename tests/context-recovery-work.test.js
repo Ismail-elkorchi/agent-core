@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { compileModelRequest } from '@agent-core/model';
+import { compileModelRequest, conservativeProtocolCapabilities } from '@agent-core/model';
 import { InMemoryArtifactRepository } from '@agent-core/persistence';
 import { ContextService, HistoryReader, InMemorySessionRepository, sourceRef } from '@agent-core/runtime';
 
 const profile = {
   id: 'metadata-count', provider: 'metadata-count',
-  capabilities: { streaming: false, toolCalling: false, jsonMode: false, jsonSchema: false,
+  capabilities: { protocol: { ...conservativeProtocolCapabilities('metadata-count'), contextReset: 'fresh_request' }, streaming: false, toolCalling: false, jsonMode: false, jsonSchema: false,
     logprobs: false, temperature: false, topP: false },
   modalities: { input: ['text'], output: ['text'] }, limits: { contextTokens: 64000, outputTokens: 1024 },
   supportedParameters: ['maxOutputTokens']
@@ -28,7 +28,7 @@ test('one selected-metadata scan per captured cut is independent of released arc
     const setup = new ContextService({ repository: sessions, session, artifacts,
       policy: { maxSourceBytes: 100000, selfContained: true } });
     await setup.transition({ expectedWindowId: null, expectedSourceRevision: (await setup.history.capture()).sourceRevision,
-      selection: { strategy: 'sources', retained: [] }, reason: 'Explicitly release optional archived sources.', idempotencyKey: 'archive' });
+      selection: await setup.freshSelection({ selection: { retained: [] }, model: { provider: profile.provider, model: profile.id }, profile, cut: await setup.history.capture(), resetId: 'archive-reset' }), reason: 'Explicitly release optional archived sources.', idempotencyKey: 'archive' }, { admit: admitEmpty });
     await sessions.appendInput(session, { runId: 'active', task: 'Fixed active input.' });
     await sessions.appendAssistant(session, { runId: 'active', identity: { turnId: 'active', turnIndex: 1, requestAttempt: 1 }, content: 'Fixed active response.' });
     const history = new HistoryReader({ repository: sessions, session, artifacts });
@@ -101,8 +101,8 @@ test('JSONL cold reopen reads bounded projection paths while active metadata wor
       archive.add(entry.id);
     }
     const setup = new ContextService({ repository: memory, session, artifacts, policy: { maxSourceBytes: 100000, selfContained: true } });
-    await setup.transition({ expectedWindowId: null, selection: { strategy: 'sources', retained: [] },
-      reason: 'Release complete optional archive.', idempotencyKey: 'release' });
+    await setup.transition({ expectedWindowId: null, selection: await setup.freshSelection({ selection: { retained: [] }, model: { provider: profile.provider, model: profile.id }, profile, cut: await setup.history.capture(), resetId: 'archive-reset' }),
+      reason: 'Release complete optional archive.', idempotencyKey: 'release' }, { admit: admitEmpty });
     await memory.appendInput(session, { runId: 'active', task: 'Fixed active input.' });
     await memory.appendAssistant(session, { runId: 'active', identity: { turnId: 'active', turnIndex: 1, requestAttempt: 1 }, content: 'Fixed active response.' });
     const writer = new JsonlSessionRepository(root);
@@ -160,3 +160,9 @@ test('JSONL cold reopen reads bounded projection paths while active metadata wor
   }
   t.diagnostic(JSON.stringify({ measurement: 'JSONL cold reopen and warm source checks', evidence }));
 });
+
+async function admitEmpty() {
+ const request = { model: profile.id, messages: [{ role: 'user', content: 'Continue.' }] };
+ const compiled = await compileModelRequest({ request, body: request, profile, endpoint: 'fixture://metadata-count' });
+ return { compiledInputIdentity: compiled.inputIdentity, capabilityRevision: compiled.capabilityRevision };
+}

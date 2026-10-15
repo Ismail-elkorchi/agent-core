@@ -47,6 +47,14 @@ function terminal(runId) {
     }
   };
 }
+// Service tests provide deterministic compiled admission; runtime tests compile the actual request.
+function renew(context, request, options = {}) {
+  const selection = request.selection;
+  return context.transition({ ...request, selection: { ...selection,
+    continuity: selection.continuity ?? { kind: 'fresh', resetId: request.idempotencyKey,
+      model: { provider: 'fixture', model: 'context' }, sources: selection.retained }
+  } }, { admit: async () => ({ compiledInputIdentity: 'fixture-input', capabilityRevision: 'fixture' }), ...options });
+}
 async function backend(kind) {
   if (kind === 'memory')
     return {
@@ -81,10 +89,10 @@ for (const kind of ['memory', 'jsonl']) {
     const context = new ContextService({ repository: sessions, session, artifacts, history,
       policy: { maxSourceBytes: 1024 * 1024, historyRead: { history, isAvailable: () => true } }
     });
-    const point = await context.transition({
+    const point = await renew(context, {
       expectedWindowId: (await context.inspect()).window?.windowId ?? null,
       expectedSourceRevision: (await context.history.capture()).sourceRevision,
-      selection: { strategy: 'sources', retained: await context.protectedSources() },
+      selection: { retained: await context.protectedSources() },
  idempotencyKey: 'fork-point', reason: 'Historical point'
     });
     await events.append('open-run', answer('Later parent answer', 2));
@@ -395,12 +403,12 @@ test('context validation releases the session queue and accepted queued input ma
       throw new Error('No runtime needed');
     }
   });
-  const changing = context.transition(
+  const changing = renew(context,
     {
       expectedWindowId: null,
       idempotencyKey: 'pending',
       reason: 'capture',
-      selection: { strategy: 'sources', retained: [sourceRef(session.id, first)] }
+      selection: { retained: [sourceRef(session.id, first)] }
     },
     {
       admit: async () => {
@@ -553,84 +561,26 @@ test('active accepted input and tool-result dependencies cannot be omitted', asy
     policy: { maxSourceBytes: 8192 }
   });
   await assert.rejects(
-    context.transition({
+    renew(context, {
       expectedWindowId: null,
       idempotencyKey: 'orphan',
       reason: 'test',
       selection: {
-        strategy: 'sources',
         retained: [sourceRef(session.id, input), sourceRef(session.id, observation)]
       }
     }),
     /no matching original call/u
   );
   await assert.rejects(
-    context.transition({
+    renew(context, {
       expectedWindowId: null,
       idempotencyKey: 'omit-active',
       reason: 'test',
       selection: {
-        strategy: 'sources',
         retained: []
       }
     }),
     /active accepted or protected input is mandatory/u
-  );
-});
-
-test('native context selection binds only validated host state and rejects caller-supplied state', async () => {
-  const sessions = new InMemorySessionRepository();
-  const session = await sessions.create({ binding });
-  const input = await sessions.appendInput(session, {
-    runId: 'run',
-    task: 'original native input'
-  });
-  await sessions.recordRunFinalization(session, terminal('run'));
-  const state = {
-    artifact: { id: 'host-validated-artifact', sha256: 'a'.repeat(64) },
-    invocationId: 'native-invocation'
-  };
-  const context = new ContextService({
-    artifacts: new InMemoryArtifactRepository(),
-    repository: sessions,
-    session,
-    policy: { maxSourceBytes: 8192 }
-  });
-  const selection = {
-    strategy: 'provider',
-    retained: [sourceRef(session.id, input)]
-  };
-  await assert.rejects(
-    context.transition({
-      expectedWindowId: null,
-      idempotencyKey: 'forged',
-      reason: 'test',
-      selection: { ...selection, providerState: { authority: 'forged' } }
-    }),
-    /governed host validation/u
-  );
-  const committed = await context.transition(
-    {
-      expectedWindowId: null,
-      idempotencyKey: 'native',
-      reason: 'test',
-      selection
-    },
-    {
-      admit: async () => ({
-        compiledInputIdentity: 'native-request',
-        capabilityRevision: 'fixture',
-        providerState: state
-      })
-    }
-  );
-  state.artifact.id = 'mutated';
-  assert.equal(committed.window.selection.providerState.artifact.id, 'host-validated-artifact');
-  assert.equal(Object.isFrozen(committed.window.selection.providerState.artifact), true);
-  assert.equal(
-    (await context.inspect()).window.selection.providerState,
-    undefined,
-    'ordinary context inspection exposes references without opaque state payload'
   );
 });
 
@@ -795,23 +745,12 @@ for (const kind of ['memory', 'jsonl']) {
   });
 }
 
-test('context discovery advertises provider transformation only while a capable runtime is bound', async () => {
+test('context discovery advertises fresh renewal only', async () => {
   const sessions = new InMemorySessionRepository();
   const session = await sessions.create({ binding });
-  const context = new ContextService({
-    artifacts: new InMemoryArtifactRepository(),
-    repository: sessions,
-    session,
-    policy: { maxSourceBytes: 8192 }
-  });
-  assert.deepEqual((await context.inspect()).legalTransitions, ['sources']);
-  const unbind = context.bindRuntime({
-    providerTransform: async () => true,
-    schedule: async () => ({ requestId: 'request' })
-  });
-  assert.deepEqual((await context.inspect()).legalTransitions, ['sources', 'provider']);
-  unbind();
-  assert.deepEqual((await context.inspect()).legalTransitions, ['sources']);
+  const context = new ContextService({ artifacts: new InMemoryArtifactRepository(), repository: sessions,
+    session, policy: { maxSourceBytes: 8192 } });
+  assert.deepEqual((await context.inspect()).legalTransitions, ['fresh']);
 });
 
 async function sourceAfter(reader, source, cut) {
@@ -1186,19 +1125,19 @@ for (const contextRecovery of [false, true]) {
     const context = new ContextService({ repository: sessions, session, artifacts, history,
       policy: { maxSourceBytes: 65536, historyRead: { history, isAvailable: () => true } } });
     const cut = await history.capture();
-    const transition = context.transition({
+    const transition = renew(context, {
       expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
       idempotencyKey: 'omit-unexecuted', reason: 'Explicit selection',
-      selection: { strategy: 'sources', retained: [sourceRef(session.id, input)] }
+      selection: { retained: [sourceRef(session.id, input)] }
     });
     if (contextRecovery) {
       const result = await transition;
       assert.equal(result.type, 'context_transition');
     } else {
       await assert.rejects(transition, /unfinished tool exchange cannot be released/);
-      await assert.rejects(context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
+      await assert.rejects(renew(context, { expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
         idempotencyKey: 'fresh-cannot-drop-pending', reason: 'Explicit fresh continuation still owes its result',
-        selection: { strategy: 'sources', retained: [sourceRef(session.id, input)], continuity: {
+        selection: { retained: [sourceRef(session.id, input)], continuity: {
           kind: 'fresh', resetId: 'fresh-pending', model: { provider: 'fixture', model: 'context' }, sources: [sourceRef(session.id, input)]
         } } }), /unfinished tool exchange cannot be released/);
       assert.equal(await history.selectedContext(), undefined);
@@ -1219,10 +1158,10 @@ test('raw transition cannot reintroduce a partial historical exchange outside th
   const history = new HistoryReader({ repository: sessions, session, artifacts });
   const context = new ContextService({ repository: sessions, session, artifacts, history,
     policy: { maxSourceBytes: 65536, historyRead: { history, isAvailable: () => true } } });
-  const first = await context.transition({ expectedWindowId: null, expectedSourceRevision: (await history.capture()).sourceRevision,
-    idempotencyKey: 'remove-complete', reason: 'Remove complete exchange', selection: { strategy: 'sources', retained: [sourceRef(session.id, input)] } });
-  await assert.rejects(context.transition({ expectedWindowId: first.window.windowId, expectedSourceRevision: (await history.capture()).sourceRevision,
-    idempotencyKey: 'partial-add', reason: 'Partial historical add', selection: { strategy: 'sources', retained: [sourceRef(session.id, input), sourceRef(session.id, assistant)] } }), /complete tool exchange/);
+  const first = await renew(context, { expectedWindowId: null, expectedSourceRevision: (await history.capture()).sourceRevision,
+    idempotencyKey: 'remove-complete', reason: 'Remove complete exchange', selection: { retained: [sourceRef(session.id, input)] } });
+  await assert.rejects(renew(context, { expectedWindowId: first.window.windowId, expectedSourceRevision: (await history.capture()).sourceRevision,
+    idempotencyKey: 'partial-add', reason: 'Partial historical add', selection: { retained: [sourceRef(session.id, input), sourceRef(session.id, assistant)] } }), /complete tool exchange/);
 });
 
 test('explicit replacement can release more than ten thousand completed exchanges', async () => {
@@ -1241,9 +1180,9 @@ test('explicit replacement can release more than ten thousand completed exchange
     assert.equal(id, input.id, 'replacement must not hydrate discarded exchange bodies');
     return read(descriptor, boundary, id);
   };
-  const result = await context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
+  const result = await renew(context, { expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
     idempotencyKey: 'bounded-replacement', reason: 'Replace the oversized source plan',
-    selection: { strategy: 'sources', retained: [sourceRef(session.id, input)] } });
+    selection: { retained: [sourceRef(session.id, input)] } });
   assert.equal(result.type, 'context_transition');
   assert.deepEqual(result.window.selection.retained, [sourceRef(session.id, input)]);
 });
@@ -1280,22 +1219,23 @@ test('whole native prefix release requires a new explicit fresh continuation', a
   const inputRef = sourceRef(session.id, input);
   const cut = await history.capture();
   await assert.rejects(context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
-    idempotencyKey: 'silent-native-drop', reason: 'Release all native sources', selection: { strategy: 'sources', retained: [inputRef] } }), /explicit fresh continuation/);
+    idempotencyKey: 'silent-native-drop', reason: 'Release all native sources', selection: { retained: [inputRef] } },
+    { admit: async () => ({ compiledInputIdentity: 'fixture', capabilityRevision: 'fixture' }) }), /new fresh continuation/);
   assert.equal(await history.selectedContext(), undefined);
-  await assert.rejects(context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
+  await assert.rejects(renew(context, { expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
     idempotencyKey: 'fresh-cannot-drop-input', reason: 'Fresh continuity still owes the accepted input',
-    selection: { strategy: 'sources', retained: [], continuity: { kind: 'fresh', resetId: 'fresh-without-input', model: { provider: 'fixture', model: 'context' }, sources: [] } } }), /active accepted or protected input is mandatory/);
-  const preserved = await context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
+    selection: { retained: [], continuity: { kind: 'fresh', resetId: 'fresh-without-input', model: { provider: 'fixture', model: 'context' }, sources: [] } } }), /active accepted or protected input is mandatory/);
+  const preserved = await renew(context, { expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
     idempotencyKey: 'preserve-native', reason: 'Preserve native prefix',
-    selection: { strategy: 'sources', retained: [inputRef, sourceRef(session.id, response)] } });
-  const fresh = await context.transition({ expectedWindowId: preserved.window.windowId, expectedSourceRevision: (await history.capture()).sourceRevision,
+    selection: { retained: [inputRef, sourceRef(session.id, response)] } });
+  const fresh = await renew(context, { expectedWindowId: preserved.window.windowId, expectedSourceRevision: (await history.capture()).sourceRevision,
     idempotencyKey: 'explicit-native-reset', reason: 'Explicit fresh continuation',
-    selection: { strategy: 'sources', retained: [inputRef], continuity: { kind: 'fresh', resetId: 'new-explicit-reset', model: { provider: 'fixture', model: 'context' }, sources: [inputRef] } } });
+    selection: { retained: [inputRef], continuity: { kind: 'fresh', resetId: 'new-explicit-reset', model: { provider: 'fixture', model: 'context' }, sources: [inputRef] } } });
   assert.deepEqual(fresh.window.selection.retained, [inputRef]);
   assert.equal(fresh.window.selection.continuity.resetId, 'new-explicit-reset');
 });
 
-test('native prefix validation orders an older open run tail before a later retained response', async () => {
+test('fresh renewal can release a completed older native prefix tail', async () => {
   const { sessions, events, artifacts } = await backend('memory');
   const session = await sessions.create({ binding });
   const earlierInput = await sessions.appendInput(session, { runId: 'earlier-open', task: 'Earlier obligation' });
@@ -1310,12 +1250,13 @@ test('native prefix validation orders an older open run tail before a later reta
   const cut = await history.capture();
   const selection = await context.selectSources(cut, {});
   assert(selection.retained.some(source => source.entryId === earlierInput.id));
-  const prior = await context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
+  const prior = await renew(context, { expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
     idempotencyKey: 'native-order-initial', reason: 'Preserve current prefix', selection });
   await events.append('earlier-open', { type: 'assistant.ended', ...identity, turnId: 'late-earlier-response', content: 'Earlier run acquired a tail',
     modelOutput: { status: 'complete', message: 'Earlier run acquired a tail', source: 'content', turnIndex: 1 } });
-  await assert.rejects(context.transition({ expectedWindowId: prior.window.windowId, expectedSourceRevision: (await history.capture()).sourceRevision,
-    idempotencyKey: 'omit-earlier-tail', reason: 'Omit the new earlier-run tail', selection }), /complete preceding source prefix/);
+  const renewed = await renew(context, { expectedWindowId: prior.window.windowId, expectedSourceRevision: (await history.capture()).sourceRevision,
+    idempotencyKey: 'omit-earlier-tail', reason: 'Omit the completed earlier-run tail', selection });
+  assert.deepEqual(renewed.window.selection.retained, selection.retained);
 });
 
 test('metadata continuation carries only a cut fingerprint and resumes across readers', async () => {
@@ -1349,8 +1290,8 @@ test('manifest byte backtracking preserves the last fitting page across skipped 
   const history = new HistoryReader({ repository: sessions, session, artifacts });
   const context = new ContextService({ repository: sessions, session, artifacts, history,
     policy: { maxSourceBytes: 65536, historyRead: { history, isAvailable: () => true } } });
-  await context.transition({ expectedWindowId: null, expectedSourceRevision: (await history.capture()).sourceRevision,
-    idempotencyKey: 'retained-tail-boundary', reason: 'Keep the retained inputs', selection: { strategy: 'sources', retained } });
+  await renew(context, { expectedWindowId: null, expectedSourceRevision: (await history.capture()).sourceRevision,
+    idempotencyKey: 'retained-tail-boundary', reason: 'Keep the retained inputs', selection: { retained } });
   await sessions.appendInput(session, { runId: 'new-tail', task: 'A new tail original' });
   const cut = await history.capture();
   const six = (await context.inspect(cut, { limit: 6, maxBytes: 8192 })).activeSelection.manifest;

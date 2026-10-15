@@ -29,14 +29,12 @@ export type {
 
 export interface ModelRequestAssemblyInput {
   readonly runId?: string;
-  /** Compile selected conversation for a native transform, without adding the current task or context again. */
-  readonly conversationOnly?: boolean;
   readonly window: ModelWindow;
   readonly task: string;
   readonly images?: readonly import('../session/images.js').SessionImageInput[];
   readonly instructions: readonly PromptInstructionBlock[];
   readonly contextItems?: readonly PromptContextItemInput[];
-  readonly workingState?: PromptContextItemInput;
+  readonly sessionState?: PromptContextItemInput;
   readonly capacityNotice?: PromptContextItemInput;
   readonly tools: readonly PromptToolSummary[];
   readonly modelProfile: ModelProfile;
@@ -68,14 +66,14 @@ export class ModelRequestAssembler {
     const history = input.window.messagesFor(input.modelProfile);
     const prior = input.window.priorMessagesFor(input.modelProfile);
     const context = deliverPromptContext(input.contextItems ?? [], this.estimator);
-    const state = deliverPromptContext(input.workingState ? [input.workingState] : [], this.estimator);
+    const state = deliverPromptContext(input.sessionState ? [input.sessionState] : [], this.estimator);
     const notices = deliverPromptContext(input.capacityNotice ? [input.capacityNotice] : [], this.estimator);
     const material = createPromptMaterial({
       task: input.task,
       ...(input.images === undefined ? {} : { images: input.images }),
       instructions: input.instructions,
       context: context.items,
-      ...(state.items[0] ? { workingState: state.items[0] } : {}),
+      ...(state.items[0] ? { sessionState: state.items[0] } : {}),
       ...(notices.items[0] ? { capacityNotice: notices.items[0] } : {}),
       tools: input.tools,
       ...(input.metadata ? { metadata: input.metadata } : {})
@@ -83,14 +81,13 @@ export class ModelRequestAssembler {
     let messages = await compilePromptMaterial(
       material,
       {
-        transformed: input.window.transformedMessagesFor(input.modelProfile),
         prior: prior.messages,
         current: history.messages
       },
       {
         artifacts: this.artifacts,
         maxImageBytes: input.window.imageLimits.maxBytes,
-        conversationOnly: input.conversationOnly ?? false
+        authorityRole: input.modelProfile.capabilities.protocol?.roles.includes('developer') ? 'developer' : 'system'
       }
     );
     const presentation: RequestPresentation = {
@@ -104,8 +101,8 @@ export class ModelRequestAssembler {
           .map(({ role, content }) => ({ role, content }))
       ),
       context: hashJson(renderContext(material.context)),
-      workingState: hashJson(
-        material.workingState ? renderContext([material.workingState]) : null
+      sessionState: hashJson(
+        material.sessionState ? renderContext([material.sessionState]) : null
       )
     };
     const bound = input.window.continuation();
@@ -121,9 +118,14 @@ export class ModelRequestAssembler {
           continuationSource,
           'Current instructions differ from the authority bound to earlier reasoning.'
         );
+      if (presentation.sessionState !== bound.input.presentation.sessionState)
+        throw new NativeContextTransitionRequired(
+          continuationSource,
+          'Session state changed and requires a fresh request.'
+        );
       const newRun = input.runId !== bound.input.runId;
       const inputMessages =
-        newRun && !input.conversationOnly
+        newRun
           ? await compilePromptMaterial(
               {
                 id: material.id,
@@ -136,8 +138,7 @@ export class ModelRequestAssembler {
               undefined,
               { artifacts: this.artifacts, maxImageBytes: input.window.imageLimits.maxBytes }
             )
-          : !input.conversationOnly &&
-              presentation.runInstructions !== bound.input.presentation.runInstructions
+          : presentation.runInstructions !== bound.input.presentation.runInstructions
             ? material.instructions
                 .filter((item) => item.role === 'user')
                 .map(({ content }) => ({ role: 'user' as const, content }))
@@ -147,18 +148,11 @@ export class ModelRequestAssembler {
         ...bound.prior,
         ...inputMessages,
         ...bound.current,
-        ...(!input.conversationOnly &&
-        presentation.context !== bound.input.presentation.context &&
+        ...(presentation.context !== bound.input.presentation.context &&
         material.context.length
           ? [{ role: 'user' as const, content: renderContext(material.context) }]
           : []),
-        ...(!input.conversationOnly &&
-        presentation.workingState !== bound.input.presentation.workingState &&
-        material.workingState
-          ? [{ role: 'user' as const, content: renderContext([material.workingState]) }]
-          : []),
-        ...(!input.conversationOnly &&
-        presentation.capacityNotice !== bound.input.presentation.capacityNotice &&
+        ...(presentation.capacityNotice !== bound.input.presentation.capacityNotice &&
         material.capacityNotice
           ? [{ role: 'user' as const, content: renderContext([material.capacityNotice]) }]
           : [])
@@ -187,18 +181,17 @@ export class ModelRequestAssembler {
   }
 }
 
-/** Stable reference material precedes conversation; current understanding is a request suffix. */
+/** Stable reference material and session state precede append-only conversation. */
 export async function compilePromptMaterial(
   material: PromptMaterial,
   conversation: {
-    readonly transformed?: readonly ModelInputItem[];
     readonly prior: readonly ModelInputItem[];
     readonly current: readonly ModelInputItem[];
   } = { prior: [], current: [] },
   options: {
     readonly artifacts?: ArtifactRepository | undefined;
     readonly maxImageBytes?: number;
-    readonly conversationOnly?: boolean;
+    readonly authorityRole?: 'system' | 'developer';
   } = {}
 ): Promise<readonly ModelInputItem[]> {
   const instructionMessages: ModelInputItem[] = material.instructions.map((instruction) =>
@@ -210,15 +203,15 @@ export async function compilePromptMaterial(
   if (material.outputContract)
     instructionMessages.push(
       Object.freeze({
-        role: 'developer',
+        role: options.authorityRole ?? 'developer',
         content: material.outputContract.description
       })
     );
   // Tool schemas and descriptions are carried once by the advertised catalog.
   const guides = material.tools.flatMap((tool) => (tool.promptGuide ? [tool.promptGuide] : []));
   if (guides.length > 0)
-    instructionMessages.push(Object.freeze({ role: 'developer', content: guides.join('\n\n') }));
-  const taskMessage: ModelInputItem | undefined = options.conversationOnly ? undefined : Object.freeze({
+    instructionMessages.push(Object.freeze({ role: options.authorityRole ?? 'developer', content: guides.join('\n\n') }));
+  const taskMessage: ModelInputItem = Object.freeze({
     role: 'user',
     content: material.task,
     ...(material.images === undefined
@@ -235,19 +228,18 @@ export async function compilePromptMaterial(
   const contextMessage: ModelInputItem | undefined = contextText
     ? Object.freeze({ role: 'user', content: contextText })
     : undefined;
-  const workingState: ModelInputItem | undefined = material.workingState
-    ? Object.freeze({ role: 'user', content: renderContext([material.workingState]) })
+  const sessionState: ModelInputItem | undefined = material.sessionState
+    ? Object.freeze({ role: 'user', content: renderContext([material.sessionState]) })
     : undefined;
   return Object.freeze([
     ...instructionMessages.filter((item) => item.role !== 'user'),
-    ...(conversation.transformed ?? []),
-    ...(contextMessage && !options.conversationOnly ? [contextMessage] : []),
+    ...(contextMessage ? [contextMessage] : []),
+    ...(sessionState ? [sessionState] : []),
     ...conversation.prior,
-    ...instructionMessages.filter((item) => item.role === 'user' && !options.conversationOnly),
-    ...(taskMessage ? [taskMessage] : []),
+    ...instructionMessages.filter((item) => item.role === 'user'),
+    taskMessage,
     ...conversation.current,
-    ...(workingState && !options.conversationOnly ? [workingState] : []),
-    ...(material.capacityNotice && !options.conversationOnly
+    ...(material.capacityNotice
       ? [{ role: 'user' as const, content: renderContext([material.capacityNotice]) }]
       : [])
   ]);

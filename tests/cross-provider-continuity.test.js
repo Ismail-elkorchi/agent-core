@@ -41,7 +41,7 @@ for (const id of ['openai', 'openai-codex']) {
       ...initial,
       messages: [
         { role: 'developer', content: 'Current scoped repository guidance.' },
-        { role: 'user', content: 'Current working state and workspace context.' },
+        { role: 'user', content: 'Current session state and workspace context.' },
         initial.messages[2],
         ...output,
         { role: 'user', content: 'Continue the inspection.' }
@@ -140,7 +140,7 @@ for (const id of providerIds) {
     assert.deepEqual(resumed.reasoning, firstRequest.logicalRequest.reasoning);
     assert.equal(resumed.temperature, firstRequest.logicalRequest.temperature);
     assert.equal(resumed.responseFormat, options.responseFormat);
-    assert.equal((await context.workingState()).revision, null);
+    assert.equal((await context.sessionState()).revision, null);
     const usage = await service.settledRunUsage('continue', 'continue');
     assert.equal(usage.invocations, 1);
     assert.equal(usage.usage.promptTokens, 20);
@@ -218,7 +218,7 @@ for (const id of ['openai', 'openai-codex', 'openrouter', 'claude']) {
         inspected.admission.accounting.unknownComponents.length > 0,
         'uncertainty remains explicit'
       );
-    assert.equal(inspected.workingState.revisionId, null);
+    assert.equal(inspected.sessionState.revisionId, null);
   });
 }
 
@@ -298,7 +298,7 @@ test('mid-run continuation preserves signed reasoning and the completed tool exc
   assert.ok(JSON.stringify(bodies[1]).includes('Observation. Observation.'));
 });
 for (const id of providerIds) {
-  test(`${id} preserves native blocks with one revised working state and current authority/catalog`, async () => {
+  test(`${id} preserves native blocks with one revised session state and current authority/catalog`, async () => {
     const bodies = [];
     const provider = continuityProvider(id, { bodies, opaqueReasoning: true });
     const profile = await provider.describeModel(model);
@@ -306,7 +306,7 @@ for (const id of providerIds) {
     const window = new ModelWindow();
     const state = (text) => ({
       id: 'current-state',
-      sourceUri: 'session://working-state',
+      sourceUri: 'session://session-state',
       sourceKind: 'generated',
       representation: 'full',
       mediaType: 'text/plain',
@@ -319,7 +319,7 @@ for (const id of providerIds) {
         window,
         task,
         instructions: [{ id: 'authority', role: 'system', content: guidance }],
-        workingState: state(text),
+        sessionState: state(text),
         tools: [],
         modelProfile: profile
       });

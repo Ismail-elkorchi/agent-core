@@ -1,8 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { compilePromptMaterial } from '@agent-core/runtime';
-import { createProviderContextState } from '@agent-core/model';
-import { responsesInput } from '@agent-core/provider-openai-responses';
 
 test('prompt compilation separates background data from instructions and the current request', async () => {
   const instructions = [
@@ -70,64 +68,23 @@ test('plain conversational material adds no persona, output contract, duplicated
   assert.deepEqual(configured[0], { role: 'developer', content: 'Return one category identifier.' });
 });
 
-test('current application context preserves the provider-native compacted window prefix', async () => {
-  const compacted = { type: 'compaction', encrypted_content: 'opaque-provider-fixture' };
-  const state = await createProviderContextState({
-    provider: 'openai',
-    protocolRevision: 'fixture',
-    endpoint: 'https://api.openai.com/v1',
-    request: { model: 'fixture', messages: [{ role: 'user', content: 'Original requirement.' }] },
-    requestId: 'compacted',
-    kind: 'responses.compaction',
-    requiresExactPrefix: false,
-    data: { items: [compacted] }
-  });
-  const messages = await compilePromptMaterial(
-    {
-      id: 'material',
-      task: 'Continue the work.',
-      tools: [],
-      instructions: [{ id: 'authority', role: 'developer', content: 'Current authority.', priority: 1 }],
-      context: [
-        {
-          id: 'environment',
-          sourceUri: 'application://environment',
-          sourceKind: 'external',
-          representation: 'full',
-          mediaType: 'text/plain',
-          title: 'Environment',
-          content: 'Current environment.',
-          purpose: 'Execution context.',
-          tokenEstimate: 5
-        }
-      ]
-    },
-    { transformed: [{ role: 'protocol', content: '', state }], prior: [], current: [] }
-  );
-  const { input } = responsesInput({ model: 'fixture', messages }, 'openai');
-  assert.deepEqual(input[0], compacted);
-  assert.equal(input[1].role, 'developer');
-  assert.equal(input[2].role, 'user');
-  assert.match(input[2].content, /Current environment/);
-  assert.deepEqual(input[3], { role: 'user', content: 'Continue the work.' });
-});
-
-test('stable references retain their prefix while current working state changes at the suffix', async () => {
+test('session state appears once before ordinary history and is replaced on a fresh request', async () => {
   const item = (id, sourceKind, content) => ({ id, sourceUri: `history://${id}`, sourceKind,
     representation: 'full', mediaType: 'text/plain', title: id,
     content, tokenEstimate: 8, purpose: 'context' });
   const material = { id: 'state-placement', task: 'Complete the repair', tools: [],
     instructions: [{ id: 'system', role: 'system', content: 'Current authority', priority: 1 }],
     context: [item('repository', 'external', 'Stable repository guidance')],
-    workingState: item('state-1', 'generated', 'Superseded understanding') };
+    sessionState: item('state-1', 'generated', 'Superseded understanding') };
   const prior = [{ role: 'user', content: 'Original requirement' }, { role: 'assistant', content: 'Earlier answer' }];
   const current = [{ role: 'assistant', content: 'Current answer' }];
   const first = await compilePromptMaterial(material, { prior, current });
   const second = await compilePromptMaterial({ ...material,
-    workingState: item('state-2', 'generated', 'Corrected understanding') }, { prior, current });
-  assert.deepEqual(first.slice(0, -1), second.slice(0, -1));
-  assert.match(second.at(-1).content, /Corrected understanding/);
-  assert.match(second.at(-1).content, /sourceKind="generated"/);
+    sessionState: item('state-2', 'generated', 'Corrected understanding') }, { prior, current });
+  assert.deepEqual(first.slice(0, 2), second.slice(0, 2));
+  assert.deepEqual(first.slice(3), second.slice(3));
+  assert.match(second[2].content, /Corrected understanding/);
+  assert.match(second[2].content, /sourceKind="generated"/);
   assert.doesNotMatch(JSON.stringify(second), /Superseded understanding/);
   assert.equal(second.filter(m => m.content.includes('Corrected understanding')).length, 1);
   const next = await compilePromptMaterial({ ...material, task: 'New question' },

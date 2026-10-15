@@ -6,16 +6,16 @@ test('context RPC requires an explicit selection and inspected cut; no renewal e
   const requests = [];
   const methods = contextRpcMethods({
     inspectContext: async () => ({}),
-    freshContext: async () => ({}),
     transitionContext: async (request) => { requests.push(request); return { kind: 'scheduled', requestId: 'request' }; }
   });
   assert.equal(methods['context.renew'], undefined);
+  assert.equal(methods['context.fresh'], undefined);
   const request = {
     expectedWindowId: null,
     expectedSourceRevision: 42,
     idempotencyKey: 'selection-1',
     reason: 'Explicit user selection',
-    selection: { strategy: 'sources', retained: [] }
+    selection: { retained: [] }
   };
   assert.deepEqual(await methods['context.transition'].invoke(request), { kind: 'scheduled', requestId: 'request' });
   assert.deepEqual(requests, [request]);

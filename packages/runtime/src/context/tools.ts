@@ -1,22 +1,22 @@
-import { stageWorkingState } from './working-state.js';
+import { stageSessionState } from './session-state.js';
 import { contextInspectionCursor, contextInspectionSchema } from './inspection.js';
 import { parseJsonObject, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import {
   defaultToolModelContent,
   ToolInputError,
   defineTool,
-  unicodeTextSchema,
   type ToolCanonicalizationContext,
   type ToolExecutionContext,
   type ToolObservationInput,
   type CompiledToolDefinition
 } from '@agent-core/tools';
 import * as z from 'zod';
-import { historyCutSchema, sourceSchema } from '../history/schema.js';
+import { historyCutSchema, sourceSchema, sourceExcerptSchema } from '../history/schema.js';
 import { scopedTool, scopePath, invocationIdentity } from '../history/tool-support.js';
 import { contextTransitionRequestSchema } from './schema.js';
 import { hashJson, type ArtifactRepository } from '@agent-core/persistence';
-import { WORKING_STATE_GUIDANCE } from '../session/working-state.js';
+import { SESSION_STATE_GUIDANCE, sessionStateContentSchema } from '../session/session-state.js';
+import type { HistorySourceExcerpt } from '../history/contracts.js';
 import type { ContextService } from './service.js';
 /** Internal construction receives explicit owned storage, never a public staging capability. */
 export function contextToolDefinitions(options: {
@@ -33,51 +33,38 @@ export function contextToolDefinitions(options: {
       retain: sources.optional(),
       add: sources.optional(),
       release: sources.optional(),
-      workingState: unicodeTextSchema.optional(),
-      continuation: z.enum(['preserve', 'fresh']).default('preserve'),
-      strategy: z.enum(['sources', 'provider']).optional()
+      recentFrom: sourceSchema.optional(),
+      excerpts: z.array(sourceExcerptSchema).max(10000).readonly().optional(),
+      sessionState: sessionStateContentSchema.optional(),
+      declaredHistoryCut: historyCutSchema.optional()
     })
     .refine(
-      (input) => input.retain === undefined || input.release === undefined,
+      (input) => input.retain === undefined || (input.release === undefined && input.recentFrom === undefined),
       'Use retain for a replacement or add/release to edit the current selection.'
-    )
-    .refine(
-      (input) => input.continuation !== 'fresh' || input.strategy !== 'provider',
-      'A fresh continuation uses original sources, not native compaction.'
     );
   const canonicalize = async (value: z.output<typeof transition>, planning: ToolCanonicalizationContext) => {
     if (!planning.invocation) throw new Error('Context operation requires an invocation.');
-    const origin = await options.context.workingStateOrigin(planning.invocation);
+    const origin = await options.context.sessionStateOrigin(planning.invocation);
     const cut = await options.context.history.capture();
     if (cut.sessionId !== origin.sessionId || cut.branchId !== origin.branchId)
       throw new Error('Context branch changed after the originating inference.');
     const window = await options.context.history.selectedContext(cut);
     const selection = await options.context.selectSources(cut, value);
     const identity = invocationIdentity(planning);
-    const preserveSelection = value.retain === undefined && value.add === undefined && value.release === undefined &&
-      value.strategy === undefined && value.continuation === 'preserve';
     return {
       ...value,
-      preserveSelection,
       origin,
       cut,
       expectedWindowId: window?.windowId ?? null,
       selection: {
         ...selection,
-        strategy: value.strategy ?? (preserveSelection ? window?.selection.strategy : undefined) ?? 'sources',
-        ...(value.continuation === 'fresh'
-          ? {
-              continuity: {
-                kind: 'fresh' as const,
-                resetId: identity,
-                model: options.context.currentModel(),
-                sources: selection.retained
-              }
-            }
-          : {})
+        continuity: {
+          kind: 'fresh' as const, resetId: identity,
+          model: options.context.currentModel(), sources: selection.retained
+        }
       },
       identity,
-      stateId: `working-state-${hashJson({ invocation: identity, text: value.workingState ?? null })}`
+      stateId: `session-state-${hashJson({ invocation: identity, content: value.sessionState ?? null })}`
     };
   };
   const observe = async (value: Awaited<ReturnType<typeof canonicalize>>, execution: ToolExecutionContext): Promise<ToolObservationInput<JsonValue>> => {
@@ -91,13 +78,15 @@ export function contextToolDefinitions(options: {
       output: { status: 'committed', windowId: committed.window.windowId },
       scope: { resources: [scopePath('context', value.cut.sessionId, value.cut.branchId)], coverage: 'complete' }
     };
-    let workingState;
-    if (value.workingState !== undefined) {
-      const staged = await stageWorkingState(options.context, options, {
+    let sessionState;
+    if (value.sessionState !== undefined) {
+      const staged = await stageSessionState(options.context, options, {
         id: value.stateId,
         revisionId: value.origin.revisionId,
         inference: value.origin.inference,
-        text: value.workingState
+        content: value.sessionState,
+        capturedHistoryCut: value.origin.capturedHistoryCut,
+        ...(value.declaredHistoryCut ? { declaredHistoryCut: value.declaredHistoryCut } : {})
       });
       if ('status' in staged && staged.status !== 'unchanged')
         return {
@@ -110,27 +99,19 @@ export function contextToolDefinitions(options: {
             coverage: 'complete'
           }
         };
-      if ('status' in staged && value.retain === undefined &&
-          value.add === undefined && value.release === undefined && value.continuation === 'preserve' &&
-          value.preserveSelection) return {
-        kind: 'result', execution: { state: 'settled' }, summary: 'Working state is unchanged.',
-        output: { status: 'unchanged' },
-        scope: { resources: [scopePath('context', value.cut.sessionId, value.cut.branchId)], coverage: 'complete' }
-      };
-      if (!('status' in staged)) workingState = staged;
+      if (!('status' in staged)) sessionState = staged;
     }
     const invocation = execution.invocation;
     if (!invocation) throw new Error('Context operation requires an invocation.');
     const { runId, turnId, requestAttempt, toolBatchId, callIndex, toolAttempt } = invocation;
     const result = await options.context.schedule(
       contextTransitionRequestSchema.parse({
-        ...(value.preserveSelection ? { preserveSelection: true } : {}),
         toolInvocation: { runId, turnId, requestAttempt, toolBatchId, callIndex, toolAttempt },
         expectedCut: value.cut,
         expectedWindowId: value.expectedWindowId,
         expectedSourceRevision: value.cut.sourceRevision,
-        expectedWorkingStateRevisionId: value.origin.revisionId,
-        ...(workingState ? { workingState } : {}),
+        expectedSessionStateRevisionId: value.origin.revisionId,
+        ...(sessionState ? { sessionState } : {}),
         idempotencyKey: value.identity,
         reason: value.reason,
         selection: value.selection
@@ -187,10 +168,10 @@ export function contextToolDefinitions(options: {
           const active = inspection.activeSelection;
           const result = parseJsonObject({
             ...inspection,
+            excerpts: excerptInspection(inspection.window?.selection.excerpts ?? [], page.limit, Math.floor(page.maxBytes / 4)),
             activeSelection: active.status === 'available' ? active.manifest : active,
             window: inspection.window
-              ? { windowId: inspection.window.windowId, historyPosition: inspection.window.historyPosition,
-                  strategy: inspection.window.selection.strategy }
+              ? { windowId: inspection.window.windowId, historyPosition: inspection.window.historyPosition }
               : null
           });
           const bytes = Buffer.byteLength(inspectionPresentation(result));
@@ -207,23 +188,23 @@ export function contextToolDefinitions(options: {
       name: `${prefix}_transition`,
       implementationId: 'agent-core.context-transition.v1',
       description:
-        `${WORKING_STATE_GUIDANCE} Change the active context without summarizing history. Add or release source references; release applies to the complete exchange. Supply retain to replace optional history (an empty array releases it all). Active input and required exchanges remain protected. Optionally replace workingState in the same atomic transition. Fresh continuation explicitly ends native reasoning while keeping the session and selected originals. Use provider strategy only to request native compaction. No change requires no call. A successful scheduled receipt is pending: the runtime first completes this exchange and admits the actual next request before atomically publishing state and selection.`,
+        `${SESSION_STATE_GUIDANCE} Change the active context without summarizing history. Add or release source references; release applies to the complete exchange. Supply retain to replace optional history (an empty array releases it all). Active input and required exchanges remain protected. Optionally replace structured sessionState in the same atomic transition. recentFrom retains the active source suffix beginning at that exact reference, with complete exchanges. excerpts replaces retained exact text spans ({source,offset,bytes}, UTF-8 byte boundaries); excerpts are attributed historical evidence, not conversation replay, and cannot replace mandatory originals. Every transition starts fresh provider continuation while keeping the session and selected originals. No change requires no call. A successful scheduled receipt is pending: the runtime first completes this exchange and admits the actual next request before atomically publishing state and selection.`,
       schema: transition,
       outputSchema: z.json().transform((value) => parseJsonValue(value)),
       effectEnvelope: {
         accesses: [
           { mode: 'write', scope: 'context' },
-          { mode: 'write', scope: 'working_state' }
+          { mode: 'write', scope: 'session_state' }
         ],
-        lockScopes: ['context', 'working_state']
+        lockScopes: ['context', 'session_state']
       },
       canonicalizeInput: canonicalize,
 
       deriveEffects(value) {
         const contextScope = scopePath('context', value.cut.sessionId, value.cut.branchId);
-        const stateScope = scopePath('working_state', value.cut.sessionId, value.cut.branchId);
+        const stateScope = scopePath('session_state', value.cut.sessionId, value.cut.branchId);
         const scopes =
-          value.workingState === undefined ? [contextScope] : [contextScope, stateScope];
+          value.sessionState === undefined ? [contextScope] : [contextScope, stateScope];
         return {
           accesses: scopes.map((scope) => ({ mode: 'write' as const, scope })),
           lockScopes: scopes,
@@ -245,6 +226,20 @@ export function contextToolDefinitions(options: {
       }
     })
   ]);
+}
+
+/** A bounded, explicitly partial inventory; original spans remain in the committed selection. */
+function excerptInspection(excerpts: readonly HistorySourceExcerpt[], limit: number, maxBytes: number) {
+  const items: HistorySourceExcerpt[] = [];
+  let bytes = 0;
+  for (const excerpt of excerpts) {
+    const size = Buffer.byteLength(JSON.stringify(excerpt));
+    if (items.length >= limit || bytes + size > maxBytes) break;
+    items.push(excerpt);
+    bytes += size;
+  }
+  return { items, totalCount: excerpts.length, textBytes: excerpts.reduce((sum, excerpt) => sum + excerpt.bytes, 0),
+    coverage: items.length === excerpts.length ? 'complete' : 'partial' };
 }
 
 function inspectionPresentation(result: JsonObject): string {
@@ -276,8 +271,9 @@ function inspectionPresentation(result: JsonObject): string {
       }
     } : {}),
     selection: result.activeSelection,
+    excerpts: result.excerpts,
     committedWindow: result.window,
-    workingState: result.workingState,
+    sessionState: result.sessionState,
     protectedSources: result.protectedSources,
     pendingWork: result.pendingWork,
     legalTransitions: result.legalTransitions,

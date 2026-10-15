@@ -5,7 +5,7 @@ import type { HistoryReader } from '../history/reader.js';
 import type { HistorySourceCut, HistorySourceRef, HistorySourceMetadata } from '../history/contracts.js';
 
 /** Complete exchanges and native prefix dependencies form source-change units. */
-export function contextMetadataGroups(items: readonly HistorySourceMetadata[]): HistorySourceMetadata[][] {
+export function contextMetadataGroups(items: readonly HistorySourceMetadata[], fresh = false): HistorySourceMetadata[][] {
   const groups: HistorySourceMetadata[][] = [];
   const responses = new Map<string, HistorySourceMetadata[]>();
   for (const item of items) {
@@ -18,7 +18,7 @@ export function contextMetadataGroups(items: readonly HistorySourceMetadata[]): 
   }
   const retained: HistorySourceMetadata[][] = [];
   for (const group of groups) {
-    if (group.some(item => item.prefixBound && !item.contextRecovery)) retained.splice(0, retained.length, [...retained.flat(), ...group]);
+    if (!fresh && group.some(item => item.prefixBound && !item.contextRecovery)) retained.splice(0, retained.length, [...retained.flat(), ...group]);
     else retained.push(group);
   }
   return retained;

@@ -1,8 +1,9 @@
-import type { JsonObject } from '@agent-core/json';
-import type { HistorySourceCut, HistorySourceRef, HistorySourceMetadata } from '../history/contracts.js';
-import type { WorkingStateChange } from '../session/working-state.js';
+import type { HistorySourceCut, HistorySourceRef, HistorySourceExcerpt, HistorySourceMetadata } from '../history/contracts.js';
+import type { SessionStateChange } from '../session/session-state.js';
 
 export interface ContextSelection {
+  /** Exact historical text evidence, not conversational or native protocol replay. */
+  readonly excerpts?: readonly HistorySourceExcerpt[] | undefined;
   /** Explicit host/user retention across subsequent renewals. */
   readonly protected?: readonly HistorySourceRef[] | undefined;
   readonly continuity?:
@@ -15,8 +16,6 @@ export interface ContextSelection {
     | undefined;
 
   readonly retained: readonly HistorySourceRef[];
-  readonly strategy: 'sources' | 'provider';
-  readonly providerState?: JsonObject | undefined;
 }
 export interface ContextWindowRecord {
   readonly windowId: string;
@@ -27,10 +26,8 @@ export interface ContextWindowRecord {
   readonly createdAt: string;
 }
 export interface ContextTransitionRecord {
-  readonly preservedSelection?: true | undefined;
   readonly admission:
-    | { readonly status: 'admitted'; readonly compiledInputIdentity: string; readonly capabilityRevision: string }
-    | { readonly status: 'pending'; readonly reason: 'idle_source_selection' };
+    { readonly status: 'admitted'; readonly compiledInputIdentity: string; readonly capabilityRevision: string };
   readonly transitionId: string;
   readonly idempotencyKey: string;
   readonly previousWindowId: string | null;
@@ -38,12 +35,12 @@ export interface ContextTransitionRecord {
   readonly requestFingerprint: string;
   readonly selectionFingerprint: string;
   readonly requestedSourceRevision?: number | undefined;
-  readonly requestedWorkingStateRevisionId?: string | null | undefined;
+  readonly requestedSessionStateRevisionId?: string | null | undefined;
   readonly committedAt: string;
 }
 export interface ContextTransitionCommit {
-  readonly expectedWorkingStateRevisionId: string | null;
-  readonly workingState?: WorkingStateChange | undefined;
+  readonly expectedSessionStateRevisionId: string | null;
+  readonly sessionState?: SessionStateChange | undefined;
   readonly expectedLeafId: string | null;
   readonly expectedSourceRevision: number;
   readonly expectedWindowId: string | null;
@@ -51,11 +48,9 @@ export interface ContextTransitionCommit {
   readonly transition: ContextTransitionRecord;
 }
 export interface ContextTransitionRequest {
-  /** Preserve the captured sources and native continuity; no transform is requested. */
-  readonly preserveSelection?: true | undefined;
   readonly expectedCut?: HistorySourceCut | undefined;
-  readonly workingState?: WorkingStateChange | undefined;
-  readonly expectedWorkingStateRevisionId?: string | null | undefined;
+  readonly sessionState?: SessionStateChange | undefined;
+  readonly expectedSessionStateRevisionId?: string | null | undefined;
   readonly toolInvocation?:
     | Pick<
         import('@agent-core/tools').ToolInvocationContext,

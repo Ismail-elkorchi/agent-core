@@ -824,7 +824,7 @@ for (const [model, canDisable, input, cacheRead, output] of [
     assert.deepEqual(profile.pricing.rates, { input, cacheRead, cacheWrite: input * 1.25, output });
     assert.equal(profile.capabilities.protocol.asyncTools, true);
     assert.equal(profile.capabilities.protocol.steering, 'native');
-    assert.deepEqual(profile.capabilities.protocol.contextTransforms, ['responses.compact']);
+    assert.equal(profile.capabilities.protocol.contextReset, 'fresh_request');
     const compiled = await provider.compileRequest({
       model, messages: [{ role: 'user', content: 'Inspect' }], maxOutputTokens: 100,
       reasoning: { strategy: 'effort', effort: 'max' },

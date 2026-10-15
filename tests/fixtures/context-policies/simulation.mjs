@@ -1,4 +1,4 @@
-import { compileModelRequest, createProviderContextState } from '@agent-core/model';
+import { compileModelRequest } from '@agent-core/model';
 
 export const simulationProfile = Object.freeze({
   id: 'deterministic-memory-parser-v1',
@@ -23,7 +23,7 @@ export const simulationProfile = Object.freeze({
       continuation: 'replay',
       asyncTools: false,
       steering: 'next_request',
-      contextTransforms: ['simulation.compact'],
+      contextReset: 'fresh_request',
       toolChoice: ['auto'],
       counting: 'estimate'
     }
@@ -39,10 +39,8 @@ export class MemorySimulationProvider {
   id = 'simulation';
   implementationId = 'context-policies.simulation@1';
   calls = [];
-  transforms = [];
   lastTask;
   taskCalls = new Set();
-  admittedTransforms = new WeakSet();
   describe() {
     return {
       id: this.id,
@@ -65,41 +63,9 @@ export class MemorySimulationProvider {
   async completeCompiled(compiled) {
     return this.complete(compiled.logicalRequest);
   }
-  async compileContextTransform({ request }) {
-    const compiled = await compileModelRequest({
-      request,
-      profile: await this.describeModel(request.model),
-      body: { model: request.model, input: request.messages },
-      endpoint: 'simulation://local'
-    });
-    this.admittedTransforms.add(compiled);
-    return compiled;
-  }
-  async transformContextCompiled(transformId, compiled) {
-    if (!this.admittedTransforms.has(compiled))
-      throw new Error('Transform was not admitted by the fixture.');
-    compiled.logicalRequest.signal?.throwIfAborted();
-    this.transforms.push({ transformId, compiled });
-    const facts = requestTexts(compiled.logicalRequest).flatMap((text) =>
-      [...text.matchAll(/STATE\[\d+\]\s*\{[^\n]*?\}/gu)].map((match) => match[0])
-    );
-    const memory = [...new Set(facts)].join('\n');
-    const state = await createProviderContextState({
-      protocolRevision: 'simulation/2',
-      provider: this.id,
-      endpoint: 'simulation://local',
-      request: compiled.logicalRequest,
-      requestId: transformId,
-      kind: 'simulation.compaction',
-      data: { memory },
-      requiresExactPrefix: false,
-      tokenEstimate: Math.ceil(memory.length / 4)
-    });
-    return { transformId, state, input: [{ role: 'protocol', content: '', state }] };
-  }
   async complete(request) {
     this.calls.push(request);
-    if (request.messages.some(item => item.role === 'system' && item.content.includes('bounded context-management turn'))) {
+    if (request.messages.some(item => item.role === 'user' && item.content.includes('Prepare a fresh context for the same ongoing work'))) {
       const task = request.messages.findLast(item => item.role === 'user');
       const recovery = JSON.parse(task.content);
       const retain = (recovery.inventory.items ?? [])
@@ -108,7 +74,7 @@ export class MemorySimulationProvider {
       return {
         provider: this.id, model: request.model, content: '', terminationReason: 'tool_calls',
         toolCalls: [{ id: `recovery-${this.calls.length}`, type: 'function', name: 'context_transition',
-          input: { kind: 'json', value: { reason: 'Release unrelated sources to admit the original task; preserve user requirements.', strategy: 'sources', retain } } }]
+          input: { kind: 'json', value: { reason: 'Release unrelated sources to admit the original task; preserve user requirements.', retain } } }]
       };
     }
     const texts = requestTexts(request);
@@ -133,7 +99,6 @@ export class MemorySimulationProvider {
       toolCalls = call('context_inspect', {});
       content = '';
     } else if (lastUser.includes('REPORT:') && available('context_transition') && !used.has('context_transition')) {
-      const native = request.messages.some(item => item.role === 'system' && item.content.includes('Policy: provider-native'));
       const inspection = current.findLast(item => item.role === 'tool' && item.toolName === 'context_inspect');
       let selected = [];
       try { selected = inspection ? JSON.parse(inspection.content).selection?.items ?? [] : []; } catch {
@@ -142,7 +107,7 @@ export class MemorySimulationProvider {
       const retain = selected.filter(item => item.type === 'input' && /^(Background detail|Correction:|Explicit task replacement:)/u.test(item.description)).map(item => item.source);
       toolCalls = call('context_transition', {
         reason: 'Before answering, release unrelated material while preserving authoritative requirements through scoped retrieval.',
-        ...(native ? { strategy: 'provider' } : { strategy: 'sources', retain })
+        retain
       });
       content = '';
     } else if (
@@ -180,13 +145,12 @@ export class MemorySimulationProvider {
 }
 
 function requestTexts(request) {
-  // This fixture is a plumbing oracle: only user records, provider state, and scoped
+  // This fixture is a plumbing oracle: only user records and scoped
   // history search results are authoritative inputs. It does not measure injection resistance.
   const historyCalls = new Set(request.messages.flatMap(item =>
     (item.toolCalls ?? []).filter(call => call.name === 'history_search').map(call => call.id)));
   return request.messages.flatMap(item =>
-    item.role === 'protocol' ? strings(item.state.data.memory)
-      : item.role === 'user' || (item.role === 'tool' && historyCalls.has(item.toolCallId))
+    item.role === 'user' || (item.role === 'tool' && historyCalls.has(item.toolCallId))
         ? strings(item.content) : []);
 }
 
