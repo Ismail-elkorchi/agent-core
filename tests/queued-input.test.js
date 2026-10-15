@@ -20,13 +20,17 @@ const configuration = { provider: 'fixture', model: 'fixture' };
 for (const kind of ['memory', 'jsonl']) {
   test(`${kind}: queued input revisions and cancellation persist without executing a run`, async (t) => {
     const root = await mkdtemp(path.join(tmpdir(), 'queued-input-'));
-    t.after(() => rm(root, { recursive: true, force: true }));
+    let session;
+    t.after(async () => {
+      await session?.close();
+      await rm(root, { recursive: true, force: true });
+    });
     const repository =
       kind === 'memory'
         ? new InMemorySessionRepository()
         : new JsonlSessionRepository({ rootDir: root });
     const descriptor = await repository.create({ binding });
-    const session = new AgentSession({
+    session = new AgentSession({
       descriptor,
       expectedBinding: binding,
       repository,
