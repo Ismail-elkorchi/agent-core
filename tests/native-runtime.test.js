@@ -199,6 +199,15 @@ test(
     assert.equal(result.terminal.budget.completionTokens, 6);
     assert.equal(slowInvocations, 1);
     assert.equal(socket.sent.length, 3);
+    const audit = await Array.fromAsync(events.read('native-independent'));
+    const receipts = audit.filter(record => record.event.type === 'tool.call.received');
+    assert.deepEqual(receipts.map(record => record.event.callId), ['a', 'b']);
+    for (const receipt of receipts) {
+      const started = audit.find(record => record.event.type === 'tool.started' &&
+        record.event.callId === receipt.event.callId);
+      assert.ok(receipt.sequence < started.sequence, 'Accepted native calls precede effect start');
+      assert.deepEqual(receipt.event.toolCall, started.event.input);
+    }
     const state = (await new AgentRunCoordinator(events, artifacts).inspect('native-independent'))
       .state;
     assert.deepEqual(state.providerRequests, []);
@@ -559,6 +568,13 @@ for (const publication of ['normal', 'lost_receipt', 'rejected']) test(
       toolBoundary: { authorizationPolicyId: 'native-state', executionTargetId: 'native-state' },
       repositories: { events, artifacts, session: { repository: sessions, descriptor } }
     }).run({ task: 'Correct the understanding and finish.' }).result;
+    const audit = await Array.fromAsync(events.read(result.terminal.runId));
+    const receipts = audit.filter(record => record.event.type === 'tool.call.received');
+    const recordedCalls = (await sessions.loadReplayState(descriptor)).branch.filter(entry => entry.type === 'tool_call');
+    assert.ok(receipts.length > 0);
+    assert.deepEqual(recordedCalls.map(entry => entry.call), receipts.map(record => record.event.toolCall));
+    const sources = (await history.page({ limit: 1000 })).entries.filter(entry => entry.type === 'tool_call');
+    assert.deepEqual(sources.map(entry => entry.source.eventId), receipts.map(record => record.eventId));
     if (publication === 'rejected') {
       assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
       assert.equal((await context.sessionState()).revision, null);

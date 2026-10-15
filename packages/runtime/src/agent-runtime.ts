@@ -1240,6 +1240,42 @@ export class AgentRuntime {
     });
   }
 
+  /** Accepted calls are durable history even when prerequisites prevent execution. */
+  private async recordAcceptedToolCalls(
+    runtime: RunExecutionRuntime,
+    identity: AgentTurnIdentity,
+    toolBatchId: string,
+    calls: readonly ToolCall[]
+  ): Promise<void> {
+    for (const [callIndex, call] of calls.entries()) {
+      const received = {
+        type: 'tool.call.received' as const,
+        ...identity,
+        toolBatchId,
+        callIndex,
+        ...(call.id ? { callId: call.id } : {}),
+        toolCall: call
+      };
+      await runtime.append(received, toolCallReceivedKey(runtime.runId, received));
+      await runtime.emit(received);
+      if (this.options.repositories.session) {
+        await this.options.repositories.session.repository.appendToolCall(
+          this.options.repositories.session.descriptor,
+          {
+            runId: runtime.runId,
+            identity: {
+              ...identity,
+              toolBatchId,
+              callIndex,
+              ...(call.id ? { callId: call.id } : {})
+            },
+            call
+          }
+        );
+      }
+    }
+  }
+
   private async executeRun(runtime: RunExecutionRuntime): Promise<ExecutionDecision> {
     const providerPhase = currentProviderRequest(runtime.run.state());
     const failedAttempt =
@@ -1759,34 +1795,7 @@ export class AgentRuntime {
           toolCalls: toolCalls.map(modelToolCallFromToolCall),
           ...(response.output ? { output: response.output } : {})
         });
-        // Accepted calls are durable history even when prerequisites prevent execution.
-        for (const [callIndex, call] of toolCalls.entries()) {
-          const received = {
-            type: 'tool.call.received' as const,
-            ...activeTurnIdentity,
-            toolBatchId,
-            callIndex,
-            ...(call.id ? { callId: call.id } : {}),
-            toolCall: call
-          };
-          await runtime.append(received, toolCallReceivedKey(runtime.runId, received));
-          await runtime.emit(received);
-          if (this.options.repositories.session) {
-            await this.options.repositories.session.repository.appendToolCall(
-              this.options.repositories.session.descriptor,
-              {
-                runId: runtime.runId,
-                identity: {
-                  ...activeTurnIdentity,
-                  toolBatchId,
-                  callIndex,
-                  ...(call.id ? { callId: call.id } : {})
-                },
-                call
-              }
-            );
-          }
-        }
+        await this.recordAcceptedToolCalls(runtime, activeTurnIdentity, toolBatchId, toolCalls);
         const sourceRequest = providerWork(runtime.run.state(), activeTurnIdentity);
         if (sourceRequest.stage !== 'settled')
           throw new Error('Tool calls require a known provider settlement.');
@@ -2512,6 +2521,7 @@ export class AgentRuntime {
             const source = providerWork(runtime.run.state(), item.request.snapshot.record);
             if (source.stage !== 'settled')
               throw new Error('Native tool source is not durably settled.');
+            await this.recordAcceptedToolCalls(runtime, source.identity, item.request.toolBatchId, calls);
             const batch: AgentToolPhase = {
               kind: 'tools',
               identity: source.identity,
