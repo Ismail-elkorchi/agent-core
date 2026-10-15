@@ -83,6 +83,13 @@ export interface ToolExecutionInput {
     readonly repository: SessionRepository;
     readonly descriptor: SessionDescriptor;
   };
+  /** Stage completed ordinary batches; streaming native deliveries keep their adapter boundary. */
+  readonly stagePresentations?: (phase: AgentToolPhase) => boolean;
+  readonly selectPresentations?: (phase: AgentToolPhase, observations: readonly {
+    readonly callIndex: number;
+    readonly committed: CommittedToolObservation;
+    readonly published: boolean;
+  }[]) => Promise<readonly CommittedToolObservation[]>;
   readonly state: () => AgentRunState;
   readonly transitionTool: (
     procedure: AgentRunProcedure,
@@ -121,6 +128,7 @@ export class ToolCallExecutor {
   private readonly active = new Map<string, Promise<ToolCallCompletion>>();
   private readonly observations = new Map<string, CommittedToolObservation>();
   private readonly stepping = new Set<string>();
+  private readonly preparedPresentations = new Set<string>();
 
   constructor(private readonly input: ToolExecutionInput) {}
 
@@ -185,6 +193,34 @@ export class ToolCallExecutor {
         this.active.set(key, completion);
         return Object.freeze({ kind: 'started', completion });
       }
+      if ((call.stage === 'settled' || call.stage === 'recording') &&
+          this.input.stagePresentations?.(phase) && !this.preparedPresentations.has(phase.toolBatchId)) {
+        if (phase.callStates.some(item => !['settled', 'recording', 'recorded', 'resolved', 'cancelled'].includes(item.stage)))
+          return Object.freeze({ kind: 'blocked', reason: 'dependencies' });
+        const observations = [];
+        for (const [callIndex, state] of phase.callStates.entries()) {
+          if (state.stage !== 'settled' && state.stage !== 'recording' && state.stage !== 'recorded') continue;
+          const batchCall = requireCall(phase, callIndex);
+          const committed = this.observations.get(callKey({ toolBatchId: phase.toolBatchId, callIndex })) ??
+            committedFromState(this.input, phase, batchCall, state);
+          const identity = attemptIdentity(phase, callIndex, batchCall, state.toolAttempt);
+          const previous = await this.input.events.referenceByKey(this.input.runId, toolEventKey(this.input.runId, identity, 'observation'));
+          const event = previous ? (await this.input.events.readReference(previous)).event : undefined;
+          if (event && event.type !== 'observation.record.created') throw new Error('Invalid persisted observation selection.');
+          const withoutReference = { ...committed };
+          delete withoutReference.modelContentRef;
+          observations.push({ callIndex, published: !!event,
+            committed: event ? { ...withoutReference, modelContent: event.modelContent ?? [],
+              ...(event.modelContentRef ? { modelContentRef: event.modelContentRef } : {}) } : committed });
+        }
+        const selected = await this.input.selectPresentations?.(phase, observations) ?? observations.map(item => item.committed);
+        for (const [index, observation] of observations.entries()) {
+          const chosen = selected[index];
+          if (chosen?.id !== observation.committed.id) throw new Error('Tool presentation changed its observation identity.');
+          this.observations.set(callKey({ toolBatchId: phase.toolBatchId, callIndex: observation.callIndex }), chosen);
+        }
+        this.preparedPresentations.add(phase.toolBatchId);
+      }
       if (call.stage === 'settled') {
         await beginObservationRecording(this.input, phase, target.callIndex);
         return Object.freeze({ kind: 'advanced' });
@@ -198,6 +234,9 @@ export class ToolCallExecutor {
           this.observations.get(key)
         );
         this.observations.delete(key);
+        if (this.input.state().toolBatches.find(batch => batch.toolBatchId === phase.toolBatchId)?.callStates.every(item =>
+          item.stage === 'recorded' || item.stage === 'resolved' || item.stage === 'cancelled'))
+          this.preparedPresentations.delete(phase.toolBatchId);
         return Object.freeze({ kind: 'advanced' });
       }
       return Object.freeze({
@@ -222,6 +261,7 @@ export class ToolCallExecutor {
   async release(): Promise<void> {
     const plans = [...this.retainedPlans.values()];
     this.retainedPlans.clear();
+    this.preparedPresentations.clear();
     await Promise.all(plans.map((plan) => releaseToolCallPlan(plan)));
   }
 }
@@ -875,20 +915,20 @@ async function recordObservation(
   committed: CommittedToolObservation
 ): Promise<void> {
   const identity = attemptIdentity(phase, callIndex, call, state.toolAttempt);
+  const previous = await input.events.referenceByKey(input.runId, toolEventKey(input.runId, identity, 'observation'));
+  if (previous) {
+    const event = (await input.events.readReference(previous)).event;
+    if (event.type !== 'observation.record.created' || event.id !== committed.id || event.toolName !== call.name)
+      throw new Error('Published tool presentation has a different source identity.');
+    // Publication owns delivery even if recovery policy changed before restart.
+    const withoutReference = { ...committed };
+    delete withoutReference.modelContentRef;
+    committed = { ...withoutReference, modelContent: event.modelContent ?? [],
+      ...(event.modelContentRef ? { modelContentRef: event.modelContentRef } : {}) };
+  }
   try {
     const record = await input.observationStore.projectToolObservation(committed);
-    await input.session?.repository.appendObservation(input.session.descriptor, {
-      runId: input.runId,
-      identity,
-      toolName: call.name,
-      observation: sessionObservation(
-        state.settlement.observation,
-        record.modelContent,
-        record.original,
-        record.modelContentRef
-      )
-    });
-    await input.append(
+    if (!previous) await input.append(
       {
         type: 'observation.record.created',
         id: record.id,
@@ -908,7 +948,27 @@ async function recordObservation(
       },
       toolEventKey(input.runId, identity, 'observation')
     );
+    try {
+      await input.session?.repository.appendObservation(input.session.descriptor, {
+        runId: input.runId,
+        identity,
+        toolName: call.name,
+        observation: sessionObservation(
+          state.settlement.observation,
+          record.modelContent,
+          record.original,
+          record.modelContentRef
+        )
+      });
+    } catch (error) {
+      // The ledger already owns this exact selected presentation. A failed
+      // session mirror cannot reclassify the effect or replace that selection.
+      await input.append({ type: 'observation.recording.failed', id: committed.id, ...identity,
+        toolName: call.name, message: error instanceof Error ? error.message : String(error) },
+      toolEventKey(input.runId, identity, 'recording-failed'));
+    }
     input.modelWindow.recordToolResult({
+      observationId: record.id,
       turnIndex: phase.identity.turnIndex,
       toolName: record.toolName,
       ...(call.id ? { callId: call.id } : {}),
@@ -917,6 +977,9 @@ async function recordObservation(
       immediateImages: record.modelImages
     });
   } catch (error) {
+    // Once published, selection is immutable. Retry its session/window delivery;
+    // never replace it with a different fallback after a partial publication.
+    if (await input.events.referenceByKey(input.runId, toolEventKey(input.runId, identity, 'observation'))) throw error;
     const message = error instanceof Error ? error.message : String(error);
     await input.append(
       {
@@ -944,7 +1007,7 @@ function committedFromState(
   input: ToolExecutionInput,
   phase: AgentToolPhase,
   call: ToolCall,
-  state: Extract<AgentToolCallState, { readonly stage: 'recording' }>
+  state: Extract<AgentToolCallState, { readonly stage: 'settled' | 'recording' | 'recorded' }>
 ): CommittedToolObservation {
   const tool = state.plan
     ? sourceTools(input, phase, call).find(

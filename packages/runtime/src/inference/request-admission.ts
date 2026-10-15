@@ -101,6 +101,7 @@ export function requestCapacity(accounting: RequestAccounting, headroom?: number
   );
   return Object.freeze({
     inputTokens,
+    ...(inputCapacity === undefined ? {} : { inputCapacity }),
     ...(remainingTokens === undefined ? {} : { remainingTokens }),
     outputReservation: accounting.outputReservation,
     reasoningReservation,

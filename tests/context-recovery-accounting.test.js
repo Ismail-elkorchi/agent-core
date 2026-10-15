@@ -220,7 +220,15 @@ test('a provider capacity rejection of recovery preserves the application confli
 });
 
 test('successful distinct recovery boundaries exceed four requests while retaining the inference owner budget', async t => {
-  for (const maxInvocations of [22, 21]) await t.test(`owner allowance ${maxInvocations}`, async () => {
+  const baseline = await fixture();
+  baseline.application(() => baseline.reads() < 15 ? call('domain_read') : response('All fifteen sources processed.'));
+  const completed = await new AgentRuntime(baseline.options()).run({ runId: 'boundary-baseline', task: applicationTask }).result;
+  assert.equal(completed.terminal?.executionStatus, 'completed', JSON.stringify(completed));
+  const requiredInvocations = baseline.requests.length;
+  const requiredRecoveries = baseline.recoveryRequests().length;
+  assert.ok(requiredRecoveries > 4, 'This fixture must exercise more than one unchanged-boundary allowance.');
+  assert.equal(requiredInvocations, 16 + requiredRecoveries);
+  for (const maxInvocations of [requiredInvocations, requiredInvocations - 1]) await t.test(`owner allowance ${maxInvocations}`, async () => {
     const f = await fixture({ budget: { maxInvocations } });
     const boundaryReads = [];
     const readMetadata = f.events.readMetadataRange.bind(f.events);
@@ -229,16 +237,16 @@ test('successful distinct recovery boundaries exceed four requests while retaini
       if (query?.types?.includes('turn.snapshot.created')) boundaryReads.push({ query, scanned: page.scanned });
       return page;
     };
-    // Three bounded result presentations naturally fill each renewed window.
-    // Six successful boundaries must not reset this same owner's allowance.
+    // Derive the allowance from the same completed work, rather than assuming a
+    // tokenizer-specific renewal cadence. Every recovery still consumes its owner budget.
     f.application(() => f.reads() < 15 ? call('domain_read') : response('All fifteen sources processed.'));
     const runId = `many-boundaries-${maxInvocations}`;
     const result = await new AgentRuntime(f.options()).run({ runId, task: applicationTask }).result;
     const control = f.recoveryRequests();
-    assert.equal(control.length, 6, JSON.stringify(result));
-    assert.equal(new Set(control.map(request => controlTask(request).conflict.recoveryBoundary)).size, 6);
+    assert.equal(control.length, requiredRecoveries, JSON.stringify(result));
+    assert.equal(new Set(control.map(request => controlTask(request).conflict.recoveryBoundary)).size, requiredRecoveries);
     assert.ok(control.every(request => controlTask(request).attempt === 1));
-    assert.equal(boundaryReads.length, 6);
+    assert.equal(boundaryReads.length, requiredRecoveries);
     assert.ok(boundaryReads.every(read => typeof read.query.metadata.recoveryBoundary === 'string' && read.scanned === 0),
       'The indexed boundary allowance never scans prior successful recoveries.');
     assert.equal(f.reads(), 15);
@@ -247,8 +255,8 @@ test('successful distinct recovery boundaries exceed four requests while retaini
     assert.equal(owner.committed.invocations, maxInvocations);
     assert.equal(owner.settledUsage.invocations, maxInvocations);
     const log = await records(f, runId);
-    assert.equal(log.filter(event => event.type === 'tool.started' && event.toolName === 'context_transition').length, 6);
-    if (maxInvocations === 22) {
+    assert.equal(log.filter(event => event.type === 'tool.started' && event.toolName === 'context_transition').length, requiredRecoveries);
+    if (maxInvocations === requiredInvocations) {
       assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
       assert.equal(result.terminal.modelOutput.message, 'All fifteen sources processed.');
     } else {

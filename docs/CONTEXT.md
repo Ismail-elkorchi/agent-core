@@ -140,8 +140,22 @@ determines fit; failed preparation or admission never publishes a candidate.
 With `contextRenewal: { automatic: true }` and context tools available, bounded
 recovery uses the same inference service, owner budgets, authorization, and
 transition path. Continuity room is derived from compilation of the bounded
-control request. Recovery can inspect metadata, retrieve history, and propose a
-fresh source selection. It cannot execute domain effects or answer the user.
+control request and the retained ordinary generation reservation. Input-only and
+combined context limits are checked independently; separately accounted reasoning
+is included once. An explicit ordinary output reservation is never silently
+reduced. Estimated growth remains an estimate: newly accepted input, provider
+protocol material, and actual tool presentations still require admission.
+
+Completed ordinary tool batches settle their effects before selecting model
+presentations. The runtime admits the complete batch's checkpoint candidate,
+reducing derived presentations through artifact-backed excerpts when necessary.
+Original observations remain unchanged, and the published presentation is reused
+on retry. If required metadata, images, or preserved protocol obligations cannot
+fit, the run suspends with its settlements intact. Native in-inference tool
+delivery retains its provider protocol boundary and is not treated as a completed
+ordinary batch.
+
+Recovery can inspect metadata, retrieve history, and propose a fresh source selection. It cannot execute domain effects or answer the user.
 Its control requests and original results remain recorded. Repeated unchanged
 attempts and exhausted allowances produce durable, explicit suspension rather
 than resetting limits. Tool-result presentation bounds never alter authoritative

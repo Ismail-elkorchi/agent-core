@@ -566,7 +566,7 @@ export const agentEventCodec: EventCodec<AgentEvent> = {
         identity: `observation:${event.turnId}:${String(event.requestAttempt)}:${event.toolBatchId}:${String(event.callIndex)}:${String(event.toolAttempt)}`
       };
       case 'observation.record.created': return { ...exchange, toolName: event.toolName };
-      case 'turn.snapshot.created': return event.snapshot.contextRecovery ? { contextRecovery: 'true', ...(event.snapshot.contextRecovery.recoveryBoundary ? { recoveryBoundary: event.snapshot.contextRecovery.recoveryBoundary } : {}), exchangeId: `assistant:${event.snapshot.turnId}:${String(event.snapshot.requestAttempt)}:ended` } : {};
+      case 'turn.snapshot.created': return { exchangeId: `assistant:${event.snapshot.turnId}:${String(event.snapshot.requestAttempt)}:ended`, ...(event.snapshot.contextRecovery ? { contextRecovery: 'true', ...(event.snapshot.contextRecovery.recoveryBoundary ? { recoveryBoundary: event.snapshot.contextRecovery.recoveryBoundary } : {}) } : {}) };
       default: return {};
     }
   },

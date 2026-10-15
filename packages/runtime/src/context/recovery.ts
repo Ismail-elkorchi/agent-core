@@ -3,7 +3,7 @@ import { parseJsonObject } from '@agent-core/json';
 import { hashJson } from '@agent-core/persistence';
 import { createPromptMaterial } from '../inference/prompt-material.js';
 import type { ModelRequest } from '@agent-core/model';
-import type { RequestAdmission } from '../inference/request-admission.js';
+import { requestCapacity, type RequestAdmission } from '../inference/request-admission.js';
 import type { PromptToolSummary } from '../inference/prompt-material.js';
 
 /** Control presentation bounds and the durable unchanged-boundary request allowance. */
@@ -74,18 +74,22 @@ export async function assembleContextControlRequest(
 
 }
 
-/** Total compiled footprint, including independent reasoning reservation. */
-export function contextControlHeadroom(compiled: CompiledModelRequest): number {
-  return requestAccountingInputTokens(compiled.accounting) + compiled.accounting.outputReservation +
-    (compiled.accounting.pricingSemantics.reasoningIncludedInOutput === false
-      ? compiled.accounting.reasoningReservation : 0);
-}
-
-/** Leave room after an ordinary response for the full checkpoint's additional input and output. */
+/**
+ * Reserve the next checkpoint after the ordinary generation is retained as input.
+ * Input-only limits do not release the ordinary output reservation: compare each
+ * compiled request's actual input capacity, not just their total footprints.
+ * Tool observations and newly accepted input still need their own admission.
+ */
 export function contextControlReserve(original: CompiledModelRequest, checkpoint: CompiledModelRequest): number {
-  const checkpointOutput = checkpoint.accounting.outputReservation +
-    (checkpoint.accounting.pricingSemantics.reasoningIncludedInOutput === false ? checkpoint.accounting.reasoningReservation : 0);
-  return Math.max(0, contextControlHeadroom(checkpoint) - contextControlHeadroom(original) + checkpointOutput);
+  const ordinaryCapacity = requestCapacity(original.accounting).inputCapacity;
+  const checkpointCapacity = requestCapacity(checkpoint.accounting).inputCapacity;
+  if (ordinaryCapacity === undefined || checkpointCapacity === undefined) return 0;
+  const output = original.accounting.outputReservation +
+    (original.accounting.pricingSemantics.reasoningIncludedInOutput === false ? original.accounting.reasoningReservation : 0);
+  // A retained generation becomes input, including the input estimator's margin.
+  const retainedOutput = Math.ceil(output * (1 + checkpoint.accounting.uncertainty.headroomRatio));
+  const inputDelta = requestAccountingInputTokens(checkpoint.accounting) - requestAccountingInputTokens(original.accounting);
+  return Math.max(0, ordinaryCapacity - checkpointCapacity + inputDelta + retainedOutput);
 }
 
 /** A bounded presentation retains explicit byte coverage and never changes its source. */

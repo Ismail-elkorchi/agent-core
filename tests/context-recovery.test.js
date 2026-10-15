@@ -2,11 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
 import { conservativeProtocolCapabilities, compileModelRequest } from '@agent-core/model';
-import { defineTool, ToolInputError } from '@agent-core/tools';
+import { defineTool, ToolInputError, serializeToolModelContent } from '@agent-core/tools';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import {
   AgentRuntime, ContextService, HistoryReader, InMemorySessionRepository,
-  InMemoryInferenceRepository, InferenceService, agentEventCodec, createHistoryTools
+  InMemoryInferenceRepository, InferenceService, agentEventCodec, createHistoryTools, resolveToolObservation, resolveToolModelContent
 } from '@agent-core/runtime';
 
 const marker = 'Prepare a fresh context for the same ongoing work';
@@ -15,10 +15,10 @@ const call = (name, value = {}) => ({ ...response(''), terminationReason: 'tool_
   toolCalls: [{ id: `call-${crypto.randomUUID()}`, type: 'function', name, input: { kind: 'json', value } }] });
 const select = () => call('context_transition', { reason: 'Release old optional material; preserve active task.', retain: [] });
 
-async function fixture({ allowedRisks = ['read', 'write'], budget, sourceBytes = 24000, sourceBound = 100000, targetCapacity = 19400 } = {}) {
+async function fixture({ allowedRisks = ['read', 'write'], budget, sourceBytes = 24000, sourceBound = 100000, targetCapacity = 19400,
+  events = new InMemoryEventRepository(agentEventCodec), toolOutput = () => 'written' } = {}) {
   const sessions = new InMemorySessionRepository();
   const descriptor = await sessions.create({ binding: { schemaId: 'recovery-tests', schemaVersion: 1, subject: {} } });
-  const events = new InMemoryEventRepository(agentEventCodec);
   const artifacts = new InMemoryArtifactRepository();
   const history = new HistoryReader({ repository: sessions, session: descriptor, events, artifacts });
   const inferenceRepository = new InMemoryInferenceRepository();
@@ -46,7 +46,7 @@ async function fixture({ allowedRisks = ['read', 'write'], budget, sourceBytes =
     schema: z.strictObject({}), outputSchema: z.string(), canonicalizeInput: input => input,
     effectEnvelope: { accesses: [{ mode: 'write', scope: 'domain' }], lockScopes: ['domain'] },
     deriveEffects: () => ({ accesses: [{ mode: 'write', scope: 'domain' }], lockScopes: ['domain'], recovery: { kind: 'unknown' } }),
-    invoke: async () => { effects++; return { kind: 'result', output: 'written', summary: 'Written', scope: { resources: ['domain'], coverage: 'complete' } }; }
+    invoke: async () => { effects++; return { kind: 'result', output: toolOutput(effects), summary: 'Written', scope: { resources: ['domain'], coverage: 'complete' } }; }
   });
   const options = maxSourceBytes => {
     const context = new ContextService({ repository: sessions, session: descriptor, history, artifacts,
@@ -377,7 +377,7 @@ test('a cheaper compiled checkpoint does not invent excessive continuity pressur
   assert.equal(current.capacity.pressure, 'normal');
 });
 
-test('a short request with a large ordinary output reservation does not trigger needless renewal', async () => {
+test('a short request still requires room to retain its large ordinary generation', async () => {
   const f = await fixture({ sourceBytes: 64, sourceBound: 100000, targetCapacity: 32768 });
   const describe = f.provider.describeModel;
   f.provider.describeModel = async () => {
@@ -386,12 +386,15 @@ test('a short request with a large ordinary output reservation does not trigger 
   };
   const options = { ...f.options(), maxOutputTokens: 16384 };
   const result = await new AgentRuntime(options).run({ runId: 'large-output', task: 'Explain this small example.' }).result;
-  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
-  assert.equal(f.recoveryRequests().length, 0);
-  assert.equal(f.requests.at(-1).maxOutputTokens, 16384);
+  assert.equal(result.state, 'suspended', JSON.stringify(result));
+  assert.equal(result.reason, 'context_admission');
+  assert.ok(f.recoveryRequests().length > 0);
+  const resumed = await new AgentRuntime({ ...options, maxOutputTokens: 8192 }).resume('large-output').result;
+  assert.equal(resumed.terminal?.executionStatus, 'completed', JSON.stringify(resumed));
+  assert.equal(f.requests.at(-1).maxOutputTokens, 8192);
 });
 
-test('ordinary turns compile one current control probe without scanning durable recovery attempts', async t => {
+test('ordinary turns and settled tool batches compile control probes without scanning durable recovery attempts', async t => {
   const { compileModelRequest } = await import('@agent-core/model');
   const f = await fixture({ sourceBytes: 64, sourceBound: 100000, targetCapacity: 64000 });
   const options = f.options();
@@ -420,7 +423,8 @@ test('ordinary turns compile one current control probe without scanning durable 
   });
   const result = await new AgentRuntime(options).run({ runId: 'ordinary-probe-work', task: 'Complete the ordinary work.' }).result;
   assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
-  assert.deepEqual(counts, { ordinaryCompilations: 3, controlCompilations: 3, recoveryQueries: 0, boundedInspections: 3, unpagedInspections: 0 });
+  // Three inference candidates plus two completed batches each check their exact successor.
+  assert.deepEqual(counts, { ordinaryCompilations: 5, controlCompilations: 5, recoveryQueries: 0, boundedInspections: 5, unpagedInspections: 0 });
   t.diagnostic(JSON.stringify({ measurement: 'three ordinary turns', counts }));
 });
 
@@ -488,3 +492,240 @@ test('oversized steering cannot be silently replaced by its bounded preview', as
   assert.equal(f.recoveryRequests().length, 0);
   assert.equal((await records(f, 'recent-steering')).filter(event => event.type === 'input.steering.accepted').length, 15);
 });
+
+
+for (const reasoningAccounting of ['included_output', 'separate']) {
+  for (const inputOnly of [false, true]) {
+    test(`renewal precedes retained ordinary output larger than checkpoint output (${reasoningAccounting}, ${inputOnly ? 'input maximum' : 'context maximum'})`, async () => {
+      const f = await fixture({ sourceBytes: 64, targetCapacity: inputOnly ? 65536 : 32768 });
+      f.requests.length = 0;
+      const describe = f.provider.describeModel;
+      f.provider.describeModel = async () => {
+        const profile = await describe();
+        return { ...profile,
+          supportedParameters: [...profile.supportedParameters, 'reasoning'],
+          capabilities: { ...profile.capabilities,
+            reasoning: { strategies: ['budget'], canDisable: false, separateOutput: true },
+            protocol: { ...profile.capabilities.protocol, reasoningAccounting } },
+          limits: { ...profile.limits, outputTokens: 16384, ...(inputOnly ? { maxInputTokens: 26000 } : {}) } };
+      };
+      const retained = 'RETAINED_OUTPUT ' + 'x'.repeat(48000);
+      const compilations = [];
+      f.provider.compileRequest = async request => {
+        const checkpoint = request.messages.some(item => item.content.includes(marker));
+        const oldHistory = request.messages.some(item => item.content.startsWith('Old optional evidence:'));
+        const hasRetained = request.messages.some(item => item.content.includes('RETAINED_OUTPUT'));
+        // Exact provider counts isolate the next-turn output growth from heuristic text estimates.
+        const input = (oldHistory ? (reasoningAccounting === 'separate' ? 13000 : 15000) : 1000) +
+          (checkpoint ? 1000 : 0) + (hasRetained ? 12000 : 0);
+        const { signal: _signal, ...body } = request;
+        const compiled = await compileModelRequest({ request, body, profile: await f.provider.describeModel(),
+          endpoint: 'fixture://retained-generation', providerInputTokens: input });
+        compilations.push({ checkpoint, oldHistory, hasRetained, compiled });
+        return compiled;
+      };
+      let ordinary = 0;
+      let firstPressure;
+      f.provider.complete = async request => {
+        f.requests.push(request);
+        if (request.messages.some(item => item.content.includes(marker))) {
+          firstPressure ??= (await options.context.inspect()).capacity;
+          return select();
+        }
+        assert.equal(request.maxOutputTokens, 16384, 'Core must preserve the explicit ordinary output reservation.');
+        assert.ok(!request.messages.some(item => item.content.startsWith('Old optional evidence:')),
+          'Risky ordinary generation must wait for the first renewal.');
+        return ++ordinary === 1 ? { ...call('domain_write'), content: retained } : response('Continued after renewal.');
+      };
+      const options = { ...f.options(), maxOutputTokens: 16384, reasoning: { strategy: 'budget', maxTokens: 1024 } };
+      const result = await new AgentRuntime(options).run({ runId: 'retained-generation', task: 'Continue work after the tool result.' }).result;
+      assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+      assert.equal(result.terminal.modelOutput.message, 'Continued after renewal.');
+      assert.equal(ordinary, 2);
+      assert.equal(f.effects(), 1);
+      assert.ok(f.requests[0].messages.some(item => item.content.includes(marker)));
+      assert.ok(f.recoveryRequests().length >= 1);
+      const oldCandidate = compilations.find(item => item.oldHistory && !item.checkpoint).compiled.accounting;
+      const checkpoint = compilations.find(item => item.oldHistory && item.checkpoint).compiled.accounting;
+      assert.equal(oldCandidate.outputReservation, 16384);
+      assert.equal(checkpoint.outputReservation, 8192);
+      assert.equal(oldCandidate.reasoningReservation, 1024);
+      assert.equal(firstPressure.continuityHeadroomTokens,
+        (inputOnly ? 17384 : 9192) + (reasoningAccounting === 'separate' ? 1024 : 0),
+        'Independent input limits cannot borrow released output capacity; included reasoning is not double counted.');
+      assert.equal(oldCandidate.pricingSemantics.reasoningIncludedInOutput, reasoningAccounting === 'included_output');
+      assert.ok(compilations.some(item => item.hasRetained), 'The complete ordinary generation participates in successor accounting.');
+      const replay = await f.sessions.loadReplayState(f.descriptor);
+      assert.ok(replay.branch.some(item => item.type === 'assistant' && item.content === retained),
+        'Renewal cannot rewrite the original assistant output.');
+      const restarted = await new AgentRuntime(options).resume('retained-generation').result;
+      assert.equal(restarted.terminal?.executionStatus, 'completed');
+      assert.equal(ordinary, 2, 'Restart cannot repeat already completed work.');
+      assert.equal(f.effects(), 1);
+    });
+  }
+}
+
+
+for (const mode of ['ordinary', 'restart', 'restart without automatic renewal']) {
+  const interruptPublication = mode !== 'ordinary';
+  const disableAutomaticOnResume = mode === 'restart without automatic renewal';
+  const batchSize = disableAutomaticOnResume ? 1 : 10;
+  const capacity = disableAutomaticOnResume ? 4000 : 15000;
+  test(`an oversized ordinary tool batch stages bounded presentations with exact durable originals (${mode})`, async () => {
+    class PublicationEvents extends InMemoryEventRepository {
+      stopped = false;
+      interrupted = false;
+      async appendConditional(runId, event, options) {
+        if (this.stopped) throw new Error('simulated stop during staged presentation publication');
+        const receipt = await super.appendConditional(runId, event, options);
+        if (interruptPublication && !this.interrupted && event.type === 'observation.record.created' &&
+            event.toolName === 'domain_write') {
+          this.interrupted = this.stopped = true;
+          throw new Error('simulated stop during staged presentation publication');
+        }
+        return receipt;
+      }
+    }
+    const events = new PublicationEvents(agentEventCodec);
+    const callIndexes = Array.from({ length: batchSize }, (_, index) => index + 1);
+    const originals = callIndexes.map(index => `BATCH_ORIGINAL_${index}: ` + '日本語🦉'.repeat(800));
+    const f = await fixture({ sourceBytes: 64, sourceBound: 1000000, targetCapacity: capacity, events,
+      toolOutput: index => originals[index - 1] });
+    f.requests.length = 0;
+    const compilations = [];
+    f.provider.compileRequest = async request => {
+      const checkpoint = request.messages.some(item => item.content.includes(marker));
+      const resultBytes = request.messages.filter(item => item.role === 'tool')
+        .reduce((sum, item) => sum + Buffer.byteLength(item.content), 0);
+      const { signal: _signal, ...body } = request;
+      const compiled = await compileModelRequest({ request, body, profile: await f.provider.describeModel(),
+        endpoint: 'fixture://staged-tool-batch', providerInputTokens: 1000 + Math.ceil(resultBytes / 4) + (checkpoint ? 1000 : 0) });
+      compilations.push({ checkpoint, resultBytes, compiled });
+      return compiled;
+    };
+    let ordinary = 0;
+    f.provider.complete = async request => {
+      f.requests.push(request);
+      if (request.messages.some(item => item.content.includes(marker))) return select();
+      if (++ordinary === 1) return { ...call('domain_write'), toolCalls: callIndexes.map(index => ({
+        id: `batch-call-${index}`, type: 'function', name: 'domain_write', input: { kind: 'json', value: {} }
+      })) };
+      return response('All exact originals processed.');
+    };
+    const options = f.options();
+    const handle = new AgentRuntime(options).run({ runId: 'staged-batch', task: 'Process the complete sources.' });
+    let result;
+    let publishedBeforeRestart = [];
+    if (interruptPublication) {
+      await assert.rejects(handle.result, /simulated stop|unresolved started provider effect/);
+      assert.equal(events.stopped, true);
+      publishedBeforeRestart = (await records(f, 'staged-batch')).filter(event =>
+        event.type === 'observation.record.created' && event.toolName === 'domain_write');
+      assert.equal(publishedBeforeRestart.length, 1);
+      events.stopped = false;
+      result = await new AgentRuntime({ ...f.options(),
+        ...(disableAutomaticOnResume ? { contextRenewal: { automatic: false } } : {})
+      }).resume('staged-batch').result;
+    } else result = await handle.result;
+    assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+    assert.equal(f.effects(), batchSize, 'Settled effects must never repeat to repair presentation publication.');
+    const log = await records(f, 'staged-batch');
+    const ends = log.filter(event => event.type === 'tool.ended' && event.toolName === 'domain_write');
+    assert.equal(ends.length, batchSize);
+    for (let index = 0; index < batchSize; index++) {
+      const original = await resolveToolObservation(ends[index].observation, f.artifacts);
+      assert.equal(original.output, originals[index]);
+      assert.equal(original.scope.coverage, 'complete');
+    }
+    const presentations = log.filter(event => event.type === 'observation.record.created' && event.toolName === 'domain_write');
+    assert.equal(presentations.length, batchSize);
+    if (interruptPublication) assert.deepEqual(presentations[0], publishedBeforeRestart[0]);
+    const replay = await f.sessions.loadReplayState(f.descriptor);
+    const replayed = replay.branch.filter(item => item.type === 'observation' && item.toolName === 'domain_write');
+    assert.equal(replayed.length, batchSize);
+    for (const record of presentations) {
+      const content = await resolveToolModelContent(record, f.artifacts);
+      const text = content.filter(part => part.type === 'text').map(part => part.text).join('\n');
+      assert.match(text, /Presentation coverage: partial/);
+      assert.match(text, /Original result coverage: complete/);
+      const entry = replayed.find(item => item.callId === record.callId);
+      assert.ok(entry);
+      assert.deepEqual(await resolveToolModelContent(entry, f.artifacts), content,
+        'Session replay uses the exact immutable selected event presentation.');
+      const deliveries = f.requests.flatMap(request => request.messages.filter(item =>
+        item.role === 'tool' && item.toolCallId === record.callId));
+      assert.ok(deliveries.length > 0);
+      assert.ok(deliveries.every(item => item.content === serializeToolModelContent(content)),
+        'Every dispatched successor uses the published selection, even when automatic renewal is disabled on resume.');
+      const full = content.find(part => part.type === 'artifact');
+      assert.ok(full, 'Full selected presentation remains retrievable.');
+      assert.ok(JSON.parse(new TextDecoder().decode(await f.artifacts.readVerified(full.artifact))).length > 0);
+    }
+    assert.ok(compilations.some(item => item.checkpoint && 2000 + Math.ceil(item.resultBytes / 4) + 512 > capacity),
+      'Admission checks the combined batch before publishing bounded views.');
+    assert.ok(f.requests.every(request => request.messages.filter(item => item.role === 'tool')
+      .reduce((sum, item) => sum + Buffer.byteLength(item.content), 0) < (capacity - 1512) * 4));
+    const delivered = f.requests.flatMap(request => request.messages.filter(item => item.role === 'tool'));
+    assert.ok(delivered.length >= batchSize, 'A fitting checkpoint or ordinary successor receives every tool outcome.');
+    const before = f.requests.length;
+    assert.equal((await new AgentRuntime(f.options()).resume('staged-batch').result).terminal?.executionStatus, 'completed');
+    assert.equal(f.requests.length, before);
+    assert.equal(f.effects(), batchSize);
+  });
+}
+
+for (const blocker of ['presentation storage', 'minimum protocol metadata']) {
+  test(`an unpresentable settled batch suspends without losing or repeating effects: ${blocker}`, async () => {
+    const original = 'EXACT_UNPRESENTABLE_SOURCE ' + 'x'.repeat(12000);
+    const f = await fixture({ sourceBytes: 64, sourceBound: 1000000, targetCapacity: 15000,
+      toolOutput: () => original });
+    f.requests.length = 0;
+    const store = f.artifacts.store.bind(f.artifacts);
+    let blockedStores = 0;
+    if (blocker === 'presentation storage') f.artifacts.store = async request => {
+      // Initial per-result preservation succeeds; fail only preservation of an
+      // already bounded presentation when the complete batch needs a smaller view.
+      if (request.label === 'domain_write-full-model-content' &&
+          new TextDecoder().decode(request.content).includes('Presentation coverage: partial')) {
+        blockedStores++;
+        throw new Error('Presentation preservation unavailable.');
+      }
+      return store(request);
+    };
+    f.provider.compileRequest = async request => {
+      const checkpoint = request.messages.some(item => item.content.includes(marker));
+      const results = request.messages.filter(item => item.role === 'tool');
+      const bytes = results.reduce((sum, item) => sum + Buffer.byteLength(item.content), 0);
+      const { signal: _signal, ...body } = request;
+      return compileModelRequest({ request, body, profile: await f.provider.describeModel(),
+        endpoint: 'fixture://unpresentable-tool-batch',
+        providerInputTokens: 1000 + Math.ceil(bytes / 4) + (checkpoint ? 1000 : 0) +
+          (blocker === 'minimum protocol metadata' && results.length ? 14000 : 0) });
+    };
+    f.provider.complete = async request => {
+      f.requests.push(request);
+      assert.equal(f.requests.length, 1, 'No oversized successor may dispatch.');
+      return { ...call('domain_write'), toolCalls: Array.from({ length: 10 }, (_, index) => ({
+        id: `blocked-call-${index}`, type: 'function', name: 'domain_write', input: { kind: 'json', value: {} }
+      })) };
+    };
+    const first = await new AgentRuntime(f.options()).run({ runId: 'unpresentable-batch', task: 'Process ten originals.' }).result;
+    assert.equal(first.state, 'suspended', JSON.stringify(first));
+    assert.equal(first.reason, 'context_admission');
+    assert.equal(first.contextAdmission.recovery, 'request_unavailable');
+    assert.equal(f.effects(), 10);
+    if (blocker === 'presentation storage') assert.ok(blockedStores > 0);
+    const log = await records(f, 'unpresentable-batch');
+    const settled = log.filter(event => event.type === 'tool.ended' && event.toolName === 'domain_write');
+    assert.equal(settled.length, 10);
+    for (const event of settled) assert.equal((await resolveToolObservation(event.observation, f.artifacts)).output, original);
+    assert.equal(log.filter(event => event.type === 'observation.record.created' && event.toolName === 'domain_write').length, 0,
+      'An unadmitted batch must not publish shortened presentations.');
+    const resumed = await new AgentRuntime(f.options()).resume('unpresentable-batch').result;
+    assert.equal(resumed.state, 'suspended', JSON.stringify(resumed));
+    assert.equal(resumed.reason, 'context_admission');
+    assert.equal(f.effects(), 10);
+    assert.equal(f.requests.length, 1);
+  });
+}

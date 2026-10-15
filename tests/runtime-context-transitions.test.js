@@ -436,7 +436,7 @@ test(
   }
 );
 
-test('large output reservations do not trigger renewal of a short conversation', async () => {
+test('a short conversation cannot waive retained-generation checkpoint capacity', async () => {
   const state = await fixture();
   await new AgentRuntime(state.options).run({ task: 'Original requirements.' }).result;
   const provider = {
@@ -446,18 +446,27 @@ test('large output reservations do not trigger renewal of a short conversation',
       limits: { contextTokens: 32768, outputTokens: 16384 }
     })
   };
+  const inferenceService = new InferenceService({ provider, artifacts: state.options.repositories.artifacts,
+    repository: new InMemoryInferenceRepository() });
   const result = await new AgentRuntime({
     ...state.options,
     provider,
+    inferenceService,
     maxOutputTokens: 16384,
     contextRenewal: { automatic: true }
   }).run({ task: 'Continue.' }).result;
-  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.equal(result.state, 'suspended', JSON.stringify(result));
+  assert.equal(result.reason, 'context_admission');
+  assert.equal(result.contextAdmission.recovery, 'unsupported_action');
   assert.equal(state.requests.length, 2);
   assert.ok(
     state.requests[1].messages.some((message) => message.content === 'Original requirements.')
   );
   assert.equal((await state.context.inspect()).window, null);
+  const resumed = await new AgentRuntime({ ...state.options, provider, inferenceService, maxOutputTokens: 8192,
+    contextRenewal: { automatic: true } }).resume(result.runId).result;
+  assert.equal(resumed.terminal?.executionStatus, 'completed', JSON.stringify(resumed));
+  assert.ok(state.requests.at(-1).messages.some(message => message.content === 'Original requirements.'));
 });
 
 test('a changed admitted request resumes a definitively rejected provider request without unresolved-outcome recovery', async () => {

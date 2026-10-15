@@ -59,6 +59,7 @@ export interface RecordModelOutputInput {
 }
 
 export interface RecordToolResultInput {
+  readonly observationId?: string;
   turnIndex: number;
   toolName: string;
   toolCallType: 'function' | 'custom';
@@ -146,9 +147,17 @@ export class ModelWindow {
   }
 
   recordToolResult(input: RecordToolResultInput): void {
+    if (input.observationId) {
+      const previous = this.activeItems.find(item => item.id === input.observationId);
+      if (previous) {
+        if (previous.kind !== 'tool_result' || canonicalJsonString(previous.immediateMessage) !== canonicalJsonString(toolResultMessage(input)))
+          throw new Error('A recorded observation presentation cannot change during replay.');
+        return;
+      }
+    }
     const item: ActiveToolResultItem = {
       kind: 'tool_result',
-      id: `hist_${randomUUID()}`,
+      id: input.observationId ?? `hist_${randomUUID()}`,
       turnIndex: input.turnIndex,
       toolName: input.toolName,
       toolCallType: input.toolCallType,

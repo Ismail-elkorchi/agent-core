@@ -204,6 +204,7 @@ export async function rebuildModelWindowFromRepositories(input: {
       ) {
         const modelContent = await resolveToolModelContent(event, input.artifacts);
         modelWindow.recordToolResult({
+          observationId: event.id,
           turnIndex: event.turnIndex,
           toolName: event.toolName,
           toolCallType: event.toolCallType,

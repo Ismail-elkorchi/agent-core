@@ -1,5 +1,5 @@
 import { textRange } from '../history/reader.js';
-import { storedToolObservation, type StoredToolObservation } from './observation-source.js';
+import { resolveToolModelContent, storedToolObservation, type StoredToolObservation } from './observation-source.js';
 import { randomUUID } from 'node:crypto';
 import {
   redactJson,
@@ -50,6 +50,7 @@ export interface ToolObservationRecord extends CommittedToolObservation {
 /** Original storage and delivered content have independent, explicit boundaries. */
 export class ObservationStore {
   private readonly artifacts: ArtifactRepository | undefined;
+  private readonly resizedPresentationArtifacts = new WeakMap<CommittedToolObservation, PublicArtifactRef>();
   private readonly maxPresentationBytes: number | undefined;
   constructor(options: {
     readonly artifacts?: ArtifactRepository;
@@ -161,27 +162,12 @@ export class ObservationStore {
     if (this.maxPresentationBytes !== undefined &&
         Buffer.byteLength(serializeToolModelContent(modelContent)) > this.maxPresentationBytes) {
       try {
-        if (!this.artifacts) throw new Error('Bounded presentation requires original artifact storage.');
-        const fullPresentation = await this.artifacts.store({
-          label: `${input.call.name}-full-model-content`,
-          content: new TextEncoder().encode(JSON.stringify(selectedContent)),
-          mediaType: 'application/json',
-          description: 'Complete redacted selected presentation before the explicit delivery excerpt.'
-        });
-        const retained: ToolContent[] = [
-          ...modelContent.filter(part => part.type === 'image'),
-          { type: 'artifact', artifact: fullPresentation }
-        ];
-        const notice = `${serializeToolModelContent(toolModelContentFacts(durableObservation, {
-          coverage: 'partial', causes: [...presentationCauses, 'presentation_limit']
-        }))}\nFull selected text and artifact references are preserved in the attached presentation artifact.${durableStorageDegraded ? ' Original observation storage is unavailable; the presentation artifact does not replace the original structured observation.' : ''}`;
-        const suffix: readonly ToolContent[] = [{ type: 'text', text: notice }, ...retained];
-        // Reserve the entire authoritative suffix before excerpting only selected content.
-        const reserved = Buffer.byteLength(serializeToolModelContent(suffix)) + 2;
-        if (reserved > this.maxPresentationBytes)
-          throw new Error('Presentation metadata alone exceeds the delivery allowance.');
-        const excerpt = textRange(serializeToolModelContent(selectedContent), 0, this.maxPresentationBytes - reserved).text;
-        modelContent = decodeToolContent([{ type: 'text', text: excerpt }, ...suffix]);
+        modelContent = (await this.boundedPresentation({
+          toolName: input.call.name, selected: selectedContent, observation: durableObservation,
+          maxBytes: this.maxPresentationBytes, causes: presentationCauses,
+          requireByteLimit: true,
+          notice: `Full selected text and artifact references are preserved in the attached presentation artifact.${durableStorageDegraded ? ' Original observation storage is unavailable; the presentation artifact does not replace the original structured observation.' : ''}`
+        })).modelContent;
       } catch (error) {
         // Failure to preserve the selected original is not permission to discard it.
         // Keep its full delivery; context admission can then report the real blocker.
@@ -250,10 +236,72 @@ export class ObservationStore {
       createdAt: new Date().toISOString()
     });
   }
+  /** One artifact-backed presentation path for initial delivery and capacity-driven resizing. */
+  private async boundedPresentation(input: {
+    readonly toolName: string;
+    readonly selected: readonly ToolContent[];
+    readonly observation: ToolObservation;
+    readonly maxBytes: number;
+    readonly causes?: readonly string[];
+    readonly requireByteLimit?: boolean;
+    readonly artifact?: PublicArtifactRef;
+    readonly notice?: string;
+  }): Promise<{ readonly modelContent: readonly ToolContent[]; readonly artifact: PublicArtifactRef }> {
+    if (!this.artifacts) throw new Error('Bounded presentation requires original artifact storage.');
+    const artifact = input.artifact ?? await this.artifacts.store({
+      label: `${input.toolName}-full-model-content`,
+      content: new TextEncoder().encode(JSON.stringify(input.selected)),
+      mediaType: 'application/json',
+      description: 'Complete redacted selected presentation before the explicit delivery excerpt.'
+    });
+    const notice = `${serializeToolModelContent(toolModelContentFacts(input.observation, {
+      coverage: 'partial', causes: [...input.causes ?? [], 'presentation_limit']
+    }))}\n${input.notice ?? 'Full selected content remains available in the attached presentation artifact.'}`;
+    const suffix: readonly ToolContent[] = [
+      { type: 'text', text: notice },
+      ...input.selected.filter(part => part.type === 'image'),
+      { type: 'artifact', artifact }
+    ];
+    const reserved = Buffer.byteLength(serializeToolModelContent(suffix)) + 2;
+    if (input.requireByteLimit && reserved > input.maxBytes)
+      throw new Error('Presentation metadata alone exceeds the delivery allowance.');
+    const excerpt = textRange(serializeToolModelContent(input.selected), 0, Math.max(0, input.maxBytes - reserved)).text;
+    return { artifact, modelContent: decodeToolContent([
+      ...excerpt ? [{ type: 'text' as const, text: excerpt }] : [], ...suffix
+    ]) };
+  }
+
+  /** Select a smaller derived delivery without changing the settled observation. */
+  async resizeToolObservation(
+    committed: CommittedToolObservation,
+    maxBytes: number
+  ): Promise<CommittedToolObservation> {
+    if (!this.artifacts || !committed.durableObservation) return committed;
+    const selected = committed.modelContentRef
+      ? await resolveToolModelContent({ modelContentRef: committed.modelContentRef }, this.artifacts) : committed.modelContent;
+    if (Buffer.byteLength(serializeToolModelContent(selected)) <= maxBytes) return committed;
+    try {
+      const artifact = this.resizedPresentationArtifacts.get(committed);
+      const bounded = await this.boundedPresentation({
+        toolName: committed.toolName, selected, observation: committed.durableObservation, maxBytes,
+        ...(artifact ? { artifact } : {})
+      });
+      this.resizedPresentationArtifacts.set(committed, bounded.artifact);
+      const modelContent = bounded.modelContent;
+      const rest = { ...committed };
+      delete rest.modelContentRef;
+      return Object.freeze({ ...rest, modelContent });
+    } catch {
+      // Failed preservation cannot authorize omission; exact admission decides.
+      return committed;
+    }
+  }
+
   async projectToolObservation(
     committed: CommittedToolObservation
   ): Promise<ToolObservationRecord> {
-    const modelContent = committed.modelContent;
+    const modelContent = committed.modelContentRef
+      ? await resolveToolModelContent({ modelContentRef: committed.modelContentRef }, this.artifacts) : committed.modelContent;
     const imageParts = modelContent.filter((part) => part.type === 'image');
     const modelImages = await Promise.all(
       imageParts.map(async (part): Promise<ModelImage> => {

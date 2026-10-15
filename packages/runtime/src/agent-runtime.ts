@@ -16,6 +16,8 @@ import {
 } from '@agent-core/effects';
 import {
   RequestTokenEstimator,
+  modelOutputToInput,
+  modelResponseOutput,
   ModelContractError,
   parseModelProfile,
   type CompiledModelRequest,
@@ -115,7 +117,7 @@ import {
 } from './orchestration/model-request.js';
 import { ModelStreamInterruptedError } from './orchestration/model-stream.js';
 import { NativeToolDelivery } from './orchestration/native-tool-delivery.js';
-import { ObservationStore } from './orchestration/observation-store.js';
+import { ObservationStore, type CommittedToolObservation } from './orchestration/observation-store.js';
 import { readProviderStateArtifact } from './orchestration/provider-state-artifacts.js';
 import { AgentLimitExceededError, AgentRunBudget } from './run/budget.js';
 import { ToolCallExecutor } from './orchestration/tool-execution.js';
@@ -438,6 +440,7 @@ export class AgentRuntime {
   private readonly recoveryActions = new Set<string>();
   private recoveryActionBoundary: string | undefined;
   private contextControlReserve: { readonly identity: string; readonly tokens: number } | undefined;
+  private presentationSnapshot: TurnSnapshot | undefined;
   private activeContextIdentity: string | null | undefined;
   private activeHistoryCut: import('./history/contracts.js').HistorySourceCut | undefined;
   private pendingCompatibilityTransition = false;
@@ -1895,6 +1898,14 @@ export class AgentRuntime {
         : {}),
       modelWindow,
       observationStore,
+      ...(this.options.context && this.options.contextRenewal?.automatic ? {
+        stagePresentations: (phase: AgentToolPhase) => !phase.source.nativeCatalogIdentity &&
+          (this.catalogTools.get(phase.source.catalog.revision) ?? this.tools).some(tool => tool.implementationId === 'agent-core.context-transition.v1') &&
+          providerWork(runtime.run.state(), phase.identity).stage === 'consumed',
+        selectPresentations: (phase: AgentToolPhase, observations: readonly {
+          readonly callIndex: number; readonly committed: CommittedToolObservation; readonly published: boolean;
+        }[]) => this.selectToolPresentations(runtime, phase, observations, observationStore)
+      } : {}),
       ...(this.options.repositories.session ? { session: this.options.repositories.session } : {}),
       state: () => runtime.run.state(),
       transitionTool: async (procedure, target, update) => {
@@ -1904,6 +1915,65 @@ export class AgentRuntime {
       append: runtime.append,
       emit: runtime.emit
     });
+  }
+
+  /** Admit a complete settled ordinary batch before publishing its selected presentations. */
+  private async selectToolPresentations(
+    runtime: RunExecutionRuntime,
+    phase: AgentToolPhase,
+    observations: readonly { readonly callIndex: number; readonly committed: CommittedToolObservation; readonly published: boolean }[],
+    store: ObservationStore
+  ): Promise<readonly CommittedToolObservation[]> {
+    const source = providerWork(runtime.run.state(), phase.identity);
+    if (source.stage !== 'consumed') return observations.map(item => item.committed);
+    let snapshot = this.presentationSnapshot;
+    if (!snapshot || !sameTurnIdentity(snapshot.record, phase.identity)) {
+      const records = await this.options.repositories.events.readMetadataRange(runtime.runId, {
+        types: ['turn.snapshot.created'], metadata: { exchangeId: `assistant:${phase.identity.turnId}:${String(phase.identity.requestAttempt)}:ended` },
+        limit: 1, maxBytes: 1024 * 1024
+      });
+      const reference = records.records[0]?.reference;
+      const event = reference ? (await this.options.repositories.events.readReference(reference)).event : undefined;
+      if (event?.type !== 'turn.snapshot.created') throw new Error('Settled tool batch is missing its source snapshot.');
+      snapshot = await this.restoreTurnSnapshot(event.snapshot);
+    }
+    if (snapshot.record.contextRecovery) return observations.map(item => item.committed);
+    if (observations.length !== phase.calls.length)
+      throw new ContextContinuityError('unsupported', 'A settled tool batch lacks a complete recorded result for every original call; its protocol cannot be reconstructed for context recovery.');
+    const admitted = await this.inferenceService.admittedInput(this.options.inferenceOwnerId ?? runtime.runId, source.invocationId);
+    const settled = await this.readProviderSettlement(runtime.runId, source.effect.intent.effectId, source.responseId, source.settlementReference);
+    if (settled?.event.type !== 'provider.attempt.settled') throw new Error('Tool batch source response is unavailable.');
+    const original = observations.map(item => item.committed);
+    let selected: readonly CommittedToolObservation[] = original;
+    let failure: ContextAdmissionError | undefined;
+    for (const maxBytes of [undefined, 4096, 2048, 1024, 0]) {
+      if (maxBytes !== undefined)
+        selected = await Promise.all(original.map(async (item, index) => observations[index]?.published
+          ? item : store.resizeToolObservation(item, maxBytes)));
+      const results = await Promise.all(selected.map(item => store.projectToolObservation(item)));
+      const logical: ModelRequest = { ...admitted.request, messages: [
+        ...admitted.request.messages,
+        ...modelOutputToInput(modelResponseOutput(settled.event.response)),
+        ...results.map(item => ({ role: 'tool' as const, content: item.modelText, toolName: item.toolName,
+          toolCallType: item.call.input.kind === 'text' ? 'custom' as const : 'function' as const,
+          ...(item.call.id ? { toolCallId: item.call.id } : {}),
+          ...(item.modelImages.length ? { images: item.modelImages } : {}) }))
+      ] };
+      const compiled = await this.requestAdmission.compile(logical, snapshot.profile, snapshot.requestWindow.maxOutputTokens);
+      const probe = await this.assembleContextRecovery({ runId: runtime.runId, input: runtime.input, snapshot,
+        signal: runtime.signal, run: runtime.run }, new ContextAdmissionError(compiled,
+        new Error('Settled tool presentations must leave an admissible context-management request.')), runtime.append, true);
+      try {
+        await this.requestAdmission.admit(probe.assembly.compiled, snapshot.profile);
+        return selected;
+      } catch (error) {
+        if (!(error instanceof ContextAdmissionError)) throw error;
+        failure = error;
+      }
+    }
+    if (!failure) throw new Error('Tool presentation admission did not produce a candidate.');
+    throw new ContextRecoveryStoppedError(requestCapacityConflict(failure),
+      'Settled tool results are preserved, but even their artifact-backed presentations cannot fit a context-management request.');
   }
 
   private async executeToolWork(
@@ -3030,13 +3100,13 @@ export class AgentRuntime {
   }
 
   /** Recovery is an ordinary governed turn with a narrower catalog and no domain output. */
-  private async assembleContextRecovery(
-    ordinary: AssistantTurnRequest,
+  private async assembleContextRecovery<T extends Pick<AssistantTurnRequest, 'runId' | 'input' | 'snapshot' | 'signal' | 'run'>>(
+    ordinary: T,
     failure: ContextAdmissionError | ContextSourceCapacityError,
     append: (event: AgentAuditEvent) => Promise<EventAppendReceipt>,
     probe = false,
     cut?: import('./history/contracts.js').HistorySourceCut
-  ): Promise<{ request: AssistantTurnRequest; assembly: RequestAssemblyResult }> {
+  ): Promise<{ request: T; assembly: RequestAssemblyResult }> {
     const context = this.options.context;
     if (!context || !ordinary.snapshot.profile.capabilities.toolCalling || !(failure instanceof ContextAdmissionError)) throw failure;
     cut ??= await context.history.capture();
@@ -3192,6 +3262,7 @@ export class AgentRuntime {
       modelWindowHash: hashJson(assembled.assembly.messages)
     };
     if (!probe) {
+      this.presentationSnapshot = snapshot;
       await append({ type: 'prompt.context.delivered', delivery: assembled.assembly.context });
       await append({ type: 'prompt.material.selected', material: assembled.assembly.material });
       await append({ type: 'budget.estimate.created', ...turnIdentity(snapshot.record), attempt: 1, estimate });
@@ -3205,6 +3276,7 @@ export class AgentRuntime {
     emit: (event: AgentProgressEvent) => Promise<void>,
     rejected?: CompiledModelRequest
   ): Promise<RequestAssemblyResult> {
+    this.presentationSnapshot = request.snapshot;
     const identity = turnIdentity(request.snapshot.record);
     let sourceConflict: ContextSourceCapacityError | undefined;
     try {
@@ -3517,7 +3589,7 @@ export class AgentRuntime {
     return reserve;
   }
 
-  private preserveRecoveryFailure(error: unknown, request: AssistantTurnRequest): void {
+  private preserveRecoveryFailure(error: unknown, request: Pick<AssistantTurnRequest, 'runId' | 'signal' | 'run'>): void {
     request.signal.throwIfAborted();
     if (error instanceof AgentRunOwnershipLostError || error instanceof AgentLimitExceededError ||
         error instanceof InferenceBudgetExceededError) throw error;
