@@ -54,6 +54,13 @@ export type AgentToolCallAttemptIdentity = AgentToolCallIdentity &
     readonly toolAttempt: number;
   }>;
 
+export function toolCallReceivedKey(
+  runId: string,
+  identity: Pick<AgentToolCallIdentity, 'turnId' | 'requestAttempt' | 'toolBatchId' | 'callIndex'>
+): string {
+  return `${runId}:tool:${identity.turnId}:${String(identity.requestAttempt)}:${identity.toolBatchId}:${String(identity.callIndex)}:received`;
+}
+
 export function toolEventKey(
   runId: string,
   identity: Pick<

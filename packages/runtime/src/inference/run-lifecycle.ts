@@ -35,7 +35,6 @@ import { randomUUID } from 'node:crypto';
 import type { AgentAuditEvent, AgentEvent, AgentProgressEvent } from '../events.js';
 import type { summarizeModelRequest } from '../orchestration/event-summaries.js';
 import {
-  normalizeModelToolCall,
   providerFailureDiagnostic,
   type RequestTokenEstimate
 } from '../orchestration/model-request.js';
@@ -129,7 +128,6 @@ export function createRunInferenceLifecycle(
   };
   let effectId = '';
   let responseId = '';
-  let streamedToolCallIndex = 0;
   let sawUpdate = false;
   const onStreamEvent = async (
     event: Exclude<ModelStreamEvent, { readonly type: 'done' }>
@@ -155,15 +153,6 @@ export function createRunInferenceLifecycle(
         });
     } else if (event.type === 'tool_call') {
       sawUpdate = true;
-      const toolCall = normalizeModelToolCall(event.toolCall);
-      await emit({
-        type: 'tool.call.received',
-        ...identity,
-        toolBatchId: turnRequest.toolBatchId,
-        toolCall,
-        callIndex: streamedToolCallIndex++,
-        ...(toolCall.id ? { callId: toolCall.id } : {})
-      });
     } else if (event.type === 'status')
       await emit({
         type: 'assistant.status',

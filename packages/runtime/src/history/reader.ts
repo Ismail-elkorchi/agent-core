@@ -49,7 +49,7 @@ import { publicEventEntry, mergeMirror, entryIdentity } from './ledger.js';
 import { historySearchContent } from './model-content.js';
 import { historyCutSchema, sourceSchema, sourceExcerptSchema } from './schema.js';
 import { resolveToolObservation } from '../orchestration/observation-source.js';
-import { assistantResponseKey, toolEventKey } from '../run/contracts.js';
+import { assistantResponseKey, toolCallReceivedKey, toolEventKey } from '../run/contracts.js';
 import type { ContextWindowRecord } from '../context/contracts.js';
 import type { SessionSourceMetadata, SessionSourceSnapshot } from '../session/contracts.js';
 
@@ -227,7 +227,8 @@ export class HistoryReader {
       const events = this.options.events;
       const keys = [
         assistantResponseKey(invocation.runId, invocation),
-        ...['started', 'ended'].map((stage) => toolEventKey(invocation.runId, invocation, stage))
+        toolCallReceivedKey(invocation.runId, invocation),
+        toolEventKey(invocation.runId, invocation, 'ended')
       ];
       return Promise.all(
         keys.map(async (key) => {
@@ -1758,7 +1759,7 @@ function eventTypes(filter?: HistoryFilter): readonly string[] {
     ['input.steering.accepted', 'steering', 'user'],
     ['assistant.ended', 'assistant', 'assistant'],
     ['assistant.interrupted', 'assistant', 'assistant'],
-    ['tool.started', 'tool_call', 'assistant'],
+    ['tool.call.received', 'tool_call', 'assistant'],
     ['tool.ended', 'observation', 'tool']
   ] as const;
   return mapping

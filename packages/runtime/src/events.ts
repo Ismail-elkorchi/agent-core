@@ -403,6 +403,10 @@ export type AgentEvent =
       readonly decision: 'allow' | 'deny';
     } & AgentToolCallIdentity)
   | ({
+      readonly type: 'tool.call.received';
+      readonly toolCall: ToolCall;
+    } & AgentToolCallIdentity)
+  | ({
       readonly type: 'tool.started';
       readonly toolName: string;
       readonly input: ToolCall;
@@ -483,10 +487,7 @@ export type AgentProgressEvent =
       readonly type: 'assistant.status';
       readonly message: string;
     } & AgentTurnIdentity)
-  | ({
-      readonly type: 'tool.call.received';
-      readonly toolCall: ToolCall;
-    } & AgentToolCallIdentity)
+  | Extract<AgentEvent, { readonly type: 'tool.call.received' }>
   | ({
       readonly type: 'assistant.ended';
       readonly contextRecovery?: true;
@@ -553,9 +554,9 @@ export const agentEventCodec: EventCodec<AgentEvent> = {
         sourceType: 'steering', description: event.content.slice(0, 200),
         identity: `steering:${event.deliveryId}`
       };
-      case 'tool.started': return {
-        ...exchange, sourceType: 'tool_call', toolName: event.input.name,
-        description: event.input.name, callIndex: String(event.callIndex), toolBatchId: event.toolBatchId,
+      case 'tool.call.received': return {
+        ...exchange, sourceType: 'tool_call', toolName: event.toolCall.name,
+        description: event.toolCall.name, callIndex: String(event.callIndex), toolBatchId: event.toolBatchId,
         identity: `tool_call:${event.toolBatchId}:${String(event.callIndex)}`
       };
       case 'tool.ended': return {
@@ -1123,6 +1124,14 @@ const AGENT_EVENT_DECODERS = {
       fingerprint: requiredString(value.fingerprint, 'fingerprint'),
       binding: decodeApprovalBinding(value.binding),
       decision: requiredEnum(value.decision, APPROVAL_DECISIONS, 'decision')
+    });
+  },
+  'tool.call.received': (value) => {
+    exact(value, ['type', ...TOOL_CALL_KEYS, 'toolCall']);
+    return Object.freeze({
+      type: 'tool.call.received',
+      ...decodeToolCallIdentity(value),
+      toolCall: decodeOwnedToolCall(requiredObject(value.toolCall, 'toolCall'))
     });
   },
   'tool.started': (value) => {

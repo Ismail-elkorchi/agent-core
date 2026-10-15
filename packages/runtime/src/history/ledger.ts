@@ -47,7 +47,7 @@ export function publicEventEntry(
     });
     return entry;
   }
-  if (event.type === 'tool.started')
+  if (event.type === 'tool.call.received')
     return Object.freeze({
       ...base,
       type: 'tool_call',
@@ -57,7 +57,7 @@ export function publicEventEntry(
       toolBatchId: event.toolBatchId,
       callIndex: event.callIndex,
       ...(event.callId ? { callId: event.callId } : {}),
-      call: parseJsonValue(event.input)
+      call: parseJsonValue(event.toolCall)
     });
   if (event.type === 'tool.ended')
     return Object.freeze({

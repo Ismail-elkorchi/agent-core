@@ -129,6 +129,7 @@ import { RunContextTransitions } from './run/context-transitions.js';
 import {
   createAgentTerminalSnapshot,
   assistantResponseKey,
+  toolCallReceivedKey,
   type AgentApprovalRequest,
   type AgentClock,
   type AgentEffectiveInstruction,
@@ -1758,8 +1759,19 @@ export class AgentRuntime {
           toolCalls: toolCalls.map(modelToolCallFromToolCall),
           ...(response.output ? { output: response.output } : {})
         });
-        if (this.options.repositories.session) {
-          for (const [callIndex, call] of toolCalls.entries()) {
+        // Accepted calls are durable history even when prerequisites prevent execution.
+        for (const [callIndex, call] of toolCalls.entries()) {
+          const received = {
+            type: 'tool.call.received' as const,
+            ...activeTurnIdentity,
+            toolBatchId,
+            callIndex,
+            ...(call.id ? { callId: call.id } : {}),
+            toolCall: call
+          };
+          await runtime.append(received, toolCallReceivedKey(runtime.runId, received));
+          await runtime.emit(received);
+          if (this.options.repositories.session) {
             await this.options.repositories.session.repository.appendToolCall(
               this.options.repositories.session.descriptor,
               {

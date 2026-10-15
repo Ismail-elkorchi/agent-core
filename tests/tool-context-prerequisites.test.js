@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
-import { AgentRuntime, agentEventCodec } from '@agent-core/runtime';
+import { AgentRuntime, HistoryReader, InMemorySessionRepository, assertHistoryModelCompatibility, agentEventCodec } from '@agent-core/runtime';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import { defineTool } from '@agent-core/tools';
 
@@ -11,6 +11,9 @@ test('host guidance is presented before a mutation without using its tool output
     needsGuidance = true,
     requests = 0;
   const events = new InMemoryEventRepository(agentEventCodec);
+  const artifacts = new InMemoryArtifactRepository();
+  const sessions = new InMemorySessionRepository();
+  const session = await sessions.create({ binding: { schemaId: 'test/guidance', schemaVersion: 1, subject: {} } });
   const tool = defineTool({
     name: 'edit_value',
     implementationId: 'edit-value@1',
@@ -95,16 +98,24 @@ test('host guidance is presented before a mutation without using its tool output
         needsGuidance = false;
         return call('reconsidered-call');
       }
+      if (requests === 4) {
+        assert.deepEqual(request.messages.flatMap(item => item.toolCalls ?? []).map(call => call.id),
+          ['original-call', 'reconsidered-call']);
+        assert.equal(request.messages.filter(item => item.role === 'tool').length, 2);
+        assert.ok(request.messages.some(item => item.role === 'tool' && item.content.includes('context_required')));
+      }
       return { provider: 'fixture', model: 'fixture', content: 'Done.', terminationReason: 'stop' };
     }
   };
-  const runtime = new AgentRuntime({ maxOutputTokens: 64,
+  const progress = [];
+  const options = { maxOutputTokens: 64,
+    onProgress: event => progress.push(event),
     provider,
     model: 'fixture',
     tools: [tool],
     toolPolicy: { allowedRisks: ['write'] },
     toolBoundary: { authorizationPolicyId: 'allow-write', executionTargetId: 'value' },
-    repositories: { events, artifacts: new InMemoryArtifactRepository() },
+    repositories: { events, artifacts, session: { repository: sessions, descriptor: session } },
     toolContextPrerequisite: async () =>
       needsGuidance
         ? {
@@ -120,7 +131,8 @@ test('host guidance is presented before a mutation without using its tool output
             ]
           }
         : undefined
-  });
+  };
+  const runtime = new AgentRuntime(options);
   const result = await runtime.run({ runId: 'guidance-run', task: 'Update the value.' }).result;
   assert.equal(result.state, 'ended');
   assert.equal(result.terminal.executionStatus, 'completed', JSON.stringify(result.terminal));
@@ -130,4 +142,20 @@ test('host guidance is presented before a mutation without using its tool output
   for await (const record of events.read('guidance-run'))
     if (record.event.type === 'tool.started') starts.push(record.event.callId);
   assert.deepEqual(starts, ['reconsidered-call']);
+  assert.deepEqual(progress.filter(event => event.type === 'tool.call.received').map(event => event.callId),
+    ['original-call', 'reconsidered-call']);
+  const history = new HistoryReader({ repository: sessions, session, events, artifacts });
+  const page = await history.page({ limit: 100 });
+  const calls = page.entries.filter(entry => entry.type === 'tool_call');
+  assert.deepEqual(calls.map(entry => entry.callId), ['original-call', 'reconsidered-call']);
+  for (const call of calls) {
+    assert.equal((await events.readReference(call.source)).event.type, 'tool.call.received');
+  }
+  await assertHistoryModelCompatibility({ history, artifacts,
+    profile: await provider.describeModel(), representation: 'portable' });
+  const reopened = new AgentRuntime(options);
+  const followup = await reopened.run({ runId: 'guidance-followup', task: 'Explain the result.' }).result;
+  assert.equal(followup.terminal.executionStatus, 'completed', JSON.stringify(followup));
+  assert.equal(requests, 4);
+  assert.equal(mutations, 1);
 });
