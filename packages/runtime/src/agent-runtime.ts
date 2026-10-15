@@ -2668,15 +2668,9 @@ export class AgentRuntime {
             request.runId
           )
         );
-        if (assembly.capturedHistoryCut && !request.snapshot.record.contextRecovery && this.options.context) {
-          const currentCut = await this.options.context.history.capture();
-          const captured = assembly.capturedHistoryCut;
-          if (currentCut.branchId !== captured.branchId || currentCut.sourceRevision !== captured.sourceRevision ||
-              currentCut.throughEntryId !== captured.throughEntryId) {
-            await this.activateCommittedContext(request.modelWindow, request.runId, true);
-            continue;
-          }
-        }
+        if (!request.snapshot.record.contextRecovery &&
+            await this.refreshAdvancedHistory(request.modelWindow, request.runId, assembly.capturedHistoryCut))
+          continue;
         const protocol = request.snapshot.profile.capabilities.protocol;
         if (
           !request.snapshot.record.contextRecovery && request.modelSession.continueNative &&
@@ -3216,6 +3210,9 @@ export class AgentRuntime {
     try {
       await this.options.context?.assertSourceCapacity();
       await this.activateCommittedContext(request.modelWindow, request.runId);
+      // Incrementally recorded tool turns may have advanced the source boundary.
+      // Refresh before compiling; the same fence runs again before dispatch for races.
+      await this.refreshAdvancedHistory(request.modelWindow, request.runId, this.activeHistoryCut);
     } catch (error) {
       if (!(error instanceof ContextSourceCapacityError)) throw error;
       sourceConflict = error;
@@ -3545,6 +3542,20 @@ export class AgentRuntime {
       new Set(input.selection.continuity?.sources.map(source => source.entryId)), request.runId);
     recordContextExcerpts(window, input.excerpts);
     return { window };
+  }
+
+  /** Refresh only when the selected source boundary advanced beyond the replayed cut. */
+  private async refreshAdvancedHistory(
+    window: ModelWindow,
+    runId: string,
+    captured: import('./history/contracts.js').HistorySourceCut | undefined
+  ): Promise<boolean> {
+    if (!captured || !this.options.context) return false;
+    const current = await this.options.context.history.capture();
+    if (current.branchId === captured.branchId && current.sourceRevision === captured.sourceRevision &&
+        current.throughEntryId === captured.throughEntryId) return false;
+    await this.activateCommittedContext(window, runId, true);
+    return true;
   }
 
   private async activateCommittedContext(window: ModelWindow, runId: string, refresh = false): Promise<void> {
