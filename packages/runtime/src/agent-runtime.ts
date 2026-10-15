@@ -75,7 +75,7 @@ import {
   rebuildModelWindowFromRepositories,
   assertHistoryModelCompatibility,
   replaySourceEntries,
-  recordContextEvidence
+  recordContextExcerpts
 } from './orchestration/session-replay.js';
 import { ModelWindow } from './inference/model-window.js';
 import type { NativeGenerationContext } from './inference/native-inference.js';
@@ -3522,7 +3522,7 @@ export class AgentRuntime {
     await replaySourceEntries(window, input.cut.sessionId, input.entries,
       this.options.repositories.artifacts,
       new Set(input.selection.continuity?.sources.map(source => source.entryId)), request.runId);
-    recordContextEvidence(window, input.excerpts);
+    recordContextExcerpts(window, input.excerpts);
     return { window };
   }
 

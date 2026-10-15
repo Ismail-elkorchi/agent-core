@@ -113,7 +113,7 @@ export async function rebuildModelWindowFromRepositories(input: {
     portableSources
   );
   if (input.history && view?.contextWindow?.selection.excerpts?.length)
-    recordContextEvidence(modelWindow, await input.history.readExcerpts(view.contextWindow.selection.excerpts, view.cut, SELECTED_SOURCE_LIMITS.bytes));
+    recordContextExcerpts(modelWindow, await input.history.readExcerpts(view.contextWindow.selection.excerpts, view.cut, SELECTED_SOURCE_LIMITS.bytes));
   // Only the owning unfinished run may use an open ledger tail. Completed history
   // is branch-scoped above; reading entire historical ledgers would cross a fork.
   let replayedLedgers = 0;
@@ -649,7 +649,7 @@ function applicationHistory(entries: readonly SessionBranchEntry[]): readonly Se
 }
 
 /** Evidence is attributed quotation, never a response to a live tool call. */
-export function recordContextEvidence(window: ModelWindow, excerpts: readonly import('../history/contracts.js').HistoryExcerptItem[]): void {
+export function recordContextExcerpts(window: ModelWindow, excerpts: readonly import('../history/contracts.js').HistoryExcerptItem[]): void {
   for (const item of excerpts) {
     const source = item.excerpt.source;
     window.recordSourceItem(`evidence:${source.sessionId}:${source.entryId}:${source.sha256}:${String(item.excerpt.offset)}:${String(item.excerpt.bytes)}`, {
