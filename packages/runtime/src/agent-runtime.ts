@@ -3499,7 +3499,7 @@ export class AgentRuntime {
     const cut = this.activeHistoryCut ?? await this.options.context?.history.capture();
     const sessionState = (await this.options.context?.sessionState(cut)) ?? {
       revision: null,
-      content: {}
+      content: { blocks: [] }
     };
     let result: Awaited<ReturnType<typeof assemble>>;
     try {

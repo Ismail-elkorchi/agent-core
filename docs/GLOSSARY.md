@@ -10,9 +10,9 @@ events, state fields, and documentation use them consistently.
 | **context window** | A committed selection of session history and derived artifacts. It can span many completed runs; run completion does not evict history. |
 | **history position** | A branch boundary and the exact committed source records visible at that boundary. Independent run ledgers do not share a fabricated global sequence. |
 | **history selection** | Explicit original-source and derived-artifact references retained for inference, with bounded retrieval of omitted material. |
-| **session state** | One current revisioned body of attributed, fallible model understanding per session branch, with an optional working section. It is neither user authority nor a verification result. |
+| **session state** | One current revisioned body of attributed, fallible model understanding per session branch, expressed as narrative blocks that can include working notes. It is neither user authority nor a verification result. |
 | **context state sequence** | Immutable checkpoint-state reference and ordered replacement notices within a provider continuation. Its committed record describes admitted content; it does not prove provider delivery or application. |
-| **working section** | Optional plans, progress, or open questions inside the single session-state body; it is not a separate memory store. |
+| **working notes** | Plans, progress, or open questions expressed in narrative text inside the single session-state body; not a separate memory store or required section. |
 | **context transition** | An admitted state/source proposal that is unchanged, appends a lawful successor, or starts fresh provider continuation. State revision and provider reset are independent. Committed changes require actual successor admission; fresh continuation also requires a supported reset at a safe protocol boundary. Idle selection intent is not publication. |
 | **prompt material** | Typed application or runtime material available to the request assembler. |
 | **logical model request** | Provider-neutral request assembled by Core before wire serialization. |

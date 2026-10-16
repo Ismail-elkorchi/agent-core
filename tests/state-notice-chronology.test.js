@@ -57,7 +57,7 @@ test('stateless archived runs replay exact notices around corrections and respec
     const cut = await history.capture();
     const result = await context.transition({ expectedWindowId: (await history.selectedContext(cut))?.windowId ?? null,
       idempotencyKey: id, reason: 'Update interpretation', selection: await context.selectSources(cut, {}),
-      sessionState: { id, previousRevisionId, content: { working: [{ id: 'note', text }] }, capturedHistoryCut: cut,
+      sessionState: { id, previousRevisionId, content: { blocks: [{ text }] }, capturedHistoryCut: cut,
         inference: { ownerId: 'owner', invocationId: id, requestRef } }
     }, { admit: admitContext });
     assert.equal(result.transition.strategy, 'append');

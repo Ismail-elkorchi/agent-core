@@ -70,21 +70,25 @@ delivery is immediate, steering, or queued.
 
 ## Session state
 
-A branch owns one current `SessionStateSnapshot`: revision metadata and one structured
+A branch owns one current `SessionStateSnapshot`: revision metadata and one narrative
 `content` body. Revision metadata contains attribution, content digest, and byte size;
-it never duplicates that body. The optional `interaction`, `understanding`, `working`, and `trajectory`
-sections contain stable-ID items with `id`, `text`, optional exact history `sources`,
-and optional natural-language `status` and `scope`. No section, domain ontology,
-workflow, or update schedule is mandatory. Freeform working notes belong in item
-text. `decodeSessionStateContent` establishes an owned immutable value;
-`sessionStateContentSchema` exposes the same bounded contract.
+it never duplicates that body. Content has one ordered `blocks` array. Each block
+contains `text` and optional exact history `sources`. Headings, qualifications,
+working notes, uncertainties, and trajectory can be expressed naturally in text;
+there is no mandatory taxonomy, item identity, workflow, or update schedule.
+`decodeSessionStateContent` establishes an owned immutable value;
+`sessionStateContentSchema` exposes the same bounded contract. Content permits at
+most 1,024 blocks, each with 1–65,536 JavaScript string units and at most 256 source
+references. The existing `maxSourceBytes` policy additionally bounds serialized
+UTF-8 content and combined source selection; compiled admission still decides fit.
 
 The model sends a complete replacement through `context_transition.sessionState`.
-Keep IDs when revising the same item; remove obsolete claims and omit unnecessary
-sections. Omitted content leaves the current interpretation unchanged; empty content
-clears it. Identical content preserves revision identity. Clearing state does not
-erase original history or older state already delivered to a provider. State is fallible interpretation, never authority, verification, or a
-replacement for original user requirements and observations.
+Remove obsolete claims in that replacement. Omitting `sessionState` leaves the
+current interpretation unchanged; `{ blocks: [] }` explicitly clears it. An empty
+object is invalid. Identical content preserves revision identity. Clearing state
+does not erase original history or older state already delivered to a provider.
+State is fallible interpretation, never authority, verification, or a replacement
+for original user requirements and observations.
 
 Runtime provenance is separate from model content: the revision records its
 previous revision, exact originating inference request, captured history cut, and
@@ -137,7 +141,7 @@ recast as ordinary state. Model changes preserve only compatible provider state.
 replacement of optional history. `recentFrom` selects the active suffix from an
 exact source. Omitting source edits keeps the selection; empty `retain` releases
 optional history. Complete exchanges, active accepted input, and explicit protections
-remain protected. Citations in every state section are exact retrieval references,
+remain protected. Citations in every narrative block are exact retrieval references,
 not automatic retention. Use source-selection operations to retain or release
 originals independently of how the state is organized.
 
@@ -234,8 +238,8 @@ or acknowledged delivery cannot be resent without evidence that it failed.
 
 ## Compatibility and evidence
 
-Execution and state-sequence formats are versioned. The continuation contract uses
-`agent-core.session/3`. This build cannot open, resume, or read historical content
+Execution and state-sequence formats are versioned. The narrative-state contract uses
+`agent-core.session/4`. This build cannot open, resume, or read historical content
 from earlier session formats. It rejects unsupported execution records and
 incompatible session headers without rewriting original journals. Reading those
 originals requires the matching earlier build; this build performs no conversion. It has no aliases, old-format readers, migrations, or

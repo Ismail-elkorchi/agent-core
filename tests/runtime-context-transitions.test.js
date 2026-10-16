@@ -1019,10 +1019,10 @@ test('abort after publication with a lost receipt preserves committed state and 
 });
 
 function stateContent(text) {
-  return text ? { understanding: [{ id: 'understanding', text }] } : {};
+  return { blocks: text ? [{ text }] : [] };
 }
 function stateText(snapshot) {
-  return snapshot.content.understanding?.[0]?.text ?? '';
+  return snapshot.content.blocks?.[0]?.text ?? '';
 }
 // Structural source-selection tests supply an explicit immutable compilation boundary.
 // Full runtime tests above separately verify successor prompt assembly and transport.

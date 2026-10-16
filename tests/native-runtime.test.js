@@ -527,14 +527,14 @@ for (const publication of ['normal', 'lost_receipt', 'rejected', 'append_noop_fr
             ? message(fresh ? 'Finished.' : 'Selection requested.')
             : [{ ...call(id + '-state', 'context_transition'), arguments: JSON.stringify({
               reason: 'Revise useful understanding.', renewal: true,
-              sessionState: { understanding: [{ id: 'rationale', text: freshRequests === 1 ? body1 : body2 }] }
+              sessionState: { blocks: [{ text: freshRequests === 1 ? body1 : body2 }] }
             }) }];
           const turn = frames.length;
           const output = publication !== 'append_noop_fresh' ? ordinaryOutput
             : [1, 3, 5, 7].includes(turn)
               ? [{ ...call(id + '-state', 'context_transition'), arguments: JSON.stringify({
                   reason: 'Preserve transport until deliberate renewal.',
-                  sessionState: { understanding: [{ id: 'rationale', text: turn <= 3 ? body1 : body2 }] },
+                  sessionState: { blocks: [{ text: turn <= 3 ? body1 : body2 }] },
                   ...(turn === 7 ? { renewal: true } : {})
                 }) }]
               : message(turn === 9 ? 'Finished.' : 'Selection requested.');
@@ -600,7 +600,7 @@ for (const publication of ['normal', 'lost_receipt', 'rejected', 'append_noop_fr
     const { branch } = await sessions.loadReplayState(descriptor);
     const revisions = branch.filter((entry) => entry.type === 'context_transition' && entry.sessionState);
     assert.equal(revisions.length, 2, JSON.stringify((await Array.fromAsync(events.read(result.terminal.runId))).filter(({event}) => event.type === 'context.transition.rejected')));
-    assert.equal((await context.sessionState()).content.understanding[0].text, body2);
+    assert.equal((await context.sessionState()).content.blocks[0].text, body2);
     if (publication === 'append_noop_fresh') {
       assert.equal(frames.length, 9);
       assert.equal(sockets.length, 2, 'Append and no-op retain the actual native socket; only explicit renewal replaces it.');
@@ -830,7 +830,7 @@ for (const publication of ['normal', 'lost_receipt', 'rejected']) {
         if (body.type === 'response.steer') {
           ws.feed({ type: 'response.steer.accepted', steer: { id: 'state-steer', previous_response_id: 'r1' } },
             { type: 'response.completed', response: response('r1', [{ ...call('state-call', 'context_transition'),
-              arguments: JSON.stringify({ reason: 'Remember the corrected understanding.', renewal: true, sessionState: { understanding: [{ id: 'correction', text }] } }) }]) });
+              arguments: JSON.stringify({ reason: 'Remember the corrected understanding.', renewal: true, sessionState: { blocks: [{ text }] } }) }]) });
         } else if (!body.previous_response_id && frames.length === 1) {
           ws.feed({ type: 'response.created', response: { id: 'r1' } },
             { type: 'response.output_text.delta', response_id: 'r1', delta: 'Working.' });
@@ -883,7 +883,7 @@ for (const publication of ['normal', 'lost_receipt', 'rejected']) {
     assert.equal(frames.length, 4);
     assert.equal(connections, 2);
     assert.equal(resultDeliveries, 1);
-    assert.equal((await context.sessionState()).content.understanding[0].text, text);
+    assert.equal((await context.sessionState()).content.blocks[0].text, text);
     const extension = audit.find(({ event }) => event.type === 'inference.extended').event;
     const origin = await inference.sessionStateOrigin(runId, extension.invocationId);
     assert.equal(origin.revisionId, null, 'Steering stays bound to the old state until fresh admission');

@@ -670,7 +670,7 @@ export class ContextService {
   }
   /** Read the immutable checkpoint referenced by a continuation, never the latest mutable state. */
   async checkpointState(stateSequence: ContextStateSequence, cut?: HistorySourceCut): Promise<SessionStateSnapshot> {
-    if (stateSequence.checkpointRevisionId === null) return { revision: null, content: {} };
+    if (stateSequence.checkpointRevisionId === null) return { revision: null, content: { blocks: [] } };
     cut ??= await this.history.capture();
     const snapshot = await this.options.repository.sourceSnapshot(this.options.session, cut.throughEntryId);
     const entry = await this.options.repository.readBranchEntry(this.options.session, snapshot.boundary, stateSequence.checkpointRevisionId);
@@ -681,17 +681,16 @@ export class ContextService {
 
   async validateSessionStateSources(content: SessionStateContent, cut: HistorySourceCut): Promise<void> {
     await this.history.validateCut(cut);
-    for (const items of [content.interaction, content.understanding, content.working, content.trajectory])
-      for (const item of items ?? [])
-        for (const source of item.sources ?? [])
-          if (!await this.history.metadata(source, cut))
-            throw new Error('Session-state citation is unavailable at its captured history cut.');
+    for (const block of content.blocks)
+      for (const source of block.sources ?? [])
+        if (!await this.history.metadata(source, cut))
+          throw new Error('Session-state citation is unavailable at its captured history cut.');
   }
 
   async sessionState(cut?: HistorySourceCut): Promise<SessionStateSnapshot> {
     cut ??= await this.history.capture();
     const revision = await this.options.repository.currentSessionState(this.options.session, cut.throughEntryId);
-    if (!revision) return Object.freeze({ revision: null, content: Object.freeze({}) });
+    if (!revision) return Object.freeze({ revision: null, content: Object.freeze({ blocks: Object.freeze([]) }) });
     if (revision.contentBytes > this.options.policy.maxSourceBytes)
       throw new ContextSourceCapacityError(cut, {
         unit: 'bytes', limit: this.options.policy.maxSourceBytes, observedAtLeast: revision.contentBytes
@@ -715,7 +714,7 @@ export class ContextService {
   async inspectSessionState(cut?: HistorySourceCut, maxBytes = 32 * 1024) {
     cut ??= await this.history.capture();
     const revision = await this.options.repository.currentSessionState(this.options.session, cut.throughEntryId);
-    if (!revision) return { revisionId: null, content: {}, complete: true };
+    if (!revision) return { revisionId: null, content: { blocks: [] }, complete: true };
     const snapshot = await this.options.repository.sourceSnapshot(this.options.session, cut.throughEntryId);
     const entry = await snapshot.index.byId.get(revision.id);
     if (!entry) throw new Error('Session-state index points outside the captured session branch.');

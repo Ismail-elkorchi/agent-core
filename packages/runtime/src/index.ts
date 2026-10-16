@@ -28,7 +28,7 @@ export * from './inference/usage-cost.js';
 export { decodeSessionStateContent, sessionStateContentSchema } from './session/session-state.js';
 export type {
   SessionStateContent,
-  SessionStateItem,
+  SessionStateBlock,
   SessionStateChange,
   SessionStateInference,
   SessionStateSnapshot,

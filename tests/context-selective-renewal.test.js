@@ -33,22 +33,23 @@ test('recentFrom is an exact stable inclusive boundary, with canonical add/relea
   await assert.rejects(context.selectSources(cut, { recentFrom: refs[1], retain: [] }), /replacement/);
 });
 
-test('moving exact citations between state sections never changes source retention', async () => {
+test('narrative headings and block positions never change citation retention', async () => {
   const { context, history, artifacts, refs } = await fixture();
   const requestRef = await artifacts.storeProtected({ label: 'state-inference', mediaType: 'application/json',
     content: new TextEncoder().encode('{}') });
-  const item = { id: 'evidence', text: 'Same cited evidence', sources: [refs[0]] };
+  const item = { text: 'Same cited evidence', sources: [refs[0]] };
   let revisionId = null;
-  for (const section of ['interaction', 'understanding', 'working', 'trajectory']) {
+  for (const [index, heading] of ['Current question', 'Evidence', 'Working notes', 'What changed'].entries()) {
     const cut = await history.capture();
-    const content = { [section]: [item] };
+    const headingBlock = { text: `${heading}\nA freely authored narrative heading.` };
+    const content = { blocks: index % 2 ? [item, headingBlock] : [headingBlock, item] };
     await context.validateSessionStateSources(content, cut);
-    const candidate = request(cut, [], `move-${section}`);
+    const candidate = request(cut, [], `move-${index}`);
     const committed = await context.transition({ ...candidate,
       expectedWindowId: (await history.selectedContext(cut))?.windowId ?? null,
       expectedSessionStateRevisionId: revisionId,
-      sessionState: { id: `state-${section}`, previousRevisionId: revisionId,
-        inference: { ownerId: 'owner', invocationId: `inference-${section}`, requestRef },
+      sessionState: { id: `state-${index}`, previousRevisionId: revisionId,
+        inference: { ownerId: 'owner', invocationId: `inference-${index}`, requestRef },
         capturedHistoryCut: cut, content }
     }, admitted);
     revisionId = (await context.sessionState()).revision.id;
@@ -70,7 +71,7 @@ test('citations do not prevent explicit release of an original', async () => {
   await context.transition({ ...request(cut, refs), sessionState: {
     id: 'cited', previousRevisionId: null,
     inference: { ownerId: 'owner', invocationId: 'inference', requestRef }, capturedHistoryCut: cut,
-    content: { interaction: [{ id: 'evidence', text: 'Cited original', sources: [refs[0]] }] }
+    content: { blocks: [{ text: 'Cited original', sources: [refs[0]] }] }
   } }, admitted);
   const releaseCut = await history.capture();
   const selection = await context.selectSources(releaseCut, { release: [refs[0]] });
@@ -81,22 +82,20 @@ test('citations do not prevent explicit release of an original', async () => {
   assert.equal((await context.sessionState()).revision.id, 'cited');
 });
 
-test('all citation sections validate exact source identity and captured branch access', async () => {
+test('narrative block citations validate exact source identity and captured branch access', async () => {
   const { context, history, repository, session, refs } = await fixture();
   const point = await context.transition(request(await history.capture(), refs, 'branch-point'), admitted);
   const later = await repository.appendAssistant(session, { runId: 'run',
     identity: { turnId: 'parent-only', turnIndex: 4, requestAttempt: 1 }, content: 'Parent-only evidence' });
   const parentOnly = sourceRef(session.id, later);
-  const cited = (section, source) => ({ [section]: [{ id: 'evidence', text: 'Exact evidence', sources: [source] }] });
-  await context.validateSessionStateSources(cited('interaction', parentOnly), await history.capture());
+  const cited = source => ({ blocks: [{ text: 'Uncited narrative.' }, { text: 'Exact evidence', sources: [source] }] });
+  await context.validateSessionStateSources(cited(parentOnly), await history.capture());
   await repository.branchFrom(session, point.id, 'Citation isolation');
   const childCut = await history.capture();
-  for (const section of ['interaction', 'understanding', 'working', 'trajectory']) {
-    await context.validateSessionStateSources(cited(section, refs[0]), childCut);
-    await assert.rejects(context.validateSessionStateSources(cited(section, parentOnly), childCut), /unavailable|outside|branch|cut/i);
-    await assert.rejects(context.validateSessionStateSources(cited(section, { ...refs[0], sha256: '0'.repeat(64) }), childCut));
-    await assert.rejects(context.validateSessionStateSources(cited(section, { ...refs[0], sessionId: 'other-session' }), childCut));
-  }
+  await context.validateSessionStateSources(cited(refs[0]), childCut);
+  await assert.rejects(context.validateSessionStateSources(cited(parentOnly), childCut), /unavailable|outside|branch|cut/i);
+  await assert.rejects(context.validateSessionStateSources(cited({ ...refs[0], sha256: '0'.repeat(64) }), childCut));
+  await assert.rejects(context.validateSessionStateSources(cited({ ...refs[0], sessionId: 'other-session' }), childCut));
 });
 
 test('renewal cannot publish without actual admission, and failed admission leaves no window', async () => {
@@ -162,7 +161,7 @@ test('session-state citations cannot claim observations newer than the originati
   const origin = await history.capture();
   const later = await repository.appendAssistant(session, { runId: 'run',
     identity: { turnId: 'later', turnIndex: 4, requestAttempt: 1 }, content: 'After inference' });
-  const content = { understanding: [{ id: 'late', text: 'Unavailable to the origin', sources: [sourceRef(session.id, later)] }] };
+  const content = { blocks: [{ text: 'Unavailable to the origin', sources: [sourceRef(session.id, later)] }] };
   await assert.rejects(context.validateSessionStateSources(content, origin), /unavailable|outside|cut/i);
   await context.validateSessionStateSources(content, await history.capture());
 });

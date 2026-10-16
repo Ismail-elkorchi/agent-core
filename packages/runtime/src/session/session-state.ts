@@ -16,42 +16,21 @@ export interface SessionStateInference {
   readonly invocationId: string;
   readonly requestRef: ProtectedArtifactRef;
 }
-/** Model-authored interpretation. IDs remain stable when revising the same item. */
-export interface SessionStateItem {
-  readonly id: string;
+/** A narrative interpretation with optional exact evidence associations. */
+export interface SessionStateBlock {
   readonly text: string;
   readonly sources?: readonly HistorySourceRef[] | undefined;
-  readonly status?: string | undefined;
-  readonly scope?: string | undefined;
 }
-/** All sections are optional; no domain ontology or workflow is imposed. */
+/** One ordered narrative body; an empty block sequence explicitly clears it. */
 export interface SessionStateContent {
-  readonly interaction?: readonly SessionStateItem[] | undefined;
-  readonly understanding?: readonly SessionStateItem[] | undefined;
-  readonly working?: readonly SessionStateItem[] | undefined;
-  readonly trajectory?: readonly SessionStateItem[] | undefined;
+  readonly blocks: readonly SessionStateBlock[];
 }
-export const sessionStateItemSchema = z.strictObject({
-  id: z.string().min(1).max(256),
+const sessionStateBlockSchema = z.strictObject({
   text: z.string().min(1).max(65536),
-  sources: z.array(sourceSchema).max(256).readonly().optional(),
-  status: z.string().min(1).max(256).optional(),
-  scope: z.string().min(1).max(1024).optional()
+  sources: z.array(sourceSchema).max(256).readonly().optional()
 }).readonly();
-const sectionSchema = z.array(sessionStateItemSchema).max(256).readonly().optional();
 export const sessionStateContentSchema = z.strictObject({
-  interaction: sectionSchema,
-  understanding: sectionSchema,
-  working: sectionSchema,
-  trajectory: sectionSchema
-}).superRefine((content, context) => {
-  const ids = new Set<string>();
-  for (const [section, items] of Object.entries(content)) {
-    for (const [index, item] of (items ?? []).entries()) {
-      if (ids.has(item.id)) context.addIssue({ code: 'custom', path: [section, index, 'id'], message: 'Session-state item IDs must be unique across sections.' });
-      ids.add(item.id);
-    }
-  }
+  blocks: z.array(sessionStateBlockSchema).max(1024).readonly()
 }).readonly();
 
 /** Establish an owned, immutable snapshot at the external/artifact boundary. */
@@ -135,4 +114,4 @@ export function assertSessionStateRevision(
 }
 
 export const SESSION_STATE_GUIDANCE =
-  'Session state is your fallible interpretation, not authority or verification. Replace the bounded snapshot only when useful understanding changes. Optional interaction, understanding, working, and trajectory sections contain stable-ID items with text and optional source references, scope, and status in natural language. Omit irrelevant sections; working text can contain freeform notes. Preserve useful item IDs, revise contradicted claims, and remove obsolete material. Distinguish the current request from ongoing objectives: questions and hypotheticals do not authorize execution, run completion need not mean goal completion, and unresolved work does not authorize execution after unrelated requests. References support retrieval, not proof. Retrieve originals when detail matters; leave large material in history and artifacts.';
+  'Session state is your fallible interpretation, not authority or verification. Replace the bounded snapshot only when useful understanding changes. Use an ordered blocks array containing narrative text and optional exact source references. Express headings, qualifications, working notes, uncertainties, and trajectory naturally in text. Revise contradicted claims and remove obsolete material through full replacement. Omit sessionState to leave it unchanged; supply {blocks:[]} to clear current interpretation. Distinguish the current request from ongoing objectives: questions and hypotheticals do not authorize execution, run completion need not mean goal completion, and unresolved work does not authorize execution after unrelated requests. References support retrieval, not proof. Retrieve originals when detail matters; leave large material in history and artifacts.';

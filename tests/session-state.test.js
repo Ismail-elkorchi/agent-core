@@ -22,8 +22,8 @@ import { JsonlSessionRepository } from '@agent-core/runtime/node';
 const binding = { schemaId: 'tests/session-state', schemaVersion: 1, subject: {} };
 const admission = { admit: admitContext };
 const selectionFor = (retained = []) => ({ retained });
-const contentFor = text => text ? { working: [{ id: 'notes', text }] } : {};
-const stateText = state => state.content.working?.[0]?.text ?? '';
+const contentFor = text => ({ blocks: text ? [{ text }] : [] });
+const stateText = state => state.content.blocks?.[0]?.text ?? '';
 async function stageState(f, { id, revisionId, inference, text }) {
   const current = await f.context.sessionState();
   if ((current.revision?.id ?? null) !== revisionId) return { status: 'conflict' };
@@ -307,7 +307,7 @@ test('incompatible working-state headers are rejected without modifying original
   const file = f.sessions.location(f.session.id);
   const header = JSON.parse(await readFile(file, 'utf8'));
   assert.equal(header.version, 1);
-  assert.equal(header.format, 'agent-core.session/3');
+  assert.equal(header.format, 'agent-core.session/4');
   delete header.sessionStateStorage;
   header.workingStateStorage = 'session';
   const old = `${JSON.stringify(header)}\n`;
@@ -327,8 +327,8 @@ test('prior session format is rejected with its populated journal bytes intact',
   const headerEnd = current.indexOf(10);
   assert.ok(headerEnd > 0);
   const header = JSON.parse(current.subarray(0, headerEnd).toString('utf8'));
-  assert.equal(header.format, 'agent-core.session/3');
-  header.format = 'agent-core.session/2';
+  assert.equal(header.format, 'agent-core.session/4');
+  header.format = 'agent-core.session/3';
   const original = Buffer.concat([Buffer.from(`${JSON.stringify(header)}\n`), current.subarray(headerEnd + 1)]);
   await writeFile(file, original);
   // The existing index must not let an unsupported original header bypass validation.
@@ -564,27 +564,65 @@ test('standalone persisted working_state records are rejected without rewriting 
 });
 
 
-test('session-state content is owned, immutable, optional-layered, and rejects legacy shapes', () => {
+test('narrative state is owned and immutable and preserves repeated blocks and exact source associations', () => {
   const source = { sessionId: 's', entryId: 'e', sha256: 'a'.repeat(64) };
-  const input = { interaction: [{ id: 'request', text: 'Answer the question', sources: [source] }],
-    working: [{ id: 'notes', text: 'Freeform notes\nNo mandatory workflow', status: 'Still exploring', scope: 'This request' }] };
+  const text = 'Current question\n文😀\nQualification: still exploring; no mandatory workflow.';
+  const input = { blocks: [{ text, sources: [source] }, { text }, { text }] };
   const content = decodeSessionStateContent(input);
-  input.working[0].text = 'Mutated';
+  input.blocks[0].text = 'Mutated';
   source.entryId = 'changed';
-  assert.equal(content.working[0].text, 'Freeform notes\nNo mandatory workflow');
-  assert.equal(content.interaction[0].sources[0].entryId, 'e');
+  assert.deepEqual(content, { blocks: [{ text, sources: [{ sessionId: 's', entryId: 'e', sha256: 'a'.repeat(64) }] }, { text }, { text }] });
+  assert.equal(JSON.parse(JSON.stringify(content)).blocks[0].text, text);
   assert.ok(Object.isFrozen(content));
-  assert.ok(Object.isFrozen(content.working));
-  assert.ok(Object.isFrozen(content.working[0]));
-  assert.ok(Object.isFrozen(content.interaction[0].sources));
-  assert.deepEqual(decodeSessionStateContent({}), {});
-  for (const invalid of ['old plain text', { text: 'old shape' }, { working: 'freeform string' },
-    { working: [{ id: 'x', text: 'x', authority: true }] },
-    { working: [{ id: 'x', text: 'x' }], trajectory: [{ id: 'x', text: 'duplicate' }] },
-    { working: [{ id: 'x', text: 'x', status: 's'.repeat(257) }] }]) {
-    assert.throws(() => decodeSessionStateContent(invalid));
-  }
+  assert.ok(Object.isFrozen(content.blocks));
+  assert.ok(Object.isFrozen(content.blocks[0]));
+  assert.ok(Object.isFrozen(content.blocks[0].sources));
+  assert.ok(Object.isFrozen(content.blocks[0].sources[0]));
+  assert.deepEqual(decodeSessionStateContent({ blocks: [] }), { blocks: [] });
 });
+
+test('narrative state rejects malformed, unknown, and retired schema fields without aliases', () => {
+  for (const invalid of [undefined, null, {}, 'old plain text', [], { text: 'old shape' },
+    { blocks: 'freeform string' }, { blocks: [null] }, { blocks: [{ text: '' }] }, { blocks: [{ text: 1 }] },
+    { blocks: [], unknown: true }, { blocks: [{ text: 'x', id: 'retired' }] },
+    { blocks: [{ text: 'x', status: 'active' }] }, { blocks: [{ text: 'x', scope: 'request' }] },
+    { blocks: [{ text: 'x', authority: true }] }, { blocks: [{ text: 'x', sources: 'not references' }] },
+    ...['interaction', 'understanding', 'working', 'trajectory'].flatMap(section => [
+      { [section]: [] }, { [section]: [{ id: 'old', text: 'Retired schema' }] }, { blocks: [], [section]: [] }
+    ])]) assert.throws(() => decodeSessionStateContent(invalid));
+});
+
+test('narrative state enforces exact block, text, and reference bounds', () => {
+  const source = { sessionId: 's', entryId: 'e', sha256: 'a'.repeat(64) };
+  assert.equal(decodeSessionStateContent({ blocks: Array.from({ length: 1024 }, () => ({ text: 'Repeated narrative is valid.' })) }).blocks.length, 1024);
+  assert.throws(() => decodeSessionStateContent({ blocks: Array.from({ length: 1025 }, () => ({ text: 'Too many blocks.' })) }));
+  assert.equal(decodeSessionStateContent({ blocks: [{ text: 'x'.repeat(65536) }] }).blocks[0].text.length, 65536);
+  assert.throws(() => decodeSessionStateContent({ blocks: [{ text: 'x'.repeat(65537) }] }));
+  assert.equal(decodeSessionStateContent({ blocks: [{ text: 'Exact evidence.', sources: Array.from({ length: 256 }, () => source) }] }).blocks[0].sources.length, 256);
+  assert.throws(() => decodeSessionStateContent({ blocks: [{ text: 'Too many references.', sources: Array.from({ length: 257 }, () => source) }] }));
+});
+
+for (const kind of ['memory', 'jsonl']) {
+  test(`${kind}: aggregate UTF-8 state bound rejects many individually valid narrative blocks atomically`, async t => {
+    const f = await fixture(t, kind, 1024);
+    await f.update('bounded-initial', null, 'Preserve admitted interpretation.');
+    const before = await f.context.inspect();
+    const cut = await f.history.capture();
+    const content = { blocks: Array.from({ length: 10 }, () => ({ text: '文'.repeat(80) })) };
+    assert.doesNotThrow(() => decodeSessionStateContent(content));
+    assert.ok(Buffer.byteLength(JSON.stringify(content), 'utf8') > 1024);
+    assert.ok(JSON.stringify(content).length < 1024, 'The fixture distinguishes UTF-8 bytes from character count.');
+    await assert.rejects(f.context.transition({ expectedWindowId: before.window.windowId,
+      expectedSourceRevision: cut.sourceRevision, expectedSessionStateRevisionId: 'bounded-initial',
+      renewal: true, selection: { retained: [] }, idempotencyKey: 'oversized-narrative', reason: 'Attempt oversized narrative',
+      sessionState: { id: 'oversized-narrative', previousRevisionId: 'bounded-initial', content,
+        capturedHistoryCut: cut, inference: f.inference }
+    }, admission), /bound|byte|capacity|size/i);
+    assert.equal((await f.context.sessionState()).revision.id, 'bounded-initial');
+    assert.equal((await f.context.inspect()).window.windowId, before.window.windowId);
+    assert.equal((await f.sessions.loadReplayState(f.session)).branch.filter(entry => entry.type === 'context_transition').length, 1);
+  });
+}
 
 for (const kind of ['memory', 'jsonl']) {
   test(`${kind}: persisted session-state JSON remains structured with exact runtime attribution`, async t => {
@@ -600,7 +638,7 @@ for (const kind of ['memory', 'jsonl']) {
     assert.equal(state.revision.contentSha256, hashJson(state.content));
     assert.equal(state.revision.contentBytes, Buffer.byteLength(JSON.stringify(state.content)));
     assert.deepEqual(state.content,
-      { working: [{ id: 'notes', text: 'Current interpretation' }] });
+      { blocks: [{ text: 'Current interpretation' }] });
     assert.equal(state.revision.id, (await f.sessions.loadReplayState(f.session)).sessionState.id);
   });
 }
@@ -619,7 +657,7 @@ test('large inline state remains journal-owned with bounded point-projection rea
     policy: { maxSourceBytes: 1024 * 1024 } });
   const state = await context.sessionState();
   const after = reopened.historyReadMetrics(f.session.id);
-  assert.equal(state.content.working[0].text, body);
+  assert.equal(state.content.blocks[0].text, body);
   assert.ok(after.bodyRecordsRead - before.bodyRecordsRead <= 2, 'Only the current committed entry is loaded');
   const history = new HistoryReader({ repository: reopened, session: f.session });
   const source = (await f.context.inspect()).sessionState.source;

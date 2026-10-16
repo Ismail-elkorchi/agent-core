@@ -462,7 +462,7 @@ test('fresh continuation keeps the current session state separate from selected 
   const cut = await f.history.capture();
   const sessionState = {
     id: 'current-understanding', previousRevisionId: null, capturedHistoryCut: cut,
-    content: { understanding: [{ id: 'constraint', text: 'Keep the original Unicode constraint; understanding does not authorize edits.' }] },
+    content: { blocks: [{ text: 'Keep the original Unicode constraint; understanding does not authorize edits.' }] },
     inference: { ownerId: 'owner', invocationId: 'original', requestRef }
   };
   const stateEntry = await f.context.transition({

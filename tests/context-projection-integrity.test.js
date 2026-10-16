@@ -24,7 +24,7 @@ async function fixture(t, kind) {
     const cut = await history.capture();
     return context.transition({ expectedWindowId: (await history.selectedContext(cut))?.windowId ?? null,
       renewal, idempotencyKey: id, reason: 'Update interpretation', selection: { retained: [] },
-      sessionState: { id, previousRevisionId, content: { working: [{ id: 'note', text: id }] },
+      sessionState: { id, previousRevisionId, content: { blocks: [{ text: id }] },
         inference: { ownerId: 'owner', invocationId: id, requestRef }, capturedHistoryCut: cut }
     }, { admit: admitContext });
   };

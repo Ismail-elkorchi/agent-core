@@ -19,7 +19,7 @@ for (const columns of [48, 120])
       cut,
       window: null,
       activeSelection: { status: 'available', selection: { retained: [source] } },
-      sessionState: { revisionId: 'revision', content: { working: [{ id: 'hypothesis', text: 'A model hypothesis' }] }, complete: true },
+      sessionState: { revisionId: 'revision', content: { blocks: [{ text: 'A model hypothesis' }] }, complete: true },
       protectedSources: [source],
       pendingWork: [{ submissionId: 'submission', runId: 'run', state: 'claimed' }],
       legalTransitions: ['unchanged', 'append', 'fresh'],
@@ -69,7 +69,7 @@ for (const columns of [48, 120])
     await runtime.dispatch({ type: 'context.apply' });
     for (let i = 0; i < 300 && selections.length === 0; i++)
       await new Promise((resolve) => setTimeout(resolve, 5));
-    assert.equal(runtime.state().inspection.sessionState.content.working[0].text, 'A model hypothesis');
+    assert.equal(runtime.state().inspection.sessionState.content.blocks[0].text, 'A model hypothesis');
     assert.ok(!('notes' in selections[0].selection));
     assert.deepEqual(selections[0].selection.retained, [source]);
     assert.equal(selections[0].expectedWindowId, null);
