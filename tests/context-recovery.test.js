@@ -1,3 +1,4 @@
+import { admitContext } from './context-admission-fixtures.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
@@ -97,6 +98,7 @@ test('restricted recovery uses the ordinary executor and restores original appli
 test('recovery cannot execute domain side effects or claim a final answer, including after restart', async () => {
   for (const behavior of [() => call('domain_write'), () => response('Task complete without doing it.')]) {
     const f = await fixture();
+    countedCheckpoint(f);
     f.recover(behavior);
     const first = await new AgentRuntime(f.options()).run({ runId: 'blocked', task: 'ACTUAL TASK: keep read-only requirements.' }).result;
     assert.equal(first.state, 'suspended', JSON.stringify(first));
@@ -155,6 +157,7 @@ test('recovery consumes the same inference budget as ordinary work', async () =>
 test('native state from a restricted recovery invocation never binds the resumed domain prefix', async () => {
   const { createProviderContextState } = await import('@agent-core/model');
   const f = await fixture();
+  countedCheckpoint(f);
   f.recover(async request => ({ ...response('Do not replay this recovery-only answer.'),
     output: [{ type: 'protocol', state: await createProviderContextState({
       provider: 'recovery-fixture', protocolRevision: 'conservative-v1', endpoint: 'fixture://recovery',
@@ -306,9 +309,9 @@ test('paged inspection of large session state reads only metadata and retains an
     content: JSON.parse(body),
     inference: { ownerId: 'owner', invocationId: 'state-origin', requestRef } };
   const update = await context.transition({ expectedWindowId: (await context.history.selectedContext(cut))?.windowId ?? null,
-    expectedSourceRevision: cut.sourceRevision, sessionState, idempotencyKey: 'large-session-state', reason: 'Fixture admitted state',
-    selection: await context.freshSelection({ selection: await context.selectSources(cut, {}), model: { provider: f.provider.id, model: 'fixture' }, profile: await f.provider.describeModel(), cut, resetId: 'fixture-state' }) },
-    { admit: async () => ({ compiledInputIdentity: 'fixture-state', capabilityRevision: 'fixture' }) });
+    expectedSourceRevision: cut.sourceRevision, sessionState, renewal: true, idempotencyKey: 'large-session-state', reason: 'Fixture admitted state',
+    selection: await context.selectSources(cut, {}) },
+    { admit: admitContext });
   assert.equal(update.transition.admission.status, 'admitted');
   const reads = [];
   for (const method of ['readVerified', 'readVerifiedRange']) {
@@ -469,8 +472,8 @@ test('oversized full-context state cannot be replaced by a bounded checkpoint pr
     content: { working: [{ id: 'notes', text: 'Important uncertainty: verify the original. ' + '文😀'.repeat(4000) }] },
     inference: { ownerId: 'owner', invocationId: 'state-origin', requestRef } };
   await context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
-    idempotencyKey: 'preview-state', sessionState, reason: 'Fixture admitted state', selection: await context.freshSelection({ selection: await context.selectSources(cut, {}), model: { provider: f.provider.id, model: 'fixture' }, profile: await f.provider.describeModel(), cut, resetId: 'fixture-state' }) },
-    { admit: async () => ({ compiledInputIdentity: 'fixture-state', capabilityRevision: 'fixture' }) });
+    idempotencyKey: 'preview-state', sessionState, renewal: true, reason: 'Fixture admitted state', selection: await context.selectSources(cut, {}) },
+    { admit: admitContext });
   const result = await new AgentRuntime(options).run({ runId: 'preview-recovery', task: 'Current scoped question.' }).result;
   assert.equal(result.state, 'suspended', JSON.stringify(result));
   assert.equal(result.contextAdmission.recovery, 'request_unavailable');

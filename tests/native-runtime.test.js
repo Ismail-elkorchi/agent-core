@@ -485,7 +485,7 @@ for (const [requiresResult, reportsUsage] of [
   });
 }
 
-for (const publication of ['normal', 'lost_receipt', 'rejected']) test(
+for (const publication of ['normal', 'lost_receipt', 'rejected', 'append_noop_fresh']) test(
   `native session-state ${publication} binds each successor to its exact admitted input`,
   { timeout: 10000 },
   async () => {
@@ -510,6 +510,7 @@ for (const publication of ['normal', 'lost_receipt', 'rejected']) test(
     });
     const frames = [];
     const sockets = [];
+    const frameSockets = [];
     let freshRequests = 0;
     const body1 = 'Retain the rationale.';
     const body2 = 'Retain the corrected rationale.';
@@ -518,15 +519,25 @@ for (const publication of ['normal', 'lost_receipt', 'rejected']) test(
       webSocketFactory: () => {
         const socket = new Socket((body, ws) => {
           frames.push(body);
+          frameSockets.push(ws);
           const fresh = !body.previous_response_id;
           if (fresh) freshRequests++;
-          const id = fresh ? `r${freshRequests}` : `ack${freshRequests}`;
-          const output = !fresh || freshRequests === 3 || (publication === 'rejected' && freshRequests > 1)
+          const id = publication === 'append_noop_fresh' ? `continuation-${frames.length}` : fresh ? `r${freshRequests}` : `ack${freshRequests}`;
+          const ordinaryOutput = !fresh || freshRequests === 3 || (publication === 'rejected' && freshRequests > 1)
             ? message(fresh ? 'Finished.' : 'Selection requested.')
             : [{ ...call(id + '-state', 'context_transition'), arguments: JSON.stringify({
-              reason: 'Revise useful understanding.',
+              reason: 'Revise useful understanding.', renewal: true,
               sessionState: { understanding: [{ id: 'rationale', text: freshRequests === 1 ? body1 : body2 }] }
             }) }];
+          const turn = frames.length;
+          const output = publication !== 'append_noop_fresh' ? ordinaryOutput
+            : [1, 3, 5, 7].includes(turn)
+              ? [{ ...call(id + '-state', 'context_transition'), arguments: JSON.stringify({
+                  reason: 'Preserve transport until deliberate renewal.',
+                  sessionState: { understanding: [{ id: 'rationale', text: turn <= 3 ? body1 : body2 }] },
+                  ...(turn === 7 ? { renewal: true } : {})
+                }) }]
+              : message(turn === 9 ? 'Finished.' : 'Selection requested.');
           ws.feed({ type: 'response.created', response: { id,
             ...(body.previous_response_id ? { previous_response_id: body.previous_response_id } : {}) } },
             { type: 'response.completed', response: response(id, output) });
@@ -590,9 +601,28 @@ for (const publication of ['normal', 'lost_receipt', 'rejected']) test(
     const revisions = branch.filter((entry) => entry.type === 'context_transition' && entry.sessionState);
     assert.equal(revisions.length, 2, JSON.stringify((await Array.fromAsync(events.read(result.terminal.runId))).filter(({event}) => event.type === 'context.transition.rejected')));
     assert.equal((await context.sessionState()).content.understanding[0].text, body2);
-    assert.equal(frames.length, 5);
-    assert.equal(sockets.length, 3, 'Each committed state opens a fresh provider session');
-    for (const [index, text] of [body1, body2].entries()) {
+    if (publication === 'append_noop_fresh') {
+      assert.equal(frames.length, 9);
+      assert.equal(sockets.length, 2, 'Append and no-op retain the actual native socket; only explicit renewal replaces it.');
+      assert.ok(frameSockets.slice(0, 8).every(socket => socket === sockets[0]));
+      assert.equal(frameSockets[8], sockets[1]);
+      const transitions = branch.filter(entry => entry.type === 'context_transition');
+      assert.deepEqual(transitions.map(entry => entry.transition.strategy), ['append', 'append', 'fresh']);
+      assert.deepEqual(transitions.map(entry => entry.transition.cause), ['state_update', 'state_update', 'explicit_renewal']);
+      assert.equal(transitions.at(-1).sessionState, undefined);
+      for (const index of [1, 3, 5, 7]) {
+        assert.ok(frames[index].previous_response_id, 'Native result delivery keeps its response lineage.');
+        assert.ok(frames[index].input.some(item => item.type === 'function_call_output'));
+      }
+      assert.ok(JSON.stringify(frames[2]).includes(body1));
+      assert.ok(JSON.stringify(frames[6]).includes(body2));
+      assert.equal(frames[8].previous_response_id, undefined);
+      assert.ok(!JSON.stringify(frames[8]).includes('Session state replacement'));
+    } else {
+      assert.equal(frames.length, 5);
+      assert.equal(sockets.length, 3, 'Each explicitly requested fresh renewal opens a fresh provider session');
+    }
+    for (const [index, text] of (publication === 'append_noop_fresh' ? [] : [body1, body2]).entries()) {
       const wire = frames[(index + 1) * 2];
       assert.equal(wire.previous_response_id, undefined);
       assert.equal(wire.input.filter(item => item.role === 'user' && JSON.stringify(item).includes(text)).length, 1);
@@ -778,6 +808,7 @@ for (const publication of ['normal', 'lost_receipt', 'rejected']) {
     let handle;
     let steered = false;
     let commits = 0;
+    let resultDeliveries = 0;
     let lost = false;
     const commit = sessions.commitContextTransition.bind(sessions);
     sessions.commitContextTransition = async (...args) => {
@@ -799,17 +830,18 @@ for (const publication of ['normal', 'lost_receipt', 'rejected']) {
         if (body.type === 'response.steer') {
           ws.feed({ type: 'response.steer.accepted', steer: { id: 'state-steer', previous_response_id: 'r1' } },
             { type: 'response.completed', response: response('r1', [{ ...call('state-call', 'context_transition'),
-              arguments: JSON.stringify({ reason: 'Remember the corrected understanding.', sessionState: { understanding: [{ id: 'correction', text }] } }) }]) });
-        } else if (!body.previous_response_id && connections === 1) {
+              arguments: JSON.stringify({ reason: 'Remember the corrected understanding.', renewal: true, sessionState: { understanding: [{ id: 'correction', text }] } }) }]) });
+        } else if (!body.previous_response_id && frames.length === 1) {
           ws.feed({ type: 'response.created', response: { id: 'r1' } },
             { type: 'response.output_text.delta', response_id: 'r1', delta: 'Working.' });
-        } else if (body.previous_response_id) {
+        } else if (body.previous_response_id === 'r1' && body.input.some(item => item.type === 'function_call_output')) {
+          resultDeliveries++;
           assert.equal(commits, 0, 'Old native input receives only its mandatory tool result');
           assert.equal(body.input[0].call_id, 'state-call');
           ws.feed({ type: 'response.created', response: { id: 'r2', previous_response_id: 'r1' } },
             { type: 'response.completed', response: response('r2', message('Selection requested.')) });
         } else {
-          assert.equal(commits, publication === 'rejected' ? 0 : 1, 'Fresh state is sent only after publication');
+          assert.equal(commits, publication === 'rejected' ? 0 : 1, 'Staged state is sent only after publication');
           assert.equal(body.input.some(item => item.role === 'user' && JSON.stringify(item).includes(text)), publication !== 'rejected');
           ws.feed({ type: 'response.created', response: { id: 'fresh' } },
             { type: 'response.completed', response: response('fresh', message('Correction remembered.')) });
@@ -838,7 +870,10 @@ for (const publication of ['normal', 'lost_receipt', 'rejected']) {
       assert.equal(commits, 0);
       assert.equal(transitions.length, 0);
       assert.equal((await context.sessionState()).revision, null);
-      assert.equal(frames.length, 4, 'Rejected state is omitted from the unchanged fresh fallback');
+      assert.equal(frames.length, 4, 'Rejected state is omitted from the unchanged continuation');
+      assert.equal(connections, 1, 'A rejected renewal must preserve the original provider session.');
+      assert.equal(resultDeliveries, 1, 'The original mandatory result is delivered exactly once.');
+      assert.equal((await sessions.loadReplayState(descriptor)).branch.filter(entry => entry.type === 'tool_call').length, 1);
       return;
     }
     assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify({ result, errors: socket.errors, transitions: (await Array.fromAsync(events.read(runId))).filter(({event}) => event.type === 'context.transition.rejected' || event.type === 'model.failed' || event.type === 'model.stream.failed') }));
@@ -847,6 +882,7 @@ for (const publication of ['normal', 'lost_receipt', 'rejected']) {
     assert.equal(lost, publication === 'lost_receipt');
     assert.equal(frames.length, 4);
     assert.equal(connections, 2);
+    assert.equal(resultDeliveries, 1);
     assert.equal((await context.sessionState()).content.understanding[0].text, text);
     const extension = audit.find(({ event }) => event.type === 'inference.extended').event;
     const origin = await inference.sessionStateOrigin(runId, extension.invocationId);

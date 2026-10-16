@@ -1,3 +1,4 @@
+import { admittedSelection, admitContext } from './context-admission-fixtures.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -467,9 +468,9 @@ test('fresh continuation keeps the current session state separate from selected 
   const stateEntry = await f.context.transition({
     expectedWindowId: (await f.history.selectedContext(cut))?.windowId ?? null,
     expectedSourceRevision: cut.sourceRevision, expectedSessionStateRevisionId: null,
-    sessionState, idempotencyKey: 'current-understanding', reason: 'Seed admitted fixture understanding.',
-    selection: await f.context.freshSelection({ selection: await f.context.selectSources(cut, {}), model: { provider: 'portable', model: 'model' }, profile: profile(), cut, resetId: 'seed-state' })
-  }, { admit: async () => ({ compiledInputIdentity: 'fixture-input', capabilityRevision: 'fixture' }) });
+    sessionState, renewal: true, idempotencyKey: 'current-understanding', reason: 'Seed admitted fixture understanding.',
+    selection: await f.context.selectSources(cut, {})
+  }, { admit: async input => ({ ...await admitContext(input), selection: admittedSelection(input, { provider: 'portable', model: 'model' }) }) });
   await f.agent.changeModel({ selection: { provider: 'portable', model: 'model' }, profile: profile(), artifacts: f.artifacts });
   const accepted = await f.agent.submit({ task: 'Explain the preserved constraint without editing.' });
   const result = await accepted.completion;
@@ -508,14 +509,11 @@ test('retained exact excerpts survive restart as attributed evidence without nat
   const source = sourceRef(f.session.id, original.answer);
   const excerpt = { source, offset: 4, bytes: 8 };
   const cut = await f.history.capture();
-  const selection = await f.context.freshSelection({
-    selection: { retained: [sourceRef(f.session.id, original.input)], excerpts: [excerpt] },
-    model: { provider: 'portable', model: 'model' }, profile: profile(), cut, resetId: 'fixture-excerpt-reset'
-  });
+  const selection = { retained: [sourceRef(f.session.id, original.input)], excerpts: [excerpt] };
   await f.context.transition({
     expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
     idempotencyKey: 'fixture-excerpt-selection', reason: 'Seed admitted exact evidence selection.', selection
-  }, { admit: async () => ({ compiledInputIdentity: 'fixture-compiled-evidence', capabilityRevision: 'fixture' }) });
+  }, { admit: async input => ({ ...await admitContext(input), selection: admittedSelection(input, { provider: 'portable', model: 'model' }) }) });
   await f.agent.close();
 
   const sessions = new JsonlSessionRepository({ rootDir: root });

@@ -24,9 +24,11 @@ Finishing a run does not evict its conversation. Context transitions change
 retained attention explicitly, while original sources remain available within
 their authorized retention scope. Session state is one revisioned body of attributed
 understanding, optionally including a working section. It is not authority or proof
-that work passed verification. Fresh windows require admitted requests and an explicit
-provider reset at a safe protocol boundary; ordinary reasoning and tool continuity
-remain intact within each window. See
+that work passed verification. State-only updates can append attributed replacement
+notices without resetting lawful provider continuation; effective no-ops publish
+nothing. Fresh continuation requires an admitted request and supported provider
+reset at a safe protocol boundary. Callers request deliberate renewal through
+`renewal: true` on the same transition operation. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for ownership and recovery contracts.
 The [context composition guide](docs/CONTEXT.md) describes the public services,
 their boundaries, and the policy evaluation runner.

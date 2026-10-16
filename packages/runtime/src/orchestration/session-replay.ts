@@ -18,7 +18,7 @@ import type { ArtifactRef, ArtifactRepository, EventRepository } from '@agent-co
 import { decodeToolCall } from '@agent-core/tools';
 import type { AgentEvent, AgentProviderStateSummary } from '../events.js';
 import type { HistorySourceCut } from '../history/contracts.js';
-import type { ContextWindowRecord } from '../context/contracts.js';
+import type { ContextWindowRecord, ContextStateNotice } from '../context/contracts.js';
 import { ContextSourceCapacityError } from '../run/context-admission.js';
 import { HistorySourceTooLargeError, HistoryReader, sourceRef } from '../history/reader.js';
 import { readAdmittedModelInput, type AdmittedModelInput } from '../inference/input.js';
@@ -67,6 +67,13 @@ export async function rebuildModelWindowFromRepositories(input: {
       artifacts: input.artifacts, profile: input.profile,
       ...(input.currentRunId === undefined ? {} : { currentRunId: input.currentRunId })
     });
+  modelWindow.setStateSequence(view?.contextWindow?.stateSequence);
+  const stateNotices = input.history && view?.contextWindow
+    ? await readContextStateNotices(input.history, view.contextWindow, view.cut)
+    : [];
+  const currentNotices = stateNotices.filter(notice =>
+    notice.after.ledgerHeads?.some(head => head.runId === input.currentRunId));
+  const priorNotices = stateNotices.filter(notice => !currentNotices.includes(notice));
   const selected = applicationHistory(view?.entries ?? []);
   const invalidatedProviderStates: { state: ProviderContextState; reason: string }[] = [];
   const target = {
@@ -107,16 +114,26 @@ export async function rebuildModelWindowFromRepositories(input: {
     active.flatMap((entry) => (entry.type === 'steering' ? [entry.deliveryId] : []))
   );
   const selectedWindow = view?.contextWindow !== undefined;
+  const excerpts = input.history && view?.contextWindow?.selection.excerpts?.length
+    ? await input.history.readExcerpts(view.contextWindow.selection.excerpts, view.cut, SELECTED_SOURCE_LIMITS.bytes)
+    : [];
+  let excerptsRecorded = false;
+  const recordExcerpts = () => {
+    if (excerptsRecorded) return;
+    recordContextExcerpts(modelWindow, excerpts);
+    excerptsRecorded = true;
+  };
   let replayedToolResults = 0;
   replayedToolResults += await replaySourceEntries(
     modelWindow,
     view?.cut.sessionId ?? 'local',
     prior,
     input.artifacts,
-    portableSources
+    portableSources,
+    undefined,
+    input.history ? { history: input.history, notices: priorNotices, beforeBind: recordExcerpts } : undefined
   );
-  if (input.history && view?.contextWindow?.selection.excerpts?.length)
-    recordContextExcerpts(modelWindow, await input.history.readExcerpts(view.contextWindow.selection.excerpts, view.cut, SELECTED_SOURCE_LIMITS.bytes));
+  recordExcerpts();
   // Only the owning unfinished run may use an open ledger tail. Completed history
   // is branch-scoped above; reading entire historical ledgers would cross a fork.
   let replayedLedgers = 0;
@@ -130,9 +147,19 @@ export async function rebuildModelWindowFromRepositories(input: {
   for (const runId of [...new Set(input.runIds ?? [])]) {
     replayedLedgers++;
     const resetHead = view?.contextWindow?.selection.continuity
-      ? view.contextWindow.historyPosition.ledgerHeads?.find(head => head.runId === runId)
+      ? view.contextWindow.stateSequence.lineage?.ledgerHeads?.find(head => head.runId === runId)
       : undefined;
+    const runNotices = currentNotices.filter(notice =>
+      notice.after.ledgerHeads?.some(head => head.runId === runId));
+    let noticeIndex = 0;
     for await (const record of input.events.read(runId)) {
+      while (noticeIndex < runNotices.length) {
+        const notice = runNotices[noticeIndex];
+        const head = notice?.after.ledgerHeads?.find(item => item.runId === runId);
+        if (!notice || !head || record.sequence <= head.sequence) break;
+        modelWindow.recordStateNotice(notice);
+        noticeIndex++;
+      }
       const event = record.event;
       if (event.type === 'turn.snapshot.created' && event.snapshot.contextRecovery)
         recoveryTurns.add(`${event.snapshot.turnId}:${String(event.snapshot.requestAttempt)}`);
@@ -248,6 +275,8 @@ export async function rebuildModelWindowFromRepositories(input: {
         }
       }
     }
+    // A notice may be the final committed contribution, with no later ledger event yet.
+    for (const notice of runNotices.slice(noticeIndex)) modelWindow.recordStateNotice(notice);
   }
   invalidatedProviderStates.push(...modelWindow.invalidateProviderState(target));
   const incompatibleState = invalidatedProviderStates[0];
@@ -268,6 +297,64 @@ export async function rebuildModelWindowFromRepositories(input: {
 }
 
 export const SELECTED_SOURCE_LIMITS = Object.freeze({ bytes: 8 * 1024 * 1024, entries: 10000 });
+
+/** Follow immutable branch-owned state-sequence records; never reconstruct notices from latest state. */
+export async function readContextStateNotices(
+  history: HistoryReader,
+  window: ContextWindowRecord,
+  cut: HistorySourceCut
+): Promise<readonly ContextStateNotice[]> {
+  const notices: ContextStateNotice[] = [];
+  const visited = new Set<string>();
+  let bytes = new TextEncoder().encode(JSON.stringify(window)).byteLength;
+  const checkpoint = window.stateSequence.checkpointRevisionId;
+  const lineage = canonicalJsonString(window.stateSequence.lineage);
+  for (;;) {
+    if (visited.has(window.windowId)) throw new Error('Context state sequence ancestry contains a cycle.');
+    visited.add(window.windowId);
+    const stateSequence = window.stateSequence;
+    if (stateSequence.checkpointRevisionId !== checkpoint || canonicalJsonString(stateSequence.lineage) !== lineage)
+      throw new Error('Context state sequence ancestry changed its immutable checkpoint.');
+    if (stateSequence.notice) {
+      if (!(await history.extendsCut(stateSequence.notice.after, cut)))
+        throw new Error('Context state notice is outside this branch history.');
+      notices.push(stateSequence.notice);
+    }
+    if (bytes > SELECTED_SOURCE_LIMITS.bytes || visited.size >= SELECTED_SOURCE_LIMITS.entries)
+      throw new ContextSourceCapacityError(cut,
+        bytes > SELECTED_SOURCE_LIMITS.bytes
+          ? { unit: 'bytes', limit: SELECTED_SOURCE_LIMITS.bytes, observedAtLeast: bytes }
+          : { unit: 'entries', limit: SELECTED_SOURCE_LIMITS.entries, observedAtLeast: visited.size });
+    if (!stateSequence.parent) break;
+    const metadata = await history.metadata(stateSequence.parent, cut);
+    if (!metadata) throw new Error('Context state sequence ancestor is unavailable on this branch.');
+    const projectedBytes = bytes + metadata.sourceBytes;
+    if (projectedBytes > SELECTED_SOURCE_LIMITS.bytes)
+      throw new ContextSourceCapacityError(cut, {
+        unit: 'bytes', limit: SELECTED_SOURCE_LIMITS.bytes, observedAtLeast: projectedBytes
+      }, stateSequence.parent);
+    const parent = await history.resolve(stateSequence.parent, cut, Math.max(1, SELECTED_SOURCE_LIMITS.bytes - bytes));
+    bytes = projectedBytes;
+    if (parent?.type !== 'context_transition')
+      throw new Error('Context state sequence ancestor is unavailable on this branch.');
+    if (window.parentWindowId !== parent.window.windowId)
+      throw new Error('Context state sequence parent does not match its committed window ancestry.');
+    window = parent.window;
+  }
+  notices.reverse();
+  let previousRevisionId = checkpoint;
+  let previousCut = window.stateSequence.lineage;
+  for (const notice of notices) {
+    if (notice.previousRevisionId !== previousRevisionId)
+      throw new Error('Context state notices do not form an immutable revision sequence.');
+    if (previousCut && !(await history.extendsCut(previousCut, notice.after)))
+      throw new Error('Context state notices changed their committed order.');
+    previousRevisionId = notice.revisionId;
+    previousCut = notice.after;
+  }
+  return Object.freeze(notices);
+}
+
 
 export interface SelectedHistorySources {
   readonly sourceBytes: number;
@@ -373,7 +460,12 @@ export async function replaySourceEntries(
   prior: readonly SessionBranchEntry[],
   artifacts?: ArtifactRepository,
   portableSources: ReadonlySet<string> = new Set(),
-  currentRunId?: string
+  currentRunId?: string,
+  stateSequence?: {
+    readonly history: HistoryReader;
+    readonly notices: readonly ContextStateNotice[];
+    readonly beforeBind?: () => void;
+  }
 ): Promise<number> {
   prior = applicationHistory(prior);
   let toolResults = 0;
@@ -388,8 +480,17 @@ export async function replaySourceEntries(
         )
     );
   const exchanges = correlateToolExchanges(prior);
+  let noticeIndex = 0;
   for (const entry of prior) {
     const source = sourceRef(sessionId, entry);
+    if (stateSequence) {
+      while (noticeIndex < stateSequence.notices.length) {
+        const notice = stateSequence.notices[noticeIndex];
+        if (!notice || await stateSequence.history.metadata(source, notice.after)) break;
+        modelWindow.recordStateNotice(notice, false);
+        noticeIndex++;
+      }
+    }
     const key = `${source.sessionId}:${source.entryId}:${source.sha256}`;
     const active = 'runId' in entry && entry.runId === currentRunId;
     const record = (id: string, item: ModelInputItem) => {
@@ -449,6 +550,9 @@ export async function replaySourceEntries(
       if (entry === boundResponse) {
         if (!artifacts || !entry.inferenceInput)
           throw new Error('Prefix-bound reasoning is missing its protected inference input.');
+        // The admitted prefix already contains the frozen source presentation. Record
+        // its identities before binding so it is not appended to that prefix twice.
+        stateSequence?.beforeBind?.();
         modelWindow.bindContinuation(
           await readAdmittedModelInput(artifacts, entry.inferenceInput)
         );
@@ -497,6 +601,8 @@ export async function replaySourceEntries(
       toolResults++;
     }
   }
+  for (const notice of stateSequence?.notices.slice(noticeIndex) ?? [])
+    modelWindow.recordStateNotice(notice, false);
   return toolResults;
 }
 
@@ -637,7 +743,7 @@ export async function assertPortableHistoryCompatibility(input: {
   readonly sessionId: string;
   readonly entries: readonly SessionBranchEntry[];
   readonly profile: ModelProfile;
-  readonly artifacts: ArtifactRepository;
+  readonly artifacts?: ArtifactRepository | undefined;
 }): Promise<void> {
   assertPortableHistorySources(input.entries, input.profile);
   const window = new ModelWindow(new RequestTokenEstimator());

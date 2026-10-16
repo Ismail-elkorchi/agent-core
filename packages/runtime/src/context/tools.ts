@@ -30,6 +30,7 @@ export function contextToolDefinitions(options: {
   const transition = z
     .strictObject({
       reason: z.string().min(1),
+      renewal: z.boolean().optional(),
       retain: sources.optional(),
       add: sources.optional(),
       release: sources.optional(),
@@ -56,13 +57,7 @@ export function contextToolDefinitions(options: {
       origin,
       cut,
       expectedWindowId: window?.windowId ?? null,
-      selection: {
-        ...selection,
-        continuity: {
-          kind: 'fresh' as const, resetId: identity,
-          model: options.context.currentModel(), sources: selection.retained
-        }
-      },
+      selection,
       identity,
       stateId: `session-state-${hashJson({ invocation: identity, content: value.sessionState ?? null })}`
     };
@@ -114,6 +109,7 @@ export function contextToolDefinitions(options: {
         ...(sessionState ? { sessionState } : {}),
         idempotencyKey: value.identity,
         reason: value.reason,
+        ...(value.renewal === undefined ? {} : { renewal: value.renewal }),
         selection: value.selection
       })
     );
@@ -188,7 +184,7 @@ export function contextToolDefinitions(options: {
       name: `${prefix}_transition`,
       implementationId: 'agent-core.context-transition.v1',
       description:
-        `${SESSION_STATE_GUIDANCE} Change the active context without summarizing history. Add or release source references; release applies to the complete exchange. Supply retain to replace optional history (an empty array releases it all). Active input and required exchanges remain protected. Optionally replace structured sessionState in the same atomic transition. recentFrom retains the active source suffix beginning at that exact reference, with complete exchanges. excerpts replaces retained exact text spans ({source,offset,bytes}, UTF-8 byte boundaries); excerpts are attributed historical evidence, not conversation replay, and cannot replace mandatory originals. Every transition starts fresh provider continuation while keeping the session and selected originals. No change requires no call. A successful scheduled receipt is pending: the runtime first completes this exchange and admits the actual next request before atomically publishing state and selection.`,
+        `${SESSION_STATE_GUIDANCE} Change the active context without summarizing history. Add or release source references; release applies to the complete exchange. Supply retain to replace optional history (an empty array releases it all). Active input and required exchanges remain protected. Optionally replace structured sessionState in the same atomic transition. recentFrom retains the active source suffix beginning at that exact reference, with complete exchanges. excerpts replaces retained exact text spans ({source,offset,bytes}, UTF-8 byte boundaries); excerpts are attributed historical evidence, not conversation replay, and cannot replace mandatory originals. Source-preserving state updates preserve lawful provider continuation; selection edits, capacity recovery, and incompatible prefixes start fresh. Set renewal:true to deliberately start fresh even without a content change. Identical updates are unchanged. Clearing state does not delete history or earlier provider-visible state. A successful scheduled receipt is pending: the runtime first completes this exchange and admits the actual next request before atomically publishing state and selection.`,
       schema: transition,
       outputSchema: z.json().transform((value) => parseJsonValue(value)),
       effectEnvelope: {

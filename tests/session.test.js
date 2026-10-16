@@ -1,3 +1,4 @@
+import { admitContext } from './context-admission-fixtures.js';
 import { InMemoryArtifactRepository } from '@agent-core/persistence';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -1062,12 +1063,8 @@ test('context transitions commit once without evicting original session records'
     expectedSourceRevision: (await history.capture()).sourceRevision,
     idempotencyKey: 'retain-once',
     reason: 'Explicit attention boundary',
-    selection: {
-      retained: view.entries.map((entry) => sourceRef(descriptor.id, entry)),
-      continuity: { kind: 'fresh', resetId: 'retain-once',
-        model: { provider: 'test', model: 'model' },
-        sources: view.entries.map((entry) => sourceRef(descriptor.id, entry)) }
-    }
+    renewal: true,
+    selection: { retained: view.entries.map((entry) => sourceRef(descriptor.id, entry)) }
   };
   const agent = new AgentSession({
     descriptor,
@@ -1081,7 +1078,7 @@ test('context transitions commit once without evicting original session records'
     }
   });
   await assert.rejects(agent.transitionContext(request), /compiled next-request admission/);
-  const admission = { admit: async () => ({ compiledInputIdentity: 'session-fixture', capabilityRevision: 'fixture' }) };
+  const admission = { admit: admitContext };
   const first = await context.transition(request, admission);
   assert.equal(Object.isFrozen(first.window.selection), true);
   assert.equal((await context.transition(request, admission)).id, first.id);

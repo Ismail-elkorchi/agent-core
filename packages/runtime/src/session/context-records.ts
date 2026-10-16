@@ -2,6 +2,7 @@ import { latestSessionState, assertSessionStateRevision } from './session-state.
 import { hashJson, PersistenceConflictError } from '@agent-core/persistence';
 import type { ContextTransitionCommit, ContextWindowRecord } from '../context/contracts.js';
 import { contextEntrySchema } from '../context/schema.js';
+import { createContextStateNotice } from '../context/state-notice.js';
 import type {
   SessionBranchEntry,
   SessionContextTransitionEntry,
@@ -54,7 +55,7 @@ export function validateContextCommit(
 ): void {
   validateContextCommitState(sessionId, {
     leafId: branch.at(-1)?.id ?? null,
-    windowId: latestContextWindow(branch)?.windowId ?? null,
+    context: [...branch].reverse().find((entry): entry is SessionContextTransitionEntry => entry.type === 'context_transition') ?? null,
     sessionState: latestSessionState(branch),
     refs: new Map(branch.map(entry => [entry.id, hashJson(entry)])),
     finalizations
@@ -65,7 +66,7 @@ export function validateContextCommitState(
   sessionId: string,
   source: {
     readonly leafId: string | null;
-    readonly windowId: string | null;
+    readonly context: SessionContextTransitionEntry | null;
     readonly sessionState: import('./session-state.js').SessionStateRevision | null;
     readonly refs: ReadonlyMap<string, string>;
     readonly finalizations: readonly Pick<SessionRunFinalization, 'runId' | 'throughEntryId'>[];
@@ -76,7 +77,7 @@ export function validateContextCommitState(
   assertSessionStateRevision(source.sessionState, input.expectedSessionStateRevisionId);
   if (input.sessionState) assertSessionStateRevision(source.sessionState, input.sessionState.previousRevisionId);
   const leaf = source.leafId;
-  const currentWindowId = source.windowId;
+  const currentWindowId = source.context?.window.windowId ?? null;
   if (
     input.expectedLeafId !== leaf ||
     input.expectedSourceRevision !== sourceRevision ||
@@ -96,7 +97,29 @@ export function validateContextCommitState(
     input.transition.windowId !== input.window.windowId
   )
     throw new Error('Context transition identities do not match its captured boundary.');
+  const stateSequence = input.window.stateSequence;
+  if (hashJson(stateSequence) !== input.transition.stateSequenceFingerprint)
+    throw new Error('Context state sequence fingerprint differs from the admitted state sequence.');
+  if (input.transition.strategy === 'fresh' &&
+      (stateSequence.parent !== null || stateSequence.notice !== undefined ||
+        stateSequence.checkpointRevisionId !== (input.sessionState?.id ?? source.sessionState?.id ?? null) ||
+        hashJson(stateSequence.lineage) !== hashJson(cut)))
+    throw new Error('Fresh context state sequence does not match its checkpoint and lineage.');
+  if (input.transition.strategy === 'append') {
+    const previous = source.context;
+    const expectedParent = previous
+      ? { sessionId, entryId: previous.id, sha256: hashJson(previous) }
+      : null;
+    if (hashJson(stateSequence.parent) !== hashJson(expectedParent) ||
+        stateSequence.checkpointRevisionId !== (previous ? previous.window.stateSequence.checkpointRevisionId : source.sessionState?.id ?? null) ||
+        hashJson(stateSequence.lineage) !== hashJson(previous?.window.stateSequence.lineage ?? null) ||
+        hashJson(input.window.selection.continuity ?? null) !== hashJson(previous?.window.selection.continuity ?? null))
+      throw new Error('Append state sequence must preserve its exact parent, checkpoint and continuation lineage.');
+  }
+  assertStateNotice(input.transition.strategy, stateSequence, input.sessionState, cut);
   const refs = source.refs;
+  if (stateSequence.parent && (stateSequence.parent.sessionId !== sessionId || refs.get(stateSequence.parent.entryId) !== stateSequence.parent.sha256))
+    throw new Error('Context state sequence parent is unavailable on this branch.');
   for (const ref of [...input.window.selection.retained, ...(input.window.selection.excerpts ?? []).map(excerpt => excerpt.source)]) {
     const ledger = ref.event
       ? cut.ledgerHeads?.find((head) => head.runId === ref.event?.runId)
@@ -138,9 +161,36 @@ export function contextCommitRetry(
   return existing;
 }
 
+/** Hashes authenticate record identity, not the relationship between state and its presentation. */
+function assertStateNotice(
+  strategy: 'append' | 'fresh',
+  stateSequence: ContextWindowRecord['stateSequence'],
+  state: import('./session-state.js').SessionStateChange | undefined,
+  cut: ContextWindowRecord['historyPosition']
+): void {
+  const expected = strategy === 'append' && state
+    ? createContextStateNotice(state.previousRevisionId, state.id, state.content, cut)
+    : null;
+  if (hashJson(stateSequence.notice ?? null) !== hashJson(expected))
+    throw new Error('Context state notice differs from its singular committed state revision.');
+  if (strategy === 'fresh' &&
+      (stateSequence.parent !== null || stateSequence.notice !== undefined ||
+        hashJson(stateSequence.lineage) !== hashJson(cut) ||
+        (state !== undefined && stateSequence.checkpointRevisionId !== state.id)))
+    throw new Error('Fresh context state sequence does not match its checkpoint and lineage.');
+}
+
 /** Decode the current format only. Committed transitions are immutable source records. */
 export function decodeContextTransitionEntry(value: unknown): SessionContextTransitionEntry {
   const entry = contextEntrySchema.parse(value);
+  assertStateNotice(entry.transition.strategy, entry.window.stateSequence,
+    entry.sessionState ? { id: entry.id, ...entry.sessionState } : undefined,
+    entry.window.historyPosition);
+  if (entry.transition.strategy === 'append' &&
+      ((entry.window.stateSequence.parent === null) !== (entry.window.parentWindowId === null) ||
+        (entry.window.stateSequence.parent !== null &&
+          entry.window.stateSequence.parent.sessionId !== entry.window.historyPosition.sessionId)))
+    throw new Error('Append state sequence must reference its preceding context window on the same session.');
   if (
     entry.transition.windowId !== entry.window.windowId ||
     entry.transition.previousWindowId !== entry.window.parentWindowId
@@ -148,6 +198,7 @@ export function decodeContextTransitionEntry(value: unknown): SessionContextTran
     throw new Error('Context transition record identities disagree.');
   }
   const fingerprint = hashJson({
+    ...(entry.transition.requestedRenewal === undefined ? {} : { renewal: entry.transition.requestedRenewal }),
     ...(entry.sessionState ? { sessionState: { id: entry.id, ...entry.sessionState } } : {}),
     ...(entry.transition.requestedSessionStateRevisionId === undefined
       ? {}
@@ -160,13 +211,14 @@ export function decodeContextTransitionEntry(value: unknown): SessionContextTran
       retained: entry.window.selection.retained,
       ...(entry.window.selection.excerpts ? { excerpts: entry.window.selection.excerpts } : {}),
       ...(entry.window.selection.protected ? { protected: entry.window.selection.protected } : {}),
-      continuity: entry.window.selection.continuity
     },
     reason: entry.window.reason,
     ...(entry.transition.requestedSourceRevision === undefined
       ? {}
       : { expectedSourceRevision: entry.transition.requestedSourceRevision })
   });
+  if (hashJson(entry.window.stateSequence) !== entry.transition.stateSequenceFingerprint)
+    throw new Error('Context state sequence fingerprint does not match its committed bytes.');
   if (hashJson(entry.window.selection) !== entry.transition.selectionFingerprint)
     throw new Error(
       'Context selected provider state fingerprint does not match its committed window.'

@@ -1,3 +1,4 @@
+import { admittedSelection } from './context-admission-fixtures.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { compileModelRequest, conservativeProtocolCapabilities } from '@agent-core/model';
@@ -27,8 +28,36 @@ test('one selected-metadata scan per captured cut is independent of released arc
     });
     const setup = new ContextService({ repository: sessions, session, artifacts,
       policy: { maxSourceBytes: 100000, selfContained: true } });
-    await setup.transition({ expectedWindowId: null, expectedSourceRevision: (await setup.history.capture()).sourceRevision,
-      selection: await setup.freshSelection({ selection: { retained: [] }, model: { provider: profile.provider, model: profile.id }, profile, cut: await setup.history.capture(), resetId: 'archive-reset' }), reason: 'Explicitly release optional archived sources.', idempotencyKey: 'archive' }, { admit: admitEmpty });
+    const comparison = { pages: 0, scanned: 0, positions: 0, hydrated: 0, firstPageScanned: 0 };
+    const setupPage = setup.history.metadataPage.bind(setup.history);
+    const setupPosition = setup.history.sourcePosition.bind(setup.history);
+    const setupResolve = setup.history.resolve.bind(setup.history);
+    t.mock.method(setup.history, 'metadataPage', async (...args) => {
+      const page = await setupPage(...args); comparison.pages++; comparison.scanned += page.scanned;
+      if (comparison.pages === 1) comparison.firstPageScanned = page.scanned;
+      return page;
+    });
+    t.mock.method(setup.history, 'sourcePosition', async (...args) => { comparison.positions++; return setupPosition(...args); });
+    t.mock.method(setup.history, 'resolve', async (...args) => { comparison.hydrated++; return setupResolve(...args); });
+    // Measure the required protocol-closure scan at this exact cut without publishing. Explicit renewal skips equality comparison.
+    await assert.rejects(setup.transition({ expectedWindowId: null, renewal: true, selection: { retained: [] },
+      reason: 'Measure required closure without publication.', idempotencyKey: 'closure-control' },
+    { admit: async () => { throw new Error('Closure-only measurement'); } }), /Closure-only measurement/);
+    const closure = { ...comparison };
+    Object.assign(comparison, { pages: 0, scanned: 0, positions: 0, hydrated: 0, firstPageScanned: 0 });
+    // No explicit renewal: the runtime must compare effective selections without materializing the discarded archive.
+    const released = await setup.transition({ expectedWindowId: null, expectedSourceRevision: (await setup.history.capture()).sourceRevision,
+      selection: { retained: [] }, reason: 'Explicitly release optional archived sources.', idempotencyKey: 'archive' }, { admit: admitEmpty });
+    assert.equal(released.transition.strategy, 'fresh');
+    assert.equal(released.transition.cause, 'selection_change');
+    assert.equal(comparison.positions, 0, 'Selection comparison must not position each discarded source.');
+    assert.equal(comparison.hydrated, 0, 'Selection comparison must not hydrate discarded originals.');
+    // Protocol-closure validation still reads every discarded exchange. Equality adds exactly one bounded page before its first mismatch.
+    assert.equal(comparison.pages, closure.pages + 1,
+      `Selection comparison must add only one page beyond required protocol closure: ${JSON.stringify(comparison)}`);
+    assert.ok(comparison.firstPageScanned <= 1000);
+    assert.equal(comparison.scanned, closure.scanned + comparison.firstPageScanned,
+      `Comparison cannot perform an extra full-archive scan: ${JSON.stringify(comparison)}`);
     await sessions.appendInput(session, { runId: 'active', task: 'Fixed active input.' });
     await sessions.appendAssistant(session, { runId: 'active', identity: { turnId: 'active', turnIndex: 1, requestAttempt: 1 }, content: 'Fixed active response.' });
     const history = new HistoryReader({ repository: sessions, session, artifacts });
@@ -59,7 +88,7 @@ test('one selected-metadata scan per captured cut is independent of released arc
     await context.assertSourceCapacity(capture);
     await context.capacityFeedback(compiled);
     assert.deepEqual(counts, cold, 'Warm admission and feedback must reuse the exact-cut source facts.');
-    evidence.push({ archiveSize, activeSources: 2, uncached, cold, warm: { pages: 0, scanned: 0, pointed: 0 } });
+    evidence.push({ archiveSize, activeSources: 2, closure, comparison, uncached, cold, warm: { pages: 0, scanned: 0, pointed: 0 } });
     assert.deepEqual(uncached, { pages: 2, scanned: 6, pointed: 0 });
     assert.equal(cold.pages, 1);
     assert.equal(cold.pointed, 0);
@@ -101,7 +130,7 @@ test('JSONL cold reopen reads bounded projection paths while active metadata wor
       archive.add(entry.id);
     }
     const setup = new ContextService({ repository: memory, session, artifacts, policy: { maxSourceBytes: 100000, selfContained: true } });
-    await setup.transition({ expectedWindowId: null, selection: await setup.freshSelection({ selection: { retained: [] }, model: { provider: profile.provider, model: profile.id }, profile, cut: await setup.history.capture(), resetId: 'archive-reset' }),
+    await setup.transition({ expectedWindowId: null, selection: { retained: [] },
       reason: 'Release complete optional archive.', idempotencyKey: 'release' }, { admit: admitEmpty });
     await memory.appendInput(session, { runId: 'active', task: 'Fixed active input.' });
     await memory.appendAssistant(session, { runId: 'active', identity: { turnId: 'active', turnIndex: 1, requestAttempt: 1 }, content: 'Fixed active response.' });
@@ -161,8 +190,8 @@ test('JSONL cold reopen reads bounded projection paths while active metadata wor
   t.diagnostic(JSON.stringify({ measurement: 'JSONL cold reopen and warm source checks', evidence }));
 });
 
-async function admitEmpty() {
+async function admitEmpty(input) {
  const request = { model: profile.id, messages: [{ role: 'user', content: 'Continue.' }] };
  const compiled = await compileModelRequest({ request, body: request, profile, endpoint: 'fixture://metadata-count' });
- return { compiledInputIdentity: compiled.inputIdentity, capabilityRevision: compiled.capabilityRevision };
+ return { compiledInputIdentity: compiled.inputIdentity, capabilityRevision: compiled.capabilityRevision, selection: admittedSelection(input, { provider: profile.provider, model: profile.id }) };
 }

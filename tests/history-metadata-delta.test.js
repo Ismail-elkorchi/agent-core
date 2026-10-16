@@ -1,3 +1,4 @@
+import { admitContext } from './context-admission-fixtures.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
@@ -91,9 +92,8 @@ test('a changed selection and later mirrors cannot resurrect released sources', 
   const cut = await f.history.capture();
   const retained = await f.context.protectedSources(cut);
   await f.context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
-    idempotencyKey: 'release', reason: 'Release completed answer', selection: { retained,
-      continuity: { kind: 'fresh', resetId: 'release', model: { provider: 'fixture', model: 'context' }, sources: retained } } },
-    { admit: async () => ({ compiledInputIdentity: 'fixture', capabilityRevision: 'fixture' }) });
+    idempotencyKey: 'release', reason: 'Release completed answer', renewal: true, selection: { retained } },
+    { admit: admitContext });
   await f.context.assertSourceCapacity();
   await f.sessions.appendAssistant(f.session, { runId: 'run', identity, content: 'Answer 0' });
   const selected = await f.context.selectSources(await f.history.capture(), {});
@@ -105,9 +105,8 @@ test('an exact cached cut is revalidated after branch replacement', async () => 
   const cut = await f.history.capture();
   const retained = await f.context.protectedSources(cut);
   const point = await f.context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
-    idempotencyKey: 'branch-point', reason: 'Branch point', selection: { retained,
-      continuity: { kind: 'fresh', resetId: 'branch-point', model: { provider: 'fixture', model: 'context' }, sources: retained } } },
-    { admit: async () => ({ compiledInputIdentity: 'fixture', capabilityRevision: 'fixture' }) });
+    idempotencyKey: 'branch-point', reason: 'Branch point', renewal: true, selection: { retained } },
+    { admit: admitContext });
   await f.answer(0);
   const stale = await f.history.capture();
   await f.context.assertSourceCapacity(stale);

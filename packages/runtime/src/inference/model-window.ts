@@ -16,6 +16,7 @@ import {
 import { randomUUID } from 'node:crypto';
 import type { AdmittedModelInput } from './input.js';
 import type { EventReference } from '@agent-core/persistence';
+import type { ContextWindowRecord, ContextStateNotice } from '../context/contracts.js';
 
 export interface ModelWindowMessages {
   readonly messages: readonly ModelInputItem[];
@@ -72,6 +73,30 @@ export interface RecordToolResultInput {
 }
 
 export class ModelWindow {
+  private contextStateSequence: ContextWindowRecord['stateSequence'] | undefined;
+  private readonly stateNotices = new Map<string, string>();
+
+  setStateSequence(stateSequence: ContextWindowRecord['stateSequence'] | undefined): void {
+    this.contextStateSequence = stateSequence;
+  }
+
+  stateSequence(): ContextWindowRecord['stateSequence'] | undefined {
+    return this.contextStateSequence;
+  }
+
+  /** Reapply the exact durable presentation once; state text never becomes authority. */
+  recordStateNotice(notice: ContextStateNotice, active = true): void {
+    const identity = canonicalJsonString(notice);
+    const previous = this.stateNotices.get(notice.id);
+    if (previous !== undefined) {
+      if (previous !== identity) throw new Error('A state notice cannot change its immutable identity.');
+      return;
+    }
+    if (active) this.recordInput(`state-notice:${notice.id}`, notice.message);
+    else this.recordSourceItem(`state-notice:${notice.id}`, notice.message);
+    this.stateNotices.set(notice.id, identity);
+  }
+
   private readonly appliedSources = new Map<string, string>();
 
   /** A durable contribution is acknowledged only after its model presentation is applied. */
@@ -237,13 +262,18 @@ export class ModelWindow {
   }
 
   replaceWith(window: ModelWindow): void {
+    this.contextStateSequence = window.contextStateSequence;
+    this.stateNotices.clear();
+    for (const [id, identity] of window.stateNotices) this.stateNotices.set(id, identity);
     this.appliedSources.clear();
     for (const [key, hash] of window.appliedSources) this.appliedSources.set(key, hash);
     this.activeItems.splice(0, this.activeItems.length, ...window.activeItems);
     this.priorItems.clear();
     for (const [source, item] of window.priorItems) this.priorItems.set(source, item);
     this.admittedInput = window.admittedInput;
-    this.boundInput = window.boundInput;
+    this.boundInput = window.boundInput
+      ? { input: window.boundInput.input, prior: [...window.boundInput.prior], current: [...window.boundInput.current] }
+      : undefined;
   }
 
   assertImagesAdmitted(messages: readonly ModelInputItem[], profile: ModelProfile): void {

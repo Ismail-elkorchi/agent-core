@@ -47,7 +47,7 @@ cap parameter.
 | Ollama Chat | Declared thinking output and native tool-call associations | Ordinary request/response execution with explicit unsupported-control errors. |
 | Claude Messages | Thinking signatures and redacted-thinking blocks in original order | Ordinary response/tool-result boundaries; no advertised steering, async tools, or inline context editing. |
 
-Profiles explicitly declare `protocol.contextReset` as `fresh_request` or `unsupported`. Fresh-window publication requires the supported reset, compiled request admission, and a safe boundary with no outstanding protocol obligations. The runtime replaces the provider session after publication. Adapters expose no native or server compaction operations; ordinary signed reasoning, tool-call associations, and continuation remain supported within a window.
+Profiles explicitly declare `protocol.contextReset` as `fresh_request` or `unsupported`. Fresh-window publication requires the supported reset, compiled request admission, and a safe boundary with no outstanding protocol obligations. The runtime replaces the provider session after publication. Adapters expose no native or server compaction operations; ordinary signed reasoning, tool-call associations, and continuation remain supported within a provider continuation. A state revision alone does not require reset capability: append publication must prove that the actual successor lawfully extends the delivered prefix. Reset support and append compatibility are separate contracts, and neither implies provider cache reuse.
 
 These are adapter conformance claims. They do not establish model quality or live
 account availability. Qwen/Kimi/GLM-compatible Chat fixtures exercise routed wire

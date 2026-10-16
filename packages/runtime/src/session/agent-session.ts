@@ -60,7 +60,7 @@ export type AgentSessionSuspensionDescriptor = SessionSuspensionDescriptor;
 
 export type AgentSessionEvent =
   | ApplicationDeliveryEvent
-  | Extract<AgentProgressEvent, { readonly type: 'context.transition.rejected' }>
+  | Extract<AgentProgressEvent, { readonly type: 'context.transition.rejected' | 'context.transition.unchanged' }>
   | { readonly type: 'run.progress'; readonly runId: string; readonly event: AgentProgressEvent }
   | { readonly type: 'run.completed'; readonly runId: string; readonly result: AgentRunResult }
   | { readonly type: 'run.failed'; readonly runId: string; readonly error: Error }
@@ -370,6 +370,7 @@ export class AgentSession {
         window: result.entry.window,
         transition: result.entry.transition
       });
+    if (result.kind === 'unchanged') this.emit({ type: 'context.transition.unchanged', idempotencyKey: request.idempotencyKey, windowId: result.windowId });
     return result;
   }
 
@@ -811,7 +812,7 @@ export class AgentSession {
         configuration,
         (event) => {
           this.emit({ type: 'run.progress', runId, event });
-          if (event.type === 'context.transition.rejected') this.emit(event);
+          if (event.type === 'context.transition.rejected' || event.type === 'context.transition.unchanged') this.emit(event);
           if (event.type === 'context.transitioned')
             this.emit({
               type: 'context.transitioned',

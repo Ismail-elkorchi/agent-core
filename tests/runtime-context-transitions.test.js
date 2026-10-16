@@ -1,3 +1,4 @@
+import { admittedSelection } from './context-admission-fixtures.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
@@ -540,7 +541,7 @@ test('a model-selected fresh context keeps parallel observations and commits sta
       provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
       toolCalls: [
         { id: 'context-call', name: 'context_transition', type: 'function', input: { kind: 'json', value: {
-          reason: 'Continue with selected originals', retain: [], sessionState: stateContent('Use original evidence.')
+          reason: 'Continue with selected originals', renewal: true, retain: [], sessionState: stateContent('Use original evidence.')
         } } },
         { id: 'fact-call', name: 'read_fact', type: 'function', input: { kind: 'json', value: {} } }
       ]
@@ -863,7 +864,7 @@ for (const lostReceipt of ['request', 'publication', 'completion_prewrite', 'com
   });
 }
 
-test('state replacement, unchanged interpretation, and clear each use admitted renewal', async () => {
+test('state replacement and clear append once while unchanged interpretation creates no revision or notice', async () => {
   const f = await fixture();
   const bodies = ['Scoped understanding.', 'Scoped understanding.', ''];
   f.provider.complete = async request => {
@@ -877,10 +878,12 @@ test('state replacement, unchanged interpretation, and clear each use admitted r
   const result = await new AgentRuntime(f.options).run({ task: 'Keep requirements explicit.' }).result;
   assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
   const entries = (await f.sessions.loadReplayState(f.session)).branch.filter(item => item.type === 'context_transition');
-  assert.equal(entries.length, 3, 'Even unchanged interpretation requires an admitted fresh context window');
-  assert.equal(entries[1].sessionState, undefined, 'Unchanged interpretation does not manufacture a revision');
+  assert.equal(entries.length, 2, 'Unchanged interpretation creates neither a revision nor a projection notice');
+  assert.ok(entries.every(entry => entry.transition.strategy === 'append'));
+  assert.ok(entries.every(entry => entry.transition.admission.status === 'admitted'));
+  assert.equal(entries.filter(entry => entry.window.stateSequence.notice).length, 2);
   assert.equal(stateText(await f.context.sessionState()), '');
-  assert.equal(entries[2].sessionState.previousRevisionId, entries[0].id);
+  assert.equal(entries[1].sessionState.previousRevisionId, entries[0].id);
   assert.deepEqual(entries[0].sessionState.content, stateContent(bodies[0]));
   const receipt = f.requests[2].messages.find(item => item.role === 'tool' && item.toolCallId === 'state-1');
   assert.match(receipt.content, /scheduled/);
@@ -1024,17 +1027,16 @@ function stateText(snapshot) {
 // Structural source-selection tests supply an explicit immutable compilation boundary.
 // Full runtime tests above separately verify successor prompt assembly and transport.
 async function admitSelection(f, request) {
-  const selection = { ...request.selection, continuity: { kind: 'fresh',
-    resetId: request.idempotencyKey, model: { provider: 'fixture', model: 'context' },
-    sources: request.selection.retained } };
-  return f.context.transition({ ...request, selection }, { admit: async ({ entries }) => {
+  return f.context.transition({ ...request, renewal: true }, { admit: async input => {
+    const { entries, excerpts } = input;
     const modelProfile = await f.provider.describeModel('context');
     const logical = { model: 'context', maxOutputTokens: 128,
-      messages: entries.map(entry => ({ role: 'user', content: JSON.stringify(entry) })) };
+      messages: [...entries.map(entry => ({ role: 'user', content: JSON.stringify(entry) })),
+        ...excerpts.map(excerpt => ({ role: 'user', content: JSON.stringify(excerpt) }))] };
     const compiled = await compileModelRequest({ request: logical, profile: modelProfile,
       body: logical, endpoint: 'fixture://context' });
     assertRequestAccountingFits(compiled.accounting);
-    return { compiledInputIdentity: compiled.inputIdentity, capabilityRevision: compiled.capabilityRevision };
+    return { compiledInputIdentity: compiled.inputIdentity, capabilityRevision: compiled.capabilityRevision, selection: admittedSelection(input) };
   } });
 }
 
@@ -1082,3 +1084,111 @@ test('input arriving after replay selection capture is included before dispatch'
   assert.equal(f.requests[0].messages.filter(item => item.content ===
     'Late correction during replay: keep the operation read-only.').length, 1);
 });
+
+test('state publication with active historical excerpts uses fresh when no bound continuation proves append placement', async () => {
+  const f = await fixture();
+  await new AgentRuntime(f.options).run({ task: 'Historical evidence with an exact retained excerpt.' }).result;
+  const hits = await f.history.search({ query: 'Historical evidence with an exact retained excerpt.' });
+  const source = hits.items[0].source;
+  const cut = await f.history.capture();
+  const selection = await f.context.selectSources(cut, { retain: [], excerpts: [{ source, offset: 0, bytes: 19 }] });
+  await admitSelection(f, { expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
+    idempotencyKey: 'excerpt-window', reason: 'Keep attributed excerpt evidence', selection });
+  let turns = 0;
+  f.provider.complete = async request => {
+    f.requests.push(request);
+    return ++turns === 1
+      ? { provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
+          toolCalls: [{ id: 'excerpt-state', name: 'context_transition', type: 'function', input: { kind: 'json',
+            value: { reason: 'Replace interpretation while retaining evidence', sessionState: stateContent('Interpretation based on exact evidence.') } } }] }
+      : { provider: 'fixture', model: 'context', content: 'Done.', terminationReason: 'stop' };
+  };
+  const result = await new AgentRuntime(f.options).run({ task: 'Continue with the selected evidence.' }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  const records = (await f.sessions.loadReplayState(f.session)).branch.filter(entry => entry.type === 'context_transition');
+  assert.equal(records.length, 2);
+  assert.equal(records.at(-1).transition.strategy, 'fresh');
+  assert.equal(records.at(-1).transition.admission.status, 'admitted');
+  assert.deepEqual(records.at(-1).window.selection.excerpts, selection.excerpts);
+  assert.equal(records.at(-1).window.stateSequence.notice, undefined);
+  assert.ok(JSON.stringify(f.requests.at(-1)).includes('Interpretation based on exact evidence.'));
+});
+
+test('append and no-op preserve the actual provider session while explicit renewal replaces it once', async () => {
+  const f = await fixture();
+  const requests = [];
+  const closed = [];
+  let opened = 0;
+  f.provider.createSession = () => {
+    const sessionId = ++opened;
+    let isClosed = false;
+    return {
+      complete: async request => {
+        assert.equal(isClosed, false, 'No request may dispatch through a closed provider session.');
+        requests.push({ sessionId, request });
+        const turn = requests.length;
+        if (turn <= 3) return {
+          provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
+          toolCalls: [{ id: `session-state-${turn}`, name: 'context_transition', type: 'function', input: { kind: 'json',
+            value: { reason: 'Maintain interpretation without unnecessary transport replacement',
+              sessionState: stateContent('Stable interpretation.'), ...(turn === 3 ? { renewal: true } : {}) } } }]
+        };
+        return { provider: 'fixture', model: 'context', content: 'Done.', terminationReason: 'stop' };
+      },
+      close: async () => { assert.equal(isClosed, false); isClosed = true; closed.push(sessionId); }
+    };
+  };
+  const result = await new AgentRuntime(f.options).run({ task: 'Continue on the same provider session where lawful.' }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+  assert.deepEqual(requests.map(item => item.sessionId), [1, 1, 1, 2]);
+  assert.equal(opened, 2);
+  assert.deepEqual(closed, [1, 2]);
+  const records = (await f.sessions.loadReplayState(f.session)).branch.filter(entry => entry.type === 'context_transition');
+  assert.deepEqual(records.map(entry => entry.transition.strategy), ['append', 'fresh']);
+  assert.deepEqual(records.map(entry => entry.transition.cause), ['state_update', 'explicit_renewal']);
+  assert.equal(records.filter(entry => entry.sessionState).length, 1);
+  assert.equal((await f.context.sessionState()).revision.id, records[0].id);
+});
+
+for (const invalidAccounting of ['unknown_reasoning', 'output_only_limit']) {
+  test(`${invalidAccounting}: inadmissible accounting with ample context cannot trigger fresh fallback for an append`, async () => {
+    const f = await fixture();
+    const interpretation = 'Interpretation whose accounting must be admitted without renewal shortcuts.';
+    const candidates = [];
+    f.provider.compileRequest = async request => {
+      const { signal: _signal, ...body } = request;
+      const compiled = await compileModelRequest({ request, body, profile: await f.provider.describeModel(),
+        endpoint: 'fixture://invalid-state-accounting', providerInputTokens: 100 });
+      if (!request.messages.some(message => message.role === 'user' && message.content.includes(interpretation))) return compiled;
+      candidates.push(request);
+      // Adapter accounting can fail independently of input/context capacity. Neither failure is repaired by discarding a prefix.
+      const accounting = invalidAccounting === 'unknown_reasoning'
+        ? { ...compiled.accounting, reasoningReservation: 32,
+            pricingSemantics: { ...compiled.accounting.pricingSemantics, reasoningIncludedInOutput: 'unknown' } }
+        : { ...compiled.accounting, limits: { ...compiled.accounting.limits, outputTokens: compiled.accounting.outputReservation - 1 } };
+      assert.ok(accounting.estimatedInputTokens + accounting.outputReservation + accounting.reasoningReservation < accounting.limits.contextTokens);
+      return { ...compiled, accounting };
+    };
+    f.provider.complete = async request => {
+      f.requests.push(request);
+      return f.requests.length === 1
+        ? { provider: 'fixture', model: 'context', content: '', terminationReason: 'tool_calls',
+            toolCalls: [{ id: 'invalid-accounting-state', name: 'context_transition', type: 'function', input: { kind: 'json',
+              value: { reason: 'Attempt an ordinary state append', sessionState: stateContent(interpretation) } } }] }
+        : { provider: 'fixture', model: 'context', content: 'Kept the original admitted context.', terminationReason: 'stop' };
+    };
+    const runId = `invalid-state-accounting-${invalidAccounting}`;
+    const result = await new AgentRuntime(f.options).run({ runId, task: 'Keep requirements and transport lineage intact.' }).result;
+    assert.equal(result.terminal?.executionStatus, 'completed', JSON.stringify(result));
+    assert.equal(candidates.length, 1, 'A non-capacity admission failure must not compile a fresh fallback.');
+    assert.ok(candidates[0].messages.some(message => message.content.includes('Session state replacement')));
+    assert.equal((await f.context.sessionState()).revision, null);
+    assert.equal((await f.context.inspect()).window, null);
+    const records = (await f.sessions.loadReplayState(f.session)).branch;
+    assert.equal(records.filter(entry => entry.type === 'context_transition').length, 0);
+    const events = await Array.fromAsync(f.events.read(runId));
+    assert.equal(events.filter(({ event }) => event.type === 'context.transition.rejected').length, 1);
+    assert.ok(f.requests.at(-1).messages.some(message => message.role === 'tool' && message.toolCallId === 'invalid-accounting-state'));
+    assert.ok(!f.requests.at(-1).messages.some(message => message.role === 'user' && message.content.includes(interpretation)));
+  });
+}

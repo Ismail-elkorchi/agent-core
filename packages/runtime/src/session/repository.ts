@@ -125,7 +125,7 @@ export class InMemorySessionRepository implements SessionRepository {
       const header: SessionHeader = Object.freeze({
         type: 'session',
         version: 1,
-        format: 'agent-core.session/2',
+        format: 'agent-core.session/3',
         sessionStateStorage: 'session',
         id,
         timestamp: new Date().toISOString(),

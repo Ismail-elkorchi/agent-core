@@ -1,7 +1,7 @@
 import { hashJson, type EventRepository } from '@agent-core/persistence';
 import type { AgentAuditEvent, AgentEvent } from '../events.js';
 import { contextTransitionRequestSchema } from '../context/schema.js';
-import type { ContextTransitionRequest } from '../context/contracts.js';
+import type { ContextTransitionUnchanged, ContextTransitionRequest } from '../context/contracts.js';
 import type { ContextAdmission, ContextService } from '../context/service.js';
 import type { SessionContextTransitionEntry } from '../session/contracts.js';
 
@@ -146,7 +146,9 @@ export class RunContextTransitions {
     readonly onlyIdempotencyKey?: string;
     readonly admit: (request: ContextTransitionRequest) => Promise<ContextTransitionRequest>;
     readonly validate?: ContextAdmission;
+    readonly renewalReason?: 'capacity' | 'prefix_incompatibility';
     readonly committed: (entry: SessionContextTransitionEntry) => Promise<void>;
+    readonly unchanged?: (result: ContextTransitionUnchanged, idempotencyKey: string) => Promise<void>;
     readonly rejected?: (requestId: string, message: string, idempotencyKey: string) => void | Promise<void>;
     readonly signal: AbortSignal;
     readonly preserveFailure?: (error: unknown) => void;
@@ -155,7 +157,7 @@ export class RunContextTransitions {
     for (const pending of this.requests.values()) {
       if (input.onlyIdempotencyKey && pending.requested.idempotencyKey !== input.onlyIdempotencyKey) continue;
       input.signal.throwIfAborted();
-      let entry: SessionContextTransitionEntry;
+      let entry: SessionContextTransitionEntry | ContextTransitionUnchanged;
       try {
         if (!pending.admitted) {
           const request = contextTransitionRequestSchema.parse(
@@ -173,7 +175,8 @@ export class RunContextTransitions {
         }
         entry = await input.context.transition(pending.admitted, {
           signal: input.signal,
-          ...(input.validate ? { admit: input.validate } : {})
+          ...(input.validate ? { admit: input.validate } : {}),
+          ...(input.renewalReason ? { renewalReason: input.renewalReason } : {})
         });
       } catch (cause) {
         // Resolve publication before cancellation or failure classification: its receipt may be lost.
@@ -200,15 +203,17 @@ export class RunContextTransitions {
         }
       }
       await this.complete(pending, entry);
-      await input.committed(entry);
+      if ('status' in entry) await input.unchanged?.(entry, pending.requested.idempotencyKey);
+      else await input.committed(entry);
     }
   }
   /** Completion delivery is idempotent; session publication remains the authority. */
-  private async complete(pending: PendingTransition, entry: SessionContextTransitionEntry): Promise<void> {
+  private async complete(pending: PendingTransition, entry: SessionContextTransitionEntry | ContextTransitionUnchanged): Promise<void> {
     const event = {
       type: 'context.transition.completed' as const,
       requestId: pending.requestId,
-      windowId: entry.window.windowId
+      status: 'status' in entry ? 'unchanged' as const : 'committed' as const,
+      windowId: 'status' in entry ? entry.windowId : entry.window.windowId
     };
     const key = `${this.options.runId}:${pending.requestId}:completed`;
     try {

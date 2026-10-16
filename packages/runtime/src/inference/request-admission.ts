@@ -61,6 +61,10 @@ export class ContextAdmissionError extends Error {
     'change_model',
     'cancel'
   ] as const);
+  /** Only measured input/context pressure (or an explicit provider rejection) can justify renewal. */
+  get capacityExceeded(): boolean {
+    return contextCapacityExceeded(this.compiled.accounting, this.continuityHeadroomTokens, this.providerRejected);
+  }
   constructor(
     readonly compiled: CompiledModelRequest,
     cause: unknown,
@@ -119,4 +123,16 @@ export function requestCapacity(accounting: RequestAccounting, headroom?: number
     method: accounting.method,
     unknownComponents: accounting.unknownComponents
   });
+}
+
+/** Reuse the admitted capacity model; malformed accounting or output policy alone is not input pressure. */
+export function contextCapacityExceeded(
+  accounting: RequestAccounting,
+  requiredHeadroom?: number,
+  providerRejected = false
+): boolean {
+  if (providerRejected) return true;
+  const capacity = requestCapacity(accounting, requiredHeadroom);
+  return (capacity.inputCapacity !== undefined && capacity.inputTokens > capacity.inputCapacity) ||
+    (requiredHeadroom !== undefined && capacity.remainingTokens !== undefined && capacity.remainingTokens < requiredHeadroom);
 }

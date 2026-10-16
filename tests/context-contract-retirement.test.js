@@ -6,7 +6,7 @@ import * as model from '@agent-core/model';
 import { AgentSession } from '@agent-core/runtime';
 
 const root = path.resolve(import.meta.dirname, '..');
-const retired = /\b(?:createWorkingStateTool|createContextTools|SessionWorkingStateEntry|SessionQueuedSubmission|commitWorkingState|updateWorkingState|enqueueSubmission|findBranchMatches|SessionAppendIndex|SessionCompactionEntry|AgentSessionCompactionRequest|appendCompaction|summarizeConversation|SimpleTokenEstimator|TokenEstimator|ModelMessage|ModelProviderState|normalizeStreamedFinalResponse|installCheckpoint|checkpointHistorySummary|renderTurnCheckpoint|renderSessionHistory|renderSemanticCompaction|renderInterruptedTurnCheckpoint|executeAssistantToolCalls|nextObservationIndex)\b/u;
+const retired = /\b(?:createWorkingStateTool|createContextTools|SessionWorkingStateEntry|SessionQueuedSubmission|commitWorkingState|updateWorkingState|enqueueSubmission|findBranchMatches|SessionAppendIndex|SessionCompactionEntry|AgentSessionCompactionRequest|appendCompaction|summarizeConversation|SimpleTokenEstimator|TokenEstimator|ModelMessage|ModelProviderState|normalizeStreamedFinalResponse|installCheckpoint|checkpointHistorySummary|renderTurnCheckpoint|renderSessionHistory|renderSemanticCompaction|renderInterruptedTurnCheckpoint|executeAssistantToolCalls|nextObservationIndex|freshSelection)\b/u;
 
 test('the context redesign has one production path and no retired contract aliases', async () => {
   const remaining = [];

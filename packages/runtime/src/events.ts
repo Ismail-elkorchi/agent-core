@@ -182,7 +182,8 @@ export type AgentEvent =
   | {
       readonly type: 'context.transition.completed';
       readonly requestId: string;
-      readonly windowId: string;
+      readonly status: 'committed' | 'unchanged';
+      readonly windowId: string | null;
     }
   | {
       readonly type: 'context.transition.rejected';
@@ -427,6 +428,7 @@ export type AgentEvent =
 export type AgentAuditEvent = Exclude<AgentEvent, { readonly type: 'run.state.transitioned' }>;
 
 export type AgentProgressEvent =
+  | { readonly type: 'context.transition.unchanged'; readonly idempotencyKey: string; readonly windowId: string | null }
   | {
       readonly type: 'context.transition.rejected';
       readonly requestId: string;
@@ -684,11 +686,15 @@ const AGENT_EVENT_DECODERS = {
     });
   },
   'context.transition.completed': (value) => {
-    exact(value, ['type', 'requestId', 'windowId']);
+    exact(value, ['type', 'requestId', 'status', 'windowId']);
     return Object.freeze({
       type: 'context.transition.completed',
       requestId: requiredString(value.requestId, 'requestId'),
-      windowId: requiredString(value.windowId, 'windowId')
+      status: (() => {
+        if (value.status !== 'committed' && value.status !== 'unchanged') throw new Error('Invalid context completion status.');
+        return value.status;
+      })(),
+      windowId: value.windowId === null ? null : requiredString(value.windowId, 'windowId')
     });
   },
   'context.transition.rejected': (value) => {

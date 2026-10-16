@@ -1,8 +1,8 @@
+import { admitContext, admittedSelection } from './context-admission-fixtures.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { conservativeProtocolCapabilities } from '@agent-core/model';
 import { hashJson, InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
@@ -20,8 +20,8 @@ import {
 import { JsonlSessionRepository } from '@agent-core/runtime/node';
 
 const binding = { schemaId: 'tests/session-state', schemaVersion: 1, subject: {} };
-const admission = { admit: async () => ({ compiledInputIdentity: 'test-input', capabilityRevision: 'fixture' }) };
-const selectionFor = (retained = []) => ({ retained, continuity: { kind: 'fresh', resetId: randomUUID(), model: { provider: 'fixture', model: 'fixture' }, sources: retained } });
+const admission = { admit: admitContext };
+const selectionFor = (retained = []) => ({ retained });
 const contentFor = text => text ? { working: [{ id: 'notes', text }] } : {};
 const stateText = state => state.content.working?.[0]?.text ?? '';
 async function stageState(f, { id, revisionId, inference, text }) {
@@ -32,7 +32,7 @@ async function stageState(f, { id, revisionId, inference, text }) {
     capturedHistoryCut: await f.context.history.capture(),
     content: contentFor(text) };
 }
-async function fixture(t, kind = 'memory', maxSourceBytes = 1024 * 1024) {
+async function fixture(t, kind = 'memory', maxSourceBytes = 1024 * 1024, continuation = 'fresh') {
   const root = await mkdtemp(path.join(tmpdir(), 'session-state-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const artifacts =
@@ -74,13 +74,14 @@ async function fixture(t, kind = 'memory', maxSourceBytes = 1024 * 1024) {
         expectedWindowId: (await history.selectedContext(cut))?.windowId ?? null,
         expectedSessionStateRevisionId: revisionId, sessionState,
         idempotencyKey: id, reason: 'Update interpretation',
+        ...(continuation === 'fresh' ? { renewal: true } : {}),
         selection: selectionFor()
       } };
       requests.set(id, request);
     }
     try {
       const entry = await context.transition(request.transition, {
-        admit: async () => ({ compiledInputIdentity: `test-${id}`, capabilityRevision: 'fixture' })
+        admit: async input => ({ compiledInputIdentity: `test-${id}`, capabilityRevision: 'fixture', selection: admittedSelection(input) })
       });
       return { status: 'committed', revisionId: entry.id };
     } catch (error) {
@@ -135,6 +136,7 @@ for (const kind of ['memory', 'jsonl']) {
     const point = await f.context.transition({
       expectedWindowId: (await f.context.inspect()).window?.windowId ?? null,
       expectedSourceRevision: (await f.context.history.capture()).sourceRevision,
+      renewal: true,
       selection: selectionFor(await f.context.protectedSources()),
 
       idempotencyKey: 'point',
@@ -170,6 +172,7 @@ for (const kind of ['memory', 'jsonl']) {
     const nestedPoint = await f.context.transition({
       expectedWindowId: (await f.context.inspect()).window?.windowId ?? null,
       expectedSourceRevision: (await f.context.history.capture()).sourceRevision,
+      renewal: true,
       selection: selectionFor(await f.context.protectedSources()),
 
       idempotencyKey: 'nested-point', reason: 'Nested historical boundary'
@@ -191,6 +194,7 @@ for (const kind of ['memory', 'jsonl']) {
     const previous = await f.context.transition({
       expectedWindowId: (await f.context.inspect()).window?.windowId ?? null,
       expectedSourceRevision: (await f.context.history.capture()).sourceRevision,
+      renewal: true,
       selection: selectionFor(await f.context.protectedSources()),
 
       idempotencyKey: 'old-window',
@@ -206,6 +210,7 @@ for (const kind of ['memory', 'jsonl']) {
     const request = {
       expectedWindowId: previous.window.windowId,
       idempotencyKey: 'renew',
+      renewal: true,
       selection: selectionFor(),
       reason: 'Renewal'
     };
@@ -222,7 +227,7 @@ for (const kind of ['memory', 'jsonl']) {
     const committed = await f.context.transition({ ...request, sessionState: candidate }, {
       admit: async (input) => {
         assert.equal(stateText(input.sessionState), 'Keep constraints; correction confirmed');
-        return { compiledInputIdentity: 'new-input', capabilityRevision: 'test' };
+        return { compiledInputIdentity: 'new-input', capabilityRevision: 'test', selection: admittedSelection(input) };
       }
     });
     assert.equal((await f.context.sessionState()).revision.id, committed.id);
@@ -250,6 +255,7 @@ for (const kind of ['memory', 'jsonl']) {
     await f.context.transition({
       expectedWindowId: (await f.context.inspect()).window?.windowId ?? null,
       expectedSourceRevision: (await f.context.history.capture()).sourceRevision,
+      renewal: true,
       selection: selectionFor(await f.context.protectedSources()),
 
       idempotencyKey: 'unchanged-window',
@@ -296,12 +302,12 @@ for (const kind of ['memory', 'jsonl']) {
   });
 }
 
-test('incompatible working-state sessions are rejected without a version bump or data deletion', async (t) => {
+test('incompatible working-state headers are rejected without modifying original data', async (t) => {
   const f = await fixture(t, 'jsonl');
   const file = f.sessions.location(f.session.id);
   const header = JSON.parse(await readFile(file, 'utf8'));
   assert.equal(header.version, 1);
-  assert.equal(header.format, 'agent-core.session/2');
+  assert.equal(header.format, 'agent-core.session/3');
   delete header.sessionStateStorage;
   header.workingStateStorage = 'session';
   const old = `${JSON.stringify(header)}\n`;
@@ -311,6 +317,26 @@ test('incompatible working-state sessions are rejected without a version bump or
     /Incompatible session format|saved messages/
   );
   assert.equal(await readFile(file, 'utf8'), old);
+});
+
+test('prior session format is rejected with its populated journal bytes intact', async (t) => {
+  const f = await fixture(t, 'jsonl');
+  await f.update('preserved-state', null, 'Original interpretation: 文😀\nKeep exact bytes.');
+  const file = f.sessions.location(f.session.id);
+  const current = await readFile(file);
+  const headerEnd = current.indexOf(10);
+  assert.ok(headerEnd > 0);
+  const header = JSON.parse(current.subarray(0, headerEnd).toString('utf8'));
+  assert.equal(header.format, 'agent-core.session/3');
+  header.format = 'agent-core.session/2';
+  const original = Buffer.concat([Buffer.from(`${JSON.stringify(header)}\n`), current.subarray(headerEnd + 1)]);
+  await writeFile(file, original);
+  // The existing index must not let an unsupported original header bypass validation.
+  const reopened = new JsonlSessionRepository(path.join(f.root, 'sessions'));
+  await assert.rejects(reopened.open(f.session.id, binding), /Incompatible session format|saved messages/);
+  assert.deepEqual(await readFile(file), original);
+  await assert.rejects(reopened.rebuildHistoryIndex(f.session.id, binding), /Incompatible session format|saved messages/);
+  assert.deepEqual(await readFile(file), original);
 });
 
 test('normal inference supplies expected revision and exact request attribution to the admitted context transition', async (t) => {
@@ -436,6 +462,7 @@ for (const kind of ['memory', 'jsonl']) {
     const branchPoint = await f.context.transition({
       expectedWindowId: (await f.context.inspect()).window?.windowId ?? null,
       expectedSourceRevision: (await f.context.history.capture()).sourceRevision,
+      renewal: true,
       selection: selectionFor(await f.context.protectedSources()),
 
       idempotencyKey: 'stable-branch-point',
@@ -513,6 +540,7 @@ for (const kind of ['memory', 'jsonl']) {
     const sessionState = await stageState(f, { id: 'unadmitted', revisionId: null,
       inference: f.inference, text: 'Not yet admitted' });
     const request = { expectedWindowId: null, idempotencyKey: 'unadmitted', reason: 'Attempt idle publication',
+      renewal: true,
       selection: selectionFor(), sessionState };
     await assert.rejects(f.context.transition(request), /requires compiled next-request admission/);
     assert.equal((await f.context.sessionState()).revision, null);
@@ -599,3 +627,137 @@ test('large inline state remains journal-owned with bounded point-projection rea
   assert.equal(original.status, 'available');
   assert.deepEqual(JSON.parse(original.item.text), state.content);
 });
+
+
+for (const kind of ['memory', 'jsonl']) {
+  test(`${kind}: append publication failure before commit preserves state and retry publishes exactly once`, async t => {
+    const f = await fixture(t, kind, 1024 * 1024, 'append');
+    await f.update('append-initial', null, 'Initial understanding');
+    const before = await f.context.inspect();
+    const commit = f.sessions.commitContextTransition.bind(f.sessions);
+    f.sessions.commitContextTransition = async () => { throw new Error('Crash before append commit'); };
+    await assert.rejects(f.update('append-next', 'append-initial', 'Next understanding'), /Crash before append commit/);
+    assert.equal((await f.context.sessionState()).revision.id, 'append-initial');
+    assert.equal((await f.context.inspect()).window.windowId, before.window.windowId);
+    f.sessions.commitContextTransition = commit;
+    const published = await f.update('append-next', 'append-initial', 'Next understanding');
+    assert.equal(published.status, 'committed');
+    assert.deepEqual(await f.update('append-next', 'append-initial', 'Next understanding'), published);
+    const records = (await f.sessions.loadReplayState(f.session)).branch.filter(entry => entry.type === 'context_transition');
+    assert.equal(records.length, 2);
+    assert.equal(records.at(-1).transition.strategy, 'append');
+    assert.equal((await f.context.sessionState()).revision.id, 'append-next');
+  });
+
+  test(`${kind}: append lost publication receipt reconciles one immutable state revision and notice`, async t => {
+    const f = await fixture(t, kind, 1024 * 1024, 'append');
+    await f.update('receipt-initial', null, 'Initial interpretation');
+    const commit = f.sessions.commitContextTransition.bind(f.sessions);
+    let loseReceipt = true;
+    f.sessions.commitContextTransition = async (...args) => {
+      const result = await commit(...args);
+      if (loseReceipt) { loseReceipt = false; throw new Error('Lost durable publication receipt'); }
+      return result;
+    };
+    await assert.rejects(f.update('receipt-next', 'receipt-initial', 'Corrected interpretation'), /Lost durable publication receipt/);
+    const afterCommit = await f.context.inspect();
+    assert.equal((await f.context.sessionState()).revision.id, 'receipt-next');
+    const recovered = await f.update('receipt-next', 'receipt-initial', 'Corrected interpretation');
+    assert.equal(recovered.status, 'committed');
+    assert.deepEqual(await f.context.inspect(), afterCommit);
+    const records = (await f.sessions.loadReplayState(f.session)).branch.filter(entry => entry.type === 'context_transition');
+    assert.equal(records.length, 2);
+    assert.equal(records.at(-1).transition.strategy, 'append');
+    assert.equal(records.filter(entry => entry.id === 'receipt-next' && entry.sessionState).length, 1);
+    assert.equal(records.filter(entry => entry.window.stateSequence.notice?.revisionId === 'receipt-next').length, 1);
+  });
+
+  test(`${kind}: competing append corrections preserve a single CAS winner`, async t => {
+    const f = await fixture(t, kind, 1024 * 1024, 'append');
+    await f.update('cas-initial', null, 'Initial understanding');
+    const outcomes = await Promise.all([
+      f.update('cas-left', 'cas-initial', 'Left correction'),
+      f.update('cas-right', 'cas-initial', 'Right correction')
+    ]);
+    assert.deepEqual(outcomes.map(outcome => outcome.status).sort(), ['committed', 'conflict']);
+    const records = (await f.sessions.loadReplayState(f.session)).branch.filter(entry => entry.type === 'context_transition');
+    assert.equal(records.length, 2);
+    assert.equal(records.at(-1).transition.strategy, 'append');
+    const current = await f.context.sessionState();
+    assert.equal(current.revision.previousRevisionId, 'cas-initial');
+    assert.equal(stateText(current), current.revision.id === 'cas-left' ? 'Left correction' : 'Right correction');
+  });
+}
+
+for (const kind of ['memory', 'jsonl']) {
+  test(`${kind}: append successor admission failure and accepted correction cannot publish staged state`, async t => {
+    const f = await fixture(t, kind, 1024 * 1024, 'append');
+    await f.update('admission-initial', null, 'Original interpretation');
+    const before = await f.context.inspect();
+    const cut = await f.history.capture();
+    const candidate = await stageState(f, { id: 'admission-next', revisionId: 'admission-initial',
+      inference: f.inference, text: 'Staged interpretation' });
+    const request = { expectedWindowId: before.window.windowId, expectedSourceRevision: cut.sourceRevision,
+      expectedSessionStateRevisionId: 'admission-initial', expectedCut: cut, sessionState: candidate,
+      idempotencyKey: 'admission-next', reason: 'Stage an append', selection: { retained: [] } };
+    await assert.rejects(f.context.transition(request, { admit: async input => {
+      assert.equal(input.strategy, 'append');
+      assert.equal(stateText(input.sessionState), 'Staged interpretation');
+      throw new Error('Exact compiled successor exceeds input limit');
+    } }), /Exact compiled successor exceeds input limit/);
+    assert.equal((await f.context.sessionState()).revision.id, 'admission-initial');
+    assert.deepEqual(await f.context.inspect(), before);
+    await assert.rejects(f.context.transition(request, { admit: async input => {
+      await f.sessions.appendInput(f.session, { runId: 'correction', task: 'Accepted correction after staging.' });
+      return { compiledInputIdentity: 'obsolete-successor', capabilityRevision: 'fixture', selection: admittedSelection(input) };
+    } }), /changed|stale|conflict|boundary/i);
+    assert.equal((await f.context.sessionState()).revision.id, 'admission-initial');
+    const records = (await f.sessions.loadReplayState(f.session)).branch;
+    assert.equal(records.filter(entry => entry.type === 'context_transition').length, 1);
+    assert.ok(JSON.stringify(await f.sessions.readConversation(f.session)).includes('Accepted correction after staging.'));
+  });
+}
+
+for (const kind of ['memory', 'jsonl']) {
+  test(`${kind}: identical-state explicit renewal retries against its original boundary without creating a revision`, async t => {
+    const f = await fixture(t, kind);
+    await f.update('identical-initial', null, 'Unchanged interpretation');
+    const cut = await f.history.capture();
+    const request = {
+      expectedWindowId: (await f.context.inspect()).window.windowId,
+      expectedSourceRevision: cut.sourceRevision, expectedCut: cut,
+      expectedSessionStateRevisionId: 'identical-initial',
+      renewal: true, selection: { retained: [] }, idempotencyKey: 'identical-renewal', reason: 'Deliberate fresh continuation',
+      sessionState: { id: 'proposed-identical', previousRevisionId: 'identical-initial', inference: f.inference,
+        capturedHistoryCut: cut, content: contentFor('Unchanged interpretation') }
+    };
+    const renewed = await f.context.transition(request, admission);
+    assert.equal(renewed.transition.strategy, 'fresh');
+    assert.equal(renewed.sessionState, undefined);
+    assert.equal((await f.context.sessionState()).revision.id, 'identical-initial');
+    assert.deepEqual(await f.context.transition(request, admission), renewed);
+    await f.update('identical-later', 'identical-initial', 'Later interpretation');
+    assert.deepEqual(await f.context.transition(request, admission), renewed);
+    assert.equal((await f.context.sessionState()).revision.id, 'identical-later');
+    const records = (await f.sessions.loadReplayState(f.session)).branch.filter(entry => entry.type === 'context_transition');
+    assert.equal(records.length, 3);
+    assert.equal(records.filter(entry => entry.sessionState).length, 2);
+    assert.equal(records.filter(entry => entry.window.stateSequence.notice).length, 0);
+  });
+
+  test(`${kind}: identical state cannot bypass the supplied previous-revision fence`, async t => {
+    const f = await fixture(t, kind);
+    await f.update('fenced-initial', null, 'Stable interpretation');
+    const before = await f.context.inspect();
+    const cut = await f.history.capture();
+    await assert.rejects(f.context.transition({
+      expectedWindowId: before.window.windowId, expectedSourceRevision: cut.sourceRevision,
+      expectedSessionStateRevisionId: 'fenced-initial', renewal: true,
+      selection: { retained: [] }, idempotencyKey: 'wrong-predecessor', reason: 'Attempt identical replacement',
+      sessionState: { id: 'wrong-predecessor', previousRevisionId: null, inference: f.inference,
+        capturedHistoryCut: cut, content: contentFor('Stable interpretation') }
+    }, admission), /revision|conflict|stale/i);
+    assert.deepEqual(await f.context.inspect(), before);
+    assert.equal((await f.context.sessionState()).revision.id, 'fenced-initial');
+  });
+}

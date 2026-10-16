@@ -118,11 +118,8 @@ class Provider extends MemorySimulationProvider {
             expectedWindowId: null,
             idempotencyKey: 'select',
             reason: 'Completed exchange is no longer needed.',
-            selection: {
-              retained: retained.map((entry) => sourceRef(session.id, entry)),
-              continuity: { kind: 'fresh', resetId: 'select', model: { provider: provider.id, model: simulationProfile.id },
-                sources: retained.map(entry => sourceRef(session.id, entry)) }
-            }
+            renewal: true,
+            selection: { retained: retained.map((entry) => sourceRef(session.id, entry)) }
           });
           return result({ scheduled: true });
         }

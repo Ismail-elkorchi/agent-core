@@ -120,6 +120,8 @@ export async function* selectedHistoryMetadata(history: HistoryReader, cut: Hist
   } while (cursor);
 }
 
+export const SELECTED_METADATA_LIMITS = Object.freeze({ records: 10000, bytes: 4 * 1024 * 1024 });
+
 interface SelectedMetadataView {
   readonly cut: HistorySourceCut;
   readonly contextWindow: ContextWindowRecord | undefined;
@@ -167,10 +169,10 @@ export class SelectedHistoryMetadata {
       if (old && !sameHistorySource(old.item.source, item.source)) throw new Error('Selected source identities conflict.');
       const size = Buffer.byteLength(JSON.stringify(item));
       bytes += size - (old?.bytes ?? 0);
-      if ((!old && count >= 10000) || bytes > 4 * 1024 * 1024)
-        throw new ContextSourceCapacityError(cut, bytes > 4 * 1024 * 1024
-          ? { unit: 'bytes', limit: 4 * 1024 * 1024, observedAtLeast: bytes }
-          : { unit: 'records', limit: 10000, observedAtLeast: count + 1 });
+      if ((!old && count >= SELECTED_METADATA_LIMITS.records) || bytes > SELECTED_METADATA_LIMITS.bytes)
+        throw new ContextSourceCapacityError(cut, bytes > SELECTED_METADATA_LIMITS.bytes
+          ? { unit: 'bytes', limit: SELECTED_METADATA_LIMITS.bytes, observedAtLeast: bytes }
+          : { unit: 'records', limit: SELECTED_METADATA_LIMITS.records, observedAtLeast: count + 1 });
       const position = old?.position ?? await history.sourcePosition(item.source, cut);
       changes.set(item.source.entryId, { item, position, bytes: size });
       if (!old) count++;

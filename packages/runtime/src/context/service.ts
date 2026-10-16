@@ -1,16 +1,15 @@
 import { contextToolDefinitions } from './tools.js';
 import { stagedSessionState } from './session-state.js';
 import type { PromptContextItemInput } from '../inference/prompt-material.js';
-import { contextSourceManifest, SelectedHistoryMetadata, type ContextInspectionPage } from './inspection.js';
+import { contextSourceManifest, selectedHistoryMetadata, SELECTED_METADATA_LIMITS, SelectedHistoryMetadata, type ContextInspectionPage } from './inspection.js';
 import {
-  SELECTED_SOURCE_LIMITS,
-  assertPortableHistoryCompatibility
+  SELECTED_SOURCE_LIMITS
 } from '../orchestration/session-replay.js';
 import { contextMetadataGroups, assertContextProtocolClosure } from './selection.js';
-import type { CompiledModelRequest, ModelProfile, ModelSelection } from '@agent-core/model';
+import type { CompiledModelRequest } from '@agent-core/model';
 import { ContextSourceCapacityError } from '../run/context-admission.js';
 import { HistorySourceTooLargeError } from '../history/reader.js';
-import { requestCapacity } from '../inference/request-admission.js';
+import { contextCapacityExceeded, requestCapacity } from '../inference/request-admission.js';
 import {
   hashJson,
   PersistenceConflictError,
@@ -32,7 +31,8 @@ import type {
   SessionDescriptor,
   SessionRepository
 } from '../session/contracts.js';
-import type { ContextSelection, ContextTransitionRequest } from './contracts.js';
+import { createContextStateNotice } from './state-notice.js';
+import type { ContextStateSequence, ContextTransitionUnchanged, ContextSourceSelection, ContextSelection, ContextTransitionRequest } from './contracts.js';
 import { contextTransitionRequestSchema } from './schema.js';
 
 export interface ContextPolicy {
@@ -54,11 +54,16 @@ export interface ContextAdmissionInput {
   readonly window?: import('./contracts.js').ContextWindowRecord | undefined;
   readonly selection: ContextSelection;
   readonly sessionState: SessionStateSnapshot;
+  readonly checkpointState: SessionStateSnapshot;
+  readonly stateSequence: ContextStateSequence;
+  readonly strategy: 'append' | 'fresh';
   readonly signal?: AbortSignal;
 }
 export type ContextAdmission = (input: ContextAdmissionInput) => Promise<{
   readonly compiledInputIdentity: string;
   readonly capabilityRevision: string;
+  readonly selection?: ContextSelection;
+  readonly renewal?: { readonly selection: ContextSelection; readonly stateSequence: ContextStateSequence; readonly cause: 'capacity' | 'prefix_incompatibility' };
 }>;
 export interface ContextServiceOptions {
   readonly repository: SessionRepository;
@@ -122,7 +127,7 @@ export class ContextService {
           Object.freeze({ runId: item.runId, submissionId: item.submissionId, state: item.state })
         )
       ),
-      legalTransitions: Object.freeze(['fresh']),
+      legalTransitions: Object.freeze(['unchanged', 'append', 'fresh']),
       ...(this.admission ? { admission: this.admission } : {}),
       protectedSources: await this.protectedSources(cut),
       ...(capacity ? { capacity } : {})
@@ -155,7 +160,6 @@ export class ContextService {
           readonly capturedHistoryCut: HistorySourceCut;
         }>;
         schedule: (request: ContextTransitionRequest) => Promise<{ readonly requestId: string }>;
-        modelSelection?: () => ModelSelection;
       }
     | undefined;
   private admission:
@@ -165,6 +169,7 @@ export class ContextService {
         readonly accounting: import('@agent-core/model').RequestAccounting;
         readonly continuityHeadroomTokens?: number;
         readonly message?: string;
+        readonly providerRejected?: boolean;
         readonly feedback?: {
           readonly key: string;
           readonly notice: PromptContextItemInput;
@@ -245,10 +250,9 @@ export class ContextService {
     };
   }
 
-  currentModel(): ModelSelection {
-    const selection = this.runtime?.modelSelection?.();
-    if (!selection) throw new Error('Fresh continuation requires the active model selection.');
-    return selection;
+  private requiresRenewal(): boolean {
+    return this.admission?.status === 'blocked' && contextCapacityExceeded(
+      this.admission.accounting, this.admission.continuityHeadroomTokens, this.admission.providerRejected);
   }
 
   /** Resolve a model's source choices once against the authorized boundary. */
@@ -256,13 +260,12 @@ export class ContextService {
     cut: HistorySourceCut,
     change: {
       readonly excerpts?: readonly HistorySourceExcerpt[] | undefined;
-      readonly sessionState?: SessionStateContent | undefined;
       readonly recentFrom?: HistorySourceRef | undefined;
       readonly retain?: readonly HistorySourceRef[] | undefined;
       readonly add?: readonly HistorySourceRef[] | undefined;
       readonly release?: readonly HistorySourceRef[] | undefined;
     }
-  ): Promise<ContextSelection> {
+  ): Promise<ContextSourceSelection> {
     if (change.retain !== undefined && (change.release !== undefined || change.recentFrom !== undefined))
       throw new Error('Use retain for replacement or recentFrom/add/release to edit sources.');
     // An explicit replacement must not read the originals it is discarding.
@@ -287,9 +290,7 @@ export class ContextService {
       for (const group of groups)
         if (group.some(item => recentIds.has(item.source.entryId)) && !group.some((item) => released.has(item.source.entryId)))
           for (const item of group) retained.set(item.source.entryId, item.source);
-    const content = change.sessionState ?? (await this.sessionState(cut)).content;
-    const interactionSources = (content.interaction ?? []).flatMap(item => item.sources ?? []);
-    for (const source of [...(change.retain ?? []), ...(change.add ?? []), ...interactionSources]) {
+    for (const source of [...(change.retain ?? []), ...(change.add ?? [])]) {
       const group = groups.find((items) =>
         items.some((item) => sameHistorySource(item.source, source))
       );
@@ -308,6 +309,43 @@ export class ContextService {
     };
   }
 
+  /** Compare canonical source identities without hydrating or ordering discarded history. */
+  private async sameCurrentSelection(
+    selection: ContextSourceSelection,
+    window: import('./contracts.js').ContextWindowRecord | undefined,
+    cut: HistorySourceCut,
+    signal?: AbortSignal
+  ): Promise<boolean> {
+    if (hashJson(selection.protected ?? []) !== hashJson(window?.selection.protected ?? [])) return false;
+    const expected = new Map(selection.retained.map(source => [source.entryId, source]));
+    const matched = new Set<string>();
+    const match = (source: HistorySourceRef) => {
+      const candidate = expected.get(source.entryId);
+      if (!candidate || !sameHistorySource(candidate, source)) return false;
+      matched.add(source.entryId);
+      return true;
+    };
+    for (const source of await this.protectedSources(cut)) if (!match(source)) return false;
+    let examined = 0;
+    let bytes = 0;
+    for await (const item of selectedHistoryMetadata(this.history, cut)) {
+      throwIfAborted(signal);
+      examined++;
+      bytes += Buffer.byteLength(JSON.stringify(item));
+      if (examined > SELECTED_METADATA_LIMITS.records || bytes > SELECTED_METADATA_LIMITS.bytes)
+        throw new ContextSourceCapacityError(cut, bytes > SELECTED_METADATA_LIMITS.bytes
+          ? { unit: 'bytes', limit: SELECTED_METADATA_LIMITS.bytes, observedAtLeast: bytes }
+          : { unit: 'records', limit: SELECTED_METADATA_LIMITS.records, observedAtLeast: examined });
+      // Match the conversational contributions selected by complete-exchange grouping.
+      if (item.type !== 'input' && item.type !== 'steering' && !item.exchangeId) continue;
+      if (!match(item.source)) return false;
+    }
+    if (matched.size !== expected.size) return false;
+    const excerpts = await this.selectionExcerpts(window?.selection.excerpts ?? [], selection.retained, cut);
+    // Both retained sets are now proven equal and the proposal was already ordered by history.
+    return hashJson(excerpts) === hashJson(selection.excerpts ?? []);
+  }
+
   private async selectionExcerpts(
     excerpts: readonly HistorySourceExcerpt[], retained: readonly HistorySourceRef[], cut: HistorySourceCut
   ): Promise<readonly HistorySourceExcerpt[]> {
@@ -318,39 +356,6 @@ export class ContextService {
       const original = originals.get(excerpt.source.entryId);
       return !original || !sameHistorySource(original, excerpt.source);
     });
-  }
-
-  /** A fresh inference continuation ends native reasoning, while preserving selected originals. */
-  async freshSelection(input: {
-    readonly selection: ContextSelection;
-    readonly model: ModelSelection;
-    readonly profile: ModelProfile;
-    readonly cut: HistorySourceCut;
-    readonly resetId: string;
-  }): Promise<ContextSelection> {
-    const entries: SessionBranchEntry[] = [];
-    for (const source of input.selection.retained) {
-      const entry = await this.history.resolve(source, input.cut);
-      if (!entry) throw new Error('Fresh continuation source is unavailable.');
-      entries.push(entry);
-    }
-    await assertPortableHistoryCompatibility({
-      sessionId: input.cut.sessionId,
-      entries,
-      profile: input.profile,
-      artifacts: this.options.artifacts
-    });
-    return {
-      retained: input.selection.retained,
-      ...(input.selection.excerpts ? { excerpts: input.selection.excerpts } : {}),
-      ...(input.selection.protected ? { protected: input.selection.protected } : {}),
-      continuity: {
-        kind: 'fresh',
-        resetId: input.resetId,
-        model: input.model,
-        sources: input.selection.retained
-      }
-    };
   }
 
   async schedule(request: ContextTransitionRequest): Promise<{ readonly requestId: string }> {
@@ -366,7 +371,8 @@ export class ContextService {
   ) {
     throwIfAborted(options.signal);
     if (this.runtime) return { kind: 'scheduled' as const, ...(await this.schedule(request)) };
-    return { kind: 'selected' as const, entry: await this.transition(request, options) };
+    const result = await this.transition(request, options);
+    return 'status' in result ? { kind: 'unchanged' as const, windowId: result.windowId } : { kind: 'selected' as const, entry: result };
   }
   /** Network work belongs outside session serialization; the final repository append alone commits the window. */
   async transition(
@@ -374,15 +380,24 @@ export class ContextService {
     options: {
       readonly signal?: AbortSignal;
       readonly admit?: ContextAdmission;
+      readonly renewalReason?: 'capacity' | 'prefix_incompatibility';
     } = {}
-  ): Promise<SessionContextTransitionEntry> {
+  ): Promise<SessionContextTransitionEntry | ContextTransitionUnchanged> {
     let request = ownRequest(requestInput);
     throwIfAborted(options.signal);
     if (!options.admit)
       throw new Error('Context publication requires compiled next-request admission.');
     const cut = await this.history.capture();
     const window = await this.history.selectedContext(cut);
+    const captured = await this.sessionState(cut);
     const previous = await this.findTransition(request.idempotencyKey);
+    const normalizationState = previous ? await this.sessionState(previous.window.historyPosition) : captured;
+    if (request.sessionState) assertSessionStateRevision(normalizationState.revision, request.sessionState.previousRevisionId);
+    if (request.sessionState && hashJson(request.sessionState.content) === hashJson(normalizationState.content)) {
+      const unchanged = { ...request };
+      delete unchanged.sessionState;
+      request = ownRequest(unchanged);
+    }
     // Reconcile against the original committed selection, never a later live window.
     const normalizationWindow = previous?.window ?? window;
     if (request.selection.protected === undefined && normalizationWindow?.selection.protected)
@@ -415,15 +430,24 @@ export class ContextService {
         request.expectedSourceRevision !== cut.sourceRevision)
     )
       throw new PersistenceConflictError('Context transition expected boundary is stale.');
-    const continuity = request.selection.continuity;
-    const freshReset = continuity !== undefined &&
-      continuity.resetId !== window?.selection.continuity?.resetId;
-    if (!freshReset) throw new Error('Context renewal requires a new fresh continuation.');
-    const freshSources = continuity.sources;
-    if (freshSources.length !== request.selection.retained.length || request.selection.retained.some(source =>
-        !freshSources.some(fresh => sameHistorySource(source, fresh))))
-      throw new Error('Fresh continuation must name exactly the selected original sources.');
-    const portableSources = new Set(freshSources.map(source => source.entryId));
+    let renewalReason = options.renewalReason ?? (this.requiresRenewal() ? 'capacity' : undefined);
+    const requiredRenewal = request.renewal === true || renewalReason !== undefined;
+    let sameSelection = false;
+    if (!requiredRenewal) {
+      try {
+        sameSelection = await this.sameCurrentSelection(request.selection, window, cut, options.signal);
+      } catch (error) {
+        // A bounded replacement must not hydrate the over-capacity history it releases.
+        if (!(error instanceof ContextSourceCapacityError)) throw error;
+        renewalReason = 'capacity';
+      }
+    }
+    const freshReset = requiredRenewal || !sameSelection;
+    const plannedSelection: ContextSelection = {
+      ...request.selection,
+      ...(!freshReset && window?.selection.continuity ? { continuity: window.selection.continuity } : {})
+    };
+    const portableSources = new Set((freshReset ? request.selection.retained : window?.selection.continuity?.sources ?? []).map(source => source.entryId));
     await assertContextProtocolClosure(this.history, cut, request.selection.retained,
       portableSources, options.signal, freshReset);
     const retained = new Map(request.selection.retained.map((ref) => [ref.entryId, ref]));
@@ -518,7 +542,6 @@ export class ContextService {
             'context_admission_failed: omitted history has no authorized available read capability.'
           );
     }
-    const captured = await this.sessionState(cut);
     const expectedSessionStateRevisionId =
       request.expectedSessionStateRevisionId === undefined
         ? (captured.revision?.id ?? null)
@@ -535,10 +558,6 @@ export class ContextService {
           !await this.history.extendsCut(request.sessionState.declaredHistoryCut, request.sessionState.capturedHistoryCut))
         throw new Error('Declared session-state history cut exceeds its captured boundary.');
     }
-    for (const item of sessionState.content.interaction ?? [])
-      for (const source of item.sources ?? [])
-        if (!sameHistorySource(retained.get(source.entryId) ?? { sessionId: '', entryId: '', sha256: '' }, source))
-          throw new Error('Interaction source originals are mandatory in the selected context.');
     const pending = await this.options.repository.loadPendingSubmissions(this.options.session);
     const bytes = Buffer.byteLength(
       JSON.stringify({
@@ -554,16 +573,54 @@ export class ContextService {
         limit: this.options.policy.maxSourceBytes,
         observedAtLeast: bytes
       });
+    const stateChanged = hashJson(sessionState.content) !== hashJson(captured.content);
+    if (!stateChanged && sameSelection && !freshReset && !request.renewal) {
+      throwIfAborted(options.signal);
+      if (hashJson(await this.history.capture()) !== hashJson(cut))
+        throw new PersistenceConflictError('Context source boundary changed during unchanged admission.');
+      return Object.freeze({ status: 'unchanged', windowId: window?.windowId ?? null });
+    }
+    let strategy: 'fresh' | 'append' = freshReset ? 'fresh' : 'append';
+    const snapshot = await this.options.repository.sourceSnapshot(this.options.session, cut.throughEntryId);
+    const prior = await snapshot.latestContext;
+    const checkpointRevisionId = freshReset ? sessionState.revision?.id ?? null
+      : window ? window.stateSequence.checkpointRevisionId : captured.revision?.id ?? null;
+    let stateSequence: ContextStateSequence = {
+      checkpointRevisionId,
+      lineage: freshReset ? cut : window?.stateSequence.lineage ?? null,
+      parent: freshReset || !prior ? null : { sessionId: cut.sessionId, entryId: prior.entryId, sha256: prior.sha256 },
+      ...(!freshReset && stateChanged && sessionState.revision ? {
+        notice: createContextStateNotice(captured.revision?.id ?? null, sessionState.revision.id, sessionState.content, cut)
+      } : {})
+    };
+    const checkpointState = freshReset ? sessionState : await this.checkpointState(stateSequence, cut);
     const validation = await options.admit({
       cut,
       entries: selected,
       excerpts,
       window,
-      selection: request.selection,
+      selection: plannedSelection,
       sessionState,
+      checkpointState,
+      stateSequence,
+      strategy,
       ...(options.signal ? { signal: options.signal } : {})
     });
-    const selection: ContextSelection = Object.freeze({ ...request.selection });
+    if (validation.renewal) {
+      if (strategy !== 'append' || effectiveSelectionIdentity(validation.renewal.selection) !== effectiveSelectionIdentity(request.selection))
+        throw new Error('Renewal fallback may not change the admitted source proposal.');
+      strategy = 'fresh';
+      stateSequence = validation.renewal.stateSequence;
+    }
+    const selection: ContextSelection = Object.freeze({ ...(validation.renewal?.selection ?? validation.selection ?? plannedSelection) });
+    if (effectiveSelectionIdentity(selection) !== effectiveSelectionIdentity(request.selection))
+      throw new Error('Admission changed the requested evidence selection.');
+    if (strategy === 'fresh' && (!selection.continuity ||
+        selection.continuity.resetId === window?.selection.continuity?.resetId ||
+        hashJson(selection.continuity.sources) !== hashJson(selection.retained)))
+      throw new Error('Fresh admission must establish a new continuation over the exact selected originals.');
+    if (strategy === 'append' && hashJson(selection.continuity ?? null) !== hashJson(window?.selection.continuity ?? null))
+      throw new Error('Append admission cannot change provider continuation lineage.');
     throwIfAborted(options.signal);
     if (hashJson(await this.history.capture()) !== hashJson(cut))
       throw new PersistenceConflictError(
@@ -573,11 +630,12 @@ export class ContextService {
     const windowId = randomUUID();
     return this.options.repository.commitContextTransition(this.options.session, {
       expectedSessionStateRevisionId,
-      ...(request.sessionState ? { sessionState: request.sessionState } : {}),
+      ...(stateChanged && request.sessionState ? { sessionState: request.sessionState } : {}),
       expectedLeafId: cut.throughEntryId,
       expectedSourceRevision: cut.sourceRevision,
       expectedWindowId: request.expectedWindowId,
       window: {
+        stateSequence,
         windowId,
         parentWindowId: request.expectedWindowId,
         historyPosition: cut,
@@ -586,6 +644,9 @@ export class ContextService {
         createdAt: timestamp
       },
       transition: {
+        strategy,
+        cause: validation.renewal?.cause ?? renewalReason ?? (request.renewal ? 'explicit_renewal' : freshReset ? 'selection_change' : 'state_update'),
+        ...(request.renewal === undefined ? {} : { requestedRenewal: request.renewal }),
         transitionId: randomUUID(),
         admission: { status: 'admitted', compiledInputIdentity: validation.compiledInputIdentity,
           capabilityRevision: validation.capabilityRevision },
@@ -599,6 +660,7 @@ export class ContextService {
               requestedSessionStateRevisionId: request.expectedSessionStateRevisionId
             }),
         selectionFingerprint: hashJson(selection),
+        stateSequenceFingerprint: hashJson(stateSequence),
         ...(request.expectedSourceRevision === undefined
           ? {}
           : { requestedSourceRevision: request.expectedSourceRevision }),
@@ -606,6 +668,17 @@ export class ContextService {
       }
     });
   }
+  /** Read the immutable checkpoint referenced by a continuation, never the latest mutable state. */
+  async checkpointState(stateSequence: ContextStateSequence, cut?: HistorySourceCut): Promise<SessionStateSnapshot> {
+    if (stateSequence.checkpointRevisionId === null) return { revision: null, content: {} };
+    cut ??= await this.history.capture();
+    const snapshot = await this.options.repository.sourceSnapshot(this.options.session, cut.throughEntryId);
+    const entry = await this.options.repository.readBranchEntry(this.options.session, snapshot.boundary, stateSequence.checkpointRevisionId);
+    if (entry.type !== 'context_transition' || !entry.sessionState)
+      throw new Error('Continuation checkpoint does not reference an immutable state revision.');
+    return stagedSessionState(this.options.policy.maxSourceBytes, { id: entry.id, ...entry.sessionState }, entry.parentId);
+  }
+
   async validateSessionStateSources(content: SessionStateContent, cut: HistorySourceCut): Promise<void> {
     await this.history.validateCut(cut);
     for (const items of [content.interaction, content.understanding, content.working, content.trajectory])
@@ -748,4 +821,8 @@ function ownRequest(input: ContextTransitionRequest): ContextTransitionRequest {
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted)
     throw signal.reason instanceof Error ? signal.reason : new Error('Context transition aborted.');
+}
+
+function effectiveSelectionIdentity(selection: ContextSelection): string {
+  return hashJson({ retained: selection.retained, excerpts: selection.excerpts ?? [], protected: selection.protected ?? [] });
 }

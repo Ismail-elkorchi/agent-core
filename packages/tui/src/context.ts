@@ -16,7 +16,7 @@ export interface ContextOperations {
   inspectContext(): Promise<ContextInspection>;
   contextSources(request: HistorySearchRequest): Promise<HistorySearchResult>;
   transitionContext(request: ContextTransitionRequest): Promise<{
-    readonly selection: { readonly kind: 'scheduled'; readonly requestId: string } | { readonly kind: 'selected' };
+    readonly selection: { readonly kind: 'scheduled'; readonly requestId: string } | { readonly kind: 'selected' } | { readonly kind: 'unchanged' };
   }>;
 }
 export interface ContextState {
@@ -34,7 +34,7 @@ export type ContextMessage =
   | { readonly type: 'context.source'; readonly source: HistorySourceRef }
   | { readonly type: 'context.scroll'; readonly offset: number }
   | { readonly type: 'context.scheduled'; readonly requestId: string; readonly scheduledRequestId: string }
-  | { readonly type: 'context.applied'; readonly idempotencyKey: string }
+  | { readonly type: 'context.applied'; readonly idempotencyKey: string; readonly status?: 'committed' | 'unchanged' }
   | { readonly type: 'context.rejected'; readonly idempotencyKey: string; readonly message: string }
   | {
       readonly type: 'context.loaded';
@@ -66,7 +66,7 @@ export function updateContext(
     case 'context.applied': {
       if (state.pendingTransition?.idempotencyKey !== message.idempotencyKey) return { state };
       const result = updateContext({ ...state, pendingTransition: undefined }, { type: 'context.open' }, operations);
-      return { ...result, state: { ...result.state, notice: 'Context selection applied.' } };
+      return { ...result, state: { ...result.state, notice: message.status === 'unchanged' ? 'Context selection unchanged.' : 'Context selection applied.' } };
     }
     case 'context.rejected':
       return state.pendingTransition?.idempotencyKey !== message.idempotencyKey
@@ -150,7 +150,7 @@ export function updateContext(
                 signal.throwIfAborted();
                 return { kind: 'message', message: result.selection.kind === 'scheduled'
                   ? { type: 'context.scheduled', requestId, scheduledRequestId: result.selection.requestId }
-                  : { type: 'context.applied', idempotencyKey: requestId } };
+                  : { type: 'context.applied', idempotencyKey: requestId, status: result.selection.kind === 'unchanged' ? 'unchanged' : 'committed' } };
               }
               signal.throwIfAborted();
               const inspection = reset
@@ -226,7 +226,7 @@ export function contextView(
                 state.inspection?.admission?.message ??
                 (state.inspection && !state.inspection.pendingWork.some((work) => work.state === 'claimed')
                   ? 'Apply is available while a request is running; idle history remains inspectable.'
-                  : 'Choose original sources for the next window. Current session state is included automatically; history remains available.'))
+                  : 'Choose original sources for the next request. Current session state is included automatically; history remains available.'))
           }),
           ...(capacity
             ? [
@@ -238,7 +238,7 @@ export function contextView(
           text({
             content:
               state.selection === undefined
-                ? 'Select originals to build a replacement window.'
+                ? 'Select originals for the next request.'
                 : `Draft selection: ${String(state.selection.retained.length)} sources. Required inputs are retained automatically.`
           }),
           ...selectedOutsidePage.map((source) => sourceChoice(source, source.entryId)),

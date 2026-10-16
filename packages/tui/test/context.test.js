@@ -22,7 +22,7 @@ for (const columns of [48, 120])
       sessionState: { revisionId: 'revision', content: { working: [{ id: 'hypothesis', text: 'A model hypothesis' }] }, complete: true },
       protectedSources: [source],
       pendingWork: [{ submissionId: 'submission', runId: 'run', state: 'claimed' }],
-      legalTransitions: ['fresh'],
+      legalTransitions: ['unchanged', 'append', 'fresh'],
       budget: { maxSourceBytes: 8192, quality: 'byte_bound' }
     };
     const selections = [];
@@ -75,6 +75,7 @@ for (const columns of [48, 120])
     assert.equal(selections[0].expectedWindowId, null);
     assert.equal(selections[0].expectedSourceRevision, cut.sourceRevision);
     assert.ok(selections[0].idempotencyKey);
+    assert.equal(selections[0].renewal, undefined, 'Applying sources does not request unnecessary renewal');
   });
 
 test('context controls preserve the effective selection and forward the edited set through one transition', async () => {
@@ -197,3 +198,27 @@ test('idle context remains inspectable but cannot schedule an unadmitted selecti
   assert.equal(result.state.selection, draft.selection);
   assert.match(result.state.notice, /while a request is running/);
 });
+
+for (const scheduled of [false, true])
+  test(`${scheduled ? 'scheduled' : 'direct'} unchanged Apply completes without claiming a new context`, async () => {
+    const draft = selectionDraft();
+    const operations = {
+      transitionContext: async () => ({ selection: scheduled
+        ? { kind: 'scheduled', requestId: 'queued-no-op' }
+        : { kind: 'unchanged', windowId: null } }),
+      inspectContext: async () => ({ ...draft.inspection, activeSelection: { status: 'available', selection: draft.selection } }),
+      contextSources: async () => ({ items: [] })
+    };
+    const applying = updateContext(draft, { type: 'context.apply' }, operations);
+    const response = await applying.effects[0].run({ signal: new AbortController().signal });
+    let result = updateContext(applying.state, response.message, operations);
+    if (scheduled)
+      result = updateContext(result.state, { type: 'context.applied',
+        idempotencyKey: applying.state.pendingTransition.idempotencyKey, status: 'unchanged' }, operations);
+    assert.equal(result.state.pendingTransition, undefined);
+    assert.equal(result.state.notice, 'Context selection unchanged.');
+    const refreshed = await result.effects[0].run({ signal: new AbortController().signal });
+    const completed = updateContext(result.state, refreshed.message, operations).state;
+    assert.equal(completed.inspection.window, null);
+    assert.equal(completed.notice, 'Context selection unchanged.');
+  });

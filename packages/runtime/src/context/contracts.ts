@@ -1,11 +1,15 @@
 import type { HistorySourceCut, HistorySourceRef, HistorySourceExcerpt, HistorySourceMetadata } from '../history/contracts.js';
 import type { SessionStateChange } from '../session/session-state.js';
 
-export interface ContextSelection {
+export interface ContextSourceSelection {
   /** Exact historical text evidence, not conversational or native protocol replay. */
   readonly excerpts?: readonly HistorySourceExcerpt[] | undefined;
   /** Explicit host/user retention across subsequent renewals. */
   readonly protected?: readonly HistorySourceRef[] | undefined;
+  readonly retained: readonly HistorySourceRef[];
+}
+/** Runtime-owned persisted selection and provider continuation lineage. */
+export interface ContextSelection extends ContextSourceSelection {
   readonly continuity?:
     | {
         readonly kind: 'fresh';
@@ -14,10 +18,24 @@ export interface ContextSelection {
         readonly sources: readonly HistorySourceRef[];
       }
     | undefined;
-
-  readonly retained: readonly HistorySourceRef[];
+}
+/** Immutable low-authority replacement, delivered only by an admitted provider request. */
+export interface ContextStateNotice {
+  readonly id: string;
+  readonly previousRevisionId: string | null;
+  readonly revisionId: string;
+  readonly after: HistorySourceCut;
+  readonly message: { readonly role: 'user'; readonly content: string };
+}
+/** A linked state-sequence journal references the one authoritative state revision. */
+export interface ContextStateSequence {
+  readonly checkpointRevisionId: string | null;
+  readonly lineage: HistorySourceCut | null;
+  readonly parent: HistorySourceRef | null;
+  readonly notice?: ContextStateNotice | undefined;
 }
 export interface ContextWindowRecord {
+  readonly stateSequence: ContextStateSequence;
   readonly windowId: string;
   readonly parentWindowId: string | null;
   readonly historyPosition: HistorySourceCut;
@@ -26,6 +44,9 @@ export interface ContextWindowRecord {
   readonly createdAt: string;
 }
 export interface ContextTransitionRecord {
+  readonly strategy: 'append' | 'fresh';
+  readonly cause: 'state_update' | 'selection_change' | 'explicit_renewal' | 'capacity' | 'prefix_incompatibility';
+  readonly requestedRenewal?: boolean | undefined;
   readonly admission:
     { readonly status: 'admitted'; readonly compiledInputIdentity: string; readonly capabilityRevision: string };
   readonly transitionId: string;
@@ -34,6 +55,7 @@ export interface ContextTransitionRecord {
   readonly windowId: string;
   readonly requestFingerprint: string;
   readonly selectionFingerprint: string;
+  readonly stateSequenceFingerprint: string;
   readonly requestedSourceRevision?: number | undefined;
   readonly requestedSessionStateRevisionId?: string | null | undefined;
   readonly committedAt: string;
@@ -48,6 +70,8 @@ export interface ContextTransitionCommit {
   readonly transition: ContextTransitionRecord;
 }
 export interface ContextTransitionRequest {
+  /** Deliberately replace the provider continuation even when content is unchanged. */
+  readonly renewal?: boolean | undefined;
   readonly expectedCut?: HistorySourceCut | undefined;
   readonly sessionState?: SessionStateChange | undefined;
   readonly expectedSessionStateRevisionId?: string | null | undefined;
@@ -60,7 +84,7 @@ export interface ContextTransitionRequest {
   readonly expectedWindowId: string | null;
   readonly expectedSourceRevision?: number | undefined;
   readonly idempotencyKey: string;
-  readonly selection: ContextSelection;
+  readonly selection: ContextSourceSelection;
   readonly reason: string;
 }
 
@@ -83,4 +107,9 @@ export interface ContextSourceManifest {
   readonly coverage: 'complete' | 'partial';
   readonly cursor?: string;
   readonly releaseMeaning: string;
+}
+
+export interface ContextTransitionUnchanged {
+  readonly status: 'unchanged';
+  readonly windowId: string | null;
 }

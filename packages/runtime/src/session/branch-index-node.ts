@@ -327,6 +327,7 @@ export class JsonlBranchIndex {
       const runs = new Set<string>();
       const selectedRefs = new Map([
         ...input.window.selection.retained,
+        ...(input.window.stateSequence.parent ? [input.window.stateSequence.parent] : []),
         ...(input.window.selection.excerpts ?? []).map(excerpt => excerpt.source)
       ].map(ref => [hashJson(ref), ref]));
       for (const ref of selectedRefs.values()) {
@@ -345,7 +346,7 @@ export class JsonlBranchIndex {
       }
       const context = leaf?.contextId ? await this.branchRecord(await this.locate(root, `entry:${leaf.contextId}`), leaf.contextId, root) : undefined;
       validateContextCommitState(this.sessionId, {
-        leafId: root.leafId, windowId: context?.type === 'context_transition' ? context.window.windowId : null,
+        leafId: root.leafId, context: context?.type === 'context_transition' ? context : null,
         sessionState: await this.stateAt(root, leaf?.sessionStateId ?? null), refs, finalizations
       }, root.sourceRevision, input);
     });

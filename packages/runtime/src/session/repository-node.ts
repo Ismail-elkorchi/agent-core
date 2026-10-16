@@ -135,7 +135,7 @@ export class JsonlSessionRepository implements SessionRepository {
         const header: SessionHeader = Object.freeze({
           type: 'session',
           version: 1,
-          format: 'agent-core.session/2',
+          format: 'agent-core.session/3',
           sessionStateStorage: 'session',
           id,
           timestamp: new Date().toISOString(),
@@ -1017,7 +1017,7 @@ const SESSION_HEADER_FIELDS = new Set([
 function parseSessionHeader(value: JsonValue, sessionId: string): SessionHeader {
   if (
     !isJsonObject(value) ||
-    value.format !== 'agent-core.session/2' ||
+    value.format !== 'agent-core.session/3' ||
     value.sessionStateStorage !== 'session'
   )
     throw new Error(
@@ -1039,7 +1039,7 @@ function parseSessionHeader(value: JsonValue, sessionId: string): SessionHeader 
   return Object.freeze({
     type: 'session',
     version: 1,
-    format: 'agent-core.session/2',
+    format: 'agent-core.session/3',
     sessionStateStorage: 'session',
     id: value.id,
     timestamp: value.timestamp,

@@ -81,8 +81,9 @@ text. `decodeSessionStateContent` establishes an owned immutable value;
 
 The model sends a complete replacement through `context_transition.sessionState`.
 Keep IDs when revising the same item; remove obsolete claims and omit unnecessary
-sections. Empty content clears the snapshot. Identical content preserves revision
-identity. State is fallible interpretation, never authority, verification, or a
+sections. Omitted content leaves the current interpretation unchanged; empty content
+clears it. Identical content preserves revision identity. Clearing state does not
+erase original history or older state already delivered to a provider. State is fallible interpretation, never authority, verification, or a
 replacement for original user requirements and observations.
 
 Runtime provenance is separate from model content: the revision records its
@@ -95,33 +96,76 @@ admission of the actual next request. A scheduled tool receipt is not publicatio
 Rejected, stale, or oversized proposals leave the previous state intact; retries
 are idempotent. Forks inherit state at the selected historical point.
 
-Present only the current snapshot once in each request. `ContextService.sessionState()`
-reads it without replaying the archive. `inspect()` supplies bounded content or a
-partial preview plus an exact history reference. Historical revisions stay
-retrievable through original history.
+`ContextService.sessionState()` reads the authoritative current snapshot without
+replaying the archive. `inspect()` supplies bounded content or a partial preview
+plus an exact history reference. Within a supported session format, historical
+revisions stay retrievable through original history.
 
-## Context renewal
+Within a provider continuation, the initial checkpoint-state presentation is frozen.
+An admitted state update appends an attributed complete replacement notice,
+identifying its previous and successor revisions. An empty replacement is explicit.
+The exact notice role, bytes, identity, and position are persisted for replay;
+restart and fork preserve the applicable branch ancestry. Earlier state can remain
+visible as explicitly superseded interpretation until renewal. Neither checkpoint
+nor replacement notice becomes system/developer authority or overwrites execution
+facts. A fresh continuation starts from the latest state without older notices.
 
-There is one context transition: select original sources and start fresh provider
-continuation in the same session. The runtime supplies the reset identity and
-model binding. Session identity, authority, effects, resources, accounting, and
-unresolved delivery obligations survive. Native reasoning stays in original
-storage; selected portable originals form the new request. Model changes use the
-same fresh-continuation rule without a separate user choice.
+## Context transitions and renewal
+
+One `context_transition` operation proposes state and source changes. The runtime
+chooses the lawful successor from the actual delivered request and provider
+capabilities:
+
+- **Unchanged:** effective state and ordered evidence selection are unchanged,
+  with no required or requested renewal. No state revision, notice, or window is
+  published, and the tool exchange still completes normally
+- **Append:** a source-preserving state replacement lawfully extends the exact
+  delivered prefix with its notice, preserving provider continuation
+- **Fresh:** explicit renewal, source reduction or reorder, incompatible
+  configuration/prefix, or required capacity recovery needs a fresh continuation
+
+Use `renewal: true` only when deliberately requesting fresh context, including
+renewal with unchanged state. Callers do not select append or provide reset IDs,
+model bindings, or provider-prefix bookkeeping. If no admitted lawful successor is
+supported, the transition fails without publishing state. Session identity,
+authority, effects, resources, accounting, and unresolved delivery obligations
+survive either committed strategy. Fresh continuation retains portable selected
+originals; signed or opaque native material stays in original storage and is not
+recast as ordinary state. Model changes preserve only compatible provider state.
 
 `context_transition` accepts `add` and `release` edits, or `retain` as a complete
 replacement of optional history. `recentFrom` selects the active suffix from an
 exact source. Omitting source edits keeps the selection; empty `retain` releases
-optional history. Complete exchanges, active accepted input, explicit protections,
-and the originals cited by current interaction state remain protected. Citations
-in other state sections are retrieval references, not automatic retention.
+optional history. Complete exchanges, active accepted input, and explicit protections
+remain protected. Citations in every state section are exact retrieval references,
+not automatic retention. Use source-selection operations to retain or release
+originals independently of how the state is organized.
 
 State replacement may accompany source changes. Both are bound to the originating
 inference revision and the authoritative source cut, with no implicit stale-state
 rebase. Finish the transition tool's exchange before compiling the successor.
 Outstanding effect and result-delivery obligations cannot be dropped to make a
 request fit. Hosts use `transitionContext` at the inspected window and source
-revision. The TUI has one advanced Apply selection action while a request is running; idle history remains inspectable without publishing an unadmitted window.
+revision. Their `ContextTransitionRequest.selection` contains only evidence:
+`retained`, optional `excerpts`, and optional `protected` sources. Do not copy the
+persisted window's runtime-owned `continuity` into a proposal. For example, reuse
+`inspection.activeSelection.selection` when its status is `available`, with
+`expectedWindowId`, `expectedSourceRevision`, `idempotencyKey`, and `reason` from
+the inspected operation; add `renewal: true` only for deliberate renewal.
+
+`AgentSession.transitionContext()` returns `kind: 'scheduled'` for queued work,
+`kind: 'selected'` with the committed entry, or `kind: 'unchanged'` with a nullable
+window ID. Scheduling is not commitment. Committed transition records expose the
+selected `strategy`, `cause`, and optional `requestedRenewal` separately. The
+correlated `context.transitioned`, `context.transition.unchanged`, or
+`context.transition.rejected` event settles a pending application action. An
+unchanged result is not evidence of pressure relief. Durable publication also is
+not proof of provider delivery; existing invocation and delivery receipts remain
+authoritative.
+
+The TUI has one advanced Apply selection action while a request is running; it
+does not force renewal. Idle history remains inspectable without publishing an
+unadmitted window.
 
 `context_inspect` exposes bounded source metadata and exact references. Follow its
 cursor to inspect more of the captured selection. Original-history inspection,
@@ -133,7 +177,8 @@ savings. Do not infer complete coverage from a single page or an unread source.
 
 Applications set source byte bounds and explicit output reservations. Admission
 compiles the actual task, attachments, instructions, session state, selected
-originals, tools, media, and protocol requirements. Exact counts, estimates, and
+originals, the frozen checkpoint and all active replacement notices, tools, media,
+and protocol requirements. Exact counts, estimates, and
 unknown components remain distinguishable. Only the compiled request's accounting
 determines fit; failed preparation or admission never publishes a candidate.
 
@@ -155,7 +200,13 @@ fit, the run suspends with its settlements intact. Native in-inference tool
 delivery retains its provider protocol boundary and is not treated as a completed
 ordinary batch.
 
-Recovery can inspect metadata, retrieve history, and propose a fresh source selection. It cannot execute domain effects or answer the user.
+Appended replacements consume capacity. They are never rewritten or deleted
+inside a preserved prefix. When actual reduction is required, recovery uses an
+admitted fresh request containing the latest state and required evidence,
+without superseded notices. Unavailable measurements do not establish exhaustion.
+
+Recovery can inspect metadata, retrieve history, and request fresh context through
+the same transition operation. It cannot execute domain effects or answer the user.
 Its control requests and original results remain recorded. Repeated unchanged
 attempts and exhausted allowances produce durable, explicit suspension rather
 than resetting limits. Tool-result presentation bounds never alter authoritative
@@ -183,9 +234,13 @@ or acknowledged delivery cannot be resent without evidence that it failed.
 
 ## Compatibility and evidence
 
-This pre-alpha replacement rejects old working-state payloads and incompatible
-session headers in place. It has no aliases, old-format readers, migrations, or
+Execution and state-sequence formats are versioned. The continuation contract uses
+`agent-core.session/3`. This build cannot open, resume, or read historical content
+from earlier session formats. It rejects unsupported execution records and
+incompatible session headers without rewriting original journals. Reading those
+originals requires the matching earlier build; this build performs no conversion. It has no aliases, old-format readers, migrations, or
 automatic deletion. Structural tests establish publication, persistence, forks,
-source attribution, admission, and protocol boundaries. They do not establish a
+source attribution, admission, and protocol boundaries. Continuation strategy,
+provider cache usage, and retained information are separate measurements. They do not establish a
 model-quality improvement; empirical claims require identified models, workloads,
 resource limits, and comparable live trials.

@@ -56,7 +56,7 @@ import {
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { ContextTransitionRequest } from './context/contracts.js';
-import type { ContextAdmissionInput, ContextService } from './context/service.js';
+import { type ContextAdmissionInput, type ContextService } from './context/service.js';
 import {
   encodeAgentEvent,
   type AgentAuditEvent,
@@ -74,6 +74,7 @@ import {
   requestCapacity
 } from './inference/request-admission.js';
 import {
+  assertPortableHistoryCompatibility,
   rebuildModelWindowFromRepositories,
   replaySourceEntries,
   recordContextExcerpts,
@@ -302,7 +303,7 @@ type AssistantTurnResult =
       readonly native: boolean;
       readonly source: import('@agent-core/persistence').EventReference;
     }
-  | { readonly kind: 'renew_context' }
+  | { readonly kind: 'transition_context' }
   | { readonly kind: 'decision'; readonly decision: ExecutionDecision }
   | { readonly kind: 'outcome_unknown'; readonly effectId: string };
 interface RequestAssemblyResult {
@@ -500,12 +501,6 @@ export class AgentRuntime {
         );
       },
       schedule: (request) => this.scheduleContextTransition(request),
-      modelSelection: () => ({
-        provider: this.options.provider.id,
-        model: this.options.model,
-        ...(this.options.reasoning ? { reasoning: this.options.reasoning } : {}),
-        ...(this.options.temperature === undefined ? {} : { temperature: this.options.temperature })
-      }),
     });
     if (!Number.isSafeInteger(options.maxOutputTokens) || options.maxOutputTokens < 1)
       throw new TypeError('AgentRuntime requires an explicit positive maxOutputTokens allowance.');
@@ -1394,8 +1389,7 @@ export class AgentRuntime {
       replay = await rebuild();
     } catch (error) {
       if (error instanceof NativeContextIncompatibilityError) {
-        await this.scheduleModelCompatibilityTransition(runtime.runId,
-          await this.options.provider.describeModel(this.options.model));
+        await this.scheduleModelCompatibilityTransition(runtime.runId);
       } else if (!(error instanceof ContextSourceCapacityError) || !this.options.contextRenewal?.automatic)
         throw error;
       // This empty staging window is never dispatched as application context.
@@ -1682,10 +1676,8 @@ export class AgentRuntime {
           );
         }
         if (assistant.kind === 'decision') return assistant.decision;
-        if (assistant.kind === 'renew_context') {
-          await modelSession?.close?.();
-          modelSession = undefined;
-          sessionModel = undefined;
+        if (assistant.kind === 'transition_context') {
+          // The shared successor planner decides whether the settled native session is renewed.
           turnIndex++;
           continue;
         }
@@ -2270,7 +2262,7 @@ export class AgentRuntime {
     let final: Extract<AssistantTurnResult, { readonly kind: 'settled' }> | undefined;
     let paused: ExecutionDecision | undefined;
     let unknownEffect: string | undefined;
-    const transition = { renewed: false };
+    const transition = { pending: false };
     let nextTools = initial.snapshot.tools;
     const pause = new Error('Native execution reached a durable suspension boundary.');
     const pauseFor = (status: ToolWorkStatus): void => {
@@ -2541,7 +2533,7 @@ export class AgentRuntime {
           ) {
             const source = providerWork(runtime.run.state(), item.request.snapshot.record);
             if (source.stage !== 'settled')
-              throw new Error('Native renewal requires settled provider work.');
+              throw new Error('Native context transition requires settled provider work.');
             assertToolTransitionBoundary(runtime.run.state());
             await runtime.run.transitionProvider(
               'consume_provider_settlement',
@@ -2555,7 +2547,7 @@ export class AgentRuntime {
                 turnIndex: item.request.turnIndex + 1
               }
             });
-            transition.renewed = true;
+            transition.pending = true;
             return;
           }
 
@@ -2661,7 +2653,7 @@ export class AgentRuntime {
         }
       });
       await this.nativeSteering?.finishResponse();
-      if (transition.renewed) return { kind: 'renew_context' };
+      if (transition.pending) return { kind: 'transition_context' };
       if (!final || final.toolCalls.length)
         throw new Error('Native execution ended with unresolved model work.');
       return final;
@@ -3341,7 +3333,10 @@ export class AgentRuntime {
       window: ModelWindow,
       sessionState: SessionStateSnapshot
     ) => {
-      const stateContext = sessionStateContext(sessionState)[0];
+      const stateSequence = window.stateSequence();
+      const checkpoint = stateSequence && stateSequence.checkpointRevisionId !== (sessionState.revision?.id ?? null) && this.options.context
+        ? await this.options.context.checkpointState(stateSequence) : sessionState;
+      const stateContext = sessionStateContext(checkpoint)[0];
       const result = await this.requestAdmission.assemble(
         {
           window,
@@ -3394,7 +3389,7 @@ export class AgentRuntime {
       );
       return { ...result, sessionStateRevisionId: sessionState.revision?.id ?? null };
     };
-    const contextPublication = { committed: false, candidateAdmitted: false };
+    const contextPublication = { committed: false, fresh: false, candidateAdmitted: false };
     const controlReserves = new Map<string, number>();
     const admitOrdinary = async (compiled: CompiledModelRequest) => {
       const reserve = await this.admitContextRequest(compiled, request, append);
@@ -3403,9 +3398,30 @@ export class AgentRuntime {
     const validate = async (input: ContextAdmissionInput) => {
       assertToolTransitionBoundary(request.run.state());
       const boundary = request.run.state().revision;
-      const proposed = await this.contextWindowForAdmission(input, request);
-      const result = await assemble(proposed.window, input.sessionState);
-      await admitOrdinary(result.compiled);
+      let proposed;
+      let result;
+      let renewal;
+      try {
+        proposed = await this.contextWindowForAdmission(input, request);
+        result = await assemble(proposed.window, input.checkpointState);
+        await admitOrdinary(result.compiled);
+      } catch (error) {
+        if (input.strategy !== 'append' ||
+            (!(error instanceof NativeContextTransitionRequired) &&
+              !(error instanceof ContextAdmissionError && error.capacityExceeded) &&
+              !(error instanceof AppendContextRenewalRequired))) throw error;
+        if (!this.options.context) throw error;
+        const stateSequence = {
+          checkpointRevisionId: input.sessionState.revision?.id ?? null,
+          lineage: input.cut, parent: null
+        };
+        proposed = await this.contextWindowForAdmission({ ...input, stateSequence,
+          checkpointState: input.sessionState, strategy: 'fresh' }, request);
+        renewal = { selection: proposed.selection, stateSequence,
+          cause: error instanceof ContextAdmissionError ? 'capacity' as const : 'prefix_incompatibility' as const };
+        result = await assemble(proposed.window, input.sessionState);
+        await admitOrdinary(result.compiled);
+      }
       if (result.compiled.inputIdentity === rejected?.inputIdentity)
         throw new ContextAdmissionError(
           result.compiled,
@@ -3422,7 +3438,9 @@ export class AgentRuntime {
       contextPublication.candidateAdmitted = true;
       return {
         compiledInputIdentity: result.compiled.inputIdentity,
-        capabilityRevision: result.compiled.capabilityRevision
+        capabilityRevision: result.compiled.capabilityRevision,
+        selection: proposed.selection,
+        ...(renewal ? { renewal } : {})
       };
     };
     if (this.options.context) {
@@ -3432,9 +3450,15 @@ export class AgentRuntime {
           preserveFailure: (error) => { this.preserveRecoveryFailure(error, request); },
           admit: (transition) => this.retainPendingSources(transition, request.runId),
           validate,
+          ...(sourceConflict ? { renewalReason: 'capacity' as const } :
+            this.pendingCompatibilityTransition ? { renewalReason: 'prefix_incompatibility' as const } : {}),
+          unchanged: async (result, idempotencyKey) => {
+            await emit({ type: 'context.transition.unchanged', idempotencyKey, windowId: result.windowId });
+          },
           committed: async (entry) => {
             await this.activateCommittedContext(request.modelWindow, request.runId);
             contextPublication.committed = true;
+            contextPublication.fresh ||= entry.transition.strategy === 'fresh';
             await emit({
               type: 'context.transitioned',
               window: entry.window,
@@ -3482,7 +3506,7 @@ export class AgentRuntime {
       result = await assemble(request.modelWindow, sessionState);
     } catch (error) {
       if (!(error instanceof NativeContextTransitionRequired)) throw error;
-      await this.scheduleModelCompatibilityTransition(request.runId, request.snapshot.profile);
+      await this.scheduleModelCompatibilityTransition(request.runId);
       return this.assembleModelRequest(request, append, emit, rejected);
     }
     let admissionFailure: ContextAdmissionError | undefined;
@@ -3504,6 +3528,7 @@ export class AgentRuntime {
         inputIdentity: result.compiled.inputIdentity,
         accounting: result.compiled.accounting,
         message: admissionFailure.message,
+        ...(admissionFailure.providerRejected ? { providerRejected: true } : {}),
         ...(admissionFailure.continuityHeadroomTokens === undefined ? {} :
           { continuityHeadroomTokens: admissionFailure.continuityHeadroomTokens })
       });
@@ -3588,7 +3613,7 @@ export class AgentRuntime {
       request: compiled.logicalRequest,
       presentation: assembly.presentation
     });
-    return { request: result.request, compiled, estimate, fingerprint, freshContext: contextPublication.committed, ...(cut ? { capturedHistoryCut: cut } : {}) };
+    return { request: result.request, compiled, estimate, fingerprint, freshContext: contextPublication.fresh, ...(cut ? { capturedHistoryCut: cut } : {}) };
   }
 
   private async admitContextRequest(
@@ -3643,14 +3668,34 @@ export class AgentRuntime {
     input: ContextAdmissionInput,
     request: AssistantTurnRequest
   ) {
+    if (input.strategy === 'append') {
+      if (input.excerpts.length && !request.modelWindow.continuation())
+        throw new AppendContextRenewalRequired('Historical excerpts require a fresh request without an exact bound request.');
+      const window = new ModelWindow(this.estimator);
+      window.replaceWith(request.modelWindow);
+      window.setStateSequence(input.stateSequence);
+      if (input.stateSequence.notice) window.recordStateNotice(input.stateSequence.notice);
+      return { window, selection: input.selection };
+    }
     if (request.snapshot.profile.capabilities.protocol?.contextReset !== 'fresh_request')
       throw new ContextContinuityError('unsupported', 'The selected provider does not support fresh context renewal.');
+    await assertPortableHistoryCompatibility({ sessionId: input.cut.sessionId, entries: input.entries,
+      profile: request.snapshot.profile, artifacts: this.options.repositories.artifacts });
+    const selection = { ...input.selection, continuity: {
+      kind: 'fresh' as const,
+      resetId: `renewal-${hashJson({ cut: input.cut, state: input.sessionState.revision?.id ?? null, model: request.snapshot.configuration.model })}`,
+      model: { provider: request.snapshot.profile.provider, model: request.snapshot.configuration.model,
+        ...(request.snapshot.configuration.reasoning === undefined ? {} : { reasoning: request.snapshot.configuration.reasoning }),
+        ...(request.snapshot.configuration.temperature === undefined ? {} : { temperature: request.snapshot.configuration.temperature }) },
+      sources: input.selection.retained
+    } };
     const window = new ModelWindow(this.estimator);
     await replaySourceEntries(window, input.cut.sessionId, input.entries,
       this.options.repositories.artifacts,
-      new Set(input.selection.continuity?.sources.map(source => source.entryId)), request.runId);
+      new Set(selection.retained.map(source => source.entryId)), request.runId);
     recordContextExcerpts(window, input.excerpts);
-    return { window };
+    window.setStateSequence(input.stateSequence);
+    return { window, selection };
   }
 
   /** Reconcile committed sources against the contributions already applied to this window. */
@@ -3721,7 +3766,7 @@ export class AgentRuntime {
       });
     } catch (error) {
       if (!(error instanceof NativeContextIncompatibilityError)) throw error;
-      await this.scheduleModelCompatibilityTransition(runId, profile);
+      await this.scheduleModelCompatibilityTransition(runId);
       return;
     }
     for (const invalidated of replay.invalidatedProviderStates) {
@@ -3742,7 +3787,7 @@ export class AgentRuntime {
   }
 
   /** A model choice requests fresh source replay; publication still requires its actual successor. */
-  private async scheduleModelCompatibilityTransition(runId: string, profile: ModelProfile): Promise<void> {
+  private async scheduleModelCompatibilityTransition(runId: string): Promise<void> {
     const context = this.options.context;
     if (!context || !this.contextTransitions)
       throw new Error('Incompatible native context requires source-backed successor admission.');
@@ -3755,13 +3800,12 @@ export class AgentRuntime {
       ...(this.options.reasoning === undefined ? {} : { reasoning: this.options.reasoning }),
       ...(this.options.temperature === undefined ? {} : { temperature: this.options.temperature }) };
     const resetId = `model-${hashJson({ runId, model, windowId: window?.windowId ?? null })}`;
-    const selection = await context.freshSelection({
-      selection: await context.selectSources(cut, {}), model, profile, cut, resetId
-    });
+    const selection = await context.selectSources(cut, {});
     await this.contextTransitions.schedule({
       expectedWindowId: window?.windowId ?? null,
       idempotencyKey: resetId,
       reason: 'Admit original sources for the selected model.',
+      renewal: true,
       selection
     });
   }
@@ -3844,36 +3888,14 @@ export class AgentRuntime {
       retain: [...retained.values()]
     });
     for (const source of completed.retained) retained.set(source.entryId, source);
-    const continuity = transition.selection.continuity ?? window?.selection.continuity;
-    const fresh =
-      transition.selection.continuity &&
-      transition.selection.continuity.resetId !== window?.selection.continuity?.resetId;
-    const selection = fresh
-      ? await this.options.context.freshSelection({
-          selection: { ...transition.selection, retained: [...retained.values()] },
-          model: transition.selection.continuity.model,
-          profile: await this.options.provider.describeModel(this.options.model),
-          cut,
-          resetId: transition.selection.continuity.resetId
-        })
-      : transition.selection;
+    const candidate = {
+      ...transition.selection,
+      retained: await this.options.context.history.orderSources([...retained.values()], cut)
+    };
     return {
       ...transition,
       expectedSourceRevision: cut.sourceRevision,
-      selection: {
-        ...selection,
-        retained: [...retained.values()],
-        ...(continuity
-          ? {
-              continuity: {
-                ...continuity,
-                sources: fresh
-                  ? [...retained.values()]
-                  : continuity.sources.filter((source) => retained.has(source.entryId))
-              }
-            }
-          : {})
-      }
+      selection: candidate
     };
   }
 
@@ -5125,6 +5147,8 @@ function sessionStateContext(
     }
   ];
 }
+
+class AppendContextRenewalRequired extends Error {}
 
 class ContextRecoveryStoppedError extends Error {
   readonly conflict: ContextAdmissionConflict;

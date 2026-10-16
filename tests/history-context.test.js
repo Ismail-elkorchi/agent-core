@@ -1,3 +1,4 @@
+import { admitContext } from './context-admission-fixtures.js';
 import * as z from 'zod';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -49,11 +50,7 @@ function terminal(runId) {
 }
 // Service tests provide deterministic compiled admission; runtime tests compile the actual request.
 function renew(context, request, options = {}) {
-  const selection = request.selection;
-  return context.transition({ ...request, selection: { ...selection,
-    continuity: selection.continuity ?? { kind: 'fresh', resetId: request.idempotencyKey,
-      model: { provider: 'fixture', model: 'context' }, sources: selection.retained }
-  } }, { admit: async () => ({ compiledInputIdentity: 'fixture-input', capabilityRevision: 'fixture' }), ...options });
+  return context.transition({ ...request, renewal: true }, { admit: admitContext, ...options });
 }
 async function backend(kind) {
   if (kind === 'memory')
@@ -411,10 +408,10 @@ test('context validation releases the session queue and accepted queued input ma
       selection: { retained: [sourceRef(session.id, first)] }
     },
     {
-      admit: async () => {
+      admit: async input => {
         entered();
         await gate;
-        return { compiledInputIdentity: 'captured-request', capabilityRevision: 'fixture' };
+        return admitContext(input);
       }
     }
   );
@@ -745,12 +742,12 @@ for (const kind of ['memory', 'jsonl']) {
   });
 }
 
-test('context discovery advertises fresh renewal only', async () => {
+test('context discovery advertises unchanged, append and fresh outcomes', async () => {
   const sessions = new InMemorySessionRepository();
   const session = await sessions.create({ binding });
   const context = new ContextService({ artifacts: new InMemoryArtifactRepository(), repository: sessions,
     session, policy: { maxSourceBytes: 8192 } });
-  assert.deepEqual((await context.inspect()).legalTransitions, ['fresh']);
+  assert.deepEqual((await context.inspect()).legalTransitions, ['unchanged', 'append', 'fresh']);
 });
 
 async function sourceAfter(reader, source, cut) {
@@ -1137,9 +1134,7 @@ for (const contextRecovery of [false, true]) {
       await assert.rejects(transition, /unfinished tool exchange cannot be released/);
       await assert.rejects(renew(context, { expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
         idempotencyKey: 'fresh-cannot-drop-pending', reason: 'Explicit fresh continuation still owes its result',
-        selection: { retained: [sourceRef(session.id, input)], continuity: {
-          kind: 'fresh', resetId: 'fresh-pending', model: { provider: 'fixture', model: 'context' }, sources: [sourceRef(session.id, input)]
-        } } }), /unfinished tool exchange cannot be released/);
+        selection: { retained: [sourceRef(session.id, input)] } }), /unfinished tool exchange cannot be released/);
       assert.equal(await history.selectedContext(), undefined);
     }
   });
@@ -1204,7 +1199,7 @@ test('ledger-only native prefix and pending call facts remain visible before a s
   assert.equal(assistant.group.release, 'unfinished_exchange');
 });
 
-test('whole native prefix release requires a new explicit fresh continuation', async () => {
+test('whole native prefix release requires runtime-admitted fresh lineage', async () => {
   const sessions = new InMemorySessionRepository();
   const artifacts = new InMemoryArtifactRepository();
   const session = await sessions.create({ binding });
@@ -1220,19 +1215,19 @@ test('whole native prefix release requires a new explicit fresh continuation', a
   const cut = await history.capture();
   await assert.rejects(context.transition({ expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
     idempotencyKey: 'silent-native-drop', reason: 'Release all native sources', selection: { retained: [inputRef] } },
-    { admit: async () => ({ compiledInputIdentity: 'fixture', capabilityRevision: 'fixture' }) }), /new fresh continuation/);
+    { admit: async () => ({ compiledInputIdentity: 'fixture', capabilityRevision: 'fixture' }) }), /Fresh admission must establish a new continuation/);
   assert.equal(await history.selectedContext(), undefined);
   await assert.rejects(renew(context, { expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
     idempotencyKey: 'fresh-cannot-drop-input', reason: 'Fresh continuity still owes the accepted input',
-    selection: { retained: [], continuity: { kind: 'fresh', resetId: 'fresh-without-input', model: { provider: 'fixture', model: 'context' }, sources: [] } } }), /active accepted or protected input is mandatory/);
+    selection: { retained: [] } }), /active accepted or protected input is mandatory/);
   const preserved = await renew(context, { expectedWindowId: null, expectedSourceRevision: cut.sourceRevision,
     idempotencyKey: 'preserve-native', reason: 'Preserve native prefix',
     selection: { retained: [inputRef, sourceRef(session.id, response)] } });
   const fresh = await renew(context, { expectedWindowId: preserved.window.windowId, expectedSourceRevision: (await history.capture()).sourceRevision,
     idempotencyKey: 'explicit-native-reset', reason: 'Explicit fresh continuation',
-    selection: { retained: [inputRef], continuity: { kind: 'fresh', resetId: 'new-explicit-reset', model: { provider: 'fixture', model: 'context' }, sources: [inputRef] } } });
+    selection: { retained: [inputRef] } });
   assert.deepEqual(fresh.window.selection.retained, [inputRef]);
-  assert.equal(fresh.window.selection.continuity.resetId, 'new-explicit-reset');
+  assert.notEqual(fresh.window.selection.continuity.resetId, preserved.window.selection.continuity.resetId);
 });
 
 test('fresh renewal can release a completed older native prefix tail', async () => {
