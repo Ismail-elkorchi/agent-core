@@ -175,12 +175,16 @@ function decodeExecution(
   return Object.freeze({ state });
 }
 
-export interface RecordedToolModelContent {
+export type RecordedToolModelContent =
+  | { readonly modelContent: readonly import('@agent-core/tools').ToolContent[]; readonly modelContentRef?: never }
+  | { readonly modelContent?: never; readonly modelContentRef: PublicArtifactRef };
+
+interface ToolModelContentInput {
   readonly modelContent?: readonly import('@agent-core/tools').ToolContent[];
   readonly modelContentRef?: PublicArtifactRef;
 }
 export async function resolveToolModelContent(
-  record: RecordedToolModelContent,
+  record: ToolModelContentInput,
   artifacts?: ArtifactRepository
 ): Promise<readonly import('@agent-core/tools').ToolContent[]> {
   if (record.modelContent !== undefined && record.modelContentRef !== undefined)
@@ -197,7 +201,7 @@ export async function resolveToolModelContent(
   );
 }
 export function decodeRecordedToolModelContent(
-  value: RecordedToolModelContent
+  value: ToolModelContentInput
 ): RecordedToolModelContent {
   if ((value.modelContent === undefined) === (value.modelContentRef === undefined))
     throw new Error('Exactly one recorded model content representation is required.');

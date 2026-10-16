@@ -311,7 +311,7 @@ test('inspection reports an impossible whole-envelope bound without dropping pro
     const before = inspections;
     await assert.rejects(inspectPresentation(context, { maxBytes }), error =>
       error instanceof ToolInputError && /cannot fit maxBytes/.test(error.message));
-    assert.equal(inspections - before, 1);
+    assert.equal(inspections - before, 2, 'One bounded single-source probe measures actionable retry feedback');
   }
   const complete = await inspectPresentation(context, { maxBytes: 16384 });
   assert.ok(Buffer.byteLength(complete.text) <= 16384);
@@ -752,3 +752,108 @@ for (const blocker of ['presentation storage', 'minimum protocol metadata']) {
     assert.equal(f.requests.length, 1);
   });
 }
+
+for (const interruption of ['abort', 'admission failure']) {
+  test(`settled observations remain replayable before presentation publication: ${interruption}`, async () => {
+    const original = 'SETTLED_BEFORE_PUBLICATION';
+    const f = await fixture({ sourceBytes: 64, toolOutput: () => original });
+    f.requests.length = 0;
+    let ordinary = 0;
+    let failAdmission = interruption === 'admission failure';
+    f.provider.compileRequest = async request => {
+      if (failAdmission && request.messages.some(item => item.role === 'tool'))
+        throw new Error('Injected admission failure after settlement');
+      const { signal: _signal, ...body } = request;
+      return compileModelRequest({ request, body, profile: await f.provider.describeModel(),
+        endpoint: 'fixture://interrupted-publication', providerInputTokens: 1000 });
+    };
+    f.provider.complete = async request => {
+      f.requests.push(request);
+      return ++ordinary === 1 ? call('domain_write') : response('Continued from settled observation.');
+    };
+    const controller = new AbortController();
+    const first = await new AgentRuntime({ ...f.options(), onProgress(event) {
+      if (interruption === 'abort' && event.type === 'tool.ended' && event.toolName === 'domain_write')
+        controller.abort();
+    } }).run({ runId: 'interrupted-before-publication', task: 'Write once.', signal: controller.signal }).result;
+    assert.equal(first.terminal?.executionStatus, interruption === 'abort' ? 'aborted' : 'failed', JSON.stringify(first));
+    const log = await records(f, 'interrupted-before-publication');
+    assert.equal(log.filter(event => event.type === 'tool.ended' && event.toolName === 'domain_write').length, 1);
+    assert.equal(log.filter(event => event.type === 'observation.record.created' && event.toolName === 'domain_write').length, 0);
+    failAdmission = false;
+    const next = await new AgentRuntime(f.options()).run({ runId: 'follow-up-after-interruption', task: 'What was the settled result?' }).result;
+    assert.equal(next.terminal?.executionStatus, 'completed', JSON.stringify(next));
+    assert.equal(f.effects(), 1, 'Repairing replay must never repeat a settled effect.');
+    assert.ok(f.requests.at(-1).messages.some(item => item.role === 'tool' && item.content.includes(original)));
+  });
+}
+
+test('a stopped driver resumes settlement publication without repeating the effect', async () => {
+  class StoppedEvents extends InMemoryEventRepository {
+    stopped = false;
+    async appendConditional(runId, event, options) {
+      if (this.stopped) throw new Error('Stopped after settled outcome');
+      const receipt = await super.appendConditional(runId, event, options);
+      if (event.type === 'tool.ended' && event.toolName === 'domain_write') {
+        this.stopped = true;
+        throw new Error('Stopped after settled outcome');
+      }
+      return receipt;
+    }
+  }
+  const events = new StoppedEvents(agentEventCodec);
+  const f = await fixture({ events, sourceBytes: 64, toolOutput: () => 'EXACT_SETTLED_SOURCE' });
+  f.provider.compileRequest = async request => {
+    const { signal: _signal, ...body } = request;
+    return compileModelRequest({ request, body, profile: await f.provider.describeModel(),
+      endpoint: 'fixture://stopped-publication', providerInputTokens: 1000 });
+  };
+  let turns = 0;
+  f.provider.complete = async request => {
+    f.requests.push(request);
+    return ++turns === 1 ? call('domain_write') : response();
+  };
+  await assert.rejects(new AgentRuntime(f.options()).run({ runId: 'stopped-publication', task: 'Write once.' }).result,
+    /Stopped after settled outcome/);
+  assert.equal(f.effects(), 1);
+  const before = await records(f, 'stopped-publication');
+  assert.equal(before.filter(event => event.type === 'observation.record.created').length, 0);
+  events.stopped = false;
+  const resumed = await new AgentRuntime(f.options()).resume('stopped-publication').result;
+  assert.equal(resumed.terminal?.executionStatus, 'completed', JSON.stringify(resumed));
+  assert.equal(f.effects(), 1);
+  const after = await records(f, 'stopped-publication');
+  assert.equal(after.filter(event => event.type === 'tool.ended').length, 1);
+  assert.equal(after.filter(event => event.type === 'observation.record.created').length, 1);
+  assert.ok(f.requests.at(-1).messages.some(item => item.role === 'tool' && item.content.includes('EXACT_SETTLED_SOURCE')));
+});
+
+test('settlement and publication share one immutable presentation artifact', async () => {
+  const f = await fixture({ sourceBytes: 64, toolOutput: () => 'SINGLE_PRESENTATION_PAYLOAD' });
+  const store = f.artifacts.store.bind(f.artifacts);
+  const presentations = [];
+  f.artifacts.store = async input => {
+    const artifact = await store(input);
+    if (input.label === 'domain_write-model-content') presentations.push({ input, artifact });
+    return artifact;
+  };
+  f.provider.compileRequest = async request => {
+    const { signal: _signal, ...body } = request;
+    return compileModelRequest({ request, body, profile: await f.provider.describeModel(),
+      endpoint: 'fixture://shared-presentation', providerInputTokens: 1000 });
+  };
+  let turns = 0;
+  f.provider.complete = async () => ++turns === 1 ? call('domain_write') : response();
+  const result = await new AgentRuntime(f.options()).run({ runId: 'shared-presentation', task: 'Write once.' }).result;
+  assert.equal(result.terminal?.executionStatus, 'completed');
+  assert.equal(presentations.length, 1, 'Exact selected model content is stored once.');
+  const log = await records(f, 'shared-presentation');
+  const outcome = log.find(event => event.type === 'tool.ended');
+  const publication = log.find(event => event.type === 'observation.record.created');
+  for (const event of [outcome, publication]) {
+    assert.equal(event.modelContent, undefined, 'Journal records must not duplicate artifact-backed presentation bytes.');
+    assert.deepEqual(event.modelContentRef, presentations[0].artifact);
+    assert.match(serializeToolModelContent(await resolveToolModelContent(event, f.artifacts)), /SINGLE_PRESENTATION_PAYLOAD/);
+  }
+  assert.equal((await resolveToolObservation(outcome.observation, f.artifacts)).output, 'SINGLE_PRESENTATION_PAYLOAD');
+});

@@ -47,7 +47,7 @@ export const applyPatchTool = defineTool({
       tree = parseApplyPatch(input.patch, { maxPatchBytes: limits.maxPatchBytes });
     } catch (error) {
       const failure = patchFailureFromError('', error);
-      throw new ToolInputError(failure.message, { failures: [failure] });
+      throw new ToolInputError(`Patch validation failed. No files were written. ${failure.message}`, { failures: [failure] });
     }
     if (tree.operations.length > limits.maxOperations) {
       throw new ToolInputError(

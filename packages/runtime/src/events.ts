@@ -3,7 +3,8 @@ import { validatePublicArtifactRef } from '@agent-core/persistence';
 import {
   decodeStoredToolObservation,
   encodeStoredToolObservation,
-  type StoredToolObservation
+  type StoredToolObservation,
+  type RecordedToolModelContent
 } from './orchestration/observation-source.js';
 import { parseJsonObject, type JsonObject, type JsonValue } from '@agent-core/json';
 import type {
@@ -423,7 +424,7 @@ export type AgentEvent =
       readonly type: 'tool.ended';
       readonly toolName: string;
       readonly observation: StoredToolObservation;
-    } & AgentToolCallAttemptIdentity);
+    } & AgentToolCallAttemptIdentity & RecordedToolModelContent);
 
 export type AgentAuditEvent = Exclude<AgentEvent, { readonly type: 'run.state.transitioned' }>;
 
@@ -1161,12 +1162,15 @@ const AGENT_EVENT_DECODERS = {
     });
   },
   'tool.ended': (value) => {
-    exact(value, ['type', ...TOOL_ATTEMPT_KEYS, 'toolName', 'observation']);
+    exact(value, ['type', ...TOOL_ATTEMPT_KEYS, 'toolName', 'observation', 'modelContent', 'modelContentRef']);
+    if (value.modelContent === undefined && value.modelContentRef === undefined)
+      throw malformed('Incompatible settled observation: recorded model content is required.');
     return Object.freeze({
       type: 'tool.ended',
       ...decodeToolAttemptIdentity(value),
       toolName: requiredString(value.toolName, 'toolName'),
-      observation: decodeStoredToolObservation(value.observation)
+      observation: decodeStoredToolObservation(value.observation),
+      ...decodeRecordedContent(value)
     });
   }
 } satisfies AgentEventDecoderMap;

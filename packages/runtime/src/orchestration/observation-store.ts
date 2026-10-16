@@ -176,7 +176,9 @@ export class ObservationStore {
     }
     const modelContentBytes = new TextEncoder().encode(JSON.stringify(modelContent));
     let modelContentRef: PublicArtifactRef | undefined;
-    if (modelContentBytes.byteLength > 256 * 1024) {
+    // One immutable content artifact is shared by settlement, outcome history,
+    // and publication; the journal records references rather than duplicate text.
+    if (this.artifacts || modelContentBytes.byteLength > 256 * 1024) {
       try {
         if (!this.artifacts) throw new Error('Model content artifact storage is unavailable.');
         modelContentRef = await this.artifacts.store({
@@ -189,7 +191,8 @@ export class ObservationStore {
         durableStorageDegraded = {
           message: error instanceof Error ? error.message : String(error)
         };
-        modelContent = decodeToolContent([
+        // Small content remains safely inline if artifact persistence fails.
+        if (modelContentBytes.byteLength > 256 * 1024) modelContent = decodeToolContent([
           {
             type: 'text',
             text: `${durableObservation.summary}\nDetailed model content is unavailable because storage failed: ${durableStorageDegraded.message.slice(0, 1000)}.`

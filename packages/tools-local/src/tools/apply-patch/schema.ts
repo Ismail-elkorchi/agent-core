@@ -39,6 +39,12 @@ export type ApplyPatchFailureReason =
   | 'parent_symlink'
   | 'write_failed';
 
+export interface PatchMatchExcerpt {
+  line: number;
+  startLine: number;
+  excerpt: string;
+}
+
 export interface ApplyPatchFailure {
   path: string;
   reason: ApplyPatchFailureReason;
@@ -50,6 +56,8 @@ export interface ApplyPatchFailure {
   oldPreview?: string;
   matchCount?: number;
   candidateLines?: number[];
+  /** At most five bounded excerpts from staged content before the failing hunk. */
+  matchExcerpts?: PatchMatchExcerpt[];
   possiblyAlreadyApplied?: boolean;
   nextAction?: string;
 }

@@ -1419,3 +1419,128 @@ test('active commands expose their effective deadline and rejected writes return
   assert.equal(foreign.output.details.cause, 'wrong_owner');
   assert.equal(foreign.output.details.process, undefined);
 });
+
+test('process wait guidance exposes cursor and activity semantics without changing defaults', () => {
+  const parsed = writeStdinTool.decodeInput({ kind: 'json', value: { processId: 'process' } });
+  assert.equal(parsed.ok, true);
+  const input = parsed.input;
+  assert.equal(input.yieldMs, 1_000);
+  assert.equal(input.afterCursor, 0);
+  assert.match(writeStdinTool.description, /wait for output or termination/);
+  assert.match(writeStdinTool.jsonSchema.properties.afterCursor.description, /prior result cursorEnd/);
+  assert.match(writeStdinTool.jsonSchema.properties.yieldMs.description, /Prefer 30000/);
+  for (const yieldMs of [-1, 0.5])
+    assert.equal(writeStdinTool.decodeInput({ kind: 'json', value: { processId: 'process', yieldMs } }).ok, false);
+});
+
+test('quiet process waits stay bounded and report no fresh output without claiming completion', async (t) => {
+  const { context, manager, root } = await processContext({ maxYieldMs: 100 });
+  t.after(async () => {
+    await manager.close();
+    context.services.rootedFileAuthority.close();
+    await rm(root, { recursive: true, force: true });
+  });
+  const started = await invokeToolCall(jsonToolCall('exec_command', {
+    command: 'sleep 30', background: true, timeoutMs: 60_000
+  }), tools, context);
+  assert.equal(started.kind, 'result', JSON.stringify(started));
+  const before = performance.now();
+  const quiet = await invokeToolCall(jsonToolCall('write_stdin', {
+    processId: started.output.processId, afterCursor: started.output.cursorEnd, yieldMs: 30_000
+  }), tools, context);
+  const elapsed = performance.now() - before;
+  assert(elapsed >= 75, `Wait returned too early: ${elapsed}ms`);
+  assert(elapsed < 5_000, `Configured wait cap was not honored: ${elapsed}ms`);
+  assert.equal(quiet.output.status, 'running');
+  assert.equal(quiet.output.cursorStart, quiet.output.cursorEnd);
+  assert.equal(quiet.output.deadline, started.output.deadline);
+  assert.equal(quiet.output.combined.segments.join(''), '');
+  const content = writeStdinTool.buildModelContent({ observation: quiet });
+  assert.match(content.map(part => part.text).join('\n'), /No fresh output.*still running/);
+  assert.match(content.map(part => part.text).join('\n'), /afterCursor=cursorEnd, and a longer yieldMs/);
+});
+
+test('long activity waits wake for fresh input output, exit, and owner cancellation', async (t) => {
+  for (const action of ['output', 'exit', 'cancel']) {
+    await t.test(action, async (t) => {
+      const { context, manager, root } = await processContext();
+      t.after(async () => {
+        await manager.close();
+        context.services.rootedFileAuthority.close();
+        await rm(root, { recursive: true, force: true });
+      });
+      const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(
+        "process.stdout.write('ready\\n'); process.stdin.on('data', d => process.stdout.write(d)); process.stdin.on('end', () => process.exit(0));"
+      )}`;
+      const started = await invokeToolCall(jsonToolCall('exec_command', {
+        command, background: true, timeoutMs: 60_000
+      }), tools, context);
+      assert.equal(started.kind, 'result', JSON.stringify(started));
+      assert.match(started.output.combined.segments.join(''), /ready/);
+      let settled = false;
+      const waiting = invokeToolCall(jsonToolCall('write_stdin', {
+        processId: started.output.processId, afterCursor: started.output.cursorEnd, yieldMs: 30_000
+      }), tools, context).then(result => { settled = true; return result; });
+      await new Promise(resolve => setTimeout(resolve, 100));
+      assert.equal(settled, false, 'A quiet active process must remain waiting');
+      const before = performance.now();
+      if (action === 'output') await manager.writeInput(started.output.processId, 'fresh\n', invocation);
+      else if (action === 'exit') await manager.closeInput(started.output.processId, invocation);
+      else await manager.disposeOwner(invocation.ownerId);
+      const result = await waiting;
+      assert(performance.now() - before < 5_000, 'Activity must wake the wait before its 30s limit');
+      assert.equal(result.output.cursorStart, started.output.cursorEnd);
+      assert.doesNotMatch(result.output.combined.segments.join(''), /ready/);
+      if (action === 'output') {
+        assert.equal(result.output.status, 'running');
+        assert.match(result.output.combined.segments.join(''), /fresh/);
+      } else if (action === 'exit') {
+        assert.equal(result.output.status, 'exited');
+        const content = writeStdinTool.buildModelContent({ observation: result });
+        assert.doesNotMatch(content.map(part => part.text).join('\n'), /Await progress/);
+      } else {
+        // A termination request can wake the existing activity waiter before settlement.
+        // Preserve that prompt interruption without inventing a terminal outcome.
+        assert(['running', 'stopped'].includes(result.output.status));
+        const terminal = await manager.query(started.output.processId, 100, 0, result.output.cursorEnd, invocation);
+        assert.equal(terminal.status, 'stopped');
+      }
+    });
+  }
+});
+
+test('wait guidance preserves process facts and only appears for quiet running ranges', () => {
+  const empty = { segments: [], observedBytes: 0, capturedBytes: 0, omittedBytes: 0,
+    startsAtOutputStart: true, endsAtOutputEnd: true };
+  for (const status of ['running', 'exited', 'stopped', 'timed_out', 'failed']) {
+    const output = { processId: 'quiet-process', owner: invocation, status,
+      cursorStart: 0, cursorEnd: 0, stdout: empty, stderr: empty, combined: empty,
+      ...(status === 'running' ? { deadline: '2026-10-16T23:30:00.000Z' } : { exitCode: 0 }) };
+    const original = structuredClone(output);
+    const content = writeStdinTool.buildModelContent({ observation: { kind: 'result', output } });
+    assert.deepEqual(output, original, 'Presentation must not mutate authoritative output');
+    assert.equal(JSON.parse(content[0].text).status, status);
+    assert.equal(content.some(part => part.text.includes('No fresh output')), status === 'running');
+  }
+  const fresh = { ...empty, segments: ['fresh'], observedBytes: 5, capturedBytes: 5 };
+  const content = writeStdinTool.buildModelContent({ observation: { kind: 'result', output: {
+    processId: 'active-process', owner: invocation, status: 'running', cursorStart: 0, cursorEnd: 5,
+    stdout: fresh, stderr: empty, combined: fresh
+  } } });
+  assert.equal(content.some(part => part.text.includes('No fresh output')), false);
+  assert.equal(content.at(-1).text, 'fresh');
+});
+
+test('requested long process waits retain the configured yield bound', async () => {
+  const context = { services: { localToolConfiguration: {
+    ...DEFAULT_LOCAL_TOOL_CONFIGURATION,
+    process: { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process, maxYieldMs: 75 }
+  } } };
+  for (const [requested, expected] of [[0, 0], [50, 50], [30_000, 75]]) {
+    const parsed = writeStdinTool.decodeInput({ kind: 'json', value: { processId: 'p', yieldMs: requested } });
+    assert.equal(parsed.ok, true);
+    const canonical = await writeStdinTool.canonicalizeInput(parsed.input, context);
+    assert.equal(canonical.yieldMs, expected);
+    assert.equal(canonical.afterCursor, 0);
+  }
+});

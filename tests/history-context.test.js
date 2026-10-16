@@ -164,12 +164,12 @@ for (const kind of ['memory', 'jsonl']) {
       mediaType: 'application/json' });
     for (const [callIndex, toolName] of ['other_tool', 'wanted_tool'].entries()) {
       await events.append('run', { type: 'tool.ended', ...identity, toolBatchId: 'batch', callIndex,
-        toolAttempt: 1, toolName,
+        toolAttempt: 1, toolName, modelContent: [{ type: 'text', text: original.summary }],
         observation: { storage: 'artifact', kind: original.kind, summary: original.summary,
           digest: hashJson(encodeToolObservation(original)), coverage: 'complete', artifact } });
     }
     await events.append('run', { type: 'tool.ended', ...identity, toolBatchId: 'batch', callIndex: 2,
-      toolAttempt: 1, toolName: 'small_tool',
+      toolAttempt: 1, toolName: 'small_tool', modelContent: [{ type: 'text', text: 'small' }],
       observation: { storage: 'inline', kind: 'result', summary: 'small', coverage: 'complete',
         digest: hashJson(encodeToolObservation(parseToolObservation({ outputSchema: z.json() }, { ...original, summary: 'small', output: { text: 'needle' } }))),
         observation: parseToolObservation({ outputSchema: z.json() }, { ...original, summary: 'small', output: { text: 'needle' } }) } });
@@ -951,7 +951,8 @@ for (const kind of ['memory', 'jsonl']) {
             ...(artifact ? { storage: 'artifact', artifact } : { storage: 'inline', observation }) };
           if (authoritative) {
             const receipt = await f.events.append('run', { type: 'tool.ended', ...identity,
-              toolBatchId: 'batch', callIndex, toolAttempt: 1, toolName, observation: stored });
+              toolBatchId: 'batch', callIndex, toolAttempt: 1, toolName, observation: stored,
+              modelContent: [{ type: 'text', text: toolName }] });
             if (toolName === 'large') relevant = receipt.eventId;
           } else {
             const entry = await f.sessions.appendObservation(session, { runId: 'run',
@@ -1300,3 +1301,37 @@ test('manifest byte backtracking preserves the last fitting page across skipped 
   assert.deepEqual(next.items.map(item => item.description), ['A new tail original']);
   assert.equal(next.coverage, 'complete');
 });
+
+for (const kind of ['memory', 'jsonl']) {
+  test(`${kind}: an admitted inline presentation replaces the settled artifact representation`, async () => {
+    const { sessions, events, artifacts } = await backend(kind);
+    const session = await sessions.create({ binding });
+    await sessions.appendInput(session, { runId: 'run', task: 'Preserve settled content.' });
+    const observation = parseToolObservation({ outputSchema: z.json() }, {
+      kind: 'result', summary: 'Settled original', scope: { resources: [], coverage: 'complete' },
+      output: { exact: 'original' }
+    });
+    const modelContentRef = await artifacts.store({ label: 'settled-content', mediaType: 'application/json',
+      content: Buffer.from(JSON.stringify([{ type: 'text', text: 'Settled full presentation' }])) });
+    const attempt = { ...identity, toolBatchId: 'batch', callIndex: 0, callId: 'call', toolAttempt: 1 };
+    await events.append('run', { type: 'tool.ended', ...attempt, toolName: 'read', modelContentRef,
+      observation: { storage: 'inline', kind: observation.kind, summary: observation.summary,
+        coverage: 'complete', digest: hashJson(encodeToolObservation(observation)), observation }
+    }, { idempotencyKey: 'tool:ended' });
+    const history = new HistoryReader({ repository: sessions, session, events, artifacts });
+    const settledCut = await history.capture();
+    const settled = (await history.page({ cut: settledCut })).entries.find(entry => entry.type === 'observation');
+    assert.deepEqual(settled.modelContentRef, modelContentRef);
+    const modelContent = [{ type: 'text', text: 'Admitted derived presentation' }];
+    await events.append('run', { type: 'observation.record.created', ...attempt, id: 'observation', toolName: 'read',
+      call: { id: 'call', name: 'read', input: { kind: 'json', value: {} } }, toolCallType: 'function', observedFacts: [],
+      kind: observation.kind, summary: observation.summary, modelContent
+    }, { idempotencyKey: 'tool:observation' });
+    const admitted = (await history.page()).entries.find(entry => entry.type === 'observation');
+    assert.deepEqual(admitted.modelContent, modelContent);
+    assert.equal(admitted.modelContentRef, undefined, 'Selected inline and artifact representations cannot conflict.');
+    assert.deepEqual(admitted.output, observation.output);
+    const originalCut = (await history.page({ cut: settledCut })).entries.find(entry => entry.type === 'observation');
+    assert.deepEqual(originalCut.modelContentRef, modelContentRef, 'Publication cannot rewrite an earlier captured cut.');
+  });
+}

@@ -3,6 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as z from 'zod';
 import { defineTool } from '@agent-core/tools';
+import { invokeToolCall } from './tool-call-helpers.js';
 import { compileModelRequest, conservativeProtocolCapabilities, assertRequestAccountingFits, ModelProviderError } from '@agent-core/model';
 import { InMemoryArtifactRepository, InMemoryEventRepository } from '@agent-core/persistence';
 import {
@@ -1192,3 +1193,90 @@ for (const invalidAccounting of ['unknown_reasoning', 'output_only_limit']) {
     assert.ok(!f.requests.at(-1).messages.some(message => message.role === 'user' && message.content.includes(interpretation)));
   });
 }
+
+
+test('inspection size feedback measures a bounded retry and pins the original capture', async () => {
+  const f = await fixture();
+  await new AgentRuntime(f.options).run({ task: 'First original' }).result;
+  const cut = await f.history.capture();
+  let details;
+  await assert.rejects(inspectTool(f.context, { limit: 20, maxBytes: 1 }), error => {
+    details = error.details;
+    assert.equal(details.code, 'context_inspection_max_bytes');
+    assert.equal(details.requestedMaxBytes, 1);
+    assert.equal(details.maxAllowedBytes, 256 * 1024);
+    assert.equal(details.measurement, 'one_source_page_with_maximum_excerpt_allowance');
+    assert.equal(details.retry.limit, 1);
+    assert.equal(details.retry.maxBytes, details.measuredPageBytes);
+    assert.equal('minimumRequiredBytes' in details, false, 'A candidate size is not a global minimum');
+    return true;
+  });
+  await new AgentRuntime(f.options).run({ task: 'Later original' }).result;
+  const retried = await inspectTool(f.context, details.retry);
+  assert.deepEqual(retried.selection.cut, cut);
+  assert.equal(retried.selection.offset, 0);
+  assert.equal(retried.selection.items.length, 1);
+  assert.equal(Buffer.byteLength(JSON.stringify(retried)), details.measuredPageBytes);
+  const nextCursor = retried.selection.cursor;
+  await assert.rejects(inspectTool(f.context, { cursor: nextCursor, limit: 10, maxBytes: 1 }), error => {
+    details = error.details;
+    assert.equal(details.retry.cursor, nextCursor);
+    return true;
+  });
+  const next = await inspectTool(f.context, details.retry);
+  assert.deepEqual(next.selection.cut, cut);
+  assert.equal(next.selection.offset, 1);
+  assert.notEqual(next.selection.items[0].source.entryId, retried.selection.items[0].source.entryId);
+});
+
+test('inspection reports unsupported candidate sizes without inventing an executable retry', async () => {
+  const f = await fixture();
+  for (let i = 0; i < 200; i++)
+    await f.sessions.appendInput(f.session, { runId: `oversize-${i}-${'x'.repeat(1000)}`, task: `Original ${i}` });
+  await assert.rejects(inspectTool(f.context, { maxBytes: 1500 }), error => {
+    assert.equal(error.details.code, 'context_inspection_max_bytes');
+    assert.equal(error.details.requestedMaxBytes, 1500);
+    assert.equal(error.details.maxAllowedBytes, 256 * 1024);
+    assert(error.details.requiredManifestBytes > error.details.maxAllowedBytes);
+    assert.equal(error.details.retry, null);
+    assert.equal('measuredPageBytes' in error.details, false, 'Full result size is unknown when its manifest cannot fit');
+    return true;
+  });
+});
+
+
+test('inspection byte feedback is delivered as structured model-visible invalid arguments', async () => {
+  const f = await fixture();
+  await new AgentRuntime(f.options).run({ task: 'Inspect bounded feedback' }).result;
+  const tools = f.context.toolDefinitions();
+  const observation = await invokeToolCall({ type: 'function', id: 'inspect-small', name: 'context_inspect',
+    input: { kind: 'json', value: { maxBytes: 1 } } }, tools, { policy: { allowedRisks: ['read'] } });
+  assert.equal(observation.kind, 'failure');
+  assert.equal(observation.output.reason, 'invalid_arguments');
+  const tool = tools.find(item => item.name === 'context_inspect');
+  const text = tool.buildModelContent({ observation })[0].text;
+  const presented = JSON.parse(text.slice(text.indexOf('\n') + 1));
+  assert.equal(presented.details.requestedMaxBytes, 1);
+  const retried = await inspectTool(f.context, presented.details.retry);
+  assert(Buffer.byteLength(JSON.stringify(retried)) <= presented.details.retry.maxBytes);
+});
+
+test('inspection reports honest bounds for small and large caller allowances', async t => {
+  const f = await fixture();
+  await new AgentRuntime(f.options).run({ task: 'Inspect original sources' }).result;
+  for (const maxBytes of [1500, 1800, 4000, 16000]) {
+    try {
+      const result = await inspectTool(f.context, { maxBytes });
+      const delivered = Buffer.byteLength(JSON.stringify(result));
+      assert(delivered <= maxBytes);
+      t.diagnostic(`maxBytes=${maxBytes}: delivered ${delivered} bytes`);
+    } catch (error) {
+      assert.equal(error.details?.requestedMaxBytes, maxBytes);
+      assert(error.details.retry);
+      const result = await inspectTool(f.context, error.details.retry);
+      const delivered = Buffer.byteLength(JSON.stringify(result));
+      assert(delivered <= error.details.retry.maxBytes);
+      t.diagnostic(`maxBytes=${maxBytes}: measured retry ${error.details.retry.maxBytes}, delivered ${delivered} bytes`);
+    }
+  }
+});

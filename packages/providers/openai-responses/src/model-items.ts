@@ -1,4 +1,4 @@
-import { parseJsonObject } from '@agent-core/json';
+import { canonicalJsonString, parseJsonObject } from '@agent-core/json';
 import {
   ModelProviderError,
   createProviderContextState,
@@ -7,7 +7,8 @@ import {
   type ModelInputItem,
   type ModelOutputItem,
   type ModelRequest,
-  type ModelToolCall
+  type ModelToolCall,
+  type OpaqueProtocolPayload
 } from '@agent-core/model';
 import { decodeResponsesPayload, type ResponsesOutputItem } from './index.js';
 
@@ -219,6 +220,39 @@ export function responsesPayloadPaths(
         for (const field of ['file_data', 'file_url', 'file_id'])
           if (part[field] !== undefined) paths.push(['input', index, 'content', partIndex, field]);
     }
+  }
+  return paths;
+}
+
+/**
+ * Classify only encrypted leaves replayed from validated native reasoning state.
+ * The adapter must first validate provider/model/endpoint/revision compatibility.
+ * Matching the complete item prevents lookalike fields elsewhere in the body from
+ * acquiring protocol authority; summaries and all other fields remain plaintext.
+ */
+export function responsesOpaqueProtocolPayloads(
+  request: ModelRequest,
+  body: Readonly<Record<string, unknown>>,
+  provider: string
+): readonly OpaqueProtocolPayload[] {
+  const reasoning = new Map<string, { messageIndex: number; statePath: readonly (string | number)[] }>();
+  for (const [messageIndex, message] of request.messages.entries()) {
+    if (message.role !== 'protocol' || message.state.provider !== provider ||
+        message.state.kind !== 'responses.reasoning') continue;
+    for (const [itemIndex, item] of responsesReasoningItems(message.state.data.items, provider).entries())
+      if (typeof item.encrypted_content === 'string')
+        reasoning.set(canonicalJsonString(item), {
+          messageIndex, statePath: ['items', itemIndex, 'encrypted_content']
+        });
+  }
+  const paths: OpaqueProtocolPayload[] = [];
+  if (!Array.isArray(body.input) || !reasoning.size) return paths;
+  for (const [index, item] of (body.input as unknown[]).entries()) {
+    if (!item || typeof item !== 'object' || Array.isArray(item) ||
+        Reflect.get(item, 'type') !== 'reasoning') continue;
+    // Lowered native items are already validated JSON; do not impose a second, smaller JSON budget.
+    const origin = reasoning.get(canonicalJsonString(item));
+    if (origin) paths.push({ inputPath: ['input', index, 'encrypted_content'], ...origin });
   }
   return paths;
 }

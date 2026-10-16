@@ -70,8 +70,11 @@ test('agent event append, idempotency, hashing, and read share one owned value',
     callId: 'call',
     toolAttempt: 1,
     toolName: 'tool',
-    observation: committed.original
+    observation: committed.original,
+    modelContent: committed.modelContent
   };
+  const { modelContent: _content, ...incompatible } = original;
+  assert.throws(() => decodeAgentEvent(incompatible), /Incompatible settled observation/);
   const encoded = encodeAgentEvent(original);
   const appended = await repository.append('run-1', original, {
     timestamp: '2026-01-01T00:00:00.000Z',

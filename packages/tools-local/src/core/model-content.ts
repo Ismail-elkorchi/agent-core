@@ -83,7 +83,10 @@ function processResultContent(output: ProcessOutput): readonly ToolContent[] {
       ...(originalOutput?.kind === 'unavailable' || (originalOutput?.kind === 'captured' && originalOutput.omittedBytes > 0) ? { originalOutput } : {}),
       ...(partial && artifact ? { artifact } : {})
     })),
-    ...(combined.segments.length || combined.observedBytes ? [text(renderCommandOutput(combined))] : [])
+    ...(combined.segments.length || combined.observedBytes ? [text(renderCommandOutput(combined))] : []),
+    ...(output.status === 'running' && output.cursorStart === output.cursorEnd
+      ? [text('No fresh output; still running. Await progress with write_stdin, afterCursor=cursorEnd, and a longer yieldMs. Waiting ends on output, termination, or the wait limit.')]
+      : [])
   ];
 }
 

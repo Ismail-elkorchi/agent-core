@@ -4,6 +4,7 @@ import {
   accountModelRequest,
   assertRequestAccountingFits,
   compileModelRequest,
+  compiledRequestPlaintext,
   RequestTokenEstimator,
   createProviderContextState,
   modelInputIdentity,
@@ -351,4 +352,40 @@ test('observed request usage covers an exact prefix and only estimates additions
   assert.equal(requestAccountingInputBound(counted.accounting), 42);
   assert.equal(observeModelRequest(first, { ...response, usage: undefined }), undefined);
   assert.equal(observeModelRequest(first, { ...response, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } }), undefined);
+});
+
+
+test('plaintext inspection binds opaque classification to exact logical native state and compilation', async () => {
+  const opaque = 'synthetic.sk-' + 'NOT_A_REAL_CREDENTIAL_1234567890';
+  const state = await createProviderContextState({
+    provider: 'test', endpoint: 'https://provider.test', protocolRevision: 'v1',
+    request: { model: 'model', messages: [{ role: 'user', content: 'hello' }] }, requestId: 'synthetic',
+    kind: 'native.reasoning', requiresExactPrefix: false,
+    data: { payload: opaque, summary: 'visible' }
+  });
+  const logical = { model: 'model', messages: [{ role: 'protocol', content: '', state }] };
+  const proof = { inputPath: ['input', 0, 'ciphertext'], messageIndex: 0, statePath: ['payload'] };
+  const options = {
+    request: logical, profile, endpoint: 'https://provider.test',
+    body: { input: [{ ciphertext: opaque, summary: 'visible' }], extra: { encrypted_content: opaque } },
+    opaqueProtocolPayloads: [proof]
+  };
+  const compiled = await compileModelRequest(options);
+  assert.equal(compiledRequestPlaintext(compiled).input[0].ciphertext, '[native payload]');
+  assert.equal(compiledRequestPlaintext(compiled).input[0].summary, 'visible');
+  assert.equal(compiledRequestPlaintext(compiled).extra.encrypted_content, opaque);
+  assert.equal(compiledRequestPlaintext(compiled).extra, compiled.body.extra, 'inspection shares unchanged immutable subtrees');
+  assert.equal(compiled.body.input[0].ciphertext, opaque);
+  proof.inputPath[0] = 'extra';
+  assert.equal(compiledRequestPlaintext(compiled).input[0].ciphertext, '[native payload]', 'classification owns its paths');
+  assert.deepEqual(compiledRequestPlaintext({ ...compiled }), compiled.body, 'copies lose proof and scan fully');
+  for (const invalid of [
+    { inputPath: ['input', 0, 'summary'], messageIndex: 0, statePath: ['payload'] },
+    { inputPath: ['input', 0, 'ciphertext'], messageIndex: 1, statePath: ['payload'] },
+    { inputPath: ['input'], messageIndex: 0, statePath: ['payload'] },
+    { inputPath: ['input', 0, 'ciphertext'], messageIndex: 0, statePath: [] }
+  ]) await assert.rejects(compileModelRequest({ ...options, opaqueProtocolPayloads: [invalid] }), /Opaque/);
+  await assert.rejects(compileModelRequest({ ...options, endpoint: 'https://wrong.test',
+    opaqueProtocolPayloads: [{ inputPath: ['input', 0, 'ciphertext'], messageIndex: 0, statePath: ['payload'] }]
+  }), /compatible logical protocol state/);
 });

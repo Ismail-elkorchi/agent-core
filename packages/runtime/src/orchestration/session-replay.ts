@@ -64,8 +64,7 @@ export async function rebuildModelWindowFromRepositories(input: {
   const view = input.history ? await readSelectedHistorySources(input.history) : undefined;
   if (view && input.artifacts)
     await assertSelectedHistoryModelCompatibility(view, {
-      artifacts: input.artifacts, profile: input.profile,
-      ...(input.currentRunId === undefined ? {} : { currentRunId: input.currentRunId })
+      artifacts: input.artifacts, profile: input.profile
     });
   modelWindow.setStateSequence(view?.contextWindow?.stateSequence);
   const stateNotices = input.history && view?.contextWindow
@@ -612,7 +611,6 @@ export async function assertHistoryModelCompatibility(input: {
   readonly artifacts: ArtifactRepository;
   readonly profile: ModelProfile;
   readonly representation?: 'portable';
-  readonly currentRunId?: string;
 }): Promise<void> {
   await assertSelectedHistoryModelCompatibility(await readSelectedHistorySources(input.history), input);
 }
@@ -622,7 +620,6 @@ async function assertSelectedHistoryModelCompatibility(view: SelectedHistorySour
   readonly artifacts: ArtifactRepository;
   readonly profile: ModelProfile;
   readonly representation?: 'portable';
-  readonly currentRunId?: string;
 }): Promise<void> {
   if (input.representation === 'portable') assertPortableHistorySources(view.entries, input.profile);
   const target = {
@@ -648,7 +645,6 @@ async function assertSelectedHistoryModelCompatibility(view: SelectedHistorySour
     if (
       !input.profile.modalities.input.includes('image') &&
       ((entry.type === 'observation' &&
-        !(entry.runId === input.currentRunId && !entry.modelContent && !entry.modelContentRef) &&
         (await resolveToolModelContent(entry, input.artifacts)).some(
           (part) => part.type === 'image'
         )) ||

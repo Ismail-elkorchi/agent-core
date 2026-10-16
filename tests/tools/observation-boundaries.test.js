@@ -543,3 +543,17 @@ for (const executionState of ['settled', 'active']) {
     assert.equal(invocationCount, 1);
   });
 }
+
+test('small selected content survives failed canonical artifact storage without becoming partial', async () => {
+  const artifacts = new InMemoryArtifactRepository();
+  artifacts.store = async () => { throw new Error('presentation storage unavailable'); };
+  const selected = [{ type: 'text', text: 'Exact small selected content' }];
+  const store = new ObservationStore({ artifacts });
+  const committed = await store.commitToolObservation({ turnIndex: 1, call,
+    tool: { ...tool, buildModelContent: () => selected }, observation: observation('exact original') });
+  assert.equal(committed.modelContentRef, undefined);
+  assert.deepEqual(committed.modelContent, selected);
+  assert.equal((await store.projectToolObservation(committed)).modelText, selected[0].text);
+  assert.equal((await resolveToolObservation(committed.original)).output, 'exact original');
+  assert.match(committed.durableStorageDegraded.message, /presentation storage unavailable/);
+});

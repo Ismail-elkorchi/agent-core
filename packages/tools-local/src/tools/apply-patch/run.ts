@@ -383,20 +383,26 @@ async function planOperation(
 ): Promise<
   { ok: true; operation: PlannedPatchOperation } | { ok: false; failure: ApplyPatchFailure }
 > {
+  const paths = operation.kind === 'update' && operation.moveTo
+    ? [operation.path, operation.moveTo] : [operation.path];
+  for (const path of paths) {
+    const duplicate = reservePath(reservedPaths, canonicalFilePath(root, path));
+    if (duplicate) return { ok: false, failure: withFailureContext(duplicate,
+      operation.kind === 'update' && operation.moveTo ? 'move' : operation.kind) };
+  }
   if (operation.kind === 'add') {
     return planAdd(
       root,
       operation.path,
       operation.content,
       operation.additions,
-      input,
-      reservedPaths
+      input
     );
   }
   if (operation.kind === 'delete') {
-    return planDelete(root, operation.path, input, reservedPaths);
+    return planDelete(root, operation.path, input);
   }
-  return planUpdate(root, operation, input, reservedPaths);
+  return planUpdate(root, operation, input);
 }
 
 async function planAdd(
@@ -404,18 +410,13 @@ async function planAdd(
   requestedPath: string,
   content: string,
   additions: number,
-  input: CanonicalApplyPatchInput,
-  reservedPaths: Set<string>
+  input: CanonicalApplyPatchInput
 ): Promise<
   { ok: true; operation: PlannedPatchOperation } | { ok: false; failure: ApplyPatchFailure }
 > {
   const target = await inspectNewTarget(root, requestedPath, 'already_exists');
   if (!target.ok) {
     return { ok: false, failure: withFailureContext(target.failure, 'add') };
-  }
-  const duplicate = reservePath(reservedPaths, target.path);
-  if (duplicate) {
-    return { ok: false, failure: withFailureContext(duplicate, 'add') };
   }
   const bytes = byteLengthUtf8(content);
   if (bytes > input.limits.maxNewBytesPerFile) {
@@ -473,8 +474,7 @@ async function planAdd(
 async function planDelete(
   root: FileAuthority,
   requestedPath: string,
-  input: CanonicalApplyPatchInput,
-  reservedPaths: Set<string>
+  input: CanonicalApplyPatchInput
 ): Promise<
   { ok: true; operation: PlannedPatchOperation } | { ok: false; failure: ApplyPatchFailure }
 > {
@@ -489,10 +489,6 @@ async function planDelete(
         'delete'
       )
     };
-  }
-  const duplicate = reservePath(reservedPaths, inspected.file.path);
-  if (duplicate) {
-    return { ok: false, failure: withFailureContext(duplicate, 'delete') };
   }
   const oldSha256 = inspected.file.sha256;
   const shaFailure = validateExpectedSha(
@@ -535,8 +531,7 @@ async function planDelete(
 async function planUpdate(
   root: FileAuthority,
   operation: Extract<ParsedPatchOperation, { kind: 'update' }>,
-  input: CanonicalApplyPatchInput,
-  reservedPaths: Set<string>
+  input: CanonicalApplyPatchInput
 ): Promise<
   { ok: true; operation: PlannedPatchOperation } | { ok: false; failure: ApplyPatchFailure }
 > {
@@ -552,14 +547,6 @@ async function planUpdate(
       )
     };
   }
-  const sourceDuplicate = reservePath(reservedPaths, inspected.file.path);
-  if (sourceDuplicate) {
-    return {
-      ok: false,
-      failure: withFailureContext(sourceDuplicate, operation.moveTo ? 'move' : 'update')
-    };
-  }
-
   const oldSha256 = inspected.file.sha256;
   const shaFailure = validateExpectedSha(
     input,
@@ -604,10 +591,6 @@ async function planUpdate(
     const target = await inspectNewTarget(root, operation.moveTo, 'destination_exists');
     if (!target.ok) {
       return { ok: false, failure: withFailureContext(target.failure, 'move') };
-    }
-    const targetDuplicate = reservePath(reservedPaths, target.path);
-    if (targetDuplicate) {
-      return { ok: false, failure: withFailureContext(targetDuplicate, 'move') };
     }
     return {
       ok: true,
@@ -829,6 +812,7 @@ export function patchFailureFromError(
         oldPreview: error.oldPreview,
         ...(error.matchCount !== undefined ? { matchCount: error.matchCount } : {}),
         ...(error.candidateLines ? { candidateLines: error.candidateLines } : {}),
+        ...(error.matchExcerpts ? { matchExcerpts: error.matchExcerpts } : {}),
         ...(error.possiblyAlreadyApplied ? { possiblyAlreadyApplied: true } : {})
       },
       operation
@@ -846,7 +830,7 @@ export function patchFailureFromError(
 
 function nextActionForParseError(error: PatchParseError): string {
   if (error.reason === 'hunk_without_change') {
-    return 'This hunk only has context lines. Add at least one + or - line, or remove the hunk if no change is needed.';
+    return 'This update only has context constraints. Include at least one + or - line in another hunk of this update, or remove the update if no change is needed.';
   }
   if (error.reason === 'invalid_hunk_line') {
     return 'Every update hunk line must start with exactly one of: space for context, - for removal, or + for addition.';
@@ -895,13 +879,13 @@ function nextActionForFailure(failure: ApplyPatchFailure): string {
       : 'Inspect the exact current region again with unnumbered output, then rebuild this hunk from that current text.';
   }
   if (failure.reason === 'ambiguous_context') {
-    return 'Inspect the matching region lines, then add more surrounding context or a narrower @@ header so this hunk matches exactly one location.';
+    return 'Inspect matchExcerpts (up to five, from staged content before this hunk) and candidateLines, then add more surrounding context or a narrower @@ header so this hunk matches exactly one location.';
   }
   if (failure.reason === 'patch_parse_error') {
     return 'Rewrite the patch using the supported *** Begin Patch wrapper and valid operation/hunk lines.';
   }
   if (failure.reason === 'duplicate_path') {
-    return 'Merge duplicate edits for the same resolved path into one operation.';
+    return 'Use one operation per resolved path. To replace existing file contents, use Update File with explicit removals and additions; Delete File plus Add File is not a replacement operation.';
   }
   if (failure.reason === 'already_exists' || failure.reason === 'destination_exists') {
     return 'Choose a path that does not already exist, or update/move a different target.';

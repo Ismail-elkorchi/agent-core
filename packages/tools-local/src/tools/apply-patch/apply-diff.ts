@@ -1,6 +1,6 @@
 import { joinLogicalLines, splitLogicalLines } from '@agent-core/tools';
 import type { ParsedHunk, ParsedUpdateFile } from './patch-parser.js';
-import type { PatchMatchMode } from './schema.js';
+import type { PatchMatchMode, PatchMatchExcerpt } from './schema.js';
 
 export type PatchApplyFailureReason = 'context_not_found' | 'ambiguous_context';
 
@@ -22,9 +22,10 @@ export class PatchApplyError extends Error {
   readonly oldPreview: string;
   readonly matchCount?: number;
   readonly candidateLines?: number[];
+  readonly matchExcerpts?: PatchMatchExcerpt[];
   readonly possiblyAlreadyApplied?: boolean;
 
-  constructor(reason: PatchApplyFailureReason, hunk: ParsedHunk, message: string, details: { matchCount?: number; candidateLines?: number[]; possiblyAlreadyApplied?: boolean } = {}) {
+  constructor(reason: PatchApplyFailureReason, hunk: ParsedHunk, message: string, details: { matchCount?: number; candidateLines?: number[]; matchExcerpts?: PatchMatchExcerpt[]; possiblyAlreadyApplied?: boolean } = {}) {
     super(message);
     this.name = 'PatchApplyError';
     this.reason = reason;
@@ -34,6 +35,7 @@ export class PatchApplyError extends Error {
     this.oldPreview = hunk.oldPreview;
     if (details.matchCount !== undefined) this.matchCount = details.matchCount;
     if (details.candidateLines !== undefined) this.candidateLines = details.candidateLines;
+    if (details.matchExcerpts !== undefined) this.matchExcerpts = details.matchExcerpts;
     if (details.possiblyAlreadyApplied !== undefined) this.possiblyAlreadyApplied = details.possiblyAlreadyApplied;
   }
 }
@@ -62,20 +64,27 @@ export function applyPatchUpdate(content: string, operation: ParsedUpdateFile): 
 function applyHunk(lines: string[], hunk: ParsedHunk): PatchMatchMode {
   const match = findHunkMatch(lines, hunk);
   if (!match) {
-    const alreadyApplied = hunk.newLines.length > 0 && findOldLines(lines, hunk.newLines).length === 1;
-    throw new PatchApplyError('context_not_found', hunk, `Hunk ${String(hunk.index + 1)} context was not found.`, {
+    const alreadyApplied = hunk.additions + hunk.deletions > 0 && hunk.newLines.length > 0
+      && findOldLines(lines, hunk.newLines)
+        .filter((start) => !hunk.endOfFile || start + hunk.newLines.length === lines.length).length === 1;
+    throw new PatchApplyError('context_not_found', hunk, `Hunk ${String(hunk.index + 1)} ${hunk.additions + hunk.deletions === 0 ? 'exact context constraint' : 'context'} was not found${hunk.endOfFile ? ' at the end of the file' : ''}.`, {
       matchCount: 0,
       ...(alreadyApplied ? { possiblyAlreadyApplied: true } : {})
     });
   }
 
-  lines.splice(match.start, hunk.oldLines.length, ...hunk.newLines);
+  // Context-only hunks are assertions, never whitespace-normalizing writes.
+  if (hunk.additions + hunk.deletions > 0) {
+    lines.splice(match.start, hunk.oldLines.length, ...hunk.newLines);
+  }
   return match.mode;
 }
 
 function findHunkMatch(lines: readonly string[], hunk: ParsedHunk): { start: number; mode: PatchMatchMode } | undefined {
-  for (const mode of matchModeOrder) {
-    const candidates = findOldLines(lines, hunk.oldLines, mode);
+  const modes: readonly PatchMatchMode[] = hunk.additions + hunk.deletions === 0 ? ['exact'] : matchModeOrder;
+  for (const mode of modes) {
+    const candidates = findOldLines(lines, hunk.oldLines, mode)
+      .filter((start) => !hunk.endOfFile || start + hunk.oldLines.length === lines.length);
     if (candidates.length === 0) {
       continue;
     }
@@ -88,7 +97,15 @@ function findHunkMatch(lines: readonly string[], hunk: ParsedHunk): { start: num
     const candidateLines = narrowed.length > 0 ? narrowed.map((index) => index + 1) : candidates.map((index) => index + 1);
     throw new PatchApplyError('ambiguous_context', hunk, `Hunk ${String(hunk.index + 1)} context matched ${String(candidateLines.length)} locations.`, {
       matchCount: candidateLines.length,
-      candidateLines
+      candidateLines,
+      matchExcerpts: candidateLines.slice(0, 5).map((line) => {
+        const start = Math.max(0, line - 3);
+        return {
+          line,
+          startLine: start + 1,
+          excerpt: lines.slice(start, line + 2).map((text) => text.length > 160 ? `${text.slice(0, 160)}…` : text).join('\n')
+        };
+      })
     });
   }
   return undefined;

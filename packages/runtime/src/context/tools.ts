@@ -1,5 +1,5 @@
 import { stageSessionState } from './session-state.js';
-import { contextInspectionCursor, contextInspectionSchema } from './inspection.js';
+import { ContextInspectionSizeError, MAX_MANIFEST_BYTES, contextInspectionStartCursor, contextInspectionCursor, contextInspectionSchema } from './inspection.js';
 import { parseJsonObject, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import {
   defaultToolModelContent,
@@ -128,7 +128,7 @@ export function contextToolDefinitions(options: {
     scopedTool({
       name: `${prefix}_inspect`,
       description:
-        'Inspect the live selected sources at a captured boundary, including recent exchanges, protected input and native prefix dependencies. Source references can be passed unchanged to context_transition add/release. maxBytes bounds the complete delivered JSON, including bookkeeping and cursor. Continue with cursor for more sources. Capacity describes the last admitted request, not later tool results. No periodic inspection is required.',
+        'Inspect the live selected sources at a captured boundary, including recent exchanges, protected input and native prefix dependencies. Source references can be passed unchanged to context_transition add/release. maxBytes bounds successful delivered JSON, including bookkeeping and cursor. Size errors provide measured bounds and cut-pinned retry arguments when supported. Continue with cursor for more sources. Capacity describes the last admitted request, not later tool results. No periodic inspection is required.',
       schema: contextInspectionSchema,
       mode: 'read',
       root: 'context',
@@ -158,26 +158,58 @@ export function contextToolDefinitions(options: {
         await options.context.history.validateCut(cut);
         // maxBytes bounds the complete model-facing JSON, not just its source list.
         // Re-page at the same cut so shrinking preserves exact cursor/coverage semantics.
-        let manifestBytes = page.maxBytes;
-        while (manifestBytes > 0) {
-          const inspection = await options.context.inspect(cut, { ...page, maxBytes: manifestBytes });
+        const present = (inspection: Awaited<ReturnType<ContextService['inspect']>>, excerptBudget: number) => {
           const active = inspection.activeSelection;
-          const result = parseJsonObject({
+          return parseJsonObject({
             ...inspection,
-            excerpts: excerptInspection(inspection.window?.selection.excerpts ?? [], page.limit, Math.floor(page.maxBytes / 4)),
+            excerpts: excerptInspection(inspection.window?.selection.excerpts ?? [], page.limit, excerptBudget),
             activeSelection: active.status === 'available' ? active.manifest : active,
             window: inspection.window
               ? { windowId: inspection.window.windowId, historyPosition: inspection.window.historyPosition }
               : null
           });
-          const bytes = Buffer.byteLength(inspectionPresentation(result));
-          if (bytes <= page.maxBytes) return result;
-          const manifestSize = Buffer.byteLength(JSON.stringify(result.activeSelection));
-          // Account for actual page size, not unused requested space: oversized fixed
-          // bookkeeping must fail immediately instead of shrinking one byte per pass.
-          manifestBytes = Math.min(manifestBytes - 1, page.maxBytes - (bytes - manifestSize));
+        };
+        let manifestBytes = page.maxBytes;
+        try {
+          while (manifestBytes > 0) {
+            const inspection = await options.context.inspect(cut, { ...page, maxBytes: manifestBytes });
+            const result = present(inspection, Math.floor(page.maxBytes / 4));
+            const bytes = Buffer.byteLength(inspectionPresentation(result));
+            if (bytes <= page.maxBytes) return result;
+            const manifestSize = Buffer.byteLength(JSON.stringify(result.activeSelection));
+            manifestBytes = Math.min(manifestBytes - 1, page.maxBytes - (bytes - manifestSize));
+          }
+        } catch (error) {
+          if (!(error instanceof ContextInspectionSizeError)) throw error;
         }
-        throw new ToolInputError('Context inspection cannot fit maxBytes including required metadata and pagination. Increase maxBytes.');
+        // Probe only one source at the same cut and within the schema ceiling. This
+        // measures a sufficient retry budget, not a global minimum: a complete page
+        // can be smaller than a partial page carrying a continuation cursor.
+        const retryCursor = page.cursor ?? contextInspectionStartCursor(cut);
+        let probe;
+        try {
+          probe = await options.context.inspect(cut, { cursor: retryCursor, limit: 1, maxBytes: MAX_MANIFEST_BYTES });
+        } catch (error) {
+          if (!(error instanceof ContextInspectionSizeError)) throw error;
+          throw new ToolInputError('Context inspection cannot fit maxBytes: the candidate manifest exceeds the supported maximum.', {
+            code: 'context_inspection_max_bytes', requestedMaxBytes: page.maxBytes,
+            maxAllowedBytes: MAX_MANIFEST_BYTES, requiredManifestBytes: error.requiredManifestBytes,
+            retry: null
+          });
+        }
+        // Use the largest allowed excerpt allowance, so the suggested retry never
+        // underestimates extra excerpt inventory revealed by increasing maxBytes.
+        const candidate = present(probe, Math.floor(MAX_MANIFEST_BYTES / 4));
+        const suggestedMaxBytes = Buffer.byteLength(inspectionPresentation(candidate));
+        const retry = suggestedMaxBytes <= MAX_MANIFEST_BYTES
+          ? { cursor: retryCursor, limit: 1, maxBytes: suggestedMaxBytes } : null;
+        throw new ToolInputError(retry
+          ? `Context inspection cannot fit maxBytes=${String(page.maxBytes)}. Retry with limit=1 and maxBytes=${String(suggestedMaxBytes)} using the supplied cursor.`
+          : 'Context inspection cannot fit maxBytes: the measured one-source result exceeds the supported maximum.', {
+          code: 'context_inspection_max_bytes', requestedMaxBytes: page.maxBytes,
+          maxAllowedBytes: MAX_MANIFEST_BYTES, measuredPageBytes: suggestedMaxBytes,
+          measurement: 'one_source_page_with_maximum_excerpt_allowance', retry
+        });
       }
     }),
     defineTool({
@@ -263,7 +295,7 @@ function inspectionPresentation(result: JsonObject): string {
         reasoningIncludedInOutput: parseJsonObject(accounting.pricingSemantics).reasoningIncludedInOutput,
         limits: accounting.limits,
         inputTokensMeaning:
-          'Capacity inputTokens = ceil(estimatedInputTokens × (1 + uncertainty.headroomRatio)). Provider counting is exact; compatible provider usage calibrates an unchanged prefix plus estimated additions. Unknown components remain unquantified and do not establish overflow. Unquantified components under an explicit token or cost budget require a finite model input bound. Reservations otherwise use the count or estimate; actual usage settles the invocation.'
+          'inputTokens = ceil(estimatedInputTokens × (1 + uncertainty.headroomRatio)). Provider counts are exact; compatible usage calibrates unchanged prefixes plus estimated additions. Unknowns do not prove overflow; budgeted unknowns require a finite input bound. Reservations use counts/estimates; actual usage settles.'
       }
     } : {}),
     selection: result.activeSelection,

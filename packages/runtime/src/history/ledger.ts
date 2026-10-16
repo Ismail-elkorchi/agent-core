@@ -73,6 +73,9 @@ export function publicEventEntry(
       toolName: event.toolName,
       kind: event.observation.kind,
       summary: event.observation.summary,
+      ...(event.modelContentRef
+        ? { modelContentRef: event.modelContentRef }
+        : { modelContent: event.modelContent }),
       ...(event.observation.storage === 'inline'
         ? { output: parseJsonValue(event.observation.observation.output) }
         : event.observation.storage === 'artifact'

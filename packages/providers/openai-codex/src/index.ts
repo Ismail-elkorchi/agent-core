@@ -32,7 +32,8 @@ import {
 } from '@agent-core/model';
 import {
   readBoundedJsonResponse,
-  responsesPayloadPaths
+  responsesPayloadPaths,
+  responsesOpaqueProtocolPayloads
 } from '@agent-core/provider-openai-responses';
 import { type CodexCatalogModel, decodeCodexCatalog } from './catalog.js';
 
@@ -274,11 +275,12 @@ export class OpenAICodexProvider implements ModelProvider {
     const body = toCodexResponsesRequest(request);
     delete body.stream;
     const compiled = await compileModelRequest({
+      ...options,
       request,
       profile: await this.describeModel(request.model),
       body,
       payloadPaths: responsesPayloadPaths(body),
-      ...options,
+      opaqueProtocolPayloads: responsesOpaqueProtocolPayloads(request, body, this.id),
       endpoint: this.baseUrl
     });
     cacheCodexCompiledRequest(compiled);

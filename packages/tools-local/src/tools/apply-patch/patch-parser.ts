@@ -57,6 +57,7 @@ export interface ParsedHunk {
   additions: number;
   deletions: number;
   oldPreview: string;
+  endOfFile: boolean;
 }
 
 export interface ParsedHunkLine {
@@ -203,6 +204,10 @@ function parseUpdateFile(lines: readonly string[], startIndex: number): { operat
   if (!moveTo && hunks.length === 0) {
     throw new PatchParseError('empty_update', `Update File operation has no hunks: ${path}`, { path });
   }
+  const first = hunks[0];
+  if (!moveTo && first && hunks.every((hunk) => hunk.additions + hunk.deletions === 0)) {
+    throw new PatchParseError('hunk_without_change', `Update File operation contains only context constraints: ${path}`, { path, hunkIndex: first.index, oldPreview: first.oldPreview });
+  }
   return {
     operation: {
       kind: 'update',
@@ -223,16 +228,18 @@ function parseHunk(lines: readonly string[], startIndex: number, hunkIndex: numb
   }
   const header = headerLine.slice(2).trim() || undefined;
   const hunkLines: ParsedHunkLine[] = [];
+  let endOfFile = false;
   let index = startIndex + 1;
   while (index < lines.length - 1 && !isOperationHeader(lines[index] ?? '') && !(lines[index] ?? '').startsWith('@@')) {
     if ((lines[index] ?? '') === '*** End of File') {
+      endOfFile = true;
       index += 1;
       break;
     }
     hunkLines.push(parseHunkLine(lines[index] ?? '', hunkIndex, header, path));
     index += 1;
   }
-  return { hunk: buildHunk(hunkIndex, header, hunkLines, path), nextIndex: index };
+  return { hunk: buildHunk(hunkIndex, header, hunkLines, path, endOfFile), nextIndex: index };
 }
 
 function parseHunkLine(line: string, hunkIndex: number, header: string | undefined, path: string): ParsedHunkLine {
@@ -247,16 +254,13 @@ function parseHunkLine(line: string, hunkIndex: number, header: string | undefin
   throw new PatchParseError('invalid_hunk_line', `Invalid hunk line prefix: ${prefix}`, { path, hunkIndex, ...(header ? { header } : {}), failingLine: line });
 }
 
-function buildHunk(index: number, header: string | undefined, lines: ParsedHunkLine[], path: string): ParsedHunk {
+function buildHunk(index: number, header: string | undefined, lines: ParsedHunkLine[], path: string, endOfFile: boolean): ParsedHunk {
   if (lines.length === 0) {
     throw new PatchParseError('empty_hunk', `Hunk ${String(index + 1)} has no lines.`, { path, hunkIndex: index, ...(header ? { header } : {}) });
   }
   const additions = lines.filter((line) => line.kind === 'add').length;
   const deletions = lines.filter((line) => line.kind === 'remove').length;
   const oldLines = lines.filter((line) => line.kind !== 'add').map((line) => line.text);
-  if (additions + deletions === 0) {
-    throw new PatchParseError('hunk_without_change', `Hunk ${String(index + 1)} has no additions or deletions.`, { path, hunkIndex: index, ...(header ? { header } : {}), oldPreview: previewLines(oldLines) });
-  }
   const newLines = lines.filter((line) => line.kind !== 'remove').map((line) => line.text);
   return {
     index,
@@ -266,7 +270,8 @@ function buildHunk(index: number, header: string | undefined, lines: ParsedHunkL
     newLines,
     additions,
     deletions,
-    oldPreview: previewLines(oldLines)
+    oldPreview: previewLines(oldLines),
+    endOfFile
   };
 }
 

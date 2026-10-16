@@ -886,7 +886,10 @@ async function appendToolEnded(
       type: 'tool.ended',
       ...identity,
       toolName: call.name,
-      observation: state.settlement.original
+      observation: state.settlement.original,
+      ...(state.settlement.modelContentRef
+        ? { modelContentRef: state.settlement.modelContentRef }
+        : { modelContent: state.settlement.modelContent })
     },
     key
   );

@@ -16,7 +16,7 @@ export const writeStdinTool = defineTool({
   name: 'write_stdin',
   implementationId: 'agent-core.write-stdin.v1',
   description:
-    'Write to, close, or poll a process started by exec_command using a stable output cursor.',
+    'Write to, close, or wait for output or termination of a process started by exec_command. Pass its last cursorEnd as afterCursor; for quiet processes prefer a bounded long yieldMs over repeated short polls.',
   schema: writeStdinInputSchema,
   outputSchema: writeStdinOutputSchema,
   buildModelContent: buildProcessContent,

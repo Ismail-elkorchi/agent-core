@@ -604,14 +604,18 @@ export class HistoryReader {
         const representation = publicEventEntry(content, null, new Map());
         if (!representation || entryIdentity(representation) !== entryIdentity(entry))
           throw new Error('Observation content belongs to a different invocation.');
-        if (entry.type === 'observation')
+        if (entry.type === 'observation') {
+          const originalEntry = { ...entry };
+          delete originalEntry.modelContent;
+          delete originalEntry.modelContentRef;
           entry = Object.freeze({
-            ...entry,
+            ...originalEntry,
             ...(content.event.modelContent ? { modelContent: content.event.modelContent } : {}),
             ...(content.event.modelContentRef
               ? { modelContentRef: content.event.modelContentRef }
               : {})
           });
+        }
         bytes += page.bytes;
         scanned += page.scanned;
       }

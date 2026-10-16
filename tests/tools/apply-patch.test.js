@@ -464,8 +464,8 @@ test('apply_patch rejects invalid targets atomically under host limits', async (
   );
   assert.equal(observation.kind, 'failure');
   assert.deepEqual(observation.output.details.failures.map((failure) => failure.reason).sort(), [
-    'already_exists',
     'binary',
+    'duplicate_path',
     'not_file',
     'not_found',
     'too_large'
@@ -852,3 +852,113 @@ async function writeJournalEnvelope(filePath, manifest) {
     { mode: 0o600 }
   );
 }
+
+test('apply_patch validates context-only constraints alongside edits without changing assertion text', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-constraints-'));
+  const original = 'anchor  \r\nold\r\ntail\r\n';
+  await writeFile(path.join(root, 'note.txt'), original);
+  const services = { rootedFileAuthority: testRootedFileAuthority(root), patchJournal: testPatchJournal(testRootedFileAuthority(root)) };
+  const invoke = (lines) => invokeToolCall(textToolCall('apply_patch', patch(lines)), [applyPatchTool], { policy, services });
+  for (const constraint of [' missing', ' anchor']) {
+    const result = await invoke(['*** Update File: note.txt', '@@', '-old', '+new', '@@', constraint]);
+    assert.equal(result.kind, 'failure');
+    assert.equal(result.output.details.failures[0].reason, 'context_not_found');
+    assert.equal(result.output.details.failures[0].hunkIndex, 1);
+    assert.match(result.summary, /No files were written/u);
+    assert.equal(await readFile(path.join(root, 'note.txt'), 'utf8'), original);
+  }
+  const result = await invoke(['*** Update File: note.txt', '@@', ' anchor  ', '@@', '-old', '+new', '@@', ' new', '@@', ' tail', '*** End of File']);
+  assert.equal(result.kind, 'result');
+  assert.equal(result.output.totalHunkCount, 4);
+  assert.equal(result.output.totalAdditions, 1);
+  assert.equal(result.output.totalDeletions, 1);
+  assert.equal(await readFile(path.join(root, 'note.txt'), 'utf8'), 'anchor  \r\nnew\r\ntail\r\n');
+});
+
+test('apply_patch does not use context-only assertions to silently choose an ambiguous edit', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-ambiguous-'));
+  const original = 'first\nvalue\nsecond\nvalue\n';
+  await writeFile(path.join(root, 'note.txt'), original);
+  for (const lines of [
+    ['@@', ' first', '@@', '-value', '+new'],
+    ['@@', '-first', '+FIRST', '@@', ' value']
+  ]) {
+    const result = await invokeToolCall(textToolCall('apply_patch', patch(['*** Update File: note.txt', ...lines])), [applyPatchTool], {
+      policy, services: { rootedFileAuthority: testRootedFileAuthority(root) }
+    });
+    assert.equal(result.kind, 'failure');
+    const failure = result.output.details.failures[0];
+    assert.equal(failure.path, 'note.txt');
+    assert.equal(failure.hunkIndex, 1);
+    assert.equal(failure.reason, 'ambiguous_context');
+    assert.deepEqual(failure.candidateLines, [2, 4]);
+    assert.deepEqual(failure.matchExcerpts.map(({ line }) => line), [2, 4]);
+    assert.match(failure.matchExcerpts[1].excerpt, /second\nvalue/u);
+    assert.equal(await readFile(path.join(root, 'note.txt'), 'utf8'), original);
+  }
+});
+
+test('apply_patch enforces end-of-file constraints and rejects delete/add replacement collisions', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-boundaries-'));
+  const original = 'value\ntail\n';
+  await writeFile(path.join(root, 'note.txt'), original);
+  for (const lines of [
+    ['*** Update File: note.txt', '@@', '-value', '+new', '*** End of File'],
+    ['*** Update File: note.txt', '@@', '-tail', '+TAIL', '@@', ' value', '*** End of File'],
+    ['*** Delete File: note.txt', '*** Add File: ./note.txt', '+replacement'],
+    ['*** Add File: note.txt', '+replacement', '*** Delete File: ./note.txt']
+  ]) {
+    const result = await invokeToolCall(textToolCall('apply_patch', patch(lines)), [applyPatchTool], {
+      policy, services: { rootedFileAuthority: testRootedFileAuthority(root) }
+    });
+    assert.equal(result.kind, 'failure');
+    const failures = result.output.details.failures;
+    if (lines[0] === '*** Update File: note.txt') assert.equal(failures[0].reason, 'context_not_found');
+    else {
+      const collision = failures.find(({ reason }) => reason === 'duplicate_path');
+      assert.ok(collision);
+      assert.equal(collision.path, 'note.txt');
+      assert.match(collision.nextAction, /Update File/u);
+    }
+    assert.match(result.summary, /No files were written/u);
+    assert.equal(await readFile(path.join(root, 'note.txt'), 'utf8'), original);
+  }
+});
+
+test('apply_patch keeps candidate excerpts bounded and validation failure atomic across files', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-excerpts-'));
+  const original = Array.from({ length: 8 }, (_, index) => `${index} ${'x'.repeat(300)}\nvalue\n`).join('');
+  await writeFile(path.join(root, 'repeated.txt'), original);
+  await writeFile(path.join(root, 'other.txt'), 'old\n');
+  const result = await invokeToolCall(textToolCall('apply_patch', patch([
+    '*** Update File: other.txt', '@@', '-old', '+new',
+    '*** Update File: repeated.txt', '@@', '-value', '+new'
+  ])), [applyPatchTool], { policy, services: { rootedFileAuthority: testRootedFileAuthority(root) } });
+  assert.equal(result.kind, 'failure');
+  assert.equal(result.execution.state, 'not_started');
+  const failure = result.output.details.failures[0];
+  assert.equal(failure.matchCount, 8);
+  assert.equal(failure.candidateLines.length, 8);
+  assert.equal(failure.matchExcerpts.length, 5);
+  for (const candidate of failure.matchExcerpts) {
+    assert.ok(candidate.excerpt.length <= 5 * 162);
+    assert.ok(candidate.startLine <= candidate.line);
+  }
+  assert.equal(await readFile(path.join(root, 'other.txt'), 'utf8'), 'old\n');
+  assert.equal(await readFile(path.join(root, 'repeated.txt'), 'utf8'), original);
+});
+
+test('apply_patch permits a context-validated move with no text edits', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-core-patch-move-constraint-'));
+  const original = 'anchor  \r\n';
+  await writeFile(path.join(root, 'old.txt'), original);
+  const result = await invokeToolCall(textToolCall('apply_patch', patch([
+    '*** Update File: old.txt', '*** Move to: new.txt', '@@', ' anchor  ', '*** End of File'
+  ])), [applyPatchTool], { policy, services: { rootedFileAuthority: testRootedFileAuthority(root) } });
+  assert.equal(result.kind, 'result');
+  assert.equal(result.output.applicationStatus, 'applied');
+  assert.equal(result.output.totalAdditions, 0);
+  assert.equal(result.output.totalDeletions, 0);
+  assert.equal(await readFile(path.join(root, 'new.txt'), 'utf8'), original);
+  await assert.rejects(readFile(path.join(root, 'old.txt')), { code: 'ENOENT' });
+});

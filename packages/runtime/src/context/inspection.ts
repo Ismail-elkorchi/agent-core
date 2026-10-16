@@ -8,7 +8,21 @@ import type { HistorySourceCut, HistorySourceRef, HistorySourceMetadata, History
 import { historyCutSchema } from '../history/schema.js';
 import { sameHistorySource, type HistoryReader } from '../history/reader.js';
 
-const MAX_MANIFEST_BYTES = 256 * 1024;
+export const MAX_MANIFEST_BYTES = 256 * 1024;
+
+/** Exact size of the candidate manifest, not a minimum for the full tool result. */
+export class ContextInspectionSizeError extends ToolInputError {
+  constructor(readonly requiredManifestBytes: number, requestedMaxBytes: number) {
+    super('Context inspection metadata cannot fit maxBytes.', {
+      code: 'context_inspection_max_bytes', requestedMaxBytes, requiredManifestBytes,
+      maxAllowedBytes: MAX_MANIFEST_BYTES
+    });
+  }
+}
+
+export function contextInspectionStartCursor(cut: HistorySourceCut): string {
+  return Buffer.from(JSON.stringify({ cut, offset: 0, retained: 0, phase: 'retained' })).toString('base64url');
+}
 export const contextInspectionSchema = z.strictObject({
   cursor: z.string().max(MAX_MANIFEST_BYTES).optional(),
   limit: z.number().int().min(1).max(100).default(20),
@@ -56,7 +70,7 @@ export async function contextSourceManifest(
     status: 'available' as const, cut, offset, items,
     coverage: complete ? 'complete' as const : 'partial' as const,
     ...(!complete ? { cursor: Buffer.from(JSON.stringify({ cut, offset: offset + items.length, retained, phase, ...(tail ? { tail } : {}) })).toString('base64url') } : {}),
-    releaseMeaning: 'Release choices are validated against complete exchanges, protected sources and native prefix dependencies before changing the selection. Bytes describe stored sources, not compiled token savings.'
+    releaseMeaning: 'Release validates complete exchanges, protected sources and native prefixes. sourceBytes measures stored sources, not token savings.'
   });
   let lastFit: { retained: number; tail: string | undefined; phase: typeof phase; complete: boolean; count: number } | undefined;
   while (items.length < request.limit && scanned < 1000 && !complete) {
@@ -91,8 +105,9 @@ export async function contextSourceManifest(
       }
       items.push({ source: item.source, type: item.type, description: item.description, sourceBytes: item.sourceBytes, group });
     }
-    if (Buffer.byteLength(JSON.stringify(page())) > request.maxBytes) {
-      if (!lastFit) throw new ToolInputError('Context inspection metadata cannot fit maxBytes; increase maxBytes.');
+    const bytes = Buffer.byteLength(JSON.stringify(page()));
+    if (bytes > request.maxBytes) {
+      if (!lastFit) throw new ContextInspectionSizeError(bytes, request.maxBytes);
       ({ retained, tail, phase, complete } = lastFit);
       items.length = lastFit.count;
       break;
@@ -100,7 +115,8 @@ export async function contextSourceManifest(
     lastFit = { retained, tail, phase, complete, count: items.length };
   }
   const result = page();
-  if (Buffer.byteLength(JSON.stringify(result)) > request.maxBytes) throw new ToolInputError('Context inspection metadata cannot fit maxBytes; increase maxBytes.');
+  const bytes = Buffer.byteLength(JSON.stringify(result));
+  if (bytes > request.maxBytes) throw new ContextInspectionSizeError(bytes, request.maxBytes);
   return result;
 }
 

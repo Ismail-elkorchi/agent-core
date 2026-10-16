@@ -53,6 +53,7 @@ import {
   responsesOutput,
   responsesUsage,
   responsesPayloadPaths,
+  responsesOpaqueProtocolPayloads,
   responsesTool,
   waitForResponseOrStatus,
   type JsonSseEvent,
@@ -390,6 +391,7 @@ export class OpenAIProvider implements ModelProvider {
       ...(providerInputTokens === undefined ? {} : { providerInputTokens }),
       body,
       payloadPaths: responsesPayloadPaths(body),
+      opaqueProtocolPayloads: responsesOpaqueProtocolPayloads(request, body, this.id),
       endpoint: `${this.baseUrl}/responses`
     });
     this.compiledRequests.set(compiled.logicalRequest, compiled);
@@ -410,7 +412,9 @@ export class OpenAIProvider implements ModelProvider {
       retainedInputTokenReservation,
       outputReservation: effective.accounting.outputReservation,
       payloadPaths: responsesPayloadPaths(body),
+      opaqueProtocolPayloads: responsesOpaqueProtocolPayloads(request, body, this.id),
       retainedPayloadPaths: responsesPayloadPaths(retainedBody),
+      retainedOpaqueProtocolPayloads: responsesOpaqueProtocolPayloads(request, retainedBody, this.id),
       ...(this.countTokens
         ? { providerInputTokens: effective.accounting.estimatedInputTokens }
         : {}),

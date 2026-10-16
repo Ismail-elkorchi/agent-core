@@ -1,4 +1,4 @@
-import { canonicalJsonString, parseJsonObject, parseJsonValue, type JsonObject } from '@agent-core/json';
+import { canonicalJsonString, parseJsonObject, parseJsonValue, type JsonObject, type JsonValue } from '@agent-core/json';
 import { MODEL_REQUEST_JSON_LIMITS } from './json-limits.js';
 import { parseModelRequest, ModelContractError } from './validation.js';
 import { modelOutputToInput, modelResponseOutput } from './protocol.js';
@@ -112,6 +112,61 @@ export interface CompiledModelRequest {
   readonly accounting: RequestAccounting;
   readonly inputIdentity: string;
 }
+/** Adapter classification bound to a native protocol-state string in the logical input. */
+export interface OpaqueProtocolPayload {
+  readonly inputPath: readonly (string | number)[];
+  readonly messageIndex: number;
+  readonly statePath: readonly (string | number)[];
+}
+type PayloadPaths = readonly (readonly (string | number)[])[];
+const OPAQUE_REQUEST_PAYLOADS = new WeakMap<CompiledModelRequest, {
+  readonly body: PayloadPaths;
+  readonly retainedBody: PayloadPaths;
+}>();
+
+/**
+ * Inspect plaintext without interpreting adapter-validated opaque protocol bytes.
+ * Proof belongs to the exact owned compilation, never to caller-supplied JSON metadata.
+ * Copies and unrecognized compilations conservatively expose the complete input.
+ */
+export function compiledRequestPlaintext(request: CompiledModelRequest): JsonObject {
+  const paths = OPAQUE_REQUEST_PAYLOADS.get(request);
+  const body = paths ? projectOpaquePayloads(request.body, paths.body) : request.body;
+  const retainedBody = request.retainedBody;
+  return retainedBody === undefined ? body : Object.freeze({
+    body,
+    retainedBody: paths ? projectOpaquePayloads(retainedBody, paths.retainedBody) : retainedBody
+  });
+}
+
+/** Copy only classified leaves and their ancestors; all unchanged owned subtrees are shared. */
+function projectOpaquePayloads(body: JsonObject, paths: PayloadPaths): JsonObject {
+  if (!paths.length) return body;
+  interface Branch { readonly children: Map<string | number, Branch> }
+  const root: Branch = { children: new Map() };
+  for (const path of paths) {
+    let branch = root;
+    for (const segment of path) {
+      let child = branch.children.get(segment);
+      if (!child) {
+        child = { children: new Map() };
+        branch.children.set(segment, child);
+      }
+      branch = child;
+    }
+  }
+  const project = (value: JsonValue, branch: Branch): JsonValue => {
+    if (!branch.children.size) return '[native payload]';
+    // All paths were checked against the owned immutable input during compilation.
+    const source = value as JsonObject | JsonValue[];
+    const copy = Array.isArray(source) ? [...source] : { ...source };
+    for (const [segment, child] of branch.children)
+      Reflect.set(copy, segment, project(Reflect.get(source, segment) as JsonValue, child));
+    return Object.freeze(copy);
+  };
+  return project(body, root) as JsonObject;
+}
+
 export function accountModelRequest(
   request: ModelRequest,
   profile: ModelProfile,
@@ -315,6 +370,9 @@ export async function compileModelRequest(
     readonly endpoint: string;
     readonly retainedBody?: unknown;
     readonly retainedPayloadPaths?: readonly (readonly (string | number)[])[];
+    /** Trusted adapter classifications, only after validating protocol provenance and exact replay. */
+    readonly opaqueProtocolPayloads?: readonly OpaqueProtocolPayload[];
+    readonly retainedOpaqueProtocolPayloads?: readonly OpaqueProtocolPayload[];
   }
 ): Promise<CompiledModelRequest> {
   const request = parseModelRequest(options.request);
@@ -375,7 +433,7 @@ export async function compileModelRequest(
           providerInputTokens: options.providerInputTokens + (retainedInputTokenReservation ?? 0)
         }
   );
-  return Object.freeze({
+  const compiled: CompiledModelRequest = Object.freeze({
     version: 1,
     provider: options.profile.provider,
     model: request.model,
@@ -387,6 +445,34 @@ export async function compileModelRequest(
     accounting,
     inputIdentity: await modelInputIdentity(retainedBody ? { body, retainedBody } : body)
   });
+  const leaf = (source: unknown, path: readonly (string | number)[]): string => {
+    let value = source;
+    for (const segment of path) {
+      if (!value || typeof value !== 'object' || !Object.hasOwn(value, segment))
+        throw new RangeError('Opaque protocol payload path does not exist.');
+      value = Reflect.get(value, segment) as unknown;
+    }
+    if (!path.length || typeof value !== 'string')
+      throw new RangeError('Opaque protocol payload paths must identify encoded string leaves.');
+    return value;
+  };
+  const ownPaths = (
+    source: JsonObject | undefined, payloads: readonly OpaqueProtocolPayload[]
+  ): PayloadPaths => Object.freeze(payloads.map((payload) => {
+    const message = request.messages[payload.messageIndex];
+    if (!Number.isSafeInteger(payload.messageIndex) || message?.role !== 'protocol' ||
+        message.state.provider !== options.profile.provider || message.state.model !== request.model ||
+        message.state.endpoint !== options.endpoint)
+      throw new RangeError('Opaque payload must originate in compatible logical protocol state.');
+    if (leaf(source, payload.inputPath) !== leaf(message.state.data, payload.statePath))
+      throw new RangeError('Opaque payload must exactly match its logical protocol-state leaf.');
+    return Object.freeze([...payload.inputPath]);
+  }));
+  const opaque = ownPaths(body, options.opaqueProtocolPayloads ?? []);
+  const retainedOpaque = ownPaths(retainedBody, options.retainedOpaqueProtocolPayloads ?? []);
+  if (opaque.length || retainedOpaque.length)
+    OPAQUE_REQUEST_PAYLOADS.set(compiled, { body: opaque, retainedBody: retainedOpaque });
+  return compiled;
 }
 /** Exact SHA-256 identity of canonical JSON; not a claim about tokenization. */
 export async function modelInputIdentity(value: unknown): Promise<string> {

@@ -11,6 +11,7 @@ export const APPLY_PATCH_PROMPT_GUIDE = `Send a patch document directly as freef
 *** Delete File: obsolete/path
 *** End Patch
 
+Use one operation per path; replace existing content with Update File, never Delete File plus Add File for the same path. Validation failures write no files.
 For a move, use "*** Update File: old/path" followed by "*** Move to: new/path", with optional update hunks.
-Each update hunk starts with @@ and includes at least one + or - line. Context lines start with a space. Use exact current source text and enough context to identify the intended region; labels after @@ can disambiguate repeated text. Do not copy display line numbers into the patch.
+Each update hunk starts with @@. An update must include at least one + or - line, unless it moves a file. Additional context-only hunks are exact-match constraints checked in order against staged content; they never change text or disambiguate other hunks. Context lines start with a space. Use exact current source text and enough context to identify the intended region; labels after @@ can disambiguate repeated text. Do not copy display line numbers into the patch.
 Use "*** End of File" after a hunk only when it must match at the file's end.`;

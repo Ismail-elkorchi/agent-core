@@ -584,6 +584,7 @@ export {
   responsesInput,
   responsesOutput,
   responsesToolCall,
-  responsesPayloadPaths
+  responsesPayloadPaths,
+  responsesOpaqueProtocolPayloads
 } from './model-items.js';
 export { responsesTool } from './tools.js';
