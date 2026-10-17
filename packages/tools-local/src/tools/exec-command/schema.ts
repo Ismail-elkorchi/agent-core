@@ -13,8 +13,8 @@ export function execCommandSchema(ptySupported: boolean) {
         'Directory relative to the workspace root. Use "." for the root; absolute paths are not accepted.'
       ),
     ...(ptySupported ? { pty: z.boolean().default(false) } : {}),
-    yieldMs: z.int().min(0).default(1_000).describe(
-      'Observation wait limit; returns on fresh output, termination, steering, or this limit. A running result includes the process handle for later control.'
+    yieldMs: z.int().min(0).default(30_000).describe(
+      'Observation wait limit, defaulting to 30 seconds and clamped to the configured limit; returns on fresh output, termination, steering, or this limit. Use 0 for an immediate snapshot. A running result includes the process handle for later control.'
     ),
     timeoutMs: z.int().min(1).default(60_000).describe(
       'Maximum process lifetime, independent of observation waits. The runtime enforces its limits and returns the effective deadline for an active process.'

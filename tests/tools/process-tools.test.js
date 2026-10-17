@@ -522,7 +522,7 @@ test('process ownership and run cleanup cannot affect another run', async () => 
   const { context, manager } = await processContext({}, ownerA);
   const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify('setInterval(()=>{},1000)')}`;
   const started = await invokeToolCall(
-    jsonToolCall('exec_command', { command }),
+    jsonToolCall('exec_command', { command, yieldMs: 0 }),
     tools,
     context
   );
@@ -1429,15 +1429,15 @@ test('active commands expose their effective deadline and rejected writes return
   assert.equal(foreign.output.details.process, undefined);
 });
 
-test('process wait guidance exposes cursor and activity semantics without changing defaults', () => {
+test('process wait guidance defaults to a long interruptible observation', () => {
   const parsed = writeStdinTool.decodeInput({ kind: 'json', value: { processId: 'process' } });
   assert.equal(parsed.ok, true);
   const input = parsed.input;
-  assert.equal(input.yieldMs, 1_000);
+  assert.equal(input.yieldMs, 30_000);
   assert.equal(input.afterCursor, 0);
   assert.match(writeStdinTool.description, /wait for output or termination/);
   assert.match(writeStdinTool.jsonSchema.properties.afterCursor.description, /prior result cursorEnd/);
-  assert.match(writeStdinTool.jsonSchema.properties.yieldMs.description, /Prefer 30000/);
+  assert.match(writeStdinTool.jsonSchema.properties.yieldMs.description, /Keep the default/);
   for (const yieldMs of [-1, 0.5])
     assert.equal(writeStdinTool.decodeInput({ kind: 'json', value: { processId: 'process', yieldMs } }).ok, false);
 });
@@ -1545,8 +1545,8 @@ test('requested long process waits retain the configured yield bound', async () 
     ...DEFAULT_LOCAL_TOOL_CONFIGURATION,
     process: { ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process, maxYieldMs: 75 }
   } } };
-  for (const [requested, expected] of [[0, 0], [50, 50], [30_000, 75]]) {
-    const parsed = writeStdinTool.decodeInput({ kind: 'json', value: { processId: 'p', yieldMs: requested } });
+  for (const [requested, expected] of [[undefined, 75], [0, 0], [50, 50], [30_000, 75]]) {
+    const parsed = writeStdinTool.decodeInput({ kind: 'json', value: { processId: 'p', ...(requested === undefined ? {} : { yieldMs: requested }) } });
     assert.equal(parsed.ok, true);
     const canonical = await writeStdinTool.canonicalizeInput(parsed.input, context);
     assert.equal(canonical.yieldMs, expected);
@@ -1557,7 +1557,7 @@ test('requested long process waits retain the configured yield bound', async () 
 test('exec_command exposes a bounded observation window without execution modes', async () => {
   const decoded = execCommandTool.decodeInput({ kind: 'json', value: { command: 'printf ready' } });
   assert.equal(decoded.ok, true);
-  assert.equal(decoded.input.yieldMs, 1_000);
+  assert.equal(decoded.input.yieldMs, 30_000);
   assert.equal(Object.hasOwn(execCommandTool.jsonSchema.properties, 'background'), false);
   assert.equal(execCommandTool.decodeInput({ kind: 'json', value: { command: 'true', background: true } }).ok, false);
   for (const yieldMs of [-1, 0.5])
@@ -1606,4 +1606,18 @@ test('a yielded stop preserves active execution when its output cursor is reject
   assert.equal(result.kind, 'failure');
   assert.equal(result.execution.state, 'active');
   assert.equal(result.output.details.cause, 'invalid_cursor');
+});
+
+
+test('exec observation defaults and explicit snapshots retain the configured yield bound', async t => {
+  const { context, manager, root } = await processContext({ maxYieldMs: 75 });
+  t.after(async () => { await manager.close(); await rm(root, { recursive: true, force: true }); });
+  for (const [requested, expected] of [[undefined, 75], [0, 0], [50, 50], [30_000, 75]]) {
+    const parsed = execCommandTool.decodeInput({ kind: 'json', value: {
+      command: 'true', ...(requested === undefined ? {} : { yieldMs: requested })
+    } });
+    assert.equal(parsed.ok, true);
+    const canonical = await execCommandTool.canonicalizeInput(parsed.input, context);
+    assert.equal(canonical.yieldMs, expected);
+  }
 });
