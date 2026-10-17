@@ -1621,3 +1621,109 @@ test('exec observation defaults and explicit snapshots retain the configured yie
     assert.equal(canonical.yieldMs, expected);
   }
 });
+
+test('terminal observations wait for the single durable report handoff', async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'process-terminal-observation-'));
+  const files = testRootedFileAuthority(root);
+  let enterHandoff;
+  const entered = new Promise(resolve => { enterHandoff = resolve; });
+  let releaseHandoff;
+  const released = new Promise(resolve => { releaseHandoff = resolve; });
+  let handoffs = 0;
+  const manager = new LocalCommandExecution({ artifactRepository: new InMemoryArtifactRepository(),
+    rootedFileAuthority: files, ledgerDirectory: path.join(root, 'processes'),
+    ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process,
+    async commitTerminalReport(report) {
+      handoffs += 1;
+      assert.equal(report.result.status, 'exited');
+      enterHandoff(report.result.processId);
+      await released;
+    }
+  });
+  t.after(async () => { releaseHandoff(); await manager.close(); files.close(); await rm(root, { recursive: true, force: true }); });
+  const running = await startCommand(manager, {
+    command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("setTimeout(() => process.stdout.write('done'), 100)")}`,
+    rootedDirectory: '.', pty: false, timeoutMs: 5_000, yieldMs: 0, outputTokenBudget: 100, owner: invocation
+  });
+  const processId = await entered;
+  assert.equal(processId, running.processId);
+  let observed = false;
+  const observation = manager.query(processId, 100, 0, 0, invocation).then(result => { observed = true; return result; });
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(observed, false, 'terminal results must not outrun their durable report handoff');
+  const controller = new AbortController();
+  const interrupted = manager.query(processId, 100, 0, 0, invocation, controller.signal);
+  controller.abort('steering during finalization');
+  const pending = await interrupted;
+  assert.equal(pending.status, 'exited', 'steering does not falsify the known process outcome');
+  assert.equal(pending.finalizationPending, true);
+  assert.equal(pending.artifact, undefined, 'yielded snapshots do not await artifact IO');
+  assert.equal((await manager.terminate(processId, invocation, controller.signal)).finalizationPending, true);
+  releaseHandoff();
+  const terminal = await observation;
+  assert.equal(terminal.status, 'exited');
+  assert.equal(terminal.combined.segments.join(''), 'done');
+  assert.equal(terminal.finalizationPending, undefined);
+  assert.equal(handoffs, 1);
+  assert.deepEqual(await manager.unreportedTerminalProcesses(invocation.ownerId), []);
+});
+
+
+test('steering yields a truthful terminal snapshot while artifact persistence is blocked', async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'process-artifact-observation-'));
+  const files = testRootedFileAuthority(root);
+  const artifacts = new InMemoryArtifactRepository();
+  const store = artifacts.store.bind(artifacts);
+  let enterStore;
+  const entered = new Promise(resolve => { enterStore = resolve; });
+  let releaseStore;
+  const released = new Promise(resolve => { releaseStore = resolve; });
+  artifacts.store = async input => { enterStore(); await released; return store(input); };
+  const manager = new LocalCommandExecution({ artifactRepository: artifacts, rootedFileAuthority: files,
+    ledgerDirectory: path.join(root, 'processes'), ...DEFAULT_LOCAL_TOOL_CONFIGURATION.process });
+  t.after(async () => { releaseStore(); await manager.close(); files.close(); await rm(root, { recursive: true, force: true }); });
+  const running = await startCommand(manager, {
+    command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("setTimeout(() => process.stdout.write('done'), 100)")}`,
+    rootedDirectory: '.', pty: false, timeoutMs: 5_000, yieldMs: 0, outputTokenBudget: 100, owner: invocation
+  });
+  await entered;
+  const pending = await manager.query(running.processId, 100, 0, 0, invocation, AbortSignal.abort('steer'));
+  assert.equal(pending.status, 'exited');
+  assert.equal(pending.finalizationPending, true);
+  assert.equal(pending.artifact, undefined);
+  releaseStore();
+  const terminal = await manager.query(running.processId, 100, 0, 0, invocation);
+  assert.equal(terminal.finalizationPending, undefined);
+  assert.ok(terminal.artifact);
+});
+
+
+test('pending process finalization remains an active observation with truthful terminal presentation', async t => {
+  const { context, manager, root } = await processContext();
+  t.after(async () => { await manager.close(); await rm(root, { recursive: true, force: true }); });
+  const empty = { segments: [], observedBytes: 0, capturedBytes: 0, omittedBytes: 0,
+    startsAtOutputStart: true, endsAtOutputEnd: true };
+  const output = { processId: 'pending-process', owner: {
+    ownerId: invocation.ownerId, runId: invocation.runId, turnId: invocation.turnId,
+    toolBatchId: invocation.toolBatchId, callIndex: invocation.callIndex
+  }, status: 'exited', finalizationPending: true,
+    cursorStart: 0, cursorEnd: 0, stdout: empty, stderr: empty, combined: empty, exitCode: 0 };
+  const signal = AbortSignal.abort('steer pending finalization');
+  manager.query = async (_id, _budget, _yield, _cursor, _owner, receivedSignal) => {
+    assert.equal(receivedSignal, signal, 'control follow-up must preserve the observation yield');
+    return output;
+  };
+  manager.terminate = async () => output;
+  for (const toolName of ['write_stdin', 'stop_process']) {
+    const result = await invokeToolCall(jsonToolCall(toolName, { processId: output.processId }), tools, { ...context, observationSignal: signal });
+    assert.equal(result.kind, 'result');
+    assert.equal(result.execution.state, 'active');
+    assert.equal(result.output.status, 'exited');
+    assert.equal(result.output.finalizationPending, true);
+    const content = (toolName === 'write_stdin' ? writeStdinTool : stopProcessTool).buildModelContent({ observation: result });
+    const metadata = JSON.parse(content[0].text);
+    assert.equal(metadata.status, 'exited');
+    assert.equal(metadata.finalizationPending, true);
+    assert.equal(metadata.processId, output.processId);
+  }
+});

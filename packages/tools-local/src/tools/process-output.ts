@@ -24,6 +24,7 @@ export const processOutputSchema = z.strictObject({
   processId: z.string().min(1),
   owner: commandOwnerSchema,
   status: z.enum(['running', 'exited', 'stopped', 'timed_out', 'failed']),
+  finalizationPending: z.literal(true).optional(),
   cursorStart: z.int().nonnegative(),
   cursorEnd: z.int().nonnegative(),
   cursorExpired: z.boolean().optional(),

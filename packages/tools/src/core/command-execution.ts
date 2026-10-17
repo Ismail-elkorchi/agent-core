@@ -122,6 +122,8 @@ export interface CommandExecutionResult {
   readonly processId: string;
   readonly owner: CommandExecutionOwner;
   readonly status: CommandExecutionStatus;
+  /** Process outcome is known, but receipt persistence or terminal handoff is still pending. */
+  readonly finalizationPending?: true;
   readonly cursorStart: number;
   readonly cursorEnd: number;
   readonly cursorExpired?: boolean;

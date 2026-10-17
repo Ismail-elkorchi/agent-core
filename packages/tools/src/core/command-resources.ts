@@ -30,10 +30,11 @@ export function commandReleaseReport(report: CommandExecutionReport): ResourceRe
   const result = report.result;
   return Object.freeze({
     resourceId: result.processId,
-    outcome: result.status === 'running' ? 'unknown' : 'released',
+    outcome: result.status === 'running' || result.finalizationPending ? 'unknown' : 'released',
     ...(report.settlementReference ? { settlementReference: report.settlementReference } : {}),
     details: parseJsonObject({
       status: result.status,
+      ...(result.finalizationPending ? { finalizationPending: true } : {}),
       owner: result.owner,
       cursorEnd: result.cursorEnd,
       stdout: outputCounts(result.stdout),

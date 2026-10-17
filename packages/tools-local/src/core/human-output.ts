@@ -36,13 +36,14 @@ export function renderLocalToolObservation(
       const { combined } = output;
       content = [
         `Process ${output.processId} · ${output.status}`,
+        ...(output.finalizationPending ? ['Terminal receipt finalization is pending'] : []),
         ...(output.exitCode === undefined ? [] : [`Exit code: ${String(output.exitCode)}`]),
         `Output cursor ${String(output.cursorStart)}–${String(output.cursorEnd)}`,
         ...(combined.omittedBytes ? [`${String(combined.omittedBytes)} output bytes omitted`] : []),
         ...(typeof output.diagnostic === 'string' ? [output.diagnostic] : []),
         renderCommandOutput(combined)
       ].join('\n');
-      status =
+      status = output.finalizationPending ? 'warning' :
         output.status === 'running'
           ? 'running'
           : output.status === 'exited'

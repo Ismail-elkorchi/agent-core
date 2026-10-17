@@ -137,8 +137,8 @@ async function executeCommand(
   }
   return {
     kind: 'result' as const,
-    execution: { state: result.status === 'running' ? ('active' as const) : ('settled' as const) },
-    summary:
+    execution: { state: (result.status === 'running' || result.finalizationPending === true) ? ('active' as const) : ('settled' as const) },
+    summary: result.finalizationPending ? 'Process ' + result.processId + ' is ' + result.status + '; terminal receipt finalization is pending.' :
       result.status === 'running'
         ? 'Process continues as ' + result.processId + '.'
         : 'Process ' +

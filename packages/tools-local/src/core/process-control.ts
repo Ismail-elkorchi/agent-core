@@ -30,8 +30,8 @@ export function processObservation(result: CommandExecutionResult) {
   const incomplete = result.combined.omittedBytes > 0 || result.cursorExpired === true;
   return {
     kind: 'result' as const,
-    execution: { state: result.status === 'running' ? 'active' as const : 'settled' as const },
-    summary: `Process ${result.processId} is ${result.status}.`,
+    execution: { state: (result.status === 'running' || result.finalizationPending === true) ? 'active' as const : 'settled' as const },
+    summary: `Process ${result.processId} is ${result.status}.${result.finalizationPending ? ' Terminal receipt finalization is pending.' : ''}`,
     scope: {
       resources: [processScope(result.processId)],
       coverage: incomplete ? 'partial' as const : 'complete' as const,
@@ -51,11 +51,12 @@ export async function processOperationRejectedObservation(
   executor: CommandExecution,
   owner: CommandExecutionOwner,
   outputTokenBudget: number,
-  execution: 'not_started' | 'active' | 'settled' = 'not_started'
+  execution: 'not_started' | 'active' | 'settled' = 'not_started',
+  observationSignal?: AbortSignal
 ) {
   // Only not_running establishes a known, authorized process with a terminal outcome.
   const process = error.reason === 'not_running'
-    ? await executor.query(error.processId, outputTokenBudget, 0, 0, owner)
+    ? await executor.query(error.processId, outputTokenBudget, 0, 0, owner, observationSignal)
     : undefined;
   return {
     kind: 'failure' as const,
@@ -89,9 +90,9 @@ export async function recoverProcessObservation(
 ) {
   try {
     const result = await commandExecutor(context).query(
-      input.processId, input.outputTokenBudget, 0, input.afterCursor, processOwner(context)
+      input.processId, input.outputTokenBudget, 0, input.afterCursor, processOwner(context), context.observationSignal
     );
-    return requireTerminal && result.status === 'running'
+    return requireTerminal && (result.status === 'running' || result.finalizationPending === true)
       ? { status: 'running' as const }
       : { status: 'settled' as const, observation: processObservation(result) };
   } catch (error) {

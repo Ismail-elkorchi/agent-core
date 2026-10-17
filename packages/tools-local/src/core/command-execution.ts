@@ -410,7 +410,7 @@ export class LocalCommandExecution implements CommandExecution {
       if (options.signal.aborted) record.abortListener();
     }
     await this.waitForActivity(record, request.yieldMs, 0, options.observationSignal);
-    return { kind: 'started', result: await this.query(id, request.outputTokenBudget, 0, 0, request.owner) };
+    return { kind: 'started', result: await this.query(id, request.outputTokenBudget, 0, 0, request.owner, options.observationSignal) };
   }
 
   async query(
@@ -439,11 +439,28 @@ export class LocalCommandExecution implements CommandExecution {
     }
     const record = this.requireProcess(processId);
     this.assertOwner(record, requester);
-    if (record.status !== 'running' && record.progressClosed) await record.progressDrainPromise;
     if (!Number.isSafeInteger(afterCursor) || afterCursor < 0 || afterCursor > record.cursor)
       throw new CommandProcessOperationRejectedError(processId, 'invalid_cursor');
     if (record.status === 'running' && record.cursor === afterCursor && yieldMs > 0)
       await this.waitForActivity(record, yieldMs, afterCursor, observationSignal);
+    // Terminal status alone is not a completed observation: receipt persistence can
+    // still add diagnostics, and the terminal report handoff must finish first.
+    if (record.status !== 'running') {
+      const report = await this.observeFinalization(this.finish(record), observationSignal);
+      return this.processResult(record, outputTokenBudget, afterCursor, report?.result.artifact, report === undefined);
+    }
+    return this.processResult(record, outputTokenBudget, afterCursor);
+  }
+
+  /** Build a snapshot without joining finalization; finishOnce uses this to avoid self-await. */
+  private processResult(
+    record: ManagedProcess,
+    outputTokenBudget: number,
+    afterCursor: number,
+    artifact?: PublicArtifactRef,
+    finalizationPending = false
+  ): CommandExecutionResult {
+    const processId = record.id;
     const cursorExpired = afterCursor < record.oldestCursor;
     const useCapture = cursorExpired && afterCursor === 0;
     const effectiveCursor = useCapture ? 0 : cursorExpired ? record.oldestCursor : afterCursor;
@@ -457,11 +474,11 @@ export class LocalCommandExecution implements CommandExecution {
       record.observed.stderr, 'stderr');
     const combined = processOutputView(available, Math.floor(budgetBytes / 2), effectiveCursor,
       record.cursor);
-    const artifacts = record.status === 'running' ? undefined : await this.finalArtifacts(record);
     return Object.freeze({
       processId,
       owner: record.owner,
       status: record.status,
+      ...(finalizationPending ? { finalizationPending: true as const } : {}),
       ...(record.status === 'running' ? { deadline: new Date(record.deadline).toISOString() } : {}),
       cursorStart: effectiveCursor,
       cursorEnd: record.cursor,
@@ -469,7 +486,7 @@ export class LocalCommandExecution implements CommandExecution {
       stdout,
       stderr,
       combined,
-      ...(artifacts?.publicArtifact ? { artifact: artifacts.publicArtifact } : {}),
+      ...(artifact ? { artifact } : {}),
       ...(record.exitCode === undefined ? {} : { exitCode: record.exitCode }),
       ...(record.signal === undefined ? {} : { signal: record.signal }),
       ...(record.diagnostic === undefined ? {} : { diagnostic: record.diagnostic }),
@@ -553,8 +570,8 @@ export class LocalCommandExecution implements CommandExecution {
         });
       this.requestTermination(record, 'stopped');
     }
-    await this.waitForTermination(record, observationSignal);
-    return this.query(processId, 4_000, 0, 0, requester);
+    await this.observeFinalization(record.tree.settle().then(() => this.finish(record)), observationSignal);
+    return this.query(processId, 4_000, 0, 0, requester, observationSignal);
   }
 
   /** Stop active owned processes and return every terminal process not yet durably reported. */
@@ -883,7 +900,7 @@ export class LocalCommandExecution implements CommandExecution {
     } catch (error) {
       record.diagnostic = appendDiagnostic(record.diagnostic, `Process terminal metadata storage failed: ${errorMessage(error)}`);
     }
-    const result = await this.query(record.id, 4_000);
+    const result = this.processResult(record, 4_000, 0, artifacts.publicArtifact);
     const report = Object.freeze({ result,
       ...(artifacts.protectedArtifact === undefined ? {} : { protectedArtifact: artifacts.protectedArtifact })
     });
@@ -1008,17 +1025,19 @@ export class LocalCommandExecution implements CommandExecution {
     });
   }
 
-  private async waitForTermination(record: ManagedProcess, observationSignal?: AbortSignal): Promise<void> {
-    const settlement = record.tree.settle().then(() => this.finish(record));
-    if (!observationSignal) { await settlement; return; }
+  private async observeFinalization(
+    settlement: Promise<CommandExecutionReport>,
+    observationSignal?: AbortSignal
+  ): Promise<CommandExecutionReport | undefined> {
+    if (!observationSignal) return settlement;
     let remove = (): void => undefined;
-    const yielded = new Promise<void>((resolve) => {
-      const finish = () => { resolve(); };
+    const yielded = new Promise<undefined>((resolve) => {
+      const finish = () => { resolve(undefined); };
       observationSignal.addEventListener('abort', finish, { once: true });
       remove = () => { observationSignal.removeEventListener('abort', finish); };
       if (observationSignal.aborted) finish();
     });
-    try { await Promise.race([settlement, yielded]); }
+    try { return await Promise.race([settlement, yielded]); }
     finally { remove(); }
   }
 
@@ -1467,7 +1486,8 @@ function terminalRecordFromReport(
   executionTargetId: string
 ): ProcessTerminalRecord {
   const { result, protectedArtifact } = report;
-  if (result.status === 'running') throw new Error('A running process has no terminal record.');
+  if (result.status === 'running' || result.finalizationPending)
+    throw new Error('An unfinished process report has no terminal record.');
   const counts = (stream: CommandOutputView) => ({
     observedBytes: stream.observedBytes,
     capturedBytes: stream.capturedBytes

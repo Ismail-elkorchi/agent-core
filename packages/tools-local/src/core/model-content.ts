@@ -70,12 +70,13 @@ function processResultContent(output: ProcessOutput): readonly ToolContent[] {
   return [
     text(json({
       status: output.status,
+      ...(output.finalizationPending ? { finalizationPending: true } : {}),
       ...(output.deadline ? { deadline: output.deadline } : {}),
       ...(output.exitCode === undefined ? {} : { exitCode: output.exitCode }),
       ...(output.signal ? { signal: output.signal } : {}),
       ...(output.diagnostic ? { diagnostic: output.diagnostic } : {}),
       outputCoverage: partial ? 'partial' : 'complete',
-      ...(output.status === 'running' || partial ? {
+      ...(output.status === 'running' || output.finalizationPending || partial ? {
         processId: output.processId, cursorStart: output.cursorStart, cursorEnd: output.cursorEnd
       } : {}),
       ...(output.cursorExpired ? { cursorExpired: true } : {}),
